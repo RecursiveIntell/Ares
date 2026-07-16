@@ -50,6 +50,35 @@ def test_context_governor_handle_tool_call_status(tmp_path):
     assert "compression_count" in result
 
 
+def test_context_governor_status_includes_native_receipt_index_lifecycle(tmp_path):
+    binary = _find_binary()
+    engine = ContextGovernorEngine(binary=binary, store_dir=str(tmp_path), timeout_sec=10)
+
+    result = json.loads(engine.handle_tool_call("context_status", {}))
+
+    receipt_store = result["receipt_store"]
+    assert receipt_store["schema"] == "FileContextStoreStatusV1"
+    assert receipt_store["available"] is True
+    assert Path(receipt_store["root"]) == tmp_path
+    assert receipt_store["receipt_count"] == 0
+    assert receipt_store["total_bytes"] == 0
+    assert receipt_store["index_built"] is False
+    assert receipt_store["searchable"] is True
+    assert receipt_store["last_receipt"] is None
+
+
+def test_context_governor_status_keeps_engine_status_when_native_status_fails(tmp_path):
+    engine = ContextGovernorEngine(binary="/bin/false", store_dir=str(tmp_path), timeout_sec=10)
+
+    result = json.loads(engine.handle_tool_call("context_status", {}))
+
+    assert result["engine"] == "context_governor"
+    assert result["available"] is True
+    assert result["receipt_store"]["available"] is False
+    assert result["receipt_store"]["root"] == str(tmp_path)
+    assert result["receipt_store"]["error"]
+
+
 def test_context_governor_handle_tool_call_unknown(tmp_path):
     binary = _find_binary()
     engine = ContextGovernorEngine(binary=binary, store_dir=str(tmp_path), timeout_sec=10)

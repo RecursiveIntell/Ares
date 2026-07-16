@@ -555,7 +555,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                     "name": "context_status",
                     "description": (
                         "Show context-governor engine status: compression count, "
-                        "last receipt, last error, stored receipts."
+                        "last receipt, last error, and native receipt-store/index lifecycle."
                     ),
                     "parameters": {
                         "type": "object",
@@ -775,6 +775,23 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 logger.warning("context-governor compaction failed; keeping original messages: %s", exc)
             return messages
 
+    def _get_receipt_store_status(self) -> Dict[str, Any]:
+        """Return native receipt/index lifecycle data without breaking engine status."""
+        try:
+            native_status = self._run_json(
+                ["status", "--dir", str(self.store_dir)],
+                {},
+            )
+            if not isinstance(native_status, dict):
+                raise ValueError("context-governor status returned a non-object payload")
+            return {**native_status, "available": True}
+        except Exception as exc:
+            return {
+                "available": False,
+                "root": str(self.store_dir),
+                "error": str(exc),
+            }
+
     def get_status(self) -> Dict[str, Any]:
         status = super().get_status()
         status.update(
@@ -798,6 +815,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 "telemetry_max_additional_protected_messages": self._policy[
                     "telemetry_max_additional_protected_messages"
                 ],
+                "receipt_store": self._get_receipt_store_status(),
             }
         )
         return status
