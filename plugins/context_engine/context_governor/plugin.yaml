@@ -1,0 +1,5 @@
+name: context_governor
+description: "Structural compaction with content-addressed exact fallback, anti-degradation LLM summarization, and SQLite persistence. Requires the context-governor binary (cargo install context-governor)."
+version: 0.1.0
+author: RecursiveIntell
+license: MIT
