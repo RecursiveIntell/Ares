@@ -609,6 +609,10 @@ def _is_hermes_internal_secret(key: str) -> bool:
         upper.endswith("_SECRET") or upper.endswith("_KEY") or upper.endswith("_TOKEN")
     ):
         return True
+    if upper.endswith("_ACCESS_TOKEN"):
+        # BWS bootstrap token and any access_token_env remap. Hermes's own
+        # vault credential must never reach a child by inheritance.
+        return True
     return False
 
 
@@ -626,6 +630,16 @@ def _plugin_terminal_env_strip_keys() -> frozenset:
         return plugin_strip_env_keys()
     except Exception:
         return frozenset()
+
+
+def _is_credential_shaped_password(key: str) -> bool:
+    """True for ``*_PASSWORD`` env names.
+
+    Password-shaped names are stripped by default from child environments;
+    terminal passthrough remains the explicit capability for commands that
+    genuinely need one.
+    """
+    return key.upper().endswith("_PASSWORD")
 
 
 def _inject_context_hermes_home(env: dict) -> None:
@@ -712,6 +726,8 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
         passthrough = _is_passthrough(key)
         if key in _HERMES_PROVIDER_ENV_BLOCKLIST and not (passthrough or first_party):
             continue
+        if _is_credential_shaped_password(key) and not passthrough:
+            continue
         # First-party platform vars are the process's own env values: use them
         # directly, never scope-resolve (multiplex with no scope would raise
         # UnscopedSecretError — a regression where the script previously ran
@@ -736,6 +752,8 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
             first_party = _is_terminal_first_party_env(key)
             passthrough = _is_passthrough(key)
             if key in _HERMES_PROVIDER_ENV_BLOCKLIST and not (passthrough or first_party):
+                continue
+            if _is_credential_shaped_password(key) and not passthrough:
                 continue
             resolved = value
             if passthrough and not first_party:
@@ -870,6 +888,12 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
         env.pop(key, None)
     for key in _plugin_terminal_env_strip_keys():
         env.pop(key, None)
+    # *PASSWORD values never belong in a non-terminal child (browser, ACP,
+    # computer-use, dep-ensure, TUI/Node host). Unlike the terminal path
+    # there is no skill-passthrough concept, so strip unconditionally.
+    for key in list(env):
+        if _is_credential_shaped_password(key):
+            env.pop(key, None)
     # Internal routing hints and Hermes-internal dynamic secrets
     # (``AUXILIARY_<TASK>_API_KEY`` / ``_BASE_URL`` side-LLM credentials,
     # ``GATEWAY_RELAY_*`` relay-auth material) must never reach a child,
