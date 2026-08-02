@@ -609,11 +609,37 @@ def _is_hermes_internal_secret(key: str) -> bool:
         upper.endswith("_SECRET") or upper.endswith("_KEY") or upper.endswith("_TOKEN")
     ):
         return True
-    if upper.endswith("_ACCESS_TOKEN"):
-        # BWS bootstrap token and any access_token_env remap. Hermes's own
-        # vault credential must never reach a child by inheritance.
+    if upper == _get_configured_bws_token_env().upper():
+        # Bitwarden Secrets Manager bootstrap token — the exact configured
+        # access_token_env name (default BWS_ACCESS_TOKEN; may be remapped to
+        # a non-suffix name like MY_BWS_TOKEN). Hermes's own vault credential
+        # must never reach a child by inheritance.
         return True
     return False
+
+
+_configured_bws_token_env: str | None = None
+_configured_bws_token_env_loaded = False
+
+
+def _get_configured_bws_token_env() -> str:
+    """Resolve the exact Bitwarden ``access_token_env`` name from config."""
+    global _configured_bws_token_env, _configured_bws_token_env_loaded
+    if not _configured_bws_token_env_loaded:
+        _configured_bws_token_env_loaded = True
+        name = "BWS_ACCESS_TOKEN"
+        try:
+            from hermes_cli.config import cfg_get, read_raw_config
+
+            configured = cfg_get(
+                read_raw_config(), "secrets", "bitwarden", "access_token_env"
+            )
+            if isinstance(configured, str) and configured.strip():
+                name = configured.strip()
+        except Exception:
+            pass
+        _configured_bws_token_env = name
+    return _configured_bws_token_env or "BWS_ACCESS_TOKEN"
 
 
 def _plugin_terminal_env_strip_keys() -> frozenset:
