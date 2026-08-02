@@ -383,6 +383,13 @@ def _is_hermes_internal_secret(key: str) -> bool:
       ``_ALWAYS_STRIP_KEYS``. Non-secret ``GATEWAY_RELAY_*`` routing hints
       (``GATEWAY_RELAY_URL``, ``GATEWAY_RELAY_PLATFORMS``, …) are NOT matched
       and remain visible.
+    - ``BWS_ACCESS_TOKEN`` — the Bitwarden Secrets Manager bootstrap token
+      (and any ``*_ACCESS_TOKEN`` name it is remapped to via
+      ``secrets.bitwarden.access_token_env``). Hermes's own vault credential;
+      no spawned child legitimately needs it. The one child that does — the
+      ``bws`` CLI — receives it explicitly via
+      ``build_subprocess_env(scrub_secrets=False)`` in
+      ``agent/secret_sources/bitwarden.py``, never through inheritance.
 
     ``code_execution_tool.py`` already catches these via substring matching on
     ``KEY`` / ``SECRET`` / ``TOKEN``; the terminal backend's narrower name-based
@@ -405,7 +412,37 @@ def _is_hermes_internal_secret(key: str) -> bool:
         upper.endswith("_SECRET") or upper.endswith("_KEY") or upper.endswith("_TOKEN")
     ):
         return True
+    if upper.endswith("_ACCESS_TOKEN"):
+        # BWS bootstrap token and any access_token_env remap.  Hermes's own
+        # vault credential must never reach a child by inheritance.
+        return True
     return False
+
+
+def _plugin_terminal_env_strip_keys() -> frozenset:
+    """Credential env keys owned by plugin-registered terminal backends.
+
+    Computed at call time (not import time) because plugins register after
+    this module is imported. Treated as Tier-1: stripped from every spawned
+    subprocess unconditionally, exactly like MODAL_*/DAYTONA_API_KEY in
+    ``_ALWAYS_STRIP_KEYS``. Fail-soft to an empty set.
+    """
+    try:
+        from agent.terminal_env_registry import plugin_strip_env_keys
+
+        return plugin_strip_env_keys()
+    except Exception:
+        return frozenset()
+
+
+def _is_credential_shaped_password(key: str) -> bool:
+    """True for ``*_PASSWORD`` env names.
+
+    Password-shaped names are stripped by default from child environments;
+    terminal passthrough remains the explicit capability for commands that
+    genuinely need one.
+    """
+    return key.upper().endswith("_PASSWORD")
 
 
 def _inject_context_hermes_home(env: dict) -> None:
@@ -488,6 +525,8 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
         passthrough = _is_passthrough(key)
         if key in _HERMES_PROVIDER_ENV_BLOCKLIST and not passthrough:
             continue
+        if _is_credential_shaped_password(key) and not passthrough:
+            continue
         resolved = _resolve_passthrough_value(key, value) if passthrough else value
         if resolved is not None:
             sanitized[key] = resolved
@@ -503,6 +542,8 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
         else:
             passthrough = _is_passthrough(key)
             if key in _HERMES_PROVIDER_ENV_BLOCKLIST and not passthrough:
+                continue
+            if _is_credential_shaped_password(key) and not passthrough:
                 continue
             resolved = _resolve_passthrough_value(key, value) if passthrough else value
             if resolved is not None:
@@ -625,6 +666,14 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     # Tier 1 — always strip.
     for key in _ALWAYS_STRIP_KEYS:
         env.pop(key, None)
+    for key in _plugin_terminal_env_strip_keys():
+        env.pop(key, None)
+    # *PASSWORD values never belong in a non-terminal child (browser, ACP,
+    # computer-use, dep-ensure, TUI/Node host). Unlike the terminal path
+    # there is no skill-passthrough concept, so strip unconditionally.
+    for key in list(env):
+        if _is_credential_shaped_password(key):
+            env.pop(key, None)
     # Internal routing hints and Hermes-internal dynamic secrets
     # (``AUXILIARY_<TASK>_API_KEY`` / ``_BASE_URL`` side-LLM credentials,
     # ``GATEWAY_RELAY_*`` relay-auth material) must never reach a child,

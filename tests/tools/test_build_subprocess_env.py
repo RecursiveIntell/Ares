@@ -2,6 +2,7 @@
 factory for child-process environments (profile-home + secret-scrub owner).
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -97,3 +98,78 @@ def test_e2e_no_scrub_child_keeps_planted_secret(tmp_path, monkeypatch):
         env=env, capture_output=True, text=True, timeout=60, check=True,
     )
     assert out.stdout.strip() == "sk-FAKE-planted"
+
+
+# ---------------------------------------------------------------------------
+# E2E regression (#93082): cron/no_agent children keep bare `hermes` on PATH
+# ---------------------------------------------------------------------------
+
+
+def test_e2e_scrubbed_env_resolves_bare_hermes_under_minimal_parent_path(monkeypatch):
+    """Regression for #92998/#93082: a gateway launched by systemd/cron with a
+    minimal PATH (no hermes console-script dir) must still hand cron job
+    children an env whose PATH resolves bare ``hermes``.
+
+    Exercises the REAL factory and the REAL bin-dir resolver — no mocks of the
+    helpers. cron/scheduler._run_job_script builds its child env via exactly
+    this call (``build_subprocess_env()`` with scrub on).
+    """
+    import shutil
+
+    from tools.environments import local as local_mod
+
+    bin_dir = local_mod._resolve_hermes_bin_dir()
+    if not bin_dir or not os.path.isfile(
+        os.path.join(bin_dir, "hermes.exe" if os.name == "nt" else "hermes")
+    ):
+        pytest.skip("no real hermes console-script install available")
+
+    minimal_path = os.pathsep.join(["/usr/bin", "/bin"])
+    monkeypatch.setenv("PATH", minimal_path)
+    assert shutil.which("hermes", path=minimal_path) is None
+
+    env = build_subprocess_env(scrub_secrets=True)
+
+    resolved = shutil.which("hermes", path=env.get("PATH", ""))
+    assert resolved is not None, (
+        f"bare 'hermes' must resolve from the child PATH {env.get('PATH')!r}"
+    )
+    assert os.path.dirname(resolved) == bin_dir
+    assert env["PATH"].split(os.pathsep)[0] == bin_dir
+    env2 = build_subprocess_env(env, scrub_secrets=True)
+    assert env2["PATH"].split(os.pathsep).count(bin_dir) == 1
+
+
+def test_e2e_child_never_sees_bws_token_or_password(tmp_path, monkeypatch):
+    """BWS bootstrap tokens and password-shaped values stay out of children."""
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "0.abc123.def456:xyz789")
+    monkeypatch.setenv("DB_PASSWORD", "db-pass-9f2c1a")
+
+    env = build_subprocess_env()
+    code = (
+        "import os, json; "
+        "print(json.dumps({'bws': 'BWS_ACCESS_TOKEN' in os.environ, "
+        "'pw': 'DB_PASSWORD' in os.environ}))"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env, capture_output=True, text=True, timeout=60, check=True,
+    )
+    result = json.loads(out.stdout)
+    assert result["bws"] is False
+    assert result["pw"] is False
+
+
+def test_hermes_subprocess_env_strips_bws_token_and_password(monkeypatch):
+    """Non-terminal child environments also strip these values by default."""
+    from tools.environments.local import hermes_subprocess_env
+
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "0.abc123.def456:xyz789")
+    monkeypatch.setenv("DB_PASSWORD", "db-pass-9f2c1a")
+
+    env = hermes_subprocess_env()
+    assert "BWS_ACCESS_TOKEN" not in env
+    assert "DB_PASSWORD" not in env
