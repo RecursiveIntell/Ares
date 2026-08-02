@@ -383,13 +383,16 @@ def _is_hermes_internal_secret(key: str) -> bool:
       ``_ALWAYS_STRIP_KEYS``. Non-secret ``GATEWAY_RELAY_*`` routing hints
       (``GATEWAY_RELAY_URL``, ``GATEWAY_RELAY_PLATFORMS``, …) are NOT matched
       and remain visible.
-    - ``BWS_ACCESS_TOKEN`` — the Bitwarden Secrets Manager bootstrap token
-      (and any ``*_ACCESS_TOKEN`` name it is remapped to via
-      ``secrets.bitwarden.access_token_env``). Hermes's own vault credential;
-      no spawned child legitimately needs it. The one child that does — the
-      ``bws`` CLI — receives it explicitly via
-      ``build_subprocess_env(scrub_secrets=False)`` in
-      ``agent/secret_sources/bitwarden.py``, never through inheritance.
+    - ``BWS_ACCESS_TOKEN`` — the Bitwarden Secrets Manager bootstrap token,
+      under the **exact** name configured via ``secrets.bitwarden.access_token_env``
+      (default ``BWS_ACCESS_TOKEN``; may be remapped to any name, e.g.
+      ``MY_BWS_TOKEN``). Hermes's own vault credential; no spawned child
+      legitimately needs it. The one child that does — the ``bws`` CLI —
+      receives it explicitly via ``build_subprocess_env(scrub_secrets=False)``
+      in ``agent/secret_sources/bitwarden.py``, never through inheritance.
+      Only the exact configured name is matched (not a ``*_ACCESS_TOKEN``
+      suffix) so legitimate third-party access tokens stay
+      ``env_passthrough``-registerable — see ``tools/env_passthrough.py``.
 
     ``code_execution_tool.py`` already catches these via substring matching on
     ``KEY`` / ``SECRET`` / ``TOKEN``; the terminal backend's narrower name-based
@@ -412,21 +415,41 @@ def _is_hermes_internal_secret(key: str) -> bool:
         upper.endswith("_SECRET") or upper.endswith("_KEY") or upper.endswith("_TOKEN")
     ):
         return True
-    if upper.endswith("_ACCESS_TOKEN"):
-        # BWS bootstrap token and any access_token_env remap.  Hermes's own
-        # vault credential must never reach a child by inheritance.
+    if upper == _get_configured_bws_token_env().upper():
+        # Bitwarden Secrets Manager bootstrap token — the exact configured
+        # access_token_env name (default BWS_ACCESS_TOKEN; may be remapped to
+        # a non-suffix name like MY_BWS_TOKEN). Hermes's own vault credential
+        # must never reach a child by inheritance.
         return True
     return False
 
 
-def _plugin_terminal_env_strip_keys() -> frozenset:
-    """Credential env keys owned by plugin-registered terminal backends.
+_configured_bws_token_env: str | None = None
+_configured_bws_token_env_loaded = False
 
-    Computed at call time (not import time) because plugins register after
-    this module is imported. Treated as Tier-1: stripped from every spawned
-    subprocess unconditionally, exactly like MODAL_*/DAYTONA_API_KEY in
-    ``_ALWAYS_STRIP_KEYS``. Fail-soft to an empty set.
-    """
+
+def _get_configured_bws_token_env() -> str:
+    """Resolve the exact Bitwarden ``access_token_env`` name from config."""
+    global _configured_bws_token_env, _configured_bws_token_env_loaded
+    if not _configured_bws_token_env_loaded:
+        _configured_bws_token_env_loaded = True
+        name = "BWS_ACCESS_TOKEN"
+        try:
+            from hermes_cli.config import cfg_get, read_raw_config
+
+            configured = cfg_get(
+                read_raw_config(), "secrets", "bitwarden", "access_token_env"
+            )
+            if isinstance(configured, str) and configured.strip():
+                name = configured.strip()
+        except Exception:
+            pass
+        _configured_bws_token_env = name
+    return _configured_bws_token_env or "BWS_ACCESS_TOKEN"
+
+
+def _plugin_terminal_env_strip_keys() -> frozenset:
+    """Credential env keys owned by plugin-registered terminal backends."""
     try:
         from agent.terminal_env_registry import plugin_strip_env_keys
 
@@ -436,12 +459,7 @@ def _plugin_terminal_env_strip_keys() -> frozenset:
 
 
 def _is_credential_shaped_password(key: str) -> bool:
-    """True for ``*_PASSWORD`` env names.
-
-    Password-shaped names are stripped by default from child environments;
-    terminal passthrough remains the explicit capability for commands that
-    genuinely need one.
-    """
+    """True for ``*_PASSWORD`` env names."""
     return key.upper().endswith("_PASSWORD")
 
 
