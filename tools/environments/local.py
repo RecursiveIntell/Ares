@@ -672,13 +672,13 @@ def _plugin_terminal_env_strip_keys() -> frozenset:
 
 
 def _is_credential_shaped_password(key: str) -> bool:
-    """True for ``*_PASSWORD`` env names.
+    """True for password-class env names.
 
-    Password-shaped names are stripped by default from child environments;
-    terminal passthrough remains the explicit capability for commands that
-    genuinely need one.
+    Matches password-shaped names plus bare PASSWORD and *_PWD variants,
+    excluding PWD itself because it is the shell working-directory variable.
     """
-    return key.upper().endswith("_PASSWORD")
+    upper = key.upper()
+    return "PASSWORD" in upper or (upper.endswith("_PWD") and upper != "PWD")
 
 
 def _inject_context_hermes_home(env: dict) -> None:
