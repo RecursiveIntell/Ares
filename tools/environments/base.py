@@ -417,12 +417,17 @@ def _pipe_stdin(proc: subprocess.Popen, data: str) -> None:
 def _popen_bash(
     cmd: list[str], stdin_data: str | None = None, **kwargs
 ) -> subprocess.Popen:
-    """Spawn a subprocess with standard stdout/stderr/stdin setup.
+    """Spawn a terminal-backend child through the shared sanitized boundary.
 
-    If *stdin_data* is provided, writes it asynchronously via :func:`_pipe_stdin`.
-    Backends with special Popen needs (e.g. local's ``preexec_fn``) can bypass
-    this and call :func:`_pipe_stdin` directly.
+    Docker, SSH, and Singularity all converge here for model-authored command
+    execution.  Sanitize even when the caller supplies an ``env`` mapping so a
+    future backend cannot re-open ambient credential inheritance by omitting
+    the factory or passing an unsafe overlay.
     """
+    from tools.environments.local import build_subprocess_env
+
+    base_env = kwargs.pop("env", None)
+    kwargs["env"] = build_subprocess_env(base=base_env)
     kwargs.setdefault("creationflags", windows_hide_flags())
     proc = subprocess.Popen(
         cmd,

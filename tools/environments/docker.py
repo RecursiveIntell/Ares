@@ -1601,12 +1601,18 @@ class DockerEnvironment(BaseEnvironment):
         # Explicit docker_forward_env entries are an intentional opt-in and must
         # win over the generic Hermes secret blocklist. Only implicit passthrough
         # keys are filtered. Also strip Hermes-internal dynamic secrets
-        # (AUXILIARY_*_API_KEY / _BASE_URL, GATEWAY_RELAY_* auth) that the
-        # name-based blocklist doesn't cover — see _is_hermes_internal_secret.
+        # (AUXILIARY_*_API_KEY / _BASE_URL, GATEWAY_RELAY_* auth,
+        # BWS_ACCESS_TOKEN) that the name-based blocklist doesn't cover — see
+        # _is_hermes_internal_secret.  Naming an internal bootstrap credential
+        # in docker_forward_env must NOT export it into the container: the
+        # forwarding list is a capability boundary, not an unconditional bypass.
         _implicit_forward = {
             k for k in passthrough_keys if not _is_hermes_internal_secret(k)
         }
-        forward_keys = explicit_forward_keys | (_implicit_forward - _HERMES_PROVIDER_ENV_BLOCKLIST)
+        _explicit_forward = {
+            k for k in explicit_forward_keys if not _is_hermes_internal_secret(k)
+        }
+        forward_keys = _explicit_forward | (_implicit_forward - _HERMES_PROVIDER_ENV_BLOCKLIST)
         hermes_env = _load_hermes_env_vars() if forward_keys else {}
         unset_names: set[str] = set()
         for key in sorted(forward_keys):
