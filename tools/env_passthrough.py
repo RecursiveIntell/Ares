@@ -69,7 +69,7 @@ def _is_hermes_provider_credential(name: str) -> bool:
     """
     try:
         from tools.environments.local import (
-            _HERMES_PROVIDER_ENV_BLOCKLIST,
+            _is_blocked_provider_env,
             _is_hermes_internal_secret,
         )
     except Exception as e:
@@ -87,7 +87,7 @@ def _is_hermes_provider_credential(name: str) -> bool:
     # as passthrough and tunnel them into an execute_code / terminal child.
     if _is_hermes_internal_secret(name):
         return True
-    return name in _HERMES_PROVIDER_ENV_BLOCKLIST
+    return _is_blocked_provider_env(name)
 
 
 def register_env_passthrough(var_names: Iterable[str]) -> None:

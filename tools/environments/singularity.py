@@ -22,10 +22,33 @@ from tools.environments.base import (
     _save_json_store,
     sanitize_task_id_for_path,
 )
+from tools.environments.local import build_subprocess_env
 
 logger = logging.getLogger(__name__)
 
 _SNAPSHOT_STORE = get_hermes_home() / "singularity_snapshots.json"
+
+# Apptainer accepts these exact variables for private Docker-registry pulls.
+# Image construction gets this narrow capability set back after the common
+# sanitizer runs; it never receives the rest of the trusted Hermes env.
+_REGISTRY_AUTH_ENV_VARS = (
+    "APPTAINER_DOCKER_USERNAME",
+    "APPTAINER_DOCKER_PASSWORD",
+    "SINGULARITY_DOCKER_USERNAME",
+    "SINGULARITY_DOCKER_PASSWORD",
+    "DOCKER_USERNAME",
+    "DOCKER_PASSWORD",
+)
+
+
+def _singularity_subprocess_env(*, include_registry_auth: bool = False) -> dict[str, str]:
+    env = build_subprocess_env()
+    if include_registry_auth:
+        for key in _REGISTRY_AUTH_ENV_VARS:
+            value = os.environ.get(key)
+            if value is not None:
+                env[key] = value
+    return env
 
 
 def _find_singularity_executable() -> str:
@@ -47,6 +70,7 @@ def _ensure_singularity_available() -> str:
     try:
         result = subprocess.run(
             [exe, "version"], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10,
+            env=_singularity_subprocess_env(),
             stdin=subprocess.DEVNULL,
         )
     except FileNotFoundError:
@@ -130,10 +154,9 @@ def _get_or_build_sif(image: str, executable: str = "apptainer") -> str:
         tmp_dir = cache_dir / "tmp"
         tmp_dir.mkdir(parents=True, exist_ok=True)
 
-        # apptainer/singularity build: external tool, may need registry
-        # credentials from the user env — exact preservation.
-        from tools.environments.local import build_subprocess_env
-        env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=False)
+        # Image construction may need private-registry auth, but only the exact
+        # Apptainer/Singularity Docker credential contract is reintroduced.
+        env = _singularity_subprocess_env(include_registry_auth=True)
         env["APPTAINER_TMPDIR"] = str(tmp_dir)
         env["APPTAINER_CACHEDIR"] = str(cache_dir)
 
@@ -228,7 +251,10 @@ class SingularityEnvironment(BaseEnvironment):
         cmd.extend([str(self.image), self.instance_id])
 
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=120, stdin=subprocess.DEVNULL)
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=120,
+                env=_singularity_subprocess_env(), stdin=subprocess.DEVNULL,
+            )
             if result.returncode != 0:
                 raise RuntimeError(f"Failed to start instance: {result.stderr}")
             self._instance_started = True
@@ -260,6 +286,7 @@ class SingularityEnvironment(BaseEnvironment):
                 subprocess.run(
                     [self.executable, "instance", "stop", self.instance_id],
                     capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=30,
+                    env=_singularity_subprocess_env(),
                     stdin=subprocess.DEVNULL,
                 )
                 logger.info("Singularity instance %s stopped", self.instance_id)
