@@ -238,6 +238,7 @@ const DESKTOP_COMMAND_SPECS: readonly DesktopCommandSpec[] = [
   {
     name: '/llm-pipeline',
     description: 'Inspect or configure the LLM pipeline',
+    aliases: ['/llm_pipeline'],
     surface: exec(),
     argumentMode: 'mixed'
   },
