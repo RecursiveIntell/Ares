@@ -12877,9 +12877,7 @@ if (!IS_WINDOWS) {
       return
     }
 
-    rememberLog(
-      `[hermes] GPU process gone (exitCode=${details.exitCode ?? '?'}); forcing chat window repaint`
-    )
+    rememberLog(`[hermes] GPU process gone (exitCode=${details.exitCode ?? '?'}); forcing chat window repaint`)
 
     setTimeout(() => repaintController.kickAll(), GPU_PROCESS_RESTART_GRACE_MS)
   })
