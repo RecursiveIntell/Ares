@@ -649,6 +649,31 @@ def _compute_tool_definitions(
     except Exception as e:  # pragma: no cover — never break tool loading
         logger.warning("Tool search assembly skipped: %s", e)
 
+    # ── Core-tool lazy schema loading ─────────────────────────────────────
+    # Compresses the ALWAYS-eager core tool surface (terminal, file, web,
+    # browser, delegate, memory, skills, ...) behind a compact capability index
+    # + one ``request_tool_schema`` bridge. Tool Search handles MCP/plugin bloat;
+    # this handles the core surface it deliberately never defers (#6839).
+    # Opt-in only (tools.core_lazy.enabled, default "off") and fail-open.
+    try:
+        from tools.lazy_core_tools import assemble_core_tool_defs as _assemble_core
+        from tools.lazy_core_tools import load_config as _load_core_cfg
+        _core_cfg = _load_core_cfg()
+        if _core_cfg.enabled != "off":
+            _core_assembly = _assemble_core(
+                filtered_tools, context_length=_resolve_active_context_length(),
+                config=_core_cfg,
+            )
+            if _core_assembly.activated and not quiet_mode:
+                print(
+                    f"🪶 Core-tool lazy load: {_core_assembly.deferred_count} core tools "
+                    f"deferred (~{_core_assembly.deferred_tokens} tokens) behind "
+                    f"request_tool_schema; index ~{_core_assembly.index_tokens} tokens."
+                )
+            filtered_tools = _core_assembly.tool_defs
+    except Exception as e:  # pragma: no cover — never break tool loading
+        logger.warning("Core-tool lazy assembly skipped: %s", e)
+
     return filtered_tools
 
 
@@ -1345,6 +1370,29 @@ def handle_function_call(
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
             )
+
+    # ── Core-tool lazy schema bridge ────────────────────────────────────────
+    # request_tool_schema hydrates one core tool's full schema on demand. It
+    # never executes a tool; it only returns the schema so the model can call
+    # the tool directly next turn. Scoped to the session's granted core tools.
+    try:
+        from tools.lazy_core_tools import REQUEST_SCHEMA_NAME as _CL_NAME
+        from tools.lazy_core_tools import dispatch_request_tool_schema as _cl_dispatch
+        if function_name == _CL_NAME:
+            _cl_current = []
+            try:
+                _cl_current = get_tool_definitions(
+                    enabled_toolsets=enabled_toolsets,
+                    disabled_toolsets=disabled_toolsets,
+                    quiet_mode=True, skip_tool_search_assembly=True,
+                ) or []
+            except Exception:
+                _cl_current = []
+            return _return_bridge_result(
+                _cl_dispatch(function_args or {}, current_tool_defs=_cl_current)
+            )
+    except Exception as e:  # pragma: no cover
+        logger.warning("core_lazy bridge dispatch skipped: %s", e)
 
     _tool_original_args = dict(function_args)
     if not skip_tool_request_middleware:

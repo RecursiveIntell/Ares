@@ -2730,6 +2730,27 @@ DEFAULT_CONFIG = {
             # estimate), regardless of context size. Range 200..60000.
             "listing_max_tokens": 4000,
         },
+        # Core-tool lazy schema loading (see tools/lazy_core_tools.py).
+        # Compresses the always-eager CORE tool surface (terminal, file, web,
+        # browser, delegate, memory, skills, ...) behind a compact capability
+        # index + a single request_tool_schema bridge, so a fresh session pays
+        # a few hundred tokens instead of ~60K of full core schemas (#6839).
+        # This is OFF by default and composes with Tool Search (which only
+        # defers MCP/plugin tools). Opt in to activate.
+        "core_lazy": {
+            # "off" — disable; tools-array assembly is a pure pass-through.
+            # "on"  — always collapse the core surface behind the bridge.
+            # "auto" — reserved for future context-aware activation (acts as
+            #         "on" today so the behavior is deterministic and explicit).
+            "enabled": "off",
+            # Core tool names to ALWAYS keep eager (safety-critical / hot path).
+            # These still appear in the index but their full schema is never
+            # deferred. Empty = none.
+            "always_include": [],
+            # Hard cap on the compact index size in tokens (chars/4 estimate).
+            # Range 200..60000.
+            "index_max_tokens": 1500,
+        },
     },
 
     # Logging — controls file logging to ~/.hermes/logs/.
