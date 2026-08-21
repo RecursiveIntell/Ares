@@ -691,6 +691,21 @@ class BaseEnvironment(ABC):
         self.cwd = cwd
         self.timeout = timeout
         self.env = env or {}
+        self._profile_env_boundary = None
+        _multiplex_active = False
+        if self._profile_scoped_passthrough:
+            try:
+                from agent.secret_scope import build_profile_env_boundary, is_multiplex_active
+
+                _multiplex_active = is_multiplex_active()
+                if _multiplex_active:
+                    self._profile_env_boundary = build_profile_env_boundary()
+            except Exception as exc:
+                if _multiplex_active:
+                    raise RuntimeError(
+                        "profile environment boundary could not be captured for "
+                        "the execution environment"
+                    ) from exc
 
         self._session_id = uuid.uuid4().hex[:12]
         temp_dir = self.get_temp_dir().rstrip("/") or "/"
@@ -750,9 +765,11 @@ class BaseEnvironment(ABC):
             from agent.secret_scope import is_multiplex_active
             if is_multiplex_active():
                 from tools.env_passthrough import get_all_passthrough
+                boundary = getattr(self, "_profile_env_boundary", None)
                 names = (
                     *get_all_passthrough(),
                     *self._additional_profile_scoped_passthrough_names(),
+                    *(boundary.source_owned_names if boundary is not None else ()),
                 )
                 self._snapshot_passthrough_names.update(
                     name
