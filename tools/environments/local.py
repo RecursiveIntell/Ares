@@ -574,8 +574,45 @@ def _inject_session_context_env(env: dict) -> None:
             env.pop(var_name, None)
 
 
-def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
-    """Filter Hermes-managed secrets from a subprocess environment."""
+def _sanitize_subprocess_env(
+    base_env: dict | None,
+    extra_env: dict | None = None,
+    *,
+    profile_home: str | os.PathLike | None = None,
+    source_profile_home: str | os.PathLike | None = None,
+    enforce_profile_boundary: bool = False,
+) -> dict:
+    """Filter Hermes-managed and cross-profile secrets from a child environment.
+
+    In multiplex mode the exact source-profile ownership boundary is applied
+    before the existing provider/blocklist policy. Explicit homes let
+    standalone workers such as Kanban enforce the same rule without gateway
+    process-global state.
+    """
+    protected_base = dict(base_env or {})
+    boundary = None
+    boundary_active = enforce_profile_boundary
+    try:
+        from agent.secret_scope import (
+            build_profile_env_boundary,
+            is_multiplex_active,
+        )
+
+        boundary_active = boundary_active or is_multiplex_active()
+        if boundary_active:
+            boundary = build_profile_env_boundary(
+                source_home=source_profile_home,
+                target_home=profile_home,
+            )
+            protected_base = boundary.sanitize(protected_base)
+    except Exception as exc:
+        if enforce_profile_boundary or boundary_active:
+            raise RuntimeError(
+                "profile environment boundary could not be constructed; refusing "
+                "to spawn with ambient environment"
+            ) from exc
+        logger.debug("profile environment boundary unavailable outside multiplex", exc_info=True)
+
     try:
         from tools.env_passthrough import (
             is_env_passthrough as _is_passthrough,
@@ -588,7 +625,7 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     sanitized: dict[str, str] = {}
     _plugin_strip = _plugin_terminal_env_strip_keys()
 
-    for key, value in (base_env or {}).items():
+    for key, value in protected_base.items():
         if key.upper().startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             continue
         if _is_hermes_internal_secret(key):
@@ -623,6 +660,12 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
             resolved = _resolve_passthrough_value(key, value) if passthrough else value
             if resolved is not None:
                 sanitized[key] = resolved
+
+    # Apply the profile boundary after all explicit force-prefix values have
+    # been unwrapped. This prevents ``extra_env`` from reintroducing a
+    # source-owned credential after the initial protected-base sanitization.
+    if boundary_active and boundary is not None:
+        sanitized = boundary.sanitize(sanitized)
 
     _inject_context_hermes_home(sanitized)
 
@@ -820,6 +863,9 @@ def build_subprocess_env(
     inherit_profile_home: bool = True,
     scrub_secrets: bool = True,
     extra: "Mapping[str, str] | None" = None,
+    profile_home: str | os.PathLike | None = None,
+    source_profile_home: str | os.PathLike | None = None,
+    enforce_profile_boundary: bool = False,
 ) -> dict[str, str]:
     """Single factory for building a child-process environment.
 
@@ -857,6 +903,10 @@ def build_subprocess_env(
       overrides (e.g. a session-scoped ``HERMES_HOME``) always win.  On the
       scrub path it is forwarded as ``_sanitize_subprocess_env``'s
       ``extra_env`` (same force-prefix / blocklist handling as today).
+    * ``profile_home`` / ``source_profile_home`` — optional explicit target
+      and source profile homes.  When supplied with
+      ``enforce_profile_boundary=True`` they make the profile ownership policy
+      usable by standalone workers such as Kanban.
     """
     if scrub_secrets:
         # _sanitize_subprocess_env already performs HERMES_HOME override
@@ -865,6 +915,9 @@ def build_subprocess_env(
         return _sanitize_subprocess_env(
             dict(base) if base is not None else os.environ.copy(),
             dict(extra) if extra else None,
+            profile_home=profile_home,
+            source_profile_home=source_profile_home,
+            enforce_profile_boundary=enforce_profile_boundary,
         )
 
     env: dict[str, str] = dict(base) if base is not None else os.environ.copy()
@@ -1435,9 +1488,32 @@ def _make_run_env(env: dict) -> dict:
         _resolve_passthrough_value = lambda _name, fallback: fallback  # noqa: E731
 
     merged = dict(os.environ | env)
+    _multiplex_active = False
+    _boundary = None
+    try:
+        from agent.secret_scope import build_profile_env_boundary, is_multiplex_active
+
+        _multiplex_active = is_multiplex_active()
+        if _multiplex_active:
+            _boundary = build_profile_env_boundary()
+            merged = _boundary.sanitize(merged)
+    except Exception as exc:
+        if _multiplex_active:
+            raise RuntimeError(
+                "profile environment boundary could not be constructed; refusing "
+                "to run with ambient environment"
+            ) from exc
+        logger.debug("profile environment boundary unavailable outside multiplex", exc_info=True)
     run_env = {}
+    explicit_force_names = {
+        key
+        for key in env
+        if isinstance(key, str) and key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX)
+    }
     for k, v in merged.items():
         if k.upper().startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
+            if k not in explicit_force_names:
+                continue
             real_key = k[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
             if _is_hermes_internal_secret(real_key):
                 continue
@@ -1453,6 +1529,9 @@ def _make_run_env(env: dict) -> dict:
             value = _resolve_passthrough_value(k, v) if passthrough else v
             if value is not None:
                 run_env[k] = value
+    if _multiplex_active and _boundary is not None:
+        run_env = _boundary.sanitize(run_env)
+
     path_key = _path_env_key(run_env)
     if path_key is not None:
         new_path = _append_missing_sane_path_entries(run_env.get(path_key, ""))
