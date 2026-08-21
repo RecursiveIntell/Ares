@@ -10757,12 +10757,9 @@ def _default_spawn(
     for key in _VAR_MAP:
         env.pop(key, None)
 
-    # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
-    # (fallback_providers, toolsets, agent settings, etc.) instead of the root
-    # config.  Without this, the child can fall back to the default profile
-    # before _apply_profile_override() runs.
-    if target_home is not None:
-        env["HERMES_HOME"] = target_home
+    # build_subprocess_env installs the target HERMES_HOME before applying the
+    # subprocess HOME policy, so both identities already point at the assignee
+    # profile here.
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
