@@ -667,7 +667,14 @@ def _sanitize_subprocess_env(
     if boundary_active and boundary is not None:
         sanitized = boundary.sanitize(sanitized)
 
-    _inject_context_hermes_home(sanitized)
+    # An explicit target profile is authoritative for both HERMES_HOME and the
+    # derived subprocess HOME policy.  Install it before evaluating
+    # apply_subprocess_home_env(); otherwise standalone workers can get split
+    # identity (target HERMES_HOME with the dispatcher's HOME).
+    if profile_home is not None:
+        sanitized["HERMES_HOME"] = str(profile_home)
+    else:
+        _inject_context_hermes_home(sanitized)
 
     from hermes_constants import apply_subprocess_home_env
     apply_subprocess_home_env(sanitized)
