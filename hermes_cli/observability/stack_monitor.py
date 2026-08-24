@@ -318,9 +318,17 @@ def observe_lifecycle(hook_name: str, **kwargs: Any) -> None:
         kind, _ = _kind_status(hook_name, kwargs)
         _OPEN_EVENTS.pop((session_id, request_id, kind), None)
     if hook_name == "on_session_end":
-        for key, pending in list(_OPEN_EVENTS.items()):
-            if key[0] != session_id:
-                continue
+        pending_items = [
+            (key, pending)
+            for key, pending in _OPEN_EVENTS.items()
+            if key[0] == session_id
+        ]
+        if not pending_items:
+            # Some legacy/transport paths finalize without forwarding the
+            # session identity on every hook. Do not lose a known open event;
+            # close it as an explicitly unmatched terminal observation.
+            pending_items = list(_OPEN_EVENTS.items())
+        for key, pending in pending_items:
             producer.sequence += 1
             producer.emit(
                 build_envelope(
