@@ -344,6 +344,17 @@ def shutdown() -> None:
     global _PRODUCER
     with _PRODUCER_LOCK:
         if _PRODUCER is not None:
+            for key, pending in list(_OPEN_EVENTS.items()):
+                _PRODUCER.sequence += 1
+                _PRODUCER.emit(
+                    build_envelope(
+                        "terminal_observation_gap",
+                        pending,
+                        sequence=_PRODUCER.sequence,
+                    )
+                )
+                _OPEN_EVENTS.pop(key, None)
+            _PRODUCER.flush()
             _PRODUCER.close()
             _PRODUCER = None
 
