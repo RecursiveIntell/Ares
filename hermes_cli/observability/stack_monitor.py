@@ -345,7 +345,11 @@ def observe_lifecycle(hook_name: str, **kwargs: Any) -> None:
 
 
 def handles_hook(hook_name: str) -> bool:
-    return hook_name in _HANDLED_HOOKS and _producer() is not None
+    # Hook admission follows the enabled policy, not a point-in-time socket
+    # probe. The collector may start/restart after the agent does; suppressing
+    # the lifecycle hook when the socket is briefly absent loses the event
+    # entirely instead of recording a bounded drop.
+    return hook_name in _HANDLED_HOOKS and _enabled(_config())
 
 
 def shutdown() -> None:
