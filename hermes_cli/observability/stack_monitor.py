@@ -92,6 +92,8 @@ def _enabled(config: Mapping[str, Any]) -> bool:
 
 
 def _kind_status(hook_name: str, kwargs: Mapping[str, Any]) -> tuple[str, str]:
+    if hook_name == "terminal_observation_gap":
+        return str(kwargs.get("gap_kind") or "health"), "cancelled"
     if hook_name in {"pre_api_request", "pre_llm_call"}:
         return "llm_call", "started"
     if hook_name in {"post_api_request", "on_session_end"}:
@@ -147,6 +149,9 @@ def build_envelope(hook_name: str, kwargs: Mapping[str, Any], *, sequence: int) 
     if hook_name == "api_request_error":
         payload["retryable"] = bool(kwargs.get("retryable", False))
         payload["retry_count"] = int(kwargs.get("retry_count") or 0)
+    if hook_name == "terminal_observation_gap":
+        payload["reason"] = "session_end_without_terminal_hook"
+        payload["missing_terminal_hook"] = _bounded(kwargs.get("missing_terminal_hook"))
 
     timing: dict[str, Any] = {}
     for source, target in (
@@ -214,6 +219,19 @@ class _Producer:
             with self._lock:
                 self.dropped += 1
 
+    def flush(self, timeout: float = 1.0) -> None:
+        if timeout <= 0:
+            return
+        finished = threading.Event()
+
+        def wait_for_queue() -> None:
+            self.queue.join()
+            finished.set()
+
+        waiter = threading.Thread(target=wait_for_queue, daemon=True)
+        waiter.start()
+        finished.wait(timeout)
+
     def _run(self) -> None:
         stream: socket.socket | None = None
         while not self.stop.is_set() or not self.queue.empty():
@@ -252,6 +270,7 @@ class _Producer:
 
 _PRODUCER: _Producer | None = None
 _PRODUCER_LOCK = threading.Lock()
+_OPEN_EVENTS: dict[tuple[str, str, str], dict[str, Any]] = {}
 
 
 def _producer() -> _Producer | None:
@@ -283,8 +302,38 @@ def observe_lifecycle(hook_name: str, **kwargs: Any) -> None:
     producer = _producer()
     if producer is None:
         return
+    session_id = _bounded(kwargs.get("session_id")) or ""
+    request_id = _bounded(kwargs.get("api_request_id") or kwargs.get("tool_call_id")) or ""
+    if hook_name in {"pre_api_request", "pre_tool_call"} and request_id:
+        kind, _ = _kind_status(hook_name, kwargs)
+        _OPEN_EVENTS[(session_id, request_id, kind)] = {
+            "session_id": session_id,
+            "request_id": request_id,
+            "gap_kind": kind,
+            "missing_terminal_hook": (
+                "post_api_request" if kind == "llm_call" else "post_tool_call"
+            ),
+        }
+    elif hook_name in {"post_api_request", "api_request_error", "post_tool_call"} and request_id:
+        kind, _ = _kind_status(hook_name, kwargs)
+        _OPEN_EVENTS.pop((session_id, request_id, kind), None)
+    if hook_name == "on_session_end":
+        for key, pending in list(_OPEN_EVENTS.items()):
+            if key[0] != session_id:
+                continue
+            producer.sequence += 1
+            producer.emit(
+                build_envelope(
+                    "terminal_observation_gap",
+                    pending,
+                    sequence=producer.sequence,
+                )
+            )
+            _OPEN_EVENTS.pop(key, None)
     producer.sequence += 1
     producer.emit(build_envelope(hook_name, kwargs, sequence=producer.sequence))
+    if hook_name == "on_session_end":
+        producer.flush()
 
 
 def handles_hook(hook_name: str) -> bool:

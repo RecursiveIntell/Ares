@@ -40,6 +40,23 @@ def test_build_envelope_excludes_content_and_secrets():
     assert "result" not in encoded
 
 
+def test_terminal_gap_is_an_explicit_negative_witness():
+    event = stack_monitor.build_envelope(
+        "terminal_observation_gap",
+        {
+            "session_id": "session-1",
+            "request_id": "request-1",
+            "gap_kind": "llm_call",
+            "missing_terminal_hook": "post_api_request",
+        },
+        sequence=2,
+    )
+    assert event["kind"] == "llm_call"
+    assert event["status"] == "cancelled"
+    assert event["payload"]["reason"] == "session_end_without_terminal_hook"
+    assert event["payload"]["missing_terminal_hook"] == "post_api_request"
+
+
 def test_observe_lifecycle_sends_bounded_frame(monkeypatch):
     socket_path = "/tmp/ares-observability-test.sock"
     try:
