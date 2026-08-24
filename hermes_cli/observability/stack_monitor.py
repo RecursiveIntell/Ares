@@ -149,6 +149,12 @@ def build_envelope(hook_name: str, kwargs: Mapping[str, Any], *, sequence: int) 
     if hook_name == "api_request_error":
         payload["retryable"] = bool(kwargs.get("retryable", False))
         payload["retry_count"] = int(kwargs.get("retry_count") or 0)
+    if hook_name == "on_session_end" and isinstance(kwargs.get("coverage"), Mapping):
+        payload["coverage"] = {
+            str(key): int(value)
+            for key, value in kwargs["coverage"].items()
+            if isinstance(value, int) and value >= 0
+        }
     if hook_name == "terminal_observation_gap":
         payload["reason"] = "session_end_without_terminal_hook"
         payload["missing_terminal_hook"] = _bounded(kwargs.get("missing_terminal_hook"))
@@ -271,6 +277,7 @@ class _Producer:
 _PRODUCER: _Producer | None = None
 _PRODUCER_LOCK = threading.Lock()
 _OPEN_EVENTS: dict[tuple[str, str, str], dict[str, Any]] = {}
+_SESSION_COUNTS: dict[str, dict[str, int]] = {}
 
 
 def _producer() -> _Producer | None:
@@ -306,6 +313,11 @@ def observe_lifecycle(hook_name: str, **kwargs: Any) -> None:
     request_id = _bounded(kwargs.get("api_request_id") or kwargs.get("tool_call_id")) or ""
     if hook_name in {"pre_api_request", "pre_tool_call"} and request_id:
         kind, _ = _kind_status(hook_name, kwargs)
+        counts = _SESSION_COUNTS.setdefault(
+            session_id,
+            {"started_llm": 0, "terminal_llm": 0, "started_tool": 0, "terminal_tool": 0},
+        )
+        counts[f"started_{'llm' if kind == 'llm_call' else 'tool'}"] += 1
         _OPEN_EVENTS[(session_id, request_id, kind)] = {
             "session_id": session_id,
             "request_id": request_id,
@@ -316,8 +328,18 @@ def observe_lifecycle(hook_name: str, **kwargs: Any) -> None:
         }
     elif hook_name in {"post_api_request", "api_request_error", "post_tool_call"} and request_id:
         kind, _ = _kind_status(hook_name, kwargs)
+        counts = _SESSION_COUNTS.setdefault(
+            session_id,
+            {"started_llm": 0, "terminal_llm": 0, "started_tool": 0, "terminal_tool": 0},
+        )
+        counts[f"terminal_{'llm' if kind == 'llm_call' else 'tool'}"] += 1
         _OPEN_EVENTS.pop((session_id, request_id, kind), None)
     if hook_name == "on_session_end":
+        kwargs = dict(kwargs)
+        kwargs["coverage"] = _SESSION_COUNTS.pop(
+            session_id,
+            {"started_llm": 0, "terminal_llm": 0, "started_tool": 0, "terminal_tool": 0},
+        )
         pending_items = [
             (key, pending)
             for key, pending in _OPEN_EVENTS.items()

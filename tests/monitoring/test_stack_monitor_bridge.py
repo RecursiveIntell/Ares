@@ -57,6 +57,28 @@ def test_terminal_gap_is_an_explicit_negative_witness():
     assert event["payload"]["missing_terminal_hook"] == "post_api_request"
 
 
+def test_session_end_exposes_started_vs_terminal_coverage():
+    event = stack_monitor.build_envelope(
+        "on_session_end",
+        {
+            "session_id": "session-1",
+            "coverage": {
+                "started_llm": 2,
+                "terminal_llm": 0,
+                "started_tool": 1,
+                "terminal_tool": 0,
+            },
+        },
+        sequence=3,
+    )
+    assert event["payload"]["coverage"] == {
+        "started_llm": 2,
+        "terminal_llm": 0,
+        "started_tool": 1,
+        "terminal_tool": 0,
+    }
+
+
 def test_observe_lifecycle_sends_bounded_frame(monkeypatch):
     socket_path = "/tmp/ares-observability-test.sock"
     try:
