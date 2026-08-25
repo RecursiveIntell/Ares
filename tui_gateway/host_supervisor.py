@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from hermes_constants import get_hermes_home
-from tools.environments.local import hermes_subprocess_env
+from tools.environments.local import build_subprocess_env, hermes_subprocess_env
 
 logger = logging.getLogger(__name__)
 _Thread = threading.Thread
@@ -316,9 +316,8 @@ class HostSupervisor:
         self._hello_event.clear()
         self._hello = {}
         env = hermes_subprocess_env(inherit_credentials=True)
-        env.update(os.environ)
         if self.env:
-            env.update(self.env)
+            env.update(build_subprocess_env(base={}, extra=self.env))
         env["HERMES_COMPUTE_HOST_HEARTBEAT_SECS"] = str(self.heartbeat_secs)
         env.setdefault("PYTHONPATH", str(_repo_root()))
         if str(_repo_root()) not in env["PYTHONPATH"].split(os.pathsep):

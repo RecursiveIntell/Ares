@@ -209,12 +209,18 @@ _CONTAINER_ENV_FORWARD_PREFIXES = ("APPTAINERENV_", "SINGULARITYENV_")
 
 
 def _credential_target_env_name(key: str) -> str:
-    """Return the effective credential name after known forwarding wrappers."""
-    upper = key.upper()
-    for prefix in _CONTAINER_ENV_FORWARD_PREFIXES:
-        if upper.startswith(prefix):
-            return key[len(prefix):]
-    return key
+    """Return the effective credential name after nested forwarding wrappers."""
+    value = str(key)
+    changed = True
+    while changed:
+        changed = False
+        upper = value.upper()
+        for prefix in _CONTAINER_ENV_FORWARD_PREFIXES:
+            if upper.startswith(prefix):
+                value = value[len(prefix):]
+                changed = True
+                break
+    return value
 
 # Hermes-managed AWS *inference* credentials for ``auth_type="aws_sdk"``
 # providers (Bedrock).  Scoped DELIBERATELY NARROW: this lists only the
@@ -358,7 +364,25 @@ _HERMES_PROVIDER_ENV_BLOCKLIST_UPPER = frozenset(
 
 def _build_model_provider_env_names() -> frozenset[str]:
     """Return exact model-provider credential and endpoint env names."""
-    names: set[str] = set()
+    names: set[str] = {
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "COPILOT_GITHUB_TOKEN",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_PROFILE",
+        "AWS_DEFAULT_PROFILE",
+        "AWS_REGION",
+        "AWS_DEFAULT_REGION",
+        "AWS_CONFIG_FILE",
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "AWS_ROLE_ARN",
+        "AWS_ROLE_SESSION_NAME",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "AWS_EC2_METADATA_DISABLED",
+    }
     try:
         from hermes_cli.auth import PROVIDER_REGISTRY
 
@@ -527,6 +551,8 @@ def _finalize_child_env_policy(
     env: dict[str, str],
     is_passthrough,
     explicit_force_targets=(),
+    *,
+    enforce_password_policy: bool = False,
 ) -> dict[str, str]:
     """Reapply generic policy after profile values are overlaid.
 
@@ -557,7 +583,11 @@ def _finalize_child_env_policy(
             env.pop(key, None)
         elif _is_blocked_provider_env(target_key) and not allow_credential:
             env.pop(key, None)
-        elif _is_credential_shaped_password(target_key) and not allow_credential:
+        elif (
+            enforce_password_policy
+            and _is_credential_shaped_password(target_key)
+            and not allow_credential
+        ):
             env.pop(key, None)
     return env
 
@@ -682,7 +712,7 @@ def _sanitize_subprocess_env(
         passthrough = _is_passthrough(key)
         if _is_blocked_provider_env(key) and not passthrough:
             continue
-        if _is_credential_shaped_password(key) and not passthrough:
+        if boundary_active and _is_credential_shaped_password(key) and not passthrough:
             continue
         resolved = _resolve_passthrough_value(key, value) if passthrough else value
         if resolved is not None:
@@ -702,7 +732,7 @@ def _sanitize_subprocess_env(
             passthrough = _is_passthrough(key)
             if _is_blocked_provider_env(key) and not passthrough:
                 continue
-            if _is_credential_shaped_password(key) and not passthrough:
+            if boundary_active and _is_credential_shaped_password(key) and not passthrough:
                 continue
             resolved = _resolve_passthrough_value(key, value) if passthrough else value
             if resolved is not None:
@@ -721,6 +751,7 @@ def _sanitize_subprocess_env(
             for key in (extra_env or {})
             if key.upper().startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX)
         },
+        enforce_password_policy=boundary_active,
     )
 
     # An explicit target profile is authoritative for both HERMES_HOME and the
@@ -862,7 +893,8 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
 
     from agent.secret_scope import build_profile_env_boundary, is_multiplex_active
 
-    if is_multiplex_active():
+    multiplex_active = is_multiplex_active()
+    if multiplex_active:
         boundary = build_profile_env_boundary()
         env = boundary.sanitize(env)
         if inherit_credentials:
@@ -876,14 +908,19 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     for key in list(env):
         if _credential_target_env_name(key).upper() in _ALWAYS_STRIP_KEYS:
             env.pop(key, None)
-    for key in _plugin_terminal_env_strip_keys():
-        env.pop(key, None)
-    # *PASSWORD values never belong in a non-terminal child (browser, ACP,
-    # computer-use, dep-ensure, TUI/Node host). Unlike the terminal path
-    # there is no skill-passthrough concept, so strip unconditionally.
+    plugin_strip = {
+        _credential_target_env_name(name).upper()
+        for name in _plugin_terminal_env_strip_keys()
+    }
     for key in list(env):
-        if _is_credential_shaped_password(key):
+        if _credential_target_env_name(key).upper() in plugin_strip:
             env.pop(key, None)
+    # Password-shaped variables are provenance-isolated only when crossing
+    # profile authority. Single-profile helpers retain the trusted shell contract.
+    if multiplex_active:
+        for key in list(env):
+            if _is_credential_shaped_password(key):
+                env.pop(key, None)
     # Internal routing hints and Hermes-internal dynamic secrets
     # (``AUXILIARY_<TASK>_API_KEY`` / ``_BASE_URL`` side-LLM credentials,
     # ``GATEWAY_RELAY_*`` relay-auth material) must never reach a child,
@@ -1598,7 +1635,7 @@ def _make_run_env(env: dict) -> dict:
             passthrough = _is_passthrough(k)
             if _is_blocked_provider_env(k) and not passthrough:
                 continue
-            if _is_credential_shaped_password(k) and not passthrough:
+            if _multiplex_active and _is_credential_shaped_password(k) and not passthrough:
                 continue
             value = _resolve_passthrough_value(k, v) if passthrough else v
             if value is not None:
@@ -1612,6 +1649,7 @@ def _make_run_env(env: dict) -> dict:
             key[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
             for key in explicit_force_names
         },
+        enforce_password_policy=_multiplex_active,
     )
 
     path_key = _path_env_key(run_env)
