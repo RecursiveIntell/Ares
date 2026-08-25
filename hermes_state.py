@@ -4458,6 +4458,104 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 self._warn_fts5_unavailable(exc)
             return False
 
+    def mobile_request_outcome_reserve(
+        self,
+        *,
+        scope_key: str,
+        method: str,
+        idempotency_key: str,
+        payload_digest: str,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """Atomically reserve or replay one application-level mutation key."""
+        timestamp = float(time.time() if now is None else now)
+
+        def _write(conn):
+            row = conn.execute(
+                "SELECT scope_key, method, idempotency_key, payload_digest, state, "
+                "result_json, error_json, created_at, updated_at "
+                "FROM mobile_request_outcomes WHERE scope_key = ? AND method = ? "
+                "AND idempotency_key = ?",
+                (scope_key, method, idempotency_key),
+            ).fetchone()
+            if row is not None:
+                data = dict(row)
+                data["created"] = False
+                data["conflict"] = data["payload_digest"] != payload_digest
+                return data
+            conn.execute(
+                "INSERT INTO mobile_request_outcomes "
+                "(scope_key, method, idempotency_key, payload_digest, state, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, 'in_progress', ?, ?)",
+                (scope_key, method, idempotency_key, payload_digest, timestamp, timestamp),
+            )
+            return {
+                "scope_key": scope_key,
+                "method": method,
+                "idempotency_key": idempotency_key,
+                "payload_digest": payload_digest,
+                "state": "in_progress",
+                "result_json": None,
+                "error_json": None,
+                "created_at": timestamp,
+                "updated_at": timestamp,
+                "created": True,
+                "conflict": False,
+            }
+
+        return self._execute_write(_write)
+
+    def mobile_request_outcome_finish(
+        self,
+        *,
+        scope_key: str,
+        method: str,
+        idempotency_key: str,
+        payload_digest: str,
+        state: str,
+        result_json: str | None,
+        error_json: str | None,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """Persist one terminal/indeterminate outcome without overwriting it."""
+        timestamp = float(time.time() if now is None else now)
+
+        def _write(conn):
+            row = conn.execute(
+                "SELECT scope_key, method, idempotency_key, payload_digest, state, "
+                "result_json, error_json, created_at, updated_at "
+                "FROM mobile_request_outcomes WHERE scope_key = ? AND method = ? "
+                "AND idempotency_key = ?",
+                (scope_key, method, idempotency_key),
+            ).fetchone()
+            if row is None:
+                raise KeyError("mobile request outcome reservation not found")
+            data = dict(row)
+            if data["payload_digest"] != payload_digest:
+                data["conflict"] = True
+                data["created"] = False
+                return data
+            if data["state"] == "in_progress":
+                conn.execute(
+                    "UPDATE mobile_request_outcomes SET state = ?, result_json = ?, "
+                    "error_json = ?, updated_at = ? WHERE scope_key = ? AND method = ? "
+                    "AND idempotency_key = ? AND state = 'in_progress'",
+                    (state, result_json, error_json, timestamp, scope_key, method, idempotency_key),
+                )
+                row = conn.execute(
+                    "SELECT scope_key, method, idempotency_key, payload_digest, state, "
+                    "result_json, error_json, created_at, updated_at "
+                    "FROM mobile_request_outcomes WHERE scope_key = ? AND method = ? "
+                    "AND idempotency_key = ?",
+                    (scope_key, method, idempotency_key),
+                ).fetchone()
+                data = dict(row)
+            data["created"] = False
+            data["conflict"] = False
+            return data
+
+        return self._execute_write(_write)
+
     def _execute_write(
         self,
         fn: Callable[[sqlite3.Connection], T],

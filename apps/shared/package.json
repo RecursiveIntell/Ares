@@ -5,6 +5,7 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
+    "./protocol": "./src/protocol/generated/mobile-protocol.ts",
     "./billing": "./src/billing-types.ts",
     "./billing-policy": "./src/billing-policy.ts",
     "./charge-settlement": "./src/charge-settlement.ts",

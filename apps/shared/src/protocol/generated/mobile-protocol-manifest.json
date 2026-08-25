@@ -1,0 +1,36 @@
+{
+  "protocol_revision": 2,
+  "schema": "AresMobileProtocolManifestV1",
+  "schemas": [
+    {
+      "bytes": 905,
+      "name": "gateway-ready.v2.json",
+      "sha256": "2973a36aacd06ed9915162ef62ccef4c63b88a765cdcd2f2f855663197060198"
+    },
+    {
+      "bytes": 1209,
+      "name": "mutation-outcome.v1.json",
+      "sha256": "2269bd811e1b0393c9135b2e2a2a5c43c2a878b5abcad45504aba23b015cbec0"
+    },
+    {
+      "bytes": 876,
+      "name": "session-control.v1.json",
+      "sha256": "ebf52854dbb6d8d8d680d6cfc7aa698cfcd2c8454a3a7c48b2d5c49b325106f6"
+    },
+    {
+      "bytes": 893,
+      "name": "session-event-envelope.v1.json",
+      "sha256": "cd3553a86af00db8e2d09201d8523f4c297a3c219e6c68e9e682f8475f9387ef"
+    },
+    {
+      "bytes": 526,
+      "name": "session-observe.v1.json",
+      "sha256": "d3723e31e572f7c544f82043933089de6b437fd3080d29405955bb041a67e923"
+    },
+    {
+      "bytes": 1247,
+      "name": "session-snapshot.v1.json",
+      "sha256": "3137ff6035e30adc49eaf42f9dc566c7f346059dbfd05929e287235e1cb591e5"
+    }
+  ]
+}

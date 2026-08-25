@@ -5,6 +5,7 @@ are rebound onto server.py's globals at install time — see method_ctx.py.
 """
 
 from .method_ctx import HandlerRegistry
+from .request_outcomes import mobile_request_outcome_scope_key
 
 _registry = HandlerRegistry()
 method = _registry.method
@@ -1240,6 +1241,121 @@ def _(rid, params: dict) -> dict:
         title = (params.get("title", "") or "").strip()
         if not title:
             return _err(rid, 4021, "title required")
+        idempotency_key = str(params.get("idempotency_key") or "").strip()
+        if idempotency_key:
+            if not mobile_protocol_capability_enabled("write_idempotency_v1"):
+                return _err(
+                    rid,
+                    4401,
+                    "mobile capability is not enabled: write_idempotency_v1",
+                    {"capability": "write_idempotency_v1"},
+                )
+            if not mobile_protocol_capability_enabled("session_control_lease_v1"):
+                return _err(
+                    rid,
+                    4401,
+                    "mobile capability is not enabled: session_control_lease_v1",
+                    {"capability": "session_control_lease_v1"},
+                )
+            host_id = str(params.get("host_id") or "").strip()
+            profile = str(params.get("profile") or session.get("profile") or "default").strip()
+            runtime_id = str(params.get("runtime_id") or "").strip()
+            instance = str(params.get("controller_instance_id") or "").strip()
+            if host_id != host_identity_digest() or runtime_id != protocol_runtime_id():
+                return _err(rid, 4403, "mobile title owner scope mismatch", {"reason": "wrong_host_or_runtime"})
+            transport = current_transport()
+            identity = getattr(transport, "auth_identity", None) if transport is not None else None
+            principal = str((identity or {}).get("user_id") or "").strip()
+            peer = str((getattr(transport, "peer", None) or getattr(transport, "_peer", "")) if transport is not None else "")
+            if not principal and peer.startswith(("127.0.0.1:", "[::1]:", "::1:")):
+                principal = "loopback"
+            if not principal or not instance:
+                return _err(rid, 4403, "authenticated controller identity required")
+            outcome_scope_key = mobile_request_outcome_scope_key(
+                host_id=host_id,
+                profile=profile,
+                session_key=str(key),
+                principal_id=principal,
+            )
+            try:
+                _session_controller.validate(
+                    host_id=host_id,
+                    profile=profile,
+                    session_id=str(params.get("session_id") or ""),
+                    runtime_id=runtime_id,
+                    principal_id=principal,
+                    controller_instance_id=instance,
+                    generation=int(params.get("generation")),
+                    fencing_token=str(params.get("fencing_token") or ""),
+                )
+            except (TypeError, ValueError, ControllerLeaseError) as exc:
+                return _err(rid, 4410, str(exc), {"reason": "stale_or_missing_lease"})
+            payload_digest = hashlib.sha256(
+                json.dumps({"title": title}, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            outcome = db.mobile_request_outcome_reserve(
+                scope_key=outcome_scope_key,
+                method="session.title",
+                idempotency_key=idempotency_key,
+                payload_digest=payload_digest,
+            )
+            if outcome.get("conflict"):
+                return _err(rid, 4411, "idempotency key payload mismatch", {"reason": "payload_conflict"})
+            if outcome.get("created") is not True:
+                if outcome.get("state") != "completed":
+                    state = str(outcome.get("state") or "unknown")
+                    return _err(  # type: ignore[reportUndefinedVariable]
+                        rid,
+                        4412,
+                        "idempotency outcome cannot be safely replayed",
+                        {"reason": f"outcome_{state}", "state": state},
+                    )
+                try:
+                    replay = json.loads(outcome.get("result_json") or "{}")
+                except (TypeError, ValueError):
+                    return _err(  # type: ignore[reportUndefinedVariable]
+                        rid,
+                        4412,
+                        "stored idempotency outcome is malformed",
+                        {"reason": "outcome_malformed", "state": "completed"},
+                    )
+                if not isinstance(replay, dict):
+                    return _err(  # type: ignore[reportUndefinedVariable]
+                        rid,
+                        4412,
+                        "stored idempotency outcome is malformed",
+                        {"reason": "outcome_malformed", "state": "completed"},
+                    )
+                return _ok(rid, replay)
+            try:
+                if not db.set_session_title(key, title):
+                    _ensure_session_db_row(session)
+                    if not db.set_session_title(key, title):
+                        raise RuntimeError("session title row unavailable")
+                session["pending_title"] = None
+                result = {"pending": False, "title": title, "idempotency_key": idempotency_key}
+                db.mobile_request_outcome_finish(
+                    scope_key=outcome_scope_key,
+                    method="session.title",
+                    idempotency_key=idempotency_key,
+                    payload_digest=payload_digest,
+                    state="completed",
+                    result_json=json.dumps(result, sort_keys=True, separators=(",", ":")),
+                    error_json=None,
+                )
+                _emit_session_info_for_session(params.get("session_id", ""), session)
+                return _ok(rid, result)
+            except Exception as exc:
+                db.mobile_request_outcome_finish(
+                    scope_key=outcome_scope_key,
+                    method="session.title",
+                    idempotency_key=idempotency_key,
+                    payload_digest=payload_digest,
+                    state="indeterminate",
+                    result_json=None,
+                    error_json=json.dumps({"message": str(exc)}, sort_keys=True, separators=(",", ":")),
+                )
+                return _err(rid, 5007, str(exc))
         try:
             if db.set_session_title(key, title):
                 session["pending_title"] = None
@@ -3591,4 +3707,5 @@ def _(rid, params: dict) -> dict:
 
 def register(server) -> None:
     """Bind this module's handlers onto ``server``'s globals and registry."""
+    server.mobile_request_outcome_scope_key = mobile_request_outcome_scope_key
     _registry.install(server)

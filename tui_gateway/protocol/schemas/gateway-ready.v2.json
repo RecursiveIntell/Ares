@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ares.local/protocol/gateway-ready.v2.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol_revision", "schema_digest", "host_identity_digest", "runtime_id", "capabilities"],
+  "properties": {
+    "protocol_revision": {"type": "integer", "const": 2},
+    "schema_digest": {"type": "string", "minLength": 64, "maxLength": 64},
+    "host_identity_digest": {"type": "string", "minLength": 1},
+    "runtime_id": {"type": "string", "minLength": 1},
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": {"type": "boolean"},
+      "required": [
+        "session_observe_v1",
+        "session_snapshot_v1",
+        "event_cursor_v1",
+        "bounded_replay_v1",
+        "session_control_lease_v1",
+        "write_idempotency_v1",
+        "mobile_surface_v1"
+      ]
+    }
+  }
+}

@@ -51,6 +51,10 @@ from tui_gateway.transport import (
     current_transport,
     reset_transport,
 )
+from tui_gateway.observers import observer_registry
+from tui_gateway.protocol import host_identity_digest, protocol_runtime_id
+from tui_gateway.request_outcomes import RequestOutcomeLedger
+from tui_gateway.session_control import ControllerLeaseError, SessionController
 
 logger = logging.getLogger(__name__)
 
@@ -159,11 +163,54 @@ _cfg_lock = threading.Lock()
 # dedicated lock rather than the unrelated process-config cache lock.
 _profile_ui_meta_lock = threading.Lock()
 _sessions_lock = threading.RLock()  # reentrant: _close_session_by_id may run under callers that already hold it
+_session_event_lock = threading.Lock()
+_session_event_revisions: dict[tuple[str, str, str], int] = {}
+_session_controller = SessionController()
+_request_outcome_ledger = RequestOutcomeLedger()
+_mobile_protocol_capabilities: dict[str, bool] = {
+    "session_observe_v1": False,
+    "session_snapshot_v1": False,
+    "event_cursor_v1": False,
+    "bounded_replay_v1": False,
+    "session_control_lease_v1": False,
+    "write_idempotency_v1": False,
+    "mobile_surface_v1": False,
+}
 _prompt_lock = threading.Lock()
 _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
 _session_resume_lock = threading.Lock()
+
+
+def mobile_protocol_capability_enabled(name: str) -> bool:
+    """Return explicit runtime/config admission state for one capability."""
+    if _mobile_protocol_capabilities.get(name) is True:
+        return True
+    section_name = {
+        "session_observe_v1": "session_observe",
+        "session_snapshot_v1": "session_snapshot",
+        "event_cursor_v1": "event_cursor",
+        "bounded_replay_v1": "bounded_replay",
+        "session_control_lease_v1": "session_control",
+        "write_idempotency_v1": "write_idempotency",
+        "mobile_surface_v1": "mobile_surface",
+    }.get(name)
+    if not section_name:
+        return False
+    try:
+        import yaml
+
+        raw = yaml.safe_load(Path(_hermes_home, "config.yaml").read_text(encoding="utf-8")) or {}
+        section = (raw.get("mobile") or {}).get(section_name) or {}
+        return section.get("enabled") is True
+    except Exception:
+        return False
+
+
+def mobile_protocol_capabilities() -> dict[str, bool]:
+    """Return the independently admitted capability projection for ready frames."""
+    return {name: mobile_protocol_capability_enabled(name) for name in _mobile_protocol_capabilities}
 try:
     _slash_timeout = float(os.environ.get("HERMES_TUI_SLASH_TIMEOUT_S") or "45")
 except (ValueError, TypeError):
@@ -1662,19 +1709,72 @@ def _default_session_cwd() -> str:
     return _launch_configured_cwd() or os.getenv("TERMINAL_CWD") or os.getcwd()
 
 
+def _annotate_session_event(obj: dict) -> tuple[dict, str, str, str] | None:
+    """Attach explicit protocol scope and a per-runtime session revision."""
+    if obj.get("method") != "event":
+        return None
+    params = obj.get("params")
+    if not isinstance(params, dict):
+        return None
+    sid = str(params.get("session_id") or "")
+    if not sid or params.get("protocol_envelope") is True:
+        return None
+
+    runtime_id = protocol_runtime_id()
+    with _sessions_lock:
+        session = dict(_sessions.get(sid) or {})
+    profile = str(session.get("profile") or "default")
+    with _session_event_lock:
+        key = (profile, sid, runtime_id)
+        revision = _session_event_revisions.get(key, 0) + 1
+        _session_event_revisions[key] = revision
+    lineage_root = str(
+        session.get("lineage_root_id")
+        or session.get("_lineage_root_id")
+        or session.get("session_key")
+        or sid
+    )
+    connection_id = str(session.get("connection_id") or "local")
+    annotated = dict(params)
+    annotated.update(
+        {
+            "host_id": host_identity_digest(),
+            "connection_id": connection_id,
+            "profile": profile,
+            "lineage_root_id": lineage_root,
+            "runtime_id": runtime_id,
+            "revision": revision,
+            "event_id": uuid.uuid4().hex,
+            "protocol_envelope": True,
+        }
+    )
+    return {**obj, "params": annotated}, sid, profile, runtime_id
+
+
 def write_json(obj: dict) -> bool:
-    """Emit one JSON frame. Routes via the most-specific transport available.
+    """Emit one JSON frame and fan out annotated session events to observers.
 
-    Precedence:
-
-    1. Event frames with a session id → the transport stored on that session,
-       so async events land with the client that owns the session even if
-       the emitting thread has no contextvar binding.
-    2. Otherwise the transport bound on the current context (set by
-       :func:`dispatch` for the lifetime of a request).
-    3. Otherwise the module-level stdio transport, matching the historical
-       behaviour and keeping tests that monkey-patch ``_real_stdout`` green.
+    The primary session transport remains authoritative. Observer delivery is a
+    bounded read-only projection and never replaces the primary transport.
     """
+    event = _annotate_session_event(obj)
+    if event is not None:
+        annotated, sid, profile, runtime_id = event
+        with _sessions_lock:
+            primary = (_sessions.get(sid) or {}).get("transport")
+        if primary is not None:
+            ok = primary.write(annotated)
+        else:
+            ok = (current_transport() or _stdio_transport).write(annotated)
+        observer_registry.fanout(
+            session_id=sid,
+            profile=profile,
+            runtime_id=runtime_id,
+            frame=annotated,
+            primary_transport=primary,
+        )
+        return ok
+
     if obj.get("method") == "event":
         sid = ((obj.get("params") or {}).get("session_id")) or ""
         if sid and (t := (_sessions.get(sid) or {}).get("transport")) is not None:
@@ -15722,6 +15822,8 @@ from . import (  # noqa: E402
     methods_complete as _methods_complete,
     methods_config as _methods_config,
     methods_images as _methods_images,
+    methods_control as _methods_control,
+    methods_observer as _methods_observer,
     methods_profiles as _methods_profiles,
     methods_prompt as _methods_prompt,
     methods_session as _methods_session,
@@ -15737,6 +15839,8 @@ for _m in (
     _methods_tools,
     _methods_profiles,
     _methods_images,
+    _methods_control,
+    _methods_observer,
     _methods_bot_relay,
 ):
     _m.register(sys.modules[__name__])

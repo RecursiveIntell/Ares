@@ -58,6 +58,18 @@ export {
   JsonRpcGatewayError,
   type WebSocketLike
 } from './json-rpc-gateway'
+export {
+  type GatewayCapabilities,
+  type GatewayReadyV2,
+  MOBILE_PROTOCOL_REVISION,
+  MOBILE_PROTOCOL_SCHEMA_DIGEST,
+  type MutationOutcomeScopeV1,
+  type MutationOutcomeV1,
+  type SessionControlLeaseV1,
+  type SessionEventEnvelopeV1,
+  type SessionOwnerScope,
+  type SessionSnapshotV1
+} from './protocol/generated/mobile-protocol'
 export { skillInvocationText } from './skill-scaffold'
 export {
   type HermesSkin,

@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ares.local/protocol/mutation-outcome.v1.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "scope",
+    "method",
+    "idempotency_key",
+    "payload_digest",
+    "state",
+    "result",
+    "error",
+    "created_at",
+    "updated_at"
+  ],
+  "properties": {
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["host_id", "profile", "session_key", "principal_id"],
+      "properties": {
+        "host_id": {"type": "string", "minLength": 1},
+        "profile": {"type": "string", "minLength": 1},
+        "session_key": {"type": "string", "minLength": 1},
+        "principal_id": {"type": "string", "minLength": 1}
+      }
+    },
+    "method": {"type": "string", "minLength": 1},
+    "idempotency_key": {"type": "string", "minLength": 1},
+    "payload_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "state": {"enum": ["in_progress", "completed", "failed", "indeterminate"]},
+    "result": {"type": ["object", "null"]},
+    "error": {"type": ["object", "null"]},
+    "created_at": {"type": "number"},
+    "updated_at": {"type": "number"}
+  }
+}

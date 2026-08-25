@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ares.local/protocol/session-snapshot.v1.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["scope", "schema_version", "revision", "status", "transcript_tail", "transcript_cursor", "pending_requests", "controller"],
+  "properties": {
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["host_id", "connection_id", "profile", "session_id", "lineage_root_id", "runtime_id"],
+      "properties": {
+        "host_id": {"type": "string", "minLength": 1},
+        "connection_id": {"type": "string", "minLength": 1},
+        "profile": {"type": "string", "minLength": 1},
+        "session_id": {"type": "string", "minLength": 1},
+        "lineage_root_id": {"type": "string", "minLength": 1},
+        "runtime_id": {"type": "string", "minLength": 1}
+      }
+    },
+    "schema_version": {"type": "integer", "minimum": 1},
+    "revision": {"type": "integer", "minimum": 0},
+    "status": {"type": "string", "minLength": 1},
+    "transcript_tail": {"type": "array"},
+    "transcript_cursor": {"type": ["string", "null"]},
+    "pending_requests": {"type": "array"},
+    "controller": {"type": "object"}
+  }
+}
