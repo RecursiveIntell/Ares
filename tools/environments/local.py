@@ -518,26 +518,32 @@ def _is_credential_shaped_password(key: str) -> bool:
 def _finalize_child_env_policy(
     env: dict[str, str],
     is_passthrough,
+    explicit_force_targets=(),
 ) -> dict[str, str]:
-    """Reapply the generic child policy after profile values are overlaid.
+    """Reapply generic policy after profile values are overlaid.
 
     Profile provenance may replace a source-owned value with a target-owned
-    value. That replacement must not bypass the generic credential policy:
-    target-owned credential-shaped values require explicit passthrough just as
-    ambient values do. This is the final choke point for both terminal builders.
+    value. That replacement must not bypass generic credential filtering.
+    Explicit force-prefix targets remain the existing opt-in escape for
+    non-internal credentials, while internal secrets stay denied.
     """
     plugin_strip = _plugin_terminal_env_strip_keys()
+    force_targets = {str(name).upper() for name in explicit_force_targets}
     for key in list(env):
         target_key = _credential_target_env_name(key)
+        target_upper = target_key.upper()
+        allow_credential = (
+            target_upper in force_targets or is_passthrough(target_key)
+        )
         if key.upper().startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             env.pop(key, None)
         elif _is_hermes_internal_secret(target_key):
             env.pop(key, None)
-        elif key in plugin_strip:
+        elif key in plugin_strip and target_upper not in force_targets:
             env.pop(key, None)
-        elif _is_blocked_provider_env(target_key) and not is_passthrough(target_key):
+        elif _is_blocked_provider_env(target_key) and not allow_credential:
             env.pop(key, None)
-        elif _is_credential_shaped_password(target_key) and not is_passthrough(target_key):
+        elif _is_credential_shaped_password(target_key) and not allow_credential:
             env.pop(key, None)
     return env
 
@@ -693,7 +699,15 @@ def _sanitize_subprocess_env(
     # source-owned credential after the initial protected-base sanitization.
     if boundary_active and boundary is not None:
         sanitized = boundary.sanitize(sanitized)
-    sanitized = _finalize_child_env_policy(sanitized, _is_passthrough)
+    sanitized = _finalize_child_env_policy(
+        sanitized,
+        _is_passthrough,
+        {
+            key[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
+            for key in (extra_env or {})
+            if key.upper().startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX)
+        },
+    )
 
     # An explicit target profile is authoritative for both HERMES_HOME and the
     # derived subprocess HOME policy.  Install it before evaluating
@@ -1566,7 +1580,14 @@ def _make_run_env(env: dict) -> dict:
                 run_env[k] = value
     if _multiplex_active and _boundary is not None:
         run_env = _boundary.sanitize(run_env)
-    run_env = _finalize_child_env_policy(run_env, _is_passthrough)
+    run_env = _finalize_child_env_policy(
+        run_env,
+        _is_passthrough,
+        {
+            key[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
+            for key in explicit_force_names
+        },
+    )
 
     path_key = _path_env_key(run_env)
     if path_key is not None:
