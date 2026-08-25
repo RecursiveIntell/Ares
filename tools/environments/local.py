@@ -356,6 +356,24 @@ _HERMES_PROVIDER_ENV_BLOCKLIST_UPPER = frozenset(
 )
 
 
+def _build_model_provider_env_names() -> frozenset[str]:
+    """Return exact model-provider credential and endpoint env names."""
+    names: set[str] = set()
+    try:
+        from hermes_cli.auth import PROVIDER_REGISTRY
+
+        for provider in PROVIDER_REGISTRY.values():
+            names.update(str(item).upper() for item in provider.api_key_env_vars)
+            if provider.base_url_env_var:
+                names.add(str(provider.base_url_env_var).upper())
+    except ImportError:
+        pass
+    return frozenset(name for name in names if name)
+
+
+_MODEL_PROVIDER_ENV_NAMES_UPPER = _build_model_provider_env_names()
+
+
 def _is_blocked_provider_env(key: str) -> bool:
     """Match provider credentials case-insensitively and through wrappers.
 
@@ -845,7 +863,13 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     from agent.secret_scope import build_profile_env_boundary, is_multiplex_active
 
     if is_multiplex_active():
-        env = build_profile_env_boundary().sanitize(env)
+        boundary = build_profile_env_boundary()
+        env = boundary.sanitize(env)
+        if inherit_credentials:
+            for key, value in boundary.target_values.items():
+                target_name = _credential_target_env_name(key).upper()
+                if target_name in _MODEL_PROVIDER_ENV_NAMES_UPPER:
+                    env[str(key)] = str(value)
 
     # Tier 1 — always strip, including mixed-case Windows keys and
     # Apptainer/Singularity forwarding wrappers around a Tier-1 target.
