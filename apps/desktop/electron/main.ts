@@ -2344,14 +2344,10 @@ function findSystemPython() {
   //      that didn't check the launcher option, so PATH-only checks
   //      miss real Python 3.13 installs (user-reported case).
   //
-  // We also restrict ourselves to Python 3.11–3.13. 3.14 is the latest
-  // CPython but several Hermes deps (notably pywinpty's Rust-built
-  // windows_x86_64_msvc crate) don't yet publish 3.14 wheels, and
-  // `pip install -e .` falls back to source-build, which fails without
-  // a Rust toolchain. install.ps1 sidesteps this by pinning to 3.11
-  // via uv; until we add the same uv-managed Python pathway here, the
-  // simplest fix is to refuse 3.14 detection and let the NSIS prereq
-  // page offer to install 3.11 alongside.
+  // The locked project admission covers Python 3.11–3.14. pywinpty 3.0.5
+  // supplies cp314 Windows wheels, so 3.14 is no longer excluded from the
+  // resolver's candidate ladder. The later backend probe still verifies the
+  // actual Hermes imports before a candidate is trusted.
   //
   // Strategy: probe in three passes, in order from most-precise to
   // least-precise, and ONLY use PATH lookup as a last resort after
@@ -2361,7 +2357,7 @@ function findSystemPython() {
   //          installer registers itself at SOFTWARE\Python\PythonCore.
   //          The MS Store stub does NOT register here, so a hit means
   //          a real Python install. Versions are explicit so we
-  //          inherently filter 3.14 out.
+  //          inherently restrict the result to the admitted versions.
   //  Pass 2: Filesystem probe of standard install locations
   //          (Program Files, LocalAppData\Programs\Python). Same
   //          version filtering by directory name.
@@ -2371,8 +2367,8 @@ function findSystemPython() {
   //          py.exe's default is (which on a 3.14-only box would be
   //          3.14).
 
-  const SUPPORTED_VERSIONS = ['3.11', '3.12', '3.13']
-  const SUPPORTED_VERSIONS_NO_DOT = ['311', '312', '313']
+  const SUPPORTED_VERSIONS = ['3.11', '3.12', '3.13', '3.14']
+  const SUPPORTED_VERSIONS_NO_DOT = ['311', '312', '313', '314']
 
   // Pass 1: registry. Use `reg query` since main process doesn't have
   // a reliable in-process registry API across all electron versions.
@@ -2426,7 +2422,7 @@ function findSystemPython() {
   }
 
   // Pass 3: py.exe with explicit version flag. The launcher itself is
-  // safe to invoke (no Store popup) and `py -3.13 -c "import sys;
+  // safe to invoke (no Store popup) and `py -3.14 -c "import sys;
   // print(sys.executable)"` resolves to the actual python.exe path of
   // the requested version. We try in version-priority order so the
   // first hit wins.
@@ -2462,10 +2458,9 @@ function findSystemPython() {
 
   // We deliberately do NOT fall back to plain `python.exe` on PATH.
   // Without a way to verify the version safely (running `python -V`
-  // risks the Microsoft Store popup), accepting whatever's there
-  // could land us on 3.14 and trigger the Rust-build-from-source
-  // failure. Better to return null and let the NSIS prereq page
-  // offer to install a known-good 3.11 via winget.
+  // risks the Microsoft Store popup), accepting whatever's there could
+  // land us outside the locked admission range. Better to return null and
+  // let the NSIS prereq page offer to install a known-good interpreter.
   return null
 }
 

@@ -29,6 +29,8 @@ export async function driveChargeSettlement(deps: SettlementDeps): Promise<Settl
   const start = deps.now()
   const timedOut = (): boolean => deps.now() - start >= SETTLEMENT_POLL_CAP_MS
 
+  // Terminal outcomes return; no nonterminal exit exists.
+  // eslint-disable-next-line no-constant-condition
   while (true) {
     if (deps.isCancelled()) {
       return { kind: 'cancelled' }
