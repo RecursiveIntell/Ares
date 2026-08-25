@@ -515,6 +515,33 @@ def _is_credential_shaped_password(key: str) -> bool:
     return "PASSWORD" in upper or (upper.endswith("_PWD") and upper != "PWD")
 
 
+def _finalize_child_env_policy(
+    env: dict[str, str],
+    is_passthrough,
+) -> dict[str, str]:
+    """Reapply the generic child policy after profile values are overlaid.
+
+    Profile provenance may replace a source-owned value with a target-owned
+    value. That replacement must not bypass the generic credential policy:
+    target-owned credential-shaped values require explicit passthrough just as
+    ambient values do. This is the final choke point for both terminal builders.
+    """
+    plugin_strip = _plugin_terminal_env_strip_keys()
+    for key in list(env):
+        target_key = _credential_target_env_name(key)
+        if key.upper().startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
+            env.pop(key, None)
+        elif _is_hermes_internal_secret(target_key):
+            env.pop(key, None)
+        elif key in plugin_strip:
+            env.pop(key, None)
+        elif _is_blocked_provider_env(target_key) and not is_passthrough(target_key):
+            env.pop(key, None)
+        elif _is_credential_shaped_password(target_key) and not is_passthrough(target_key):
+            env.pop(key, None)
+    return env
+
+
 def _inject_context_hermes_home(env: dict) -> None:
     """Bridge the context-local Hermes home override into subprocess env."""
     try:
@@ -666,6 +693,7 @@ def _sanitize_subprocess_env(
     # source-owned credential after the initial protected-base sanitization.
     if boundary_active and boundary is not None:
         sanitized = boundary.sanitize(sanitized)
+    sanitized = _finalize_child_env_policy(sanitized, _is_passthrough)
 
     # An explicit target profile is authoritative for both HERMES_HOME and the
     # derived subprocess HOME policy.  Install it before evaluating
@@ -1538,6 +1566,7 @@ def _make_run_env(env: dict) -> dict:
                 run_env[k] = value
     if _multiplex_active and _boundary is not None:
         run_env = _boundary.sanitize(run_env)
+    run_env = _finalize_child_env_policy(run_env, _is_passthrough)
 
     path_key = _path_env_key(run_env)
     if path_key is not None:
