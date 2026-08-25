@@ -446,6 +446,12 @@ def _is_hermes_internal_secret(key: str) -> bool:
         upper.endswith("_SECRET") or upper.endswith("_KEY") or upper.endswith("_TOKEN")
     ):
         return True
+    if upper in {"OP_SERVICE_ACCOUNT_TOKEN", "OP_CONNECT_TOKEN"}:
+        return True
+    if upper.startswith("OP_SESSION_"):
+        return True
+    if "BWS" in upper and upper.endswith("_TOKEN"):
+        return True
     if upper == "BWS_ACCESS_TOKEN" or upper == _get_configured_bws_token_env().upper():
         # Bitwarden Secrets Manager bootstrap token — the exact configured
         # access_token_env name (default BWS_ACCESS_TOKEN; may be remapped to
@@ -458,28 +464,13 @@ def _is_hermes_internal_secret(key: str) -> bool:
     return False
 
 
-_configured_bws_token_env_by_home: dict[str, str] = {}
-
-
 def _get_configured_bws_token_env() -> str:
-    """Resolve the exact Bitwarden token env name per active Hermes home.
+    """Resolve the exact Bitwarden token env name for the active profile.
 
-    A multiplexed process may serve profiles with different remapped token
-    names, so the cache is keyed by the active home rather than process-global.
+    ``read_raw_config`` is already cached by profile-aware config path and file
+    revision. Adding another per-home cache here would hide runtime remaps and
+    leave the newly configured bootstrap token unclassified.
     """
-    try:
-        from hermes_constants import get_hermes_home
-
-        home_key = str(get_hermes_home())
-    except Exception:
-        # Home resolution can fail in stripped-down environments (no
-        # LOCALAPPDATA/HOME/USERPROFILE, e.g. the test runner's clean env).
-        # Fall back to the process env var, then a shared slot — never raise.
-        home_key = os.environ.get("HERMES_HOME", "") or "<unknown-home>"
-    cached = _configured_bws_token_env_by_home.get(home_key)
-    if cached is not None:
-        return cached
-
     name = "BWS_ACCESS_TOKEN"
     try:
         from hermes_cli.config import cfg_get, read_raw_config
@@ -491,7 +482,6 @@ def _get_configured_bws_token_env() -> str:
             name = configured.strip()
     except Exception:
         pass
-    _configured_bws_token_env_by_home[home_key] = name
     return name
 
 
@@ -527,7 +517,11 @@ def _finalize_child_env_policy(
     Explicit force-prefix targets remain the existing opt-in escape for
     non-internal credentials, while internal secrets stay denied.
     """
-    plugin_strip = _plugin_terminal_env_strip_keys()
+    plugin_strip = {
+        _credential_target_env_name(name).upper()
+        for name in _plugin_terminal_env_strip_keys()
+    }
+    always_strip = {name.upper() for name in _ALWAYS_STRIP_KEYS}
     force_targets = {str(name).upper() for name in explicit_force_targets}
     for key in list(env):
         target_key = _credential_target_env_name(key)
@@ -539,7 +533,9 @@ def _finalize_child_env_policy(
             env.pop(key, None)
         elif _is_hermes_internal_secret(target_key):
             env.pop(key, None)
-        elif key in plugin_strip and target_upper not in force_targets:
+        elif target_upper in always_strip:
+            env.pop(key, None)
+        elif target_upper in plugin_strip:
             env.pop(key, None)
         elif _is_blocked_provider_env(target_key) and not allow_credential:
             env.pop(key, None)
@@ -845,6 +841,11 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     ``os.environ`` into the returned dict.
     """
     env = os.environ.copy()
+
+    from agent.secret_scope import build_profile_env_boundary, is_multiplex_active
+
+    if is_multiplex_active():
+        env = build_profile_env_boundary().sanitize(env)
 
     # Tier 1 — always strip, including mixed-case Windows keys and
     # Apptainer/Singularity forwarding wrappers around a Tier-1 target.
