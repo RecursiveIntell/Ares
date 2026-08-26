@@ -36,7 +36,12 @@ import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
 import { buildDesktopBackendEnv, hermesManagedNodePathEntries, normalizeHermesHomeRoot } from './backend-env'
 import { isReauthRequiredError, makeNousCloudBackendDownError, waitForHermesReady } from './backend-health'
-import { backendCommandMatches, createBackendOwnership, createBackendShutdownCoordinator } from './backend-ownership'
+import {
+  backendCommandMatches,
+  createBackendOrphanReaper,
+  createBackendOwnership,
+  createBackendShutdownCoordinator
+} from './backend-ownership'
 import {
   canImportHermesCli,
   execProbeSync,
@@ -218,7 +223,7 @@ import {
   registryGatewayWsUrl,
   undialedSshRouteSeeds
 } from './plugin-profile-routes'
-import { selectPoolEvictions } from './pool-eviction'
+import { canAdmitLocalBackend, PoolCapacityError, selectPoolEvictions } from './pool-eviction'
 import { createPoolStopper } from './pool-stop'
 import { poolTouchKeys } from './pool-touch-scope'
 import { createKeepAwake } from './power-save'
@@ -1305,7 +1310,7 @@ const profileDeletionGate = new ProfileDeletionGate()
 // Keep the pool light: cap concurrent profile backends (LRU eviction) and reap
 // idle ones. A user idles at exactly the primary backend; pool backends only
 // exist while a non-primary profile is actively being chatted through.
-const POOL_MAX_BACKENDS = Math.max(1, Number(process.env.HERMES_DESKTOP_POOL_MAX) || 3)
+const POOL_MAX_BACKENDS = Math.max(1, Number(process.env.HERMES_DESKTOP_POOL_MAX) || 4)
 const POOL_IDLE_MS = Math.max(60_000, Number(process.env.HERMES_DESKTOP_POOL_IDLE_MS) || 10 * 60_000)
 // A backend touched within this window has a live renderer socket (the keepalive
 // pings every 60s for every open profile). LRU eviction must spare these — a
@@ -1313,7 +1318,6 @@ const POOL_IDLE_MS = Math.max(60_000, Number(process.env.HERMES_DESKTOP_POOL_IDL
 // killing one to honor the soft cap would abort a running agent.
 const POOL_KEEPALIVE_FRESH_MS = 90_000
 let poolIdleReaper = null
-let backendOrphanReapPromise = null
 // Auto-reload budget for renderer crashes, shared by EVERY window (primary,
 // secondary session, instance) so a crash loop anywhere is suppressed after
 // the same budget instead of reloading per-window forever. A deterministic
@@ -3365,23 +3369,14 @@ function releaseBackendChild(child) {
   }
 }
 
-function reapOrphanedBackendsOnce() {
-  if (!backendOrphanReapPromise) {
-    backendOrphanReapPromise = backendOwnership
-      .reapOrphans()
-      .then(pids => {
-        if (pids.length) {
-          rememberLog(`Reaped orphaned desktop backend PID(s): ${pids.join(', ')}`)
-        }
-      })
-      .catch(error => {
-        backendOrphanReapPromise = null
-        throw error
-      })
+const reapOrphanedBackends = createBackendOrphanReaper(
+  () => backendOwnership.reapOrphans(),
+  pids => {
+    if (pids.length) {
+      rememberLog(`Reaped orphaned desktop backend PID(s): ${pids.join(', ')}`)
+    }
   }
-
-  return backendOrphanReapPromise
-}
+)
 
 // Before handing off the update on Windows, the desktop MUST stop every backend
 // it spawned and WAIT for the venv shim to actually unlock. The old code did
@@ -9949,10 +9944,15 @@ async function ensureBackend(profile) {
     return connection
   }
 
+  if (!canAdmitLocalBackend(backendPool.entries(), POOL_MAX_BACKENDS)) {
+    throw new PoolCapacityError(POOL_MAX_BACKENDS)
+  }
+
   evictLruPoolBackends(POOL_MAX_BACKENDS - 1)
 
   const entry = {
     process: null,
+    countsTowardPoolCap: true,
     port: null,
     token: null,
     connectionPromise: null,
@@ -10038,10 +10038,15 @@ async function ensureRegistryBackend(connectionId, profile) {
       return existingLocal.connectionPromise
     }
 
+    if (!canAdmitLocalBackend(backendPool.entries(), POOL_MAX_BACKENDS)) {
+      throw new PoolCapacityError(POOL_MAX_BACKENDS)
+    }
+
     evictLruPoolBackends(POOL_MAX_BACKENDS - 1)
 
     const localEntry = {
       process: null,
+      countsTowardPoolCap: true,
       port: null,
       token: null,
       connectionPromise: null,
@@ -10278,7 +10283,7 @@ function startPoolIdleReaper() {
 async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; poolKey?: string } = {}) {
   const poolKey = opts.poolKey || profile
 
-  await reapOrphanedBackendsOnce()
+  await reapOrphanedBackends()
   profileDeletionGate.assertCanStart(profile)
 
   // A profile may point at its OWN remote backend (connection.json
@@ -10566,7 +10571,7 @@ async function startHermes() {
     throw new Error('Hermes Desktop is already running in another window.')
   }
 
-  await reapOrphanedBackendsOnce()
+  await reapOrphanedBackends()
 
   // Latched-failure short-circuit: once bootstrap has failed in this
   // process, every subsequent startHermes() call re-throws the same error
