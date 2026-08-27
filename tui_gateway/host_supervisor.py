@@ -424,16 +424,17 @@ class HostSupervisor:
             profile_boundary=boundary,
         )
         if self.env:
-            explicit_env_kwargs = {}
             if boundary is not None:
-                explicit_env_kwargs = {
-                    "profile_home": boundary.target_home,
-                    "source_profile_home": boundary.source_home,
-                    "enforce_profile_boundary": True,
-                }
-            env.update(
-                build_subprocess_env(base={}, extra=self.env, **explicit_env_kwargs)
-            )
+                explicit_env = build_subprocess_env(
+                    base={},
+                    extra=self.env,
+                    profile_home=boundary.target_home,
+                    source_profile_home=boundary.source_home,
+                    enforce_profile_boundary=True,
+                )
+            else:
+                explicit_env = build_subprocess_env(base={}, extra=self.env)
+            env.update(explicit_env)
         env["HERMES_COMPUTE_HOST_HEARTBEAT_SECS"] = str(self.heartbeat_secs)
         env.setdefault("PYTHONPATH", str(_repo_root()))
         if str(_repo_root()) not in env["PYTHONPATH"].split(os.pathsep):
