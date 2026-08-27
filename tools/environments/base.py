@@ -427,7 +427,15 @@ def _popen_bash(
     from tools.environments.local import build_subprocess_env
 
     base_env = kwargs.pop("env", None)
-    kwargs["env"] = build_subprocess_env(base=base_env)
+    profile_home = kwargs.pop("profile_home", None)
+    source_profile_home = kwargs.pop("source_profile_home", None)
+    enforce_profile_boundary = bool(kwargs.pop("enforce_profile_boundary", False))
+    kwargs["env"] = build_subprocess_env(
+        base=base_env,
+        profile_home=profile_home,
+        source_profile_home=source_profile_home,
+        enforce_profile_boundary=enforce_profile_boundary,
+    )
     kwargs.setdefault("creationflags", windows_hide_flags())
     proc = subprocess.Popen(
         cmd,
@@ -785,7 +793,7 @@ class BaseEnvironment(ABC):
                     fail_closed_external=True,
                 )
                 names = (
-                    *get_all_passthrough(),
+                    *get_all_passthrough(profile_home=boundary.target_home),
                     *self._additional_profile_scoped_passthrough_names(),
                     *source_owned_names,
                 )

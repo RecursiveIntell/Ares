@@ -111,6 +111,18 @@ def _load_hermes_env_vars() -> dict[str, str]:
         return {}
 
 
+def _credential_file_mounts_for_boundary(profile_boundary) -> list[dict[str, str]]:
+    """Return mounts only when their process-global config cache is unambiguous."""
+    if profile_boundary is not None:
+        # tools.credential_files remains a separate owner and currently caches
+        # config-derived host paths process-wide. Quarantine this capability in
+        # a multiplexer rather than mount a path resolved for a sibling profile.
+        return []
+    from tools.credential_files import get_credential_file_mounts
+
+    return get_credential_file_mounts()
+
+
 # Docker label values must match [a-zA-Z0-9_.-] and stay ≤63 chars to round-trip
 # safely through `docker ps --filter label=key=value`. Profile and task names
 # can technically contain other characters; sanitize defensively.
@@ -1046,12 +1058,13 @@ class DockerEnvironment(BaseEnvironment):
         # Read-only so the container can authenticate but not modify host creds.
         try:
             from tools.credential_files import (
-                get_credential_file_mounts,
                 get_skills_directory_mount,
                 get_cache_directory_mounts,
             )
 
-            for mount_entry in get_credential_file_mounts():
+            for mount_entry in _credential_file_mounts_for_boundary(
+                self._profile_env_boundary
+            ):
                 src = Path(mount_entry["host_path"])
                 if src.is_dir():
                     # Docker-in-Docker: Docker auto-created the source path as
