@@ -215,6 +215,35 @@ def _image_identity(image: str) -> str:
     return hashlib.sha256(image.encode()).hexdigest()
 
 
+def _resolved_image_identity(
+    image_reference: str,
+    resolved_image: str,
+    *,
+    require_immutable: bool,
+) -> str:
+    """Return immutable image authority or a one-use quarantine identity."""
+    resolved_path = Path(resolved_image)
+    if resolved_path.is_file():
+        digest = hashlib.sha256()
+        with resolved_path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    lowered = image_reference.lower()
+    marker = "@sha256:"
+    if marker in lowered:
+        return lowered.split(marker, 1)[1]
+
+    if require_immutable:
+        # A mutable reference that could not be materialized to a local SIF has
+        # no reusable image authority. Give this environment a one-use identity
+        # so neither overlays nor snapshot registry entries can be reused by a
+        # later resolution of the same tag.
+        return f"quarantine-{uuid.uuid4().hex}"
+    return _image_identity(image_reference)
+
+
 def _get_or_build_sif(
     image: str,
     executable: str = "apptainer",
@@ -342,7 +371,6 @@ class SingularityEnvironment(BaseEnvironment):
         self._owner_generation = (
             boundary.target_generation if boundary is not None else ""
         )
-        self._image_authority_id = _image_identity(image)
         self._artifact_epoch = (
             hashlib.sha256(self._owner_generation.encode()).hexdigest()
             if self._owner_generation
@@ -358,6 +386,11 @@ class SingularityEnvironment(BaseEnvironment):
             owner_home=self._owner_home,
             source_home=self._source_home,
             policy_generation=self._owner_generation,
+        )
+        self._image_authority_id = _resolved_image_identity(
+            image,
+            self.image,
+            require_immutable=boundary is not None,
         )
         self.instance_id = f"hermes_{uuid.uuid4().hex[:12]}"
         self._instance_started = False
