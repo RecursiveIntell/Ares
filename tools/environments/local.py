@@ -13,10 +13,14 @@ import tempfile
 import time
 from collections.abc import Mapping
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from hermes_constants import get_process_hermes_home
 from tools.environments.base import BaseEnvironment, _pipe_stdin
 from hermes_cli._subprocess_compat import windows_hide_flags
+
+if TYPE_CHECKING:
+    from agent.secret_scope import ProfileEnvBoundary
 
 _IS_WINDOWS = platform.system() == "Windows"
 
@@ -405,10 +409,8 @@ def _is_blocked_provider_env(key: str) -> bool:
     can rename ``APPTAINERENV_*`` / ``SINGULARITYENV_*`` entries inside the
     container.  Both representations must resolve to the same policy key.
     """
-    return (
-        _credential_target_env_name(key).upper()
-        in _HERMES_PROVIDER_ENV_BLOCKLIST_UPPER
-    )
+    current = frozenset(name.upper() for name in _build_provider_env_blocklist())
+    return _credential_target_env_name(key).upper() in current
 
 # Active-virtualenv markers that must NOT leak into terminal subprocesses.
 # The gateway runs inside its own venv, so its process environment carries
@@ -522,8 +524,11 @@ def _get_configured_bws_token_env() -> str:
         )
         if isinstance(configured, str) and configured.strip():
             name = configured.strip()
-    except Exception:
-        pass
+    except Exception as exc:
+        # A remapped bootstrap name may have no credential-looking suffix. If
+        # config authority is unavailable, returning the default would let that
+        # arbitrary name cross. Refuse the child decision instead of widening.
+        raise RuntimeError("Bitwarden token policy unavailable") from exc
     return name
 
 
@@ -533,8 +538,10 @@ def _plugin_terminal_env_strip_keys() -> frozenset:
         from agent.terminal_env_registry import plugin_strip_env_keys
 
         return plugin_strip_env_keys()
-    except Exception:
-        return frozenset()
+    except Exception as exc:
+        # An unavailable plugin registry is not an empty deny set. Treat it as
+        # degraded policy and refuse the child boundary.
+        raise RuntimeError("plugin terminal environment policy unavailable") from exc
 
 
 def _is_credential_shaped_password(key: str) -> bool:
@@ -669,6 +676,7 @@ def _sanitize_subprocess_env(
     protected_base = dict(base_env or {})
     boundary = None
     boundary_active = enforce_profile_boundary
+    cross_profile = False
     try:
         from agent.secret_scope import (
             build_profile_env_boundary,
@@ -681,19 +689,24 @@ def _sanitize_subprocess_env(
                 source_home=source_profile_home,
                 target_home=profile_home,
             )
+            cross_profile = boundary.source_home != boundary.target_home
             protected_base = boundary.sanitize(protected_base)
     except Exception as exc:
         if enforce_profile_boundary or boundary_active:
             raise RuntimeError(
                 "profile environment boundary could not be constructed; refusing "
-                "to spawn with ambient environment"
+                f"to spawn with ambient environment: {exc}"
             ) from exc
         logger.debug("profile environment boundary unavailable outside multiplex", exc_info=True)
 
     try:
         from tools.env_passthrough import (
-            is_env_passthrough as _is_passthrough,
+            is_env_passthrough as _is_passthrough_for_profile,
             resolve_passthrough_value as _resolve_passthrough_value,
+        )
+        _is_passthrough = lambda name: _is_passthrough_for_profile(  # noqa: E731
+            name,
+            profile_home=profile_home,
         )
     except Exception:
         _is_passthrough = lambda _: False  # noqa: E731
@@ -712,7 +725,7 @@ def _sanitize_subprocess_env(
         passthrough = _is_passthrough(key)
         if _is_blocked_provider_env(key) and not passthrough:
             continue
-        if boundary_active and _is_credential_shaped_password(key) and not passthrough:
+        if cross_profile and _is_credential_shaped_password(key) and not passthrough:
             continue
         resolved = _resolve_passthrough_value(key, value) if passthrough else value
         if resolved is not None:
@@ -732,7 +745,7 @@ def _sanitize_subprocess_env(
             passthrough = _is_passthrough(key)
             if _is_blocked_provider_env(key) and not passthrough:
                 continue
-            if boundary_active and _is_credential_shaped_password(key) and not passthrough:
+            if cross_profile and _is_credential_shaped_password(key) and not passthrough:
                 continue
             resolved = _resolve_passthrough_value(key, value) if passthrough else value
             if resolved is not None:
@@ -743,6 +756,12 @@ def _sanitize_subprocess_env(
     # source-owned credential after the initial protected-base sanitization.
     if boundary_active and boundary is not None:
         sanitized = boundary.sanitize(sanitized)
+        sanitized = _materialize_target_passthrough_values(
+            sanitized,
+            boundary,
+            is_passthrough=_is_passthrough,
+            plugin_strip=_plugin_strip,
+        )
     sanitized = _finalize_child_env_policy(
         sanitized,
         _is_passthrough,
@@ -751,7 +770,7 @@ def _sanitize_subprocess_env(
             for key in (extra_env or {})
             if key.upper().startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX)
         },
-        enforce_password_policy=boundary_active,
+        enforce_password_policy=cross_profile,
     )
 
     # An explicit target profile is authoritative for both HERMES_HOME and the
@@ -789,6 +808,38 @@ def _sanitize_subprocess_env(
     sanitized = _scrub_delegated_child_kanban_env(sanitized)
 
     return sanitized
+
+
+def _materialize_target_passthrough_values(
+    env: dict[str, str],
+    boundary: "ProfileEnvBoundary",
+    *,
+    is_passthrough,
+    plugin_strip: frozenset[str] | set[str],
+) -> dict[str, str]:
+    """Add exact target-authored passthrough grants absent from ambient env.
+
+    The profile boundary is the value authority and the target profile's
+    passthrough configuration is the policy authority.  Keeping this step
+    shared prevents foreground local execution and process-registry execution
+    from disagreeing about target-only grants.
+    """
+    result = dict(env)
+    if boundary.source_home == boundary.target_home:
+        return result
+    for key, value in boundary.compiled_target_values().items():
+        if not is_passthrough(key):
+            continue
+        if _is_hermes_internal_secret(key) or key in plugin_strip:
+            continue
+        if _is_blocked_provider_env(key):
+            continue
+        # ``boundary.target_values`` is already an immutable, identity-bound
+        # target-profile snapshot. Re-resolving it through the ambient
+        # ContextVar would make a valid explicit boundary depend on caller
+        # thread context and can drop target-only grants on recovery threads.
+        result[key] = str(value)
+    return result
 
 
 def _scrub_delegated_child_kanban_env(env: dict[str, str]) -> dict[str, str]:
@@ -857,7 +908,11 @@ _ALWAYS_STRIP_KEYS: frozenset[str] = frozenset({
 })
 
 
-def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str]:
+def hermes_subprocess_env(
+    *,
+    inherit_credentials: bool = False,
+    profile_boundary: "ProfileEnvBoundary | None" = None,
+) -> dict[str, str]:
     """Build a sanitized environment dict for a spawned subprocess.
 
     Centralized helper for the **non-terminal** spawn surface (browser,
@@ -894,13 +949,15 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     from agent.secret_scope import build_profile_env_boundary, is_multiplex_active
 
     multiplex_active = is_multiplex_active()
-    if multiplex_active:
-        boundary = build_profile_env_boundary()
+    boundary = profile_boundary
+    boundary_active = multiplex_active or boundary is not None
+    if boundary_active:
+        boundary = boundary or build_profile_env_boundary()
         env = boundary.sanitize(env)
         if inherit_credentials:
-            for key, value in boundary.target_values.items():
+            for key, value in boundary.compiled_target_values().items():
                 target_name = _credential_target_env_name(key).upper()
-                if target_name in _MODEL_PROVIDER_ENV_NAMES_UPPER:
+                if target_name in _build_model_provider_env_names():
                     env[str(key)] = str(value)
 
     # Tier 1 — always strip, including mixed-case Windows keys and
@@ -917,7 +974,10 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
             env.pop(key, None)
     # Password-shaped variables are provenance-isolated only when crossing
     # profile authority. Single-profile helpers retain the trusted shell contract.
-    if multiplex_active:
+    cross_profile = bool(
+        boundary is not None and boundary.source_home != boundary.target_home
+    )
+    if cross_profile:
         for key in list(env):
             if _is_credential_shaped_password(key):
                 env.pop(key, None)
@@ -941,7 +1001,10 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     # Windows UTF-8 safety for spawned processes (#31420).
     env.setdefault("PYTHONUTF8", "1")
 
-    _inject_context_hermes_home(env)
+    if boundary is not None:
+        env["HERMES_HOME"] = str(boundary.target_home)
+    else:
+        _inject_context_hermes_home(env)
     from hermes_constants import apply_subprocess_home_env
     apply_subprocess_home_env(env)
 
@@ -1642,6 +1705,12 @@ def _make_run_env(env: dict) -> dict:
                 run_env[k] = value
     if _multiplex_active and _boundary is not None:
         run_env = _boundary.sanitize(run_env)
+        run_env = _materialize_target_passthrough_values(
+            run_env,
+            _boundary,
+            is_passthrough=_is_passthrough,
+            plugin_strip=_plugin_terminal_env_strip_keys(),
+        )
     run_env = _finalize_child_env_policy(
         run_env,
         _is_passthrough,
