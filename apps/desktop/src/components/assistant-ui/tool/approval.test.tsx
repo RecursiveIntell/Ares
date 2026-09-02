@@ -100,9 +100,11 @@ describe('PendingToolApproval', () => {
     const request = mockGateway()
     const witness = { approval_id: 'approval:test-1', key_id: 'desktop-key', signature: [1, 2, 3] }
     const sign = vi.fn().mockResolvedValue(witness)
+
     const desktop = window as unknown as {
       hermesDesktop?: { productionPermit: { sign: (envelope: unknown) => Promise<unknown> } }
     }
+
     desktop.hermesDesktop ??= { productionPermit: { sign: vi.fn() } }
     const previousSigner = desktop.hermesDesktop.productionPermit.sign
     desktop.hermesDesktop.productionPermit.sign = sign

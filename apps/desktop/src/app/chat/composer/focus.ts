@@ -256,9 +256,9 @@ export const shouldAutoFocusComposer = (
 
   return Boolean(
     !activeElement ||
-      activeElement === editor ||
-      activeElement === ownerDocument.body ||
-      activeElement === ownerDocument.documentElement
+    activeElement === editor ||
+    activeElement === ownerDocument.body ||
+    activeElement === ownerDocument.documentElement
   )
 }
 

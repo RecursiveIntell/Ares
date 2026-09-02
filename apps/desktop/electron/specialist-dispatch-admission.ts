@@ -31,13 +31,15 @@ const RUN_ID = /^specialist-run-[a-z0-9][a-z0-9-]{7,63}$/
 function valid(request: SpecialistDispatchAdmissionRequest): boolean {
   return Boolean(
     request &&
-      typeof request.runId === 'string' && RUN_ID.test(request.runId) &&
-      typeof request.requestDigest === 'string' && DIGEST.test(request.requestDigest) &&
-      Array.isArray(request.profileIds) &&
-      request.profileIds.length >= 1 &&
-      request.profileIds.length <= 4 &&
-      request.profileIds.every(profile => typeof profile === 'string' && PROFILE.test(profile)) &&
-      request.profileIds.every((profile, index, profiles) => index === 0 || profiles[index - 1] < profile)
+    typeof request.runId === 'string' &&
+    RUN_ID.test(request.runId) &&
+    typeof request.requestDigest === 'string' &&
+    DIGEST.test(request.requestDigest) &&
+    Array.isArray(request.profileIds) &&
+    request.profileIds.length >= 1 &&
+    request.profileIds.length <= 4 &&
+    request.profileIds.every(profile => typeof profile === 'string' && PROFILE.test(profile)) &&
+    request.profileIds.every((profile, index, profiles) => index === 0 || profiles[index - 1] < profile)
   )
 }
 
@@ -47,7 +49,10 @@ function valid(request: SpecialistDispatchAdmissionRequest): boolean {
  * Electron spawn path receives only an admitted request identity.
  */
 export function createSpecialistDispatchAdmission(deps: SpecialistDispatchAdmissionDeps) {
-  const starts = new Map<string, { digest: string; result: Promise<SpecialistDispatchAdmissionResult>; entry?: PoolEvictionEntry }>()
+  const starts = new Map<
+    string,
+    { digest: string; result: Promise<SpecialistDispatchAdmissionResult>; entry?: PoolEvictionEntry }
+  >()
   const terminals = new Map<string, 'released' | 'runner_failed' | 'cleanup_failed'>()
 
   function poolKey(runId: string): string {
@@ -56,13 +61,17 @@ export function createSpecialistDispatchAdmission(deps: SpecialistDispatchAdmiss
 
   function release(runId: string, terminal: 'released' | 'runner_failed' | 'cleanup_failed'): void {
     const record = starts.get(runId)
+
     if (!record) {
       return
     }
+
     const key = poolKey(runId)
+
     if (record.entry && deps.pool.get(key) === record.entry) {
       deps.pool.delete(key)
     }
+
     terminals.set(runId, terminal)
   }
 
@@ -71,14 +80,19 @@ export function createSpecialistDispatchAdmission(deps: SpecialistDispatchAdmiss
       if (!valid(request)) {
         return { outcome: 'rejected', reasonCode: 'INVALID_REQUEST', runId: String(request?.runId || '') }
       }
+
       const prior = starts.get(request.runId)
+
       if (prior) {
         if (prior.digest !== request.requestDigest) {
           return { outcome: 'rejected', reasonCode: 'IDEMPOTENCY_CONFLICT', runId: request.runId }
         }
+
         return prior.result
       }
+
       const reservedCapacity = request.profileIds.length
+
       const result = Promise.resolve().then(async (): Promise<SpecialistDispatchAdmissionResult> => {
         if (!canAdmitLocalBackend(deps.pool.entries(), deps.maxCapacity, reservedCapacity)) {
           return {
@@ -88,26 +102,34 @@ export function createSpecialistDispatchAdmission(deps: SpecialistDispatchAdmiss
             runId: request.runId
           }
         }
+
         const entry: PoolEvictionEntry = {
           process: null,
           countsTowardPoolCap: true,
           capacityUnits: reservedCapacity,
           lastActiveAt: Date.now()
         }
+
         starts.get(request.runId)!.entry = entry
         deps.pool.set(poolKey(request.runId), entry)
+
         try {
           entry.process = await deps.spawnRunner(request)
+
           return { outcome: 'admitted', reasonCode: 'ADMITTED', reservedCapacity, runId: request.runId }
         } catch {
           if (deps.pool.get(poolKey(request.runId)) === entry) {
             deps.pool.delete(poolKey(request.runId))
           }
+
           starts.delete(request.runId)
+
           return { outcome: 'rejected', reasonCode: 'RUNNER_START_FAILED', runId: request.runId }
         }
       })
+
       starts.set(request.runId, { digest: request.requestDigest, result })
+
       return result
     },
     hasActive(): boolean {

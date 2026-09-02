@@ -140,6 +140,7 @@ function validateEnvelope(envelope: ProductionApprovalEnvelope): void {
   }
 
   const c = envelope.constraints
+
   if (
     c.validity_ms <= 0 ||
     c.validity_ms > MAX_VALIDITY_MS ||
@@ -158,6 +159,7 @@ function validateEnvelope(envelope: ProductionApprovalEnvelope): void {
 
   const root = path.resolve(c.allowed_write_root)
   const target = path.resolve(envelope.call.args.path)
+
   if (target === root || !target.startsWith(`${root}${path.sep}`)) {
     throw new Error('production permit path escapes root')
   }
@@ -183,7 +185,10 @@ function signingPayload(witness: Omit<ProductionApprovalWitness, 'signature'>): 
   }
 }
 
-export function createProductionPermitController(userDataDir: string, storage: SafeStoragePort): ProductionPermitController {
+export function createProductionPermitController(
+  userDataDir: string,
+  storage: SafeStoragePort
+): ProductionPermitController {
   return createProductionPermitControllerWithClock(userDataDir, storage, () => new Date())
 }
 
@@ -202,13 +207,16 @@ export function createProductionPermitControllerWithClock(
     if (!storage.isEncryptionAvailable()) {
       throw new Error('production permit safeStorage unavailable')
     }
+
     fs.mkdirSync(userDataDir, { recursive: true, mode: 0o700 })
     const filename = path.join(userDataDir, KEY_FILE)
     let stored: StoredKey
+
     if (fs.existsSync(filename)) {
       const encrypted = fs.readFileSync(filename)
       const plaintext = storage.decryptString(encrypted)
       stored = JSON.parse(plaintext) as StoredKey
+
       if (!stored.key_id || !stored.private_key_pkcs8 || !stored.public_key_spki) {
         throw new Error('production permit key material malformed')
       }
@@ -227,7 +235,9 @@ export function createProductionPermitControllerWithClock(
       fs.renameSync(temporary, filename)
       fs.chmodSync(filename, 0o600)
     }
+
     cached = stored
+
     return stored
   }
 
@@ -238,6 +248,7 @@ export function createProductionPermitControllerWithClock(
       const now = clock()
       const issuedAt = rustDateTime(now)
       const expiresAt = rustDateTime(new Date(now.getTime() + envelope.constraints.validity_ms))
+
       const witnessWithoutSignature: Omit<ProductionApprovalWitness, 'signature'> = {
         approval_id: envelope.approval_id,
         mission_ref: envelope.mission_ref,
@@ -264,23 +275,36 @@ export function createProductionPermitControllerWithClock(
         outcome_policy: 'terminal_quarantine',
         key_id: stored.key_id
       }
-      const privateKey = crypto.createPrivateKey({ key: Buffer.from(stored.private_key_pkcs8, 'base64'), format: 'der', type: 'pkcs8' })
-      const signature = crypto.sign(null, Buffer.from(canonicalize(signingPayload(witnessWithoutSignature))), privateKey)
+
+      const privateKey = crypto.createPrivateKey({
+        key: Buffer.from(stored.private_key_pkcs8, 'base64'),
+        format: 'der',
+        type: 'pkcs8'
+      })
+      const signature = crypto.sign(
+        null,
+        Buffer.from(canonicalize(signingPayload(witnessWithoutSignature))),
+        privateKey
+      )
+
       return { ...witnessWithoutSignature, signature: [...signature] }
     },
     publicKeyForEnrollment() {
       const stored = loadOrCreate()
       const publicKey = Buffer.from(stored.public_key_spki, 'base64')
-      const jwk = crypto
-        .createPublicKey({ key: publicKey, format: 'der', type: 'spki' })
-        .export({ format: 'jwk' })
+
+      const jwk = crypto.createPublicKey({ key: publicKey, format: 'der', type: 'spki' }).export({ format: 'jwk' })
+
       if (typeof jwk.x !== 'string') {
         throw new Error('production verifier key cannot be exported as Ed25519 raw bytes')
       }
+
       const verifierKey = Buffer.from(jwk.x, 'base64url')
+
       if (verifierKey.length !== 32) {
         throw new Error('production verifier key has unexpected length')
       }
+
       return {
         key_id: stored.key_id,
         public_key: publicKey.toString('base64'),

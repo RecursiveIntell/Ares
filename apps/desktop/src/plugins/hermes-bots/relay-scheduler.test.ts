@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const { sdkMock } = vi.hoisted(() => {
-  const atom = <T,>(initial: T) => {
+  const atom = <T>(initial: T) => {
     let value = initial
 
     return {
@@ -68,7 +68,7 @@ const { sdkMock } = vi.hoisted(() => {
       ToolsetConfigPanel: component,
       McpTab: component,
       useQuery: vi.fn(),
-      useValue: <T,>(store: { get: () => T }) => store.get()
+      useValue: <T>(store: { get: () => T }) => store.get()
     }
   }
 })
@@ -173,25 +173,29 @@ describe('Bot relay delivery scheduler', () => {
     const target = { connectionId: 'target', profile: 'ops', targetProfile: 'ops' }
     const replies: Array<Record<string, unknown>> = []
     sdkMock.host.profileRoutes = vi.fn(async () => [sender, target])
-    sdkMock.host.requestProfile = vi.fn(async (route: { connectionId: string }, method: string, params: Record<string, unknown>) => {
-      if (route.connectionId === 'sender' && method === 'bot_relay.outbox.drain') {
-        return { envelopes: [{ id: 'a'.repeat(32), target_connection: 'target', target_profile: 'ops', message: 'hello' }] }
+    sdkMock.host.requestProfile = vi.fn(
+      async (route: { connectionId: string }, method: string, params: Record<string, unknown>) => {
+        if (route.connectionId === 'sender' && method === 'bot_relay.outbox.drain') {
+          return {
+            envelopes: [{ id: 'a'.repeat(32), target_connection: 'target', target_profile: 'ops', message: 'hello' }]
+          }
+        }
+
+        if (route.connectionId === 'target' && method === 'bot_relay.deliver') {
+          expect(params).toMatchObject({ profile: 'ops', message: 'hello' })
+
+          return { reply: 'world' }
+        }
+
+        if (route.connectionId === 'sender' && method === 'bot_relay.reply') {
+          replies.push(params)
+
+          return { ok: true }
+        }
+
+        throw new Error(`unexpected RPC: ${route.connectionId} ${method}`)
       }
-
-      if (route.connectionId === 'target' && method === 'bot_relay.deliver') {
-        expect(params).toMatchObject({ profile: 'ops', message: 'hello' })
-
-        return { reply: 'world' }
-      }
-
-      if (route.connectionId === 'sender' && method === 'bot_relay.reply') {
-        replies.push(params)
-
-        return { ok: true }
-      }
-
-      throw new Error(`unexpected RPC: ${route.connectionId} ${method}`)
-    })
+    )
 
     await (await botPlugin()).drainRelayOutboxes()
 

@@ -288,6 +288,7 @@ test('shutdown coordinator returns one promise and awaits teardown exactly once'
 
 test('orphan reaper coalesces only the active sweep and reruns after settlement', async () => {
   const first = deferred()
+
   const reap = vi.fn(async () => {
     if (reap.mock.calls.length === 1) {
       await first.promise
@@ -295,6 +296,7 @@ test('orphan reaper coalesces only the active sweep and reruns after settlement'
 
     return [reap.mock.calls.length]
   })
+
   const observed: number[][] = []
   const run = createBackendOrphanReaper(reap, pids => observed.push(pids))
 
@@ -319,6 +321,7 @@ test('orphan reaper permits a later retry after failure', async () => {
     .fn<() => Promise<number[]>>()
     .mockRejectedValueOnce(new Error('process table unavailable'))
     .mockResolvedValueOnce([])
+
   const run = createBackendOrphanReaper(reap)
 
   await assert.rejects(run(), /process table unavailable/)

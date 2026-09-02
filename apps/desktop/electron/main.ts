@@ -1407,6 +1407,7 @@ let softRehomeInProgress = false
 // byte-for-byte the single-backend behavior.
 const backendPool = new Map() // profile -> { process, port, token, connectionPromise, lastActiveAt }
 const profileDeletionGate = new ProfileDeletionGate()
+
 // Keep the pool light: cap concurrent profile backends (LRU eviction) and reap
 // idle ones. A user idles at exactly the primary backend; pool backends only
 // exist while a non-primary profile is actively being chatted through.
@@ -1419,6 +1420,7 @@ const POOL_MAX_BACKENDS = normalizeProfileBackendPoolMax(
   process.env.HERMES_DESKTOP_POOL_MAX,
   readProfileBackendPoolSettings(app.getPath('userData')).maxBackends
 )
+
 const POOL_IDLE_MS = Math.max(60_000, Number(process.env.HERMES_DESKTOP_POOL_IDLE_MS) || 10 * 60_000)
 
 // A backend touched within this window has a live renderer socket (the keepalive
@@ -12232,7 +12234,9 @@ const specialistDispatchAdmission = createSpecialistDispatchAdmission({
 
     const timeout = setTimeout(() => {
       timedOut = true
-      rememberLog(`[specialist] runner ${request.runId} exceeded the bounded deadline; stopping its owned process group`)
+      rememberLog(
+        `[specialist] runner ${request.runId} exceeded the bounded deadline; stopping its owned process group`
+      )
       void poolStopper.stop(specialistDispatchAdmission.poolKey(request.runId))
     }, SPECIALIST_RUNNER_TIMEOUT_MS)
 
@@ -16990,6 +16994,7 @@ ipcMain.handle('hermes:production-permit:sign', (event, envelope) => {
   if (!event.sender || event.sender.isDestroyed()) {
     throw new Error('production permit renderer unavailable')
   }
+
   return productionPermitController.requestSignedWitness(envelope)
 })
 ipcMain.handle('hermes:production-permit:public-key', () => productionPermitController.publicKeyForEnrollment())
@@ -17523,7 +17528,9 @@ app.whenReady().then(() => {
   installRemoteHeaderRules()
   registerDeepLinkProtocol()
   void startSpecialistDispatchTransport().catch(error => {
-    rememberLog(`[specialist] explicit dispatch transport unavailable: ${error instanceof Error ? error.message : String(error)}`)
+    rememberLog(
+      `[specialist] explicit dispatch transport unavailable: ${error instanceof Error ? error.message : String(error)}`
+    )
   })
 
   ensureWslWindowsFonts()
