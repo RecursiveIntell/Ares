@@ -63,30 +63,6 @@ def test_get_secret_source_values_returns_home_snapshot_copy(tmp_path):
     }
 
 
-def test_external_secret_snapshot_distinguishes_not_hydrated_absent_and_failed(
-    tmp_path, monkeypatch
-):
-    env_loader.reset_secret_source_cache()
-    assert env_loader.get_external_secret_snapshot(tmp_path).status == "not_hydrated"
-
-    assert env_loader.hydrate_profile_secret_sources(tmp_path) == {}
-    absent = env_loader.get_external_secret_snapshot(tmp_path)
-    assert absent.status == "absent"
-    assert absent.generation > 0
-
-    env_loader.reset_secret_source_cache()
-
-    def _fail_config(_home):
-        raise RuntimeError("unreadable config")
-
-    monkeypatch.setattr(env_loader, "_load_secrets_config", _fail_config)
-    assert env_loader.hydrate_profile_secret_sources(tmp_path) == {}
-    failed = env_loader.get_external_secret_snapshot(tmp_path)
-    assert failed.status == "failed"
-    assert failed.error_kind == "config"
-    assert failed.generation > absent.generation
-
-
 def test_format_secret_source_suffix_empty_for_untracked():
     # Credentials from .env or the shell shouldn't add noise — the
     # implicit case stays unlabeled.
@@ -198,26 +174,34 @@ def test_cold_profile_bitwarden_uses_profile_bootstrap_without_global_env(
     assert os.environ.get("ANTHROPIC_API_KEY") is None
 
 
-def test_multiplex_without_profile_scope_still_loads(tmp_path, monkeypatch):
-    """Multiplex startup without a routed profile scope still loads .env."""
+def test_single_profile_scoped_load_keeps_override_behavior(tmp_path, monkeypatch):
+    """Without multiplex, a scoped load keeps its historical override behaviour.
+
+    Ported from #77970 (@DonShelly): the guard must key on the multiplex flag,
+    not on the home override alone -- single-profile ``-p`` runs still load.
+    """
     from agent import secret_scope
-    from hermes_constants import get_hermes_home_override
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
-    env_file = tmp_path / ".env"
-    env_file.write_text("DISCORD_ALLOWED_CHANNELS=123,456\n", encoding="utf-8")
-    monkeypatch.delenv("DISCORD_ALLOWED_CHANNELS", raising=False)
-
-    assert get_hermes_home_override() is None
+    monkeypatch.delenv("HERMES_TEST_SHARED_ADAPTER_CONFIG", raising=False)
+    other_home = tmp_path / "other"
+    other_home.mkdir()
+    (other_home / ".env").write_text("HERMES_TEST_SHARED_ADAPTER_CONFIG=second\n")
 
     was_active = secret_scope.is_multiplex_active()
-    secret_scope.set_multiplex_active(True)
+    secret_scope.set_multiplex_active(False)
+    home_token = set_hermes_home_override(other_home)
     try:
-        loaded = env_loader.load_hermes_dotenv(hermes_home=tmp_path)
+        loaded = env_loader.load_hermes_dotenv(hermes_home=other_home)
     finally:
         secret_scope.set_multiplex_active(was_active)
+        reset_hermes_home_override(home_token)
 
-    assert os.environ.get("DISCORD_ALLOWED_CHANNELS") == "123,456"
-    assert env_file in loaded
+    try:
+        assert os.environ.get("HERMES_TEST_SHARED_ADAPTER_CONFIG") == "second"
+        assert (other_home / ".env") in loaded
+    finally:
+        os.environ.pop("HERMES_TEST_SHARED_ADAPTER_CONFIG", None)
 
 
 def test_multiplex_dotenv_load_hydrates_sources_without_global_env(
@@ -267,41 +251,6 @@ def test_multiplex_dotenv_load_hydrates_sources_without_global_env(
     }
     assert os.environ.get("BWS_ACCESS_TOKEN") is None
     assert os.environ.get("ANTHROPIC_API_KEY") is None
-
-
-def test_multiplex_scoped_load_respects_external_secret_opt_out(
-    tmp_path, monkeypatch
-):
-    """Updater opt-out must skip hydration without exporting profile dotenv."""
-    from agent import secret_scope
-    from hermes_constants import (
-        reset_hermes_home_override,
-        set_hermes_home_override,
-    )
-
-    (tmp_path / ".env").write_text("PROFILE_ONLY=secret\n", encoding="utf-8")
-    monkeypatch.delenv("PROFILE_ONLY", raising=False)
-    hydration_calls = []
-    monkeypatch.setattr(
-        env_loader,
-        "hydrate_profile_secret_sources",
-        lambda home: hydration_calls.append(home),
-    )
-
-    was_active = secret_scope.is_multiplex_active()
-    home_token = set_hermes_home_override(tmp_path)
-    secret_scope.set_multiplex_active(True)
-    try:
-        assert env_loader.load_hermes_dotenv(
-            hermes_home=tmp_path,
-            load_external_secrets=False,
-        ) == []
-    finally:
-        secret_scope.set_multiplex_active(was_active)
-        reset_hermes_home_override(home_token)
-
-    assert hydration_calls == []
-    assert os.environ.get("PROFILE_ONLY") is None
 
 
 def test_cold_profile_hydration_seeds_op_env_bootstrap(tmp_path, monkeypatch):

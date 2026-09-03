@@ -10717,6 +10717,32 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
+def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
+    """Wrap a managed-gateway worker in the shared restart-safe scope."""
+    if task.current_run_id is None:
+        # Outside managed systemd this is harmless, but a managed dispatch must
+        # never mint an untraceable scope.  Check topology through the shared
+        # helper first, using a placeholder suffix that cannot be launched.
+        from tools.process_registry import restart_safe_gateway_child_argv
+
+        scoped = restart_safe_gateway_child_argv(
+            command, unit_suffix=f"kanban-{task.id}-run-missing"
+        )
+        if scoped is not command:
+            raise RuntimeError(
+                "cannot create restart-safe systemd scope for Kanban worker: "
+                "the claimed task has no current run id"
+            )
+        return command
+
+    from tools.process_registry import restart_safe_gateway_child_argv
+
+    return restart_safe_gateway_child_argv(
+        command,
+        unit_suffix=f"kanban-{task.id}-run-{task.current_run_id}",
+    )
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -10896,6 +10922,12 @@ def _default_spawn(
         # turn, prints text, exits rc=0, and the dispatcher records a
         # protocol violation (incident 2026-06-09 t_d9cbe312).
         cmd.append("-Q")
+
+    # A worker spawned by a managed systemd gateway must leave the gateway's
+    # cgroup before startup; otherwise restarting the service kills the worker
+    # that is performing the handoff.
+    cmd = _restart_safe_worker_argv(task, cmd)
+
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and
@@ -11686,8 +11718,8 @@ def purge_stale_done_notify_subs(
     *,
     max_age_days: int = 30,
 ) -> int:
-    """Delete notify subscriptions whose task has sat in ``done`` untouched
-    for longer than ``max_age_days``.
+    """Delete notify subscriptions whose task has sat in ``done`` or
+    ``blocked`` untouched for longer than ``max_age_days``.
 
     The notifier keeps subscriptions alive through ``done`` because a
     completed task can be reopened (review corrections, continuation) and
@@ -11696,7 +11728,10 @@ def purge_stale_done_notify_subs(
     subscription rows forever — each one scanned every notifier tick.
     This GC bounds that: a task that has been ``done`` with no new events
     for the retention window is treated as settled and its subscriptions
-    are purged. Age is measured from the task's most recent event
+    are purged. ``blocked`` tasks (circuit-breaker trips, dead workers)
+    are reaped on the same clock — they are abandoned, not idle, unlike a
+    ``backlog``/``ready`` card that is merely waiting for pickup (#100955).
+    Age is measured from the task's most recent event
     (falling back to ``completed_at`` then ``created_at``), so ANY
     activity — including a reopen, which also moves the task off
     ``done`` — resets or exempts it.
@@ -11715,7 +11750,7 @@ def purge_stale_done_notify_subs(
         cur = conn.execute(
             "DELETE FROM kanban_notify_subs WHERE task_id IN ("
             " SELECT t.id FROM tasks t"
-            " WHERE t.status = 'done'"
+            " WHERE t.status IN ('done', 'blocked')"
             " AND COALESCE("
             "  (SELECT MAX(e.created_at) FROM task_events e"
             "   WHERE e.task_id = t.id),"
