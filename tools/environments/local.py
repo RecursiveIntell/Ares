@@ -786,7 +786,10 @@ def _finalize_child_env_policy(
             env.pop(key, None)
         elif target_upper in plugin_strip:
             env.pop(key, None)
-        elif _is_blocked_provider_env(target_key) and not allow_credential:
+        elif (
+            _is_blocked_provider_env(target_key)
+            and not (allow_credential or _is_terminal_first_party_env(target_key))
+        ):
             env.pop(key, None)
         elif (
             enforce_password_policy
