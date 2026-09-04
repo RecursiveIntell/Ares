@@ -326,7 +326,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
     )
 
 
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 27
 
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
@@ -507,6 +507,53 @@ CREATE TABLE IF NOT EXISTS session_turn_leases (
     acquired_at REAL NOT NULL,
     expires_at REAL NOT NULL
 );
+
+-- Server-owned mobile device enrollment. Raw bearer values never enter this
+-- table: verification uses per-device salts and digests; revocation persists
+-- across gateway restart.
+CREATE TABLE IF NOT EXISTS mobile_devices (
+    device_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    label TEXT NOT NULL,
+    public_key_fingerprint TEXT NOT NULL,
+    public_key_der BLOB,
+    scopes_json TEXT NOT NULL DEFAULT '[]',
+    enrollment_challenge_id TEXT,
+    token_salt BLOB NOT NULL,
+    token_digest BLOB NOT NULL,
+    access_expires_at REAL NOT NULL DEFAULT 0,
+    refresh_token_salt BLOB,
+    refresh_token_digest BLOB,
+    previous_refresh_token_salt BLOB,
+    previous_refresh_token_digest BLOB,
+    refresh_expires_at REAL,
+    created_at REAL NOT NULL,
+    last_seen_at REAL,
+    revoked_at REAL,
+    revoked_by_user_id TEXT,
+    revocation_reason TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mobile_devices_fingerprint_owner
+    ON mobile_devices(public_key_fingerprint, user_id, provider);
+CREATE INDEX IF NOT EXISTS idx_mobile_devices_owner_active
+    ON mobile_devices(user_id, provider, revoked_at);
+
+CREATE TABLE IF NOT EXISTS mobile_enrollment_challenges (
+    challenge_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    label TEXT NOT NULL,
+    host_id TEXT NOT NULL,
+    challenge_digest BLOB NOT NULL,
+    requested_scopes_json TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    consumed_at REAL,
+    consumed_device_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_mobile_enrollment_challenges_expiry
+    ON mobile_enrollment_challenges(expires_at, consumed_at);
 
 CREATE TABLE IF NOT EXISTS async_delegations (
     delegation_id TEXT PRIMARY KEY,

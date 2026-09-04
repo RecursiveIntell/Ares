@@ -63,6 +63,23 @@ export interface GatewayReadyV2 {{
   capabilities: GatewayCapabilities
 }}
 
+export const MOBILE_ENROLLMENT_DOMAIN = "ares-mobile-enrollment-v1" as const
+
+export interface MobileEnrollmentChallengeV1 {{
+  challenge_id: string
+  host_id: string
+  expires_at: number
+  requested_scopes: string[]
+}}
+
+export interface MobileEnrollmentProofV1 {{
+  challenge_id: string
+  challenge: string
+  app_instance_id: string
+  public_key_der_b64: string
+  signature_b64: string
+}}
+
 export interface SessionOwnerScope {{
   host_id: string
   connection_id: string

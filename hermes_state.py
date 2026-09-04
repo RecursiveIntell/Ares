@@ -19,6 +19,7 @@ import atexit
 import contextlib
 import errno
 import hashlib
+import secrets
 import json
 import logging
 import os
@@ -5145,6 +5146,272 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             else:
                 self._warn_fts5_unavailable(exc)
             return False
+
+    def mobile_enrollment_create_challenge(
+        self,
+        *,
+        user_id: str,
+        provider: str,
+        label: str,
+        host_id: str,
+        requested_scopes: list[str] | tuple[str, ...],
+        ttl_seconds: float = 300.0,
+    ) -> dict[str, Any]:
+        """Create a one-use challenge without persisting its raw value."""
+        from hermes_cli.dashboard_auth.mobile_enrollment import normalize_scopes
+
+        if not user_id or not provider or not host_id:
+            raise ValueError("user, provider, and host identity are required")
+        ttl = float(ttl_seconds)
+        if ttl <= 0 or ttl > 900:
+            raise ValueError("enrollment challenge TTL must be between 1 and 900 seconds")
+        scopes = normalize_scopes(requested_scopes)
+        challenge_id = secrets.token_urlsafe(18)
+        challenge = secrets.token_urlsafe(32)
+        now = time.time()
+        expires_at = now + ttl
+        digest = hashlib.sha256(challenge.encode("utf-8")).digest()
+
+        def _write(conn):
+            conn.execute(
+                "INSERT INTO mobile_enrollment_challenges "
+                "(challenge_id,user_id,provider,label,host_id,challenge_digest,"
+                "requested_scopes_json,created_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    challenge_id,
+                    user_id,
+                    provider,
+                    str(label or "").strip()[:160],
+                    host_id,
+                    digest,
+                    json.dumps(list(scopes), separators=(",", ":")),
+                    now,
+                    expires_at,
+                ),
+            )
+            return {
+                "challenge_id": challenge_id,
+                "challenge": challenge,
+                "host_id": host_id,
+                "expires_at": expires_at,
+                "requested_scopes": list(scopes),
+            }
+
+        return self._execute_write(_write)
+
+    def mobile_device_complete_enrollment(
+        self,
+        *,
+        challenge_id: str,
+        challenge: str,
+        host_id: str,
+        app_instance_id: str,
+        public_key_der: bytes,
+        signature: bytes,
+    ) -> dict[str, Any]:
+        """Verify and atomically consume a challenge before minting a bearer."""
+        from hermes_cli.dashboard_auth.mobile_enrollment import (
+            canonical_enrollment_message,
+            verify_enrollment_signature,
+        )
+
+        if not challenge_id or not challenge or not app_instance_id:
+            raise ValueError("challenge, challenge ID, and app instance are required")
+        if len(app_instance_id) > 200:
+            raise ValueError("app instance ID is too long")
+
+        now = time.time()
+        device_id = secrets.token_urlsafe(24)
+        token = secrets.token_urlsafe(32)
+        access_salt = secrets.token_bytes(32)
+        access_digest = hashlib.sha256(access_salt + token.encode("utf-8")).digest()
+        refresh_token = secrets.token_urlsafe(48)
+        refresh_salt = secrets.token_bytes(32)
+        refresh_digest = hashlib.sha256(refresh_salt + refresh_token.encode("utf-8")).digest()
+        access_expires_at = now + 15 * 60
+        refresh_expires_at = now + 30 * 24 * 60 * 60
+
+        def _write(conn):
+            row = conn.execute(
+                "SELECT * FROM mobile_enrollment_challenges WHERE challenge_id = ?",
+                (challenge_id,),
+            ).fetchone()
+            if row is None or row["consumed_at"] is not None:
+                raise ValueError("enrollment challenge is unknown or already consumed")
+            if float(row["expires_at"]) <= now:
+                raise ValueError("enrollment challenge has expired")
+            if row["host_id"] != host_id:
+                raise ValueError("enrollment host identity mismatch")
+            expected = hashlib.sha256(challenge.encode("utf-8")).digest()
+            if not secrets.compare_digest(expected, row["challenge_digest"]):
+                raise ValueError("enrollment challenge proof mismatch")
+            scopes = json.loads(row["requested_scopes_json"])
+            fingerprint = verify_enrollment_signature(
+                public_key_der=public_key_der,
+                signature=signature,
+                message=canonical_enrollment_message(
+                    challenge_id=challenge_id,
+                    challenge=challenge,
+                    host_id=host_id,
+                    app_instance_id=app_instance_id,
+                    requested_scopes=scopes,
+                    expires_at=float(row["expires_at"]),
+                ),
+            )
+            existing = conn.execute(
+                "SELECT device_id, user_id, provider FROM mobile_devices "
+                "WHERE public_key_fingerprint = ? AND revoked_at IS NULL",
+                (fingerprint,),
+            ).fetchone()
+            if existing is not None:
+                raise ValueError("device public key is already enrolled")
+            conn.execute(
+                "INSERT INTO mobile_devices "
+                "(device_id,user_id,provider,label,public_key_fingerprint,public_key_der,"
+                "scopes_json,enrollment_challenge_id,token_salt,token_digest,access_expires_at,"
+                "refresh_token_salt,refresh_token_digest,refresh_expires_at,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    device_id,
+                    row["user_id"],
+                    row["provider"],
+                    row["label"],
+                    fingerprint,
+                    public_key_der,
+                    json.dumps(scopes, separators=(",", ":")),
+                    challenge_id,
+                    access_salt,
+                    access_digest,
+                    access_expires_at,
+                    refresh_salt,
+                    refresh_digest,
+                    refresh_expires_at,
+                    now,
+                ),
+            )
+            updated = conn.execute(
+                "UPDATE mobile_enrollment_challenges SET consumed_at = ?, "
+                "consumed_device_id = ? WHERE challenge_id = ? AND consumed_at IS NULL",
+                (now, device_id, challenge_id),
+            )
+            if updated.rowcount != 1:
+                raise ValueError("enrollment challenge was consumed concurrently")
+            return {
+                "device_id": device_id,
+                "access_token": token,
+                "device_token": token,
+                "refresh_token": refresh_token,
+                "user_id": row["user_id"],
+                "provider": row["provider"],
+                "public_key_fingerprint": fingerprint,
+                "scopes": scopes,
+                "access_expires_at": access_expires_at,
+                "refresh_expires_at": refresh_expires_at,
+            }
+
+        return self._execute_write(_write)
+
+    def mobile_device_list(self, *, user_id: str, provider: str) -> list[dict[str, Any]]:
+        """List safe device metadata; never return bearer or private-key data."""
+        rows = self._conn.execute(
+            "SELECT device_id,label,public_key_fingerprint,scopes_json,created_at,"
+            "last_seen_at,revoked_at,revocation_reason FROM mobile_devices "
+            "WHERE user_id = ? AND provider = ? ORDER BY created_at DESC",
+            (user_id, provider),
+        ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["scopes"] = json.loads(item.pop("scopes_json") or "[]")
+            result.append(item)
+        return result
+
+    def mobile_device_verify_token(self, token: str) -> dict[str, Any] | None:
+        """Return only an active, unexpired server-resolved device identity."""
+        now = time.time()
+        def _write(conn):
+            for row in conn.execute("SELECT * FROM mobile_devices WHERE revoked_at IS NULL").fetchall():
+                if float(row["access_expires_at"] or 0) <= now:
+                    continue
+                if secrets.compare_digest(hashlib.sha256(row["token_salt"] + token.encode("utf-8")).digest(), row["token_digest"]):
+                    conn.execute("UPDATE mobile_devices SET last_seen_at = ? WHERE device_id = ?", (now, row["device_id"]))
+                    return {"device_id": row["device_id"], "user_id": row["user_id"], "provider": row["provider"]}
+            return None
+        return self._execute_write(_write)
+
+    def mobile_device_refresh(self, refresh_token: str) -> dict[str, Any] | None:
+        """Rotate access/refresh credentials; reuse of the prior refresh revokes the device."""
+        if not refresh_token:
+            return None
+        now = time.time()
+        access_token = secrets.token_urlsafe(32)
+        access_salt = secrets.token_bytes(32)
+        access_digest = hashlib.sha256(access_salt + access_token.encode("utf-8")).digest()
+        next_refresh = secrets.token_urlsafe(48)
+        refresh_salt = secrets.token_bytes(32)
+        refresh_digest = hashlib.sha256(refresh_salt + next_refresh.encode("utf-8")).digest()
+        access_expires_at = now + 15 * 60
+        refresh_expires_at = now + 30 * 24 * 60 * 60
+
+        def _write(conn):
+            for row in conn.execute("SELECT * FROM mobile_devices WHERE revoked_at IS NULL").fetchall():
+                current_salt = row["refresh_token_salt"]
+                current_digest = row["refresh_token_digest"]
+                if current_salt and current_digest and secrets.compare_digest(
+                    hashlib.sha256(current_salt + refresh_token.encode("utf-8")).digest(),
+                    current_digest,
+                ):
+                    if float(row["refresh_expires_at"] or 0) <= now:
+                        return None
+                    conn.execute(
+                        "UPDATE mobile_devices SET token_salt = ?, token_digest = ?, "
+                        "access_expires_at = ?, refresh_token_salt = ?, refresh_token_digest = ?, "
+                        "previous_refresh_token_salt = ?, previous_refresh_token_digest = ?, "
+                        "refresh_expires_at = ?, last_seen_at = ? "
+                        "WHERE device_id = ? AND revoked_at IS NULL",
+                        (
+                            access_salt,
+                            access_digest,
+                            access_expires_at,
+                            refresh_salt,
+                            refresh_digest,
+                            current_salt,
+                            current_digest,
+                            refresh_expires_at,
+                            now,
+                            row["device_id"],
+                        ),
+                    )
+                    return {
+                        "device_id": row["device_id"],
+                        "access_token": access_token,
+                        "refresh_token": next_refresh,
+                        "user_id": row["user_id"],
+                        "provider": row["provider"],
+                        "access_expires_at": access_expires_at,
+                        "refresh_expires_at": refresh_expires_at,
+                    }
+                previous_salt = row["previous_refresh_token_salt"]
+                previous = row["previous_refresh_token_digest"]
+                if previous_salt and previous and secrets.compare_digest(
+                    previous,
+                    hashlib.sha256(previous_salt + refresh_token.encode("utf-8")).digest(),
+                ):
+                    conn.execute(
+                        "UPDATE mobile_devices SET revoked_at = ?, revoked_by_user_id = ?, "
+                        "revocation_reason = ? WHERE device_id = ? AND revoked_at IS NULL",
+                        (now, row["user_id"], "refresh_token_reuse", row["device_id"]),
+                    )
+                    return None
+            return None
+
+        return self._execute_write(_write)
+
+    def mobile_device_revoke(self, *, device_id: str, user_id: str, provider: str, reason: str = "") -> bool:
+        def _write(conn):
+            result = conn.execute("UPDATE mobile_devices SET revoked_at = ?, revoked_by_user_id = ?, revocation_reason = ? WHERE device_id = ? AND user_id = ? AND provider = ? AND revoked_at IS NULL", (time.time(), user_id, reason, device_id, user_id, provider))
+            return result.rowcount == 1
+        return self._execute_write(_write)
 
     def _execute_write(
         self,

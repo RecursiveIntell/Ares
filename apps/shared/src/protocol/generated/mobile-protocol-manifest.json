@@ -3,6 +3,11 @@
   "schema": "AresMobileProtocolManifestV1",
   "schemas": [
     {
+      "bytes": 584,
+      "name": "device-enrollment.v1.json",
+      "sha256": "f9f935f183fa5126aecc6910e77c137d7d98dd96ad9af5543917fdcef0accb81"
+    },
+    {
       "bytes": 905,
       "name": "gateway-ready.v2.json",
       "sha256": "2973a36aacd06ed9915162ef62ccef4c63b88a765cdcd2f2f855663197060198"
