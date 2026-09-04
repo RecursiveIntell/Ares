@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ares.local/protocol/session-observe.v1.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["host_id", "session_id", "profile"],
+  "properties": {
+    "host_id": {"type": "string", "minLength": 1},
+    "session_id": {"type": "string", "minLength": 1},
+    "profile": {"type": "string", "minLength": 1},
+    "last_seen_revision": {"type": "integer", "minimum": 0},
+    "runtime_id": {"type": "string", "minLength": 1}
+  }
+}

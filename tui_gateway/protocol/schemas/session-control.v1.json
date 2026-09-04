@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ares.local/protocol/session-control.v1.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "host_id",
+    "profile",
+    "session_id",
+    "runtime_id",
+    "principal_id",
+    "controller_instance_id",
+    "generation",
+    "fencing_token",
+    "expires_at"
+  ],
+  "properties": {
+    "host_id": {"type": "string", "minLength": 1},
+    "profile": {"type": "string", "minLength": 1},
+    "session_id": {"type": "string", "minLength": 1},
+    "runtime_id": {"type": "string", "minLength": 1},
+    "principal_id": {"type": "string", "minLength": 1},
+    "controller_instance_id": {"type": "string", "minLength": 1},
+    "generation": {"type": "integer", "minimum": 0},
+    "fencing_token": {"type": "string", "minLength": 1},
+    "expires_at": {"type": "number"}
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ares.local/protocol/session-event-envelope.v1.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["host_id", "connection_id", "profile", "session_id", "lineage_root_id", "runtime_id", "revision", "event_id", "type"],
+  "properties": {
+    "host_id": {"type": "string", "minLength": 1},
+    "connection_id": {"type": "string", "minLength": 1},
+    "profile": {"type": "string", "minLength": 1},
+    "session_id": {"type": "string", "minLength": 1},
+    "lineage_root_id": {"type": "string", "minLength": 1},
+    "runtime_id": {"type": "string", "minLength": 1},
+    "revision": {"type": "integer", "minimum": 0},
+    "event_id": {"type": "string", "minLength": 1},
+    "type": {"type": "string", "minLength": 1},
+    "payload": {"type": "object"},
+    "critical": {"type": "boolean"}
+  }
+}
