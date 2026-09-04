@@ -34,6 +34,7 @@ from typing import Any
 
 from tui_gateway import server
 from tui_gateway.event_replay import replay_epoch
+from tui_gateway.protocol import build_gateway_ready_payload, host_identity_digest, protocol_runtime_id
 
 _log = logging.getLogger(__name__)
 
@@ -366,6 +367,20 @@ async def handle_ws(
         # (#60800). The skin payload is small (a dict of strings/arrays),
         # so the to_thread overhead is negligible.
         skin_payload = await asyncio.to_thread(server.resolve_skin)
+        ready_payload = {
+            "skin": skin_payload,
+            "change_events": True,
+            "heartbeat": True,
+            "replay_epoch": replay_epoch(),
+            **build_gateway_ready_payload(
+                host_identity_digest=host_identity_digest(),
+                runtime_id=protocol_runtime_id(),
+                capabilities=server.mobile_protocol_capabilities(),
+            ),
+            "host_identity_state": (
+                "bound" if host_identity_digest() != "unbound" else "unbound"
+            ),
+        }
         ready_ok = await transport.write_async(
             {
                 "jsonrpc": "2.0",
@@ -375,15 +390,7 @@ async def handle_ws(
                     # change_events: this backend broadcasts pet.changed /
                     # cron.changed / sessions.changed, so clients can demote
                     # their legacy polls to slow backstops.
-                    "payload": {
-                        "skin": skin_payload,
-                        "change_events": True,
-                        "heartbeat": True,
-                        # Replay-contract process identity: lets reconnecting
-                        # clients detect a backend restart and reset their
-                        # per-session seq watermarks (see event_replay).
-                        "replay_epoch": replay_epoch(),
-                    },
+                    "payload": ready_payload,
                 },
             }
         )
@@ -520,6 +527,7 @@ async def handle_ws(
         detached_sessions = 0
         if transport is not None:
             server.unregister_live_transport(transport)
+            server.observer_registry.unregister_transport(transport)
 
             # Owner-safely park browser controllers this transport registered.
             # A reconnect with the same stable identity may deliver a terminal

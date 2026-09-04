@@ -44,6 +44,8 @@ from tui_gateway.turn_marker import (
     read_turn_marker,
     record_turn_start,
 )
+from tui_gateway.observers import observer_registry
+from tui_gateway.protocol import host_identity_digest, protocol_runtime_id
 from tui_gateway.transport import (
     StdioTransport,
     Transport,
@@ -159,11 +161,57 @@ _cfg_lock = threading.Lock()
 # dedicated lock rather than the unrelated process-config cache lock.
 _profile_ui_meta_lock = threading.Lock()
 _sessions_lock = threading.RLock()  # reentrant: _close_session_by_id may run under callers that already hold it
+_session_event_lock = threading.Lock()
+_session_event_revisions: dict[tuple[str, str, str], int] = {}
+_mobile_protocol_capabilities: dict[str, bool] = {
+    "session_observe_v1": False,
+    "session_snapshot_v1": False,
+    "event_cursor_v1": False,
+    "bounded_replay_v1": False,
+    "session_control_lease_v1": False,
+    "write_idempotency_v1": False,
+    "mobile_surface_v1": False,
+}
 _prompt_lock = threading.Lock()
 _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
 _session_resume_lock = threading.Lock()
+
+
+def mobile_protocol_capability_enabled(name: str) -> bool:
+    """Return explicit admission state for a mobile capability.
+
+    Defaults are closed. Runtime tests may set an in-memory capability; normal
+    operation requires an explicit ``mobile.<capability>.enabled: true`` config
+    declaration.
+    """
+    if _mobile_protocol_capabilities.get(name) is True:
+        return True
+    section_name = {
+        "session_observe_v1": "session_observe",
+        "session_snapshot_v1": "session_snapshot",
+        "event_cursor_v1": "event_cursor",
+        "bounded_replay_v1": "bounded_replay",
+        "session_control_lease_v1": "session_control",
+        "write_idempotency_v1": "write_idempotency",
+        "mobile_surface_v1": "mobile_surface",
+    }.get(name)
+    if section_name is None:
+        return False
+    try:
+        mobile = (_load_cfg().get("mobile") or {})
+        section = mobile.get(section_name) if isinstance(mobile, dict) else None
+        return isinstance(section, dict) and section.get("enabled") is True
+    except Exception:
+        return False
+
+
+def mobile_protocol_capabilities() -> dict[str, bool]:
+    """Return the advertised capability projection without widening defaults."""
+    return {name: mobile_protocol_capability_enabled(name) for name in _mobile_protocol_capabilities}
+
+
 try:
     _slash_timeout = float(os.environ.get("HERMES_TUI_SLASH_TIMEOUT_S") or "45")
 except (ValueError, TypeError):
@@ -2215,6 +2263,46 @@ def _default_session_cwd() -> str:
     return _launch_configured_cwd() or os.getenv("TERMINAL_CWD") or os.getcwd()
 
 
+def _annotate_session_event(obj: dict) -> tuple[dict, str, str, str] | None:
+    """Attach exact mobile scope and a per-runtime revision to session events."""
+    if obj.get("method") != "event":
+        return None
+    params = obj.get("params")
+    if not isinstance(params, dict):
+        return None
+    session_id = str(params.get("session_id") or "")
+    if not session_id or params.get("protocol_envelope") is True:
+        return None
+
+    runtime_id = protocol_runtime_id()
+    with _sessions_lock:
+        session = dict(_sessions.get(session_id) or {})
+    profile = str(session.get("profile") or "default")
+    with _session_event_lock:
+        key = (profile, session_id, runtime_id)
+        revision = _session_event_revisions.get(key, 0) + 1
+        _session_event_revisions[key] = revision
+    annotated = dict(params)
+    annotated.update(
+        {
+            "host_id": host_identity_digest(),
+            "connection_id": str(session.get("connection_id") or "local"),
+            "profile": profile,
+            "lineage_root_id": str(
+                session.get("lineage_root_id")
+                or session.get("_lineage_root_id")
+                or session.get("session_key")
+                or session_id
+            ),
+            "runtime_id": runtime_id,
+            "revision": revision,
+            "event_id": uuid.uuid4().hex,
+            "protocol_envelope": True,
+        }
+    )
+    return {**obj, "params": annotated}, session_id, profile, runtime_id
+
+
 def write_json(obj: dict) -> bool:
     """Emit one JSON frame. Routes via the most-specific transport available.
 
@@ -2233,6 +2321,27 @@ def write_json(obj: dict) -> bool:
     so a WS client can resume losslessly after a reconnect via
     ``session.events.since``.
     """
+    event = _annotate_session_event(obj)
+    if event is not None:
+        annotated, session_id, profile, runtime_id = event
+        with _sessions_lock:
+            primary = (_sessions.get(session_id) or {}).get("transport")
+        from tui_gateway.event_replay import _stamp_event
+
+        _stamp_event(annotated)
+        if primary is not None:
+            ok = primary.write(annotated)
+        else:
+            ok = (current_transport() or _stdio_transport).write(annotated)
+        observer_registry.fanout(
+            session_id=session_id,
+            profile=profile,
+            runtime_id=runtime_id,
+            frame=annotated,
+            primary_transport=primary,
+        )
+        return ok
+
     if obj.get("method") == "event":
         params = obj.get("params")
         sid = ((params or {}).get("session_id")) if isinstance(params, dict) else ""
@@ -17043,6 +17152,7 @@ from . import (  # noqa: E402
     methods_complete as _methods_complete,
     methods_config as _methods_config,
     methods_images as _methods_images,
+    methods_observer as _methods_observer,
     methods_profiles as _methods_profiles,
     methods_prompt as _methods_prompt,
     methods_session as _methods_session,
@@ -17058,6 +17168,7 @@ for _m in (
     _methods_tools,
     _methods_profiles,
     _methods_images,
+    _methods_observer,
     _methods_bot_relay,
 ):
     _m.register(sys.modules[__name__])
