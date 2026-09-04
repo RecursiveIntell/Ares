@@ -147,7 +147,14 @@ fi
 etc_mounts=()
 if [ "$USE_HOST_RUNTIME" = true ] && [ -d /etc ]; then
   sandbox_etc="$DEV_SANDBOX_ROOT/etc-merged"
-  rm -rf -- "$sandbox_etc"
+  if [ -e "$sandbox_etc" ]; then
+    # Persistent sandboxes may contain files created by the inner root mapping.
+    # Do not let an unremovable old overlay block a fresh invocation; use a
+    # disposable sibling and retain the old tree for explicit sandbox cleanup.
+    if ! rm -rf -- "$sandbox_etc" 2>/dev/null; then
+      sandbox_etc="$DEV_SANDBOX_ROOT/etc-merged.$$.${RANDOM}"
+    fi
+  fi
   mkdir -p "$sandbox_etc"
   # -a keeps symlinks as symlinks; unreadable entries (shadow, sudoers) are
   # skipped rather than failing the run.
