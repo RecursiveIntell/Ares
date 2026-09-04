@@ -135,6 +135,7 @@ class ProfileSecretScope(Mapping[str, str]):
     generation: str
     source_status: str
     digest: str
+    external_generation: int = 0
 
     def __getitem__(self, key: str) -> str:
         return self.data[key]
@@ -219,6 +220,7 @@ def _immutable_scope(
         generation=generation,
         source_status=source_status,
         digest=digest,
+        external_generation=external_generation,
     )
 
 
@@ -248,6 +250,33 @@ def reset_secret_scope(token: Token) -> None:
 def current_secret_scope() -> Optional[ProfileSecretScope]:
     """Return the active secret mapping, or None when no scope is installed."""
     return _SECRET_SCOPE.get()
+
+
+def update_secret_scope(name: str, value: Optional[str]) -> bool:
+    """Replace one value in the active immutable scope.
+
+    Persistence helpers publish through this operation after writing the
+    profile's ``.env``. Replacing the context value preserves immutability and
+    recomputes the generation/digest, so later boundary captures cannot use a
+    stale scope. Returns False when no scope is installed.
+    """
+    scope = current_secret_scope()
+    if scope is None:
+        return False
+    values = dict(scope.data)
+    if value is None:
+        values.pop(name, None)
+    else:
+        values[name] = str(value)
+    _SECRET_SCOPE.set(
+        _immutable_scope(
+            values,
+            profile_home=scope.profile_home,
+            source_status=scope.source_status,
+            external_generation=scope.external_generation,
+        )
+    )
+    return True
 
 
 # ── genuinely-global env vars (NOT per-profile secrets) ──────────────────

@@ -4714,18 +4714,16 @@ def _publish_env_value(key: str, value: Optional[str]) -> None:
     and leave ``os.environ`` alone. Every other caller keeps the legacy
     ``os.environ`` publish.
     """
+    scope_module: Any = None
     try:
-        from agent.secret_scope import current_secret_scope, is_multiplex_active
-
-        scope = current_secret_scope() if is_multiplex_active() else None
+        from agent import secret_scope as scope_module
     except Exception:
-        scope = None
-    if scope is not None:
-        if isinstance(scope, dict):
-            if value is None:
-                scope.pop(key, None)
-            else:
-                scope[key] = value
+        pass
+    if scope_module is not None and scope_module.is_multiplex_active():
+        # Multiplex mode must never publish a routed profile's credential to
+        # shared os.environ. The immutable scope owner replaces the current
+        # context value; a missing scope stays fail-closed.
+        scope_module.update_secret_scope(key, value)
         return
     if value is None:
         os.environ.pop(key, None)
