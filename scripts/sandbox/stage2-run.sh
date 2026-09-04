@@ -48,8 +48,20 @@ fi
 home_mounts+=(--bind "$DEV_SANDBOX_ROOT/home" "$DEV_SANDBOX_HOME")
 
 node_env=()
-if [ -n "${DEV_SANDBOX_NODE_DIR:-}" ]; then
-  node_env+=(--setenv npm_config_nodedir "$DEV_SANDBOX_NODE_DIR")
+node_toolchain_mounts=()
+node_path_prefix=""
+if [ -n "${DEV_SANDBOX_NODE_DIR:-}" ] \
+  && [ -x "${DEV_SANDBOX_NODE_DIR}/bin/node" ] \
+  && [ -f "${DEV_SANDBOX_NODE_DIR}/include/node/common.gypi" ]; then
+  # Keep native-module builds self-contained. The host Node root is outside the
+  # sandbox's visible filesystem, so passing it only as npm_config_nodedir makes
+  # node-gyp fail with a misleading missing-common.gypi error. Mount the exact
+  # complete toolchain and use it for both the runtime and headers.
+  node_toolchain_mounts+=(--dir /opt --ro-bind "$DEV_SANDBOX_NODE_DIR" /opt/hermes-node)
+  node_env+=(--setenv npm_config_nodedir /opt/hermes-node)
+  node_path_prefix="/opt/hermes-node/bin:"
+elif [ -n "${DEV_SANDBOX_NODE_DIR:-}" ]; then
+  echo "warning: ignoring incomplete Node toolchain at $DEV_SANDBOX_NODE_DIR" >&2
 fi
 electron_env=()
 if [ -n "${DEV_SANDBOX_ELECTRON_LD_LIBRARY_PATH:-}" ]; then
@@ -147,11 +159,21 @@ fi
 etc_mounts=()
 if [ "$USE_HOST_RUNTIME" = true ] && [ -d /etc ]; then
   sandbox_etc="$DEV_SANDBOX_ROOT/etc-merged"
-  rm -rf -- "$sandbox_etc"
+  if [ -e "$sandbox_etc" ]; then
+    # Persistent sandboxes may contain files created by the inner root mapping.
+    # Do not let an unremovable old overlay block a fresh invocation; use a
+    # disposable sibling and retain the old tree for explicit sandbox cleanup.
+    if ! rm -rf -- "$sandbox_etc" 2>/dev/null; then
+      sandbox_etc="$DEV_SANDBOX_ROOT/etc-merged.$$.${RANDOM}"
+    fi
+  fi
   mkdir -p "$sandbox_etc"
   # -a keeps symlinks as symlinks; unreadable entries (shadow, sudoers) are
   # skipped rather than failing the run.
   cp -a /etc/. "$sandbox_etc/" 2>/dev/null || true
+  # Preserve the host's read-only metadata for the mounted view, but make the
+  # disposable host-side copy removable by the mapped sandbox user on replay.
+  chmod -R u+rwX "$sandbox_etc" 2>/dev/null || true
   for etc_file in passwd group resolv.conf nsswitch.conf hosts; do
     [ -f "$DEV_SANDBOX_ROOT/etc/$etc_file" ] || continue
     rm -f "$sandbox_etc/$etc_file"
@@ -204,12 +226,13 @@ exec bwrap \
   "${runtime_mounts[@]}" \
   --bind "$DEV_SANDBOX_ROOT/root" /work \
   "${shim_mounts[@]}" \
+  "${node_toolchain_mounts[@]}" \
   --bind "$DEV_SANDBOX_ROOT/root/usr/local" /usr/local \
   "${home_mounts[@]}" \
   "${etc_mounts[@]}" \
   --chdir /work/repo \
   --clearenv \
-  --setenv PATH "$DEV_SANDBOX_HOME/.local/bin:/usr/local/bin:/usr/bin:$PATH" \
+  --setenv PATH "${node_path_prefix}${DEV_SANDBOX_HOME}/.local/bin:/usr/local/bin:/usr/bin:$PATH" \
   --setenv HOME "$DEV_SANDBOX_HOME" \
   --setenv USER "$DEV_SANDBOX_USER" \
   --setenv LOGNAME "$DEV_SANDBOX_USER" \

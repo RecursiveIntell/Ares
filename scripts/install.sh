@@ -28,9 +28,9 @@ if [ -n "${PYTHONHOME:-}" ]; then
     unset PYTHONHOME
 fi
 
-# Prevent uv from discovering config files (uv.toml, pyproject.toml) from the
-# wrong user's home directory when running under sudo -u <user>.  See #21269.
-export UV_NO_CONFIG=1
+# Do not set UV_NO_CONFIG globally.  Project installs must read the checked-in
+# pyproject.toml, including [tool.uv] lock and exclude-newer policy.  Commands
+# that intentionally need config isolation scope UV_NO_CONFIG at the call site.
 
 # Colors
 RED='\033[0;31m'
@@ -2425,9 +2425,15 @@ install_node_deps() {
         # Capture npm output so failures are diagnosable (#87340).
         local npm_log
         npm_log="$(mktemp)"
-        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent \
-                >"$npm_log" 2>&1; then
-            log_error "npm install failed or timed out; Node.js dependencies were not installed"
+        local npm_rc=0
+        run_with_timeout "$NODE_DEPS_TIMEOUT" npm install \
+                >"$npm_log" 2>&1 || npm_rc=$?
+        if [ "$npm_rc" -ne 0 ]; then
+            if [ "$npm_rc" -eq 124 ]; then
+                log_error "npm install timed out after ${NODE_DEPS_TIMEOUT}s; Node.js dependencies were not installed"
+            else
+                log_error "npm install exited with code $npm_rc; Node.js dependencies were not installed"
+            fi
             if [ -s "$npm_log" ]; then
                 log_error "npm output:"
                 cat "$npm_log" >&2
