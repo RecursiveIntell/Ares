@@ -15,6 +15,8 @@ The routes:
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import logging
 import threading
 import time
@@ -23,7 +25,7 @@ from typing import Any, Deque, Dict
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from hermes_cli.dashboard_auth import (
     get_provider,
@@ -47,10 +49,148 @@ from hermes_cli.dashboard_auth.cookies import (
     set_session_cookies,
 )
 from hermes_cli.dashboard_auth.login_page import render_login_html
+from hermes_cli.dashboard_auth.mobile_device import register_mobile_device_provider
+from hermes_constants import get_hermes_home
+from hermes_state import SessionDB
+from tui_gateway.protocol.registry import host_identity_digest
 
 _log = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# Token-only device credentials are a provider capability; routes opt in later.
+register_mobile_device_provider()
+
+
+class MobileEnrollmentChallengeRequest(BaseModel):
+    label: str = ""
+    requested_scopes: list[str] = Field(default_factory=list, max_length=16)
+
+
+class MobileEnrollmentCompleteRequest(BaseModel):
+    challenge_id: str
+    challenge: str
+    app_instance_id: str
+    public_key_der_b64: str
+    signature_b64: str
+
+
+class MobileDeviceRevokeRequest(BaseModel):
+    reason: str = ""
+
+
+class MobileDeviceRefreshRequest(BaseModel):
+    refresh_token: str
+
+
+def _verified_dashboard_session(request: Request):
+    session = getattr(request.state, "session", None)
+    user_id = str(getattr(session, "user_id", "") or "").strip()
+    provider = str(getattr(session, "provider", "") or "").strip()
+    if not user_id or not provider:
+        raise HTTPException(status_code=401, detail="native bearer authentication required")
+    return session, user_id, provider
+
+
+@router.post("/api/mobile/enrollment/challenge")
+async def create_mobile_enrollment_challenge(
+    request: Request,
+    body: MobileEnrollmentChallengeRequest,
+):
+    """Create a short-lived challenge from an authenticated dashboard session."""
+    _session, user_id, provider = _verified_dashboard_session(request)
+    host_id = host_identity_digest()
+    if len(host_id) != 64:
+        raise HTTPException(status_code=503, detail="host identity is not configured")
+    db = SessionDB(db_path=get_hermes_home() / "state.db")
+    try:
+        return db.mobile_enrollment_create_challenge(
+            user_id=user_id,
+            provider=provider,
+            label=body.label,
+            host_id=host_id,
+            requested_scopes=body.requested_scopes,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        db.close()
+
+
+@router.post("/api/mobile/enrollment/complete")
+async def complete_mobile_enrollment(body: MobileEnrollmentCompleteRequest):
+    """Complete enrollment from a one-use challenge and device-key proof."""
+    try:
+        public_key_der = base64.b64decode(body.public_key_der_b64, validate=True)
+        signature = base64.b64decode(body.signature_b64, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise HTTPException(status_code=400, detail="invalid enrollment proof encoding") from exc
+    host_id = host_identity_digest()
+    if len(host_id) != 64:
+        raise HTTPException(status_code=503, detail="host identity is not configured")
+    db = SessionDB(db_path=get_hermes_home() / "state.db")
+    try:
+        return db.mobile_device_complete_enrollment(
+            challenge_id=body.challenge_id,
+            challenge=body.challenge,
+            host_id=host_id,
+            app_instance_id=body.app_instance_id,
+            public_key_der=public_key_der,
+            signature=signature,
+        )
+    except ValueError as exc:
+        message = str(exc)
+        status = 409 if "consumed" in message or "already enrolled" in message else 401
+        raise HTTPException(status_code=status, detail=message) from exc
+    finally:
+        db.close()
+
+
+@router.get("/api/mobile/devices")
+async def list_mobile_devices(request: Request):
+    """List non-secret device metadata for the authenticated human owner."""
+    _session, user_id, provider = _verified_dashboard_session(request)
+    db = SessionDB(db_path=get_hermes_home() / "state.db")
+    try:
+        return {"devices": db.mobile_device_list(user_id=user_id, provider=provider)}
+    finally:
+        db.close()
+
+
+@router.post("/api/mobile/auth/refresh")
+async def refresh_mobile_device(body: MobileDeviceRefreshRequest):
+    """Rotate device credentials without accepting a cookie or query bearer."""
+    db = SessionDB(db_path=get_hermes_home() / "state.db")
+    try:
+        refreshed = db.mobile_device_refresh(body.refresh_token)
+        if refreshed is None:
+            raise HTTPException(status_code=401, detail="refresh credential is invalid, expired, or revoked")
+        return refreshed
+    finally:
+        db.close()
+
+
+@router.post("/api/mobile/devices/{device_id}/revoke")
+async def revoke_mobile_device(
+    request: Request,
+    device_id: str,
+    body: MobileDeviceRevokeRequest,
+):
+    """Revoke one device principal and prevent future token verification."""
+    _session, user_id, provider = _verified_dashboard_session(request)
+    db = SessionDB(db_path=get_hermes_home() / "state.db")
+    try:
+        revoked = db.mobile_device_revoke(
+            device_id=device_id,
+            user_id=user_id,
+            provider=provider,
+            reason=body.reason,
+        )
+        if not revoked:
+            raise HTTPException(status_code=404, detail="mobile device not found or already revoked")
+        return {"revoked": True, "device_id": device_id}
+    finally:
+        db.close()
 
 
 def _redirect_uri(request: Request) -> str:

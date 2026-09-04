@@ -37,7 +37,7 @@ from hermes_cli.dashboard_auth.cookies import (
     set_session_provider_cookie,
     set_sso_attempt_cookie,
 )
-from hermes_cli.dashboard_auth.public_paths import PUBLIC_API_PATHS
+from hermes_cli.dashboard_auth.public_paths import MOBILE_PROOF_API_PATHS, PUBLIC_API_PATHS
 
 _log = logging.getLogger(__name__)
 
@@ -78,7 +78,7 @@ def _path_is_public(path: str) -> bool:
       mounts. Prefix-matched so ``/assets/foo.css`` lights up via
       ``/assets/``.
     """
-    if path in PUBLIC_API_PATHS:
+    if path in PUBLIC_API_PATHS or path in MOBILE_PROOF_API_PATHS:
         return True
     return any(
         path == prefix or path.startswith(prefix)

@@ -651,6 +651,7 @@ app.add_middleware(
 # endpoints belong there.
 # ---------------------------------------------------------------------------
 from hermes_cli.dashboard_auth.public_paths import (
+    MOBILE_PROOF_API_PATHS as _MOBILE_PROOF_API_PATHS,
     PUBLIC_API_PATHS as _PUBLIC_API_PATHS,
 )
 
@@ -1000,7 +1001,7 @@ async def auth_middleware(request: Request, call_next):
         return await call_next(request)
     path = request.url.path
     is_mcp_oauth_callback = path.startswith("/api/mcp/oauth/callback/")
-    if path.startswith("/api/") and path not in _PUBLIC_API_PATHS and not is_mcp_oauth_callback:
+    if path.startswith("/api/") and path not in _PUBLIC_API_PATHS and path not in _MOBILE_PROOF_API_PATHS and not is_mcp_oauth_callback:
         if not _has_valid_session_token(request) and not _has_valid_query_token(request, path):
             return JSONResponse(
                 status_code=401,
@@ -16447,6 +16448,33 @@ _GATEWAY_WS_PROTOCOL = "hermes-gateway-v1"
 _GATEWAY_WS_TICKET_PROTOCOL_PREFIX = "hermes-gateway-ticket."
 
 
+def _mobile_device_ws_identity(ws: "WebSocket") -> dict | None:
+    """Resolve only a server-enrolled mobile bearer from the WS header."""
+    raw = str(ws.headers.get("authorization", "") or "")
+    scheme, _, token = raw.partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        return None
+    from hermes_cli.dashboard_auth import list_token_providers
+
+    for provider in list_token_providers():
+        # Do not widen any other token provider into mobile gateway admission.
+        if getattr(provider, "name", "") != "mobile-device":
+            continue
+        try:
+            principal = provider.verify_token(token=token.strip())
+        except Exception:
+            continue
+        if principal is None or principal.provider != "mobile-device":
+            continue
+        return {
+            "user_id": str(principal.principal),
+            "provider": "mobile-device",
+            "device_id": str(principal.principal),
+            "scopes": list(principal.scopes),
+        }
+    return None
+
+
 def _gateway_ws_ticket_from_subprotocol(ws: "WebSocket") -> tuple[str, str]:
     """Return ``(ticket, reason)`` from an unambiguous gateway protocol set."""
     raw = str(ws.headers.get("sec-websocket-protocol", "") or "")
@@ -16532,6 +16560,11 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
                 )
                 return "internal_invalid", "internal"
 
+        mobile_identity = _mobile_device_ws_identity(ws)
+        if mobile_identity is not None:
+            ws._hermes_auth_identity = mobile_identity
+            return None, "mobile-device"
+
         protocol_ticket, protocol_reason = _gateway_ws_ticket_from_subprotocol(ws)
         if protocol_reason == "invalid":
             return "ticket_invalid", "ticket-subprotocol"
@@ -16567,6 +16600,11 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
                 path=ws.url.path,
             )
             return "ticket_invalid", "ticket"
+
+    mobile_identity = _mobile_device_ws_identity(ws)
+    if mobile_identity is not None:
+        ws._hermes_auth_identity = mobile_identity
+        return None, "mobile-device"
 
     token = ws.query_params.get("token", "")
     if not token:

@@ -58,3 +58,10 @@ PUBLIC_API_PATHS: frozenset[str] = frozenset({
     # 401 no_cookie. The JWT — not this allowlist — is the security boundary.
     "/api/cron/fire",
 })
+
+# These endpoints bypass the cookie gate only because each validates its own
+# challenge/proof or refresh credential. They are not public data endpoints.
+MOBILE_PROOF_API_PATHS: frozenset[str] = frozenset({
+    "/api/mobile/enrollment/complete",
+    "/api/mobile/auth/refresh",
+})
