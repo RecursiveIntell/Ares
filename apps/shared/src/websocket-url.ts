@@ -111,11 +111,14 @@ export interface HermesWebSocketUrlOptions {
 }
 
 function readWindowLocation(): { host: string; protocol: string } {
-  if (typeof window === 'undefined') {
+  const location = (globalThis as {
+    location?: {host?: string; protocol?: string}
+  }).location
+  if (!location) {
     return { host: '', protocol: 'http:' }
   }
 
-  return { host: window.location.host, protocol: window.location.protocol }
+  return { host: location.host ?? '', protocol: location.protocol ?? 'http:' }
 }
 
 function normalizeBasePath(basePath: string | undefined): string {

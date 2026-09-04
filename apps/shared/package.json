@@ -5,6 +5,7 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
+    "./json-rpc-gateway": "./src/json-rpc-gateway.ts",
     "./protocol": "./src/protocol/generated/mobile-protocol.ts",
     "./billing": "./src/billing-types.ts",
     "./billing-policy": "./src/billing-policy.ts",

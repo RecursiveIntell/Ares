@@ -64,7 +64,19 @@ export class JsonRpcGatewayError extends Error {
   }
 }
 
-export type WebSocketLike = WebSocket
+export interface WebSocketLike {
+  readyState: number
+  send(data: string): void
+  close(): void
+  addEventListener(
+    type: string,
+    listener: (event: unknown) => void,
+    options?: {once?: boolean},
+  ): void
+  removeEventListener(type: string, listener: (event: unknown) => void): void
+}
+
+export type SocketCloseEvent = {code?: number; reason?: string}
 
 type PendingCall = {
   reject: (error: Error) => void
@@ -80,7 +92,7 @@ export interface GatewayClientOptions {
   heartbeatDeadlineMs?: number
   heartbeatIntervalMs?: number
   /** Return true to intercept the default closed-state transition. */
-  onSocketClose?: (event: CloseEvent) => boolean | void
+  onSocketClose?: (event: SocketCloseEvent) => boolean | void
   requestIdPrefix?: string
   requestTimeoutMs?: number
   socketFactory?: (url: string) => WebSocketLike
@@ -98,6 +110,12 @@ const DEFAULT_HEARTBEAT_DEADLINE_MS = 45_000
 // keeps the composer disabled and stuck on "Starting Hermes..."). If the open
 // handshake doesn't land in this window, fail to 'error' so callers can retry.
 const DEFAULT_CONNECT_TIMEOUT_MS = 15_000
+
+function abortError(): Error {
+  const error = new Error('Aborted')
+  error.name = 'AbortError'
+  return error
+}
 
 export class JsonRpcGatewayClient {
   private nextId = 0
@@ -177,13 +195,17 @@ export class JsonRpcGatewayClient {
       throw invalidUrl()
     }
 
-    if (this.socket?.readyState === WebSocket.OPEN || this.state === 'connecting') {
+    if (this.socket?.readyState === 1 || this.state === 'connecting') {
       return
     }
 
     this.setState('connecting')
 
-    const socket = this.options.socketFactory?.(wsUrl) ?? new WebSocket(wsUrl)
+    const defaultConstructor = (globalThis as {WebSocket?: new (url: string) => WebSocketLike}).WebSocket
+    if (!this.options.socketFactory && !defaultConstructor) {
+      throw new Error('gateway WebSocket constructor is unavailable')
+    }
+    const socket = this.options.socketFactory?.(wsUrl) ?? new defaultConstructor!(wsUrl)
     this.socket = socket
     this.stopHeartbeat()
 
@@ -193,7 +215,7 @@ export class JsonRpcGatewayClient {
       }
 
       this.lastInboundAt = Date.now()
-      this.handleMessage(message.data)
+      this.handleMessage((message as {data?: unknown}).data)
     })
 
     socket.addEventListener('close', event => {
@@ -201,7 +223,7 @@ export class JsonRpcGatewayClient {
         return
       }
 
-      if (this.options.onSocketClose(event)) {
+      if (this.options.onSocketClose(event as SocketCloseEvent)) {
         return
       }
 
@@ -348,12 +370,12 @@ export class JsonRpcGatewayClient {
   ): Promise<T> {
     const socket = this.socket
 
-    if (!socket || socket.readyState !== WebSocket.OPEN) {
+    if (!socket || socket.readyState !== 1) {
       return Promise.reject(new Error(this.options.notConnectedErrorMessage))
     }
 
     if (signal?.aborted) {
-      return Promise.reject(new DOMException('Aborted', 'AbortError'))
+      return Promise.reject(abortError())
     }
 
     const id = this.options.createRequestId(++this.nextId)
@@ -403,7 +425,7 @@ export class JsonRpcGatewayClient {
 
           this.pending.delete(id)
           detach()
-          reject(new DOMException('Aborted', 'AbortError'))
+          reject(abortError())
         }
 
         signal.addEventListener('abort', onAbort, { once: true })
@@ -659,7 +681,7 @@ export class JsonRpcGatewayClient {
     }
 
     this.heartbeatTimer = setInterval(() => {
-      if (this.socket !== socket || socket.readyState !== WebSocket.OPEN) {
+      if (this.socket !== socket || socket.readyState !== 1) {
         return
       }
 
