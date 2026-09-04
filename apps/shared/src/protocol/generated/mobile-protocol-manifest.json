@@ -28,6 +28,11 @@
       "sha256": "cd3553a86af00db8e2d09201d8523f4c297a3c219e6c68e9e682f8475f9387ef"
     },
     {
+      "bytes": 1065,
+      "name": "session-list.v1.json",
+      "sha256": "ec9756cda8efabc1255145694d342f64f9cd9ff43ba060025c1395110a83b578"
+    },
+    {
       "bytes": 526,
       "name": "session-observe.v1.json",
       "sha256": "d3723e31e572f7c544f82043933089de6b437fd3080d29405955bb041a67e923"

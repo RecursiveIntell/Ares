@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ares.local/protocol/session-list.v1.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["scope", "title", "preview", "message_count", "started_at", "status"],
+  "properties": {
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["host_id", "connection_id", "profile", "session_id", "lineage_root_id", "runtime_id"],
+      "properties": {
+        "host_id": {"type": "string", "minLength": 1},
+        "connection_id": {"type": "string", "minLength": 1},
+        "profile": {"type": "string", "minLength": 1},
+        "session_id": {"type": "string", "minLength": 1},
+        "lineage_root_id": {"type": "string", "minLength": 1},
+        "runtime_id": {"type": "string", "minLength": 1}
+      }
+    },
+    "title": {"type": "string"},
+    "preview": {"type": "string"},
+    "message_count": {"type": "integer", "minimum": 0},
+    "started_at": {"type": "number"},
+    "status": {"type": "string", "minLength": 1}
+  }
+}

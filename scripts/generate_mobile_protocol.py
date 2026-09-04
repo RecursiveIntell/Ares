@@ -89,6 +89,15 @@ export interface SessionOwnerScope {{
   runtime_id: string
 }}
 
+export interface MobileSessionListItemV1 {{
+  scope: SessionOwnerScope
+  title: string
+  preview: string
+  message_count: number
+  started_at: number
+  status: string
+}}
+
 export interface SessionEventEnvelopeV1 {{
   host_id: string
   connection_id: string
