@@ -1,7 +1,7 @@
 ---
 name: github-pr-workflow
-description: "GitHub PR lifecycle: branch, commit, open, CI, merge."
-version: 1.1.0
+description: "Operate the requested part of a GitHub PR lifecycle with exact fork/base/head identity, scoped writes, and honest CI evidence. Inspection does not authorize pushing, posting, merging, or branch deletion."
+version: 1.2.0
 author: Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
@@ -13,355 +13,79 @@ metadata:
 
 # GitHub Pull Request Workflow
 
-Complete guide for managing the PR lifecycle. Each section shows the `gh` way first, then the `git` + `curl` fallback for machines without `gh`.
+Own PR mechanics, not code-review judgment or a second end-to-end implementation workflow. `github-issue-to-pr` owns an explicitly requested issue-to-PR task; `github-code-review` owns review. Execute only the requested lifecycle stages, preserving existing authorization rather than asking again for the same approved action.
 
-## Prerequisites
+## Scope and effect boundaries
 
-- Authenticated with GitHub (see `github-auth` skill)
-- Inside a git repository with a GitHub remote
+Read/status/draft requests produce observations or drafts. Explicit requests to implement, commit, push, open a PR, edit a description, post a comment, submit a formal review, request reviewers, merge, enable auto-merge, or delete a branch are distinct grants. A request can explicitly cover several stages; do those stages without redundant permission questions. Capability and credentials do not create a grant. Preserve host confirmation requirements.
 
-### Quick Auth Detection
+Opening a PR does not authorize merge, approval, unsolicited issue comments, or branch deletion. Green checks do not create merge authority. A failed or ambiguous write does not authorize blind retries.
 
-```bash
-# Determine which method to use throughout this workflow
-if command -v gh &>/dev/null && gh auth status &>/dev/null; then
-  AUTH="gh"
-else
-  AUTH="git"
-  # Ensure we have a token for API calls
-  if [ -z "$GITHUB_TOKEN" ]; then
-    if _hermes_env="${HERMES_HOME:-$HOME/.hermes}/.env"; [ -f "$_hermes_env" ] && grep -q "^GITHUB_TOKEN=" "$_hermes_env"; then
-      GITHUB_TOKEN=$(grep "^GITHUB_TOKEN=" "$_hermes_env" | head -1 | cut -d= -f2 | tr -d '\n\r')
-    elif grep -q "github.com" ~/.git-credentials 2>/dev/null; then
-      GITHUB_TOKEN=$(uv run python "${HERMES_HOME:-$HOME/.hermes}/skills/github/github-auth/scripts/git-credential-token.py")
-    fi
-  fi
-fi
-echo "Using: $AUTH"
-```
+## 1. Resolve identity and the actual environment
 
-### Extracting Owner/Repo from the Git Remote
+Read repository instructions and the live contribution target. Record separately:
 
-Many `curl` commands need `owner/repo`. Extract it from the git remote:
+- Base repository, branch and current commit; its actual default branch when relevant.
+- Head repository, branch and exact commit; the fork is not necessarily the upstream.
+- PR/issue number, current review subject and observation time.
+- Local checkout/worktree, remote mapping, staged/unstaged/untracked state when using local Git.
+- Requested effects, target paths/refs and applicable restrictions.
+
+Do not assume `origin`, `main`, a particular merge method, or that the checked-out branch is the requested PR. Resolve defaults from repository metadata. Preserve contributor authorship and accepted upstream history; do not replace another contributor's work or squash away credit by habit.
+
+Prefer an available GitHub connector or already authenticated `gh`. An approved Git credential provider may supply authentication without revealing secrets. Do not scrape `.env`, credential stores, browser state, unrelated profiles or process logs. Missing CLI does not imply missing connector access. Equivalent transport must preserve identity, scope, effect type and read-back checks; otherwise report the missing capability.
+
+## 2. Prepare only the requested change
+
+For authorized implementation, inspect the current base before creating an isolated branch/worktree. Leave unrelated user changes untouched. Follow current naming and commit conventions; `references/conventional-commits.md` is an aid, not authority over repository policy.
+
+Stage an explicit reviewed file allowlist, never the whole working tree as an auto-fix shortcut. Inspect the staged diff before committing. Inspect build/test commands and hooks before running contribution code; use a disposable environment without privileged credentials when code is untrusted.
 
 ```bash
-# Works for both HTTPS and SSH remote URLs
-REMOTE_URL=$(git remote get-url origin)
-OWNER_REPO=$(echo "$REMOTE_URL" | sed -E 's|.*github\.com[:/]||; s|\.git$||')
-OWNER=$(echo "$OWNER_REPO" | cut -d/ -f1)
-REPO=$(echo "$OWNER_REPO" | cut -d/ -f2)
-echo "Owner: $OWNER, Repo: $REPO"
+# Set these paths from the reviewed change; they are examples, not mandatory files.
+git add -- path/to/changed-source path/to/regression-test
+git diff --cached --check
+git diff --cached --stat
+git diff --cached
+# Commit only after verifying that the staged tree matches the authorized scope.
 ```
 
----
+Preserve raw command exits and logs. Do not infer a test passed from the exit of `head`, `tail` or another display process. A failed, skipped or unavailable check is not a passing gate.
 
-## 1. Branch Creation
+## 3. Publish an authorized branch or PR
 
-This part is pure `git` — identical either way:
+Before pushing, re-read the relevant remote target and check that the intended update still applies. Use a normal non-force push unless history rewriting was specifically authorized. Where the operation supports an expected-old-ref or expected head, bind it; a non-force update prevents non-fast-forward changes but is not a universal compare-and-swap guarantee.
 
-```bash
-# Make sure you're up to date
-git fetch origin
-git checkout main && git pull origin main
+For a PR, bind the actual upstream base and fork-qualified head. Use the repository's real templates and contribution policy. `templates/pr-body-bugfix.md` and `templates/pr-body-feature.md` are optional starting points. State problem, implementation, tests actually executed, risk, exclusions, and the exact candidate revision. Do not convert unchecked test boxes into green claims.
 
-# Create and switch to a new branch
-git checkout -b feat/add-user-authentication
-```
+Read back the created/updated object and verify its ID, base, head, files, title/body and requested state. If publication succeeded but the response was lost, search/reconcile the exact intended object before retrying. Preserve partial completion.
 
-Branch naming conventions:
-- `feat/description` — new features
-- `fix/description` — bug fixes
-- `refactor/description` — code restructuring
-- `docs/description` — documentation
-- `ci/description` — CI/CD changes
+Record the actual operation: local commit, branch push/ref update, PR creation/edit, comment, formal review, merge or deploy. A direct branch update is not a PR merge. A source push is not deployment or browser validation.
 
-## 2. Making Commits
+## 4. Reconcile current CI and reviews
 
-Use the agent's file tools (`write_file`, `patch`) to make changes, then commit:
+Use current PR metadata to identify the correct head and any separately tested merge candidate. Inspect relevant check runs, commit statuses, workflow runs/jobs, required checks when visible, reviews and unresolved requests. Follow pagination. Distinguish inaccessible, partial, empty and complete results. An empty check-runs response alone does not prove green CI.
 
-```bash
-# Stage specific files
-git add src/auth.py src/models/user.py tests/test_auth.py
+Bind each result to its tested SHA/run ID and observation time. Keep historical tests and reviews, but do not let them certify a newer revision without justified applicability. Re-evaluate only affected proof after a change; preserve unaffected evidence with its basis.
 
-# Commit with a conventional commit message
-git commit -m "feat: add JWT-based user authentication
+Classify gates separately: introduced code failure, baseline failure, infrastructure failure, pending execution, maintainer-controlled approval, merge conflict, stale evidence, or unknown coverage. Permission to run CI is not code approval; passing CI is not a complete security or product correctness certificate.
 
-- Add login/register endpoints
-- Add User model with password hashing
-- Add auth middleware for protected routes
-- Add unit tests for auth flow"
-```
+`references/ci-troubleshooting.md` can guide diagnosis after verifying it matches the actual runner and failure. Do not alter tests to hide failures or bypass required checks.
 
-Commit message format (Conventional Commits):
-```
-type(scope): short description
+## 5. Fix within the existing request and close the current turn
 
-Longer explanation if needed. Wrap at 72 characters.
-```
+For an authorized CI repair, read the first meaningful failure, reproduce where appropriate, make the smallest complete correction and test the original failure plus affected siblings. Apply a predeclared retry/compute budget. Retry a suspected flake only with evidence and retain the failed run; repeated retries are not proof of correctness.
 
-Types: `feat`, `fix`, `refactor`, `docs`, `test`, `ci`, `chore`, `perf`
+A request to inspect failures does not authorize a push. An existing request to fix and push does, within its original scope. Stop at new destructive effects, changed targets, missing privileges, or exhausted budget; report completed actions and the exact remaining gate rather than restarting planning or asking an already-answered question.
 
-## 3. Pushing and Creating a PR
+Do not promise future monitoring from a one-shot conversation. A brief bounded check during this execution is distinct from a scheduled watcher; future monitoring requires an available scheduling tool and an actual configured task.
 
-### Push the Branch (same either way)
+## 6. Merge and cleanup only when requested
 
-```bash
-git push -u origin HEAD
-```
-
-### Create the PR
-
-**With gh:**
+Re-read head, current gates and repository policy immediately before an authorized merge. Use the explicitly selected or policy-required merge strategy and preserve attribution. Bind expected head when supported and stop on a mismatch. Do not bypass protection or fabricate approval.
 
-```bash
-gh pr create \
-  --title "feat: add JWT-based user authentication" \
-  --body "## Summary
-- Adds login and register API endpoints
-- JWT token generation and validation
+Auto-merge is its own future effect and must be requested. Local/remote branch deletion is separate from merge and must be within the grant; never delete the user's working branch as an automatic epilogue. Cleanup of disposable resources is limited to resources created for this task and must not remove user work.
 
-## Test Plan
-- [ ] Unit tests pass
+## Output and completion
 
-Closes #42"
-```
-
-Options: `--draft`, `--reviewer user1,user2`, `--label "enhancement"`, `--base develop`
-
-**With git + curl:**
-
-```bash
-BRANCH=$(git branch --show-current)
-
-curl -s -X POST \
-  -H "Authorization: token $GITHUB_TOKEN" \
-  -H "Accept: application/vnd.github.v3+json" \
-  https://api.github.com/repos/$OWNER/$REPO/pulls \
-  -d "{
-    \"title\": \"feat: add JWT-based user authentication\",
-    \"body\": \"## Summary\nAdds login and register API endpoints.\n\nCloses #42\",
-    \"head\": \"$BRANCH\",
-    \"base\": \"main\"
-  }"
-```
-
-The response JSON includes the PR `number` — save it for later commands.
-
-To create as a draft, add `"draft": true` to the JSON body.
-
-## 4. Monitoring CI Status
-
-### Check CI Status
-
-**With gh:**
-
-```bash
-# One-shot check
-gh pr checks
-
-# Watch until all checks finish (polls every 10s)
-gh pr checks --watch
-```
-
-**With git + curl:**
-
-```bash
-# Get the latest commit SHA on the current branch
-SHA=$(git rev-parse HEAD)
-
-# Query the combined status
-curl -s \
-  -H "Authorization: token $GITHUB_TOKEN" \
-  https://api.github.com/repos/$OWNER/$REPO/commits/$SHA/status \
-  | python -c "
-import sys, json
-data = json.load(sys.stdin)
-print(f\"Overall: {data['state']}\")
-for s in data.get('statuses', []):
-    print(f\"  {s['context']}: {s['state']} - {s.get('description', '')}\")"
-
-# Also check GitHub Actions check runs (separate endpoint)
-curl -s \
-  -H "Authorization: token $GITHUB_TOKEN" \
-  https://api.github.com/repos/$OWNER/$REPO/commits/$SHA/check-runs \
-  | python -c "
-import sys, json
-data = json.load(sys.stdin)
-for cr in data.get('check_runs', []):
-    print(f\"  {cr['name']}: {cr['status']} / {cr['conclusion'] or 'pending'}\")"
-```
-
-### Poll Until Complete (git + curl)
-
-```bash
-# Simple polling loop — check every 30 seconds, up to 10 minutes
-SHA=$(git rev-parse HEAD)
-for i in $(seq 1 20); do
-  STATUS=$(curl -s \
-    -H "Authorization: token $GITHUB_TOKEN" \
-    https://api.github.com/repos/$OWNER/$REPO/commits/$SHA/status \
-    | python -c "import sys,json; print(json.load(sys.stdin)['state'])")
-  echo "Check $i: $STATUS"
-  if [ "$STATUS" = "success" ] || [ "$STATUS" = "failure" ] || [ "$STATUS" = "error" ]; then
-    break
-  fi
-  sleep 30
-done
-```
-
-## 5. Auto-Fixing CI Failures
-
-When CI fails, diagnose and fix. This loop works with either auth method.
-
-### Step 1: Get Failure Details
-
-**With gh:**
-
-```bash
-# List recent workflow runs on this branch
-gh run list --branch $(git branch --show-current) --limit 5
-
-# View failed logs
-gh run view <RUN_ID> --log-failed
-```
-
-**With git + curl:**
-
-```bash
-BRANCH=$(git branch --show-current)
-
-# List workflow runs on this branch
-curl -s \
-  -H "Authorization: token $GITHUB_TOKEN" \
-  "https://api.github.com/repos/$OWNER/$REPO/actions/runs?branch=$BRANCH&per_page=5" \
-  | python -c "
-import sys, json
-runs = json.load(sys.stdin)['workflow_runs']
-for r in runs:
-    print(f\"Run {r['id']}: {r['name']} - {r['conclusion'] or r['status']}\")"
-
-# Get failed job logs (download as zip, extract, read)
-RUN_ID=<run_id>
-curl -s -L \
-  -H "Authorization: token $GITHUB_TOKEN" \
-  https://api.github.com/repos/$OWNER/$REPO/actions/runs/$RUN_ID/logs \
-  -o /tmp/ci-logs.zip
-cd /tmp && unzip -o ci-logs.zip -d ci-logs && cat ci-logs/*.txt
-```
-
-### Step 2: Fix and Push
-
-After identifying the issue, use file tools (`patch`, `write_file`) to fix it:
-
-```bash
-git add <fixed_files>
-git commit -m "fix: resolve CI failure in <check_name>"
-git push
-```
-
-### Step 3: Verify
-
-Re-check CI status using the commands from Section 4 above.
-
-### Auto-Fix Loop Pattern
-
-When asked to auto-fix CI, follow this loop:
-
-1. Check CI status → identify failures
-2. Read failure logs → understand the error
-3. Use `read_file` + `patch`/`write_file` → fix the code
-4. `git add . && git commit -m "fix: ..." && git push`
-5. Wait for CI → re-check status
-6. Repeat if still failing (up to 3 attempts, then ask the user)
-
-## 6. Merging
-
-**With gh:**
-
-```bash
-# Squash merge + delete branch (cleanest for feature branches)
-gh pr merge --squash --delete-branch
-
-# Enable auto-merge (merges when all checks pass)
-gh pr merge --auto --squash --delete-branch
-```
-
-**With git + curl:**
-
-```bash
-PR_NUMBER=<number>
-
-# Merge the PR via API (squash)
-curl -s -X PUT \
-  -H "Authorization: token $GITHUB_TOKEN" \
-  https://api.github.com/repos/$OWNER/$REPO/pulls/$PR_NUMBER/merge \
-  -d "{
-    \"merge_method\": \"squash\",
-    \"commit_title\": \"feat: add user authentication (#$PR_NUMBER)\"
-  }"
-
-# Delete the remote branch after merge
-BRANCH=$(git branch --show-current)
-git push origin --delete $BRANCH
-
-# Switch back to main locally
-git checkout main && git pull origin main
-git branch -d $BRANCH
-```
-
-Merge methods: `"merge"` (merge commit), `"squash"`, `"rebase"`
-
-### Enable Auto-Merge (curl)
-
-```bash
-# Auto-merge requires the repo to have it enabled in settings.
-# This uses the GraphQL API since REST doesn't support auto-merge.
-PR_NODE_ID=$(curl -s \
-  -H "Authorization: token $GITHUB_TOKEN" \
-  https://api.github.com/repos/$OWNER/$REPO/pulls/$PR_NUMBER \
-  | python -c "import sys,json; print(json.load(sys.stdin)['node_id'])")
-
-curl -s -X POST \
-  -H "Authorization: token $GITHUB_TOKEN" \
-  https://api.github.com/graphql \
-  -d "{\"query\": \"mutation { enablePullRequestAutoMerge(input: {pullRequestId: \\\"$PR_NODE_ID\\\", mergeMethod: SQUASH}) { clientMutationId } }\"}"
-```
-
-## 7. Complete Workflow Example
-
-```bash
-# 1. Start from clean main
-git checkout main && git pull origin main
-
-# 2. Branch
-git checkout -b fix/login-redirect-bug
-
-# 3. (Agent makes code changes with file tools)
-
-# 4. Commit
-git add src/auth/login.py tests/test_login.py
-git commit -m "fix: correct redirect URL after login
-
-Preserves the ?next= parameter instead of always redirecting to /dashboard."
-
-# 5. Push
-git push -u origin HEAD
-
-# 6. Create PR (picks gh or curl based on what's available)
-# ... (see Section 3)
-
-# 7. Monitor CI (see Section 4)
-
-# 8. Merge when green (see Section 6)
-```
-
-## Useful PR Commands Reference
-
-| Action | gh | git + curl |
-|--------|-----|-----------|
-| List my PRs | `gh pr list --author @me` | `curl -s -H "Authorization: token $GITHUB_TOKEN" "https://api.github.com/repos/$OWNER/$REPO/pulls?state=open"` |
-| View PR diff | `gh pr diff` | `git diff main...HEAD` (local) or `curl -H "Accept: application/vnd.github.diff" ...` |
-| Add comment | `gh pr comment N --body "..."` | `curl -X POST .../issues/N/comments -d '{"body":"..."}'` |
-| Request review | `gh pr edit N --add-reviewer user` | `curl -X POST .../pulls/N/requested_reviewers -d '{"reviewers":["user"]}'` |
-| Close PR | `gh pr close N` | `curl -X PATCH .../pulls/N -d '{"state":"closed"}'` |
-| Check out someone's PR | `gh pr checkout N` | `git fetch origin pull/N/head:pr-N && git checkout pr-N` |
+Return the exact contribution identity, operations completed with returned IDs/commits, current check/review coverage, genuine remaining gates, and the smallest next action. For a delta question, report only changed or invalidated evidence plus necessary context. Do not claim merged, released, deployed, fully green, or runtime-certified unless the corresponding evidence actually exists.
