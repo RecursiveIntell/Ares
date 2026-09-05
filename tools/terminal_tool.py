@@ -21,6 +21,7 @@ import/patch target): ``terminal_tool_config`` (TERMINAL_* reads, ``_quiet``),
 import json
 import logging
 import os
+import sys
 import time
 import threading
 import atexit
@@ -43,7 +44,7 @@ from tools.terminal_tool_lifecycle import (
     _evict_environment_for_task, cleanup_all_environments, ensure_task_env,
 )
 from tools.terminal_tool_config import (
-    _HOST_CWD_PREFIXES, _is_container_backend, _is_unusable_container_cwd, _parse_env_var,
+    _is_container_backend, _is_host_cwd, _is_unusable_container_cwd, _parse_env_var,
     _plugin_env_flag, _quiet, _safe_getcwd, _tenv, _tenv_bool,
 )
 from tools.terminal_tool_backends import (
@@ -580,7 +581,7 @@ def _resolve_config_cwd(env_type: str, mount_docker_cwd: bool) -> tuple:
     if env_type == "docker" and mount_docker_cwd:
         candidate = os.path.abspath(os.path.expanduser(_tenv("TERMINAL_CWD") or _safe_getcwd()))
         if (
-            any(candidate.startswith(p) for p in _HOST_CWD_PREFIXES)
+            _is_host_cwd(candidate)
             or (os.path.isabs(candidate) and os.path.isdir(candidate) and not candidate.startswith(("/workspace", "/root")))
         ):
             host_cwd = candidate
@@ -654,6 +655,7 @@ def _get_env_config() -> Dict[str, Any]:
         "docker_volumes": docker_volumes,
         "docker_env": docker_env,
         "docker_run_as_host_user": _tenv_bool("TERMINAL_DOCKER_RUN_AS_HOST_USER", "false"),
+        "docker_snap_compat": _tenv_bool("TERMINAL_DOCKER_SNAP_COMPAT", "false"),
         "docker_network": _tenv_bool("TERMINAL_DOCKER_NETWORK", "true"),
         "docker_extra_args": docker_extra_args,
         "docker_shm_size": docker_shm_size,
@@ -714,6 +716,10 @@ def _atexit_cleanup():
             if wait_fn is not None:
                 with _quiet("wait_for_cleanup raised on exit"):  # never block shutdown on a bad backend
                     wait_fn(timeout=15.0)
+    # Workers of envs the idle reaper already detached are not in the registry (#86317).
+    if "tools.environments.docker" in sys.modules:
+        with _quiet("teardown drain raised on exit"):
+            sys.modules["tools.environments.docker"].DockerEnvironment.wait_for_all_teardowns(timeout=15.0)
 
 atexit.register(_atexit_cleanup)
 

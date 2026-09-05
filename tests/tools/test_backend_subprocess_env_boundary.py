@@ -171,6 +171,26 @@ def test_shared_popen_boundary_sanitizes_caller_supplied_base_env(monkeypatch, t
     _assert_child_env_is_sanitized(calls[0][1]["env"])
 
 
+def test_docker_explicit_provider_grant_survives_shared_child_policy(monkeypatch, tmp_path):
+    """A name-only Docker grant must carry its value, not widen the ambient env."""
+    _plant_parent_env(monkeypatch, tmp_path)
+    calls = _capture_popen(monkeypatch)
+    env = _make_docker_exec_env()
+    env._forward_env = ["OPENAI_API_KEY", "BWS_ACCESS_TOKEN"]
+    env._profile_scoped_passthrough = True
+    monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {})
+
+    env._run_bash("true")
+
+    argv, kwargs = calls[0]
+    assert "OPENAI_API_KEY" in argv
+    assert kwargs["env"]["OPENAI_API_KEY"] == _BLOCKED["OPENAI_API_KEY"]
+    assert _BLOCKED["OPENAI_API_KEY"] not in " ".join(argv)
+    assert "BWS_ACCESS_TOKEN" not in argv
+    assert "BWS_ACCESS_TOKEN" not in kwargs["env"]
+    assert "GH_TOKEN" not in kwargs["env"]
+
+
 def test_shared_popen_boundary_accepts_empty_base_env(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
     calls = _capture_popen(monkeypatch)

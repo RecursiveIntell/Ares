@@ -225,11 +225,21 @@ def current_secret_scope() -> Optional[ProfileSecretScope]:
     return _SECRET_SCOPE.get()
 
 
-def update_secret_scope(name: str, value: Optional[str]) -> bool:
-    """Replace one value in the active immutable scope."""
+def update_secret_scope(
+    name: str, value: Optional[str], *, profile_home: str | os.PathLike,
+) -> bool:
+    """Publish a persisted change without retaining its old source generation."""
     scope = current_secret_scope()
     if scope is None:
         return False
+    if scope.profile_home is not None:
+        if scope.profile_home != Path(profile_home).resolve():
+            raise RuntimeError("persisted environment home does not match active profile scope")
+        # A dotenv write may also invalidate the external-source snapshot. Rebuild
+        # through the owner so the next child sees the complete new generation;
+        # merely copying the old external_generation makes our own write stale.
+        _SECRET_SCOPE.set(build_profile_secret_scope(scope.profile_home, fail_closed_external=True))
+        return True
     values = dict(scope.data)
     if value is None:
         values.pop(name, None)

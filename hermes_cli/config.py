@@ -2055,7 +2055,7 @@ TERMINAL_CONFIG_ENV_MAP = {
             "daytona_image", "vercel_runtime", "ssh_host", "ssh_user", "ssh_port", "ssh_key",
             "container_cpu", "container_memory", "container_disk", "container_persistent",
             "docker_volumes", "docker_env", "docker_mount_cwd_to_workspace", "docker_network",
-            "docker_extra_args", "docker_shm_size", "docker_run_as_host_user",
+            "docker_extra_args", "docker_shm_size", "docker_run_as_host_user", "docker_snap_compat",
             "docker_persist_across_processes", "docker_shared_container_key",
             "docker_orphan_reaper", "sandbox_dir", "persistent_shell")}}
 
@@ -2565,7 +2565,7 @@ def _publish_env_value(key: str, value: Optional[str]) -> None:
         # Multiplex mode must never publish a routed profile's credential to
         # shared os.environ. The immutable scope owner replaces the current
         # context value; a missing scope stays fail-closed.
-        scope_module.update_secret_scope(key, value)
+        scope_module.update_secret_scope(key, value, profile_home=get_env_path().parent)
         return
     if value is None:
         os.environ.pop(key, None)

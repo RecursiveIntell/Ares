@@ -262,6 +262,7 @@ def _popen_bash(cmd: list[str], stdin_data: str | None = None, **kwargs) -> subp
     enforce_profile_boundary = kwargs.pop("enforce_profile_boundary", False)
     kwargs["env"] = build_subprocess_env(
         base=kwargs.get("env"),
+        extra=kwargs.pop("extra_env", None),
         profile_home=profile_home,
         source_profile_home=source_profile_home,
         enforce_profile_boundary=enforce_profile_boundary,
