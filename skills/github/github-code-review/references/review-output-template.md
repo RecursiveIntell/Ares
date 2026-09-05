@@ -1,74 +1,55 @@
 # Review Output Template
 
-Use this as the structure for PR review summary comments. Copy and fill in the sections.
+This is a presentation aid under `github-code-review/SKILL.md`, not an instruction or authorization to publish. Return findings to the user by default. A draft, an internal recommendation, a posted comment and a submitted formal review are different states.
 
-## For PR Summary Comment
+Use only useful sections; do not invent praise or findings to fill the template. For a blockers-only or delta request, omit unrelated observations.
 
 ```markdown
-## Code Review Summary
+## Review of the inspected revision
 
-**Verdict: [Approved ✅ | Changes Requested 🔴 | Reviewed 💬]** ([N] issues, [N] suggestions)
+Subject: [upstream repository / PR / head repository / exact reviewed SHA]
+Observed: [timestamp]
+Scope: [paths and behaviors inspected; important exclusions]
 
-**PR:** #[number] — [title]
-**Author:** @[username]
-**Files changed:** [N] (+[additions] -[deletions])
+### Supported blockers or defects
+- [ID] [path:line at reviewed SHA]: [reachable cause and consequence].
+  Evidence: [source/test/observation and its origin].
+  Required correction or proof: [smallest specific acceptance gate].
+  Confidence: [supported / plausible risk / unproven].
 
-### 🔴 Critical
-<!-- Issues that MUST be fixed before merge -->
-- **file.py:line** — [description]. Suggestion: [fix].
+### Optional improvements
+- [Only material, nonblocking improvements relevant to the request.]
 
-### ⚠️ Warnings
-<!-- Issues that SHOULD be fixed, but not strictly blocking -->
-- **file.py:line** — [description].
+### Verification and remaining gates
+- [Exact command/oracle, tested subject, raw result and scope.]
+- [FAIL / BLOCKED / NOT_RUN / SKIP where applicable, with reason.]
+- [Maintainer-controlled gate distinguished from contributor-actionable work.]
 
-### 💡 Suggestions
-<!-- Non-blocking improvements, style preferences, future considerations -->
-- **file.py:line** — [description].
-
-### ✅ Looks Good
-<!-- Call out things done well — positive reinforcement -->
-- [aspect that was done well]
-
----
-*Reviewed by Hermes Agent*
+Publication: [not posted / draft only / exact authorized action and returned ID]
 ```
 
-## Severity Guide
+## Judgment is not a GitHub action
 
-| Level | Icon | When to use | Blocks merge? |
-|-------|------|-------------|---------------|
-| Critical | 🔴 | Security vulnerabilities, data loss risk, crashes, broken core functionality | Yes |
-| Warning | ⚠️ | Bugs in non-critical paths, missing error handling, missing tests for new code | Usually yes |
-| Suggestion | 💡 | Style improvements, refactoring ideas, performance hints, documentation gaps | No |
-| Looks Good | ✅ | Clean patterns, good test coverage, clear naming, smart design decisions | N/A |
+“No supported blocking defect found in the inspected scope” is an internal conclusion. It is not a submitted APPROVE review and not a guarantee that the code is secure.
 
-## Verdict Decision
+“Changes are needed before the claimed behavior is proven” is a finding. It is not automatically a submitted REQUEST_CHANGES event.
 
-- **Approved ✅** — Zero critical/warning items. Only suggestions or all clear.
-- **Changes Requested 🔴** — Any critical or warning item exists.
-- **Reviewed 💬** — Observations only (draft PRs, uncertain findings, informational).
+Submit COMMENT, APPROVE or REQUEST_CHANGES only when the actual user request grants that specific action and target, subject to host requirements. Revalidate the current head before publishing; do not attach stale findings to new code silently. A generic comment grant is not an approval grant.
 
-## For Inline Comments
+## Severity and blocker classification
 
-Prefix inline comments with the severity icon so they're scannable:
+Assess consequence and reachability separately from confidence and merge policy. A demonstrated authorization bypass, destructive data error or core regression may be blocking. A missing test may be a required acceptance gate or a nonblocking improvement depending on the requested claim. A style preference is not a security blocker.
 
-```
-🔴 **Critical:** User input passed directly to SQL query — use parameterized queries to prevent injection.
-```
+Do not turn every warning into a request-changes event. Preserve reviewer/maintainer intent and distinguish a current unresolved requirement from a historical fixed finding.
 
-```
-⚠️ **Warning:** This error is silently swallowed. At minimum, log it.
-```
+## Inline findings
 
-```
-💡 **Suggestion:** This could be simplified with a dict comprehension:
-`{k: v for k, v in items if v is not None}`
-```
+A useful inline finding states the invariant, where the current path violates it, why that matters, and the smallest correction or discriminating test. Bind the finding to the reviewed commit and valid file/line. Do not add speculative allegations or generic praise at arbitrary lines.
 
-```
-✅ **Nice:** Good use of context manager here — ensures cleanup on exceptions.
-```
+If authorized to publish, prefer one coherent communication rather than automatically posting a formal review and a redundant summary comment. Record returned IDs and read-back state. Reconcile ambiguous results before retrying.
 
-## For Local (Pre-Push) Review
+## Local review and follow-ups
 
-When reviewing locally before push, use the same structure but present it as a message to the user instead of a PR comment. Skip the PR metadata header and just start with the severity sections.
+For local code, replace PR metadata with the worktree, base/head and dirty-state scope. Do not change branches or discard edits as a presentation step.
+
+For follow-ups, bind the prior and current reviewed revisions. Mark earlier findings still open, fixed with evidence, changed but unproven, superseded or unresolved. Report only genuinely changed or invalidated evidence unless a new full review was requested.
