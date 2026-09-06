@@ -560,11 +560,8 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
                 "refusing to rebuild an immutable release"
             )
 
-    def _build_runtime(self, source: Path, *, desktop: bool) -> None:
-        if self._installed_release_source(source):
-            raise AresLocalRuntimeError(
-                "cannot mutate an installed release; build a new staged Ares release instead"
-            )
+    def _sync_python_runtime(self, source: Path) -> None:
+        """Install and verify the editable Python runtime at ``source``."""
 
         from hermes_cli.managed_uv import ensure_uv
 
@@ -603,6 +600,38 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
             cwd=self.paths.state_root,
             env=self._build_environment(source),
         )
+
+    def _refresh_moved_editable_install(self, source: Path) -> None:
+        """Finalize one newly moved, inactive release's editable path binding."""
+
+        resolved = source.resolve()
+        try:
+            relative = resolved.relative_to(self.paths.releases_dir.resolve())
+            if len(relative.parts) != 2 or relative.parts[1] != "source":
+                raise ValueError("invalid release source layout")
+            revision = self._require_revision(relative.parts[0])
+        except (AresLocalRuntimeError, OSError, ValueError) as exc:
+            raise AresLocalRuntimeError(
+                "editable install refresh requires an exact releases/<revision>/source path"
+            ) from exc
+        if resolved != (self._release_dir(revision) / "source").resolve():
+            raise AresLocalRuntimeError(
+                "editable install refresh requires an exact releases/<revision>/source path"
+            )
+        current = self._release_from_link(self.paths.current_link, "current")
+        if current is not None and current[1].resolve() == resolved:
+            raise AresLocalRuntimeError(
+                "cannot refresh the editable install of an active Ares release"
+            )
+        self._sync_python_runtime(resolved)
+
+    def _build_runtime(self, source: Path, *, desktop: bool) -> None:
+        if self._installed_release_source(source):
+            raise AresLocalRuntimeError(
+                "cannot mutate an installed release; build a new staged Ares release instead"
+            )
+
+        self._sync_python_runtime(source)
         if desktop:
             npm = self._managed_npm()
             if npm is None:
@@ -700,9 +729,9 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
             moved_to_final = True
             # ``uv sync`` intentionally creates an editable install. Its finder
             # records absolute paths, so the atomic staging-to-release move must
-            # be followed by a bounded re-sync at the final immutable path.
+            # be followed by one bounded finalization at the final, inactive path.
             # Desktop artifacts already moved with the source and are not rebuilt.
-            self._build_runtime(final_dir / "source", desktop=False)
+            self._refresh_moved_editable_install(final_dir / "source")
         except Exception:
             cleanup_failure: OSError | None = None
             if staging.exists():
@@ -777,6 +806,8 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
         staging = self.paths.staging_dir / f"candidate.{uuid.uuid4().hex}"
         source = staging / "source"
         patch_path = staging / "ares.patch"
+        final_dir: Path | None = None
+        moved_to_final = False
         try:
             self._run(["git", "clone", "--no-local", downstream_remote, source])
             self._run([
@@ -923,10 +954,25 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
                 },
             )
             os.replace(staging, final_dir)
+            moved_to_final = True
+            self._refresh_moved_editable_install(final_dir / "source")
             return candidate_revision
         except Exception:
+            cleanup_failure: OSError | None = None
             if staging.exists():
-                shutil.rmtree(staging)
+                try:
+                    shutil.rmtree(staging)
+                except OSError as exc:
+                    cleanup_failure = exc
+            if moved_to_final and final_dir is not None and final_dir.exists():
+                try:
+                    shutil.rmtree(final_dir)
+                except OSError as exc:
+                    cleanup_failure = cleanup_failure or exc
+            if cleanup_failure is not None:
+                raise AresLocalRuntimeError(
+                    "Ares upstream candidate cleanup failed"
+                ) from cleanup_failure
             raise
 
     def _install_launcher(self) -> None:

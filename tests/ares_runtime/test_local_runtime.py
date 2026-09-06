@@ -202,6 +202,7 @@ def test_upstream_candidate_applies_downstream_delta_in_staging(
 
     runtime = _runtime(tmp_path)
     monkeypatch.setattr(runtime, "_build_runtime", lambda source, *, desktop: None)
+    monkeypatch.setattr(runtime, "_refresh_moved_editable_install", lambda source: None)
 
     candidate_revision = runtime._materialize_upstream_candidate(
         downstream_remote=str(downstream),
@@ -248,6 +249,7 @@ def test_update_activates_only_the_verified_upstream_candidate(
         upstream_branch="main",
     )
     monkeypatch.setattr(runtime, "_build_runtime", lambda source, *, desktop: None)
+    monkeypatch.setattr(runtime, "_refresh_moved_editable_install", lambda source: None)
 
     candidate_revision, changed = runtime.update(desktop=False)
 
@@ -808,6 +810,7 @@ def test_materialize_rebinds_editable_runtime_after_staging_move(
     runtime = _runtime(tmp_path)
     revision = "c" * 40
     builds: list[Path] = []
+    refreshes: list[Path] = []
 
     def fake_run(args, **_kwargs):
         if args[:2] == ["git", "clone"]:
@@ -823,13 +826,18 @@ def test_materialize_rebinds_editable_runtime_after_staging_move(
         "_build_runtime",
         lambda source, *, desktop: builds.append(source.resolve()),
     )
+    monkeypatch.setattr(
+        runtime,
+        "_refresh_moved_editable_install",
+        lambda source: refreshes.append(source.resolve()),
+    )
 
     runtime._materialize("candidate-source", revision, desktop=False)
 
     final_source = runtime._release_source(revision).resolve()
-    assert len(builds) == 2
+    assert len(builds) == 1
     assert builds[0] != final_source
-    assert builds[1] == final_source
+    assert refreshes == [final_source]
 
 
 def test_chat_command_leaves_hermes_options_for_the_runtime() -> None:
@@ -929,6 +937,39 @@ def test_runtime_builder_refuses_an_installed_release_source(
         runtime._build_runtime(source, desktop=False)
 
 
+def test_editable_refresh_is_limited_to_an_inactive_final_release(
+    tmp_path: Path, monkeypatch
+) -> None:
+    runtime = _runtime(tmp_path)
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    invalid_revision_child = (
+        runtime.paths.releases_dir / "not-a-revision" / "arbitrary-subdir"
+    )
+    invalid_revision_child.mkdir(parents=True)
+    wrong_child = runtime.paths.releases_dir / ("b" * 40) / "wrong-child"
+    wrong_child.mkdir(parents=True)
+    syncs: list[Path] = []
+    monkeypatch.setattr(
+        runtime, "_sync_python_runtime", lambda source: syncs.append(source)
+    )
+
+    for invalid in (checkout, invalid_revision_child, wrong_child):
+        with pytest.raises(AresLocalRuntimeError, match="exact releases"):
+            runtime._refresh_moved_editable_install(invalid)
+    assert syncs == []
+
+    revision = "a" * 40
+    source = _release(runtime, revision)
+    runtime._refresh_moved_editable_install(source)
+    assert syncs == [source]
+
+    runtime._activate(revision)
+    with pytest.raises(AresLocalRuntimeError, match="active Ares release"):
+        runtime._refresh_moved_editable_install(source)
+    assert syncs == [source]
+
+
 def test_materialize_reuses_a_complete_existing_release_without_rebuilding(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -966,24 +1007,30 @@ def test_materialize_quarantines_an_incomplete_nonactive_release_then_rebuilds(
     runtime._atomic_link(runtime.paths.previous_link, incomplete_source.resolve())
 
     build_sources: list[Path] = []
+    refresh_sources: list[Path] = []
 
     def mark_ready(source: Path, *, desktop: bool) -> None:
         assert desktop is False
         build_sources.append(source)
-        assert runtime._installed_release_source(source) is (len(build_sources) == 2)
+        assert not runtime._installed_release_source(source)
         python = runtime._python_for(source)
         python.parent.mkdir(parents=True, exist_ok=True)
         python.write_text("python", encoding="utf-8")
         python.chmod(0o755)
 
+    def mark_refreshed(source: Path) -> None:
+        assert runtime._installed_release_source(source)
+        refresh_sources.append(source)
+
     monkeypatch.setattr(runtime, "_build_runtime", mark_ready)
+    monkeypatch.setattr(runtime, "_refresh_moved_editable_install", mark_refreshed)
 
     runtime._materialize(str(source_repository), revision, desktop=False)
 
     rebuilt = runtime._release_source(revision)
-    assert len(build_sources) == 2
+    assert len(build_sources) == 1
     assert not runtime._installed_release_source(build_sources[0])
-    assert runtime._installed_release_source(build_sources[1])
+    assert refresh_sources == [rebuilt]
     assert (rebuilt / "canonical.txt").read_text(encoding="utf-8") == "canonical\n"
     assert not (rebuilt / "preserved.txt").exists()
     quarantines = sorted(
@@ -1019,6 +1066,48 @@ def test_materialize_restores_incomplete_release_when_recovery_build_fails(
     )
 
     with pytest.raises(RuntimeError, match="injected build failure"):
+        runtime._materialize(str(source_repository), revision, desktop=False)
+
+    restored = runtime._release_source(revision)
+    assert (restored / "preserved.txt").read_text(
+        encoding="utf-8"
+    ) == "old incomplete release\n"
+    assert runtime.previous_release() == (revision, restored.resolve())
+    assert not list(
+        (runtime.paths.data_root / "quarantine" / "incomplete-releases").glob(
+            f"{revision}.*"
+        )
+    )
+
+
+def test_materialize_restores_incomplete_release_when_editable_refresh_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    runtime = _runtime(tmp_path)
+    source_repository = _repository(tmp_path / "source-refresh-failure")
+    (source_repository / "canonical.txt").write_text("canonical\n", encoding="utf-8")
+    revision = _commit(source_repository, "canonical source")
+    incomplete_source = _release(runtime, revision)
+    (incomplete_source / "preserved.txt").write_text(
+        "old incomplete release\n", encoding="utf-8"
+    )
+    runtime._atomic_link(runtime.paths.previous_link, incomplete_source.resolve())
+
+    def mark_ready(source: Path, *, desktop: bool) -> None:
+        assert desktop is False
+        python = runtime._python_for(source)
+        python.parent.mkdir(parents=True, exist_ok=True)
+        python.write_text("python", encoding="utf-8")
+        python.chmod(0o755)
+
+    monkeypatch.setattr(runtime, "_build_runtime", mark_ready)
+    monkeypatch.setattr(
+        runtime,
+        "_refresh_moved_editable_install",
+        lambda _source: (_ for _ in ()).throw(RuntimeError("injected refresh failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="injected refresh failure"):
         runtime._materialize(str(source_repository), revision, desktop=False)
 
     restored = runtime._release_source(revision)
@@ -1095,6 +1184,54 @@ def test_materialize_restores_incomplete_release_when_staging_cleanup_fails(
     assert runtime.previous_release() == (revision, restored.resolve())
 
 
+def test_upstream_candidate_refresh_failure_removes_published_candidate(
+    tmp_path: Path, monkeypatch
+) -> None:
+    upstream = _repository(tmp_path / "upstream-refresh-failure")
+    (upstream / "base.txt").write_text("base\n", encoding="utf-8")
+    _commit(upstream, "base")
+
+    downstream = tmp_path / "downstream-refresh-failure"
+    subprocess.run(["git", "clone", str(upstream), str(downstream)], check=True)
+    _git(downstream, "config", "user.name", "Ares Runtime Tests")
+    _git(downstream, "config", "user.email", "ares-runtime-tests@example.invalid")
+    (downstream / "ares.txt").write_text("Ares\n", encoding="utf-8")
+    downstream_revision = _commit(downstream, "Ares patch")
+
+    (upstream / "upstream.txt").write_text("upstream\n", encoding="utf-8")
+    upstream_revision = _commit(upstream, "upstream patch")
+    runtime = _runtime(tmp_path)
+
+    def mark_ready(source: Path, *, desktop: bool) -> None:
+        assert desktop is False
+        assert not runtime._installed_release_source(source)
+        python = runtime._python_for(source)
+        python.parent.mkdir(parents=True, exist_ok=True)
+        python.write_text("python", encoding="utf-8")
+        python.chmod(0o755)
+
+    monkeypatch.setattr(runtime, "_build_runtime", mark_ready)
+    monkeypatch.setattr(
+        runtime,
+        "_refresh_moved_editable_install",
+        lambda _source: (_ for _ in ()).throw(RuntimeError("injected refresh failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="injected refresh failure"):
+        runtime._materialize_upstream_candidate(
+            downstream_remote=str(downstream),
+            downstream_revision=downstream_revision,
+            upstream_remote=str(upstream),
+            upstream_branch="main",
+            upstream_revision=upstream_revision,
+            desktop=False,
+        )
+
+    assert not list(runtime.paths.releases_dir.iterdir())
+    assert not runtime.paths.current_link.exists()
+    assert not list(runtime.paths.staging_dir.iterdir())
+
+
 def test_upstream_candidate_reuse_never_rebuilds_the_installed_release(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -1113,15 +1250,24 @@ def test_upstream_candidate_reuse_never_rebuilds_the_installed_release(
     upstream_revision = _commit(upstream, "upstream patch")
 
     runtime = _runtime(tmp_path)
+    build_sources: list[Path] = []
+    refresh_sources: list[Path] = []
 
     def mark_ready(source: Path, *, desktop: bool) -> None:
         assert desktop is False
+        build_sources.append(source)
+        assert not runtime._installed_release_source(source)
         python = runtime._python_for(source)
         python.parent.mkdir(parents=True, exist_ok=True)
         python.write_text("python", encoding="utf-8")
         python.chmod(0o755)
 
     monkeypatch.setattr(runtime, "_build_runtime", mark_ready)
+    monkeypatch.setattr(
+        runtime,
+        "_refresh_moved_editable_install",
+        lambda source: refresh_sources.append(source),
+    )
     first = runtime._materialize_upstream_candidate(
         downstream_remote=str(downstream),
         downstream_revision=downstream_revision,
@@ -1130,6 +1276,10 @@ def test_upstream_candidate_reuse_never_rebuilds_the_installed_release(
         upstream_revision=upstream_revision,
         desktop=False,
     )
+    final_source = runtime._release_source(first)
+    assert len(build_sources) == 1
+    assert not runtime._installed_release_source(build_sources[0])
+    assert refresh_sources == [final_source]
     monkeypatch.setattr(
         runtime,
         "_build_runtime",
@@ -1148,6 +1298,8 @@ def test_upstream_candidate_reuse_never_rebuilds_the_installed_release(
     )
 
     assert second == first
+    assert len(build_sources) == 1
+    assert refresh_sources == [final_source]
 
 
 def test_desktop_rebuild_refuses_to_mutate_the_active_release(
