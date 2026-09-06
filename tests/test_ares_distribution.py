@@ -21,7 +21,9 @@ def test_readme_declares_ares_as_a_downstream_distribution() -> None:
 
 
 def test_website_front_door_carries_ares_identity() -> None:
-    config = (REPO_ROOT / "website" / "docusaurus.config.ts").read_text(encoding="utf-8")
+    config = (REPO_ROOT / "website" / "docusaurus.config.ts").read_text(
+        encoding="utf-8"
+    )
     index = (REPO_ROOT / "website" / "docs" / "index.mdx").read_text(encoding="utf-8")
 
     assert "title: 'Ares'" in config
@@ -38,14 +40,23 @@ def test_ares_installer_is_explicit_about_compatibility_and_plugin_scope() -> No
 
     assert "Ares Installer" in installer
     assert "--with-recursive-agent-source PATH" in installer
-    assert "Recursive Agent daemon is not installed or started by this option" in installer
+    assert (
+        "Recursive Agent daemon is not installed or started by this option" in installer
+    )
+    assert "--no-gateway" in installer
+    assert "INSTALL_GATEWAY=false" in installer
+    assert "setup_args+=(--no-gateway)" in installer
     assert "config set" not in installer
     assert "yaml.safe_dump" not in installer
 
 
 def test_ares_docs_are_deployed_by_the_downstream_workflow() -> None:
-    workflow = (REPO_ROOT / ".github" / "workflows" / "deploy-site.yml").read_text(encoding="utf-8")
-    llms_generator = (REPO_ROOT / "website" / "scripts" / "generate-llms-txt.py").read_text(encoding="utf-8")
+    workflow = (REPO_ROOT / ".github" / "workflows" / "deploy-site.yml").read_text(
+        encoding="utf-8"
+    )
+    llms_generator = (
+        REPO_ROOT / "website" / "scripts" / "generate-llms-txt.py"
+    ).read_text(encoding="utf-8")
 
     assert "github.repository == 'RecursiveIntell/hermes-agent'" in workflow
     assert "https://recursiveintell.github.io/hermes-agent/docs" in llms_generator

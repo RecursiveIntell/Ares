@@ -379,6 +379,8 @@ The bootstrap installer accepts:
 | `--hermes-home PATH` | Select the Ares data directory. |
 | `--ares-bin-dir PATH` | Select where the `ares` launcher is written. |
 | `--no-venv` | Use the active Python environment instead of a managed virtual environment. |
+| `--no-desktop` | Skip the Desktop build for a CLI-only or disposable installation. |
+| `--no-gateway` | Do not install, enable, or start the user-level Ares gateway service. |
 | `--with-recursive-agent-source PATH` | Install only the standalone Recursive Agent plugin from an existing checkout. The daemon remains operator-managed. |
 
 Run `bash install.sh --help` for the authoritative installer contract. The bootstrap refuses to update a dirty existing checkout and refuses to overwrite a non-Ares launcher.

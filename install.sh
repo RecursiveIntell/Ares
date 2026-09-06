@@ -12,6 +12,8 @@ HERMES_HOME="${HERMES_HOME:-$HOME/.ares}"
 INSTALL_DIR=""
 ARES_BIN_DIR="${ARES_BIN_DIR:-$HOME/.local/bin}"
 USE_VENV=true
+INSTALL_DESKTOP=true
+INSTALL_GATEWAY=true
 RECURSIVE_AGENT_SOURCE=""
 
 log() { printf '[ares] %s\n' "$*"; }
@@ -34,6 +36,8 @@ Options:
   --hermes-home PATH                Ares data directory (default: ~/.ares)
   --ares-bin-dir PATH               Directory for the `ares` launcher (default: ~/.local/bin)
   --no-venv                         Use the active Python environment instead of a managed .venv
+  --no-desktop                      Do not build or install the Ares Desktop application
+  --no-gateway                      Do not install, enable, or start the Ares gateway service
   --with-recursive-agent-source PATH
                                     Install the standalone Recursive Agent plugin from an existing
                                     RecursiveIntell/recursive-agent checkout.
@@ -55,6 +59,8 @@ while (($#)); do
         --hermes-home) HERMES_HOME="${2:?--hermes-home requires a value}"; shift 2 ;;
         --ares-bin-dir) ARES_BIN_DIR="${2:?--ares-bin-dir requires a value}"; shift 2 ;;
         --no-venv) USE_VENV=false; shift ;;
+        --no-desktop) INSTALL_DESKTOP=false; shift ;;
+        --no-gateway) INSTALL_GATEWAY=false; shift ;;
         --with-recursive-agent-source) RECURSIVE_AGENT_SOURCE="${2:?--with-recursive-agent-source requires a value}"; shift 2 ;;
         -h|--help) show_help; exit 0 ;;
         *) die "unknown option: $1" ;;
@@ -106,12 +112,15 @@ install_runtime() {
 
 install_stable_runtime() {
     log "building the isolated Ares release runtime"
+    local setup_args=(setup --source "$INSTALL_DIR")
+    [[ "$INSTALL_DESKTOP" == true ]] || setup_args+=(--no-desktop)
+    [[ "$INSTALL_GATEWAY" == true ]] || setup_args+=(--no-gateway)
     if [[ "$USE_VENV" == true ]]; then
         ARES_HOME="$HERMES_HOME" ARES_BIN_DIR="$ARES_BIN_DIR" \
-            "$INSTALL_DIR/.venv/bin/ares" setup --source "$INSTALL_DIR"
+            "$INSTALL_DIR/.venv/bin/ares" "${setup_args[@]}"
     else
         ARES_HOME="$HERMES_HOME" ARES_BIN_DIR="$ARES_BIN_DIR" \
-            python3 -m ares_runtime.local_runtime setup --source "$INSTALL_DIR"
+            python3 -m ares_runtime.local_runtime "${setup_args[@]}"
     fi
 }
 

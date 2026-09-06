@@ -75,7 +75,9 @@ def test_current_link_is_the_only_active_runtime_pointer(tmp_path: Path) -> None
     assert runtime.previous_release() == (first, first_source.resolve())
 
 
-def test_rollback_swaps_current_and_previous_without_a_worktree_fallback(tmp_path: Path) -> None:
+def test_rollback_swaps_current_and_previous_without_a_worktree_fallback(
+    tmp_path: Path,
+) -> None:
     runtime = _runtime(tmp_path)
     first = "a" * 40
     second = "b" * 40
@@ -147,7 +149,9 @@ def test_rollback_pointer_failure_restores_the_complete_pair(
 
 def test_config_only_tracks_update_source_not_active_release(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path)
-    runtime._write_config(remote="https://github.com/RecursiveIntell/Ares.git", branch="main")
+    runtime._write_config(
+        remote="https://github.com/RecursiveIntell/Ares.git", branch="main"
+    )
 
     payload = json.loads(runtime.paths.config_path.read_text(encoding="utf-8"))
 
@@ -173,11 +177,15 @@ def test_legacy_update_config_receives_safe_upstream_defaults(tmp_path: Path) ->
 
     config = runtime._read_config()
 
-    assert config["upstream_remote"] == "https://github.com/NousResearch/hermes-agent.git"
+    assert (
+        config["upstream_remote"] == "https://github.com/NousResearch/hermes-agent.git"
+    )
     assert config["upstream_branch"] == "main"
 
 
-def test_upstream_candidate_applies_downstream_delta_in_staging(tmp_path: Path, monkeypatch) -> None:
+def test_upstream_candidate_applies_downstream_delta_in_staging(
+    tmp_path: Path, monkeypatch
+) -> None:
     upstream = _repository(tmp_path / "upstream")
     (upstream / "hermes.txt").write_text("base\n", encoding="utf-8")
     _commit(upstream, "base")
@@ -205,7 +213,9 @@ def test_upstream_candidate_applies_downstream_delta_in_staging(tmp_path: Path, 
     )
 
     candidate = runtime._release_source(candidate_revision)
-    assert (candidate / "upstream.txt").read_text(encoding="utf-8") == "new Hermes feature\n"
+    assert (candidate / "upstream.txt").read_text(
+        encoding="utf-8"
+    ) == "new Hermes feature\n"
     assert (candidate / "ares.txt").read_text(encoding="utf-8") == "downstream patch\n"
     assert _git(candidate, "status", "--porcelain") == ""
     metadata = runtime._release_metadata(candidate_revision)
@@ -213,7 +223,9 @@ def test_upstream_candidate_applies_downstream_delta_in_staging(tmp_path: Path, 
     assert metadata["downstream_revision"] == downstream_revision
 
 
-def test_update_activates_only_the_verified_upstream_candidate(tmp_path: Path, monkeypatch) -> None:
+def test_update_activates_only_the_verified_upstream_candidate(
+    tmp_path: Path, monkeypatch
+) -> None:
     upstream = _repository(tmp_path / "upstream")
     (upstream / "hermes.txt").write_text("base\n", encoding="utf-8")
     _commit(upstream, "base")
@@ -247,7 +259,9 @@ def test_update_activates_only_the_verified_upstream_candidate(tmp_path: Path, m
     assert runtime.update(desktop=False) == (candidate_revision, False)
 
 
-def test_upstream_candidate_conflict_never_publishes_a_release(tmp_path: Path, monkeypatch) -> None:
+def test_upstream_candidate_conflict_never_publishes_a_release(
+    tmp_path: Path, monkeypatch
+) -> None:
     upstream = _repository(tmp_path / "upstream")
     (upstream / "shared.txt").write_text("base\n", encoding="utf-8")
     _commit(upstream, "base")
@@ -275,25 +289,41 @@ def test_upstream_candidate_conflict_never_publishes_a_release(tmp_path: Path, m
             desktop=False,
         )
 
-    assert not runtime.paths.releases_dir.exists() or not any(runtime.paths.releases_dir.iterdir())
+    assert not runtime.paths.releases_dir.exists() or not any(
+        runtime.paths.releases_dir.iterdir()
+    )
 
 
 def test_desktop_launch_uses_xwayland_only_when_available() -> None:
     executable = Path("/tmp/Ares")
 
-    assert _desktop_launch_arguments(executable, platform="linux", environment={"XDG_SESSION_TYPE": "wayland", "DISPLAY": ":0"}) == [
+    assert _desktop_launch_arguments(
+        executable,
+        platform="linux",
+        environment={"XDG_SESSION_TYPE": "wayland", "DISPLAY": ":0"},
+    ) == [
         str(executable),
         "--ozone-platform=x11",
     ]
-    assert _desktop_launch_arguments(executable, platform="linux", environment={"XDG_SESSION_TYPE": "wayland"}) == [str(executable)]
-    assert _desktop_launch_arguments(executable, platform="linux", environment={"DISPLAY": ":0"}) == [str(executable)]
-    assert _desktop_launch_arguments(executable, platform="darwin", environment={"WAYLAND_DISPLAY": "wayland-0", "DISPLAY": ":0"}) == [str(executable)]
+    assert _desktop_launch_arguments(
+        executable, platform="linux", environment={"XDG_SESSION_TYPE": "wayland"}
+    ) == [str(executable)]
+    assert _desktop_launch_arguments(
+        executable, platform="linux", environment={"DISPLAY": ":0"}
+    ) == [str(executable)]
+    assert _desktop_launch_arguments(
+        executable,
+        platform="darwin",
+        environment={"WAYLAND_DISPLAY": "wayland-0", "DISPLAY": ":0"},
+    ) == [str(executable)]
 
 
 def test_desktop_gpu_policy_reads_the_ares_scoped_config(tmp_path: Path) -> None:
     home = tmp_path / "ares-home"
     home.mkdir()
-    (home / "config.yaml").write_text("desktop:\n  disable_gpu: true\n", encoding="utf-8")
+    (home / "config.yaml").write_text(
+        "desktop:\n  disable_gpu: true\n", encoding="utf-8"
+    )
 
     assert _desktop_disable_gpu_policy(home) == "1"
 
@@ -306,7 +336,9 @@ def test_desktop_launch_bridges_configured_gpu_policy_without_overriding_environ
     source = _release(runtime, revision)
     runtime._activate(revision)
     runtime.paths.agent_home.mkdir()
-    (runtime.paths.agent_home / "config.yaml").write_text("desktop:\n  disable_gpu: true\n", encoding="utf-8")
+    (runtime.paths.agent_home / "config.yaml").write_text(
+        "desktop:\n  disable_gpu: true\n", encoding="utf-8"
+    )
     executable = source / "Ares"
     executable.write_text("desktop", encoding="utf-8")
     captured: list[dict[str, str]] = []
@@ -338,12 +370,14 @@ def test_launcher_resolves_the_selected_runtime_dynamically(tmp_path: Path) -> N
     assert 'runtime_root="$ARES_HOME/runtime/current"' in launcher
     assert 'if [[ -z "${ARES_HOME:-}" ]]' in launcher
     assert 'if [[ -z "${ARES_GATEWAY_UNIT_PATH:-}" ]]' in launcher
-    assert "cd \"$runtime_root\"" in launcher
+    assert 'cd "$runtime_root"' in launcher
     assert "-m ares_runtime.local_runtime" in launcher
     assert "Coding" not in launcher
 
 
-def test_default_paths_honors_an_explicit_gateway_unit_path(tmp_path: Path, monkeypatch) -> None:
+def test_default_paths_honors_an_explicit_gateway_unit_path(
+    tmp_path: Path, monkeypatch
+) -> None:
     monkeypatch.setenv("ARES_HOME", str(tmp_path / "ares-home"))
     monkeypatch.setenv("ARES_BIN_DIR", str(tmp_path / "bin"))
     unit_path = tmp_path / "isolated" / "isolated-gateway.service"
@@ -354,7 +388,9 @@ def test_default_paths_honors_an_explicit_gateway_unit_path(tmp_path: Path, monk
     assert _default_paths().unit_path == unit_path
 
 
-def test_custom_gateway_unit_path_never_probes_the_live_default_unit(tmp_path: Path, monkeypatch) -> None:
+def test_custom_gateway_unit_path_never_probes_the_live_default_unit(
+    tmp_path: Path, monkeypatch
+) -> None:
     runtime = AresLocalRuntime(
         AresLocalPaths(
             state_root=tmp_path / "state",
@@ -366,20 +402,31 @@ def test_custom_gateway_unit_path_never_probes_the_live_default_unit(tmp_path: P
     )
     calls: list[tuple[str, ...]] = []
 
-    monkeypatch.setattr("ares_runtime.local_runtime.shutil.which", lambda _name: "/usr/bin/systemctl")
+    monkeypatch.setattr(
+        "ares_runtime.local_runtime.shutil.which", lambda _name: "/usr/bin/systemctl"
+    )
     monkeypatch.setattr(
         "ares_runtime.local_runtime.subprocess.run",
-        lambda command, **_kwargs: calls.append(tuple(command)) or SimpleNamespace(returncode=1, stdout="", stderr=""),
+        lambda command, **_kwargs: (
+            calls.append(tuple(command))
+            or SimpleNamespace(returncode=1, stdout="", stderr="")
+        ),
     )
 
     runtime._systemctl("is-active", "--quiet", "ares-gateway.service", required=False)
 
-    assert calls == [("systemctl", "--user", "is-active", "--quiet", "isolated-gateway.service")]
+    assert calls == [
+        ("systemctl", "--user", "is-active", "--quiet", "isolated-gateway.service")
+    ]
 
 
-def test_custom_gateway_unit_path_rejects_the_live_default_basename(tmp_path: Path, monkeypatch) -> None:
+def test_custom_gateway_unit_path_rejects_the_live_default_basename(
+    tmp_path: Path, monkeypatch
+) -> None:
     monkeypatch.setenv("ARES_HOME", str(tmp_path / "ares-home"))
-    monkeypatch.setenv("ARES_GATEWAY_UNIT_PATH", str(tmp_path / "isolated" / "ares-gateway.service"))
+    monkeypatch.setenv(
+        "ARES_GATEWAY_UNIT_PATH", str(tmp_path / "isolated" / "ares-gateway.service")
+    )
 
     from ares_runtime.local_runtime import _default_paths
 
@@ -392,19 +439,23 @@ def test_generated_launcher_is_shell_safe_for_unusual_paths(tmp_path: Path) -> N
         AresLocalPaths(
             state_root=tmp_path / "state",
             data_root=tmp_path / "data",
-            agent_home=tmp_path / "home with \"quotes\" $() `ticks` (x)",
+            agent_home=tmp_path / 'home with "quotes" $() `ticks` (x)',
             launcher_path=tmp_path / "bin with spaces" / "ares",
             unit_path=tmp_path / "unit with spaces" / "isolated-gateway.service",
         )
     )
     runtime._install_launcher()
 
-    result = subprocess.run(["bash", "-n", str(runtime.paths.launcher_path)], check=False)
+    result = subprocess.run(
+        ["bash", "-n", str(runtime.paths.launcher_path)], check=False
+    )
 
     assert result.returncode == 0
 
 
-def test_isolated_setup_does_not_probe_legacy_live_gateway(tmp_path: Path, monkeypatch) -> None:
+def test_isolated_setup_does_not_probe_legacy_live_gateway(
+    tmp_path: Path, monkeypatch
+) -> None:
     runtime = _runtime(tmp_path)
     revision = "c" * 40
     _release(runtime, revision)
@@ -441,8 +492,14 @@ def test_isolated_setup_does_not_probe_legacy_live_gateway(tmp_path: Path, monke
     monkeypatch.setattr(runtime, "_write_config", lambda **_kwargs: None)
     monkeypatch.setattr(runtime, "_install_launcher", lambda: None)
     monkeypatch.setattr(runtime, "_install_gateway_unit", lambda: None)
-    monkeypatch.setattr(runtime, "_handoff_gateway", lambda *, legacy_active: handoff.append(legacy_active))
-    monkeypatch.setattr(runtime, "_systemctl", lambda *args, **_kwargs: calls.append(args) or False)
+    monkeypatch.setattr(
+        runtime,
+        "_handoff_gateway",
+        lambda *, legacy_active: handoff.append(legacy_active),
+    )
+    monkeypatch.setattr(
+        runtime, "_systemctl", lambda *args, **_kwargs: calls.append(args) or False
+    )
 
     runtime.setup(source, desktop=False, gateway=True, seed_from=tmp_path / "seed")
 
@@ -450,7 +507,9 @@ def test_isolated_setup_does_not_probe_legacy_live_gateway(tmp_path: Path, monke
     assert all("hermes-gateway.service" not in call for call in calls)
 
 
-def test_setup_handoff_failure_restores_pointer_and_launcher(tmp_path: Path, monkeypatch) -> None:
+def test_setup_handoff_failure_restores_pointer_and_launcher(
+    tmp_path: Path, monkeypatch
+) -> None:
     runtime = _runtime(tmp_path)
     prior_revision = "0" * 40
     old_revision = "a" * 40
@@ -481,20 +540,30 @@ def test_setup_handoff_failure_restores_pointer_and_launcher(tmp_path: Path, mon
     monkeypatch.setattr(runtime, "_provision_context_governor_key", lambda *_args: None)
     monkeypatch.setattr(runtime, "_write_config", lambda **_kwargs: None)
     monkeypatch.setattr(runtime, "_install_gateway_unit", lambda: None)
-    monkeypatch.setattr(runtime, "_handoff_gateway", lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("handoff failed")))
-    monkeypatch.setattr(runtime, "_systemctl", lambda *args, **_kwargs: calls.append(args) or True)
+    monkeypatch.setattr(
+        runtime,
+        "_handoff_gateway",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("handoff failed")),
+    )
+    monkeypatch.setattr(
+        runtime, "_systemctl", lambda *args, **_kwargs: calls.append(args) or True
+    )
 
     with pytest.raises(RuntimeError, match="handoff failed"):
         runtime.setup(source, desktop=False, gateway=True, seed_from=tmp_path / "seed")
 
     assert runtime.active_release() == (old_revision, old_source.resolve())
     assert runtime.previous_release() == (prior_revision, prior_source.resolve())
-    assert "cd \"$runtime_root\"" in runtime.paths.launcher_path.read_text(encoding="utf-8")
+    assert 'cd "$runtime_root"' in runtime.paths.launcher_path.read_text(
+        encoding="utf-8"
+    )
     assert ("enable", "ares-gateway.service") in calls
     assert ("restart", "ares-gateway.service") in calls
 
 
-def test_update_failure_restores_complete_pointer_pair(tmp_path: Path, monkeypatch) -> None:
+def test_update_failure_restores_complete_pointer_pair(
+    tmp_path: Path, monkeypatch
+) -> None:
     runtime = _runtime(tmp_path)
     prior_revision = "0" * 40
     old_revision = "a" * 40
@@ -532,7 +601,9 @@ def test_update_failure_restores_complete_pointer_pair(tmp_path: Path, monkeypat
     monkeypatch.setattr(
         runtime,
         "_systemctl",
-        lambda *args, **_kwargs: False if args[:2] == ("is-active", "--quiet") else True,
+        lambda *args, **_kwargs: (
+            False if args[:2] == ("is-active", "--quiet") else True
+        ),
     )
     monkeypatch.setattr("ares_runtime.local_runtime.time.sleep", lambda _seconds: None)
 
@@ -647,7 +718,9 @@ def test_gateway_unit_uses_the_explicit_foreground_action(tmp_path: Path) -> Non
     assert "TimeoutStopSec=210" in unit
 
 
-def test_source_cleanliness_reports_dirty_and_clean_git_releases(tmp_path: Path) -> None:
+def test_source_cleanliness_reports_dirty_and_clean_git_releases(
+    tmp_path: Path,
+) -> None:
     runtime = _runtime(tmp_path)
     source = _repository(tmp_path / "release")
     (source / "tracked.txt").write_text("clean\n", encoding="utf-8")
@@ -672,21 +745,34 @@ def test_systemd_environment_preserves_an_existing_session_bus(monkeypatch) -> N
     assert environment["PATH"] == os.environ["PATH"]
 
 
-def test_seed_adds_missing_auth_without_overwriting_an_ares_home(tmp_path: Path) -> None:
+def test_seed_adds_missing_auth_without_overwriting_an_ares_home(
+    tmp_path: Path,
+) -> None:
     runtime = _runtime(tmp_path)
     source_home = tmp_path / "hermes-home"
     source_home.mkdir()
     (source_home / "auth.json").write_text('{"provider":"codex"}', encoding="utf-8")
     runtime.paths.agent_home.mkdir()
-    (runtime.paths.agent_home / "config.yaml").write_text("provider: preserved\n", encoding="utf-8")
+    (runtime.paths.agent_home / "config.yaml").write_text(
+        "provider: preserved\n", encoding="utf-8"
+    )
     runtime._atomic_json(
         runtime.paths.agent_home / "ares-migration.json",
-        {"schema_version": 1, "source_home": str(source_home), "copied": [], "migrated_at": 0},
+        {
+            "schema_version": 1,
+            "source_home": str(source_home),
+            "copied": [],
+            "migrated_at": 0,
+        },
     )
 
     assert runtime._seed_agent_home(source_home) is True
-    assert (runtime.paths.agent_home / "auth.json").read_text(encoding="utf-8") == '{"provider":"codex"}'
-    assert (runtime.paths.agent_home / "config.yaml").read_text(encoding="utf-8") == "provider: preserved\n"
+    assert (runtime.paths.agent_home / "auth.json").read_text(
+        encoding="utf-8"
+    ) == '{"provider":"codex"}'
+    assert (runtime.paths.agent_home / "config.yaml").read_text(
+        encoding="utf-8"
+    ) == "provider: preserved\n"
 
 
 def test_context_governor_provisioning_uses_the_existing_governed_key_owner() -> None:
@@ -716,10 +802,42 @@ def test_runtime_builder_uses_editable_python_and_managed_node() -> None:
     assert '[npm, "ci", "--include=dev"]' in implementation
 
 
-def test_chat_command_leaves_hermes_options_for_the_runtime() -> None:
-    args, passthrough = _parser().parse_known_args(
-        ["chat", "--oneshot", "Reply with exactly ARES_RUNTIME_OK"]
+def test_materialize_rebinds_editable_runtime_after_staging_move(
+    tmp_path: Path, monkeypatch
+) -> None:
+    runtime = _runtime(tmp_path)
+    revision = "c" * 40
+    builds: list[Path] = []
+
+    def fake_run(args, **_kwargs):
+        if args[:2] == ["git", "clone"]:
+            source = Path(args[-1])
+            source.mkdir(parents=True)
+            (source / "ares_runtime").mkdir()
+            (source / "ares_runtime" / "__init__.py").write_text("", encoding="utf-8")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(runtime, "_run", fake_run)
+    monkeypatch.setattr(
+        runtime,
+        "_build_runtime",
+        lambda source, *, desktop: builds.append(source.resolve()),
     )
+
+    runtime._materialize("candidate-source", revision, desktop=False)
+
+    final_source = runtime._release_source(revision).resolve()
+    assert len(builds) == 2
+    assert builds[0] != final_source
+    assert builds[1] == final_source
+
+
+def test_chat_command_leaves_hermes_options_for_the_runtime() -> None:
+    args, passthrough = _parser().parse_known_args([
+        "chat",
+        "--oneshot",
+        "Reply with exactly ARES_RUNTIME_OK",
+    ])
 
     assert args.command == "chat"
     assert passthrough == ["--oneshot", "Reply with exactly ARES_RUNTIME_OK"]
@@ -842,12 +960,17 @@ def test_materialize_quarantines_an_incomplete_nonactive_release_then_rebuilds(
     (source_repository / "canonical.txt").write_text("canonical\n", encoding="utf-8")
     revision = _commit(source_repository, "canonical source")
     incomplete_source = _release(runtime, revision)
-    (incomplete_source / "preserved.txt").write_text("old incomplete release\n", encoding="utf-8")
+    (incomplete_source / "preserved.txt").write_text(
+        "old incomplete release\n", encoding="utf-8"
+    )
     runtime._atomic_link(runtime.paths.previous_link, incomplete_source.resolve())
+
+    build_sources: list[Path] = []
 
     def mark_ready(source: Path, *, desktop: bool) -> None:
         assert desktop is False
-        assert not runtime._installed_release_source(source)
+        build_sources.append(source)
+        assert runtime._installed_release_source(source) is (len(build_sources) == 2)
         python = runtime._python_for(source)
         python.parent.mkdir(parents=True, exist_ok=True)
         python.write_text("python", encoding="utf-8")
@@ -858,11 +981,20 @@ def test_materialize_quarantines_an_incomplete_nonactive_release_then_rebuilds(
     runtime._materialize(str(source_repository), revision, desktop=False)
 
     rebuilt = runtime._release_source(revision)
+    assert len(build_sources) == 2
+    assert not runtime._installed_release_source(build_sources[0])
+    assert runtime._installed_release_source(build_sources[1])
     assert (rebuilt / "canonical.txt").read_text(encoding="utf-8") == "canonical\n"
     assert not (rebuilt / "preserved.txt").exists()
-    quarantines = sorted((runtime.paths.data_root / "quarantine" / "incomplete-releases").glob(f"{revision}.*"))
+    quarantines = sorted(
+        (runtime.paths.data_root / "quarantine" / "incomplete-releases").glob(
+            f"{revision}.*"
+        )
+    )
     assert len(quarantines) == 1
-    assert (quarantines[0] / "source" / "preserved.txt").read_text(encoding="utf-8") == "old incomplete release\n"
+    assert (quarantines[0] / "source" / "preserved.txt").read_text(
+        encoding="utf-8"
+    ) == "old incomplete release\n"
     assert runtime.previous_release() == (revision, rebuilt.resolve())
 
 
@@ -874,21 +1006,31 @@ def test_materialize_restores_incomplete_release_when_recovery_build_fails(
     (source_repository / "canonical.txt").write_text("canonical\n", encoding="utf-8")
     revision = _commit(source_repository, "canonical source")
     incomplete_source = _release(runtime, revision)
-    (incomplete_source / "preserved.txt").write_text("old incomplete release\n", encoding="utf-8")
+    (incomplete_source / "preserved.txt").write_text(
+        "old incomplete release\n", encoding="utf-8"
+    )
     runtime._atomic_link(runtime.paths.previous_link, incomplete_source.resolve())
     monkeypatch.setattr(
         runtime,
         "_build_runtime",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("injected build failure")),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("injected build failure")
+        ),
     )
 
     with pytest.raises(RuntimeError, match="injected build failure"):
         runtime._materialize(str(source_repository), revision, desktop=False)
 
     restored = runtime._release_source(revision)
-    assert (restored / "preserved.txt").read_text(encoding="utf-8") == "old incomplete release\n"
+    assert (restored / "preserved.txt").read_text(
+        encoding="utf-8"
+    ) == "old incomplete release\n"
     assert runtime.previous_release() == (revision, restored.resolve())
-    assert not list((runtime.paths.data_root / "quarantine" / "incomplete-releases").glob(f"{revision}.*"))
+    assert not list(
+        (runtime.paths.data_root / "quarantine" / "incomplete-releases").glob(
+            f"{revision}.*"
+        )
+    )
 
 
 def test_materialize_refuses_to_quarantine_an_incomplete_active_release(
@@ -903,14 +1045,20 @@ def test_materialize_refuses_to_quarantine_an_incomplete_active_release(
     monkeypatch.setattr(
         runtime,
         "_build_runtime",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("build must not run")),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("build must not run")
+        ),
     )
 
     with pytest.raises(AresLocalRuntimeError, match="active Ares release"):
         runtime._materialize(str(source_repository), revision, desktop=False)
 
     assert runtime.active_release() == (revision, incomplete_source.resolve())
-    assert not list((runtime.paths.data_root / "quarantine" / "incomplete-releases").glob(f"{revision}.*"))
+    assert not list(
+        (runtime.paths.data_root / "quarantine" / "incomplete-releases").glob(
+            f"{revision}.*"
+        )
+    )
 
 
 def test_materialize_restores_incomplete_release_when_staging_cleanup_fails(
@@ -921,12 +1069,16 @@ def test_materialize_restores_incomplete_release_when_staging_cleanup_fails(
     (source_repository / "canonical.txt").write_text("canonical\n", encoding="utf-8")
     revision = _commit(source_repository, "canonical source")
     incomplete_source = _release(runtime, revision)
-    (incomplete_source / "preserved.txt").write_text("old incomplete release\n", encoding="utf-8")
+    (incomplete_source / "preserved.txt").write_text(
+        "old incomplete release\n", encoding="utf-8"
+    )
     runtime._atomic_link(runtime.paths.previous_link, incomplete_source.resolve())
     monkeypatch.setattr(
         runtime,
         "_build_runtime",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("injected build failure")),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("injected build failure")
+        ),
     )
     monkeypatch.setattr(
         "ares_runtime.local_runtime.shutil.rmtree",
@@ -937,7 +1089,9 @@ def test_materialize_restores_incomplete_release_when_staging_cleanup_fails(
         runtime._materialize(str(source_repository), revision, desktop=False)
 
     restored = runtime._release_source(revision)
-    assert (restored / "preserved.txt").read_text(encoding="utf-8") == "old incomplete release\n"
+    assert (restored / "preserved.txt").read_text(
+        encoding="utf-8"
+    ) == "old incomplete release\n"
     assert runtime.previous_release() == (revision, restored.resolve())
 
 
@@ -1014,5 +1168,7 @@ def test_desktop_rebuild_refuses_to_mutate_the_active_release(
         ),
     )
 
-    with pytest.raises(AresLocalRuntimeError, match="cannot mutate an installed release"):
+    with pytest.raises(
+        AresLocalRuntimeError, match="cannot mutate an installed release"
+    ):
         runtime.desktop(rebuild=True)
