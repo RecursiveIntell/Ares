@@ -3,6 +3,7 @@
 This module owns immutable contracts and rebuildable projections only. Existing
 profile, task, claim, permit, effect, and model-route stores remain canonical.
 """
+
 from __future__ import annotations
 
 import contextvars
@@ -29,7 +30,16 @@ EPOCH = "1970-01-01T00:00:00Z"
 
 
 def canonical_json(value: Any) -> bytes:
-    return (json.dumps(_thaw(value), sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False) + "\n").encode()
+    return (
+        json.dumps(
+            _thaw(value),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode()
 
 
 def digest(value: Any) -> str:
@@ -39,7 +49,9 @@ def digest(value: Any) -> str:
 def _freeze(value: Any) -> Any:
     """Recursively freeze artifact payloads so callers cannot alter a projection."""
     if isinstance(value, Mapping):
-        return MappingProxyType({str(key): _freeze(item) for key, item in value.items()})
+        return MappingProxyType({
+            str(key): _freeze(item) for key, item in value.items()
+        })
     if isinstance(value, (list, tuple)):
         return tuple(_freeze(item) for item in value)
     return value
@@ -65,11 +77,21 @@ class ContractError(ValueError):
 
 
 def _check_ref(value: Any, field: str) -> None:
-    if not isinstance(value, str) or not value or any(c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:/@#-" for c in value):
+    if (
+        not isinstance(value, str)
+        or not value
+        or any(
+            c
+            not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:/@#-"
+            for c in value
+        )
+    ):
         raise ContractError("INVALID_REFERENCE", field)
 
 
-def _strict_payload(raw: Mapping[str, Any], required: set[str], allowed: set[str], digest_field: str) -> dict[str, Any]:
+def _strict_payload(
+    raw: Mapping[str, Any], required: set[str], allowed: set[str], digest_field: str
+) -> dict[str, Any]:
     if not isinstance(raw, Mapping):
         raise ContractError("INVALID_ARTIFACT")
     keys = set(raw)
@@ -146,8 +168,32 @@ class ImmutableArtifact:
         return self.payload[self.digest_field]
 
 
-ROLE_REQUIRED = {"schema_version", "role_id", "role_kind", "durable_ownership", "objective", "unique_questions", "mandatory_triggers", "exclusions", "context_policy", "capability_profile", "mutation_authority", "output_schema_ref", "stop_conditions", "typed_failures", "handoff_rules", "model_eligibility", "evaluation", "recorded_at", "contract_digest"}
-ROLE_ALLOWED = ROLE_REQUIRED | {"profile_ref", "merge_prohibition", "supersedes_contract_ref"}
+ROLE_REQUIRED = {
+    "schema_version",
+    "role_id",
+    "role_kind",
+    "durable_ownership",
+    "objective",
+    "unique_questions",
+    "mandatory_triggers",
+    "exclusions",
+    "context_policy",
+    "capability_profile",
+    "mutation_authority",
+    "output_schema_ref",
+    "stop_conditions",
+    "typed_failures",
+    "handoff_rules",
+    "model_eligibility",
+    "evaluation",
+    "recorded_at",
+    "contract_digest",
+}
+ROLE_ALLOWED = ROLE_REQUIRED | {
+    "profile_ref",
+    "merge_prohibition",
+    "supersedes_contract_ref",
+}
 SPECIALIST_DESCRIPTOR_REQUIRED = {
     "schema_version",
     "profile_id",
@@ -172,21 +218,51 @@ SPECIALIST_DESCRIPTOR_ALLOWED = SPECIALIST_DESCRIPTOR_REQUIRED | {
     "supersedes_descriptor_ref"
 }
 _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
-MISSION_REQUIRED = {"schema_version", "mission_id", "kanban_root_task_ref", "objective", "source_freeze", "closure_profile", "risk_class", "effect_class", "boundaries", "required_evidence", "topology_policy", "stop_conditions", "recorded_at", "contract_digest"}
-MISSION_ALLOWED = MISSION_REQUIRED | {"session_ref", "goal_ref", "non_goals", "budget", "supersedes_contract_ref"}
+MISSION_REQUIRED = {
+    "schema_version",
+    "mission_id",
+    "kanban_root_task_ref",
+    "objective",
+    "source_freeze",
+    "closure_profile",
+    "risk_class",
+    "effect_class",
+    "boundaries",
+    "required_evidence",
+    "topology_policy",
+    "stop_conditions",
+    "recorded_at",
+    "contract_digest",
+}
+MISSION_ALLOWED = MISSION_REQUIRED | {
+    "session_ref",
+    "goal_ref",
+    "non_goals",
+    "budget",
+    "supersedes_contract_ref",
+}
 
 
 class RoleContractV1(ImmutableArtifact):
     @classmethod
-    def create(cls, values: Mapping[str, Any], profile_exists: Callable[[str], bool] | None = None) -> "RoleContractV1":
-        value = dict(values); value.setdefault("schema_version", SCHEMA_VERSION); value.setdefault("recorded_at", EPOCH)
-        if value["schema_version"] != SCHEMA_VERSION: raise ContractError("UNSUPPORTED_SCHEMA", "schema_version")
+    def create(
+        cls,
+        values: Mapping[str, Any],
+        profile_exists: Callable[[str], bool] | None = None,
+    ) -> "RoleContractV1":
+        value = dict(values)
+        value.setdefault("schema_version", SCHEMA_VERSION)
+        value.setdefault("recorded_at", EPOCH)
+        if value["schema_version"] != SCHEMA_VERSION:
+            raise ContractError("UNSUPPORTED_SCHEMA", "schema_version")
         if value.get("profile_ref") is not None:
             _check_ref(value["profile_ref"], "profile_ref")
-            if profile_exists is not None and not profile_exists(value["profile_ref"]): raise ContractError("UNKNOWN_PROFILE", value["profile_ref"])
+            if profile_exists is not None and not profile_exists(value["profile_ref"]):
+                raise ContractError("UNKNOWN_PROFILE", value["profile_ref"])
         if value.get("supersedes_contract_ref") is not None:
             _check_ref(value["supersedes_contract_ref"], "supersedes_contract_ref")
-        value.pop("contract_digest", None); value = _finalize(value, "contract_digest")
+        value.pop("contract_digest", None)
+        value = _finalize(value, "contract_digest")
         _strict_payload(value, ROLE_REQUIRED, ROLE_ALLOWED, "contract_digest")
         _validate_schema("role", value)
         return cls(value, "contract_digest")
@@ -195,7 +271,9 @@ class RoleContractV1(ImmutableArtifact):
     def parse(cls, raw: Mapping[str, Any]) -> "RoleContractV1":
         value = _strict_payload(raw, ROLE_REQUIRED, ROLE_ALLOWED, "contract_digest")
         _validate_schema("role", raw)
-        return cls({**value, "contract_digest": raw["contract_digest"]}, "contract_digest")
+        return cls(
+            {**value, "contract_digest": raw["contract_digest"]}, "contract_digest"
+        )
 
 
 def _validate_specialist_descriptor_references(
@@ -349,23 +427,37 @@ def validate_specialist_descriptor_set(
 
 class MissionContractV1(ImmutableArtifact):
     @classmethod
-    def create(cls, values: Mapping[str, Any], task_exists: Callable[[str], bool] | None = None) -> "MissionContractV1":
-        value = dict(values); value.setdefault("schema_version", SCHEMA_VERSION); value.setdefault("recorded_at", EPOCH)
-        if value["schema_version"] != SCHEMA_VERSION: raise ContractError("UNSUPPORTED_SCHEMA", "schema_version")
+    def create(
+        cls, values: Mapping[str, Any], task_exists: Callable[[str], bool] | None = None
+    ) -> "MissionContractV1":
+        value = dict(values)
+        value.setdefault("schema_version", SCHEMA_VERSION)
+        value.setdefault("recorded_at", EPOCH)
+        if value["schema_version"] != SCHEMA_VERSION:
+            raise ContractError("UNSUPPORTED_SCHEMA", "schema_version")
         _check_ref(value.get("kanban_root_task_ref"), "kanban_root_task_ref")
-        if task_exists is not None and not task_exists(value["kanban_root_task_ref"]): raise ContractError("UNKNOWN_OWNER_REFERENCE", value["kanban_root_task_ref"])
+        if task_exists is not None and not task_exists(value["kanban_root_task_ref"]):
+            raise ContractError(
+                "UNKNOWN_OWNER_REFERENCE", value["kanban_root_task_ref"]
+            )
         for field in ("session_ref", "goal_ref", "supersedes_contract_ref"):
-            if value.get(field) is not None: _check_ref(value[field], field)
-        value.pop("contract_digest", None); value = _finalize(value, "contract_digest")
+            if value.get(field) is not None:
+                _check_ref(value[field], field)
+        value.pop("contract_digest", None)
+        value = _finalize(value, "contract_digest")
         _strict_payload(value, MISSION_REQUIRED, MISSION_ALLOWED, "contract_digest")
         _validate_schema("mission", value)
         return cls(value, "contract_digest")
 
     @classmethod
     def parse(cls, raw: Mapping[str, Any]) -> "MissionContractV1":
-        value = _strict_payload(raw, MISSION_REQUIRED, MISSION_ALLOWED, "contract_digest")
+        value = _strict_payload(
+            raw, MISSION_REQUIRED, MISSION_ALLOWED, "contract_digest"
+        )
         _validate_schema("mission", raw)
-        return cls({**value, "contract_digest": raw["contract_digest"]}, "contract_digest")
+        return cls(
+            {**value, "contract_digest": raw["contract_digest"]}, "contract_digest"
+        )
 
 
 def contract_ref(contract: ImmutableArtifact) -> str:
@@ -381,6 +473,7 @@ class ContractBindings:
     It owns neither rows nor credentials. Callers provide the existing owner
     operations; with the flag disabled every method is a strict no-op.
     """
+
     def __init__(
         self,
         *,
@@ -429,27 +522,150 @@ class ContractBindings:
 
 
 ARTIFACT_FIELDS: dict[str, tuple[set[str], str]] = {
-    "finding": ({"schema_version", "finding_id", "mission_ref", "role_contract_ref", "severity", "release_impact", "surface", "evidence_refs", "consequence", "root_cause", "owner_preserving_fix", "acceptance_test", "rollback_or_quarantine", "confidence_basis", "status", "recorded_at", "finding_digest"}, "finding_digest"),
-    "evidence": ({"schema_version", "evidence_id", "mission_ref", "kind", "source_ref", "artifact_digest", "recorded_at", "evidence_state", "authority_class", "taint", "acquisition_receipt_ref"}, "artifact_digest"),
-    "context": ({"schema_version", "context_packet_id", "mission_ref", "role_contract_ref", "included_refs", "omitted_classes", "withheld_until_commit", "compiler_version", "compiled_at", "context_digest"}, "context_digest"),
-    "handoff": ({"schema_version", "handoff_id", "mission_ref", "from_role_ref", "to_role_ref", "owned_question", "context_packet_ref", "evidence_refs", "unresolved_claim_refs", "withheld_classes", "permit_refs", "required_output_schema_ref", "stop_conditions", "recorded_at", "handoff_digest"}, "handoff_digest"),
-    "test_request": ({"schema_version", "test_request_id", "mission_ref", "question", "oracle_class", "procedure", "expected_discriminators", "required_environment", "authority_requirements", "stop_conditions", "recorded_at"}, ""),
-    "witness": ({"schema_version", "witness_id", "mission_ref", "test_request_ref", "role_contract_ref", "independence", "verdict", "evidence_refs", "coverage", "limitations", "recorded_at", "witness_digest"}, "witness_digest"),
-    "closure": ({"schema_version", "mission_ref", "closure_profile", "state", "satisfied_gate_ids", "unsatisfied_gate_ids", "blocking_refs", "source_event_refs", "projected_at", "projection_digest"}, "projection_digest"),
+    "finding": (
+        {
+            "schema_version",
+            "finding_id",
+            "mission_ref",
+            "role_contract_ref",
+            "severity",
+            "release_impact",
+            "surface",
+            "evidence_refs",
+            "consequence",
+            "root_cause",
+            "owner_preserving_fix",
+            "acceptance_test",
+            "rollback_or_quarantine",
+            "confidence_basis",
+            "status",
+            "recorded_at",
+            "finding_digest",
+        },
+        "finding_digest",
+    ),
+    "evidence": (
+        {
+            "schema_version",
+            "evidence_id",
+            "mission_ref",
+            "kind",
+            "source_ref",
+            "artifact_digest",
+            "recorded_at",
+            "evidence_state",
+            "authority_class",
+            "taint",
+            "acquisition_receipt_ref",
+        },
+        "artifact_digest",
+    ),
+    "context": (
+        {
+            "schema_version",
+            "context_packet_id",
+            "mission_ref",
+            "role_contract_ref",
+            "included_refs",
+            "omitted_classes",
+            "withheld_until_commit",
+            "compiler_version",
+            "compiled_at",
+            "context_digest",
+        },
+        "context_digest",
+    ),
+    "handoff": (
+        {
+            "schema_version",
+            "handoff_id",
+            "mission_ref",
+            "from_role_ref",
+            "to_role_ref",
+            "owned_question",
+            "context_packet_ref",
+            "evidence_refs",
+            "unresolved_claim_refs",
+            "withheld_classes",
+            "permit_refs",
+            "required_output_schema_ref",
+            "stop_conditions",
+            "recorded_at",
+            "handoff_digest",
+        },
+        "handoff_digest",
+    ),
+    "test_request": (
+        {
+            "schema_version",
+            "test_request_id",
+            "mission_ref",
+            "question",
+            "oracle_class",
+            "procedure",
+            "expected_discriminators",
+            "required_environment",
+            "authority_requirements",
+            "stop_conditions",
+            "recorded_at",
+        },
+        "",
+    ),
+    "witness": (
+        {
+            "schema_version",
+            "witness_id",
+            "mission_ref",
+            "test_request_ref",
+            "role_contract_ref",
+            "independence",
+            "verdict",
+            "evidence_refs",
+            "coverage",
+            "limitations",
+            "recorded_at",
+            "witness_digest",
+        },
+        "witness_digest",
+    ),
+    "closure": (
+        {
+            "schema_version",
+            "mission_ref",
+            "closure_profile",
+            "state",
+            "satisfied_gate_ids",
+            "unsatisfied_gate_ids",
+            "blocking_refs",
+            "source_event_refs",
+            "projected_at",
+            "projection_digest",
+        },
+        "projection_digest",
+    ),
 }
 ARTIFACT_ALLOWED = {k: set(fields) for k, (fields, _) in ARTIFACT_FIELDS.items()}
-ARTIFACT_ALLOWED["evidence"] |= {"source_locator", "valid_from", "valid_to", "content_excerpt"}
+ARTIFACT_ALLOWED["evidence"] |= {
+    "source_locator",
+    "valid_from",
+    "valid_to",
+    "content_excerpt",
+}
 ARTIFACT_ALLOWED["context"] |= {"parent_context_ref"}
 ARTIFACT_ALLOWED["test_request"] |= {"input_refs"}
 ARTIFACT_ALLOWED["closure"] |= {"divergence_flags"}
 
 
 def make_artifact(kind: str, values: Mapping[str, Any]) -> ImmutableArtifact:
-    if kind not in ARTIFACT_FIELDS: raise ContractError("UNKNOWN_ARTIFACT", kind)
+    if kind not in ARTIFACT_FIELDS:
+        raise ContractError("UNKNOWN_ARTIFACT", kind)
     required, field = ARTIFACT_FIELDS[kind]
-    value = dict(values); value.setdefault("schema_version", SCHEMA_VERSION)
-    if "recorded_at" in required: value.setdefault("recorded_at", EPOCH)
-    value.pop(field, None); value = _finalize(value, field)
+    value = dict(values)
+    value.setdefault("schema_version", SCHEMA_VERSION)
+    if "recorded_at" in required:
+        value.setdefault("recorded_at", EPOCH)
+    value.pop(field, None)
+    value = _finalize(value, field)
     _strict_payload(value, required, ARTIFACT_ALLOWED[kind], field)
     _validate_schema(kind, value)
     return ImmutableArtifact(value, field)
@@ -461,6 +677,7 @@ class FindingV1(ImmutableArtifact):
         item = make_artifact("finding", values)
         _validate_schema("finding", item.payload)
         return cls(item.payload, item.digest_field)
+
     @classmethod
     def parse(cls, raw: Mapping[str, Any]) -> "FindingV1":
         required, field = ARTIFACT_FIELDS["finding"]
@@ -475,6 +692,7 @@ class EvidenceItemV1(ImmutableArtifact):
         item = make_artifact("evidence", values)
         _validate_schema("evidence", item.payload)
         return cls(item.payload, item.digest_field)
+
     @classmethod
     def parse(cls, raw: Mapping[str, Any]) -> "EvidenceItemV1":
         required, field = ARTIFACT_FIELDS["evidence"]
@@ -489,6 +707,7 @@ class HandoffPacketV1(ImmutableArtifact):
         item = make_artifact("handoff", values)
         _validate_schema("handoff", item.payload)
         return cls(item.payload, item.digest_field)
+
     @classmethod
     def parse(cls, raw: Mapping[str, Any]) -> "HandoffPacketV1":
         required, field = ARTIFACT_FIELDS["handoff"]
@@ -499,6 +718,7 @@ class HandoffPacketV1(ImmutableArtifact):
 
 class ContextPacketV1(ImmutableArtifact):
     """Immutable, rebuildable projection; it never embeds source material."""
+
     @classmethod
     def create(cls, values: Mapping[str, Any]) -> "ContextPacketV1":
         item = make_artifact("context", values)
@@ -517,17 +737,26 @@ class TestRequestV1(ImmutableArtifact):
 
     @classmethod
     def create(cls, values: Mapping[str, Any]) -> "TestRequestV1":
-        required, _ = ARTIFACT_FIELDS["test_request"]; value = dict(values); value.setdefault("schema_version", SCHEMA_VERSION); value.setdefault("recorded_at", EPOCH)
+        required, _ = ARTIFACT_FIELDS["test_request"]
+        value = dict(values)
+        value.setdefault("schema_version", SCHEMA_VERSION)
+        value.setdefault("recorded_at", EPOCH)
         unknown = set(value) - ARTIFACT_ALLOWED["test_request"]
-        if unknown: raise ContractError("UNKNOWN_FIELD", sorted(unknown)[0])
-        if required - set(value): raise ContractError("MISSING_FIELD", sorted(required - set(value))[0])
+        if unknown:
+            raise ContractError("UNKNOWN_FIELD", sorted(unknown)[0])
+        if required - set(value):
+            raise ContractError("MISSING_FIELD", sorted(required - set(value))[0])
         _validate_schema("test_request", value)
         return cls(value, "")
+
     @classmethod
     def parse(cls, raw: Mapping[str, Any]) -> "TestRequestV1":
-        required, _ = ARTIFACT_FIELDS["test_request"]; unknown = set(raw) - ARTIFACT_ALLOWED["test_request"]
-        if unknown: raise ContractError("UNKNOWN_FIELD", sorted(unknown)[0])
-        if required - set(raw): raise ContractError("MISSING_FIELD", sorted(required - set(raw))[0])
+        required, _ = ARTIFACT_FIELDS["test_request"]
+        unknown = set(raw) - ARTIFACT_ALLOWED["test_request"]
+        if unknown:
+            raise ContractError("UNKNOWN_FIELD", sorted(unknown)[0])
+        if required - set(raw):
+            raise ContractError("MISSING_FIELD", sorted(required - set(raw))[0])
         _validate_schema("test_request", raw)
         return cls(dict(raw), "")
 
@@ -536,7 +765,9 @@ class TestRequestV1(ImmutableArtifact):
         return digest(self.payload)
 
 
-def _normalize_context_ref(item: Mapping[str, Any]) -> tuple[dict[str, str], str | None]:
+def _normalize_context_ref(
+    item: Mapping[str, Any],
+) -> tuple[dict[str, str], str | None]:
     """Strip compiler-only classification metadata before a context is emitted."""
     if not isinstance(item, Mapping):
         raise ContractError("INVALID_CONTEXT_REF")
@@ -550,11 +781,17 @@ def _normalize_context_ref(item: Mapping[str, Any]) -> tuple[dict[str, str], str
     if not isinstance(ref["purpose"], str) or not ref["purpose"]:
         raise ContractError("INVALID_CONTEXT_REF", "purpose")
     classification = item.get("classification") or item.get("secret_class")
-    if classification is not None and (not isinstance(classification, str) or not classification):
+    if classification is not None and (
+        not isinstance(classification, str) or not classification
+    ):
         raise ContractError("INVALID_CONTEXT_CLASSIFICATION")
     if item.get("withhold") is not None and type(item["withhold"]) is not bool:
         raise ContractError("INVALID_CONTEXT_CLASSIFICATION")
-    return ref, classification if item.get("withhold") or classification not in (None, "none", "public") else None
+    return ref, classification if item.get("withhold") or classification not in (
+        None,
+        "none",
+        "public",
+    ) else None
 
 
 def _resolution_withheld(resolution: Any) -> str | None:
@@ -570,16 +807,38 @@ def _resolution_withheld(resolution: Any) -> str | None:
 
 class ContextCompiler:
     """Pure compiler. Resolver hooks make exact refs and source freeze checkable."""
-    def compile(self, mission_ref: str, role_ref: str, refs: Sequence[Mapping[str, Any]], *, withheld: Sequence[str] | None = None, omitted: Sequence[str] | None = None, resolve_ref: Callable[[str, str], bool | Mapping[str, Any]] | None = None, source_revision: str | None = None, frozen_source_revision: str | None = None, max_refs: int | None = None) -> ContextPacketV1:
-        _check_ref(mission_ref, "mission_ref"); _check_ref(role_ref, "role_contract_ref")
-        if frozen_source_revision is not None and source_revision != frozen_source_revision: raise ContractError("STALE_SOURCE_FREEZE")
+
+    def compile(
+        self,
+        mission_ref: str,
+        role_ref: str,
+        refs: Sequence[Mapping[str, Any]],
+        *,
+        withheld: Sequence[str] | None = None,
+        omitted: Sequence[str] | None = None,
+        resolve_ref: Callable[[str, str], bool | Mapping[str, Any]] | None = None,
+        source_revision: str | None = None,
+        frozen_source_revision: str | None = None,
+        max_refs: int | None = None,
+    ) -> ContextPacketV1:
+        _check_ref(mission_ref, "mission_ref")
+        _check_ref(role_ref, "role_contract_ref")
+        if (
+            frozen_source_revision is not None
+            and source_revision != frozen_source_revision
+        ):
+            raise ContractError("STALE_SOURCE_FREEZE")
         if max_refs is not None and (type(max_refs) is not int or max_refs < 1):
             raise ContractError("INVALID_CONTEXT_LIMIT", "max_refs")
         normalized: list[dict[str, str]] = []
         auto_withheld: list[str] = []
         for raw in refs:
             item, classification = _normalize_context_ref(raw)
-            resolution = resolve_ref(item["ref"], item["digest"]) if resolve_ref is not None else True
+            resolution = (
+                resolve_ref(item["ref"], item["digest"])
+                if resolve_ref is not None
+                else True
+            )
             if resolution is False or resolution is None:
                 raise ContractError("MISSING_EVIDENCE_REF", item["ref"])
             classification = classification or _resolution_withheld(resolution)
@@ -587,8 +846,13 @@ class ContextCompiler:
                 auto_withheld.append(classification)
                 continue
             normalized.append(item)
-        ordered_refs = sorted({(item["ref"], item["digest"], item["purpose"]) for item in normalized})
-        normalized = [{"ref": ref, "digest": item_digest, "purpose": purpose} for ref, item_digest, purpose in ordered_refs]
+        ordered_refs = sorted({
+            (item["ref"], item["digest"], item["purpose"]) for item in normalized
+        })
+        normalized = [
+            {"ref": ref, "digest": item_digest, "purpose": purpose}
+            for ref, item_digest, purpose in ordered_refs
+        ]
         omitted_classes = set(omitted or ())
         if max_refs is not None and len(normalized) > max_refs:
             normalized = normalized[:max_refs]
@@ -596,15 +860,615 @@ class ContextCompiler:
         if not normalized:
             raise ContractError("EVIDENCE_DEFICIT", "included_refs")
         withheld_classes = set(withheld or ()) | set(auto_withheld)
-        if not all(isinstance(value, str) and value for value in omitted_classes | withheld_classes):
+        if not all(
+            isinstance(value, str) and value
+            for value in omitted_classes | withheld_classes
+        ):
             raise ContractError("INVALID_CONTEXT_CLASSIFICATION")
-        identity = {"mission_ref": mission_ref, "role_contract_ref": role_ref, "included_refs": normalized, "omitted_classes": sorted(omitted_classes), "withheld_until_commit": sorted(withheld_classes)}
-        value = {"schema_version": SCHEMA_VERSION, "context_packet_id": "ctx:" + digest(identity)[7:], "mission_ref": mission_ref, "role_contract_ref": role_ref, "included_refs": normalized, "omitted_classes": sorted(omitted_classes), "withheld_until_commit": sorted(withheld_classes), "compiler_version": COMPILER_VERSION, "compiled_at": EPOCH}
+        identity = {
+            "mission_ref": mission_ref,
+            "role_contract_ref": role_ref,
+            "included_refs": normalized,
+            "omitted_classes": sorted(omitted_classes),
+            "withheld_until_commit": sorted(withheld_classes),
+        }
+        value = {
+            "schema_version": SCHEMA_VERSION,
+            "context_packet_id": "ctx:" + digest(identity)[7:],
+            "mission_ref": mission_ref,
+            "role_contract_ref": role_ref,
+            "included_refs": normalized,
+            "omitted_classes": sorted(omitted_classes),
+            "withheld_until_commit": sorted(withheld_classes),
+            "compiler_version": COMPILER_VERSION,
+            "compiled_at": EPOCH,
+        }
         return ContextPacketV1.create(value)
 
 
+_PROFILE_RUNTIME_BASIS_REQUIRED = {
+    "schema",
+    "basis_ref",
+    "mission_ref",
+    "task_ref",
+    "instruction_ref",
+    "instruction_digest",
+    "source_revision",
+    "authority_snapshot_ref",
+    "applicability_context_ref",
+    "profile_set_ref",
+    "composition_rule_set_ref",
+    "owner_refs",
+    "limits",
+    "not_before",
+    "not_after",
+    "status",
+    "basis_digest",
+}
+_PROFILE_RUNTIME_BASIS_ALLOWED = _PROFILE_RUNTIME_BASIS_REQUIRED | {
+    "admitted_profile_refs",
+    "admitted_exception_refs",
+    "allowed_route_classes",
+    "allowed_disclosure_classes",
+    "allowed_effect_classes",
+    "mandatory_obligations",
+    "required_check_families",
+    "residual_exception_obligations",
+    "authority_refs",
+    "provenance_refs",
+    "unsupported_policy_families",
+    "degradation_markers",
+    "blocking_reasons",
+}
+_PROFILE_RUNTIME_OWNER_REF_REQUIRED = {
+    "composition_receipt_ref",
+    "composition_receipt_digest",
+    "effective_constitution_ref",
+    "effective_constitution_digest",
+    "compiled_obligation_set_ref",
+    "compiled_obligation_set_digest",
+}
+_PROFILE_RUNTIME_OWNER_REF_ALLOWED = _PROFILE_RUNTIME_OWNER_REF_REQUIRED | {
+    "conflict_set_ref",
+    "conflict_set_digest",
+}
+_POLICY_LIMIT_FIELDS = {
+    "max_input_tokens",
+    "max_output_tokens",
+    "max_attempts",
+    "max_concurrency",
+    "max_wall_time_ms",
+    "max_artifact_bytes",
+}
+_POLICY_BASIS_FIELDS = {
+    "schema_version",
+    "basis_ref",
+    "basis_digest",
+    "owner_projection",
+    "projection_digest",
+}
+_OWNER_POLICY_CAPABILITY = object()
+_SEALED_INVOCATION_FIELDS = {
+    "schema_version",
+    "invocation_id",
+    "mission_ref",
+    "context_packet_ref",
+    "context_digest",
+    "basis_ref",
+    "basis_digest",
+    "source_revision",
+    "graph_obligation_ref",
+    "graph_obligation_digest",
+    "route_class",
+    "provider_identity",
+    "model_ref",
+    "included_refs",
+    "input_tokens",
+    "output_reserve",
+    "rendered_payload",
+    "payload_digest",
+    "sealed_at",
+    "invocation_digest",
+}
+
+
+def _strict_artifact(
+    raw: Mapping[str, Any], fields: set[str], digest_field: str
+) -> dict[str, Any]:
+    return _strict_payload(raw, fields - {digest_field}, fields, digest_field)
+
+
+def _string_list(value: Any, field: str) -> list[str]:
+    if (
+        not isinstance(value, (list, tuple))
+        or not value
+        or not all(isinstance(item, str) and item for item in value)
+    ):
+        raise ContractError("INVALID_POLICY_FIELD", field)
+    return sorted(set(value))
+
+
+def _positive_int(value: Any, field: str) -> int:
+    if type(value) is not int or value < 1:
+        raise ContractError("INVALID_POLICY_FIELD", field)
+    return value
+
+
+def _parse_utc(value: Any, field: str) -> datetime:
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise ContractError("INVALID_POLICY_FIELD", field)
+    try:
+        return datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
+    except ValueError as exc:
+        raise ContractError("INVALID_POLICY_FIELD", field) from exc
+
+
+def _is_algorithm_digest(value: Any, algorithm: str | None = None) -> bool:
+    if not isinstance(value, str) or ":" not in value:
+        return False
+    actual, hexadecimal = value.split(":", 1)
+    return (
+        (algorithm is None or actual == algorithm)
+        and actual in {"sha256", "blake3"}
+        and len(hexadecimal) == 64
+        and all(character in "0123456789abcdefABCDEF" for character in hexadecimal)
+    )
+
+
+def _strict_keys(
+    raw: Any, required: set[str], allowed: set[str], field: str
+) -> dict[str, Any]:
+    if not isinstance(raw, Mapping):
+        raise ContractError("INVALID_POLICY_FIELD", field)
+    keys = set(raw)
+    missing, unknown = required - keys, keys - allowed
+    if missing:
+        raise ContractError("MISSING_FIELD", f"{field}.{sorted(missing)[0]}")
+    if unknown:
+        raise ContractError("UNKNOWN_FIELD", f"{field}.{sorted(unknown)[0]}")
+    return dict(raw)
+
+
+def _validate_profile_runtime_basis(raw: Any) -> dict[str, Any]:
+    value = _strict_keys(
+        raw,
+        _PROFILE_RUNTIME_BASIS_REQUIRED,
+        _PROFILE_RUNTIME_BASIS_ALLOWED,
+        "owner_projection",
+    )
+    if value.get("schema") != "profile-runtime.resolved-policy-basis/v1":
+        raise ContractError("UNSUPPORTED_POLICY_OWNER", "schema")
+    for field in (
+        "basis_ref",
+        "mission_ref",
+        "task_ref",
+        "instruction_ref",
+        "source_revision",
+        "authority_snapshot_ref",
+        "applicability_context_ref",
+        "profile_set_ref",
+        "composition_rule_set_ref",
+    ):
+        _check_ref(value.get(field), field)
+    if not _is_algorithm_digest(value.get("instruction_digest")):
+        raise ContractError("INVALID_DIGEST", "instruction_digest")
+    owner_refs = _strict_keys(
+        value.get("owner_refs"),
+        _PROFILE_RUNTIME_OWNER_REF_REQUIRED,
+        _PROFILE_RUNTIME_OWNER_REF_ALLOWED,
+        "owner_refs",
+    )
+    for field in _PROFILE_RUNTIME_OWNER_REF_REQUIRED:
+        if field.endswith("_digest"):
+            if (
+                not isinstance(owner_refs.get(field), str)
+                or len(owner_refs[field]) != 64
+                or not all(
+                    character in "0123456789abcdefABCDEF"
+                    for character in owner_refs[field]
+                )
+            ):
+                raise ContractError("INVALID_DIGEST", f"owner_refs.{field}")
+        else:
+            _check_ref(owner_refs.get(field), f"owner_refs.{field}")
+    if ("conflict_set_ref" in owner_refs) != ("conflict_set_digest" in owner_refs):
+        raise ContractError("INVALID_POLICY_FIELD", "owner_refs.conflict_set")
+    if "conflict_set_ref" in owner_refs:
+        _check_ref(owner_refs["conflict_set_ref"], "owner_refs.conflict_set_ref")
+        if (
+            not isinstance(owner_refs["conflict_set_digest"], str)
+            or len(owner_refs["conflict_set_digest"]) != 64
+        ):
+            raise ContractError("INVALID_DIGEST", "owner_refs.conflict_set_digest")
+    limits = _strict_keys(
+        value.get("limits"), _POLICY_LIMIT_FIELDS, _POLICY_LIMIT_FIELDS, "limits"
+    )
+    for field in _POLICY_LIMIT_FIELDS:
+        _positive_int(limits.get(field), f"limits.{field}")
+    for field in (
+        "admitted_profile_refs",
+        "admitted_exception_refs",
+        "allowed_route_classes",
+        "allowed_disclosure_classes",
+        "allowed_effect_classes",
+        "mandatory_obligations",
+        "required_check_families",
+        "residual_exception_obligations",
+        "authority_refs",
+        "provenance_refs",
+        "unsupported_policy_families",
+        "degradation_markers",
+        "blocking_reasons",
+    ):
+        items = value.get(field, [])
+        if not isinstance(items, (list, tuple)) or not all(
+            isinstance(item, str) and item for item in items
+        ):
+            raise ContractError("INVALID_POLICY_FIELD", field)
+        value[field] = sorted(set(items))
+    for field in ("not_before", "not_after"):
+        _parse_utc(value.get(field), field)
+    if value.get("status") not in {"admitted", "blocked"}:
+        raise ContractError("INVALID_POLICY_FIELD", "status")
+    if (
+        not isinstance(value.get("basis_digest"), str)
+        or len(value["basis_digest"]) != 64
+        or not all(
+            character in "0123456789abcdefABCDEF" for character in value["basis_digest"]
+        )
+    ):
+        raise ContractError("INVALID_DIGEST", "basis_digest")
+    if value["status"] == "admitted":
+        if value["blocking_reasons"] or value["unsupported_policy_families"]:
+            raise ContractError("POLICY_BASIS_BLOCKED")
+        for field in (
+            "allowed_route_classes",
+            "allowed_disclosure_classes",
+            "allowed_effect_classes",
+        ):
+            if not value[field]:
+                raise ContractError("EMPTY_POLICY_INTERSECTION", field)
+    elif not value["blocking_reasons"]:
+        raise ContractError("INVALID_POLICY_FIELD", "blocking_reasons")
+    value["owner_refs"] = owner_refs
+    value["limits"] = limits
+    return value
+
+
+@dataclass(frozen=True)
+class ResolvedPolicyBasisV1(ImmutableArtifact):
+    """Verified projection of the exact profile-runtime owner output.
+
+    Serialized instances are evidence only. Only `from_profile_runtime` marks an
+    in-process value current after a caller-injected owner resolver succeeds.
+    """
+
+    _owner_capability: object | None = None
+
+    @property
+    def owner_verified(self) -> bool:
+        return self._owner_capability is _OWNER_POLICY_CAPABILITY
+
+    @classmethod
+    def from_profile_runtime(
+        cls,
+        raw: Mapping[str, Any],
+        *,
+        resolve_owner: Callable[[str, str], Mapping[str, Any] | None],
+    ) -> "ResolvedPolicyBasisV1":
+        owner = _validate_profile_runtime_basis(raw)
+        basis_digest = "blake3:" + owner["basis_digest"]
+        current = resolve_owner(owner["basis_ref"], basis_digest)
+        if not isinstance(current, Mapping):
+            raise ContractError("OWNER_POLICY_UNAVAILABLE")
+        current_owner = _validate_profile_runtime_basis(current)
+        if canonical_json(current_owner) != canonical_json(owner):
+            raise ContractError("OWNER_POLICY_MISMATCH")
+        projection = {
+            "schema_version": SCHEMA_VERSION,
+            "basis_ref": owner["basis_ref"],
+            "basis_digest": basis_digest,
+            "owner_projection": owner,
+        }
+        projection = _finalize(projection, "projection_digest")
+        _strict_artifact(projection, _POLICY_BASIS_FIELDS, "projection_digest")
+        return cls(projection, "projection_digest", _OWNER_POLICY_CAPABILITY)
+
+    @classmethod
+    def parse(cls, raw: Mapping[str, Any]) -> "ResolvedPolicyBasisV1":
+        value = _strict_artifact(raw, _POLICY_BASIS_FIELDS, "projection_digest")
+        owner = _validate_profile_runtime_basis(value.get("owner_projection"))
+        if (
+            value.get("basis_ref") != owner["basis_ref"]
+            or value.get("basis_digest") != "blake3:" + owner["basis_digest"]
+        ):
+            raise ContractError("OWNER_POLICY_MISMATCH")
+        return cls(
+            {**value, "projection_digest": raw["projection_digest"]},
+            "projection_digest",
+        )
+
+
+class SealedInvocationV1(ImmutableArtifact):
+    """Provider-ready correlation binding. It is never egress authority."""
+
+    @classmethod
+    def create(cls, values: Mapping[str, Any]) -> "SealedInvocationV1":
+        value = dict(values)
+        value.setdefault("schema_version", SCHEMA_VERSION)
+        if value.get("schema_version") != SCHEMA_VERSION:
+            raise ContractError("UNSUPPORTED_SCHEMA", "schema_version")
+        for field in (
+            "invocation_id",
+            "mission_ref",
+            "context_packet_ref",
+            "basis_ref",
+            "source_revision",
+            "graph_obligation_ref",
+            "route_class",
+            "provider_identity",
+            "model_ref",
+        ):
+            _check_ref(value.get(field), field)
+        for field, algorithm in (
+            ("context_digest", "sha256"),
+            ("basis_digest", "blake3"),
+            ("graph_obligation_digest", None),
+            ("payload_digest", "sha256"),
+        ):
+            if not _is_algorithm_digest(value.get(field), algorithm):
+                raise ContractError("INVALID_DIGEST", field)
+        value["included_refs"] = _string_list(
+            value.get("included_refs"), "included_refs"
+        )
+        for field in ("input_tokens", "output_reserve"):
+            value[field] = _positive_int(value.get(field), field)
+        if not isinstance(value.get("rendered_payload"), Mapping):
+            raise ContractError("INVALID_RENDERED_PAYLOAD")
+        _parse_utc(value.get("sealed_at"), "sealed_at")
+        value.pop("invocation_digest", None)
+        value = _finalize(value, "invocation_digest")
+        _strict_artifact(value, _SEALED_INVOCATION_FIELDS, "invocation_digest")
+        return cls(value, "invocation_digest")
+
+    @classmethod
+    def parse(cls, raw: Mapping[str, Any]) -> "SealedInvocationV1":
+        value = _strict_artifact(raw, _SEALED_INVOCATION_FIELDS, "invocation_digest")
+        return cls.create({**value, "invocation_digest": raw["invocation_digest"]})
+
+
+class ContextMaterializer:
+    """Renders only current owner-verified policy and Graph obligation inputs."""
+
+    @staticmethod
+    def _owner_payload(basis: ResolvedPolicyBasisV1) -> dict[str, Any]:
+        if not isinstance(basis, ResolvedPolicyBasisV1) or not basis.owner_verified:
+            raise ContractError("OWNER_POLICY_UNAVAILABLE")
+        payload = basis.to_dict()
+        return _validate_profile_runtime_basis(payload["owner_projection"])
+
+    @staticmethod
+    def _require_graph_obligation(
+        ref: str,
+        value_digest: str,
+        resolver: Callable[[str, str], bool | Mapping[str, Any]],
+    ) -> None:
+        _check_ref(ref, "graph_obligation_ref")
+        if not _is_algorithm_digest(value_digest):
+            raise ContractError("INVALID_DIGEST", "graph_obligation_digest")
+        resolved = resolver(ref, value_digest)
+        if resolved is True:
+            return
+        if (
+            isinstance(resolved, Mapping)
+            and resolved.get("ref") == ref
+            and resolved.get("digest") == value_digest
+        ):
+            return
+        raise ContractError("GRAPH_OBLIGATION_MISMATCH")
+
+    def materialize(
+        self,
+        context: ContextPacketV1,
+        basis: ResolvedPolicyBasisV1,
+        *,
+        current_instruction: str,
+        route_class: str,
+        provider_identity: str,
+        model_ref: str,
+        source_revision: str,
+        graph_obligation_ref: str,
+        graph_obligation_digest: str,
+        output_reserve: int,
+        tool_schemas: Sequence[Mapping[str, Any]],
+        resolve_ref: Callable[[str, str], Mapping[str, Any]],
+        resolve_graph_obligation: Callable[[str, str], bool | Mapping[str, Any]],
+        count_tokens: Callable[[str], int],
+        now_utc: str,
+    ) -> SealedInvocationV1:
+        if not isinstance(context, ContextPacketV1):
+            raise ContractError("INVALID_MATERIALIZATION_INPUT")
+        owner = self._owner_payload(basis)
+        context_payload, basis_payload = context.to_dict(), basis.to_dict()
+        if owner["status"] != "admitted":
+            raise ContractError("POLICY_BASIS_BLOCKED")
+        if context_payload["mission_ref"] != owner["mission_ref"]:
+            raise ContractError("POLICY_MISSION_MISMATCH")
+        if source_revision != owner["source_revision"]:
+            raise ContractError("SOURCE_REVISION_MISMATCH")
+        if not isinstance(current_instruction, str) or not current_instruction.strip():
+            raise ContractError("MANDATORY_INSTRUCTION_MISSING")
+        if digest(current_instruction) != owner["instruction_digest"]:
+            raise ContractError("CURRENT_INSTRUCTION_MISMATCH")
+        if _parse_utc(owner["not_before"], "not_before") > _parse_utc(
+            now_utc, "now_utc"
+        ):
+            raise ContractError("POLICY_NOT_YET_VALID")
+        if _parse_utc(owner["not_after"], "not_after") <= _parse_utc(
+            now_utc, "now_utc"
+        ):
+            raise ContractError("POLICY_EXPIRED")
+        if route_class not in owner["allowed_route_classes"]:
+            raise ContractError("ROUTE_DENIED")
+        if "sealed_completion" not in owner["allowed_effect_classes"]:
+            raise ContractError("EFFECT_DENIED")
+        for field, value in (
+            ("provider_identity", provider_identity),
+            ("model_ref", model_ref),
+            ("source_revision", source_revision),
+        ):
+            _check_ref(value, field)
+        self._require_graph_obligation(
+            graph_obligation_ref, graph_obligation_digest, resolve_graph_obligation
+        )
+        limits = owner["limits"]
+        if (
+            type(output_reserve) is not int
+            or output_reserve < 1
+            or output_reserve > limits["max_output_tokens"]
+        ):
+            raise ContractError("OUTPUT_RESERVE_DENIED")
+        rendered_sources = []
+        included_refs = []
+        for item in context_payload["included_refs"]:
+            resolved = resolve_ref(item["ref"], item["digest"])
+            if (
+                not isinstance(resolved, Mapping)
+                or resolved.get("digest") != item["digest"]
+                or not isinstance(resolved.get("content"), str)
+            ):
+                raise ContractError("MISSING_EVIDENCE_REF", item["ref"])
+            classification = resolved.get("classification", "public")
+            if classification not in owner["allowed_disclosure_classes"]:
+                raise ContractError("DISCLOSURE_DENIED")
+            rendered_sources.append({
+                "ref": item["ref"],
+                "purpose": item["purpose"],
+                "content": resolved["content"],
+            })
+            included_refs.append(item["ref"])
+        rendered_payload = {
+            "messages": [
+                {"role": "system", "content": current_instruction},
+                {"role": "user", "content": rendered_sources},
+            ],
+            "tools": [_thaw(schema) for schema in tool_schemas],
+            "model_ref": model_ref,
+        }
+        rendered_text = canonical_json(rendered_payload).decode("utf-8")
+        input_tokens = count_tokens(rendered_text)
+        if type(input_tokens) is not int or input_tokens < 0:
+            raise ContractError("TOKEN_COUNTER_INVALID")
+        if (
+            input_tokens > limits["max_input_tokens"]
+            or input_tokens + output_reserve
+            > limits["max_input_tokens"] + limits["max_output_tokens"]
+        ):
+            raise ContractError("CONTEXT_BUDGET_EXCEEDED")
+        payload_digest = digest(rendered_payload)
+        identity = {
+            "context_digest": context_payload["context_digest"],
+            "basis_digest": basis_payload["basis_digest"],
+            "graph_obligation_digest": graph_obligation_digest,
+            "provider_identity": provider_identity,
+            "model_ref": model_ref,
+            "payload_digest": payload_digest,
+        }
+        return SealedInvocationV1.create({
+            "invocation_id": "invocation:" + digest(identity).removeprefix("sha256:"),
+            "mission_ref": context_payload["mission_ref"],
+            "context_packet_ref": "ctx:"
+            + context_payload["context_digest"].removeprefix("sha256:"),
+            "context_digest": context_payload["context_digest"],
+            "basis_ref": basis_payload["basis_ref"],
+            "basis_digest": basis_payload["basis_digest"],
+            "source_revision": source_revision,
+            "graph_obligation_ref": graph_obligation_ref,
+            "graph_obligation_digest": graph_obligation_digest,
+            "route_class": route_class,
+            "provider_identity": provider_identity,
+            "model_ref": model_ref,
+            "included_refs": included_refs,
+            "input_tokens": max(1, input_tokens),
+            "output_reserve": output_reserve,
+            "rendered_payload": rendered_payload,
+            "payload_digest": payload_digest,
+            "sealed_at": now_utc,
+        })
+
+    def authorize_egress(
+        self,
+        sealed: SealedInvocationV1,
+        basis: ResolvedPolicyBasisV1,
+        *,
+        route_class: str,
+        provider_identity: str,
+        model_ref: str,
+        rendered_payload: Mapping[str, Any],
+        now_utc: str,
+        resolve_owner: Callable[[str, str], Mapping[str, Any] | None],
+        resolve_graph_obligation: Callable[[str, str], bool | Mapping[str, Any]],
+    ) -> None:
+        if not isinstance(sealed, SealedInvocationV1):
+            raise ContractError("INVALID_EGRESS_INPUT")
+        owner = self._owner_payload(basis)
+        record, current = sealed.to_dict(), basis.to_dict()
+        resolved_owner = resolve_owner(current["basis_ref"], current["basis_digest"])
+        if not isinstance(resolved_owner, Mapping):
+            raise ContractError("OWNER_POLICY_UNAVAILABLE")
+        if canonical_json(
+            _validate_profile_runtime_basis(resolved_owner)
+        ) != canonical_json(owner):
+            raise ContractError("POLICY_BASIS_MISMATCH")
+        if (
+            record["basis_ref"] != current["basis_ref"]
+            or record["basis_digest"] != current["basis_digest"]
+        ):
+            raise ContractError("POLICY_BASIS_MISMATCH")
+        if owner["status"] != "admitted":
+            raise ContractError("POLICY_BASIS_BLOCKED")
+        if owner["blocking_reasons"] or owner["unsupported_policy_families"]:
+            raise ContractError("POLICY_BASIS_BLOCKED")
+        if _parse_utc(owner["not_before"], "not_before") > _parse_utc(
+            now_utc, "now_utc"
+        ):
+            raise ContractError("POLICY_NOT_YET_VALID")
+        if _parse_utc(owner["not_after"], "not_after") <= _parse_utc(
+            now_utc, "now_utc"
+        ):
+            raise ContractError("POLICY_EXPIRED")
+        if "sealed_completion" not in owner["allowed_effect_classes"]:
+            raise ContractError("EFFECT_DENIED")
+        if record["source_revision"] != owner["source_revision"]:
+            raise ContractError("SOURCE_REVISION_MISMATCH")
+        limits = owner["limits"]
+        if record["input_tokens"] > limits["max_input_tokens"]:
+            raise ContractError("CONTEXT_BUDGET_EXCEEDED")
+        if record["output_reserve"] > limits["max_output_tokens"]:
+            raise ContractError("OUTPUT_RESERVE_DENIED")
+        if (
+            route_class != record["route_class"]
+            or route_class not in owner["allowed_route_classes"]
+        ):
+            raise ContractError("ROUTE_DENIED")
+        if (
+            provider_identity != record["provider_identity"]
+            or model_ref != record["model_ref"]
+        ):
+            raise ContractError("PROVIDER_ROUTE_MISMATCH")
+        self._require_graph_obligation(
+            record["graph_obligation_ref"],
+            record["graph_obligation_digest"],
+            resolve_graph_obligation,
+        )
+        if digest(rendered_payload) != record["payload_digest"]:
+            raise ContractError("SEALED_PAYLOAD_MISMATCH")
+
+
 class PermitReceiptAdapter(Protocol):
-    def validate_and_consume(self, *, mission_ref: str, tool_name: str, args_digest: str, target_ref: str) -> Mapping[str, Any]: ...
+    def validate_and_consume(
+        self, *, mission_ref: str, tool_name: str, args_digest: str, target_ref: str
+    ) -> Mapping[str, Any]: ...
     def record_receipt(self, receipt: Mapping[str, Any]) -> None: ...
 
 
@@ -622,6 +1486,7 @@ class PermitBridgeState(str, Enum):
 @dataclass(frozen=True)
 class PermitBridgeOutcome:
     """Typed result from the canonical daemon; never a local permit projection."""
+
     state: PermitBridgeState
     code: str
     facts: Mapping[str, Any] | None = None
@@ -717,7 +1582,11 @@ class DesktopProductionApprovalEnvelope:
         worktree_root: str | Path,
         approval_id: str | None = None,
     ) -> "DesktopProductionApprovalEnvelope":
-        if not isinstance(call, Mapping) or set(call) != {"tool", "args", "frozen_clock"}:
+        if not isinstance(call, Mapping) or set(call) != {
+            "tool",
+            "args",
+            "frozen_clock",
+        }:
             raise ContractError("DESKTOP_APPROVAL_CALL_MALFORMED")
         if call.get("tool") != "write_file" or call.get("frozen_clock") is not None:
             raise ContractError("DESKTOP_APPROVAL_SCOPE_DENIED")
@@ -728,7 +1597,15 @@ class DesktopProductionApprovalEnvelope:
             raise ContractError("DESKTOP_APPROVAL_SCOPE_DENIED")
         _check_ref(mission_ref, "mission_ref")
         _check_ref(target_ref, "target_ref")
-        selected_approval_id = approval_id or "approval:" + digest({"mission_ref": mission_ref, "target_ref": target_ref, "call": call})[7:]
+        selected_approval_id = (
+            approval_id
+            or "approval:"
+            + digest({
+                "mission_ref": mission_ref,
+                "target_ref": target_ref,
+                "call": call,
+            })[7:]
+        )
         _check_ref(selected_approval_id, "approval_id")
         try:
             root = Path(worktree_root).resolve(strict=True)
@@ -755,7 +1632,11 @@ class DesktopProductionApprovalEnvelope:
             "schema": self.schema,
             "mission_ref": self.mission_ref,
             "target_ref": self.target_ref,
-            "call": {"tool": self.tool_name, "args": _thaw(self.args), "frozen_clock": None},
+            "call": {
+                "tool": self.tool_name,
+                "args": _thaw(self.args),
+                "frozen_clock": None,
+            },
             "constraints": {
                 "validity_ms": self.validity_ms,
                 "one_use": self.one_use,
@@ -785,7 +1666,12 @@ class DesktopProductionApprovalWitnessProvider:
     protocol can consume the resulting opaque witness.
     """
 
-    def __init__(self, *, controller: DesktopProductionApprovalController | None, worktree_root: str | Path) -> None:
+    def __init__(
+        self,
+        *,
+        controller: DesktopProductionApprovalController | None,
+        worktree_root: str | Path,
+    ) -> None:
         self._controller = controller
         self._worktree_root = Path(worktree_root)
 
@@ -853,7 +1739,9 @@ class GatewayProductionApprovalWitnessProvider:
                 session_key,
                 notify_cb,
                 {
-                    "command": json.dumps(envelope.to_dict(), sort_keys=True, separators=(",", ":")),
+                    "command": json.dumps(
+                        envelope.to_dict(), sort_keys=True, separators=(",", ":")
+                    ),
                     "description": "One-time approval for the exact bounded production write.",
                     "pattern_key": "production_per_call_write_file",
                     "pattern_keys": ["production_per_call_write_file"],
@@ -882,16 +1770,24 @@ class DaemonPermitReceiptAdapter:
     that same call, and records the outcome.  This adapter never mints permits,
     creates approval witnesses, or persists receipts locally.
     """
+
     REQUEST_SCHEMA = "recursive-agent.ipc/request/v1"
     PROTOCOL_VERSION = 1
     MAX_FRAME_BYTES = 1024 * 1024 + 64 * 1024
 
-    def __init__(self, config: Mapping[str, Any], *, approval_witness_provider: OperatorApprovalWitnessProvider | None = None) -> None:
+    def __init__(
+        self,
+        config: Mapping[str, Any],
+        *,
+        approval_witness_provider: OperatorApprovalWitnessProvider | None = None,
+    ) -> None:
         self._config = dict(config)
         self._approval_witness_provider = approval_witness_provider
 
     @classmethod
-    def from_ares_config(cls, config: Mapping[str, Any]) -> "DaemonPermitReceiptAdapter | None":
+    def from_ares_config(
+        cls, config: Mapping[str, Any]
+    ) -> "DaemonPermitReceiptAdapter | None":
         ares = config.get("ares") if isinstance(config, Mapping) else None
         bridge = ares.get("permit_daemon") if isinstance(ares, Mapping) else None
         if not isinstance(bridge, Mapping):
@@ -900,18 +1796,29 @@ class DaemonPermitReceiptAdapter:
         configured_session = bridge.get("canary_session_id")
         if bridge.get("mode") == cls._PRODUCTION_MODE:
             provider = GatewayProductionApprovalWitnessProvider(
-                worktree_root=bridge.get("worktree_root", "/home/sikmindz/work/ares-production-permit-20260830"),
-                session_key=configured_session if isinstance(configured_session, str) else "",
+                worktree_root=bridge.get(
+                    "worktree_root",
+                    "/home/sikmindz/work/ares-production-permit-20260830",
+                ),
+                session_key=configured_session
+                if isinstance(configured_session, str)
+                else "",
             )
         return cls(bridge, approval_witness_provider=provider)
 
     _TEST_ONLY_MODE = "test_only_echo"
-    _TEST_ONLY_WITNESS_SCHEMA = "recursive-agent.operator-test-permit-issuance-approval/v1"
+    _TEST_ONLY_WITNESS_SCHEMA = (
+        "recursive-agent.operator-test-permit-issuance-approval/v1"
+    )
     # This is the daemon's closed wire witness, not an Ares approval schema.
     # The provider must obtain it from the trusted controller after displaying
     # the exact call. Ares validates only shape and forwards it unchanged; the
     # daemon recomputes and authenticates the canonical request binding.
-    _TEST_ONLY_WITNESS_FIELDS = frozenset({"operator_case", "request_digest", "authenticator"})
+    _TEST_ONLY_WITNESS_FIELDS = frozenset({
+        "operator_case",
+        "request_digest",
+        "authenticator",
+    })
 
     def _test_only_enabled(self) -> bool:
         """Production/default configuration never enables this test fixture."""
@@ -934,12 +1841,16 @@ class DaemonPermitReceiptAdapter:
             raise ContractError("OPERATOR_APPROVAL_WITNESS_MALFORMED")
         return value
 
-    def _operator_approval_witness(self, *, mission_ref: str, target_ref: str, call: Mapping[str, Any]) -> dict[str, Any]:
+    def _operator_approval_witness(
+        self, *, mission_ref: str, target_ref: str, call: Mapping[str, Any]
+    ) -> dict[str, Any]:
         provider = self._approval_witness_provider
         if provider is None:
             raise ContractError("OPERATOR_APPROVAL_WITNESS_UNAVAILABLE")
         try:
-            witness = provider.issue_witness(mission_ref=mission_ref, target_ref=target_ref, call=call)
+            witness = provider.issue_witness(
+                mission_ref=mission_ref, target_ref=target_ref, call=call
+            )
         except ContractError:
             raise
         except Exception:
@@ -963,7 +1874,9 @@ class DaemonPermitReceiptAdapter:
             raise ContractError("CANONICAL_DIGEST_UNAVAILABLE")
         input_path: str | None = None
         try:
-            with tempfile.NamedTemporaryFile(mode="wb", prefix="ares-permit-", suffix=".json", delete=False) as handle:
+            with tempfile.NamedTemporaryFile(
+                mode="wb", prefix="ares-permit-", suffix=".json", delete=False
+            ) as handle:
                 input_path = handle.name
                 os.fchmod(handle.fileno(), 0o600)
                 handle.write(canonical_json(args))
@@ -987,13 +1900,21 @@ class DaemonPermitReceiptAdapter:
         raw = result.stdout
         if raw.endswith("\n"):
             raw = raw[:-1]
-        if len(raw) != 64 or any(character not in "0123456789abcdef" for character in raw):
+        if len(raw) != 64 or any(
+            character not in "0123456789abcdef" for character in raw
+        ):
             raise ContractError("CANONICAL_DIGEST_MALFORMED")
         return raw
 
     @staticmethod
     def _send_frame(stream: socket.socket, value: Mapping[str, Any]) -> None:
-        payload = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode("utf-8")
+        payload = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
         if len(payload) > DaemonPermitReceiptAdapter.MAX_FRAME_BYTES:
             raise ContractError("PERMIT_BRIDGE_MALFORMED")
         stream.sendall(struct.pack(">I", len(payload)) + payload)
@@ -1011,11 +1932,20 @@ class DaemonPermitReceiptAdapter:
     def _connect(self) -> socket.socket:
         path = self._config.get("socket_path")
         timeout = self._config.get("timeout_seconds", 5.0)
-        if not isinstance(path, str) or not path or not isinstance(timeout, (int, float)) or timeout <= 0:
+        if (
+            not isinstance(path, str)
+            or not path
+            or not isinstance(timeout, (int, float))
+            or timeout <= 0
+        ):
             raise ContractError("PERMIT_BRIDGE_UNAVAILABLE")
         try:
             node = Path(path).stat()
-            if not stat.S_ISSOCK(node.st_mode) or node.st_uid != os.geteuid() or node.st_mode & 0o022:
+            if (
+                not stat.S_ISSOCK(node.st_mode)
+                or node.st_uid != os.geteuid()
+                or node.st_mode & 0o022
+            ):
                 raise ContractError("PERMIT_BRIDGE_UNAVAILABLE")
             stream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             stream.settimeout(float(timeout))
@@ -1023,7 +1953,9 @@ class DaemonPermitReceiptAdapter:
             if not hasattr(socket, "SO_PEERCRED"):
                 stream.close()
                 raise ContractError("PERMIT_BRIDGE_UNAVAILABLE")
-            peer_pid, peer_uid, _peer_gid = struct.unpack("3i", stream.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            peer_pid, peer_uid, _peer_gid = struct.unpack(
+                "3i", stream.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+            )
             if peer_pid <= 0 or peer_uid != os.geteuid():
                 stream.close()
                 raise ContractError("PERMIT_BRIDGE_UNAVAILABLE")
@@ -1060,30 +1992,80 @@ class DaemonPermitReceiptAdapter:
         # daemon's injected public verifier owns their canonical validation.
         return dict(witness)
 
-    def consume(self, *, mission_ref: str, tool_name: str, args: Mapping[str, Any], target_ref: str) -> PermitBridgeOutcome:
+    def consume(
+        self,
+        *,
+        mission_ref: str,
+        tool_name: str,
+        args: Mapping[str, Any],
+        target_ref: str,
+    ) -> PermitBridgeOutcome:
         production = self._production_enabled()
         if not self._test_only_enabled() and not production:
-            return PermitBridgeOutcome(PermitBridgeState.DENIED, "TEST_ONLY_ECHO_DISABLED")
+            return PermitBridgeOutcome(
+                PermitBridgeState.DENIED, "TEST_ONLY_ECHO_DISABLED"
+            )
         if production:
-            if tool_name != "write_file" or type(args) is not dict or set(args) != {"path", "content"} or not all(isinstance(args.get(key), str) for key in ("path", "content")):
-                return PermitBridgeOutcome(PermitBridgeState.DENIED, "PRODUCTION_WRITE_FILE_REQUIRED")
-            call = {"tool": "write_file", "args": {"path": args["path"], "content": args["content"]}, "frozen_clock": None}
+            if (
+                tool_name != "write_file"
+                or type(args) is not dict
+                or set(args) != {"path", "content"}
+                or not all(
+                    isinstance(args.get(key), str) for key in ("path", "content")
+                )
+            ):
+                return PermitBridgeOutcome(
+                    PermitBridgeState.DENIED, "PRODUCTION_WRITE_FILE_REQUIRED"
+                )
+            call = {
+                "tool": "write_file",
+                "args": {"path": args["path"], "content": args["content"]},
+                "frozen_clock": None,
+            }
             try:
-                witness = self._production_approval_witness(mission_ref=mission_ref, target_ref=target_ref, call=call)
+                witness = self._production_approval_witness(
+                    mission_ref=mission_ref, target_ref=target_ref, call=call
+                )
             except ContractError as exc:
-                state = PermitBridgeState.UNAVAILABLE if exc.code == "OPERATOR_APPROVAL_WITNESS_UNAVAILABLE" else PermitBridgeState.DENIED
+                state = (
+                    PermitBridgeState.UNAVAILABLE
+                    if exc.code == "OPERATOR_APPROVAL_WITNESS_UNAVAILABLE"
+                    else PermitBridgeState.DENIED
+                )
                 return PermitBridgeOutcome(state, exc.code)
             issuance_body = {"kind": "permit_issue_production", "witness": witness}
         else:
-            if tool_name != "echo" or type(args) is not dict or set(args) != {"text"} or not isinstance(args.get("text"), str) or target_ref != "tool:echo":
-                return PermitBridgeOutcome(PermitBridgeState.DENIED, "TEST_ONLY_ECHO_REQUIRED")
-            call = {"tool": "echo", "args": {"text": args["text"]}, "frozen_clock": None}
+            if (
+                tool_name != "echo"
+                or type(args) is not dict
+                or set(args) != {"text"}
+                or not isinstance(args.get("text"), str)
+                or target_ref != "tool:echo"
+            ):
+                return PermitBridgeOutcome(
+                    PermitBridgeState.DENIED, "TEST_ONLY_ECHO_REQUIRED"
+                )
+            call = {
+                "tool": "echo",
+                "args": {"text": args["text"]},
+                "frozen_clock": None,
+            }
             try:
-                witness = self._operator_approval_witness(mission_ref=mission_ref, target_ref=target_ref, call=call)
+                witness = self._operator_approval_witness(
+                    mission_ref=mission_ref, target_ref=target_ref, call=call
+                )
             except ContractError as exc:
-                state = PermitBridgeState.UNAVAILABLE if exc.code == "OPERATOR_APPROVAL_WITNESS_UNAVAILABLE" else PermitBridgeState.DENIED
+                state = (
+                    PermitBridgeState.UNAVAILABLE
+                    if exc.code == "OPERATOR_APPROVAL_WITNESS_UNAVAILABLE"
+                    else PermitBridgeState.DENIED
+                )
                 return PermitBridgeOutcome(state, exc.code)
-            issuance_body = {"kind": "permit_issue", "request": {"call": call, "requested_validity_ms": 300000}, "approval": witness}
+            issuance_body = {
+                "kind": "permit_issue",
+                "request": {"call": call, "requested_validity_ms": 300000},
+                "approval": witness,
+            }
         issuance_request_id = "ares:" + secrets.token_hex(16)
         issuance_request = {
             "schema": self.REQUEST_SCHEMA,
@@ -1096,23 +2078,49 @@ class DaemonPermitReceiptAdapter:
                 self._send_frame(stream, issuance_request)
                 length = struct.unpack(">I", self._recv_exact(stream, 4))[0]
                 if length > self.MAX_FRAME_BYTES:
-                    return PermitBridgeOutcome(PermitBridgeState.MALFORMED, "PERMIT_BRIDGE_MALFORMED")
-                issuance_response = json.loads(self._recv_exact(stream, length).decode("utf-8"))
+                    return PermitBridgeOutcome(
+                        PermitBridgeState.MALFORMED, "PERMIT_BRIDGE_MALFORMED"
+                    )
+                issuance_response = json.loads(
+                    self._recv_exact(stream, length).decode("utf-8")
+                )
         except ContractError as exc:
             return PermitBridgeOutcome(PermitBridgeState.UNAVAILABLE, exc.code)
         except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
-            return PermitBridgeOutcome(PermitBridgeState.UNAVAILABLE, "PERMIT_BRIDGE_UNAVAILABLE")
-        if not isinstance(issuance_response, Mapping) or issuance_response.get("request_id") != issuance_request_id:
-            return PermitBridgeOutcome(PermitBridgeState.MALFORMED, "PERMIT_BRIDGE_MALFORMED")
+            return PermitBridgeOutcome(
+                PermitBridgeState.UNAVAILABLE, "PERMIT_BRIDGE_UNAVAILABLE"
+            )
+        if (
+            not isinstance(issuance_response, Mapping)
+            or issuance_response.get("request_id") != issuance_request_id
+        ):
+            return PermitBridgeOutcome(
+                PermitBridgeState.MALFORMED, "PERMIT_BRIDGE_MALFORMED"
+            )
         error = issuance_response.get("error")
         if error is not None:
-            if not isinstance(error, Mapping) or error.get("code") != "runtime_error" or not isinstance(error.get("message"), str):
-                return PermitBridgeOutcome(PermitBridgeState.MALFORMED, "PERMIT_BRIDGE_MALFORMED")
-            return PermitBridgeOutcome(PermitBridgeState.DENIED, "PERMIT_DENIED", dict(issuance_response))
+            if (
+                not isinstance(error, Mapping)
+                or error.get("code") != "runtime_error"
+                or not isinstance(error.get("message"), str)
+            ):
+                return PermitBridgeOutcome(
+                    PermitBridgeState.MALFORMED, "PERMIT_BRIDGE_MALFORMED"
+                )
+            return PermitBridgeOutcome(
+                PermitBridgeState.DENIED, "PERMIT_DENIED", dict(issuance_response)
+            )
         permit_id = issuance_response.get("permit_id")
         binding = issuance_response.get("binding")
-        if not isinstance(permit_id, str) or not permit_id or not isinstance(binding, Mapping) or not binding:
-            return PermitBridgeOutcome(PermitBridgeState.MALFORMED, "PERMIT_BRIDGE_MALFORMED")
+        if (
+            not isinstance(permit_id, str)
+            or not permit_id
+            or not isinstance(binding, Mapping)
+            or not binding
+        ):
+            return PermitBridgeOutcome(
+                PermitBridgeState.MALFORMED, "PERMIT_BRIDGE_MALFORMED"
+            )
         request_id = "ares:" + secrets.token_hex(16)
         request = {
             "schema": self.REQUEST_SCHEMA,
@@ -1130,28 +2138,66 @@ class DaemonPermitReceiptAdapter:
                 self._send_frame(stream, request)
                 length = struct.unpack(">I", self._recv_exact(stream, 4))[0]
                 if length > self.MAX_FRAME_BYTES:
-                    return PermitBridgeOutcome(PermitBridgeState.MALFORMED, "PERMIT_BRIDGE_MALFORMED")
+                    return PermitBridgeOutcome(
+                        PermitBridgeState.MALFORMED, "PERMIT_BRIDGE_MALFORMED"
+                    )
                 response = json.loads(self._recv_exact(stream, length).decode("utf-8"))
         except ContractError as exc:
             return PermitBridgeOutcome(PermitBridgeState.UNAVAILABLE, exc.code)
         except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
-            return PermitBridgeOutcome(PermitBridgeState.UNAVAILABLE, "PERMIT_BRIDGE_UNAVAILABLE")
-        if not isinstance(response, Mapping) or response.get("request_id") != request_id:
-            return PermitBridgeOutcome(PermitBridgeState.MALFORMED, "PERMIT_BRIDGE_MALFORMED")
+            return PermitBridgeOutcome(
+                PermitBridgeState.UNAVAILABLE, "PERMIT_BRIDGE_UNAVAILABLE"
+            )
+        if (
+            not isinstance(response, Mapping)
+            or response.get("request_id") != request_id
+        ):
+            return PermitBridgeOutcome(
+                PermitBridgeState.MALFORMED, "PERMIT_BRIDGE_MALFORMED"
+            )
         error = response.get("error")
         if error is not None:
-            if not isinstance(error, Mapping) or error.get("code") != "runtime_error" or not isinstance(error.get("message"), str):
-                return PermitBridgeOutcome(PermitBridgeState.MALFORMED, "PERMIT_BRIDGE_MALFORMED")
-            return PermitBridgeOutcome(PermitBridgeState.DENIED, "PERMIT_DENIED", dict(response))
+            if (
+                not isinstance(error, Mapping)
+                or error.get("code") != "runtime_error"
+                or not isinstance(error.get("message"), str)
+            ):
+                return PermitBridgeOutcome(
+                    PermitBridgeState.MALFORMED, "PERMIT_BRIDGE_MALFORMED"
+                )
+            return PermitBridgeOutcome(
+                PermitBridgeState.DENIED, "PERMIT_DENIED", dict(response)
+            )
         required = {"permit_id", "evidence", "preflight_artifact", "receipt_artifact"}
-        if not required <= set(response) or response.get("permit_id") != permit_id or not all(isinstance(response.get(key), Mapping) for key in ("evidence", "preflight_artifact", "receipt_artifact")):
-            return PermitBridgeOutcome(PermitBridgeState.MALFORMED, "PERMIT_BRIDGE_MALFORMED")
+        if (
+            not required <= set(response)
+            or response.get("permit_id") != permit_id
+            or not all(
+                isinstance(response.get(key), Mapping)
+                for key in ("evidence", "preflight_artifact", "receipt_artifact")
+            )
+        ):
+            return PermitBridgeOutcome(
+                PermitBridgeState.MALFORMED, "PERMIT_BRIDGE_MALFORMED"
+            )
         facts = dict(response)
         facts["canonical_permit_ref"] = permit_id
         return PermitBridgeOutcome(PermitBridgeState.CONSUMED, "PERMIT_CONSUMED", facts)
 
-    def validate_and_consume_call(self, *, mission_ref: str, tool_name: str, args: Mapping[str, Any], target_ref: str) -> Mapping[str, Any]:
-        outcome = self.consume(mission_ref=mission_ref, tool_name=tool_name, args=args, target_ref=target_ref)
+    def validate_and_consume_call(
+        self,
+        *,
+        mission_ref: str,
+        tool_name: str,
+        args: Mapping[str, Any],
+        target_ref: str,
+    ) -> Mapping[str, Any]:
+        outcome = self.consume(
+            mission_ref=mission_ref,
+            tool_name=tool_name,
+            args=args,
+            target_ref=target_ref,
+        )
         if outcome.state is not PermitBridgeState.CONSUMED or outcome.facts is None:
             raise ContractError(outcome.code)
         return outcome.facts
@@ -1171,15 +2217,29 @@ class DaemonPermitReceiptAdapter:
             or state not in {"ok", "error", "ambiguous"}
             or not isinstance(duration_ms, int)
             or duration_ms < 0
-            or error_type is not None and not isinstance(error_type, str)
+            or error_type is not None
+            and not isinstance(error_type, str)
         ):
             raise ContractError("PERMIT_BRIDGE_MALFORMED")
         safe_error_type = (
             error_type
-            if isinstance(error_type, str) and error_type and len(error_type) <= 256 and not any(character.isspace() and character != " " for character in error_type)
-            else "tool_error" if state == "error" else None
+            if isinstance(error_type, str)
+            and error_type
+            and len(error_type) <= 256
+            and not any(
+                character.isspace() and character != " " for character in error_type
+            )
+            else "tool_error"
+            if state == "error"
+            else None
         )
-        reported_state = "succeeded" if state == "ok" else "failed" if state == "error" else "outcome_ambiguous"
+        reported_state = (
+            "succeeded"
+            if state == "ok"
+            else "failed"
+            if state == "error"
+            else "outcome_ambiguous"
+        )
         request_id = "ares:" + secrets.token_hex(16)
         request = {
             "schema": self.REQUEST_SCHEMA,
@@ -1207,14 +2267,22 @@ class DaemonPermitReceiptAdapter:
             raise
         except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
             raise ContractError("PERMIT_BRIDGE_UNAVAILABLE") from None
-        if not isinstance(response, Mapping) or response.get("request_id") != request_id:
+        if (
+            not isinstance(response, Mapping)
+            or response.get("request_id") != request_id
+        ):
             raise ContractError("PERMIT_BRIDGE_MALFORMED")
         if response.get("error") is not None:
             raise ContractError("PERMIT_OUTCOME_DENIED")
         outcome_artifact = response.get("outcome_artifact")
-        if response.get("permit_id") != permit_id or not isinstance(outcome_artifact, Mapping):
+        if response.get("permit_id") != permit_id or not isinstance(
+            outcome_artifact, Mapping
+        ):
             raise ContractError("PERMIT_BRIDGE_MALFORMED")
-        if state == "ambiguous" and outcome_artifact.get("state") != "terminal_quarantine":
+        if (
+            state == "ambiguous"
+            and outcome_artifact.get("state") != "terminal_quarantine"
+        ):
             raise ContractError("PERMIT_BRIDGE_MALFORMED")
 
 
@@ -1229,7 +2297,9 @@ def _load_runtime_config() -> Mapping[str, Any]:
         return {}
 
 
-def _production_permit_canary_config(*, session_id: str | None) -> dict[str, Any] | None:
+def _production_permit_canary_config(
+    *, session_id: str | None
+) -> dict[str, Any] | None:
     """Return the only production enablement shape, scoped to one session.
 
     The daemon transport configuration remains non-authoritative: the selected
@@ -1291,53 +2361,218 @@ def production_permit_canary_enabled(*, session_id: str | None) -> bool:
     return production_permit_canary_context(session_id=session_id) is not None
 
 
-_ADAPTER: contextvars.ContextVar[PermitReceiptAdapter | None] = contextvars.ContextVar("ares_permit_adapter", default=None)
-_EFFECTFUL_TOOLS = frozenset({"write_file", "patch", "terminal", "execute_code", "browser_exec", "browser_click", "browser_type", "browser_navigate", "browser_press", "browser_scroll", "browser_back", "browser_dialog", "browser_cdp", "browser_console", "send_message", "computer_use", "image_generate", "bfl_flux3_image_to_video", "bfl_flux3_keyframes_to_video", "bfl_flux3_text_to_video", "bfl_flux3_video_continuation"})
+_ADAPTER: contextvars.ContextVar[PermitReceiptAdapter | None] = contextvars.ContextVar(
+    "ares_permit_adapter", default=None
+)
+_EFFECTFUL_TOOLS = frozenset({
+    "write_file",
+    "patch",
+    "terminal",
+    "execute_code",
+    "browser_exec",
+    "browser_click",
+    "browser_type",
+    "browser_navigate",
+    "browser_press",
+    "browser_scroll",
+    "browser_back",
+    "browser_dialog",
+    "browser_cdp",
+    "browser_console",
+    "send_message",
+    "computer_use",
+    "image_generate",
+    "bfl_flux3_image_to_video",
+    "bfl_flux3_keyframes_to_video",
+    "bfl_flux3_text_to_video",
+    "bfl_flux3_video_continuation",
+})
 _DEFAULT_EFFECT_SCHEMAS: dict[str, Mapping[str, Any]] = {
-    "write_file": {"type": "object", "required": ["path", "content"], "properties": {"path": {"type": "string"}, "content": {"type": "string"}}},
-    "patch": {"type": "object", "required": ["path", "old_string", "new_string"], "properties": {"path": {"type": "string"}, "old_string": {"type": "string"}, "new_string": {"type": "string"}, "replace_all": {"type": "boolean"}}},
-    "terminal": {"type": "object", "required": ["command"], "properties": {"command": {"type": "string"}, "timeout": {"type": "integer"}, "workdir": {"type": "string"}, "pty": {"type": "boolean"}, "background": {"type": "boolean"}, "notify_on_complete": {"type": "boolean"}}},
-    "execute_code": {"type": "object", "required": ["code"], "properties": {"code": {"type": "string"}}},
-    "browser_exec": {"type": "object", "required": ["code"], "properties": {"code": {"type": "string"}}},
-    "browser_navigate": {"type": "object", "required": ["url"], "properties": {"url": {"type": "string"}}},
-    "browser_type": {"type": "object", "required": ["text"], "properties": {"text": {"type": "string"}}},
-    "browser_click": {"type": "object", "properties": {"element": {"type": "integer"}, "coordinate": {"type": "array", "items": {"type": "integer"}}, "button": {"type": "string"}, "modifiers": {"type": "array", "items": {"type": "string"}}}},
-    "browser_press": {"type": "object", "required": ["keys"], "properties": {"keys": {"type": "string"}}},
-    "browser_scroll": {"type": "object", "properties": {"direction": {"type": "string"}, "amount": {"type": "integer"}}},
+    "write_file": {
+        "type": "object",
+        "required": ["path", "content"],
+        "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+    },
+    "patch": {
+        "type": "object",
+        "required": ["path", "old_string", "new_string"],
+        "properties": {
+            "path": {"type": "string"},
+            "old_string": {"type": "string"},
+            "new_string": {"type": "string"},
+            "replace_all": {"type": "boolean"},
+        },
+    },
+    "terminal": {
+        "type": "object",
+        "required": ["command"],
+        "properties": {
+            "command": {"type": "string"},
+            "timeout": {"type": "integer"},
+            "workdir": {"type": "string"},
+            "pty": {"type": "boolean"},
+            "background": {"type": "boolean"},
+            "notify_on_complete": {"type": "boolean"},
+        },
+    },
+    "execute_code": {
+        "type": "object",
+        "required": ["code"],
+        "properties": {"code": {"type": "string"}},
+    },
+    "browser_exec": {
+        "type": "object",
+        "required": ["code"],
+        "properties": {"code": {"type": "string"}},
+    },
+    "browser_navigate": {
+        "type": "object",
+        "required": ["url"],
+        "properties": {"url": {"type": "string"}},
+    },
+    "browser_type": {
+        "type": "object",
+        "required": ["text"],
+        "properties": {"text": {"type": "string"}},
+    },
+    "browser_click": {
+        "type": "object",
+        "properties": {
+            "element": {"type": "integer"},
+            "coordinate": {"type": "array", "items": {"type": "integer"}},
+            "button": {"type": "string"},
+            "modifiers": {"type": "array", "items": {"type": "string"}},
+        },
+    },
+    "browser_press": {
+        "type": "object",
+        "required": ["keys"],
+        "properties": {"keys": {"type": "string"}},
+    },
+    "browser_scroll": {
+        "type": "object",
+        "properties": {"direction": {"type": "string"}, "amount": {"type": "integer"}},
+    },
     "browser_back": {"type": "object", "properties": {}},
-    "browser_dialog": {"type": "object", "required": ["action"], "properties": {"action": {"type": "string"}, "prompt_text": {"type": "string"}}},
-    "browser_cdp": {"type": "object", "required": ["code"], "properties": {"code": {"type": "string"}}},
+    "browser_dialog": {
+        "type": "object",
+        "required": ["action"],
+        "properties": {"action": {"type": "string"}, "prompt_text": {"type": "string"}},
+    },
+    "browser_cdp": {
+        "type": "object",
+        "required": ["code"],
+        "properties": {"code": {"type": "string"}},
+    },
     "browser_console": {"type": "object", "properties": {"level": {"type": "string"}}},
-    "send_message": {"type": "object", "required": ["recipient", "content"], "properties": {"recipient": {"type": "string"}, "content": {"type": "string"}}},
-    "computer_use": {"type": "object", "required": ["action"], "properties": {"action": {"type": "string"}, "app": {"type": "string"}, "pid": {"type": "integer"}, "window_id": {"type": "integer"}}},
-    "image_generate": {"type": "object", "required": ["prompt"], "properties": {"prompt": {"type": "string"}, "aspect_ratio": {"type": "string"}}},
-    "bfl_flux3_image_to_video": {"type": "object", "required": ["prompt", "input_image"], "properties": {"prompt": {"type": "string"}, "input_image": {"type": "string"}, "aspect_ratio": {"type": "string"}, "duration": {"type": "integer"}, "resolution": {"type": "string"}, "generate_audio": {"type": "boolean"}}},
-    "bfl_flux3_keyframes_to_video": {"type": "object", "required": ["prompt", "input_images"], "properties": {"prompt": {"type": "string"}, "input_images": {"type": "array", "items": {"type": "string"}}, "keyframe_indices": {"type": "array", "items": {"type": "integer"}}, "aspect_ratio": {"type": "string"}, "duration": {"type": "integer"}}},
-    "bfl_flux3_text_to_video": {"type": "object", "required": ["prompt"], "properties": {"prompt": {"type": "string"}, "aspect_ratio": {"type": "string"}, "duration": {"type": "integer"}, "resolution": {"type": "string"}, "generate_audio": {"type": "boolean"}}},
-    "bfl_flux3_video_continuation": {"type": "object", "required": ["prompt", "input_video"], "properties": {"prompt": {"type": "string"}, "input_video": {"type": "string"}, "aspect_ratio": {"type": "string"}, "duration": {"type": "integer"}}},
+    "send_message": {
+        "type": "object",
+        "required": ["recipient", "content"],
+        "properties": {"recipient": {"type": "string"}, "content": {"type": "string"}},
+    },
+    "computer_use": {
+        "type": "object",
+        "required": ["action"],
+        "properties": {
+            "action": {"type": "string"},
+            "app": {"type": "string"},
+            "pid": {"type": "integer"},
+            "window_id": {"type": "integer"},
+        },
+    },
+    "image_generate": {
+        "type": "object",
+        "required": ["prompt"],
+        "properties": {
+            "prompt": {"type": "string"},
+            "aspect_ratio": {"type": "string"},
+        },
+    },
+    "bfl_flux3_image_to_video": {
+        "type": "object",
+        "required": ["prompt", "input_image"],
+        "properties": {
+            "prompt": {"type": "string"},
+            "input_image": {"type": "string"},
+            "aspect_ratio": {"type": "string"},
+            "duration": {"type": "integer"},
+            "resolution": {"type": "string"},
+            "generate_audio": {"type": "boolean"},
+        },
+    },
+    "bfl_flux3_keyframes_to_video": {
+        "type": "object",
+        "required": ["prompt", "input_images"],
+        "properties": {
+            "prompt": {"type": "string"},
+            "input_images": {"type": "array", "items": {"type": "string"}},
+            "keyframe_indices": {"type": "array", "items": {"type": "integer"}},
+            "aspect_ratio": {"type": "string"},
+            "duration": {"type": "integer"},
+        },
+    },
+    "bfl_flux3_text_to_video": {
+        "type": "object",
+        "required": ["prompt"],
+        "properties": {
+            "prompt": {"type": "string"},
+            "aspect_ratio": {"type": "string"},
+            "duration": {"type": "integer"},
+            "resolution": {"type": "string"},
+            "generate_audio": {"type": "boolean"},
+        },
+    },
+    "bfl_flux3_video_continuation": {
+        "type": "object",
+        "required": ["prompt", "input_video"],
+        "properties": {
+            "prompt": {"type": "string"},
+            "input_video": {"type": "string"},
+            "aspect_ratio": {"type": "string"},
+            "duration": {"type": "integer"},
+        },
+    },
 }
 
 
 def _exact_type(value: Any, expected: Any) -> bool:
-    if isinstance(expected, list): return any(_exact_type(value, x) for x in expected)
-    return {"object": type(value) is dict, "array": type(value) is list, "string": type(value) is str, "integer": type(value) is int, "number": type(value) in (int, float) and type(value) is not bool, "boolean": type(value) is bool, "null": value is None}.get(expected, False)
+    if isinstance(expected, list):
+        return any(_exact_type(value, x) for x in expected)
+    return {
+        "object": type(value) is dict,
+        "array": type(value) is list,
+        "string": type(value) is str,
+        "integer": type(value) is int,
+        "number": type(value) in (int, float) and type(value) is not bool,
+        "boolean": type(value) is bool,
+        "null": value is None,
+    }.get(expected, False)
 
 
 def validate_effect_args(args: Any, schema: Mapping[str, Any]) -> None:
-    if type(args) is not dict or schema.get("type") != "object": raise ContractError("INVALID_EFFECT_ARGS")
-    required, allowed = set(schema.get("required", [])), set(schema.get("properties", {}))
-    if set(args) - allowed: raise ContractError("UNKNOWN_FIELD", sorted(set(args) - allowed)[0])
-    if required - set(args): raise ContractError("MISSING_FIELD", sorted(required - set(args))[0])
+    if type(args) is not dict or schema.get("type") != "object":
+        raise ContractError("INVALID_EFFECT_ARGS")
+    required, allowed = (
+        set(schema.get("required", [])),
+        set(schema.get("properties", {})),
+    )
+    if set(args) - allowed:
+        raise ContractError("UNKNOWN_FIELD", sorted(set(args) - allowed)[0])
+    if required - set(args):
+        raise ContractError("MISSING_FIELD", sorted(required - set(args))[0])
     for key, spec in schema.get("properties", {}).items():
-        if key in args and not _exact_type(args[key], spec.get("type")): raise ContractError("COERCION_REQUIRED", key)
+        if key in args and not _exact_type(args[key], spec.get("type")):
+            raise ContractError("COERCION_REQUIRED", key)
 
 
 def target_for(tool_name: str, args: Mapping[str, Any]) -> str:
     if tool_name in {"write_file", "patch"}:
-        if not isinstance(args.get("path"), str): raise ContractError("INVALID_TARGET", "path")
+        if not isinstance(args.get("path"), str):
+            raise ContractError("INVALID_TARGET", "path")
         return "path:" + digest(args["path"])[7:]
     if tool_name in {"send_message"}:
-        if not isinstance(args.get("recipient"), str): raise ContractError("INVALID_TARGET", "recipient")
+        if not isinstance(args.get("recipient"), str):
+            raise ContractError("INVALID_TARGET", "recipient")
         return "recipient:" + digest(args["recipient"])[7:]
     return "tool:" + tool_name
 
@@ -1375,9 +2610,9 @@ def dispatcher_boundary(
             return False, exc.code, None
     if not permits or tool_name not in _EFFECTFUL_TOOLS or not authorize_permit:
         return True, None, None
-    adapter = DaemonPermitReceiptAdapter.from_ares_config(
-        {"ares": {"permit_daemon": bridge}}
-    )
+    adapter = DaemonPermitReceiptAdapter.from_ares_config({
+        "ares": {"permit_daemon": bridge}
+    })
     if adapter is None:
         return False, "PERMIT_BRIDGE_UNAVAILABLE", None
     if not mission_ref:
@@ -1409,11 +2644,16 @@ def dispatcher_boundary(
 
 def record_receipt(receipt: Mapping[str, Any]) -> None:
     adapter = _ADAPTER.get()
-    if adapter is not None: adapter.record_receipt(dict(receipt))
+    if adapter is not None:
+        adapter.record_receipt(dict(receipt))
 
 
-def permit_adapter(adapter: PermitReceiptAdapter): return _ADAPTER.set(adapter)
-def reset_permit_adapter(token: contextvars.Token) -> None: _ADAPTER.reset(token)
+def permit_adapter(adapter: PermitReceiptAdapter):
+    return _ADAPTER.set(adapter)
+
+
+def reset_permit_adapter(token: contextvars.Token) -> None:
+    _ADAPTER.reset(token)
 
 
 class BlindWitness:
@@ -1426,10 +2666,14 @@ class BlindWitness:
         self._witness_route_ref: str | None = None
         self._revealed = False
 
-    def commit(self, context_digest: str, *, executor_route_ref: str, witness_route_ref: str) -> str:
+    def commit(
+        self, context_digest: str, *, executor_route_ref: str, witness_route_ref: str
+    ) -> str:
         if self._commitment is not None or self._revealed:
             raise ContractError("COMMITMENT_ALREADY_RECORDED")
-        if not isinstance(context_digest, str) or not context_digest.startswith("sha256:"):
+        if not isinstance(context_digest, str) or not context_digest.startswith(
+            "sha256:"
+        ):
             raise ContractError("INVALID_CONTEXT_DIGEST")
         _check_ref(executor_route_ref, "executor_route_ref")
         _check_ref(witness_route_ref, "witness_route_ref")
@@ -1438,33 +2682,107 @@ class BlindWitness:
         self._committed_context = context_digest
         self._executor_route_ref = executor_route_ref
         self._witness_route_ref = witness_route_ref
-        self._commitment = digest({"context_digest": context_digest, "executor_route_ref": executor_route_ref, "witness_route_ref": witness_route_ref, "nonce": secrets.token_hex(16)})
+        self._commitment = digest({
+            "context_digest": context_digest,
+            "executor_route_ref": executor_route_ref,
+            "witness_route_ref": witness_route_ref,
+            "nonce": secrets.token_hex(16),
+        })
         return self._commitment
 
-    def reveal_and_record(self, result: Mapping[str, Any], *, mission_ref: str, test_request_ref: str, role_contract_ref: str, context_digest: str, executor_route_ref: str, witness_route_ref: str) -> ImmutableArtifact:
+    def reveal_and_record(
+        self,
+        result: Mapping[str, Any],
+        *,
+        mission_ref: str,
+        test_request_ref: str,
+        role_contract_ref: str,
+        context_digest: str,
+        executor_route_ref: str,
+        witness_route_ref: str,
+    ) -> ImmutableArtifact:
         if self._commitment is None or self._revealed:
             raise ContractError("COMMITMENT_REQUIRED")
-        if executor_route_ref != self._executor_route_ref or witness_route_ref != self._witness_route_ref or context_digest != self._committed_context:
+        if (
+            executor_route_ref != self._executor_route_ref
+            or witness_route_ref != self._witness_route_ref
+            or context_digest != self._committed_context
+        ):
             raise ContractError("COMMITMENT_MISMATCH")
         if executor_route_ref == witness_route_ref:
             raise ContractError("WITNESS_ROUTE_NOT_INDEPENDENT")
-        if not isinstance(result, Mapping) or result.get("verdict") not in {"pass", "fail", "blocked", "inconclusive", "not_applicable"}:
+        if not isinstance(result, Mapping) or result.get("verdict") not in {
+            "pass",
+            "fail",
+            "blocked",
+            "inconclusive",
+            "not_applicable",
+        }:
             raise ContractError("INVALID_WITNESS_RESULT")
         self._revealed = True
-        return make_artifact("witness", {"mission_ref": mission_ref, "test_request_ref": test_request_ref, "role_contract_ref": role_contract_ref, "witness_id": "witness:" + digest(result)[7:], "independence": {"executor_output_withheld_until_commit": True, "context_digest": context_digest, "commitment": self._commitment, "executor_route_ref": executor_route_ref, "witness_route_ref": witness_route_ref, "shared_evidence_refs": []}, "verdict": result["verdict"], "evidence_refs": list(result.get("evidence_refs", [])), "coverage": list(result.get("coverage", ["declared test request"])), "limitations": list(result.get("limitations", []))})
+        return make_artifact(
+            "witness",
+            {
+                "mission_ref": mission_ref,
+                "test_request_ref": test_request_ref,
+                "role_contract_ref": role_contract_ref,
+                "witness_id": "witness:" + digest(result)[7:],
+                "independence": {
+                    "executor_output_withheld_until_commit": True,
+                    "context_digest": context_digest,
+                    "commitment": self._commitment,
+                    "executor_route_ref": executor_route_ref,
+                    "witness_route_ref": witness_route_ref,
+                    "shared_evidence_refs": [],
+                },
+                "verdict": result["verdict"],
+                "evidence_refs": list(result.get("evidence_refs", [])),
+                "coverage": list(result.get("coverage", ["declared test request"])),
+                "limitations": list(result.get("limitations", [])),
+            },
+        )
 
 
 class ClosureProjector:
     """Pure, rebuildable projection over owner events; it never closes a mission."""
 
-    PROFILE_REQUIRED_GATES = {"engineering": frozenset({"test"}), "research": frozenset({"evidence_review"}), "public_artifact": frozenset({"artifact_verification"}), "effectful_operation": frozenset({"effect_receipt"}), "ordinary_response": frozenset({"response_evidence"}), "mixed": frozenset({"test", "evidence_review"})}
-    ALLOWED_FLAGS = {"KANBAN_DONE_WITHOUT_CLOSURE", "GOAL_DONE_WITHOUT_CLOSURE", "NARRATIVE_AHEAD_OF_LEDGER", "LEDGER_AHEAD_OF_UI", "STALE_SOURCE_FREEZE", "AMBIGUOUS_EFFECT", "MISSING_WITNESS", "RUNTIME_CANDIDATE_NOT_ACTIVE", "UI_TASK_COUNT_MISMATCH"}
+    PROFILE_REQUIRED_GATES = {
+        "engineering": frozenset({"test"}),
+        "research": frozenset({"evidence_review"}),
+        "public_artifact": frozenset({"artifact_verification"}),
+        "effectful_operation": frozenset({"effect_receipt"}),
+        "ordinary_response": frozenset({"response_evidence"}),
+        "mixed": frozenset({"test", "evidence_review"}),
+    }
+    ALLOWED_FLAGS = {
+        "KANBAN_DONE_WITHOUT_CLOSURE",
+        "GOAL_DONE_WITHOUT_CLOSURE",
+        "NARRATIVE_AHEAD_OF_LEDGER",
+        "LEDGER_AHEAD_OF_UI",
+        "STALE_SOURCE_FREEZE",
+        "AMBIGUOUS_EFFECT",
+        "MISSING_WITNESS",
+        "RUNTIME_CANDIDATE_NOT_ACTIVE",
+        "UI_TASK_COUNT_MISMATCH",
+    }
 
-    def project(self, mission_ref: str, closure_profile: str, gates: Mapping[str, bool], *, source_event_refs: Sequence[str], source_event_exists: Callable[[str], bool], flags: Sequence[str] = (), previous_projection: Mapping[str, Any] | ImmutableArtifact | None = None) -> ImmutableArtifact:
+    def project(
+        self,
+        mission_ref: str,
+        closure_profile: str,
+        gates: Mapping[str, bool],
+        *,
+        source_event_refs: Sequence[str],
+        source_event_exists: Callable[[str], bool],
+        flags: Sequence[str] = (),
+        previous_projection: Mapping[str, Any] | ImmutableArtifact | None = None,
+    ) -> ImmutableArtifact:
         _check_ref(mission_ref, "mission_ref")
         if closure_profile not in self.PROFILE_REQUIRED_GATES:
             raise ContractError("UNKNOWN_CLOSURE_PROFILE", closure_profile)
-        if not isinstance(gates, Mapping) or any(type(value) is not bool for value in gates.values()):
+        if not isinstance(gates, Mapping) or any(
+            type(value) is not bool for value in gates.values()
+        ):
             raise ContractError("INVALID_GATE_STATE")
         if not source_event_refs:
             raise ContractError("MISSING_SOURCE_EVENTS")
@@ -1474,10 +2792,19 @@ class ClosureProjector:
             if not source_event_exists(event_ref):
                 raise ContractError("MISSING_SOURCE_EVENT", event_ref)
         if previous_projection is not None:
-            prior = previous_projection.to_dict() if isinstance(previous_projection, ImmutableArtifact) else dict(previous_projection)
-            if prior.get("mission_ref") != mission_ref or prior.get("closure_profile") != closure_profile:
+            prior = (
+                previous_projection.to_dict()
+                if isinstance(previous_projection, ImmutableArtifact)
+                else dict(previous_projection)
+            )
+            if (
+                prior.get("mission_ref") != mission_ref
+                or prior.get("closure_profile") != closure_profile
+            ):
                 raise ContractError("PROJECTION_LINEAGE_MISMATCH")
-            if prior.get("state") == "closed" and not set(normalized_events).difference(prior.get("source_event_refs", [])):
+            if prior.get("state") == "closed" and not set(normalized_events).difference(
+                prior.get("source_event_refs", [])
+            ):
                 raise ContractError("REOPEN_REQUIRES_NEW_EVIDENCE")
         unknown = set(flags) - self.ALLOWED_FLAGS
         if unknown:
@@ -1487,8 +2814,25 @@ class ClosureProjector:
             effective_gates.setdefault(required_gate, False)
         satisfied = sorted(key for key, value in effective_gates.items() if value)
         unsatisfied = sorted(key for key, value in effective_gates.items() if not value)
-        state = "closed" if not unsatisfied and not flags else ("quarantined" if "AMBIGUOUS_EFFECT" in flags else "evidence_pending")
-        return make_artifact("closure", {"mission_ref": mission_ref, "closure_profile": closure_profile, "state": state, "satisfied_gate_ids": satisfied, "unsatisfied_gate_ids": unsatisfied, "blocking_refs": unsatisfied, "source_event_refs": normalized_events, "projected_at": EPOCH, "divergence_flags": sorted(set(flags))})
+        state = (
+            "closed"
+            if not unsatisfied and not flags
+            else ("quarantined" if "AMBIGUOUS_EFFECT" in flags else "evidence_pending")
+        )
+        return make_artifact(
+            "closure",
+            {
+                "mission_ref": mission_ref,
+                "closure_profile": closure_profile,
+                "state": state,
+                "satisfied_gate_ids": satisfied,
+                "unsatisfied_gate_ids": unsatisfied,
+                "blocking_refs": unsatisfied,
+                "source_event_refs": normalized_events,
+                "projected_at": EPOCH,
+                "divergence_flags": sorted(set(flags)),
+            },
+        )
 
 
 BASELINE_DEFINITIONS: Mapping[str, Mapping[str, str]] = {
@@ -1506,13 +2850,18 @@ _MUTATION_ALIASES = {
     "missing_evidence_ref": "missing_evidence",
 }
 _REQUIRED_MUTATIONS = frozenset({
-    "skipped_test", "ambiguous_effect", "missing_witness", "stale_source", "missing_evidence",
+    "skipped_test",
+    "ambiguous_effect",
+    "missing_witness",
+    "stale_source",
+    "missing_evidence",
 })
 
 
 @dataclass(frozen=True)
 class FrozenReplayCorpusV1:
     """Immutable, canonical replay input; it carries no runtime or UI truth."""
+
     corpus_version: str
     corpus_digest: str
     _canonical_cases: bytes
@@ -1529,7 +2878,9 @@ class FrozenReplayCorpusV1:
         }
 
 
-def freeze_replay_corpus(cases: Sequence[Mapping[str, Any]], *, corpus_version: str = "held-out-v1") -> FrozenReplayCorpusV1:
+def freeze_replay_corpus(
+    cases: Sequence[Mapping[str, Any]], *, corpus_version: str = "held-out-v1"
+) -> FrozenReplayCorpusV1:
     """Validate, sort, and freeze a replay corpus before deterministic grading."""
     if not isinstance(corpus_version, str) or not corpus_version:
         raise ContractError("INVALID_CORPUS_VERSION")
@@ -1561,6 +2912,7 @@ def freeze_replay_corpus(cases: Sequence[Mapping[str, Any]], *, corpus_version: 
 @dataclass(frozen=True)
 class BaselineResultV1:
     """Immutable per-baseline evaluation projection, suitable for comparison only."""
+
     baseline_id: str
     corpus_digest: str
     result_digest: str
@@ -1579,7 +2931,9 @@ class BaselineResultV1:
             "cases": cases,
             "verified_closure_count": sum(item["verified_closure"] for item in cases),
             "false_closure_count": sum(item["false_closure"] for item in cases),
-            "authority_violation_count": sum(item["authority_violation"] for item in cases),
+            "authority_violation_count": sum(
+                item["authority_violation"] for item in cases
+            ),
             "quarantined": any(item["quarantined"] for item in cases),
             "result_digest": self.result_digest,
         }
@@ -1601,22 +2955,42 @@ def _case_outcome(case: Mapping[str, Any], baseline_id: str) -> dict[str, Any]:
     if not isinstance(override, Mapping):
         raise ContractError("INVALID_BASELINE_OVERRIDE", baseline_id)
     gates = dict(case.get("gates", {}))
-    if not all(isinstance(name, str) and type(value) is bool for name, value in gates.items()):
+    if not all(
+        isinstance(name, str) and type(value) is bool for name, value in gates.items()
+    ):
         raise ContractError("INVALID_REPLAY_GATES")
     override_gates = override.get("gates", {})
-    if not isinstance(override_gates, Mapping) or not all(isinstance(name, str) and type(value) is bool for name, value in override_gates.items()):
+    if not isinstance(override_gates, Mapping) or not all(
+        isinstance(name, str) and type(value) is bool
+        for name, value in override_gates.items()
+    ):
         raise ContractError("INVALID_REPLAY_GATES")
     gates.update(override_gates)
     mutation = _normalized_mutation(override.get("mutation", case.get("mutation")))
     if mutation in _REQUIRED_MUTATIONS:
         gates[mutation] = False
-    divergence_flags = override.get("divergence_flags", case.get("divergence_flags", ()))
-    if not isinstance(divergence_flags, (list, tuple, set)) or not all(isinstance(flag, str) for flag in divergence_flags):
+    divergence_flags = override.get(
+        "divergence_flags", case.get("divergence_flags", ())
+    )
+    if not isinstance(divergence_flags, (list, tuple, set)) or not all(
+        isinstance(flag, str) for flag in divergence_flags
+    ):
         raise ContractError("INVALID_DIVERGENCE_FLAGS")
     closed = bool(gates) and all(gates.values()) and not divergence_flags
-    expected_verified = bool(override.get("expected_verified_closure", case.get("expected_verified_closure", True)))
-    authority_violation = bool(override.get("authority_violation", case.get("authority_violation", False)))
-    critical_authority_violation = bool(override.get("critical_authority_violation", case.get("critical_authority_violation", authority_violation)))
+    expected_verified = bool(
+        override.get(
+            "expected_verified_closure", case.get("expected_verified_closure", True)
+        )
+    )
+    authority_violation = bool(
+        override.get("authority_violation", case.get("authority_violation", False))
+    )
+    critical_authority_violation = bool(
+        override.get(
+            "critical_authority_violation",
+            case.get("critical_authority_violation", authority_violation),
+        )
+    )
     if mutation == "critical_authority_violation":
         authority_violation = critical_authority_violation = True
     quarantined = critical_authority_violation
@@ -1624,72 +2998,112 @@ def _case_outcome(case: Mapping[str, Any], baseline_id: str) -> dict[str, Any]:
         closed = False
     verified_closure = closed and expected_verified and not authority_violation
     false_closure = closed and not expected_verified
-    closure_state = "quarantined" if quarantined else ("closed" if verified_closure else "evidence_pending")
+    closure_state = (
+        "quarantined"
+        if quarantined
+        else ("closed" if verified_closure else "evidence_pending")
+    )
     outcome = {
-        "case_id": case["case_id"], "mutation": mutation, "closed": closed,
-        "verified_closure": verified_closure, "false_closure": false_closure,
+        "case_id": case["case_id"],
+        "mutation": mutation,
+        "closed": closed,
+        "verified_closure": verified_closure,
+        "false_closure": false_closure,
         "authority_violation": authority_violation,
         "critical_authority_violation": critical_authority_violation,
         "injected_mutation": mutation is not None,
-        "quarantined": quarantined, "closure_state": closure_state,
-        "unsatisfied_gate_ids": sorted(name for name, passed in gates.items() if not passed),
+        "quarantined": quarantined,
+        "closure_state": closure_state,
+        "unsatisfied_gate_ids": sorted(
+            name for name, passed in gates.items() if not passed
+        ),
         "divergence_flags": sorted(set(divergence_flags)),
     }
     outcome["digest"] = digest(outcome)
     return outcome
 
 
-def _baseline_result(corpus: FrozenReplayCorpusV1, baseline_id: str) -> BaselineResultV1:
+def _baseline_result(
+    corpus: FrozenReplayCorpusV1, baseline_id: str
+) -> BaselineResultV1:
     outcomes = [_case_outcome(case, baseline_id) for case in corpus.cases]
     canonical_outcomes = canonical_json(outcomes)
-    result_digest = digest({"baseline_id": baseline_id, "corpus_digest": corpus.corpus_digest, "cases": outcomes})
-    return BaselineResultV1(baseline_id, corpus.corpus_digest, result_digest, canonical_outcomes)
+    result_digest = digest({
+        "baseline_id": baseline_id,
+        "corpus_digest": corpus.corpus_digest,
+        "cases": outcomes,
+    })
+    return BaselineResultV1(
+        baseline_id, corpus.corpus_digest, result_digest, canonical_outcomes
+    )
 
 
-def replay_mutations(cases: Sequence[Mapping[str, Any]] | FrozenReplayCorpusV1) -> dict[str, Any]:
+def replay_mutations(
+    cases: Sequence[Mapping[str, Any]] | FrozenReplayCorpusV1,
+) -> dict[str, Any]:
     """Evaluate a frozen held-out corpus across B0--B3 without promoting anything."""
-    corpus = cases if isinstance(cases, FrozenReplayCorpusV1) else freeze_replay_corpus(cases)
-    results = {baseline: _baseline_result(corpus, baseline) for baseline in BASELINE_DEFINITIONS}
+    corpus = (
+        cases
+        if isinstance(cases, FrozenReplayCorpusV1)
+        else freeze_replay_corpus(cases)
+    )
+    results = {
+        baseline: _baseline_result(corpus, baseline)
+        for baseline in BASELINE_DEFINITIONS
+    }
     baseline_data = {baseline: result.to_dict() for baseline, result in results.items()}
     b3_cases = baseline_data["B3"]["cases"]
     mutations = sorted({item["mutation"] for item in b3_cases if item["mutation"]})
-    critical_mutations = [item for item in b3_cases if item["mutation"] in _REQUIRED_MUTATIONS]
+    critical_mutations = [
+        item for item in b3_cases if item["mutation"] in _REQUIRED_MUTATIONS
+    ]
     critical_authority = any(
         case["critical_authority_violation"] and not case["injected_mutation"]
-        for result in baseline_data.values() for case in result["cases"]
+        for result in baseline_data.values()
+        for case in result["cases"]
     )
     # Injected mutations are expected hostile fixtures. Their per-case state is
     # quarantined, but successful containment must not masquerade as a real
     # candidate authority violation.
     quarantined = critical_authority or any(
         case["quarantined"] and not case["injected_mutation"]
-        for result in baseline_data.values() for case in result["cases"]
+        for result in baseline_data.values()
+        for case in result["cases"]
     )
     return {
         "corpus_version": corpus.corpus_version,
         "corpus_digest": corpus.corpus_digest,
         "cases": b3_cases,
         "baseline_results": baseline_data,
-        "critical_mutations_blocked": bool(critical_mutations) and all(not item["closed"] for item in critical_mutations),
+        "critical_mutations_blocked": bool(critical_mutations)
+        and all(not item["closed"] for item in critical_mutations),
         "mutation_coverage": mutations,
         "quarantined": quarantined,
         "promotion_state": "QUARANTINED" if quarantined else "NOT_PROMOTED",
     }
 
 
-def closure_ui_projection(closure: ImmutableArtifact | Mapping[str, Any]) -> dict[str, Any]:
+def closure_ui_projection(
+    closure: ImmutableArtifact | Mapping[str, Any],
+) -> dict[str, Any]:
     """Derived read model only; callers must not treat it as closure authority."""
-    value = closure.to_dict() if isinstance(closure, ImmutableArtifact) else dict(closure)
+    value = (
+        closure.to_dict() if isinstance(closure, ImmutableArtifact) else dict(closure)
+    )
     return {
-        "projection_kind": "closure_ui_v1", "authoritative": False,
-        "mission_ref": value.get("mission_ref"), "state": value.get("state"),
+        "projection_kind": "closure_ui_v1",
+        "authoritative": False,
+        "mission_ref": value.get("mission_ref"),
+        "state": value.get("state"),
         "source_event_refs": list(value.get("source_event_refs", ())),
         "divergence_flags": list(value.get("divergence_flags", ())),
         "closure_projection_digest": value.get("projection_digest"),
     }
 
 
-def evaluation_ui_projection(result: Mapping[str, Any], *, source_refs: Sequence[str] = ()) -> dict[str, Any]:
+def evaluation_ui_projection(
+    result: Mapping[str, Any], *, source_refs: Sequence[str] = ()
+) -> dict[str, Any]:
     """Derived evaluation display data; it cannot create truth or alter promotion."""
     for ref in source_refs:
         _check_ref(ref, "source_refs")
@@ -1698,17 +3112,26 @@ def evaluation_ui_projection(result: Mapping[str, Any], *, source_refs: Sequence
         raise ContractError("INVALID_EVALUATION_RESULT")
     summary = {
         baseline: {
-            key: value.get(key) for key in (
-                "verified_closure_count", "false_closure_count", "authority_violation_count", "quarantined",
+            key: value.get(key)
+            for key in (
+                "verified_closure_count",
+                "false_closure_count",
+                "authority_violation_count",
+                "quarantined",
             )
         }
-        for baseline, value in sorted(baselines.items()) if isinstance(value, Mapping)
+        for baseline, value in sorted(baselines.items())
+        if isinstance(value, Mapping)
     }
     return {
-        "projection_kind": "evaluation_ui_v1", "authoritative": False,
-        "corpus_version": result.get("corpus_version"), "corpus_digest": result.get("corpus_digest"),
-        "promotion_state": result.get("promotion_state"), "quarantined": bool(result.get("quarantined")),
-        "source_refs": sorted(set(source_refs)), "baseline_summary": summary,
+        "projection_kind": "evaluation_ui_v1",
+        "authoritative": False,
+        "corpus_version": result.get("corpus_version"),
+        "corpus_digest": result.get("corpus_digest"),
+        "promotion_state": result.get("promotion_state"),
+        "quarantined": bool(result.get("quarantined")),
+        "source_refs": sorted(set(source_refs)),
+        "baseline_summary": summary,
     }
 
 
@@ -1720,20 +3143,61 @@ def evaluation_ui_projection(result: Mapping[str, Any], *, source_refs: Sequence
 
 OPERATOR_RUN_PROJECTION_KIND = "operator_run_v1"
 
-_OPERATOR_RUN_LIFECYCLE_STATES = frozenset({"pending", "planned", "running", "paused", "completed", "failed", "cancelled"})
-_OPERATOR_RUN_EFFECT_STATES = frozenset({"queued", "in_flight", "applied", "failed", "rolled_back"})
+_OPERATOR_RUN_LIFECYCLE_STATES = frozenset({
+    "pending",
+    "planned",
+    "running",
+    "paused",
+    "completed",
+    "failed",
+    "cancelled",
+})
+_OPERATOR_RUN_EFFECT_STATES = frozenset({
+    "queued",
+    "in_flight",
+    "applied",
+    "failed",
+    "rolled_back",
+})
 _OPERATOR_RUN_EFFECT_RISKS = frozenset({"none", "low", "medium", "high", "critical"})
-_OPERATOR_RUN_PERMIT_STATES = frozenset({"none", "pending", "granted", "denied", "revoked", "expired"})
-_OPERATOR_RUN_RECOVERY_STATES = frozenset({"not_started", "checkpointed", "resumed_safe", "resumed_unsafe", "unrecoverable"})
-_OPERATOR_RUN_EVIDENCE_KINDS = frozenset({"event", "receipt", "witness", "test", "artifact"})
+_OPERATOR_RUN_PERMIT_STATES = frozenset({
+    "none",
+    "pending",
+    "granted",
+    "denied",
+    "revoked",
+    "expired",
+})
+_OPERATOR_RUN_RECOVERY_STATES = frozenset({
+    "not_started",
+    "checkpointed",
+    "resumed_safe",
+    "resumed_unsafe",
+    "unrecoverable",
+})
+_OPERATOR_RUN_EVIDENCE_KINDS = frozenset({
+    "event",
+    "receipt",
+    "witness",
+    "test",
+    "artifact",
+})
 _RISK_RANK = {"none": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
-_FORBIDDEN_SUMMARY_KEYS = frozenset({"summary", "summary_text", "telemetry", "transcript_summary", "narrative"})
+_FORBIDDEN_SUMMARY_KEYS = frozenset({
+    "summary",
+    "summary_text",
+    "telemetry",
+    "transcript_summary",
+    "narrative",
+})
 _UNSETTLED_EFFECT_STATES = frozenset({"queued", "in_flight"})
 _REVOKED_PERMIT_STATES = frozenset({"denied", "revoked", "expired"})
 
 
 def _operator_run_check_refs(refs: Any, field: str) -> list[str]:
-    if not isinstance(refs, (list, tuple)) or not all(isinstance(ref, str) for ref in refs):
+    if not isinstance(refs, (list, tuple)) or not all(
+        isinstance(ref, str) for ref in refs
+    ):
         raise ContractError("INVALID_REFERENCE", field)
     normalized = sorted(set(refs))
     for ref in normalized:
@@ -1769,8 +3233,12 @@ def operator_run_projection(
     if lifecycle not in _OPERATOR_RUN_LIFECYCLE_STATES:
         raise ContractError("INVALID_LIFECYCLE_STATE", str(lifecycle))
 
-    plan_event_refs = _operator_run_check_refs(state.get("plan_event_refs", ()), "plan_event_refs")
-    actual_event_refs = _operator_run_check_refs(state.get("actual_event_refs", ()), "actual_event_refs")
+    plan_event_refs = _operator_run_check_refs(
+        state.get("plan_event_refs", ()), "plan_event_refs"
+    )
+    actual_event_refs = _operator_run_check_refs(
+        state.get("actual_event_refs", ()), "actual_event_refs"
+    )
     overlap = set(plan_event_refs) & set(actual_event_refs)
     if overlap:
         raise ContractError("PLAN_ACTUAL_EVENT_SHARED", sorted(overlap)[0])
@@ -1814,11 +3282,18 @@ def operator_run_projection(
         risk = record.get("risk")
         if risk not in _OPERATOR_RUN_EFFECT_RISKS:
             raise ContractError("INVALID_EFFECT_RISK", str(risk))
-        refs = _operator_run_check_refs(record.get("evidence_refs", ()), "effect.evidence_refs")
+        refs = _operator_run_check_refs(
+            record.get("evidence_refs", ()), "effect.evidence_refs"
+        )
         for ref in refs:
             if not source_event_exists(ref):
                 raise ContractError("MISSING_SOURCE_EVENT", ref)
-        effects.append({"effect_ref": effect_ref, "state": effect_state, "risk": risk, "evidence_refs": refs})
+        effects.append({
+            "effect_ref": effect_ref,
+            "state": effect_state,
+            "risk": risk,
+            "evidence_refs": refs,
+        })
     effects.sort(key=lambda item: item["effect_ref"])
 
     permit_records = state.get("permits", [])
@@ -1834,11 +3309,17 @@ def operator_run_projection(
         permit_state = record.get("state")
         if permit_state not in _OPERATOR_RUN_PERMIT_STATES:
             raise ContractError("INVALID_PERMIT_STATE", str(permit_state))
-        refs = _operator_run_check_refs(record.get("evidence_refs", ()), "permit.evidence_refs")
+        refs = _operator_run_check_refs(
+            record.get("evidence_refs", ()), "permit.evidence_refs"
+        )
         for ref in refs:
             if not source_event_exists(ref):
                 raise ContractError("MISSING_SOURCE_EVENT", ref)
-        permits.append({"permit_ref": permit_ref, "state": permit_state, "evidence_refs": refs})
+        permits.append({
+            "permit_ref": permit_ref,
+            "state": permit_state,
+            "evidence_refs": refs,
+        })
     permits.sort(key=lambda item: item["permit_ref"])
 
     recovery = state.get("recovery", {})
@@ -1853,16 +3334,24 @@ def operator_run_projection(
         _check_ref(checkpoint_ref, "checkpoint_ref")
         if not source_event_exists(checkpoint_ref):
             raise ContractError("MISSING_SOURCE_EVENT", checkpoint_ref)
-    if recovery_state in {"checkpointed", "resumed_safe", "resumed_unsafe"} and checkpoint_ref is None:
+    if (
+        recovery_state in {"checkpointed", "resumed_safe", "resumed_unsafe"}
+        and checkpoint_ref is None
+    ):
         raise ContractError("CHECKPOINT_REQUIRED")
-    recovery_refs = _operator_run_check_refs(recovery.get("evidence_refs", ()), "recovery.evidence_refs")
+    recovery_refs = _operator_run_check_refs(
+        recovery.get("evidence_refs", ()), "recovery.evidence_refs"
+    )
     for ref in recovery_refs:
         if not source_event_exists(ref):
             raise ContractError("MISSING_SOURCE_EVENT", ref)
 
     if source_versions is not None and (
         not isinstance(source_versions, Mapping)
-        or not all(isinstance(key, str) and isinstance(value, str) and value for key, value in source_versions.items())
+        or not all(
+            isinstance(key, str) and isinstance(value, str) and value
+            for key, value in source_versions.items()
+        )
     ):
         raise ContractError("INVALID_SOURCE_VERSIONS")
     versions = dict(sorted((source_versions or {}).items()))
@@ -1877,26 +3366,66 @@ def operator_run_projection(
     revoked = [item for item in permits if item["state"] in _REVOKED_PERMIT_STATES]
     authority_violated = bool(revoked) and bool(unsettled)
     evidence_missing = state.get("declared_evidence_refs") is not None and bool(
-        set(_operator_run_check_refs(state["declared_evidence_refs"], "declared_evidence_refs")) - set(evidence_refs)
+        set(
+            _operator_run_check_refs(
+                state["declared_evidence_refs"], "declared_evidence_refs"
+            )
+        )
+        - set(evidence_refs)
     )
-    evidence_health = "missing" if evidence_missing else ("degraded" if not evidence_refs and lifecycle != "pending" else "healthy")
+    evidence_health = (
+        "missing"
+        if evidence_missing
+        else ("degraded" if not evidence_refs and lifecycle != "pending" else "healthy")
+    )
 
     attention: list[dict[str, Any]] = []
     if authority_violated:
-        attention.append({"axis": "authority", "code": "REVOKED_PERMIT_WITH_UNSETTLED_EFFECT",
-                          "detail_refs": sorted({ref for item in revoked for ref in item["evidence_refs"]} | {item["effect_ref"] for item in unsettled})})
+        attention.append({
+            "axis": "authority",
+            "code": "REVOKED_PERMIT_WITH_UNSETTLED_EFFECT",
+            "detail_refs": sorted(
+                {ref for item in revoked for ref in item["evidence_refs"]}
+                | {item["effect_ref"] for item in unsettled}
+            ),
+        })
     if unsettled and lifecycle in {"paused", "completed", "cancelled", "failed"}:
-        attention.append({"axis": "effect_risk", "code": "UNSETTLED_EFFECT_OUTSIDE_RUNNING",
-                          "detail_refs": sorted(item["effect_ref"] for item in unsettled)})
+        attention.append({
+            "axis": "effect_risk",
+            "code": "UNSETTLED_EFFECT_OUTSIDE_RUNNING",
+            "detail_refs": sorted(item["effect_ref"] for item in unsettled),
+        })
     if recovery_state == "resumed_unsafe":
-        attention.append({"axis": "recovery", "code": "UNSAFE_RESUME",
-                          "detail_refs": sorted(set(recovery_refs) | ({checkpoint_ref} if checkpoint_ref else set()))})
+        attention.append({
+            "axis": "recovery",
+            "code": "UNSAFE_RESUME",
+            "detail_refs": sorted(
+                set(recovery_refs) | ({checkpoint_ref} if checkpoint_ref else set())
+            ),
+        })
     if evidence_health != "healthy":
-        attention.append({"axis": "evidence_health", "code": "EVIDENCE_" + evidence_health.upper(),
-                          "detail_refs": sorted(set(_operator_run_check_refs(state.get("declared_evidence_refs", ()), "declared_evidence_refs")) - set(evidence_refs)) if evidence_missing else sorted(set(actual_event_refs) or set(plan_event_refs))})
+        attention.append({
+            "axis": "evidence_health",
+            "code": "EVIDENCE_" + evidence_health.upper(),
+            "detail_refs": sorted(
+                set(
+                    _operator_run_check_refs(
+                        state.get("declared_evidence_refs", ()),
+                        "declared_evidence_refs",
+                    )
+                )
+                - set(evidence_refs)
+            )
+            if evidence_missing
+            else sorted(set(actual_event_refs) or set(plan_event_refs)),
+        })
     distinct_versions = sorted(set(versions.values()))
     if len(distinct_versions) > 1:
-        attention.append({"axis": "lifecycle", "code": "MIXED_SOURCE_VERSIONS", "detail_refs": sorted(versions)})
+        attention.append({
+            "axis": "lifecycle",
+            "code": "MIXED_SOURCE_VERSIONS",
+            "detail_refs": sorted(versions),
+        })
     attention.sort(key=lambda item: (item["axis"], item["code"]))
 
     projection = {
@@ -1916,7 +3445,11 @@ def operator_run_projection(
         "actual_event_refs": actual_event_refs,
         "effects": effects,
         "permits": permits,
-        "recovery": {"state": recovery_state, "checkpoint_ref": checkpoint_ref, "evidence_refs": recovery_refs},
+        "recovery": {
+            "state": recovery_state,
+            "checkpoint_ref": checkpoint_ref,
+            "evidence_refs": recovery_refs,
+        },
         "evidence_refs": evidence_refs,
         "source_versions": versions,
         "status_to_predicate": {
