@@ -1,9 +1,10 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { $hoveredTreeGroup } from '@/components/pane-shell/tree/store'
 
 import {
   blurComposerInput,
+  focusComposerInput,
   getActiveComposer,
   markActiveComposer,
   onComposerFocusRequest,
@@ -314,5 +315,56 @@ describe('shouldAutoFocusComposer', () => {
     const editor = document.createElement('div')
 
     expect(shouldAutoFocusComposer(editor, editor)).toBe(true)
+  })
+
+  it('does not auto-focus a hidden pane', () => {
+    const editor = document.createElement('div')
+    editor.setAttribute('data-pane-hidden', '')
+
+    expect(shouldAutoFocusComposer(editor, document.body, { target: 'tile:hidden' })).toBe(false)
+  })
+
+  it('lets the interacted pane focus after a split exists', () => {
+    const editor = document.createElement('div')
+
+    expect(
+      shouldAutoFocusComposer(editor, document.body, {
+        activeTreeGroup: 'group-side',
+        paneGroup: 'group-side',
+        target: 'tile:side'
+      })
+    ).toBe(true)
+    expect(
+      shouldAutoFocusComposer(editor, document.body, {
+        activeTreeGroup: 'group-main',
+        paneGroup: 'group-side',
+        target: 'tile:side'
+      })
+    ).toBe(false)
+  })
+
+  it('defaults the initial caret to the primary composer', () => {
+    const editor = document.createElement('div')
+
+    expect(shouldAutoFocusComposer(editor, document.body, { activeTreeGroup: null, target: 'main' })).toBe(true)
+    expect(shouldAutoFocusComposer(editor, document.body, { activeTreeGroup: null, target: 'tile:side' })).toBe(false)
+  })
+
+  it('does not reclaim focus after a guarded auto-focus', () => {
+    vi.useFakeTimers()
+    const editor = document.createElement('div')
+    const outside = document.createElement('button')
+    editor.tabIndex = 0
+    document.body.append(editor, outside)
+
+    try {
+      focusComposerInput(editor, { retry: false })
+      outside.focus()
+      vi.runAllTimers()
+
+      expect(document.activeElement).toBe(outside)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

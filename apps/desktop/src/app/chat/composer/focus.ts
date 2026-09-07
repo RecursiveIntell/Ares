@@ -246,13 +246,36 @@ export const getActiveComposer = (): ComposerTarget => resolveActive()
  * requests continue to bypass this predicate. */
 export const shouldAutoFocusComposer = (
   editor: HTMLElement | null,
-  activeElement: Element | null = typeof document === 'undefined' ? null : document.activeElement
+  activeElement: Element | null = typeof document === 'undefined' ? null : document.activeElement,
+  context: {
+    activeTreeGroup?: null | string
+    paneGroup?: string
+    target?: ComposerTarget
+  } = {}
 ): boolean => {
   if (!editor) {
     return false
   }
 
   const ownerDocument = editor.ownerDocument
+
+  if (editor.closest('[data-pane-hidden]')) {
+    return false
+  }
+
+  const { activeTreeGroup, paneGroup, target } = context
+
+  if (activeTreeGroup !== undefined) {
+    if (activeTreeGroup) {
+      if (paneGroup !== activeTreeGroup) {
+        return false
+      }
+    } else if (target !== 'main' && paneGroup !== 'window') {
+      // Before the first pointer/focus interaction, only the primary composer
+      // may claim the caret. Otherwise two visible split panes race on mount.
+      return false
+    }
+  }
 
   return Boolean(
     !activeElement ||
@@ -411,7 +434,7 @@ export const onComposerModelMenuRequest = (handler: (target: ComposerTarget) => 
  *   - rAF:  React just committed a `renderComposerContents` swap
  *   - 0ms:  browser focus reclaim from a click target inside an external panel
  */
-export const focusComposerInput = (el: HTMLElement | null) => {
+export const focusComposerInput = (el: HTMLElement | null, options: { retry?: boolean } = {}) => {
   if (!el) {
     return
   }
@@ -426,6 +449,11 @@ export const focusComposerInput = (el: HTMLElement | null) => {
   }
 
   focus()
+
+  if (options.retry === false) {
+    return
+  }
+
   window.requestAnimationFrame(focus)
   window.setTimeout(focus, 0)
 }

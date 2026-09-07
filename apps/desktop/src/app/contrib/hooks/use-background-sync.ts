@@ -268,6 +268,10 @@ const LIVE_SESSION_STATUS_POLL_INTERVAL_MS = 1_500
 // the interval only covers the degraded-socket edge the stream can't replay
 // (see rehydrateLiveSessionStatuses) — 30s is plenty for that.
 const LIVE_SESSION_STATUS_BACKSTOP_INTERVAL_MS = 30_000
+// Several retained panes / profile backends can emit sessions.changed in the
+// same burst. The live-status snapshot is shared by all of them, so do not
+// restart it once per tick; one trailing read per window is enough.
+const LIVE_SESSION_STATUS_TICK_GAP_MS = 1_500
 // Coalesce tick-driven sidebar list refreshes: sessions.changed fires (floored
 // to 2s server-side) on every state.db write during a streaming turn, and the
 // full list refresh is heavier than the active_list snapshot. Trailing-edge
@@ -540,7 +544,6 @@ export function useBackgroundSync({
 }: BackgroundSyncParams): void {
   const changeEventsAvailable = useStore($changeEventsAvailable)
   const cronChangeTick = useStore($cronChangeTick)
-  const sessionsChangeTick = useStore($sessionsChangeTick)
   const activeTranscriptBusy = useStore($busy)
   const activeTranscriptRefreshPendingRef = useRef<string | null>(null)
   // Tile reconcile state (#93942 slice 1): shared sequence guard + per-tile
@@ -636,13 +639,20 @@ export function useBackgroundSync({
 
     let cancelled = false
     let inFlight = false
+    let pending = false
+    let lastRefreshAt = 0
+    let tickTimer: null | number = null
 
     const refreshLiveStatuses = async () => {
-      if (inFlight) {
+      if (cancelled || inFlight) {
+        pending = true
+
         return
       }
 
+      pending = false
       inFlight = true
+      lastRefreshAt = Date.now()
 
       try {
         const response = await requestGateway<LiveSessionStatusResponse>('session.active_list', {})
@@ -655,23 +665,47 @@ export function useBackgroundSync({
         // still work as before; leave the current sidebar state untouched.
       } finally {
         inFlight = false
+
+        if (pending && !cancelled) {
+          queueLiveStatusRefresh()
+        }
       }
+    }
+
+    const queueLiveStatusRefresh = () => {
+      pending = true
+
+      if (cancelled || inFlight || tickTimer !== null) {
+        return
+      }
+
+      const delay = Math.max(0, LIVE_SESSION_STATUS_TICK_GAP_MS - (Date.now() - lastRefreshAt))
+
+      tickTimer = window.setTimeout(() => {
+        tickTimer = null
+        void refreshLiveStatuses()
+      }, delay)
     }
 
     const dispose = visiblePoll(
       changeEventsAvailable ? LIVE_SESSION_STATUS_BACKSTOP_INTERVAL_MS : LIVE_SESSION_STATUS_POLL_INTERVAL_MS,
-      () => void refreshLiveStatuses()
+      queueLiveStatusRefresh
     )
 
-    void refreshLiveStatuses()
+    const unsubscribeSessions = changeEventsAvailable ? $sessionsChangeTick.listen(queueLiveStatusRefresh) : () => {}
+
+    queueLiveStatusRefresh()
 
     return () => {
       cancelled = true
       dispose()
+      unsubscribeSessions()
+
+      if (tickTimer !== null) {
+        window.clearTimeout(tickTimer)
+      }
     }
-    // sessionsChangeTick: each sessions.changed broadcast re-seeds immediately
-    // via the effect re-run (already coalesced to 2s server-side).
-  }, [activeGatewayProfile, changeEventsAvailable, gatewayState, requestGateway, sessionsChangeTick])
+  }, [activeGatewayProfile, changeEventsAvailable, gatewayState, requestGateway])
 
   // sessions.changed also means the *stored* list may have new rows (a cron
   // run's session, an inbound messaging turn creating a thread). The full list
@@ -718,6 +752,11 @@ export function useBackgroundSync({
       const now = Date.now()
 
       if (!isTypingBurstActive(now)) {
+        if (timer !== null) {
+          window.clearTimeout(timer)
+          timer = null
+        }
+
         if (typingDeferTimer !== null) {
           window.clearTimeout(typingDeferTimer)
           typingDeferTimer = null

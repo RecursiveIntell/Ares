@@ -7,8 +7,11 @@ import '@/store/suggestion-providers/mcp'
 import '@/store/suggestion-providers/skill'
 
 import { useAui, useAuiState, useComposerRuntime } from '@assistant-ui/react'
+import { useStore } from '@nanostores/react'
 import { type RefObject, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 
+import { usePaneGroup } from '@/components/pane-shell/pane-visibility'
+import { $activeTreeGroup } from '@/components/pane-shell/tree/store'
 import { SLASH_COMMAND_RE } from '@/lib/chat-runtime'
 import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
 import {
@@ -78,6 +81,8 @@ export function useComposerDraft({
   const composerRuntime = useComposerRuntime()
   // Which composer this is on the focus bus + which attachment set it owns.
   const { attachments: attachmentScope, target } = useComposerScope()
+  const paneGroup = usePaneGroup()
+  const activeTreeGroup = useStore($activeTreeGroup)
 
   // Coarse edges only — these flip rarely (empty↔non-empty, the `?` help sigil,
   // steerable-vs-slash), so typing within a line costs no render.
@@ -124,8 +129,8 @@ export function useComposerDraft({
 
   const [focusRequestId, setFocusRequestId] = useState(0)
 
-  const focusInput = useCallback(() => {
-    focusComposerInput(editorRef.current)
+  const focusInput = useCallback((retry = true) => {
+    focusComposerInput(editorRef.current, { retry })
     markActiveComposer(target)
   }, [target])
 
@@ -191,10 +196,17 @@ export function useComposerDraft({
     // automatic caret move.
     markActiveComposer(target)
 
-    if (!inputDisabled && shouldAutoFocusComposer(editorRef.current)) {
-      focusInput()
+    if (
+      !inputDisabled &&
+      shouldAutoFocusComposer(editorRef.current, undefined, {
+        activeTreeGroup,
+        paneGroup,
+        target
+      })
+    ) {
+      focusInput(false)
     }
-  }, [focusInput, focusKey, inputDisabled, target])
+  }, [activeTreeGroup, focusInput, focusKey, inputDisabled, paneGroup, target])
 
   // Explicit focus-bus and programmatic insert requests ARE user intent and
   // retain the existing triple-focus behavior across React/browser commits.

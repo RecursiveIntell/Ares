@@ -413,6 +413,64 @@ describe('active transcript refresh', () => {
 
     expect(refresh).toHaveBeenCalledTimes(1)
   })
+
+  it('coalesces live-status reads from several pane/profile change ticks', async () => {
+    vi.useFakeTimers()
+    $changeEventsAvailable.set(true)
+
+    const requestGateway = vi.fn(async (method: string) =>
+      method === 'session.active_list' ? { sessions: [] } : { cwd: '' }
+    )
+
+    const stable = {
+      refreshActiveTranscript: vi.fn(async () => undefined),
+      refreshCronJobs: vi.fn(),
+      refreshCurrentModel: vi.fn(),
+      refreshHermesConfig: vi.fn(),
+      refreshMessagingSessions: vi.fn(),
+      refreshSessions: vi.fn(),
+      updateSessionState: vi.fn()
+    }
+
+    renderHook(() =>
+      useBackgroundSync({
+        activeConnectionId: 'local',
+        activeGatewayProfile: 'default',
+        activeIsMessaging: false,
+        activeSessionId: null,
+        activeStoredSessionId: null,
+        freshDraftReady: false,
+        gatewayState: 'open',
+        ...stable,
+        requestGateway: requestGateway as never
+      })
+    )
+
+    await act(async () => {
+      vi.advanceTimersByTime(0)
+      await Promise.resolve()
+    })
+    expect(requestGateway).toHaveBeenCalledTimes(1)
+    requestGateway.mockClear()
+
+    act(() => {
+      for (let index = 0; index < 5; index += 1) {
+        notifySessionsChanged()
+      }
+    })
+
+    await act(async () => {
+      vi.advanceTimersByTime(1_499)
+      await Promise.resolve()
+    })
+    expect(requestGateway).not.toHaveBeenCalled()
+
+    await act(async () => {
+      vi.advanceTimersByTime(1)
+      await Promise.resolve()
+    })
+    expect(requestGateway).toHaveBeenCalledTimes(1)
+  })
 })
 
 describe('reconcileActiveTranscript', () => {
