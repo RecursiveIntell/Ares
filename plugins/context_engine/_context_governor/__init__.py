@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import signal
 import shutil
 import subprocess
 import threading
@@ -177,6 +178,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         self.last_receipt_id: str | None = None
         self.last_error: str | None = None
         self.last_warning: str | None = None
+        self.last_outcome: dict[str, Any] | None = None
         self.last_summary_safety: dict[str, Any] | None = None
         self.last_compaction_metrics: dict[str, Any] | None = None
         self.fallback_event_count = 0
@@ -326,6 +328,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         clone.last_receipt_id = self.last_receipt_id
         clone.last_error = self.last_error
         clone.last_warning = self.last_warning
+        clone.last_outcome = copy.deepcopy(self.last_outcome)
         clone.last_summary_safety = copy.deepcopy(self.last_summary_safety)
         clone.last_compaction_metrics = copy.deepcopy(self.last_compaction_metrics)
         clone.fallback_event_count = self.fallback_event_count
@@ -838,6 +841,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         self.last_receipt_id = None
         self.last_error = None
         self.last_warning = None
+        self.last_outcome = None
         self.last_summary_safety = None
         self.last_compaction_metrics = None
         self.fallback_event_count = 0
@@ -1241,6 +1245,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         self._last_summary_error = None
         self._last_summary_fallback_used = False
         self._last_compression_made_progress = False
+        self.last_outcome = None
         if not messages:
             return messages
         self._ensure_inflight_state()
@@ -1292,6 +1297,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         self._last_summary_error = None
         self._last_summary_fallback_used = False
         self._last_compression_made_progress = False
+        self.last_outcome = None
 
         if not messages:
             return messages
@@ -1574,6 +1580,17 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             finalized_messages = response.get("compacted_messages")
             if not isinstance(finalized_messages, list):
                 raise ValueError("finalize returned no compacted_messages list")
+            finalized_receipt = response.get("receipt") or {}
+            finalized_tokens = finalized_receipt.get("compacted_approx_tokens")
+            if (
+                isinstance(finalized_tokens, int)
+                and not isinstance(finalized_tokens, bool)
+                and finalized_tokens > target_tokens
+            ):
+                raise RuntimeError(
+                    "CannotMeetTarget: final emitted transcript exceeds the "
+                    f"admitted target ({finalized_tokens} > {target_tokens})"
+                )
             compacted = [
                 self._message_from_governor(message)
                 for message in finalized_messages
@@ -1643,6 +1660,12 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 "lineage_session_id": self._governor_session_id(),
             }
             self.last_error = None
+            self.last_outcome = {
+                "kind": "compacted_pending_host_commit",
+                "receipt_id": pending_receipt_id,
+                "target_tokens": target_tokens,
+                "final_tokens": finalized_tokens,
+            }
 
             return compacted or messages
         except Exception as exc:
@@ -1659,6 +1682,26 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             self._last_compress_aborted = True
             self._last_summary_error = str(exc)
             self._last_compression_made_progress = False
+            error_text = str(exc)
+            if "CannotMeetTarget" in error_text or "context budget exceeded" in error_text:
+                self.last_outcome = {
+                    "kind": "cannot_meet_target",
+                    "error": self._safe_summary_diagnostic(error_text),
+                    "target_tokens": target_tokens,
+                }
+            elif "LineageGenerationLimit" in error_text or (
+                "generation" in error_text and "maximum" in error_text
+            ):
+                self.last_outcome = {
+                    "kind": "continuation_required",
+                    "error": self._safe_summary_diagnostic(error_text),
+                    "generation_limit": self._policy.get("max_lineage_generation"),
+                }
+            else:
+                self.last_outcome = {
+                    "kind": "compaction_failed_closed",
+                    "error": self._safe_summary_diagnostic(error_text),
+                }
             failure_type = self._classify_subprocess_error(exc)
             if failure_type == "auth":
                 logger.error("context-governor auth failure: %s", exc)
@@ -1688,6 +1731,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             "last_receipt_id": self.last_receipt_id,
             "last_error": self.last_error,
             "last_warning": self.last_warning,
+            "last_outcome": copy.deepcopy(self.last_outcome),
             "last_summary_safety": self.last_summary_safety,
             "last_compaction_metrics": copy.deepcopy(self.last_compaction_metrics),
             "fallback_event_count": self.fallback_event_count,
@@ -3398,21 +3442,68 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         *,
         pass_fds: tuple[int, ...] = (),
     ) -> dict[str, Any]:
-        proc = subprocess.run(
-            [str(self.binary), *args],
-            input=json.dumps(payload, ensure_ascii=False),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=self.timeout_sec,
-            pass_fds=pass_fds,
-            check=False,
-        )
+        command = [str(self.binary), *args]
+        popen_kwargs: dict[str, Any] = {
+            "stdin": subprocess.PIPE,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+        }
+        if os.name == "nt":
+            creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            if creationflags:
+                popen_kwargs["creationflags"] = creationflags
+        else:
+            # Keep the governor worker and any descendants in a killable group.
+            # This is required because a timeout is a cancellation boundary,
+            # not permission for a detached worker to publish later.
+            popen_kwargs["start_new_session"] = True
+            popen_kwargs["pass_fds"] = pass_fds
+        proc = subprocess.Popen(command, **popen_kwargs)
+        try:
+            stdout, stderr = proc.communicate(
+                input=json.dumps(payload, ensure_ascii=False),
+                timeout=self.timeout_sec,
+            )
+        except subprocess.TimeoutExpired as exc:
+            self._terminate_process_group(proc)
+            try:
+                stdout, stderr = proc.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                stdout, stderr = proc.communicate()
+            raise subprocess.TimeoutExpired(
+                command,
+                self.timeout_sec,
+                output=stdout or exc.output,
+                stderr=stderr or exc.stderr,
+            ) from exc
         if proc.returncode != 0:
             raise RuntimeError(
-                (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
+                (stderr or stdout or f"exit {proc.returncode}").strip()
             )
-        return json.loads(proc.stdout)
+        return json.loads(stdout)
+
+    @staticmethod
+    def _terminate_process_group(proc: subprocess.Popen) -> None:
+        """Terminate a timed-out worker before releasing governed descriptors."""
+        if proc.poll() is not None:
+            return
+        if os.name != "nt":
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                return
+            try:
+                proc.wait(timeout=0.5)
+                return
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    return
+        else:
+            proc.terminate()
 
     def _prepare_response(self, response: dict[str, Any]) -> dict[str, Any]:
         """Durably stage a verified receipt without publishing a lineage tip."""
