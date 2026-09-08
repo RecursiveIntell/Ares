@@ -1,0 +1,125 @@
+name: Port vetted Hermes efficiency commits once
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  port:
+    if: github.event.pull_request.head.ref == 'upstream/hermes-efficiency-sync-20260907'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout Ares PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: upstream/hermes-efficiency-sync-20260907
+          fetch-depth: 0
+
+      - name: Configure Git identity
+        run: |
+          git config user.name "Ares Upstream Port Bot"
+          git config user.email "ares-upstream-port@users.noreply.github.com"
+
+      - name: Fetch Hermes upstream
+        run: |
+          git remote add hermes https://github.com/NousResearch/hermes-agent.git
+          git fetch --no-tags hermes main
+
+      - name: Cherry-pick vetted efficiency and correctness commits
+        shell: bash
+        run: |
+          set -euo pipefail
+          commits=(
+            5180601a6ab2aa43b19540a5692914ad7b2630a9
+            4155ea97e881e12d68688fc323abbd6c6bcce0f3
+            0534f1033b4547aed86b235ecc1ec18f01492d90
+            32fe1293244f186c75e82090ed06fe416739f146
+            6064668c8fd2dbbb232ea073b32c9d06d932fa56
+            cb0b66c16170042d22ffb9714ec19f601a3c5cc5
+            8b681f70ea505959cf7721be40d9dad8f3d33c8f
+            b363fee510a048b010480ca7941126b8613fa6df
+            bbbd3b100fb353bc72cb5c887d84bca9697e8bc1
+            4a1780228008572445d8a5d98f30340acf6e9695
+            8196d409a06eeaf2afaba910f673b80b532c8140
+            2d783a15eb0b582938e96d4b0ccbe97f6a1a849a
+            9fbb3b716a5786c5dd2c986b610fdf9ae9bae6ad
+            6a2b3f1ebf6eabc09e5dbb14236df39bb64de2ac
+            d3275acf80a05ca79e6ce817d4965283ff7f6f11
+            8cab422ab09332c1867af81ee4e910878ac1172b
+            87597d30c8b834ed276bd5361451fd36aad0ffa7
+            11ed840431aba7ca3fd51508ecf11bf234131762
+            7caee2898b70d445f0dcc08e198394b18b393b12
+            c3b411dfb77fd8a1bad34fb80d4ef1f0e2b6f38e
+            c96568f66ca49d27beec4545bee9740b09d64018
+            2b55ded1ac5f3b41cdc580974e745631dac1bb53
+            561b053f794a1781868bb032029d589c67708119
+            e245e40f731ce0e723e993803f3286440034c30b
+            71516214c3d7d59c6d94b6b5a3b325c506dc7cb2
+            9160c4e27e32b5984b01cf5514fd4f6ef3471d53
+            869432301b03f29c1384421a97459e8407d9aea1
+            802f0f97adfbf3708888f9d21ba85ca80e0cec87
+            6a04ea67c0e75ef1218bf4ceaac071c2f16a0701
+            bbcf1ee180f170032079996b87f296acf2af7456
+            0d6106eab8a5b8afc3357d6e1030723b8be129f2
+            c3ce41645cb08f39e7dd5739dcfd72527096896f
+            6e2b8e070d28b1a3381a3fb290b6b8d6cce13cef
+          )
+          : > /tmp/ported-shas.txt
+          for sha in "${commits[@]}"; do
+            echo "=== cherry-pick $sha ==="
+            if ! git cherry-pick -x "$sha"; then
+              echo "Conflict while cherry-picking $sha" >&2
+              git status --short >&2
+              git diff --name-only --diff-filter=U >&2 || true
+              git cherry-pick --abort || true
+              exit 42
+            fi
+            echo "$sha" >> /tmp/ported-shas.txt
+          done
+
+      - name: Syntax validation
+        run: |
+          python -m compileall -q agent tools hermes_cli gateway cron run_agent.py
+
+      - name: Write upstream port receipt
+        shell: bash
+        run: |
+          {
+            echo '# Hermes selective upstream port receipt'
+            echo
+            echo '- Source: `NousResearch/hermes-agent`'
+            echo '- Target: `RecursiveIntell/Ares`'
+            echo '- Method: literal `git cherry-pick -x`, fail-closed on conflicts'
+            echo '- Scope: vetted efficiency, lifecycle reliability, model/context correctness, and platform fixes that do not intentionally replace Ares authority/permit/context owners'
+            echo
+            echo '## Ported upstream commits'
+            while read -r sha; do
+              subject=$(git show -s --format=%s "$sha")
+              echo "- \`$sha\` — $subject"
+            done < /tmp/ported-shas.txt
+            echo
+            echo '## Explicitly deferred from this pass'
+            echo '- Delegation fallback-policy commits: require Ares authority-scope adaptation rather than direct cherry-pick.'
+            echo '- Owner-mailbox / durable Bot Chat ingress commits: require review against Ares managed-admission, receipt, and goal/session ownership semantics.'
+            echo '- Group-chat parallelism changes: alter scheduling semantics and need validation against Ares specialist/authority policy.'
+            echo '- Completion-retention and approval-parser clusters not included in the first automated batch; evaluate after this batch proves clean composition.'
+            echo
+            echo '## Validation performed by bootstrap'
+            echo '- Cherry-picks must apply without conflict; no automatic conflict resolution is permitted.'
+            echo '- Python compileall over agent/tools/hermes_cli/gateway/cron/run_agent.py.'
+            echo '- Repository PR CI remains the build-certified gate.'
+          } > HERMES_UPSTREAM_PORT_2026-09-07.md
+          git add HERMES_UPSTREAM_PORT_2026-09-07.md
+          git commit -m 'docs(upstream): record vetted Hermes port receipt'
+
+      - name: Remove one-shot bootstrap workflow
+        run: |
+          git rm .github/workflows/port-hermes-efficiency-once.yml
+          git commit -m 'chore(upstream): remove one-shot port bootstrap'
+
+      - name: Push ported branch
+        run: git push origin HEAD:upstream/hermes-efficiency-sync-20260907
