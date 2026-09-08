@@ -1,0 +1,57 @@
+name: Port dependent Hermes file-op efficiency chain once
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  port-fileops:
+    if: github.event.pull_request.head.ref == 'upstream/hermes-efficiency-sync-20260907'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: upstream/hermes-efficiency-sync-20260907
+          fetch-depth: 0
+      - name: Configure Git
+        run: |
+          git config user.name "Ares Upstream Port Bot"
+          git config user.email "ares-upstream-port@users.noreply.github.com"
+          git remote add hermes https://github.com/NousResearch/hermes-agent.git
+          git fetch --no-tags hermes main
+      - name: Port file-operation chain in dependency order
+        shell: bash
+        run: |
+          set -euo pipefail
+          for sha in \
+            9fbb3b716a5786c5dd2c986b610fdf9ae9bae6ad \
+            d3275acf80a05ca79e6ce817d4965283ff7f6f11 \
+            8cab422ab09332c1867af81ee4e910878ac1172b
+          do
+            echo "=== cherry-pick $sha ==="
+            if ! git cherry-pick -x "$sha"; then
+              echo "Dependency-ordered file-op port still conflicts at $sha" >&2
+              git status --short >&2 || true
+              git diff --name-only --diff-filter=U >&2 || true
+              git cherry-pick --abort || true
+              exit 42
+            fi
+          done
+      - name: Validate file operations
+        run: |
+          git diff --check
+          python -m compileall -q tools/file_operations.py tests/tools/file_ops_fakes.py
+          python -m pytest -q \
+            tests/tools/test_file_ops_single_roundtrip.py \
+            tests/tools/test_file_operations.py \
+            tests/tools/test_file_operations_edge_cases.py \
+            tests/tools/test_file_ops_native_local_read.py
+      - name: Remove bootstrap and push
+        run: |
+          git rm .github/workflows/port-hermes-fileops-once.yml
+          git commit -m 'chore(upstream): remove file-op port bootstrap'
+          git push origin HEAD:upstream/hermes-efficiency-sync-20260907
