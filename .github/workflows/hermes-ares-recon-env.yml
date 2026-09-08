@@ -35,7 +35,8 @@ jobs:
           set -euo pipefail
           out="$RUNNER_TEMP/recon-env"
           mkdir -p "$out"
-          python_root=$(uv python find 3.11 | xargs dirname | xargs dirname)
+          python_root=$(.venv/bin/python -c 'import sys; print(sys.base_prefix)')
+          test -f "$python_root/lib/python3.11/os.py"
           tar -czf "$out/python311.tar.gz" -C "$python_root" .
           tar -czf "$out/site-packages.tar.gz" -C .venv/lib/python3.11 site-packages
           .venv/bin/python -VV > "$out/python-version.txt"
