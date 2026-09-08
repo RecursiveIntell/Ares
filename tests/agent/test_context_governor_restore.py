@@ -32,18 +32,18 @@ from tools.todo_tool import TODO_INJECTION_HEADER
 
 
 def _bind_fixture(engine):
-    """Fixture-only held-descriptor authority; no path/key material exists."""
-    binding = SimpleNamespace(
-        command_args=lambda: [
-            "--governed-key-fd",
-            "71",
-            "--governed-snapshot-fd",
-            "72",
-        ],
-        close=lambda: None,
-    )
-    engine._key_binding = binding
-    engine._certified_store_args = binding.command_args
+    """Route certified fixture calls without opening real secret descriptors."""
+    command_args = [
+        "--governed-key-fd",
+        "71",
+        "--governed-snapshot-fd",
+        "72",
+    ]
+
+    def run_certified(args, payload):
+        return engine._run_json([*args, *command_args], payload)
+
+    engine._run_certified_json = run_certified
 
 
 def test_ares_governor_is_discoverable_as_a_context_engine():
@@ -2028,13 +2028,13 @@ def test_real_binary_retries_activation_in_same_process_after_host_commit(
         raw_run_json = engine._run_json
         activation_calls = 0
 
-        def fail_first_activation(args, payload):
+        def fail_first_activation(args, payload, *, pass_fds=()):
             nonlocal activation_calls
             if args[0] == "activate-v2":
                 activation_calls += 1
                 if activation_calls == 1:
                     raise TimeoutError("synthetic post-commit activation outage")
-            return raw_run_json(args, payload)
+            return raw_run_json(args, payload, pass_fds=pass_fds)
 
         engine._run_json = fail_first_activation
         with pytest.raises(TimeoutError, match="post-commit activation outage"):
