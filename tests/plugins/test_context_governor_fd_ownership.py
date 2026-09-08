@@ -128,3 +128,52 @@ def test_detached_worker_binding_does_not_close_new_operation_binding() -> None:
     assert not old_thread.is_alive()
     assert old_worker.close_count == 1
     assert results == {"old": {"marker": 51}, "new": {"marker": 61}}
+
+
+def test_identical_same_lineage_compressions_join_one_owner() -> None:
+    engine = ContextGovernorEngine.__new__(ContextGovernorEngine)
+    engine.session_id = "coalesced-session"
+    engine._lineage_session_id = "coalesced-session"
+    engine.last_receipt_id = "ctxr_parent"
+    engine._policy = {"allocator": "deterministic_v1", "budget_mode": "hard_cascade"}
+    engine.timeout_sec = 1
+    started = threading.Event()
+    release = threading.Event()
+    calls = 0
+
+    def compress_once(messages, current_tokens, focus_topic):
+        nonlocal calls
+        calls += 1
+        started.set()
+        assert release.wait(2)
+        return [{"role": "user", "content": "bounded result"}]
+
+    setattr(engine, "_compress_once", compress_once)
+    messages = [{"role": "user", "content": "same request"}]
+    results: dict[str, list[dict]] = {}
+    owner = threading.Thread(
+        target=lambda: results.setdefault("owner", engine.compress(messages, 100, "focus"))
+    )
+    owner.start()
+    assert started.wait(2)
+    joined_result: dict[str, list[dict]] = {}
+    follower = threading.Thread(
+        target=lambda: joined_result.setdefault(
+            "joined", engine.compress(messages, 100, "focus")
+        )
+    )
+    follower.start()
+    # The follower must join the owner rather than invoke the fake expensive
+    # operation a second time while the owner remains blocked.
+    threading.Event().wait(0.05)
+    assert calls == 1
+    release.set()
+    owner.join(2)
+    follower.join(2)
+
+    assert not owner.is_alive()
+    assert not follower.is_alive()
+    joined = joined_result["joined"]
+    assert calls == 1
+    assert joined == [{"role": "user", "content": "bounded result"}]
+    assert results["owner"] == joined

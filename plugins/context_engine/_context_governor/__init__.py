@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -61,6 +62,15 @@ class _SummaryLLMResult:
 
     content: str
     route: _SummaryLLMRoute
+
+
+@dataclass
+class _InflightCompression:
+    """Non-authoritative join state for one identical compaction request."""
+
+    event: threading.Event
+    result: List[Dict[str, Any]] | None = None
+    error: BaseException | None = None
 
 
 class ContextGovernorActivationError(RuntimeError):
@@ -154,6 +164,10 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         # invisible to parent selection/search/expand until the host confirms
         # its transcript commit through commit_pending_compression().
         self._pending_admission: dict[str, Any] | None = None
+        # In-flight coalescing is only a compute optimization. Rust receipt
+        # preparation/activation remains the authoritative publication fence.
+        self._inflight_lock = threading.RLock()
+        self._inflight_compressions: dict[str, _InflightCompression] = {}
         self.last_prompt_tokens = 0
         self.last_completion_tokens = 0
         self.last_total_tokens = 0
@@ -1159,11 +1173,120 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         )
         return None
 
+    def _ensure_inflight_state(self) -> None:
+        """Create coalescing state for lightweight test/clone instances too."""
+        if not hasattr(self, "_inflight_lock"):
+            self._inflight_lock = threading.RLock()
+        if not hasattr(self, "_inflight_compressions"):
+            self._inflight_compressions = {}
+        if not hasattr(self, "_pending_admission"):
+            self._pending_admission = None
+
+    def _release_inflight_compression(self, key: str | None) -> None:
+        if not key:
+            return
+        self._ensure_inflight_state()
+        with self._inflight_lock:
+            self._inflight_compressions.pop(key, None)
+
+    def _compression_coalescing_key(
+        self,
+        messages: List[Dict[str, Any]],
+        current_tokens: int | None,
+        focus_topic: str | None,
+    ) -> str:
+        transcript = json.dumps(
+            messages,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        policy = getattr(self, "_policy", {})
+        lineage_id = (
+            getattr(self, "_lineage_session_id", "")
+            or getattr(self, "session_id", "")
+            or "default"
+        )
+        payload = {
+            "logical_lineage_id": lineage_id,
+            "expected_parent_receipt_id": getattr(self, "last_receipt_id", None),
+            "original_transcript_sha256": hashlib.sha256(
+                transcript.encode("utf-8")
+            ).hexdigest(),
+            "effective_compaction_policy_digest": hashlib.sha256(
+                json.dumps(
+                    policy,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                ).encode("utf-8")
+            ).hexdigest(),
+            "current_tokens": current_tokens,
+            "focus_topic": focus_topic,
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
     def compress(
         self,
         messages: List[Dict[str, Any]],
-        current_tokens: int = None,
-        focus_topic: str = None,
+        current_tokens: int | None = None,
+        focus_topic: str | None = None,
+    ) -> List[Dict[str, Any]]:
+        """Coalesce exact duplicate work while keeping Rust publication authoritative."""
+        self._last_compress_aborted = False
+        self._last_summary_error = None
+        self._last_summary_fallback_used = False
+        self._last_compression_made_progress = False
+        if not messages:
+            return messages
+        self._ensure_inflight_state()
+        # Pending activation recovery is a transactional operation, not
+        # duplicate compute. Never let a cached coalesced result bypass retry,
+        # reconciliation, or typed indeterminate state.
+        if self._pending_admission is not None:
+            return self._compress_once(messages, current_tokens, focus_topic)
+        key = self._compression_coalescing_key(messages, current_tokens, focus_topic)
+        with self._inflight_lock:
+            operation = self._inflight_compressions.get(key)
+            owner = operation is None
+            if owner:
+                operation = _InflightCompression(event=threading.Event())
+                self._inflight_compressions[key] = operation
+        assert operation is not None
+        if not owner:
+            timeout = max(30, int(getattr(self, "timeout_sec", 30)) * 4)
+            if not operation.event.wait(timeout=timeout):
+                raise TimeoutError("coalesced context-governor operation did not complete")
+            if operation.error is not None:
+                raise operation.error
+            return copy.deepcopy(operation.result or messages)
+        try:
+            result = self._compress_once(messages, current_tokens, focus_topic)
+        except BaseException as exc:
+            with self._inflight_lock:
+                operation.error = exc
+                self._inflight_compressions.pop(key, None)
+                operation.event.set()
+            raise
+        else:
+            with self._inflight_lock:
+                operation.result = copy.deepcopy(result)
+                if self._pending_admission is not None:
+                    self._pending_admission["coalescing_key"] = key
+                else:
+                    self._inflight_compressions.pop(key, None)
+                operation.event.set()
+            return result
+
+    def _compress_once(
+        self,
+        messages: List[Dict[str, Any]],
+        current_tokens: int | None = None,
+        focus_topic: str | None = None,
     ) -> List[Dict[str, Any]]:
         self._last_compress_aborted = False
         self._last_summary_error = None
@@ -3439,7 +3562,9 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         # Rust has atomically activated the receipt. Clear local pending state
         # before best-effort bookkeeping so a later Python exception cannot
         # make the host try to discard an already-active receipt.
+        coalescing_key = pending.get("coalescing_key")
         self._pending_admission = None
+        self._release_inflight_compression(coalescing_key)
         try:
             generation = info.get("generation")
             if isinstance(generation, int) and not isinstance(generation, bool):
@@ -3513,11 +3638,14 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         if pending is None:
             return True
         receipt_id = str(pending.get("receipt_id") or "")
+        coalescing_key = pending.get("coalescing_key")
         if not receipt_id:
             self._pending_admission = None
+            self._release_inflight_compression(coalescing_key)
             return True
         self._discard_pending_receipt(receipt_id)
         self._pending_admission = None
+        self._release_inflight_compression(coalescing_key)
         if self.last_compaction_metrics is not None:
             self.last_compaction_metrics["integrity_result"] = "pending_discarded"
         return True
