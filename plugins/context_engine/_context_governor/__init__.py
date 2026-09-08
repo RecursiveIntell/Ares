@@ -34,7 +34,6 @@ from hermes_constants import get_hermes_home
 from plugins.context_engine._context_governor.key_state import (
     ContextGovernorKeyError,
     ContextGovernorKeyState,
-    GovernedKeyBinding,
 )
 
 logger = logging.getLogger(__name__)
@@ -210,7 +209,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         # Ares owns lifecycle under the profile root. No config-supplied key
         # path is ever a canonical signing authority.
         self._key_state = ContextGovernorKeyState(get_hermes_home(), self.binary)
-        self._key_binding: GovernedKeyBinding | None = None
+
         self._unsafe_configured_hmac_path: str | None = None
         self._capabilities: dict[str, Any] | None = None
         # Runtime model credentials are refreshed by update_model.  Keep them
@@ -475,12 +474,11 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 },
                 "focus": None,
             }
-            candidate = self._run_json(
+            candidate = self._run_certified_json(
                 [
                     "compact-v2",
                     "--dir",
                     store_dir,
-                    *self._certified_store_args(),
                 ],
                 request,
             )
@@ -494,8 +492,8 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             if not isinstance(receipt_id, str) or not isinstance(messages, list):
                 raise ValueError("compact-v2 omitted receipt identity or messages")
 
-            finalized = self._run_json(
-                ["finalize-v2", *self._certified_store_args()],
+            finalized = self._run_certified_json(
+                ["finalize-v2"],
                 {
                     "candidate": candidate,
                     "compacted_messages": messages,
@@ -510,12 +508,11 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             ):
                 raise ValueError("finalize-v2 changed or omitted receipt identity")
 
-            prepared = self._run_json(
+            prepared = self._run_certified_json(
                 [
                     "prepare-v2",
                     "--dir",
                     store_dir,
-                    *self._certified_store_args(),
                 ],
                 finalized,
             )
@@ -527,14 +524,13 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             ):
                 raise ValueError("prepare-v2 did not verify the finalized receipt")
 
-            discarded = self._run_json(
+            discarded = self._run_certified_json(
                 [
                     "discard-v2",
                     "--dir",
                     store_dir,
                     "--receipt",
                     receipt_id,
-                    *self._certified_store_args(),
                 ],
                 {},
             )
@@ -552,15 +548,21 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 "stages": ["compact-v2", "finalize-v2", "prepare-v2", "discard-v2"],
             }
 
-    def _certified_store_args(self) -> list[str]:
+    def _run_certified_json(
+        self, args: list[str], payload: dict[str, Any]
+    ) -> dict[str, Any]:
         try:
-            if self._key_binding is not None:
-                self._key_binding.close()
             binding = self._key_state.active_binding()
         except ContextGovernorKeyError as exc:
             raise ContextGovernorActivationError(str(exc)) from exc
-        self._key_binding = binding
-        return binding.command_args()
+        try:
+            return self._run_json(
+                [*args, *binding.command_args()],
+                payload,
+                pass_fds=binding.pass_fds,
+            )
+        finally:
+            binding.close()
 
     def update_model(
         self,
@@ -760,7 +762,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         use context_search/context_expand to recover specific details.
         """
         try:
-            receipt_ids = self._run_json(
+            receipt_ids = self._run_certified_json(
                 [
                     "search",
                     "--dir",
@@ -769,7 +771,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                     "",
                     "--top-k",
                     "1",
-                    *self._certified_store_args(),
+
                 ],
                 {},
             )
@@ -1031,7 +1033,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
     def handle_tool_call(self, name: str, args: Dict[str, Any], **kwargs) -> str:
         try:
             if name == "context_expand":
-                result = self._run_json(
+                result = self._run_certified_json(
                     [
                         "expand",
                         "--dir",
@@ -1042,7 +1044,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                         args["item_id"],
                         "--max-chars",
                         str(args.get("max_chars", 100000)),
-                        *self._certified_store_args(),
+
                     ],
                     {},
                 )
@@ -1062,10 +1064,9 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 scope = args.get("scope", "all")
                 cmd = ["search", "--dir", str(self.store_dir), "--query", args["query"]]
                 cmd.extend(["--top-k", str(args.get("top_k", 10))])
-                cmd.extend(self._certified_store_args())
                 if scope != "all":
                     cmd.extend(["--scope", scope])
-                result = self._run_json(cmd, {})
+                result = self._run_certified_json(cmd, {})
                 return json.dumps(result)
             elif name == "context_status":
                 return json.dumps(self.get_status())
@@ -1242,8 +1243,6 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             len(source_messages), self.protect_first_n + telemetry_protect_last_n
         )
 
-        certified_args = self._certified_store_args()
-        assert self._key_binding is not None
         governor_messages = [
             self._message_to_governor(m, i)
             for i, m in enumerate(source_messages)
@@ -1283,12 +1282,12 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             "focus": focus_topic,
         }
         try:
-            response = self._run_json(
+            response = self._run_certified_json(
                 [
                     "compact-v2",
                     "--dir",
                     str(self.store_dir),
-                    *certified_args,
+
                 ],
                 request,
             )
@@ -2250,7 +2249,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         session_sha256 = hashlib.sha256(governor_session_id.encode("utf-8")).hexdigest()
         session_marker = f"llm_checkpoint_session_sha256={session_sha256}"
         try:
-            result = self._run_json(
+            result = self._run_certified_json(
                 [
                     "search",
                     "--dir",
@@ -2261,7 +2260,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                     "summary",
                     "--top-k",
                     str(min(1024, max(64, maximum + 1))),
-                    *self._certified_store_args(),
+
                 ],
                 {},
             )
@@ -2378,8 +2377,8 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 if isinstance(message, dict)
             ],
         }
-        finalized = self._run_json(
-            ["finalize-v2", *self._certified_store_args()],
+        finalized = self._run_certified_json(
+            ["finalize-v2"],
             payload,
         )
         if not isinstance(finalized, dict):
@@ -3269,23 +3268,23 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             return max(512, int(current_tokens * 0.20))
         return 8000
 
-    def _run_json(self, args: list[str], payload: dict[str, Any]) -> dict[str, Any]:
-        binding = self._key_binding
-        try:
-            proc = subprocess.run(
-                [str(self.binary), *args],
-                input=json.dumps(payload, ensure_ascii=False),
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=self.timeout_sec,
-                pass_fds=binding.pass_fds if binding else (),
-                check=False,
-            )
-        finally:
-            if binding is not None:
-                binding.close()
-                self._key_binding = None
+    def _run_json(
+        self,
+        args: list[str],
+        payload: dict[str, Any],
+        *,
+        pass_fds: tuple[int, ...] = (),
+    ) -> dict[str, Any]:
+        proc = subprocess.run(
+            [str(self.binary), *args],
+            input=json.dumps(payload, ensure_ascii=False),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=self.timeout_sec,
+            pass_fds=pass_fds,
+            check=False,
+        )
         if proc.returncode != 0:
             raise RuntimeError(
                 (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
@@ -3299,12 +3298,12 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         if receipt.get("schema") != "ContextCompactionReceiptV2":
             raise ValueError("refusing to prepare a non-V2 Context Governor receipt")
         receipt_id = str(receipt.get("receipt_id") or "")
-        result = self._run_json(
+        result = self._run_certified_json(
             [
                 "prepare-v2",
                 "--dir",
                 str(self.store_dir),
-                *self._certified_store_args(),
+
             ],
             response,
         )
@@ -3347,14 +3346,14 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         return result
 
     def _discard_pending_receipt(self, receipt_id: str) -> dict[str, Any]:
-        result = self._run_json(
+        result = self._run_certified_json(
             [
                 "discard-v2",
                 "--dir",
                 str(self.store_dir),
                 "--receipt",
                 receipt_id,
-                *self._certified_store_args(),
+
             ],
             {},
         )
@@ -3419,12 +3418,12 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 "pending governor projection as an exact prefix"
             )
         receipt_id = str(pending.get("receipt_id") or "")
-        result = self._run_json(
+        result = self._run_certified_json(
             [
                 "activate-v2",
                 "--dir",
                 str(self.store_dir),
-                *self._certified_store_args(),
+
             ],
             {"receipt_id": receipt_id, "committed_messages": projection},
         )
@@ -3526,12 +3525,12 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
     def _reconcile_pending_receipts(self, session_db: Any, session_id: str) -> None:
         """Recover a receipt prepared before a process/desktop crash."""
         try:
-            records = self._run_json(
+            records = self._run_certified_json(
                 [
                     "pending-v2",
                     "--dir",
                     str(self.store_dir),
-                    *self._certified_store_args(),
+
                 ],
                 {},
             )
