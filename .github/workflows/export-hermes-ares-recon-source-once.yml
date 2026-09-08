@@ -1,0 +1,73 @@
+name: Export hermes-ares-recon source once
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    if: >-
+      github.event.pull_request.number == 35 &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'hermes-ares-recon'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - name: Export exact history and pinned upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/recon-source"
+          mkdir -p "$out"
+          git remote add hermes https://github.com/NousResearch/hermes-agent.git
+          git fetch --no-tags hermes 2237be355906fbe6065ce1815711eee52b2d646e
+          test "$(git rev-parse FETCH_HEAD)" = 2237be355906fbe6065ce1815711eee52b2d646e
+          git update-ref refs/heads/evidence-hermes-v0211 2237be355906fbe6065ce1815711eee52b2d646e
+          git update-ref refs/heads/evidence-pr35-head HEAD
+          git update-ref refs/heads/evidence-main origin/main
+          git bundle create "$out/hermes-ares-recon.bundle" \
+            refs/heads/evidence-hermes-v0211 \
+            refs/heads/evidence-pr35-head \
+            refs/heads/evidence-main
+          git bundle verify "$out/hermes-ares-recon.bundle"
+          git show-ref refs/heads/evidence-hermes-v0211 refs/heads/evidence-pr35-head refs/heads/evidence-main > "$out/refs.txt"
+          split --bytes=300M --numeric-suffixes=0 "$out/hermes-ares-recon.bundle" "$out/source-part-"
+          sha256sum "$out"/source-part-* > "$out/PART_SHA256SUMS"
+          sha256sum "$out/hermes-ares-recon.bundle" > "$out/BUNDLE_SHA256SUM"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: hermes-ares-recon-source-evidence
+          path: |
+            ${{ runner.temp }}/recon-source/refs.txt
+            ${{ runner.temp }}/recon-source/PART_SHA256SUMS
+            ${{ runner.temp }}/recon-source/BUNDLE_SHA256SUM
+          retention-days: 7
+          if-no-files-found: error
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: hermes-ares-recon-source-part-00
+          path: ${{ runner.temp }}/recon-source/source-part-00
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: hermes-ares-recon-source-part-01
+          path: ${{ runner.temp }}/recon-source/source-part-01
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: hermes-ares-recon-source-part-02
+          path: ${{ runner.temp }}/recon-source/source-part-02
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
