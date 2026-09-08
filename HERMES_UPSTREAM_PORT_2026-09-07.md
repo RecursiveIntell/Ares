@@ -4,6 +4,9 @@
 - Target: `RecursiveIntell/Ares`
 - Method: literal `git cherry-pick -x`; non-clean commits are aborted, quarantined, and recorded; no conflict is auto-resolved.
 - Scope: vetted efficiency, lifecycle reliability, model/context correctness, and platform fixes that do not intentionally replace Ares authority/permit/context owners.
+- Result: **16 upstream commits ported cleanly; 20 non-clean candidates quarantined automatically**.
+- Bootstrap port head: `dcab80c0a9e05912fdea98f9a274a90f5c078ee6` before this receipt-only summary update.
+- Build-certification boundary: bootstrap static validation passed, but repository CI/Nix/Docker must run on the owner-authored final PR head before this PR can be considered merge-ready.
 
 ## Ported upstream commits
 - `5180601a6ab2aa43b19540a5692914ad7b2630a9` — perf(cli): dispatch serve without the full parser tree
