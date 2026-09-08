@@ -1,0 +1,69 @@
+name: Export pinned PR34 source in bounded artifacts
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  actions: read
+
+jobs:
+  export-source:
+    if: >-
+      github.event.pull_request.number == 34 &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'upstream/hermes-efficiency-sync-20260907'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Read and verify the existing immutable source artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/ares-source"
+          mkdir -p "$out"
+          gh run download 34191905424 --repo RecursiveIntell/Ares \
+            --name ares-pr34-reconciliation-source-34191905424 --dir "$out"
+          cd "$out"
+          sha256sum --check SHA256SUMS
+          # The connector limits a single artifact to 512 MiB. Preserve the
+          # exact original bundle bytes, split into three bounded parts.
+          split --bytes=300M --numeric-suffixes=0 ares-pr34-source.bundle source-part-
+          test "$(find . -maxdepth 1 -name 'source-part-*' | wc -l)" -eq 3
+          sha256sum source-part-* > PART_SHA256SUMS
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ares-pr34-source-evidence
+          path: |
+            ${{ runner.temp }}/ares-source/*.txt
+            ${{ runner.temp }}/ares-source/*.xml
+            ${{ runner.temp }}/ares-source/*SHA256SUMS
+          retention-days: 7
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ares-pr34-source-part-00
+          path: ${{ runner.temp }}/ares-source/source-part-00
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 0
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ares-pr34-source-part-01
+          path: ${{ runner.temp }}/ares-source/source-part-01
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 0
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ares-pr34-source-part-02
+          path: ${{ runner.temp }}/ares-source/source-part-02
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 0
