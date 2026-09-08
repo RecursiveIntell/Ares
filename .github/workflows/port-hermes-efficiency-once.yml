@@ -17,7 +17,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: upstream/hermes-efficiency-sync-20260907
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Configure Git identity
         run: |
@@ -29,10 +29,12 @@ jobs:
           git remote add hermes https://github.com/NousResearch/hermes-agent.git
           git fetch --no-tags hermes main
 
-      - name: Cherry-pick vetted efficiency and correctness commits
+      - name: Cherry-pick clean efficiency and correctness commits
         shell: bash
         run: |
           set -euo pipefail
+          base_head=$(git rev-parse HEAD)
+          echo "$base_head" > /tmp/base-head.txt
           commits=(
             5180601a6ab2aa43b19540a5692914ad7b2630a9
             4155ea97e881e12d68688fc323abbd6c6bcce0f3
@@ -41,8 +43,6 @@ jobs:
             6064668c8fd2dbbb232ea073b32c9d06d932fa56
             cb0b66c16170042d22ffb9714ec19f601a3c5cc5
             8b681f70ea505959cf7721be40d9dad8f3d33c8f
-            b363fee510a048b010480ca7941126b8613fa6df
-            bbbd3b100fb353bc72cb5c887d84bca9697e8bc1
             4a1780228008572445d8a5d98f30340acf6e9695
             8196d409a06eeaf2afaba910f673b80b532c8140
             2d783a15eb0b582938e96d4b0ccbe97f6a1a849a
@@ -62,27 +62,52 @@ jobs:
             9160c4e27e32b5984b01cf5514fd4f6ef3471d53
             869432301b03f29c1384421a97459e8407d9aea1
             802f0f97adfbf3708888f9d21ba85ca80e0cec87
+            07b161e2419b92970cf198e5c6dbf953653e9193
+            321e8a79b0fa36eb63d9c89fa22d09d993a9866d
+            116ca1db1e0b900fca37c4aba6b59370a5dff4d4
             6a04ea67c0e75ef1218bf4ceaac071c2f16a0701
             bbcf1ee180f170032079996b87f296acf2af7456
             0d6106eab8a5b8afc3357d6e1030723b8be129f2
+            c111ede3e56c62b0399cf932acafc4f0a5757bdf
+            520e63661c8eaa2135ebd60a07192f0d8aa45e6e
             c3ce41645cb08f39e7dd5739dcfd72527096896f
             6e2b8e070d28b1a3381a3fb290b6b8d6cce13cef
           )
           : > /tmp/ported-shas.txt
+          : > /tmp/skipped-shas.txt
+          : > /tmp/skipped-details.txt
           for sha in "${commits[@]}"; do
             echo "=== cherry-pick $sha ==="
-            if ! git cherry-pick -x "$sha"; then
-              echo "Conflict while cherry-picking $sha" >&2
-              git status --short >&2
-              git diff --name-only --diff-filter=U >&2 || true
-              git cherry-pick --abort || true
-              exit 42
+            if git cherry-pick -x "$sha"; then
+              echo "$sha" >> /tmp/ported-shas.txt
+              continue
             fi
-            echo "$sha" >> /tmp/ported-shas.txt
+
+            echo "Non-clean cherry-pick quarantined: $sha" >&2
+            {
+              echo "### $sha"
+              git status --short || true
+              git diff --name-only --diff-filter=U || true
+              echo
+            } >> /tmp/skipped-details.txt
+            git cherry-pick --abort || true
+            echo "$sha" >> /tmp/skipped-shas.txt
           done
 
-      - name: Syntax validation
+          if [[ ! -s /tmp/ported-shas.txt ]]; then
+            echo "No Hermes commit composed cleanly with Ares" >&2
+            exit 42
+          fi
+
+          if git diff --name-only "$base_head"...HEAD | grep -q '^ares_runtime/'; then
+            echo "Upstream port unexpectedly changed Ares-owned ares_runtime/" >&2
+            git diff --name-only "$base_head"...HEAD | grep '^ares_runtime/' >&2
+            exit 43
+          fi
+
+      - name: Static validation
         run: |
+          git diff --check "$(cat /tmp/base-head.txt)"...HEAD
           python -m compileall -q agent tools hermes_cli gateway cron run_agent.py
 
       - name: Write upstream port receipt
@@ -93,8 +118,8 @@ jobs:
             echo
             echo '- Source: `NousResearch/hermes-agent`'
             echo '- Target: `RecursiveIntell/Ares`'
-            echo '- Method: literal `git cherry-pick -x`, fail-closed on conflicts'
-            echo '- Scope: vetted efficiency, lifecycle reliability, model/context correctness, and platform fixes that do not intentionally replace Ares authority/permit/context owners'
+            echo '- Method: literal `git cherry-pick -x`; non-clean commits are aborted, quarantined, and recorded; no conflict is auto-resolved.'
+            echo '- Scope: vetted efficiency, lifecycle reliability, model/context correctness, and platform fixes that do not intentionally replace Ares authority/permit/context owners.'
             echo
             echo '## Ported upstream commits'
             while read -r sha; do
@@ -102,16 +127,31 @@ jobs:
               echo "- \`$sha\` — $subject"
             done < /tmp/ported-shas.txt
             echo
-            echo '## Explicitly deferred from this pass'
-            echo '- Delegation fallback-policy commits: require Ares authority-scope adaptation rather than direct cherry-pick.'
-            echo '- Owner-mailbox / durable Bot Chat ingress commits: require review against Ares managed-admission, receipt, and goal/session ownership semantics.'
-            echo '- Group-chat parallelism changes: alter scheduling semantics and need validation against Ares specialist/authority policy.'
-            echo '- Completion-retention and approval-parser clusters not included in the first automated batch; evaluate after this batch proves clean composition.'
+            echo '## Automatically quarantined non-clean candidates'
+            if [[ -s /tmp/skipped-shas.txt ]]; then
+              while read -r sha; do
+                subject=$(git show -s --format=%s "$sha")
+                echo "- \`$sha\` — $subject"
+              done < /tmp/skipped-shas.txt
+            else
+              echo '- None.'
+            fi
+            echo
+            echo '## Known non-applicable / adaptation-required candidates'
+            echo '- `b363fee510a048b010480ca7941126b8613fa6df` and `bbbd3b100fb353bc72cb5c887d84bca9697e8bc1` — Hermes Yoga rounding-cache optimizations conflict with Ares independently changed/deleted TUI layout surfaces; do not resolve toward upstream blindly.'
+            echo '- Delegation fallback-policy commits — require Ares authority-scope adaptation rather than direct cherry-pick.'
+            echo '- Owner-mailbox / durable Bot Chat ingress commits — require review against Ares managed-admission, receipt, and goal/session ownership semantics.'
+            echo '- Group-chat parallelism changes — alter scheduling semantics and need validation against Ares specialist/authority policy.'
+            echo '- Approval-parser changes — security-relevant but overlap Ares approval/permit ownership, so they need owner-preserving adaptation.'
+            echo '- Subagent process-handoff changes — useful upstream behavior but authority-bearing in Ares; adapt rather than silently import.'
             echo
             echo '## Validation performed by bootstrap'
-            echo '- Cherry-picks must apply without conflict; no automatic conflict resolution is permitted.'
+            echo '- Every included upstream commit applied as a literal conflict-free `git cherry-pick -x`.'
+            echo '- Any non-clean candidate was aborted and recorded rather than resolved.'
+            echo '- No included upstream commit may modify `ares_runtime/`.'
+            echo '- `git diff --check` over the resulting port.'
             echo '- Python compileall over agent/tools/hermes_cli/gateway/cron/run_agent.py.'
-            echo '- Repository PR CI remains the build-certified gate.'
+            echo '- Repository PR CI remains the build-certified gate; upstream benchmark numbers are not Ares benchmark claims.'
           } > HERMES_UPSTREAM_PORT_2026-09-07.md
           git add HERMES_UPSTREAM_PORT_2026-09-07.md
           git commit -m 'docs(upstream): record vetted Hermes port receipt'
