@@ -17,6 +17,7 @@ import os
 import re
 import signal
 import shutil
+import sqlite3
 import subprocess
 import threading
 import time
@@ -1965,28 +1966,66 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             return governor_messages
 
         candidates: list[tuple[int, str, List[Dict[str, Any]]]] = []
-        try:
-            for path in self.store_dir.glob("ctxr_*.json"):
-                try:
-                    payload = json.loads(path.read_text(encoding="utf-8"))
-                    receipt = payload.get("receipt") or {}
-                    compacted = payload.get("compacted_messages") or []
-                    if (
-                        receipt.get("session_id") != governor_session_id
-                        or not isinstance(compacted, list)
-                        or not compacted
-                        or any(not isinstance(message, dict) for message in compacted)
-                    ):
-                        continue
-                    candidates.append((
-                        int(receipt.get("generation") or 0),
-                        str(receipt.get("created_utc") or ""),
-                        compacted,
-                    ))
-                except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        index_path = self.store_dir / ".receipt-index.sqlite3"
+        receipt_paths: list[tuple[str, int, str]] = []
+        if index_path.is_file():
+            # The catalog is a rebuildable selector, not receipt authority. It
+            # bounds this compatibility bridge to the target lineage; the core
+            # still authenticates the selected receipt and its complete chain.
+            try:
+                uri = f"file:{index_path.as_posix()}?mode=ro"
+                with sqlite3.connect(uri, uri=True, timeout=0.5) as connection:
+                    receipt_paths = [
+                        (str(receipt_id), int(generation or 0), str(created_utc or ""))
+                        for receipt_id, generation, created_utc in connection.execute(
+                            "SELECT receipt_id, generation, created_utc "
+                            "FROM receipts WHERE session_id = ? "
+                            "ORDER BY generation DESC, receipt_id DESC",
+                            (governor_session_id,),
+                        )
+                    ]
+            except (OSError, sqlite3.Error, TypeError, ValueError):
+                # A missing/unreadable/stale catalog must not trigger a corpus
+                # scan. compact-v2 will fail closed with rebuild-required.
+                receipt_paths = []
+        else:
+            # Preserve small pre-catalog archives without permitting a large
+            # legacy store to reintroduce the original corpus-scaled timeout.
+            try:
+                legacy_paths = list(self.store_dir.glob("ctxr_*.json"))
+                legacy_bytes = sum(path.stat().st_size for path in legacy_paths)
+            except OSError:
+                legacy_paths = []
+                legacy_bytes = DEFAULT_MAX_PROVENANCE_BYTES + 1
+            if len(legacy_paths) <= 64 and legacy_bytes <= DEFAULT_MAX_PROVENANCE_BYTES:
+                receipt_paths = [
+                    (path.stem, 0, "") for path in legacy_paths
+                ]
+
+        for receipt_id, generation, created_utc in receipt_paths:
+            if not receipt_id.startswith("ctxr_") or Path(receipt_id).name != receipt_id:
+                continue
+            path = self.store_dir / f"{receipt_id}.json"
+            try:
+                if path.resolve().parent != self.store_dir.resolve():
                     continue
-        except OSError:
-            return governor_messages
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                receipt = payload.get("receipt") or {}
+                compacted = payload.get("compacted_messages") or []
+                if (
+                    receipt.get("session_id") != governor_session_id
+                    or not isinstance(compacted, list)
+                    or not compacted
+                    or any(not isinstance(message, dict) for message in compacted)
+                ):
+                    continue
+                candidates.append((
+                    int(receipt.get("generation") or generation),
+                    str(receipt.get("created_utc") or created_utc),
+                    compacted,
+                ))
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                continue
 
         def legacy_projection(message: Dict[str, Any]) -> Dict[str, Any]:
             projection = copy.deepcopy(message)
@@ -3444,7 +3483,6 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
     ) -> dict[str, Any]:
         command = [str(self.binary), *args]
         popen_kwargs: dict[str, Any] = {
-            "stdin": subprocess.PIPE,
             "stdout": subprocess.PIPE,
             "stderr": subprocess.PIPE,
             "text": True,
@@ -3459,7 +3497,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             # not permission for a detached worker to publish later.
             popen_kwargs["start_new_session"] = True
             popen_kwargs["pass_fds"] = pass_fds
-        proc = subprocess.Popen(command, **popen_kwargs)
+        proc = subprocess.Popen(command, stdin=subprocess.PIPE, **popen_kwargs)
         try:
             stdout, stderr = proc.communicate(
                 input=json.dumps(payload, ensure_ascii=False),
@@ -3491,7 +3529,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             return
         if os.name != "nt":
             try:
-                os.killpg(proc.pid, signal.SIGTERM)
+                os.killpg(proc.pid, signal.SIGTERM)  # windows-footgun: ok
             except ProcessLookupError:
                 return
             try:
@@ -3499,7 +3537,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 return
             except subprocess.TimeoutExpired:
                 try:
-                    os.killpg(proc.pid, signal.SIGKILL)
+                    os.killpg(proc.pid, signal.SIGKILL)  # windows-footgun: ok
                 except ProcessLookupError:
                     return
         else:
