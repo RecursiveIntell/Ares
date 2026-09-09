@@ -15,8 +15,10 @@ import json
 import logging
 import os
 import re
+import signal
 import shutil
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,7 +36,6 @@ from hermes_constants import get_hermes_home
 from plugins.context_engine._context_governor.key_state import (
     ContextGovernorKeyError,
     ContextGovernorKeyState,
-    GovernedKeyBinding,
 )
 
 logger = logging.getLogger(__name__)
@@ -62,6 +63,15 @@ class _SummaryLLMResult:
 
     content: str
     route: _SummaryLLMRoute
+
+
+@dataclass
+class _InflightCompression:
+    """Non-authoritative join state for one identical compaction request."""
+
+    event: threading.Event
+    result: List[Dict[str, Any]] | None = None
+    error: BaseException | None = None
 
 
 class ContextGovernorActivationError(RuntimeError):
@@ -155,6 +165,10 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         # invisible to parent selection/search/expand until the host confirms
         # its transcript commit through commit_pending_compression().
         self._pending_admission: dict[str, Any] | None = None
+        # In-flight coalescing is only a compute optimization. Rust receipt
+        # preparation/activation remains the authoritative publication fence.
+        self._inflight_lock = threading.RLock()
+        self._inflight_compressions: dict[str, _InflightCompression] = {}
         self.last_prompt_tokens = 0
         self.last_completion_tokens = 0
         self.last_total_tokens = 0
@@ -164,6 +178,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         self.last_receipt_id: str | None = None
         self.last_error: str | None = None
         self.last_warning: str | None = None
+        self.last_outcome: dict[str, Any] | None = None
         self.last_summary_safety: dict[str, Any] | None = None
         self.last_compaction_metrics: dict[str, Any] | None = None
         self.fallback_event_count = 0
@@ -210,7 +225,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         # Ares owns lifecycle under the profile root. No config-supplied key
         # path is ever a canonical signing authority.
         self._key_state = ContextGovernorKeyState(get_hermes_home(), self.binary)
-        self._key_binding: GovernedKeyBinding | None = None
+
         self._unsafe_configured_hmac_path: str | None = None
         self._capabilities: dict[str, Any] | None = None
         # Runtime model credentials are refreshed by update_model.  Keep them
@@ -313,6 +328,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         clone.last_receipt_id = self.last_receipt_id
         clone.last_error = self.last_error
         clone.last_warning = self.last_warning
+        clone.last_outcome = copy.deepcopy(self.last_outcome)
         clone.last_summary_safety = copy.deepcopy(self.last_summary_safety)
         clone.last_compaction_metrics = copy.deepcopy(self.last_compaction_metrics)
         clone.fallback_event_count = self.fallback_event_count
@@ -475,12 +491,11 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 },
                 "focus": None,
             }
-            candidate = self._run_json(
+            candidate = self._run_certified_json(
                 [
                     "compact-v2",
                     "--dir",
                     store_dir,
-                    *self._certified_store_args(),
                 ],
                 request,
             )
@@ -494,8 +509,8 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             if not isinstance(receipt_id, str) or not isinstance(messages, list):
                 raise ValueError("compact-v2 omitted receipt identity or messages")
 
-            finalized = self._run_json(
-                ["finalize-v2", *self._certified_store_args()],
+            finalized = self._run_certified_json(
+                ["finalize-v2"],
                 {
                     "candidate": candidate,
                     "compacted_messages": messages,
@@ -510,12 +525,11 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             ):
                 raise ValueError("finalize-v2 changed or omitted receipt identity")
 
-            prepared = self._run_json(
+            prepared = self._run_certified_json(
                 [
                     "prepare-v2",
                     "--dir",
                     store_dir,
-                    *self._certified_store_args(),
                 ],
                 finalized,
             )
@@ -527,14 +541,13 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             ):
                 raise ValueError("prepare-v2 did not verify the finalized receipt")
 
-            discarded = self._run_json(
+            discarded = self._run_certified_json(
                 [
                     "discard-v2",
                     "--dir",
                     store_dir,
                     "--receipt",
                     receipt_id,
-                    *self._certified_store_args(),
                 ],
                 {},
             )
@@ -552,15 +565,21 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 "stages": ["compact-v2", "finalize-v2", "prepare-v2", "discard-v2"],
             }
 
-    def _certified_store_args(self) -> list[str]:
+    def _run_certified_json(
+        self, args: list[str], payload: dict[str, Any]
+    ) -> dict[str, Any]:
         try:
-            if self._key_binding is not None:
-                self._key_binding.close()
             binding = self._key_state.active_binding()
         except ContextGovernorKeyError as exc:
             raise ContextGovernorActivationError(str(exc)) from exc
-        self._key_binding = binding
-        return binding.command_args()
+        try:
+            return self._run_json(
+                [*args, *binding.command_args()],
+                payload,
+                pass_fds=binding.pass_fds,
+            )
+        finally:
+            binding.close()
 
     def update_model(
         self,
@@ -760,7 +779,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         use context_search/context_expand to recover specific details.
         """
         try:
-            receipt_ids = self._run_json(
+            receipt_ids = self._run_certified_json(
                 [
                     "search",
                     "--dir",
@@ -769,7 +788,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                     "",
                     "--top-k",
                     "1",
-                    *self._certified_store_args(),
+
                 ],
                 {},
             )
@@ -822,6 +841,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         self.last_receipt_id = None
         self.last_error = None
         self.last_warning = None
+        self.last_outcome = None
         self.last_summary_safety = None
         self.last_compaction_metrics = None
         self.fallback_event_count = 0
@@ -1031,7 +1051,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
     def handle_tool_call(self, name: str, args: Dict[str, Any], **kwargs) -> str:
         try:
             if name == "context_expand":
-                result = self._run_json(
+                result = self._run_certified_json(
                     [
                         "expand",
                         "--dir",
@@ -1042,7 +1062,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                         args["item_id"],
                         "--max-chars",
                         str(args.get("max_chars", 100000)),
-                        *self._certified_store_args(),
+
                     ],
                     {},
                 )
@@ -1062,10 +1082,9 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 scope = args.get("scope", "all")
                 cmd = ["search", "--dir", str(self.store_dir), "--query", args["query"]]
                 cmd.extend(["--top-k", str(args.get("top_k", 10))])
-                cmd.extend(self._certified_store_args())
                 if scope != "all":
                     cmd.extend(["--scope", scope])
-                result = self._run_json(cmd, {})
+                result = self._run_certified_json(cmd, {})
                 return json.dumps(result)
             elif name == "context_status":
                 return json.dumps(self.get_status())
@@ -1158,16 +1177,127 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         )
         return None
 
+    def _ensure_inflight_state(self) -> None:
+        """Create coalescing state for lightweight test/clone instances too."""
+        if not hasattr(self, "_inflight_lock"):
+            self._inflight_lock = threading.RLock()
+        if not hasattr(self, "_inflight_compressions"):
+            self._inflight_compressions = {}
+        if not hasattr(self, "_pending_admission"):
+            self._pending_admission = None
+
+    def _release_inflight_compression(self, key: str | None) -> None:
+        if not key:
+            return
+        self._ensure_inflight_state()
+        with self._inflight_lock:
+            self._inflight_compressions.pop(key, None)
+
+    def _compression_coalescing_key(
+        self,
+        messages: List[Dict[str, Any]],
+        current_tokens: int | None,
+        focus_topic: str | None,
+    ) -> str:
+        transcript = json.dumps(
+            messages,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        policy = getattr(self, "_policy", {})
+        lineage_id = (
+            getattr(self, "_lineage_session_id", "")
+            or getattr(self, "session_id", "")
+            or "default"
+        )
+        payload = {
+            "logical_lineage_id": lineage_id,
+            "expected_parent_receipt_id": getattr(self, "last_receipt_id", None),
+            "original_transcript_sha256": hashlib.sha256(
+                transcript.encode("utf-8")
+            ).hexdigest(),
+            "effective_compaction_policy_digest": hashlib.sha256(
+                json.dumps(
+                    policy,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                ).encode("utf-8")
+            ).hexdigest(),
+            "current_tokens": current_tokens,
+            "focus_topic": focus_topic,
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
     def compress(
         self,
         messages: List[Dict[str, Any]],
-        current_tokens: int = None,
-        focus_topic: str = None,
+        current_tokens: int | None = None,
+        focus_topic: str | None = None,
+    ) -> List[Dict[str, Any]]:
+        """Coalesce exact duplicate work while keeping Rust publication authoritative."""
+        self._last_compress_aborted = False
+        self._last_summary_error = None
+        self._last_summary_fallback_used = False
+        self._last_compression_made_progress = False
+        self.last_outcome = None
+        if not messages:
+            return messages
+        self._ensure_inflight_state()
+        # Pending activation recovery is a transactional operation, not
+        # duplicate compute. Never let a cached coalesced result bypass retry,
+        # reconciliation, or typed indeterminate state.
+        if self._pending_admission is not None:
+            return self._compress_once(messages, current_tokens, focus_topic)
+        key = self._compression_coalescing_key(messages, current_tokens, focus_topic)
+        with self._inflight_lock:
+            operation = self._inflight_compressions.get(key)
+            owner = operation is None
+            if owner:
+                operation = _InflightCompression(event=threading.Event())
+                self._inflight_compressions[key] = operation
+        assert operation is not None
+        if not owner:
+            timeout = max(30, int(getattr(self, "timeout_sec", 30)) * 4)
+            if not operation.event.wait(timeout=timeout):
+                raise TimeoutError("coalesced context-governor operation did not complete")
+            if operation.error is not None:
+                raise operation.error
+            return copy.deepcopy(operation.result or messages)
+        try:
+            result = self._compress_once(messages, current_tokens, focus_topic)
+        except BaseException as exc:
+            with self._inflight_lock:
+                operation.error = exc
+                self._inflight_compressions.pop(key, None)
+                operation.event.set()
+            raise
+        else:
+            with self._inflight_lock:
+                operation.result = copy.deepcopy(result)
+                if self._pending_admission is not None:
+                    self._pending_admission["coalescing_key"] = key
+                else:
+                    self._inflight_compressions.pop(key, None)
+                operation.event.set()
+            return result
+
+    def _compress_once(
+        self,
+        messages: List[Dict[str, Any]],
+        current_tokens: int | None = None,
+        focus_topic: str | None = None,
     ) -> List[Dict[str, Any]]:
         self._last_compress_aborted = False
         self._last_summary_error = None
         self._last_summary_fallback_used = False
         self._last_compression_made_progress = False
+        self.last_outcome = None
 
         if not messages:
             return messages
@@ -1242,8 +1372,6 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             len(source_messages), self.protect_first_n + telemetry_protect_last_n
         )
 
-        certified_args = self._certified_store_args()
-        assert self._key_binding is not None
         governor_messages = [
             self._message_to_governor(m, i)
             for i, m in enumerate(source_messages)
@@ -1283,12 +1411,12 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             "focus": focus_topic,
         }
         try:
-            response = self._run_json(
+            response = self._run_certified_json(
                 [
                     "compact-v2",
                     "--dir",
                     str(self.store_dir),
-                    *certified_args,
+
                 ],
                 request,
             )
@@ -1452,6 +1580,17 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             finalized_messages = response.get("compacted_messages")
             if not isinstance(finalized_messages, list):
                 raise ValueError("finalize returned no compacted_messages list")
+            finalized_receipt = response.get("receipt") or {}
+            finalized_tokens = finalized_receipt.get("compacted_approx_tokens")
+            if (
+                isinstance(finalized_tokens, int)
+                and not isinstance(finalized_tokens, bool)
+                and finalized_tokens > target_tokens
+            ):
+                raise RuntimeError(
+                    "CannotMeetTarget: final emitted transcript exceeds the "
+                    f"admitted target ({finalized_tokens} > {target_tokens})"
+                )
             compacted = [
                 self._message_from_governor(message)
                 for message in finalized_messages
@@ -1521,6 +1660,12 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 "lineage_session_id": self._governor_session_id(),
             }
             self.last_error = None
+            self.last_outcome = {
+                "kind": "compacted_pending_host_commit",
+                "receipt_id": pending_receipt_id,
+                "target_tokens": target_tokens,
+                "final_tokens": finalized_tokens,
+            }
 
             return compacted or messages
         except Exception as exc:
@@ -1537,6 +1682,26 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             self._last_compress_aborted = True
             self._last_summary_error = str(exc)
             self._last_compression_made_progress = False
+            error_text = str(exc)
+            if "CannotMeetTarget" in error_text or "context budget exceeded" in error_text:
+                self.last_outcome = {
+                    "kind": "cannot_meet_target",
+                    "error": self._safe_summary_diagnostic(error_text),
+                    "target_tokens": target_tokens,
+                }
+            elif "LineageGenerationLimit" in error_text or (
+                "generation" in error_text and "maximum" in error_text
+            ):
+                self.last_outcome = {
+                    "kind": "continuation_required",
+                    "error": self._safe_summary_diagnostic(error_text),
+                    "generation_limit": self._policy.get("max_lineage_generation"),
+                }
+            else:
+                self.last_outcome = {
+                    "kind": "compaction_failed_closed",
+                    "error": self._safe_summary_diagnostic(error_text),
+                }
             failure_type = self._classify_subprocess_error(exc)
             if failure_type == "auth":
                 logger.error("context-governor auth failure: %s", exc)
@@ -1566,6 +1731,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             "last_receipt_id": self.last_receipt_id,
             "last_error": self.last_error,
             "last_warning": self.last_warning,
+            "last_outcome": copy.deepcopy(self.last_outcome),
             "last_summary_safety": self.last_summary_safety,
             "last_compaction_metrics": copy.deepcopy(self.last_compaction_metrics),
             "fallback_event_count": self.fallback_event_count,
@@ -2250,7 +2416,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         session_sha256 = hashlib.sha256(governor_session_id.encode("utf-8")).hexdigest()
         session_marker = f"llm_checkpoint_session_sha256={session_sha256}"
         try:
-            result = self._run_json(
+            result = self._run_certified_json(
                 [
                     "search",
                     "--dir",
@@ -2261,7 +2427,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                     "summary",
                     "--top-k",
                     str(min(1024, max(64, maximum + 1))),
-                    *self._certified_store_args(),
+
                 ],
                 {},
             )
@@ -2378,8 +2544,8 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 if isinstance(message, dict)
             ],
         }
-        finalized = self._run_json(
-            ["finalize-v2", *self._certified_store_args()],
+        finalized = self._run_certified_json(
+            ["finalize-v2"],
             payload,
         )
         if not isinstance(finalized, dict):
@@ -3269,28 +3435,75 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             return max(512, int(current_tokens * 0.20))
         return 8000
 
-    def _run_json(self, args: list[str], payload: dict[str, Any]) -> dict[str, Any]:
-        binding = self._key_binding
+    def _run_json(
+        self,
+        args: list[str],
+        payload: dict[str, Any],
+        *,
+        pass_fds: tuple[int, ...] = (),
+    ) -> dict[str, Any]:
+        command = [str(self.binary), *args]
+        popen_kwargs: dict[str, Any] = {
+            "stdin": subprocess.PIPE,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+        }
+        if os.name == "nt":
+            creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            if creationflags:
+                popen_kwargs["creationflags"] = creationflags
+        else:
+            # Keep the governor worker and any descendants in a killable group.
+            # This is required because a timeout is a cancellation boundary,
+            # not permission for a detached worker to publish later.
+            popen_kwargs["start_new_session"] = True
+            popen_kwargs["pass_fds"] = pass_fds
+        proc = subprocess.Popen(command, **popen_kwargs)
         try:
-            proc = subprocess.run(
-                [str(self.binary), *args],
+            stdout, stderr = proc.communicate(
                 input=json.dumps(payload, ensure_ascii=False),
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
                 timeout=self.timeout_sec,
-                pass_fds=binding.pass_fds if binding else (),
-                check=False,
             )
-        finally:
-            if binding is not None:
-                binding.close()
-                self._key_binding = None
+        except subprocess.TimeoutExpired as exc:
+            self._terminate_process_group(proc)
+            try:
+                stdout, stderr = proc.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                stdout, stderr = proc.communicate()
+            raise subprocess.TimeoutExpired(
+                command,
+                self.timeout_sec,
+                output=stdout or exc.output,
+                stderr=stderr or exc.stderr,
+            ) from exc
         if proc.returncode != 0:
             raise RuntimeError(
-                (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
+                (stderr or stdout or f"exit {proc.returncode}").strip()
             )
-        return json.loads(proc.stdout)
+        return json.loads(stdout)
+
+    @staticmethod
+    def _terminate_process_group(proc: subprocess.Popen) -> None:
+        """Terminate a timed-out worker before releasing governed descriptors."""
+        if proc.poll() is not None:
+            return
+        if os.name != "nt":
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                return
+            try:
+                proc.wait(timeout=0.5)
+                return
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    return
+        else:
+            proc.terminate()
 
     def _prepare_response(self, response: dict[str, Any]) -> dict[str, Any]:
         """Durably stage a verified receipt without publishing a lineage tip."""
@@ -3299,12 +3512,12 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         if receipt.get("schema") != "ContextCompactionReceiptV2":
             raise ValueError("refusing to prepare a non-V2 Context Governor receipt")
         receipt_id = str(receipt.get("receipt_id") or "")
-        result = self._run_json(
+        result = self._run_certified_json(
             [
                 "prepare-v2",
                 "--dir",
                 str(self.store_dir),
-                *self._certified_store_args(),
+
             ],
             response,
         )
@@ -3347,14 +3560,14 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         return result
 
     def _discard_pending_receipt(self, receipt_id: str) -> dict[str, Any]:
-        result = self._run_json(
+        result = self._run_certified_json(
             [
                 "discard-v2",
                 "--dir",
                 str(self.store_dir),
                 "--receipt",
                 receipt_id,
-                *self._certified_store_args(),
+
             ],
             {},
         )
@@ -3419,12 +3632,12 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 "pending governor projection as an exact prefix"
             )
         receipt_id = str(pending.get("receipt_id") or "")
-        result = self._run_json(
+        result = self._run_certified_json(
             [
                 "activate-v2",
                 "--dir",
                 str(self.store_dir),
-                *self._certified_store_args(),
+
             ],
             {"receipt_id": receipt_id, "committed_messages": projection},
         )
@@ -3440,7 +3653,9 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         # Rust has atomically activated the receipt. Clear local pending state
         # before best-effort bookkeeping so a later Python exception cannot
         # make the host try to discard an already-active receipt.
+        coalescing_key = pending.get("coalescing_key")
         self._pending_admission = None
+        self._release_inflight_compression(coalescing_key)
         try:
             generation = info.get("generation")
             if isinstance(generation, int) and not isinstance(generation, bool):
@@ -3514,11 +3729,14 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         if pending is None:
             return True
         receipt_id = str(pending.get("receipt_id") or "")
+        coalescing_key = pending.get("coalescing_key")
         if not receipt_id:
             self._pending_admission = None
+            self._release_inflight_compression(coalescing_key)
             return True
         self._discard_pending_receipt(receipt_id)
         self._pending_admission = None
+        self._release_inflight_compression(coalescing_key)
         if self.last_compaction_metrics is not None:
             self.last_compaction_metrics["integrity_result"] = "pending_discarded"
         return True
@@ -3526,12 +3744,12 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
     def _reconcile_pending_receipts(self, session_db: Any, session_id: str) -> None:
         """Recover a receipt prepared before a process/desktop crash."""
         try:
-            records = self._run_json(
+            records = self._run_certified_json(
                 [
                     "pending-v2",
                     "--dir",
                     str(self.store_dir),
-                    *self._certified_store_args(),
+
                 ],
                 {},
             )
