@@ -5,7 +5,8 @@ Status: in progress; branch/worktree only; not merge-ready and not activated.
 ## Source pins
 
 - Shared Ares/Hermes merge base: `8966b0a70029cb226e35c49f91d0c2208ab1d8c4`
-- Ares main source pin: `7ecc1f0a94b967abb89153a4904ca6551b6c7128`
+- Original Ares main source pin: `7ecc1f0a94b967abb89153a4904ca6551b6c7128`
+- Current-main owner pin incorporated before the full merge: `fa74bfdb98e541fe719bb0f99f6bd44bce034f44`
 - Starting PR #35 head: `e5f745e1697d610a1a7abf30d76e2639b96007f3`
 - Hermes v0.21.1 / v2026.9.7: `2237be355906fbe6065ce1815711eee52b2d646e`
 - Verified source bundle SHA-256: `7070d36d5e20f0a15c2fc3f8edabb68429ec113c4fd2d00f2e3fa2dd69131d6e`
@@ -71,6 +72,9 @@ Structural gates at this checkpoint:
 - `git diff --cached --check`: PASS;
 - changed Python files compiled: 3,681 / 3,681;
 - syntax/indentation failures: 0.
+
+The exact validated structural tree is `0085da4d85ac61772b09c4b4947b49667315b44e`.
+GitHub Actions reproduced that tree, compiled all changed Python files, and created local merge commit `743ed4b916…`; its only failure was the final push, which GitHub rejected because the Actions token may not update workflow files. The same verified tree was then committed through the GitHub API as the real two-parent branch commit `f59ca66c625bf58c2078882367e03b19f4666fb2`, with Hermes `2237be355906fbe6065ce1815711eee52b2d646e` as parent 2.
 
 This is a **structural checkpoint only**. Import sweeps, owner-focused behavioral tests,
 lock/lint checks, desktop/TUI checks, and final CI/Nix/Docker remain required before any
