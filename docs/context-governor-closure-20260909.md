@@ -1,7 +1,7 @@
 # Context Governor adapter closure — 2026-09-09
 
 Status: implementation in progress; NOT merge-ready, installed, or activated.
-Base: `fa74bfdb98e541fe719bb0f99f6bd44bce034f44`.
+Base: `5bf10e831b1106bd92669eb80abe8802743f8ab5` after syncing current main recovery fixes.
 Core owner: RecursiveIntell/Libraries PR #17, `context-governor/`.
 
 The hostile audit and core repair plan live in Libraries at
