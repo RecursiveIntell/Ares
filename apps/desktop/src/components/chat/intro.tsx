@@ -3,6 +3,7 @@ import { useState } from 'react'
 import { capitalize, normalize } from '@/lib/text'
 
 import introCopyJsonl from './intro-copy.jsonl?raw'
+import { Wordmark } from './wordmark'
 
 type IntroCopy = {
   headline: string

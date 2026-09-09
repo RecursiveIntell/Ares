@@ -2,6 +2,8 @@
 
 import json
 import os
+import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -10,13 +12,12 @@ import time
 import pytest
 from unittest.mock import MagicMock, patch
 
-from tools.environments.local import _HERMES_PROVIDER_ENV_FORCE_PREFIX
+from tools.environments.local_env_policy import _HERMES_PROVIDER_ENV_FORCE_PREFIX
 from tools.process_registry import (
     ProcessRegistry,
     ProcessSession,
     FINISHED_TTL_SECONDS,
     MAX_PROCESSES,
-    MAX_ACTIVE_PROCESS_AGE,
 )
 
 
@@ -1259,7 +1260,7 @@ class TestProcessToolHandler:
 # format_process_notification + drain_notifications (shared helpers)
 # =========================================================================
 
-from tools.process_registry import format_process_notification
+from tools.process_registry_notifications import format_process_notification
 
 
 def test_drain_notifications_completion_callback_exception_fails_closed(registry):
@@ -1931,7 +1932,10 @@ class TestSystemdCgroupIsolation:
             if value == "--property"
         ]
         assert "MemoryAccounting=yes" in properties
-        assert "OOMPolicy=kill" in properties
+        # systemd rejects OOMPolicy= on transient --scope units across the versions
+        # users run (239/245/249, #102486); emitting it fails the probe and every
+        # cron worker dispatch. MemoryMax + MemoryAccounting carry the isolation.
+        assert not any(p.startswith("OOMPolicy=") for p in properties), properties
         memory_max = next(
             value for value in properties if value.startswith("MemoryMax=")
         )
@@ -2340,6 +2344,12 @@ class TestSystemdCgroupIsolation:
         assert first is True
         assert second is True
         assert len(probe_calls) == 1, "probe must run only once (cached)"
+        # The probe must not carry OOMPolicy= either: that is the argv systemd
+        # rejected on scope units and cached as "unavailable" (#102486).
+        probe_argv = probe_calls[0][0]
+        assert not any(
+            value.startswith("OOMPolicy=") for value in probe_argv if isinstance(value, str)
+        ), probe_argv
 
     def test_systemd_scope_first_probe_is_serialized(self, monkeypatch):
         """Concurrent first-use callers must wait for one definitive probe.
@@ -2429,6 +2439,77 @@ class TestSystemdCgroupIsolation:
         )
 
         assert pr._stop_systemd_unit("hermes-worker-gone.scope") is True
+
+    def test_darwin_never_takes_scope_path_even_with_systemd_run_on_path(
+        self, registry, monkeypatch, _gateway_identity
+    ):
+        """macOS no-op guarantee (#70716 cross-platform audit).
+
+        With ``_IS_LINUX = False`` (darwin), the spawn path must be
+        byte-identical to the legacy path even when a ``systemd-run``
+        binary is somehow on PATH and the gateway identity checks pass:
+        no probe, no wrapping, no unit recorded.
+        """
+        import tools.process_registry as pr
+
+        fake_popen, captured = self._fake_popen_capture()
+
+        monkeypatch.setattr(pr, "_IS_LINUX", False)
+        monkeypatch.setattr(pr, "_IS_WINDOWS", False)
+        monkeypatch.setattr(pr, "_SYSTEMD_SCOPE_AVAILABLE", None)
+        monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
+        monkeypatch.setattr(
+            "gateway.restart.is_gateway_supervisor_process", lambda: True
+        )
+        # If any branch consults the probe or builds a scope argv on darwin,
+        # fail loudly.
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/local/bin/systemd-run")
+        scope_builds = []
+        real_build = pr._build_systemd_scope_argv
+        monkeypatch.setattr(
+            pr,
+            "_build_systemd_scope_argv",
+            lambda *a, **k: scope_builds.append(a) or real_build(*a, **k),
+        )
+        probe_runs = []
+
+        def fake_probe_run(argv, **kwargs):
+            probe_runs.append(argv)
+            return subprocess.CompletedProcess(args=argv, returncode=0)
+
+        monkeypatch.setattr("subprocess.run", fake_probe_run)
+
+        with (
+            patch("subprocess.Popen", side_effect=fake_popen),
+            patch("threading.Thread", return_value=MagicMock()),
+            patch.object(registry, "_write_checkpoint"),
+        ):
+            session = registry.spawn_local("echo hello", cwd="/tmp")
+
+        argv = captured["argv"]
+        assert argv == ["/bin/bash", "-lic", "set +m; echo hello"], argv
+        assert captured["start_new_session"] is True
+        assert session.systemd_unit == ""
+        assert scope_builds == [], "darwin must never build a systemd scope argv"
+        assert probe_runs == [], "darwin must never run the systemd-run probe"
+
+    def test_probe_returns_false_off_linux(self, monkeypatch):
+        """``_systemd_run_user_scope_available`` is False on non-Linux even
+        when a ``systemd-run`` binary exists on PATH."""
+        import tools.process_registry as pr
+
+        monkeypatch.setattr(pr, "_IS_LINUX", False)
+        monkeypatch.setattr(pr, "_SYSTEMD_SCOPE_AVAILABLE", None)
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/local/bin/systemd-run")
+        probe_runs = []
+        monkeypatch.setattr(
+            "subprocess.run",
+            lambda argv, **kwargs: probe_runs.append(argv)
+            or subprocess.CompletedProcess(args=argv, returncode=0),
+        )
+
+        assert pr._systemd_run_user_scope_available() is False
+        assert probe_runs == [], "non-Linux must not exec the probe"
 
 
 class TestNotificationRedaction:
@@ -2558,3 +2639,155 @@ class TestGetByPrefix:
         result = registry.poll("4dae56ca")
         assert result["session_id"] == "proc_4dae56ca81f6"
         assert result["status"] == "running"
+
+
+# ---------------------------------------------------------------------------
+# Config-level model_not_found notice in delegation batch reports (#97654)
+# ---------------------------------------------------------------------------
+
+
+def _make_delegation_batch_evt(results):
+    """A batch async-delegation event carrying a per-task ``results`` list."""
+    return {
+        "type": "async_delegation",
+        "delegation_id": "deleg_97654",
+        "is_batch": True,
+        "results": results,
+        "goals": [r.get("goal") or "" for r in results],
+        "session_key": "agent:main:cli:dm:local",
+        "status": "completed",
+        "model": "upstage/solar-pro-4",
+    }
+
+
+def _patch_delegation_config(
+    monkeypatch, model="upstage/solar-pro-4", provider="openrouter", **over
+):
+    import tools.process_registry_notifications as _prn
+
+    cfg = {"model": model, "provider": provider}
+    cfg.update(over)
+    monkeypatch.setattr(_prn, "_delegation_config", lambda: cfg)
+    return cfg
+
+
+def _format_async(evt) -> str:
+    from tools.process_registry_notifications import format_process_notification
+
+    text = format_process_notification(evt)
+    assert text is not None, "format_process_notification returned None"
+    return text
+
+
+def test_model_not_found_notice_single_failure_once(monkeypatch):
+    evt = _make_delegation_batch_evt([
+        {
+            "task_index": 0,
+            "status": "failed",
+            "exit_reason": "error",
+            "goal": "Create bridge module",
+            "error": "HTTP 400: upstage/solar-pro-4 is not a valid model ID",
+            "summary": "HTTP 400: upstage/solar-pro-4 is not a valid model ID",
+        }
+    ])
+    _patch_delegation_config(monkeypatch)
+    text = _format_async(evt)
+    assert text is not None
+    assert text.count("SUBAGENT MODEL REJECTED") == 1
+    assert "upstage/solar-pro-4" in text
+    assert "openrouter" in text
+    assert "No fallback chain is configured" in text
+
+
+def test_model_not_found_notice_mixed_batch_named_model(monkeypatch):
+    evt = _make_delegation_batch_evt([
+        {
+            "task_index": 0,
+            "status": "failed",
+            "exit_reason": "error",
+            "goal": "A",
+            "error": "HTTP 400: upstage/solar-pro-4 is not a valid model ID",
+            "summary": "HTTP 400: upstage/solar-pro-4 is not a valid model ID",
+        },
+        {
+            "task_index": 1,
+            "status": "completed",
+            "goal": "B",
+            "summary": "ok",
+            "api_calls": 3,
+        },
+    ])
+    _patch_delegation_config(monkeypatch)
+    text = _format_async(evt)
+    assert text.count("SUBAGENT MODEL REJECTED") == 1
+    assert "upstage/solar-pro-4" in text
+
+
+def test_model_not_found_notice_absent_for_non_model_errors(monkeypatch):
+    evt = _make_delegation_batch_evt([
+        {
+            "task_index": 0,
+            "status": "failed",
+            "goal": "A",
+            "error": "HTTP 429: rate limit exceeded",
+        },
+        {
+            "task_index": 1,
+            "status": "failed",
+            "goal": "B",
+            "error": "Connection timed out",
+        },
+    ])
+    _patch_delegation_config(monkeypatch)
+    text = _format_async(evt)
+    assert "SUBAGENT MODEL REJECTED" not in text
+
+
+def test_model_not_found_notice_absent_when_configured_model_not_named(monkeypatch):
+    evt = _make_delegation_batch_evt([
+        {
+            "task_index": 0,
+            "status": "failed",
+            "goal": "A",
+            "error": "HTTP 400: gpt-99 is not a valid model ID",
+        }
+    ])
+    # Configured model is upstage/solar-pro-4; the rejection names gpt-99.
+    _patch_delegation_config(monkeypatch)
+    text = _format_async(evt)
+    assert "SUBAGENT MODEL REJECTED" not in text
+
+
+def test_model_not_found_notice_single_dispatch(monkeypatch):
+    evt = {
+        "type": "async_delegation",
+        "delegation_id": "deleg_single",
+        "session_key": "agent:main:cli:dm:local",
+        "goal": "task A",
+        "model": "upstage/solar-pro-4",
+        "status": "failed",
+        "error": "HTTP 400: upstage/solar-pro-4 is not a valid model ID",
+        "summary": "HTTP 400: upstage/solar-pro-4 is not a valid model ID",
+    }
+    _patch_delegation_config(monkeypatch)
+    text = _format_async(evt)
+    assert text.count("SUBAGENT MODEL REJECTED") == 1
+    assert "upstage/solar-pro-4" in text
+
+
+def test_model_not_found_notice_absent_when_fallback_chain_configured(monkeypatch):
+    evt = _make_delegation_batch_evt([
+        {
+            "task_index": 0,
+            "status": "failed",
+            "goal": "A",
+            "error": "HTTP 400: upstage/solar-pro-4 is not a valid model ID",
+        }
+    ])
+    _patch_delegation_config(
+        monkeypatch,
+        fallback_providers=[{"provider": "openrouter", "model": "upstage/solar-pro4"}],
+    )
+    text = _format_async(evt)
+    assert text.count("SUBAGENT MODEL REJECTED") == 1
+    assert "No fallback chain is configured" not in text

@@ -8,6 +8,12 @@ crash), stdio MCP servers it spawned are reparented to init and keep running
 forever.  macOS has no ``PR_SET_PDEATHSIG``, so something has to outlive Hermes
 and reap them.
 
+This module is deliberately standard-library-only and must not import anything
+from ``tools/``: it runs after Hermes may already be dead, and pulling in
+``mcp_tool`` would drag the whole agent with it. The TERM -> grace -> KILL
+``killpg`` sweep in ``_reap`` therefore duplicates similar sweeps elsewhere in
+the tree on purpose.
+
 The predecessor (``mcp_stdio_watchdog.py``) solved this with one CPython
 *per MCP server*, wrapping each server command and polling ``getppid()`` every
 two seconds.  That costs ~10 MB of resident memory per server and detects death
@@ -35,6 +41,30 @@ which unregisters as it tears each server down -- ends with nothing to kill.
 
 Unparseable lines are ignored rather than fatal: a corrupted byte on the control
 pipe must not cost us the reaping guarantee for every other server.
+
+Residual risk: process-group reuse
+----------------------------------
+We reap by pgid, so a registration is only as meaningful as the group's
+identity.  A group we deliberately keep registered -- an orphan that teardown
+failed to kill, such as the ``node`` ``mcp-remote`` leaves behind -- can
+eventually exit on its own, after which the kernel is free to hand that pgid to
+an unrelated process owned by the same user.  If Hermes then dies ungracefully
+while the registration is still stale, we would signal a stranger.
+``_is_safe_target`` cannot catch this: the value is stale, not invalid.
+
+Two things narrow the window.  Hermes prunes registrations whose group has no
+members left (``_prune_dead_supervised_pgids``) on every registration change,
+and the orphan sweep unregisters whatever it reaps.  Neither closes it -- a
+group can die and its pgid be recycled between two probes -- so the exposure is
+real but bounded to that gap, and requires an ungraceful death inside it.
+
+Closing it completely means proving group identity at reap time, e.g. stamping
+MCP children with a boot-unique env marker and checking that some member still
+carries it before signalling.  That was judged not worth putting a ``ps`` parse
+into the one process whose job is to stay simple enough to always work; it is
+the obvious next step if this class of bug ever actually bites.  Note the same
+exposure already exists in Hermes's own killpg-based orphan cleanup, which this
+module did not introduce (see upstream issue #88350).
 """
 
 from __future__ import annotations

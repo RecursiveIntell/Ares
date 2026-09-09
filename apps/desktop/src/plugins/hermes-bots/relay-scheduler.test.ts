@@ -81,17 +81,13 @@ type Scheduler = {
 }
 
 async function scheduler(): Promise<Scheduler> {
-  // @ts-expect-error Bundled plugin remains plain JavaScript for disk-plugin compatibility.
-  const mod = await import('./plugin.js')
+  const mod = await import('./relay')
 
-  return mod.default.createRelayDeliveryScheduler() as Scheduler
+  return mod.createRelayDeliveryScheduler() as Scheduler
 }
 
-async function botPlugin() {
-  // @ts-expect-error Bundled plugin remains plain JavaScript for disk-plugin compatibility.
-  const mod = await import('./plugin.js')
-
-  return mod.default as { drainRelayOutboxes: () => Promise<void> }
+async function relayModule() {
+  return import('./relay')
 }
 
 beforeEach(() => {
@@ -193,7 +189,7 @@ describe('Bot relay delivery scheduler', () => {
       throw new Error(`unexpected RPC: ${route.connectionId} ${method}`)
     })
 
-    await (await botPlugin()).drainRelayOutboxes()
+    await (await relayModule()).drainRelayOutboxes()
 
     expect(replies).toEqual([{ id: 'a'.repeat(32), reply: 'world' }])
   })

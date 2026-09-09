@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from tools import mcp_death_supervisor, mcp_tool
+from tools import mcp_tool_lifecycle as _mcp_lifecycle
 
 pytestmark = pytest.mark.skipif(
     os.name != "posix", reason="the supervisor is POSIX-only (process groups)"
@@ -350,11 +351,29 @@ class _FakeSupervisor:
         self.stdin = io.StringIO()
         self.pid = 4242
         self._exited = exited
+        self._sent = ""
+        self.closed = False
+        _real_close = self.stdin.close
+
+        def _close():
+            # Mirror a real pipe: capture what was written before the write
+            # end goes away, so tests can still assert on the control stream.
+            self._sent = self.stdin.getvalue()
+            self.closed = True
+            _real_close()
+
+        self.stdin.close = _close
 
     def poll(self):
         return 1 if self._exited else None
 
+    def wait(self, timeout=None):
+        self.waited = True
+        return 0
+
     def lines(self):
+        if self.closed:
+            return self._sent.splitlines()
         return self.stdin.getvalue().splitlines()
 
 
@@ -365,7 +384,19 @@ def _reset_client_state():
     mcp_tool._supervised_pgids.clear()
 
 
-def test_register_starts_the_supervisor_once_and_reuses_it(monkeypatch):
+@pytest.fixture
+def all_groups_alive(monkeypatch):
+    """Answer every liveness probe with "this group exists".
+
+    The protocol tests below register synthetic pgids that were never real
+    process groups. Without this, the liveness prune correctly discards them
+    before the control stream can be asserted on -- so state the precondition
+    rather than letting these tests depend on pid-space luck.
+    """
+    monkeypatch.setattr(mcp_tool.os, "killpg", lambda pgid, sig: None)
+
+
+def test_register_starts_the_supervisor_once_and_reuses_it(monkeypatch, all_groups_alive):
     spawned = []
 
     def _spawn():
@@ -382,7 +413,7 @@ def test_register_starts_the_supervisor_once_and_reuses_it(monkeypatch):
     assert spawned[0].lines() == ["register 111", "register 222"]
 
 
-def test_unregister_is_forwarded(monkeypatch):
+def test_unregister_is_forwarded(monkeypatch, all_groups_alive):
     fake = _FakeSupervisor()
     monkeypatch.setattr(mcp_tool, "_spawn_death_supervisor", lambda: fake)
 
@@ -391,6 +422,56 @@ def test_unregister_is_forwarded(monkeypatch):
 
     assert fake.lines() == ["register 111", "unregister 111"]
     assert mcp_tool._supervised_pgids == set()
+
+
+def test_supervisor_is_released_once_nothing_is_left_to_reap(monkeypatch, all_groups_alive):
+    """An empty registration set must not keep a supervisor resident.
+
+    A gateway that once connected a stdio server would otherwise carry a
+    ~15 MB process and a live pipe for the rest of its life. Closing our
+    write end is the same EOF the supervisor treats as parent death; with
+    nothing registered it exits without reaping. The next register starts a
+    fresh one, exactly like the dead-supervisor replay path.
+    """
+    spawned = []
+
+    def _spawn():
+        fake = _FakeSupervisor()
+        spawned.append(fake)
+        return fake
+
+    monkeypatch.setattr(mcp_tool, "_spawn_death_supervisor", _spawn)
+
+    mcp_tool._update_death_supervisor("register", [111, 222])
+    mcp_tool._update_death_supervisor("unregister", [111])
+    assert not spawned[0].closed, "released the supervisor while a group was still registered"
+
+    mcp_tool._update_death_supervisor("unregister", [222])
+    assert spawned[0].closed, "supervisor kept resident with nothing left to reap"
+    assert getattr(spawned[0], "waited", False), "released supervisor was never wait()ed -> zombie until the next Popen"
+    assert spawned[0].lines()[-1] == "unregister 222", "release happened before the last unregister was sent"
+    assert mcp_tool._death_supervisor is None
+
+    mcp_tool._update_death_supervisor("register", [333])
+    assert len(spawned) == 2 and spawned[1].lines() == ["register 333"]
+
+
+def test_supervisor_survives_the_real_eof_release():
+    """End to end: closing the control pipe with nothing registered exits cleanly."""
+    if os.name != "posix":
+        pytest.skip("POSIX-only supervisor")
+    child = subprocess.Popen(_VICTIM, start_new_session=True)
+    try:
+        mcp_tool._update_death_supervisor("register", [os.getpgid(child.pid)])
+        proc = mcp_tool._death_supervisor
+        assert proc is not None and proc.poll() is None
+        mcp_tool._update_death_supervisor("unregister", [os.getpgid(child.pid)])
+        assert mcp_tool._death_supervisor is None
+        assert proc.wait(timeout=10) == 0, "supervisor did not exit on the release EOF"
+        assert child.poll() is None, "release reaped a group that had been unregistered"
+    finally:
+        _kill(child.pid)
+        child.wait(timeout=10)
 
 
 def test_unregister_alone_does_not_start_a_supervisor(monkeypatch):
@@ -406,7 +487,7 @@ def test_unregister_alone_does_not_start_a_supervisor(monkeypatch):
     assert spawned == []
 
 
-def test_a_dead_supervisor_is_replaced_and_live_coverage_replayed(monkeypatch):
+def test_a_dead_supervisor_is_replaced_and_live_coverage_replayed(monkeypatch, all_groups_alive):
     dead = _FakeSupervisor(exited=True)
     replacement = _FakeSupervisor()
     queue = [dead, replacement]
@@ -420,7 +501,7 @@ def test_a_dead_supervisor_is_replaced_and_live_coverage_replayed(monkeypatch):
     assert set(replacement.lines()) == {"register 111", "register 222"}
 
 
-def test_replay_does_not_resurrect_an_unregistered_group(monkeypatch):
+def test_replay_does_not_resurrect_an_unregistered_group(monkeypatch, all_groups_alive):
     dead = _FakeSupervisor(exited=True)
     replacement = _FakeSupervisor()
     queue = [dead, replacement]
@@ -431,10 +512,17 @@ def test_replay_does_not_resurrect_an_unregistered_group(monkeypatch):
     mcp_tool._update_death_supervisor("unregister", [111])
 
     assert mcp_tool._supervised_pgids == {222}
-    assert "register 111" not in replacement.lines()[-1:]
+    # 111 was legitimately replayed to the replacement (it was live when the
+    # dead supervisor was swapped out), then unregistered. What must never
+    # happen is a replay AFTER the unregister bringing it back.
+    lines = replacement.lines()
+    assert lines.index("unregister 111") > lines.index("register 111")
+    assert "register 111" not in lines[lines.index("unregister 111") :]
+    mcp_tool._update_death_supervisor("register", [333])  # any later replay/append
+    assert "register 111" not in replacement.lines()[len(lines) :]
 
 
-def test_a_broken_pipe_never_propagates_into_a_live_mcp_session(monkeypatch):
+def test_a_broken_pipe_never_propagates_into_a_live_mcp_session(monkeypatch, all_groups_alive):
     class _BrokenPipe(_FakeSupervisor):
         def __init__(self):
             super().__init__()
@@ -457,7 +545,46 @@ def test_a_broken_pipe_never_propagates_into_a_live_mcp_session(monkeypatch):
     assert mcp_tool._death_supervisor is None
 
 
-def test_a_supervisor_that_cannot_start_is_not_fatal(monkeypatch):
+def test_unregister_after_a_broken_pipe_rebuilds_coverage_for_survivors(monkeypatch, all_groups_alive):
+    """A lost supervisor must be replaced by the NEXT lifecycle event, whatever its verb.
+
+    Sequence from the #93517 review: two groups live, the control pipe dies
+    (write fails, supervisor dropped, set retained), then a clean teardown
+    unregisters one of them. Keying the no-spawn fast path on the verb left
+    the survivor recorded but unsupervised; it must be keyed on the set.
+    """
+    spawned = []
+
+    def _spawn():
+        fake = _FakeSupervisor()
+        spawned.append(fake)
+        return fake
+
+    monkeypatch.setattr(mcp_tool, "_spawn_death_supervisor", _spawn)
+    mcp_tool._update_death_supervisor("register", [111, 222])
+
+    class _DeadStdin:
+        def write(self, _payload):
+            raise BrokenPipeError("supervisor died")
+
+        def flush(self):
+            pass
+
+    spawned[0].stdin = _DeadStdin()
+    mcp_tool._update_death_supervisor("register", [333])  # the write fails; supervisor dropped
+    assert mcp_tool._death_supervisor is None
+    assert mcp_tool._supervised_pgids == {111, 222, 333}
+
+    mcp_tool._update_death_supervisor("unregister", [222])
+
+    assert len(spawned) == 2, "unregister after a lost supervisor did not respawn one"
+    assert sorted(spawned[1].lines()) == ["register 111", "register 333"], (
+        "the replacement did not receive the surviving groups"
+    )
+    assert mcp_tool._death_supervisor is spawned[1]
+
+
+def test_a_supervisor_that_cannot_start_is_not_fatal(monkeypatch, all_groups_alive):
     monkeypatch.setattr(mcp_tool, "_spawn_death_supervisor", lambda: None)
 
     mcp_tool._update_death_supervisor("register", [111])  # must not raise
@@ -491,10 +618,10 @@ def _stdio_connection(child_pid, fake_supervisor):
         # First call is the pids_before baseline; the second reports our child
         # as the newly spawned server.
         patch(
-            "tools.mcp_tool._snapshot_child_pids",
+            "tools.mcp_tool_lifecycle._snapshot_child_pids",
             side_effect=[set(), {child_pid}],
         ),
-        patch("tools.mcp_tool._write_stderr_log_header"),
+        patch("tools.mcp_tool_config._write_stderr_log_header"),
         patch("tools.mcp_tool._get_mcp_stderr_log", return_value=None),
         patch(
             "tools.mcp_tool._spawn_death_supervisor",
@@ -574,6 +701,111 @@ def test_a_server_that_survived_teardown_stays_registered():
     finally:
         _kill(child.pid)
         child.wait(timeout=10)
+
+
+@pytest.mark.live_system_guard_bypass
+def test_scoped_teardown_of_one_owner_keeps_the_other_owner_supervised(monkeypatch):
+    """Two owners (profiles / agents) each hold a stdio group; tearing one down
+    must release only that owner's group and leave the other covered, and the
+    per-process supervisor must then still know about the survivor.
+
+    Exercises the real registry + ``_kill_orphaned_mcp_children`` scoping
+    rather than the control protocol alone (review request on #93517).
+    """
+    fake = _FakeSupervisor()
+    monkeypatch.setattr(mcp_tool, "_spawn_death_supervisor", lambda: fake)
+    monkeypatch.setattr(_mcp_lifecycle.time, "sleep", lambda _s: None)  # skip the SIGTERM grace wait
+    a = subprocess.Popen(_VICTIM, start_new_session=True)
+    b = subprocess.Popen(_VICTIM, start_new_session=True)
+    try:
+        pg_a, pg_b = os.getpgid(a.pid), os.getpgid(b.pid)
+        with mcp_tool._lock:
+            _mcp_lifecycle._stdio_pids[a.pid] = "profile-a"
+            _mcp_lifecycle._stdio_pids[b.pid] = "profile-b"
+            _mcp_lifecycle._stdio_pgids[a.pid] = pg_a
+            _mcp_lifecycle._stdio_pgids[b.pid] = pg_b
+        mcp_tool._update_death_supervisor("register", [pg_a, pg_b])
+
+        _mcp_lifecycle._kill_orphaned_mcp_children(include_active=True, server_name="profile-a")
+        a.wait(timeout=10)
+
+        assert b.poll() is None, "scoped teardown of profile-a killed profile-b's server"
+        assert f"unregister {pg_a}" in fake.lines()
+        assert f"unregister {pg_b}" not in fake.lines(), (
+            "scoped teardown released the OTHER owner's group from the supervisor"
+        )
+        assert mcp_tool._supervised_pgids == {pg_b}
+        assert b.pid in _mcp_lifecycle._stdio_pids and b.pid in _mcp_lifecycle._stdio_pgids
+    finally:
+        for p in (a, b):
+            _kill(p.pid)
+            try:
+                p.wait(timeout=10)
+            except Exception:  # noqa: BLE001 - best-effort cleanup
+                pass
+        with mcp_tool._lock:
+            for p in (a, b):
+                _mcp_lifecycle._stdio_pids.pop(p.pid, None)
+                _mcp_lifecycle._stdio_pgids.pop(p.pid, None)
+
+
+@pytest.mark.live_system_guard_bypass
+def test_a_group_with_nothing_left_alive_is_forgotten_and_unregistered(monkeypatch):
+    """A dead group must not stay registered: its pgid can be recycled.
+
+    Uses a real process so the liveness probe is answered by the kernel rather
+    than a fixture -- the whole point is that we notice actual death.
+    """
+    fake = _FakeSupervisor()
+    monkeypatch.setattr(mcp_tool, "_spawn_death_supervisor", lambda: fake)
+
+    doomed = subprocess.Popen(_VICTIM, start_new_session=True)
+    doomed_pgid = os.getpgid(doomed.pid)
+    survivor = subprocess.Popen(_VICTIM, start_new_session=True)
+    survivor_pgid = os.getpgid(survivor.pid)
+    try:
+        mcp_tool._update_death_supervisor("register", [doomed_pgid, survivor_pgid])
+        assert mcp_tool._supervised_pgids == {doomed_pgid, survivor_pgid}
+
+        # Reap it fully so the group is genuinely empty, not a zombie.
+        doomed.kill()
+        doomed.wait(timeout=10)
+
+        # Any later registration change is when we notice.
+        mcp_tool._update_death_supervisor("register", [survivor_pgid])
+
+        assert doomed_pgid not in mcp_tool._supervised_pgids, (
+            "a group with no members left stayed registered, so a recycled "
+            "pgid could later be reaped as if it were an MCP server"
+        )
+        assert survivor_pgid in mcp_tool._supervised_pgids, (
+            "pruning dropped a group that is still alive"
+        )
+        assert f"unregister {doomed_pgid}" in fake.lines(), (
+            "the supervisor was never told to forget the dead group"
+        )
+    finally:
+        _kill(survivor.pid)
+        survivor.wait(timeout=10)
+        _kill(doomed.pid)
+
+
+def test_pruning_keeps_groups_it_cannot_prove_are_gone(monkeypatch):
+    # An ambiguous probe (EPERM: exists but not ours) must not drop coverage --
+    # losing a real registration is worse than keeping a doubtful one.
+    monkeypatch.setattr(mcp_tool, "_supervised_pgids", {111, 222}, raising=False)
+
+    def _probe(pgid, sig):
+        if pgid == 111:
+            raise PermissionError("exists, not ours")
+        raise ProcessLookupError("gone")
+
+    monkeypatch.setattr(mcp_tool.os, "killpg", _probe)
+
+    stale = mcp_tool._prune_dead_supervised_pgids()
+
+    assert stale == {222}
+    assert mcp_tool._supervised_pgids == {111}
 
 
 def test_no_pgids_is_a_no_op(monkeypatch):

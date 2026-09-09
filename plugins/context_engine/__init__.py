@@ -1,29 +1,14 @@
-"""Context engine plugin discovery.
-
-Scans ``plugins/context_engine/<name>/`` directories for context engine
-plugins.  Each subdirectory must contain ``__init__.py`` with a class
-implementing the ContextEngine ABC.
-
-Context engines are separate from the general plugin system — they live
-in the repo and are always available without user installation.  Only ONE
-can be active at a time, selected via ``context.engine`` in config.yaml.
-The default engine is ``"compressor"`` (the built-in ContextCompressor).
-
-Usage:
-    from plugins.context_engine import discover_context_engines, load_context_engine
-
-    available = discover_context_engines()   # [(name, desc, available), ...]
-    engine = load_context_engine("lcm")      # ContextEngine instance
-"""
+"""Context engine plugin discovery: ``plugins/context_engine/<name>/`` → ``ContextEngine``.
+Engines ship in the repo, separate from the general plugin system; only one is active
+(``context.engine`` in config.yaml; default ``"compressor"``, the built-in ContextCompressor)."""
 
 from __future__ import annotations
 
-import importlib
-import importlib.util
 import logging
-import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
+
+from plugins import plugin_loader as _loader
 
 logger = logging.getLogger(__name__)
 
@@ -85,11 +70,8 @@ def discover_context_engines() -> List[Tuple[str, str, bool]]:
     return results
 
 
-def load_context_engine(name: str) -> Optional["ContextEngine"]:
-    """Load and return a ContextEngine instance by name.
-
-    Returns None if the engine is not found or fails to load.
-    """
+def load_context_engine(name: str) -> Optional["ContextEngine"]:  # noqa: F821
+    """Load a ContextEngine instance by name; None if not found or it fails to load."""
     engine_dir = _CONTEXT_ENGINE_PLUGINS_DIR / name
     if not engine_dir.is_dir():
         logger.debug(
@@ -242,40 +224,24 @@ def _load_engine_from_dir(engine_dir: Path) -> Optional["ContextEngine"]:
     return None
 
 
-class _EngineCollector:
-    """Fake plugin context that captures register_context_engine calls.
-
-    Plugin context engines using the standard ``register(ctx)`` pattern may
-    also call ``ctx.register_command(...)`` to expose slash commands (e.g.
-    ``/lcm``). Forward those to the global plugin command registry so they
-    behave identically to commands registered by normal plugins.
-    """
+class _EngineCollector(_loader.NoopPluginContext):
+    """Captures register_context_engine; forwards register_command to the global plugin command
+    registry so engine slash commands behave like plugin ones."""
 
     def __init__(self, engine_name: str = ""):
         self.engine = None
         self._engine_name = engine_name or "context_engine"
-        self._registered_commands: list[str] = []
 
     def register_context_engine(self, engine):
         self.engine = engine
 
-    def register_command(
-        self,
-        name: str,
-        handler,
-        description: str = "",
-        args_hint: str = "",
-    ) -> None:
-        """Forward to the global plugin command registry."""
+    def register_command(self, name: str, handler, description: str = "", args_hint: str = "") -> None:
         clean = (name or "").lower().strip().lstrip("/").replace(" ", "-")
         if not clean:
-            logger.warning(
-                "Context engine '%s' tried to register a command with an empty name.",
-                self._engine_name,
-            )
+            logger.warning("Context engine '%s' tried to register a command with an empty name.",
+                           self._engine_name)
             return
-
-        # Reject conflicts with built-in commands.
+        conflict = "Context engine '%s' tried to register command '/%s' which %s Skipping."
         try:
             from hermes_cli.commands import resolve_command
 
@@ -289,7 +255,6 @@ class _EngineCollector:
                 return
         except Exception:
             pass
-
         try:
             from hermes_cli.plugins import get_plugin_manager
 
@@ -324,15 +289,11 @@ class _EngineCollector:
                 exc,
             )
 
-    # No-op for other registration methods
-    def register_tool(self, *args, **kwargs):
-        pass
 
-    def register_hook(self, *args, **kwargs):
-        pass
-
-    def register_cli_command(self, *args, **kwargs):
-        pass
-
-    def register_memory_provider(self, *args, **kwargs):
-        pass
+# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
+# Names external plugins imported from this module before the Sep 2026 decomposition.
+# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
+# The whole block is removed by reverting the commit that added it.
+import importlib.util  # noqa: F401,E402
+import sys  # noqa: F401,E402
+# ---- END PLUGIN-COMPAT ----

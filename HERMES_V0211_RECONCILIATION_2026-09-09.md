@@ -49,3 +49,29 @@ The conflict set divides mechanically into:
 - temporary reconciliation workflows absent from the proposed final tree.
 
 No merge to `main`, force-push, runtime activation, live migration, provider call, or user-state mutation is authorized by this receipt.
+
+## Structural reconciliation checkpoint — 2026-09-09
+
+The reconciliation was rebased onto the then-current Ares main owner state before merging Hermes:
+
+- current-main owner pin incorporated first: `fa74bfdb98e541fe719bb0f99f6bd44bce034f44`;
+- conflict inventory remained exactly 121 paths: 36 upstream-only, 85 owner-sensitive;
+- upstream-only conflicts resolve to the pinned Hermes tree;
+- owner-sensitive conflicts preserve Ares on overlapping hunks, with decomposed upstream owners restored where an old monolithic Ares body would otherwise become a shadow owner;
+- Bot Mode retains upstream modular `relay.ts` ownership plus Ares keyed bounded delivery concurrency;
+- managed Ares runtime keeps custody of its release-pointer systemd unit;
+- multiplex authorization remains fail-closed if profile scope resolution fails;
+- oneshot keeps opt-in audit transcript archiving at the decomposed cleanup owner;
+- `ares_runtime/` remains unchanged by this upstream merge.
+
+Structural gates at this checkpoint:
+
+- unmerged index entries: 0;
+- real conflict start/end markers: 0;
+- `git diff --cached --check`: PASS;
+- changed Python files compiled: 3,681 / 3,681;
+- syntax/indentation failures: 0.
+
+This is a **structural checkpoint only**. Import sweeps, owner-focused behavioral tests,
+lock/lint checks, desktop/TUI checks, and final CI/Nix/Docker remain required before any
+merge-ready claim.
