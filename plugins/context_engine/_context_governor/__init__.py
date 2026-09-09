@@ -3483,7 +3483,6 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
     ) -> dict[str, Any]:
         command = [str(self.binary), *args]
         popen_kwargs: dict[str, Any] = {
-            "stdin": subprocess.PIPE,
             "stdout": subprocess.PIPE,
             "stderr": subprocess.PIPE,
             "text": True,
@@ -3498,7 +3497,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             # not permission for a detached worker to publish later.
             popen_kwargs["start_new_session"] = True
             popen_kwargs["pass_fds"] = pass_fds
-        proc = subprocess.Popen(command, **popen_kwargs)
+        proc = subprocess.Popen(command, stdin=subprocess.PIPE, **popen_kwargs)
         try:
             stdout, stderr = proc.communicate(
                 input=json.dumps(payload, ensure_ascii=False),
@@ -3530,7 +3529,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             return
         if os.name != "nt":
             try:
-                os.killpg(proc.pid, signal.SIGTERM)
+                os.killpg(proc.pid, signal.SIGTERM)  # windows-footgun: ok
             except ProcessLookupError:
                 return
             try:
@@ -3538,7 +3537,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 return
             except subprocess.TimeoutExpired:
                 try:
-                    os.killpg(proc.pid, signal.SIGKILL)
+                    os.killpg(proc.pid, signal.SIGKILL)  # windows-footgun: ok
                 except ProcessLookupError:
                     return
         else:
