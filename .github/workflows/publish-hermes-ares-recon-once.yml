@@ -40,6 +40,8 @@ jobs:
           gzip -dc "$patch_gz" > "$patch"
           test "$(sha256sum "$patch" | awk '{print $1}')" = "$expected_patch"
 
+          git config user.name 'Ares Hermes Reconciliation'
+          git config user.email 'ares-hermes-recon@users.noreply.github.com'
           git remote add hermes https://github.com/NousResearch/hermes-agent.git
           git fetch --no-tags hermes "$expected_upstream"
           test "$(git rev-parse FETCH_HEAD)" = "$expected_upstream"
@@ -118,8 +120,6 @@ jobs:
             python -m py_compile "${changed_py[@]}"
           fi
 
-          git config user.name 'Ares Hermes Reconciliation'
-          git config user.email 'ares-hermes-recon@users.noreply.github.com'
           git commit -m 'merge(upstream): reconcile Hermes v0.21.1 structural owners'
           test "$(git rev-parse HEAD^{tree})" = "$expected_tree"
           test "$(git rev-parse HEAD^2)" = "$expected_upstream"
