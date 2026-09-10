@@ -71,9 +71,7 @@ def parse_failure_envelope(stderr: str, expected_operation: str) -> ContextGover
             )
         )
     except (TypeError, ValueError) as exc:
-        raise ContextGovernorProtocolError(
-            "unserializable Context Governor failure details"
-        ) from exc
+        raise ContextGovernorProtocolError("unserializable Context Governor failure details") from exc
     if details_size > _MAX_DETAILS_BYTES:
         raise ContextGovernorProtocolError("Context Governor failure details exceed bound")
     return ContextGovernorCommandError(expected_operation, code, details)

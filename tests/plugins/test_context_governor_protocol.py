@@ -52,28 +52,9 @@ def test_failure_envelope_uses_code_not_display_text():
     [
         "CannotMeetTarget: old English message",
         "{}",
-        json.dumps(
-            {
-                "schema": "ContextGovernorFailureV1",
-                "operation": "wrong",
-                "code": "io_failed",
-            }
-        ),
-        json.dumps(
-            {
-                "schema": "ContextGovernorFailureV1",
-                "operation": "compact-v2",
-                "code": "BAD CODE",
-            }
-        ),
-        json.dumps(
-            {
-                "schema": "ContextGovernorFailureV1",
-                "operation": "compact-v2",
-                "code": "io_failed",
-                "unexpected": True,
-            }
-        ),
+        json.dumps({"schema": "ContextGovernorFailureV1", "operation": "wrong", "code": "io_failed"}),
+        json.dumps({"schema": "ContextGovernorFailureV1", "operation": "compact-v2", "code": "BAD CODE"}),
+        json.dumps({"schema": "ContextGovernorFailureV1", "operation": "compact-v2", "code": "io_failed", "unexpected": True}),
     ],
 )
 def test_malformed_or_untyped_failure_is_protocol_error(stderr):
