@@ -4,8 +4,12 @@ on:
     types: [opened, synchronize, reopened]
     paths:
       - '.github/workflows/context-governor-paired-proof-once.yml'
-      # Attribution-only repair commits must receive exact-head paired proof.
       - 'contributors/emails/**'
+      - 'docs/context-governor-runtime-closure-20260909.md'
+      - 'plugins/context_engine/_context_governor/**'
+      - 'tests/agent/test_context_governor_restore.py'
+      - 'tests/plugins/test_context_governor_fd_ownership.py'
+      - 'tests/plugins/test_context_governor_runtime_closure.py'
 permissions:
   contents: read
 concurrency:
@@ -13,7 +17,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   paired-proof:
-    if: github.head_ref == 'repair/context-governor-runtime-closure-20260909' && github.event.pull_request.head.repo.full_name == github.repository
+    if: github.head_ref == 'fix/context-governor-runtime-mainline-final' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
