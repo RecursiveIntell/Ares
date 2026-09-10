@@ -77,6 +77,7 @@ def _activation_engine():
         },
         "savings_pct": 50.0,
         "exact_fallback_available": True,
+        "host_boundary_accepted": True,
     }
     engine.store_dir = Path("/tmp/unused-cg-test-store")
     engine.compression_count = 0
@@ -131,3 +132,42 @@ def test_failed_activation_replay_retains_pending_for_reconciliation():
         engine.commit_pending_compression([{"role": "user", "content": "kept"}])
     assert calls == 2
     assert engine._pending_admission["receipt_id"] == "ctxr_test"
+
+
+def test_accepted_pending_mismatch_is_retained_and_blocks_automatic_discard():
+    engine = _activation_engine()
+    engine._pending_admission["host_boundary_accepted"] = True
+    engine.validate_pending_compression = lambda _messages: False
+    discarded = []
+    engine._discard_pending_receipt = lambda receipt_id: discarded.append(receipt_id)
+    engine._last_compress_aborted = False
+    engine._last_summary_error = None
+    engine._last_summary_fallback_used = False
+    engine._last_compression_made_progress = False
+    engine._compression_operation_lock = __import__("threading").RLock()
+    original = [{"role": "user", "content": "different durable transcript"}]
+
+    assert engine.compress(original, current_tokens=100) == original
+    assert discarded == []
+    assert engine._pending_admission["receipt_id"] == "ctxr_test"
+    assert engine.last_outcome == {
+        "kind": "pending_recovery_blocked",
+        "receipt_id": "ctxr_test",
+    }
+
+
+def test_accepted_pending_cannot_be_discarded_by_generic_abort_hook():
+    engine = _activation_engine()
+    engine._pending_admission["host_boundary_accepted"] = True
+    engine._discard_pending_receipt = lambda _receipt_id: pytest.fail("receipt was discarded")
+    with pytest.raises(ContextGovernorProtocolError, match="after host boundary acceptance"):
+        engine.discard_pending_compression(reason="engine_aborted")
+    assert engine._pending_admission["receipt_id"] == "ctxr_test"
+
+
+def test_missing_pending_receipt_cannot_acknowledge_changed_projection():
+    engine = _activation_engine()
+    engine._pending_admission = None
+    engine._last_compression_made_progress = True
+    with pytest.raises(ContextGovernorProtocolError, match="without a prepared"):
+        engine.commit_pending_compression([{"role": "user", "content": "changed"}])

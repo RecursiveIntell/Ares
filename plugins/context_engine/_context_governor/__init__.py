@@ -1132,25 +1132,20 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         self,
         messages: List[Dict[str, Any]],
     ) -> str | None:
-        """Settle a prior durable-host commit before preparing another receipt.
+        """Reconcile one prepared receipt without widening settlement authority.
 
-        The host commits SessionDB before activating the prepared governor
-        receipt. If activation fails transiently, the authoritative transcript
-        is already durable and rolling it back would be wrong. Retain the
-        pending admission, but retry its authenticated activation on every
-        later compaction attempt. A transcript that no longer contains the
-        prepared projection can never activate legitimately, so discard that
-        inert receipt and let the current authoritative transcript start a new
-        generation instead of permanently wedging the live engine.
-
-        Return an operator-safe error only when the pending transition remains
-        unsettled. ``None`` means activation succeeded, mismatch discard
-        succeeded, or no admission was pending.
+        ``prepare-v2`` is inert until the host has accepted the exact projection
+        at its durable transcript boundary.  A second caller that merely sees
+        the same pending receipt is not allowed to activate or discard it. Once
+        ``commit_pending_compression`` has observed that durable boundary, the
+        pending receipt remains bound to host truth across response loss and may
+        be replayed idempotently through Rust's activation owner.
         """
         pending = self._pending_admission
         if pending is None:
             return None
         receipt_id = str(pending.get("receipt_id") or "unknown")
+        host_boundary_accepted = pending.get("host_boundary_accepted") is True
         try:
             matches_host = self.validate_pending_compression(messages)
         except Exception as exc:
@@ -1159,39 +1154,63 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 f"validated against the durable host transcript: {exc}"
             )
 
-        if not matches_host:
-            try:
-                self.discard_pending_compression(
-                    reason="pre_compaction_projection_mismatch"
-                )
-            except Exception as exc:
+        if matches_host:
+            if not host_boundary_accepted:
+                self.last_outcome = {
+                    "kind": "pending_host_commit",
+                    "receipt_id": receipt_id,
+                }
                 return (
-                    f"stale context-governor receipt {receipt_id} does not match "
-                    f"the durable host transcript and could not be discarded: {exc}"
+                    f"context-governor receipt {receipt_id} is still awaiting "
+                    "host commit settlement"
                 )
-            warning = (
-                f"stale pending receipt {receipt_id} did not match the durable "
-                "host transcript; discarded it before retrying compaction"
+            try:
+                self.commit_pending_compression(messages)
+            except Exception as exc:
+                self.last_outcome = {
+                    "kind": "pending_recovery_blocked",
+                    "receipt_id": receipt_id,
+                }
+                return (
+                    f"pending context-governor receipt {receipt_id} still matches "
+                    f"the durable host transcript but activation retry failed: {exc}"
+                )
+            logger.info(
+                "context-governor: recovered pending receipt %s before new compaction",
+                receipt_id,
             )
-            self._record_summary_warning(
-                "pending_projection_mismatch_discarded",
-                warning,
-            )
-            logger.warning("context-governor: %s", warning)
-            self.last_error = None
             return None
 
+        if host_boundary_accepted:
+            self.last_outcome = {
+                "kind": "pending_recovery_blocked",
+                "receipt_id": receipt_id,
+            }
+            return (
+                f"pending context-governor receipt {receipt_id} was accepted at the "
+                "host durability boundary but the current transcript no longer "
+                "matches it; refusing automatic discard"
+            )
+
         try:
-            self.commit_pending_compression(messages)
+            self.discard_pending_compression(
+                reason="pre_compaction_projection_mismatch"
+            )
         except Exception as exc:
             return (
-                f"pending context-governor receipt {receipt_id} still matches "
-                f"the durable host transcript but activation retry failed: {exc}"
+                f"stale context-governor receipt {receipt_id} does not match "
+                f"the durable host transcript and could not be discarded: {exc}"
             )
-        logger.info(
-            "context-governor: recovered pending receipt %s before new compaction",
-            receipt_id,
+        warning = (
+            f"stale pending receipt {receipt_id} did not match the durable "
+            "host transcript; discarded it before retrying compaction"
         )
+        self._record_summary_warning(
+            "pending_projection_mismatch_discarded",
+            warning,
+        )
+        logger.warning("context-governor: %s", warning)
+        self.last_error = None
         return None
 
     def _ensure_operation_state(self) -> None:
@@ -1217,21 +1236,21 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             return messages
         self._ensure_operation_state()
         with self._compression_operation_lock:
-            pending = self._pending_admission
-            if pending is not None:
-                receipt_id = str(pending.get("receipt_id") or "unknown")
-                error = (
-                    f"context-governor receipt {receipt_id} is still awaiting "
-                    "host commit settlement"
+            if self._pending_admission is not None:
+                receipt_id = str(
+                    self._pending_admission.get("receipt_id") or "unknown"
                 )
-                self.last_error = error
-                self._last_compress_aborted = True
-                self._last_summary_error = error
-                self.last_outcome = {
-                    "kind": "pending_host_commit",
-                    "receipt_id": receipt_id,
-                }
-                return messages
+                error = self._recover_pending_before_compaction(messages)
+                if error is not None:
+                    self.last_error = error
+                    self._last_compress_aborted = True
+                    self._last_summary_error = error
+                    if not isinstance(self.last_outcome, dict):
+                        self.last_outcome = {
+                            "kind": "pending_recovery_blocked",
+                            "receipt_id": receipt_id,
+                        }
+                    return messages
             return self._compress_once(messages, current_tokens, focus_topic)
 
     def _compress_once(
@@ -1248,13 +1267,6 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
 
         if not messages:
             return messages
-        if self._pending_admission is not None:
-            error = self._recover_pending_before_compaction(messages)
-            if error is not None:
-                self.last_error = error
-                self._last_compress_aborted = True
-                self._last_summary_error = error
-                return messages
 
         started = time.monotonic()
         before_bytes = len(json.dumps(messages, ensure_ascii=False).encode("utf-8"))
@@ -1598,6 +1610,10 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 "exact_fallback_available": bool(exact_refs),
                 "physical_session_id": self.session_id,
                 "lineage_session_id": self._governor_session_id(),
+                # False until commit_pending_compression observes the host's
+                # durable transcript boundary. This prevents an unrelated
+                # concurrent caller from activating or discarding this receipt.
+                "host_boundary_accepted": False,
             }
             self.last_error = None
             self.last_outcome = {
@@ -3705,6 +3721,10 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         """Activate the prepared receipt only after the host accepts its prefix."""
         pending = self._pending_admission
         if pending is None:
+            if self._last_compression_made_progress:
+                raise ContextGovernorProtocolError(
+                    "compression changed the host projection without a prepared Context Governor receipt"
+                )
             return True
         info = pending.get("pending_info") or {}
         expected = info.get("expected_compacted_messages") or []
@@ -3717,6 +3737,10 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 "host-committed transcript does not contain the authenticated "
                 "pending governor projection as an exact prefix"
             )
+        # Crossing this point means the host supplied a transcript that exactly
+        # contains the authenticated prepared projection. Retain that fact even
+        # if the activation response is lost; Rust owns idempotent settlement.
+        pending["host_boundary_accepted"] = True
         receipt_id = str(pending.get("receipt_id") or "")
         activation_args = [
             "activate-v2",
@@ -3823,10 +3847,19 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         )
 
     def discard_pending_compression(self, **kwargs) -> bool:
-        """Discard an in-process receipt when the host rejects its boundary."""
+        """Discard only an inert receipt that has not crossed host durability."""
         pending = self._pending_admission
         if pending is None:
             return True
+        if pending.get("host_boundary_accepted") is True:
+            raise ContextGovernorProtocolError(
+                "refusing to discard a Context Governor receipt after host boundary acceptance"
+            )
+        # A concurrent caller that was explicitly blocked on another caller's
+        # prepared receipt must not turn a generic host-abort hook into shared
+        # settlement authority.
+        if (self.last_outcome or {}).get("kind") == "pending_host_commit":
+            return False
         receipt_id = str(pending.get("receipt_id") or "")
         if not receipt_id:
             self._pending_admission = None
@@ -3916,6 +3949,10 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                     "exact_fallback_available": True,
                     "physical_session_id": session_id,
                     "lineage_session_id": self._governor_session_id(),
+                    # The durable SessionDB transcript is the recovery witness.
+                    # commit_pending_compression marks the boundary accepted
+                    # before replaying activation.
+                    "host_boundary_accepted": False,
                 }
                 try:
                     self.commit_pending_compression(durable)

@@ -169,6 +169,7 @@ def test_duplicate_compressions_do_not_share_pending_settlement() -> None:
         return [{"role": "user", "content": "bounded result"}]
 
     setattr(engine, "_compress_once", compress_once)
+    engine.validate_pending_compression = lambda _messages: True
     messages = [{"role": "user", "content": "same request"}]
     results = {}
     owner = threading.Thread(
