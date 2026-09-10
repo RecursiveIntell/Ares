@@ -78,7 +78,7 @@ def _capture_popen(monkeypatch):
         calls.append((list(args), kwargs))
         return _DummyProcess()
 
-    monkeypatch.setattr(base_env.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
     return calls
 
 
@@ -445,5 +445,6 @@ def test_docker_explicit_forward_cannot_export_hermes_internal_secret(
 
     args = env._build_init_env_args()
 
-    assert "DB_PASSWORD=fake-db-password" in args
+    assert ["-e", "DB_PASSWORD"] == args
+    assert env._init_env_values["DB_PASSWORD"] == "fake-db-password"
     assert not any(arg.startswith("BWS_ACCESS_TOKEN=") for arg in args)

@@ -3491,7 +3491,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             return
         if os.name != "nt":
             try:
-                os.killpg(proc.pid, signal.SIGTERM)
+                os.killpg(proc.pid, signal.SIGTERM)  # windows-footgun: ok
             except ProcessLookupError:
                 return
             try:
@@ -3499,7 +3499,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 return
             except subprocess.TimeoutExpired:
                 try:
-                    os.killpg(proc.pid, signal.SIGKILL)
+                    os.killpg(proc.pid, signal.SIGKILL)  # windows-footgun: ok
                 except ProcessLookupError:
                     return
         else:

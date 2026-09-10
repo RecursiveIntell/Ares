@@ -41,7 +41,7 @@ from agent.message_sanitization import (_sanitize_surrogates, _repair_tool_call_
 from agent.reasoning_summaries import separate_glued_reasoning_blocks
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 from agent.transports.ri_llm import _should_use_ri_pipeline, ri_pipeline_chat_completion
-from tools.terminal_tool import is_persistent_env
+from tools.terminal_tool_lifecycle import is_persistent_env
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 
 logger = logging.getLogger(__name__)

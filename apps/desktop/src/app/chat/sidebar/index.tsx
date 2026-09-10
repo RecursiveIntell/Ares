@@ -155,6 +155,7 @@ import { filterSessionsByProfileScope } from './profile-scope'
 import { ProfileRail } from './profile-switcher'
 import { ProjectDialog } from './project-dialog'
 import { resolveLiveProjectFilter } from './project-filter'
+import { useEnteredProjectSessions } from './use-entered-project-sessions'
 import {
   excludeProjectSessions,
   orderProjectsByIds,

@@ -941,7 +941,7 @@ def handle_function_call(
         _dispatch_start = time.monotonic()
         _approval_tokens = None
         try:
-            from tools.approval import (
+            from tools.approval_context import (
                 reset_current_observability_context,
                 set_current_observability_context,
             )

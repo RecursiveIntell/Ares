@@ -526,7 +526,7 @@ class ResponsesApiTransport(ProviderTransport):
         )
 
         from agent.prompt_builder import select_default_agent_identity
-        from run_agent import DEFAULT_AGENT_IDENTITY
+        from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
 
         instructions = params.get("instructions", "")
         payload_messages = messages

@@ -10,7 +10,7 @@ import { useAui, useAuiState, useComposerRuntime } from '@assistant-ui/react'
 import { useStore } from '@nanostores/react'
 import { type RefObject, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 
-import { usePaneGroup } from '@/components/pane-shell/pane-visibility'
+import { usePaneGroup, usePaneVisible } from '@/components/pane-shell/pane-visibility'
 import { $activeTreeGroup } from '@/components/pane-shell/tree/store'
 import { SLASH_COMMAND_RE } from '@/lib/chat-runtime'
 import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'

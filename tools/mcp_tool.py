@@ -1754,7 +1754,7 @@ class ElicitationHandler:
         # bootstrap; matching the lazy pattern used by _fire_approval_hook
         # avoids any chance of import-order coupling.
         try:
-            from tools.approval import request_elicitation_consent
+            from tools.approval_prompt import request_elicitation_consent
         except Exception as exc:  # pragma: no cover -- defensive
             logger.error(
                 "MCP server '%s' elicitation: approval system unavailable: %s",

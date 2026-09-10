@@ -17,7 +17,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from hermes_constants import get_process_hermes_home
+from hermes_constants import apply_subprocess_home_env, get_process_hermes_home
 from tools.environments.base import BaseEnvironment
 from tools.environments.base_output import _pipe_stdin
 from hermes_cli._subprocess_compat import windows_hide_flags
@@ -712,11 +712,10 @@ def _sanitize_subprocess_env(
             real_key = key[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
             if _is_hermes_internal_secret(real_key):
                 continue
-            key = key[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
-            if not _is_hermes_internal_secret(key):
-                out[key] = value
+            sanitized[real_key] = value
+        elif _is_hermes_internal_secret(key):
             continue
-        if _is_hermes_internal_secret(key) or key in plugin_strip:
+        elif key in _plugin_strip:
             continue
         else:
             passthrough = _is_passthrough(key)
@@ -751,13 +750,24 @@ def _sanitize_subprocess_env(
     )
 
     # An explicit target profile is authoritative for both HERMES_HOME and the
-    # derived subprocess HOME policy.  Install it before evaluating
+    # derived subprocess HOME policy. Install it before evaluating
     # apply_subprocess_home_env(); otherwise standalone workers can get split
     # identity (target HERMES_HOME with the dispatcher's HOME).
     if profile_home is not None:
         sanitized["HERMES_HOME"] = str(profile_home)
     else:
         _inject_context_hermes_home(sanitized)
+
+    from hermes_constants import apply_subprocess_home_env
+    apply_subprocess_home_env(sanitized)
+    _inject_session_context_env(sanitized)
+    _strip_hermes_owned_pythonpath_and_runtime_markers(sanitized)
+    path_key = _path_env_key(sanitized)
+    if path_key is not None:
+        sanitized[path_key] = _prepend_hermes_bin_dir(sanitized.get(path_key, ""))
+    _apply_windows_msys_bash_env_defaults(sanitized)
+    return _scrub_delegated_child_kanban_env(sanitized)
+
 
 def _finalize_child_env(env: dict) -> dict:
     """Guards shared by every spawn surface: profile-home propagation, session-context
