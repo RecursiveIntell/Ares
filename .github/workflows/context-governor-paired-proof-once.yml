@@ -4,6 +4,8 @@ on:
     types: [opened, synchronize, reopened]
     paths:
       - '.github/workflows/context-governor-paired-proof-once.yml'
+      # Attribution-only repair commits must receive exact-head paired proof.
+      - 'contributors/emails/**'
 permissions:
   contents: read
 concurrency:
