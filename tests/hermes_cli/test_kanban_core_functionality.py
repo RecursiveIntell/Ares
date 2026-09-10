@@ -717,6 +717,10 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
 
     monkeypatch.setattr("subprocess.Popen", fake_popen)
 
+    # Worker profile resolution is fail-closed before spawn.  Keep this test
+    # focused on argv skill loading by providing the profile it asks to run.
+    (kanban_home / "profiles" / "some-profile").mkdir(parents=True)
+
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="skill-loading test",
