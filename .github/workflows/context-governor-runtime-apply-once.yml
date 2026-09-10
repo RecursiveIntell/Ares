@@ -34,8 +34,8 @@ jobs:
           actual = hashlib.sha256(raw).hexdigest()
           if actual != expected:
               raise SystemExit(f'runtime patch digest mismatch: {actual}')
-          subprocess.run(['git','apply','--check','-'], input=raw, check=True)
-          subprocess.run(['git','apply','-'], input=raw, check=True)
+          subprocess.run(['git','apply','--check','--whitespace=fix','-'], input=raw, check=True)
+          subprocess.run(['git','apply','--whitespace=fix','-'], input=raw, check=True)
           PY
           git diff --check
           uv sync --frozen --extra dev
