@@ -18,7 +18,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: 0
+          fetch-depth: 1
       - uses: astral-sh/setup-uv@v7
         with:
           version: '0.9.28'
