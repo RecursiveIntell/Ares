@@ -1,0 +1,88 @@
+name: Context Governor paired binary proof (temporary)
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - '.github/workflows/context-governor-paired-proof-once.yml'
+permissions:
+  contents: read
+concurrency:
+  group: context-governor-paired-proof
+  cancel-in-progress: false
+jobs:
+  paired-proof:
+    if: github.head_ref == 'repair/context-governor-runtime-closure-20260909' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+      - uses: actions/checkout@v4
+        with:
+          repository: RecursiveIntell/Libraries
+          ref: 4d622eff4dcc5fdf9aa8131f7e739a113a945ca6
+          path: libraries
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: '0.9.28'
+      - name: Build exact Context Governor owner
+        run: cargo build --release --locked --manifest-path libraries/context-governor/Cargo.toml
+      - name: Install locked Ares test environment
+        run: uv sync --frozen --extra dev
+      - name: Exercise exact binary through Ares protocol and subprocess path
+        shell: bash
+        env:
+          HERMES_HOME: ${{ runner.temp }}/hermes
+        run: |
+          set -euo pipefail
+          bin="$PWD/libraries/context-governor/target/release/context-governor"
+          test -x "$bin"
+          "$bin" capabilities > "$RUNNER_TEMP/capabilities.json"
+          BIN="$bin" .venv/bin/python - <<'PY'
+          import json, os, tempfile
+          from pathlib import Path
+          from plugins.context_engine._context_governor import ContextGovernorEngine
+          from plugins.context_engine._context_governor.protocol import (
+              ContextGovernorCommandError,
+              FAILURE_FLAG,
+              require_failure_capability,
+          )
+          capabilities = json.loads(Path(os.environ['RUNNER_TEMP']).joinpath('capabilities.json').read_text())
+          require_failure_capability(capabilities)
+          engine = ContextGovernorEngine(binary=os.environ['BIN'], store_dir=tempfile.mkdtemp())
+          engine.timeout_sec = 10
+          try:
+              engine._run_json(["compact", FAILURE_FLAG], {"session_id": "paired-proof", "messages": []})
+          except ContextGovernorCommandError as exc:
+              assert exc.operation == "compact"
+              assert exc.code == "empty_messages"
+          else:
+              raise AssertionError("exact Rust binary did not surface typed failure through Ares")
+          PY
+          set +e
+          printf '%s' '{"session_id":"human-proof","messages":[]}' | "$bin" compact > "$RUNNER_TEMP/human.out" 2> "$RUNNER_TEMP/human.err"
+          rc=$?
+          set -e
+          test "$rc" -ne 0
+          grep -q 'cannot compact an empty message list' "$RUNNER_TEMP/human.err"
+      - name: Re-run focused Ares closure suites on same head
+        shell: bash
+        run: |
+          set -euo pipefail
+          HERMES_PYTHON="$PWD/.venv/bin/python" scripts/run_tests.sh \
+            tests/plugins/test_context_governor_protocol.py \
+            tests/plugins/test_context_governor_fd_ownership.py \
+            tests/plugins/test_context_governor_runtime_closure.py \
+            tests/agent/test_context_governor_restore.py -- -q
+          .venv/bin/python scripts/check-windows-footguns.py --all
+          uvx --from ruff==0.15.10 ruff check \
+            plugins/context_engine/_context_governor \
+            tests/plugins/test_context_governor_protocol.py \
+            tests/plugins/test_context_governor_fd_ownership.py \
+            tests/plugins/test_context_governor_runtime_closure.py \
+            tests/agent/test_context_governor_restore.py
+          .venv/bin/python -m compileall -q plugins/context_engine/_context_governor tests/plugins tests/agent/test_context_governor_restore.py
