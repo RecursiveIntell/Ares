@@ -333,6 +333,7 @@ def _checkpoint_engine(
                 "path": f"/tmp/{payload['receipt_id']}.json",
                 "activated": True,
                 "verified": True,
+                "already_activated": False,
             }
         if args[:3] == ["discard-v2", "--dir", str(engine.store_dir)]:
             receipt_id = args[args.index("--receipt") + 1]
@@ -411,6 +412,7 @@ def test_live_engine_retries_pending_activation_before_new_compaction():
         "llm_checkpoint_applied": False,
         "savings_pct": 50.0,
         "exact_fallback_available": True,
+        "host_boundary_accepted": True,
     }
     calls = []
     activation_attempts = 0
@@ -427,6 +429,7 @@ def test_live_engine_retries_pending_activation_before_new_compaction():
                 "receipt_id": payload["receipt_id"],
                 "activated": True,
                 "verified": True,
+                "already_activated": False,
             }
         if args[0] == "compact-v2":
             raise RuntimeError("synthetic next compaction reached")
@@ -467,6 +470,7 @@ def test_mismatched_pending_projection_is_discarded_before_new_compaction():
         "llm_checkpoint_applied": False,
         "savings_pct": 50.0,
         "exact_fallback_available": True,
+        "host_boundary_accepted": False,
     }
     calls = []
 
@@ -538,6 +542,7 @@ def test_restart_reconciliation_failure_stays_bound_for_next_turn_retry():
                 "receipt_id": payload["receipt_id"],
                 "activated": True,
                 "verified": True,
+                "already_activated": False,
             }
         if args[0] == "compact-v2":
             raise RuntimeError("synthetic next compaction reached")
@@ -1454,6 +1459,7 @@ def test_host_todo_snapshot_does_not_block_recursive_llm_checkpoint():
                 "receipt_id": payload["receipt_id"],
                 "activated": True,
                 "verified": True,
+                "already_activated": False,
             }
         raise AssertionError(f"unexpected command: {args}")
 
@@ -1555,6 +1561,7 @@ def test_background_notification_compaction_binds_host_real_user_anchor():
                 "receipt_id": payload["receipt_id"],
                 "activated": True,
                 "verified": True,
+                "already_activated": False,
             }
         raise AssertionError(f"unexpected command: {args}")
 
@@ -1716,6 +1723,7 @@ def test_host_alternation_repair_is_bound_into_the_receipt_projection():
                 "receipt_id": payload["receipt_id"],
                 "activated": True,
                 "verified": True,
+                "already_activated": False,
             }
         raise AssertionError(f"unexpected command: {args}")
 

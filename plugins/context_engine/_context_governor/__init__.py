@@ -38,6 +38,15 @@ from plugins.context_engine._context_governor.key_state import (
     ContextGovernorKeyError,
     ContextGovernorKeyState,
 )
+from plugins.context_engine._context_governor.protocol import (
+    FAILURE_FLAG,
+    ContextGovernorCancellationIndeterminate,
+    ContextGovernorCommandError,
+    ContextGovernorProtocolError,
+    parse_failure_envelope,
+    require_failure_capability,
+    validated_finalized_tokens,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,15 +73,6 @@ class _SummaryLLMResult:
 
     content: str
     route: _SummaryLLMRoute
-
-
-@dataclass
-class _InflightCompression:
-    """Non-authoritative join state for one identical compaction request."""
-
-    event: threading.Event
-    result: List[Dict[str, Any]] | None = None
-    error: BaseException | None = None
 
 
 class ContextGovernorActivationError(RuntimeError):
@@ -166,10 +166,10 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         # invisible to parent selection/search/expand until the host confirms
         # its transcript commit through commit_pending_compression().
         self._pending_admission: dict[str, Any] | None = None
-        # In-flight coalescing is only a compute optimization. Rust receipt
-        # preparation/activation remains the authoritative publication fence.
-        self._inflight_lock = threading.RLock()
-        self._inflight_compressions: dict[str, _InflightCompression] = {}
+        # Serialize one prepare/host-settlement boundary per engine instance.
+        # This is coordination only; Rust receipts and the host transcript remain
+        # authoritative. Independent callers must never share one pending receipt.
+        self._compression_operation_lock = threading.RLock()
         self.last_prompt_tokens = 0
         self.last_completion_tokens = 0
         self.last_total_tokens = 0
@@ -380,6 +380,11 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             raise ContextGovernorActivationError(
                 "ConfigurationPathOutsideCanonicalState: receipt_hmac_key_path is not accepted"
             )
+        if os.name == "nt":
+            raise ContextGovernorActivationError(
+                "certified Context Governor is unavailable on Windows: "
+                "the governed descriptor transport requires /proc/self/fd"
+            )
         binary = str(self.binary)
         resolved_text = (
             str(Path(binary)) if Path(binary).is_file() else shutil.which(binary)
@@ -434,14 +439,19 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             raise ContextGovernorActivationError(
                 f"governor capability mismatch: {capabilities!r}"
             )
+        try:
+            require_failure_capability(capabilities)
+        except ContextGovernorProtocolError as exc:
+            raise ContextGovernorActivationError(str(exc)) from exc
         self.binary = str(resolved)
+        self._capabilities = capabilities
         try:
             protocol = self._probe_protocol_contract()
         except Exception as exc:
+            self._capabilities = None
             raise ContextGovernorActivationError(
                 f"certified V2 lifecycle probe failed: {exc}"
             ) from exc
-        self._capabilities = capabilities
         self.set_activation_status(
             configured_engine=self.name,
             discovered=True,
@@ -569,13 +579,19 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
     def _run_certified_json(
         self, args: list[str], payload: dict[str, Any]
     ) -> dict[str, Any]:
+        capabilities = getattr(self, "_capabilities", None)
+        if not isinstance(capabilities, dict):
+            raise ContextGovernorProtocolError(
+                "certified call attempted before capability negotiation"
+            )
+        require_failure_capability(capabilities)
         try:
             binding = self._key_state.active_binding()
         except ContextGovernorKeyError as exc:
             raise ContextGovernorActivationError(str(exc)) from exc
         try:
             return self._run_json(
-                [*args, *binding.command_args()],
+                [*args, FAILURE_FLAG, *binding.command_args()],
                 payload,
                 pass_fds=binding.pass_fds,
             )
@@ -1116,25 +1132,20 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         self,
         messages: List[Dict[str, Any]],
     ) -> str | None:
-        """Settle a prior durable-host commit before preparing another receipt.
+        """Reconcile one prepared receipt without widening settlement authority.
 
-        The host commits SessionDB before activating the prepared governor
-        receipt. If activation fails transiently, the authoritative transcript
-        is already durable and rolling it back would be wrong. Retain the
-        pending admission, but retry its authenticated activation on every
-        later compaction attempt. A transcript that no longer contains the
-        prepared projection can never activate legitimately, so discard that
-        inert receipt and let the current authoritative transcript start a new
-        generation instead of permanently wedging the live engine.
-
-        Return an operator-safe error only when the pending transition remains
-        unsettled. ``None`` means activation succeeded, mismatch discard
-        succeeded, or no admission was pending.
+        ``prepare-v2`` is inert until the host has accepted the exact projection
+        at its durable transcript boundary.  A second caller that merely sees
+        the same pending receipt is not allowed to activate or discard it. Once
+        ``commit_pending_compression`` has observed that durable boundary, the
+        pending receipt remains bound to host truth across response loss and may
+        be replayed idempotently through Rust's activation owner.
         """
         pending = self._pending_admission
         if pending is None:
             return None
         receipt_id = str(pending.get("receipt_id") or "unknown")
+        host_boundary_accepted = pending.get("host_boundary_accepted") is True
         try:
             matches_host = self.validate_pending_compression(messages)
         except Exception as exc:
@@ -1143,97 +1154,71 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 f"validated against the durable host transcript: {exc}"
             )
 
-        if not matches_host:
-            try:
-                self.discard_pending_compression(
-                    reason="pre_compaction_projection_mismatch"
-                )
-            except Exception as exc:
+        if matches_host:
+            if not host_boundary_accepted:
+                self.last_outcome = {
+                    "kind": "pending_host_commit",
+                    "receipt_id": receipt_id,
+                }
                 return (
-                    f"stale context-governor receipt {receipt_id} does not match "
-                    f"the durable host transcript and could not be discarded: {exc}"
+                    f"context-governor receipt {receipt_id} is still awaiting "
+                    "host commit settlement"
                 )
-            warning = (
-                f"stale pending receipt {receipt_id} did not match the durable "
-                "host transcript; discarded it before retrying compaction"
+            try:
+                self.commit_pending_compression(messages)
+            except Exception as exc:
+                self.last_outcome = {
+                    "kind": "pending_recovery_blocked",
+                    "receipt_id": receipt_id,
+                }
+                return (
+                    f"pending context-governor receipt {receipt_id} still matches "
+                    f"the durable host transcript but activation retry failed: {exc}"
+                )
+            logger.info(
+                "context-governor: recovered pending receipt %s before new compaction",
+                receipt_id,
             )
-            self._record_summary_warning(
-                "pending_projection_mismatch_discarded",
-                warning,
-            )
-            logger.warning("context-governor: %s", warning)
-            self.last_error = None
             return None
 
+        if host_boundary_accepted:
+            self.last_outcome = {
+                "kind": "pending_recovery_blocked",
+                "receipt_id": receipt_id,
+            }
+            return (
+                f"pending context-governor receipt {receipt_id} was accepted at the "
+                "host durability boundary but the current transcript no longer "
+                "matches it; refusing automatic discard"
+            )
+
         try:
-            self.commit_pending_compression(messages)
+            self.discard_pending_compression(
+                reason="pre_compaction_projection_mismatch"
+            )
         except Exception as exc:
             return (
-                f"pending context-governor receipt {receipt_id} still matches "
-                f"the durable host transcript but activation retry failed: {exc}"
+                f"stale context-governor receipt {receipt_id} does not match "
+                f"the durable host transcript and could not be discarded: {exc}"
             )
-        logger.info(
-            "context-governor: recovered pending receipt %s before new compaction",
-            receipt_id,
+        warning = (
+            f"stale pending receipt {receipt_id} did not match the durable "
+            "host transcript; discarded it before retrying compaction"
         )
+        self._record_summary_warning(
+            "pending_projection_mismatch_discarded",
+            warning,
+        )
+        logger.warning("context-governor: %s", warning)
+        self.last_error = None
         return None
 
-    def _ensure_inflight_state(self) -> None:
-        """Create coalescing state for lightweight test/clone instances too."""
-        if not hasattr(self, "_inflight_lock"):
-            self._inflight_lock = threading.RLock()
-        if not hasattr(self, "_inflight_compressions"):
-            self._inflight_compressions = {}
+    def _ensure_operation_state(self) -> None:
+        """Create operation-local coordination for lightweight test instances."""
+        if not hasattr(self, "_compression_operation_lock"):
+            self._compression_operation_lock = threading.RLock()
         if not hasattr(self, "_pending_admission"):
             self._pending_admission = None
-
-    def _release_inflight_compression(self, key: str | None) -> None:
-        if not key:
-            return
-        self._ensure_inflight_state()
-        with self._inflight_lock:
-            self._inflight_compressions.pop(key, None)
-
-    def _compression_coalescing_key(
-        self,
-        messages: List[Dict[str, Any]],
-        current_tokens: int | None,
-        focus_topic: str | None,
-    ) -> str:
-        transcript = json.dumps(
-            messages,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            default=str,
-        )
-        policy = getattr(self, "_policy", {})
-        lineage_id = (
-            getattr(self, "_lineage_session_id", "")
-            or getattr(self, "session_id", "")
-            or "default"
-        )
-        payload = {
-            "logical_lineage_id": lineage_id,
-            "expected_parent_receipt_id": getattr(self, "last_receipt_id", None),
-            "original_transcript_sha256": hashlib.sha256(
-                transcript.encode("utf-8")
-            ).hexdigest(),
-            "effective_compaction_policy_digest": hashlib.sha256(
-                json.dumps(
-                    policy,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    default=str,
-                ).encode("utf-8")
-            ).hexdigest(),
-            "current_tokens": current_tokens,
-            "focus_topic": focus_topic,
-        }
-        return hashlib.sha256(
-            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
 
     def compress(
         self,
@@ -1241,7 +1226,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         current_tokens: int | None = None,
         focus_topic: str | None = None,
     ) -> List[Dict[str, Any]]:
-        """Coalesce exact duplicate work while keeping Rust publication authoritative."""
+        """Run one compaction transaction without sharing pending settlement."""
         self._last_compress_aborted = False
         self._last_summary_error = None
         self._last_summary_fallback_used = False
@@ -1249,44 +1234,24 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         self.last_outcome = None
         if not messages:
             return messages
-        self._ensure_inflight_state()
-        # Pending activation recovery is a transactional operation, not
-        # duplicate compute. Never let a cached coalesced result bypass retry,
-        # reconciliation, or typed indeterminate state.
-        if self._pending_admission is not None:
+        self._ensure_operation_state()
+        with self._compression_operation_lock:
+            if self._pending_admission is not None:
+                receipt_id = str(
+                    self._pending_admission.get("receipt_id") or "unknown"
+                )
+                error = self._recover_pending_before_compaction(messages)
+                if error is not None:
+                    self.last_error = error
+                    self._last_compress_aborted = True
+                    self._last_summary_error = error
+                    if not isinstance(self.last_outcome, dict):
+                        self.last_outcome = {
+                            "kind": "pending_recovery_blocked",
+                            "receipt_id": receipt_id,
+                        }
+                    return messages
             return self._compress_once(messages, current_tokens, focus_topic)
-        key = self._compression_coalescing_key(messages, current_tokens, focus_topic)
-        with self._inflight_lock:
-            operation = self._inflight_compressions.get(key)
-            owner = operation is None
-            if owner:
-                operation = _InflightCompression(event=threading.Event())
-                self._inflight_compressions[key] = operation
-        assert operation is not None
-        if not owner:
-            timeout = max(30, int(getattr(self, "timeout_sec", 30)) * 4)
-            if not operation.event.wait(timeout=timeout):
-                raise TimeoutError("coalesced context-governor operation did not complete")
-            if operation.error is not None:
-                raise operation.error
-            return copy.deepcopy(operation.result or messages)
-        try:
-            result = self._compress_once(messages, current_tokens, focus_topic)
-        except BaseException as exc:
-            with self._inflight_lock:
-                operation.error = exc
-                self._inflight_compressions.pop(key, None)
-                operation.event.set()
-            raise
-        else:
-            with self._inflight_lock:
-                operation.result = copy.deepcopy(result)
-                if self._pending_admission is not None:
-                    self._pending_admission["coalescing_key"] = key
-                else:
-                    self._inflight_compressions.pop(key, None)
-                operation.event.set()
-            return result
 
     def _compress_once(
         self,
@@ -1302,13 +1267,6 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
 
         if not messages:
             return messages
-        if self._pending_admission is not None:
-            error = self._recover_pending_before_compaction(messages)
-            if error is not None:
-                self.last_error = error
-                self._last_compress_aborted = True
-                self._last_summary_error = error
-                return messages
 
         started = time.monotonic()
         before_bytes = len(json.dumps(messages, ensure_ascii=False).encode("utf-8"))
@@ -1582,16 +1540,9 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             if not isinstance(finalized_messages, list):
                 raise ValueError("finalize returned no compacted_messages list")
             finalized_receipt = response.get("receipt") or {}
-            finalized_tokens = finalized_receipt.get("compacted_approx_tokens")
-            if (
-                isinstance(finalized_tokens, int)
-                and not isinstance(finalized_tokens, bool)
-                and finalized_tokens > target_tokens
-            ):
-                raise RuntimeError(
-                    "CannotMeetTarget: final emitted transcript exceeds the "
-                    f"admitted target ({finalized_tokens} > {target_tokens})"
-                )
+            finalized_tokens = validated_finalized_tokens(
+                finalized_receipt, target_tokens
+            )
             compacted = [
                 self._message_from_governor(message)
                 for message in finalized_messages
@@ -1659,6 +1610,10 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 "exact_fallback_available": bool(exact_refs),
                 "physical_session_id": self.session_id,
                 "lineage_session_id": self._governor_session_id(),
+                # False until commit_pending_compression observes the host's
+                # durable transcript boundary. This prevents an unrelated
+                # concurrent caller from activating or discarding this receipt.
+                "host_boundary_accepted": False,
             }
             self.last_error = None
             self.last_outcome = {
@@ -1684,23 +1639,32 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             self._last_summary_error = str(exc)
             self._last_compression_made_progress = False
             error_text = str(exc)
-            if "CannotMeetTarget" in error_text or "context budget exceeded" in error_text:
+            if isinstance(exc, ContextGovernorCommandError) and exc.code in {
+                "cannot_meet_target",
+                "budget_exceeded",
+            }:
                 self.last_outcome = {
                     "kind": "cannot_meet_target",
-                    "error": self._safe_summary_diagnostic(error_text),
-                    "target_tokens": target_tokens,
+                    "source_error_code": exc.code,
+                    "target_tokens": exc.details.get("target", target_tokens),
+                    "actual_tokens": exc.details.get("actual"),
                 }
-            elif "LineageGenerationLimit" in error_text or (
-                "generation" in error_text and "maximum" in error_text
-            ):
+            elif isinstance(exc, ContextGovernorCommandError) and exc.code in {
+                "lineage_generation_limit",
+                "generation_overflow",
+            }:
                 self.last_outcome = {
                     "kind": "continuation_required",
-                    "error": self._safe_summary_diagnostic(error_text),
-                    "generation_limit": self._policy.get("max_lineage_generation"),
+                    "source_error_code": exc.code,
+                    "generation": exc.details.get("generation"),
+                    "generation_limit": exc.details.get(
+                        "maximum_generation", self._policy.get("max_lineage_generation")
+                    ),
                 }
             else:
                 self.last_outcome = {
                     "kind": "compaction_failed_closed",
+                    "source_error_code": getattr(exc, "code", None),
                     "error": self._safe_summary_diagnostic(error_text),
                 }
             failure_type = self._classify_subprocess_error(exc)
@@ -3423,19 +3387,32 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
     # ------------------------------------------------------------------
 
     def _classify_subprocess_error(self, exc: Exception) -> str:
-        """Classify subprocess errors for appropriate fallback behavior."""
-        msg = str(exc).lower()
-        if "401" in msg or "403" in msg or "unauthorized" in msg or "forbidden" in msg:
-            return "auth"
-        if (
-            "connection" in msg
-            or "timeout" in msg
-            or "reset" in msg
-            or "broken pipe" in msg
-        ):
-            return "network"
+        """Classify failures without deriving certified semantics from prose."""
+        if isinstance(exc, ContextGovernorCommandError):
+            if exc.code in {
+                "canonical_active_key_missing",
+                "key_unreadable",
+                "invalid_key_length",
+                "invalid_key_encoding",
+                "invalid_key_permissions",
+                "wrong_key_owner",
+                "key_path_escape",
+                "computed_key_id_mismatch",
+                "wrong_configured_key_id",
+                "required_historical_key_unavailable",
+                "compromised_key",
+                "legacy_unbound_key_use",
+                "conflicting_active_key_state",
+            }:
+                return "auth"
+            return "governed"
+        if isinstance(exc, ContextGovernorProtocolError):
+            return "protocol"
         if isinstance(exc, subprocess.TimeoutExpired):
             return "timeout"
+        msg = str(exc).lower()
+        if "connection" in msg or "reset" in msg or "broken pipe" in msg:
+            return "network"
         return "transient"
 
     # ------------------------------------------------------------------
@@ -3481,6 +3458,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         *,
         pass_fds: tuple[int, ...] = (),
     ) -> dict[str, Any]:
+        expect_failure_envelope = FAILURE_FLAG in args
         command = [str(self.binary), *args]
         popen_kwargs: dict[str, Any] = {
             "stdout": subprocess.PIPE,
@@ -3492,9 +3470,6 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             if creationflags:
                 popen_kwargs["creationflags"] = creationflags
         else:
-            # Keep the governor worker and any descendants in a killable group.
-            # This is required because a timeout is a cancellation boundary,
-            # not permission for a detached worker to publish later.
             popen_kwargs["start_new_session"] = True
             popen_kwargs["pass_fds"] = pass_fds
         proc = subprocess.Popen(command, stdin=subprocess.PIPE, **popen_kwargs)
@@ -3506,10 +3481,17 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         except subprocess.TimeoutExpired as exc:
             self._terminate_process_group(proc)
             try:
-                stdout, stderr = proc.communicate(timeout=2)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                stdout, stderr = proc.communicate()
+                stdout, stderr = proc.communicate(timeout=1)
+            except subprocess.TimeoutExpired as drain_exc:
+                for stream in (proc.stdin, proc.stdout, proc.stderr):
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except Exception:
+                            pass
+                raise ContextGovernorCancellationIndeterminate(
+                    "timed-out Context Governor streams did not quiesce after containment kill"
+                ) from drain_exc
             raise subprocess.TimeoutExpired(
                 command,
                 self.timeout_sec,
@@ -3517,31 +3499,113 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 stderr=stderr or exc.stderr,
             ) from exc
         if proc.returncode != 0:
-            raise RuntimeError(
-                (stderr or stdout or f"exit {proc.returncode}").strip()
+            if expect_failure_envelope:
+                operation = args[0] if args else "unknown"
+                raise parse_failure_envelope(stderr, operation)
+            raise RuntimeError((stderr or stdout or f"exit {proc.returncode}").strip())
+        try:
+            result = json.loads(stdout)
+        except json.JSONDecodeError as exc:
+            if expect_failure_envelope:
+                raise ContextGovernorProtocolError(
+                    "Context Governor returned invalid JSON success output"
+                ) from exc
+            raise
+        if not isinstance(result, dict) and expect_failure_envelope:
+            raise ContextGovernorProtocolError(
+                "Context Governor returned non-object certified success output"
             )
-        return json.loads(stdout)
+        return result
 
     @staticmethod
-    def _terminate_process_group(proc: subprocess.Popen) -> None:
-        """Terminate a timed-out worker before releasing governed descriptors."""
-        if proc.poll() is not None:
-            return
-        if os.name != "nt":
+    def _process_group_alive(pgid: int) -> bool:
+        """Return whether the governed Linux process group can still execute code.
+
+        Certified descriptor transport already requires /proc/self/fd, so this
+        postcondition deliberately uses /proc to distinguish unreaped zombies
+        from live group members. A zombie cannot publish after cancellation.
+        """
+        proc_root = Path("/proc")
+        if not proc_root.is_dir():
+            raise ContextGovernorCancellationIndeterminate(
+                "cannot prove Context Governor process-group quiescence without /proc"
+            )
+        observed = False
+        try:
+            entries = list(proc_root.iterdir())
+        except OSError as exc:
+            raise ContextGovernorCancellationIndeterminate(
+                "could not inspect /proc for Context Governor process-group quiescence"
+            ) from exc
+        for entry in entries:
+            if not entry.name.isdigit():
+                continue
             try:
-                os.killpg(proc.pid, signal.SIGTERM)  # windows-footgun: ok
-            except ProcessLookupError:
-                return
+                raw = (entry / "stat").read_text(encoding="utf-8")
+                close = raw.rfind(")")
+                fields = raw[close + 2 :].split()
+                if close < 0 or len(fields) < 3 or int(fields[2]) != pgid:
+                    continue
+            except (OSError, ValueError):
+                continue
+            observed = True
+            if fields[0] != "Z":
+                return True
+        if observed:
+            return False
+        try:
+            os.killpg(pgid, 0)  # windows-footgun: ok
+        except ProcessLookupError:
+            return False
+        except PermissionError as exc:
+            raise ContextGovernorCancellationIndeterminate(
+                "could not verify Context Governor process-group ownership"
+            ) from exc
+        # A process group visible to killpg but absent from /proc cannot be
+        # proven quiescent, so fail closed rather than assuming it is dead.
+        raise ContextGovernorCancellationIndeterminate(
+            "Context Governor process group remained observable outside /proc inspection"
+        )
+
+    @classmethod
+    def _terminate_process_group(cls, proc: subprocess.Popen) -> None:
+        """Boundedly terminate the launched containment unit and prove quiescence."""
+        if os.name == "nt":
+            proc.terminate()
             try:
                 proc.wait(timeout=0.5)
-                return
             except subprocess.TimeoutExpired:
+                proc.kill()
                 try:
-                    os.killpg(proc.pid, signal.SIGKILL)  # windows-footgun: ok
-                except ProcessLookupError:
-                    return
-        else:
-            proc.terminate()
+                    proc.wait(timeout=0.5)
+                except subprocess.TimeoutExpired as exc:
+                    raise ContextGovernorCancellationIndeterminate(
+                        "timed-out Context Governor process did not terminate"
+                    ) from exc
+            return
+
+        pgid = proc.pid
+        try:
+            os.killpg(pgid, signal.SIGTERM)  # windows-footgun: ok
+        except ProcessLookupError:
+            return
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            if not cls._process_group_alive(pgid):
+                return
+            time.sleep(0.02)
+        try:
+            os.killpg(pgid, signal.SIGKILL)  # windows-footgun: ok
+        except ProcessLookupError:
+            return
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            if not cls._process_group_alive(pgid):
+                return
+            time.sleep(0.02)
+        raise ContextGovernorCancellationIndeterminate(
+            "timed-out Context Governor process group could not be proven quiescent"
+        )
 
     def _prepare_response(self, response: dict[str, Any]) -> dict[str, Any]:
         """Durably stage a verified receipt without publishing a lineage tip."""
@@ -3657,6 +3721,10 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         """Activate the prepared receipt only after the host accepts its prefix."""
         pending = self._pending_admission
         if pending is None:
+            if self._last_compression_made_progress:
+                raise ContextGovernorProtocolError(
+                    "compression changed the host projection without a prepared Context Governor receipt"
+                )
             return True
         info = pending.get("pending_info") or {}
         expected = info.get("expected_compacted_messages") or []
@@ -3669,31 +3737,42 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 "host-committed transcript does not contain the authenticated "
                 "pending governor projection as an exact prefix"
             )
+        # Crossing this point means the host supplied a transcript that exactly
+        # contains the authenticated prepared projection. Retain that fact even
+        # if the activation response is lost; Rust owns idempotent settlement.
+        pending["host_boundary_accepted"] = True
         receipt_id = str(pending.get("receipt_id") or "")
-        result = self._run_certified_json(
-            [
-                "activate-v2",
-                "--dir",
-                str(self.store_dir),
-
-            ],
-            {"receipt_id": receipt_id, "committed_messages": projection},
-        )
+        activation_args = [
+            "activate-v2",
+            "--dir",
+            str(self.store_dir),
+        ]
+        activation_payload = {
+            "receipt_id": receipt_id,
+            "committed_messages": projection,
+        }
+        replayed_after_timeout = False
+        try:
+            result = self._run_certified_json(activation_args, activation_payload)
+        except (subprocess.TimeoutExpired, ContextGovernorCancellationIndeterminate):
+            replayed_after_timeout = True
+            result = self._run_certified_json(activation_args, activation_payload)
         if (
             not isinstance(result, dict)
             or result.get("schema") != "ReceiptActivationResultV2"
             or result.get("receipt_id") != receipt_id
             or result.get("activated") is not True
             or result.get("verified") is not True
+            or type(result.get("already_activated")) is not bool
         ):
-            raise ValueError("activate-v2 did not verify the prepared receipt")
+            raise ContextGovernorProtocolError(
+                "activate-v2 did not return the required verified settlement contract"
+            )
 
         # Rust has atomically activated the receipt. Clear local pending state
         # before best-effort bookkeeping so a later Python exception cannot
         # make the host try to discard an already-active receipt.
-        coalescing_key = pending.get("coalescing_key")
         self._pending_admission = None
-        self._release_inflight_compression(coalescing_key)
         try:
             generation = info.get("generation")
             if isinstance(generation, int) and not isinstance(generation, bool):
@@ -3726,6 +3805,12 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 )
                 self.last_compaction_metrics["integrity_result"] = (
                     "host_commit_activation_verified"
+                )
+                self.last_compaction_metrics["activation_replayed_after_timeout"] = (
+                    replayed_after_timeout
+                )
+                self.last_compaction_metrics["activation_already_activated"] = result.get(
+                    "already_activated"
                 )
             self.last_error = None
             self.set_activation_status(
@@ -3762,19 +3847,25 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         )
 
     def discard_pending_compression(self, **kwargs) -> bool:
-        """Discard an in-process receipt when the host rejects its boundary."""
+        """Discard only an inert receipt that has not crossed host durability."""
         pending = self._pending_admission
         if pending is None:
             return True
+        if pending.get("host_boundary_accepted") is True:
+            raise ContextGovernorProtocolError(
+                "refusing to discard a Context Governor receipt after host boundary acceptance"
+            )
+        # A concurrent caller that was explicitly blocked on another caller's
+        # prepared receipt must not turn a generic host-abort hook into shared
+        # settlement authority.
+        if (self.last_outcome or {}).get("kind") == "pending_host_commit":
+            return False
         receipt_id = str(pending.get("receipt_id") or "")
-        coalescing_key = pending.get("coalescing_key")
         if not receipt_id:
             self._pending_admission = None
-            self._release_inflight_compression(coalescing_key)
             return True
         self._discard_pending_receipt(receipt_id)
         self._pending_admission = None
-        self._release_inflight_compression(coalescing_key)
         if self.last_compaction_metrics is not None:
             self.last_compaction_metrics["integrity_result"] = "pending_discarded"
         return True
@@ -3858,6 +3949,10 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                     "exact_fallback_available": True,
                     "physical_session_id": session_id,
                     "lineage_session_id": self._governor_session_id(),
+                    # The durable SessionDB transcript is the recovery witness.
+                    # commit_pending_compression marks the boundary accepted
+                    # before replaying activation.
+                    "host_boundary_accepted": False,
                 }
                 try:
                     self.commit_pending_compression(durable)
