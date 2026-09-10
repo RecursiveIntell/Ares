@@ -8,6 +8,17 @@ import pytest
 from plugins.context_engine._context_governor import ContextGovernorEngine
 
 
+
+
+def _failure_capabilities() -> dict:
+    return {
+        "failure_envelope": {
+            "schema": "ContextGovernorFailureV1",
+            "flag": "--failure-envelope-v1",
+            "stream": "stderr",
+        }
+    }
+
 class _Binding:
     def __init__(self, marker: int) -> None:
         self.marker = marker
@@ -31,6 +42,7 @@ def test_certified_subprocess_owns_its_binding_across_overlap() -> None:
             return bindings.pop(0)
 
     engine._key_state = SimpleNamespace(active_binding=active_binding)
+    engine._capabilities = _failure_capabilities()
     a_entered = threading.Event()
     release_a = threading.Event()
     calls: list[tuple[list[str], tuple[int, ...]]] = []
@@ -74,6 +86,7 @@ def test_certified_binding_closes_once_on_timeout_without_touching_peer() -> Non
     peer = _Binding(42)
     bindings = iter((timed_out, peer))
     engine._key_state = SimpleNamespace(active_binding=lambda: next(bindings))
+    engine._capabilities = _failure_capabilities()
 
     def run_json(args, payload, *, pass_fds=()):
         del payload, pass_fds
@@ -98,6 +111,7 @@ def test_detached_worker_binding_does_not_close_new_operation_binding() -> None:
     new_worker = _Binding(61)
     bindings = iter((old_worker, new_worker))
     setattr(engine, "_key_state", SimpleNamespace(active_binding=lambda: next(bindings)))
+    engine._capabilities = _failure_capabilities()
     old_started = threading.Event()
     release_old = threading.Event()
 
@@ -130,13 +144,18 @@ def test_detached_worker_binding_does_not_close_new_operation_binding() -> None:
     assert results == {"old": {"marker": 51}, "new": {"marker": 61}}
 
 
-def test_identical_same_lineage_compressions_join_one_owner() -> None:
+def test_duplicate_compressions_do_not_share_pending_settlement() -> None:
     engine = ContextGovernorEngine.__new__(ContextGovernorEngine)
-    engine.session_id = "coalesced-session"
-    engine._lineage_session_id = "coalesced-session"
+    engine.session_id = "serialized-session"
+    engine._lineage_session_id = "serialized-session"
     engine.last_receipt_id = "ctxr_parent"
-    engine._policy = {"allocator": "deterministic_v1", "budget_mode": "hard_cascade"}
-    engine.timeout_sec = 1
+    engine._pending_admission = None
+    engine.last_outcome = None
+    engine.last_error = None
+    engine._last_compress_aborted = False
+    engine._last_summary_error = None
+    engine._last_summary_fallback_used = False
+    engine._last_compression_made_progress = False
     started = threading.Event()
     release = threading.Event()
     calls = 0
@@ -146,34 +165,32 @@ def test_identical_same_lineage_compressions_join_one_owner() -> None:
         calls += 1
         started.set()
         assert release.wait(2)
+        engine._pending_admission = {"receipt_id": "ctxr_pending"}
         return [{"role": "user", "content": "bounded result"}]
 
     setattr(engine, "_compress_once", compress_once)
     messages = [{"role": "user", "content": "same request"}]
-    results: dict[str, list[dict]] = {}
+    results = {}
     owner = threading.Thread(
         target=lambda: results.setdefault("owner", engine.compress(messages, 100, "focus"))
     )
+    follower = threading.Thread(
+        target=lambda: results.setdefault("follower", engine.compress(messages, 100, "focus"))
+    )
     owner.start()
     assert started.wait(2)
-    joined_result: dict[str, list[dict]] = {}
-    follower = threading.Thread(
-        target=lambda: joined_result.setdefault(
-            "joined", engine.compress(messages, 100, "focus")
-        )
-    )
     follower.start()
-    # The follower must join the owner rather than invoke the fake expensive
-    # operation a second time while the owner remains blocked.
     threading.Event().wait(0.05)
     assert calls == 1
     release.set()
     owner.join(2)
     follower.join(2)
-
-    assert not owner.is_alive()
-    assert not follower.is_alive()
-    joined = joined_result["joined"]
+    assert not owner.is_alive() and not follower.is_alive()
     assert calls == 1
-    assert joined == [{"role": "user", "content": "bounded result"}]
-    assert results["owner"] == joined
+    assert results["owner"] == [{"role": "user", "content": "bounded result"}]
+    assert results["follower"] == messages
+    assert engine._pending_admission == {"receipt_id": "ctxr_pending"}
+    assert engine.last_outcome == {
+        "kind": "pending_host_commit",
+        "receipt_id": "ctxr_pending",
+    }
