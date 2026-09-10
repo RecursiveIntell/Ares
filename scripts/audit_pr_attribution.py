@@ -12,7 +12,8 @@ Logic (kept in sync with contributor-check.yml):
   - scans ``git log $(git merge-base origin/main HEAD)..HEAD --format=%ae``
   - skips teknium/bot emails and ``<id>+<login>@users.noreply.github.com``
     (CI auto-resolves those)
-  - everything else must have ``contributors/emails/<email>`` or a legacy
+  - everything else must have an exact ``contributors/emails/<email>`` mapping,
+    a unique case-fold-equivalent mapping (for portable checkouts), or a legacy
     AUTHOR_MAP entry in scripts/release.py
 
 ``--fix`` resolution order for an unmapped email:
@@ -32,6 +33,7 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+EMAILS_DIR = REPO_ROOT / "contributors" / "emails"
 
 SKIP_SUBSTRINGS = (
     "teknium",
@@ -61,12 +63,36 @@ def new_emails() -> list[str]:
     return sorted({e for e in log.splitlines() if e.strip()})
 
 
+def _has_unique_casefold_mapping(email: str) -> bool:
+    """Return True when exactly one portable mapping aliases ``email`` by case.
+
+    Mapping filenames are repository paths, so Windows and default macOS cannot
+    represent two names that differ only by case. A single case-fold-equivalent
+    file therefore represents that author spelling too; multiple matches remain
+    ambiguous and must be repaired instead of silently choosing one.
+    """
+    if not EMAILS_DIR.is_dir():
+        return False
+    folded = email.casefold()
+    try:
+        matches = [
+            entry
+            for entry in EMAILS_DIR.iterdir()
+            if entry.is_file() and entry.name.casefold() == folded
+        ]
+    except OSError:
+        return False
+    return len(matches) == 1
+
+
 def is_mapped(email: str) -> bool:
     if any(s in email for s in SKIP_SUBSTRINGS):
         return True
     if ID_NOREPLY_RE.search(email):
         return True
-    if (REPO_ROOT / "contributors" / "emails" / email).is_file():
+    if (EMAILS_DIR / email).is_file():
+        return True
+    if _has_unique_casefold_mapping(email):
         return True
     release_py = REPO_ROOT / "scripts" / "release.py"
     try:

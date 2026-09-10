@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Add a contributor email → GitHub login mapping.
 
-Writes one file per email under contributors/emails/ (filename = email,
-content = login). File additions never merge-conflict, unlike the legacy
-AUTHOR_MAP dict in scripts/release.py, which is frozen — do not append to it.
+Writes one file per portable email key under contributors/emails/ (normally
+filename = email, content = login). File additions never merge-conflict, unlike
+the legacy AUTHOR_MAP dict in scripts/release.py, which is frozen — do not
+append to it. If an existing filename differs only by case and maps to the same
+login, that file is reused because Windows/default macOS cannot represent both.
 
 Usage (from the repo root):
     python3 scripts/add_contributor.py <email> <github-login> [comment...]
@@ -86,18 +88,28 @@ def add_contributor(email: str, login: str, comment: str = "") -> int:
 
     path = EMAILS_DIR / email
 
-    # One file per email means the FILENAME is the key, and on a
+    # One file per portable key means the FILENAME is the key, and on a
     # case-insensitive filesystem (Windows, default macOS) two emails differing
-    # only in case are the same file. Creating both makes the repo impossible to
-    # check out cleanly there -- `git status` reports a phantom modification
-    # forever, because whichever file git wrote second wins on disk. Refuse for
-    # the same reason a conflicting login is refused: resolve it deliberately.
+    # only in case are the same file. If the existing case-fold alias maps to
+    # the same GitHub login, reuse it. A different or malformed mapping remains
+    # an explicit conflict and is never silently reassigned.
     collision = _case_collision(email)
     if collision is not None:
+        collision_path = EMAILS_DIR / collision
+        collision_login = read_mapping_file(collision_path)
+        if collision_login == login:
+            print(f"present (case-fold alias: contributors/emails/{collision})")
+            return 0
+        if collision_login is None:
+            print(
+                f"error: {email} collides with unreadable mapping {collision} on "
+                "case-insensitive filesystems — repair that mapping first",
+                file=sys.stderr,
+            )
+            return 1
         print(
-            f"error: {email} collides with existing mapping {collision} on "
-            "case-insensitive filesystems (Windows/macOS) — the two are the same "
-            "file there. Reuse that mapping, or resolve manually.",
+            f"error: {email} collides with {collision}, which maps to "
+            f"{collision_login!r} (asked for {login!r}) — resolve manually",
             file=sys.stderr,
         )
         return 1
