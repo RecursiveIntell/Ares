@@ -155,7 +155,6 @@ import { filterSessionsByProfileScope } from './profile-scope'
 import { ProfileRail } from './profile-switcher'
 import { ProjectDialog } from './project-dialog'
 import { resolveLiveProjectFilter } from './project-filter'
-import { useEnteredProjectSessions } from './use-entered-project-sessions'
 import {
   excludeProjectSessions,
   orderProjectsByIds,
@@ -186,6 +185,7 @@ import { buildSessionByAnyId, resolvePinnedSessions } from './session-index'
 import { SidebarSessionsSection, VIRTUALIZE_THRESHOLD } from './sessions-section'
 import { CONTEXT_SPLIT_KIT, SplitSubmenu } from './split-submenu'
 import { stabilizeSessionOrder } from './stable-session-order'
+import { useEnteredProjectSessions } from './use-entered-project-sessions'
 
 // Non-session groups (messaging platforms) stay compact: show a few rows up
 // front, reveal more in larger steps on demand. Keeps a busy platform from

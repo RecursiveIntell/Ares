@@ -15,6 +15,11 @@ const { sdkMock } = vi.hoisted(() => {
 
   const component = () => null
   const host: Record<string, unknown> = { state: {} }
+  class UnboundedCache<K, V> extends Map<K, V> {
+    constructor(_max: number) {
+      super()
+    }
+  }
 
   return {
     sdkMock: {
@@ -49,6 +54,7 @@ const { sdkMock } = vi.hoisted(() => {
       haptic: vi.fn(),
       host,
       Input: component,
+      LruCache: UnboundedCache,
       PALETTE_AREA: 'palette',
       profileColor: () => '#000',
       queryClient: { invalidateQueries: vi.fn() },
