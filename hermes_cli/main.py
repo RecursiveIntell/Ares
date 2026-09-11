@@ -471,7 +471,7 @@ from hermes_cli.subcommands.skin import build_skin_parser
 from hermes_cli.subcommands.console import build_console_parser
 from hermes_cli.subcommands.update import build_update_parser
 from hermes_cli.subcommands.uninstall import build_uninstall_parser
-from hermes_cli.subcommands.dashboard import build_dashboard_parser
+from hermes_cli.subcommands.dashboard import build_dashboard_parser, build_serve_parser
 from hermes_cli.subcommands.gui import build_gui_parser
 from hermes_cli.subcommands.logs import build_logs_parser
 from hermes_cli.subcommands.prompt_size import build_prompt_size_parser
@@ -12226,18 +12226,29 @@ def cmd_dashboard(args):
     # this, a profile's configured MCP servers never connect, so desktop
     # sessions show no MCP tools.  Spawn discovery in the background here so a
     # slow/dead server can't block dashboard startup.
-    try:
-        from hermes_cli.mcp_startup import start_background_mcp_discovery
+    #
+    # Desktop-spawned headless backends start it AFTER the socket binds
+    # instead (start_server's ready path): the thread's first act is the
+    # ~350ms `mcp` SDK import, which holds the GIL against the main thread's
+    # own web_server import and pushes the READY sentinel — and every
+    # renderer paint behind it — back by that much. The Desktop can't issue
+    # an agent turn until its WebSocket is up anyway, and _make_agent's
+    # bounded wait_for_mcp_discovery + the late-binding refresh cover a
+    # server that is still connecting when the first turn lands.
+    _mcp_discovery_after_bind = _headless_backend and os.environ.get("HERMES_DESKTOP") == "1"
+    if not _mcp_discovery_after_bind:
+        try:
+            from hermes_cli.mcp_startup import start_background_mcp_discovery
 
-        start_background_mcp_discovery(
-            logger=logger,
-            thread_name="dashboard-mcp-discovery",
-        )
-    except Exception:
-        logger.debug(
-            "Background MCP tool discovery failed at dashboard startup",
-            exc_info=True,
-        )
+            start_background_mcp_discovery(
+                logger=logger,
+                thread_name="dashboard-mcp-discovery",
+            )
+        except Exception:
+            logger.debug(
+                "Background MCP tool discovery failed at dashboard startup",
+                exc_info=True,
+            )
 
     from hermes_cli.web_server import start_server
 
@@ -12260,6 +12271,7 @@ def cmd_dashboard(args):
         headless=_headless_backend,
         ssh_session_token=_ssh_session_token,
         ssh_owner_nonce=_ssh_owner_nonce,
+        start_mcp_discovery_after_bind=_mcp_discovery_after_bind,
     )
 
 
@@ -12608,6 +12620,47 @@ def _set_chat_arg_defaults(args) -> None:
     ]:
         if not hasattr(args, attr):
             setattr(args, attr, default)
+
+
+def _try_fast_serve_launch() -> bool:
+    """Dispatch an unambiguous built-in ``serve`` without the full CLI tree.
+
+    Desktop launches this exact command on every cold start. Building parsers
+    for unrelated Hermes commands performs thousands of filesystem-backed
+    translation lookups on Windows even though none of those commands are
+    usable in this process. Unknown or globally-scoped arguments fall back to
+    normal parsing so compatibility and error reporting remain unchanged.
+    """
+    if os.environ.get("HERMES_DISABLE_FAST_SERVE_LAUNCH") == "1":
+        return False
+
+    argv = sys.argv[1:]
+    if not argv or argv[0] != "serve" or "-h" in argv or "--help" in argv:
+        return False
+
+    # Container routing is top-level policy and must run before host dispatch.
+    try:
+        from hermes_cli.config import get_container_exec_info
+
+        if get_container_exec_info():
+            return False
+    except Exception:
+        return False
+
+    parser = build_serve_parser(
+        cmd_dashboard=cmd_dashboard,
+        add_help=False,
+        exit_on_error=False,
+    )
+    try:
+        args, unknown = parser.parse_known_args(argv[1:])
+    except (argparse.ArgumentError, ValueError):
+        return False
+    if unknown:
+        return False
+
+    cmd_dashboard(args)
+    return True
 
 
 def _try_fast_chat_launch() -> bool:
@@ -13156,6 +13209,8 @@ def main():
     if _try_termux_fast_tui_launch():
         return
     if _try_termux_fast_cli_launch():
+        return
+    if _try_fast_serve_launch():
         return
     if _try_fast_chat_launch():
         return

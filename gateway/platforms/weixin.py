@@ -62,9 +62,9 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
-    cache_audio_from_bytes,
-    cache_document_from_bytes,
-    cache_image_from_bytes,
+    cache_audio_from_bytes_async,
+    cache_document_from_bytes_async,
+    cache_image_from_bytes_async,
 )
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
@@ -1672,7 +1672,7 @@ class WeixinAdapter(BasePlatformAdapter):
                 full_url=media.get("full_url"),
                 timeout_seconds=30.0,
             )
-            return cache_image_from_bytes(data, ".jpg")
+            return await cache_image_from_bytes_async(data, ".jpg")
         except Exception as exc:
             logger.warning("[%s] image download failed: %s", self.name, exc)
             return None
@@ -1688,7 +1688,7 @@ class WeixinAdapter(BasePlatformAdapter):
                 full_url=media.get("full_url"),
                 timeout_seconds=120.0,
             )
-            return cache_document_from_bytes(data, "video.mp4")
+            return await cache_document_from_bytes_async(data, "video.mp4")
         except Exception as exc:
             logger.warning("[%s] video download failed: %s", self.name, exc)
             return None
@@ -1707,7 +1707,7 @@ class WeixinAdapter(BasePlatformAdapter):
                 full_url=media.get("full_url"),
                 timeout_seconds=60.0,
             )
-            return cache_document_from_bytes(data, filename), mime
+            return await cache_document_from_bytes_async(data, filename), mime
         except Exception as exc:
             logger.warning("[%s] file download failed: %s", self.name, exc)
             return None, mime
@@ -1731,7 +1731,7 @@ class WeixinAdapter(BasePlatformAdapter):
                 full_url=media.get("full_url"),
                 timeout_seconds=60.0,
             )
-            return cache_audio_from_bytes(data, ".silk")
+            return await cache_audio_from_bytes_async(data, ".silk")
         except Exception as exc:
             logger.warning("[%s] voice download failed: %s", self.name, exc)
             return None
