@@ -27,7 +27,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "ddc22f90059e339f3a20f7fbc33701418e1f9502"
+          test "$(git rev-parse HEAD^)" = "e7cfadd29b2e7176c1df66fae63518ab87fb4340"
           git fetch --no-tags origin main
           test "$(git rev-parse origin/main)" = "0451a66cbb765a3ede359660e37b1b2fbe857525"
           test -z "$(git status --porcelain)"
@@ -48,10 +48,8 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
-
           path = Path("hermes_state.py")
           text = path.read_text(encoding="utf-8")
-
           activity_anchor = "from agent.message_sanitization import _sanitize_surrogates\n"
           activity_owner = "from agent.session_activity import ActivityProvenance\n"
           activity_expected = activity_anchor + activity_owner
@@ -59,7 +57,6 @@ jobs:
               if text.count(activity_anchor) != 1:
                   raise SystemExit("unexpected hermes_state message-sanitization import shape")
               text = text.replace(activity_anchor, activity_expected, 1)
-
           common_import = "from hermes_state_common import escape_like as _escape_like, stat_db_file_identity as _stat_db_file_identity\n"
           common_expected = (
               "from hermes_state_common import (\n"
@@ -72,7 +69,6 @@ jobs:
               if text.count(common_import) != 1:
                   raise SystemExit("unexpected hermes_state_common import shape")
               text = text.replace(common_import, common_expected, 1)
-
           path.write_text(text, encoding="utf-8")
           checked = path.read_text(encoding="utf-8")
           if activity_expected not in checked:
@@ -118,12 +114,11 @@ jobs:
           python -m pytest -q --tb=short tests/agent/test_context_governor_restore.py 2>&1 | tee "$log"
           status=${PIPESTATUS[0]}
           if [ "$status" -ne 0 ]; then
-            {
-              echo "### PR35 context-governor failure"
-              echo '```text'
-              tail -n 120 "$log"
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
+            git merge --abort
+            tail -n 160 "$log" > .github/pr35-context-failure.txt
+            git add .github/pr35-context-failure.txt
+            git commit -m "chore(ci): record PR35 reconciliation failure"
+            git push origin HEAD:hermes-ares-recon
             exit "$status"
           fi
 
@@ -160,6 +155,7 @@ jobs:
         run: |
           set -euo pipefail
           git rm .github/workflows/pr35-reconcile-current-main.yml
+          rm -f .github/pr35-context-failure.txt
           git add -A
           git diff --cached --check
           git commit -m "merge(main): reconcile PR 35 with current Ares main"
