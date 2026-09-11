@@ -28,6 +28,10 @@ from tools.environments.docker_egress import (
     _egress_reuse_fingerprint, check_docker_env_collisions, check_extra_args_collisions,
     check_forward_env_collisions, merge_egress_env,
 )
+from tools.environments.local_env_policy import (
+    _HERMES_PROVIDER_ENV_BLOCKLIST,
+    _is_hermes_internal_secret,
+)
 from tools.environments.path_utils import sanitize_task_id_for_path
 from tools.environments.remote_common import (
     bash_argv, client_env_with, load_hermes_env_vars, prepend_unset, resolve_passthrough_env, run_capture)

@@ -250,10 +250,28 @@ def _pipe_stdin(proc: subprocess.Popen, data: str) -> None:
     thread.start()
 
 
-def _popen_bash(cmd: list[str], stdin_data: str | None = None, **kwargs) -> subprocess.Popen:
-    """Spawn a subprocess with standard stdout/stderr/stdin setup; *stdin_data* is written
-    asynchronously via :func:`_pipe_stdin`. Backends with special Popen needs (e.g. local's
-    ``preexec_fn``) can bypass this and call :func:`_pipe_stdin` directly."""
+def _popen_bash(
+    cmd: list[str], stdin_data: str | None = None, **kwargs
+) -> subprocess.Popen:
+    """Spawn a terminal-backend child through the shared sanitized boundary.
+
+    Docker, SSH, and Singularity converge here for model-authored command
+    execution. Sanitize even when the caller supplies an ``env`` mapping so a
+    future backend cannot re-open ambient credential inheritance by omitting
+    the factory or passing an unsafe overlay.
+    """
+    from tools.environments.local import build_subprocess_env
+
+    base_env = kwargs.pop("env", None)
+    profile_home = kwargs.pop("profile_home", None)
+    source_profile_home = kwargs.pop("source_profile_home", None)
+    enforce_profile_boundary = bool(kwargs.pop("enforce_profile_boundary", False))
+    kwargs["env"] = build_subprocess_env(
+        base=base_env,
+        profile_home=profile_home,
+        source_profile_home=source_profile_home,
+        enforce_profile_boundary=enforce_profile_boundary,
+    )
     kwargs.setdefault("creationflags", windows_hide_flags())
     proc = subprocess.Popen(
         cmd,
@@ -261,7 +279,8 @@ def _popen_bash(cmd: list[str], stdin_data: str | None = None, **kwargs) -> subp
         stderr=subprocess.STDOUT,
         stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
         text=True, encoding="utf-8", errors="replace",
-        **kwargs)
+        **kwargs,
+    )
     if stdin_data is not None:
         _pipe_stdin(proc, stdin_data)
     return proc

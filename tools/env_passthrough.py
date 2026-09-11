@@ -45,7 +45,7 @@ def _is_hermes_provider_credential(name: str) -> bool:
     in the ``execute_code`` child); non-Hermes keys (TENOR_API_KEY, …) stay
     registerable. Fails closed when the blocklist cannot be imported."""
     try:
-        from tools.environments.local import (
+        from tools.environments.local_env_policy import (
             _is_blocked_provider_env,
             _is_hermes_internal_secret,
         )
@@ -77,6 +77,18 @@ def register_env_passthrough(var_names: Iterable[str]) -> None:
     )):
         _get_allowed().add(name)
         logger.debug("env passthrough: registered %s", name)
+
+
+def _accepted(names, refusal_msg: str):
+    """Yield non-empty *names* that are not Hermes provider credentials; refused
+    names are logged with *refusal_msg* (``%r`` = name)."""
+    for name in names:
+        if not name:
+            continue
+        if _is_hermes_provider_credential(name):
+            logger.warning(refusal_msg, name)
+            continue
+        yield name
 
 
 def _load_config_passthrough(

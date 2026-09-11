@@ -17,7 +17,7 @@ from unittest.mock import patch
 
 import pytest
 
-from tools.environments import base as base_env
+from tools.environments import base_output as base_output_env
 from tools.environments import docker as docker_env
 from tools.environments import local as local_env
 from tools.environments import singularity as singularity_env
@@ -78,7 +78,7 @@ def _capture_popen(monkeypatch):
         calls.append((list(args), kwargs))
         return _DummyProcess()
 
-    monkeypatch.setattr(base_env.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(base_output_env.subprocess, "Popen", fake_popen)
     return calls
 
 
@@ -165,7 +165,7 @@ def test_shared_popen_boundary_sanitizes_caller_supplied_base_env(monkeypatch, t
     calls = _capture_popen(monkeypatch)
     supplied = {**_SAFE, **_BLOCKED, **_USER_PASSWORDS, **_CONTAINER_TUNNELS}
 
-    base_env._popen_bash(["bash", "-c", "true"], env=supplied)
+    base_output_env._popen_bash(["bash", "-c", "true"], env=supplied)
 
     assert len(calls) == 1
     _assert_child_env_is_sanitized(calls[0][1]["env"])
@@ -175,7 +175,7 @@ def test_shared_popen_boundary_accepts_empty_base_env(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
     calls = _capture_popen(monkeypatch)
 
-    base_env._popen_bash(["bash", "-c", "true"], env={})
+    base_output_env._popen_bash(["bash", "-c", "true"], env={})
 
     assert len(calls) == 1
     assert isinstance(calls[0][1]["env"], dict)
@@ -445,5 +445,8 @@ def test_docker_explicit_forward_cannot_export_hermes_internal_secret(
 
     args = env._build_init_env_args()
 
-    assert "DB_PASSWORD=fake-db-password" in args
-    assert not any(arg.startswith("BWS_ACCESS_TOKEN=") for arg in args)
+    assert "DB_PASSWORD" in args
+    assert all("fake-db-password" not in arg for arg in args)
+    assert env._init_env_values["DB_PASSWORD"] == "fake-db-password"
+    assert "BWS_ACCESS_TOKEN" not in args
+    assert "BWS_ACCESS_TOKEN" not in env._init_env_values

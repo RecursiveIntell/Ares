@@ -7,6 +7,27 @@ import os
 # Prefix a caller uses in ``extra_env`` to force a blocklisted var through.
 _HERMES_PROVIDER_ENV_FORCE_PREFIX = "_HERMES_FORCE_"
 
+# Apptainer/Singularity rename these host variables before injecting them into
+# a container. Evaluate the target name as well as the wrapper name so nested
+# forwarding cannot tunnel a blocked credential past the common policy.
+_CONTAINER_ENV_FORWARD_PREFIXES = ("APPTAINERENV_", "SINGULARITYENV_")
+
+
+def _credential_target_env_name(key: str) -> str:
+    """Return the effective credential name after nested forwarding wrappers."""
+    value = str(key)
+    changed = True
+    while changed:
+        changed = False
+        upper = value.upper()
+        for prefix in _CONTAINER_ENV_FORWARD_PREFIXES:
+            if upper.startswith(prefix):
+                value = value[len(prefix):]
+                changed = True
+                break
+    return value
+
+
 # Hermes-managed AWS *inference* credentials for ``auth_type="aws_sdk"`` (Bedrock):
 # only the Bedrock bearer token, which no aws/terraform/boto3 toolchain uses. The
 # general AWS chain stays inheritable on purpose — the local terminal is the user's
@@ -80,6 +101,16 @@ def _build_provider_env_blocklist() -> frozenset:
 
 
 _HERMES_PROVIDER_ENV_BLOCKLIST = _build_provider_env_blocklist()
+
+def _is_blocked_provider_env(key: str) -> bool:
+    """Match provider credentials case-insensitively and through wrappers.
+
+    Windows environment keys are case-insensitive, and Apptainer/Singularity
+    can rename ``APPTAINERENV_*`` / ``SINGULARITYENV_*`` entries inside the
+    container.  Both representations must resolve to the same policy key.
+    """
+    current = frozenset(name.upper() for name in _build_provider_env_blocklist())
+    return _credential_target_env_name(key).upper() in current
 
 # First-party platform credentials (``BUZZ_*``, driving the platform-mandated ``buzz``
 # CLI) carved out of the TERMINAL scrub only (``_make_run_env``,
@@ -169,28 +200,109 @@ def _is_terminal_first_party_env(name: str) -> bool:
 _ACTIVE_VENV_MARKER_VARS = ("VIRTUAL_ENV", "CONDA_PREFIX", "PYTHONHOME")
 
 
+def _get_configured_bws_token_env() -> str:
+    """Resolve the exact Bitwarden token env name for the active profile.
+
+    ``read_raw_config`` is already cached by profile-aware config path and file
+    revision. Adding another per-home cache here would hide runtime remaps and
+    leave the newly configured bootstrap token unclassified.
+    """
+    name = "BWS_ACCESS_TOKEN"
+    try:
+        from hermes_cli.config import cfg_get, read_raw_config
+
+        configured = cfg_get(
+            read_raw_config(), "secrets", "bitwarden", "access_token_env"
+        )
+        if isinstance(configured, str) and configured.strip():
+            name = configured.strip()
+    except Exception as exc:
+        # A remapped bootstrap name may have no credential-looking suffix. If
+        # config authority is unavailable, returning the default would let that
+        # arbitrary name cross. Refuse the child decision instead of widening.
+        raise RuntimeError("Bitwarden token policy unavailable") from exc
+    return name
+
 def _is_hermes_internal_secret(key: str) -> bool:
-    """True for Hermes-internal secrets injected under *dynamic* names the static
-    blocklist cannot enumerate: ``AUXILIARY_<TASK>_API_KEY``/``_BASE_URL`` (per-task
-    side-LLM credentials) and ``GATEWAY_RELAY_*_SECRET``/``_KEY``/``_TOKEN`` (relay
-    auth; non-secret routing hints stay visible). Stripped on every spawn path
-    regardless of env_passthrough registration or ``inherit_credentials``."""
-    upper = key.upper()
-    if upper.startswith("AUXILIARY_") and upper.endswith(("_API_KEY", "_BASE_URL")):
+    """Return True for Hermes-internal secrets injected under *dynamic* names.
+
+    ``_HERMES_PROVIDER_ENV_BLOCKLIST`` is name-based and derived from the
+    provider/tool registries, but the gateway and CLI also inject secrets into
+    ``os.environ`` at runtime under names no static registry knows about:
+
+    - ``AUXILIARY_<TASK>_API_KEY`` / ``AUXILIARY_<TASK>_BASE_URL`` — per-task
+      side-LLM credentials bridged from ``config.yaml[auxiliary]`` by
+      ``gateway/run.py`` and ``cli.py`` (vision, web_extract, approval,
+      compression, and any plugin-registered auxiliary task). These are
+      separate, often higher-spend API keys plus base URLs that may point at
+      private endpoints; a model-authored shell command must never see them.
+    - ``GATEWAY_RELAY_*_SECRET`` / ``GATEWAY_RELAY_*_KEY`` /
+      ``GATEWAY_RELAY_*_TOKEN`` — relay-auth material provisioned by the
+      gateway (``GATEWAY_RELAY_SECRET``, ``GATEWAY_RELAY_DELIVERY_KEY``).
+      These are Tier-1 gateway secrets, like the messaging bot tokens in
+      ``_ALWAYS_STRIP_KEYS``. Non-secret ``GATEWAY_RELAY_*`` routing hints
+      (``GATEWAY_RELAY_URL``, ``GATEWAY_RELAY_PLATFORMS``, …) are NOT matched
+      and remain visible.
+    - ``BWS_ACCESS_TOKEN`` — the Bitwarden Secrets Manager bootstrap token,
+      under the **exact** name configured via ``secrets.bitwarden.access_token_env``
+      (default ``BWS_ACCESS_TOKEN``; may be remapped to any name, e.g.
+      ``MY_BWS_TOKEN``). Hermes's own vault credential; no spawned child
+      legitimately needs it. The one child that does — the ``bws`` CLI —
+      receives it explicitly via ``build_subprocess_env(scrub_secrets=False)``
+      in ``agent/secret_sources/bitwarden.py``, never through inheritance.
+      Only the exact configured name is matched (not a ``*_ACCESS_TOKEN``
+      suffix) so legitimate third-party access tokens stay
+      ``env_passthrough``-registerable — see ``tools/env_passthrough.py``.
+
+    ``code_execution_tool.py`` already catches these via substring matching on
+    ``KEY`` / ``SECRET`` / ``TOKEN``; the terminal backend's narrower name-based
+    blocklist did not, which is the leak this predicate closes.
+
+    This is the single source of truth for "Hermes-internal dynamic secret"
+    across every spawn path — the terminal ``_make_run_env`` /
+    ``_sanitize_subprocess_env`` filters, the Docker passthrough filter, and the
+    non-terminal :func:`hermes_subprocess_env` helper all call it, so the
+    dynamic patterns are stripped **unconditionally** regardless of
+    ``env_passthrough`` skill registration or ``inherit_credentials``. Nothing
+    a model-driving CLI legitimately needs matches these patterns.
+    """
+    upper = _credential_target_env_name(key).upper()
+    if upper.startswith("AUXILIARY_") and (
+        upper.endswith("_API_KEY") or upper.endswith("_BASE_URL")
+    ):
         return True
-    return upper.startswith("GATEWAY_RELAY_") and upper.endswith(("_SECRET", "_KEY", "_TOKEN"))
+    if upper.startswith("GATEWAY_RELAY_") and (
+        upper.endswith("_SECRET") or upper.endswith("_KEY") or upper.endswith("_TOKEN")
+    ):
+        return True
+    if upper in {"OP_SERVICE_ACCOUNT_TOKEN", "OP_CONNECT_TOKEN"}:
+        return True
+    if upper.startswith("OP_SESSION_"):
+        return True
+    if "BWS" in upper and upper.endswith("_TOKEN"):
+        return True
+    if upper == "BWS_ACCESS_TOKEN" or upper == _get_configured_bws_token_env().upper():
+        # Bitwarden Secrets Manager bootstrap token — the exact configured
+        # access_token_env name (default BWS_ACCESS_TOKEN; may be remapped to
+        # a non-suffix name like MY_BWS_TOKEN), plus the default name itself.
+        # A remapped profile sharing one process with a default profile must
+        # not let the default profile's BWS_ACCESS_TOKEN (which the shared
+        # os.environ carries across profile turns) cross its child boundary
+        # either — the Bitwarden rule holds in both directions.
+        return True
+    return False
 
 
 def _plugin_terminal_env_strip_keys() -> frozenset:
-    """Credential env keys owned by plugin-registered terminal backends (Tier-1:
-    stripped from every spawned subprocess). Computed at call time because plugins
-    register after import; fail-soft to empty."""
+    """Credential env keys owned by plugin-registered terminal backends."""
     try:
         from agent.terminal_env_registry import plugin_strip_env_keys
 
         return plugin_strip_env_keys()
-    except Exception:
-        return frozenset()
+    except Exception as exc:
+        # An unavailable plugin registry is not an empty deny set. Treat it as
+        # degraded policy and refuse the child boundary.
+        raise RuntimeError("plugin terminal environment policy unavailable") from exc
 
 
 # Tier-1 secrets: stripped from EVERY spawned subprocess even under inherit_credentials
@@ -208,6 +320,7 @@ _ALWAYS_STRIP_KEYS: frozenset[str] = frozenset({
     # enumerated here to stay stripped on the inherit_credentials=True path.
     "GATEWAY_RELAY_ID", "GATEWAY_RELAY_SECRET", "GATEWAY_RELAY_DELIVERY_KEY",
     "HASS_TOKEN", "EMAIL_PASSWORD", "HERMES_DASHBOARD_SESSION_TOKEN",
+    "BWS_ACCESS_TOKEN",
     # Remote-compute / infrastructure secrets
     "MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET", "DAYTONA_API_KEY",
 })

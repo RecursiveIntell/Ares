@@ -18,11 +18,11 @@ from hermes_constants import get_hermes_home
 from tools.environments.base import (
     BaseEnvironment,
     _load_json_store,
-    _popen_bash,
     _save_json_store,
-    sanitize_task_id_for_path,
 )
+from tools.environments.base_output import _popen_bash
 from tools.environments.local import build_subprocess_env
+from tools.environments.path_utils import sanitize_task_id_for_path
 
 logger = logging.getLogger(__name__)
 

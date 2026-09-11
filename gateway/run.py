@@ -5513,7 +5513,7 @@ class GatewayRunner(
             if _show_reasoning_effective and response and not _intentional_silence:
                 last_reasoning = agent_result.get("last_reasoning")
                 if last_reasoning:
-                    from gateway.stream_consumer import escape_code_fences_for_display
+                    from gateway.stream_consumer_fences import escape_code_fences_for_display
                     # Collapse long reasoning to keep messages readable
                     lines = last_reasoning.strip().splitlines()
                     if len(lines) > 15:
@@ -8580,7 +8580,9 @@ class GatewayRunner(
         """
         loop = asyncio.get_running_loop()
         try:
-            from tools.mcp_tool import shutdown_mcp_servers, discover_mcp_tools, _servers, _lock
+            from tools.mcp_tool import _servers, _lock
+            from tools.mcp_tool_discovery import discover_mcp_tools
+            from tools.mcp_tool_lifecycle import shutdown_mcp_servers
 
             # Capture old server names before shutdown
             with _lock:
@@ -8620,7 +8622,7 @@ class GatewayRunner(
             # consented to the prompt-cache invalidation via the slash-confirm
             # gate in _handle_reload_mcp_command before we reach this point.
             try:
-                from tools.mcp_tool import refresh_agent_mcp_tools
+                from tools.mcp_tool_agent import refresh_agent_mcp_tools
                 _cache = getattr(self, "_agent_cache", None)
                 _cache_lock = getattr(self, "_agent_cache_lock", None)
                 if _cache_lock is not None and _cache:

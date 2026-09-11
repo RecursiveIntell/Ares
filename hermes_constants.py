@@ -188,6 +188,12 @@ def get_ares_state_root() -> Path:
     return get_default_hermes_root() / "ares"
 
 
+# Tombstone lives beside the profile dir (not inside) so a stale mkdir or rmtree cannot erase it.
+_DELETED_PROFILES_DIR = ".deleted"
+# Files marking a real Hermes home; arbitrary dirs with a ``profiles`` segment lack them.
+_HERMES_HOME_MARKERS = ("config.yaml", ".env", "state.db")
+
+
 def _is_hermes_profiles_root(profiles_dir: Path) -> bool:
     """True when *profiles_dir* is provably ``<hermes-home>/profiles``.
 

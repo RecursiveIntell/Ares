@@ -1678,6 +1678,7 @@ class TestSanePathIncludesHomebrew:
         key casing alone (a real Windows box has those dirs).
         """
         from tools.environments import local as local_mod
+        from tools.environments import local_env_policy as policy_mod
         from tools.environments.local import _make_run_env
         windows_env = {"Path": r"C:\Windows\System32;C:\Program Files\Git\bin"}
         monkeypatch.setattr(local_mod, "_git_bash_bin_dirs", lambda: [])
@@ -1685,7 +1686,7 @@ class TestSanePathIncludesHomebrew:
         # casing, not secrets.  The real resolver reads the operator's config
         # and fails closed when it is unavailable, so pin it to the default
         # name instead of letting the host environment leak in.
-        monkeypatch.setattr(local_mod, "_get_configured_bws_token_env", lambda: "BWS_ACCESS_TOKEN")
+        monkeypatch.setattr(policy_mod, "_get_configured_bws_token_env", lambda: "BWS_ACCESS_TOKEN")
         with patch.object(local_mod.os, "environ", windows_env):
             result = _make_run_env({})
         assert result["Path"] == windows_env["Path"]

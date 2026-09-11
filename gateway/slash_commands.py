@@ -598,8 +598,8 @@ class GatewaySlashCommandsMixin(
             switch_model as _switch_model, parse_model_switch_args,
             resolve_persist_behavior,
             list_authenticated_providers,
-            list_picker_providers,
         )
+        from hermes_cli.model_switch_providers import list_picker_providers
         from hermes_cli.providers import get_label
 
         raw_args = event.get_command_args().strip()
@@ -1970,7 +1970,7 @@ class GatewaySlashCommandsMixin(
 
         snapshot = list(getattr(agent, "_session_messages", None) or [])
 
-        from tools.approval import (
+        from tools.approval_context import (
             reset_current_session_key,
             set_current_session_key,
         )
