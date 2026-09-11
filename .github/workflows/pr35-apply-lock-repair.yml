@@ -1,0 +1,73 @@
+name: PR35 apply validated lock repair
+
+on:
+  push:
+    branches:
+      - hermes-ares-recon
+    paths:
+      - .github/workflows/pr35-apply-lock-repair.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out exact PR branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          ref: hermes-ares-recon
+          fetch-depth: 0
+
+      - name: Reassemble and verify lock patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          cat \
+            .github/pr35-lock.patch.gz.b64.part00 \
+            .github/pr35-lock.patch.gz.b64.part01 \
+            .github/pr35-lock.patch.gz.b64.part02 \
+            > /tmp/pr35-lock.patch.gz.b64
+          base64 --decode /tmp/pr35-lock.patch.gz.b64 > /tmp/pr35-lock.patch.gz
+          echo "faf73a8d65fe6ed65c3ff6d5e2c59d7b947a3731f7c1c20a264bc7ed45ee5895  /tmp/pr35-lock.patch.gz" | sha256sum -c -
+          gzip -dc /tmp/pr35-lock.patch.gz > /tmp/pr35-lock.patch
+          echo "3d2d6927124846750dbca79edda77c23d275e222b20145c0968c2bdb599b784e  /tmp/pr35-lock.patch" | sha256sum -c -
+          git apply --check /tmp/pr35-lock.patch
+
+      - name: Apply lock repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          git apply /tmp/pr35-lock.patch
+          git diff --check
+
+      - name: Install canonical uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.9.28"
+
+      - name: Verify repaired lockfile
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv lock --check
+
+      - name: Commit and fast-forward push exact validated repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin hermes-ares-recon
+          test "$(git rev-parse origin/hermes-ares-recon)" = "$GITHUB_SHA"
+          rm -f \
+            .github/workflows/pr35-apply-lock-repair.yml \
+            .github/pr35-lock.patch.gz.b64.part00 \
+            .github/pr35-lock.patch.gz.b64.part01 \
+            .github/pr35-lock.patch.gz.b64.part02
+          git add -A
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "fix(lock): restore brotlicffi 1.2.0.2 wheel metadata"
+          git push origin HEAD:hermes-ares-recon
