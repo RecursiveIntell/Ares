@@ -27,7 +27,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "3a7f1770f4ce50495814f232d3773276940c89dd"
+          test "$(git rev-parse HEAD^)" = "4ba181ee4c13deae76424cb42a6104f29036d396"
           test "$(git hash-object apps/desktop/src/app/chat/composer/hooks/use-composer-draft.ts)" = "d2e4b88ae1f535339ae94e393d8ab6d145eeb8cf"
           test "$(git hash-object apps/desktop/src/app/chat/sidebar/index.tsx)" = "8a8aec6d4449f654fbf20ff5ec7e8f607f4605fd"
           test "$(git hash-object apps/desktop/src/app/chat/sidebar/use-entered-project-sessions.ts)" = "a86fb130b34242c474ffdab65fe68edebc82db89"
