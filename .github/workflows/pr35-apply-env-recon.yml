@@ -21,12 +21,27 @@ jobs:
           ref: hermes-ares-recon
           fetch-depth: 0
 
-      - name: Verify event head and patch payload
+      - name: Reassemble and verify patch payload
         shell: bash
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          gzip -dc .github/pr35-env-recon.patch.gz > /tmp/pr35-env-recon.patch
+          cat \
+            .github/pr35-env-recon.patch.gz.b64.part00 \
+            .github/pr35-env-recon.patch.gz.b64.part01 \
+            .github/pr35-env-recon.patch.gz.b64.part02 \
+            .github/pr35-env-recon.patch.gz.b64.part03 \
+            .github/pr35-env-recon.patch.gz.b64.part04 \
+            .github/pr35-env-recon.patch.gz.b64.part05 \
+            .github/pr35-env-recon.patch.gz.b64.part06 \
+            .github/pr35-env-recon.patch.gz.b64.part07 \
+            .github/pr35-env-recon.patch.gz.b64.part08 \
+            .github/pr35-env-recon.patch.gz.b64.part09 \
+            .github/pr35-env-recon.patch.gz.b64.part10 \
+            > /tmp/pr35-env-recon.patch.gz.b64
+          base64 --decode /tmp/pr35-env-recon.patch.gz.b64 > /tmp/pr35-env-recon.patch.gz
+          echo "273dcd67c2898ffedd8b49fb681e873d8db6189c5a3db1fee2889a2c004bb6a0  /tmp/pr35-env-recon.patch.gz" | sha256sum -c -
+          gzip -dc /tmp/pr35-env-recon.patch.gz > /tmp/pr35-env-recon.patch
           echo "f6448bc9aee2874be64cee2f3dfa52268cc99257f476c975c4cecdf0c1963d97  /tmp/pr35-env-recon.patch" | sha256sum -c -
           git apply --check /tmp/pr35-env-recon.patch
 
@@ -61,7 +76,20 @@ jobs:
           set -euo pipefail
           git fetch origin hermes-ares-recon
           test "$(git rev-parse origin/hermes-ares-recon)" = "$GITHUB_SHA"
-          rm -f .github/workflows/pr35-apply-env-recon.yml .github/pr35-env-recon.patch.gz
+          rm -f \
+            .github/workflows/pr35-apply-env-recon.yml \
+            .github/pr35-env-recon.patch.gz \
+            .github/pr35-env-recon.patch.gz.b64.part00 \
+            .github/pr35-env-recon.patch.gz.b64.part01 \
+            .github/pr35-env-recon.patch.gz.b64.part02 \
+            .github/pr35-env-recon.patch.gz.b64.part03 \
+            .github/pr35-env-recon.patch.gz.b64.part04 \
+            .github/pr35-env-recon.patch.gz.b64.part05 \
+            .github/pr35-env-recon.patch.gz.b64.part06 \
+            .github/pr35-env-recon.patch.gz.b64.part07 \
+            .github/pr35-env-recon.patch.gz.b64.part08 \
+            .github/pr35-env-recon.patch.gz.b64.part09 \
+            .github/pr35-env-recon.patch.gz.b64.part10
           git add -A
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
