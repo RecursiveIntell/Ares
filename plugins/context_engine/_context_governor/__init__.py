@@ -3490,8 +3490,12 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         if proc.poll() is not None:
             return
         if os.name != "nt":
+            killpg = getattr(os, "killpg", None)
+            if killpg is None:
+                proc.terminate()
+                return
             try:
-                os.killpg(proc.pid, signal.SIGTERM)
+                killpg(proc.pid, signal.SIGTERM)
             except ProcessLookupError:
                 return
             try:
@@ -3499,7 +3503,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 return
             except subprocess.TimeoutExpired:
                 try:
-                    os.killpg(proc.pid, signal.SIGKILL)
+                    killpg(proc.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
                 except ProcessLookupError:
                     return
         else:
