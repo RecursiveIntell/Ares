@@ -1,0 +1,199 @@
+name: PR35 extracted-owner repair
+
+on:
+  push:
+    branches: [hermes-ares-recon]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pr35-extracted-owner-repair
+  cancel-in-progress: false
+
+jobs:
+  repair:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Checkout exact reconciliation branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: hermes-ares-recon
+          fetch-depth: 2
+
+      - name: Verify exact preflight and fetch pinned Hermes tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "5228a47ef3807ac5bcaf6e420b6d544595990c8f"
+          test "$(git hash-object hermes_cli/commands.py)" = "3eb5264d12f0d12fc0857dd04fe5e77f00a77152"
+          test "$(git hash-object hermes_state.py)" = "11be3d4266bd4bd4fd09d0e2b7f0778651a69bbe"
+          test -z "$(git status --porcelain)"
+          git fetch --no-tags --depth=1 origin 2237be355906fbe6065ce1815711eee52b2d646e
+          git cat-file -e 2237be355906fbe6065ce1815711eee52b2d646e^{commit}
+
+      - name: Restore extracted Python owners
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import ast
+          import subprocess
+          from pathlib import Path
+
+          PIN = "2237be355906fbe6065ce1815711eee52b2d646e"
+          COMPAT = "# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----"
+
+          def git_show(path: str) -> str:
+              return subprocess.check_output(
+                  ["git", "show", f"{PIN}:{path}"],
+                  text=True,
+                  encoding="utf-8",
+              )
+
+          def class_node(tree: ast.Module, name: str) -> ast.ClassDef:
+              matches = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == name]
+              if len(matches) != 1:
+                  raise SystemExit(f"expected exactly one class {name}, found {len(matches)}")
+              return matches[0]
+
+          def method_nodes(cls: ast.ClassDef, name: str):
+              return [
+                  n for n in cls.body
+                  if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name
+              ]
+
+          # 1) commands.py: the compatibility tail is upstream-owned temporary
+          # API surface. Preserve Ares' registry/helper prefix byte-for-byte and
+          # restore only the pinned compat tail, which forwards extracted owners.
+          commands_path = Path("hermes_cli/commands.py")
+          current_commands = commands_path.read_text(encoding="utf-8")
+          pinned_commands = git_show("hermes_cli/commands.py")
+          if current_commands.count(COMPAT) != 1 or pinned_commands.count(COMPAT) != 1:
+              raise SystemExit("commands.py compat marker is not uniquely owned")
+          current_prefix = current_commands.split(COMPAT, 1)[0]
+          pinned_tail = COMPAT + pinned_commands.split(COMPAT, 1)[1]
+          repaired_commands = current_prefix + pinned_tail
+          commands_path.write_text(repaired_commands, encoding="utf-8")
+
+          commands_tree = ast.parse(repaired_commands)
+          forbidden = {"SlashCommandCompleter", "SlashCommandAutoSuggest"}
+          stale = sorted(
+              n.name for n in commands_tree.body
+              if isinstance(n, ast.ClassDef) and n.name in forbidden
+          )
+          if stale:
+              raise SystemExit(f"stale completion owners remain in commands.py: {stale}")
+          if repaired_commands[repaired_commands.index(COMPAT):] != pinned_tail:
+              raise SystemExit("commands.py compat tail differs from pinned Hermes")
+
+          # 2) hermes_state.py: remove the malformed stale SessionDB method only
+          # if both sides of the ownership move are proven:
+          #   - pinned SessionDB no longer owns it;
+          #   - exactly one current inherited mixin owns it.
+          state_path = Path("hermes_state.py")
+          state_text = state_path.read_text(encoding="utf-8")
+          state_tree = ast.parse(state_text)
+          pinned_state_tree = ast.parse(git_show("hermes_state.py"))
+          session_db = class_node(state_tree, "SessionDB")
+          pinned_session_db = class_node(pinned_state_tree, "SessionDB")
+          target = "_delete_routing_entries_for_sessions"
+          current_methods = method_nodes(session_db, target)
+          pinned_methods = method_nodes(pinned_session_db, target)
+          if len(current_methods) != 1:
+              raise SystemExit(f"expected one stale SessionDB.{target}, found {len(current_methods)}")
+          if pinned_methods:
+              raise SystemExit(f"pinned SessionDB still owns {target}; refusing ownership rewrite")
+
+          inherited = {
+              base.id for base in session_db.bases if isinstance(base, ast.Name)
+          }
+          owner_hits = []
+          for candidate in sorted(Path(".").glob("hermes_state*.py")):
+              if candidate == state_path:
+                  continue
+              try:
+                  tree = ast.parse(candidate.read_text(encoding="utf-8"))
+              except (OSError, SyntaxError):
+                  continue
+              for node in tree.body:
+                  if not isinstance(node, ast.ClassDef) or node.name not in inherited:
+                      continue
+                  if method_nodes(node, target):
+                      owner_hits.append((candidate.as_posix(), node.name))
+          if len(owner_hits) != 1:
+              raise SystemExit(
+                  f"expected exactly one inherited owner for {target}, found {owner_hits!r}"
+              )
+          owner_path, owner_class = owner_hits[0]
+          print(f"verified {target} owner: {owner_class} in {owner_path}")
+
+          lines = state_text.splitlines(keepends=True)
+          node = current_methods[0]
+          decorator_lines = [d.lineno for d in node.decorator_list]
+          start_line = min([node.lineno, *decorator_lines]) - 1
+          end_line = node.end_lineno
+          del lines[start_line:end_line]
+          repaired_state = "".join(lines)
+          state_path.write_text(repaired_state, encoding="utf-8")
+
+          repaired_state_tree = ast.parse(repaired_state)
+          repaired_session_db = class_node(repaired_state_tree, "SessionDB")
+          if method_nodes(repaired_session_db, target):
+              raise SystemExit(f"stale SessionDB.{target} remains after repair")
+          PY
+
+      - name: Validate extracted-owner repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m py_compile \
+            hermes_cli/commands.py \
+            hermes_cli/commands_completion.py \
+            hermes_cli/commands_platforms.py \
+            hermes_state.py \
+            hermes_state_sessions.py \
+            gateway/platforms/base.py \
+            gateway/platforms/event.py
+          python3 - <<'PY'
+          import ast
+          import subprocess
+          from pathlib import Path
+
+          pin = "2237be355906fbe6065ce1815711eee52b2d646e"
+          marker = "# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----"
+          current = Path("hermes_cli/commands.py").read_text(encoding="utf-8")
+          pinned = subprocess.check_output(
+              ["git", "show", f"{pin}:hermes_cli/commands.py"], text=True, encoding="utf-8"
+          )
+          if current[current.index(marker):] != pinned[pinned.index(marker):]:
+              raise SystemExit("commands compat tail is not pinned-exact")
+
+          state = ast.parse(Path("hermes_state.py").read_text(encoding="utf-8"))
+          db = next(n for n in state.body if isinstance(n, ast.ClassDef) and n.name == "SessionDB")
+          if any(
+              isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+              and n.name == "_delete_routing_entries_for_sessions"
+              for n in db.body
+          ):
+              raise SystemExit("SessionDB still shadows routing-entry cleanup owner")
+          PY
+          git diff --check
+          git diff --stat
+
+      - name: Commit repair and remove one-shot workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "Josh Stevenson"
+          git config user.email "J.stevenson.cs@gmail.com"
+          git rm .github/workflows/pr35-extracted-owner-repair.yml
+          git add hermes_cli/commands.py hermes_state.py
+          git diff --cached --check
+          git diff --cached --stat
+          git commit -m "fix(reconcile): restore extracted Python owners"
+          git push origin HEAD:hermes-ares-recon
