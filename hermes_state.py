@@ -1905,34 +1905,6 @@ class SessionDB(
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def _delete_routing_entries_for_sessions(self, session_ids: Set[str]) -> int:
-        """Drop ``gateway_routing`` rows pointing at any of *session_ids*.
-
-        Routing entries are keyed by ``(scope, session_key)`` and record their
-        target session inside ``entry_json``, so there is no way to reach them
-        by session id in SQL — the match is done in Python over all scopes.
-        """
-        if not session_ids:
-            return 0
-        with self._read_ctx() as conn:
-            rows = conn.execute(
-                "SELECT scope, session_key, entry_json FROM gateway_routing"
-            ).fetchall()
-        doomed: List[Tuple[str, str]] = []
-        for row in rows:
-            try:
-                self.close()
-            except Exception:
-                pass
-
-        def _do(conn):
-            conn.executemany(
-                "DELETE FROM gateway_routing WHERE scope = ? AND session_key = ?",
-                doomed,
-            )
-
-        self._execute_write(_do)
-        return len(doomed)
 
     def prune_never_active_keyed_sessions(
         self,
