@@ -27,7 +27,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "401632cc79b21b53d8d013e4ef4b151caa7d785d"
+          test "$(git rev-parse HEAD^)" = "ddc22f90059e339f3a20f7fbc33701418e1f9502"
           git fetch --no-tags origin main
           test "$(git rev-parse origin/main)" = "0451a66cbb765a3ede359660e37b1b2fbe857525"
           test -z "$(git status --porcelain)"
@@ -111,7 +111,21 @@ jobs:
 
       - name: Test context governor restore
         shell: bash
-        run: source .venv/bin/activate && python -m pytest -q tests/agent/test_context_governor_restore.py
+        run: |
+          set -uo pipefail
+          source .venv/bin/activate
+          log="$RUNNER_TEMP/context-governor-restore.log"
+          python -m pytest -q --tb=short tests/agent/test_context_governor_restore.py 2>&1 | tee "$log"
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            {
+              echo "### PR35 context-governor failure"
+              echo '```text'
+              tail -n 120 "$log"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit "$status"
+          fi
 
       - name: Test Ares managed calls
         shell: bash
