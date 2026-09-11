@@ -27,7 +27,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "cca8a4ada5b38d8b434e5c64ac2abe069a5f009e"
+          test "$(git rev-parse HEAD^)" = "ffb7fdac99b41e422819b65e33f4d6f820d3f82e"
           git fetch --no-tags origin main
           test "$(git rev-parse origin/main)" = "4dda54e0bea205d257dea6c61c5efe89771f4beb"
           test -z "$(git status --porcelain)"
@@ -41,9 +41,29 @@ jobs:
           git merge --no-ff --no-commit -X theirs 4dda54e0bea205d257dea6c61c5efe89771f4beb
           test -z "$(git diff --name-only --diff-filter=U)"
           git diff --check
-          echo "Merged paths:"
+
+      - name: Restore current-main activity provenance owner
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("hermes_state.py")
+          text = path.read_text(encoding="utf-8")
+          owner = "from agent.session_activity import ActivityProvenance\n"
+          if owner not in text:
+              anchor = "from agent.message_sanitization import _sanitize_surrogates\n"
+              if text.count(anchor) != 1:
+                  raise SystemExit("unexpected hermes_state message-sanitization import shape")
+              text = text.replace(anchor, anchor + owner, 1)
+              path.write_text(text, encoding="utf-8")
+          PY
+          git add hermes_state.py
+          git diff --cached --check
+          echo "Reconciled paths:"
           git diff --cached --name-status
-          echo "Merge stat:"
+          echo "Reconciliation stat:"
           git diff --cached --stat
 
       - name: Install uv
