@@ -27,7 +27,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "ffb7fdac99b41e422819b65e33f4d6f820d3f82e"
+          test "$(git rev-parse HEAD^)" = "5177b52e8c496e85088fe3f8de384c366058e70c"
           git fetch --no-tags origin main
           test "$(git rev-parse origin/main)" = "4dda54e0bea205d257dea6c61c5efe89771f4beb"
           test -z "$(git status --porcelain)"
@@ -51,13 +51,16 @@ jobs:
 
           path = Path("hermes_state.py")
           text = path.read_text(encoding="utf-8")
+          anchor = "from agent.message_sanitization import _sanitize_surrogates\n"
           owner = "from agent.session_activity import ActivityProvenance\n"
-          if owner not in text:
-              anchor = "from agent.message_sanitization import _sanitize_surrogates\n"
+          expected = anchor + owner
+          if expected not in text:
               if text.count(anchor) != 1:
                   raise SystemExit("unexpected hermes_state message-sanitization import shape")
-              text = text.replace(anchor, anchor + owner, 1)
+              text = text.replace(anchor, expected, 1)
               path.write_text(text, encoding="utf-8")
+          if expected not in path.read_text(encoding="utf-8"):
+              raise SystemExit("top-level ActivityProvenance owner was not restored")
           PY
           git add hermes_state.py
           git diff --cached --check
