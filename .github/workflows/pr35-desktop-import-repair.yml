@@ -1,0 +1,88 @@
+name: PR35 Desktop import repair
+
+on:
+  push:
+    branches: [hermes-ares-recon]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pr35-desktop-import-repair
+  cancel-in-progress: false
+
+jobs:
+  repair:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact reconciliation branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: hermes-ares-recon
+          fetch-depth: 2
+
+      - name: Verify exact preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "3a7f1770f4ce50495814f232d3773276940c89dd"
+          test "$(git hash-object apps/desktop/src/app/chat/composer/hooks/use-composer-draft.ts)" = "d2e4b88ae1f535339ae94e393d8ab6d145eeb8cf"
+          test "$(git hash-object apps/desktop/src/app/chat/sidebar/index.tsx)" = "8a8aec6d4449f654fbf20ff5ec7e8f607f4605fd"
+          test "$(git hash-object apps/desktop/src/app/chat/sidebar/use-entered-project-sessions.ts)" = "a86fb130b34242c474ffdab65fe68edebc82db89"
+          test -z "$(git status --porcelain)"
+
+      - name: Restore omitted Desktop imports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          composer = Path("apps/desktop/src/app/chat/composer/hooks/use-composer-draft.ts")
+          text = composer.read_text(encoding="utf-8")
+          old = "import { usePaneGroup } from '@/components/pane-shell/pane-visibility'"
+          new = "import { usePaneGroup, usePaneVisible } from '@/components/pane-shell/pane-visibility'"
+          if text.count(old) != 1 or new in text:
+              raise SystemExit("unexpected composer pane-visibility import shape")
+          text = text.replace(old, new, 1)
+          composer.write_text(text, encoding="utf-8")
+
+          sidebar = Path("apps/desktop/src/app/chat/sidebar/index.tsx")
+          text = sidebar.read_text(encoding="utf-8")
+          anchor = "import { CONTEXT_SPLIT_KIT, SplitSubmenu } from './split-submenu'\n"
+          addition = anchor + "import { useEnteredProjectSessions } from './use-entered-project-sessions'\n"
+          if text.count(anchor) != 1 or "from './use-entered-project-sessions'" in text:
+              raise SystemExit("unexpected sidebar entered-project import shape")
+          text = text.replace(anchor, addition, 1)
+          sidebar.write_text(text, encoding="utf-8")
+          PY
+          git diff --check
+          git diff -- apps/desktop/src/app/chat/composer/hooks/use-composer-draft.ts apps/desktop/src/app/chat/sidebar/index.tsx
+
+      - name: Install JS dependencies for validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Validate Desktop type and lint gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run --workspace apps/desktop typecheck
+          npm run --workspace apps/desktop lint -- --max-warnings=0
+
+      - name: Commit repair and remove one-shot workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "Josh Stevenson"
+          git config user.email "J.stevenson.cs@gmail.com"
+          git rm .github/workflows/pr35-desktop-import-repair.yml
+          git add apps/desktop/src/app/chat/composer/hooks/use-composer-draft.ts apps/desktop/src/app/chat/sidebar/index.tsx
+          git diff --cached --check
+          git diff --cached --stat
+          git commit -m "fix(desktop): restore reconciled hook imports"
+          git push origin HEAD:hermes-ares-recon
