@@ -353,6 +353,63 @@ def test_prompt_submit_dispatches_to_compute_host_when_turn_isolation_enabled(mo
         server._sessions.pop("iso-sid", None)
 
 
+def test_prewarmed_deferred_session_still_uses_compute_host(monkeypatch):
+    """A deferred session remains isolated after its serving-side prewarm.
+
+    ``session.create`` starts a background build so the composer can show a
+    ready agent.  The build may finish before the first prompt arrives.  That
+    must not turn an isolated session back into an in-process turn, or the
+    isolation guarantee becomes a timing race under concurrent load.
+    """
+    class _FakeSupervisor:
+        def __init__(self):
+            self.frames = []
+
+        def submit_turn(self, frame, *, on_complete=None):
+            self.frames.append(frame)
+            return frame["request_id"]
+
+    fake_supervisor = _FakeSupervisor()
+    session = _session(agent=object(), agent_ready=threading.Event())
+    sid = "iso-prewarmed"
+    server._sessions[sid] = session
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {"dashboard": {"turn_isolation": True}},
+    )
+    monkeypatch.setattr(
+        server,
+        "_get_compute_host_supervisor",
+        lambda _cfg=None: fake_supervisor,
+    )
+    monkeypatch.setattr(
+        server,
+        "_ensure_session_db_row",
+        lambda _session: pytest.fail("prewarmed isolated turn must not write in the serving process"),
+    )
+    monkeypatch.setattr(
+        server,
+        "_persist_branch_seed",
+        lambda _session: pytest.fail("prewarmed isolated turn must not persist branch state in the serving process"),
+    )
+
+    try:
+        response = server.handle_request(
+            {
+                "id": "prewarmed-submit",
+                "method": "prompt.submit",
+                "params": {"session_id": sid, "text": "hello after prewarm"},
+            }
+        )
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert response["result"] == {"status": "streaming", "turn_isolation": True}
+    assert len(fake_supervisor.frames) == 1
+    assert fake_supervisor.frames[0]["text"] == "hello after prewarm"
+
+
 def test_compute_host_explicit_images_do_not_clear_later_attachment(monkeypatch):
     class _Supervisor:
         def submit_turn(self, _frame, *, on_complete=None):
