@@ -1,0 +1,136 @@
+name: PR35 one-shot structural repair
+
+on:
+  push:
+    branches: [hermes-ares-recon]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pr35-one-shot-structural-repair
+  cancel-in-progress: false
+
+jobs:
+  repair:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout exact reconciliation branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: hermes-ares-recon
+          fetch-depth: 2
+
+      - name: Verify exact preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "6e874b0cddc929d013e5f97a8e3c73ec84b8d3e9"
+          test "$(git hash-object gateway/platforms/base.py)" = "7528480d91c299b64c7eb549f55ffc26c2dc4f9b"
+          test -z "$(git status --porcelain)"
+
+      - name: Restore canonical MessageEvent ownership
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import ast
+          from pathlib import Path
+
+          path = Path("gateway/platforms/base.py")
+          text = path.read_text(encoding="utf-8")
+          tree = ast.parse(text)
+
+          target_names = {"MessageType", "ProcessingOutcome", "MessageEvent"}
+          targets = [
+              node
+              for node in tree.body
+              if isinstance(node, ast.ClassDef) and node.name in target_names
+          ]
+          found = [node.name for node in targets]
+          if set(found) != target_names or len(found) != len(target_names):
+              raise SystemExit(f"unexpected structural owners in base.py: {found!r}")
+
+          lines = text.splitlines(keepends=True)
+          for node in sorted(targets, key=lambda item: item.lineno, reverse=True):
+              decorator_lines = [decorator.lineno for decorator in node.decorator_list]
+              start_line = min([node.lineno, *decorator_lines]) - 1
+              end_line = node.end_lineno
+              del lines[start_line:end_line]
+
+          text = "".join(lines)
+          marker = "from urllib.parse import urlsplit\n\nfrom utils import normalize_proxy_url\n"
+          replacement = (
+              "from urllib.parse import urlsplit\n\n"
+              "from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome\n"
+              "from utils import normalize_proxy_url\n"
+          )
+          if marker not in text:
+              raise SystemExit("expected import anchor not found")
+          if "from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome" in text:
+              raise SystemExit("event-owner import already present unexpectedly")
+          text = text.replace(marker, replacement, 1)
+          path.write_text(text, encoding="utf-8")
+
+          repaired = ast.parse(text)
+          stale = [
+              node.name
+              for node in repaired.body
+              if isinstance(node, ast.ClassDef) and node.name in target_names
+          ]
+          if stale:
+              raise SystemExit(f"stale structural-owner classes remain: {stale!r}")
+
+          imports = [
+              node
+              for node in repaired.body
+              if isinstance(node, ast.ImportFrom)
+              and node.module == "gateway.platforms.event"
+          ]
+          imported = {
+              alias.name
+              for node in imports
+              for alias in node.names
+          }
+          if not target_names <= imported:
+              raise SystemExit(f"canonical event-owner imports incomplete: {sorted(imported)!r}")
+          PY
+
+      - name: Validate structural repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m py_compile gateway/platforms/base.py gateway/platforms/event.py
+          python3 - <<'PY'
+          import ast
+          from pathlib import Path
+
+          base = ast.parse(Path("gateway/platforms/base.py").read_text(encoding="utf-8"))
+          forbidden = {"MessageType", "ProcessingOutcome", "MessageEvent"}
+          defined = {
+              node.name
+              for node in base.body
+              if isinstance(node, ast.ClassDef)
+          }
+          overlap = sorted(defined & forbidden)
+          if overlap:
+              raise SystemExit(f"base.py still owns event types: {overlap}")
+          PY
+          git diff --check
+
+      - name: Commit repair and remove one-shot workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "Josh Stevenson"
+          git config user.email "J.stevenson.cs@gmail.com"
+          git rm .github/workflows/pr35-one-shot-structural-repair.yml
+          git add gateway/platforms/base.py
+          git diff --cached --check
+          git diff --cached --stat
+          git commit -m "fix(gateway): restore MessageEvent structural ownership"
+          git push origin HEAD:hermes-ares-recon
