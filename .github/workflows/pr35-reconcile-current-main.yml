@@ -27,7 +27,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "e7cfadd29b2e7176c1df66fae63518ab87fb4340"
+          test "$(git rev-parse HEAD^)" = "1285813329514a61da1baf53c76af9d5df00db67"
           git fetch --no-tags origin main
           test "$(git rev-parse origin/main)" = "0451a66cbb765a3ede359660e37b1b2fbe857525"
           test -z "$(git status --porcelain)"
@@ -80,7 +80,7 @@ jobs:
           git diff --cached --check
 
       - name: Install uv
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
           version: "0.9.28"
           enable-cache: true
@@ -112,15 +112,16 @@ jobs:
           source .venv/bin/activate
           log="$RUNNER_TEMP/context-governor-restore.log"
           python -m pytest -q --tb=short tests/agent/test_context_governor_restore.py 2>&1 | tee "$log"
-          status=${PIPESTATUS[0]}
-          if [ "$status" -ne 0 ]; then
-            git merge --abort
-            tail -n 160 "$log" > .github/pr35-context-failure.txt
-            git add .github/pr35-context-failure.txt
-            git commit -m "chore(ci): record PR35 reconciliation failure"
-            git push origin HEAD:hermes-ares-recon
-            exit "$status"
-          fi
+          exit ${PIPESTATUS[0]}
+
+      - name: Upload context governor failure log
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pr35-context-governor-failure
+          path: ${{ runner.temp }}/context-governor-restore.log
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Test Ares managed calls
         shell: bash
