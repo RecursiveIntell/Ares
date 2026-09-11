@@ -8856,6 +8856,19 @@ def _light_chat_parser():
     return parser
 
 
+def _run_oneshot_from_args(args) -> None:
+    """Top-level --oneshot / -z: single-shot mode, stdout = final response only."""
+    _confirm_startup_expensive_model_override(args)
+    _run_and_exit_oneshot(
+        args.oneshot,
+        model=getattr(args, "model", None),
+        provider=getattr(args, "provider", None),
+        toolsets=getattr(args, "toolsets", None),
+        skills=getattr(args, "skills", None),
+        usage_file=getattr(args, "usage_file", None),
+    )
+
+
 def _try_fast_serve_launch() -> bool:
     """Dispatch an unambiguous built-in ``serve`` without the full CLI tree.
 
