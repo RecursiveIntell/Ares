@@ -1955,9 +1955,23 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         else:
             # Preserve small pre-catalog archives without permitting a large
             # legacy store to reintroduce the original corpus-scaled timeout.
+            # Stop as soon as either bound is exceeded; do not enumerate the
+            # entire receipt corpus merely to prove it is too large.
+            legacy_paths: list[Path] = []
+            legacy_bytes = 0
             try:
-                legacy_paths = list(self.store_dir.glob("ctxr_*.json"))
-                legacy_bytes = sum(path.stat().st_size for path in legacy_paths)
+                for path in self.store_dir.iterdir():
+                    if path.suffix != ".json" or not path.name.startswith("ctxr_"):
+                        continue
+                    legacy_paths.append(path)
+                    legacy_bytes += path.stat().st_size
+                    if (
+                        len(legacy_paths) > 64
+                        or legacy_bytes > DEFAULT_MAX_PROVENANCE_BYTES
+                    ):
+                        legacy_paths = []
+                        legacy_bytes = DEFAULT_MAX_PROVENANCE_BYTES + 1
+                        break
             except OSError:
                 legacy_paths = []
                 legacy_bytes = DEFAULT_MAX_PROVENANCE_BYTES + 1

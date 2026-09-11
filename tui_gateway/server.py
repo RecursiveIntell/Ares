@@ -1096,17 +1096,52 @@ def _ws_session_is_detached(session: dict | None) -> bool:
 
 
 def _ws_session_is_orphaned(session: dict | None) -> bool:
-    """True if a WS session has no live transport and no in-flight turn.
-
-    After ``handle_ws`` detaches a disconnected client it points the session at
-    ``_detached_ws_transport``. A session left on that transport (and not
-    mid-turn) is genuinely orphaned and safe to reap.
-    """
+    """True if a WS session has no live transport and no in-flight turn."""
     return bool(
         _ws_session_is_detached(session)
         and session is not None
         and not session.get("running")
     )
+
+
+def _detached_execution_policy(
+    session: dict | None,
+    *,
+    now: float | None = None,
+    max_seconds: float | None = None,
+) -> str:
+    """Classify a detached turn without treating transport loss as Stop.
+
+    Returns ``attached``, ``retain``, ``interrupt``, ``cancel`` or ``reap``.
+    The policy is pure apart from reading the configured finite bound, making
+    the disconnect/reconnect boundary directly testable with a fake clock.
+    """
+    if not _ws_session_is_detached(session):
+        return "attached"
+    if session is None:
+        return "reap"
+    if session.get("_turn_cancel_requested"):
+        return "cancel"
+    if not session.get("running"):
+        return "reap"
+    detached_at = session.get("_detached_at")
+    if detached_at is None:
+        # Synthetic/legacy sessions without a detach timestamp have already
+        # crossed the attachment boundary; retain policy is only granted by the
+        # real disconnect path, which records ``_detached_at``.
+        return "interrupt"
+    if max_seconds is None:
+        try:
+            max_seconds = float(
+                _load_dashboard_process_isolation_config().get(
+                    "detached_execution_max_s",
+                    _DASHBOARD_DETACHED_EXECUTION_MAX_S_DEFAULT,
+                )
+            )
+        except Exception:
+            max_seconds = _DASHBOARD_DETACHED_EXECUTION_MAX_S_DEFAULT
+    clock = time.monotonic() if now is None else float(now)
+    return "interrupt" if clock - float(detached_at) >= max(1.0, max_seconds) else "retain"
 
 
 def _interrupt_session_turn(
@@ -1298,30 +1333,42 @@ def _schedule_ws_orphan_reap(sid: str, *, delay_s: float | None = None) -> None:
             if _session_has_active_delegations(sid, current):
                 reschedule_delay = _WS_ORPHAN_REAP_GRACE_S
             elif current.get("running"):
-                # Mid-turn detached sessions must never drop the single
-                # Timer (#85578): after the reconnect grace the turn is
-                # interrupted once, then the reap keeps polling until the
-                # normal turn-finalization path settles.
-                polls = int(current.get("_client_gone_interrupt_polls") or 0) + 1
-                current["_client_gone_interrupt_polls"] = polls
-                if polls > _WS_ORPHAN_INTERRUPT_REAP_MAX_POLLS:
-                    # The interrupted turn never settled inside the budget —
-                    # force-reap rather than parking the session + a timer
-                    # chain forever. Loud by design: this only fires when a
-                    # turn is genuinely stuck past interrupt.
-                    logger.error(
-                        "client_gone sid=%s: turn did not settle after %d "
-                        "interrupt polls (%.0fs) — force-reaping detached "
-                        "session",
-                        sid, polls - 1,
-                        (polls - 1) * _WS_ORPHAN_INTERRUPT_REAP_POLL_S,
-                    )
-                    session = _pop_session_by_id(sid)
+                policy = _detached_execution_policy(current)
+                if policy == "retain":
+                    # Transport loss is not authenticated cancellation. Keep
+                    # the already-authorized turn running until the finite
+                    # detached bound expires; a reconnect cancels this timer.
+                    try:
+                        bound = float(
+                            _load_dashboard_process_isolation_config().get(
+                                "detached_execution_max_s",
+                                _DASHBOARD_DETACHED_EXECUTION_MAX_S_DEFAULT,
+                            )
+                        )
+                    except Exception:
+                        bound = _DASHBOARD_DETACHED_EXECUTION_MAX_S_DEFAULT
+                    elapsed = time.monotonic() - float(current.get("_detached_at") or time.monotonic())
+                    reschedule_delay = max(0.1, min(_WS_ORPHAN_INTERRUPT_REAP_POLL_S, bound - elapsed))
                 else:
-                    if not current.get("_client_gone_interrupt_requested"):
-                        current["_client_gone_interrupt_requested"] = True
-                        interrupt_session = current
-                    reschedule_delay = _WS_ORPHAN_INTERRUPT_REAP_POLL_S
+                    # Mid-turn detached sessions must never drop the single
+                    # Timer (#85578): once the finite detached bound expires,
+                    # interrupt once, then poll until normal finalization.
+                    polls = int(current.get("_client_gone_interrupt_polls") or 0) + 1
+                    current["_client_gone_interrupt_polls"] = polls
+                    if polls > _WS_ORPHAN_INTERRUPT_REAP_MAX_POLLS:
+                        logger.error(
+                            "client_gone sid=%s: turn did not settle after %d "
+                            "interrupt polls (%.0fs) — force-reaping detached "
+                            "session",
+                            sid, polls - 1,
+                            (polls - 1) * _WS_ORPHAN_INTERRUPT_REAP_POLL_S,
+                        )
+                        session = _pop_session_by_id(sid)
+                    else:
+                        if not current.get("_client_gone_interrupt_requested"):
+                            current["_client_gone_interrupt_requested"] = True
+                            interrupt_session = current
+                        reschedule_delay = _WS_ORPHAN_INTERRUPT_REAP_POLL_S
             else:
                 session = _pop_session_by_id(sid)
 
@@ -1435,7 +1482,9 @@ def _close_sessions_for_transport(
                         current["transport"] = remaining[-1][1]
                     else:
                         current["transport"] = _detached_ws_transport
+                        current["_detached_at"] = time.monotonic()
                         current.pop("_client_gone_interrupt_requested", None)
+                        current.pop("_client_gone_interrupt_polls", None)
                         should_schedule_reap = True
         if claimed_for_teardown is not None:
             if _teardown_popped_session(claimed_for_teardown, end_reason=end_reason):
@@ -4018,6 +4067,15 @@ def _set_session_cwd(session: dict, cwd: str) -> str:
 _DASHBOARD_TURN_ISOLATION_DEFAULT = False
 _DASHBOARD_COMPUTE_HOST_HEARTBEAT_SECS_DEFAULT = 15
 _DASHBOARD_COMPUTE_HOST_RESPAWN_MAX_DEFAULT = 3
+_DASHBOARD_DETACHED_EXECUTION_MAX_S_DEFAULT = 300
+
+
+def _coerce_float_config_value(value: Any, default: float, *, min_value: float) -> float:
+    try:
+        coerced = float(value)
+    except (TypeError, ValueError):
+        return default
+    return coerced if coerced >= min_value else default
 
 
 def _coerce_int_config_value(value: Any, default: int, *, min_value: int) -> int:
@@ -4055,6 +4113,11 @@ def _load_dashboard_process_isolation_config(cfg: dict | None = None) -> dict[st
             dashboard.get("compute_host_respawn_max"),
             _DASHBOARD_COMPUTE_HOST_RESPAWN_MAX_DEFAULT,
             min_value=0,
+        ),
+        "detached_execution_max_s": _coerce_float_config_value(
+            dashboard.get("detached_execution_max_s"),
+            _DASHBOARD_DETACHED_EXECUTION_MAX_S_DEFAULT,
+            min_value=1.0,
         ),
     }
 
@@ -10219,6 +10282,9 @@ def _live_session_payload(
             viewers = session.setdefault("viewers", {})
             viewers[transport] = time.time()
             if transport is not _detached_ws_transport:
+                session.pop("_detached_at", None)
+                session.pop("_client_gone_interrupt_requested", None)
+                session.pop("_client_gone_interrupt_polls", None)
                 # A live transport rebind means the client is back — any
                 # pending ws-orphan reap must not fire (storm killer).
                 _cancel_ws_orphan_reap(sid)
@@ -11857,39 +11923,30 @@ def _plan_goal_compression_recovery(
         session.pop(_GOAL_COMPRESSION_RECOVERY_ATTEMPTS, None)
         return None, None
 
-    goal_created_at = float(getattr(goal_mgr.state, "created_at", 0.0) or 0.0)
-    recovery_state = session.get(_GOAL_COMPRESSION_RECOVERY_ATTEMPTS)
-    attempts = 0
-    if (
-        isinstance(recovery_state, dict)
-        and recovery_state.get("goal_created_at") == goal_created_at
-        and recovery_state.get("goal") == getattr(goal_mgr.state, "goal", "")
-    ):
-        try:
-            attempts = int(recovery_state.get("attempts", 0) or 0)
-        except (TypeError, ValueError):
-            attempts = 0
-
-    continuation_prompt = goal_mgr.next_continuation_prompt()
-    if attempts < _GOAL_COMPRESSION_RECOVERY_LIMIT and continuation_prompt:
-        session[_GOAL_COMPRESSION_RECOVERY_ATTEMPTS] = {
-            "goal_created_at": goal_created_at,
-            "goal": getattr(goal_mgr.state, "goal", ""),
-            "attempts": attempts + 1,
-        }
-        return (
-            continuation_prompt,
-            "Context compression was exhausted. Retrying the active goal once.",
-        )
-
-    goal_mgr.pause(reason="context compression exhausted twice consecutively")
-    # A later explicit /goal resume gets a fresh bounded recovery cycle.
-    session.pop(_GOAL_COMPRESSION_RECOVERY_ATTEMPTS, None)
-    return (
-        None,
-        "Goal paused after context compression was exhausted twice. "
-        "Run /compress, then /goal resume to continue.",
+    metadata = {
+        "failure_fingerprint": "CONTEXT_COMPRESSION_EXHAUSTED",
+        "session_id": sid_key,
+        "goal_created_at": float(getattr(goal_mgr.state, "created_at", 0.0) or 0.0),
+        "goal": getattr(goal_mgr.state, "goal", ""),
+    }
+    recovery = goal_mgr.checkpoint_recovery(
+        "CONTEXT_COMPRESSION_EXHAUSTED",
+        metadata=metadata,
     )
+    if recovery.get("should_continue"):
+        continuation_prompt = recovery.get("continuation_prompt")
+        if continuation_prompt:
+            return (
+                continuation_prompt,
+                "Context compression was exhausted. Retrying the active goal once from its durable recovery checkpoint.",
+            )
+    if recovery.get("verdict") == "recovery_exhausted":
+        return (
+            None,
+            "Goal paused after context compression made no progress across its bounded recovery episode. "
+            "Repair the context issue, then /goal resume to continue.",
+        )
+    return None, recovery.get("message") or "Context compression recovery was not admitted."
 
 
 # Captured at import time. Several _run_prompt_submit tests monkeypatch
