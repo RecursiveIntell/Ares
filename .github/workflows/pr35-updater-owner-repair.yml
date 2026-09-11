@@ -27,7 +27,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "485af6b5f1dc30023ea3461fa4c014060af833b3"
+          test "$(git rev-parse HEAD^)" = "ab51522ab62343337fe7399988c4101f0a0e7b6c"
           test "$(git hash-object hermes_cli/update_cmd.py)" = "1b04c61081216c371a1ec6d6cf260a42356d62a7"
           test -z "$(git status --porcelain)"
           git fetch --no-tags --depth=1 origin 2237be355906fbe6065ce1815711eee52b2d646e
@@ -153,15 +153,11 @@ jobs:
           from pathlib import Path
 
           tree = ast.parse(Path("hermes_cli/update_cmd.py").read_text(encoding="utf-8"))
-          imported = set()
-          defined = set()
-          for node in tree.body:
-              if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("hermes_cli.update_"):
-                  imported.update(alias.asname or alias.name for alias in node.names if alias.name != "*")
-              elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                  defined.add(node.name)
-          # The pinned source intentionally keeps a few wrappers; any accidental
-          # reappearance of the known stale ZIP owner is always a blocker.
+          defined = {
+              node.name
+              for node in tree.body
+              if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+          }
           if "_zip_overlay_block_reason" in defined:
               raise SystemExit("update_cmd.py still shadows update_cmd_zip._zip_overlay_block_reason")
           PY
