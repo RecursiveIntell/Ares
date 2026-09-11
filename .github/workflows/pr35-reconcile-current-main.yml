@@ -27,7 +27,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "1285813329514a61da1baf53c76af9d5df00db67"
+          test "$(git rev-parse HEAD^)" = "bc73feeb1ddcade6609913d971148518545bacf3"
           git fetch --no-tags origin main
           test "$(git rev-parse origin/main)" = "0451a66cbb765a3ede359660e37b1b2fbe857525"
           test -z "$(git status --porcelain)"
@@ -50,6 +50,7 @@ jobs:
           from pathlib import Path
           path = Path("hermes_state.py")
           text = path.read_text(encoding="utf-8")
+
           activity_anchor = "from agent.message_sanitization import _sanitize_surrogates\n"
           activity_owner = "from agent.session_activity import ActivityProvenance\n"
           activity_expected = activity_anchor + activity_owner
@@ -57,6 +58,17 @@ jobs:
               if text.count(activity_anchor) != 1:
                   raise SystemExit("unexpected hermes_state message-sanitization import shape")
               text = text.replace(activity_anchor, activity_expected, 1)
+
+          marker_import = (
+              "from agent.context_compressor import (\n"
+              "    _DB_PERSISTED_MARKER as _DB_PERSISTED_MARKER_KEY,\n"
+              ")\n"
+          )
+          if marker_import not in text:
+              if text.count(activity_owner) != 1:
+                  raise SystemExit("unexpected ActivityProvenance import shape while restoring DB marker owner")
+              text = text.replace(activity_owner, activity_owner + marker_import, 1)
+
           common_import = "from hermes_state_common import escape_like as _escape_like, stat_db_file_identity as _stat_db_file_identity\n"
           common_expected = (
               "from hermes_state_common import (\n"
@@ -69,10 +81,13 @@ jobs:
               if text.count(common_import) != 1:
                   raise SystemExit("unexpected hermes_state_common import shape")
               text = text.replace(common_import, common_expected, 1)
+
           path.write_text(text, encoding="utf-8")
           checked = path.read_text(encoding="utf-8")
           if activity_expected not in checked:
               raise SystemExit("top-level ActivityProvenance owner was not restored")
+          if marker_import not in checked:
+              raise SystemExit("DB persisted marker owner was not restored")
           if common_expected not in checked:
               raise SystemExit("recoverable end-reason owner was not restored")
           PY
@@ -102,7 +117,9 @@ jobs:
           source .venv/bin/activate
           python - <<'PY'
           import hermes_state
+          import agent.context_compressor as context_compressor
           assert hermes_state.SessionDB.RECOVERABLE_END_REASONS == hermes_state._RECOVERABLE_END_REASONS
+          assert hermes_state._DB_PERSISTED_MARKER_KEY == context_compressor._DB_PERSISTED_MARKER
           PY
 
       - name: Test context governor restore
