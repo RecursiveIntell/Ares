@@ -222,6 +222,7 @@ def test_dashboard_process_isolation_config_defaults_without_default_merge(monke
         "turn_isolation": False,
         "compute_host_heartbeat_secs": 15,
         "compute_host_respawn_max": 3,
+        "detached_execution_max_s": 300,
     }
 
 
@@ -238,6 +239,7 @@ def test_dashboard_process_isolation_config_coerces_raw_values():
         "turn_isolation": True,
         "compute_host_heartbeat_secs": 30,
         "compute_host_respawn_max": 0,
+        "detached_execution_max_s": 300,
     }
 
     malformed = {"dashboard": "enabled"}
@@ -245,6 +247,7 @@ def test_dashboard_process_isolation_config_coerces_raw_values():
         "turn_isolation": False,
         "compute_host_heartbeat_secs": 15,
         "compute_host_respawn_max": 3,
+        "detached_execution_max_s": 300,
     }
 
 
@@ -255,6 +258,30 @@ def test_default_config_seeds_dashboard_process_isolation_keys():
     assert dashboard["turn_isolation"] is False
     assert dashboard["compute_host_heartbeat_secs"] == 15
     assert dashboard["compute_host_respawn_max"] == 3
+    assert dashboard["detached_execution_max_s"] == 300
+
+
+def test_detached_execution_policy_separates_disconnect_from_stop():
+    detached = {
+        "transport": server._detached_ws_transport,
+        "running": True,
+        "_detached_at": 100.0,
+    }
+    assert server._detached_execution_policy(detached, now=150.0, max_seconds=300.0) == "retain"
+    assert server._detached_execution_policy(detached, now=400.0, max_seconds=300.0) == "interrupt"
+    detached["_turn_cancel_requested"] = True
+    assert server._detached_execution_policy(detached, now=150.0, max_seconds=300.0) == "cancel"
+    detached["_turn_cancel_requested"] = False
+    detached["running"] = False
+    assert server._detached_execution_policy(detached, now=150.0, max_seconds=300.0) == "reap"
+    detached["transport"] = object()
+    detached["running"] = True
+    assert server._detached_execution_policy(detached, now=150.0, max_seconds=300.0) == "attached"
+
+
+def test_detached_execution_policy_without_timestamp_requires_legacy_interrupt():
+    session = {"transport": server._detached_ws_transport, "running": True}
+    assert server._detached_execution_policy(session, now=0.0, max_seconds=1.0) == "interrupt"
 
 
 def test_prompt_submit_dispatches_to_compute_host_when_turn_isolation_enabled(monkeypatch):

@@ -4,6 +4,8 @@ These tests intentionally exercise the owner (GoalManager/SessionDB projection)
 without a provider, UI, or semantic-memory dependency.
 """
 import json
+import multiprocessing
+import os
 
 import pytest
 
@@ -357,3 +359,99 @@ def test_legacy_migration_is_idempotent_and_preserves_budget(monkeypatch, tmp_pa
     assert first["migrated"] is True
     assert second["migrated"] is False
     assert first_json == second_json
+
+
+
+def test_deferred_flush_retains_failed_write_and_removes_only_after_success(monkeypatch, tmp_path):
+    mgr = _manager(monkeypatch, tmp_path, sid="deferred-flush")
+    state = mgr.set("retain deferred state")
+    goals._DEFERRED_GOAL_WRITES.clear()
+    goals._defer_goal_write("deferred-flush", state)
+    home = next(iter(goals._DEFERRED_GOAL_WRITES))[0]
+
+    class FailingDB:
+        def set_meta(self, *_args, **_kwargs):
+            raise OSError("injected flush failure")
+
+    goals._flush_deferred_goal_writes(home, FailingDB())
+    assert (home, "deferred-flush") in goals._DEFERRED_GOAL_WRITES
+
+    class WorkingDB:
+        def __init__(self):
+            self.writes = []
+
+        def set_meta(self, key, value):
+            self.writes.append((key, value))
+
+    db = WorkingDB()
+    goals._flush_deferred_goal_writes(home, db)
+    assert db.writes
+    assert (home, "deferred-flush") not in goals._DEFERRED_GOAL_WRITES
+
+
+def test_failed_atomic_goal_migration_keeps_parent_and_no_child(monkeypatch, tmp_path):
+    mgr = _manager(monkeypatch, tmp_path, sid="migration-parent")
+    state = mgr.set("rotate safely")
+    db = goals._get_session_db()
+    monkeypatch.setattr(db, "compare_and_set_meta_many", lambda _items: False)
+
+    assert goals.migrate_goal_to_session("migration-parent", "migration-child") is False
+    parent = goals.load_goal("migration-parent")
+    assert parent is not None
+    assert parent.status == "active"
+    assert parent.goal_id == state.goal_id
+    assert goals.load_goal("migration-child") is None
+
+
+def test_atomic_goal_migration_preserves_identity_and_archives_parent(monkeypatch, tmp_path):
+    mgr = _manager(monkeypatch, tmp_path, sid="atomic-parent")
+    state = mgr.set("rotate atomically")
+
+    assert goals.migrate_goal_to_session("atomic-parent", "atomic-child", reason="test") is True
+    parent = goals.load_goal("atomic-parent")
+    child = goals.load_goal("atomic-child")
+    assert parent is not None and child is not None
+    assert parent.status == "cleared"
+    assert parent.outcome == goals.CANCELLED
+    assert child.status == "active"
+    assert child.goal_id == state.goal_id
+    assert child.migration["migrated_from_session"] == "atomic-parent"
+
+
+def _claim_continuation_in_child(home, session_id, start_barrier, release_barrier, result_queue, owner):
+    os.environ["HERMES_HOME"] = str(home)
+    goals._DB_CACHE.clear()
+    start_barrier.wait(timeout=20)
+    manager = goals.GoalManager(session_id)
+    claimed = manager.claim_continuation(owner)
+    result_queue.put(claimed)
+    release_barrier.wait(timeout=20)
+    if claimed:
+        manager.release_continuation(queued=False)
+
+
+def test_two_processes_have_one_continuation_claim(monkeypatch, tmp_path):
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("requires POSIX fork for the SessionDB race witness")
+    manager = _manager(monkeypatch, tmp_path, sid="multiprocess-claim")
+    manager.set("one owner only")
+    manager.evaluate_after_turn("", turn_outcome=goals.EXECUTION_FAILED)
+    home = tmp_path / ".hermes"
+    ctx = multiprocessing.get_context("fork")
+    start_barrier = ctx.Barrier(2)
+    release_barrier = ctx.Barrier(2)
+    result_queue = ctx.Queue()
+    workers = [
+        ctx.Process(
+            target=_claim_continuation_in_child,
+            args=(home, "multiprocess-claim", start_barrier, release_barrier, result_queue, f"owner-{i}"),
+        )
+        for i in range(2)
+    ]
+    for worker in workers:
+        worker.start()
+    results = [result_queue.get(timeout=20) for _ in workers]
+    for worker in workers:
+        worker.join(timeout=20)
+    assert all(worker.exitcode == 0 for worker in workers)
+    assert sorted(results) == [False, True]

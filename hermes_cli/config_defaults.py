@@ -1618,6 +1618,11 @@ DEFAULT_CONFIG = {
         "turn_isolation": False,
         "compute_host_heartbeat_secs": 15,
         "compute_host_respawn_max": 3,
+        # Finite execution bound for an already-authorized turn after the last
+        # Desktop/WebSocket viewer detaches. Detachment is not cancellation;
+        # explicit Stop still interrupts immediately. Runtime reads this from
+        # the same raw dashboard config owner as the other isolation controls.
+        "detached_execution_max_s": 300,
         # Hide the token/cost analytics surfaces (Analytics page, token bars and
         # cost figures on the Models page) by default.  The numbers shown there
         # are a local debug estimate: they only count successful main-agent

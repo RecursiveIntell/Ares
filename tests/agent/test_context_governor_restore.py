@@ -127,6 +127,20 @@ def test_protocol_probe_exercises_the_certified_two_phase_wire_contract():
     assert calls[-1][1] == {}
 
 
+
+
+def test_legacy_rehydration_stops_at_bounded_store_size(monkeypatch, tmp_path):
+    """A missing catalog must not scan every receipt in a large archive."""
+    store = tmp_path / "governor"
+    store.mkdir()
+    for index in range(65):
+        (store / f"ctxr_{index:032x}.json").write_text("{}", encoding="utf-8")
+    engine = ContextGovernorEngine(binary="/tmp/context-governor", store_dir=store)
+    messages = [{"role": "user", "content": "current"}]
+    with patch.object(type(store), "glob", side_effect=AssertionError("unbounded glob used")):
+        assert engine._rehydrate_legacy_parent_prefix(messages) == messages
+
+
 def _valid_llm_summary(body: str = "checkpoint") -> str:
     return (
         "=== ACTIVE TASK ===\nfinal\n\n"
