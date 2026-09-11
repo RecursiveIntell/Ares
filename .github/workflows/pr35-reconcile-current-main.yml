@@ -27,9 +27,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "15bb2bf0eb77d5c2b169721b78c65b6e3b0044fa"
+          test "$(git rev-parse HEAD^)" = "932b0f60080e1203f959f37b28df1cc5c5759b40"
           git fetch --no-tags origin main
-          test "$(git rev-parse origin/main)" = "4dda54e0bea205d257dea6c61c5efe89771f4beb"
+          test "$(git rev-parse origin/main)" = "0451a66cbb765a3ede359660e37b1b2fbe857525"
           test -z "$(git status --porcelain)"
 
       - name: Reconcile current main with conflict-hunk precedence
@@ -38,7 +38,7 @@ jobs:
           set -euo pipefail
           git config user.name "Josh Stevenson"
           git config user.email "J.stevenson.cs@gmail.com"
-          git merge --no-ff --no-commit -X theirs 4dda54e0bea205d257dea6c61c5efe89771f4beb
+          git merge --no-ff --no-commit -X theirs 0451a66cbb765a3ede359660e37b1b2fbe857525
           test -z "$(git diff --name-only --diff-filter=U)"
           git diff --check
 
