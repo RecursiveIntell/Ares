@@ -1,0 +1,91 @@
+name: PR35 reconcile current main
+
+on:
+  push:
+    branches: [hermes-ares-recon]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pr35-reconcile-current-main
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact reconciliation branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: hermes-ares-recon
+          fetch-depth: 0
+
+      - name: Verify pinned heads
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "cca8a4ada5b38d8b434e5c64ac2abe069a5f009e"
+          git fetch --no-tags origin main
+          test "$(git rev-parse origin/main)" = "4dda54e0bea205d257dea6c61c5efe89771f4beb"
+          test -z "$(git status --porcelain)"
+
+      - name: Reconcile current main with conflict-hunk precedence
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "Josh Stevenson"
+          git config user.email "J.stevenson.cs@gmail.com"
+          git merge --no-ff --no-commit -X theirs 4dda54e0bea205d257dea6c61c5efe89771f4beb
+          test -z "$(git diff --name-only --diff-filter=U)"
+          git diff --check
+          echo "Merged paths:"
+          git diff --cached --name-status
+          echo "Merge stat:"
+          git diff --cached --stat
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.9.28"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.11
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv python install 3.11
+          uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web
+
+      - name: Validate main-owned reconciliation surfaces
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          python -m pytest -q \
+            tests/agent/test_context_governor_restore.py \
+            tests/ares_runtime/test_managed_calls.py \
+            tests/hermes_cli/test_goal_lifecycle_contract.py \
+            tests/plugins/test_context_governor_fd_ownership.py \
+            tests/plugins/test_context_governor_protocol.py \
+            tests/plugins/test_context_governor_runtime_closure.py \
+            tests/test_hermes_state.py \
+            tests/test_tui_gateway_server.py
+
+      - name: Commit reconciliation and remove one-shot workflows
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm .github/workflows/pr35-reconcile-current-main.yml
+          if test -f .github/workflows/pr35-desktop-import-repair.yml; then
+            git rm .github/workflows/pr35-desktop-import-repair.yml
+          fi
+          git add -A
+          git diff --cached --check
+          git commit -m "merge(main): reconcile PR 35 with current Ares main"
+          git push origin HEAD:hermes-ares-recon
