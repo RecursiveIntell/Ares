@@ -390,6 +390,7 @@ describe('quickstart', () => {
         error: null
       }
     ])
+    mocked.getLocalModelsJobs.mockResolvedValue({ jobs: [...$localRuntimeJobs.get()] })
     renderPane()
 
     expect(await screen.findByText('Qwen3.6 27B — 17.6 GB')).toBeTruthy()

@@ -290,6 +290,14 @@ import {
   undialedSshRouteSeeds
 } from './plugin-profile-routes'
 import { canAdmitLocalBackend, isUnlimitedPoolCapacity, PoolCapacityError, selectPoolEvictions } from './pool-eviction'
+import { clampPoolLimits, parsePoolLimits, POOL_LIMITS_DEFAULTS, type PoolLimits } from './pool-limits'
+import {
+  isBackgroundSlotWaitTimeout,
+  LocalBackendSpawnCoordinator,
+  type LocalBackendSpawnPriority,
+  type LocalBackendSpawnRequest,
+  releaseLocalBackendSlotAfterExit
+} from './pool-spawn-coordinator'
 import { createPoolStopper } from './pool-stop'
 import { poolTouchKeys } from './pool-touch-scope'
 import { createKeepAwake } from './power-save'
@@ -302,7 +310,6 @@ import {
 } from './primary-backend-startup'
 import { rehomePrimaryConnection } from './primary-connection-rehome'
 import { createProductionPermitController } from './production-permit'
-import { normalizeProfileBackendPoolMax, readProfileBackendPoolSettings } from './profile-backend-pool-settings'
 import {
   assertLocalProfileCanStart,
   decideProfileDeleteAction,
@@ -897,7 +904,11 @@ const DESKTOP_LOG_BUFFER_MAX_CHARS = 64 * 1024
 const DESKTOP_LOG_MAX_BYTES = 10 * 1024 * 1024
 const DESKTOP_LOG_BACKUP_COUNT = 3
 const DESKTOP_LOG_DISCARD_BYTES = DESKTOP_LOG_MAX_BYTES * 4
-const desktopLogBackupPath = n => `${DESKTOP_LOG_PATH}.${n}`
+const desktopLogBackupPath = (n: number) => `${DESKTOP_LOG_PATH}.${n}`
+const hermesLog: string[] = []
+let desktopLogBuffer = ''
+let desktopLogFlushTimer: ReturnType<typeof setTimeout> | null = null
+let desktopLogFlushPromise: Promise<void> = Promise.resolve()
 const BOOT_FAKE_MODE = process.env.HERMES_DESKTOP_BOOT_FAKE === '1'
 const BOOT_FAKE_ERROR = process.env.HERMES_DESKTOP_BOOT_FAKE_ERROR || ''
 // Automated teardown (Playwright's app.close(), harness scripts) quits with
@@ -1430,16 +1441,138 @@ const profileDeletionGate = new ProfileDeletionGate()
 // Keep the pool light: cap concurrent profile backends (LRU eviction) and reap
 // idle ones. A user idles at exactly the primary backend; pool backends only
 // exist while a non-primary profile is actively being chatted through.
-// Pool cap precedence: HERMES_DESKTOP_POOL_MAX env var (operator/test override)
-// > persisted profile-backend-settings.json > 4. A stored 0 means unlimited —
-// hard admission always admits and LRU cap eviction never fires; the idle
-// reaper (POOL_IDLE_MS) remains the sole idle teardown path so an unlimited
-// pool still reclaims MCP-heavy backends instead of accumulating them.
-const POOL_MAX_BACKENDS = normalizeProfileBackendPoolMax(
-  process.env.HERMES_DESKTOP_POOL_MAX,
-  readProfileBackendPoolSettings(app.getPath('userData')).maxBackends
-)
-const POOL_IDLE_MS = Math.max(60_000, Number(process.env.HERMES_DESKTOP_POOL_IDLE_MS) || 10 * 60_000)
+// Pool sizing is a device preference (Settings → Advanced → pool rows), not a
+// launch constant: mutable at runtime, persisted in userData, applied live.
+// The legacy HERMES_DESKTOP_POOL_* env vars remain the initial-value fallback
+// for scripted/headless setups; after launch the stored preference wins.
+const POOL_LIMITS_PATH = path.join(app.getPath('userData'), 'pool-limits.json')
+
+function readPersistedPoolLimits(): PoolLimits {
+  try {
+    const limits = parsePoolLimits(fs.readFileSync(POOL_LIMITS_PATH, 'utf8'))
+    rememberLog(
+      `[pool-limits] loaded from ${POOL_LIMITS_PATH}: maxBackends=${limits.maxBackends}, idleMs=${limits.idleMs}`
+    )
+
+    return limits
+  } catch {
+    // No persisted file yet — fall back to the legacy env vars so scripted
+    // setups keep working. Log which source won: a silently-ignored env var
+    // here costs a scripted-setup user a debugging session.
+    const fromEnv = clampPoolLimits({
+      maxBackends: Number(process.env.HERMES_DESKTOP_POOL_MAX) || undefined,
+      idleMs: Number(process.env.HERMES_DESKTOP_POOL_IDLE_MS) || undefined
+    })
+
+    if (fromEnv.maxBackends !== POOL_LIMITS_DEFAULTS.maxBackends || fromEnv.idleMs !== POOL_LIMITS_DEFAULTS.idleMs) {
+      rememberLog(`[pool-limits] no saved file; using env-var overrides: maxBackends=${fromEnv.maxBackends}, idleMs=${fromEnv.idleMs}`)
+    } else {
+      rememberLog('[pool-limits] no saved file and no env overrides; using defaults')
+    }
+
+    return fromEnv
+  }
+}
+
+function persistPoolLimits(limits: PoolLimits) {
+  try {
+    fs.mkdirSync(path.dirname(POOL_LIMITS_PATH), { recursive: true })
+    // Atomic write: write to a temp file in the same directory, then rename.
+    // A crash mid-write would otherwise leave truncated JSON and silently
+    // lose the user's saved sizing.
+    const tmpPath = `${POOL_LIMITS_PATH}.tmp`
+    fs.writeFileSync(tmpPath, JSON.stringify(limits, null, 2), 'utf8')
+    fs.renameSync(tmpPath, POOL_LIMITS_PATH)
+  } catch (error) {
+    rememberLog(`[pool-limits] write failed: ${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
+let poolLimits = readPersistedPoolLimits()
+// Hard cap on local backends that are starting OR running (the LRU eviction
+// above is soft — it spares keepalive-fresh entries). Follows the live
+// preference: setPoolLimits() pushes a new max into the coordinator.
+const localBackendSpawnCoordinator = new LocalBackendSpawnCoordinator(poolLimits.maxBackends)
+// How long a spawn may wait for a free local slot. Must stay under the
+// renderer's BACKEND_BOOT_WAIT_TIMEOUT_MS (45s, src/lib/with-timeout.ts) so
+// the queued ticket fails before the renderer does and the user sees why.
+const POOL_SLOT_WAIT_MS = 30_000
+
+function poolMaxBackends(): number {
+  return poolLimits.maxBackends
+}
+
+function poolIdleMs(): number {
+  return poolLimits.idleMs
+}
+
+function spawnPriorityFrom(value: unknown): LocalBackendSpawnPriority {
+  return value === 'foreground' ? 'foreground' : 'background'
+}
+
+// Foreground intent for a dial whose pool entry does not exist yet: a user
+// click that joins an in-flight backendDialClaims claim never re-enters
+// ensureBackend(), and the claim owner may still be awaiting poolStopper /
+// registry resolution before backendPool.set(). The mark is cleared when the
+// claim settles or consumed immediately before a local slot request.
+const pendingForegroundSpawns = new Set<string>()
+
+function takeForegroundSpawn(...poolKeys: string[]): boolean {
+  let marked = false
+
+  for (const poolKey of poolKeys) {
+    marked = pendingForegroundSpawns.delete(poolKey) || marked
+  }
+
+  return marked
+}
+
+function promotePoolEntry(entry: any): void {
+  entry.spawnPriority = 'foreground'
+  entry.localBackendSpawnRequest?.promote?.('foreground')
+}
+
+function logPoolSpawnFailure(label: string, error: unknown): void {
+  if (isBackgroundSlotWaitTimeout(error)) {
+    rememberLog(`Profile backend ${label} slot wait timed out (background); will retry on the next hydration`)
+  } else {
+    rememberLog(
+      `Hermes backend for profile ${label} failed to start: ${error instanceof Error ? error.message : String(error)}`
+    )
+  }
+}
+
+function applySpawnPriority(scopeKey: string, spawnPriority: LocalBackendSpawnPriority): () => void {
+  if (spawnPriority !== 'foreground') {
+    return () => undefined
+  }
+
+  const existing = backendPool.get(scopeKey)
+
+  if (existing) {
+    promotePoolEntry(existing)
+  } else {
+    pendingForegroundSpawns.add(scopeKey)
+  }
+
+  return () => void pendingForegroundSpawns.delete(scopeKey)
+}
+
+/**
+ * Apply new limits live: persist, then converge the running pool — evict
+ * LRU backends down to the new max, and let the (already running) idle
+ * reaper handle a shortened idle window on its next tick. Returns the
+ * limits actually in force (post-clamp).
+ */
+function setPoolLimits(raw: Partial<PoolLimits>): PoolLimits {
+  poolLimits = clampPoolLimits(raw)
+  persistPoolLimits(poolLimits)
+  localBackendSpawnCoordinator.setLimit(poolLimits.maxBackends)
+  evictLruPoolBackends(poolMaxBackends())
+  startPoolIdleReaper()
+
+  return { ...poolLimits }
+}
 
 // A backend touched within this window has a live renderer socket (the keepalive
 // pings every 60s for every open profile). LRU eviction must spare these — a
@@ -11355,11 +11488,11 @@ async function ensureBackend(profile, opts: { spawnPriority?: LocalBackendSpawnP
     return connection
   }
 
-  if (!canAdmitLocalBackend(backendPool.entries(), POOL_MAX_BACKENDS)) {
-    throw new PoolCapacityError(POOL_MAX_BACKENDS)
+  if (!canAdmitLocalBackend(backendPool.entries(), poolMaxBackends())) {
+    throw new PoolCapacityError(poolMaxBackends())
   }
 
-  evictLruPoolBackends(POOL_MAX_BACKENDS - 1)
+  evictLruPoolBackends(poolMaxBackends() - 1)
 
   const entry = {
     process: null,
@@ -11536,11 +11669,11 @@ async function ensureRegistryBackend(
       return existingLocal.connectionPromise
     }
 
-    if (!canAdmitLocalBackend(backendPool.entries(), POOL_MAX_BACKENDS)) {
-      throw new PoolCapacityError(POOL_MAX_BACKENDS)
+    if (!canAdmitLocalBackend(backendPool.entries(), poolMaxBackends())) {
+      throw new PoolCapacityError(poolMaxBackends())
     }
 
-    evictLruPoolBackends(POOL_MAX_BACKENDS - 1)
+    evictLruPoolBackends(poolMaxBackends() - 1)
 
     const localEntry = {
       process: null,
@@ -12263,7 +12396,7 @@ function touchPoolBackend(profile) {
 // was merely idle past the keepalive window. Descriptors are still reclaimed
 // by the idle reaper.
 function evictLruPoolBackends(keep) {
-  if (isUnlimitedPoolCapacity(POOL_MAX_BACKENDS)) {
+  if (isUnlimitedPoolCapacity(poolMaxBackends())) {
     return
   }
 
@@ -12643,7 +12776,7 @@ const SPECIALIST_RUNNER_TIMEOUT_MS = 5 * 60_000
 let specialistDispatchServer: Awaited<ReturnType<typeof startSpecialistDispatchServer>> | null = null
 
 const specialistDispatchAdmission = createSpecialistDispatchAdmission({
-  maxCapacity: POOL_MAX_BACKENDS,
+  maxCapacity: poolMaxBackends(),
   pool: backendPool,
   spawnRunner: async request => {
     // Reuse Desktop's established runtime resolver, but do not accept a caller
