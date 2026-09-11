@@ -2372,12 +2372,13 @@ def _turn_isolation_enabled(cfg: dict | None = None) -> bool:
 def _session_uses_compute_host(session: dict, cfg: dict | None = None) -> bool:
     if not _turn_isolation_enabled(cfg):
         return False
-    # Phase 1 routes lazy/dashboard sessions whose live AIAgent has not been
-    # built inside the serving process. Already-built in-process sessions keep
-    # the historical path unless a prior isolated turn marked host ownership.
-    return bool(session.get("_compute_host_active")) or (
-        session.get("agent") is None and session.get("agent_ready") is not None
-    )
+    # Phase 1 routes deferred dashboard sessions through the host for their
+    # entire lifetime. ``session.create`` prewarms the AIAgent in the serving
+    # process after a short timer, so using ``agent is None`` here makes the
+    # isolation guarantee depend on whether that race wins before the first
+    # prompt. ``agent_ready`` is the durable shape marker for a deferred session;
+    # its current agent value must not revoke the host-owned turn boundary.
+    return bool(session.get("_compute_host_active")) or session.get("agent_ready") is not None
 
 
 def _get_compute_host_supervisor(cfg: dict | None = None):

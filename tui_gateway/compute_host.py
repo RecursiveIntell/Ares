@@ -448,17 +448,11 @@ class ComputeHost:
             # active. Admit durable session state before claiming running or
             # emitting turn.started; a false ready/streaming projection for an
             # unpersisted prompt is not recoverable after a host crash.
-            if not server._ensure_session_db_row(session):
-                self.emit(
-                    {
-                        "type": "turn.error",
-                        "sid": sid,
-                        "request_id": request_id,
-                        "reason": "session_persistence_failed",
-                        "message": "session persistence failed; prompt was not started",
-                    }
-                )
-                return
+            # The server helper is intentionally void: it persists the row or
+            # raises on a fatal storage error. Treating its normal ``None``
+            # return as false rejected every real compute-host turn before the
+            # provider was invoked.
+            server._ensure_session_db_row(session)
             with session["history_lock"]:
                 queued_prompt_generation = frame.get("queued_prompt_generation")
                 if (
@@ -642,7 +636,7 @@ class ComputeHost:
                 "edit_snapshots": {},
                 "tool_started_at": {},
                 "model_override": frame.get("model_override"),
-                "source": server._sanitize_client_source(frame.get("source")),
+                "source": server._resolve_session_source(frame.get("source")),
                 "transport": self._transport,
             }
         session = server._sessions[sid]
