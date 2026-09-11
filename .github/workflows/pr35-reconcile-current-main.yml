@@ -27,7 +27,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "5177b52e8c496e85088fe3f8de384c366058e70c"
+          test "$(git rev-parse HEAD^)" = "15bb2bf0eb77d5c2b169721b78c65b6e3b0044fa"
           git fetch --no-tags origin main
           test "$(git rev-parse origin/main)" = "4dda54e0bea205d257dea6c61c5efe89771f4beb"
           test -z "$(git status --porcelain)"
@@ -42,7 +42,7 @@ jobs:
           test -z "$(git diff --name-only --diff-filter=U)"
           git diff --check
 
-      - name: Restore current-main activity provenance owner
+      - name: Restore current-main hermes_state owners
         shell: bash
         run: |
           set -euo pipefail
@@ -51,16 +51,34 @@ jobs:
 
           path = Path("hermes_state.py")
           text = path.read_text(encoding="utf-8")
-          anchor = "from agent.message_sanitization import _sanitize_surrogates\n"
-          owner = "from agent.session_activity import ActivityProvenance\n"
-          expected = anchor + owner
-          if expected not in text:
-              if text.count(anchor) != 1:
+
+          activity_anchor = "from agent.message_sanitization import _sanitize_surrogates\n"
+          activity_owner = "from agent.session_activity import ActivityProvenance\n"
+          activity_expected = activity_anchor + activity_owner
+          if activity_expected not in text:
+              if text.count(activity_anchor) != 1:
                   raise SystemExit("unexpected hermes_state message-sanitization import shape")
-              text = text.replace(anchor, expected, 1)
-              path.write_text(text, encoding="utf-8")
-          if expected not in path.read_text(encoding="utf-8"):
+              text = text.replace(activity_anchor, activity_expected, 1)
+
+          common_import = "from hermes_state_common import escape_like as _escape_like, stat_db_file_identity as _stat_db_file_identity\n"
+          common_expected = (
+              "from hermes_state_common import (\n"
+              "    _RECOVERABLE_END_REASONS,\n"
+              "    escape_like as _escape_like,\n"
+              "    stat_db_file_identity as _stat_db_file_identity,\n"
+              ")\n"
+          )
+          if common_expected not in text:
+              if text.count(common_import) != 1:
+                  raise SystemExit("unexpected hermes_state_common import shape")
+              text = text.replace(common_import, common_expected, 1)
+
+          path.write_text(text, encoding="utf-8")
+          checked = path.read_text(encoding="utf-8")
+          if activity_expected not in checked:
               raise SystemExit("top-level ActivityProvenance owner was not restored")
+          if common_expected not in checked:
+              raise SystemExit("recoverable end-reason owner was not restored")
           PY
           git add hermes_state.py
           git diff --cached --check
@@ -90,6 +108,10 @@ jobs:
         run: |
           set -euo pipefail
           source .venv/bin/activate
+          python - <<'PY'
+          import hermes_state
+          assert hermes_state.SessionDB.RECOVERABLE_END_REASONS == hermes_state._RECOVERABLE_END_REASONS
+          PY
           python -m pytest -q \
             tests/agent/test_context_governor_restore.py \
             tests/ares_runtime/test_managed_calls.py \
@@ -100,14 +122,11 @@ jobs:
             tests/test_hermes_state.py \
             tests/test_tui_gateway_server.py
 
-      - name: Commit reconciliation and remove one-shot workflows
+      - name: Commit reconciliation
         shell: bash
         run: |
           set -euo pipefail
           git rm .github/workflows/pr35-reconcile-current-main.yml
-          if test -f .github/workflows/pr35-desktop-import-repair.yml; then
-            git rm .github/workflows/pr35-desktop-import-repair.yml
-          fi
           git add -A
           git diff --cached --check
           git commit -m "merge(main): reconcile PR 35 with current Ares main"
