@@ -27,7 +27,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "932b0f60080e1203f959f37b28df1cc5c5759b40"
+          test "$(git rev-parse HEAD^)" = "401632cc79b21b53d8d013e4ef4b151caa7d785d"
           git fetch --no-tags origin main
           test "$(git rev-parse origin/main)" = "0451a66cbb765a3ede359660e37b1b2fbe857525"
           test -z "$(git status --porcelain)"
@@ -82,10 +82,6 @@ jobs:
           PY
           git add hermes_state.py
           git diff --cached --check
-          echo "Reconciled paths:"
-          git diff --cached --name-status
-          echo "Reconciliation stat:"
-          git diff --cached --stat
 
       - name: Install uv
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
@@ -103,7 +99,7 @@ jobs:
           uv python install 3.11
           uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web
 
-      - name: Validate main-owned reconciliation surfaces
+      - name: Validate hermes_state owner contract
         shell: bash
         run: |
           set -euo pipefail
@@ -112,15 +108,38 @@ jobs:
           import hermes_state
           assert hermes_state.SessionDB.RECOVERABLE_END_REASONS == hermes_state._RECOVERABLE_END_REASONS
           PY
-          python -m pytest -q \
-            tests/agent/test_context_governor_restore.py \
-            tests/ares_runtime/test_managed_calls.py \
-            tests/hermes_cli/test_goal_lifecycle_contract.py \
-            tests/plugins/test_context_governor_fd_ownership.py \
-            tests/plugins/test_context_governor_protocol.py \
-            tests/plugins/test_context_governor_runtime_closure.py \
-            tests/test_hermes_state.py \
-            tests/test_tui_gateway_server.py
+
+      - name: Test context governor restore
+        shell: bash
+        run: source .venv/bin/activate && python -m pytest -q tests/agent/test_context_governor_restore.py
+
+      - name: Test Ares managed calls
+        shell: bash
+        run: source .venv/bin/activate && python -m pytest -q tests/ares_runtime/test_managed_calls.py
+
+      - name: Test goal lifecycle contract
+        shell: bash
+        run: source .venv/bin/activate && python -m pytest -q tests/hermes_cli/test_goal_lifecycle_contract.py
+
+      - name: Test context governor fd ownership
+        shell: bash
+        run: source .venv/bin/activate && python -m pytest -q tests/plugins/test_context_governor_fd_ownership.py
+
+      - name: Test context governor protocol
+        shell: bash
+        run: source .venv/bin/activate && python -m pytest -q tests/plugins/test_context_governor_protocol.py
+
+      - name: Test context governor runtime closure
+        shell: bash
+        run: source .venv/bin/activate && python -m pytest -q tests/plugins/test_context_governor_runtime_closure.py
+
+      - name: Test hermes state
+        shell: bash
+        run: source .venv/bin/activate && python -m pytest -q tests/test_hermes_state.py
+
+      - name: Test TUI gateway server
+        shell: bash
+        run: source .venv/bin/activate && python -m pytest -q tests/test_tui_gateway_server.py
 
       - name: Commit reconciliation
         shell: bash
