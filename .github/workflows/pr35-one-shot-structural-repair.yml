@@ -27,7 +27,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "6e874b0cddc929d013e5f97a8e3c73ec84b8d3e9"
+          test "$(git rev-parse HEAD^)" = "0458e49f436126cb2700ae970d4ae5a322b6a399"
           test "$(git hash-object gateway/platforms/base.py)" = "7528480d91c299b64c7eb549f55ffc26c2dc4f9b"
           test -z "$(git status --porcelain)"
 
@@ -55,39 +55,9 @@ jobs:
           if set(found) != target_names or len(found) != len(target_names):
               raise SystemExit(f"unexpected structural owners in base.py: {found!r}")
 
-          lines = text.splitlines(keepends=True)
-          for node in sorted(targets, key=lambda item: item.lineno, reverse=True):
-              decorator_lines = [decorator.lineno for decorator in node.decorator_list]
-              start_line = min([node.lineno, *decorator_lines]) - 1
-              end_line = node.end_lineno
-              del lines[start_line:end_line]
-
-          text = "".join(lines)
-          marker = "from urllib.parse import urlsplit\n\nfrom utils import normalize_proxy_url\n"
-          replacement = (
-              "from urllib.parse import urlsplit\n\n"
-              "from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome\n"
-              "from utils import normalize_proxy_url\n"
-          )
-          if marker not in text:
-              raise SystemExit("expected import anchor not found")
-          if "from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome" in text:
-              raise SystemExit("event-owner import already present unexpectedly")
-          text = text.replace(marker, replacement, 1)
-          path.write_text(text, encoding="utf-8")
-
-          repaired = ast.parse(text)
-          stale = [
-              node.name
-              for node in repaired.body
-              if isinstance(node, ast.ClassDef) and node.name in target_names
-          ]
-          if stale:
-              raise SystemExit(f"stale structural-owner classes remain: {stale!r}")
-
           imports = [
               node
-              for node in repaired.body
+              for node in tree.body
               if isinstance(node, ast.ImportFrom)
               and node.module == "gateway.platforms.event"
           ]
@@ -98,6 +68,25 @@ jobs:
           }
           if not target_names <= imported:
               raise SystemExit(f"canonical event-owner imports incomplete: {sorted(imported)!r}")
+
+          lines = text.splitlines(keepends=True)
+          for node in sorted(targets, key=lambda item: item.lineno, reverse=True):
+              decorator_lines = [decorator.lineno for decorator in node.decorator_list]
+              start_line = min([node.lineno, *decorator_lines]) - 1
+              end_line = node.end_lineno
+              del lines[start_line:end_line]
+
+          text = "".join(lines)
+          path.write_text(text, encoding="utf-8")
+
+          repaired = ast.parse(text)
+          stale = [
+              node.name
+              for node in repaired.body
+              if isinstance(node, ast.ClassDef) and node.name in target_names
+          ]
+          if stale:
+              raise SystemExit(f"stale structural-owner classes remain: {stale!r}")
           PY
 
       - name: Validate structural repair
