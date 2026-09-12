@@ -27,7 +27,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "b579d90ba9636a168a9850f1f0d0573eb4eb724c"
+          test "$(git rev-parse HEAD^)" = "f3e397e45df42931f636073d3898d45f1bf7831d"
           git fetch --no-tags origin main
           test "$(git rev-parse origin/main)" = "0451a66cbb765a3ede359660e37b1b2fbe857525"
           test -z "$(git status --porcelain)"
@@ -47,6 +47,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 .github/pr35_reconcile.py
+          python3 .github/pr35_reconcile_state_support.py
           git add hermes_state.py hermes_cli/goals.py tests/hermes_cli/test_goals.py
           git diff --cached --check
 
@@ -81,6 +82,19 @@ jobs:
           assert hermes_state._DB_PERSISTED_MARKER_KEY == context_compressor._DB_PERSISTED_MARKER
           assert hermes_state.sanitize_context is memory_manager.sanitize_context
           assert "active_delegations" in inspect.signature(GoalManager.evaluate_after_turn).parameters
+          for name in (
+              "_MODEL_CONFIG_ROW_MISSING",
+              "_cwd_prefix_clause",
+              "_workspace_key_clause",
+              "_collect_delegate_child_ids",
+              "_delete_delegate_children",
+              "_LISTABLE_CHILD_SQL",
+              "_RECOVERABLE_END_REASONS_SQL",
+              "_RESET_END_REASONS_SQL",
+              "_sql_session_last_active",
+              "_sql_session_last_active_by_id",
+          ):
+              assert hasattr(hermes_state, name), name
           PY
 
       - name: Test context governor restore
@@ -119,7 +133,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git rm .github/workflows/pr35-reconcile-current-main.yml .github/pr35_reconcile.py
+          git rm .github/workflows/pr35-reconcile-current-main.yml .github/pr35_reconcile.py .github/pr35_reconcile_state_support.py
           git add -A
           git diff --cached --check
           git commit -m "merge(main): reconcile PR 35 with current Ares main"
