@@ -99,11 +99,18 @@ vi.mock('undici', () => ({ WebSocket: FakeWebSocket }))
 
 import {
   GatewayClient,
+  gatewayPythonArgs,
   RECONNECT_BASE_MS,
   RECONNECT_MAX_MS,
   WS_HEARTBEAT_DEAD_MS,
   WS_HEARTBEAT_INTERVAL_MS
 } from '../gatewayClient.js'
+
+describe('spawned gateway command', () => {
+  it('uses Python safe-path mode before importing the gateway module', () => {
+    expect(gatewayPythonArgs()).toEqual(['-P', '-m', 'tui_gateway.entry'])
+  })
+})
 
 describe('GatewayClient websocket attach mode', () => {
   const originalWebSocket = globalThis.WebSocket

@@ -1,7 +1,7 @@
 ---
 name: profile-collaboration
 description: Route substantive work to relevant Ares profiles.
-version: 1.2.0
+version: 1.2.1
 author: Josh Stevenson / RecursiveIntell Ares
 license: MIT
 platforms: [linux, macos, windows]
@@ -118,7 +118,9 @@ selection. All eight profiles require `full_panel_explicit: true`.
    ```
    Use `--full-panel` only as an explicit escalation. The runner refuses an
    implicit all-profile invocation, isolates each selected `HERMES_HOME`, uses
-   bounded concurrency and process-group cleanup, requests automatic archival
+   bounded concurrency and process-group cleanup, launches the runtime with
+   Python safe-path mode so the assigned workspace cannot shadow Hermes modules,
+   requests automatic archival
    of automation-owned oneshot sessions, and writes a machine-readable receipt
    under `~/.ares/profile-collaboration/receipts/`.
 3. Run the dry-run first for a new routing shape. It must enumerate exactly the
@@ -191,7 +193,7 @@ safe.
   against the staged stat, selected high-risk paths, and named validation receipts.
   A panel timeout caused by unbounded review scope is not a profile-health failure.
 - Mutating profile homes during a read-only consultation.
-- A profile can exit zero yet be operationally blocked when every tool call fails before execution (observed runtime error: `DaemonThreadPoolExecutor object has no attribute _initializer`). Treat the lane as `failed`/`blocked`, not `returned` approval; preserve the receipt, report the runtime revision, and retry only after the executor/runtime owner is repaired or with a verified alternate runtime.
+- A profile can exit zero yet be operationally blocked when every tool call fails before execution (observed runtime error: `DaemonThreadPoolExecutor object has no attribute _initializer`). The runner recognizes this incident, records `outcome=blocked`, `termination_reason=operational_blocked_report`, and `operational_block=daemon_pool_initializer_failure`, then exits nonzero instead of manufacturing approval. It also launches both the specialist and archive helper with `-P` plus the explicit runtime `PYTHONPATH`, preventing an assigned workspace from shadowing the receipt-bound runtime. Preserve the receipt and require a real post-fix inspection probe before retrying publication.
 - Overwriting an old receipt or deleting failed evidence. Receipts are
   append-only run artifacts; new attempts get new directories.
 

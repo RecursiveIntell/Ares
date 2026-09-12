@@ -10516,7 +10516,7 @@ def _module_hermes_argv() -> list[str]:
     # ``hermes_cli.main`` is the console-script target declared in
     # pyproject.toml, NOT a top-level ``hermes`` package — there is no
     # ``hermes`` package to import.
-    return [sys.executable, "-m", "hermes_cli.main"]
+    return [sys.executable, "-P", "-m", "hermes_cli.main"]
 
 
 def _absolute_hermes_path(path: str) -> str:
@@ -10761,6 +10761,9 @@ def _default_spawn(
         source_profile_home=get_process_hermes_home(),
         enforce_profile_boundary=target_home is not None,
     )
+    from hermes_bootstrap import pin_runtime_pythonpath
+
+    pin_runtime_pythonpath(env)
     # The dispatcher is detached from every conversation. Its worker must never
     # inherit routing mirrored by a previous gateway turn, even before the first
     # session binds ContextVars in this process.

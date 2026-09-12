@@ -14,6 +14,8 @@ the crash class cannot silently regress.
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
 import subprocess
 from unittest.mock import MagicMock, patch
 
@@ -73,11 +75,17 @@ def test_cli_exec_uses_utf8_replace():
     subprocess.run; it must pass encoding="utf-8" and errors="replace"
     (#53137)."""
     handler = server._methods["cli.exec"]
-    with patch("subprocess.run", return_value=_make_completed_process()) as mock_run:
-        # Non-interactive argv that passes _cli_exec_blocked.
-        resp = handler(1, {"argv": ["--version"]})
+    hostile_pythonpath = os.pathsep.join(["/tmp/hostile", "/tmp/userlib"])
+    with patch.dict(os.environ, {"PYTHONPATH": hostile_pythonpath}), \
+         patch("subprocess.run", return_value=_make_completed_process()) as mock_run:
+        handler(1, {"argv": ["--version"]})
         assert mock_run.called, "subprocess.run was not invoked"
+        command = mock_run.call_args.args[0]
+        assert command[1:4] == ["-P", "-m", "hermes_cli.main"]
         kwargs = mock_run.call_args[1]
+        pythonpath = kwargs["env"]["PYTHONPATH"].split(os.pathsep)
+        assert Path(pythonpath[0]).resolve() == Path(server.__file__).resolve().parent.parent
+        assert pythonpath[1:] == hostile_pythonpath.split(os.pathsep)
         assert kwargs.get("encoding") == "utf-8", (
             f"cli.exec subprocess.run must set encoding='utf-8' (got {kwargs.get('encoding')!r})"
         )

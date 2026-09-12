@@ -268,6 +268,24 @@ class TestEntryPointsImportBootstrap:
         )
 
 
+class TestPinRuntimePythonpath:
+    def test_runtime_root_is_first_without_losing_unrelated_entries(self):
+        hb = _fresh_import()
+        env = {
+            "PYTHONPATH": os.pathsep.join(
+                ["", "/tmp/hostile", "/opt/hermes", "/tmp/userlib", "/opt/hermes"]
+            )
+        }
+
+        hb.pin_runtime_pythonpath(env, "/opt/hermes")
+
+        assert env["PYTHONPATH"].split(os.pathsep) == [
+            "/opt/hermes",
+            "/tmp/hostile",
+            "/tmp/userlib",
+        ]
+
+
 class TestHardenImportPath:
     """harden_import_path() must keep a same-named package in the launch
     directory from shadowing Hermes's own top-level modules — covering both

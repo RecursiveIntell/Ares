@@ -39,6 +39,24 @@ PROFILES = (
 
 DEFAULT_PROFILE_TIMEOUT_SECONDS = 180.0
 DEFAULT_PANEL_TIMEOUT_SECONDS = 600.0
+PANEL_CHILD_ENVIRONMENT_POLICY = "runtime_safe_path_v1"
+DAEMON_POOL_BLOCK_MARKERS = (
+    b"every inspection tool failed",
+    b"all execution and file-inspection tools failed",
+    b"unable to complete",
+)
+
+
+def reported_operational_block(stdout: bytes, stderr: bytes) -> str | None:
+    """Recognize the known exit-zero daemon-pool infrastructure failure."""
+    output = (stdout + b"\n" + stderr).lower()
+    if (
+        b"daemonthreadpoolexecutor" in output
+        and b"_initializer" in output
+        and any(marker in output for marker in DAEMON_POOL_BLOCK_MARKERS)
+    ):
+        return "daemon_pool_initializer_failure"
+    return None
 
 
 class ProcessRegistry:
@@ -265,7 +283,7 @@ def archive_automation_session(
     environment.pop("HERMES_SESSION_SOURCE", None)
     try:
         completed = subprocess.run(
-            [str(runtime / ".venv" / "bin" / "python"), "-c", program],
+            [str(runtime / ".venv" / "bin" / "python"), "-P", "-c", program],
             env=environment,
             text=True,
             stdout=subprocess.PIPE,
@@ -304,6 +322,7 @@ def run_one(
     python = runtime / ".venv" / "bin" / "python"
     command = [
         str(python),
+        "-P",
         "-m",
         "hermes_cli.main",
         "--in",
@@ -378,7 +397,27 @@ def run_one(
     )
     ended_at = utc_now()
     panel_deadline = panel_cancelled is not None and panel_cancelled.is_set()
-    outcome = "timed_out" if timed_out or panel_deadline else ("returned" if return_code == 0 else "failed")
+    operational_block = reported_operational_block(stdout_raw or b"", stderr_raw or b"")
+    outcome = (
+        "timed_out"
+        if timed_out or panel_deadline
+        else "blocked"
+        if operational_block is not None and return_code == 0
+        else "returned"
+        if return_code == 0
+        else "failed"
+    )
+    termination_reason = (
+        "operational_blocked_report"
+        if operational_block is not None and return_code == 0 and not timed_out and not panel_deadline
+        else "profile_timeout"
+        if timed_out
+        else "panel_deadline"
+        if panel_deadline
+        else "returned"
+        if return_code == 0
+        else "process_failure"
+    )
     return {
         "profile": profile,
         "profile_home": str(profile_home),
@@ -393,6 +432,8 @@ def run_one(
         "duration_seconds": round(time.monotonic() - started, 3),
         "exit_code": return_code,
         "outcome": outcome,
+        "termination_reason": termination_reason,
+        "operational_block": operational_block,
         "stdout_path": str(stdout_path.relative_to(receipt_dir)),
         "stderr_path": str(stderr_path.relative_to(receipt_dir)),
         "stdout_bytes": stdout_bytes,
@@ -492,6 +533,7 @@ def main() -> int:
         "workspace": str(workspace),
         "required_profiles": list(profiles),
         "routing_mode": "full_panel" if args.full_panel else "relevance_gated",
+        "child_environment_policy": PANEL_CHILD_ENVIRONMENT_POLICY,
         "brief_sha256": brief_digest,
         "max_workers": worker_count,
         "timeout_seconds": args.timeout,
@@ -513,7 +555,18 @@ def main() -> int:
             {
                 "profile": profile,
                 "profile_home": str(Path.home() / ".ares" / "profiles" / profile),
-                "command": [str(python), "-m", "hermes_cli.main", "--in", str(workspace), "--reasoning", "low", "-z", "<brief>"],
+                "command": [
+                    str(python),
+                    "-P",
+                    "-m",
+                    "hermes_cli.main",
+                    "--in",
+                    str(workspace),
+                    "--reasoning",
+                    "low",
+                    "-z",
+                    "<brief>",
+                ],
             }
             for profile in profiles
         ]
