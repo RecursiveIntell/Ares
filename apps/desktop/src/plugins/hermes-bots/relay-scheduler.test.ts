@@ -15,6 +15,13 @@ const { sdkMock } = vi.hoisted(() => {
 
   const component = () => null
   const host: Record<string, unknown> = { state: {} }
+  // Stand-in for the SDK's LruCache. These scheduler tests do not exercise
+  // relay-roster eviction; the cache has its own unit test.
+  const UnboundedCache = class extends Map {
+    constructor(_max: number) {
+      super()
+    }
+  }
 
   return {
     sdkMock: {
@@ -49,6 +56,7 @@ const { sdkMock } = vi.hoisted(() => {
       haptic: vi.fn(),
       host,
       Input: component,
+      LruCache: UnboundedCache,
       PALETTE_AREA: 'palette',
       profileColor: () => '#000',
       queryClient: { invalidateQueries: vi.fn() },
