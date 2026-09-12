@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Restore Ares-owned SessionDB support owners after the pinned main merge.
+"""Restore Ares SessionDB references to the modular canonical owners.
 
-Temporary PR35 reconciliation scaffolding.  The branch keeps the Hermes v0.21.1
-modular SessionDB shape, while this transform restores the exact current-Ares
-helper/import owners required by Ares call sites that survive that merge.
+Temporary PR35 reconciliation scaffolding. The branch keeps the Hermes v0.21.1
+modular SessionDB shape; surviving Ares call sites must import/re-export those
+module owners rather than duplicating their implementations in hermes_state.py.
 """
 
 from __future__ import annotations
@@ -34,8 +34,8 @@ def main() -> None:
         ["git", "show", f"{PINNED_MAIN}:hermes_state.py"], text=True
     )
 
-    # Re-export the exact Ares common owners.  PR35's modular Hermes file kept
-    # only escape_like/stat identity, while merged Ares call sites reference
+    # Re-export the exact Ares common owners. PR35's modular Hermes file kept
+    # only escape_like/stat identity, while surviving Ares call sites reference
     # lineage, recovery, preview and last-active owners from hermes_state_common.
     common_start = "from hermes_state_common import ("
     merged_common_end = "from hermes_state_errors import (\n"
@@ -44,26 +44,39 @@ def main() -> None:
     canonical_common = between(ares_main, common_start, main_common_end)
     merged = merged.replace(merged_common, canonical_common, 1)
 
-    # Restore the exact Ares helper prelude used by the surviving monolithic
-    # SessionDB methods.  This is deliberately copied from current main rather
-    # than reimplemented here: one source of truth for workspace matching,
-    # model-config row absence, delegate cascade selection and cwd prefix SQL.
-    branch_support_start = "# Billing buckets that aren't a routable provider identity:"
-    support_end = 'T = TypeVar("T")\n'
-    canonical_support_start = "def workspace_key(row: Dict[str, Any]) -> Optional[str]:\n"
-    merged_support = between(merged, branch_support_start, support_end)
-    canonical_support = between(ares_main, canonical_support_start, support_end)
-    merged = merged.replace(merged_support, canonical_support, 1)
+    # The modular SessionDB split moved these helpers into hermes_state_sessions.
+    # Import/re-export that canonical owner instead of recreating local copies.
+    old_sessions_import = "from hermes_state_sessions import SessionSessionsMixin\n"
+    canonical_sessions_import = (
+        "from hermes_state_sessions import (\n"
+        "    SessionSessionsMixin,\n"
+        "    _MODEL_CONFIG_ROW_MISSING,\n"
+        "    _collect_delegate_child_ids,\n"
+        "    _cwd_prefix_clause,\n"
+        "    _delete_delegate_children,\n"
+        "    _delegate_from_json,\n"
+        "    _workspace_key_clause,\n"
+        "    classify_session_status,\n"
+        "    workspace_key,\n"
+        ")\n"
+    )
+    if canonical_sessions_import not in merged:
+        if merged.count(old_sessions_import) != 1:
+            raise SystemExit("unexpected hermes_state_sessions import shape")
+        merged = merged.replace(old_sessions_import, canonical_sessions_import, 1)
 
     path.write_text(merged, encoding="utf-8")
 
     checked = path.read_text(encoding="utf-8")
     required = (
-        "_MODEL_CONFIG_ROW_MISSING = object()",
-        "def _cwd_prefix_clause(cwd_prefix: str)",
-        "def _workspace_key_clause(key: str)",
-        "def _collect_delegate_child_ids(conn, parent_ids: List[str])",
-        "def _delete_delegate_children(conn, parent_ids: List[str])",
+        "_MODEL_CONFIG_ROW_MISSING,",
+        "_collect_delegate_child_ids,",
+        "_cwd_prefix_clause,",
+        "_delete_delegate_children,",
+        "_delegate_from_json,",
+        "_workspace_key_clause,",
+        "classify_session_status,",
+        "workspace_key,",
         "_LISTABLE_CHILD_SQL,",
         "_RECOVERABLE_END_REASONS_SQL,",
         "_RESET_END_REASONS_SQL,",
@@ -72,7 +85,7 @@ def main() -> None:
     )
     missing = [owner for owner in required if owner not in checked]
     if missing:
-        raise SystemExit(f"SessionDB support owners missing after reconcile: {missing}")
+        raise SystemExit(f"SessionDB support owner imports missing after reconcile: {missing}")
 
 
 if __name__ == "__main__":
