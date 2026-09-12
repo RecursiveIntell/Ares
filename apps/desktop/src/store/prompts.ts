@@ -96,6 +96,7 @@ export function parseProductionPermitRequest(value: unknown): ProductionPermitRe
   const raw = value as Record<string, unknown>
   const call = raw.call
   const constraints = raw.constraints
+
   if (
     raw.schema !== 'recursive-agent.desktop-production-approval-request/v1' ||
     typeof raw.approval_id !== 'string' ||
@@ -112,6 +113,7 @@ export function parseProductionPermitRequest(value: unknown): ProductionPermitRe
   const c = constraints as Record<string, unknown>
   const typedCall = call as Record<string, unknown>
   const args = typedCall.args
+
   if (
     typedCall.tool !== 'write_file' ||
     typedCall.frozen_clock !== null ||

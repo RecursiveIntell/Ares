@@ -35,8 +35,7 @@ export interface SpecialistDispatchQuiesceLease {
 }
 
 export type SpecialistDispatchQuiesceRelease =
-  | { outcome: 'released'; profileIds: string[] }
-  | { outcome: 'rejected'; reasonCode: 'UNKNOWN_QUIESCE_LEASE' }
+  { outcome: 'released'; profileIds: string[] } | { outcome: 'rejected'; reasonCode: 'UNKNOWN_QUIESCE_LEASE' }
 
 function exactProfileIds(profileIds: string[]): string[] {
   if (
@@ -46,7 +45,10 @@ function exactProfileIds(profileIds: string[]): string[] {
     profileIds.some(profileId => typeof profileId !== 'string' || !PROFILE.test(profileId)) ||
     profileIds.some((profileId, index) => index > 0 && profileIds[index - 1] >= profileId)
   ) {
-    throw new SpecialistQuiesceError('INVALID_QUIESCE_PROFILE_SET', 'Quiesce profiles must be sorted, unique, valid IDs (1-4).')
+    throw new SpecialistQuiesceError(
+      'INVALID_QUIESCE_PROFILE_SET',
+      'Quiesce profiles must be sorted, unique, valid IDs (1-4).'
+    )
   }
 
   return [...profileIds]
@@ -63,6 +65,7 @@ export function createSpecialistDispatchQuiesce(deps: SpecialistDispatchQuiesceD
 
   function clearLease(leaseId: string, profileIds: string[]): void {
     leases.delete(leaseId)
+
     for (const profileId of profileIds) {
       if (profileLeases.get(profileId) === leaseId) {
         profileLeases.delete(profileId)
@@ -73,9 +76,11 @@ export function createSpecialistDispatchQuiesce(deps: SpecialistDispatchQuiesceD
   return {
     async acquire(profileIds: string[]): Promise<SpecialistDispatchQuiesceLease> {
       const exact = exactProfileIds(profileIds)
+
       if (leases.size > 0) {
         throw new SpecialistQuiesceError('QUIESCE_CONFLICT', 'An explicit specialist capacity lease is already active.')
       }
+
       const conflicting = exact.find(profileId => profileLeases.has(profileId))
 
       if (conflicting) {
@@ -84,6 +89,7 @@ export function createSpecialistDispatchQuiesce(deps: SpecialistDispatchQuiesceD
 
       const leaseId = `specialist-quiesce-${crypto.randomUUID()}`
       leases.set(leaseId, exact)
+
       for (const profileId of exact) {
         profileLeases.set(profileId, leaseId)
       }
@@ -94,7 +100,10 @@ export function createSpecialistDispatchQuiesce(deps: SpecialistDispatchQuiesceD
         }
       } catch {
         clearLease(leaseId, exact)
-        throw new SpecialistQuiesceError('QUIESCE_STOP_FAILED', 'Electron could not quiesce the requested profile pool.')
+        throw new SpecialistQuiesceError(
+          'QUIESCE_STOP_FAILED',
+          'Electron could not quiesce the requested profile pool.'
+        )
       }
 
       return { leaseId, profileIds: exact }
@@ -127,6 +136,7 @@ export function createSpecialistDispatchQuiesce(deps: SpecialistDispatchQuiesceD
       }
 
       clearLease(leaseId, profileIds)
+
       return { outcome: 'released', profileIds }
     }
   }

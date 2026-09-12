@@ -9,8 +9,12 @@ import { afterEach, expect, test, vi } from 'vitest'
 import { type SpecialistDispatchAdmission, startSpecialistDispatchServer } from './specialist-dispatch-server'
 
 const roots: string[] = []
+
 const unusedQuiesce = {
-  acquire: async (profileIds: string[]) => ({ leaseId: 'specialist-quiesce-00000000-0000-4000-8000-000000000000', profileIds }),
+  acquire: async (profileIds: string[]) => ({
+    leaseId: 'specialist-quiesce-00000000-0000-4000-8000-000000000000',
+    profileIds
+  }),
   release: () => ({ outcome: 'rejected' as const, reasonCode: 'UNKNOWN_QUIESCE_LEASE' as const })
 }
 
@@ -25,7 +29,9 @@ function request(port: number, payload: object): Promise<Record<string, unknown>
     const socket = net.createConnection({ host: '127.0.0.1', port })
     let response = ''
     socket.once('error', reject)
-    socket.on('data', chunk => { response += chunk.toString() })
+    socket.on('data', chunk => {
+      response += chunk.toString()
+    })
     socket.once('end', () => resolve(JSON.parse(response)))
     socket.once('connect', () => socket.write(`${JSON.stringify(payload)}\n`))
   })
@@ -36,7 +42,9 @@ function rawRequest(port: number, payload: string): Promise<Record<string, unkno
     const socket = net.createConnection({ host: '127.0.0.1', port })
     let response = ''
     socket.once('error', reject)
-    socket.on('data', chunk => { response += chunk.toString() })
+    socket.on('data', chunk => {
+      response += chunk.toString()
+    })
     socket.once('end', () => resolve(JSON.parse(response)))
     socket.once('connect', () => socket.write(`${payload}\n`))
   })
@@ -54,7 +62,13 @@ test('loopback transport requires its private capability and never exposes it', 
   }
 
   const server = await startSpecialistDispatchServer({
-    admission: { admit, hasActive: () => false, poolKey: runId => `specialist-run:${runId}`, release: vi.fn(), status: () => 'running' },
+    admission: {
+      admit,
+      hasActive: () => false,
+      poolKey: runId => `specialist-run:${runId}`,
+      release: vi.fn(),
+      status: () => 'running'
+    },
     cancel: async () => undefined,
     quiesce: unusedQuiesce,
     root
@@ -90,14 +104,24 @@ test('status and cancel are explicit operations; unknown payload fields are reje
   const cancel = vi.fn(async () => undefined)
 
   const server = await startSpecialistDispatchServer({
-    admission: { admit: vi.fn(), hasActive: () => false, poolKey: runId => `specialist-run:${runId}`, release: vi.fn(), status: () => 'released' },
+    admission: {
+      admit: vi.fn(),
+      hasActive: () => false,
+      poolKey: runId => `specialist-run:${runId}`,
+      release: vi.fn(),
+      status: () => 'released'
+    },
     cancel,
     quiesce: unusedQuiesce,
     root
   })
 
   const endpoint = JSON.parse(fs.readFileSync(path.join(root, 'specialist-dispatch.json'), 'utf8'))
-  const base = { schema: 'AresDesktopSpecialistDispatchEnvelopeV1', token: endpoint.token, run_id: 'specialist-run-00000001' }
+  const base = {
+    schema: 'AresDesktopSpecialistDispatchEnvelopeV1',
+    token: endpoint.token,
+    run_id: 'specialist-run-00000001'
+  }
 
   const status = await request(endpoint.port, { ...base, operation: 'status' })
   const cancelled = await request(endpoint.port, { ...base, operation: 'cancel' })
@@ -113,27 +137,41 @@ test('status and cancel are explicit operations; unknown payload fields are reje
 test('authenticated quiesce leases are exact, releasable, and never expose the endpoint capability', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ares-specialist-dispatch-'))
   roots.push(root)
-  const acquire = vi.fn(async (profileIds: string[]) => ({ leaseId: 'specialist-quiesce-00000000-0000-4000-8000-000000000000', profileIds }))
+  const acquire = vi.fn(async (profileIds: string[]) => ({
+    leaseId: 'specialist-quiesce-00000000-0000-4000-8000-000000000000',
+    profileIds
+  }))
+
   const release = vi.fn((leaseId: string) =>
     leaseId === 'specialist-quiesce-00000000-0000-4000-8000-000000000000'
       ? { outcome: 'released' as const, profileIds: ['explorer', 'public'] }
       : { outcome: 'rejected' as const, reasonCode: 'UNKNOWN_QUIESCE_LEASE' as const }
   )
+
   const server = await startSpecialistDispatchServer({
-    admission: { admit: vi.fn(), hasActive: () => false, poolKey: (runId: string) => `specialist-run:${runId}`, release: vi.fn(), status: () => 'unknown' },
+    admission: {
+      admit: vi.fn(),
+      hasActive: () => false,
+      poolKey: (runId: string) => `specialist-run:${runId}`,
+      release: vi.fn(),
+      status: () => 'unknown'
+    },
     cancel: async () => undefined,
     quiesce: { acquire, release },
     root
   } as any)
+
   const endpoint = JSON.parse(fs.readFileSync(path.join(root, 'specialist-dispatch.json'), 'utf8'))
   const base = { schema: 'AresDesktopSpecialistDispatchEnvelopeV1', token: endpoint.token }
 
   const acquired = await request(endpoint.port, { ...base, operation: 'quiesce', profile_ids: ['explorer', 'public'] })
+
   const released = await request(endpoint.port, {
     ...base,
     operation: 'unquiesce',
     lease_id: 'specialist-quiesce-00000000-0000-4000-8000-000000000000'
   })
+
   const malformed = await request(endpoint.port, { ...base, operation: 'quiesce', profile_ids: ['public', 'explorer'] })
 
   expect(acquired).toEqual({
@@ -157,16 +195,27 @@ test('duplicate keys anywhere in the untrusted envelope reject before admission'
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ares-specialist-dispatch-'))
   roots.push(root)
   const admit = vi.fn()
+
   const server = await startSpecialistDispatchServer({
-    admission: { admit, hasActive: () => false, poolKey: runId => `specialist-run:${runId}`, release: vi.fn(), status: () => 'unknown' },
+    admission: {
+      admit,
+      hasActive: () => false,
+      poolKey: runId => `specialist-run:${runId}`,
+      release: vi.fn(),
+      status: () => 'unknown'
+    },
     cancel: async () => undefined,
     quiesce: unusedQuiesce,
     root
   })
+
   const endpoint = JSON.parse(fs.readFileSync(path.join(root, 'specialist-dispatch.json'), 'utf8'))
   const duplicateRequest = `{"schema":"AresDesktopSpecialistDispatchEnvelopeV1","operation":"submit","token":"${endpoint.token}","request":{"run_id":"specialist-run-00000001","run_id":"specialist-run-00000001","request_digest":"sha256:${'a'.repeat(64)}","profile_ids":["explorer"]}}`
 
-  await expect(rawRequest(endpoint.port, duplicateRequest)).resolves.toEqual({ outcome: 'rejected', reasonCode: 'INVALID_ENVELOPE' })
+  await expect(rawRequest(endpoint.port, duplicateRequest)).resolves.toEqual({
+    outcome: 'rejected',
+    reasonCode: 'INVALID_ENVELOPE'
+  })
   expect(admit).not.toHaveBeenCalled()
   await server.close()
 })

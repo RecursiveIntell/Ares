@@ -24,11 +24,14 @@ test('pool max rejects negative, fractional, unsafe, and empty values', () => {
 test('settings round-trip preserves ten and zero without truthiness fallback', () => {
   const files = new Map<string, string>()
   const write = (filePath: string, content: string) => files.set(filePath, content)
+
   const rename = (from: string, to: string) => {
     const content = files.get(from)
+
     if (content === undefined) {
       throw new Error('temporary file missing')
     }
+
     files.delete(from)
     files.set(to, content)
   }
@@ -45,7 +48,7 @@ test('settings round-trip preserves ten and zero without truthiness fallback', (
 })
 
 test('malformed settings fall back to the safe default', () => {
-  expect(
-    readProfileBackendPoolSettings('/tmp/ares-settings', () => '{"max_backends": -2}')
-  ).toEqual({ maxBackends: DEFAULT_PROFILE_BACKEND_POOL_MAX })
+  expect(readProfileBackendPoolSettings('/tmp/ares-settings', () => '{"max_backends": -2}')).toEqual({
+    maxBackends: DEFAULT_PROFILE_BACKEND_POOL_MAX
+  })
 })
