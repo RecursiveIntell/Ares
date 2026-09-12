@@ -3850,11 +3850,13 @@ DEFAULT_CONFIG = {
         # ad-hoc signing (identifier-pinned requirement).
         "macos_signing_identity": "",
         # Auto-continue a turn that was killed mid-run by an app/backend/machine
-        # crash: resuming that session re-submits the interrupted prompt (shown
-        # as a "resumed interrupted turn" event) if the interruption is fresh.
-        # A stale interruption just shows the recovered partial transcript.
+        # crash. Disabled by default: a restart may have more than one live
+        # client/process racing to resume the same durable session, so replay is
+        # an explicit operator action until a single-flight continuation claim
+        # has been acquired. A stale interruption just shows the recovered
+        # partial transcript.
         "auto_continue": {
-            "enabled": True,
+            "enabled": False,
             # How recent the interruption must be to auto-continue (minutes).
             "freshness_minutes": 15,
             # Crash-loop breaker: max automatic re-runs of one interrupted turn.

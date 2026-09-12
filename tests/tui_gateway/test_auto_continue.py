@@ -246,7 +246,14 @@ def schedule_env(monkeypatch, marker_home):
     return submitted
 
 
-def test_fresh_marker_schedules_continuation(emits, schedule_env, marker_home):
+def test_fresh_marker_schedules_continuation(
+    emits, schedule_env, marker_home, monkeypatch
+):
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {"desktop": {"auto_continue": {"enabled": True}}},
+    )
     record_turn_start(marker_home, "session-key", "fix the flaky test")
     session = _session()
 
@@ -261,6 +268,18 @@ def test_fresh_marker_schedules_continuation(emits, schedule_env, marker_home):
     assert "fix the flaky test" in text
     assert kwargs["display_kind"] == "auto_continue"
     assert ("message.start", "sid", None) in [(e, s, p) for e, s, p in emits]
+
+
+def test_auto_continue_is_disabled_when_config_is_absent(
+    schedule_env, marker_home
+):
+    record_turn_start(marker_home, "session-key", "prompt")
+
+    result = server._maybe_schedule_auto_continue("sid", _session(), "session-key")
+
+    assert result is None
+    assert not schedule_env
+    assert read_turn_marker(marker_home, "session-key") is None
 
 
 def test_stale_marker_is_cleared_not_continued(schedule_env, marker_home, monkeypatch):
@@ -281,7 +300,14 @@ def test_config_widens_freshness_window(emits, schedule_env, marker_home, monkey
     monkeypatch.setattr(
         server,
         "_load_cfg",
-        lambda: {"desktop": {"auto_continue": {"freshness_minutes": 120}}},
+        lambda: {
+            "desktop": {
+                "auto_continue": {
+                    "enabled": True,
+                    "freshness_minutes": 120,
+                }
+            }
+        },
     )
     monkeypatch.setattr(
         server, "time", types.SimpleNamespace(time=lambda: time.time() + 3600)
@@ -322,9 +348,16 @@ def test_no_marker_means_no_continuation(schedule_env, marker_home):
     assert not schedule_env
 
 
-def test_running_session_wins_over_continuation(emits, schedule_env, marker_home):
+def test_running_session_wins_over_continuation(
+    emits, schedule_env, marker_home, monkeypatch
+):
     """A real user prompt that raced the kickoff keeps its turn; the marker is
     left for that turn's own conclusion to clear."""
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {"desktop": {"auto_continue": {"enabled": True}}},
+    )
     record_turn_start(marker_home, "session-key", "prompt")
     session = _session(running=True)
 
@@ -340,7 +373,14 @@ def test_running_session_wins_over_continuation(emits, schedule_env, marker_home
     assert "_auto_continue_prompt" not in session
 
 
-def test_double_schedule_is_guarded(emits, schedule_env, marker_home):
+def test_double_schedule_is_guarded(
+    emits, schedule_env, marker_home, monkeypatch
+):
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {"desktop": {"auto_continue": {"enabled": True}}},
+    )
     record_turn_start(marker_home, "session-key", "prompt")
     session = _session()
 
@@ -355,6 +395,11 @@ def test_double_schedule_is_guarded(emits, schedule_env, marker_home):
 def test_failed_agent_build_leaves_marker_for_retry(
     emits, schedule_env, marker_home, monkeypatch
 ):
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {"desktop": {"auto_continue": {"enabled": True}}},
+    )
     record_turn_start(marker_home, "session-key", "prompt")
     monkeypatch.setattr(
         server,
