@@ -66,7 +66,13 @@ export async function processStartMarker(pid: number, timeoutMs: number = 30_000
   }
 
   if (process.platform === 'linux') {
-    const stat = await fs.promises.readFile(`/proc/${pid}/stat`, 'utf8')
+    // In PID-namespaced runners (and some embedded hosts), process.pid can be
+    // translated at the boundary while /proc still addresses the caller by
+    // `self`. Use the kernel's own-process alias for this one safe case; a
+    // foreign PID must keep the explicit path so PID-reuse checks remain
+    // meaningful.
+    const statPath = pid === process.pid ? '/proc/self/stat' : `/proc/${pid}/stat`
+    const stat = await fs.promises.readFile(statPath, 'utf8')
 
     const fields = stat
       .slice(stat.lastIndexOf(')') + 1)
