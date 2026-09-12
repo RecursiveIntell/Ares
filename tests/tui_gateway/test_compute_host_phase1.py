@@ -4,6 +4,7 @@ import os
 import sys
 import threading
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -145,6 +146,7 @@ def test_compute_host_workers_inherit_tui_pool_env_or_8(monkeypatch):
 
 def test_mutator_route_table_matches_prd_inventory():
     assert MUTATOR_ROUTE_TABLE == {
+        "config.set.model": "run-concurrent",
         "prompt.submit": "turn-path",
         "session.interrupt": "turn-path",
         "reload.mcp": "run-concurrent",
@@ -565,3 +567,189 @@ def test_shutdown_drain_sleep_never_overshoots_the_reserve(monkeypatch):
     assert events == ["finalize:idle:compute_host_sigterm"]
     assert slept, "the drain loop should have ticked at least once"
     assert sum(slept) <= drain_budget + 1e-6
+
+
+def test_resume_claim_adopts_the_compute_host_owner_when_parent_mirror_is_gone(monkeypatch):
+    """A reconnect must target the host-side owner, never mint a second runtime.
+
+    The serving process may lose its mirror after a websocket disconnect while
+    the isolated compute host still owns the actual agent. A new runtime id for
+    the same stored session would leave Stop/model controls targeting the new
+    id while the old host turn carries on.
+    """
+    owner_sid = "host-owner"
+    session_key = "stored-session"
+    observed = {}
+
+    class _Supervisor:
+        def lookup_session_key(self, key):
+            assert key == session_key
+            return {
+                "session_id": owner_sid,
+                "session_info": {"model": "owner-model", "provider": "owner-provider"},
+                "running": True,
+            }
+
+        def observe_session(self, sid, callback):
+            observed["sid"] = sid
+            observed["callback"] = callback
+
+    record = {
+        "agent": None,
+        "agent_ready": threading.Event(),
+        "history": [],
+        "history_lock": threading.Lock(),
+        "running": False,
+        "session_key": session_key,
+    }
+    server._sessions.clear()
+    monkeypatch.setattr(server, "_turn_isolation_enabled", lambda _cfg=None: True)
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: _Supervisor())
+
+    try:
+        winner = server._claim_or_reuse_live("new-runtime", session_key, record, lease=None)
+
+        assert winner is not None
+        assert winner == (owner_sid, record)
+        assert set(server._sessions) == {owner_sid}
+        assert record["running"] is True
+        assert record["_compute_host_active"] is True
+        assert record["_metadata_mirror"] == {"model": "owner-model", "provider": "owner-provider"}
+        assert observed["sid"] == owner_sid
+    finally:
+        server._sessions.clear()
+
+
+def test_isolated_model_switch_is_applied_by_the_compute_host_owner(monkeypatch):
+    """The isolated host's live agent, not the stale parent mirror, owns picks."""
+    sid = "host-owner"
+    session = {
+        "agent": types.SimpleNamespace(model="old", provider="old-provider"),
+        "agent_ready": threading.Event(),
+        "history": [],
+        "history_lock": threading.Lock(),
+        "running": False,
+        "session_key": "stored-session",
+    }
+    calls = []
+
+    class _Supervisor:
+        def control(self, control_sid, *, route_name, payload, wait=True, timeout=30.0):
+            calls.append((control_sid, route_name, payload, wait, timeout))
+            return {
+                "type": "control.ack",
+                "result": {"key": "model", "value": "new-model", "scope": "session"},
+                "session_info": {"model": "new-model", "provider": "new-provider"},
+            }
+
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: True)
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: _Supervisor())
+    monkeypatch.setattr(
+        server,
+        "_apply_model_switch",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("parent mirror must not switch")),
+    )
+
+    try:
+        response = server.handle_request(
+            {
+                "id": "model-switch",
+                "method": "config.set",
+                "params": {
+                    "session_id": sid,
+                    "key": "model",
+                    "value": "new-model --provider new-provider --session",
+                },
+            }
+        )
+
+        assert response["result"]["value"] == "new-model"
+        assert len(calls) == 1
+        control_sid, route_name, payload, wait, timeout = calls[0]
+        assert (control_sid, route_name, wait, timeout) == (sid, "config.set.model", True, 30.0)
+        assert payload["params"] == {
+            "key": "model",
+            "value": "new-model --provider new-provider --session",
+        }
+        assert session["_metadata_mirror"]["model"] == "new-model"
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_reclaimed_compute_host_owner_receives_stop_for_the_original_runtime(monkeypatch):
+    """Stop on a reattached view must address the still-running host runtime."""
+    owner_sid = "host-owner"
+    calls = []
+    session = {
+        "agent": None,
+        "agent_ready": threading.Event(),
+        "history": [],
+        "history_lock": threading.Lock(),
+        "running": True,
+        "session_key": "stored-session",
+    }
+
+    class _Supervisor:
+        def interrupt(self, sid, *, request_id=None):
+            calls.append((sid, request_id))
+
+    server._sessions[owner_sid] = session
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: True)
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: _Supervisor())
+
+    try:
+        response = server.handle_request(
+            {
+                "id": "stop",
+                "method": "session.interrupt",
+                "params": {"session_id": owner_sid},
+            }
+        )
+
+        assert isinstance(response, dict)
+        assert response.get("result"), response.get("error")
+        assert calls == [(owner_sid, "interrupt-stop")]
+        assert session["_turn_cancel_requested"] is True
+    finally:
+        server._sessions.pop(owner_sid, None)
+
+
+def test_compute_host_lookup_returns_session_owner_metadata(monkeypatch):
+    """The lookup protocol exposes only routing metadata, never credentials."""
+    owner_sid = "host-owner"
+    session = {
+        "agent": types.SimpleNamespace(),
+        "history_lock": threading.Lock(),
+        "running": True,
+        "session_key": "stored-session",
+    }
+    output = io.StringIO()
+    host = ComputeHost(stdout=output, heartbeat_secs=0)
+    monkeypatch.setattr(server, "_sessions", {owner_sid: session})
+    monkeypatch.setattr(
+        server,
+        "_session_info",
+        lambda _agent, _session: {"model": "owner-model", "provider": "owner-provider"},
+    )
+    try:
+        host._handle_session_lookup(
+            {"request_id": "lookup", "session_key": "stored-session"}
+        )
+    finally:
+        host.close()
+
+    frames = _json_lines(output)
+    assert frames[-1] == {
+        "type": "session.lookup.ack",
+        "request_id": "lookup",
+        "session_key": "stored-session",
+        "sessions": [
+            {
+                "session_id": owner_sid,
+                "running": True,
+                "session_info": {"model": "owner-model", "provider": "owner-provider"},
+            }
+        ],
+        "host_ns": frames[-1]["host_ns"],
+    }
