@@ -310,6 +310,7 @@ import shutil
 import subprocess
 from pathlib import Path
 from typing import Optional
+from hermes_cli.timefmt import relative_time as _relative_time
 
 
 from hermes_cli.subcommands.cron import build_cron_parser

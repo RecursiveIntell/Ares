@@ -24,7 +24,7 @@ logger = logging.getLogger("tools.approval")
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("event", "data", "result", "reason", "acknowledged")
+    __slots__ = ("event", "data", "result", "reason", "witness", "acknowledged")
 
     def __init__(self, data: dict):
         self.event = threading.Event()
@@ -34,6 +34,8 @@ class _ApprovalEntry:
         self.result: str | None = None  # "once"|"session"|"always"|"deny"
         # Free-text reason from ``/deny <reason>`` so the agent can adapt, not just hear "denied".
         self.reason: str | None = None
+        # Opaque daemon-verifiable witness for production-permit authorization.
+        self.witness: dict | None = None
 
 
 def _poll_event(event: threading.Event, session_key: str, *, interrupt_log: str) -> str:

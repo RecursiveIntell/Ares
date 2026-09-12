@@ -14,12 +14,24 @@ import contextvars
 import importlib
 import importlib.util
 import inspect
+import concurrent.futures
+import errno
+import fnmatch
+import json
 import logging
+import math
 import os
+import random
+import re
+import shutil
 import sys
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional, Set
+from contextlib import asynccontextmanager
+from datetime import datetime
+from types import SimpleNamespace
+from typing import Any, Callable, Coroutine, Dict, List, Optional, Set, Tuple
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +132,47 @@ def __getattr__(name: str):
         except KeyError:
             pass  # SDK missing or symbol absent on this SDK build
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+# Names external plugins imported from this module before the Sep 2026
+# decomposition. Internal code uses the split owners directly; this lazy
+# facade keeps the old import path working when one of those names is not
+# provided by the compatibility surface below.
+_PLUGIN_COMPAT_LAZY = {
+    "InvalidMcpUrlError": ("tools.mcp_tool_errors", "InvalidMcpUrlError"),
+    "MCP_TOOL_NAME_PREFIX": ("tools.mcp_tool_schema", "MCP_TOOL_NAME_PREFIX"),
+    "NonMcpEndpointError": ("tools.mcp_tool_errors", "NonMcpEndpointError"),
+    "discover_mcp_tools": ("tools.mcp_tool_discovery", "discover_mcp_tools"),
+    "get_mcp_status": ("tools.mcp_tool_discovery", "get_mcp_status"),
+    "get_registered_mcp_server_names": ("tools.mcp_tool_discovery", "get_registered_mcp_server_names"),
+    "has_registered_mcp_tools": ("tools.mcp_tool_discovery", "has_registered_mcp_tools"),
+    "is_mcp_tool_parallel_safe": ("tools.mcp_tool_agent", "is_mcp_tool_parallel_safe"),
+    "matches_name_filter": ("tools.mcp_tool_schema", "matches_name_filter"),
+    "mcp_prefixed_tool_name": ("tools.mcp_tool_schema", "mcp_prefixed_tool_name"),
+    "persist_agent_tool_names": ("tools.mcp_tool_agent", "persist_agent_tool_names"),
+    "probe_mcp_server_tools": ("tools.mcp_tool_discovery", "probe_mcp_server_tools"),
+    "reconnect_mcp_server": ("tools.mcp_tool_loop", "reconnect_mcp_server"),
+    "refresh_agent_mcp_tools": ("tools.mcp_tool_agent", "refresh_agent_mcp_tools"),
+    "register_mcp_servers": ("tools.mcp_tool_discovery", "register_mcp_servers"),
+    "reprobe_tool_availability": ("tools.mcp_tool_agent", "reprobe_tool_availability"),
+    "restore_agent_tool_prefix": ("tools.mcp_tool_agent", "restore_agent_tool_prefix"),
+    "sanitize_mcp_name_component": ("tools.mcp_tool_schema", "sanitize_mcp_name_component"),
+    "shutdown_mcp_servers": ("tools.mcp_tool_lifecycle", "shutdown_mcp_servers"),
+    "strip_unicode_tags": ("tools.ansi_strip", "strip_unicode_tags"),
+    "tool_error": ("tools.registry", "tool_error"),
+}
+
+_plugin_compat_prev_getattr = __getattr__
+
+
+def __getattr__(name):  # PEP 562 — chained onto the module's own __getattr__
+    target = _PLUGIN_COMPAT_LAZY.get(name)
+    if target is None:
+        return _plugin_compat_prev_getattr(name)
+    import importlib
+    from hermes_cli.plugin_compat import warn_once
+    warn_once(__name__, name, *target)
+    return getattr(importlib.import_module(target[0]), target[1])
 
 
 def _import_sdk_names(module: str, names: tuple, missing_msg: Optional[str] = None) -> bool:

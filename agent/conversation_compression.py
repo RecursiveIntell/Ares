@@ -2127,7 +2127,17 @@ def _ensure_compressed_has_user_turn(original_messages: list, compressed: list) 
         and COMPRESSION_CONTINUATION_USER_CONTENT in _message_text(message)
         for message in compressed
     ):
-        return
+        return "already_present"
+
+    # An in-flight task may already have been re-appended by the context
+    # compressor. Alternation repair can merge that replay onto a summary
+    # carrier, so the marker is the durable identity for this boundary. Do not
+    # anchor the same task a second time on the host-side receipt pass.
+    if any(
+        isinstance(message, dict) and message.get(_INFLIGHT_REPLAY_MERGED_KEY)
+        for message in compressed
+    ):
+        return "already_present"
 
     for message in reversed(original_messages):
         if _is_real_user_message(message):

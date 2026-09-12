@@ -1005,17 +1005,19 @@ def _tirith_scan(command: str) -> dict:
     (default) or, under fail-closed, synthesizes a HIGH warn finding that goes
     through the normal approval flow (#20733)."""
     try:
-        from hermes_cli.config import load_config_readonly
-
-        config = load_config_readonly() or {}
-        approval_config = ((config.get("security") or {}).get("approval") or {})
-        selected = str(approval_config.get("transport") or "builtin").strip().lower()
-        fallback = str(approval_config.get("transport_fallback") or "").strip().lower()
-    except Exception:
-        # An unreadable/malformed selection must not silently materialize a
-        # prompt on a built-in surface the operator may not be watching.
-        return "config-error", None
-    return selected or "builtin", "builtin" if fallback == "builtin" else None
+        from tools.tirith_security import check_command_security
+        return check_command_security(command)
+    except ImportError:
+        if _tirith_fail_open():
+            return {"action": "allow", "findings": [], "summary": ""}
+        return {"action": "warn", "summary": "Tirith unavailable (fail-closed)", "findings": [{
+            "rule_id": "tirith-import-error", "severity": "HIGH",
+            "title": "Tirith security module unavailable",
+            "description": ("The Tirith security scanner could not be imported. "
+                            "Because security.tirith_fail_open is false, this "
+                            "command cannot be silently allowed. Approve only if "
+                            "you have verified the command is safe."),
+        }]}
 
 
 def _present_with_selected_transport(
@@ -1432,6 +1434,17 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         "reason": entry.reason,
         "witness": dict(entry.witness) if entry.witness is not None else None,
     }
+
+
+# The approval prompt and gateway wait modules are the canonical owners. A
+# legacy monolithic copy remains above in this merged tree, so rebind the
+# public names before any guard executes; this also keeps direct plugin imports
+# on the split implementations.
+from tools.approval_gateway_wait import _await_gateway_decision as _canonical_await_gateway_decision
+from tools.approval_prompt import _present_with_selected_transport as _canonical_present_with_selected_transport
+
+_await_gateway_decision = _canonical_await_gateway_decision
+_present_with_selected_transport = _canonical_present_with_selected_transport
 
 
 def check_all_command_guards(command: str, env_type: str,

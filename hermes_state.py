@@ -2662,15 +2662,22 @@ class SessionDB(
         cooldown_until: float,
         error: Optional[str] = None,
     ) -> None:
-        """Persist the active compression-failure cooldown for a session."""
+        """Persist the active compression-failure cooldown for a session.
+
+        Cooldown deadlines merge by maximum: a later, shorter failure signal
+        must not reopen a window already closed by a longer timeout.
+        """
         if not session_id:
             return
 
         def _do(conn):
             conn.execute(
-                "UPDATE sessions SET compression_failure_cooldown_until = ?, "
+                "UPDATE sessions SET compression_failure_cooldown_until = CASE "
+                "WHEN compression_failure_cooldown_until IS NOT NULL "
+                "AND compression_failure_cooldown_until > ? "
+                "THEN compression_failure_cooldown_until ELSE ? END, "
                 "compression_failure_error = ? WHERE id = ?",
-                (cooldown_until, error, session_id),
+                (cooldown_until, cooldown_until, error, session_id),
             )
 
         try:
@@ -6336,6 +6343,7 @@ class SessionDB(
         model_config_patch: Optional[Dict[str, Any]] = None,
         watermark: Optional[int] = None,
         lock_holder: Optional[str] = None,
+        tail_count: int = 0,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
 
@@ -6368,6 +6376,11 @@ class SessionDB(
         reference durable row ids re-resolve by content (see 3e8ab0610).
         ``watermark=None`` preserves the historical archive-everything
         behavior.
+
+        ``tail_count`` marks the last carried-forward active rows as
+        superseded duplicates (``active = 0, compacted = 0``) instead of
+        summarized history. When both arguments are present, the tail walk is
+        bounded at *watermark* so concurrent appends do not consume slots.
 
         Commit-fence safety: when *lock_holder* is provided, the commit
         verifies INSIDE the transaction that the compression lock is still
@@ -6429,6 +6442,30 @@ class SessionDB(
                         except (TypeError, ValueError):
                             pass
 
+            # The compressor carries a protected tail into the replacement
+            # set verbatim. Those originals are superseded duplicates, not
+            # summarized history, so they must receive rewind semantics after
+            # the common archive update. Limit the walk to the pre-compression
+            # watermark when one exists: rows above it are the independent
+            # concurrent tail handled by the clone path above.
+            rewind_ids: list[int] = []
+            normalized_tail_count = max(0, int(tail_count or 0))
+            if normalized_tail_count:
+                _tail_ceiling = "" if watermark is None else " AND id <= ?"
+                _tail_params: list[Any] = [session_id]
+                if watermark is not None:
+                    _tail_params.append(int(watermark))
+                _tail_params.append(normalized_tail_count)
+                rewind_ids = [
+                    int(row["id"])
+                    for row in conn.execute(
+                        "SELECT id FROM messages "
+                        "WHERE session_id = ? AND active = 1"
+                        f"{_tail_ceiling} ORDER BY id DESC LIMIT ?",
+                        _tail_params,
+                    ).fetchall()
+                ]
+
             # Soft-archive the live turns: active=0 hides them from the live
             # context load, compacted=1 marks them as "summarized away" (vs
             # rewind/undo's active=0+compacted=0, which means "user took it
@@ -6441,6 +6478,17 @@ class SessionDB(
                 "WHERE session_id = ? AND active = 1",
                 (session_id,),
             )
+            # Concurrent-tail originals are also superseded duplicates: their
+            # live copies are inserted below, so they must not be recalled as
+            # compacted history alongside those clones.
+            rewind_ids.extend(tail_ids)
+            if rewind_ids:
+                placeholders = ",".join("?" for _ in rewind_ids)
+                conn.execute(
+                    f"UPDATE messages SET compacted = 0 WHERE session_id = ? "
+                    f"AND active = 0 AND id IN ({placeholders})",
+                    [session_id, *rewind_ids],
+                )
             inserted, tool_calls_total = self._insert_message_rows(
                 conn, session_id, compacted_messages
             )

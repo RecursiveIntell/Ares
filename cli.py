@@ -5445,7 +5445,7 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
             from hermes_cli.commands import resolve_command
             base = text.split(None, 1)[0].lower().lstrip('/')
             cmd = resolve_command(base)
-            return bool(cmd and cmd.name == "background")
+            return bool(cmd and cmd.name in {"bg", "btw", "background"})
         except Exception:
             return False
 
@@ -5594,6 +5594,19 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
             # one-shot (cleared on the next submitted input, whether it's the selection or anything else).
             # See #34584.
             self._pending_resume_sessions = None
+
+        # Keep slash routing owned by the central command registry. The legacy
+        # branch below predates aliases and the mixin handlers; it can silently
+        # fall through without returning a bool for newer commands. Resolve
+        # once, invoke the registered handler, and preserve False as the REPL
+        # exit signal.
+        entry = self._slash_handler(canonical)
+        if entry is None:
+            return self._process_unregistered_slash(cmd_original, cmd_lower)
+        method_name, pass_arg = entry
+        handler = getattr(self, method_name)
+        result = handler(cmd_original) if pass_arg else handler()
+        return result is not False
 
         if canonical in {"quit", "exit"}:
             # Parse --delete flag: /exit --delete also removes the current

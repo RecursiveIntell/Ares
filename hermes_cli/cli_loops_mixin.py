@@ -555,11 +555,10 @@ class CLILoopsMixin:
                 f"Use /goal resume to continue, or /goal clear to stop.{_RST}")
             return
 
-        # Empty/whitespace responses are almost always transient failures (API error,
-        # empty stream): judging would say "continue" and trip the parse-failure backstop.
+        # Let GoalManager classify an empty/whitespace response as an execution
+        # failure. It owns the durable checkpoint and bounded retry, and must
+        # see the turn even when no assistant text was produced.
         last_response = self._last_assistant_response_text()
-        if not last_response.strip():
-            return
         _active_deleg = 0
         try:
             from hermes_cli.goals import count_active_delegations, gather_background_processes as _gather_bg
