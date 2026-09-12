@@ -27,7 +27,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "f3e397e45df42931f636073d3898d45f1bf7831d"
+          test "$(git rev-parse HEAD^)" = "a803450d9fa3141b48a9a7bf62f8a23b8af463cc"
           git fetch --no-tags origin main
           test "$(git rev-parse origin/main)" = "0451a66cbb765a3ede359660e37b1b2fbe857525"
           test -z "$(git status --porcelain)"
@@ -88,6 +88,9 @@ jobs:
               "_workspace_key_clause",
               "_collect_delegate_child_ids",
               "_delete_delegate_children",
+              "_delegate_from_json",
+              "classify_session_status",
+              "workspace_key",
               "_LISTABLE_CHILD_SQL",
               "_RECOVERABLE_END_REASONS_SQL",
               "_RESET_END_REASONS_SQL",
