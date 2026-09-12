@@ -10,7 +10,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-PINNED_MAIN = "0451a66cbb765a3ede359660e37b1b2fbe857525"
+PINNED_MAIN = "94a17d17521d92407b6418e57e755e279e40cc6f"
 
 
 def between(text: str, start: str, end: str) -> str:
