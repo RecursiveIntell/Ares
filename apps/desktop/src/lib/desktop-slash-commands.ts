@@ -268,7 +268,7 @@ const DESKTOP_COMMAND_SPECS: readonly DesktopCommandSpec[] = [
   {
     name: '/background',
     description: 'Run a prompt in the background',
-    aliases: ['/bg', '/btw'],
+    aliases: ['/bg'],
     surface: exec(),
     argumentMode: 'text'
   },
