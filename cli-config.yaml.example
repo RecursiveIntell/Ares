@@ -1012,6 +1012,13 @@ agent:
   # Non-positive values fall back to the 1800-second default.
   # gateway_turn_lease_timeout: 1800
 
+  # Maximum time a second Hermes process waits for the durable session-turn
+  # lease used by the full load -> run -> flush region. This is distinct from
+  # gateway_turn_lease_timeout. 0 = one immediate attempt; values above 1800
+  # are capped. A timeout returns an explicit resend notice; it does not
+  # automatically requeue the message. Default 30 seconds.
+  # session_turn_lease_wait_seconds: 30
+
   # Staged warning: send a warning before escalating to full timeout.
   # Fires once per run when inactivity reaches this threshold (seconds).
   # Set to 0 to disable the warning.
