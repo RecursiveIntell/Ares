@@ -27,7 +27,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "8d45976e2d278fc1c1e22788ce3bdc4fb0e9df28"
+          test "$(git rev-parse HEAD^)" = "eebc51c784928619f566cfc137034db132b109e6"
           git fetch --no-tags origin main
           test "$(git rev-parse origin/main)" = "0451a66cbb765a3ede359660e37b1b2fbe857525"
           test -z "$(git status --porcelain)"
