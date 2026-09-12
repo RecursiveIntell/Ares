@@ -152,7 +152,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True, desktop="terminal"),
     CommandDef("model", "Switch model (session-scoped; --global to persist)", "Configuration",
                args_hint="[model] [--provider name] [--global|--session] [--refresh]",
-               busy_policy="reject", busy_handler="model"),
+               busy_policy="reject", busy_handler="model", desktop="hidden"),
     CommandDef("llm-pipeline", "Toggle Rust-backed llm-pipeline transport", "Configuration",
                aliases=("llm_pipeline",), args_hint="[on|off|status|providers ...]"),
     CommandDef("codex-runtime", "Toggle codex app-server runtime for OpenAI/Codex models",

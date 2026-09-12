@@ -27,11 +27,12 @@ def _turn_isolation_enabled(cfg: dict | None = None) -> bool:
 
 
 def _session_uses_compute_host(session: dict, cfg: dict | None = None) -> bool:
-    # Routes lazy sessions whose AIAgent was never built in-process; already-built
-    # sessions keep the in-process path unless a prior isolated turn marked host ownership.
+    # ``agent_ready`` is the durable shape marker for a deferred dashboard
+    # session.  Prewarming may build ``agent`` before the first prompt arrives,
+    # but that race must not revoke the isolated turn boundary.
     return _turn_isolation_enabled(cfg) and (
         bool(session.get("_compute_host_active"))
-        or (session.get("agent") is None and session.get("agent_ready") is not None))
+        or session.get("agent_ready") is not None)
 
 
 def _get_compute_host_supervisor(cfg: dict | None = None):

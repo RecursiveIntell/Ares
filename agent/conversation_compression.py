@@ -2268,6 +2268,11 @@ def _notify_context_engine_compression_complete(
         return False
 
 
+_PENDING_CONTEXT_ENGINE_NOTIFICATION = (
+    "_pending_context_engine_compression_notification"
+)
+
+
 def _queue_context_engine_compression_notification(agent: Any, *, new_session_id: str, old_session_id: str) -> None:
     """Stage exactly one existing hook call for an outer host transaction."""
     if callable(getattr(agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION, None)):

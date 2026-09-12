@@ -73,6 +73,40 @@ def _session_cwd(session: dict | None) -> str:
     return str(session["cwd"]) if session and session.get("cwd") else _completion_cwd()
 
 
+def _hydrate_session_cwd(
+    sid: str, session_key: str, session_db=None, profile_home=None
+) -> None:
+    """Hydrate an eagerly-created runtime from its owning session row.
+
+    Eager resume and branch construction already open the profile-owned DB and
+    pass that handle here.  When they do not, use the session's profile-aware
+    DB context; never substitute the launch DB for a named profile.  A missing
+    row keeps the in-memory cwd and best-effort stamps it when the store offers
+    the update hook.
+    """
+    session = _sessions.get(sid)
+    if session is None:
+        return
+    db_context = (contextlib.nullcontext(session_db)
+                  if session_db is not None else _session_db(session))
+    try:
+        with db_context as db:
+            if db is None:
+                return
+            row = db.get_session(session_key) if hasattr(db, "get_session") else None
+            if isinstance(row, dict) and row.get("cwd"):
+                with _sessions_lock:
+                    current = _sessions.get(sid)
+                    if current is session:
+                        current["cwd"] = row["cwd"]
+                return
+            if hasattr(db, "update_session_cwd"):
+                _persist_session_cwd_and_schedule_git_meta(
+                    session, _session_cwd(session), db=db)
+    except Exception:
+        logger.debug("failed to hydrate session cwd for %s", session_key, exc_info=True)
+
+
 # Sources whose launch directory is an artifact of how the app was started, not a workspace the user picked.
 _LAUNCH_CWD_NOT_A_WORKSPACE = {"desktop"}
 

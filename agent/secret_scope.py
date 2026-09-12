@@ -284,6 +284,12 @@ def _is_global_env(name: str) -> bool:
     )
 
 
+def _environ_or(name: str, default: Optional[str] = None) -> Optional[str]:
+    """Read a process environment value, preserving ``None``/default semantics."""
+    value = os.environ.get(name)
+    return value if value is not None else default
+
+
 def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
     """Resolve a credential by env-var name, honoring the active profile scope.
 

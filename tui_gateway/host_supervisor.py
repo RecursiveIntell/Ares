@@ -24,6 +24,11 @@ from tools.environments.local import build_subprocess_env, hermes_subprocess_env
 
 logger = logging.getLogger(__name__)
 
+# Injectable thread constructor for spawn/respawn tests. Keeping the seam at
+# the owner module prevents tests from reaching through the supervisor's
+# implementation to patch the stdlib globally.
+_Thread = threading.Thread
+
 MUTATOR_ROUTE_TABLE: dict[str, str] = {
     "prompt.submit": "turn-path", "session.interrupt": "turn-path", "reload.mcp": "run-concurrent",
     "session.save": "run-concurrent", "session.compress": "idle-gated",
@@ -89,10 +94,19 @@ def _pid_alive(pid: int) -> bool:
     try:
         import psutil
 
-        return bool(psutil.pid_exists(pid))
+        if psutil.pid_exists(pid):
+            return True
     except Exception:
-        logger.debug("failed to %s compute host pid=%s", label, pid, exc_info=True)
+        logger.debug("failed to query compute host pid=%s with psutil", pid, exc_info=True)
+    if os.name == "nt":
         return False
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 def _pid_command(pid: int) -> str:
@@ -360,7 +374,7 @@ class HostSupervisor:
         for target, name in ((self._drain_stdout, "compute-host-stdout"),
                              (self._drain_stderr, "compute-host-stderr"),
                              (self._wait_for_exit, "compute-host-wait")):
-            threading.Thread(target=target, args=(proc,), name=name, daemon=True).start()
+            _Thread(target=target, args=(proc,), name=name, daemon=True).start()
         if not self._hello_event.wait(timeout=10.0):
             self._terminate_process(proc)
             raise RuntimeError(f"compute host did not send hello; stderr={self._stderr_tail[-5:]}")
@@ -496,7 +510,7 @@ class HostSupervisor:
                     self._spawn_locked(reason="crash")
                 except Exception:
                     logger.exception("compute host respawn failed")
-        threading.Thread(target=_respawn, name="compute-host-respawn", daemon=True).start()
+        _Thread(target=_respawn, name="compute-host-respawn", daemon=True).start()
 
     _pid_matches_compute_host = staticmethod(is_compute_host_identity)
 

@@ -2218,12 +2218,12 @@ def _load_dashboard_process_isolation_config(cfg: dict | None = None) -> dict[st
         "compute_host_heartbeat_secs": _coerce_int_config_value(
             dash.get("compute_host_heartbeat_secs"), _DASHBOARD_COMPUTE_HOST_HEARTBEAT_SECS_DEFAULT, min_value=1),
         "compute_host_respawn_max": _coerce_int_config_value(
-            dashboard.get("compute_host_respawn_max"),
+            dash.get("compute_host_respawn_max"),
             _DASHBOARD_COMPUTE_HOST_RESPAWN_MAX_DEFAULT,
             min_value=0,
         ),
         "detached_execution_max_s": _coerce_float_config_value(
-            dashboard.get("detached_execution_max_s"),
+            dash.get("detached_execution_max_s"),
             _DASHBOARD_DETACHED_EXECUTION_MAX_S_DEFAULT,
             min_value=1.0,
         ),
@@ -4405,86 +4405,6 @@ def _make_agent(
     return agent
 
 
-def _init_session(
-    sid: str,
-    key: str,
-    agent,
-    history: list,
-    cols: int = 80,
-    cwd: str | None = None,
-    session_db=None,
-    source: str | None = None,
-    profile_home: str | None = None,
-):
-    now = time.time()
-    with _sessions_lock:
-        _sessions[sid] = {
-            "agent": agent,
-            # ``sid`` is the live runtime identity carried on gateway events
-            # and required by every session-scoped RPC.  Keep it inside the
-            # record as well: production_permit.respond verifies that the
-            # renderer's response targets exactly the live session that owns
-            # the pending approval.  Omitting it made every otherwise-valid
-            # production response fail the identity check.
-            "session_id": sid,
-            "session_key": key,
-            "history": history,
-            "history_lock": threading.Lock(),
-            "history_version": 0,
-            "inflight_turn": None,
-            "created_at": now,
-            "last_active": now,
-            "running": False,
-            "attached_images": [],
-            "image_counter": 0,
-            "cwd": cwd or _completion_cwd(),
-            "cols": cols,
-            "slash_worker": None,
-            "show_reasoning": _load_show_reasoning(),
-            "source": _resolve_session_source(source),
-            "tool_progress_mode": _load_tool_progress_mode(),
-            "edit_snapshots": {},
-            "tool_started_at": {},
-            # Profile-scoped HERMES_HOME for app-global remote mode; None =
-            # launch profile. SessionBranch copies the parent's value so the
-            # child stays on the same state.db.
-            "profile_home": profile_home,
-            # Per-session model override set by an in-session /model switch.
-            # Honored on rebuild (/new, resume) so a switch in THIS session
-            # never leaks into siblings via process-global env vars.
-            "model_override": None,
-            # Pin async event emissions to whichever transport created the
-            # session (stdio for Ink, JSON-RPC WS for the dashboard sidebar).
-            "transport": current_transport() or _stdio_transport,
-        }
-    _init_owns_db = False
-    if session_db is not None:
-        db = session_db
-    elif profile_home:
-        try:
-            db = _open_profile_session_db(profile_home)
-            owns_db = True
-        except Exception:
-            # FAIL CLOSED (as the deferred-build bind): a named-profile session must never touch the launch
-            # state.db — skip hydration (the row lands on the agent's own lazy-create once the store recovers).
-            logger.warning("profile session store unavailable for %s — skipping cwd hydration instead of "
-                           "touching the launch state.db", profile_home, exc_info=True)
-    try:
-        if db is not None:
-            row = db.get_session(key) if hasattr(db, "get_session") else None
-            if row and row.get("cwd"):
-                with _sessions_lock:
-                    if sid in _sessions:
-                        _sessions[sid]["cwd"] = row["cwd"]
-            elif hasattr(db, "update_session_cwd"):
-                try:
-                    _persist_session_cwd_and_schedule_git_meta(_sessions[sid], _sessions[sid]["cwd"], db=db)
-                except Exception:
-                    logger.debug("failed to persist resumed session cwd", exc_info=True)
-    finally:
-        if owns_db and db is not None:
-            with contextlib.suppress(Exception):
-                db.close()
 
 
 def _init_session(
@@ -4494,7 +4414,8 @@ def _init_session(
     now = time.time()
     with _sessions_lock:
         _sessions[sid] = {
-            "agent": agent, "session_key": key, "history": history, "history_lock": threading.Lock(),
+            "agent": agent, "session_id": sid, "session_key": key, "history": history,
+            "history_lock": threading.Lock(),
             "history_version": 0, "inflight_turn": None, "created_at": now, "last_active": now,
             "running": False, "attached_images": [], "image_counter": 0, "cwd": cwd or _completion_cwd(),
             "explicit_cwd": bool(explicit_cwd), "cols": cols, "slash_worker": None,
@@ -4550,7 +4471,7 @@ def _lazy_resume_info(cwd: str, *, model: str = "", provider: str = "", profile:
 
 def _deferred_session_record(
     sid: str,
-    session_key: str,
+    session_key: str | None = None,
     *,
     cols: int,
     cwd: str,
@@ -4561,12 +4482,15 @@ def _deferred_session_record(
     display_history_prefix: list | None = None,
     profile_home: Path | None = None,
     lazy: bool = False,
+    explicit_cwd: bool = False,
+    todo_state: dict | None = None,
     model_override=None,
     resume_runtime_overrides: dict | None = None,
 ) -> dict:
     """A live-session record whose AIAgent is built later (lazy watch / cold
     resume) — _init_session's shape minus the agent."""
     now = time.time()
+    session_key = session_key or sid
     return {
         "agent": None, "agent_error": None, "agent_ready": threading.Event(), "attached_images": [],
         "close_on_disconnect": close_on_disconnect, "active_session_lease": lease, "cols": cols,
@@ -4589,6 +4513,7 @@ def _deferred_session_record(
         "tool_progress_mode": _load_tool_progress_mode(),
         "tool_started_at": {},
         "transport": current_transport() or _stdio_transport,
+        **({"todo_state": todo_state} if todo_state is not None else {}),
     }
 
 
@@ -4848,7 +4773,7 @@ def _live_visible_history(session: dict, db, in_memory_fallback: list[dict]) -> 
             # include_compacted: a compacted session's archived turns are still the user's
             # conversation; without them a warm switch repainted the chat as summary + tail only.
             display = db.get_messages_as_conversation(
-                key, include_ancestors=True, include_row_ids=True, include_compacted=True)
+                key, include_ancestors=True, include_row_ids=True)
             # See #92080.
             return _reconcile_display_with_live(display, in_memory_fallback)
         except Exception:
