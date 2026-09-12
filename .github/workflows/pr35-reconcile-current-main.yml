@@ -8,8 +8,8 @@ permissions:
   contents: write
 
 concurrency:
-  group: pr35-reconcile-current-main-${{ github.sha }}
-  cancel-in-progress: false
+  group: pr35-reconcile-current-main
+  cancel-in-progress: true
 
 jobs:
   reconcile:
@@ -27,7 +27,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "2103b8457116e6408969d96f4ebe5ed355a52c51"
+          test "$(git rev-parse HEAD^)" = "15140675180ee068dd24d6da5a78c666c9d2dc81"
           git fetch --no-tags origin main
           test "$(git rev-parse origin/main)" = "94a17d17521d92407b6418e57e755e279e40cc6f"
           test -z "$(git status --porcelain)"
