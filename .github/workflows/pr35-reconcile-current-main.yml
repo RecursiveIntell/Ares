@@ -27,7 +27,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "52eebac3f9e8953ee42c7fc6fc226243941b4939"
+          test "$(git rev-parse HEAD^)" = "663017f6dcc3f51f492dcebc9c4dc148b3cc292f"
           git fetch --no-tags origin main
           test "$(git rev-parse origin/main)" = "0451a66cbb765a3ede359660e37b1b2fbe857525"
           test -z "$(git status --porcelain)"
@@ -51,9 +51,14 @@ jobs:
           path = Path("hermes_state.py")
           text = path.read_text(encoding="utf-8")
 
+          sanitize_import = "from agent.memory_manager import sanitize_context\n"
           activity_anchor = "from agent.message_sanitization import _sanitize_surrogates\n"
           activity_owner = "from agent.session_activity import ActivityProvenance\n"
           activity_expected = activity_anchor + activity_owner
+          if sanitize_import not in text:
+              if text.count(activity_anchor) != 1:
+                  raise SystemExit("unexpected hermes_state message-sanitization import shape while restoring sanitize_context")
+              text = text.replace(activity_anchor, sanitize_import + activity_anchor, 1)
           if activity_expected not in text:
               if text.count(activity_anchor) != 1:
                   raise SystemExit("unexpected hermes_state message-sanitization import shape")
@@ -85,6 +90,8 @@ jobs:
 
           path.write_text(text, encoding="utf-8")
           checked = path.read_text(encoding="utf-8")
+          if sanitize_import not in checked:
+              raise SystemExit("sanitize_context owner was not restored")
           if activity_expected not in checked:
               raise SystemExit("top-level ActivityProvenance owner was not restored")
           if marker_import not in checked:
@@ -119,8 +126,10 @@ jobs:
           python - <<'PY'
           import hermes_state
           import agent.context_compressor as context_compressor
+          import agent.memory_manager as memory_manager
           assert hermes_state.SessionDB.RECOVERABLE_END_REASONS == hermes_state._RECOVERABLE_END_REASONS
           assert hermes_state._DB_PERSISTED_MARKER_KEY == context_compressor._DB_PERSISTED_MARKER
+          assert hermes_state.sanitize_context is memory_manager.sanitize_context
           PY
 
       - name: Test context governor restore
