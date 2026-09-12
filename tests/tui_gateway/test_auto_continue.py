@@ -283,6 +283,11 @@ def test_auto_continue_is_disabled_when_config_is_absent(
 
 
 def test_stale_marker_is_cleared_not_continued(schedule_env, marker_home, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {"desktop": {"auto_continue": {"enabled": True}}},
+    )
     record_turn_start(marker_home, "session-key", "old prompt")
     monkeypatch.setattr(
         server, "time", types.SimpleNamespace(time=lambda: time.time() + 3600)
@@ -319,7 +324,12 @@ def test_config_widens_freshness_window(emits, schedule_env, marker_home, monkey
     assert len(schedule_env) == 1
 
 
-def test_exhausted_attempts_break_the_loop(schedule_env, marker_home):
+def test_exhausted_attempts_break_the_loop(schedule_env, marker_home, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {"desktop": {"auto_continue": {"enabled": True}}},
+    )
     record_turn_start(marker_home, "session-key", "crashy prompt", attempts=2)
 
     result = server._maybe_schedule_auto_continue("sid", _session(), "session-key")
