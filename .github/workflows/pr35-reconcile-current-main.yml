@@ -8,7 +8,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: pr35-reconcile-current-main
+  group: pr35-reconcile-current-main-${{ github.sha }}
   cancel-in-progress: false
 
 jobs:
@@ -27,7 +27,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "49536d48f5515b633d899273393b3f8b9b0825a6"
+          test "$(git rev-parse HEAD^)" = "2103b8457116e6408969d96f4ebe5ed355a52c51"
           git fetch --no-tags origin main
           test "$(git rev-parse origin/main)" = "94a17d17521d92407b6418e57e755e279e40cc6f"
           test -z "$(git status --porcelain)"
@@ -145,9 +145,32 @@ jobs:
         shell: bash
         run: source .venv/bin/activate && python -m pytest -q tests/plugins/test_context_governor_runtime_closure.py
 
-      - name: Test hermes state
+      - name: Test reconciled SessionDB regression set
         shell: bash
-        run: source .venv/bin/activate && python -m pytest -q tests/test_hermes_state.py
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          python -m pytest -q \
+            tests/test_hermes_state.py::TestSchemaInit::test_telegram_topic_binding_roundtrip_requires_explicit_schema \
+            tests/test_hermes_state.py::TestCompressionChainProjection::test_list_serves_full_lineage_ids_for_projected_rows \
+            tests/test_hermes_state.py::TestVacuum::test_auto_maintenance_skips_vacuum_below_freelist_ratio \
+            tests/test_hermes_state.py::TestVacuum::test_auto_maintenance_vacuums_above_freelist_ratio \
+            tests/test_hermes_state.py::TestVacuum::test_auto_maintenance_freelist_ratio_exactly_at_threshold_skips \
+            tests/test_hermes_state.py::TestVacuum::test_auto_maintenance_unknown_freelist_ratio_falls_back_to_time_throttle \
+            tests/test_hermes_state.py::TestVacuum::test_auto_maintenance_ratio_gate_threshold_is_overridable \
+            tests/test_hermes_state.py::TestAutoMaintenance::test_first_run_prunes_and_skips_vacuum_when_little_reclaimable \
+            tests/test_hermes_state.py::TestAutoMaintenance::test_first_run_prunes_and_vacuums_when_mostly_reclaimable \
+            tests/test_hermes_state.py::test_peer_fallback_never_adopts_a_sibling_profiles_row \
+            tests/test_hermes_state.py::test_child_inherits_parent_profile_only_within_its_key_namespace \
+            tests/test_hermes_state.py::TestGetMessagesPagination::test_resume_safety_tip_only_counts_the_tip_segment \
+            tests/test_hermes_state.py::TestGetMessagesPagination::test_resume_guard_counts_exactly_what_a_branch_resume_loads
+
+      - name: Test hermes state full suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          timeout 240s python -m pytest -vv tests/test_hermes_state.py
 
       - name: Test TUI gateway server
         shell: bash
