@@ -14,10 +14,15 @@ PINNED_MAIN = "0451a66cbb765a3ede359660e37b1b2fbe857525"
 
 
 def between(text: str, start: str, end: str) -> str:
-    if text.count(start) != 1 or text.count(end) != 1:
-        raise SystemExit(f"unexpected ownership anchors: {start!r} -> {end!r}")
+    if text.count(start) != 1:
+        raise SystemExit(f"unexpected ownership start anchor: {start!r}")
     a = text.index(start)
-    b = text.index(end, a)
+    try:
+        b = text.index(end, a + len(start))
+    except ValueError as exc:
+        raise SystemExit(
+            f"missing ownership end anchor after {start!r}: {end!r}"
+        ) from exc
     return text[a:b]
 
 
@@ -177,19 +182,32 @@ def reconcile_goals() -> None:
     )
     merged = merged.replace(budget_old, budget_new, 1)
 
-    blocked_start = (
-        "        # BLOCKED is NOT done: pause so the user sees the judge's reason "
-        "and can re-scope or override,\n"
-    )
-    done_start = "        if verdict == \"done\":\n"
-    blocked_old = between(merged, blocked_start, done_start)
+    # Restrict BLOCKED replacement to GoalManager.evaluate_after_turn so the
+    # kanban worker loop's separate blocked semantics are never touched.
+    goal_class_end = "\n\n# ── Kanban worker goal loop"
+    eval_block = between(merged, eval_start, goal_class_end)
+    blocked_if = "        if verdict == \"blocked\":\n"
+    done_if = "        if verdict == \"done\":\n"
+    blocked_pos = eval_block.find(blocked_if)
+    if blocked_pos < 0:
+        raise SystemExit("GoalManager evaluator missing blocked verdict branch")
+    done_pos = eval_block.find(done_if, blocked_pos + len(blocked_if))
+    if done_pos < 0:
+        raise SystemExit("GoalManager evaluator missing done verdict after blocked branch")
+    # Include comments immediately preceding the blocked branch when present,
+    # but never search outside the evaluator block.
+    comment_marker = "        # BLOCKED is NOT done:"
+    comment_pos = eval_block.rfind(comment_marker, 0, blocked_pos)
+    replace_pos = comment_pos if comment_pos >= 0 else blocked_pos
+    blocked_old = eval_block[replace_pos:done_pos]
     blocked_new = (
         "        # BLOCKED is not completion. Use the canonical lifecycle stop owner\n"
         "        # so pause, checkpoint, outcome, and persistence remain one transition.\n"
         "        if verdict == \"blocked\":\n"
         "            return self._execution_stop(GOAL_BLOCKED, reason, metadata=turn_metadata)\n\n"
     )
-    merged = merged.replace(blocked_old, blocked_new, 1)
+    eval_block = eval_block[:replace_pos] + blocked_new + eval_block[done_pos:]
+    merged = merged.replace(between(merged, eval_start, goal_class_end), eval_block, 1)
 
     failure_start = (
         "        # Auto-pause when the judge cannot reach the API at all N turns in a\n"
@@ -203,9 +221,7 @@ def reconcile_goals() -> None:
 
     path.write_text(merged, encoding="utf-8")
     checked = path.read_text(encoding="utf-8")
-    goal_class = between(
-        checked, "class GoalManager:\n", "\n\n# ── Kanban worker goal loop"
-    )
+    goal_class = between(checked, "class GoalManager:\n", goal_class_end)
     for stale in (
         "self._save()",
         "self._require_goal()",
