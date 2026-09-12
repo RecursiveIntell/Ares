@@ -35,6 +35,101 @@ def _wait_for_frame(out: io.StringIO, predicate, timeout: float = 2.0) -> dict:
     raise AssertionError(f"timed out waiting for frame; saw={_json_lines(out)}")
 
 
+def test_ensure_server_session_fallback_uses_canonical_source_resolver(monkeypatch):
+    """A side-machinery failure must not abort a real host turn.
+
+    The fallback is intentionally part of the compute-host recovery boundary.
+    Its source field must use the server's canonical resolver rather than a
+    removed compatibility symbol.
+    """
+    class _Agent:
+        session_id = "host-session"
+        model = "synthetic-heavy"
+        provider = "synthetic"
+
+    monkeypatch.setattr(server, "_sessions", {}, raising=False)
+    monkeypatch.setattr(
+        server,
+        "_make_agent",
+        lambda *args, **kwargs: _Agent(),
+    )
+    monkeypatch.setattr(server, "_transfer_db_to_agent", lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        server,
+        "_init_session",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("optional session machinery unavailable")
+        ),
+    )
+
+    host = ComputeHost(stdout=io.StringIO(), heartbeat_secs=0)
+    try:
+        session = host._ensure_server_session(
+            server,
+            {
+                "sid": "fallback-sid",
+                "session_key": "fallback-key",
+                "history": [],
+                "history_version": 0,
+                "cols": 80,
+                "cwd": ".",
+                "source": "iso-certify",
+            },
+        )
+    finally:
+        host.close()
+
+    assert session["agent"].session_id == "host-session"
+    assert session["source"] == "iso-certify"
+
+
+def test_real_turn_accepts_void_session_persistence_contract(monkeypatch):
+    """A successful void persistence helper must admit the host turn."""
+    class _Agent:
+        session_id = "host-session"
+        model = "synthetic-heavy"
+        provider = "synthetic"
+
+    session = {
+        "agent": _Agent(),
+        "session_key": "real-turn-key",
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "running": False,
+        "_turn_cancel_requested": False,
+    }
+    monkeypatch.setattr(server, "_sessions", {"real-sid": session}, raising=False)
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: None)
+    monkeypatch.setattr(server, "_persist_branch_seed", lambda _session: None)
+    monkeypatch.setattr(server, "_start_inflight_turn", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_run_prompt_submit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_session_info", lambda *args, **kwargs: {"model": "synthetic-heavy"})
+
+    output = io.StringIO()
+    host = ComputeHost(stdout=output, heartbeat_secs=0)
+    monkeypatch.setattr(host, "_ensure_server_session", lambda _server, _frame: session)
+    try:
+        host._run_real_turn(
+            {
+                "sid": "real-sid",
+                "request_id": "real-r1",
+                "session_key": "real-turn-key",
+                "text": "hello",
+                "history": [],
+                "history_version": 0,
+                "cols": 80,
+                "cwd": ".",
+                "source": "iso-certify",
+            }
+        )
+    finally:
+        host.close()
+
+    frames = _json_lines(output)
+    assert [frame["type"] for frame in frames] == ["turn.started", "turn.end"]
+
+
 def test_compute_host_workers_inherit_tui_pool_env_or_8(monkeypatch):
     monkeypatch.delenv("HERMES_TUI_RPC_POOL_WORKERS", raising=False)
     monkeypatch.delenv("HERMES_COMPUTE_HOST_WORKERS", raising=False)

@@ -8487,6 +8487,81 @@ class SessionDB(
         else:
             self._write_sql(sql, (key, value))
 
+    def set_meta_many(self, items: List[Tuple[str, str]]) -> None:
+        """Write multiple ``state_meta`` rows in one owner transaction.
+
+        Lifecycle migrations use this to publish a child goal and archive its
+        parent atomically. The method deliberately remains a small SessionDB
+        primitive; it does not create a second goal store or expose a generic
+        transaction API to callers.
+        """
+        normalized = [(str(key), str(value)) for key, value in items]
+        if not normalized:
+            return
+
+        def _do(conn):
+            for meta_key, meta_value in normalized:
+                conn.execute(
+                    "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (meta_key, meta_value),
+                )
+
+        self._execute_write(_do)
+
+    def compare_and_set_meta(
+        self, key: str, expected: Optional[str], value: str
+    ) -> bool:
+        """Conditionally publish one meta row under the SessionDB write lock."""
+        def _do(conn):
+            if expected is None:
+                cursor = conn.execute(
+                    "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO NOTHING",
+                    (key, value),
+                )
+            else:
+                cursor = conn.execute(
+                    "UPDATE state_meta SET value = ? "
+                    "WHERE key = ? AND value = ?",
+                    (value, key, expected),
+                )
+            return bool(cursor.rowcount == 1)
+
+        return bool(self._execute_write(_do))
+
+    def compare_and_set_meta_many(
+        self, items: List[Tuple[str, Optional[str], str]]
+    ) -> bool:
+        """Atomically publish several meta rows if every preimage matches."""
+        normalized = [(str(key), expected, str(value)) for key, expected, value in items]
+        if not normalized:
+            return True
+
+        def _do(conn):
+            for key, expected, _value in normalized:
+                if expected is None:
+                    row = conn.execute(
+                        "SELECT 1 FROM state_meta WHERE key = ?", (key,)
+                    ).fetchone()
+                    if row is not None:
+                        return False
+                else:
+                    row = conn.execute(
+                        "SELECT value FROM state_meta WHERE key = ?", (key,)
+                    ).fetchone()
+                    if row is None or row[0] != expected:
+                        return False
+            for key, _expected, value in normalized:
+                conn.execute(
+                    "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (key, value),
+                )
+            return True
+
+        return bool(self._execute_write(_do))
+
     def retag_kanban_worker_sessions(self, workspaces_root: str) -> int:
         """Retag legacy kanban worker rows from ``cli`` to ``kanban`` by cwd under the board's workspaces
         root; gated once per root via state_meta. Returns rows retagged."""

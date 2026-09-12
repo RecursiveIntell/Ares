@@ -487,6 +487,12 @@ class GoalState:
     # Immutable collaboration artifacts remain content-addressed references;
     # their bytes stay with the collaboration artifact owner.
     collaboration_contract_refs: List[str] = field(default_factory=list)
+    # Durable infrastructure-recovery accounting. ``recovery_attempts`` is
+    # cumulative; ``recovery_episode_attempts`` is reset only by verified
+    # progress or explicit /goal resume, never by reconnect alone.
+    recovery_attempts: int = 0
+    recovery_episode_attempts: int = 0
+    last_recovery_reason: Optional[str] = None
     # Versioned lifecycle projection. Legacy rows are migrated conservatively.
     schema_version: int = 2
     migration: Dict[str, Any] = field(default_factory=dict)
@@ -556,6 +562,9 @@ class GoalState:
                 str(ref) for ref in (data.get("collaboration_contract_refs") or [])
                 if isinstance(ref, str) and ref
             }),
+            recovery_attempts=int(data.get("recovery_attempts", 0) or 0),
+            recovery_episode_attempts=int(data.get("recovery_episode_attempts", 0) or 0),
+            last_recovery_reason=data.get("last_recovery_reason"),
             schema_version=int(data.get("schema_version", 1) or 1),
             migration=migration,
         )
@@ -628,18 +637,24 @@ def _flush_deferred_goal_writes(home: str, db: Any) -> None:
     """
     with _DEFERRED_WRITES_LOCK:
         keys = [k for k in _DEFERRED_GOAL_WRITES if k[0] == home]
-        if not keys:
-            return
-        pending = {k: _DEFERRED_GOAL_WRITES.pop(k) for k in keys}
+        pending = {k: _DEFERRED_GOAL_WRITES[k] for k in keys}
     for (_home, session_id), entry in pending.items():
         try:
             db.set_meta(_meta_key(session_id), entry["payload"])
         except Exception as exc:
+            # Keep the entry for a later retry. It may have been replaced by a
+            # newer state while this flush was in flight, so never delete or
+            # overwrite the newer value here.
             logger.warning(
                 "GoalManager: deferred goal write for %s still not durable: %s",
                 session_id,
                 exc,
             )
+            continue
+        with _DEFERRED_WRITES_LOCK:
+            current = _DEFERRED_GOAL_WRITES.get((_home, session_id))
+            if current is entry:
+                _DEFERRED_GOAL_WRITES.pop((_home, session_id), None)
 
 # How long a loop-thread caller waits for an ALREADY-RUNNING bootstrap
 # before degrading to None. Normal SessionDB init is ~10-100ms, so a call
@@ -832,13 +847,17 @@ def list_persisted_goals() -> List[Tuple[str, GoalState]]:
     return result
 
 
-def clear_goal(session_id: str) -> None:
-    """Mark a goal cleared in the DB (preserved for audit, status=cleared)."""
+def clear_goal(session_id: str) -> bool:
+    """Mark a goal cleared in the DB (preserved for audit)."""
     state = load_goal(session_id)
     if state is None:
-        return
+        return False
     state.status = "cleared"
-    save_goal(session_id, state)
+    state.outcome = CANCELLED
+    state.last_stop_reason = "USER_CLEARED"
+    state.next_action = None
+    state.continuation_pending = False
+    return save_goal(session_id, state)
 
 
 def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason: str = "") -> bool:
@@ -854,16 +873,54 @@ def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason:
     if not old_session_id or not new_session_id or old_session_id == new_session_id:
         return False
     try:
-        state = load_goal(old_session_id)
-        if state is None or state.status == "cleared":
+        db = _get_session_db()
+        if db is None:
             return False
-        # Don't clobber a goal already set on the child (e.g. a resumed lineage).
-        if load_goal(new_session_id) is not None:
+        parent_raw = db.get_meta(_meta_key(old_session_id))
+        if not parent_raw:
             return False
-        save_goal(new_session_id, state)
-        # Archive the parent's row so it isn't double-counted as active.
-        clear_goal(old_session_id)
-        logger.debug("GoalManager: migrated goal %s -> %s (%s)", old_session_id, new_session_id, reason or "rotation")
+        state = GoalState.from_json(parent_raw)
+        if state.status == "cleared":
+            return False
+        child_raw = db.get_meta(_meta_key(new_session_id))
+        if child_raw:
+            return False
+
+        child = GoalState.from_json(state.to_json())
+        child.migration = {
+            **dict(child.migration or {}),
+            "migrated_from_session": old_session_id,
+            "migration_reason": reason or "rotation",
+            "migrated_at": time.time(),
+        }
+        archived = GoalState.from_json(state.to_json())
+        archived.status = "cleared"
+        archived.outcome = CANCELLED
+        archived.last_stop_reason = f"MIGRATED_TO:{new_session_id}"
+        archived.next_action = None
+        archived.continuation_pending = False
+        archived.continuation_claimed_by = None
+        archived.continuation_claimed_at = 0.0
+
+        child_payload = child.to_json()
+        archived_payload = archived.to_json()
+        if hasattr(db, "compare_and_set_meta_many"):
+            migrated = db.compare_and_set_meta_many(
+                [
+                    (_meta_key(old_session_id), parent_raw, archived_payload),
+                    (_meta_key(new_session_id), None, child_payload),
+                ]
+            )
+        else:
+            # Test doubles and older external SessionDB implementations must
+            # fail closed rather than recreate the old child-then-clear race.
+            migrated = False
+        if not migrated:
+            return False
+        logger.debug(
+            "GoalManager: migrated goal %s -> %s (%s)",
+            old_session_id, new_session_id, reason or "rotation",
+        )
         return True
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("GoalManager: goal migration failed: %s", exc)
@@ -1257,6 +1314,7 @@ class GoalManager:
         self.default_max_turns = int(default_max_turns or DEFAULT_MAX_TURNS)
         self._state: Optional[GoalState] = load_goal(session_id)
         self._continuation_lock_handle = None
+        self._continuation_claim_owner: Optional[str] = None
 
     # --- introspection ------------------------------------------------
 
@@ -1456,6 +1514,8 @@ class GoalManager:
         self._state.clear_wait()   # resuming starts fresh
         if reset_budget:
             self._state.turns_used = 0
+        self._state.recovery_episode_attempts = 0
+        self._state.last_recovery_reason = None
         # Resume is a durable dispatch request, not merely a status mutation.
         # Keep it pending until the ordinary prompt consumer starts the turn so
         # replayed/duplicate dispatches are rejected by start_continuation().
@@ -1503,14 +1563,18 @@ class GoalManager:
         return True, "checkpoint is current"
 
     def claim_continuation(self, owner: str, *, lease_seconds: float = 120.0) -> bool:
-        """Atomically claim one pending continuation across local processes.
-
-        The durable state remains in ``SessionDB``; the lock file is only a
-        process-coordination primitive. A stale lease expires, so a crashed
-        scheduler cannot permanently strand a checkpoint.
-        """
-        state = load_goal(self.session_id)
-        if state is None or not state.continuation_pending or state.status != "active":
+        """Atomically claim one pending continuation across local processes."""
+        db = _get_session_db()
+        if db is None:
+            return False
+        try:
+            expected_raw = db.get_meta(_meta_key(self.session_id))
+            if not expected_raw:
+                return False
+            state = GoalState.from_json(expected_raw)
+        except Exception:
+            return False
+        if not state.continuation_pending or state.status != "active":
             return False
         self._state = state
         valid, _reason = self.validate_checkpoint()
@@ -1526,6 +1590,14 @@ class GoalManager:
             os.makedirs(lock_dir, exist_ok=True)
             handle = open(os.path.join(lock_dir, f"{state.goal_id}.lock"), "a+", encoding="utf-8")
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # The file lock only coordinates local contenders. Re-read the
+            # canonical row after taking it, then publish with a CAS so another
+            # process cannot win between load and durable claim.
+            current_raw = db.get_meta(_meta_key(self.session_id))
+            if current_raw != expected_raw:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                handle.close()
+                return False
         except Exception:
             if handle is not None:
                 try:
@@ -1536,26 +1608,47 @@ class GoalManager:
         state.continuation_claimed_by = owner
         state.continuation_claimed_at = time.time()
         self._state = state
-        if not save_goal(self.session_id, state):
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-            handle.close()
+        payload = state.to_json()
+        saved = (
+            db.compare_and_set_meta(_meta_key(self.session_id), expected_raw, payload)
+            if hasattr(db, "compare_and_set_meta")
+            else False
+        )
+        if not saved:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                handle.close()
+            except Exception:
+                pass
             return False
         self._continuation_lock_handle = handle
+        self._continuation_claim_owner = owner
         return True
 
     def release_continuation(self, *, queued: bool) -> bool:
         """Release the scheduler lease; retain pending state until turn start."""
-        state = self._state
-        if state is None:
-            return False
-        if queued:
-            # The FIFO is process-local. Keep the durable checkpoint pending
-            # until the consumer actually starts the synthetic turn; a crash
-            # after enqueue but before consumption must be recoverable.
-            state.migration["continuation_enqueued_at"] = time.time()
-        state.continuation_claimed_by = None
-        state.continuation_claimed_at = 0.0
-        saved = save_goal(self.session_id, state)
+        db = _get_session_db()
+        owner = self._continuation_claim_owner
+        saved = False
+        if db is not None and owner:
+            try:
+                expected_raw = db.get_meta(_meta_key(self.session_id))
+                current = GoalState.from_json(expected_raw) if expected_raw else None
+                if current is not None and current.continuation_claimed_by == owner:
+                    if queued:
+                        current.migration["continuation_enqueued_at"] = time.time()
+                    current.continuation_claimed_by = None
+                    current.continuation_claimed_at = 0.0
+                    payload = current.to_json()
+                    saved = (
+                        db.compare_and_set_meta(_meta_key(self.session_id), expected_raw, payload)
+                        if hasattr(db, "compare_and_set_meta")
+                        else False
+                    )
+                    if saved:
+                        self._state = current
+            except Exception:
+                saved = False
         handle = self._continuation_lock_handle
         if handle is not None:
             try:
@@ -1565,6 +1658,7 @@ class GoalManager:
             except Exception:
                 pass
             self._continuation_lock_handle = None
+        self._continuation_claim_owner = None
         return saved
 
     def start_continuation(
@@ -1584,7 +1678,14 @@ class GoalManager:
         event without consuming the newer pending continuation. The checkpoint
         itself is retained for audit and stale/replay validation.
         """
-        state = load_goal(self.session_id)
+        db = _get_session_db()
+        if db is None:
+            return False
+        try:
+            expected_raw = db.get_meta(_meta_key(self.session_id))
+            state = GoalState.from_json(expected_raw) if expected_raw else None
+        except Exception:
+            return False
         if state is None or state.status != "active" or not state.continuation_pending:
             return False
         if expected_goal_id is not None and state.goal_id != expected_goal_id:
@@ -1607,7 +1708,12 @@ class GoalManager:
         state.last_stop_reason = "CONTINUATION_STARTED"
         state.next_action = "evaluate the current continuation turn"
         state.migration.pop("continuation_enqueued_at", None)
-        return save_goal(self.session_id, state)
+        payload = state.to_json()
+        return bool(
+            db.compare_and_set_meta(_meta_key(self.session_id), expected_raw, payload)
+            if hasattr(db, "compare_and_set_meta")
+            else False
+        )
 
     def confirm_completion(self, evidence: str, *, source: str = "user") -> bool:
         if not self._state or self._state.status not in {"active", "paused"}:
@@ -2010,6 +2116,34 @@ class GoalManager:
                 "reason": "no active goal",
                 "message": "",
             }
+        metadata = dict(metadata or {})
+        fingerprint = str(metadata.get("failure_fingerprint") or reason)
+        if (
+            state.last_recovery_reason == fingerprint
+            and state.recovery_episode_attempts >= 1
+        ):
+            paused = self.pause(
+                reason=f"{reason.lower().replace('_', ' ')} twice consecutively"
+            )
+            if paused is None:
+                return self._persistence_failure("recovery exhaustion pause could not be saved")
+            return {
+                "status": "paused",
+                "should_continue": False,
+                "continuation_prompt": None,
+                "verdict": "recovery_exhausted",
+                "reason": reason,
+                "message": (
+                    f"⏸ Goal paused — recovery failed twice without progress: {reason}. "
+                    "Repair the blocker, then /goal resume."
+                ),
+            }
+        state.recovery_attempts += 1
+        state.recovery_episode_attempts += 1
+        state.last_recovery_reason = fingerprint
+        metadata["failure_fingerprint"] = fingerprint
+        metadata["recovery_attempt"] = state.recovery_attempts
+        metadata["recovery_episode_attempt"] = state.recovery_episode_attempts
         if not self._checkpoint(
             CONTINUATION_REQUIRED,
             reason,
@@ -2061,6 +2195,7 @@ class GoalManager:
         state = self._state
         if state is None:
             return {"status": None, "should_continue": False, "verdict": "inactive", "reason": "no active goal", "message": ""}
+        before = state.to_json()
         state.status = "done"
         state.outcome = GOAL_COMPLETED
         state.last_verdict = "done"
@@ -2069,7 +2204,9 @@ class GoalManager:
         state.next_action = None
         state.continuation_pending = False
         state.completion_evidence = {"source": "verified_contract", "contract": asdict(state.contract), "recorded_at": time.time()}
-        save_goal(self.session_id, state)
+        if not save_goal(self.session_id, state):
+            self._state = GoalState.from_json(before)
+            return self._persistence_failure("verified completion could not be saved")
         return {"status": "done", "should_continue": False, "continuation_prompt": None, "verdict": "done", "reason": reason, "message": f"✓ Goal achieved with deterministic completion evidence: {reason}"}
 
     # --- the main entry point called after every turn -----------------
@@ -2164,6 +2301,11 @@ class GoalManager:
                 metadata=turn_metadata,
             )
 
+        # A usable turn is evidence of progress for the current recovery
+        # episode. Preserve cumulative recovery_attempts, but allow one fresh
+        # bounded infrastructure retry episode after this progress.
+        state.recovery_episode_attempts = 0
+        state.last_recovery_reason = None
         verdict, reason, parse_failed, wait_directive, transport_failed = judge_goal(
             state.goal, last_response, subgoals=state.subgoals or None, background_processes=background_processes,
             contract=state.contract if state.has_contract() else None, active_delegations=active_delegations,

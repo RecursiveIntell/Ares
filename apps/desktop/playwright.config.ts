@@ -24,6 +24,9 @@ if (process.env.CI) {
   reporters.push(['json', { outputFile: 'playwright-report/results.json' }])
 }
 
+const parsedWorkers = Number.parseInt(process.env.PLAYWRIGHT_WORKERS ?? '', 10)
+const e2eWorkers = Number.isInteger(parsedWorkers) && parsedWorkers > 0 ? parsedWorkers : 1
+
 export default defineConfig({
   /* Test files live under e2e/ so they never collide with the vitest suite
    * under src/ or the node:test files under electron/. */
@@ -36,6 +39,10 @@ export default defineConfig({
    * per test gives us headroom without masking real hangs. */
   timeout: 90_000,
   retries: process.env.CI ? 1 : 0,
+  // Electron tests create a real desktop process. Keep local execution to one
+  // worker so a default run cannot open one visible Ares window per CPU core.
+  // CI/admitted stress runs may opt into a measured count explicitly.
+  workers: e2eWorkers,
   /* Each test gets its own worker so the Electron process is fully isolated. */
   fullyParallel: false,
   reporter: reporters,

@@ -925,10 +925,25 @@ DEFAULT_CONFIG = {
         "turn_isolation": False,
         "compute_host_heartbeat_secs": 15,
         "compute_host_respawn_max": 3,
-        # Token/cost analytics surfaces are hidden by default: the numbers are a local LOWER-BOUND
-        # estimate, not billing — only successful main-agent responses with a response.usage count;
-        # auxiliary calls, retries, fallbacks and cache writes are missed, so the total can be
-        # 10x-100x under the provider bill.
+        # Finite execution bound for an already-authorized turn after the last
+        # Desktop/WebSocket viewer detaches. Detachment is not cancellation;
+        # explicit Stop still interrupts immediately. Runtime reads this from
+        # the same raw dashboard config owner as the other isolation controls.
+        "detached_execution_max_s": 300,
+        # Hide the token/cost analytics surfaces (Analytics page, token bars and
+        # cost figures on the Models page) by default.  The numbers shown there
+        # are a local debug estimate: they only count successful main-agent
+        # responses with a usable ``response.usage``, and silently exclude every
+        # auxiliary call (context compression, title generation, vision,
+        # session search, web extract, smart approval, MCP routing, plugin LLM
+        # access) plus provider-side retries, fallback attempts, and any call
+        # whose usage block didn't come back.  Cache writes are also missing
+        # from the API response.  On models with heavy auxiliary traffic
+        # (Kimi K2.6, MiniMax M2.7) the local total can be 10x-100x lower than
+        # the provider bill, which is worse than hiding the numbers entirely
+        # because they look precise enough to compare against the provider.
+        # Set this to True to re-enable the surfaces with the understanding
+        # that the numbers are a local lower-bound estimate, not billing.
         "show_token_analytics": False,
         # IPs / bounded CIDRs of reverse proxies trusted to supply X-Forwarded-Proto/-For. Loopback
         # always trusted; wildcards and /0 rejected (spoofing guard).

@@ -10,6 +10,7 @@ harness percentile math.
 from __future__ import annotations
 
 import importlib.util
+import json
 import threading
 import time
 from pathlib import Path
@@ -50,5 +51,47 @@ def test_harness_percentile_and_guard():
     # The empty-timeline INCONCLUSIVE floor: too few probe samples never PASSes.
     assert iso.probe_thread_samples_ok([1.0, 2.0], [1.0, 2.0, 3.0]) is False
     assert iso.probe_thread_samples_ok([1.0, 2.0, 3.0], [1.0, 2.0, 3.0]) is True
+
+
+def test_ws_client_preserves_event_that_precedes_rpc_response(monkeypatch):
+    """The streaming event can beat prompt.submit's RPC response.
+
+    The certify harness must retain that event; discarding it makes a valid
+    isolated turn look like zero completed turns and incorrectly yields
+    INCONCLUSIVE under the faster child-process path.
+    """
+    iso = _load_iso_certify()
+
+    class _FakeWS:
+        def __init__(self):
+            self.messages = [
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "event",
+                        "params": {"type": "message.start"},
+                    }
+                ),
+                json.dumps({"jsonrpc": "2.0", "id": "r1", "result": {}}),
+            ]
+
+        def recv(self, timeout):
+            del timeout
+            if not self.messages:
+                raise TimeoutError
+            return self.messages.pop(0)
+
+    client = iso.WSClient.__new__(iso.WSClient)
+    client.ws = _FakeWS()
+    client._pending = []
+    client._id = 0
+    client._lock = threading.Lock()
+
+    response = client._recv_until(lambda obj: obj.get("id") == "r1", timeout=1)
+    assert response["id"] == "r1"
+    event = client._recv_until(
+        lambda obj: obj.get("method") == "event", timeout=1
+    )
+    assert event["params"]["type"] == "message.start"
 
 

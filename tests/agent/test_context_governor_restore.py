@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import shutil
+import sqlite3
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -124,6 +125,20 @@ def test_protocol_probe_exercises_the_certified_two_phase_wire_contract():
     }
     assert [args[0] for args, _payload in calls] == result["stages"]
     assert calls[-1][1] == {}
+
+
+
+
+def test_legacy_rehydration_stops_at_bounded_store_size(monkeypatch, tmp_path):
+    """A missing catalog must not scan every receipt in a large archive."""
+    store = tmp_path / "governor"
+    store.mkdir()
+    for index in range(65):
+        (store / f"ctxr_{index:032x}.json").write_text("{}", encoding="utf-8")
+    engine = ContextGovernorEngine(binary="/tmp/context-governor", store_dir=store)
+    messages = [{"role": "user", "content": "current"}]
+    with patch.object(type(store), "glob", side_effect=AssertionError("unbounded glob used")):
+        assert engine._rehydrate_legacy_parent_prefix(messages) == messages
 
 
 def _valid_llm_summary(body: str = "checkpoint") -> str:
@@ -332,6 +347,7 @@ def _checkpoint_engine(
                 "path": f"/tmp/{payload['receipt_id']}.json",
                 "activated": True,
                 "verified": True,
+                "already_activated": False,
             }
         if args[:3] == ["discard-v2", "--dir", str(engine.store_dir)]:
             receipt_id = args[args.index("--receipt") + 1]
@@ -410,6 +426,7 @@ def test_live_engine_retries_pending_activation_before_new_compaction():
         "llm_checkpoint_applied": False,
         "savings_pct": 50.0,
         "exact_fallback_available": True,
+        "host_boundary_accepted": True,
     }
     calls = []
     activation_attempts = 0
@@ -426,6 +443,7 @@ def test_live_engine_retries_pending_activation_before_new_compaction():
                 "receipt_id": payload["receipt_id"],
                 "activated": True,
                 "verified": True,
+                "already_activated": False,
             }
         if args[0] == "compact-v2":
             raise RuntimeError("synthetic next compaction reached")
@@ -466,6 +484,7 @@ def test_mismatched_pending_projection_is_discarded_before_new_compaction():
         "llm_checkpoint_applied": False,
         "savings_pct": 50.0,
         "exact_fallback_available": True,
+        "host_boundary_accepted": False,
     }
     calls = []
 
@@ -537,6 +556,7 @@ def test_restart_reconciliation_failure_stays_bound_for_next_turn_retry():
                 "receipt_id": payload["receipt_id"],
                 "activated": True,
                 "verified": True,
+                "already_activated": False,
             }
         if args[0] == "compact-v2":
             raise RuntimeError("synthetic next compaction reached")
@@ -1453,6 +1473,7 @@ def test_host_todo_snapshot_does_not_block_recursive_llm_checkpoint():
                 "receipt_id": payload["receipt_id"],
                 "activated": True,
                 "verified": True,
+                "already_activated": False,
             }
         raise AssertionError(f"unexpected command: {args}")
 
@@ -1554,6 +1575,7 @@ def test_background_notification_compaction_binds_host_real_user_anchor():
                 "receipt_id": payload["receipt_id"],
                 "activated": True,
                 "verified": True,
+                "already_activated": False,
             }
         raise AssertionError(f"unexpected command: {args}")
 
@@ -1715,6 +1737,7 @@ def test_host_alternation_repair_is_bound_into_the_receipt_projection():
                 "receipt_id": payload["receipt_id"],
                 "activated": True,
                 "verified": True,
+                "already_activated": False,
             }
         raise AssertionError(f"unexpected command: {args}")
 
@@ -2173,6 +2196,70 @@ def test_legacy_receipt_prefix_rehydrates_only_lost_durable_fields(tmp_path):
     incoming[0]["content"] = "tool result"
     incoming[0]["metadata"]["tool_call_id"] = "call_drifted"
     assert engine._rehydrate_legacy_parent_prefix(incoming) == incoming
+
+
+def test_legacy_rehydrate_uses_catalog_session_rows(tmp_path, monkeypatch):
+    """Large stores must not rescan unrelated receipt payloads on resume."""
+    session_id = "catalog-bounded"
+    engine = ContextGovernorEngine(binary="/tmp/context-governor", store_dir=tmp_path)
+    engine.session_id = session_id
+    receipt_prefix = [
+        {
+            "role": "assistant",
+            "id": "summary_123",
+            "name": "context_governor",
+            "content": "deterministic extractive summary",
+        },
+        {"role": "user", "content": "active task"},
+    ]
+    target = tmp_path / "ctxr_target.json"
+    target.write_text(
+        json.dumps(
+            {
+                "receipt": {
+                    "session_id": session_id,
+                    "generation": 4,
+                    "created_utc": "2026-08-16T00:00:00Z",
+                },
+                "compacted_messages": receipt_prefix,
+            }
+        ),
+        encoding="utf-8",
+    )
+    for index in range(128):
+        (tmp_path / f"ctxr_noise_{index}.json").write_text("not-read", encoding="utf-8")
+
+    with sqlite3.connect(tmp_path / ".receipt-index.sqlite3") as connection:
+        connection.execute(
+            "CREATE TABLE receipts ("
+            "receipt_id TEXT, generation INTEGER, created_utc TEXT, session_id TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO receipts VALUES (?, ?, ?, ?)",
+            ("ctxr_target", 4, "2026-08-16T00:00:00Z", session_id),
+        )
+        connection.commit()
+
+    original_read_text = type(target).read_text
+    read_names = []
+
+    def tracked_read_text(path, *args, **kwargs):
+        read_names.append(path.name)
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(type(target), "read_text", tracked_read_text)
+    incoming = [
+        engine._message_to_governor(
+            {"role": "assistant", "content": "deterministic extractive summary"}, 0
+        ),
+        engine._message_to_governor({"role": "user", "content": "active task"}, 1),
+        engine._message_to_governor({"role": "user", "content": "new work"}, 2),
+    ]
+
+    assert engine._rehydrate_legacy_parent_prefix(incoming) == receipt_prefix + [
+        {"role": "user", "content": "new work"}
+    ]
+    assert read_names == ["ctxr_target.json"]
 
 
 def test_resume_alternation_repair_rehydrates_authenticated_parent(tmp_path):

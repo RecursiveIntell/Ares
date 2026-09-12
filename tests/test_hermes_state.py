@@ -3008,6 +3008,28 @@ class TestStateMeta:
         db.set_meta("foo", "bar")
         assert db.get_meta("foo") == "bar"
 
+    def test_compare_and_set_meta_requires_matching_preimage(self, db):
+        db.set_meta("cas", "old")
+        assert db.compare_and_set_meta("cas", "wrong", "new") is False
+        assert db.get_meta("cas") == "old"
+        assert db.compare_and_set_meta("cas", "old", "new") is True
+        assert db.get_meta("cas") == "new"
+
+    def test_compare_and_set_meta_many_is_atomic(self, db):
+        db.set_meta("parent", "active")
+        assert db.compare_and_set_meta_many([
+            ("parent", "active", "cleared"),
+            ("child", None, "active"),
+        ]) is True
+        assert db.get_meta("parent") == "cleared"
+        assert db.get_meta("child") == "active"
+        assert db.compare_and_set_meta_many([
+            ("parent", "not-current", "bad"),
+            ("another-child", None, "should-not-land"),
+        ]) is False
+        assert db.get_meta("parent") == "cleared"
+        assert db.get_meta("another-child") is None
+
 
 
 class TestVacuum:

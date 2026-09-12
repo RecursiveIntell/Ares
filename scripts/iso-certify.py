@@ -221,8 +221,9 @@ class WSClient:
         )
         self._id = 0
         self._lock = threading.Lock()
+        self._pending: list[dict] = []
         # Drain the gateway.ready event.
-        self._recv_until(lambda o: o.get("method") == "event", timeout=10)
+        self._recv_until(lambda o: o.get("method") == "event" and (o.get("params") or {}).get("type") == "gateway.ready", timeout=10)
 
     def _next_id(self) -> str:
         with self._lock:
@@ -232,6 +233,9 @@ class WSClient:
     def _recv_until(self, pred, timeout: float) -> dict:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            for index, obj in enumerate(self._pending):
+                if pred(obj):
+                    return self._pending.pop(index)
             try:
                 raw = self.ws.recv(timeout=max(0.05, deadline - time.monotonic()))
             except TimeoutError:
@@ -242,6 +246,11 @@ class WSClient:
                 continue
             if pred(obj):
                 return obj
+            # prompt.submit acknowledges asynchronously. A stream event can
+            # arrive before its RPC response, especially across the compute-host
+            # pipe; retain it instead of turning a real turn into zero observed
+            # turns in the certification harness.
+            self._pending.append(obj)
         raise TimeoutError("ws recv predicate timed out")
 
     def rpc(self, method: str, params: dict, timeout: float = 30.0) -> dict:
