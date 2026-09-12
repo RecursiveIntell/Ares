@@ -37,9 +37,9 @@ jobs:
             exit 0
           fi
 
-          # An email is mapped if it has a file in contributors/emails/
-          # (one file per email — conflict-free) or an entry in the frozen
-          # legacy AUTHOR_MAP in scripts/release.py.
+          # An email is mapped if it has an exact file in contributors/emails/,
+          # a unique case-fold-equivalent file (required for portable checkouts),
+          # or an entry in the frozen legacy AUTHOR_MAP in scripts/release.py.
           MISSING=""
           while IFS= read -r email; do
             # Skip teknium and bot emails
@@ -53,7 +53,16 @@ jobs:
             fi
 
             if [ -f "contributors/emails/${email}" ]; then
-              continue  # mapped via the contributors directory
+              continue  # exact mapping via the contributors directory
+            fi
+
+            # The repository cannot contain two mapping filenames that differ
+            # only by case: those are one file on Windows/default macOS. Reuse a
+            # single case-fold-equivalent mapping instead. More than one match
+            # remains ambiguous and is deliberately rejected.
+            CASEFOLD_COUNT=$(python3 -c 'from pathlib import Path; import sys; d=Path("contributors/emails"); target=sys.argv[1].casefold(); print(sum(1 for p in d.iterdir() if p.is_file() and p.name.casefold() == target) if d.is_dir() else 0)' "$email")
+            if [ "$CASEFOLD_COUNT" = "1" ]; then
+              continue
             fi
 
             if ! grep -qF "\"${email}\"" scripts/release.py 2>/dev/null; then
@@ -85,7 +94,7 @@ jobs:
             REVIEW_STATUS=$(jq -nc \
               --arg detail "$DETAIL" \
               --arg how_to_fix "$HOW_TO_FIX" \
-              '[{"source":"contributor attribution","results":[{"kind":"action_required","title":"Unmapped contributor email(s)","summary":"New contributor email(s) are not in AUTHOR_MAP.","detail":$detail,"how_to_fix":$how_to_fix}]}]')
+              '[{"source":"contributor attribution","results":[{"kind":"action_required","title":"Unmapped contributor email(s)","summary":"New contributor email(s) are not mapped.","detail":$detail,"how_to_fix":$how_to_fix}]}]')
             echo "review_status=$REVIEW_STATUS" >> "$GITHUB_OUTPUT"
             echo "review_status=$REVIEW_STATUS" > review-status.json
 

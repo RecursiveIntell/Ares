@@ -10,7 +10,7 @@ import { useAui, useAuiState, useComposerRuntime } from '@assistant-ui/react'
 import { useStore } from '@nanostores/react'
 import { type RefObject, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 
-import { usePaneGroup } from '@/components/pane-shell/pane-visibility'
+import { usePaneGroup, usePaneVisible } from '@/components/pane-shell/pane-visibility'
 import { $activeTreeGroup } from '@/components/pane-shell/tree/store'
 import { SLASH_COMMAND_RE } from '@/lib/chat-runtime'
 import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
@@ -79,6 +79,7 @@ export function useComposerDraft({
 }: UseComposerDraftArgs) {
   const aui = useAui()
   const composerRuntime = useComposerRuntime()
+  const paneVisible = usePaneVisible()
   // Which composer this is on the focus bus + which attachment set it owns.
   const { attachments: attachmentScope, target } = useComposerScope()
   const paneGroup = usePaneGroup()
@@ -151,14 +152,22 @@ export function useComposerDraft({
 
       if (editor) {
         renderComposerContents(editor, next, { trailingCommitted: true })
-        placeCaretEnd(editor)
+
+        // Selection is document-global: a keep-alive composer in a hidden tab
+        // may repaint when its background session updates, but moving its caret
+        // here steals the selection from the visible composer without changing
+        // document.activeElement. The foreground then still looks focused while
+        // printable keydowns produce no input.
+        if (paneVisible) {
+          placeCaretEnd(editor)
+        }
       }
 
       if (focus) {
         requestMainFocus()
       }
     },
-    [requestMainFocus, setComposerText]
+    [paneVisible, requestMainFocus, setComposerText]
   )
 
   const appendExternalText = useCallback(
@@ -191,9 +200,14 @@ export function useComposerDraft({
   // owns focus. A background reconnect must never steal the caret from another
   // input, button, terminal, or sidebar control.
   useEffect(() => {
-    // Routing identity and keyboard focus are separate: every mounted composer
-    // must claim its bus target, while only an unowned document may receive an
-    // automatic caret move.
+    // Keep-alive panes remain mounted while hidden. They must not claim the
+    // routing key or run the automatic-focus predicate until they are fronted;
+    // the visibility dependency below retries the same mount/runtime path when
+    // the pane becomes visible.
+    if (!paneVisible) {
+      return
+    }
+
     markActiveComposer(target)
 
     if (
@@ -206,7 +220,7 @@ export function useComposerDraft({
     ) {
       focusInput(false)
     }
-  }, [activeTreeGroup, focusInput, focusKey, inputDisabled, paneGroup, target])
+  }, [activeTreeGroup, focusInput, focusKey, inputDisabled, paneGroup, paneVisible, target])
 
   // Explicit focus-bus and programmatic insert requests ARE user intent and
   // retain the existing triple-focus behavior across React/browser commits.
@@ -286,9 +300,12 @@ export function useComposerDraft({
 
     if (editorRef.current) {
       renderComposerContents(editorRef.current, '')
-      placeCaretEnd(editorRef.current)
+
+      if (paneVisible) {
+        placeCaretEnd(editorRef.current)
+      }
     }
-  }, [setComposerText])
+  }, [paneVisible, setComposerText])
 
   // Read the editor's current plain text into draftRef + composer state. This
   // closes the "queued rAF flush hasn't run yet" window so scope-swap/pagehide
@@ -387,7 +404,7 @@ export function useComposerDraft({
       return false
     }
 
-    const nextDraft = insertInlineRefsIntoEditor(editor, refs)
+    const nextDraft = insertInlineRefsIntoEditor(editor, refs, { interactive: paneVisible })
 
     if (nextDraft === null) {
       return false
@@ -395,7 +412,10 @@ export function useComposerDraft({
 
     draftRef.current = nextDraft
     setComposerText(nextDraft)
-    requestMainFocus()
+
+    if (paneVisible) {
+      requestMainFocus()
+    }
 
     return true
   }

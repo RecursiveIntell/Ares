@@ -1,8 +1,7 @@
 """Singularity/Apptainer persistent container environment.
 
-Security-hardened with --containall, --no-home, capability dropping.
-Supports configurable resource limits and optional filesystem persistence
-via writable overlay directories that survive across sessions.
+Security-hardened with --containall, --no-home, capability dropping. Supports
+resource limits and optional persistence via writable overlay dirs that survive sessions.
 """
 
 import logging
@@ -19,11 +18,11 @@ from hermes_constants import get_hermes_home
 from tools.environments.base import (
     BaseEnvironment,
     _load_json_store,
-    _popen_bash,
     _save_json_store,
-    sanitize_task_id_for_path,
 )
+from tools.environments.base_output import _popen_bash
 from tools.environments.local import build_subprocess_env
+from tools.environments.path_utils import sanitize_task_id_for_path
 
 logger = logging.getLogger(__name__)
 
@@ -120,15 +119,13 @@ def _singularity_subprocess_env(
 
 def _find_singularity_executable() -> str:
     """Locate the apptainer or singularity CLI binary."""
-    if shutil.which("apptainer"):
-        return "apptainer"
-    if shutil.which("singularity"):
-        return "singularity"
+    for exe in ("apptainer", "singularity"):
+        if shutil.which(exe):
+            return exe
     raise RuntimeError(
         "Neither 'apptainer' nor 'singularity' was found in PATH. "
         "Install Apptainer (https://apptainer.org/docs/admin/main/installation.html) "
-        "or Singularity and ensure the CLI is available."
-    )
+        "or Singularity and ensure the CLI is available.")
 
 
 def _ensure_singularity_available(
@@ -148,12 +145,9 @@ def _ensure_singularity_available(
             stdin=subprocess.DEVNULL,
         )
     except FileNotFoundError:
-        raise RuntimeError(
-            f"Singularity backend selected but '{exe}' could not be executed."
-        )
+        raise RuntimeError(f"Singularity backend selected but '{exe}' could not be executed.")
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"'{exe} version' timed out.")
-
     if result.returncode != 0:
         stderr = result.stderr.strip()[:200]
         raise RuntimeError(f"'{exe} version' failed (exit code {result.returncode}): {stderr}")
@@ -172,34 +166,25 @@ def _save_snapshots(
 
 
 def _get_scratch_dir() -> Path:
+    """``TERMINAL_SCRATCH_DIR`` override, else a writable ``/scratch`` (HPC), else the sandbox dir."""
     custom_scratch = os.getenv("TERMINAL_SCRATCH_DIR")
     if custom_scratch:
         scratch_path = Path(custom_scratch)
-        scratch_path.mkdir(parents=True, exist_ok=True)
-        return scratch_path
-
-    from tools.environments.base import get_sandbox_dir
-    sandbox = get_sandbox_dir() / "singularity"
-
-    scratch = Path("/scratch")
-    if scratch.exists() and os.access(scratch, os.W_OK):
-        user_scratch = scratch / os.getenv("USER", "hermes") / "hermes-agent"
-        user_scratch.mkdir(parents=True, exist_ok=True)
-        logger.info("Using /scratch for sandboxes: %s", user_scratch)
-        return user_scratch
-
-    sandbox.mkdir(parents=True, exist_ok=True)
-    return sandbox
+    else:
+        from tools.environments.base import get_sandbox_dir
+        scratch_path = get_sandbox_dir() / "singularity"
+        scratch = Path("/scratch")
+        if scratch.exists() and os.access(scratch, os.W_OK):
+            scratch_path = scratch / os.getenv("USER", "hermes") / "hermes-agent"
+            scratch_path.mkdir(parents=True, exist_ok=True)
+            logger.info("Using /scratch for sandboxes: %s", scratch_path)
+    scratch_path.mkdir(parents=True, exist_ok=True)
+    return scratch_path
 
 
 def _get_apptainer_cache_dir() -> Path:
     cache_dir = os.getenv("APPTAINER_CACHEDIR")
-    if cache_dir:
-        cache_path = Path(cache_dir)
-        cache_path.mkdir(parents=True, exist_ok=True)
-        return cache_path
-    scratch = _get_scratch_dir()
-    cache_path = scratch / ".apptainer"
+    cache_path = Path(cache_dir) if cache_dir else _get_scratch_dir() / ".apptainer"
     cache_path.mkdir(parents=True, exist_ok=True)
     return cache_path
 
@@ -337,8 +322,7 @@ class SingularityEnvironment(BaseEnvironment):
     """Hardened Singularity/Apptainer container with resource limits and persistence.
 
     Spawn-per-call: every execute() spawns a fresh ``apptainer exec ... bash -c`` process.
-    Session snapshot preserves env vars across calls.
-    CWD persists via in-band stdout markers.
+    Session snapshot preserves env vars across calls; CWD persists via in-band stdout markers.
     """
 
     _profile_scoped_passthrough = True
@@ -453,7 +437,6 @@ class SingularityEnvironment(BaseEnvironment):
             cmd.extend(["--memory", f"{self._memory}M"])
         if self._cpu > 0:
             cmd.extend(["--cpus", str(self._cpu)])
-
         cmd.extend([str(self.image), self.instance_id])
 
         try:
@@ -471,9 +454,12 @@ class SingularityEnvironment(BaseEnvironment):
                         self.instance_id, self._persistent)
         except subprocess.TimeoutExpired:
             raise RuntimeError("Instance start timed out")
+        if result.returncode != 0:
+            raise RuntimeError(f"Failed to start instance: {result.stderr}")
+        self._instance_started = True
+        logger.info("Singularity instance %s started (persistent=%s)", self.instance_id, self._persistent)
 
-    def _run_bash(self, cmd_string: str, *, login: bool = False,
-                  timeout: int = 120,
+    def _run_bash(self, cmd_string: str, *, login: bool = False, timeout: int = 120,
                   stdin_data: str | None = None) -> subprocess.Popen:
         """Spawn a bash process inside the Singularity instance."""
         if not self._instance_started:

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Add a contributor email → GitHub login mapping.
 
-Writes one file per email under contributors/emails/ (filename = email,
-content = login). File additions never merge-conflict, unlike the legacy
-AUTHOR_MAP dict in scripts/release.py, which is frozen — do not append to it.
+Writes one file per portable email key under contributors/emails/ (normally
+filename = email, content = login). File additions never merge-conflict, unlike
+the legacy AUTHOR_MAP dict in scripts/release.py, which is frozen — do not
+append to it. If an existing filename differs only by case and maps to the same
+login, that file is reused because Windows/default macOS cannot represent both.
 
 Usage (from the repo root):
     python3 scripts/add_contributor.py <email> <github-login> [comment...]
@@ -55,6 +57,24 @@ def _legacy_login(email: str) -> str | None:
         return None
 
 
+def _case_collision(email: str) -> str | None:
+    """An existing mapping whose filename differs from `email` only in case.
+
+    Returns the colliding filename, or None. Exact matches are not collisions --
+    that is the ordinary "already mapped" path handled by the caller.
+    """
+    if not EMAILS_DIR.is_dir():
+        return None
+
+    # casefold (not lower) matches how macOS/Windows fold non-ASCII text —
+    # same key scripts/check-case-collisions.py uses repo-wide.
+    folded = email.casefold()
+    for entry in EMAILS_DIR.iterdir():
+        if entry.name != email and entry.name.casefold() == folded:
+            return entry.name
+    return None
+
+
 def add_contributor(email: str, login: str, comment: str = "") -> int:
     email = email.strip()
     login = login.strip().lstrip("@")
@@ -67,6 +87,33 @@ def add_contributor(email: str, login: str, comment: str = "") -> int:
         return 2
 
     path = EMAILS_DIR / email
+
+    # One file per portable key means the FILENAME is the key, and on a
+    # case-insensitive filesystem (Windows, default macOS) two emails differing
+    # only in case are the same file. If the existing case-fold alias maps to
+    # the same GitHub login, reuse it. A different or malformed mapping remains
+    # an explicit conflict and is never silently reassigned.
+    collision = _case_collision(email)
+    if collision is not None:
+        collision_path = EMAILS_DIR / collision
+        collision_login = read_mapping_file(collision_path)
+        if collision_login == login:
+            print(f"present (case-fold alias: contributors/emails/{collision})")
+            return 0
+        if collision_login is None:
+            print(
+                f"error: {email} collides with unreadable mapping {collision} on "
+                "case-insensitive filesystems — repair that mapping first",
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            f"error: {email} collides with {collision}, which maps to "
+            f"{collision_login!r} (asked for {login!r}) — resolve manually",
+            file=sys.stderr,
+        )
+        return 1
+
     existing = read_mapping_file(path) if path.is_file() else None
     if existing is None:
         existing = _legacy_login(email)

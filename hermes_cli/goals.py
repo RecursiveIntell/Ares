@@ -1,30 +1,9 @@
 """Persistent session goals — the Ralph loop for Hermes.
 
-A goal is a free-form user objective that stays active across turns. After
-each turn completes, a small judge call asks an auxiliary model "is this
-goal satisfied by the assistant's last response?". If not, Hermes feeds a
-continuation prompt back into the same session and keeps working until the
-goal is done, turn budget is exhausted, the user pauses/clears it, or the
-user sends a new message (which takes priority and pauses the goal loop).
-
-State is persisted in SessionDB's ``state_meta`` table keyed by
-``goal:<session_id>`` so ``/resume`` picks it up.
-
-Design notes / invariants:
-
-- The continuation prompt is just a normal user message appended to the
-  session via ``run_conversation``. No system-prompt mutation, no toolset
-  swap — prompt caching stays intact.
-- Judge failures are fail-OPEN: ``continue``. A broken judge must not wedge
-  progress; the turn budget is the backstop.
-- When a real user message arrives mid-loop it preempts the continuation
-  prompt and also pauses the goal loop for that turn (we still re-judge
-  after, so if the user's message happens to complete the goal the judge
-  will say ``done``).
-- This module has zero hard dependency on ``cli.HermesCLI`` or the gateway
-  runner — both wire the same ``GoalManager`` in.
-
-Nothing in this module touches the agent's system prompt or toolset.
+A goal is a free-form objective that stays active across turns; after each turn an auxiliary-model
+judge decides whether it is satisfied. The continuation prompt is a normal user message appended via
+``run_conversation`` (no system-prompt mutation or toolset swap — prompt caching stays intact). Judge
+failures are fail-OPEN (``continue``); the turn budget is the backstop.
 """
 
 from __future__ import annotations
@@ -43,12 +22,12 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+from hermes_cli._subprocess_compat import noninteractive_git_env
+
 logger = logging.getLogger(__name__)
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Constants & defaults
-# ──────────────────────────────────────────────────────────────────────
+# ── Constants & defaults ──────────────────────────────────────────────
 
 GOAL_COMPLETED = "GOAL_COMPLETED"
 GOAL_ACTIVE = "GOAL_ACTIVE"
@@ -71,43 +50,31 @@ _ALLOWED_OUTCOMES = {
 
 DEFAULT_MAX_TURNS = 20
 DEFAULT_JUDGE_TIMEOUT = 30.0
-# Judge output budget. The freeform judge returns a one-line JSON verdict, but
-# reasoning models (deepseek-v4, qwq, etc.) burn tokens on hidden reasoning
-# before emitting the visible JSON — and the first /goal turn's prompt is
-# larger than later turns, which pushes total reply length past tight caps.
-# 200 tokens (the original default) reliably truncated the JSON on reasoning
-# models, leaving '{"done": true, "reason": "The agent successfully' and
-# triggering the auto-pause. 4096 covers reasoning + verdict on every model
-# we've live-tested; override via auxiliary.goal_judge.max_tokens for
-# specifically constrained setups.
+# Judge output budget. Reasoning models burn hidden-reasoning tokens before the visible one-line
+# JSON verdict; 200 (the original) reliably truncated it and tripped the auto-pause. 4096 covers
+# every model live-tested; override via auxiliary.goal_judge.max_tokens.
 DEFAULT_JUDGE_MAX_TOKENS = 4096
 DEFAULT_GATE_TIMEOUT_SECONDS = 300
 DEFAULT_GATE_MAX_RETRIES = 3
 _GATE_OUTPUT_TAIL_CHARS = 3000
 # Cap how much of the last response + recent messages we send to the judge.
 _JUDGE_RESPONSE_SNIPPET_CHARS = 4000
-# After this many consecutive judge *parse* failures (empty output / non-JSON),
-# the loop auto-pauses and points the user at the goal_judge config. API /
-# transport errors do NOT count toward this — those are transient. This guards
-# against small models (e.g. deepseek-v4-flash) that cannot follow the strict
-# JSON reply contract; without it the loop runs until the turn budget is
-# exhausted with every reply shaped like `judge returned empty response` or
-# `judge reply was not JSON`.
+# Consecutive judge *parse* failures (empty / non-JSON) before the loop auto-pauses and points at
+# the goal_judge config. API/transport errors do NOT count — those are tracked separately below.
+# Guards against small models that cannot follow the strict JSON contract burning the whole budget.
 DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES = 3
-# Transport failures (API auth errors 401, timeouts, DNS, etc.) are also
-# tracked and auto-pause the loop after this many consecutive failures.
-# A broken/invalid API key returns 401 every call — the loop must not
-# run until the turn budget, wasting every turn on an unreachable judge.
+# Consecutive transport failures (401, timeout, DNS) before auto-pause: a broken API key returns
+# 401 every call and must not spend every turn on an unreachable judge.
 DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES = 5
 
-# Quality gates: deterministic shell commands that must pass before the goal
-# judge may declare the goal done. Defaults mirror the bounded-autonomy
-# pattern (per-gate retry limit + timeout, bounded output fed back to the
-# agent). A failed gate short-circuits the judge — its output IS the
-# continuation prompt, so the agent works on concrete evidence instead of a
-# vibe check.
+# Quality gates: deterministic shell commands that must pass before the judge may declare DONE. A
+# failed gate short-circuits the judge — its output IS the continuation prompt, so the agent works
+# on concrete evidence instead of a vibe check.
 DEFAULT_GATE_TIMEOUT_SECONDS = 300
 DEFAULT_GATE_MAX_RETRIES = 3
+# Longest a pid/session wait barrier may hold the loop before judging resumes. Timed barriers
+# (``waiting_until``) carry their own deadline and are exempt.
+_MAX_BARRIER_WAIT_S = 30 * 60
 # Bounded tail of a failed gate's combined stdout/stderr fed back to the agent.
 _GATE_OUTPUT_TAIL_CHARS = 3000
 
@@ -120,10 +87,8 @@ CONTINUATION_PROMPT_TEMPLATE = (
     "If you are blocked and need input from the user, say so clearly and stop."
 )
 
-# Used when the goal carries a structured completion contract. The contract
-# block tells the agent exactly what "done" means, how to prove it, what not
-# to break, what's in scope, and when to stop and ask — so it targets the
-# verification surface instead of declaring victory loosely.
+# With a completion contract: the block tells the agent what "done" means, how to prove it, what
+# not to break, scope, and when to stop — so it targets the verification surface.
 CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE = (
     "[Continuing toward your standing goal]\n"
     "Goal: {goal}\n\n"
@@ -137,9 +102,7 @@ CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE = (
     "user input, say so clearly and stop."
 )
 
-# Used when the user has added one or more /subgoal criteria. Surfaced
-# to the agent verbatim so it sees what to target on the next turn,
-# and surfaced to the judge so the verdict considers them too.
+# With /subgoal criteria: surfaced verbatim to the agent and to the judge.
 CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE = (
     "[Continuing toward your standing goal]\n"
     "Goal: {goal}\n\n"
@@ -152,9 +115,7 @@ CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE = (
     "and stop."
 )
 
-
-# Fed back when a quality gate fails: the gate's bounded output is the
-# evidence the agent must repair against. Deterministic — no judge involved.
+# Fed back when a quality gate fails: bounded output is the evidence to repair against (no judge).
 CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE = (
     "[Continuing toward your standing goal — a quality gate failed]\n"
     "Goal: {goal}\n\n"
@@ -171,17 +132,26 @@ CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE = (
     "gate itself is wrong or cannot pass, say so clearly and stop."
 )
 
-
 JUDGE_SYSTEM_PROMPT = (
     "You are a strict judge evaluating whether an autonomous agent has "
     "achieved a user's stated goal. You receive the goal text, the agent's "
     "most recent response, and — when present — a list of background "
-    "processes the agent has running. Decide one of three verdicts.\n\n"
+    "processes the agent has running. Decide one of four verdicts.\n\n"
     "DONE — the goal is fully satisfied:\n"
     "- The response explicitly confirms the goal was completed, OR\n"
-    "- The response clearly shows the final deliverable was produced, OR\n"
-    "- The response explains the goal is unachievable / blocked / needs "
-    "user input (treat this as DONE with reason describing the block).\n\n"
+    "- The response clearly shows the final deliverable was produced.\n"
+    "DONE requires the deliverable to actually exist. If the response only "
+    "explains why the goal cannot be reached, the verdict is BLOCKED, not "
+    "DONE.\n\n"
+    "BLOCKED — the goal cannot be satisfied as stated:\n"
+    "- The response explains the goal is genuinely unachievable (impossible, "
+    "out of scope, no valid path to the deliverable), or refuses to "
+    "fabricate a deliverable that cannot exist, OR\n"
+    "- The response explains progress is blocked and the next step needs "
+    "user input to proceed.\n"
+    "Return BLOCKED with the reason describing what is blocking. BLOCKED is "
+    "a refusal, not a completion — never return BLOCKED for a goal that "
+    "was achieved.\n\n"
     "WAIT — the goal is NOT done, but the next step is to wait for async "
     "work to finish rather than act again. Choose this ONLY when the agent's "
     "progress is genuinely gated on something running on its own:\n"
@@ -194,6 +164,11 @@ JUDGE_SYSTEM_PROMPT = (
     "``wait_on_pid`` (releases on exit only).\n"
     "- The agent says it is rate-limited / backing off / must wait a fixed "
     "period — return seconds in ``wait_for_seconds``.\n"
+    "- The agent has delegated subagents still running (stated below as "
+    "active delegations) and the response says it is waiting on them with "
+    "nothing else dispatchable — return ``wait_for_seconds`` between 600 and "
+    "1800. Their results wake the agent on their own; re-poking it now only "
+    "produces a status recap.\n"
     "Picking WAIT parks the loop without burning a turn; it resumes "
     "automatically when the pid exits or the time elapses. Do NOT pick WAIT "
     "just because work remains — only when re-poking now would be pure "
@@ -203,6 +178,7 @@ JUDGE_SYSTEM_PROMPT = (
     "take right now. This is the default when in doubt.\n\n"
     "Reply ONLY with a single JSON object on one line. Shapes:\n"
     '{"verdict": "done", "reason": "<one sentence>"}\n'
+    '{"verdict": "blocked", "reason": "<one sentence>"}\n'
     '{"verdict": "continue", "reason": "<one sentence>"}\n'
     '{"verdict": "wait", "wait_on_session": "<id>", "reason": "<one sentence>"}\n'
     '{"verdict": "wait", "wait_on_pid": <int>, "reason": "<one sentence>"}\n'
@@ -211,26 +187,27 @@ JUDGE_SYSTEM_PROMPT = (
     "accepted (true=done, false=continue)."
 )
 
+# Judge prompt line for live delegated subagents (WAIT-for-seconds vs CONTINUE).
+JUDGE_DELEGATIONS_BLOCK_TEMPLATE = (
+    "Active delegations: the agent has {count} delegated subagent batch(es) still running; "
+    "their results are delivered to it automatically when they finish.\n\n"
+)
 
-# Rendered into the judge prompt when the agent has background processes
-# running. Gives the judge the context it needs to decide WAIT vs CONTINUE
-# (and which pid to wait on) without it having to probe anything itself.
+# Judge prompt block listing running background processes (WAIT vs CONTINUE, which pid).
 JUDGE_BACKGROUND_BLOCK_TEMPLATE = (
     "Background processes the agent currently has running (it may be waiting "
     "on one of these):\n{background_lines}\n\n"
 )
-
 
 JUDGE_USER_PROMPT_TEMPLATE = (
     "Goal:\n{goal}\n\n"
     "Agent's most recent response:\n{response}\n\n"
     "{background_block}"
     "Current time: {current_time}\n\n"
-    "Is the goal satisfied — done, continue, or wait?"
+    "Is the goal satisfied — done, blocked, continue, or wait?"
 )
 
-# Used when the user has added /subgoal criteria. The judge must
-# evaluate ALL of them being met, not just the original goal.
+# With /subgoal criteria: the judge must see ALL of them met, not just the original goal.
 JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE = (
     "Goal:\n{goal}\n\n"
     "Additional criteria the user added mid-loop (all must also be "
@@ -249,10 +226,7 @@ JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE = (
     "Is the goal AND every additional criterion satisfied?"
 )
 
-
-# Used when the goal carries a structured completion contract. The judge
-# decides DONE strictly against the Verification criterion and refuses to
-# accept completion when a constraint was violated.
+# With a contract: DONE strictly against the Verification criterion; a violated constraint refuses.
 JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE = (
     "Goal:\n{goal}\n\n"
     "Completion contract (the authoritative definition of done):\n"
@@ -275,13 +249,10 @@ JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE = (
     "an actual running process/session or bounded delay. The controller persists "
     "the resulting paused/blocked state; never promote a technical block to DONE.\n"
     "- Otherwise the goal is NOT done — CONTINUE.\n\n"
-    "Is the goal satisfied per its completion contract — done, continue, or wait?"
+    "Is the goal satisfied per its completion contract — done, blocked, continue, or wait?"
 )
 
-
-# System prompt for /goal draft — turns a plain-language objective into a
-# structured completion contract the user can review before activating.
-# Adapted from Codex's "let Codex draft the goal" guidance.
+# /goal draft: turn a plain objective into a reviewable contract (after Codex's "draft the goal").
 DRAFT_CONTRACT_SYSTEM_PROMPT = (
     "You turn a user's plain-language objective into a structured completion "
     "contract for an autonomous coding agent. The contract has five fields:\n"
@@ -303,69 +274,35 @@ DRAFT_CONTRACT_SYSTEM_PROMPT = (
 )
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Completion contract
-# ──────────────────────────────────────────────────────────────────────
+# ── Completion contract ───────────────────────────────────────────────
 
-# The five contract fields, in display order. Adapted from OpenAI Codex's
-# "strong goal" guidance: a durable objective works best when it names what
-# "done" means, how to prove it, what must not regress, what tools/paths are
-# in bounds, and when to stop and ask. A bare free-form goal (no contract)
-# stays fully supported — every field defaults empty and is simply omitted
-# from the prompts when unset.
+# The five contract fields, in display order (after OpenAI Codex's "strong goal" guidance: what
+# "done" means, how to prove it, what must not regress, what is in bounds, when to stop and ask).
+# A bare free-form goal stays fully supported — empty fields are omitted from every prompt.
 _CONTRACT_FIELDS = ("outcome", "verification", "constraints", "boundaries", "stop_when")
 
-# Human labels for rendering and for the inline `field: value` parser.
 _CONTRACT_LABELS = {
-    "outcome": "Outcome",
-    "verification": "Verification",
-    "constraints": "Constraints",
-    "boundaries": "Boundaries",
-    "stop_when": "Stop when blocked",
+    "outcome": "Outcome", "verification": "Verification", "constraints": "Constraints",
+    "boundaries": "Boundaries", "stop_when": "Stop when blocked",
 }
 
-# Inline-input aliases the user may type before a value, mapped to the
-# canonical field name. e.g. `verify: tests pass` or `done when: ...`.
+# Inline-input aliases the user may type before a value (`verify: tests pass`, `done when: ...`).
 _CONTRACT_ALIASES = {
-    "outcome": "outcome",
-    "goal": "outcome",
-    "done": "outcome",
-    "done when": "outcome",
-    "verification": "verification",
-    "verify": "verification",
-    "verified by": "verification",
-    "evidence": "verification",
-    "proof": "verification",
-    "constraints": "constraints",
-    "constraint": "constraints",
-    "preserve": "constraints",
-    "must not": "constraints",
-    "do not change": "constraints",
-    "boundaries": "boundaries",
-    "boundary": "boundaries",
-    "scope": "boundaries",
-    "allowed": "boundaries",
-    "files": "boundaries",
-    "stop when": "stop_when",
-    "stop_when": "stop_when",
-    "blocked": "stop_when",
-    "stop if blocked": "stop_when",
-    "give up when": "stop_when",
+    "outcome": "outcome", "goal": "outcome", "done": "outcome", "done when": "outcome",
+    "verification": "verification", "verify": "verification", "verified by": "verification",
+    "evidence": "verification", "proof": "verification",
+    "constraints": "constraints", "constraint": "constraints", "preserve": "constraints",
+    "must not": "constraints", "do not change": "constraints",
+    "boundaries": "boundaries", "boundary": "boundaries", "scope": "boundaries",
+    "allowed": "boundaries", "files": "boundaries",
+    "stop when": "stop_when", "stop_when": "stop_when", "blocked": "stop_when",
+    "stop if blocked": "stop_when", "give up when": "stop_when",
 }
 
 
 @dataclass
 class GoalContract:
-    """Optional structured completion contract for a goal.
-
-    Each field is free-form prose the user (or :func:`draft_contract`)
-    supplies. Empty fields are omitted everywhere — a goal with no contract
-    behaves exactly like the original free-form goal. The contract is woven
-    into both the continuation prompt (so the agent targets the verification
-    surface and respects constraints) and the judge prompt (so "done" is
-    decided against evidence, not vibes).
-    """
-
+    """Optional structured completion contract; empty fields are omitted everywhere."""
     outcome: str = ""
     verification: str = ""
     constraints: str = ""
@@ -385,94 +322,55 @@ class GoalContract:
         return cls(**{f: str(data.get(f) or "").strip() for f in _CONTRACT_FIELDS})
 
     def render_block(self) -> str:
-        """Render non-empty contract fields as a labelled block. Empty
-        contract → empty string (callers skip the section entirely)."""
-        lines = []
-        for f in _CONTRACT_FIELDS:
-            val = getattr(self, f).strip()
-            if val:
-                lines.append(f"- {_CONTRACT_LABELS[f]}: {val}")
-        return "\n".join(lines)
+        """Non-empty fields as a labelled block; empty contract → empty string."""
+        return "\n".join(f"- {_CONTRACT_LABELS[f]}: {getattr(self, f).strip()}" for f in _CONTRACT_FIELDS if getattr(self, f).strip())
 
 
 def parse_contract(text: str) -> Tuple[str, GoalContract]:
-    """Split user-typed goal text into a headline + structured contract.
+    """Split user-typed goal text into a headline + contract from inline ``field: value`` lines.
 
-    Supports inline ``field: value`` lines so power users can type a full
-    contract in one shot, e.g.::
-
-        Migrate auth to JWT
-        verify: the auth test suite passes
-        constraints: keep the public /login response shape unchanged
-        boundaries: only touch services/auth and its tests
-        stop when: a schema change needs product sign-off
-
-    The first non-field line(s) become the goal headline; recognized
-    ``field:`` lines populate the contract. Lines for the same field are
-    joined. Unrecognized prefixes stay part of the headline, so a plain
-    free-form goal with an incidental colon (``Fix bug: the parser``)
-    is NOT mangled — only lines whose prefix matches a known alias are
-    pulled out. Returns ``(headline, contract)``.
+    A headline without an explicit ``outcome:`` IS the outcome — it is not duplicated into the
+    contract block (the goal text already carries it), so outcome stays empty in that case.
     """
     if not text:
         return "", GoalContract()
-
     headline_parts: List[str] = []
     fields: Dict[str, List[str]] = {f: [] for f in _CONTRACT_FIELDS}
-
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line:
             continue
-        matched = False
         if ":" in line:
             prefix, _, value = line.partition(":")
             key = _CONTRACT_ALIASES.get(prefix.strip().lower())
             if key is not None and value.strip():
                 fields[key].append(value.strip())
-                matched = True
-        if not matched:
-            headline_parts.append(line)
-
-    headline = " ".join(headline_parts).strip()
-    contract = GoalContract(
-        **{f: " ".join(v).strip() for f, v in fields.items()}
-    )
-    # If a headline was given but no explicit `outcome:` field, the headline
-    # IS the outcome — don't duplicate it into the contract block (the goal
-    # text already carries it), so leave outcome empty in that case.
-    return headline, contract
+                continue
+        headline_parts.append(line)
+    contract = GoalContract(**{f: " ".join(v).strip() for f, v in fields.items()})
+    return " ".join(headline_parts).strip(), contract
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Quality gates
-# ──────────────────────────────────────────────────────────────────────
+def _render_extra_criteria(subgoals: List[str]) -> str:
+    return "\n".join(f"- Extra criterion {i}: {text}" for i, text in enumerate(subgoals, start=1))
 
+
+# ── Quality gates ─────────────────────────────────────────────────────
 
 @dataclass
 class GoalGate:
     """A deterministic shell command that must pass before a goal can be done.
 
-    Gates run at turn boundary BEFORE the LLM judge. A failing gate
-    short-circuits judging entirely: its bounded output becomes the
-    continuation prompt, so the agent iterates against concrete evidence.
-    Only when every gate passes does the judge get to decide DONE.
-
-    ``attempts`` counts failed runs; when it exceeds ``max_retries`` the goal
-    auto-pauses (mirrors the turn-budget pause) instead of spinning. A gate
-    that failed on an unchanged workspace is not re-run — the recorded
-    failure is replayed and the attempt count advances, so a stuck agent
-    can't burn wall-clock re-running the same red suite.
+    Gates run at turn boundary BEFORE the LLM judge; a failing gate short-circuits judging and its
+    bounded output becomes the continuation prompt.
     """
-
     command: str
     timeout_seconds: int = DEFAULT_GATE_TIMEOUT_SECONDS
     max_retries: int = DEFAULT_GATE_MAX_RETRIES
     attempts: int = 0
     last_exit_code: Optional[int] = None
     last_output_tail: str = ""
-    # Workspace fingerprint at the time of the last FAILED run — used to skip
-    # re-running an identical gate when nothing changed since it failed.
+    # Workspace fingerprint at the last FAILED run — skips re-running an identical gate unchanged.
     last_failed_fingerprint: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
@@ -484,9 +382,9 @@ class GoalGate:
             return cls(command="")
         return cls(
             command=str(data.get("command") or ""),
-            timeout_seconds=int(data.get("timeout_seconds", DEFAULT_GATE_TIMEOUT_SECONDS) or DEFAULT_GATE_TIMEOUT_SECONDS),
-            max_retries=int(data.get("max_retries", DEFAULT_GATE_MAX_RETRIES) or DEFAULT_GATE_MAX_RETRIES),
-            attempts=int(data.get("attempts", 0) or 0),
+            timeout_seconds=int(data.get("timeout_seconds") or DEFAULT_GATE_TIMEOUT_SECONDS),
+            max_retries=int(data.get("max_retries") or DEFAULT_GATE_MAX_RETRIES),
+            attempts=int(data.get("attempts") or 0),
             last_exit_code=(int(data["last_exit_code"]) if data.get("last_exit_code") is not None else None),
             last_output_tail=str(data.get("last_output_tail") or ""),
             last_failed_fingerprint=str(data.get("last_failed_fingerprint") or ""),
@@ -494,83 +392,53 @@ class GoalGate:
 
 
 def workspace_fingerprint(cwd: Optional[str] = None) -> str:
-    """Cheap workspace change fingerprint for unchanged-gate skip.
-
-    Uses ``git status --porcelain`` + ``git rev-parse HEAD`` when inside a git
-    repo (covers tracked edits, stages, and commits). Outside git, returns
-    an empty string — an empty fingerprint never matches, so gates simply
-    always re-run (safe fallback, no behavior regression for non-repo work).
-    """
+    """sha256 of ``git rev-parse HEAD`` + ``git status --porcelain``; "" outside git (never matches,
+    so gates always re-run — a safe fallback)."""
     workdir = cwd or os.getcwd()
     try:
-        head = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=10, cwd=workdir,
-        )
-        if head.returncode != 0:
-            return ""
-        status = subprocess.run(
-            ["git", "status", "--porcelain"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=30, cwd=workdir,
-        )
-        if status.returncode != 0:
-            return ""
-        blob = head.stdout.strip() + "\n" + status.stdout
+        outputs = []
+        for argv, timeout in (
+            (["git", "rev-parse", "HEAD"], 10),
+            (["git", "status", "--porcelain"], 30),
+        ):
+            proc = subprocess.run(
+                argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=timeout, cwd=workdir, stdin=subprocess.DEVNULL, env=noninteractive_git_env(),
+            )
+            if proc.returncode != 0:
+                return ""
+            outputs.append(proc.stdout)
+        blob = outputs[0].strip() + "\n" + outputs[1]
         return hashlib.sha256(blob.encode("utf-8", "replace")).hexdigest()
     except Exception:
         return ""
 
 
 def run_gate(gate: GoalGate, *, cwd: Optional[str] = None) -> Tuple[bool, int, str]:
-    """Run one gate command. Returns ``(passed, exit_code, output_tail)``.
-
-    The command runs through the shell in ``cwd`` (default: process cwd) with
-    a hard timeout; on timeout the process is killed and treated as failed
-    with exit code -1. Output is the combined stdout+stderr tail, bounded to
-    ``_GATE_OUTPUT_TAIL_CHARS``.
-    """
+    """Run one gate through the shell. Returns ``(passed, exit_code, output_tail)``; a timeout kills
+    the process and counts as exit code -1."""
     try:
+        # utf-8/replace: operator-configured output is arbitrary bytes; strict codepage decoding of
+        # one unmappable byte (emoji/CJK on a non-UTF-8 Windows console) kills the reader thread and
+        # the tail the agent needs arrives empty.
         proc = subprocess.run(
-            gate.command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            # A gate runs whatever the operator configured, so its output is
-            # arbitrary bytes. The default text mode decodes with the process
-            # codepage under errors="strict": one byte the codepage can't map
-            # (emoji or CJK from a test runner on a non-UTF-8 Windows console,
-            # or stray binary) kills the reader thread, leaves stdout as None,
-            # and the tail the agent needs to fix the failure arrives empty.
-            encoding="utf-8",
-            errors="replace",
-            timeout=max(1, int(gate.timeout_seconds)),
-            cwd=cwd or None,
+            gate.command, shell=True, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=max(1, int(gate.timeout_seconds)), cwd=cwd or None,
         )
         combined = (proc.stdout or "") + (("\n" + proc.stderr) if proc.stderr else "")
-        tail = combined[-_GATE_OUTPUT_TAIL_CHARS:]
-        return proc.returncode == 0, proc.returncode, tail
+        return proc.returncode == 0, proc.returncode, combined[-_GATE_OUTPUT_TAIL_CHARS:]
     except subprocess.TimeoutExpired as exc:
-        out = ""
-        for chunk in (exc.stdout, exc.stderr):
-            if chunk:
-                out += chunk if isinstance(chunk, str) else chunk.decode("utf-8", "replace")
-        tail = (out + f"\n[gate timed out after {gate.timeout_seconds}s]")[-_GATE_OUTPUT_TAIL_CHARS:]
-        return False, -1, tail
+        out = "".join(c if isinstance(c, str) else c.decode("utf-8", "replace") for c in (exc.stdout, exc.stderr) if c)
+        return False, -1, (out + f"\n[gate timed out after {gate.timeout_seconds}s]")[-_GATE_OUTPUT_TAIL_CHARS:]
     except Exception as exc:
         return False, -1, f"[gate could not run: {type(exc).__name__}: {exc}]"
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Dataclass
-# ──────────────────────────────────────────────────────────────────────
-
+# ── Goal state ────────────────────────────────────────────────────────
 
 @dataclass
 class GoalState:
     """Serializable goal state stored per session."""
-
     goal: str
     goal_id: str = ""
     status: str = "active"          # projection: active | paused | done | cleared
@@ -589,47 +457,29 @@ class GoalState:
     max_turns: int = DEFAULT_MAX_TURNS
     created_at: float = 0.0
     last_turn_at: float = 0.0
-    last_verdict: Optional[str] = None        # "done" | "continue" | "skipped"
+    last_verdict: Optional[str] = None        # "done" | "blocked" | "continue" | "wait" | "skipped"
     last_reason: Optional[str] = None
     paused_reason: Optional[str] = None       # why we auto-paused (budget, etc.)
     consecutive_parse_failures: int = 0       # judge-output parse failures in a row
-    # Transport failures are API/auth/network errors.  Broken API keys return
-    # 401 every call — track them separately so the loop auto-pauses instead
-    # of burning every turn budget slot on an unreachable judge.
+    # Tracked separately from parse failures: a broken API key returns 401 every call and must
+    # auto-pause instead of burning the budget on an unreachable judge.
     consecutive_transport_failures: int = 0   # judge API/transport errors in a row
-    # User-added criteria appended mid-loop via the /subgoal command.
-    # When non-empty the judge prompt and continuation prompt both
-    # include them so the agent works toward them and the judge factors
-    # them into the verdict. Backwards-compatible: defaults to empty so
-    # old state_meta rows load unchanged.
+    # User-added criteria (/subgoal). Both the judge and continuation prompts include them.
     subgoals: List[str] = field(default_factory=list)
-    # Wait barrier: when the agent is blocked on long-running async work
-    # (CI poller, build, test run, deploy, rate-limit cooldown) the goal loop
-    # PARKS instead of being re-poked every turn into busy-work. Two barrier
-    # kinds, set automatically by the judge (which now sees the live
-    # background-process list and can return a ``wait`` verdict) or manually
-    # via ``/goal wait``:
-    #   • ``waiting_on_pid`` — park until that process exits.
-    #   • ``waiting_on_session`` — park until that process_registry session's
-    #     OWN trigger fires: it exits, OR (if it has watch_patterns) its
-    #     pattern matches. Covers long-lived watchers/servers that signal
-    #     mid-run via a trigger and may never exit. Preferred over raw pid
-    #     when the agent set up a watch_patterns/notify_on_complete process.
-    #   • ``waiting_until``  — park until this wall-clock epoch (time backoff).
-    # While ANY is active, ``evaluate_after_turn`` short-circuits to
-    # should_continue=False without burning a turn or calling the judge. The
-    # barrier auto-clears when the pid exits / the trigger fires / the deadline
-    # passes, then the next turn resumes normal judging. Cleared by that,
-    # ``/goal unwait``, pause, resume, or clear. Backwards-compatible: old
-    # state_meta rows load with no barrier.
+    # Wait barrier (judge ``wait`` verdict or ``/goal wait``): parks the loop instead of re-poking the
+    # agent into busy-work. pid → until exit; session → until that process_registry session's OWN
+    # trigger fires (exit OR watch_patterns match — preferred for watchers that signal mid-run);
+    # until → wall-clock deadline. While ANY is active evaluate_after_turn returns
+    # should_continue=False without burning a turn; cleared lazily when satisfied or by unwait/pause/
+    # resume/clear. Defaults empty so old state_meta rows load unchanged.
     waiting_on_pid: Optional[int] = None
     waiting_on_session: Optional[str] = None
     waiting_until: float = 0.0
+    # Live delegation batches when a timed WAIT was set because of them; the barrier lifts as soon
+    # as that count drops (a batch returned), not only when the timer runs out.
+    waiting_on_delegations: int = 0
     waiting_reason: Optional[str] = None
     waiting_since: float = 0.0
-    # Optional structured completion contract (outcome / verification /
-    # constraints / boundaries / stop_when). Empty by default; a goal with
-    # no contract behaves exactly like the original free-form goal.
     contract: GoalContract = field(default_factory=GoalContract)
     # Quality gates (/goal gate add <cmd>): deterministic shell commands that
     # must ALL pass before the judge may declare the goal done.
@@ -654,9 +504,7 @@ class GoalState:
             self.outcome = GOAL_COMPLETED if self.status == "done" else GOAL_PAUSED if self.status == "paused" else GOAL_ACTIVE
 
     def to_json(self) -> str:
-        data = asdict(self)
-        # asdict already recursed GoalContract into a plain dict.
-        return json.dumps(data, ensure_ascii=False)
+        return json.dumps(asdict(self), ensure_ascii=False)
 
     @classmethod
     def from_json(cls, raw: str) -> "GoalState":
@@ -701,18 +549,13 @@ class GoalState:
             last_verdict=data.get("last_verdict"),
             last_reason=data.get("last_reason"),
             paused_reason=data.get("paused_reason"),
-            consecutive_parse_failures=int(data.get("consecutive_parse_failures", 0) or 0),
-            consecutive_transport_failures=int(data.get("consecutive_transport_failures", 0) or 0),
-            subgoals=subgoals,
+            subgoals=[str(s).strip() for s in raw_subgoals if str(s).strip()] if isinstance(raw_subgoals, list) else [],
             waiting_on_pid=(int(data["waiting_on_pid"]) if data.get("waiting_on_pid") else None),
             waiting_on_session=(str(data["waiting_on_session"]) if data.get("waiting_on_session") else None),
-            waiting_until=float(data.get("waiting_until", 0.0) or 0.0),
             waiting_reason=data.get("waiting_reason"),
-            waiting_since=float(data.get("waiting_since", 0.0) or 0.0),
             contract=GoalContract.from_dict(data.get("contract")),
             gates=[
-                GoalGate.from_dict(g)
-                for g in (data.get("gates") or [])
+                GoalGate.from_dict(g) for g in (data.get("gates") or [])
                 if isinstance(g, dict) and str(g.get("command") or "").strip()
             ],
             collaboration_contract_refs=sorted({
@@ -726,25 +569,23 @@ class GoalState:
             migration=migration,
         )
 
-    # --- contract helpers -------------------------------------------------
-
     def has_contract(self) -> bool:
         return self.contract is not None and not self.contract.is_empty()
 
-    # --- subgoals helpers -------------------------------------------------
-
     def render_subgoals_block(self) -> str:
-        """Render the subgoals as a numbered ``- N. text`` block. Empty
-        when no subgoals exist."""
-        if not self.subgoals:
-            return ""
+        """Numbered ``- N. text`` block; empty when there are no subgoals."""
         return "\n".join(f"- {i}. {text}" for i, text in enumerate(self.subgoals, start=1))
 
+    def clear_wait(self) -> None:
+        self.waiting_on_pid = None
+        self.waiting_on_session = None
+        self.waiting_until = 0.0
+        self.waiting_on_delegations = 0
+        self.waiting_reason = None
+        self.waiting_since = 0.0
 
-# ──────────────────────────────────────────────────────────────────────
-# Persistence (SessionDB state_meta)
-# ──────────────────────────────────────────────────────────────────────
 
+# ── Persistence (SessionDB state_meta) ────────────────────────────────
 
 def _meta_key(session_id: str) -> str:
     return f"goal:{session_id}"
@@ -823,34 +664,22 @@ def _flush_deferred_goal_writes(home: str, db: Any) -> None:
 # probe window.
 _DB_BOOTSTRAP_LOOP_WAIT_S = 0.25
 
-# The call that STARTS the bootstrap (cold cache, nothing in flight)
-# waits this long instead of the short window above. A fresh state.db
-# init measures ~300ms warm on a fast machine: schema DDL, FTS table
-# creation, and the first hermes_cli.config import (journal-mode
-# resolution). It is longer on a slow CI box, and it is well past 0.25s.
-# The old window dropped the first /goal write. The response said
-# "Goal set" but nothing persisted. The longer window is a bounded
-# one-time stall. Only the kick call pays it. Every later call keeps
-# the short window, so a contended migration never stalls the loop
-# repeatedly.
+# The call that STARTS the bootstrap (cold cache) waits this long instead. A fresh state.db init
+# (schema DDL, FTS tables, first hermes_cli.config import) measures ~300ms warm and more on slow
+# CI — well past 0.25s, which used to drop the first /goal write ("Goal set" but nothing
+# persisted). Only the kick call pays this one-time stall; later calls keep the short window.
 _DB_BOOTSTRAP_INIT_WAIT_S = 1.5
 
 
 def _bootstrap_session_db(home: str, done: threading.Event) -> None:
     """Construct SessionDB off-loop and populate the cache (worker thread)."""
     try:
-        from hermes_constants import (
-            reset_hermes_home_override,
-            set_hermes_home_override,
-        )
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
         from hermes_state import SessionDB
 
-        # Bind the caller's home for this thread. The cache key is the
-        # caller's scoped home, so the constructed SessionDB must point at
-        # that home's state.db too. Without the override, a multiplexed
-        # worker thread resolves the process env (the default profile's
-        # HERMES_HOME). It then caches the wrong profile's DB under this
-        # profile's key.
+        # Bind the caller's home for this thread: the cache key is the caller's scoped home, and
+        # without the override a multiplexed worker thread would resolve the process env (default
+        # profile) and cache the wrong profile's DB under this profile's key.
         token = set_hermes_home_override(home)
         try:
             db = SessionDB()
@@ -872,26 +701,11 @@ def _bootstrap_session_db(home: str, done: threading.Event) -> None:
 
 
 def _get_session_db() -> Optional[Any]:
-    """Return a SessionDB instance for the current HERMES_HOME.
+    """Cached SessionDB per HERMES_HOME (profile switches pick the right DB); None on any failure.
 
-    SessionDB has no built-in singleton, but opening a new connection per
-    /goal call would thrash the file. We cache one instance per
-    ``hermes_home`` path so profile switches still pick up the right DB.
-    Defensive against import/instantiation failures so tests and
-    non-standard launchers can still use the GoalManager.
-
-    Never constructs SessionDB on an event-loop thread. ``SessionDB.__init__``
-    runs schema init, and a migration against a contended state.db blocks for
-    seconds — on the gateway's loop thread that starves the loop-liveness
-    watchdog, which hard-exits the process (exit 75) and crash-loops the
-    gateway (enterprise field report, 2026-08-14). On a cache miss with a running
-    loop we kick a one-shot background bootstrap and wait a bounded grace
-    window for it. The kick call waits the one-time init window
-    (``_DB_BOOTSTRAP_INIT_WAIT_S``), so a healthy cold init completes and
-    the first write is not dropped. Later calls wait only the short window
-    (``_DB_BOOTSTRAP_LOOP_WAIT_S``). On timeout we return None. Every
-    caller degrades gracefully on None, and a later call returns the
-    cached instance.
+    Never constructs SessionDB on an event-loop thread: a cache miss there kicks a one-shot background
+    bootstrap and waits a bounded grace window (the kick call waits ``_DB_BOOTSTRAP_INIT_WAIT_S`` so a
+    healthy cold init completes and the first write isn't dropped).
     """
     try:
         from hermes_constants import get_hermes_home
@@ -915,34 +729,16 @@ def _get_session_db() -> Optional[Any]:
 
     if on_loop_thread:
         with _DB_BOOTSTRAP_LOCK:
-            # Re-check under the lock: a bootstrap may have finished between
-            # the unlocked read above and here.
+            # Re-check under the lock: a bootstrap may have finished since the unlocked read.
             cached = _DB_CACHE.get(home)
             if cached is not None:
                 return cached
             done = _DB_BOOTSTRAP_INFLIGHT.get(home)
+            wait = _DB_BOOTSTRAP_LOOP_WAIT_S   # already running: brief grace window only
             if done is None:
-                done = threading.Event()
-                _DB_BOOTSTRAP_INFLIGHT[home] = done
-                threading.Thread(
-                    target=_bootstrap_session_db,
-                    args=(home, done),
-                    name="goals-sessiondb-bootstrap",
-                    daemon=True,
-                ).start()
-                # This call starts the bootstrap, so it pays the one-time
-                # init cost. Wait long enough for a healthy cold init
-                # (~300ms warm, more on slow CI) to finish. This keeps the
-                # first goal/heartbeat write from being silently dropped.
-                wait = _DB_BOOTSTRAP_INIT_WAIT_S
-            else:
-                # Bootstrap already running: brief grace window only. A
-                # healthy init usually finishes in tens of ms, so this
-                # still picks the cached instance up. A contended init
-                # (the crash-loop scenario) exceeds the window and we
-                # degrade to None. The stall is bounded, far below the
-                # watchdog's probe timeout.
-                wait = _DB_BOOTSTRAP_LOOP_WAIT_S
+                done = _DB_BOOTSTRAP_INFLIGHT[home] = threading.Event()
+                threading.Thread(target=_bootstrap_session_db, args=(home, done), name="goals-sessiondb-bootstrap", daemon=True).start()
+                wait = _DB_BOOTSTRAP_INIT_WAIT_S   # kick call pays the one-time init cost
         done.wait(wait)
         cached = _DB_CACHE.get(home)
         if cached is not None:
@@ -957,8 +753,7 @@ def _get_session_db() -> Optional[Any]:
     with _DB_BOOTSTRAP_LOCK:
         existing = _DB_CACHE.get(home)
         if existing is not None:
-            # A concurrent bootstrap won the race; keep one instance and
-            # close ours so connections don't leak.
+            # A concurrent bootstrap won the race; close ours so connections don't leak.
             try:
                 db.close()
             except Exception:
@@ -971,18 +766,12 @@ def _get_session_db() -> Optional[Any]:
 
 
 def _warn_dropped_write(manager: str, kind: str, session_id: str) -> None:
-    """Log a dropped state write at WARNING.
-
-    The reply already told the user that the state was set. A silent
-    drop makes that reply a lie. One shared message keeps the goal,
-    loop, and heartbeat logs greppable as one bug class.
-    """
+    """WARN on a dropped state write — the reply already told the user the state was set. One shared
+    message keeps goal, loop and heartbeat logs greppable as one bug class."""
     logger.warning(
         "%s: %s for %s not persisted — session DB unavailable "
         "(bootstrap window exceeded, in-memory state still active)",
-        manager,
-        kind,
-        session_id,
+        manager, kind, session_id,
     )
 
 
@@ -1072,19 +861,14 @@ def clear_goal(session_id: str) -> bool:
 
 
 def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason: str = "") -> bool:
-    """Carry a persistent /goal from a parent session to its continuation.
+    """Carry a persistent /goal from a parent session to its continuation. Best-effort, never raises
+    (a failure here must not block compression). Returns True when a goal was migrated.
 
-    Context compression rotates ``session_id`` to a fresh child session,
-    but ``load_goal`` does a flat ``goal:<session_id>`` lookup with no
-    parent-lineage walk — so an active goal silently dies at the
-    compaction boundary (#33618). Copy the goal onto the new session and
-    archive the old row as ``cleared`` so exactly one active goal row
-    exists per logical conversation (avoids the "two active goals"
-    hazard of a pure copy).
-
-    Returns True when a goal was migrated, False when there was nothing
-    to migrate or the DB was unavailable. Best-effort and never raises —
-    a failure here must not block compression.
+    Context compression rotates ``session_id`` to a fresh child session, but ``load_goal`` does a flat
+    ``goal:<session_id>`` lookup with no parent-lineage walk — so an active goal silently dies at the
+    compaction boundary (#33618). Copy the goal onto the new session and archive the old row as ``cleared``
+    so exactly one active goal row exists per logical conversation (avoids the "two active goals" hazard of
+    a pure copy).
     """
     if not old_session_id or not new_session_id or old_session_id == new_session_id:
         return False
@@ -1143,30 +927,18 @@ def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason:
         return False
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Judge
-# ──────────────────────────────────────────────────────────────────────
-
+# ── Judge ─────────────────────────────────────────────────────────────
 
 def _truncate(text: str, limit: int) -> str:
     if not text:
         return ""
-    if len(text) <= limit:
-        return text
-    return text[:limit] + "… [truncated]"
+    return text if len(text) <= limit else text[:limit] + "… [truncated]"
 
 
 def _pid_alive(pid: int) -> bool:
-    """Return True if a process with ``pid`` is currently alive.
-
-    Delegates to ``gateway.status._pid_exists`` — the canonical,
-    cross-platform, footgun-safe liveness check (psutil with a ctypes /
-    POSIX fallback). Critically this avoids ``os.kill(pid, 0)``, which on
-    Windows is NOT a no-op: it routes to ``CTRL_C_EVENT`` and hard-kills the
-    target's console process group (bpo-14484). Any error resolves to False
-    (treat unknown as dead) so a stale barrier never wedges the loop — the
-    worst case is the goal resumes one turn early, which is safe.
-    """
+    """Liveness via ``gateway.status._pid_exists`` (psutil + ctypes/POSIX fallback). Never uses
+    ``os.kill(pid, 0)``: on Windows that routes to CTRL_C_EVENT and hard-kills the target's console
+    group (bpo-14484)."""
     if not pid or pid <= 0:
         return False
     try:
@@ -1175,7 +947,6 @@ def _pid_alive(pid: int) -> bool:
         return bool(_pid_exists(int(pid)))
     except Exception:
         pass
-    # Last-resort fallback if gateway.status is unavailable: psutil directly.
     try:
         import psutil  # type: ignore
 
@@ -1185,13 +956,8 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _session_waiting(session_id: str) -> bool:
-    """Whether a goal parked on a process_registry session should stay parked.
-
-    Delegates to ``process_registry.is_session_waiting`` — True while the
-    session is running and (if it has watch_patterns) its trigger hasn't fired.
-    Fail-safe: any import/registry error yields False (don't wait) so a stale
-    barrier can never wedge the loop.
-    """
+    """True while the process_registry session is running and its trigger hasn't fired. Fail-safe:
+    any import/registry error yields False so a stale barrier can never wedge the loop."""
     if not session_id:
         return False
     try:
@@ -1205,421 +971,36 @@ def _session_waiting(session_id: str) -> bool:
 _JSON_OBJECT_RE = re.compile(r"\{.*?\}", re.DOTALL)
 
 
-def _goal_judge_max_tokens() -> int:
-    """Resolve auxiliary.goal_judge.max_tokens, falling back to the default.
-
-    ``load_config()`` is cached on the config file's (mtime, size), so calling
-    this once per judge turn is cheap. A non-positive or non-int value falls
-    back to the default rather than crashing the goal loop.
-    """
+def _goal_judge_setting(key: str, default, cast):
+    """Resolve ``auxiliary.goal_judge.<key>``; non-positive/garbage falls back to ``default``
+    rather than crashing the loop. ``load_config()`` is cached on (mtime, size) so this is cheap."""
     try:
         from hermes_cli.config import load_config
 
-        cfg = load_config()
-        value = (
-            (cfg.get("auxiliary") or {})
-            .get("goal_judge", {})
-            .get("max_tokens", DEFAULT_JUDGE_MAX_TOKENS)
-        )
-        value = int(value)
+        value = cast((load_config().get("auxiliary") or {}).get("goal_judge", {}).get(key, default))
         if value > 0:
             return value
     except Exception:
         pass
-    return DEFAULT_JUDGE_MAX_TOKENS
+    return default
+
+
+def _goal_judge_max_tokens() -> int:
+    return _goal_judge_setting("max_tokens", DEFAULT_JUDGE_MAX_TOKENS, int)
 
 
 def _goal_judge_timeout() -> float:
-    """Resolve auxiliary.goal_judge.timeout, falling back to the default.
-
-    Mirrors :func:`_goal_judge_max_tokens`. The key is declared in
-    ``DEFAULT_CONFIG`` and surfaces in the auxiliary config UI, but the
-    judge path used to hardcode ``DEFAULT_JUDGE_TIMEOUT`` and never read
-    it — so a user raising the timeout for a slow-but-healthy reasoning
-    endpoint got no effect, and the loop auto-paused on misleading
-    transport failures pointing at provider/key (#91022). A non-positive
-    or non-numeric value falls back rather than crashing the goal loop.
-    """
-    try:
-        from hermes_cli.config import load_config
-
-        cfg = load_config()
-        value = (
-            (cfg.get("auxiliary") or {})
-            .get("goal_judge", {})
-            .get("timeout", DEFAULT_JUDGE_TIMEOUT)
-        )
-        value = float(value)
-        if value > 0:
-            return value
-    except Exception:
-        pass
-    return DEFAULT_JUDGE_TIMEOUT
-
-
-def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, Any]]]:
-    """Parse the judge's reply. Fail-open on unusable output.
-
-    Returns ``(verdict, reason, parse_failed, wait_directive)`` where:
-      - ``verdict`` is ``"done"``, ``"continue"``, or ``"wait"``.
-      - ``parse_failed`` is True when the judge returned output that couldn't
-        be interpreted as the expected JSON verdict (empty body, prose,
-        malformed JSON). Callers use it to auto-pause after N consecutive
-        parse failures so a weak judge model doesn't silently burn the budget.
-      - ``wait_directive`` is set only for ``verdict == "wait"``: a dict with
-        ``{"pid": int}`` or ``{"seconds": int}`` (whichever the judge supplied).
-        ``None`` otherwise. If a wait verdict carries neither a usable pid nor
-        seconds, it is downgraded to ``continue`` (can't park on nothing).
-
-    Accepts both the new ``{"verdict": ...}`` shape and the legacy
-    ``{"done": <bool>}`` shape.
-    """
-    if not raw:
-        return "continue", "judge returned empty response", True, None
-
-    text = raw.strip()
-
-    # Strip markdown code fences the model may wrap JSON in.
-    if text.startswith("```"):
-        text = text.strip("`")
-        # Peel off leading json/JSON/etc tag
-        nl = text.find("\n")
-        if nl != -1:
-            text = text[nl + 1:]
-
-    # First try: parse the whole blob.
-    data: Optional[Dict[str, Any]] = None
-    try:
-        data = json.loads(text)
-    except Exception:
-        # Second try: pull the first JSON object out.
-        match = _JSON_OBJECT_RE.search(text)
-        if match:
-            try:
-                data = json.loads(match.group(0))
-            except Exception:
-                data = None
-
-    if not isinstance(data, dict):
-        return "continue", f"judge reply was not JSON: {_truncate(raw, 200)!r}", True, None
-
-    reason = str(data.get("reason") or "").strip() or "no reason provided"
-
-    # Determine verdict — prefer the explicit "verdict" field, fall back to
-    # the legacy "done" boolean.
-    verdict_raw = data.get("verdict")
-    if isinstance(verdict_raw, str):
-        verdict = verdict_raw.strip().lower()
-    else:
-        done_val = data.get("done")
-        if isinstance(done_val, str):
-            done = done_val.strip().lower() in {"true", "yes", "1", "done"}
-        else:
-            done = bool(done_val)
-        verdict = "done" if done else "continue"
-
-    if verdict not in {"done", "continue", "wait"}:
-        verdict = "continue"
-
-    if verdict != "wait":
-        return verdict, reason, False, None
-
-    # Wait verdict: extract a concrete directive (pid or seconds). Accept a
-    # few key spellings the model might emit.
-    def _first_int(*keys: str) -> Optional[int]:
-        for k in keys:
-            v = data.get(k)
-            if v is None:
-                continue
-            try:
-                iv = int(v)
-                if iv > 0:
-                    return iv
-            except (TypeError, ValueError):
-                continue
-        return None
-
-    # Prefer a session-id directive (releases on the process's own trigger —
-    # exit OR watch-pattern match), then pid (exit only), then seconds.
-    sess = data.get("wait_on_session") or data.get("session_id") or data.get("wait_session")
-    if isinstance(sess, str) and sess.strip():
-        return "wait", reason, False, {"session_id": sess.strip()}
-    pid = _first_int("wait_on_pid", "pid", "wait_pid")
-    if pid is not None:
-        return "wait", reason, False, {"pid": pid}
-    seconds = _first_int("wait_for_seconds", "seconds", "wait_seconds")
-    if seconds is not None:
-        return "wait", reason, False, {"seconds": seconds}
-    # Wait with no usable target — can't park on nothing; treat as continue.
-    return "continue", f"{reason} (wait verdict had no target — continuing)", False, None
-
-
-def _render_background_block(background_processes: Optional[List[Dict[str, Any]]]) -> str:
-    """Render the live background-process list for the judge prompt.
-
-    Each entry is a ``process_registry.list_sessions()`` dict. Only RUNNING
-    processes are worth showing (an exited one is nothing to wait on). Returns
-    an empty string when there's nothing running, so the judge prompt is
-    byte-identical to the no-background case (no behavior change for the
-    common path).
-    """
-    if not background_processes:
-        return ""
-    lines: List[str] = []
-    for p in background_processes:
-        if not isinstance(p, dict):
-            continue
-        if p.get("status") == "exited":
-            continue
-        pid = p.get("pid")
-        if not pid:
-            continue
-        cmd = _truncate(str(p.get("command") or "").replace("\n", " ").strip(), 120)
-        uptime = p.get("uptime_seconds")
-        tail = _truncate(str(p.get("output_preview") or "").replace("\n", " ").strip(), 120)
-        sid = p.get("session_id")
-        line = f"- pid {pid}"
-        if sid:
-            line += f" / session {sid}"
-        line += f": {cmd}"
-        if uptime is not None:
-            line += f" (running {uptime}s)"
-        # Surface the process's own trigger so the judge can wait on a
-        # mid-run signal (watch-pattern) or completion, not just exit.
-        wps = p.get("watch_patterns")
-        if wps:
-            hit = " [already matched]" if p.get("watch_hit") else ""
-            line += f" | watch_patterns={wps}{hit}"
-        elif p.get("notify_on_complete"):
-            line += " | notify_on_complete"
-        if tail:
-            line += f" | recent output: {tail}"
-        lines.append(line)
-    if not lines:
-        return ""
-    return JUDGE_BACKGROUND_BLOCK_TEMPLATE.format(background_lines="\n".join(lines))
-
-
-def judge_goal(
-    goal: str,
-    last_response: str,
-    *,
-    timeout: Optional[float] = None,
-    subgoals: Optional[List[str]] = None,
-    background_processes: Optional[List[Dict[str, Any]]] = None,
-    contract: Optional[GoalContract] = None,
-) -> Tuple[str, str, bool, Optional[Dict[str, Any]], bool]:
-    """Ask the auxiliary model whether the goal is satisfied.
-
-    Returns ``(verdict, reason, parse_failed, wait_directive, transport_failed)`` where verdict
-    is ``"done"``, ``"continue"``, ``"wait"``, or ``"skipped"`` (when the
-    judge couldn't be reached). ``wait_directive`` is set only for ``"wait"``
-    (``{"pid": int}`` or ``{"seconds": int}``); ``None`` otherwise.
-
-    ``parse_failed`` is True only when the judge call succeeded but its output
-    was unusable (empty or non-JSON). API/transport errors return False — they
-    are transient and should fail-open silently.
-
-    ``transport_failed`` is True only when the judge couldn't reach the API at
-    all (auth 401, timeout, DNS, connection error).  Repeated transport
-    failures signal a permanent config problem (e.g. invalid API key).  Callers
-    use this flag to auto-pause after N consecutive transport failures (see
-    ``DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES``). Callers use this flag to
-    auto-pause after N consecutive parse failures (see
-    ``DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES``).
-
-    ``subgoals`` is an optional list of user-added criteria (from
-    ``/subgoal``) factored into the verdict. ``background_processes`` is the
-    live ``process_registry.list_sessions()`` snapshot; when the agent is
-    waiting on one (a CI poller, build, etc.) the judge can return a ``wait``
-    verdict naming its pid, parking the loop instead of re-poking.
-    ``contract`` is an optional structured completion contract; when present
-    the judge decides DONE strictly against its Verification criterion and
-    refuses completion when a Constraint was violated. All three are additive
-    — a contract, subgoals, and a background-process list can coexist in one
-    judge prompt; when none are set, behavior is identical to the original
-    free-form judge.
-
-    This is deliberately fail-open: transport errors return ``("continue", ..., ..., None, True)``
-    — the ``transport_failed=True`` flag lets callers track and auto-pause after
-    N consecutive transport failures (see
-    ``DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES``) so a permanently broken
-    judge doesn't burn the entire turn budget.
-    """
-    if not goal.strip():
-        return "skipped", "empty goal", False, None, False
-    if not last_response.strip():
-        # No substantive reply this turn — almost certainly not done yet.
-        return "continue", "empty response (nothing to evaluate)", False, None, False
-    if timeout is None:
-        # The declared default for this path is the config key, not the
-        # module constant — see _goal_judge_timeout (#91022).
-        timeout = _goal_judge_timeout()
-
-    try:
-        from agent.auxiliary_client import call_llm
-    except Exception as exc:
-        logger.debug("goal judge: auxiliary client import failed: %s", exc)
-        return "continue", "auxiliary client unavailable", False, None, False
-
-    # Build the prompt. Priority: contract > subgoals > plain. When both a
-    # contract and subgoals exist, the subgoals are appended into the
-    # contract block as extra criteria so the judge sees a single source of
-    # truth.
-    clean_subgoals = [s.strip() for s in (subgoals or []) if s and s.strip()]
-    background_block = _render_background_block(background_processes)
-    current_time = datetime.now(tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-
-    if contract is not None and not contract.is_empty():
-        contract_block = contract.render_block()
-        if clean_subgoals:
-            extra = "\n".join(
-                f"- Extra criterion {i}: {text}"
-                for i, text in enumerate(clean_subgoals, start=1)
-            )
-            contract_block = f"{contract_block}\n{extra}"
-        prompt = JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE.format(
-            goal=_truncate(goal, 2000),
-            contract_block=_truncate(contract_block, 2500),
-            response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
-            background_block=background_block,
-            current_time=current_time,
-        )
-    elif clean_subgoals:
-        subgoals_block = "\n".join(
-            f"- {i}. {text}" for i, text in enumerate(clean_subgoals, start=1)
-        )
-        prompt = JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE.format(
-            goal=_truncate(goal, 2000),
-            subgoals_block=_truncate(subgoals_block, 2000),
-            response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
-            background_block=background_block,
-            current_time=current_time,
-        )
-    else:
-        prompt = JUDGE_USER_PROMPT_TEMPLATE.format(
-            goal=_truncate(goal, 2000),
-            response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
-            background_block=background_block,
-            current_time=current_time,
-        )
-
-    try:
-        # Route through call_llm so auxiliary.goal_judge.* config
-        # (provider/model/base_url, extra_body, reasoning_effort, retries)
-        # all apply — the direct-create path dropped extra_body (#35566).
-        resp = call_llm(
-            task="goal_judge",
-            messages=[
-                {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0,
-            max_tokens=_goal_judge_max_tokens(),
-            timeout=timeout,
-        )
-    except Exception as exc:
-        logger.info("goal judge: API call failed (%s) — falling through to continue", exc)
-        return "continue", f"judge error: {type(exc).__name__}", False, None, True
-
-    try:
-        raw = resp.choices[0].message.content or ""
-    except Exception:
-        raw = ""
-
-    verdict, reason, parse_failed, wait_directive = _parse_judge_response(raw)
-    logger.info(
-        "goal judge: verdict=%s reason=%s%s",
-        verdict, _truncate(reason, 120),
-        f" wait={wait_directive}" if wait_directive else "",
-    )
-    return verdict, reason, parse_failed, wait_directive, False
-
-
-def gather_background_processes(task_id: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Return the live background-process snapshot for the goal judge.
-
-    Thin, fail-safe wrapper over ``process_registry.list_sessions(task_id)``.
-    Returns only RUNNING processes (an exited one is nothing to wait on) and
-    never raises — any import/registry failure yields ``[]`` so the goal loop
-    degrades to its pre-wait-barrier behavior (judge just won't see processes).
-    The drivers (CLI + gateway) call this and pass the result into
-    ``GoalManager.evaluate_after_turn(background_processes=...)``.
-    """
-    try:
-        from tools.process_registry import process_registry
-
-        sessions = process_registry.list_sessions(task_id=task_id) or []
-    except Exception as exc:
-        logger.debug("gather_background_processes failed: %s", exc)
-        return []
-    return [s for s in sessions if isinstance(s, dict) and s.get("status") != "exited"]
-
-
-def draft_contract(objective: str, *, timeout: Optional[float] = None) -> Optional[GoalContract]:
-    """Expand a plain-language objective into a structured completion contract.
-
-    Uses the ``goal_judge`` auxiliary task (main-model-first, cache-safe — it
-    is a side LLM call, not a conversation turn). Returns a populated
-    :class:`GoalContract` on success, or ``None`` when the auxiliary client is
-    unavailable or the model's reply can't be parsed. Callers fall back to a
-    bare free-form goal in that case, so a missing/weak aux model never blocks
-    setting a goal.
-    """
-    objective = (objective or "").strip()
-    if not objective:
-        return None
-    if timeout is None:
-        # Same config-backed default as judge_goal (#91022).
-        timeout = _goal_judge_timeout()
-
-    try:
-        from agent.auxiliary_client import call_llm
-    except Exception as exc:
-        logger.debug("goal draft: auxiliary client import failed: %s", exc)
-        return None
-
-    try:
-        # Route through call_llm — same #35566 fix as the judge call above.
-        resp = call_llm(
-            task="goal_judge",
-            messages=[
-                {"role": "system", "content": DRAFT_CONTRACT_SYSTEM_PROMPT},
-                {"role": "user", "content": f"Objective:\n{_truncate(objective, 4000)}"},
-            ],
-            temperature=0,
-            max_tokens=_goal_judge_max_tokens(),
-            timeout=timeout,
-        )
-    except Exception as exc:
-        logger.info("goal draft: API call failed (%s)", exc)
-        return None
-
-    try:
-        raw = resp.choices[0].message.content or ""
-    except Exception:
-        raw = ""
-
-    data = _extract_json_object(raw)
-    if not isinstance(data, dict):
-        logger.debug("goal draft: reply was not JSON: %r", _truncate(raw, 200))
-        return None
-    contract = GoalContract.from_dict(data)
-    return None if contract.is_empty() else contract
+    return _goal_judge_setting("timeout", DEFAULT_JUDGE_TIMEOUT, float)
 
 
 def _extract_json_object(raw: str) -> Optional[Dict[str, Any]]:
-    """Best-effort: pull the first JSON object out of a model reply.
-
-    Shares the fence-stripping + first-object fallback logic used by the
-    judge parser, but returns the dict (or None) rather than a verdict.
-    """
+    """Best-effort: strip code fences, parse the blob, else pull the first ``{...}`` out."""
     if not raw:
         return None
     text = raw.strip()
     if text.startswith("```"):
         text = text.strip("`")
-        nl = text.find("\n")
+        nl = text.find("\n")   # peel off leading json/JSON tag
         if nl != -1:
             text = text[nl + 1:]
     try:
@@ -1635,26 +1016,297 @@ def _extract_json_object(raw: str) -> Optional[Dict[str, Any]]:
     return data if isinstance(data, dict) else None
 
 
-# ──────────────────────────────────────────────────────────────────────
-# GoalManager — the orchestration surface CLI + gateway talk to
-# ──────────────────────────────────────────────────────────────────────
+def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, Any]]]:
+    """Parse the judge's reply, fail-open. Returns ``(verdict, reason, parse_failed, wait_directive)``.
+
+    ``parse_failed`` flags non-JSON output so callers can auto-pause after N in a row.
+    ``wait_directive`` is ``{"session_id"}`` / ``{"pid"}`` / ``{"seconds"}`` for a ``wait``
+    verdict; a wait with no target is downgraded to ``continue``. Accepts ``{"verdict": ...}`` and
+    the legacy ``{"done": <bool>}`` shape.
+    """
+    if not raw:
+        return "continue", "judge returned empty response", True, None
+    data = _extract_json_object(raw)
+    if data is None:
+        return "continue", f"judge reply was not JSON: {_truncate(raw, 200)!r}", True, None
+
+    reason = str(data.get("reason") or "").strip() or "no reason provided"
+    verdict_raw = data.get("verdict")
+    if isinstance(verdict_raw, str):
+        verdict = verdict_raw.strip().lower()
+    else:
+        done_val = data.get("done")
+        done = done_val.strip().lower() in {"true", "yes", "1", "done"} if isinstance(done_val, str) else bool(done_val)
+        verdict = "done" if done else "continue"
+    if verdict not in {"done", "blocked", "continue", "wait"}:
+        verdict = "continue"
+    if verdict != "wait":
+        return verdict, reason, False, None
+
+    def _first_int(*keys: str) -> Optional[int]:
+        for k in keys:
+            try:
+                iv = int(data[k]) if data.get(k) is not None else 0
+            except (TypeError, ValueError):
+                continue
+            if iv > 0:
+                return iv
+        return None
+
+    # Prefer session (releases on the process's own trigger), then pid (exit only), then seconds.
+    sess = data.get("wait_on_session") or data.get("session_id") or data.get("wait_session")
+    if isinstance(sess, str) and sess.strip():
+        return "wait", reason, False, {"session_id": sess.strip()}
+    pid = _first_int("wait_on_pid", "pid", "wait_pid")
+    if pid is not None:
+        return "wait", reason, False, {"pid": pid}
+    seconds = _first_int("wait_for_seconds", "seconds", "wait_seconds")
+    if seconds is not None:
+        return "wait", reason, False, {"seconds": seconds}
+    return "continue", f"{reason} (wait verdict had no target — continuing)", False, None
+
+
+def _render_background_block(background_processes: Optional[List[Dict[str, Any]]]) -> str:
+    """Render RUNNING ``process_registry.list_sessions()`` entries for the judge prompt. Empty string
+    when nothing is running, so the prompt stays byte-identical to the no-background case."""
+    lines: List[str] = []
+    for p in background_processes or []:
+        if not isinstance(p, dict) or p.get("status") == "exited" or not p.get("pid"):
+            continue
+        cmd = _truncate(str(p.get("command") or "").replace("\n", " ").strip(), 120)
+        tail = _truncate(str(p.get("output_preview") or "").replace("\n", " ").strip(), 120)
+        line = f"- pid {p['pid']}"
+        if p.get("session_id"):
+            line += f" / session {p['session_id']}"
+        line += f": {cmd}"
+        if p.get("uptime_seconds") is not None:
+            line += f" (running {p['uptime_seconds']}s)"
+        # Surface the process's own trigger so the judge can wait on a mid-run signal, not just exit.
+        wps = p.get("watch_patterns")
+        if wps:
+            hit = " [already matched]" if p.get("watch_hit") else ""
+            line += f" | watch_patterns={wps}{hit}"
+        elif p.get("notify_on_complete"):
+            line += " | notify_on_complete"
+        if tail:
+            line += f" | recent output: {tail}"
+        lines.append(line)
+    if not lines:
+        return ""
+    return JUDGE_BACKGROUND_BLOCK_TEMPLATE.format(background_lines="\n".join(lines))
+
+
+def _call_goal_judge_llm(call_llm, system_prompt: str, user_prompt: str, timeout: Optional[float]) -> str:
+    """Route through call_llm so auxiliary.goal_judge.* config (provider/model, extra_body,
+    reasoning_effort, retries) all apply. Returns the raw reply text."""
+    # See #35566.
+    # Route through call_llm — same #35566 fix as the judge call above.
+    resp = call_llm(
+        task="goal_judge",
+        messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+        temperature=0, max_tokens=_goal_judge_max_tokens(), timeout=timeout,
+    )
+    try:
+        return resp.choices[0].message.content or ""
+    except Exception:
+        return ""
+
+
+def judge_goal(
+    goal: str,
+    last_response: str,
+    *,
+    timeout: Optional[float] = None,
+    subgoals: Optional[List[str]] = None,
+    background_processes: Optional[List[Dict[str, Any]]] = None,
+    contract: Optional[GoalContract] = None,
+    active_delegations: int = 0,
+) -> Tuple[str, str, bool, Optional[Dict[str, Any]], bool]:
+    """Ask the auxiliary model whether the goal is satisfied.
+
+    Returns ``(verdict, reason, parse_failed, wait_directive, transport_failed)``; verdict is done /
+    blocked / continue / wait / skipped. ``parse_failed`` means unusable output; transport errors
+    set ``transport_failed`` instead and fail-open to ``continue``.
+    """
+    if not goal.strip():
+        return "skipped", "empty goal", False, None, False
+    if not last_response.strip():
+        return "continue", "empty response (nothing to evaluate)", False, None, False
+    if timeout is None:
+        timeout = _goal_judge_timeout()   # the declared default is the config key, not the constant
+
+    try:
+        from agent.auxiliary_client import call_llm
+    except Exception as exc:
+        logger.debug("goal judge: auxiliary client import failed: %s", exc)
+        return "continue", "auxiliary client unavailable", False, None, False
+
+    # Prompt priority: contract > subgoals > plain. With both, subgoals fold into the contract
+    # block as extra criteria so the judge sees a single source of truth.
+    clean_subgoals = [s.strip() for s in (subgoals or []) if s and s.strip()]
+    common = dict(
+        goal=_truncate(goal, 2000),
+        response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
+        background_block=_render_background_block(background_processes)
+        + (JUDGE_DELEGATIONS_BLOCK_TEMPLATE.format(count=active_delegations) if active_delegations > 0 else ""),
+        current_time=datetime.now(tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z"),
+    )
+    if contract is not None and not contract.is_empty():
+        contract_block = contract.render_block()
+        if clean_subgoals:
+            contract_block = f"{contract_block}\n{_render_extra_criteria(clean_subgoals)}"
+        prompt = JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE.format(contract_block=_truncate(contract_block, 2500), **common)
+    elif clean_subgoals:
+        subgoals_block = "\n".join(f"- {i}. {text}" for i, text in enumerate(clean_subgoals, start=1))
+        prompt = JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE.format(subgoals_block=_truncate(subgoals_block, 2000), **common)
+    else:
+        prompt = JUDGE_USER_PROMPT_TEMPLATE.format(**common)
+
+    try:
+        raw = _call_goal_judge_llm(call_llm, JUDGE_SYSTEM_PROMPT, prompt, timeout)
+    except Exception as exc:
+        logger.info("goal judge: API call failed (%s) — falling through to continue", exc)
+        return "continue", f"judge error: {type(exc).__name__}", False, None, True
+
+    verdict, reason, parse_failed, wait_directive = _parse_judge_response(raw)
+    logger.info("goal judge: verdict=%s reason=%s%s", verdict, _truncate(reason, 120),
+                f" wait={wait_directive}" if wait_directive else "")
+    return verdict, reason, parse_failed, wait_directive, False
+
+
+def count_active_delegations(session_id: Optional[str]) -> int:
+    """Live async delegation batches spawned by this session (fail-safe 0)."""
+    if not session_id:
+        return 0
+    try:
+        from tools.async_delegation import _LIVE_STATES, _session_records
+        return len(_session_records(_LIVE_STATES, "", "", str(session_id)))
+    except Exception:
+        return 0
+
+
+# `/goal <text>` kicks the loop by sending the goal as the next user turn. When that text IS what
+# the user just said (a pasted handoff note, a plan the agent already has), re-sending it makes the
+# agent spend a turn deciding it is a replay (11 API calls, 6 min, in one run) and duplicates ~2k
+# tokens of context. The pointer is used only when the goal is substantially the WHOLE last
+# message: a short goal that merely appears inside a longer one ("ship the API" after a message
+# offering API or UI work) selects one option, and two different goals must not kick identically.
+GOAL_ALREADY_SEEN_KICK = "[Goal set] Continue with the goal you were just given; there is no need to re-read it."
+_GOAL_REPASTE_MIN_CHARS = 400
+_GOAL_REPASTE_MIN_SHARE = 0.8
+
+
+def goal_kick_prompt(goal: str, last_user_message: Any) -> str:
+    """The goal text, or ``GOAL_ALREADY_SEEN_KICK`` when ``last_user_message`` is essentially that text."""
+    content = last_user_message
+    if isinstance(content, list):
+        content = " ".join(str(b.get("text", "")) for b in content if isinstance(b, dict))
+    goal_norm, last_norm = " ".join(str(goal or "").split()), " ".join(str(content or "").split())
+    if (
+        len(goal_norm) >= _GOAL_REPASTE_MIN_CHARS
+        and goal_norm in last_norm
+        and len(goal_norm) >= _GOAL_REPASTE_MIN_SHARE * len(last_norm)
+    ):
+        return GOAL_ALREADY_SEEN_KICK
+    return goal
+
+
+def last_user_message_content(history: Any) -> Any:
+    """Content of the newest ``role == "user"`` message in an OpenAI-shaped history, else ``""``."""
+    for msg in reversed(history or []):
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            return msg.get("content")
+    return ""
+
+
+def last_user_message_from_db(session_id: Optional[str]) -> Any:
+    """Newest user message of ``session_id`` from the SessionDB (gateway/TUI surfaces have no live
+    history object at slash-command time); ``""`` on any error."""
+    if not session_id:
+        return ""
+    try:
+        db = _get_session_db()
+        if db is None:
+            return ""
+        rows = db.get_messages(str(session_id), limit=20, latest=True)
+        return last_user_message_content(rows)
+    except Exception:
+        return ""
+
+
+def gather_background_processes(task_id: Optional[str] = None, *, owner_task_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Fail-safe snapshot of RUNNING ``process_registry`` sessions for the judge; ``[]`` on any error
+    so the loop degrades to its pre-wait-barrier behavior.
+
+    ``owner_task_id`` restricts the snapshot to processes the goal's OWN session spawned. The registry's
+    ``task_id`` is the container key, which collapses to one value for every agent in the process, so
+    without this filter a fan-out parent's judge saw every subagent's pollers and parked the goal on a
+    grandchild's ``proc_*`` session (one run: 7 of 7 root verdicts were WAIT on child-owned processes;
+    parked 3 h 22 min at the end while nothing of its own was running)."""
+    try:
+        from tools.process_registry import process_registry
+
+        sessions = process_registry.list_sessions(task_id=task_id) or []
+    except Exception as exc:
+        logger.debug("gather_background_processes failed: %s", exc)
+        return []
+    running = [s for s in sessions if isinstance(s, dict) and s.get("status") != "exited"]
+    if owner_task_id:
+        running = [s for s in running if str(s.get("owner_task_id") or s.get("task_id") or "") == str(owner_task_id)]
+    return running
+
+
+def draft_contract(objective: str, *, timeout: Optional[float] = None) -> Optional[GoalContract]:
+    """Expand a plain-language objective into a completion contract via the ``goal_judge`` auxiliary
+    task (a side LLM call, not a conversation turn). None when unavailable or unparseable."""
+    objective = (objective or "").strip()
+    if not objective:
+        return None
+    if timeout is None:
+        # The declared default for this path is the config key, not the module constant — see
+        # _goal_judge_timeout (#91022).
+        # Same config-backed default as judge_goal (#91022).
+        timeout = _goal_judge_timeout()
+
+    try:
+        from agent.auxiliary_client import call_llm
+    except Exception as exc:
+        logger.debug("goal draft: auxiliary client import failed: %s", exc)
+        return None
+
+    try:
+        raw = _call_goal_judge_llm(call_llm, DRAFT_CONTRACT_SYSTEM_PROMPT, f"Objective:\n{_truncate(objective, 4000)}", timeout)
+    except Exception as exc:
+        logger.info("goal draft: API call failed (%s)", exc)
+        return None
+
+    data = _extract_json_object(raw)
+    if not isinstance(data, dict):
+        logger.debug("goal draft: reply was not JSON: %r", _truncate(raw, 200))
+        return None
+    contract = GoalContract.from_dict(data)
+    return None if contract.is_empty() else contract
+
+
+# ── GoalManager — the orchestration surface CLI + gateway talk to ──────
+
+def _decision(status, should_continue: bool, prompt: Optional[str], verdict: str, reason: str, message: str) -> Dict[str, Any]:
+    return {"status": status, "should_continue": should_continue, "continuation_prompt": prompt,
+            "verdict": verdict, "reason": reason, "message": message}
+
+
+_JUDGE_CONFIG_HINT = (
+    "~/.hermes/config.yaml:\n  auxiliary:\n    goal_judge:\n      provider: {provider}\n      model: {model}\n"
+    "Then /goal resume to continue."
+)
 
 
 class GoalManager:
     """Per-session goal state + continuation decisions.
 
-    The CLI and gateway each hold one ``GoalManager`` per live session.
-
-    Methods:
-
-    - ``set(goal)`` — start a new standing goal.
-    - ``clear()`` — remove the active goal.
-    - ``pause()`` / ``resume()`` — explicit user controls.
-    - ``status()`` — printable one-liner.
-    - ``evaluate_after_turn(last_response)`` — call the judge, update state,
-      and return a decision dict the caller uses to drive the next turn.
-    - ``next_continuation_prompt()`` — the canonical user-role message to
-      feed back into ``run_conversation``.
+    The CLI and gateway each hold one per live session. ``evaluate_after_turn`` calls the judge and
+    returns the decision dict that drives the next turn; ``next_continuation_prompt`` is the
+    canonical user-role message to feed back into ``run_conversation``.
     """
 
     def __init__(self, session_id: str, *, default_max_turns: int = DEFAULT_MAX_TURNS):
@@ -1670,6 +1322,16 @@ class GoalManager:
     def state(self) -> Optional[GoalState]:
         return self._state
 
+    def _save(self) -> bool:
+        """Persist the current in-memory state after an external mutation.
+
+        GoalManager's public mutators save as they go, but a few lifecycle
+        owners update a barrier field before handing control back to the idle
+        loop. Keep that compatibility seam on the manager so the mutation is
+        durable before the next process observes it.
+        """
+        return bool(self._state is not None and save_goal(self.session_id, self._state))
+
     def is_active(self) -> bool:
         return self._state is not None and self._state.status == "active"
 
@@ -1681,7 +1343,7 @@ class GoalManager:
 
     def status_line(self) -> str:
         s = self._state
-        if s is None or s.status in {"cleared",}:
+        if s is None or s.status == "cleared":
             return "No active goal. Set one with /goal <text>."
         turns = f"{s.turns_used}/{s.max_turns} turns"
         sub = f", {len(s.subgoals)} subgoal{'s' if len(s.subgoals) != 1 else ''}" if s.subgoals else ""
@@ -1690,11 +1352,9 @@ class GoalManager:
         meta = f"{turns}{sub}{con}{gat}"
         if s.status == "active":
             if s.waiting_on_session and _session_waiting(s.waiting_on_session):
-                wr = s.waiting_reason or f"session {s.waiting_on_session}"
-                return f"⏳ Goal (parked on {wr}, {meta}): {s.goal}"
+                return f"⏳ Goal (parked on {s.waiting_reason or f'session {s.waiting_on_session}'}, {meta}): {s.goal}"
             if s.waiting_on_pid and _pid_alive(s.waiting_on_pid):
-                wr = s.waiting_reason or f"pid {s.waiting_on_pid}"
-                return f"⏳ Goal (parked on {wr}, {meta}): {s.goal}"
+                return f"⏳ Goal (parked on {s.waiting_reason or f'pid {s.waiting_on_pid}'}, {meta}): {s.goal}"
             if s.waiting_until and time.time() < s.waiting_until:
                 remaining = int(s.waiting_until - time.time())
                 wr = s.waiting_reason or f"{remaining}s"
@@ -1861,12 +1521,7 @@ class GoalManager:
             return self._state
         self._state.status = "active"
         self._state.paused_reason = None
-        # Resuming starts fresh — clear any stale barrier.
-        self._state.waiting_on_pid = None
-        self._state.waiting_on_session = None
-        self._state.waiting_until = 0.0
-        self._state.waiting_reason = None
-        self._state.waiting_since = 0.0
+        self._state.clear_wait()   # resuming starts fresh
         if reset_budget:
             self._state.turns_used = 0
         self._state.recovery_episode_attempts = 0
@@ -2296,6 +1951,7 @@ class GoalManager:
         self._state.waiting_on_pid = pid
         self._state.waiting_on_session = None
         self._state.waiting_until = 0.0
+        self._state.waiting_on_delegations = 0
         self._state.waiting_reason = (reason or "").strip() or None
         self._state.waiting_since = time.time()
         save_goal(self.session_id, self._state)
@@ -2318,12 +1974,13 @@ class GoalManager:
         self._state.waiting_on_session = session_id
         self._state.waiting_on_pid = None
         self._state.waiting_until = 0.0
+        self._state.waiting_on_delegations = 0
         self._state.waiting_reason = (reason or "").strip() or None
         self._state.waiting_since = time.time()
         save_goal(self.session_id, self._state)
         return self._state
 
-    def wait_for_seconds(self, seconds: int, reason: str = "") -> GoalState:
+    def wait_for_seconds(self, seconds: int, reason: str = "", *, on_delegations: int = 0) -> GoalState:
         """Park the goal loop until ``seconds`` from now have elapsed.
 
         Time-based counterpart to ``wait_on`` — for backoff / cooldown waits
@@ -2339,6 +1996,7 @@ class GoalManager:
         self._state.waiting_on_pid = None
         self._state.waiting_on_session = None
         self._state.waiting_until = time.time() + seconds
+        self._state.waiting_on_delegations = max(0, int(on_delegations))
         self._state.waiting_reason = (reason or "").strip() or None
         self._state.waiting_since = time.time()
         save_goal(self.session_id, self._state)
@@ -2358,39 +2016,41 @@ class GoalManager:
         self._state.waiting_on_pid = None
         self._state.waiting_on_session = None
         self._state.waiting_until = 0.0
+        self._state.waiting_on_delegations = 0
         self._state.waiting_reason = None
         self._state.waiting_since = 0.0
         save_goal(self.session_id, self._state)
         return True
 
     def is_waiting(self) -> bool:
-        """True iff a barrier is set AND not yet satisfied.
-
-        Session barrier: active until the process exits or its watch-pattern
-        trigger fires. Pid barrier: active while the process is alive. Time
-        barrier: active until the deadline passes. Side effect: a satisfied
-        barrier is cleared here (lazy auto-clear) so the next evaluation
-        resumes normal judging.
-        """
+        """True iff a barrier is set AND not yet satisfied. A satisfied barrier is cleared here
+        (lazy auto-clear) so the next evaluation resumes normal judging. A pid/session barrier
+        also expires after ``_MAX_BARRIER_WAIT_S``: a watcher or poller that never exits would
+        otherwise park the goal indefinitely (one run sat 3 h 22 min on a poller that outlived
+        the work it was polling)."""
         s = self._state
         if s is None:
             return False
         if s.waiting_on_session is not None:
-            if _session_waiting(s.waiting_on_session):
-                return True
-            self.stop_waiting()  # session exited or trigger fired
+            still = _session_waiting(s.waiting_on_session)
+        elif s.waiting_on_pid is not None:
+            still = _pid_alive(s.waiting_on_pid)
+        elif s.waiting_until:
+            still = time.time() < s.waiting_until
+            if still and s.waiting_on_delegations > 0:
+                # Set because of live delegations: lift the moment one of them returned.
+                live = count_active_delegations(self.session_id)
+                if live < s.waiting_on_delegations:
+                    still = False
+        else:
             return False
-        if s.waiting_on_pid is not None:
-            if _pid_alive(s.waiting_on_pid):
-                return True
-            self.stop_waiting()  # process gone
-            return False
-        if s.waiting_until:
-            if time.time() < s.waiting_until:
-                return True
-            self.stop_waiting()  # deadline passed
-            return False
-        return False
+        if still and s.waiting_since and s.waiting_until == 0.0 and time.time() - s.waiting_since > _MAX_BARRIER_WAIT_S:
+            logger.info("goal %s: wait barrier on %s exceeded %ds; resuming judging",
+                        self.session_id, s.waiting_on_session or s.waiting_on_pid, _MAX_BARRIER_WAIT_S)
+            still = False
+        if not still:
+            self.stop_waiting()
+        return still
 
     def _checkpoint(self, outcome: str, reason: str, next_action: Optional[str], *, continuation: bool, metadata: Optional[Dict[str, Any]] = None) -> bool:
         state = self._state
@@ -2561,67 +2221,63 @@ class GoalManager:
 
     # --- the main entry point called after every turn -----------------
 
+    def _waiting_decision(self, state: GoalState) -> Dict[str, Any]:
+        if state.waiting_on_session is not None:
+            tgt = f"session {state.waiting_on_session}"
+        elif state.waiting_on_pid is not None:
+            tgt = f"pid {state.waiting_on_pid}"
+        else:
+            tgt = f"{max(0, int(state.waiting_until - time.time()))}s remaining"
+        reason = state.waiting_reason or tgt
+        return _decision("active", False, None, "waiting", reason, f"⏳ Goal parked — waiting on {tgt}: {reason}")
+
+    def _apply_wait_directive(self, wait_directive: Dict[str, Any], reason: str, *, active_delegations: int = 0) -> Dict[str, Any]:
+        """Judge said WAIT: set the barrier and park. The counted turn stands (the judge ran) but no
+        continuation fires; the loop resumes once the barrier clears."""
+        if wait_directive.get("session_id"):
+            tgt = f"session {self.wait_on_session(str(wait_directive['session_id']), reason=reason).waiting_on_session}"
+        elif wait_directive.get("pid"):
+            tgt = f"pid {self.wait_on(int(wait_directive['pid']), reason=reason).waiting_on_pid}"
+        else:
+            self.wait_for_seconds(int(wait_directive["seconds"]), reason=reason, on_delegations=active_delegations)
+            tgt = f"{wait_directive['seconds']}s"
+        return _decision("active", False, None, "wait", reason, f"⏳ Goal parked (judge) — waiting on {tgt}: {reason}")
+
+    def _budget_pause(self, state: GoalState, verdict: str, reason: str, note: str = "") -> Dict[str, Any]:
+        state.status = "paused"
+        state.outcome = TURN_BUDGET_EXHAUSTED
+        state.paused_reason = f"turn budget exhausted ({state.turns_used}/{state.max_turns})"
+        if not self._checkpoint(
+            TURN_BUDGET_EXHAUSTED,
+            state.paused_reason,
+            "explicit /goal resume after inspecting cumulative budget",
+            continuation=False,
+        ):
+            return self._persistence_failure("turn budget stop could not be saved")
+        return _decision(
+            "paused", False, None, verdict, reason,
+            f"⏸ Goal paused — {state.turns_used}/{state.max_turns} turns used{note}. "
+            "Use /goal resume to keep going, or /goal clear to stop.",
+        )
+
     def evaluate_after_turn(
-        self,
-        last_response: str,
-        *,
-        user_initiated: bool = True,
+        self, last_response: str, *, user_initiated: bool = True,
         background_processes: Optional[List[Dict[str, Any]]] = None,
+        active_delegations: int = 0,
         turn_outcome: Optional[str] = None,
         turn_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Run the judge and update state. Return a decision dict.
-
-        ``user_initiated`` distinguishes a real user prompt (True) from a
-        continuation prompt we fed ourselves (False). Both increment
-        ``turns_used`` because both consume model budget.
-
-        ``background_processes`` is the live ``process_registry.list_sessions()``
-        snapshot for this session. It's handed to the judge so it can decide
-        to WAIT on an in-flight process (CI poller, build, ...) instead of
-        re-poking the agent — the automatic counterpart to ``/goal wait``.
-
-        Decision keys:
-          - ``status``: current goal status after update
-          - ``should_continue``: bool — caller should fire another turn
-          - ``continuation_prompt``: str or None
-          - ``verdict``: "done" | "continue" | "wait" | "skipped" | "inactive"
-          - ``reason``: str
-          - ``message``: user-visible one-liner to print/send
-        """
+        """Run gates + judge and update state. Return a decision dict (``status``, ``should_continue``,
+        ``continuation_prompt``, ``verdict``, ``reason``, ``message``). Both real user prompts and our
+        own continuations increment ``turns_used`` — both consume model budget."""
         state = self._state
         if state is None or state.status != "active":
-            return {
-                "status": state.status if state else None,
-                "should_continue": False,
-                "continuation_prompt": None,
-                "verdict": "inactive",
-                "reason": "no active goal",
-                "message": "",
-            }
+            return _decision(state.status if state else None, False, None, "inactive", "no active goal", "")
 
-        # Wait barrier: if the loop is parked (on a live process OR a time
-        # deadline that hasn't passed), quiesce — do NOT burn a turn or call
-        # the judge. Resumes automatically once the barrier clears.
+        # Parked on a live process or an unexpired deadline: quiesce without burning a turn.
         if self.is_waiting():
-            if state.waiting_on_session is not None:
-                tgt = f"session {state.waiting_on_session}"
-            elif state.waiting_on_pid is not None:
-                tgt = f"pid {state.waiting_on_pid}"
-            else:
-                remaining = max(0, int(state.waiting_until - time.time()))
-                tgt = f"{remaining}s remaining"
-            reason = state.waiting_reason or tgt
-            return {
-                "status": "active",
-                "should_continue": False,
-                "continuation_prompt": None,
-                "verdict": "waiting",
-                "reason": reason,
-                "message": f"⏳ Goal parked — waiting on {tgt}: {reason}",
-            }
+            return self._waiting_decision(state)
 
-        # Count the turn that just finished.
         state.turns_used += 1
         state.last_turn_at = time.time()
         state.continuation_pending = False
@@ -2661,57 +2317,24 @@ class GoalManager:
         state.recovery_episode_attempts = 0
         state.last_recovery_reason = None
         verdict, reason, parse_failed, wait_directive, transport_failed = judge_goal(
-            state.goal,
-            last_response,
-            subgoals=state.subgoals or None,
-            background_processes=background_processes,
-            contract=state.contract if state.has_contract() else None,
+            state.goal, last_response, subgoals=state.subgoals or None, background_processes=background_processes,
+            contract=state.contract if state.has_contract() else None, active_delegations=active_delegations,
         )
         state.last_verdict = verdict
         state.last_reason = reason
+        # Parse failures reset on any usable reply INCLUDING transport errors, so a flaky network
+        # doesn't trip the auto-pause meant for bad judge models; transport failures are counted
+        # separately because persistent API errors (401, DNS) mean a broken config.
+        state.consecutive_parse_failures = state.consecutive_parse_failures + 1 if parse_failed else 0
+        state.consecutive_transport_failures = state.consecutive_transport_failures + 1 if transport_failed else 0
 
-        # Track consecutive judge parse failures. Reset on any usable reply,
-        # including API / transport errors (parse_failed=False) so a flaky
-        # network doesn't trip the auto-pause meant for bad judge models.
-        if parse_failed:
-            state.consecutive_parse_failures += 1
-        else:
-            state.consecutive_parse_failures = 0
-
-        # Track consecutive transport failures separately — persistent API
-        # errors (401 auth, DNS, timeout) signal a broken config, not
-        # transient network flakiness.  Auto-pause after N consecutive
-        # transport failures so a permanently broken judge doesn't burn
-        # every turn budget slot on an unreachable API.
-        if transport_failed:
-            state.consecutive_transport_failures += 1
-        else:
-            state.consecutive_transport_failures = 0
-
-        # WAIT verdict: the judge decided the agent is blocked on async work
-        # and re-poking now would be busy-work. Set the barrier and park —
-        # the turn we just counted stands (the judge call happened), but no
-        # continuation fires. The loop resumes automatically when the pid
-        # exits or the deadline passes (next evaluate_after_turn falls through
-        # the is_waiting() short-circuit once the barrier clears).
         if verdict == "wait" and wait_directive:
-            if wait_directive.get("session_id"):
-                self.wait_on_session(str(wait_directive["session_id"]), reason=reason)
-                tgt = f"session {wait_directive['session_id']}"
-            elif wait_directive.get("pid"):
-                self.wait_on(int(wait_directive["pid"]), reason=reason)
-                tgt = f"pid {wait_directive['pid']}"
-            else:
-                self.wait_for_seconds(int(wait_directive["seconds"]), reason=reason)
-                tgt = f"{wait_directive['seconds']}s"
-            return {
-                "status": "active",
-                "should_continue": False,
-                "continuation_prompt": None,
-                "verdict": "wait",
-                "reason": reason,
-                "message": f"⏳ Goal parked (judge) — waiting on {tgt}: {reason}",
-            }
+            return self._apply_wait_directive(wait_directive, reason, active_delegations=active_delegations)
+
+        # BLOCKED is not completion. Use the canonical lifecycle stop owner
+        # so pause, checkpoint, outcome, and persistence remain one transition.
+        if verdict == "blocked":
+            return self._execution_stop(GOAL_BLOCKED, f"judged unachievable: {reason}", metadata=turn_metadata)
 
         if verdict == "done":
             # Judge prose is never completion evidence. Even a structured
@@ -2840,47 +2463,31 @@ class GoalManager:
         }
 
     def next_continuation_prompt(self) -> Optional[str]:
-        if not self._state or self._state.status != "active":
+        s = self._state
+        if not s or s.status != "active":
             return None
-        # Contract takes priority: it carries the verification surface and
-        # constraints the agent must target. Subgoals fold in as extra
-        # criteria appended to the contract block.
-        if self._state.has_contract():
-            contract_block = self._state.contract.render_block()
-            if self._state.subgoals:
-                extra = "\n".join(
-                    f"- Extra criterion {i}: {text}"
-                    for i, text in enumerate(self._state.subgoals, start=1)
-                )
-                contract_block = f"{contract_block}\n{extra}"
-            return CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE.format(
-                goal=self._state.goal,
-                contract_block=contract_block,
-            )
-        if self._state.subgoals:
-            return CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE.format(
-                goal=self._state.goal,
-                subgoals_block=self._state.render_subgoals_block(),
-            )
-        return CONTINUATION_PROMPT_TEMPLATE.format(goal=self._state.goal)
+        # Contract first (it carries the verification surface); subgoals fold in as extra criteria.
+        if s.has_contract():
+            contract_block = s.contract.render_block()
+            if s.subgoals:
+                contract_block = f"{contract_block}\n{_render_extra_criteria(s.subgoals)}"
+            return CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE.format(goal=s.goal, contract_block=contract_block)
+        if s.subgoals:
+            return CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE.format(goal=s.goal, subgoals_block=s.render_subgoals_block())
+        return CONTINUATION_PROMPT_TEMPLATE.format(goal=s.goal)
 
     def render_contract(self) -> str:
         """Public helper for the /goal show + /goal draft slash commands."""
         if self._state is None:
             return "(no active goal)"
-        if not self._state.has_contract():
-            return "(no completion contract — set one with /goal draft <objective> or inline field: value lines)"
-        return self._state.contract.render_block()
+        return self._state.contract.render_block() if self._state.has_contract() else (
+            "(no completion contract — set one with /goal draft <objective> or inline field: value lines)")
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Kanban worker goal loop
-# ──────────────────────────────────────────────────────────────────────
+# ── Kanban worker goal loop ───────────────────────────────────────────
 
-# Continuation prompt fed back to a kanban goal-mode worker that has not
-# yet completed/blocked its task. The card's own acceptance criteria are
-# the goal — the worker already has the full task body in its first turn,
-# so we keep this short and point it back at the lifecycle contract.
+# Fed to a kanban goal-mode worker that hasn't completed/blocked its task yet: short, and points it
+# back at the lifecycle contract (it already has the full task body).
 KANBAN_GOAL_CONTINUATION_TEMPLATE = (
     "[Continuing toward this kanban task — judge says it is not done yet]\n"
     "Reason: {reason}\n\n"
@@ -2892,9 +2499,7 @@ KANBAN_GOAL_CONTINUATION_TEMPLATE = (
     "calling one of them."
 )
 
-# Fed when the judge believes the work is done but the worker never called
-# kanban_complete / kanban_block. One explicit nudge to terminate the task
-# the right way before the loop gives up.
+# Judge says done but the worker never called kanban_complete/kanban_block: one explicit nudge.
 KANBAN_GOAL_FINALIZE_TEMPLATE = (
     "[The work looks complete, but the task is still open]\n"
     "Reason: {reason}\n\n"
@@ -2903,6 +2508,17 @@ KANBAN_GOAL_FINALIZE_TEMPLATE = (
     "call kanban_request_review with that summary instead. If something still "
     "blocks completion, call kanban_block with the reason instead."
 )
+
+
+# Worker-driven terminal task statuses → loop outcome. The card's own acceptance criteria are the
+# goal; the worker already has the full task body, so these outcomes stop the loop cleanly.
+_KANBAN_TERMINAL_STATUSES = {
+    "done": ("completed_by_worker", "worker completed the task", "task {task_id} completed by worker after {turns} turn(s)"),
+    "blocked": ("blocked_by_worker", "worker blocked the task", "task {task_id} blocked by worker after {turns} turn(s)"),
+    # kanban_request_review is a legitimate terminator: implementation done, awaiting a reviewer.
+    "review": ("review_requested_by_worker", "worker requested review", "task {task_id} handed off for review by worker after {turns} turn(s)"),
+    "changes_requested": ("changes_requested_by_reviewer", "reviewer requested changes", "reviewer returned task {task_id} for changes after {turns} turn(s)"),
+}
 
 
 def run_kanban_goal_loop(
@@ -2918,31 +2534,10 @@ def run_kanban_goal_loop(
 ) -> Dict[str, Any]:
     """Drive a kanban worker through a Ralph-style goal loop.
 
-    The dispatcher spawns a goal-mode worker exactly like a normal worker
-    (``hermes -p <profile> chat -q "work kanban task <id>"``). The worker's
-    first turn has already run by the time this is called; ``first_response``
-    is that turn's reply. From here we:
-
-    1. Check whether the worker already terminated the task (called
-       ``kanban_complete`` / ``kanban_block``). If so, stop — nothing to do.
-    2. Otherwise judge the latest response against ``goal_text`` (the card's
-       title + body). ``continue`` → feed a continuation prompt and run
-       another turn IN THE SAME SESSION via ``run_turn``. ``done`` but the
-       task is still open → one explicit "call kanban_complete" nudge.
-    3. When the turn budget is exhausted and the worker still hasn't
-       terminated the task, ``block_fn`` is invoked so the card lands in a
-       sticky ``blocked`` state for human review (NOT a silent exit).
-
-    This function performs NO SessionDB persistence — a worker process is
-    ephemeral, so the turn budget lives in a local counter. It is fully
-    decoupled from the CLI for testability: callers inject ``run_turn``
-    (str -> str), ``task_status_fn`` (() -> str|None), and ``block_fn``
-    (reason: str -> None).
-
-    Returns a decision dict: ``{"outcome", "turns_used", "reason"}`` where
-    outcome is one of ``"completed_by_worker"``, ``"review_requested_by_worker"``,
-    ``"changes_requested_by_reviewer"``, ``"blocked_budget"``,
-    ``"blocked_by_worker"``, or ``"stopped"``.
+    Each iteration: stop if the worker already terminated the task (``kanban_complete`` /
+    ``kanban_block`` / review hand-off); otherwise judge the latest response against ``goal_text``
+    (the card's title + body) and feed a continuation or finalize nudge. A WAIT verdict is treated
+    as CONTINUE (workers finish via kanban tools, not by parking).
     """
 
     def _log(msg: str) -> None:
@@ -2952,65 +2547,62 @@ def run_kanban_goal_loop(
             except Exception:
                 pass
 
+    def _block(message: str) -> None:
+        try:
+            block_fn(message)
+        except Exception as exc:
+            _log(f"kanban goal loop: block_fn failed ({exc})")
+
+    def _result(outcome: str, reason: str) -> Dict[str, Any]:
+        return {"outcome": outcome, "turns_used": turns_used, "reason": reason}
+
     max_turns = int(max_turns or DEFAULT_MAX_TURNS)
     if max_turns < 1:
         max_turns = DEFAULT_MAX_TURNS
 
     last_response = first_response or ""
-    # The first turn already consumed one unit of budget.
-    turns_used = 1
+    turns_used = 1   # the first turn already consumed one unit of budget
     nudged_to_finalize = False
 
     while True:
-        # Did the worker terminate the task itself this turn?
         try:
             status = task_status_fn()
         except Exception as exc:
             _log(f"kanban goal loop: status check failed ({exc}); stopping")
-            return {"outcome": "stopped", "turns_used": turns_used, "reason": "status check failed"}
+            return _result("stopped", "status check failed")
 
-        if status == "done":
-            _log(f"kanban goal loop: task {task_id} completed by worker after {turns_used} turn(s)")
-            return {"outcome": "completed_by_worker", "turns_used": turns_used, "reason": "worker completed the task"}
-        if status == "blocked":
-            _log(f"kanban goal loop: task {task_id} blocked by worker after {turns_used} turn(s)")
-            return {"outcome": "blocked_by_worker", "turns_used": turns_used, "reason": "worker blocked the task"}
-        if status == "review":
-            # A legitimate worker-driven terminator (kanban_request_review),
-            # not an unexpected stop: the implementation is done and the task
-            # is awaiting a reviewer. Stop the loop cleanly.
-            _log(f"kanban goal loop: task {task_id} handed off for review by worker after {turns_used} turn(s)")
-            return {"outcome": "review_requested_by_worker", "turns_used": turns_used, "reason": "worker requested review"}
-        if status == "changes_requested":
-            _log(f"kanban goal loop: reviewer returned task {task_id} for changes after {turns_used} turn(s)")
-            return {"outcome": "changes_requested_by_reviewer", "turns_used": turns_used, "reason": "reviewer requested changes"}
+        terminal = _KANBAN_TERMINAL_STATUSES.get(status)
+        if terminal is not None:
+            outcome, reason, log_fmt = terminal
+            _log("kanban goal loop: " + log_fmt.format(task_id=task_id, turns=turns_used))
+            return _result(outcome, reason)
         if status not in ("running", "ready"):
             # Reclaimed / archived / unexpected — let the dispatcher own it.
             _log(f"kanban goal loop: task {task_id} status={status!r}; stopping")
-            return {"outcome": "stopped", "turns_used": turns_used, "reason": f"status={status}"}
+            return _result("stopped", f"status={status}")
 
-        # Still open — judge whether the latest response satisfies the card.
-        # The kanban worker loop has no wait-barrier concept (workers finish
-        # via kanban_complete / kanban_block, not by parking), so a WAIT
-        # verdict is treated as CONTINUE here.
         verdict, reason, _parse_failed, _wait, _transport_failed = judge_goal(goal_text, last_response)
         if verdict == "wait":
             verdict = "continue"
         _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")
 
+        if verdict == "blocked":
+            # Unachievable is NOT done: block the card with the judge's reason now instead of
+            # re-poking an impossible goal, and never let it land in done.
+            # The judge ruled the goal cannot be satisfied at all — this is NOT done (#100954).
+            _log(f"kanban goal loop: task {task_id} judged unachievable; blocking")
+            _block(f"Goal-mode judge ruled the goal unachievable: {reason}")
+            return _result("blocked_unachievable", f"judge verdict blocked: {reason}")
+
         if verdict == "done":
             if nudged_to_finalize:
-                # Already asked once to call kanban_complete and it still
-                # didn't — block for review rather than spin.
+                # Already asked once to call kanban_complete — block for review rather than spin.
                 _log(f"kanban goal loop: task {task_id} judged done but worker won't finalize; blocking")
-                try:
-                    block_fn(
-                        f"Goal-mode worker's output looked complete but it never "
-                        f"called kanban_complete after a finalize nudge ({reason})."
-                    )
-                except Exception as exc:
-                    _log(f"kanban goal loop: block_fn failed ({exc})")
-                return {"outcome": "blocked_budget", "turns_used": turns_used, "reason": "judged done, never finalized"}
+                _block(
+                    f"Goal-mode worker's output looked complete but it never "
+                    f"called kanban_complete after a finalize nudge ({reason})."
+                )
+                return _result("blocked_budget", "judged done, never finalized")
             prompt = KANBAN_GOAL_FINALIZE_TEMPLATE.format(reason=_truncate(reason, 400))
             nudged_to_finalize = True
         else:
@@ -3019,22 +2611,18 @@ def run_kanban_goal_loop(
         # Budget check BEFORE spending another turn.
         if turns_used >= max_turns:
             _log(f"kanban goal loop: task {task_id} exhausted {turns_used}/{max_turns} turns; blocking")
-            try:
-                block_fn(
-                    f"Goal-mode worker exhausted its turn budget "
-                    f"({turns_used}/{max_turns}) without completing the task. "
-                    f"Last judge verdict: {_truncate(reason, 300)}"
-                )
-            except Exception as exc:
-                _log(f"kanban goal loop: block_fn failed ({exc})")
-            return {"outcome": "blocked_budget", "turns_used": turns_used, "reason": "turn budget exhausted"}
+            _block(
+                f"Goal-mode worker exhausted its turn budget "
+                f"({turns_used}/{max_turns}) without completing the task. "
+                f"Last judge verdict: {_truncate(reason, 300)}"
+            )
+            return _result("blocked_budget", "turn budget exhausted")
 
-        # Run another turn in the same session.
         try:
             last_response = run_turn(prompt) or ""
         except Exception as exc:
             _log(f"kanban goal loop: run_turn failed ({exc}); stopping")
-            return {"outcome": "stopped", "turns_used": turns_used, "reason": f"run_turn error: {type(exc).__name__}"}
+            return _result("stopped", f"run_turn error: {type(exc).__name__}")
         turns_used += 1
 
 

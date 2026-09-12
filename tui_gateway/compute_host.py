@@ -1,9 +1,5 @@
-"""Persistent dashboard compute-host process.
-
-Phase 0 used this module as a deterministic line-JSON spike.  Phase 1 keeps the
-same transport and turns it into the long-lived child that owns live AIAgent
-objects when ``dashboard.turn_isolation`` is enabled.
-"""
+"""Persistent dashboard compute-host child: owns live AIAgent objects when
+``dashboard.turn_isolation`` is enabled; frames are line-JSON over stdin/stdout."""
 
 from __future__ import annotations
 
@@ -29,6 +25,12 @@ def now_ns() -> int:
     return time.perf_counter_ns()
 
 
+
+
+# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
+# Names external plugins imported from this module before the Sep 2026 decomposition.
+# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
+# The whole block is removed by reverting the commit that added it.
 @dataclass
 class SpikeAgent:
     """A deterministic AIAgent-shaped object for pipe/interrupt measurements."""
@@ -77,7 +79,6 @@ class SpikeAgent:
         ]
         self.history = messages
         return {"final_response": final, "messages": messages, "interrupted": interrupted}
-
 
 @dataclass
 class HostSession:
@@ -272,6 +273,8 @@ class ComputeHost:
             self._handle_turn_start(frame)
         elif kind == "interrupt":
             self._handle_interrupt(frame)
+        elif kind == "respond":
+            self._handle_respond(frame)
         elif kind == "reload_mcp":
             self._handle_reload_mcp(frame)
         elif kind == "control":
@@ -374,6 +377,29 @@ class ComputeHost:
             self.emit({"type": "interrupt.ack", "sid": sid, "request_id": frame.get("request_id"), "applied": True, "applied_ns": now_ns()})
         except Exception as exc:
             self.emit({"type": "interrupt.ack", "sid": sid, "request_id": frame.get("request_id"), "applied": False, "message": str(exc)})
+
+    def _handle_respond(self, frame: dict[str, Any]) -> None:
+        """Resolve an interactive request in the host-owned pending registry."""
+        sid = str(frame.get("sid") or "")
+        request_id = frame.get("request_id")
+        try:
+            from tui_gateway import server
+
+            params = frame.get("params")
+            if sid not in server._sessions:
+                self.emit({"type": "respond.error", "sid": sid, "request_id": request_id,
+                           "message": "session not found"})
+                return
+            if not isinstance(params, dict):
+                self.emit({"type": "respond.error", "sid": sid, "request_id": request_id,
+                           "message": "response params must be an object"})
+                return
+            response = server._methods["clarify.respond"](request_id, params)
+            self.emit({"type": "respond.ack", "sid": sid, "request_id": request_id,
+                       "response": response})
+        except Exception as exc:
+            self.emit({"type": "respond.error", "sid": sid, "request_id": request_id,
+                       "message": str(exc)})
 
     def _run_spike_turn(self, session: HostSession, frame: dict[str, Any]) -> None:
         request_id = frame.get("request_id") or uuid.uuid4().hex

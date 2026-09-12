@@ -12,9 +12,11 @@ which never fires on Windows: ``_pause_windows_gateways_for_update`` /
 hoists the "should the probe have produced rows?" decision into
 ``_fleet_probe_expected_runtimes`` and keys it on the ROW-CAPABLE pre-update
 liveness signals: restart-phase bookkeeping, the pre-restart PID snapshot,
-and the pre-update plan inventory.  The Windows pause/resume token is
-deliberately NOT a signal — it is bookkeeping, not a runtime inventory, and
-its entries have no corresponding ``collect_fleet_versions()`` rows (see
+and the gateway-kind records in the pre-update plan inventory (the plan's
+serve/dashboard records are row-incapable for this probe, #97332).  The
+Windows pause/resume token is deliberately NOT a signal — it is bookkeeping,
+not a runtime inventory, and its entries have no corresponding
+``collect_fleet_versions()`` rows (see
 ``test_update_fleet_probe_resume_token.py``).  The same condition gates the
 2.0s settle sleep.
 """
@@ -24,6 +26,7 @@ from __future__ import annotations
 import types
 
 from hermes_cli.main import _fleet_probe_expected_runtimes
+from hermes_cli.update_inventory import RuntimeRecord
 
 
 def _plan(runtimes):
@@ -33,13 +36,13 @@ def _plan(runtimes):
 class TestEmptySnapshotFailClosed:
     """Signals under which zero fleet rows means verification failure."""
 
-    def test_incomplete_when_pre_update_plan_saw_runtimes(self):
-        # (a) The plan inventoried a live runtime pre-update but the restart
-        # phase's POSIX bookkeeping is empty (e.g. Windows, or an
+    def test_incomplete_when_pre_update_plan_saw_gateway_runtimes(self):
+        # (a) The plan inventoried a live gateway runtime pre-update but the
+        # restart phase's POSIX bookkeeping is empty (e.g. Windows, or an
         # externally-supervised gateway). Zero rows must fail closed.
         assert (
             _fleet_probe_expected_runtimes(
-                _plan([object()]),
+                _plan([RuntimeRecord(kind="gateway", profile="default")]),
                 [],  # pre_restart_pids: probe saw nothing
                 None,  # no Windows resume token
                 [],  # restarted_services
@@ -47,6 +50,15 @@ class TestEmptySnapshotFailClosed:
             )
             is True
         )
+
+    def test_plan_expectation_keys_on_gateway_kind_only(self):
+        # #97332: serve/dashboard plan records have no gateway_state.json row, so a
+        # dashboard-only or serve-only plan must not demand rows (that made a successful
+        # update exit 1); one gateway record alongside them still carries the expectation.
+        non_gateway = [RuntimeRecord(kind="dashboard", profile="default"), RuntimeRecord(kind="serve", profile="default")]
+        assert _fleet_probe_expected_runtimes(_plan(non_gateway), [], None, [], set()) is False
+        mixed = non_gateway + [RuntimeRecord(kind="gateway", profile="work")]
+        assert _fleet_probe_expected_runtimes(_plan(mixed), [], None, [], set()) is True
 
     def test_windows_resume_token_alone_is_not_expected(self):
         # (c) The Windows pause/resume token is EXCLUDED from the expectation

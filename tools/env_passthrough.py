@@ -1,23 +1,8 @@
-"""Environment variable passthrough registry.
-
-Skills that declare ``required_environment_variables`` in their frontmatter
-need those vars available in sandboxed execution environments (execute_code,
-terminal).  By default both sandboxes strip secrets from the child process
-environment for security.  This module provides a session-scoped allowlist
-so skill-declared vars (and user-configured overrides) pass through.
-
-Two sources feed the allowlist:
-
-1. **Skill declarations** — when a skill is loaded via ``skill_view``, its
-   ``required_environment_variables`` are registered here automatically.
-2. **User config** — ``terminal.env_passthrough`` in config.yaml lets users
-   explicitly allowlist vars for non-skill use cases.
-
-Both ``code_execution_tool.py`` and ``tools/environments/local.py`` consult
-:func:`is_env_passthrough` before stripping a variable.
-When profile multiplexing is active, their forwarded values are resolved
-through the current profile's secret scope rather than the process environment.
-"""
+"""Environment variable passthrough registry: the session-scoped allowlist of vars a
+skill's ``required_environment_variables`` (registered by ``skill_view``) or
+``terminal.env_passthrough`` in config.yaml may forward into sandboxed children
+(execute_code, terminal), which strip secrets by default. Under profile multiplexing,
+forwarded values resolve through the profile's secret scope, not the process env."""
 
 from __future__ import annotations
 
@@ -26,12 +11,12 @@ import os
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Iterable
-from hermes_cli.config import cfg_get
+from hermes_cli.config import cfg_get, read_raw_config
 
 logger = logging.getLogger(__name__)
 
-# Session-scoped set of env var names that should pass through to sandboxes.
-# Backed by ContextVar to prevent cross-session data bleed in the gateway pipeline.
+# Session-scoped allowlist; ContextVar-backed to prevent cross-session bleed
+# in the gateway pipeline.
 _allowed_env_vars_var: ContextVar[set[str]] = ContextVar("_allowed_env_vars")
 
 
@@ -52,37 +37,22 @@ _config_passthrough: frozenset[str] | None = None
 
 
 def _is_hermes_provider_credential(name: str) -> bool:
-    """True if ``name`` is a Hermes-managed provider credential (API key,
-    token, or similar) per ``_HERMES_PROVIDER_ENV_BLOCKLIST``.
-
-    Skill-declared ``required_environment_variables`` frontmatter must
-    not be able to override this list — that was the bypass in
-    GHSA-rhgp-j443-p4rf where a malicious skill registered
-    ``ANTHROPIC_TOKEN`` / ``OPENAI_API_KEY`` as passthrough and received
-    the credential in the ``execute_code`` child process, defeating the
-    sandbox's scrubbing guarantee.
-
-    Non-Hermes API keys (TENOR_API_KEY, NOTION_TOKEN, etc.) are NOT
-    in the blocklist and remain legitimately registerable — skills that
-    wrap third-party APIs still work.
-
-    Fail closed: if the authoritative blocklist cannot be imported (partial
-    install, import-time error, etc.) we treat the name as a protected
-    provider credential and refuse passthrough, rather than fall open and
-    let a skill tunnel a Hermes credential into the execute_code child.
-    """
+    """True if ``name`` is a Hermes-managed provider credential per
+    ``_HERMES_PROVIDER_ENV_BLOCKLIST`` or a dynamic Hermes-internal secret
+    (AUXILIARY_*_API_KEY / _BASE_URL, GATEWAY_RELAY_*). Skill-declared
+    ``required_environment_variables`` must not override this — that was the
+    GHSA-rhgp-j443-p4rf bypass (a skill registered ``OPENAI_API_KEY`` and received it
+    in the ``execute_code`` child); non-Hermes keys (TENOR_API_KEY, …) stay
+    registerable. Fails closed when the blocklist cannot be imported."""
     try:
-        from tools.environments.local import (
+        from tools.environments.local_env_policy import (
             _is_blocked_provider_env,
             _is_hermes_internal_secret,
         )
     except Exception as e:
         logger.warning(
             "env passthrough: provider credential blocklist import failed; "
-            "failing closed and refusing passthrough registration for %r: %s",
-            name,
-            e,
-        )
+            "failing closed and refusing passthrough registration for %r: %s", name, e)
         return True
     # Dynamically-generated Hermes-internal secrets (AUXILIARY_*_API_KEY /
     # _BASE_URL side-LLM credentials, GATEWAY_RELAY_* relay-auth) are provider
@@ -95,36 +65,30 @@ def _is_hermes_provider_credential(name: str) -> bool:
 
 
 def register_env_passthrough(var_names: Iterable[str]) -> None:
-    """Register environment variable names as allowed in sandboxed environments.
+    """Register env var names as allowed in sandboxed environments (typically a
+    skill's ``required_environment_variables``). Hermes-managed provider credentials
+    are rejected (GHSA-rhgp-j443-p4rf) — such skills should use the main-process tools
+    (web_search, web_extract, …); third-party keys pass normally."""
+    for name in _accepted((n.strip() for n in var_names), (
+        "env passthrough: refusing to register Hermes provider "
+        "credential %r (blocked by _HERMES_PROVIDER_ENV_BLOCKLIST). "
+        "Skills must not override the execute_code sandbox's "
+        "credential scrubbing; see GHSA-rhgp-j443-p4rf."
+    )):
+        _get_allowed().add(name)
+        logger.debug("env passthrough: registered %s", name)
 
-    Typically called when a skill declares ``required_environment_variables``.
 
-    Variables that are Hermes-managed provider credentials (from
-    ``_HERMES_PROVIDER_ENV_BLOCKLIST``) are rejected here to preserve
-    the ``execute_code`` sandbox's credential-scrubbing guarantee per
-    GHSA-rhgp-j443-p4rf. A skill that needs to talk to a Hermes-managed
-    provider should do so via the agent's main-process tools (web_search,
-    web_extract, etc.) where the credential remains safely in the main
-    process.
-
-    Non-Hermes third-party API keys (TENOR_API_KEY, NOTION_TOKEN, etc.)
-    pass through normally — they were never in the sandbox scrub list.
-    """
-    for name in var_names:
-        name = name.strip()
+def _accepted(names, refusal_msg: str):
+    """Yield non-empty *names* that are not Hermes provider credentials; refused
+    names are logged with *refusal_msg* (``%r`` = name)."""
+    for name in names:
         if not name:
             continue
         if _is_hermes_provider_credential(name):
-            logger.warning(
-                "env passthrough: refusing to register Hermes provider "
-                "credential %r (blocked by _HERMES_PROVIDER_ENV_BLOCKLIST). "
-                "Skills must not override the execute_code sandbox's "
-                "credential scrubbing; see GHSA-rhgp-j443-p4rf.",
-                name,
-            )
+            logger.warning(refusal_msg, name)
             continue
-        _get_allowed().add(name)
-        logger.debug("env passthrough: registered %s", name)
+        yield name
 
 
 def _load_config_passthrough(
@@ -172,7 +136,6 @@ def _load_config_passthrough(
                 result.add(name)
     except Exception as e:
         logger.debug("Could not read tools.env_passthrough from config: %s", e)
-
     _config_passthrough = frozenset(result)
     return _config_passthrough
 
@@ -200,42 +163,22 @@ def get_all_passthrough(
     return frozenset(_get_allowed()) | _load_config_passthrough(profile_home)
 
 
-def resolve_passthrough_value(
-    name: str,
-    fallback: str | None = None,
-) -> str | None:
-    """Resolve an allowlisted variable without crossing profile boundaries.
-
-    ``fallback`` is the value the caller would have forwarded before profile
-    secret scopes existed (typically a snapshot of ``os.environ`` or the
-    current profile's ``.env``).  An active multiplex scope is authoritative:
-    a missing key returns ``None`` and never falls back to the process-global
-    environment.  An unscoped read while multiplexing is active raises the
-    fail-closed ``UnscopedSecretError`` from :mod:`agent.secret_scope`.
-
-    Outside multiplexing, an installed scope keeps the existing overlay
-    semantics and an unscoped caller keeps its already-resolved fallback.
-    """
+def resolve_passthrough_value(name: str, fallback: str | None = None) -> str | None:
+    """Resolve an allowlisted variable without crossing profile boundaries. ``fallback``
+    is what the caller would have forwarded before secret scopes existed (a snapshot of
+    ``os.environ`` / the profile ``.env``). An active multiplex scope is authoritative:
+    a missing key returns ``None``, never the process-global env, and an unscoped read
+    raises the fail-closed ``UnscopedSecretError``. Outside multiplexing an installed
+    scope keeps overlay semantics and an unscoped caller keeps its fallback."""
     from agent.secret_scope import (
-        _is_global_env,
-        current_secret_scope,
-        get_secret,
-        is_multiplex_active,
-    )
-
-    # Global terminal/runtime settings are not profile secrets.  ``fallback``
-    # is already the caller's effective value (including an explicit per-call
-    # override), so preserve it instead of replacing it with the process-wide
-    # value while a multiplex scope is active.
+        _is_global_env, current_secret_scope, get_secret, is_multiplex_active)
+    # Global terminal/runtime settings are not profile secrets; ``fallback`` is
+    # already the caller's effective value (incl. an explicit per-call override).
     if _is_global_env(name) and fallback is not None:
         return fallback
-
-    scope = current_secret_scope()
     multiplex_active = is_multiplex_active()
-    if scope is None:
-        if multiplex_active:
-            return get_secret(name)
-        return fallback
+    if current_secret_scope() is None:
+        return get_secret(name) if multiplex_active else fallback
     return get_secret(name, None if multiplex_active else fallback)
 
 
