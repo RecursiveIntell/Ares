@@ -448,7 +448,7 @@ class TestWaitBarrier:
             mgr.wait_on(proc.pid, reason="poller")
             assert mgr.is_waiting() is True
             mgr.state.waiting_since = time.time() - goals._MAX_BARRIER_WAIT_S - 1
-            mgr._save()
+            assert goals.save_goal(mgr.session_id, mgr.state)
             assert mgr.is_waiting() is False
             assert mgr.state.waiting_on_pid is None
         finally:

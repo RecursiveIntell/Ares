@@ -184,6 +184,7 @@ import {
 import { buildSessionByAnyId, resolvePinnedSessions } from './session-index'
 import { SidebarSessionsSection, VIRTUALIZE_THRESHOLD } from './sessions-section'
 import { CONTEXT_SPLIT_KIT, SplitSubmenu } from './split-submenu'
+import { useEnteredProjectSessions } from './use-entered-project-sessions'
 import { stabilizeSessionOrder } from './stable-session-order'
 
 // Non-session groups (messaging platforms) stay compact: show a few rows up

@@ -1382,16 +1382,24 @@ class GoalManager:
             next_action="run the first turn",
             turns_used=0,
             max_turns=int(max_turns) if max_turns else self.default_max_turns,
+            created_at=time.time(),
+            last_turn_at=0.0,
             contract=contract if contract is not None else GoalContract(),
         )
-        return self._save()
+        self._state = state
+        save_goal(self.session_id, state)
+        return state
 
     def set_contract(self, contract: GoalContract) -> Optional[GoalState]:
-        """Attach or replace the completion contract on the active goal."""
+        """Attach or replace the completion contract on the active goal.
+
+        Returns the updated state, or None when there is no goal to attach to.
+        """
         if self._state is None:
             return None
         self._state.contract = contract or GoalContract()
-        return self._save()
+        save_goal(self.session_id, self._state)
+        return self._state
 
     def add_collaboration_contract_ref(self, contract_ref: str) -> GoalState:
         """Attach a content-addressed collaboration artifact to this goal.
@@ -1627,50 +1635,66 @@ class GoalManager:
     # --- /subgoal user controls ---------------------------------------
 
     def add_subgoal(self, text: str) -> str:
-        """Append a user-added criterion; raises ``RuntimeError`` without ``has_goal()``."""
-        state = self._require_goal()
+        """Append a user-added criterion to the active goal. Requires
+        ``has_goal()``; raises ``RuntimeError`` otherwise.
+
+        Returns the cleaned text so the caller can show it back to the user.
+        """
+        if self._state is None or not self.has_goal():
+            raise RuntimeError("no active goal")
         text = (text or "").strip()
         if not text:
             raise ValueError("subgoal text is empty")
-        state.subgoals.append(text)
-        self._save()
+        self._state.subgoals.append(text)
+        save_goal(self.session_id, self._state)
         return text
-
-    def _pop_item(self, attr: str, index_1based: int):
-        items = getattr(self._require_goal(), attr)
-        idx = int(index_1based) - 1
-        if idx < 0 or idx >= len(items):
-            raise IndexError(f"index out of range (1..{len(items)})")
-        removed = items.pop(idx)
-        self._save()
-        return removed
-
-    def _clear_items(self, attr: str) -> int:
-        state = self._require_goal()
-        prev = len(getattr(state, attr))
-        setattr(state, attr, [])
-        self._save()
-        return prev
 
     def remove_subgoal(self, index_1based: int) -> str:
         """Remove a subgoal by 1-based index. Returns the removed text."""
-        return self._pop_item("subgoals", index_1based)
+        if self._state is None or not self.has_goal():
+            raise RuntimeError("no active goal")
+        idx = int(index_1based) - 1
+        if idx < 0 or idx >= len(self._state.subgoals):
+            raise IndexError(
+                f"index out of range (1..{len(self._state.subgoals)})"
+            )
+        removed = self._state.subgoals.pop(idx)
+        save_goal(self.session_id, self._state)
+        return removed
 
     def clear_subgoals(self) -> int:
         """Wipe all subgoals. Returns the previous count."""
-        return self._clear_items("subgoals")
+        if self._state is None or not self.has_goal():
+            raise RuntimeError("no active goal")
+        prev = len(self._state.subgoals)
+        self._state.subgoals = []
+        save_goal(self.session_id, self._state)
+        return prev
 
     def render_subgoals(self) -> str:
         """Public helper for the /subgoal slash command."""
         if self._state is None:
             return "(no active goal)"
-        return self._state.render_subgoals_block() or "(no subgoals — use /subgoal <text> to add criteria)"
+        if not self._state.subgoals:
+            return "(no subgoals — use /subgoal <text> to add criteria)"
+        return self._state.render_subgoals_block()
 
     # --- /goal gate quality gates ---------------------------------------
 
-    def add_gate(self, command: str, *, timeout_seconds: Optional[int] = None, max_retries: Optional[int] = None) -> GoalGate:
-        """Append a quality-gate command; raises ``RuntimeError`` without ``has_goal()``."""
-        state = self._require_goal()
+    def add_gate(
+        self,
+        command: str,
+        *,
+        timeout_seconds: Optional[int] = None,
+        max_retries: Optional[int] = None,
+    ) -> GoalGate:
+        """Append a quality-gate command to the active goal.
+
+        Requires ``has_goal()``; raises ``RuntimeError`` otherwise. Returns
+        the created gate so callers can echo it back.
+        """
+        if self._state is None or not self.has_goal():
+            raise RuntimeError("no active goal")
         command = (command or "").strip()
         if not command:
             raise ValueError("gate command is empty")
@@ -1715,19 +1739,26 @@ class GoalManager:
         lines = []
         for i, g in enumerate(self._state.gates, start=1):
             status = ""
-            if g.last_exit_code == 0:
-                status = " ✓ passing"
-            elif g.last_exit_code is not None:
-                status = f" ✗ failing (exit {g.last_exit_code}, attempt {g.attempts}/{g.max_retries})"
+            if g.last_exit_code is not None:
+                status = " ✓ passing" if g.last_exit_code == 0 else (
+                    f" ✗ failing (exit {g.last_exit_code}, attempt {g.attempts}/{g.max_retries})"
+                )
             lines.append(f"- {i}. $ {g.command}{status}")
         return "\n".join(lines)
 
     def _check_gates(self) -> Optional[Dict[str, Any]]:
         """Run quality gates in order; return a decision dict on failure.
 
-        An unchanged workspace since the last failure of the same gate is NOT re-run — the recorded
-        failure is replayed and the attempt count advances, so a stalled agent can't spin re-running
-        an identical red suite.
+        Returns ``None`` when there are no gates or every gate passes —
+        the caller then proceeds to the LLM judge. On the first failing
+        gate, returns a full ``evaluate_after_turn``-shaped decision dict:
+        either a continuation carrying the gate's output (attempts left)
+        or an auto-pause (retries exhausted).
+
+        An unchanged workspace since the last failure of the same gate is
+        NOT re-run — the recorded failure is replayed and the attempt count
+        advances, so a stalled agent can't spin re-running an identical red
+        suite (mirrors Prime-Agent's unchanged-gate rule).
         """
         state = self._state
         if state is None or not state.gates:
@@ -1735,7 +1766,11 @@ class GoalManager:
 
         fingerprint = workspace_fingerprint()
         for gate in state.gates:
-            unchanged = bool(fingerprint) and gate.last_exit_code not in (None, 0) and gate.last_failed_fingerprint == fingerprint
+            unchanged = (
+                bool(fingerprint)
+                and gate.last_exit_code not in (None, 0)
+                and gate.last_failed_fingerprint == fingerprint
+            )
             if unchanged:
                 passed, exit_code, tail = False, int(gate.last_exit_code or -1), gate.last_output_tail
             else:
@@ -1781,52 +1816,94 @@ class GoalManager:
 
     # --- /goal wait barrier -------------------------------------------
 
-    def _park(self, reason: str, **barrier) -> GoalState:
-        state = self._require_active()
-        state.clear_wait()
-        for k, v in barrier.items():
-            setattr(state, k, v)
-        state.waiting_reason = (reason or "").strip() or None
-        state.waiting_since = time.time()
-        return self._save()
-
     def wait_on(self, pid: int, reason: str = "") -> GoalState:
-        """Park the goal loop until a background PID exits (no turn burned, no judge call). For a
-        process with a watch/notify trigger prefer ``wait_on_session``. Requires an active goal."""
-        self._require_active()
+        """Park the goal loop on a background process PID.
+
+        While the PID is alive, ``evaluate_after_turn`` returns
+        ``should_continue=False`` without burning a turn or calling the
+        judge — the loop quiesces instead of re-poking the agent into busy
+        work. The barrier auto-clears when the process exits. Requires an
+        active goal. For a process with a watch_patterns/notify_on_complete
+        trigger, prefer ``wait_on_session`` so a mid-run trigger (not just
+        exit) releases the barrier.
+        """
+        if self._state is None or self._state.status != "active":
+            raise RuntimeError("no active goal to park")
         pid = int(pid)
         if pid <= 0:
             raise ValueError("pid must be a positive integer")
-        return self._park(reason, waiting_on_pid=pid)
+        self._state.waiting_on_pid = pid
+        self._state.waiting_on_session = None
+        self._state.waiting_until = 0.0
+        self._state.waiting_on_delegations = 0
+        self._state.waiting_reason = (reason or "").strip() or None
+        self._state.waiting_since = time.time()
+        save_goal(self.session_id, self._state)
+        return self._state
 
     def wait_on_session(self, session_id: str, reason: str = "") -> GoalState:
-        """Park on a process_registry session's OWN trigger: exit OR ``watch_patterns`` match. The
-        right barrier for a long-lived watcher/poller that signals mid-run and may never exit."""
-        self._require_active()
+        """Park the goal loop on a process_registry session's OWN trigger.
+
+        Unlike ``wait_on`` (which releases only on PID exit), this releases
+        when the session's trigger fires: it exits, OR — if it was started
+        with ``watch_patterns`` — its pattern matches. This is the right
+        barrier for a long-lived watcher/server/poller that signals mid-run
+        and may never exit. Requires an active goal.
+        """
+        if self._state is None or self._state.status != "active":
+            raise RuntimeError("no active goal to park")
         session_id = str(session_id or "").strip()
         if not session_id:
             raise ValueError("session_id must be a non-empty string")
-        return self._park(reason, waiting_on_session=session_id)
+        self._state.waiting_on_session = session_id
+        self._state.waiting_on_pid = None
+        self._state.waiting_until = 0.0
+        self._state.waiting_on_delegations = 0
+        self._state.waiting_reason = (reason or "").strip() or None
+        self._state.waiting_since = time.time()
+        save_goal(self.session_id, self._state)
+        return self._state
 
     def wait_for_seconds(self, seconds: int, reason: str = "", *, on_delegations: int = 0) -> GoalState:
-        """Park until ``seconds`` from now (backoff/cooldown waits with no process to track). With
-        ``on_delegations`` the wait is FOR those live delegation batches: it also lifts as soon as
-        fewer are live (a batch result came back), so the loop re-judges with the result in hand
-        instead of sleeping out a 20-minute timer (independent review: results arrived with 1,199 s
-        left on the timer and nothing re-judged)."""
-        self._require_active()
+        """Park the goal loop until ``seconds`` from now have elapsed.
+
+        Time-based counterpart to ``wait_on`` — for backoff / cooldown waits
+        where there's no process to track (e.g. the agent is rate-limited).
+        The barrier auto-clears once the deadline passes. Requires an active
+        goal.
+        """
+        if self._state is None or self._state.status != "active":
+            raise RuntimeError("no active goal to park")
         seconds = int(seconds)
         if seconds <= 0:
             raise ValueError("seconds must be a positive integer")
-        return self._park(reason, waiting_until=time.time() + seconds, waiting_on_delegations=max(0, int(on_delegations)))
+        self._state.waiting_on_pid = None
+        self._state.waiting_on_session = None
+        self._state.waiting_until = time.time() + seconds
+        self._state.waiting_on_delegations = max(0, int(on_delegations))
+        self._state.waiting_reason = (reason or "").strip() or None
+        self._state.waiting_since = time.time()
+        save_goal(self.session_id, self._state)
+        return self._state
 
     def stop_waiting(self) -> bool:
-        """Clear any active wait barrier (pid / session / time). Returns True if one was cleared."""
-        s = self._state
-        if s is None or (s.waiting_on_pid is None and s.waiting_on_session is None and not s.waiting_until):
+        """Clear any active wait barrier (pid / session / time). Returns True
+        if one was cleared."""
+        if self._state is None:
             return False
-        s.clear_wait()
-        self._save()
+        if (
+            self._state.waiting_on_pid is None
+            and self._state.waiting_on_session is None
+            and not self._state.waiting_until
+        ):
+            return False
+        self._state.waiting_on_pid = None
+        self._state.waiting_on_session = None
+        self._state.waiting_until = 0.0
+        self._state.waiting_on_delegations = 0
+        self._state.waiting_reason = None
+        self._state.waiting_since = 0.0
+        save_goal(self.session_id, self._state)
         return True
 
     def is_waiting(self) -> bool:
@@ -2020,8 +2097,18 @@ class GoalManager:
         return _decision("active", False, None, "wait", reason, f"⏳ Goal parked (judge) — waiting on {tgt}: {reason}")
 
     def _budget_pause(self, state: GoalState, verdict: str, reason: str, note: str = "") -> Dict[str, Any]:
-        return self._pause_decision(
-            f"turn budget exhausted ({state.turns_used}/{state.max_turns})", verdict, reason,
+        state.status = "paused"
+        state.outcome = TURN_BUDGET_EXHAUSTED
+        state.paused_reason = f"turn budget exhausted ({state.turns_used}/{state.max_turns})"
+        if not self._checkpoint(
+            TURN_BUDGET_EXHAUSTED,
+            state.paused_reason,
+            "explicit /goal resume after inspecting cumulative budget",
+            continuation=False,
+        ):
+            return self._persistence_failure("turn budget stop could not be saved")
+        return _decision(
+            "paused", False, None, verdict, reason,
             f"⏸ Goal paused — {state.turns_used}/{state.max_turns} turns used{note}. "
             "Use /goal resume to keep going, or /goal clear to stop.",
         )
@@ -2029,6 +2116,7 @@ class GoalManager:
     def evaluate_after_turn(
         self, last_response: str, *, user_initiated: bool = True,
         background_processes: Optional[List[Dict[str, Any]]] = None,
+        active_delegations: int = 0,
         turn_outcome: Optional[str] = None,
         turn_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
@@ -2091,15 +2179,10 @@ class GoalManager:
         if verdict == "wait" and wait_directive:
             return self._apply_wait_directive(wait_directive, reason, active_delegations=active_delegations)
 
-        # BLOCKED is NOT done: pause so the user sees the judge's reason and can re-scope or override,
-        # instead of burning turns on an unachievable goal or waving it through as complete.
-        # BLOCKED verdict: the judge ruled the goal genuinely cannot be satisfied as stated (impossible, out
-        # of scope, needs user input). See #100954.
+        # BLOCKED is not completion. Use the canonical lifecycle stop owner
+        # so pause, checkpoint, outcome, and persistence remain one transition.
         if verdict == "blocked":
-            return self._pause_decision(
-                f"judged unachievable: {reason}", "blocked", reason,
-                f"🚫 Goal judged unachievable — paused: {reason} Re-scope with /goal set, or override with /goal resume.",
-            )
+            return self._execution_stop(GOAL_BLOCKED, f"judged unachievable: {reason}", metadata=turn_metadata)
 
         if verdict == "done":
             # Judge prose is never completion evidence. Even a structured
@@ -2170,6 +2253,24 @@ class GoalManager:
             state.paused_reason = (
                 f"judge model returned unparseable output {state.consecutive_parse_failures} turns in a row"
             )
+            save_goal(self.session_id, state)
+            return {
+                "status": "paused",
+                "should_continue": False,
+                "continuation_prompt": None,
+                "verdict": "continue",
+                "reason": reason,
+                "message": (
+                    f"⏸ Goal paused — the judge model ({state.consecutive_parse_failures} turns) "
+                    "isn't returning the required JSON verdict. Route the judge to a stricter "
+                    "model in ~/.hermes/config.yaml:\n"
+                    "  auxiliary:\n"
+                    "    goal_judge:\n"
+                    "      provider: openrouter\n"
+                    "      model: google/gemini-3-flash-preview\n"
+                    "Then /goal resume to continue."
+                ),
+            }
 
         if state.turns_used >= state.max_turns:
             state.status = "paused"
