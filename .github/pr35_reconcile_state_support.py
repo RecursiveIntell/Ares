@@ -34,14 +34,22 @@ def main() -> None:
         ["git", "show", f"{PINNED_MAIN}:hermes_state.py"], text=True
     )
 
-    # Re-export the exact Ares common owners. PR35's modular Hermes file kept
-    # only escape_like/stat identity, while surviving Ares call sites reference
-    # lineage, recovery, preview and last-active owners from hermes_state_common.
+    # Re-export current Ares common owners while retaining the modular
+    # SessionDB's db-file identity alias.  Both names resolve to the single
+    # canonical implementation in hermes_state_common; no helper is copied.
     common_start = "from hermes_state_common import ("
     merged_common_end = "from hermes_state_errors import (\n"
     main_common_end = "from hermes_state_portability import SessionPortabilityMixin\n"
     merged_common = between(merged, common_start, merged_common_end)
     canonical_common = between(ares_main, common_start, main_common_end)
+    identity_alias = "    stat_db_file_identity as _stat_db_file_identity,\n"
+    if identity_alias not in canonical_common:
+        escape_alias = "    escape_like as _escape_like,\n"
+        if canonical_common.count(escape_alias) != 1:
+            raise SystemExit("unexpected current-main escape_like import shape")
+        canonical_common = canonical_common.replace(
+            escape_alias, escape_alias + identity_alias, 1
+        )
     merged = merged.replace(merged_common, canonical_common, 1)
 
     # The modular SessionDB split moved these helpers into hermes_state_sessions.
@@ -69,6 +77,7 @@ def main() -> None:
 
     checked = path.read_text(encoding="utf-8")
     required = (
+        "stat_db_file_identity as _stat_db_file_identity,",
         "_MODEL_CONFIG_ROW_MISSING,",
         "_collect_delegate_child_ids,",
         "_cwd_prefix_clause,",
