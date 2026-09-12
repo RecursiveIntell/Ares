@@ -27,7 +27,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "fcf2293c86eb915c1aee7267da7617624fd0bf1a"
+          test "$(git rev-parse HEAD^)" = "b579d90ba9636a168a9850f1f0d0573eb4eb724c"
           git fetch --no-tags origin main
           test "$(git rev-parse origin/main)" = "0451a66cbb765a3ede359660e37b1b2fbe857525"
           test -z "$(git status --porcelain)"
@@ -46,7 +46,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sed -i 's/return self\._execution_stop(GOAL_BLOCKED, reason, metadata=turn_metadata)/return self._execution_stop(GOAL_BLOCKED, f"judged unachievable: {reason}", metadata=turn_metadata)/' .github/pr35_reconcile.py
           python3 .github/pr35_reconcile.py
           git add hermes_state.py hermes_cli/goals.py tests/hermes_cli/test_goals.py
           git diff --cached --check
