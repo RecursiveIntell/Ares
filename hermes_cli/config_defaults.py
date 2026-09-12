@@ -295,6 +295,12 @@ DEFAULT_CONFIG = {
         # from gateway_timeout (which kills the turn) and
         # gateway_notify_interval ("still working" heartbeats). 0 = disable.
         "session_stall_timeout": 300,
+        # Maximum time (seconds) a second process waits for the durable
+        # session-turn lease before refusing the turn with an explicit retry
+        # result. A long model/tool turn may legitimately hold the lease, but
+        # an unbounded cross-process wait freezes a Desktop session and hides
+        # the ownership conflict. 0 means try once without waiting.
+        "session_turn_lease_wait_seconds": 30,
         # Long-lived reconnect-loop escalation (seconds). A platform that has
         # been continuously failing/reconnecting for this long gets
         # needs_attention flagged in gateway runtime status (visible in
