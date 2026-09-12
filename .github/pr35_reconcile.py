@@ -204,7 +204,7 @@ def reconcile_goals() -> None:
         "        # BLOCKED is not completion. Use the canonical lifecycle stop owner\n"
         "        # so pause, checkpoint, outcome, and persistence remain one transition.\n"
         "        if verdict == \"blocked\":\n"
-        "            return self._execution_stop(GOAL_BLOCKED, reason, metadata=turn_metadata)\n\n"
+        "            return self._execution_stop(GOAL_BLOCKED, f\"judged unachievable: {reason}\", metadata=turn_metadata)\n\n"
     )
     eval_block = eval_block[:replace_pos] + blocked_new + eval_block[done_pos:]
     merged = merged.replace(between(merged, eval_start, goal_class_end), eval_block, 1)
