@@ -27,7 +27,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "c4410997433f400f55ee446c08193c80819662d1"
+          test "$(git rev-parse HEAD^)" = "93fb8fc4512ad95b02f740e821b3aec9362a20b4"
           git fetch --no-tags origin main
           test "$(git rev-parse origin/main)" = "94a17d17521d92407b6418e57e755e279e40cc6f"
           test -z "$(git status --porcelain)"
@@ -118,6 +118,7 @@ jobs:
               "maybe_auto_prune_and_vacuum": SessionMaintenanceMixin,
               "sweep_orphaned_sessions": SessionMaintenanceMixin,
               "_prune_filter_where": SessionMaintenanceMixin,
+              "_check_transcript_write_guards": SessionMessagesMixin,
               "get_resume_message_count": SessionMessagesMixin,
               "assert_resume_safe": SessionMessagesMixin,
           }
