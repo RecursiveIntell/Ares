@@ -62,7 +62,7 @@ class CodexAppServerClient:
         if codex_home:
             spawn_env["CODEX_HOME"] = codex_home
 
-        cmd = [codex_bin, "app-server", *(extra_args or [])]
+        app_server_args = list(extra_args or [])
         from agent.delegation_context import (
             DELEGATED_CHILD_ENV_MARKER, KANBAN_ENV_KEYS,
             delegated_child_subprocess_env, is_dispatcher_owned_worker_context,
@@ -74,8 +74,8 @@ class CodexAppServerClient:
         if owned_task:
             for key in (*KANBAN_ENV_KEYS, "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD"):
                 if key in os.environ:
-                    cmd += ["-c", f"mcp_servers.hermes-mcp.env.{key}={json.dumps(os.environ[key])}"]
-            cmd += ["-c", f'mcp_servers.hermes-mcp.env.{DELEGATED_CHILD_ENV_MARKER}=""']
+                    app_server_args += ["-c", f"mcp_servers.hermes-mcp.env.{key}={json.dumps(os.environ[key])}"]
+            app_server_args += ["-c", f'mcp_servers.hermes-mcp.env.{DELEGATED_CHILD_ENV_MARKER}=""']
         spawn_env = delegated_child_subprocess_env(spawn_env)
         # Kanban workers must write handoff/status to the board DB outside the
         # workspace: keep the sandbox on, add the Kanban root as writable.
@@ -103,7 +103,7 @@ class CodexAppServerClient:
                 ]
             )
 
-        cmd = [codex_bin, "app-server"] + app_server_args
+        cmd = [codex_bin, "app-server", *app_server_args]
         # Codex emits tracing to stderr; default WARN keeps it quiet for users.
         spawn_env.setdefault("RUST_LOG", "warn")
 
