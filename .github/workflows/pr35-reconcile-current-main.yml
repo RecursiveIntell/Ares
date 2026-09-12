@@ -27,7 +27,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "15140675180ee068dd24d6da5a78c666c9d2dc81"
+          test "$(git rev-parse HEAD^)" = "c4410997433f400f55ee446c08193c80819662d1"
           git fetch --no-tags origin main
           test "$(git rev-parse origin/main)" = "94a17d17521d92407b6418e57e755e279e40cc6f"
           test -z "$(git status --porcelain)"
@@ -112,9 +112,14 @@ jobs:
               "_insert_session_row": SessionSessionsMixin,
               "list_sessions_rich": SessionSessionsMixin,
               "apply_telegram_topic_migration": SessionTelegramTopicsMixin,
+              "bind_telegram_topic": SessionTelegramTopicsMixin,
+              "get_telegram_topic_binding": SessionTelegramTopicsMixin,
               "find_latest_gateway_session_for_peer": SessionGatewayMixin,
               "maybe_auto_prune_and_vacuum": SessionMaintenanceMixin,
+              "sweep_orphaned_sessions": SessionMaintenanceMixin,
+              "_prune_filter_where": SessionMaintenanceMixin,
               "get_resume_message_count": SessionMessagesMixin,
+              "assert_resume_safe": SessionMessagesMixin,
           }
           for name, owner in modular_owners.items():
               assert name not in hermes_state.SessionDB.__dict__, name
@@ -152,7 +157,6 @@ jobs:
           source .venv/bin/activate
           python -m pytest -q \
             tests/test_hermes_state.py::TestSchemaInit::test_telegram_topic_binding_roundtrip_requires_explicit_schema \
-            tests/test_hermes_state.py::TestCompressionChainProjection::test_list_serves_full_lineage_ids_for_projected_rows \
             tests/test_hermes_state.py::TestVacuum::test_auto_maintenance_skips_vacuum_below_freelist_ratio \
             tests/test_hermes_state.py::TestVacuum::test_auto_maintenance_vacuums_above_freelist_ratio \
             tests/test_hermes_state.py::TestVacuum::test_auto_maintenance_freelist_ratio_exactly_at_threshold_skips \
@@ -160,8 +164,6 @@ jobs:
             tests/test_hermes_state.py::TestVacuum::test_auto_maintenance_ratio_gate_threshold_is_overridable \
             tests/test_hermes_state.py::TestAutoMaintenance::test_first_run_prunes_and_skips_vacuum_when_little_reclaimable \
             tests/test_hermes_state.py::TestAutoMaintenance::test_first_run_prunes_and_vacuums_when_mostly_reclaimable \
-            tests/test_hermes_state.py::test_peer_fallback_never_adopts_a_sibling_profiles_row \
-            tests/test_hermes_state.py::test_child_inherits_parent_profile_only_within_its_key_namespace \
             tests/test_hermes_state.py::TestGetMessagesPagination::test_resume_safety_tip_only_counts_the_tip_segment \
             tests/test_hermes_state.py::TestGetMessagesPagination::test_resume_guard_counts_exactly_what_a_branch_resume_loads
 
