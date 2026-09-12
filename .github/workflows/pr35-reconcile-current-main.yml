@@ -27,7 +27,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "b4b625bc8dcb8316ffe3df9a140672746a9d5257"
+          test "$(git rev-parse HEAD^)" = "49536d48f5515b633d899273393b3f8b9b0825a6"
           git fetch --no-tags origin main
           test "$(git rev-parse origin/main)" = "94a17d17521d92407b6418e57e755e279e40cc6f"
           test -z "$(git status --porcelain)"
@@ -48,6 +48,7 @@ jobs:
           set -euo pipefail
           python3 .github/pr35_reconcile.py
           python3 .github/pr35_reconcile_state_support.py
+          python3 .github/pr35_reconcile_state_ownership.py
           git add hermes_state.py hermes_cli/goals.py tests/hermes_cli/test_goals.py
           git diff --cached --check
 
@@ -78,6 +79,12 @@ jobs:
           import agent.context_compressor as context_compressor
           import agent.memory_manager as memory_manager
           from hermes_cli.goals import GoalManager
+          from hermes_state_gateway import SessionGatewayMixin
+          from hermes_state_maintenance import SessionMaintenanceMixin
+          from hermes_state_messages import SessionMessagesMixin
+          from hermes_state_sessions import SessionSessionsMixin
+          from hermes_state_telegram import SessionTelegramTopicsMixin
+
           assert hermes_state.SessionDB.RECOVERABLE_END_REASONS == hermes_state._RECOVERABLE_END_REASONS
           assert hermes_state._DB_PERSISTED_MARKER_KEY == context_compressor._DB_PERSISTED_MARKER
           assert hermes_state.sanitize_context is memory_manager.sanitize_context
@@ -100,6 +107,18 @@ jobs:
               "_sql_session_last_active_by_id",
           ):
               assert hasattr(hermes_state, name), name
+
+          modular_owners = {
+              "_insert_session_row": SessionSessionsMixin,
+              "list_sessions_rich": SessionSessionsMixin,
+              "apply_telegram_topic_migration": SessionTelegramTopicsMixin,
+              "find_latest_gateway_session_for_peer": SessionGatewayMixin,
+              "maybe_auto_prune_and_vacuum": SessionMaintenanceMixin,
+              "get_resume_message_count": SessionMessagesMixin,
+          }
+          for name, owner in modular_owners.items():
+              assert name not in hermes_state.SessionDB.__dict__, name
+              assert getattr(hermes_state.SessionDB, name) is getattr(owner, name), name
           PY
 
       - name: Test context governor restore
@@ -138,7 +157,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git rm .github/workflows/pr35-reconcile-current-main.yml .github/pr35_reconcile.py .github/pr35_reconcile_state_support.py
+          git rm .github/workflows/pr35-reconcile-current-main.yml .github/pr35_reconcile.py .github/pr35_reconcile_state_support.py .github/pr35_reconcile_state_ownership.py
           git add -A
           git diff --cached --check
           git commit -m "merge(main): reconcile PR 35 with current Ares main"
