@@ -15,6 +15,7 @@ const { sdkMock } = vi.hoisted(() => {
 
   const component = () => null
   const host: Record<string, unknown> = { state: {} }
+
   // Stand-in for the SDK's LruCache. These scheduler tests do not exercise
   // relay-roster eviction; the cache has its own unit test.
   const UnboundedCache = class extends Map {
