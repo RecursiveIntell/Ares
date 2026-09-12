@@ -1,8915 +1,2749 @@
-#!/usr/bin/env python3
-"""SQLite state store for Hermes Agent: session metadata, message history, model
-config, FTS5 search. WAL mode (concurrent readers + one writer); compression
-splits sessions via parent_session_id chains; sessions are source-tagged
-('cli', 'telegram', ...). Batch-runner / RL trajectories live elsewhere.
-"""
-
-import asyncio
-import atexit
-import hashlib
-import json
-import logging
-import os
-import queue
-import random
-import re
-import sqlite3
-import sys
-import threading
-import time
-import uuid
-from collections import deque
-from contextlib import contextmanager
-from pathlib import Path
-
-from agent.memory_manager import sanitize_context
-from agent.message_sanitization import _sanitize_surrogates
-from agent.session_activity import ActivityProvenance
-from agent.context_compressor import (
-    _DB_PERSISTED_MARKER as _DB_PERSISTED_MARKER_KEY,
-)
-from hermes_constants import get_hermes_home
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, TypeVar, cast
-
-from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
-    _BRANCH_CHILD_SQL,
-    _COMPRESSION_CHILD_SQL,
-    _FTS_CJK_TRIGGERS,
-    _FTS_TRIGGERS,
-    _LISTABLE_CHILD_SQL,
-    _PREVIEW_ELIGIBLE_SQL,
-    _PREVIEW_RAW_SELECT,
-    _RECOVERABLE_END_REASONS,
-    _RECOVERABLE_END_REASONS_SQL,
-    _RESET_END_REASONS,
-    _RESET_END_REASONS_SQL,
-    _ephemeral_child_sql,
-    _legacy_reset_child_sql,
-    _shape_preview,
-    _sql_session_last_active,
-    _sql_session_last_active_by_id,
-    escape_like as _escape_like,
-    stat_db_file_identity as _stat_db_file_identity,
-    DEFERRED_INDEX_SQL,
-    FTS_CJK_STALE_KEY,
-    FTS_REBUILD_DEFERRAL_KEY,
-    FTS_SQL,
-    FTS_STALE_KEY,
-    FTS_STORAGE_VERSION,
-    FTS_TRIGRAM_SQL,
-    LEGACY_FTS_SQL,
-    LEGACY_FTS_TRIGRAM_SQL,
-    MAX_FTS5_QUERY_CHARS,
-    SCHEMA_SQL,
-    SCHEMA_VERSION,
-    _PREVIEW_CONTENT_SQL,
-    _PREVIEW_HEAD_CHARS,
-    _PREVIEW_MAX_CHARS,
-    _PREVIEW_SCAFFOLD_WINDOW,
-    _PREVIEW_SCAFFOLDED_SQL,
-)
-from hermes_state_errors import (
-    _DELETED_WAL_GENERATION_MSG, _DISK_IO_ERROR_MARKER, _STATE_DB_CORRUPT_MSG, _STATE_DB_GENERATION_KEY,
-    _STATE_DB_REPLACED_MSG, DeletedWalGenerationError, SessionCompressionInProgressError, StateDbCorruptError,
-    StateDbReplacedError, _is_no_more_rows, classify_persistence_error, is_malformed_db_error,
-    is_malformed_schema_error,
-)
-from hermes_state_guard import (
-    _STATE_DB_GUARD_BYPASS_ENV, _in_test_context, _is_production_state_db, _real_platform_state_root,
-    _set_last_init_error, get_last_init_error,
-)
-from hermes_state_readpool import _READ_POOL_MAX, _proc_fd_targets, _read_budget_for
-from hermes_state_sessions import (
-    SessionSessionsMixin,
-    _MODEL_CONFIG_ROW_MISSING,
-    _collect_delegate_child_ids,
-    _cwd_prefix_clause,
-    _delete_delegate_children,
-    _delegate_from_json,
-    _workspace_key_clause,
-    classify_session_status,
-    workspace_key,
-)
-from hermes_state_fts import SessionFtsSetupMixin, load_fts5_cjk_extension
-from hermes_state_portability import SessionPortabilityMixin
-from hermes_state_telegram import SessionTelegramTopicsMixin
-from hermes_state_schema import SessionSchemaMixin
-import hermes_state_holders as _state_holders
-from hermes_state_dbfile import (
-    _canonical_sqlite_path, _connect_tracked_db, _read_sqlite_application_id, _stat_sqlite_sidecar_identity,
-    _watched_sqlite_sidecar_paths, is_zeroed_state_db, quarantine_cross_process_lock, quarantine_zeroed_state_db,
-    refuse_deleted_wal_generation,
-)
-from hermes_state_messages import SessionMessagesMixin
-from hermes_state_wal import _WAL_INCOMPAT_MARKERS, apply_database_pragmas, apply_wal_with_fallback
-from hermes_state_repair import _claim_repair_attempt, preflight_db_writability, repair_state_db_schema
-from hermes_state_titles import SessionTitlesMixin
-from hermes_state_usage import SessionUsageMixin
-from hermes_state_maintenance import SessionMaintenanceMixin
-from hermes_state_gateway import SessionGatewayMixin
-from hermes_state_compression import SessionCompressionMixin
-from hermes_state_search import SessionSearchMixin
-
-try:  # Hard dependency, but tolerate scaffold-phase imports before pip install.
-    import psutil
-except ImportError:  # pragma: no cover - stripped/scaffold installs only
-    psutil = None  # type: ignore[assignment]
-
-logger = logging.getLogger(__name__)
-
-_MAX_SAFE_MESSAGES = 20_000  # resume/export guard default
-
-
-def _configured_transcript_limit(key: str, fallback: int = _MAX_SAFE_MESSAGES) -> int:
-    """``sessions.<key>`` from config.yaml (lazy import: circular at load), else *fallback*; 0 disables."""
-    try:
-        from hermes_cli.config import load_config_readonly
-        value = (load_config_readonly().get("sessions") or {}).get(key)
-        if value is None:
-            return fallback
-        limit = int(value)
-        return limit if limit >= 0 else fallback
-    except Exception:
-        return fallback
-
-
-def resolved_max_resume_messages() -> int:
-    return _configured_transcript_limit("max_resume_messages")
-
-
-def resolved_max_export_messages() -> int:
-    return _configured_transcript_limit("max_export_messages")
-
-
-class SessionResumeTooLargeError(ValueError):
-    def __init__(
-        self, message_count: int, limit: int = _MAX_SAFE_MESSAGES, scope: str = "across its lineage",
-    ):
-        self.message_count, self.limit = message_count, limit
-        super().__init__(
-            f"session has at least {message_count} active messages {scope}; "
-            f"safe resume limit is {limit}. Export the session instead, or set "
-            "sessions.max_resume_messages: 0 in config.yaml to disable the guard."
-        )
-
-
-class SessionExportTooLargeError(ValueError):
-    def __init__(self, session_id: str, message_count: int, limit: int = _MAX_SAFE_MESSAGES):
-        self.session_id, self.message_count, self.limit = session_id, message_count, limit
-        super().__init__(
-            f"session '{session_id}' has at least {message_count} active messages; "
-            f"safe in-memory export limit is {limit}"
-        )
-
-
-def _compression_lock_holder_process_is_dead(holder: str) -> bool:
-    """True only when a ``pid=<n>`` lock holder's local PID is provably gone.
-    Reclaim on kernel proof only: unstructured/same-process holders (another
-    thread's live lease) and any probe doubt keep the lease until TTL expiry
-    (PID reuse must never steal a live lease; a wrongly-kept one self-heals)."""
-    match = re.search(r"(?:^|:)pid=(\d+)(?::|$)", holder or "")
-    pid = int(match.group(1)) if match else 0
-    if pid <= 0 or pid == os.getpid():
-        return False
-    if psutil is not None:
-        try:
-            return not psutil.pid_exists(pid)  # recycled PIDs read as alive (conservative)
-        except Exception:
-            return False
-    # psutil-less fallback is POSIX-only: on Windows os.kill(pid, 0) maps sig=0 to
-    # CTRL_C_EVENT and can kill the target's console group.
-    if os.name == "nt":
-        return False
-    try:
-        os.kill(pid, 0)  # windows-footgun: ok â€” nt early-returns just above
-    except ProcessLookupError:
-        return True
-    except (OSError, OverflowError):  # PermissionError is an OSError: alive but foreign
-        return False
-    return False
-
-
-def _scrub_surrogates(value: Any) -> Any:
-    """Replace lone surrogates in text (sqlite3 raises UnicodeEncodeError, aborting the whole write)."""
-    return _sanitize_surrogates(value) if isinstance(value, str) else value
-
-
-# Billing buckets that aren't a routable provider identity: a session that persisted only
-# one of these (never ran /model) falls back to the config default. Shared by
-# session_gateway_runtime and tui_gateway.server so they cannot drift.
-_BARE_BILLING_PROVIDERS = frozenset({"auto", "custom"})
-
-T = TypeVar("T")
-
-# Import-time snapshot lets _default_db_path() detect a re-pointed DEFAULT_DB_PATH
-# (tests monkeypatch the constant directly).
-DEFAULT_DB_PATH = _IMPORT_DEFAULT_DB_PATH = get_hermes_home() / "state.db"
-
-# Back off from read-only opens after one fails: not per query, but short enough that
-# transient fd pressure doesn't strand the read pool.
-_READ_OPEN_RETRY_SECONDS = 60.0
-# Transient SQLITE_IOERR retry budget for READ-ONLY opens (#100436): a WAL writer's checkpoint/
-# reset/frame flush surfaces "disk I/O error" to a concurrent mode=ro reader for a millisecond-
-# wide window â€” the ro connection cannot perform WAL recovery because recovery writes the -shm
-# index, which mode=ro refuses. The writer closes the window on its own, so a few short retries
-# make the open succeed instead of 500-ing the whole /api/sessions poll (or any other ro opener).
-# Deliberately NOT for writable opens: a writer owns the transition, so an IOERR there is a real
-# storage/fd problem. A persistent IOERR still exhausts the budget and propagates.
-_READ_ONLY_IOERR_RETRY_ATTEMPTS, _READ_ONLY_IOERR_RETRY_BACKOFF_S = 3, 0.05
-
-
-def _default_db_path() -> Path:
-    """Default state DB path at CALL time: a re-pointed ``DEFAULT_DB_PATH`` wins, else
-    ``get_hermes_home()`` is resolved fresh (a runtime HERMES_HOME redirect works regardless of import)."""
-    return DEFAULT_DB_PATH if DEFAULT_DB_PATH != _IMPORT_DEFAULT_DB_PATH else get_hermes_home() / "state.db"
-
-
-# Live-DB guard knobs live HERE (not in hermes_state_guard): the hermetic conftest monkeypatches
-# ``hermes_state._STATE_DB_GUARD_BYPASS`` (``@pytest.mark.live_system_guard_bypass`` escape hatch)
-# and ``_EXTRA_DENY_ROOTS`` (the pre-sandbox root, so custom-HERMES_HOME deployments are covered).
-_STATE_DB_GUARD_BYPASS = False
-
-#: Env-carried twin of ``_STATE_DB_GUARD_BYPASS``.  A module global cannot
-#: cross a process boundary, so a test that deliberately points a *child* at
-#: the live DB has no way to opt out once ancestry arms the guard there.
-#: Export this in the child's env instead.
-_STATE_DB_GUARD_BYPASS_ENV = "HERMES_STATE_DB_GUARD_BYPASS"
-
-#: Additional production roots to refuse (beyond the platform default
-#: ``~/.ares``).  The test conftest injects the pre-sandbox production
-#: root here so custom-``HERMES_HOME`` deployments are covered too.
-_STATE_DB_GUARD_EXTRA_DENY_ROOTS: Tuple[Path, ...] = ()
-
-
-def _real_platform_state_root() -> Optional[Path]:
-    """Resolve the REAL platform-default Hermes root for the guard.
-
-    Deliberately avoids ``Path.home()`` / ``hermes_constants``: tests
-    routinely monkeypatch ``Path.home`` to a tempdir, and ``hermes_state``
-    is often imported lazily *while* such a patch is active â€” resolving
-    through the patched callable would misidentify the test's own hermetic
-    home as "production" (false positive) or, worse, miss the real one
-    (false negative).  ``os.path.expanduser`` reads the HOME environment
-    variable / passwd entry, which the hermetic conftest never rewrites.
-    """
-    try:
-        if sys.platform == "win32":
-            base = os.environ.get("LOCALAPPDATA", "").strip()
-            root = (
-                Path(base) / "ares"
-                if base
-                else Path(os.path.expanduser("~")) / "AppData" / "Local" / "ares"
-            )
-        else:
-            root = Path(os.path.expanduser("~")) / ".ares"
-        return root.resolve()
-    except Exception:
-        return None
-
-
-#: Env marker exported by the hermetic test conftest at the same moment it
-#: redirects ``HERMES_HOME`` to the per-session tmp isolation root.  Its
-#: value is that isolation root.  Unlike ``PYTEST_*`` (owned by pytest, and
-#: routinely scrubbed by tests that rebuild a child environment), this marker
-#: is OURS: it declares "this process tree is running under Hermes test
-#: isolation", and it inherits into subprocess children by default â€” so a
-#: child that received the patched ``HERMES_HOME`` also received the marker,
-#: and a child that resolves a production DB while carrying it is, by
-#: definition, an isolation escape (#82770).
-_TEST_ISOLATION_MARKER_ENV = "HERMES_TEST_ISOLATION"
-
-
-def _running_under_pytest() -> bool:
-    """True when this process (or a parent test process) is a pytest run."""
-    return bool(
-        os.environ.get("PYTEST_CURRENT_TEST")
-        or os.environ.get("PYTEST_VERSION")
-        or os.environ.get(_TEST_ISOLATION_MARKER_ENV)
-    )
-
-
-#: Names that identify a pytest launcher in a process command line.  Matched
-#: against the *basename* of each argv token so ``/tmp/pytest-of-dev/...``
-#: paths â€” which do show up in real argv â€” cannot false-positive.
-_PYTEST_LAUNCHER_NAMES = frozenset(
-    {"pytest", "py.test", "pytest.exe", "py.test.exe"}
-)
-
-#: Memoised ancestry answer.  The process tree above us does not change in a
-#: way that matters here, and the walk must not cost anything on the hot path.
-_PYTEST_ANCESTOR: Optional[bool] = None
-
-
-def _process_looks_like_pytest(proc: Any) -> bool:
-    """True when *proc*'s command line is a pytest invocation.
-
-    Covers both ``pytest ...`` (launcher on argv[0]) and ``python -m pytest``
-    (launcher as a bare ``pytest`` token).  A process whose command line we
-    cannot read is treated as "not pytest": guessing the other way would
-    refuse production opens for unrelated reasons.
-    """
-    try:
-        cmdline = proc.cmdline() or []
-    except Exception:
-        return False
-    for arg in cmdline:
-        try:
-            token = str(arg).strip('"').strip("'")
-            # Split on both separators on every host: os.path.basename is
-            # POSIX-only under Linux and would leave a Windows-style path
-            # intact, making the matcher's answer depend on the platform.
-            name = token.replace("\\", "/").rsplit("/", 1)[-1].lower()
-        except Exception:
-            continue
-        if name in _PYTEST_LAUNCHER_NAMES:
-            return True
-    return False
-
-
-def _has_pytest_ancestor() -> bool:
-    """True when some ancestor process of this one is a pytest run.
-
-    ``_running_under_pytest`` reads ``PYTEST_*`` env vars, which a child
-    spawned with a rebuilt environment loses at the same moment it loses the
-    ``HERMES_HOME`` redirect: that child aims at the production DB *and*
-    disarms the guard in one step (#82770).  Ancestry is the one test-context
-    signal that survives an env rebuild, so it backs the env check up.
-
-    Fails open (``False``) when ``psutil`` is unavailable or the walk errors â€”
-    that restores the previous env-only behaviour rather than blocking real
-    user runs on a psutil hiccup.
-    """
-    global _PYTEST_ANCESTOR
-    if _PYTEST_ANCESTOR is not None:
-        return _PYTEST_ANCESTOR
-    found = False
-    if psutil is not None:
-        try:
-            for parent in psutil.Process().parents():
-                if _process_looks_like_pytest(parent):
-                    found = True
-                    break
-        except Exception:
-            found = False
-    _PYTEST_ANCESTOR = found
-    return found
-
-
-def _in_test_context() -> bool:
-    """True when this process is a test run, by environment or by ancestry.
-
-    Order matters for cost: the env probe is two dict lookups and covers the
-    common in-process case, so the ancestry walk only runs for processes the
-    environment claims are ordinary user runs â€” and its answer is memoised,
-    so a real ``hermes`` invocation pays for at most one walk.
-    """
-    if _running_under_pytest():
-        return True
-    return _has_pytest_ancestor()
-
-
-def _production_state_roots() -> List[Path]:
-    roots: List[Path] = []
-    real_root = _real_platform_state_root()
-    if real_root is not None:
-        roots.append(real_root)
-    for extra in _STATE_DB_GUARD_EXTRA_DENY_ROOTS:
-        try:
-            roots.append(Path(extra).expanduser().resolve())
-        except Exception:
-            continue
-    return roots
-
-
-def _is_production_state_db(resolved: Path, root: Path) -> bool:
-    """True when *resolved* is a DB file of the real Hermes home *root*.
-
-    Matches files directly in the root (``<root>/state.db``) and profile
-    homes (``<root>/profiles/<name>/state.db``).  Deliberately does NOT
-    match deeper scratch paths (e.g. repo worktrees that happen to live
-    under ``~/.hermes/hermes-agent/...``) so hermetic tests using unusual
-    tempdirs cannot false-positive.
-    """
-    if resolved.parent == root:
-        return True
-    try:
-        rel = resolved.relative_to(root)
-    except ValueError:
-        return False
-    parts = rel.parts
-    return len(parts) == 3 and parts[0] == "profiles"
-
-
-def _ensure_test_isolation(db_path: Path) -> None:
-    """Raise before any connection/mkdir/pragma/byte probe when a pytest-context process
-    (env OR ancestry) resolves a production DB.
-
-    Env alone is not enough: a child spawned with a rebuilt environment loses ``PYTEST_*`` and
-    ``HERMES_HOME`` together, which is precisely the state in which it writes to production (#82770).
-    """
-    if _STATE_DB_GUARD_BYPASS or os.environ.get(_STATE_DB_GUARD_BYPASS_ENV) or not _in_test_context():
-        return
-    try:
-        resolved = Path(db_path).expanduser().resolve()
-    except Exception:
-        return
-    roots = [r for r in (_real_platform_state_root(),) if r is not None]
-    for extra in _STATE_DB_GUARD_EXTRA_DENY_ROOTS:
-        try:
-            roots.append(Path(extra).expanduser().resolve())
-        except Exception:
-            continue
-    for root in roots:
-        if _is_production_state_db(resolved, root):
-            raise RuntimeError(
-                "live-system guard: test attempted to open production "
-                f"state.db at {resolved} (under real Hermes root {root}). "
-                "Tests must run against a temporary HERMES_HOME â€” pass an "
-                "explicit tmp db_path or let the hermetic conftest redirect "
-                "HERMES_HOME. If this test genuinely needs the live database, mark it with "
-                "@pytest.mark.live_system_guard_bypass â€” or, for a spawned "
-                f"child process, export {_STATE_DB_GUARD_BYPASS_ENV}=1 in "
-                "its environment."
-            )
-
-
-# Openings of the background-review harness prompts (agent/background_review.py).
-_REVIEW_HARNESS_PREFIXES = (
-    "Review the conversation above and update the skill library",
-    "Review the conversation above and consider saving to memory",
-)
-
-
-def _is_background_review_harness_message(msg: Dict[str, Any]) -> bool:
-    """Persisted harness prompt (older builds wrote the forked curator's turns
-    into real sessions; replaying them hijacks the session)."""
-    if not isinstance(msg, dict) or msg.get("role") not in {"user", "system"}:
-        return False
-    content = msg.get("content")
-    return isinstance(content, str) and content.lstrip().startswith(_REVIEW_HARNESS_PREFIXES)
-
-
-def _strip_background_review_harness(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Drop harness messages and the curator-mode assistant reply that immediately followed each."""
-    if not messages:
-        return messages
-    out: List[Dict[str, Any]] = []
-    skip_next_assistant = False
-    for msg in messages:
-        if _is_background_review_harness_message(msg):
-            skip_next_assistant = True
-            continue
-        if skip_next_assistant:
-            skip_next_assistant = False
-            if isinstance(msg, dict) and msg.get("role") == "assistant":
-                continue  # the curator-mode reply to the harness prompt
-        out.append(msg)
-    return out
-
-
-# Matches a bare protocol/tool-name marker such as "[memory]" or "[skill_manage]".
-_STALE_TOOL_CALL_MARKER_RE = re.compile(r"^\[[A-Za-z_][A-Za-z0-9_.-]*\]$")
-
-
-def _is_stale_tool_call_marker_message(msg: Dict[str, Any]) -> bool:
-    """Assistant tool-call turn whose content is a bare ``[marker]`` (an older
-    conversation_loop persisted a local template's marker as the final response)."""
-    if not isinstance(msg, dict) or msg.get("role") != "assistant" or not msg.get("tool_calls"):
-        return False
-    content = msg.get("content")
-    return isinstance(content, str) and bool(_STALE_TOOL_CALL_MARKER_RE.fullmatch(content.strip()))
-
-
-def _strip_stale_tool_call_markers(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Blank stale ``[marker]`` assistant content (replaying it teaches the model
-    to keep emitting it); tool_call/result pairing stays intact."""
-    repaired = 0
-    for msg in filter(_is_stale_tool_call_marker_message, messages):
-        msg["content"] = ""
-        repaired += 1
-    if repaired:
-        logger.info(
-            "Cleared %d stale tool-call marker message(s) while restoring session (#78148)", repaired,
-        )
-    return messages
-
-
-def format_session_db_unavailable(prefix: str = "Session database not available") -> str:
-    """User-facing message with the captured init cause (+ WAL-docs hint for NFS/SMB locking failures)."""
-    cause = get_last_init_error()
-    if not cause:
-        return f"{prefix}."
-    hint = " (state.db may be on NFS/SMB/FUSE/ZFS â€” see https://www.sqlite.org/wal.html)"
-    return f"{prefix}: {cause}{hint if any(m in cause.lower() for m in _WAL_INCOMPAT_MARKERS) else ''}."
-
-
-# Auto-repair at most once per DB path per process (no repair loops; serialises concurrent
-# web_server / gateway opens on the same malformed file).
-_repair_attempted_paths: set[str] = set()
-_repair_attempt_lock = threading.Lock()
-# Cross-process schema-surgery lock timeout (``_repair_attempt_lock`` covers one interpreter
-# only); sized for the slowest legitimate holder (VACUUM, multi-GB DB).
-_REPAIR_LOCK_TIMEOUT_SECONDS = 120.0
-_IS_WINDOWS = sys.platform == "win32"
-
-
-def divert_session_transcript_jsonl(session_id: str, messages) -> "Optional[Path]":
-    """Append pending messages to HERMES_HOME/sessions/<id>.jsonl (state.db was replaced under a
-    live process). Returns the path, or None if nothing to write."""
-    sid = str(session_id or "").strip()
-    if not sid or not messages:
-        return None
-    sessions_dir = get_hermes_home() / "sessions"
-    sessions_dir.mkdir(parents=True, exist_ok=True)
-    path = sessions_dir / f"{sid}.jsonl"
-    with path.open("a", encoding="utf-8") as handle:
-        for msg in messages:
-            if msg is not None:
-                record = msg if isinstance(msg, dict) else {"content": str(msg)}
-                handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
-    return path
-
-
-# Process-wide shared SessionDB registry: long-lived in-process callers share ONE writer
-# connection per resolved path via hermes_state_registry.acquire(); one-shots use SessionDB() + close().
-def _foreign_state_db_holders(db_path: Path) -> List[Tuple[int, str]]:
-    """Compatibility delegate to the state-holder authority."""
-    return _state_holders.foreign_state_db_holders(db_path)
-
-
-# â”€â”€ Process-wide shared SessionDB registry (#90837) â”€â”€ lives in hermes_state_registry.py (acquire /
-# release / close_all / release_or_close). Long-lived in-process callers (gateway, tui_gateway, cron,
-# in-process tools) share ONE writer connection per resolved path via hermes_state_registry.acquire(); CLI
-# one-shots, recovery flows, and read-only cross-profile opens use SessionDB() directly with their own close().
-
-
-class SessionDB(
-    SessionSessionsMixin, SessionFtsSetupMixin, SessionSearchMixin, SessionSchemaMixin,
-    SessionPortabilityMixin, SessionTelegramTopicsMixin, SessionCompressionMixin,
-    SessionGatewayMixin, SessionMaintenanceMixin, SessionUsageMixin, SessionTitlesMixin,
-    SessionMessagesMixin,
-):
-    """SQLite-backed session storage with FTS5 search; many reader threads, one writer (WAL)."""
-
-    # Only these state-owned producers join automatic stale-open reconciliation; messaging/UI
-    # sources have their own lifecycle owners; unknown sources fail closed.
-    # See #60609.
-    _AUTO_PRUNE_STALE_OPEN_SOURCES: Tuple[str, ...] = (
-        "cli", "cron", "kanban", "acp", "api_server", "subagent", "tool",
-    )
-
-    # â”€â”€ Write-contention tuning â”€â”€
-    # SQLite's deterministic busy handler convoys under many hermes processes: keep its
-    # timeout short (1s) and retry with random jitter. Patience is TIME-based (a sibling
-    # legitimately holds the lock for seconds: checkpoint at close, VACUUM, recovery, FTS
-    # optimize); attempt-counted budgets destroyed turns on a healthy store. Transcript
-    # writes (failure aborts the turn) get the long budget; observation-only activity
-    # writes sit on the response-critical path and get a sub-second one.
-    _WRITE_PATIENCE_S, _TRANSCRIPT_WRITE_PATIENCE_S, _ACTIVITY_WRITE_PATIENCE_S = 20.0, 60.0, 0.5
-    # A live compression lock gets a short wait (compression publishes in seconds), but the lease
-    # is a correctness boundary: a writer still locked out afterwards is refused.
-    # Observation-only activity heartbeat/label writes (#76354 review S1): these run on (or adjacent to) the
-    # response-critical path and must never wait out the full routine patience under contention. Sub-second
-    # budget; a skipped write is retried naturally at the next heartbeat window.
-    # A live compression lock gets its own, much shorter budget than the write lock. Compression publishes
-    # in a couple of seconds, so a brief wait saves the overwhelming majority of concurrent turns (#75083).
-    # It deliberately stays short: the lease is a correctness boundary, not just a busy signal (see
-    # test_compression_lease_blocks_non_owner_but_allows_owner_flush), so a writer that is still locked out
-    # after this budget must still be refused rather than allowed to land a stale turn in a session whose
-    # compression is genuinely long-running or wedged.
-    _COMPRESSION_BUSY_WAIT_S = 5.0
-    _WRITE_RETRY_MIN_S, _WRITE_RETRY_MAX_S = 0.020, 0.150  # fast jitter for the first _SLOW_AFTER_S
-    _WRITE_RETRY_SLOW_AFTER_S = 2.0
-    _WRITE_RETRY_SLOW_MIN_S, _WRITE_RETRY_SLOW_MAX_S = 0.250, 1.000
-    # PASSIVE WAL checkpoint every N successful writes.
-    _CHECKPOINT_EVERY_N_WRITES = 50
-    # Bounded FTS ``'merge'`` (ms of lock each) instead of ``'optimize'`` (9-18s per index on a 10GB
-    # DB, longer than a writer's patience); up to _COMMANDS_PER_PASS per index, stopping on no-progress.
-    _FTS_MERGE_EVERY_N_WRITES, _FTS_MERGE_MAX_PAGES_PER_INDEX, _FTS_MERGE_COMMANDS_PER_PASS = 1000, 500, 4
-    # Imports cap lower than exports: an import holds one BEGIN IMMEDIATE.
-    _IMPORT_MAX_SESSIONS, _IMPORT_MAX_MESSAGES_PER_SESSION, _IMPORT_MAX_TOTAL_MESSAGES = 500, 10_000, 50_000
-    _IMPORT_MAX_SESSION_BYTES, _IMPORT_MAX_TOTAL_BYTES = 5 * 1024 * 1024, 25 * 1024 * 1024
-    # Accounting workers retire when idle so a bound-method target can't keep an abandoned SessionDB alive.
-    _TOKEN_WRITER_IDLE_SECONDS = 30.0
-
-    @staticmethod
-    def _store_system_prompt(conn, system_prompt: Optional[str]) -> Optional[str]:
-        if system_prompt is None:
-            return None
-        prompt_hash = hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()
-        conn.execute(
-            "INSERT OR IGNORE INTO system_prompts (hash, prompt) VALUES (?, ?)",
-            (prompt_hash, system_prompt),
-        )
-        return prompt_hash
-
-    @staticmethod
-    def _delete_unreferenced_system_prompts(conn) -> None:
-        conn.execute(
-            "DELETE FROM system_prompts WHERE NOT EXISTS ("
-            "SELECT 1 FROM sessions WHERE sessions.system_prompt_hash = system_prompts.hash)"
-        )
-
-    @staticmethod
-    def _session_row_dict(row: sqlite3.Row) -> Dict[str, Any]:
-        data = dict(row)
-        if "_system_prompt_resolved" in data:
-            resolved = data.pop("_system_prompt_resolved")
-            if "system_prompt" in data:
-                data["system_prompt"] = resolved
-        return data
-
-    @staticmethod
-    def _close_connection_quietly(conn: Optional[sqlite3.Connection]) -> None:
-        """Close a partially initialized connection without masking its error."""
-        if conn is None:
-            return
-        try:
-            conn.close()
-        except Exception:
-            logger.debug("Could not close a SessionDB connection", exc_info=True)
-
-    def _close_conn_logged(self, conn, label: str) -> None:
-        """Close *conn*; a failing close leaks a tracked fd: logged at WARNING, never swallowed."""
-        try:
-            conn.close()
-        except Exception as exc:
-            logger.warning("%s close failed for %s: %s", label, self.db_path, exc)
-
-    def __init__(self, db_path: Path = None, read_only: bool = False):
-        self.db_path = db_path or _default_db_path()
-        _ensure_test_isolation(self.db_path)  # before any connection/pragma/mkdir
-        self.read_only = read_only
-        self._lock = threading.Lock()
-        # Read-path split (WAL only): reads borrow from a BOUNDED read-only pool so they
-        # never queue behind writer flushes on self._lock (see _read_ctx); unbounded
-        # per-thread connections pinned fds for the process lifetime and hit EMFILE.
-        self._read_pool: "queue.LifoQueue[sqlite3.Connection]" = queue.LifoQueue(maxsize=_READ_POOL_MAX)
-        # Permits bound PEAK descriptors (the pool bounds only the idle set), shared per
-        # DATABASE PATH; acquired non-blocking so a permitless reader degrades to the writer lock.
-        # One permit per live read connection, held from before the open in _get_read_conn() until after the
-        # close in _close_read_conn(). See _READ_POOL_MAX. Acquired non-blocking on purpose: a reader that
-        # cannot get a permit must degrade to the writer lock, not queue here â€” blocking would convert fd
-        # exhaustion into a stall, which is the same outage with a different stack trace. Permits are shared
-        # per DATABASE PATH, not per instance: the descriptors they ration belong to the file, and one
-        # process holds several SessionDB objects on the same state.db (#98573). See _PathReadBudget.
-        self._read_budget = _read_budget_for(self.db_path)
-        self._read_budget.register(self)
-        self._read_permits = self._read_budget.permits
-        self._read_conns_lock = threading.Lock()
-        # Set when close() begins; an in-flight reader then closes its own connection
-        # instead of re-populating a pool nobody will drain again.
-        self._read_conns_closed = False
-        # Read-open failure backoff is a TIMESTAMP, not a sticky bool: the likeliest trigger
-        # is transient EMFILE, and a permanent flag would demote every reader forever.
-        self._read_open_failed_at = 0.0
-        self._wal_active, self._write_count = False, 0
-        # File identity of the opened state.db, compared on every write so an out-of-band
-        # replace cannot limp through in-place surgery (inode: mv/new-file; application_id: cp).
-        self._db_file_identity: Optional[tuple] = None
-        self._db_file_application_id: int = 0
-        self._db_sidecar_identity: Dict[str, tuple] = {}
-        self._db_replaced = self._db_wal_generation_lost = False
-        self._db_corrupt, self._db_corrupt_reason = False, ""  # sticky quarantine (StateDbCorruptError)
-        self._fts_usermerge_floor_applied = False  # one-shot usermerge-floor write guard
-        self._fts_enabled = self._fts_stale = self._trigram_available = False
-        # _fts_cjk_loaded: tokenizer on the writer connection; _fts_cjk_available: messages_fts_cjk
-        # is queryable AND not marked stale.
-        self._fts_cjk_loaded = self._fts_cjk_available = self._fts_unavailable_warned = False
-        self._conn = None
-        # Async token accounting; distinct from self._lock so enqueue/flush never contends with writes.
-        self._token_queue: deque = deque()
-        self._token_queue_cond = threading.Condition(threading.Lock())
-        self._token_writer_thread: Optional[threading.Thread] = None
-        self._token_writer_stop = self._token_writer_busy = False
-        self._token_atexit_hook: Optional[Callable[[], None]] = None
-        # Opened via hermes_state_registry.acquire(): close() releases a refcount instead.
-        # Set True when this instance is opened via hermes_state_registry.acquire(). Makes close() a no-op so the
-        # registry (not individual callers) controls the connection lifecycle (#90837).
-        self._shared_registry_owned = False
-        initialization_complete = False
-        try:
-            if read_only:
-                self._open_read_only()
-            else:
-                self._open_writer()
-            self._record_db_file_identity()
-            initialization_complete = True
-        except Exception as exc:
-            # Surface WHY via /resume and friends; callers keep their ``_session_db = None`` path.
-            _set_last_init_error(f"{type(exc).__name__}: {exc}")
-            raise
-        finally:
-            if not initialization_complete:
-                conn, self._conn = self._conn, None
-                self._close_connection_quietly(conn)
-
-    def _open_writer(self) -> None:
-        """Writable open: preflight, zero-byte quarantine, connect + schema (one in-place repair of a
-        malformed sqlite_master), generation stamp."""
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        # Read-only file/sidecar preflight BEFORE the first connection: an actionable message
-        # instead of an opaque "attempt to write a readonly database" from inside _init_schema.
-        preflight_db_writability(self.db_path, db_label="state.db")
-        try:
-            # Serialize zero-byte check, quarantine, connect and schema commit so concurrent
-            # openers don't race the absent-path -> schema-commit window.
-            if not self.db_path.exists() or is_zeroed_state_db(self.db_path):
-                with quarantine_cross_process_lock(self.db_path) as lock_acquired:
-                    if not lock_acquired:
-                        logger.warning(
-                            "startup quarantine lock for %s not acquired within 5s; proceeding",
-                            self.db_path,
-                        )
-                    self._handle_quarantine_if_zeroed(already_locked=lock_acquired)
-                    self._connect_and_init_with_lock_patience()
-            else:
-                self._handle_quarantine_if_zeroed(already_locked=False)
-                self._connect_and_init_with_lock_patience()
-        except sqlite3.DatabaseError as exc:
-            # A malformed schema fails on the very first statement (before _init_schema), so the
-            # FTS-rebuild layer never sees it: repair sqlite_master in place (backup first), reopen once.
-            if not is_malformed_schema_error(exc) or not _claim_repair_attempt(self.db_path):
-                raise
-            logger.error(
-                "state.db schema is malformed (%s) â€” attempting automatic "
-                "repair (a backup copy is made first).", exc,
-            )
-            self._close_connection_quietly(self._conn)
-            if not repair_state_db_schema(self.db_path).get("repaired"):
-                raise
-            self._connect_and_init_with_lock_patience()
-        # FTS optimization is OPT-IN (`hermes db optimize`); no background worker races session lifecycle.
-        self._ensure_db_file_generation()
-
-    def _open_read_only(self) -> None:
-        """Read-only attach for cross-profile aggregation: no schema init, NO write
-        lock (sidebar polling never contends with that profile's backend); the DB
-        must exist. FTS flags are probed with SELECTs only, and the connection is
-        closed on ANY probe failure (malformed schema raises DatabaseError) so a
-        leaked tracked connection cannot block the forensic backup the writable heal takes next."""
-        for attempt in range(_READ_ONLY_IOERR_RETRY_ATTEMPTS + 1):
-            try:
-                self._conn = conn = self._connect_read_only(timeout=1.0)
-                try:
-                    apply_database_pragmas(conn, db_label="state.db")
-                    cursor = conn.cursor()
-                    self._fts_enabled = self._fts_table_probe(cursor, "messages_fts") is True
-                    if self._fts_enabled:
-                        self._trigram_available = (
-                            self._fts_table_probe(cursor, "messages_fts_trigram") is True
-                        )
-                except BaseException:
-                    self._conn = None
-                    self._close_connection_quietly(conn)
-                    raise
-                return
-            except sqlite3.OperationalError as ioerr:
-                # In-flight WAL checkpoint/reset/frame-flush on the writer side can surface
-                # SQLITE_IOERR to a mode=ro reader (it can't do the -shm recovery the read
-                # needs). Closes in milliseconds: retry a bounded number of times before
-                # classifying the store as failed (#100436; see _READ_ONLY_IOERR_RETRY_ATTEMPTS).
-                transient = _DISK_IO_ERROR_MARKER in str(ioerr).lower()
-                if attempt >= _READ_ONLY_IOERR_RETRY_ATTEMPTS or not transient:
-                    raise
-                time.sleep(_READ_ONLY_IOERR_RETRY_BACKOFF_S)
-
-    def _connect_read_only(self, timeout: float) -> sqlite3.Connection:
-        """``mode=ro`` tracked connection with Row factory. check_same_thread=False: pooled connections
-        are borrowed by whichever thread reads next; exclusive ownership is enforced by pool checkout."""
-        conn = _connect_tracked_db(
-            f"file:{self.db_path}?mode=ro", tracking_path=self.db_path, uri=True,
-            check_same_thread=False, timeout=timeout, isolation_level=None,
-        )
-        conn.row_factory = sqlite3.Row
-        return conn
-
-    def _handle_quarantine_if_zeroed(self, already_locked: bool = False) -> None:
-        """Quarantine a zero-byte/headerless state.db so a fresh one can open; if quarantine failed,
-        raise the clear message instead of opening the zeroed file."""
-        if not (self.db_path.exists() and is_zeroed_state_db(self.db_path)):
-            return
-        try:
-            zsize = self.db_path.stat().st_size
-        except OSError:
-            zsize = -1
-        qpath = quarantine_zeroed_state_db(self.db_path, already_locked=already_locked)
-        msg = (
-            f"state.db looks ZEROED ({zsize} bytes, no SQLite header). "
-            f"Preserved at {qpath or '(quarantine failed â€” file left in place)'}. "
-            f"Restore from {self.db_path.parent / 'state-snapshots'} via `hermes snapshot list` / "
-            f"`hermes snapshot restore <id>` if available. "
-            "Opening a fresh empty database so the agent can start."
-        )
-        logger.error(msg)
-        _set_last_init_error(msg)
-        if qpath is None and self.db_path.exists() and is_zeroed_state_db(self.db_path):
-            raise sqlite3.DatabaseError(msg)
-
-    def _open_writer_conn(self) -> sqlite3.Connection:
-        """Connect + WAL/pragma/tokenizer setup for a writer connection (no schema init). Short timeout:
-        jittered application-level retry handles contention, not SQLite's busy handler;
-        isolation_level=None: explicit BEGIN IMMEDIATE."""
-        conn = _connect_tracked_db(
-            str(self.db_path), check_same_thread=False, timeout=1.0, isolation_level=None,
-        )
-        try:
-            conn.row_factory = sqlite3.Row
-            self._wal_active = apply_wal_with_fallback(conn, db_label="state.db") == "wal"
-            apply_database_pragmas(conn, db_label="state.db")
-            conn.execute("PRAGMA foreign_keys=ON")
-            self._fts_cjk_loaded = load_fts5_cjk_extension(conn)
-        except BaseException:
-            self._close_connection_quietly(conn)
-            raise
-        return conn
-
-    def _connect_and_init(self) -> None:
-        # Refuse before sqlite3.connect (under the startup lock) so we cannot mint
-        # a replacement WAL while a live writer still holds a deleted sidecar inode.
-        refuse_deleted_wal_generation(self.db_path)
-        self._conn = self._open_writer_conn()
-        self._init_schema()
-
-    def _connect_and_init_with_lock_patience(self) -> None:
-        """Open + init, waiting out a sibling's write lock with jittered patience:
-        _init_schema's DDL runs on a 1s-timeout connection, so a sibling's VACUUM
-        or checkpoint used to fail the ENTIRE open and callers disabled
-        persistence for the whole run. Non-lock errors propagate immediately."""
-        # Lock contention during open: _init_schema's DDL/reconcile statements run on a 1s-timeout
-        # connection with no retry, so a sibling process holding the write lock (VACUUM, TRUNCATE checkpoint
-        # at close, a long FTS pass from an older still-running install) used to fail the ENTIRE open â€”
-        # callers then disable persistence for the whole run ("Failed to initialize SessionDB ... database
-        # is locked", #74478). The store is healthy; wait it out with the same jittered patience the write
-        # path uses.
-        deadline = time.monotonic() + self._WRITE_PATIENCE_S
-        while True:
-            try:
-                self._connect_and_init()
-                return
-            except sqlite3.OperationalError as exc:
-                err = str(exc).lower()
-                if "locked" not in err and "busy" not in err:
-                    raise
-                self._close_connection_quietly(self._conn)
-                now = time.monotonic()
-                if now >= deadline:
-                    raise
-                jitter = random.uniform(self._WRITE_RETRY_SLOW_MIN_S, self._WRITE_RETRY_SLOW_MAX_S)
-                time.sleep(min(jitter, max(deadline - now, 0.001)))
-
-    # â”€â”€ Read-path split â”€â”€
-
-    def _get_read_conn(self) -> Optional[sqlite3.Connection]:
-        """Open a fresh read-only connection, or None when unavailable (callers
-        return it to self._read_pool). WAL only: WAL readers never block on the
-        writer, so reads skip self._lock; under DELETE journal mode (NFS fallback)
-        readers hit SQLITE_BUSY storms, so the legacy locked path stays. Autocommit
-        reads see everything committed so far (read-your-writes for flush-then-search)."""
-        if not self._wal_active or self.read_only:
-            return None
-        with self._read_conns_lock:
-            failed_at = self._read_open_failed_at
-            backing_off = failed_at and time.monotonic() - failed_at < _READ_OPEN_RETRY_SECONDS
-            if self._read_conns_closed or backing_off:
-                return None
-        # Permit BEFORE the open: openers race for permits, not descriptors.
-        if not self._read_budget.acquire(self):
-            logger.debug(
-                "read pool at capacity (%d) for %s; serving this read from the "
-                "locked writer connection", _READ_POOL_MAX, self.db_path,
-            )
-            return None
-        conn = None  # bound before the try so the handlers can close a half-open one
-        try:
-            conn = self._connect_read_only(timeout=5.0)
-            apply_database_pragmas(conn, db_label="state.db")
-            if self._fts_cjk_loaded:  # registers in the connection, not the file: ro is fine
-                load_fts5_cjk_extension(conn)
-        except BaseException as exc:
-            # A half-open connection (open ok, extension load failed) is a live tracked descriptor,
-            # the leak shape this pool exists to fix; a stranded permit would shrink the read
-            # path by one slot forever. (Not _close_read_conn: callers release their own permit.)
-            if conn is not None:
-                self._close_conn_logged(conn, "partially-opened read conn")
-            self._read_budget.release()
-            if not isinstance(exc, sqlite3.Error):
-                raise
-            with self._read_conns_lock:
-                self._read_open_failed_at = time.monotonic()
-            logger.debug("read-only connection open failed for %s", self.db_path, exc_info=True)
-            return None
-        return conn
-
-    def _evict_one_idle_read_conn(self) -> bool:
-        """Close one idle pooled connection (a peer on the same file wants its permit); never a live one."""
-        try:
-            conn = self._read_pool.get_nowait()
-        except queue.Empty:
-            return False
-        self._close_read_conn(conn)
-        return True
-
-    def _close_read_conn(self, conn) -> None:
-        """Close a pooled read connection and release its permit even when the close fails (withholding
-        it would narrow the read path forever). Over-releasing the BoundedSemaphore raises ValueError."""
-        try:
-            self._close_conn_logged(conn, "read-conn")
-        finally:
-            self._read_budget.release()
-
-    def _checkout_read_conn(self) -> Optional[sqlite3.Connection]:
-        """Borrow a read connection, opening on a miss; None when the read path is unavailable.
-        A pool hit costs no permit (the connection already holds one)."""
-        if not self._wal_active or self.read_only:
-            return None
-        try:
-            return self._read_pool.get_nowait()
-        except queue.Empty:
-            return self._get_read_conn()
-
-    @contextmanager
-    def _read_ctx(self) -> Iterator[sqlite3.Connection]:
-        """Yield a connection for read-only statements: a pooled read-only
-        connection with NO lock under WAL; otherwise (non-WAL, open failure,
-        ceiling reached) the writer connection under self._lock â€” deliberate
-        degradation: slower beats EMFILE, which the supervisor cannot see."""
-        conn = self._checkout_read_conn()
-        if conn is not None:
-            try:
-                yield conn
-            finally:
-                returned = False
-                with self._read_conns_lock:
-                    if not self._read_conns_closed:
-                        try:
-                            self._read_pool.put_nowait(conn)
-                            returned = True
-                        except queue.Full:
-                            pass
-                if not returned:
-                    # close() drained the pool (or queue.Full: unreachable while
-                    # permits == maxsize, load-bearing if they drift): surplus.
-                    self._close_read_conn(conn)
-            return
-        with self._lock:
-            if self._conn is None:  # close() raced a still-unwinding reader
-                self._reopen_after_close_locked(context="read")
-            yield cast(sqlite3.Connection, self._conn)
-
-    def _reopen_after_close_locked(self, context: str = "write") -> None:
-        """Reopen the writer after ``close()`` raced a live caller (a teardown owner
-        set ``_conn = None`` while a worker still had a transcript flush to land).
-        Loud (WARNING) and bounded (only after an explicit close()). Caller holds
-        ``self._lock``. No _init_schema: no DDL races with siblings during teardown."""
-        if self.read_only:
-            raise sqlite3.ProgrammingError(
-                f"SessionDB for {self.db_path} was closed (read-only handle); "
-                f"cannot serve a {context} after close()"
-            )
-        # A reopen resolves the PATH again: a replaced file would be written through stale WAL/shm
-        # assumptions; a quarantined handle must never hand a fresh connection to a damaged file.
-        if self._db_corrupt and not (self._db_replaced or self._db_file_was_replaced()):
-            raise self._corrupt_error(
-                f"state.db connection for {self.db_path} is quarantined after "
-                f"structural corruption; refusing to reopen for a {context} "
-                "after close(). "
-            )
-        self._halt_if_db_generation_changed()
-        logger.warning(
-            "state.db connection for %s was closed while a %s was still in "
-            "flight â€” reopening (teardown/worker race, #94736)", self.db_path, context,
-        )
-        try:
-            self._conn = self._open_writer_conn()
-        except Exception as exc:
-            raise sqlite3.OperationalError(
-                f"state.db connection was closed while a {context} was still "
-                f"in flight (a session-teardown path called close() before "
-                f"this worker finished â€” #94736) and the automatic reopen failed: {exc}"
-            ) from exc
-
-    def _execute_write(
-        self, fn: Callable[[sqlite3.Connection], T], patience_s: Optional[float] = None,
-    ) -> T:
-        """Run *fn(conn)* inside BEGIN IMMEDIATE with jittered lock retry; commit
-        is handled here (callers must not commit). Returns *fn*'s result.
-        BEGIN IMMEDIATE takes the WAL write lock up front so contention surfaces
-        immediately; on locked/busy the Python lock is released, a jitter slept,
-        and the WHOLE callback retried â€” *fn* must stay idempotent under retry."""
-        if patience_s is None:
-            patience_s = self._WRITE_PATIENCE_S
-        deadline = time.monotonic() + patience_s
-        compression_deadline: Optional[float] = None  # set on the first compression-busy collision
-        # One retry for SQLITE_IOERR raised by BEGIN IMMEDIATE itself (callback not run: nothing
-        # replayed). Once fn has started, an IOERR leaves settlement unknown and must propagate.
-        # The callback has not run at that point, so there is no durable effect to replay and the retry is
-        # exactly-once safe (#99502's contract). Once the callback starts, an IOERR leaves the write's
-        # settlement unknown and must propagate â€” this helper owns non-idempotent transcript/counter
-        # mutations, not just idempotent UPSERTs.
-        ioerr_begin_retried = False
-        while True:
-            self._raise_if_db_corrupt()
-            self._raise_if_db_replaced()
-            fn_started = False
-            try:
-                with self._lock:
-                    if self._conn is None:  # close() raced this writer
-                        self._reopen_after_close_locked(context="write")
-                    self._conn.execute("BEGIN IMMEDIATE")
-                    try:
-                        fn_started = True
-                        result = fn(self._conn)
-                        self._conn.commit()
-                    except BaseException:
-                        try:
-                            self._conn.rollback()
-                        except Exception:
-                            pass
-                        raise
-                # Success â€” periodic best-effort checkpoint + FTS merge.
-                self._write_count += 1
-                if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
-                    self._try_wal_checkpoint()
-                if self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
-                    self._try_incremental_merge_fts()
-                return result
-            except SessionCompressionInProgressError:
-                # Transient (see _COMPRESSION_BUSY_WAIT_S): a steer landing mid-compression must not abort.
-                # A live foreign compression lock is transient: the compressor publishes in a couple of
-                # seconds. Without any wait, a steer that lands mid-compression aborts the user's turn as
-                # session_persistence_failed and sends the operator hunting disk space that was never the
-                # problem (#75083). The budget is _COMPRESSION_BUSY_WAIT_S, not the write-lock patience: the
-                # lease is a correctness boundary, so a writer still locked out after a short wait must be
-                # refused rather than left to land a stale turn once a long-running or wedged compression
-                # finally lets go.
-                if compression_deadline is None:
-                    compression_deadline = min(time.monotonic() + self._COMPRESSION_BUSY_WAIT_S, deadline)
-                if self._sleep_before_write_retry(
-                    compression_deadline, self._COMPRESSION_BUSY_WAIT_S
-                ):
-                    continue
-                raise
-            except sqlite3.Error as exc:
-                # 'no more rows' is a transient engine error on contended WAL appends (some builds
-                # raise it as InterfaceError, a sibling of DatabaseError): retry like locked/busy.
-                if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
-                    continue
-                err_msg = str(exc).lower()
-                if isinstance(exc, sqlite3.OperationalError):
-                    if "locked" in err_msg or "busy" in err_msg:
-                        if self._sleep_before_write_retry(deadline, patience_s):
-                            continue
-                        # Say what actually happened, not disk/permission damage.
-                        raise sqlite3.OperationalError(
-                            f"database is locked (another Hermes process held the "
-                            f"state.db write lock for over {patience_s:.0f}s â€” "
-                            "likely a long maintenance operation such as VACUUM, "
-                            "a large WAL checkpoint, or an older pre-update "
-                            "process; the database itself is healthy)"
-                        ) from exc
-                    if (
-                        _DISK_IO_ERROR_MARKER in err_msg and not fn_started and not ioerr_begin_retried
-                        and self._sleep_before_write_retry(deadline, patience_s)
-                    ):
-                        # Retry on the SAME connection: close()+reopen would cancel this process's
-                        # POSIX locks for every sibling (howtocorrupt Â§2.2).
-                        ioerr_begin_retried = True
-                        continue
-                    raise  # non-lock error, callback already ran, or patience exhausted
-                if isinstance(exc, sqlite3.DatabaseError):
-                    # An out-of-band replace surfaces as this same corruption class; in-file repair
-                    # on a NEW generation amplifies the damage.
-                    if (
-                        "not a database" in err_msg or is_malformed_db_error(exc)
-                        or self._is_fts_write_corruption_error(exc)
-                    ):
-                        self._raise_if_db_replaced()
-                    # Corrupt FTS shadow tables fail every write via the sync triggers while canonical
-                    # rows are intact: detach the derived indexes atomically and retry (never rebuild here).
-                    if self._enter_fts_fail_open(exc):
-                        continue
-                    # What survives both checks is structural damage: quarantine.
-                    if self._is_structural_corruption_error(exc):
-                        self._halt_db_corrupt(exc)
-                raise
-
-    def _write_sql(
-        self, sql: str, params: Any = (), *, many: bool = False, patience_s: Optional[float] = None,
-    ) -> None:
-        """Run one INSERT/UPDATE/DELETE through ``_execute_write``."""
-        def _do(conn):
-            (conn.executemany if many else conn.execute)(sql, params)
-        self._execute_write(_do, patience_s=patience_s)
-
-    def _write_rowcount(self, sql: str, params: Any = (), *, patience_s: Optional[float] = None) -> int:
-        """Run one UPDATE/DELETE through ``_execute_write``; return rows changed
-        (``SELECT changes()`` when the driver reports None / negative)."""
-        def _do(conn):
-            rowcount = conn.execute(sql, params).rowcount
-            if rowcount is None or rowcount < 0:
-                rowcount = conn.execute("SELECT changes()").fetchone()[0]
-            return rowcount
-        return self._execute_write(_do, patience_s=patience_s)
-
-    def _read_one(self, sql: str, params: Any = ()) -> Optional[sqlite3.Row]:
-        """``fetchone()`` of one read-only statement via ``_read_ctx``."""
-        with self._read_ctx() as conn:
-            return conn.execute(sql, params).fetchone()
-
-    def _read_all(self, sql: str, params: Any = ()) -> List[sqlite3.Row]:
-        """``fetchall()`` of one read-only statement via ``_read_ctx``."""
-        with self._read_ctx() as conn:
-            return conn.execute(sql, params).fetchall()
-
-    def _ensure_db_file_generation(self) -> None:
-        """Mint a once-per-file generation stamp (state_meta + application_id). First opener wins (INSERT
-        OR IGNORE); application_id is written only while 0 so racers converge. PASSIVE checkpoint only.
-
-        See #45383.
-        """
-        if self.read_only or self._conn is None:
-            return
-        token = uuid.uuid4().hex
-        try:
-            with self._lock:
-                self._conn.execute(
-                    "INSERT OR IGNORE INTO state_meta (key, value) VALUES (?, ?)",
-                    (_STATE_DB_GENERATION_KEY, token),
-                )
-                row = self._conn.execute(
-                    "SELECT value FROM state_meta WHERE key = ?", (_STATE_DB_GENERATION_KEY,),
-                ).fetchone()
-                if row and row[0]:
-                    token = str(row[0])
-                pragma_row = self._conn.execute("PRAGMA application_id").fetchone()
-                current = int(pragma_row[0] or 0) if pragma_row else 0
-                if current == 0:
-                    current = (int(token[:8], 16) & 0x7FFFFFFF) or 1
-                    self._conn.execute(f"PRAGMA application_id={current}")
-                self._db_file_application_id = current
-                try:
-                    self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-                except sqlite3.Error:
-                    pass
-        except sqlite3.Error as exc:
-            logger.debug("state.db generation stamp skipped: %s", exc)
-
-    def _record_db_file_identity(self) -> None:
-        """Snapshot inode plus the on-disk generation header when present."""
-        self._db_file_identity = _stat_db_file_identity(self.db_path)
-        self._db_sidecar_identity = _stat_sqlite_sidecar_identity(self.db_path)
-        disk_id = _read_sqlite_application_id(self.db_path)
-        if disk_id:
-            self._db_file_application_id = disk_id
-        elif self._conn is not None and not self._db_file_application_id:
-            try:
-                pragma_row = self._read_one("PRAGMA application_id")
-            except sqlite3.Error:
-                pragma_row = None
-            if pragma_row and pragma_row[0]:
-                self._db_file_application_id = int(pragma_row[0])
-
-    def _db_file_was_replaced(self) -> bool:
-        """True when the path no longer names the file this instance opened."""
-        recorded = self._db_file_identity
-        if recorded is not None and _stat_db_file_identity(self.db_path) != recorded:
-            return True
-        recorded_app = int(self._db_file_application_id or 0)
-        if not recorded_app:
-            return False
-        # Header 0 = WAL not yet checkpointed, not a replace; a real replacement is nonzero.
-        disk_app = _read_sqlite_application_id(self.db_path)
-        return bool(disk_app and disk_app != recorded_app)
-
-    def _wal_generation_was_lost(self) -> bool:
-        """True when the WAL/SHM generation this handle opened is gone. Recorded
-        generation: pure stat (no /proc walk on healthy writes). Empty identity
-        (WAL appeared after open, or cleared by a clean close()): probe
-        /proc/self/fd for deleted sidecars and adopt the current ones once clean."""
-        recorded = self._db_sidecar_identity or {}
-        base = os.fspath(self.db_path)
-        if recorded:
-            return any(
-                _stat_db_file_identity(Path(base + suffix)) != ident for suffix, ident in recorded.items()
-            )
-        if not self._wal_active:  # no sidecar generation to lose; keep /proc off the hot path
-            return False
-        if sys.platform.startswith("linux"):
-            watched = _watched_sqlite_sidecar_paths(self.db_path)
-            try:
-                for target in _proc_fd_targets(os.getpid()):
-                    if " (deleted)" in target and _canonical_sqlite_path(target) in watched:
-                        return True
-            except OSError:
-                return False
-        # Probe clean (or unavailable): adopt the current sidecar generation.
-        current_identity = _stat_sqlite_sidecar_identity(self.db_path)
-        if current_identity:
-            self._db_sidecar_identity = current_identity
-        return False
-
-    def _halt_if_db_generation_changed(self) -> None:
-        """Stop writes (logging once) when the file was replaced or its WAL/SHM generation
-        is gone: never run in-file repair on a new generation, never keep committing on a
-        split WAL. Both flags are sticky."""
-        # A reopen resolves the PATH again â€” if the file at that path is no longer the one this instance
-        # originally opened (out-of-band restore/cp/mv), reconnecting would write into the new generation
-        # through stale WAL/shm assumptions (#89332). Refuse instead.
-        if self._db_replaced or self._db_file_was_replaced():
-            self._db_replaced = True
-            logger.error(_STATE_DB_REPLACED_MSG)
-            raise StateDbReplacedError(_STATE_DB_REPLACED_MSG)
-        if self._db_wal_generation_lost or self._wal_generation_was_lost():
-            self._db_wal_generation_lost = True
-            logger.error(_DELETED_WAL_GENERATION_MSG)
-            raise DeletedWalGenerationError(_DELETED_WAL_GENERATION_MSG)
-
-    def _raise_if_db_replaced(self) -> None:
-        """Sticky-flag fast path (no log spam on every write), then the live probe."""
-        if self._db_replaced:
-            raise StateDbReplacedError(_STATE_DB_REPLACED_MSG)
-        if self._db_wal_generation_lost:
-            raise DeletedWalGenerationError(_DELETED_WAL_GENERATION_MSG)
-        self._halt_if_db_generation_changed()
-
-    @classmethod
-    def _is_structural_corruption_error(cls, exc: BaseException) -> bool:
-        """Bare SQLITE_CORRUPT/NOTADB with no FTS provenance: canonical B-tree/schema/freelist damage,
-        never repairable from the live write path."""
-        return (
-            isinstance(exc, sqlite3.DatabaseError)
-            and not isinstance(exc, StateDbCorruptError)
-            and not cls._is_fts_write_corruption_error(exc)
-            and classify_persistence_error(exc) == "corrupt"
-        )
-
-    def _corrupt_error(self, prefix: str = "") -> "StateDbCorruptError":
-        """Build the quarantine error for this handle (message assembled once)."""
-        return StateDbCorruptError(f"{prefix}{_STATE_DB_CORRUPT_MSG} (cause: {self._db_corrupt_reason})")
-
-    def _halt_db_corrupt(self, exc: BaseException) -> None:
-        """Quarantine this handle and raise; never run in-file repair here."""
-        self._db_corrupt = True
-        self._db_corrupt_reason = str(exc)
-        self._disable_close_time_checkpoint()
-        logger.error(
-            "state.db %s reported structural corruption outside the FTS "
-            "indexes (%s); quarantining this handle: no further writes, no "
-            "automatic reopen, no explicit WAL checkpoint at close. Stop the "
-            "gateway and run `hermes sessions recover --source %s --inspect-only`.", self.db_path, exc,
-            self.db_path,
-        )
-        err = self._corrupt_error()
-        for attr in ("sqlite_errorcode", "sqlite_errorname"):
-            if getattr(exc, attr, None) is not None:
-                setattr(err, attr, getattr(exc, attr))
-        raise err from exc
-
-    def _disable_close_time_checkpoint(self) -> None:
-        """Best-effort SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE (Python 3.12+): sqlite3's
-        close() otherwise runs the internal last-connection checkpoint that wrote
-        the incident's pages under wrong page numbers (see StateDbCorruptError).
-        <3.12 has no setconfig; the residual checkpoint only carries
-        pre-quarantine committed frames, which is tolerable."""
-        flag = getattr(sqlite3, "SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE", None)
-        conn = self._conn
-        setconfig = getattr(conn, "setconfig", None)
-        if flag is None or setconfig is None:
-            return
-        try:
-            setconfig(flag, True)
-        except Exception:
-            logger.debug(
-                "Could not disable SQLite's close-time checkpoint on the quarantined handle for %s",
-                self.db_path, exc_info=True,
-            )
-
-    def _raise_if_db_corrupt(self) -> None:
-        if self._db_corrupt:
-            raise self._corrupt_error()
-
-    def _sleep_before_write_retry(self, deadline: float, patience_s: float) -> bool:
-        """Sleep one jitter interval if the budget allows; True = retry, False = deadline passed. Small
-        jitter for the first _WRITE_RETRY_SLOW_AFTER_S, then slow; never overshoots the deadline."""
-        now = time.monotonic()
-        if now >= deadline:
-            return False
-        slow = now - (deadline - patience_s) >= self._WRITE_RETRY_SLOW_AFTER_S
-        jitter = random.uniform(*(
-            (self._WRITE_RETRY_SLOW_MIN_S, self._WRITE_RETRY_SLOW_MAX_S) if slow
-            else (self._WRITE_RETRY_MIN_S, self._WRITE_RETRY_MAX_S)
-        ))
-        time.sleep(min(jitter, max(deadline - now, 0.001)))
-        return True
-
-    def _foreign_state_db_holders(self) -> List[Tuple[int, str]]:
-        """Foreign processes holding this DB or its WAL sidecars (see hermes_state_holders)."""
-        return _foreign_state_db_holders(self.db_path)
-
-    def _try_wal_checkpoint(self) -> None:
-        """Best-effort PASSIVE WAL checkpoint; never raises. PASSIVE never blocks writers;
-        TRUNCATE corrupted B-trees on 65K+ page databases under exclusive-lock I/O pressure.
-
-        Previous TRUNCATE strategy caused B-tree corruption on large databases (65K+ pages) due to the
-        exclusive-lock I/O pressure from checkpointing thousands of frames at once (issue #45383).
-        """
-        if self._db_corrupt:
-            return  # quarantined: never checkpoint over a damaged image
-        try:
-            with self._lock:
-                result = self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
-                if result and result[1] > 0:
-                    logger.debug("WAL checkpoint: %d/%d pages checkpointed", result[2], result[1])
-        except Exception as exc:
-            logger.warning("WAL checkpoint (PASSIVE) failed: %s", exc)
-
-    def __enter__(self) -> "SessionDB":
-        """``with SessionDB(path) as db:`` closes on exit; owners must release deterministically.
-
-        Ownership of a SessionDB should be released explicitly. Historically an instance with a started
-        token writer pinned ITSELF (bound-method writer target plus a strong ``atexit`` drain hook), so
-        ``__del__`` never ran for exactly the instances that leaked descriptors (#88033). The writer now
-        retires after an idle window and the atexit hook holds only a weak reference, so abandoned handles
-        are eventually collectible â€” but "eventually, after the idle window and a GC cycle" is not a release
-        policy. Call sites owning a handle are still expected to close it deterministically (see the
-        ownership comments in ``run_agent.py`` and ``tui_gateway/methods_session.py``).
-        """
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> bool:
-        self.close()
-        return False  # never suppress the caller's exception
-
-    def close(self):
-        """Drain queued token deltas, then a PASSIVE checkpoint on writable handles
-        (NOT TRUNCATE: a full WAL reset races the gateway's live writer, tearing
-        B-tree pages). A registry-shared instance RELEASES one refcount instead.
-
-        Drains queued token deltas first (the background writer needs the connection). Read-only connections
-        never request a checkpoint. See #45383.
-        When this instance is shared (opened via ``hermes_state_registry.acquire``), ``close()`` RELEASES one
-        refcount instead of tearing down the connection: the registry owns the lifecycle and only closes on
-        the final release (#90837). This prevents one caller's close from tearing down the writer connection
-        that other callers in the same process are still using â€” while still letting legacy ``close()`` call
-        sites return their reference instead of leaking it.
-        """
-        if self._shared_registry_owned:
-            from hermes_state_registry import release
-            release(self)
-            return
-        self._stop_token_writer()
-        hook, self._token_atexit_hook = self._token_atexit_hook, None
-        if hook is not None:
-            atexit.unregister(hook)
-        # Closed flag first: an in-flight reader then closes its own connection.
-        with self._read_conns_lock:
-            self._read_conns_closed = True
-        while self._evict_one_idle_read_conn():
-            pass
-        with self._lock:
-            if self._conn:
-                if self._db_corrupt:  # quarantined: no checkpoint over a damaged image
-                    logger.warning(
-                        "Skipping the close-time WAL checkpoint for %s: this "
-                        "handle observed structural corruption (%s). Take a "
-                        "snapshot of state.db, -wal and -shm before restarting, "
-                        "then run `hermes sessions recover --source %s --inspect-only`.", self.db_path,
-                        self._db_corrupt_reason, self.db_path,
-                    )
-                elif not self.read_only:  # PASSIVE, not TRUNCATE (see docstring)
-                    try:
-                        # Every cron run_agent opens+closes a transient SessionDB, so a TRUNCATE here fires
-                        # a full WAL reset many times/hour, racing the gateway's long-lived writer on large
-                        # WAL databases and tearing hot B-tree pages -- the #45383 corruption this class's
-                        # own periodic checkpoint was already made PASSIVE to avoid. TRUNCATE belongs only
-                        # on a sole-opener/quiescent connection.
-                        self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-                    except Exception as exc:
-                        logger.debug("WAL checkpoint (PASSIVE) at close failed: %s", exc)
-                conn, self._conn = self._conn, None
-                self._close_connection_quietly(conn)
-                # A clean close lets SQLite unlink the sidecars (a legitimate end of the
-                # generation, not a split): a teardown-race reopen must re-adopt.
-                self._db_sidecar_identity = {}
-
-    def __del__(self) -> None:
-        """Safety net: close the connection if the caller forgot.
-
-        The async accounting worker retires when idle and its atexit hook
-        holds only a weak reference, so neither can pin an otherwise orphaned
-        instance. During interpreter teardown the order of module cleanup is
-        undefined, so every attribute access remains guarded.
-
-        Delegates to ``close()`` so the read pool, token writer, and atexit
-        hook are all cleaned up â€” not just the writer connection.
-        """
-        if self.__dict__.get("_conn") is None:
-            return
-        try:
-            self.close()
-        except Exception:
-            pass
-
-    # â”€â”€ Chunked FTS rebuild engine (v23 opt-in optimize) â”€â”€
-    #
-    # `optimize_fts_storage()` (the `hermes sessions optimize-storage`
-    # command) drops the legacy inline FTS indexes and backfills the new
-    # external-content ones. A single blocking rebuild measured ~16 minutes
-    # of held write lock on a real 25 GB DB, so the backfill runs in small
-    # chunks, each in its own short write transaction:
-    #   - concurrent readers/writers are never starved (WAL stays small,
-    #     each chunk checkpoints via the normal _execute_write cadence);
-    #   - an interrupted run (Ctrl-C, crash) resumes from
-    #     fts_rebuild_progress when the command is re-run;
-    #   - multiple processes sharing the DB don't double-run it â€” each chunk
-    #     claims work by compare-and-swap on fts_rebuild_progress, so even a
-    #     concurrent second runner just interleaves chunks safely.
-    #
-    # THROTTLING (the part that keeps a live gateway sharing the DB
-    # responsive): a greedy chunk loop re-acquires BEGIN IMMEDIATE nearly
-    # back-to-back and can starve another process's writer into exhausting
-    # its lock retries (an early 5000-row/50ms version owned the write lock
-    # ~85% of the time and visibly froze concurrent CLI sessions on a large
-    # install). Two layers prevent that:
-    #   1. Small chunks (500 rows) â€” a foreground write queues behind a
-    #      chunk for at most ~tens of ms.
-    #   2. Inter-chunk pause â€” the loop sleeps max(_FTS_REBUILD_MIN_PAUSE,
-    #      chunk cost x _FTS_REBUILD_DUTY_FACTOR) between chunks, capping
-    #      this process's share of DB bandwidth so concurrent writers always
-    #      find open windows. This works cross-process (unlike any
-    #      same-process activity stamp) because it bounds our own duty
-    #      cycle unconditionally.
-
-    _FTS_REBUILD_CHUNK_ROWS = 500
-    _FTS_REBUILD_DUTY_FACTOR = 4.0      # sleep >= 4x chunk cost (â‰¤20% duty)
-    _FTS_REBUILD_MIN_PAUSE = 0.2        # seconds â€” floor between chunks
-
-    # Demoted v22 FTS shadow tables awaiting teardown (see the v23 migration:
-    # DROP of a multi-GB FTS vtable blocks for minutes, so the migration
-    # demotes the vtable definitions out of sqlite_master and renames the
-    # orphaned shadow tables â€” now plain tables â€” to fts_v22_trash_*; the
-    # worker empties them in bounded chunks, then drops them cheaply).
-    _FTS_TRASH_PREFIX = "fts_v22_trash_"
-
-    # â”€â”€ CJK-bigram index backfill (dedicated marker pair) â”€â”€
-    #
-    # Same chunk engine as the main deferred rebuild, but on the
-    # ``fts_cjk_rebuild_*`` markers so a cjk-only backfill (the common case:
-    # an already-optimized v23 DB gaining the cjk index) never gates the
-    # complete ``messages_fts`` / trigram triggers.
-
-    # â”€â”€ Opt-in v23 FTS storage optimization (`hermes sessions optimize-storage`) â”€â”€
-    #
-    # This is the ONLY path that migrates an existing legacy (v22 inline) DB
-    # to the v23 external-content schema. It is deliberately foreground and
-    # user-invoked, never automatic, because it is disk-heavy and long. It
-    # runs the throttled/resumable chunk engine above to completion
-    # synchronously â€” demote â†’ new schema â†’ chunked backfill â†’ chunked
-    # teardown â€” with progress callbacks, a disk preflight in the CLI
-    # wrapper, a VACUUM at the end, and a defensive schema_version bump.
-
-    def _has_fts_trash(self, conn) -> bool:
-        """True when demoted v22 shadow tables are still awaiting teardown.
-        Caller must hold ``self._lock`` (or pass a migration-time cursor)."""
-        return bool(conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-            "AND name LIKE ? ESCAPE '\\' LIMIT 1",
-            (self._FTS_TRASH_PREFIX.replace("_", "\\_") + "%",),
-        ).fetchone())
-
-    # =========================================================================
-    # Session lifecycle
-    # =========================================================================
-
-
-    def create_session(self, session_id: str, source: str, **kwargs) -> str:
-        """Create a new session record. Returns the session_id."""
-        self._insert_session_row(session_id, source, **kwargs)
-        return session_id
-
-    def record_gateway_session_peer(
-        self,
-        session_id: str,
-        *,
-        source: str,
-        user_id: str = None,
-        session_key: str = None,
-        chat_id: str = None,
-        chat_type: str = None,
-        thread_id: str = None,
-        display_name: str = None,
-        origin_json: str = None,
-        include_compression_ancestors: bool = False,
-    ) -> None:
-        """Persist the gateway routing peer for an existing session row.
-
-        ``display_name`` / ``origin_json`` carry the gateway's presentation
-        and full origin metadata (#9006) so consumers (mcp_serve, mirror,
-        channel directory) can read routing data from state.db instead of
-        sessions.json.  They are COALESCE'd only in the sense that ``None``
-        leaves the existing value untouched.
-
-        ``include_compression_ancestors`` keeps a logical compression lineage
-        on one routing peer when an explicit gateway resume moves its tip to a
-        different lane. Normal per-turn metadata refreshes update only the
-        supplied row.
-
-        Self-healing (#82616): when the target row does not exist yet â€” the
-        gateway's ``create_session`` write failed and was deferred, or a
-        crash landed between routing publication and row creation â€” this
-        recorder INSERTs the row with the full identity instead of silently
-        no-opping. Every per-turn peer refresh is therefore a repair
-        opportunity: a gateway session row can no longer be first-created by
-        an identity-less lazy writer (``update_token_counts`` /
-        ``record_auxiliary_usage``) and stay unroutable forever.
-        """
-        if not session_id or not session_key:
-            return
-
-        def _do(conn):
-            lineage_cte = ""
-            target_clause = "WHERE id = ?"
-            query_params = []
-            if include_compression_ancestors:
-                lineage_cte = """
-                    WITH RECURSIVE compression_lineage(id) AS (
-                        SELECT ?
-                        UNION
-                        SELECT parent.id
-                        FROM compression_lineage lineage
-                        JOIN sessions child ON child.id = lineage.id
-                        JOIN sessions parent ON parent.id = child.parent_session_id
-                        WHERE parent.end_reason = 'compression'
-                          AND json_extract(
-                              COALESCE(child.model_config, '{}'),
-                              '$._branched_from'
-                          ) IS NULL
-                          AND json_extract(
-                              COALESCE(child.model_config, '{}'),
-                              '$._delegate_from'
-                          ) IS NULL
-                          AND COALESCE(child.source, '') != 'tool'
-                    )
-                """
-                target_clause = "WHERE id IN (SELECT id FROM compression_lineage)"
-                query_params.append(session_id)
-            query_params.extend(
-                (
-                    session_key,
-                    source,
-                    user_id,
-                    chat_id,
-                    chat_type,
-                    thread_id,
-                    display_name,
-                    origin_json,
-                )
-            )
-            if not include_compression_ancestors:
-                query_params.append(session_id)
-            conn.execute(
-                f"""{lineage_cte}
-                   UPDATE sessions
-                   SET session_key = ?, source = ?, user_id = ?, chat_id = ?,
-                       chat_type = ?, thread_id = ?,
-                       display_name = COALESCE(?, display_name),
-                       origin_json = COALESCE(?, origin_json)
-                   {target_clause}""",
-                query_params,
-            )
-            # Self-heal (#82616): the UPDATE is a silent no-op when the row
-            # is missing (create_session failed earlier, or a crash landed
-            # between routing publication and row creation). Insert it with
-            # the full identity so the session is durably routable â€” never
-            # leave first-creation to an identity-less lazy writer.
-            if not include_compression_ancestors:
-                cur = conn.execute(
-                    "SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)
-                )
-                if cur.fetchone() is None:
-                    conn.execute(
-                        """INSERT INTO sessions (
-                               id, source, user_id, session_key, chat_id,
-                               chat_type, thread_id, display_name, origin_json,
-                               started_at
-                           )
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                           ON CONFLICT(id) DO UPDATE SET
-                               session_key = COALESCE(sessions.session_key, excluded.session_key),
-                               chat_id = COALESCE(sessions.chat_id, excluded.chat_id),
-                               chat_type = COALESCE(sessions.chat_type, excluded.chat_type),
-                               thread_id = COALESCE(sessions.thread_id, excluded.thread_id),
-                               display_name = COALESCE(sessions.display_name, excluded.display_name),
-                               origin_json = COALESCE(sessions.origin_json, excluded.origin_json)""",
-                        (
-                            session_id,
-                            source,
-                            user_id,
-                            session_key,
-                            chat_id,
-                            chat_type,
-                            thread_id,
-                            display_name,
-                            origin_json,
-                            time.time(),
-                        ),
-                    )
-
-        self._execute_write(_do)
-
-    def set_expiry_finalized(self, session_id: str, finalized: bool = True) -> None:
-        """Mark a gateway session's expiry-finalization flag in state.db.
-
-        Mirrors ``SessionEntry.expiry_finalized`` (sessions.json) so the flag
-        survives even if the JSON index is pruned or lost (#9006).
-        """
-        if not session_id:
-            return
-
-        def _do(conn):
-            conn.execute(
-                "UPDATE sessions SET expiry_finalized = ? WHERE id = ?",
-                (1 if finalized else 0, session_id),
-            )
-
-        self._execute_write(_do)
-
-    # â”€â”€ Gateway routing index (replaces sessions.json, #9006 follow-up) â”€â”€â”€â”€
-
-    def save_gateway_routing_entry(
-        self, session_key: str, entry_json: str, *, scope: str = ""
-    ) -> None:
-        """Upsert one gateway routing entry (session_key -> SessionEntry JSON).
-
-        The gateway_routing table is the durable replacement for
-        sessions.json: one row per routing key, holding the full serialized
-        ``SessionEntry`` so the gateway can rehydrate exactly what it wrote.
-
-        ``scope`` namespaces the index the way separate sessions.json files
-        did (one per sessions_dir) â€” callers pass their sessions_dir path so
-        two stores with different directories never share routing state.
-        """
-        if not session_key or not entry_json:
-            return
-
-        def _do(conn):
-            conn.execute(
-                """INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at)
-                   VALUES (?, ?, ?, ?)
-                   ON CONFLICT(scope, session_key) DO UPDATE SET
-                       entry_json = excluded.entry_json,
-                       updated_at = excluded.updated_at""",
-                (scope, session_key, entry_json, time.time()),
-            )
-
-        self._execute_write(_do)
-
-    def replace_gateway_routing_entries(
-        self, entries: Dict[str, str], *, scope: str = ""
-    ) -> None:
-        """Atomically replace the routing index for *scope* with *entries*.
-
-        Mirrors the sessions.json full-rewrite semantics: keys absent from
-        *entries* are removed (pruned/reset sessions disappear from the
-        index).  Runs as a single write transaction.  Other scopes are
-        untouched.
-        """
-        now = time.time()
-
-        def _do(conn):
-            conn.execute("DELETE FROM gateway_routing WHERE scope = ?", (scope,))
-            if entries:
-                conn.executemany(
-                    "INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at) "
-                    "VALUES (?, ?, ?, ?)",
-                    [(scope, k, v, now) for k, v in entries.items() if k and v],
-                )
-
-        self._execute_write(_do)
-
-    def load_gateway_routing_entries(self, *, scope: str = "") -> Dict[str, str]:
-        """Load routing entries for *scope* as {session_key: entry_json}."""
-        with self._read_ctx() as conn:
-            rows = conn.execute(
-                "SELECT session_key, entry_json FROM gateway_routing WHERE scope = ?",
-                (scope,),
-            ).fetchall()
-        return {r["session_key"]: r["entry_json"] for r in rows}
-
-    def delete_gateway_routing_entries(
-        self, session_keys: List[str], *, scope: str = ""
-    ) -> None:
-        """Remove routing entries for the given session keys in *scope*."""
-        if not session_keys:
-            return
-
-        def _do(conn):
-            conn.executemany(
-                "DELETE FROM gateway_routing WHERE scope = ? AND session_key = ?",
-                [(scope, k) for k in session_keys],
-            )
-
-        self._execute_write(_do)
-
-    def list_never_active_keyed_sessions(
-        self, *, older_than_days: float
-    ) -> List[Dict[str, Any]]:
-        """Keyed gateway rows that were opened and then never used at all.
-
-        Selects rows that are keyed (``session_key IS NOT NULL``), still open
-        (``ended_at IS NULL``) and carry no evidence of a single turn: no
-        messages, no tokens, no tool or API calls, no recorded activity, no
-        title.  Such a row is indistinguishable from "never happened".
-
-        That is exactly the shape of a leaked test fixture (#82770) â€” and
-        also of a chat that was routed but never answered.  Both are safe to
-        drop: there is no transcript to lose, and the gateway mints a fresh
-        session on the next inbound message either way.
-
-        ``bulk prune``/``archive`` cannot reach these rows: their shared
-        selector is pinned to ``ended_at IS NOT NULL`` so that a live session
-        is never picked, which permanently excludes every never-closed row.
-        Hence a separate, narrower selector rather than another filter flag.
-
-        ``pinned`` and ``archived`` rows are excluded â€” both are explicit
-        user intent to keep the row around.
-        """
-        cutoff = time.time() - (float(older_than_days) * 86400.0)
-        with self._read_ctx() as conn:
-            rows = conn.execute(
-                """
-                SELECT s.id, s.session_key, s.source, s.chat_id,
-                       s.chat_type, s.user_id, s.started_at
-                  FROM sessions s
-                 WHERE s.session_key IS NOT NULL
-                   AND s.ended_at IS NULL
-                   AND s.title IS NULL
-                   AND s.last_activity_at IS NULL
-                   AND COALESCE(s.message_count, 0) = 0
-                   AND COALESCE(s.tool_call_count, 0) = 0
-                   AND COALESCE(s.api_call_count, 0) = 0
-                   AND COALESCE(s.input_tokens, 0) = 0
-                   AND COALESCE(s.output_tokens, 0) = 0
-                   AND COALESCE(s.pinned, 0) = 0
-                   AND COALESCE(s.archived, 0) = 0
-                   AND s.started_at IS NOT NULL
-                   AND s.started_at < ?
-                   AND NOT EXISTS (
-                           SELECT 1 FROM messages m WHERE m.session_id = s.id
-                       )
-                 ORDER BY s.started_at
-                """,
-                (cutoff,),
-            ).fetchall()
-        return [dict(r) for r in rows]
-
-
-    def prune_never_active_keyed_sessions(
-        self,
-        *,
-        older_than_days: float,
-        sessions_dir: Optional[Path] = None,
-    ) -> Tuple[int, int]:
-        """Delete never-active keyed rows and the routing entries naming them.
-
-        Returns ``(sessions_deleted, routing_entries_deleted)``.
-
-        The routing entries go first: a stale entry that outlived its target
-        would leave the gateway resuming a session id that no longer exists.
-        Deleting the pair is what leaving them both would have amounted to
-        anyway â€” the target had no transcript to resume.
-
-        Deletion goes through :meth:`delete_session` rather than a bulk
-        ``DELETE`` so the delegate cascade, FTS bookkeeping and on-disk
-        transcript cleanup stay owned by one implementation.
-        """
-        candidates = self.list_never_active_keyed_sessions(
-            older_than_days=older_than_days
-        )
-        if not candidates:
-            return (0, 0)
-        ids = {str(row["id"]) for row in candidates}
-        routing_deleted = self._delete_routing_entries_for_sessions(ids)
-        deleted = 0
-        for session_id in ids:
-            if self.delete_session(session_id, sessions_dir=sessions_dir):
-                deleted += 1
-        return (deleted, routing_deleted)
-
-    def list_gateway_sessions(
-        self,
-        *,
-        platform: Optional[str] = None,
-        active_only: bool = True,
-    ) -> List[Dict[str, Any]]:
-        """List gateway sessions (rows with a session_key) from state.db.
-
-        Returns the newest row per session_key â€” the same shape consumers got
-        from sessions.json: one live mapping per routing key.  ``platform``
-        filters on ``source``; ``active_only`` restricts to sessions that
-        have not ended.
-        """
-        # Full rows carry token/cost totals (MCP listings, /status) â€” drain
-        # queued async accounting deltas so consumers see exact counters.
-        self.flush_token_counts()
-        query = f"""
-            SELECT sessions.*,
-                   COALESCE(sp.prompt, sessions.system_prompt)
-                       AS _system_prompt_resolved,
-                   {_sql_session_last_active("sessions")} AS last_active
-            FROM sessions
-            LEFT JOIN system_prompts sp
-              ON sp.hash = sessions.system_prompt_hash
-            WHERE session_key IS NOT NULL
-              AND started_at = (
-                  SELECT MAX(s2.started_at) FROM sessions s2
-                  WHERE s2.session_key = sessions.session_key
-              )
-        """
-        params: list = []
-        if platform:
-            query += " AND LOWER(source) = LOWER(?)"
-            params.append(platform)
-        if active_only:
-            query += " AND ended_at IS NULL"
-        query += " ORDER BY last_active DESC"
-        with self._lock:
-            rows = self._conn.execute(query, params).fetchall()
-        return [self._session_row_dict(r) for r in rows]
-
-    def find_session_by_origin(
-        self,
-        *,
-        platform: str,
-        chat_id: str,
-        thread_id: Optional[str] = None,
-        user_id: Optional[str] = None,
-    ) -> Optional[str]:
-        """Find the most recent live session_id for a platform + chat origin.
-
-        Equivalent of gateway/mirror's sessions.json scan: matches on
-        source + chat_id (+ thread_id when provided).  When ``user_id`` is
-        provided, exact sender matches are preferred; if multiple distinct
-        users share the chat and none matches, returns None rather than
-        contaminating another participant's session.
-        """
-        if not platform or chat_id in (None, ""):
-            return None
-        query = """
-            SELECT id, user_id, started_at FROM sessions
-            WHERE LOWER(source) = LOWER(?)
-              AND session_key IS NOT NULL
-              AND chat_id = ?
-              AND ended_at IS NULL
-        """
-        params: list = [platform, str(chat_id)]
-        if thread_id is not None:
-            query += " AND COALESCE(thread_id, '') = ?"
-            params.append(str(thread_id))
-        query += " ORDER BY started_at DESC"
-        with self._lock:
-            rows = [dict(r) for r in self._conn.execute(query, params).fetchall()]
-        if not rows:
-            return None
-        if user_id:
-            exact = [r for r in rows if str(r.get("user_id") or "") == str(user_id)]
-            if exact:
-                return str(exact[0]["id"])
-            if len(rows) > 1:
-                return None
-        elif len(rows) > 1:
-            distinct_users = {
-                str(r.get("user_id") or "").strip()
-                for r in rows
-                if str(r.get("user_id") or "").strip()
-            }
-            if len(distinct_users) > 1:
-                return None
-        return str(rows[0]["id"])
-
-
-    # â”€â”€ Orphaned gateway-session repair (#82616) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    # A write-path failure (corrupt FTS, crash between routing publication
-    # and row creation) can leave the live conversation in a session row
-    # that never received its identity columns. Both queries above require
-    # those columns, so the row holding the real transcript is invisible to
-    # recovery: the chat resolves to the last keyed row instead â€” days older
-    # â€” and the conversation time-travels. Hardening the write side cannot
-    # reach a row that is *already* damaged; these two methods are the
-    # offline repair path behind ``hermes sessions repair-routing``.
-
-    # Widest plausible gap between a keyed predecessor going quiet and its
-    # unkeyed successor being minted. The reported incident gap was ~60s;
-    # 15 minutes stays generous without spanning unrelated conversations.
-    _ORPHAN_ADOPTION_MAX_GAP_S = 900.0
-
-    def find_orphaned_gateway_sessions(
-        self, *, max_gap_s: Optional[float] = None
-    ) -> List[Dict[str, Any]]:
-        """Report message-bearing session rows that lost their routing identity.
-
-        A row is a candidate orphan when it has messages but no
-        ``session_key``. It is only *adoptable* when exactly one keyed
-        predecessor can be named as the conversation it continues:
-
-        * ``lineage`` â€” ``parent_session_id`` points at a keyed row of the
-          same source. That is a recorded fact, so no time window applies.
-        * ``contiguity`` â€” exactly one keyed row of the same source (and
-          compatible ``user_id``) fell quiet within *max_gap_s* of the
-          orphan's start, and is older than the orphan's own last activity.
-
-        Anything ambiguous is reported with ``adoptable=False`` and a reason
-        rather than guessed at: mis-adopting would splice one person's
-        conversation into another person's chat. Branch/delegate/tool rows
-        are excluded outright â€” they are unkeyed by design, not by damage.
-        """
-        gap = (
-            self._ORPHAN_ADOPTION_MAX_GAP_S
-            if max_gap_s is None
-            else float(max_gap_s)
-        )
-        orphan_active = _sql_session_last_active("o")
-        donor_active = _sql_session_last_active("d")
-        donor_columns = (
-            "d.id, d.session_key, d.chat_id, d.chat_type, d.thread_id, "
-            "d.user_id, d.origin_json, d.display_name, d.end_reason"
-        )
-        records: List[Dict[str, Any]] = []
-
-        with self._read_ctx() as conn:
-            orphans = conn.execute(
-                f"""
-                SELECT o.id, o.source, o.user_id, o.started_at,
-                       o.parent_session_id,
-                       {orphan_active} AS last_active,
-                       (SELECT COUNT(*) FROM messages m
-                         WHERE m.session_id = o.id) AS message_count
-                FROM sessions o
-                WHERE o.session_key IS NULL
-                  AND EXISTS (SELECT 1 FROM messages m
-                               WHERE m.session_id = o.id)
-                  AND COALESCE(o.source, '') != 'tool'
-                  AND json_extract(COALESCE(o.model_config, '{{}}'),
-                                   '$._branched_from') IS NULL
-                  AND json_extract(COALESCE(o.model_config, '{{}}'),
-                                   '$._delegate_from') IS NULL
-                ORDER BY o.started_at ASC
-                """
-            ).fetchall()
-
-            for orphan in orphans:
-                donor = None
-                evidence = ""
-                reason = ""
-
-                if orphan["parent_session_id"]:
-                    evidence = "lineage"
-                    donor = conn.execute(
-                        f"""
-                        SELECT {donor_columns}
-                        FROM sessions d
-                        WHERE d.id = ?
-                          AND d.session_key IS NOT NULL
-                          AND COALESCE(d.source, '') = COALESCE(?, '')
-                        """,
-                        (orphan["parent_session_id"], orphan["source"]),
-                    ).fetchone()
-                    if donor is None:
-                        reason = (
-                            "parent session carries no gateway identity of "
-                            "this source"
-                        )
-                else:
-                    evidence = "contiguity"
-                    candidates = conn.execute(
-                        f"""
-                        SELECT {donor_columns}, {donor_active} AS last_active
-                        FROM sessions d
-                        WHERE d.session_key IS NOT NULL
-                          AND d.id != ?
-                          AND COALESCE(d.source, '') = COALESCE(?, '')
-                          AND (COALESCE(d.user_id, '') = ''
-                               OR COALESCE(?, '') = ''
-                               OR d.user_id = ?)
-                          AND {donor_active} BETWEEN ? AND ?
-                          AND {donor_active} < ?
-                        ORDER BY last_active DESC
-                        LIMIT 2
-                        """,
-                        (
-                            orphan["id"],
-                            orphan["source"],
-                            orphan["user_id"],
-                            orphan["user_id"],
-                            (orphan["started_at"] or 0) - gap,
-                            (orphan["started_at"] or 0) + gap,
-                            orphan["last_active"],
-                        ),
-                    ).fetchall()
-                    if not candidates:
-                        reason = (
-                            f"no keyed predecessor fell quiet within {gap:.0f}s "
-                            "of this session's start"
-                        )
-                    elif len(candidates) > 1:
-                        reason = (
-                            "ambiguous: more than one keyed predecessor "
-                            "matches this window"
-                        )
-                    else:
-                        donor = candidates[0]
-
-                records.append(
-                    {
-                        "orphan_id": orphan["id"],
-                        "source": orphan["source"],
-                        "message_count": orphan["message_count"],
-                        "started_at": orphan["started_at"],
-                        "last_active": orphan["last_active"],
-                        "donor_id": donor["id"] if donor else None,
-                        "session_key": donor["session_key"] if donor else None,
-                        "evidence": evidence if donor else "",
-                        "adoptable": donor is not None,
-                        "reason": reason,
-                    }
-                )
-
-        # Two unkeyed successors claiming the same predecessor means at most
-        # one of them continues that chat, and nothing here says which.
-        contested = {
-            r["donor_id"]
-            for r in records
-            if r["adoptable"]
-            and sum(1 for x in records if x["donor_id"] == r["donor_id"]) > 1
-        }
-        for record in records:
-            if record["donor_id"] in contested:
-                record["adoptable"] = False
-                record["reason"] = (
-                    "ambiguous: more than one unkeyed session claims this "
-                    "predecessor"
-                )
-        return records
-
-    def adopt_orphaned_gateway_session(
-        self, orphan_id: str, donor_id: str
-    ) -> bool:
-        """Stamp *orphan_id* with *donor_id*'s routing identity, retire *donor_id*.
-
-        Re-verifies the pair inside the write transaction, so a concurrent
-        gateway that healed either row in the meantime turns this into a
-        no-op instead of a conflicting write. Existing non-NULL columns on
-        the orphan are preserved. Returns True when the adoption applied.
-        """
-        if not orphan_id or not donor_id or orphan_id == donor_id:
-            return False
-
-        def _do(conn):
-            donor = conn.execute(
-                "SELECT session_key, chat_id, chat_type, thread_id, user_id, "
-                "origin_json, display_name, source FROM sessions WHERE id = ?",
-                (donor_id,),
-            ).fetchone()
-            orphan = conn.execute(
-                "SELECT session_key, source FROM sessions WHERE id = ?",
-                (orphan_id,),
-            ).fetchone()
-            if donor is None or orphan is None:
-                return False
-            if not donor["session_key"] or orphan["session_key"]:
-                return False
-            if (donor["source"] or "") != (orphan["source"] or ""):
-                return False
-
-            conn.execute(
-                """UPDATE sessions
-                      SET session_key = ?,
-                          chat_id = COALESCE(chat_id, ?),
-                          chat_type = COALESCE(chat_type, ?),
-                          thread_id = COALESCE(thread_id, ?),
-                          user_id = COALESCE(user_id, ?),
-                          origin_json = COALESCE(origin_json, ?),
-                          display_name = COALESCE(display_name, ?),
-                          parent_session_id = COALESCE(parent_session_id, ?)
-                    WHERE id = ? AND session_key IS NULL""",
-                (
-                    donor["session_key"],
-                    donor["chat_id"],
-                    donor["chat_type"],
-                    donor["thread_id"],
-                    donor["user_id"],
-                    donor["origin_json"],
-                    donor["display_name"],
-                    donor_id,
-                    orphan_id,
-                ),
-            )
-            # Retire the predecessor under a reason recovery does NOT treat
-            # as resumable â€” 'agent_close'/'ws_orphan_reap' would keep it in
-            # the running, and the newly keyed orphan could lose the chat
-            # again on the next restart.
-            conn.execute(
-                "UPDATE sessions SET ended_at = COALESCE(ended_at, ?), "
-                "end_reason = 'superseded_by_repair' WHERE id = ?",
-                (time.time(), donor_id),
-            )
-            return True
-
-        return self._execute_write(_do)
-
-    # Children that carry a ``parent_session_id`` but are NOT compression
-    # continuations: branches, delegate/subagent runs, and tool sessions.
-    # A marker only disqualifies a child when it points at the parent being
-    # queried â€” compression continuations inherit the rotated agent's
-    # ``model_config`` verbatim (``publish_compression_child`` callers pass
-    # ``agent._session_init_model_config``), so a delegate subagent's
-    # continuation carries ``_delegate_from=<the delegate's own parent>``.
-    # Matching markers by mere presence misclassified those real
-    # continuations as delegate children (fail-open for orphan reopen,
-    # fail-closed for adoption). Bind the parent id for both markers.
-    _NON_CONTINUATION_CHILD_FILTER_SQL = (
-        "  AND COALESCE(json_extract(COALESCE({alias}model_config, '{{}}'),"
-        " '$._branched_from'), '') != ?\n"
-        "  AND COALESCE(json_extract(COALESCE({alias}model_config, '{{}}'),"
-        " '$._delegate_from'), '') != ?\n"
-        "  AND COALESCE({alias}source, '') != 'tool'\n"
-    )
-
-    def find_live_compression_child(
-        self, parent_session_id: str
-    ) -> Optional[Dict[str, Any]]:
-        """Return the unique live direct child of a compression-ended session.
-
-        A stale agent may observe that another compression path already rotated
-        its parent. Recovery is safe only when the durable lineage identifies
-        exactly one live direct continuation. Multiple children are treated as
-        ambiguous and fail closed rather than guessing which transcript owns
-        subsequent messages.
-        """
-        if not parent_session_id:
-            return None
-        with self._read_ctx() as conn:
-            parent = conn.execute(
-                "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
-                (parent_session_id,),
-            ).fetchone()
-            if (
-                parent is None
-                or parent["ended_at"] is None
-                or parent["end_reason"] != "compression"
-            ):
-                return None
-            rows = conn.execute(
-                """
-                SELECT s.*,
-                       COALESCE(sp.prompt, s.system_prompt)
-                           AS _system_prompt_resolved
-                FROM sessions s
-                LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash
-                WHERE s.parent_session_id = ?
-                  AND s.ended_at IS NULL
-                """
-                + self._NON_CONTINUATION_CHILD_FILTER_SQL.format(alias="s.")
-                + """
-                ORDER BY s.started_at ASC
-                LIMIT 2
-                """,
-                (parent_session_id, parent_session_id, parent_session_id),
-            ).fetchall()
-        return self._session_row_dict(rows[0]) if len(rows) == 1 else None
-
-    def reopen_orphaned_compression_session(self, session_id: str) -> bool:
-        """Reopen a compression parent only when no continuation was published.
-
-        Compression publication is atomic in current builds, but older builds
-        could leave a closed parent behind after an interrupted handoff.  This
-        recovery is deliberately conservative: an active compression lease or
-        any canonical child means the lineage is still owned by another path,
-        so the caller must fail closed instead of reopening the parent.
-        """
-        if not session_id:
-            return False
-
-        def _do(conn):
-            parent = conn.execute(
-                "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
-                (session_id,),
-            ).fetchone()
-            if (
-                parent is None
-                or parent["ended_at"] is None
-                or parent["end_reason"] != "compression"
-            ):
-                return False
-
-            # Treat any direct non-branch/non-delegate/non-tool child as a
-            # continuation, regardless of its current ended state. Reopening
-            # in that case could create a second live head for one lineage.
-            child = conn.execute(
-                """
-                SELECT 1
-                FROM sessions
-                WHERE parent_session_id = ?
-                """
-                + self._NON_CONTINUATION_CHILD_FILTER_SQL.format(alias="")
-                + """
-                LIMIT 1
-                """,
-                (session_id, session_id, session_id),
-            ).fetchone()
-            if child is not None:
-                return False
-
-            # refresh_compression_lock() deliberately lets an owner revive its
-            # own expired row. Reclaim that row inside this write transaction
-            # before reopening: refresh-first makes the lease active and aborts
-            # recovery; recovery-first deletes the holder identity so a later
-            # refresh cannot resurrect it.
-            now = time.time()
-            lock_row = conn.execute(
-                "SELECT holder, expires_at FROM compression_locks "
-                "WHERE session_id = ?",
-                (session_id,),
-            ).fetchone()
-            if lock_row is not None:
-                expires_at = lock_row["expires_at"]
-                if expires_at is None or float(expires_at) >= now:
-                    return False
-                deleted = conn.execute(
-                    "DELETE FROM compression_locks "
-                    "WHERE session_id = ? AND holder = ? AND expires_at = ?",
-                    (session_id, lock_row["holder"], expires_at),
-                )
-                if deleted.rowcount != 1:
-                    return False
-
-            updated = conn.execute(
-                "UPDATE sessions SET ended_at = NULL, end_reason = NULL "
-                "WHERE id = ? AND ended_at IS NOT NULL "
-                "AND end_reason = 'compression'",
-                (session_id,),
-            )
-            # rowcount==1 is guaranteed by the parent SELECT at the top of
-            # this same BEGIN IMMEDIATE transaction. If this is ever edited
-            # to return False past this point, note that the lease DELETE
-            # above will still COMMIT (_execute_write commits unless _do
-            # raises) â€” raise instead of returning False to roll back.
-            return updated.rowcount == 1
-
-        return bool(self._execute_write(_do))
-
-    def publish_compression_child(
-        self,
-        *,
-        parent_session_id: str,
-        child_session_id: str,
-        source: str,
-        messages: List[Dict[str, Any]],
-        model: str = None,
-        model_config: Dict[str, Any] = None,
-        system_prompt: str = None,
-        cwd: str = None,
-        profile_name: str = None,
-        compression_lock_holder: str = None,
-        require_compression_lease: bool = True,
-        watermark: Optional[int] = None,
-        watermark_ceiling: Optional[int] = None,
-    ) -> None:
-        """Atomically close a parent and publish its durable compression child.
-
-        The parent closure, child row, and compacted handoff become visible in
-        one transaction. Readers can therefore observe either the live parent or
-        a complete child, never an ended parent with a missing/empty child.
-
-        Concurrent-append safety (#75316): when *watermark* is provided (the
-        parent's :meth:`get_active_message_watermark` captured at compression
-        start), parent rows that arrived during the slow summary call
-        (``id > watermark``) are cloned into the child AFTER the handoff â€”
-        same pure-SQL column clone as :meth:`archive_and_compact`, with the
-        session id rewritten â€” so a mid-compression append survives rotation
-        instead of stranding in the closed parent.
-
-        *watermark_ceiling* bounds the clone from above: the rotation path
-        flushes its OWN un-persisted input transcript to the parent right
-        before publishing (#47202), and those rows are already represented in
-        the compacted handoff â€” cloning them would duplicate the transcript.
-        The caller captures ``MAX(id)`` immediately BEFORE that flush; only
-        rows in ``(watermark, watermark_ceiling]`` are foreign concurrent
-        tail. ``None`` = unbounded (no internal flush happened).
-        """
-        def _do(conn):
-            lock_row = conn.execute(
-                "SELECT holder, expires_at FROM compression_locks WHERE session_id = ?",
-                (parent_session_id,),
-            ).fetchone()
-            if require_compression_lease and (
-                lock_row is None
-                or not compression_lock_holder
-                or lock_row["holder"] != compression_lock_holder
-                or float(lock_row["expires_at"]) <= time.time()
-            ):
-                raise CompressionSessionBusyError(
-                    f"Compression lease lost before publication: {parent_session_id}"
-                )
-            parent = conn.execute(
-                """SELECT ended_at, cwd, git_branch, git_repo_root,
-                          user_id, session_key, chat_id, chat_type,
-                          thread_id, display_name, origin_json, profile_name
-                   FROM sessions WHERE id = ?""",
-                (parent_session_id,),
-            ).fetchone()
-            if parent is None:
-                raise RuntimeError(f"Compression parent not found: {parent_session_id}")
-            if parent["ended_at"] is not None:
-                raise RuntimeError(f"Compression parent already ended: {parent_session_id}")
-            if not messages:
-                raise RuntimeError("Compression child handoff must not be empty")
-            system_prompt_hash = self._store_system_prompt(conn, system_prompt)
-
-            conn.execute(
-                """INSERT INTO sessions (
-                   id, source, model, model_config, system_prompt,
-                   system_prompt_hash,
-                   parent_session_id, cwd, git_branch, git_repo_root,
-                   profile_name, user_id, session_key, chat_id, chat_type,
-                   thread_id, display_name, origin_json, started_at
-                ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    child_session_id,
-                    source,
-                    model,
-                    json.dumps(model_config) if model_config else None,
-                    system_prompt_hash,
-                    parent_session_id,
-                    cwd or parent["cwd"],
-                    parent["git_branch"],
-                    parent["git_repo_root"],
-                    # Same inheritance contract as _insert_session_row's
-                    # compression-fork backfill (#59527 / cross-profile jump
-                    # fix): the child stays on the parent's profile and keeps
-                    # the gateway routing/origin columns so peer recovery
-                    # still works after a crash at the boundary.
-                    profile_name or parent["profile_name"],
-                    parent["user_id"],
-                    parent["session_key"],
-                    parent["chat_id"],
-                    parent["chat_type"],
-                    parent["thread_id"],
-                    parent["display_name"],
-                    parent["origin_json"],
-                    time.time(),
-                ),
-            )
-            total_messages, total_tool_calls = self._insert_message_rows(
-                conn, child_session_id, messages
-            )
-            if watermark is not None:
-                # Clone the parent's concurrent tail (rows landed after the
-                # watermark, at or below the ceiling â€” see docstring) into the
-                # child, after the handoff. Column-exact except id/session_id;
-                # originals stay in the (closed) parent for lineage recovery.
-                _ceiling_clause = ""
-                _params: list = [parent_session_id, int(watermark)]
-                if watermark_ceiling is not None:
-                    _ceiling_clause = " AND id <= ?"
-                    _params.append(int(watermark_ceiling))
-                tail_rows = conn.execute(
-                    "SELECT id, tool_calls FROM messages "
-                    "WHERE session_id = ? AND active = 1 AND id > ?"
-                    f"{_ceiling_clause} ORDER BY id",
-                    _params,
-                ).fetchall()
-                if tail_rows:
-                    tail_ids = [int(r["id"]) for r in tail_rows]
-                    placeholders = ",".join("?" for _ in tail_ids)
-                    clone_cols = [
-                        c for c in self._message_column_names(conn)
-                        if c not in ("id", "session_id", "active", "compacted")
-                    ]
-                    col_list = ", ".join(clone_cols)
-                    conn.execute(
-                        f"INSERT INTO messages ({col_list}, session_id, active, compacted) "
-                        f"SELECT {col_list}, ?, 1, 0 FROM messages "
-                        f"WHERE id IN ({placeholders}) ORDER BY id",
-                        [child_session_id, *tail_ids],
-                    )
-                    total_messages += len(tail_ids)
-                    for r in tail_rows:
-                        raw = r["tool_calls"]
-                        if raw:
-                            try:
-                                parsed = json.loads(raw) if isinstance(raw, str) else raw
-                                total_tool_calls += len(parsed) if isinstance(parsed, list) else 0
-                            except (TypeError, ValueError):
-                                pass
-            conn.execute(
-                "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
-                (total_messages, total_tool_calls, child_session_id),
-            )
-            updated = conn.execute(
-                "UPDATE sessions SET ended_at = ?, end_reason = 'compression' "
-                "WHERE id = ? AND ended_at IS NULL",
-                (time.time(), parent_session_id),
-            )
-            if updated.rowcount != 1:
-                raise RuntimeError(
-                    f"Compression parent changed during publication: {parent_session_id}"
-                )
-
-        self._execute_write(_do)
-
-    def end_session(self, session_id: str, end_reason: str) -> None:
-        """Mark a session as ended.
-
-        No-ops when the session is already ended. The first end_reason wins:
-        compression-split sessions must keep their ``end_reason = 'compression'``
-        record even if a later stale ``end_session()`` call (e.g. from a
-        desynced CLI session_id after ``/resume`` or ``/branch``) targets them
-        with a different reason. Use ``reopen_session()`` first if you
-        intentionally need to re-end a closed session with a new reason.
-        """
-        def _do(conn):
-            conn.execute(
-                "UPDATE sessions SET ended_at = ?, end_reason = ? "
-                "WHERE id = ? AND ended_at IS NULL",
-                (time.time(), end_reason, session_id),
-            )
-        self._execute_write(_do)
-
-    def reopen_session(self, session_id: str) -> None:
-        """Clear ended_at/end_reason so a session can be resumed.
-
-        Before clearing a reset boundary, stabilize markerless legacy reset
-        children that still depend on the parent's mutable end_reason.
-        """
-        def _do(conn):
-            placeholders = ",".join("?" for _ in _RESET_END_REASONS)
-            # WHERE shape shared with _RESET_CHILD_SQL's fallback arm via
-            # _legacy_reset_child_sql so the stamping and the listing
-            # predicate cannot drift.
-            conn.execute(
-                "UPDATE sessions AS child SET model_config = json_set("
-                "COALESCE(child.model_config, '{}'), '$._reset_from', "
-                "child.parent_session_id) "
-                "WHERE child.parent_session_id = ? "
-                "AND json_extract(COALESCE(child.model_config, '{}'), "
-                "                 '$._reset_from') IS NULL "
-                f"AND {_legacy_reset_child_sql('child', placeholders)}",
-                (session_id, *_RESET_END_REASONS),
-            )
-            conn.execute(
-                "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
-                (session_id,),
-            )
-        self._execute_write(_do)
-
-    def promote_to_session_reset(
-        self, session_id: str, reason: str = "session_reset"
-    ) -> bool:
-        """Durably mark a session as ended by an intentional reset boundary.
-
-        Promotes *only* live rows (``ended_at IS NULL``) or rows carrying an
-        accidental end_reason that the recovery query
-        (``find_latest_gateway_session_for_peer``) treats as recoverable:
-        ``agent_close`` (older gateway cleanup bug) and ``ws_orphan_reap``
-        (mistaken TUI reaper).  Explicit conversation boundaries such as
-        ``compression``, ``session_reset``, ``session_switch``, etc. are
-        preserved â€” the first writer wins for those, and a later expiry
-        finalization must not silently overwrite them.
-
-        Plain ``end_session()`` is NOT sufficient for reset boundaries: it
-        no-ops on an already-ended row, so a row that agent cleanup already
-        closed as ``agent_close`` would stay recoverable and stale-route
-        recovery would resurrect the reset session with its full history
-        (#61220, #61993, #63539).
-
-        Keep this promotion set in sync with the recoverable set in
-        ``find_latest_gateway_session_for_peer`` â€” any reason recovery would
-        reopen must be promotable here.
-
-        ``reason`` lets reset paths keep their auditable specific reasons
-        (``idle``, ``daily``, ``suspended``, ``resume_pending_expired``).
-
-        Returns ``True`` when the row was promoted, ``False`` when skipped
-        (already has a different explicit end_reason, or row not found).
-        """
-        if not session_id:
-            return False
-        now = time.time()
-
-        def _do(conn):
-            cursor = conn.execute(
-                "UPDATE sessions SET ended_at = ?, end_reason = ? "
-                "WHERE id = ? AND (ended_at IS NULL "
-                f"OR end_reason IN ({_RECOVERABLE_END_REASONS_SQL}))",
-                (now, reason, session_id),
-            )
-            return cursor.rowcount
-
-        try:
-            rows = self._execute_write(_do)
-            return bool(rows)
-        except Exception:
-            return False
-
-    def update_session_cwd(
-        self,
-        session_id: str,
-        cwd: str,
-        git_branch: Optional[str] = None,
-        git_repo_root: Optional[str] = None,
-        replace_git_meta: bool = False,
-    ) -> Optional[int]:
-        """Persist the authoritative cwd and claim a Git metadata generation.
-
-        ``git_branch`` records the git branch checked out in ``cwd`` at the time
-        the session started/resumed. The sidebar groups main-checkout sessions
-        by this so feature-branch work doesn't pile under a single "main" row
-        (the main checkout's *current* branch is transient and would
-        misattribute past sessions).
-
-        ``git_repo_root`` records the git repo this cwd belongs to â€” the
-        authoritative project key. Resolving it here, at the lowest level, means
-        every surface reads the same membership instead of re-probing git in the
-        GUI over a partial page. Each field is only written when non-empty so a
-        probe failure never clobbers a previously-captured value.
-
-        ``replace_git_meta`` inverts that non-empty rule: a deliberate workspace
-        MOVE (re-homing a session into another project) must overwrite the old
-        repo identity even when the new cwd resolves to none â€” keeping the stale
-        root would leave the session grouped under the project it just left.
-
-        Every call increments ``git_metadata_generation`` in the same write
-        transaction. Async Git probes must publish through
-        :meth:`publish_session_git_metadata` with the returned generation, so
-        an older worker cannot overwrite a newer cwd claim even after an
-        A -> B -> A transition or from another process sharing this database.
-        Metadata from a different cwd is cleared atomically with the move.
-        """
-        if not session_id or not cwd:
-            return None
-
-        branch = (git_branch or "").strip()
-        repo_root = (git_repo_root or "").strip()
-
-        def _do(conn):
-            current = conn.execute(
-                "SELECT cwd FROM sessions WHERE id = ?", (session_id,)
-            ).fetchone()
-            if current is None:
-                return None
-
-            current_cwd = current["cwd"] if isinstance(current, sqlite3.Row) else current[0]
-            sets = [
-                "cwd = ?",
-                "git_metadata_generation = COALESCE(git_metadata_generation, 0) + 1",
-            ]
-            params: List[Any] = [cwd]
-            if current_cwd != cwd or replace_git_meta:
-                sets.extend(("git_branch = ?", "git_repo_root = ?"))
-                params.extend((branch or None, repo_root or None))
-            elif branch:
-                sets.append("git_branch = ?")
-                params.append(branch)
-            if repo_root and current_cwd == cwd and not replace_git_meta:
-                sets.append("git_repo_root = ?")
-                params.append(repo_root)
-            params.append(session_id)
-            conn.execute(
-                f"UPDATE sessions SET {', '.join(sets)} WHERE id = ?", params
-            )
-            row = conn.execute(
-                "SELECT git_metadata_generation FROM sessions WHERE id = ?",
-                (session_id,),
-            ).fetchone()
-            if row is None:
-                return None
-            value = row["git_metadata_generation"] if isinstance(row, sqlite3.Row) else row[0]
-            return int(value)
-
-        return self._execute_write(_do)
-
-    def publish_session_git_metadata(
-        self,
-        session_id: str,
-        cwd: str,
-        generation: int,
-        git_branch: Optional[str] = None,
-        git_repo_root: Optional[str] = None,
-    ) -> bool:
-        """Publish async Git enrichment only while its cwd claim is current."""
-        if (
-            not session_id
-            or not cwd
-            or isinstance(generation, bool)
-            or not isinstance(generation, int)
-            or generation < 1
-        ):
-            return False
-
-        branch = (git_branch or "").strip()
-        repo_root = (git_repo_root or "").strip()
-        if not branch and not repo_root:
-            return False
-
-        sets: List[str] = []
-        params: List[Any] = []
-        if branch:
-            sets.append("git_branch = ?")
-            params.append(branch)
-        if repo_root:
-            sets.append("git_repo_root = ?")
-            params.append(repo_root)
-        params.extend((session_id, cwd, generation))
-
-        def _do(conn):
-            cursor = conn.execute(
-                f"UPDATE sessions SET {', '.join(sets)} "
-                "WHERE id = ? AND cwd = ? "
-                "AND git_metadata_generation = ?",
-                params,
-            )
-            return cursor.rowcount == 1
-
-        return bool(self._execute_write(_do))
-
-    def backfill_repo_roots(self, cwd_to_root: Dict[str, str]) -> None:
-        """Persist resolved git repo roots for cwds that don't have one yet.
-
-        Backfills history so projects light up for sessions created before the
-        column existed, without clobbering an already-recorded root. Only
-        non-empty roots are written (a non-git cwd stays NULL).
-        """
-        pairs = [(root, cwd) for cwd, root in cwd_to_root.items() if root and cwd]
-        if not pairs:
-            return
-
-        def _do(conn):
-            for root, cwd in pairs:
-                conn.execute(
-                    "UPDATE sessions SET git_repo_root = ? "
-                    "WHERE cwd = ? AND COALESCE(git_repo_root, '') = ''",
-                    (root, cwd),
-                )
-
-        self._execute_write(_do)
-
-    def record_compression_failure_cooldown(
-        self,
-        session_id: str,
-        cooldown_until: float,
-        error: Optional[str] = None,
-    ) -> None:
-        """Persist the active compression-failure cooldown for a session.
-
-        Cooldown deadlines merge by maximum: a later, shorter failure signal
-        must not reopen a window already closed by a longer timeout.
-        """
-        if not session_id:
-            return
-
-        def _do(conn):
-            conn.execute(
-                "UPDATE sessions SET compression_failure_cooldown_until = CASE "
-                "WHEN compression_failure_cooldown_until IS NOT NULL "
-                "AND compression_failure_cooldown_until > ? "
-                "THEN compression_failure_cooldown_until ELSE ? END, "
-                "compression_failure_error = ? WHERE id = ?",
-                (cooldown_until, cooldown_until, error, session_id),
-            )
-
-        try:
-            self._execute_write(_do)
-        except sqlite3.Error as exc:
-            logger.warning(
-                "record_compression_failure_cooldown(%s) failed: %s",
-                session_id, exc,
-            )
-
-    def get_compression_failure_cooldown(
-        self,
-        session_id: str,
-    ) -> Optional[Dict[str, Any]]:
-        """Return the active compression-failure cooldown for ``session_id``."""
-        if not session_id:
-            return None
-        now = time.time()
-        with self._read_ctx() as conn:
-            row = conn.execute(
-                "SELECT compression_failure_cooldown_until, compression_failure_error "
-                "FROM sessions WHERE id = ?",
-                (session_id,),
-            ).fetchone()
-        if row is None:
-            return None
-        cooldown_until = (
-            row["compression_failure_cooldown_until"]
-            if isinstance(row, sqlite3.Row)
-            else row[0]
-        )
-        if cooldown_until is None:
-            return None
-        cooldown_until = float(cooldown_until)
-        if cooldown_until <= now:
-            return None
-        error = (
-            row["compression_failure_error"]
-            if isinstance(row, sqlite3.Row)
-            else row[1]
-        )
-        return {
-            "cooldown_until": cooldown_until,
-            "remaining_seconds": cooldown_until - now,
-            "error": error,
-        }
-
-    def get_compression_failure_cooldown_row(
-        self,
-        session_id: str,
-    ) -> Dict[str, Any]:
-        """Return the exact stored cooldown columns without expiry filtering.
-
-        Compression cancellation uses this under its session lease so rollback
-        can preserve an expired row, a partially-null row, or an absent session
-        exactly instead of converting those states through the active-cooldown
-        API.
-        """
-        if not session_id:
-            return {"session_exists": False, "cooldown_until": None, "error": None}
-        with self._read_ctx() as conn:
-            row = conn.execute(
-                "SELECT compression_failure_cooldown_until, compression_failure_error "
-                "FROM sessions WHERE id = ?",
-                (session_id,),
-            ).fetchone()
-        if row is None:
-            return {"session_exists": False, "cooldown_until": None, "error": None}
-        cooldown_until = (
-            row["compression_failure_cooldown_until"]
-            if isinstance(row, sqlite3.Row)
-            else row[0]
-        )
-        error = (
-            row["compression_failure_error"]
-            if isinstance(row, sqlite3.Row)
-            else row[1]
-        )
-        return {
-            "session_exists": True,
-            "cooldown_until": (
-                float(cooldown_until) if cooldown_until is not None else None
-            ),
-            "error": error,
-        }
-
-    def restore_compression_failure_cooldown_row(
-        self,
-        session_id: str,
-        snapshot: Dict[str, Any],
-    ) -> None:
-        """Restore and verify an exact cooldown-row snapshot.
-
-        Unlike the ordinary record/clear helpers, this transactional rollback
-        API deliberately propagates write and verification failures. A caller
-        must not report cancellation as mutation-free when compensation failed.
-        """
-        expected_exists = bool(snapshot.get("session_exists", False))
-        if not expected_exists:
-            actual = self.get_compression_failure_cooldown_row(session_id)
-            if actual.get("session_exists", False):
-                raise RuntimeError(
-                    "cannot restore absent compression cooldown row: session now exists"
-                )
-            return
-
-        deadline = snapshot.get("cooldown_until")
-        error = snapshot.get("error")
-
-        def _do(conn):
-            cursor = conn.execute(
-                "UPDATE sessions SET compression_failure_cooldown_until = ?, "
-                "compression_failure_error = ? WHERE id = ?",
-                (deadline, error, session_id),
-            )
-            if cursor.rowcount != 1:
-                raise RuntimeError(
-                    f"compression cooldown rollback session missing: {session_id}"
-                )
-
-        self._execute_write(_do)
-        actual = self.get_compression_failure_cooldown_row(session_id)
-        expected = {
-            "session_exists": True,
-            "cooldown_until": float(deadline) if deadline is not None else None,
-            "error": error,
-        }
-        if actual != expected:
-            raise RuntimeError(
-                f"compression cooldown rollback verification failed: "
-                f"expected={expected!r}, actual={actual!r}"
-            )
-
-    def clear_compression_failure_cooldown(self, session_id: str) -> None:
-        """Clear any persisted compression-failure cooldown for a session."""
-        if not session_id:
-            return
-
-        def _do(conn):
-            conn.execute(
-                "UPDATE sessions SET compression_failure_cooldown_until = NULL, "
-                "compression_failure_error = NULL WHERE id = ?",
-                (session_id,),
-            )
-
-        try:
-            self._execute_write(_do)
-        except sqlite3.Error as exc:
-            logger.warning(
-                "clear_compression_failure_cooldown(%s) failed: %s",
-                session_id, exc,
-            )
-
-    def get_compression_fallback_streak(self, session_id: str) -> int:
-        """Return the persisted deterministic-fallback streak."""
-        if not session_id:
-            return 0
-        with self._lock:
-            conn = self._conn
-            if conn is None:
-                return 0
-            row = conn.execute(
-                "SELECT compression_fallback_streak FROM sessions WHERE id = ?",
-                (session_id,),
-            ).fetchone()
-        if row is None:
-            return 0
-        value = (
-            row["compression_fallback_streak"]
-            if isinstance(row, sqlite3.Row)
-            else row[0]
-        )
-        try:
-            return max(0, int(value or 0))
-        except (TypeError, ValueError):
-            return 0
-
-    def set_compression_fallback_streak(self, session_id: str, streak: int) -> None:
-        """Persist the deterministic-fallback streak for one session."""
-        if not session_id:
-            return
-        normalized = max(0, int(streak))
-
-        def _do(conn):
-            conn.execute(
-                "UPDATE sessions SET compression_fallback_streak = ? WHERE id = ?",
-                (normalized, session_id),
-            )
-
-        self._execute_write(_do)
-
-    def increment_hygiene_failure_streak(self, session_key: str) -> int:
-        """Atomically increment the session-hygiene failure streak for one chat."""
-        if not session_key:
-            return 1
-        result = []
-
-        def _do(conn):
-            conn.execute(
-                """INSERT INTO gateway_hygiene_state (session_key, failure_streak)
-                   VALUES (?, 1)
-                   ON CONFLICT(session_key) DO UPDATE SET
-                       failure_streak = gateway_hygiene_state.failure_streak + 1""",
-                (session_key,),
-            )
-            row = conn.execute(
-                "SELECT failure_streak FROM gateway_hygiene_state WHERE session_key = ?",
-                (session_key,),
-            ).fetchone()
-            result.append(int(row[0]))
-
-        self._execute_write(_do)
-        return result[0]
-
-    def reset_hygiene_failure_streak(self, session_key: str) -> None:
-        """Clear the persisted session-hygiene failure streak for one chat."""
-        if not session_key:
-            return
-
-        def _do(conn):
-            conn.execute(
-                "DELETE FROM gateway_hygiene_state WHERE session_key = ?",
-                (session_key,),
-            )
-
-        self._execute_write(_do)
-
-    def get_compression_ineffective_count(self, session_id: str) -> int:
-        """Return the persisted ineffective-compaction strike count.
-
-        Mirrors ``get_compression_fallback_streak``: this is the durable half
-        of the anti-thrash guard (``_ineffective_compression_count`` on the
-        built-in compressor), persisted so that a fresh compressor bound to a
-        resumed session inherits an armed/tripped guard instead of starting
-        from zero across process restarts (#54923).
-        """
-        if not session_id:
-            return 0
-        with self._lock:
-            conn = self._conn
-            if conn is None:
-                return 0
-            row = conn.execute(
-                "SELECT compression_ineffective_count FROM sessions WHERE id = ?",
-                (session_id,),
-            ).fetchone()
-        if row is None:
-            return 0
-        value = (
-            row["compression_ineffective_count"]
-            if isinstance(row, sqlite3.Row)
-            else row[0]
-        )
-        try:
-            return max(0, int(value or 0))
-        except (TypeError, ValueError):
-            return 0
-
-    def set_compression_ineffective_count(self, session_id: str, count: int) -> None:
-        """Persist the ineffective-compaction strike count for one session."""
-        if not session_id:
-            return
-        normalized = max(0, int(count))
-
-        def _do(conn):
-            conn.execute(
-                "UPDATE sessions SET compression_ineffective_count = ? WHERE id = ?",
-                (normalized, session_id),
-            )
-
-        self._execute_write(_do)
-
-    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    # Compression locks
-    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    # Atomic per-session locks that prevent two compression paths from
-    # racing on the same session_id and producing orphan child sessions.
-    #
-    # The race: ``conversation_compression.py`` rotates ``agent.session_id``
-    # as a side effect of a successful compression (end old session, create
-    # new). That mutation is local to the AIAgent instance â€” but ``state.db``
-    # is shared across all instances. Two AIAgents that share the same
-    # ``session_id`` at the moment they both decide to compress (most
-    # commonly the parent turn's agent + a background-review fork started
-    # right after the turn ended) each end the parent and create their own
-    # NEW session, parented to the same old id. The gateway SessionEntry
-    # only catches one rotation; the other child silently accumulates
-    # writes â€” Damien's "parent â†’ two orphan children" repro shape.
-    #
-    # The lock is keyed by ``session_id`` and is held for the duration of
-    # the compress() call plus the rotation. ``holder`` identifies the
-    # current owner (pid:tid:nonce) for diagnostics; the lock is recovered
-    # via ``expires_at`` if the holder process crashed without releasing.
-    def refresh_compression_lock(
-        self,
-        session_id: str,
-        holder: str,
-        ttl_seconds: float = 300.0,
-    ) -> bool:
-        """Extend the compression lock lease if ``holder`` still owns it.
-
-        Ownership is decided by the ``holder`` column alone, deliberately NOT
-        by ``expires_at``: a live owner whose refresher thread was starved
-        (GC pause, loaded CI runner, a slow write escaping ``_execute_write``'s
-        retry budget) past its own TTL must be able to revive its still-unclaimed
-        row on the next tick. Requiring ``expires_at >= now`` here made such a
-        stall permanent â€” every later refresh matched 0 rows, so the owner kept
-        compressing and rotating with no lease at all, which is exactly the
-        unprotected window a competing path can fork the session lineage in.
-
-        This does not resurrect a lock somebody else already took: SQLite
-        serialises writes, so a reclaim (DELETE-expired + INSERT-or-IGNORE in
-        :meth:`try_acquire_compression_lock`) and this UPDATE never interleave.
-        Reclaim-first replaces ``holder``, so this UPDATE matches nothing and
-        returns False; refresh-first pushes ``expires_at`` into the future, so
-        the reclaimer's DELETE-expired matches nothing and its acquire fails.
-        """
-        if not session_id or not holder:
-            return False
-        now = time.time()
-        expires_at = now + ttl_seconds
-
-        def _do(conn):
-            cur = conn.execute(
-                "UPDATE compression_locks SET expires_at = ? "
-                "WHERE session_id = ? AND holder = ?",
-                (expires_at, session_id, holder),
-            )
-            return cur.rowcount > 0
-
-        try:
-            return bool(self._execute_write(_do))
-        except sqlite3.Error as exc:
-            logger.warning(
-                "refresh_compression_lock(%s) failed: %s",
-                session_id, exc,
-            )
-            return False
-
-    def try_acquire_compression_lock(
-        self,
-        session_id: str,
-        holder: str,
-        ttl_seconds: float = 300.0,
-    ) -> bool:
-        """Try to atomically acquire the compression lock for ``session_id``.
-
-        Returns ``True`` on success (caller now owns the lock and must
-        release via :meth:`release_compression_lock`).  Returns ``False``
-        if another holder already owns a non-expired lock â€” the caller
-        MUST NOT proceed with compression in that case (its rotation would
-        race against the holder's, splitting the session lineage).
-
-        Expired locks (``expires_at < now``) are reclaimed transparently.
-        Structured holders whose local ``pid=`` no longer exists are reclaimed
-        immediately, so a gateway killed during compression does not stall the
-        replacement process for the full lease TTL.
-
-        Implementation: single-transaction DELETE-expired + INSERT-or-IGNORE,
-        followed by a SELECT to confirm we got the row. SQLite serialises
-        writes, so the whole sequence is atomic against other writers.
-        """
-        if not session_id:
-            return False
-        now = time.time()
-        expires_at = now + ttl_seconds
-
-        def _do(conn):
-            reclaimed_holder = None
-            row = conn.execute(
-                "SELECT holder, expires_at FROM compression_locks "
-                "WHERE session_id = ?",
-                (session_id,),
-            ).fetchone()
-            if row is not None:
-                current_holder = (
-                    row["holder"] if isinstance(row, sqlite3.Row) else row[0]
-                )
-                current_expires_at = (
-                    row["expires_at"] if isinstance(row, sqlite3.Row) else row[1]
-                )
-                if (
-                    current_expires_at < now
-                    or _compression_lock_holder_process_is_dead(current_holder)
-                ):
-                    conn.execute(
-                        "DELETE FROM compression_locks "
-                        "WHERE session_id = ? AND holder = ?",
-                        (session_id, current_holder),
-                    )
-                    reclaimed_holder = current_holder
-            # Then: try to insert. INSERT OR IGNORE returns no rowcount
-            # difference â€” verify ownership via SELECT.
-            conn.execute(
-                "INSERT OR IGNORE INTO compression_locks "
-                "(session_id, holder, acquired_at, expires_at) "
-                "VALUES (?, ?, ?, ?)",
-                (session_id, holder, now, expires_at),
-            )
-            row = conn.execute(
-                "SELECT holder FROM compression_locks WHERE session_id = ?",
-                (session_id,),
-            ).fetchone()
-            acquired = row is not None and (
-                row["holder"] if isinstance(row, sqlite3.Row) else row[0]
-            ) == holder
-            return acquired, reclaimed_holder
-
-        try:
-            acquired, reclaimed_holder = self._execute_write(_do)
-            if reclaimed_holder:
-                logger.warning(
-                    "Reclaimed stale compression lock for session=%s "
-                    "(holder=%s)",
-                    session_id,
-                    reclaimed_holder,
-                )
-            return bool(acquired)
-        except sqlite3.Error as exc:
-            logger.warning(
-                "try_acquire_compression_lock(%s) failed: %s",
-                session_id, exc,
-            )
-            # Fail open: returning False makes the caller skip compression,
-            # which is the safe behaviour when the lock subsystem is broken.
-            return False
-
-    def release_compression_lock(self, session_id: str, holder: str) -> None:
-        """Release the compression lock for ``session_id`` iff we own it.
-
-        Idempotent: no-op when the lock has already expired and been
-        reclaimed by a different holder, or when no lock exists. The
-        ``holder`` check prevents a late-returning compressor from
-        clobbering a fresh lock held by someone else.
-        """
-        if not session_id:
-            return
-
-        def _do(conn):
-            conn.execute(
-                "DELETE FROM compression_locks "
-                "WHERE session_id = ? AND holder = ?",
-                (session_id, holder),
-            )
-
-        try:
-            self._execute_write(_do)
-        except sqlite3.Error as exc:
-            logger.warning(
-                "release_compression_lock(%s) failed: %s",
-                session_id, exc,
-            )
-
-    def _session_turn_lease_key_on_conn(self, conn, session_id: str) -> str:
-        """Walk compression parents on ``conn`` to the conversation lease key.
-
-        Must run on the same connection as the lease INSERT/UPDATE/DELETE.
-        A prior ``get_session`` failure must not compute a child id that the
-        later write then persists: refresh would walk to the parent and
-        fail-close. Markers bind to ``parent_session_id`` (same contract as
-        ``_NON_CONTINUATION_CHILD_FILTER_SQL``). Lock errors propagate so
-        ``_execute_write`` / ``acquire_session_turn_lease`` can retry.
-        """
-        if not session_id:
-            return session_id
-
-        def _row(sid: str):
-            row = conn.execute(
-                "SELECT id, parent_session_id, source, model_config, end_reason "
-                "FROM sessions WHERE id = ?",
-                (sid,),
-            ).fetchone()
-            return dict(row) if row else None
-
-        current = _row(session_id)
-        seen = {session_id}
-        while current:
-            parent_id = current.get("parent_session_id")
-            if (
-                not parent_id
-                or parent_id in seen
-                or self._is_explicit_fork_child_row(current)
-            ):
-                break
-            parent = _row(parent_id)
-            if not parent or parent.get("end_reason") != "compression":
-                break
-            seen.add(parent_id)
-            current = parent
-        return str(current.get("id") or session_id) if current else session_id
-
-    def _session_turn_lease_key(self, session_id: str) -> str:
-        """Return the stable serialization key for every compression segment.
-
-        Acquire/refresh/release resolve this inside their write transaction.
-        This helper is for tests and diagnostics; it does not swallow lock
-        errors (a swallowed walk plus a later successful write was the
-        fail-open that replayed the post-rotation refresh miss).
-        """
-        if not session_id:
-            return session_id
-        with self._read_ctx() as conn:
-            return self._session_turn_lease_key_on_conn(conn, session_id)
-
-    def try_acquire_session_turn_lease(
-        self,
-        session_id: str,
-        holder: str,
-        *,
-        ttl_seconds: float = 300.0,
-        patience_s: Optional[float] = None,
-    ) -> bool:
-        """Atomically acquire the cross-process turn lease for a conversation.
-
-        Compression rotates a session into child segments, so the durable key
-        is the lineage root rather than the current segment id. The walk and
-        INSERT share one write transaction. Expired leases and leases whose
-        structured local holder PID is known dead are reclaimed in that same
-        transaction.
-        """
-        if not session_id or not holder:
-            return False
-        now = time.time()
-        expires_at = now + max(0.1, float(ttl_seconds))
-
-        def _do(conn):
-            conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
-            row = conn.execute(
-                "SELECT holder, expires_at FROM session_turn_leases "
-                "WHERE conversation_id = ?",
-                (conversation_id,),
-            ).fetchone()
-            if row is not None:
-                current_holder = row["holder"]
-                if (
-                    float(row["expires_at"]) <= now
-                    or _compression_lock_holder_process_is_dead(current_holder)
-                ):
-                    conn.execute(
-                        "DELETE FROM session_turn_leases "
-                        "WHERE conversation_id = ? AND holder = ?",
-                        (conversation_id, current_holder),
-                    )
-            conn.execute(
-                "INSERT OR IGNORE INTO session_turn_leases "
-                "(conversation_id, holder, acquired_at, expires_at) "
-                "VALUES (?, ?, ?, ?)",
-                (conversation_id, holder, now, expires_at),
-            )
-            owner = conn.execute(
-                "SELECT holder FROM session_turn_leases WHERE conversation_id = ?",
-                (conversation_id,),
-            ).fetchone()
-            return owner is not None and owner["holder"] == holder
-
-        return bool(self._execute_write(_do, patience_s=patience_s))
-
-    def acquire_session_turn_lease(
-        self,
-        session_id: str,
-        holder: str,
-        *,
-        ttl_seconds: float = 300.0,
-        wait_seconds: float = 1800.0,
-        poll_interval_seconds: float = 1.0,
-        on_wait=None,
-        wait_notice_interval_seconds: float = 15.0,
-        should_abort=None,
-        acquire_patience_s: float = 0.5,
-    ) -> bool:
-        """Wait for a cross-process turn lease without holding a SQLite lock.
-
-        ``on_wait(elapsed_seconds)`` is best-effort: invoked when the first
-        attempt fails (elapsed ~0) and again about every
-        ``wait_notice_interval_seconds`` while still waiting, so UIs can show
-        that another process holds the conversation.
-
-        When ``should_abort()`` returns True (for example the agent received
-        ``/stop`` while waiting), acquisition stops immediately and returns
-        False without consuming the full ``wait_seconds`` budget.
-        """
-        deadline = time.monotonic() + max(0.0, float(wait_seconds))
-        wait_started = None
-        last_notice_at = None
-        notice_every = max(0.0, float(wait_notice_interval_seconds))
-        while True:
-            if should_abort is not None:
-                try:
-                    if should_abort():
-                        return False
-                except Exception:
-                    logger.debug(
-                        "session turn lease should_abort callback failed",
-                        exc_info=True,
-                    )
-            try:
-                if self.try_acquire_session_turn_lease(
-                    session_id,
-                    holder,
-                    ttl_seconds=ttl_seconds,
-                    patience_s=acquire_patience_s,
-                ):
-                    return True
-            except sqlite3.Error as exc:
-                # Long holder transactions (compression publish, large
-                # flushes) can exhaust a single write-patience budget.
-                # Keep polling until wait_seconds or should_abort.
-                if classify_persistence_error(exc) != "locked":
-                    raise
-            now = time.monotonic()
-            remaining = deadline - now
-            if remaining <= 0:
-                return False
-            if wait_started is None:
-                wait_started = now
-            if on_wait is not None and (
-                last_notice_at is None
-                or notice_every == 0.0
-                or (now - last_notice_at) >= notice_every
-            ):
-                try:
-                    on_wait(max(0.0, now - wait_started))
-                except Exception:
-                    logger.debug(
-                        "session turn lease on_wait callback failed",
-                        exc_info=True,
-                    )
-                last_notice_at = now
-            time.sleep(min(max(0.01, float(poll_interval_seconds)), remaining))
-
-    def refresh_session_turn_lease(
-        self,
-        session_id: str,
-        holder: str,
-        *,
-        ttl_seconds: float = 300.0,
-    ) -> bool:
-        """Extend a turn lease only while ``holder`` still owns it."""
-        if not session_id or not holder:
-            return False
-        expires_at = time.time() + max(0.1, float(ttl_seconds))
-
-        def _do(conn):
-            conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
-            cursor = conn.execute(
-                "UPDATE session_turn_leases SET expires_at = ? "
-                "WHERE conversation_id = ? AND holder = ?",
-                (expires_at, conversation_id, holder),
-            )
-            return cursor.rowcount > 0
-
-        return bool(self._execute_write(_do))
-
-    def release_session_turn_lease(self, session_id: str, holder: str) -> None:
-        """Release a turn lease iff ``holder`` still owns it; idempotent."""
-        if not session_id or not holder:
-            return
-
-        def _do(conn):
-            conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
-            conn.execute(
-                "DELETE FROM session_turn_leases "
-                "WHERE conversation_id = ? AND holder = ?",
-                (conversation_id, holder),
-            )
-
-        self._execute_write(_do)
-
-    def get_compression_lock_holder(self, session_id: str) -> Optional[str]:
-        """Return the current (non-expired) holder for ``session_id``, or None.
-
-        Diagnostic helper â€” not used by the locking protocol itself.
-        """
-        if not session_id:
-            return None
-        now = time.time()
-        row = self._conn.execute(
-            "SELECT holder FROM compression_locks "
-            "WHERE session_id = ? AND expires_at >= ?",
-            (session_id, now),
-        ).fetchone()
-        if row is None:
-            return None
-        return row["holder"] if isinstance(row, sqlite3.Row) else row[0]
-
-    def touch_session_activity(
-        self,
-        session_id: str,
-        ts: Optional[float] = None,
-        *,
-        description: Optional[str] = None,
-        provenance: Optional[ActivityProvenance] = None,
-    ) -> None:
-        """Stamp durable mid-turn session activity (observation-only).
-
-        Called (rate-limited) from ``AIAgent._touch_activity`` so gateway/CLI
-        surfaces and stall consumers observe API/tool/compaction activity
-        even when no new message row has been written yet (#72016 / #72039).
-
-        Never moves ``last_activity_at`` backwards. When the timestamp
-        advances, bounded ``last_activity_description`` /
-        ``last_activity_provenance`` are written with it. No-ops when
-        ``session_id`` is empty or the row does not exist.
-        """
-        if not session_id:
-            return
-        from agent.session_activity import (
-            bound_activity_description,
-            normalize_activity_provenance,
-        )
-
-        when = float(ts if ts is not None else time.time())
-        desc = bound_activity_description(description)
-        prov = normalize_activity_provenance(provenance).value
-
-        def _do(conn):
-            conn.execute(
-                "UPDATE sessions SET "
-                "last_activity_at = ?, "
-                "last_activity_description = ?, "
-                "last_activity_provenance = ? "
-                "WHERE id = ? AND (last_activity_at IS NULL OR last_activity_at < ?)",
-                (when, desc, prov, session_id, when),
-            )
-
-        # Observation-only write: never let it ride the full routine
-        # write-patience budget (#76354 review S1). Under contention a
-        # heartbeat that waits ~20s would delay the response-critical path
-        # it is merely observing; give up after a sub-second budget instead
-        # (the next due window retries naturally).
-        self._execute_write(_do, patience_s=self._ACTIVITY_WRITE_PATIENCE_S)
-
-    def clear_session_activity_labels(self, session_id: str) -> None:
-        """Clear mid-turn activity labels after a turn ends.
-
-        Keeps ``last_activity_at`` intact so idle / watchdog clocks stay
-        continuous. Description and provenance are observation labels for
-        *what was happening at* that timestamp during an active turn; once
-        the turn is idle they must not keep advertising "compressing" /
-        "executing tool" (#72039).
-
-        Response-critical-path contract (#76354 review S1): runs in the
-        turn's ``finally``; a no-op clear (labels already empty) skips the
-        write transaction entirely, and a real clear uses the same short
-        sub-second busy budget as :meth:`touch_session_activity` instead of
-        the full routine write patience.
-        """
-        if not session_id:
-            return
-        from agent.session_activity import ActivityProvenance
-
-        # No-op fast path: skip the transaction when there is nothing to
-        # clear. Read-only, no write lock.
-        try:
-            row = self._conn.execute(
-                "SELECT last_activity_description, last_activity_provenance "
-                "FROM sessions WHERE id = ?",
-                (session_id,),
-            ).fetchone()
-        except sqlite3.Error:
-            row = None
-        if row is not None:
-            desc = row[0] if not isinstance(row, sqlite3.Row) else row["last_activity_description"]
-            prov = row[1] if not isinstance(row, sqlite3.Row) else row["last_activity_provenance"]
-            if not desc and (
-                not prov or prov == ActivityProvenance.UNKNOWN.value
-            ):
-                return
-
-        def _do(conn):
-            conn.execute(
-                "UPDATE sessions SET "
-                "last_activity_description = ?, "
-                "last_activity_provenance = ? "
-                "WHERE id = ?",
-                ("", ActivityProvenance.UNKNOWN.value, session_id),
-            )
-
-        self._execute_write(_do, patience_s=self._ACTIVITY_WRITE_PATIENCE_S)
-
-    def get_session_activity(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """Return the durable activity snapshot for *session_id*, or None."""
-        if not session_id:
-            return None
-        row = self.get_session(session_id)
-        if not row:
-            return None
-        from agent.session_activity import build_activity_snapshot
-
-        return build_activity_snapshot(
-            last_activity_at=row.get("last_activity_at"),
-            last_activity_description=row.get("last_activity_description"),
-            last_activity_provenance=row.get("last_activity_provenance"),
-        )
-
-    def update_session_meta(
-        self,
-        session_id: str,
-        model_config_json: str,
-        model: Optional[str] = None,
-    ) -> None:
-        """Update model_config and optionally model for an existing session.
-
-        Uses COALESCE so that passing model=None leaves the stored model
-        column unchanged.  Routes through _execute_write for the standard
-        BEGIN IMMEDIATE + jitter-retry + lock guarantee.
-        """
-        # Barrier against queued token deltas â€” see update_session_model.
-        self.flush_token_counts()
-
-        def _do(conn):
-            conn.execute(
-                "UPDATE sessions SET model_config = ?, model = COALESCE(?, model) WHERE id = ?",
-                (model_config_json, model, session_id),
-            )
-        self._execute_write(_do)
-
-    def update_system_prompt(
-        self, session_id: str, system_prompt: Optional[str]
-    ) -> None:
-        """Store the full assembled system prompt snapshot."""
-        def _do(conn):
-            system_prompt_hash = self._store_system_prompt(conn, system_prompt)
-            conn.execute(
-                "UPDATE sessions "
-                "SET system_prompt_hash = ?, system_prompt = NULL WHERE id = ?",
-                (system_prompt_hash, session_id),
-            )
-            self._delete_unreferenced_system_prompts(conn)
-        self._execute_write(_do)
-
-    def update_session_model(
-        self, session_id: str, model: str, provider: Optional[str] = None
-    ) -> None:
-        """Update the model for a session after a mid-session switch.
-
-        Unlike ``update_token_counts`` which uses ``COALESCE(model, ?)``
-        (only filling in NULL), this unconditionally sets the model column
-        so that the dashboard reflects the user's latest /model choice.
-        Also nulls ``system_prompt`` so stale ``Model:`` / ``Provider:``
-        footer metadata is rebuilt on the next turn. A successful /model
-        switch explicitly replaces any confirmed Browser runtime lock while
-        preserving unrelated lineage markers in ``model_config``.
-
-        When *provider* is given, it is merged into ``model_config``
-        alongside the model (``$.model`` / ``$.provider``) so a later
-        resume recombines the persisted model with the provider that
-        actually serves it instead of the config.yaml primary provider
-        (#79536). Callers without provider knowledge leave any stored
-        provider untouched.
-        """
-        # This write bypasses the token queue, so deltas enqueued before the
-        # switch must land first: a still-queued first delta carries the
-        # pre-switch route, and applying it after this UPDATE would trip the
-        # first_accounted_route overwrite in update_token_counts (row sees
-        # api_call_count == 0 + a route mismatch) and resurrect the old
-        # model/provider. Flushing here restores the pre-queue ordering.
-        self.flush_token_counts()
-
-        def _do(conn):
-            # Use the shared merge discipline so lineage markers like
-            # _branched_from / _delegate_from survive. browser_model_lock
-            # is deleted via a None patch value (same semantics as the
-            # old json_remove).
-            patch: Dict[str, Any] = {"browser_model_lock": None}
-            if model:
-                patch["model"] = model
-            if provider:
-                patch["provider"] = provider
-            merged = self._merge_model_config_json(conn, session_id, patch)
-            if merged is _MODEL_CONFIG_ROW_MISSING:
-                return
-            conn.execute(
-                "UPDATE sessions SET "
-                "model = ?, model_config = ?, "
-                "system_prompt = NULL, system_prompt_hash = NULL "
-                "WHERE id = ?",
-                (model, merged, session_id),
-            )
-            self._delete_unreferenced_system_prompts(conn)
-        self._execute_write(_do)
-
-    def _merge_model_config_json(
-        self,
-        conn,
-        session_id: str,
-        patch: Dict[str, Any],
-        *,
-        on_missing: str = "skip",
-    ):
-        """SELECT + tolerant-parse + merge ``patch`` into a session's model_config.
-
-        Shared by every model_config writer (``update_session_runtime_lock``,
-        ``set_session_yolo``, ``archive_and_compact``,
-        ``patch_session_model_config``) so the merge discipline that keeps
-        lineage markers like ``_branched_from`` / ``_delegate_from`` alive
-        lives in exactly one place. A ``None`` patch value deletes that key.
-        Must run inside an open write transaction (callers own the UPDATE).
-
-        Returns the serialized merged JSON â€” ``None`` when the merged dict is
-        empty (matching ``create_session``'s NULL convention) â€” or the
-        ``_MODEL_CONFIG_ROW_MISSING`` sentinel when the row doesn't exist and
-        ``on_missing == "skip"``; ``on_missing == "raise"`` raises ValueError.
-        """
-        row = conn.execute(
-            "SELECT model_config FROM sessions WHERE id = ?",
-            (session_id,),
-        ).fetchone()
-        if row is None:
-            if on_missing == "raise":
-                raise ValueError(f"Session not found: {session_id}")
-            return _MODEL_CONFIG_ROW_MISSING
-        raw = row["model_config"] if isinstance(row, sqlite3.Row) else row[0]
-        config: Dict[str, Any] = {}
-        if isinstance(raw, str) and raw.strip():
-            try:
-                parsed = json.loads(raw)
-                if isinstance(parsed, dict):
-                    config = parsed
-            except (json.JSONDecodeError, TypeError):
-                config = {}
-        elif isinstance(raw, dict):
-            config = dict(raw)
-        for key, value in patch.items():
-            if value is None:
-                config.pop(key, None)
-            else:
-                config[key] = value
-        return json.dumps(config) if config else None
-
-    def patch_session_model_config(
-        self, session_id: str, patch: Dict[str, Any]
-    ) -> None:
-        """Merge ``patch`` into a session's model_config JSON atomically.
-
-        A ``None`` patch value removes that key. No-op when the session row
-        doesn't exist or the patch is empty. This is the standalone setter for
-        callers that need to update model_config *without* rewriting the
-        transcript (the transcript-coupled path is ``archive_and_compact``'s
-        ``model_config_patch``, which shares the same merge helper).
-        """
-        if not session_id or not patch:
-            return
-
-        def _do(conn):
-            merged = self._merge_model_config_json(conn, session_id, patch)
-            if merged is _MODEL_CONFIG_ROW_MISSING:
-                return
-            conn.execute(
-                "UPDATE sessions SET model_config = ? WHERE id = ?",
-                (merged, session_id),
-            )
-
-        self._execute_write(_do)
-
-    def get_session_model_config_value(
-        self, session_id: str, key: str, default: Any = None
-    ) -> Any:
-        """Read one key out of a session's model_config JSON (tolerant parse)."""
-        session = self.get_session(session_id) or {}
-        raw = session.get("model_config")
-        config: Dict[str, Any] = {}
-        if isinstance(raw, str) and raw.strip():
-            try:
-                parsed = json.loads(raw)
-                if isinstance(parsed, dict):
-                    config = parsed
-            except (json.JSONDecodeError, TypeError):
-                config = {}
-        elif isinstance(raw, dict):
-            config = raw
-        return config.get(key, default)
-
-    def update_session_runtime_lock(
-        self,
-        session_id: str,
-        *,
-        model: Optional[str] = None,
-        provider: Optional[str] = None,
-        model_options: Optional[Dict[str, Any]] = None,
-        route_source: Optional[str] = None,
-        confirmed: bool = False,
-    ) -> None:
-        """Persist a Browser / API client runtime lock without clobbering lineage markers.
-
-        Merges ``browser_model_lock`` into the existing ``model_config`` JSON so
-        ``_branched_from`` / ``_delegate_from`` survive. Nulls ``system_prompt``
-        so cached ``Model:`` / ``Provider:`` footers cannot lie after a switch.
-        """
-        lock = {
-            "provider": provider or "",
-            "model": model or "",
-            "model_options": model_options or {},
-            "route_source": route_source or "",
-            "confirmed": bool(confirmed),
-            "updated_at": time.time(),
-        }
-
-        def _do(conn):
-            merged = self._merge_model_config_json(
-                conn, session_id, {"browser_model_lock": lock}
-            )
-            if merged is _MODEL_CONFIG_ROW_MISSING:
-                return
-            conn.execute(
-                """UPDATE sessions SET
-                   model_config = ?,
-                   model = COALESCE(?, model),
-                   system_prompt = NULL,
-                   system_prompt_hash = NULL
-                   WHERE id = ?""",
-                (merged, model, session_id),
-            )
-            self._delete_unreferenced_system_prompts(conn)
-        self._execute_write(_do)
-
-    def set_session_yolo(self, session_id: str, enabled: bool) -> None:
-        """Persist the per-session YOLO bypass flag into ``model_config``.
-
-        Merges ``yolo_mode`` into the existing ``model_config`` JSON (same
-        merge discipline as ``update_session_runtime_lock`` so lineage
-        markers like ``_branched_from`` / ``_delegate_from`` survive). The
-        CLI resume paths read this flag back so a ``/yolo ON`` toggle â€” or a
-        ``--yolo`` launch â€” survives ``hermes --resume`` into a fresh
-        process. No-op when the session row doesn't exist yet; the
-        creation-time ``model_config`` carries the flag for ``--yolo``
-        launches.
-        """
-        if not session_id:
-            return
-
-        def _do(conn):
-            merged = self._merge_model_config_json(
-                conn, session_id, {"yolo_mode": bool(enabled)}
-            )
-            if merged is _MODEL_CONFIG_ROW_MISSING:
-                return
-            conn.execute(
-                "UPDATE sessions SET model_config = ? WHERE id = ?",
-                (merged, session_id),
-            )
-        self._execute_write(_do)
-
-    @staticmethod
-    def session_yolo_enabled(session_meta: Optional[Dict[str, Any]]) -> bool:
-        """Read the persisted YOLO flag off a session row dict.
-
-        Accepts the dict returned by ``get_session`` (``model_config`` is a
-        JSON string) or an already-parsed dict. Returns False on any parse
-        failure â€” resume must never enable the bypass by accident.
-        """
-        raw = (session_meta or {}).get("model_config")
-        if isinstance(raw, str):
-            try:
-                raw = json.loads(raw)
-            except Exception:
-                return False
-        if not isinstance(raw, dict):
-            return False
-        return bool(raw.get("yolo_mode"))
-
-    @staticmethod
-    def session_gateway_runtime(session_meta: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-        """Read the persisted runtime route off a session row dict.
-
-        Accepts the dict returned by ``get_session`` (``model_config`` is a
-        JSON string) or an already-parsed dict. Prefers the nested
-        ``gateway_runtime`` key (written by the gateway's
-        ``_sync_session_model_from_agent`` and the CLI ``/model`` persist),
-        falling back to the top-level ``provider``/``base_url``/``api_mode``
-        keys the TUI gateway's ``_runtime_model_config`` writes. As a last
-        resort, falls back to the ``billing_provider`` column (written on
-        every session's first accounted API call) so sessions that never ran
-        ``/model`` still restore the provider that actually served them.
-        Returns an empty dict on any parse failure â€” resume falls back to
-        ambient config resolution.
-        """
-        raw = (session_meta or {}).get("model_config")
-        if isinstance(raw, str):
-            try:
-                raw = json.loads(raw)
-            except Exception:
-                raw = {}
-        if not isinstance(raw, dict):
-            raw = {}
-        runtime = raw.get("gateway_runtime")
-        if isinstance(runtime, dict) and runtime.get("provider"):
-            # Filter None values: the persist path writes or-None to trigger
-            # deletion in the top-level merge, but gateway_runtime is replaced
-            # as a whole dict (not deep-merged), so None values survive here.
-            return {k: v for k, v in runtime.items() if v is not None}
-        top_level = {
-            key: raw.get(key)
-            for key in ("provider", "base_url", "api_mode")
-            if raw.get(key)
-        }
-        if top_level:
-            return top_level
-        # Last resort: billing_provider column. Written via COALESCE on every
-        # session's first accounted API call â€” the only durable record for
-        # sessions that never ran /model. Mirrors the TUI gateway's
-        # _stored_session_runtime_overrides fallback. Bare billing buckets
-        # ("auto"/"custom") are not routable identities â€” filter them out so
-        # resume falls back to the ambient config default instead.
-        billing_provider = str(
-            (session_meta or {}).get("billing_provider") or ""
-        ).strip()
-        if (
-            billing_provider
-            and billing_provider.lower() not in _BARE_BILLING_PROVIDERS
-        ):
-            return {"provider": billing_provider}
-        return {k: v for k, v in (runtime or {}).items() if v is not None} if isinstance(runtime, dict) else {}
-
-    def update_session_billing_route(
-        self,
-        session_id: str,
-        *,
-        provider: str,
-        base_url: str,
-        billing_mode: Optional[str] = None,
-    ) -> None:
-        """Unconditionally update the billing provider/base_url for a session.
-
-        Unlike ``update_token_counts`` which uses ``COALESCE(billing_provider, ?)``
-        (only filling in NULL), this unconditionally sets the billing fields so
-        that the dashboard reflects the user's latest /model switch.
-
-        Also nulls ``system_prompt`` so the cached snapshot (which embeds a
-        stale ``Model:`` / ``Provider:`` header) is rebuilt â€” matching the
-        behavior of ``update_session_model`` (see #48173, #48248).
-        """
-        # Barrier against queued token deltas â€” see update_session_model.
-        self.flush_token_counts()
-
-        def _do(conn):
-            conn.execute(
-                """UPDATE sessions SET
-                   billing_provider = ?,
-                   billing_base_url = ?,
-                   billing_mode = COALESCE(?, billing_mode),
-                   system_prompt = NULL,
-                   system_prompt_hash = NULL
-                   WHERE id = ?""",
-                (provider, base_url, billing_mode, session_id),
-            )
-            self._delete_unreferenced_system_prompts(conn)
-        self._execute_write(_do)
-
-    # â”€â”€ Async token accounting â”€â”€
-    # update_token_counts() runs a sessions UPDATE (plus a per-model usage
-    # upsert) inside BEGIN IMMEDIATE; against a cold multi-GB state.db one
-    # call can stall the turn thread for tens to hundreds of ms, and the
-    # tool loop pays it after EVERY API call (measured p50 3.3ms / p95 70ms
-    # per call in production). queue_token_counts() reduces the critical
-    # path to a deque append: a dedicated single-writer thread applies
-    # deltas in enqueue order, coalescing consecutive same-route deltas
-    # into one UPDATE when a backlog forms. Readers that need exact
-    # mid-turn totals (get_session and friends) call flush_token_counts()
-    # first â€” a plain attribute check when nothing is queued.
-
-    # Delta fields summed when coalescing. Route fields must be equal for
-    # two deltas to merge: model/billing_* feed COALESCE backfill and the
-    # per-model usage attribution key, and cost_status/cost_source are
-    # last-non-None-wins â€” equality makes the merged UPDATE byte-for-byte
-    # equivalent to applying the deltas sequentially.
-    _TOKEN_DELTA_SUM_FIELDS = (
-        "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens",
-        "api_call_count",
-    )
-    _TOKEN_DELTA_COST_FIELDS = ("estimated_cost_usd", "actual_cost_usd")
-    _TOKEN_DELTA_ROUTE_FIELDS = (
-        "model", "cost_status", "cost_source", "pricing_version", "billing_provider", "billing_base_url",
-        "billing_mode",
-    )
-
-    def queue_token_counts(self, session_id: str, **kwargs) -> None:
-        """Enqueue a token/cost delta for the background writer.
-
-        Accepts the same keyword arguments as :meth:`update_token_counts`
-        and applies them asynchronously with identical semantics.  Cheap
-        (append + notify) â€” safe to call on the turn thread after every
-        API call.  After close() has stopped the writer, falls back to the
-        synchronous path and may raise like :meth:`update_token_counts`.
-        """
-        with self._token_queue_cond:
-            thread = self._token_writer_thread
-            writer_stopped = self._token_writer_stop and (
-                thread is None or not thread.is_alive()
-            )
-            if not writer_stopped:
-                self._token_queue.append((session_id, kwargs))
-                if thread is None or not thread.is_alive():
-                    # Daemon so process exit never hangs on accounting; the
-                    # atexit hook drains anything still queued at interpreter
-                    # shutdown (registered once per instance, on first use).
-                    # ``not is_alive()`` (rather than ``is None`` only)
-                    # respawns the writer if it ever died from an unexpected
-                    # escape â€” otherwise a dead thread object would block
-                    # respawn forever and deltas would pile up on the deque
-                    # until a reader's flush drained them synchronously.
-                    thread = threading.Thread(
-                        target=self._token_writer_loop,
-                        name="session-db-token-writer",
-                        daemon=True,
-                    )
-                    self._token_writer_thread = thread
-                    thread.start()
-                    if self._token_atexit_hook is None:
-                        self_ref = weakref.ref(self)
-
-                        def _drain_at_exit() -> None:
-                            db = self_ref()
-                            if db is not None:
-                                db._drain_token_queue_at_exit()
-
-                        self._token_atexit_hook = _drain_at_exit
-                        atexit.register(_drain_at_exit)
-                self._token_queue_cond.notify_all()
-        if writer_stopped:
-            # Writer permanently stopped (close() ran; a stop-flagged but
-            # still-live writer keeps accepting â€” its loop drains before
-            # exiting). Enqueueing now would drop the delta silently: no
-            # writer will run and close() already unregistered the atexit
-            # hook. Apply inline instead so a closed-connection failure
-            # raises at the call site, exactly like the old synchronous
-            # update_token_counts path these call sites still guard for.
-            self.update_token_counts(session_id, **kwargs)
-
-    def flush_token_counts(self, timeout: float = 5.0) -> bool:
-        """Block until every queued token delta has been applied.
-
-        Returns True when the queue is fully drained, False on timeout
-        (callers then read totals that are stale by the still-queued
-        deltas â€” no worse than reading before the flush existed).
-        Never raises: apply failures are logged by the writer.
-        """
-        # Fast path â€” nothing queued, nothing in flight.
-        if not self._token_queue and not self._token_writer_busy:
-            return True
-        batch = None
-        with self._token_queue_cond:
-            deadline = time.monotonic() + timeout
-            while self._token_queue or self._token_writer_busy:
-                # A live writer is authoritative even when stop-flagged
-                # (close() in progress): its loop drains the queue before
-                # exiting, and draining here instead would race its
-                # in-flight batch â€” newer deltas committing before older
-                # ones breaks the last-non-None-wins / first-accounted-
-                # route / COALESCE-backfill fields. Only when the writer is
-                # dead (or never started for these deltas) does the caller
-                # take the leftovers. Re-checked each wakeup: the writer
-                # can exit mid-wait with deltas enqueued after its final
-                # empty-queue check. busy is claimed while draining (same
-                # protocol as the writer) so a concurrent flush cannot
-                # report drained â€” or pop a newer delta â€” while this batch
-                # is still unapplied; a claimed busy therefore also means
-                # "wait", never "drain alongside".
-                thread = self._token_writer_thread
-                if (
-                    (thread is None or not thread.is_alive())
-                    and not self._token_writer_busy
-                ):
-                    self._token_writer_busy = True
-                    batch = list(self._token_queue)
-                    self._token_queue.clear()
-                    break
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return False
-                self._token_queue_cond.wait(remaining)
-        if batch:
-            try:
-                self._apply_token_batch(batch)
-            finally:
-                with self._token_queue_cond:
-                    self._token_writer_busy = False
-                    self._token_queue_cond.notify_all()
-        return True
-
-    def _token_writer_loop(self) -> None:
-        while True:
-            with self._token_queue_cond:
-                idle_deadline = time.monotonic() + self._TOKEN_WRITER_IDLE_SECONDS
-                while not self._token_queue and not self._token_writer_stop:
-                    remaining = idle_deadline - time.monotonic()
-                    if remaining <= 0:
-                        # Publish retirement under the same lock used by
-                        # queue_token_counts() to decide whether to spawn. An
-                        # enqueue cannot strand a delta behind an exiting worker.
-                        self._token_writer_thread = None
-                        return
-                    self._token_queue_cond.wait(remaining)
-                if not self._token_queue:
-                    self._token_writer_thread = None
-                    return  # stop requested and fully drained
-                # busy is set BEFORE the queue is cleared: the lock-free
-                # fast path in flush_token_counts() reads queue-then-busy,
-                # so this order guarantees it can never observe an empty
-                # queue while the popped batch is still unapplied.
-                self._token_writer_busy = True
-                batch = list(self._token_queue)
-                self._token_queue.clear()
-            try:
-                self._apply_token_batch(batch)
-            finally:
-                with self._token_queue_cond:
-                    self._token_writer_busy = False
-                    self._token_queue_cond.notify_all()
-
-    def _apply_token_batch(self, batch: List[Tuple[str, Dict[str, Any]]]) -> None:
-        """Apply queued deltas in order, coalescing where safe. Never raises."""
-        try:
-            coalesced = self._coalesce_token_deltas(batch)
-        except Exception as exc:
-            # Coalescing must never kill the writer thread (a dead writer
-            # can't be observed by callers). Fall back to applying the raw
-            # batch delta-by-delta â€” the merge is an optimization only.
-            logger.warning(
-                "async token accounting: coalesce failed, applying raw "
-                "batch: %s", exc,
-            )
-            coalesced = batch
-        for session_id, kwargs in coalesced:
-            try:
-                self.update_token_counts(session_id, **kwargs)
-            except Exception as exc:
-                # Same contract as the old inline call sites: accounting
-                # loss is logged, never raised into a turn.
-                logger.warning(
-                    "async token accounting: apply failed (session=%s): %s",
-                    session_id, exc,
-                )
-
-    def _coalesce_token_deltas(
-        self, batch: List[Tuple[str, Dict[str, Any]]]
-    ) -> List[Tuple[str, Dict[str, Any]]]:
-        """Merge consecutive incremental deltas with an identical route.
-
-        Only adjacent deltas merge, so ordering across sessions and across
-        a mid-session /model switch is preserved exactly.  absolute=True
-        deltas (cumulative overwrites) never merge.
-        """
-        groups: List[Tuple[Optional[tuple], str, Dict[str, Any]]] = []
-        for session_id, kwargs in batch:
-            key = None
-            if not kwargs.get("absolute"):
-                key = (session_id,) + tuple(
-                    kwargs.get(f) for f in self._TOKEN_DELTA_ROUTE_FIELDS
-                )
-            if groups and key is not None and groups[-1][0] == key:
-                merged = groups[-1][2]
-                for f in self._TOKEN_DELTA_SUM_FIELDS:
-                    merged[f] = merged.get(f, 0) + kwargs.get(f, 0)
-                for f in self._TOKEN_DELTA_COST_FIELDS:
-                    value = kwargs.get(f)
-                    if value is not None:
-                        # None-preserving sum: an all-None run must stay
-                        # None so COALESCE keeps the stored value untouched.
-                        merged[f] = (merged.get(f) or 0.0) + value
-            else:
-                groups.append((key, session_id, dict(kwargs)))
-        return [(sid, kw) for _, sid, kw in groups]
-
-    def _stop_token_writer(self, join_timeout: float = 10.0) -> None:
-        """Stop the writer thread and drain remaining deltas. Never raises."""
-        with self._token_queue_cond:
-            self._token_writer_stop = True
-            self._token_queue_cond.notify_all()
-            thread = self._token_writer_thread
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=join_timeout)
-            if thread.is_alive():
-                # Writer stuck mid-apply (pathological lock contention).
-                # Leave any queued deltas unapplied rather than racing the
-                # stuck apply and misordering/double-counting.
-                logger.warning(
-                    "async token accounting: writer did not stop within %.0fs; "
-                    "%d queued delta(s) not persisted",
-                    join_timeout, len(self._token_queue),
-                )
-                return
-        # Writer exited (or never started) â€” apply leftovers synchronously.
-        # Claim busy like the writer/flush drains do, so a concurrent
-        # flush_token_counts cannot fast-path True while this batch is
-        # still being applied; conversely, wait out a flush caller-drain
-        # that already claimed busy â€” close() nulls the connection right
-        # after this returns, and must not yank it mid-batch.
-        with self._token_queue_cond:
-            deadline = time.monotonic() + join_timeout
-            while self._token_writer_busy:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    logger.warning(
-                        "async token accounting: concurrent drain did not "
-                        "finish within %.0fs; %d queued delta(s) not persisted",
-                        join_timeout, len(self._token_queue),
-                    )
-                    return
-                self._token_queue_cond.wait(remaining)
-            # busy is claimed BEFORE the queue is cleared â€” same ordering
-            # as the writer loop and the flush caller-drain. The lock-free
-            # fast path in flush_token_counts() reads queue-then-busy
-            # without the cond, so clearing first would let a concurrent
-            # flush observe "empty and idle" and return True while this
-            # popped batch is still unapplied.
-            batch = list(self._token_queue)
-            if batch:
-                self._token_writer_busy = True
-                self._token_queue.clear()
-        if batch:
-            try:
-                self._apply_token_batch(batch)
-            finally:
-                with self._token_queue_cond:
-                    self._token_writer_busy = False
-                    self._token_queue_cond.notify_all()
-
-    def _drain_token_queue_at_exit(self) -> None:
-        try:
-            self._stop_token_writer()
-        except Exception:
-            pass  # Best effort â€” never fatal at interpreter shutdown.
-
-    def update_token_counts(
-        self,
-        session_id: str,
-        input_tokens: int = 0,
-        output_tokens: int = 0,
-        model: str = None,
-        cache_read_tokens: int = 0,
-        cache_write_tokens: int = 0,
-        reasoning_tokens: int = 0,
-        estimated_cost_usd: Optional[float] = None,
-        actual_cost_usd: Optional[float] = None,
-        cost_status: Optional[str] = None,
-        cost_source: Optional[str] = None,
-        pricing_version: Optional[str] = None,
-        billing_provider: Optional[str] = None,
-        billing_base_url: Optional[str] = None,
-        billing_mode: Optional[str] = None,
-        api_call_count: int = 0,
-        absolute: bool = False,
-    ) -> None:
-        """Update token counters and backfill model if not already set.
-
-        When *absolute* is False (default), values are **incremented** â€” use
-        this for per-API-call deltas (CLI path).
-
-        When *absolute* is True, values are **set directly** â€” use this when
-        the caller already holds cumulative totals (gateway path, where the
-        cached agent accumulates across messages).
-        """
-        # Ensure the session row exists so the UPDATE doesn't silently affect
-        # 0 rows.  Under concurrent load (cron + kanban + delegate_task) the
-        # initial create_session() may have failed due to SQLite locking.
-        # INSERT OR IGNORE is cheap and idempotent.
-        self._insert_session_row(session_id, "unknown", model=model)
-        if absolute:
-            sql = """UPDATE sessions SET
-                   input_tokens = ?,
-                   output_tokens = ?,
-                   cache_read_tokens = ?,
-                   cache_write_tokens = ?,
-                   reasoning_tokens = ?,
-                   estimated_cost_usd = COALESCE(?, 0),
-                   actual_cost_usd = CASE
-                       WHEN ? IS NULL THEN actual_cost_usd
-                       ELSE ?
-                   END,
-                   cost_status = COALESCE(?, cost_status),
-                   cost_source = COALESCE(?, cost_source),
-                   pricing_version = COALESCE(?, pricing_version),
-                   billing_provider = COALESCE(billing_provider, ?),
-                   billing_base_url = COALESCE(billing_base_url, ?),
-                   billing_mode = COALESCE(billing_mode, ?),
-                   model = COALESCE(model, ?),
-                   api_call_count = ?
-                   WHERE id = ?"""
-        else:
-            sql = """UPDATE sessions SET
-                   input_tokens = input_tokens + ?,
-                   output_tokens = output_tokens + ?,
-                   cache_read_tokens = cache_read_tokens + ?,
-                   cache_write_tokens = cache_write_tokens + ?,
-                   reasoning_tokens = reasoning_tokens + ?,
-                   estimated_cost_usd = COALESCE(estimated_cost_usd, 0) + COALESCE(?, 0),
-                   actual_cost_usd = CASE
-                       WHEN ? IS NULL THEN actual_cost_usd
-                       ELSE COALESCE(actual_cost_usd, 0) + ?
-                   END,
-                   cost_status = COALESCE(?, cost_status),
-                   cost_source = COALESCE(?, cost_source),
-                   pricing_version = COALESCE(?, pricing_version),
-                   billing_provider = COALESCE(billing_provider, ?),
-                   billing_base_url = COALESCE(billing_base_url, ?),
-                   billing_mode = COALESCE(billing_mode, ?),
-                   model = COALESCE(model, ?),
-                   api_call_count = COALESCE(api_call_count, 0) + ?
-                   WHERE id = ?"""
-        has_accounted_usage = bool(
-            input_tokens or output_tokens or cache_read_tokens
-            or cache_write_tokens or reasoning_tokens or api_call_count
-            or estimated_cost_usd or actual_cost_usd
-        )
-        params = (
-            input_tokens,
-            output_tokens,
-            cache_read_tokens,
-            cache_write_tokens,
-            reasoning_tokens,
-            estimated_cost_usd,
-            actual_cost_usd,
-            actual_cost_usd,
-            cost_status,
-            cost_source,
-            pricing_version,
-            billing_provider if has_accounted_usage else None,
-            billing_base_url if has_accounted_usage else None,
-            billing_mode if has_accounted_usage else None,
-            model if has_accounted_usage else None,
-            api_call_count,
-            session_id,
-        )
-        # Per-model usage attribution.  ``update_token_counts`` is the single
-        # chokepoint every per-API-call delta flows through (CLI, gateway, cron,
-        # delegated runs â€” see conversation_loop / codex_runtime), and each call
-        # carries the model/provider *active at the time of that call*.  The
-        # ``sessions`` row only keeps one (model, billing_provider) pair, so a
-        # mid-session ``/model`` switch otherwise attributes every token to the
-        # initial model (issue #51607).  Recording the per-call delta into
-        # session_model_usage keyed by the live model preserves an accurate
-        # per-model breakdown regardless of how many times the user switches.
-        #
-        # Only the incremental path records here. Absolute cumulative updates
-        # cannot be split back into routes; Insights reconciles any positive
-        # residual against the aggregate session row instead.
-        record_model_usage = (not absolute) and (
-            input_tokens or output_tokens or cache_read_tokens
-            or cache_write_tokens or reasoning_tokens or api_call_count
-            or estimated_cost_usd
-        )
-
-        def _do(conn):
-            row = conn.execute(
-                "SELECT model, billing_provider, api_call_count FROM sessions WHERE id = ?",
-                (session_id,),
-            ).fetchone()
-            existing_model = row["model"] if row is not None else None
-            existing_provider = row["billing_provider"] if row is not None else None
-            existing_api_calls = int((row["api_call_count"] if row is not None else 0) or 0)
-
-            # Session creation records the requested primary route before any API
-            # call. If it fails and fallback succeeds, the first accounted usage
-            # event is the first authoritative route. After that, preserve the
-            # legacy row: one row cannot represent mixed-provider usage.
-            first_accounted_route = (
-                existing_api_calls == 0
-                and has_accounted_usage
-                and bool(model)
-                and bool(billing_provider)
-                and (existing_model != model or existing_provider != billing_provider)
-            )
-            if first_accounted_route:
-                conn.execute(
-                    """UPDATE sessions
-                       SET model = ?, billing_provider = ?,
-                       billing_base_url = ?, billing_mode = ?
-                       WHERE id = ?""",
-                    (model, billing_provider, billing_base_url, billing_mode, session_id),
-                )
-            conn.execute(sql, params)
-            if record_model_usage:
-                self._record_model_usage(
-                    conn,
-                    session_id,
-                    model=model,
-                    billing_provider=billing_provider,
-                    billing_base_url=billing_base_url,
-                    billing_mode=billing_mode,
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                    cache_read_tokens=cache_read_tokens,
-                    cache_write_tokens=cache_write_tokens,
-                    reasoning_tokens=reasoning_tokens,
-                    estimated_cost_usd=estimated_cost_usd,
-                    actual_cost_usd=actual_cost_usd,
-                    cost_status=cost_status,
-                    cost_source=cost_source,
-                    api_call_count=api_call_count,
-                )
-        self._execute_write(_do)
-
-    def _record_model_usage(
-        self,
-        conn,
-        session_id: str,
-        *,
-        model: Optional[str],
-        billing_provider: Optional[str],
-        billing_base_url: Optional[str],
-        billing_mode: Optional[str],
-        input_tokens: int,
-        output_tokens: int,
-        cache_read_tokens: int,
-        cache_write_tokens: int,
-        reasoning_tokens: int,
-        estimated_cost_usd: Optional[float],
-        actual_cost_usd: Optional[float],
-        cost_status: Optional[str],
-        cost_source: Optional[str],
-        api_call_count: int,
-        task: str = "",
-    ) -> None:
-        """Accumulate a per-API-call usage delta into session_model_usage.
-
-        Runs inside the caller's write transaction (after the ``sessions``
-        UPDATE) so the per-model rows stay consistent with the summary row.
-        When the caller omits the model/provider (some paths only pass token
-        deltas), fall back to the values already recorded on the session row â€”
-        the same COALESCE-from-session behaviour the summary update uses.
-
-        ``task`` distinguishes what kind of work consumed the tokens:
-        ``''`` (empty) is the main agent loop; auxiliary calls record their
-        task name (``vision``, ``compression``, ``title_generation``, ...)
-        via :meth:`record_auxiliary_usage` (issue #23270).
-        """
-        row = conn.execute(
-            "SELECT model, billing_provider, billing_base_url, billing_mode "
-            "FROM sessions WHERE id = ?",
-            (session_id,),
-        ).fetchone()
-        sess_model = row["model"] if row is not None else None
-        sess_provider = row["billing_provider"] if row is not None else None
-        sess_base_url = row["billing_base_url"] if row is not None else None
-        sess_billing_mode = row["billing_mode"] if row is not None else None
-
-        # Aux-task rows (task != '') must NOT inherit the session's main-loop
-        # route: an aux call may use a completely different provider/model
-        # (vision on gemini while the main loop runs anthropic). Missing info
-        # stays 'unknown'/empty rather than borrowing a misleading route.
-        if task:
-            eff_model = model or "unknown"
-            eff_provider = billing_provider or ""
-            eff_base_url = billing_base_url or ""
-            eff_billing_mode = billing_mode or ""
-        else:
-            eff_model = model or sess_model or "unknown"
-            eff_provider = billing_provider or sess_provider or ""
-            eff_base_url = billing_base_url or sess_base_url or ""
-            eff_billing_mode = billing_mode or sess_billing_mode or ""
-        now = time.time()
-        conn.execute(
-            """INSERT INTO session_model_usage (
-                   session_id, model, billing_provider, billing_base_url, billing_mode,
-                   task, api_call_count, input_tokens, output_tokens,
-                   cache_read_tokens, cache_write_tokens, reasoning_tokens,
-                   estimated_cost_usd, actual_cost_usd, cost_status, cost_source,
-                   first_seen, last_seen
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(session_id, model, billing_provider, billing_base_url, billing_mode, task)
-               DO UPDATE SET
-                   api_call_count = api_call_count + excluded.api_call_count,
-                   input_tokens = input_tokens + excluded.input_tokens,
-                   output_tokens = output_tokens + excluded.output_tokens,
-                   cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
-                   cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens,
-                   reasoning_tokens = reasoning_tokens + excluded.reasoning_tokens,
-                   estimated_cost_usd = estimated_cost_usd + excluded.estimated_cost_usd,
-                   actual_cost_usd = actual_cost_usd + excluded.actual_cost_usd,
-                   cost_status = COALESCE(excluded.cost_status, cost_status),
-                   cost_source = COALESCE(excluded.cost_source, cost_source),
-                   last_seen = excluded.last_seen""",
-            (
-                session_id,
-                eff_model,
-                eff_provider,
-                eff_base_url,
-                eff_billing_mode,
-                task or "",
-                api_call_count or 0,
-                input_tokens or 0,
-                output_tokens or 0,
-                cache_read_tokens or 0,
-                cache_write_tokens or 0,
-                reasoning_tokens or 0,
-                float(estimated_cost_usd or 0.0),
-                float(actual_cost_usd or 0.0),
-                cost_status,
-                cost_source,
-                now,
-                now,
-            ),
-        )
-
-    def ensure_session(
-        self,
-        session_id: str,
-        source: str = "unknown",
-        model: str = None,
-        **kwargs,
-    ) -> str:
-        """Ensure a session row exists (INSERT OR IGNORE). Accepts optional kwargs."""
-        self._insert_session_row(session_id, source, model=model, **kwargs)
-        return session_id
-
-    def record_auxiliary_usage(
-        self,
-        session_id: str,
-        task: str,
-        *,
-        model: Optional[str] = None,
-        billing_provider: Optional[str] = None,
-        billing_base_url: Optional[str] = None,
-        input_tokens: int = 0,
-        output_tokens: int = 0,
-        cache_read_tokens: int = 0,
-        cache_write_tokens: int = 0,
-        reasoning_tokens: int = 0,
-        estimated_cost_usd: Optional[float] = None,
-        api_call_count: int = 1,
-    ) -> None:
-        """Record an auxiliary LLM call's usage against *session_id* (issue #23270).
-
-        Auxiliary calls (vision, compression, title_generation, web_extract,
-        session_search, ...) historically discarded their usage, leaving the
-        dashboard's per-model analytics blind to aux model spend. This writes
-        a per-(model, provider, task) delta into ``session_model_usage`` â€”
-        the same table the main loop's ``update_token_counts`` feeds â€” WITHOUT
-        touching the ``sessions`` summary row. That separation is deliberate:
-        the gateway overwrites session counters with absolute main-loop totals,
-        so folding aux tokens into the summary row would either be clobbered
-        or double-counted. Insights/analytics read the union of both.
-
-        ``api_call_count`` defaults to 1 (one aux LLM call). Background-review
-        forks record an aggregate of N fork API calls in one write with
-        ``task='background_review'`` (issue #87250).
-
-        Best-effort by contract: callers must never fail an aux call because
-        accounting failed.
-        """
-        if not session_id or not task:
-            return
-        # FK on session_model_usage.session_id â†’ sessions.id: ensure the row
-        # exists (same INSERT OR IGNORE guard update_token_counts uses â€” the
-        # initial create_session() can fail under concurrent SQLite locking).
-        self._insert_session_row(session_id, "unknown")
-
-        def _do(conn):
-            self._record_model_usage(
-                conn,
-                session_id,
-                model=model,
-                billing_provider=billing_provider,
-                billing_base_url=billing_base_url,
-                billing_mode=None,
-                input_tokens=input_tokens or 0,
-                output_tokens=output_tokens or 0,
-                cache_read_tokens=cache_read_tokens or 0,
-                cache_write_tokens=cache_write_tokens or 0,
-                reasoning_tokens=reasoning_tokens or 0,
-                estimated_cost_usd=estimated_cost_usd,
-                actual_cost_usd=None,
-                cost_status=None,
-                cost_source=None,
-                api_call_count=(
-                    1 if api_call_count is None else int(api_call_count)
-                ),
-                task=task,
-            )
-        self._execute_write(_do)
-
-
-    def finalize_orphaned_compression_sessions(self) -> int:
-        """Mark orphaned compression continuation sessions as ended.
-
-        Targets child sessions that were never finalized: parent is ended
-        with reason='compression', child has messages but no end_reason/ended_at
-        and api_call_count=0.  Non-destructive: preserves all messages and sets
-        end_reason='orphaned_compression'.  Fix for #20001.
-        """
-        cutoff = time.time() - 604800  # 7 days
-
-        def _do(conn):
-            now = time.time()
-            result = conn.execute(
-                """
-                UPDATE sessions
-                SET ended_at = ?,
-                    end_reason = 'orphaned_compression'
-                WHERE api_call_count = 0
-                  AND end_reason IS NULL
-                  AND ended_at IS NULL
-                  AND started_at < ?
-                  AND parent_session_id IS NOT NULL
-                  AND EXISTS (
-                      SELECT 1 FROM sessions p
-                      WHERE p.id = sessions.parent_session_id
-                        AND p.end_reason = 'compression'
-                        AND p.ended_at IS NOT NULL
-                  )
-                  AND EXISTS (
-                      SELECT 1 FROM messages m
-                      WHERE m.session_id = sessions.id
-                  )
-                """,
-                (now, cutoff),
-            )
-            return result.rowcount
-
-        return self._execute_write(_do) or 0
-
-
-    def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """Get a session by ID."""
-        # Cost/usage readers (/status, /usage, gateway endpoints) reach the
-        # row through here; drain queued token deltas so they see exact
-        # totals. No-op attribute check when nothing is queued.
-        self.flush_token_counts()
-        with self._read_ctx() as conn:
-            cursor = conn.execute(
-                "SELECT s.*, "
-                "COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved "
-                "FROM sessions s "
-                "LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
-                "WHERE s.id = ?",
-                (session_id,),
-            )
-            row = cursor.fetchone()
-        return self._session_row_dict(row) if row else None
-
-    def get_dominant_session_model_route(
-        self, session_id: str
-    ) -> Optional[Dict[str, Any]]:
-        """Return the main-loop model route that served most API calls.
-
-        ``sessions`` is a legacy aggregate row and can hold model/provider fields
-        written by different route changes. ``session_model_usage`` keeps the
-        coherent per-call tuple, so persisted status and billing reads should use
-        its dominant main-loop route when one is available.
-        """
-        self.flush_token_counts()
-        with self._read_ctx() as conn:
-            row = conn.execute(
-                """SELECT model, billing_provider, billing_base_url, billing_mode,
-                          api_call_count
-                     FROM session_model_usage
-                    WHERE session_id = ?
-                      AND task = ''
-                      AND model <> 'unknown'
-                      AND billing_provider <> ''
-                    ORDER BY api_call_count DESC,
-                             (input_tokens + output_tokens + cache_read_tokens +
-                              cache_write_tokens + reasoning_tokens) DESC,
-                             last_seen DESC
-                    LIMIT 1""",
-                (session_id,),
-            ).fetchone()
-        return dict(row) if row else None
-
-    def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
-        """Resolve an exact or uniquely prefixed session ID to the full ID.
-
-        Returns the exact ID when it exists. Otherwise treats the input as a
-        prefix and returns the single matching session ID if the prefix is
-        unambiguous. Returns None for no matches or ambiguous prefixes.
-        """
-        exact = self.get_session(session_id_or_prefix)
-        if exact:
-            return exact["id"]
-
-        escaped = _escape_like(session_id_or_prefix)
-        with self._read_ctx() as conn:
-            cursor = conn.execute(
-                "SELECT id FROM sessions WHERE id LIKE ? ESCAPE '\\' ORDER BY started_at DESC LIMIT 2",
-                (f"{escaped}%",),
-            )
-            matches = [row["id"] for row in cursor.fetchall()]
-        if len(matches) == 1:
-            return matches[0]
-        return None
-
-    # Maximum length for session titles
-    MAX_TITLE_LENGTH = 100
-
-    # Title provenance, lowest to highest authority: auto-titling may only replace a
-    # strictly lower-authority title (``derived`` -> ``llm`` once; never a user-typed name).
-    TITLE_SOURCE_DERIVED, TITLE_SOURCE_LLM, TITLE_SOURCE_USER = "derived", "llm", "user"
-    _TITLE_SOURCE_RANK = {TITLE_SOURCE_DERIVED: 0, TITLE_SOURCE_LLM: 1, TITLE_SOURCE_USER: 2}
-
-    # Bot Mode's canonical chat is resolved by exact-title lookup: the title IS the identity,
-    # so _set_session_title refuses renames of a hidden row holding it.
-    # Bot Mode's forever-chat registry: the session titled exactly this, on a bot's profile, IS the bot's
-    # canonical chat â€” resolved by exact-title lookup on every open (no session-id pointer exists). See
-    # #92473.
-    CANONICAL_BOT_CHAT_TITLE = "Bot Chat"
-
-    @classmethod
-    def _title_rank(cls, source: Optional[str]) -> int:
-        """Rank a stored title_source. NULL means a pre-provenance row.
-
-        Rows written before this column existed carry NULL. They were almost
-        always set by the old auto-titler, but a manual ``/title`` from that
-        era is indistinguishable â€” so treat NULL as ``user`` and refuse to
-        overwrite it. Auto-titling only ever fills genuinely empty titles on
-        legacy rows, which is the conservative direction.
-        """
-        if source is None:
-            return cls._TITLE_SOURCE_RANK[cls.TITLE_SOURCE_USER]
-        return cls._TITLE_SOURCE_RANK.get(str(source), 0)
-
-    @staticmethod
-    def sanitize_title(title: Optional[str]) -> Optional[str]:
-        """Validate and sanitize a session title.
-
-        - Strips leading/trailing whitespace
-        - Removes ASCII control characters (0x00-0x1F, 0x7F) and problematic
-          Unicode control chars (zero-width, RTL/LTR overrides, etc.)
-        - Collapses internal whitespace runs to single spaces
-        - Normalizes empty/whitespace-only strings to None
-        - Enforces MAX_TITLE_LENGTH
-
-        Returns the cleaned title string or None.
-        Raises ValueError if the title exceeds MAX_TITLE_LENGTH after cleaning.
-        """
-        if not title:
-            return None
-
-        # Lone surrogates cannot be bound by sqlite3 (UnicodeEncodeError at
-        # UTF-8 encode time) â€” scrub them like every other write path here.
-        title = _sanitize_surrogates(title)
-
-        # Remove ASCII control characters (0x00-0x1F, 0x7F) but keep
-        # whitespace chars (\t=0x09, \n=0x0A, \r=0x0D) so they can be
-        # normalized to spaces by the whitespace collapsing step below
-        cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', title)
-
-        # Remove problematic Unicode control characters:
-        # - Zero-width chars (U+200B-U+200F, U+FEFF)
-        # - Directional overrides (U+202A-U+202E, U+2066-U+2069)
-        # - Object replacement (U+FFFC), interlinear annotation (U+FFF9-U+FFFB)
-        cleaned = re.sub(
-            r'[\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff\ufffc\ufff9-\ufffb]',
-            '', cleaned,
-        )
-
-        # Collapse internal whitespace runs and strip
-        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-
-        if not cleaned:
-            return None
-
-        if len(cleaned) > SessionDB.MAX_TITLE_LENGTH:
-            raise ValueError(
-                f"Title too long ({len(cleaned)} chars, max {SessionDB.MAX_TITLE_LENGTH})"
-            )
-
-        return cleaned
-
-    def _is_compression_ancestor(
-        self, conn, *, ancestor_id: str, descendant_id: str
-    ) -> bool:
-        """Return True if *ancestor_id* is a compression predecessor of
-        *descendant_id* (walking parent links up the continuation chain).
-
-        The continuation edge is the canonical one shared with
-        :func:`_ephemeral_child_sql` / :meth:`set_session_archived`
-        (``_COMPRESSION_CHILD_SQL``): a parent â†’ child edge counts only when the
-        parent ended with ``end_reason = 'compression'`` and the child started
-        at or after the parent's ``ended_at``, which distinguishes continuations
-        from delegate subagents / branch children that also carry a
-        ``parent_session_id``. Expressed as a single recursive CTE rather than a
-        per-hop Python walk so the edge definition lives in exactly one place.
-        """
-        if not ancestor_id or not descendant_id or ancestor_id == descendant_id:
-            return False
-        # Walk parent links up from the descendant, following only compression
-        # continuation edges, and check whether ancestor_id is reached.
-        edge = _COMPRESSION_CHILD_SQL.format(a="child")
-        row = conn.execute(
-            f"""
-            WITH RECURSIVE ancestors(id) AS (
-                SELECT ?
-                UNION
-                SELECT parent.id
-                FROM ancestors a
-                JOIN sessions child ON child.id = a.id
-                JOIN sessions parent ON parent.id = child.parent_session_id
-                WHERE {edge}
-            )
-            SELECT 1 FROM ancestors WHERE id = ? AND id != ? LIMIT 1
-            """,
-            (descendant_id, ancestor_id, descendant_id),
-        ).fetchone()
-        return row is not None
-
-    def _set_session_title(
-        self,
-        session_id: str,
-        title: str,
-        *,
-        source: str,
-    ) -> bool:
-        """Write a title, enforcing provenance precedence.
-
-        ``source`` is one of ``TITLE_SOURCE_{DERIVED,LLM,USER}``. A ``user``
-        write always lands â€” an explicit rename is authoritative. An automatic
-        write (``derived``/``llm``) lands only when the row is untitled or the
-        stored title has strictly lower authority, so the instant ``derived``
-        title upgrades to ``llm`` exactly once and neither can ever overwrite a
-        name the user typed. Re-running the titler on an already-``llm`` row is
-        a no-op, which is what stops a session renaming itself.
-
-        The read and the write are one compare-and-swap inside a single
-        transaction, so a manual ``/title`` racing an in-flight generation
-        cannot be clobbered by the late arrival.
-        """
-        title = self.sanitize_title(title)
-        is_user = source == self.TITLE_SOURCE_USER
-        new_rank = self._title_rank(source) if not is_user else None
-
-        def _do(conn):
-            current = conn.execute(
-                "SELECT title, title_source, hidden FROM sessions WHERE id = ?",
-                (session_id,),
-            ).fetchone()
-            if current is None:
-                return 0
-            # The canonical Bot Chat's NAME is its identity: Bot Mode resolves
-            # the forever-chat by exact-title lookup on every open, so renaming
-            # the row orphans the entire conversation â€” the next click mints an
-            # empty replacement and UNIQUE(title) then blocks ever renaming
-            # back (#92473). Refuse the rename at the single write path every
-            # surface funnels through (gateway session.title, /title, CLI
-            # rename, REST). Hidden is the discriminator: canonical chats are
-            # born hidden; an ordinary visible session a user happens to call
-            # "Bot Chat" stays freely renameable.
-            if (
-                is_user
-                and (current["title"] or "") == self.CANONICAL_BOT_CHAT_TITLE
-                and bool(current["hidden"])
-                and title != self.CANONICAL_BOT_CHAT_TITLE
-            ):
-                raise ValueError(
-                    "This is the bot's canonical Bot Chat â€” its name is its "
-                    "identity, and renaming it would orphan the conversation. "
-                    "To start fresh, create a new bot instead."
-                )
-            if not is_user and current["title"] is not None:
-                if self._title_rank(current["title_source"]) >= new_rank:
-                    return 0
-
-            if title:
-                # Check uniqueness (allow the same session to keep its own title)
-                cursor = conn.execute(
-                    "SELECT id FROM sessions WHERE title = ? AND id != ?",
-                    (title, session_id),
-                )
-                conflict = cursor.fetchone()
-                if conflict:
-                    conflict_id = conflict["id"]
-                    # A compression continuation is the live, projected-forward
-                    # head of its conversation; its compressed predecessors are
-                    # ended and hidden from the session list (list_sessions_rich
-                    # projects roots â†’ tip). When the title that "conflicts" is
-                    # held by such a hidden ancestor, the user has no way to free
-                    # it â€” renaming the visible tip back to the base name would
-                    # dead-end with "already in use by <session they can't see>".
-                    # Treat this as a transfer: move the title off the ancestor
-                    # onto the continuation. Uniqueness is preserved (still only
-                    # one session carries the exact title) and the parent-link
-                    # lineage is untouched.
-                    if self._is_compression_ancestor(
-                        conn, ancestor_id=conflict_id, descendant_id=session_id
-                    ):
-                        conn.execute(
-                            "UPDATE sessions SET title = NULL WHERE id = ?",
-                            (conflict_id,),
-                        )
-                    else:
-                        raise ValueError(
-                            f"Title '{title}' is already in use by session {conflict_id}"
-                        )
-            # Compare-and-swap on the exact values we just read (``IS`` is
-            # NULL-safe in SQLite), so a concurrent write between the SELECT
-            # and here loses instead of being silently overwritten.
-            cursor = conn.execute(
-                "UPDATE sessions SET title = ?, title_source = ? "
-                "WHERE id = ? AND title IS ? AND title_source IS ?",
-                (
-                    title,
-                    source if title else None,
-                    session_id,
-                    current["title"],
-                    current["title_source"],
-                ),
-            )
-            return cursor.rowcount
-
-        rowcount = self._execute_write(_do)
-        return rowcount > 0
-
-    def set_session_title(self, session_id: str, title: str) -> bool:
-        """Set or update a session's title on the user's behalf.
-
-        Returns True if session was found and title was set.
-        Raises ValueError if title is already in use by another session,
-        or if the title fails validation (too long, invalid characters).
-        Empty/whitespace-only strings are normalized to None (clearing the title).
-
-        This records ``user`` provenance, so auto-titling will never replace
-        the result. Automatic callers must use :meth:`set_auto_title`.
-        """
-        return self._set_session_title(
-            session_id, title, source=self.TITLE_SOURCE_USER
-        )
-
-    def set_auto_title(self, session_id: str, title: str, *, source: str) -> bool:
-        """Set an automatically generated title, honoring provenance precedence.
-
-        Returns True when the title was written, False when a higher-authority
-        title already holds the row (nothing is modified in that case).
-        """
-        if source not in (self.TITLE_SOURCE_DERIVED, self.TITLE_SOURCE_LLM):
-            raise ValueError(f"invalid automatic title source: {source!r}")
-        return self._set_session_title(session_id, title, source=source)
-
-    def set_auto_title_if_empty(self, session_id: str, title: str) -> bool:
-        """Back-compat shim: set an LLM title only if nothing better exists.
-
-        Retained because older callers (and third-party plugins) reference it
-        by name. New code should call :meth:`set_auto_title` with an explicit
-        source.
-        """
-        return self.set_auto_title(
-            session_id, title, source=self.TITLE_SOURCE_LLM
-        )
-
-    def get_session_title(self, session_id: str) -> Optional[str]:
-        """Get the title for a session, or None."""
-        with self._read_ctx() as conn:
-            cursor = conn.execute(
-                "SELECT title FROM sessions WHERE id = ?", (session_id,)
-            )
-            row = cursor.fetchone()
-        return row["title"] if row else None
-
-    def get_session_title_source(self, session_id: str) -> Optional[str]:
-        """Get the provenance of a session's title, or None when untitled."""
-        with self._read_ctx() as conn:
-            cursor = conn.execute(
-                "SELECT title, title_source FROM sessions WHERE id = ?",
-                (session_id,),
-            )
-            row = cursor.fetchone()
-        if not row or row["title"] is None:
-            return None
-        return row["title_source"]
-
-    def set_session_title_source(self, session_id: str, source: str) -> bool:
-        """Overwrite a title's provenance without touching the title text.
-
-        Used when a title is carried across a session boundary (compression
-        rotation) and the copy must keep the original's authority rather than
-        the authority of whichever setter performed the copy.
-        """
-        if source not in self._TITLE_SOURCE_RANK:
-            raise ValueError(f"invalid title source: {source!r}")
-
-        def _do(conn):
-            cursor = conn.execute(
-                "UPDATE sessions SET title_source = ? "
-                "WHERE id = ? AND title IS NOT NULL",
-                (source, session_id),
-            )
-            return cursor.rowcount
-
-        return self._execute_write(_do) > 0
-
-    def backfill_null_session_profiles(self, profile_name: str) -> int:
-        """One-shot owner backfill for legacy pre-ownership session rows.
-
-        Sessions created before the durable-ownership work (#95407 lineage)
-        carry ``profile_name = NULL``. On single-backend installs that was
-        harmless, but once a Desktop registers a second connection the
-        fail-closed owner ladder (which is correct for new sessions) can no
-        longer route those rows anywhere â€” every pre-campaign session becomes
-        unresumable after upgrade (#94724, field report).
-
-        This store belongs to exactly one profile â€” the profile whose
-        ``state.db`` this is â€” so stamping its own name onto rows that never
-        recorded one is a single-match backfill, not a guess. Rules mirror the
-        ``create_session`` COALESCE contract:
-
-        * only ``NULL``/empty ``profile_name`` rows are touched â€” a non-NULL
-          owner is NEVER overwritten;
-        * idempotent and one-shot-per-row: a second run matches zero rows.
-
-        Returns the number of rows stamped (0 when nothing was legacy).
-        """
-        stamp = (profile_name or "").strip()
-        if not stamp:
-            return 0
-
-        def _do(conn):
-            cursor = conn.execute(
-                """UPDATE sessions
-                   SET profile_name = ?
-                 WHERE profile_name IS NULL OR TRIM(profile_name) = ''""",
-                (stamp,),
-            )
-            rowcount = cursor.rowcount
-            if rowcount is None or rowcount < 0:
-                rowcount = conn.execute("SELECT changes()").fetchone()[0]
-            return rowcount
-
-        return int(self._execute_write(_do) or 0)
-
-    def set_session_archived(self, session_id: str, archived: bool) -> bool:
-        """Archive or unarchive a session.
-
-        Archived sessions are hidden from the default session list but keep all
-        their messages â€” this is a soft hide, not a delete. For compression
-        chains, archive the whole logical conversation. Desktop lists compression
-        roots projected forward to their latest continuation; updating only the
-        displayed tip lets the still-unarchived root resurrect it on refresh.
-        Returns True when at least one row was updated.
-        """
-        def _do(conn):
-            cursor = conn.execute(
-                """
-                WITH RECURSIVE
-                  ancestors(id) AS (
-                    SELECT ?
-                    UNION
-                    SELECT parent.id
-                    FROM ancestors a
-                    JOIN sessions child ON child.id = a.id
-                    JOIN sessions parent ON parent.id = child.parent_session_id
-                    WHERE parent.end_reason = 'compression'
-                  ),
-                  descendants(id) AS (
-                    SELECT ?
-                    UNION
-                    SELECT child.id
-                    FROM descendants d
-                    JOIN sessions parent ON parent.id = d.id
-                    JOIN sessions child ON child.parent_session_id = parent.id
-                    WHERE parent.end_reason = 'compression'
-                  ),
-                  lineage(id) AS (
-                    SELECT id FROM ancestors
-                    UNION
-                    SELECT id FROM descendants
-                  )
-                UPDATE sessions
-                SET archived = ?
-                WHERE id IN (SELECT id FROM lineage)
-                """,
-                (session_id, session_id, 1 if archived else 0),
-            )
-            rowcount = cursor.rowcount
-            if rowcount is None or rowcount < 0:
-                rowcount = conn.execute("SELECT changes()").fetchone()[0]
-            return rowcount
-        rowcount = self._execute_write(_do)
-        return rowcount > 0
-
-    # Accidental end reasons that recovery treats as resumable. Single source
-    # of truth: hermes_state_common._RECOVERABLE_END_REASONS, interpolated
-    # into find_latest_gateway_session_for_peer / promote_to_session_reset
-    # SQL â€” literals cannot drift (docs/session-lifecycle.md "recoverable
-    # accidental reasons").
-    RECOVERABLE_END_REASONS = _RECOVERABLE_END_REASONS
-
-    def unarchive_recoverable_session(self, session_id: str) -> bool:
-        """Un-archive a session that was archived by a recoverable accident.
-
-        Registry-style lookups (Bot Mode's canonical "Bot Chat") use this to
-        resurrect a row the ws-orphan reaper (``ws_orphan_reap``) or older
-        agent cleanup (``agent_close``) archived: those ends are accidents,
-        not user intent, so the identity-scoped canonical chat must survive
-        them (#92687). Sessions archived with no end_reason or an explicit
-        boundary reason (user archived deliberately, ``session_reset``, â€¦)
-        are left untouched â€” returns ``False`` for those, ``True`` only when
-        the row was archived for a recoverable reason and is now un-archived
-        (whole compression lineage, via :meth:`set_session_archived`).
-        """
-        if not session_id:
-            return False
-        try:
-            row = self.get_session(session_id)
-        except Exception:
-            return False
-        if not row or not row.get("archived"):
-            return False
-        # A compressed lineage's registry row keeps end_reason='compression';
-        # the accidental stamp lives on the live TIP. Judge recoverability at
-        # the tip (== the row itself when uncompressed).
-        tip = row
-        try:
-            tip_id = self.resolve_resume_session_id(session_id) or session_id
-            if tip_id != session_id:
-                tip = self.get_session(tip_id) or row
-        except Exception:
-            tip_id = session_id
-        if (tip.get("end_reason") or "") not in self.RECOVERABLE_END_REASONS:
-            return False
-        if not self.set_session_archived(session_id, False):
-            return False
-
-        # Clear the accidental end stamp: the session is live again, and a
-        # surviving ws_orphan_reap/agent_close reason would make a LATER
-        # deliberate archive (which never writes end_reason) auto-resurrect
-        # on the next lookup â€” permanently overriding user intent.
-        def _clear_end(conn):
-            conn.execute(
-                "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
-                (tip["id"],),
-            )
-            return 1
-
-        self._execute_write(_clear_end)
-        return True
-
-    def set_session_pinned(self, session_id: str, pinned: bool) -> bool:
-        """Pin or unpin a session (and its whole compression lineage).
-
-        ``pinned`` is a durable "keep" flag: pinned sessions are exempt from
-        the ``sessions.auto_archive`` stale sweep (see
-        :meth:`archive_stale_sessions`). Desktop is the current writer â€” its
-        sidebar pins mirror here so a backend/other-surface sweep honours
-        them. Like :meth:`set_session_archived` the whole compression chain is
-        flipped as a unit, so pinning the surfaced tip protects the root (and
-        vice-versa) no matter which id the caller holds. Returns True when at
-        least one row changed.
-        """
-        def _do(conn):
-            cursor = conn.execute(
-                """
-                WITH RECURSIVE
-                  ancestors(id) AS (
-                    SELECT ?
-                    UNION
-                    SELECT parent.id
-                    FROM ancestors a
-                    JOIN sessions child ON child.id = a.id
-                    JOIN sessions parent ON parent.id = child.parent_session_id
-                    WHERE parent.end_reason = 'compression'
-                  ),
-                  descendants(id) AS (
-                    SELECT ?
-                    UNION
-                    SELECT child.id
-                    FROM descendants d
-                    JOIN sessions parent ON parent.id = d.id
-                    JOIN sessions child ON child.parent_session_id = parent.id
-                    WHERE parent.end_reason = 'compression'
-                  ),
-                  lineage(id) AS (
-                    SELECT id FROM ancestors
-                    UNION
-                    SELECT id FROM descendants
-                  )
-                UPDATE sessions
-                SET pinned = ?
-                WHERE id IN (SELECT id FROM lineage)
-                """,
-                (session_id, session_id, 1 if pinned else 0),
-            )
-            rowcount = cursor.rowcount
-            if rowcount is None or rowcount < 0:
-                rowcount = conn.execute("SELECT changes()").fetchone()[0]
-            return rowcount
-        rowcount = self._execute_write(_do)
-        return rowcount > 0
-
-    def set_session_hidden(self, session_id: str, hidden: bool) -> bool:
-        """Hide or unhide a session (and its whole compression lineage).
-
-        ``hidden`` is a generic "don't show in the global Sessions sidebar"
-        flag: a hidden session is dropped from the default
-        :meth:`list_sessions_rich` listing (which omits ``include_hidden``) but
-        stays fully resumable by the surface that owns it â€” useful for plugins
-        that manage their own sessions (e.g. kanban) and don't want them
-        cluttering the shared recents list. Like :meth:`set_session_archived`
-        / :meth:`set_session_pinned` the whole compression chain is flipped as
-        a unit, so hiding the surfaced tip hides the root (and vice-versa) no
-        matter which id the caller holds. Returns True when at least one row
-        changed.
-        """
-        def _do(conn):
-            cursor = conn.execute(
-                """
-                WITH RECURSIVE
-                  ancestors(id) AS (
-                    SELECT ?
-                    UNION
-                    SELECT parent.id
-                    FROM ancestors a
-                    JOIN sessions child ON child.id = a.id
-                    JOIN sessions parent ON parent.id = child.parent_session_id
-                    WHERE parent.end_reason = 'compression'
-                  ),
-                  descendants(id) AS (
-                    SELECT ?
-                    UNION
-                    SELECT child.id
-                    FROM descendants d
-                    JOIN sessions parent ON parent.id = d.id
-                    JOIN sessions child ON child.parent_session_id = parent.id
-                    WHERE parent.end_reason = 'compression'
-                  ),
-                  lineage(id) AS (
-                    SELECT id FROM ancestors
-                    UNION
-                    SELECT id FROM descendants
-                  )
-                UPDATE sessions
-                SET hidden = ?
-                WHERE id IN (SELECT id FROM lineage)
-                """,
-                (session_id, session_id, 1 if hidden else 0),
-            )
-            rowcount = cursor.rowcount
-            if rowcount is None or rowcount < 0:
-                rowcount = conn.execute("SELECT changes()").fetchone()[0]
-            return rowcount
-        rowcount = self._execute_write(_do)
-        return rowcount > 0
-
-    def set_session_read(self, session_id: str, read: bool = True) -> bool:
-        """Mark a session read or unread (and its whole compression lineage).
-
-        Read state is a watermark, not a flag: ``last_read_at`` records when
-        the conversation was last read, and it counts as unread when activity
-        postdates that watermark (the derived ``unread`` key on
-        :meth:`list_sessions_rich` rows). New messages therefore flip a read
-        conversation back to unread without any write on the message path.
-        Three states:
-
-        * NULL â€” never tracked (every pre-feature row): treated as read, so
-          shipping the column doesn't badge a user's entire history at once.
-        * 0 â€” explicitly marked unread: any activity postdates it.
-        * timestamp â€” read up to that moment.
-
-        Like :meth:`set_session_archived` / :meth:`set_session_pinned`, the
-        whole compression chain is stamped as a unit, so reading the surfaced
-        tip clears the root (and vice-versa) no matter which id the caller
-        holds. Returns True when at least one row changed.
-        """
-        def _do(conn):
-            cursor = conn.execute(
-                """
-                WITH RECURSIVE
-                  ancestors(id) AS (
-                    SELECT ?
-                    UNION
-                    SELECT parent.id
-                    FROM ancestors a
-                    JOIN sessions child ON child.id = a.id
-                    JOIN sessions parent ON parent.id = child.parent_session_id
-                    WHERE parent.end_reason = 'compression'
-                  ),
-                  descendants(id) AS (
-                    SELECT ?
-                    UNION
-                    SELECT child.id
-                    FROM descendants d
-                    JOIN sessions parent ON parent.id = d.id
-                    JOIN sessions child ON child.parent_session_id = parent.id
-                    WHERE parent.end_reason = 'compression'
-                  ),
-                  lineage(id) AS (
-                    SELECT id FROM ancestors
-                    UNION
-                    SELECT id FROM descendants
-                  )
-                UPDATE sessions
-                SET last_read_at = ?
-                WHERE id IN (SELECT id FROM lineage)
-                """,
-                (session_id, session_id, time.time() if read else 0.0),
-            )
-            rowcount = cursor.rowcount
-            if rowcount is None or rowcount < 0:
-                rowcount = conn.execute("SELECT changes()").fetchone()[0]
-            return rowcount
-        rowcount = self._execute_write(_do)
-        return rowcount > 0
-
-    @staticmethod
-    def session_unread(session_row: Dict[str, Any]) -> bool:
-        """Derive unread from a session row's watermark and activity.
-
-        Shared by ``list_sessions_rich`` and any future surface that holds a
-        row (or projected row) with ``last_read_at`` and ``last_active``.
-        NULL watermark = never tracked = read.
-        """
-        last_read = session_row.get("last_read_at")
-        if last_read is None:
-            return False
-        last_active = session_row.get("last_active") or session_row.get("started_at")
-        return float(last_active or 0) > float(last_read)
-
-    def get_session_by_title(self, title: str) -> Optional[Dict[str, Any]]:
-        """Look up a session by exact title. Returns session dict or None."""
-        with self._read_ctx() as conn:
-            cursor = conn.execute(
-                "SELECT s.*, "
-                "COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved "
-                "FROM sessions s "
-                "LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
-                "WHERE s.title = ?",
-                (title,),
-            )
-            row = cursor.fetchone()
-        return self._session_row_dict(row) if row else None
-
-    def resolve_session_by_title(self, title: str) -> Optional[str]:
-        """Resolve a title to a session ID, preferring the latest in a lineage.
-
-        If the exact title exists, returns that session's ID.
-        If not, searches for "title #N" variants and returns the latest one.
-        If the exact title exists AND numbered variants exist, returns the
-        latest numbered variant (the most recent continuation).
-        """
-        # First try exact match
-        exact = self.get_session_by_title(title)
-
-        # Also search for numbered variants: "title #2", "title #3", etc.
-        # Escape SQL LIKE wildcards (%, _) in the title to prevent false matches
-        escaped = _escape_like(title)
-        with self._read_ctx() as conn:
-            cursor = conn.execute(
-                "SELECT id, title, started_at FROM sessions "
-                "WHERE title LIKE ? ESCAPE '\\' ORDER BY started_at DESC",
-                (f"{escaped} #%",),
-            )
-            numbered = cursor.fetchall()
-
-        if numbered:
-            # Return the most recent numbered variant
-            return numbered[0]["id"]
-        elif exact:
-            return exact["id"]
-        return None
-
-    def get_next_title_in_lineage(self, base_title: str) -> str:
-        """Generate the next title in a lineage (e.g., "my session" â†’ "my session #2").
-
-        Strips any existing " #N" suffix to find the base name, then finds
-        the highest existing number and increments.
-        """
-        # Strip existing #N suffix to find the true base
-        match = re.match(r'^(.*?) #(\d+)$', base_title)
-        if match:
-            base = match.group(1)
-        else:
-            base = base_title
-
-        # Find all existing numbered variants
-        # Escape SQL LIKE wildcards (%, _) in the base to prevent false matches
-        escaped = _escape_like(base)
-        with self._read_ctx() as conn:
-            cursor = conn.execute(
-                "SELECT title FROM sessions WHERE title = ? OR title LIKE ? ESCAPE '\\'",
-                (base, f"{escaped} #%"),
-            )
-            existing = [row["title"] for row in cursor.fetchall()]
-
-        if not existing:
-            return base  # No conflict, use the base name as-is
-
-        # Find the highest number
-        max_num = 1  # The unnumbered original counts as #1
-        for t in existing:
-            m = re.match(r'^.* #(\d+)$', t)
-            if m:
-                max_num = max(max_num, int(m.group(1)))
-
-        return f"{base} #{max_num + 1}"
-
-    def get_compression_tip(self, session_id: str) -> Optional[str]:
-        """Walk the compression-continuation chain forward and return the tip.
-
-        A compression continuation is a child of a session whose
-        ``end_reason = 'compression'``.  Older builds tried to distinguish
-        continuations from branches/subagents by requiring
-        ``child.started_at >= parent.ended_at``.  That ordering is too brittle:
-        gateway + compression races can insert the real continuation row before
-        the parent row's ``ended_at`` is written, while a stale websocket later
-        creates/reuses a sibling that *does* satisfy the timestamp test.  The
-        visible symptom is brutal: desktop resume follows the stale sibling and
-        the user's latest messages look "lost" even though they are persisted in
-        the real continuation chain.
-
-        Instead, only follow children of compression-ended parents, exclude
-        explicit branch/delegate/tool children, and prefer children that are
-        themselves continuing the compression chain (``end_reason='compression'``)
-        or still live over stale closed siblings such as ``ws_orphan_reap``.
-        Returns the latest continuation tip, or the input id when no
-        continuation exists.
-        """
-        current = session_id
-        seen = {current} if current else set()
-        # Bound the walk defensively â€” compression chains this deep are
-        # pathological and shouldn't happen in practice. 100 = plenty.
-        for _ in range(100):
-            with self._read_ctx() as conn:
-                cursor = conn.execute(
-                    f"""
-                    SELECT child.id
-                    FROM sessions parent
-                    JOIN sessions child ON child.parent_session_id = parent.id
-                    WHERE parent.id = ?
-                      AND parent.end_reason = 'compression'
-                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
-                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
-                      AND COALESCE(child.source, '') != 'tool'
-                    ORDER BY
-                      CASE
-                        WHEN child.end_reason = 'compression' THEN 0
-                        WHEN child.ended_at IS NULL THEN 1
-                        ELSE 2
-                      END,
-                      {_sql_session_last_active("child")} DESC,
-                      child.started_at DESC,
-                      child.id DESC
-                    LIMIT 1
-                    """,
-                    (current,),
-                )
-                row = cursor.fetchone()
-            if row is None:
-                return current
-            child_id = row["id"]
-            if not child_id or child_id in seen:
-                return current
-            seen.add(child_id)
-            current = child_id
-        return current
-
-    # Columns excluded from compact_rows projections: only the payload-heavy
-    # blob no list consumer renders. Everything else â€” including gateway
-    # routing fields and desktop sidebar fields like git_branch â€” stays, and
-    # the projection is derived from SCHEMA_SQL so columns added later via
-    # declarative reconciliation are included automatically instead of
-    # silently dropping out of list rows.
-    _SESSION_COMPACT_EXCLUDED = frozenset(
-        {"system_prompt", "system_prompt_hash", "git_metadata_generation"}
-    )
-    _session_compact_cols_sql: Optional[str] = None
-
-    def usage_totals(self, *, min_message_count: int = 1, include_archived: bool = False) -> Dict[str, float]:
-        """Tokens and spend across this store, as one aggregate.
-
-        The sidebar shows a profile's totals beside a page of its sessions, so
-        summing the rows it happens to have loaded would report a fraction of
-        the truth and shrink as paging changed. SQLite adds the columns up over
-        every row instead, at the cost of one scan.
-
-        Spend is the billed figure when the provider returned one and the
-        estimate otherwise â€” the same precedence a single row renders.
-        """
-        where = ["parent_session_id IS NULL", "message_count >= ?"]
-        params: List[Any] = [min_message_count]
-        if not include_archived:
-            where.append("COALESCE(archived, 0) = 0")
-
-        with self._read_ctx() as conn:
-            row = conn.execute(
-                f"""
-                SELECT COALESCE(SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)), 0),
-                       COALESCE(SUM(COALESCE(actual_cost_usd, estimated_cost_usd, 0)), 0)
-                  FROM sessions
-                 WHERE {' AND '.join(where)}
-                """,
-                params,
-            ).fetchone()
-
-        return {"tokens": int(row[0] or 0), "cost_usd": float(row[1] or 0.0)}
-
-
-    def session_lifecycle_statuses(
-        self, session_ids: List[str]
-    ) -> Dict[str, str]:
-        """Classify each session's lifecycle state from its LAST message row.
-
-        Returns ``{session_id: status}`` where status is one of:
-
-        - ``'complete'``    â€” last message is a normal assistant reply
-        - ``'interrupted'`` â€” last message is a user turn, a pending assistant
-          tool call (no tool result followed), or a tool result the assistant
-          never responded to
-        - ``'error'``       â€” last message carries an error finish_reason
-        - ``'empty'``       â€” session has no messages
-
-        Cost-bounded by design: one query that resolves each listed session's
-        newest message id via ``MAX(id)`` (an index seek on
-        ``idx_messages_session_id``) and joins back for that single row's
-        role/tool_calls/finish_reason. Never scans transcripts, so it stays
-        cheap on large databases regardless of total message volume.
-        """
-        ids = [sid for sid in (session_ids or []) if sid]
-        if not ids:
-            return {}
-        statuses: Dict[str, str] = {sid: "empty" for sid in ids}
-        placeholders = ",".join("?" for _ in ids)
-        query = f"""
-            SELECT m.session_id, m.role,
-                   m.tool_calls IS NOT NULL AS has_tool_calls,
-                   m.finish_reason
-            FROM messages m
-            JOIN (
-                SELECT session_id, MAX(id) AS max_id
-                FROM messages
-                WHERE session_id IN ({placeholders})
-                GROUP BY session_id
-            ) latest ON m.id = latest.max_id
-        """
-        with self._read_ctx() as conn:
-            rows = conn.execute(query, ids).fetchall()
-        for row in rows:
-            statuses[row["session_id"]] = classify_session_status(
-                role=row["role"],
-                has_tool_calls=bool(row["has_tool_calls"]),
-                finish_reason=row["finish_reason"],
-            )
-        return statuses
-
-    # =========================================================================
-    # Message storage
-    # =========================================================================
-
-    # Sentinel prefix used to distinguish JSON-encoded structured content
-    # (multimodal messages: lists of parts like text + image_url) from plain
-    # string content. The NUL byte is not legal in normal text, so this
-    # cannot collide with real user content.
-    _CONTENT_JSON_PREFIX = "\x00json:"
-
-    @classmethod
-    def _encode_content(cls, content: Any) -> Any:
-        """Serialize structured (list/dict) message content for sqlite.
-
-        sqlite3 can only bind ``str``, ``bytes``, ``int``, ``float``, and ``None``
-        to query parameters. Multimodal messages have ``content`` as a list of
-        parts (``[{"type": "text", ...}, {"type": "image_url", ...}]``), which
-        raises ``ProgrammingError: Error binding parameter N: type 'list' is
-        not supported`` when bound directly.
-
-        Returns the value unchanged when it's already a safe scalar, or a
-        sentinel-prefixed JSON string for lists/dicts. Paired with
-        :meth:`_decode_content` on read.
-        """
-        if isinstance(content, str):
-            # Lone UTF-16 surrogates reach here inside tool results scraped
-            # from the web/social platforms (the same input that crashed the
-            # guardrail hasher). The proactive sanitizer upstream only cleans
-            # the *api_messages* copy, and the recovery sanitizer only runs
-            # after the API call itself raises â€” which it no longer does â€” so
-            # the canonical history keeps them and this write is where they
-            # land. Left raw, sqlite3 raises UnicodeEncodeError, the flush is
-            # abandoned, and the session silently stops persisting for the
-            # rest of its life. Scrub so persistence never fails.
-            return _sanitize_surrogates(content)
-        if content is None or isinstance(content, (bytes, int, float)):
-            return content
-        try:
-            # json.dumps defaults to ensure_ascii=True, which escapes any
-            # surrogate as \udXXX â€” already safe to bind.
-            return cls._CONTENT_JSON_PREFIX + json.dumps(content)
-        except (TypeError, ValueError):
-            # Last-resort fallback: stringify so persistence never fails.
-            return _sanitize_surrogates(str(content))
-
-    @classmethod
-    def _decode_content(cls, content: Any) -> Any:
-        """Reverse :meth:`_encode_content`; returns scalars unchanged."""
-        if isinstance(content, str) and content.startswith(cls._CONTENT_JSON_PREFIX):
-            try:
-                return json.loads(content[len(cls._CONTENT_JSON_PREFIX):])
-            except (json.JSONDecodeError, TypeError):
-                logger.warning(
-                    "Failed to decode JSON-encoded message content; "
-                    "returning raw string"
-                )
-                return content
-        return content
-
-    @staticmethod
-    def _encode_display_metadata(display_metadata: Any) -> Optional[str]:
-        """Serialize ``display_metadata`` for its TEXT column without double-encoding.
-
-        Import/replace paths can hand us an already-serialized JSON string (the
-        same hazard ``tool_calls`` guards against above). ``json.dumps`` on that
-        string would store a quoted JSON string, and the single ``json.loads``
-        on read then yields a ``str`` instead of a dict.
-        """
-        if not display_metadata:
-            return None
-        if isinstance(display_metadata, str):
-            try:
-                parsed = json.loads(display_metadata)
-            except (json.JSONDecodeError, TypeError):
-                logger.warning("Ignoring non-JSON display metadata on write")
-                return None
-            if not isinstance(parsed, dict):
-                logger.warning("Ignoring non-object display metadata on write")
-                return None
-            return json.dumps(parsed)
-        if isinstance(display_metadata, dict):
-            return json.dumps(display_metadata)
-        logger.warning(
-            "Ignoring unexpected display metadata type on write: %s",
-            type(display_metadata).__name__,
-        )
-        return None
-
-
-    @staticmethod
-    def _decode_display_metadata(raw: Any) -> Optional[Dict[str, Any]]:
-        """Decode a ``display_metadata`` column into the dict every reader expects.
-
-        Every message read path must go through this. Returning the raw TEXT
-        instead reaches the desktop as a string, where ``'task_count' in meta``
-        throws and fails the whole resume. Rows written before the encode guard
-        landed are double-encoded, so unwrap a second layer when we find one.
-        """
-        if raw is None:
-            return None
-        try:
-            meta = json.loads(raw) if isinstance(raw, str) else raw
-            if isinstance(meta, str):
-                meta = json.loads(meta)
-        except (json.JSONDecodeError, TypeError):
-            logger.warning("Ignoring invalid display metadata on message row")
-            return None
-        if not isinstance(meta, dict):
-            logger.warning("Ignoring non-object display metadata on message row")
-            return None
-        return meta
-
-    @staticmethod
-    def _reasoning_json_text(value: Any) -> Optional[str]:
-        """Serialize a structured reasoning field for its TEXT column.
-
-        ``reasoning_details`` / ``codex_reasoning_items`` / ``codex_message_items``
-        arrive as list/dict structures from the live runtime, but callers that
-        round-trip stored rows â€” ``get_messages`` straight into
-        ``replace_messages``, e.g. the POST /api/sessions/{id}/fork handler â€”
-        hand back the raw TEXT these columns already hold, because
-        ``get_messages`` only deserializes ``content`` and ``tool_calls``.
-        Re-dumping that TEXT double-encodes it, and the forked session's next
-        ``get_messages_as_conversation`` json.loads then yields the inner
-        string instead of the original list, so every reasoning-replay consumer
-        (all of which check ``isinstance(..., list)``) silently drops it.
-        Strings are therefore stored as-is; structures are dumped.
-        """
-        if not value:
-            return None
-        if isinstance(value, str):
-            return value
-        return json.dumps(value)
-
-    def append_message(
-        self,
-        session_id: str,
-        role: str,
-        content: str = None,
-        tool_name: str = None,
-        tool_calls: Any = None,
-        tool_call_id: str = None,
-        token_count: int = None,
-        finish_reason: str = None,
-        reasoning: str = None,
-        reasoning_content: str = None,
-        reasoning_details: Any = None,
-        codex_reasoning_items: Any = None,
-        codex_message_items: Any = None,
-        platform_message_id: str = None,
-        observed: bool = False,
-        effect_disposition: Optional[str] = None,
-        _compressed_summary: bool = False,
-        timestamp: Any = None,
-        api_content: Optional[str] = None,
-        display_kind: Optional[str] = None,
-        display_metadata: Optional[Dict[str, Any]] = None,
-        compression_lock_holder: Optional[str] = None,
-        turn_lease_holder: Optional[str] = None,
-        turn_lease_ttl_seconds: float = 300.0,
-    ) -> int:
-        """
-        Append a message to a session. Returns the message row ID.
-
-        Also increments the session's message_count (and tool_call_count
-        if role is 'tool' or tool_calls is present).
-
-        ``platform_message_id`` is the external messaging platform's own
-        message ID (e.g. Telegram update_id, Yuanbao msg_id).  It is
-        independent of the SQLite autoincrement primary key and is used by
-        platform-specific flows like yuanbao's recall guard to redact a
-        message by its platform-side identifier.
-
-        ``api_content`` is the exact content string sent to the API for this
-        message when it differs from ``content`` (ephemeral memory/plugin
-        injections, persist overrides).  It is a byte-fidelity sidecar for
-        prompt-cache-stable replay â€” stored as sent, except lone surrogates
-        (which sqlite3 cannot bind and which the conversation loop scrubs
-        from every outgoing payload anyway, so the scrubbed form IS the
-        wire bytes).
-        """
-        # Display metadata is presentation-only and never changes the model
-        # context role/content replayed to providers.
-        display_metadata_json = self._encode_display_metadata(display_metadata)
-        # Serialize structured fields to JSON before entering the write txn
-        reasoning_details_json = self._reasoning_json_text(reasoning_details)
-        codex_items_json = self._reasoning_json_text(codex_reasoning_items)
-        codex_message_items_json = self._reasoning_json_text(codex_message_items)
-        # tool_calls may arrive as a Python list (from the live agent) or
-        # as a JSON string (from import/export). Parse first to avoid
-        # double-encoding.
-        if isinstance(tool_calls, str):
-            try:
-                tool_calls = json.loads(tool_calls)
-            except (json.JSONDecodeError, TypeError):
-                tool_calls = []
-        tool_calls_json = json.dumps(tool_calls) if tool_calls else None
-        # Multimodal content (list of parts) must be JSON-encoded: sqlite3
-        # cannot bind list/dict parameters directly.
-        stored_content = self._encode_content(content)
-
-        message_timestamp = time.time()
-        if timestamp is not None:
-            try:
-                if hasattr(timestamp, "timestamp"):
-                    message_timestamp = float(timestamp.timestamp())
-                else:
-                    message_timestamp = float(timestamp)
-            except (TypeError, ValueError):
-                logger.debug("Ignoring invalid explicit message timestamp: %r", timestamp)
-
-        # Pre-compute tool call count
-        num_tool_calls = 0
-        if tool_calls is not None:
-            num_tool_calls = len(tool_calls) if isinstance(tool_calls, list) else 1
-
-        def _do(conn):
-            self._check_transcript_write_guards(
-                conn,
-                session_id,
-                compression_lock_holder,
-                turn_lease_holder=turn_lease_holder,
-                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
-            )
-            cursor = conn.execute(
-                """INSERT INTO messages (session_id, role, content, tool_call_id,
-                   tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
-                   reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, _compressed_summary, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    session_id,
-                    role,
-                    stored_content,
-                    tool_call_id,
-                    tool_calls_json,
-                    _scrub_surrogates(tool_name),
-                    effect_disposition,
-                    message_timestamp,
-                    token_count,
-                    finish_reason,
-                    _scrub_surrogates(reasoning),
-                    _scrub_surrogates(reasoning_content),
-                    reasoning_details_json,
-                    codex_items_json,
-                    codex_message_items_json,
-                    platform_message_id,
-                    1 if observed else 0,
-                    1 if _compressed_summary else 0,
-                    1,
-                    _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
-                    _scrub_surrogates(display_kind) if isinstance(display_kind, str) else None,
-                    display_metadata_json,
-                ),
-            )
-            msg_id = cursor.lastrowid
-
-            # Update counters
-            if num_tool_calls > 0:
-                conn.execute(
-                    """UPDATE sessions SET message_count = message_count + 1,
-                       tool_call_count = tool_call_count + ? WHERE id = ?""",
-                    (num_tool_calls, session_id),
-                )
-            else:
-                conn.execute(
-                    "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
-                    (session_id,),
-                )
-            return msg_id
-
-        # Transcript append is THE critical write: its failure aborts the
-        # user's turn (session_persistence_failed). Use the long patience so
-        # a sibling process legitimately holding the write lock for seconds
-        # (VACUUM, TRUNCATE checkpoint at close, an older pre-bounded-merge
-        # process's FTS optimize) can't destroy a healthy turn (#74478).
-        return self._execute_write(
-            _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
-        )
-
-    def append_messages_batch(
-        self,
-        session_id: str,
-        messages: List[Dict[str, Any]],
-        compression_lock_holder: Optional[str] = None,
-        turn_lease_holder: Optional[str] = None,
-        chunk_rows: Optional[int] = None,
-        turn_lease_ttl_seconds: float = 300.0,
-    ) -> int:
-        """Append multiple messages atomically in ONE write transaction.
-
-        ``messages`` is a list of dicts in the same shape
-        :meth:`_insert_message_rows` already consumes for replace/compact/
-        import (role, content, tool_name, tool_calls, tool_call_id,
-        finish_reason, reasoning*, codex_*, timestamp, api_content,
-        display_kind, display_metadata, ...). Reusing that helper keeps ONE
-        row-serialization path for every multi-row writer.
-
-        A turn-boundary flush writes the whole turn (user + assistant + tool
-        rows, typically 3-8 messages) as one BEGIN IMMEDIATE / commit pair
-        instead of one transaction (and, off WAL, one fsync) per row.
-
-        Atomicity contract: all rows land or none do (the caller re-flushes
-        unstamped messages on the next attempt). The same admission guards
-        as :meth:`append_message` run once for the batch â€” same session,
-        same instant.
-
-        ``chunk_rows`` bounds the transaction size for LARGE copies (branch
-        seeds can be thousands of rows; measured: 10k rows â‰ˆ 2.4s inside one
-        BEGIN IMMEDIATE because the FTS triggers run per row, which would
-        monopolize the write lock and starve concurrent writers). When set,
-        the batch commits in chunks of at most that many rows â€” same
-        recovery semantics as the old per-row loops (a mid-copy failure
-        leaves a partial seed), just with bounded lock holds. A turn flush
-        never needs it. Returns the inserted row count.
-        """
-        if not messages:
-            return 0
-
-        if chunk_rows is not None and len(messages) > chunk_rows:
-            inserted_total = 0
-            for start in range(0, len(messages), chunk_rows):
-                inserted_total += self.append_messages_batch(
-                    session_id,
-                    messages[start:start + chunk_rows],
-                    compression_lock_holder=compression_lock_holder,
-                    turn_lease_holder=turn_lease_holder,
-                    turn_lease_ttl_seconds=turn_lease_ttl_seconds,
-                )
-            return inserted_total
-
-        def _do(conn):
-            self._check_transcript_write_guards(
-                conn,
-                session_id,
-                compression_lock_holder,
-                turn_lease_holder=turn_lease_holder,
-                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
-            )
-            inserted, tool_calls_total = self._insert_message_rows(
-                conn, session_id, messages
-            )
-            # One aggregated counter update for the whole batch.
-            if tool_calls_total > 0:
-                conn.execute(
-                    """UPDATE sessions SET message_count = message_count + ?,
-                       tool_call_count = tool_call_count + ? WHERE id = ?""",
-                    (inserted, tool_calls_total, session_id),
-                )
-            else:
-                conn.execute(
-                    "UPDATE sessions SET message_count = message_count + ? WHERE id = ?",
-                    (inserted, session_id),
-                )
-            return inserted
-
-        # Same criticality as append_message: this IS the turn's transcript.
-        return self._execute_write(
-            _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
-        )
-
-    def set_latest_matching_message_display_kind(
-        self, session_id: str, *, role: str, content: str, display_kind: str,
-        display_metadata: Optional[Dict[str, Any]] = None,
-    ) -> bool:
-        """Stamp presentation metadata on this turn's freshly persisted row.
-
-        The model still receives ``role`` and ``content`` unchanged. Gateway and
-        CLI synthetic inputs call this immediately after their serial turn has
-        flushed, preserving producer provenance without classifying by content
-        during transcript rendering.
-        """
-        if not session_id or not content or not display_kind:
-            return False
-
-        def _do(conn):
-            row = conn.execute(
-                "SELECT id FROM messages WHERE session_id = ? AND role = ? "
-                "AND content = ? AND active = 1 ORDER BY id DESC LIMIT 1",
-                (session_id, role, self._encode_content(content)),
-            ).fetchone()
-            if row is None:
-                return False
-            conn.execute(
-                "UPDATE messages SET display_kind = ?, display_metadata = ? WHERE id = ?",
-                (
-                    _scrub_surrogates(display_kind),
-                    self._encode_display_metadata(display_metadata),
-                    row[0],
-                ),
-            )
-            return True
-
-        return bool(self._execute_write(_do))
-
-    def quarantine_legacy_tool_carriers(
-        self,
-        candidates: List[Dict[str, Any]],
-        *,
-        migration_id: str,
-        dry_run: bool = True,
-    ) -> Dict[str, int]:
-        """Hide manifest-proven legacy raw-tool carrier rows without erasure.
-
-        The context-governor adapter historically converted orphaned tool
-        results into assistant text.  This method is deliberately narrower than
-        a generic visibility update: every candidate is pinned by row id,
-        session id, role, and original content digest before any write.  It
-        preserves content and existing display metadata, adds one typed marker,
-        and is idempotent for the same candidate state.
-        """
-        if not migration_id or not isinstance(migration_id, str):
-            raise ValueError("migration_id is required")
-        if not isinstance(candidates, list):
-            raise ValueError("candidates must be a list")
-
-        from agent.compaction_display import (
-            LEGACY_TOOL_CARRIER_QUARANTINE_METADATA_KEY,
-            LEGACY_TOOL_CARRIER_QUARANTINE_SCHEMA,
-        )
-
-        def _do(conn):
-            updates: List[Tuple[int, str]] = []
-            seen_row_ids: set[int] = set()
-            changed = 0
-            unchanged = 0
-            for candidate in candidates:
-                if not isinstance(candidate, dict):
-                    raise ValueError("candidate must be an object")
-                row_id = candidate.get("id")
-                session_id = candidate.get("session_id")
-                expected_hash = candidate.get("content_sha256")
-                if (
-                    not isinstance(row_id, int)
-                    or not isinstance(session_id, str)
-                    or not isinstance(expected_hash, str)
-                    or not re.fullmatch(r"[0-9a-f]{64}", expected_hash)
-                ):
-                    raise ValueError("candidate identity is invalid")
-                if row_id in seen_row_ids:
-                    raise ValueError(f"duplicate candidate row {row_id}")
-                seen_row_ids.add(row_id)
-                row = conn.execute(
-                    "SELECT id, session_id, role, content, display_kind, display_metadata "
-                    "FROM messages WHERE id = ?",
-                    (row_id,),
-                ).fetchone()
-                if row is None or row["session_id"] != session_id:
-                    raise ValueError(f"candidate row {row_id} is absent or moved")
-                content = self._decode_content(row["content"])
-                if not isinstance(content, str) or row["role"] != "assistant":
-                    raise ValueError(f"candidate row {row_id} is not an assistant text row")
-                actual_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
-                if actual_hash != expected_hash:
-                    raise ValueError(f"candidate row {row_id} content hash mismatch")
-                # The command admits only an explicitly reviewed legacy shape;
-                # it never turns an arbitrary assistant row into hidden state.
-                if not re.match(r"^\[Tool result(?: [^\]\r\n]{1,256})?\]: ", content):
-                    raise ValueError(f"candidate row {row_id} is not a legacy tool carrier")
-
-                metadata = self._decode_display_metadata(row["display_metadata"]) or {}
-                marker = metadata.get(LEGACY_TOOL_CARRIER_QUARANTINE_METADATA_KEY)
-                if isinstance(marker, dict):
-                    if (
-                        marker.get("schema") != LEGACY_TOOL_CARRIER_QUARANTINE_SCHEMA
-                        or marker.get("original_content_sha256") != expected_hash
-                        or row["display_kind"] != "hidden"
-                    ):
-                        raise ValueError(f"candidate row {row_id} has a conflicting quarantine")
-                    unchanged += 1
-                    continue
-                if row["display_kind"] is not None:
-                    raise ValueError(f"candidate row {row_id} already has display state")
-
-                metadata[LEGACY_TOOL_CARRIER_QUARANTINE_METADATA_KEY] = {
-                    "schema": LEGACY_TOOL_CARRIER_QUARANTINE_SCHEMA,
-                    "migration_id": migration_id,
-                    "original_content_sha256": expected_hash,
-                }
-                updates.append((row_id, self._encode_display_metadata(metadata) or "{}"))
-                changed += 1
-
-            if not dry_run:
-                for row_id, metadata_json in updates:
-                    conn.execute(
-                        "UPDATE messages SET display_kind = ?, display_metadata = ? WHERE id = ?",
-                        ("hidden", metadata_json, row_id),
-                    )
-            return {"changed": changed if not dry_run else 0, "unchanged": unchanged}
-
-        return self._execute_write(_do)
-
-    #: Key under which message reactions live inside ``display_metadata``.
-    #: Reactions share the existing per-message JSON column rather than a side
-    #: table so they survive rewind/compaction row rewrites with the row itself.
-    REACTIONS_METADATA_KEY = "reactions"
-
-    def set_message_reaction(
-        self,
-        session_id: str,
-        message_row_id: int,
-        emoji: Optional[str],
-        *,
-        author: str = "user",
-    ) -> Optional[List[Dict[str, Any]]]:
-        """Set (or with ``emoji=None`` clear) *author*'s reaction on one message.
-
-        iOS Tapback semantics: one reaction per author per message. Re-sending
-        the same emoji clears it, a different emoji replaces it. Returns the
-        message's full reaction list after the write, or ``None`` when the row
-        doesn't exist or isn't part of *session_id*.
-        """
-        if not session_id or message_row_id is None:
-            return None
-
-        def _do(conn):
-            row = conn.execute(
-                "SELECT display_metadata FROM messages WHERE id = ? AND session_id = ?",
-                (message_row_id, session_id),
-            ).fetchone()
-            if row is None:
-                return None
-
-            meta = self._decode_display_metadata(row[0]) or {}
-            existing = meta.get(self.REACTIONS_METADATA_KEY)
-            reactions = [
-                r
-                for r in (existing if isinstance(existing, list) else [])
-                if isinstance(r, dict) and r.get("author") != author
-            ]
-            previous = next(
-                (
-                    r
-                    for r in (existing if isinstance(existing, list) else [])
-                    if isinstance(r, dict) and r.get("author") == author
-                ),
-                None,
-            )
-            # Tapping the live reaction again retracts it.
-            toggling_off = (
-                emoji is not None and previous is not None and previous.get("emoji") == emoji
-            )
-            if emoji and not toggling_off:
-                reactions.append(
-                    {"emoji": _scrub_surrogates(emoji), "author": author, "at": time.time()}
-                )
-
-            if reactions:
-                meta[self.REACTIONS_METADATA_KEY] = reactions
-            else:
-                meta.pop(self.REACTIONS_METADATA_KEY, None)
-
-            conn.execute(
-                "UPDATE messages SET display_metadata = ? WHERE id = ?",
-                (self._encode_display_metadata(meta) if meta else None, message_row_id),
-            )
-            return reactions
-
-        return self._execute_write(_do)
-
-    def get_message_reactions(
-        self, session_id: str, message_row_id: int
-    ) -> List[Dict[str, Any]]:
-        """Return the reaction list persisted on one message row (never ``None``)."""
-        if not session_id or message_row_id is None:
-            return []
-
-        with self._read_ctx() as conn:
-            row = conn.execute(
-                "SELECT display_metadata FROM messages WHERE id = ? AND session_id = ?",
-                (message_row_id, session_id),
-            ).fetchone()
-
-        if row is None:
-            return []
-
-        meta = self._decode_display_metadata(row[0]) or {}
-        reactions = meta.get(self.REACTIONS_METADATA_KEY)
-
-        return [r for r in reactions if isinstance(r, dict)] if isinstance(reactions, list) else []
-
-    def take_unseen_reactions(
-        self, session_id: str, *, author: str = "user"
-    ) -> List[Dict[str, Any]]:
-        """Return *author*'s not-yet-surfaced reactions and mark them seen.
-
-        Powers the cache-safe model-context path: reactions are announced on the
-        NEXT user turn (never by rewriting the message that was reacted to), and
-        the ``seen`` stamp guarantees each one is announced exactly once.
-        """
-        if not session_id:
-            return []
-
-        def _do(conn):
-            rows = conn.execute(
-                "SELECT id, role, content, display_metadata FROM messages "
-                "WHERE session_id = ? AND active = 1 AND display_metadata IS NOT NULL "
-                "ORDER BY id",
-                (session_id,),
-            ).fetchall()
-
-            pending = []
-            for row in rows:
-                meta = self._decode_display_metadata(row["display_metadata"])
-                if not meta:
-                    continue
-                reactions = meta.get(self.REACTIONS_METADATA_KEY)
-                if not isinstance(reactions, list):
-                    continue
-
-                changed = False
-                for reaction in reactions:
-                    if (
-                        not isinstance(reaction, dict)
-                        or reaction.get("author") != author
-                        or reaction.get("seen")
-                    ):
-                        continue
-                    reaction["seen"] = True
-                    changed = True
-                    content = self._decode_content(row["content"])
-                    pending.append(
-                        {
-                            "row_id": row["id"],
-                            "role": row["role"],
-                            "emoji": reaction.get("emoji") or "",
-                            "text": content if isinstance(content, str) else "",
-                        }
-                    )
-
-                if changed:
-                    conn.execute(
-                        "UPDATE messages SET display_metadata = ? WHERE id = ?",
-                        (self._encode_display_metadata(meta), row["id"]),
-                    )
-
-            return pending
-
-        return self._execute_write(_do) or []
-
-    def latest_message_row_id(
-        self, session_id: str, *, role: str = "user", offset: int = 0, require_text: bool = True
-    ) -> Optional[int]:
-        """Row id of the most recent active message with *role*, or ``None``.
-
-        Two callers, same need â€” "the message I mean, without an id": the agent
-        defaulting to the turn that triggered it, and the desktop reacting to a
-        live message that hasn't round-tripped through a resume yet.
-        ``offset`` steps to earlier turns (1 = the one before the latest) so a
-        reaction can land retroactively â€” "two messages ago" is how the caller
-        thinks about it.
-
-        ``require_text`` (default) skips rows with no plain-text content â€”
-        tool-call-only assistant turns and attachment stubs don't render as
-        bubbles, so "the latest message" as a HUMAN means it must never
-        resolve to one (a reaction landing on an invisible row looks dropped,
-        and its annotation quotes an empty string).
-        """
-        if not session_id or role not in {"user", "assistant"} or offset < 0:
-            return None
-
-        text_filter = (
-            "AND content IS NOT NULL AND TRIM(content) != '' " if require_text else ""
-        )
-
-        with self._read_ctx() as conn:
-            row = conn.execute(
-                "SELECT id FROM messages WHERE session_id = ? AND role = ? "
-                f"AND active = 1 {text_filter}ORDER BY id DESC LIMIT 1 OFFSET ?",
-                (session_id, role, int(offset)),
-            ).fetchone()
-
-        return row[0] if row else None
-
-    def latest_user_message_row_id(self, session_id: str) -> Optional[int]:
-        """Row id of the most recent active user message, or ``None``.
-
-        The agent's default reaction target: "the message that triggered me",
-        so the model never has to thread row ids through a tool call (mirrors
-        the photon adapter's ``_record_last_inbound``).
-        """
-        return self.latest_message_row_id(session_id, role="user")
-
-    def get_message_role(self, session_id: str, row_id: int) -> Optional[str]:
-        """Role of the active message at *row_id* in *session_id*, or ``None``.
-
-        Lets a reaction event carry the target's role so a renderer can match
-        a live message that doesn't know its durable row id yet.
-        """
-        if not session_id:
-            return None
-
-        with self._read_ctx() as conn:
-            row = conn.execute(
-                "SELECT role FROM messages WHERE id = ? AND session_id = ? AND active = 1",
-                (int(row_id), session_id),
-            ).fetchone()
-
-        return row[0] if row else None
-
-    def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> tuple[int, int]:
-        """Insert *messages* as fresh active rows for *session_id*.
-
-        Shared by :meth:`replace_messages` (delete-then-insert) and
-        :meth:`archive_and_compact` (soft-archive-then-insert). Runs inside the
-        caller's write transaction (takes the live ``conn``). Returns
-        ``(inserted_count, tool_call_count)``. Does NOT touch sessions.* counters
-        â€” the caller owns that, since the two flows reconcile counts differently.
-        """
-        now_ts = time.time()
-        inserted = 0
-        tool_calls_total = 0
-        for msg in messages:
-            role = msg.get("role", "unknown")
-            tool_calls = msg.get("tool_calls")
-            message_timestamp = now_ts
-            if msg.get("timestamp") is not None:
-                try:
-                    ts_value = msg.get("timestamp")
-                    if hasattr(ts_value, "timestamp"):
-                        message_timestamp = float(ts_value.timestamp())
-                    else:
-                        message_timestamp = float(ts_value)
-                except (TypeError, ValueError):
-                    logger.debug("Ignoring invalid explicit message timestamp: %r", msg.get("timestamp"))
-            reasoning_details = msg.get("reasoning_details") if role == "assistant" else None
-            codex_reasoning_items = (
-                msg.get("codex_reasoning_items") if role == "assistant" else None
-            )
-            codex_message_items = (
-                msg.get("codex_message_items") if role == "assistant" else None
-            )
-            reasoning_details_json = self._reasoning_json_text(reasoning_details)
-            codex_items_json = self._reasoning_json_text(codex_reasoning_items)
-            codex_message_items_json = self._reasoning_json_text(codex_message_items)
-            # tool_calls may arrive as a Python list (from the live agent)
-            # or as a JSON string (from import_sessions / export_session,
-            # which store it as TEXT). json.dumps on an already-serialized
-            # string double-encodes it, so parse first.
-            if isinstance(tool_calls, str):
-                try:
-                    tool_calls = json.loads(tool_calls)
-                except (json.JSONDecodeError, TypeError):
-                    tool_calls = []
-            tool_calls_json = json.dumps(tool_calls) if tool_calls else None
-            # Accept either `platform_message_id` (new explicit name) or
-            # `message_id` (yuanbao's existing convention on message dicts).
-            platform_msg_id = (
-                msg.get("platform_message_id") or msg.get("message_id")
-            )
-
-            api_content = msg.get("api_content")
-
-            cur = conn.execute(
-                """INSERT INTO messages (session_id, role, content, tool_call_id,
-                   tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
-                   reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, _compressed_summary, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    session_id,
-                    role,
-                    self._encode_content(msg.get("content")),
-                    msg.get("tool_call_id"),
-                    tool_calls_json,
-                    _scrub_surrogates(msg.get("tool_name")),
-                    msg.get("effect_disposition"),
-                    message_timestamp,
-                    msg.get("token_count"),
-                    msg.get("finish_reason"),
-                    _scrub_surrogates(msg.get("reasoning")) if role == "assistant" else None,
-                    _scrub_surrogates(msg.get("reasoning_content")) if role == "assistant" else None,
-                    reasoning_details_json,
-                    codex_items_json,
-                    codex_message_items_json,
-                    platform_msg_id,
-                    1 if msg.get("observed") else 0,
-                    1 if msg.get("_compressed_summary") else 0,
-                    1,
-                    _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
-                    _scrub_surrogates(msg.get("display_kind")) if isinstance(msg.get("display_kind"), str) else None,
-                    self._encode_display_metadata(msg.get("display_metadata")),
-                ),
-            )
-            if isinstance(msg, dict) and cur.lastrowid is not None:
-                msg["_row_id"] = cur.lastrowid
-            inserted += 1
-            if tool_calls is not None:
-                tool_calls_total += (
-                    len(tool_calls) if isinstance(tool_calls, list) else 1
-                )
-            now_ts = max(now_ts + 1e-6, message_timestamp + 1e-6)
-        return inserted, tool_calls_total
-
-    def replace_messages(
-        self,
-        session_id: str,
-        messages: List[Dict[str, Any]],
-        active_only: bool = False,
-        archive_dropped: bool = False,
-        reject_active_turn_lease: bool = False,
-    ) -> None:
-        """Atomically replace the stored messages for a session.
-
-        Used by transcript-rewrite flows such as /retry, /undo, and /compress.
-        The delete + reinsert sequence must commit as one transaction so a
-        mid-rewrite failure does not leave SQLite with a partial transcript.
-
-        DESTRUCTIVE by default: every row for the session is DELETEd (and drops
-        out of the FTS index). For compaction that must preserve the
-        pre-compaction transcript under the same id, use
-        :meth:`archive_and_compact` instead.
-
-        Pass ``active_only=True`` to replace ONLY the live (``active = 1``) rows,
-        leaving soft-archived rows (``active = 0`` â€” e.g. the ``compacted = 1``
-        turns that :meth:`archive_and_compact` keeps on disk for #38763
-        durability, or rewind/undo rows) untouched. Callers that share a session
-        id with an agent already running in-place compaction must use this so a
-        full-history rewrite doesn't wipe the rows the agent deliberately
-        archived. ``message_count``/``tool_call_count`` then track the live set,
-        matching :meth:`archive_and_compact`.
-
-        Pass ``archive_dropped=True`` to SOFT-archive the live rows instead of
-        DELETEing them: the replaced turns stay on disk with ``active = 0``,
-        ``compacted = 0`` â€” the same "the user took it back" marking
-        :meth:`rewind_to_message` applies â€” and stay readable via
-        :meth:`get_messages` with ``include_inactive=True``. This is the mode a
-        rewind/edit/regenerate must use: those flows overwrite a transcript the
-        user may not have meant to drop, and a plain DELETE also evicts the rows
-        from the FTS index, leaving nothing to recover from (#82756). It implies
-        active-only handling â€” already-archived rows are never touched â€” so
-        ``active_only`` is redundant with it. The rewritten set is inserted as
-        fresh active rows exactly as in the destructive path, so the live view
-        is identical either way; only the durability of the dropped turns
-        differs.
-
-        Pass ``reject_active_turn_lease=True`` for user-initiated rewrites that
-        do not already own the cross-process turn lease. The lease check and
-        transcript mutation then share one write transaction, so a second
-        process cannot archive or replace a turn that is still being produced.
-        """
-
-        active_clause = " AND active = 1" if active_only else ""
-
-        def _do(conn):
-            if reject_active_turn_lease:
-                self._check_transcript_write_guards(
-                    conn,
-                    session_id,
-                    None,
-                    reject_active_turn_lease=True,
-                    reject_active_compression_lock=True,
-                )
-            else:
-                session = conn.execute(
-                    "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
-                    (session_id,),
-                ).fetchone()
-                if (
-                    session is not None
-                    and session["ended_at"] is not None
-                    and session["end_reason"] == "compression"
-                ):
-                    raise CompressionSessionClosedError(session_id)
-            if archive_dropped:
-                # Content-preserving UPDATE: the rows keep their FTS entries
-                # (the messages_fts triggers fire on INSERT / DELETE / UPDATE
-                # of content columns, not on `active`), so the replaced turns
-                # stay readable via get_messages(include_inactive=True) and
-                # searchable with include_inactive=True after the rewrite.
-                conn.execute(
-                    "UPDATE messages SET active = 0 "
-                    "WHERE session_id = ? AND active = 1",
-                    (session_id,),
-                )
-            else:
-                conn.execute(
-                    f"DELETE FROM messages WHERE session_id = ?{active_clause}",
-                    (session_id,),
-                )
-            conn.execute(
-                "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?",
-                (session_id,),
-            )
-            total_messages, total_tool_calls = self._insert_message_rows(
-                conn, session_id, messages
-            )
-            conn.execute(
-                "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
-                (total_messages, total_tool_calls, session_id),
-            )
-
-        self._execute_write(_do)
-
-    def has_archived_messages(self, session_id: str) -> bool:
-        """Return True if the session has any soft-archived (``active = 0``) rows.
-
-        Cheap existence probe â€” does not load rows. NOTE: production rewrite
-        paths no longer branch on this (they pass ``active_only=True``
-        unconditionally â€” a probe can fail open or race a concurrent
-        ``archive_and_compact``, #80216); kept for tests and diagnostics.
-        """
-        with self._read_ctx() as conn:
-            cursor = conn.execute(
-                "SELECT 1 FROM messages WHERE session_id = ? AND active = 0 LIMIT 1",
-                (session_id,),
-            )
-            return cursor.fetchone() is not None
-
-    def get_active_message_watermark(self, session_id: str) -> int:
-        """MAX(id) of the session's active rows â€” the compression watermark.
-
-        Captured at compression START (before the slow provider summary call).
-        Every active row with ``id > watermark`` at commit time arrived
-        concurrently and must survive the compaction verbatim. Returns 0 for
-        an empty/unknown session.
-        """
-        if not session_id:
-            return 0
-        with self._read_ctx() as conn:
-            row = conn.execute(
-                "SELECT COALESCE(MAX(id), 0) FROM messages "
-                "WHERE session_id = ? AND active = 1",
-                (session_id,),
-            ).fetchone()
-        return int(row[0]) if row else 0
-
-    def archive_and_compact(
-        self,
-        session_id: str,
-        compacted_messages: List[Dict[str, Any]],
-        model_config_patch: Optional[Dict[str, Any]] = None,
-        watermark: Optional[int] = None,
-        lock_holder: Optional[str] = None,
-        tail_count: int = 0,
-    ) -> int:
-        """Non-destructive in-place compaction for a single durable session id.
-
-        Soft-archives the active messages (``active = 0``) and inserts
-        *compacted_messages* as fresh active rows â€” atomically, in one write
-        transaction. The conversation keeps ONE session id for life (#38763)
-        WITHOUT destroying history:
-
-        - The live-context load (:meth:`get_messages_as_conversation`,
-          :meth:`get_messages`) filters ``active = 1`` by default, so the model
-          reloads ONLY the compacted set.
-        - The archived pre-compaction turns stay on disk (active=0) and stay
-          DISCOVERABLE: they are marked compacted=1, and search_messages()
-          includes compacted=1 rows by default â€” so session_search still finds
-          them, unlike rewind/undo rows (active=0, compacted=0) which stay
-          hidden. They remain in the FTS index (the messages_fts* triggers
-          index on INSERT / drop on DELETE and don't key on active/compacted;
-          flipping to active=0 is a content-preserving UPDATE) and are
-          recoverable via get_messages(..., include_inactive=True).
-
-        Concurrent-append safety (#75316): when *watermark* is provided (the
-        value of :meth:`get_active_message_watermark` captured at compression
-        START), rows that arrived during the slow provider summary call
-        (``id > watermark``) are NOT summarized away. They are re-sequenced
-        after the compacted set by a pure-SQL column clone (every column
-        except ``id`` â€” content, api_content, platform_message_id, token
-        counts, reasoning sidecars all survive byte-exact, and the FTS
-        triggers index the clones naturally), and the originals are archived.
-        NOTE: re-sequencing assigns the tail rows fresh ids; consumers that
-        reference durable row ids re-resolve by content (see 3e8ab0610).
-        ``watermark=None`` preserves the historical archive-everything
-        behavior.
-
-        ``tail_count`` marks the last carried-forward active rows as
-        superseded duplicates (``active = 0, compacted = 0``) instead of
-        summarized history. When both arguments are present, the tail walk is
-        bounded at *watermark* so concurrent appends do not consume slots.
-
-        Commit-fence safety: when *lock_holder* is provided, the commit
-        verifies INSIDE the transaction that the compression lock is still
-        held by that holder and unexpired â€” a compression whose lease was
-        reclaimed (crash cleanup, TTL expiry, competing writer) fails the
-        commit instead of clobbering the winner's transcript.
-
-        ``message_count`` is set to the ACTIVE count after commit, matching
-        what the live load returns. ``model_config_patch`` is merged into the
-        session's JSON config in the same transaction; a ``None`` value
-        removes that key. Returns the new active count.
-        """
-
-        def _do(conn):
-            if lock_holder is not None:
-                lock_row = conn.execute(
-                    "SELECT holder, expires_at FROM compression_locks "
-                    "WHERE session_id = ?",
-                    (session_id,),
-                ).fetchone()
-                if (
-                    lock_row is None
-                    or lock_row["holder"] != lock_holder
-                    or float(lock_row["expires_at"]) <= time.time()
-                ):
-                    raise SessionCompressionInProgressError(
-                        f"Compression lease for {session_id!r} lost before "
-                        "commit; refusing to publish a stale compaction"
-                    )
-
-            patched_model_config = None
-            if model_config_patch is not None:
-                # on_missing="raise": a prune/compaction must not commit
-                # against a vanished session row (the compressor's caller
-                # converts the raised error into a safe keep-the-original
-                # no-op), unlike the flag setters which tolerate missing rows.
-                patched_model_config = self._merge_model_config_json(
-                    conn, session_id, model_config_patch, on_missing="raise"
-                )
-
-            # Concurrent tail: active rows that arrived after the watermark.
-            # Snapshot their ids and tool_calls now â€” the clone below needs a
-            # stable id list, and the tool-call count keeps sessions.* honest.
-            tail_ids: list[int] = []
-            tail_tool_calls = 0
-            if watermark is not None:
-                for row in conn.execute(
-                    "SELECT id, tool_calls FROM messages "
-                    "WHERE session_id = ? AND active = 1 AND id > ? "
-                    "ORDER BY id",
-                    (session_id, int(watermark)),
-                ).fetchall():
-                    tail_ids.append(int(row["id"]))
-                    raw = row["tool_calls"]
-                    if raw:
-                        try:
-                            parsed = json.loads(raw) if isinstance(raw, str) else raw
-                            tail_tool_calls += len(parsed) if isinstance(parsed, list) else 0
-                        except (TypeError, ValueError):
-                            pass
-
-            # The compressor carries a protected tail into the replacement
-            # set verbatim. Those originals are superseded duplicates, not
-            # summarized history, so they must receive rewind semantics after
-            # the common archive update. Limit the walk to the pre-compression
-            # watermark when one exists: rows above it are the independent
-            # concurrent tail handled by the clone path above.
-            rewind_ids: list[int] = []
-            normalized_tail_count = max(0, int(tail_count or 0))
-            if normalized_tail_count:
-                _tail_ceiling = "" if watermark is None else " AND id <= ?"
-                _tail_params: list[Any] = [session_id]
-                if watermark is not None:
-                    _tail_params.append(int(watermark))
-                _tail_params.append(normalized_tail_count)
-                rewind_ids = [
-                    int(row["id"])
-                    for row in conn.execute(
-                        "SELECT id FROM messages "
-                        "WHERE session_id = ? AND active = 1"
-                        f"{_tail_ceiling} ORDER BY id DESC LIMIT ?",
-                        _tail_params,
-                    ).fetchall()
-                ]
-
-            # Soft-archive the live turns: active=0 hides them from the live
-            # context load, compacted=1 marks them as "summarized away" (vs
-            # rewind/undo's active=0+compacted=0, which means "user took it
-            # back"). search_messages includes compacted=1 rows by default so
-            # the pre-compaction transcript stays discoverable; live-context
-            # loads (active=1 only) still exclude them. Tail originals are
-            # archived too â€” their clones (below) carry the live copy.
-            conn.execute(
-                "UPDATE messages SET active = 0, compacted = 1 "
-                "WHERE session_id = ? AND active = 1",
-                (session_id,),
-            )
-            # Concurrent-tail originals are also superseded duplicates: their
-            # live copies are inserted below, so they must not be recalled as
-            # compacted history alongside those clones.
-            rewind_ids.extend(tail_ids)
-            if rewind_ids:
-                placeholders = ",".join("?" for _ in rewind_ids)
-                conn.execute(
-                    f"UPDATE messages SET compacted = 0 WHERE session_id = ? "
-                    f"AND active = 0 AND id IN ({placeholders})",
-                    [session_id, *rewind_ids],
-                )
-            inserted, tool_calls_total = self._insert_message_rows(
-                conn, session_id, compacted_messages
-            )
-
-            if tail_ids:
-                # Re-sequence the concurrent tail after the compacted set via
-                # a pure-SQL column clone: no decode/re-encode round trip, no
-                # field drift â€” new id, active=1, compacted=0, all else exact.
-                placeholders = ",".join("?" for _ in tail_ids)
-                clone_cols = [
-                    c for c in self._message_column_names(conn)
-                    if c not in ("id", "active", "compacted")
-                ]
-                col_list = ", ".join(clone_cols)
-                conn.execute(
-                    f"INSERT INTO messages ({col_list}, active, compacted) "
-                    f"SELECT {col_list}, 1, 0 FROM messages "
-                    f"WHERE id IN ({placeholders}) ORDER BY id",
-                    tail_ids,
-                )
-                inserted += len(tail_ids)
-                tool_calls_total += tail_tool_calls
-
-            # message_count / tool_call_count reflect the LIVE (active) set â€”
-            # the archived rows are still on disk but not part of the live count.
-            if model_config_patch is None:
-                conn.execute(
-                    "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
-                    (inserted, tool_calls_total, session_id),
-                )
-            else:
-                conn.execute(
-                    "UPDATE sessions SET message_count = ?, tool_call_count = ?, "
-                    "model_config = ? WHERE id = ?",
-                    (inserted, tool_calls_total, patched_model_config, session_id),
-                )
-            return inserted
-
-        return self._execute_write(_do)
-
-    def _message_column_names(self, conn) -> List[str]:
-        """Column names of the messages table, cached per-connection era."""
-        cached = getattr(self, "_message_columns_cache", None)
-        if cached:
-            return cached
-        cols = [r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()]
-        self._message_columns_cache = cols
-        return cols
-
-    def set_latest_user_api_content(
-        self, session_id: str, content: Any, api_content: str
-    ) -> int:
-        """Backfill the ``api_content`` sidecar onto the newest ACTIVE user row.
-
-        In-place preflight compaction (:meth:`archive_and_compact`) inserts the
-        current turn's user row BEFORE the turn prologue composes the
-        prefetch/plugin sidecar, and the subsequent crash persist identity-skips
-        every compacted dict â€” without this backfill the stamped sidecar would
-        never land in the DB and any reload would replay clean content,
-        re-introducing the prompt-cache divergence the sidecar exists to close.
-
-        The ``content`` match is a defensive guard: if the newest active user
-        row is not the message the caller stamped (racing rewrite, unexpected
-        tail shape), nothing is written. Returns the number of rows updated
-        (0 or 1).
-        """
-        encoded = self._encode_content(content)
-
-        def _do(conn):
-            cursor = conn.execute(
-                "UPDATE messages SET api_content = ? WHERE id = ("
-                "SELECT id FROM messages "
-                "WHERE session_id = ? AND role = 'user' AND active = 1 "
-                "ORDER BY id DESC LIMIT 1"
-                ") AND content IS ?",
-                (_scrub_surrogates(api_content), session_id, encoded),
-            )
-            return cursor.rowcount
-
-        return self._execute_write(_do)
-
-    def get_messages(
-        self,
-        session_id: str,
-        include_inactive: bool = False,
-        include_compacted: bool = False,
-        limit: Optional[int] = None,
-        offset: int = 0,
-        latest: bool = False,
-        after_id: Optional[int] = None,
-    ) -> List[Dict[str, Any]]:
-        """Load messages for a session in insertion order.
-
-        By default only active messages are returned. Pass
-        ``include_inactive=True`` to load soft-deleted rows (e.g. for
-        audit / debug views of rewound history). See
-        :meth:`rewind_to_message` for the soft-delete mechanic.
-
-        Pass ``include_compacted=True`` to additionally load rows preserved
-        by in-place context compaction (``active=0, compacted=1``). Those are
-        durable display history, not soft-deleted rows â€” a user-visible
-        transcript read must not drop them, or earlier turns silently become
-        unreachable once the UI exhausts its active-only window. Soft-deleted
-        Undo/Rewind rows (``active=0, compacted=0``) stay excluded; use
-        ``include_inactive`` for those.
-
-        Ordered by AUTOINCREMENT id (true insertion order) rather than
-        timestamp â€” see c03acca50 for the WSL2 clock-regression rationale.
-
-        When ``limit`` is provided, returns at most ``limit`` messages
-        starting from ``offset`` (0-based, in insertion order). Enables
-        pagination for the API endpoint to avoid loading entire transcripts.
-        With ``latest=True``, the offset is measured back from the newest
-        message and the selected page is still returned in chronological
-        order. ``offset`` alone (without ``limit``) also pages â€” SQLite
-        requires a LIMIT clause for OFFSET, so it's emitted as ``LIMIT -1``
-        (unbounded).
-
-        ``after_id`` enables keyset pagination (``id > after_id``): O(1)
-        page seeks on huge transcripts where OFFSET degrades to O(n) per
-        page. Ascending order only (incompatible with ``latest``/``offset``).
-        """
-        if after_id is not None and (latest or offset):
-            raise ValueError("after_id is incompatible with latest/offset paging")
-        if after_id is not None and include_compacted:
-            raise ValueError("after_id is incompatible with include_compacted (deduped display reads use offset paging)")
-        if include_inactive:
-            # Audit / debug reads: every row, including soft-deleted.
-            active_clause = ""
-        elif include_compacted:
-            # Display history: active rows plus rows preserved by in-place
-            # compaction (active=0, compacted=1), but never soft-deleted
-            # Undo/Rewind rows (active=0, compacted=0).
-            active_clause = " AND (active = 1 OR compacted = 1)"
-        else:
-            active_clause = " AND active = 1"
-        keyset_clause = " AND id > ?" if after_id is not None else ""
-        sql = (
-            "SELECT * FROM messages WHERE session_id = ?"
-            f"{active_clause}{keyset_clause} ORDER BY id {'DESC' if latest else 'ASC'}"
-        )
-        params: list = [session_id]
-        if after_id is not None:
-            params.append(after_id)
-        if include_compacted:
-            # Compaction epochs copy the protected tail into each new
-            # generation, so the same logical message can exist as several
-            # rows (identical role/content/timestamp) with different active
-            # flags and ids. A display read must surface each message exactly
-            # once: prefer the live row, then the newest generation. Read the
-            # full display set (a session's rows are bounded; the UI-level
-            # 500-row cap lives in the endpoint, not here), dedupe in Python,
-            # then apply paging.
-            with self._read_ctx() as conn:
-                cursor = conn.execute(
-                    "SELECT * FROM messages WHERE session_id = ?" + active_clause
-                    + " ORDER BY id ASC",
-                    [session_id],
-                )
-                all_rows = cursor.fetchall()
-            seen: dict = {}
-            for row in all_rows:
-                dedupe_content = row["content"]
-                if row["role"] == "user":
-                    from agent.context_compressor import split_user_originated_turn
-
-                    candidate = {
-                        "role": "user",
-                        "content": self._decode_content(row["content"]),
-                        "display_kind": row["display_kind"],
-                        "display_metadata": self._decode_display_metadata(
-                            row["display_metadata"]
-                        ),
-                    }
-                    handoff, live_view = split_user_originated_turn(candidate)
-                    if handoff is not None and live_view is not None:
-                        dedupe_content = self._encode_content(
-                            live_view.get("content")
-                        )
-                # Tool fields participate in the dedupe key: compaction copies
-                # them verbatim, so identical tool messages across generations
-                # still collapse, while distinct tool calls that happen to
-                # share role/content/timestamp are never merged.
-                key = (
-                    row["role"],
-                    dedupe_content,
-                    row["timestamp"],
-                    row["tool_call_id"],
-                    row["tool_calls"],
-                    row["tool_name"],
-                )
-                cur = seen.get(key)
-                if cur is None or (row["active"], row["id"]) > (cur["active"], cur["id"]):
-                    seen[key] = row
-            rows = sorted(seen.values(), key=lambda r: r["id"])
-            if latest:
-                rows = rows[::-1]
-            rows = rows[offset:]
-            if limit is not None:
-                rows = rows[:limit]
-            if latest:
-                rows = rows[::-1]
-        else:
-            if limit is not None or offset:
-                # SQLite's OFFSET requires LIMIT; -1 means "no limit".
-                sql += " LIMIT ? OFFSET ?"
-                params.extend([-1 if limit is None else limit, offset])
-            with self._read_ctx() as conn:
-                cursor = conn.execute(sql, params)
-                rows = cursor.fetchall()
-            if latest:
-                rows.reverse()
-        result = []
-        for row in rows:
-            msg = dict(row)
-            if msg.pop("_compressed_summary", 0):
-                msg["_compressed_summary"] = True
-            if "content" in msg:
-                msg["content"] = self._decode_content(msg["content"])
-            if msg.get("tool_calls"):
-                try:
-                    msg["tool_calls"] = json.loads(msg["tool_calls"])
-                except (json.JSONDecodeError, TypeError):
-                    logger.warning("Failed to deserialize tool_calls in get_messages, falling back to []")
-                    msg["tool_calls"] = []
-            if msg.get("display_metadata") is not None:
-                msg["display_metadata"] = self._decode_display_metadata(msg["display_metadata"])
-            result.append(msg)
-        return result
-
-    def find_pr_url_messages(self, session_ids: List[str]) -> List[Dict[str, Any]]:
-        """Tool results in these sessions that mention a GitHub PR url.
-
-        A candidate scan, deliberately loose: it hands back every tool result
-        containing ``/pull/`` and leaves the caller to decide which ones make a
-        claim (see the desktop's PR recovery, which only accepts an output that
-        is a bare PR url â€” the signature of ``gh pr create``). Ordered
-        oldest-first per session so the caller can take the last match.
-        """
-        found: List[Dict[str, Any]] = []
-        ids = [s for s in session_ids if s]
-        for start in range(0, len(ids), 900):  # SQLite's bound-variable ceiling.
-            chunk = ids[start : start + 900]
-            placeholders = ",".join("?" * len(chunk))
-            with self._read_ctx() as conn:
-                rows = conn.execute(
-                    f"""SELECT session_id, content FROM messages
-                        WHERE session_id IN ({placeholders})
-                          AND role = 'tool' AND content LIKE '%/pull/%'
-                        ORDER BY id ASC""",
-                    chunk,
-                ).fetchall()
-            found.extend({"session_id": row[0], "content": row[1]} for row in rows)
-        return found
-
-    def get_messages_around(
-        self,
-        session_id: str,
-        around_message_id: int,
-        window: int = 5,
-    ) -> Dict[str, Any]:
-        """Load a window of messages anchored on a specific message id.
-
-        Returns a dict with:
-          - ``window``: up to ``window`` messages before the anchor, the anchor
-            itself, and up to ``window`` messages after, ordered by id ascending.
-          - ``messages_before``: count of messages strictly before the anchor
-            still in the session (== window unless we hit the start).
-          - ``messages_after``: count of messages strictly after the anchor
-            still in the session (== window unless we hit the end).
-
-        Used by ``session_search`` for both the discovery shape (anchored on the
-        FTS5 match) and the scroll shape (anchored on any message id). The
-        ``messages_before`` / ``messages_after`` counts let the caller detect
-        session boundaries: when either is less than ``window``, the agent has
-        reached one end of the session.
-
-        Returns an empty window when ``around_message_id`` is not a real id in
-        ``session_id`` â€” callers decide how to surface that.
-        """
-        if window < 0:
-            window = 0
-        with self._read_ctx() as conn:
-            # Confirm the anchor exists in this session.
-            anchor_exists = conn.execute(
-                "SELECT 1 FROM messages WHERE id = ? AND session_id = ? LIMIT 1",
-                (around_message_id, session_id),
-            ).fetchone()
-            if not anchor_exists:
-                return {"window": [], "messages_before": 0, "messages_after": 0}
-
-            # Two queries: anchor + before (DESC, take window+1), and after
-            # (ASC, take window). Final order is id ASC.
-            before_rows = conn.execute(
-                "SELECT * FROM messages "
-                "WHERE session_id = ? AND id <= ? "
-                "ORDER BY id DESC LIMIT ?",
-                (session_id, around_message_id, window + 1),
-            ).fetchall()
-            after_rows = conn.execute(
-                "SELECT * FROM messages "
-                "WHERE session_id = ? AND id > ? "
-                "ORDER BY id ASC LIMIT ?",
-                (session_id, around_message_id, window),
-            ).fetchall()
-
-        # before_rows is DESC; reverse so it's ASC, then concatenate after_rows.
-        rows = list(reversed(before_rows)) + list(after_rows)
-        result = []
-        for row in rows:
-            msg = dict(row)
-            if "content" in msg:
-                msg["content"] = self._decode_content(msg["content"])
-            if msg.get("tool_calls"):
-                try:
-                    msg["tool_calls"] = json.loads(msg["tool_calls"])
-                except (json.JSONDecodeError, TypeError):
-                    logger.warning(
-                        "Failed to deserialize tool_calls in get_messages_around, falling back to []"
-                    )
-                    msg["tool_calls"] = []
-            if msg.get("display_metadata") is not None:
-                msg["display_metadata"] = self._decode_display_metadata(msg["display_metadata"])
-            result.append(msg)
-
-        # before_rows includes the anchor itself; subtract 1 for the count of
-        # messages strictly before the anchor in the returned slice.
-        messages_before = max(0, len(before_rows) - 1)
-        messages_after = len(after_rows)
-        return {
-            "window": result,
-            "messages_before": messages_before,
-            "messages_after": messages_after,
-        }
-
-    def resolve_resume_session_id(self, session_id: str) -> str:
-        """Redirect a resume target to the descendant session that holds the messages.
-
-        Context compression ends the current session and forks a new child session
-        (linked via ``parent_session_id``). The flush cursor is reset, so the
-        child is where new messages actually land â€” the parent ends up with
-        ``message_count = 0`` rows unless messages had already been flushed to
-        it before compression. See #15000.
-
-        This helper walks ``parent_session_id`` forward from ``session_id`` and
-        returns the descendant in the chain that has the **most recent** messages.
-        Unlike the original logic, it does NOT short-circuit when the starting
-        session already has messages â€” a descendant that was created by
-        compression may hold the continuation content and should be preferred
-        by the WebUI and gateway for ``--resume`` and session loading.
-
-        If no descendant (including the starting session) has any messages,
-        the original ``session_id`` is returned unchanged.
-
-        The chain is always walked via the child whose ``started_at`` is
-        latest; that matches the single-chain shape that compression creates.
-        A depth cap (32) guards against accidental loops in malformed data.
-        """
-        if not session_id:
-            return session_id
-
-        # Follow the compression-continuation chain forward to the live tip
-        # FIRST. Auto-compression ends the current session and forks a
-        # continuation child, but a long-lived parent keeps its own flushed
-        # message rows â€” so the empty-head walk below never redirects it, and
-        # resuming the parent id reloads the pre-compression transcript while
-        # the turns generated *after* compression (and their responses) sit in
-        # the continuation. ``get_compression_tip`` is lineage-aware: it only
-        # follows children whose parent ended with ``end_reason='compression'``
-        # (created after the parent was ended), so delegation / branch children
-        # never hijack the resume. This is the fix for the desktop "I came back
-        # and the reply isn't there" report on large sessions.
-        try:
-            tip = self.get_compression_tip(session_id)
-        except Exception:
-            tip = session_id
-        if tip and tip != session_id:
-            session_id = tip
-
-        with self._read_ctx() as conn:
-            current = session_id
-            seen = {current}
-            best = None  # tracks the last (deepest) node with messages
-
-            for _ in range(32):
-                # Check if the current node has messages.
-                try:
-                    row = conn.execute(
-                        "SELECT 1 FROM messages WHERE session_id = ? LIMIT 1",
-                        (current,),
-                    ).fetchone()
-                except Exception:
-                    return session_id
-                if row is not None:
-                    best = current
-
-                # Walk to the most-recently-started child â€” but skip explicit
-                # branch (`_branched_from`), delegate/subagent (`_delegate_from`),
-                # reset-continuation (`_reset_from` or the legacy same-key
-                # heuristic â€” a post-reset conversation must never be reached
-                # by resuming the parent the user reset away), and tool
-                # children. They also carry a ``parent_session_id`` yet
-                # are NOT compression continuations; following them would hijack
-                # the resume target to an unrelated session (e.g. a subagent
-                # run). This mirrors the child-exclusion in ``get_compression_tip``.
-                try:
-                    child_row = conn.execute(
-                        "SELECT id FROM sessions AS child "
-                        "WHERE child.parent_session_id = ? "
-                        "  AND json_extract(COALESCE(child.model_config, '{}'), '$._branched_from') IS NULL "
-                        "  AND json_extract(COALESCE(child.model_config, '{}'), '$._delegate_from') IS NULL "
-                        "  AND json_extract(COALESCE(child.model_config, '{}'), '$._reset_from') IS NULL "
-                        f"  AND NOT {_legacy_reset_child_sql('child', _RESET_END_REASONS_SQL)} "
-                        "  AND COALESCE(child.source, '') != 'tool' "
-                        "ORDER BY child.started_at DESC, child.id DESC LIMIT 1",
-                        (current,),
-                    ).fetchone()
-                except Exception:
-                    return session_id
-                if child_row is None:
-                    break
-                child_id = child_row["id"] if hasattr(child_row, "keys") else child_row[0]
-                if not child_id or child_id in seen:
-                    break
-                seen.add(child_id)
-                current = child_id
-
-            return best if best is not None else session_id
-
-    def get_messages_as_conversation(
-        self,
-        session_id: str,
-        include_ancestors: bool = False,
-        include_inactive: bool = False,
-        repair_alternation: bool = False,
-        include_row_ids: bool = False,
-    ) -> List[Dict[str, Any]]:
-        """
-        Load messages in the OpenAI conversation format (role + content dicts).
-        Used by the gateway to restore conversation history.
-
-        By default only active messages are returned. Pass
-        ``include_inactive=True`` to load soft-deleted (rewound) rows
-        as well. See :meth:`rewind_to_message`.
-
-        ``repair_alternation=True`` runs ``repair_message_sequence`` over the
-        loaded list before returning it. Callers that restore a session for
-        LIVE REPLAY should pass it: a durable alternation violation (e.g. a
-        ``user;user`` pair left by a turn that persisted no assistant row)
-        otherwise re-triggers the pre-request defensive repair on every
-        single request for the rest of the session's life â€” the repair
-        mutates only the per-request list, never the stored transcript.
-        Inspection/export consumers keep the default and see the transcript
-        verbatim.
-        """
-        session_ids = [session_id]
-        if include_ancestors and not self._is_explicit_branch_session(session_id):
-            session_ids = self._session_lineage_root_to_tip(session_id)
-
-        active_clause = "" if include_inactive else " AND active = 1"
-        with self._read_ctx() as conn:
-            placeholders = ",".join("?" for _ in session_ids)
-            rows = conn.execute(
-                f"SELECT {self._CONVERSATION_ROW_COLUMNS} "
-                f"FROM messages WHERE session_id IN ({placeholders})"
-                # Order by AUTOINCREMENT id (true insertion order), NOT timestamp:
-                # append_message stamps rows with time.time(), which is not
-                # monotonic (WSL2, NTP steps, VM/laptop sleep resume). A later
-                # row can carry an earlier timestamp than its predecessor, and
-                # ORDER BY timestamp would then sort an assistant tool_calls row
-                # after its tool response, breaking tool-call/response adjacency
-                # and triggering an HTTP 400 on replay. This matches get_messages
-                # â€” see c03acca50 for the original fix.
-                f"{active_clause} ORDER BY id",
-                tuple(session_ids),
-            ).fetchall()
-
-        return self._rows_to_conversation(
-            rows,
-            session_id=session_id,
-            include_ancestors=include_ancestors,
-            repair_alternation=repair_alternation,
-            include_row_ids=include_row_ids,
-        )
-
-    # Columns every conversation projection decodes. Shared by
-    # get_messages_as_conversation and get_resume_conversations so a single
-    # SELECT can feed both the model-fed and display views.
-    _CONVERSATION_ROW_COLUMNS = (
-        "id, role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
-        "finish_reason, reasoning, reasoning_content, reasoning_details, "
-        "codex_reasoning_items, codex_message_items, platform_message_id, observed, "
-        "_compressed_summary, timestamp, active, api_content, display_kind, display_metadata"
-    )
-
-    def _rows_to_conversation(
-        self,
-        rows,
-        *,
-        session_id: str,
-        include_ancestors: bool,
-        repair_alternation: bool,
-        include_row_ids: bool = False,
-        include_summary_markers: bool = False,
-    ) -> List[Dict[str, Any]]:
-        """Decode fetched message rows into the OpenAI conversation format.
-
-        Extracted from get_messages_as_conversation so get_resume_conversations
-        can build the model-fed and display views from one SELECT. ``rows`` must
-        already be ordered by ``id`` (insertion order) and filtered to the
-        desired session set / active state by the caller.
-        """
-        messages = []
-        # Watermark rotation column-clones concurrent tail rows into the child
-        # after the new summary, so the copies need not be adjacent. Index the
-        # exact durable clone identity while decoding instead of rescanning the
-        # whole accumulated lineage for every user row.
-        exact_user_clones: Dict[Tuple[Any, str], Dict[str, Any]] = {}
-        for row in rows:
-            content = self._decode_content(row["content"])
-            if row["role"] in {"user", "assistant"} and isinstance(content, str):
-                content = sanitize_context(content).strip()
-            msg = {"role": row["role"], "content": content}
-            # Born durable (#92231): this dict is materialized FROM a durable
-            # row, so stamp the persistence marker at the source instead of
-            # relying on every restore caller to thread the loaded list back
-            # through a flush as ``conversation_history=`` â€” any
-            # identity-losing handoff (compression's durable-snapshot
-            # adoption, incremental persists with no history arg) would
-            # otherwise re-append the ENTIRE transcript on flush.
-            # Underscore-prefixed like ``_row_id``: every transport strips it
-            # before the wire, and compression's assembly copies deliberately
-            # strip it so rotated child handoffs still flush (see
-            # _fresh_compaction_message_copy).
-            msg[_DB_PERSISTED_MARKER_KEY] = True
-            # Durable per-message identity for surfaces that need to address a
-            # specific row later (desktop reactions). OPT-IN: only the gateway
-            # asks for it â€” every other consumer (ACP restore, export,
-            # inspection) gets the transcript in its historical shape.
-            # Underscore-prefixed so every transport's convert_messages()
-            # strips it before the wire.
-            if include_row_ids and row["id"] is not None:
-                msg["_row_id"] = row["id"]
-            # api_content is the byte-fidelity sidecar: the exact string sent
-            # to the API when it differed from the clean content. Returned
-            # VERBATIM â€” no sanitize_context, no strip â€” because the replay
-            # path substitutes it for content to keep the provider prompt
-            # cache prefix byte-stable across turns. Cleaning it here would
-            # re-introduce the divergence it exists to remove.
-            if row["api_content"]:
-                msg["api_content"] = row["api_content"]
-            if row["display_kind"]:
-                msg["display_kind"] = row["display_kind"]
-            if row["display_metadata"]:
-                decoded = self._decode_display_metadata(row["display_metadata"])
-                if decoded is not None:
-                    msg["display_metadata"] = decoded
-            if include_summary_markers and row["_compressed_summary"]:
-                msg["_compressed_summary"] = True
-            if row["timestamp"]:
-                msg["timestamp"] = row["timestamp"]
-            if row["tool_call_id"]:
-                msg["tool_call_id"] = row["tool_call_id"]
-            if row["tool_name"]:
-                msg["tool_name"] = row["tool_name"]
-            if row["effect_disposition"]:
-                msg["effect_disposition"] = row["effect_disposition"]
-            if row["tool_calls"]:
-                try:
-                    msg["tool_calls"] = json.loads(row["tool_calls"])
-                except (json.JSONDecodeError, TypeError):
-                    logger.warning("Failed to deserialize tool_calls in conversation replay, falling back to []")
-                    msg["tool_calls"] = []
-            # Surface the platform-side message id (e.g. yuanbao msg_id,
-            # telegram update_id) so platform-specific flows like recall
-            # can match by external identifier instead of having to fall
-            # back to content-match heuristics.  Exposed as ``message_id``
-            # for backward compatibility with the JSONL transcript shape.
-            if row["platform_message_id"]:
-                msg["message_id"] = row["platform_message_id"]
-            if row["observed"]:
-                msg["observed"] = True
-            # Restore reasoning fields on assistant messages so providers
-            # that replay reasoning (OpenRouter, OpenAI, Nous) receive
-            # coherent multi-turn reasoning context.
-            if row["role"] == "assistant":
-                if row["finish_reason"]:
-                    msg["finish_reason"] = row["finish_reason"]
-                if row["reasoning"]:
-                    msg["reasoning"] = row["reasoning"]
-                if row["reasoning_content"] is not None:
-                    msg["reasoning_content"] = row["reasoning_content"]
-                if row["reasoning_details"]:
-                    try:
-                        msg["reasoning_details"] = json.loads(row["reasoning_details"])
-                    except (json.JSONDecodeError, TypeError):
-                        logger.warning("Failed to deserialize reasoning_details, falling back to None")
-                        msg["reasoning_details"] = None
-                if row["codex_reasoning_items"]:
-                    try:
-                        msg["codex_reasoning_items"] = json.loads(row["codex_reasoning_items"])
-                    except (json.JSONDecodeError, TypeError):
-                        logger.warning("Failed to deserialize codex_reasoning_items, falling back to None")
-                        msg["codex_reasoning_items"] = None
-                if row["codex_message_items"]:
-                    try:
-                        msg["codex_message_items"] = json.loads(row["codex_message_items"])
-                    except (json.JSONDecodeError, TypeError):
-                        logger.warning("Failed to deserialize codex_message_items, falling back to None")
-                        msg["codex_message_items"] = None
-            if include_ancestors:
-                canonical_content, _is_composite = (
-                    self._canonical_replayed_user_content(msg)
-                )
-                exact_clone_key = self._exact_replayed_user_clone_key(
-                    msg.get("timestamp"), canonical_content
-                )
-                previous_exact = (
-                    exact_user_clones.get(exact_clone_key)
-                    if exact_clone_key is not None
-                    else None
-                )
-                duplicate = None
-                if previous_exact is not None:
-                    previous_index = next(
-                        (
-                            index
-                            for index, candidate in enumerate(messages)
-                            if candidate is previous_exact
-                        ),
-                        None,
-                    )
-                    if previous_index is not None:
-                        duplicate = (previous_index, True)
-                if duplicate is None:
-                    duplicate = self._find_duplicate_replayed_user_message(
-                        messages, msg
-                    )
-                if duplicate is not None:
-                    duplicate_index, prefer_current = duplicate
-                    if prefer_current:
-                        # A rotated compression child can carry the same live
-                        # ask as the parent row plus the only surviving summary
-                        # scaffold. Keep the child carrier (and its durable row
-                        # id), not the simpler ancestor copy.
-                        messages.pop(duplicate_index)
-                    else:
-                        continue
-            messages.append(msg)
-            if include_ancestors and exact_clone_key is not None:
-                exact_user_clones[exact_clone_key] = msg
-        # DEFENSE-IN-DEPTH against background-review session pollution: a forked
-        # skill/memory review that (in older builds, before the _persist_disabled
-        # fix) shared the parent's session_id wrote its harness turn into this
-        # real session. The harness is a user/system message instructing the
-        # agent to "Review the conversation above and update the skill library /
-        # save to memory" under a hard tool restriction; re-loading it as live
-        # history makes the agent adopt the curator role and refuse the user's
-        # actual task. Strip any such harness message AND the curator-mode
-        # assistant reply immediately following it, so a polluted session
-        # resumes clean even if stray rows exist.
-        messages = _strip_background_review_harness(messages)
-        # DEFENSE-IN-DEPTH against #78148: before that fix, a bare tool-call
-        # marker (e.g. "[memory]") could get cached as a fallback and
-        # persisted as if it were the model's real answer. Sessions written
-        # before the fix can still carry those rows â€” clear the stray
-        # content on load so replaying history doesn't re-teach the model
-        # to keep emitting the marker. No-op for unaffected sessions.
-        messages = _strip_stale_tool_call_markers(messages)
-        if repair_alternation and messages:
-            # Lazy import: hermes_state already depends on agent.* (see
-            # sanitize_context above), but keep this optional path from
-            # widening the import surface at module load.
-            from agent.agent_runtime_helpers import repair_message_sequence
-
-            repaired = repair_message_sequence(None, messages)
-            if repaired:
-                logger.info(
-                    "Repaired %d message-alternation violation(s) while "
-                    "restoring session %s â€” durable transcript kept them, "
-                    "see repair_message_sequence",
-                    repaired,
-                    session_id,
-                )
-        return messages
-
-    def get_resume_conversations(
-        self, session_id: str
-    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        """Return ``(model_history, display_history)`` for a session resume in ONE SELECT.
-
-        ``session.resume`` needs two projections of the same lineage:
-
-        - ``model_history`` â€” the tip session's active rows, alternation-repaired
-          (the live-replay working conversation). Equivalent to
-          ``get_messages_as_conversation(session_id, repair_alternation=True)``.
-        - ``display_history`` â€” the full compression lineage (ancestors â†’ tip),
-          verbatim, with replayed-user dedup. Explicit ``/branch`` sessions are
-          excluded from this lineage because their own rows already contain the
-          copied transcript; including the live parent's rows would let messages
-          written to the original after the fork leak into the branch.
-
-        The display fetch already reads a superset of the model fetch (the tip
-        rows are part of the lineage), so serving both from one lineage SELECT
-        halves the resume's DB work versus two separate calls, with byte-identical
-        output (see test_get_resume_conversations_matches_separate_reads).
-        """
-        session_ids = (
-            [session_id]
-            if self._is_explicit_branch_session(session_id)
-            else self._session_lineage_root_to_tip(session_id)
-        )
-        with self._read_ctx() as conn:
-            placeholders = ",".join("?" for _ in session_ids)
-            rows = conn.execute(
-                f"SELECT session_id, {self._CONVERSATION_ROW_COLUMNS} "
-                f"FROM messages WHERE session_id IN ({placeholders}) AND active = 1 "
-                # ORDER BY id (insertion order) â€” see get_messages_as_conversation
-                # for why timestamp ordering is unsafe.
-                "ORDER BY id",
-                tuple(session_ids),
-            ).fetchall()
-
-        # Tip rows are exactly the model-fed set (get_messages_as_conversation
-        # with session_ids=[session_id]); filtering the lineage fetch preserves
-        # their relative id order.
-        tip_rows = [r for r in rows if r["session_id"] == session_id]
-        model_history = self._rows_to_conversation(
-            tip_rows,
-            session_id=session_id,
-            include_ancestors=False,
-            repair_alternation=True,
-            include_row_ids=True,
-            # Pre-compress checkpointing: the resumed model history must keep
-            # the summary marker so checkpoint providers can exclude derivative
-            # summaries after a process restart (marker survives restart).
-            include_summary_markers=True,
-        )
-        display_history = self._rows_to_conversation(
-            rows,
-            session_id=session_id,
-            include_ancestors=True,
-            repair_alternation=False,
-            include_row_ids=True,
-        )
-        return model_history, display_history
-
-
-
-    def assert_export_safe(
-        self,
-        session_id: str,
-        max_messages: Optional[int] = None,
-    ) -> int:
-        """Return active row count or reject an unsafe in-memory export.
-
-        Exporting one session does not include compression ancestors, so this
-        guard deliberately counts only the requested segment. The limited
-        subquery stops as soon as it proves the transcript exceeds the bound.
-
-        ``max_messages=None`` resolves the limit from config
-        (``sessions.max_export_messages``); 0 disables the guard and returns
-        the active row count without raising.
-        """
-        if max_messages is None:
-            max_messages = resolved_max_export_messages()
-        if max_messages < 0:
-            raise ValueError("max_messages must be non-negative")
-        if max_messages == 0:
-            # Guard disabled by config â€” skip the COUNT; live callers use
-            # this for its raise side effect only (and skip calling it
-            # entirely when the limit is 0).
-            return 0
-        with self._read_ctx() as conn:
-            row = conn.execute(
-                "SELECT COUNT(*) FROM ("
-                "SELECT 1 FROM messages WHERE session_id = ? AND active = 1 LIMIT ?"
-                ")",
-                (session_id, max_messages + 1),
-            ).fetchone()
-        message_count = int(row[0] if row else 0)
-        if message_count > max_messages:
-            raise SessionExportTooLargeError(session_id, message_count, max_messages)
-        return message_count
-
-    def get_ancestor_display_prefix(self, session_id: str) -> List[Dict[str, Any]]:
-        """Return the ancestor-only display messages for a session lineage.
-
-        These are messages from parent/grandparent sessions (compression
-        ancestors) that appear in the display transcript but NOT in the
-        tip session's model-fed history. Used by ``session.resume`` to
-        build the ``display_history_prefix`` that ``_live_session_payload``
-        prepends to the live model history.
-
-        Previously the prefix was calculated as
-        ``display_history[:len(display) - len(raw)]``, but that overcounts
-        when ``repair_message_sequence`` removes messages from the MIDDLE
-        of the tip history (e.g. verification candidates collapsed by the
-        consecutive-assistant merge) â€” the length difference includes both
-        ancestor messages AND repair-removed tip messages, but the slice
-        only captures the first N display messages (which are tip messages
-        when there are no ancestors), causing duplication. This method
-        returns ONLY the genuine ancestor messages, identified by
-        ``session_id != tip_session_id``. (#65919)
-        """
-        if self._is_explicit_branch_session(session_id):
-            return []
-
-        session_ids = self._session_lineage_root_to_tip(session_id)
-        if len(session_ids) <= 1:
-            return []
-        with self._read_ctx() as conn:
-            placeholders = ",".join("?" for _ in session_ids)
-            rows = conn.execute(
-                f"SELECT session_id, {self._CONVERSATION_ROW_COLUMNS} "
-                f"FROM messages WHERE session_id IN ({placeholders}) AND active = 1 "
-                "ORDER BY id",
-                tuple(session_ids),
-            ).fetchall()
-        ancestor_ids = {
-            int(row["id"])
-            for row in rows
-            if row["session_id"] != session_id and row["id"] is not None
-        }
-        if not ancestor_ids:
-            return []
-        lineage = self._rows_to_conversation(
-            rows,
-            session_id=session_id,
-            include_ancestors=True,
-            repair_alternation=False,
-            include_row_ids=True,
-        )
-        prefix: List[Dict[str, Any]] = []
-        for message in lineage:
-            if message.get("_row_id") not in ancestor_ids:
-                continue
-            projected = message.copy()
-            projected.pop("_row_id", None)
-            prefix.append(projected)
-        return prefix
-
-    def _is_explicit_branch_session(self, session_id: str) -> bool:
-        """Return whether *session_id* is a copied user-facing branch.
-
-        Branches and compression continuations both use ``parent_session_id``,
-        but they have different history semantics: a branch owns a copied
-        transcript, while a compression continuation needs its ended parent's
-        archived rows for display. The durable ``_branched_from`` marker is the
-        existing discriminator written by all branch creation paths.
-        """
-        if not session_id:
-            return False
-        with self._read_ctx() as conn:
-            row = conn.execute(
-                "SELECT model_config FROM sessions WHERE id = ?",
-                (session_id,),
-            ).fetchone()
-        if row is None:
-            return False
-        raw_config = row["model_config"] if hasattr(row, "keys") else row[0]
-        if not raw_config:
-            return False
-        try:
-            config = json.loads(raw_config) if isinstance(raw_config, str) else raw_config
-        except (json.JSONDecodeError, TypeError):
-            return False
-        return isinstance(config, dict) and bool(config.get("_branched_from"))
-
-    def get_conversation_root(self, session_id: str) -> str:
-        """Return the ROOT id of *session_id*'s lineage chain.
-
-        The root is the stable "conversation id": context compression
-        rotates ``session_id`` to a new segment linked via
-        ``parent_session_id``, and delegate subagents hang off their
-        parent the same way. Walking to the root gives every segment of
-        one user-facing conversation (and its delegation tree) a single
-        identifier â€” used for Nous Portal ``conversation=`` usage tagging.
-        Returns *session_id* unchanged when it has no recorded parent.
-        """
-        chain = self._session_lineage_root_to_tip(session_id)
-        return (chain[0] if chain and chain[0] else session_id)
-
-    def _session_lineage_root_to_tip(self, session_id: str) -> List[str]:
-        if not session_id:
-            return [session_id]
-
-        chain = []
-        current = session_id
-        seen = set()
-        with self._read_ctx() as conn:
-            for _ in range(100):
-                if not current or current in seen:
-                    break
-                seen.add(current)
-                chain.append(current)
-                row = conn.execute(
-                    "SELECT parent_session_id FROM sessions WHERE id = ?",
-                    (current,),
-                ).fetchone()
-                if row is None:
-                    break
-                current = row["parent_session_id"] if hasattr(row, "keys") else row[0]
-        return list(reversed(chain)) or [session_id]
-
-    @staticmethod
-    def _canonical_replayed_user_content(
-        msg: Dict[str, Any],
-    ) -> Tuple[Any, bool]:
-        """Return canonical live content and whether *msg* is composite."""
-        if msg.get("role") != "user":
-            return None, False
-
-        from agent.context_compressor import split_user_originated_turn
-
-        handoff, live_view = split_user_originated_turn(msg)
-        is_composite = handoff is not None and live_view is not None
-        return (
-            live_view.get("content")
-            if is_composite and live_view is not None
-            else msg.get("content"),
-            is_composite,
-        )
-
-    @staticmethod
-    def _exact_replayed_user_clone_key(
-        timestamp: Any, content: Any
-    ) -> Optional[Tuple[Any, str]]:
-        """Return a hashable key for a column-exact rotation clone."""
-        if timestamp is None or content in (None, "", []):
-            return None
-        try:
-            encoded = json.dumps(
-                content,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-        except (TypeError, ValueError):
-            return None
-        return timestamp, encoded
-
-    @staticmethod
-    def _find_duplicate_replayed_user_message(
-        messages: List[Dict[str, Any]], msg: Dict[str, Any]
-    ) -> Optional[Tuple[int, bool]]:
-        """Return an adjacent replay duplicate and whether *msg* must win.
-
-        Compression rotation may persist the current ask once in the parent
-        and again inside a composite child carrier. Compare the canonical live
-        payload for that carrier, while retaining the historical exact-string
-        dedupe for ordinary replayed users. The child carrier wins because it
-        owns both the current durable row identity and the retained scaffold.
-        """
-        if msg.get("role") != "user":
-            return None
-
-        content, prefer_current = SessionDB._canonical_replayed_user_content(msg)
-        if content in (None, "", []):
-            return None
-
-        for index in range(len(messages) - 1, -1, -1):
-            prev = messages[index]
-            if prev.get("role") == "user":
-                prev_content, prev_is_composite = (
-                    SessionDB._canonical_replayed_user_content(prev)
-                )
-                if prev_content == content and (
-                    prefer_current
-                    or prev_is_composite
-                    or isinstance(content, str)
-                ):
-                    return index, prefer_current
-            if prev.get("role") == "assistant" and (prev.get("content") or prev.get("tool_calls")):
-                return None
-        return None
-
-    @staticmethod
-    def _is_duplicate_replayed_user_message(
-        messages: List[Dict[str, Any]], msg: Dict[str, Any]
-    ) -> bool:
-        return SessionDB._find_duplicate_replayed_user_message(messages, msg) is not None
-
-    # =========================================================================
-    # Rewind (soft-delete) â€” see /rewind slash command + issue #21910
-    # =========================================================================
-
-    def get_active_message_ids(self, session_id: str) -> List[int]:
-        """Return the ordered physical ids pinned by rewind CAS checks.
-
-        Conversation projections intentionally omit legacy background-review
-        harness rows.  Destructive rewinds must nevertheless pin every active
-        physical row so the caller snapshot matches the transaction-local
-        comparison in :meth:`rewind_to_message`.
-        """
-        with self._read_ctx() as conn:
-            rows = conn.execute(
-                "SELECT id FROM messages "
-                "WHERE session_id = ? AND active = 1 ORDER BY id",
-                (session_id,),
-            ).fetchall()
-        return [int(row[0]) for row in rows]
-
-    @staticmethod
-    def _active_transcript_counts(conn, session_id: str) -> tuple[int, int]:
-        """Return active message/tool-call counts inside the caller's txn."""
-        rows = conn.execute(
-            "SELECT tool_calls FROM messages "
-            "WHERE session_id = ? AND active = 1",
-            (session_id,),
-        ).fetchall()
-        tool_call_count = 0
-        for row in rows:
-            raw = row[0]
-            if not raw:
-                continue
-            try:
-                decoded = json.loads(raw) if isinstance(raw, str) else raw
-            except (json.JSONDecodeError, TypeError):
-                continue
-            if isinstance(decoded, list):
-                tool_call_count += len(decoded)
-            elif decoded:
-                tool_call_count += 1
-        return len(rows), tool_call_count
-
-    def rewind_to_message(
-        self,
-        session_id: str,
-        target_message_id: int,
-        *,
-        preserve_compaction_handoff: bool = False,
-        expected_active_ids: Optional[List[int]] = None,
-        expected_target_content: Any = None,
-    ) -> Dict[str, Any]:
-        """Soft-delete all messages with id >= ``target_message_id`` in *session_id*.
-
-        The target message itself becomes inactive as well so the caller
-        can pre-fill it as the next user prompt without it appearing
-        twice in the replayed transcript.  Rewound rows are kept on
-        disk with ``active=0`` for audit / forensic inspection â€” use
-        :meth:`get_messages` with ``include_inactive=True`` to see them.
-
-        Returns a dict::
-
-            {
-                "rewound_count": int,    # number of rows newly flipped to active=0
-                "target_message": dict,  # full row dict of the target
-                "new_head_id":   int|None  # id of the last still-active row, or None
-            }
-
-        Raises ``ValueError`` if the target message does not exist in
-        *session_id* or if its role is not ``"user"``.  With
-        ``preserve_compaction_handoff=True``, a composite summary carrier is
-        split inside the same write transaction: its original row is archived
-        and its canonical hidden handoff scaffold is inserted as the new head.
-        That opt-in result also contains ``replacement_message_id``.
-
-        ``expected_active_ids`` optionally pins the ordered active row set.
-        ``expected_target_content`` additionally pins the selected canonical
-        live-user payload.  Both checks run inside the write transaction before
-        any row or counter mutation.  Presentation-only metadata changes (for
-        example Desktop reactions) deliberately do not invalidate a rewind.
-        A live cross-process turn lease always refuses the rewind; expired or
-        provably dead holders are reclaimed inside the mutation transaction.
-
-        Always increments ``sessions.rewind_count`` â€” even when the
-        target is already inactive â€” so the counter accurately reflects
-        the number of rewind operations performed against the session.
-        Idempotent on the ``active`` flag: re-rewinding past the same
-        target is a no-op on row state but still bumps the counter.
-        """
-
-        def _do(conn):
-            # Rewind changes the active transcript and must honor the same
-            # compression/closed-parent and cross-process turn guards as
-            # append writers.
-            self._check_transcript_write_guards(
-                conn,
-                session_id,
-                None,
-                reject_active_turn_lease=True,
-                reject_active_compression_lock=True,
-            )
-
-            if expected_active_ids is not None:
-                active_rows = conn.execute(
-                    "SELECT id FROM messages "
-                    "WHERE session_id = ? AND active = 1 ORDER BY id",
-                    (session_id,),
-                ).fetchall()
-                active_ids = [int(active_row[0]) for active_row in active_rows]
-                if active_ids != expected_active_ids:
-                    raise RuntimeError(
-                        "active transcript changed before the rewind could be persisted"
-                    )
-
-            row = conn.execute(
-                "SELECT * FROM messages WHERE id = ? AND session_id = ?",
-                (target_message_id, session_id),
-            ).fetchone()
-            if row is None:
-                raise ValueError(
-                    f"message {target_message_id} not found in session {session_id}"
-                )
-            target_row = dict(row)
-            if target_row.get("role") != "user":
-                raise ValueError(
-                    f"rewind target must be a 'user' message (got role="
-                    f"{target_row.get('role')!r}, id={target_message_id})"
-                )
-
-            replacement_message_id: Optional[int] = None
-            replacement: Optional[Dict[str, Any]] = None
-            if preserve_compaction_handoff or expected_target_content is not None:
-                if not target_row.get("active"):
-                    raise ValueError("rewind target is not active")
-                from agent.context_compressor import split_user_originated_turn
-
-                split_target = target_row.copy()
-                split_target["content"] = self._decode_content(
-                    split_target.get("content")
-                )
-                split_target["display_metadata"] = self._decode_display_metadata(
-                    split_target.get("display_metadata")
-                )
-                handoff, live_view = split_user_originated_turn(split_target)
-                if live_view is None:
-                    raise ValueError("rewind target is not a user-originated turn")
-                live_content = live_view.get("content")
-                if isinstance(live_content, str):
-                    live_content = sanitize_context(live_content).strip()
-                if (
-                    expected_target_content is not None
-                    and live_content != expected_target_content
-                ):
-                    raise RuntimeError(
-                        "rewind target changed before it could be persisted"
-                    )
-                if preserve_compaction_handoff and handoff is None:
-                    raise ValueError(
-                        "preserve_compaction_handoff requires an active composite carrier"
-                    )
-                replacement = handoff if preserve_compaction_handoff else None
-
-            cursor = conn.execute(
-                "SELECT id FROM messages "
-                "WHERE session_id = ? AND id >= ? AND active = 1",
-                (session_id, target_message_id),
-            )
-            ids = [r[0] for r in cursor.fetchall()]
-            if ids:
-                placeholders = ",".join("?" for _ in ids)
-                conn.execute(
-                    f"UPDATE messages SET active = 0 WHERE id IN ({placeholders})",
-                    ids,
-                )
-            if replacement is not None:
-                self._insert_message_rows(conn, session_id, [replacement])
-                inserted = conn.execute("SELECT last_insert_rowid()").fetchone()
-                replacement_message_id = int(inserted[0])
-            conn.execute(
-                "UPDATE sessions SET rewind_count = COALESCE(rewind_count, 0) + 1 "
-                "WHERE id = ?",
-                (session_id,),
-            )
-            message_count, tool_call_count = self._active_transcript_counts(
-                conn, session_id
-            )
-            conn.execute(
-                "UPDATE sessions SET message_count = ?, tool_call_count = ? "
-                "WHERE id = ?",
-                (message_count, tool_call_count, session_id),
-            )
-            head_row = conn.execute(
-                "SELECT MAX(id) FROM messages WHERE session_id = ? AND active = 1",
-                (session_id,),
-            ).fetchone()
-            new_head_id = (
-                head_row[0] if head_row and head_row[0] is not None else None
-            )
-            return target_row, ids, new_head_id, replacement_message_id
-
-        target_row, rewound, new_head_id, replacement_message_id = (
-            self._execute_write(_do)
-        )
-
-        # Decode content for callers (prefill the prompt buffer) without a
-        # second fallible database operation after the transaction commits.
-        target_row["content"] = self._decode_content(target_row.get("content"))
-
-        result = {
-            "rewound_count": len(rewound),
-            "target_message": target_row,
-            "new_head_id": new_head_id,
-        }
-        if preserve_compaction_handoff:
-            result["replacement_message_id"] = replacement_message_id
-        return result
-
-    def restore_rewound(self, session_id: str, since_message_id: int) -> int:
-        """Mark inactive messages with id >= *since_message_id* active again.
-
-        Returns the number of rows flipped back to ``active=1``.
-        Intended for undo-of-rewind and test cleanup; not wired to a
-        slash command in v1.
-        """
-        def _do(conn):
-            cursor = conn.execute(
-                "SELECT id FROM messages "
-                "WHERE session_id = ? AND id >= ? AND active = 0",
-                (session_id, since_message_id),
-            )
-            ids = [r[0] for r in cursor.fetchall()]
-            if ids:
-                placeholders = ",".join("?" for _ in ids)
-                conn.execute(
-                    f"UPDATE messages SET active = 1 WHERE id IN ({placeholders})",
-                    ids,
-                )
-            return len(ids)
-
-        return self._execute_write(_do)
-
-    # =========================================================================
-    # Search
-    # =========================================================================
-
-    def search_sessions(
-        self,
-        source: str = None,
-        limit: int = 20,
-        offset: int = 0,
-        workspace_key: str = None,
-    ) -> List[Dict[str, Any]]:
-        """List sessions, optionally filtered by source.
-
-        Returns rows enriched with a computed ``last_active`` column
-        (freshest of ``last_activity_at`` and latest message timestamp,
-        else ``started_at``), ordered by most-recently-used first.
-
-        Pass ``workspace_key`` to scope rows to one workspace - matching
-        :func:`workspace_key` semantics (git repo root, else cwd). Used by
-        ``hermes -c``/``--resume`` so the "last" session is the last one in
-        the *current* workspace, not the global MRU.
-        """
-        select_with_last_active = (
-            "SELECT s.*, "
-            "COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved, "
-            f"{_sql_session_last_active('s')} AS last_active "
-            "FROM sessions s "
-            "LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
-        )
-        where_clauses = []
-        params: list = []
-        if source:
-            where_clauses.append("s.source = ?")
-            params.append(source)
-        if workspace_key:
-            ws_clause, ws_params = _workspace_key_clause(workspace_key)
-            where_clauses.append(ws_clause)
-            params.extend(ws_params)
-        where_sql = f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
-        params.extend([limit, offset])
-        with self._lock:
-            cursor = self._conn.execute(
-                f"{select_with_last_active}"
-                f"{where_sql} "
-                "ORDER BY last_active DESC, s.started_at DESC, s.id DESC LIMIT ? OFFSET ?",
-                params,
-            )
-            return [self._session_row_dict(row) for row in cursor.fetchall()]
-
-    # =========================================================================
-    # Utility
-    # =========================================================================
-
-    def session_count(
-        self,
-        source: str = None,
-        sources: List[str] = None,
-        cwd_prefix: str = None,
-        min_message_count: int = 0,
-        include_archived: bool = False,
-        archived_only: bool = False,
-        exclude_children: bool = False,
-        exclude_sources: List[str] = None,
-    ) -> int:
-        """Count sessions, optionally filtered by source.
-
-        Pass ``exclude_children=True`` to count only the conversations that
-        ``list_sessions_rich`` surfaces (root + branch/reset sessions), hiding
-        sub-agent runs and compression continuations. Use it whenever the count
-        is paired with a ``list_sessions_rich`` page (e.g. sidebar "load more"
-        totals) so the total matches the number of listable rows â€” otherwise the
-        raw row count is inflated by children and "load more" never settles.
-
-        Pass ``exclude_sources`` to drop whole source classes from the count
-        (e.g. ``["cron"]`` so the recents "load more" total matches a
-        cron-excluded ``list_sessions_rich`` page and doesn't keep "load more"
-        stuck on for buried scheduler sessions).
-        """
-        where_clauses = []
-        params = []
-
-        if exclude_children:
-            # Mirror list_sessions_rich's child-exclusion clause exactly so the
-            # count lines up with the rows: roots plus user-visible branch/reset
-            # children.
-            where_clauses.append(_LISTABLE_CHILD_SQL)
-            where_clauses.append(f"{_delegate_from_json('s.model_config')} IS NULL")
-        include_sources = [source] if source else list(sources or [])
-        if include_sources:
-            placeholders = ",".join("?" for _ in include_sources)
-            where_clauses.append(f"s.source IN ({placeholders})")
-            params.extend(include_sources)
-        if exclude_sources:
-            placeholders = ",".join("?" for _ in exclude_sources)
-            where_clauses.append(f"s.source NOT IN ({placeholders})")
-            params.extend(exclude_sources)
-        if cwd_prefix:
-            clause, clause_params = _cwd_prefix_clause(cwd_prefix)
-            where_clauses.append(clause)
-            params.extend(clause_params)
-        if min_message_count > 0:
-            where_clauses.append("s.message_count >= ?")
-            params.append(min_message_count)
-        if archived_only:
-            where_clauses.append("s.archived = 1")
-        elif not include_archived:
-            where_clauses.append("s.archived = 0")
-
-        where_sql = f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
-
-        with self._read_ctx() as conn:
-            cursor = conn.execute(f"SELECT COUNT(*) FROM sessions s{where_sql}", params)
-            return cursor.fetchone()[0]
-
-    def session_count_ge(self, n: int = 1) -> bool:
-        """Check if at least N sessions exist (archived included).
-
-        Short-circuits via LIMIT â€” much cheaper than ``session_count()``,
-        which pays a full index scan for its default ``archived = 0``
-        filter (measured 543us vs 4us on a 20k-session DB). Archived
-        sessions count: every caller so far asks "has this install ever
-        had sessions", and an archived session is still a created one.
-        Use this instead of ``session_count() >= n`` when the exact count
-        is irrelevant.
-        """
-        with self._read_ctx() as conn:
-            cursor = conn.execute("SELECT 1 FROM sessions LIMIT ?", (n,))
-            rows = cursor.fetchall()
-        return len(rows) >= n
-
-    def session_count_by_source(
-        self,
-        *,
-        include_archived: bool = False,
-        archived_only: bool = False,
-        exclude_children: bool = False,
-    ) -> Dict[str, int]:
-        """Return a ``{source: count}`` dict via a single ``GROUP BY`` query.
-
-        Replaces the O(N) ``list_sessions_rich`` histogram loop with an
-        aggregate query. When ``exclude_children`` is False the query uses
-        ``idx_sessions_source``; when True, the child-exclusion predicates
-        require a full table scan (same as ``session_count`` and
-        ``list_sessions_rich``).
-
-        ``exclude_children=True`` mirrors ``list_sessions_rich`` visibility
-        (roots + branch/reset sessions, excluding sub-agent runs, delegates,
-        and compression continuations) so the source counts match what the
-        Sessions page actually lists.
-        """
-        where_clauses = []
-        params: list = []
-
-        if exclude_children:
-            where_clauses.append(_LISTABLE_CHILD_SQL)
-            where_clauses.append(f"{_delegate_from_json('s.model_config')} IS NULL")
-        if archived_only:
-            where_clauses.append("s.archived = 1")
-        elif not include_archived:
-            where_clauses.append("s.archived = 0")
-
-        where_sql = f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
-
-        with self._read_ctx() as conn:
-            if self._conn is None:
-                raise RuntimeError("SessionDB connection is closed")
-            rows = conn.execute(
-                "SELECT COALESCE(NULLIF(s.source, ''), 'cli') AS source, COUNT(*) AS count "
-                f"FROM sessions s{where_sql} "
-                "GROUP BY COALESCE(NULLIF(s.source, ''), 'cli') "
-                "ORDER BY count DESC",
-                params,
-            ).fetchall()
-        return {str(row["source"]): int(row["count"] or 0) for row in rows}
-
-    def message_count(self, session_id: str = None) -> int:
-        """Count messages, optionally for a specific session."""
-        with self._read_ctx() as conn:
-            if session_id:
-                cursor = conn.execute(
-                    "SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,)
-                )
-            else:
-                cursor = conn.execute("SELECT COUNT(*) FROM messages")
-            return cursor.fetchone()[0]
-
-    def has_platform_message_id(
-        self, session_id: str, platform_message_id: str
-    ) -> bool:
-        """Check if a message with the given platform_message_id exists.
-
-        Uses the idx_messages_platform_msg_id partial index for efficient
-        lookup. Used by the gateway's transient-failure dedupe guard (#47237)
-        to skip re-persisting a user message that was already saved on a
-        prior retry of the same inbound platform message.
-        """
-        with self._read_ctx() as conn:
-            cursor = conn.execute(
-                "SELECT 1 FROM messages "
-                "WHERE session_id = ? AND platform_message_id = ? LIMIT 1",
-                (session_id, platform_message_id),
-            )
-            return cursor.fetchone() is not None
-
-    # =========================================================================
-    # Export and cleanup
-    # =========================================================================
-
-    def _is_explicit_fork_child_row(self, session: Dict[str, Any]) -> bool:
-        """True when ``session`` is a branch, delegate, or tool child of its parent.
-
-        Markers only count as a fork when they point at ``parent_session_id``.
-        Compression copies ``model_config`` onto the continuation
-        (``publish_compression_child`` callers pass
-        ``agent._session_init_model_config``), so a delegate's continuation
-        carries ``_delegate_from=<the delegate's own parent>``. Presence-only
-        matching would treat that real continuation as a fork â€” the same
-        misclassification ``_NON_CONTINUATION_CHILD_FILTER_SQL`` already
-        avoids by binding both markers to the queried parent.
-        """
-        if session.get("source") == "tool":
-            return True
-        raw = session.get("model_config")
-        if not raw:
-            return False
-        try:
-            cfg = json.loads(raw) if isinstance(raw, str) else raw
-        except (TypeError, json.JSONDecodeError):
-            return False
-        if not isinstance(cfg, dict):
-            return False
-        parent_id = session.get("parent_session_id")
-        branched = cfg.get("_branched_from")
-        delegated = cfg.get("_delegate_from")
-        if parent_id:
-            return branched == parent_id or delegated == parent_id
-        return branched is not None or delegated is not None
-
-    def _is_compression_child_row(self, child: Dict[str, Any]) -> bool:
-        parent_id = child.get("parent_session_id")
-        if not parent_id or self._is_explicit_fork_child_row(child):
-            return False
-        parent = self.get_session(parent_id)
-        return bool(parent and parent.get("end_reason") == "compression")
-
-    def get_compression_lineage(self, session_id: str) -> List[str]:
-        """Return compression ancestors through tip in chronological order."""
-        session = self.get_session(session_id)
-        if not session or self._is_explicit_fork_child_row(session):
-            return [session_id] if session else []
-
-        root = session
-        ancestors = {root["id"]}
-        while self._is_compression_child_row(root):
-            parent = self.get_session(root["parent_session_id"])
-            if not parent or parent["id"] in ancestors:
-                break
-            root = parent
-            ancestors.add(root["id"])
-
-        lineage = [root["id"]]
-        seen = {root["id"]}
-        current = root
-        while current.get("end_reason") == "compression":
-            with self._read_ctx() as conn:
-                rows = conn.execute(
-                    """
-                    SELECT * FROM sessions
-                    WHERE parent_session_id = ?
-                    ORDER BY started_at ASC
-                    """,
-                    (current["id"],),
-                ).fetchall()
-            next_child = None
-            for row in rows:
-                candidate = dict(row)
-                if self._is_compression_child_row(candidate):
-                    next_child = candidate
-                    break
-            if not next_child or next_child["id"] in seen:
-                break
-            lineage.append(next_child["id"])
-            seen.add(next_child["id"])
-            current = next_child
-            if current["id"] == session_id:
-                # Continue to include later compression tips only when the
-                # requested session itself was compacted.
-                continue
-        return lineage if session_id in lineage else [session_id]
-
-    def clear_messages(self, session_id: str) -> None:
-        """Delete all messages for a session and reset its counters."""
-        def _do(conn):
-            conn.execute(
-                "DELETE FROM messages WHERE session_id = ?", (session_id,)
-            )
-            conn.execute(
-                "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?",
-                (session_id,),
-            )
-        self._execute_write(_do)
-
-    @staticmethod
-    def _remove_session_files(sessions_dir: Optional[Path], session_id: str) -> None:
-        """Remove on-disk transcript files for a session.
-
-        Cleans up ``{session_id}.json``, ``{session_id}.jsonl``, and any
-        ``request_dump_{session_id}_*.json`` files left by the gateway.
-        Silently skips files that don't exist and swallows OSError so a
-        filesystem hiccup never blocks a DB operation.
-        """
-        if sessions_dir is None:
-            return
-        for suffix in (".json", ".jsonl"):
-            p = sessions_dir / f"{session_id}{suffix}"
-            try:
-                p.unlink(missing_ok=True)
-            except OSError:
-                pass
-        # request_dump files use session_id as a prefix component
-        try:
-            for p in sessions_dir.glob(f"request_dump_{session_id}_*.json"):
-                try:
-                    p.unlink(missing_ok=True)
-                except OSError:
-                    pass
-        except OSError:
-            pass
-
-    def get_session_delete_targets(self, session_id: str) -> List[str]:
-        """Return every session row that :meth:`delete_session` would remove.
-
-        The requested session is first, followed by its recursively discovered
-        delegate/subagent children. Branch and compression children are not
-        included because deletion preserves them by orphaning their parent
-        reference.
-        """
-        with self._read_ctx() as conn:
-            exists = conn.execute(
-                "SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)
-            ).fetchone()
-            if not exists:
-                return []
-            delegate_ids = _collect_delegate_child_ids(self._conn, [session_id])
-        return [session_id, *sorted(delegate_ids)]
-
-    def delete_session(
-        self,
-        session_id: str,
-        sessions_dir: Optional[Path] = None,
-        expected_delete_ids: Optional[List[str]] = None,
-    ) -> bool:
-        """Delete a session and all its messages.
-
-        Delegate subagent children (``model_config._delegate_from``) are
-        cascade-deleted with the parent so they never resurface in session
-        pickers as orphaned rows. Branch / compression children are orphaned
-        (``parent_session_id â†’ NULL``) so they remain accessible independently.
-        When *sessions_dir* is provided, also removes on-disk transcript
-        files (``.json`` / ``.jsonl`` / ``request_dump_*``) for every deleted
-        session. When *expected_delete_ids* is provided, deletion proceeds only
-        if the parent plus delegate cascade still matches that exact set. This
-        lets export-before-delete callers fail closed if a new delegate appears
-        after they materialize their archive. The delegate tree is re-walked
-        inside the write transaction on purpose (TOCTOU guard); the cost is
-        accepted for correctness. Returns True if the session was found and
-        deleted.
-        """
-        removed_delegate_ids: List[str] = []
-        expected_ids = (
-            set(expected_delete_ids) if expected_delete_ids is not None else None
-        )
-
-        def _do(conn):
-            cursor = conn.execute(
-                "SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)
-            )
-            if cursor.fetchone() is None:
-                return False
-            if expected_ids is not None:
-                actual_ids = {
-                    session_id,
-                    *_collect_delegate_child_ids(conn, [session_id]),
-                }
-                if actual_ids != expected_ids:
-                    return False
-            removed_delegate_ids.extend(_delete_delegate_children(conn, [session_id]))
-            # Orphan remaining child sessions (branches, etc.) so FK is satisfied.
-            conn.execute(
-                "UPDATE sessions SET parent_session_id = NULL "
-                "WHERE parent_session_id = ?",
-                (session_id,),
-            )
-            conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
-            conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
-            self._delete_unreferenced_system_prompts(conn)
-            return True
-
-        deleted = self._execute_write(_do)
-        if deleted:
-            for delegate_id in removed_delegate_ids:
-                self._remove_session_files(sessions_dir, delegate_id)
-            self._remove_session_files(sessions_dir, session_id)
-        return bool(deleted)
-
-    def delete_session_if_empty(
-        self,
-        session_id: str,
-        sessions_dir: Optional[Path] = None,
-    ) -> bool:
-        """Delete *session_id* only when it never gained resumable content.
-
-        A session is considered empty when it has no messages and no
-        user-assigned title. Used by CLI exit / session-rotation paths so
-        immediately-started-and-quit sessions don't pile up in ``/resume``
-        and ``hermes sessions list`` output. (Pattern ported from
-        google-gemini/gemini-cli#27770.)
-
-        The emptiness check and delete run in one transaction, so a message
-        flushed concurrently by another writer can't be lost. Sessions with
-        children (delegate subagent runs) are preserved â€” a parent that
-        spawned work is not "empty" even if its own transcript never
-        flushed. Returns True if the session was deleted.
-        """
-        def _do(conn):
-            cursor = conn.execute(
-                """
-                DELETE FROM sessions
-                WHERE id = ?
-                  AND title IS NULL
-                  AND NOT EXISTS (
-                      SELECT 1 FROM messages WHERE messages.session_id = sessions.id
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM sessions child
-                      WHERE child.parent_session_id = sessions.id
-                  )
-                """,
-                (session_id,),
-            )
-            if cursor.rowcount > 0:
-                self._delete_unreferenced_system_prompts(conn)
-            return cursor.rowcount > 0
-
-        deleted = self._execute_write(_do)
-        if deleted:
-            self._remove_session_files(sessions_dir, session_id)
-        return bool(deleted)
-
-    def delete_sessions(
-        self,
-        session_ids: List[str],
-        sessions_dir: Optional[Path] = None,
-    ) -> int:
-        """Delete every session in *session_ids* in a single transaction.
-
-        Backs the dashboard's bulk-select-then-delete flow on the
-        sessions page (``POST /api/sessions/bulk-delete``). Mirrors the
-        single-session :meth:`delete_session` contract per row:
-
-        * Unknown IDs are silently skipped (no 404) â€” selection state
-          in the UI can race against another tab's delete, and we'd
-          rather succeed-on-the-rest than fail-the-whole-batch.
-        * Delegate subagent children (``model_config._delegate_from``) are
-          cascade-deleted with their parent; branch children are orphaned
-          (``parent_session_id â†’ NULL``) so they stay accessible.
-        * Messages and the session row both go in one
-          ``_execute_write`` call so a partial failure can't leave the
-          DB in a "messages gone but session row still there" state.
-        * On-disk transcript / ``request_dump_*`` files are cleaned up
-          outside the DB transaction when *sessions_dir* is provided,
-          matching :meth:`prune_sessions` and
-          :meth:`delete_empty_sessions`.
-
-        Returns the count of sessions that actually existed and were
-        deleted (may be less than ``len(session_ids)`` if some IDs were
-        already gone).
-        """
-        if not session_ids:
-            return 0
-        # Dedup + drop any non-string entries up-front. Avoids
-        # double-counting in the WHERE-IN list and protects against
-        # callers that pass a list with stray ``None`` values.
-        unique_ids = list({sid for sid in session_ids if isinstance(sid, str) and sid})
-        if not unique_ids:
-            return 0
-
-        removed_ids: list[str] = []
-        removed_delegate_ids: list[str] = []
-
-        def _do(conn):
-            placeholders = ",".join("?" * len(unique_ids))
-            # First, filter to IDs that actually exist â€” we want to
-            # return the real deleted count, not the input length.
-            cursor = conn.execute(
-                f"SELECT id FROM sessions WHERE id IN ({placeholders})",
-                unique_ids,
-            )
-            existing = [row["id"] for row in cursor.fetchall()]
-            if not existing:
-                return 0
-
-            existing_placeholders = ",".join("?" * len(existing))
-            removed_delegate_ids.extend(_delete_delegate_children(conn, existing))
-            # Orphan remaining children whose parent is in the kill list so the
-            # FK constraint stays satisfied. Pin children whose parent
-            # is itself in the kill list rather than NULL-ing parents
-            # of survivors â€” the IN list on ``parent_session_id`` does
-            # exactly this.
-            conn.execute(
-                f"UPDATE sessions SET parent_session_id = NULL "
-                f"WHERE parent_session_id IN ({existing_placeholders})",
-                existing,
-            )
-            conn.execute(
-                f"DELETE FROM messages WHERE session_id IN ({existing_placeholders})",
-                existing,
-            )
-            conn.execute(
-                f"DELETE FROM sessions WHERE id IN ({existing_placeholders})",
-                existing,
-            )
-            self._delete_unreferenced_system_prompts(conn)
-            removed_ids.extend(existing)
-            return len(existing)
-
-        count = self._execute_write(_do)
-        for sid in removed_delegate_ids:
-            self._remove_session_files(sessions_dir, sid)
-        for sid in removed_ids:
-            self._remove_session_files(sessions_dir, sid)
-        return count
-
-    #: Shared selector for :meth:`count_empty_sessions` and
-    #: :meth:`delete_empty_sessions` so the badge and the sweep agree.
-    #:
-    #: ``message_count`` tracks live (``active = 1``) rows only; rewind
-    #: (:meth:`replace_messages` w/ ``archive_dropped``) and in-place
-    #: compaction (:meth:`archive_and_compact`) reset it to 0 while keeping
-    #: dropped turns on disk as ``active = 0`` â€” the only recoverable copy
-    #: (#70516 / #80763 / #82756). The ``NOT EXISTS`` probe is the authority;
-    #: ``message_count = 0`` stays as a cheap prefilter. Same shape as every
-    #: other emptiness guard in this module. (#95868)
-    _EMPTY_SESSION_WHERE = (
-        "message_count = 0 "
-        "AND ended_at IS NOT NULL "
-        "AND archived = 0 "
-        "AND NOT EXISTS ("
-        "SELECT 1 FROM messages WHERE messages.session_id = sessions.id"
-        ")"
-    )
-
-    def count_empty_sessions(self) -> int:
-        """Return the count of empty, non-active, non-archived sessions.
-
-        "Empty" = the session holds no message rows at all AND has ended
-        (``ended_at IS NOT NULL``) AND is not archived. The ``ended_at``
-        guard matches the safety contract used by :meth:`prune_sessions`:
-        only ended sessions are candidates for bulk deletion, so a freshly
-        spawned session whose first message hasn't landed yet â€” or one
-        held open by the live agent â€” is never sniped out from under
-        the runtime.
-
-        Emptiness is decided by :data:`_EMPTY_SESSION_WHERE` â€” see that
-        constant for why the ``NOT EXISTS`` probe is needed instead of
-        trusting ``message_count`` alone.
-
-        Backs the ``GET /api/sessions/empty/count`` endpoint that lets the
-        web dashboard hide its "Delete empty" button when there's nothing
-        to clean up, and pre-populate the confirm dialog with the actual
-        count.
-        """
-        with self._read_ctx() as conn:
-            cursor = conn.execute(
-                f"SELECT COUNT(*) FROM sessions WHERE {self._EMPTY_SESSION_WHERE}"
-            )
-            return cursor.fetchone()[0]
-
-    def delete_empty_sessions(
-        self,
-        sessions_dir: Optional[Path] = None,
-    ) -> int:
-        """Delete every empty, ended, non-archived session.
-
-        Mirrors :meth:`prune_sessions`' transactional shape:
-
-        * Selects candidate IDs first (:data:`_EMPTY_SESSION_WHERE`) so we
-          never touch a live session, one the user deliberately archived,
-          or one whose transcript survives as soft-archived rows.
-        * Orphans any child whose parent is in the kill list â€” children
-          of an empty parent are kept and re-parented to ``NULL`` rather
-          than cascade-deleted, matching ``delete_session`` /
-          ``prune_sessions`` semantics so branch/subagent transcripts
-          survive an inadvertent parent cleanup.
-        * Deletes the rows in a single ``_execute_write`` callback so
-          the operation is atomic â€” a partial failure (e.g. SIGKILL
-          mid-loop) doesn't leave the DB in a "messages-deleted but
-          session-row-still-there" half-state.
-        * Cleans up on-disk transcript files (``.json`` / ``.jsonl`` /
-          ``request_dump_*``) outside the DB transaction when
-          ``sessions_dir`` is provided. Empty sessions don't typically
-          have transcript files, but the gateway can leave a stub
-          ``request_dump_*`` if it crashed before the first reply â€”
-          so we still sweep, matching ``prune_sessions``.
-
-        Returns the number of sessions deleted.
-        """
-        removed_ids: list[str] = []
-
-        def _do(conn):
-            cursor = conn.execute(
-                f"SELECT id FROM sessions WHERE {self._EMPTY_SESSION_WHERE}"
-            )
-            session_ids = {row["id"] for row in cursor.fetchall()}
-
-            if not session_ids:
-                return 0
-
-            placeholders = ",".join("?" * len(session_ids))
-            conn.execute(
-                f"UPDATE sessions SET parent_session_id = NULL "
-                f"WHERE parent_session_id IN ({placeholders})",
-                list(session_ids),
-            )
-
-            for sid in session_ids:
-                # DELETE FROM messages is paranoia â€” the selector's
-                # ``NOT EXISTS`` probe already proved these sessions own no
-                # message rows â€” but a row inserted between the SELECT and
-                # this statement would otherwise be left dangling, so we
-                # still leave a clean FK state.
-                conn.execute(
-                    "DELETE FROM messages WHERE session_id = ?", (sid,)
-                )
-                conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
-                removed_ids.append(sid)
-            self._delete_unreferenced_system_prompts(conn)
-            return len(session_ids)
-
-        count = self._execute_write(_do)
-        for sid in removed_ids:
-            self._remove_session_files(sessions_dir, sid)
-        return count
-
-
-    @staticmethod
-    def _apply_prune_age_filter(
-        older_than_days: Optional[float], filters: Dict[str, Any]
-    ) -> None:
-        """Translate the legacy age window into the shared activity filter."""
-        if (
-            filters.get("last_active_before") is None
-            and filters.get("started_before") is None
-            and older_than_days is not None
-        ):
-            filters["last_active_before"] = time.time() - (
-                older_than_days * 86400
-            )
-
-
-
-
-    def archive_sessions(
-        self,
-        older_than_days: Optional[float] = None,
-        source: str = None,
-        **filters,
-    ) -> int:
-        """Bulk-archive (soft-hide) every session matching the filters.
-
-        Same filter surface as :meth:`prune_sessions`, but instead of deleting
-        rows it flips ``archived = 1`` via :meth:`set_session_archived` so
-        each match's compression lineage is archived as a unit (an unarchived
-        compression root would otherwise resurrect the conversation in
-        Desktop's projected list). Nothing is deleted; messages and transcript
-        files are untouched. Returns the number of sessions matched.
-
-        ``archived`` defaults to ``False`` here (only select rows not yet
-        archived) so repeat runs are idempotent no-ops.
-        """
-        filters.setdefault("archived", False)
-        rows = self.list_prune_candidates(
-            older_than_days=older_than_days, source=source, **filters
-        )
-        for row in rows:
-            self.set_session_archived(row["id"], True)
-        return len(rows)
-
-
-
-    def purge_stale_tool_call_markers(
-        self, *, dry_run: bool = False, backup: bool = True
-    ) -> Dict[str, Any]:
-        """Permanently clear bare tool-call marker content (e.g. "[memory]")
-        left in the ``messages`` table by sessions persisted before the
-        #78148 fix in ``agent.conversation_loop``.
-
-        ``_strip_stale_tool_call_markers`` already repairs this in memory on
-        every session load (see ``_rows_to_conversation``), so running this
-        is optional â€” but for long-lived sessions the same rows get
-        re-scanned and re-repaired on every resume, which is wasted work
-        and keeps the contaminated bytes sitting in the DB (and in any
-        downstream cache/backup snapshot of it) indefinitely. This rewrites
-        the affected rows once, in place.
-
-        Only the ``content`` column is touched â€” ``role``, ``tool_calls``,
-        and every other column on the row are left exactly as they are, so
-        provider tool_call/tool_result pairing is unaffected.
-
-        Unlike the in-memory repair, this UPDATE is permanent and can't be
-        undone from within the DB. Since ``backup`` defaults to True, a
-        timestamped full snapshot is taken via ``VACUUM INTO`` (safe against
-        a live connection, unlike the raw-copy ``_backup_db_file`` used for
-        malformed-schema repair) before any row is touched â€” mirroring
-        ``repair_state_db_schema``'s backup-by-default convention for
-        destructive state.db operations. No snapshot is taken when there is
-        nothing to change.
-
-        With ``dry_run=True``, reports the affected row count/ids without
-        writing or backing up (read-only, no write lock taken).
-
-        Returns ``{"dry_run": bool, "rows_affected": int, "row_ids": [...],
-        "backup_path": str|None}``.
-        """
-
-        def _find_affected(conn) -> List[int]:
-            cursor = conn.execute(
-                "SELECT id, content FROM messages "
-                "WHERE role = 'assistant' AND tool_calls IS NOT NULL AND tool_calls != ''"
-            )
-            affected: List[int] = []
-            for row in cursor.fetchall():
-                content = row["content"]
-                if isinstance(content, str) and _STALE_TOOL_CALL_MARKER_RE.fullmatch(content.strip()):
-                    affected.append(row["id"])
-            return affected
-
-        with self._read_ctx() as conn:
-            affected_ids = _find_affected(conn)
-
-        if dry_run:
-            return {
-                "dry_run": True,
-                "rows_affected": len(affected_ids),
-                "row_ids": affected_ids,
-                "backup_path": None,
-            }
-
-        if not affected_ids:
-            return {
-                "dry_run": False,
-                "rows_affected": 0,
-                "row_ids": [],
-                "backup_path": None,
-            }
-
-        backup_path: Optional[str] = None
-        if backup:
-            import datetime
-
-            stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            dest = self.db_path.with_name(
-                f"{self.db_path.name}.pre-clean-markers-backup-{stamp}"
-            )
-            with self._lock:
-                self._conn.execute("VACUUM INTO ?", (str(dest),))
-            backup_path = str(dest)
-            logger.info("Backed up state.db to %s before clean-markers write", backup_path)
-
-        def _do(conn):
-            ids = _find_affected(conn)
-            if ids:
-                placeholders = ",".join("?" * len(ids))
-                conn.execute(
-                    f"UPDATE messages SET content = '' WHERE id IN ({placeholders})",
-                    ids,
-                )
-            return ids
-
-        affected_ids = self._execute_write(_do)
-        if affected_ids:
-            logger.info(
-                "Permanently cleared %d stale tool-call marker row(s) in state.db (#78148)",
-                len(affected_ids),
-            )
-        return {
-            "dry_run": False,
-            "rows_affected": len(affected_ids),
-            "row_ids": affected_ids,
-            "backup_path": backup_path,
-        }
-
-    # â”€â”€ Meta key/value (for scheduler bookkeeping) â”€â”€
-
-    def get_meta(self, key: str) -> Optional[str]:
-        """Read a value from the state_meta key/value store."""
-        # Kept on self._lock (not _read_ctx) because callers like
-        # fts_rebuild_step read progress before entering a write
-        # transaction, and the read-only WAL connection sees only
-        # committed data â€” a pending write transaction's uncommitted
-        # meta writes would be invisible.  This is a cheap point lookup,
-        # not the convoy bottleneck the read-path split targets.
-        with self._read_ctx() as conn:
-            row = conn.execute(
-                "SELECT value FROM state_meta WHERE key = ?", (key,)
-            ).fetchone()
-        if row is None:
-            return None
-        return row["value"] if isinstance(row, sqlite3.Row) else row[0]
-
-    def set_meta(self, key: str, value: str, *, cursor: Optional[sqlite3.Cursor] = None) -> None:
-        """Upsert state_meta[key]; with ``cursor`` the write is inline (the caller already holds a
-        transaction â€” nesting BEGIN IMMEDIATE would deadlock)."""
-        sql = (
-            "INSERT INTO state_meta (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
-        )
-        if cursor is not None:
-            cursor.execute(sql, (key, value))
-        else:
-            self._write_sql(sql, (key, value))
-
-    def set_meta_many(self, items: List[Tuple[str, str]]) -> None:
-        """Write multiple ``state_meta`` rows in one owner transaction.
-
-        Lifecycle migrations use this to publish a child goal and archive its
-        parent atomically. The method deliberately remains a small SessionDB
-        primitive; it does not create a second goal store or expose a generic
-        transaction API to callers.
-        """
-        normalized = [(str(key), str(value)) for key, value in items]
-        if not normalized:
-            return
-
-        def _do(conn):
-            for meta_key, meta_value in normalized:
-                conn.execute(
-                    "INSERT INTO state_meta (key, value) VALUES (?, ?) "
-                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                    (meta_key, meta_value),
-                )
-
-        self._execute_write(_do)
-
-    def compare_and_set_meta(
-        self, key: str, expected: Optional[str], value: str
-    ) -> bool:
-        """Conditionally publish one meta row under the SessionDB write lock."""
-        def _do(conn):
-            if expected is None:
-                cursor = conn.execute(
-                    "INSERT INTO state_meta (key, value) VALUES (?, ?) "
-                    "ON CONFLICT(key) DO NOTHING",
-                    (key, value),
-                )
-            else:
-                cursor = conn.execute(
-                    "UPDATE state_meta SET value = ? "
-                    "WHERE key = ? AND value = ?",
-                    (value, key, expected),
-                )
-            return bool(cursor.rowcount == 1)
-
-        return bool(self._execute_write(_do))
-
-    def compare_and_set_meta_many(
-        self, items: List[Tuple[str, Optional[str], str]]
-    ) -> bool:
-        """Atomically publish several meta rows if every preimage matches."""
-        normalized = [(str(key), expected, str(value)) for key, expected, value in items]
-        if not normalized:
-            return True
-
-        def _do(conn):
-            for key, expected, _value in normalized:
-                if expected is None:
-                    row = conn.execute(
-                        "SELECT 1 FROM state_meta WHERE key = ?", (key,)
-                    ).fetchone()
-                    if row is not None:
-                        return False
-                else:
-                    row = conn.execute(
-                        "SELECT value FROM state_meta WHERE key = ?", (key,)
-                    ).fetchone()
-                    if row is None or row[0] != expected:
-                        return False
-            for key, _expected, value in normalized:
-                conn.execute(
-                    "INSERT INTO state_meta (key, value) VALUES (?, ?) "
-                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                    (key, value),
-                )
-            return True
-
-        return bool(self._execute_write(_do))
-
-    def retag_kanban_worker_sessions(self, workspaces_root: str) -> int:
-        """Retag legacy kanban worker rows from ``cli`` to ``kanban`` by cwd under the board's workspaces
-        root; gated once per root via state_meta. Returns rows retagged."""
-        prefix = str(workspaces_root).rstrip("/\\")
-        if not prefix:
-            return 0
-        gate = f"kanban_worker_source_retagged:{prefix}"
-        if self.get_meta(gate) == "1":
-            return 0
-        def _do(conn):
-            cursor = conn.execute(
-                "UPDATE sessions SET source = 'kanban' "
-                "WHERE source = 'cli' AND (cwd = ? OR cwd LIKE ? ESCAPE '\\')",
-                (prefix, _escape_like(prefix) + "/%"),
-            )
-            # rowcount BEFORE set_meta reuses this cursor for its INSERT.
-            retagged = cursor.rowcount or 0
-            self.set_meta(gate, "1", cursor=cursor)
-            return retagged
-        return self._execute_write(_do)
-
-    def list_meta_prefix(self, prefix: str) -> List[Tuple[str, str]]:
-        """``[(key, value), ...]`` for state_meta keys starting with the literal
-        ``prefix`` (LIKE wildcards escaped) â€” e.g. ``loop:<session_id>`` rows."""
-        if not prefix:
-            return []
-        escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        with self._read_ctx() as conn:
-            rows = conn.execute(
-                "SELECT key, value FROM state_meta WHERE key LIKE ? ESCAPE '\\'",
-                (escaped + "%",),
-            ).fetchall()
-        return [(row[0], row[1]) for row in rows]
-
-
-
-
-
-
-
-
-
-
-
-
-    # â”€â”€ Space reclamation â”€â”€
-
-    # FTS5 virtual tables whose b-tree segments we merge on optimize. The
-    # trigram table is created lazily / may be disabled, and the cjk-bigram
-    # table only exists (and is only queryable) when the loadable tokenizer
-    # is present â€” so we probe each before touching it (see optimize_fts).
-    _FTS_TABLES = ("messages_fts", "messages_fts_trigram", "messages_fts_cjk")
-
-
-
-
-    def maybe_auto_archive(
-        self,
-        idle_days: float = 3,
-        min_interval_hours: int = 24,
-        exclude_pinned: bool = True,
-    ) -> Dict[str, Any]:
-        """Idempotent auto-archive: soft-hide sessions idle for ``idle_days``.
-
-        Sibling of :meth:`maybe_auto_prune_and_vacuum` but non-destructive â€”
-        it archives (hides) rather than deletes, and ages on last activity
-        (see :meth:`archive_stale_sessions`) rather than creation. Records the
-        last run in ``state_meta['last_auto_archive']`` so calls within
-        ``min_interval_hours`` no-op; safe to call opportunistically (startup
-        hooks, or when the Desktop backend lists sessions).
-
-        Never raises. Returns a dict with:
-          - ``"skipped"`` (bool) â€” within min_interval_hours of last run
-          - ``"archived"`` (int) â€” sessions archived this run
-          - ``"error"`` (str, optional) â€” present only on failure
-        """
-        result: Dict[str, Any] = {"skipped": False, "archived": 0}
-        try:
-            last_raw = self.get_meta("last_auto_archive")
-            now = time.time()
-            if last_raw:
-                try:
-                    if now - float(last_raw) < min_interval_hours * 3600:
-                        result["skipped"] = True
-                        return result
-                except (TypeError, ValueError):
-                    pass  # corrupt meta; treat as no prior run
-
-            archived = self.archive_stale_sessions(
-                idle_days, exclude_pinned=exclude_pinned
-            )
-            result["archived"] = archived
-
-            # Record even a zero-archive run so we don't re-sweep every call
-            # within the interval window.
-            self.set_meta("last_auto_archive", str(now))
-
-            if archived > 0:
-                logger.info(
-                    "state.db auto-archive: archived %d session(s) idle >= %s days",
-                    archived,
-                    idle_days,
-                )
-        except Exception as exc:
-            logger.warning("state.db auto-archive failed: %s", exc)
-            result["error"] = str(exc)
-
-        return result
-
-    # â”€â”€ Handoff (cross-platform session transfer) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    #
-    # State machine:
-    #   None       â€” no handoff in flight
-    #   "pending"  â€” CLI requested handoff, gateway hasn't picked it up yet
-    #   "running"  â€” gateway is processing (session switch + synthetic turn)
-    #   "completed"â€” gateway successfully delivered the synthetic turn
-    #   "failed"   â€” gateway hit an error; reason in handoff_error
-    #
-    # The CLI writes "pending" then poll-waits for terminal state. The gateway
-    # watcher transitions pendingâ†’runningâ†’{completed,failed}.
-
-    def request_handoff(self, session_id: str, platform: str) -> bool:
-        """Mark a session as pending handoff to the given platform.
-
-        Returns True if the row was found and not already in flight; False if
-        the session is already in a non-terminal handoff state.
-        """
-        def _do(conn):
-            cur = conn.execute(
-                "UPDATE sessions "
-                "SET handoff_state = 'pending', "
-                "    handoff_platform = ?, "
-                "    handoff_error = NULL "
-                "WHERE id = ? AND (handoff_state IS NULL "
-                "                  OR handoff_state IN ('completed', 'failed'))",
-                (platform, session_id),
-            )
-            return cur.rowcount > 0
-        return self._execute_write(_do)
-
-    def get_handoff_state(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """Read the current handoff state for a session.
-
-        Returns ``{"state", "platform", "error"}`` or None if the session has
-        no handoff record.
-        """
-        try:
-            cur = self._conn.execute(
-                "SELECT handoff_state, handoff_platform, handoff_error "
-                "FROM sessions WHERE id = ?",
-                (session_id,),
-            )
-            row = cur.fetchone()
-            if not row:
-                return None
-            return {
-                "state": row["handoff_state"],
-                "platform": row["handoff_platform"],
-                "error": row["handoff_error"],
-            }
-        except Exception:
-            return None
-
-    def list_pending_handoffs(self) -> List[Dict[str, Any]]:
-        """Return all sessions in handoff_state='pending', oldest first.
-
-        Used by the gateway's handoff watcher.
-        """
-        try:
-            cur = self._conn.execute(
-                "SELECT s.*, "
-                "COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved "
-                "FROM sessions s "
-                "LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
-                "WHERE s.handoff_state = 'pending' "
-                "ORDER BY s.started_at ASC"
-            )
-            return [self._session_row_dict(r) for r in cur.fetchall()]
-        except Exception:
-            return []
-
-    def claim_handoff(self, session_id: str) -> bool:
-        """Atomically transition pending â†’ running. Returns True if claimed."""
-        def _do(conn):
-            cur = conn.execute(
-                "UPDATE sessions SET handoff_state = 'running' "
-                "WHERE id = ? AND handoff_state = 'pending'",
-                (session_id,),
-            )
-            return cur.rowcount > 0
-        return self._execute_write(_do)
-
-    def complete_handoff(self, session_id: str) -> None:
-        """Mark a handoff as completed."""
-        def _do(conn):
-            conn.execute(
-                "UPDATE sessions SET handoff_state = 'completed', "
-                "handoff_error = NULL WHERE id = ?",
-                (session_id,),
-            )
-        self._execute_write(_do)
-
-    def fail_handoff(self, session_id: str, error: str) -> None:
-        """Mark a handoff as failed and record the reason."""
-        def _do(conn):
-            conn.execute(
-                "UPDATE sessions SET handoff_state = 'failed', "
-                "handoff_error = ? WHERE id = ?",
-                (error[:500], session_id),
-            )
-        self._execute_write(_do)
-
-
-class AsyncSessionDB:
-    """Async door onto SessionDB: every call runs via asyncio.to_thread so a blocking SQLite call
-    never freezes the event loop (no method returns a live cursor)."""
-
-    def __init__(self, db: "SessionDB") -> None:
-        self._db = db
-
-    def __getattr__(self, name: str):
-        attr = getattr(self._db, name)
-        if not callable(attr):
-            return attr
-        async def _offloaded(*args, **kwargs):
-            return await asyncio.to_thread(attr, *args, **kwargs)
-        return _offloaded
-
-
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
-from typing import Set  # noqa: F401,E402
-import contextlib  # noqa: F401,E402
-import errno  # noqa: F401,E402
-import struct  # noqa: F401,E402
-import weakref  # noqa: F401,E402
-
-MAX_SAFE_EXPORT_MESSAGES = 20_000
-
-MAX_SAFE_RESUME_MESSAGES = 20_000
-
-
-_PLUGIN_COMPAT_LAZY = {
-    'AUTO_VACUUM_MIN_FREELIST_RATIO': ('hermes_state_common', 'AUTO_VACUUM_MIN_FREELIST_RATIO'),
-    'ActivityProvenance': ('agent.session_activity', 'ActivityProvenance'),
-    'CompressionSessionBusyError': ('hermes_state_errors', 'CompressionSessionBusyError'),
-    'CompressionSessionClosedError': ('hermes_state_errors', 'CompressionSessionClosedError'),
-    'DEFERRED_INDEX_SQL': ('hermes_state_common', 'DEFERRED_INDEX_SQL'),
-    'FTS_CJK_STALE_KEY': ('hermes_state_common', 'FTS_CJK_STALE_KEY'),
-    'FTS_CJK_TABLE_SQL': ('hermes_state_fts', 'FTS_CJK_TABLE_SQL'),
-    'FTS_CJK_TRIGGER_SQL': ('hermes_state_fts', 'FTS_CJK_TRIGGER_SQL'),
-    'FTS_REBUILD_DEFERRAL_KEY': ('hermes_state_common', 'FTS_REBUILD_DEFERRAL_KEY'),
-    'FTS_SQL': ('hermes_state_common', 'FTS_SQL'),
-    'FTS_STALE_KEY': ('hermes_state_common', 'FTS_STALE_KEY'),
-    'FTS_STORAGE_VERSION': ('hermes_state_common', 'FTS_STORAGE_VERSION'),
-    'FTS_TRIGRAM_SQL': ('hermes_state_common', 'FTS_TRIGRAM_SQL'),
-    'LEGACY_FTS_SQL': ('hermes_state_common', 'LEGACY_FTS_SQL'),
-    'LEGACY_FTS_TRIGRAM_SQL': ('hermes_state_common', 'LEGACY_FTS_TRIGRAM_SQL'),
-    'MAX_FTS5_QUERY_CHARS': ('hermes_state_common', 'MAX_FTS5_QUERY_CHARS'),
-    'PERSISTENCE_ERROR_CAUSES': ('hermes_state_errors', 'PERSISTENCE_ERROR_CAUSES'),
-    'SCHEMA_SQL': ('hermes_state_common', 'SCHEMA_SQL'),
-    'SCHEMA_VERSION': ('hermes_state_common', 'SCHEMA_VERSION'),
-    'SESSION_STATUS_COMPLETE': ('hermes_state_sessions', 'SESSION_STATUS_COMPLETE'),
-    'SESSION_STATUS_EMPTY': ('hermes_state_sessions', 'SESSION_STATUS_EMPTY'),
-    'SESSION_STATUS_ERROR': ('hermes_state_sessions', 'SESSION_STATUS_ERROR'),
-    'SESSION_STATUS_INTERRUPTED': ('hermes_state_sessions', 'SESSION_STATUS_INTERRUPTED'),
-    'SKILL_EXCERPT_JOINT': ('agent.skill_commands', 'SKILL_EXCERPT_JOINT'),
-    'SKILL_SCAFFOLD_SQL_LIKE': ('agent.skill_commands', 'SKILL_SCAFFOLD_SQL_LIKE'),
-    'SessionTurnLeaseLostError': ('hermes_state_errors', 'SessionTurnLeaseLostError'),
-    'WalUnsupportedError': ('hermes_state_wal', 'WalUnsupportedError'),
-    'apply_durability_barriers': ('hermes_state_repair', 'apply_durability_barriers'),
-    'classify_session_status': ('hermes_state_sessions', 'classify_session_status'),
-    'collect_state_db_stats': ('hermes_state_dbfile', 'collect_state_db_stats'),
-    'count_db_holders': ('hermes_state_dbfile', 'count_db_holders'),
-    'describe_skill_invocation': ('agent.skill_commands', 'describe_skill_invocation'),
-    'fts5_cjk_so_path': ('hermes_state_fts', 'fts5_cjk_so_path'),
-    'is_advisory_lock_contention': ('hermes_state_common', 'is_advisory_lock_contention'),
-    'is_automatic_end_reason': ('hermes_state_common', 'is_automatic_end_reason'),
-    'is_disk_full_error': ('hermes_state_errors', 'is_disk_full_error'),
-    'is_sqlite_wal_reset_vulnerable': ('hermes_state_wal', 'is_sqlite_wal_reset_vulnerable'),
-    'is_transient_sqlite_error': ('hermes_state_errors', 'is_transient_sqlite_error'),
-    'iter_deleted_sqlite_sidecar_holders': ('hermes_state_dbfile', 'iter_deleted_sqlite_sidecar_holders'),
-    'release_or_close': ('hermes_state_registry', 'release_or_close'),
-    'report_startup_progress': ('hermes_startup_watchdog', 'report_startup_progress'),
-    'resolve_journal_mode': ('hermes_state_wal', 'resolve_journal_mode'),
-    'resolve_synchronous_level': ('hermes_state_wal', 'resolve_synchronous_level'),
-    'sanitize_context': ('agent.memory_manager', 'sanitize_context'),
-    'sqlite_source_id': ('hermes_state_wal', 'sqlite_source_id'),
-    'workspace_key': ('hermes_state_sessions', 'workspace_key'),
-}
-
-
-def __getattr__(name):  # PEP 562 â€” lazy so no import cycles
-    target = _PLUGIN_COMPAT_LAZY.get(name)
-    if target is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    import importlib
-    from hermes_cli.plugin_compat import warn_once
-    warn_once(__name__, name, *target)
-    return getattr(importlib.import_module(target[0]), target[1])
-# ---- END PLUGIN-COMPAT ----
+YªçŠx-®éÜj×¢ëiºÚ+Š§j[h‘éÜ¢éí×~·ãDèµ©hºÚn¶X§zÍHÈKÝ\Ü‹Øš[‹Ù[ˆ]ÛŒÂˆˆˆ”ÔS]HÝ]HÝÜ™H›Üˆ\›Y\ÈYÙ[ˆÙ\ÜÚ[ÛˆY]Y]KY\ÜØYÙH\ÝÜžK[Ù[˜ÛÛ™šYË•ÍHÙX\˜ÚˆÐS[ÙH
+ÛÛ˜Ý\œ™[™XY\œÈ
+ÈÛ™HÜš]\ŠNÈÛÛ\™\ÜÚ[Û‚œÜ]ÈÙ\ÜÚ[ÛœÈšXH\™[ÜÙ\ÜÚ[Û—ÚYÚZ[œÎÈÙ\ÜÚ[ÛœÈ\™HÛÝ\˜ÙK]YÙÙYŠ	ØÛIË	Ý[YÜ˜[IË‹‹ŠKˆ˜]Ú\[›™\ˆÈ“˜Z™XÝÜšY\È]™H[Ù]Ú\™K‚ˆˆˆ‚‚š[\Ü\Þ[˜Ú[Âš[\Ü]^]š[\Ü\ÚX‚š[\ÜœÛÛ‚š[\ÜÙÙÚ[™Âš[\ÜÜÂš[\Ü]Y]YBš[\Ü˜[™ÛBš[\Ü™Bš[\ÜÜ[]LÂš[\ÜÞ\Âš[\Ü™XY[™Âš[\Ü[YBš[\Ü]ZY™œ›ÛHÛÛXÝ[ÛœÈ[\Ü\]YB™œ›ÛHÛÛ^Xˆ[\ÜÛÛ^X[˜YÙ\‚™œ›ÛH]Xˆ[\Ü]‚™œ›ÛHYÙ[›Y[[ÜžWÛX[˜YÙ\ˆ[\ÜØ[š]^™WØÛÛ^™œ›ÛHYÙ[›Y\ÜØYÙWÜØ[š]^˜][Ûˆ[\ÜÜØ[š]^™WÜÝ\œ›ÙØ]\Â™œ›ÛHYÙ[œÙ\ÜÚ[Û—ØXÝ]š]H[\ÜXÝ]š]T›Ý™[˜[˜ÙB™œ›ÛHYÙ[˜ÛÛ^ØÛÛ\™\ÜÛÜˆ[\Ü
+ˆÑ—ÔT”ÒTÕQÓPT’ÑTˆ\ÈÑ—ÔT”ÒTÕQÓPT’ÑT—ÒÑVKŠB™œ›ÛH\›Y\×ØÛÛœÝ[È[\ÜÙ]Ú\›Y\×ÚÛYB™œ›ÛH\[™È[\Ü[žKØ[X›KXÝ]\˜]Ü‹\ÝÜ[Û˜[\K\U˜\‹Ø\Ý‚™œ›ÛH\›Y\×ÜÝ]WØÛÛ[[Ûˆ[\Ü
+È›ÜXNˆH
+™KY^ÜY›Üˆ˜XÚËXÛÛ\]
+BˆÐ”SÒÐÒSÔÔSˆÐÓÓT‘TÔÒSÓ—ÐÒSÔÔSˆÑ•×ÐÒ’×Õ’QÑÑT”ËˆÑ•×Õ’QÑÑT”ËˆÓTÕP“WÐÒSÔÔSˆÔ‘U’QU×ÑSQÒP“WÔÔSˆÔ‘U’QU×ÔU×ÔÑSPÕˆÔ‘PÓÕ‘TP“WÑS‘Ô‘PTÓÓ”ËˆÔ‘PÓÕ‘TP“WÑS‘Ô‘PTÓÓ”×ÔÔSˆÔ‘TÑUÑS‘Ô‘PTÓÓ”ËˆÔ‘TÑUÑS‘Ô‘PTÓÓ”×ÔÔSˆÙ\[Y\˜[ØÚ[ÜÜ[ˆÛYØXÞWÜ™\Ù]ØÚ[ÜÜ[ˆÜÚ\WÜ™]šY]ËˆÜÜ[ÜÙ\ÜÚ[Û—Û\ÝØXÝ]™KˆÜÜ[ÜÙ\ÜÚ[Û—Û\ÝØXÝ]™WØžWÚYˆ\ØØ\WÛZÙH\ÈÙ\ØØ\WÛZÙKˆÝ]Ù—Ùš[WÚY[]H\ÈÜÝ]Ù—Ùš[WÚY[]KˆQ‘T”‘QÒS‘VÔÔSˆ•×ÐÒ’×ÔÕSWÒÑVKˆ•×Ô‘P•RSÑQ‘T”SÒÑVKˆ•×ÔÔSˆ•×ÔÕSWÒÑVKˆ•×ÔÕÔQÑWÕ‘T”ÒSÓ‹ˆ•×Õ’QÔSWÔÔSˆQÐPÖWÑ•×ÔÔSˆQÐPÖWÑ•×Õ’QÔSWÔÔSˆPVÑ•ÍWÔUQT–WÐÒT”ËˆÐÒSPWÔÔSˆÐÒSPWÕ‘T”ÒSÓ‹ˆÔ‘U’QU×ÐÓÓ•S•ÔÔSˆÔ‘U’QU×ÒPQÐÒT”ËˆÔ‘U’QU×ÓPVÐÒT”ËˆÔ‘U’QU×ÔÐÐQ‘“ÓÕÒS‘ÕËˆÔ‘U’QU×ÔÐÐQ‘“ÓQÔÔSŠB™œ›ÛH\›Y\×ÜÝ]WÙ\œ›ÜœÈ[\Ü
+ˆÑSUQÕÐSÑÑS‘TUSÓ—ÓTÑËÑTÒ×ÒS×ÑT”“Ô—ÓPT’ÑT‹ÔÕUWÑ—ÐÓÔ”•TÓTÑËÔÕUWÑ—ÑÑS‘TUSÓ—ÒÑVKˆÔÕUWÑ—Ô‘TPÑQÓTÑË[]YØ[Ù[™\˜][Û‘\œ›Ü‹Ù\ÜÚ[ÛÛÛ\™\ÜÚ[Û’[”›ÙÜ™\ÜÑ\œ›Ü‹Ý]QÛÜœ\\œ›Ü‹ˆÝ]Q”™\XÙY\œ›Ü‹Ú\×Û›×Û[Ü™WÜ›ÝÜËÛ\ÜÚYžWÜ\œÚ\Ý[˜ÙWÙ\œ›Ü‹\×ÛX[›Ü›YYÙ—Ù\œ›Ü‹ˆ\×ÛX[›Ü›YYÜØÚ[XWÙ\œ›Ü‹ŠB™œ›ÛH\›Y\×ÜÝ]WÙÝX\™[\Ü
+ˆÔÕUWÑ—ÑÕPT‘Ð–TTÔ×ÑS•‹Ú[—Ý\ÝØÛÛ^Ú\×Ü›ÙXÝ[Û—ÜÝ]WÙ‹Ü™X[Ü]›Ü›WÜÝ]WÜ›ÛÝˆÜÙ]Û\ÝÚ[š]Ù\œ›Ü‹Ù]Û\ÝÚ[š]Ù\œ›Ü‹ŠB™œ›ÛH\›Y\×ÜÝ]WÜ™XYÛÛ[\ÜÔ‘PQÔÓÓÓPVÜ›Ø×Ù™Ý\™Ù]ËÜ™XYØYÙ]Ù›Ü‚™œ›ÛH\›Y\×ÜÝ]WÜÙ\ÜÚ[ÛœÈ[\Ü
+ˆÙ\ÜÚ[Û”Ù\ÜÚ[ÛœÓZ^[‹ˆÓSÑSÐÓÓ‘’Q×Ô“Õ×ÓRTÔÒS‘ËˆØÛÛXÝÙ[YØ]WØÚ[ÚYËˆØÝÙÜ™Yš^ØÛ]\ÙKˆÙ[]WÙ[YØ]WØÚ[™[‹ˆÙ[YØ]WÙœ›ÛWÚœÛÛ‹ˆÝÛÜšÜÜXÙWÚÙ^WØÛ]\ÙKˆÛ\ÜÚYžWÜÙ\ÜÚ[Û—ÜÝ]\ËˆÛÜšÜÜXÙWÚÙ^KŠB™œ›ÛH\›Y\×ÜÝ]WÙÈ[\ÜÙ\ÜÚ[Û‘ÔÙ]\Z^[‹ØYÙÍWØÚš×Ù^[œÚ[Û‚™œ›ÛH\›Y\×ÜÝ]WÜÜXš[]H[\ÜÙ\ÜÚ[Û”ÜXš[]SZ^[‚™œ›ÛH\›Y\×ÜÝ]WÝ[YÜ˜[H[\ÜÙ\ÜÚ[Û•[YÜ˜[UÜXÜÓZ^[‚™œ›ÛH\›Y\×ÜÝ]WÜØÚ[XH[\ÜÙ\ÜÚ[Û”ØÚ[XSZ^[‚š[\Ü\›Y\×ÜÝ]WÚÛ\œÈ\ÈÜÝ]WÚÛ\œÂ™œ›ÛH\›Y\×ÜÝ]WÙ™š[H[\Ü
+ˆØØ[›ÛšXØ[ÜÜ[]WÜ]ØÛÛ›™XÝÝ˜XÚÙYÙ‹Ü™XYÜÜ[]WØ\XØ][Û—ÚYÜÝ]ÜÜ[]WÜÚYXØ\—ÚY[]KˆÝØ]ÚYÜÜ[]WÜÚYXØ\—Ü]Ë\×Þ™\›ÙYÜÝ]WÙ‹]X\˜[[™WØÜ›ÜÜ×Ü›ØÙ\Ü×ÛØÚË]X\˜[[™WÞ™\›ÙYÜÝ]WÙ‹ˆ™Y\ÙWÙ[]YÝØ[ÙÙ[™\˜][Û‹ŠB™œ›ÛH\›Y\×ÜÝ]WÛY\ÜØYÙ\È[\ÜÙ\ÜÚ[Û“Y\ÜØYÙ\ÓZ^[‚™œ›ÛH\›Y\×ÜÝ]WÝØ[[\ÜÕÐSÒSÓÓTUÓPT’ÑT”Ë\WÙ]X˜\ÙWÜ˜YÛX\Ë\WÝØ[ÝÚ]Ù˜[˜XÚÂ™œ›ÛH\›Y\×ÜÝ]WÜ™\Z\ˆ[\ÜØÛZ[WÜ™\Z\—Ø][\™Y›YÚÙ—ÝÜš]Xš[]K™\Z\—ÜÝ]WÙ—ÜØÚ[XB™œ›ÛH\›Y\×ÜÝ]WÝ]\È[\ÜÙ\ÜÚ[Û•]\ÓZ^[‚™œ›ÛH\›Y\×ÜÝ]WÝ\ØYÙH[\ÜÙ\ÜÚ[Û•\ØYÙSZ^[‚™œ›ÛH\›Y\×ÜÝ]WÛXZ[[˜[˜ÙH[\ÜÙ\ÜÚ[Û“XZ[[˜[˜ÙSZ^[‚™œ›ÛH\›Y\×ÜÝ]WÙØ]]Ø^H[\ÜÙ\ÜÚ[Û‘Ø]]Ø^SZ^[‚™œ›ÛH\›Y\×ÜÝ]WØÛÛ\™\ÜÚ[Ûˆ[\ÜÙ\ÜÚ[ÛÛÛ\™\ÜÚ[Û“Z^[‚™œ›ÛH\›Y\×ÜÝ]WÜÙX\˜Ú[\ÜÙ\ÜÚ[Û”ÙX\˜ÚZ^[‚‚žNˆÈ\™\[™[˜ÞK]Û\˜]HØØY™›Û\\ÙH[\ÜÈ™Y›Ü™H\[œÝ[‚ˆ[\ÜÝ][™^Ù\[\Ü\œ›ÜŽˆÈ˜YÛXNˆ›ÈÛÝ™\ˆHÝš\YÜØØY™›Û[œÝ[ÈÛ›BˆÝ][H›Û™HÈ\NˆYÛ›Ü™VØ\ÜÚYÛ›Y[B‚›ÙÙÙ\ˆHÙÙÚ[™Ë™Ù]ÙÙÙ\Š×Û˜[YW×ÊB‚—ÓPVÔÐQ‘WÓQTÔÐQÑTÈHŒÌÈ™\Ý[YKÙ^ÜÝX\™Y˜][‚‚™YˆØÛÛ™šYÝ\™YÝ˜[œØÜš\Û[Z]
+Ù^NˆÝ‹˜[˜XÚÎˆ[HÓPVÔÐQ‘WÓQTÔÐQÑTÊHOˆ[‚ˆˆˆ˜Ù\ÜÚ[ÛœËÙ^O˜œ›ÛHÛÛ™šYËžX[[
+^žH[\ÜˆÚ\˜Ý[\ˆ]ØY
+K[ÙH
+™˜[˜XÚÊŽÈ\ØX›\Ëˆˆˆ‚ˆžN‚ˆœ›ÛH\›Y\×ØÛK˜ÛÛ™šYÈ[\ÜØYØÛÛ™šY×Ü™XYÛ›Bˆ˜[YHH
+ØYØÛÛ™šY×Ü™XYÛ›J
+K™Ù]
+œÙ\ÜÚ[ÛœÈŠHÜˆßJK™Ù]
+Ù^JBˆYˆ˜[YH\È›Û™N‚ˆ™]\›ˆ˜[˜XÚÂˆ[Z]H[
+˜[YJBˆ™]\›ˆ[Z]Yˆ[Z]H[ÙH˜[˜XÚÂˆ^Ù\^Ù\[ÛŽ‚ˆ™]\›ˆ˜[˜XÚÂ‚‚™Yˆ™\ÛÛ™YÛX^Ü™\Ý[YWÛY\ÜØYÙ\Ê
+HOˆ[‚ˆ™]\›ˆØÛÛ™šYÝ\™YÝ˜[œØÜš\Û[Z]
+›X^Ü™\Ý[YWÛY\ÜØYÙ\ÈŠB‚‚™Yˆ™\ÛÛ™YÛX^Ù^ÜÛY\ÜØYÙ\Ê
+HOˆ[‚ˆ™]\›ˆØÛÛ™šYÝ\™YÝ˜[œØÜš\Û[Z]
+›X^Ù^ÜÛY\ÜØYÙ\ÈŠB‚‚˜Û\ÜÈÙ\ÜÚ[Û”™\Ý[YUÛÓ\™ÙQ\œ›ÜŠ˜[YQ\œ›ÜŠN‚ˆYˆ×Ú[š]×ÊˆÙ[‹Y\ÜØYÙWØÛÝ[ˆ[[Z]ˆ[HÓPVÔÐQ‘WÓQTÔÐQÑTËØÛÜNˆÝˆH˜XÜ›ÜÜÈ]È[™XYÙH‹ˆ
+N‚ˆÙ[‹›Y\ÜØYÙWØÛÝ[Ù[‹›[Z]HY\ÜØYÙWØÛÝ[[Z]ˆÝ\\Š
+K—×Ú[š]×ÊˆˆœÙ\ÜÚ[Ûˆ\È]X\ÝÛY\ÜØYÙWØÛÝ[HXÝ]™HY\ÜØYÙ\ÈÜØÛÜ_NÈ‚ˆˆœØY™H™\Ý[YH[Z]\ÈÛ[Z]Kˆ^ÜHÙ\ÜÚ[Ûˆ[œÝXYÜˆÙ]‚ˆœÙ\ÜÚ[ÛœË›X^Ü™\Ý[YWÛY\ÜØYÙ\Îˆ[ˆÛÛ™šYËžX[[È\ØX›HHÝX\™ˆ‚ˆ
+B‚‚˜Û\ÜÈÙ\ÜÚ[Û‘^ÜÛÓ\™ÙQ\œ›ÜŠ˜[YQ\œ›ÜŠN‚ˆYˆ×Ú[š]×ÊÙ[‹Ù\ÜÚ[Û—ÚYˆÝ‹Y\ÜØYÙWØÛÝ[ˆ[[Z]ˆ[HÓPVÔÐQ‘WÓQTÔÐQÑTÊN‚ˆÙ[‹œÙ\ÜÚ[Û—ÚYÙ[‹›Y\ÜØYÙWØÛÝ[Ù[‹›[Z]HÙ\ÜÚ[Û—ÚYY\ÜØYÙWØÛÝ[[Z]ˆÝ\\Š
+K—×Ú[š]×ÊˆˆœÙ\ÜÚ[Ûˆ	ÞÜÙ\ÜÚ[Û—ÚYIÈ\È]X\ÝÛY\ÜØYÙWØÛÝ[HXÝ]™HY\ÜØYÙ\ÎÈ‚ˆˆœØY™H[‹[Y[[ÜžH^Ü[Z]\ÈÛ[Z]H‚ˆ
+B‚‚™YˆØÛÛ\™\ÜÚ[Û—ÛØÚ×ÚÛ\—Ü›ØÙ\Ü×Ú\×ÙXY
+Û\ŽˆÝŠHOˆ›ÛÛ‚ˆˆˆ•YHÛ›HÚ[ˆHYO˜ØÚÈÛ\‰ÜÈØØ[Q\È›Ý˜X›HÛÛ™K‚ˆ™XÛZ[HÛˆÙ\›™[›ÛÙˆÛ›Nˆ[œÝXÝ\™YÜØ[YK\›ØÙ\ÜÈÛ\œÈ
+[›Ý\‚ˆ™XY	ÜÈ]™HX\ÙJH[™[žH›Ø™HÝXÙY\HX\ÙH[[^\žBˆ
+Q™]\ÙH]\Ý™]™\ˆÝX[H]™HX\ÙNÈHÜ›Û™ÛKZÙ\Û™HÙ[‹ZX[ÊKˆˆˆ‚ˆX]ÚH™KœÙX\˜Ú
+ˆŠÎ—ŸŠ\YJ
+ÊJÎŽŸ	
+H‹Û\ˆÜˆˆŠBˆYH[
+X]Ú™Ü›Ý\
+JJHYˆX]Ú[ÙHˆYˆYHÜˆYOHÜË™Ù]Y
+
+N‚ˆ™]\›ˆ˜[ÙBˆYˆÝ][\È›Ý›Û™N‚ˆžN‚ˆ™]\›ˆ›ÝÝ][œYÙ^\ÝÊY
+HÈ™XÞXÛYQÈ™XY\È[]™H
+ÛÛœÙ\˜]]™JBˆ^Ù\^Ù\[ÛŽ‚ˆ™]\›ˆ˜[ÙBˆÈÝ][[\ÜÈ˜[˜XÚÈ\ÈÔÒV[Û›NˆÛˆÚ[™ÝÜÈÜËšÚ[
+Y
+HX\ÈÚYÏLÂˆÈÕ“Ð×ÑU‘S•[™Ø[ˆÚ[H\™Ù]	ÜÈÛÛœÛÛHÜ›Ý\‚ˆYˆÜË›˜[YHOH›Ž‚ˆ™]\›ˆ˜[ÙBˆžN‚ˆÜËšÚ[
+Y
+HÈÚ[™ÝÜËY›ÛÝÝ[ŽˆÚÈ8 %X\›K\™]\›œÈ\ÝX›Ý™Bˆ^Ù\›ØÙ\ÜÓÛÚÝ\\œ›ÜŽ‚ˆ™]\›ˆYBˆ^Ù\
+ÔÑ\œ›Ü‹Ý™\™›ÝÑ\œ›ÜŠNˆÈ\›Z\ÜÚ[Û‘\œ›Üˆ\È[ˆÔÑ\œ›ÜŽˆ[]™H]›Ü™ZYÛ‚ˆ™]\›ˆ˜[ÙBˆ™]\›ˆ˜[ÙB‚‚™YˆÜØÜX—ÜÝ\œ›ÙØ]\Ê˜[YNˆ[žJHOˆ[žN‚ˆˆˆ”™\XÙHÛ™HÝ\œ›ÙØ]\È[ˆ^
+Ü[]LÈ˜Z\Ù\È[šXÛÙQ[˜ÛÙQ\œ›Ü‹X›Ü[™ÈHÚÛHÜš]JKˆˆˆ‚ˆ™]\›ˆÜØ[š]^™WÜÝ\œ›ÙØ]\Ê˜[YJHYˆ\Ú[œÝ[˜ÙJ˜[YKÝŠH[ÙH˜[YB‚‚ˆÈš[[™ÈXÚÙ]È]\™[‰ÝH›Ý]X›H›ÝšY\ˆY[]NˆHÙ\ÜÚ[Ûˆ]\œÚ\ÝYÛ›BˆÈÛ™HÙˆ\ÙH
+™]™\ˆ˜[ˆÛ[Ù[
+H˜[È˜XÚÈÈHÛÛ™šYÈY˜][ˆÚ\™YžBˆÈÙ\ÜÚ[Û—ÙØ]]Ø^WÜ[[YH[™ZWÙØ]]Ø^KœÙ\™\ˆÛÈ^HØ[››ÝšY‚—ÐT‘WÐ’SS‘×Ô“Õ’QT”ÈHœ›Þ™[œÙ]
+È˜]]È‹˜Ý\ÝÛHŸJB‚•H\U˜\Š•ŠB‚ˆÈ[\Ü][YHÛ˜\ÚÝ]ÈÙY˜][Ù—Ü]
+
+H]XÝH™K\Ú[YQUSÑ—ÔUˆÈ
+\ÝÈ[ÛšÙ^\]ÚHÛÛœÝ[\™XÝJK‚‘QUSÑ—ÔUHÒSTÔ•ÑQUSÑ—ÔUHÙ]Ú\›Y\×ÚÛYJ
+HÈœÝ]K™ˆ‚‚ˆÈ˜XÚÈÙ™ˆœ›ÛH™XY[Û›HÜ[œÈY\ˆÛ™H˜Z[Îˆ›Ý\ˆ]Y\žK]ÚÜ[›ÝYÚ]ˆÈ˜[œÚY[™™\ÜÝ\™HÙ\Û‰ÝÝ˜[™H™XYÛÛ‚—Ô‘PQÓÔS—Ô‘U–WÔÑPÓÓ‘ÈHŒŒˆÈ˜[œÚY[ÔSUWÒSÑT”ˆ™]žHYÙ]›Üˆ‘PQSÓ“HÜ[œÈ
+ÌLÍŠNˆHÐSÜš]\‰ÜÈÚXÚÜÚ[ÂˆÈ™\Ù]Ùœ˜[YH›\ÚÝ\™˜XÙ\È™\ÚÈKÓÈ\œ›ÜˆˆÈHÛÛ˜Ý\œ™[[ÙO\›È™XY\ˆ›ÜˆHZ[\ÙXÛÛ™BˆÈÚYHÚ[™ÝÈ8 %H›ÈÛÛ›™XÝ[ÛˆØ[››Ý\™›Ü›HÐS™XÛÝ™\žH™XØ]\ÙH™XÛÝ™\žHÜš]\ÈH\ÚBˆÈ[™^ÚXÚ[ÙO\›È™Y\Ù\ËˆHÜš]\ˆÛÜÙ\ÈHÚ[™ÝÈÛˆ]ÈÝÛ‹ÛÈH™]ÈÚÜ™]šY\ÂˆÈXZÙHHÜ[ˆÝXØÙYY[œÝXYÙˆLZ[™ÈHÚÛHØ\KÜÙ\ÜÚ[ÛœÈÛ
+Üˆ[žHÝ\ˆ›ÈÜ[™\ŠK‚ˆÈ[X™\˜][H“Õ›ÜˆÜš]X›HÜ[œÎˆHÜš]\ˆÝÛœÈH˜[œÚ][Û‹ÛÈ[ˆSÑT”ˆ\™H\ÈH™X[ˆÈÝÜ˜YÙKÙ™›Ø›[KˆH\œÚ\Ý[SÑT”ˆÝ[^]\ÝÈHYÙ][™›ÜYØ]\Ë‚—Ô‘PQÓÓ“WÒSÑT”—Ô‘U–WÐUSTËÔ‘PQÓÓ“WÒSÑT”—Ô‘U–WÐPÒÓÑ‘—ÔÈHËŒB‚‚™YˆÙY˜][Ù—Ü]
+
+HOˆ]‚ˆˆˆ‘Y˜][Ý]Hˆ]]ÐS[YNˆH™K\Ú[YQUSÑ—ÔUÚ[œË[ÙBˆÙ]Ú\›Y\×ÚÛYJ
+X\È™\ÛÛ™Yœ™\Ú
+H[[YHT“QT×ÒÓQH™Y\™XÝÛÜšÜÈ™YØ\™\ÜÈÙˆ[\Ü
+Kˆˆˆ‚ˆ™]\›ˆQUSÑ—ÔUYˆQUSÑ—ÔUOHÒSTÔ•ÑQUSÑ—ÔU[ÙHÙ]Ú\›Y\×ÚÛYJ
+HÈœÝ]K™ˆ‚‚‚ˆÈ]™KQˆÝX\™Û›ØœÈ]™HT‘H
+›Ý[ˆ\›Y\×ÜÝ]WÙÝX\™
+NˆH\›Y]XÈÛÛ™\Ý[ÛšÙ^\]Ú\ÂˆÈ\›Y\×ÜÝ]K—ÔÕUWÑ—ÑÕPT‘Ð–TTÔØ
+]\Ý›X\šË›]™WÜÞ\Ý[WÙÝX\™Øž\\ÜØ\ØØ\H]Ú
+BˆÈ[™ÑVWÑS–WÔ“ÓÕØ
+H™K\Ø[™›Þ›ÛÝÛÈÝ\ÝÛKRT“QT×ÒÓQH\Þ[Y[È\™HÛÝ™\™Y
+K‚—ÔÕUWÑ—ÑÕPT‘Ð–TTÔÈH˜[ÙB‚ˆÎˆ[‹XØ\œšYYÚ[ˆÙˆÔÕUWÑ—ÑÕPT‘Ð–TTÔØˆH[Ù[HÛØ˜[Ø[››ÝˆÎˆÜ›ÜÜÈH›ØÙ\ÜÈ›Ý[™\žKÛÈH\Ý][X™\˜][HÚ[ÈH
+˜Ú[
+ˆ]ˆÎˆH]™Hˆ\È›ÈØ^HÈÜÝ]Û˜ÙH[˜Ù\ÝžH\›\ÈHÝX\™\™K‚ˆÎˆ^Ü\È[ˆHÚ[	ÜÈ[ˆ[œÝXY‚—ÔÕUWÑ—ÑÕPT‘Ð–TTÔ×ÑS•ˆH’T“QT×ÔÕUWÑ—ÑÕPT‘Ð–TTÔÈ‚‚ˆÎˆY][Û˜[›ÙXÝ[Ûˆ›ÛÝÈÈ™Y\ÙH
+™^[Û™H]›Ü›HY˜][ˆÎˆ‹Ë˜\™\Ø
+KˆH\ÝÛÛ™\Ý[š™XÝÈH™K\Ø[™›Þ›ÙXÝ[Û‚ˆÎˆ›ÛÝ\™HÛÈÝ\ÝÛKXT“QT×ÒÓQX\Þ[Y[È\™HÛÝ™\™YÛË‚—ÔÕUWÑ—ÑÕPT‘ÑVWÑS–WÔ“ÓÕÎˆ\VÔ]‹‹—HH
+
+B‚‚™YˆÜ™X[Ü]›Ü›WÜÝ]WÜ›ÛÝ
+
+HOˆÜ[Û˜[Ô]N‚ˆˆˆ”™\ÛÛ™HH‘PS]›Ü›KYY˜][\›Y\È›ÛÝ›ÜˆHÝX\™‚‚ˆ[X™\˜][H]›ÚYÈ]šÛYJ
+XÈ\›Y\×ØÛÛœÝ[Øˆ\ÝÂˆ›Ý][™[H[ÛšÙ^\]Ú]šÛYXÈH[\\‹[™\›Y\×ÜÝ]Xˆ\ÈÙ[ˆ[\ÜY^š[H
+Ú[JˆÝXÚH]Ú\ÈXÝ]™H8 %™\ÛÛš[™Âˆ›ÝYÚH]ÚYØ[X›HÛÝ[Z\ÚY[YžHH\Ý	ÜÈÝÛˆ\›Y]XÂˆÛYH\Èœ›ÙXÝ[Ûˆˆ
+˜[ÙHÜÚ]]™JHÜ‹ÛÜœÙKZ\ÜÈH™X[Û™Bˆ
+˜[ÙH™YØ]]™JKˆÜËœ]™^[™\Ù\˜™XYÈHÓQH[š\›Û›Y[ˆ˜\šXX›HÈ\ÜÝÙ[žKÚXÚH\›Y]XÈÛÛ™\Ý™]™\ˆ™]Üš]\Ë‚ˆˆˆ‚ˆžN‚ˆYˆÞ\Ëœ]›Ü›HOHÚ[ŒÌˆŽ‚ˆ˜\ÙHHÜË™[š\›Û‹™Ù]
+“ÐÐSTUH‹ˆŠKœÝš\
+
+Bˆ›ÛÝH
+ˆ]
+˜\ÙJHÈ˜\™\È‚ˆYˆ˜\ÙBˆ[ÙH]
+ÜËœ]™^[™\Ù\ŠŸˆŠJHÈ\]HˆÈ“ØØ[ˆÈ˜\™\È‚ˆ
+Bˆ[ÙN‚ˆ›ÛÝH]
+ÜËœ]™^[™\Ù\ŠŸˆŠJHÈ‹˜\™\È‚ˆ™]\›ˆ›ÛÝœ™\ÛÛ™J
+Bˆ^Ù\^Ù\[ÛŽ‚ˆ™]\›ˆ›Û™B‚‚ˆÎˆ[ˆX\šÙ\ˆ^ÜYžHH\›Y]XÈ\ÝÛÛ™\Ý]HØ[YH[ÛY[]ˆÎˆ™Y\™XÝÈT“QT×ÒÓQXÈH\‹\Ù\ÜÚ[Ûˆ\\ÛÛ][Ûˆ›ÛÝˆ]ÂˆÎˆ˜[YH\È]\ÛÛ][Ûˆ›ÛÝˆ[›ZÙHUTÕÊ˜
+ÝÛ™YžH]\Ý[™ˆÎˆ›Ý][™[HØÜX˜™YžH\ÝÈ]™XZ[HÚ[[š\›Û›Y[
+K\ÈX\šÙ\‚ˆÎˆ\ÈÕT”Îˆ]XÛ\™\È\È›ØÙ\ÜÈ™YH\È[›š[™È[™\ˆ\›Y\È\ÝˆÎˆ\ÛÛ][Ûˆ‹[™][š\š]È[ÈÝXœ›ØÙ\ÜÈÚ[™[ˆžHY˜][8 %ÛÈBˆÎˆÚ[]™XÙZ]™YH]ÚYT“QT×ÒÓQX[ÛÈ™XÙZ]™YHX\šÙ\‹ˆÎˆ[™HÚ[]™\ÛÛ™\ÈH›ÙXÝ[ÛˆˆÚ[HØ\œžZ[™È]\ËžBˆÎˆYš[š][Û‹[ˆ\ÛÛ][Ûˆ\ØØ\H
+ÎÍÌ
+K‚—ÕTÕÒTÓÓUSÓ—ÓPT’ÑT—ÑS•ˆH’T“QT×ÕTÕÒTÓÓUSÓˆ‚‚‚™YˆÜ[›š[™×Ý[™\—Ü]\Ý
+
+HOˆ›ÛÛ‚ˆˆˆ•YHÚ[ˆ\È›ØÙ\ÜÈ
+ÜˆH\™[\Ý›ØÙ\ÜÊH\ÈH]\Ý[‹ˆˆˆ‚ˆ™]\›ˆ›ÛÛ
+ˆÜË™[š\›Û‹™Ù]
+”UTÕÐÕT”‘S•ÕTÕŠBˆÜˆÜË™[š\›Û‹™Ù]
+”UTÕÕ‘T”ÒSÓˆŠBˆÜˆÜË™[š\›Û‹™Ù]
+ÕTÕÒTÓÓUSÓ—ÓPT’ÑT—ÑS•ŠBˆ
+B‚‚ˆÎˆ˜[Y\È]Y[YžHH]\Ý][˜Ú\ˆ[ˆH›ØÙ\ÜÈÛÛ[X[™[™KˆX]ÚYˆÎˆYØZ[œÝH
+˜˜\Ù[˜[YJˆÙˆXXÚ\™ÝˆÚÙ[ˆÛÈÝ\Ü]\Ý[Ù‹Y]‹Ë‹‹˜ˆÎˆ]È8 %ÚXÚÈÚÝÈ\[ˆ™X[\™Ýˆ8 %Ø[››Ý˜[ÙK\ÜÚ]]™K‚—ÔUTÕÓUSÒT—ÓSQTÈHœ›Þ™[œÙ]
+ˆÈœ]\Ý‹œK\Ý‹œ]\Ý™^H‹œK\Ý™^HŸBŠB‚ˆÎˆY[[Ú\ÙY[˜Ù\ÝžH[œÝÙ\‹ˆH›ØÙ\ÜÈ™YHX›Ý™H\ÈÙ\È›ÝÚ[™ÙH[ˆBˆÎˆØ^H]X]\œÈ\™K[™HØ[È]\Ý›ÝÛÜÝ[ž][™ÈÛˆHÝ]‚—ÔUTÕÐSÑTÕÔŽˆÜ[Û˜[Ø›ÛÛHH›Û™B‚‚™YˆÜ›ØÙ\Ü×ÛÛÚÜ×ÛZÙWÜ]\Ý
+›ØÎˆ[žJHOˆ›ÛÛ‚ˆˆˆ•YHÚ[ˆ
+œ›ØÊ‰ÜÈÛÛ[X[™[™H\ÈH]\Ý[›ØØ][Û‹‚‚ˆÛÝ™\œÈ›Ý]\Ý‹‹˜
+][˜Ú\ˆÛˆ\™Ý–ÌJH[™]Ûˆ[H]\Ýˆ
+][˜Ú\ˆ\ÈH˜\™H]\ÝÚÙ[ŠKˆH›ØÙ\ÜÈÚÜÙHÛÛ[X[™[™HÙBˆØ[››Ý™XY\È™X]Y\È››Ý]\ÝŽˆÝY\ÜÚ[™ÈHÝ\ˆØ^HÛÝ[ˆ™Y\ÙH›ÙXÝ[ÛˆÜ[œÈ›Üˆ[œ™[]Y™X\ÛÛœË‚ˆˆˆ‚ˆžN‚ˆÛY[™HH›ØË˜ÛY[™J
+HÜˆ×Bˆ^Ù\^Ù\[ÛŽ‚ˆ™]\›ˆ˜[ÙBˆ›Üˆ\™È[ˆÛY[™N‚ˆžN‚ˆÚÙ[ˆHÝŠ\™ÊKœÝš\
+	È‰ÊKœÝš\
+‰ÈŠBˆÈÜ]Ûˆ›ÝÙ\\˜]ÜœÈÛˆ]™\žHÜÝˆÜËœ]˜˜\Ù[˜[YH\ÂˆÈÔÒV[Û›H[™\ˆ[^[™ÛÝ[X]™HHÚ[™ÝÜË\Ý[H]ˆÈ[XÝXZÚ[™ÈHX]Ú\‰ÜÈ[œÝÙ\ˆ\[™ÛˆH]›Ü›K‚ˆ˜[YHHÚÙ[‹œ™\XÙJ—‹‹ÈŠKœœÜ]
+‹È‹JVËLWK›ÝÙ\Š
+Bˆ^Ù\^Ù\[ÛŽ‚ˆÛÛ[YBˆYˆ˜[YH[ˆÔUTÕÓUSÒT—ÓSQTÎ‚ˆ™]\›ˆYBˆ™]\›ˆ˜[ÙB‚‚™YˆÚ\×Ü]\ÝØ[˜Ù\ÝÜŠ
+HOˆ›ÛÛ‚ˆˆˆ•YHÚ[ˆÛÛYH[˜Ù\ÝÜˆ›ØÙ\ÜÈÙˆ\ÈÛ™H\ÈH]\Ý[‹‚‚ˆÜ[›š[™×Ý[™\—Ü]\Ý™XYÈUTÕÊ˜[ˆ˜\œËÚXÚHÚ[ˆÜ]Û™YÚ]H™XZ[[š\›Û›Y[ÜÙ\È]HØ[YH[ÛY[]ÜÙ\ÈBˆT“QT×ÒÓQX™Y\™XÝˆ]Ú[Z[\È]H›ÙXÝ[Ûˆˆ
+˜[™
+‚ˆ\Ø\›\ÈHÝX\™[ˆÛ™HÝ\
+ÎÍÌ
+Kˆ[˜Ù\ÝžH\ÈHÛ™H\ÝXÛÛ^ˆÚYÛ˜[]Ý\š]™\È[ˆ[ˆ™XZ[ÛÈ]˜XÚÜÈH[ˆÚXÚÈ\‚‚ˆ˜Z[ÈÜ[ˆ
+˜[ÙX
+HÚ[ˆÝ][\È[˜]˜Z[X›HÜˆHØ[È\œ›ÜœÈ8 %ˆ]™\ÝÜ™\ÈH™]š[Ý\È[‹[Û›H™Z]š[Ý\ˆ˜]\ˆ[ˆ›ØÚÚ[™È™X[ˆ\Ù\ˆ[œÈÛˆHÝ][XØÝ\‚ˆˆˆ‚ˆÛØ˜[ÔUTÕÐSÑTÕÔ‚ˆYˆÔUTÕÐSÑTÕÔˆ\È›Ý›Û™N‚ˆ™]\›ˆÔUTÕÐSÑTÕÔ‚ˆ›Ý[™H˜[ÙBˆYˆÝ][\È›Ý›Û™N‚ˆžN‚ˆ›Üˆ\™[[ˆÝ][”›ØÙ\ÜÊ
+Kœ\™[Ê
+N‚ˆYˆÜ›ØÙ\Ü×ÛÛÚÜ×ÛZÙWÜ]\Ý
+\™[
+N‚ˆ›Ý[™HYBˆœ™XZÂˆ^Ù\^Ù\[ÛŽ‚ˆ›Ý[™H˜[ÙBˆÔUTÕÐSÑTÕÔˆH›Ý[™ˆ™]\›ˆ›Ý[™‚‚™YˆÚ[—Ý\ÝØÛÛ^
+
+HOˆ›ÛÛ‚ˆˆˆ•YHÚ[ˆ\È›ØÙ\ÜÈ\ÈH\Ý[‹žH[š\›Û›Y[ÜˆžH[˜Ù\ÝžK‚‚ˆÜ™\ˆX]\œÈ›ÜˆÛÜÝˆH[ˆ›Ø™H\ÈÛÈXÝÛÚÝ\È[™ÛÝ™\œÈBˆÛÛ[[Ûˆ[‹\›ØÙ\ÜÈØ\ÙKÛÈH[˜Ù\ÝžHØ[ÈÛ›H[œÈ›Üˆ›ØÙ\ÜÙ\ÈBˆ[š\›Û›Y[ÛZ[\È\™HÜ™[˜\žH\Ù\ˆ[œÈ8 %[™]È[œÝÙ\ˆ\ÈY[[Ú\ÙYˆÛÈH™X[\›Y\Ø[›ØØ][Ûˆ^\È›Üˆ][ÜÝÛ™HØ[Ë‚ˆˆˆ‚ˆYˆÜ[›š[™×Ý[™\—Ü]\Ý
+
+N‚ˆ™]\›ˆYBˆ™]\›ˆÚ\×Ü]\ÝØ[˜Ù\ÝÜŠ
+B‚‚™YˆÜ›ÙXÝ[Û—ÜÝ]WÜ›ÛÝÊ
+HOˆ\ÝÔ]N‚ˆ›ÛÝÎˆ\ÝÔ]HH×Bˆ™X[Ü›ÛÝHÜ™X[Ü]›Ü›WÜÝ]WÜ›ÛÝ
+
+BˆYˆ™X[Ü›ÛÝ\È›Ý›Û™N‚ˆ›ÛÝË˜\[™
+™X[Ü›ÛÝ
+Bˆ›Üˆ^˜H[ˆÔÕUWÑ—ÑÕPT‘ÑVWÑS–WÔ“ÓÕÎ‚ˆžN‚ˆ›ÛÝË˜\[™
+]
+^˜JK™^[™\Ù\Š
+Kœ™\ÛÛ™J
+JBˆ^Ù\^Ù\[ÛŽ‚ˆÛÛ[YBˆ™]\›ˆ›ÛÝÂ‚‚™YˆÚ\×Ü›ÙXÝ[Û—ÜÝ]WÙŠ™\ÛÛ™Yˆ]›ÛÝˆ]
+HOˆ›ÛÛ‚ˆˆˆ•YHÚ[ˆ
+œ™\ÛÛ™Y
+ˆ\ÈHˆš[HÙˆH™X[\›Y\ÈÛYH
+œ›ÛÝ
+‹‚‚ˆX]Ú\Èš[\È\™XÝH[ˆH›ÛÝ
+›ÛÝ‹ÜÝ]K™˜
+H[™›Ùš[BˆÛY\È
+›ÛÝ‹Ü›Ùš[\ËÏ˜[YO‹ÜÝ]K™˜
+Kˆ[X™\˜][HÙ\È“ÕˆX]ÚY\\ˆØÜ˜]Ú]È
+K™Ëˆ™\ÈÛÜšÝ™Y\È]\[ˆÈ]™Bˆ[™\ˆ‹Ëš\›Y\ËÚ\›Y\ËXYÙ[Ë‹‹˜
+HÛÈ\›Y]XÈ\ÝÈ\Ú[™È[\ÝX[ˆ[\\œÈØ[››Ý˜[ÙK\ÜÚ]]™K‚ˆˆˆ‚ˆYˆ™\ÛÛ™Yœ\™[OH›ÛÝ‚ˆ™]\›ˆYBˆžN‚ˆ™[H™\ÛÛ™Yœ™[]]™WÝÊ›ÛÝ
+Bˆ^Ù\˜[YQ\œ›ÜŽ‚ˆ™]\›ˆ˜[ÙBˆ\ÈH™[œ\Âˆ™]\›ˆ[Š\ÊHOHÈ[™\ÖÌHOHœ›Ùš[\È‚‚‚™YˆÙ[œÝ\™WÝ\ÝÚ\ÛÛ][ÛŠ—Ü]ˆ]
+HOˆ›Û™N‚ˆˆˆ”˜Z\ÙH™Y›Ü™H[žHÛÛ›™XÝ[Û‹ÛZÙ\‹Ü˜YÛXKØž]H›Ø™HÚ[ˆH]\ÝXÛÛ^›ØÙ\ÜÂˆ
+[ˆÔˆ[˜Ù\ÝžJH™\ÛÛ™\ÈH›ÙXÝ[Ûˆ‹‚‚ˆ[ˆ[Û™H\È›Ý[›ÝYÚˆHÚ[Ü]Û™YÚ]H™XZ[[š\›Û›Y[ÜÙ\ÈUTÕÊ˜[™ˆT“QT×ÒÓQXÙÙ]\‹ÚXÚ\È™XÚ\Ù[HHÝ]H[ˆÚXÚ]Üš]\ÈÈ›ÙXÝ[Ûˆ
+ÎÍÌ
+K‚ˆˆˆ‚ˆYˆÔÕUWÑ—ÑÕPT‘Ð–TTÔÈÜˆÜË™[š\›Û‹™Ù]
+ÔÕUWÑ—ÑÕPT‘Ð–TTÔ×ÑS•ŠHÜˆ›ÝÚ[—Ý\ÝØÛÛ^
+
+N‚ˆ™]\›‚ˆžN‚ˆ™\ÛÛ™YH]
+—Ü]
+K™^[™\Ù\Š
+Kœ™\ÛÛ™J
+Bˆ^Ù\^Ù\[ÛŽ‚ˆ™]\›‚ˆ›ÛÝÈHÜˆ›Üˆˆ[ˆ
+Ü™X[Ü]›Ü›WÜÝ]WÜ›ÛÝ
+
+K
+HYˆˆ\È›Ý›Û™WBˆ›Üˆ^˜H[ˆÔÕUWÑ—ÑÕPT‘ÑVWÑS–WÔ“ÓÕÎ‚ˆžN‚ˆ›ÛÝË˜\[™
+]
+^˜JK™^[™\Ù\Š
+Kœ™\ÛÛ™J
+JBˆ^Ù\^Ù\[ÛŽ‚ˆÛÛ[YBˆ›Üˆ›ÛÝ[ˆ›ÛÝÎ‚ˆYˆÚ\×Ü›ÙXÝ[Û—ÜÝ]WÙŠ™\ÛÛ™Y›ÛÝ
+N‚ˆ˜Z\ÙH[[YQ\œ›ÜŠˆ›]™K\Þ\Ý[HÝX\™ˆ\Ý][\YÈÜ[ˆ›ÙXÝ[Ûˆ‚ˆˆœÝ]K™ˆ]Ü™\ÛÛ™YH
+[™\ˆ™X[\›Y\È›ÛÝÜ›ÛÝJKˆ‚ˆ•\ÝÈ]\Ý[ˆYØZ[œÝH[\Ü˜\žHT“QT×ÒÓQH8 %\ÜÈ[ˆ‚ˆ™^XÚ]\—Ü]Üˆ]H\›Y]XÈÛÛ™\Ý™Y\™XÝ‚ˆ’T“QT×ÒÓQKˆYˆ\È\ÝÙ[Z[™[H™YYÈH]™H]X˜\ÙKX\šÈ]Ú]‚ˆ]\Ý›X\šË›]™WÜÞ\Ý[WÙÝX\™Øž\\ÜÈ8 %Ü‹›ÜˆHÜ]Û™Y‚ˆˆ˜Ú[›ØÙ\ÜË^Ü×ÔÕUWÑ—ÑÕPT‘Ð–TTÔ×ÑS•ŸOLH[ˆ‚ˆš]È[š\›Û›Y[ˆ‚ˆ
+B‚‚ˆÈÜ[š[™ÜÈÙˆH˜XÚÙÜ›Ý[™\™]šY]È\›™\ÜÈ›Û\È
+YÙ[Ø˜XÚÙÜ›Ý[™Ü™]šY]ËœJK‚—Ô‘U’QU×ÒT“‘TÔ×Ô‘Q’VTÈH
+ˆ”™]šY]ÈHÛÛ™\œØ][ÛˆX›Ý™H[™\]HHÚÚ[Xœ˜\žH‹ˆ”™]šY]ÈHÛÛ™\œØ][ÛˆX›Ý™H[™ÛÛœÚY\ˆØ]š[™ÈÈY[[ÜžH‹ŠB‚‚™YˆÚ\×Ø˜XÚÙÜ›Ý[™Ü™]šY]×Ú\›™\Ü×ÛY\ÜØYÙJ\ÙÎˆXÝÜÝ‹[žWJHOˆ›ÛÛ‚ˆˆˆ”\œÚ\ÝY\›™\ÜÈ›Û\
+Û\ˆZ[ÈÜ›ÝHH›ÜšÙYÝ\˜]Ü‰ÜÈ\›œÂˆ[È™X[Ù\ÜÚ[ÛœÎÈ™\^Z[™È[HZ˜XÚÜÈHÙ\ÜÚ[ÛŠKˆˆˆ‚ˆYˆ›Ý\Ú[œÝ[˜ÙJ\ÙËXÝ
+HÜˆ\ÙË™Ù]
+œ›ÛHŠH›Ý[ˆÈ\Ù\ˆ‹œÞ\Ý[HŸN‚ˆ™]\›ˆ˜[ÙBˆÛÛ[H\ÙË™Ù]
+˜ÛÛ[ŠBˆ™]\›ˆ\Ú[œÝ[˜ÙJÛÛ[ÝŠH[™ÛÛ[›Ýš\
+
+KœÝ\ÝÚ]
+Ô‘U’QU×ÒT“‘TÔ×Ô‘Q’VTÊB‚‚™YˆÜÝš\Ø˜XÚÙÜ›Ý[™Ü™]šY]×Ú\›™\ÜÊY\ÜØYÙ\Îˆ\ÝÑXÝÜÝ‹[žWWJHOˆ\ÝÑXÝÜÝ‹[žWWN‚ˆˆˆ‘›Ü\›™\ÜÈY\ÜØYÙ\È[™HÝ\˜]Ü‹[[ÙH\ÜÚ\Ý[™\H][[YYX][H›ÛÝÙYXXÚˆˆˆ‚ˆYˆ›ÝY\ÜØYÙ\Î‚ˆ™]\›ˆY\ÜØYÙ\ÂˆÝ]ˆ\ÝÑXÝÜÝ‹[žWWHH×BˆÚÚ\Û™^Ø\ÜÚ\Ý[H˜[ÙBˆ›Üˆ\ÙÈ[ˆY\ÜØYÙ\Î‚ˆYˆÚ\×Ø˜XÚÙÜ›Ý[™Ü™]šY]×Ú\›™\Ü×ÛY\ÜØYÙJ\ÙÊN‚ˆÚÚ\Û™^Ø\ÜÚ\Ý[HYBˆÛÛ[YBˆYˆÚÚ\Û™^Ø\ÜÚ\Ý[‚ˆÚÚ\Û™^Ø\ÜÚ\Ý[H˜[ÙBˆYˆ\Ú[œÝ[˜ÙJ\ÙËXÝ
+H[™\ÙË™Ù]
+œ›ÛHŠHOH˜\ÜÚ\Ý[Ž‚ˆÛÛ[YHÈHÝ\˜]Ü‹[[ÙH™\HÈH\›™\ÜÈ›Û\ˆÝ]˜\[™
+\ÙÊBˆ™]\›ˆÝ]‚‚ˆÈX]Ú\ÈH˜\™H›ÝØÛÛÝÛÛ[˜[YHX\šÙ\ˆÝXÚ\È–ÛY[[ÜžWHˆÜˆ–ÜÚÚ[ÛX[˜YÙWH‹‚—ÔÕSWÕÓÓÐÐSÓPT’ÑT—Ô‘HH™K˜ÛÛ\[Jˆ——ÖÐKV˜K^—×VÐKV˜K^ŒNWË‹WJ—IŠB‚‚™YˆÚ\×ÜÝ[WÝÛÛØØ[ÛX\šÙ\—ÛY\ÜØYÙJ\ÙÎˆXÝÜÝ‹[žWJHOˆ›ÛÛ‚ˆˆˆ\ÜÚ\Ý[ÛÛXØ[\›ˆÚÜÙHÛÛ[\ÈH˜\™HÛX\šÙ\—X
+[ˆÛ\‚ˆÛÛ™\œØ][Û—ÛÛÜ\œÚ\ÝYHØØ[[\]IÜÈX\šÙ\ˆ\ÈHš[˜[™\ÜÛœÙJKˆˆˆ‚ˆYˆ›Ý\Ú[œÝ[˜ÙJ\ÙËXÝ
+HÜˆ\ÙË™Ù]
+œ›ÛHŠHOH˜\ÜÚ\Ý[ˆÜˆ›Ý\ÙË™Ù]
+ÛÛØØ[ÈŠN‚ˆ™]\›ˆ˜[ÙBˆÛÛ[H\ÙË™Ù]
+˜ÛÛ[ŠBˆ™]\›ˆ\Ú[œÝ[˜ÙJÛÛ[ÝŠH[™›ÛÛ
+ÔÕSWÕÓÓÐÐSÓPT’ÑT—Ô‘K™[X]Ú
+ÛÛ[œÝš\
+
+JJB‚‚™YˆÜÝš\ÜÝ[WÝÛÛØØ[ÛX\šÙ\œÊY\ÜØYÙ\Îˆ\ÝÑXÝÜÝ‹[žWWJHOˆ\ÝÑXÝÜÝ‹[žWWN‚ˆˆˆ›[šÈÝ[HÛX\šÙ\—X\ÜÚ\Ý[ÛÛ[
+™\^Z[™È]XXÚ\ÈH[Ù[ˆÈÙY\[Z][™È]
+NÈÛÛØØ[Ü™\Ý[Z\š[™ÈÝ^\È[XÝˆˆˆ‚ˆ™\Z\™YHˆ›Üˆ\ÙÈ[ˆš[\ŠÚ\×ÜÝ[WÝÛÛØØ[ÛX\šÙ\—ÛY\ÜØYÙKY\ÜØYÙ\ÊN‚ˆ\ÙÖÈ˜ÛÛ[—HHˆ‚ˆ™\Z\™Y
+ÏHBˆYˆ™\Z\™Y‚ˆÙÙÙ\‹š[™›ÊˆÛX\™Y	YÝ[HÛÛXØ[X\šÙ\ˆY\ÜØYÙJÊHÚ[H™\ÝÜš[™ÈÙ\ÜÚ[Ûˆ
+ÍÎM
+H‹™\Z\™Yˆ
+Bˆ™]\›ˆY\ÜØYÙ\Â‚‚™Yˆ›Ü›X]ÜÙ\ÜÚ[Û—Ù—Ý[˜]˜Z[X›J™Yš^ˆÝˆH”Ù\ÜÚ[Ûˆ]X˜\ÙH›Ý]˜Z[X›HŠHOˆÝŽ‚ˆˆˆ•\Ù\‹Y˜XÚ[™ÈY\ÜØYÙHÚ]HØ\\™Y[š]Ø]\ÙH
+
+ÈÐSYØÜÈ[›Üˆ‘”ËÔÓPˆØÚÚ[™È˜Z[\™\ÊKˆˆˆ‚ˆØ]\ÙHHÙ]Û\ÝÚ[š]Ù\œ›ÜŠ
+BˆYˆ›ÝØ]\ÙN‚ˆ™]\›ˆˆžÜ™Yš^Kˆ‚ˆ[Hˆ
+Ý]K™ˆX^H™HÛˆ‘”ËÔÓP‹Ñ•TÑKÖ‘”È8 %ÙYHÎ‹ËÝÝÝËœÜ[]K›Ü™ËÝØ[š[
+H‚ˆ™]\›ˆˆžÜ™Yš^NˆØØ]\Ù_^Ú[Yˆ[žJH[ˆØ]\ÙK›ÝÙ\Š
+H›ÜˆH[ˆÕÐSÒSÓÓTUÓPT’ÑT”ÊH[ÙH	ÉßKˆ‚‚‚ˆÈ]]Ë\™\Z\ˆ][ÜÝÛ˜ÙH\ˆˆ]\ˆ›ØÙ\ÜÈ
+›È™\Z\ˆÛÜÎÈÙ\šX[\Ù\ÈÛÛ˜Ý\œ™[ˆÈÙX—ÜÙ\™\ˆÈØ]]Ø^HÜ[œÈÛˆHØ[YHX[›Ü›YYš[JK‚—Ü™\Z\—Ø][\YÜ]ÎˆÙ]ÜÝ—HHÙ]
+
+B—Ü™\Z\—Ø][\ÛØÚÈH™XY[™Ë“ØÚÊ
+BˆÈÜ›ÜÜË\›ØÙ\ÜÈØÚ[XK\Ý\™Ù\žHØÚÈ[Y[Ý]
+Ü™\Z\—Ø][\ÛØÚØÛÝ™\œÈÛ™H[\œ™]\‚ˆÈÛ›JNÈÚ^™Y›ÜˆHÛÝÙ\ÝYÚ][X]HÛ\ˆ
+PÕUSK][KQÐˆŠK‚—Ô‘TRT—ÓÐÒ×ÕSQSÕUÔÑPÓÓ‘ÈHLŒŒ—ÒT×ÕÒS‘ÕÔÈHÞ\Ëœ]›Ü›HOHÚ[ŒÌˆ‚‚‚™Yˆ]™\ÜÙ\ÜÚ[Û—Ý˜[œØÜš\ÚœÛÛ›
+Ù\ÜÚ[Û—ÚYˆÝ‹Y\ÜØYÙ\ÊHOˆ“Ü[Û˜[Ô]HŽ‚ˆˆˆ\[™[™[™ÈY\ÜØYÙ\ÈÈT“QT×ÒÓQKÜÙ\ÜÚ[ÛœËÏY‹šœÛÛ›
+Ý]K™ˆØ\È™\XÙY[™\ˆBˆ]™H›ØÙ\ÜÊKˆ™]\›œÈH]Üˆ›Û™HYˆ›Ý[™ÈÈÜš]Kˆˆˆ‚ˆÚYHÝŠÙ\ÜÚ[Û—ÚYÜˆˆŠKœÝš\
+
+BˆYˆ›ÝÚYÜˆ›ÝY\ÜØYÙ\Î‚ˆ™]\›ˆ›Û™BˆÙ\ÜÚ[Ûœ×Ù\ˆHÙ]Ú\›Y\×ÚÛYJ
+HÈœÙ\ÜÚ[ÛœÈ‚ˆÙ\ÜÚ[Ûœ×Ù\‹›ZÙ\Š\™[ÏUYK^\ÝÛÚÏUYJBˆ]HÙ\ÜÚ[Ûœ×Ù\ˆÈˆžÜÚYKšœÛÛ›‚ˆÚ]]›Ü[Š˜H‹[˜ÛÙ[™ÏH]‹NŠH\È[™N‚ˆ›Üˆ\ÙÈ[ˆY\ÜØYÙ\Î‚ˆYˆ\ÙÈ\È›Ý›Û™N‚ˆ™XÛÜ™H\ÙÈYˆ\Ú[œÝ[˜ÙJ\ÙËXÝ
+H[ÙHÈ˜ÛÛ[ŽˆÝŠ\ÙÊ_Bˆ[™KÜš]JœÛÛ‹™[\Ê™XÛÜ™[œÝ\™WØ\ØÚZOQ˜[ÙKY˜][\ÝŠH
+È—ˆŠBˆ™]\›ˆ]‚‚ˆÈ›ØÙ\ÜË]ÚYHÚ\™YÙ\ÜÚ[Û‘ˆ™YÚ\ÝžNˆÛ™Ë[]™Y[‹\›ØÙ\ÜÈØ[\œÈÚ\™HÓ‘HÜš]\‚ˆÈÛÛ›™XÝ[Ûˆ\ˆ™\ÛÛ™Y]šXH\›Y\×ÜÝ]WÜ™YÚ\ÝžK˜XÜ]Z\™J
+NÈÛ™K\ÚÝÈ\ÙHÙ\ÜÚ[Û‘Š
+H
+ÈÛÜÙJ
+K‚™YˆÙ›Ü™ZYÛ—ÜÝ]WÙ—ÚÛ\œÊ—Ü]ˆ]
+HOˆ\ÝÕ\VÚ[Ý—WN‚ˆˆˆÛÛ\]Xš[]H[YØ]HÈHÝ]KZÛ\ˆ]]Üš]Kˆˆˆ‚ˆ™]\›ˆÜÝ]WÚÛ\œË™›Ü™ZYÛ—ÜÝ]WÙ—ÚÛ\œÊ—Ü]
+B‚‚ˆÈ8¥ 8¥ ›ØÙ\ÜË]ÚYHÚ\™YÙ\ÜÚ[Û‘ˆ™YÚ\ÝžH
+ÎLÍÊH8¥ 8¥ ]™\È[ˆ\›Y\×ÜÝ]WÜ™YÚ\ÝžKœH
+XÜ]Z\™HÂˆÈ™[X\ÙHÈÛÜÙWØ[È™[X\ÙWÛÜ—ØÛÜÙJKˆÛ™Ë[]™Y[‹\›ØÙ\ÜÈØ[\œÈ
+Ø]]Ø^KZWÙØ]]Ø^KÜ›Û‹ˆÈ[‹\›ØÙ\ÜÈÛÛÊHÚ\™HÓ‘HÜš]\ˆÛÛ›™XÝ[Ûˆ\ˆ™\ÛÛ™Y]šXH\›Y\×ÜÝ]WÜ™YÚ\ÝžK˜XÜ]Z\™J
+NÈÓBˆÈÛ™K\ÚÝË™XÛÝ™\žH›ÝÜË[™™XY[Û›HÜ›ÜÜË\›Ùš[HÜ[œÈ\ÙHÙ\ÜÚ[Û‘Š
+H\™XÝHÚ]Z\ˆÝÛˆÛÜÙJ
+K‚‚‚˜Û\ÜÈÙ\ÜÚ[Û‘ŠˆÙ\ÜÚ[Û”Ù\ÜÚ[ÛœÓZ^[‹Ù\ÜÚ[Û‘ÔÙ]\Z^[‹Ù\ÜÚ[Û”ÙX\˜ÚZ^[‹Ù\ÜÚ[Û”ØÚ[XSZ^[‹ˆÙ\ÜÚ[Û”ÜXš[]SZ^[‹Ù\ÜÚ[Û•[YÜ˜[UÜXÜÓZ^[‹Ù\ÜÚ[ÛÛÛ\™\ÜÚ[Û“Z^[‹ˆÙ\ÜÚ[Û‘Ø]]Ø^SZ^[‹Ù\ÜÚ[Û“XZ[[˜[˜ÙSZ^[‹Ù\ÜÚ[Û•\ØYÙSZ^[‹Ù\ÜÚ[Û•]\ÓZ^[‹ˆÙ\ÜÚ[Û“Y\ÜØYÙ\ÓZ^[‹ŠN‚ˆˆˆ”ÔS]KX˜XÚÙYÙ\ÜÚ[ÛˆÝÜ˜YÙHÚ]•ÍHÙX\˜ÚÈX[žH™XY\ˆ™XYËÛ™HÜš]\ˆ
+ÐS
+Kˆˆˆ‚‚ˆÈÛ›H\ÙHÝ]K[ÝÛ™Y›ÙXÙ\œÈ›Ú[ˆ]]ÛX]XÈÝ[K[Ü[ˆ™XÛÛ˜Ú[X][ÛŽÈY\ÜØYÚ[™ËÕRBˆÈÛÝ\˜Ù\È]™HZ\ˆÝÛˆY™XÞXÛHÝÛ™\œÎÈ[šÛ›ÝÛˆÛÝ\˜Ù\È˜Z[ÛÜÙY‚ˆÈÙYHÍŒŒK‚ˆÐUU×Ô•S‘WÔÕSWÓÔS—ÔÓÕTÑTÎˆ\VÜÝ‹‹‹—HH
+ˆ˜ÛH‹˜Ü›Ûˆ‹šØ[˜˜[ˆ‹˜XÜ‹˜\WÜÙ\™\ˆ‹œÝX˜YÙ[‹ÛÛ‹ˆ
+B‚ˆÈ8¥ 8¥ Üš]KXÛÛ[[Ûˆ[š[™È8¥ 8¥ ˆÈÔS]IÜÈ]\›Z[š\ÝXÈ\ÞH[™\ˆÛÛ›Þ\È[™\ˆX[žH\›Y\È›ØÙ\ÜÙ\ÎˆÙY\]ÂˆÈ[Y[Ý]ÚÜ
+\ÊH[™™]žHÚ]˜[™ÛHš]\‹ˆ]Y[˜ÙH\ÈSQKX˜\ÙY
+HÚX›[™ÂˆÈYÚ][X][HÛÈHØÚÈ›ÜˆÙXÛÛ™ÎˆÚXÚÜÚ[]ÛÜÙKPÕUSK™XÛÝ™\žK•ÂˆÈÜ[Z^™JNÈ][\XÛÝ[YYÙ]È\Ý›ÞYY\›œÈÛˆHX[HÝÜ™Kˆ˜[œØÜš\ˆÈÜš]\È
+˜Z[\™HX›ÜÈH\›ŠHÙ]HÛ™ÈYÙ]ÈØœÙ\˜][Û‹[Û›HXÝ]š]BˆÈÜš]\ÈÚ]ÛˆH™\ÜÛœÙKXÜš]XØ[][™Ù]HÝX‹\ÙXÛÛ™Û™K‚ˆÕÔ’UWÔUQSÑWÔËÕS”ÐÔ’TÕÔ’UWÔUQSÑWÔËÐPÕU’UWÕÔ’UWÔUQSÑWÔÈHŒŒŒŒBˆÈH]™HÛÛ\™\ÜÚ[ÛˆØÚÈÙ]ÈHÚÜØZ]
+ÛÛ\™\ÜÚ[ÛˆX›\Ú\È[ˆÙXÛÛ™ÊK]HX\ÙBˆÈ\ÈHÛÜœ™XÝ™\ÜÈ›Ý[™\žNˆHÜš]\ˆÝ[ØÚÙYÝ]Y\Ø\™È\È™Y\ÙY‚ˆÈØœÙ\˜][Û‹[Û›HXÝ]š]HX\™X]ÛX™[Üš]\È
+ÍÍŒÍM™]šY]ÈÌJNˆ\ÙH[ˆÛˆ
+ÜˆY˜XÙ[ÊHBˆÈ™\ÜÛœÙKXÜš]XØ[][™]\Ý™]™\ˆØZ]Ý]H[›Ý][™H]Y[˜ÙH[™\ˆÛÛ[[Û‹ˆÝX‹\ÙXÛÛ™ˆÈYÙ]ÈHÚÚ\YÜš]H\È™]šYY˜]\˜[H]H™^X\™X]Ú[™ÝË‚ˆÈH]™HÛÛ\™\ÜÚ[ÛˆØÚÈÙ]È]ÈÝÛ‹]XÚÚÜ\ˆYÙ][ˆHÜš]HØÚËˆÛÛ\™\ÜÚ[ÛˆX›\Ú\ÂˆÈ[ˆHÛÝ\HÙˆÙXÛÛ™ËÛÈHœšYYˆØZ]Ø]™\ÈHÝ™\Ú[Z[™ÈXZ›Üš]HÙˆÛÛ˜Ý\œ™[\›œÈ
+ÍÍLÊK‚ˆÈ][X™\˜][HÝ^\ÈÚÜˆHX\ÙH\ÈHÛÜœ™XÝ™\ÜÈ›Ý[™\žK›Ý\ÝH\ÞHÚYÛ˜[
+ÙYBˆÈ\ÝØÛÛ\™\ÜÚ[Û—ÛX\ÙWØ›ØÚÜ×Û›Û—ÛÝÛ™\—Ø]Ø[ÝÜ×ÛÝÛ™\—Ù›\Ú
+KÛÈHÜš]\ˆ]\ÈÝ[ØÚÙYÝ]ˆÈY\ˆ\ÈYÙ]]\ÝÝ[™H™Y\ÙY˜]\ˆ[ˆ[ÝÙYÈ[™HÝ[H\›ˆ[ˆHÙ\ÜÚ[ÛˆÚÜÙBˆÈÛÛ\™\ÜÚ[Ûˆ\ÈÙ[Z[™[HÛ™Ë\[›š[™ÈÜˆÙYÙY‚ˆÐÓÓT‘TÔÒSÓ—Ð•TÖWÕÐRUÔÈHKŒˆÕÔ’UWÔ‘U–WÓRS—ÔËÕÔ’UWÔ‘U–WÓPVÔÈHŒŒŒMLÈ˜\Ýš]\ˆ›ÜˆHš\œÝÔÓÕ×ÐQ•T—ÔÂˆÕÔ’UWÔ‘U–WÔÓÕ×ÐQ•T—ÔÈH‹ŒˆÕÔ’UWÔ‘U–WÔÓÕ×ÓRS—ÔËÕÔ’UWÔ‘U–WÔÓÕ×ÓPVÔÈHŒLKŒˆÈTÔÒU‘HÐSÚXÚÜÚ[]™\žHˆÝXØÙ\ÜÙ[Üš]\Ë‚ˆÐÒPÒÔÒS•ÑU‘T–WÓ—ÕÔ’UTÈHLˆÈ›Ý[™Y•È	ÛY\™ÙIØ
+\ÈÙˆØÚÈXXÚ
+H[œÝXYÙˆ	ÛÜ[Z^™IØ
+KLNÈ\ˆ[™^ÛˆHLÐ‚ˆÈ‹Û™Ù\ˆ[ˆHÜš]\‰ÜÈ]Y[˜ÙJNÈ\ÈÐÓÓSPS‘×ÔT—ÔTÔÈ\ˆ[™^ÝÜ[™ÈÛˆ›Ë\›ÙÜ™\ÜË‚ˆÑ•×ÓQT‘ÑWÑU‘T–WÓ—ÕÔ’UTËÑ•×ÓQT‘ÑWÓPVÔQÑT×ÔT—ÒS‘VÑ•×ÓQT‘ÑWÐÓÓSPS‘×ÔT—ÔTÔÈHLLˆÈ[\ÜÈØ\ÝÙ\ˆ[ˆ^ÜÎˆ[ˆ[\ÜÛÈÛ™H‘QÒSˆSSQQPUK‚ˆÒSTÔ•ÓPVÔÑTÔÒSÓ”ËÒSTÔ•ÓPVÓQTÔÐQÑT×ÔT—ÔÑTÔÒSÓ‹ÒSTÔ•ÓPVÕÕSÓQTÔÐQÑTÈHLLÌLÌˆÒSTÔ•ÓPVÔÑTÔÒSÓ—Ð–UTËÒSTÔ•ÓPVÕÕSÐ–UTÈHH
+ˆL
+ˆLH
+ˆL
+ˆLˆÈXØÛÝ[[™ÈÛÜšÙ\œÈ™]\™HÚ[ˆYHÛÈH›Ý[™[Y]Ù\™Ù]Ø[‰ÝÙY\[ˆX˜[™Û™YÙ\ÜÚ[Û‘ˆ[]™K‚ˆÕÒÑS—ÕÔ’UT—ÒQWÔÑPÓÓ‘ÈHÌŒ‚ˆÝ]XÛY]ÙˆYˆÜÝÜ™WÜÞ\Ý[WÜ›Û\
+ÛÛ›‹Þ\Ý[WÜ›Û\ˆÜ[Û˜[ÜÝ—JHOˆÜ[Û˜[ÜÝ—N‚ˆYˆÞ\Ý[WÜ›Û\\È›Û™N‚ˆ™]\›ˆ›Û™Bˆ›Û\Ú\ÚH\ÚX‹œÚLMŠÞ\Ý[WÜ›Û\™[˜ÛÙJ]‹NŠJKš^YÙ\Ý
+
+BˆÛÛ›‹™^XÝ]Jˆ’S”ÑT•ÔˆQÓ“Ô‘HS•ÈÞ\Ý[WÜ›Û\È
+\Ú›Û\
+HSQTÈ
+ËÊH‹ˆ
+›Û\Ú\ÚÞ\Ý[WÜ›Û\
+Kˆ
+Bˆ™]\›ˆ›Û\Ú\Ú‚ˆÝ]XÛY]ÙˆYˆÙ[]WÝ[œ™Y™\™[˜ÙYÜÞ\Ý[WÜ›Û\ÊÛÛ›ŠHOˆ›Û™N‚ˆÛÛ›‹™^XÝ]Jˆ‘SUH”“ÓHÞ\Ý[WÜ›Û\ÈÒT‘H“ÕVTÕÈ
+‚ˆ”ÑSPÕH”“ÓHÙ\ÜÚ[ÛœÈÒT‘HÙ\ÜÚ[ÛœËœÞ\Ý[WÜ›Û\Ú\ÚHÞ\Ý[WÜ›Û\Ëš\Ú
+H‚ˆ
+B‚ˆÝ]XÛY]ÙˆYˆÜÙ\ÜÚ[Û—Ü›Ý×ÙXÝ
+›ÝÎˆÜ[]LË”›ÝÊHOˆXÝÜÝ‹[žWN‚ˆ]HHXÝ
+›ÝÊBˆYˆ—ÜÞ\Ý[WÜ›Û\Ü™\ÛÛ™Yˆ[ˆ]N‚ˆ™\ÛÛ™YH]KœÜ
+—ÜÞ\Ý[WÜ›Û\Ü™\ÛÛ™YŠBˆYˆœÞ\Ý[WÜ›Û\ˆ[ˆ]N‚ˆ]VÈœÞ\Ý[WÜ›Û\—HH™\ÛÛ™Yˆ™]\›ˆ]B‚ˆÝ]XÛY]ÙˆYˆØÛÜÙWØÛÛ›™XÝ[Û—Ü]ZY]JÛÛ›ŽˆÜ[Û˜[ÜÜ[]LËÛÛ›™XÝ[Û—JHOˆ›Û™N‚ˆˆˆÛÜÙHH\X[H[š]X[^™YÛÛ›™XÝ[ÛˆÚ]Ý]X\ÚÚ[™È]È\œ›Ü‹ˆˆˆ‚ˆYˆÛÛ›ˆ\È›Û™N‚ˆ™]\›‚ˆžN‚ˆÛÛ›‹˜ÛÜÙJ
+Bˆ^Ù\^Ù\[ÛŽ‚ˆÙÙÙ\‹™XYÊÛÝ[›ÝÛÜÙHHÙ\ÜÚ[Û‘ˆÛÛ›™XÝ[Ûˆ‹^×Ú[™›ÏUYJB‚ˆYˆØÛÜÙWØÛÛ›—ÛÙÙÙY
+Ù[‹ÛÛ›‹X™[ˆÝŠHOˆ›Û™N‚ˆˆˆÛÜÙH
+˜ÛÛ›ŠŽÈH˜Z[[™ÈÛÜÙHXZÜÈH˜XÚÙY™ˆÙÙÙY]ÐT“’S‘Ë™]™\ˆÝØ[ÝÙYˆˆˆ‚ˆžN‚ˆÛÛ›‹˜ÛÜÙJ
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙÙÙ\‹Ø\›š[™Ê‰\ÈÛÜÙH˜Z[Y›Üˆ	\Îˆ	\È‹X™[Ù[‹™—Ü]^ÊB‚ˆYˆ×Ú[š]×ÊÙ[‹—Ü]ˆ]H›Û™K™XYÛÛ›Nˆ›ÛÛH˜[ÙJN‚ˆÙ[‹™—Ü]H—Ü]ÜˆÙY˜][Ù—Ü]
+
+BˆÙ[œÝ\™WÝ\ÝÚ\ÛÛ][ÛŠÙ[‹™—Ü]
+HÈ™Y›Ü™H[žHÛÛ›™XÝ[Û‹Ü˜YÛXKÛZÙ\‚ˆÙ[‹œ™XYÛÛ›HH™XYÛÛ›BˆÙ[‹—ÛØÚÈH™XY[™Ë“ØÚÊ
+BˆÈ™XY\]Ü]
+ÐSÛ›JNˆ™XYÈ›Üœ›ÝÈœ›ÛHH“ÕS‘Q™XY[Û›HÛÛÛÈ^BˆÈ™]™\ˆ]Y]YH™Z[™Üš]\ˆ›\Ú\ÈÛˆÙ[‹—ÛØÚÈ
+ÙYHÜ™XYØÝ
+NÈ[˜›Ý[™YˆÈ\‹]™XYÛÛ›™XÝ[ÛœÈ[›™Y™È›ÜˆH›ØÙ\ÜÈY™][YH[™]SQ’SK‚ˆÙ[‹—Ü™XYÜÛÛˆœ]Y]YK“Y›Ô]Y]YVÜÜ[]LËÛÛ›™XÝ[Û—HˆH]Y]YK“Y›Ô]Y]YJX^Ú^™OWÔ‘PQÔÓÓÓPV
+BˆÈ\›Z]È›Ý[™PRÈ\ØÜš\ÜœÈ
+HÛÛ›Ý[™ÈÛ›HHYHÙ]
+KÚ\™Y\‚ˆÈUPTÑHUÈXÜ]Z\™Y›Û‹X›ØÚÚ[™ÈÛÈH\›Z]\ÜÈ™XY\ˆYÜ˜Y\ÈÈHÜš]\ˆØÚË‚ˆÈÛ™H\›Z]\ˆ]™H™XYÛÛ›™XÝ[Û‹[œ›ÛH™Y›Ü™HHÜ[ˆ[ˆÙÙ]Ü™XYØÛÛ›Š
+H[[Y\ˆBˆÈÛÜÙH[ˆØÛÜÙWÜ™XYØÛÛ›Š
+KˆÙYHÔ‘PQÔÓÓÓPVˆXÜ]Z\™Y›Û‹X›ØÚÚ[™ÈÛˆ\œÜÙNˆH™XY\ˆ]ˆÈØ[››ÝÙ]H\›Z]]\ÝYÜ˜YHÈHÜš]\ˆØÚË›Ý]Y]YH\™H8 %›ØÚÚ[™ÈÛÝ[ÛÛ™\™ˆÈ^]\Ý[Ûˆ[ÈHÝ[ÚXÚ\ÈHØ[YHÝ]YÙHÚ]HY™™\™[ÝXÚÈ˜XÙKˆ\›Z]È\™HÚ\™YˆÈ\ˆUPTÑHU›Ý\ˆ[œÝ[˜ÙNˆH\ØÜš\ÜœÈ^H˜][Ûˆ™[Û™ÈÈHš[K[™Û™BˆÈ›ØÙ\ÜÈÛÈÙ]™\˜[Ù\ÜÚ[Û‘ˆØš™XÝÈÛˆHØ[YHÝ]K™ˆ
+ÎNMÌÊKˆÙYHÔ]™XYYÙ]‚ˆÙ[‹—Ü™XYØYÙ]HÜ™XYØYÙ]Ù›ÜŠÙ[‹™—Ü]
+BˆÙ[‹—Ü™XYØYÙ]œ™YÚ\Ý\ŠÙ[ŠBˆÙ[‹—Ü™XYÜ\›Z]ÈHÙ[‹—Ü™XYØYÙ]œ\›Z]ÂˆÙ[‹—Ü™XYØÛÛ›œ×ÛØÚÈH™XY[™Ë“ØÚÊ
+BˆÈÙ]Ú[ˆÛÜÙJ
+H™YÚ[œÎÈ[ˆ[‹Y›YÚ™XY\ˆ[ˆÛÜÙ\È]ÈÝÛˆÛÛ›™XÝ[Û‚ˆÈ[œÝXYÙˆ™K\Ü[][™ÈHÛÛ›Ø›ÙHÚ[˜Z[ˆYØZ[‹‚ˆÙ[‹—Ü™XYØÛÛ›œ×ØÛÜÙYH˜[ÙBˆÈ™XY[Ü[ˆ˜Z[\™H˜XÚÛÙ™ˆ\ÈHSQTÕST›ÝHÝXÚÞH›ÛÛˆHZÙ[Y\ÝšYÙÙ\‚ˆÈ\È˜[œÚY[SQ’SK[™H\›X[™[›YÈÛÝ[[[ÝH]™\žH™XY\ˆ›Ü™]™\‹‚ˆÙ[‹—Ü™XYÛÜ[—Ù˜Z[YØ]HŒˆÙ[‹—ÝØ[ØXÝ]™KÙ[‹—ÝÜš]WØÛÝ[H˜[ÙKˆÈš[HY[]HÙˆHÜ[™YÝ]K™‹ÛÛ\\™YÛˆ]™\žHÜš]HÛÈ[ˆÝ][Ù‹X˜[™ˆÈ™\XÙHØ[››Ý[\›ÝYÚ[‹\XÙHÝ\™Ù\žH
+[›ÙNˆ]‹Û™]ËYš[NÈ\XØ][Û—ÚYˆÜ
+K‚ˆÙ[‹—Ù—Ùš[WÚY[]NˆÜ[Û˜[Ý\WHH›Û™BˆÙ[‹—Ù—Ùš[WØ\XØ][Û—ÚYˆ[HˆÙ[‹—Ù—ÜÚYXØ\—ÚY[]NˆXÝÜÝ‹\WHHßBˆÙ[‹—Ù—Ü™\XÙYHÙ[‹—Ù—ÝØ[ÙÙ[™\˜][Û—ÛÜÝH˜[ÙBˆÙ[‹—Ù—ØÛÜœ\Ù[‹—Ù—ØÛÜœ\Ü™X\ÛÛˆH˜[ÙKˆˆÈÝXÚÞH]X\˜[[™H
+Ý]QÛÜœ\\œ›ÜŠBˆÙ[‹—Ù×Ý\Ù\›Y\™ÙWÙ›ÛÜ—Ø\YYH˜[ÙHÈÛ™K\ÚÝ\Ù\›Y\™ÙKY›ÛÜˆÜš]HÝX\™ˆÙ[‹—Ù×Ù[˜X›YHÙ[‹—Ù×ÜÝ[HHÙ[‹—ÝšYÜ˜[WØ]˜Z[X›HH˜[ÙBˆÈÙ×ØÚš×ÛØYYˆÚÙ[š^™\ˆÛˆHÜš]\ˆÛÛ›™XÝ[ÛŽÈÙ×ØÚš×Ø]˜Z[X›NˆY\ÜØYÙ\×Ù×ØÚšÂˆÈ\È]Y\žXX›HS‘›ÝX\šÙYÝ[K‚ˆÙ[‹—Ù×ØÚš×ÛØYYHÙ[‹—Ù×ØÚš×Ø]˜Z[X›HHÙ[‹—Ù×Ý[˜]˜Z[X›WÝØ\›™YH˜[ÙBˆÙ[‹—ØÛÛ›ˆH›Û™BˆÈ\Þ[˜ÈÚÙ[ˆXØÛÝ[[™ÎÈ\Ý[˜Ýœ›ÛHÙ[‹—ÛØÚÈÛÈ[œ]Y]YKÙ›\Ú™]™\ˆÛÛ[™ÈÚ]Üš]\Ë‚ˆÙ[‹—ÝÚÙ[—Ü]Y]YNˆ\]YHH\]YJ
+BˆÙ[‹—ÝÚÙ[—Ü]Y]YWØÛÛ™H™XY[™ËÛÛ™][ÛŠ™XY[™Ë“ØÚÊ
+JBˆÙ[‹—ÝÚÙ[—ÝÜš]\—Ý™XYˆÜ[Û˜[Ý™XY[™Ë•™XYHH›Û™BˆÙ[‹—ÝÚÙ[—ÝÜš]\—ÜÝÜHÙ[‹—ÝÚÙ[—ÝÜš]\—Ø\ÞHH˜[ÙBˆÙ[‹—ÝÚÙ[—Ø]^]ÚÛÚÎˆÜ[Û˜[ÐØ[X›VÖ×K›Û™WWHH›Û™BˆÈÜ[™YšXH\›Y\×ÜÝ]WÜ™YÚ\ÝžK˜XÜ]Z\™J
+NˆÛÜÙJ
+H™[X\Ù\ÈH™Y˜ÛÝ[[œÝXY‚ˆÈÙ]YHÚ[ˆ\È[œÝ[˜ÙH\ÈÜ[™YšXH\›Y\×ÜÝ]WÜ™YÚ\ÝžK˜XÜ]Z\™J
+KˆXZÙ\ÈÛÜÙJ
+HH›Ë[ÜÛÈBˆÈ™YÚ\ÝžH
+›Ý[™]šYX[Ø[\œÊHÛÛ›ÛÈHÛÛ›™XÝ[ÛˆY™XÞXÛH
+ÎLÍÊK‚ˆÙ[‹—ÜÚ\™YÜ™YÚ\ÝžWÛÝÛ™YH˜[ÙBˆ[š]X[^˜][Û—ØÛÛ\]HH˜[ÙBˆžN‚ˆYˆ™XYÛÛ›N‚ˆÙ[‹—ÛÜ[—Ü™XYÛÛ›J
+Bˆ[ÙN‚ˆÙ[‹—ÛÜ[—ÝÜš]\Š
+BˆÙ[‹—Ü™XÛÜ™Ù—Ùš[WÚY[]J
+Bˆ[š]X[^˜][Û—ØÛÛ\]HHYBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÈÝ\™˜XÙHÒHšXHÜ™\Ý[YH[™œšY[™ÎÈØ[\œÈÙY\Z\ˆÜÙ\ÜÚ[Û—ÙˆH›Û™X]‚ˆÜÙ]Û\ÝÚ[š]Ù\œ›ÜŠˆžÝ\J^ÊK—×Û˜[YW×ßNˆÙ^ßHŠBˆ˜Z\ÙBˆš[˜[N‚ˆYˆ›Ý[š]X[^˜][Û—ØÛÛ\]N‚ˆÛÛ›‹Ù[‹—ØÛÛ›ˆHÙ[‹—ØÛÛ›‹›Û™BˆÙ[‹—ØÛÜÙWØÛÛ›™XÝ[Û—Ü]ZY]JÛÛ›ŠB‚ˆYˆÛÜ[—ÝÜš]\ŠÙ[ŠHOˆ›Û™N‚ˆˆˆ•Üš]X›HÜ[Žˆ™Y›YÚ™\›ËXž]H]X\˜[[™KÛÛ›™XÝ
+ÈØÚ[XH
+Û™H[‹\XÙH™\Z\ˆÙˆBˆX[›Ü›YYÜ[]WÛX\Ý\ŠKÙ[™\˜][ÛˆÝ[\ˆˆˆ‚ˆÙ[‹™—Ü]œ\™[›ZÙ\Š\™[ÏUYK^\ÝÛÚÏUYJBˆÈ™XY[Û›Hš[KÜÚYXØ\ˆ™Y›YÚ‘Q“Ô‘HHš\œÝÛÛ›™XÝ[ÛŽˆ[ˆXÝ[Û˜X›HY\ÜØYÙBˆÈ[œÝXYÙˆ[ˆÜ\]YH˜][\ÈÜš]HH™XYÛ›H]X˜\ÙHˆœ›ÛH[œÚYHÚ[š]ÜØÚ[XK‚ˆ™Y›YÚÙ—ÝÜš]Xš[]JÙ[‹™—Ü]—ÛX™[HœÝ]K™ˆŠBˆžN‚ˆÈÙ\šX[^™H™\›ËXž]HÚXÚË]X\˜[[™KÛÛ›™XÝ[™ØÚ[XHÛÛ[Z]ÛÈÛÛ˜Ý\œ™[ˆÈÜ[™\œÈÛ‰Ý˜XÙHHXœÙ[\]OˆØÚ[XKXÛÛ[Z]Ú[™ÝË‚ˆYˆ›ÝÙ[‹™—Ü]™^\ÝÊ
+HÜˆ\×Þ™\›ÙYÜÝ]WÙŠÙ[‹™—Ü]
+N‚ˆÚ]]X\˜[[™WØÜ›ÜÜ×Ü›ØÙ\Ü×ÛØÚÊÙ[‹™—Ü]
+H\ÈØÚ×ØXÜ]Z\™Y‚ˆYˆ›ÝØÚ×ØXÜ]Z\™Y‚ˆÙÙÙ\‹Ø\›š[™ÊˆœÝ\\]X\˜[[™HØÚÈ›Üˆ	\È›ÝXÜ]Z\™YÚ][ˆ\ÎÈ›ØÙYY[™È‹ˆÙ[‹™—Ü]ˆ
+BˆÙ[‹—Ú[™WÜ]X\˜[[™WÚY—Þ™\›ÙY
+[™XYWÛØÚÙY[ØÚ×ØXÜ]Z\™Y
+BˆÙ[‹—ØÛÛ›™XÝØ[™Ú[š]ÝÚ]ÛØÚ×Ü]Y[˜ÙJ
+Bˆ[ÙN‚ˆÙ[‹—Ú[™WÜ]X\˜[[™WÚY—Þ™\›ÙY
+[™XYWÛØÚÙYQ˜[ÙJBˆÙ[‹—ØÛÛ›™XÝØ[™Ú[š]ÝÚ]ÛØÚ×Ü]Y[˜ÙJ
+Bˆ^Ù\Ü[]LË‘]X˜\ÙQ\œ›Üˆ\È^Î‚ˆÈHX[›Ü›YYØÚ[XH˜Z[ÈÛˆH™\žHš\œÝÝ][Y[
+™Y›Ü™HÚ[š]ÜØÚ[XJKÛÈBˆÈ•Ë\™XZ[^Y\ˆ™]™\ˆÙY\È]ˆ™\Z\ˆÜ[]WÛX\Ý\ˆ[ˆXÙH
+˜XÚÝ\š\œÝ
+K™[Ü[ˆÛ˜ÙK‚ˆYˆ›Ý\×ÛX[›Ü›YYÜØÚ[XWÙ\œ›ÜŠ^ÊHÜˆ›ÝØÛZ[WÜ™\Z\—Ø][\
+Ù[‹™—Ü]
+N‚ˆ˜Z\ÙBˆÙÙÙ\‹™\œ›ÜŠˆœÝ]K™ˆØÚ[XH\ÈX[›Ü›YY
+	\ÊH8 %][\[™È]]ÛX]XÈ‚ˆœ™\Z\ˆ
+H˜XÚÝ\ÛÜH\ÈXYHš\œÝ
+Kˆ‹^Ëˆ
+BˆÙ[‹—ØÛÜÙWØÛÛ›™XÝ[Û—Ü]ZY]JÙ[‹—ØÛÛ›ŠBˆYˆ›Ý™\Z\—ÜÝ]WÙ—ÜØÚ[XJÙ[‹™—Ü]
+K™Ù]
+œ™\Z\™YŠN‚ˆ˜Z\ÙBˆÙ[‹—ØÛÛ›™XÝØ[™Ú[š]ÝÚ]ÛØÚ×Ü]Y[˜ÙJ
+BˆÈ•ÈÜ[Z^˜][Ûˆ\ÈÔRSˆ
+\›Y\ÈˆÜ[Z^™X
+NÈ›È˜XÚÙÜ›Ý[™ÛÜšÙ\ˆ˜XÙ\ÈÙ\ÜÚ[ÛˆY™XÞXÛK‚ˆÙ[‹—Ù[œÝ\™WÙ—Ùš[WÙÙ[™\˜][ÛŠ
+B‚ˆYˆÛÜ[—Ü™XYÛÛ›JÙ[ŠHOˆ›Û™N‚ˆˆˆ”™XY[Û›H]XÚ›ÜˆÜ›ÜÜË\›Ùš[HYÙÜ™YØ][ÛŽˆ›ÈØÚ[XH[š]“ÈÜš]BˆØÚÈ
+ÚYX˜\ˆÛ[™È™]™\ˆÛÛ[™ÈÚ]]›Ùš[IÜÈ˜XÚÙ[™
+NÈH‚ˆ]\Ý^\Ýˆ•È›YÜÈ\™H›Ø™YÚ]ÑSPÕÈÛ›K[™HÛÛ›™XÝ[Ûˆ\ÂˆÛÜÙYÛˆS–H›Ø™H˜Z[\™H
+X[›Ü›YYØÚ[XH˜Z\Ù\È]X˜\ÙQ\œ›ÜŠHÛÈBˆXZÙY˜XÚÙYÛÛ›™XÝ[ÛˆØ[››Ý›ØÚÈH›Ü™[œÚXÈ˜XÚÝ\HÜš]X›HX[ZÙ\È™^ˆˆˆ‚ˆ›Üˆ][\[ˆ˜[™ÙJÔ‘PQÓÓ“WÒSÑT”—Ô‘U–WÐUSTÈ
+ÈJN‚ˆžN‚ˆÙ[‹—ØÛÛ›ˆHÛÛ›ˆHÙ[‹—ØÛÛ›™XÝÜ™XYÛÛ›J[Y[Ý]LKŒ
+BˆžN‚ˆ\WÙ]X˜\ÙWÜ˜YÛX\ÊÛÛ›‹—ÛX™[HœÝ]K™ˆŠBˆÝ\œÛÜˆHÛÛ›‹˜Ý\œÛÜŠ
+BˆÙ[‹—Ù×Ù[˜X›YHÙ[‹—Ù×ÝX›WÜ›Ø™JÝ\œÛÜ‹›Y\ÜØYÙ\×ÙÈŠH\ÈYBˆYˆÙ[‹—Ù×Ù[˜X›Y‚ˆÙ[‹—ÝšYÜ˜[WØ]˜Z[X›HH
+ˆÙ[‹—Ù×ÝX›WÜ›Ø™JÝ\œÛÜ‹›Y\ÜØYÙ\×Ù×ÝšYÜ˜[HŠH\ÈYBˆ
+Bˆ^Ù\˜\ÙQ^Ù\[ÛŽ‚ˆÙ[‹—ØÛÛ›ˆH›Û™BˆÙ[‹—ØÛÜÙWØÛÛ›™XÝ[Û—Ü]ZY]JÛÛ›ŠBˆ˜Z\ÙBˆ™]\›‚ˆ^Ù\Ü[]LË“Ü\˜][Û˜[\œ›Üˆ\È[Ù\œŽ‚ˆÈ[‹Y›YÚÐSÚXÚÜÚ[Ü™\Ù]Ùœ˜[YKY›\ÚÛˆHÜš]\ˆÚYHØ[ˆÝ\™˜XÙBˆÈÔSUWÒSÑT”ˆÈH[ÙO\›È™XY\ˆ
+]Ø[‰ÝÈH\ÚH™XÛÝ™\žHH™XYˆÈ™YYÊKˆÛÜÙ\È[ˆZ[\ÙXÛÛ™Îˆ™]žHH›Ý[™Y[X™\ˆÙˆ[Y\È™Y›Ü™BˆÈÛ\ÜÚYžZ[™ÈHÝÜ™H\È˜Z[Y
+ÌLÍŽÈÙYHÔ‘PQÓÓ“WÒSÑT”—Ô‘U–WÐUSTÊK‚ˆ˜[œÚY[HÑTÒ×ÒS×ÑT”“Ô—ÓPT’ÑTˆ[ˆÝŠ[Ù\œŠK›ÝÙ\Š
+BˆYˆ][\HÔ‘PQÓÓ“WÒSÑT”—Ô‘U–WÐUSTÈÜˆ›Ý˜[œÚY[‚ˆ˜Z\ÙBˆ[YKœÛY\
+Ô‘PQÓÓ“WÒSÑT”—Ô‘U–WÐPÒÓÑ‘—ÔÊB‚ˆYˆØÛÛ›™XÝÜ™XYÛÛ›JÙ[‹[Y[Ý]ˆ›Ø]
+HOˆÜ[]LËÛÛ›™XÝ[ÛŽ‚ˆˆˆ˜[ÙO\›Ø˜XÚÙYÛÛ›™XÝ[ÛˆÚ]›ÝÈ˜XÝÜžKˆÚXÚ×ÜØ[YWÝ™XYQ˜[ÙNˆÛÛYÛÛ›™XÝ[ÛœÂˆ\™H›Üœ›ÝÙYžHÚXÚ]™\ˆ™XY™XYÈ™^È^Û\Ú]™HÝÛ™\œÚ\\È[™›Ü˜ÙYžHÛÛÚXÚÛÝ]ˆˆˆ‚ˆÛÛ›ˆHØÛÛ›™XÝÝ˜XÚÙYÙŠˆˆ™š[NžÜÙ[‹™—Ü]OÛ[ÙO\›È‹˜XÚÚ[™×Ü]\Ù[‹™—Ü]\šOUYKˆÚXÚ×ÜØ[YWÝ™XYQ˜[ÙK[Y[Ý]][Y[Ý]\ÛÛ][Û—Û]™[S›Û™Kˆ
+BˆÛÛ›‹œ›Ý×Ù˜XÝÜžHHÜ[]LË”›ÝÂˆ™]\›ˆÛÛ›‚‚ˆYˆÚ[™WÜ]X\˜[[™WÚY—Þ™\›ÙY
+Ù[‹[™XYWÛØÚÙYˆ›ÛÛH˜[ÙJHOˆ›Û™N‚ˆˆˆ”]X\˜[[™HH™\›ËXž]KÚXY\›\ÜÈÝ]K™ˆÛÈHœ™\ÚÛ™HØ[ˆÜ[ŽÈYˆ]X\˜[[™H˜Z[Yˆ˜Z\ÙHHÛX\ˆY\ÜØYÙH[œÝXYÙˆÜ[š[™ÈH™\›ÙYš[Kˆˆˆ‚ˆYˆ›Ý
+Ù[‹™—Ü]™^\ÝÊ
+H[™\×Þ™\›ÙYÜÝ]WÙŠÙ[‹™—Ü]
+JN‚ˆ™]\›‚ˆžN‚ˆœÚ^™HHÙ[‹™—Ü]œÝ]
+
+KœÝÜÚ^™Bˆ^Ù\ÔÑ\œ›ÜŽ‚ˆœÚ^™HHLBˆ\]H]X\˜[[™WÞ™\›ÙYÜÝ]WÙŠÙ[‹™—Ü][™XYWÛØÚÙYX[™XYWÛØÚÙY
+Bˆ\ÙÈH
+ˆˆœÝ]K™ˆÛÚÜÈ‘T“ÑQ
+ÞœÚ^™_Hž]\Ë›ÈÔS]HXY\ŠKˆ‚ˆˆ”™\Ù\™Y]Ü\]Üˆ	Ê]X\˜[[™H˜Z[Y8 %š[HY[ˆXÙJIßKˆ‚ˆˆ”™\ÝÜ™Hœ›ÛHÜÙ[‹™—Ü]œ\™[È	ÜÝ]K\Û˜\ÚÝÉßHšXH\›Y\ÈÛ˜\ÚÝ\ÝÈ‚ˆˆ˜\›Y\ÈÛ˜\ÚÝ™\ÝÜ™HY˜Yˆ]˜Z[X›Kˆ‚ˆ“Ü[š[™ÈHœ™\Ú[\H]X˜\ÙHÛÈHYÙ[Ø[ˆÝ\ˆ‚ˆ
+BˆÙÙÙ\‹™\œ›ÜŠ\ÙÊBˆÜÙ]Û\ÝÚ[š]Ù\œ›ÜŠ\ÙÊBˆYˆ\]\È›Û™H[™Ù[‹™—Ü]™^\ÝÊ
+H[™\×Þ™\›ÙYÜÝ]WÙŠÙ[‹™—Ü]
+N‚ˆ˜Z\ÙHÜ[]LË‘]X˜\ÙQ\œ›ÜŠ\ÙÊB‚ˆYˆÛÜ[—ÝÜš]\—ØÛÛ›ŠÙ[ŠHOˆÜ[]LËÛÛ›™XÝ[ÛŽ‚ˆˆˆÛÛ›™XÝ
+ÈÐSÜ˜YÛXKÝÚÙ[š^™\ˆÙ]\›ÜˆHÜš]\ˆÛÛ›™XÝ[Ûˆ
+›ÈØÚ[XH[š]
+KˆÚÜ[Y[Ý]‚ˆš]\™Y\XØ][Û‹[]™[™]žH[™\ÈÛÛ[[Û‹›ÝÔS]IÜÈ\ÞH[™\ŽÂˆ\ÛÛ][Û—Û]™[S›Û™Nˆ^XÚ]‘QÒSˆSSQQPUKˆˆˆ‚ˆÛÛ›ˆHØÛÛ›™XÝÝ˜XÚÙYÙŠˆÝŠÙ[‹™—Ü]
+KÚXÚ×ÜØ[YWÝ™XYQ˜[ÙK[Y[Ý]LKŒ\ÛÛ][Û—Û]™[S›Û™Kˆ
+BˆžN‚ˆÛÛ›‹œ›Ý×Ù˜XÝÜžHHÜ[]LË”›ÝÂˆÙ[‹—ÝØ[ØXÝ]™HH\WÝØ[ÝÚ]Ù˜[˜XÚÊÛÛ›‹—ÛX™[HœÝ]K™ˆŠHOHØ[‚ˆ\WÙ]X˜\ÙWÜ˜YÛX\ÊÛÛ›‹—ÛX™[HœÝ]K™ˆŠBˆÛÛ›‹™^XÝ]J”QÓPH›Ü™ZYÛ—ÚÙ^\ÏSÓˆŠBˆÙ[‹—Ù×ØÚš×ÛØYYHØYÙÍWØÚš×Ù^[œÚ[ÛŠÛÛ›ŠBˆ^Ù\˜\ÙQ^Ù\[ÛŽ‚ˆÙ[‹—ØÛÜÙWØÛÛ›™XÝ[Û—Ü]ZY]JÛÛ›ŠBˆ˜Z\ÙBˆ™]\›ˆÛÛ›‚‚ˆYˆØÛÛ›™XÝØ[™Ú[š]
+Ù[ŠHOˆ›Û™N‚ˆÈ™Y\ÙH™Y›Ü™HÜ[]LË˜ÛÛ›™XÝ
+[™\ˆHÝ\\ØÚÊHÛÈÙHØ[››ÝZ[ˆÈH™\XÙ[Y[ÐSÚ[HH]™HÜš]\ˆÝ[ÛÈH[]YÚYXØ\ˆ[›ÙK‚ˆ™Y\ÙWÙ[]YÝØ[ÙÙ[™\˜][ÛŠÙ[‹™—Ü]
+BˆÙ[‹—ØÛÛ›ˆHÙ[‹—ÛÜ[—ÝÜš]\—ØÛÛ›Š
+BˆÙ[‹—Ú[š]ÜØÚ[XJ
+B‚ˆYˆØÛÛ›™XÝØ[™Ú[š]ÝÚ]ÛØÚ×Ü]Y[˜ÙJÙ[ŠHOˆ›Û™N‚ˆˆˆ“Ü[ˆ
+È[š]ØZ][™ÈÝ]HÚX›[™ÉÜÈÜš]HØÚÈÚ]š]\™Y]Y[˜ÙN‚ˆÚ[š]ÜØÚ[XIÜÈ[œÈÛˆH\Ë][Y[Ý]ÛÛ›™XÝ[Û‹ÛÈHÚX›[™ÉÜÈPÕUSBˆÜˆÚXÚÜÚ[\ÙYÈ˜Z[HS•T‘HÜ[ˆ[™Ø[\œÈ\ØX›Yˆ\œÚ\Ý[˜ÙH›ÜˆHÚÛH[‹ˆ›Û‹[ØÚÈ\œ›ÜœÈ›ÜYØ]H[[YYX][Kˆˆˆ‚ˆÈØÚÈÛÛ[[Ûˆ\š[™ÈÜ[ŽˆÚ[š]ÜØÚ[XIÜÈÜ™XÛÛ˜Ú[HÝ][Y[È[ˆÛˆH\Ë][Y[Ý]ˆÈÛÛ›™XÝ[ÛˆÚ]›È™]žKÛÈHÚX›[™È›ØÙ\ÜÈÛ[™ÈHÜš]HØÚÈ
+PÕUSK•SÐUHÚXÚÜÚ[ˆÈ]ÛÜÙKHÛ™È•È\ÜÈœ›ÛH[ˆÛ\ˆÝ[\[›š[™È[œÝ[
+H\ÙYÈ˜Z[HS•T‘HÜ[ˆ8 %ˆÈØ[\œÈ[ˆ\ØX›H\œÚ\Ý[˜ÙH›ÜˆHÚÛH[ˆ
+‘˜Z[YÈ[š]X[^™HÙ\ÜÚ[Û‘ˆ‹‹ˆ]X˜\ÙBˆÈ\ÈØÚÙY‹ÍÍÎ
+KˆHÝÜ™H\ÈX[NÈØZ]]Ý]Ú]HØ[YHš]\™Y]Y[˜ÙHHÜš]BˆÈ]\Ù\Ë‚ˆXY[™HH[YK›[Û›ÝÛšXÊ
+H
+ÈÙ[‹—ÕÔ’UWÔUQSÑWÔÂˆÚ[HYN‚ˆžN‚ˆÙ[‹—ØÛÛ›™XÝØ[™Ú[š]
+
+Bˆ™]\›‚ˆ^Ù\Ü[]LË“Ü\˜][Û˜[\œ›Üˆ\È^Î‚ˆ\œˆHÝŠ^ÊK›ÝÙ\Š
+BˆYˆ›ØÚÙYˆ›Ý[ˆ\œˆ[™˜\ÞHˆ›Ý[ˆ\œŽ‚ˆ˜Z\ÙBˆÙ[‹—ØÛÜÙWØÛÛ›™XÝ[Û—Ü]ZY]JÙ[‹—ØÛÛ›ŠBˆ›ÝÈH[YK›[Û›ÝÛšXÊ
+BˆYˆ›ÝÈHXY[™N‚ˆ˜Z\ÙBˆš]\ˆH˜[™ÛK[šY›Ü›JÙ[‹—ÕÔ’UWÔ‘U–WÔÓÕ×ÓRS—ÔËÙ[‹—ÕÔ’UWÔ‘U–WÔÓÕ×ÓPVÔÊBˆ[YKœÛY\
+Z[Šš]\‹X^
+XY[™HH›ÝËŒJJJB‚ˆÈ8¥ 8¥ ™XY\]Ü]8¥ 8¥ ‚ˆYˆÙÙ]Ü™XYØÛÛ›ŠÙ[ŠHOˆÜ[Û˜[ÜÜ[]LËÛÛ›™XÝ[Û—N‚ˆˆˆ“Ü[ˆHœ™\Ú™XY[Û›HÛÛ›™XÝ[Û‹Üˆ›Û™HÚ[ˆ[˜]˜Z[X›H
+Ø[\œÂˆ™]\›ˆ]ÈÙ[‹—Ü™XYÜÛÛ
+KˆÐSÛ›NˆÐS™XY\œÈ™]™\ˆ›ØÚÈÛˆBˆÜš]\‹ÛÈ™XYÈÚÚ\Ù[‹—ÛØÚÎÈ[™\ˆSUH›Ý\›˜[[ÙH
+‘”È˜[˜XÚÊBˆ™XY\œÈ]ÔSUWÐ•TÖHÝÜ›\ËÛÈHYØXÞHØÚÙY]Ý^\Ëˆ]]ØÛÛ[Z]ˆ™XYÈÙYH]™\ž][™ÈÛÛ[Z]YÛÈ˜\ˆ
+™XY^[Ý\‹]Üš]\È›Üˆ›\Ú][‹\ÙX\˜Ú
+Kˆˆˆ‚ˆYˆ›ÝÙ[‹—ÝØ[ØXÝ]™HÜˆÙ[‹œ™XYÛÛ›N‚ˆ™]\›ˆ›Û™BˆÚ]Ù[‹—Ü™XYØÛÛ›œ×ÛØÚÎ‚ˆ˜Z[YØ]HÙ[‹—Ü™XYÛÜ[—Ù˜Z[YØ]ˆ˜XÚÚ[™×ÛÙ™ˆH˜Z[YØ][™[YK›[Û›ÝÛšXÊ
+HH˜Z[YØ]Ô‘PQÓÔS—Ô‘U–WÔÑPÓÓ‘ÂˆYˆÙ[‹—Ü™XYØÛÛ›œ×ØÛÜÙYÜˆ˜XÚÚ[™×ÛÙ™Ž‚ˆ™]\›ˆ›Û™BˆÈ\›Z]‘Q“Ô‘HHÜ[ŽˆÜ[™\œÈ˜XÙH›Üˆ\›Z]Ë›Ý\ØÜš\ÜœË‚ˆYˆ›ÝÙ[‹—Ü™XYØYÙ]˜XÜ]Z\™JÙ[ŠN‚ˆÙÙÙ\‹™XYÊˆœ™XYÛÛ]Ø\XÚ]H
+	Y
+H›Üˆ	\ÎÈÙ\š[™È\È™XYœ›ÛHH‚ˆ›ØÚÙYÜš]\ˆÛÛ›™XÝ[Ûˆ‹Ô‘PQÔÓÓÓPVÙ[‹™—Ü]ˆ
+Bˆ™]\›ˆ›Û™BˆÛÛ›ˆH›Û™HÈ›Ý[™™Y›Ü™HHžHÛÈH[™\œÈØ[ˆÛÜÙHH[‹[Ü[ˆÛ™BˆžN‚ˆÛÛ›ˆHÙ[‹—ØÛÛ›™XÝÜ™XYÛÛ›J[Y[Ý]MKŒ
+Bˆ\WÙ]X˜\ÙWÜ˜YÛX\ÊÛÛ›‹—ÛX™[HœÝ]K™ˆŠBˆYˆÙ[‹—Ù×ØÚš×ÛØYYˆÈ™YÚ\Ý\œÈ[ˆHÛÛ›™XÝ[Û‹›ÝHš[Nˆ›È\Èš[™BˆØYÙÍWØÚš×Ù^[œÚ[ÛŠÛÛ›ŠBˆ^Ù\˜\ÙQ^Ù\[Ûˆ\È^Î‚ˆÈH[‹[Ü[ˆÛÛ›™XÝ[Ûˆ
+Ü[ˆÚË^[œÚ[ÛˆØY˜Z[Y
+H\ÈH]™H˜XÚÙY\ØÜš\Ü‹ˆÈHXZÈÚ\H\ÈÛÛ^\ÝÈÈš^ÈHÝ˜[™Y\›Z]ÛÝ[Úš[šÈH™XYˆÈ]žHÛ™HÛÝ›Ü™]™\‹ˆ
+›ÝØÛÜÙWÜ™XYØÛÛ›ŽˆØ[\œÈ™[X\ÙHZ\ˆÝÛˆ\›Z]ŠBˆYˆÛÛ›ˆ\È›Ý›Û™N‚ˆÙ[‹—ØÛÜÙWØÛÛ›—ÛÙÙÙY
+ÛÛ›‹œ\X[K[Ü[™Y™XYÛÛ›ˆŠBˆÙ[‹—Ü™XYØYÙ]œ™[X\ÙJ
+BˆYˆ›Ý\Ú[œÝ[˜ÙJ^ËÜ[]LË‘\œ›ÜŠN‚ˆ˜Z\ÙBˆÚ]Ù[‹—Ü™XYØÛÛ›œ×ÛØÚÎ‚ˆÙ[‹—Ü™XYÛÜ[—Ù˜Z[YØ]H[YK›[Û›ÝÛšXÊ
+BˆÙÙÙ\‹™XYÊœ™XY[Û›HÛÛ›™XÝ[ÛˆÜ[ˆ˜Z[Y›Üˆ	\È‹Ù[‹™—Ü]^×Ú[™›ÏUYJBˆ™]\›ˆ›Û™Bˆ™]\›ˆÛÛ›‚‚ˆYˆÙ]šXÝÛÛ™WÚYWÜ™XYØÛÛ›ŠÙ[ŠHOˆ›ÛÛ‚ˆˆˆÛÜÙHÛ™HYHÛÛYÛÛ›™XÝ[Ûˆ
+HY\ˆÛˆHØ[YHš[HØ[È]È\›Z]
+NÈ™]™\ˆH]™HÛ™Kˆˆˆ‚ˆžN‚ˆÛÛ›ˆHÙ[‹—Ü™XYÜÛÛ™Ù]Û›ÝØZ]
+
+Bˆ^Ù\]Y]YK‘[\N‚ˆ™]\›ˆ˜[ÙBˆÙ[‹—ØÛÜÙWÜ™XYØÛÛ›ŠÛÛ›ŠBˆ™]\›ˆYB‚ˆYˆØÛÜÙWÜ™XYØÛÛ›ŠÙ[‹ÛÛ›ŠHOˆ›Û™N‚ˆˆˆÛÜÙHHÛÛY™XYÛÛ›™XÝ[Ûˆ[™™[X\ÙH]È\›Z]]™[ˆÚ[ˆHÛÜÙH˜Z[È
+Ú]Û[™Âˆ]ÛÝ[˜\œ›ÝÈH™XY]›Ü™]™\ŠKˆÝ™\‹\™[X\Ú[™ÈH›Ý[™YÙ[X\Ü™H˜Z\Ù\È˜[YQ\œ›Ü‹ˆˆˆ‚ˆžN‚ˆÙ[‹—ØÛÜÙWØÛÛ›—ÛÙÙÙY
+ÛÛ›‹œ™XYXÛÛ›ˆŠBˆš[˜[N‚ˆÙ[‹—Ü™XYØYÙ]œ™[X\ÙJ
+B‚ˆYˆØÚXÚÛÝ]Ü™XYØÛÛ›ŠÙ[ŠHOˆÜ[Û˜[ÜÜ[]LËÛÛ›™XÝ[Û—N‚ˆˆˆ›Üœ›ÝÈH™XYÛÛ›™XÝ[Û‹Ü[š[™ÈÛˆHZ\ÜÎÈ›Û™HÚ[ˆH™XY]\È[˜]˜Z[X›K‚ˆHÛÛ]ÛÜÝÈ›È\›Z]
+HÛÛ›™XÝ[Ûˆ[™XYHÛÈÛ™JKˆˆˆ‚ˆYˆ›ÝÙ[‹—ÝØ[ØXÝ]™HÜˆÙ[‹œ™XYÛÛ›N‚ˆ™]\›ˆ›Û™BˆžN‚ˆ™]\›ˆÙ[‹—Ü™XYÜÛÛ™Ù]Û›ÝØZ]
+
+Bˆ^Ù\]Y]YK‘[\N‚ˆ™]\›ˆÙ[‹—ÙÙ]Ü™XYØÛÛ›Š
+B‚ˆÛÛ^X[˜YÙ\‚ˆYˆÜ™XYØÝ
+Ù[ŠHOˆ]\˜]Ü–ÜÜ[]LËÛÛ›™XÝ[Û—N‚ˆˆˆ–ZY[HÛÛ›™XÝ[Ûˆ›Üˆ™XY[Û›HÝ][Y[ÎˆHÛÛY™XY[Û›BˆÛÛ›™XÝ[ÛˆÚ]“ÈØÚÈ[™\ˆÐSÈÝ\Ú\ÙH
+›Û‹UÐSÜ[ˆ˜Z[\™KˆÙZ[[™È™XXÚY
+HHÜš]\ˆÛÛ›™XÝ[Ûˆ[™\ˆÙ[‹—ÛØÚÈ8 %[X™\˜]BˆYÜ˜Y][ÛŽˆÛÝÙ\ˆ™X]ÈSQ’SKÚXÚHÝ\\š\ÛÜˆØ[››ÝÙYKˆˆˆ‚ˆÛÛ›ˆHÙ[‹—ØÚXÚÛÝ]Ü™XYØÛÛ›Š
+BˆYˆÛÛ›ˆ\È›Ý›Û™N‚ˆžN‚ˆZY[ÛÛ›‚ˆš[˜[N‚ˆ™]\›™YH˜[ÙBˆÚ]Ù[‹—Ü™XYØÛÛ›œ×ÛØÚÎ‚ˆYˆ›ÝÙ[‹—Ü™XYØÛÛ›œ×ØÛÜÙY‚ˆžN‚ˆÙ[‹—Ü™XYÜÛÛœ]Û›ÝØZ]
+ÛÛ›ŠBˆ™]\›™YHYBˆ^Ù\]Y]YK‘[‚ˆ\ÜÂˆYˆ›Ý™]\›™Y‚ˆÈÛÜÙJ
+H˜Z[™YHÛÛ
+Üˆ]Y]YK‘[ˆ[œ™XXÚX›HÚ[BˆÈ\›Z]ÈOHX^Ú^™KØYX™X\š[™ÈYˆ^HšY
+NˆÝ\œ\Ë‚ˆÙ[‹—ØÛÜÙWÜ™XYØÛÛ›ŠÛÛ›ŠBˆ™]\›‚ˆÚ]Ù[‹—ÛØÚÎ‚ˆYˆÙ[‹—ØÛÛ›ˆ\È›Û™NˆÈÛÜÙJ
+H˜XÙYHÝ[][Ú[™[™È™XY\‚ˆÙ[‹—Ü™[Ü[—ØY\—ØÛÜÙWÛØÚÙY
+ÛÛ^Hœ™XYŠBˆZY[Ø\Ý
+Ü[]LËÛÛ›™XÝ[Û‹Ù[‹—ØÛÛ›ŠB‚ˆYˆÜ™[Ü[—ØY\—ØÛÜÙWÛØÚÙY
+Ù[‹ÛÛ^ˆÝˆHÜš]HŠHOˆ›Û™N‚ˆˆˆ”™[Ü[ˆHÜš]\ˆY\ˆÛÜÙJ
+X˜XÙYH]™HØ[\ˆ
+HX\™ÝÛˆÝÛ™\‚ˆÙ]ØÛÛ›ˆH›Û™XÚ[HHÛÜšÙ\ˆÝ[YH˜[œØÜš\›\ÚÈ[™
+K‚ˆÝY
+ÐT“’S‘ÊH[™›Ý[™Y
+Û›HY\ˆ[ˆ^XÚ]ÛÜÙJ
+JKˆØ[\ˆÛÂˆÙ[‹—ÛØÚØˆ›ÈÚ[š]ÜØÚ[XNˆ›È˜XÙ\ÈÚ]ÚX›[™ÜÈ\š[™ÈX\™ÝÛ‹ˆˆˆ‚ˆYˆÙ[‹œ™XYÛÛ›N‚ˆ˜Z\ÙHÜ[]LË”›ÙÜ˜[[Z[™Ñ\œ›ÜŠˆˆ”Ù\ÜÚ[Û‘ˆ›ÜˆÜÙ[‹™—Ü]HØ\ÈÛÜÙY
+™XY[Û›H[™JNÈ‚ˆˆ˜Ø[››ÝÙ\™HHØÛÛ^HY\ˆÛÜÙJ
+H‚ˆ
+BˆÈH™[Ü[ˆ™\ÛÛ™\ÈHUYØZ[ŽˆH™\XÙYš[HÛÝ[™HÜš][ˆ›ÝYÚÝ[HÐSÜÚBˆÈ\ÜÝ[\[ÛœÎÈH]X\˜[[™Y[™H]\Ý™]™\ˆ[™Hœ™\ÚÛÛ›™XÝ[ÛˆÈH[XYÙYš[K‚ˆYˆÙ[‹—Ù—ØÛÜœ\[™›Ý
+Ù[‹—Ù—Ü™\XÙYÜˆÙ[‹—Ù—Ùš[WÝØ\×Ü™\XÙY
+
+JN‚ˆ˜Z\ÙHÙ[‹—ØÛÜœ\Ù\œ›ÜŠˆˆœÝ]K™ˆÛÛ›™XÝ[Ûˆ›ÜˆÜÙ[‹™—Ü]H\È]X\˜[[™YY\ˆ‚ˆˆœÝXÝ\˜[ÛÜœ\[ÛŽÈ™Y\Ú[™ÈÈ™[Ü[ˆ›ÜˆHØÛÛ^H‚ˆ˜Y\ˆÛÜÙJ
+Kˆ‚ˆ
+BˆÙ[‹—Ú[ÚY—Ù—ÙÙ[™\˜][Û—ØÚ[™ÙY
+
+BˆÙÙÙ\‹Ø\›š[™ÊˆœÝ]K™ˆÛÛ›™XÝ[Ûˆ›Üˆ	\ÈØ\ÈÛÜÙYÚ[HH	\ÈØ\ÈÝ[[ˆ‚ˆ™›YÚ8 %™[Ü[š[™È
+X\™ÝÛ‹ÝÛÜšÙ\ˆ˜XÙKÎMÌÍŠH‹Ù[‹™—Ü]ÛÛ^ˆ
+BˆžN‚ˆÙ[‹—ØÛÛ›ˆHÙ[‹—ÛÜ[—ÝÜš]\—ØÛÛ›Š
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆ˜Z\ÙHÜ[]LË“Ü\˜][Û˜[\œ›ÜŠˆˆœÝ]K™ˆÛÛ›™XÝ[ÛˆØ\ÈÛÜÙYÚ[HHØÛÛ^HØ\ÈÝ[‚ˆˆš[ˆ›YÚ
+HÙ\ÜÚ[Û‹]X\™ÝÛˆ]Ø[YÛÜÙJ
+H™Y›Ü™H‚ˆˆ\ÈÛÜšÙ\ˆš[š\ÚY8 %ÎMÌÍŠH[™H]]ÛX]XÈ™[Ü[ˆ˜Z[YˆÙ^ßH‚ˆ
+Hœ›ÛH^Â‚ˆYˆÙ^XÝ]WÝÜš]JˆÙ[‹›ŽˆØ[X›VÖÜÜ[]LËÛÛ›™XÝ[Û—KK]Y[˜ÙWÜÎˆÜ[Û˜[Ù›Ø]HH›Û™Kˆ
+HOˆ‚ˆˆˆ”[ˆ
+™›ŠÛÛ›ŠJˆ[œÚYH‘QÒSˆSSQQPUHÚ]š]\™YØÚÈ™]žNÈÛÛ[Z]ˆ\È[™Y\™H
+Ø[\œÈ]\Ý›ÝÛÛ[Z]
+Kˆ™]\›œÈ
+™›Š‰ÜÈ™\Ý[‚ˆ‘QÒSˆSSQQPUHZÙ\ÈHÐSÜš]HØÚÈ\œ›ÛÛÈÛÛ[[ÛˆÝ\™˜XÙ\Âˆ[[YYX][NÈÛˆØÚÙYØ\ÞHH]ÛˆØÚÈ\È™[X\ÙYHš]\ˆÛ\ˆ[™HÒÓHØ[˜XÚÈ™]šYY8 %
+™›Šˆ]\ÝÝ^HY[\Ý[[™\ˆ™]žKˆˆˆ‚ˆYˆ]Y[˜ÙWÜÈ\È›Û™N‚ˆ]Y[˜ÙWÜÈHÙ[‹—ÕÔ’UWÔUQSÑWÔÂˆXY[™HH[YK›[Û›ÝÛšXÊ
+H
+È]Y[˜ÙWÜÂˆÛÛ\™\ÜÚ[Û—ÙXY[™NˆÜ[Û˜[Ù›Ø]HH›Û™HÈÙ]ÛˆHš\œÝÛÛ\™\ÜÚ[Û‹X\ÞHÛÛ\Ú[Û‚ˆÈÛ™H™]žH›ÜˆÔSUWÒSÑT”ˆ˜Z\ÙYžH‘QÒSˆSSQQPUH]Ù[ˆ
+Ø[˜XÚÈ›Ý[Žˆ›Ý[™ÂˆÈ™\^YY
+KˆÛ˜ÙH›ˆ\ÈÝ\Y[ˆSÑT”ˆX]™\ÈÙ][Y[[šÛ›ÝÛˆ[™]\Ý›ÜYØ]K‚ˆÈHØ[˜XÚÈ\È›Ý[ˆ]]Ú[ÛÈ\™H\È›È\˜X›HY™™XÝÈ™\^H[™H™]žH\ÂˆÈ^XÝK[Û˜ÙHØY™H
+ÎNML‰ÜÈÛÛ˜XÝ
+KˆÛ˜ÙHHØ[˜XÚÈÝ\Ë[ˆSÑT”ˆX]™\ÈHÜš]IÜÂˆÈÙ][Y[[šÛ›ÝÛˆ[™]\Ý›ÜYØ]H8 %\È[\ˆÝÛœÈ›Û‹ZY[\Ý[˜[œØÜš\ØÛÝ[\‚ˆÈ]]][ÛœË›Ý\ÝY[\Ý[TÑT•Ë‚ˆ[Ù\œ—Ø™YÚ[—Ü™]šYYH˜[ÙBˆÚ[HYN‚ˆÙ[‹—Ü˜Z\ÙWÚY—Ù—ØÛÜœ\
+
+BˆÙ[‹—Ü˜Z\ÙWÚY—Ù—Ü™\XÙY
+
+Bˆ›—ÜÝ\YH˜[ÙBˆžN‚ˆÚ]Ù[‹—ÛØÚÎ‚ˆYˆÙ[‹—ØÛÛ›ˆ\È›Û™NˆÈÛÜÙJ
+H˜XÙY\ÈÜš]\‚ˆÙ[‹—Ü™[Ü[—ØY\—ØÛÜÙWÛØÚÙY
+ÛÛ^HÜš]HŠBˆÙ[‹—ØÛÛ›‹™^XÝ]J‘QÒSˆSSQQPUHŠBˆžN‚ˆ›—ÜÝ\YHYBˆ™\Ý[H›ŠÙ[‹—ØÛÛ›ŠBˆÙ[‹—ØÛÛ›‹˜ÛÛ[Z]
+
+Bˆ^Ù\˜\ÙQ^Ù\[ÛŽ‚ˆžN‚ˆÙ[‹—ØÛÛ›‹œ›Û˜XÚÊ
+Bˆ^Ù\^Ù\[ÛŽ‚ˆ\ÜÂˆ˜Z\ÙBˆÈÝXØÙ\ÜÈ8 %\š[ÙXÈ™\ÝYY™›ÜÚXÚÜÚ[
+È•ÈY\™ÙK‚ˆÙ[‹—ÝÜš]WØÛÝ[
+ÏHBˆYˆÙ[‹—ÝÜš]WØÛÝ[	HÙ[‹—ÐÒPÒÔÒS•ÑU‘T–WÓ—ÕÔ’UTÈOH‚ˆÙ[‹—ÝžWÝØ[ØÚXÚÜÚ[
+
+BˆYˆÙ[‹—ÝÜš]WØÛÝ[	HÙ[‹—Ñ•×ÓQT‘ÑWÑU‘T–WÓ—ÕÔ’UTÈOH‚ˆÙ[‹—ÝžWÚ[˜Ü™[Y[[ÛY\™ÙWÙÊ
+Bˆ™]\›ˆ™\Ý[ˆ^Ù\Ù\ÜÚ[ÛÛÛ\™\ÜÚ[Û’[”›ÙÜ™\ÜÑ\œ›ÜŽ‚ˆÈ˜[œÚY[
+ÙYHÐÓÓT‘TÔÒSÓ—Ð•TÖWÕÐRUÔÊNˆHÝY\ˆ[™[™ÈZYXÛÛ\™\ÜÚ[Ûˆ]\Ý›ÝX›Ü‚ˆÈH]™H›Ü™ZYÛˆÛÛ\™\ÜÚ[ÛˆØÚÈ\È˜[œÚY[ˆHÛÛ\™\ÜÛÜˆX›\Ú\È[ˆHÛÝ\HÙ‚ˆÈÙXÛÛ™ËˆÚ]Ý][žHØZ]HÝY\ˆ][™ÈZYXÛÛ\™\ÜÚ[ÛˆX›ÜÈH\Ù\‰ÜÈ\›ˆ\ÂˆÈÙ\ÜÚ[Û—Ü\œÚ\Ý[˜ÙWÙ˜Z[Y[™Ù[™ÈHÜ\˜]Üˆ[[™È\ÚÈÜXÙH]Ø\È™]™\ˆBˆÈ›Ø›[H
+ÍÍLÊKˆHYÙ]\ÈÐÓÓT‘TÔÒSÓ—Ð•TÖWÕÐRUÔË›ÝHÜš]K[ØÚÈ]Y[˜ÙNˆBˆÈX\ÙH\ÈHÛÜœ™XÝ™\ÜÈ›Ý[™\žKÛÈHÜš]\ˆÝ[ØÚÙYÝ]Y\ˆHÚÜØZ]]\Ý™BˆÈ™Y\ÙY˜]\ˆ[ˆYÈ[™HÝ[H\›ˆÛ˜ÙHHÛ™Ë\[›š[™ÈÜˆÙYÙYÛÛ\™\ÜÚ[Û‚ˆÈš[˜[H]ÈÛË‚ˆYˆÛÛ\™\ÜÚ[Û—ÙXY[™H\È›Û™N‚ˆÛÛ\™\ÜÚ[Û—ÙXY[™HHZ[Š[YK›[Û›ÝÛšXÊ
+H
+ÈÙ[‹—ÐÓÓT‘TÔÒSÓ—Ð•TÖWÕÐRUÔËXY[™JBˆYˆÙ[‹—ÜÛY\Ø™Y›Ü™WÝÜš]WÜ™]žJˆÛÛ\™\ÜÚ[Û—ÙXY[™KÙ[‹—ÐÓÓT‘TÔÒSÓ—Ð•TÖWÕÐRUÔÂˆ
+N‚ˆÛÛ[YBˆ˜Z\ÙBˆ^Ù\Ü[]LË‘\œ›Üˆ\È^Î‚ˆÈ	Û›È[Ü™H›ÝÜÉÈ\ÈH˜[œÚY[[™Ú[™H\œ›ÜˆÛˆÛÛ[™YÐS\[™È
+ÛÛYHZ[ÂˆÈ˜Z\ÙH]\È[\™˜XÙQ\œ›Ü‹HÚX›[™ÈÙˆ]X˜\ÙQ\œ›ÜŠNˆ™]žHZÙHØÚÙYØ\ÞK‚ˆYˆÚ\×Û›×Û[Ü™WÜ›ÝÜÊ^ÊH[™Ù[‹—ÜÛY\Ø™Y›Ü™WÝÜš]WÜ™]žJXY[™K]Y[˜ÙWÜÊN‚ˆÛÛ[YBˆ\œ—Û\ÙÈHÝŠ^ÊK›ÝÙ\Š
+BˆYˆ\Ú[œÝ[˜ÙJ^ËÜ[]LË“Ü\˜][Û˜[\œ›ÜŠN‚ˆYˆ›ØÚÙYˆ[ˆ\œ—Û\ÙÈÜˆ˜\ÞHˆ[ˆ\œ—Û\ÙÎ‚ˆYˆÙ[‹—ÜÛY\Ø™Y›Ü™WÝÜš]WÜ™]žJXY[™K]Y[˜ÙWÜÊN‚ˆÛÛ[YBˆÈØ^HÚ]XÝX[H\[™Y›Ý\ÚËÜ\›Z\ÜÚ[Ûˆ[XYÙK‚ˆ˜Z\ÙHÜ[]LË“Ü\˜][Û˜[\œ›ÜŠˆˆ™]X˜\ÙH\ÈØÚÙY
+[›Ý\ˆ\›Y\È›ØÙ\ÜÈ[H‚ˆˆœÝ]K™ˆÜš]HØÚÈ›ÜˆÝ™\ˆÜ]Y[˜ÙWÜÎ‹ŒŸ\È8 %‚ˆ›ZÙ[HHÛ™ÈXZ[[˜[˜ÙHÜ\˜][ÛˆÝXÚ\ÈPÕUSK‚ˆ˜H\™ÙHÐSÚXÚÜÚ[Üˆ[ˆÛ\ˆ™K]\]H‚ˆœ›ØÙ\ÜÎÈH]X˜\ÙH]Ù[ˆ\ÈX[JH‚ˆ
+Hœ›ÛH^ÂˆYˆ
+ˆÑTÒ×ÒS×ÑT”“Ô—ÓPT’ÑTˆ[ˆ\œ—Û\ÙÈ[™›Ý›—ÜÝ\Y[™›Ý[Ù\œ—Ø™YÚ[—Ü™]šYYˆ[™Ù[‹—ÜÛY\Ø™Y›Ü™WÝÜš]WÜ™]žJXY[™K]Y[˜ÙWÜÊBˆ
+N‚ˆÈ™]žHÛˆHÐSQHÛÛ›™XÝ[ÛŽˆÛÜÙJ
+JÜ™[Ü[ˆÛÝ[Ø[˜Ù[\È›ØÙ\ÜÉÜÂˆÈÔÒVØÚÜÈ›Üˆ]™\žHÚX›[™È
+ÝÝØÛÜœ\0©Ì‹ŒŠK‚ˆ[Ù\œ—Ø™YÚ[—Ü™]šYYHYBˆÛÛ[YBˆ˜Z\ÙHÈ›Û‹[ØÚÈ\œ›Ü‹Ø[˜XÚÈ[™XYH˜[‹Üˆ]Y[˜ÙH^]\ÝYˆYˆ\Ú[œÝ[˜ÙJ^ËÜ[]LË‘]X˜\ÙQ\œ›ÜŠN‚ˆÈ[ˆÝ][Ù‹X˜[™™\XÙHÝ\™˜XÙ\È\È\ÈØ[YHÛÜœ\[ÛˆÛ\ÜÎÈ[‹Yš[H™\Z\‚ˆÈÛˆH‘UÈÙ[™\˜][Ûˆ[\YšY\ÈH[XYÙK‚ˆYˆ
+ˆ››ÝH]X˜\ÙHˆ[ˆ\œ—Û\ÙÈÜˆ\×ÛX[›Ü›YYÙ—Ù\œ›ÜŠ^ÊBˆÜˆÙ[‹—Ú\×Ù×ÝÜš]WØÛÜœ\[Û—Ù\œ›ÜŠ^ÊBˆ
+N‚ˆÙ[‹—Ü˜Z\ÙWÚY—Ù—Ü™\XÙY
+
+BˆÈÛÜœ\•ÈÚYÝÈX›\È˜Z[]™\žHÜš]HšXHHÞ[˜ÈšYÙÙ\œÈÚ[HØ[›ÛšXØ[ˆÈ›ÝÜÈ\™H[XÝˆ]XÚH\š]™Y[™^\È]ÛZXØ[H[™™]žH
+™]™\ˆ™XZ[\™JK‚ˆYˆÙ[‹—Ù[\—Ù×Ù˜Z[ÛÜ[Š^ÊN‚ˆÛÛ[YBˆÈÚ]Ý\š]™\È›ÝÚXÚÜÈ\ÈÝXÝ\˜[[XYÙNˆ]X\˜[[™K‚ˆYˆÙ[‹—Ú\×ÜÝXÝ\˜[ØÛÜœ\[Û—Ù\œ›ÜŠ^ÊN‚ˆÙ[‹—Ú[Ù—ØÛÜœ\
+^ÊBˆ˜Z\ÙB‚ˆYˆÝÜš]WÜÜ[
+ˆÙ[‹Ü[ˆÝ‹\˜[\Îˆ[žHH
+
+K
+‹X[žNˆ›ÛÛH˜[ÙK]Y[˜ÙWÜÎˆÜ[Û˜[Ù›Ø]HH›Û™Kˆ
+HOˆ›Û™N‚ˆˆˆ”[ˆÛ™HS”ÑT•ÕTUKÑSUH›ÝYÚÙ^XÝ]WÝÜš]Xˆˆˆ‚ˆYˆÙÊÛÛ›ŠN‚ˆ
+ÛÛ›‹™^XÝ][X[žHYˆX[žH[ÙHÛÛ›‹™^XÝ]JJÜ[\˜[\ÊBˆÙ[‹—Ù^XÝ]WÝÜš]JÙË]Y[˜ÙWÜÏ\]Y[˜ÙWÜÊB‚ˆYˆÝÜš]WÜ›ÝØÛÝ[
+Ù[‹Ü[ˆÝ‹\˜[\Îˆ[žHH
+
+K
+‹]Y[˜ÙWÜÎˆÜ[Û˜[Ù›Ø]HH›Û™JHOˆ[‚ˆˆˆ”[ˆÛ™HTUKÑSUH›ÝYÚÙ^XÝ]WÝÜš]XÈ™]\›ˆ›ÝÜÈÚ[™ÙYˆ
+ÑSPÕÚ[™Ù\Ê
+XÚ[ˆHš]™\ˆ™\ÜÈ›Û™HÈ™YØ]]™JKˆˆˆ‚ˆYˆÙÊÛÛ›ŠN‚ˆ›ÝØÛÝ[HÛÛ›‹™^XÝ]JÜ[\˜[\ÊKœ›ÝØÛÝ[ˆYˆ›ÝØÛÝ[\È›Û™HÜˆ›ÝØÛÝ[‚ˆ›ÝØÛÝ[HÛÛ›‹™^XÝ]J”ÑSPÕÚ[™Ù\Ê
+HŠK™™]ÚÛ™J
+VÌBˆ™]\›ˆ›ÝØÛÝ[ˆ™]\›ˆÙ[‹—Ù^XÝ]WÝÜš]JÙË]Y[˜ÙWÜÏ\]Y[˜ÙWÜÊB‚ˆYˆÜ™XYÛÛ™JÙ[‹Ü[ˆÝ‹\˜[\Îˆ[žHH
+
+JHOˆÜ[Û˜[ÜÜ[]LË”›Ý×N‚ˆˆˆ˜™]ÚÛ™J
+XÙˆÛ™H™XY[Û›HÝ][Y[šXHÜ™XYØÝˆˆˆ‚ˆÚ]Ù[‹—Ü™XYØÝ
+
+H\ÈÛÛ›Ž‚ˆ™]\›ˆÛÛ›‹™^XÝ]JÜ[\˜[\ÊK™™]ÚÛ™J
+B‚ˆYˆÜ™XYØ[
+Ù[‹Ü[ˆÝ‹\˜[\Îˆ[žHH
+
+JHOˆ\ÝÜÜ[]LË”›Ý×N‚ˆˆˆ˜™]Ú[
+
+XÙˆÛ™H™XY[Û›HÝ][Y[šXHÜ™XYØÝˆˆˆ‚ˆÚ]Ù[‹—Ü™XYØÝ
+
+H\ÈÛÛ›Ž‚ˆ™]\›ˆÛÛ›‹™^XÝ]JÜ[\˜[\ÊK™™]Ú[
+
+B‚ˆYˆÙ[œÝ\™WÙ—Ùš[WÙÙ[™\˜][ÛŠÙ[ŠHOˆ›Û™N‚ˆˆˆ“Z[HÛ˜ÙK\\‹Yš[HÙ[™\˜][ÛˆÝ[\
+Ý]WÛY]H
+È\XØ][Û—ÚY
+Kˆš\œÝÜ[™\ˆÚ[œÈ
+S”ÑT•ˆÔˆQÓ“Ô‘JNÈ\XØ][Û—ÚY\ÈÜš][ˆÛ›HÚ[HÛÈ˜XÙ\œÈÛÛ™\™ÙKˆTÔÒU‘HÚXÚÜÚ[Û›K‚‚ˆÙYHÍLÎË‚ˆˆˆ‚ˆYˆÙ[‹œ™XYÛÛ›HÜˆÙ[‹—ØÛÛ›ˆ\È›Û™N‚ˆ™]\›‚ˆÚÙ[ˆH]ZY]ZY
+
+Kš^ˆžN‚ˆÚ]Ù[‹—ÛØÚÎ‚ˆÙ[‹—ØÛÛ›‹™^XÝ]Jˆ’S”ÑT•ÔˆQÓ“Ô‘HS•ÈÝ]WÛY]H
+Ù^K˜[YJHSQTÈ
+ËÊH‹ˆ
+ÔÕUWÑ—ÑÑS‘TUSÓ—ÒÑVKÚÙ[ŠKˆ
+Bˆ›ÝÈHÙ[‹—ØÛÛ›‹™^XÝ]Jˆ”ÑSPÕ˜[YH”“ÓHÝ]WÛY]HÒT‘HÙ^HHÈ‹
+ÔÕUWÑ—ÑÑS‘TUSÓ—ÒÑVK
+Kˆ
+K™™]ÚÛ™J
+BˆYˆ›ÝÈ[™›ÝÖÌN‚ˆÚÙ[ˆHÝŠ›ÝÖÌJBˆ˜YÛXWÜ›ÝÈHÙ[‹—ØÛÛ›‹™^XÝ]J”QÓPH\XØ][Û—ÚYŠK™™]ÚÛ™J
+BˆÝ\œ™[H[
+˜YÛXWÜ›ÝÖÌHÜˆ
+HYˆ˜YÛXWÜ›ÝÈ[ÙHˆYˆÝ\œ™[OH‚ˆÝ\œ™[H
+[
+ÚÙ[–ÎŽKMŠH	ˆÑ‘‘‘‘‘‘ŠHÜˆBˆÙ[‹—ØÛÛ›‹™^XÝ]Jˆ”QÓPH\XØ][Û—ÚY^ØÝ\œ™[HŠBˆÙ[‹—Ù—Ùš[WØ\XØ][Û—ÚYHÝ\œ™[ˆžN‚ˆÙ[‹—ØÛÛ›‹™^XÝ]J”QÓPHØ[ØÚXÚÜÚ[
+TÔÒU‘JHŠBˆ^Ù\Ü[]LË‘\œ›ÜŽ‚ˆ\ÜÂˆ^Ù\Ü[]LË‘\œ›Üˆ\È^Î‚ˆÙÙÙ\‹™XYÊœÝ]K™ˆÙ[™\˜][ÛˆÝ[\ÚÚ\Yˆ	\È‹^ÊB‚ˆYˆÜ™XÛÜ™Ù—Ùš[WÚY[]JÙ[ŠHOˆ›Û™N‚ˆˆˆ”Û˜\ÚÝ[›ÙH\ÈHÛ‹Y\ÚÈÙ[™\˜][ÛˆXY\ˆÚ[ˆ™\Ù[ˆˆˆ‚ˆÙ[‹—Ù—Ùš[WÚY[]HHÜÝ]Ù—Ùš[WÚY[]JÙ[‹™—Ü]
+BˆÙ[‹—Ù—ÜÚYXØ\—ÚY[]HHÜÝ]ÜÜ[]WÜÚYXØ\—ÚY[]JÙ[‹™—Ü]
+Bˆ\Ú×ÚYHÜ™XYÜÜ[]WØ\XØ][Û—ÚY
+Ù[‹™—Ü]
+BˆYˆ\Ú×ÚY‚ˆÙ[‹—Ù—Ùš[WØ\XØ][Û—ÚYH\Ú×ÚYˆ[YˆÙ[‹—ØÛÛ›ˆ\È›Ý›Û™H[™›ÝÙ[‹—Ù—Ùš[WØ\XØ][Û—ÚY‚ˆžN‚ˆ˜YÛXWÜ›ÝÈHÙ[‹—Ü™XYÛÛ™J”QÓPH\XØ][Û—ÚYŠBˆ^Ù\Ü[]LË‘\œ›ÜŽ‚ˆ˜YÛXWÜ›ÝÈH›Û™BˆYˆ˜YÛXWÜ›ÝÈ[™˜YÛXWÜ›ÝÖÌN‚ˆÙ[‹—Ù—Ùš[WØ\XØ][Û—ÚYH[
+˜YÛXWÜ›ÝÖÌJB‚ˆYˆÙ—Ùš[WÝØ\×Ü™\XÙY
+Ù[ŠHOˆ›ÛÛ‚ˆˆˆ•YHÚ[ˆH]›ÈÛ™Ù\ˆ˜[Y\ÈHš[H\È[œÝ[˜ÙHÜ[™Yˆˆˆ‚ˆ™XÛÜ™YHÙ[‹—Ù—Ùš[WÚY[]BˆYˆ™XÛÜ™Y\È›Ý›Û™H[™ÜÝ]Ù—Ùš[WÚY[]JÙ[‹™—Ü]
+HOH™XÛÜ™Y‚ˆ™]\›ˆYBˆ™XÛÜ™YØ\H[
+Ù[‹—Ù—Ùš[WØ\XØ][Û—ÚYÜˆ
+BˆYˆ›Ý™XÛÜ™YØ\‚ˆ™]\›ˆ˜[ÙBˆÈXY\ˆHÐS›ÝY]ÚXÚÜÚ[Y›ÝH™\XÙNÈH™X[™\XÙ[Y[\È›Ûž™\›Ë‚ˆ\Ú×Ø\HÜ™XYÜÜ[]WØ\XØ][Û—ÚY
+Ù[‹™—Ü]
+Bˆ™]\›ˆ›ÛÛ
+\Ú×Ø\[™\Ú×Ø\OH™XÛÜ™YØ\
+B‚ˆYˆÝØ[ÙÙ[™\˜][Û—ÝØ\×ÛÜÝ
+Ù[ŠHOˆ›ÛÛ‚ˆˆˆ•YHÚ[ˆHÐSÔÒHÙ[™\˜][Ûˆ\È[™HÜ[™Y\ÈÛÛ™Kˆ™XÛÜ™YˆÙ[™\˜][ÛŽˆ\™HÝ]
+›ÈÜ›ØÈØ[ÈÛˆX[HÜš]\ÊKˆ[\HY[]Bˆ
+ÐS\X\™YY\ˆÜ[‹ÜˆÛX\™YžHHÛX[ˆÛÜÙJ
+JNˆ›Ø™BˆÜ›ØËÜÙ[‹Ù™›Üˆ[]YÚYXØ\œÈ[™YÜHÝ\œ™[Û™\ÈÛ˜ÙHÛX[‹ˆˆˆ‚ˆ™XÛÜ™YHÙ[‹—Ù—ÜÚYXØ\—ÚY[]HÜˆßBˆ˜\ÙHHÜË™œÜ]
+Ù[‹™—Ü]
+BˆYˆ™XÛÜ™Y‚ˆ™]\›ˆ[žJˆÜÝ]Ù—Ùš[WÚY[]J]
+˜\ÙH
+ÈÝY™š^
+JHOHY[›ÜˆÝY™š^Y[[ˆ™XÛÜ™Yš][\Ê
+Bˆ
+BˆYˆ›ÝÙ[‹—ÝØ[ØXÝ]™NˆÈ›ÈÚYXØ\ˆÙ[™\˜][ÛˆÈÜÙNÈÙY\Ü›ØÈÙ™ˆHÝ]ˆ™]\›ˆ˜[ÙBˆYˆÞ\Ëœ]›Ü›KœÝ\ÝÚ]
+›[^ŠN‚ˆØ]ÚYHÝØ]ÚYÜÜ[]WÜÚYXØ\—Ü]ÊÙ[‹™—Ü]
+BˆžN‚ˆ›Üˆ\™Ù][ˆÜ›Ø×Ù™Ý\™Ù]ÊÜË™Ù]Y
+
+JN‚ˆYˆˆ
+[]Y
+Hˆ[ˆ\™Ù][™ØØ[›ÛšXØ[ÜÜ[]WÜ]
+\™Ù]
+H[ˆØ]ÚY‚ˆ™]\›ˆYBˆ^Ù\ÔÑ\œ›ÜŽ‚ˆ™]\›ˆ˜[ÙBˆÈ›Ø™HÛX[ˆ
+Üˆ[˜]˜Z[X›JNˆYÜHÝ\œ™[ÚYXØ\ˆÙ[™\˜][Û‹‚ˆÝ\œ™[ÚY[]HHÜÝ]ÜÜ[]WÜÚYXØ\—ÚY[]JÙ[‹™—Ü]
+BˆYˆÝ\œ™[ÚY[]N‚ˆÙ[‹—Ù—ÜÚYXØ\—ÚY[]HHÝ\œ™[ÚY[]Bˆ™]\›ˆ˜[ÙB‚ˆYˆÚ[ÚY—Ù—ÙÙ[™\˜][Û—ØÚ[™ÙY
+Ù[ŠHOˆ›Û™N‚ˆˆˆ”ÝÜÜš]\È
+ÙÙÚ[™ÈÛ˜ÙJHÚ[ˆHš[HØ\È™\XÙYÜˆ]ÈÐSÔÒHÙ[™\˜][Û‚ˆ\ÈÛÛ™Nˆ™]™\ˆ[ˆ[‹Yš[H™\Z\ˆÛˆH™]ÈÙ[™\˜][Û‹™]™\ˆÙY\ÛÛ[Z][™ÈÛˆBˆÜ]ÐSˆ›Ý›YÜÈ\™HÝXÚÞKˆˆˆ‚ˆÈH™[Ü[ˆ™\ÛÛ™\ÈHUYØZ[ˆ8 %YˆHš[H]]]\È›ÈÛ™Ù\ˆHÛ™H\È[œÝ[˜ÙBˆÈÜšYÚ[˜[HÜ[™Y
+Ý][Ù‹X˜[™™\ÝÜ™KØÜÛ]ŠK™XÛÛ›™XÝ[™ÈÛÝ[Üš]H[ÈH™]ÈÙ[™\˜][Û‚ˆÈ›ÝYÚÝ[HÐSÜÚH\ÜÝ[\[ÛœÈ
+ÎLÌÌŠKˆ™Y\ÙH[œÝXY‚ˆYˆÙ[‹—Ù—Ü™\XÙYÜˆÙ[‹—Ù—Ùš[WÝØ\×Ü™\XÙY
+
+N‚ˆÙ[‹—Ù—Ü™\XÙYHYBˆÙÙÙ\‹™\œ›ÜŠÔÕUWÑ—Ô‘TPÑQÓTÑÊBˆ˜Z\ÙHÝ]Q”™\XÙY\œ›ÜŠÔÕUWÑ—Ô‘TPÑQÓTÑÊBˆYˆÙ[‹—Ù—ÝØ[ÙÙ[™\˜][Û—ÛÜÝÜˆÙ[‹—ÝØ[ÙÙ[™\˜][Û—ÝØ\×ÛÜÝ
+
+N‚ˆÙ[‹—Ù—ÝØ[ÙÙ[™\˜][Û—ÛÜÝHYBˆÙÙÙ\‹™\œ›ÜŠÑSUQÕÐSÑÑS‘TUSÓ—ÓTÑÊBˆ˜Z\ÙH[]YØ[Ù[™\˜][Û‘\œ›ÜŠÑSUQÕÐSÑÑS‘TUSÓ—ÓTÑÊB‚ˆYˆÜ˜Z\ÙWÚY—Ù—Ü™\XÙY
+Ù[ŠHOˆ›Û™N‚ˆˆˆ”ÝXÚÞKY›YÈ˜\Ý]
+›ÈÙÈÜ[HÛˆ]™\žHÜš]JK[ˆH]™H›Ø™Kˆˆˆ‚ˆYˆÙ[‹—Ù—Ü™\XÙY‚ˆ˜Z\ÙHÝ]Q”™\XÙY\œ›ÜŠÔÕUWÑ—Ô‘TPÑQÓTÑÊBˆYˆÙ[‹—Ù—ÝØ[ÙÙ[™\˜][Û—ÛÜÝ‚ˆ˜Z\ÙH[]YØ[Ù[™\˜][Û‘\œ›ÜŠÑSUQÕÐSÑÑS‘TUSÓ—ÓTÑÊBˆÙ[‹—Ú[ÚY—Ù—ÙÙ[™\˜][Û—ØÚ[™ÙY
+
+B‚ˆÛ\ÜÛY]ÙˆYˆÚ\×ÜÝXÝ\˜[ØÛÜœ\[Û—Ù\œ›ÜŠÛË^Îˆ˜\ÙQ^Ù\[ÛŠHOˆ›ÛÛ‚ˆˆˆ˜\™HÔSUWÐÓÔ”•TÓ“ÕQˆÚ]›È•È›Ý™[˜[˜ÙNˆØ[›ÛšXØ[‹]™YKÜØÚ[XKÙœ™Y[\Ý[XYÙKˆ™]™\ˆ™\Z\˜X›Hœ›ÛHH]™HÜš]H]ˆˆˆ‚ˆ™]\›ˆ
+ˆ\Ú[œÝ[˜ÙJ^ËÜ[]LË‘]X˜\ÙQ\œ›ÜŠBˆ[™›Ý\Ú[œÝ[˜ÙJ^ËÝ]QÛÜœ\\œ›ÜŠBˆ[™›ÝÛË—Ú\×Ù×ÝÜš]WØÛÜœ\[Û—Ù\œ›ÜŠ^ÊBˆ[™Û\ÜÚYžWÜ\œÚ\Ý[˜ÙWÙ\œ›ÜŠ^ÊHOH˜ÛÜœ\‚ˆ
+B‚ˆYˆØÛÜœ\Ù\œ›ÜŠÙ[‹™Yš^ˆÝˆHˆŠHOˆ”Ý]QÛÜœ\\œ›ÜˆŽ‚ˆˆˆZ[H]X\˜[[™H\œ›Üˆ›Üˆ\È[™H
+Y\ÜØYÙH\ÜÙ[X›YÛ˜ÙJKˆˆˆ‚ˆ™]\›ˆÝ]QÛÜœ\\œ›ÜŠˆžÜ™Yš^^×ÔÕUWÑ—ÐÓÔ”•TÓTÑßH
+Ø]\ÙNˆÜÙ[‹—Ù—ØÛÜœ\Ü™X\ÛÛŸJHŠB‚ˆYˆÚ[Ù—ØÛÜœ\
+Ù[‹^Îˆ˜\ÙQ^Ù\[ÛŠHOˆ›Û™N‚ˆˆˆ”]X\˜[[™H\È[™H[™˜Z\ÙNÈ™]™\ˆ[ˆ[‹Yš[H™\Z\ˆ\™Kˆˆˆ‚ˆÙ[‹—Ù—ØÛÜœ\HYBˆÙ[‹—Ù—ØÛÜœ\Ü™X\ÛÛˆHÝŠ^ÊBˆÙ[‹—Ù\ØX›WØÛÜÙWÝ[YWØÚXÚÜÚ[
+
+BˆÙÙÙ\‹™\œ›ÜŠˆœÝ]K™ˆ	\È™\ÜYÝXÝ\˜[ÛÜœ\[ÛˆÝ]ÚYHH•È‚ˆš[™^\È
+	\ÊNÈ]X\˜[[š[™È\È[™Nˆ›È\\ˆÜš]\Ë›È‚ˆ˜]]ÛX]XÈ™[Ü[‹›È^XÚ]ÐSÚXÚÜÚ[]ÛÜÙKˆÝÜH‚ˆ™Ø]]Ø^H[™[ˆ\›Y\ÈÙ\ÜÚ[ÛœÈ™XÛÝ™\ˆK\ÛÝ\˜ÙH	\ÈKZ[œÜXÝ[Û›Xˆ‹Ù[‹™—Ü]^ËˆÙ[‹™—Ü]ˆ
+Bˆ\œˆHÙ[‹—ØÛÜœ\Ù\œ›ÜŠ
+Bˆ›Üˆ]ˆ[ˆ
+œÜ[]WÙ\œ›Ü˜ÛÙH‹œÜ[]WÙ\œ›Ü›˜[YHŠN‚ˆYˆÙ]]Š^Ë]‹›Û™JH\È›Ý›Û™N‚ˆÙ]]Š\œ‹]‹Ù]]Š^Ë]ŠJBˆ˜Z\ÙH\œˆœ›ÛH^Â‚ˆYˆÙ\ØX›WØÛÜÙWÝ[YWØÚXÚÜÚ[
+Ù[ŠHOˆ›Û™N‚ˆˆˆ™\ÝYY™›ÜÔSUWÑÓÓ‘’Q×Ó“×ÐÒÔÓÓ—ÐÓÔÑH
+]ÛˆËŒLŠÊNˆÜ[]LÉÜÂˆÛÜÙJ
+HÝ\Ú\ÙH[œÈH[\›˜[\ÝXÛÛ›™XÝ[ÛˆÚXÚÜÚ[]Ü›ÝBˆH[˜ÚY[	ÜÈYÙ\È[™\ˆÜ›Û™ÈYÙH[X™\œÈ
+ÙYHÝ]QÛÜœ\\œ›ÜŠK‚ˆËŒLˆ\È›ÈÙ]ÛÛ™šYÎÈH™\ÚYX[ÚXÚÜÚ[Û›HØ\œšY\Âˆ™K\]X\˜[[™HÛÛ[Z]Yœ˜[Y\ËÚXÚ\ÈÛ\˜X›Kˆˆˆ‚ˆ›YÈHÙ]]ŠÜ[]LË”ÔSUWÑÓÓ‘’Q×Ó“×ÐÒÔÓÓ—ÐÓÔÑH‹›Û™JBˆÛÛ›ˆHÙ[‹—ØÛÛ›‚ˆÙ]ÛÛ™šYÈHÙ]]ŠÛÛ›‹œÙ]ÛÛ™šYÈ‹›Û™JBˆYˆ›YÈ\È›Û™HÜˆÙ]ÛÛ™šYÈ\È›Û™N‚ˆ™]\›‚ˆžN‚ˆÙ]ÛÛ™šYÊ›YËYJBˆ^Ù\^Ù\[ÛŽ‚ˆÙÙÙ\‹™XYÊˆÛÝ[›Ý\ØX›HÔS]IÜÈÛÜÙK][YHÚXÚÜÚ[ÛˆH]X\˜[[™Y[™H›Üˆ	\È‹ˆÙ[‹™—Ü]^×Ú[™›ÏUYKˆ
+B‚ˆYˆÜ˜Z\ÙWÚY—Ù—ØÛÜœ\
+Ù[ŠHOˆ›Û™N‚ˆYˆÙ[‹—Ù—ØÛÜœ\‚ˆ˜Z\ÙHÙ[‹—ØÛÜœ\Ù\œ›ÜŠ
+B‚ˆYˆÜÛY\Ø™Y›Ü™WÝÜš]WÜ™]žJÙ[‹XY[™Nˆ›Ø]]Y[˜ÙWÜÎˆ›Ø]
+HOˆ›ÛÛ‚ˆˆˆ”ÛY\Û™Hš]\ˆ[\˜[YˆHYÙ][ÝÜÎÈYHH™]žK˜[ÙHHXY[™H\ÜÙYˆÛX[ˆš]\ˆ›ÜˆHš\œÝÕÔ’UWÔ‘U–WÔÓÕ×ÐQ•T—ÔË[ˆÛÝÎÈ™]™\ˆÝ™\œÚÛÝÈHXY[™Kˆˆˆ‚ˆ›ÝÈH[YK›[Û›ÝÛšXÊ
+BˆYˆ›ÝÈHXY[™N‚ˆ™]\›ˆ˜[ÙBˆÛÝÈH›ÝÈH
+XY[™HH]Y[˜ÙWÜÊHHÙ[‹—ÕÔ’UWÔ‘U–WÔÓÕ×ÐQ•T—ÔÂˆš]\ˆH˜[™ÛK[šY›Ü›J
+Šˆ
+Ù[‹—ÕÔ’UWÔ‘U–WÔÓÕ×ÓRS—ÔËÙ[‹—ÕÔ’UWÔ‘U–WÔÓÕ×ÓPVÔÊHYˆÛÝÂˆ[ÙH
+Ù[‹—ÕÔ’UWÔ‘U–WÓRS—ÔËÙ[‹—ÕÔ’UWÔ‘U–WÓPVÔÊBˆ
+JBˆ[YKœÛY\
+Z[Šš]\‹X^
+XY[™HH›ÝËŒJJJBˆ™]\›ˆYB‚ˆYˆÙ›Ü™ZYÛ—ÜÝ]WÙ—ÚÛ\œÊÙ[ŠHOˆ\ÝÕ\VÚ[Ý—WN‚ˆˆˆ‘›Ü™ZYÛˆ›ØÙ\ÜÙ\ÈÛ[™È\ÈˆÜˆ]ÈÐSÚYXØ\œÈ
+ÙYH\›Y\×ÜÝ]WÚÛ\œÊKˆˆˆ‚ˆ™]\›ˆÙ›Ü™ZYÛ—ÜÝ]WÙ—ÚÛ\œÊÙ[‹™—Ü]
+B‚ˆYˆÝžWÝØ[ØÚXÚÜÚ[
+Ù[ŠHOˆ›Û™N‚ˆˆˆ™\ÝYY™›ÜTÔÒU‘HÐSÚXÚÜÚ[È™]™\ˆ˜Z\Ù\ËˆTÔÒU‘H™]™\ˆ›ØÚÜÈÜš]\œÎÂˆ•SÐUHÛÜœ\Y‹]™Y\ÈÛˆRÊÈYÙH]X˜\Ù\È[™\ˆ^Û\Ú]™K[ØÚÈKÓÈ™\ÜÝ\™K‚‚ˆ™]š[Ý\È•SÐUHÝ˜]YÞHØ]\ÙY‹]™YHÛÜœ\[ÛˆÛˆ\™ÙH]X˜\Ù\È
+RÊÈYÙ\ÊHYHÈBˆ^Û\Ú]™K[ØÚÈKÓÈ™\ÜÝ\™Hœ›ÛHÚXÚÜÚ[[™ÈÝ\Ø[™ÈÙˆœ˜[Y\È]Û˜ÙH
+\ÜÝYHÍLÎÊK‚ˆˆˆ‚ˆYˆÙ[‹—Ù—ØÛÜœ\‚ˆ™]\›ˆÈ]X\˜[[™Yˆ™]™\ˆÚXÚÜÚ[Ý™\ˆH[XYÙY[XYÙBˆžN‚ˆÚ]Ù[‹—ÛØÚÎ‚ˆ™\Ý[HÙ[‹—ØÛÛ›‹™^XÝ]J”QÓPHØ[ØÚXÚÜÚ[
+TÔÒU‘JHŠK™™]ÚÛ™J
+BˆYˆ™\Ý[[™™\Ý[ÌWHˆ‚ˆÙÙÙ\‹™XYÊ•ÐSÚXÚÜÚ[ˆ	YÉYYÙ\ÈÚXÚÜÚ[Y‹™\Ý[Ì—K™\Ý[ÌWJBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙÙÙ\‹Ø\›š[™Ê•ÐSÚXÚÜÚ[
+TÔÒU‘JH˜Z[Yˆ	\È‹^ÊB‚ˆYˆ×Ù[\—×ÊÙ[ŠHOˆ”Ù\ÜÚ[Û‘ˆŽ‚ˆˆˆ˜Ú]Ù\ÜÚ[Û‘Š]
+H\ÈŽ˜ÛÜÙ\ÈÛˆ^]ÈÝÛ™\œÈ]\Ý™[X\ÙH]\›Z[š\ÝXØ[K‚‚ˆÝÛ™\œÚ\ÙˆHÙ\ÜÚ[Û‘ˆÚÝ[™H™[X\ÙY^XÚ]Kˆ\ÝÜšXØ[H[ˆ[œÝ[˜ÙHÚ]HÝ\YˆÚÙ[ˆÜš]\ˆ[›™YUÑSˆ
+›Ý[™[Y]ÙÜš]\ˆ\™Ù]\ÈHÝ›Û™È]^]˜Z[ˆÛÚÊKÛÂˆ×Ù[×Ø™]™\ˆ˜[ˆ›Üˆ^XÝHH[œÝ[˜Ù\È]XZÙY\ØÜš\ÜœÈ
+ÎÌÊKˆHÜš]\ˆ›ÝÂˆ™]\™\ÈY\ˆ[ˆYHÚ[™ÝÈ[™H]^]ÛÚÈÛÈÛ›HHÙXZÈ™Y™\™[˜ÙKÛÈX˜[™Û™Y[™\Âˆ\™H]™[X[HÛÛXÝX›H8 %]™]™[X[KY\ˆHYHÚ[™ÝÈ[™HÐÈÞXÛHˆ\È›ÝH™[X\ÙBˆÛXÞKˆØ[Ú]\ÈÝÛš[™ÈH[™H\™HÝ[^XÝYÈÛÜÙH]]\›Z[š\ÝXØ[H
+ÙYHBˆÝÛ™\œÚ\ÛÛ[Y[È[ˆ[—ØYÙ[œX[™ZWÙØ]]Ø^KÛY]Ù×ÜÙ\ÜÚ[Û‹œX
+K‚ˆˆˆ‚ˆ™]\›ˆÙ[‚‚ˆYˆ×Ù^]×ÊÙ[‹^×Ý\K^ËŠHOˆ›ÛÛ‚ˆÙ[‹˜ÛÜÙJ
+Bˆ™]\›ˆ˜[ÙHÈ™]™\ˆÝ\™\ÜÈHØ[\‰ÜÈ^Ù\[Û‚‚ˆYˆÛÜÙJÙ[ŠN‚ˆˆˆ‘˜Z[ˆ]Y]YYÚÙ[ˆ[\Ë[ˆHTÔÒU‘HÚXÚÜÚ[ÛˆÜš]X›H[™\Âˆ
+“Õ•SÐUNˆH[ÐS™\Ù]˜XÙ\ÈHØ]]Ø^IÜÈ]™HÜš]\‹X\š[™Âˆ‹]™YHYÙ\ÊKˆH™YÚ\ÝžK\Ú\™Y[œÝ[˜ÙH‘SPTÑTÈÛ™H™Y˜ÛÝ[[œÝXY‚‚ˆ˜Z[œÈ]Y]YYÚÙ[ˆ[\Èš\œÝ
+H˜XÚÙÜ›Ý[™Üš]\ˆ™YYÈHÛÛ›™XÝ[ÛŠKˆ™XY[Û›HÛÛ›™XÝ[ÛœÂˆ™]™\ˆ™\]Y\ÝHÚXÚÜÚ[ˆÙYHÍLÎË‚ˆÚ[ˆ\È[œÝ[˜ÙH\ÈÚ\™Y
+Ü[™YšXH\›Y\×ÜÝ]WÜ™YÚ\ÝžK˜XÜ]Z\™X
+KÛÜÙJ
+X‘SPTÑTÈÛ™Bˆ™Y˜ÛÝ[[œÝXYÙˆX\š[™ÈÝÛˆHÛÛ›™XÝ[ÛŽˆH™YÚ\ÝžHÝÛœÈHY™XÞXÛH[™Û›HÛÜÙ\ÈÛ‚ˆHš[˜[™[X\ÙH
+ÎLÍÊKˆ\È™]™[ÈÛ™HØ[\‰ÜÈÛÜÙHœ›ÛHX\š[™ÈÝÛˆHÜš]\ˆÛÛ›™XÝ[Û‚ˆ]Ý\ˆØ[\œÈ[ˆHØ[YH›ØÙ\ÜÈ\™HÝ[\Ú[™È8 %Ú[HÝ[][™ÈYØXÞHÛÜÙJ
+XØ[ˆÚ]\È™]\›ˆZ\ˆ™Y™\™[˜ÙH[œÝXYÙˆXZÚ[™È]‚ˆˆˆ‚ˆYˆÙ[‹—ÜÚ\™YÜ™YÚ\ÝžWÛÝÛ™Y‚ˆœ›ÛH\›Y\×ÜÝ]WÜ™YÚ\ÝžH[\Ü™[X\ÙBˆ™[X\ÙJÙ[ŠBˆ™]\›‚ˆÙ[‹—ÜÝÜÝÚÙ[—ÝÜš]\Š
+BˆÛÚËÙ[‹—ÝÚÙ[—Ø]^]ÚÛÚÈHÙ[‹—ÝÚÙ[—Ø]^]ÚÛÚË›Û™BˆYˆÛÚÈ\È›Ý›Û™N‚ˆ]^][œ™YÚ\Ý\ŠÛÚÊBˆÈÛÜÙY›YÈš\œÝˆ[ˆ[‹Y›YÚ™XY\ˆ[ˆÛÜÙ\È]ÈÝÛˆÛÛ›™XÝ[Û‹‚ˆÚ]Ù[‹—Ü™XYØÛÛ›œ×ÛØÚÎ‚ˆÙ[‹—Ü™XYØÛÛ›œ×ØÛÜÙYHYBˆÚ[HÙ[‹—Ù]šXÝÛÛ™WÚYWÜ™XYØÛÛ›Š
+N‚ˆ\ÜÂˆÚ]Ù[‹—ÛØÚÎ‚ˆYˆÙ[‹—ØÛÛ›Ž‚ˆYˆÙ[‹—Ù—ØÛÜœ\ˆÈ]X\˜[[™Yˆ›ÈÚXÚÜÚ[Ý™\ˆH[XYÙY[XYÙBˆÙÙÙ\‹Ø\›š[™Êˆ”ÚÚ\[™ÈHÛÜÙK][YHÐSÚXÚÜÚ[›Üˆ	\Îˆ\È‚ˆš[™HØœÙ\™YÝXÝ\˜[ÛÜœ\[Ûˆ
+	\ÊKˆZÙHH‚ˆœÛ˜\ÚÝÙˆÝ]K™‹]Ø[[™\ÚH™Y›Ü™H™\Ý\[™Ë‚ˆ[ˆ[ˆ\›Y\ÈÙ\ÜÚ[ÛœÈ™XÛÝ™\ˆK\ÛÝ\˜ÙH	\ÈKZ[œÜXÝ[Û›Xˆ‹Ù[‹™—Ü]ˆÙ[‹—Ù—ØÛÜœ\Ü™X\ÛÛ‹Ù[‹™—Ü]ˆ
+Bˆ[Yˆ›ÝÙ[‹œ™XYÛÛ›NˆÈTÔÒU‘K›Ý•SÐUH
+ÙYHØÜÝš[™ÊBˆžN‚ˆÈ]™\žHÜ›Ûˆ[—ØYÙ[Ü[œÊØÛÜÙ\ÈH˜[œÚY[Ù\ÜÚ[Û‘‹ÛÈH•SÐUH\™Hš\™\ÂˆÈH[ÐS™\Ù]X[žH[Y\ËÚÝ\‹˜XÚ[™ÈHØ]]Ø^IÜÈÛ™Ë[]™YÜš]\ˆÛˆ\™ÙBˆÈÐS]X˜\Ù\È[™X\š[™ÈÝ‹]™YHYÙ\ÈKHHÍLÎÈÛÜœ\[Ûˆ\ÈÛ\ÜÉÜÂˆÈÝÛˆ\š[ÙXÈÚXÚÜÚ[Ø\È[™XYHXYHTÔÒU‘HÈ]›ÚYˆ•SÐUH™[Û™ÜÈÛ›BˆÈÛˆHÛÛK[Ü[™\‹Ü]ZY\ØÙ[ÛÛ›™XÝ[Û‹‚ˆÙ[‹—ØÛÛ›‹™^XÝ]J”QÓPHØ[ØÚXÚÜÚ[
+TÔÒU‘JHŠBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙÙÙ\‹™XYÊ•ÐSÚXÚÜÚ[
+TÔÒU‘JH]ÛÜÙH˜Z[Yˆ	\È‹^ÊBˆÛÛ›‹Ù[‹—ØÛÛ›ˆHÙ[‹—ØÛÛ›‹›Û™BˆÙ[‹—ØÛÜÙWØÛÛ›™XÝ[Û—Ü]ZY]JÛÛ›ŠBˆÈHÛX[ˆÛÜÙH]ÈÔS]H[›[šÈHÚYXØ\œÈ
+HYÚ][X]H[™ÙˆBˆÈÙ[™\˜][Û‹›ÝHÜ]
+NˆHX\™ÝÛ‹\˜XÙH™[Ü[ˆ]\Ý™KXYÜ‚ˆÙ[‹—Ù—ÜÚYXØ\—ÚY[]HHßB‚ˆYˆ×Ù[×ÊÙ[ŠHOˆ›Û™N‚ˆˆˆ”ØY™]H™]ˆÛÜÙHHÛÛ›™XÝ[ÛˆYˆHØ[\ˆ›Ü™ÛÝ‚‚ˆH\Þ[˜ÈXØÛÝ[[™ÈÛÜšÙ\ˆ™]\™\ÈÚ[ˆYH[™]È]^]ÛÚÂˆÛÈÛ›HHÙXZÈ™Y™\™[˜ÙKÛÈ™Z]\ˆØ[ˆ[ˆ[ˆÝ\Ú\ÙHÜœ[™Yˆ[œÝ[˜ÙKˆ\š[™È[\œ™]\ˆX\™ÝÛˆHÜ™\ˆÙˆ[Ù[HÛX[\\Âˆ[™Yš[™YÛÈ]™\žH]šX]HXØÙ\ÜÈ™[XZ[œÈÝX\™Y‚‚ˆ[YØ]\ÈÈÛÜÙJ
+XÛÈH™XYÛÛÚÙ[ˆÜš]\‹[™]^]ˆÛÚÈ\™H[ÛX[™Y\8 %›Ý\ÝHÜš]\ˆÛÛ›™XÝ[Û‹‚ˆˆˆ‚ˆYˆÙ[‹—×ÙXÝ×Ë™Ù]
+—ØÛÛ›ˆŠH\È›Û™N‚ˆ™]\›‚ˆžN‚ˆÙ[‹˜ÛÜÙJ
+Bˆ^Ù\^Ù\[ÛŽ‚ˆ\ÜÂ‚ˆÈ8¥ 8¥ Ú[šÙY•È™XZ[[™Ú[™H
+ŒŒÈÜZ[ˆÜ[Z^™JH8¥ 8¥ ˆÂˆÈÜ[Z^™WÙ×ÜÝÜ˜YÙJ
+X
+H\›Y\ÈÙ\ÜÚ[ÛœÈÜ[Z^™K\ÝÜ˜YÙXˆÈÛÛ[X[™
+H›ÜÈHYØXÞH[›[™H•È[™^\È[™˜XÚÙš[ÈH™]ÂˆÈ^\›˜[XÛÛ[Û™\ËˆHÚ[™ÛH›ØÚÚ[™È™XZ[YX\Ý\™YŒMˆZ[]\ÂˆÈÙˆ[Üš]HØÚÈÛˆH™X[HÐˆ‹ÛÈH˜XÚÙš[[œÈ[ˆÛX[ˆÈÚ[šÜËXXÚ[ˆ]ÈÝÛˆÚÜÜš]H˜[œØXÝ[ÛŽ‚ˆÈHÛÛ˜Ý\œ™[™XY\œËÝÜš]\œÈ\™H™]™\ˆÝ\™Y
+ÐSÝ^\ÈÛX[ˆÈXXÚÚ[šÈÚXÚÜÚ[ÈšXHH›Ü›X[Ù^XÝ]WÝÜš]HØY[˜ÙJNÂˆÈH[ˆ[\œ\Y[ˆ
+Ý›PËÜ˜\Ú
+H™\Ý[Y\Èœ›ÛBˆÈ×Ü™XZ[Ü›ÙÜ™\ÜÈÚ[ˆHÛÛ[X[™\È™K\[ŽÂˆÈH][\H›ØÙ\ÜÙ\ÈÚ\š[™ÈHˆÛ‰ÝÝX›K\[ˆ]8 %XXÚÚ[šÂˆÈÛZ[\ÈÛÜšÈžHÛÛ\\™KX[™\ÝØ\Ûˆ×Ü™XZ[Ü›ÙÜ™\ÜËÛÈ]™[ˆBˆÈÛÛ˜Ý\œ™[ÙXÛÛ™[›™\ˆ\Ý[\›X]™\ÈÚ[šÜÈØY™[K‚ˆÂˆÈ“ÕS‘È
+H\]ÙY\ÈH]™HØ]]Ø^HÚ\š[™ÈH‚ˆÈ™\ÜÛœÚ]™JNˆHÜ™YYHÚ[šÈÛÜ™KXXÜ]Z\™\È‘QÒSˆSSQQPUH™X\›BˆÈ˜XÚË]ËX˜XÚÈ[™Ø[ˆÝ\™H[›Ý\ˆ›ØÙ\ÜÉÜÈÜš]\ˆ[È^]\Ý[™ÂˆÈ]ÈØÚÈ™]šY\È
+[ˆX\›HL\›ÝËÍL\È™\œÚ[ÛˆÝÛ™YHÜš]HØÚÂˆÈŽIHÙˆH[YH[™š\ÚX›Hœ›Þ™HÛÛ˜Ý\œ™[ÓHÙ\ÜÚ[ÛœÈÛˆH\™ÙBˆÈ[œÝ[
+KˆÛÈ^Y\œÈ™]™[]‚ˆÈKˆÛX[Ú[šÜÈ
+L›ÝÜÊH8 %H›Ü™YÜ›Ý[™Üš]H]Y]Y\È™Z[™BˆÈÚ[šÈ›Üˆ][ÜÝ[œÈÙˆ\Ë‚ˆÈ‹ˆ[\‹XÚ[šÈ]\ÙH8 %HÛÜÛY\ÈX^
+Ñ•×Ô‘P•RSÓRS—ÔUTÑKˆÈÚ[šÈÛÜÝÑ•×Ô‘P•RSÑUWÑPÕÔŠH™]ÙY[ˆÚ[šÜËØ\[™ÂˆÈ\È›ØÙ\ÜÉÜÈÚ\™HÙˆˆ˜[™ÚYÛÈÛÛ˜Ý\œ™[Üš]\œÈ[Ø^\ÂˆÈš[™Ü[ˆÚ[™ÝÜËˆ\ÈÛÜšÜÈÜ›ÜÜË\›ØÙ\ÜÈ
+[›ZÙH[žBˆÈØ[YK\›ØÙ\ÜÈXÝ]š]HÝ[\
+H™XØ]\ÙH]›Ý[™ÈÝ\ˆÝÛˆ]BˆÈÞXÛH[˜ÛÛ™][Û˜[K‚‚ˆÑ•×Ô‘P•RSÐÒS’×Ô“ÕÔÈHLˆÑ•×Ô‘P•RSÑUWÑPÕÔˆHŒÈÛY\HÚ[šÈÛÜÝ
+8¢iŒ	H]JBˆÑ•×Ô‘P•RSÓRS—ÔUTÑHHŒˆÈÙXÛÛ™È8 %›ÛÜˆ™]ÙY[ˆÚ[šÜÂ‚ˆÈ[[ÝYŒŒˆ•ÈÚYÝÈX›\È]ØZ][™ÈX\™ÝÛˆ
+ÙYHHŒŒÈZYÜ˜][ÛŽ‚ˆÈ“ÔÙˆH][KQÐˆ•ÈX›H›ØÚÜÈ›ÜˆZ[]\ËÛÈHZYÜ˜][Û‚ˆÈ[[Ý\ÈHX›HYš[š][ÛœÈÝ]ÙˆÜ[]WÛX\Ý\ˆ[™™[˜[Y\ÈBˆÈÜœ[™YÚYÝÈX›\È8 %›ÝÈZ[ˆX›\È8 %È×ÝŒŒ—Ý˜\ÚÊŽÈBˆÈÛÜšÙ\ˆ[\Y\È[H[ˆ›Ý[™YÚ[šÜË[ˆ›ÜÈ[HÚX\JK‚ˆÑ•×ÕTÒÔ‘Q’VH™×ÝŒŒ—Ý˜\ÚÈ‚‚ˆÈ8¥ 8¥ Ò’ËXšYÜ˜[H[™^˜XÚÙš[
+YXØ]YX\šÙ\ˆZ\ŠH8¥ 8¥ ˆÂˆÈØ[YHÚ[šÈ[™Ú[™H\ÈHXZ[ˆY™\œ™Y™XZ[]ÛˆBˆÈ×ØÚš×Ü™XZ[Ê˜X\šÙ\œÈÛÈHÚšË[Û›H˜XÚÙš[
+HÛÛ[[ÛˆØ\ÙN‚ˆÈ[ˆ[™XYK[Ü[Z^™YŒŒÈˆØZ[š[™ÈHÚšÈ[™^
+H™]™\ˆØ]\ÈBˆÈÛÛ\]HY\ÜØYÙ\×ÙØÈšYÜ˜[HšYÙÙ\œË‚‚ˆÈ8¥ 8¥ ÜZ[ˆŒŒÈ•ÈÝÜ˜YÙHÜ[Z^˜][Ûˆ
+\›Y\ÈÙ\ÜÚ[ÛœÈÜ[Z^™K\ÝÜ˜YÙX
+H8¥ 8¥ ˆÂˆÈ\È\ÈHÓ“H]]ZYÜ˜]\È[ˆ^\Ý[™ÈYØXÞH
+ŒŒˆ[›[™JH‚ˆÈÈHŒŒÈ^\›˜[XÛÛ[ØÚ[XKˆ]\È[X™\˜][H›Ü™YÜ›Ý[™[™ˆÈ\Ù\‹Z[›ÚÙY™]™\ˆ]]ÛX]XË™XØ]\ÙH]\È\ÚËZX]žH[™Û™Ëˆ]ˆÈ[œÈH›ÝYÜ™\Ý[XX›HÚ[šÈ[™Ú[™HX›Ý™HÈÛÛ\][Û‚ˆÈÞ[˜Ú›Û›Ý\ÛH8 %[[ÝH8¡¤ˆ™]ÈØÚ[XH8¡¤ˆÚ[šÙY˜XÚÙš[8¡¤ˆÚ[šÙYˆÈX\™ÝÛˆ8 %Ú]›ÙÜ™\ÜÈØ[˜XÚÜËH\ÚÈ™Y›YÚ[ˆHÓBˆÈÜ˜\\‹HPÕUSH]H[™[™HY™[œÚ]™HØÚ[XWÝ™\œÚ[Ûˆ[\‚‚ˆYˆÚ\×Ù×Ý˜\Ú
+Ù[‹ÛÛ›ŠHOˆ›ÛÛ‚ˆˆˆ•YHÚ[ˆ[[ÝYŒŒˆÚYÝÈX›\È\™HÝ[]ØZ][™ÈX\™ÝÛ‹‚ˆØ[\ˆ]\ÝÛÙ[‹—ÛØÚØ
+Üˆ\ÜÈHZYÜ˜][Û‹][YHÝ\œÛÜŠKˆˆˆ‚ˆ™]\›ˆ›ÛÛ
+ÛÛ›‹™^XÝ]Jˆ”ÑSPÕH”“ÓHÜ[]WÛX\Ý\ˆÒT‘H\HH	ÝX›IÈ‚ˆS‘˜[YHRÑHÈTÐÐTH	×	ÈSRUH‹ˆ
+Ù[‹—Ñ•×ÕTÒÔ‘Q’Vœ™\XÙJ—È‹—ÈŠH
+È‰H‹
+Kˆ
+K™™]ÚÛ™J
+JB‚ˆÈOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOBˆÈÙ\ÜÚ[ÛˆY™XÞXÛBˆÈOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOB‚‚ˆYˆÜ™X]WÜÙ\ÜÚ[ÛŠÙ[‹Ù\ÜÚ[Û—ÚYˆÝ‹ÛÝ\˜ÙNˆÝ‹
+ŠšÝØ\™ÜÊHOˆÝŽ‚ˆˆˆÜ™X]HH™]ÈÙ\ÜÚ[Ûˆ™XÛÜ™ˆ™]\›œÈHÙ\ÜÚ[Û—ÚYˆˆˆ‚ˆÙ[‹—Ú[œÙ\ÜÙ\ÜÚ[Û—Ü›ÝÊÙ\ÜÚ[Û—ÚYÛÝ\˜ÙK
+ŠšÝØ\™ÜÊBˆ™]\›ˆÙ\ÜÚ[Û—ÚY‚ˆYˆ™XÛÜ™ÙØ]]Ø^WÜÙ\ÜÚ[Û—ÜY\ŠˆÙ[‹ˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆ
+‹ˆÛÝ\˜ÙNˆÝ‹ˆ\Ù\—ÚYˆÝˆH›Û™KˆÙ\ÜÚ[Û—ÚÙ^NˆÝˆH›Û™KˆÚ]ÚYˆÝˆH›Û™KˆÚ]Ý\NˆÝˆH›Û™Kˆ™XYÚYˆÝˆH›Û™Kˆ\Ü^WÛ˜[YNˆÝˆH›Û™KˆÜšYÚ[—ÚœÛÛŽˆÝˆH›Û™Kˆ[˜ÛYWØÛÛ\™\ÜÚ[Û—Ø[˜Ù\ÝÜœÎˆ›ÛÛH˜[ÙKˆ
+HOˆ›Û™N‚ˆˆˆ”\œÚ\ÝHØ]]Ø^H›Ý][™ÈY\ˆ›Üˆ[ˆ^\Ý[™ÈÙ\ÜÚ[Ûˆ›ÝË‚‚ˆ\Ü^WÛ˜[YXÈÜšYÚ[—ÚœÛÛ˜Ø\œžHHØ]]Ø^IÜÈ™\Ù[][Û‚ˆ[™[ÜšYÚ[ˆY]Y]H
+ÎLŠHÛÈÛÛœÝ[Y\œÈ
+XÜÜÙ\™KZ\œ›Ü‹ˆÚ[›™[\™XÝÜžJHØ[ˆ™XY›Ý][™È]Hœ›ÛHÝ]K™ˆ[œÝXYÙ‚ˆÙ\ÜÚ[ÛœËšœÛÛ‹ˆ^H\™HÓÐSTÐÑIÙÛ›H[ˆHÙ[œÙH]›Û™XˆX]™\ÈH^\Ý[™È˜[YH[ÝXÚY‚‚ˆ[˜ÛYWØÛÛ\™\ÜÚ[Û—Ø[˜Ù\ÝÜœØÙY\ÈHÙÚXØ[ÛÛ\™\ÜÚ[Ûˆ[™XYÙBˆÛˆÛ™H›Ý][™ÈY\ˆÚ[ˆ[ˆ^XÚ]Ø]]Ø^H™\Ý[YH[Ý™\È]È\ÈBˆY™™\™[[™Kˆ›Ü›X[\‹]\›ˆY]Y]H™Yœ™\Ú\È\]HÛ›HBˆÝ\YY›ÝË‚‚ˆÙ[‹ZX[[™È
+ÎŒMŠNˆÚ[ˆH\™Ù]›ÝÈÙ\È›Ý^\ÝY]8 %BˆØ]]Ø^IÜÈÜ™X]WÜÙ\ÜÚ[Û˜Üš]H˜Z[Y[™Ø\ÈY™\œ™YÜˆBˆÜ˜\Ú[™Y™]ÙY[ˆ›Ý][™ÈX›XØ][Ûˆ[™›ÝÈÜ™X][Ûˆ8 %\Âˆ™XÛÜ™\ˆS”ÑT•ÈH›ÝÈÚ]H[Y[]H[œÝXYÙˆÚ[[Bˆ›Ë[Ü[™Ëˆ]™\žH\‹]\›ˆY\ˆ™Yœ™\Ú\È\™Y›Ü™HH™\Z\‚ˆÜÜ[š]NˆHØ]]Ø^HÙ\ÜÚ[Ûˆ›ÝÈØ[ˆ›ÈÛ™Ù\ˆ™Hš\œÝXÜ™X]YžBˆ[ˆY[]K[\ÜÈ^žHÜš]\ˆ
+\]WÝÚÙ[—ØÛÝ[ØÂˆ™XÛÜ™Ø]^[X\žWÝ\ØYÙX
+H[™Ý^H[œ›Ý]X›H›Ü™]™\‹‚ˆˆˆ‚ˆYˆ›ÝÙ\ÜÚ[Û—ÚYÜˆ›ÝÙ\ÜÚ[Û—ÚÙ^N‚ˆ™]\›‚‚ˆYˆÙÊÛÛ›ŠN‚ˆ[™XYÙWØÝHHˆ‚ˆ\™Ù]ØÛ]\ÙHH•ÒT‘HYHÈ‚ˆ]Y\žWÜ\˜[\ÈH×BˆYˆ[˜ÛYWØÛÛ\™\ÜÚ[Û—Ø[˜Ù\ÝÜœÎ‚ˆ[™XYÙWØÝHHˆˆ‚ˆÒU‘PÕT”ÒU‘HÛÛ\™\ÜÚ[Û—Û[™XYÙJY
+HTÈ
+ˆÑSPÕÂˆS’SÓ‚ˆÑSPÕ\™[šYˆ”“ÓHÛÛ\™\ÜÚ[Û—Û[™XYÙH[™XYÙBˆ“ÒSˆÙ\ÜÚ[ÛœÈÚ[ÓˆÚ[šYH[™XYÙKšYˆ“ÒSˆÙ\ÜÚ[ÛœÈ\™[Óˆ\™[šYHÚ[œ\™[ÜÙ\ÜÚ[Û—ÚYˆÒT‘H\™[™[™Ü™X\ÛÛˆH	ØÛÛ\™\ÜÚ[Û‰ÂˆS‘œÛÛ—Ù^˜XÝ
+ˆÓÐSTÐÑJÚ[›[Ù[ØÛÛ™šYË	ÞßIÊKˆ	É—Øœ˜[˜ÚYÙœ›ÛIÂˆ
+HTÈ•SˆS‘œÛÛ—Ù^˜XÝ
+ˆÓÐSTÐÑJÚ[›[Ù[ØÛÛ™šYË	ÞßIÊKˆ	É—Ù[YØ]WÙœ›ÛIÂˆ
+HTÈ•SˆS‘ÓÐSTÐÑJÚ[œÛÝ\˜ÙK	ÉÊHOH	ÝÛÛ	Âˆ
+Bˆˆˆ‚ˆ\™Ù]ØÛ]\ÙHH•ÒT‘HYSˆ
+ÑSPÕY”“ÓHÛÛ\™\ÜÚ[Û—Û[™XYÙJH‚ˆ]Y\žWÜ\˜[\Ë˜\[™
+Ù\ÜÚ[Û—ÚY
+Bˆ]Y\žWÜ\˜[\Ë™^[™
+ˆ
+ˆÙ\ÜÚ[Û—ÚÙ^KˆÛÝ\˜ÙKˆ\Ù\—ÚYˆÚ]ÚYˆÚ]Ý\Kˆ™XYÚYˆ\Ü^WÛ˜[YKˆÜšYÚ[—ÚœÛÛ‹ˆ
+Bˆ
+BˆYˆ›Ý[˜ÛYWØÛÛ\™\ÜÚ[Û—Ø[˜Ù\ÝÜœÎ‚ˆ]Y\žWÜ\˜[\Ë˜\[™
+Ù\ÜÚ[Û—ÚY
+BˆÛÛ›‹™^XÝ]JˆˆˆˆžÛ[™XYÙWØÝ_BˆTUHÙ\ÜÚ[ÛœÂˆÑUÙ\ÜÚ[Û—ÚÙ^HHËÛÝ\˜ÙHHË\Ù\—ÚYHËÚ]ÚYHËˆÚ]Ý\HHË™XYÚYHËˆ\Ü^WÛ˜[YHHÓÐSTÐÑJË\Ü^WÛ˜[YJKˆÜšYÚ[—ÚœÛÛˆHÓÐSTÐÑJËÜšYÚ[—ÚœÛÛŠBˆÝ\™Ù]ØÛ]\Ù_Hˆˆ‹ˆ]Y\žWÜ\˜[\Ëˆ
+BˆÈÙ[‹ZX[
+ÎŒMŠNˆHTUH\ÈHÚ[[›Ë[ÜÚ[ˆH›ÝÂˆÈ\ÈZ\ÜÚ[™È
+Ü™X]WÜÙ\ÜÚ[Ûˆ˜Z[YX\›Y\‹ÜˆHÜ˜\Ú[™YˆÈ™]ÙY[ˆ›Ý][™ÈX›XØ][Ûˆ[™›ÝÈÜ™X][ÛŠKˆ[œÙ\]Ú]ˆÈH[Y[]HÛÈHÙ\ÜÚ[Ûˆ\È\˜X›H›Ý]X›H8 %™]™\‚ˆÈX]™Hš\œÝXÜ™X][ÛˆÈ[ˆY[]K[\ÜÈ^žHÜš]\‹‚ˆYˆ›Ý[˜ÛYWØÛÛ\™\ÜÚ[Û—Ø[˜Ù\ÝÜœÎ‚ˆÝ\ˆHÛÛ›‹™^XÝ]Jˆ”ÑSPÕH”“ÓHÙ\ÜÚ[ÛœÈÒT‘HYHÈSRUH‹
+Ù\ÜÚ[Û—ÚY
+Bˆ
+BˆYˆÝ\‹™™]ÚÛ™J
+H\È›Û™N‚ˆÛÛ›‹™^XÝ]Jˆˆˆ’S”ÑT•S•ÈÙ\ÜÚ[ÛœÈ
+ˆYÛÝ\˜ÙK\Ù\—ÚYÙ\ÜÚ[Û—ÚÙ^KÚ]ÚYˆÚ]Ý\K™XYÚY\Ü^WÛ˜[YKÜšYÚ[—ÚœÛÛ‹ˆÝ\YØ]ˆ
+BˆSQTÈ
+ËËËËËËËËËÊBˆÓˆÓÓ‘“PÕ
+Y
+HÈTUHÑUˆÙ\ÜÚ[Û—ÚÙ^HHÓÐSTÐÑJÙ\ÜÚ[ÛœËœÙ\ÜÚ[Û—ÚÙ^K^ÛYYœÙ\ÜÚ[Û—ÚÙ^JKˆÚ]ÚYHÓÐSTÐÑJÙ\ÜÚ[ÛœË˜Ú]ÚY^ÛYY˜Ú]ÚY
+KˆÚ]Ý\HHÓÐSTÐÑJÙ\ÜÚ[ÛœË˜Ú]Ý\K^ÛYY˜Ú]Ý\JKˆ™XYÚYHÓÐSTÐÑJÙ\ÜÚ[ÛœË™XYÚY^ÛYY™XYÚY
+Kˆ\Ü^WÛ˜[YHHÓÐSTÐÑJÙ\ÜÚ[ÛœË™\Ü^WÛ˜[YK^ÛYY™\Ü^WÛ˜[YJKˆÜšYÚ[—ÚœÛÛˆHÓÐSTÐÑJÙ\ÜÚ[ÛœË›ÜšYÚ[—ÚœÛÛ‹^ÛYY›ÜšYÚ[—ÚœÛÛŠHˆˆ‹ˆ
+ˆÙ\ÜÚ[Û—ÚYˆÛÝ\˜ÙKˆ\Ù\—ÚYˆÙ\ÜÚ[Û—ÚÙ^KˆÚ]ÚYˆÚ]Ý\Kˆ™XYÚYˆ\Ü^WÛ˜[YKˆÜšYÚ[—ÚœÛÛ‹ˆ[YK[YJ
+Kˆ
+Kˆ
+B‚ˆÙ[‹—Ù^XÝ]WÝÜš]JÙÊB‚ˆYˆÙ]Ù^\žWÙš[˜[^™Y
+Ù[‹Ù\ÜÚ[Û—ÚYˆÝ‹š[˜[^™Yˆ›ÛÛHYJHOˆ›Û™N‚ˆˆˆ“X\šÈHØ]]Ø^HÙ\ÜÚ[Û‰ÜÈ^\žKYš[˜[^˜][Ûˆ›YÈ[ˆÝ]K™‹‚‚ˆZ\œ›ÜœÈÙ\ÜÚ[Û‘[žK™^\žWÙš[˜[^™Y
+Ù\ÜÚ[ÛœËšœÛÛŠHÛÈH›YÂˆÝ\š]™\È]™[ˆYˆH”ÓÓˆ[™^\È[™YÜˆÜÝ
+ÎLŠK‚ˆˆˆ‚ˆYˆ›ÝÙ\ÜÚ[Û—ÚY‚ˆ™]\›‚‚ˆYˆÙÊÛÛ›ŠN‚ˆÛÛ›‹™^XÝ]Jˆ•TUHÙ\ÜÚ[ÛœÈÑU^\žWÙš[˜[^™YHÈÒT‘HYHÈ‹ˆ
+HYˆš[˜[^™Y[ÙHÙ\ÜÚ[Û—ÚY
+Kˆ
+B‚ˆÙ[‹—Ù^XÝ]WÝÜš]JÙÊB‚ˆÈ8¥ 8¥ Ø]]Ø^H›Ý][™È[™^
+™\XÙ\ÈÙ\ÜÚ[ÛœËšœÛÛ‹ÎLˆ›ÛÝË]\
+H8¥ 8¥ 8¥ 8¥ ‚ˆYˆØ]™WÙØ]]Ø^WÜ›Ý][™×Ù[žJˆÙ[‹Ù\ÜÚ[Û—ÚÙ^NˆÝ‹[žWÚœÛÛŽˆÝ‹
+‹ØÛÜNˆÝˆHˆ‚ˆ
+HOˆ›Û™N‚ˆˆˆ•\Ù\Û™HØ]]Ø^H›Ý][™È[žH
+Ù\ÜÚ[Û—ÚÙ^HOˆÙ\ÜÚ[Û‘[žH”ÓÓŠK‚‚ˆHØ]]Ø^WÜ›Ý][™ÈX›H\ÈH\˜X›H™\XÙ[Y[›Ü‚ˆÙ\ÜÚ[ÛœËšœÛÛŽˆÛ™H›ÝÈ\ˆ›Ý][™ÈÙ^KÛ[™ÈH[Ù\šX[^™YˆÙ\ÜÚ[Û‘[žXÛÈHØ]]Ø^HØ[ˆ™ZY˜]H^XÝHÚ]]Ü›ÝK‚‚ˆØÛÜX˜[Y\ÜXÙ\ÈH[™^HØ^HÙ\\˜]HÙ\ÜÚ[ÛœËšœÛÛˆš[\ÂˆY
+Û™H\ˆÙ\ÜÚ[Ûœ×Ù\ŠH8 %Ø[\œÈ\ÜÈZ\ˆÙ\ÜÚ[Ûœ×Ù\ˆ]ÛÂˆÛÈÝÜ™\ÈÚ]Y™™\™[\™XÝÜšY\È™]™\ˆÚ\™H›Ý][™ÈÝ]K‚ˆˆˆ‚ˆYˆ›ÝÙ\ÜÚ[Û—ÚÙ^HÜˆ›Ý[žWÚœÛÛŽ‚ˆ™]\›‚‚ˆYˆÙÊÛÛ›ŠN‚ˆÛÛ›‹™^XÝ]Jˆˆˆ’S”ÑT•S•ÈØ]]Ø^WÜ›Ý][™È
+ØÛÜKÙ\ÜÚ[Û—ÚÙ^K[žWÚœÛÛ‹\]YØ]
+BˆSQTÈ
+ËËËÊBˆÓˆÓÓ‘“PÕ
+ØÛÜKÙ\ÜÚ[Û—ÚÙ^JHÈTUHÑUˆ[žWÚœÛÛˆH^ÛYY™[žWÚœÛÛ‹ˆ\]YØ]H^ÛYY\]YØ]ˆˆ‹ˆ
+ØÛÜKÙ\ÜÚ[Û—ÚÙ^K[žWÚœÛÛ‹[YK[YJ
+JKˆ
+B‚ˆÙ[‹—Ù^XÝ]WÝÜš]JÙÊB‚ˆYˆ™\XÙWÙØ]]Ø^WÜ›Ý][™×Ù[šY\ÊˆÙ[‹[šY\ÎˆXÝÜÝ‹Ý—K
+‹ØÛÜNˆÝˆHˆ‚ˆ
+HOˆ›Û™N‚ˆˆˆ]ÛZXØ[H™\XÙHH›Ý][™È[™^›Üˆ
+œØÛÜJˆÚ]
+™[šY\Ê‹‚‚ˆZ\œ›ÜœÈHÙ\ÜÚ[ÛœËšœÛÛˆ[\™]Üš]HÙ[X[XÜÎˆÙ^\ÈXœÙ[œ›ÛBˆ
+™[šY\Êˆ\™H™[[Ý™Y
+[™YÜ™\Ù]Ù\ÜÚ[ÛœÈ\Ø\X\ˆœ›ÛHBˆ[™^
+Kˆ[œÈ\ÈHÚ[™ÛHÜš]H˜[œØXÝ[Û‹ˆÝ\ˆØÛÜ\È\™Bˆ[ÝXÚY‚ˆˆˆ‚ˆ›ÝÈH[YK[YJ
+B‚ˆYˆÙÊÛÛ›ŠN‚ˆÛÛ›‹™^XÝ]J‘SUH”“ÓHØ]]Ø^WÜ›Ý][™ÈÒT‘HØÛÜHHÈ‹
+ØÛÜK
+JBˆYˆ[šY\Î‚ˆÛÛ›‹™^XÝ][X[žJˆ’S”ÑT•S•ÈØ]]Ø^WÜ›Ý][™È
+ØÛÜKÙ\ÜÚ[Û—ÚÙ^K[žWÚœÛÛ‹\]YØ]
+H‚ˆ•SQTÈ
+ËËËÊH‹ˆÊØÛÜKË‹›ÝÊH›ÜˆËˆ[ˆ[šY\Ëš][\Ê
+HYˆÈ[™—Kˆ
+B‚ˆÙ[‹—Ù^XÝ]WÝÜš]JÙÊB‚ˆYˆØYÙØ]]Ø^WÜ›Ý][™×Ù[šY\ÊÙ[‹
+‹ØÛÜNˆÝˆHˆŠHOˆXÝÜÝ‹Ý—N‚ˆˆˆ“ØY›Ý][™È[šY\È›Üˆ
+œØÛÜJˆ\ÈÜÙ\ÜÚ[Û—ÚÙ^Nˆ[žWÚœÛÛŸKˆˆˆ‚ˆÚ]Ù[‹—Ü™XYØÝ
+
+H\ÈÛÛ›Ž‚ˆ›ÝÜÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕÙ\ÜÚ[Û—ÚÙ^K[žWÚœÛÛˆ”“ÓHØ]]Ø^WÜ›Ý][™ÈÒT‘HØÛÜHHÈ‹ˆ
+ØÛÜK
+Kˆ
+K™™]Ú[
+
+Bˆ™]\›ˆÜ–ÈœÙ\ÜÚ[Û—ÚÙ^H—Nˆ–È™[žWÚœÛÛˆ—H›Üˆˆ[ˆ›ÝÜßB‚ˆYˆ[]WÙØ]]Ø^WÜ›Ý][™×Ù[šY\ÊˆÙ[‹Ù\ÜÚ[Û—ÚÙ^\Îˆ\ÝÜÝ—K
+‹ØÛÜNˆÝˆHˆ‚ˆ
+HOˆ›Û™N‚ˆˆˆ”™[[Ý™H›Ý][™È[šY\È›ÜˆHÚ]™[ˆÙ\ÜÚ[ÛˆÙ^\È[ˆ
+œØÛÜJ‹ˆˆˆ‚ˆYˆ›ÝÙ\ÜÚ[Û—ÚÙ^\Î‚ˆ™]\›‚‚ˆYˆÙÊÛÛ›ŠN‚ˆÛÛ›‹™^XÝ][X[žJˆ‘SUH”“ÓHØ]]Ø^WÜ›Ý][™ÈÒT‘HØÛÜHHÈS‘Ù\ÜÚ[Û—ÚÙ^HHÈ‹ˆÊØÛÜKÊH›ÜˆÈ[ˆÙ\ÜÚ[Û—ÚÙ^\×Kˆ
+B‚ˆÙ[‹—Ù^XÝ]WÝÜš]JÙÊB‚ˆYˆ\ÝÛ™]™\—ØXÝ]™WÚÙ^YYÜÙ\ÜÚ[ÛœÊˆÙ[‹
+‹Û\—Ý[—Ù^\Îˆ›Ø]ˆ
+HOˆ\ÝÑXÝÜÝ‹[žWWN‚ˆˆˆ’Ù^YYØ]]Ø^H›ÝÜÈ]Ù\™HÜ[™Y[™[ˆ™]™\ˆ\ÙY][‚‚ˆÙ[XÝÈ›ÝÜÈ]\™HÙ^YY
+Ù\ÜÚ[Û—ÚÙ^HTÈ“Õ•S
+KÝ[Ü[‚ˆ
+[™YØ]TÈ•S
+H[™Ø\œžH›È]šY[˜ÙHÙˆHÚ[™ÛH\›Žˆ›ÂˆY\ÜØYÙ\Ë›ÈÚÙ[œË›ÈÛÛÜˆTHØ[Ë›È™XÛÜ™YXÝ]š]K›Âˆ]KˆÝXÚH›ÝÈ\È[™\Ý[™ÝZ\ÚX›Hœ›ÛH›™]™\ˆ\[™Y‹‚‚ˆ]\È^XÝHHÚ\HÙˆHXZÙY\Ýš^\™H
+ÎÍÌ
+H8 %[™ˆ[ÛÈÙˆHÚ]]Ø\È›Ý]Y]™]™\ˆ[œÝÙ\™Yˆ›Ý\™HØY™HÂˆ›Üˆ\™H\È›È˜[œØÜš\ÈÜÙK[™HØ]]Ø^HZ[ÈHœ™\ÚˆÙ\ÜÚ[ÛˆÛˆH™^[˜›Ý[™Y\ÜØYÙHZ]\ˆØ^K‚‚ˆ[È[™XØ\˜Ú]™XØ[››Ý™XXÚ\ÙH›ÝÜÎˆZ\ˆÚ\™YˆÙ[XÝÜˆ\È[›™YÈ[™YØ]TÈ“Õ•SÛÈ]H]™HÙ\ÜÚ[Û‚ˆ\È™]™\ˆXÚÙYÚXÚ\›X[™[H^ÛY\È]™\žH™]™\‹XÛÜÙY›ÝË‚ˆ[˜ÙHHÙ\\˜]K˜\œ›ÝÙ\ˆÙ[XÝÜˆ˜]\ˆ[ˆ[›Ý\ˆš[\ˆ›YË‚‚ˆ[›™Y[™\˜Ú]™Y›ÝÜÈ\™H^ÛYY8 %›Ý\™H^XÚ]ˆ\Ù\ˆ[[ÈÙY\H›ÝÈ\›Ý[™‚ˆˆˆ‚ˆÝ]Ù™ˆH[YK[YJ
+HH
+›Ø]
+Û\—Ý[—Ù^\ÊH
+ˆŒ
+BˆÚ]Ù[‹—Ü™XYØÝ
+
+H\ÈÛÛ›Ž‚ˆ›ÝÜÈHÛÛ›‹™^XÝ]Jˆˆˆ‚ˆÑSPÕËšYËœÙ\ÜÚ[Û—ÚÙ^KËœÛÝ\˜ÙKË˜Ú]ÚYˆË˜Ú]Ý\KË\Ù\—ÚYËœÝ\YØ]ˆ”“ÓHÙ\ÜÚ[ÛœÈÂˆÒT‘HËœÙ\ÜÚ[Û—ÚÙ^HTÈ“Õ•SˆS‘Ë™[™YØ]TÈ•SˆS‘Ë]HTÈ•SˆS‘Ë›\ÝØXÝ]š]WØ]TÈ•SˆS‘ÓÐSTÐÑJË›Y\ÜØYÙWØÛÝ[
+HHˆS‘ÓÐSTÐÑJËÛÛØØ[ØÛÝ[
+HHˆS‘ÓÐSTÐÑJË˜\WØØ[ØÛÝ[
+HHˆS‘ÓÐSTÐÑJËš[œ]ÝÚÙ[œË
+HHˆS‘ÓÐSTÐÑJË›Ý]]ÝÚÙ[œË
+HHˆS‘ÓÐSTÐÑJËœ[›™Y
+HHˆS‘ÓÐSTÐÑJË˜\˜Ú]™Y
+HHˆS‘ËœÝ\YØ]TÈ“Õ•SˆS‘ËœÝ\YØ]ÂˆS‘“ÕVTÕÈ
+ˆÑSPÕH”“ÓHY\ÜØYÙ\ÈHÒT‘HKœÙ\ÜÚ[Û—ÚYHËšYˆ
+BˆÔ‘Tˆ–HËœÝ\YØ]ˆˆˆ‹ˆ
+Ý]Ù™‹
+Kˆ
+K™™]Ú[
+
+Bˆ™]\›ˆÙXÝ
+ŠH›Üˆˆ[ˆ›ÝÜ×B‚‚ˆYˆ[™WÛ™]™\—ØXÝ]™WÚÙ^YYÜÙ\ÜÚ[ÛœÊˆÙ[‹ˆ
+‹ˆÛ\—Ý[—Ù^\Îˆ›Ø]ˆÙ\ÜÚ[Ûœ×Ù\ŽˆÜ[Û˜[Ô]HH›Û™Kˆ
+HOˆ\VÚ[[N‚ˆˆˆ‘[]H™]™\‹XXÝ]™HÙ^YY›ÝÜÈ[™H›Ý][™È[šY\È˜[Z[™È[K‚‚ˆ™]\›œÈ
+Ù\ÜÚ[Ûœ×Ù[]Y›Ý][™×Ù[šY\×Ù[]Y
+X‚‚ˆH›Ý][™È[šY\ÈÛÈš\œÝˆHÝ[H[žH]Ý]]™Y]È\™Ù]ˆÛÝ[X]™HHØ]]Ø^H™\Ý[Z[™ÈHÙ\ÜÚ[ÛˆY]›ÈÛ™Ù\ˆ^\ÝË‚ˆ[][™ÈHZ\ˆ\ÈÚ]X]š[™È[H›ÝÛÝ[]™H[[Ý[YÂˆ[ž]Ø^H8 %H\™Ù]Y›È˜[œØÜš\È™\Ý[YK‚‚ˆ[][ÛˆÛÙ\È›ÝYÚ›Y]˜[]WÜÙ\ÜÚ[Û˜˜]\ˆ[ˆH[ÂˆSUXÛÈH[YØ]HØ\ØØYK•È›ÛÚÚÙY\[™È[™Û‹Y\ÚÂˆ˜[œØÜš\ÛX[\Ý^HÝÛ™YžHÛ™H[\[Y[][Û‹‚ˆˆˆ‚ˆØ[™Y]\ÈHÙ[‹›\ÝÛ™]™\—ØXÝ]™WÚÙ^YYÜÙ\ÜÚ[ÛœÊˆÛ\—Ý[—Ù^\Ï[Û\—Ý[—Ù^\Âˆ
+BˆYˆ›ÝØ[™Y]\Î‚ˆ™]\›ˆ
+
+BˆYÈHÜÝŠ›ÝÖÈšY—JH›Üˆ›ÝÈ[ˆØ[™Y]\ßBˆ›Ý][™×Ù[]YHÙ[‹—Ù[]WÜ›Ý][™×Ù[šY\×Ù›Ü—ÜÙ\ÜÚ[ÛœÊYÊBˆ[]YHˆ›ÜˆÙ\ÜÚ[Û—ÚY[ˆYÎ‚ˆYˆÙ[‹™[]WÜÙ\ÜÚ[ÛŠÙ\ÜÚ[Û—ÚYÙ\ÜÚ[Ûœ×Ù\\Ù\ÜÚ[Ûœ×Ù\ŠN‚ˆ[]Y
+ÏHBˆ™]\›ˆ
+[]Y›Ý][™×Ù[]Y
+B‚ˆYˆ\ÝÙØ]]Ø^WÜÙ\ÜÚ[ÛœÊˆÙ[‹ˆ
+‹ˆ]›Ü›NˆÜ[Û˜[ÜÝ—HH›Û™KˆXÝ]™WÛÛ›Nˆ›ÛÛHYKˆ
+HOˆ\ÝÑXÝÜÝ‹[žWWN‚ˆˆˆ“\ÝØ]]Ø^HÙ\ÜÚ[ÛœÈ
+›ÝÜÈÚ]HÙ\ÜÚ[Û—ÚÙ^JHœ›ÛHÝ]K™‹‚‚ˆ™]\›œÈH™]Ù\Ý›ÝÈ\ˆÙ\ÜÚ[Û—ÚÙ^H8 %HØ[YHÚ\HÛÛœÝ[Y\œÈÛÝˆœ›ÛHÙ\ÜÚ[ÛœËšœÛÛŽˆÛ™H]™HX\[™È\ˆ›Ý][™ÈÙ^Kˆ]›Ü›Xˆš[\œÈÛˆÛÝ\˜ÙXÈXÝ]™WÛÛ›X™\ÝšXÝÈÈÙ\ÜÚ[ÛœÈ]ˆ]™H›Ý[™Y‚ˆˆˆ‚ˆÈ[›ÝÜÈØ\œžHÚÙ[‹ØÛÜÝÝ[È
+PÔ\Ý[™ÜËÜÝ]\ÊH8 %˜Z[‚ˆÈ]Y]YY\Þ[˜ÈXØÛÝ[[™È[\ÈÛÈÛÛœÝ[Y\œÈÙYH^XÝÛÝ[\œË‚ˆÙ[‹™›\ÚÝÚÙ[—ØÛÝ[Ê
+Bˆ]Y\žHHˆˆˆ‚ˆÑSPÕÙ\ÜÚ[ÛœËŠ‹ˆÓÐSTÐÑJÜœ›Û\Ù\ÜÚ[ÛœËœÞ\Ý[WÜ›Û\
+BˆTÈÜÞ\Ý[WÜ›Û\Ü™\ÛÛ™Yˆ×ÜÜ[ÜÙ\ÜÚ[Û—Û\ÝØXÝ]™JœÙ\ÜÚ[ÛœÈŠ_HTÈ\ÝØXÝ]™Bˆ”“ÓHÙ\ÜÚ[ÛœÂˆQ•“ÒSˆÞ\Ý[WÜ›Û\ÈÜˆÓˆÜš\ÚHÙ\ÜÚ[ÛœËœÞ\Ý[WÜ›Û\Ú\ÚˆÒT‘HÙ\ÜÚ[Û—ÚÙ^HTÈ“Õ•SˆS‘Ý\YØ]H
+ˆÑSPÕPV
+Ì‹œÝ\YØ]
+H”“ÓHÙ\ÜÚ[ÛœÈÌ‚ˆÒT‘HÌ‹œÙ\ÜÚ[Û—ÚÙ^HHÙ\ÜÚ[ÛœËœÙ\ÜÚ[Û—ÚÙ^Bˆ
+Bˆˆˆ‚ˆ\˜[\Îˆ\ÝH×BˆYˆ]›Ü›N‚ˆ]Y\žH
+ÏHˆS‘ÕÑTŠÛÝ\˜ÙJHHÕÑTŠÊH‚ˆ\˜[\Ë˜\[™
+]›Ü›JBˆYˆXÝ]™WÛÛ›N‚ˆ]Y\žH
+ÏHˆS‘[™YØ]TÈ•S‚ˆ]Y\žH
+ÏHˆÔ‘Tˆ–H\ÝØXÝ]™HTÐÈ‚ˆÚ]Ù[‹—ÛØÚÎ‚ˆ›ÝÜÈHÙ[‹—ØÛÛ›‹™^XÝ]J]Y\žK\˜[\ÊK™™]Ú[
+
+Bˆ™]\›ˆÜÙ[‹—ÜÙ\ÜÚ[Û—Ü›Ý×ÙXÝ
+ŠH›Üˆˆ[ˆ›ÝÜ×B‚ˆYˆš[™ÜÙ\ÜÚ[Û—ØžWÛÜšYÚ[ŠˆÙ[‹ˆ
+‹ˆ]›Ü›NˆÝ‹ˆÚ]ÚYˆÝ‹ˆ™XYÚYˆÜ[Û˜[ÜÝ—HH›Û™Kˆ\Ù\—ÚYˆÜ[Û˜[ÜÝ—HH›Û™Kˆ
+HOˆÜ[Û˜[ÜÝ—N‚ˆˆˆ‘š[™H[ÜÝ™XÙ[]™HÙ\ÜÚ[Û—ÚY›ÜˆH]›Ü›H
+ÈÚ]ÜšYÚ[‹‚‚ˆ\]Z]˜[[ÙˆØ]]Ø^KÛZ\œ›Ü‰ÜÈÙ\ÜÚ[ÛœËšœÛÛˆØØ[ŽˆX]Ú\ÈÛ‚ˆÛÝ\˜ÙH
+ÈÚ]ÚY
+
+È™XYÚYÚ[ˆ›ÝšYY
+KˆÚ[ˆ\Ù\—ÚY\Âˆ›ÝšYY^XÝÙ[™\ˆX]Ú\È\™H™Y™\œ™YÈYˆ][\H\Ý[˜Ýˆ\Ù\œÈÚ\™HHÚ][™›Û™HX]Ú\Ë™]\›œÈ›Û™H˜]\ˆ[‚ˆÛÛ[Z[˜][™È[›Ý\ˆ\XÚ\[	ÜÈÙ\ÜÚ[Û‹‚ˆˆˆ‚ˆYˆ›Ý]›Ü›HÜˆÚ]ÚY[ˆ
+›Û™KˆŠN‚ˆ™]\›ˆ›Û™Bˆ]Y\žHHˆˆ‚ˆÑSPÕY\Ù\—ÚYÝ\YØ]”“ÓHÙ\ÜÚ[ÛœÂˆÒT‘HÕÑTŠÛÝ\˜ÙJHHÕÑTŠÊBˆS‘Ù\ÜÚ[Û—ÚÙ^HTÈ“Õ•SˆS‘Ú]ÚYHÂˆS‘[™YØ]TÈ•Sˆˆˆ‚ˆ\˜[\Îˆ\ÝHÜ]›Ü›KÝŠÚ]ÚY
+WBˆYˆ™XYÚY\È›Ý›Û™N‚ˆ]Y\žH
+ÏHˆS‘ÓÐSTÐÑJ™XYÚY	ÉÊHHÈ‚ˆ\˜[\Ë˜\[™
+ÝŠ™XYÚY
+JBˆ]Y\žH
+ÏHˆÔ‘Tˆ–HÝ\YØ]TÐÈ‚ˆÚ]Ù[‹—ÛØÚÎ‚ˆ›ÝÜÈHÙXÝ
+ŠH›Üˆˆ[ˆÙ[‹—ØÛÛ›‹™^XÝ]J]Y\žK\˜[\ÊK™™]Ú[
+
+WBˆYˆ›Ý›ÝÜÎ‚ˆ™]\›ˆ›Û™BˆYˆ\Ù\—ÚY‚ˆ^XÝHÜˆ›Üˆˆ[ˆ›ÝÜÈYˆÝŠ‹™Ù]
+\Ù\—ÚYŠHÜˆˆŠHOHÝŠ\Ù\—ÚY
+WBˆYˆ^XÝ‚ˆ™]\›ˆÝŠ^XÝÌVÈšY—JBˆYˆ[Š›ÝÜÊHˆN‚ˆ™]\›ˆ›Û™Bˆ[Yˆ[Š›ÝÜÊHˆN‚ˆ\Ý[˜ÝÝ\Ù\œÈHÂˆÝŠ‹™Ù]
+\Ù\—ÚYŠHÜˆˆŠKœÝš\
+
+Bˆ›Üˆˆ[ˆ›ÝÜÂˆYˆÝŠ‹™Ù]
+\Ù\—ÚYŠHÜˆˆŠKœÝš\
+
+BˆBˆYˆ[Š\Ý[˜ÝÝ\Ù\œÊHˆN‚ˆ™]\›ˆ›Û™Bˆ™]\›ˆÝŠ›ÝÜÖÌVÈšY—JB‚‚ˆÈ8¥ 8¥ Üœ[™YØ]]Ø^K\Ù\ÜÚ[Ûˆ™\Z\ˆ
+ÎŒMŠH8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ ˆÈHÜš]K\]˜Z[\™H
+ÛÜœ\•ËÜ˜\Ú™]ÙY[ˆ›Ý][™ÈX›XØ][Û‚ˆÈ[™›ÝÈÜ™X][ÛŠHØ[ˆX]™HH]™HÛÛ™\œØ][Ûˆ[ˆHÙ\ÜÚ[Ûˆ›ÝÂˆÈ]™]™\ˆ™XÙZ]™Y]ÈY[]HÛÛ[[œËˆ›Ý]Y\šY\ÈX›Ý™H™\]Z\™BˆÈÜÙHÛÛ[[œËÛÈH›ÝÈÛ[™ÈH™X[˜[œØÜš\\È[š\ÚX›HÂˆÈ™XÛÝ™\žNˆHÚ]™\ÛÛ™\ÈÈH\ÝÙ^YY›ÝÈ[œÝXY8 %^\ÈÛ\‚ˆÈ8 %[™HÛÛ™\œØ][Ûˆ[YK]˜]™[Ëˆ\™[š[™ÈHÜš]HÚYHØ[››ÝˆÈ™XXÚH›ÝÈ]\È
+˜[™XYJˆ[XYÙYÈ\ÙHÛÈY]ÙÈ\™HBˆÈÙ™›[™H™\Z\ˆ]™Z[™\›Y\ÈÙ\ÜÚ[ÛœÈ™\Z\‹\›Ý][™Ø‚‚ˆÈÚY\Ý]\ÚX›HØ\™]ÙY[ˆHÙ^YY™YXÙ\ÜÛÜˆÛÚ[™È]ZY][™]ÂˆÈ[šÙ^YYÝXØÙ\ÜÛÜˆ™Z[™ÈZ[YˆH™\ÜY[˜ÚY[Ø\Ø\ÈŒÎÂˆÈMHZ[]\ÈÝ^\ÈÙ[™\›Ý\ÈÚ]Ý]Ü[›š[™È[œ™[]YÛÛ™\œØ][ÛœË‚ˆÓÔ”S—ÐQÔSÓ—ÓPVÑÐTÔÈHLŒ‚ˆYˆš[™ÛÜœ[™YÙØ]]Ø^WÜÙ\ÜÚ[ÛœÊˆÙ[‹
+‹X^ÙØ\ÜÎˆÜ[Û˜[Ù›Ø]HH›Û™Bˆ
+HOˆ\ÝÑXÝÜÝ‹[žWWN‚ˆˆˆ”™\ÜY\ÜØYÙKX™X\š[™ÈÙ\ÜÚ[Ûˆ›ÝÜÈ]ÜÝZ\ˆ›Ý][™ÈY[]K‚‚ˆH›ÝÈ\ÈHØ[™Y]HÜœ[ˆÚ[ˆ]\ÈY\ÜØYÙ\È]›ÂˆÙ\ÜÚ[Û—ÚÙ^Xˆ]\ÈÛ›H
+˜YÜX›JˆÚ[ˆ^XÝHÛ™HÙ^YYˆ™YXÙ\ÜÛÜˆØ[ˆ™H˜[YY\ÈHÛÛ™\œØ][Ûˆ]ÛÛ[Y\Î‚‚ˆ
+ˆ[™XYÙX8 %\™[ÜÙ\ÜÚ[Û—ÚYÚ[È]HÙ^YY›ÝÈÙˆBˆØ[YHÛÝ\˜ÙKˆ]\ÈH™XÛÜ™Y˜XÝÛÈ›È[YHÚ[™ÝÈ\Y\Ë‚ˆ
+ˆÛÛYÝZ]X8 %^XÝHÛ™HÙ^YY›ÝÈÙˆHØ[YHÛÝ\˜ÙH
+[™ˆÛÛ\]X›H\Ù\—ÚY
+H™[]ZY]Ú][ˆ
+›X^ÙØ\ÜÊˆÙˆBˆÜœ[‰ÜÈÝ\[™\ÈÛ\ˆ[ˆHÜœ[‰ÜÈÝÛˆ\ÝXÝ]š]K‚‚ˆ[ž][™È[XšYÝ[Ý\È\È™\ÜYÚ]YÜX›OQ˜[ÙX[™H™X\ÛÛ‚ˆ˜]\ˆ[ˆÝY\ÜÙY]ˆZ\ËXYÜ[™ÈÛÝ[ÜXÙHÛ™H\œÛÛ‰ÜÂˆÛÛ™\œØ][Ûˆ[È[›Ý\ˆ\œÛÛ‰ÜÈÚ]ˆœ˜[˜ÚÙ[YØ]KÝÛÛ›ÝÜÂˆ\™H^ÛYYÝ]šYÚ8 %^H\™H[šÙ^YYžH\ÚYÛ‹›ÝžH[XYÙK‚ˆˆˆ‚ˆØ\H
+ˆÙ[‹—ÓÔ”S—ÐQÔSÓ—ÓPVÑÐTÔÂˆYˆX^ÙØ\ÜÈ\È›Û™Bˆ[ÙH›Ø]
+X^ÙØ\ÜÊBˆ
+BˆÜœ[—ØXÝ]™HHÜÜ[ÜÙ\ÜÚ[Û—Û\ÝØXÝ]™J›ÈŠBˆÛ›Ü—ØXÝ]™HHÜÜ[ÜÙ\ÜÚ[Û—Û\ÝØXÝ]™J™ŠBˆÛ›Ü—ØÛÛ[[œÈH
+ˆ™šYœÙ\ÜÚ[Û—ÚÙ^K˜Ú]ÚY˜Ú]Ý\K™XYÚY‚ˆ™\Ù\—ÚY›ÜšYÚ[—ÚœÛÛ‹™\Ü^WÛ˜[YK™[™Ü™X\ÛÛˆ‚ˆ
+Bˆ™XÛÜ™Îˆ\ÝÑXÝÜÝ‹[žWWHH×B‚ˆÚ]Ù[‹—Ü™XYØÝ
+
+H\ÈÛÛ›Ž‚ˆÜœ[œÈHÛÛ›‹™^XÝ]Jˆˆˆˆ‚ˆÑSPÕËšYËœÛÝ\˜ÙKË\Ù\—ÚYËœÝ\YØ]ˆËœ\™[ÜÙ\ÜÚ[Û—ÚYˆÛÜœ[—ØXÝ]™_HTÈ\ÝØXÝ]™Kˆ
+ÑSPÕÓÕS•
+
+ŠH”“ÓHY\ÜØYÙ\ÈBˆÒT‘HKœÙ\ÜÚ[Û—ÚYHËšY
+HTÈY\ÜØYÙWØÛÝ[ˆ”“ÓHÙ\ÜÚ[ÛœÈÂˆÒT‘HËœÙ\ÜÚ[Û—ÚÙ^HTÈ•SˆS‘VTÕÈ
+ÑSPÕH”“ÓHY\ÜØYÙ\ÈBˆÒT‘HKœÙ\ÜÚ[Û—ÚYHËšY
+BˆS‘ÓÐSTÐÑJËœÛÝ\˜ÙK	ÉÊHOH	ÝÛÛ	ÂˆS‘œÛÛ—Ù^˜XÝ
+ÓÐSTÐÑJË›[Ù[ØÛÛ™šYË	ÞÞß_IÊKˆ	É—Øœ˜[˜ÚYÙœ›ÛIÊHTÈ•SˆS‘œÛÛ—Ù^˜XÝ
+ÓÐSTÐÑJË›[Ù[ØÛÛ™šYË	ÞÞß_IÊKˆ	É—Ù[YØ]WÙœ›ÛIÊHTÈ•SˆÔ‘Tˆ–HËœÝ\YØ]TÐÂˆˆˆ‚ˆ
+K™™]Ú[
+
+B‚ˆ›ÜˆÜœ[ˆ[ˆÜœ[œÎ‚ˆÛ›ÜˆH›Û™Bˆ]šY[˜ÙHHˆ‚ˆ™X\ÛÛˆHˆ‚‚ˆYˆÜœ[–Èœ\™[ÜÙ\ÜÚ[Û—ÚY—N‚ˆ]šY[˜ÙHH›[™XYÙH‚ˆÛ›ÜˆHÛÛ›‹™^XÝ]Jˆˆˆˆ‚ˆÑSPÕÙÛ›Ü—ØÛÛ[[œßBˆ”“ÓHÙ\ÜÚ[ÛœÈˆÒT‘HšYHÂˆS‘œÙ\ÜÚ[Û—ÚÙ^HTÈ“Õ•SˆS‘ÓÐSTÐÑJœÛÝ\˜ÙK	ÉÊHHÓÐSTÐÑJË	ÉÊBˆˆˆ‹ˆ
+Üœ[–Èœ\™[ÜÙ\ÜÚ[Û—ÚY—KÜœ[–ÈœÛÝ\˜ÙH—JKˆ
+K™™]ÚÛ™J
+BˆYˆÛ›Üˆ\È›Û™N‚ˆ™X\ÛÛˆH
+ˆœ\™[Ù\ÜÚ[ÛˆØ\œšY\È›ÈØ]]Ø^HY[]HÙˆ‚ˆ\ÈÛÝ\˜ÙH‚ˆ
+Bˆ[ÙN‚ˆ]šY[˜ÙHH˜ÛÛYÝZ]H‚ˆØ[™Y]\ÈHÛÛ›‹™^XÝ]Jˆˆˆˆ‚ˆÑSPÕÙÛ›Ü—ØÛÛ[[œßKÙÛ›Ü—ØXÝ]™_HTÈ\ÝØXÝ]™Bˆ”“ÓHÙ\ÜÚ[ÛœÈˆÒT‘HœÙ\ÜÚ[Û—ÚÙ^HTÈ“Õ•SˆS‘šYOHÂˆS‘ÓÐSTÐÑJœÛÝ\˜ÙK	ÉÊHHÓÐSTÐÑJË	ÉÊBˆS‘
+ÓÐSTÐÑJ\Ù\—ÚY	ÉÊHH	ÉÂˆÔˆÓÐSTÐÑJË	ÉÊHH	ÉÂˆÔˆ\Ù\—ÚYHÊBˆS‘ÙÛ›Ü—ØXÝ]™_H‘UÑQSˆÈS‘ÂˆS‘ÙÛ›Ü—ØXÝ]™_HÂˆÔ‘Tˆ–H\ÝØXÝ]™HTÐÂˆSRU‚ˆˆˆ‹ˆ
+ˆÜœ[–ÈšY—KˆÜœ[–ÈœÛÝ\˜ÙH—KˆÜœ[–È\Ù\—ÚY—KˆÜœ[–È\Ù\—ÚY—Kˆ
+Üœ[–ÈœÝ\YØ]—HÜˆ
+HHØ\ˆ
+Üœ[–ÈœÝ\YØ]—HÜˆ
+H
+ÈØ\ˆÜœ[–È›\ÝØXÝ]™H—Kˆ
+Kˆ
+K™™]Ú[
+
+BˆYˆ›ÝØ[™Y]\Î‚ˆ™X\ÛÛˆH
+ˆˆ››ÈÙ^YY™YXÙ\ÜÛÜˆ™[]ZY]Ú][ˆÙØ\‹ŒŸ\È‚ˆ›Ùˆ\ÈÙ\ÜÚ[Û‰ÜÈÝ\‚ˆ
+Bˆ[Yˆ[ŠØ[™Y]\ÊHˆN‚ˆ™X\ÛÛˆH
+ˆ˜[XšYÝ[Ý\Îˆ[Ü™H[ˆÛ™HÙ^YY™YXÙ\ÜÛÜˆ‚ˆ›X]Ú\È\ÈÚ[™ÝÈ‚ˆ
+Bˆ[ÙN‚ˆÛ›ÜˆHØ[™Y]\ÖÌB‚ˆ™XÛÜ™Ë˜\[™
+ˆÂˆ›Üœ[—ÚYŽˆÜœ[–ÈšY—KˆœÛÝ\˜ÙHŽˆÜœ[–ÈœÛÝ\˜ÙH—Kˆ›Y\ÜØYÙWØÛÝ[ŽˆÜœ[–È›Y\ÜØYÙWØÛÝ[—KˆœÝ\YØ]ŽˆÜœ[–ÈœÝ\YØ]—Kˆ›\ÝØXÝ]™HŽˆÜœ[–È›\ÝØXÝ]™H—Kˆ™Û›Ü—ÚYŽˆÛ›Ü–ÈšY—HYˆÛ›Üˆ[ÙH›Û™KˆœÙ\ÜÚ[Û—ÚÙ^HŽˆÛ›Ü–ÈœÙ\ÜÚ[Û—ÚÙ^H—HYˆÛ›Üˆ[ÙH›Û™Kˆ™]šY[˜ÙHŽˆ]šY[˜ÙHYˆÛ›Üˆ[ÙHˆ‹ˆ˜YÜX›HŽˆÛ›Üˆ\È›Ý›Û™Kˆœ™X\ÛÛˆŽˆ™X\ÛÛ‹ˆBˆ
+B‚ˆÈÛÈ[šÙ^YYÝXØÙ\ÜÛÜœÈÛZ[Z[™ÈHØ[YH™YXÙ\ÜÛÜˆYX[œÈ][ÜÝˆÈÛ™HÙˆ[HÛÛ[Y\È]Ú][™›Ý[™È\™HØ^\ÈÚXÚ‚ˆÛÛ\ÝYHÂˆ–È™Û›Ü—ÚY—Bˆ›Üˆˆ[ˆ™XÛÜ™ÂˆYˆ–È˜YÜX›H—Bˆ[™Ý[JH›Üˆ[ˆ™XÛÜ™ÈYˆÈ™Û›Ü—ÚY—HOH–È™Û›Ü—ÚY—JHˆBˆBˆ›Üˆ™XÛÜ™[ˆ™XÛÜ™Î‚ˆYˆ™XÛÜ™È™Û›Ü—ÚY—H[ˆÛÛ\ÝY‚ˆ™XÛÜ™È˜YÜX›H—HH˜[ÙBˆ™XÛÜ™Èœ™X\ÛÛˆ—HH
+ˆ˜[XšYÝ[Ý\Îˆ[Ü™H[ˆÛ™H[šÙ^YYÙ\ÜÚ[ÛˆÛZ[\È\È‚ˆœ™YXÙ\ÜÛÜˆ‚ˆ
+Bˆ™]\›ˆ™XÛÜ™Â‚ˆYˆYÜÛÜœ[™YÙØ]]Ø^WÜÙ\ÜÚ[ÛŠˆÙ[‹Üœ[—ÚYˆÝ‹Û›Ü—ÚYˆÝ‚ˆ
+HOˆ›ÛÛ‚ˆˆˆ”Ý[\
+›Üœ[—ÚY
+ˆÚ]
+™Û›Ü—ÚY
+‰ÜÈ›Ý][™ÈY[]K™]\™H
+™Û›Ü—ÚY
+‹‚‚ˆ™K]™\šYšY\ÈHZ\ˆ[œÚYHHÜš]H˜[œØXÝ[Û‹ÛÈHÛÛ˜Ý\œ™[ˆØ]]Ø^H]X[YZ]\ˆ›ÝÈ[ˆHYX[[YH\›œÈ\È[ÈBˆ›Ë[Ü[œÝXYÙˆHÛÛ™›XÝ[™ÈÜš]Kˆ^\Ý[™È›Û‹S•SÛÛ[[œÈÛ‚ˆHÜœ[ˆ\™H™\Ù\™Yˆ™]\›œÈYHÚ[ˆHYÜ[Ûˆ\YY‚ˆˆˆ‚ˆYˆ›ÝÜœ[—ÚYÜˆ›ÝÛ›Ü—ÚYÜˆÜœ[—ÚYOHÛ›Ü—ÚY‚ˆ™]\›ˆ˜[ÙB‚ˆYˆÙÊÛÛ›ŠN‚ˆÛ›ÜˆHÛÛ›‹™^XÝ]Jˆ”ÑSPÕÙ\ÜÚ[Û—ÚÙ^KÚ]ÚYÚ]Ý\K™XYÚY\Ù\—ÚY‚ˆ›ÜšYÚ[—ÚœÛÛ‹\Ü^WÛ˜[YKÛÝ\˜ÙH”“ÓHÙ\ÜÚ[ÛœÈÒT‘HYHÈ‹ˆ
+Û›Ü—ÚY
+Kˆ
+K™™]ÚÛ™J
+BˆÜœ[ˆHÛÛ›‹™^XÝ]Jˆ”ÑSPÕÙ\ÜÚ[Û—ÚÙ^KÛÝ\˜ÙH”“ÓHÙ\ÜÚ[ÛœÈÒT‘HYHÈ‹ˆ
+Üœ[—ÚY
+Kˆ
+K™™]ÚÛ™J
+BˆYˆÛ›Üˆ\È›Û™HÜˆÜœ[ˆ\È›Û™N‚ˆ™]\›ˆ˜[ÙBˆYˆ›ÝÛ›Ü–ÈœÙ\ÜÚ[Û—ÚÙ^H—HÜˆÜœ[–ÈœÙ\ÜÚ[Û—ÚÙ^H—N‚ˆ™]\›ˆ˜[ÙBˆYˆ
+Û›Ü–ÈœÛÝ\˜ÙH—HÜˆˆŠHOH
+Üœ[–ÈœÛÝ\˜ÙH—HÜˆˆŠN‚ˆ™]\›ˆ˜[ÙB‚ˆÛÛ›‹™^XÝ]Jˆˆˆ•TUHÙ\ÜÚ[ÛœÂˆÑUÙ\ÜÚ[Û—ÚÙ^HHËˆÚ]ÚYHÓÐSTÐÑJÚ]ÚYÊKˆÚ]Ý\HHÓÐSTÐÑJÚ]Ý\KÊKˆ™XYÚYHÓÐSTÐÑJ™XYÚYÊKˆ\Ù\—ÚYHÓÐSTÐÑJ\Ù\—ÚYÊKˆÜšYÚ[—ÚœÛÛˆHÓÐSTÐÑJÜšYÚ[—ÚœÛÛ‹ÊKˆ\Ü^WÛ˜[YHHÓÐSTÐÑJ\Ü^WÛ˜[YKÊKˆ\™[ÜÙ\ÜÚ[Û—ÚYHÓÐSTÐÑJ\™[ÜÙ\ÜÚ[Û—ÚYÊBˆÒT‘HYHÈS‘Ù\ÜÚ[Û—ÚÙ^HTÈ•Sˆˆ‹ˆ
+ˆÛ›Ü–ÈœÙ\ÜÚ[Û—ÚÙ^H—KˆÛ›Ü–È˜Ú]ÚY—KˆÛ›Ü–È˜Ú]Ý\H—KˆÛ›Ü–È™XYÚY—KˆÛ›Ü–È\Ù\—ÚY—KˆÛ›Ü–È›ÜšYÚ[—ÚœÛÛˆ—KˆÛ›Ü–È™\Ü^WÛ˜[YH—KˆÛ›Ü—ÚYˆÜœ[—ÚYˆ
+Kˆ
+BˆÈ™]\™HH™YXÙ\ÜÛÜˆ[™\ˆH™X\ÛÛˆ™XÛÝ™\žHÙ\È“Õ™X]ˆÈ\È™\Ý[XX›H8 %	ØYÙ[ØÛÜÙIËÉÝÜ×ÛÜœ[—Ü™X\	ÈÛÝ[ÙY\][‚ˆÈH[›š[™Ë[™H™]ÛHÙ^YYÜœ[ˆÛÝ[ÜÙHHÚ]ˆÈYØZ[ˆÛˆH™^™\Ý\‚ˆÛÛ›‹™^XÝ]Jˆ•TUHÙ\ÜÚ[ÛœÈÑU[™YØ]HÓÐSTÐÑJ[™YØ]ÊK‚ˆ™[™Ü™X\ÛÛˆH	ÜÝ\\œÙYYØžWÜ™\Z\‰ÈÒT‘HYHÈ‹ˆ
+[YK[YJ
+KÛ›Ü—ÚY
+Kˆ
+Bˆ™]\›ˆYB‚ˆ™]\›ˆÙ[‹—Ù^XÝ]WÝÜš]JÙÊB‚ˆÈÚ[™[ˆ]Ø\œžHH\™[ÜÙ\ÜÚ[Û—ÚY]\™H“ÕÛÛ\™\ÜÚ[Û‚ˆÈÛÛ[X][ÛœÎˆœ˜[˜Ú\Ë[YØ]KÜÝX˜YÙ[[œË[™ÛÛÙ\ÜÚ[ÛœË‚ˆÈHX\šÙ\ˆÛ›H\Ü]X[YšY\ÈHÚ[Ú[ˆ]Ú[È]H\™[™Z[™ÂˆÈ]Y\šYY8 %ÛÛ\™\ÜÚ[ÛˆÛÛ[X][ÛœÈ[š\š]H›Ý]YYÙ[	ÜÂˆÈ[Ù[ØÛÛ™šYØ™\˜˜][H
+X›\ÚØÛÛ\™\ÜÚ[Û—ØÚ[Ø[\œÈ\ÜÂˆÈYÙ[—ÜÙ\ÜÚ[Û—Ú[š]Û[Ù[ØÛÛ™šYØ
+KÛÈH[YØ]HÝX˜YÙ[	ÜÂˆÈÛÛ[X][ÛˆØ\œšY\ÈÙ[YØ]WÙœ›ÛOOH[YØ]IÜÈÝÛˆ\™[˜‚ˆÈX]Ú[™ÈX\šÙ\œÈžHY\™H™\Ù[˜ÙHZ\ØÛ\ÜÚYšYYÜÙH™X[ˆÈÛÛ[X][ÛœÈ\È[YØ]HÚ[™[ˆ
+˜Z[[Ü[ˆ›ÜˆÜœ[ˆ™[Ü[‹ˆÈ˜Z[XÛÜÙY›ÜˆYÜ[ÛŠKˆš[™H\™[Y›Üˆ›ÝX\šÙ\œË‚ˆÓ“Ó—ÐÓÓ•S•PUSÓ—ÐÒSÑ’ST—ÔÔSH
+ˆˆS‘ÓÐSTÐÑJœÛÛ—Ù^˜XÝ
+ÓÐSTÐÑJØ[X\ß[[Ù[ØÛÛ™šYË	ÞÞß_IÊK‚ˆˆ	É—Øœ˜[˜ÚYÙœ›ÛIÊK	ÉÊHOH×ˆ‚ˆˆS‘ÓÐSTÐÑJœÛÛ—Ù^˜XÝ
+ÓÐSTÐÑJØ[X\ß[[Ù[ØÛÛ™šYË	ÞÞß_IÊK‚ˆˆ	É—Ù[YØ]WÙœ›ÛIÊK	ÉÊHOH×ˆ‚ˆˆS‘ÓÐSTÐÑJØ[X\ß\ÛÝ\˜ÙK	ÉÊHOH	ÝÛÛ	×ˆ‚ˆ
+B‚ˆYˆš[™Û]™WØÛÛ\™\ÜÚ[Û—ØÚ[
+ˆÙ[‹\™[ÜÙ\ÜÚ[Û—ÚYˆÝ‚ˆ
+HOˆÜ[Û˜[ÑXÝÜÝ‹[žWWN‚ˆˆˆ”™]\›ˆH[š\]YH]™H\™XÝÚ[ÙˆHÛÛ\™\ÜÚ[Û‹Y[™YÙ\ÜÚ[Û‹‚‚ˆHÝ[HYÙ[X^HØœÙ\™H][›Ý\ˆÛÛ\™\ÜÚ[Ûˆ][™XYH›Ý]Yˆ]È\™[ˆ™XÛÝ™\žH\ÈØY™HÛ›HÚ[ˆH\˜X›H[™XYÙHY[YšY\Âˆ^XÝHÛ™H]™H\™XÝÛÛ[X][Û‹ˆ][\HÚ[™[ˆ\™H™X]Y\Âˆ[XšYÝ[Ý\È[™˜Z[ÛÜÙY˜]\ˆ[ˆÝY\ÜÚ[™ÈÚXÚ˜[œØÜš\ÝÛœÂˆÝXœÙ\]Y[Y\ÜØYÙ\Ë‚ˆˆˆ‚ˆYˆ›Ý\™[ÜÙ\ÜÚ[Û—ÚY‚ˆ™]\›ˆ›Û™BˆÚ]Ù[‹—Ü™XYØÝ
+
+H\ÈÛÛ›Ž‚ˆ\™[HÛÛ›‹™^XÝ]Jˆ”ÑSPÕ[™YØ][™Ü™X\ÛÛˆ”“ÓHÙ\ÜÚ[ÛœÈÒT‘HYHÈ‹ˆ
+\™[ÜÙ\ÜÚ[Û—ÚY
+Kˆ
+K™™]ÚÛ™J
+BˆYˆ
+ˆ\™[\È›Û™BˆÜˆ\™[È™[™YØ]—H\È›Û™BˆÜˆ\™[È™[™Ü™X\ÛÛˆ—HOH˜ÛÛ\™\ÜÚ[Ûˆ‚ˆ
+N‚ˆ™]\›ˆ›Û™Bˆ›ÝÜÈHÛÛ›‹™^XÝ]Jˆˆˆ‚ˆÑSPÕËŠ‹ˆÓÐSTÐÑJÜœ›Û\ËœÞ\Ý[WÜ›Û\
+BˆTÈÜÞ\Ý[WÜ›Û\Ü™\ÛÛ™Yˆ”“ÓHÙ\ÜÚ[ÛœÈÂˆQ•“ÒSˆÞ\Ý[WÜ›Û\ÈÜÓˆÜš\ÚHËœÞ\Ý[WÜ›Û\Ú\ÚˆÒT‘HËœ\™[ÜÙ\ÜÚ[Û—ÚYHÂˆS‘Ë™[™YØ]TÈ•Sˆˆˆ‚ˆ
+ÈÙ[‹—Ó“Ó—ÐÓÓ•S•PUSÓ—ÐÒSÑ’ST—ÔÔS™›Ü›X]
+[X\ÏHœËˆŠBˆ
+Èˆˆ‚ˆÔ‘Tˆ–HËœÝ\YØ]TÐÂˆSRU‚ˆˆˆ‹ˆ
+\™[ÜÙ\ÜÚ[Û—ÚY\™[ÜÙ\ÜÚ[Û—ÚY\™[ÜÙ\ÜÚ[Û—ÚY
+Kˆ
+K™™]Ú[
+
+Bˆ™]\›ˆÙ[‹—ÜÙ\ÜÚ[Û—Ü›Ý×ÙXÝ
+›ÝÜÖÌJHYˆ[Š›ÝÜÊHOHH[ÙH›Û™B‚ˆYˆ™[Ü[—ÛÜœ[™YØÛÛ\™\ÜÚ[Û—ÜÙ\ÜÚ[ÛŠÙ[‹Ù\ÜÚ[Û—ÚYˆÝŠHOˆ›ÛÛ‚ˆˆˆ”™[Ü[ˆHÛÛ\™\ÜÚ[Ûˆ\™[Û›HÚ[ˆ›ÈÛÛ[X][ÛˆØ\ÈX›\ÚY‚‚ˆÛÛ\™\ÜÚ[ÛˆX›XØ][Ûˆ\È]ÛZXÈ[ˆÝ\œ™[Z[Ë]Û\ˆZ[ÂˆÛÝ[X]™HHÛÜÙY\™[™Z[™Y\ˆ[ˆ[\œ\Y[™Ù™‹ˆ\Âˆ™XÛÝ™\žH\È[X™\˜][HÛÛœÙ\˜]]™Nˆ[ˆXÝ]™HÛÛ\™\ÜÚ[ÛˆX\ÙHÜ‚ˆ[žHØ[›ÛšXØ[Ú[YX[œÈH[™XYÙH\ÈÝ[ÝÛ™YžH[›Ý\ˆ]ˆÛÈHØ[\ˆ]\Ý˜Z[ÛÜÙY[œÝXYÙˆ™[Ü[š[™ÈH\™[‚ˆˆˆ‚ˆYˆ›ÝÙ\ÜÚ[Û—ÚY‚ˆ™]\›ˆ˜[ÙB‚ˆYˆÙÊÛÛ›ŠN‚ˆ\™[HÛÛ›‹™^XÝ]Jˆ”ÑSPÕ[™YØ][™Ü™X\ÛÛˆ”“ÓHÙ\ÜÚ[ÛœÈÒT‘HYHÈ‹ˆ
+Ù\ÜÚ[Û—ÚY
+Kˆ
+K™™]ÚÛ™J
+BˆYˆ
+ˆ\™[\È›Û™BˆÜˆ\™[È™[™YØ]—H\È›Û™BˆÜˆ\™[È™[™Ü™X\ÛÛˆ—HOH˜ÛÛ\™\ÜÚ[Ûˆ‚ˆ
+N‚ˆ™]\›ˆ˜[ÙB‚ˆÈ™X][žH\™XÝ›Û‹Xœ˜[˜ÚÛ›Û‹Y[YØ]KÛ›Û‹]ÛÛÚ[\ÈBˆÈÛÛ[X][Û‹™YØ\™\ÜÈÙˆ]ÈÝ\œ™[[™YÝ]Kˆ™[Ü[š[™ÂˆÈ[ˆ]Ø\ÙHÛÝ[Ü™X]HHÙXÛÛ™]™HXY›ÜˆÛ™H[™XYÙK‚ˆÚ[HÛÛ›‹™^XÝ]Jˆˆˆ‚ˆÑSPÕBˆ”“ÓHÙ\ÜÚ[ÛœÂˆÒT‘H\™[ÜÙ\ÜÚ[Û—ÚYHÂˆˆˆ‚ˆ
+ÈÙ[‹—Ó“Ó—ÐÓÓ•S•PUSÓ—ÐÒSÑ’ST—ÔÔS™›Ü›X]
+[X\ÏHˆŠBˆ
+Èˆˆ‚ˆSRUBˆˆˆ‹ˆ
+Ù\ÜÚ[Û—ÚYÙ\ÜÚ[Û—ÚYÙ\ÜÚ[Û—ÚY
+Kˆ
+K™™]ÚÛ™J
+BˆYˆÚ[\È›Ý›Û™N‚ˆ™]\›ˆ˜[ÙB‚ˆÈ™Yœ™\ÚØÛÛ\™\ÜÚ[Û—ÛØÚÊ
+H[X™\˜][H]È[ˆÝÛ™\ˆ™]š]™H]ÂˆÈÝÛˆ^\™Y›ÝËˆ™XÛZ[H]›ÝÈ[œÚYH\ÈÜš]H˜[œØXÝ[Û‚ˆÈ™Y›Ü™H™[Ü[š[™Îˆ™Yœ™\ÚYš\œÝXZÙ\ÈHX\ÙHXÝ]™H[™X›ÜÂˆÈ™XÛÝ™\žNÈ™XÛÝ™\žKYš\œÝ[]\ÈHÛ\ˆY[]HÛÈH]\‚ˆÈ™Yœ™\ÚØ[››Ý™\Ý\œ™XÝ]‚ˆ›ÝÈH[YK[YJ
+BˆØÚ×Ü›ÝÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕÛ\‹^\™\×Ø]”“ÓHÛÛ\™\ÜÚ[Û—ÛØÚÜÈ‚ˆ•ÒT‘HÙ\ÜÚ[Û—ÚYHÈ‹ˆ
+Ù\ÜÚ[Û—ÚY
+Kˆ
+K™™]ÚÛ™J
+BˆYˆØÚ×Ü›ÝÈ\È›Ý›Û™N‚ˆ^\™\×Ø]HØÚ×Ü›ÝÖÈ™^\™\×Ø]—BˆYˆ^\™\×Ø]\È›Û™HÜˆ›Ø]
+^\™\×Ø]
+HH›ÝÎ‚ˆ™]\›ˆ˜[ÙBˆ[]YHÛÛ›‹™^XÝ]Jˆ‘SUH”“ÓHÛÛ\™\ÜÚ[Û—ÛØÚÜÈ‚ˆ•ÒT‘HÙ\ÜÚ[Û—ÚYHÈS‘Û\ˆHÈS‘^\™\×Ø]HÈ‹ˆ
+Ù\ÜÚ[Û—ÚYØÚ×Ü›ÝÖÈšÛ\ˆ—K^\™\×Ø]
+Kˆ
+BˆYˆ[]Yœ›ÝØÛÝ[OHN‚ˆ™]\›ˆ˜[ÙB‚ˆ\]YHÛÛ›‹™^XÝ]Jˆ•TUHÙ\ÜÚ[ÛœÈÑU[™YØ]H•S[™Ü™X\ÛÛˆH•S‚ˆ•ÒT‘HYHÈS‘[™YØ]TÈ“Õ•S‚ˆS‘[™Ü™X\ÛÛˆH	ØÛÛ\™\ÜÚ[Û‰È‹ˆ
+Ù\ÜÚ[Û—ÚY
+Kˆ
+BˆÈ›ÝØÛÝ[OLH\ÈÝX\˜[YYžHH\™[ÑSPÕ]HÜÙ‚ˆÈ\ÈØ[YH‘QÒSˆSSQQPUH˜[œØXÝ[Û‹ˆYˆ\È\È]™\ˆY]YˆÈÈ™]\›ˆ˜[ÙH\Ý\ÈÚ[›ÝH]HX\ÙHSUBˆÈX›Ý™HÚ[Ý[ÓÓSRU
+Ù^XÝ]WÝÜš]HÛÛ[Z]È[›\ÜÈÙÂˆÈ˜Z\Ù\ÊH8 %˜Z\ÙH[œÝXYÙˆ™]\›š[™È˜[ÙHÈ›Û˜XÚË‚ˆ™]\›ˆ\]Yœ›ÝØÛÝ[OHB‚ˆ™]\›ˆ›ÛÛ
+Ù[‹—Ù^XÝ]WÝÜš]JÙÊJB‚ˆYˆX›\ÚØÛÛ\™\ÜÚ[Û—ØÚ[
+ˆÙ[‹ˆ
+‹ˆ\™[ÜÙ\ÜÚ[Û—ÚYˆÝ‹ˆÚ[ÜÙ\ÜÚ[Û—ÚYˆÝ‹ˆÛÝ\˜ÙNˆÝ‹ˆY\ÜØYÙ\Îˆ\ÝÑXÝÜÝ‹[žWWKˆ[Ù[ˆÝˆH›Û™Kˆ[Ù[ØÛÛ™šYÎˆXÝÜÝ‹[žWHH›Û™KˆÞ\Ý[WÜ›Û\ˆÝˆH›Û™KˆÝÙˆÝˆH›Û™Kˆ›Ùš[WÛ˜[YNˆÝˆH›Û™KˆÛÛ\™\ÜÚ[Û—ÛØÚ×ÚÛ\ŽˆÝˆH›Û™Kˆ™\]Z\™WØÛÛ\™\ÜÚ[Û—ÛX\ÙNˆ›ÛÛHYKˆØ]\›X\šÎˆÜ[Û˜[Ú[HH›Û™KˆØ]\›X\š×ØÙZ[[™ÎˆÜ[Û˜[Ú[HH›Û™Kˆ
+HOˆ›Û™N‚ˆˆˆ]ÛZXØ[HÛÜÙHH\™[[™X›\Ú]È\˜X›HÛÛ\™\ÜÚ[ÛˆÚ[‚‚ˆH\™[ÛÜÝ\™KÚ[›ÝË[™ÛÛ\XÝY[™Ù™ˆ™XÛÛYHš\ÚX›H[‚ˆÛ™H˜[œØXÝ[Û‹ˆ™XY\œÈØ[ˆ\™Y›Ü™HØœÙ\™HZ]\ˆH]™H\™[Ü‚ˆHÛÛ\]HÚ[™]™\ˆ[ˆ[™Y\™[Ú]HZ\ÜÚ[™ËÙ[\HÚ[‚‚ˆÛÛ˜Ý\œ™[X\[™ØY™]H
+ÍÍLÌMŠNˆÚ[ˆ
+Ø]\›X\šÊˆ\È›ÝšYY
+Bˆ\™[	ÜÈ›Y]˜Ù]ØXÝ]™WÛY\ÜØYÙWÝØ]\›X\šØØ\\™Y]ÛÛ\™\ÜÚ[Û‚ˆÝ\
+K\™[›ÝÜÈ]\œš]™Y\š[™ÈHÛÝÈÝ[[X\žHØ[ˆ
+YˆØ]\›X\šØ
+H\™HÛÛ™Y[ÈHÚ[Q•TˆH[™Ù™ˆ8 %ˆØ[YH\™KTÔSÛÛ[[ˆÛÛ™H\È›Y]˜\˜Ú]™WØ[™ØÛÛ\XÝÚ]BˆÙ\ÜÚ[ÛˆY™]Üš][ˆ8 %ÛÈHZYXÛÛ\™\ÜÚ[Ûˆ\[™Ý\š]™\È›Ý][Û‚ˆ[œÝXYÙˆÝ˜[™[™È[ˆHÛÜÙY\™[‚‚ˆ
+Ø]\›X\š×ØÙZ[[™Êˆ›Ý[™ÈHÛÛ™Hœ›ÛHX›Ý™NˆH›Ý][Ûˆ]ˆ›\Ú\È]ÈÕÓˆ[‹\\œÚ\ÝY[œ]˜[œØÜš\ÈH\™[šYÚˆ™Y›Ü™HX›\Ú[™È
+ÍÌŒŠK[™ÜÙH›ÝÜÈ\™H[™XYH™\™\Ù[Y[‚ˆHÛÛ\XÝY[™Ù™ˆ8 %ÛÛš[™È[HÛÝ[\XØ]HH˜[œØÜš\‚ˆHØ[\ˆØ\\™\ÈPV
+Y
+X[[YYX][H‘Q“Ô‘H]›\ÚÈÛ›Bˆ›ÝÜÈ[ˆ
+Ø]\›X\šËØ]\›X\š×ØÙZ[[™×X\™H›Ü™ZYÛˆÛÛ˜Ý\œ™[ˆZ[ˆ›Û™XH[˜›Ý[™Y
+›È[\›˜[›\Ú\[™Y
+K‚ˆˆˆ‚ˆYˆÙÊÛÛ›ŠN‚ˆØÚ×Ü›ÝÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕÛ\‹^\™\×Ø]”“ÓHÛÛ\™\ÜÚ[Û—ÛØÚÜÈÒT‘HÙ\ÜÚ[Û—ÚYHÈ‹ˆ
+\™[ÜÙ\ÜÚ[Û—ÚY
+Kˆ
+K™™]ÚÛ™J
+BˆYˆ™\]Z\™WØÛÛ\™\ÜÚ[Û—ÛX\ÙH[™
+ˆØÚ×Ü›ÝÈ\È›Û™BˆÜˆ›ÝÛÛ\™\ÜÚ[Û—ÛØÚ×ÚÛ\‚ˆÜˆØÚ×Ü›ÝÖÈšÛ\ˆ—HOHÛÛ\™\ÜÚ[Û—ÛØÚ×ÚÛ\‚ˆÜˆ›Ø]
+ØÚ×Ü›ÝÖÈ™^\™\×Ø]—JHH[YK[YJ
+Bˆ
+N‚ˆ˜Z\ÙHÛÛ\™\ÜÚ[Û”Ù\ÜÚ[Û\ÞQ\œ›ÜŠˆˆÛÛ\™\ÜÚ[ÛˆX\ÙHÜÝ™Y›Ü™HX›XØ][ÛŽˆÜ\™[ÜÙ\ÜÚ[Û—ÚYH‚ˆ
+Bˆ\™[HÛÛ›‹™^XÝ]Jˆˆˆ”ÑSPÕ[™YØ]ÝÙÚ]Øœ˜[˜ÚÚ]Ü™\×Ü›ÛÝˆ\Ù\—ÚYÙ\ÜÚ[Û—ÚÙ^KÚ]ÚYÚ]Ý\Kˆ™XYÚY\Ü^WÛ˜[YKÜšYÚ[—ÚœÛÛ‹›Ùš[WÛ˜[YBˆ”“ÓHÙ\ÜÚ[ÛœÈÒT‘HYHÈˆˆ‹ˆ
+\™[ÜÙ\ÜÚ[Û—ÚY
+Kˆ
+K™™]ÚÛ™J
+BˆYˆ\™[\È›Û™N‚ˆ˜Z\ÙH[[YQ\œ›ÜŠˆÛÛ\™\ÜÚ[Ûˆ\™[›Ý›Ý[™ˆÜ\™[ÜÙ\ÜÚ[Û—ÚYHŠBˆYˆ\™[È™[™YØ]—H\È›Ý›Û™N‚ˆ˜Z\ÙH[[YQ\œ›ÜŠˆÛÛ\™\ÜÚ[Ûˆ\™[[™XYH[™YˆÜ\™[ÜÙ\ÜÚ[Û—ÚYHŠBˆYˆ›ÝY\ÜØYÙ\Î‚ˆ˜Z\ÙH[[YQ\œ›ÜŠÛÛ\™\ÜÚ[ÛˆÚ[[™Ù™ˆ]\Ý›Ý™H[\HŠBˆÞ\Ý[WÜ›Û\Ú\ÚHÙ[‹—ÜÝÜ™WÜÞ\Ý[WÜ›Û\
+ÛÛ›‹Þ\Ý[WÜ›Û\
+B‚ˆÛÛ›‹™^XÝ]Jˆˆˆ’S”ÑT•S•ÈÙ\ÜÚ[ÛœÈ
+ˆYÛÝ\˜ÙK[Ù[[Ù[ØÛÛ™šYËÞ\Ý[WÜ›Û\ˆÞ\Ý[WÜ›Û\Ú\Úˆ\™[ÜÙ\ÜÚ[Û—ÚYÝÙÚ]Øœ˜[˜ÚÚ]Ü™\×Ü›ÛÝˆ›Ùš[WÛ˜[YK\Ù\—ÚYÙ\ÜÚ[Û—ÚÙ^KÚ]ÚYÚ]Ý\Kˆ™XYÚY\Ü^WÛ˜[YKÜšYÚ[—ÚœÛÛ‹Ý\YØ]ˆ
+HSQTÈ
+ËËËË•SËËËËËËËËËËËËËÊHˆˆ‹ˆ
+ˆÚ[ÜÙ\ÜÚ[Û—ÚYˆÛÝ\˜ÙKˆ[Ù[ˆœÛÛ‹™[\Ê[Ù[ØÛÛ™šYÊHYˆ[Ù[ØÛÛ™šYÈ[ÙH›Û™KˆÞ\Ý[WÜ›Û\Ú\Úˆ\™[ÜÙ\ÜÚ[Û—ÚYˆÝÙÜˆ\™[È˜ÝÙ—Kˆ\™[È™Ú]Øœ˜[˜Ú—Kˆ\™[È™Ú]Ü™\×Ü›ÛÝ—KˆÈØ[YH[š\š][˜ÙHÛÛ˜XÝ\ÈÚ[œÙ\ÜÙ\ÜÚ[Û—Ü›ÝÉÜÂˆÈÛÛ\™\ÜÚ[Û‹Y›ÜšÈ˜XÚÙš[
+ÍNMLÈÈÜ›ÜÜË\›Ùš[H[\ˆÈš^
+NˆHÚ[Ý^\ÈÛˆH\™[	ÜÈ›Ùš[H[™ÙY\ÂˆÈHØ]]Ø^H›Ý][™ËÛÜšYÚ[ˆÛÛ[[œÈÛÈY\ˆ™XÛÝ™\žBˆÈÝ[ÛÜšÜÈY\ˆHÜ˜\Ú]H›Ý[™\žK‚ˆ›Ùš[WÛ˜[YHÜˆ\™[Èœ›Ùš[WÛ˜[YH—Kˆ\™[È\Ù\—ÚY—Kˆ\™[ÈœÙ\ÜÚ[Û—ÚÙ^H—Kˆ\™[È˜Ú]ÚY—Kˆ\™[È˜Ú]Ý\H—Kˆ\™[È™XYÚY—Kˆ\™[È™\Ü^WÛ˜[YH—Kˆ\™[È›ÜšYÚ[—ÚœÛÛˆ—Kˆ[YK[YJ
+Kˆ
+Kˆ
+BˆÝ[ÛY\ÜØYÙ\ËÝ[ÝÛÛØØ[ÈHÙ[‹—Ú[œÙ\ÛY\ÜØYÙWÜ›ÝÜÊˆÛÛ›‹Ú[ÜÙ\ÜÚ[Û—ÚYY\ÜØYÙ\Âˆ
+BˆYˆØ]\›X\šÈ\È›Ý›Û™N‚ˆÈÛÛ™HH\™[	ÜÈÛÛ˜Ý\œ™[Z[
+›ÝÜÈ[™YY\ˆBˆÈØ]\›X\šË]Üˆ™[ÝÈHÙZ[[™È8 %ÙYHØÜÝš[™ÊH[ÈBˆÈÚ[Y\ˆH[™Ù™‹ˆÛÛ[[‹Y^XÝ^Ù\YÜÙ\ÜÚ[Û—ÚYÂˆÈÜšYÚ[˜[ÈÝ^H[ˆH
+ÛÜÙY
+H\™[›Üˆ[™XYÙH™XÛÝ™\žK‚ˆØÙZ[[™×ØÛ]\ÙHHˆ‚ˆÜ\˜[\Îˆ\ÝHÜ\™[ÜÙ\ÜÚ[Û—ÚY[
+Ø]\›X\šÊWBˆYˆØ]\›X\š×ØÙZ[[™È\È›Ý›Û™N‚ˆØÙZ[[™×ØÛ]\ÙHHˆS‘YHÈ‚ˆÜ\˜[\Ë˜\[™
+[
+Ø]\›X\š×ØÙZ[[™ÊJBˆZ[Ü›ÝÜÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕYÛÛØØ[È”“ÓHY\ÜØYÙ\È‚ˆ•ÒT‘HÙ\ÜÚ[Û—ÚYHÈS‘XÝ]™HHHS‘YˆÈ‚ˆˆž×ØÙZ[[™×ØÛ]\Ù_HÔ‘Tˆ–HY‹ˆÜ\˜[\Ëˆ
+K™™]Ú[
+
+BˆYˆZ[Ü›ÝÜÎ‚ˆZ[ÚYÈHÚ[
+–ÈšY—JH›Üˆˆ[ˆZ[Ü›ÝÜ×BˆXÙZÛ\œÈH‹‹š›Ú[ŠÈˆ›ÜˆÈ[ˆZ[ÚYÊBˆÛÛ™WØÛÛÈHÂˆÈ›ÜˆÈ[ˆÙ[‹—ÛY\ÜØYÙWØÛÛ[[—Û˜[Y\ÊÛÛ›ŠBˆYˆÈ›Ý[ˆ
+šY‹œÙ\ÜÚ[Û—ÚY‹˜XÝ]™H‹˜ÛÛ\XÝYŠBˆBˆÛÛÛ\ÝH‹‹š›Ú[ŠÛÛ™WØÛÛÊBˆÛÛ›‹™^XÝ]Jˆˆ’S”ÑT•S•ÈY\ÜØYÙ\È
+ØÛÛÛ\ÝKÙ\ÜÚ[Û—ÚYXÝ]™KÛÛ\XÝY
+H‚ˆˆ”ÑSPÕØÛÛÛ\ÝKËK”“ÓHY\ÜØYÙ\È‚ˆˆ•ÒT‘HYSˆ
+ÜXÙZÛ\œßJHÔ‘Tˆ–HY‹ˆØÚ[ÜÙ\ÜÚ[Û—ÚY
+Z[ÚY×Kˆ
+BˆÝ[ÛY\ÜØYÙ\È
+ÏH[ŠZ[ÚYÊBˆ›Üˆˆ[ˆZ[Ü›ÝÜÎ‚ˆ˜]ÈH–ÈÛÛØØ[È—BˆYˆ˜]Î‚ˆžN‚ˆ\œÙYHœÛÛ‹›ØYÊ˜]ÊHYˆ\Ú[œÝ[˜ÙJ˜]ËÝŠH[ÙH˜]ÂˆÝ[ÝÛÛØØ[È
+ÏH[Š\œÙY
+HYˆ\Ú[œÝ[˜ÙJ\œÙY\Ý
+H[ÙHˆ^Ù\
+\Q\œ›Ü‹˜[YQ\œ›ÜŠN‚ˆ\ÜÂˆÛÛ›‹™^XÝ]Jˆ•TUHÙ\ÜÚ[ÛœÈÑUY\ÜØYÙWØÛÝ[HËÛÛØØ[ØÛÝ[HÈÒT‘HYHÈ‹ˆ
+Ý[ÛY\ÜØYÙ\ËÝ[ÝÛÛØØ[ËÚ[ÜÙ\ÜÚ[Û—ÚY
+Kˆ
+Bˆ\]YHÛÛ›‹™^XÝ]Jˆ•TUHÙ\ÜÚ[ÛœÈÑU[™YØ]HË[™Ü™X\ÛÛˆH	ØÛÛ\™\ÜÚ[Û‰È‚ˆ•ÒT‘HYHÈS‘[™YØ]TÈ•S‹ˆ
+[YK[YJ
+K\™[ÜÙ\ÜÚ[Û—ÚY
+Kˆ
+BˆYˆ\]Yœ›ÝØÛÝ[OHN‚ˆ˜Z\ÙH[[YQ\œ›ÜŠˆˆÛÛ\™\ÜÚ[Ûˆ\™[Ú[™ÙY\š[™ÈX›XØ][ÛŽˆÜ\™[ÜÙ\ÜÚ[Û—ÚYH‚ˆ
+B‚ˆÙ[‹—Ù^XÝ]WÝÜš]JÙÊB‚ˆYˆ[™ÜÙ\ÜÚ[ÛŠÙ[‹Ù\ÜÚ[Û—ÚYˆÝ‹[™Ü™X\ÛÛŽˆÝŠHOˆ›Û™N‚ˆˆˆ“X\šÈHÙ\ÜÚ[Ûˆ\È[™Y‚‚ˆ›Ë[ÜÈÚ[ˆHÙ\ÜÚ[Ûˆ\È[™XYH[™YˆHš\œÝ[™Ü™X\ÛÛˆÚ[œÎ‚ˆÛÛ\™\ÜÚ[Û‹\Ü]Ù\ÜÚ[ÛœÈ]\ÝÙY\Z\ˆ[™Ü™X\ÛÛˆH	ØÛÛ\™\ÜÚ[Û‰Øˆ™XÛÜ™]™[ˆYˆH]\ˆÝ[H[™ÜÙ\ÜÚ[ÛŠ
+XØ[
+K™Ëˆœ›ÛHBˆ\Þ[˜ÙYÓHÙ\ÜÚ[Û—ÚYY\ˆÜ™\Ý[YXÜˆØœ˜[˜Ú
+H\™Ù]È[BˆÚ]HY™™\™[™X\ÛÛ‹ˆ\ÙH™[Ü[—ÜÙ\ÜÚ[ÛŠ
+Xš\œÝYˆ[ÝBˆ[[[Û˜[H™YYÈ™KY[™HÛÜÙYÙ\ÜÚ[ÛˆÚ]H™]È™X\ÛÛ‹‚ˆˆˆ‚ˆÙ[‹—Ù^XÝ]WÝÜš]J[X™HÛÛ›ŽˆÙ[‹—Ù[™Ø[™Ø[\
+ˆÛÛ›‹ˆ•TUHÙ\ÜÚ[ÛœÈÑU[™YØ]HË[™Ü™X\ÛÛˆHÈ‚ˆ•ÒT‘HYHÈS‘[™YØ]TÈ•S‹ˆ
+[YK[YJ
+K[™Ü™X\ÛÛ‹Ù\ÜÚ[Û—ÚY
+KˆÙ\ÜÚ[Û—ÚYˆ[™Ü™X\ÛÛ‹ˆ
+JB‚ˆYˆ™[Ü[—ÜÙ\ÜÚ[ÛŠÙ[‹Ù\ÜÚ[Û—ÚYˆÝŠHOˆ›Û™N‚ˆˆˆÛX\ˆ[™YØ]Ù[™Ü™X\ÛÛˆÛÈHÙ\ÜÚ[ÛˆØ[ˆ™H™\Ý[YY‚‚ˆ™Y›Ü™HÛX\š[™ÈH™\Ù]›Ý[™\žKÝXš[^™HX\šÙ\›\ÜÈYØXÞH™\Ù]ˆÚ[™[ˆ]Ý[\[™ÛˆH\™[	ÜÈ]]X›H[™Ü™X\ÛÛ‹‚ˆˆˆ‚ˆYˆÙÊÛÛ›ŠN‚ˆXÙZÛ\œÈH‹‹š›Ú[ŠÈˆ›ÜˆÈ[ˆÔ‘TÑUÑS‘Ô‘PTÓÓ”ÊBˆÈÒT‘HÚ\HÚ\™YÚ]Ô‘TÑUÐÒSÔÔS	ÜÈ˜[˜XÚÈ\›HšXBˆÈÛYØXÞWÜ™\Ù]ØÚ[ÜÜ[ÛÈHÝ[\[™È[™H\Ý[™ÂˆÈ™YXØ]HØ[››ÝšY‚ˆÛÛ›‹™^XÝ]Jˆ•TUHÙ\ÜÚ[ÛœÈTÈÚ[ÑU[Ù[ØÛÛ™šYÈHœÛÛ—ÜÙ]
+‚ˆÓÐSTÐÑJÚ[›[Ù[ØÛÛ™šYË	ÞßIÊK	É—Ü™\Ù]Ùœ›ÛIË‚ˆ˜Ú[œ\™[ÜÙ\ÜÚ[Û—ÚY
+H‚ˆ•ÒT‘HÚ[œ\™[ÜÙ\ÜÚ[Û—ÚYHÈ‚ˆS‘œÛÛ—Ù^˜XÝ
+ÓÐSTÐÑJÚ[›[Ù[ØÛÛ™šYË	ÞßIÊK‚ˆˆ	É—Ü™\Ù]Ùœ›ÛIÊHTÈ•S‚ˆˆS‘×ÛYØXÞWÜ™\Ù]ØÚ[ÜÜ[
+	ØÚ[	ËXÙZÛ\œÊ_H‹ˆ
+Ù\ÜÚ[Û—ÚY
+—Ô‘TÑUÑS‘Ô‘PTÓÓ”ÊKˆ
+BˆÛÛ›‹™^XÝ]Jˆ•TUHÙ\ÜÚ[ÛœÈÑU[™YØ]H•S[™Ü™X\ÛÛˆH•SÒT‘HYHÈ‹ˆ
+Ù\ÜÚ[Û—ÚY
+Kˆ
+BˆÙ[‹—Ù^XÝ]WÝÜš]JÙÊB‚ˆYˆ›Û[ÝWÝ×ÜÙ\ÜÚ[Û—Ü™\Ù]
+ˆÙ[‹Ù\ÜÚ[Û—ÚYˆÝ‹™X\ÛÛŽˆÝˆHœÙ\ÜÚ[Û—Ü™\Ù]‚ˆ
+HOˆ›ÛÛ‚ˆˆˆ‘\˜X›HX\šÈHÙ\ÜÚ[Ûˆ\È[™YžH[ˆ[[[Û˜[™\Ù]›Ý[™\žK‚‚ˆ›Û[Ý\È
+›Û›Jˆ]™H›ÝÜÈ
+[™YØ]TÈ•S
+HÜˆ›ÝÜÈØ\œžZ[™È[‚ˆXØÚY[[[™Ü™X\ÛÛˆ]H™XÛÝ™\žH]Y\žBˆ
+š[™Û]\ÝÙØ]]Ø^WÜÙ\ÜÚ[Û—Ù›Ü—ÜY\˜
+H™X]È\È™XÛÝ™\˜X›N‚ˆYÙ[ØÛÜÙX
+Û\ˆØ]]Ø^HÛX[\YÊH[™Ü×ÛÜœ[—Ü™X\ˆ
+Z\ÝZÙ[ˆRH™X\\ŠKˆ^XÚ]ÛÛ™\œØ][Ûˆ›Ý[™\šY\ÈÝXÚ\ÂˆÛÛ\™\ÜÚ[Û˜Ù\ÜÚ[Û—Ü™\Ù]Ù\ÜÚ[Û—ÜÝÚ]Ú]Ëˆ\™Bˆ™\Ù\™Y8 %Hš\œÝÜš]\ˆÚ[œÈ›ÜˆÜÙK[™H]\ˆ^\žBˆš[˜[^˜][Ûˆ]\Ý›ÝÚ[[HÝ™\Üš]H[K‚‚ˆZ[ˆ[™ÜÙ\ÜÚ[ÛŠ
+X\È“ÕÝY™šXÚY[›Üˆ™\Ù]›Ý[™\šY\Îˆ]ˆ›Ë[ÜÈÛˆ[ˆ[™XYKY[™Y›ÝËÛÈH›ÝÈ]YÙ[ÛX[\[™XYBˆÛÜÙY\ÈYÙ[ØÛÜÙXÛÝ[Ý^H™XÛÝ™\˜X›H[™Ý[K\›Ý]Bˆ™XÛÝ™\žHÛÝ[™\Ý\œ™XÝH™\Ù]Ù\ÜÚ[ÛˆÚ]]È[\ÝÜžBˆ
+ÍŒLŒŒÍŒNNLËÍŒÍLÎJK‚‚ˆÙY\\È›Û[Ý[ÛˆÙ][ˆÞ[˜ÈÚ]H™XÛÝ™\˜X›HÙ][‚ˆš[™Û]\ÝÙØ]]Ø^WÜÙ\ÜÚ[Û—Ù›Ü—ÜY\˜8 %[žH™X\ÛÛˆ™XÛÝ™\žHÛÝ[ˆ™[Ü[ˆ]\Ý™H›Û[ÝX›H\™K‚‚ˆ™X\ÛÛ˜]È™\Ù]]ÈÙY\Z\ˆ]Y]X›HÜXÚYšXÈ™X\ÛÛœÂˆ
+YXZ[XÝ\Ü[™Y™\Ý[YWÜ[™[™×Ù^\™Y
+K‚‚ˆ™]\›œÈYXÚ[ˆH›ÝÈØ\È›Û[ÝY˜[ÙXÚ[ˆÚÚ\Yˆ
+[™XYH\ÈHY™™\™[^XÚ][™Ü™X\ÛÛ‹Üˆ›ÝÈ›Ý›Ý[™
+K‚ˆˆˆ‚ˆYˆ›ÝÙ\ÜÚ[Û—ÚY‚ˆ™]\›ˆ˜[ÙBˆ›ÝÈH[YK[YJ
+B‚ˆžN‚ˆ›ÝÜÈHÙ[‹—Ù^XÝ]WÝÜš]J[X™HÛÛ›ŽˆÙ[‹—Ù[™Ø[™Ø[\
+ˆÛÛ›‹ˆ•TUHÙ\ÜÚ[ÛœÈÑU[™YØ]HË[™Ü™X\ÛÛˆHÈ‚ˆ•ÒT‘HYHÈS‘
+[™YØ]TÈ•S‚ˆˆ“Ôˆ[™Ü™X\ÛÛˆSˆ
+×Ô‘PÓÕ‘TP“WÑS‘Ô‘PTÓÓ”×ÔÔSJJH‹ˆ
+›ÝË™X\ÛÛ‹Ù\ÜÚ[Û—ÚY
+KˆÙ\ÜÚ[Û—ÚYˆ™X\ÛÛ‹ˆ
+JBˆ™]\›ˆ›ÛÛ
+›ÝÜÊBˆ^Ù\^Ù\[ÛŽ‚ˆ™]\›ˆ˜[ÙB‚ˆYˆ\]WÜÙ\ÜÚ[Û—ØÝÙ
+ˆÙ[‹ˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆÝÙˆÝ‹ˆÚ]Øœ˜[˜ÚˆÜ[Û˜[ÜÝ—HH›Û™KˆÚ]Ü™\×Ü›ÛÝˆÜ[Û˜[ÜÝ—HH›Û™Kˆ™\XÙWÙÚ]ÛY]Nˆ›ÛÛH˜[ÙKˆ
+HOˆÜ[Û˜[Ú[N‚ˆˆˆ”\œÚ\ÝH]]Üš]]]™HÝÙ[™ÛZ[HHÚ]Y]Y]HÙ[™\˜][Û‹‚‚ˆÚ]Øœ˜[˜Ú™XÛÜ™ÈHÚ]œ˜[˜ÚÚXÚÙYÝ][ˆÝÙ]H[YBˆHÙ\ÜÚ[ÛˆÝ\YÜ™\Ý[YYˆHÚYX˜\ˆÜ›Ý\ÈXZ[‹XÚXÚÛÝ]Ù\ÜÚ[ÛœÂˆžH\ÈÛÈ™X]\™KXœ˜[˜ÚÛÜšÈÙ\Û‰Ý[H[™\ˆHÚ[™ÛH›XZ[ˆˆ›ÝÂˆ
+HXZ[ˆÚXÚÛÝ]	ÜÈ
+˜Ý\œ™[
+ˆœ˜[˜Ú\È˜[œÚY[[™ÛÝ[ˆZ\Ø]šX]H\ÝÙ\ÜÚ[ÛœÊK‚‚ˆÚ]Ü™\×Ü›ÛÝ™XÛÜ™ÈHÚ]™\È\ÈÝÙ™[Û™ÜÈÈ8 %Bˆ]]Üš]]]™H›Ú™XÝÙ^Kˆ™\ÛÛš[™È]\™K]HÝÙ\Ý]™[YX[œÂˆ]™\žHÝ\™˜XÙH™XYÈHØ[YHY[X™\œÚ\[œÝXYÙˆ™K\›Øš[™ÈÚ][ˆBˆÕRHÝ™\ˆH\X[YÙKˆXXÚšY[\ÈÛ›HÜš][ˆÚ[ˆ›Û‹Y[\HÛÈBˆ›Ø™H˜Z[\™H™]™\ˆÛØ˜™\œÈH™]š[Ý\ÛKXØ\\™Y˜[YK‚‚ˆ™\XÙWÙÚ]ÛY]X[™\È]›Û‹Y[\H[NˆH[X™\˜]HÛÜšÜÜXÙBˆSÕ‘H
+™KZÛZ[™ÈHÙ\ÜÚ[Ûˆ[È[›Ý\ˆ›Ú™XÝ
+H]\ÝÝ™\Üš]HHÛˆ™\ÈY[]H]™[ˆÚ[ˆH™]ÈÝÙ™\ÛÛ™\ÈÈ›Û™H8 %ÙY\[™ÈHÝ[Bˆ›ÛÝÛÝ[X]™HHÙ\ÜÚ[ÛˆÜ›Ý\Y[™\ˆH›Ú™XÝ]\ÝY‚‚ˆ]™\žHØ[[˜Ü™[Y[ÈÚ]ÛY]Y]WÙÙ[™\˜][Û˜[ˆHØ[YHÜš]Bˆ˜[œØXÝ[Û‹ˆ\Þ[˜ÈÚ]›Ø™\È]\ÝX›\Ú›ÝYÚˆ›Y]˜X›\ÚÜÙ\ÜÚ[Û—ÙÚ]ÛY]Y]XÚ]H™]\›™YÙ[™\˜][Û‹ÛÂˆ[ˆÛ\ˆÛÜšÙ\ˆØ[››ÝÝ™\Üš]HH™]Ù\ˆÝÙÛZ[H]™[ˆY\ˆ[‚ˆHOˆˆOˆH˜[œÚ][ÛˆÜˆœ›ÛH[›Ý\ˆ›ØÙ\ÜÈÚ\š[™È\È]X˜\ÙK‚ˆY]Y]Hœ›ÛHHY™™\™[ÝÙ\ÈÛX\™Y]ÛZXØ[HÚ]H[Ý™K‚ˆˆˆ‚ˆYˆ›ÝÙ\ÜÚ[Û—ÚYÜˆ›ÝÝÙ‚ˆ™]\›ˆ›Û™B‚ˆœ˜[˜ÚH
+Ú]Øœ˜[˜ÚÜˆˆŠKœÝš\
+
+Bˆ™\×Ü›ÛÝH
+Ú]Ü™\×Ü›ÛÝÜˆˆŠKœÝš\
+
+B‚ˆYˆÙÊÛÛ›ŠN‚ˆÝ\œ™[HÛÛ›‹™^XÝ]Jˆ”ÑSPÕÝÙ”“ÓHÙ\ÜÚ[ÛœÈÒT‘HYHÈ‹
+Ù\ÜÚ[Û—ÚY
+Bˆ
+K™™]ÚÛ™J
+BˆYˆÝ\œ™[\È›Û™N‚ˆ™]\›ˆ›Û™B‚ˆÝ\œ™[ØÝÙHÝ\œ™[È˜ÝÙ—HYˆ\Ú[œÝ[˜ÙJÝ\œ™[Ü[]LË”›ÝÊH[ÙHÝ\œ™[ÌBˆÙ]ÈHÂˆ˜ÝÙHÈ‹ˆ™Ú]ÛY]Y]WÙÙ[™\˜][ÛˆHÓÐSTÐÑJÚ]ÛY]Y]WÙÙ[™\˜][Û‹
+H
+ÈH‹ˆBˆ\˜[\Îˆ\ÝÐ[žWHHØÝÙBˆYˆÝ\œ™[ØÝÙOHÝÙÜˆ™\XÙWÙÚ]ÛY]N‚ˆÙ]Ë™^[™
+
+™Ú]Øœ˜[˜ÚHÈ‹™Ú]Ü™\×Ü›ÛÝHÈŠJBˆ\˜[\Ë™^[™
+
+œ˜[˜ÚÜˆ›Û™K™\×Ü›ÛÝÜˆ›Û™JJBˆ[Yˆœ˜[˜Ú‚ˆÙ]Ë˜\[™
+™Ú]Øœ˜[˜ÚHÈŠBˆ\˜[\Ë˜\[™
+œ˜[˜Ú
+BˆYˆ™\×Ü›ÛÝ[™Ý\œ™[ØÝÙOHÝÙ[™›Ý™\XÙWÙÚ]ÛY]N‚ˆÙ]Ë˜\[™
+™Ú]Ü™\×Ü›ÛÝHÈŠBˆ\˜[\Ë˜\[™
+™\×Ü›ÛÝ
+Bˆ\˜[\Ë˜\[™
+Ù\ÜÚ[Û—ÚY
+BˆÛÛ›‹™^XÝ]Jˆˆ•TUHÙ\ÜÚ[ÛœÈÑUÉË	Ëš›Ú[ŠÙ]Ê_HÒT‘HYHÈ‹\˜[\Âˆ
+Bˆ›ÝÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕÚ]ÛY]Y]WÙÙ[™\˜][Ûˆ”“ÓHÙ\ÜÚ[ÛœÈÒT‘HYHÈ‹ˆ
+Ù\ÜÚ[Û—ÚY
+Kˆ
+K™™]ÚÛ™J
+BˆYˆ›ÝÈ\È›Û™N‚ˆ™]\›ˆ›Û™Bˆ˜[YHH›ÝÖÈ™Ú]ÛY]Y]WÙÙ[™\˜][Ûˆ—HYˆ\Ú[œÝ[˜ÙJ›ÝËÜ[]LË”›ÝÊH[ÙH›ÝÖÌBˆ™]\›ˆ[
+˜[YJB‚ˆ™]\›ˆÙ[‹—Ù^XÝ]WÝÜš]JÙÊB‚ˆYˆX›\ÚÜÙ\ÜÚ[Û—ÙÚ]ÛY]Y]JˆÙ[‹ˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆÝÙˆÝ‹ˆÙ[™\˜][ÛŽˆ[ˆÚ]Øœ˜[˜ÚˆÜ[Û˜[ÜÝ—HH›Û™KˆÚ]Ü™\×Ü›ÛÝˆÜ[Û˜[ÜÝ—HH›Û™Kˆ
+HOˆ›ÛÛ‚ˆˆˆ”X›\Ú\Þ[˜ÈÚ][œšXÚY[Û›HÚ[H]ÈÝÙÛZ[H\ÈÝ\œ™[ˆˆˆ‚ˆYˆ
+ˆ›ÝÙ\ÜÚ[Û—ÚYˆÜˆ›ÝÝÙˆÜˆ\Ú[œÝ[˜ÙJÙ[™\˜][Û‹›ÛÛ
+BˆÜˆ›Ý\Ú[œÝ[˜ÙJÙ[™\˜][Û‹[
+BˆÜˆÙ[™\˜][ÛˆBˆ
+N‚ˆ™]\›ˆ˜[ÙB‚ˆœ˜[˜ÚH
+Ú]Øœ˜[˜ÚÜˆˆŠKœÝš\
+
+Bˆ™\×Ü›ÛÝH
+Ú]Ü™\×Ü›ÛÝÜˆˆŠKœÝš\
+
+BˆYˆ›Ýœ˜[˜Ú[™›Ý™\×Ü›ÛÝ‚ˆ™]\›ˆ˜[ÙB‚ˆÙ]Îˆ\ÝÜÝ—HH×Bˆ\˜[\Îˆ\ÝÐ[žWHH×BˆYˆœ˜[˜Ú‚ˆÙ]Ë˜\[™
+™Ú]Øœ˜[˜ÚHÈŠBˆ\˜[\Ë˜\[™
+œ˜[˜Ú
+BˆYˆ™\×Ü›ÛÝ‚ˆÙ]Ë˜\[™
+™Ú]Ü™\×Ü›ÛÝHÈŠBˆ\˜[\Ë˜\[™
+™\×Ü›ÛÝ
+Bˆ\˜[\Ë™^[™
+
+Ù\ÜÚ[Û—ÚYÝÙÙ[™\˜][ÛŠJB‚ˆYˆÙÊÛÛ›ŠN‚ˆÝ\œÛÜˆHÛÛ›‹™^XÝ]Jˆˆ•TUHÙ\ÜÚ[ÛœÈÑUÉË	Ëš›Ú[ŠÙ]Ê_H‚ˆ•ÒT‘HYHÈS‘ÝÙHÈ‚ˆS‘Ú]ÛY]Y]WÙÙ[™\˜][ÛˆHÈ‹ˆ\˜[\Ëˆ
+Bˆ™]\›ˆÝ\œÛÜ‹œ›ÝØÛÝ[OHB‚ˆ™]\›ˆ›ÛÛ
+Ù[‹—Ù^XÝ]WÝÜš]JÙÊJB‚ˆYˆ˜XÚÙš[Ü™\×Ü›ÛÝÊÙ[‹ÝÙÝ×Ü›ÛÝˆXÝÜÝ‹Ý—JHOˆ›Û™N‚ˆˆˆ”\œÚ\Ý™\ÛÛ™YÚ]™\È›ÛÝÈ›ÜˆÝÙÈ]Û‰Ý]™HÛ™HY]‚‚ˆ˜XÚÙš[È\ÝÜžHÛÈ›Ú™XÝÈYÚ\›ÜˆÙ\ÜÚ[ÛœÈÜ™X]Y™Y›Ü™HBˆÛÛ[[ˆ^\ÝYÚ]Ý]ÛØ˜™\š[™È[ˆ[™XYK\™XÛÜ™Y›ÛÝˆÛ›Bˆ›Û‹Y[\H›ÛÝÈ\™HÜš][ˆ
+H›Û‹YÚ]ÝÙÝ^\È•S
+K‚ˆˆˆ‚ˆZ\œÈHÊ›ÛÝÝÙ
+H›ÜˆÝÙ›ÛÝ[ˆÝÙÝ×Ü›ÛÝš][\Ê
+HYˆ›ÛÝ[™ÝÙBˆYˆ›ÝZ\œÎ‚ˆ™]\›‚‚ˆYˆÙÊÛÛ›ŠN‚ˆ›Üˆ›ÛÝÝÙ[ˆZ\œÎ‚ˆÛÛ›‹™^XÝ]Jˆ•TUHÙ\ÜÚ[ÛœÈÑUÚ]Ü™\×Ü›ÛÝHÈ‚ˆ•ÒT‘HÝÙHÈS‘ÓÐSTÐÑJÚ]Ü™\×Ü›ÛÝ	ÉÊHH	ÉÈ‹ˆ
+›ÛÝÝÙ
+Kˆ
+B‚ˆÙ[‹—Ù^XÝ]WÝÜš]JÙÊB‚ˆYˆ™XÛÜ™ØÛÛ\™\ÜÚ[Û—Ù˜Z[\™WØÛÛÛÝÛŠˆÙ[‹ˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆÛÛÛÝÛ—Ý[[ˆ›Ø]ˆ\œ›ÜŽˆÜ[Û˜[ÜÝ—HH›Û™Kˆ
+HOˆ›Û™N‚ˆˆˆ”\œÚ\ÝHXÝ]™HÛÛ\™\ÜÚ[Û‹Y˜Z[\™HÛÛÛÝÛˆ›ÜˆHÙ\ÜÚ[Û‹‚‚ˆÛÛÛÝÛˆXY[™\ÈY\™ÙHžHX^[][NˆH]\‹ÚÜ\ˆ˜Z[\™HÚYÛ˜[ˆ]\Ý›Ý™[Ü[ˆHÚ[™ÝÈ[™XYHÛÜÙYžHHÛ™Ù\ˆ[Y[Ý]‚ˆˆˆ‚ˆYˆ›ÝÙ\ÜÚ[Û—ÚY‚ˆ™]\›‚‚ˆYˆÙÊÛÛ›ŠN‚ˆÛÛ›‹™^XÝ]Jˆ•TUHÙ\ÜÚ[ÛœÈÑUÛÛ\™\ÜÚ[Û—Ù˜Z[\™WØÛÛÛÝÛ—Ý[[HÐTÑH‚ˆ•ÒSˆÛÛ\™\ÜÚ[Û—Ù˜Z[\™WØÛÛÛÝÛ—Ý[[TÈ“Õ•S‚ˆS‘ÛÛ\™\ÜÚ[Û—Ù˜Z[\™WØÛÛÛÝÛ—Ý[[ˆÈ‚ˆ•SˆÛÛ\™\ÜÚ[Û—Ù˜Z[\™WØÛÛÛÝÛ—Ý[[SÑHÈS‘‚ˆ˜ÛÛ\™\ÜÚ[Û—Ù˜Z[\™WÙ\œ›ÜˆHÈÒT‘HYHÈ‹ˆ
+ÛÛÛÝÛ—Ý[[ÛÛÛÝÛ—Ý[[\œ›Ü‹Ù\ÜÚ[Û—ÚY
+Kˆ
+B‚ˆžN‚ˆÙ[‹—Ù^XÝ]WÝÜš]JÙÊBˆ^Ù\Ü[]LË‘\œ›Üˆ\È^Î‚ˆÙÙÙ\‹Ø\›š[™Êˆœ™XÛÜ™ØÛÛ\™\ÜÚ[Û—Ù˜Z[\™WØÛÛÛÝÛŠ	\ÊH˜Z[Yˆ	\È‹ˆÙ\ÜÚ[Û—ÚY^Ëˆ
+B‚ˆYˆÙ]ØÛÛ\™\ÜÚ[Û—Ù˜Z[\™WØÛÛÛÝÛŠˆÙ[‹ˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆ
+HOˆÜ[Û˜[ÑXÝÜÝ‹[žWWN‚ˆˆˆ”™]\›ˆHXÝ]™HÛÛ\™\ÜÚ[Û‹Y˜Z[\™HÛÛÛÝÛˆ›ÜˆÙ\ÜÚ[Û—ÚYˆˆˆ‚ˆYˆ›ÝÙ\ÜÚ[Û—ÚY‚ˆ™]\›ˆ›Û™Bˆ›ÝÈH[YK[YJ
+BˆÚ]Ù[‹—Ü™XYØÝ
+
+H\ÈÛÛ›Ž‚ˆ›ÝÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕÛÛ\™\ÜÚ[Û—Ù˜Z[\™WØÛÛÛÝÛ—Ý[[ÛÛ\™\ÜÚ[Û—Ù˜Z[\™WÙ\œ›Üˆ‚ˆ‘”“ÓHÙ\ÜÚ[ÛœÈÒT‘HYHÈ‹ˆ
+Ù\ÜÚ[Û—ÚY
+Kˆ
+K™™]ÚÛ™J
+BˆYˆ›ÝÈ\È›Û™N‚ˆ™]\›ˆ›Û™BˆÛÛÛÝÛ—Ý[[H
+ˆ›ÝÖÈ˜ÛÛ\™\ÜÚ[Û—Ù˜Z[\™WØÛÛÛÝÛ—Ý[[—BˆYˆ\Ú[œÝ[˜ÙJ›ÝËÜ[]LË”›ÝÊBˆ[ÙH›ÝÖÌBˆ
+BˆYˆÛÛÛÝÛ—Ý[[\È›Û™N‚ˆ™]\›ˆ›Û™BˆÛÛÛÝÛ—Ý[[H›Ø]
+ÛÛÛÝÛ—Ý[[
+BˆYˆÛÛÛÝÛ—Ý[[H›ÝÎ‚ˆ™]\›ˆ›Û™Bˆ\œ›ÜˆH
+ˆ›ÝÖÈ˜ÛÛ\™\ÜÚ[Û—Ù˜Z[\™WÙ\œ›Üˆ—BˆYˆ\Ú[œÝ[˜ÙJ›ÝËÜ[]LË”›ÝÊBˆ[ÙH›ÝÖÌWBˆ
+Bˆ™]\›ˆÂˆ˜ÛÛÛÝÛ—Ý[[ŽˆÛÛÛÝÛ—Ý[[ˆœ™[XZ[š[™×ÜÙXÛÛ™ÈŽˆÛÛÛÝÛ—Ý[[H›ÝËˆ™\œ›ÜˆŽˆ\œ›Ü‹ˆB‚ˆYˆÙ]ØÛÛ\™\ÜÚ[Û—Ù˜Z[\™WØÛÛÛÝÛ—Ü›ÝÊˆÙ[‹ˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆ
+HOˆXÝÜÝ‹[žWN‚ˆˆˆ”™]\›ˆH^XÝÝÜ™YÛÛÛÝÛˆÛÛ[[œÈÚ]Ý]^\žHš[\š[™Ë‚‚ˆÛÛ\™\ÜÚ[ÛˆØ[˜Ù[][Ûˆ\Ù\È\È[™\ˆ]ÈÙ\ÜÚ[ÛˆX\ÙHÛÈ›Û˜XÚÂˆØ[ˆ™\Ù\™H[ˆ^\™Y›ÝËH\X[K[[›ÝËÜˆ[ˆXœÙ[Ù\ÜÚ[Û‚ˆ^XÝH[œÝXYÙˆÛÛ™\[™ÈÜÙHÝ]\È›ÝYÚHXÝ]™KXÛÛÛÝÛ‚ˆTK‚ˆˆˆ‚ˆYˆ›ÝÙ\ÜÚ[Û—ÚY‚ˆ™]\›ˆÈœÙ\ÜÚ[Û—Ù^\ÝÈŽˆ˜[ÙK˜ÛÛÛÝÛ—Ý[[Žˆ›Û™K™\œ›ÜˆŽˆ›Û™_BˆÚ]Ù[‹—Ü™XYØÝ
+
+H\ÈÛÛ›Ž‚ˆ›ÝÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕÛÛ\™\ÜÚ[Û—Ù˜Z[\™WØÛÛÛÝÛ—Ý[[ÛÛ\™\ÜÚ[Û—Ù˜Z[\™WÙ\œ›Üˆ‚ˆ‘”“ÓHÙ\ÜÚ[ÛœÈÒT‘HYHÈ‹ˆ
+Ù\ÜÚ[Û—ÚY
+Kˆ
+K™™]ÚÛ™J
+BˆYˆ›ÝÈ\È›Û™N‚ˆ™]\›ˆÈœÙ\ÜÚ[Û—Ù^\ÝÈŽˆ˜[ÙK˜ÛÛÛÝÛ—Ý[[Žˆ›Û™K™\œ›ÜˆŽˆ›Û™_BˆÛÛÛÝÛ—Ý[[H
+ˆ›ÝÖÈ˜ÛÛ\™\ÜÚ[Û—Ù˜Z[\™WØÛÛÛÝÛ—Ý[[—BˆYˆ\Ú[œÝ[˜ÙJ›ÝËÜ[]LË”›ÝÊBˆ[ÙH›ÝÖÌBˆ
+Bˆ\œ›ÜˆH
+ˆ›ÝÖÈ˜ÛÛ\™\ÜÚ[Û—Ù˜Z[\™WÙ\œ›Üˆ—BˆYˆ\Ú[œÝ[˜ÙJ›ÝËÜ[]LË”›ÝÊBˆ[ÙH›ÝÖÌWBˆ
+Bˆ™]\›ˆÂˆœÙ\ÜÚ[Û—Ù^\ÝÈŽˆYKˆ˜ÛÛÛÝÛ—Ý[[Žˆ
+ˆ›Ø]
+ÛÛÛÝÛ—Ý[[
+HYˆÛÛÛÝÛ—Ý[[\È›Ý›Û™H[ÙH›Û™Bˆ
+Kˆ™\œ›ÜˆŽˆ\œ›Ü‹ˆB‚ˆYˆ™\ÝÜ™WØÛÛ\™\ÜÚ[Û—Ù˜Z[\™WØÛÛÛÝÛ—Ü›ÝÊˆÙ[‹ˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆÛ˜\ÚÝˆXÝÜÝ‹[žWKˆ
+HOˆ›Û™N‚ˆˆˆ”™\ÝÜ™H[™™\šYžH[ˆ^XÝÛÛÛÝÛ‹\›ÝÈÛ˜\ÚÝ‚‚ˆ[›ZÙHHÜ™[˜\žH™XÛÜ™ØÛX\ˆ[\œË\È˜[œØXÝ[Û˜[›Û˜XÚÂˆTH[X™\˜][H›ÜYØ]\ÈÜš]H[™™\šYšXØ][Ûˆ˜Z[\™\ËˆHØ[\‚ˆ]\Ý›Ý™\ÜØ[˜Ù[][Ûˆ\È]]][Û‹Yœ™YHÚ[ˆÛÛ\[œØ][Ûˆ˜Z[Y‚ˆˆˆ‚ˆ^XÝYÙ^\ÝÈH›ÛÛ
+Û˜\ÚÝ™Ù]
+œÙ\ÜÚ[Û—Ù^\ÝÈ‹˜[ÙJJBˆYˆ›Ý^XÝYÙ^\ÝÎ‚ˆXÝX[HÙ[‹™Ù]ØÛÛ\™\ÜÚ[Û—Ù˜Z[\™WØÛÛÛÝÛ—Ü›ÝÊÙ\ÜÚ[Û—ÚY
+BˆYˆXÝX[™Ù]
+œÙ\ÜÚ[Û—Ù^\ÝÈ‹˜[ÙJN‚ˆ˜Z\ÙH[[YQ\œ›ÜŠˆ˜Ø[››Ý™\ÝÜ™HXœÙ[ÛÛ\™\ÜÚ[ÛˆÛÛÛÝÛˆ›ÝÎˆÙ\ÜÚ[Ûˆ›ÝÈ^\ÝÈ‚ˆ
+Bˆ™]\›‚‚ˆXY[™HHÛ˜\ÚÝ™Ù]
+˜ÛÛÛÝÛ—Ý[[ŠBˆ\œ›ÜˆHÛ˜\ÚÝ™Ù]
+™\œ›ÜˆŠB‚ˆYˆÙÊÛÛ›ŠN‚ˆÝ\œÛÜˆHÛÛ›‹™^XÝ]Jˆ•TUHÙ\ÜÚ[ÛœÈÑUÛÛ\™\ÜÚ[Û—Ù˜Z[\™WØÛÛÛÝÛ—Ý[[HË‚ˆ˜ÛÛ\™\ÜÚ[Û—Ù˜Z[\™WÙ\œ›ÜˆHÈÒT‘HYHÈ‹ˆ
+XY[™K\œ›Ü‹Ù\ÜÚ[Û—ÚY
+Kˆ
+BˆYˆÝ\œÛÜ‹œ›ÝØÛÝ[OHN‚ˆ˜Z\ÙH[[YQ\œ›ÜŠˆˆ˜ÛÛ\™\ÜÚ[ÛˆÛÛÛÝÛˆ›Û˜XÚÈÙ\ÜÚ[ÛˆZ\ÜÚ[™ÎˆÜÙ\ÜÚ[Û—ÚYH‚ˆ
+B‚ˆÙ[‹—Ù^XÝ]WÝÜš]JÙÊBˆXÝX[HÙ[‹™Ù]ØÛÛ\™\ÜÚ[Û—Ù˜Z[\™WØÛÛÛÝÛ—Ü›ÝÊÙ\ÜÚ[Û—ÚY
+Bˆ^XÝYHÂˆœÙ\ÜÚ[Û—Ù^\ÝÈŽˆYKˆ˜ÛÛÛÝÛ—Ý[[Žˆ›Ø]
+XY[™JHYˆXY[™H\È›Ý›Û™H[ÙH›Û™Kˆ™\œ›ÜˆŽˆ\œ›Ü‹ˆBˆYˆXÝX[OH^XÝY‚ˆ˜Z\ÙH[[YQ\œ›ÜŠˆˆ˜ÛÛ\™\ÜÚ[ÛˆÛÛÛÝÛˆ›Û˜XÚÈ™\šYšXØ][Ûˆ˜Z[Yˆ‚ˆˆ™^XÝY^Ù^XÝY\ŸKXÝX[^ØXÝX[\ŸH‚ˆ
+B‚ˆYˆÛX\—ØÛÛ\™\ÜÚ[Û—Ù˜Z[\™WØÛÛÛÝÛŠÙ[‹Ù\ÜÚ[Û—ÚYˆÝŠHOˆ›Û™N‚ˆˆˆÛX\ˆ[žH\œÚ\ÝYÛÛ\™\ÜÚ[Û‹Y˜Z[\™HÛÛÛÝÛˆ›ÜˆHÙ\ÜÚ[Û‹ˆˆˆ‚ˆYˆ›ÝÙ\ÜÚ[Û—ÚY‚ˆ™]\›‚‚ˆYˆÙÊÛÛ›ŠN‚ˆÛÛ›‹™^XÝ]Jˆ•TUHÙ\ÜÚ[ÛœÈÑUÛÛ\™\ÜÚ[Û—Ù˜Z[\™WØÛÛÛÝÛ—Ý[[H•S‚ˆ˜ÛÛ\™\ÜÚ[Û—Ù˜Z[\™WÙ\œ›ÜˆH•SÒT‘HYHÈ‹ˆ
+Ù\ÜÚ[Û—ÚY
+Kˆ
+B‚ˆžN‚ˆÙ[‹—Ù^XÝ]WÝÜš]JÙÊBˆ^Ù\Ü[]LË‘\œ›Üˆ\È^Î‚ˆÙÙÙ\‹Ø\›š[™Êˆ˜ÛX\—ØÛÛ\™\ÜÚ[Û—Ù˜Z[\™WØÛÛÛÝÛŠ	\ÊH˜Z[Yˆ	\È‹ˆÙ\ÜÚ[Û—ÚY^Ëˆ
+B‚ˆYˆÙ]ØÛÛ\™\ÜÚ[Û—Ù˜[˜XÚ×ÜÝ™XZÊÙ[‹Ù\ÜÚ[Û—ÚYˆÝŠHOˆ[‚ˆˆˆ”™]\›ˆH\œÚ\ÝY]\›Z[š\ÝXËY˜[˜XÚÈÝ™XZËˆˆˆ‚ˆYˆ›ÝÙ\ÜÚ[Û—ÚY‚ˆ™]\›ˆˆÚ]Ù[‹—ÛØÚÎ‚ˆÛÛ›ˆHÙ[‹—ØÛÛ›‚ˆYˆÛÛ›ˆ\È›Û™N‚ˆ™]\›ˆˆ›ÝÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕÛÛ\™\ÜÚ[Û—Ù˜[˜XÚ×ÜÝ™XZÈ”“ÓHÙ\ÜÚ[ÛœÈÒT‘HYHÈ‹ˆ
+Ù\ÜÚ[Û—ÚY
+Kˆ
+K™™]ÚÛ™J
+BˆYˆ›ÝÈ\È›Û™N‚ˆ™]\›ˆˆ˜[YHH
+ˆ›ÝÖÈ˜ÛÛ\™\ÜÚ[Û—Ù˜[˜XÚ×ÜÝ™XZÈ—BˆYˆ\Ú[œÝ[˜ÙJ›ÝËÜ[]LË”›ÝÊBˆ[ÙH›ÝÖÌBˆ
+BˆžN‚ˆ™]\›ˆX^
+[
+˜[YHÜˆ
+JBˆ^Ù\
+\Q\œ›Ü‹˜[YQ\œ›ÜŠN‚ˆ™]\›ˆ‚ˆYˆÙ]ØÛÛ\™\ÜÚ[Û—Ù˜[˜XÚ×ÜÝ™XZÊÙ[‹Ù\ÜÚ[Û—ÚYˆÝ‹Ý™XZÎˆ[
+HOˆ›Û™N‚ˆˆˆ”\œÚ\ÝH]\›Z[š\ÝXËY˜[˜XÚÈÝ™XZÈ›ÜˆÛ™HÙ\ÜÚ[Û‹ˆˆˆ‚ˆYˆ›ÝÙ\ÜÚ[Û—ÚY‚ˆ™]\›‚ˆ›Ü›X[^™YHX^
+[
+Ý™XZÊJB‚ˆYˆÙÊÛÛ›ŠN‚ˆÛÛ›‹™^XÝ]Jˆ•TUHÙ\ÜÚ[ÛœÈÑUÛÛ\™\ÜÚ[Û—Ù˜[˜XÚ×ÜÝ™XZÈHÈÒT‘HYHÈ‹ˆ
+›Ü›X[^™YÙ\ÜÚ[Û—ÚY
+Kˆ
+B‚ˆÙ[‹—Ù^XÝ]WÝÜš]JÙÊB‚ˆYˆ[˜Ü™[Y[ÚYÚY[™WÙ˜Z[\™WÜÝ™XZÊÙ[‹Ù\ÜÚ[Û—ÚÙ^NˆÝŠHOˆ[‚ˆˆˆ]ÛZXØ[H[˜Ü™[Y[HÙ\ÜÚ[Û‹ZYÚY[™H˜Z[\™HÝ™XZÈ›ÜˆÛ™HÚ]ˆˆˆ‚ˆYˆ›ÝÙ\ÜÚ[Û—ÚÙ^N‚ˆ™]\›ˆBˆ™\Ý[H×B‚ˆYˆÙÊÛÛ›ŠN‚ˆÛÛ›‹™^XÝ]Jˆˆˆ’S”ÑT•S•ÈØ]]Ø^WÚYÚY[™WÜÝ]H
+Ù\ÜÚ[Û—ÚÙ^K˜Z[\™WÜÝ™XZÊBˆSQTÈ
+ËJBˆÓˆÓÓ‘“PÕ
+Ù\ÜÚ[Û—ÚÙ^JHÈTUHÑUˆ˜Z[\™WÜÝ™XZÈHØ]]Ø^WÚYÚY[™WÜÝ]K™˜Z[\™WÜÝ™XZÈ
+ÈHˆˆ‹ˆ
+Ù\ÜÚ[Û—ÚÙ^K
+Kˆ
+Bˆ›ÝÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕ˜Z[\™WÜÝ™XZÈ”“ÓHØ]]Ø^WÚYÚY[™WÜÝ]HÒT‘HÙ\ÜÚ[Û—ÚÙ^HHÈ‹ˆ
+Ù\ÜÚ[Û—ÚÙ^K
+Kˆ
+K™™]ÚÛ™J
+Bˆ™\Ý[˜\[™
+[
+›ÝÖÌJJB‚ˆÙ[‹—Ù^XÝ]WÝÜš]JÙÊBˆ™]\›ˆ™\Ý[ÌB‚ˆYˆ™\Ù]ÚYÚY[™WÙ˜Z[\™WÜÝ™XZÊÙ[‹Ù\ÜÚ[Û—ÚÙ^NˆÝŠHOˆ›Û™N‚ˆˆˆÛX\ˆH\œÚ\ÝYÙ\ÜÚ[Û‹ZYÚY[™H˜Z[\™HÝ™XZÈ›ÜˆÛ™HÚ]ˆˆˆ‚ˆYˆ›ÝÙ\ÜÚ[Û—ÚÙ^N‚ˆ™]\›‚‚ˆYˆÙÊÛÛ›ŠN‚ˆÛÛ›‹™^XÝ]Jˆ‘SUH”“ÓHØ]]Ø^WÚYÚY[™WÜÝ]HÒT‘HÙ\ÜÚ[Û—ÚÙ^HHÈ‹ˆ
+Ù\ÜÚ[Û—ÚÙ^K
+Kˆ
+B‚ˆÙ[‹—Ù^XÝ]WÝÜš]JÙÊB‚ˆYˆÙ]ØÛÛ\™\ÜÚ[Û—Ú[™Y™™XÝ]™WØÛÝ[
+Ù[‹Ù\ÜÚ[Û—ÚYˆÝŠHOˆ[‚ˆˆˆ”™]\›ˆH\œÚ\ÝY[™Y™™XÝ]™KXÛÛ\XÝ[ÛˆÝšZÙHÛÝ[‚‚ˆZ\œ›ÜœÈÙ]ØÛÛ\™\ÜÚ[Û—Ù˜[˜XÚ×ÜÝ™XZØˆ\È\ÈH\˜X›H[‚ˆÙˆH[K]˜\ÚÝX\™
+Ú[™Y™™XÝ]™WØÛÛ\™\ÜÚ[Û—ØÛÝ[ÛˆBˆZ[Z[ˆÛÛ\™\ÜÛÜŠK\œÚ\ÝYÛÈ]Hœ™\ÚÛÛ\™\ÜÛÜˆ›Ý[™ÈBˆ™\Ý[YYÙ\ÜÚ[Ûˆ[š\š]È[ˆ\›YYÝš\YÝX\™[œÝXYÙˆÝ\[™Âˆœ›ÛH™\›ÈXÜ›ÜÜÈ›ØÙ\ÜÈ™\Ý\È
+ÍMLŒÊK‚ˆˆˆ‚ˆYˆ›ÝÙ\ÜÚ[Û—ÚY‚ˆ™]\›ˆˆÚ]Ù[‹—ÛØÚÎ‚ˆÛÛ›ˆHÙ[‹—ØÛÛ›‚ˆYˆÛÛ›ˆ\È›Û™N‚ˆ™]\›ˆˆ›ÝÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕÛÛ\™\ÜÚ[Û—Ú[™Y™™XÝ]™WØÛÝ[”“ÓHÙ\ÜÚ[ÛœÈÒT‘HYHÈ‹ˆ
+Ù\ÜÚ[Û—ÚY
+Kˆ
+K™™]ÚÛ™J
+BˆYˆ›ÝÈ\È›Û™N‚ˆ™]\›ˆˆ˜[YHH
+ˆ›ÝÖÈ˜ÛÛ\™\ÜÚ[Û—Ú[™Y™™XÝ]™WØÛÝ[—BˆYˆ\Ú[œÝ[˜ÙJ›ÝËÜ[]LË”›ÝÊBˆ[ÙH›ÝÖÌBˆ
+BˆžN‚ˆ™]\›ˆX^
+[
+˜[YHÜˆ
+JBˆ^Ù\
+\Q\œ›Ü‹˜[YQ\œ›ÜŠN‚ˆ™]\›ˆ‚ˆYˆÙ]ØÛÛ\™\ÜÚ[Û—Ú[™Y™™XÝ]™WØÛÝ[
+Ù[‹Ù\ÜÚ[Û—ÚYˆÝ‹ÛÝ[ˆ[
+HOˆ›Û™N‚ˆˆˆ”\œÚ\ÝH[™Y™™XÝ]™KXÛÛ\XÝ[ÛˆÝšZÙHÛÝ[›ÜˆÛ™HÙ\ÜÚ[Û‹ˆˆˆ‚ˆYˆ›ÝÙ\ÜÚ[Û—ÚY‚ˆ™]\›‚ˆ›Ü›X[^™YHX^
+[
+ÛÝ[
+JB‚ˆYˆÙÊÛÛ›ŠN‚ˆÛÛ›‹™^XÝ]Jˆ•TUHÙ\ÜÚ[ÛœÈÑUÛÛ\™\ÜÚ[Û—Ú[™Y™™XÝ]™WØÛÝ[HÈÒT‘HYHÈ‹ˆ
+›Ü›X[^™YÙ\ÜÚ[Û—ÚY
+Kˆ
+B‚ˆÙ[‹—Ù^XÝ]WÝÜš]JÙÊB‚ˆÈ8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ ˆÈÛÛ\™\ÜÚ[ÛˆØÚÜÂˆÈ8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ ˆÈ]ÛZXÈ\‹\Ù\ÜÚ[ÛˆØÚÜÈ]™]™[ÛÈÛÛ\™\ÜÚ[Ûˆ]Èœ›ÛBˆÈ˜XÚ[™ÈÛˆHØ[YHÙ\ÜÚ[Û—ÚY[™›ÙXÚ[™ÈÜœ[ˆÚ[Ù\ÜÚ[ÛœË‚ˆÂˆÈH˜XÙNˆÛÛ™\œØ][Û—ØÛÛ\™\ÜÚ[Û‹œX›Ý]\ÈYÙ[œÙ\ÜÚ[Û—ÚYˆÈ\ÈHÚYHY™™XÝÙˆHÝXØÙ\ÜÙ[ÛÛ\™\ÜÚ[Ûˆ
+[™ÛÙ\ÜÚ[Û‹Ü™X]BˆÈ™]ÊKˆ]]]][Ûˆ\ÈØØ[ÈHRPYÙ[[œÝ[˜ÙH8 %]Ý]K™˜ˆÈ\ÈÚ\™YXÜ›ÜÜÈ[[œÝ[˜Ù\ËˆÛÈRPYÙ[È]Ú\™HHØ[YBˆÈÙ\ÜÚ[Û—ÚY]H[ÛY[^H›ÝXÚYHÈÛÛ\™\ÜÈ
+[ÜÝˆÈÛÛ[[Û›HH\™[\›‰ÜÈYÙ[
+ÈH˜XÚÙÜ›Ý[™\™]šY]È›ÜšÈÝ\YˆÈšYÚY\ˆH\›ˆ[™Y
+HXXÚ[™H\™[[™Ü™X]HZ\ˆÝÛ‚ˆÈ‘UÈÙ\ÜÚ[Û‹\™[YÈHØ[YHÛYˆHØ]]Ø^HÙ\ÜÚ[Û‘[žBˆÈÛ›HØ]Ú\ÈÛ™H›Ý][ÛŽÈHÝ\ˆÚ[Ú[[HXØÝ[][]\ÂˆÈÜš]\È8 %[ZY[‰ÜÈœ\™[8¡¤ˆÛÈÜœ[ˆÚ[™[ˆˆ™\›ÈÚ\K‚ˆÂˆÈHØÚÈ\ÈÙ^YYžHÙ\ÜÚ[Û—ÚY[™\È[›ÜˆH\˜][ÛˆÙ‚ˆÈHÛÛ\™\ÜÊ
+HØ[\ÈH›Ý][Û‹ˆÛ\˜Y[YšY\ÈBˆÈÝ\œ™[ÝÛ™\ˆ
+YY››Û˜ÙJH›ÜˆXYÛ›ÜÝXÜÎÈHØÚÈ\È™XÛÝ™\™YˆÈšXH^\™\×Ø]YˆHÛ\ˆ›ØÙ\ÜÈÜ˜\ÚYÚ]Ý]™[X\Ú[™Ë‚ˆYˆ™Yœ™\ÚØÛÛ\™\ÜÚ[Û—ÛØÚÊˆÙ[‹ˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆÛ\ŽˆÝ‹ˆÜÙXÛÛ™Îˆ›Ø]HÌŒˆ
+HOˆ›ÛÛ‚ˆˆˆ‘^[™HÛÛ\™\ÜÚ[ÛˆØÚÈX\ÙHYˆÛ\˜Ý[ÝÛœÈ]‚‚ˆÝÛ™\œÚ\\ÈXÚYYžHHÛ\˜ÛÛ[[ˆ[Û™K[X™\˜][H“ÕˆžH^\™\×Ø]ˆH]™HÝÛ™\ˆÚÜÙH™Yœ™\Ú\ˆ™XYØ\ÈÝ\™Yˆ
+ÐÈ]\ÙKØYYÒH[›™\‹HÛÝÈÜš]H\ØØ\[™ÈÙ^XÝ]WÝÜš]X	ÜÂˆ™]žHYÙ]
+H\Ý]ÈÝÛˆ]\Ý™HX›HÈ™]š]™H]ÈÝ[][˜ÛZ[YYˆ›ÝÈÛˆH™^XÚËˆ™\]Z\š[™È^\™\×Ø]H›ÝØ\™HXYHÝXÚBˆÝ[\›X[™[8 %]™\žH]\ˆ™Yœ™\ÚX]ÚY›ÝÜËÛÈHÝÛ™\ˆÙ\ˆÛÛ\™\ÜÚ[™È[™›Ý][™ÈÚ]›ÈX\ÙH][ÚXÚ\È^XÝHBˆ[œ›ÝXÝYÚ[™ÝÈHÛÛ\][™È]Ø[ˆ›ÜšÈHÙ\ÜÚ[Ûˆ[™XYÙH[‹‚‚ˆ\ÈÙ\È›Ý™\Ý\œ™XÝHØÚÈÛÛYX›ÙH[ÙH[™XYHÛÚÎˆÔS]BˆÙ\šX[\Ù\ÈÜš]\ËÛÈH™XÛZ[H
+SUKY^\™Y
+ÈS”ÑT•[Ü‹RQÓ“Ô‘H[‚ˆ›Y]˜žWØXÜ]Z\™WØÛÛ\™\ÜÚ[Û—ÛØÚØ
+H[™\ÈTUH™]™\ˆ[\›X]™K‚ˆ™XÛZ[KYš\œÝ™\XÙ\ÈÛ\˜ÛÈ\ÈTUHX]Ú\È›Ý[™È[™ˆ™]\›œÈ˜[ÙNÈ™Yœ™\ÚYš\œÝ\Ú\È^\™\×Ø][ÈH]\™KÛÂˆH™XÛZ[Y\‰ÜÈSUKY^\™YX]Ú\È›Ý[™È[™]ÈXÜ]Z\™H˜Z[Ë‚ˆˆˆ‚ˆYˆ›ÝÙ\ÜÚ[Û—ÚYÜˆ›ÝÛ\Ž‚ˆ™]\›ˆ˜[ÙBˆ›ÝÈH[YK[YJ
+Bˆ^\™\×Ø]H›ÝÈ
+ÈÜÙXÛÛ™Â‚ˆYˆÙÊÛÛ›ŠN‚ˆÝ\ˆHÛÛ›‹™^XÝ]Jˆ•TUHÛÛ\™\ÜÚ[Û—ÛØÚÜÈÑU^\™\×Ø]HÈ‚ˆ•ÒT‘HÙ\ÜÚ[Û—ÚYHÈS‘Û\ˆHÈ‹ˆ
+^\™\×Ø]Ù\ÜÚ[Û—ÚYÛ\ŠKˆ
+Bˆ™]\›ˆÝ\‹œ›ÝØÛÝ[ˆ‚ˆžN‚ˆ™]\›ˆ›ÛÛ
+Ù[‹—Ù^XÝ]WÝÜš]JÙÊJBˆ^Ù\Ü[]LË‘\œ›Üˆ\È^Î‚ˆÙÙÙ\‹Ø\›š[™Êˆœ™Yœ™\ÚØÛÛ\™\ÜÚ[Û—ÛØÚÊ	\ÊH˜Z[Yˆ	\È‹ˆÙ\ÜÚ[Û—ÚY^Ëˆ
+Bˆ™]\›ˆ˜[ÙB‚ˆYˆžWØXÜ]Z\™WØÛÛ\™\ÜÚ[Û—ÛØÚÊˆÙ[‹ˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆÛ\ŽˆÝ‹ˆÜÙXÛÛ™Îˆ›Ø]HÌŒˆ
+HOˆ›ÛÛ‚ˆˆˆ•žHÈ]ÛZXØ[HXÜ]Z\™HHÛÛ\™\ÜÚ[ÛˆØÚÈ›ÜˆÙ\ÜÚ[Û—ÚY‚‚ˆ™]\›œÈYXÛˆÝXØÙ\ÜÈ
+Ø[\ˆ›ÝÈÝÛœÈHØÚÈ[™]\Ýˆ™[X\ÙHšXH›Y]˜™[X\ÙWØÛÛ\™\ÜÚ[Û—ÛØÚØ
+Kˆ™]\›œÈ˜[ÙXˆYˆ[›Ý\ˆÛ\ˆ[™XYHÝÛœÈH›Û‹Y^\™YØÚÈ8 %HØ[\‚ˆUTÕ“Õ›ØÙYYÚ]ÛÛ\™\ÜÚ[Ûˆ[ˆ]Ø\ÙH
+]È›Ý][ÛˆÛÝ[ˆ˜XÙHYØZ[œÝHÛ\‰ÜËÜ][™ÈHÙ\ÜÚ[Ûˆ[™XYÙJK‚‚ˆ^\™YØÚÜÈ
+^\™\×Ø]›ÝØ
+H\™H™XÛZ[YY˜[œÜ\™[K‚ˆÝXÝ\™YÛ\œÈÚÜÙHØØ[YX›ÈÛ™Ù\ˆ^\ÝÈ\™H™XÛZ[YYˆ[[YYX][KÛÈHØ]]Ø^HÚ[Y\š[™ÈÛÛ\™\ÜÚ[ÛˆÙ\È›ÝÝ[Bˆ™\XÙ[Y[›ØÙ\ÜÈ›ÜˆH[X\ÙH‚‚ˆ[\[Y[][ÛŽˆÚ[™ÛK]˜[œØXÝ[ÛˆSUKY^\™Y
+ÈS”ÑT•[Ü‹RQÓ“Ô‘Kˆ›ÛÝÙYžHHÑSPÕÈÛÛ™š\›HÙHÛÝH›ÝËˆÔS]HÙ\šX[\Ù\ÂˆÜš]\ËÛÈHÚÛHÙ\]Y[˜ÙH\È]ÛZXÈYØZ[œÝÝ\ˆÜš]\œË‚ˆˆˆ‚ˆYˆ›ÝÙ\ÜÚ[Û—ÚY‚ˆ™]\›ˆ˜[ÙBˆ›ÝÈH[YK[YJ
+Bˆ^\™\×Ø]H›ÝÈ
+ÈÜÙXÛÛ™Â‚ˆYˆÙÊÛÛ›ŠN‚ˆ™XÛZ[YYÚÛ\ˆH›Û™Bˆ›ÝÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕÛ\‹^\™\×Ø]”“ÓHÛÛ\™\ÜÚ[Û—ÛØÚÜÈ‚ˆ•ÒT‘HÙ\ÜÚ[Û—ÚYHÈ‹ˆ
+Ù\ÜÚ[Û—ÚY
+Kˆ
+K™™]ÚÛ™J
+BˆYˆ›ÝÈ\È›Ý›Û™N‚ˆÝ\œ™[ÚÛ\ˆH
+ˆ›ÝÖÈšÛ\ˆ—HYˆ\Ú[œÝ[˜ÙJ›ÝËÜ[]LË”›ÝÊH[ÙH›ÝÖÌBˆ
+BˆÝ\œ™[Ù^\™\×Ø]H
+ˆ›ÝÖÈ™^\™\×Ø]—HYˆ\Ú[œÝ[˜ÙJ›ÝËÜ[]LË”›ÝÊH[ÙH›ÝÖÌWBˆ
+BˆYˆ
+ˆÝ\œ™[Ù^\™\×Ø]›ÝÂˆÜˆØÛÛ\™\ÜÚ[Û—ÛØÚ×ÚÛ\—Ü›ØÙ\Ü×Ú\×ÙXY
+Ý\œ™[ÚÛ\ŠBˆ
+N‚ˆÛÛ›‹™^XÝ]Jˆ‘SUH”“ÓHÛÛ\™\ÜÚ[Û—ÛØÚÜÈ‚ˆ•ÒT‘HÙ\ÜÚ[Û—ÚYHÈS‘Û\ˆHÈ‹ˆ
+Ù\ÜÚ[Û—ÚYÝ\œ™[ÚÛ\ŠKˆ
+Bˆ™XÛZ[YYÚÛ\ˆHÝ\œ™[ÚÛ\‚ˆÈ[ŽˆžHÈ[œÙ\ˆS”ÑT•ÔˆQÓ“Ô‘H™]\›œÈ›È›ÝØÛÝ[ˆÈY™™\™[˜ÙH8 %™\šYžHÝÛ™\œÚ\šXHÑSPÕ‚ˆÛÛ›‹™^XÝ]Jˆ’S”ÑT•ÔˆQÓ“Ô‘HS•ÈÛÛ\™\ÜÚ[Û—ÛØÚÜÈ‚ˆŠÙ\ÜÚ[Û—ÚYÛ\‹XÜ]Z\™YØ]^\™\×Ø]
+H‚ˆ•SQTÈ
+ËËËÊH‹ˆ
+Ù\ÜÚ[Û—ÚYÛ\‹›ÝË^\™\×Ø]
+Kˆ
+Bˆ›ÝÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕÛ\ˆ”“ÓHÛÛ\™\ÜÚ[Û—ÛØÚÜÈÒT‘HÙ\ÜÚ[Û—ÚYHÈ‹ˆ
+Ù\ÜÚ[Û—ÚY
+Kˆ
+K™™]ÚÛ™J
+BˆXÜ]Z\™YH›ÝÈ\È›Ý›Û™H[™
+ˆ›ÝÖÈšÛ\ˆ—HYˆ\Ú[œÝ[˜ÙJ›ÝËÜ[]LË”›ÝÊH[ÙH›ÝÖÌBˆ
+HOHÛ\‚ˆ™]\›ˆXÜ]Z\™Y™XÛZ[YYÚÛ\‚‚ˆžN‚ˆXÜ]Z\™Y™XÛZ[YYÚÛ\ˆHÙ[‹—Ù^XÝ]WÝÜš]JÙÊBˆYˆ™XÛZ[YYÚÛ\Ž‚ˆÙÙÙ\‹Ø\›š[™Êˆ”™XÛZ[YYÝ[HÛÛ\™\ÜÚ[ÛˆØÚÈ›ÜˆÙ\ÜÚ[ÛI\È‚ˆŠÛ\I\ÊH‹ˆÙ\ÜÚ[Û—ÚYˆ™XÛZ[YYÚÛ\‹ˆ
+Bˆ™]\›ˆ›ÛÛ
+XÜ]Z\™Y
+Bˆ^Ù\Ü[]LË‘\œ›Üˆ\È^Î‚ˆÙÙÙ\‹Ø\›š[™ÊˆžWØXÜ]Z\™WØÛÛ\™\ÜÚ[Û—ÛØÚÊ	\ÊH˜Z[Yˆ	\È‹ˆÙ\ÜÚ[Û—ÚY^Ëˆ
+BˆÈ˜Z[Ü[Žˆ™]\›š[™È˜[ÙHXZÙ\ÈHØ[\ˆÚÚ\ÛÛ\™\ÜÚ[Û‹ˆÈÚXÚ\ÈHØY™H™Z]š[Ý\ˆÚ[ˆHØÚÈÝXœÞ\Ý[H\Èœ›ÚÙ[‹‚ˆ™]\›ˆ˜[ÙB‚ˆYˆ™[X\ÙWØÛÛ\™\ÜÚ[Û—ÛØÚÊÙ[‹Ù\ÜÚ[Û—ÚYˆÝ‹Û\ŽˆÝŠHOˆ›Û™N‚ˆˆˆ”™[X\ÙHHÛÛ\™\ÜÚ[ÛˆØÚÈ›ÜˆÙ\ÜÚ[Û—ÚYY™ˆÙHÝÛˆ]‚‚ˆY[\Ý[ˆ›Ë[ÜÚ[ˆHØÚÈ\È[™XYH^\™Y[™™Y[‚ˆ™XÛZ[YYžHHY™™\™[Û\‹ÜˆÚ[ˆ›ÈØÚÈ^\ÝËˆBˆÛ\˜ÚXÚÈ™]™[ÈH]K\™]\›š[™ÈÛÛ\™\ÜÛÜˆœ›ÛBˆÛØ˜™\š[™ÈHœ™\ÚØÚÈ[žHÛÛY[Û™H[ÙK‚ˆˆˆ‚ˆYˆ›ÝÙ\ÜÚ[Û—ÚY‚ˆ™]\›‚‚ˆYˆÙÊÛÛ›ŠN‚ˆÛÛ›‹™^XÝ]Jˆ‘SUH”“ÓHÛÛ\™\ÜÚ[Û—ÛØÚÜÈ‚ˆ•ÒT‘HÙ\ÜÚ[Û—ÚYHÈS‘Û\ˆHÈ‹ˆ
+Ù\ÜÚ[Û—ÚYÛ\ŠKˆ
+B‚ˆžN‚ˆÙ[‹—Ù^XÝ]WÝÜš]JÙÊBˆ^Ù\Ü[]LË‘\œ›Üˆ\È^Î‚ˆÙÙÙ\‹Ø\›š[™Êˆœ™[X\ÙWØÛÛ\™\ÜÚ[Û—ÛØÚÊ	\ÊH˜Z[Yˆ	\È‹ˆÙ\ÜÚ[Û—ÚY^Ëˆ
+B‚ˆYˆÜÙ\ÜÚ[Û—Ý\›—ÛX\ÙWÚÙ^WÛÛ—ØÛÛ›ŠÙ[‹ÛÛ›‹Ù\ÜÚ[Û—ÚYˆÝŠHOˆÝŽ‚ˆˆˆ•Ø[ÈÛÛ\™\ÜÚ[Ûˆ\™[ÈÛˆÛÛ›˜ÈHÛÛ™\œØ][ÛˆX\ÙHÙ^K‚‚ˆ]\Ý[ˆÛˆHØ[YHÛÛ›™XÝ[Ûˆ\ÈHX\ÙHS”ÑT•ÕTUKÑSUK‚ˆHš[ÜˆÙ]ÜÙ\ÜÚ[Û˜˜Z[\™H]\Ý›ÝÛÛ\]HHÚ[Y]Bˆ]\ˆÜš]H[ˆ\œÚ\ÝÎˆ™Yœ™\ÚÛÝ[Ø[ÈÈH\™[[™ˆ˜Z[XÛÜÙKˆX\šÙ\œÈš[™È\™[ÜÙ\ÜÚ[Û—ÚY
+Ø[YHÛÛ˜XÝ\ÂˆÓ“Ó—ÐÓÓ•S•PUSÓ—ÐÒSÑ’ST—ÔÔS
+KˆØÚÈ\œ›ÜœÈ›ÜYØ]HÛÂˆÙ^XÝ]WÝÜš]XÈXÜ]Z\™WÜÙ\ÜÚ[Û—Ý\›—ÛX\ÙXØ[ˆ™]žK‚ˆˆˆ‚ˆYˆ›ÝÙ\ÜÚ[Û—ÚY‚ˆ™]\›ˆÙ\ÜÚ[Û—ÚY‚ˆYˆÜ›ÝÊÚYˆÝŠN‚ˆ›ÝÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕY\™[ÜÙ\ÜÚ[Û—ÚYÛÝ\˜ÙK[Ù[ØÛÛ™šYË[™Ü™X\ÛÛˆ‚ˆ‘”“ÓHÙ\ÜÚ[ÛœÈÒT‘HYHÈ‹ˆ
+ÚY
+Kˆ
+K™™]ÚÛ™J
+Bˆ™]\›ˆXÝ
+›ÝÊHYˆ›ÝÈ[ÙH›Û™B‚ˆÝ\œ™[HÜ›ÝÊÙ\ÜÚ[Û—ÚY
+BˆÙY[ˆHÜÙ\ÜÚ[Û—ÚYBˆÚ[HÝ\œ™[‚ˆ\™[ÚYHÝ\œ™[™Ù]
+œ\™[ÜÙ\ÜÚ[Û—ÚYŠBˆYˆ
+ˆ›Ý\™[ÚYˆÜˆ\™[ÚY[ˆÙY[‚ˆÜˆÙ[‹—Ú\×Ù^XÚ]Ù›Üš×ØÚ[Ü›ÝÊÝ\œ™[
+Bˆ
+N‚ˆœ™XZÂˆ\™[HÜ›ÝÊ\™[ÚY
+BˆYˆ›Ý\™[Üˆ\™[™Ù]
+™[™Ü™X\ÛÛˆŠHOH˜ÛÛ\™\ÜÚ[ÛˆŽ‚ˆœ™XZÂˆÙY[‹˜Y
+\™[ÚY
+BˆÝ\œ™[H\™[ˆ™]\›ˆÝŠÝ\œ™[™Ù]
+šYŠHÜˆÙ\ÜÚ[Û—ÚY
+HYˆÝ\œ™[[ÙHÙ\ÜÚ[Û—ÚY‚ˆYˆÜÙ\ÜÚ[Û—Ý\›—ÛX\ÙWÚÙ^JÙ[‹Ù\ÜÚ[Û—ÚYˆÝŠHOˆÝŽ‚ˆˆˆ”™]\›ˆHÝX›HÙ\šX[^˜][ÛˆÙ^H›Üˆ]™\žHÛÛ\™\ÜÚ[ÛˆÙYÛY[‚‚ˆXÜ]Z\™KÜ™Yœ™\ÚÜ™[X\ÙH™\ÛÛ™H\È[œÚYHZ\ˆÜš]H˜[œØXÝ[Û‹‚ˆ\È[\ˆ\È›Üˆ\ÝÈ[™XYÛ›ÜÝXÜÎÈ]Ù\È›ÝÝØ[ÝÈØÚÂˆ\œ›ÜœÈ
+HÝØ[ÝÙYØ[È\ÈH]\ˆÝXØÙ\ÜÙ[Üš]HØ\ÈBˆ˜Z[[Ü[ˆ]™\^YYHÜÝ\›Ý][Ûˆ™Yœ™\ÚZ\ÜÊK‚ˆˆˆ‚ˆYˆ›ÝÙ\ÜÚ[Û—ÚY‚ˆ™]\›ˆÙ\ÜÚ[Û—ÚYˆÚ]Ù[‹—Ü™XYØÝ
+
+H\ÈÛÛ›Ž‚ˆ™]\›ˆÙ[‹—ÜÙ\ÜÚ[Û—Ý\›—ÛX\ÙWÚÙ^WÛÛ—ØÛÛ›ŠÛÛ›‹Ù\ÜÚ[Û—ÚY
+B‚ˆYˆžWØXÜ]Z\™WÜÙ\ÜÚ[Û—Ý\›—ÛX\ÙJˆÙ[‹ˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆÛ\ŽˆÝ‹ˆ
+‹ˆÜÙXÛÛ™Îˆ›Ø]HÌŒˆ]Y[˜ÙWÜÎˆÜ[Û˜[Ù›Ø]HH›Û™Kˆ
+HOˆ›ÛÛ‚ˆˆˆ]ÛZXØ[HXÜ]Z\™HHÜ›ÜÜË\›ØÙ\ÜÈ\›ˆX\ÙH›ÜˆHÛÛ™\œØ][Û‹‚‚ˆÛÛ\™\ÜÚ[Ûˆ›Ý]\ÈHÙ\ÜÚ[Ûˆ[ÈÚ[ÙYÛY[ËÛÈH\˜X›HÙ^Bˆ\ÈH[™XYÙH›ÛÝ˜]\ˆ[ˆHÝ\œ™[ÙYÛY[YˆHØ[È[™ˆS”ÑT•Ú\™HÛ™HÜš]H˜[œØXÝ[Û‹ˆ^\™YX\Ù\È[™X\Ù\ÈÚÜÙBˆÝXÝ\™YØØ[Û\ˆQ\ÈÛ›ÝÛˆXY\™H™XÛZ[YY[ˆ]Ø[YBˆ˜[œØXÝ[Û‹‚ˆˆˆ‚ˆYˆ›ÝÙ\ÜÚ[Û—ÚYÜˆ›ÝÛ\Ž‚ˆ™]\›ˆ˜[ÙBˆ›ÝÈH[YK[YJ
+Bˆ^\™\×Ø]H›ÝÈ
+ÈX^
+ŒK›Ø]
+ÜÙXÛÛ™ÊJB‚ˆYˆÙÊÛÛ›ŠN‚ˆÛÛ™\œØ][Û—ÚYHÙ[‹—ÜÙ\ÜÚ[Û—Ý\›—ÛX\ÙWÚÙ^WÛÛ—ØÛÛ›ŠÛÛ›‹Ù\ÜÚ[Û—ÚY
+Bˆ›ÝÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕÛ\‹^\™\×Ø]”“ÓHÙ\ÜÚ[Û—Ý\›—ÛX\Ù\È‚ˆ•ÒT‘HÛÛ™\œØ][Û—ÚYHÈ‹ˆ
+ÛÛ™\œØ][Û—ÚY
+Kˆ
+K™™]ÚÛ™J
+BˆYˆ›ÝÈ\È›Ý›Û™N‚ˆÝ\œ™[ÚÛ\ˆH›ÝÖÈšÛ\ˆ—BˆYˆ
+ˆ›Ø]
+›ÝÖÈ™^\™\×Ø]—JHH›ÝÂˆÜˆØÛÛ\™\ÜÚ[Û—ÛØÚ×ÚÛ\—Ü›ØÙ\Ü×Ú\×ÙXY
+Ý\œ™[ÚÛ\ŠBˆ
+N‚ˆÛÛ›‹™^XÝ]Jˆ‘SUH”“ÓHÙ\ÜÚ[Û—Ý\›—ÛX\Ù\È‚ˆ•ÒT‘HÛÛ™\œØ][Û—ÚYHÈS‘Û\ˆHÈ‹ˆ
+ÛÛ™\œØ][Û—ÚYÝ\œ™[ÚÛ\ŠKˆ
+BˆÛÛ›‹™^XÝ]Jˆ’S”ÑT•ÔˆQÓ“Ô‘HS•ÈÙ\ÜÚ[Û—Ý\›—ÛX\Ù\È‚ˆŠÛÛ™\œØ][Û—ÚYÛ\‹XÜ]Z\™YØ]^\™\×Ø]
+H‚ˆ•SQTÈ
+ËËËÊH‹ˆ
+ÛÛ™\œØ][Û—ÚYÛ\‹›ÝË^\™\×Ø]
+Kˆ
+BˆÝÛ™\ˆHÛÛ›‹™^XÝ]Jˆ7ë~4¶‰žËkºwµçUSQTÈ
+ËËËËËËËËËËËËËËËËËËËËËÊHˆˆ‹ˆ
+ˆÙ\ÜÚ[Û—ÚYˆ›ÛKˆÝÜ™YØÛÛ[ˆÛÛØØ[ÚYˆÛÛØØ[×ÚœÛÛ‹ˆÜØÜX—ÜÝ\œ›ÙØ]\ÊÛÛÛ˜[YJKˆY™™XÝÙ\ÜÜÚ][Û‹ˆY\ÜØYÙWÝ[Y\Ý[\ˆÚÙ[—ØÛÝ[ˆš[š\ÚÜ™X\ÛÛ‹ˆÜØÜX—ÜÝ\œ›ÙØ]\Ê™X\ÛÛš[™ÊKˆÜØÜX—ÜÝ\œ›ÙØ]\Ê™X\ÛÛš[™×ØÛÛ[
+Kˆ™X\ÛÛš[™×Ù]Z[×ÚœÛÛ‹ˆÛÙ^Ú][\×ÚœÛÛ‹ˆÛÙ^ÛY\ÜØYÙWÚ][\×ÚœÛÛ‹ˆ]›Ü›WÛY\ÜØYÙWÚYˆHYˆØœÙ\™Y[ÙHˆHYˆØÛÛ\™\ÜÙYÜÝ[[X\žH[ÙHˆKˆÜØÜX—ÜÝ\œ›ÙØ]\Ê\WØÛÛ[
+HYˆ\Ú[œÝ[˜ÙJ\WØÛÛ[ÝŠH[ÙH›Û™KˆÜØÜX—ÜÝ\œ›ÙØ]\Ê\Ü^WÚÚ[™
+HYˆ\Ú[œÝ[˜ÙJ\Ü^WÚÚ[™ÝŠH[ÙH›Û™Kˆ\Ü^WÛY]Y]WÚœÛÛ‹ˆ
+Kˆ
+Bˆ\Ù×ÚYHÝ\œÛÜ‹›\Ý›ÝÚY‚ˆÈ\]HÛÝ[\œÂˆYˆ[WÝÛÛØØ[Èˆ‚ˆÛÛ›‹™^XÝ]Jˆˆˆ•TUHÙ\ÜÚ[ÛœÈÑUY\ÜØYÙWØÛÝ[HY\ÜØYÙWØÛÝ[
+ÈKˆÛÛØØ[ØÛÝ[HÛÛØØ[ØÛÝ[
+ÈÈÒT‘HYHÈˆˆ‹ˆ
+[WÝÛÛØØ[ËÙ\ÜÚ[Û—ÚY
+Kˆ
+Bˆ[ÙN‚ˆÛÛ›‹™^XÝ]Jˆ•TUHÙ\ÜÚ[ÛœÈÑUY\ÜØYÙWØÛÝ[HY\ÜØYÙWØÛÝ[
+ÈHÒT‘HYHÈ‹ˆ
+Ù\ÜÚ[Û—ÚY
+Kˆ
+Bˆ™]\›ˆ\Ù×ÚY‚ˆÈ˜[œØÜš\\[™\ÈHÜš]XØ[Üš]Nˆ]È˜Z[\™HX›ÜÈBˆÈ\Ù\‰ÜÈ\›ˆ
+Ù\ÜÚ[Û—Ü\œÚ\Ý[˜ÙWÙ˜Z[Y
+Kˆ\ÙHHÛ™È]Y[˜ÙHÛÂˆÈHÚX›[™È›ØÙ\ÜÈYÚ][X][HÛ[™ÈHÜš]HØÚÈ›ÜˆÙXÛÛ™ÂˆÈ
+PÕUSK•SÐUHÚXÚÜÚ[]ÛÜÙK[ˆÛ\ˆ™KX›Ý[™Y[Y\™ÙBˆÈ›ØÙ\ÜÉÜÈ•ÈÜ[Z^™JHØ[‰Ý\Ý›ÞHHX[H\›ˆ
+ÍÍÎ
+K‚ˆ™]\›ˆÙ[‹—Ù^XÝ]WÝÜš]JˆÙË]Y[˜ÙWÜÏ\Ù[‹—ÕS”ÐÔ’TÕÔ’UWÔUQSÑWÔÂˆ
+B‚ˆYˆ\[™ÛY\ÜØYÙ\×Ø˜]Ú
+ˆÙ[‹ˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆY\ÜØYÙ\Îˆ\ÝÑXÝÜÝ‹[žWWKˆÛÛ\™\ÜÚ[Û—ÛØÚ×ÚÛ\ŽˆÜ[Û˜[ÜÝ—HH›Û™Kˆ\›—ÛX\ÙWÚÛ\ŽˆÜ[Û˜[ÜÝ—HH›Û™KˆÚ[š×Ü›ÝÜÎˆÜ[Û˜[Ú[HH›Û™Kˆ\›—ÛX\ÙWÝÜÙXÛÛ™Îˆ›Ø]HÌŒˆ
+HOˆ[‚ˆˆˆ\[™][\HY\ÜØYÙ\È]ÛZXØ[H[ˆÓ‘HÜš]H˜[œØXÝ[Û‹‚‚ˆY\ÜØYÙ\Ø\ÈH\ÝÙˆXÝÈ[ˆHØ[YHÚ\Bˆ›Y]˜Ú[œÙ\ÛY\ÜØYÙWÜ›ÝÜØ[™XYHÛÛœÝ[Y\È›Üˆ™\XÙKØÛÛ\XÝÂˆ[\Ü
+›ÛKÛÛ[ÛÛÛ˜[YKÛÛØØ[ËÛÛØØ[ÚYˆš[š\ÚÜ™X\ÛÛ‹™X\ÛÛš[™Ê‹ÛÙ^Ê‹[Y\Ý[\\WØÛÛ[ˆ\Ü^WÚÚ[™\Ü^WÛY]Y]K‹‹ŠKˆ™]\Ú[™È][\ˆÙY\ÈÓ‘Bˆ›ÝË\Ù\šX[^˜][Ûˆ]›Üˆ]™\žH][K\›ÝÈÜš]\‹‚‚ˆH\›‹X›Ý[™\žH›\ÚÜš]\ÈHÚÛH\›ˆ
+\Ù\ˆ
+È\ÜÚ\Ý[
+ÈÛÛˆ›ÝÜË\XØ[HËNY\ÜØYÙ\ÊH\ÈÛ™H‘QÒSˆSSQQPUHÈÛÛ[Z]Z\‚ˆ[œÝXYÙˆÛ™H˜[œØXÝ[Ûˆ
+[™Ù™ˆÐSÛ™HœÞ[˜ÊH\ˆ›ÝË‚‚ˆ]ÛZXÚ]HÛÛ˜XÝˆ[›ÝÜÈ[™Üˆ›Û™HÈ
+HØ[\ˆ™KY›\Ú\Âˆ[œÝ[\YY\ÜØYÙ\ÈÛˆH™^][\
+KˆHØ[YHYZ\ÜÚ[ÛˆÝX\™Âˆ\È›Y]˜\[™ÛY\ÜØYÙX[ˆÛ˜ÙH›ÜˆH˜]Ú8 %Ø[YHÙ\ÜÚ[Û‹ˆØ[YH[œÝ[‚‚ˆÚ[š×Ü›ÝÜØ›Ý[™ÈH˜[œØXÝ[ÛˆÚ^™H›ÜˆT‘ÑHÛÜY\È
+œ˜[˜ÚˆÙYYÈØ[ˆ™HÝ\Ø[™ÈÙˆ›ÝÜÎÈYX\Ý\™YˆLÈ›ÝÜÈ8¢b‹È[œÚYHÛ™Bˆ‘QÒSˆSSQQPUH™XØ]\ÙHH•ÈšYÙÙ\œÈ[ˆ\ˆ›ÝËÚXÚÛÝ[ˆ[Û›ÜÛ^™HHÜš]HØÚÈ[™Ý\™HÛÛ˜Ý\œ™[Üš]\œÊKˆÚ[ˆÙ]ˆH˜]ÚÛÛ[Z]È[ˆÚ[šÜÈÙˆ][ÜÝ]X[žH›ÝÜÈ8 %Ø[YBˆ™XÛÝ™\žHÙ[X[XÜÈ\ÈHÛ\‹\›ÝÈÛÜÈ
+HZYXÛÜH˜Z[\™BˆX]™\ÈH\X[ÙYY
+K\ÝÚ]›Ý[™YØÚÈÛËˆH\›ˆ›\Úˆ™]™\ˆ™YYÈ]ˆ™]\›œÈH[œÙ\Y›ÝÈÛÝ[‚ˆˆˆ‚ˆYˆ›ÝY\ÜØYÙ\Î‚ˆ™]\›ˆ‚ˆYˆÚ[š×Ü›ÝÜÈ\È›Ý›Û™H[™[ŠY\ÜØYÙ\ÊHˆÚ[š×Ü›ÝÜÎ‚ˆ[œÙ\YÝÝ[Hˆ›ÜˆÝ\[ˆ˜[™ÙJ[ŠY\ÜØYÙ\ÊKÚ[š×Ü›ÝÜÊN‚ˆ[œÙ\YÝÝ[
+ÏHÙ[‹˜\[™ÛY\ÜØYÙ\×Ø˜]Ú
+ˆÙ\ÜÚ[Û—ÚYˆY\ÜØYÙ\ÖÜÝ\œÝ\
+ÈÚ[š×Ü›ÝÜ×KˆÛÛ\™\ÜÚ[Û—ÛØÚ×ÚÛ\XÛÛ\™\ÜÚ[Û—ÛØÚ×ÚÛ\‹ˆ\›—ÛX\ÙWÚÛ\]\›—ÛX\ÙWÚÛ\‹ˆ\›—ÛX\ÙWÝÜÙXÛÛ™Ï]\›—ÛX\ÙWÝÜÙXÛÛ™Ëˆ
+Bˆ™]\›ˆ[œÙ\YÝÝ[‚ˆYˆÙÊÛÛ›ŠN‚ˆÙ[‹—ØÚXÚ×Ý˜[œØÜš\ÝÜš]WÙÝX\™ÊˆÛÛ›‹ˆÙ\ÜÚ[Û—ÚYˆÛÛ\™\ÜÚ[Û—ÛØÚ×ÚÛ\‹ˆ\›—ÛX\ÙWÚÛ\]\›—ÛX\ÙWÚÛ\‹ˆ\›—ÛX\ÙWÝÜÙXÛÛ™Ï]\›—ÛX\ÙWÝÜÙXÛÛ™Ëˆ
+Bˆ[œÙ\YÛÛØØ[×ÝÝ[HÙ[‹—Ú[œÙ\ÛY\ÜØYÙWÜ›ÝÜÊˆÛÛ›‹Ù\ÜÚ[Û—ÚYY\ÜØYÙ\Âˆ
+BˆÈÛ™HYÙÜ™YØ]YÛÝ[\ˆ\]H›ÜˆHÚÛH˜]Ú‚ˆYˆÛÛØØ[×ÝÝ[ˆ‚ˆÛÛ›‹™^XÝ]Jˆˆˆ•TUHÙ\ÜÚ[ÛœÈÑUY\ÜØYÙWØÛÝ[HY\ÜØYÙWØÛÝ[
+ÈËˆÛÛØØ[ØÛÝ[HÛÛØØ[ØÛÝ[
+ÈÈÒT‘HYHÈˆˆ‹ˆ
+[œÙ\YÛÛØØ[×ÝÝ[Ù\ÜÚ[Û—ÚY
+Kˆ
+Bˆ[ÙN‚ˆÛÛ›‹™^XÝ]Jˆ•TUHÙ\ÜÚ[ÛœÈÑUY\ÜØYÙWØÛÝ[HY\ÜØYÙWØÛÝ[
+ÈÈÒT‘HYHÈ‹ˆ
+[œÙ\YÙ\ÜÚ[Û—ÚY
+Kˆ
+Bˆ™]\›ˆ[œÙ\Y‚ˆÈØ[YHÜš]XØ[]H\È\[™ÛY\ÜØYÙNˆ\ÈTÈH\›‰ÜÈ˜[œØÜš\‚ˆ™]\›ˆÙ[‹—Ù^XÝ]WÝÜš]JˆÙË]Y[˜ÙWÜÏ\Ù[‹—ÕS”ÐÔ’TÕÔ’UWÔUQSÑWÔÂˆ
+B‚ˆYˆÙ]Û]\ÝÛX]Ú[™×ÛY\ÜØYÙWÙ\Ü^WÚÚ[™
+ˆÙ[‹Ù\ÜÚ[Û—ÚYˆÝ‹
+‹›ÛNˆÝ‹ÛÛ[ˆÝ‹\Ü^WÚÚ[™ˆÝ‹ˆ\Ü^WÛY]Y]NˆÜ[Û˜[ÑXÝÜÝ‹[žWWHH›Û™Kˆ
+HOˆ›ÛÛ‚ˆˆˆ”Ý[\™\Ù[][ÛˆY]Y]HÛˆ\È\›‰ÜÈœ™\ÚH\œÚ\ÝY›ÝË‚‚ˆH[Ù[Ý[™XÙZ]™\È›ÛX[™ÛÛ[[˜Ú[™ÙYˆØ]]Ø^H[™ˆÓHÞ[]XÈ[œ]ÈØ[\È[[YYX][HY\ˆZ\ˆÙ\šX[\›ˆ\Âˆ›\ÚY™\Ù\š[™È›ÙXÙ\ˆ›Ý™[˜[˜ÙHÚ]Ý]Û\ÜÚYžZ[™ÈžHÛÛ[ˆ\š[™È˜[œØÜš\™[™\š[™Ë‚ˆˆˆ‚ˆYˆ›ÝÙ\ÜÚ[Û—ÚYÜˆ›ÝÛÛ[Üˆ›Ý\Ü^WÚÚ[™‚ˆ™]\›ˆ˜[ÙB‚ˆYˆÙÊÛÛ›ŠN‚ˆ›ÝÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕY”“ÓHY\ÜØYÙ\ÈÒT‘HÙ\ÜÚ[Û—ÚYHÈS‘›ÛHHÈ‚ˆS‘ÛÛ[HÈS‘XÝ]™HHHÔ‘Tˆ–HYTÐÈSRUH‹ˆ
+Ù\ÜÚ[Û—ÚY›ÛKÙ[‹—Ù[˜ÛÙWØÛÛ[
+ÛÛ[
+JKˆ
+K™™]ÚÛ™J
+BˆYˆ›ÝÈ\È›Û™N‚ˆ™]\›ˆ˜[ÙBˆÛÛ›‹™^XÝ]Jˆ•TUHY\ÜØYÙ\ÈÑU\Ü^WÚÚ[™HË\Ü^WÛY]Y]HHÈÒT‘HYHÈ‹ˆ
+ˆÜØÜX—ÜÝ\œ›ÙØ]\Ê\Ü^WÚÚ[™
+KˆÙ[‹—Ù[˜ÛÙWÙ\Ü^WÛY]Y]J\Ü^WÛY]Y]JKˆ›ÝÖÌKˆ
+Kˆ
+Bˆ™]\›ˆYB‚ˆ™]\›ˆ›ÛÛ
+Ù[‹—Ù^XÝ]WÝÜš]JÙÊJB‚ˆYˆ]X\˜[[™WÛYØXÞWÝÛÛØØ\œšY\œÊˆÙ[‹ˆØ[™Y]\Îˆ\ÝÑXÝÜÝ‹[žWWKˆ
+‹ˆZYÜ˜][Û—ÚYˆÝ‹ˆžWÜ[Žˆ›ÛÛHYKˆ
+HOˆXÝÜÝ‹[N‚ˆˆˆ’YHX[šY™\Ý\›Ý™[ˆYØXÞH˜]Ë]ÛÛØ\œšY\ˆ›ÝÜÈÚ]Ý]\˜\Ý\™K‚‚ˆHÛÛ^YÛÝ™\››ÜˆY\\ˆ\ÝÜšXØ[HÛÛ™\YÜœ[™YÛÛˆ™\Ý[È[È\ÜÚ\Ý[^ˆ\ÈY]Ù\È[X™\˜][H˜\œ›ÝÙ\ˆ[‚ˆHÙ[™\šXÈš\ÚXš[]H\]Nˆ]™\žHØ[™Y]H\È[›™YžH›ÝÈYˆÙ\ÜÚ[ÛˆY›ÛK[™ÜšYÚ[˜[ÛÛ[YÙ\Ý™Y›Ü™H[žHÜš]Kˆ]ˆ™\Ù\™\ÈÛÛ[[™^\Ý[™È\Ü^HY]Y]KYÈÛ™H\YX\šÙ\‹ˆ[™\ÈY[\Ý[›ÜˆHØ[YHØ[™Y]HÝ]K‚ˆˆˆ‚ˆYˆ›ÝZYÜ˜][Û—ÚYÜˆ›Ý\Ú[œÝ[˜ÙJZYÜ˜][Û—ÚYÝŠN‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ›ZYÜ˜][Û—ÚY\È™\]Z\™YŠBˆYˆ›Ý\Ú[œÝ[˜ÙJØ[™Y]\Ë\Ý
+N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ˜Ø[™Y]\È]\Ý™HH\ÝŠB‚ˆœ›ÛHYÙ[˜ÛÛ\XÝ[Û—Ù\Ü^H[\Ü
+ˆQÐPÖWÕÓÓÐÐT”’QT—ÔUPTS•S‘WÓQUQUWÒÑVKˆQÐPÖWÕÓÓÐÐT”’QT—ÔUPTS•S‘WÔÐÒSPKˆ
+B‚ˆYˆÙÊÛÛ›ŠN‚ˆ\]\Îˆ\ÝÕ\VÚ[Ý—WHH×BˆÙY[—Ü›Ý×ÚYÎˆÙ]Ú[HHÙ]
+
+BˆÚ[™ÙYHˆ[˜Ú[™ÙYHˆ›ÜˆØ[™Y]H[ˆØ[™Y]\Î‚ˆYˆ›Ý\Ú[œÝ[˜ÙJØ[™Y]KXÝ
+N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ˜Ø[™Y]H]\Ý™H[ˆØš™XÝŠBˆ›Ý×ÚYHØ[™Y]K™Ù]
+šYŠBˆÙ\ÜÚ[Û—ÚYHØ[™Y]K™Ù]
+œÙ\ÜÚ[Û—ÚYŠBˆ^XÝYÚ\ÚHØ[™Y]K™Ù]
+˜ÛÛ[ÜÚLMˆŠBˆYˆ
+ˆ›Ý\Ú[œÝ[˜ÙJ›Ý×ÚY[
+BˆÜˆ›Ý\Ú[œÝ[˜ÙJÙ\ÜÚ[Û—ÚYÝŠBˆÜˆ›Ý\Ú[œÝ[˜ÙJ^XÝYÚ\ÚÝŠBˆÜˆ›Ý™K™[X]Ú
+ˆ–ÌNXKY—^ÍH‹^XÝYÚ\Ú
+Bˆ
+N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ˜Ø[™Y]HY[]H\È[˜[YŠBˆYˆ›Ý×ÚY[ˆÙY[—Ü›Ý×ÚYÎ‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠˆ™\XØ]HØ[™Y]H›ÝÈÜ›Ý×ÚYHŠBˆÙY[—Ü›Ý×ÚYË˜Y
+›Ý×ÚY
+Bˆ›ÝÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕYÙ\ÜÚ[Û—ÚY›ÛKÛÛ[\Ü^WÚÚ[™\Ü^WÛY]Y]H‚ˆ‘”“ÓHY\ÜØYÙ\ÈÒT‘HYHÈ‹ˆ
+›Ý×ÚY
+Kˆ
+K™™]ÚÛ™J
+BˆYˆ›ÝÈ\È›Û™HÜˆ›ÝÖÈœÙ\ÜÚ[Û—ÚY—HOHÙ\ÜÚ[Û—ÚY‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠˆ˜Ø[™Y]H›ÝÈÜ›Ý×ÚYH\ÈXœÙ[Üˆ[Ý™YŠBˆÛÛ[HÙ[‹—ÙXÛÙWØÛÛ[
+›ÝÖÈ˜ÛÛ[—JBˆYˆ›Ý\Ú[œÝ[˜ÙJÛÛ[ÝŠHÜˆ›ÝÖÈœ›ÛH—HOH˜\ÜÚ\Ý[Ž‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠˆ˜Ø[™Y]H›ÝÈÜ›Ý×ÚYH\È›Ý[ˆ\ÜÚ\Ý[^›ÝÈŠBˆXÝX[Ú\ÚH\ÚX‹œÚLMŠÛÛ[™[˜ÛÙJ]‹NŠJKš^YÙ\Ý
+
+BˆYˆXÝX[Ú\ÚOH^XÝYÚ\Ú‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠˆ˜Ø[™Y]H›ÝÈÜ›Ý×ÚYHÛÛ[\ÚZ\ÛX]ÚŠBˆÈHÛÛ[X[™YZ]ÈÛ›H[ˆ^XÚ]H™]šY]ÙYYØXÞHÚ\NÂˆÈ]™]™\ˆ\›œÈ[ˆ\˜š]˜\žH\ÜÚ\Ý[›ÝÈ[ÈY[ˆÝ]K‚ˆYˆ›Ý™K›X]Ú
+ˆ——ÕÛÛ™\Ý[
+Îˆ×—W——^ÌKMŸJO×Nˆ‹ÛÛ[
+N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠˆ˜Ø[™Y]H›ÝÈÜ›Ý×ÚYH\È›ÝHYØXÞHÛÛØ\œšY\ˆŠB‚ˆY]Y]HHÙ[‹—ÙXÛÙWÙ\Ü^WÛY]Y]J›ÝÖÈ™\Ü^WÛY]Y]H—JHÜˆßBˆX\šÙ\ˆHY]Y]K™Ù]
+QÐPÖWÕÓÓÐÐT”’QT—ÔUPTS•S‘WÓQUQUWÒÑVJBˆYˆ\Ú[œÝ[˜ÙJX\šÙ\‹XÝ
+N‚ˆYˆ
+ˆX\šÙ\‹™Ù]
+œØÚ[XHŠHOHQÐPÖWÕÓÓÐÐT”’QT—ÔUPTS•S‘WÔÐÒSPBˆÜˆX\šÙ\‹™Ù]
+›ÜšYÚ[˜[ØÛÛ[ÜÚLMˆŠHOH^XÝYÚ\ÚˆÜˆ›ÝÖÈ™\Ü^WÚÚ[™—HOHšY[ˆ‚ˆ
+N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠˆ˜Ø[™Y]H›ÝÈÜ›Ý×ÚYH\ÈHÛÛ™›XÝ[™È]X\˜[[™HŠBˆ[˜Ú[™ÙY
+ÏHBˆÛÛ[YBˆYˆ›ÝÖÈ™\Ü^WÚÚ[™—H\È›Ý›Û™N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠˆ˜Ø[™Y]H›ÝÈÜ›Ý×ÚYH[™XYH\È\Ü^HÝ]HŠB‚ˆY]Y]VÓQÐPÖWÕÓÓÐÐT”’QT—ÔUPTS•S‘WÓQUQUWÒÑVWHHÂˆœØÚ[XHŽˆQÐPÖWÕÓÓÐÐT”’QT—ÔUPTS•S‘WÔÐÒSPKˆ›ZYÜ˜][Û—ÚYŽˆZYÜ˜][Û—ÚYˆ›ÜšYÚ[˜[ØÛÛ[ÜÚLMˆŽˆ^XÝYÚ\ÚˆBˆ\]\Ë˜\[™
+
+›Ý×ÚYÙ[‹—Ù[˜ÛÙWÙ\Ü^WÛY]Y]JY]Y]JHÜˆžßHŠJBˆÚ[™ÙY
+ÏHB‚ˆYˆ›ÝžWÜ[Ž‚ˆ›Üˆ›Ý×ÚYY]Y]WÚœÛÛˆ[ˆ\]\Î‚ˆÛÛ›‹™^XÝ]Jˆ•TUHY\ÜØYÙ\ÈÑU\Ü^WÚÚ[™HË\Ü^WÛY]Y]HHÈÒT‘HYHÈ‹ˆ
+šY[ˆ‹Y]Y]WÚœÛÛ‹›Ý×ÚY
+Kˆ
+Bˆ™]\›ˆÈ˜Ú[™ÙYŽˆÚ[™ÙYYˆ›ÝžWÜ[ˆ[ÙH[˜Ú[™ÙYŽˆ[˜Ú[™ÙYB‚ˆ™]\›ˆÙ[‹—Ù^XÝ]WÝÜš]JÙÊB‚ˆÎˆÙ^H[™\ˆÚXÚY\ÜØYÙH™XXÝ[ÛœÈ]™H[œÚYH\Ü^WÛY]Y]X‚ˆÎˆ™XXÝ[ÛœÈÚ\™HH^\Ý[™È\‹[Y\ÜØYÙH”ÓÓˆÛÛ[[ˆ˜]\ˆ[ˆHÚYBˆÎˆX›HÛÈ^HÝ\š]™H™]Ú[™ØÛÛ\XÝ[Ûˆ›ÝÈ™]Üš]\ÈÚ]H›ÝÈ]Ù[‹‚ˆ‘PPÕSÓ”×ÓQUQUWÒÑVHHœ™XXÝ[ÛœÈ‚‚ˆYˆÙ]ÛY\ÜØYÙWÜ™XXÝ[ÛŠˆÙ[‹ˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆY\ÜØYÙWÜ›Ý×ÚYˆ[ˆ[[ÚšNˆÜ[Û˜[ÜÝ—Kˆ
+‹ˆ]]ÜŽˆÝˆH\Ù\ˆ‹ˆ
+HOˆÜ[Û˜[Ó\ÝÑXÝÜÝ‹[žWWWN‚ˆˆˆ”Ù]
+ÜˆÚ][[ÚšOS›Û™XÛX\ŠH
+˜]]ÜŠ‰ÜÈ™XXÝ[ÛˆÛˆÛ™HY\ÜØYÙK‚‚ˆSÔÈ\˜XÚÈÙ[X[XÜÎˆÛ™H™XXÝ[Ûˆ\ˆ]]Üˆ\ˆY\ÜØYÙKˆ™K\Ù[™[™ÂˆHØ[YH[[ÚšHÛX\œÈ]HY™™\™[[[ÚšH™\XÙ\È]ˆ™]\›œÈBˆY\ÜØYÙIÜÈ[™XXÝ[Ûˆ\ÝY\ˆHÜš]KÜˆ›Û™XÚ[ˆH›ÝÂˆÙ\Û‰Ý^\ÝÜˆ\Û‰Ý\Ùˆ
+œÙ\ÜÚ[Û—ÚY
+‹‚ˆˆˆ‚ˆYˆ›ÝÙ\ÜÚ[Û—ÚYÜˆY\ÜØYÙWÜ›Ý×ÚY\È›Û™N‚ˆ™]\›ˆ›Û™B‚ˆYˆÙÊÛÛ›ŠN‚ˆ›ÝÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕ\Ü^WÛY]Y]H”“ÓHY\ÜØYÙ\ÈÒT‘HYHÈS‘Ù\ÜÚ[Û—ÚYHÈ‹ˆ
+Y\ÜØYÙWÜ›Ý×ÚYÙ\ÜÚ[Û—ÚY
+Kˆ
+K™™]ÚÛ™J
+BˆYˆ›ÝÈ\È›Û™N‚ˆ™]\›ˆ›Û™B‚ˆY]HHÙ[‹—ÙXÛÙWÙ\Ü^WÛY]Y]J›ÝÖÌJHÜˆßBˆ^\Ý[™ÈHY]K™Ù]
+Ù[‹”‘PPÕSÓ”×ÓQUQUWÒÑVJBˆ™XXÝ[ÛœÈHÂˆ‚ˆ›Üˆˆ[ˆ
+^\Ý[™ÈYˆ\Ú[œÝ[˜ÙJ^\Ý[™Ë\Ý
+H[ÙH×JBˆYˆ\Ú[œÝ[˜ÙJ‹XÝ
+H[™‹™Ù]
+˜]]ÜˆŠHOH]]Ü‚ˆBˆ™]š[Ý\ÈH™^
+ˆ
+ˆ‚ˆ›Üˆˆ[ˆ
+^\Ý[™ÈYˆ\Ú[œÝ[˜ÙJ^\Ý[™Ë\Ý
+H[ÙH×JBˆYˆ\Ú[œÝ[˜ÙJ‹XÝ
+H[™‹™Ù]
+˜]]ÜˆŠHOH]]Ü‚ˆ
+Kˆ›Û™Kˆ
+BˆÈ\[™ÈH]™H™XXÝ[ÛˆYØZ[ˆ™]˜XÝÈ]‚ˆÙÙÛ[™×ÛÙ™ˆH
+ˆ[[ÚšH\È›Ý›Û™H[™™]š[Ý\È\È›Ý›Û™H[™™]š[Ý\Ë™Ù]
+™[[ÚšHŠHOH[[ÚšBˆ
+BˆYˆ[[ÚšH[™›ÝÙÙÛ[™×ÛÙ™Ž‚ˆ™XXÝ[ÛœË˜\[™
+ˆÈ™[[ÚšHŽˆÜØÜX—ÜÝ\œ›ÙØ]\Ê[[ÚšJK˜]]ÜˆŽˆ]]Ü‹˜]Žˆ[YK[YJ
+_Bˆ
+B‚ˆYˆ™XXÝ[ÛœÎ‚ˆY]VÜÙ[‹”‘PPÕSÓ”×ÓQUQUWÒÑVWHH™XXÝ[ÛœÂˆ[ÙN‚ˆY]KœÜ
+Ù[‹”‘PPÕSÓ”×ÓQUQUWÒÑVK›Û™JB‚ˆÛÛ›‹™^XÝ]Jˆ•TUHY\ÜØYÙ\ÈÑU\Ü^WÛY]Y]HHÈÒT‘HYHÈ‹ˆ
+Ù[‹—Ù[˜ÛÙWÙ\Ü^WÛY]Y]JY]JHYˆY]H[ÙH›Û™KY\ÜØYÙWÜ›Ý×ÚY
+Kˆ
+Bˆ™]\›ˆ™XXÝ[ÛœÂ‚ˆ™]\›ˆÙ[‹—Ù^XÝ]WÝÜš]JÙÊB‚ˆYˆÙ]ÛY\ÜØYÙWÜ™XXÝ[ÛœÊˆÙ[‹Ù\ÜÚ[Û—ÚYˆÝ‹Y\ÜØYÙWÜ›Ý×ÚYˆ[ˆ
+HOˆ\ÝÑXÝÜÝ‹[žWWN‚ˆˆˆ”™]\›ˆH™XXÝ[Ûˆ\Ý\œÚ\ÝYÛˆÛ™HY\ÜØYÙH›ÝÈ
+™]™\ˆ›Û™X
+Kˆˆˆ‚ˆYˆ›ÝÙ\ÜÚ[Û—ÚYÜˆY\ÜØYÙWÜ›Ý×ÚY\È›Û™N‚ˆ™]\›ˆ×B‚ˆÚ]Ù[‹—Ü™XYØÝ
+
+H\ÈÛÛ›Ž‚ˆ›ÝÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕ\Ü^WÛY]Y]H”“ÓHY\ÜØYÙ\ÈÒT‘HYHÈS‘Ù\ÜÚ[Û—ÚYHÈ‹ˆ
+Y\ÜØYÙWÜ›Ý×ÚYÙ\ÜÚ[Û—ÚY
+Kˆ
+K™™]ÚÛ™J
+B‚ˆYˆ›ÝÈ\È›Û™N‚ˆ™]\›ˆ×B‚ˆY]HHÙ[‹—ÙXÛÙWÙ\Ü^WÛY]Y]J›ÝÖÌJHÜˆßBˆ™XXÝ[ÛœÈHY]K™Ù]
+Ù[‹”‘PPÕSÓ”×ÓQUQUWÒÑVJB‚ˆ™]\›ˆÜˆ›Üˆˆ[ˆ™XXÝ[ÛœÈYˆ\Ú[œÝ[˜ÙJ‹XÝ
+WHYˆ\Ú[œÝ[˜ÙJ™XXÝ[ÛœË\Ý
+H[ÙH×B‚ˆYˆZÙWÝ[œÙY[—Ü™XXÝ[ÛœÊˆÙ[‹Ù\ÜÚ[Û—ÚYˆÝ‹
+‹]]ÜŽˆÝˆH\Ù\ˆ‚ˆ
+HOˆ\ÝÑXÝÜÝ‹[žWWN‚ˆˆˆ”™]\›ˆ
+˜]]ÜŠ‰ÜÈ›Ý^Y]\Ý\™˜XÙY™XXÝ[ÛœÈ[™X\šÈ[HÙY[‹‚‚ˆÝÙ\œÈHØXÚK\ØY™H[Ù[XÛÛ^]ˆ™XXÝ[ÛœÈ\™H[››Ý[˜ÙYÛˆBˆ‘V\Ù\ˆ\›ˆ
+™]™\ˆžH™]Üš][™ÈHY\ÜØYÙH]Ø\È™XXÝYÊK[™ˆHÙY[˜Ý[\ÝX\˜[Y\ÈXXÚÛ™H\È[››Ý[˜ÙY^XÝHÛ˜ÙK‚ˆˆˆ‚ˆYˆ›ÝÙ\ÜÚ[Û—ÚY‚ˆ™]\›ˆ×B‚ˆYˆÙÊÛÛ›ŠN‚ˆ›ÝÜÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕY›ÛKÛÛ[\Ü^WÛY]Y]H”“ÓHY\ÜØYÙ\È‚ˆ•ÒT‘HÙ\ÜÚ[Û—ÚYHÈS‘XÝ]™HHHS‘\Ü^WÛY]Y]HTÈ“Õ•S‚ˆ“Ô‘Tˆ–HY‹ˆ
+Ù\ÜÚ[Û—ÚY
+Kˆ
+K™™]Ú[
+
+B‚ˆ[™[™ÈH×Bˆ›Üˆ›ÝÈ[ˆ›ÝÜÎ‚ˆY]HHÙ[‹—ÙXÛÙWÙ\Ü^WÛY]Y]J›ÝÖÈ™\Ü^WÛY]Y]H—JBˆYˆ›ÝY]N‚ˆÛÛ[YBˆ™XXÝ[ÛœÈHY]K™Ù]
+Ù[‹”‘PPÕSÓ”×ÓQUQUWÒÑVJBˆYˆ›Ý\Ú[œÝ[˜ÙJ™XXÝ[ÛœË\Ý
+N‚ˆÛÛ[YB‚ˆÚ[™ÙYH˜[ÙBˆ›Üˆ™XXÝ[Ûˆ[ˆ™XXÝ[ÛœÎ‚ˆYˆ
+ˆ›Ý\Ú[œÝ[˜ÙJ™XXÝ[Û‹XÝ
+BˆÜˆ™XXÝ[Û‹™Ù]
+˜]]ÜˆŠHOH]]Ü‚ˆÜˆ™XXÝ[Û‹™Ù]
+œÙY[ˆŠBˆ
+N‚ˆÛÛ[YBˆ™XXÝ[Û–ÈœÙY[ˆ—HHYBˆÚ[™ÙYHYBˆÛÛ[HÙ[‹—ÙXÛÙWØÛÛ[
+›ÝÖÈ˜ÛÛ[—JBˆ[™[™Ë˜\[™
+ˆÂˆœ›Ý×ÚYŽˆ›ÝÖÈšY—Kˆœ›ÛHŽˆ›ÝÖÈœ›ÛH—Kˆ™[[ÚšHŽˆ™XXÝ[Û‹™Ù]
+™[[ÚšHŠHÜˆˆ‹ˆ^ŽˆÛÛ[Yˆ\Ú[œÝ[˜ÙJÛÛ[ÝŠH[ÙHˆ‹ˆBˆ
+B‚ˆYˆÚ[™ÙY‚ˆÛÛ›‹™^XÝ]Jˆ•TUHY\ÜØYÙ\ÈÑU\Ü^WÛY]Y]HHÈÒT‘HYHÈ‹ˆ
+Ù[‹—Ù[˜ÛÙWÙ\Ü^WÛY]Y]JY]JK›ÝÖÈšY—JKˆ
+B‚ˆ™]\›ˆ[™[™Â‚ˆ™]\›ˆÙ[‹—Ù^XÝ]WÝÜš]JÙÊHÜˆ×B‚ˆYˆ]\ÝÛY\ÜØYÙWÜ›Ý×ÚY
+ˆÙ[‹Ù\ÜÚ[Û—ÚYˆÝ‹
+‹›ÛNˆÝˆH\Ù\ˆ‹Ù™œÙ]ˆ[H™\]Z\™WÝ^ˆ›ÛÛHYBˆ
+HOˆÜ[Û˜[Ú[N‚ˆˆˆ”›ÝÈYÙˆH[ÜÝ™XÙ[XÝ]™HY\ÜØYÙHÚ]
+œ›ÛJ‹Üˆ›Û™X‚‚ˆÛÈØ[\œËØ[YH™YY8 %HY\ÜØYÙHHYX[‹Ú]Ý][ˆYŽˆHYÙ[ˆY˜][[™ÈÈH\›ˆ]šYÙÙ\™Y][™H\ÚÝÜ™XXÝ[™ÈÈBˆ]™HY\ÜØYÙH]\Û‰Ý›Ý[™]š\Y›ÝYÚH™\Ý[YHY]‚ˆÙ™œÙ]Ý\ÈÈX\›Y\ˆ\›œÈ
+HHHÛ™H™Y›Ü™HH]\Ý
+HÛÈBˆ™XXÝ[ÛˆØ[ˆ[™™]›ØXÝ]™[H8 %ÛÈY\ÜØYÙ\ÈYÛÈˆ\ÈÝÈHØ[\‚ˆ[šÜÈX›Ý]]‚‚ˆ™\]Z\™WÝ^
+Y˜][
+HÚÚ\È›ÝÜÈÚ]›ÈZ[‹]^ÛÛ[8 %ˆÛÛXØ[[Û›H\ÜÚ\Ý[\›œÈ[™]XÚY[ÝXœÈÛ‰Ý™[™\ˆ\ÂˆX˜›\ËÛÈH]\ÝY\ÜØYÙHˆ\ÈHSPSˆYX[œÈ]]\Ý™]™\‚ˆ™\ÛÛ™HÈÛ™H
+H™XXÝ[Ûˆ[™[™ÈÛˆ[ˆ[š\ÚX›H›ÝÈÛÚÜÈ›ÜYˆ[™]È[››Ý][Ûˆ][Ý\È[ˆ[\HÝš[™ÊK‚ˆˆˆ‚ˆYˆ›ÝÙ\ÜÚ[Û—ÚYÜˆ›ÛH›Ý[ˆÈ\Ù\ˆ‹˜\ÜÚ\Ý[ŸHÜˆÙ™œÙ]‚ˆ™]\›ˆ›Û™B‚ˆ^Ùš[\ˆH
+ˆS‘ÛÛ[TÈ“Õ•SS‘’SJÛÛ[
+HOH	ÉÈˆYˆ™\]Z\™WÝ^[ÙHˆ‚ˆ
+B‚ˆÚ]Ù[‹—Ü™XYØÝ
+
+H\ÈÛÛ›Ž‚ˆ›ÝÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕY”“ÓHY\ÜØYÙ\ÈÒT‘HÙ\ÜÚ[Û—ÚYHÈS‘›ÛHHÈ‚ˆˆS‘XÝ]™HHHÝ^Ùš[\ŸSÔ‘Tˆ–HYTÐÈSRUHÑ‘”ÑUÈ‹ˆ
+Ù\ÜÚ[Û—ÚY›ÛK[
+Ù™œÙ]
+JKˆ
+K™™]ÚÛ™J
+B‚ˆ™]\›ˆ›ÝÖÌHYˆ›ÝÈ[ÙH›Û™B‚ˆYˆ]\ÝÝ\Ù\—ÛY\ÜØYÙWÜ›Ý×ÚY
+Ù[‹Ù\ÜÚ[Û—ÚYˆÝŠHOˆÜ[Û˜[Ú[N‚ˆˆˆ”›ÝÈYÙˆH[ÜÝ™XÙ[XÝ]™H\Ù\ˆY\ÜØYÙKÜˆ›Û™X‚‚ˆHYÙ[	ÜÈY˜][™XXÝ[Ûˆ\™Ù]ˆHY\ÜØYÙH]šYÙÙ\™YYH‹ˆÛÈH[Ù[™]™\ˆ\ÈÈ™XY›ÝÈYÈ›ÝYÚHÛÛØ[
+Z\œ›ÜœÂˆHÝÛˆY\\‰ÜÈÜ™XÛÜ™Û\ÝÚ[˜›Ý[™
+K‚ˆˆˆ‚ˆ™]\›ˆÙ[‹›]\ÝÛY\ÜØYÙWÜ›Ý×ÚY
+Ù\ÜÚ[Û—ÚY›ÛOH\Ù\ˆŠB‚ˆYˆÙ]ÛY\ÜØYÙWÜ›ÛJÙ[‹Ù\ÜÚ[Û—ÚYˆÝ‹›Ý×ÚYˆ[
+HOˆÜ[Û˜[ÜÝ—N‚ˆˆˆ”›ÛHÙˆHXÝ]™HY\ÜØYÙH]
+œ›Ý×ÚY
+ˆ[ˆ
+œÙ\ÜÚ[Û—ÚY
+‹Üˆ›Û™X‚‚ˆ]ÈH™XXÝ[Ûˆ]™[Ø\œžHH\™Ù]	ÜÈ›ÛHÛÈH™[™\™\ˆØ[ˆX]ÚˆH]™HY\ÜØYÙH]Ù\Û‰ÝÛ›ÝÈ]È\˜X›H›ÝÈYY]‚ˆˆˆ‚ˆYˆ›ÝÙ\ÜÚ[Û—ÚY‚ˆ™]\›ˆ›Û™B‚ˆÚ]Ù[‹—Ü™XYØÝ
+
+H\ÈÛÛ›Ž‚ˆ›ÝÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕ›ÛH”“ÓHY\ÜØYÙ\ÈÒT‘HYHÈS‘Ù\ÜÚ[Û—ÚYHÈS‘XÝ]™HHH‹ˆ
+[
+›Ý×ÚY
+KÙ\ÜÚ[Û—ÚY
+Kˆ
+K™™]ÚÛ™J
+B‚ˆ™]\›ˆ›ÝÖÌHYˆ›ÝÈ[ÙH›Û™B‚ˆYˆÚ[œÙ\ÛY\ÜØYÙWÜ›ÝÜÊÙ[‹ÛÛ›‹Ù\ÜÚ[Û—ÚYˆÝ‹Y\ÜØYÙ\Îˆ\ÝÑXÝÜÝ‹[žWWJHOˆ\VÚ[[N‚ˆˆˆ’[œÙ\
+›Y\ÜØYÙ\Êˆ\Èœ™\ÚXÝ]™H›ÝÜÈ›Üˆ
+œÙ\ÜÚ[Û—ÚY
+‹‚‚ˆÚ\™YžH›Y]˜™\XÙWÛY\ÜØYÙ\Ø
+[]K][‹Z[œÙ\
+H[™ˆ›Y]˜\˜Ú]™WØ[™ØÛÛ\XÝ
+ÛÙX\˜Ú]™K][‹Z[œÙ\
+Kˆ[œÈ[œÚYHBˆØ[\‰ÜÈÜš]H˜[œØXÝ[Ûˆ
+ZÙ\ÈH]™HÛÛ›˜
+Kˆ™]\›œÂˆ
+[œÙ\YØÛÝ[ÛÛØØ[ØÛÝ[
+XˆÙ\È“ÕÝXÚÙ\ÜÚ[ÛœËŠˆÛÝ[\œÂˆ8 %HØ[\ˆÝÛœÈ]Ú[˜ÙHHÛÈ›ÝÜÈ™XÛÛ˜Ú[HÛÝ[ÈY™™\™[K‚ˆˆˆ‚ˆ›Ý×ÝÈH[YK[YJ
+Bˆ[œÙ\YHˆÛÛØØ[×ÝÝ[Hˆ›Üˆ\ÙÈ[ˆY\ÜØYÙ\Î‚ˆ›ÛHH\ÙË™Ù]
+œ›ÛH‹[šÛ›ÝÛˆŠBˆÛÛØØ[ÈH\ÙË™Ù]
+ÛÛØØ[ÈŠBˆY\ÜØYÙWÝ[Y\Ý[\H›Ý×ÝÂˆYˆ\ÙË™Ù]
+[Y\Ý[\ŠH\È›Ý›Û™N‚ˆžN‚ˆ×Ý˜[YHH\ÙË™Ù]
+[Y\Ý[\ŠBˆYˆ\Ø]Š×Ý˜[YK[Y\Ý[\ŠN‚ˆY\ÜØYÙWÝ[Y\Ý[\H›Ø]
+×Ý˜[YK[Y\Ý[\
+
+JBˆ[ÙN‚ˆY\ÜØYÙWÝ[Y\Ý[\H›Ø]
+×Ý˜[YJBˆ^Ù\
+\Q\œ›Ü‹˜[YQ\œ›ÜŠN‚ˆÙÙÙ\‹™XYÊ’YÛ›Üš[™È[˜[Y^XÚ]Y\ÜØYÙH[Y\Ý[\ˆ	\ˆ‹\ÙË™Ù]
+[Y\Ý[\ŠJBˆ™X\ÛÛš[™×Ù]Z[ÈH\ÙË™Ù]
+œ™X\ÛÛš[™×Ù]Z[ÈŠHYˆ›ÛHOH˜\ÜÚ\Ý[ˆ[ÙH›Û™BˆÛÙ^Ü™X\ÛÛš[™×Ú][\ÈH
+ˆ\ÙË™Ù]
+˜ÛÙ^Ü™X\ÛÛš[™×Ú][\ÈŠHYˆ›ÛHOH˜\ÜÚ\Ý[ˆ[ÙH›Û™Bˆ
+BˆÛÙ^ÛY\ÜØYÙWÚ][\ÈH
+ˆ\ÙË™Ù]
+˜ÛÙ^ÛY\ÜØYÙWÚ][\ÈŠHYˆ›ÛHOH˜\ÜÚ\Ý[ˆ[ÙH›Û™Bˆ
+Bˆ™X\ÛÛš[™×Ù]Z[×ÚœÛÛˆHÙ[‹—Ü™X\ÛÛš[™×ÚœÛÛ—Ý^
+™X\ÛÛš[™×Ù]Z[ÊBˆÛÙ^Ú][\×ÚœÛÛˆHÙ[‹—Ü™X\ÛÛš[™×ÚœÛÛ—Ý^
+ÛÙ^Ü™X\ÛÛš[™×Ú][\ÊBˆÛÙ^ÛY\ÜØYÙWÚ][\×ÚœÛÛˆHÙ[‹—Ü™X\ÛÛš[™×ÚœÛÛ—Ý^
+ÛÙ^ÛY\ÜØYÙWÚ][\ÊBˆÈÛÛØØ[ÈX^H\œš]™H\ÈH]Ûˆ\Ý
+œ›ÛHH]™HYÙ[
+BˆÈÜˆ\ÈH”ÓÓˆÝš[™È
+œ›ÛH[\ÜÜÙ\ÜÚ[ÛœÈÈ^ÜÜÙ\ÜÚ[Û‹ˆÈÚXÚÝÜ™H]\ÈV
+KˆœÛÛ‹™[\ÈÛˆ[ˆ[™XYK\Ù\šX[^™YˆÈÝš[™ÈÝX›KY[˜ÛÙ\È]ÛÈ\œÙHš\œÝ‚ˆYˆ\Ú[œÝ[˜ÙJÛÛØØ[ËÝŠN‚ˆžN‚ˆÛÛØØ[ÈHœÛÛ‹›ØYÊÛÛØØ[ÊBˆ^Ù\
+œÛÛ‹’”ÓÓ‘XÛÙQ\œ›Ü‹\Q\œ›ÜŠN‚ˆÛÛØØ[ÈH×BˆÛÛØØ[×ÚœÛÛˆHœÛÛ‹™[\ÊÛÛØØ[ÊHYˆÛÛØØ[È[ÙH›Û™BˆÈXØÙ\Z]\ˆ]›Ü›WÛY\ÜØYÙWÚY
+™]È^XÚ]˜[YJHÜ‚ˆÈY\ÜØYÙWÚY
+]X[˜˜[ÉÜÈ^\Ý[™ÈÛÛ™[[ÛˆÛˆY\ÜØYÙHXÝÊK‚ˆ]›Ü›WÛ\Ù×ÚYH
+ˆ\ÙË™Ù]
+œ]›Ü›WÛY\ÜØYÙWÚYŠHÜˆ\ÙË™Ù]
+›Y\ÜØYÙWÚYŠBˆ
+B‚ˆ\WØÛÛ[H\ÙË™Ù]
+˜\WØÛÛ[ŠB‚ˆÝ\ˆHÛÛ›‹™^XÝ]Jˆˆˆ’S”ÑT•S•ÈY\ÜØYÙ\È
+Ù\ÜÚ[Û—ÚY›ÛKÛÛ[ÛÛØØ[ÚYˆÛÛØØ[ËÛÛÛ˜[YKY™™XÝÙ\ÜÜÚ][Û‹[Y\Ý[\ÚÙ[—ØÛÝ[š[š\ÚÜ™X\ÛÛ‹ˆ™X\ÛÛš[™Ë™X\ÛÛš[™×ØÛÛ[™X\ÛÛš[™×Ù]Z[ËÛÙ^Ü™X\ÛÛš[™×Ú][\ËˆÛÙ^ÛY\ÜØYÙWÚ][\Ë]›Ü›WÛY\ÜØYÙWÚYØœÙ\™YØÛÛ\™\ÜÙYÜÝ[[X\žKXÝ]™K\WØÛÛ[\Ü^WÚÚ[™\Ü^WÛY]Y]JBˆSQTÈ
+ËËËËËËËËËËËËËËËËËËËËËÊHˆˆ‹ˆ
+ˆÙ\ÜÚ[Û—ÚYˆ›ÛKˆÙ[‹—Ù[˜ÛÙWØÛÛ[
+\ÙË™Ù]
+˜ÛÛ[ŠJKˆ\ÙË™Ù]
+ÛÛØØ[ÚYŠKˆÛÛØØ[×ÚœÛÛ‹ˆÜØÜX—ÜÝ\œ›ÙØ]\Ê\ÙË™Ù]
+ÛÛÛ˜[YHŠJKˆ\ÙË™Ù]
+™Y™™XÝÙ\ÜÜÚ][ÛˆŠKˆY\ÜØYÙWÝ[Y\Ý[\ˆ\ÙË™Ù]
+ÚÙ[—ØÛÝ[ŠKˆ\ÙË™Ù]
+™š[š\ÚÜ™X\ÛÛˆŠKˆÜØÜX—ÜÝ\œ›ÙØ]\Ê\ÙË™Ù]
+œ™X\ÛÛš[™ÈŠJHYˆ›ÛHOH˜\ÜÚ\Ý[ˆ[ÙH›Û™KˆÜØÜX—ÜÝ\œ›ÙØ]\Ê\ÙË™Ù]
+œ™X\ÛÛš[™×ØÛÛ[ŠJHYˆ›ÛHOH˜\ÜÚ\Ý[ˆ[ÙH›Û™Kˆ™X\ÛÛš[™×Ù]Z[×ÚœÛÛ‹ˆÛÙ^Ú][\×ÚœÛÛ‹ˆÛÙ^ÛY\ÜØYÙWÚ][\×ÚœÛÛ‹ˆ]›Ü›WÛ\Ù×ÚYˆHYˆ\ÙË™Ù]
+›ØœÙ\™YŠH[ÙHˆHYˆ\ÙË™Ù]
+—ØÛÛ\™\ÜÙYÜÝ[[X\žHŠH[ÙHˆKˆÜØÜX—ÜÝ\œ›ÙØ]\Ê\WØÛÛ[
+HYˆ\Ú[œÝ[˜ÙJ\WØÛÛ[ÝŠH[ÙH›Û™KˆÜØÜX—ÜÝ\œ›ÙØ]\Ê\ÙË™Ù]
+™\Ü^WÚÚ[™ŠJHYˆ\Ú[œÝ[˜ÙJ\ÙË™Ù]
+™\Ü^WÚÚ[™ŠKÝŠH[ÙH›Û™KˆÙ[‹—Ù[˜ÛÙWÙ\Ü^WÛY]Y]J\ÙË™Ù]
+™\Ü^WÛY]Y]HŠJKˆ
+Kˆ
+BˆYˆ\Ú[œÝ[˜ÙJ\ÙËXÝ
+H[™Ý\‹›\Ý›ÝÚY\È›Ý›Û™N‚ˆ\ÙÖÈ—Ü›Ý×ÚY—HHÝ\‹›\Ý›ÝÚYˆ[œÙ\Y
+ÏHBˆYˆÛÛØØ[È\È›Ý›Û™N‚ˆÛÛØØ[×ÝÝ[
+ÏH
+ˆ[ŠÛÛØØ[ÊHYˆ\Ú[œÝ[˜ÙJÛÛØØ[Ë\Ý
+H[ÙHBˆ
+Bˆ›Ý×ÝÈHX^
+›Ý×ÝÈ
+ÈYKM‹Y\ÜØYÙWÝ[Y\Ý[\
+ÈYKMŠBˆ™]\›ˆ[œÙ\YÛÛØØ[×ÝÝ[‚ˆYˆ™\XÙWÛY\ÜØYÙ\ÊˆÙ[‹ˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆY\ÜØYÙ\Îˆ\ÝÑXÝÜÝ‹[žWWKˆXÝ]™WÛÛ›Nˆ›ÛÛH˜[ÙKˆ\˜Ú]™WÙ›ÜYˆ›ÛÛH˜[ÙKˆ™Z™XÝØXÝ]™WÝ\›—ÛX\ÙNˆ›ÛÛH˜[ÙKˆ
+HOˆ›Û™N‚ˆˆˆ]ÛZXØ[H™\XÙHHÝÜ™YY\ÜØYÙ\È›ÜˆHÙ\ÜÚ[Û‹‚‚ˆ\ÙYžH˜[œØÜš\\™]Üš]H›ÝÜÈÝXÚ\ÈÜ™]žKÝ[™Ë[™ØÛÛ\™\ÜË‚ˆH[]H
+È™Z[œÙ\Ù\]Y[˜ÙH]\ÝÛÛ[Z]\ÈÛ™H˜[œØXÝ[ÛˆÛÈBˆZY\™]Üš]H˜Z[\™HÙ\È›ÝX]™HÔS]HÚ]H\X[˜[œØÜš\‚‚ˆTÕ•PÕU‘HžHY˜][ˆ]™\žH›ÝÈ›ÜˆHÙ\ÜÚ[Ûˆ\ÈSUY
+[™›ÜÂˆÝ]ÙˆH•È[™^
+Kˆ›ÜˆÛÛ\XÝ[Ûˆ]]\Ý™\Ù\™HBˆ™KXÛÛ\XÝ[Ûˆ˜[œØÜš\[™\ˆHØ[YHY\ÙBˆ›Y]˜\˜Ú]™WØ[™ØÛÛ\XÝ[œÝXY‚‚ˆ\ÜÈXÝ]™WÛÛ›OUYXÈ™\XÙHÓ“HH]™H
+XÝ]™HHX
+H›ÝÜËˆX]š[™ÈÛÙX\˜Ú]™Y›ÝÜÈ
+XÝ]™HH8 %K™ËˆHÛÛ\XÝYHXˆ\›œÈ]›Y]˜\˜Ú]™WØ[™ØÛÛ\XÝÙY\ÈÛˆ\ÚÈ›ÜˆÌÎÍŒÂˆ\˜Xš[]KÜˆ™]Ú[™Ý[™È›ÝÜÊH[ÝXÚYˆØ[\œÈ]Ú\™HHÙ\ÜÚ[Û‚ˆYÚ][ˆYÙ[[™XYH[›š[™È[‹\XÙHÛÛ\XÝ[Ûˆ]\Ý\ÙH\ÈÛÈBˆ[Z\ÝÜžH™]Üš]HÙ\Û‰ÝÚ\HH›ÝÜÈHYÙ[[X™\˜][Bˆ\˜Ú]™YˆY\ÜØYÙWØÛÝ[ØÛÛØØ[ØÛÝ[[ˆ˜XÚÈH]™HÙ]ˆX]Ú[™È›Y]˜\˜Ú]™WØ[™ØÛÛ\XÝ‚‚ˆ\ÜÈ\˜Ú]™WÙ›ÜYUYXÈÓÑ•X\˜Ú]™HH]™H›ÝÜÈ[œÝXYÙ‚ˆSUZ[™È[NˆH™\XÙY\›œÈÝ^HÛˆ\ÚÈÚ]XÝ]™HHˆÛÛ\XÝYH8 %HØ[YHH\Ù\ˆÛÚÈ]˜XÚÈˆX\šÚ[™Âˆ›Y]˜™]Ú[™Ý×ÛY\ÜØYÙX\Y\È8 %[™Ý^H™XYX›HšXBˆ›Y]˜Ù]ÛY\ÜØYÙ\ØÚ][˜ÛYWÚ[˜XÝ]™OUYXˆ\È\ÈH[ÙHBˆ™]Ú[™ÙY]Ü™YÙ[™\˜]H]\Ý\ÙNˆÜÙH›ÝÜÈÝ™\Üš]HH˜[œØÜš\Bˆ\Ù\ˆX^H›Ý]™HYX[È›Ü[™HZ[ˆSUH[ÛÈ]šXÝÈH›ÝÜÂˆœ›ÛHH•È[™^X]š[™È›Ý[™ÈÈ™XÛÝ™\ˆœ›ÛH
+ÎÍMŠKˆ][\Y\ÂˆXÝ]™K[Û›H[™[™È8 %[™XYKX\˜Ú]™Y›ÝÜÈ\™H™]™\ˆÝXÚY8 %ÛÂˆXÝ]™WÛÛ›X\È™Y[™[Ú]]ˆH™]Üš][ˆÙ]\È[œÙ\Y\Âˆœ™\ÚXÝ]™H›ÝÜÈ^XÝH\È[ˆH\ÝXÝ]™H]ÛÈH]™HšY]Âˆ\ÈY[XØ[Z]\ˆØ^NÈÛ›HH\˜Xš[]HÙˆH›ÜY\›œÂˆY™™\œË‚‚ˆ\ÜÈ™Z™XÝØXÝ]™WÝ\›—ÛX\ÙOUYX›Üˆ\Ù\‹Z[š]X]Y™]Üš]\È]ˆÈ›Ý[™XYHÝÛˆHÜ›ÜÜË\›ØÙ\ÜÈ\›ˆX\ÙKˆHX\ÙHÚXÚÈ[™ˆ˜[œØÜš\]]][Ûˆ[ˆÚ\™HÛ™HÜš]H˜[œØXÝ[Û‹ÛÈHÙXÛÛ™ˆ›ØÙ\ÜÈØ[››Ý\˜Ú]™HÜˆ™\XÙHH\›ˆ]\ÈÝ[™Z[™È›ÙXÙY‚ˆˆˆ‚‚ˆXÝ]™WØÛ]\ÙHHˆS‘XÝ]™HHHˆYˆXÝ]™WÛÛ›H[ÙHˆ‚‚ˆYˆÙÊÛÛ›ŠN‚ˆYˆ™Z™XÝØXÝ]™WÝ\›—ÛX\ÙN‚ˆÙ[‹—ØÚXÚ×Ý˜[œØÜš\ÝÜš]WÙÝX\™ÊˆÛÛ›‹ˆÙ\ÜÚ[Û—ÚYˆ›Û™Kˆ™Z™XÝØXÝ]™WÝ\›—ÛX\ÙOUYKˆ™Z™XÝØXÝ]™WØÛÛ\™\ÜÚ[Û—ÛØÚÏUYKˆ
+Bˆ[ÙN‚ˆÙ\ÜÚ[ÛˆHÛÛ›‹™^XÝ]Jˆ”ÑSPÕ[™YØ][™Ü™X\ÛÛˆ”“ÓHÙ\ÜÚ[ÛœÈÒT‘HYHÈ‹ˆ
+Ù\ÜÚ[Û—ÚY
+Kˆ
+K™™]ÚÛ™J
+BˆYˆ
+ˆÙ\ÜÚ[Ûˆ\È›Ý›Û™Bˆ[™Ù\ÜÚ[Û–È™[™YØ]—H\È›Ý›Û™Bˆ[™Ù\ÜÚ[Û–È™[™Ü™X\ÛÛˆ—HOH˜ÛÛ\™\ÜÚ[Ûˆ‚ˆ
+N‚ˆ˜Z\ÙHÛÛ\™\ÜÚ[Û”Ù\ÜÚ[ÛÛÜÙY\œ›ÜŠÙ\ÜÚ[Û—ÚY
+BˆYˆ\˜Ú]™WÙ›ÜY‚ˆÈÛÛ[\™\Ù\š[™ÈTUNˆH›ÝÜÈÙY\Z\ˆ•È[šY\ÂˆÈ
+HY\ÜØYÙ\×ÙÈšYÙÙ\œÈš\™HÛˆS”ÑT•ÈSUHÈTUBˆÈÙˆÛÛ[ÛÛ[[œË›ÝÛˆXÝ]™X
+KÛÈH™\XÙY\›œÂˆÈÝ^H™XYX›HšXHÙ]ÛY\ÜØYÙ\Ê[˜ÛYWÚ[˜XÝ]™OUYJH[™ˆÈÙX\˜ÚX›HÚ][˜ÛYWÚ[˜XÝ]™OUYHY\ˆH™]Üš]K‚ˆÛÛ›‹™^XÝ]Jˆ•TUHY\ÜØYÙ\ÈÑUXÝ]™HH‚ˆ•ÒT‘HÙ\ÜÚ[Û—ÚYHÈS‘XÝ]™HHH‹ˆ
+Ù\ÜÚ[Û—ÚY
+Kˆ
+Bˆ[ÙN‚ˆÛÛ›‹™^XÝ]Jˆˆ‘SUH”“ÓHY\ÜØYÙ\ÈÒT‘HÙ\ÜÚ[Û—ÚYHÞØXÝ]™WØÛ]\Ù_H‹ˆ
+Ù\ÜÚ[Û—ÚY
+Kˆ
+BˆÛÛ›‹™^XÝ]Jˆ•TUHÙ\ÜÚ[ÛœÈÑUY\ÜØYÙWØÛÝ[HÛÛØØ[ØÛÝ[HÒT‘HYHÈ‹ˆ
+Ù\ÜÚ[Û—ÚY
+Kˆ
+BˆÝ[ÛY\ÜØYÙ\ËÝ[ÝÛÛØØ[ÈHÙ[‹—Ú[œÙ\ÛY\ÜØYÙWÜ›ÝÜÊˆÛÛ›‹Ù\ÜÚ[Û—ÚYY\ÜØYÙ\Âˆ
+BˆÛÛ›‹™^XÝ]Jˆ•TUHÙ\ÜÚ[ÛœÈÑUY\ÜØYÙWØÛÝ[HËÛÛØØ[ØÛÝ[HÈÒT‘HYHÈ‹ˆ
+Ý[ÛY\ÜØYÙ\ËÝ[ÝÛÛØØ[ËÙ\ÜÚ[Û—ÚY
+Kˆ
+B‚ˆÙ[‹—Ù^XÝ]WÝÜš]JÙÊB‚ˆYˆ\×Ø\˜Ú]™YÛY\ÜØYÙ\ÊÙ[‹Ù\ÜÚ[Û—ÚYˆÝŠHOˆ›ÛÛ‚ˆˆˆ”™]\›ˆYHYˆHÙ\ÜÚ[Ûˆ\È[žHÛÙX\˜Ú]™Y
+XÝ]™HH
+H›ÝÜË‚‚ˆÚX\^\Ý[˜ÙH›Ø™H8 %Ù\È›ÝØY›ÝÜËˆ“ÕNˆ›ÙXÝ[Ûˆ™]Üš]Bˆ]È›ÈÛ™Ù\ˆœ˜[˜ÚÛˆ\È
+^H\ÜÈXÝ]™WÛÛ›OUYXˆ[˜ÛÛ™][Û˜[H8 %H›Ø™HØ[ˆ˜Z[Ü[ˆÜˆ˜XÙHHÛÛ˜Ý\œ™[ˆ\˜Ú]™WØ[™ØÛÛ\XÝÎŒMŠNÈÙ\›Üˆ\ÝÈ[™XYÛ›ÜÝXÜË‚ˆˆˆ‚ˆÚ]Ù[‹—Ü™XYØÝ
+
+H\ÈÛÛ›Ž‚ˆÝ\œÛÜˆHÛÛ›‹™^XÝ]Jˆ”ÑSPÕH”“ÓHY\ÜØYÙ\ÈÒT‘HÙ\ÜÚ[Û—ÚYHÈS‘XÝ]™HHSRUH‹ˆ
+Ù\ÜÚ[Û—ÚY
+Kˆ
+Bˆ™]\›ˆÝ\œÛÜ‹™™]ÚÛ™J
+H\È›Ý›Û™B‚ˆYˆÙ]ØXÝ]™WÛY\ÜØYÙWÝØ]\›X\šÊÙ[‹Ù\ÜÚ[Û—ÚYˆÝŠHOˆ[‚ˆˆˆ“PV
+Y
+HÙˆHÙ\ÜÚ[Û‰ÜÈXÝ]™H›ÝÜÈ8 %HÛÛ\™\ÜÚ[ÛˆØ]\›X\šË‚‚ˆØ\\™Y]ÛÛ\™\ÜÚ[ÛˆÕT•
+™Y›Ü™HHÛÝÈ›ÝšY\ˆÝ[[X\žHØ[
+K‚ˆ]™\žHXÝ]™H›ÝÈÚ]YˆØ]\›X\šØ]ÛÛ[Z][YH\œš]™YˆÛÛ˜Ý\œ™[H[™]\ÝÝ\š]™HHÛÛ\XÝ[Ûˆ™\˜˜][Kˆ™]\›œÈ›Ü‚ˆ[ˆ[\KÝ[šÛ›ÝÛˆÙ\ÜÚ[Û‹‚ˆˆˆ‚ˆYˆ›ÝÙ\ÜÚ[Û—ÚY‚ˆ™]\›ˆˆÚ]Ù[‹—Ü™XYØÝ
+
+H\ÈÛÛ›Ž‚ˆ›ÝÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕÓÐSTÐÑJPV
+Y
+K
+H”“ÓHY\ÜØYÙ\È‚ˆ•ÒT‘HÙ\ÜÚ[Û—ÚYHÈS‘XÝ]™HHH‹ˆ
+Ù\ÜÚ[Û—ÚY
+Kˆ
+K™™]ÚÛ™J
+Bˆ™]\›ˆ[
+›ÝÖÌJHYˆ›ÝÈ[ÙH‚ˆYˆ\˜Ú]™WØ[™ØÛÛ\XÝ
+ˆÙ[‹ˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆÛÛ\XÝYÛY\ÜØYÙ\Îˆ\ÝÑXÝÜÝ‹[žWWKˆ[Ù[ØÛÛ™šY×Ü]ÚˆÜ[Û˜[ÑXÝÜÝ‹[žWWHH›Û™KˆØ]\›X\šÎˆÜ[Û˜[Ú[HH›Û™KˆØÚ×ÚÛ\ŽˆÜ[Û˜[ÜÝ—HH›Û™KˆZ[ØÛÝ[ˆ[Hˆ
+HOˆ[‚ˆˆˆ“›Û‹Y\ÝXÝ]™H[‹\XÙHÛÛ\XÝ[Ûˆ›ÜˆHÚ[™ÛH\˜X›HÙ\ÜÚ[ÛˆY‚‚ˆÛÙX\˜Ú]™\ÈHXÝ]™HY\ÜØYÙ\È
+XÝ]™HH
+H[™[œÙ\Âˆ
+˜ÛÛ\XÝYÛY\ÜØYÙ\Êˆ\Èœ™\ÚXÝ]™H›ÝÜÈ8 %]ÛZXØ[K[ˆÛ™HÜš]Bˆ˜[œØXÝ[Û‹ˆHÛÛ™\œØ][ÛˆÙY\ÈÓ‘HÙ\ÜÚ[ÛˆY›ÜˆY™H
+ÌÎÍŒÊBˆÒUÕU\Ý›ÞZ[™È\ÝÜžN‚‚ˆHH]™KXÛÛ^ØY
+›Y]˜Ù]ÛY\ÜØYÙ\×Ø\×ØÛÛ™\œØ][Û˜ˆ›Y]˜Ù]ÛY\ÜØYÙ\Ø
+Hš[\œÈXÝ]™HHXžHY˜][ÛÈH[Ù[ˆ™[ØYÈÓ“HHÛÛ\XÝYÙ]‚ˆHH\˜Ú]™Y™KXÛÛ\XÝ[Ûˆ\›œÈÝ^HÛˆ\ÚÈ
+XÝ]™OL
+H[™Ý^BˆTÐÓÕ‘TP“Nˆ^H\™HX\šÙYÛÛ\XÝYLK[™ÙX\˜ÚÛY\ÜØYÙ\Ê
+Bˆ[˜ÛY\ÈÛÛ\XÝYLH›ÝÜÈžHY˜][8 %ÛÈÙ\ÜÚ[Û—ÜÙX\˜ÚÝ[š[™Âˆ[K[›ZÙH™]Ú[™Ý[™È›ÝÜÈ
+XÝ]™OLÛÛ\XÝYL
+HÚXÚÝ^BˆY[‹ˆ^H™[XZ[ˆ[ˆH•È[™^
+HY\ÜØYÙ\×ÙÊˆšYÙÙ\œÂˆ[™^ÛˆS”ÑT•È›ÜÛˆSUH[™Û‰ÝÙ^HÛˆXÝ]™KØÛÛ\XÝYÂˆ›\[™ÈÈXÝ]™OL\ÈHÛÛ[\™\Ù\š[™ÈTUJH[™\™Bˆ™XÛÝ™\˜X›HšXHÙ]ÛY\ÜØYÙ\Ê‹‹‹[˜ÛYWÚ[˜XÝ]™OUYJK‚‚ˆÛÛ˜Ý\œ™[X\[™ØY™]H
+ÍÍLÌMŠNˆÚ[ˆ
+Ø]\›X\šÊˆ\È›ÝšYY
+Bˆ˜[YHÙˆ›Y]˜Ù]ØXÝ]™WÛY\ÜØYÙWÝØ]\›X\šØØ\\™Y]ÛÛ\™\ÜÚ[Û‚ˆÕT•
+K›ÝÜÈ]\œš]™Y\š[™ÈHÛÝÈ›ÝšY\ˆÝ[[X\žHØ[ˆ
+YˆØ]\›X\šØ
+H\™H“ÕÝ[[X\š^™Y]Ø^Kˆ^H\™H™K\Ù\]Y[˜ÙYˆY\ˆHÛÛ\XÝYÙ]žHH\™KTÔSÛÛ[[ˆÛÛ™H
+]™\žHÛÛ[[‚ˆ^Ù\Y8 %ÛÛ[\WØÛÛ[]›Ü›WÛY\ÜØYÙWÚYÚÙ[‚ˆÛÝ[Ë™X\ÛÛš[™ÈÚYXØ\œÈ[Ý\š]™Hž]KY^XÝ[™H•ÂˆšYÙÙ\œÈ[™^HÛÛ™\È˜]\˜[JK[™HÜšYÚ[˜[È\™H\˜Ú]™Y‚ˆ“ÕNˆ™K\Ù\]Y[˜Ú[™È\ÜÚYÛœÈHZ[›ÝÜÈœ™\ÚYÎÈÛÛœÝ[Y\œÈ]ˆ™Y™\™[˜ÙH\˜X›H›ÝÈYÈ™K\™\ÛÛ™HžHÛÛ[
+ÙYHÙNXŒŒL
+K‚ˆØ]\›X\šÏS›Û™X™\Ù\™\ÈH\ÝÜšXØ[\˜Ú]™KY]™\ž][™Âˆ™Z]š[Ü‹‚‚ˆZ[ØÛÝ[X\šÜÈH\ÝØ\œšYYY›ÜØ\™XÝ]™H›ÝÜÈ\ÂˆÝ\\œÙYY\XØ]\È
+XÝ]™HHÛÛ\XÝYH
+H[œÝXYÙ‚ˆÝ[[X\š^™Y\ÝÜžKˆÚ[ˆ›Ý\™Ý[Y[È\™H™\Ù[HZ[Ø[È\Âˆ›Ý[™Y]
+Ø]\›X\šÊˆÛÈÛÛ˜Ý\œ™[\[™ÈÈ›ÝÛÛœÝ[YHÛÝË‚‚ˆÛÛ[Z]Y™[˜ÙHØY™]NˆÚ[ˆ
+›ØÚ×ÚÛ\Šˆ\È›ÝšYYHÛÛ[Z]ˆ™\šYšY\ÈS”ÒQHH˜[œØXÝ[Ûˆ]HÛÛ\™\ÜÚ[ÛˆØÚÈ\ÈÝ[ˆ[žH]Û\ˆ[™[™^\™Y8 %HÛÛ\™\ÜÚ[ÛˆÚÜÙHX\ÙHØ\Âˆ™XÛZ[YY
+Ü˜\ÚÛX[\^\žKÛÛ\][™ÈÜš]\ŠH˜Z[ÈBˆÛÛ[Z][œÝXYÙˆÛØ˜™\š[™ÈHÚ[›™\‰ÜÈ˜[œØÜš\‚‚ˆY\ÜØYÙWØÛÝ[\ÈÙ]ÈHPÕU‘HÛÝ[Y\ˆÛÛ[Z]X]Ú[™ÂˆÚ]H]™HØY™]\›œËˆ[Ù[ØÛÛ™šY×Ü]Ú\ÈY\™ÙY[ÈBˆÙ\ÜÚ[Û‰ÜÈ”ÓÓˆÛÛ™šYÈ[ˆHØ[YH˜[œØXÝ[ÛŽÈH›Û™X˜[YBˆ™[[Ý™\È]Ù^Kˆ™]\›œÈH™]ÈXÝ]™HÛÝ[‚ˆˆˆ‚‚ˆYˆÙÊÛÛ›ŠN‚ˆYˆØÚ×ÚÛ\ˆ\È›Ý›Û™N‚ˆØÚ×Ü›ÝÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕÛ\‹^\™\×Ø]”“ÓHÛÛ\™\ÜÚ[Û—ÛØÚÜÈ‚ˆ•ÒT‘HÙ\ÜÚ[Û—ÚYHÈ‹ˆ
+Ù\ÜÚ[Û—ÚY
+Kˆ
+K™™]ÚÛ™J
+BˆYˆ
+ˆØÚ×Ü›ÝÈ\È›Û™BˆÜˆØÚ×Ü›ÝÖÈšÛ\ˆ—HOHØÚ×ÚÛ\‚ˆÜˆ›Ø]
+ØÚ×Ü›ÝÖÈ™^\™\×Ø]—JHH[YK[YJ
+Bˆ
+N‚ˆ˜Z\ÙHÙ\ÜÚ[ÛÛÛ\™\ÜÚ[Û’[”›ÙÜ™\ÜÑ\œ›ÜŠˆˆÛÛ\™\ÜÚ[ÛˆX\ÙH›ÜˆÜÙ\ÜÚ[Û—ÚY\ŸHÜÝ™Y›Ü™H‚ˆ˜ÛÛ[Z]È™Y\Ú[™ÈÈX›\ÚHÝ[HÛÛ\XÝ[Ûˆ‚ˆ
+B‚ˆ]ÚYÛ[Ù[ØÛÛ™šYÈH›Û™BˆYˆ[Ù[ØÛÛ™šY×Ü]Ú\È›Ý›Û™N‚ˆÈÛ—ÛZ\ÜÚ[™ÏHœ˜Z\ÙHŽˆH[™KØÛÛ\XÝ[Ûˆ]\Ý›ÝÛÛ[Z]ˆÈYØZ[œÝH˜[š\ÚYÙ\ÜÚ[Ûˆ›ÝÈ
+HÛÛ\™\ÜÛÜ‰ÜÈØ[\‚ˆÈÛÛ™\ÈH˜Z\ÙY\œ›Üˆ[ÈHØY™HÙY\]K[ÜšYÚ[˜[ˆÈ›Ë[Ü
+K[›ZÙHH›YÈÙ]\œÈÚXÚÛ\˜]HZ\ÜÚ[™È›ÝÜË‚ˆ]ÚYÛ[Ù[ØÛÛ™šYÈHÙ[‹—ÛY\™ÙWÛ[Ù[ØÛÛ™šY×ÚœÛÛŠˆÛÛ›‹Ù\ÜÚ[Û—ÚY[Ù[ØÛÛ™šY×Ü]ÚÛ—ÛZ\ÜÚ[™ÏHœ˜Z\ÙH‚ˆ
+B‚ˆÈÛÛ˜Ý\œ™[Z[ˆXÝ]™H›ÝÜÈ]\œš]™YY\ˆHØ]\›X\šË‚ˆÈÛ˜\ÚÝZ\ˆYÈ[™ÛÛØØ[È›ÝÈ8 %HÛÛ™H™[ÝÈ™YYÈBˆÈÝX›HY\Ý[™HÛÛXØ[ÛÝ[ÙY\ÈÙ\ÜÚ[ÛœËŠˆÛ™\Ý‚ˆZ[ÚYÎˆ\ÝÚ[HH×BˆZ[ÝÛÛØØ[ÈHˆYˆØ]\›X\šÈ\È›Ý›Û™N‚ˆ›Üˆ›ÝÈ[ˆÛÛ›‹™^XÝ]Jˆ”ÑSPÕYÛÛØØ[È”“ÓHY\ÜØYÙ\È‚ˆ•ÒT‘HÙ\ÜÚ[Û—ÚYHÈS‘XÝ]™HHHS‘YˆÈ‚ˆ“Ô‘Tˆ–HY‹ˆ
+Ù\ÜÚ[Û—ÚY[
+Ø]\›X\šÊJKˆ
+K™™]Ú[
+
+N‚ˆZ[ÚYË˜\[™
+[
+›ÝÖÈšY—JJBˆ˜]ÈH›ÝÖÈÛÛØØ[È—BˆYˆ˜]Î‚ˆžN‚ˆ\œÙYHœÛÛ‹›ØYÊ˜]ÊHYˆ\Ú[œÝ[˜ÙJ˜]ËÝŠH[ÙH˜]ÂˆZ[ÝÛÛØØ[È
+ÏH[Š\œÙY
+HYˆ\Ú[œÝ[˜ÙJ\œÙY\Ý
+H[ÙHˆ^Ù\
+\Q\œ›Ü‹˜[YQ\œ›ÜŠN‚ˆ\ÜÂ‚ˆÈHÛÛ\™\ÜÛÜˆØ\œšY\ÈH›ÝXÝYZ[[ÈH™\XÙ[Y[ˆÈÙ]™\˜˜][KˆÜÙHÜšYÚ[˜[È\™HÝ\\œÙYY\XØ]\Ë›ÝˆÈÝ[[X\š^™Y\ÝÜžKÛÈ^H]\Ý™XÙZ]™H™]Ú[™Ù[X[XÜÈY\‚ˆÈHÛÛ[[Ûˆ\˜Ú]™H\]Kˆ[Z]HØ[ÈÈH™KXÛÛ\™\ÜÚ[Û‚ˆÈØ]\›X\šÈÚ[ˆÛ™H^\ÝÎˆ›ÝÜÈX›Ý™H]\™HH[™\[™[ˆÈÛÛ˜Ý\œ™[Z[[™YžHHÛÛ™H]X›Ý™K‚ˆ™]Ú[™ÚYÎˆ\ÝÚ[HH×Bˆ›Ü›X[^™YÝZ[ØÛÝ[HX^
+[
+Z[ØÛÝ[Üˆ
+JBˆYˆ›Ü›X[^™YÝZ[ØÛÝ[‚ˆÝZ[ØÙZ[[™ÈHˆˆYˆØ]\›X\šÈ\È›Û™H[ÙHˆS‘YHÈ‚ˆÝZ[Ü\˜[\Îˆ\ÝÐ[žWHHÜÙ\ÜÚ[Û—ÚYBˆYˆØ]\›X\šÈ\È›Ý›Û™N‚ˆÝZ[Ü\˜[\Ë˜\[™
+[
+Ø]\›X\šÊJBˆÝZ[Ü\˜[\Ë˜\[™
+›Ü›X[^™YÝZ[ØÛÝ[
+Bˆ™]Ú[™ÚYÈHÂˆ[
+›ÝÖÈšY—JBˆ›Üˆ›ÝÈ[ˆÛÛ›‹™^XÝ]Jˆ”ÑSPÕY”“ÓHY\ÜØYÙ\È‚ˆ•ÒT‘HÙ\ÜÚ[Û—ÚYHÈS‘XÝ]™HHH‚ˆˆž×ÝZ[ØÙZ[[™ßHÔ‘Tˆ–HYTÐÈSRUÈ‹ˆÝZ[Ü\˜[\Ëˆ
+K™™]Ú[
+
+BˆB‚ˆÈÛÙX\˜Ú]™HH]™H\›œÎˆXÝ]™OLY\È[Hœ›ÛHH]™BˆÈÛÛ^ØYÛÛ\XÝYLHX\šÜÈ[H\ÈœÝ[[X\š^™Y]Ø^Hˆ
+œÂˆÈ™]Ú[™Ý[™ÉÜÈXÝ]™OL
+ØÛÛ\XÝYLÚXÚYX[œÈ\Ù\ˆÛÚÈ]ˆÈ˜XÚÈŠKˆÙX\˜ÚÛY\ÜØYÙ\È[˜ÛY\ÈÛÛ\XÝYLH›ÝÜÈžHY˜][ÛÂˆÈH™KXÛÛ\XÝ[Ûˆ˜[œØÜš\Ý^\È\ØÛÝ™\˜X›NÈ]™KXÛÛ^ˆÈØYÈ
+XÝ]™OLHÛ›JHÝ[^ÛYH[KˆZ[ÜšYÚ[˜[È\™BˆÈ\˜Ú]™YÛÈ8 %Z\ˆÛÛ™\È
+™[ÝÊHØ\œžHH]™HÛÜK‚ˆÛÛ›‹™^XÝ]Jˆ•TUHY\ÜØYÙ\ÈÑUXÝ]™HHÛÛ\XÝYHH‚ˆ•ÒT‘HÙ\ÜÚ[Û—ÚYHÈS‘XÝ]™HHH‹ˆ
+Ù\ÜÚ[Û—ÚY
+Kˆ
+BˆÈÛÛ˜Ý\œ™[]Z[ÜšYÚ[˜[È\™H[ÛÈÝ\\œÙYY\XØ]\ÎˆZ\‚ˆÈ]™HÛÜY\È\™H[œÙ\Y™[ÝËÛÈ^H]\Ý›Ý™H™XØ[Y\ÂˆÈÛÛ\XÝY\ÝÜžH[Û™ÜÚYHÜÙHÛÛ™\Ë‚ˆ™]Ú[™ÚYË™^[™
+Z[ÚYÊBˆYˆ™]Ú[™ÚYÎ‚ˆXÙZÛ\œÈH‹‹š›Ú[ŠÈˆ›ÜˆÈ[ˆ™]Ú[™ÚYÊBˆÛÛ›‹™^XÝ]Jˆˆ•TUHY\ÜØYÙ\ÈÑUÛÛ\XÝYHÒT‘HÙ\ÜÚ[Û—ÚYHÈ‚ˆˆS‘XÝ]™HHS‘YSˆ
+ÜXÙZÛ\œßJH‹ˆÜÙ\ÜÚ[Û—ÚY
+œ™]Ú[™ÚY×Kˆ
+Bˆ[œÙ\YÛÛØØ[×ÝÝ[HÙ[‹—Ú[œÙ\ÛY\ÜØYÙWÜ›ÝÜÊˆÛÛ›‹Ù\ÜÚ[Û—ÚYÛÛ\XÝYÛY\ÜØYÙ\Âˆ
+B‚ˆYˆZ[ÚYÎ‚ˆÈ™K\Ù\]Y[˜ÙHHÛÛ˜Ý\œ™[Z[Y\ˆHÛÛ\XÝYÙ]šXBˆÈH\™KTÔSÛÛ[[ˆÛÛ™Nˆ›ÈXÛÙKÜ™KY[˜ÛÙH›Ý[™š\›ÂˆÈšY[šY8 %™]ÈYXÝ]™OLKÛÛ\XÝYL[[ÙH^XÝ‚ˆXÙZÛ\œÈH‹‹š›Ú[ŠÈˆ›ÜˆÈ[ˆZ[ÚYÊBˆÛÛ™WØÛÛÈHÂˆÈ›ÜˆÈ[ˆÙ[‹—ÛY\ÜØYÙWØÛÛ[[—Û˜[Y\ÊÛÛ›ŠBˆYˆÈ›Ý[ˆ
+šY‹˜XÝ]™H‹˜ÛÛ\XÝYŠBˆBˆÛÛÛ\ÝH‹‹š›Ú[ŠÛÛ™WØÛÛÊBˆÛÛ›‹™^XÝ]Jˆˆ’S”ÑT•S•ÈY\ÜØYÙ\È
+ØÛÛÛ\ÝKXÝ]™KÛÛ\XÝY
+H‚ˆˆ”ÑSPÕØÛÛÛ\ÝKK”“ÓHY\ÜØYÙ\È‚ˆˆ•ÒT‘HYSˆ
+ÜXÙZÛ\œßJHÔ‘Tˆ–HY‹ˆZ[ÚYËˆ
+Bˆ[œÙ\Y
+ÏH[ŠZ[ÚYÊBˆÛÛØØ[×ÝÝ[
+ÏHZ[ÝÛÛØØ[Â‚ˆÈY\ÜØYÙWØÛÝ[ÈÛÛØØ[ØÛÝ[™Y›XÝHU‘H
+XÝ]™JHÙ]8 %ˆÈH\˜Ú]™Y›ÝÜÈ\™HÝ[Ûˆ\ÚÈ]›Ý\ÙˆH]™HÛÝ[‚ˆYˆ[Ù[ØÛÛ™šY×Ü]Ú\È›Û™N‚ˆÛÛ›‹™^XÝ]Jˆ•TUHÙ\ÜÚ[ÛœÈÑUY\ÜØYÙWØÛÝ[HËÛÛØØ[ØÛÝ[HÈÒT‘HYHÈ‹ˆ
+[œÙ\YÛÛØØ[×ÝÝ[Ù\ÜÚ[Û—ÚY
+Kˆ
+Bˆ[ÙN‚ˆÛÛ›‹™^XÝ]Jˆ•TUHÙ\ÜÚ[ÛœÈÑUY\ÜØYÙWØÛÝ[HËÛÛØØ[ØÛÝ[HË‚ˆ›[Ù[ØÛÛ™šYÈHÈÒT‘HYHÈ‹ˆ
+[œÙ\YÛÛØØ[×ÝÝ[]ÚYÛ[Ù[ØÛÛ™šYËÙ\ÜÚ[Û—ÚY
+Kˆ
+Bˆ™]\›ˆ[œÙ\Y‚ˆ™]\›ˆÙ[‹—Ù^XÝ]WÝÜš]JÙÊB‚ˆYˆÛY\ÜØYÙWØÛÛ[[—Û˜[Y\ÊÙ[‹ÛÛ›ŠHOˆ\ÝÜÝ—N‚ˆˆˆÛÛ[[ˆ˜[Y\ÈÙˆHY\ÜØYÙ\ÈX›KØXÚY\‹XÛÛ›™XÝ[Ûˆ\˜Kˆˆˆ‚ˆØXÚYHÙ]]ŠÙ[‹—ÛY\ÜØYÙWØÛÛ[[œ×ØØXÚH‹›Û™JBˆYˆØXÚY‚ˆ™]\›ˆØXÚYˆÛÛÈHÜ–ÌWH›Üˆˆ[ˆÛÛ›‹™^XÝ]J”QÓPHX›WÚ[™›ÊY\ÜØYÙ\ÊHŠK™™]Ú[
+
+WBˆÙ[‹—ÛY\ÜØYÙWØÛÛ[[œ×ØØXÚHHÛÛÂˆ™]\›ˆÛÛÂ‚ˆYˆÙ]Û]\ÝÝ\Ù\—Ø\WØÛÛ[
+ˆÙ[‹Ù\ÜÚ[Û—ÚYˆÝ‹ÛÛ[ˆ[žK\WØÛÛ[ˆÝ‚ˆ
+HOˆ[‚ˆˆˆ˜XÚÙš[H\WØÛÛ[ÚYXØ\ˆÛÈH™]Ù\ÝPÕU‘H\Ù\ˆ›ÝË‚‚ˆ[‹\XÙH™Y›YÚÛÛ\XÝ[Ûˆ
+›Y]˜\˜Ú]™WØ[™ØÛÛ\XÝ
+H[œÙ\ÈBˆÝ\œ™[\›‰ÜÈ\Ù\ˆ›ÝÈ‘Q“Ô‘HH\›ˆ›ÛÙÝYHÛÛ\ÜÙ\ÈBˆ™Y™]ÚÜYÚ[ˆÚYXØ\‹[™HÝXœÙ\]Y[Ü˜\Ú\œÚ\ÝY[]K\ÚÚ\Âˆ]™\žHÛÛ\XÝYXÝ8 %Ú]Ý]\È˜XÚÙš[HÝ[\YÚYXØ\ˆÛÝ[ˆ™]™\ˆ[™[ˆHˆ[™[žH™[ØYÛÝ[™\^HÛX[ˆÛÛ[ˆ™KZ[›ÙXÚ[™ÈH›Û\XØXÚH]™\™Ù[˜ÙHHÚYXØ\ˆ^\ÝÈÈÛÜÙK‚‚ˆHÛÛ[X]Ú\ÈHY™[œÚ]™HÝX\™ˆYˆH™]Ù\ÝXÝ]™H\Ù\‚ˆ›ÝÈ\È›ÝHY\ÜØYÙHHØ[\ˆÝ[\Y
+˜XÚ[™È™]Üš]K[™^XÝYˆZ[Ú\JK›Ý[™È\ÈÜš][‹ˆ™]\›œÈH[X™\ˆÙˆ›ÝÜÈ\]Yˆ
+ÜˆJK‚ˆˆˆ‚ˆ[˜ÛÙYHÙ[‹—Ù[˜ÛÙWØÛÛ[
+ÛÛ[
+B‚ˆYˆÙÊÛÛ›ŠN‚ˆÝ\œÛÜˆHÛÛ›‹™^XÝ]Jˆ•TUHY\ÜØYÙ\ÈÑU\WØÛÛ[HÈÒT‘HYH
+‚ˆ”ÑSPÕY”“ÓHY\ÜØYÙ\È‚ˆ•ÒT‘HÙ\ÜÚ[Û—ÚYHÈS‘›ÛHH	Ý\Ù\‰ÈS‘XÝ]™HHH‚ˆ“Ô‘Tˆ–HYTÐÈSRUH‚ˆŠHS‘ÛÛ[TÈÈ‹ˆ
+ÜØÜX—ÜÝ\œ›ÙØ]\Ê\WØÛÛ[
+KÙ\ÜÚ[Û—ÚY[˜ÛÙY
+Kˆ
+Bˆ™]\›ˆÝ\œÛÜ‹œ›ÝØÛÝ[‚ˆ™]\›ˆÙ[‹—Ù^XÝ]WÝÜš]JÙÊB‚ˆYˆÙ]ÛY\ÜØYÙ\ÊˆÙ[‹ˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆ[˜ÛYWÚ[˜XÝ]™Nˆ›ÛÛH˜[ÙKˆ[˜ÛYWØÛÛ\XÝYˆ›ÛÛH˜[ÙKˆ[Z]ˆÜ[Û˜[Ú[HH›Û™KˆÙ™œÙ]ˆ[Hˆ]\Ýˆ›ÛÛH˜[ÙKˆY\—ÚYˆÜ[Û˜[Ú[HH›Û™Kˆ
+HOˆ\ÝÑXÝÜÝ‹[žWWN‚ˆˆˆ“ØYY\ÜØYÙ\È›ÜˆHÙ\ÜÚ[Ûˆ[ˆ[œÙ\[ÛˆÜ™\‹‚‚ˆžHY˜][Û›HXÝ]™HY\ÜØYÙ\È\™H™]\›™Yˆ\ÜÂˆ[˜ÛYWÚ[˜XÝ]™OUYXÈØYÛÙY[]Y›ÝÜÈ
+K™Ëˆ›Ü‚ˆ]Y]ÈXYÈšY]ÜÈÙˆ™]ÛÝ[™\ÝÜžJKˆÙYBˆ›Y]˜™]Ú[™Ý×ÛY\ÜØYÙX›ÜˆHÛÙY[]HYXÚ[šXË‚‚ˆ\ÜÈ[˜ÛYWØÛÛ\XÝYUYXÈY][Û˜[HØY›ÝÜÈ™\Ù\™YˆžH[‹\XÙHÛÛ^ÛÛ\XÝ[Ûˆ
+XÝ]™OLÛÛ\XÝYLX
+KˆÜÙH\™Bˆ\˜X›H\Ü^H\ÝÜžK›ÝÛÙY[]Y›ÝÜÈ8 %H\Ù\‹]š\ÚX›Bˆ˜[œØÜš\™XY]\Ý›Ý›Ü[KÜˆX\›Y\ˆ\›œÈÚ[[H™XÛÛYBˆ[œ™XXÚX›HÛ˜ÙHHRH^]\ÝÈ]ÈXÝ]™K[Û›HÚ[™ÝËˆÛÙY[]Yˆ[™ËÔ™]Ú[™›ÝÜÈ
+XÝ]™OLÛÛ\XÝYL
+HÝ^H^ÛYYÈ\ÙBˆ[˜ÛYWÚ[˜XÝ]™X›ÜˆÜÙK‚‚ˆÜ™\™YžHUUÒSÔ‘SQS•Y
+YH[œÙ\[ÛˆÜ™\ŠH˜]\ˆ[‚ˆ[Y\Ý[\8 %ÙYHÌØXØØML›ÜˆHÔÓˆÛØÚË\™YÜ™\ÜÚ[Ûˆ˜][Û˜[K‚‚ˆÚ[ˆ[Z]\È›ÝšYY™]\›œÈ][ÜÝ[Z]Y\ÜØYÙ\ÂˆÝ\[™Èœ›ÛHÙ™œÙ]
+X˜\ÙY[ˆ[œÙ\[ÛˆÜ™\ŠKˆ[˜X›\ÂˆYÚ[˜][Ûˆ›ÜˆHTH[™Ú[È]›ÚYØY[™È[\™H˜[œØÜš\Ë‚ˆÚ]]\ÝUYXHÙ™œÙ]\ÈYX\Ý\™Y˜XÚÈœ›ÛHH™]Ù\ÝˆY\ÜØYÙH[™HÙ[XÝYYÙH\ÈÝ[™]\›™Y[ˆÚ›Û›ÛÙÚXØ[ˆÜ™\‹ˆÙ™œÙ][Û™H
+Ú]Ý][Z]
+H[ÛÈYÙ\È8 %ÔS]Bˆ™\]Z\™\ÈHSRUÛ]\ÙH›ÜˆÑ‘”ÑUÛÈ]	ÜÈ[Z]Y\ÈSRULXˆ
+[˜›Ý[™Y
+K‚‚ˆY\—ÚY[˜X›\ÈÙ^\Ù]YÚ[˜][Ûˆ
+YˆY\—ÚY
+NˆÊJBˆYÙHÙYZÜÈÛˆYÙH˜[œØÜš\ÈÚ\™HÑ‘”ÑUYÜ˜Y\ÈÈÊŠH\‚ˆYÙKˆ\ØÙ[™[™ÈÜ™\ˆÛ›H
+[˜ÛÛ\]X›HÚ]]\ÝØÙ™œÙ]
+K‚ˆˆˆ‚ˆYˆY\—ÚY\È›Ý›Û™H[™
+]\ÝÜˆÙ™œÙ]
+N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ˜Y\—ÚY\È[˜ÛÛ\]X›HÚ]]\ÝÛÙ™œÙ]YÚ[™ÈŠBˆYˆY\—ÚY\È›Ý›Û™H[™[˜ÛYWØÛÛ\XÝY‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ˜Y\—ÚY\È[˜ÛÛ\]X›HÚ][˜ÛYWØÛÛ\XÝY
+Y\Y\Ü^H™XYÈ\ÙHÙ™œÙ]YÚ[™ÊHŠBˆYˆ[˜ÛYWÚ[˜XÝ]™N‚ˆÈ]Y]ÈXYÈ™XYÎˆ]™\žH›ÝË[˜ÛY[™ÈÛÙY[]Y‚ˆXÝ]™WØÛ]\ÙHHˆ‚ˆ[Yˆ[˜ÛYWØÛÛ\XÝY‚ˆÈ\Ü^H\ÝÜžNˆXÝ]™H›ÝÜÈ\È›ÝÜÈ™\Ù\™YžH[‹\XÙBˆÈÛÛ\XÝ[Ûˆ
+XÝ]™OLÛÛ\XÝYLJK]™]™\ˆÛÙY[]YˆÈ[™ËÔ™]Ú[™›ÝÜÈ
+XÝ]™OLÛÛ\XÝYL
+K‚ˆXÝ]™WØÛ]\ÙHHˆS‘
+XÝ]™HHHÔˆÛÛ\XÝYHJH‚ˆ[ÙN‚ˆXÝ]™WØÛ]\ÙHHˆS‘XÝ]™HHH‚ˆÙ^\Ù]ØÛ]\ÙHHˆS‘YˆÈˆYˆY\—ÚY\È›Ý›Û™H[ÙHˆ‚ˆÜ[H
+ˆ”ÑSPÕ
+ˆ”“ÓHY\ÜØYÙ\ÈÒT‘HÙ\ÜÚ[Û—ÚYHÈ‚ˆˆžØXÝ]™WØÛ]\Ù_^ÚÙ^\Ù]ØÛ]\Ù_HÔ‘Tˆ–HYÉÑTÐÉÈYˆ]\Ý[ÙH	ÐTÐÉßH‚ˆ
+Bˆ\˜[\Îˆ\ÝHÜÙ\ÜÚ[Û—ÚYBˆYˆY\—ÚY\È›Ý›Û™N‚ˆ\˜[\Ë˜\[™
+Y\—ÚY
+BˆYˆ[˜ÛYWØÛÛ\XÝY‚ˆÈÛÛ\XÝ[Ûˆ\ØÚÈÛÜHH›ÝXÝYZ[[ÈXXÚ™]ÂˆÈÙ[™\˜][Û‹ÛÈHØ[YHÙÚXØ[Y\ÜØYÙHØ[ˆ^\Ý\ÈÙ]™\˜[ˆÈ›ÝÜÈ
+Y[XØ[›ÛKØÛÛ[Ý[Y\Ý[\
+HÚ]Y™™\™[XÝ]™BˆÈ›YÜÈ[™YËˆH\Ü^H™XY]\ÝÝ\™˜XÙHXXÚY\ÜØYÙH^XÝBˆÈÛ˜ÙNˆ™Y™\ˆH]™H›ÝË[ˆH™]Ù\ÝÙ[™\˜][Û‹ˆ™XYBˆÈ[\Ü^HÙ]
+HÙ\ÜÚ[Û‰ÜÈ›ÝÜÈ\™H›Ý[™YÈHRK[]™[ˆÈL\›ÝÈØ\]™\È[ˆH[™Ú[›Ý\™JKY\H[ˆ]Û‹ˆÈ[ˆ\HYÚ[™Ë‚ˆÚ]Ù[‹—Ü™XYØÝ
+
+H\ÈÛÛ›Ž‚ˆÝ\œÛÜˆHÛÛ›‹™^XÝ]Jˆ”ÑSPÕ
+ˆ”“ÓHY\ÜØYÙ\ÈÒT‘HÙ\ÜÚ[Û—ÚYHÈˆ
+ÈXÝ]™WØÛ]\ÙBˆ
+ÈˆÔ‘Tˆ–HYTÐÈ‹ˆÜÙ\ÜÚ[Û—ÚYKˆ
+Bˆ[Ü›ÝÜÈHÝ\œÛÜ‹™™]Ú[
+
+BˆÙY[ŽˆXÝHßBˆ›Üˆ›ÝÈ[ˆ[Ü›ÝÜÎ‚ˆY\WØÛÛ[H›ÝÖÈ˜ÛÛ[—BˆYˆ›ÝÖÈœ›ÛH—HOH\Ù\ˆŽ‚ˆœ›ÛHYÙ[˜ÛÛ^ØÛÛ\™\ÜÛÜˆ[\ÜÜ]Ý\Ù\—ÛÜšYÚ[˜]YÝ\›‚‚ˆØ[™Y]HHÂˆœ›ÛHŽˆ\Ù\ˆ‹ˆ˜ÛÛ[ŽˆÙ[‹—ÙXÛÙWØÛÛ[
+›ÝÖÈ˜ÛÛ[—JKˆ™\Ü^WÚÚ[™Žˆ›ÝÖÈ™\Ü^WÚÚ[™—Kˆ™\Ü^WÛY]Y]HŽˆÙ[‹—ÙXÛÙWÙ\Ü^WÛY]Y]Jˆ›ÝÖÈ™\Ü^WÛY]Y]H—Bˆ
+KˆBˆ[™Ù™‹]™WÝšY]ÈHÜ]Ý\Ù\—ÛÜšYÚ[˜]YÝ\›ŠØ[™Y]JBˆYˆ[™Ù™ˆ\È›Ý›Û™H[™]™WÝšY]È\È›Ý›Û™N‚ˆY\WØÛÛ[HÙ[‹—Ù[˜ÛÙWØÛÛ[
+ˆ]™WÝšY]Ë™Ù]
+˜ÛÛ[ŠBˆ
+BˆÈÛÛšY[È\XÚ\]H[ˆHY\HÙ^NˆÛÛ\XÝ[ÛˆÛÜY\ÂˆÈ[H™\˜˜][KÛÈY[XØ[ÛÛY\ÜØYÙ\ÈXÜ›ÜÜÈÙ[™\˜][ÛœÂˆÈÝ[ÛÛ\ÙKÚ[H\Ý[˜ÝÛÛØ[È]\[ˆÂˆÈÚ\™H›ÛKØÛÛ[Ý[Y\Ý[\\™H™]™\ˆY\™ÙY‚ˆÙ^HH
+ˆ›ÝÖÈœ›ÛH—KˆY\WØÛÛ[ˆ›ÝÖÈ[Y\Ý[\—Kˆ›ÝÖÈÛÛØØ[ÚY—Kˆ›ÝÖÈÛÛØØ[È—Kˆ›ÝÖÈÛÛÛ˜[YH—Kˆ
+BˆÝ\ˆHÙY[‹™Ù]
+Ù^JBˆYˆÝ\ˆ\È›Û™HÜˆ
+›ÝÖÈ˜XÝ]™H—K›ÝÖÈšY—JHˆ
+Ý\–È˜XÝ]™H—KÝ\–ÈšY—JN‚ˆÙY[–ÚÙ^WHH›ÝÂˆ›ÝÜÈHÛÜY
+ÙY[‹˜[Y\Ê
+KÙ^O[[X™HŽˆ–ÈšY—JBˆYˆ]\Ý‚ˆ›ÝÜÈH›ÝÜÖÎŽ‹LWBˆ›ÝÜÈH›ÝÜÖÛÙ™œÙ]—BˆYˆ[Z]\È›Ý›Û™N‚ˆ›ÝÜÈH›ÝÜÖÎ›[Z]BˆYˆ]\Ý‚ˆ›ÝÜÈH›ÝÜÖÎŽ‹LWBˆ[ÙN‚ˆYˆ[Z]\È›Ý›Û™HÜˆÙ™œÙ]‚ˆÈÔS]IÜÈÑ‘”ÑU™\]Z\™\ÈSRUÈLHYX[œÈ››È[Z]‹‚ˆÜ[
+ÏHˆSRUÈÑ‘”ÑUÈ‚ˆ\˜[\Ë™^[™
+ËLHYˆ[Z]\È›Û™H[ÙH[Z]Ù™œÙ]JBˆÚ]Ù[‹—Ü™XYØÝ
+
+H\ÈÛÛ›Ž‚ˆÝ\œÛÜˆHÛÛ›‹™^XÝ]JÜ[\˜[\ÊBˆ›ÝÜÈHÝ\œÛÜ‹™™]Ú[
+
+BˆYˆ]\Ý‚ˆ›ÝÜËœ™]™\œÙJ
+Bˆ™\Ý[H×Bˆ›Üˆ›ÝÈ[ˆ›ÝÜÎ‚ˆ\ÙÈHXÝ
+›ÝÊBˆYˆ\ÙËœÜ
+—ØÛÛ\™\ÜÙYÜÝ[[X\žH‹
+N‚ˆ\ÙÖÈ—ØÛÛ\™\ÜÙYÜÝ[[X\žH—HHYBˆYˆ˜ÛÛ[ˆ[ˆ\ÙÎ‚ˆ\ÙÖÈ˜ÛÛ[—HHÙ[‹—ÙXÛÙWØÛÛ[
+\ÙÖÈ˜ÛÛ[—JBˆYˆ\ÙË™Ù]
+ÛÛØØ[ÈŠN‚ˆžN‚ˆ\ÙÖÈÛÛØØ[È—HHœÛÛ‹›ØYÊ\ÙÖÈÛÛØØ[È—JBˆ^Ù\
+œÛÛ‹’”ÓÓ‘XÛÙQ\œ›Ü‹\Q\œ›ÜŠN‚ˆÙÙÙ\‹Ø\›š[™Ê‘˜Z[YÈ\Ù\šX[^™HÛÛØØ[È[ˆÙ]ÛY\ÜØYÙ\Ë˜[[™È˜XÚÈÈ×HŠBˆ\ÙÖÈÛÛØØ[È—HH×BˆYˆ\ÙË™Ù]
+™\Ü^WÛY]Y]HŠH\È›Ý›Û™N‚ˆ\ÙÖÈ™\Ü^WÛY]Y]H—HHÙ[‹—ÙXÛÙWÙ\Ü^WÛY]Y]J\ÙÖÈ™\Ü^WÛY]Y]H—JBˆ™\Ý[˜\[™
+\ÙÊBˆ™]\›ˆ™\Ý[‚ˆYˆš[™Ü—Ý\›ÛY\ÜØYÙ\ÊÙ[‹Ù\ÜÚ[Û—ÚYÎˆ\ÝÜÝ—JHOˆ\ÝÑXÝÜÝ‹[žWWN‚ˆˆˆ•ÛÛ™\Ý[È[ˆ\ÙHÙ\ÜÚ[ÛœÈ]Y[[ÛˆHÚ]Xˆˆ\›‚‚ˆHØ[™Y]HØØ[‹[X™\˜][HÛÜÙNˆ][™È˜XÚÈ]™\žHÛÛ™\Ý[ˆÛÛZ[š[™ÈÜ[Ø[™X]™\ÈHØ[\ˆÈXÚYHÚXÚÛ™\ÈXZÙHBˆÛZ[H
+ÙYHH\ÚÝÜ	ÜÈˆ™XÛÝ™\žKÚXÚÛ›HXØÙ\È[ˆÝ]]]ˆ\ÈH˜\™Hˆ\›8 %HÚYÛ˜]\™HÙˆÚˆÜ™X]X
+KˆÜ™\™YˆÛ\ÝYš\œÝ\ˆÙ\ÜÚ[ÛˆÛÈHØ[\ˆØ[ˆZÙHH\ÝX]Ú‚ˆˆˆ‚ˆ›Ý[™ˆ\ÝÑXÝÜÝ‹[žWWHH×BˆYÈHÜÈ›ÜˆÈ[ˆÙ\ÜÚ[Û—ÚYÈYˆ×Bˆ›ÜˆÝ\[ˆ˜[™ÙJ[ŠYÊKL
+NˆÈÔS]IÜÈ›Ý[™]˜\šXX›HÙZ[[™Ë‚ˆÚ[šÈHYÖÜÝ\ˆÝ\
+ÈLBˆXÙZÛ\œÈH‹‹š›Ú[ŠÈˆ
+ˆ[ŠÚ[šÊJBˆÚ]Ù[‹—Ü™XYØÝ
+
+H\ÈÛÛ›Ž‚ˆ›ÝÜÈHÛÛ›‹™^XÝ]Jˆˆˆˆ”ÑSPÕÙ\ÜÚ[Û—ÚYÛÛ[”“ÓHY\ÜØYÙ\ÂˆÒT‘HÙ\ÜÚ[Û—ÚYSˆ
+ÜXÙZÛ\œßJBˆS‘›ÛHH	ÝÛÛ	ÈS‘ÛÛ[RÑH	ÉKÜ[ÉIÂˆÔ‘Tˆ–HYTÐÈˆˆ‹ˆÚ[šËˆ
+K™™]Ú[
+
+Bˆ›Ý[™™^[™
+ÈœÙ\ÜÚ[Û—ÚYŽˆ›ÝÖÌK˜ÛÛ[Žˆ›ÝÖÌW_H›Üˆ›ÝÈ[ˆ›ÝÜÊBˆ™]\›ˆ›Ý[™‚ˆYˆÙ]ÛY\ÜØYÙ\×Ø\›Ý[™
+ˆÙ[‹ˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆ\›Ý[™ÛY\ÜØYÙWÚYˆ[ˆÚ[™ÝÎˆ[HKˆ
+HOˆXÝÜÝ‹[žWN‚ˆˆˆ“ØYHÚ[™ÝÈÙˆY\ÜØYÙ\È[˜ÚÜ™YÛˆHÜXÚYšXÈY\ÜØYÙHY‚‚ˆ™]\›œÈHXÝÚ]‚ˆHÚ[™ÝØˆ\ÈÚ[™ÝØY\ÜØYÙ\È™Y›Ü™HH[˜ÚÜ‹H[˜ÚÜ‚ˆ]Ù[‹[™\ÈÚ[™ÝØY\ÜØYÙ\ÈY\‹Ü™\™YžHY\ØÙ[™[™Ë‚ˆHY\ÜØYÙ\×Ø™Y›Ü™XˆÛÝ[ÙˆY\ÜØYÙ\ÈÝšXÝH™Y›Ü™HH[˜ÚÜ‚ˆÝ[[ˆHÙ\ÜÚ[Ûˆ
+OHÚ[™ÝÈ[›\ÜÈÙH]HÝ\
+K‚ˆHY\ÜØYÙ\×ØY\˜ˆÛÝ[ÙˆY\ÜØYÙ\ÈÝšXÝHY\ˆH[˜ÚÜ‚ˆÝ[[ˆHÙ\ÜÚ[Ûˆ
+OHÚ[™ÝÈ[›\ÜÈÙH]H[™
+K‚‚ˆ\ÙYžHÙ\ÜÚ[Û—ÜÙX\˜Ú›Üˆ›ÝH\ØÛÝ™\žHÚ\H
+[˜ÚÜ™YÛˆBˆ•ÍHX]Ú
+H[™HØÜ›ÛÚ\H
+[˜ÚÜ™YÛˆ[žHY\ÜØYÙHY
+KˆBˆY\ÜØYÙ\×Ø™Y›Ü™XÈY\ÜØYÙ\×ØY\˜ÛÝ[È]HØ[\ˆ]XÝˆÙ\ÜÚ[Ûˆ›Ý[™\šY\ÎˆÚ[ˆZ]\ˆ\È\ÜÈ[ˆÚ[™ÝØHYÙ[\Âˆ™XXÚYÛ™H[™ÙˆHÙ\ÜÚ[Û‹‚‚ˆ™]\›œÈ[ˆ[\HÚ[™ÝÈÚ[ˆ\›Ý[™ÛY\ÜØYÙWÚY\È›ÝH™X[Y[‚ˆÙ\ÜÚ[Û—ÚY8 %Ø[\œÈXÚYHÝÈÈÝ\™˜XÙH]‚ˆˆˆ‚ˆYˆÚ[™ÝÈ‚ˆÚ[™ÝÈHˆÚ]Ù[‹—Ü™XYØÝ
+
+H\ÈÛÛ›Ž‚ˆÈÛÛ™š\›HH[˜ÚÜˆ^\ÝÈ[ˆ\ÈÙ\ÜÚ[Û‹‚ˆ[˜ÚÜ—Ù^\ÝÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕH”“ÓHY\ÜØYÙ\ÈÒT‘HYHÈS‘Ù\ÜÚ[Û—ÚYHÈSRUH‹ˆ
+\›Ý[™ÛY\ÜØYÙWÚYÙ\ÜÚ[Û—ÚY
+Kˆ
+K™™]ÚÛ™J
+BˆYˆ›Ý[˜ÚÜ—Ù^\ÝÎ‚ˆ™]\›ˆÈÚ[™ÝÈŽˆ×K›Y\ÜØYÙ\×Ø™Y›Ü™HŽˆ›Y\ÜØYÙ\×ØY\ˆŽˆB‚ˆÈÛÈ]Y\šY\Îˆ[˜ÚÜˆ
+È™Y›Ü™H
+TÐËZÙHÚ[™ÝÊÌJK[™Y\‚ˆÈ
+TÐËZÙHÚ[™ÝÊKˆš[˜[Ü™\ˆ\ÈYTÐË‚ˆ™Y›Ü™WÜ›ÝÜÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕ
+ˆ”“ÓHY\ÜØYÙ\È‚ˆ•ÒT‘HÙ\ÜÚ[Û—ÚYHÈS‘YHÈ‚ˆ“Ô‘Tˆ–HYTÐÈSRUÈ‹ˆ
+Ù\ÜÚ[Û—ÚY\›Ý[™ÛY\ÜØYÙWÚYÚ[™ÝÈ
+ÈJKˆ
+K™™]Ú[
+
+BˆY\—Ü›ÝÜÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕ
+ˆ”“ÓHY\ÜØYÙ\È‚ˆ•ÒT‘HÙ\ÜÚ[Û—ÚYHÈS‘YˆÈ‚ˆ“Ô‘Tˆ–HYTÐÈSRUÈ‹ˆ
+Ù\ÜÚ[Û—ÚY\›Ý[™ÛY\ÜØYÙWÚYÚ[™ÝÊKˆ
+K™™]Ú[
+
+B‚ˆÈ™Y›Ü™WÜ›ÝÜÈ\ÈTÐÎÈ™]™\œÙHÛÈ]	ÜÈTÐË[ˆÛÛ˜Ø][˜]HY\—Ü›ÝÜË‚ˆ›ÝÜÈH\Ý
+™]™\œÙY
+™Y›Ü™WÜ›ÝÜÊJH
+È\Ý
+Y\—Ü›ÝÜÊBˆ™\Ý[H×Bˆ›Üˆ›ÝÈ[ˆ›ÝÜÎ‚ˆ\ÙÈHXÝ
+›ÝÊBˆYˆ˜ÛÛ[ˆ[ˆ\ÙÎ‚ˆ\ÙÖÈ˜ÛÛ[—HHÙ[‹—ÙXÛÙWØÛÛ[
+\ÙÖÈ˜ÛÛ[—JBˆYˆ\ÙË™Ù]
+ÛÛØØ[ÈŠN‚ˆžN‚ˆ\ÙÖÈÛÛØØ[È—HHœÛÛ‹›ØYÊ\ÙÖÈÛÛØØ[È—JBˆ^Ù\
+œÛÛ‹’”ÓÓ‘XÛÙQ\œ›Ü‹\Q\œ›ÜŠN‚ˆÙÙÙ\‹Ø\›š[™Êˆ‘˜Z[YÈ\Ù\šX[^™HÛÛØØ[È[ˆÙ]ÛY\ÜØYÙ\×Ø\›Ý[™˜[[™È˜XÚÈÈ×H‚ˆ
+Bˆ\ÙÖÈÛÛØØ[È—HH×BˆYˆ\ÙË™Ù]
+™\Ü^WÛY]Y]HŠH\È›Ý›Û™N‚ˆ\ÙÖÈ™\Ü^WÛY]Y]H—HHÙ[‹—ÙXÛÙWÙ\Ü^WÛY]Y]J\ÙÖÈ™\Ü^WÛY]Y]H—JBˆ™\Ý[˜\[™
+\ÙÊB‚ˆÈ™Y›Ü™WÜ›ÝÜÈ[˜ÛY\ÈH[˜ÚÜˆ]Ù[ŽÈÝX˜XÝH›ÜˆHÛÝ[Ù‚ˆÈY\ÜØYÙ\ÈÝšXÝH™Y›Ü™HH[˜ÚÜˆ[ˆH™]\›™YÛXÙK‚ˆY\ÜØYÙ\×Ø™Y›Ü™HHX^
+[Š™Y›Ü™WÜ›ÝÜÊHHJBˆY\ÜØYÙ\×ØY\ˆH[ŠY\—Ü›ÝÜÊBˆ™]\›ˆÂˆÚ[™ÝÈŽˆ™\Ý[ˆ›Y\ÜØYÙ\×Ø™Y›Ü™HŽˆY\ÜØYÙ\×Ø™Y›Ü™Kˆ›Y\ÜØYÙ\×ØY\ˆŽˆY\ÜØYÙ\×ØY\‹ˆB‚ˆYˆ™\ÛÛ™WÜ™\Ý[YWÜÙ\ÜÚ[Û—ÚY
+Ù[‹Ù\ÜÚ[Û—ÚYˆÝŠHOˆÝŽ‚ˆˆˆ”™Y\™XÝH™\Ý[YH\™Ù]ÈH\ØÙ[™[Ù\ÜÚ[Ûˆ]ÛÈHY\ÜØYÙ\Ë‚‚ˆÛÛ^ÛÛ\™\ÜÚ[Ûˆ[™ÈHÝ\œ™[Ù\ÜÚ[Ûˆ[™›ÜšÜÈH™]ÈÚ[Ù\ÜÚ[Û‚ˆ
+[šÙYšXH\™[ÜÙ\ÜÚ[Û—ÚY
+KˆH›\ÚÝ\œÛÜˆ\È™\Ù]ÛÈBˆÚ[\ÈÚ\™H™]ÈY\ÜØYÙ\ÈXÝX[H[™8 %H\™[[™È\Ú]ˆY\ÜØYÙWØÛÝ[H›ÝÜÈ[›\ÜÈY\ÜØYÙ\ÈY[™XYH™Y[ˆ›\ÚYÂˆ]™Y›Ü™HÛÛ\™\ÜÚ[Û‹ˆÙYHÌML‚‚ˆ\È[\ˆØ[ÜÈ\™[ÜÙ\ÜÚ[Û—ÚY›ÜØ\™œ›ÛHÙ\ÜÚ[Û—ÚY[™ˆ™]\›œÈH\ØÙ[™[[ˆHÚZ[ˆ]\ÈH
+Š›[ÜÝ™XÙ[
+ŠˆY\ÜØYÙ\Ë‚ˆ[›ZÙHHÜšYÚ[˜[ÙÚXË]Ù\È“ÕÚÜXÚ\˜ÝZ]Ú[ˆHÝ\[™ÂˆÙ\ÜÚ[Ûˆ[™XYH\ÈY\ÜØYÙ\È8 %H\ØÙ[™[]Ø\ÈÜ™X]YžBˆÛÛ\™\ÜÚ[ÛˆX^HÛHÛÛ[X][ÛˆÛÛ[[™ÚÝ[™H™Y™\œ™YˆžHHÙX•RH[™Ø]]Ø^H›ÜˆK\™\Ý[YX[™Ù\ÜÚ[ÛˆØY[™Ë‚‚ˆYˆ›È\ØÙ[™[
+[˜ÛY[™ÈHÝ\[™ÈÙ\ÜÚ[ÛŠH\È[žHY\ÜØYÙ\ËˆHÜšYÚ[˜[Ù\ÜÚ[Û—ÚY\È™]\›™Y[˜Ú[™ÙY‚‚ˆHÚZ[ˆ\È[Ø^\ÈØ[ÙYšXHHÚ[ÚÜÙHÝ\YØ]\Âˆ]\ÝÈ]X]Ú\ÈHÚ[™ÛKXÚZ[ˆÚ\H]ÛÛ\™\ÜÚ[ÛˆÜ™X]\Ë‚ˆH\Ø\
+ÌŠHÝX\™ÈYØZ[œÝXØÚY[[ÛÜÈ[ˆX[›Ü›YY]K‚ˆˆˆ‚ˆYˆ›ÝÙ\ÜÚ[Û—ÚY‚ˆ™]\›ˆÙ\ÜÚ[Û—ÚY‚ˆÈ›ÛÝÈHÛÛ\™\ÜÚ[Û‹XÛÛ[X][ÛˆÚZ[ˆ›ÜØ\™ÈH]™H\ˆÈ’T”Õˆ]]ËXÛÛ\™\ÜÚ[Ûˆ[™ÈHÝ\œ™[Ù\ÜÚ[Ûˆ[™›ÜšÜÈBˆÈÛÛ[X][ÛˆÚ[]HÛ™Ë[]™Y\™[ÙY\È]ÈÝÛˆ›\ÚYˆÈY\ÜØYÙH›ÝÜÈ8 %ÛÈH[\KZXYØ[È™[ÝÈ™]™\ˆ™Y\™XÝÈ][™ˆÈ™\Ý[Z[™ÈH\™[Y™[ØYÈH™KXÛÛ\™\ÜÚ[Ûˆ˜[œØÜš\Ú[BˆÈH\›œÈÙ[™\˜]Y
+˜Y\ŠˆÛÛ\™\ÜÚ[Ûˆ
+[™Z\ˆ™\ÜÛœÙ\ÊHÚ][‚ˆÈHÛÛ[X][Û‹ˆÙ]ØÛÛ\™\ÜÚ[Û—Ý\\È[™XYÙKX]Ø\™Nˆ]Û›BˆÈ›ÛÝÜÈÚ[™[ˆÚÜÙH\™[[™YÚ][™Ü™X\ÛÛIØÛÛ\™\ÜÚ[Û‰ØˆÈ
+Ü™X]YY\ˆH\™[Ø\È[™Y
+KÛÈ[YØ][ÛˆÈœ˜[˜ÚÚ[™[‚ˆÈ™]™\ˆZ˜XÚÈH™\Ý[YKˆ\È\ÈHš^›ÜˆH\ÚÝÜ’HØ[YH˜XÚÂˆÈ[™H™\H\Û‰Ý\™Hˆ™\ÜÛˆ\™ÙHÙ\ÜÚ[ÛœË‚ˆžN‚ˆ\HÙ[‹™Ù]ØÛÛ\™\ÜÚ[Û—Ý\
+Ù\ÜÚ[Û—ÚY
+Bˆ^Ù\^Ù\[ÛŽ‚ˆ\HÙ\ÜÚ[Û—ÚYˆYˆ\[™\OHÙ\ÜÚ[Û—ÚY‚ˆÙ\ÜÚ[Û—ÚYH\‚ˆÚ]Ù[‹—Ü™XYØÝ
+
+H\ÈÛÛ›Ž‚ˆÝ\œ™[HÙ\ÜÚ[Û—ÚYˆÙY[ˆHØÝ\œ™[Bˆ™\ÝH›Û™HÈ˜XÚÜÈH\Ý
+Y\\Ý
+H›ÙHÚ]Y\ÜØYÙ\Â‚ˆ›ÜˆÈ[ˆ˜[™ÙJÌŠN‚ˆÈÚXÚÈYˆHÝ\œ™[›ÙH\ÈY\ÜØYÙ\Ë‚ˆžN‚ˆ›ÝÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕH”“ÓHY\ÜØYÙ\ÈÒT‘HÙ\ÜÚ[Û—ÚYHÈSRUH‹ˆ
+Ý\œ™[
+Kˆ
+K™™]ÚÛ™J
+Bˆ^Ù\^Ù\[ÛŽ‚ˆ™]\›ˆÙ\ÜÚ[Û—ÚYˆYˆ›ÝÈ\È›Ý›Û™N‚ˆ™\ÝHÝ\œ™[‚ˆÈØ[ÈÈH[ÜÝ\™XÙ[K\Ý\YÚ[8 %]ÚÚ\^XÚ]ˆÈœ˜[˜Ú
+Øœ˜[˜ÚYÙœ›ÛX
+K[YØ]KÜÝX˜YÙ[
+Ù[YØ]WÙœ›ÛX
+KˆÈ™\Ù]XÛÛ[X][Ûˆ
+Ü™\Ù]Ùœ›ÛXÜˆHYØXÞHØ[YKZÙ^BˆÈ]\š\ÝXÈ8 %HÜÝ\™\Ù]ÛÛ™\œØ][Ûˆ]\Ý™]™\ˆ™H™XXÚYˆÈžH™\Ý[Z[™ÈH\™[H\Ù\ˆ™\Ù]]Ø^JK[™ÛÛˆÈÚ[™[‹ˆ^H[ÛÈØ\œžHH\™[ÜÙ\ÜÚ[Û—ÚYY]ˆÈ\™H“ÕÛÛ\™\ÜÚ[ÛˆÛÛ[X][ÛœÎÈ›ÛÝÚ[™È[HÛÝ[Z˜XÚÂˆÈH™\Ý[YH\™Ù]È[ˆ[œ™[]YÙ\ÜÚ[Ûˆ
+K™ËˆHÝX˜YÙ[ˆÈ[ŠKˆ\ÈZ\œ›ÜœÈHÚ[Y^Û\Ú[Ûˆ[ˆÙ]ØÛÛ\™\ÜÚ[Û—Ý\‚ˆžN‚ˆÚ[Ü›ÝÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕY”“ÓHÙ\ÜÚ[ÛœÈTÈÚ[‚ˆ•ÒT‘HÚ[œ\™[ÜÙ\ÜÚ[Û—ÚYHÈ‚ˆˆS‘œÛÛ—Ù^˜XÝ
+ÓÐSTÐÑJÚ[›[Ù[ØÛÛ™šYË	ÞßIÊK	É—Øœ˜[˜ÚYÙœ›ÛIÊHTÈ•S‚ˆˆS‘œÛÛ—Ù^˜XÝ
+ÓÐSTÐÑJÚ[›[Ù[ØÛÛ™šYË	ÞßIÊK	É—Ù[YØ]WÙœ›ÛIÊHTÈ•S‚ˆˆS‘œÛÛ—Ù^˜XÝ
+ÓÐSTÐÑJÚ[›[Ù[ØÛÛ™šYË	ÞßIÊK	É—Ü™\Ù]Ùœ›ÛIÊHTÈ•S‚ˆˆˆS‘“Õ×ÛYØXÞWÜ™\Ù]ØÚ[ÜÜ[
+	ØÚ[	ËÔ‘TÑUÑS‘Ô‘PTÓÓ”×ÔÔS
+_H‚ˆˆS‘ÓÐSTÐÑJÚ[œÛÝ\˜ÙK	ÉÊHOH	ÝÛÛ	È‚ˆ“Ô‘Tˆ–HÚ[œÝ\YØ]TÐËÚ[šYTÐÈSRUH‹ˆ
+Ý\œ™[
+Kˆ
+K™™]ÚÛ™J
+Bˆ^Ù\^Ù\[ÛŽ‚ˆ™]\›ˆÙ\ÜÚ[Û—ÚYˆYˆÚ[Ü›ÝÈ\È›Û™N‚ˆœ™XZÂˆÚ[ÚYHÚ[Ü›ÝÖÈšY—HYˆ\Ø]ŠÚ[Ü›ÝËšÙ^\ÈŠH[ÙHÚ[Ü›ÝÖÌBˆYˆ›ÝÚ[ÚYÜˆÚ[ÚY[ˆÙY[Ž‚ˆœ™XZÂˆÙY[‹˜Y
+Ú[ÚY
+BˆÝ\œ™[HÚ[ÚY‚ˆ™]\›ˆ™\ÝYˆ™\Ý\È›Ý›Û™H[ÙHÙ\ÜÚ[Û—ÚY‚ˆYˆÙ]ÛY\ÜØYÙ\×Ø\×ØÛÛ™\œØ][ÛŠˆÙ[‹ˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆ[˜ÛYWØ[˜Ù\ÝÜœÎˆ›ÛÛH˜[ÙKˆ[˜ÛYWÚ[˜XÝ]™Nˆ›ÛÛH˜[ÙKˆ™\Z\—Ø[\›˜][ÛŽˆ›ÛÛH˜[ÙKˆ[˜ÛYWÜ›Ý×ÚYÎˆ›ÛÛH˜[ÙKˆ
+HOˆ\ÝÑXÝÜÝ‹[žWWN‚ˆˆˆ‚ˆØYY\ÜØYÙ\È[ˆHÜ[RHÛÛ™\œØ][Ûˆ›Ü›X]
+›ÛH
+ÈÛÛ[XÝÊK‚ˆ\ÙYžHHØ]]Ø^HÈ™\ÝÜ™HÛÛ™\œØ][Ûˆ\ÝÜžK‚‚ˆžHY˜][Û›HXÝ]™HY\ÜØYÙ\È\™H™]\›™Yˆ\ÜÂˆ[˜ÛYWÚ[˜XÝ]™OUYXÈØYÛÙY[]Y
+™]ÛÝ[™
+H›ÝÜÂˆ\ÈÙ[ˆÙYH›Y]˜™]Ú[™Ý×ÛY\ÜØYÙX‚‚ˆ™\Z\—Ø[\›˜][ÛUYX[œÈ™\Z\—ÛY\ÜØYÙWÜÙ\]Y[˜ÙXÝ™\ˆBˆØYY\Ý™Y›Ü™H™]\›š[™È]ˆØ[\œÈ]™\ÝÜ™HHÙ\ÜÚ[Ûˆ›Ü‚ˆU‘H‘TVHÚÝ[\ÜÈ]ˆH\˜X›H[\›˜][Ûˆš[Û][Ûˆ
+K™ËˆBˆ\Ù\ŽÝ\Ù\˜Z\ˆYžHH\›ˆ]\œÚ\ÝY›È\ÜÚ\Ý[›ÝÊBˆÝ\Ú\ÙH™K]šYÙÙ\œÈH™K\™\]Y\ÝY™[œÚ]™H™\Z\ˆÛˆ]™\žBˆÚ[™ÛH™\]Y\Ý›ÜˆH™\ÝÙˆHÙ\ÜÚ[Û‰ÜÈY™H8 %H™\Z\‚ˆ]]]\ÈÛ›HH\‹\™\]Y\Ý\Ý™]™\ˆHÝÜ™Y˜[œØÜš\‚ˆ[œÜXÝ[Û‹Ù^ÜÛÛœÝ[Y\œÈÙY\HY˜][[™ÙYHH˜[œØÜš\ˆ™\˜˜][K‚ˆˆˆ‚ˆÙ\ÜÚ[Û—ÚYÈHÜÙ\ÜÚ[Û—ÚYBˆYˆ[˜ÛYWØ[˜Ù\ÝÜœÈ[™›ÝÙ[‹—Ú\×Ù^XÚ]Øœ˜[˜ÚÜÙ\ÜÚ[ÛŠÙ\ÜÚ[Û—ÚY
+N‚ˆÙ\ÜÚ[Û—ÚYÈHÙ[‹—ÜÙ\ÜÚ[Û—Û[™XYÙWÜ›ÛÝÝ×Ý\
+Ù\ÜÚ[Û—ÚY
+B‚ˆXÝ]™WØÛ]\ÙHHˆˆYˆ[˜ÛYWÚ[˜XÝ]™H[ÙHˆS‘XÝ]™HHH‚ˆÚ]Ù[‹—Ü™XYØÝ
+
+H\ÈÛÛ›Ž‚ˆXÙZÛ\œÈH‹‹š›Ú[ŠÈˆ›ÜˆÈ[ˆÙ\ÜÚ[Û—ÚYÊBˆ›ÝÜÈHÛÛ›‹™^XÝ]Jˆˆ”ÑSPÕÜÙ[‹—ÐÓÓ•‘T”ÐUSÓ—Ô“Õ×ÐÓÓSS”ßH‚ˆˆ‘”“ÓHY\ÜØYÙ\ÈÒT‘HÙ\ÜÚ[Û—ÚYSˆ
+ÜXÙZÛ\œßJH‚ˆÈÜ™\ˆžHUUÒSÔ‘SQS•Y
+YH[œÙ\[ÛˆÜ™\ŠK“Õ[Y\Ý[\‚ˆÈ\[™ÛY\ÜØYÙHÝ[\È›ÝÜÈÚ][YK[YJ
+KÚXÚ\È›ÝˆÈ[Û›ÝÛšXÈ
+ÔÓ‹•Ý\Ë“KÛ\ÜÛY\™\Ý[YJKˆH]\‚ˆÈ›ÝÈØ[ˆØ\œžH[ˆX\›Y\ˆ[Y\Ý[\[ˆ]È™YXÙ\ÜÛÜ‹[™ˆÈÔ‘Tˆ–H[Y\Ý[\ÛÝ[[ˆÛÜ[ˆ\ÜÚ\Ý[ÛÛØØ[È›ÝÂˆÈY\ˆ]ÈÛÛ™\ÜÛœÙKœ™XZÚ[™ÈÛÛXØ[Ü™\ÜÛœÙHY˜XÙ[˜ÞBˆÈ[™šYÙÙ\š[™È[ˆÛˆ™\^Kˆ\ÈX]Ú\ÈÙ]ÛY\ÜØYÙ\ÂˆÈ8 %ÙYHÌØXØØML›ÜˆHÜšYÚ[˜[š^‚ˆˆžØXÝ]™WØÛ]\Ù_HÔ‘Tˆ–HY‹ˆ\JÙ\ÜÚ[Û—ÚYÊKˆ
+K™™]Ú[
+
+B‚ˆ™]\›ˆÙ[‹—Ü›ÝÜ×Ý×ØÛÛ™\œØ][ÛŠˆ›ÝÜËˆÙ\ÜÚ[Û—ÚY\Ù\ÜÚ[Û—ÚYˆ[˜ÛYWØ[˜Ù\ÝÜœÏZ[˜ÛYWØ[˜Ù\ÝÜœËˆ™\Z\—Ø[\›˜][Û\™\Z\—Ø[\›˜][Û‹ˆ[˜ÛYWÜ›Ý×ÚYÏZ[˜ÛYWÜ›Ý×ÚYËˆ
+B‚ˆÈÛÛ[[œÈ]™\žHÛÛ™\œØ][Ûˆ›Ú™XÝ[ÛˆXÛÙ\ËˆÚ\™YžBˆÈÙ]ÛY\ÜØYÙ\×Ø\×ØÛÛ™\œØ][Ûˆ[™Ù]Ü™\Ý[YWØÛÛ™\œØ][ÛœÈÛÈHÚ[™ÛBˆÈÑSPÕØ[ˆ™YY›ÝH[Ù[Y™Y[™\Ü^HšY]ÜË‚ˆÐÓÓ•‘T”ÐUSÓ—Ô“Õ×ÐÓÓSS”ÈH
+ˆšY›ÛKÛÛ[ÛÛØØ[ÚYÛÛØØ[ËÛÛÛ˜[YKY™™XÝÙ\ÜÜÚ][Û‹‚ˆ™š[š\ÚÜ™X\ÛÛ‹™X\ÛÛš[™Ë™X\ÛÛš[™×ØÛÛ[™X\ÛÛš[™×Ù]Z[Ë‚ˆ˜ÛÙ^Ü™X\ÛÛš[™×Ú][\ËÛÙ^ÛY\ÜØYÙWÚ][\Ë]›Ü›WÛY\ÜØYÙWÚYØœÙ\™Y‚ˆ—ØÛÛ\™\ÜÙYÜÝ[[X\žK[Y\Ý[\XÝ]™K\WØÛÛ[\Ü^WÚÚ[™\Ü^WÛY]Y]H‚ˆ
+B‚ˆYˆÜ›ÝÜ×Ý×ØÛÛ™\œØ][ÛŠˆÙ[‹ˆ›ÝÜËˆ
+‹ˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆ[˜ÛYWØ[˜Ù\ÝÜœÎˆ›ÛÛˆ™\Z\—Ø[\›˜][ÛŽˆ›ÛÛˆ[˜ÛYWÜ›Ý×ÚYÎˆ›ÛÛH˜[ÙKˆ[˜ÛYWÜÝ[[X\žWÛX\šÙ\œÎˆ›ÛÛH˜[ÙKˆ
+HOˆ\ÝÑXÝÜÝ‹[žWWN‚ˆˆˆ‘XÛÙH™]ÚYY\ÜØYÙH›ÝÜÈ[ÈHÜ[RHÛÛ™\œØ][Ûˆ›Ü›X]‚‚ˆ^˜XÝYœ›ÛHÙ]ÛY\ÜØYÙ\×Ø\×ØÛÛ™\œØ][ÛˆÛÈÙ]Ü™\Ý[YWØÛÛ™\œØ][ÛœÂˆØ[ˆZ[H[Ù[Y™Y[™\Ü^HšY]ÜÈœ›ÛHÛ™HÑSPÕˆ›ÝÜØ]\Ýˆ[™XYH™HÜ™\™YžHY
+[œÙ\[ÛˆÜ™\ŠH[™š[\™YÈBˆ\Ú\™YÙ\ÜÚ[ÛˆÙ]ÈXÝ]™HÝ]HžHHØ[\‹‚ˆˆˆ‚ˆY\ÜØYÙ\ÈH×BˆÈØ]\›X\šÈ›Ý][ÛˆÛÛ[[‹XÛÛ™\ÈÛÛ˜Ý\œ™[Z[›ÝÜÈ[ÈHÚ[ˆÈY\ˆH™]ÈÝ[[X\žKÛÈHÛÜY\È™YY›Ý™HY˜XÙ[ˆ[™^BˆÈ^XÝ\˜X›HÛÛ™HY[]HÚ[HXÛÙ[™È[œÝXYÙˆ™\ØØ[›š[™ÈBˆÈÚÛHXØÝ[][]Y[™XYÙH›Üˆ]™\žH\Ù\ˆ›ÝË‚ˆ^XÝÝ\Ù\—ØÛÛ™\ÎˆXÝÕ\VÐ[žKÝ—KXÝÜÝ‹[žWWHHßBˆ›Üˆ›ÝÈ[ˆ›ÝÜÎ‚ˆÛÛ[HÙ[‹—ÙXÛÙWØÛÛ[
+›ÝÖÈ˜ÛÛ[—JBˆYˆ›ÝÖÈœ›ÛH—H[ˆÈ\Ù\ˆ‹˜\ÜÚ\Ý[ŸH[™\Ú[œÝ[˜ÙJÛÛ[ÝŠN‚ˆÛÛ[HØ[š]^™WØÛÛ^
+ÛÛ[
+KœÝš\
+
+Bˆ\ÙÈHÈœ›ÛHŽˆ›ÝÖÈœ›ÛH—K˜ÛÛ[ŽˆÛÛ[BˆÈ›Ü›ˆ\˜X›H
+ÎLŒŒÌJNˆ\ÈXÝ\ÈX]\šX[^™Y”“ÓHH\˜X›BˆÈ›ÝËÛÈÝ[\H\œÚ\Ý[˜ÙHX\šÙ\ˆ]HÛÝ\˜ÙH[œÝXYÙ‚ˆÈ™[Z[™ÈÛˆ]™\žH™\ÝÜ™HØ[\ˆÈ™XYHØYY\Ý˜XÚÂˆÈ›ÝYÚH›\Ú\ÈÛÛ™\œØ][Û—Ú\ÝÜžOX8 %[žBˆÈY[]K[ÜÚ[™È[™Ù™ˆ
+ÛÛ\™\ÜÚ[Û‰ÜÈ\˜X›K\Û˜\ÚÝˆÈYÜ[Û‹[˜Ü™[Y[[\œÚ\ÝÈÚ]›È\ÝÜžH\™ÊHÛÝ[ˆÈÝ\Ú\ÙH™KX\[™HS•T‘H˜[œØÜš\Ûˆ›\Ú‚ˆÈ[™\œØÛÜ™K\™Yš^YZÙHÜ›Ý×ÚYˆ]™\žH˜[œÜÜÝš\È]ˆÈ™Y›Ü™HHÚ\™K[™ÛÛ\™\ÜÚ[Û‰ÜÈ\ÜÙ[X›HÛÜY\È[X™\˜][BˆÈÝš\]ÛÈ›Ý]YÚ[[™Ù™œÈÝ[›\Ú
+ÙYBˆÈÙœ™\ÚØÛÛ\XÝ[Û—ÛY\ÜØYÙWØÛÜJK‚ˆ\ÙÖ×Ñ—ÔT”ÒTÕQÓPT’ÑT—ÒÑVWHHYBˆÈ\˜X›H\‹[Y\ÜØYÙHY[]H›ÜˆÝ\™˜XÙ\È]™YYÈY™\ÜÈBˆÈÜXÚYšXÈ›ÝÈ]\ˆ
+\ÚÝÜ™XXÝ[ÛœÊKˆÔRSŽˆÛ›HHØ]]Ø^BˆÈ\ÚÜÈ›Üˆ]8 %]™\žHÝ\ˆÛÛœÝ[Y\ˆ
+PÔ™\ÝÜ™K^ÜˆÈ[œÜXÝ[ÛŠHÙ]ÈH˜[œØÜš\[ˆ]È\ÝÜšXØ[Ú\K‚ˆÈ[™\œØÛÜ™K\™Yš^YÛÈ]™\žH˜[œÜÜ	ÜÈÛÛ™\ÛY\ÜØYÙ\Ê
+BˆÈÝš\È]™Y›Ü™HHÚ\™K‚ˆYˆ[˜ÛYWÜ›Ý×ÚYÈ[™›ÝÖÈšY—H\È›Ý›Û™N‚ˆ\ÙÖÈ—Ü›Ý×ÚY—HH›ÝÖÈšY—BˆÈ\WØÛÛ[\ÈHž]KYšY[]HÚYXØ\ŽˆH^XÝÝš[™ÈÙ[ˆÈÈHTHÚ[ˆ]Y™™\™Yœ›ÛHHÛX[ˆÛÛ[ˆ™]\›™YˆÈ‘TUSH8 %›ÈØ[š]^™WØÛÛ^›ÈÝš\8 %™XØ]\ÙHH™\^BˆÈ]ÝXœÝ]]\È]›ÜˆÛÛ[ÈÙY\H›ÝšY\ˆ›Û\ˆÈØXÚH™Yš^ž]K\ÝX›HXÜ›ÜÜÈ\›œËˆÛX[š[™È]\™HÛÝ[ˆÈ™KZ[›ÙXÙHH]™\™Ù[˜ÙH]^\ÝÈÈ™[[Ý™K‚ˆYˆ›ÝÖÈ˜\WØÛÛ[—N‚ˆ\ÙÖÈ˜\WØÛÛ[—HH›ÝÖÈ˜\WØÛÛ[—BˆYˆ›ÝÖÈ™\Ü^WÚÚ[™—N‚ˆ\ÙÖÈ™\Ü^WÚÚ[™—HH›ÝÖÈ™\Ü^WÚÚ[™—BˆYˆ›ÝÖÈ™\Ü^WÛY]Y]H—N‚ˆXÛÙYHÙ[‹—ÙXÛÙWÙ\Ü^WÛY]Y]J›ÝÖÈ™\Ü^WÛY]Y]H—JBˆYˆXÛÙY\È›Ý›Û™N‚ˆ\ÙÖÈ™\Ü^WÛY]Y]H—HHXÛÙYˆYˆ[˜ÛYWÜÝ[[X\žWÛX\šÙ\œÈ[™›ÝÖÈ—ØÛÛ\™\ÜÙYÜÝ[[X\žH—N‚ˆ\ÙÖÈ—ØÛÛ\™\ÜÙYÜÝ[[X\žH—HHYBˆYˆ›ÝÖÈ[Y\Ý[\—N‚ˆ\ÙÖÈ[Y\Ý[\—HH›ÝÖÈ[Y\Ý[\—BˆYˆ›ÝÖÈÛÛØØ[ÚY—N‚ˆ\ÙÖÈÛÛØØ[ÚY—HH›ÝÖÈÛÛØØ[ÚY—BˆYˆ›ÝÖÈÛÛÛ˜[YH—N‚ˆ\ÙÖÈÛÛÛ˜[YH—HH›ÝÖÈÛÛÛ˜[YH—BˆYˆ›ÝÖÈ™Y™™XÝÙ\ÜÜÚ][Ûˆ—N‚ˆ\ÙÖÈ™Y™™XÝÙ\ÜÜÚ][Ûˆ—HH›ÝÖÈ™Y™™XÝÙ\ÜÜÚ][Ûˆ—BˆYˆ›ÝÖÈÛÛØØ[È—N‚ˆžN‚ˆ\ÙÖÈÛÛØØ[È—HHœÛÛ‹›ØYÊ›ÝÖÈÛÛØØ[È—JBˆ^Ù\
+œÛÛ‹’”ÓÓ‘XÛÙQ\œ›Ü‹\Q\œ›ÜŠN‚ˆÙÙÙ\‹Ø\›š[™Ê‘˜Z[YÈ\Ù\šX[^™HÛÛØØ[È[ˆÛÛ™\œØ][Ûˆ™\^K˜[[™È˜XÚÈÈ×HŠBˆ\ÙÖÈÛÛØØ[È—HH×BˆÈÝ\™˜XÙHH]›Ü›K\ÚYHY\ÜØYÙHY
+K™Ëˆ]X[˜˜[È\Ù×ÚYˆÈ[YÜ˜[H\]WÚY
+HÛÈ]›Ü›K\ÜXÚYšXÈ›ÝÜÈZÙH™XØ[ˆÈØ[ˆX]ÚžH^\›˜[Y[YšY\ˆ[œÝXYÙˆ]š[™ÈÈ˜[ˆÈ˜XÚÈÈÛÛ[[X]Ú]\š\ÝXÜËˆ^ÜÙY\ÈY\ÜØYÙWÚYˆÈ›Üˆ˜XÚÝØ\™ÛÛ\]Xš[]HÚ]H”ÓÓ“˜[œØÜš\Ú\K‚ˆYˆ›ÝÖÈœ]›Ü›WÛY\ÜØYÙWÚY—N‚ˆ\ÙÖÈ›Y\ÜØYÙWÚY—HH›ÝÖÈœ]›Ü›WÛY\ÜØYÙWÚY—BˆYˆ›ÝÖÈ›ØœÙ\™Y—N‚ˆ\ÙÖÈ›ØœÙ\™Y—HHYBˆÈ™\ÝÜ™H™X\ÛÛš[™ÈšY[ÈÛˆ\ÜÚ\Ý[Y\ÜØYÙ\ÈÛÈ›ÝšY\œÂˆÈ]™\^H™X\ÛÛš[™È
+Ü[”›Ý]\‹Ü[RK›Ý\ÊH™XÙZ]™BˆÈÛÚ\™[][K]\›ˆ™X\ÛÛš[™ÈÛÛ^‚ˆYˆ›ÝÖÈœ›ÛH—HOH˜\ÜÚ\Ý[Ž‚ˆYˆ›ÝÖÈ™š[š\ÚÜ™X\ÛÛˆ—N‚ˆ\ÙÖÈ™š[š\ÚÜ™X\ÛÛˆ—HH›ÝÖÈ™š[š\ÚÜ™X\ÛÛˆ—BˆYˆ›ÝÖÈœ™X\ÛÛš[™È—N‚ˆ\ÙÖÈœ™X\ÛÛš[™È—HH›ÝÖÈœ™X\ÛÛš[™È—BˆYˆ›ÝÖÈœ™X\ÛÛš[™×ØÛÛ[—H\È›Ý›Û™N‚ˆ\ÙÖÈœ™X\ÛÛš[™×ØÛÛ[—HH›ÝÖÈœ™X\ÛÛš[™×ØÛÛ[—BˆYˆ›ÝÖÈœ™X\ÛÛš[™×Ù]Z[È—N‚ˆžN‚ˆ\ÙÖÈœ™X\ÛÛš[™×Ù]Z[È—HHœÛÛ‹›ØYÊ›ÝÖÈœ™X\ÛÛš[™×Ù]Z[È—JBˆ^Ù\
+œÛÛ‹’”ÓÓ‘XÛÙQ\œ›Ü‹\Q\œ›ÜŠN‚ˆÙÙÙ\‹Ø\›š[™Ê‘˜Z[YÈ\Ù\šX[^™H™X\ÛÛš[™×Ù]Z[Ë˜[[™È˜XÚÈÈ›Û™HŠBˆ\ÙÖÈœ™X\ÛÛš[™×Ù]Z[È—HH›Û™BˆYˆ›ÝÖÈ˜ÛÙ^Ü™X\ÛÛš[™×Ú][\È—N‚ˆžN‚ˆ\ÙÖÈ˜ÛÙ^Ü™X\ÛÛš[™×Ú][\È—HHœÛÛ‹›ØYÊ›ÝÖÈ˜ÛÙ^Ü™X\ÛÛš[™×Ú][\È—JBˆ^Ù\
+œÛÛ‹’”ÓÓ‘XÛÙQ\œ›Ü‹\Q\œ›ÜŠN‚ˆÙÙÙ\‹Ø\›š[™Ê‘˜Z[YÈ\Ù\šX[^™HÛÙ^Ü™X\ÛÛš[™×Ú][\Ë˜[[™È˜XÚÈÈ›Û™HŠBˆ\ÙÖÈ˜ÛÙ^Ü™X\ÛÛš[™×Ú][\È—HH›Û™BˆYˆ›ÝÖÈ˜ÛÙ^ÛY\ÜØYÙWÚ][\È—N‚ˆžN‚ˆ\ÙÖÈ˜ÛÙ^ÛY\ÜØYÙWÚ][\È—HHœÛÛ‹›ØYÊ›ÝÖÈ˜ÛÙ^ÛY\ÜØYÙWÚ][\È—JBˆ^Ù\
+œÛÛ‹’”ÓÓ‘XÛÙQ\œ›Ü‹\Q\œ›ÜŠN‚ˆÙÙÙ\‹Ø\›š[™Ê‘˜Z[YÈ\Ù\šX[^™HÛÙ^ÛY\ÜØYÙWÚ][\Ë˜[[™È˜XÚÈÈ›Û™HŠBˆ\ÙÖÈ˜ÛÙ^ÛY\ÜØYÙWÚ][\È—HH›Û™BˆYˆ[˜ÛYWØ[˜Ù\ÝÜœÎ‚ˆØ[›ÛšXØ[ØÛÛ[Ú\×ØÛÛ\ÜÚ]HH
+ˆÙ[‹—ØØ[›ÛšXØ[Ü™\^YYÝ\Ù\—ØÛÛ[
+\ÙÊBˆ
+Bˆ^XÝØÛÛ™WÚÙ^HHÙ[‹—Ù^XÝÜ™\^YYÝ\Ù\—ØÛÛ™WÚÙ^Jˆ\ÙË™Ù]
+[Y\Ý[\ŠKØ[›ÛšXØ[ØÛÛ[ˆ
+Bˆ™]š[Ý\×Ù^XÝH
+ˆ^XÝÝ\Ù\—ØÛÛ™\Ë™Ù]
+^XÝØÛÛ™WÚÙ^JBˆYˆ^XÝØÛÛ™WÚÙ^H\È›Ý›Û™Bˆ[ÙH›Û™Bˆ
+Bˆ\XØ]HH›Û™BˆYˆ™]š[Ý\×Ù^XÝ\È›Ý›Û™N‚ˆ™]š[Ý\×Ú[™^H™^
+ˆ
+ˆ[™^ˆ›Üˆ[™^Ø[™Y]H[ˆ[[Y\˜]JY\ÜØYÙ\ÊBˆYˆØ[™Y]H\È™]š[Ý\×Ù^XÝˆ
+Kˆ›Û™Kˆ
+BˆYˆ™]š[Ý\×Ú[™^\È›Ý›Û™N‚ˆ\XØ]HH
+™]š[Ý\×Ú[™^YJBˆYˆ\XØ]H\È›Û™N‚ˆ\XØ]HHÙ[‹—Ùš[™Ù\XØ]WÜ™\^YYÝ\Ù\—ÛY\ÜØYÙJˆY\ÜØYÙ\Ë\ÙÂˆ
+BˆYˆ\XØ]H\È›Ý›Û™N‚ˆ\XØ]WÚ[™^™Y™\—ØÝ\œ™[H\XØ]BˆYˆ™Y™\—ØÝ\œ™[‚ˆÈH›Ý]YÛÛ\™\ÜÚ[ÛˆÚ[Ø[ˆØ\œžHHØ[YH]™BˆÈ\ÚÈ\ÈH\™[›ÝÈ\ÈHÛ›HÝ\š]š[™ÈÝ[[X\žBˆÈØØY™›ÛˆÙY\HÚ[Ø\œšY\ˆ
+[™]È\˜X›H›ÝÂˆÈY
+K›ÝHÚ[\\ˆ[˜Ù\ÝÜˆÛÜK‚ˆY\ÜØYÙ\ËœÜ
+\XØ]WÚ[™^
+Bˆ[ÙN‚ˆÛÛ[YBˆY\ÜØYÙ\Ë˜\[™
+\ÙÊBˆYˆ[˜ÛYWØ[˜Ù\ÝÜœÈ[™^XÝØÛÛ™WÚÙ^H\È›Ý›Û™N‚ˆ^XÝÝ\Ù\—ØÛÛ™\ÖÙ^XÝØÛÛ™WÚÙ^WHH\ÙÂˆÈQ‘S”ÑKRS‹QTYØZ[œÝ˜XÚÙÜ›Ý[™\™]šY]ÈÙ\ÜÚ[ÛˆÛ][ÛŽˆH›ÜšÙYˆÈÚÚ[ÛY[[ÜžH™]šY]È]
+[ˆÛ\ˆZ[Ë™Y›Ü™HHÜ\œÚ\ÝÙ\ØX›YˆÈš^
+HÚ\™YH\™[	ÜÈÙ\ÜÚ[Û—ÚYÜ›ÝH]È\›™\ÜÈ\›ˆ[È\ÂˆÈ™X[Ù\ÜÚ[Û‹ˆH\›™\ÜÈ\ÈH\Ù\‹ÜÞ\Ý[HY\ÜØYÙH[œÝXÝ[™ÈBˆÈYÙ[È”™]šY]ÈHÛÛ™\œØ][ÛˆX›Ý™H[™\]HHÚÚ[Xœ˜\žHÂˆÈØ]™HÈY[[ÜžHˆ[™\ˆH\™ÛÛ™\ÝšXÝ[ÛŽÈ™K[ØY[™È]\È]™BˆÈ\ÝÜžHXZÙ\ÈHYÙ[YÜHÝ\˜]Üˆ›ÛH[™™Y\ÙHH\Ù\‰ÜÂˆÈXÝX[\ÚËˆÝš\[žHÝXÚ\›™\ÜÈY\ÜØYÙHS‘HÝ\˜]Ü‹[[ÙBˆÈ\ÜÚ\Ý[™\H[[YYX][H›ÛÝÚ[™È]ÛÈHÛ]YÙ\ÜÚ[Û‚ˆÈ™\Ý[Y\ÈÛX[ˆ]™[ˆYˆÝ˜^H›ÝÜÈ^\Ý‚ˆY\ÜØYÙ\ÈHÜÝš\Ø˜XÚÙÜ›Ý[™Ü™]šY]×Ú\›™\ÜÊY\ÜØYÙ\ÊBˆÈQ‘S”ÑKRS‹QTYØZ[œÝÍÎMˆ™Y›Ü™H]š^H˜\™HÛÛXØ[ˆÈX\šÙ\ˆ
+K™Ëˆ–ÛY[[ÜžWHŠHÛÝ[Ù]ØXÚY\ÈH˜[˜XÚÈ[™ˆÈ\œÚ\ÝY\ÈYˆ]Ù\™HH[Ù[	ÜÈ™X[[œÝÙ\‹ˆÙ\ÜÚ[ÛœÈÜš][‚ˆÈ™Y›Ü™HHš^Ø[ˆÝ[Ø\œžHÜÙH›ÝÜÈ8 %ÛX\ˆHÝ˜^BˆÈÛÛ[ÛˆØYÛÈ™\^Z[™È\ÝÜžHÙ\Û‰Ý™K]XXÚH[Ù[ˆÈÈÙY\[Z][™ÈHX\šÙ\‹ˆ›Ë[Ü›Üˆ[˜Y™™XÝYÙ\ÜÚ[ÛœË‚ˆY\ÜØYÙ\ÈHÜÝš\ÜÝ[WÝÛÛØØ[ÛX\šÙ\œÊY\ÜØYÙ\ÊBˆYˆ™\Z\—Ø[\›˜][Ûˆ[™Y\ÜØYÙ\Î‚ˆÈ^žH[\Üˆ\›Y\×ÜÝ]H[™XYH\[™ÈÛˆYÙ[Šˆ
+ÙYBˆÈØ[š]^™WØÛÛ^X›Ý™JK]ÙY\\ÈÜ[Û˜[]œ›ÛBˆÈÚY[š[™ÈH[\ÜÝ\™˜XÙH][Ù[HØY‚ˆœ›ÛHYÙ[˜YÙ[Ü[[YWÚ[\œÈ[\Ü™\Z\—ÛY\ÜØYÙWÜÙ\]Y[˜ÙB‚ˆ™\Z\™YH™\Z\—ÛY\ÜØYÙWÜÙ\]Y[˜ÙJ›Û™KY\ÜØYÙ\ÊBˆYˆ™\Z\™Y‚ˆÙÙÙ\‹š[™›Êˆ”™\Z\™Y	YY\ÜØYÙKX[\›˜][Ûˆš[Û][ÛŠÊHÚ[H‚ˆœ™\ÝÜš[™ÈÙ\ÜÚ[Ûˆ	\È8 %\˜X›H˜[œØÜš\Ù\[K‚ˆœÙYH™\Z\—ÛY\ÜØYÙWÜÙ\]Y[˜ÙH‹ˆ™\Z\™YˆÙ\ÜÚ[Û—ÚYˆ
+Bˆ™]\›ˆY\ÜØYÙ\Â‚ˆYˆÙ]Ü™\Ý[YWØÛÛ™\œØ][ÛœÊˆÙ[‹Ù\ÜÚ[Û—ÚYˆÝ‚ˆ
+HOˆ\VÓ\ÝÑXÝÜÝ‹[žWWK\ÝÑXÝÜÝ‹[žWWWN‚ˆˆˆ”™]\›ˆ
+[Ù[Ú\ÝÜžK\Ü^WÚ\ÝÜžJX›ÜˆHÙ\ÜÚ[Ûˆ™\Ý[YH[ˆÓ‘HÑSPÕ‚‚ˆÙ\ÜÚ[Û‹œ™\Ý[YX™YYÈÛÈ›Ú™XÝ[ÛœÈÙˆHØ[YH[™XYÙN‚‚ˆH[Ù[Ú\ÝÜžX8 %H\Ù\ÜÚ[Û‰ÜÈXÝ]™H›ÝÜË[\›˜][Û‹\™\Z\™Yˆ
+H]™K\™\^HÛÜšÚ[™ÈÛÛ™\œØ][ÛŠKˆ\]Z]˜[[ÂˆÙ]ÛY\ÜØYÙ\×Ø\×ØÛÛ™\œØ][ÛŠÙ\ÜÚ[Û—ÚY™\Z\—Ø[\›˜][ÛUYJX‚ˆH\Ü^WÚ\ÝÜžX8 %H[ÛÛ\™\ÜÚ[Ûˆ[™XYÙH
+[˜Ù\ÝÜœÈ8¡¤ˆ\
+Kˆ™\˜˜][KÚ]™\^YY]\Ù\ˆY\ˆ^XÚ]Øœ˜[˜ÚÙ\ÜÚ[ÛœÈ\™Bˆ^ÛYYœ›ÛH\È[™XYÙH™XØ]\ÙHZ\ˆÝÛˆ›ÝÜÈ[™XYHÛÛZ[ˆBˆÛÜYY˜[œØÜš\È[˜ÛY[™ÈH]™H\™[	ÜÈ›ÝÜÈÛÝ[]Y\ÜØYÙ\ÂˆÜš][ˆÈHÜšYÚ[˜[Y\ˆH›ÜšÈXZÈ[ÈHœ˜[˜Ú‚‚ˆH\Ü^H™]Ú[™XYH™XYÈHÝ\\œÙ]ÙˆH[Ù[™]Ú
+H\ˆ›ÝÜÈ\™H\ÙˆH[™XYÙJKÛÈÙ\š[™È›Ýœ›ÛHÛ™H[™XYÙHÑSPÕˆ[™\ÈH™\Ý[YIÜÈˆÛÜšÈ™\œÝ\ÈÛÈÙ\\˜]HØ[ËÚ]ž]KZY[XØ[ˆÝ]]
+ÙYH\ÝÙÙ]Ü™\Ý[YWØÛÛ™\œØ][Ûœ×ÛX]Ú\×ÜÙ\\˜]WÜ™XYÊK‚ˆˆˆ‚ˆÙ\ÜÚ[Û—ÚYÈH
+ˆÜÙ\ÜÚ[Û—ÚYBˆYˆÙ[‹—Ú\×Ù^XÚ]Øœ˜[˜ÚÜÙ\ÜÚ[ÛŠÙ\ÜÚ[Û—ÚY
+Bˆ[ÙHÙ[‹—ÜÙ\ÜÚ[Û—Û[™XYÙWÜ›ÛÝÝ×Ý\
+Ù\ÜÚ[Û—ÚY
+Bˆ
+BˆÚ]Ù[‹—Ü™XYØÝ
+
+H\ÈÛÛ›Ž‚ˆXÙZÛ\œÈH‹‹š›Ú[ŠÈˆ›ÜˆÈ[ˆÙ\ÜÚ[Û—ÚYÊBˆ›ÝÜÈHÛÛ›‹™^XÝ]Jˆˆ”ÑSPÕÙ\ÜÚ[Û—ÚYÜÙ[‹—ÐÓÓ•‘T”ÐUSÓ—Ô“Õ×ÐÓÓSS”ßH‚ˆˆ‘”“ÓHY\ÜØYÙ\ÈÒT‘HÙ\ÜÚ[Û—ÚYSˆ
+ÜXÙZÛ\œßJHS‘XÝ]™HHH‚ˆÈÔ‘Tˆ–HY
+[œÙ\[ÛˆÜ™\ŠH8 %ÙYHÙ]ÛY\ÜØYÙ\×Ø\×ØÛÛ™\œØ][Û‚ˆÈ›ÜˆÚH[Y\Ý[\Ü™\š[™È\È[œØY™K‚ˆ“Ô‘Tˆ–HY‹ˆ\JÙ\ÜÚ[Û—ÚYÊKˆ
+K™™]Ú[
+
+B‚ˆÈ\›ÝÜÈ\™H^XÝHH[Ù[Y™YÙ]
+Ù]ÛY\ÜØYÙ\×Ø\×ØÛÛ™\œØ][Û‚ˆÈÚ]Ù\ÜÚ[Û—ÚYÏVÜÙ\ÜÚ[Û—ÚYJNÈš[\š[™ÈH[™XYÙH™]Ú™\Ù\™\ÂˆÈZ\ˆ™[]]™HYÜ™\‹‚ˆ\Ü›ÝÜÈHÜˆ›Üˆˆ[ˆ›ÝÜÈYˆ–ÈœÙ\ÜÚ[Û—ÚY—HOHÙ\ÜÚ[Û—ÚYBˆ[Ù[Ú\ÝÜžHHÙ[‹—Ü›ÝÜ×Ý×ØÛÛ™\œØ][ÛŠˆ\Ü›ÝÜËˆÙ\ÜÚ[Û—ÚY\Ù\ÜÚ[Û—ÚYˆ[˜ÛYWØ[˜Ù\ÝÜœÏQ˜[ÙKˆ™\Z\—Ø[\›˜][ÛUYKˆ[˜ÛYWÜ›Ý×ÚYÏUYKˆÈ™KXÛÛ\™\ÜÈÚXÚÜÚ[[™ÎˆH™\Ý[YY[Ù[\ÝÜžH]\ÝÙY\ˆÈHÝ[[X\žHX\šÙ\ˆÛÈÚXÚÜÚ[›ÝšY\œÈØ[ˆ^ÛYH\š]˜]]™BˆÈÝ[[X\šY\ÈY\ˆH›ØÙ\ÜÈ™\Ý\
+X\šÙ\ˆÝ\š]™\È™\Ý\
+K‚ˆ[˜ÛYWÜÝ[[X\žWÛX\šÙ\œÏUYKˆ
+Bˆ\Ü^WÚ\ÝÜžHHÙ[‹—Ü›ÝÜ×Ý×ØÛÛ™\œØ][ÛŠˆ›ÝÜËˆÙ\ÜÚ[Û—ÚY\Ù\ÜÚ[Û—ÚYˆ[˜ÛYWØ[˜Ù\ÝÜœÏUYKˆ™\Z\—Ø[\›˜][ÛQ˜[ÙKˆ[˜ÛYWÜ›Ý×ÚYÏUYKˆ
+Bˆ™]\›ˆ[Ù[Ú\ÝÜžK\Ü^WÚ\ÝÜžB‚‚‚ˆYˆ\ÜÙ\Ù^ÜÜØY™JˆÙ[‹ˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆX^ÛY\ÜØYÙ\ÎˆÜ[Û˜[Ú[HH›Û™Kˆ
+HOˆ[‚ˆˆˆ”™]\›ˆXÝ]™H›ÝÈÛÝ[Üˆ™Z™XÝ[ˆ[œØY™H[‹[Y[[ÜžH^Ü‚‚ˆ^Ü[™ÈÛ™HÙ\ÜÚ[ÛˆÙ\È›Ý[˜ÛYHÛÛ\™\ÜÚ[Ûˆ[˜Ù\ÝÜœËÛÈ\ÂˆÝX\™[X™\˜][HÛÝ[ÈÛ›HH™\]Y\ÝYÙYÛY[ˆH[Z]YˆÝXœ]Y\žHÝÜÈ\ÈÛÛÛˆ\È]›Ý™\ÈH˜[œØÜš\^ÙYYÈH›Ý[™‚‚ˆX^ÛY\ÜØYÙ\ÏS›Û™X™\ÛÛ™\ÈH[Z]œ›ÛHÛÛ™šYÂˆ
+Ù\ÜÚ[ÛœË›X^Ù^ÜÛY\ÜØYÙ\Ø
+NÈ\ØX›\ÈHÝX\™[™™]\›œÂˆHXÝ]™H›ÝÈÛÝ[Ú]Ý]˜Z\Ú[™Ë‚ˆˆˆ‚ˆYˆX^ÛY\ÜØYÙ\È\È›Û™N‚ˆX^ÛY\ÜØYÙ\ÈH™\ÛÛ™YÛX^Ù^ÜÛY\ÜØYÙ\Ê
+BˆYˆX^ÛY\ÜØYÙ\È‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠ›X^ÛY\ÜØYÙ\È]\Ý™H›Û‹[™YØ]]™HŠBˆYˆX^ÛY\ÜØYÙ\ÈOH‚ˆÈÝX\™\ØX›YžHÛÛ™šYÈ8 %ÚÚ\HÓÕS•È]™HØ[\œÈ\ÙBˆÈ\È›Üˆ]È˜Z\ÙHÚYHY™™XÝÛ›H
+[™ÚÚ\Ø[[™È]ˆÈ[\™[HÚ[ˆH[Z]\È
+K‚ˆ™]\›ˆˆÚ]Ù[‹—Ü™XYØÝ
+
+H\ÈÛÛ›Ž‚ˆ›ÝÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕÓÕS•
+
+ŠH”“ÓH
+‚ˆ”ÑSPÕH”“ÓHY\ÜØYÙ\ÈÒT‘HÙ\ÜÚ[Û—ÚYHÈS‘XÝ]™HHHSRUÈ‚ˆŠH‹ˆ
+Ù\ÜÚ[Û—ÚYX^ÛY\ÜØYÙ\È
+ÈJKˆ
+K™™]ÚÛ™J
+BˆY\ÜØYÙWØÛÝ[H[
+›ÝÖÌHYˆ›ÝÈ[ÙH
+BˆYˆY\ÜØYÙWØÛÝ[ˆX^ÛY\ÜØYÙ\Î‚ˆ˜Z\ÙHÙ\ÜÚ[Û‘^ÜÛÓ\™ÙQ\œ›ÜŠÙ\ÜÚ[Û—ÚYY\ÜØYÙWØÛÝ[X^ÛY\ÜØYÙ\ÊBˆ™]\›ˆY\ÜØYÙWØÛÝ[‚ˆYˆÙ]Ø[˜Ù\ÝÜ—Ù\Ü^WÜ™Yš^
+Ù[‹Ù\ÜÚ[Û—ÚYˆÝŠHOˆ\ÝÑXÝÜÝ‹[žWWN‚ˆˆˆ”™]\›ˆH[˜Ù\ÝÜ‹[Û›H\Ü^HY\ÜØYÙ\È›ÜˆHÙ\ÜÚ[Ûˆ[™XYÙK‚‚ˆ\ÙH\™HY\ÜØYÙ\Èœ›ÛH\™[ÙÜ˜[™\™[Ù\ÜÚ[ÛœÈ
+ÛÛ\™\ÜÚ[Û‚ˆ[˜Ù\ÝÜœÊH]\X\ˆ[ˆH\Ü^H˜[œØÜš\]“Õ[ˆBˆ\Ù\ÜÚ[Û‰ÜÈ[Ù[Y™Y\ÝÜžKˆ\ÙYžHÙ\ÜÚ[Û‹œ™\Ý[YXÂˆZ[H\Ü^WÚ\ÝÜžWÜ™Yš^]Û]™WÜÙ\ÜÚ[Û—Ü^[ØYˆ™\[™ÈÈH]™H[Ù[\ÝÜžK‚‚ˆ™]š[Ý\ÛHH™Yš^Ø\ÈØ[Ý[]Y\Âˆ\Ü^WÚ\ÝÜžVÎ›[Š\Ü^JHH[Š˜]ÊWX]]Ý™\˜ÛÝ[ÂˆÚ[ˆ™\Z\—ÛY\ÜØYÙWÜÙ\]Y[˜ÙX™[[Ý™\ÈY\ÜØYÙ\Èœ›ÛHHRQBˆÙˆH\\ÝÜžH
+K™Ëˆ™\šYšXØ][ÛˆØ[™Y]\ÈÛÛ\ÙYžHBˆÛÛœÙXÝ]]™KX\ÜÚ\Ý[Y\™ÙJH8 %H[™ÝY™™\™[˜ÙH[˜ÛY\È›Ýˆ[˜Ù\ÝÜˆY\ÜØYÙ\ÈS‘™\Z\‹\™[[Ý™Y\Y\ÜØYÙ\Ë]HÛXÙBˆÛ›HØ\\™\ÈHš\œÝˆ\Ü^HY\ÜØYÙ\È
+ÚXÚ\™H\Y\ÜØYÙ\ÂˆÚ[ˆ\™H\™H›È[˜Ù\ÝÜœÊKØ]\Ú[™È\XØ][Û‹ˆ\ÈY]Ùˆ™]\›œÈÓ“HHÙ[Z[™H[˜Ù\ÝÜˆY\ÜØYÙ\ËY[YšYYžBˆÙ\ÜÚ[Û—ÚYOH\ÜÙ\ÜÚ[Û—ÚYˆ
+ÍNLNJBˆˆˆ‚ˆYˆÙ[‹—Ú\×Ù^XÚ]Øœ˜[˜ÚÜÙ\ÜÚ[ÛŠÙ\ÜÚ[Û—ÚY
+N‚ˆ™]\›ˆ×B‚ˆÙ\ÜÚ[Û—ÚYÈHÙ[‹—ÜÙ\ÜÚ[Û—Û[™XYÙWÜ›ÛÝÝ×Ý\
+Ù\ÜÚ[Û—ÚY
+BˆYˆ[ŠÙ\ÜÚ[Û—ÚYÊHHN‚ˆ™]\›ˆ×BˆÚ]Ù[‹—Ü™XYØÝ
+
+H\ÈÛÛ›Ž‚ˆXÙZÛ\œÈH‹‹š›Ú[ŠÈˆ›ÜˆÈ[ˆÙ\ÜÚ[Û—ÚYÊBˆ›ÝÜÈHÛÛ›‹™^XÝ]Jˆˆ”ÑSPÕÙ\ÜÚ[Û—ÚYÜÙ[‹—ÐÓÓ•‘T”ÐUSÓ—Ô“Õ×ÐÓÓSS”ßH‚ˆˆ‘”“ÓHY\ÜØYÙ\ÈÒT‘HÙ\ÜÚ[Û—ÚYSˆ
+ÜXÙZÛ\œßJHS‘XÝ]™HHH‚ˆ“Ô‘Tˆ–HY‹ˆ\JÙ\ÜÚ[Û—ÚYÊKˆ
+K™™]Ú[
+
+Bˆ[˜Ù\ÝÜ—ÚYÈHÂˆ[
+›ÝÖÈšY—JBˆ›Üˆ›ÝÈ[ˆ›ÝÜÂˆYˆ›ÝÖÈœÙ\ÜÚ[Û—ÚY—HOHÙ\ÜÚ[Û—ÚY[™›ÝÖÈšY—H\È›Ý›Û™BˆBˆYˆ›Ý[˜Ù\ÝÜ—ÚYÎ‚ˆ™]\›ˆ×Bˆ[™XYÙHHÙ[‹—Ü›ÝÜ×Ý×ØÛÛ™\œØ][ÛŠˆ›ÝÜËˆÙ\ÜÚ[Û—ÚY\Ù\ÜÚ[Û—ÚYˆ[˜ÛYWØ[˜Ù\ÝÜœÏUYKˆ™\Z\—Ø[\›˜][ÛQ˜[ÙKˆ[˜ÛYWÜ›Ý×ÚYÏUYKˆ
+Bˆ™Yš^ˆ\ÝÑXÝÜÝ‹[žWWHH×Bˆ›ÜˆY\ÜØYÙH[ˆ[™XYÙN‚ˆYˆY\ÜØYÙK™Ù]
+—Ü›Ý×ÚYŠH›Ý[ˆ[˜Ù\ÝÜ—ÚYÎ‚ˆÛÛ[YBˆ›Ú™XÝYHY\ÜØYÙK˜ÛÜJ
+Bˆ›Ú™XÝYœÜ
+—Ü›Ý×ÚY‹›Û™JBˆ™Yš^˜\[™
+›Ú™XÝY
+Bˆ™]\›ˆ™Yš^‚ˆYˆÚ\×Ù^XÚ]Øœ˜[˜ÚÜÙ\ÜÚ[ÛŠÙ[‹Ù\ÜÚ[Û—ÚYˆÝŠHOˆ›ÛÛ‚ˆˆˆ”™]\›ˆÚ]\ˆ
+œÙ\ÜÚ[Û—ÚY
+ˆ\ÈHÛÜYY\Ù\‹Y˜XÚ[™Èœ˜[˜Ú‚‚ˆœ˜[˜Ú\È[™ÛÛ\™\ÜÚ[ÛˆÛÛ[X][ÛœÈ›Ý\ÙH\™[ÜÙ\ÜÚ[Û—ÚYˆ]^H]™HY™™\™[\ÝÜžHÙ[X[XÜÎˆHœ˜[˜ÚÝÛœÈHÛÜYYˆ˜[œØÜš\Ú[HHÛÛ\™\ÜÚ[ÛˆÛÛ[X][Ûˆ™YYÈ]È[™Y\™[	ÜÂˆ\˜Ú]™Y›ÝÜÈ›Üˆ\Ü^KˆH\˜X›HØœ˜[˜ÚYÙœ›ÛXX\šÙ\ˆ\ÈBˆ^\Ý[™È\ØÜš[Z[˜]ÜˆÜš][ˆžH[œ˜[˜ÚÜ™X][Ûˆ]Ë‚ˆˆˆ‚ˆYˆ›ÝÙ\ÜÚ[Û—ÚY‚ˆ™]\›ˆ˜[ÙBˆÚ]Ù[‹—Ü™XYØÝ
+
+H\ÈÛÛ›Ž‚ˆ›ÝÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕ[Ù[ØÛÛ™šYÈ”“ÓHÙ\ÜÚ[ÛœÈÒT‘HYHÈ‹ˆ
+Ù\ÜÚ[Û—ÚY
+Kˆ
+K™™]ÚÛ™J
+BˆYˆ›ÝÈ\È›Û™N‚ˆ™]\›ˆ˜[ÙBˆ˜]×ØÛÛ™šYÈH›ÝÖÈ›[Ù[ØÛÛ™šYÈ—HYˆ\Ø]Š›ÝËšÙ^\ÈŠH[ÙH›ÝÖÌBˆYˆ›Ý˜]×ØÛÛ™šYÎ‚ˆ™]\›ˆ˜[ÙBˆžN‚ˆÛÛ™šYÈHœÛÛ‹›ØYÊ˜]×ØÛÛ™šYÊHYˆ\Ú[œÝ[˜ÙJ˜]×ØÛÛ™šYËÝŠH[ÙH˜]×ØÛÛ™šYÂˆ^Ù\
+œÛÛ‹’”ÓÓ‘XÛÙQ\œ›Ü‹\Q\œ›ÜŠN‚ˆ™]\›ˆ˜[ÙBˆ™]\›ˆ\Ú[œÝ[˜ÙJÛÛ™šYËXÝ
+H[™›ÛÛ
+ÛÛ™šYË™Ù]
+—Øœ˜[˜ÚYÙœ›ÛHŠJB‚ˆYˆÙ]ØÛÛ™\œØ][Û—Ü›ÛÝ
+Ù[‹Ù\ÜÚ[Û—ÚYˆÝŠHOˆÝŽ‚ˆˆˆ”™]\›ˆH“ÓÕYÙˆ
+œÙ\ÜÚ[Û—ÚY
+‰ÜÈ[™XYÙHÚZ[‹‚‚ˆH›ÛÝ\ÈHÝX›H˜ÛÛ™\œØ][ÛˆYŽˆÛÛ^ÛÛ\™\ÜÚ[Û‚ˆ›Ý]\ÈÙ\ÜÚ[Û—ÚYÈH™]ÈÙYÛY[[šÙYšXBˆ\™[ÜÙ\ÜÚ[Û—ÚY[™[YØ]HÝX˜YÙ[È[™ÈÙ™ˆZ\‚ˆ\™[HØ[YHØ^KˆØ[Ú[™ÈÈH›ÛÝÚ]™\È]™\žHÙYÛY[Ù‚ˆÛ™H\Ù\‹Y˜XÚ[™ÈÛÛ™\œØ][Ûˆ
+[™]È[YØ][Ûˆ™YJHHÚ[™ÛBˆY[YšY\ˆ8 %\ÙY›Üˆ›Ý\ÈÜ[ÛÛ™\œØ][ÛX\ØYÙHYÙÚ[™Ë‚ˆ™]\›œÈ
+œÙ\ÜÚ[Û—ÚY
+ˆ[˜Ú[™ÙYÚ[ˆ]\È›È™XÛÜ™Y\™[‚ˆˆˆ‚ˆÚZ[ˆHÙ[‹—ÜÙ\ÜÚ[Û—Û[™XYÙWÜ›ÛÝÝ×Ý\
+Ù\ÜÚ[Û—ÚY
+Bˆ™]\›ˆ
+ÚZ[–ÌHYˆÚZ[ˆ[™ÚZ[–ÌH[ÙHÙ\ÜÚ[Û—ÚY
+B‚ˆYˆÜÙ\ÜÚ[Û—Û[™XYÙWÜ›ÛÝÝ×Ý\
+Ù[‹Ù\ÜÚ[Û—ÚYˆÝŠHOˆ\ÝÜÝ—N‚ˆYˆ›ÝÙ\ÜÚ[Û—ÚY‚ˆ™]\›ˆÜÙ\ÜÚ[Û—ÚYB‚ˆÚZ[ˆH×BˆÝ\œ™[HÙ\ÜÚ[Û—ÚYˆÙY[ˆHÙ]
+
+BˆÚ]Ù[‹—Ü™XYØÝ
+
+H\ÈÛÛ›Ž‚ˆ›ÜˆÈ[ˆ˜[™ÙJL
+N‚ˆYˆ›ÝÝ\œ™[ÜˆÝ\œ™[[ˆÙY[Ž‚ˆœ™XZÂˆÙY[‹˜Y
+Ý\œ™[
+BˆÚZ[‹˜\[™
+Ý\œ™[
+Bˆ›ÝÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕ\™[ÜÙ\ÜÚ[Û—ÚY”“ÓHÙ\ÜÚ[ÛœÈÒT‘HYHÈ‹ˆ
+Ý\œ™[
+Kˆ
+K™™]ÚÛ™J
+BˆYˆ›ÝÈ\È›Û™N‚ˆœ™XZÂˆÝ\œ™[H›ÝÖÈœ\™[ÜÙ\ÜÚ[Û—ÚY—HYˆ\Ø]Š›ÝËšÙ^\ÈŠH[ÙH›ÝÖÌBˆ™]\›ˆ\Ý
+™]™\œÙY
+ÚZ[ŠJHÜˆÜÙ\ÜÚ[Û—ÚYB‚ˆÝ]XÛY]ÙˆYˆØØ[›ÛšXØ[Ü™\^YYÝ\Ù\—ØÛÛ[
+ˆ\ÙÎˆXÝÜÝ‹[žWKˆ
+HOˆ\VÐ[žK›ÛÛN‚ˆˆˆ”™]\›ˆØ[›ÛšXØ[]™HÛÛ[[™Ú]\ˆ
+›\ÙÊˆ\ÈÛÛ\ÜÚ]Kˆˆˆ‚ˆYˆ\ÙË™Ù]
+œ›ÛHŠHOH\Ù\ˆŽ‚ˆ™]\›ˆ›Û™K˜[ÙB‚ˆœ›ÛHYÙ[˜ÛÛ^ØÛÛ\™\ÜÛÜˆ[\ÜÜ]Ý\Ù\—ÛÜšYÚ[˜]YÝ\›‚‚ˆ[™Ù™‹]™WÝšY]ÈHÜ]Ý\Ù\—ÛÜšYÚ[˜]YÝ\›Š\ÙÊBˆ\×ØÛÛ\ÜÚ]HH[™Ù™ˆ\È›Ý›Û™H[™]™WÝšY]È\È›Ý›Û™Bˆ™]\›ˆ
+ˆ]™WÝšY]Ë™Ù]
+˜ÛÛ[ŠBˆYˆ\×ØÛÛ\ÜÚ]H[™]™WÝšY]È\È›Ý›Û™Bˆ[ÙH\ÙË™Ù]
+˜ÛÛ[ŠKˆ\×ØÛÛ\ÜÚ]Kˆ
+B‚ˆÝ]XÛY]ÙˆYˆÙ^XÝÜ™\^YYÝ\Ù\—ØÛÛ™WÚÙ^Jˆ[Y\Ý[\ˆ[žKÛÛ[ˆ[žBˆ
+HOˆÜ[Û˜[Õ\VÐ[žKÝ—WN‚ˆˆˆ”™]\›ˆH\ÚX›HÙ^H›ÜˆHÛÛ[[‹Y^XÝ›Ý][ÛˆÛÛ™Kˆˆˆ‚ˆYˆ[Y\Ý[\\È›Û™HÜˆÛÛ[[ˆ
+›Û™Kˆ‹×JN‚ˆ™]\›ˆ›Û™BˆžN‚ˆ[˜ÛÙYHœÛÛ‹™[\ÊˆÛÛ[ˆ[œÝ\™WØ\ØÚZOQ˜[ÙKˆÛÜÚÙ^\ÏUYKˆÙ\\˜]ÜœÏJ‹‹ŽˆŠKˆ
+Bˆ^Ù\
+\Q\œ›Ü‹˜[YQ\œ›ÜŠN‚ˆ™]\›ˆ›Û™Bˆ™]\›ˆ[Y\Ý[\[˜ÛÙY‚ˆÝ]XÛY]ÙˆYˆÙš[™Ù\XØ]WÜ™\^YYÝ\Ù\—ÛY\ÜØYÙJˆY\ÜØYÙ\Îˆ\ÝÑXÝÜÝ‹[žWWK\ÙÎˆXÝÜÝ‹[žWBˆ
+HOˆÜ[Û˜[Õ\VÚ[›ÛÛWN‚ˆˆˆ”™]\›ˆ[ˆY˜XÙ[™\^H\XØ]H[™Ú]\ˆ
+›\ÙÊˆ]\ÝÚ[‹‚‚ˆÛÛ\™\ÜÚ[Ûˆ›Ý][ÛˆX^H\œÚ\ÝHÝ\œ™[\ÚÈÛ˜ÙH[ˆH\™[ˆ[™YØZ[ˆ[œÚYHHÛÛ\ÜÚ]HÚ[Ø\œšY\‹ˆÛÛ\\™HHØ[›ÛšXØ[]™Bˆ^[ØY›Üˆ]Ø\œšY\‹Ú[H™]Z[š[™ÈH\ÝÜšXØ[^XÝ\Ýš[™ÂˆY\H›ÜˆÜ™[˜\žH™\^YY\Ù\œËˆHÚ[Ø\œšY\ˆÚ[œÈ™XØ]\ÙH]ˆÝÛœÈ›ÝHÝ\œ™[\˜X›H›ÝÈY[]H[™H™]Z[™YØØY™›Û‚ˆˆˆ‚ˆYˆ\ÙË™Ù]
+œ›ÛHŠHOH\Ù\ˆŽ‚ˆ™]\›ˆ›Û™B‚ˆÛÛ[™Y™\—ØÝ\œ™[HÙ\ÜÚ[Û‘‹—ØØ[›ÛšXØ[Ü™\^YYÝ\Ù\—ØÛÛ[
+\ÙÊBˆYˆÛÛ[[ˆ
+›Û™Kˆ‹×JN‚ˆ™]\›ˆ›Û™B‚ˆ›Üˆ[™^[ˆ˜[™ÙJ[ŠY\ÜØYÙ\ÊHHKLKLJN‚ˆ™]ˆHY\ÜØYÙ\ÖÚ[™^BˆYˆ™]‹™Ù]
+œ›ÛHŠHOH\Ù\ˆŽ‚ˆ™]—ØÛÛ[™]—Ú\×ØÛÛ\ÜÚ]HH
+ˆÙ\ÜÚ[Û‘‹—ØØ[›ÛšXØ[Ü™\^YYÝ\Ù\—ØÛÛ[
+™]ŠBˆ
+BˆYˆ™]—ØÛÛ[OHÛÛ[[™
+ˆ™Y™\—ØÝ\œ™[ˆÜˆ™]—Ú\×ØÛÛ\ÜÚ]BˆÜˆ\Ú[œÝ[˜ÙJÛÛ[ÝŠBˆ
+N‚ˆ™]\›ˆ[™^™Y™\—ØÝ\œ™[ˆYˆ™]‹™Ù]
+œ›ÛHŠHOH˜\ÜÚ\Ý[ˆ[™
+™]‹™Ù]
+˜ÛÛ[ŠHÜˆ™]‹™Ù]
+ÛÛØØ[ÈŠJN‚ˆ™]\›ˆ›Û™Bˆ™]\›ˆ›Û™B‚ˆÝ]XÛY]ÙˆYˆÚ\×Ù\XØ]WÜ™\^YYÝ\Ù\—ÛY\ÜØYÙJˆY\ÜØYÙ\Îˆ\ÝÑXÝÜÝ‹[žWWK\ÙÎˆXÝÜÝ‹[žWBˆ
+HOˆ›ÛÛ‚ˆ™]\›ˆÙ\ÜÚ[Û‘‹—Ùš[™Ù\XØ]WÜ™\^YYÝ\Ù\—ÛY\ÜØYÙJY\ÜØYÙ\Ë\ÙÊH\È›Ý›Û™B‚ˆÈOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOBˆÈ™]Ú[™
+ÛÙY[]JH8 %ÙYHÜ™]Ú[™Û\ÚÛÛ[X[™
+È\ÜÝYHÌŒNLLˆÈOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOB‚ˆYˆÙ]ØXÝ]™WÛY\ÜØYÙWÚYÊÙ[‹Ù\ÜÚ[Û—ÚYˆÝŠHOˆ\ÝÚ[N‚ˆˆˆ”™]\›ˆHÜ™\™Y\ÚXØ[YÈ[›™YžH™]Ú[™ÐTÈÚXÚÜË‚‚ˆÛÛ™\œØ][Ûˆ›Ú™XÝ[ÛœÈ[[[Û˜[HÛZ]YØXÞH˜XÚÙÜ›Ý[™\™]šY]Âˆ\›™\ÜÈ›ÝÜËˆ\ÝXÝ]™H™]Ú[™È]\Ý™]™\[\ÜÈ[ˆ]™\žHXÝ]™Bˆ\ÚXØ[›ÝÈÛÈHØ[\ˆÛ˜\ÚÝX]Ú\ÈH˜[œØXÝ[Û‹[ØØ[ˆÛÛ\\š\ÛÛˆ[ˆ›Y]˜™]Ú[™Ý×ÛY\ÜØYÙX‚ˆˆˆ‚ˆÚ]Ù[‹—Ü™XYØÝ
+
+H\ÈÛÛ›Ž‚ˆ›ÝÜÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕY”“ÓHY\ÜØYÙ\È‚ˆ•ÒT‘HÙ\ÜÚ[Û—ÚYHÈS‘XÝ]™HHHÔ‘Tˆ–HY‹ˆ
+Ù\ÜÚ[Û—ÚY
+Kˆ
+K™™]Ú[
+
+Bˆ™]\›ˆÚ[
+›ÝÖÌJH›Üˆ›ÝÈ[ˆ›ÝÜ×B‚ˆÝ]XÛY]ÙˆYˆØXÝ]™WÝ˜[œØÜš\ØÛÝ[ÊÛÛ›‹Ù\ÜÚ[Û—ÚYˆÝŠHOˆ\VÚ[[N‚ˆˆˆ”™]\›ˆXÝ]™HY\ÜØYÙKÝÛÛXØ[ÛÝ[È[œÚYHHØ[\‰ÜÈ‹ˆˆˆ‚ˆ›ÝÜÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕÛÛØØ[È”“ÓHY\ÜØYÙ\È‚ˆ•ÒT‘HÙ\ÜÚ[Û—ÚYHÈS‘XÝ]™HHH‹ˆ
+Ù\ÜÚ[Û—ÚY
+Kˆ
+K™™]Ú[
+
+BˆÛÛØØ[ØÛÝ[Hˆ›Üˆ›ÝÈ[ˆ›ÝÜÎ‚ˆ˜]ÈH›ÝÖÌBˆYˆ›Ý˜]Î‚ˆÛÛ[YBˆžN‚ˆXÛÙYHœÛÛ‹›ØYÊ˜]ÊHYˆ\Ú[œÝ[˜ÙJ˜]ËÝŠH[ÙH˜]Âˆ^Ù\
+œÛÛ‹’”ÓÓ‘XÛÙQ\œ›Ü‹\Q\œ›ÜŠN‚ˆÛÛ[YBˆYˆ\Ú[œÝ[˜ÙJXÛÙY\Ý
+N‚ˆÛÛØØ[ØÛÝ[
+ÏH[ŠXÛÙY
+Bˆ[YˆXÛÙY‚ˆÛÛØØ[ØÛÝ[
+ÏHBˆ™]\›ˆ[Š›ÝÜÊKÛÛØØ[ØÛÝ[‚ˆYˆ™]Ú[™Ý×ÛY\ÜØYÙJˆÙ[‹ˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆ\™Ù]ÛY\ÜØYÙWÚYˆ[ˆ
+‹ˆ™\Ù\™WØÛÛ\XÝ[Û—Ú[™Ù™Žˆ›ÛÛH˜[ÙKˆ^XÝYØXÝ]™WÚYÎˆÜ[Û˜[Ó\ÝÚ[WHH›Û™Kˆ^XÝYÝ\™Ù]ØÛÛ[ˆ[žHH›Û™Kˆ
+HOˆXÝÜÝ‹[žWN‚ˆˆˆ”ÛÙY[]H[Y\ÜØYÙ\ÈÚ]YH\™Ù]ÛY\ÜØYÙWÚY[ˆ
+œÙ\ÜÚ[Û—ÚY
+‹‚‚ˆH\™Ù]Y\ÜØYÙH]Ù[ˆ™XÛÛY\È[˜XÝ]™H\ÈÙ[ÛÈHØ[\‚ˆØ[ˆ™KYš[]\ÈH™^\Ù\ˆ›Û\Ú]Ý]]\X\š[™ÂˆÚXÙH[ˆH™\^YY˜[œØÜš\ˆ™]ÛÝ[™›ÝÜÈ\™HÙ\Û‚ˆ\ÚÈÚ]XÝ]™OL›Üˆ]Y]È›Ü™[œÚXÈ[œÜXÝ[Ûˆ8 %\ÙBˆ›Y]˜Ù]ÛY\ÜØYÙ\ØÚ][˜ÛYWÚ[˜XÝ]™OUYXÈÙYH[K‚‚ˆ™]\›œÈHXÝŽ‚‚ˆÂˆœ™]ÛÝ[™ØÛÝ[Žˆ[È[X™\ˆÙˆ›ÝÜÈ™]ÛH›\YÈXÝ]™OLˆ\™Ù]ÛY\ÜØYÙHŽˆXÝÈ[›ÝÈXÝÙˆH\™Ù]ˆ›™]×ÚXYÚYŽˆ[›Û™HÈYÙˆH\ÝÝ[XXÝ]™H›ÝËÜˆ›Û™BˆB‚ˆ˜Z\Ù\È˜[YQ\œ›Ü˜YˆH\™Ù]Y\ÜØYÙHÙ\È›Ý^\Ý[‚ˆ
+œÙ\ÜÚ[Û—ÚY
+ˆÜˆYˆ]È›ÛH\È›Ý\Ù\ˆ˜ˆÚ]ˆ™\Ù\™WØÛÛ\XÝ[Û—Ú[™Ù™UYXHÛÛ\ÜÚ]HÝ[[X\žHØ\œšY\ˆ\ÂˆÜ][œÚYHHØ[YHÜš]H˜[œØXÝ[ÛŽˆ]ÈÜšYÚ[˜[›ÝÈ\È\˜Ú]™Yˆ[™]ÈØ[›ÛšXØ[Y[ˆ[™Ù™ˆØØY™›Û\È[œÙ\Y\ÈH™]ÈXY‚ˆ]ÜZ[ˆ™\Ý[[ÛÈÛÛZ[œÈ™\XÙ[Y[ÛY\ÜØYÙWÚY‚‚ˆ^XÝYØXÝ]™WÚYØÜ[Û˜[H[œÈHÜ™\™YXÝ]™H›ÝÈÙ]‚ˆ^XÝYÝ\™Ù]ØÛÛ[Y][Û˜[H[œÈHÙ[XÝYØ[›ÛšXØ[ˆ]™K]\Ù\ˆ^[ØYˆ›ÝÚXÚÜÈ[ˆ[œÚYHHÜš]H˜[œØXÝ[Ûˆ™Y›Ü™Bˆ[žH›ÝÈÜˆÛÝ[\ˆ]]][Û‹ˆ™\Ù[][Û‹[Û›HY]Y]HÚ[™Ù\È
+›Ü‚ˆ^[\H\ÚÝÜ™XXÝ[ÛœÊH[X™\˜][HÈ›Ý[˜[Y]HH™]Ú[™‚ˆH]™HÜ›ÜÜË\›ØÙ\ÜÈ\›ˆX\ÙH[Ø^\È™Y\Ù\ÈH™]Ú[™È^\™YÜ‚ˆ›Ý˜X›HXYÛ\œÈ\™H™XÛZ[YY[œÚYHH]]][Ûˆ˜[œØXÝ[Û‹‚‚ˆ[Ø^\È[˜Ü™[Y[ÈÙ\ÜÚ[ÛœËœ™]Ú[™ØÛÝ[8 %]™[ˆÚ[ˆBˆ\™Ù]\È[™XYH[˜XÝ]™H8 %ÛÈHÛÝ[\ˆXØÝ\˜][H™Y›XÝÂˆH[X™\ˆÙˆ™]Ú[™Ü\˜][ÛœÈ\™›Ü›YYYØZ[œÝHÙ\ÜÚ[Û‹‚ˆY[\Ý[ÛˆHXÝ]™X›YÎˆ™K\™]Ú[™[™È\ÝHØ[YBˆ\™Ù]\ÈH›Ë[ÜÛˆ›ÝÈÝ]H]Ý[[\ÈHÛÝ[\‹‚ˆˆˆ‚‚ˆYˆÙÊÛÛ›ŠN‚ˆÈ™]Ú[™Ú[™Ù\ÈHXÝ]™H˜[œØÜš\[™]\ÝÛ›ÜˆHØ[YBˆÈÛÛ\™\ÜÚ[Û‹ØÛÜÙY\\™[[™Ü›ÜÜË\›ØÙ\ÜÈ\›ˆÝX\™È\ÂˆÈ\[™Üš]\œË‚ˆÙ[‹—ØÚXÚ×Ý˜[œØÜš\ÝÜš]WÙÝX\™ÊˆÛÛ›‹ˆÙ\ÜÚ[Û—ÚYˆ›Û™Kˆ™Z™XÝØXÝ]™WÝ\›—ÛX\ÙOUYKˆ™Z™XÝØXÝ]™WØÛÛ\™\ÜÚ[Û—ÛØÚÏUYKˆ
+B‚ˆYˆ^XÝYØXÝ]™WÚYÈ\È›Ý›Û™N‚ˆXÝ]™WÜ›ÝÜÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕY”“ÓHY\ÜØYÙ\È‚ˆ•ÒT‘HÙ\ÜÚ[Û—ÚYHÈS‘XÝ]™HHHÔ‘Tˆ–HY‹ˆ
+Ù\ÜÚ[Û—ÚY
+Kˆ
+K™™]Ú[
+
+BˆXÝ]™WÚYÈHÚ[
+XÝ]™WÜ›ÝÖÌJH›ÜˆXÝ]™WÜ›ÝÈ[ˆXÝ]™WÜ›ÝÜ×BˆYˆXÝ]™WÚYÈOH^XÝYØXÝ]™WÚYÎ‚ˆ˜Z\ÙH[[YQ\œ›ÜŠˆ˜XÝ]™H˜[œØÜš\Ú[™ÙY™Y›Ü™HH™]Ú[™ÛÝ[™H\œÚ\ÝY‚ˆ
+B‚ˆ›ÝÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕ
+ˆ”“ÓHY\ÜØYÙ\ÈÒT‘HYHÈS‘Ù\ÜÚ[Û—ÚYHÈ‹ˆ
+\™Ù]ÛY\ÜØYÙWÚYÙ\ÜÚ[Û—ÚY
+Kˆ
+K™™]ÚÛ™J
+BˆYˆ›ÝÈ\È›Û™N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠˆˆ›Y\ÜØYÙHÝ\™Ù]ÛY\ÜØYÙWÚYH›Ý›Ý[™[ˆÙ\ÜÚ[ÛˆÜÙ\ÜÚ[Û—ÚYH‚ˆ
+Bˆ\™Ù]Ü›ÝÈHXÝ
+›ÝÊBˆYˆ\™Ù]Ü›ÝË™Ù]
+œ›ÛHŠHOH\Ù\ˆŽ‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠˆˆœ™]Ú[™\™Ù]]\Ý™HH	Ý\Ù\‰ÈY\ÜØYÙH
+ÛÝ›ÛOH‚ˆˆžÝ\™Ù]Ü›ÝË™Ù]
+	Ü›ÛIÊH\ŸKY^Ý\™Ù]ÛY\ÜØYÙWÚYJH‚ˆ
+B‚ˆ™\XÙ[Y[ÛY\ÜØYÙWÚYˆÜ[Û˜[Ú[HH›Û™Bˆ™\XÙ[Y[ˆÜ[Û˜[ÑXÝÜÝ‹[žWWHH›Û™BˆYˆ™\Ù\™WØÛÛ\XÝ[Û—Ú[™Ù™ˆÜˆ^XÝYÝ\™Ù]ØÛÛ[\È›Ý›Û™N‚ˆYˆ›Ý\™Ù]Ü›ÝË™Ù]
+˜XÝ]™HŠN‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠœ™]Ú[™\™Ù]\È›ÝXÝ]™HŠBˆœ›ÛHYÙ[˜ÛÛ^ØÛÛ\™\ÜÛÜˆ[\ÜÜ]Ý\Ù\—ÛÜšYÚ[˜]YÝ\›‚‚ˆÜ]Ý\™Ù]H\™Ù]Ü›ÝË˜ÛÜJ
+BˆÜ]Ý\™Ù]È˜ÛÛ[—HHÙ[‹—ÙXÛÙWØÛÛ[
+ˆÜ]Ý\™Ù]™Ù]
+˜ÛÛ[ŠBˆ
+BˆÜ]Ý\™Ù]È™\Ü^WÛY]Y]H—HHÙ[‹—ÙXÛÙWÙ\Ü^WÛY]Y]JˆÜ]Ý\™Ù]™Ù]
+™\Ü^WÛY]Y]HŠBˆ
+Bˆ[™Ù™‹]™WÝšY]ÈHÜ]Ý\Ù\—ÛÜšYÚ[˜]YÝ\›ŠÜ]Ý\™Ù]
+BˆYˆ]™WÝšY]È\È›Û™N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠœ™]Ú[™\™Ù]\È›ÝH\Ù\‹[ÜšYÚ[˜]Y\›ˆŠBˆ]™WØÛÛ[H]™WÝšY]Ë™Ù]
+˜ÛÛ[ŠBˆYˆ\Ú[œÝ[˜ÙJ]™WØÛÛ[ÝŠN‚ˆ]™WØÛÛ[HØ[š]^™WØÛÛ^
+]™WØÛÛ[
+KœÝš\
+
+BˆYˆ
+ˆ^XÝYÝ\™Ù]ØÛÛ[\È›Ý›Û™Bˆ[™]™WØÛÛ[OH^XÝYÝ\™Ù]ØÛÛ[ˆ
+N‚ˆ˜Z\ÙH[[YQ\œ›ÜŠˆœ™]Ú[™\™Ù]Ú[™ÙY™Y›Ü™H]ÛÝ[™H\œÚ\ÝY‚ˆ
+BˆYˆ™\Ù\™WØÛÛ\XÝ[Û—Ú[™Ù™ˆ[™[™Ù™ˆ\È›Û™N‚ˆ˜Z\ÙH˜[YQ\œ›ÜŠˆœ™\Ù\™WØÛÛ\XÝ[Û—Ú[™Ù™ˆ™\]Z\™\È[ˆXÝ]™HÛÛ\ÜÚ]HØ\œšY\ˆ‚ˆ
+Bˆ™\XÙ[Y[H[™Ù™ˆYˆ™\Ù\™WØÛÛ\XÝ[Û—Ú[™Ù™ˆ[ÙH›Û™B‚ˆÝ\œÛÜˆHÛÛ›‹™^XÝ]Jˆ”ÑSPÕY”“ÓHY\ÜØYÙ\È‚ˆ•ÒT‘HÙ\ÜÚ[Û—ÚYHÈS‘YHÈS‘XÝ]™HHH‹ˆ
+Ù\ÜÚ[Û—ÚY\™Ù]ÛY\ÜØYÙWÚY
+Kˆ
+BˆYÈHÜ–ÌH›Üˆˆ[ˆÝ\œÛÜ‹™™]Ú[
+
+WBˆYˆYÎ‚ˆXÙZÛ\œÈH‹‹š›Ú[ŠÈˆ›ÜˆÈ[ˆYÊBˆÛÛ›‹™^XÝ]Jˆˆ•TUHY\ÜØYÙ\ÈÑUXÝ]™HHÒT‘HYSˆ
+ÜXÙZÛ\œßJH‹ˆYËˆ
+BˆYˆ™\XÙ[Y[\È›Ý›Û™N‚ˆÙ[‹—Ú[œÙ\ÛY\ÜØYÙWÜ›ÝÜÊÛÛ›‹Ù\ÜÚ[Û—ÚYÜ™\XÙ[Y[JBˆ[œÙ\YHÛÛ›‹™^XÝ]J”ÑSPÕ\ÝÚ[œÙ\Ü›ÝÚY
+
+HŠK™™]ÚÛ™J
+Bˆ™\XÙ[Y[ÛY\ÜØYÙWÚYH[
+[œÙ\YÌJBˆÛÛ›‹™^XÝ]Jˆ•TUHÙ\ÜÚ[ÛœÈÑU™]Ú[™ØÛÝ[HÓÐSTÐÑJ™]Ú[™ØÛÝ[
+H
+ÈH‚ˆ•ÒT‘HYHÈ‹ˆ
+Ù\ÜÚ[Û—ÚY
+Kˆ
+BˆY\ÜØYÙWØÛÝ[ÛÛØØ[ØÛÝ[HÙ[‹—ØXÝ]™WÝ˜[œØÜš\ØÛÝ[ÊˆÛÛ›‹Ù\ÜÚ[Û—ÚYˆ
+BˆÛÛ›‹™^XÝ]Jˆ•TUHÙ\ÜÚ[ÛœÈÑUY\ÜØYÙWØÛÝ[HËÛÛØØ[ØÛÝ[HÈ‚ˆ•ÒT‘HYHÈ‹ˆ
+Y\ÜØYÙWØÛÝ[ÛÛØØ[ØÛÝ[Ù\ÜÚ[Û—ÚY
+Kˆ
+BˆXYÜ›ÝÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕPV
+Y
+H”“ÓHY\ÜØYÙ\ÈÒT‘HÙ\ÜÚ[Û—ÚYHÈS‘XÝ]™HHH‹ˆ
+Ù\ÜÚ[Û—ÚY
+Kˆ
+K™™]ÚÛ™J
+Bˆ™]×ÚXYÚYH
+ˆXYÜ›ÝÖÌHYˆXYÜ›ÝÈ[™XYÜ›ÝÖÌH\È›Ý›Û™H[ÙH›Û™Bˆ
+Bˆ™]\›ˆ\™Ù]Ü›ÝËYË™]×ÚXYÚY™\XÙ[Y[ÛY\ÜØYÙWÚY‚ˆ\™Ù]Ü›ÝË™]ÛÝ[™™]×ÚXYÚY™\XÙ[Y[ÛY\ÜØYÙWÚYH
+ˆÙ[‹—Ù^XÝ]WÝÜš]JÙÊBˆ
+B‚ˆÈXÛÙHÛÛ[›ÜˆØ[\œÈ
+™Yš[H›Û\Y™™\ŠHÚ]Ý]BˆÈÙXÛÛ™˜[X›H]X˜\ÙHÜ\˜][ÛˆY\ˆH˜[œØXÝ[ÛˆÛÛ[Z]Ë‚ˆ\™Ù]Ü›ÝÖÈ˜ÛÛ[—HHÙ[‹—ÙXÛÙWØÛÛ[
+\™Ù]Ü›ÝË™Ù]
+˜ÛÛ[ŠJB‚ˆ™\Ý[HÂˆœ™]ÛÝ[™ØÛÝ[Žˆ[Š™]ÛÝ[™
+Kˆ\™Ù]ÛY\ÜØYÙHŽˆ\™Ù]Ü›ÝËˆ›™]×ÚXYÚYŽˆ™]×ÚXYÚYˆBˆYˆ™\Ù\™WØÛÛ\XÝ[Û—Ú[™Ù™Ž‚ˆ™\Ý[Èœ™\XÙ[Y[ÛY\ÜØYÙWÚY—HH™\XÙ[Y[ÛY\ÜØYÙWÚYˆ™]\›ˆ™\Ý[‚ˆYˆ™\ÝÜ™WÜ™]ÛÝ[™
+Ù[‹Ù\ÜÚ[Û—ÚYˆÝ‹Ú[˜ÙWÛY\ÜØYÙWÚYˆ[
+HOˆ[‚ˆˆˆ“X\šÈ[˜XÝ]™HY\ÜØYÙ\ÈÚ]YH
+œÚ[˜ÙWÛY\ÜØYÙWÚY
+ˆXÝ]™HYØZ[‹‚‚ˆ™]\›œÈH[X™\ˆÙˆ›ÝÜÈ›\Y˜XÚÈÈXÝ]™OLX‚ˆ[[™Y›Üˆ[™Ë[Ù‹\™]Ú[™[™\ÝÛX[\È›ÝÚ\™YÈBˆÛ\ÚÛÛ[X[™[ˆŒK‚ˆˆˆ‚ˆYˆÙÊÛÛ›ŠN‚ˆÝ\œÛÜˆHÛÛ›‹™^XÝ]Jˆ”ÑSPÕY”“ÓHY\ÜØYÙ\È‚ˆ•ÒT‘HÙ\ÜÚ[Û—ÚYHÈS‘YHÈS‘XÝ]™HH‹ˆ
+Ù\ÜÚ[Û—ÚYÚ[˜ÙWÛY\ÜØYÙWÚY
+Kˆ
+BˆYÈHÜ–ÌH›Üˆˆ[ˆÝ\œÛÜ‹™™]Ú[
+
+WBˆYˆYÎ‚ˆXÙZÛ\œÈH‹‹š›Ú[ŠÈˆ›ÜˆÈ[ˆYÊBˆÛÛ›‹™^XÝ]Jˆˆ•TUHY\ÜØYÙ\ÈÑUXÝ]™HHHÒT‘HYSˆ
+ÜXÙZÛ\œßJH‹ˆYËˆ
+Bˆ™]\›ˆ[ŠYÊB‚ˆ™]\›ˆÙ[‹—Ù^XÝ]WÝÜš]JÙÊB‚ˆÈOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOBˆÈÙX\˜ÚˆÈOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOB‚ˆYˆÙX\˜ÚÜÙ\ÜÚ[ÛœÊˆÙ[‹ˆÛÝ\˜ÙNˆÝˆH›Û™Kˆ[Z]ˆ[HŒˆÙ™œÙ]ˆ[HˆÛÜšÜÜXÙWÚÙ^NˆÝˆH›Û™Kˆ
+HOˆ\ÝÑXÝÜÝ‹[žWWN‚ˆˆˆ“\ÝÙ\ÜÚ[ÛœËÜ[Û˜[Hš[\™YžHÛÝ\˜ÙK‚‚ˆ™]\›œÈ›ÝÜÈ[œšXÚYÚ]HÛÛ\]Y\ÝØXÝ]™XÛÛ[[‚ˆ
+œ™\Ú\ÝÙˆ\ÝØXÝ]š]WØ][™]\ÝY\ÜØYÙH[Y\Ý[\ˆ[ÙHÝ\YØ]
+KÜ™\™YžH[ÜÝ\™XÙ[K]\ÙYš\œÝ‚‚ˆ\ÜÈÛÜšÜÜXÙWÚÙ^XÈØÛÜH›ÝÜÈÈÛ™HÛÜšÜÜXÙHHX]Ú[™Âˆ™[˜Î˜ÛÜšÜÜXÙWÚÙ^XÙ[X[XÜÈ
+Ú]™\È›ÛÝ[ÙHÝÙ
+Kˆ\ÙYžBˆ\›Y\ÈXØØK\™\Ý[YXÛÈH›\ÝˆÙ\ÜÚ[Ûˆ\ÈH\ÝÛ™H[‚ˆH
+˜Ý\œ™[
+ˆÛÜšÜÜXÙK›ÝHÛØ˜[T•K‚ˆˆˆ‚ˆÙ[XÝÝÚ]Û\ÝØXÝ]™HH
+ˆ”ÑSPÕËŠ‹‚ˆÓÐSTÐÑJÜœ›Û\ËœÞ\Ý[WÜ›Û\
+HTÈÜÞ\Ý[WÜ›Û\Ü™\ÛÛ™Y‚ˆˆž×ÜÜ[ÜÙ\ÜÚ[Û—Û\ÝØXÝ]™J	ÜÉÊ_HTÈ\ÝØXÝ]™H‚ˆ‘”“ÓHÙ\ÜÚ[ÛœÈÈ‚ˆ“Q•“ÒSˆÞ\Ý[WÜ›Û\ÈÜÓˆÜš\ÚHËœÞ\Ý[WÜ›Û\Ú\Ú‚ˆ
+BˆÚ\™WØÛ]\Ù\ÈH×Bˆ\˜[\Îˆ\ÝH×BˆYˆÛÝ\˜ÙN‚ˆÚ\™WØÛ]\Ù\Ë˜\[™
+œËœÛÝ\˜ÙHHÈŠBˆ\˜[\Ë˜\[™
+ÛÝ\˜ÙJBˆYˆÛÜšÜÜXÙWÚÙ^N‚ˆÜ×ØÛ]\ÙKÜ×Ü\˜[\ÈHÝÛÜšÜÜXÙWÚÙ^WØÛ]\ÙJÛÜšÜÜXÙWÚÙ^JBˆÚ\™WØÛ]\Ù\Ë˜\[™
+Ü×ØÛ]\ÙJBˆ\˜[\Ë™^[™
+Ü×Ü\˜[\ÊBˆÚ\™WÜÜ[HˆˆÒT‘HÉÈS‘	Ëš›Ú[ŠÚ\™WØÛ]\Ù\Ê_HˆYˆÚ\™WØÛ]\Ù\È[ÙHˆ‚ˆ\˜[\Ë™^[™
+Û[Z]Ù™œÙ]JBˆÚ]Ù[‹—ÛØÚÎ‚ˆÝ\œÛÜˆHÙ[‹—ØÛÛ›‹™^XÝ]JˆˆžÜÙ[XÝÝÚ]Û\ÝØXÝ]™_H‚ˆˆžÝÚ\™WÜÜ[H‚ˆ“Ô‘Tˆ–H\ÝØXÝ]™HTÐËËœÝ\YØ]TÐËËšYTÐÈSRUÈÑ‘”ÑUÈ‹ˆ\˜[\Ëˆ
+Bˆ™]\›ˆÜÙ[‹—ÜÙ\ÜÚ[Û—Ü›Ý×ÙXÝ
+›ÝÊH›Üˆ›ÝÈ[ˆÝ\œÛÜ‹™™]Ú[
+
+WB‚ˆÈOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOBˆÈ][]BˆÈOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOB‚ˆYˆÙ\ÜÚ[Û—ØÛÝ[
+ˆÙ[‹ˆÛÝ\˜ÙNˆÝˆH›Û™KˆÛÝ\˜Ù\Îˆ\ÝÜÝ—HH›Û™KˆÝÙÜ™Yš^ˆÝˆH›Û™KˆZ[—ÛY\ÜØYÙWØÛÝ[ˆ[Hˆ[˜ÛYWØ\˜Ú]™Yˆ›ÛÛH˜[ÙKˆ\˜Ú]™YÛÛ›Nˆ›ÛÛH˜[ÙKˆ^ÛYWØÚ[™[Žˆ›ÛÛH˜[ÙKˆ^ÛYWÜÛÝ\˜Ù\Îˆ\ÝÜÝ—HH›Û™Kˆ
+HOˆ[‚ˆˆˆÛÝ[Ù\ÜÚ[ÛœËÜ[Û˜[Hš[\™YžHÛÝ\˜ÙK‚‚ˆ\ÜÈ^ÛYWØÚ[™[UYXÈÛÝ[Û›HHÛÛ™\œØ][ÛœÈ]ˆ\ÝÜÙ\ÜÚ[Ûœ×ÜšXÚÝ\™˜XÙ\È
+›ÛÝ
+Èœ˜[˜ÚÜ™\Ù]Ù\ÜÚ[ÛœÊKY[™ÂˆÝX‹XYÙ[[œÈ[™ÛÛ\™\ÜÚ[ÛˆÛÛ[X][ÛœËˆ\ÙH]Ú[™]™\ˆHÛÝ[ˆ\ÈZ\™YÚ]H\ÝÜÙ\ÜÚ[Ûœ×ÜšXÚYÙH
+K™ËˆÚYX˜\ˆ›ØY[Ü™H‚ˆÝ[ÊHÛÈHÝ[X]Ú\ÈH[X™\ˆÙˆ\ÝX›H›ÝÜÈ8 %Ý\Ú\ÙHBˆ˜]È›ÝÈÛÝ[\È[™›]YžHÚ[™[ˆ[™›ØY[Ü™Hˆ™]™\ˆÙ]\Ë‚‚ˆ\ÜÈ^ÛYWÜÛÝ\˜Ù\ØÈ›ÜÚÛHÛÝ\˜ÙHÛ\ÜÙ\Èœ›ÛHHÛÝ[ˆ
+K™ËˆÈ˜Ü›Ûˆ—XÛÈH™XÙ[È›ØY[Ü™HˆÝ[X]Ú\ÈBˆÜ›Û‹Y^ÛYY\ÝÜÙ\ÜÚ[Ûœ×ÜšXÚYÙH[™Ù\Û‰ÝÙY\›ØY[Ü™H‚ˆÝXÚÈÛˆ›Üˆ\šYYØÚY[\ˆÙ\ÜÚ[ÛœÊK‚ˆˆˆ‚ˆÚ\™WØÛ]\Ù\ÈH×Bˆ\˜[\ÈH×B‚ˆYˆ^ÛYWØÚ[™[Ž‚ˆÈZ\œ›Üˆ\ÝÜÙ\ÜÚ[Ûœ×ÜšXÚ	ÜÈÚ[Y^Û\Ú[ÛˆÛ]\ÙH^XÝHÛÈBˆÈÛÝ[[™\È\Ú]H›ÝÜÎˆ›ÛÝÈ\È\Ù\‹]š\ÚX›Hœ˜[˜ÚÜ™\Ù]ˆÈÚ[™[‹‚ˆÚ\™WØÛ]\Ù\Ë˜\[™
+ÓTÕP“WÐÒSÔÔS
+BˆÚ\™WØÛ]\Ù\Ë˜\[™
+ˆž×Ù[YØ]WÙœ›ÛWÚœÛÛŠ	ÜË›[Ù[ØÛÛ™šYÉÊ_HTÈ•SŠBˆ[˜ÛYWÜÛÝ\˜Ù\ÈHÜÛÝ\˜ÙWHYˆÛÝ\˜ÙH[ÙH\Ý
+ÛÝ\˜Ù\ÈÜˆ×JBˆYˆ[˜ÛYWÜÛÝ\˜Ù\Î‚ˆXÙZÛ\œÈH‹‹š›Ú[ŠÈˆ›ÜˆÈ[ˆ[˜ÛYWÜÛÝ\˜Ù\ÊBˆÚ\™WØÛ]\Ù\Ë˜\[™
+ˆœËœÛÝ\˜ÙHSˆ
+ÜXÙZÛ\œßJHŠBˆ\˜[\Ë™^[™
+[˜ÛYWÜÛÝ\˜Ù\ÊBˆYˆ^ÛYWÜÛÝ\˜Ù\Î‚ˆXÙZÛ\œÈH‹‹š›Ú[ŠÈˆ›ÜˆÈ[ˆ^ÛYWÜÛÝ\˜Ù\ÊBˆÚ\™WØÛ]\Ù\Ë˜\[™
+ˆœËœÛÝ\˜ÙH“ÕSˆ
+ÜXÙZÛ\œßJHŠBˆ\˜[\Ë™^[™
+^ÛYWÜÛÝ\˜Ù\ÊBˆYˆÝÙÜ™Yš^‚ˆÛ]\ÙKÛ]\ÙWÜ\˜[\ÈHØÝÙÜ™Yš^ØÛ]\ÙJÝÙÜ™Yš^
+BˆÚ\™WØÛ]\Ù\Ë˜\[™
+Û]\ÙJBˆ\˜[\Ë™^[™
+Û]\ÙWÜ\˜[\ÊBˆYˆZ[—ÛY\ÜØYÙWØÛÝ[ˆ‚ˆÚ\™WØÛ]\Ù\Ë˜\[™
+œË›Y\ÜØYÙWØÛÝ[HÈŠBˆ\˜[\Ë˜\[™
+Z[—ÛY\ÜØYÙWØÛÝ[
+BˆYˆ\˜Ú]™YÛÛ›N‚ˆÚ\™WØÛ]\Ù\Ë˜\[™
+œË˜\˜Ú]™YHHŠBˆ[Yˆ›Ý[˜ÛYWØ\˜Ú]™Y‚ˆÚ\™WØÛ]\Ù\Ë˜\[™
+œË˜\˜Ú]™YHŠB‚ˆÚ\™WÜÜ[HˆˆÒT‘HÉÈS‘	Ëš›Ú[ŠÚ\™WØÛ]\Ù\Ê_HˆYˆÚ\™WØÛ]\Ù\È[ÙHˆ‚‚ˆÚ]Ù[‹—Ü™XYØÝ
+
+H\ÈÛÛ›Ž‚ˆÝ\œÛÜˆHÛÛ›‹™^XÝ]Jˆ”ÑSPÕÓÕS•
+
+ŠH”“ÓHÙ\ÜÚ[ÛœÈÞÝÚ\™WÜÜ[H‹\˜[\ÊBˆ™]\›ˆÝ\œÛÜ‹™™]ÚÛ™J
+VÌB‚ˆYˆÙ\ÜÚ[Û—ØÛÝ[ÙÙJÙ[‹Žˆ[HJHOˆ›ÛÛ‚ˆˆˆÚXÚÈYˆ]X\ÝˆÙ\ÜÚ[ÛœÈ^\Ý
+\˜Ú]™Y[˜ÛYY
+K‚‚ˆÚÜXÚ\˜ÝZ]ÈšXHSRU8 %]XÚÚX\\ˆ[ˆÙ\ÜÚ[Û—ØÛÝ[
+
+XˆÚXÚ^\ÈH[[™^ØØ[ˆ›Üˆ]ÈY˜][\˜Ú]™YHˆš[\ˆ
+YX\Ý\™YMÝ\ÈœÈ\ÈÛˆHŒË\Ù\ÜÚ[ÛˆŠKˆ\˜Ú]™YˆÙ\ÜÚ[ÛœÈÛÝ[ˆ]™\žHØ[\ˆÛÈ˜\ˆ\ÚÜÈš\È\È[œÝ[]™\‚ˆYÙ\ÜÚ[ÛœÈ‹[™[ˆ\˜Ú]™YÙ\ÜÚ[Ûˆ\ÈÝ[HÜ™X]YÛ™K‚ˆ\ÙH\È[œÝXYÙˆÙ\ÜÚ[Û—ØÛÝ[
+
+HH˜Ú[ˆH^XÝÛÝ[ˆ\È\œ™[]˜[‚ˆˆˆ‚ˆÚ]Ù[‹—Ü™XYØÝ
+
+H\ÈÛÛ›Ž‚ˆÝ\œÛÜˆHÛÛ›‹™^XÝ]J”ÑSPÕH”“ÓHÙ\ÜÚ[ÛœÈSRUÈ‹
+‹
+JBˆ›ÝÜÈHÝ\œÛÜ‹™™]Ú[
+
+Bˆ™]\›ˆ[Š›ÝÜÊHH‚‚ˆYˆÙ\ÜÚ[Û—ØÛÝ[ØžWÜÛÝ\˜ÙJˆÙ[‹ˆ
+‹ˆ[˜ÛYWØ\˜Ú]™Yˆ›ÛÛH˜[ÙKˆ\˜Ú]™YÛÛ›Nˆ›ÛÛH˜[ÙKˆ^ÛYWØÚ[™[Žˆ›ÛÛH˜[ÙKˆ
+HOˆXÝÜÝ‹[N‚ˆˆˆ”™]\›ˆHÜÛÝ\˜ÙNˆÛÝ[XXÝšXHHÚ[™ÛHÔ“ÕT–X]Y\žK‚‚ˆ™\XÙ\ÈHÊŠH\ÝÜÙ\ÜÚ[Ûœ×ÜšXÚ\ÝÙÜ˜[HÛÜÚ][‚ˆYÙÜ™YØ]H]Y\žKˆÚ[ˆ^ÛYWØÚ[™[˜\È˜[ÙHH]Y\žH\Ù\ÂˆYÜÙ\ÜÚ[Ûœ×ÜÛÝ\˜ÙXÈÚ[ˆYKHÚ[Y^Û\Ú[Ûˆ™YXØ]\Âˆ™\]Z\™HH[X›HØØ[ˆ
+Ø[YH\ÈÙ\ÜÚ[Û—ØÛÝ[[™ˆ\ÝÜÙ\ÜÚ[Ûœ×ÜšXÚ
+K‚‚ˆ^ÛYWØÚ[™[UYXZ\œ›ÜœÈ\ÝÜÙ\ÜÚ[Ûœ×ÜšXÚš\ÚXš[]Bˆ
+›ÛÝÈ
+Èœ˜[˜ÚÜ™\Ù]Ù\ÜÚ[ÛœË^ÛY[™ÈÝX‹XYÙ[[œË[YØ]\Ëˆ[™ÛÛ\™\ÜÚ[ÛˆÛÛ[X][ÛœÊHÛÈHÛÝ\˜ÙHÛÝ[ÈX]ÚÚ]BˆÙ\ÜÚ[ÛœÈYÙHXÝX[H\ÝË‚ˆˆˆ‚ˆÚ\™WØÛ]\Ù\ÈH×Bˆ\˜[\Îˆ\ÝH×B‚ˆYˆ^ÛYWØÚ[™[Ž‚ˆÚ\™WØÛ]\Ù\Ë˜\[™
+ÓTÕP“WÐÒSÔÔS
+BˆÚ\™WØÛ]\Ù\Ë˜\[™
+ˆž×Ù[YØ]WÙœ›ÛWÚœÛÛŠ	ÜË›[Ù[ØÛÛ™šYÉÊ_HTÈ•SŠBˆYˆ\˜Ú]™YÛÛ›N‚ˆÚ\™WØÛ]\Ù\Ë˜\[™
+œË˜\˜Ú]™YHHŠBˆ[Yˆ›Ý[˜ÛYWØ\˜Ú]™Y‚ˆÚ\™WØÛ]\Ù\Ë˜\[™
+œË˜\˜Ú]™YHŠB‚ˆÚ\™WÜÜ[HˆˆÒT‘HÉÈS‘	Ëš›Ú[ŠÚ\™WØÛ]\Ù\Ê_HˆYˆÚ\™WØÛ]\Ù\È[ÙHˆ‚‚ˆÚ]Ù[‹—Ü™XYØÝ
+
+H\ÈÛÛ›Ž‚ˆYˆÙ[‹—ØÛÛ›ˆ\È›Û™N‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ”Ù\ÜÚ[Û‘ˆÛÛ›™XÝ[Ûˆ\ÈÛÜÙYŠBˆ›ÝÜÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕÓÐSTÐÑJ•SQŠËœÛÝ\˜ÙK	ÉÊK	ØÛIÊHTÈÛÝ\˜ÙKÓÕS•
+
+ŠHTÈÛÝ[‚ˆˆ‘”“ÓHÙ\ÜÚ[ÛœÈÞÝÚ\™WÜÜ[H‚ˆ‘Ô“ÕT–HÓÐSTÐÑJ•SQŠËœÛÝ\˜ÙK	ÉÊK	ØÛIÊH‚ˆ“Ô‘Tˆ–HÛÝ[TÐÈ‹ˆ\˜[\Ëˆ
+K™™]Ú[
+
+Bˆ™]\›ˆÜÝŠ›ÝÖÈœÛÝ\˜ÙH—JNˆ[
+›ÝÖÈ˜ÛÝ[—HÜˆ
+H›Üˆ›ÝÈ[ˆ›ÝÜßB‚ˆYˆY\ÜØYÙWØÛÝ[
+Ù[‹Ù\ÜÚ[Û—ÚYˆÝˆH›Û™JHOˆ[‚ˆˆˆÛÝ[Y\ÜØYÙ\ËÜ[Û˜[H›ÜˆHÜXÚYšXÈÙ\ÜÚ[Û‹ˆˆˆ‚ˆÚ]Ù[‹—Ü™XYØÝ
+
+H\ÈÛÛ›Ž‚ˆYˆÙ\ÜÚ[Û—ÚY‚ˆÝ\œÛÜˆHÛÛ›‹™^XÝ]Jˆ”ÑSPÕÓÕS•
+
+ŠH”“ÓHY\ÜØYÙ\ÈÒT‘HÙ\ÜÚ[Û—ÚYHÈ‹
+Ù\ÜÚ[Û—ÚY
+Bˆ
+Bˆ[ÙN‚ˆÝ\œÛÜˆHÛÛ›‹™^XÝ]J”ÑSPÕÓÕS•
+
+ŠH”“ÓHY\ÜØYÙ\ÈŠBˆ™]\›ˆÝ\œÛÜ‹™™]ÚÛ™J
+VÌB‚ˆYˆ\×Ü]›Ü›WÛY\ÜØYÙWÚY
+ˆÙ[‹Ù\ÜÚ[Û—ÚYˆÝ‹]›Ü›WÛY\ÜØYÙWÚYˆÝ‚ˆ
+HOˆ›ÛÛ‚ˆˆˆÚXÚÈYˆHY\ÜØYÙHÚ]HÚ]™[ˆ]›Ü›WÛY\ÜØYÙWÚY^\ÝË‚‚ˆ\Ù\ÈHYÛY\ÜØYÙ\×Ü]›Ü›WÛ\Ù×ÚY\X[[™^›ÜˆY™šXÚY[ˆÛÚÝ\ˆ\ÙYžHHØ]]Ø^IÜÈ˜[œÚY[Y˜Z[\™HY\HÝX\™
+ÍÌŒÍÊBˆÈÚÚ\™K\\œÚ\Ý[™ÈH\Ù\ˆY\ÜØYÙH]Ø\È[™XYHØ]™YÛˆBˆš[Üˆ™]žHÙˆHØ[YH[˜›Ý[™]›Ü›HY\ÜØYÙK‚ˆˆˆ‚ˆÚ]Ù[‹—Ü™XYØÝ
+
+H\ÈÛÛ›Ž‚ˆÝ\œÛÜˆHÛÛ›‹™^XÝ]Jˆ”ÑSPÕH”“ÓHY\ÜØYÙ\È‚ˆ•ÒT‘HÙ\ÜÚ[Û—ÚYHÈS‘]›Ü›WÛY\ÜØYÙWÚYHÈSRUH‹ˆ
+Ù\ÜÚ[Û—ÚY]›Ü›WÛY\ÜØYÙWÚY
+Kˆ
+Bˆ™]\›ˆÝ\œÛÜ‹™™]ÚÛ™J
+H\È›Ý›Û™B‚ˆÈOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOBˆÈ^Ü[™ÛX[\ˆÈOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOB‚ˆYˆÚ\×Ù^XÚ]Ù›Üš×ØÚ[Ü›ÝÊÙ[‹Ù\ÜÚ[ÛŽˆXÝÜÝ‹[žWJHOˆ›ÛÛ‚ˆˆˆ•YHÚ[ˆÙ\ÜÚ[Û˜\ÈHœ˜[˜Ú[YØ]KÜˆÛÛÚ[Ùˆ]È\™[‚‚ˆX\šÙ\œÈÛ›HÛÝ[\ÈH›ÜšÈÚ[ˆ^HÚ[]\™[ÜÙ\ÜÚ[Û—ÚY‚ˆÛÛ\™\ÜÚ[ÛˆÛÜY\È[Ù[ØÛÛ™šYØÛÈHÛÛ[X][Û‚ˆ
+X›\ÚØÛÛ\™\ÜÚ[Û—ØÚ[Ø[\œÈ\ÜÂˆYÙ[—ÜÙ\ÜÚ[Û—Ú[š]Û[Ù[ØÛÛ™šYØ
+KÛÈH[YØ]IÜÈÛÛ[X][Û‚ˆØ\œšY\ÈÙ[YØ]WÙœ›ÛOOH[YØ]IÜÈÝÛˆ\™[˜ˆ™\Ù[˜ÙK[Û›BˆX]Ú[™ÈÛÝ[™X]]™X[ÛÛ[X][Ûˆ\ÈH›ÜšÈ8 %HØ[YBˆZ\ØÛ\ÜÚYšXØ][ÛˆÓ“Ó—ÐÓÓ•S•PUSÓ—ÐÒSÑ’ST—ÔÔS[™XYBˆ]›ÚYÈžHš[™[™È›ÝX\šÙ\œÈÈH]Y\šYY\™[‚ˆˆˆ‚ˆYˆÙ\ÜÚ[Û‹™Ù]
+œÛÝ\˜ÙHŠHOHÛÛŽ‚ˆ™]\›ˆYBˆ˜]ÈHÙ\ÜÚ[Û‹™Ù]
+›[Ù[ØÛÛ™šYÈŠBˆYˆ›Ý˜]Î‚ˆ™]\›ˆ˜[ÙBˆžN‚ˆÙ™ÈHœÛÛ‹›ØYÊ˜]ÊHYˆ\Ú[œÝ[˜ÙJ˜]ËÝŠH[ÙH˜]Âˆ^Ù\
+\Q\œ›Ü‹œÛÛ‹’”ÓÓ‘XÛÙQ\œ›ÜŠN‚ˆ™]\›ˆ˜[ÙBˆYˆ›Ý\Ú[œÝ[˜ÙJÙ™ËXÝ
+N‚ˆ™]\›ˆ˜[ÙBˆ\™[ÚYHÙ\ÜÚ[Û‹™Ù]
+œ\™[ÜÙ\ÜÚ[Û—ÚYŠBˆœ˜[˜ÚYHÙ™Ë™Ù]
+—Øœ˜[˜ÚYÙœ›ÛHŠBˆ[YØ]YHÙ™Ë™Ù]
+—Ù[YØ]WÙœ›ÛHŠBˆYˆ\™[ÚY‚ˆ™]\›ˆœ˜[˜ÚYOH\™[ÚYÜˆ[YØ]YOH\™[ÚYˆ™]\›ˆœ˜[˜ÚY\È›Ý›Û™HÜˆ[YØ]Y\È›Ý›Û™B‚ˆYˆÚ\×ØÛÛ\™\ÜÚ[Û—ØÚ[Ü›ÝÊÙ[‹Ú[ˆXÝÜÝ‹[žWJHOˆ›ÛÛ‚ˆ\™[ÚYHÚ[™Ù]
+œ\™[ÜÙ\ÜÚ[Û—ÚYŠBˆYˆ›Ý\™[ÚYÜˆÙ[‹—Ú\×Ù^XÚ]Ù›Üš×ØÚ[Ü›ÝÊÚ[
+N‚ˆ™]\›ˆ˜[ÙBˆ\™[HÙ[‹™Ù]ÜÙ\ÜÚ[ÛŠ\™[ÚY
+Bˆ™]\›ˆ›ÛÛ
+\™[[™\™[™Ù]
+™[™Ü™X\ÛÛˆŠHOH˜ÛÛ\™\ÜÚ[ÛˆŠB‚ˆYˆÙ]ØÛÛ\™\ÜÚ[Û—Û[™XYÙJÙ[‹Ù\ÜÚ[Û—ÚYˆÝŠHOˆ\ÝÜÝ—N‚ˆˆˆ”™]\›ˆÛÛ\™\ÜÚ[Ûˆ[˜Ù\ÝÜœÈ›ÝYÚ\[ˆÚ›Û›ÛÙÚXØ[Ü™\‹ˆˆˆ‚ˆÙ\ÜÚ[ÛˆHÙ[‹™Ù]ÜÙ\ÜÚ[ÛŠÙ\ÜÚ[Û—ÚY
+BˆYˆ›ÝÙ\ÜÚ[ÛˆÜˆÙ[‹—Ú\×Ù^XÚ]Ù›Üš×ØÚ[Ü›ÝÊÙ\ÜÚ[ÛŠN‚ˆ™]\›ˆÜÙ\ÜÚ[Û—ÚYHYˆÙ\ÜÚ[Ûˆ[ÙH×B‚ˆ›ÛÝHÙ\ÜÚ[Û‚ˆ[˜Ù\ÝÜœÈHÜ›ÛÝÈšY—_BˆÚ[HÙ[‹—Ú\×ØÛÛ\™\ÜÚ[Û—ØÚ[Ü›ÝÊ›ÛÝ
+N‚ˆ\™[HÙ[‹™Ù]ÜÙ\ÜÚ[ÛŠ›ÛÝÈœ\™[ÜÙ\ÜÚ[Û—ÚY—JBˆYˆ›Ý\™[Üˆ\™[ÈšY—H[ˆ[˜Ù\ÝÜœÎ‚ˆœ™XZÂˆ›ÛÝH\™[ˆ[˜Ù\ÝÜœË˜Y
+›ÛÝÈšY—JB‚ˆ[™XYÙHHÜ›ÛÝÈšY—WBˆÙY[ˆHÜ›ÛÝÈšY—_BˆÝ\œ™[H›ÛÝˆÚ[HÝ\œ™[™Ù]
+™[™Ü™X\ÛÛˆŠHOH˜ÛÛ\™\ÜÚ[ÛˆŽ‚ˆÚ]Ù[‹—Ü™XYØÝ
+
+H\ÈÛÛ›Ž‚ˆ›ÝÜÈHÛÛ›‹™^XÝ]Jˆˆˆ‚ˆÑSPÕ
+ˆ”“ÓHÙ\ÜÚ[ÛœÂˆÒT‘H\™[ÜÙ\ÜÚ[Û—ÚYHÂˆÔ‘Tˆ–HÝ\YØ]TÐÂˆˆˆ‹ˆ
+Ý\œ™[ÈšY—K
+Kˆ
+K™™]Ú[
+
+Bˆ™^ØÚ[H›Û™Bˆ›Üˆ›ÝÈ[ˆ›ÝÜÎ‚ˆØ[™Y]HHXÝ
+›ÝÊBˆYˆÙ[‹—Ú\×ØÛÛ\™\ÜÚ[Û—ØÚ[Ü›ÝÊØ[™Y]JN‚ˆ™^ØÚ[HØ[™Y]Bˆœ™XZÂˆYˆ›Ý™^ØÚ[Üˆ™^ØÚ[ÈšY—H[ˆÙY[Ž‚ˆœ™XZÂˆ[™XYÙK˜\[™
+™^ØÚ[ÈšY—JBˆÙY[‹˜Y
+™^ØÚ[ÈšY—JBˆÝ\œ™[H™^ØÚ[ˆYˆÝ\œ™[ÈšY—HOHÙ\ÜÚ[Û—ÚY‚ˆÈÛÛ[YHÈ[˜ÛYH]\ˆÛÛ\™\ÜÚ[Ûˆ\ÈÛ›HÚ[ˆBˆÈ™\]Y\ÝYÙ\ÜÚ[Ûˆ]Ù[ˆØ\ÈÛÛ\XÝY‚ˆÛÛ[YBˆ™]\›ˆ[™XYÙHYˆÙ\ÜÚ[Û—ÚY[ˆ[™XYÙH[ÙHÜÙ\ÜÚ[Û—ÚYB‚ˆYˆÛX\—ÛY\ÜØYÙ\ÊÙ[‹Ù\ÜÚ[Û—ÚYˆÝŠHOˆ›Û™N‚ˆˆˆ‘[]H[Y\ÜØYÙ\È›ÜˆHÙ\ÜÚ[Ûˆ[™™\Ù]]ÈÛÝ[\œËˆˆˆ‚ˆYˆÙÊÛÛ›ŠN‚ˆÛÛ›‹™^XÝ]Jˆ‘SUH”“ÓHY\ÜØYÙ\ÈÒT‘HÙ\ÜÚ[Û—ÚYHÈ‹
+Ù\ÜÚ[Û—ÚY
+Bˆ
+BˆÛÛ›‹™^XÝ]Jˆ•TUHÙ\ÜÚ[ÛœÈÑUY\ÜØYÙWØÛÝ[HÛÛØØ[ØÛÝ[HÒT‘HYHÈ‹ˆ
+Ù\ÜÚ[Û—ÚY
+Kˆ
+BˆÙ[‹—Ù^XÝ]WÝÜš]JÙÊB‚ˆÝ]XÛY]ÙˆYˆÜ™[[Ý™WÜÙ\ÜÚ[Û—Ùš[\ÊÙ\ÜÚ[Ûœ×Ù\ŽˆÜ[Û˜[Ô]KÙ\ÜÚ[Û—ÚYˆÝŠHOˆ›Û™N‚ˆˆˆ”™[[Ý™HÛ‹Y\ÚÈ˜[œØÜš\š[\È›ÜˆHÙ\ÜÚ[Û‹‚‚ˆÛX[œÈ\ÜÙ\ÜÚ[Û—ÚYKšœÛÛ˜ÜÙ\ÜÚ[Û—ÚYKšœÛÛ›[™[žBˆ™\]Y\ÝÙ[\ÞÜÙ\ÜÚ[Û—ÚYWÊ‹šœÛÛ˜š[\ÈYžHHØ]]Ø^K‚ˆÚ[[HÚÚ\Èš[\È]Û‰Ý^\Ý[™ÝØ[ÝÜÈÔÑ\œ›ÜˆÛÈBˆš[\Þ\Ý[HXØÝ\™]™\ˆ›ØÚÜÈHˆÜ\˜][Û‹‚ˆˆˆ‚ˆYˆÙ\ÜÚ[Ûœ×Ù\ˆ\È›Û™N‚ˆ™]\›‚ˆ›ÜˆÝY™š^[ˆ
+‹šœÛÛˆ‹‹šœÛÛ›ŠN‚ˆHÙ\ÜÚ[Ûœ×Ù\ˆÈˆžÜÙ\ÜÚ[Û—ÚY^ÜÝY™š^H‚ˆžN‚ˆ[›[šÊZ\ÜÚ[™×ÛÚÏUYJBˆ^Ù\ÔÑ\œ›ÜŽ‚ˆ\ÜÂˆÈ™\]Y\ÝÙ[\š[\È\ÙHÙ\ÜÚ[Û—ÚY\ÈH™Yš^ÛÛ\Û™[ˆžN‚ˆ›Üˆ[ˆÙ\ÜÚ[Ûœ×Ù\‹™ÛØŠˆœ™\]Y\ÝÙ[\ÞÜÙ\ÜÚ[Û—ÚYWÊ‹šœÛÛˆŠN‚ˆžN‚ˆ[›[šÊZ\ÜÚ[™×ÛÚÏUYJBˆ^Ù\ÔÑ\œ›ÜŽ‚ˆ\ÜÂˆ^Ù\ÔÑ\œ›ÜŽ‚ˆ\ÜÂ‚ˆYˆÙ]ÜÙ\ÜÚ[Û—Ù[]WÝ\™Ù]ÊÙ[‹Ù\ÜÚ[Û—ÚYˆÝŠHOˆ\ÝÜÝ—N‚ˆˆˆ”™]\›ˆ]™\žHÙ\ÜÚ[Ûˆ›ÝÈ]›Y]˜[]WÜÙ\ÜÚ[Û˜ÛÝ[™[[Ý™K‚‚ˆH™\]Y\ÝYÙ\ÜÚ[Ûˆ\Èš\œÝ›ÛÝÙYžH]È™XÝ\œÚ]™[H\ØÛÝ™\™Yˆ[YØ]KÜÝX˜YÙ[Ú[™[‹ˆœ˜[˜Ú[™ÛÛ\™\ÜÚ[ÛˆÚ[™[ˆ\™H›Ýˆ[˜ÛYY™XØ]\ÙH[][Ûˆ™\Ù\™\È[HžHÜœ[š[™ÈZ\ˆ\™[ˆ™Y™\™[˜ÙK‚ˆˆˆ‚ˆÚ]Ù[‹—Ü™XYØÝ
+
+H\ÈÛÛ›Ž‚ˆ^\ÝÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕH”“ÓHÙ\ÜÚ[ÛœÈÒT‘HYHÈSRUH‹
+Ù\ÜÚ[Û—ÚY
+Bˆ
+K™™]ÚÛ™J
+BˆYˆ›Ý^\ÝÎ‚ˆ™]\›ˆ×Bˆ[YØ]WÚYÈHØÛÛXÝÙ[YØ]WØÚ[ÚYÊÙ[‹—ØÛÛ›‹ÜÙ\ÜÚ[Û—ÚYJBˆ™]\›ˆÜÙ\ÜÚ[Û—ÚY
+œÛÜY
+[YØ]WÚYÊWB‚ˆYˆ[]WÜÙ\ÜÚ[ÛŠˆÙ[‹ˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆÙ\ÜÚ[Ûœ×Ù\ŽˆÜ[Û˜[Ô]HH›Û™Kˆ^XÝYÙ[]WÚYÎˆÜ[Û˜[Ó\ÝÜÝ—WHH›Û™Kˆ
+HOˆ›ÛÛ‚ˆˆˆ‘[]HHÙ\ÜÚ[Ûˆ[™[]ÈY\ÜØYÙ\Ë‚‚ˆ[YØ]HÝX˜YÙ[Ú[™[ˆ
+[Ù[ØÛÛ™šYË—Ù[YØ]WÙœ›ÛX
+H\™BˆØ\ØØYKY[]YÚ]H\™[ÛÈ^H™]™\ˆ™\Ý\™˜XÙH[ˆÙ\ÜÚ[Û‚ˆXÚÙ\œÈ\ÈÜœ[™Y›ÝÜËˆœ˜[˜ÚÈÛÛ\™\ÜÚ[ÛˆÚ[™[ˆ\™HÜœ[™Yˆ
+\™[ÜÙ\ÜÚ[Û—ÚY8¡¤ˆ•S
+HÛÈ^H™[XZ[ˆXØÙ\ÜÚX›H[™\[™[K‚ˆÚ[ˆ
+œÙ\ÜÚ[Ûœ×Ù\Šˆ\È›ÝšYY[ÛÈ™[[Ý™\ÈÛ‹Y\ÚÈ˜[œØÜš\ˆš[\È
+šœÛÛ˜ÈšœÛÛ›È™\]Y\ÝÙ[\Ê˜
+H›Üˆ]™\žH[]YˆÙ\ÜÚ[Û‹ˆÚ[ˆ
+™^XÝYÙ[]WÚYÊˆ\È›ÝšYY[][Ûˆ›ØÙYYÈÛ›BˆYˆH\™[\È[YØ]HØ\ØØYHÝ[X]Ú\È]^XÝÙ]ˆ\Âˆ]È^ÜX™Y›Ü™KY[]HØ[\œÈ˜Z[ÛÜÙYYˆH™]È[YØ]H\X\œÂˆY\ˆ^HX]\šX[^™HZ\ˆ\˜Ú]™KˆH[YØ]H™YH\È™K]Ø[ÙYˆ[œÚYHHÜš]H˜[œØXÝ[ÛˆÛˆ\œÜÙH
+ÐÕÕHÝX\™
+NÈHÛÜÝ\ÂˆXØÙ\Y›ÜˆÛÜœ™XÝ™\ÜËˆ™]\›œÈYHYˆHÙ\ÜÚ[ÛˆØ\È›Ý[™[™ˆ[]Y‚ˆˆˆ‚ˆ™[[Ý™YÙ[YØ]WÚYÎˆ\ÝÜÝ—HH×Bˆ^XÝYÚYÈH
+ˆÙ]
+^XÝYÙ[]WÚYÊHYˆ^XÝYÙ[]WÚYÈ\È›Ý›Û™H[ÙH›Û™Bˆ
+B‚ˆYˆÙÊÛÛ›ŠN‚ˆÝ\œÛÜˆHÛÛ›‹™^XÝ]Jˆ”ÑSPÕH”“ÓHÙ\ÜÚ[ÛœÈÒT‘HYHÈSRUH‹
+Ù\ÜÚ[Û—ÚY
+Bˆ
+BˆYˆÝ\œÛÜ‹™™]ÚÛ™J
+H\È›Û™N‚ˆ™]\›ˆ˜[ÙBˆYˆ^XÝYÚYÈ\È›Ý›Û™N‚ˆXÝX[ÚYÈHÂˆÙ\ÜÚ[Û—ÚYˆ
+—ØÛÛXÝÙ[YØ]WØÚ[ÚYÊÛÛ›‹ÜÙ\ÜÚ[Û—ÚYJKˆBˆYˆXÝX[ÚYÈOH^XÝYÚYÎ‚ˆ™]\›ˆ˜[ÙBˆ™[[Ý™YÙ[YØ]WÚYË™^[™
+Ù[]WÙ[YØ]WØÚ[™[ŠÛÛ›‹ÜÙ\ÜÚ[Û—ÚYJJBˆÈÜœ[ˆ™[XZ[š[™ÈÚ[Ù\ÜÚ[ÛœÈ
+œ˜[˜Ú\Ë]ËŠHÛÈ’È\ÈØ]\ÙšYY‚ˆÛÛ›‹™^XÝ]Jˆ•TUHÙ\ÜÚ[ÛœÈÑU\™[ÜÙ\ÜÚ[Û—ÚYH•S‚ˆ•ÒT‘H\™[ÜÙ\ÜÚ[Û—ÚYHÈ‹ˆ
+Ù\ÜÚ[Û—ÚY
+Kˆ
+BˆÛÛ›‹™^XÝ]J‘SUH”“ÓHY\ÜØYÙ\ÈÒT‘HÙ\ÜÚ[Û—ÚYHÈ‹
+Ù\ÜÚ[Û—ÚY
+JBˆÛÛ›‹™^XÝ]J‘SUH”“ÓHÙ\ÜÚ[ÛœÈÒT‘HYHÈ‹
+Ù\ÜÚ[Û—ÚY
+JBˆÙ[‹—Ù[]WÝ[œ™Y™\™[˜ÙYÜÞ\Ý[WÜ›Û\ÊÛÛ›ŠBˆ™]\›ˆYB‚ˆ[]YHÙ[‹—Ù^XÝ]WÝÜš]JÙÊBˆYˆ[]Y‚ˆ›Üˆ[YØ]WÚY[ˆ™[[Ý™YÙ[YØ]WÚYÎ‚ˆÙ[‹—Ü™[[Ý™WÜÙ\ÜÚ[Û—Ùš[\ÊÙ\ÜÚ[Ûœ×Ù\‹[YØ]WÚY
+BˆÙ[‹—Ü™[[Ý™WÜÙ\ÜÚ[Û—Ùš[\ÊÙ\ÜÚ[Ûœ×Ù\‹Ù\ÜÚ[Û—ÚY
+Bˆ™]\›ˆ›ÛÛ
+[]Y
+B‚ˆYˆ[]WÜÙ\ÜÚ[Û—ÚY—Ù[\JˆÙ[‹ˆÙ\ÜÚ[Û—ÚYˆÝ‹ˆÙ\ÜÚ[Ûœ×Ù\ŽˆÜ[Û˜[Ô]HH›Û™Kˆ
+HOˆ›ÛÛ‚ˆˆˆ‘[]H
+œÙ\ÜÚ[Û—ÚY
+ˆÛ›HÚ[ˆ]™]™\ˆØZ[™Y™\Ý[XX›HÛÛ[‚‚ˆHÙ\ÜÚ[Ûˆ\ÈÛÛœÚY\™Y[\HÚ[ˆ]\È›ÈY\ÜØYÙ\È[™›Âˆ\Ù\‹X\ÜÚYÛ™Y]Kˆ\ÙYžHÓH^]ÈÙ\ÜÚ[Û‹\›Ý][Ûˆ]ÈÛÂˆ[[YYX][K\Ý\YX[™\]Z]Ù\ÜÚ[ÛœÈÛ‰Ý[H\[ˆÜ™\Ý[YXˆ[™\›Y\ÈÙ\ÜÚ[ÛœÈ\ÝÝ]]ˆ
+]\›ˆÜYœ›ÛBˆÛÛÙÛKYÙ[Z[šKÙÙ[Z[šKXÛHÌÍÍÌŠB‚ˆH[\[™\ÜÈÚXÚÈ[™[]H[ˆ[ˆÛ™H˜[œØXÝ[Û‹ÛÈHY\ÜØYÙBˆ›\ÚYÛÛ˜Ý\œ™[HžH[›Ý\ˆÜš]\ˆØ[‰Ý™HÜÝˆÙ\ÜÚ[ÛœÈÚ]ˆÚ[™[ˆ
+[YØ]HÝX˜YÙ[[œÊH\™H™\Ù\™Y8 %H\™[]ˆÜ]Û™YÛÜšÈ\È›Ý™[\Hˆ]™[ˆYˆ]ÈÝÛˆ˜[œØÜš\™]™\‚ˆ›\ÚYˆ™]\›œÈYHYˆHÙ\ÜÚ[ÛˆØ\È[]Y‚ˆˆˆ‚ˆYˆÙÊÛÛ›ŠN‚ˆÝ\œÛÜˆHÛÛ›‹™^XÝ]Jˆˆˆ‚ˆSUH”“ÓHÙ\ÜÚ[ÛœÂˆÒT‘HYHÂˆS‘]HTÈ•SˆS‘“ÕVTÕÈ
+ˆÑSPÕH”“ÓHY\ÜØYÙ\ÈÒT‘HY\ÜØYÙ\ËœÙ\ÜÚ[Û—ÚYHÙ\ÜÚ[ÛœËšYˆ
+BˆS‘“ÕVTÕÈ
+ˆÑSPÕH”“ÓHÙ\ÜÚ[ÛœÈÚ[ˆÒT‘HÚ[œ\™[ÜÙ\ÜÚ[Û—ÚYHÙ\ÜÚ[ÛœËšYˆ
+Bˆˆˆ‹ˆ
+Ù\ÜÚ[Û—ÚY
+Kˆ
+BˆYˆÝ\œÛÜ‹œ›ÝØÛÝ[ˆ‚ˆÙ[‹—Ù[]WÝ[œ™Y™\™[˜ÙYÜÞ\Ý[WÜ›Û\ÊÛÛ›ŠBˆ™]\›ˆÝ\œÛÜ‹œ›ÝØÛÝ[ˆ‚ˆ[]YHÙ[‹—Ù^XÝ]WÝÜš]JÙÊBˆYˆ[]Y‚ˆÙ[‹—Ü™[[Ý™WÜÙ\ÜÚ[Û—Ùš[\ÊÙ\ÜÚ[Ûœ×Ù\‹Ù\ÜÚ[Û—ÚY
+Bˆ™]\›ˆ›ÛÛ
+[]Y
+B‚ˆYˆ[]WÜÙ\ÜÚ[ÛœÊˆÙ[‹ˆÙ\ÜÚ[Û—ÚYÎˆ\ÝÜÝ—KˆÙ\ÜÚ[Ûœ×Ù\ŽˆÜ[Û˜[Ô]HH›Û™Kˆ
+HOˆ[‚ˆˆˆ‘[]H]™\žHÙ\ÜÚ[Ûˆ[ˆ
+œÙ\ÜÚ[Û—ÚYÊˆ[ˆHÚ[™ÛH˜[œØXÝ[Û‹‚‚ˆ˜XÚÜÈH\Ú›Ø\™	ÜÈ[Ë\Ù[XÝ][‹Y[]H›ÝÈÛˆBˆÙ\ÜÚ[ÛœÈYÙH
+ÔÕØ\KÜÙ\ÜÚ[ÛœËØ[ËY[]X
+KˆZ\œ›ÜœÈBˆÚ[™ÛK\Ù\ÜÚ[Ûˆ›Y]˜[]WÜÙ\ÜÚ[Û˜ÛÛ˜XÝ\ˆ›ÝÎ‚‚ˆ
+ˆ[šÛ›ÝÛˆQÈ\™HÚ[[HÚÚ\Y
+›È
+H8 %Ù[XÝ[ÛˆÝ]Bˆ[ˆHRHØ[ˆ˜XÙHYØZ[œÝ[›Ý\ˆX‰ÜÈ[]K[™ÙIÙˆ˜]\ˆÝXØÙYY[Û‹]K\™\Ý[ˆ˜Z[]K]ÚÛKX˜]Ú‚ˆ
+ˆ[YØ]HÝX˜YÙ[Ú[™[ˆ
+[Ù[ØÛÛ™šYË—Ù[YØ]WÙœ›ÛX
+H\™BˆØ\ØØYKY[]YÚ]Z\ˆ\™[Èœ˜[˜ÚÚ[™[ˆ\™HÜœ[™Yˆ
+\™[ÜÙ\ÜÚ[Û—ÚY8¡¤ˆ•S
+HÛÈ^HÝ^HXØÙ\ÜÚX›K‚ˆ
+ˆY\ÜØYÙ\È[™HÙ\ÜÚ[Ûˆ›ÝÈ›ÝÛÈ[ˆÛ™BˆÙ^XÝ]WÝÜš]XØ[ÛÈH\X[˜Z[\™HØ[‰ÝX]™HBˆˆ[ˆH›Y\ÜØYÙ\ÈÛÛ™H]Ù\ÜÚ[Ûˆ›ÝÈÝ[\™HˆÝ]K‚ˆ
+ˆÛ‹Y\ÚÈ˜[œØÜš\È™\]Y\ÝÙ[\Ê˜š[\È\™HÛX[™Y\ˆÝ]ÚYHHˆ˜[œØXÝ[ÛˆÚ[ˆ
+œÙ\ÜÚ[Ûœ×Ù\Šˆ\È›ÝšYYˆX]Ú[™È›Y]˜[™WÜÙ\ÜÚ[ÛœØ[™ˆ›Y]˜[]WÙ[\WÜÙ\ÜÚ[ÛœØ‚‚ˆ™]\›œÈHÛÝ[ÙˆÙ\ÜÚ[ÛœÈ]XÝX[H^\ÝY[™Ù\™Bˆ[]Y
+X^H™H\ÜÈ[ˆ[ŠÙ\ÜÚ[Û—ÚYÊXYˆÛÛYHQÈÙ\™Bˆ[™XYHÛÛ™JK‚ˆˆˆ‚ˆYˆ›ÝÙ\ÜÚ[Û—ÚYÎ‚ˆ™]\›ˆˆÈY\
+È›Ü[žH›Û‹\Ýš[™È[šY\È\Yœ›Ûˆ]›ÚYÂˆÈÝX›KXÛÝ[[™È[ˆHÒT‘KRSˆ\Ý[™›ÝXÝÈYØZ[œÝˆÈØ[\œÈ]\ÜÈH\ÝÚ]Ý˜^H›Û™X˜[Y\Ë‚ˆ[š\]YWÚYÈH\Ý
+ÜÚY›ÜˆÚY[ˆÙ\ÜÚ[Û—ÚYÈYˆ\Ú[œÝ[˜ÙJÚYÝŠH[™ÚYJBˆYˆ›Ý[š\]YWÚYÎ‚ˆ™]\›ˆ‚ˆ™[[Ý™YÚYÎˆ\ÝÜÝ—HH×Bˆ™[[Ý™YÙ[YØ]WÚYÎˆ\ÝÜÝ—HH×B‚ˆYˆÙÊÛÛ›ŠN‚ˆXÙZÛ\œÈH‹‹š›Ú[ŠÈˆ
+ˆ[Š[š\]YWÚYÊJBˆÈš\œÝš[\ˆÈQÈ]XÝX[H^\Ý8 %ÙHØ[ÂˆÈ™]\›ˆH™X[[]YÛÝ[›ÝH[œ][™Ý‚ˆÝ\œÛÜˆHÛÛ›‹™^XÝ]Jˆˆ”ÑSPÕY”“ÓHÙ\ÜÚ[ÛœÈÒT‘HYSˆ
+ÜXÙZÛ\œßJH‹ˆ[š\]YWÚYËˆ
+Bˆ^\Ý[™ÈHÜ›ÝÖÈšY—H›Üˆ›ÝÈ[ˆÝ\œÛÜ‹™™]Ú[
+
+WBˆYˆ›Ý^\Ý[™Î‚ˆ™]\›ˆ‚ˆ^\Ý[™×ÜXÙZÛ\œÈH‹‹š›Ú[ŠÈˆ
+ˆ[Š^\Ý[™ÊJBˆ™[[Ý™YÙ[YØ]WÚYË™^[™
+Ù[]WÙ[YØ]WØÚ[™[ŠÛÛ›‹^\Ý[™ÊJBˆÈÜœ[ˆ™[XZ[š[™ÈÚ[™[ˆÚÜÙH\™[\È[ˆHÚ[\ÝÛÈBˆÈ’ÈÛÛœÝ˜Z[Ý^\ÈØ]\ÙšYYˆ[ˆÚ[™[ˆÚÜÙH\™[ˆÈ\È]Ù[ˆ[ˆHÚ[\Ý˜]\ˆ[ˆ•SZ[™È\™[ÂˆÈÙˆÝ\š]›ÜœÈ8 %HSˆ\ÝÛˆ\™[ÜÙ\ÜÚ[Û—ÚYÙ\ÂˆÈ^XÝH\Ë‚ˆÛÛ›‹™^XÝ]Jˆˆ•TUHÙ\ÜÚ[ÛœÈÑU\™[ÜÙ\ÜÚ[Û—ÚYH•S‚ˆˆ•ÒT‘H\™[ÜÙ\ÜÚ[Û—ÚYSˆ
+Ù^\Ý[™×ÜXÙZÛ\œßJH‹ˆ^\Ý[™Ëˆ
+BˆÛÛ›‹™^XÝ]Jˆˆ‘SUH”“ÓHY\ÜØYÙ\ÈÒT‘HÙ\ÜÚ[Û—ÚYSˆ
+Ù^\Ý[™×ÜXÙZÛ\œßJH‹ˆ^\Ý[™Ëˆ
+BˆÛÛ›‹™^XÝ]Jˆˆ‘SUH”“ÓHÙ\ÜÚ[ÛœÈÒT‘HYSˆ
+Ù^\Ý[™×ÜXÙZÛ\œßJH‹ˆ^\Ý[™Ëˆ
+BˆÙ[‹—Ù[]WÝ[œ™Y™\™[˜ÙYÜÞ\Ý[WÜ›Û\ÊÛÛ›ŠBˆ™[[Ý™YÚYË™^[™
+^\Ý[™ÊBˆ™]\›ˆ[Š^\Ý[™ÊB‚ˆÛÝ[HÙ[‹—Ù^XÝ]WÝÜš]JÙÊBˆ›ÜˆÚY[ˆ™[[Ý™YÙ[YØ]WÚYÎ‚ˆÙ[‹—Ü™[[Ý™WÜÙ\ÜÚ[Û—Ùš[\ÊÙ\ÜÚ[Ûœ×Ù\‹ÚY
+Bˆ›ÜˆÚY[ˆ™[[Ý™YÚYÎ‚ˆÙ[‹—Ü™[[Ý™WÜÙ\ÜÚ[Û—Ùš[\ÊÙ\ÜÚ[Ûœ×Ù\‹ÚY
+Bˆ™]\›ˆÛÝ[‚ˆÎˆÚ\™YÙ[XÝÜˆ›Üˆ›Y]˜ÛÝ[Ù[\WÜÙ\ÜÚ[ÛœØ[™ˆÎˆ›Y]˜[]WÙ[\WÜÙ\ÜÚ[ÛœØÛÈH˜YÙH[™HÝÙY\YÜ™YK‚ˆÎ‚ˆÎˆY\ÜØYÙWØÛÝ[˜XÚÜÈ]™H
+XÝ]™HHX
+H›ÝÜÈÛ›NÈ™]Ú[™ˆÎˆ
+›Y]˜™\XÙWÛY\ÜØYÙ\ØËÈ\˜Ú]™WÙ›ÜY
+H[™[‹\XÙBˆÎˆÛÛ\XÝ[Ûˆ
+›Y]˜\˜Ú]™WØ[™ØÛÛ\XÝ
+H™\Ù]]ÈÚ[HÙY\[™ÂˆÎˆ›ÜY\›œÈÛˆ\ÚÈ\ÈXÝ]™HH8 %HÛ›H™XÛÝ™\˜X›HÛÜBˆÎˆ
+ÍÌLMˆÈÎÍŒÈÈÎÍMŠKˆH“ÕVTÕØ›Ø™H\ÈH]]Üš]NÂˆÎˆY\ÜØYÙWØÛÝ[HÝ^\È\ÈHÚX\™Yš[\‹ˆØ[YHÚ\H\È]™\žBˆÎˆÝ\ˆ[\[™\ÜÈÝX\™[ˆ\È[Ù[Kˆ
+ÎMNŽ
+BˆÑSTWÔÑTÔÒSÓ—ÕÒT‘HH
+ˆ›Y\ÜØYÙWØÛÝ[H‚ˆS‘[™YØ]TÈ“Õ•S‚ˆS‘\˜Ú]™YH‚ˆS‘“ÕVTÕÈ
+‚ˆ”ÑSPÕH”“ÓHY\ÜØYÙ\ÈÒT‘HY\ÜØYÙ\ËœÙ\ÜÚ[Û—ÚYHÙ\ÜÚ[ÛœËšY‚ˆŠH‚ˆ
+B‚ˆYˆÛÝ[Ù[\WÜÙ\ÜÚ[ÛœÊÙ[ŠHOˆ[‚ˆˆˆ”™]\›ˆHÛÝ[Ùˆ[\K›Û‹XXÝ]™K›Û‹X\˜Ú]™YÙ\ÜÚ[ÛœË‚‚ˆ‘[\HˆHHÙ\ÜÚ[ÛˆÛÈ›ÈY\ÜØYÙH›ÝÜÈ][S‘\È[™Yˆ
+[™YØ]TÈ“Õ•S
+HS‘\È›Ý\˜Ú]™YˆH[™YØ]ˆÝX\™X]Ú\ÈHØY™]HÛÛ˜XÝ\ÙYžH›Y]˜[™WÜÙ\ÜÚ[ÛœØ‚ˆÛ›H[™YÙ\ÜÚ[ÛœÈ\™HØ[™Y]\È›Üˆ[È[][Û‹ÛÈHœ™\ÚBˆÜ]Û™YÙ\ÜÚ[ÛˆÚÜÙHš\œÝY\ÜØYÙH\Û‰Ý[™YY]8 %ÜˆÛ™Bˆ[Ü[ˆžHH]™HYÙ[8 %\È™]™\ˆÛš\YÝ]œ›ÛH[™\‚ˆH[[YK‚‚ˆ[\[™\ÜÈ\ÈXÚYYžH™]N˜ÑSTWÔÑTÔÒSÓ—ÕÒT‘X8 %ÙYH]ˆÛÛœÝ[›ÜˆÚHH“ÕVTÕØ›Ø™H\È™YYY[œÝXYÙ‚ˆ\Ý[™ÈY\ÜØYÙWØÛÝ[[Û™K‚‚ˆ˜XÚÜÈHÑUØ\KÜÙ\ÜÚ[ÛœËÙ[\KØÛÝ[[™Ú[]]ÈBˆÙXˆ\Ú›Ø\™YH]È‘[]H[\Hˆ]ÛˆÚ[ˆ\™IÜÈ›Ý[™ÂˆÈÛX[ˆ\[™™K\Ü[]HHÛÛ™š\›HX[ÙÈÚ]HXÝX[ˆÛÝ[‚ˆˆˆ‚ˆÚ]Ù[‹—Ü™XYØÝ
+
+H\ÈÛÛ›Ž‚ˆÝ\œÛÜˆHÛÛ›‹™^XÝ]Jˆˆ”ÑSPÕÓÕS•
+
+ŠH”“ÓHÙ\ÜÚ[ÛœÈÒT‘HÜÙ[‹—ÑSTWÔÑTÔÒSÓ—ÕÒT‘_H‚ˆ
+Bˆ™]\›ˆÝ\œÛÜ‹™™]ÚÛ™J
+VÌB‚ˆYˆ[]WÙ[\WÜÙ\ÜÚ[ÛœÊˆÙ[‹ˆÙ\ÜÚ[Ûœ×Ù\ŽˆÜ[Û˜[Ô]HH›Û™Kˆ
+HOˆ[‚ˆˆˆ‘[]H]™\žH[\K[™Y›Û‹X\˜Ú]™YÙ\ÜÚ[Û‹‚‚ˆZ\œ›ÜœÈ›Y]˜[™WÜÙ\ÜÚ[ÛœØ	È˜[œØXÝ[Û˜[Ú\N‚‚ˆ
+ˆÙ[XÝÈØ[™Y]HQÈš\œÝ
+™]N˜ÑSTWÔÑTÔÒSÓ—ÕÒT‘X
+HÛÈÙBˆ™]™\ˆÝXÚH]™HÙ\ÜÚ[Û‹Û™HH\Ù\ˆ[X™\˜][H\˜Ú]™YˆÜˆÛ™HÚÜÙH˜[œØÜš\Ý\š]™\È\ÈÛÙX\˜Ú]™Y›ÝÜË‚ˆ
+ˆÜœ[œÈ[žHÚ[ÚÜÙH\™[\È[ˆHÚ[\Ý8 %Ú[™[‚ˆÙˆ[ˆ[\H\™[\™HÙ\[™™K\\™[YÈ•S˜]\‚ˆ[ˆØ\ØØYKY[]YX]Ú[™È[]WÜÙ\ÜÚ[Û˜Âˆ[™WÜÙ\ÜÚ[ÛœØÙ[X[XÜÈÛÈœ˜[˜ÚÜÝX˜YÙ[˜[œØÜš\ÂˆÝ\š]™H[ˆ[˜Y™\[\™[ÛX[\‚ˆ
+ˆ[]\ÈH›ÝÜÈ[ˆHÚ[™ÛHÙ^XÝ]WÝÜš]XØ[˜XÚÈÛÂˆHÜ\˜][Ûˆ\È]ÛZXÈ8 %H\X[˜Z[\™H
+K™ËˆÒQÒÒSˆZY[ÛÜ
+HÙ\Û‰ÝX]™HHˆ[ˆH›Y\ÜØYÙ\ËY[]Y]ˆÙ\ÜÚ[Û‹\›ÝË\Ý[]\™Hˆ[‹\Ý]K‚ˆ
+ˆÛX[œÈ\Û‹Y\ÚÈ˜[œØÜš\š[\È
+šœÛÛ˜ÈšœÛÛ›Âˆ™\]Y\ÝÙ[\Ê˜
+HÝ]ÚYHHˆ˜[œØXÝ[ÛˆÚ[‚ˆÙ\ÜÚ[Ûœ×Ù\˜\È›ÝšYYˆ[\HÙ\ÜÚ[ÛœÈÛ‰Ý\XØ[Bˆ]™H˜[œØÜš\š[\Ë]HØ]]Ø^HØ[ˆX]™HHÝX‚ˆ™\]Y\ÝÙ[\Ê˜Yˆ]Ü˜\ÚY™Y›Ü™HHš\œÝ™\H8 %ˆÛÈÙHÝ[ÝÙY\X]Ú[™È[™WÜÙ\ÜÚ[ÛœØ‚‚ˆ™]\›œÈH[X™\ˆÙˆÙ\ÜÚ[ÛœÈ[]Y‚ˆˆˆ‚ˆ™[[Ý™YÚYÎˆ\ÝÜÝ—HH×B‚ˆYˆÙÊÛÛ›ŠN‚ˆÝ\œÛÜˆHÛÛ›‹™^XÝ]Jˆˆ”ÑSPÕY”“ÓHÙ\ÜÚ[ÛœÈÒT‘HÜÙ[‹—ÑSTWÔÑTÔÒSÓ—ÕÒT‘_H‚ˆ
+BˆÙ\ÜÚ[Û—ÚYÈHÜ›ÝÖÈšY—H›Üˆ›ÝÈ[ˆÝ\œÛÜ‹™™]Ú[
+
+_B‚ˆYˆ›ÝÙ\ÜÚ[Û—ÚYÎ‚ˆ™]\›ˆ‚ˆXÙZÛ\œÈH‹‹š›Ú[ŠÈˆ
+ˆ[ŠÙ\ÜÚ[Û—ÚYÊJBˆÛÛ›‹™^XÝ]Jˆˆ•TUHÙ\ÜÚ[ÛœÈÑU\™[ÜÙ\ÜÚ[Û—ÚYH•S‚ˆˆ•ÒT‘H\™[ÜÙ\ÜÚ[Û—ÚYSˆ
+ÜXÙZÛ\œßJH‹ˆ\Ý
+Ù\ÜÚ[Û—ÚYÊKˆ
+B‚ˆ›ÜˆÚY[ˆÙ\ÜÚ[Û—ÚYÎ‚ˆÈSUH”“ÓHY\ÜØYÙ\È\È\˜[›ÚXH8 %HÙ[XÝÜ‰ÜÂˆÈ“ÕVTÕØ›Ø™H[™XYH›Ý™Y\ÙHÙ\ÜÚ[ÛœÈÝÛˆ›ÂˆÈY\ÜØYÙH›ÝÜÈ8 %]H›ÝÈ[œÙ\Y™]ÙY[ˆHÑSPÕ[™ˆÈ\ÈÝ][Y[ÛÝ[Ý\Ú\ÙH™HY[™Û[™ËÛÈÙBˆÈÝ[X]™HHÛX[ˆ’ÈÝ]K‚ˆÛÛ›‹™^XÝ]Jˆ‘SUH”“ÓHY\ÜØYÙ\ÈÒT‘HÙ\ÜÚ[Û—ÚYHÈ‹
+ÚY
+Bˆ
+BˆÛÛ›‹™^XÝ]J‘SUH”“ÓHÙ\ÜÚ[ÛœÈÒT‘HYHÈ‹
+ÚY
+JBˆ™[[Ý™YÚYË˜\[™
+ÚY
+BˆÙ[‹—Ù[]WÝ[œ™Y™\™[˜ÙYÜÞ\Ý[WÜ›Û\ÊÛÛ›ŠBˆ™]\›ˆ[ŠÙ\ÜÚ[Û—ÚYÊB‚ˆÛÝ[HÙ[‹—Ù^XÝ]WÝÜš]JÙÊBˆ›ÜˆÚY[ˆ™[[Ý™YÚYÎ‚ˆÙ[‹—Ü™[[Ý™WÜÙ\ÜÚ[Û—Ùš[\ÊÙ\ÜÚ[Ûœ×Ù\‹ÚY
+Bˆ™]\›ˆÛÝ[‚‚ˆÝ]XÛY]ÙˆYˆØ\WÜ[™WØYÙWÙš[\ŠˆÛ\—Ý[—Ù^\ÎˆÜ[Û˜[Ù›Ø]Kš[\œÎˆXÝÜÝ‹[žWBˆ
+HOˆ›Û™N‚ˆˆˆ•˜[œÛ]HHYØXÞHYÙHÚ[™ÝÈ[ÈHÚ\™YXÝ]š]Hš[\‹ˆˆˆ‚ˆYˆ
+ˆš[\œË™Ù]
+›\ÝØXÝ]™WØ™Y›Ü™HŠH\È›Û™Bˆ[™š[\œË™Ù]
+œÝ\YØ™Y›Ü™HŠH\È›Û™Bˆ[™Û\—Ý[—Ù^\È\È›Ý›Û™Bˆ
+N‚ˆš[\œÖÈ›\ÝØXÝ]™WØ™Y›Ü™H—HH[YK[YJ
+HH
+ˆÛ\—Ý[—Ù^\È
+ˆˆ
+B‚‚‚‚ˆYˆ\˜Ú]™WÜÙ\ÜÚ[ÛœÊˆÙ[‹ˆÛ\—Ý[—Ù^\ÎˆÜ[Û˜[Ù›Ø]HH›Û™KˆÛÝ\˜ÙNˆÝˆH›Û™Kˆ
+Š™š[\œËˆ
+HOˆ[‚ˆˆˆ[ËX\˜Ú]™H
+ÛÙZYJH]™\žHÙ\ÜÚ[ÛˆX]Ú[™ÈHš[\œË‚‚ˆØ[YHš[\ˆÝ\™˜XÙH\È›Y]˜[™WÜÙ\ÜÚ[ÛœØ][œÝXYÙˆ[][™Âˆ›ÝÜÈ]›\È\˜Ú]™YHXšXH›Y]˜Ù]ÜÙ\ÜÚ[Û—Ø\˜Ú]™YÛÂˆXXÚX]Ú	ÜÈÛÛ\™\ÜÚ[Ûˆ[™XYÙH\È\˜Ú]™Y\ÈH[š]
+[ˆ[˜\˜Ú]™YˆÛÛ\™\ÜÚ[Ûˆ›ÛÝÛÝ[Ý\Ú\ÙH™\Ý\œ™XÝHÛÛ™\œØ][Ûˆ[‚ˆ\ÚÝÜ	ÜÈ›Ú™XÝY\Ý
+Kˆ›Ý[™È\È[]YÈY\ÜØYÙ\È[™˜[œØÜš\ˆš[\È\™H[ÝXÚYˆ™]\›œÈH[X™\ˆÙˆÙ\ÜÚ[ÛœÈX]ÚY‚‚ˆ\˜Ú]™YY˜][ÈÈ˜[ÙX\™H
+Û›HÙ[XÝ›ÝÜÈ›ÝY]ˆ\˜Ú]™Y
+HÛÈ™\X][œÈ\™HY[\Ý[›Ë[ÜË‚ˆˆˆ‚ˆš[\œËœÙ]Y˜][
+˜\˜Ú]™Y‹˜[ÙJBˆ›ÝÜÈHÙ[‹›\ÝÜ[™WØØ[™Y]\ÊˆÛ\—Ý[—Ù^\Ï[Û\—Ý[—Ù^\ËÛÝ\˜ÙO\ÛÝ\˜ÙK
+Š™š[\œÂˆ
+Bˆ›Üˆ›ÝÈ[ˆ›ÝÜÎ‚ˆÙ[‹œÙ]ÜÙ\ÜÚ[Û—Ø\˜Ú]™Y
+›ÝÖÈšY—KYJBˆ™]\›ˆ[Š›ÝÜÊB‚‚‚ˆYˆ\™ÙWÜÝ[WÝÛÛØØ[ÛX\šÙ\œÊˆÙ[‹
+‹žWÜ[Žˆ›ÛÛH˜[ÙK˜XÚÝ\ˆ›ÛÛHYBˆ
+HOˆXÝÜÝ‹[žWN‚ˆˆˆ”\›X[™[HÛX\ˆ˜\™HÛÛXØ[X\šÙ\ˆÛÛ[
+K™Ëˆ–ÛY[[ÜžWHŠBˆY[ˆHY\ÜØYÙ\ØX›HžHÙ\ÜÚ[ÛœÈ\œÚ\ÝY™Y›Ü™HBˆÍÎMš^[ˆYÙ[˜ÛÛ™\œØ][Û—ÛÛÜ‚‚ˆÜÝš\ÜÝ[WÝÛÛØØ[ÛX\šÙ\œØ[™XYH™\Z\œÈ\È[ˆY[[ÜžHÛ‚ˆ]™\žHÙ\ÜÚ[ÛˆØY
+ÙYHÜ›ÝÜ×Ý×ØÛÛ™\œØ][Û˜
+KÛÈ[›š[™È\Âˆ\ÈÜ[Û˜[8 %]›ÜˆÛ™Ë[]™YÙ\ÜÚ[ÛœÈHØ[YH›ÝÜÈÙ]ˆ™K\ØØ[›™Y[™™K\™\Z\™YÛˆ]™\žH™\Ý[YKÚXÚ\ÈØ\ÝYÛÜšÂˆ[™ÙY\ÈHÛÛ[Z[˜]Yž]\ÈÚ][™È[ˆHˆ
+[™[ˆ[žBˆÝÛœÝ™X[HØXÚKØ˜XÚÝ\Û˜\ÚÝÙˆ]
+H[™Yš[š][Kˆ\È™]Üš]\ÂˆHY™™XÝY›ÝÜÈÛ˜ÙK[ˆXÙK‚‚ˆÛ›HHÛÛ[ÛÛ[[ˆ\ÈÝXÚY8 %›ÛXÛÛØØ[Øˆ[™]™\žHÝ\ˆÛÛ[[ˆÛˆH›ÝÈ\™HY^XÝH\È^H\™KÛÂˆ›ÝšY\ˆÛÛØØ[ÝÛÛÜ™\Ý[Z\š[™È\È[˜Y™™XÝY‚‚ˆ[›ZÙHH[‹[Y[[ÜžH™\Z\‹\ÈTUH\È\›X[™[[™Ø[‰Ý™Bˆ[™Û™Hœ›ÛHÚ][ˆH‹ˆÚ[˜ÙH˜XÚÝ\Y˜][ÈÈYKBˆ[Y\Ý[\Y[Û˜\ÚÝ\ÈZÙ[ˆšXHPÕUSHS•Ø
+ØY™HYØZ[œÝˆH]™HÛÛ›™XÝ[Û‹[›ZÙHH˜]ËXÛÜHØ˜XÚÝ\Ù—Ùš[X\ÙY›Ü‚ˆX[›Ü›YY\ØÚ[XH™\Z\ŠH™Y›Ü™H[žH›ÝÈ\ÈÝXÚY8 %Z\œ›Üš[™Âˆ™\Z\—ÜÝ]WÙ—ÜØÚ[XX	ÜÈ˜XÚÝ\XžKYY˜][ÛÛ™[[Ûˆ›Ü‚ˆ\ÝXÝ]™HÝ]K™ˆÜ\˜][ÛœËˆ›ÈÛ˜\ÚÝ\ÈZÙ[ˆÚ[ˆ\™H\Âˆ›Ý[™ÈÈÚ[™ÙK‚‚ˆÚ]žWÜ[UYX™\ÜÈHY™™XÝY›ÝÈÛÝ[ÚYÈÚ]Ý]ˆÜš][™ÈÜˆ˜XÚÚ[™È\
+™XY[Û›K›ÈÜš]HØÚÈZÙ[ŠK‚‚ˆ™]\›œÈÈ™žWÜ[ˆŽˆ›ÛÛœ›ÝÜ×ØY™™XÝYŽˆ[œ›Ý×ÚYÈŽˆË‹‹—Kˆ˜˜XÚÝ\Ü]ŽˆÝŸ›Û™_X‚ˆˆˆ‚‚ˆYˆÙš[™ØY™™XÝY
+ÛÛ›ŠHOˆ\ÝÚ[N‚ˆÝ\œÛÜˆHÛÛ›‹™^XÝ]Jˆ”ÑSPÕYÛÛ[”“ÓHY\ÜØYÙ\È‚ˆ•ÒT‘H›ÛHH	Ø\ÜÚ\Ý[	ÈS‘ÛÛØØ[ÈTÈ“Õ•SS‘ÛÛØØ[ÈOH	ÉÈ‚ˆ
+BˆY™™XÝYˆ\ÝÚ[HH×Bˆ›Üˆ›ÝÈ[ˆÝ\œÛÜ‹™™]Ú[
+
+N‚ˆÛÛ[H›ÝÖÈ˜ÛÛ[—BˆYˆ\Ú[œÝ[˜ÙJÛÛ[ÝŠH[™ÔÕSWÕÓÓÐÐSÓPT’ÑT—Ô‘K™[X]Ú
+ÛÛ[œÝš\
+
+JN‚ˆY™™XÝY˜\[™
+›ÝÖÈšY—JBˆ™]\›ˆY™™XÝY‚ˆÚ]Ù[‹—Ü™XYØÝ
+
+H\ÈÛÛ›Ž‚ˆY™™XÝYÚYÈHÙš[™ØY™™XÝY
+ÛÛ›ŠB‚ˆYˆžWÜ[Ž‚ˆ™]\›ˆÂˆ™žWÜ[ˆŽˆYKˆœ›ÝÜ×ØY™™XÝYŽˆ[ŠY™™XÝYÚYÊKˆœ›Ý×ÚYÈŽˆY™™XÝYÚYËˆ˜˜XÚÝ\Ü]Žˆ›Û™KˆB‚ˆYˆ›ÝY™™XÝYÚYÎ‚ˆ™]\›ˆÂˆ™žWÜ[ˆŽˆ˜[ÙKˆœ›ÝÜ×ØY™™XÝYŽˆˆœ›Ý×ÚYÈŽˆ×Kˆ˜˜XÚÝ\Ü]Žˆ›Û™KˆB‚ˆ˜XÚÝ\Ü]ˆÜ[Û˜[ÜÝ—HH›Û™BˆYˆ˜XÚÝ\‚ˆ[\Ü]][YB‚ˆÝ[\H]][YK™]][YK››ÝÊ
+KœÝ™[YJ‰VI[IYÉR	SITÈŠBˆ\ÝHÙ[‹™—Ü]Ú]Û˜[YJˆˆžÜÙ[‹™—Ü]›˜[Y_Kœ™KXÛX[‹[X\šÙ\œËX˜XÚÝ\^ÜÝ[\H‚ˆ
+BˆÚ]Ù[‹—ÛØÚÎ‚ˆÙ[‹—ØÛÛ›‹™^XÝ]J•PÕUSHS•ÈÈ‹
+ÝŠ\Ý
+K
+JBˆ˜XÚÝ\Ü]HÝŠ\Ý
+BˆÙÙÙ\‹š[™›Ê˜XÚÙY\Ý]K™ˆÈ	\È™Y›Ü™HÛX[‹[X\šÙ\œÈÜš]H‹˜XÚÝ\Ü]
+B‚ˆYˆÙÊÛÛ›ŠN‚ˆYÈHÙš[™ØY™™XÝY
+ÛÛ›ŠBˆYˆYÎ‚ˆXÙZÛ\œÈH‹‹š›Ú[ŠÈˆ
+ˆ[ŠYÊJBˆÛÛ›‹™^XÝ]Jˆˆ•TUHY\ÜØYÙ\ÈÑUÛÛ[H	ÉÈÒT‘HYSˆ
+ÜXÙZÛ\œßJH‹ˆYËˆ
+Bˆ™]\›ˆYÂ‚ˆY™™XÝYÚYÈHÙ[‹—Ù^XÝ]WÝÜš]JÙÊBˆYˆY™™XÝYÚYÎ‚ˆÙÙÙ\‹š[™›Êˆ”\›X[™[HÛX\™Y	YÝ[HÛÛXØ[X\šÙ\ˆ›ÝÊÊH[ˆÝ]K™ˆ
+ÍÎM
+H‹ˆ[ŠY™™XÝYÚYÊKˆ
+Bˆ™]\›ˆÂˆ™žWÜ[ˆŽˆ˜[ÙKˆœ›ÝÜ×ØY™™XÝYŽˆ[ŠY™™XÝYÚYÊKˆœ›Ý×ÚYÈŽˆY™™XÝYÚYËˆ˜˜XÚÝ\Ü]Žˆ˜XÚÝ\Ü]ˆB‚ˆÈ8¥ 8¥ Y]HÙ^KÝ˜[YH
+›ÜˆØÚY[\ˆ›ÛÚÚÙY\[™ÊH8¥ 8¥ ‚ˆYˆÙ]ÛY]JÙ[‹Ù^NˆÝŠHOˆÜ[Û˜[ÜÝ—N‚ˆˆˆ”™XYH˜[YHœ›ÛHHÝ]WÛY]HÙ^KÝ˜[YHÝÜ™Kˆˆˆ‚ˆÈÙ\ÛˆÙ[‹—ÛØÚÈ
+›ÝÜ™XYØÝ
+H™XØ]\ÙHØ[\œÈZÙBˆÈ×Ü™XZ[ÜÝ\™XY›ÙÜ™\ÜÈ™Y›Ü™H[\š[™ÈHÜš]BˆÈ˜[œØXÝ[Û‹[™H™XY[Û›HÐSÛÛ›™XÝ[ÛˆÙY\ÈÛ›BˆÈÛÛ[Z]Y]H8 %H[™[™ÈÜš]H˜[œØXÝ[Û‰ÜÈ[˜ÛÛ[Z]YˆÈY]HÜš]\ÈÛÝ[™H[š\ÚX›Kˆ\È\ÈHÚX\Ú[ÛÚÝ\ˆÈ›ÝHÛÛ›ÞH›Ý[™XÚÈH™XY\]Ü]\™Ù]Ë‚ˆÚ]Ù[‹—Ü™XYØÝ
+
+H\ÈÛÛ›Ž‚ˆ›ÝÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕ˜[YH”“ÓHÝ]WÛY]HÒT‘HÙ^HHÈ‹
+Ù^K
+Bˆ
+K™™]ÚÛ™J
+BˆYˆ›ÝÈ\È›Û™N‚ˆ™]\›ˆ›Û™Bˆ™]\›ˆ›ÝÖÈ˜[YH—HYˆ\Ú[œÝ[˜ÙJ›ÝËÜ[]LË”›ÝÊH[ÙH›ÝÖÌB‚ˆYˆÙ]ÛY]JÙ[‹Ù^NˆÝ‹˜[YNˆÝ‹
+‹Ý\œÛÜŽˆÜ[Û˜[ÜÜ[]LËÝ\œÛÜ—HH›Û™JHOˆ›Û™N‚ˆˆˆ•\Ù\Ý]WÛY]VÚÙ^WNÈÚ]Ý\œÛÜ˜HÜš]H\È[›[™H
+HØ[\ˆ[™XYHÛÈBˆ˜[œØXÝ[Ûˆ8 %™\Ý[™È‘QÒSˆSSQQPUHÛÝ[XYØÚÊKˆˆˆ‚ˆÜ[H
+ˆ’S”ÑT•S•ÈÝ]WÛY]H
+Ù^K˜[YJHSQTÈ
+ËÊH‚ˆ“ÓˆÓÓ‘“PÕ
+Ù^JHÈTUHÑU˜[YHH^ÛYY˜[YH‚ˆ
+BˆYˆÝ\œÛÜˆ\È›Ý›Û™N‚ˆÝ\œÛÜ‹™^XÝ]JÜ[
+Ù^K˜[YJJBˆ[ÙN‚ˆÙ[‹—ÝÜš]WÜÜ[
+Ü[
+Ù^K˜[YJJB‚ˆYˆÙ]ÛY]WÛX[žJÙ[‹][\Îˆ\ÝÕ\VÜÝ‹Ý—WJHOˆ›Û™N‚ˆˆˆ•Üš]H][\HÝ]WÛY]X›ÝÜÈ[ˆÛ™HÝÛ™\ˆ˜[œØXÝ[Û‹‚‚ˆY™XÞXÛHZYÜ˜][ÛœÈ\ÙH\ÈÈX›\ÚHÚ[ÛØ[[™\˜Ú]™H]Âˆ\™[]ÛZXØ[KˆHY]Ù[X™\˜][H™[XZ[œÈHÛX[Ù\ÜÚ[Û‘‚ˆš[Z]]™NÈ]Ù\È›ÝÜ™X]HHÙXÛÛ™ÛØ[ÝÜ™HÜˆ^ÜÙHHÙ[™\šXÂˆ˜[œØXÝ[ÛˆTHÈØ[\œË‚ˆˆˆ‚ˆ›Ü›X[^™YHÊÝŠÙ^JKÝŠ˜[YJJH›ÜˆÙ^K˜[YH[ˆ][\×BˆYˆ›Ý›Ü›X[^™Y‚ˆ™]\›‚‚ˆYˆÙÊÛÛ›ŠN‚ˆ›ÜˆY]WÚÙ^KY]WÝ˜[YH[ˆ›Ü›X[^™Y‚ˆÛÛ›‹™^XÝ]Jˆ’S”ÑT•S•ÈÝ]WÛY]H
+Ù^K˜[YJHSQTÈ
+ËÊH‚ˆ“ÓˆÓÓ‘“PÕ
+Ù^JHÈTUHÑU˜[YHH^ÛYY˜[YH‹ˆ
+Y]WÚÙ^KY]WÝ˜[YJKˆ
+B‚ˆÙ[‹—Ù^XÝ]WÝÜš]JÙÊB‚ˆYˆÛÛ\\™WØ[™ÜÙ]ÛY]JˆÙ[‹Ù^NˆÝ‹^XÝYˆÜ[Û˜[ÜÝ—K˜[YNˆÝ‚ˆ
+HOˆ›ÛÛ‚ˆˆˆÛÛ™][Û˜[HX›\ÚÛ™HY]H›ÝÈ[™\ˆHÙ\ÜÚ[Û‘ˆÜš]HØÚËˆˆˆ‚ˆYˆÙÊÛÛ›ŠN‚ˆYˆ^XÝY\È›Û™N‚ˆÝ\œÛÜˆHÛÛ›‹™^XÝ]Jˆ’S”ÑT•S•ÈÝ]WÛY]H
+Ù^K˜[YJHSQTÈ
+ËÊH‚ˆ“ÓˆÓÓ‘“PÕ
+Ù^JHÈ“ÕS‘È‹ˆ
+Ù^K˜[YJKˆ
+Bˆ[ÙN‚ˆÝ\œÛÜˆHÛÛ›‹™^XÝ]Jˆ•TUHÝ]WÛY]HÑU˜[YHHÈ‚ˆ•ÒT‘HÙ^HHÈS‘˜[YHHÈ‹ˆ
+˜[YKÙ^K^XÝY
+Kˆ
+Bˆ™]\›ˆ›ÛÛ
+Ý\œÛÜ‹œ›ÝØÛÝ[OHJB‚ˆ™]\›ˆ›ÛÛ
+Ù[‹—Ù^XÝ]WÝÜš]JÙÊJB‚ˆYˆÛÛ\\™WØ[™ÜÙ]ÛY]WÛX[žJˆÙ[‹][\Îˆ\ÝÕ\VÜÝ‹Ü[Û˜[ÜÝ—KÝ—WBˆ
+HOˆ›ÛÛ‚ˆˆˆ]ÛZXØ[HX›\ÚÙ]™\˜[Y]H›ÝÜÈYˆ]™\žH™Z[XYÙHX]Ú\Ëˆˆˆ‚ˆ›Ü›X[^™YHÊÝŠÙ^JK^XÝYÝŠ˜[YJJH›ÜˆÙ^K^XÝY˜[YH[ˆ][\×BˆYˆ›Ý›Ü›X[^™Y‚ˆ™]\›ˆYB‚ˆYˆÙÊÛÛ›ŠN‚ˆ›ÜˆÙ^K^XÝYÝ˜[YH[ˆ›Ü›X[^™Y‚ˆYˆ^XÝY\È›Û™N‚ˆ›ÝÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕH”“ÓHÝ]WÛY]HÒT‘HÙ^HHÈ‹
+Ù^K
+Bˆ
+K™™]ÚÛ™J
+BˆYˆ›ÝÈ\È›Ý›Û™N‚ˆ™]\›ˆ˜[ÙBˆ[ÙN‚ˆ›ÝÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕ˜[YH”“ÓHÝ]WÛY]HÒT‘HÙ^HHÈ‹
+Ù^K
+Bˆ
+K™™]ÚÛ™J
+BˆYˆ›ÝÈ\È›Û™HÜˆ›ÝÖÌHOH^XÝY‚ˆ™]\›ˆ˜[ÙBˆ›ÜˆÙ^KÙ^XÝY˜[YH[ˆ›Ü›X[^™Y‚ˆÛÛ›‹™^XÝ]Jˆ’S”ÑT•S•ÈÝ]WÛY]H
+Ù^K˜[YJHSQTÈ
+ËÊH‚ˆ“ÓˆÓÓ‘“PÕ
+Ù^JHÈTUHÑU˜[YHH^ÛYY˜[YH‹ˆ
+Ù^K˜[YJKˆ
+Bˆ™]\›ˆYB‚ˆ™]\›ˆ›ÛÛ
+Ù[‹—Ù^XÝ]WÝÜš]JÙÊJB‚ˆYˆ™]Y×ÚØ[˜˜[—ÝÛÜšÙ\—ÜÙ\ÜÚ[ÛœÊÙ[‹ÛÜšÜÜXÙ\×Ü›ÛÝˆÝŠHOˆ[‚ˆˆˆ”™]YÈYØXÞHØ[˜˜[ˆÛÜšÙ\ˆ›ÝÜÈœ›ÛHÛXÈØ[˜˜[˜žHÝÙ[™\ˆH›Ø\™	ÜÈÛÜšÜÜXÙ\Âˆ›ÛÝÈØ]YÛ˜ÙH\ˆ›ÛÝšXHÝ]WÛY]Kˆ™]\›œÈ›ÝÜÈ™]YÙÙYˆˆˆ‚ˆ™Yš^HÝŠÛÜšÜÜXÙ\×Ü›ÛÝ
+KœœÝš\
+‹×ŠBˆYˆ›Ý™Yš^‚ˆ™]\›ˆˆØ]HHˆšØ[˜˜[—ÝÛÜšÙ\—ÜÛÝ\˜ÙWÜ™]YÙÙYžÜ™Yš^H‚ˆYˆÙ[‹™Ù]ÛY]JØ]JHOHŒHŽ‚ˆ™]\›ˆˆYˆÙÊÛÛ›ŠN‚ˆÝ\œÛÜˆHÛÛ›‹™^XÝ]Jˆ•TUHÙ\ÜÚ[ÛœÈÑUÛÝ\˜ÙHH	ÚØ[˜˜[‰È‚ˆ•ÒT‘HÛÝ\˜ÙHH	ØÛIÈS‘
+ÝÙHÈÔˆÝÙRÑHÈTÐÐTH	×	ÊH‹ˆ
+™Yš^Ù\ØØ\WÛZÙJ™Yš^
+H
+È‹ÉHŠKˆ
+BˆÈ›ÝØÛÝ[‘Q“Ô‘HÙ]ÛY]H™]\Ù\È\ÈÝ\œÛÜˆ›Üˆ]ÈS”ÑT•‚ˆ™]YÙÙYHÝ\œÛÜ‹œ›ÝØÛÝ[ÜˆˆÙ[‹œÙ]ÛY]JØ]KŒH‹Ý\œÛÜXÝ\œÛÜŠBˆ™]\›ˆ™]YÙÙYˆ™]\›ˆÙ[‹—Ù^XÝ]WÝÜš]JÙÊB‚ˆYˆ\ÝÛY]WÜ™Yš^
+Ù[‹™Yš^ˆÝŠHOˆ\ÝÕ\VÜÝ‹Ý—WN‚ˆˆˆ˜ÊÙ^K˜[YJK‹‹—X›ÜˆÝ]WÛY]HÙ^\ÈÝ\[™ÈÚ]H]\˜[ˆ™Yš^
+RÑHÚ[Ø\™È\ØØ\Y
+H8 %K™ËˆÛÜÙ\ÜÚ[Û—ÚY˜›ÝÜËˆˆˆ‚ˆYˆ›Ý™Yš^‚ˆ™]\›ˆ×Bˆ\ØØ\YH™Yš^œ™\XÙJ—‹—ŠKœ™\XÙJ‰H‹—	HŠKœ™\XÙJ—È‹—ÈŠBˆÚ]Ù[‹—Ü™XYØÝ
+
+H\ÈÛÛ›Ž‚ˆ›ÝÜÈHÛÛ›‹™^XÝ]Jˆ”ÑSPÕÙ^K˜[YH”“ÓHÝ]WÛY]HÒT‘HÙ^HRÑHÈTÐÐTH	×	È‹ˆ
+\ØØ\Y
+È‰H‹
+Kˆ
+K™™]Ú[
+
+Bˆ™]\›ˆÊ›ÝÖÌK›ÝÖÌWJH›Üˆ›ÝÈ[ˆ›ÝÜ×B‚‚‚‚‚‚‚‚‚‚‚‚ˆÈ8¥ 8¥ ÜXÙH™XÛ[X][Ûˆ8¥ 8¥ ‚ˆÈ•ÍHš\X[X›\ÈÚÜÙH‹]™YHÙYÛY[ÈÙHY\™ÙHÛˆÜ[Z^™KˆBˆÈšYÜ˜[HX›H\ÈÜ™X]Y^š[HÈX^H™H\ØX›Y[™HÚšËXšYÜ˜[BˆÈX›HÛ›H^\ÝÈ
+[™\ÈÛ›H]Y\žXX›JHÚ[ˆHØYX›HÚÙ[š^™\‚ˆÈ\È™\Ù[8 %ÛÈÙH›Ø™HXXÚ™Y›Ü™HÝXÚ[™È]
+ÙYHÜ[Z^™WÙÊK‚ˆÑ•×ÕP“TÈH
+›Y\ÜØYÙ\×ÙÈ‹›Y\ÜØYÙ\×Ù×ÝšYÜ˜[H‹›Y\ÜØYÙ\×Ù×ØÚšÈŠB‚‚‚‚ˆYˆX^X™WØ]]×Ø\˜Ú]™JˆÙ[‹ˆYWÙ^\Îˆ›Ø]HËˆZ[—Ú[\˜[ÚÝ\œÎˆ[Hˆ^ÛYWÜ[›™Yˆ›ÛÛHYKˆ
+HOˆXÝÜÝ‹[žWN‚ˆˆˆ’Y[\Ý[]]ËX\˜Ú]™NˆÛÙZYHÙ\ÜÚ[ÛœÈYH›ÜˆYWÙ^\Ø‚‚ˆÚX›[™ÈÙˆ›Y]˜X^X™WØ]]×Ü[™WØ[™Ý˜XÝ][X]›Û‹Y\ÝXÝ]™H8 %ˆ]\˜Ú]™\È
+Y\ÊH˜]\ˆ[ˆ[]\Ë[™YÙ\ÈÛˆ\ÝXÝ]š]Bˆ
+ÙYH›Y]˜\˜Ú]™WÜÝ[WÜÙ\ÜÚ[ÛœØ
+H˜]\ˆ[ˆÜ™X][Û‹ˆ™XÛÜ™ÈBˆ\Ý[ˆ[ˆÝ]WÛY]VÉÛ\ÝØ]]×Ø\˜Ú]™I×XÛÈØ[ÈÚ][‚ˆZ[—Ú[\˜[ÚÝ\œØ›Ë[ÜÈØY™HÈØ[ÜÜ[š\ÝXØ[H
+Ý\\ˆÛÚÜËÜˆÚ[ˆH\ÚÝÜ˜XÚÙ[™\ÝÈÙ\ÜÚ[ÛœÊK‚‚ˆ™]™\ˆ˜Z\Ù\Ëˆ™]\›œÈHXÝÚ]‚ˆHœÚÚ\Y˜
+›ÛÛ
+H8 %Ú][ˆZ[—Ú[\˜[ÚÝ\œÈÙˆ\Ý[‚ˆH˜\˜Ú]™Y˜
+[
+H8 %Ù\ÜÚ[ÛœÈ\˜Ú]™Y\È[‚ˆH™\œ›Üˆ˜
+Ý‹Ü[Û˜[
+H8 %™\Ù[Û›HÛˆ˜Z[\™Bˆˆˆ‚ˆ™\Ý[ˆXÝÜÝ‹[žWHHÈœÚÚ\YŽˆ˜[ÙK˜\˜Ú]™YŽˆBˆžN‚ˆ\ÝÜ˜]ÈHÙ[‹™Ù]ÛY]J›\ÝØ]]×Ø\˜Ú]™HŠBˆ›ÝÈH[YK[YJ
+BˆYˆ\ÝÜ˜]Î‚ˆžN‚ˆYˆ›ÝÈH›Ø]
+\ÝÜ˜]ÊHZ[—Ú[\˜[ÚÝ\œÈ
+ˆÍŒ‚ˆ™\Ý[ÈœÚÚ\Y—HHYBˆ™]\›ˆ™\Ý[ˆ^Ù\
+\Q\œ›Ü‹˜[YQ\œ›ÜŠN‚ˆ\ÜÈÈÛÜœ\Y]NÈ™X]\È›Èš[Üˆ[‚‚ˆ\˜Ú]™YHÙ[‹˜\˜Ú]™WÜÝ[WÜÙ\ÜÚ[ÛœÊˆYWÙ^\Ë^ÛYWÜ[›™YY^ÛYWÜ[›™Yˆ
+Bˆ™\Ý[È˜\˜Ú]™Y—HH\˜Ú]™Y‚ˆÈ™XÛÜ™]™[ˆH™\›ËX\˜Ú]™H[ˆÛÈÙHÛ‰Ý™K\ÝÙY\]™\žHØ[ˆÈÚ][ˆH[\˜[Ú[™ÝË‚ˆÙ[‹œÙ]ÛY]J›\ÝØ]]×Ø\˜Ú]™H‹ÝŠ›ÝÊJB‚ˆYˆ\˜Ú]™Yˆ‚ˆÙÙÙ\‹š[™›ÊˆœÝ]K™ˆ]]ËX\˜Ú]™Nˆ\˜Ú]™Y	YÙ\ÜÚ[ÛŠÊHYHH	\È^\È‹ˆ\˜Ú]™YˆYWÙ^\Ëˆ
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙÙÙ\‹Ø\›š[™ÊœÝ]K™ˆ]]ËX\˜Ú]™H˜Z[Yˆ	\È‹^ÊBˆ™\Ý[È™\œ›Üˆ—HHÝŠ^ÊB‚ˆ™]\›ˆ™\Ý[‚ˆÈ8¥ 8¥ [™Ù™ˆ
+Ü›ÜÜË\]›Ü›HÙ\ÜÚ[Ûˆ˜[œÙ™\ŠH8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ ˆÂˆÈÝ]HXXÚ[™N‚ˆÈ›Û™H8 %›È[™Ù™ˆ[ˆ›YÚˆÈœ[™[™Èˆ8 %ÓH™\]Y\ÝY[™Ù™‹Ø]]Ø^H\Û‰ÝXÚÙY]\Y]ˆÈœ[›š[™Èˆ8 %Ø]]Ø^H\È›ØÙ\ÜÚ[™È
+Ù\ÜÚ[ÛˆÝÚ]Ú
+ÈÞ[]XÈ\›ŠBˆÈ˜ÛÛ\]Y¸ %Ø]]Ø^HÝXØÙ\ÜÙ[H[]™\™YHÞ[]XÈ\›‚ˆÈ™˜Z[Yˆ8 %Ø]]Ø^H][ˆ\œ›ÜŽÈ™X\ÛÛˆ[ˆ[™Ù™—Ù\œ›Ü‚ˆÂˆÈHÓHÜš]\Èœ[™[™Èˆ[ˆÛ]ØZ]È›Üˆ\›Z[˜[Ý]KˆHØ]]Ø^BˆÈØ]Ú\ˆ˜[œÚ][ÛœÈ[™[™ø¡¤œ[›š[™ø¡¤žØÛÛ\]Y˜Z[YK‚‚ˆYˆ™\]Y\ÝÚ[™Ù™ŠÙ[‹Ù\ÜÚ[Û—ÚYˆÝ‹]›Ü›NˆÝŠHOˆ›ÛÛ‚ˆˆˆ“X\šÈHÙ\ÜÚ[Ûˆ\È[™[™È[™Ù™ˆÈHÚ]™[ˆ]›Ü›K‚‚ˆ™]\›œÈYHYˆH›ÝÈØ\È›Ý[™[™›Ý[™XYH[ˆ›YÚÈ˜[ÙHY‚ˆHÙ\ÜÚ[Ûˆ\È[™XYH[ˆH›Û‹]\›Z[˜[[™Ù™ˆÝ]K‚ˆˆˆ‚ˆYˆÙÊÛÛ›ŠN‚ˆÝ\ˆHÛÛ›‹™^XÝ]Jˆ•TUHÙ\ÜÚ[ÛœÈ‚ˆ”ÑU[™Ù™—ÜÝ]HH	Ü[™[™ÉË‚ˆˆ[™Ù™—Ü]›Ü›HHË‚ˆˆ[™Ù™—Ù\œ›ÜˆH•S‚ˆ•ÒT‘HYHÈS‘
+[™Ù™—ÜÝ]HTÈ•S‚ˆˆÔˆ[™Ù™—ÜÝ]HSˆ
+	ØÛÛ\]Y	Ë	Ù˜Z[Y	ÊJH‹ˆ
+]›Ü›KÙ\ÜÚ[Û—ÚY
+Kˆ
+Bˆ™]\›ˆÝ\‹œ›ÝØÛÝ[ˆˆ™]\›ˆÙ[‹—Ù^XÝ]WÝÜš]JÙÊB‚ˆYˆÙ]Ú[™Ù™—ÜÝ]JÙ[‹Ù\ÜÚ[Û—ÚYˆÝŠHOˆÜ[Û˜[ÑXÝÜÝ‹[žWWN‚ˆˆˆ”™XYHÝ\œ™[[™Ù™ˆÝ]H›ÜˆHÙ\ÜÚ[Û‹‚‚ˆ™]\›œÈÈœÝ]H‹œ]›Ü›H‹™\œ›ÜˆŸXÜˆ›Û™HYˆHÙ\ÜÚ[Ûˆ\Âˆ›È[™Ù™ˆ™XÛÜ™‚ˆˆˆ‚ˆžN‚ˆÝ\ˆHÙ[‹—ØÛÛ›‹™^XÝ]Jˆ”ÑSPÕ[™Ù™—ÜÝ]K[™Ù™—Ü]›Ü›K[™Ù™—Ù\œ›Üˆ‚ˆ‘”“ÓHÙ\ÜÚ[ÛœÈÒT‘HYHÈ‹ˆ
+Ù\ÜÚ[Û—ÚY
+Kˆ
+Bˆ›ÝÈHÝ\‹™™]ÚÛ™J
+BˆYˆ›Ý›ÝÎ‚ˆ™]\›ˆ›Û™Bˆ™]\›ˆÂˆœÝ]HŽˆ›ÝÖÈš[™Ù™—ÜÝ]H—Kˆœ]›Ü›HŽˆ›ÝÖÈš[™Ù™—Ü]›Ü›H—Kˆ™\œ›ÜˆŽˆ›ÝÖÈš[™Ù™—Ù\œ›Üˆ—KˆBˆ^Ù\^Ù\[ÛŽ‚ˆ™]\›ˆ›Û™B‚ˆYˆ\ÝÜ[™[™×Ú[™Ù™œÊÙ[ŠHOˆ\ÝÑXÝÜÝ‹[žWWN‚ˆˆˆ”™]\›ˆ[Ù\ÜÚ[ÛœÈ[ˆ[™Ù™—ÜÝ]OIÜ[™[™ÉËÛ\Ýš\œÝ‚‚ˆ\ÙYžHHØ]]Ø^IÜÈ[™Ù™ˆØ]Ú\‹‚ˆˆˆ‚ˆžN‚ˆÝ\ˆHÙ[‹—ØÛÛ›‹™^XÝ]Jˆ”ÑSPÕËŠ‹‚ˆÓÐSTÐÑJÜœ›Û\ËœÞ\Ý[WÜ›Û\
+HTÈÜÞ\Ý[WÜ›Û\Ü™\ÛÛ™Y‚ˆ‘”“ÓHÙ\ÜÚ[ÛœÈÈ‚ˆ“Q•“ÒSˆÞ\Ý[WÜ›Û\ÈÜÓˆÜš\ÚHËœÞ\Ý[WÜ›Û\Ú\Ú‚ˆ•ÒT‘HËš[™Ù™—ÜÝ]HH	Ü[™[™ÉÈ‚ˆ“Ô‘Tˆ–HËœÝ\YØ]TÐÈ‚ˆ
+Bˆ™]\›ˆÜÙ[‹—ÜÙ\ÜÚ[Û—Ü›Ý×ÙXÝ
+ŠH›Üˆˆ[ˆÝ\‹™™]Ú[
+
+WBˆ^Ù\^Ù\[ÛŽ‚ˆ™]\›ˆ×B‚ˆYˆÛZ[WÚ[™Ù™ŠÙ[‹Ù\ÜÚ[Û—ÚYˆÝŠHOˆ›ÛÛ‚ˆˆˆ]ÛZXØ[H˜[œÚ][Ûˆ[™[™È8¡¤ˆ[›š[™Ëˆ™]\›œÈYHYˆÛZ[YYˆˆˆ‚ˆYˆÙÊÛÛ›ŠN‚ˆÝ\ˆHÛÛ›‹™^XÝ]Jˆ•TUHÙ\ÜÚ[ÛœÈÑU[™Ù™—ÜÝ]HH	Ü[›š[™ÉÈ‚ˆ•ÒT‘HYHÈS‘[™Ù™—ÜÝ]HH	Ü[™[™ÉÈ‹ˆ
+Ù\ÜÚ[Û—ÚY
+Kˆ
+Bˆ™]\›ˆÝ\‹œ›ÝØÛÝ[ˆˆ™]\›ˆÙ[‹—Ù^XÝ]WÝÜš]JÙÊB‚ˆYˆÛÛ\]WÚ[™Ù™ŠÙ[‹Ù\ÜÚ[Û—ÚYˆÝŠHOˆ›Û™N‚ˆˆˆ“X\šÈH[™Ù™ˆ\ÈÛÛ\]Yˆˆˆ‚ˆYˆÙÊÛÛ›ŠN‚ˆÛÛ›‹™^XÝ]Jˆ•TUHÙ\ÜÚ[ÛœÈÑU[™Ù™—ÜÝ]HH	ØÛÛ\]Y	Ë‚ˆš[™Ù™—Ù\œ›ÜˆH•SÒT‘HYHÈ‹ˆ
+Ù\ÜÚ[Û—ÚY
+Kˆ
+BˆÙ[‹—Ù^XÝ]WÝÜš]JÙÊB‚ˆYˆ˜Z[Ú[™Ù™ŠÙ[‹Ù\ÜÚ[Û—ÚYˆÝ‹\œ›ÜŽˆÝŠHOˆ›Û™N‚ˆˆˆ“X\šÈH[™Ù™ˆ\È˜Z[Y[™™XÛÜ™H™X\ÛÛ‹ˆˆˆ‚ˆYˆÙÊÛÛ›ŠN‚ˆÛÛ›‹™^XÝ]Jˆ•TUHÙ\ÜÚ[ÛœÈÑU[™Ù™—ÜÝ]HH	Ù˜Z[Y	Ë‚ˆš[™Ù™—Ù\œ›ÜˆHÈÒT‘HYHÈ‹ˆ
+\œ›Ü–ÎLKÙ\ÜÚ[Û—ÚY
+Kˆ
+BˆÙ[‹—Ù^XÝ]WÝÜš]JÙÊB‚‚˜Û\ÜÈ\Þ[˜ÔÙ\ÜÚ[Û‘Ž‚ˆˆˆ\Þ[˜ÈÛÜˆÛÈÙ\ÜÚ[Û‘Žˆ]™\žHØ[[œÈšXH\Þ[˜Ú[Ë×Ý™XYÛÈH›ØÚÚ[™ÈÔS]HØ[ˆ™]™\ˆœ™Y^™\ÈH]™[ÛÜ
+›ÈY]Ù™]\›œÈH]™HÝ\œÛÜŠKˆˆˆ‚‚ˆYˆ×Ú[š]×ÊÙ[‹Žˆ”Ù\ÜÚ[Û‘ˆŠHOˆ›Û™N‚ˆÙ[‹—ÙˆH‚‚ˆYˆ×ÙÙ]]—×ÊÙ[‹˜[YNˆÝŠN‚ˆ]ˆHÙ]]ŠÙ[‹—Ù‹˜[YJBˆYˆ›ÝØ[X›J]ŠN‚ˆ™]\›ˆ]‚ˆ\Þ[˜ÈYˆÛÙ™›ØYY
+
+˜\™ÜË
+ŠšÝØ\™ÜÊN‚ˆ™]\›ˆ]ØZ]\Þ[˜Ú[Ë×Ý™XY
+]‹
+˜\™ÜË
+ŠšÝØ\™ÜÊBˆ™]\›ˆÛÙ™›ØYY‚‚ˆÈKKKH‘QÒSˆQÒS‹PÓÓTU
+™]™\\ØÚY[YÈÙYHÓÓTUÓPS’Q‘TÕ›Y
+HKKKBˆÈ˜[Y\È^\›˜[YÚ[œÈ[\ÜYœ›ÛH\È[Ù[H™Y›Ü™HHÙ\ŒˆXÛÛ\ÜÚ][Û‹‚ˆÈ[\›˜[ÛÙHUTÕ“Õ\ÙH\ÙH
+ØÜš\ËØÚXÚ×ØÛÛ\]ÜÚ[\œËœH˜Z[ÈÒHYˆ]Ù\ÊK‚ˆÈHÚÛH›ØÚÈ\È™[[Ý™YžH™]™\[™ÈHÛÛ[Z]]YY]‚™œ›ÛH\[™È[\ÜÙ]È›ÜXNˆKM‚š[\ÜÛÛ^XˆÈ›ÜXNˆKM‚š[\Ü\œ››ÈÈ›ÜXNˆKM‚š[\ÜÝXÝÈ›ÜXNˆKM‚š[\ÜÙXZÜ™YˆÈ›ÜXNˆKM‚‚“PVÔÐQ‘WÑVÔ•ÓQTÔÐQÑTÈHŒÌ‚“PVÔÐQ‘WÔ‘TÕSQWÓQTÔÐQÑTÈHŒÌ‚‚—ÔQÒS—ÐÓÓTUÓV–HHÂˆ	ÐUU×ÕPÕUSWÓRS—Ñ”‘QSTÕÔUSÉÎˆ
+	Ú\›Y\×ÜÝ]WØÛÛ[[Û‰Ë	ÐUU×ÕPÕUSWÓRS—Ñ”‘QSTÕÔUSÉÊKˆ	ÐXÝ]š]T›Ý™[˜[˜ÙIÎˆ
+	ØYÙ[œÙ\ÜÚ[Û—ØXÝ]š]IË	ÐXÝ]š]T›Ý™[˜[˜ÙIÊKˆ	ÐÛÛ\™\ÜÚ[Û”Ù\ÜÚ[Û\ÞQ\œ›Ü‰Îˆ
+	Ú\›Y\×ÜÝ]WÙ\œ›ÜœÉË	ÐÛÛ\™\ÜÚ[Û”Ù\ÜÚ[Û\ÞQ\œ›Ü‰ÊKˆ	ÐÛÛ\™\ÜÚ[Û”Ù\ÜÚ[ÛÛÜÙY\œ›Ü‰Îˆ
+	Ú\›Y\×ÜÝ]WÙ\œ›ÜœÉË	ÐÛÛ\™\ÜÚ[Û”Ù\ÜÚ[ÛÛÜÙY\œ›Ü‰ÊKˆ	ÑQ‘T”‘QÒS‘VÔÔS	Îˆ
+	Ú\›Y\×ÜÝ]WØÛÛ[[Û‰Ë	ÑQ‘T”‘QÒS‘VÔÔS	ÊKˆ	Ñ•×ÐÒ’×ÔÕSWÒÑVIÎˆ
+	Ú\›Y\×ÜÝ]WØÛÛ[[Û‰Ë	Ñ•×ÐÒ’×ÔÕSWÒÑVIÊKˆ	Ñ•×ÐÒ’×ÕP“WÔÔS	Îˆ
+	Ú\›Y\×ÜÝ]WÙÉË	Ñ•×ÐÒ’×ÕP“WÔÔS	ÊKˆ	Ñ•×ÐÒ’×Õ’QÑÑT—ÔÔS	Îˆ
+	Ú\›Y\×ÜÝ]WÙÉË	Ñ•×ÐÒ’×Õ’QÑÑT—ÔÔS	ÊKˆ	Ñ•×Ô‘P•RSÑQ‘T”SÒÑVIÎˆ
+	Ú\›Y\×ÜÝ]WØÛÛ[[Û‰Ë	Ñ•×Ô‘P•RSÑQ‘T”SÒÑVIÊKˆ	Ñ•×ÔÔS	Îˆ
+	Ú\›Y\×ÜÝ]WØÛÛ[[Û‰Ë	Ñ•×ÔÔS	ÊKˆ	Ñ•×ÔÕSWÒÑVIÎˆ
+	Ú\›Y\×ÜÝ]WØÛÛ[[Û‰Ë	Ñ•×ÔÕSWÒÑVIÊKˆ	Ñ•×ÔÕÔQÑWÕ‘T”ÒSÓ‰Îˆ
+	Ú\›Y\×ÜÝ]WØÛÛ[[Û‰Ë	Ñ•×ÔÕÔQÑWÕ‘T”ÒSÓ‰ÊKˆ	Ñ•×Õ’QÔSWÔÔS	Îˆ
+	Ú\›Y\×ÜÝ]WØÛÛ[[Û‰Ë	Ñ•×Õ’QÔSWÔÔS	ÊKˆ	ÓQÐPÖWÑ•×ÔÔS	Îˆ
+	Ú\›Y\×ÜÝ]WØÛÛ[[Û‰Ë	ÓQÐPÖWÑ•×ÔÔS	ÊKˆ	ÓQÐPÖWÑ•×Õ’QÔSWÔÔS	Îˆ
+	Ú\›Y\×ÜÝ]WØÛÛ[[Û‰Ë	ÓQÐPÖWÑ•×Õ’QÔSWÔÔS	ÊKˆ	ÓPVÑ•ÍWÔUQT–WÐÒT”ÉÎˆ
+	Ú\›Y\×ÜÝ]WØÛÛ[[Û‰Ë	ÓPVÑ•ÍWÔUQT–WÐÒT”ÉÊKˆ	ÔT”ÒTÕSÑWÑT”“Ô—ÐÐUTÑTÉÎˆ
+	Ú\›Y\×ÜÝ]WÙ\œ›ÜœÉË	ÔT”ÒTÕSÑWÑT”“Ô—ÐÐUTÑTÉÊKˆ	ÔÐÒSPWÔÔS	Îˆ
+	Ú\›Y\×ÜÝ]WØÛÛ[[Û‰Ë	ÔÐÒSPWÔÔS	ÊKˆ	ÔÐÒSPWÕ‘T”ÒSÓ‰Îˆ
+	Ú\›Y\×ÜÝ]WØÛÛ[[Û‰Ë	ÔÐÒSPWÕ‘T”ÒSÓ‰ÊKˆ	ÔÑTÔÒSÓ—ÔÕUT×ÐÓÓTUIÎˆ
+	Ú\›Y\×ÜÝ]WÜÙ\ÜÚ[ÛœÉË	ÔÑTÔÒSÓ—ÔÕUT×ÐÓÓTUIÊKˆ	ÔÑTÔÒSÓ—ÔÕUT×ÑSTIÎˆ
+	Ú\›Y\×ÜÝ]WÜÙ\ÜÚ[ÛœÉË	ÔÑTÔÒSÓ—ÔÕUT×ÑSTIÊKˆ	ÔÑTÔÒSÓ—ÔÕUT×ÑT”“Ô‰Îˆ
+	Ú\›Y\×ÜÝ]WÜÙ\ÜÚ[ÛœÉË	ÔÑTÔÒSÓ—ÔÕUT×ÑT”“Ô‰ÊKˆ	ÔÑTÔÒSÓ—ÔÕUT×ÒS•T”•TQ	Îˆ
+	Ú\›Y\×ÜÝ]WÜÙ\ÜÚ[ÛœÉË	ÔÑTÔÒSÓ—ÔÕUT×ÒS•T”•TQ	ÊKˆ	ÔÒÒSÑVÑT”Ò“ÒS•	Îˆ
+	ØYÙ[œÚÚ[ØÛÛ[X[™ÉË	ÔÒÒSÑVÑT”Ò“ÒS•	ÊKˆ	ÔÒÒSÔÐÐQ‘“ÓÔÔSÓRÑIÎˆ
+	ØYÙ[œÚÚ[ØÛÛ[X[™ÉË	ÔÒÒSÔÐÐQ‘“ÓÔÔSÓRÑIÊKˆ	ÔÙ\ÜÚ[Û•\›“X\ÙSÜÝ\œ›Ü‰Îˆ
+	Ú\›Y\×ÜÝ]WÙ\œ›ÜœÉË	ÔÙ\ÜÚ[Û•\›“X\ÙSÜÝ\œ›Ü‰ÊKˆ	ÕØ[[œÝ\ÜY\œ›Ü‰Îˆ
+	Ú\›Y\×ÜÝ]WÝØ[	Ë	ÕØ[[œÝ\ÜY\œ›Ü‰ÊKˆ	Ø\WÙ\˜Xš[]WØ˜\œšY\œÉÎˆ
+	Ú\›Y\×ÜÝ]WÜ™\Z\‰Ë	Ø\WÙ\˜Xš[]WØ˜\œšY\œÉÊKˆ	ØÛ\ÜÚYžWÜÙ\ÜÚ[Û—ÜÝ]\ÉÎˆ
+	Ú\›Y\×ÜÝ]WÜÙ\ÜÚ[ÛœÉË	ØÛ\ÜÚYžWÜÙ\ÜÚ[Û—ÜÝ]\ÉÊKˆ	ØÛÛXÝÜÝ]WÙ—ÜÝ]ÉÎˆ
+	Ú\›Y\×ÜÝ]WÙ™š[IË	ØÛÛXÝÜÝ]WÙ—ÜÝ]ÉÊKˆ	ØÛÝ[Ù—ÚÛ\œÉÎˆ
+	Ú\›Y\×ÜÝ]WÙ™š[IË	ØÛÝ[Ù—ÚÛ\œÉÊKˆ	Ù\ØÜšX™WÜÚÚ[Ú[›ØØ][Û‰Îˆ
+	ØYÙ[œÚÚ[ØÛÛ[X[™ÉË	Ù\ØÜšX™WÜÚÚ[Ú[›ØØ][Û‰ÊKˆ	ÙÍWØÚš×ÜÛ×Ü]	Îˆ
+	Ú\›Y\×ÜÝ]WÙÉË	ÙÍWØÚš×ÜÛ×Ü]	ÊKˆ	Ú\×ØYš\ÛÜžWÛØÚ×ØÛÛ[[Û‰Îˆ
+	Ú\›Y\×ÜÝ]WØÛÛ[[Û‰Ë	Ú\×ØYš\ÛÜžWÛØÚ×ØÛÛ[[Û‰ÊKˆ	Ú\×Ø]]ÛX]X×Ù[™Ü™X\ÛÛ‰Îˆ
+	Ú\›Y\×ÜÝ]WØÛÛ[[Û‰Ë	Ú\×Ø]]ÛX]X×Ù[™Ü™X\ÛÛ‰ÊKˆ	Ú\×Ù\Ú×Ù[Ù\œ›Ü‰Îˆ
+	Ú\›Y\×ÜÝ]WÙ\œ›ÜœÉË	Ú\×Ù\Ú×Ù[Ù\œ›Ü‰ÊKˆ	Ú\×ÜÜ[]WÝØ[Ü™\Ù]Ý[™\˜X›IÎˆ
+	Ú\›Y\×ÜÝ]WÝØ[	Ë	Ú\×ÜÜ[]WÝØ[Ü™\Ù]Ý[™\˜X›IÊKˆ	Ú\×Ý˜[œÚY[ÜÜ[]WÙ\œ›Ü‰Îˆ
+	Ú\›Y\×ÜÝ]WÙ\œ›ÜœÉË	Ú\×Ý˜[œÚY[ÜÜ[]WÙ\œ›Ü‰ÊKˆ	Ú]\—Ù[]YÜÜ[]WÜÚYXØ\—ÚÛ\œÉÎˆ
+	Ú\›Y\×ÜÝ]WÙ™š[IË	Ú]\—Ù[]YÜÜ[]WÜÚYXØ\—ÚÛ\œÉÊKˆ	Ü™[X\ÙWÛÜ—ØÛÜÙIÎˆ
+	Ú\›Y\×ÜÝ]WÜ™YÚ\ÝžIË	Ü™[X\ÙWÛÜ—ØÛÜÙIÊKˆ	Ü™\ÜÜÝ\\Ü›ÙÜ™\ÜÉÎˆ
+	Ú\›Y\×ÜÝ\\ÝØ]ÚÙÉË	Ü™\ÜÜÝ\\Ü›ÙÜ™\ÜÉÊKˆ	Ü™\ÛÛ™WÚ›Ý\›˜[Û[ÙIÎˆ
+	Ú\›Y\×ÜÝ]WÝØ[	Ë	Ü™\ÛÛ™WÚ›Ý\›˜[Û[ÙIÊKˆ	Ü™\ÛÛ™WÜÞ[˜Ú›Û›Ý\×Û]™[	Îˆ
+	Ú\›Y\×ÜÝ]WÝØ[	Ë	Ü™\ÛÛ™WÜÞ[˜Ú›Û›Ý\×Û]™[	ÊKˆ	ÜØ[š]^™WØÛÛ^	Îˆ
+	ØYÙ[›Y[[ÜžWÛX[˜YÙ\‰Ë	ÜØ[š]^™WØÛÛ^	ÊKˆ	ÜÜ[]WÜÛÝ\˜ÙWÚY	Îˆ
+	Ú\›Y\×ÜÝ]WÝØ[	Ë	ÜÜ[]WÜÛÝ\˜ÙWÚY	ÊKˆ	ÝÛÜšÜÜXÙWÚÙ^IÎˆ
+	Ú\›Y\×ÜÝ]WÜÙ\ÜÚ[ÛœÉË	ÝÛÜšÜÜXÙWÚÙ^IÊKŸB‚‚™Yˆ×ÙÙ]]—×Ê˜[YJNˆÈTMŒˆ8 %^žHÛÈ›È[\ÜÞXÛ\Âˆ\™Ù]HÔQÒS—ÐÓÓTUÓV–K™Ù]
+˜[YJBˆYˆ\™Ù]\È›Û™N‚ˆ˜Z\ÙH]šX]Q\œ›ÜŠˆ›[Ù[H××Û˜[YW×È\ŸH\È›È]šX]HÛ˜[YH\ŸHŠBˆ[\Ü[\ÜX‚ˆœ›ÛH\›Y\×ØÛKœYÚ[—ØÛÛ\][\ÜØ\›—ÛÛ˜ÙBˆØ\›—ÛÛ˜ÙJ×Û˜[YW×Ë˜[YK
+\™Ù]
+Bˆ™]\›ˆÙ]]Š[\ÜX‹š[\ÜÛ[Ù[J\™Ù]ÌJK\™Ù]ÌWJBˆÈKKKHS‘QÒS‹PÓÓTUKKKB

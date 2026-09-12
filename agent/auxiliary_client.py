@@ -1,7507 +1,2895 @@
-"""Shared auxiliary client router for side tasks (compression, search, vision, ...).
-
-Text auto chain: main provider+model â†’ OpenRouter â†’ Nous Portal â†’ custom endpoint â†’
-native Anthropic â†’ direct API-key providers â†’ None. Vision auto chain: main
-provider (if a supported vision backend) â†’ OpenRouter â†’ Nous â†’ Anthropic â†’ custom.
-``auxiliary.free_only`` restricts the OpenRouter lane to ``:free`` SKUs. Codex OAuth is
-in neither chain (undocumented, shifting allow-list): main provider or explicit
-``auxiliary.<task>.provider`` only. HTTP 402 in call_llm() falls through the chain.
-"""
-
-import contextlib
-import contextvars
-import functools
-import hashlib
-import inspect
-import json
-import logging
-import os
-import re
-import threading
-import time
-import uuid
-from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, TYPE_CHECKING
-from urllib.parse import urlparse, parse_qs, urlunparse
-
-from agent.codex_headers import (
-    CODEX_AUX_BASE_URL as _CODEX_AUX_BASE_URL,
-    apply_required_codex_headers as _apply_required_codex_headers,
-    codex_cloudflare_headers as _codex_cloudflare_headers,
-    is_official_codex_base_url as _is_official_codex_base_url,
-)
-from agent.codex_runtime import _codex_event_has_content
-
-# `openai.OpenAI` is imported lazily (~240 ms cold); `OpenAI` below is a proxy
-# so in-module calls, `auxiliary_client.OpenAI` reads and
-# `patch("agent.auxiliary_client.OpenAI")` all keep working.
-if TYPE_CHECKING:
-    from openai import OpenAI  # noqa: F401 â€” type hints only
-
-_OPENAI_CLS_CACHE: Optional[type] = None
-
-
-def _load_openai_cls() -> type:
-    """Import and cache ``openai.OpenAI``."""
-    global _OPENAI_CLS_CACHE
-    if _OPENAI_CLS_CACHE is None:
-        from openai import OpenAI as _cls
-        _OPENAI_CLS_CACHE = _cls
-    return _OPENAI_CLS_CACHE
-
-
-class _OpenAIProxy:
-    """Lazy stand-in for ``openai.OpenAI``: forwards calls and isinstance checks, importing on first use."""
-    __slots__ = ()
-
-    def __call__(self, *args, **kwargs):
-        return _load_openai_cls()(*args, **kwargs)
-
-    def __instancecheck__(self, obj):
-        return isinstance(obj, _load_openai_cls())
-
-    def __repr__(self):
-        return "<lazy openai.OpenAI proxy>"
-
-
-OpenAI = _OpenAIProxy()
-
-
-# Availability probe mode: check_fns only need to know whether a client is RESOLVABLE, so
-# inside `aux_probe_mode()` constructors return a stub instead of importing openai + building
-# httpx/SSL (~0.3s on CLI startup). Stubs are never cached (see _store_cached_client).
-_aux_probe_state = threading.local()
-
-
-class _AuxProbeClientStub:
-    """Non-functional placeholder returned while `aux_probe_mode` is active."""
-    __slots__ = ("api_key", "base_url")
-
-    def __init__(self, api_key: str = "", base_url: str = "") -> None:
-        self.api_key = api_key
-        self.base_url = base_url
-
-    def __getattr__(self, name: str) -> Any:
-        # Loud failure if a probe stub ever leaks into a runtime call path.
-        raise RuntimeError(
-            f"_AuxProbeClientStub used as a real client (attribute {name!r}); "
-            "aux_probe_mode is for availability checks only")
-
-    def __repr__(self) -> str:
-        return "<aux availability-probe client stub>"
-
-
-def _aux_probe_active() -> bool:
-    return bool(getattr(_aux_probe_state, "active", False))
-
-
-@contextlib.contextmanager
-def aux_probe_mode():
-    """Resolve provider availability without constructing real SDK clients."""
-    prev = getattr(_aux_probe_state, "active", False)
-    _aux_probe_state.active = True
-    try:
-        yield
-    finally:
-        _aux_probe_state.active = prev
-
-
-from agent.credential_pool import load_pool
-from agent.model_metadata import (
-    MINIMUM_CONTEXT_LENGTH, get_model_context_length,
-    strip_codex_context_variant_suffix as _strip_codex_ctx_variant,
-)
-from hermes_cli.config import get_hermes_home
-from agent.auxiliary_health import _custom_health_base_url, _unhealthy_cache_key
-from hermes_constants import OPENROUTER_BASE_URL
-from utils import base_url_host_matches, base_url_hostname, env_float, is_truthy_value, model_forces_max_completion_tokens, normalize_proxy_env_vars
-
-logger = logging.getLogger(__name__)
-
-
-# resolve_provider_client fall-through dedup: misconfigured-provider warnings fire on every
-# retry, so only the first per process surfaces. Separate sets let tests clear each branch.
-_LOGGED_UNKNOWN_PROVIDER_KEYS: set = set()
-_LOGGED_UNHANDLED_AUTHTYPE_KEYS: set = set()
-_LOGGED_UNSUPPORTED_EXTPROC_KEYS: set = set()
-_LOGGED_UNSUPPORTED_OAUTH_KEYS: set = set()
-
-
-def _resolve_aux_verify(base_url: Optional[str]) -> Any:
-    """httpx ``verify`` for an aux base_url, mirroring the main client (per-provider ``ssl_ca_cert`` /
-    ``ssl_verify``, ``HERMES_CA_BUNDLE`` / ``SSL_CERT_FILE``); any failure â†’ httpx default (``True``)."""
-    try:
-        from agent.ssl_verify import resolve_httpx_verify
-        from hermes_cli.config import get_custom_provider_tls_settings, load_config_readonly
-        tls = get_custom_provider_tls_settings(str(base_url or ""), config=load_config_readonly())
-        return resolve_httpx_verify(
-            ca_bundle=tls.get("ssl_ca_cert"), ssl_verify=tls.get("ssl_verify"), base_url=str(base_url or ""))
-    except Exception:
-        return True
-
-
-_WARNED_KEEPALIVE_IMPORT_SKEW = False
-
-
-def _openai_http_client_kwargs(base_url: Optional[str], *, async_mode: bool = False) -> Dict[str, Any]:
-    """Inject keepalive httpx client with env-only proxy (not macOS system proxy)."""
-    try:
-        from agent.process_bootstrap import build_keepalive_http_client
-        client = build_keepalive_http_client(
-            str(base_url or ""), async_mode=async_mode, verify=_resolve_aux_verify(base_url))
-    except (ImportError, AttributeError):
-        # Version-skewed install (Desktop runtime lagging a git tree) lacks this helper:
-        # degrade to the SDK default httpx client rather than kill the job; warn once.
-        global _WARNED_KEEPALIVE_IMPORT_SKEW
-        if not _WARNED_KEEPALIVE_IMPORT_SKEW:
-            _WARNED_KEEPALIVE_IMPORT_SKEW = True
-            logger.warning(
-                "agent.process_bootstrap.build_keepalive_http_client is "
-                "unavailable â€” mixed/stale install detected (#64333). Falling "
-                "back to the SDK default HTTP client. Run `hermes update` (or "
-                "reinstall the Desktop app) to resync the runtime.")
-        client = None
-    return {"http_client": client} if client is not None else {}
-
-
-def _create_openai_client(*, api_key: str, base_url: str, **kwargs: Any) -> Any:
-    if _aux_probe_active():
-        # Availability probe: resolved credentials/base_url are the answer.
-        return _AuxProbeClientStub(api_key=api_key, base_url=base_url)
-    kwargs = {**_openai_http_client_kwargs(base_url), **kwargs}
-    # OpenCode Zen free tier: the keyless placeholder must never hit the wire (relay 401s any
-    # unrecognized bearer) â€” blank the Authorization header.
-    with contextlib.suppress(Exception):
-        from hermes_cli.models import OPENCODE_ZEN_FREE_KEYLESS_PLACEHOLDER, opencode_zen_free_headers
-        if api_key == OPENCODE_ZEN_FREE_KEYLESS_PLACEHOLDER:
-            kwargs["default_headers"] = {**(kwargs.get("default_headers") or {}), **opencode_zen_free_headers()}
-    _apply_required_codex_headers(kwargs, access_token=api_key, base_url=base_url)
-    # Hermes owns aux retry/fallback policy; the SDK default (max_retries=2) would triple
-    # wall time on a hung endpoint before Hermes sees one failure.
-    # Hermes owns auxiliary retry + provider/model fallback policy (the same-provider transient retry in
-    # call_llm plus the except-chain fallback). The OpenAI SDK's own default (max_retries=2 â†’ up to 3
-    # attempts) silently multiplies the effective wall time of every aux call by 3Ã— on a slow/hung endpoint,
-    # so a 120s timeout can stall ~360s before Hermes sees a single failure (issue #54465). Disable
-    # SDK-internal retries by default and let Hermes control the budget; explicit callers can still override
-    # via kwargs.
-    kwargs.setdefault("max_retries", 0)
-    return OpenAI(api_key=api_key, base_url=base_url, **kwargs)
-
-
-# Interrupt protection for atomic aux tasks: a compression summary killed by an ordinary
-# gateway interrupt degrades to a static marker, so a thread-local flag marks such calls
-# protected. Explicit host cancel (Ctrl+C, /stop) still overrides it, timeouts still fire.
-# â”€â”€ Interrupt protection for atomic auxiliary tasks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Some auxiliary tasks must NOT be
-# aborted mid-flight by a gateway interrupt (e.g. an incoming user message while the agent is busy). Context
-# compression is the prime case: if the summary LLM call is interrupted part-way, compression falls back to
-# a static "summary unavailable" marker and the real handoff is lost (#23975). A thread-local flag lets such
-# a task mark its in-flight LLM call as interrupt-protected; the Codex Responses stream's cancellation check
-# honors it. TIMEOUTS still fire (a hung call must die), and all OTHER aux tasks (vision, web_extract,
-# title_generation, â€¦) remain freely interruptible.
-_aux_interrupt_protection = threading.local()
-
-
-class AuxiliaryExplicitCancellation(BaseException):
-    """Frozen signal that an auxiliary attempt was explicitly hard-cancelled. ``BaseException`` so broad
-    ``except Exception`` retry/fallback code never treats a host stop as a transport failure; ``cause``
-    is immutable class data so nothing re-queries a mutable host Event after the transport unwound."""
-    cause = "explicit_host_cancel"
-
-    def __init__(self) -> None:
-        super().__init__("auxiliary request explicitly cancelled by host")
-
-
-def _aux_interrupt_protected() -> bool:
-    return bool(getattr(_aux_interrupt_protection, "active", False))
-
-
-def _aux_interrupt_cancel_requested() -> bool:
-    """Return whether an explicit host cancel overrides aux protection."""
-    check = _capture_aux_cancel_check()
-    return _captured_aux_cancel_requested(check) if check is not None else False
-
-
-@contextlib.contextmanager
-def aux_interrupt_protection(active: bool = True, cancel_check=None, cancel_event=None):
-    """Mark this thread's aux LLM call interrupt-protected (re-entrant-safe). ``cancel_check`` /
-    ``cancel_event`` keep an explicit host hard-cancel path (Event preferred); nested scopes inherit both."""
-    prev = getattr(_aux_interrupt_protection, "active", False)
-    prev_cancel_check = getattr(_aux_interrupt_protection, "cancel_check", None)
-    prev_cancel_event = getattr(_aux_interrupt_protection, "cancel_event", None)
-    _aux_interrupt_protection.active = active
-    if callable(cancel_check):
-        _aux_interrupt_protection.cancel_check = cancel_check
-    if cancel_event is not None and callable(getattr(cancel_event, "is_set", None)):
-        _aux_interrupt_protection.cancel_event = cancel_event
-    try:
-        yield
-    finally:
-        _aux_interrupt_protection.active = prev
-        _aux_interrupt_protection.cancel_check = prev_cancel_check
-        _aux_interrupt_protection.cancel_event = prev_cancel_event
-
-
-def _capture_aux_cancel_check() -> Optional[Callable[[], Any]]:
-    """Capture the current explicit-cancel source on the owning request thread."""
-    is_set = getattr(getattr(_aux_interrupt_protection, "cancel_event", None), "is_set", None)
-    if callable(is_set):
-        return is_set
-    # Return the callable itself so attempt-local decision objects keep begin_timeout_cleanup().
-    check = getattr(_aux_interrupt_protection, "cancel_check", None)
-    return check if callable(check) else None
-
-
-def _captured_aux_cancel_requested(cancel_check: Callable[[], Any]) -> bool:
-    """Read a request-thread cancellation source without leaking its failures."""
-    try:
-        return bool(cancel_check())
-    except Exception:
-        logger.debug("captured aux cancel check failed", exc_info=True)
-        return False
-
-
-class _AuxiliaryCancellationDecision:
-    """Atomically choose explicit cancellation or provider timeout per attempt."""
-
-    def __init__(self, source_cancel_check: Callable[[], Any]) -> None:
-        self._source_cancel_check = source_cancel_check
-        self._lock = threading.Lock()
-        self._outcome = "active"
-
-    def __call__(self) -> bool:
-        with self._lock:
-            if self._outcome == "active" and _captured_aux_cancel_requested(self._source_cancel_check):
-                self._outcome = "cancelled"
-            return self._outcome == "cancelled"
-
-    def begin_timeout_cleanup(self) -> bool:
-        """Return whether timeout won and destructive cleanup is permitted."""
-        with self._lock:
-            if self._outcome == "active":
-                cancelled = _captured_aux_cancel_requested(self._source_cancel_check)
-                self._outcome = "cancelled" if cancelled else "timed_out"
-            return self._outcome == "timed_out"
-
-
-# Forward-progress hooks for streamed aux calls: a fixed host deadline kills a SLOW model
-# streaming a big summary as hard as a HUNG one, so wire consumers tick the progress hook only
-# for non-empty payloads and the host extends its deadline while tokens move. Thread-local:
-# the call and its stream consumption run on the installing thread.
-_aux_progress = threading.local()
-_aux_dispatch = threading.local()
-_aux_provider_response = threading.local()
-# Absolute monotonic deadline of the waiting HOST. The stream's own ceiling
-# (_aux_stream_total_ceiling, >= the host's and started later) would otherwise leave an
-# orphaned stream still billing after every host-ceiling timeout.
-# Absolute wall-clock deadline (time.monotonic) of the HOST waiting for this auxiliary call, when it has one
-# (#99692). Liveness alone is not enough: a host also stops waiting at its own total ceiling, and the
-# streamed consumer below bounds itself only by _aux_stream_total_ceiling() â€” a budget derived from the aux
-# request timeout, which is >= the host ceiling for every configured value AND starts counting later. So the
-# stream that outlives its abandoned host is not an edge case; it is the guaranteed outcome of every
-# total-ceiling timeout.
-_aux_stream_deadline = threading.local()
-
-
-def _tick_hook(local: threading.local, label: str) -> None:
-    """Call the thread-local hook installed on ``local``, if any. Never raises."""
-    hook = getattr(local, "hook", None)
-    if hook is None:
-        return
-    try:
-        hook()
-    except Exception:
-        logger.debug("aux %s hook failed", label, exc_info=True)
-
-
-def _notify_aux_progress() -> None:
-    """Tick the installed forward-progress hook, if any."""
-    _tick_hook(_aux_progress, "progress")
-
-
-def _notify_aux_dispatch() -> None:
-    """Record an actual provider dispatch without claiming response progress."""
-    _tick_hook(_aux_dispatch, "dispatch")
-
-
-def _notify_aux_timing_response() -> None:
-    """Record a content-free frame (keepalive/empty delta): counts toward
-    ``time_to_first_progress_ms`` but must not reset a compression inactivity fence."""
-    _tick_hook(_aux_provider_response, "provider response")
-
-
-def _notify_aux_provider_response() -> None:
-    """Record a provider response/chunk, then preserve the liveness signal."""
-    _notify_aux_timing_response()
-    _notify_aux_progress()
-
-
-def _aux_progress_active() -> bool:
-    return getattr(_aux_progress, "hook", None) is not None
-
-
-def _field(obj: Any, key: str, default: Any = None) -> Any:
-    """Field access for wire objects that may be dicts or SDK/SimpleNamespace objects."""
-    val = obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
-    return default if val is None else val
-
-
-def _anthropic_event_has_content(event: Any) -> bool:
-    """Whether an Anthropic stream event carries a non-empty payload."""
-    event_type = _field(event, "type")
-    if event_type == "content_block_delta":
-        delta = _field(event, "delta")
-        return any(bool(_field(delta, f)) for f in ("text", "thinking", "partial_json", "signature", "citation"))
-    if event_type == "content_block_start":
-        block = _field(event, "content_block")
-        return _field(block, "type") == "tool_use" and any(bool(_field(block, f)) for f in ("id", "name"))
-    return False
-
-
-def _anthropic_aux_stream_event_hook() -> Callable[[Any], None]:
-    """Per-event callback for the Anthropic aux wire: progress only for substantive payloads
-    (keepalives must not keep a stalled summary alive), stop at the host deadline or explicit
-    cancel. The ``TimeoutError`` text must say "timed out" so ``_is_timeout_error`` classifies it."""
-    host_deadline = _current_aux_stream_deadline()
-    started = time.monotonic()
-
-    def _on_event(event: Any) -> None:
-        if _anthropic_event_has_content(event):
-            _notify_aux_provider_response()
-        else:
-            _notify_aux_timing_response()
-        if _aux_interrupt_cancel_requested():
-            raise AuxiliaryExplicitCancellation()
-        if host_deadline is not None and time.monotonic() >= host_deadline:
-            raise TimeoutError(
-                "Anthropic auxiliary stream timed out at the host compression "
-                f"deadline after {time.monotonic() - started:.0f}s (the caller already stopped waiting)")
-
-    return _on_event
-
-
-# A dead stream fails at the no-progress window (first token AND between tokens); a live
-# stream re-arms per event, bounded by _aux_stream_total_ceiling().
-_AUX_STREAM_NO_PROGRESS_TIMEOUT_SECONDS = 60.0
-
-
-@contextlib.contextmanager
-def _aux_thread_local_hook(local: threading.local, hook):
-    """Install one thread-local hook, restoring the prior on exit (non-callable = passthrough)."""
-    previous = getattr(local, "hook", None)
-    local.hook = hook if callable(hook) else previous
-    try:
-        yield
-    finally:
-        local.hook = previous
-
-
-@contextlib.contextmanager
-def aux_progress_hook(hook):
-    """Install *hook* as the current thread's aux forward-progress callback (None = passthrough)."""
-    with _aux_thread_local_hook(_aux_progress, hook):
-        yield
-
-
-def _current_aux_stream_deadline() -> Optional[float]:
-    """The waiting host's absolute monotonic deadline, if one is installed."""
-    return getattr(_aux_stream_deadline, "value", None)
-
-
-@contextlib.contextmanager
-def aux_stream_deadline(deadline: Optional[float]):
-    """Publish the host's absolute ``time.monotonic()`` deadline to the stream consumer.
-
-    ``None`` is a passthrough; re-entrant-safe. Host->worker return leg of the progress hook:
-    without it the isolated provider daemon streams to its own ceiling after the host stopped
-    waiting, billing a summary the commit fence refuses.
-
-    ``8207862212`` releases the compression OWNER when the fence is cancelled, but the isolated provider
-    daemon (:func:`_run_protected_sync_provider_call`) that holds the socket keeps streaming to its own
-    ``_aux_stream_total_ceiling`` budget â€” >= the host's ceiling by construction â€” billing an abandoned
-    summary the commit fence is already guaranteed to refuse, and stacking one fresh orphan per turn on a
-    session that compression never managed to shrink. See #99692.
-    """
-    previous = getattr(_aux_stream_deadline, "value", None)
-    _aux_stream_deadline.value = deadline if isinstance(deadline, (int, float)) else previous
-    try:
-        yield
-    finally:
-        _aux_stream_deadline.value = previous
-
-
-def _run_protected_sync_provider_call(callback: Callable[[dict[str, Any]], Any], kwargs: dict[str, Any]) -> Any:
-    """Run one protected provider callback in an attempt-isolated daemon thread.
-
-    Aux clients are process-shared and cannot be closed to wake one request, so the callback (incl.
-    stream aggregation) runs in a daemon while the owner polls cancellation; on cancel the owner
-    unwinds at once and the daemon finishes under the provider timeout in ``kwargs`` (it owns no
-    transcript/commit state, never holds the session lock). Unprotected / no cancel source: direct.
-    """
-    source_cancel_check = _capture_aux_cancel_check()
-    if not _aux_interrupt_protected() or not callable(source_cancel_check):
-        return callback(kwargs)
-    # One linearized outcome per attempt: the host Event is reused/cleared on later turns and
-    # the Codex timeout Timer may race owner polling â€” same lock for both.
-    cancel_check = _AuxiliaryCancellationDecision(source_cancel_check)
-    if cancel_check():
-        raise AuxiliaryExplicitCancellation()
-    # Thread-locals do not cross into the daemon: timing hooks fire from the thread running
-    # the callback, and the host deadline is inert unless carried along.
-    progress_hook = getattr(_aux_progress, "hook", None)
-    dispatch_hook = getattr(_aux_dispatch, "hook", None)
-    provider_response_hook = getattr(_aux_provider_response, "hook", None)
-    host_deadline = _current_aux_stream_deadline()
-    # #99692: the stream is consumed on the daemon below, and thread-locals do not cross that boundary â€” an
-    # owner-thread-only deadline would leave the fix inert on exactly the path large-session compression
-    # takes (protected call + hard-cancel source installed).
-    provider_context = contextvars.copy_context()
-    done = threading.Event()
-    outcome: dict[str, Any] = {}
-
-    def _provider_worker() -> None:
-        try:
-            with (
-                aux_progress_hook(progress_hook),
-                _aux_thread_local_hook(_aux_dispatch, dispatch_hook),
-                _aux_thread_local_hook(_aux_provider_response, provider_response_hook),
-                aux_stream_deadline(host_deadline),
-                aux_interrupt_protection(cancel_check=cancel_check),
-            ):
-                outcome["result"] = callback(kwargs)
-        except BaseException as exc:
-            outcome["exception"] = exc
-        finally:
-            done.set()
-
-    threading.Thread(
-        target=provider_context.run, args=(_provider_worker,), name="hermes-protected-aux-provider",
-        daemon=True).start()
-    while True:
-        # Check cancel before AND after each wait so it wins when result publication and the
-        # host Event land in the same polling interval.
-        if _captured_aux_cancel_requested(cancel_check):
-            raise AuxiliaryExplicitCancellation()
-        if not done.wait(0.02):
-            continue
-        if _captured_aux_cancel_requested(cancel_check):
-            raise AuxiliaryExplicitCancellation()
-        exception = outcome.get("exception")
-        if exception is not None:
-            raise exception
-        return outcome.get("result")
-
-
-def _client_declares(client_obj: Any, flag: str) -> bool:
-    """Whether ``client_obj`` (or its class) sets ``flag`` truthy; absent â†’ False. Capability declaration,
-    not isinstance, so out-of-tree clients can opt out of wrappers unimported (cf. SUPPORTS_HERMES_TOOL_CALLS)."""
-    try:
-        return bool(getattr(client_obj, flag, False))
-    except Exception:
-        return False
-
-
-def _safe_isinstance(obj: Any, maybe_type: Any) -> bool:
-    """Return False instead of raising when a patched symbol is not a type."""
-    try:
-        return isinstance(obj, maybe_type)
-    except TypeError:
-        return False
-
-
-def _extract_url_query_params(url: str):
-    """Extract query params from URL, return (clean_url, default_query dict or None)."""
-    parsed = urlparse(url)
-    if parsed.query:
-        return urlunparse(parsed._replace(query="")), {k: v[0] for k, v in parse_qs(parsed.query).items()}
-    return url, None
-
-
-# Warn only once per process about stale OPENAI_BASE_URL.
-_stale_base_url_warned = False
-
-_PROVIDER_ALIASES = {
-    "google": "gemini", "google-gemini": "gemini", "google-ai-studio": "gemini",
-    "x-ai": "xai", "x.ai": "xai", "grok": "xai",
-    "glm": "zai", "z-ai": "zai", "z.ai": "zai", "zhipu": "zai",
-    "kimi": "kimi-coding", "moonshot": "kimi-coding",
-    "kimi-cn": "kimi-coding-cn", "moonshot-cn": "kimi-coding-cn",
-    "gmi-cloud": "gmi", "gmicloud": "gmi",
-    "actual-computer": "actual", "actualcomputer": "actual", "aci": "actual",
-    "minimax-china": "minimax-cn", "minimax_cn": "minimax-cn",
-    "claude": "anthropic", "claude-code": "anthropic",
-    "github": "copilot", "github-copilot": "copilot", "github-model": "copilot", "github-models": "copilot",
-    "github-copilot-acp": "copilot-acp", "copilot-acp-agent": "copilot-acp",
-    "tencent": "tencent-tokenhub", "tokenhub": "tencent-tokenhub", "tencent-cloud": "tencent-tokenhub",
-    "tencentmaas": "tencent-tokenhub",
-    "tokenplan": "tencent-tokenplan", "tencent-lkeap": "tencent-tokenplan",
-}
-
-
-def _normalize_aux_provider(provider: Optional[str]) -> str:
-    normalized = (provider or "auto").strip().lower()
-    if normalized.startswith("custom:"):
-        suffix = normalized.split(":", 1)[1].strip()
-        if not suffix:
-            return "custom"
-        normalized = suffix
-    if normalized == "codex":
-        return "openai-codex"
-    if normalized == "main":
-        # Resolve to the actual main provider so named custom providers work.
-        main_prov = (_read_main_provider() or "").strip().lower()
-        if not main_prov or main_prov in {"auto", "main"}:
-            return "custom"
-        normalized = main_prov
-    return _PROVIDER_ALIASES.get(normalized, normalized)
-
-
-# Sentinel from _fixed_temperature_for_model(): callers strip ``temperature`` entirely.
-# Kimi/Moonshot manage it server-side â€” any value can conflict with gateway mode selection.
-OMIT_TEMPERATURE: object = object()
-
-
-def _bare_model(model: Optional[str]) -> str:
-    """Lowercased model slug with any ``vendor/`` prefix stripped."""
-    return (model or "").strip().lower().rsplit("/", 1)[-1]
-
-
-def _is_kimi_model(model: Optional[str]) -> bool:
-    """True for any Kimi / Moonshot model that manages temperature server-side."""
-    bare = _bare_model(model)
-    return bare.startswith("kimi-") or bare == "kimi"
-
-
-def _is_arcee_trinity_thinking(model: Optional[str]) -> bool:
-    """True for Arcee Trinity Large Thinking (direct or via OpenRouter)."""
-    return _bare_model(model) == "trinity-large-thinking"
-
-
-# Codex OAuth hard-caps gpt-5.4/5.5/5.6 and gpt-6 Astra at 272K (raw API/OpenRouter expose 1.05M);
-# the default 50% trigger would compact at ~136K, so raise to 85% (~231K).
-_CODEX_GPT54_GPT55_COMPACTION_THRESHOLD = 0.85
-# gpt-5.3-codex-spark: Codex-OAuth-only, native 128K; 70% (~90K) leaves summary headroom.
-_CODEX_SPARK_COMPACTION_THRESHOLD = 0.70
-
-
-def _is_codex_gpt54_or_gpt55(model: Optional[str], provider: Optional[str] = None) -> bool:
-    """True for gpt-5.4/5.5/5.6, gpt-6 Astra (and the Daybreak Sol alias) on the Codex OAuth route only.
-
-    Other routes expose a larger window for the same slug and keep the user's threshold.
-    Prefix-matched so ``-pro`` and dated snapshots track every 272K-capped family; ``-900k``
-    picker variants are excluded. Astra is substring-matched (any slug containing ``astra``
-    without ``900k``). Name kept for the ``compression.codex_gpt55_autoraise`` key.
-    """
-    bare = _codex_route_bare_model(model, provider)
-    if bare is None:
-        return False
-    from agent.model_metadata import is_codex_context_variant
-    if is_codex_context_variant(bare):
-        return False
-    if "astra" in bare:
-        return "900k" not in bare
-    return bare == "gpt-daybreak-blue-latest" or any(
-        bare == fam or bare.startswith(fam + "-") or bare.startswith(fam + ".")
-        for fam in ("gpt-5.4", "gpt-5.5", "gpt-5.6"))
-
-
-def _codex_route_bare_model(model: Optional[str], provider: Optional[str]) -> Optional[str]:
-    """Lowercased bare model slug when ``provider`` is the Codex OAuth route, else None."""
-    return _bare_model(model) if (provider or "").strip().lower() == "openai-codex" else None
-
-
-def _is_codex_spark(model: Optional[str], provider: Optional[str] = None) -> bool:
-    """True for ``gpt-5.3-codex-spark`` on the Codex OAuth route (the slug exists nowhere else)."""
-    return _codex_route_bare_model(model, provider) == "gpt-5.3-codex-spark"
-
-
-def _fixed_temperature_for_model(
-    model: Optional[str], base_url: Optional[str] = None
-) -> "Optional[float] | object":
-    """``OMIT_TEMPERATURE`` (drop the key; Kimi/Moonshot), a fixed ``float``, or ``None``."""
-    if _is_kimi_model(model):
-        logger.debug("Omitting temperature for Kimi model %r (server-managed)", model)
-        return OMIT_TEMPERATURE
-    return 0.5 if _is_arcee_trinity_thinking(model) else None
-
-
-def _compression_threshold_for_model(
-    model: Optional[str], provider: Optional[str] = None, *,
-    allow_codex_gpt55_autoraise: bool = True,
-) -> Optional[float]:
-    """Per-model/route compression threshold override (fraction of context used), or None.
-
-    Arcee Trinity Large Thinking â†’ 0.75 (preserve reasoning context); Codex-route gpt-5.4/5.5/5.6/Astra
-    â†’ 0.85, gated by ``allow_codex_gpt55_autoraise``; Codex-route gpt-5.3-codex-spark â†’ 0.70, ungated.
-    """
-    if _is_arcee_trinity_thinking(model):
-        return 0.75
-    if allow_codex_gpt55_autoraise and _is_codex_gpt54_or_gpt55(model, provider):
-        return _CODEX_GPT54_GPT55_COMPACTION_THRESHOLD
-    if _is_codex_spark(model, provider):
-        return _CODEX_SPARK_COMPACTION_THRESHOLD
-    return None
-
-
-def _effective_compression_threshold_percent(
-    model: Optional[str],
-    provider: Optional[str] = None,
-    *,
-    global_threshold: Optional[float] = None,
-    allow_codex_gpt55_autoraise: bool = True,
-) -> float:
-    """Resolve the effective compression trigger threshold for a route.
-
-    Applies the per-model overrides (gpt-5.4/5.5/5.6 272K family â†’ 0.85,
-    gpt-5.3-codex-spark â†’ 0.70 on the Codex OAuth route) over the global
-    ``compression.threshold`` so external context engines observe the same
-    effective threshold as the built-in ContextCompressor's initial
-    construction. Reads the global threshold from config when not supplied.
-    """
-    if global_threshold is None:
-        try:
-            from hermes_cli.config import load_config_readonly
-
-            _cfg = load_config_readonly() or {}
-        except Exception:
-            _cfg = {}
-        _raw = (_cfg.get("compression") or {}).get("threshold", 0.50)
-        try:
-            global_threshold = float(_raw)
-        except (TypeError, ValueError):
-            global_threshold = 0.50
-    # Lazy import: agent_init imports this module only at function scope,
-    # so a module-level import here would be circular.
-    from agent.agent_init import _resolve_compression_threshold
-
-    _override = _compression_threshold_for_model(
-        model, provider, allow_codex_gpt55_autoraise=allow_codex_gpt55_autoraise
-    )
-    _resolved, _ = _resolve_compression_threshold(
-        float(global_threshold),
-        _override,
-        model=model,
-        is_codex_autoraise=(
-            _is_codex_gpt54_or_gpt55(model, provider) or _is_codex_spark(model, provider)
-        ),
-    )
-    return float(_resolved)
-
-
-def _update_compressor_model(
-    compressor,
-    *,
-    model: str,
-    context_length: int,
-    base_url: str = "",
-    api_key: Any = "",
-    provider: str = "",
-    api_mode: str = "",
-    threshold_percent: Optional[float] = None,
-) -> None:
-    """Call ``update_model``, forwarding ``threshold_percent`` when supported.
-
-    The built-in ContextCompressor re-resolves its threshold internally and
-    does not accept the kwarg; external engines (e.g. ri-context-governor)
-    accept it so the resolved host threshold (including the Codex gpt-5.x
-    autoraise) reaches their trigger. A signature guard keeps every engine
-    on its own contract.
-    """
-    _kwargs = {
-        "model": model,
-        "context_length": context_length,
-        "base_url": base_url,
-        "api_key": api_key,
-        "provider": provider,
-        "api_mode": api_mode,
-    }
-    if threshold_percent is not None:
-        try:
-            import inspect
-
-            _params = inspect.signature(compressor.update_model).parameters
-        except (TypeError, ValueError):
-            _params = {}
-        if "threshold_percent" in _params:
-            _kwargs["threshold_percent"] = threshold_percent
-    compressor.update_model(**_kwargs)
-
-# Model-family priority for the auxiliary "fast tier", fastest first.
-#
-# Matched as substrings against the provider's LIVE /v1/models catalog rather
-# than pinned as exact ids, because exact ids rot: a hardcoded
-# "google/gemini-3-flash" kept 404ing here once Nous dropped it upstream, and
-# every aux call paid a wasted round-trip before the retry net caught it.
-# Families outlive their version numbers, so a new mini/flash/haiku release is
-# picked up with no source edit.
-#
-# Rolling "-latest" aliases come first where a provider publishes them (Nous
-# serves ~openai/gpt-mini-latest, ~google/gemini-flash-latest, â€¦): they are the
-# only ids that are structurally rot-proof.
-#
-# Order is measured, not guessed â€” p50 on a real titling prompt against the
-# Nous catalog: gpt-mini-latest 1.40s, claude-haiku-latest 1.55s,
-# gemini-flash-latest 2.13s, step-3.7-flash 7.84s, grok-4.1-fast 8.05s. So the
-# first family a provider actually serves is also the fastest it can offer.
-_FAST_MODEL_FAMILIES: tuple = (
-    "gpt-mini-latest", "gpt-nano-latest", "claude-haiku-latest", "gemini-flash-latest",
-    "gpt-5.4-nano", "gpt-5.4-mini", "gpt-5-mini", "haiku-4.5", "gemini-3.6-flash", "flash-lite",
-    "-nano", "-mini", "-flash", "haiku",
-)
-
-# Disqualifiers: reasoning variants think before answering; ":batch" is a queue; ":free" tiers
-# are rate-limited and slowest; embedders/modality endpoints match a rung but cannot answer.
-_FAST_MODEL_EXCLUDE: tuple = (
-    "thinking", "reason", "-r1", "minilm", ":batch", ":free",
-    "o1-", "o3-", "o4-", "codex", "audio", "-vl", "embed",
-    "-tts", "-transcribe", "-realtime", "-image", "-search-preview",
-)
-
-
-def _model_recency_key(model_id: str) -> tuple:
-    """Sort key putting a family's newest release first: digit runs compare numerically (plain
-    string order picks ``gpt-3.5-mini`` over ``gpt-5.4-mini`` and breaks at 9 vs 10)."""
-    # re.split with one capturing group alternates text, number, text, â€¦
-    return tuple(
-        (1, float(part), "") if index % 2 else (0, 0.0, part)
-        for index, part in enumerate(re.split(r"(\d+(?:\.\d+)?)", model_id.lower())) if part)
-
-
-def _fast_model_from_catalog(provider_id: str) -> str:
-    """Newest ``_FAST_MODEL_FAMILIES`` match from the provider's live (cached) catalog.
-
-    "" when the catalog is unavailable or holds no small model (caller falls through to the
-    curated default). Never raises; the fetch is memory+disk cached.
-    """
-    is_nous = provider_id.strip().lower() == "nous"
-    try:
-        from hermes_cli.auth import resolve_api_key_provider_credentials
-        from hermes_cli.models_pricing import fetch_models_with_pricing
-        from providers import get_provider_profile
-        # Most /v1/models endpoints are authenticated; an anonymous 401 would read as "no small
-        # model" and pin the curated default forever.
-        api_key, base_url = "", ""
-        try:
-            creds = resolve_api_key_provider_credentials(provider_id) or {}
-            api_key = str(creds.get("api_key", "")).strip()
-            base_url = str(creds.get("base_url", "")).strip()
-        except Exception:
-            # Not an API-key provider, or nothing configured; anonymous fetch may still work.
-            logger.debug("No credentials for %s catalog", provider_id, exc_info=True)
-        if not api_key and is_nous:
-            # Nous is OAuth (resolver raises); anonymous reads return the full catalog.
-            try:
-                from hermes_cli.models_pricing import _resolve_nous_pricing_credentials
-                api_key, base_url = _resolve_nous_pricing_credentials()
-            except Exception:
-                logger.debug("No Nous credentials for catalog", exc_info=True)
-        if not base_url:
-            base_url = str(getattr(get_provider_profile(provider_id), "base_url", "") or "")
-        base_url = base_url.rstrip("/")
-        if not base_url:
-            return ""
-        if base_url.endswith("/v1"):  # fetch_models_with_pricing appends /v1/models
-            base_url = base_url[:-3]
-        # Nous-only args must match the pickers' or the seeded cache loses sale chrome and
-        # policy-catalog expiry.
-        _nous_kwargs = {}
-        if is_nous:
-            from hermes_cli.models_pricing import _NOUS_CATALOG_TTL_SECONDS
-            _nous_kwargs = {"include_sale_original": True, "cache_ttl_seconds": _NOUS_CATALOG_TTL_SECONDS}
-        catalog = fetch_models_with_pricing(
-            api_key=api_key or None, base_url=base_url, timeout=3.0, **_nous_kwargs) or {}
-    except Exception:
-        logger.debug("Fast-model catalog lookup failed for %s", provider_id, exc_info=True)
-        return ""
-    ids = sorted((str(m) for m in catalog), key=_model_recency_key, reverse=True)
-    if is_nous:
-        # Narrow catalog ids by org policy, as the pickers do.
-        try:
-            from hermes_cli.models_pricing import nous_policy_allowed_ids, restrict_to_nous_policy
-            ids = restrict_to_nous_policy(ids, nous_policy_allowed_ids())
-        except Exception:
-            logger.debug("Nous policy filter unavailable", exc_info=True)
-    for family in _FAST_MODEL_FAMILIES:
-        for model_id in ids:
-            lowered = model_id.lower()
-            if family in lowered and not any(x in lowered for x in _FAST_MODEL_EXCLUDE):
-                return model_id
-    return ""
-
-
-# Default auxiliary models for direct API-key providers (cheap/fast for side tasks)
-def _get_aux_model_for_provider(provider_id: str, *, prefer_fast: bool = False) -> str:
-    """Cheap auxiliary model for a provider.
-
-    Ladder: (``prefer_fast`` only) live-catalog family match, then ``ProviderProfile.resolve_aux_model``;
-    then ``default_aux_model`` (curated); then the legacy dict. ``prefer_fast`` is opt-in (titling)
-    so other callers keep their static behaviour and cache keys.
-    """
-    profile = None
-    with contextlib.suppress(Exception):
-        from providers import get_provider_profile
-        profile = get_provider_profile(provider_id)
-    picked = ""
-    if prefer_fast:
-        picked = _fast_model_from_catalog(provider_id)
-        if not picked and profile is not None:
-            try:
-                picked = profile.resolve_aux_model() or ""
-            except Exception:
-                logger.debug("resolve_aux_model failed for %s", provider_id, exc_info=True)
-    if not picked and profile is not None and profile.default_aux_model:
-        picked = profile.default_aux_model
-    if not picked:
-        picked = _API_KEY_PROVIDER_AUX_MODELS_FALLBACK.get(provider_id, "")
-    # Rungs 2-4 are policy-blind; a blocked pick is refused at request time, so drop it and
-    # let the caller keep the main model.
-    if picked and provider_id.strip().lower() == "nous":
-        try:
-            from hermes_cli.models_pricing import nous_policy_allowed_ids, restrict_to_nous_policy
-            allowed = nous_policy_allowed_ids()
-            if allowed and not restrict_to_nous_policy([picked], allowed):
-                return ""
-        except Exception:
-            logger.debug("Nous policy check unavailable", exc_info=True)
-    return picked
-
-
-# Fallback for providers without ProviderProfile.default_aux_model (plus some pinned here).
-# New providers should set default_aux_model instead.
-_API_KEY_PROVIDER_AUX_MODELS_FALLBACK: Dict[str, str] = {
-    "gemini": "gemini-3.6-flash", "zai": "glm-4.5-flash", "kimi-coding": "kimi-k2-turbo-preview",
-    "stepfun": "step-3.5-flash", "kimi-coding-cn": "kimi-k2-turbo-preview",
-    "gmi": "google/gemini-3.1-flash-lite-preview", "anthropic": "claude-haiku-4-5-20251001",
-    "ai-gateway": "google/gemini-3-flash", "opencode-zen": "gemini-3-flash", "opencode-go": "glm-5",
-    "kilocode": "google/gemini-3.6-flash", "ollama-cloud": "nemotron-3-nano:30b",
-    "tencent-tokenhub": "hy4-preview", "tencent-tokenplan": "hy4-preview",
-    # No "deepinfra": its aux model lives on the ProviderProfile (read first).
-}
-
-# Legacy alias for callers not yet using _get_aux_model_for_provider().
-_API_KEY_PROVIDER_AUX_MODELS: Dict[str, str] = _API_KEY_PROVIDER_AUX_MODELS_FALLBACK
-
-# Tasks that may opt into ``auxiliary.<task>.prefer_fast_model``.
-_FAST_MODEL_TASKS: frozenset = frozenset({"title_generation"})
-
-
-def _task_prefers_fast_model(task: Optional[str]) -> bool:
-    """Return whether an eligible task explicitly opts into fast-model routing."""
-    return task in _FAST_MODEL_TASKS and is_truthy_value(
-        _get_auxiliary_task_config(task).get("prefer_fast_model"), default=False)
-
-
-# Dedicated vision models for direct providers whose main chat model differs.
-_PROVIDER_VISION_MODELS: Dict[str, str] = {"xiaomi": "mimo-v2.5", "zai": "glm-5v-turbo"}
-
-
-def _resolve_provider_vision_default(provider: str) -> Optional[str]:
-    """Provider default vision model id, or None: static ``_PROVIDER_VISION_MODELS`` (vision-only
-    names absent from any catalog) win, else ``ProviderProfile.default_vision_model()``."""
-    static = _PROVIDER_VISION_MODELS.get(provider)
-    if static:
-        return static
-    try:
-        from providers import get_provider_profile
-        profile = get_provider_profile(provider)
-        return profile.default_vision_model() if profile is not None else None
-    except Exception:
-        return None
-
-
-# Endpoints that reject image input: vision auto-detect skips these to the aggregator chain
-# instead of returning a client that 404s (Kimi Coding Plan Anthropic wire has no image_in).
-_PROVIDERS_WITHOUT_VISION: frozenset = frozenset({"kimi-coding", "kimi-coding-cn"})
-
-# OpenRouter app attribution (always sent). `X-Title` is what the dashboard reads.
-_OR_HEADERS_BASE = {
-    "HTTP-Referer": "https://hermes-agent.nousresearch.com",
-    "X-Title": "Hermes Agent",
-    "X-OpenRouter-Categories": "productivity,cli-agent",
-}
-
-
-def _apply_user_default_headers(headers: dict | None) -> dict | None:
-    """Merge user ``model.default_headers`` onto resolved headers (user wins; ``model.extra_headers``
-    alias wins over both). Mirrors ``AIAgent._apply_user_default_headers`` so a custom endpoint behind a
-    WAF rejecting ``User-Agent`` / ``X-Stainless-*`` works for aux calls. SECURITY: never log values."""
-    try:
-        from hermes_cli.config import cfg_get, load_config
-        _cfg = load_config()
-        user_headers = cfg_get(_cfg, "model", "default_headers")
-        alias_headers = cfg_get(_cfg, "model", "extra_headers")
-        if isinstance(alias_headers, dict) and alias_headers:
-            user_headers = {**(user_headers if isinstance(user_headers, dict) else {}), **alias_headers}
-    except Exception:
-        return headers
-    if not isinstance(user_headers, dict) or not user_headers:
-        return headers
-    merged = dict(headers or {})
-    merged.update({str(k): str(v) for k, v in user_headers.items() if v is not None})
-    return merged or headers
-
-
-def build_or_headers(or_config: dict | None = None) -> dict:
-    """OpenRouter headers, plus response-cache headers when enabled.
-
-    Precedence env > config > default: ``HERMES_OPENROUTER_CACHE`` overrides
-    ``openrouter.response_cache``; ``HERMES_OPENROUTER_CACHE_TTL`` (1-86400 s) overrides
-    ``openrouter.response_cache_ttl``. ``or_config=None`` reads from disk.
-    """
-    headers = dict(_OR_HEADERS_BASE)
-    if or_config is None:
-        try:
-            from hermes_cli.config import load_config_readonly
-            or_config = load_config_readonly().get("openrouter", {})
-        except Exception:
-            or_config = {}
-    env_cache = os.environ.get("HERMES_OPENROUTER_CACHE", "").strip().lower()
-    if not (env_cache in {"1", "true", "yes", "on"} if env_cache else or_config.get("response_cache", False)):
-        return headers
-    headers["X-OpenRouter-Cache"] = "true"
-    env_ttl = os.environ.get("HERMES_OPENROUTER_CACHE_TTL", "").strip()
-    if env_ttl:
-        if env_ttl.isdigit() and 1 <= int(env_ttl) <= 86400:
-            headers["X-OpenRouter-Cache-TTL"] = str(int(env_ttl))
-    else:
-        ttl = or_config.get("response_cache_ttl", 300)
-        if isinstance(ttl, (int, float)) and 1 <= ttl <= 86400:
-            headers["X-OpenRouter-Cache-TTL"] = str(int(ttl))
-    return headers
-
-
-# NVIDIA NIM cloud billing attribution; host-gated because NVIDIA_BASE_URL may be a local NIM.
-_NVIDIA_NIM_CLOUD_HEADERS = {"X-BILLING-INVOKE-ORIGIN": "HermesAgent"}
-
-
-def build_nvidia_nim_headers(base_url: str | None) -> dict:
-    """Return NVIDIA NIM cloud attribution headers for build.nvidia.com traffic."""
-    return dict(_NVIDIA_NIM_CLOUD_HEADERS) if base_url_host_matches(str(base_url or ""), "integrate.api.nvidia.com") else {}
-
-
-# Vercel AI Gateway attribution (HTTP-Referer â†’ referrerUrl, X-Title â†’ appName).
-from hermes_cli import __version__ as _HERMES_VERSION
-
-_AI_GATEWAY_HEADERS = {
-    "HTTP-Referer": "https://hermes-agent.nousresearch.com",
-    "X-Title": "Hermes Agent",
-    "User-Agent": f"HermesAgent/{_HERMES_VERSION}",
-}
-
-# Nous Portal attribution extra_body. Tags come from agent.portal_tags so the client= marker
-# tracks hermes_cli.__version__ â€” never inline a literal here.
-from agent.portal_tags import nous_portal_tags as _nous_portal_tags
-
-
-def _nous_extra_body() -> dict:
-    """Fresh Nous Portal ``extra_body`` (per call, so a hot-reloaded version is reflected)."""
-    return {"tags": _nous_portal_tags()}
-
-
-# Set at resolve time â€” True if the auxiliary client points to Nous Portal
-auxiliary_is_nous: bool = False
-
-# _OPENROUTER_MODEL MUST stay a :free SKU (matching the free_only warning): this lane engages
-# silently, and a paid default meant spend the user never opted into. User-configured values
-# are honored untouched (_warn_paid_lane_once fires).
-_OPENROUTER_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
-_NOUS_MODEL = "google/gemini-3.6-flash"
-_NOUS_DEFAULT_BASE_URL = "https://inference-api.nousresearch.com/v1"
-_ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com"
-_AUTH_JSON_PATH = get_hermes_home() / "auth.json"
-
-# Hosts exposing BOTH ``â€¦/anthropic`` and a sibling OpenAI ``â€¦/v1``. Matched on the URL *host*
-# only: unconditional rewrites break Anthropic-only gateways.
-_DUAL_SURFACE_ANTHROPIC_HOST_SUFFIXES = ("minimax.io", "minimax.chat", "minimaxi.com")
-_DUAL_SURFACE_ANTHROPIC_HOST_PREFIXES = ("api.minimax.",)
-
-
-def _is_dual_surface_anthropic_host(url: str) -> bool:
-    """True when the URL's host is a known dual-surface (MiniMax-family) host."""
-    try:
-        host = (urlparse(url).hostname or "").lower()
-    except ValueError:
-        return False
-    return any(
-        host == suffix or host.endswith("." + suffix) for suffix in _DUAL_SURFACE_ANTHROPIC_HOST_SUFFIXES
-    ) or any(host.startswith(prefix) for prefix in _DUAL_SURFACE_ANTHROPIC_HOST_PREFIXES)
-
-
-def _to_openai_base_url(base_url: str) -> str:
-    """Normalize dual-surface Anthropic URLs to their OpenAI-compatible sibling.
-
-    MiniMax-family: ``/anthropic`` â†’ ``/v1``; ZAI Coding Plan â†’ ``/coding/paas/v4`` (the general
-    endpoint bills separately); Kimi Code ``/coding`` â†’ ``/coding/v1`` (the OpenAI SDK path 404s
-    without it). Anthropic-only gateways keep their path.
-    """
-    url = str(base_url or "").strip().rstrip("/")
-    if url.endswith("/anthropic"):
-        if base_url_host_matches(url, "open.bigmodel.cn") or base_url_host_matches(url, "api.z.ai"):
-            rewritten = url[: -len("/anthropic")] + "/coding/paas/v4"
-            logger.debug("Auxiliary client: rewrote ZAI base URL %s â†’ %s", url, rewritten)
-            return rewritten
-        if _is_dual_surface_anthropic_host(url):
-            rewritten = url[: -len("/anthropic")] + "/v1"
-            logger.debug("Auxiliary client: rewrote dual-surface base URL %s â†’ %s", url, rewritten)
-            return rewritten
-        logger.debug(
-            "Auxiliary client: keeping Anthropic-only base URL %s (no dual-surface host match)", url)
-        return url
-    if base_url_host_matches(url, "api.kimi.com") and url.endswith("/coding"):
-        rewritten = url + "/v1"
-        logger.debug("Auxiliary client: rewrote Kimi base URL %s â†’ %s", url, rewritten)
-        return rewritten
-    return url
-
-
-def _load_pool_with_credentials(provider: str, note: str = "") -> Optional[Any]:
-    """``load_pool(provider)`` when it has credentials, else None (never raises)."""
-    try:
-        pool = load_pool(provider)
-    except Exception as exc:
-        logger.debug("Auxiliary client: could not load pool for %s%s: %s", provider, note, exc)
-        return None
-    return pool if pool and pool.has_credentials() else None
-
-
-def _select_pool_entry(provider: str) -> Tuple[bool, Optional[Any]]:
-    """Return (pool_exists_for_provider, selected_entry)."""
-    pool = _load_pool_with_credentials(provider)
-    if pool is None:
-        return False, None
-    try:
-        return True, pool.select()
-    except Exception as exc:
-        logger.debug("Auxiliary client: could not select pool entry for %s: %s", provider, exc)
-        return True, None
-
-
-def _peek_pool_entry(provider: str) -> Optional[Any]:
-    """Best-effort current/next pool entry without mutating selection order."""
-    pool = _load_pool_with_credentials(provider, " (peek)")
-    if pool is None:
-        return None
-    try:
-        current_fn = getattr(pool, "current", None)
-        current = current_fn() if callable(current_fn) else None
-        if current is not None:
-            return current
-        peek_fn = getattr(pool, "peek", None)
-        if callable(peek_fn):
-            return peek_fn()
-    except Exception as exc:
-        logger.debug("Auxiliary client: could not peek pool entry for %s: %s", provider, exc)
-    return None
-
-
-def _pool_runtime_api_key(entry: Any) -> str:
-    # runtime_api_key handles provider-specific fallback (e.g. agent_key for nous); None entry â†’ "".
-    key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
-    return str(key or "").strip()
-
-
-def _pool_runtime_base_url(entry: Any, fallback: str = "") -> str:
-    if entry is None:
-        return str(fallback or "").strip().rstrip("/")
-    if getattr(entry, "provider", None) == "nous":
-        # Canonical auth-layer reader so the env override shares one normalization path.
-        from hermes_cli.auth import _nous_inference_env_override
-        env_url = _nous_inference_env_override()
-        if env_url:
-            return env_url
-    # runtime_base_url is provider-aware; fall back for non-PooledCredential entries.
-    url = (getattr(entry, "runtime_base_url", None) or getattr(entry, "inference_base_url", None)
-           or getattr(entry, "base_url", None) or fallback)
-    return str(url or "").strip().rstrip("/")
-
-
-# Hosts the aux Anthropic path may be pointed at via model.base_url; anything else falls back
-# to the Anthropic default so a foreign host never leaks in.
-_ANTHROPIC_COMPATIBLE_HOSTS = frozenset({"api.anthropic.com"})
-
-
-def _is_anthropic_compatible_host(url: str) -> bool:
-    """True for native Anthropic hosts and gateways serving Messages under a ``/anthropic`` path
-    (same convention as runtime_provider / ``_wrap_if_needed``), so a configured ``model.base_url``
-    whose gateway holds auth is not discarded. A bare non-Anthropic base_url is False."""
-    if not url:
-        return False
-    try:
-        parsed = urlparse(url)
-        if (parsed.hostname or "").strip().lower().rstrip(".") in _ANTHROPIC_COMPATIBLE_HOSTS:
-            return True
-        path = (parsed.path or "").rstrip("/").lower()
-        return path.endswith("/anthropic") or path.endswith("/anthropic/v1")
-    except Exception:
-        return False
-
-
-def _nous_min_key_ttl_seconds() -> int:
-    try:
-        return max(60, int(os.getenv("HERMES_NOUS_MIN_KEY_TTL_SECONDS", "1800")))
-    except (TypeError, ValueError):
-        return 1800
-
-
-def _scoped_key_env(name: str) -> str:
-    """Read a provider API key env var through the profile secret scope.
-
-    In agent turns the scope's verdict is authoritative (a scoped miss must not borrow another
-    profile's key); unscoped startup/CLI paths fall back to os.environ.
-    """
-    if not name:
-        return ""
-    with contextlib.suppress(Exception):
-        from agent.secret_scope import UnscopedSecretError, get_secret
-        with contextlib.suppress(UnscopedSecretError):
-            return (get_secret(name) or "").strip()
-    return (os.getenv(name) or "").strip()
-
-
-# Codex Responses â†’ chat.completions adapter, so aux consumers need no changes.
-def _parse_codex_final_response(final: Any) -> Tuple[List[str], List[Any], Any]:
-    """Split a completed Responses object into (text_parts, tool_calls, usage) in chat.completions shape."""
-    text_parts: List[str] = []
-    tool_calls_raw: List[Any] = []
-    for item in (getattr(final, "output", None) or []):
-        item_type = _field(item, "type")
-        if item_type == "message":
-            for part in (_field(item, "content") or []):
-                if _field(part, "type") in {"output_text", "text"}:
-                    text_parts.append(_field(part, "text", ""))
-        elif item_type == "function_call":
-            tool_calls_raw.append(SimpleNamespace(
-                id=_field(item, "call_id", ""), type="function",
-                function=SimpleNamespace(
-                    name=_field(item, "name", ""), arguments=_field(item, "arguments", "{}"))))
-    usage = None
-    resp_usage = getattr(final, "usage", None)
-    if resp_usage:
-        def _u(key: str) -> int:
-            return getattr(resp_usage, key, 0) or (resp_usage.get(key, 0) if isinstance(resp_usage, dict) else 0)
-        usage = SimpleNamespace(
-            prompt_tokens=_u("input_tokens"), completion_tokens=_u("output_tokens"),
-            total_tokens=_u("total_tokens"))
-    return text_parts, tool_calls_raw, usage
-
-
-def _close_quietly(target: Any, failure_note: Optional[str]) -> None:
-    """Call ``target.close()`` if present; a failure is debug-logged under ``failure_note`` (silent when None)."""
-    close = getattr(target, "close", None)
-    if callable(close):
-        try:
-            close()
-        except Exception:
-            if failure_note:
-                logger.debug("Codex auxiliary: %s", failure_note, exc_info=True)
-
-
-class _CodexStreamGuard:
-    """Progress-aware deadline + FD-safe timeout watchdog for one Codex aux stream attempt.
-
-    (1) The first substantive payload must arrive within ``no_progress_timeout`` or we fail fast into
-    the caller's retry/fallback chain (a dead or keepalive-only zombie must not hold the budget);
-    (2) each substantive event re-arms that window (keepalive/lifecycle frames do NOT, mirroring
-    commit-fence gating) so a live stream is never killed by an absolute total; (3) a hard ceiling
-    from ``_aux_stream_total_ceiling`` still terminates a pathological drip.
-    """
-
-    def __init__(self, client: Any, total_timeout: Optional[float]):
-        self._client = client
-        self.total_timeout = total_timeout
-        self._start = time.monotonic()
-        self.no_progress_timeout = _AUX_STREAM_NO_PROGRESS_TIMEOUT_SECONDS
-        # Progress-aware stream deadlines (supersedes the old single absolute kill at ``total_timeout``).
-        # Three regimes: 1. First token: the stream must produce its first substantive payload within
-        # ``no_progress_timeout`` (60s default) or we fail fast and let the caller's normal retry/fallback
-        # chain run â€” a dead (or keepalive-only zombie) Codex stream no longer holds the full 300s
-        # compression budget before falling back (masoria report, Aug 2026: 3 stacked 300s waits -> 20+ min
-        # stuck on "Summarizing"). 2. Streaming: every substantive event re-arms the deadline by
-        # ``no_progress_timeout`` â€” a live stream is never killed by an absolute total, so a long reasoning
-        # summary that is actually producing tokens completes instead of timing out at 300s and falling back
-        # (#54915's original complaint, fixed properly). Keepalive/lifecycle frames do NOT re-arm, mirroring
-        # the commit-fence progress gating (#96707). 3. Hard ceiling: an absolute backstop from
-        # ``_aux_stream_total_ceiling`` (max(600s, 4x configured timeout) â€” the same bound the streamed
-        # chat.completions path uses) so a pathological one-token-per-59s drip still terminates.
-        if total_timeout is not None:
-            self.no_progress_timeout = min(self.no_progress_timeout, float(total_timeout))
-        self.hard_deadline = self._start + _aux_stream_total_ceiling(total_timeout)
-        # The waiting host's absolute deadline clamps the ceiling so the watchdog Timer severs
-        # the socket the instant the host stops waiting â€” a stream blocked between events
-        # can't be stopped by a per-event check.
-        host_deadline = _current_aux_stream_deadline()
-        if isinstance(host_deadline, (int, float)) and host_deadline < self.hard_deadline:
-            self.hard_deadline = float(host_deadline)
-        self._deadline_lock = threading.Lock()
-        self._progress_deadline = self._start + self.no_progress_timeout
-        self.saw_content = threading.Event()
-        self.timed_out = threading.Event()
-        # Set only when the timeout WON (not when the owner hard-cancelled first): tells the
-        # owner's ``finally`` the shared client's FDs still need a real close.
-        self.timeout_release_pending = threading.Event()
-        self.stream_finished = threading.Event()
-        self._timer = None
-        # The owner may return on hard cancel while this attempt is still blocked in the SDK
-        # stream. Timer threads don't inherit the worker's thread-local protection state, so
-        # freeze the hard-cancel source before creating the timer.
-        self._protected_cancel_check = _capture_aux_cancel_check() if _aux_interrupt_protected() else None
-        self._attempt_stream_lock = threading.Lock()
-        self._attempt_stream: Any = None
-        # The request-driving thread owns the transport FDs â€” see _close_client_on_timeout.
-        self._owner_tid = threading.get_ident()
-
-    def effective_deadline(self) -> float:
-        with self._deadline_lock:
-            return min(self.hard_deadline, self._progress_deadline)
-
-    def cancel_requested(self) -> bool:
-        """True when the frozen hard-cancel source says the owner already cancelled."""
-        check = self._protected_cancel_check
-        return callable(check) and _captured_aux_cancel_requested(check)
-
-    def adopt_stream(self, stream: Any) -> None:
-        with self._attempt_stream_lock:
-            self._attempt_stream = stream
-
-    def release_stream(self, stream: Any) -> None:
-        """Owner-side: close the attempt stream silently and forget it."""
-        _close_quietly(stream, None)
-        with self._attempt_stream_lock:
-            self._attempt_stream = None
-
-    def close_attempt_stream(self, failure_note: str) -> None:
-        """Closes only this attempt's stream â€” never the process-shared client."""
-        with self._attempt_stream_lock:
-            stream = self._attempt_stream
-        _close_quietly(stream, failure_note)
-
-    def record_progress(self) -> None:
-        """Substantive payload re-arms the no-progress window; the hard ceiling never moves."""
-        with self._deadline_lock:
-            self._progress_deadline = time.monotonic() + self.no_progress_timeout
-
-    def timeout_message(self) -> str:
-        elapsed = time.monotonic() - self._start
-        if time.monotonic() >= self.hard_deadline:
-            return f"Codex auxiliary Responses stream exceeded {self.hard_deadline - self._start:.1f}s hard ceiling"
-        if not self.saw_content.is_set():
-            return (
-                "Codex auxiliary Responses stream produced no output "
-                f"within {float(self.no_progress_timeout):.1f}s (no-progress timeout, {elapsed:.1f}s elapsed)")
-        return (
-            "Codex auxiliary Responses stream stalled: no new output "
-            f"for {float(self.no_progress_timeout):.1f}s ({elapsed:.1f}s elapsed)")
-
-    def _close_client_on_timeout(self) -> None:
-        begin_timeout_cleanup = getattr(self._protected_cancel_check, "begin_timeout_cleanup", None)
-        if callable(begin_timeout_cleanup):
-            timeout_won = bool(begin_timeout_cleanup())
-        else:
-            timeout_won = not self.cancel_requested()
-        # Publish transport timeout only after the attempt-local decision is fixed, so owner
-        # polling cannot observe completion in between.
-        self.timed_out.set()
-        if not timeout_won:
-            # Owner already hard-cancelled. The OpenAI client is process-shared, so never
-            # close/evict it here; wake only this attempt's stream if responses.create()
-            # returned one, else rely on the bounded SDK timeout.
-            self.close_attempt_stream("cancelled attempt stream close during timeout failed")
-            return
-        # FD-ownership contract: only the thread driving the request may ``close()`` this
-        # client's FDs. From a stranger thread (the watchdog Timer) only ``shutdown()`` is
-        # FD-safe â€” ``close()`` releases the raw TLS fd while the owner's OpenSSL BIO still
-        # caches it, the kernel recycles it (e.g. into a SQLite handle), and the owner's TLS
-        # flush corrupts that file. The owner does the real close in its ``finally``.
-        # This callback has two callers â€” ``_check_cancelled`` on the owning thread, and the daemon watchdog
-        # ``threading.Timer``, which is a stranger thread. The owning thread performs the real close in the
-        # ``finally`` below, which is where the FD release belongs. See #70773.
-        self.timeout_release_pending.set()
-        if threading.get_ident() == self._owner_tid:
-            _close_quietly(self._client, "client close during timeout failed")
-        else:
-            try:
-                from agent.agent_runtime_helpers import force_close_tcp_sockets
-                shutdown_count = force_close_tcp_sockets(self._client)
-                logger.info(
-                    "Codex auxiliary client aborted (timeout, tcp_force_closed=%d, "
-                    "deferred_close=stranger_thread)", shutdown_count)
-            except Exception:
-                logger.debug("Codex auxiliary: client abort during timeout failed", exc_info=True)
-            # Socket shutdown only wakes a reader on a REAL transport; the owner may be blocked
-            # inside the SDK's event stream (or a socketless test double). Closing the
-            # attempt-owned stream releases it without touching shared FDs.
-            self.close_attempt_stream("attempt stream close during stranger-thread timeout failed")
-        # The aux client cache wraps this same client; drop the entry so the next aux call
-        # doesn't reuse the dead transport and fail fast.
-        try:
-            # After we close the httpx transport above, the cache must drop that entry â€” otherwise the next
-            # auxiliary call (compression retry, memory flush, etc.) reuses the dead client and fails fast
-            # with a connection error. See issue #23432.
-            _evict_cached_client_instance(self._client)
-        except Exception:
-            logger.debug("Codex auxiliary: cache eviction on timeout failed", exc_info=True)
-
-    def check_cancelled(self) -> None:
-        if self.total_timeout is not None and time.monotonic() >= self.effective_deadline():
-            if not self.timed_out.is_set():
-                self._close_client_on_timeout()
-            raise TimeoutError(self.timeout_message())
-        try:
-            from tools.interrupt import is_interrupted
-            # Protected atomic aux tasks (compression) must not abort on a mid-flight gateway
-            # interrupt (degraded fallback marker); explicit host cancel has its own exception.
-            if _aux_interrupt_cancel_requested():
-                raise AuxiliaryExplicitCancellation()
-            # Explicit host cancellation has its own frozen exception; timeouts above still fire and other
-            # aux tasks remain interruptible. See #23975.
-            if is_interrupted() and not _aux_interrupt_protected():
-                raise InterruptedError("Codex auxiliary Responses stream interrupted")
-        except InterruptedError:
-            raise
-        except Exception:
-            # Interrupt state is best-effort UX; never a new failure mode.
-            pass
-
-    def _watchdog_fire(self) -> None:
-        # Re-armable: if progress moved the deadline forward, reschedule instead of killing a
-        # live stream.
-        remaining = self.effective_deadline() - time.monotonic()
-        if remaining > 0:
-            if not (self.timed_out.is_set() or self.stream_finished.is_set()):
-                self._arm_timer(remaining)
-            return
-        self._close_client_on_timeout()
-
-    def _arm_timer(self, delay: float) -> None:
-        self._timer = t = threading.Timer(delay, self._watchdog_fire)
-        t.daemon = True
-        t.start()
-
-    def start(self) -> None:
-        """Arm the watchdog (when a total timeout exists) and run the first cancel check."""
-        if self.total_timeout:
-            self._arm_timer(max(self.effective_deadline() - time.monotonic(), 0.0))
-        self.check_cancelled()
-
-    def on_event(self, _event: Any) -> None:
-        # TTFP telemetry records every frame, but forward progress (compression commit fence,
-        # no-progress window) counts only substantive payloads â€” keepalives must not re-arm,
-        # so a zombie stream dies at the same window as a dead connection.
-        # #93650: keep bulk wire-format payload out of the SDK's GIL-holding request transform on auxiliary
-        # calls too.
-        if _codex_event_has_content(_event):
-            self.record_progress()
-            self.saw_content.set()
-            _notify_aux_provider_response()
-        else:
-            _notify_aux_timing_response()
-        self.check_cancelled()
-
-    def finish(self) -> None:
-        """Owner ``finally``: stop the watchdog and release FDs a stranger-thread timeout only shut down."""
-        self.stream_finished.set()
-        if self._timer is not None:
-            self._timer.cancel()
-        # Gated on timeout_release_pending, NOT timed_out: after a hard-cancel the shared
-        # client must stay usable for other sessions.
-        if self.timeout_release_pending.is_set():
-            _close_quietly(self._client, "owner-thread close after timeout failed")
-
-
-class _CodexCompletionsAdapter:
-    """Drop-in shim routing chat.completions.create() kwargs through Codex Responses streaming."""
-
-    def __init__(self, real_client: OpenAI, model: str):
-        self._client = real_client
-        self._model = model
-
-    def _build_responses_kwargs(self, kwargs: Dict[str, Any]) -> Tuple[Dict[str, Any], str, Any]:
-        """chat.completions kwargs â†’ Responses API kwargs, ``(resp_kwargs, model, timeout)``; mirrors codex.py::build_kwargs."""
-        from utils import base_url_host_matches
-        # Separate system/instructions from replayable conversation messages, then route the rest through
-        # the SINGLE shared chat->Responses converter used by the main agent transport
-        # (agent/transports/codex.py). Maintaining a private conversion loop here let chat-style messages
-        # with role="tool" leak straight into Responses input[] â€” which the Responses API rejects with
-        # "Invalid value: 'tool'. Supported values are: 'assistant', 'system', 'developer', and 'user'."
-        # (issue #5709, hit hard by flush_memories() / compression replaying real session history that
-        # includes assistant tool_calls + role="tool" results). The shared converter encodes assistant tool
-        # calls as `function_call` items and tool results as `function_call_output` items with a valid
-        # call_id, so every Responses path normalizes tool history identically and cannot drift.
-        from agent.codex_responses_adapter import _chat_messages_to_responses_input
-        model = kwargs.get("model", self._model)
-        host = str(getattr(self._client, "base_url", "") or "")
-        is_xai = base_url_host_matches(host, "x.ai") or base_url_host_matches(host, "api.x.ai")
-        is_copilot = base_url_host_matches(host, "githubcopilot.com")
-        is_github = is_copilot or base_url_host_matches(host, "models.github.ai")
-        # System â†’ ``instructions``; the rest goes through the SINGLE shared chatâ†’Responses
-        # converter (a private loop here once let role="tool" leak into input[]; the shared one
-        # encodes tool history as function_call/function_call_output).
-        instructions = "You are a helpful assistant."
-        replay_messages: List[Dict[str, Any]] = []
-        for msg in kwargs.get("messages", []):
-            content = msg.get("content") or ""
-            if msg.get("role", "user") == "system":
-                instructions = content if isinstance(content, str) else str(content)
-            else:
-                replay_messages.append(msg)
-        # Copilot binds replayed codex_message_items ids to a backend connection that doesn't
-        # survive credential rotation (401 on replay) â€” same guard as build_kwargs. Aux calls
-        # never send ``context_management`` (main-turn feature): no compaction checkpoint.
-        # Auxiliary calls (context compression, flush_memories, MoA aggregation) go through this adapter
-        # instead of agent/transports/codex.py's build_kwargs, so they need the same guard applied
-        # independently. See #32716.
-        input_items = _chat_messages_to_responses_input(
-            replay_messages, is_github_responses=is_copilot, native_compaction_eligible=False
-        )
-        resp_kwargs: Dict[str, Any] = {
-            # Codex only knows the base slug; strip the Hermes ``-900k`` picker suffix.
-            "model": _strip_codex_ctx_variant(model), "instructions": instructions,
-            "input": input_items or [{"role": "user", "content": ""}], "store": False,
-        }
-        # Forward the chat.completions timeout; otherwise a Codex stream can sit behind a
-        # dead-looking CLI until the user force-interrupts.
-        timeout = kwargs.get("timeout")
-        if timeout is not None:
-            resp_kwargs["timeout"] = timeout
-        # Per-request HTTP headers (OpenCode session affinity, Copilot x-initiator) map to real
-        # headers via the SDK kwarg â€” forward them.
-        if isinstance(kwargs.get("extra_headers"), dict) and kwargs["extra_headers"]:
-            resp_kwargs["extra_headers"] = dict(kwargs["extra_headers"])
-        # The Codex endpoint rejects max_output_tokens/temperature (400) â€” omit.
-        extra_body = kwargs.get("extra_body") or {}
-        if isinstance(extra_body, dict):
-            # service_tier (fast mode) is a top-level Responses field; xAI's endpoint rejects it.
-            service_tier = extra_body.get("service_tier")
-            if isinstance(service_tier, str) and service_tier.strip() and not is_xai:
-                resp_kwargs["service_tier"] = service_tier.strip()
-            reasoning_cfg = extra_body.get("reasoning")
-            # ``enabled: False`` leaves reasoning/include unset (Codex still thinks by default).
-            if isinstance(reasoning_cfg, dict) and reasoning_cfg.get("enabled") is not False:
-                # Truthy-only: Codex 400s on e.g. {"effort": null}, so falsy â†’ default. Shared
-                # per-model clamp with the main transport ("max" is gpt-5.6-only; "minimal"/"ultra" rejected).
-                from agent.codex_responses_adapter import classify_responses_route
-                from agent.reasoning_effort import clamp_effort
-                from agent.transports.codex import _codex_efforts_for_route
-                is_codex_backend = classify_responses_route(SimpleNamespace(base_url=host)).is_codex_backend
-                effort = clamp_effort(
-                    reasoning_cfg.get("effort") or "medium",
-                    _codex_efforts_for_route(model, host, is_codex_backend=is_codex_backend),
-                )
-                resp_kwargs["reasoning"] = {"effort": effort, "summary": "auto"}
-                resp_kwargs["include"] = ["reasoning.encrypted_content"]
-        tools = kwargs.get("tools")
-        if tools:
-            # xAI Responses rejects ``pattern``/``format`` JSON Schema keywords (400); strip for
-            # chat_completion_helpers.py parity. Deep-copy first â€” sanitizers mutate inner dicts
-            # in place and would strip the caller's tool registry.
-            try:
-                import copy as _copy
-                from tools.schema_sanitizer import strip_pattern_and_format, strip_slash_enum
-                tools = _copy.deepcopy(list(tools))
-                tools, _ = strip_pattern_and_format(tools)
-                tools, _ = strip_slash_enum(tools)
-            except Exception as exc:
-                logger.warning(
-                    "Auxiliary client: failed to sanitize tool schemas for "
-                    "Codex/xAI Responses path: %s", exc,
-                )
-            converted = []
-            for t in tools:
-                fn = t.get("function", {}) if isinstance(t, dict) else {}
-                name = fn.get("name")
-                if name:
-                    converted.append({
-                        "type": "function", "name": name, "description": fn.get("description", ""),
-                        "parameters": fn.get("parameters", {}),
-                    })
-            if converted:
-                resp_kwargs["tools"] = converted
-        # Stable prompt-cache routing: key is content-addressed from the static prefix
-        # (instructions + tool schemas) so it survives across turns, scoped by the owning
-        # conversation (rotation-stable logical scope, else the physical session id). Skip the
-        # key where the main transport does: xAI takes it in extra_body, GitHub opts out.
-        try:
-            # Reuse the Responses transport's single authoritative hash algorithm and session-scope
-            # normalization so equivalent static prefixes route to the same cache bucket across modes,
-            # without concentrating unrelated sessions into one shared bucket (see #78941).
-            from agent.transports.codex import _cache_scope_from_session_id, _content_cache_key
-            from agent.transports.codex import _default_prompt_cache_retention_for_request
-            if not (is_xai or is_github) and "prompt_cache_key" not in resp_kwargs:
-                scope = _cache_scope_from_session_id(
-                    _runtime_main_value("cache_scope") or _runtime_main_value("session_id")
-                )
-                cache_key = _content_cache_key(resp_kwargs["instructions"], resp_kwargs.get("tools"), scope)
-                if cache_key:
-                    resp_kwargs["prompt_cache_key"] = cache_key
-            if "prompt_cache_retention" not in resp_kwargs:
-                cache_retention = _default_prompt_cache_retention_for_request(model, host)
-                if cache_retention:
-                    resp_kwargs["prompt_cache_retention"] = cache_retention
-        except Exception:
-            logger.debug("Codex auxiliary: prompt_cache_key derivation skipped", exc_info=True)
-        # Last, like the main transport: caller extra_body must not put a rejected Astra field back.
-        from agent.transports.codex import _sanitize_astra_request_kwargs
-        _sanitize_astra_request_kwargs(resp_kwargs, model, host)
-        return resp_kwargs, model, timeout
-
-    def create(self, **kwargs) -> Any:
-        # Low-level ``responses.create(stream=True)`` and assemble the final response ourselves
-        # from ``response.output_item.done``: the high-level ``responses.stream()`` rebuilds from
-        # ``response.completed.response.output``, which Codex returns as ``null`` (SDK crash).
-        resp_kwargs, model, timeout = self._build_responses_kwargs(kwargs)
-        total_timeout = timeout if isinstance(timeout, (int, float)) and timeout > 0 else None
-        guard = _CodexStreamGuard(self._client, total_timeout)
-        try:
-            guard.start()
-            from agent.codex_runtime import _bypass_sdk_request_transform, _consume_codex_event_stream
-            # Keep bulk wire payload out of the SDK's GIL-holding request transform.
-            stream_kwargs = _bypass_sdk_request_transform({**resp_kwargs, "stream": True})
-            event_stream = self._client.responses.create(**stream_kwargs)
-            guard.adopt_stream(event_stream)
-            # The timer may fire while responses.create() is blocked; if the cancelled attempt
-            # had no stream to close then, close it now that it is attempt-owned â€” never the shared client.
-            if guard.timed_out.is_set() and guard.cancel_requested():
-                guard.close_attempt_stream("late cancelled attempt stream close failed")
-            try:
-                # Some Codex-compatible hosts accept ``stream=True`` but return a completed
-                # Responses object (not iterable) â€” don't hand it to the consumer.
-                if hasattr(event_stream, "output"):
-                    final = event_stream
-                else:
-                    final = _consume_codex_event_stream(
-                        event_stream, model=str(resp_kwargs.get("model") or model), on_event=guard.on_event
-                    )
-            finally:
-                guard.release_stream(event_stream)
-            if final is None:
-                raise RuntimeError("Codex auxiliary Responses stream did not return a final response")
-            text_parts, tool_calls_raw, usage = _parse_codex_final_response(final)
-        except Exception as exc:
-            if guard.timed_out.is_set():
-                raise TimeoutError(guard.timeout_message()) from exc
-            logger.debug("Codex auxiliary Responses API call failed: %s", exc)
-            raise
-        finally:
-            guard.finish()
-        # Shape the result like chat.completions.
-        message = SimpleNamespace(
-            role="assistant", content="".join(text_parts).strip() or None,
-            tool_calls=tool_calls_raw or None,
-        )
-        choice = SimpleNamespace(
-            index=0, message=message, finish_reason="stop" if not tool_calls_raw else "tool_calls"
-        )
-        return SimpleNamespace(choices=[choice], model=model, usage=usage)
-
-
-class _ChatShim:
-    """Exposes ``client.chat.completions.create()`` over a sync or async adapter."""
-
-    def __init__(self, adapter: Any):
-        self.completions = adapter
-
-
-class _AsyncCompletionsAdapter:
-    """Async adapter: runs the sync adapter's ``create`` via asyncio.to_thread()."""
-
-    def __init__(self, sync_adapter: Any):
-        self._sync = sync_adapter
-
-    async def create(self, **kwargs) -> Any:
-        import asyncio
-        return await asyncio.to_thread(self._sync.create, **kwargs)
-
-
-class _AsyncAuxiliaryClientBase:
-    """Async-compatible wrapper matching AsyncOpenAI.chat.completions.create().
-
-    Mirrors ``_real_client`` (when the sync wrapper has one) so cache eviction by
-    leaf OpenAI client drops this async entry too instead of reusing a closed transport.
-    """
-
-    def __init__(self, sync_wrapper: Any):
-        self.chat = _ChatShim(_AsyncCompletionsAdapter(sync_wrapper.chat.completions))
-        self.api_key = sync_wrapper.api_key
-        self.base_url = sync_wrapper.base_url
-        if hasattr(sync_wrapper, "_real_client"):
-            # Mirror the sync wrapper's _real_client so cache eviction by leaf OpenAI client (e.g.
-            # _close_client_on_timeout in #23482) drops this async entry too. Without this, sync and async
-            # cache entries diverge on poisoning: the sync entry is evicted but the async entry keeps
-            # reusing the closed transport, failing every subsequent async aux call with 'Connection error'
-            # until the gateway restarts.
-            self._real_client = sync_wrapper._real_client
-
-
-_AsyncAnthropicCompletionsAdapter = _AsyncCompletionsAdapter  # imported by tests
-
-
-class CodexAuxiliaryClient:
-    """OpenAI-client-compatible wrapper routing through the Codex Responses API (.api_key/.base_url for introspection)."""
-
-    def __init__(self, real_client: OpenAI, model: str):
-        self._real_client = real_client
-        self.chat = _ChatShim(_CodexCompletionsAdapter(real_client, model))
-        self.api_key = real_client.api_key
-        self.base_url = real_client.base_url
-
-    def close(self):
-        self._real_client.close()
-
-
-class AsyncCodexAuxiliaryClient(_AsyncAuxiliaryClientBase):
-    pass
-
-
-def _translate_anthropic_response_format(anthropic_kwargs: Dict[str, Any], response_format: Any) -> None:
-    """Merge an OpenAI response format into Anthropic ``output_config``."""
-    if not isinstance(response_format, dict):
-        return
-    format_type = response_format.get("type")
-    if format_type == "json_schema":
-        json_schema = response_format.get("json_schema")
-        if not isinstance(json_schema, dict) or "schema" not in json_schema:
-            return
-        schema = json_schema["schema"]
-    elif format_type == "json_object":
-        # Anthropic SDK has no schema-less JSON mode; only ``json_schema``.
-        schema = {"type": "object"}
-    else:
-        return
-    output_config = anthropic_kwargs.get("output_config")
-    if not isinstance(output_config, dict):
-        output_config = {}
-        anthropic_kwargs["output_config"] = output_config
-    output_config["format"] = {"type": "json_schema", "schema": schema}
-
-
-class _AnthropicCompletionsAdapter:
-    """OpenAI-client-compatible adapter for Anthropic Messages API."""
-
-    def __init__(self, real_client: Any, model: str, is_oauth: bool = False, base_url: str | None = None):
-        self._client = real_client
-        self._model = model
-        self._is_oauth = is_oauth
-        # Caller URL first; fall back to the SDK client's host only for Nous Portal â€” a blanket
-        # fallback would flip MiniMax/Zhipu aux adapters to third-party handling (strips thinking sigs).
-        self._base_url = base_url or None
-        if not self._base_url:
-            candidate = str(getattr(real_client, "base_url", "") or "") or None
-            if candidate:
-                with contextlib.suppress(Exception):
-                    from agent.anthropic_endpoints import _is_nous_portal_endpoint
-                    if _is_nous_portal_endpoint(candidate):
-                        self._base_url = candidate
-
-    def create(self, **kwargs) -> Any:
-        from agent.anthropic_adapter import build_anthropic_kwargs, create_anthropic_message
-        from agent.transports import get_transport
-        model = kwargs.get("model", self._model)
-        # ZAI's Anthropic endpoint rejects max_tokens on vision models (code 1210);
-        # callers signal this via _skip_zai_max_tokens.
-        if kwargs.pop("_skip_zai_max_tokens", False):
-            max_tokens = None
-        else:
-            max_tokens = kwargs.get("max_tokens") or kwargs.get("max_completion_tokens")
-        temperature = kwargs.get("temperature")
-        # Reasoning priority: explicit per-call _reasoning_config (MoA per-slot) wins over
-        # extra_body.reasoning; build_anthropic_kwargs translates to ``thinking``.
-        reasoning_cfg = kwargs.get("_reasoning_config")
-        if reasoning_cfg is None:
-            _eb = kwargs.get("extra_body")
-            _rc = _eb.get("reasoning") if isinstance(_eb, dict) else None
-            if isinstance(_rc, dict):
-                reasoning_cfg = _rc
-        # OpenAI tool_choice (str or dict) â†’ Anthropic-style name/mode string.
-        tool_choice = kwargs.get("tool_choice")
-        if isinstance(tool_choice, dict):
-            choice_type = str(tool_choice.get("type", "")).lower()
-            if choice_type == "function":
-                tool_choice = tool_choice.get("function", {}).get("name")
-            else:
-                tool_choice = choice_type if choice_type in {"auto", "required", "none"} else None
-        elif not isinstance(tool_choice, str):
-            tool_choice = None
-        anthropic_kwargs = build_anthropic_kwargs(
-            model=model, messages=kwargs.get("messages", []), tools=kwargs.get("tools"),
-            max_tokens=max_tokens, reasoning_config=reasoning_cfg, tool_choice=tool_choice,
-            is_oauth=self._is_oauth,
-            # Portal routes on ``anthropic/<slug>`` ids and replays signed thinking
-            # keyed off base_url; omitting it breaks Portal model resolution.
-            base_url=self._base_url,
-        )
-        # Opus 4.7+ rejects non-default temperature/top_p/top_k; build_anthropic_kwargs
-        # also strips these as a safety net â€” keep both layers.
-        if temperature is not None:
-            from agent.anthropic_adapter import _forbids_sampling_params
-            if not _forbids_sampling_params(model):
-                anthropic_kwargs["temperature"] = temperature
-        # Per-request HTTP headers (OpenCode session affinity) â€” the Anthropic SDK accepts
-        # ``extra_headers`` on messages.create/stream too.
-        if isinstance(kwargs.get("extra_headers"), dict) and kwargs["extra_headers"]:
-            anthropic_kwargs["extra_headers"] = {
-                **(anthropic_kwargs.get("extra_headers") or {}),
-                **kwargs["extra_headers"],
-            }
-        # response_format: top-level gets the same translation as the extra_body form; when both
-        # are present the extra_body form wins. Passthrough excludes ``reasoning``/``response_format``
-        # (already TRANSLATED to native fields â€” raw would 400 on strict gateways) and ``_`` Hermes plumbing.
-        # The adapter builds the Messages body from a fixed allow-list of kwargs, so before this an
-        # unrecognized top-level kwarg was dropped on the floor: the request succeeded but the schema
-        # contract silently became prompt compliance (#85626 review, point 2).
-        top_level_response_format = kwargs.get("response_format")
-        if top_level_response_format is not None:
-            _translate_anthropic_response_format(anthropic_kwargs, top_level_response_format)
-        caller_extra_body = kwargs.get("extra_body")
-        if caller_extra_body and isinstance(caller_extra_body, dict):
-            _translate_anthropic_response_format(anthropic_kwargs, caller_extra_body.get("response_format"))
-            passthrough = {
-                k: v for k, v in caller_extra_body.items()
-                if k not in {"reasoning", "response_format"} and not str(k).startswith("_")
-            }
-            if passthrough:
-                existing = anthropic_kwargs.get("extra_body") or {}
-                if not isinstance(existing, dict):
-                    existing = {}
-                anthropic_kwargs["extra_body"] = {**existing, **passthrough}
-        response = create_anthropic_message(
-            self._client,
-            anthropic_kwargs,
-            # Record provider-response timing every event, but tick forward progress only for
-            # substantive payloads so keepalives can't hold a stalled summary open. None keeps
-            # the fast get_final_message path.
-            on_stream_event=(_anthropic_aux_stream_event_hook() if _aux_progress_active() else None),
-        )
-        _nr = get_transport("anthropic_messages").normalize_response(response, strip_tool_prefix=self._is_oauth)
-        usage = None
-        if hasattr(response, "usage") and response.usage:
-            prompt_tokens = getattr(response.usage, "input_tokens", 0) or 0
-            completion_tokens = getattr(response.usage, "output_tokens", 0) or 0
-            usage = SimpleNamespace(
-                prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
-                total_tokens=getattr(response.usage, "total_tokens", 0) or (prompt_tokens + completion_tokens),
-            )
-        # ToolCall already duck-types as OpenAI shape via properties.
-        choice = SimpleNamespace(
-            index=0,
-            message=SimpleNamespace(content=_nr.content, tool_calls=_nr.tool_calls, reasoning=_nr.reasoning),
-            finish_reason=_nr.finish_reason,
-        )
-        return SimpleNamespace(choices=[choice], model=model, usage=usage)
-
-
-class AnthropicAuxiliaryClient:
-    """OpenAI-client-compatible wrapper over a native Anthropic client."""
-
-    def __init__(self, real_client: Any, model: str, api_key: str, base_url: str, is_oauth: bool = False):
-        self._real_client = real_client
-        self.chat = _ChatShim(_AnthropicCompletionsAdapter(real_client, model, is_oauth=is_oauth, base_url=base_url))
-        self.api_key = api_key
-        self.base_url = base_url
-
-    def close(self):
-        close_fn = getattr(self._real_client, "close", None)
-        if callable(close_fn):
-            close_fn()
-
-
-class AsyncAnthropicAuxiliaryClient(_AsyncAuxiliaryClientBase):
-    pass
-
-
-class _BedrockCompletionsAdapter:
-    """Translates ``chat.completions.create(**kwargs)`` into Bedrock Converse."""
-
-    def __init__(self, region: str, model: str):
-        self._region = region
-        self._model = model
-
-    def create(self, **kwargs) -> Any:
-        from agent.bedrock_adapter import call_converse
-        model = kwargs.get("model", self._model)
-        max_tokens = kwargs.get("max_tokens") or kwargs.get("max_completion_tokens")
-        # OpenAI accepts ``stop`` as str or list; Converse requires a list.
-        stop = kwargs.get("stop")
-        if isinstance(stop, str):
-            stop = [stop]
-        if kwargs.get("tool_choice") is not None:
-            # Converse toolChoice isn't wired through call_converse(); surface the drop.
-            logger.debug(
-                "BedrockAuxiliaryClient: tool_choice=%r not supported by the "
-                "Converse shim â€” ignored.", kwargs.get("tool_choice"),
-            )
-        if kwargs.get("stream"):
-            # Converse streaming isn't wired here; call_llm's streaming consumer
-            # detects a final object and downgrades to non-live output.
-            logger.debug(
-                "BedrockAuxiliaryClient: stream=True requested for %s â€” returning a complete response "
-                "(Converse shim does not stream); caller downgrades to non-streaming.", model,
-            )
-        response = call_converse(
-            region=self._region, model=model, messages=kwargs.get("messages", []), tools=kwargs.get("tools"),
-            # Converse specifically defaults to the model maximum when omitted.
-            # Truthiness mirrors the Anthropic shim: explicit 0 means omit.
-            max_tokens=int(max_tokens) if max_tokens else None, temperature=kwargs.get("temperature"),
-            top_p=kwargs.get("top_p"), stop_sequences=stop,
-        )
-        # Converse is complete-response here: mark provider progress only after
-        # return so TTFP reflects real Bedrock latency, not dispatch/setup.
-        _notify_aux_provider_response()
-        return response
-
-
-class BedrockAuxiliaryClient:
-    """OpenAI-client-compatible wrapper over AWS Bedrock Converse API."""
-
-    def __init__(self, region: str, model: str):
-        self._region = region
-        self._model = model
-        self.chat = _ChatShim(_BedrockCompletionsAdapter(region, model))
-        self.api_key = "aws-sdk"
-        self.base_url = f"https://bedrock-runtime.{region}.amazonaws.com"
-
-    def close(self):
-        pass
-
-
-class AsyncBedrockAuxiliaryClient(_AsyncAuxiliaryClientBase):
-    pass
-
-
-def _endpoint_speaks_anthropic_messages(base_url: str) -> bool:
-    """True if ``base_url`` speaks Anthropic Messages, not OpenAI chat.completions.
-
-    Mirrors ``hermes_cli.runtime_provider._detect_api_mode_for_url`` so aux and main agree: any
-    ``/anthropic`` URL (MiniMax, Zhipu, LiteLLM), ``api.kimi.com/coding`` (chat 404s), ``api.anthropic.com``.
-    """
-    normalized = (base_url or "").strip().lower().rstrip("/")
-    if not normalized:
-        return False
-    if urlparse(normalized).path.rstrip("/").endswith(("/anthropic", "/anthropic/v1")):
-        return True
-    hostname = base_url_hostname(normalized)
-    return hostname == "api.anthropic.com" or bool(hostname == "api.kimi.com" and "/coding" in normalized)
-
-
-def _maybe_wrap_anthropic(
-    client_obj: Any, model: str, api_key: str, base_url: str, api_mode: Optional[str] = None
-) -> Any:
-    """Rewrap a plain OpenAI client in ``AnthropicAuxiliaryClient`` when the endpoint speaks Anthropic Messages.
-
-    Single transport-correction chokepoint at the end of every ``resolve_provider_client`` branch; returns
-    ``client_obj`` unchanged for probe stubs/specialized adapters, OpenAI-wire, explicit non-Anthropic
-    ``api_mode``, or missing ``anthropic`` SDK.
-    """
-    # Anthropic/Bedrock/Codex wrappers, plus any client declaring HERMES_SKIP_TRANSPORT_WRAP
-    # (native/ACP shims, in-tree or plugin), must never be re-dispatched through a wire adapter â€”
-    # a class-attribute declaration rather than isinstance so this hot path never imports them.
-    if (
-        isinstance(client_obj, _AuxProbeClientStub)
-        or _safe_isinstance(client_obj, (AnthropicAuxiliaryClient, BedrockAuxiliaryClient, CodexAuxiliaryClient))
-        or _client_declares(client_obj, "HERMES_SKIP_TRANSPORT_WRAP")
-    ):
-        return client_obj
-    # Explicit non-anthropic api_mode wins over URL heuristics.
-    if api_mode != "anthropic_messages" and (api_mode or not _endpoint_speaks_anthropic_messages(base_url)):
-        return client_obj
-    try:
-        from agent.anthropic_adapter import build_anthropic_client
-    except ImportError:
-        logger.warning(
-            "Endpoint %s speaks Anthropic Messages but the anthropic SDK is "
-            "not installed â€” falling back to OpenAI-wire (will likely 404).",
-            base_url,
-        )
-        return client_obj
-    try:
-        real_client = build_anthropic_client(api_key, base_url)
-    except Exception as exc:
-        logger.warning(
-            "Failed to build Anthropic client for %s (%s) â€” falling back to "
-            "OpenAI-wire client.", base_url, exc,
-        )
-        return client_obj
-    logger.debug(
-        "Auxiliary transport: wrapping client in AnthropicAuxiliaryClient "
-        "(model=%s, base_url=%s, api_mode=%s)",
-        model, base_url[:60] if base_url else "", api_mode or "auto-detected",
-    )
-    return AnthropicAuxiliaryClient(real_client, model, api_key, base_url, is_oauth=False)
-
-
-def _read_nous_auth() -> Optional[dict]:
-    """Nous provider state dict from the credential pool or ~/.hermes/auth.json; None when not active with tokens."""
-    pool_present, entry = _select_pool_entry("nous")
-    if pool_present:
-        if entry is None:
-            return None
-        return {
-            "access_token": getattr(entry, "access_token", ""),
-            "refresh_token": getattr(entry, "refresh_token", None),
-            "agent_key": getattr(entry, "agent_key", None),
-            "inference_base_url": _pool_runtime_base_url(entry, _NOUS_DEFAULT_BASE_URL),
-            "portal_base_url": getattr(entry, "portal_base_url", None),
-            "client_id": getattr(entry, "client_id", None),
-            "scope": getattr(entry, "scope", None),
-            "token_type": getattr(entry, "token_type", "Bearer"),
-            "source": "pool",
-        }
-    try:
-        if not _AUTH_JSON_PATH.is_file():
-            return None
-        data = json.loads(_AUTH_JSON_PATH.read_text(encoding="utf-8-sig"))
-        if data.get("active_provider") != "nous":
-            return None
-        provider = data.get("providers", {}).get("nous", {})
-        # Must have at least an access_token or agent_key.
-        if not provider.get("agent_key") and not provider.get("access_token"):
-            return None
-        return provider
-    except Exception as exc:
-        logger.debug("Could not read Nous auth: %s", exc)
-        return None
-
-
-def _nous_api_key(provider: dict) -> str:
-    """Extract a usable Nous inference JWT from stored auth state."""
-    from hermes_cli.auth import _nous_invoke_jwt_is_usable
-    for token_key, expiry_key in (("agent_key", "agent_key_expires_at"), ("access_token", "expires_at")):
-        token = provider.get(token_key)
-        if not isinstance(token, str) or not token.strip():
-            continue
-        if _nous_invoke_jwt_is_usable(token, scope=provider.get("scope"), expires_at=provider.get(expiry_key)):
-            return token
-    return ""
-
-
-def _resolve_nous_pool_runtime_api(*, force_refresh: bool = False) -> Optional[tuple[str, str]]:
-    """Resolve Nous auxiliary credentials from the selected pool entry."""
-    try:
-        from hermes_cli.auth import _agent_key_is_usable
-        pool = load_pool("nous")
-    except Exception as exc:
-        logger.debug("Auxiliary Nous pool credential resolution failed: %s", exc)
-        return None
-    if not pool or not pool.has_credentials():
-        return None
-    try:
-        entry = pool.select()
-    except Exception as exc:
-        logger.debug("Auxiliary Nous pool selection failed: %s", exc)
-        return None
-    if entry is None:
-        return None
-
-    def _entry_state(e: Any) -> Dict[str, Any]:
-        return {k: getattr(e, k, None) for k in (
-            "agent_key", "agent_key_expires_at", "access_token", "expires_at", "scope")}
-
-    if force_refresh or not _agent_key_is_usable(_entry_state(entry), _nous_min_key_ttl_seconds()):
-        try:
-            refreshed = pool.try_refresh_current()
-        except Exception as exc:
-            logger.debug("Auxiliary Nous pool refresh failed: %s", exc)
-            refreshed = None
-        if refreshed is None:
-            return None
-        entry = refreshed
-    api_key = _nous_api_key(_entry_state(entry))
-    base_url = _pool_runtime_base_url(entry, _NOUS_DEFAULT_BASE_URL)
-    if not api_key or not base_url:
-        return None
-    return api_key, base_url
-
-
-def _resolve_nous_runtime_api(
-    *, force_refresh: bool = False, stale_access_token: Optional[str] = None
-) -> Optional[tuple[str, str]]:
-    """Fresh Nous runtime credentials (pool first, then auth store + JWT refresh) â€” mirrors the main
-    agent's 401 recovery. ``stale_access_token`` is the bearer that just 401'd; with ``force_refresh``
-    it lets the auth store adopt a sibling process's rotation instead of re-POSTing the shared grant."""
-    pooled = _resolve_nous_pool_runtime_api(force_refresh=force_refresh)
-    if pooled is not None:
-        return pooled
-    try:
-        from hermes_cli.auth import resolve_nous_runtime_credentials
-        creds = resolve_nous_runtime_credentials(
-            timeout_seconds=env_float("HERMES_NOUS_TIMEOUT_SECONDS", 15),
-            force_refresh=force_refresh,
-            stale_access_token=stale_access_token or None,
-        )
-    except Exception as exc:
-        logger.debug("Auxiliary Nous runtime credential resolution failed: %s", exc)
-        return None
-    return _creds_pair(creds)
-
-
-def _creds_pair(creds: Dict[str, Any]) -> Optional[Tuple[str, str]]:
-    """``(api_key, base_url)`` from a runtime-credentials dict, or None when either is missing."""
-    api_key = str(creds.get("api_key") or "").strip()
-    base_url = str(creds.get("base_url") or "").strip().rstrip("/")
-    if not api_key or not base_url:
-        return None
-    return api_key, base_url
-
-
-def _resolve_xai_oauth_for_aux() -> Optional[Tuple[str, str]]:
-    """Fresh xAI OAuth (api_key, base_url) for aux clients, or None.
-
-    Pool first (some xAI OAuth logins exist only as pool entries), then the singleton auth-store resolver.
-    """
-    try:
-        from hermes_cli.auth import DEFAULT_XAI_OAUTH_BASE_URL, _xai_validate_inference_base_url
-        pool = load_pool("xai-oauth")
-        if pool and pool.has_credentials():
-            entry = pool.select()
-            if entry is not None:
-                api_key = str(
-                    getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "") or ""
-                ).strip()
-                _url = lambda v: str(v or "").strip().rstrip("/")  # noqa: E731
-                base_url = _xai_validate_inference_base_url(
-                    _url(os.getenv("HERMES_XAI_BASE_URL", ""))
-                    or _url(os.getenv("XAI_BASE_URL", ""))
-                    or _url(getattr(entry, "runtime_base_url", None))
-                    or _url(getattr(entry, "base_url", None)),
-                    fallback=DEFAULT_XAI_OAUTH_BASE_URL,
-                )
-                if api_key and base_url:
-                    return api_key, base_url
-    except Exception as exc:
-        logger.debug("Auxiliary xAI OAuth pool credential resolution failed: %s", exc)
-    try:
-        from hermes_cli.auth import resolve_xai_oauth_runtime_credentials
-        creds = resolve_xai_oauth_runtime_credentials()
-    except Exception as exc:
-        logger.debug("Auxiliary xAI OAuth runtime credential resolution failed: %s", exc)
-        return None
-    return _creds_pair(creds)
-
-
-def _read_codex_access_token() -> Optional[str]:
-    """Valid, non-expired Codex OAuth access token; an exhausted pool falls back to the profile's auth.json token."""
-    pool_present, entry = _select_pool_entry("openai-codex")
-    if pool_present:
-        token = _pool_runtime_api_key(entry)
-        if token:
-            return token
-    try:
-        from hermes_cli.auth import _read_codex_tokens
-        access_token = _read_codex_tokens().get("tokens", {}).get("access_token")
-        if not isinstance(access_token, str) or not access_token.strip():
-            return None
-        # Expired JWTs would block the auto chain and prevent fallback to working providers.
-        try:
-            import base64
-            payload = access_token.split(".")[1]
-            payload += "=" * (-len(payload) % 4)
-            exp = json.loads(base64.urlsafe_b64decode(payload)).get("exp", 0)
-            if exp and time.time() > exp:
-                logger.debug("Codex access token expired (exp=%s), skipping", exp)
-                return None
-        except Exception:
-            pass  # Non-JWT token or decode error â€” use as-is
-        return access_token.strip()
-    except Exception as exc:
-        logger.debug("Could not read Codex auth for auxiliary client: %s", exc)
-        return None
-
-
-def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
-    """Try each API-key provider in PROVIDER_REGISTRY order; (client, model) or (None, None)."""
-    try:
-        from hermes_cli.auth import PROVIDER_REGISTRY, resolve_api_key_provider_credentials
-    except ImportError:
-        logger.debug("Could not import PROVIDER_REGISTRY for API-key fallback")
-        return None, None
-    for provider_id, pconfig in PROVIDER_REGISTRY.items():
-        if pconfig.auth_type != "api_key":
-            continue
-        if _is_provider_unhealthy(provider_id):
-            logger.debug("Auxiliary api-key chain: %s is unhealthy, skipping", provider_id)
-            continue
-        if provider_id == "anthropic":
-            # Explicit-config gate: Claude Code credentials must not silently become aux fallback.
-            with contextlib.suppress(ImportError):
-                from hermes_cli.auth import is_provider_explicitly_configured
-                if not is_provider_explicitly_configured("anthropic"):
-                    continue
-            return _try_anthropic()
-        pool_present, entry = _select_pool_entry(provider_id)
-        if pool_present:
-            api_key = _pool_runtime_api_key(entry)
-            if not api_key:
-                continue
-            raw_base_url = _pool_runtime_base_url(entry, pconfig.inference_base_url) or pconfig.inference_base_url
-            via = " via pool"
-        else:
-            creds = resolve_api_key_provider_credentials(provider_id)
-            api_key = str(creds.get("api_key", "")).strip()
-            if not api_key:
-                continue
-            raw_base_url = str(creds.get("base_url", "")).strip().rstrip("/") or pconfig.inference_base_url
-            via = ""
-        model = _get_aux_model_for_provider(provider_id) or None
-        if model is None:
-            continue  # skip provider if we don't know a valid aux model
-        logger.debug("Auxiliary text client: %s (%s)%s", pconfig.name, model, via)
-        # Native Gemini, else OpenAI-wire + Anthropic rewrap.
-        base_url = _to_openai_base_url(raw_base_url)
-        if provider_id == "gemini":
-            from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
-            if is_native_gemini_base_url(base_url):
-                return GeminiNativeClient(api_key=api_key, base_url=base_url), model
-        if base_url_host_matches(base_url, "api.kimi.com"):
-            headers = {"User-Agent": "claude-code/0.1.0"}
-        elif base_url_host_matches(base_url, "githubcopilot.com"):
-            from hermes_cli.models import copilot_default_headers
-            headers = copilot_default_headers()
-        elif base_url_host_matches(base_url, "integrate.api.nvidia.com"):
-            headers = build_nvidia_nim_headers(base_url)
-        else:
-            headers = _profile_default_headers(provider_id)
-        extra = {"default_headers": headers} if headers else {}
-        merged = _apply_user_default_headers(extra.get("default_headers"))
-        if merged:
-            extra["default_headers"] = merged
-        client = _create_openai_client(api_key=api_key, base_url=base_url, **extra)
-        return _maybe_wrap_anthropic(client, model, api_key, raw_base_url), model
-    return None, None
-
-
-def _endpoint_default_headers(
-    base_url: str, provider: str, *, is_vision: bool = False, xai: bool = False,
-) -> Optional[dict]:
-    """Provider-specific client headers by endpoint host, merged with user ``model.default_headers``.
-
-    Kimi Code needs the claude-code User-Agent; Copilot needs its request headers
-    (``is_vision`` adds Copilot-Vision-Request); NVIDIA NIM and (optionally) xAI have
-    their own fingerprints; anything else falls back to the provider profile.
-    """
-    if base_url_host_matches(base_url, "api.kimi.com"):
-        headers: dict = {"User-Agent": "claude-code/0.1.0"}
-    elif base_url_host_matches(base_url, "githubcopilot.com"):
-        from hermes_cli.copilot_auth import copilot_request_headers
-        headers = dict(copilot_request_headers(is_agent_turn=True, is_vision=is_vision))
-    elif base_url_host_matches(base_url, "integrate.api.nvidia.com"):
-        headers = dict(build_nvidia_nim_headers(base_url))
-    elif xai and base_url_host_matches(base_url, "x.ai"):
-        from tools.xai_http import hermes_xai_default_headers
-        headers = dict(hermes_xai_default_headers())
-    else:
-        headers = _profile_default_headers(provider) or {}
-    return _apply_user_default_headers(headers or None) or None
-
-
-def _profile_default_headers(provider: str) -> Optional[dict]:
-    """Client-level attribution headers from the provider profile (e.g. GMI User-Agent), or None."""
-    if not provider:
-        return None
-    with contextlib.suppress(Exception):
-        from providers import get_provider_profile
-        profile = get_provider_profile(provider)
-        if profile and profile.default_headers:
-            return dict(profile.default_headers)
-    return None
-
-
-# Provider resolution helpers
-
-_paid_lane_warned: set = set()
-
-
-def _is_free_model(model: Optional[str]) -> bool:
-    """True when ``model`` is a free SKU (``:free`` suffix or ``stealth/`` prefix) â€” naming-convention trust."""
-    if not model:
-        return False
-    normalized = str(model).strip()
-    return normalized.endswith(":free") or normalized.startswith("stealth/")
-
-
-def _aux_openrouter_settings() -> Tuple[bool, str]:
-    """Read (free_only, openrouter_model) from config; (False, _OPENROUTER_MODEL) on failure."""
-    try:
-        from hermes_cli.config import cfg_get, load_config_readonly
-        cfg = load_config_readonly()
-        free_only = bool(cfg_get(cfg, "auxiliary", "free_only", default=False))
-        val = cfg_get(cfg, "auxiliary", "openrouter_model")
-        model = val.strip() if isinstance(val, str) and val.strip() else _OPENROUTER_MODEL
-        return free_only, model
-    except Exception:
-        return False, _OPENROUTER_MODEL
-
-
-def _warn_paid_lane_once(model: str) -> None:
-    """Log a WARNING the first time a non-free OpenRouter model is engaged."""
-    if model in _paid_lane_warned:
-        return
-    _paid_lane_warned.add(model)
-    logger.warning(
-        "Auxiliary client: PAID lane engaged for auxiliary task â€” OpenRouter fallback model %r is not "
-        "a :free SKU and may incur real spend. Set auxiliary.free_only: true to restrict auxiliary "
-        "fallbacks to free models, or auxiliary.openrouter_model to a :free model.", model,
-    )
-
-
-def _try_openrouter(explicit_api_key: str = None, model: str = None) -> Tuple[Optional[OpenAI], Optional[str]]:
-    free_only, cfg_model = _aux_openrouter_settings()
-    or_model = model or cfg_model
-    if free_only and not _is_free_model(or_model):
-        logger.warning(
-            "Auxiliary client: auxiliary.free_only is enabled but the OpenRouter fallback model %r is "
-            "not a :free SKU â€” skipping the OpenRouter fallback. Set auxiliary.openrouter_model to a "
-            ":free model (e.g. nvidia/nemotron-3-ultra-550b-a55b:free) or disable auxiliary.free_only.",
-            or_model,
-        )
-        return None, None
-    if not _is_free_model(or_model):
-        _warn_paid_lane_once(or_model)
-    pool_present, entry = _select_pool_entry("openrouter")
-    if pool_present:
-        or_key = explicit_api_key or _pool_runtime_api_key(entry)
-        if or_key:
-            base_url = _pool_runtime_base_url(entry, OPENROUTER_BASE_URL) or OPENROUTER_BASE_URL
-            logger.debug("Auxiliary client: OpenRouter via pool")
-            return _create_openai_client(
-                api_key=or_key, base_url=base_url, default_headers=build_or_headers()
-            ), or_model
-        # Exhausted pool: fall through to OPENROUTER_API_KEY rather than fail.
-        logger.debug("Auxiliary client: OpenRouter pool exhausted, trying OPENROUTER_API_KEY")
-    or_key = explicit_api_key or _scoped_key_env("OPENROUTER_API_KEY")
-    if not or_key:
-        _mark_provider_unhealthy("openrouter", ttl=60)
-        return None, None
-    logger.debug("Auxiliary client: OpenRouter")
-    return _create_openai_client(
-        api_key=or_key, base_url=OPENROUTER_BASE_URL, default_headers=build_or_headers()
-    ), or_model
-
-
-def _describe_openrouter_unavailable(model: str = None) -> str:
-    """Return the policy or credential reason OpenRouter was unavailable."""
-    free_only, cfg_model = _aux_openrouter_settings()
-    or_model = model or cfg_model
-    if free_only and not _is_free_model(or_model):
-        return (
-            f"auxiliary.free_only rejected non-free model {or_model!r}; "
-            "the request was skipped before provider availability checks"
-        )
-    pool_present, entry = _select_pool_entry("openrouter")
-    if pool_present:
-        if entry is None:
-            return "OpenRouter credential pool has no usable entries (credentials may be exhausted)"
-        if not _pool_runtime_api_key(entry):
-            return "OpenRouter credential pool entry is missing a runtime API key"
-    if not _scoped_key_env("OPENROUTER_API_KEY"):
-        return "OPENROUTER_API_KEY not set"
-    return "no usable OpenRouter credentials found"
-
-
-def _try_nous(vision: bool = False) -> Tuple[Optional[OpenAI], Optional[str]]:
-    # Cross-session rate guard: another session's 429 means skip Nous rather than pile onto the tapped RPH bucket.
-    with contextlib.suppress(Exception):
-        from agent.nous_rate_guard import nous_rate_limit_remaining
-        _remaining = nous_rate_limit_remaining()
-        if _remaining is not None and _remaining > 0:
-            logger.debug("Auxiliary: skipping Nous Portal (rate-limited, resets in %.0fs)", _remaining)
-            _mark_provider_unhealthy("nous", ttl=_remaining)
-            return None, None
-    nous = _read_nous_auth()
-    runtime = _resolve_nous_runtime_api(force_refresh=False)
-    if runtime is None and not nous:
-        logger.warning("Auxiliary Nous client unavailable: no Nous authentication found (run: hermes auth).")
-        _mark_provider_unhealthy("nous", ttl=60)
-        return None, None
-    if runtime is None and nous:
-        logger.debug("Auxiliary Nous: runtime JWT refresh failed; checking stored auth.json token.")
-    global auxiliary_is_nous
-    auxiliary_is_nous = True
-    logger.debug("Auxiliary client: Nous Portal")
-    # Portal recommended-models is authoritative (tier-aware); _NOUS_MODEL when unreachable/null.
-    # Probes skip the lookup: exact model is irrelevant and it hits the network.
-    model = _NOUS_MODEL
-    lane = "vision" if vision else "text"
-    if not _aux_probe_active():
-        try:
-            from hermes_cli.models import get_nous_recommended_aux_model
-            recommended = get_nous_recommended_aux_model(vision=vision)
-            if recommended:
-                model = recommended
-                logger.debug("Auxiliary/%s: using Portal-recommended model %s", lane, model)
-            else:
-                logger.debug("Auxiliary/%s: no Portal recommendation, falling back to %s", lane, model)
-        except Exception as exc:
-            logger.debug(
-                "Auxiliary/%s: recommended-models lookup failed (%s); "
-                "falling back to %s",
-                lane, exc, model,
-            )
-    if runtime is not None:
-        api_key, base_url = runtime
-    else:
-        api_key = _nous_api_key(nous or {})
-        if not api_key:
-            logger.warning(
-                "Auxiliary Nous client unavailable: no usable inference JWT found "
-                "(run: hermes auth add nous)."
-            )
-            _mark_provider_unhealthy("nous", ttl=60)
-            return None, None
-        base_url = str(
-            (nous or {}).get("inference_base_url") or os.getenv("NOUS_INFERENCE_BASE_URL", _NOUS_DEFAULT_BASE_URL)
-        ).rstrip("/")
-    return _create_openai_client(api_key=api_key, base_url=base_url), model
-
-
-def _refresh_nous_recommended_model(*, vision: bool, stale_model: Optional[str]) -> Optional[str]:
-    """Fresh Portal recommended model after a stale-model 404 (long-lived processes pin dropped models).
-
-    Returns the fresh recommendation, else ``_NOUS_MODEL``, whichever differs from ``stale_model``; None if neither.
-    """
-    stale = (stale_model or "").strip().lower()
-    fresh: Optional[str] = None
-    try:
-        from hermes_cli.models import get_nous_recommended_aux_model
-        fresh = get_nous_recommended_aux_model(vision=vision, force_refresh=True)
-    except Exception as exc:
-        logger.debug("Nous recommended-model refresh failed (%s); using default %s", exc, _NOUS_MODEL)
-    if fresh and fresh.strip().lower() != stale:
-        return fresh
-    return _NOUS_MODEL if _NOUS_MODEL.strip().lower() != stale else None
-
-
-def _read_main_field(field: str, *, readonly: bool, lower: bool = False) -> str:
-    """Main ``model.<field>``: runtime override (``set_runtime_main``) first, then config.yaml.
-
-    The override wins so "active main model" gates see the live CLI/gateway runtime, not the persisted
-    default. ``readonly`` picks ``load_config_readonly`` (model/provider) vs ``load_config`` (api_key/base_url).
-    """
-    override = _runtime_main_value(field)
-    if isinstance(override, str) and override.strip():
-        value = override.strip()
-        return value.lower() if lower else value
-    with contextlib.suppress(Exception):
-        from hermes_cli import config as _cfg_mod
-        cfg = (_cfg_mod.load_config_readonly if readonly else _cfg_mod.load_config)()
-        model_cfg = cfg.get("model", {})
-        if field == "model" and isinstance(model_cfg, str) and model_cfg.strip():
-            return model_cfg.strip()
-        if isinstance(model_cfg, dict):
-            value = model_cfg.get("default" if field == "model" else field, "")
-            if isinstance(value, str) and value.strip():
-                value = value.strip()
-                return value.lower() if lower else value
-    return ""
-
-
-# Module-level callables (tests patch them): model/provider (lowercased) read the readonly config;
-# api_key/base_url read the full config so ``custom`` aux tasks can inherit main creds.
-_read_main_model = functools.partial(_read_main_field, "model", readonly=True)
-_read_main_provider = functools.partial(_read_main_field, "provider", readonly=True, lower=True)
-_read_main_api_key = functools.partial(_read_main_field, "api_key", readonly=False)
-_read_main_base_url = functools.partial(_read_main_field, "base_url", readonly=False)
-
-
-def _resolve_moa_aggregator(preset_name: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
-    """MoA preset â†’ aggregator (provider, model); (None, None) if unresolvable. None/"" = default preset.
-
-    "moa" is virtual â€” aux tasks skip the fan-out and use the aggregator slot; shared so lookup can't drift.
-    """
-    try:
-        from hermes_cli.config import load_config
-        from hermes_cli.moa_config import resolve_moa_preset
-        preset = resolve_moa_preset(load_config().get("moa") or {}, preset_name or None)
-        agg = preset.get("aggregator") or {}
-        agg_provider = str(agg.get("provider") or "").strip()
-        agg_model = str(agg.get("model") or "").strip()
-        if agg_provider and agg_model and agg_provider.lower() != "moa":
-            return agg_provider, agg_model
-    except Exception:
-        logger.debug("MoA aggregator resolution failed for preset %r", preset_name, exc_info=True)
-    return None, None
-
-
-def _read_main_model_for_aux() -> str:
-    """Main model with MoA presets unwrapped to the aggregator's model; "" when unresolvable (a preset name would 400)."""
-    model = _read_main_model()
-    if (_read_main_provider() or "").strip().lower() == "moa":
-        _, agg_model = _resolve_moa_aggregator(model)
-        return agg_model or ""
-    return model
-
-
-def _read_main_api_key_if_same_host(aux_base_url: str) -> str:
-    """Main api_key only when *aux_base_url* shares the main base_url's host.
-
-    Unconditional inheritance would leak the credential to any misconfigured host; mismatch keeps ``no-key-required`` â†’ 401.
-    """
-    aux_host = base_url_hostname(aux_base_url)
-    if not aux_host or aux_host != base_url_hostname(_read_main_base_url()):
-        return ""
-    return _read_main_api_key()
-
-
-# Compatibility mirrors for older readers/tests; the ContextVar below is
-# authoritative (overlapping gateway sessions make a process-global unsafe).
-_RUNTIME_MAIN_PROVIDER: str = ""
-_RUNTIME_MAIN_MODEL: str = ""
-_RUNTIME_MAIN_BASE_URL: str = ""
-_RUNTIME_MAIN_API_KEY: Any = ""
-_RUNTIME_MAIN_API_MODE: str = ""
-_RUNTIME_MAIN_AUTH_MODE: str = ""
-_RUNTIME_MAIN_CONTEXT: contextvars.ContextVar[Optional[Dict[str, Any]]] = (
-    contextvars.ContextVar("auxiliary_runtime_main", default=None)
-)
-
-_RELAY_AUX_CALL_CONTEXT: contextvars.ContextVar[Optional[Dict[str, Any]]] = (
-    contextvars.ContextVar("auxiliary_relay_call", default=None)
-)
-
-
-@contextlib.contextmanager
-def _relay_aux_call_scope(args: tuple, kwargs: dict):
-    """Bind a fresh relay call context for one auxiliary call; mark it failed on any exception."""
-    task = args[0] if args else kwargs.get("task")
-    token = _RELAY_AUX_CALL_CONTEXT.set({
-        "task": str(task or "unknown"),
-        "request_id": f"aux-{uuid.uuid4().hex}",
-        "attempt_count": 0,
-        "provider": "",
-        "model": "",
-        "response_model": None,
-        "api_mode": "chat_completions",
-    })
-    try:
-        yield
-    except BaseException:
-        _fail_relay_auxiliary_call()
-        raise
-    finally:
-        _RELAY_AUX_CALL_CONTEXT.reset(token)
-
-
-def _relay_auxiliary_call(callback):
-    """Give every physical retry in one auxiliary call a shared Relay identity."""
-    @functools.wraps(callback)
-    def wrapped(*args, **kwargs):
-        with _relay_aux_call_scope(args, kwargs):
-            return callback(*args, **kwargs)
-    return wrapped
-
-
-def _relay_auxiliary_call_async(callback):
-    """Async counterpart to :func:`_relay_auxiliary_call`."""
-    @functools.wraps(callback)
-    async def wrapped(*args, **kwargs):
-        with _relay_aux_call_scope(args, kwargs):
-            return await callback(*args, **kwargs)
-    return wrapped
-
-
-def _set_relay_auxiliary_route(provider: str | None, model: str | None, api_mode: str | None) -> None:
-    context = _RELAY_AUX_CALL_CONTEXT.get()
-    if context is None:
-        return
-    context["provider"] = str(provider or "auxiliary")
-    context["model"] = str(model or "unknown")
-    context["response_model"] = None
-    context["api_mode"] = str(api_mode or "chat_completions")
-
-
-def _record_route_info(
-    route_info: Optional[Dict[str, str]], provider: Optional[str], model: Optional[str]
-) -> None:
-    """Expose the concrete route selected for one auxiliary call."""
-    if route_info is not None:
-        route_info["provider"] = provider or "auto"
-        route_info["model"] = model or "default"
-
-
-def _relay_auxiliary_metadata(
-    *, provider: str | None = None, api_mode: str | None = None
-) -> tuple[str, str, dict[str, Any]] | None:
-    context = _RELAY_AUX_CALL_CONTEXT.get()
-    if context is None:
-        return None
-    attempt_count = int(context.get("attempt_count") or 0)
-    context["attempt_count"] = attempt_count + 1
-    provider_name = str(provider or context.get("provider") or "auxiliary")
-    model_name = str(context.get("model") or "unknown")
-    return provider_name, model_name, {
-        "api_mode": str(api_mode or context.get("api_mode") or "chat_completions"),
-        "api_request_id": str(context["request_id"]),
-        "call_role": f"auxiliary:{context['task']}",
-        "retry_count": attempt_count,
-        "auxiliary_task": str(context["task"]),
-    }
-
-
-def _relay_sync_completion(
-    client: Any, kwargs: dict[str, Any], *, provider: str | None = None,
-    api_mode: str | None = None, create: Callable[[dict[str, Any]], Any] | None = None,
-) -> Any:
-    from agent.auxiliary_wire import prepare_chat_messages
-
-    kwargs = prepare_chat_messages(client, kwargs)
-    callback = create or (lambda request: client.chat.completions.create(**request))
-    route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
-    # Isolate only the provider callback so the owning thread can unwind its lease/DB
-    # transaction on hard cancel without touching the shared client.
-    if route is None:
-        return _run_protected_sync_provider_call(callback, kwargs)
-    provider_name, fallback_model, metadata = route
-    from agent import relay_llm
-    return relay_llm.execute_current(
-        kwargs, lambda request: _run_protected_sync_provider_call(callback, request),
-        name=provider_name, model_name=str(kwargs.get("model") or fallback_model),
-        metadata=metadata, defer_logical_completion=True,
-    )
-
-
-async def _relay_async_completion(
-    client: Any, kwargs: dict[str, Any], *, provider: str | None = None,
-    api_mode: str | None = None, create: Callable[[dict[str, Any]], Any] | None = None,
-) -> Any:
-    from agent.auxiliary_wire import prepare_chat_messages
-
-    kwargs = prepare_chat_messages(client, kwargs)
-    callback = create or (lambda request: client.chat.completions.create(**request))
-    route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
-    if route is None:
-        return await callback(kwargs)
-    provider_name, fallback_model, metadata = route
-    from agent import relay_llm
-    return await relay_llm.execute_current_async(
-        kwargs, callback, name=provider_name, model_name=str(kwargs.get("model") or fallback_model),
-        metadata=metadata, defer_logical_completion=True,
-    )
-
-
-def _relay_sync_stream(
-    client: Any, kwargs: dict[str, Any], *, provider: str | None = None, api_mode: str | None = None
-) -> Any:
-    from agent.auxiliary_wire import prepare_chat_messages
-
-    kwargs = prepare_chat_messages(client, kwargs)
-    route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
-    if route is None:
-        return client.chat.completions.create(**kwargs)
-    provider_name, fallback_model, metadata = route
-    from agent import relay_llm
-    return relay_llm.stream_current(
-        kwargs, lambda request: client.chat.completions.create(**request), name=provider_name,
-        model_name=str(kwargs.get("model") or fallback_model), finalizer=dict, metadata=metadata,
-        completed_response_predicate=lambda value: hasattr(value, "choices"),
-    )
-
-
-_RUNTIME_MAIN_COMPAT_SNAPSHOT: Tuple[Any, ...] = ("", "", "", "", "", "")
-_RUNTIME_MAIN_COMPAT_LOCK = threading.Lock()
-
-
-def _publish_runtime_main_mirrors(values: Tuple[Any, ...]) -> None:
-    """Write the legacy globals + compat snapshot (``_MAIN_RUNTIME_FIELDS`` order) under the lock."""
-    global _RUNTIME_MAIN_PROVIDER, _RUNTIME_MAIN_MODEL, _RUNTIME_MAIN_BASE_URL, _RUNTIME_MAIN_API_KEY
-    global _RUNTIME_MAIN_API_MODE, _RUNTIME_MAIN_AUTH_MODE, _RUNTIME_MAIN_COMPAT_SNAPSHOT
-    with _RUNTIME_MAIN_COMPAT_LOCK:
-        (_RUNTIME_MAIN_PROVIDER, _RUNTIME_MAIN_MODEL, _RUNTIME_MAIN_BASE_URL,
-         _RUNTIME_MAIN_API_KEY, _RUNTIME_MAIN_API_MODE, _RUNTIME_MAIN_AUTH_MODE) = values
-        _RUNTIME_MAIN_COMPAT_SNAPSHOT = tuple(values)
-
-
-def _compat_runtime_main() -> Optional[Dict[str, Any]]:
-    """Expose deliberately patched legacy globals as a main context.
-
-    Mirrors must never become runtime inputs: a direct patch counts only when it differs from
-    the mirrored snapshot and only on the main thread.
-    """
-    if threading.current_thread() is not threading.main_thread():
-        return None
-    values = (_RUNTIME_MAIN_PROVIDER, _RUNTIME_MAIN_MODEL, _RUNTIME_MAIN_BASE_URL,
-              _RUNTIME_MAIN_API_KEY, _RUNTIME_MAIN_API_MODE, _RUNTIME_MAIN_AUTH_MODE)
-    if values == _RUNTIME_MAIN_COMPAT_SNAPSHOT:
-        return None
-    return dict(zip(_MAIN_RUNTIME_FIELDS, values))
-
-
-def _runtime_main_value(field: str) -> Any:
-    """Read one runtime field through context-local/controlled legacy state."""
-    runtime = _RUNTIME_MAIN_CONTEXT.get()
-    if runtime is None:
-        runtime = _compat_runtime_main()
-    return (runtime.get(field) or "") if isinstance(runtime, dict) else ""
-
-
-def set_runtime_main(
-    provider: str, model: str, *, requested_provider: str = "", base_url: str = "",
-    api_key: Any = "", api_mode: str = "", auth_mode: str = "", session_id: str = "",
-    cache_scope: str = "",
-) -> contextvars.Token:
-    """Record the current context's live main runtime for auxiliary routing.
-
-    Context-local so concurrent gateway sessions don't clobber each other; legacy mirrors are
-    updated for old readers. ``cache_scope`` is the rotation-stable logical cache scope,
-    preferred over ``session_id`` for prompt_cache_key derivation.
-
-    ``cache_scope`` is the rotation-stable logical cache scope (compression- lineage root â€”
-    agent/prompt_cache_scope.py) resolved once per turn by turn_context; auxiliary Responses calls prefer it
-    over ``session_id`` for prompt_cache_key derivation (#79017).
-    """
-    runtime = {
-        "provider": (provider or "").strip().lower(),
-        "requested_provider": (requested_provider or "").strip().lower(),
-        "model": (model or "").strip(),
-        "base_url": (base_url or "").strip(),
-        "api_key": api_key.strip() if isinstance(api_key, str) else api_key if callable(api_key) else "",
-        "api_mode": (api_mode or "").strip(),
-        "auth_mode": (auth_mode or "").strip().lower(),
-        "session_id": (session_id or "").strip(),
-        "cache_scope": (cache_scope or "").strip(),
-    }
-    # Publish authoritative context before updating the locked mirrors.
-    token = _RUNTIME_MAIN_CONTEXT.set(runtime)
-    _publish_runtime_main_mirrors(tuple(runtime[field] for field in _MAIN_RUNTIME_FIELDS))
-    return token
-
-
-def reset_runtime_main(token: contextvars.Token) -> None:
-    """Restore the runtime binding that preceded one scoped turn."""
-    if token is None:
-        return
-    try:
-        _RUNTIME_MAIN_CONTEXT.reset(token)
-    except (RuntimeError, ValueError):
-        pass  # Tokens can't be reset from a copied Context (workers inherit values, not token ownership).
-
-
-@contextlib.contextmanager
-def scoped_runtime_main(main_runtime: Optional[Dict[str, Any]]):
-    """Temporarily bind an explicit runtime without touching legacy mirrors."""
-    runtime = _normalize_main_runtime(main_runtime)
-    token = _RUNTIME_MAIN_CONTEXT.set(runtime or None)
-    try:
-        yield runtime
-    finally:
-        _RUNTIME_MAIN_CONTEXT.reset(token)
-
-
-def clear_runtime_main() -> None:
-    """Clear the runtime override in the current context."""
-    _RUNTIME_MAIN_CONTEXT.set(None)
-    _publish_runtime_main_mirrors(("", "", "", "", "", ""))
-
-
-def _resolve_custom_runtime() -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """Resolve the active custom/main endpoint like the main CLI (env OPENAI_BASE_URL or config-saved)."""
-    try:
-        from hermes_cli.runtime_provider import resolve_runtime_provider
-        runtime = resolve_runtime_provider(requested="custom")
-    except Exception as exc:
-        logger.debug("Auxiliary client: custom runtime resolution failed: %s", exc)
-        runtime = None
-    if not isinstance(runtime, dict):
-        openai_base = os.getenv("OPENAI_BASE_URL", "").strip().rstrip("/")
-        if not openai_base:
-            return None, None, None
-        runtime = {"base_url": openai_base, "api_key": _scoped_key_env("OPENAI_API_KEY")}
-    custom_base = runtime.get("base_url")
-    custom_key = runtime.get("api_key")
-    custom_mode = runtime.get("api_mode")
-    if not isinstance(custom_base, str) or not custom_base.strip():
-        return None, None, None
-    custom_base = custom_base.strip().rstrip("/")
-    if base_url_host_matches(custom_base, "openrouter.ai"):
-        return None, None, None  # requested='custom' falls back to OpenRouter when unconfigured.
-    # Local servers (Ollama, vLLM, ...) ignore auth but the SDK needs a non-empty key.
-    # Use a placeholder key â€” the OpenAI SDK requires a non-empty string but local servers ignore the
-    # Authorization header. Same fix as cli.py _ensure_runtime_credentials() (PR #2556).
-    if not isinstance(custom_key, str) or not custom_key.strip():
-        custom_key = "no-key-required"
-    if not isinstance(custom_mode, str) or not custom_mode.strip():
-        custom_mode = None
-    return custom_base, custom_key.strip(), custom_mode
-
-
-def _current_custom_base_url() -> str:
-    custom_base, _, _ = _resolve_custom_runtime()
-    return custom_base or ""
-
-
-def _validate_proxy_env_urls() -> None:
-    """Fail fast on malformed proxy env URLs (a shell typo like ``:6153export`` otherwise surfaces as a cryptic httpx ``Invalid port``)."""
-    from urllib.parse import urlparse
-    normalize_proxy_env_vars()
-    for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy"):
-        value = str(os.environ.get(key) or "").strip()
-        if not value:
-            continue
-        try:
-            parsed = urlparse(value)
-            if parsed.scheme:
-                _ = parsed.port          # raises ValueError for e.g. '6153export'
-        except ValueError as exc:
-            raise RuntimeError(
-                f"Malformed proxy environment variable {key}={value!r}. "
-                "Fix or unset your proxy settings and try again."
-            ) from exc
-
-
-def _validate_base_url(base_url: str) -> None:
-    """Reject obviously broken custom endpoint URLs before they reach httpx."""
-    from urllib.parse import urlparse
-    candidate = str(base_url or "").strip()
-    if not candidate or candidate.startswith("acp://"):
-        return
-    try:
-        parsed = urlparse(candidate)
-        if parsed.scheme in {"http", "https"}:
-            _ = parsed.port              # raises ValueError for malformed ports
-    except ValueError as exc:
-        raise RuntimeError(
-            f"Malformed custom endpoint URL: {candidate!r}. "
-            "Run `hermes setup` or `hermes model` and enter a valid http(s) base URL."
-        ) from exc
-
-
-def _try_custom_endpoint() -> Tuple[Optional[Any], Optional[str]]:
-    runtime = _resolve_custom_runtime()
-    custom_base, custom_key, custom_mode = (*runtime, None) if len(runtime) == 2 else runtime
-    if not custom_base or not custom_key:
-        return None, None
-    if custom_base.lower().startswith(_CODEX_AUX_BASE_URL.lower()):
-        return None, None
-    model = _read_main_model_for_aux() or "gpt-4o-mini"
-    logger.debug("Auxiliary client: custom endpoint (%s, api_mode=%s)", model, custom_mode or "chat_completions")
-    _clean_base, _dq = _extract_url_query_params(custom_base)
-    _extra = {"default_query": _dq} if _dq else {}
-    # User model.default_headers override SDK fingerprint headers (as on the main client) for strict gateways/WAFs.
-    _custom_headers = _apply_user_default_headers(None)
-    if _custom_headers:
-        _extra["default_headers"] = _custom_headers
-    if custom_mode == "codex_responses":
-        real_client = _create_openai_client(api_key=custom_key, base_url=_clean_base, **_extra)
-        return CodexAuxiliaryClient(real_client, model), model
-    if custom_mode == "anthropic_messages":
-        # Third-party Anthropic-compatible gateway â€” never OAuth (that's api.anthropic.com only).
-        try:
-            from agent.anthropic_adapter import build_anthropic_client
-            real_client = build_anthropic_client(custom_key, custom_base)
-        except ImportError:
-            logger.warning(
-                "Custom endpoint declares api_mode=anthropic_messages but the "
-                "anthropic SDK is not installed â€” falling back to OpenAI-wire."
-            )
-            return _create_openai_client(api_key=custom_key, base_url=_clean_base, **_extra), model
-        return AnthropicAuxiliaryClient(real_client, model, custom_key, custom_base, is_oauth=False), model
-    # URL-based anthropic detection for custom endpoints without explicit api_mode.
-    _fallback_client = _create_openai_client(api_key=custom_key, base_url=_clean_base, **_extra)
-    return _maybe_wrap_anthropic(_fallback_client, model, custom_key, custom_base, custom_mode), model
-
-
-def _build_xai_oauth_aux_client(model: str) -> Tuple[Optional[Any], Optional[str]]:
-    """CodexAuxiliaryClient for xAI Grok OAuth (Responses API); (None, None) if not authed.
-
-    Caller must pass an explicit model â€” a pinned Grok default would rot as xAI's allowlist drifts.
-    """
-    if not model:
-        logger.warning(
-            "Auxiliary client: xai-oauth requested without a model; "
-            "pass model explicitly (auxiliary.<task>.model in config.yaml)."
-        )
-        return None, None
-    resolved = _resolve_xai_oauth_for_aux()
-    if resolved is None:
-        return None, None
-    api_key, base_url = resolved
-    logger.debug("Auxiliary client: xAI OAuth (%s via Responses API)", model)
-    from tools.xai_http import hermes_xai_default_headers
-    real_client = _create_openai_client(
-        api_key=api_key, base_url=base_url, default_headers=hermes_xai_default_headers()
-    )
-    return CodexAuxiliaryClient(real_client, model), model
-
-
-def _build_codex_client(model: str) -> Tuple[Optional[Any], Optional[str]]:
-    """CodexAuxiliaryClient for an explicit model; (None, None) without a Codex OAuth token.
-
-    No auto-selected default: the Codex model allow-list is undocumented and drifts.
-    """
-    if not model:
-        logger.warning(
-            "Auxiliary client: openai-codex requested without a model; "
-            "pass model explicitly (auxiliary.<task>.model in config.yaml)."
-        )
-        return None, None
-    pool_present, entry = _select_pool_entry("openai-codex")
-    codex_token = _pool_runtime_api_key(entry) if pool_present else None
-    if codex_token:
-        base_url = _pool_runtime_base_url(entry, _CODEX_AUX_BASE_URL) or _CODEX_AUX_BASE_URL
-    else:
-        codex_token = _read_codex_access_token()
-        if not codex_token:
-            return None, None
-        base_url = _CODEX_AUX_BASE_URL
-    logger.debug("Auxiliary client: Codex OAuth (%s via Responses API)", model)
-    real_client = _create_openai_client(
-        api_key=codex_token, base_url=base_url,
-        default_headers=_codex_cloudflare_headers(codex_token, base_url=base_url),
-    )
-    return CodexAuxiliaryClient(real_client, model), model
-
-
-def _try_azure_foundry(
-    *, model: Optional[str] = None, explicit_api_key: Optional[str] = None,
-    explicit_base_url: Optional[str] = None, api_mode: Optional[str] = None,
-) -> Tuple[Optional[Any], Optional[str]]:
-    """Azure Foundry aux client via the main agent's ``_resolve_azure_foundry_runtime`` (api_key vs Entra
-    callable bearer, per-model api_mode, base_url overrides). Returns ``(client, model)`` or ``(None, None)``."""
-    try:
-        from hermes_cli.runtime_provider import _resolve_azure_foundry_runtime
-        from hermes_cli.auth import AuthError
-        from hermes_cli.config import load_config_readonly
-    except ImportError:
-        return None, None
-    try:
-        cfg = load_config_readonly()
-        model_cfg = cfg.get("model") if isinstance(cfg, dict) else {}
-        if not isinstance(model_cfg, dict):
-            model_cfg = {}
-    except Exception:
-        model_cfg = {}
-    try:
-        runtime = _resolve_azure_foundry_runtime(
-            requested_provider="azure-foundry", model_cfg=model_cfg,
-            explicit_api_key=explicit_api_key, explicit_base_url=explicit_base_url,
-            target_model=model,
-        )
-    except AuthError as exc:
-        logger.debug("Auxiliary azure-foundry: %s", exc)
-        return None, None
-    except Exception as exc:
-        logger.debug("Auxiliary azure-foundry runtime error: %s", exc)
-        return None, None
-    api_key = runtime.get("api_key")
-    base_url = str(runtime.get("base_url", "") or "")
-    runtime_api_mode = api_mode or runtime.get("api_mode") or "chat_completions"
-    # api_key may be a callable token provider; bail only on None/"".
-    if not (callable(api_key) or api_key) or not base_url:
-        return None, None
-    final_model = _normalize_resolved_model(model or str(model_cfg.get("default") or ""), "azure-foundry")
-    if not final_model:
-        # No fallback aux model for Azure (needs a deployment name): let the auto chain fall through instead of 404ing.
-        logger.debug(
-            "Auxiliary azure-foundry: no model resolved (model=%r, default=%r)",
-            model, model_cfg.get("default"),
-        )
-        return None, None
-    # The SDK drops api-version query params from the base URL; pass via default_query.
-    _clean_base, _dq = _extract_url_query_params(base_url)
-    extra: Dict[str, Any] = {"default_query": _dq} if _dq else {}
-    client = _create_openai_client(api_key=api_key, base_url=_clean_base, **extra)
-    if runtime_api_mode == "codex_responses":
-        return CodexAuxiliaryClient(client, final_model), final_model
-    if runtime_api_mode == "anthropic_messages":
-        # api_key forwarded verbatim (string or Entra callable; build_anthropic_client installs the bearer hook).
-        return _maybe_wrap_anthropic(client, final_model, api_key, base_url, runtime_api_mode), final_model
-    return client, final_model
-
-
-def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optional[str]]:
-    try:
-        from agent.anthropic_adapter import build_anthropic_client
-        from agent.anthropic_credentials import resolve_anthropic_token
-    except ImportError:
-        return None, None
-    pool_present, entry = _select_pool_entry("anthropic")
-    if pool_present and entry is not None:
-        token = explicit_api_key or _pool_runtime_api_key(entry)
-    else:
-        # Pool absent/empty: legacy resolver so a dead pool entry can't wedge aux tasks when a standalone credential exists.
-        entry = None
-        token = explicit_api_key or resolve_anthropic_token()
-    if not token:
-        return None, None
-    # Honor config.yaml model.base_url only when provider is anthropic AND the URL is
-    # Anthropic-compatible; a foreign host (Codex, OpenRouter) would 401 every aux call.
-    base_url = _pool_runtime_base_url(entry, _ANTHROPIC_DEFAULT_BASE_URL) if pool_present else _ANTHROPIC_DEFAULT_BASE_URL
-    with contextlib.suppress(Exception):
-        from hermes_cli.config import load_config_readonly
-        cfg = load_config_readonly()
-        model_cfg = cfg.get("model")
-        if isinstance(model_cfg, dict):
-            cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
-            if cfg_provider == "anthropic":
-                cfg_base_url = (model_cfg.get("base_url") or "").strip().rstrip("/")
-                if cfg_base_url and _is_anthropic_compatible_host(cfg_base_url):
-                    base_url = cfg_base_url
-    from agent.anthropic_credentials import _is_oauth_token
-    is_oauth = _is_oauth_token(token)
-    model = _get_aux_model_for_provider("anthropic") or "claude-haiku-4-5-20251001"
-    if _aux_probe_active():
-        # Probe: token + adapter import resolved; skip real client construction.
-        return _AuxProbeClientStub(api_key="", base_url=base_url), model
-    logger.debug("Auxiliary client: Anthropic native (%s) at %s (oauth=%s)", model, base_url, is_oauth)
-    try:
-        real_client = build_anthropic_client(token, base_url)
-    except ImportError:
-        return None, None  # Adapter imports fine but the anthropic SDK itself is missing.
-    return AnthropicAuxiliaryClient(real_client, model, token, base_url, is_oauth=is_oauth), model
-
-
-_MAIN_RUNTIME_FIELDS = ("provider", "model", "base_url", "api_key", "api_mode", "auth_mode")
-_MAIN_RUNTIME_CONTEXT_FIELDS = _MAIN_RUNTIME_FIELDS + ("requested_provider",)
-
-
-def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """Return a sanitized copy of a live main-runtime override.
-
-    ``api_key`` may be a zero-arg callable (Entra ID token provider, accepted by the OpenAI SDK)
-    â€” preserved as-is so aux clients share main-agent auth.
-    """
-    if main_runtime is None:
-        # Context-local state first; compat mirrors may hold another concurrent session's endpoint/key.
-        main_runtime = _RUNTIME_MAIN_CONTEXT.get()
-        if main_runtime is None:
-            main_runtime = _compat_runtime_main()
-    if not isinstance(main_runtime, dict):
-        return {}
-    normalized: Dict[str, Any] = {}
-    for field in _MAIN_RUNTIME_CONTEXT_FIELDS:
-        value = main_runtime.get(field)
-        if field == "api_key" and callable(value) and not isinstance(value, str):
-            normalized[field] = value
-        elif isinstance(value, str) and value.strip():
-            normalized[field] = value.strip()
-    for identity_field in ("provider", "requested_provider"):
-        identity = normalized.get(identity_field)
-        if isinstance(identity, str):
-            normalized[identity_field] = identity.lower()
-    return normalized
-
-
-def _get_provider_chain() -> List[tuple]:
-    """Ordered provider detection chain, built at call time so ``_try_*`` patches are picked up.
-
-    ``openai-codex`` is deliberately absent (shifting allow-list breaks guessed-model fallback).
-    """
-    return [
-        ("openrouter", _try_openrouter), ("nous", _try_nous),
-        ("local/custom", _try_custom_endpoint), ("api-key", _resolve_api_key_provider),
-    ]
-
-
-# "Recently 402'd" unhealthy-provider cache: a depleted provider stays so for hours, so hiding it
-# for a TTL saves an RTT per aux call. In-process only (profiles may use different keys).
-_AUX_UNHEALTHY_TTL_SECONDS = 600  # 10 minutes
-_aux_unhealthy_until: Dict[Any, float] = {}
-_aux_unhealthy_logged_at: Dict[Any, float] = {}
-# resolved_provider / explicit-config names â†’ chain labels.
-_AUX_UNHEALTHY_LABEL_ALIASES = {
-    "openrouter": "openrouter", "nous": "nous", "custom": "local/custom",
-    "local/custom": "local/custom", "openai-codex": "openai-codex", "codex": "openai-codex",
-}
-
-
-def _normalize_chain_label(provider: str) -> str:
-    """resolved_provider â†’ chain label; unknown API-key providers fall back to the lowercased input."""
-    if not provider:
-        return ""
-    p = str(provider).strip().lower()
-    return _AUX_UNHEALTHY_LABEL_ALIASES.get(p, p)
-
-
-def _mark_provider_unhealthy(
-    provider: str, ttl: Optional[float] = None, *, base_url: Optional[str] = None,
-) -> None:
-    """Hide one provider endpoint until the TTL expires after a confirmed payment error."""
-    label = _normalize_chain_label(provider)
-    if not label:
-        return
-    key = _unhealthy_cache_key(label, base_url)
-    ttl = _AUX_UNHEALTHY_TTL_SECONDS if ttl is None else ttl
-    expires_at = time.time() + ttl
-    _aux_unhealthy_until[key] = expires_at
-    logger.warning(
-        "Auxiliary: marking %s unhealthy for %ds (payment / credit error). "
-        "Subsequent auxiliary calls will skip it until %s.",
-        label, int(ttl), time.strftime("%H:%M:%S", time.localtime(expires_at)),
-    )
-
-
-def _is_provider_unhealthy(label: str, base_url: Optional[str] = None) -> bool:
-    """True iff this provider endpoint is unhealthy and unexpired; lazily evicts expired entries."""
-    if not label:
-        return False
-    key = _unhealthy_cache_key(label, base_url)
-    expires_at = _aux_unhealthy_until.get(key)
-    if expires_at is None:
-        return False
-    if time.time() >= expires_at:
-        _aux_unhealthy_until.pop(key, None)
-        _aux_unhealthy_logged_at.pop(key, None)
-        return False
-    return True
-
-
-def _log_skip_unhealthy(
-    label: str, task: Optional[str] = None, *, base_url: Optional[str] = None,
-) -> None:
-    """Log a skipped unhealthy provider at most once per minute per label."""
-    now = time.time()
-    key = _unhealthy_cache_key(label, base_url)
-    if now - _aux_unhealthy_logged_at.get(key, 0.0) >= 60:
-        _aux_unhealthy_logged_at[key] = now
-        expires_at = _aux_unhealthy_until.get(key, now)
-        logger.info(
-            "Auxiliary %s: skipping %s (recently returned payment error, retry in %ds)",
-            task or "call", label, max(0, int(expires_at - now)),
-        )
-
-
-def _reset_aux_unhealthy_cache() -> None:
-    """Clear the unhealthy cache (tests / explicit user reset)."""
-    _aux_unhealthy_until.clear()
-    _aux_unhealthy_logged_at.clear()
-
-
-def _contains_any(text: str, needles: Tuple[str, ...]) -> bool:
-    """True when any needle is a substring of ``text``."""
-    return any(kw in text for kw in needles)
-
-
-# Billing-body markers (credit exhaustion wrapped in 402/403/404/429 bodies), plus daily/weekly quota
-# exhaustion (functionally credit exhaustion; "resource exhausted" is the Vertex/gRPC quota phrasing â€”
-# also serialized by SDK wrappers and NIM as RESOURCE_EXHAUSTED / ResourceExhausted / resource-exhausted).
-_PAYMENT_KEYWORDS = (
-    "credits", "insufficient funds", "can only afford", "billing", "payment required",
-    "out of funds", "run out of funds", "balance_depleted", "no usable credits",
-    "model_not_supported_on_free_tier", "not available on the free tier",
-    "requires a subscription", "upgrade for access", "upgrade for higher limits",
-    "reached your session usage limit", "quota exceeded", "quota_exceeded",
-    "too many tokens per day", "daily limit", "tokens per day", "daily quota", "resource exhausted",
-    "resource_exhausted", "resource-exhausted", "resourceexhausted",
-    "weekly usage limit", "weekly limit",
-)
-
-
-def _is_payment_error(exc: Exception) -> bool:
-    """Payment/credit/quota exhaustion: HTTP 402, or a billing/quota body on 403/404/429/no-status."""
-    status = getattr(exc, "status_code", None)
-    return status == 402 or (
-        status in {403, 404, 429, None} and _contains_any(str(exc).lower(), _PAYMENT_KEYWORDS)
-    )
-
-
-def _nous_portal_account_has_fresh_paid_access() -> bool:
-    """Return True only when the fresh Nous account API says paid access is allowed."""
-    try:
-        from hermes_cli.nous_account import get_nous_portal_account_info
-        return get_nous_portal_account_info(force_fresh=True).paid_service_access is True
-    except Exception as exc:
-        logger.debug("Auxiliary Nous paid-entitlement refresh check failed: %s", exc)
-        return False
-
-
-_RATE_LIMIT_KEYWORDS = (
-    "rate limit", "rate_limit", "too many requests", "try again", "retry after", "resets in"
-)
-_RATE_LIMIT_BILLING_KEYWORDS = (
-    "credits", "insufficient funds", "billing", "payment required", "can only afford",
-    "out of funds", "run out of funds", "balance_depleted", "no usable credits",
-    "model_not_supported_on_free_tier", "not available on the free tier",
-)
-
-
-def _is_rate_limit_error(exc: Exception) -> bool:
-    """429 rate limit (not billing/quota, which _is_payment_error owns).
-
-    OpenAI's RateLimitError may omit .status_code â€” matched by class name. A generic 429 without
-    billing keywords counts as a rate limit.
-    """
-    # (PR #8023 pattern)
-    if type(exc).__name__ == "RateLimitError":
-        return True
-    if getattr(exc, "status_code", None) != 429:
-        return False
-    err_lower = str(exc).lower()
-    return _contains_any(err_lower, _RATE_LIMIT_KEYWORDS) or not _contains_any(err_lower, _RATE_LIMIT_BILLING_KEYWORDS)
-
-
-def _is_timeout_error(exc: Exception) -> bool:
-    """Full-budget request timeout, distinct from a fast connection drop.
-
-    A timeout burns the whole ``timeout`` budget, so a same-provider retry on the compression
-    path doubles wall time; fast drops stay on the retry path.
-    """
-    with contextlib.suppress(ImportError):
-        from openai import APITimeoutError
-        if isinstance(exc, APITimeoutError):
-            return True
-    return "Timeout" in type(exc).__name__ or "timed out" in str(exc).lower()
-
-
-def _is_connection_error(exc: Exception) -> bool:
-    """Connection/network errors (endpoint unreachable), as opposed to 4xx/5xx API errors."""
-    with contextlib.suppress(ImportError):
-        from openai import APIConnectionError, APITimeoutError
-        if isinstance(exc, (APIConnectionError, APITimeoutError)):
-            return True
-    if _contains_any(type(exc).__name__, ("Connection", "Timeout", "DNS", "SSL")):
-        return True
-    return _contains_any(str(exc).lower(), (
-        "connection refused", "name or service not known", "no route to host",
-        "network is unreachable", "timed out", "connection reset",
-        # httpcore/httpx premature stream close â€” transient, retry/reroute.
-        "incomplete chunked read", "peer closed connection", "response ended prematurely",
-        "unexpected eof", "remoteprotocolerror", "localprotocolerror",
-    ))
-
-
-def _is_transient_transport_error(exc: Exception) -> bool:
-    """One-off transport blip worth retrying on the SAME provider: connection/stream-close errors plus pure 5xx/408.
-
-    Deliberately narrow: payment/auth/rate-limit errors switch provider, refresh creds, or rotate the pool.
-    """
-    if _is_connection_error(exc):
-        return True
-    status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
-    return isinstance(status, int) and (status == 408 or 500 <= status < 600)
-
-
-_DEFAULT_TRANSIENT_RETRIES = 2
-_TRANSIENT_RETRY_BACKOFF_BASE = 1.0  # Backoff base (seconds); overridable so tests can zero it out.
-
-
-def _transient_retry_count() -> int:
-    """Same-provider retries for a transient blip: ``auxiliary.transient_retries``
-    (default 2), clamped to [0, 6]; config-read failures fall back to default."""
-    try:
-        from hermes_cli.config import cfg_get, load_config
-        val = cfg_get(load_config(), "auxiliary", "transient_retries")
-        return _DEFAULT_TRANSIENT_RETRIES if val is None else max(0, min(int(val), 6))
-    except Exception:
-        return _DEFAULT_TRANSIENT_RETRIES
-
-
-def _is_auth_error(exc: Exception) -> bool:
-    """Auth failures that should trigger provider-specific refresh."""
-    status = getattr(exc, "status_code", None)
-    if status == 401:
-        return True
-    err_lower = str(exc).lower()
-    if "error code: 401" in err_lower or "authenticationerror" in type(exc).__name__.lower():
-        return True
-    # xAI returns 403 "unauthenticated:bad-credentials" for expired OAuth tokens â€” semantically a 401.
-    return "bad-credentials" in err_lower and (status == 403 or "unauthenticated" in err_lower)
-
-
-def _is_unsupported_parameter_error(exc: Exception, param: str) -> bool:
-    """Provider 400 for an unsupported request parameter: the parameter name plus a generic
-    unsupported/unknown/unrecognized marker, so call sites can retry without the key."""
-    param_lower = (param or "").lower()
-    if not param_lower:
-        return False
-    err_lower = str(exc).lower()
-    return param_lower in err_lower and _contains_any(err_lower, (
-        "unsupported parameter", "unsupported_parameter", "not supported", "does not support",
-        "unknown parameter", "unrecognized request argument", "unrecognized parameter", "invalid parameter",
-    ))
-
-
-def _is_structured_output_rejection(exc: Exception) -> bool:
-    """Provider 400/422 rejecting the structured-output field, on either wire: OpenAI ``response_format``
-    (incl. vLLM's ``guided_grammar``/xgrammar failures) or Anthropic ``output_config.format`` ("Extra inputs
-    are not permitted"). Callers tolerate an unconstrained reply, so the reaction is one retry without it."""
-    status = getattr(exc, "status_code", None)
-    if status is not None and status not in {400, 422}:
-        return False
-    err_lower = str(exc).lower()
-    # vLLM grammar-backend failures name the translated parameter, not ours.
-    if _contains_any(err_lower, ("guided_grammar", "xgrammar", "compile_grammar_error")):
-        return True
-    if "extra inputs are not permitted" in err_lower and (
-        "response_format" in err_lower or "output_config" in err_lower
-    ):
-        return True
-    if "response_format" in err_lower and "unavailable" in err_lower:
-        return True
-    return _is_unsupported_parameter_error(exc, "response_format") or _is_unsupported_parameter_error(exc, "output_config")
-
-
-def _without_structured_output_format(kwargs: dict) -> Optional[dict]:
-    """Copy *kwargs* without ``response_format`` (top-level and ``extra_body``); None when nothing was
-    removed, so call sites don't retry an unchanged request."""
-    retry_kwargs = dict(kwargs)
-    changed = retry_kwargs.pop("response_format", None) is not None
-    extra_body = retry_kwargs.get("extra_body")
-    if isinstance(extra_body, dict) and "response_format" in extra_body:
-        remaining = {k: v for k, v in extra_body.items() if k != "response_format"}
-        if remaining:
-            retry_kwargs["extra_body"] = remaining
-        else:
-            retry_kwargs.pop("extra_body", None)
-        changed = True
-    return retry_kwargs if changed else None
-
-
-def _is_model_not_found_error(exc: Exception) -> bool:
-    """"Requested model doesn't exist" (404 / invalid model) â€” typically a long-lived process pinned a
-    since-dropped model. Excludes billing keywords, which :func:`_is_payment_error` owns."""
-    status = getattr(exc, "status_code", None)
-    err_lower = str(exc).lower()
-    if _contains_any(err_lower, (
-        "credits", "insufficient funds", "billing", "out of funds", "balance_depleted",
-        "no usable credits", "free tier", "free-tier", "not available on the free tier",
-    )):
-        return False
-    if status not in {404, 400, None}:
-        return False
-    return _contains_any(err_lower, (
-        "model does not exist", "does not exist in our configuration", "openrouter catalog",
-        "is not a valid model", "no such model", "model not found",
-        "the model `",            # OpenAI-style: "The model `X` does not exist"
-        "model_not_found", "unknown model",
-    ))
-
-
-def _is_model_incompatible_error(exc: Exception) -> bool:
-    """"This route cannot serve this model" 400 (capability mismatch, e.g. a Codex/ChatGPT-account
-    fallback asked to run a non-OpenAI model). Auth/payment predicates don't fire, so this keeps the
-    chain going instead of aborting. Excludes billing 400s and not-found 400s."""
-    status = getattr(exc, "status_code", None)
-    if status not in {400, None}:
-        return False
-    err_lower = str(exc).lower()
-    if _is_model_not_found_error(exc):
-        return False
-    # Billing keywords checked directly: _is_payment_error is status-gated and misses 400-coded billing bodies.
-    if _contains_any(err_lower, (
-        "credits", "insufficient funds", "billing", "out of funds", "balance_depleted",
-        "no usable credits", "payment required", "free tier", "free-tier",
-        "not available on the free tier", "model_not_supported_on_free_tier", "quota",
-    )):
-        return False
-    return _contains_any(err_lower, (
-        "is not supported when using",   # codex/ChatGPT-account model gating
-        "model is not supported", "not supported with this", "not supported for this account",
-        "model_not_supported", "does not support this model", "unsupported model",
-    ))
-
-
-def _is_invalid_aux_response_error(exc: Exception) -> bool:
-    """HTTP-200 empty/malformed ChatCompletions â€” a capability failure routed like model incompatibility."""
-    if not isinstance(exc, RuntimeError):
-        return False
-    msg = str(exc).lower()
-    return "auxiliary " in msg and "llm returned invalid response" in msg and "choices[0].message" in msg
-
-
-# Tasks on a user-visible critical path (compression blocks resuming an oversized session; vision
-# stalls the serialised turn queue). A same-provider retry after a full-budget timeout costs another
-# whole ``timeout`` window, so they skip straight to fallback; fast blips still retry.
-# Fast blips (a streaming-close or a 5xx) still retry, since those are cheap. See issue #54465 for the
-# compression case.
-_TIMEOUT_NO_RETRY_TASKS = frozenset({"compression", "vision"})
-
-
-def _should_skip_same_provider_retry(task: Optional[str], exc: Exception) -> bool:
-    """True when a transient error on a critical-path task should go straight to fallback.
-
-    Carve-out: a fast first-token fail (dead stream within the no-progress window, zero output â€”
-    see ``_timeout_message``) is cheap and keeps the same-provider retry; mid-stream stalls and
-    hard-ceiling timeouts skip to fallback.
-    """
-    return task in _TIMEOUT_NO_RETRY_TASKS and _is_timeout_error(exc) and "no-progress timeout" not in str(exc)
-
-
-def _evict_cached_clients(provider: str) -> None:
-    """Drop cached auxiliary clients for a provider so fresh creds are used."""
-    normalized = _normalize_aux_provider(provider)
-    with _client_cache_lock:
-        for key in [key for key in _client_cache if _normalize_aux_provider(str(key[0])) == normalized]:
-            client = _client_cache.get(key, (None, None, None))[0]
-            if client is not None:
-                _close_cached_client(client)
-            _client_cache.pop(key, None)
-
-
-def _evict_cached_client_instance(target: Any) -> bool:
-    """Drop cache entries whose stored client (or its ``_real_client``) is *target*; True if any evicted.
-
-    Used when a cached client is poisoned (closed transport after a timeout). Async wrappers must
-    expose the same ``_real_client`` as their sync sibling or the async entry survives.
-    """
-    if target is None:
-        return False
-    evicted = False
-    with _client_cache_lock:
-        for key, entry in list(_client_cache.items()):
-            cached = entry[0] if entry is not None else None
-            if cached is not None and (cached is target or getattr(cached, "_real_client", None) is target):
-                del _client_cache[key]
-                evicted = True
-    return evicted
-
-
-def _pool_cache_hint(provider: str, *, main_runtime: Optional[Dict[str, Any]] = None) -> str:
-    """Return a stable cache discriminator for pooled providers."""
-    normalized = _normalize_aux_provider(provider)
-    if normalized == "auto":
-        runtime = _normalize_main_runtime(main_runtime)
-        normalized = _normalize_aux_provider(runtime.get("provider") or _read_main_provider())
-    if normalized in {"", "auto", "custom"}:
-        return ""
-    entry = _peek_pool_entry(normalized)
-    if entry is None:
-        return ""
-    entry_id = str(getattr(entry, "id", "") or "").strip()
-    return f"{normalized}:{entry_id}" if entry_id else ""
-
-
-# Ordered (host, provider) tables for inferring a backend from a client base URL.
-_POOL_PROVIDER_BY_HOST = (
-    ("chatgpt.com", "openai-codex"), ("openrouter.ai", "openrouter"),
-    ("inference-api.nousresearch.com", "nous"), ("api.anthropic.com", "anthropic"),
-    ("githubcopilot.com", "copilot"), ("api.kimi.com", "kimi-coding"), ("api.x.ai", "xai-oauth"),
-)
-_AUTH_REFRESH_PROVIDER_BY_HOST = (
-    ("api.githubcopilot.com", "copilot"), ("chatgpt.com", "openai-codex"),
-    ("api.anthropic.com", "anthropic"), ("inference-api.nousresearch.com", "nous"),
-)
-
-
-def _provider_for_host(base_url: str, table: Tuple[Tuple[str, str], ...]) -> Optional[str]:
-    """First provider in ``table`` whose host matches ``base_url``, else None."""
-    for host, provider in table:
-        if base_url_host_matches(base_url, host):
-            return provider
-    return None
-
-
-def _recoverable_pool_provider(
-    resolved_provider: str, client: Any, main_runtime: Optional[Dict[str, Any]] = None
-) -> Optional[str]:
-    """Infer which provider pool can recover the current auxiliary client."""
-    normalized = _normalize_aux_provider(resolved_provider)
-    if normalized not in {"", "auto", "custom"}:
-        return normalized
-    base = str(getattr(client, "base_url", "") or "")
-    known = _provider_for_host(base, _POOL_PROVIDER_BY_HOST)
-    if known is not None:
-        return known
-    # Providers outside the table (e.g. opencode-go): match base URL against registered
-    # api_key providers so pool rotation works for them too.
-    if main_runtime:
-        rt_provider = _normalize_main_runtime(main_runtime).get("provider", "")
-        if rt_provider and rt_provider not in {"", "auto", "custom"}:
-            with contextlib.suppress(Exception):
-                from hermes_cli.auth import PROVIDER_REGISTRY
-                pconfig = PROVIDER_REGISTRY.get(rt_provider)
-                if pconfig and getattr(pconfig, "auth_type", None) == "api_key":
-                    rt_base = str(getattr(pconfig, "inference_base_url", "") or "").rstrip("/")
-                    if rt_base and base_url_host_matches(base, base_url_hostname(rt_base)):
-                        return rt_provider
-    return None
-
-
-def _recover_provider_pool(provider: str, exc: Exception, *, failed_api_key: str = "") -> bool:
-    """Try same-provider credential-pool recovery for auxiliary calls.
-
-    ``failed_api_key`` lets mark_exhausted_and_rotate identify the right pool entry even if
-    another process already rotated (current() would be None).
-    """
-    normalized = _normalize_aux_provider(provider)
-    try:
-        pool = load_pool(normalized)
-    except Exception as load_exc:
-        logger.debug("Auxiliary client: could not load pool for %s recovery: %s", normalized, load_exc)
-        return False
-    if not pool or not pool.has_credentials():
-        return False
-    status_code = getattr(exc, "status_code", None)
-
-    def _rotate(fallback_status: int) -> bool:
-        error_context: Dict[str, Any] = {"message": str(exc)}
-        if status_code is not None:
-            error_context["status_code"] = status_code
-        next_entry = pool.mark_exhausted_and_rotate(
-            status_code=status_code if status_code is not None else fallback_status,
-            error_context=error_context, api_key_hint=failed_api_key or None,
-        )
-        if next_entry is None:
-            return False
-        _evict_cached_clients(normalized)
-        return True
-
-    if _is_auth_error(exc):
-        if pool.try_refresh_current() is not None:
-            _evict_cached_clients(normalized)
-            return True
-        return _rotate(401)
-    if _is_payment_error(exc):
-        return _rotate(402)
-    if _is_rate_limit_error(exc):
-        return _rotate(429)
-    return False
-
-
-def _prepare_same_provider_retry(
-    *, task: Optional[str], resolved_provider: str, resolved_model: Optional[str],
-    resolved_base_url: Optional[str], resolved_api_key: Optional[str],
-    resolved_api_mode: Optional[str], main_runtime: Optional[Dict[str, Any]],
-    final_model: Optional[str], messages: list, temperature: Optional[float],
-    max_tokens: Optional[int], tools: Optional[list], effective_timeout: float,
-    effective_extra_body: dict, reasoning_config: Optional[dict], async_mode: bool,
-    extra_headers: Optional[Dict[str, str]] = None,
-) -> Tuple[Any, Dict[str, Any]]:
-    """Rebuild (client, request kwargs) for a same-provider retry after credential recovery."""
-    if task == "vision":
-        effective_provider, retry_client, retry_model = resolve_vision_provider_client(
-            provider=resolved_provider, model=final_model, base_url=resolved_base_url,
-            api_key=resolved_api_key, async_mode=async_mode,
-        )
-    else:
-        retry_client, retry_model = _get_cached_client(
-            resolved_provider, resolved_model, async_mode=async_mode, base_url=resolved_base_url,
-            api_key=resolved_api_key, api_mode=resolved_api_mode, main_runtime=main_runtime,
-        )
-        effective_provider = _effective_provider_for_client(retry_client, resolved_provider)
-    if retry_client is None:
-        raise RuntimeError(
-            f"Auxiliary {task or 'call'}: provider {resolved_provider} could not be rebuilt after recovery"
-        )
-    retry_base = str(getattr(retry_client, "base_url", "") or "")
-    retry_kwargs = _build_call_kwargs(
-        effective_provider or resolved_provider, retry_model or final_model, messages,
-        temperature=temperature, max_tokens=max_tokens, tools=tools, timeout=effective_timeout,
-        extra_body=effective_extra_body, reasoning_config=reasoning_config,
-        base_url=retry_base or resolved_base_url, task=task,
-    )
-    # Preserve per-request attribution headers (e.g. Copilot ``x-initiator``) so the retry keeps capability gating.
-    if extra_headers:
-        # Copilot's ``x-initiator: user``) across the rebuilt-client retry â€” dropping them here would let a
-        # recovery retry silently lose capability gating (#60293).
-        # Preserve per-request attribution headers across the rebuilt-client retry â€” see the sync variant
-        # above (#60293).
-        retry_kwargs["extra_headers"] = dict(extra_headers)
-    if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
-        retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
-    return retry_client, retry_kwargs
-
-
-def _retry_same_provider_sync(*, resolved_provider: str, resolved_api_mode: Optional[str], task: Optional[str], **prep) -> Any:
-    retry_client, retry_kwargs = _prepare_same_provider_retry(
-        task=task, resolved_provider=resolved_provider, resolved_api_mode=resolved_api_mode, async_mode=False, **prep,
-    )
-    return _validate_llm_response(
-        _relay_sync_completion(retry_client, retry_kwargs, provider=resolved_provider, api_mode=resolved_api_mode), task,
-    )
-
-
-async def _retry_same_provider_async(*, resolved_provider: str, resolved_api_mode: Optional[str], task: Optional[str], **prep) -> Any:
-    retry_client, retry_kwargs = _prepare_same_provider_retry(
-        task=task, resolved_provider=resolved_provider, resolved_api_mode=resolved_api_mode, async_mode=True, **prep,
-    )
-    return _validate_llm_response(
-        await _relay_async_completion(retry_client, retry_kwargs, provider=resolved_provider, api_mode=resolved_api_mode),
-        task,
-    )
-
-
-def _creds_have_api_key(creds: Dict[str, Any]) -> bool:
-    return bool(str(creds.get("api_key", "") or "").strip())
-
-
-def _refresh_copilot_credentials() -> bool:
-    from hermes_cli.copilot_auth import _jwt_cache, _token_fingerprint, exchange_copilot_token, resolve_copilot_token
-    raw_token, _source = resolve_copilot_token()
-    if not str(raw_token or "").strip():
-        return False
-    _jwt_cache.pop(_token_fingerprint(raw_token), None)
-    exchange_copilot_token(raw_token)
-    return True
-
-
-def _refresh_codex_credentials() -> bool:
-    from hermes_cli.auth import resolve_codex_runtime_credentials
-    return _creds_have_api_key(resolve_codex_runtime_credentials(force_refresh=True))
-
-
-def _refresh_nous_credentials() -> bool:
-    from hermes_cli.auth import resolve_nous_runtime_credentials
-    return _creds_have_api_key(resolve_nous_runtime_credentials(
-        timeout_seconds=env_float("HERMES_NOUS_TIMEOUT_SECONDS", 15), force_refresh=True
-    ))
-
-
-def _refresh_anthropic_credentials(failed_api_key: str = "") -> bool:
-    from agent.anthropic_credentials import read_claude_code_credentials, _refresh_oauth_token
-    token = failed_api_key
-    if not token:
-        return False
-    pool = load_pool("anthropic")
-    if pool.entry_id_for_api_key(token):
-        return pool.try_refresh_matching(api_key_hint=token) is not None
-    creds = read_claude_code_credentials()
-    # Never spend an ambient login's refresh rotation for another request's key.
-    if isinstance(creds, dict) and creds.get("accessToken") == token and creds.get("refreshToken"):
-        return bool(_refresh_oauth_token(creds))
-    return False
-
-
-def _refresh_xai_oauth_credentials() -> bool:
-    """Pool-level refresh first, then the singleton auth-store resolver."""
-    pool = load_pool("xai-oauth")
-    if pool and pool.has_credentials():
-        pool.select()
-        refreshed = pool.try_refresh_current()
-        if refreshed is not None and str(getattr(refreshed, "runtime_api_key", "") or "").strip():
-            return True
-    from hermes_cli.auth import resolve_xai_oauth_runtime_credentials
-    return _creds_have_api_key(resolve_xai_oauth_runtime_credentials(force_refresh=True))
-
-
-def _refresh_vertex_credentials() -> bool:
-    """Mirrors run_agent's Vertex refresh; the cache key ignores the rotating bearer, so
-    without the eviction that follows, a ~1h-expired aux Vertex client 401s forever."""
-    from agent.vertex_adapter import get_vertex_config
-    token, base_url = get_vertex_config()
-    return bool(isinstance(token, str) and token.strip() and isinstance(base_url, str) and base_url.strip())
-
-
-# Each refresher returns True when a usable credential exists; the caller then evicts cached clients.
-_CREDENTIAL_REFRESHERS: Dict[str, Callable[..., bool]] = {
-    "copilot": _refresh_copilot_credentials, "openai-codex": _refresh_codex_credentials,
-    "nous": _refresh_nous_credentials, "anthropic": _refresh_anthropic_credentials,
-    "xai-oauth": _refresh_xai_oauth_credentials, "vertex": _refresh_vertex_credentials,
-}
-
-
-def _refresh_provider_credentials(provider: str, *, failed_api_key: str = "") -> bool:
-    """Refresh short-lived credentials for OAuth-backed auxiliary providers."""
-    normalized = _normalize_aux_provider(provider)
-    refresher = _CREDENTIAL_REFRESHERS.get(normalized)
-    if refresher is None:
-        return False
-    try:
-        if not (refresher(failed_api_key) if normalized == "anthropic" else refresher()):
-            return False
-        _evict_cached_clients(normalized)
-        return True
-    except Exception as exc:
-        logger.debug("Auxiliary provider credential refresh failed for %s: %s", normalized, exc)
-        return False
-
-
-def _auth_refresh_provider_for_route(resolved_provider: Optional[str], client_base_url: str) -> str:
-    """Provider whose short-lived credentials should be refreshed; auto-routed calls keep
-    ``resolved_provider == "auto"``, so infer the backend from the client's base URL."""
-    normalized = _normalize_aux_provider(resolved_provider)
-    if normalized and normalized != "auto":
-        return normalized
-    return _provider_for_host(client_base_url, _AUTH_REFRESH_PROVIDER_BY_HOST) or normalized
-
-
-def _fallback_chain_entry(task: Optional[str], fb_label: str) -> Optional[Dict[str, Any]]:
-    """Resolve the ``fallback_chain`` entry a ``fallback_chain[<i>](<provider>)`` label points at,
-    or None when the label is not a configured-chain candidate or the index no longer resolves."""
-    if not task or not fb_label:
-        return None
-    m = re.match(r"fallback_chain\[(\d+)\]", fb_label)
-    if not m:
-        return None
-    try:
-        chain = _get_auxiliary_task_config(task).get("fallback_chain")
-        entry = chain[int(m.group(1))] if isinstance(chain, list) else None
-    except Exception:
-        return None
-    return entry if isinstance(entry, dict) else None
-
-
-def _coerce_positive_timeout(raw: Any) -> Optional[float]:
-    """Coerce a config ``timeout`` to a positive float, or None (rejects bools, which are ints)."""
-    if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw > 0:
-        return float(raw)
-    return None
-
-
-def _fallback_entry_timeout(task: Optional[str], fb_label: str) -> Optional[float]:
-    """Per-entry ``timeout`` for a configured fallback candidate, or None (keep the task-level
-    timeout). Inheriting the primary's deadline used to kill healthy-but-slower fallbacks.
-
-    A fallback candidate previously inherited the exact timeout the primary provider was called with. When
-    that deadline was tuned for the primary (or the primary simply consumed its whole budget before failing
-    over), the fallback aborted on the same clock even when independently healthy â€” a 163k-token compression
-    that needs ~90s on the fallback died at the primary's 30s deadline every turn (#62452).
-    """
-    entry = _fallback_chain_entry(task, fb_label)
-    return _coerce_positive_timeout(entry.get("timeout") if entry else None)
-
-
-def _fallback_provider_from_label(label: str) -> str:
-    """Recover the provider identifier from a fallback display label."""
-    match = re.match(r"(?:fallback_chain\[\d+\]|fallback_providers\[\d+\]|main-agent)\(([^)]+)\)$", label or "")
-    return match.group(1).strip() if match else str(label or "").strip()
-
-
-class _FallbackDestination(NamedTuple):
-    provider: str
-    base_url: str
-    api_mode: Optional[str]
-    model: Optional[str]
-
-
-def _complete_fallback_destination(
-    provider: str, base_url: str, api_mode: Optional[str], model: Optional[str]
-) -> _FallbackDestination:
-    if not api_mode:
-        if _endpoint_speaks_anthropic_messages(base_url):
-            api_mode = "anthropic_messages"
-        else:
-            with contextlib.suppress(Exception):
-                from hermes_cli.runtime_provider import resolve_runtime_provider
-                runtime = resolve_runtime_provider(
-                    requested=provider, explicit_base_url=base_url or None, target_model=model or ""
-                )
-                api_mode = str(runtime.get("api_mode") or "").strip() or None
-    return _FallbackDestination(provider, base_url, api_mode, model)
-
-
-def _fallback_destination_from_entry(
-    entry: Dict[str, Any], fb_client: Any, fb_model: Optional[str]
-) -> _FallbackDestination:
-    provider = str(entry.get("provider") or "").strip()
-    base_url = str(entry.get("base_url") or getattr(fb_client, "base_url", "") or "").strip()
-    api_mode = str(entry.get("api_mode") or entry.get("transport") or "").strip() or None
-    model = fb_model or str(entry.get("model") or "").strip() or None
-    return _complete_fallback_destination(provider, base_url, api_mode, model)
-
-
-def _fallback_destination(
-    task: Optional[str], fb_client: Any, fb_model: Optional[str], fb_label: str
-) -> _FallbackDestination:
-    """Route identity of a fallback request: attached destination, else configured entry, else label."""
-    attached = getattr(fb_client, "_hermes_fallback_destination", None)
-    if isinstance(attached, _FallbackDestination):
-        return attached
-    entry = _fallback_chain_entry(task, fb_label)
-    if entry is not None:
-        return _fallback_destination_from_entry(entry, fb_client, fb_model)
-    return _complete_fallback_destination(
-        _fallback_provider_from_label(fb_label), str(getattr(fb_client, "base_url", "") or ""), None, fb_model,
-    )
-
-
-def _replan_synchronous_cache_sections(
-    messages: list, tools: Optional[list], *, destination: _FallbackDestination
-) -> tuple[list, list]:
-    """Strip source decoration and plan one synchronous destination locally."""
-    from agent.agent_runtime_helpers import configured_cache_ttl, plan_cache_sections_for_destination
-    return plan_cache_sections_for_destination(
-        messages, tools, provider=destination.provider, base_url=destination.base_url,
-        api_mode=destination.api_mode or "", model=destination.model or "",
-        # Operator's configured TTL so fallbacks don't regress 1h â†’ 5m default (no live agent here; read config).
-        cache_ttl=configured_cache_ttl(),
-    )
-
-
-def _fallback_request_kwargs(
-    destination: _FallbackDestination, *, task: Optional[str], messages: list,
-    tools: Optional[list], temperature: Optional[float], max_tokens: Optional[int],
-    effective_timeout: float, effective_extra_body: dict, reasoning_config: Optional[dict],
-    fallback_entry: dict, task_config: dict, apply_fast_lane: bool,
-) -> Dict[str, Any]:
-    """Build request kwargs for one fallback destination (cache-section replan + fast-lane cap)."""
-    fallback_max_tokens, fallback_extra_body = max_tokens, effective_extra_body
-    if apply_fast_lane:
-        fallback_max_tokens, fallback_extra_body = _compression_fast_lane_controls(
-            task, actual_provider=destination.provider, actual_model=destination.model,
-            requested_provider=fallback_entry.get("provider"),
-            requested_model=fallback_entry.get("model"), route_config=fallback_entry,
-            leak_guard_config=task_config, max_tokens=max_tokens, extra_body=effective_extra_body,
-        )
-    fallback_messages, fallback_tools = _replan_synchronous_cache_sections(messages, tools, destination=destination)
-    fb_kwargs = _build_call_kwargs(
-        destination.provider, destination.model, fallback_messages,
-        temperature=temperature, max_tokens=fallback_max_tokens, tools=fallback_tools, timeout=effective_timeout,
-        extra_body=fallback_extra_body, reasoning_config=reasoning_config, base_url=destination.base_url, task=task)
-    return fb_kwargs
-
-
-def _plan_fallback_candidate(
-    fb_client: Any, fb_model: Optional[str], fb_label: str, *, task: Optional[str],
-    effective_timeout: float, apply_fast_lane: bool, **request,
-) -> Tuple[_FallbackDestination, Dict[str, Any], Callable[[str, Any, Optional[str]], Dict[str, Any]]]:
-    """Resolve the destination + first-attempt kwargs for a fallback candidate.
-
-    Returns ``(destination, kwargs, rebuild)`` where ``rebuild(provider, client, model)`` produces
-    kwargs for the credential-refreshed retry destination. A configured-chain entry's own
-    ``timeout`` overrides ``effective_timeout``.
-    """
-    fb_timeout = _fallback_entry_timeout(task, fb_label)
-    if fb_timeout is not None and fb_timeout != effective_timeout:
-        logger.info(
-            "Auxiliary %s: %s using its configured timeout %.0fs "
-            "(task-level was %.0fs)",
-            task or "call", fb_label, fb_timeout, effective_timeout,
-        )
-        effective_timeout = fb_timeout
-    destination = _fallback_destination(task, fb_client, fb_model, fb_label)
-    task_config = _get_auxiliary_task_config(task) if task == "compression" else {}
-    fallback_entry = _fallback_chain_entry(task, fb_label) or {}
-    common = dict(
-        task=task, effective_timeout=effective_timeout, fallback_entry=fallback_entry,
-        task_config=task_config, apply_fast_lane=apply_fast_lane, **request,
-    )
-
-    def _rebuild(provider: str, client: Any, model: Optional[str]) -> Tuple[_FallbackDestination, Dict[str, Any]]:
-        retry_destination = _FallbackDestination(
-            provider, destination.base_url or str(getattr(client, "base_url", "") or ""),
-            destination.api_mode, model or destination.model,
-        )
-        return retry_destination, _fallback_request_kwargs(retry_destination, **common)
-
-    return destination, _fallback_request_kwargs(destination, **common), _rebuild
-
-
-def _quarantine_fallback_candidate(
-    task: Optional[str], fb_label: str, fb_provider: str, fb_err: Exception, *,
-    base_url: str = "", tag: str = "",
-) -> None:
-    """Refresh unavailable or still 401s: token is dead. Quarantine the candidate so the caller moves on."""
-    _mark_provider_unhealthy(fb_provider or fb_label, base_url=base_url)
-    logger.warning("Auxiliary %s%s: fallback candidate %s has a stale/unrefreshable "
-                   "credential (%s) â€” skipping to next fallback", task or "call", tag, fb_label, fb_err)
-
-
-def _plan_fallback_auth_retry(
-    destination: _FallbackDestination,
-    rebuild: Callable[[str, Any, Optional[str]], Tuple[_FallbackDestination, Dict[str, Any]]], *,
-    async_mode: bool,
-    failed_api_key: str = "",
-) -> Tuple[str, Optional[Tuple[Any, Dict[str, Any], _FallbackDestination]]]:
-    """After an auth error on a fallback candidate: refresh credentials and rebuild the request.
-    Returns ``(refresh_provider, retry)``; ``retry`` = ``(client, kwargs, destination)`` or None."""
-    fb_provider = _auth_refresh_provider_for_route(destination.provider, destination.base_url)
-    refresh_kwargs = {"failed_api_key": failed_api_key} if fb_provider == "anthropic" else {}
-    if fb_provider not in {"auto", "", None} and _refresh_provider_credentials(fb_provider, **refresh_kwargs):
-        retry_client, retry_model = _get_cached_client(
-            fb_provider, destination.model, **({"async_mode": True} if async_mode else {}),
-            base_url=destination.base_url or None, api_mode=destination.api_mode,
-        )
-        if retry_client is not None:
-            retry_destination, retry_kwargs = rebuild(fb_provider, retry_client, retry_model)
-            return fb_provider, (retry_client, retry_kwargs, retry_destination)
-    return fb_provider, None
-
-
-def _call_fallback_candidate_sync(
-    fb_client: Any, fb_model: Optional[str], fb_label: str, *, task: Optional[str], messages: list,
-    temperature: Optional[float], max_tokens: Optional[int], tools: Optional[list],
-    effective_timeout: float, effective_extra_body: dict, reasoning_config: Optional[dict],
-) -> Optional[Any]:
-    """Call one fallback candidate with stale-credential recovery: on an auth error refresh its
-    credentials and retry once with a rebuilt client; if that also auth-fails, quarantine the
-    provider and return None so the caller moves on. Non-auth errors raise.
-
-    ``effective_timeout`` is the task-level deadline; a configured-chain candidate with its own ``timeout``
-    entry gets that instead, so a fallback tuned differently from the primary is allowed its own budget
-    (#62452).
-    """
-    destination, fb_kwargs, rebuild = _plan_fallback_candidate(
-        fb_client, fb_model, fb_label, task=task, effective_timeout=effective_timeout,
-        apply_fast_lane=True, messages=messages, tools=tools, temperature=temperature,
-        max_tokens=max_tokens, effective_extra_body=effective_extra_body,
-        reasoning_config=reasoning_config,
-    )
-
-    def _send(client: Any, request_kwargs: Dict[str, Any], dest: _FallbackDestination) -> Any:
-        return _validate_llm_response(
-            _relay_sync_completion(
-                client, request_kwargs, provider=dest.provider, api_mode=dest.api_mode,
-                create=lambda request: _create_with_progress(
-                    client, request, task,
-                    force_stream=_provider_requires_stream(dest.provider, dest.base_url),
-                ),
-            ),
-            task,
-        )
-    try:
-        return _send(fb_client, fb_kwargs, destination)
-    except Exception as fb_err:
-        if not _is_auth_error(fb_err):
-            raise
-        fb_provider, retry = _plan_fallback_auth_retry(
-            destination, rebuild, async_mode=False, failed_api_key=getattr(fb_client, "api_key", ""))
-        failed_destination = destination
-        if retry is not None:
-            failed_destination = retry[2]
-            try:
-                return _send(*retry)
-            except Exception as retry_err:
-                if not _is_auth_error(retry_err):
-                    raise
-        _quarantine_fallback_candidate(
-            task, fb_label, fb_provider, fb_err, base_url=failed_destination.base_url,
-        )
-        return None
-
-
-async def _call_fallback_candidate_async(
-    fb_client: Any, fb_model: Optional[str], fb_label: str, *, task: Optional[str], messages: list,
-    temperature: Optional[float], max_tokens: Optional[int], tools: Optional[list],
-    effective_timeout: float, effective_extra_body: dict, reasoning_config: Optional[dict],
-) -> Optional[Any]:
-    """Async mirror of :func:`_call_fallback_candidate_sync` (no fast-lane cap on this wire)."""
-    destination, fb_kwargs, rebuild = _plan_fallback_candidate(
-        fb_client, fb_model, fb_label, task=task, effective_timeout=effective_timeout,
-        apply_fast_lane=False, messages=messages, tools=tools, temperature=temperature,
-        max_tokens=max_tokens, effective_extra_body=effective_extra_body,
-        reasoning_config=reasoning_config,
-    )
-
-    async def _send(client: Any, request_kwargs: Dict[str, Any], dest: _FallbackDestination) -> Any:
-        return _validate_llm_response(
-            await _relay_async_completion(client, request_kwargs, provider=dest.provider, api_mode=dest.api_mode),
-            task,
-        )
-    try:
-        return await _send(fb_client, fb_kwargs, destination)
-    except Exception as fb_err:
-        if not _is_auth_error(fb_err):
-            raise
-        fb_provider, retry = _plan_fallback_auth_retry(
-            destination, rebuild, async_mode=True, failed_api_key=getattr(fb_client, "api_key", ""))
-        failed_destination = destination
-        if retry is not None:
-            failed_destination = retry[2]
-            try:
-                return await _send(*retry)
-            except Exception as retry_err:
-                if not _is_auth_error(retry_err):
-                    raise
-        _quarantine_fallback_candidate(
-            task, fb_label, fb_provider, fb_err,
-            base_url=failed_destination.base_url, tag=" (async)",
-        )
-        return None
-
-
-def _try_payment_fallback(
-    failed_provider: str, task: str = None, reason: str = "payment error", *,
-    failed_base_url: str = "", failure_scope: Any = None,
-) -> Tuple[Optional[Any], Optional[str], str]:
-    """Try the auto-detection chain after a payment/credit or connection error, skipping the failed
-    provider (and the main-provider path when it maps to the same backend). Returns (client, model, label) or (None, None, "")."""
-    skip = failed_provider.lower().strip()
-    main_provider = _read_main_provider()
-    skip_labels = {skip}
-    if main_provider and main_provider.lower() in skip:
-        skip_labels.add(main_provider.lower())
-    skip_chain_labels = {_normalize_chain_label(s) for s in skip_labels}
-    skip_backend = _failed_backend_skip(
-        failed_provider, None, failed_base_url=failed_base_url, failure_scope=failure_scope)
-    tried = []
-    for label, try_fn in _get_provider_chain():
-        candidate_base_url = _custom_health_base_url(label)
-        if (not failed_base_url and label in skip_chain_labels) or skip_backend(
-                label, None, candidate_base_url):
-            continue
-        if _is_provider_unhealthy(label, candidate_base_url):
-            _log_skip_unhealthy(label, task, base_url=candidate_base_url)
-            tried.append(f"{label} (unhealthy)")
-            continue
-        client, model = try_fn()
-        if client is not None:
-            logger.info("Auxiliary %s: %s on %s â€” falling back to %s (%s)",
-                        task or "call", reason, failed_provider, label, model or "default")
-            return client, model, label
-        tried.append(label)
-    logger.warning("Auxiliary %s: %s on %s and no fallback available (tried: %s)",
-                   task or "call", reason, failed_provider, ", ".join(tried))
-    return None, None, ""
-
-
-def _failed_backend_skip(
-    failed_provider: str, failed_model: Optional[str], *, failed_base_url: str = "",
-    failure_scope: Any = None,
-) -> Callable[..., bool]:
-    """Predicate ``skip(provider, model, base_url="")`` â†’ True when a candidate must be skipped for the failed
-    route. Scope: ``failed_model`` â†’ model-scoped (only that deployment; timeout/connection/rate-limit);
-    None â†’ credential-wide (whole provider; auth/payment)."""
-    from agent.backend_identity import BackendIdentity, FailureScope, should_skip_candidate
-    skip_model = (failed_model or "").strip().lower() or None
-    failed_ident = BackendIdentity.build(
-        provider=failed_provider, model=skip_model, base_url=failed_base_url)
-    failure_scope = failure_scope or (FailureScope.MODEL if skip_model else FailureScope.CREDENTIAL)
-
-    def _skip(provider: str, model: Optional[str], base_url: str = "") -> bool:
-        return should_skip_candidate(
-            BackendIdentity.build(provider=provider, model=model, base_url=base_url), failed_ident, failure_scope,
-        )
-    return _skip
-
-
-def _try_main_agent_model_fallback(
-    failed_provider: str, task: str = None, reason: str = "error",
-    failed_model: Optional[str] = None, failed_base_url: str = "", failure_scope: Any = None,
-) -> Tuple[Optional[Any], Optional[str], str]:
-    """Last-resort fallback to the main agent provider + model after the configured chain is exhausted.
-    ``failed_model`` scoping per ``_failed_backend_skip``; same-URL custom endpoints serve many models,
-    so a hung aux model says nothing about the main model's health. Returns (client, model, label) or (None, None, "")."""
-    main_provider = (_read_main_provider() or "").strip()
-    main_model = (_read_main_model() or "").strip()
-    if main_provider.lower() == "moa":
-        # MoA virtual provider: fall back to the preset's aggregator (the acting model).
-        _agg_provider, _agg_model = _resolve_moa_aggregator(main_model)
-        if not _agg_provider or not _agg_model:
-            return None, None, ""
-        main_provider, main_model = _agg_provider, _agg_model
-    if not main_provider or not main_model or main_provider.lower() in {"auto", ""}:
-        return None, None, ""
-    main_base_url = _custom_health_base_url(main_provider)
-    if _failed_backend_skip(
-            failed_provider, failed_model, failed_base_url=failed_base_url,
-            failure_scope=failure_scope)(main_provider, main_model, main_base_url):
-        return None, None, ""
-    if _is_provider_unhealthy(main_provider, main_base_url):
-        _log_skip_unhealthy(main_provider, task, base_url=main_base_url)
-        return None, None, ""
-    try:
-        client, resolved_model = resolve_provider_client(provider=main_provider, model=main_model)
-    except Exception:
-        client, resolved_model = None, None
-    if client is None:
-        return None, None, ""
-    label = f"main-agent({main_provider})"
-    logger.info("Auxiliary %s: %s on %s â€” falling back to main agent model %s (%s)",
-                task or "call", reason, failed_provider, label, resolved_model or main_model)
-    return client, resolved_model or main_model, label
-
-
-# Context-window screening for runtime fallback chains: the startup feasibility check filters
-# too-small aux models; runtime chains must too, or compression stops at a reachable-but-too-small
-# candidate. ``None`` (unknown) passes through.
-
-# â”€â”€ Context-window screening for runtime fallback chains (issue #52392) â”€â”€ When the runtime auxiliary
-# fallback chain selects a candidate that is reachable but has a context window smaller than the compression
-# task requires, the call errors out instead of continuing to the next, viable candidate. The startup
-# feasibility check in ``agent.conversation_compression.check_compression_model_feasibility`` already
-# filters too-small auxiliary models at startup, but the runtime fallback chain
-# (``_try_configured_fallback_chain`` and ``_try_main_fallback_chain``) does not apply the same filter, so
-# compression can stop at the first alive door even if the room behind it is too small. The helpers below
-# screen each candidate by its effective context window before it is returned. ``None`` results from
-# ``get_model_context_length`` are passed through (we cannot prove a model is too small, so we do not block
-# it). This preserves the existing fallback surface for unrecognised/custom models while closing the gap on
-# the well-known ones.
-def _task_minimum_context_length(task: Optional[str]) -> Optional[int]:
-    """Minimum context length for an auxiliary task; None = no floor (only ``compression`` has one)."""
-    return MINIMUM_CONTEXT_LENGTH if task == "compression" else None
-
-
-def _candidate_context_window(provider: str, model: str, base_url: str = "", api_key: str = "") -> Optional[int]:
-    """Best-effort context window for a fallback candidate; ``None`` = unknown (never raises; callers pass it through)."""
-    if not model:
-        return None
-    try:
-        ctx = get_model_context_length(model, base_url=base_url, api_key=api_key, provider=provider)
-    except Exception as exc:
-        logger.debug("Auxiliary fallback: could not resolve context window for %s/%s: %s", provider, model, exc)
-        return None
-    return ctx if isinstance(ctx, int) and ctx > 0 else None
-
-
-def _context_too_small(
-    entry: Dict[str, Any], provider: str, model: str, min_ctx: Optional[int], *,
-    task: Optional[str], label: str, name_model: bool = False,
-) -> Optional[str]:
-    """Screen one fallback candidate by context window; returns the ``tried`` note when it is too small."""
-    if min_ctx is None:
-        return None
-    fb_ctx = _candidate_context_window(
-        provider, model, base_url=str(entry.get("base_url") or ""), api_key=_fallback_entry_api_key(entry) or "")
-    if fb_ctx is None or fb_ctx >= min_ctx:
-        return None
-    if name_model:
-        logger.info("Auxiliary %s: skipping %s (%s context=%d < min=%d), continuing chain",
-                    task, label, model, fb_ctx, min_ctx)
-    else:
-        logger.info("Auxiliary %s: skipping %s (context=%d < min=%d), continuing chain",
-                    task or "call", label, fb_ctx, min_ctx)
-    return f"{label} (context too small: {fb_ctx}<{min_ctx})"
-
-
-def _try_configured_fallback_chain(
-    task: str, failed_provider: str, reason: str = "error", failed_model: Optional[str] = None, *,
-    failed_base_url: str = "", failure_scope: Any = None,
-) -> Tuple[Optional[Any], Optional[str], str]:
-    """Try auxiliary.<task>.fallback_chain entries in order (each needs ``provider``; model/base_url/api_key optional).
-    ``failed_model`` scoping per ``_failed_backend_skip`` (sibling models on the same provider still
-    run after a model-scoped failure). Returns (client, model, provider_label) or (None, None, "")."""
-    if not task:
-        return None, None, ""
-    chain = _get_auxiliary_task_config(task).get("fallback_chain")
-    if not chain or not isinstance(chain, list):
-        return None, None, ""
-    skip = _failed_backend_skip(
-        failed_provider, failed_model, failed_base_url=failed_base_url, failure_scope=failure_scope)
-    tried = []
-    min_ctx = _task_minimum_context_length(task)
-    for i, entry in enumerate(chain):
-        if not isinstance(entry, dict):
-            continue
-        fb_provider = str(entry.get("provider", "")).strip()
-        if not fb_provider:
-            continue
-        fb_model_raw = str(entry.get("model", "")).strip()
-        fb_base_url = _custom_health_base_url(fb_provider, entry.get("base_url"))
-        if skip(fb_provider, fb_model_raw, fb_base_url):
-            continue
-        if _is_provider_unhealthy(fb_provider, fb_base_url):
-            _log_skip_unhealthy(fb_provider, task, base_url=fb_base_url)
-            tried.append(f"fallback_chain[{i}]({fb_provider}) (unhealthy)")
-            continue
-        fb_model = fb_model_raw or None
-        label = f"fallback_chain[{i}]({fb_provider})"
-        try:
-            fb_client, resolved_model = _resolve_fallback_entry(entry)
-        except Exception:
-            fb_client, resolved_model = None, None
-        if fb_client is not None:
-            too_small = _context_too_small(
-                entry, fb_provider, resolved_model, min_ctx, task=task, label=label, name_model=True,
-            ) if resolved_model else None
-            if too_small:
-                tried.append(too_small)
-                continue
-            logger.info("Auxiliary %s: %s on %s â€” configured fallback to %s (%s)",
-                        task, reason, failed_provider, label, resolved_model or fb_model or "default")
-            return fb_client, resolved_model or fb_model, label
-        tried.append(label)
-    if tried:
-        logger.debug("Auxiliary %s: configured fallback_chain exhausted (tried: %s)", task, ", ".join(tried))
-    return None, None, ""
-
-
-def _try_configured_fallback_for_unavailable_client(
-    task: Optional[str], failed_provider: str
-) -> Tuple[Optional[Any], Optional[str], str]:
-    """Task fallback_chain when an explicit aux provider cannot build a client (no key/OAuth/pool creds);
-    stops at the per-task chain â€” the main-agent model stays the runtime last resort."""
-    explicit = (failed_provider or "").strip().lower()
-    if not task or not explicit or explicit in {"auto"}:
-        return None, None, ""
-    return _try_configured_fallback_chain(task, explicit, reason="provider unavailable")
-
-
-def _fallback_entry_api_key(entry: Dict[str, Any]) -> Optional[str]:
-    """Resolve inline or env-backed API key via the secret-scope-aware resolver (no raw os.getenv under multiplexing)."""
-    from hermes_cli.fallback_config import resolve_entry_api_key
-    return resolve_entry_api_key(entry)
-
-
-def _resolve_fallback_entry(entry: Dict[str, Any]) -> Tuple[Optional[Any], Optional[str]]:
-    """Resolve one fallback entry through the central provider router."""
-    provider = str(entry.get("provider") or "").strip()
-    model = str(entry.get("model") or "").strip() or None
-    if not provider or not model:
-        return None, None
-    client, resolved_model = resolve_provider_client(
-        provider, model=model, explicit_base_url=str(entry.get("base_url") or "").strip() or None,
-        explicit_api_key=_fallback_entry_api_key(entry),
-        api_mode=str(entry.get("api_mode") or entry.get("transport") or "").strip() or None,
-    )
-    if client is not None:
-        with contextlib.suppress(Exception):
-            client._hermes_fallback_destination = _fallback_destination_from_entry(entry, client, resolved_model)
-    return client, resolved_model
-
-
-def _try_main_fallback_chain(
-    task: Optional[str], failed_provider: str = "", reason: str = "error", *,
-    failed_model: Optional[str] = None, failed_base_url: str = "", failure_scope: Any = None,
-) -> Tuple[Optional[Any], Optional[str], str]:
-    """Top-level main-agent fallback chain for a ``provider: auto`` auxiliary call: auto tasks honour the
-    user's main fallback policy before the built-in discovery chain; read via ``get_fallback_chain`` so
-    ``fallback_providers`` and legacy ``fallback_model`` keep the main agent's order."""
-    try:
-        from hermes_cli.config import load_config_readonly
-        from hermes_cli.fallback_config import get_fallback_chain
-        chain = get_fallback_chain(load_config_readonly())
-    except Exception as exc:
-        logger.debug("Auxiliary %s: could not load main fallback chain: %s", task or "call", exc)
-        return None, None, ""
-    if not chain:
-        return None, None, ""
-    skip = _failed_backend_skip(
-        failed_provider, failed_model, failed_base_url=failed_base_url, failure_scope=failure_scope)
-    tried: List[str] = []
-    min_ctx = _task_minimum_context_length(task)
-    for i, entry in enumerate(chain):
-        if not isinstance(entry, dict):
-            continue
-        fb_provider = str(entry.get("provider") or "").strip()
-        fb_model = str(entry.get("model") or "").strip()
-        if not fb_provider or not fb_model:
-            continue
-        fb_norm = fb_provider.lower()
-        label = f"fallback_providers[{i}]({fb_provider})"
-        fb_base_url = _custom_health_base_url(fb_provider, entry.get("base_url"))
-        if fb_norm == "auto" or skip(fb_provider, fb_model, fb_base_url):
-            tried.append(f"{label} (skipped)")
-            continue
-        if _is_provider_unhealthy(fb_norm, fb_base_url):
-            _log_skip_unhealthy(fb_norm, task, base_url=fb_base_url)
-            tried.append(f"{label} (unhealthy)")
-            continue
-        try:
-            fb_client, resolved_model = _resolve_fallback_entry(entry)
-        except Exception as exc:
-            logger.debug("Auxiliary %s: main fallback %s failed to resolve: %s", task or "call", label, exc)
-            fb_client, resolved_model = None, None
-        if fb_client is not None:
-            too_small = _context_too_small(
-                entry, fb_provider, resolved_model or fb_model, min_ctx, task=task, label=label,
-            )
-            if too_small:
-                tried.append(too_small)
-                continue
-            logger.info("Auxiliary %s: %s on %s â€” main fallback chain to %s (%s)",
-                        task or "call", reason, failed_provider or "auto", label, resolved_model or fb_model)
-            return fb_client, resolved_model or fb_model, fb_provider
-        tried.append(label)
-    if tried:
-        logger.debug("Auxiliary %s: main fallback chain exhausted (tried: %s)", task or "call", ", ".join(tried))
-    return None, None, ""
-
-
-def _warn_stale_openai_base_url(runtime_provider: str) -> None:
-    """Warn once when OPENAI_BASE_URL is set but config.yaml names a non-custom provider (a stale
-    ~/.hermes/.env value after `hermes model` poisons routing)."""
-    global _stale_base_url_warned
-    if _stale_base_url_warned:
-        return
-    _env_base = os.getenv("OPENAI_BASE_URL", "").strip()
-    _cfg_provider = runtime_provider or _read_main_provider()
-    if (_env_base and _cfg_provider and _cfg_provider != "custom" and not _cfg_provider.startswith("custom:")):
-        logger.warning(
-            "OPENAI_BASE_URL is set (%s) but model.provider is '%s'. "
-            "Auxiliary clients may route to the wrong endpoint. "
-            "Run: hermes model to reconfigure, or remove "
-            "OPENAI_BASE_URL from ~/.hermes/.env",
-            _env_base, _cfg_provider,
-        )
-        _stale_base_url_warned = True
-
-
-def _main_route_target(runtime: Dict[str, Any], task: Optional[str]) -> Tuple[str, str, str, Any, str]:
-    """Step-1 target: (provider, model, base_url, api_key, api_mode) of the main runtime, after the
-    fast-model opt-in and the MoA aggregator substitution."""
-    main_provider = str(runtime.get("provider", "") or _read_main_provider() or "")
-    main_model = str(runtime.get("model") or _read_main_model() or "")
-    runtime_base_url = str(runtime.get("base_url") or "")
-    runtime_api_key = runtime.get("api_key", "")
-    runtime_api_mode = str(runtime.get("api_mode") or "")
-    # Latency-critical tasks (titling only) opt in to the provider's fast model. Opt-in only:
-    # every settings surface defines "auto" as the main model.
-    if _task_prefers_fast_model(task) and main_provider and main_provider not in {"auto", ""}:
-        fast_model = _get_aux_model_for_provider(main_provider, prefer_fast=True)
-        if fast_model and fast_model != main_model:
-            logger.debug("Auxiliary task %s: preferring fast model %s over main model %s",
-                         task, fast_model, main_model)
-            main_model = fast_model
-    # MoA virtual provider: the preset name is not a wire model; run aux on the aggregator and drop
-    # the facade's "moa://local" base_url / placeholder key so it uses its own credentials.
-    if main_provider == "moa":
-        _agg_provider, _agg_model = _resolve_moa_aggregator(main_model)
-        if _agg_provider and _agg_model:
-            main_provider, main_model = _agg_provider, _agg_model
-            runtime_base_url = runtime_api_key = runtime_api_mode = ""
-    return main_provider, main_model, runtime_base_url, runtime_api_key, runtime_api_mode
-
-
-def _try_main_provider_route(
-    main_provider: str, main_model: str, runtime_base_url: str, runtime_api_key: Any, runtime_api_mode: str,
-) -> Optional[Tuple[Any, str, str]]:
-    """Step 1: route aux onto the main provider + main model; None if unusable."""
-    if not (main_provider and main_model and main_provider not in {"auto", ""}):
-        return None
-    resolved_provider = main_provider
-    explicit_base_url = runtime_base_url or None
-    health_base_url = _custom_health_base_url(main_provider, explicit_base_url)
-    explicit_api_key = None
-    if runtime_base_url and main_provider == "custom":
-        # Anonymous custom endpoint â€” pass through explicit base_url + api_key.
-        explicit_api_key = runtime_api_key or None
-    elif main_provider.startswith("custom:"):
-        # Named custom provider (custom_providers / providers dict entry).
-        _has_named_entry = False
-        with contextlib.suppress(ImportError):
-            from hermes_cli.runtime_provider import _get_named_custom_provider
-            _has_named_entry = _get_named_custom_provider(main_provider) is not None
-        if _has_named_entry:
-            # KEEP the full ``custom:<name>`` so the named arm honours the entry's api_mode
-            # (collapsing to "custom" strips /anthropic â†’ 404s). base_url/api_key come from the entry.
-            explicit_base_url = None
-        elif runtime_base_url:
-            # Config-less named custom provider (live runtime only): anonymous custom arm + runtime key.
-            # See #34777.
-            resolved_provider = "custom"
-            explicit_api_key = runtime_api_key or None
-        elif runtime_api_key:
-            explicit_api_key = runtime_api_key
-    elif runtime_api_key:
-        # Pin aux to the main session's working key, not a re-selected (maybe exhausted) pool key.
-        explicit_api_key = runtime_api_key
-    # Skip if the main provider was recently 402'd (unhealthy TTL bounds the bypass).
-    main_chain_label = _normalize_chain_label(resolved_provider)
-    if main_chain_label and _is_provider_unhealthy(main_chain_label, health_base_url):
-        _log_skip_unhealthy(main_chain_label, base_url=health_base_url)
-        return None
-    client, resolved = resolve_provider_client(
-        resolved_provider, main_model, explicit_base_url=explicit_base_url,
-        explicit_api_key=explicit_api_key, api_mode=runtime_api_mode or None,
-    )
-    if client is None:
-        return None
-    logger.info("Auxiliary auto-detect: using main provider %s (%s)", main_provider, resolved or main_model)
-    return client, resolved or main_model, resolved_provider
-
-
-def _try_discovery_chain() -> Tuple[Optional[OpenAI], Optional[str], str]:
-    """Step 3: hardcoded aggregator/fallback chain, skipping unhealthy providers."""
-    tried = []
-    for label, try_fn in _get_provider_chain():
-        candidate_base_url = _custom_health_base_url(label)
-        if _is_provider_unhealthy(label, candidate_base_url):
-            _log_skip_unhealthy(label, base_url=candidate_base_url)
-            tried.append(f"{label} (unhealthy)")
-            continue
-        client, model = try_fn()
-        if client is not None:
-            if tried:
-                logger.info("Auxiliary auto-detect: using %s (%s) â€” skipped: %s",
-                            label, model or "default", ", ".join(tried))
-            else:
-                logger.info("Auxiliary auto-detect: using %s (%s)", label, model or "default")
-            return client, model, label
-        tried.append(label)
-    logger.warning("Auxiliary auto-detect: no provider available (tried: %s). "
-                   "Compression, summarization, and memory flush will not work. "
-                   "Set OPENROUTER_API_KEY or configure a local model in config.yaml.", ", ".join(tried))
-    return None, None, ""
-
-
-def _resolve_auto_route(
-    main_runtime: Optional[Dict[str, Any]] = None, task: Optional[str] = None
-) -> Tuple[Optional[OpenAI], Optional[str], str]:
-    """Full auto-detection chain, including the selected provider identity. Priority: (1) main provider +
-    main model, regardless of provider type ("auto" means "my main model for side tasks too"; explicit
-    per-task overrides still win); (2) configured fallback policy â€” task chain, then the main agent's
-    top-level chain; (3) OpenRouter â†’ Nous â†’ custom â†’ Codex â†’ API-key providers, only with no policy
-    and no working main client."""
-    global auxiliary_is_nous
-    auxiliary_is_nous = False  # Reset â€” _try_nous() will set True if it wins
-    runtime = _normalize_main_runtime(main_runtime)
-    _warn_stale_openai_base_url(runtime.get("provider", ""))
-    main_provider, main_model, base_url, api_key, api_mode = _main_route_target(runtime, task)
-    routed = _try_main_provider_route(main_provider, main_model, base_url, api_key, api_mode)
-    if routed is not None:
-        return routed
-    if task:
-        fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-            task, main_provider or "auto", reason="main provider unavailable")
-        if fb_client is not None:
-            return fb_client, fb_model, _fallback_provider_from_label(fb_label)
-    fb_client, fb_model, fb_label = _try_main_fallback_chain(
-        task, main_provider or "auto", reason="main provider unavailable")
-    if fb_client is not None:
-        return fb_client, fb_model, fb_label
-    return _try_discovery_chain()
-
-
-def _effective_provider_for_client(client: Any, fallback: str) -> str:
-    """Return the concrete provider selected for an auto-routed client."""
-    effective_provider = getattr(client, "_hermes_aux_effective_provider", "")
-    if isinstance(effective_provider, str) and effective_provider:
-        return effective_provider
-    return str(fallback or "")
-
-
-# Centralized Provider Router: resolve_provider_client() is the single entry point for building a configured
-# client (auth, base URL, headers, API format) from (provider, model). Never read auth env vars ad-hoc.
-
-
-def _to_async_client(sync_client, model: str, is_vision: bool = False):
-    """Sync client â†’ async counterpart, preserving Codex routing (``is_vision`` adds the Copilot vision header)."""
-    from openai import AsyncOpenAI
-    if isinstance(sync_client, _AuxProbeClientStub):
-        return sync_client, model
-    if isinstance(sync_client, CodexAuxiliaryClient):
-        return AsyncCodexAuxiliaryClient(sync_client), model
-    if isinstance(sync_client, AnthropicAuxiliaryClient):
-        return AsyncAnthropicAuxiliaryClient(sync_client), model
-    if isinstance(sync_client, BedrockAuxiliaryClient):
-        return AsyncBedrockAuxiliaryClient(sync_client), model
-    with contextlib.suppress(ImportError):
-        from agent.gemini_native_adapter import GeminiNativeClient, AsyncGeminiNativeClient
-        if isinstance(sync_client, GeminiNativeClient):
-            return AsyncGeminiNativeClient(sync_client), model
-    # ACP shims (subprocess, not an HTTP pool) are already async-safe and opt out of the wrapper.
-    if _client_declares(sync_client, "HERMES_SKIP_ASYNC_WRAP"):
-        return sync_client, model
-    sync_base_url = str(sync_client.base_url)
-    async_kwargs = {"api_key": sync_client.api_key, "base_url": sync_base_url}
-    if base_url_host_matches(sync_base_url, "openrouter.ai"):
-        headers = _apply_user_default_headers(build_or_headers())
-    elif _is_official_codex_base_url(sync_base_url):
-        headers = _apply_user_default_headers(_codex_cloudflare_headers(sync_client.api_key, base_url=sync_base_url))
-    else:
-        # Provider for the profile-header fallback is inferred from the hostname.
-        try:
-            from agent.model_metadata import _infer_provider_from_url
-            inferred = _infer_provider_from_url(sync_base_url) or ""
-        except Exception:
-            inferred = ""
-        headers = _endpoint_default_headers(sync_base_url, inferred, is_vision=is_vision, xai=True)
-    if headers:
-        async_kwargs["default_headers"] = headers
-    _apply_required_codex_headers(async_kwargs, access_token=sync_client.api_key, base_url=sync_base_url)
-    async_kwargs = {**_openai_http_client_kwargs(sync_base_url, async_mode=True), **async_kwargs}
-    # Hermes owns the auxiliary retry/timeout budget; disable SDK-internal retries.
-    # See #54465.
-    async_kwargs.setdefault("max_retries", 0)
-    return AsyncOpenAI(**async_kwargs), model
-
-
-def _normalize_resolved_model(model_name: Optional[str], provider: str) -> Optional[str]:
-    """Normalize a resolved model for the provider that will receive it."""
-    if not model_name:
-        return model_name
-    try:
-        from hermes_cli.model_normalize import normalize_model_for_provider
-        return normalize_model_for_provider(model_name, provider)
-    except Exception:
-        return model_name
-
-
-def _named_custom_api_key(custom_entry: Dict[str, Any], provider: str, custom_base: str) -> Any:
-    """Credential for a named custom provider: inline api_key â†’ key_env â†’ key_cmd â†’ credential pool â†’ placeholder.
-    Aux resolves named custom providers here, not via _resolve_named_custom_runtime, so key_cmd must be
-    honoured at the same precedence or every aux call 401s."""
-    custom_key: Any = (custom_entry.get("api_key") or "").strip()
-    custom_key_env = (custom_entry.get("key_env") or custom_entry.get("api_key_env") or "").strip()
-    if not custom_key and custom_key_env:
-        custom_key = _scoped_key_env(custom_key_env)
-    custom_key_cmd = str(custom_entry.get("key_cmd", "") or "").strip()
-    if custom_key_cmd:
-        from agent.command_token_source import build_command_token_provider
-        custom_key = build_command_token_provider(custom_key_cmd, custom_entry.get("name") or provider) or custom_key
-    if not custom_key:
-        with contextlib.suppress(Exception):
-            from agent.credential_pool import custom_provider_pool_key_candidates
-            pool_name = custom_entry.get("provider_key") or custom_entry.get("name") or provider
-            for pool_key in custom_provider_pool_key_candidates(custom_base, pool_name):
-                try:
-                    pool = load_pool(pool_key)
-                except Exception:
-                    continue
-                if not pool.has_credentials():
-                    continue
-                pool_entry = pool.select()
-                if pool_entry is None:
-                    continue
-                pool_api_key = getattr(pool_entry, "runtime_api_key", None) or getattr(pool_entry, "access_token", "") or ""
-                if str(pool_api_key).strip():
-                    custom_key = str(pool_api_key).strip()
-                    break
-    return custom_key or "no-key-required"
-
-
-def _build_bedrock_client(provider: str, model: Optional[str], *, raw_codex: bool) -> Tuple[Optional[Any], Optional[str]]:
-    """AWS Bedrock: Claude â†’ Anthropic Bedrock SDK (prompt caching, thinking); OpenAI models
-    (GPT-5.5/5.6) â†’ Bedrock Mantle's OpenAI Responses endpoint; everything else â†’ Converse API."""
-    try:
-        from agent.bedrock_adapter import (
-            has_aws_credentials, is_anthropic_bedrock_model, resolve_bedrock_runtime_region,
-            is_openai_bedrock_model, bedrock_openai_base_url, resolve_bedrock_bearer_token,
-            configure_bedrock_openai_client_kwargs,
-        )
-        from agent.anthropic_adapter import build_anthropic_bedrock_client
-    except ImportError:
-        logger.warning("resolve_provider_client: bedrock requested but boto3, httpx/openai, or anthropic SDK not installed")
-        return None, None
-    if not has_aws_credentials():
-        logger.debug("resolve_provider_client: bedrock requested but no AWS credentials found")
-        return None, None
-    # Region must match the main runtime's resolution (bedrock.region in config first, then
-    # env/profile) so aux calls never leave the primary runtime's configured region.
-    # See #53880, #65076.
-    region = resolve_bedrock_runtime_region()
-    default_model = "anthropic.claude-haiku-4-5-20251001-v1:0"
-    final_model = _normalize_resolved_model(model or default_model, provider) or default_model
-    if is_openai_bedrock_model(final_model):
-        # Module-level lazy ``OpenAI`` proxy on purpose so tests can patch("agent.auxiliary_client.OpenAI").
-        client_kwargs: Dict[str, Any] = {
-            "api_key": resolve_bedrock_bearer_token() or "aws-sdk",
-            "base_url": bedrock_openai_base_url(region),
-        }
-        configure_bedrock_openai_client_kwargs(client_kwargs)
-        client = OpenAI(**client_kwargs)
-        logger.debug("resolve_provider_client: bedrock-openai (%s, %s)", final_model, region)
-        return (client if raw_codex else CodexAuxiliaryClient(client, final_model)), final_model
-    base_url = f"https://bedrock-runtime.{region}.amazonaws.com"
-    if is_anthropic_bedrock_model(final_model):
-        try:
-            real_client = build_anthropic_bedrock_client(region)
-        except ImportError as exc:
-            logger.warning("resolve_provider_client: cannot create Bedrock client: %s", exc)
-            return None, None
-        client = AnthropicAuxiliaryClient(real_client, final_model, api_key="aws-sdk", base_url=base_url)
-        logger.debug("resolve_provider_client: bedrock anthropic (%s, %s)", final_model, region)
-    else:
-        client = BedrockAuxiliaryClient(region, final_model)
-        logger.debug("resolve_provider_client: bedrock converse (%s, %s)", final_model, region)
-    return client, final_model
-
-
-def _build_vertex_client(provider: str, model: Optional[str]) -> Tuple[Optional[Any], Optional[str]]:
-    """Google Vertex AI: Gemini via the OpenAI-compatible endpoint with an OAuth2 bearer (standard OpenAI client)."""
-    try:
-        from agent.vertex_adapter import get_vertex_config, has_vertex_credentials
-    except ImportError:
-        logger.warning("resolve_provider_client: vertex requested but google-auth not installed")
-        return None, None
-    if not has_vertex_credentials():
-        logger.debug("resolve_provider_client: vertex requested but no GCP credentials found")
-        return None, None
-    token, base_url = get_vertex_config()
-    if not token or not base_url:
-        logger.warning("resolve_provider_client: vertex requested but could not mint token / resolve project")
-        return None, None
-    final_model = _normalize_resolved_model(model or "google/gemini-3-flash-preview", provider)
-    try:
-        # Aliased import: a bare `from openai import OpenAI` would shadow the module-level lazy proxy.
-        from openai import OpenAI as _VertexOpenAI
-        client = _VertexOpenAI(api_key=token, base_url=base_url)
-    except Exception as exc:
-        logger.warning("resolve_provider_client: cannot create Vertex client: %s", exc)
-        return None, None
-    logger.debug("resolve_provider_client: vertex (%s)", final_model)
-    return client, final_model
-
-
-class _ResolveRequest(NamedTuple):
-    """Normalized resolve_provider_client() arguments shared by the per-provider branch helpers."""
-    provider: str
-    original_provider: str
-    model: Optional[str]
-    async_mode: bool
-    raw_codex: bool
-    explicit_base_url: Optional[str]
-    explicit_api_key: Optional[str]
-    api_mode: Optional[str]
-    main_runtime: Optional[Dict[str, Any]]
-    is_vision: bool
-    task: Optional[str]
-
-
-_ResolveResult = Tuple[Optional[Any], Optional[str]]
-
-
-def _log_once_debug(seen: set, key: Any, msg: str, *args: Any) -> None:
-    """Debug-log ``msg`` the first time ``key`` is seen so per-call retries stay silent."""
-    if key not in seen:
-        seen.add(key)
-        logger.debug(msg, *args)
-
-
-def _wrap_transport(req: _ResolveRequest, client_obj: Any, final_model_str: str,
-                    base_url_str: str = "", api_key_str: str = ""):
-    """Wrap a plain OpenAI client in the right transport adapter; specialized wrappers pass through.
-    Codex (Responses API): explicit ``api_mode=codex_responses`` (or provider ``actual``), else â€” with no
-    explicit api_mode â€” api.openai.com + codex model. Anthropic (Messages): ``api_mode=anthropic_messages``,
-    any ``/anthropic`` suffix, ``api.kimi.com/coding``, or ``api.anthropic.com``."""
-    needs_codex = not (isinstance(client_obj, CodexAuxiliaryClient) or req.raw_codex) and (
-        req.provider == "actual" or req.api_mode == "codex_responses"
-        or (not req.api_mode and base_url_hostname(base_url_str) == "api.openai.com"
-            and "codex" in (final_model_str or "").lower())
-    )
-    if needs_codex:
-        logger.debug("resolve_provider_client: wrapping client in CodexAuxiliaryClient "
-                     "(api_mode=%s, model=%s, base_url=%s)",
-                     req.api_mode or "auto-detected", final_model_str, base_url_str[:60] if base_url_str else "")
-        return CodexAuxiliaryClient(client_obj, final_model_str)
-    return _maybe_wrap_anthropic(client_obj, final_model_str, api_key_str, base_url_str, req.api_mode)
-
-
-def _route_client(req: _ResolveRequest, client_obj: Any, final_model_str: Optional[str]) -> _ResolveResult:
-    """Return (client, model), converting to the async wrapper when ``req.async_mode``."""
-    if req.async_mode:
-        return _to_async_client(client_obj, final_model_str, is_vision=req.is_vision)
-    return client_obj, final_model_str
-
-
-def _route_or_warn(req: _ResolveRequest, client: Any, default: Optional[str], unavailable_msg: str, *args: Any) -> _ResolveResult:
-    """Route ``client`` on ``req.model or default``; warn and return (None, None) when the provider produced no client."""
-    if client is None:
-        logger.warning(unavailable_msg, *args)
-        return None, None
-    return _route_client(req, client, _normalize_resolved_model(req.model or default, req.provider))
-
-
-def _resolve_auto_branch(req: _ResolveRequest) -> _ResolveResult:
-    """Auto: try all providers in priority order; tag the client with the effective provider (survives cache reuse)."""
-    client, resolved, effective_provider = _resolve_auto_route(main_runtime=req.main_runtime, task=req.task)
-    if client is None:
-        return None, None
-    model = req.model
-    # An OpenRouter-format model override won't work on a non-OpenRouter provider (e.g. local
-    # server); drop it for the provider's default.
-    if model and "/" in model and resolved and "/" not in resolved:
-        logger.debug("Dropping OpenRouter-format model %r for non-OpenRouter "
-                     "auxiliary provider (using %r instead)", model, resolved)
-        model = None
-    routed_client, routed_model = _route_client(req, client, model or resolved)
-    if routed_client is not None and effective_provider:
-        try:
-            setattr(routed_client, "_hermes_aux_effective_provider", effective_provider)
-        except (AttributeError, TypeError):
-            logger.debug("Auxiliary client %s cannot retain effective provider %s",
-                         type(routed_client).__name__, effective_provider)
-    return routed_client, routed_model
-
-
-def _resolve_openrouter_branch(req: _ResolveRequest) -> _ResolveResult:
-    """OpenRouter."""
-    client, default = _try_openrouter(explicit_api_key=req.explicit_api_key, model=req.model)
-    if client is None:
-        logger.warning("resolve_provider_client: openrouter requested but %s",
-                       _describe_openrouter_unavailable(model=req.model))
-        return None, None
-    return _route_client(req, client, _normalize_resolved_model(req.model or default, req.provider))
-
-
-def _resolve_nous_branch(req: _ResolveRequest) -> _ResolveResult:
-    """Nous Portal (OAuth)."""
-    model = req.model
-    # Vision: caller flag, _PROVIDER_VISION_MODELS override, or a known vision id.
-    client, default = _try_nous(vision=(req.is_vision or model in _PROVIDER_VISION_MODELS.values()
-                                        or (model or "").strip().lower() == "mimo-v2-omni"))
-    if client is None:
-        logger.warning("resolve_provider_client: nous requested but Nous Portal not configured (run: hermes auth)")
-        return None, None
-    final_model = _normalize_resolved_model(model or default, req.provider)
-    # Dual-wire: anthropic/* â†’ /v1/messages, else /chat/completions. Derive from the catalog id
-    # (not a stale api_mode) so aux matches the main agent.
-    from hermes_cli.providers import nous_api_mode
-    client = _maybe_wrap_anthropic(
-        client, final_model, str(getattr(client, "api_key", "") or ""),
-        str(getattr(client, "base_url", "") or ""), nous_api_mode(final_model),
-    )
-    return _route_client(req, client, final_model)
-
-
-def _resolve_openai_codex_branch(req: _ResolveRequest) -> _ResolveResult:
-    """OpenAI Codex (OAuth â†’ Responses API)."""
-    model = req.model
-    if not model:
-        logger.warning("resolve_provider_client: openai-codex requested without a "
-                       "model; pass model explicitly (e.g. model.model in config.yaml "
-                       "or auxiliary.<task>.model for per-task aux routing).")
-        return None, None
-    no_token_msg = "resolve_provider_client: openai-codex requested but no Codex OAuth token found (run: hermes model)"
-    if req.raw_codex:
-        # Raw OpenAI client for callers needing responses.stream() (main agent loop).
-        codex_token = _read_codex_access_token()
-        if not codex_token:
-            logger.warning(no_token_msg)
-            return None, None
-        raw_client = _create_openai_client(api_key=codex_token, base_url=_CODEX_AUX_BASE_URL,
-                                           default_headers=_codex_cloudflare_headers(codex_token))
-        return raw_client, _normalize_resolved_model(model, req.provider)
-    client, default = _build_codex_client(model)
-    return _route_or_warn(req, client, default, no_token_msg)
-
-
-def _resolve_xai_oauth_branch(req: _ResolveRequest) -> _ResolveResult:
-    """xAI Grok OAuth (device code â†’ Responses API). Without this branch xai-oauth falls to the generic
-    oauth_external arm, returns (None, None), and silently re-routes every aux task to the Step-2 fallback."""
-    client, default = _build_xai_oauth_aux_client(req.model)
-    return _route_or_warn(req, client, default,
-                          "resolve_provider_client: xai-oauth requested but no xAI "
-                          "OAuth token found (run: hermes model -> xAI Grok OAuth â€” SuperGrok / Premium+)")
-
-
-def _resolve_custom_branch(req: _ResolveRequest) -> _ResolveResult:
-    """Custom endpoint (OPENAI_BASE_URL + OPENAI_API_KEY)."""
-    provider, model, main_runtime = req.provider, req.model, req.main_runtime
-    # wrap_base: base for the Anthropic-wrap decision. anthropic_messages must keep the raw
-    # /anthropic base while the plain OpenAI client uses the /v1-rewritten custom_base (never
-    # /anthropic/chat/completions). Empty means "use custom_base".
-    custom_base = custom_key = wrap_base = ""
-    if req.explicit_base_url:
-        custom_base = _to_openai_base_url(req.explicit_base_url).strip()
-        if req.api_mode == "anthropic_messages":
-            wrap_base = (req.explicit_base_url or "").strip().rstrip("/")
-        custom_key = (
-            (req.explicit_api_key or "").strip()
-            or _scoped_key_env("OPENAI_API_KEY")
-            or _read_main_api_key_if_same_host(custom_base)
-            or "no-key-required"  # local servers don't need auth
-        )
-        if not custom_base:
-            logger.warning("resolve_provider_client: explicit custom endpoint requested but base_url is empty")
-            return None, None
-    elif main_runtime:
-        # Reuse main_runtime's concrete base_url + api_key for a named custom provider;
-        # re-resolving from bare "custom" loses the name and lands on the wrong provider.
-        # Re-resolution loses the provider name and falls back to OpenRouter or a wrong API-key provider â€”
-        # the main agent already solved this, we just need to reuse its answer. (#45472)
-        _main_base = str(main_runtime.get("base_url") or "").strip().rstrip("/")
-        _main_key = str(main_runtime.get("api_key") or "").strip()
-        if _main_base and _main_key:
-            custom_base, custom_key = _main_base, _main_key
-    if custom_base and custom_key:
-        final_model = _normalize_resolved_model(
-            model or (main_runtime.get("model") if main_runtime else None) or "gpt-4o-mini", provider,
-        )
-        extra = {}
-        _clean_base, _dq = _extract_url_query_params(custom_base)
-        if _dq:
-            extra["default_query"] = _dq
-        _custom_headers = _endpoint_default_headers(custom_base, provider, is_vision=req.is_vision)
-        if _custom_headers:
-            extra["default_headers"] = _custom_headers
-        client = _create_openai_client(api_key=custom_key, base_url=_clean_base, **extra)
-        client = _wrap_transport(req, client, final_model, wrap_base or custom_base, custom_key)
-        return _route_client(req, client, final_model)
-    # Try custom first, then API-key providers (Codex excluded here:
-    # falling through to Codex with no model is a stale-constant trap).
-    for try_fn in (_try_custom_endpoint, _resolve_api_key_provider):
-        client, default = try_fn()
-        if client is not None:
-            final_model = _normalize_resolved_model(model or default, provider)
-            # ``client.api_key`` may be a callable (Azure Entra bearer provider);
-            # wrapping decisions only need base_url + api_mode.
-            _raw_ckey = getattr(client, "api_key", "")
-            _ckey = "" if (callable(_raw_ckey) and not isinstance(_raw_ckey, str)) else str(_raw_ckey or "")
-            client = _wrap_transport(req, client, final_model, str(getattr(client, "base_url", "") or ""), _ckey)
-            return _route_client(req, client, final_model)
-    logger.warning("resolve_provider_client: custom/main requested but no endpoint credentials found")
-    return None, None
-
-
-def _named_custom_openai_wire_client(custom_base: str, custom_key: Any):
-    """Plain OpenAI client on the /v1 equivalent of a named custom entry's base URL."""
-    _clean_base, _dq = _extract_url_query_params(_to_openai_base_url(custom_base))
-    _extra = {"default_query": _dq} if _dq else {}
-    _headers = _apply_user_default_headers(None)
-    if _headers:
-        _extra["default_headers"] = _headers
-    return _create_openai_client(api_key=custom_key, base_url=_clean_base, **_extra)
-
-
-def _resolve_named_custom_branch(req: _ResolveRequest) -> Optional[_ResolveResult]:
-    """Named custom provider (config.yaml providers dict / custom_providers list); None if no entry matches."""
-    from hermes_cli.runtime_provider import _get_named_custom_provider
-    provider = req.provider
-    # If the raw name is an alias (``kimi`` â†’ ``kimi-coding``) and a custom_providers entry exists
-    # under it, the custom entry wins over alias rewriting. Only for aliases, so entries matching a
-    # canonical name (e.g. ``nous``) still defer to the built-in.
-    custom_entry = None
-    if req.original_provider and req.original_provider != provider:
-        custom_entry = _get_named_custom_provider(req.original_provider)
-    if custom_entry is None:
-        custom_entry = _get_named_custom_provider(provider)
-    if not custom_entry:
-        return None
-    custom_base = (custom_entry.get("base_url") or "").strip()
-    custom_key = _named_custom_api_key(custom_entry, provider, custom_base)
-    if custom_key == "no-key-required":
-        logger.warning("resolve_provider_client: named custom provider %r has no resolvable "
-                       "api_key â€” request will be sent with placeholder no-key-required "
-                       "and will 401 on auth-required endpoints", custom_entry.get("name") or provider)
-    # Explicit per-task api_mode override wins over the provider entry's.
-    entry_api_mode = (req.api_mode or custom_entry.get("api_mode") or "").strip()
-    if not custom_base:
-        logger.warning("resolve_provider_client: named custom provider %r has no base_url", provider)
-        return None, None
-    final_model = _normalize_resolved_model(
-        req.model
-        or custom_entry.get("model")
-        or (req.main_runtime.get("model") if req.main_runtime else None)
-        or _read_main_model_for_aux()
-        or "gpt-4o-mini",
-        provider,
-    )
-    logger.debug("resolve_provider_client: named custom provider %r (%s, api_mode=%s)",
-                 provider, final_model, entry_api_mode or "chat_completions")
-    # anthropic_messages: route via AnthropicAuxiliaryClient (mirrors _try_custom_endpoint);
-    # the Anthropic SDK sees the original (un-rewritten) URL.
-    # Mirrors the anonymous-custom branch in _try_custom_endpoint(). See #15033.
-    if entry_api_mode == "anthropic_messages":
-        try:
-            from agent.anthropic_adapter import build_anthropic_client
-            real_client = build_anthropic_client(custom_key, custom_base)
-        except ImportError:
-            logger.warning("Named custom provider %r declares api_mode=anthropic_messages but the anthropic SDK "
-                           "is not installed â€” falling back to OpenAI-wire.", provider)
-            return _route_client(req, _named_custom_openai_wire_client(custom_base, custom_key), final_model)
-        return _route_client(
-            req, AnthropicAuxiliaryClient(real_client, final_model, custom_key, custom_base, is_oauth=False), final_model)
-    client = _named_custom_openai_wire_client(custom_base, custom_key)
-    # codex_responses, or auto-detect via _wrap_transport (which reads the task-level api_mode).
-    if entry_api_mode == "codex_responses":
-        client = CodexAuxiliaryClient(client, final_model)
-    else:
-        client = _wrap_transport(req, client, final_model, custom_base, custom_key)
-    return _route_client(req, client, final_model)
-
-
-def _resolve_azure_foundry_branch(req: _ResolveRequest) -> _ResolveResult:
-    """Azure Foundry via the runtime resolver: the generic PROVIDER_REGISTRY path only knows the static
-    AZURE_FOUNDRY_API_KEY env var, missing ``auth_mode: entra_id`` (callable bearer) and config base_url overrides."""
-    client, default_model = _try_azure_foundry(model=req.model, explicit_api_key=req.explicit_api_key,
-                                               explicit_base_url=req.explicit_base_url, api_mode=req.api_mode)
-    return _route_or_warn(req, client, default_model,
-                          "resolve_provider_client: azure-foundry requested but "
-                          "runtime resolution failed (run: hermes doctor for diagnostics)")
-
-
-def _resolve_api_key_branch(req: _ResolveRequest, pconfig: Any, resolve_creds: Callable) -> _ResolveResult:
-    """PROVIDER_REGISTRY ``api_key`` providers (Anthropic via its own resolver), honouring explicit overrides."""
-    provider = req.provider
-    if provider == "anthropic":
-        client, default_model = _try_anthropic(explicit_api_key=req.explicit_api_key)
-        return _route_or_warn(req, client, default_model,
-                              "resolve_provider_client: anthropic requested but no Anthropic credentials found")
-    creds = resolve_creds(provider)
-    api_key = str(creds.get("api_key", "")).strip()
-    # Explicit api_key override (fallback_model / custom_providers entry) lets callers
-    # authenticate where no built-in credential is registered for this alias.
-    if req.explicit_api_key:
-        api_key = req.explicit_api_key.strip() or api_key
-    raw_base_url = str(creds.get("base_url", "")).strip().rstrip("/") or pconfig.inference_base_url
-    if req.explicit_base_url:
-        raw_base_url = req.explicit_base_url.strip().rstrip("/")
-    # OpenCode Zen free tier (*-free slugs) is served anonymously on the Zen relay only;
-    # any bearer (even a Go subscription key) is rejected, so route keyless regardless of creds.
-    try:
-        from hermes_cli.models import opencode_zen_free_runtime as _oc_free_rt
-        _free_rt = _oc_free_rt(provider, req.model)
-    except Exception:
-        _free_rt = None
-    if _free_rt is not None:
-        api_key = _free_rt["api_key"]
-        raw_base_url = str(_free_rt["base_url"]).rstrip("/")
-    if provider == "actual":
-        with contextlib.suppress(Exception):
-            from hermes_cli.auth import (
-                ACTUAL_LOCAL_NOAUTH_PLACEHOLDER, is_actual_local_base_url, normalize_actual_base_url
-            )
-            raw_base_url = normalize_actual_base_url(raw_base_url)
-            if not api_key and is_actual_local_base_url(raw_base_url):
-                api_key = ACTUAL_LOCAL_NOAUTH_PLACEHOLDER
-    if not api_key:
-        tried_sources = list(pconfig.api_key_env_vars) + (["gh auth token"] if provider == "copilot" else [])
-        logger.debug("resolve_provider_client: provider %s has no API key configured (tried: %s)",
-                     provider, ", ".join(tried_sources))
-        return None, None
-    base_url = _to_openai_base_url(raw_base_url)
-    # Explicit base_url override: a fallback_model/custom_providers entry pointing a built-in name elsewhere.
-    if req.explicit_base_url:
-        base_url = _to_openai_base_url(req.explicit_base_url.strip().rstrip("/"))
-    final_model = _normalize_resolved_model(req.model or _get_aux_model_for_provider(provider), provider)
-    if provider == "gemini":
-        from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
-        if is_native_gemini_base_url(base_url):
-            client = GeminiNativeClient(api_key=api_key, base_url=base_url)
-            logger.debug("resolve_provider_client: %s (%s)", provider, final_model)
-            return _route_client(req, client, final_model)
-    headers = _endpoint_default_headers(base_url, provider, is_vision=req.is_vision, xai=True)
-    client = _create_openai_client(api_key=api_key, base_url=base_url, **({"default_headers": headers} if headers else {}))
-    # Copilot GPT-5+ models (except gpt-5-mini) are only reachable via the Responses API;
-    # wrap so call_llm() transparently routes through responses.stream().
-    if provider == "copilot" and final_model and not req.raw_codex:
-        with contextlib.suppress(ImportError):
-            from hermes_cli.models import _should_use_copilot_responses_api
-            if _should_use_copilot_responses_api(final_model):
-                logger.debug("resolve_provider_client: copilot model %s needs "
-                             "Responses API â€” wrapping with CodexAuxiliaryClient", final_model)
-                client = CodexAuxiliaryClient(client, final_model)
-    # api_mode handling for any API-key provider (direct OpenAI + codex model) and Anthropic-wire
-    # endpoints (api.kimi.com/coding, /anthropic gateways) without per-provider branches.
-    client = _wrap_transport(req, client, final_model, raw_base_url, api_key)
-    logger.debug("resolve_provider_client: %s (%s)", provider, final_model)
-    return _route_client(req, client, final_model)
-
-
-def _resolve_external_process_branch(req: _ResolveRequest, creds: Dict[str, Any]) -> _ResolveResult:
-    """PROVIDER_REGISTRY ``external_process`` providers, served via their registered profile."""
-    provider = req.provider
-    final_model = _normalize_resolved_model(
-        req.model or (req.main_runtime.get("model") if req.main_runtime else None) or _read_main_model_for_aux(),
-        provider,
-    )
-    # Keyed on the registered profile, not a provider name, so an out-of-tree ACP provider reaches
-    # the auxiliary path (compression, vision, background review) exactly like the in-tree one.
-    try:
-        from providers import get_provider_profile as _get_provider_profile
-        _extproc_profile = _get_provider_profile(provider)
-    except Exception:
-        _extproc_profile = None
-    if _extproc_profile is not None:
-        api_key = str(creds.get("api_key", "")).strip()
-        base_url = str(creds.get("base_url", "")).strip()
-        if not final_model:
-            logger.warning("resolve_provider_client: %s requested but no model was provided or configured", provider)
-            return None, None
-        if not api_key or not base_url:
-            logger.warning("resolve_provider_client: %s requested but external process credentials are incomplete", provider)
-            return None, None
-        try:
-            client = _extproc_profile.create_client(
-                api_key=api_key, base_url=base_url,
-                command=str(creds.get("command", "")).strip() or None, args=list(creds.get("args") or []))
-        except Exception:
-            logger.warning("resolve_provider_client: profile %r failed to create an external-process client",
-                           provider, exc_info=True)
-            client = None
-        if client is not None:
-            logger.debug("resolve_provider_client: %s (%s)", provider, final_model)
-            return _route_client(req, client, final_model)
-    _log_once_debug(_LOGGED_UNSUPPORTED_EXTPROC_KEYS, provider,
-                    "resolve_provider_client: external-process provider %s not "
-                    "directly supported", provider)
-    return None, None
-
-
-def _resolve_registry_branch(req: _ResolveRequest) -> _ResolveResult:
-    """PROVIDER_REGISTRY providers, dispatched on ``auth_type``; unknown providers log once."""
-    provider = req.provider
-    try:
-        from hermes_cli.auth import (
-            PROVIDER_REGISTRY, resolve_api_key_provider_credentials,
-            resolve_external_process_provider_credentials,
-        )
-    except ImportError:
-        logger.debug("hermes_cli.auth not available for provider %s", provider)
-        return None, None
-    pconfig = PROVIDER_REGISTRY.get(provider)
-    if pconfig is None:
-        _log_once_debug(_LOGGED_UNKNOWN_PROVIDER_KEYS, provider,
-                        "resolve_provider_client: unknown provider %r", provider)
-        return None, None
-    auth_type = pconfig.auth_type
-    if auth_type == "api_key":
-        return _resolve_api_key_branch(req, pconfig, resolve_api_key_provider_credentials)
-    if auth_type == "external_process":
-        return _resolve_external_process_branch(req, resolve_external_process_provider_credentials(provider))
-    if auth_type == "vertex":
-        client, final_model = _build_vertex_client(provider, req.model)
-    elif auth_type == "aws_sdk":
-        client, final_model = _build_bedrock_client(provider, req.model, raw_codex=req.raw_codex)
-    elif auth_type in {"oauth_device_code", "oauth_external"}:
-        # nous / openai-codex / xai-oauth already returned from their explicit branches.
-        _log_once_debug(_LOGGED_UNSUPPORTED_OAUTH_KEYS, provider,
-                        "resolve_provider_client: OAuth provider %s not "
-                        "directly supported, try 'auto'", provider)
-        return None, None
-    else:
-        # The first occurrence surfaces a real schema-drift bug; per-call retries stay silent.
-        _log_once_debug(_LOGGED_UNHANDLED_AUTHTYPE_KEYS, (auth_type, provider),
-                        "resolve_provider_client: unhandled auth_type %s for %s",
-                        auth_type, provider)
-        return None, None
-    return _route_client(req, client, final_model) if client is not None else (None, None)
-
-
-# Explicit providers with a dedicated branch; anything else falls through to named custom
-# providers â†’ azure-foundry â†’ PROVIDER_REGISTRY (order preserved from the original if-chain).
-_EXPLICIT_PROVIDER_BRANCHES: Dict[str, Callable[[_ResolveRequest], _ResolveResult]] = {
-    "auto": _resolve_auto_branch,
-    "openrouter": _resolve_openrouter_branch,
-    "nous": _resolve_nous_branch,
-    "openai-codex": _resolve_openai_codex_branch,
-    "xai-oauth": _resolve_xai_oauth_branch,
-    "custom": _resolve_custom_branch,
-}
-
-
-def resolve_provider_client(
-    provider: str, model: str = None, async_mode: bool = False, raw_codex: bool = False,
-    explicit_base_url: str = None, explicit_api_key: str = None, api_mode: str = None,
-    main_runtime: Optional[Dict[str, Any]] = None, is_vision: bool = False,
-    task: Optional[str] = None,
-) -> Tuple[Optional[Any], Optional[str]]:
-    """Central router: return a configured client (auth, base URL, API format) for a provider + optional model.
-    The client always exposes ``.chat.completions.create()``; Codex/Responses providers get an adapter.
-    ``provider``: built-in name, ``custom:<name>``, "custom" (OPENAI_BASE_URL + OPENAI_API_KEY) or "auto"
-    (full auto-detection chain). ``model=None`` â†’ provider's default aux model. ``raw_codex`` â†’ bare OpenAI
-    client for ``responses.stream()`` callers. ``api_mode`` forces "codex_responses"/"chat_completions"/
-    "anthropic_messages" instead of auto-detect. Returns (client, resolved_model) or (None, None)."""
-    _validate_proxy_env_urls()
-    # Keep the pre-alias name so a custom_providers entry named like a built-in alias
-    # (e.g. "kimi" â†’ "kimi-coding") is still reachable via the named-custom branch.
-    original_provider = (provider or "").strip().lower()
-    provider = _normalize_aux_provider(provider)
-    # MoA chokepoint: "moa" is not an HTTP provider; resolve to the aggregator so direct callers don't
-    # dead-end in unknown-provider. Unresolvable preset â†’ leave untouched for the normal diagnostic.
-    if provider == "moa":
-        _agg_provider, _agg_model = _resolve_moa_aggregator(model)
-        if _agg_provider and _agg_model:
-            original_provider = _agg_provider.strip().lower()
-            provider = _normalize_aux_provider(_agg_provider)
-            model = _agg_model
-            # The moa:// facade endpoint/key belong to the virtual runtime, not the aggregator.
-            if explicit_base_url and str(explicit_base_url).lower().startswith("moa://"):
-                explicit_base_url = None
-                explicit_api_key = None
-    # Model for concrete providers: caller ``model`` â†’ catalog default (empty for OAuth-gated providers whose
-    # lists drift) â†’ configured main model (MoA â†’ aggregator), keeping OAuth aux tasks off the Step-2 fallback.
-    # Excluded: ``auto`` (a stale main slug could pair with any picked provider) and Nous + vision (the
-    # Portal's tier-aware vision recommendation must win over a text-only model).
-    if not model and provider != "auto" and not (provider == "nous" and is_vision):
-        # ``auto`` is intentionally excluded: `_resolve_auto_route(main_runtime=...)` returns the model paired
-        # with the provider it actually selected. Pre-filling an auto call from `_read_main_model()` can
-        # leak a stale process-global runtime into a different provider (for example Claude model slug on
-        # Codex OAuth) and override that correctly resolved model. 1. ``model`` argument (caller knew what
-        # they wanted) 2. Provider's catalog default â€” cheap/fast model the provider registered via
-        # ``ProviderProfile.default_aux_model`` or the legacy ``_API_KEY_PROVIDER_AUX_MODELS_FALLBACK``
-        # dict. 3. User's main model from ``model.model`` in config.yaml. This is the load-bearing step for
-        # OAuth providers: an xai-oauth user with grok-4.3 configured gets grok-4.3 for title generation
-        # instead of silently dropping to whatever Step-2 fallback (#31845). When the main provider is MoA,
-        # ``_read_main_model_for_aux()`` substitutes the preset's aggregator model â€” the preset NAME is
-        # never a valid wire model id, so unset aux models default to the preset's acting model instead.
-        # Each provider branch below sees a non-empty ``model`` whenever the user has *anything* configured
-        # â€” no provider-specific empty-model guards needed. When the user has NOTHING configured (fresh
-        # install, main_model also empty), the branches still hit their own missing-credentials returns and
-        # ``_resolve_auto_route`` falls through to the Step-2 chain as before. Do NOT pre-fill a blank ``auto``
-        # request from the config/main default here. Claude model sent to Codex after the main lane fell
-        # back to gpt-5.5). Let _resolve_auto_route() return the actual current runtime model when the caller did
-        # not explicitly request one. (# compression-current-model) Nous + vision is the one carve-out: the
-        # branch below resolves its model from the Portal's tier-aware vision recommendation
-        # (``_try_nous(vision= True)``), and ``final_model = model or default`` means anything pre-filled
-        # here wins over that. The main chat model is routinely text-only (e.g. a ``:free`` chat SKU), so
-        # pre-filling it sends the image to a model that cannot accept one and the Portal 404s. Leave
-        # ``model`` unset and let the Portal slot through; only an explicit caller model may override it.
-        model = _get_aux_model_for_provider(provider) or _read_main_model_for_aux() or model
-    req = _ResolveRequest(
-        provider, original_provider, model, async_mode, raw_codex,
-        explicit_base_url, explicit_api_key, api_mode, main_runtime, is_vision, task,
-    )
-    branch = _EXPLICIT_PROVIDER_BRANCHES.get(provider)
-    if branch is not None:
-        return branch(req)
-    # Named custom providers; an ImportError anywhere in the arm falls through to the built-ins.
-    try:
-        result = _resolve_named_custom_branch(req)
-    except ImportError:
-        result = None
-    if result is not None:
-        return result
-    if provider == "azure-foundry":
-        return _resolve_azure_foundry_branch(req)
-    return _resolve_registry_branch(req)
-
-
-# â”€â”€ Public API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-def get_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Dict[str, Any]] = None) -> Tuple[Optional[OpenAI], Optional[str]]:
-    """Return (client, default_model_slug) for text-only aux tasks; ``task`` selects auxiliary.<task> overrides."""
-    provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task or None)
-    return resolve_provider_client(
-        provider, model=model, explicit_base_url=base_url, explicit_api_key=api_key,
-        api_mode=api_mode, main_runtime=main_runtime,
-    )
-
-
-_VISION_AUTO_PROVIDER_ORDER = ("openrouter", "nous", "deepinfra")
-
-
-def _main_model_supports_vision(provider: str, model: Optional[str]) -> bool:
-    """True when ``provider``/``model`` is known to accept image input; unknown capability â†’ True (attempt the call)."""
-    try:
-        from agent.image_routing import _lookup_supports_vision
-        from hermes_cli.config import load_config_readonly
-    except ImportError:
-        return True
-    try:
-        supports = _lookup_supports_vision(provider, model, load_config_readonly())
-    except Exception:  # pragma: no cover - defensive
-        return True
-    return True if supports is None else bool(supports)
-
-
-def _normalize_vision_provider(provider: Optional[str]) -> str:
-    return _normalize_aux_provider(provider)
-
-
-def _deepinfra_strict_vision_backend(model: Optional[str]) -> Tuple[Optional[Any], Optional[str]]:
-    """DeepInfra vision: default model is discovered live via default_vision_model() so no hardcoded id can rot."""
-    vision_model = model or _resolve_provider_vision_default("deepinfra")
-    if not vision_model:
-        logger.debug("Vision auto-detect: deepinfra catalog unreachable or returned no vision-tagged models â€” skipping")
-        return None, None
-    return resolve_provider_client("deepinfra", vision_model, is_vision=True)
-
-
-# Strict (explicitly requested) vision backends by normalized provider name. nous MUST go
-# through resolve_provider_client so anthropic/* picks wrap onto /v1/messages (a bare _try_nous
-# client 404s). openai-codex has no safe default model; callers set auxiliary.<task>.model.
-_STRICT_VISION_BACKENDS: Dict[str, Callable[[Optional[str]], Tuple[Optional[Any], Optional[str]]]] = {
-    "copilot": lambda model: resolve_provider_client("copilot", model, is_vision=True),
-    "openrouter": lambda model: _try_openrouter(model=model),
-    "nous": lambda model: resolve_provider_client("nous", model, is_vision=True),
-    "openai-codex": lambda model: resolve_provider_client("openai-codex", model, is_vision=True),
-    "anthropic": lambda model: _try_anthropic(),
-    "deepinfra": _deepinfra_strict_vision_backend,
-    "custom": lambda model: _try_custom_endpoint(),
-}
-
-
-def _resolve_strict_vision_backend(provider: str, model: Optional[str] = None) -> Tuple[Optional[Any], Optional[str]]:
-    backend = _STRICT_VISION_BACKENDS.get(_normalize_vision_provider(provider))
-    return backend(model) if backend is not None else (None, None)
-
-
-def get_available_vision_backends() -> List[str]:
-    """Available vision backends in auto-selection order (active provider â†’ OpenRouter â†’ Nous â†’ DeepInfra).
-
-    Single source of truth for setup, tool gating, and runtime auto-routing.
-    """
-    available: List[str] = []
-    main_provider = _read_main_provider()
-    if main_provider and main_provider not in {"auto", ""}:
-        if main_provider in _VISION_AUTO_PROVIDER_ORDER:
-            main_ok = _resolve_strict_vision_backend(main_provider)[0] is not None
-        else:
-            main_ok = resolve_provider_client(main_provider, _read_main_model())[0] is not None
-        if main_ok:
-            available.append(main_provider)
-    for p in _VISION_AUTO_PROVIDER_ORDER:  # skip if already covered by main provider
-        if p not in available and _resolve_strict_vision_backend(p)[0] is not None:
-            available.append(p)
-    return available
-
-
-def _finalize_vision_client(
-    resolved_provider: str, sync_client: Any, default_model: Optional[str],
-    resolved_model: Optional[str], async_mode: bool,
-) -> Tuple[Optional[str], Optional[Any], Optional[str]]:
-    """Apply the explicit model override (and async wrapping) to a resolved vision client."""
-    if sync_client is None:
-        return resolved_provider, None, None
-    final_model = resolved_model or default_model
-    if async_mode:
-        async_client, async_model = _to_async_client(sync_client, final_model, is_vision=True)
-        return resolved_provider, async_client, async_model
-    return resolved_provider, sync_client, final_model
-
-
-def _vision_main_provider_client(
-    main_provider: str, main_model: str, runtime: Dict[str, Any], resolved_model: Optional[str],
-    resolved_api_mode: Optional[str],
-) -> Tuple[Optional[Any], Optional[str]]:
-    """Auto-detect step 1: try the main provider; (None, None) falls through to the aggregator chain."""
-    # A provider vision default (static override or catalog discovery) is a *known* multimodal
-    # model; the pinned chat model usually isn't, so only fall back to it when no default exists.
-    provider_vision_default = _resolve_provider_vision_default(main_provider)
-    vision_model = provider_vision_default or main_model
-    if main_provider == "nous":
-        # Nous picks its vision model from Portal tier-aware slots inside _try_nous(vision=True);
-        # passing the chat model would override that and 404. Only auxiliary.vision.model may.
-        sync_client, default_model = _resolve_strict_vision_backend(main_provider, resolved_model or provider_vision_default)
-        if sync_client is None:
-            return None, None
-        logger.info("Vision auto-detect: using main provider %s (%s)", main_provider, default_model or resolved_model or main_model)
-        return sync_client, default_model
-    if main_provider in _PROVIDERS_WITHOUT_VISION:  # endpoint rejects image input entirely
-        logger.debug("Vision auto-detect: skipping main provider %s (no vision support) â€” falling through to aggregator chain", main_provider)
-        return None, None
-    if not _main_model_supports_vision(main_provider, vision_model):
-        # Known text-only model. Log only the provider name (CodeQL clear-text-logging FPs).
-        logger.debug(
-            "Vision auto-detect: skipping main provider %s (reports no vision capability) â€” falling through to aggregator chain",
-            main_provider,
-        )
-        return None, None
-    # Custom endpoints carry no built-in base_url/api_key: recover the live main endpoint from
-    # set_runtime_main() or, with no live runtime recorded, the configured custom endpoint.
-    rpc_base_url = rpc_api_key = None
-    rpc_api_mode = resolved_api_mode
-    if main_provider == "custom" or main_provider.startswith("custom:"):
-        if runtime.get("base_url"):
-            custom_base, custom_key, custom_mode = runtime.get("base_url"), runtime.get("api_key") or None, runtime.get("api_mode")
-        else:
-            custom_base, custom_key, custom_mode = _resolve_custom_runtime()
-        if custom_base:
-            rpc_base_url, rpc_api_key = custom_base, custom_key
-            rpc_api_mode = resolved_api_mode or custom_mode or None
-    rpc_client, rpc_model = resolve_provider_client(
-        main_provider, vision_model, api_mode=rpc_api_mode, explicit_base_url=rpc_base_url,
-        explicit_api_key=rpc_api_key, main_runtime=runtime, is_vision=True)
-    if rpc_client is None:
-        return None, None
-    logger.info("Vision auto-detect: using main provider %s (%s)", main_provider, rpc_model or vision_model)
-    return rpc_client, rpc_model or vision_model
-
-
-def _vision_auto_route(
-    runtime: Dict[str, Any], resolved_model: Optional[str], resolved_api_mode: Optional[str],
-    async_mode: bool,
-) -> Tuple[Optional[str], Optional[Any], Optional[str]]:
-    """Auto-detect order: 1. main provider + model, 2. OpenRouter, 3. Nous Portal, 4. DeepInfra, 5. stop."""
-    main_provider = str(runtime.get("provider") or _read_main_provider())
-    main_model = str(runtime.get("model") or _read_main_model())
-    if main_provider.strip().lower() == "moa":
-        # MoA main_model is a preset NAME, not a wire model â€” unwrap to the preset's aggregator
-        # slot. The moa:// facade endpoint belongs to the virtual provider, not the real one.
-        _agg_provider, _agg_model = _resolve_moa_aggregator(main_model)
-        if _agg_provider and _agg_model:
-            main_provider, main_model = _agg_provider, _agg_model
-            runtime = dict(runtime, base_url="", api_key="", api_mode="")
-    if main_provider and main_provider not in {"auto", "", "moa"}:
-        client, default_model = _vision_main_provider_client(main_provider, main_model, runtime, resolved_model, resolved_api_mode)
-        if client is not None:
-            return _finalize_vision_client(main_provider, client, default_model, resolved_model, async_mode)
-    # Aggregators use their dedicated vision model, not the user's main model.
-    for candidate in _VISION_AUTO_PROVIDER_ORDER:
-        if candidate == main_provider:
-            continue  # already tried above
-        sync_client, default_model = _resolve_strict_vision_backend(candidate)
-        if sync_client is not None:
-            return _finalize_vision_client(candidate, sync_client, default_model, resolved_model, async_mode)
-    logger.debug("Auxiliary vision client: none available")
-    return None, None, None
-
-
-# ZAI vision must use the OpenAI-compatible endpoint: the Anthropic wire rejects max_tokens on
-# multimodal calls (error 1210).
-_ZAI_OPENAI_VISION_URLS = ("https://open.bigmodel.cn/api/paas/v4", "https://api.z.ai/api/paas/v4")
-
-
-def resolve_vision_provider_client(
-    provider: Optional[str] = None, model: Optional[str] = None, *, base_url: Optional[str] = None,
-    api_key: Optional[str] = None, async_mode: bool = False,
-    main_runtime: Optional[Dict[str, Any]] = None,
-) -> Tuple[Optional[str], Optional[Any], Optional[str]]:
-    """Resolve the client actually used for vision tasks.
-
-    Direct endpoint overrides beat provider selection; explicit providers may force
-    experimental backends; auto mode only tries backends known to work.
-    """
-    runtime = _normalize_main_runtime(main_runtime)
-    requested, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
-        "vision", provider, model, base_url, api_key
-    )
-    requested = _normalize_vision_provider(requested)
-    if resolved_base_url:
-        provider_for_base_override = requested if requested and requested not in {"", "auto"} else "custom"
-        client, final_model = resolve_provider_client(
-            provider_for_base_override, model=resolved_model, async_mode=async_mode,
-            explicit_base_url=resolved_base_url, explicit_api_key=resolved_api_key,
-            api_mode=resolved_api_mode, main_runtime=runtime,
-        )
-        return provider_for_base_override, client, (final_model if client is not None else None)
-    if requested == "auto":
-        return _vision_auto_route(runtime, resolved_model, resolved_api_mode, async_mode)
-    if requested in _VISION_AUTO_PROVIDER_ORDER:
-        sync_client, default_model = _resolve_strict_vision_backend(requested, resolved_model)
-        return _finalize_vision_client(requested, sync_client, default_model, resolved_model, async_mode)
-    if requested == "zai":
-        for _zai_url in _ZAI_OPENAI_VISION_URLS:
-            client, final_model = _get_cached_client(
-                requested, resolved_model, async_mode, base_url=_zai_url,
-                api_key=resolved_api_key or None, api_mode="chat_completions", main_runtime=runtime,
-                is_vision=True,
-            )
-            if client is not None:
-                return _finalize_vision_client(requested, client, final_model, resolved_model, async_mode)
-        # Fallback: try without explicit base_url (old behavior)
-    client, final_model = _get_cached_client(
-        requested, resolved_model, async_mode, api_mode=resolved_api_mode, main_runtime=runtime, is_vision=True,
-    )
-    return requested, client, (final_model if client is not None else None)
-
-
-def get_auxiliary_extra_body() -> dict:
-    """Return extra_body kwargs (Nous Portal product tags when Nous-backed, else {})."""
-    return _nous_extra_body() if auxiliary_is_nous else {}
-
-
-def auxiliary_max_tokens_param(value: int, *, model: Optional[str] = None) -> dict:
-    """Max-tokens kwarg for the auxiliary provider: direct OpenAI/Copilot and newer OpenAI-family
-    models (by ``model`` name, so custom endpoints fronting gpt-5.x are caught) need max_completion_tokens."""
-    _custom_host = base_url_hostname(_current_custom_base_url()) or ""
-    direct_openai_family = (
-        not _scoped_key_env("OPENROUTER_API_KEY") and _read_nous_auth() is None
-        and (_custom_host in ("api.openai.com", "api.githubcopilot.com") or _custom_host.endswith(".githubcopilot.com"))
-    )
-    if direct_openai_family or model_forces_max_completion_tokens(model):
-        return {"max_completion_tokens": value}
-    return {"max_tokens": value}
-
-
-# â”€â”€ Centralized LLM Call API: call_llm()/async_call_llm() own resolve â†’ cached client â†’ shape
-# request â†’ call â†’ return. Every auxiliary LLM consumer should use these.
-
-# Client cache: (provider, async_mode, base_url, api_key, api_mode, runtime_key) -> (client, default_model, loop)
-# Loop identity is NOT part of the key: stale-loop entries are replaced in place on async hits,
-# bounding growth to one entry per provider config (avoids fd accumulation in gateways).
-# This bounds cache growth to one entry per unique provider config rather than one per (config Ã—
-# event-loop), which previously caused unbounded fd accumulation in long-running gateway processes (#10200).
-_client_cache: Dict[tuple, tuple] = {}
-_client_cache_lock = threading.Lock()
-_CLIENT_CACHE_MAX_SIZE = 64  # safety belt â€” evict oldest when exceeded
-
-
-class _CallableCacheDiscriminator:
-    """Hash a credential callback by identity without exposing its state."""
-
-    __slots__ = ("_callback",)
-
-    def __init__(self, callback: Any) -> None:
-        self._callback = callback  # retained so its id cannot be reused while cached
-
-    def __hash__(self) -> int:
-        return id(self._callback)
-
-    def __eq__(self, other: object) -> bool:
-        return isinstance(other, _CallableCacheDiscriminator) and self._callback is other._callback
-
-    def __repr__(self) -> str:
-        return "<callable-api-key>"
-
-
-def _runtime_cache_discriminator(field: str, value: Any) -> Any:
-    """Return a hashable, secret-safe runtime cache-key component."""
-    if field == "api_key" and callable(value):
-        return _CallableCacheDiscriminator(value)
-    if field == "api_key" and isinstance(value, str) and value:
-        return ("api-key-digest", hashlib.blake2b(value.encode("utf-8"), digest_size=16).digest())
-    return value
-
-
-def _client_cache_key(
-    provider: str, *, async_mode: bool, base_url: Optional[str] = None,
-    api_key: Optional[str] = None, api_mode: Optional[str] = None,
-    main_runtime: Optional[Dict[str, Any]] = None, is_vision: bool = False,
-    task: Optional[str] = None, model: Optional[str] = None,
-) -> tuple:
-    runtime = _normalize_main_runtime(main_runtime)
-    # `auto` resolves through the main runtime and task-specific policy, so both join the key.
-    runtime_key = tuple(_runtime_cache_discriminator(f, runtime.get(f, "")) for f in _MAIN_RUNTIME_FIELDS) if provider == "auto" else ()
-    task_key = (task or "", _task_prefers_fast_model(task)) if provider == "auto" else ""
-    pool_hint = _pool_cache_hint(provider, main_runtime=main_runtime)
-    # Model MUST be in the key: concurrent calls to the same endpoint with different models would
-    # share an entry, and the second builder's _store_cached_client would close the first's client.
-    model_key = model or runtime.get("model", "")
-    api_key_key = _runtime_cache_discriminator("api_key", api_key or "")
-    return (provider, async_mode, base_url or "", api_key_key, api_mode or "", runtime_key, is_vision, task_key, pool_hint, model_key)
-
-
-def _current_event_loop() -> Any:
-    """``asyncio.get_event_loop()`` or None when no loop can be obtained (async cache-key binding)."""
-    try:
-        import asyncio as _aio
-        return _aio.get_event_loop()
-    except RuntimeError:
-        return None
-
-
-def _store_cached_client(cache_key: tuple, client: Any, default_model: Optional[str], *, bound_loop: Any = None) -> None:
-    if isinstance(client, _AuxProbeClientStub):
-        return  # probe stubs must never be cached â€” the next hit would get a dud client
-    with _client_cache_lock:
-        old_entry = _client_cache.get(cache_key)
-        if old_entry is not None and old_entry[0] is not client:
-            _close_cached_client(old_entry[0])
-        _client_cache[cache_key] = (client, default_model, bound_loop)
-
-
-def _refresh_nous_auxiliary_client(
-    *, cache_provider: str, model: Optional[str], async_mode: bool, base_url: Optional[str] = None,
-    api_key: Optional[str] = None, api_mode: Optional[str] = None,
-    main_runtime: Optional[Dict[str, Any]] = None, is_vision: bool = False,
-    lookup_model: Optional[str] = None, lookup_task: Optional[str] = None,
-) -> Tuple[Optional[Any], Optional[str]]:
-    """Refresh Nous runtime creds, rebuild the client, and replace the cache entry.
-
-    ``model`` is the resolved wire model stored as the entry's usable model and returned. The
-    cache KEY MUST be built from ``lookup_model``/``lookup_task`` â€” the model and task as passed
-    to ``_get_cached_client`` when the stale client was acquired â€” so the fresh client overwrites
-    the exact entry the stale one is served from. Keying on the resolved model or an empty task
-    would leave the expired client immortal and every auxiliary call 401ing forever.
-
-    See #56889.
-    For ``provider == "auto"`` the task participates in the cache key (task-specific fallback policy), so it
-    MUST be carried into the key here for the same reason as ``lookup_model``; otherwise an auto-provider
-    client refreshed on a 401 lands under the ``task=""`` key while the stale entry survives under the
-    task-scoped key (#58894).
-    """
-    runtime = _resolve_nous_runtime_api(force_refresh=True, stale_access_token=api_key)
-    if runtime is None:
-        return None, model
-    fresh_key, fresh_base_url = runtime
-    sync_client = _create_openai_client(api_key=fresh_key, base_url=fresh_base_url)
-    current_loop = _current_event_loop() if async_mode else None
-    if async_mode:
-        client, final_model = _to_async_client(sync_client, model or "", is_vision=is_vision)
-    else:
-        client, final_model = sync_client, model
-    cache_key = _client_cache_key(
-        cache_provider, async_mode=async_mode, base_url=base_url, api_key=api_key,
-        api_mode=api_mode, main_runtime=main_runtime, is_vision=is_vision, task=lookup_task,
-        model=lookup_model,
-    )
-    _store_cached_client(cache_key, client, final_model, bound_loop=current_loop)
-    return client, final_model
-
-
-def neuter_async_httpx_del() -> None:
-    """Monkey-patch ``AsyncHttpxClientWrapper.__del__`` to be a no-op.
-
-    The SDK's ``__del__`` schedules ``aclose()`` on the *running* loop, but the transport is
-    bound to the loop the client was created on; when that loop is dead this raises "Event loop
-    is closed" into prompt_toolkit's loop. Safe because cached clients are closed explicitly and
-    the OS reaps the rest. Call once at CLI startup, before any ``AsyncOpenAI`` is created.
-    """
-    try:
-        from openai._base_client import AsyncHttpxClientWrapper
-        AsyncHttpxClientWrapper.__del__ = lambda self: None  # type: ignore[assignment]
-    except (ImportError, AttributeError):
-        pass  # Graceful degradation if the SDK changes its internals
-
-
-def _force_close_async_httpx(client: Any) -> None:
-    """Mark the httpx AsyncClient inside an AsyncOpenAI client as closed so ``__del__`` won't
-    schedule ``aclose()`` on a dead loop. Skips the full async close â€” the OS drops connections."""
-    with contextlib.suppress(Exception):
-        from httpx._client import ClientState
-        inner = getattr(client, "_client", None)
-        if inner is not None and not getattr(inner, "is_closed", True):
-            inner._state = ClientState.CLOSED
-
-
-def _schedule_async_close(close_result: Any, client: Any) -> None:
-    """Finish an async close without leaking an unawaited coroutine."""
-    async def _await_close() -> None:
-        try:
-            await close_result
-        except Exception:
-            pass
-        finally:
-            _force_close_async_httpx(client)
-    runner = _await_close()
-    try:
-        import asyncio as _aio
-        try:
-            loop = _aio.get_running_loop()
-        except RuntimeError:
-            _aio.run(runner)
-        else:
-            task = loop.create_task(runner)
-
-            def _consume(completed_task) -> None:
-                with contextlib.suppress(BaseException):
-                    completed_task.exception()
-            task.add_done_callback(_consume)
-            runner = None
-    except Exception:
-        if runner is not None:
-            with contextlib.suppress(Exception):
-                runner.close()
-        _force_close_async_httpx(client)
-
-
-def _close_cached_client(client: Any, *, close_async: bool = False) -> None:
-    """Close one cached client, awaiting async transports only when safe."""
-    if client is None:
-        return
-    close_fn = getattr(client, "close", None)
-    if not callable(close_fn):
-        _force_close_async_httpx(client)
-        return
-    try:
-        close_result = close_fn()
-    except Exception:
-        _force_close_async_httpx(client)
-        return
-    if inspect.isawaitable(close_result):
-        if close_async:
-            _schedule_async_close(close_result, client)
-        else:
-            # Never await a client owned by another live loop; close the coroutine (no
-            # unawaited warning) and neuter the transport.
-            with contextlib.suppress(Exception):
-                close_result.close()
-            _force_close_async_httpx(client)
-        return
-    _force_close_async_httpx(client)
-
-
-def shutdown_cached_clients() -> None:
-    """Close all cached clients; call at CLI shutdown *before* the loop closes.
-
-    Snapshot+clear under the lock, close outside it: async teardown can block while an owner
-    loop drains, and holding the lock would convoy every caller.
-    """
-    with _client_cache_lock:
-        clients = [(entry[0], entry[2]) for entry in _client_cache.values() if entry[0] is not None]
-        _client_cache.clear()
-    try:
-        import asyncio as _aio
-        running_loop = _aio.get_running_loop()
-    except RuntimeError:
-        running_loop = None
-    for client, owner_loop in clients:
-        # A live foreign loop owns its transport â€” neuter only and let it finish teardown.
-        # Closed loops and the current loop are safe to drain here.
-        close_async = owner_loop is not None and (owner_loop.is_closed() or owner_loop is running_loop)
-        _close_cached_client(client, close_async=close_async)
-
-
-def cleanup_stale_async_clients() -> None:
-    """Force-close cached async clients whose loop is closed; call after each agent turn
-    (defense-in-depth behind ``neuter_async_httpx_del``)."""
-    with _client_cache_lock:
-        stale = [(key, entry[0]) for key, entry in _client_cache.items() if entry[2] is not None and entry[2].is_closed()]
-        for key, _client in stale:
-            del _client_cache[key]
-    for _key, client in stale:
-        _close_cached_client(client, close_async=True)
-
-
-def _compat_model(client: Any, model: Optional[str], cached_default: Optional[str]) -> Optional[str]:
-    """Keep slash-bearing model IDs only for cached clients that accept ``vendor/model`` (OpenRouter
-    or a slash-bearing default). Mirrors the resolve_provider_client() guard, which cache hits skip."""
-    if model and "/" in model:
-        accepts_slash = any(
-            obj and base_url_host_matches(str(getattr(obj, "base_url", "") or ""), "openrouter.ai")
-            for obj in (client, getattr(client, "_client", None), getattr(client, "client", None))
-        ) or bool(cached_default and "/" in cached_default)
-        if not accepts_slash:
-            return cached_default
-    return model or cached_default
-
-
-def _get_cached_client(
-    provider: str, model: str = None, async_mode: bool = False, base_url: str = None,
-    api_key: str = None, api_mode: str = None, main_runtime: Optional[Dict[str, Any]] = None,
-    is_vision: bool = False, task: Optional[str] = None,
-) -> Tuple[Optional[Any], Optional[str]]:
-    """Get or create a cached client for the given provider.
-
-    Async clients bind to the loop they were created on, so every async hit validates the cached
-    loop is the current, open loop; stale entries are replaced in place (bounded, no cross-loop reuse).
-
-    This keeps cache size bounded to one entry per unique provider config, preventing the fd-exhaustion that
-    previously occurred in long-running gateways where recycled worker threads created unbounded entries
-    (#10200).
-    """
-    current_loop = _current_event_loop() if async_mode else None
-    runtime = _normalize_main_runtime(main_runtime)
-    cache_key = _client_cache_key(
-        provider, async_mode=async_mode, base_url=base_url, api_key=api_key, api_mode=api_mode,
-        main_runtime=main_runtime, is_vision=is_vision, task=task, model=model,
-    )
-    with _client_cache_lock:
-        if cache_key in _client_cache:
-            cached_client, cached_default, cached_loop = _client_cache[cache_key]
-            loop_ok = not async_mode or (
-                cached_loop is not None and cached_loop is current_loop and not cached_loop.is_closed()
-            )
-            if loop_ok:
-                return cached_client, _compat_model(cached_client, model, cached_default)
-            # Stale async entry â€” evict. Only a closed owner loop may be awaited here; a live
-            # foreign loop stays force-neutered.
-            _close_cached_client(cached_client, close_async=cached_loop is not None and cached_loop.is_closed())
-            del _client_cache[cache_key]
-    # Build outside the lock. For pool-backed providers derive the key from the pool entry:
-    # resolve_api_key_provider_credentials prefers env vars, which would bypass pool rotation
-    # and retry an exhausted key.
-    effective_api_key = api_key
-    if not effective_api_key:
-        _pe = _peek_pool_entry(_normalize_aux_provider(provider))
-        if _pe is not None:
-            effective_api_key = _pool_runtime_api_key(_pe) or api_key
-    client, default_model = resolve_provider_client(
-        provider, model, async_mode, explicit_base_url=base_url, explicit_api_key=effective_api_key,
-        api_mode=api_mode, main_runtime=runtime, is_vision=is_vision, task=task,
-    )
-    if client is not None:
-        with _client_cache_lock:
-            if cache_key not in _client_cache:
-                # FIFO safety-belt eviction. Do NOT close evicted clients: another caller may be
-                # mid-request on one; refcount/GC handles it.
-                while len(_client_cache) >= _CLIENT_CACHE_MAX_SIZE:
-                    del _client_cache[next(iter(_client_cache))]
-                _client_cache[cache_key] = (client, default_model, current_loop)
-            else:
-                built_client = client
-                client, default_model, _ = _client_cache[cache_key]
-                # Race loser was never exposed to a caller â€” safe to close now.
-                _close_cached_client(built_client, close_async=async_mode)
-    return client, model or default_model
-
-
-# Aliases for direct REST APIs not modeled in PROVIDER_REGISTRY, so ``auxiliary.<task>.provider:
-# openai`` resolves to a working ``custom`` endpoint (OPENAI_API_KEY + api.openai.com) instead of
-# silently falling back to the main provider and sending OpenAI model names elsewhere.
-_AUX_DIRECT_API_BASE_URLS: Dict[str, str] = {"openai": "https://api.openai.com/v1"}
-
-
-# MoA virtual provider: an *explicit* `provider: moa` override (either the caller-passed `provider` arg or
-# `auxiliary.<task>.provider` in config.yaml) reaches this function directly â€” it never goes through
-# _resolve_auto_route(), which only unwraps the *implicit* "main provider is moa" case (#53827). Left as-is, "moa"
-# is returned verbatim and resolve_provider_client() looks it up in PROVIDER_REGISTRY (which has no "moa"
-# entry â€” it's not a real HTTP provider), falls to the unknown-provider dead end, and call_llm surfaces a
-# nonsensical "MOA_API_KEY environment variable" error for a provider that was never meant to be reached
-# over the wire. Auxiliary tasks don't need the reference fan-out â€” resolve to the preset's aggregator slot
-# instead, exactly like the implicit path does (shared helper: _resolve_moa_aggregator).
-def _unwrap_moa_provider(prov: str, mdl: Optional[str]) -> Tuple[str, Optional[str]]:
-    """Resolve an *explicit* ``provider: moa`` to its preset's aggregator slot (_resolve_auto_route()
-    only unwraps the implicit case; "moa" isn't in PROVIDER_REGISTRY and would dead-end)."""
-    if prov.strip().lower() != "moa":
-        return prov, mdl
-    agg_provider, agg_model = _resolve_moa_aggregator(mdl)
-    if agg_provider and agg_model:
-        return agg_provider, agg_model
-    return prov, mdl
-
-
-def _expand_direct_api_alias(prov: Optional[str], existing_base: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
-    """``provider: openai`` â†’ custom + api.openai.com/v1; a user base_url is kept but the provider still becomes custom."""
-    if not prov:
-        return prov, existing_base
-    target_base = _AUX_DIRECT_API_BASE_URLS.get(prov.strip().lower())
-    if target_base is None:
-        return prov, existing_base
-    return "custom", existing_base or target_base
-
-
-def _preserve_provider_with_base_url(prov: Optional[str]) -> bool:
-    """True when a first-class provider keeps its identity alongside an explicit base_url."""
-    normalized = str(prov or "").strip().lower()
-    if normalized in {"", "auto", "custom"} or normalized.startswith("custom:"):
-        return False
-    try:
-        from hermes_cli.providers import get_provider
-        return get_provider(normalized) is not None
-    except Exception:  # keep provider-backed routes safe when the catalog can't load
-        return normalized in {
-            "anthropic", "copilot", "copilot-acp", "minimax-oauth", "nous", "openai-codex", "qwen-oauth", "xai-oauth",
-        }
-
-
-def _resolve_task_provider_model(
-    task: str = None, provider: str = None, model: str = None, base_url: Optional[str] = None,
-    api_key: Optional[str] = None,
-) -> Tuple[str, Optional[str], Optional[str], Optional[str], Optional[str]]:
-    """Determine (provider, model, base_url, api_key, api_mode) for a call.
-
-    Priority: explicit args > config auxiliary.{task}.* > "auto". A bare base_url means custom,
-    but a first-class provider + base_url keeps the provider identity so its auth/transport
-    shaping still applies. api_mode is "chat_completions", "codex_responses", or None (auto).
-    """
-    cfg_provider = cfg_model = cfg_base_url = cfg_api_key = resolved_api_mode = None
-    if task:
-        task_config = _get_auxiliary_task_config(task)
-        cfg_provider = str(task_config.get("provider", "")).strip() or None
-        cfg_model = str(task_config.get("model", "")).strip() or None
-        cfg_base_url = str(task_config.get("base_url", "")).strip() or None
-        cfg_api_key = str(task_config.get("api_key", "")).strip() or None
-        if not cfg_api_key:  # key_env â†’ env var when api_key is not set directly
-            cfg_key_env = str(task_config.get("key_env") or task_config.get("api_key_env") or "").strip()
-            if cfg_key_env:
-                cfg_api_key = _scoped_key_env(cfg_key_env) or None
-        resolved_api_mode = str(task_config.get("api_mode", "")).strip() or None
-    # 'auto' is a sentinel ("inherit / auto-detect"), not a model id â€” leaking it to the wire
-    # yields a 200 with an error-text body that consumers accept as output. The explicit `model`
-    # kwarg needs the same normalization: MoA slots forward preset `model:` fields through it.
-    if model and model.lower() == "auto":
-        model = None
-    if cfg_model and cfg_model.lower() == "auto":
-        cfg_model = None
-    resolved_model = model or cfg_model
-    # Any moa:// facade endpoint belongs to the facade, not the aggregator's real provider â€”
-    # drop it (mirrors _resolve_auto_route()).
-    if provider and str(provider).strip().lower() == "moa":
-        provider, resolved_model = _unwrap_moa_provider(provider, resolved_model)
-        if provider and provider.lower() != "moa":
-            base_url = None
-            api_key = None
-    elif cfg_provider and str(cfg_provider).strip().lower() == "moa":
-        cfg_provider, cfg_model = _unwrap_moa_provider(cfg_provider, resolved_model)
-        if cfg_provider and cfg_provider.lower() != "moa":
-            resolved_model = cfg_model
-            cfg_base_url = None
-            cfg_api_key = None
-    if provider:
-        provider, base_url = _expand_direct_api_alias(provider, base_url)
-    if cfg_provider:
-        cfg_provider, cfg_base_url = _expand_direct_api_alias(cfg_provider, cfg_base_url)
-    # An explicit provider without base_url adopts the task's configured endpoint (same or
-    # unnamed provider) so the early return below carries it. Explicit "auto" is excluded â€” it
-    # must keep flowing through auto-resolution.
-    # See #58515.
-    if provider and provider != "auto" and not base_url and cfg_base_url and cfg_provider in (None, provider):
-        base_url = cfg_base_url
-        if not api_key:
-            api_key = cfg_api_key
-    if base_url:
-        kept = provider if _preserve_provider_with_base_url(provider) else "custom"
-        return kept, resolved_model, base_url, api_key, resolved_api_mode
-    if provider:
-        return provider, resolved_model, base_url, api_key, resolved_api_mode
-    if cfg_base_url and cfg_api_key:
-        return "custom", resolved_model, cfg_base_url, cfg_api_key, resolved_api_mode
-    if cfg_base_url and cfg_provider and cfg_provider != "auto":
-        # base_url without api_key: keep the provider so it can resolve credentials from env
-        # vars instead of locking into "custom".
-        return cfg_provider, resolved_model, cfg_base_url, None, resolved_api_mode
-    if cfg_provider and cfg_provider != "auto":
-        return cfg_provider, resolved_model, cfg_base_url, cfg_api_key, resolved_api_mode
-    return "auto", resolved_model, None, None, resolved_api_mode
-
-
-_DEFAULT_AUX_TIMEOUT = 30.0
-
-# Reasoning compression models can exceed the default 120 s config timeout, falling back to the
-# deterministic marker. Bounded *floor* for config-derived compression timeouts only; never
-# overrides an explicit per-call timeout.
-# Compression summarises large conversation histories; a reasoning auxiliary model (e.g. Codex / GPT-5.5)
-# can legitimately take longer than the default ``auxiliary.compression.timeout`` (120 s), causing the
-# stream to time out and the compressor to fall back to the deterministic context marker (#54915). A floor
-# is harmless for fast compression models (they finish before the deadline) and is a minimum, so a higher
-# config value is kept unchanged.
-_COMPRESSION_TIMEOUT_FLOOR_SECONDS = 300.0
-
-
-def _get_auxiliary_task_config(task: str) -> Dict[str, Any]:
-    """Config dict for auxiliary.<task>, or {} when unavailable. Plugin-registered tasks get their
-    declared defaults layered under user config (user wins); built-in defaults live in DEFAULT_CONFIG."""
-    if not task:
-        return {}
-    try:
-        from hermes_cli.config import load_config_readonly
-        config = load_config_readonly()
-    except ImportError:
-        return {}
-    aux = config.get("auxiliary", {}) if isinstance(config, dict) else {}
-    task_config = aux.get(task, {}) if isinstance(aux, dict) else {}
-    if not isinstance(task_config, dict):
-        task_config = {}
-    try:
-        from hermes_cli.plugins import get_plugin_auxiliary_tasks
-        for _entry in get_plugin_auxiliary_tasks():
-            if _entry.get("key") == task:
-                _defaults = _entry.get("defaults") or {}
-                if isinstance(_defaults, dict):
-                    return {**_defaults, **task_config}
-                break
-    except Exception:
-        pass  # plugin discovery failure must not break aux task config reads
-    return task_config
-
-
-class CompressionFastLane(NamedTuple):
-    """Explicit, non-reasoning compression route."""
-
-    certified_non_reasoning: bool
-    reasoning_config: Optional[Dict[str, Any]]
-
-
-def _fast_lane_config_fields(config: Dict[str, Any]) -> tuple[str, str, bool]:
-    """Only explicit reasoning disablement certifies a non-reasoning route."""
-    from hermes_constants import parse_reasoning_effort
-    provider = str(config.get("provider") or "").strip().lower()
-    model = str(config.get("model") or "").strip()
-    parsed_effort = parse_reasoning_effort(config.get("reasoning_effort"))
-    non_reasoning = parsed_effort is not None and parsed_effort.get("enabled") is False
-    return provider, model, non_reasoning
-
-
-def resolve_compression_fast_lane(
-    actual_provider: str, actual_model: Optional[str], *, requested_provider: Optional[str] = None,
-    requested_model: Optional[str] = None, route_config: Optional[Dict[str, Any]] = None,
-) -> CompressionFastLane:
-    """Certify explicit non-reasoning settings only on the matching destination."""
-    config = route_config if route_config is not None else _get_auxiliary_task_config("compression")
-    cfg_provider, cfg_model, non_reasoning = _fast_lane_config_fields(config)
-    provider = str(requested_provider or "").strip().lower() or cfg_provider
-    model = str(requested_model or "").strip() or cfg_model
-    explicit_route = provider not in {"", "auto"} and model.lower() not in {"", "auto"}
-    actual_norm = _normalize_aux_provider(_fallback_provider_from_label(str(actual_provider or "")))
-    provider_matches = actual_norm == _normalize_aux_provider(provider)
-    model_matches = str(actual_model or "").strip().lower() == model.lower()
-    if explicit_route and provider_matches and model_matches and non_reasoning:
-        return CompressionFastLane(True, {"enabled": False, "effort": "none"})
-    return CompressionFastLane(False, None)
-
-
-def _compression_config_claims_fast_lane(config: Dict[str, Any]) -> bool:
-    """Whether task config declares fast-only controls that cannot leak."""
-    provider, model, non_reasoning = _fast_lane_config_fields(config)
-    return provider not in {"", "auto"} and model.lower() not in {"", "auto"} and non_reasoning
-
-
-def _compression_fast_lane_controls(
-    task: str | None, *, actual_provider: str, actual_model: str | None,
-    requested_provider: str | None, requested_model: str | None, route_config: Dict[str, Any],
-    leak_guard_config: Dict[str, Any], max_tokens: int | None, extra_body: Dict[str, Any],
-) -> tuple[int | None, Dict[str, Any]]:
-    """Apply the certified compression controls to one resolved route."""
-    if task != "compression" or max_tokens is not None:
-        return max_tokens, extra_body
-    body = dict(extra_body)
-    lane = resolve_compression_fast_lane(
-        actual_provider, actual_model, requested_provider=requested_provider, requested_model=requested_model, route_config=route_config,
-    )
-    if lane.reasoning_config is not None:
-        if "reasoning" not in body:
-            body["reasoning"] = lane.reasoning_config
-    elif _compression_config_claims_fast_lane(leak_guard_config):
-        body.pop("reasoning", None)
-    return max_tokens, body
-
-
-def _get_task_timeout(task: str, default: float = _DEFAULT_AUX_TIMEOUT) -> float:
-    """``auxiliary.<task>.timeout`` from config, else *default*."""
-    if not task:
-        return default
-    raw = _get_auxiliary_task_config(task).get("timeout")
-    if raw is not None:
-        with contextlib.suppress(ValueError, TypeError):
-            return float(raw)
-    return default
-
-
-def _effective_aux_timeout(task: str, timeout: Optional[float]) -> float:
-    """Explicit ``timeout`` wins, else config; compression gets a floor so a reasoning model
-    summarising a large context isn't cut off."""
-    if timeout is not None:
-        return timeout
-    effective = _get_task_timeout(task)
-    return max(effective, _COMPRESSION_TIMEOUT_FLOOR_SECONDS) if task == "compression" else effective
-
-
-def _get_task_extra_body(task: str) -> Dict[str, Any]:
-    """Shallow copy of ``auxiliary.<task>.extra_body`` with ``reasoning_effort`` folded into
-    ``reasoning`` unless one is configured (more specific wins). MoA tasks are excluded: their
-    reasoning depth is per-slot in the preset."""
-    task_config = _get_auxiliary_task_config(task)
-    raw = task_config.get("extra_body")
-    result = dict(raw) if isinstance(raw, dict) else {}
-    if "reasoning" in result:
-        return result
-    effort = task_config.get("reasoning_effort")
-    if effort is None or effort == "":
-        return result
-    if task in ("moa_reference", "moa_aggregator"):
-        logger.warning(
-            "auxiliary.%s.reasoning_effort is not supported â€” MoA reasoning depth is per-slot: set reasoning_effort "
-            "on the preset's reference_models entries / aggregator instead (moa.presets.<name>...). Ignoring.",
-            task,
-        )
-        return result
-    from hermes_constants import parse_reasoning_effort
-    parsed = parse_reasoning_effort(effort)
-    if parsed is not None:
-        result["reasoning"] = parsed
-    else:
-        logger.warning(
-            "auxiliary.%s.reasoning_effort %r is not a valid level (none, minimal, low, medium, high, xhigh, max, ultra) â€” ignoring",
-            task, effort,
-        )
-    return result
-
-
-# Per-task concurrency limiting: many sessions can spawn unbounded background aux calls, each
-# retrying across the fallback chain during incidents.
-# During provider incidents each call also retries / fans out across the fallback chain, multiplying request
-# volume on already-degraded endpoints. A per-task semaphore caps in-flight calls so retry amplification
-# stays bounded. See #23324.
-_aux_sync_semaphores: Dict[str, Tuple[int, threading.BoundedSemaphore]] = {}
-_aux_async_semaphores: Dict[Tuple[str, int], Tuple[int, Any]] = {}
-_aux_sem_lock = threading.Lock()
-
-
-def _get_task_max_concurrency(task: Optional[str]) -> Optional[int]:
-    """``auxiliary.<task>.max_concurrency`` as a positive int, or None. Vision uses this key for
-    its encode/resize CPU pool; its LLM calls stay concurrent."""
-    if not task or task == "vision":
-        return None
-    try:
-        value = int(_get_auxiliary_task_config(task).get("max_concurrency"))
-    except (TypeError, ValueError):  # missing (None) or malformed
-        return None
-    return value if value > 0 else None
-
-
-def _cached_semaphore(store: dict, key: Any, limit: int, factory: Callable[[int], Any]) -> Any:
-    """Return the cached semaphore for ``key``, rebuilding it when the limit changed."""
-    with _aux_sem_lock:
-        entry = store.get(key)
-        if entry is None or entry[0] != limit:
-            store[key] = entry = (limit, factory(limit))
-        return entry[1]
-
-
-def _acquire_sync_aux_semaphore(task: Optional[str]) -> Optional[threading.BoundedSemaphore]:
-    """Get a per-task sync semaphore, rebuilding it after a config change."""
-    limit = _get_task_max_concurrency(task)
-    return None if limit is None else _cached_semaphore(_aux_sync_semaphores, task, limit, threading.BoundedSemaphore)
-
-
-def _acquire_async_aux_semaphore(task: Optional[str]):
-    """Get a per-task, per-event-loop async semaphore after config lookup."""
-    limit = _get_task_max_concurrency(task)
-    if limit is None:
-        return None
-    import asyncio
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        return None
-    return _cached_semaphore(_aux_async_semaphores, (task, id(loop)), limit, asyncio.Semaphore)
-
-
-def _reset_aux_semaphores() -> None:
-    """Drop cached semaphores (test helper)."""
-    with _aux_sem_lock:
-        _aux_sync_semaphores.clear()
-        _aux_async_semaphores.clear()
-
-
-# Anthropic-compatible endpoints reached via the OpenAI SDK wrapper; their image content blocks
-# must use Anthropic format.
-_ANTHROPIC_COMPAT_PROVIDERS = frozenset({"minimax", "minimax-oauth", "minimax-cn"})
-
-
-def _is_anthropic_compat_endpoint(provider: str, base_url: str) -> bool:
-    """True for known Anthropic-compatible providers or any ``/anthropic`` URL path."""
-    return provider in _ANTHROPIC_COMPAT_PROVIDERS or "/anthropic" in (base_url or "").lower()
-
-
-# OpenAI block type â†’ (Anthropic block type, default media type for data: URLs). MiniMax's
-# Anthropic-compatible endpoint wants type="video" (not "video_url"/"input_video") with the same
-# ``source`` shape as "image".
-_ANTHROPIC_MEDIA_BLOCKS = {"image_url": ("image", "image/png"), "video_url": ("video", "video/mp4")}
-
-
-def _convert_openai_images_to_anthropic(messages: list) -> list:
-    """Convert OpenAI ``image_url``/``video_url`` blocks to Anthropic ``image``/``video``;
-    only list-content messages with such blocks change."""
-    converted = []
-    for msg in messages:
-        content = msg.get("content")
-        if not isinstance(content, list):
-            converted.append(msg)
-            continue
-        new_content = []
-        changed = False
-        for block in content:
-            block_type = block.get("type")
-            if block_type not in _ANTHROPIC_MEDIA_BLOCKS:
-                new_content.append(block)
-                continue
-            url = (block.get(block_type) or {}).get("url", "")
-            anth_type, media_type = _ANTHROPIC_MEDIA_BLOCKS[block_type]
-            if url.startswith("data:"):
-                header, _, b64data = url.partition(",")
-                if ":" in header and ";" in header:
-                    media_type = header.split(":", 1)[1].split(";", 1)[0]
-                source = {"type": "base64", "media_type": media_type, "data": b64data}
-            else:
-                source = {"type": "url", "url": url}
-            new_content.append({"type": anth_type, "source": source})
-            changed = True
-        converted.append({**msg, "content": new_content} if changed else msg)
-    return converted
-
-
-_PROFILE_REASONING_KEYS = {
-    "reasoning", "reasoning_effort", "thinking", "thinking_config", "thinkingconfig",
-    "thinking_budget", "thinkingbudget", "enable_thinking", "think", "verbosity",
-}
-
-
-def _contains_profile_reasoning_fields(value: Any) -> bool:
-    """Return whether a profile payload contains a reasoning wire control (recursive)."""
-    if not isinstance(value, dict):
-        return False
-    return any(
-        str(key).strip().lower() in _PROFILE_REASONING_KEYS or _contains_profile_reasoning_fields(nested)
-        for key, nested in value.items()
-    )
-
-
-_NOUS_PROVIDER_NAMES = frozenset({"nous", "nous-portal", "nousresearch"})
-
-
-def _nous_on_messages_wire(provider_norm: str, model: str) -> bool:
-    """True when a Nous Portal route serves ``model`` over /v1/messages (dual-wire catalog)."""
-    if provider_norm not in _NOUS_PROVIDER_NAMES:
-        return False
-    from hermes_cli.providers import nous_api_mode
-    return nous_api_mode(model) == "anthropic_messages"
-
-
-_NVIDIA_PROVIDER_NAMES = {"nvidia", "nvidia-nim", "nim", "build-nvidia", "nemotron"}
-_GEMINI_NATIVE_PROVIDER_NAMES = {"gemini", "google", "google-gemini", "google-ai-studio"}
-
-
-def _is_gemini_native_route(provider_norm: str, effective_base: str) -> bool:
-    """Gemini native by provider name, else (best-effort) by base URL shape."""
-    if provider_norm in _GEMINI_NATIVE_PROVIDER_NAMES:
-        return True
-    if not effective_base:
-        return False
-    try:
-        from agent.gemini_native_adapter import is_native_gemini_base_url
-        return is_native_gemini_base_url(effective_base)
-    except Exception:
-        return False
-
-
-def _forwards_max_tokens(provider: str, provider_norm: str, model: str, effective_base: str, task: Optional[str]) -> bool:
-    """Whether an explicit max_tokens is forwarded on this route.
-
-    No default cap elsewhere (omitted = provider default; avoids max_completion_tokens / ZAI-vision
-    quirks). Forward only where mandatory or honored: Anthropic Messages wire (400 without it);
-    NVIDIA NIM (empty choices[] when omitted); MoA reference slots; Gemini native (fixed 65,535
-    ceiling otherwise); OpenRouter (budgets the FULL window when omitted â†’ 402 on low credit);
-    managed local llama-server (uncapped decode with no EOS burns the GPU to the context window).
-    """
-    return (
-        _is_anthropic_compat_endpoint(provider, effective_base)
-        or _nous_on_messages_wire(provider_norm, model)
-        or provider_norm in _NVIDIA_PROVIDER_NAMES
-        or base_url_host_matches(effective_base, "integrate.api.nvidia.com")
-        or str(task) == "moa_reference"
-        or _is_gemini_native_route(provider_norm, effective_base)
-        or provider_norm == "openrouter"
-        or base_url_host_matches(effective_base, "openrouter.ai")
-        or _is_managed_local_endpoint(effective_base)
-    )
-
-
-def _dedupe_tool_names(tools: list, provider: str, model: str) -> list:
-    """Drop duplicate tool names (Vertex/Azure/Bedrock 400 on them) with a warning."""
-    seen: set = set()
-    deduped: list = []
-    for tool in tools:
-        name = (tool.get("function") or {}).get("name", "")
-        if name and name in seen:
-            logger.warning("_build_call_kwargs: duplicate tool name '%s' removed (provider=%s model=%s)", name, provider, model)
-            continue
-        if name:
-            seen.add(name)
-        deduped.append(tool)
-    return deduped
-
-
-class _ProfileProjection(NamedTuple):
-    body: Dict[str, Any]
-    reasoning_extra: Dict[str, Any]
-    top_level: Dict[str, Any]
-    handles_reasoning: bool
-
-
-def _project_provider_profile(
-    provider: str, provider_norm: str, model: str, effective_base: str, reasoning_config: Optional[dict],
-) -> _ProfileProjection:
-    """Provider profile's extra_body / kwargs projection; partial on failure."""
-    body: Dict[str, Any] = {}
-    reasoning_extra: Dict[str, Any] = {}
-    top_level: Dict[str, Any] = {}
-    handles_reasoning = False
-    try:
-        from providers import get_provider_profile
-        from providers.base import ProviderProfile
-        profile = get_provider_profile(provider_norm)
-        if profile is not None:
-            body = profile.build_extra_body(model=model, base_url=effective_base, reasoning_config=reasoning_config) or {}
-            reasoning_extra, top_level = profile.build_api_kwargs_extras(
-                reasoning_config=reasoning_config, supports_reasoning=reasoning_config is not None,
-                model=model, base_url=effective_base,
-            )
-            reasoning_extra = reasoning_extra or {}
-            top_level = top_level or {}
-            handles_reasoning = (
-                type(profile).build_api_kwargs_extras is not ProviderProfile.build_api_kwargs_extras
-                or _contains_profile_reasoning_fields(body)
-                or _contains_profile_reasoning_fields(reasoning_extra)
-                or _contains_profile_reasoning_fields(top_level)
-            )
-    except Exception as exc:
-        logger.debug("_build_call_kwargs: provider profile projection failed for %s: %s", provider, exc)
-    return _ProfileProjection(body, reasoning_extra, top_level, handles_reasoning)
-
-
-def _merge_aux_extra_body(
-    extra_body: Optional[dict], projection: _ProfileProjection, reasoning_config: Optional[dict], provider_norm: str,
-) -> Dict[str, Any]:
-    """Caller extra_body + profile body/reasoning + generic reasoning fallback + Nous tags."""
-    merged_extra = dict(extra_body or {})
-    merged_extra.update(projection.body)
-    merged_extra.update(projection.reasoning_extra)
-    if reasoning_config and isinstance(reasoning_config, dict) and not projection.handles_reasoning:
-        if reasoning_config.get("enabled") is False:
-            merged_extra["reasoning"] = {"enabled": False}
-        else:
-            merged_extra["reasoning"] = {"enabled": True, "effort": reasoning_config.get("effort") or "medium"}
-    # Portal tags + sticky session_id fallback when the profile didn't supply them; session_id
-    # keeps aux calls on the main turn's upstream instance (cache warmth) â€” tags alone are not
-    # enough on /v1/messages.
-    if provider_norm in _NOUS_PROVIDER_NAMES:
-        if "tags" not in merged_extra:
-            merged_extra["tags"] = _nous_portal_tags()
-        if "session_id" not in merged_extra:
-            try:
-                from agent.portal_tags import get_conversation_context
-                sticky_key = get_conversation_context()
-            except Exception:
-                sticky_key = None
-            if sticky_key:
-                merged_extra["session_id"] = sticky_key
-    return merged_extra
-
-
-def _build_call_kwargs(
-    provider: str, model: str, messages: list, temperature: Optional[float] = None,
-    max_tokens: Optional[int] = None, tools: Optional[list] = None, timeout: float = 30.0,
-    extra_body: Optional[dict] = None, reasoning_config: Optional[dict] = None,
-    base_url: Optional[str] = None, task: Optional[str] = None,
-) -> dict:
-    """Build kwargs for .chat.completions.create() with model/provider adjustments."""
-    kwargs: Dict[str, Any] = {"model": model, "messages": messages, "timeout": timeout}
-    # Per-model fixed/omitted temperature, then Opus 4.7+ sampling bans: it rejects any
-    # non-default temperature/top_p/top_k, so drop silently rather than 400 when the aux model flips.
-    fixed_temperature = _fixed_temperature_for_model(model, base_url)
-    if fixed_temperature is OMIT_TEMPERATURE:
-        temperature = None  # strip â€” let server choose
-    elif fixed_temperature is not None:
-        temperature = fixed_temperature
-    if temperature is not None:
-        from agent.anthropic_adapter import _forbids_sampling_params
-        if not _forbids_sampling_params(model):
-            kwargs["temperature"] = temperature
-    effective_base = base_url or (_current_custom_base_url() if provider == "custom" else "")
-    provider_norm = str(provider or "").strip().lower()
-    if max_tokens is not None and _forwards_max_tokens(provider, provider_norm, model, effective_base, task):
-        kwargs.update(auxiliary_max_tokens_param(max_tokens, model=model))  # picks max_completion_tokens where needed
-    if tools:
-        kwargs["tools"] = _dedupe_tool_names(tools, provider, model)
-    # Provider profiles are the source of truth for reasoning wire shapes (top-level, nested body,
-    # or extra_body.reasoning); providers without a reasoning-aware profile keep the generic
-    # ``extra_body.reasoning`` fallback.
-    projection = _project_provider_profile(provider, provider_norm, model, effective_base, reasoning_config)
-    kwargs.update(projection.top_level)
-    if merged_extra := _merge_aux_extra_body(extra_body, projection, reasoning_config, provider_norm):
-        kwargs["extra_body"] = merged_extra
-    # Anthropic Messages adapters take reasoning via a private kwarg that plain OpenAI SDK clients
-    # would reject; Portal Claude is dual-wire, so include it only when the catalog id selects
-    # /v1/messages.
-    if reasoning_config and isinstance(reasoning_config, dict):
-        raw_base = base_url or ""
-        if (
-            provider_norm == "anthropic" or _nous_on_messages_wire(provider_norm, model)
-            or _endpoint_speaks_anthropic_messages(raw_base) or _is_anthropic_compat_endpoint(provider_norm, raw_base)
-        ):
-            kwargs["_reasoning_config"] = dict(reasoning_config)
-    # OpenCode relay session affinity â€” same key as the main turn so compression/title/vision
-    # calls stay on the conversation's warm backend.
-    from agent.opencode_affinity import merge_opencode_session_headers
-    return merge_opencode_session_headers(kwargs, provider, base_url, _runtime_main_value("session_id") or None)
-
-
-def _validate_llm_response(
-    response: Any, task: Optional[str] = None, provider: Optional[str] = None, base_url: Optional[str] = None,
-) -> Any:
-    """Validate the .choices[0].message shape (fail fast, not a downstream AttributeError).
-
-    Also the single aux-usage accounting chokepoint: every successful non-streaming response
-    passes here exactly once; *provider*/*base_url* are optional hints.
-
-    See #7264.
-    Recording is best-effort and never affects validation. *provider*/*base_url* are optional accounting
-    hints â€” fallback-path calls omit them and the row keeps the model (read from the response itself) with
-    an empty route. See #23270.
-    """
-    if response is None:
-        raise RuntimeError(f"Auxiliary {task or 'call'}: LLM returned None response")
-    from agent.aux_accounting import record_aux_usage
-    record_aux_usage(response, task, provider=provider, base_url=base_url)
-    # Adapter SimpleNamespace responses are fine â€” they have .choices[0].message.
-    try:
-        choices = response.choices
-        if not choices or not hasattr(choices[0], "message"):
-            raise AttributeError("missing choices[0].message")
-    except (AttributeError, TypeError, IndexError) as exc:
-        recovered = _recover_aux_response_message(response)
-        if recovered is None:
-            raise RuntimeError(
-                f"Auxiliary {task or 'call'}: LLM returned invalid response (type={type(response).__name__}): "
-                f"{str(response)[:120]!r}. Expected object with .choices[0].message â€” check provider "
-                f"adapter or custom endpoint compatibility."
-            ) from exc
-        response = recovered
-    # Retain the provider-reported model for terminal relay route attribution.
-    context = _RELAY_AUX_CALL_CONTEXT.get()
-    if context is not None:
-        model = _field(response, "model")
-        if isinstance(model, str) and model.strip():
-            context["response_model"] = model
-    _complete_relay_auxiliary_call()
-    return response
-
-
-def _complete_relay_auxiliary_call(*, outcome: str = "success") -> None:
-    """Close one auxiliary logical call after acceptance or terminal failure."""
-    context = _RELAY_AUX_CALL_CONTEXT.get()
-    if context is None:
-        return
-    from agent import relay_llm
-    relay_llm.complete_logical_call(
-        str(context.get("request_id") or ""), outcome=outcome,
-        model_name=str(context.get("model") or "unknown"),
-        provider_name=str(context.get("provider") or "auxiliary"),
-        response_model_name=context.get("response_model"),
-    )
-
-
-def _fail_relay_auxiliary_call() -> None:
-    """Close a terminally failed call without replacing its original error."""
-    try:
-        _complete_relay_auxiliary_call(outcome="failed")
-    except Exception:
-        logger.warning("Relay auxiliary failure finalization failed", exc_info=True)
-
-
-def _recover_aux_response_message(response: Any) -> Optional[Any]:
-    """Synthesize chat-completions shape from Responses-style text (``output_text``,
-    ``output`` items) that some compatible endpoints return outside ``choices``."""
-    text = _extract_aux_response_text(response)
-    if not text:
-        return None
-    choice = SimpleNamespace(message=SimpleNamespace(content=text), finish_reason=getattr(response, "finish_reason", None) or "stop")
-    try:
-        response.choices = [choice]
-        return response
-    except Exception:
-        return SimpleNamespace(
-            id=getattr(response, "id", ""), model=getattr(response, "model", ""),
-            object=getattr(response, "object", "chat.completion"), choices=[choice],
-            usage=getattr(response, "usage", None),
-        )
-
-
-def _extract_aux_response_text(response: Any) -> str:
-    """Text from Responses-style ``output_text`` or ``output[].content[].text``."""
-    output_text = _field(response, "output_text")
-    if isinstance(output_text, str) and output_text.strip():
-        return output_text.strip()
-    output = _field(response, "output")
-    if not isinstance(output, list):
-        return ""
-    parts: List[str] = []
-    for item in output:
-        item_type = _field(item, "type")
-        if item_type and item_type != "message":
-            continue
-        for part in (_field(item, "content") or []):
-            if _field(part, "type") in {"output_text", "text", None}:
-                text = _field(part, "text")
-                if isinstance(text, str) and text.strip():
-                    parts.append(text.strip())
-    return "\n".join(parts).strip()
-
-
-# Streamed aggregation for progress-hooked aux calls: ``timeout`` becomes an inter-chunk idle
-# timeout (httpx read timeout is per read), each chunk ticks outer watchdogs; the total ceiling
-# bounds trickles.
-_AUX_STREAM_CEILING_FLOOR_SECONDS = 600.0
-_AUX_STREAM_CEILING_MULTIPLIER = 4.0
-
-
-def _aux_stream_total_ceiling(effective_timeout: Optional[float]) -> float:
-    """Absolute wall-clock bound for a streamed aux call; generous by design (the idle
-    timeout is the real guard â€” this only stops a one-token-per-idle-window trickle)."""
-    try:
-        timeout = float(effective_timeout) if effective_timeout is not None else 0.0
-    except (TypeError, ValueError):
-        timeout = 0.0
-    return max(_AUX_STREAM_CEILING_FLOOR_SECONDS, _AUX_STREAM_CEILING_MULTIPLIER * timeout)
-
-
-def _client_streams_internally(client: Any) -> bool:
-    """Adapters that stream inside .create() tick the hook themselves (Codex, Anthropic) or
-    cannot stream (Bedrock); none accept ``stream=True`` from us."""
-    return isinstance(client, (CodexAuxiliaryClient, AnthropicAuxiliaryClient, BedrockAuxiliaryClient))
-
-
-_MANAGED_LOCAL_STATE_TTL_S = 15.0
-_managed_local_cache: "tuple[float, str]" = (0.0, "")
-
-
-def _managed_local_netloc() -> str:
-    """host:port of the managed local llama-server ("" when none), read with a short TTL from
-    the supervisor state file provider resolution also uses (exact match)."""
-    global _managed_local_cache
-    now = time.monotonic()
-    ts, cached = _managed_local_cache
-    if now - ts < _MANAGED_LOCAL_STATE_TTL_S:
-        return cached
-    try:
-        from hermes_cli.local_runtime.supervisor import state_path
-        raw = state_path().read_text(encoding="utf-8")
-        base = str((json.loads(raw) or {}).get("base_url", ""))
-        netloc = urlparse(base).netloc.lower()
-    except Exception:
-        netloc = ""
-    _managed_local_cache = (now, netloc)
-    return netloc
-
-
-def _is_managed_local_endpoint(base_url: Optional[str]) -> bool:
-    """True when *base_url* targets the llama-server this Hermes manages."""
-    if not base_url:
-        return False
-    managed = _managed_local_netloc()
-    if not managed:
-        return False
-    try:
-        return urlparse(str(base_url)).netloc.lower() == managed
-    except Exception:
-        return False
-
-
-def _provider_requires_stream(provider: str, base_url: Optional[str]) -> bool:
-    """Providers that only accept streaming (non-stream = 400): Tencent Copilot, any
-    ``auxiliary.stream_only_base_urls`` substring, and the managed local llama-server
-    (streamed for cancellation â€” it only notices a dead client on socket write)."""
-    _url = str(base_url or "").lower()
-    if not _url:
-        return False
-    if base_url_host_matches(_url, "copilot.tencent.com") or _is_managed_local_endpoint(_url):
-        return True
-    try:
-        from hermes_cli.config import load_config
-        markers = (load_config() or {}).get("auxiliary", {}).get("stream_only_base_urls") or []
-        if isinstance(markers, (list, tuple)):
-            return any(
-                isinstance(marker, str) and marker.strip() and marker.strip().lower() in _url
-                for marker in markers)
-    except Exception:
-        pass  # Config read is best-effort; never break an aux call over it.
-    return False
-
-
-_AFFORDABLE_TOKENS_RE = re.compile(r"can only afford\s+([0-9][0-9,]*)", re.IGNORECASE)
-# Below the floor the affordable budget can't fit a useful aux output â€” treat as exhaustion;
-# the margin keeps provider-side token-count rounding from 402-ing the retry.
-_AFFORDABLE_RETRY_FLOOR_TOKENS = 512
-# See #49785.
-_AFFORDABLE_RETRY_MARGIN_TOKENS = 64
-
-
-def _affordable_max_tokens_from_error(exc: Exception) -> Optional[int]:
-    """Affordable output budget (minus margin) from an OpenRouter credit-limited 402
-    ("...but can only afford 7117": credit exists, the cap was too large); ``None``
-    when no count is present or the budget is too small to be useful."""
-    if not _is_payment_error(exc):
-        return None
-    match = _AFFORDABLE_TOKENS_RE.search(str(exc))
-    if not match:
-        return None
-    try:
-        affordable = int(match.group(1).replace(",", ""))
-    except (TypeError, ValueError):
-        return None
-    capped = affordable - _AFFORDABLE_RETRY_MARGIN_TOKENS
-    return capped if capped >= _AFFORDABLE_RETRY_FLOOR_TOKENS else None
-
-
-def _create_with_progress(
-    client: Any, kwargs: Dict[str, Any], task: Optional[str] = None, *, force_stream: bool = False
-) -> Any:
-    """Credit-aware :func:`_create_with_progress_once`: a 402 naming an affordable
-    budget retries ONCE with that cap (only ever lowering); anything else re-raises."""
-    try:
-        return _create_with_progress_once(client, kwargs, task, force_stream=force_stream)
-    except Exception as exc:
-        affordable = _affordable_max_tokens_from_error(exc)
-        if affordable is None:
-            raise
-        existing_cap = kwargs.get("max_tokens") or kwargs.get("max_completion_tokens")
-        if isinstance(existing_cap, (int, float)) and 0 < existing_cap <= affordable:
-            raise  # Already within budget â€” the error is something else; don't spin.
-        retry_kwargs = dict(kwargs)
-        retry_kwargs.pop("max_tokens", None)
-        retry_kwargs.pop("max_completion_tokens", None)
-        retry_kwargs.update(
-            auxiliary_max_tokens_param(affordable, model=str(kwargs.get("model") or "") or None))
-        logger.info("Auxiliary %s: credit-limited 402 (affordable=%d tokens); "
-                    "retrying once with a clamped output cap instead of failing: %s",
-                    task or "call", affordable, exc)
-        return _create_with_progress_once(client, retry_kwargs, task, force_stream=force_stream)
-
-
-def _stream_request_plan(kwargs: Dict[str, Any]) -> "Tuple[Dict[str, Any], str, float]":
-    """(stream kwargs, model name, total ceiling) for a streamed re-aggregation."""
-    stream_kwargs = dict(kwargs)
-    stream_kwargs["stream"] = True
-    stream_kwargs["stream_options"] = {"include_usage": True}
-    return (stream_kwargs, str(kwargs.get("model") or ""),
-            _aux_stream_total_ceiling(kwargs.get("timeout")))
-
-
-def _create_with_progress_once(
-    client: Any, kwargs: Dict[str, Any], task: Optional[str] = None, *, force_stream: bool = False
-) -> Any:
-    """create() that streams (and re-aggregates, ticking the hook per substantive chunk) when a
-    progress hook is active or the provider is stream-only; plain ``create(**kwargs)`` otherwise
-    or when the adapter streams internally. Streaming rejections fall back to a plain call â€”
-    except under ``force_stream``.
-
-    Behavior is byte-for-byte identical to a plain ``create(**kwargs)`` when neither trigger applies (every
-    existing caller/task) or when the client's wire adapter streams internally. With a hook + a
-    chunk-capable client, the request is sent with ``stream=True`` and aggregated, ticking the hook only for
-    substantive chunks. The configured ``timeout`` acts per stream read (idle) rather than as a total
-    budget, and outer liveness watchdogs see tokens moving. ``force_stream=True`` (stream-only providers
-    such as Tencent Copilot â€” credit @kudi88, PR #60686) takes the same streamed path even without a hook.
-    Providers that reject the streamed request fall back to the plain non-streaming call â€” except under
-    ``force_stream``, where a stream-only provider rejects the plain call by definition, so the original
-    error is surfaced to the normal recovery chains instead.
-    """
-    _notify_aux_dispatch()
-    _notify_aux_progress()  # Preserve the watchdog's historical dispatch tick.
-    if (not _aux_progress_active() and not force_stream) or _client_streams_internally(client):
-        response = client.chat.completions.create(**kwargs)
-        if not _client_streams_internally(client):
-            _notify_aux_provider_response()
-        return response
-    stream_kwargs, model, total_ceiling = _stream_request_plan(kwargs)
-    try:
-        chunks = client.chat.completions.create(**stream_kwargs)
-    except Exception as exc:
-        # Genuine provider failures aren't streaming's fault â€” surface unchanged so the
-        # recovery chains see the same error as a plain call.
-        if (force_stream or _is_transient_transport_error(exc) or _is_auth_error(exc)
-                or _is_payment_error(exc) or _is_rate_limit_error(exc)):
-            raise
-        # Possibly a streaming-specific rejection: retry non-streaming once; a genuinely bad
-        # request reproduces the real error for the except-chains.
-        logger.debug("Auxiliary %s: streamed request failed (%s); retrying non-streaming",
-                     task or "call", exc)
-        _notify_aux_dispatch()
-        response = client.chat.completions.create(**kwargs)
-        _notify_aux_provider_response()
-        return response
-    # Some shims (MoA quiet mode, defensive adapters) return a complete response despite
-    # stream=True; it counts as provider response + forward progress.
-    if hasattr(chunks, "choices"):
-        _notify_aux_provider_response()
-        return chunks
-    return _aggregate_chat_stream(chunks, model=model, total_ceiling=total_ceiling)
-
-
-def _close_chunk_stream(chunks: Any, *, allow_aclose: bool = False) -> Any:
-    """Best-effort ``close()`` (or ``aclose()``); returns a pending awaitable or None."""
-    close_fn = getattr(chunks, "close", None) or (
-        getattr(chunks, "aclose", None) if allow_aclose else None)
-    if not callable(close_fn):
-        return None
-    try:
-        result = close_fn()
-    except Exception:
-        return None
-    return result if inspect.isawaitable(result) else None
-
-
-def _aggregate_chat_stream(
-    chunks: Any, *, model: str = "", total_ceiling: Optional[float] = None
-) -> Any:
-    """Consume a chunk stream into a complete response; TimeoutError (phrased "timed out" so
-    ``_is_timeout_error`` matches) when *total_ceiling* elapses."""
-    acc = _ChatStreamAccumulator(
-        model=model, total_ceiling=total_ceiling, host_deadline=_current_aux_stream_deadline())
-    try:
-        for chunk in chunks:
-            acc.feed(chunk)
-    finally:
-        _close_chunk_stream(chunks)
-    return acc.finish()
-
-
-# Reasoning-detail fields whose non-empty text counts as forward progress.
-_REASONING_DETAIL_TEXT_FIELDS = ("summary", "thinking", "content", "text")
-
-
-class _ChatStreamAccumulator:
-    """Shared per-chunk accumulation so sync and async aggregation cannot drift."""
-
-    def __init__(self, model: str = "", total_ceiling: Optional[float] = None,
-                 host_deadline: Optional[float] = None):
-        self._started = time.monotonic()
-        self._total_ceiling = total_ceiling
-        # Absolute instant the waiting host gives up; checked alongside (not instead of) the
-        # ceiling, and unaffected by pre-construction dispatch/TTFT.
-        # Checked as well as (not instead of) the ceiling above: the ceiling still bounds callers with no
-        # host deadline, and the host deadline is absolute, so it is unaffected by however long dispatch and
-        # TTFT took before this accumulator was constructed. See #99692.
-        self._host_deadline = host_deadline
-        self.content_parts: List[str] = []
-        self.reasoning_parts: List[str] = []
-        self.reasoning_details: List[Any] = []
-        self.tool_calls_acc: Dict[int, Dict[str, Any]] = {}
-        self.finish_reason = self.usage = None
-        self.resp_id = ""
-        self.resp_model = model or ""
-
-    def _check_deadlines(self) -> None:
-        """Raise TimeoutError past the total ceiling or the host deadline."""
-        now = time.monotonic()
-        if self._total_ceiling is not None and (now - self._started) >= self._total_ceiling:
-            raise TimeoutError(f"Auxiliary streamed call timed out after {self._total_ceiling:.0f}s "
-                               "total ceiling (stream still open but over budget)")
-        if self._host_deadline is not None and now >= self._host_deadline:
-            raise TimeoutError("Auxiliary streamed call timed out at the host compression "
-                               f"deadline after {time.monotonic() - self._started:.0f}s "
-                               "(the caller already stopped waiting; streaming on would only "
-                               "pin its session lease)")
-
-    def _feed_reasoning_details(self, delta: Any) -> bool:
-        """Collect ``reasoning_details`` (OpenRouter-style thinking); True only when a detail
-        carries text, so structural/signed envelopes can't keep a stall alive."""
-        reasoning_details = getattr(delta, "reasoning_details", None)
-        if reasoning_details is None:
-            model_extra = getattr(delta, "model_extra", None)
-            if isinstance(model_extra, dict):
-                reasoning_details = model_extra.get("reasoning_details")
-        if not isinstance(reasoning_details, list):
-            return False
-        made_progress = False
-        for detail in reasoning_details:
-            self.reasoning_details.append(detail)
-            if isinstance(detail, dict) and any(
-                isinstance(detail.get(f), str) and detail[f] for f in _REASONING_DETAIL_TEXT_FIELDS):
-                made_progress = True
-        return made_progress
-
-    def _feed_tool_calls(self, delta: Any) -> bool:
-        """Merge tool-call fragments by index; True when any fragment carried data."""
-        made_progress = False
-        for tc in (getattr(delta, "tool_calls", None) or []):
-            idx = getattr(tc, "index", 0) or 0
-            acc = self.tool_calls_acc.setdefault(idx, {"id": "", "name": "", "arguments": []})
-            if getattr(tc, "id", None):
-                acc["id"] = tc.id
-                made_progress = True
-            fn = getattr(tc, "function", None)
-            if fn is not None:
-                if getattr(fn, "name", None):
-                    acc["name"] = fn.name
-                    made_progress = True
-                if getattr(fn, "arguments", None):
-                    acc["arguments"].append(fn.arguments)
-                    made_progress = True
-        return made_progress
-
-    def feed(self, chunk: Any) -> None:
-        # Every frame records transport timing (TTFP); only a substantive payload ticks the
-        # forward-progress hook that keeps compression alive.
-        _notify_aux_timing_response()
-        self._check_deadlines()
-        self.resp_id = getattr(chunk, "id", None) or self.resp_id
-        self.resp_model = getattr(chunk, "model", None) or self.resp_model
-        chunk_usage = getattr(chunk, "usage", None)
-        if chunk_usage:
-            self.usage = chunk_usage
-        choices = getattr(chunk, "choices", None) or []
-        if not choices:
-            return
-        choice = choices[0]
-        self.finish_reason = getattr(choice, "finish_reason", None) or self.finish_reason
-        delta = getattr(choice, "delta", None)
-        if delta is None:
-            return
-        made_progress = False
-        from agent.message_content import flatten_message_text
-
-        piece = flatten_message_text(getattr(delta, "content", None), sep="")
-        if piece:
-            self.content_parts.append(piece)
-            made_progress = True
-        reasoning_piece = getattr(delta, "reasoning", None) or getattr(delta, "reasoning_content", None)
-        reasoning_piece = flatten_message_text(reasoning_piece, sep="")
-        if reasoning_piece:
-            self.reasoning_parts.append(reasoning_piece)
-            made_progress = True
-        # Evaluate both unconditionally: they accumulate state, not just progress.
-        made_progress |= self._feed_reasoning_details(delta)
-        made_progress |= self._feed_tool_calls(delta)
-        if made_progress:
-            _notify_aux_progress()
-
-    def finish(self) -> Any:
-        tool_calls = None
-        if self.tool_calls_acc:
-            tool_calls = [
-                SimpleNamespace(id=acc["id"], type="function", function=SimpleNamespace(
-                    name=acc["name"], arguments="".join(acc["arguments"])))
-                for _idx, acc in sorted(self.tool_calls_acc.items())]
-        message = SimpleNamespace(
-            role="assistant", content="".join(self.content_parts), tool_calls=tool_calls,
-            reasoning="".join(self.reasoning_parts) or None,
-            reasoning_details=self.reasoning_details or None,
-        )
-        choice = SimpleNamespace(index=0, message=message, finish_reason=self.finish_reason or "stop")
-        return SimpleNamespace(id=self.resp_id, model=self.resp_model, object="chat.completion",
-                               choices=[choice], usage=self.usage)
-
-
-async def _aggregate_chat_stream_async(
-    chunks: Any, *, model: str = "", total_ceiling: Optional[float] = None
-) -> Any:
-    """Async mirror of :func:`_aggregate_chat_stream` (AsyncOpenAI streams need ``async for``)."""
-    acc = _ChatStreamAccumulator(
-        model=model, total_ceiling=total_ceiling, host_deadline=_current_aux_stream_deadline())
-    try:
-        async for chunk in chunks:
-            acc.feed(chunk)
-    finally:
-        pending = _close_chunk_stream(chunks, allow_aclose=True)
-        if pending is not None:
-            with contextlib.suppress(Exception):
-                await pending
-    return acc.finish()
-
-
-async def _acreate_with_stream(client: Any, kwargs: Dict[str, Any], task: Optional[str] = None) -> Any:
-    """Async create() for stream-only providers: ``stream=True`` + aggregate the async chunks."""
-    stream_kwargs, model, total_ceiling = _stream_request_plan(kwargs)
-    chunks = await client.chat.completions.create(**stream_kwargs)
-    if hasattr(chunks, "choices"):  # shims may hand back a complete response despite stream=True
-        return chunks
-    return await _aggregate_chat_stream_async(chunks, model=model, total_ceiling=total_ceiling)
-
-
-# Shared request head + recovery ladder for call_llm / async_call_llm: the entry points differ
-# only in how a request is awaited, so route resolution and the ordered recovery ladder are
-# written once. The ladder is a generator yielding ``_LadderStep`` requests and receiving the
-# response (or thrown exception), so rung ORDER and accept/re-raise contracts match on both wires.
-_ResolvedAuxRoute = NamedTuple("_ResolvedAuxRoute", [
-    ("client", Any), ("final_model", Optional[str]), ("resolved_provider", str),
-    ("effective_provider", str)])
-
-
-def _resolve_call_client(
-    task: Optional[str], *, provider: Optional[str], model: Optional[str], base_url: Optional[str],
-    api_key: Optional[str], resolved_provider: str, resolved_model: Optional[str],
-    resolved_base_url: Optional[str], resolved_api_key: Optional[str],
-    resolved_api_mode: Optional[str], main_runtime: Optional[Dict[str, Any]], async_mode: bool,
-) -> _ResolvedAuxRoute:
-    """Resolve the client for one aux call: vision chain, or cached text client with the
-    explicit-provider fallback_chain / auto-chain rescue; RuntimeError when nothing is configured."""
-    effective_provider = resolved_provider
-    if task == "vision":
-        effective_provider, client, final_model = resolve_vision_provider_client(
-            provider=resolved_provider if resolved_provider != "auto" else provider,
-            model=resolved_model or model, base_url=resolved_base_url or base_url,
-            api_key=resolved_api_key or api_key, async_mode=async_mode, main_runtime=main_runtime,
-        )
-        if client is None and resolved_provider != "auto" and not resolved_base_url:
-            logger.warning("Vision provider %s unavailable, falling back to auto vision backends",
-                           resolved_provider)
-            effective_provider, client, final_model = resolve_vision_provider_client(
-                provider="auto", model=resolved_model, async_mode=async_mode,
-                main_runtime=main_runtime)
-        if client is not None:
-            resolved_provider = effective_provider or resolved_provider
-    else:
-        client, final_model = _get_cached_client(
-            resolved_provider, resolved_model, async_mode=async_mode, base_url=resolved_base_url,
-            api_key=resolved_api_key, api_mode=resolved_api_mode, main_runtime=main_runtime,
-            task=task)
-        effective_provider = _effective_provider_for_client(client, resolved_provider)
-        if client is None:
-            # Explicit provider with no credentials: honor the task fallback_chain before
-            # raising (fallback entries may use OAuth / credential-pool auth).
-            _explicit = (resolved_provider or "").strip().lower()
-            if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
-                fb_client, fb_model, fb_label = _try_configured_fallback_for_unavailable_client(
-                    task, _explicit)
-                if fb_client is None:
-                    raise RuntimeError(
-                        f"Provider '{_explicit}' is set in config.yaml but no API key was found. "
-                        f"Set the {_explicit.upper()}_API_KEY environment variable, or switch to "
-                        f"a different provider with `hermes model`.")
-                client, final_model = fb_client, fb_model
-                if async_mode:
-                    client, final_model = _to_async_client(
-                        fb_client, fb_model or "", is_vision=(task == "vision"))
-                resolved_provider = fb_label or resolved_provider
-                effective_provider = resolved_provider
-            # Auto/custom with no credentials: walk the full auto chain (not just OpenRouter).
-            # model=None so each provider uses its own default.
-            if client is None and not resolved_base_url:
-                logger.info("Auxiliary %s: provider %s unavailable, trying auto-detection chain",
-                            task or "call", resolved_provider)
-                client, final_model = _get_cached_client(
-                    "auto", async_mode=async_mode, main_runtime=main_runtime, task=task)
-                effective_provider = _effective_provider_for_client(client, "auto")
-    if client is None:
-        raise RuntimeError(f"No LLM provider configured for task={task} "
-                           f"provider={resolved_provider}. Run: hermes setup")
-    return _ResolvedAuxRoute(client, final_model, resolved_provider, effective_provider)
-
-
-_PreparedAuxRequest = NamedTuple("_PreparedAuxRequest", [
-    ("client", Any), ("final_model", Optional[str]), ("kwargs", Dict[str, Any]),
-    ("resolved_provider", str), ("request_provider", str), ("resolved_model", Optional[str]),
-    ("resolved_base_url", Optional[str]), ("resolved_api_key", Optional[str]),
-    ("resolved_api_mode", Optional[str]), ("effective_timeout", float),
-    ("effective_extra_body", Dict[str, Any]), ("base_info", str)])
-
-
-def _prepare_aux_request(
-    task: Optional[str], *, provider: Optional[str], model: Optional[str], base_url: Optional[str],
-    api_key: Optional[str], main_runtime: Dict[str, Any], messages: list,
-    temperature: Optional[float], max_tokens: Optional[int], tools: Optional[list],
-    timeout: Optional[float], extra_body: Optional[dict], reasoning_config: Optional[dict],
-    extra_headers: Optional[Dict[str, str]], api_mode: Optional[str],
-    route_info: Optional[Dict[str, str]], async_mode: bool,
-) -> _PreparedAuxRequest:
-    """Shared head of call_llm/async_call_llm: resolve route + client, publish it, build request kwargs.
-    Sync-only: compression fast lane, per-request ``extra_headers``, and ``base_info`` falling
-    back to the resolved base_url when the client exposes none."""
-    resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
-        task, provider, model, base_url, api_key)
-    if api_mode:
-        resolved_api_mode = api_mode
-    effective_extra_body = _get_task_extra_body(task)
-    effective_extra_body.update(extra_body or {})
-    client, final_model, resolved_provider, effective_provider = _resolve_call_client(
-        task, provider=provider, model=model, base_url=base_url, api_key=api_key,
-        resolved_provider=resolved_provider, resolved_model=resolved_model,
-        resolved_base_url=resolved_base_url, resolved_api_key=resolved_api_key,
-        resolved_api_mode=resolved_api_mode, main_runtime=main_runtime, async_mode=async_mode,
-    )
-    effective_timeout = _effective_aux_timeout(task, timeout)
-    request_provider = effective_provider or resolved_provider
-    if not async_mode:
-        compression_config = _get_auxiliary_task_config("compression") if task == "compression" else {}
-        _, effective_extra_body = _compression_fast_lane_controls(
-            task, actual_provider=request_provider, actual_model=final_model,
-            requested_provider=provider, requested_model=model, route_config=compression_config,
-            leak_guard_config=compression_config, max_tokens=max_tokens,
-            extra_body=effective_extra_body,
-        )
-    _set_relay_auxiliary_route(request_provider, final_model, resolved_api_mode)
-    _record_route_info(route_info, _fallback_provider_from_label(request_provider), final_model)
-    if async_mode:
-        base_info = str(getattr(client, "base_url", "") or "")
-    else:
-        base_info = str(getattr(client, "base_url", resolved_base_url) or "")
-        if task:
-            logger.info("Auxiliary %s: using %s (%s)%s",
-                         task, request_provider or "auto", final_model or "default",
-                         f" at {base_info}" if base_info and "openrouter" not in base_info else "")
-    # Client's actual base_url so endpoint-specific temperature overrides work on
-    # auto-detected routes (api.moonshot.ai vs api.kimi.com/coding).
-    kwargs = _build_call_kwargs(
-        request_provider, final_model, messages, temperature=temperature, max_tokens=max_tokens,
-        tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
-        reasoning_config=reasoning_config, base_url=base_info or resolved_base_url, task=task)
-    if extra_headers:
-        kwargs["extra_headers"] = dict(extra_headers)
-    # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
-    client_base = str(getattr(client, "base_url", "") or "")
-    if _is_anthropic_compat_endpoint(request_provider, client_base):
-        kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
-    return _PreparedAuxRequest(
-        client, final_model, kwargs, resolved_provider, request_provider, resolved_model,
-        resolved_base_url, resolved_api_key, resolved_api_mode, effective_timeout,
-        effective_extra_body, base_info)
-
-
-class _LadderStep(NamedTuple):
-    """A provider request the ladder asks its driver to perform. kind: "call" (client, kwargs) |
-    "retry_same_provider" (provider, model) | "fallback" (fb_client, fb_model, fb_label)."""
-    kind: str
-    args: tuple
-
-
-_RERAISE_ORIGINAL = object()
-
-# Ordered (predicate, reason) pairs for the provider-fallback rung: first match
-# wins, so a payment-flavoured 429 reads as "payment error", not "rate limit".
-_FALLBACK_REASONS: Tuple[Tuple[Callable[[Exception], bool], str], ...] = (
-    (_is_auth_error, "auth error"), (_is_payment_error, "payment error"),
-    (_is_rate_limit_error, "rate limit"), (_is_model_incompatible_error, "model incompatible with route"),
-    (_is_invalid_aux_response_error, "invalid provider response"), (_is_connection_error, "connection error"),
-)
-
-
-def _rung(step: "_LadderStep", accept: Callable[[Exception], bool]):
-    """One ladder rung: perform ``step``; yields ``(response, None)`` on success,
-    ``(None, exc)`` when ``accept(exc)`` lets the next rung handle it, else re-raises."""
-    try:
-        result = yield step
-    except Exception as exc:
-        if not accept(exc):
-            raise
-        return None, exc
-    return result, None
-
-
-def _param_rung_accepts(exc: Exception) -> bool:
-    """After a parameter-strip retry: fall through to the max_tokens/payment/auth
-    chains with the stripped kwargs; re-raise anything those chains won't handle."""
-    return (_is_payment_error(exc) or _is_connection_error(exc) or _is_auth_error(exc)
-            or "max_tokens" in str(exc) or "unsupported_parameter" in str(exc))
-
-
-def _credential_rung_accepts(exc: Exception) -> bool:
-    return _is_auth_error(exc) or _is_payment_error(exc) or _is_rate_limit_error(exc)
-
-
-# Immutable route context shared by the recovery rungs.
-_LadderRoute = NamedTuple("_LadderRoute", [
-    ("client", Any), ("task", Optional[str]), ("tag", str), ("async_mode", bool), ("base_info", str),
-    ("resolved_provider", str), ("resolved_model", Optional[str]), ("resolved_base_url", Optional[str]),
-    ("resolved_api_key", Optional[str]), ("resolved_api_mode", Optional[str]),
-    ("final_model", Optional[str]), ("main_runtime", Optional[Dict[str, Any]]),
-    ("route_info", Optional[Dict[str, str]]),
-])
-
-
-def _ladder_parameter_rungs(
-    first_err: Exception, route: _LadderRoute, kwargs: Dict[str, Any], max_tokens: Optional[int],
-):
-    """Rungs 1-3: retry without temperature / structured-output format / max_tokens.
-    Returns ``(response, None, kwargs)`` or ``(None, narrowed_err, stripped_kwargs)``."""
-    client, task, tag = route.client, route.task, route.tag
-    if "temperature" in kwargs and _is_unsupported_parameter_error(first_err, "temperature"):
-        retry_kwargs = {k: v for k, v in kwargs.items() if k != "temperature"}
-        logger.info("Auxiliary %s%s: provider rejected temperature; retrying once without it",
-                    task or "call", tag)
-        resp, first_err = yield from _rung(
-            _LadderStep("call", (client, retry_kwargs)), _param_rung_accepts)
-        if first_err is None:
-            return resp, None, retry_kwargs
-        kwargs = retry_kwargs
-    if _is_structured_output_rejection(first_err):
-        retry_kwargs = _without_structured_output_format(kwargs)
-        if retry_kwargs is not None:
-            logger.info("Auxiliary %s%s: provider rejected the structured-output "
-                        "format field; retrying once without it (schema "
-                        "enforcement degrades to prompt compliance): %s", task or "call", tag, first_err)
-            resp, first_err = yield from _rung(
-                _LadderStep("call", (client, retry_kwargs)), _param_rung_accepts)
-            if first_err is None:
-                return resp, None, retry_kwargs
-            kwargs = retry_kwargs
-    err_str = str(first_err)
-    # ZAI vision models reject max_tokens with code 1210 and a message that never
-    # mentions "max_tokens", so detect it explicitly.
-    _is_zai_param_error = "1210" in err_str and "bigmodel" in str(getattr(client, "base_url", ""))
-    if max_tokens is not None and (
-        "max_tokens" in err_str or "unsupported_parameter" in err_str
-        or _is_unsupported_parameter_error(first_err, "max_tokens") or _is_zai_param_error
-    ):
-        kwargs.pop("max_tokens", None)
-        kwargs.pop("max_completion_tokens", None)
-        resp, first_err = yield from _rung(
-            _LadderStep("call", (client, kwargs)),
-            lambda exc: _is_payment_error(exc) or _is_connection_error(exc) or _is_rate_limit_error(exc),
-        )
-        if first_err is None:
-            return resp, None, kwargs
-    return None, first_err, kwargs
-
-
-def _refreshed_nous_step(route: _LadderRoute, kwargs: Dict[str, Any], message: str) -> Optional[_LadderStep]:
-    """Rebuild the Nous client after a credential event; None when nothing refreshed."""
-    refreshed_client, refreshed_model = _refresh_nous_auxiliary_client(
-        cache_provider=route.resolved_provider or "nous", model=route.final_model,
-        lookup_model=route.resolved_model, lookup_task=route.task, async_mode=route.async_mode,
-        base_url=route.resolved_base_url, api_key=route.resolved_api_key,
-        api_mode=route.resolved_api_mode, main_runtime=route.main_runtime,
-        is_vision=(route.task == "vision"),
-    )
-    if refreshed_client is None:
-        return None
-    logger.info(message, route.task or "call", route.tag)
-    if refreshed_model and refreshed_model != kwargs.get("model"):
-        kwargs["model"] = refreshed_model
-    return _LadderStep("call", (refreshed_client, kwargs))
-
-
-def _ladder_nous_rungs(
-    first_err: Exception, route: _LadderRoute, kwargs: Dict[str, Any], client_is_nous: bool,
-):
-    """Nous-only rungs: stale-model self-heal, paid-account refresh, 401 refresh.
-    Returns ``(response, None)`` or ``(None, first_err)`` to fall through."""
-    client, task, tag = route.client, route.task, route.tag
-    # A long-lived process can pin a Portal model since dropped from the catalog (every call
-    # 404s); force a fresh Portal fetch and retry once.
-    if _is_model_not_found_error(first_err) and client_is_nous:
-        healed_model = _refresh_nous_recommended_model(
-            vision=(task == "vision"), stale_model=kwargs.get("model"))
-        if healed_model and healed_model != kwargs.get("model"):
-            logger.warning("Auxiliary %s%s: model %r no longer in Nous catalog; "
-                           "retrying with refreshed recommendation %r",
-                           task or "call", tag, kwargs.get("model"), healed_model)
-            kwargs["model"] = healed_model
-            resp, first_err = yield from _rung(_LadderStep("call", (client, kwargs)), lambda exc: True)
-            if first_err is None:
-                return resp, None
-    # Auth refresh parity with the main agent.
-    if _is_payment_error(first_err) and client_is_nous and _nous_portal_account_has_fresh_paid_access():
-        step = _refreshed_nous_step(
-            route, kwargs,
-            "Auxiliary %s%s: refreshed Nous runtime credentials after paid account check, retrying")
-        if step is not None:
-            resp, first_err = yield from _rung(
-                step, lambda exc: _credential_rung_accepts(exc) or _is_connection_error(exc))
-            if first_err is None:
-                return resp, None
-    if _is_auth_error(first_err) and client_is_nous:
-        step = _refreshed_nous_step(
-            route, kwargs, "Auxiliary %s%s: refreshed Nous runtime credentials after 401, retrying")
-        if step is not None:
-            return (yield step), None
-    return None, first_err
-
-
-def _ladder_credential_rungs(
-    first_err: Exception, route: _LadderRoute, kwargs: Dict[str, Any], client_is_nous: bool,
-):
-    """OAuth credential refresh + same-provider retry, then credential-pool rotation.
-    Returns ``(response, None)`` or ``(None, first_err)`` to fall through."""
-    client, task, tag, resolved_provider = route.client, route.task, route.tag, route.resolved_provider
-    auth_refresh_provider = _auth_refresh_provider_for_route(resolved_provider, route.base_info)
-    if (_is_auth_error(first_err) and auth_refresh_provider not in {"auto", "", None}
-            and not client_is_nous):
-        refresh_kwargs = ({"failed_api_key": getattr(client, "api_key", "")}
-                          if auth_refresh_provider == "anthropic" else {})
-        if _refresh_provider_credentials(auth_refresh_provider, **refresh_kwargs):
-            if auth_refresh_provider != _normalize_aux_provider(resolved_provider):
-                # The stale client is cached under the route label (e.g. "auto"), not the
-                # concrete backend we refreshed.
-                _evict_cached_clients(resolved_provider)
-            logger.info("Auxiliary %s%s: refreshed %s credentials after auth error, retrying",
-                        task or "call", tag, auth_refresh_provider)
-            return (yield _LadderStep(
-                "retry_same_provider",
-                (auth_refresh_provider, route.resolved_model or route.final_model))), None
-    pool_provider = _recoverable_pool_provider(resolved_provider, client, main_runtime=route.main_runtime)
-    # Capture the exact key used so recovery finds the right pool entry even if another
-    # process rotated the pool meanwhile (current() would be None).
-    _client_api_key = str(getattr(client, "api_key", "") or "")
-    if pool_provider and _credential_rung_accepts(first_err):
-        recovery_err = first_err
-        # Skip the extra retry for clear payment/quota errors â€” the endpoint won't accept
-        # another request with the same exhausted key.
-        if _is_rate_limit_error(first_err) and not _is_payment_error(first_err):
-            resp, recovery_err = yield from _rung(
-                _LadderStep("call", (client, kwargs)), _credential_rung_accepts)
-            if recovery_err is None:
-                return resp, None
-        if _recover_provider_pool(pool_provider, recovery_err, failed_api_key=_client_api_key):
-            logger.info("Auxiliary %s%s: recovered %s via credential-pool rotation after %s",
-                        task or "call", tag, pool_provider, type(recovery_err).__name__)
-            try:
-                return (yield _LadderStep(
-                    "retry_same_provider", (resolved_provider, route.resolved_model))), None
-            except Exception as retry2_err:
-                # Rotated key also hit a wall: mark it now so concurrent processes skip it,
-                # then fall through to the provider fallback.
-                if (_is_payment_error(retry2_err) or _is_auth_error(retry2_err)
-                        or _is_rate_limit_error(retry2_err)):
-                    _recover_provider_pool(pool_provider, retry2_err)
-                    first_err = retry2_err
-                else:
-                    raise
-    return None, first_err
-
-
-def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
-    """Last rung: other providers (per-task chain; then auto: main fallback chain + discovery
-    chain, explicit: main-agent-model net). Returns the response or None.
-    Capacity errors (payment/quota, connection, exhausted 429, model incompatible, malformed
-    response) bypass the explicit-provider gate â€” the provider cannot serve this request
-    regardless of user intent. Auth errors only fall back in auto mode."""
-    task, tag, resolved_provider = route.task, route.tag, route.resolved_provider
-    # Respect explicit provider choice for transient errors (auth, request validation, etc.) but allow
-    # fallback when the provider clearly cannot serve the request due to capacity: payment/quota exhaustion
-    # and connection failures are capacity problems, not request constraints. See #26803: daily token quota
-    # (429 + "too many tokens per day") must fall back just like a 402 credit error.
-    # Rate limits are included: after retries are exhausted, a 429 means the provider is at capacity. See
-    # #52228. See #26803: daily token quota must fall back like a 402 credit error.
-    is_auto = resolved_provider in {"auto", "", None}
-    reason = next((label for predicate, label in _FALLBACK_REASONS if predicate(first_err)), None)
-    is_capacity_error = any(
-        predicate(first_err) for predicate, label in _FALLBACK_REASONS if label != "auth error")
-    if reason is None or not (is_auto or is_capacity_error):
-        return None
-    if reason == "payment error":
-        # Mark the concrete backend (not the "auto" label) unhealthy so later aux calls skip
-        # it instead of paying another doomed RTT.
-        _mark_provider_unhealthy(
-            _recoverable_pool_provider(resolved_provider, route.client, main_runtime=route.main_runtime)
-            or resolved_provider, base_url=route.base_info)
-    logger.info("Auxiliary %s%s: %s on %s (%s), trying fallback",
-                task or "call", tag, reason, resolved_provider, first_err)
-    # Skip only the failed model for model-specific failures; 401/402 are provider-wide, so
-    # auth keeps skipping the credential surface, while billing is scoped to the endpoint:
-    # separate custom URLs can carry separate credentials (or no billing relationship at all).
-    _chain_failed_model = None if reason in ("auth error", "payment error") else route.final_model
-    from agent.backend_identity import FailureScope
-    _chain_failure_scope = (
-        FailureScope.ENDPOINT
-        if reason == "payment error" and _custom_health_base_url(resolved_provider, route.base_info)
-        else None
-    )
-    fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-        task, resolved_provider or "auto", reason=reason, failed_model=_chain_failed_model,
-        failed_base_url=route.base_info, failure_scope=_chain_failure_scope)
-    if fb_client is None and is_auto:
-        fb_client, fb_model, fb_label = _try_main_fallback_chain(
-            task, resolved_provider or "auto", reason=reason, failed_model=_chain_failed_model,
-            failed_base_url=route.base_info, failure_scope=_chain_failure_scope)
-        if fb_client is None:
-            fb_client, fb_model, fb_label = _try_payment_fallback(
-                resolved_provider, task, reason=reason, failed_base_url=route.base_info,
-                failure_scope=_chain_failure_scope)
-    elif fb_client is None:
-        fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
-            resolved_provider, task, reason=reason, failed_model=_chain_failed_model,
-            failed_base_url=route.base_info, failure_scope=_chain_failure_scope)
-    if fb_client is not None:
-        # Second pass: the candidate credential was stale and quarantined â€” walk the discovery
-        # chain once more (unhealthy entries are skipped).
-        for _pass in range(2):
-            _record_route_info(route.route_info, _fallback_provider_from_label(fb_label), fb_model)
-            fb_resp = yield _LadderStep("fallback", (fb_client, fb_model, fb_label))
-            if fb_resp is not None:
-                return fb_resp
-            if _pass == 0:
-                fb_client, fb_model, fb_label = _try_payment_fallback(
-                    resolved_provider, task, reason="stale fallback credential",
-                    failed_base_url=route.base_info, failure_scope=_chain_failure_scope)
-                if fb_client is None:
-                    break
-    # All fallback layers exhausted â€” one user-visible warning, then re-raise.
-    logger.warning("Auxiliary %s%s: %s on %s and all fallbacks exhausted "
-                   # All fallback layers exhausted â€” emit a single user-visible warning so the operator
-                   # knows aux task is about to fail. (#26882) The error itself is re-raised below.
-                   # (#26882)
-                   "(fallback_chain + main agent model). Raising original error.",
-                   task or "call", tag, reason, resolved_provider)
-    return None
-
-
-def _aux_recovery_ladder(
-    first_err: Exception, *, client: Any, kwargs: Dict[str, Any], task: Optional[str],
-    async_mode: bool, base_info: str, resolved_provider: str, resolved_model: Optional[str],
-    resolved_base_url: Optional[str], resolved_api_key: Optional[str],
-    resolved_api_mode: Optional[str], final_model: Optional[str], max_tokens: Optional[int],
-    main_runtime: Optional[Dict[str, Any]], route_info: Optional[Dict[str, str]],
-):
-    """Ordered recovery rungs after the primary request failed (generator): parameter
-    strips â†’ Nous heal/refresh â†’ credential refresh/pool rotation â†’ provider fallback.
-    Each rung returns a response, narrows ``first_err`` and falls through, or re-raises.
-    Returns ``_RERAISE_ORIGINAL`` when exhausted (after evicting a connection-poisoned client)."""
-    tag = " (async)" if async_mode else ""
-    route = _LadderRoute(
-        client, task, tag, async_mode, base_info, resolved_provider, resolved_model,
-        resolved_base_url, resolved_api_key, resolved_api_mode, final_model, main_runtime, route_info)
-    resp, first_err, kwargs = yield from _ladder_parameter_rungs(first_err, route, kwargs, max_tokens)
-    if first_err is None:
-        return resp
-    client_is_nous = (resolved_provider == "nous"
-                      or base_url_host_matches(base_info, "inference-api.nousresearch.com"))
-    resp, first_err = yield from _ladder_nous_rungs(first_err, route, kwargs, client_is_nous)
-    if first_err is None:
-        return resp
-    resp, first_err = yield from _ladder_credential_rungs(first_err, route, kwargs, client_is_nous)
-    if first_err is None:
-        return resp
-    resp = yield from _ladder_provider_fallback(first_err, route)
-    if resp is not None:
-        return resp
-    # Connection/timeout errors poison the cached client (closed transport, half-read
-    # stream); evict so the next aux call rebuilds a fresh one.
-    # Drop it from the cache regardless of whether we found a fallback above so the next auxiliary call
-    # rebuilds a fresh client instead of reusing the dead one. See issue #23432.
-    # Mirror the sync path: drop poisoned clients on connection/timeout so the next aux call rebuilds. See
-    # issue #23432.
-    if _is_connection_error(first_err):
-        try:
-            _evict_cached_client_instance(client)
-        except Exception:
-            logger.debug("Auxiliary%s: cache eviction after connection error failed",
-                         tag, exc_info=True)
-    return _RERAISE_ORIGINAL
-
-
-def _drive_ladder(ladder, perform: Callable[[_LadderStep], Any]) -> Any:
-    """Run a ladder generator, feeding each step's result (or exception) back in."""
-    try:
-        step = next(ladder)
-        while True:
-            try:
-                result = perform(step)
-            except Exception as exc:
-                step = ladder.throw(exc)
-            else:
-                step = ladder.send(result)
-    except StopIteration as stop:
-        return stop.value
-
-
-async def _drive_ladder_async(ladder, perform: Callable[[_LadderStep], Any]) -> Any:
-    """Async twin of :func:`_drive_ladder` (``perform`` is awaited)."""
-    try:
-        step = next(ladder)
-        while True:
-            try:
-                result = await perform(step)
-            except Exception as exc:
-                step = ladder.throw(exc)
-            else:
-                step = ladder.send(result)
-    except StopIteration as stop:
-        return stop.value
-
-
-def _elapsed_ms(started_at: float, now: Optional[float] = None) -> int:
-    """Whole milliseconds since ``started_at`` (clamped at 0)."""
-    return max(0, int(((time.monotonic() if now is None else now) - started_at) * 1000))
-
-
-def _stamp_latency_once(latency_info: Optional[Dict[str, int]], key: str, started_at: float) -> None:
-    """Record ``key`` in ``latency_info`` the first time it fires."""
-    if latency_info is not None and key not in latency_info:
-        latency_info[key] = _elapsed_ms(started_at)
-
-
-@_relay_auxiliary_call
-def call_llm(
-    task: str = None, *, provider: str = None, model: str = None, base_url: str = None,
-    api_key: str = None, main_runtime: Optional[Dict[str, Any]] = None, messages: list,
-    temperature: Optional[float] = None, max_tokens: int = None, tools: list = None,
-    timeout: float = None, extra_body: dict = None, reasoning_config: Optional[dict] = None,
-    extra_headers: Optional[Dict[str, str]] = None, api_mode: str = None, stream: bool = False,
-    stream_options: dict = None, route_info: Optional[Dict[str, str]] = None,
-    latency_info: Optional[Dict[str, int]] = None,
-) -> Any:
-    """Run an auxiliary LLM request, applying the configured task limit."""
-    queue_started_at = time.monotonic()
-    semaphore = _acquire_sync_aux_semaphore(task)
-    if semaphore is not None:
-        semaphore.acquire()
-    request_started_at = time.monotonic()
-    if latency_info is not None:
-        latency_info["queue_wait_ms"] = _elapsed_ms(queue_started_at, request_started_at)
-    prior_progress_hook = getattr(_aux_progress, "hook", None)
-    try:
-        with (
-            aux_progress_hook(
-                prior_progress_hook
-                if callable(prior_progress_hook)
-                else ((lambda: None) if latency_info is not None else None)
-            ),
-            _aux_thread_local_hook(_aux_dispatch, functools.partial(
-                _stamp_latency_once, latency_info, "provider_dispatch_ms", request_started_at)),
-            _aux_thread_local_hook(_aux_provider_response, functools.partial(
-                _stamp_latency_once, latency_info, "time_to_first_progress_ms", request_started_at)),
-        ):
-            response = _call_llm_impl(
-                task=task, provider=provider, model=model, base_url=base_url, api_key=api_key,
-                main_runtime=main_runtime, messages=messages, temperature=temperature,
-                max_tokens=max_tokens, tools=tools, timeout=timeout, extra_body=extra_body,
-                reasoning_config=reasoning_config, extra_headers=extra_headers, api_mode=api_mode,
-                stream=stream, stream_options=stream_options, route_info=route_info,
-            )
-        if stream and semaphore is not None:
-            stream_semaphore = semaphore
-            semaphore = None
-            return _release_sync_semaphore_after_stream(response, stream_semaphore)
-        return response
-    finally:
-        if latency_info is not None:
-            latency_info["summary_generation_ms"] = _elapsed_ms(request_started_at)
-        if semaphore is not None:
-            semaphore.release()
-
-
-def _release_sync_semaphore_after_stream(stream: Any, semaphore: threading.BoundedSemaphore):
-    """Release a permit only after a streaming response is consumed or closed."""
-    try:
-        yield from stream
-    finally:
-        try:
-            close = getattr(stream, "close", None)
-            if callable(close):
-                close()
-        finally:
-            semaphore.release()
-
-
-def _plan_aux_call(
-    task: Optional[str], *, async_mode: bool, provider: Optional[str], model: Optional[str],
-    base_url: Optional[str], api_key: Optional[str], main_runtime: Optional[Dict[str, Any]],
-    messages: list, temperature: Optional[float], max_tokens: Optional[int], tools: Optional[list],
-    timeout: Optional[float], extra_body: Optional[dict], reasoning_config: Optional[dict],
-    extra_headers: Optional[Dict[str, str]], api_mode: Optional[str],
-    route_info: Optional[Dict[str, str]],
-) -> Tuple[_PreparedAuxRequest, Dict[str, Any], Dict[str, Any]]:
-    """Shared head of both call impls: prepare the request and bundle the kwargs the recovery
-    drivers pass to ``_retry_same_provider_*`` / ``_call_fallback_candidate_*``. One immutable
-    runtime snapshot for keying/resolution/retries/fallbacks, so a concurrent /model switch
-    can't mix key and client from different runtimes."""
-    main_runtime = _normalize_main_runtime(main_runtime)
-    req = _prepare_aux_request(
-        task, provider=provider, model=model, base_url=base_url, api_key=api_key,
-        main_runtime=main_runtime, messages=messages, temperature=temperature,
-        max_tokens=max_tokens, tools=tools, timeout=timeout, extra_body=extra_body,
-        reasoning_config=reasoning_config, extra_headers=extra_headers,
-        api_mode=api_mode, route_info=route_info, async_mode=async_mode,
-    )
-    candidate_kwargs = dict(
-        task=task, messages=messages, temperature=temperature, max_tokens=max_tokens,
-        tools=tools, effective_timeout=req.effective_timeout,
-        effective_extra_body=req.effective_extra_body, reasoning_config=reasoning_config,
-    )
-    retry_kwargs = dict(
-        candidate_kwargs, resolved_base_url=req.resolved_base_url,
-        resolved_api_key=req.resolved_api_key, resolved_api_mode=req.resolved_api_mode,
-        main_runtime=main_runtime, final_model=req.final_model, extra_headers=extra_headers,
-    )
-    return req, retry_kwargs, candidate_kwargs
-
-
-def _should_retry_same_provider(task: Optional[str], exc: Exception, tag: str) -> bool:
-    """True when ``exc`` is a transient transport blip worth a same-provider retry; critical-path
-    tasks skip it on a full-budget timeout (``_should_skip_same_provider_retry``) and go straight
-    to fallback."""
-    if not _is_transient_transport_error(exc):
-        return False
-    if _should_skip_same_provider_retry(task, exc):
-        logger.info("Auxiliary %s%s: timeout on the critical path; "
-                    "skipping same-provider retry and falling back: %s", task, tag, exc)
-        return False
-    return True
-
-
-def _ladder_step_call(
-    step: _LadderStep, req: _PreparedAuxRequest, retry_kwargs: Dict[str, Any], candidate_kwargs: Dict[str, Any],
-) -> Tuple[str, tuple, Dict[str, Any]]:
-    """Resolve a ladder step into ``(kind, args, kwargs)`` for the sync/async performer."""
-    if step.kind == "call":
-        return "call", step.args, dict(provider=req.resolved_provider, api_mode=req.resolved_api_mode)
-    if step.kind == "retry_same_provider":
-        retry_provider, retry_model = step.args
-        return "retry", (), dict(retry_kwargs, resolved_provider=retry_provider, resolved_model=retry_model)
-    return "fallback", step.args, candidate_kwargs
-
-
-def _start_recovery_ladder(
-    first_err: Exception, req: _PreparedAuxRequest, retry_kwargs: Dict[str, Any], *,
-    task: Optional[str], async_mode: bool, route_info: Optional[Dict[str, str]],
-):
-    """Build the recovery-ladder generator for a failed primary request."""
-    return _aux_recovery_ladder(
-        first_err, client=req.client, kwargs=req.kwargs, task=task, async_mode=async_mode,
-        base_info=req.base_info, resolved_provider=req.resolved_provider,
-        resolved_model=req.resolved_model, resolved_base_url=req.resolved_base_url,
-        resolved_api_key=req.resolved_api_key, resolved_api_mode=req.resolved_api_mode,
-        final_model=req.final_model, max_tokens=retry_kwargs["max_tokens"],
-        main_runtime=retry_kwargs["main_runtime"], route_info=route_info)
-
-
-def _call_llm_impl(
-    task: str = None, *, provider: str = None, model: str = None, base_url: str = None,
-    api_key: str = None, main_runtime: Optional[Dict[str, Any]] = None, messages: list,
-    temperature: Optional[float] = None, max_tokens: int = None, tools: list = None,
-    timeout: float = None, extra_body: dict = None, reasoning_config: Optional[dict] = None,
-    extra_headers: Optional[Dict[str, str]] = None, api_mode: str = None, stream: bool = False,
-    stream_options: dict = None, route_info: Optional[Dict[str, str]] = None,
-) -> Any:
-    """Centralized synchronous LLM call: resolve provider/model, auth, kwargs, fallbacks.
-    task: aux task whose provider:model comes from config (ignored if provider set); api_mode
-    overrides task config; timeout=None reads auxiliary.{task}.timeout; extra_headers override
-    client defaults. stream=True returns the raw SDK stream (caller consumes/falls back)
-    instead of a validated response. RuntimeError if no provider is configured."""
-    req, retry_kwargs, candidate_kwargs = _plan_aux_call(
-        task, async_mode=False, provider=provider, model=model, base_url=base_url,
-        api_key=api_key, main_runtime=main_runtime, messages=messages,
-        temperature=temperature, max_tokens=max_tokens, tools=tools, timeout=timeout,
-        extra_body=extra_body, reasoning_config=reasoning_config,
-        extra_headers=extra_headers, api_mode=api_mode, route_info=route_info,
-    )
-    client, kwargs, request_provider = req.client, req.kwargs, req.request_provider
-    # Streaming path (MoA aggregator): return the raw SDK stream, skipping validation and
-    # the fallback chain (they assume a complete response); the caller owns reassembly/fallback.
-    if stream:
-        kwargs["stream"] = True
-        if stream_options:
-            kwargs["stream_options"] = stream_options
-        if task == "moa_aggregator" and isinstance(client, CodexAuxiliaryClient):
-            # Responses-shim clients consume the stream internally and return a completed
-            # object Relay's managed stream would iterate; the MoA facade wraps it as one chunk.
-            return client.chat.completions.create(**kwargs)
-        return _relay_sync_stream(client, kwargs, provider=request_provider, api_mode=req.resolved_api_mode)
-
-    def _primary(**validate_kw: Any) -> Any:
-        # Retry on the same provider for a transient transport blip (connection reset / streaming-close /
-        # incomplete chunked read / 5xx / 408) before the except-chain below escalates to provider/model
-        # fallback. A dropped connection shouldn't abandon an otherwise-healthy provider â€” this especially
-        # matters for pinned auxiliary calls like MoA reference advisors, where "fallback to another
-        # provider" is not a meaningful recovery (the advisor is a specific model), so a transient blip that
-        # isn't retried simply loses that advisor for the turn (root of the run2 double-advisor "Connection
-        # error" collapse â€” a genuine upstream blip hitting both parallel advisors at once). Attempts are
-        # bounded and use exponential backoff. Count is configurable via auxiliary.transient_retries
-        # (default 2 retries â†’ 3 total attempts); a second/third failure or any non-transient error falls
-        # through to ``first_err`` and the existing fallback handling unchanged. Unified home for the
-        # transient retry every auxiliary task shares. (PR #16587)
-        return _validate_llm_response(
-            _relay_sync_completion(
-                client, kwargs, provider=request_provider, api_mode=req.resolved_api_mode,
-                create=lambda request: _create_with_progress(
-                    client, request, task,
-                    force_stream=_provider_requires_stream(
-                        request_provider, req.base_info or req.resolved_base_url),
-                ),
-            ),
-            task, **validate_kw,
-        )
-    try:
-        # Bounded same-provider retry (exponential backoff, auxiliary.transient_retries) for
-        # transient blips before escalating to fallback â€” a dropped connection shouldn't
-        # abandon a healthy provider (matters for pinned MoA advisors).
-        try:
-            return _primary(provider=request_provider, base_url=req.base_info)
-        except Exception as transient_err:
-            if not _should_retry_same_provider(task, transient_err, ""):
-                raise
-            _max_transient_retries = _transient_retry_count()
-            _last_transient = transient_err
-            for _attempt in range(1, _max_transient_retries + 1):
-                _backoff = min(_TRANSIENT_RETRY_BACKOFF_BASE * (2.0 ** (_attempt - 1)), 8.0)
-                logger.info("Auxiliary %s: transient transport error (attempt %d/%d); "
-                            "retrying same provider after %.1fs before fallback: %s",
-                            task or "call", _attempt, _max_transient_retries, _backoff, _last_transient)
-                time.sleep(_backoff)
-                try:
-                    return _primary()
-                except Exception as retry_transient:
-                    if not _is_transient_transport_error(retry_transient):
-                        raise
-                    _last_transient = retry_transient
-            raise _last_transient
-    except Exception as first_err:
-        def _perform(step: _LadderStep) -> Any:
-            kind, args, kw = _ladder_step_call(step, req, retry_kwargs, candidate_kwargs)
-            if kind == "call":
-                return _validate_llm_response(_relay_sync_completion(*args, **kw), task)
-            if kind == "retry":
-                return _retry_same_provider_sync(**kw)
-            return _call_fallback_candidate_sync(*args, **kw)
-        result = _drive_ladder(
-            _start_recovery_ladder(first_err, req, retry_kwargs, task=task, async_mode=False, route_info=route_info),
-            _perform)
-        if result is _RERAISE_ORIGINAL:
-            raise
-        return result
-
-
-def _coerce_llm_message(response):
-    """Pull a message (dict, object, or str) out of a response-or-message value: dict-shaped
-    responses/bare messages (compression, proxies) and ChatCompletion objects; MagicMock
-    ``reasoning_*`` attrs are deliberately not strings."""
-    if response is None or isinstance(response, str):
-        return response
-    if isinstance(response, dict):
-        if "choices" not in response:
-            return response
-        choices = response.get("choices") or []
-    else:
-        choices = getattr(response, "choices", None)
-        if not choices:
-            return response
-    return _message_field(choices[0], "message") if choices else None
-
-
-def _message_field(msg, name):
-    return msg.get(name) if isinstance(msg, dict) else getattr(msg, name, None)
-
-
-def extract_content_or_reasoning(response, *, max_reasoning_chars: int | None = None) -> str:
-    """Extract content from an LLM response, falling back to reasoning fields.
-    Order: ``content`` (inline think blocks stripped) â†’ ``reasoning``/``reasoning_content`` â†’
-    ``reasoning_details`` (OpenRouter array). Accepts a response or bare message;
-    ``max_reasoning_chars`` bounds a reasoning fallback so unbounded chain-of-thought can't
-    become the compaction summary. Returns ``""`` if nothing found."""
-    msg = _coerce_llm_message(response)
-    if msg is None:
-        return ""
-    if isinstance(msg, str):
-        return msg.strip()
-    raw = _message_field(msg, "content")
-    if not isinstance(raw, str):
-        raw = str(raw) if raw else ""
-    content = raw.strip()
-    if content:
-        # Mirrors _strip_think_blocks
-        cleaned = re.sub(
-            r"<(?:think|thinking|reasoning|thought|REASONING_SCRATCHPAD)>"
-            r".*?"
-            r"</(?:think|thinking|reasoning|thought|REASONING_SCRATCHPAD)>",
-            "", content, flags=re.DOTALL | re.IGNORECASE,
-        ).strip()
-        if cleaned:
-            return cleaned
-    # Content is empty or reasoning-only â€” try structured reasoning fields
-    reasoning_parts: list[str] = []
-    for field in ("reasoning", "reasoning_content"):
-        val = _message_field(msg, field)
-        if val and isinstance(val, str) and val.strip() and val not in reasoning_parts:
-            reasoning_parts.append(val.strip())
-    details = _message_field(msg, "reasoning_details")
-    if details and isinstance(details, list):
-        for detail in details:
-            if isinstance(detail, dict):
-                summary = detail.get("summary") or detail.get("content") or detail.get("text")
-                if summary and summary not in reasoning_parts:
-                    reasoning_parts.append(summary.strip() if isinstance(summary, str) else str(summary))
-    if not reasoning_parts:
-        return ""
-    text = "\n\n".join(reasoning_parts)
-    if max_reasoning_chars is not None and len(text) > max_reasoning_chars:
-        logger.warning("fell back to reasoning fields (%d chars); truncating to %d",
-                       len(text), max_reasoning_chars)
-        return text[:max_reasoning_chars]
-    return text
-
-
-@_relay_auxiliary_call_async
-async def async_call_llm(
-    task: str = None, *, provider: str = None, model: str = None, base_url: str = None,
-    api_key: str = None, main_runtime: Optional[Dict[str, Any]] = None, messages: list,
-    temperature: Optional[float] = None, max_tokens: int = None, tools: list = None,
-    timeout: float = None, extra_body: dict = None, reasoning_config: Optional[dict] = None,
-    route_info: Optional[Dict[str, str]] = None,
-) -> Any:
-    """Run an asynchronous auxiliary LLM request under the configured limit."""
-    semaphore = _acquire_async_aux_semaphore(task)
-    if semaphore is not None:
-        await semaphore.acquire()
-    try:
-        return await _async_call_llm_impl(
-            task=task, provider=provider, model=model, base_url=base_url, api_key=api_key,
-            main_runtime=main_runtime, messages=messages, temperature=temperature,
-            max_tokens=max_tokens, tools=tools, timeout=timeout, extra_body=extra_body,
-            reasoning_config=reasoning_config, route_info=route_info,
-        )
-    finally:
-        if semaphore is not None:
-            semaphore.release()
-
-
-async def _async_call_llm_impl(
-    task: str = None, *, provider: str = None, model: str = None, base_url: str = None,
-    api_key: str = None, main_runtime: Optional[Dict[str, Any]] = None, messages: list,
-    temperature: Optional[float] = None, max_tokens: int = None, tools: list = None,
-    timeout: float = None, extra_body: dict = None, reasoning_config: Optional[dict] = None,
-    route_info: Optional[Dict[str, str]] = None,
-) -> Any:
-    """Centralized asynchronous LLM call; see call_llm() for full documentation.
-    No per-request header / api_mode override on the async entry point."""
-    req, retry_kwargs, candidate_kwargs = _plan_aux_call(
-        task, async_mode=True, provider=provider, model=model, base_url=base_url,
-        api_key=api_key, main_runtime=main_runtime, messages=messages,
-        temperature=temperature, max_tokens=max_tokens, tools=tools, timeout=timeout,
-        extra_body=extra_body, reasoning_config=reasoning_config,
-        extra_headers=None, api_mode=None, route_info=route_info,
-    )
-    client, kwargs, request_provider = req.client, req.kwargs, req.request_provider
-    try:
-        # Retry ONCE on the same provider for a transient blip before fallback (see call_llm()).
-        # (PR #16587)
-        _force_stream_async = (
-            _provider_requires_stream(request_provider, req.base_info or req.resolved_base_url)
-            and not isinstance(client, (
-                AsyncCodexAuxiliaryClient, AsyncAnthropicAuxiliaryClient, AsyncBedrockAuxiliaryClient)))
-
-        async def _acreate(_kwargs: Dict[str, Any]) -> Any:
-            if _force_stream_async:
-                return await _acreate_with_stream(client, _kwargs, task)
-            return await client.chat.completions.create(**_kwargs)
-
-        async def _primary(**validate_kw: Any) -> Any:
-            return _validate_llm_response(
-                await _relay_async_completion(
-                    client, kwargs, provider=request_provider, api_mode=req.resolved_api_mode,
-                    create=_acreate),
-                task, **validate_kw)
-        try:
-            return await _primary(provider=request_provider, base_url=req.base_info)
-        except Exception as transient_err:
-            # The async Codex adapter wraps the sync stream via to_thread: same TimeoutError here.
-            if not _should_retry_same_provider(task, transient_err, " (async)"):
-                raise
-            logger.info("Auxiliary %s (async): transient transport error; retrying "
-                        "once on the same provider before fallback: %s", task or "call", transient_err)
-            return await _primary()
-    except Exception as first_err:
-        async def _perform(step: _LadderStep) -> Any:
-            kind, args, kw = _ladder_step_call(step, req, retry_kwargs, candidate_kwargs)
-            if kind == "call":
-                return _validate_llm_response(await _relay_async_completion(*args, **kw), task)
-            if kind == "retry":
-                return await _retry_same_provider_async(**kw)
-            fb_client, fb_model, fb_label = args
-            fb_client, _ = _to_async_client(fb_client, fb_model or "", is_vision=(task == "vision"))
-            return await _call_fallback_candidate_async(fb_client, fb_model, fb_label, **kw)
-        result = await _drive_ladder_async(
-            _start_recovery_ladder(first_err, req, retry_kwargs, task=task, async_mode=True, route_info=route_info),
-            _perform)
-        if result is _RERAISE_ORIGINAL:
-            raise
-        return result
-
-
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
-from pathlib import Path  # noqa: F401,E402
-import copy  # noqa: F401,E402
-
-NOUS_EXTRA_BODY = _nous_extra_body()
-
-def get_async_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Dict[str, Any]] = None):
-    """Return (async_client, model_slug) for async consumers.
-
-    For standard providers returns (AsyncOpenAI, model). For Codex returns
-    (AsyncCodexAuxiliaryClient, model) which wraps the Responses API.
-    Returns (None, None) when no provider is available.
-    """
-    provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task or None)
-    return resolve_provider_client(
-        provider,
-        model=model,
-        async_mode=True,
-        explicit_base_url=base_url,
-        explicit_api_key=api_key,
-        api_mode=api_mode,
-        main_runtime=main_runtime,
-    )
-# ---- END PLUGIN-COMPAT ----
+YªçŠx-®éÜj×¢ëiºÚ+Š§j[h‘éÜ¢éí×nôã¤èµ©hºÚn¶X§zÍHˆˆ”Ú\™Y]^[X\žHÛY[›Ý]\ˆ›ÜˆÚYH\ÚÜÈ
+ÛÛ\™\ÜÚ[Û‹ÙX\˜Úš\Ú[Û‹‹‹ŠK‚‚•^]]ÈÚZ[ŽˆXZ[ˆ›ÝšY\ŠÛ[Ù[8¡¤ˆÜ[”›Ý]\ˆ8¡¤ˆ›Ý\ÈÜ[8¡¤ˆÝ\ÝÛH[™Ú[8¡¤‚›˜]]™H[›ÜXÈ8¡¤ˆ\™XÝTKZÙ^H›ÝšY\œÈ8¡¤ˆ›Û™Kˆš\Ú[Ûˆ]]ÈÚZ[ŽˆXZ[‚œ›ÝšY\ˆ
+YˆHÝ\ÜYš\Ú[Ûˆ˜XÚÙ[™
+H8¡¤ˆÜ[”›Ý]\ˆ8¡¤ˆ›Ý\È8¡¤ˆ[›ÜXÈ8¡¤ˆÝ\ÝÛK‚˜]^[X\žK™œ™YWÛÛ›X™\ÝšXÝÈHÜ[”›Ý]\ˆ[™HÈ™œ™YXÒÕ\ËˆÛÙ^Ð]]\Âš[ˆ™Z]\ˆÚZ[ˆ
+[™ØÝ[Y[YÚY[™È[ÝË[\Ý
+NˆXZ[ˆ›ÝšY\ˆÜˆ^XÚ]˜]^[X\žK\ÚÏ‹œ›ÝšY\˜Û›Kˆˆ[ˆØ[ÛJ
+H˜[È›ÝYÚHÚZ[‹‚ˆˆˆ‚‚š[\ÜÛÛ^X‚š[\ÜÛÛ^˜\œÂš[\Ü[˜ÝÛÛÂš[\Ü\ÚX‚š[\Ü[œÜXÝš[\ÜœÛÛ‚š[\ÜÙÙÚ[™Âš[\ÜÜÂš[\Ü™Bš[\Ü™XY[™Âš[\Ü[YBš[\Ü]ZY™œ›ÛH\\È[\ÜÚ[\S˜[Y\ÜXÙB™œ›ÛH\[™È[\Ü[žKØ[X›KXÝ\Ý˜[YY\KÜ[Û˜[\KTWÐÒPÒÒS‘Â™œ›ÛH\›X‹œ\œÙH[\Ü\›\œÙK\œÙWÜ\Ë\›[œ\œÙB‚™œ›ÛHYÙ[˜ÛÙ^ÚXY\œÈ[\Ü
+ˆÓÑVÐUVÐTÑWÕT“\ÈÐÓÑVÐUVÐTÑWÕT“ˆ\WÜ™\]Z\™YØÛÙ^ÚXY\œÈ\ÈØ\WÜ™\]Z\™YØÛÙ^ÚXY\œËˆÛÙ^ØÛÝY›\™WÚXY\œÈ\ÈØÛÙ^ØÛÝY›\™WÚXY\œËˆ\×ÛÙ™šXÚX[ØÛÙ^Ø˜\ÙWÝ\›\ÈÚ\×ÛÙ™šXÚX[ØÛÙ^Ø˜\ÙWÝ\›ŠB™œ›ÛHYÙ[˜ÛÙ^Ü[[YH[\ÜØÛÙ^Ù]™[Ú\×ØÛÛ[‚ˆÈÜ[˜ZK“Ü[RX\È[\ÜY^š[H
+Œ\ÈÛÛ
+NÈÜ[RX™[ÝÈ\ÈH›ÞBˆÈÛÈ[‹[[Ù[HØ[Ë]^[X\žWØÛY[“Ü[RX™XYÈ[™ˆÈ]Ú
+˜YÙ[˜]^[X\žWØÛY[“Ü[RHŠX[ÙY\ÛÜšÚ[™Ë‚šYˆTWÐÒPÒÒS‘Î‚ˆœ›ÛHÜ[˜ZH[\ÜÜ[RHÈ›ÜXNˆH8 %\H[ÈÛ›B‚—ÓÔSRWÐÓ×ÐÐPÒNˆÜ[Û˜[Ý\WHH›Û™B‚‚™YˆÛØYÛÜ[˜ZWØÛÊ
+HOˆ\N‚ˆˆˆ’[\Ü[™ØXÚHÜ[˜ZK“Ü[RXˆˆˆ‚ˆÛØ˜[ÓÔSRWÐÓ×ÐÐPÒBˆYˆÓÔSRWÐÓ×ÐÐPÒH\È›Û™N‚ˆœ›ÛHÜ[˜ZH[\ÜÜ[RH\ÈØÛÂˆÓÔSRWÐÓ×ÐÐPÒHHØÛÂˆ™]\›ˆÓÔSRWÐÓ×ÐÐPÒB‚‚˜Û\ÜÈÓÜ[RT›ÞN‚ˆˆˆ“^žHÝ[™Z[ˆ›ÜˆÜ[˜ZK“Ü[RXˆ›ÜØ\™ÈØ[È[™\Ú[œÝ[˜ÙHÚXÚÜË[\Ü[™ÈÛˆš\œÝ\ÙKˆˆˆ‚ˆ×ÜÛÝ××ÈH
+
+B‚ˆYˆ×ØØ[×ÊÙ[‹
+˜\™ÜË
+ŠšÝØ\™ÜÊN‚ˆ™]\›ˆÛØYÛÜ[˜ZWØÛÊ
+J
+˜\™ÜË
+ŠšÝØ\™ÜÊB‚ˆYˆ×Ú[œÝ[˜ÙXÚXÚ××ÊÙ[‹ØšŠN‚ˆ™]\›ˆ\Ú[œÝ[˜ÙJØš‹ÛØYÛÜ[˜ZWØÛÊ
+JB‚ˆYˆ×Ü™\—×ÊÙ[ŠN‚ˆ™]\›ˆ^žHÜ[˜ZK“Ü[RH›ÞOˆ‚‚‚“Ü[RHHÓÜ[RT›ÞJ
+B‚‚ˆÈ]˜Z[Xš[]H›Ø™H[ÙNˆÚXÚ×Ù›œÈÛ›H™YYÈÛ›ÝÈÚ]\ˆHÛY[\È‘TÓÓP“KÛÂˆÈ[œÚYH]^Ü›Ø™WÛ[ÙJ
+XÛÛœÝXÝÜœÈ™]\›ˆHÝXˆ[œÝXYÙˆ[\Ü[™ÈÜ[˜ZH
+ÈZ[[™ÂˆÈÔÔÓ
+ŒŒÜÈÛˆÓHÝ\\
+KˆÝXœÈ\™H™]™\ˆØXÚY
+ÙYHÜÝÜ™WØØXÚYØÛY[
+K‚—Ø]^Ü›Ø™WÜÝ]HH™XY[™Ë›ØØ[
+
+B‚‚˜Û\ÜÈÐ]^›Ø™PÛY[ÝXŽ‚ˆˆˆ“›Û‹Y[˜Ý[Û˜[XÙZÛ\ˆ™]\›™YÚ[H]^Ü›Ø™WÛ[ÙX\ÈXÝ]™Kˆˆˆ‚ˆ×ÜÛÝ××ÈH
+˜\WÚÙ^H‹˜˜\ÙWÝ\›ŠB‚ˆYˆ×Ú[š]×ÊÙ[‹\WÚÙ^NˆÝˆHˆ‹˜\ÙWÝ\›ˆÝˆHˆŠHOˆ›Û™N‚ˆÙ[‹˜\WÚÙ^HH\WÚÙ^BˆÙ[‹˜˜\ÙWÝ\›H˜\ÙWÝ\›‚ˆYˆ×ÙÙ]]—×ÊÙ[‹˜[YNˆÝŠHOˆ[žN‚ˆÈÝY˜Z[\™HYˆH›Ø™HÝXˆ]™\ˆXZÜÈ[ÈH[[YHØ[]‚ˆ˜Z\ÙH[[YQ\œ›ÜŠˆˆ—Ð]^›Ø™PÛY[ÝXˆ\ÙY\ÈH™X[ÛY[
+]šX]HÛ˜[YH\ŸJNÈ‚ˆ˜]^Ü›Ø™WÛ[ÙH\È›Üˆ]˜Z[Xš[]HÚXÚÜÈÛ›HŠB‚ˆYˆ×Ü™\—×ÊÙ[ŠHOˆÝŽ‚ˆ™]\›ˆ]^]˜Z[Xš[]K\›Ø™HÛY[ÝXˆ‚‚‚™YˆØ]^Ü›Ø™WØXÝ]™J
+HOˆ›ÛÛ‚ˆ™]\›ˆ›ÛÛ
+Ù]]ŠØ]^Ü›Ø™WÜÝ]K˜XÝ]™H‹˜[ÙJJB‚‚ÛÛ^X‹˜ÛÛ^X[˜YÙ\‚™Yˆ]^Ü›Ø™WÛ[ÙJ
+N‚ˆˆˆ”™\ÛÛ™H›ÝšY\ˆ]˜Z[Xš[]HÚ]Ý]ÛÛœÝXÝ[™È™X[ÑÈÛY[Ëˆˆˆ‚ˆ™]ˆHÙ]]ŠØ]^Ü›Ø™WÜÝ]K˜XÝ]™H‹˜[ÙJBˆØ]^Ü›Ø™WÜÝ]K˜XÝ]™HHYBˆžN‚ˆZY[ˆš[˜[N‚ˆØ]^Ü›Ø™WÜÝ]K˜XÝ]™HH™]‚‚‚™œ›ÛHYÙ[˜Ü™Y[X[ÜÛÛ[\ÜØYÜÛÛ™œ›ÛHYÙ[›[Ù[ÛY]Y]H[\Ü
+ˆRS’SUSWÐÓÓ•VÓS‘ÕÙ]Û[Ù[ØÛÛ^Û[™ÝˆÝš\ØÛÙ^ØÛÛ^Ý˜\šX[ÜÝY™š^\ÈÜÝš\ØÛÙ^ØÝÝ˜\šX[ŠB™œ›ÛH\›Y\×ØÛK˜ÛÛ™šYÈ[\ÜÙ]Ú\›Y\×ÚÛYB™œ›ÛHYÙ[˜]^[X\žWÚX[[\ÜØÝ\ÝÛWÚX[Ø˜\ÙWÝ\›Ý[šX[WØØXÚWÚÙ^B™œ›ÛH\›Y\×ØÛÛœÝ[È[\ÜÔS”“ÕUT—ÐTÑWÕT“™œ›ÛH][È[\Ü˜\ÙWÝ\›ÚÜÝÛX]Ú\Ë˜\ÙWÝ\›ÚÜÝ˜[YK[—Ù›Ø]\×Ý]WÝ˜[YK[Ù[Ù›Ü˜Ù\×ÛX^ØÛÛ\][Û—ÝÚÙ[œË›Ü›X[^™WÜ›ÞWÙ[—Ý˜\œÂ‚›ÙÙÙ\ˆHÙÙÚ[™Ë™Ù]ÙÙÙ\Š×Û˜[YW×ÊB‚‚ˆÈ™\ÛÛ™WÜ›ÝšY\—ØÛY[˜[]›ÝYÚY\ˆZ\ØÛÛ™šYÝ\™Y\›ÝšY\ˆØ\›š[™ÜÈš\™HÛˆ]™\žBˆÈ™]žKÛÈÛ›HHš\œÝ\ˆ›ØÙ\ÜÈÝ\™˜XÙ\ËˆÙ\\˜]HÙ]È]\ÝÈÛX\ˆXXÚœ˜[˜Ú‚—ÓÑÑÑQÕS’Ó“ÕÓ—Ô“Õ’QT—ÒÑVTÎˆÙ]HÙ]
+
+B—ÓÑÑÑQÕS’S‘QÐUUTWÒÑVTÎˆÙ]HÙ]
+
+B—ÓÑÑÑQÕS”ÕTÔ•QÑV“Ð×ÒÑVTÎˆÙ]HÙ]
+
+B—ÓÑÑÑQÕS”ÕTÔ•QÓÐUUÒÑVTÎˆÙ]HÙ]
+
+B‚‚™YˆÜ™\ÛÛ™WØ]^Ý™\šYžJ˜\ÙWÝ\›ˆÜ[Û˜[ÜÝ—JHOˆ[žN‚ˆˆˆš™\šYžX›Üˆ[ˆ]^˜\ÙWÝ\›Z\œ›Üš[™ÈHXZ[ˆÛY[
+\‹\›ÝšY\ˆÜÛØØWØÙ\ÂˆÜÛÝ™\šYžXT“QT×ÐÐWÐ•S‘XÈÔÓÐÑT•Ñ’SX
+NÈ[žH˜Z[\™H8¡¤ˆY˜][
+YX
+Kˆˆˆ‚ˆžN‚ˆœ›ÛHYÙ[œÜÛÝ™\šYžH[\Ü™\ÛÛ™WÚÝ™\šYžBˆœ›ÛH\›Y\×ØÛK˜ÛÛ™šYÈ[\ÜÙ]ØÝ\ÝÛWÜ›ÝšY\—Ý×ÜÙ][™ÜËØYØÛÛ™šY×Ü™XYÛ›BˆÈHÙ]ØÝ\ÝÛWÜ›ÝšY\—Ý×ÜÙ][™ÜÊÝŠ˜\ÙWÝ\›ÜˆˆŠKÛÛ™šYÏ[ØYØÛÛ™šY×Ü™XYÛ›J
+JBˆ™]\›ˆ™\ÛÛ™WÚÝ™\šYžJˆØWØ[™O]Ë™Ù]
+œÜÛØØWØÙ\ŠKÜÛÝ™\šYžO]Ë™Ù]
+œÜÛÝ™\šYžHŠK˜\ÙWÝ\›\ÝŠ˜\ÙWÝ\›ÜˆˆŠJBˆ^Ù\^Ù\[ÛŽ‚ˆ™]\›ˆYB‚‚—ÕÐT“‘QÒÑQTSU‘WÒSTÔ•ÔÒÑUÈH˜[ÙB‚‚™YˆÛÜ[˜ZWÚØÛY[ÚÝØ\™ÜÊ˜\ÙWÝ\›ˆÜ[Û˜[ÜÝ—K
+‹\Þ[˜×Û[ÙNˆ›ÛÛH˜[ÙJHOˆXÝÜÝ‹[žWN‚ˆˆˆ’[š™XÝÙY\[]™HÛY[Ú][‹[Û›H›ÞH
+›ÝXXÓÔÈÞ\Ý[H›ÞJKˆˆˆ‚ˆžN‚ˆœ›ÛHYÙ[œ›ØÙ\Ü×Ø›ÛÝÝ˜\[\ÜZ[ÚÙY\[]™WÚØÛY[ˆÛY[HZ[ÚÙY\[]™WÚØÛY[
+ˆÝŠ˜\ÙWÝ\›ÜˆˆŠK\Þ[˜×Û[ÙOX\Þ[˜×Û[ÙK™\šYžOWÜ™\ÛÛ™WØ]^Ý™\šYžJ˜\ÙWÝ\›
+JBˆ^Ù\
+[\Ü\œ›Ü‹]šX]Q\œ›ÜŠN‚ˆÈ™\œÚ[Û‹\ÚÙ]ÙY[œÝ[
+\ÚÝÜ[[YHYÙÚ[™ÈHÚ]™YJHXÚÜÈ\È[\Ž‚ˆÈYÜ˜YHÈHÑÈY˜][ÛY[˜]\ˆ[ˆÚ[H›ØŽÈØ\›ˆÛ˜ÙK‚ˆÛØ˜[ÕÐT“‘QÒÑQTSU‘WÒSTÔ•ÔÒÑUÂˆYˆ›ÝÕÐT“‘QÒÑQTSU‘WÒSTÔ•ÔÒÑUÎ‚ˆÕÐT“‘QÒÑQTSU‘WÒSTÔ•ÔÒÑUÈHYBˆÙÙÙ\‹Ø\›š[™Êˆ˜YÙ[œ›ØÙ\Ü×Ø›ÛÝÝ˜\˜Z[ÚÙY\[]™WÚØÛY[\È‚ˆ[˜]˜Z[X›H8 %Z^YÜÝ[H[œÝ[]XÝY
+ÍÌÌÊKˆ˜[[™È‚ˆ˜˜XÚÈÈHÑÈY˜][ÛY[ˆ[ˆ\›Y\È\]X
+Üˆ‚ˆœ™Z[œÝ[H\ÚÝÜ\
+HÈ™\Þ[˜ÈH[[YKˆŠBˆÛY[H›Û™Bˆ™]\›ˆÈšØÛY[ŽˆÛY[HYˆÛY[\È›Ý›Û™H[ÙHßB‚‚™YˆØÜ™X]WÛÜ[˜ZWØÛY[
+
+‹\WÚÙ^NˆÝ‹˜\ÙWÝ\›ˆÝ‹
+ŠšÝØ\™ÜÎˆ[žJHOˆ[žN‚ˆYˆØ]^Ü›Ø™WØXÝ]™J
+N‚ˆÈ]˜Z[Xš[]H›Ø™Nˆ™\ÛÛ™YÜ™Y[X[ËØ˜\ÙWÝ\›\™HH[œÝÙ\‹‚ˆ™]\›ˆÐ]^›Ø™PÛY[ÝXŠ\WÚÙ^OX\WÚÙ^K˜\ÙWÝ\›X˜\ÙWÝ\›
+BˆÝØ\™ÜÈHÊŠ—ÛÜ[˜ZWÚØÛY[ÚÝØ\™ÜÊ˜\ÙWÝ\›
+K
+ŠšÝØ\™ÜßBˆÈÜ[ÛÙH™[ˆœ™YHY\ŽˆHÙ^[\ÜÈXÙZÛ\ˆ]\Ý™]™\ˆ]HÚ\™H
+™[^H\È[žBˆÈ[œ™XÛÙÛš^™Y™X\™\ŠH8 %›[šÈH]]Üš^˜][ÛˆXY\‹‚ˆÚ]ÛÛ^X‹œÝ\™\ÜÊ^Ù\[ÛŠN‚ˆœ›ÛH\›Y\×ØÛK›[Ù[È[\ÜÔSÓÑWÖ‘S—Ñ”‘QWÒÑVSTÔ×ÔPÑRÓT‹Ü[˜ÛÙWÞ™[—Ùœ™YWÚXY\œÂˆYˆ\WÚÙ^HOHÔSÓÑWÖ‘S—Ñ”‘QWÒÑVSTÔ×ÔPÑRÓTŽ‚ˆÝØ\™ÜÖÈ™Y˜][ÚXY\œÈ—HHÊŠŠÝØ\™ÜË™Ù]
+™Y˜][ÚXY\œÈŠHÜˆßJK
+Š›Ü[˜ÛÙWÞ™[—Ùœ™YWÚXY\œÊ
+_BˆØ\WÜ™\]Z\™YØÛÙ^ÚXY\œÊÝØ\™ÜËXØÙ\Ü×ÝÚÙ[X\WÚÙ^K˜\ÙWÝ\›X˜\ÙWÝ\›
+BˆÈ\›Y\ÈÝÛœÈ]^™]žKÙ˜[˜XÚÈÛXÞNÈHÑÈY˜][
+X^Ü™]šY\ÏLŠHÛÝ[š\BˆÈØ[[YHÛˆH[™È[™Ú[™Y›Ü™H\›Y\ÈÙY\ÈÛ™H˜Z[\™K‚ˆÈ\›Y\ÈÝÛœÈ]^[X\žH™]žH
+È›ÝšY\‹Û[Ù[˜[˜XÚÈÛXÞH
+HØ[YK\›ÝšY\ˆ˜[œÚY[™]žH[‚ˆÈØ[ÛH\ÈH^Ù\XÚZ[ˆ˜[˜XÚÊKˆHÜ[RHÑÉÜÈÝÛˆY˜][
+X^Ü™]šY\ÏLˆ8¡¤ˆ\ÈÂˆÈ][\ÊHÚ[[H][\Y\ÈHY™™XÝ]™HØ[[YHÙˆ]™\žH]^Ø[žHðåÈÛˆHÛÝËÚ[™È[™Ú[ˆÈÛÈHLŒÈ[Y[Ý]Ø[ˆÝ[ŒÍŒÈ™Y›Ü™H\›Y\ÈÙY\ÈHÚ[™ÛH˜Z[\™H
+\ÜÝYHÍMJKˆ\ØX›BˆÈÑËZ[\›˜[™]šY\ÈžHY˜][[™]\›Y\ÈÛÛ›ÛHYÙ]È^XÚ]Ø[\œÈØ[ˆÝ[Ý™\œšYBˆÈšXHÝØ\™ÜË‚ˆÝØ\™ÜËœÙ]Y˜][
+›X^Ü™]šY\È‹
+Bˆ™]\›ˆÜ[RJ\WÚÙ^OX\WÚÙ^K˜\ÙWÝ\›X˜\ÙWÝ\›
+ŠšÝØ\™ÜÊB‚‚ˆÈ[\œ\›ÝXÝ[Ûˆ›Üˆ]ÛZXÈ]^\ÚÜÎˆHÛÛ\™\ÜÚ[ÛˆÝ[[X\žHÚ[YžH[ˆÜ™[˜\žBˆÈØ]]Ø^H[\œ\YÜ˜Y\ÈÈHÝ]XÈX\šÙ\‹ÛÈH™XY[ØØ[›YÈX\šÜÈÝXÚØ[ÂˆÈ›ÝXÝYˆ^XÚ]ÜÝØ[˜Ù[
+Ý›
+ÐËÜÝÜ
+HÝ[Ý™\œšY\È][Y[Ý]ÈÝ[š\™K‚ˆÈ8¥ 8¥ [\œ\›ÝXÝ[Ûˆ›Üˆ]ÛZXÈ]^[X\žH\ÚÜÈ8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ ÛÛYH]^[X\žH\ÚÜÈ]\Ý“Õ™BˆÈX›ÜYZYY›YÚžHHØ]]Ø^H[\œ\
+K™Ëˆ[ˆ[˜ÛÛZ[™È\Ù\ˆY\ÜØYÙHÚ[HHYÙ[\È\ÞJKˆÛÛ^ˆÈÛÛ\™\ÜÚ[Ûˆ\ÈHš[YHØ\ÙNˆYˆHÝ[[X\žHHØ[\È[\œ\Y\]Ø^KÛÛ\™\ÜÚ[Ûˆ˜[È˜XÚÈÂˆÈHÝ]XÈœÝ[[X\žH[˜]˜Z[X›HˆX\šÙ\ˆ[™H™X[[™Ù™ˆ\ÈÜÝ
+ÌŒÎMÍJKˆH™XY[ØØ[›YÈ]ÈÝXÚˆÈH\ÚÈX\šÈ]È[‹Y›YÚHØ[\È[\œ\\›ÝXÝYÈHÛÙ^™\ÜÛœÙ\ÈÝ™X[IÜÈØ[˜Ù[][ÛˆÚXÚÂˆÈÛ›ÜœÈ]ˆSQSÕUÈÝ[š\™H
+H[™ÈØ[]\ÝYJK[™[ÕTˆ]^\ÚÜÈ
+š\Ú[Û‹ÙX—Ù^˜XÝˆÈ]WÙÙ[™\˜][Û‹8 )ŠH™[XZ[ˆœ™Y[H[\œ\X›K‚—Ø]^Ú[\œ\Ü›ÝXÝ[ÛˆH™XY[™Ë›ØØ[
+
+B‚‚˜Û\ÜÈ]^[X\žQ^XÚ]Ø[˜Ù[][ÛŠ˜\ÙQ^Ù\[ÛŠN‚ˆˆˆ‘œ›Þ™[ˆÚYÛ˜[][ˆ]^[X\žH][\Ø\È^XÚ]H\™XØ[˜Ù[Yˆ˜\ÙQ^Ù\[Û˜ÛÈœ›ØYˆ^Ù\^Ù\[Û˜™]žKÙ˜[˜XÚÈÛÙH™]™\ˆ™X]ÈHÜÝÝÜ\ÈH˜[œÜÜ˜Z[\™NÈØ]\ÙXˆ\È[[]]X›HÛ\ÜÈ]HÛÈ›Ý[™È™K\]Y\šY\ÈH]]X›HÜÝ]™[Y\ˆH˜[œÜÜ[ÛÝ[™ˆˆˆ‚ˆØ]\ÙHH™^XÚ]ÚÜÝØØ[˜Ù[‚‚ˆYˆ×Ú[š]×ÊÙ[ŠHOˆ›Û™N‚ˆÝ\\Š
+K—×Ú[š]×Ê˜]^[X\žH™\]Y\Ý^XÚ]HØ[˜Ù[YžHÜÝŠB‚‚™YˆØ]^Ú[\œ\Ü›ÝXÝY
+
+HOˆ›ÛÛ‚ˆ™]\›ˆ›ÛÛ
+Ù]]ŠØ]^Ú[\œ\Ü›ÝXÝ[Û‹˜XÝ]™H‹˜[ÙJJB‚‚™YˆØ]^Ú[\œ\ØØ[˜Ù[Ü™\]Y\ÝY
+
+HOˆ›ÛÛ‚ˆˆˆ”™]\›ˆÚ]\ˆ[ˆ^XÚ]ÜÝØ[˜Ù[Ý™\œšY\È]^›ÝXÝ[Û‹ˆˆˆ‚ˆÚXÚÈHØØ\\™WØ]^ØØ[˜Ù[ØÚXÚÊ
+Bˆ™]\›ˆØØ\\™YØ]^ØØ[˜Ù[Ü™\]Y\ÝY
+ÚXÚÊHYˆÚXÚÈ\È›Ý›Û™H[ÙH˜[ÙB‚‚ÛÛ^X‹˜ÛÛ^X[˜YÙ\‚™Yˆ]^Ú[\œ\Ü›ÝXÝ[ÛŠXÝ]™Nˆ›ÛÛHYKØ[˜Ù[ØÚXÚÏS›Û™KØ[˜Ù[Ù]™[S›Û™JN‚ˆˆˆ“X\šÈ\È™XY	ÜÈ]^HØ[[\œ\\›ÝXÝY
+™KY[˜[\ØY™JKˆØ[˜Ù[ØÚXÚØÂˆØ[˜Ù[Ù]™[ÙY\[ˆ^XÚ]ÜÝ\™XØ[˜Ù[]
+]™[™Y™\œ™Y
+NÈ™\ÝYØÛÜ\È[š\š]›Ýˆˆˆ‚ˆ™]ˆHÙ]]ŠØ]^Ú[\œ\Ü›ÝXÝ[Û‹˜XÝ]™H‹˜[ÙJBˆ™]—ØØ[˜Ù[ØÚXÚÈHÙ]]ŠØ]^Ú[\œ\Ü›ÝXÝ[Û‹˜Ø[˜Ù[ØÚXÚÈ‹›Û™JBˆ™]—ØØ[˜Ù[Ù]™[HÙ]]ŠØ]^Ú[\œ\Ü›ÝXÝ[Û‹˜Ø[˜Ù[Ù]™[‹›Û™JBˆØ]^Ú[\œ\Ü›ÝXÝ[Û‹˜XÝ]™HHXÝ]™BˆYˆØ[X›JØ[˜Ù[ØÚXÚÊN‚ˆØ]^Ú[\œ\Ü›ÝXÝ[Û‹˜Ø[˜Ù[ØÚXÚÈHØ[˜Ù[ØÚXÚÂˆYˆØ[˜Ù[Ù]™[\È›Ý›Û™H[™Ø[X›JÙ]]ŠØ[˜Ù[Ù]™[š\×ÜÙ]‹›Û™JJN‚ˆØ]^Ú[\œ\Ü›ÝXÝ[Û‹˜Ø[˜Ù[Ù]™[HØ[˜Ù[Ù]™[ˆžN‚ˆZY[ˆš[˜[N‚ˆØ]^Ú[\œ\Ü›ÝXÝ[Û‹˜XÝ]™HH™]‚ˆØ]^Ú[\œ\Ü›ÝXÝ[Û‹˜Ø[˜Ù[ØÚXÚÈH™]—ØØ[˜Ù[ØÚXÚÂˆØ]^Ú[\œ\Ü›ÝXÝ[Û‹˜Ø[˜Ù[Ù]™[H™]—ØØ[˜Ù[Ù]™[‚‚™YˆØØ\\™WØ]^ØØ[˜Ù[ØÚXÚÊ
+HOˆÜ[Û˜[ÐØ[X›VÖ×K[žWWN‚ˆˆˆØ\\™HHÝ\œ™[^XÚ]XØ[˜Ù[ÛÝ\˜ÙHÛˆHÝÛš[™È™\]Y\Ý™XYˆˆˆ‚ˆ\×ÜÙ]HÙ]]ŠÙ]]ŠØ]^Ú[\œ\Ü›ÝXÝ[Û‹˜Ø[˜Ù[Ù]™[‹›Û™JKš\×ÜÙ]‹›Û™JBˆYˆØ[X›J\×ÜÙ]
+N‚ˆ™]\›ˆ\×ÜÙ]ˆÈ™]\›ˆHØ[X›H]Ù[ˆÛÈ][\[ØØ[XÚ\Ú[ÛˆØš™XÝÈÙY\™YÚ[—Ý[Y[Ý]ØÛX[\
+
+K‚ˆÚXÚÈHÙ]]ŠØ]^Ú[\œ\Ü›ÝXÝ[Û‹˜Ø[˜Ù[ØÚXÚÈ‹›Û™JBˆ™]\›ˆÚXÚÈYˆØ[X›JÚXÚÊH[ÙH›Û™B‚‚™YˆØØ\\™YØ]^ØØ[˜Ù[Ü™\]Y\ÝY
+Ø[˜Ù[ØÚXÚÎˆØ[X›VÖ×K[žWJHOˆ›ÛÛ‚ˆˆˆ”™XYH™\]Y\Ý]™XYØ[˜Ù[][ÛˆÛÝ\˜ÙHÚ]Ý]XZÚ[™È]È˜Z[\™\Ëˆˆˆ‚ˆžN‚ˆ™]\›ˆ›ÛÛ
+Ø[˜Ù[ØÚXÚÊ
+JBˆ^Ù\^Ù\[ÛŽ‚ˆÙÙÙ\‹™XYÊ˜Ø\\™Y]^Ø[˜Ù[ÚXÚÈ˜Z[Y‹^×Ú[™›ÏUYJBˆ™]\›ˆ˜[ÙB‚‚˜Û\ÜÈÐ]^[X\žPØ[˜Ù[][Û‘XÚ\Ú[ÛŽ‚ˆˆˆ]ÛZXØ[HÚÛÜÙH^XÚ]Ø[˜Ù[][ÛˆÜˆ›ÝšY\ˆ[Y[Ý]\ˆ][\ˆˆˆ‚‚ˆYˆ×Ú[š]×ÊÙ[‹ÛÝ\˜ÙWØØ[˜Ù[ØÚXÚÎˆØ[X›VÖ×K[žWJHOˆ›Û™N‚ˆÙ[‹—ÜÛÝ\˜ÙWØØ[˜Ù[ØÚXÚÈHÛÝ\˜ÙWØØ[˜Ù[ØÚXÚÂˆÙ[‹—ÛØÚÈH™XY[™Ë“ØÚÊ
+BˆÙ[‹—ÛÝ]ÛÛYHH˜XÝ]™H‚‚ˆYˆ×ØØ[×ÊÙ[ŠHOˆ›ÛÛ‚ˆÚ]Ù[‹—ÛØÚÎ‚ˆYˆÙ[‹—ÛÝ]ÛÛYHOH˜XÝ]™Hˆ[™ØØ\\™YØ]^ØØ[˜Ù[Ü™\]Y\ÝY
+Ù[‹—ÜÛÝ\˜ÙWØØ[˜Ù[ØÚXÚÊN‚ˆÙ[‹—ÛÝ]ÛÛYHH˜Ø[˜Ù[Y‚ˆ™]\›ˆÙ[‹—ÛÝ]ÛÛYHOH˜Ø[˜Ù[Y‚‚ˆYˆ™YÚ[—Ý[Y[Ý]ØÛX[\
+Ù[ŠHOˆ›ÛÛ‚ˆˆˆ”™]\›ˆÚ]\ˆ[Y[Ý]ÛÛˆ[™\ÝXÝ]™HÛX[\\È\›Z]Yˆˆˆ‚ˆÚ]Ù[‹—ÛØÚÎ‚ˆYˆÙ[‹—ÛÝ]ÛÛYHOH˜XÝ]™HŽ‚ˆØ[˜Ù[YHØØ\\™YØ]^ØØ[˜Ù[Ü™\]Y\ÝY
+Ù[‹—ÜÛÝ\˜ÙWØØ[˜Ù[ØÚXÚÊBˆÙ[‹—ÛÝ]ÛÛYHH˜Ø[˜Ù[YˆYˆØ[˜Ù[Y[ÙH[YYÛÝ]‚ˆ™]\›ˆÙ[‹—ÛÝ]ÛÛYHOH[YYÛÝ]‚‚‚ˆÈ›ÜØ\™\›ÙÜ™\ÜÈÛÚÜÈ›ÜˆÝ™X[YY]^Ø[ÎˆHš^YÜÝXY[™HÚ[ÈHÓÕÈ[Ù[ˆÈÝ™X[Z[™ÈHšYÈÝ[[X\žH\È\™\ÈHS‘ÈÛ™KÛÈÚ\™HÛÛœÝ[Y\œÈXÚÈH›ÙÜ™\ÜÈÛÚÈÛ›BˆÈ›Üˆ›Û‹Y[\H^[ØYÈ[™HÜÝ^[™È]ÈXY[™HÚ[HÚÙ[œÈ[Ý™Kˆ™XY[ØØ[‚ˆÈHØ[[™]ÈÝ™X[HÛÛœÝ[\[Ûˆ[ˆÛˆH[œÝ[[™È™XY‚—Ø]^Ü›ÙÜ™\ÜÈH™XY[™Ë›ØØ[
+
+B—Ø]^Ù\Ü]ÚH™XY[™Ë›ØØ[
+
+B—Ø]^Ü›ÝšY\—Ü™\ÜÛœÙHH™XY[™Ë›ØØ[
+
+BˆÈXœÛÛ]H[Û›ÝÛšXÈXY[™HÙˆHØZ][™ÈÔÕˆHÝ™X[IÜÈÝÛˆÙZ[[™ÂˆÈ
+Ø]^ÜÝ™X[WÝÝ[ØÙZ[[™ËHHÜÝ	ÜÈ[™Ý\Y]\ŠHÛÝ[Ý\Ú\ÙHX]™H[‚ˆÈÜœ[™YÝ™X[HÝ[š[[™ÈY\ˆ]™\žHÜÝXÙZ[[™È[Y[Ý]‚ˆÈXœÛÛ]HØ[XÛØÚÈXY[™H
+[YK›[Û›ÝÛšXÊHÙˆHÔÕØZ][™È›Üˆ\È]^[X\žHØ[Ú[ˆ]\ÈÛ™BˆÈ
+ÎNMŽLŠKˆ]™[™\ÜÈ[Û™H\È›Ý[›ÝYÚˆHÜÝ[ÛÈÝÜÈØZ][™È]]ÈÝÛˆÝ[ÙZ[[™Ë[™BˆÈÝ™X[YYÛÛœÝ[Y\ˆ™[ÝÈ›Ý[™È]Ù[ˆÛ›HžHØ]^ÜÝ™X[WÝÝ[ØÙZ[[™Ê
+H8 %HYÙ]\š]™Yœ›ÛHH]^ˆÈ™\]Y\Ý[Y[Ý]ÚXÚ\ÈHHÜÝÙZ[[™È›Üˆ]™\žHÛÛ™šYÝ\™Y˜[YHS‘Ý\ÈÛÝ[[™È]\‹ˆÛÈBˆÈÝ™X[H]Ý]]™\È]ÈX˜[™Û™YÜÝ\È›Ý[ˆYÙHØ\ÙNÈ]\ÈHÝX\˜[YYÝ]ÛÛYHÙˆ]™\žBˆÈÝ[XÙZ[[™È[Y[Ý]‚—Ø]^ÜÝ™X[WÙXY[™HH™XY[™Ë›ØØ[
+
+B‚‚™YˆÝXÚ×ÚÛÚÊØØ[ˆ™XY[™Ë›ØØ[X™[ˆÝŠHOˆ›Û™N‚ˆˆˆØ[H™XY[ØØ[ÛÚÈ[œÝ[YÛˆØØ[Yˆ[žKˆ™]™\ˆ˜Z\Ù\Ëˆˆˆ‚ˆÛÚÈHÙ]]ŠØØ[šÛÚÈ‹›Û™JBˆYˆÛÚÈ\È›Û™N‚ˆ™]\›‚ˆžN‚ˆÛÚÊ
+Bˆ^Ù\^Ù\[ÛŽ‚ˆÙÙÙ\‹™XYÊ˜]^	\ÈÛÚÈ˜Z[Y‹X™[^×Ú[™›ÏUYJB‚‚™YˆÛ›ÝYžWØ]^Ü›ÙÜ™\ÜÊ
+HOˆ›Û™N‚ˆˆˆ•XÚÈH[œÝ[Y›ÜØ\™\›ÙÜ™\ÜÈÛÚËYˆ[žKˆˆˆ‚ˆÝXÚ×ÚÛÚÊØ]^Ü›ÙÜ™\ÜËœ›ÙÜ™\ÜÈŠB‚‚™YˆÛ›ÝYžWØ]^Ù\Ü]Ú
+
+HOˆ›Û™N‚ˆˆˆ”™XÛÜ™[ˆXÝX[›ÝšY\ˆ\Ü]ÚÚ]Ý]ÛZ[Z[™È™\ÜÛœÙH›ÙÜ™\ÜËˆˆˆ‚ˆÝXÚ×ÚÛÚÊØ]^Ù\Ü]Ú™\Ü]ÚŠB‚‚™YˆÛ›ÝYžWØ]^Ý[Z[™×Ü™\ÜÛœÙJ
+HOˆ›Û™N‚ˆˆˆ”™XÛÜ™HÛÛ[Yœ™YHœ˜[YH
+ÙY\[]™KÙ[\H[JNˆÛÝ[ÈÝØ\™ˆ[YWÝ×Ùš\œÝÜ›ÙÜ™\Ü×Û\Ø]]\Ý›Ý™\Ù]HÛÛ\™\ÜÚ[Ûˆ[˜XÝ]š]H™[˜ÙKˆˆˆ‚ˆÝXÚ×ÚÛÚÊØ]^Ü›ÝšY\—Ü™\ÜÛœÙKœ›ÝšY\ˆ™\ÜÛœÙHŠB‚‚™YˆÛ›ÝYžWØ]^Ü›ÝšY\—Ü™\ÜÛœÙJ
+HOˆ›Û™N‚ˆˆˆ”™XÛÜ™H›ÝšY\ˆ™\ÜÛœÙKØÚ[šË[ˆ™\Ù\™HH]™[™\ÜÈÚYÛ˜[ˆˆˆ‚ˆÛ›ÝYžWØ]^Ý[Z[™×Ü™\ÜÛœÙJ
+BˆÛ›ÝYžWØ]^Ü›ÙÜ™\ÜÊ
+B‚‚™YˆØ]^Ü›ÙÜ™\Ü×ØXÝ]™J
+HOˆ›ÛÛ‚ˆ™]\›ˆÙ]]ŠØ]^Ü›ÙÜ™\ÜËšÛÚÈ‹›Û™JH\È›Ý›Û™B‚‚™YˆÙšY[
+ØšŽˆ[žKÙ^NˆÝ‹Y˜][ˆ[žHH›Û™JHOˆ[žN‚ˆˆˆ‘šY[XØÙ\ÜÈ›ÜˆÚ\™HØš™XÝÈ]X^H™HXÝÈÜˆÑËÔÚ[\S˜[Y\ÜXÙHØš™XÝËˆˆˆ‚ˆ˜[HØš‹™Ù]
+Ù^JHYˆ\Ú[œÝ[˜ÙJØš‹XÝ
+H[ÙHÙ]]ŠØš‹Ù^K›Û™JBˆ™]\›ˆY˜][Yˆ˜[\È›Û™H[ÙH˜[‚‚™YˆØ[›ÜX×Ù]™[Ú\×ØÛÛ[
+]™[ˆ[žJHOˆ›ÛÛ‚ˆˆˆ•Ú]\ˆ[ˆ[›ÜXÈÝ™X[H]™[Ø\œšY\ÈH›Û‹Y[\H^[ØYˆˆˆ‚ˆ]™[Ý\HHÙšY[
+]™[\HŠBˆYˆ]™[Ý\HOH˜ÛÛ[Ø›ØÚ×Ù[HŽ‚ˆ[HHÙšY[
+]™[™[HŠBˆ™]\›ˆ[žJ›ÛÛ
+ÙšY[
+[KŠJH›Üˆˆ[ˆ
+^‹[šÚ[™È‹œ\X[ÚœÛÛˆ‹œÚYÛ˜]\™H‹˜Ú]][ÛˆŠJBˆYˆ]™[Ý\HOH˜ÛÛ[Ø›ØÚ×ÜÝ\Ž‚ˆ›ØÚÈHÙšY[
+]™[˜ÛÛ[Ø›ØÚÈŠBˆ™]\›ˆÙšY[
+›ØÚË\HŠHOHÛÛÝ\ÙHˆ[™[žJ›ÛÛ
+ÙšY[
+›ØÚËŠJH›Üˆˆ[ˆ
+šY‹›˜[YHŠJBˆ™]\›ˆ˜[ÙB‚‚™YˆØ[›ÜX×Ø]^ÜÝ™X[WÙ]™[ÚÛÚÊ
+HOˆØ[X›VÖÐ[žWK›Û™WN‚ˆˆˆ”\‹Y]™[Ø[˜XÚÈ›ÜˆH[›ÜXÈ]^Ú\™Nˆ›ÙÜ™\ÜÈÛ›H›ÜˆÝXœÝ[]™H^[ØYÂˆ
+ÙY\[]™\È]\Ý›ÝÙY\HÝ[YÝ[[X\žH[]™JKÝÜ]HÜÝXY[™HÜˆ^XÚ]ˆØ[˜Ù[ˆH[Y[Ý]\œ›Ü˜^]\ÝØ^H[YYÝ]ˆÛÈÚ\×Ý[Y[Ý]Ù\œ›Ü˜Û\ÜÚYšY\È]ˆˆˆ‚ˆÜÝÙXY[™HHØÝ\œ™[Ø]^ÜÝ™X[WÙXY[™J
+BˆÝ\YH[YK›[Û›ÝÛšXÊ
+B‚ˆYˆÛÛ—Ù]™[
+]™[ˆ[žJHOˆ›Û™N‚ˆYˆØ[›ÜX×Ù]™[Ú\×ØÛÛ[
+]™[
+N‚ˆÛ›ÝYžWØ]^Ü›ÝšY\—Ü™\ÜÛœÙJ
+Bˆ[ÙN‚ˆÛ›ÝYžWØ]^Ý[Z[™×Ü™\ÜÛœÙJ
+BˆYˆØ]^Ú[\œ\ØØ[˜Ù[Ü™\]Y\ÝY
+
+N‚ˆ˜Z\ÙH]^[X\žQ^XÚ]Ø[˜Ù[][ÛŠ
+BˆYˆÜÝÙXY[™H\È›Ý›Û™H[™[YK›[Û›ÝÛšXÊ
+HHÜÝÙXY[™N‚ˆ˜Z\ÙH[Y[Ý]\œ›ÜŠˆ[›ÜXÈ]^[X\žHÝ™X[H[YYÝ]]HÜÝÛÛ\™\ÜÚ[Ûˆ‚ˆˆ™XY[™HY\ˆÝ[YK›[Û›ÝÛšXÊ
+HHÝ\Y‹ŒŸ\È
+HØ[\ˆ[™XYHÝÜYØZ][™ÊHŠB‚ˆ™]\›ˆÛÛ—Ù]™[‚‚ˆÈHXYÝ™X[H˜Z[È]H›Ë\›ÙÜ™\ÜÈÚ[™ÝÈ
+š\œÝÚÙ[ˆS‘™]ÙY[ˆÚÙ[œÊNÈH]™BˆÈÝ™X[H™KX\›\È\ˆ]™[›Ý[™YžHØ]^ÜÝ™X[WÝÝ[ØÙZ[[™Ê
+K‚—ÐUVÔÕ‘PSWÓ“×Ô“ÑÔ‘TÔ×ÕSQSÕUÔÑPÓÓ‘ÈHŒŒ‚‚ÛÛ^X‹˜ÛÛ^X[˜YÙ\‚™YˆØ]^Ý™XYÛØØ[ÚÛÚÊØØ[ˆ™XY[™Ë›ØØ[ÛÚÊN‚ˆˆˆ’[œÝ[Û™H™XY[ØØ[ÛÚË™\ÝÜš[™ÈHš[ÜˆÛˆ^]
+›Û‹XØ[X›HH\ÜÝ›ÝYÚ
+Kˆˆˆ‚ˆ™]š[Ý\ÈHÙ]]ŠØØ[šÛÚÈ‹›Û™JBˆØØ[šÛÚÈHÛÚÈYˆØ[X›JÛÚÊH[ÙH™]š[Ý\ÂˆžN‚ˆZY[ˆš[˜[N‚ˆØØ[šÛÚÈH™]š[Ý\Â‚‚ÛÛ^X‹˜ÛÛ^X[˜YÙ\‚™Yˆ]^Ü›ÙÜ™\Ü×ÚÛÚÊÛÚÊN‚ˆˆˆ’[œÝ[
+šÛÚÊˆ\ÈHÝ\œ™[™XY	ÜÈ]^›ÜØ\™\›ÙÜ™\ÜÈØ[˜XÚÈ
+›Û™HH\ÜÝ›ÝYÚ
+Kˆˆˆ‚ˆÚ]Ø]^Ý™XYÛØØ[ÚÛÚÊØ]^Ü›ÙÜ™\ÜËÛÚÊN‚ˆZY[‚‚™YˆØÝ\œ™[Ø]^ÜÝ™X[WÙXY[™J
+HOˆÜ[Û˜[Ù›Ø]N‚ˆˆˆ•HØZ][™ÈÜÝ	ÜÈXœÛÛ]H[Û›ÝÛšXÈXY[™KYˆÛ™H\È[œÝ[Yˆˆˆ‚ˆ™]\›ˆÙ]]ŠØ]^ÜÝ™X[WÙXY[™K˜[YH‹›Û™JB‚‚ÛÛ^X‹˜ÛÛ^X[˜YÙ\‚™Yˆ]^ÜÝ™X[WÙXY[™JXY[™NˆÜ[Û˜[Ù›Ø]JN‚ˆˆˆ”X›\ÚHÜÝ	ÜÈXœÛÛ]H[YK›[Û›ÝÛšXÊ
+XXY[™HÈHÝ™X[HÛÛœÝ[Y\‹‚‚ˆ›Û™X\ÈH\ÜÝ›ÝYÚÈ™KY[˜[\ØY™KˆÜÝOÛÜšÙ\ˆ™]\›ˆYÈÙˆH›ÙÜ™\ÜÈÛÚÎ‚ˆÚ]Ý]]H\ÛÛ]Y›ÝšY\ˆY[[ÛˆÝ™X[\ÈÈ]ÈÝÛˆÙZ[[™ÈY\ˆHÜÝÝÜYˆØZ][™Ëš[[™ÈHÝ[[X\žHHÛÛ[Z]™[˜ÙH™Y\Ù\Ë‚‚ˆŒÎŒŒŒL˜™[X\Ù\ÈHÛÛ\™\ÜÚ[ÛˆÕÓ‘TˆÚ[ˆH™[˜ÙH\ÈØ[˜Ù[Y]H\ÛÛ]Y›ÝšY\‚ˆY[[Ûˆ
+™[˜Î˜Ü[—Ü›ÝXÝYÜÞ[˜×Ü›ÝšY\—ØØ[
+H]ÛÈHÛØÚÙ]ÙY\ÈÝ™X[Z[™ÈÈ]ÈÝÛ‚ˆØ]^ÜÝ™X[WÝÝ[ØÙZ[[™ØYÙ]8 %HHÜÝ	ÜÈÙZ[[™ÈžHÛÛœÝXÝ[Ûˆ8 %š[[™È[ˆX˜[™Û™YˆÝ[[X\žHHÛÛ[Z]™[˜ÙH\È[™XYHÝX\˜[YYÈ™Y\ÙK[™ÝXÚÚ[™ÈÛ™Hœ™\ÚÜœ[ˆ\ˆ\›ˆÛˆBˆÙ\ÜÚ[Ûˆ]ÛÛ\™\ÜÚ[Ûˆ™]™\ˆX[˜YÙYÈÚš[šËˆÙYHÎNMŽL‹‚ˆˆˆ‚ˆ™]š[Ý\ÈHÙ]]ŠØ]^ÜÝ™X[WÙXY[™K˜[YH‹›Û™JBˆØ]^ÜÝ™X[WÙXY[™K˜[YHHXY[™HYˆ\Ú[œÝ[˜ÙJXY[™K
+[›Ø]
+JH[ÙH™]š[Ý\ÂˆžN‚ˆZY[ˆš[˜[N‚ˆØ]^ÜÝ™X[WÙXY[™K˜[YHH™]š[Ý\Â‚‚™YˆÜ[—Ü›ÝXÝYÜÞ[˜×Ü›ÝšY\—ØØ[
+Ø[˜XÚÎˆØ[X›VÖÙXÝÜÝ‹[žWWK[žWKÝØ\™ÜÎˆXÝÜÝ‹[žWJHOˆ[žN‚ˆˆˆ”[ˆÛ™H›ÝXÝY›ÝšY\ˆØ[˜XÚÈ[ˆ[ˆ][\Z\ÛÛ]YY[[Ûˆ™XY‚‚ˆ]^ÛY[È\™H›ØÙ\ÜË\Ú\™Y[™Ø[››Ý™HÛÜÙYÈØZÙHÛ™H™\]Y\ÝÛÈHØ[˜XÚÈ
+[˜Û‚ˆÝ™X[HYÙÜ™YØ][ÛŠH[œÈ[ˆHY[[ÛˆÚ[HHÝÛ™\ˆÛÈØ[˜Ù[][ÛŽÈÛˆØ[˜Ù[HÝÛ™\‚ˆ[Ú[™È]Û˜ÙH[™HY[[Ûˆš[š\Ú\È[™\ˆH›ÝšY\ˆ[Y[Ý][ˆÝØ\™ÜØ
+]ÝÛœÈ›Âˆ˜[œØÜš\ØÛÛ[Z]Ý]K™]™\ˆÛÈHÙ\ÜÚ[ÛˆØÚÊKˆ[œ›ÝXÝYÈ›ÈØ[˜Ù[ÛÝ\˜ÙNˆ\™XÝ‚ˆˆˆ‚ˆÛÝ\˜ÙWØØ[˜Ù[ØÚXÚÈHØØ\\™WØ]^ØØ[˜Ù[ØÚXÚÊ
+BˆYˆ›ÝØ]^Ú[\œ\Ü›ÝXÝY
+
+HÜˆ›ÝØ[X›JÛÝ\˜ÙWØØ[˜Ù[ØÚXÚÊN‚ˆ™]\›ˆØ[˜XÚÊÝØ\™ÜÊBˆÈÛ™H[™X\š^™YÝ]ÛÛYH\ˆ][\ˆHÜÝ]™[\È™]\ÙYØÛX\™YÛˆ]\ˆ\›œÈ[™ˆÈHÛÙ^[Y[Ý][Y\ˆX^H˜XÙHÝÛ™\ˆÛ[™È8 %Ø[YHØÚÈ›Üˆ›Ý‚ˆØ[˜Ù[ØÚXÚÈHÐ]^[X\žPØ[˜Ù[][Û‘XÚ\Ú[ÛŠÛÝ\˜ÙWØØ[˜Ù[ØÚXÚÊBˆYˆØ[˜Ù[ØÚXÚÊ
+N‚ˆ˜Z\ÙH]^[X\žQ^XÚ]Ø[˜Ù[][ÛŠ
+BˆÈ™XY[ØØ[ÈÈ›ÝÜ›ÜÜÈ[ÈHY[[ÛŽˆ[Z[™ÈÛÚÜÈš\™Hœ›ÛHH™XY[›š[™ÂˆÈHØ[˜XÚË[™HÜÝXY[™H\È[™\[›\ÜÈØ\œšYY[Û™Ë‚ˆ›ÙÜ™\Ü×ÚÛÚÈHÙ]]ŠØ]^Ü›ÙÜ™\ÜËšÛÚÈ‹›Û™JBˆ\Ü]ÚÚÛÚÈHÙ]]ŠØ]^Ù\Ü]ÚšÛÚÈ‹›Û™JBˆ›ÝšY\—Ü™\ÜÛœÙWÚÛÚÈHÙ]]ŠØ]^Ü›ÝšY\—Ü™\ÜÛœÙKšÛÚÈ‹›Û™JBˆÜÝÙXY[™HHØÝ\œ™[Ø]^ÜÝ™X[WÙXY[™J
+BˆÈÎNMŽLŽˆHÝ™X[H\ÈÛÛœÝ[YYÛˆHY[[Ûˆ™[ÝË[™™XY[ØØ[ÈÈ›ÝÜ›ÜÜÈ]›Ý[™\žH8 %[‚ˆÈÝÛ™\‹]™XY[Û›HXY[™HÛÝ[X]™HHš^[™\Ûˆ^XÝHH]\™ÙK\Ù\ÜÚ[ÛˆÛÛ\™\ÜÚ[Û‚ˆÈZÙ\È
+›ÝXÝYØ[
+È\™XØ[˜Ù[ÛÝ\˜ÙH[œÝ[Y
+K‚ˆ›ÝšY\—ØÛÛ^HÛÛ^˜\œË˜ÛÜWØÛÛ^
+
+BˆÛ™HH™XY[™Ë‘]™[
+
+BˆÝ]ÛÛYNˆXÝÜÝ‹[žWHHßB‚ˆYˆÜ›ÝšY\—ÝÛÜšÙ\Š
+HOˆ›Û™N‚ˆžN‚ˆÚ]
+ˆ]^Ü›ÙÜ™\Ü×ÚÛÚÊ›ÙÜ™\Ü×ÚÛÚÊKˆØ]^Ý™XYÛØØ[ÚÛÚÊØ]^Ù\Ü]Ú\Ü]ÚÚÛÚÊKˆØ]^Ý™XYÛØØ[ÚÛÚÊØ]^Ü›ÝšY\—Ü™\ÜÛœÙK›ÝšY\—Ü™\ÜÛœÙWÚÛÚÊKˆ]^ÜÝ™X[WÙXY[™JÜÝÙXY[™JKˆ]^Ú[\œ\Ü›ÝXÝ[ÛŠØ[˜Ù[ØÚXÚÏXØ[˜Ù[ØÚXÚÊKˆ
+N‚ˆÝ]ÛÛYVÈœ™\Ý[—HHØ[˜XÚÊÝØ\™ÜÊBˆ^Ù\˜\ÙQ^Ù\[Ûˆ\È^Î‚ˆÝ]ÛÛYVÈ™^Ù\[Ûˆ—HH^Âˆš[˜[N‚ˆÛ™KœÙ]
+
+B‚ˆ™XY[™Ë•™XY
+ˆ\™Ù]\›ÝšY\—ØÛÛ^œ[‹\™ÜÏJÜ›ÝšY\—ÝÛÜšÙ\‹
+K˜[YOHš\›Y\Ë\›ÝXÝYX]^\›ÝšY\ˆ‹ˆY[[ÛUYJKœÝ\
+
+BˆÚ[HYN‚ˆÈÚXÚÈØ[˜Ù[™Y›Ü™HS‘Y\ˆXXÚØZ]ÛÈ]Ú[œÈÚ[ˆ™\Ý[X›XØ][Ûˆ[™BˆÈÜÝ]™[[™[ˆHØ[YHÛ[™È[\˜[‚ˆYˆØØ\\™YØ]^ØØ[˜Ù[Ü™\]Y\ÝY
+Ø[˜Ù[ØÚXÚÊN‚ˆ˜Z\ÙH]^[X\žQ^XÚ]Ø[˜Ù[][ÛŠ
+BˆYˆ›ÝÛ™KØZ]
+ŒŠN‚ˆÛÛ[YBˆYˆØØ\\™YØ]^ØØ[˜Ù[Ü™\]Y\ÝY
+Ø[˜Ù[ØÚXÚÊN‚ˆ˜Z\ÙH]^[X\žQ^XÚ]Ø[˜Ù[][ÛŠ
+Bˆ^Ù\[ÛˆHÝ]ÛÛYK™Ù]
+™^Ù\[ÛˆŠBˆYˆ^Ù\[Ûˆ\È›Ý›Û™N‚ˆ˜Z\ÙH^Ù\[Û‚ˆ™]\›ˆÝ]ÛÛYK™Ù]
+œ™\Ý[ŠB‚‚™YˆØÛY[ÙXÛ\™\ÊÛY[ÛØšŽˆ[žK›YÎˆÝŠHOˆ›ÛÛ‚ˆˆˆ•Ú]\ˆÛY[ÛØš˜
+Üˆ]ÈÛ\ÜÊHÙ]È›YØ]NÈXœÙ[8¡¤ˆ˜[ÙKˆØ\Xš[]HXÛ\˜][Û‹ˆ›Ý\Ú[œÝ[˜ÙKÛÈÝ][Ù‹]™YHÛY[ÈØ[ˆÜÝ]ÙˆÜ˜\\œÈ[š[\ÜY
+Ù‹ˆÕTÔ•×ÒT“QT×ÕÓÓÐÐSÊKˆˆˆ‚ˆžN‚ˆ™]\›ˆ›ÛÛ
+Ù]]ŠÛY[ÛØš‹›YË˜[ÙJJBˆ^Ù\^Ù\[ÛŽ‚ˆ™]\›ˆ˜[ÙB‚‚™YˆÜØY™WÚ\Ú[œÝ[˜ÙJØšŽˆ[žKX^X™WÝ\Nˆ[žJHOˆ›ÛÛ‚ˆˆˆ”™]\›ˆ˜[ÙH[œÝXYÙˆ˜Z\Ú[™ÈÚ[ˆH]ÚYÞ[X›Û\È›ÝH\Kˆˆˆ‚ˆžN‚ˆ™]\›ˆ\Ú[œÝ[˜ÙJØš‹X^X™WÝ\JBˆ^Ù\\Q\œ›ÜŽ‚ˆ™]\›ˆ˜[ÙB‚‚™YˆÙ^˜XÝÝ\›Ü]Y\žWÜ\˜[\Ê\›ˆÝŠN‚ˆˆˆ‘^˜XÝ]Y\žH\˜[\Èœ›ÛHT“™]\›ˆ
+ÛX[—Ý\›Y˜][Ü]Y\žHXÝÜˆ›Û™JKˆˆˆ‚ˆ\œÙYH\›\œÙJ\›
+BˆYˆ\œÙYœ]Y\žN‚ˆ™]\›ˆ\›[œ\œÙJ\œÙY—Ü™\XÙJ]Y\žOHˆŠJKÚÎˆ–ÌH›ÜˆËˆ[ˆ\œÙWÜ\Ê\œÙYœ]Y\žJKš][\Ê
+_Bˆ™]\›ˆ\››Û™B‚‚ˆÈØ\›ˆÛ›HÛ˜ÙH\ˆ›ØÙ\ÜÈX›Ý]Ý[HÔSRWÐTÑWÕT“‚—ÜÝ[WØ˜\ÙWÝ\›ÝØ\›™YH˜[ÙB‚—Ô“Õ’QT—ÐSPTÑTÈHÂˆ™ÛÛÙÛHŽˆ™Ù[Z[šH‹™ÛÛÙÛKYÙ[Z[šHŽˆ™Ù[Z[šH‹™ÛÛÙÛKXZK\ÝY[ÈŽˆ™Ù[Z[šH‹ˆžXZHŽˆžZH‹ž˜ZHŽˆžZH‹™Ü›ÚÈŽˆžZH‹ˆ™ÛHŽˆž˜ZH‹ž‹XZHŽˆž˜ZH‹ž‹˜ZHŽˆž˜ZH‹žš\HŽˆž˜ZH‹ˆšÚ[ZHŽˆšÚ[ZKXÛÙ[™È‹›[ÛÛœÚÝŽˆšÚ[ZKXÛÙ[™È‹ˆšÚ[ZKXÛˆŽˆšÚ[ZKXÛÙ[™ËXÛˆ‹›[ÛÛœÚÝXÛˆŽˆšÚ[ZKXÛÙ[™ËXÛˆ‹ˆ™ÛZKXÛÝYŽˆ™ÛZH‹™ÛZXÛÝYŽˆ™ÛZH‹ˆ˜XÝX[XÛÛ\]\ˆŽˆ˜XÝX[‹˜XÝX[ÛÛ\]\ˆŽˆ˜XÝX[‹˜XÚHŽˆ˜XÝX[‹ˆ›Z[š[X^XÚ[˜HŽˆ›Z[š[X^XÛˆ‹›Z[š[X^ØÛˆŽˆ›Z[š[X^XÛˆ‹ˆ˜Û]YHŽˆ˜[›ÜXÈ‹˜Û]YKXÛÙHŽˆ˜[›ÜXÈ‹ˆ™Ú]XˆŽˆ˜ÛÜ[Ý‹™Ú]X‹XÛÜ[ÝŽˆ˜ÛÜ[Ý‹™Ú]X‹[[Ù[Žˆ˜ÛÜ[Ý‹™Ú]X‹[[Ù[ÈŽˆ˜ÛÜ[Ý‹ˆ™Ú]X‹XÛÜ[ÝXXÜŽˆ˜ÛÜ[ÝXXÜ‹˜ÛÜ[ÝXXÜXYÙ[Žˆ˜ÛÜ[ÝXXÜ‹ˆ[˜Ù[Žˆ[˜Ù[]ÚÙ[šXˆ‹ÚÙ[šXˆŽˆ[˜Ù[]ÚÙ[šXˆ‹[˜Ù[XÛÝYŽˆ[˜Ù[]ÚÙ[šXˆ‹ˆ[˜Ù[XX\ÈŽˆ[˜Ù[]ÚÙ[šXˆ‹ˆÚÙ[œ[ˆŽˆ[˜Ù[]ÚÙ[œ[ˆ‹[˜Ù[[ÙX\Žˆ[˜Ù[]ÚÙ[œ[ˆ‹ŸB‚‚™YˆÛ›Ü›X[^™WØ]^Ü›ÝšY\Š›ÝšY\ŽˆÜ[Û˜[ÜÝ—JHOˆÝŽ‚ˆ›Ü›X[^™YH
+›ÝšY\ˆÜˆ˜]]ÈŠKœÝš\
+
+K›ÝÙ\Š
+BˆYˆ›Ü›X[^™YœÝ\ÝÚ]
+˜Ý\ÝÛNˆŠN‚ˆÝY™š^H›Ü›X[^™YœÜ]
+Žˆ‹JVÌWKœÝš\
+
+BˆYˆ›ÝÝY™š^‚ˆ™]\›ˆ˜Ý\ÝÛH‚ˆ›Ü›X[^™YHÝY™š^ˆYˆ›Ü›X[^™YOH˜ÛÙ^Ž‚ˆ™]\›ˆ›Ü[˜ZKXÛÙ^‚ˆYˆ›Ü›X[^™YOH›XZ[ˆŽ‚ˆÈ™\ÛÛ™HÈHXÝX[XZ[ˆ›ÝšY\ˆÛÈ˜[YYÝ\ÝÛH›ÝšY\œÈÛÜšË‚ˆXZ[—Ü›ÝˆH
+Ü™XYÛXZ[—Ü›ÝšY\Š
+HÜˆˆŠKœÝš\
+
+K›ÝÙ\Š
+BˆYˆ›ÝXZ[—Ü›ÝˆÜˆXZ[—Ü›Ýˆ[ˆÈ˜]]È‹›XZ[ˆŸN‚ˆ™]\›ˆ˜Ý\ÝÛH‚ˆ›Ü›X[^™YHXZ[—Ü›Ý‚ˆ™]\›ˆÔ“Õ’QT—ÐSPTÑTË™Ù]
+›Ü›X[^™Y›Ü›X[^™Y
+B‚‚ˆÈÙ[[™[œ›ÛHÙš^YÝ[\\˜]\™WÙ›Ü—Û[Ù[
+
+NˆØ[\œÈÝš\[\\˜]\™X[\™[K‚ˆÈÚ[ZKÓ[ÛÛœÚÝX[˜YÙH]Ù\™\‹\ÚYH8 %[žH˜[YHØ[ˆÛÛ™›XÝÚ]Ø]]Ø^H[ÙHÙ[XÝ[Û‹‚“ÓRUÕSTTUT‘NˆØš™XÝHØš™XÝ
+
+B‚‚™YˆØ˜\™WÛ[Ù[
+[Ù[ˆÜ[Û˜[ÜÝ—JHOˆÝŽ‚ˆˆˆ“ÝÙ\˜Ø\ÙY[Ù[ÛYÈÚ][žH™[™Ü‹Ø™Yš^Ýš\Yˆˆˆ‚ˆ™]\›ˆ
+[Ù[ÜˆˆŠKœÝš\
+
+K›ÝÙ\Š
+KœœÜ]
+‹È‹JVËLWB‚‚™YˆÚ\×ÚÚ[ZWÛ[Ù[
+[Ù[ˆÜ[Û˜[ÜÝ—JHOˆ›ÛÛ‚ˆˆˆ•YH›Üˆ[žHÚ[ZHÈ[ÛÛœÚÝ[Ù[]X[˜YÙ\È[\\˜]\™HÙ\™\‹\ÚYKˆˆˆ‚ˆ˜\™HHØ˜\™WÛ[Ù[
+[Ù[
+Bˆ™]\›ˆ˜\™KœÝ\ÝÚ]
+šÚ[ZKHŠHÜˆ˜\™HOHšÚ[ZH‚‚‚™YˆÚ\×Ø\˜ÙYWÝš[š]WÝ[šÚ[™Ê[Ù[ˆÜ[Û˜[ÜÝ—JHOˆ›ÛÛ‚ˆˆˆ•YH›Üˆ\˜ÙYHš[š]H\™ÙH[šÚ[™È
+\™XÝÜˆšXHÜ[”›Ý]\ŠKˆˆˆ‚ˆ™]\›ˆØ˜\™WÛ[Ù[
+[Ù[
+HOHš[š]K[\™ÙK][šÚ[™È‚‚‚ˆÈÛÙ^Ð]]\™XØ\ÈÜMKÍKKÍKˆ[™ÜMˆ\Ý˜H]Ì’È
+˜]ÈTKÓÜ[”›Ý]\ˆ^ÜÙHKŒSJNÂˆÈHY˜][L	HšYÙÙ\ˆÛÝ[ÛÛ\XÝ]ŒLÍ’ËÛÈ˜Z\ÙHÈIH
+ŒŒÌRÊK‚—ÐÓÑVÑÔMÑÔMWÐÓÓTPÕSÓ—Õ‘TÒÓHŽBˆÈÜMKŒËXÛÙ^\Ü\šÎˆÛÙ^SÐ]][Û›K˜]]™HLŽÎÈÌ	H
+ŽLÊHX]™\ÈÝ[[X\žHXY›ÛÛK‚—ÐÓÑVÔÔT’×ÐÓÓTPÕSÓ—Õ‘TÒÓHÌ‚‚™YˆÚ\×ØÛÙ^ÙÜMÛÜ—ÙÜMJ[Ù[ˆÜ[Û˜[ÜÝ—K›ÝšY\ŽˆÜ[Û˜[ÜÝ—HH›Û™JHOˆ›ÛÛ‚ˆˆˆ•YH›ÜˆÜMKÍKKÍK‹ÜMˆ\Ý˜H
+[™H^Xœ™XZÈÛÛ[X\ÊHÛˆHÛÙ^Ð]]›Ý]HÛ›K‚‚ˆÝ\ˆ›Ý]\È^ÜÙHH\™Ù\ˆÚ[™ÝÈ›ÜˆHØ[YHÛYÈ[™ÙY\H\Ù\‰ÜÈ™\ÚÛ‚ˆ™Yš^[X]ÚYÛÈ\›Ø[™]YÛ˜\ÚÝÈ˜XÚÈ]™\žHÌ’ËXØ\Y˜[Z[NÈNLØˆXÚÙ\ˆ˜\šX[È\™H^ÛYYˆ\Ý˜H\ÈÝXœÝš[™Ë[X]ÚY
+[žHÛYÈÛÛZ[š[™È\Ý˜XˆÚ]Ý]LØ
+Kˆ˜[YHÙ\›ÜˆHÛÛ\™\ÜÚ[Û‹˜ÛÙ^ÙÜMWØ]]Ü˜Z\ÙXÙ^K‚ˆˆˆ‚ˆ˜\™HHØÛÙ^Ü›Ý]WØ˜\™WÛ[Ù[
+[Ù[›ÝšY\ŠBˆYˆ˜\™H\È›Û™N‚ˆ™]\›ˆ˜[ÙBˆœ›ÛHYÙ[›[Ù[ÛY]Y]H[\Ü\×ØÛÙ^ØÛÛ^Ý˜\šX[ˆYˆ\×ØÛÙ^ØÛÛ^Ý˜\šX[
+˜\™JN‚ˆ™]\›ˆ˜[ÙBˆYˆ˜\Ý˜Hˆ[ˆ˜\™N‚ˆ™]\›ˆŽLÈˆ›Ý[ˆ˜\™Bˆ™]\›ˆ˜\™HOH™ÜY^Xœ™XZËX›YK[]\ÝˆÜˆ[žJˆ˜\™HOH˜[HÜˆ˜\™KœÝ\ÝÚ]
+˜[H
+È‹HŠHÜˆ˜\™KœÝ\ÝÚ]
+˜[H
+È‹ˆŠBˆ›Üˆ˜[H[ˆ
+™ÜMK‹™ÜMKH‹™ÜMKˆŠJB‚‚™YˆØÛÙ^Ü›Ý]WØ˜\™WÛ[Ù[
+[Ù[ˆÜ[Û˜[ÜÝ—K›ÝšY\ŽˆÜ[Û˜[ÜÝ—JHOˆÜ[Û˜[ÜÝ—N‚ˆˆˆ“ÝÙ\˜Ø\ÙY˜\™H[Ù[ÛYÈÚ[ˆ›ÝšY\˜\ÈHÛÙ^Ð]]›Ý]K[ÙH›Û™Kˆˆˆ‚ˆ™]\›ˆØ˜\™WÛ[Ù[
+[Ù[
+HYˆ
+›ÝšY\ˆÜˆˆŠKœÝš\
+
+K›ÝÙ\Š
+HOH›Ü[˜ZKXÛÙ^ˆ[ÙH›Û™B‚‚™YˆÚ\×ØÛÙ^ÜÜ\šÊ[Ù[ˆÜ[Û˜[ÜÝ—K›ÝšY\ŽˆÜ[Û˜[ÜÝ—HH›Û™JHOˆ›ÛÛ‚ˆˆˆ•YH›ÜˆÜMKŒËXÛÙ^\Ü\šØÛˆHÛÙ^Ð]]›Ý]H
+HÛYÈ^\ÝÈ›ÝÚ\™H[ÙJKˆˆˆ‚ˆ™]\›ˆØÛÙ^Ü›Ý]WØ˜\™WÛ[Ù[
+[Ù[›ÝšY\ŠHOH™ÜMKŒËXÛÙ^\Ü\šÈ‚‚‚™YˆÙš^YÝ[\\˜]\™WÙ›Ü—Û[Ù[
+ˆ[Ù[ˆÜ[Û˜[ÜÝ—K˜\ÙWÝ\›ˆÜ[Û˜[ÜÝ—HH›Û™BŠHOˆ“Ü[Û˜[Ù›Ø]HØš™XÝŽ‚ˆˆˆ˜ÓRUÕSTTUT‘X
+›ÜHÙ^NÈÚ[ZKÓ[ÛÛœÚÝ
+KHš^Y›Ø]Üˆ›Û™Xˆˆˆ‚ˆYˆÚ\×ÚÚ[ZWÛ[Ù[
+[Ù[
+N‚ˆÙÙÙ\‹™XYÊ“ÛZ][™È[\\˜]\™H›ÜˆÚ[ZH[Ù[	\ˆ
+Ù\™\‹[X[˜YÙY
+H‹[Ù[
+Bˆ™]\›ˆÓRUÕSTTUT‘Bˆ™]\›ˆHYˆÚ\×Ø\˜ÙYWÝš[š]WÝ[šÚ[™Ê[Ù[
+H[ÙH›Û™B‚‚™YˆØÛÛ\™\ÜÚ[Û—Ý™\ÚÛÙ›Ü—Û[Ù[
+ˆ[Ù[ˆÜ[Û˜[ÜÝ—K›ÝšY\ŽˆÜ[Û˜[ÜÝ—HH›Û™K
+‹ˆ[Ý×ØÛÙ^ÙÜMWØ]]Ü˜Z\ÙNˆ›ÛÛHYKŠHOˆÜ[Û˜[Ù›Ø]N‚ˆˆˆ”\‹[[Ù[Ü›Ý]HÛÛ\™\ÜÚ[Ûˆ™\ÚÛÝ™\œšYH
+œ˜XÝ[ÛˆÙˆÛÛ^\ÙY
+KÜˆ›Û™K‚‚ˆ\˜ÙYHš[š]H\™ÙH[šÚ[™È8¡¤ˆÍH
+™\Ù\™H™X\ÛÛš[™ÈÛÛ^
+NÈÛÙ^\›Ý]HÜMKÍKKÍK‹Ð\Ý˜Bˆ8¡¤ˆŽKØ]YžH[Ý×ØÛÙ^ÙÜMWØ]]Ü˜Z\ÙXÈÛÙ^\›Ý]HÜMKŒËXÛÙ^\Ü\šÈ8¡¤ˆÌ[™Ø]Y‚ˆˆˆ‚ˆYˆÚ\×Ø\˜ÙYWÝš[š]WÝ[šÚ[™Ê[Ù[
+N‚ˆ™]\›ˆÍBˆYˆ[Ý×ØÛÙ^ÙÜMWØ]]Ü˜Z\ÙH[™Ú\×ØÛÙ^ÙÜMÛÜ—ÙÜMJ[Ù[›ÝšY\ŠN‚ˆ™]\›ˆÐÓÑVÑÔMÑÔMWÐÓÓTPÕSÓ—Õ‘TÒÓˆYˆÚ\×ØÛÙ^ÜÜ\šÊ[Ù[›ÝšY\ŠN‚ˆ™]\›ˆÐÓÑVÔÔT’×ÐÓÓTPÕSÓ—Õ‘TÒÓˆ™]\›ˆ›Û™B‚‚™YˆÙY™™XÝ]™WØÛÛ\™\ÜÚ[Û—Ý™\ÚÛÜ\˜Ù[
+ˆ[Ù[ˆÜ[Û˜[ÜÝ—Kˆ›ÝšY\ŽˆÜ[Û˜[ÜÝ—HH›Û™Kˆ
+‹ˆÛØ˜[Ý™\ÚÛˆÜ[Û˜[Ù›Ø]HH›Û™Kˆ[Ý×ØÛÙ^ÙÜMWØ]]Ü˜Z\ÙNˆ›ÛÛHYKŠHOˆ›Ø]‚ˆˆˆ”™\ÛÛ™HHY™™XÝ]™HÛÛ\™\ÜÚ[ÛˆšYÙÙ\ˆ™\ÚÛ›ÜˆH›Ý]K‚‚ˆ\Y\ÈH\‹[[Ù[Ý™\œšY\È
+ÜMKÍKKÍKˆÌ’È˜[Z[H8¡¤ˆŽKˆÜMKŒËXÛÙ^\Ü\šÈ8¡¤ˆÌÛˆHÛÙ^Ð]]›Ý]JHÝ™\ˆHÛØ˜[ˆÛÛ\™\ÜÚ[Û‹™\ÚÛÛÈ^\›˜[ÛÛ^[™Ú[™\ÈØœÙ\™HHØ[YBˆY™™XÝ]™H™\ÚÛ\ÈHZ[Z[ˆÛÛ^ÛÛ\™\ÜÛÜ‰ÜÈ[š]X[ˆÛÛœÝXÝ[Û‹ˆ™XYÈHÛØ˜[™\ÚÛœ›ÛHÛÛ™šYÈÚ[ˆ›ÝÝ\YY‚ˆˆˆ‚ˆYˆÛØ˜[Ý™\ÚÛ\È›Û™N‚ˆžN‚ˆœ›ÛH\›Y\×ØÛK˜ÛÛ™šYÈ[\ÜØYØÛÛ™šY×Ü™XYÛ›B‚ˆØÙ™ÈHØYØÛÛ™šY×Ü™XYÛ›J
+HÜˆßBˆ^Ù\^Ù\[ÛŽ‚ˆØÙ™ÈHßBˆÜ˜]ÈH
+ØÙ™Ë™Ù]
+˜ÛÛ\™\ÜÚ[ÛˆŠHÜˆßJK™Ù]
+™\ÚÛ‹L
+BˆžN‚ˆÛØ˜[Ý™\ÚÛH›Ø]
+Ü˜]ÊBˆ^Ù\
+\Q\œ›Ü‹˜[YQ\œ›ÜŠN‚ˆÛØ˜[Ý™\ÚÛHLˆÈ^žH[\ÜˆYÙ[Ú[š][\ÜÈ\È[Ù[HÛ›H][˜Ý[ÛˆØÛÜKˆÈÛÈH[Ù[K[]™[[\Ü\™HÛÝ[™HÚ\˜Ý[\‹‚ˆœ›ÛHYÙ[˜YÙ[Ú[š][\ÜÜ™\ÛÛ™WØÛÛ\™\ÜÚ[Û—Ý™\ÚÛ‚ˆÛÝ™\œšYHHØÛÛ\™\ÜÚ[Û—Ý™\ÚÛÙ›Ü—Û[Ù[
+ˆ[Ù[›ÝšY\‹[Ý×ØÛÙ^ÙÜMWØ]]Ü˜Z\ÙOX[Ý×ØÛÙ^ÙÜMWØ]]Ü˜Z\ÙBˆ
+BˆÜ™\ÛÛ™YÈHÜ™\ÛÛ™WØÛÛ\™\ÜÚ[Û—Ý™\ÚÛ
+ˆ›Ø]
+ÛØ˜[Ý™\ÚÛ
+KˆÛÝ™\œšYKˆ[Ù[[[Ù[ˆ\×ØÛÙ^Ø]]Ü˜Z\ÙOJˆÚ\×ØÛÙ^ÙÜMÛÜ—ÙÜMJ[Ù[›ÝšY\ŠHÜˆÚ\×ØÛÙ^ÜÜ\šÊ[Ù[›ÝšY\ŠBˆ
+Kˆ
+Bˆ™]\›ˆ›Ø]
+Ü™\ÛÛ™Y
+B‚‚™YˆÝ\]WØÛÛ\™\ÜÛÜ—Û[Ù[
+ˆÛÛ\™\ÜÛÜ‹ˆ
+‹ˆ[Ù[ˆÝ‹ˆÛÛ^Û[™Ýˆ[ˆ˜\ÙWÝ\›ˆÝˆHˆ‹ˆ\WÚÙ^Nˆ[žHHˆ‹ˆ›ÝšY\ŽˆÝˆHˆ‹ˆ\WÛ[ÙNˆÝˆHˆ‹ˆ™\ÚÛÜ\˜Ù[ˆÜ[Û˜[Ù›Ø]HH›Û™KŠHOˆ›Û™N‚ˆˆˆØ[\]WÛ[Ù[›ÜØ\™[™È™\ÚÛÜ\˜Ù[Ú[ˆÝ\ÜY‚‚ˆHZ[Z[ˆÛÛ^ÛÛ\™\ÜÛÜˆ™K\™\ÛÛ™\È]È™\ÚÛ[\›˜[H[™ˆÙ\È›ÝXØÙ\HÝØ\™ÎÈ^\›˜[[™Ú[™\È
+K™ËˆšKXÛÛ^YÛÝ™\››ÜŠBˆXØÙ\]ÛÈH™\ÛÛ™YÜÝ™\ÚÛ
+[˜ÛY[™ÈHÛÙ^ÜMKžˆ]]Ü˜Z\ÙJH™XXÚ\ÈZ\ˆšYÙÙ\‹ˆHÚYÛ˜]\™HÝX\™ÙY\È]™\žH[™Ú[™BˆÛˆ]ÈÝÛˆÛÛ˜XÝ‚ˆˆˆ‚ˆÚÝØ\™ÜÈHÂˆ›[Ù[Žˆ[Ù[ˆ˜ÛÛ^Û[™ÝŽˆÛÛ^Û[™Ýˆ˜˜\ÙWÝ\›Žˆ˜\ÙWÝ\›ˆ˜\WÚÙ^HŽˆ\WÚÙ^Kˆœ›ÝšY\ˆŽˆ›ÝšY\‹ˆ˜\WÛ[ÙHŽˆ\WÛ[ÙKˆBˆYˆ™\ÚÛÜ\˜Ù[\È›Ý›Û™N‚ˆžN‚ˆ[\Ü[œÜXÝ‚ˆÜ\˜[\ÈH[œÜXÝœÚYÛ˜]\™JÛÛ\™\ÜÛÜ‹\]WÛ[Ù[
+Kœ\˜[Y]\œÂˆ^Ù\
+\Q\œ›Ü‹˜[YQ\œ›ÜŠN‚ˆÜ\˜[\ÈHßBˆYˆ™\ÚÛÜ\˜Ù[ˆ[ˆÜ\˜[\Î‚ˆÚÝØ\™ÜÖÈ™\ÚÛÜ\˜Ù[—HH™\ÚÛÜ\˜Ù[ˆÛÛ\™\ÜÛÜ‹\]WÛ[Ù[
+
+Š—ÚÝØ\™ÜÊB‚ˆÈ[Ù[Y˜[Z[Hš[Üš]H›ÜˆH]^[X\žH™˜\ÝY\ˆ‹˜\Ý\Ýš\œÝ‚ˆÂˆÈX]ÚY\ÈÝXœÝš[™ÜÈYØZ[œÝH›ÝšY\‰ÜÈU‘HÝŒKÛ[Ù[ÈØ][ÙÈ˜]\‚ˆÈ[ˆ[›™Y\È^XÝYË™XØ]\ÙH^XÝYÈ›ÝˆH\™ÛÙYˆÈ™ÛÛÙÛKÙÙ[Z[šKLËY›\ÚˆÙ\[™È\™HÛ˜ÙH›Ý\È›ÜY]\Ý™X[K[™ˆÈ]™\žH]^Ø[ZYHØ\ÝY›Ý[™]š\™Y›Ü™HH™]žH™]Ø]YÚ]‚ˆÈ˜[Z[Y\ÈÝ]]™HZ\ˆ™\œÚ[Ûˆ[X™\œËÛÈH™]ÈZ[šKÙ›\ÚÚZZÝH™[X\ÙH\ÂˆÈXÚÙY\Ú]›ÈÛÝ\˜ÙHY]‚ˆÂˆÈ›Û[™È‹[]\Ýˆ[X\Ù\ÈÛÛYHš\œÝÚ\™HH›ÝšY\ˆX›\Ú\È[H
+›Ý\ÂˆÈÙ\™\È›Ü[˜ZKÙÜ[Z[šK[]\Ý™ÛÛÙÛKÙÙ[Z[šKY›\Ú[]\Ý8 )ŠNˆ^H\™HBˆÈÛ›HYÈ]\™HÝXÝ\˜[H›Ý\›ÛÙ‹‚ˆÂˆÈÜ™\ˆ\ÈYX\Ý\™Y›ÝÝY\ÜÙY8 %LÛˆH™X[][™È›Û\YØZ[œÝBˆÈ›Ý\ÈØ][ÙÎˆÜ[Z[šK[]\ÝKËÛ]YKZZZÝK[]\ÝKM\ËˆÈÙ[Z[šKY›\Ú[]\Ý‹ŒLÜËÝ\LËËY›\ÚËŽËÜ›ÚËMŒKY˜\ÝŒ\ËˆÛÈBˆÈš\œÝ˜[Z[HH›ÝšY\ˆXÝX[HÙ\™\È\È[ÛÈH˜\Ý\Ý]Ø[ˆÙ™™\‹‚—ÑTÕÓSÑSÑSRSQTÎˆ\HH
+ˆ™Ü[Z[šK[]\Ý‹™Ü[˜[›Ë[]\Ý‹˜Û]YKZZZÝK[]\Ý‹™Ù[Z[šKY›\Ú[]\Ý‹ˆ™ÜMK[˜[›È‹™ÜMK[Z[šH‹™ÜMK[Z[šH‹šZZÝKMH‹™Ù[Z[šKLË‹Y›\Ú‹™›\Ú[]H‹ˆ‹[˜[›È‹‹[Z[šH‹‹Y›\Ú‹šZZÝH‹ŠB‚ˆÈ\Ü]X[YšY\œÎˆ™X\ÛÛš[™È˜\šX[È[šÈ™Y›Ü™H[œÝÙ\š[™ÎÈŽ˜˜]Úˆ\ÈH]Y]YNÈŽ™œ™YHˆY\œÂˆÈ\™H˜]K[[Z]Y[™ÛÝÙ\ÝÈ[X™Y\œËÛ[Ù[]H[™Ú[ÈX]ÚH[™È]Ø[››Ý[œÝÙ\‹‚—ÑTÕÓSÑSÑVÓQNˆ\HH
+ˆ[šÚ[™È‹œ™X\ÛÛˆ‹‹\ŒH‹›Z[š[H‹Ž˜˜]Ú‹Ž™œ™YH‹ˆ›ÌKH‹›ÌËH‹›ÍH‹˜ÛÙ^‹˜]Y[È‹‹]›‹™[X™Y‹ˆ‹]È‹‹]˜[œØÜšX™H‹‹\™X[[YH‹‹Z[XYÙH‹‹\ÙX\˜Ú\™]šY]È‹ŠB‚‚™YˆÛ[Ù[Ü™XÙ[˜ÞWÚÙ^J[Ù[ÚYˆÝŠHOˆ\N‚ˆˆˆ”ÛÜÙ^H][™ÈH˜[Z[IÜÈ™]Ù\Ý™[X\ÙHš\œÝˆYÚ][œÈÛÛ\\™H[Y\šXØ[H
+Z[‚ˆÝš[™ÈÜ™\ˆXÚÜÈÜLËK[Z[šXÝ™\ˆÜMK[Z[šX[™œ™XZÜÈ]HœÈL
+Kˆˆˆ‚ˆÈ™KœÜ]Ú]Û™HØ\\š[™ÈÜ›Ý\[\›˜]\È^[X™\‹^8 )‚ˆ™]\›ˆ\Jˆ
+K›Ø]
+\
+KˆŠHYˆ[™^	Hˆ[ÙH
+Œ\
+Bˆ›Üˆ[™^\[ˆ[[Y\˜]J™KœÜ]
+ˆŠ
+ÊÎ——
+ÊOÊH‹[Ù[ÚY›ÝÙ\Š
+JJHYˆ\
+B‚‚™YˆÙ˜\ÝÛ[Ù[Ùœ›ÛWØØ][ÙÊ›ÝšY\—ÚYˆÝŠHOˆÝŽ‚ˆˆˆ“™]Ù\ÝÑTÕÓSÑSÑSRSQTØX]Úœ›ÛHH›ÝšY\‰ÜÈ]™H
+ØXÚY
+HØ][ÙË‚‚ˆˆˆÚ[ˆHØ][ÙÈ\È[˜]˜Z[X›HÜˆÛÈ›ÈÛX[[Ù[
+Ø[\ˆ˜[È›ÝYÚÈBˆÝ\˜]YY˜][
+Kˆ™]™\ˆ˜Z\Ù\ÎÈH™]Ú\ÈY[[ÜžJÙ\ÚÈØXÚY‚ˆˆˆ‚ˆ\×Û›Ý\ÈH›ÝšY\—ÚYœÝš\
+
+K›ÝÙ\Š
+HOH››Ý\È‚ˆžN‚ˆœ›ÛH\›Y\×ØÛK˜]][\Ü™\ÛÛ™WØ\WÚÙ^WÜ›ÝšY\—ØÜ™Y[X[Âˆœ›ÛH\›Y\×ØÛK›[Ù[×ÜšXÚ[™È[\Ü™]ÚÛ[Ù[×ÝÚ]ÜšXÚ[™Âˆœ›ÛH›ÝšY\œÈ[\ÜÙ]Ü›ÝšY\—Ü›Ùš[BˆÈ[ÜÝÝŒKÛ[Ù[È[™Ú[È\™H]][XØ]YÈ[ˆ[›Ûž[[Ý\ÈHÛÝ[™XY\È››ÈÛX[ˆÈ[Ù[ˆ[™[ˆHÝ\˜]YY˜][›Ü™]™\‹‚ˆ\WÚÙ^K˜\ÙWÝ\›Hˆ‹ˆ‚ˆžN‚ˆÜ™YÈH™\ÛÛ™WØ\WÚÙ^WÜ›ÝšY\—ØÜ™Y[X[Ê›ÝšY\—ÚY
+HÜˆßBˆ\WÚÙ^HHÝŠÜ™YË™Ù]
+˜\WÚÙ^H‹ˆŠJKœÝš\
+
+Bˆ˜\ÙWÝ\›HÝŠÜ™YË™Ù]
+˜˜\ÙWÝ\›‹ˆŠJKœÝš\
+
+Bˆ^Ù\^Ù\[ÛŽ‚ˆÈ›Ý[ˆTKZÙ^H›ÝšY\‹Üˆ›Ý[™ÈÛÛ™šYÝ\™YÈ[›Ûž[[Ý\È™]ÚX^HÝ[ÛÜšË‚ˆÙÙÙ\‹™XYÊ“›ÈÜ™Y[X[È›Üˆ	\ÈØ][ÙÈ‹›ÝšY\—ÚY^×Ú[™›ÏUYJBˆYˆ›Ý\WÚÙ^H[™\×Û›Ý\Î‚ˆÈ›Ý\È\ÈÐ]]
+™\ÛÛ™\ˆ˜Z\Ù\ÊNÈ[›Ûž[[Ý\È™XYÈ™]\›ˆH[Ø][ÙË‚ˆžN‚ˆœ›ÛH\›Y\×ØÛK›[Ù[×ÜšXÚ[™È[\ÜÜ™\ÛÛ™WÛ›Ý\×ÜšXÚ[™×ØÜ™Y[X[Âˆ\WÚÙ^K˜\ÙWÝ\›HÜ™\ÛÛ™WÛ›Ý\×ÜšXÚ[™×ØÜ™Y[X[Ê
+Bˆ^Ù\^Ù\[ÛŽ‚ˆÙÙÙ\‹™XYÊ“›È›Ý\ÈÜ™Y[X[È›ÜˆØ][ÙÈ‹^×Ú[™›ÏUYJBˆYˆ›Ý˜\ÙWÝ\›‚ˆ˜\ÙWÝ\›HÝŠÙ]]ŠÙ]Ü›ÝšY\—Ü›Ùš[J›ÝšY\—ÚY
+K˜˜\ÙWÝ\›‹ˆŠHÜˆˆŠBˆ˜\ÙWÝ\›H˜\ÙWÝ\›œœÝš\
+‹ÈŠBˆYˆ›Ý˜\ÙWÝ\›‚ˆ™]\›ˆˆ‚ˆYˆ˜\ÙWÝ\›™[™ÝÚ]
+‹ÝŒHŠNˆÈ™]ÚÛ[Ù[×ÝÚ]ÜšXÚ[™È\[™ÈÝŒKÛ[Ù[Âˆ˜\ÙWÝ\›H˜\ÙWÝ\›Î‹L×BˆÈ›Ý\Ë[Û›H\™ÜÈ]\ÝX]ÚHXÚÙ\œÉÈÜˆHÙYYYØXÚHÜÙ\ÈØ[HÚ›ÛYH[™ˆÈÛXÞKXØ][ÙÈ^\žK‚ˆÛ›Ý\×ÚÝØ\™ÜÈHßBˆYˆ\×Û›Ý\Î‚ˆœ›ÛH\›Y\×ØÛK›[Ù[×ÜšXÚ[™È[\ÜÓ“ÕT×ÐÐUSÑ×ÕÔÑPÓÓ‘ÂˆÛ›Ý\×ÚÝØ\™ÜÈHÈš[˜ÛYWÜØ[WÛÜšYÚ[˜[ŽˆYK˜ØXÚWÝÜÙXÛÛ™ÈŽˆÓ“ÕT×ÐÐUSÑ×ÕÔÑPÓÓ‘ßBˆØ][ÙÈH™]ÚÛ[Ù[×ÝÚ]ÜšXÚ[™Êˆ\WÚÙ^OX\WÚÙ^HÜˆ›Û™K˜\ÙWÝ\›X˜\ÙWÝ\›[Y[Ý]LËŒ
+Š—Û›Ý\×ÚÝØ\™ÜÊHÜˆßBˆ^Ù\^Ù\[ÛŽ‚ˆÙÙÙ\‹™XYÊ‘˜\Ý[[Ù[Ø][ÙÈÛÚÝ\˜Z[Y›Üˆ	\È‹›ÝšY\—ÚY^×Ú[™›ÏUYJBˆ™]\›ˆˆ‚ˆYÈHÛÜY
+
+ÝŠJH›ÜˆH[ˆØ][ÙÊKÙ^OWÛ[Ù[Ü™XÙ[˜ÞWÚÙ^K™]™\œÙOUYJBˆYˆ\×Û›Ý\Î‚ˆÈ˜\œ›ÝÈØ][ÙÈYÈžHÜ™ÈÛXÞK\ÈHXÚÙ\œÈË‚ˆžN‚ˆœ›ÛH\›Y\×ØÛK›[Ù[×ÜšXÚ[™È[\Ü›Ý\×ÜÛXÞWØ[ÝÙYÚYË™\ÝšXÝÝ×Û›Ý\×ÜÛXÞBˆYÈH™\ÝšXÝÝ×Û›Ý\×ÜÛXÞJYË›Ý\×ÜÛXÞWØ[ÝÙYÚYÊ
+JBˆ^Ù\^Ù\[ÛŽ‚ˆÙÙÙ\‹™XYÊ“›Ý\ÈÛXÞHš[\ˆ[˜]˜Z[X›H‹^×Ú[™›ÏUYJBˆ›Üˆ˜[Z[H[ˆÑTÕÓSÑSÑSRSQTÎ‚ˆ›Üˆ[Ù[ÚY[ˆYÎ‚ˆÝÙ\™YH[Ù[ÚY›ÝÙ\Š
+BˆYˆ˜[Z[H[ˆÝÙ\™Y[™›Ý[žJ[ˆÝÙ\™Y›Üˆ[ˆÑTÕÓSÑSÑVÓQJN‚ˆ™]\›ˆ[Ù[ÚYˆ™]\›ˆˆ‚‚‚ˆÈY˜][]^[X\žH[Ù[È›Üˆ\™XÝTKZÙ^H›ÝšY\œÈ
+ÚX\Ù˜\Ý›ÜˆÚYH\ÚÜÊB™YˆÙÙ]Ø]^Û[Ù[Ù›Ü—Ü›ÝšY\Š›ÝšY\—ÚYˆÝ‹
+‹™Y™\—Ù˜\Ýˆ›ÛÛH˜[ÙJHOˆÝŽ‚ˆˆˆÚX\]^[X\žH[Ù[›ÜˆH›ÝšY\‹‚‚ˆY\Žˆ
+™Y™\—Ù˜\ÝÛ›JH]™KXØ][ÙÈ˜[Z[HX]Ú[ˆ›ÝšY\”›Ùš[Kœ™\ÛÛ™WØ]^Û[Ù[Âˆ[ˆY˜][Ø]^Û[Ù[
+Ý\˜]Y
+NÈ[ˆHYØXÞHXÝˆ™Y™\—Ù˜\Ý\ÈÜZ[ˆ
+][™ÊBˆÛÈÝ\ˆØ[\œÈÙY\Z\ˆÝ]XÈ™Z]š[Ý\ˆ[™ØXÚHÙ^\Ë‚ˆˆˆ‚ˆ›Ùš[HH›Û™BˆÚ]ÛÛ^X‹œÝ\™\ÜÊ^Ù\[ÛŠN‚ˆœ›ÛH›ÝšY\œÈ[\ÜÙ]Ü›ÝšY\—Ü›Ùš[Bˆ›Ùš[HHÙ]Ü›ÝšY\—Ü›Ùš[J›ÝšY\—ÚY
+BˆXÚÙYHˆ‚ˆYˆ™Y™\—Ù˜\Ý‚ˆXÚÙYHÙ˜\ÝÛ[Ù[Ùœ›ÛWØØ][ÙÊ›ÝšY\—ÚY
+BˆYˆ›ÝXÚÙY[™›Ùš[H\È›Ý›Û™N‚ˆžN‚ˆXÚÙYH›Ùš[Kœ™\ÛÛ™WØ]^Û[Ù[
+
+HÜˆˆ‚ˆ^Ù\^Ù\[ÛŽ‚ˆÙÙÙ\‹™XYÊœ™\ÛÛ™WØ]^Û[Ù[˜Z[Y›Üˆ	\È‹›ÝšY\—ÚY^×Ú[™›ÏUYJBˆYˆ›ÝXÚÙY[™›Ùš[H\È›Ý›Û™H[™›Ùš[K™Y˜][Ø]^Û[Ù[‚ˆXÚÙYH›Ùš[K™Y˜][Ø]^Û[Ù[ˆYˆ›ÝXÚÙY‚ˆXÚÙYHÐTWÒÑVWÔ“Õ’QT—ÐUVÓSÑS×ÑSPÒË™Ù]
+›ÝšY\—ÚYˆŠBˆÈ[™ÜÈ‹M\™HÛXÞKX›[™ÈH›ØÚÙYXÚÈ\È™Y\ÙY]™\]Y\Ý[YKÛÈ›Ü][™ˆÈ]HØ[\ˆÙY\HXZ[ˆ[Ù[‚ˆYˆXÚÙY[™›ÝšY\—ÚYœÝš\
+
+K›ÝÙ\Š
+HOH››Ý\ÈŽ‚ˆžN‚ˆœ›ÛH\›Y\×ØÛK›[Ù[×ÜšXÚ[™È[\Ü›Ý\×ÜÛXÞWØ[ÝÙYÚYË™\ÝšXÝÝ×Û›Ý\×ÜÛXÞBˆ[ÝÙYH›Ý\×ÜÛXÞWØ[ÝÙYÚYÊ
+BˆYˆ[ÝÙY[™›Ý™\ÝšXÝÝ×Û›Ý\×ÜÛXÞJÜXÚÙYK[ÝÙY
+N‚ˆ™]\›ˆˆ‚ˆ^Ù\^Ù\[ÛŽ‚ˆÙÙÙ\‹™XYÊ“›Ý\ÈÛXÞHÚXÚÈ[˜]˜Z[X›H‹^×Ú[™›ÏUYJBˆ™]\›ˆXÚÙY‚‚ˆÈ˜[˜XÚÈ›Üˆ›ÝšY\œÈÚ]Ý]›ÝšY\”›Ùš[K™Y˜][Ø]^Û[Ù[
+\ÈÛÛYH[›™Y\™JK‚ˆÈ™]È›ÝšY\œÈÚÝ[Ù]Y˜][Ø]^Û[Ù[[œÝXY‚—ÐTWÒÑVWÔ“Õ’QT—ÐUVÓSÑS×ÑSPÒÎˆXÝÜÝ‹Ý—HHÂˆ™Ù[Z[šHŽˆ™Ù[Z[šKLË‹Y›\Ú‹ž˜ZHŽˆ™ÛKMKY›\Ú‹šÚ[ZKXÛÙ[™ÈŽˆšÚ[ZKZÌ‹]\˜›Ë\™]šY]È‹ˆœÝ\[ˆŽˆœÝ\LËKY›\Ú‹šÚ[ZKXÛÙ[™ËXÛˆŽˆšÚ[ZKZÌ‹]\˜›Ë\™]šY]È‹ˆ™ÛZHŽˆ™ÛÛÙÛKÙÙ[Z[šKLËŒKY›\Ú[]K\™]šY]È‹˜[›ÜXÈŽˆ˜Û]YKZZZÝKMMKLŒLLH‹ˆ˜ZKYØ]]Ø^HŽˆ™ÛÛÙÛKÙÙ[Z[šKLËY›\Ú‹›Ü[˜ÛÙK^™[ˆŽˆ™Ù[Z[šKLËY›\Ú‹›Ü[˜ÛÙKYÛÈŽˆ™ÛKMH‹ˆšÚ[ØÛÙHŽˆ™ÛÛÙÛKÙÙ[Z[šKLË‹Y›\Ú‹›Û[XKXÛÝYŽˆ›™[[Ý›Û‹LË[˜[›ÎŒÌˆ‹ˆ[˜Ù[]ÚÙ[šXˆŽˆšM\™]šY]È‹[˜Ù[]ÚÙ[œ[ˆŽˆšM\™]šY]È‹ˆÈ›È™Y\[™œ˜HŽˆ]È]^[Ù[]™\ÈÛˆH›ÝšY\”›Ùš[H
+™XYš\œÝ
+K‚ŸB‚ˆÈYØXÞH[X\È›ÜˆØ[\œÈ›ÝY]\Ú[™ÈÙÙ]Ø]^Û[Ù[Ù›Ü—Ü›ÝšY\Š
+K‚—ÐTWÒÑVWÔ“Õ’QT—ÐUVÓSÑSÎˆXÝÜÝ‹Ý—HHÐTWÒÑVWÔ“Õ’QT—ÐUVÓSÑS×ÑSPÒÂ‚ˆÈ\ÚÜÈ]X^HÜ[È]^[X\žK\ÚÏ‹œ™Y™\—Ù˜\ÝÛ[Ù[‚—ÑTÕÓSÑSÕTÒÔÎˆœ›Þ™[œÙ]Hœ›Þ™[œÙ]
+È]WÙÙ[™\˜][ÛˆŸJB‚‚™YˆÝ\Ú×Ü™Y™\œ×Ù˜\ÝÛ[Ù[
+\ÚÎˆÜ[Û˜[ÜÝ—JHOˆ›ÛÛ‚ˆˆˆ”™]\›ˆÚ]\ˆ[ˆ[YÚX›H\ÚÈ^XÚ]HÜÈ[È˜\Ý[[Ù[›Ý][™Ëˆˆˆ‚ˆ™]\›ˆ\ÚÈ[ˆÑTÕÓSÑSÕTÒÔÈ[™\×Ý]WÝ˜[YJˆÙÙ]Ø]^[X\žWÝ\Ú×ØÛÛ™šYÊ\ÚÊK™Ù]
+œ™Y™\—Ù˜\ÝÛ[Ù[ŠKY˜][Q˜[ÙJB‚‚ˆÈYXØ]Yš\Ú[Ûˆ[Ù[È›Üˆ\™XÝ›ÝšY\œÈÚÜÙHXZ[ˆÚ][Ù[Y™™\œË‚—Ô“Õ’QT—Õ’TÒSÓ—ÓSÑSÎˆXÝÜÝ‹Ý—HHÈžX[ÛZHŽˆ›Z[[Ë]Œ‹H‹ž˜ZHŽˆ™ÛKM]‹]\˜›ÈŸB‚‚™YˆÜ™\ÛÛ™WÜ›ÝšY\—Ýš\Ú[Û—ÙY˜][
+›ÝšY\ŽˆÝŠHOˆÜ[Û˜[ÜÝ—N‚ˆˆˆ”›ÝšY\ˆY˜][š\Ú[Ûˆ[Ù[YÜˆ›Û™NˆÝ]XÈÔ“Õ’QT—Õ’TÒSÓ—ÓSÑSØ
+š\Ú[Û‹[Û›Bˆ˜[Y\ÈXœÙ[œ›ÛH[žHØ][ÙÊHÚ[‹[ÙH›ÝšY\”›Ùš[K™Y˜][Ýš\Ú[Û—Û[Ù[
+
+Xˆˆˆ‚ˆÝ]XÈHÔ“Õ’QT—Õ’TÒSÓ—ÓSÑSË™Ù]
+›ÝšY\ŠBˆYˆÝ]XÎ‚ˆ™]\›ˆÝ]XÂˆžN‚ˆœ›ÛH›ÝšY\œÈ[\ÜÙ]Ü›ÝšY\—Ü›Ùš[Bˆ›Ùš[HHÙ]Ü›ÝšY\—Ü›Ùš[J›ÝšY\ŠBˆ™]\›ˆ›Ùš[K™Y˜][Ýš\Ú[Û—Û[Ù[
+
+HYˆ›Ùš[H\È›Ý›Û™H[ÙH›Û™Bˆ^Ù\^Ù\[ÛŽ‚ˆ™]\›ˆ›Û™B‚‚ˆÈ[™Ú[È]™Z™XÝ[XYÙH[œ]ˆš\Ú[Ûˆ]]ËY]XÝÚÚ\È\ÙHÈHYÙÜ™YØ]ÜˆÚZ[‚ˆÈ[œÝXYÙˆ™]\›š[™ÈHÛY[]È
+Ú[ZHÛÙ[™È[ˆ[›ÜXÈÚ\™H\È›È[XYÙWÚ[ŠK‚—Ô“Õ’QT”×ÕÒUÕUÕ’TÒSÓŽˆœ›Þ™[œÙ]Hœ›Þ™[œÙ]
+ÈšÚ[ZKXÛÙ[™È‹šÚ[ZKXÛÙ[™ËXÛˆŸJB‚ˆÈ\™XÝY\ÙYZÈ[™Ú[È\™H^[Û›KˆÙY\\ÈÙ\\˜]Hœ›ÛHHX›XÂˆÈÚÚ\[\ÝX›Ý™NˆØ[\œÈ[™ÛÛ\]Xš[]H\ÝÈ™X]]\Ý\ÈBˆÈØÝ[Y[Y[™Ú[[]™[^Ù\[ÛœËÚ[H\È˜[˜XÚÈ\ÈÛ›HÛÛœÝ[YˆÈÚ[ˆH[Ù[Ø][ÙÈ\È[˜]˜Z[X›KˆHØ][ÙÈ™\Ý[Ý[Ú[œËÛÈBˆÈ]\™H^XÚ]HØ][ÙÝYY][[[Ù[Y\ÙYZÈ[Ù[Ø[ˆÜ[‹‚—ÒÓ“ÕÓ—ÕVÓÓ“WÕÒS—ÕSÐUSÑÕQQˆœ›Þ™[œÙ]Hœ›Þ™[œÙ]
+È™Y\ÙYZÈŸJB‚ˆÈÜ[”›Ý]\ˆ\]šX][Ûˆ
+[Ø^\ÈÙ[
+KˆU]X\ÈÚ]H\Ú›Ø\™™XYË‚—ÓÔ—ÒPQT”×ÐTÑHHÂˆ’T™Y™\™\ˆŽˆšÎ‹ËÚ\›Y\ËXYÙ[››Ý\Ü™\ÙX\˜Ú˜ÛÛH‹ˆ–U]HŽˆ’\›Y\ÈYÙ[‹ˆ–SÜ[”›Ý]\‹PØ]YÛÜšY\ÈŽˆœ›ÙXÝ]š]KÛKXYÙ[‹ŸB‚‚™YˆØ\WÝ\Ù\—ÙY˜][ÚXY\œÊXY\œÎˆXÝ›Û™JHOˆXÝ›Û™N‚ˆˆˆ“Y\™ÙH\Ù\ˆ[Ù[™Y˜][ÚXY\œØÛÈ™\ÛÛ™YXY\œÈ
+\Ù\ˆÚ[œÎÈ[Ù[™^˜WÚXY\œØˆ[X\ÈÚ[œÈÝ™\ˆ›Ý
+KˆZ\œ›ÜœÈRPYÙ[—Ø\WÝ\Ù\—ÙY˜][ÚXY\œØÛÈHÝ\ÝÛH[™Ú[™Z[™BˆÐQˆ™Z™XÝ[™È\Ù\‹PYÙ[ÈTÝZ[›\ÜËJ˜ÛÜšÜÈ›Üˆ]^Ø[ËˆÑPÕT’UNˆ™]™\ˆÙÈ˜[Y\Ëˆˆˆ‚ˆžN‚ˆœ›ÛH\›Y\×ØÛK˜ÛÛ™šYÈ[\ÜÙ™×ÙÙ]ØYØÛÛ™šYÂˆØÙ™ÈHØYØÛÛ™šYÊ
+Bˆ\Ù\—ÚXY\œÈHÙ™×ÙÙ]
+ØÙ™Ë›[Ù[‹™Y˜][ÚXY\œÈŠBˆ[X\×ÚXY\œÈHÙ™×ÙÙ]
+ØÙ™Ë›[Ù[‹™^˜WÚXY\œÈŠBˆYˆ\Ú[œÝ[˜ÙJ[X\×ÚXY\œËXÝ
+H[™[X\×ÚXY\œÎ‚ˆ\Ù\—ÚXY\œÈHÊŠŠ\Ù\—ÚXY\œÈYˆ\Ú[œÝ[˜ÙJ\Ù\—ÚXY\œËXÝ
+H[ÙHßJK
+Š˜[X\×ÚXY\œßBˆ^Ù\^Ù\[ÛŽ‚ˆ™]\›ˆXY\œÂˆYˆ›Ý\Ú[œÝ[˜ÙJ\Ù\—ÚXY\œËXÝ
+HÜˆ›Ý\Ù\—ÚXY\œÎ‚ˆ™]\›ˆXY\œÂˆY\™ÙYHXÝ
+XY\œÈÜˆßJBˆY\™ÙY\]JÜÝŠÊNˆÝŠŠH›ÜˆËˆ[ˆ\Ù\—ÚXY\œËš][\Ê
+HYˆˆ\È›Ý›Û™_JBˆ™]\›ˆY\™ÙYÜˆXY\œÂ‚‚™YˆZ[ÛÜ—ÚXY\œÊÜ—ØÛÛ™šYÎˆXÝ›Û™HH›Û™JHOˆXÝ‚ˆˆˆ“Ü[”›Ý]\ˆXY\œË\È™\ÜÛœÙKXØXÚHXY\œÈÚ[ˆ[˜X›Y‚‚ˆ™XÙY[˜ÙH[ˆˆÛÛ™šYÈˆY˜][ˆT“QT×ÓÔS”“ÕUT—ÐÐPÒXÝ™\œšY\ÂˆÜ[œ›Ý]\‹œ™\ÜÛœÙWØØXÚXÈT“QT×ÓÔS”“ÕUT—ÐÐPÒWÕ
+KNÊHÝ™\œšY\ÂˆÜ[œ›Ý]\‹œ™\ÜÛœÙWØØXÚWÝˆÜ—ØÛÛ™šYÏS›Û™X™XYÈœ›ÛH\ÚË‚ˆˆˆ‚ˆXY\œÈHXÝ
+ÓÔ—ÒPQT”×ÐTÑJBˆYˆÜ—ØÛÛ™šYÈ\È›Û™N‚ˆžN‚ˆœ›ÛH\›Y\×ØÛK˜ÛÛ™šYÈ[\ÜØYØÛÛ™šY×Ü™XYÛ›BˆÜ—ØÛÛ™šYÈHØYØÛÛ™šY×Ü™XYÛ›J
+K™Ù]
+›Ü[œ›Ý]\ˆ‹ßJBˆ^Ù\^Ù\[ÛŽ‚ˆÜ—ØÛÛ™šYÈHßBˆ[—ØØXÚHHÜË™[š\›Û‹™Ù]
+’T“QT×ÓÔS”“ÕUT—ÐÐPÒH‹ˆŠKœÝš\
+
+K›ÝÙ\Š
+BˆYˆ›Ý
+[—ØØXÚH[ˆÈŒH‹YH‹žY\È‹›ÛˆŸHYˆ[—ØØXÚH[ÙHÜ—ØÛÛ™šYË™Ù]
+œ™\ÜÛœÙWØØXÚH‹˜[ÙJJN‚ˆ™]\›ˆXY\œÂˆXY\œÖÈ–SÜ[”›Ý]\‹PØXÚH—HHYH‚ˆ[—ÝHÜË™[š\›Û‹™Ù]
+’T“QT×ÓÔS”“ÕUT—ÐÐPÒWÕ‹ˆŠKœÝš\
+
+BˆYˆ[—Ý‚ˆYˆ[—Ýš\ÙYÚ]
+
+H[™HH[
+[—Ý
+HH‚ˆXY\œÖÈ–SÜ[”›Ý]\‹PØXÚKU—HHÝŠ[
+[—Ý
+JBˆ[ÙN‚ˆHÜ—ØÛÛ™šYË™Ù]
+œ™\ÜÛœÙWØØXÚWÝ‹Ì
+BˆYˆ\Ú[œÝ[˜ÙJ
+[›Ø]
+JH[™HHH‚ˆXY\œÖÈ–SÜ[”›Ý]\‹PØXÚKU—HHÝŠ[
+
+JBˆ™]\›ˆXY\œÂ‚‚ˆÈ•’QPH’SHÛÝYš[[™È]šX][ÛŽÈÜÝYØ]Y™XØ]\ÙH•’QPWÐTÑWÕT“X^H™HHØØ[’SK‚—Ó•’QPWÓ’SWÐÓÕQÒPQT”ÈHÈ–P’SS‘ËRS•“ÒÑKSÔ’QÒSˆŽˆ’\›Y\ÐYÙ[ŸB‚‚™YˆZ[ÛšYXWÛš[WÚXY\œÊ˜\ÙWÝ\›ˆÝˆ›Û™JHOˆXÝ‚ˆˆˆ”™]\›ˆ•’QPH’SHÛÝY]šX][ÛˆXY\œÈ›ÜˆZ[›šYXK˜ÛÛH˜Y™šXËˆˆˆ‚ˆ™]\›ˆXÝ
+Ó•’QPWÓ’SWÐÓÕQÒPQT”ÊHYˆ˜\ÙWÝ\›ÚÜÝÛX]Ú\ÊÝŠ˜\ÙWÝ\›ÜˆˆŠKš[YÜ˜]K˜\K›šYXK˜ÛÛHŠH[ÙHßB‚‚ˆÈ™\˜Ù[RHØ]]Ø^H]šX][Ûˆ
+T™Y™\™\ˆ8¡¤ˆ™Y™\œ™\•\›U]H8¡¤ˆ\˜[YJK‚™œ›ÛH\›Y\×ØÛH[\Ü×Ý™\œÚ[Û—×È\ÈÒT“QT×Õ‘T”ÒSÓ‚‚—ÐRWÑÐUUÐVWÒPQT”ÈHÂˆ’T™Y™\™\ˆŽˆšÎ‹ËÚ\›Y\ËXYÙ[››Ý\Ü™\ÙX\˜Ú˜ÛÛH‹ˆ–U]HŽˆ’\›Y\ÈYÙ[‹ˆ•\Ù\‹PYÙ[Žˆˆ’\›Y\ÐYÙ[Þ×ÒT“QT×Õ‘T”ÒSÓŸH‹ŸB‚ˆÈ›Ý\ÈÜ[]šX][Ûˆ^˜WØ›ÙKˆYÜÈÛÛYHœ›ÛHYÙ[œÜ[ÝYÜÈÛÈHÛY[HX\šÙ\‚ˆÈ˜XÚÜÈ\›Y\×ØÛK—×Ý™\œÚ[Û—×È8 %™]™\ˆ[›[™HH]\˜[\™K‚™œ›ÛHYÙ[œÜ[ÝYÜÈ[\Ü›Ý\×ÜÜ[ÝYÜÈ\ÈÛ›Ý\×ÜÜ[ÝYÜÂ‚‚™YˆÛ›Ý\×Ù^˜WØ›ÙJ
+HOˆXÝ‚ˆˆˆ‘œ™\Ú›Ý\ÈÜ[^˜WØ›ÙX
+\ˆØ[ÛÈHÝ\™[ØYY™\œÚ[Ûˆ\È™Y›XÝY
+Kˆˆˆ‚ˆ™]\›ˆÈYÜÈŽˆÛ›Ý\×ÜÜ[ÝYÜÊ
+_B‚‚ˆÈÙ]]™\ÛÛ™H[YH8 %YHYˆH]^[X\žHÛY[Ú[ÈÈ›Ý\ÈÜ[˜]^[X\žWÚ\×Û›Ý\Îˆ›ÛÛH˜[ÙB‚ˆÈÓÔS”“ÕUT—ÓSÑSUTÕÝ^HH™œ™YHÒÕH
+X]Ú[™ÈHœ™YWÛÛ›HØ\›š[™ÊNˆ\È[™H[™ØYÙ\ÂˆÈÚ[[K[™HZYY˜][YX[Ü[™H\Ù\ˆ™]™\ˆÜY[Ëˆ\Ù\‹XÛÛ™šYÝ\™Y˜[Y\ÂˆÈ\™HÛ›Ü™Y[ÝXÚY
+ÝØ\›—ÜZYÛ[™WÛÛ˜ÙHš\™\ÊK‚—ÓÔS”“ÕUT—ÓSÑSH›šYXKÛ™[[Ý›Û‹LË][˜KMML‹XMMXŽ™œ™YH‚—Ó“ÕT×ÓSÑSH™ÛÛÙÛKÙÙ[Z[šKLË‹Y›\Ú‚—Ó“ÕT×ÑQUSÐTÑWÕT“HšÎ‹ËÚ[™™\™[˜ÙKX\K››Ý\Ü™\ÙX\˜Ú˜ÛÛKÝŒH‚—ÐS•“ÔP×ÑQUSÐTÑWÕT“HšÎ‹ËØ\K˜[›ÜXË˜ÛÛH‚—ÐUUÒ”ÓÓ—ÔUHÙ]Ú\›Y\×ÚÛYJ
+HÈ˜]]šœÛÛˆ‚‚ˆÈÜÝÈ^ÜÚ[™È“Õ8 )‹Ø[›ÜXØ[™HÚX›[™ÈÜ[RH8 )‹ÝŒXˆX]ÚYÛˆHT“
+šÜÝ
+‚ˆÈÛ›Nˆ[˜ÛÛ™][Û˜[™]Üš]\Èœ™XZÈ[›ÜXË[Û›HØ]]Ø^\Ë‚—ÑPSÔÕT‘PÑWÐS•“ÔP×ÒÔÕÔÕQ‘’VTÈH
+›Z[š[X^š[È‹›Z[š[X^˜Ú]‹›Z[š[X^K˜ÛÛHŠB—ÑPSÔÕT‘PÑWÐS•“ÔP×ÒÔÕÔ‘Q’VTÈH
+˜\K›Z[š[X^ˆ‹
+B‚‚™YˆÚ\×ÙX[ÜÝ\™˜XÙWØ[›ÜX×ÚÜÝ
+\›ˆÝŠHOˆ›ÛÛ‚ˆˆˆ•YHÚ[ˆHT“	ÜÈÜÝ\ÈHÛ›ÝÛˆX[\Ý\™˜XÙH
+Z[šSX^Y˜[Z[JHÜÝˆˆˆ‚ˆžN‚ˆÜÝH
+\›\œÙJ\›
+KšÜÝ˜[YHÜˆˆŠK›ÝÙ\Š
+Bˆ^Ù\˜[YQ\œ›ÜŽ‚ˆ™]\›ˆ˜[ÙBˆ™]\›ˆ[žJˆÜÝOHÝY™š^ÜˆÜÝ™[™ÝÚ]
+‹ˆˆ
+ÈÝY™š^
+H›ÜˆÝY™š^[ˆÑPSÔÕT‘PÑWÐS•“ÔP×ÒÔÕÔÕQ‘’VTÂˆ
+HÜˆ[žJÜÝœÝ\ÝÚ]
+™Yš^
+H›Üˆ™Yš^[ˆÑPSÔÕT‘PÑWÐS•“ÔP×ÒÔÕÔ‘Q’VTÊB‚‚™YˆÝ×ÛÜ[˜ZWØ˜\ÙWÝ\›
+˜\ÙWÝ\›ˆÝŠHOˆÝŽ‚ˆˆˆ“›Ü›X[^™HX[\Ý\™˜XÙH[›ÜXÈT“ÈÈZ\ˆÜ[RKXÛÛ\]X›HÚX›[™Ë‚‚ˆZ[šSX^Y˜[Z[NˆØ[›ÜXØ8¡¤ˆÝŒXÈRHÛÙ[™È[ˆ8¡¤ˆØÛÙ[™ËÜX\ËÝ
+HÙ[™\˜[ˆ[™Ú[š[ÈÙ\\˜][JNÈÚ[ZHÛÙHØÛÙ[™Ø8¡¤ˆØÛÙ[™ËÝŒX
+HÜ[RHÑÈ]ÂˆÚ]Ý]]
+Kˆ[›ÜXË[Û›HØ]]Ø^\ÈÙY\Z\ˆ]‚ˆˆˆ‚ˆ\›HÝŠ˜\ÙWÝ\›ÜˆˆŠKœÝš\
+
+KœœÝš\
+‹ÈŠBˆYˆ\›™[™ÝÚ]
+‹Ø[›ÜXÈŠN‚ˆYˆ˜\ÙWÝ\›ÚÜÝÛX]Ú\Ê\››Ü[‹˜šYÛ[Ù[˜ÛˆŠHÜˆ˜\ÙWÝ\›ÚÜÝÛX]Ú\Ê\›˜\Kž‹˜ZHŠN‚ˆ™]Üš][ˆH\›Îˆ[[Š‹Ø[›ÜXÈŠWH
+È‹ØÛÙ[™ËÜX\ËÝ‚ˆÙÙÙ\‹™XYÊ]^[X\žHÛY[ˆ™]Ü›ÝHRH˜\ÙHT“	\È8¡¤ˆ	\È‹\›™]Üš][ŠBˆ™]\›ˆ™]Üš][‚ˆYˆÚ\×ÙX[ÜÝ\™˜XÙWØ[›ÜX×ÚÜÝ
+\›
+N‚ˆ™]Üš][ˆH\›Îˆ[[Š‹Ø[›ÜXÈŠWH
+È‹ÝŒH‚ˆÙÙÙ\‹™XYÊ]^[X\žHÛY[ˆ™]Ü›ÝHX[\Ý\™˜XÙH˜\ÙHT“	\È8¡¤ˆ	\È‹\›™]Üš][ŠBˆ™]\›ˆ™]Üš][‚ˆÙÙÙ\‹™XYÊˆ]^[X\žHÛY[ˆÙY\[™È[›ÜXË[Û›H˜\ÙHT“	\È
+›ÈX[\Ý\™˜XÙHÜÝX]Ú
+H‹\›
+Bˆ™]\›ˆ\›ˆYˆ˜\ÙWÝ\›ÚÜÝÛX]Ú\Ê\›˜\KšÚ[ZK˜ÛÛHŠH[™\›™[™ÝÚ]
+‹ØÛÙ[™ÈŠN‚ˆ™]Üš][ˆH\›
+È‹ÝŒH‚ˆÙÙÙ\‹™XYÊ]^[X\žHÛY[ˆ™]Ü›ÝHÚ[ZH˜\ÙHT“	\È8¡¤ˆ	\È‹\›™]Üš][ŠBˆ™]\›ˆ™]Üš][‚ˆ™]\›ˆ\›‚‚™YˆÛØYÜÛÛÝÚ]ØÜ™Y[X[Ê›ÝšY\ŽˆÝ‹›ÝNˆÝˆHˆŠHOˆÜ[Û˜[Ð[žWN‚ˆˆˆ˜ØYÜÛÛ
+›ÝšY\ŠXÚ[ˆ]\ÈÜ™Y[X[Ë[ÙH›Û™H
+™]™\ˆ˜Z\Ù\ÊKˆˆˆ‚ˆžN‚ˆÛÛHØYÜÛÛ
+›ÝšY\ŠBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙÙÙ\‹™XYÊ]^[X\žHÛY[ˆÛÝ[›ÝØYÛÛ›Üˆ	\É\Îˆ	\È‹›ÝšY\‹›ÝK^ÊBˆ™]\›ˆ›Û™Bˆ™]\›ˆÛÛYˆÛÛ[™ÛÛš\×ØÜ™Y[X[Ê
+H[ÙH›Û™B‚‚™YˆÜÙ[XÝÜÛÛÙ[žJ›ÝšY\ŽˆÝŠHOˆ\VØ›ÛÛÜ[Û˜[Ð[žWWN‚ˆˆˆ”™]\›ˆ
+ÛÛÙ^\Ý×Ù›Ü—Ü›ÝšY\‹Ù[XÝYÙ[žJKˆˆˆ‚ˆÛÛHÛØYÜÛÛÝÚ]ØÜ™Y[X[Ê›ÝšY\ŠBˆYˆÛÛ\È›Û™N‚ˆ™]\›ˆ˜[ÙK›Û™BˆžN‚ˆ™]\›ˆYKÛÛœÙ[XÝ
+
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙÙÙ\‹™XYÊ]^[X\žHÛY[ˆÛÝ[›ÝÙ[XÝÛÛ[žH›Üˆ	\Îˆ	\È‹›ÝšY\‹^ÊBˆ™]\›ˆYK›Û™B‚‚™YˆÜYZ×ÜÛÛÙ[žJ›ÝšY\ŽˆÝŠHOˆÜ[Û˜[Ð[žWN‚ˆˆˆ™\ÝYY™›ÜÝ\œ™[Û™^ÛÛ[žHÚ]Ý]]]][™ÈÙ[XÝ[ÛˆÜ™\‹ˆˆˆ‚ˆÛÛHÛØYÜÛÛÝÚ]ØÜ™Y[X[Ê›ÝšY\‹ˆ
+YZÊHŠBˆYˆÛÛ\È›Û™N‚ˆ™]\›ˆ›Û™BˆžN‚ˆÝ\œ™[Ù›ˆHÙ]]ŠÛÛ˜Ý\œ™[‹›Û™JBˆÝ\œ™[HÝ\œ™[Ù›Š
+HYˆØ[X›JÝ\œ™[Ù›ŠH[ÙH›Û™BˆYˆÝ\œ™[\È›Ý›Û™N‚ˆ™]\›ˆÝ\œ™[ˆYZ×Ù›ˆHÙ]]ŠÛÛœYZÈ‹›Û™JBˆYˆØ[X›JYZ×Ù›ŠN‚ˆ™]\›ˆYZ×Ù›Š
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙÙÙ\‹™XYÊ]^[X\žHÛY[ˆÛÝ[›ÝYZÈÛÛ[žH›Üˆ	\Îˆ	\È‹›ÝšY\‹^ÊBˆ™]\›ˆ›Û™B‚‚™YˆÜÛÛÜ[[YWØ\WÚÙ^J[žNˆ[žJHOˆÝŽ‚ˆÈ[[YWØ\WÚÙ^H[™\È›ÝšY\‹\ÜXÚYšXÈ˜[˜XÚÈ
+K™ËˆYÙ[ÚÙ^H›Üˆ›Ý\ÊNÈ›Û™H[žH8¡¤ˆˆ‹‚ˆÙ^HHÙ]]Š[žKœ[[YWØ\WÚÙ^H‹›Û™JHÜˆÙ]]Š[žK˜XØÙ\Ü×ÝÚÙ[ˆ‹ˆŠBˆ™]\›ˆÝŠÙ^HÜˆˆŠKœÝš\
+
+B‚‚™YˆÜÛÛÜ[[YWØ˜\ÙWÝ\›
+[žNˆ[žK˜[˜XÚÎˆÝˆHˆŠHOˆÝŽ‚ˆYˆ[žH\È›Û™N‚ˆ™]\›ˆÝŠ˜[˜XÚÈÜˆˆŠKœÝš\
+
+KœœÝš\
+‹ÈŠBˆYˆÙ]]Š[žKœ›ÝšY\ˆ‹›Û™JHOH››Ý\ÈŽ‚ˆÈØ[›ÛšXØ[]][^Y\ˆ™XY\ˆÛÈH[ˆÝ™\œšYHÚ\™\ÈÛ™H›Ü›X[^˜][Ûˆ]‚ˆœ›ÛH\›Y\×ØÛK˜]][\ÜÛ›Ý\×Ú[™™\™[˜ÙWÙ[—ÛÝ™\œšYBˆ[—Ý\›HÛ›Ý\×Ú[™™\™[˜ÙWÙ[—ÛÝ™\œšYJ
+BˆYˆ[—Ý\›‚ˆ™]\›ˆ[—Ý\›ˆÈ[[YWØ˜\ÙWÝ\›\È›ÝšY\‹X]Ø\™NÈ˜[˜XÚÈ›Üˆ›Û‹TÛÛYÜ™Y[X[[šY\Ë‚ˆ\›H
+Ù]]Š[žKœ[[YWØ˜\ÙWÝ\›‹›Û™JHÜˆÙ]]Š[žKš[™™\™[˜ÙWØ˜\ÙWÝ\›‹›Û™JBˆÜˆÙ]]Š[žK˜˜\ÙWÝ\›‹›Û™JHÜˆ˜[˜XÚÊBˆ™]\›ˆÝŠ\›ÜˆˆŠKœÝš\
+
+KœœÝš\
+‹ÈŠB‚‚ˆÈÜÝÈH]^[›ÜXÈ]X^H™HÚ[Y]šXH[Ù[˜˜\ÙWÝ\›È[ž][™È[ÙH˜[È˜XÚÂˆÈÈH[›ÜXÈY˜][ÛÈH›Ü™ZYÛˆÜÝ™]™\ˆXZÜÈ[‹‚—ÐS•“ÔP×ÐÓÓTUP“WÒÔÕÈHœ›Þ™[œÙ]
+È˜\K˜[›ÜXË˜ÛÛHŸJB‚‚™YˆÚ\×Ø[›ÜX×ØÛÛ\]X›WÚÜÝ
+\›ˆÝŠHOˆ›ÛÛ‚ˆˆˆ•YH›Üˆ˜]]™H[›ÜXÈÜÝÈ[™Ø]]Ø^\ÈÙ\š[™ÈY\ÜØYÙ\È[™\ˆHØ[›ÜXØ]ˆ
+Ø[YHÛÛ™[[Ûˆ\È[[YWÜ›ÝšY\ˆÈÝÜ˜\ÚY—Û™YYY
+KÛÈHÛÛ™šYÝ\™Y[Ù[˜˜\ÙWÝ\›ˆÚÜÙHØ]]Ø^HÛÈ]]\È›Ý\ØØ\™YˆH˜\™H›Û‹P[›ÜXÈ˜\ÙWÝ\›\È˜[ÙKˆˆˆ‚ˆYˆ›Ý\›‚ˆ™]\›ˆ˜[ÙBˆžN‚ˆ\œÙYH\›\œÙJ\›
+BˆYˆ
+\œÙYšÜÝ˜[YHÜˆˆŠKœÝš\
+
+K›ÝÙ\Š
+KœœÝš\
+‹ˆŠH[ˆÐS•“ÔP×ÐÓÓTUP“WÒÔÕÎ‚ˆ™]\›ˆYBˆ]H
+\œÙYœ]ÜˆˆŠKœœÝš\
+‹ÈŠK›ÝÙ\Š
+Bˆ™]\›ˆ]™[™ÝÚ]
+‹Ø[›ÜXÈŠHÜˆ]™[™ÝÚ]
+‹Ø[›ÜXËÝŒHŠBˆ^Ù\^Ù\[ÛŽ‚ˆ™]\›ˆ˜[ÙB‚‚™YˆÛ›Ý\×ÛZ[—ÚÙ^WÝÜÙXÛÛ™Ê
+HOˆ[‚ˆžN‚ˆ™]\›ˆX^
+Œ[
+ÜË™Ù][Š’T“QT×Ó“ÕT×ÓRS—ÒÑVWÕÔÑPÓÓ‘È‹ŒNŠJJBˆ^Ù\
+\Q\œ›Ü‹˜[YQ\œ›ÜŠN‚ˆ™]\›ˆN‚‚™YˆÜØÛÜYÚÙ^WÙ[Š˜[YNˆÝŠHOˆÝŽ‚ˆˆˆ”™XYH›ÝšY\ˆTHÙ^H[ˆ˜\ˆ›ÝYÚH›Ùš[HÙXÜ™]ØÛÜK‚‚ˆ[ˆYÙ[\›œÈHØÛÜIÜÈ™\™XÝ\È]]Üš]]]™H
+HØÛÜYZ\ÜÈ]\Ý›Ý›Üœ›ÝÈ[›Ý\‚ˆ›Ùš[IÜÈÙ^JNÈ[œØÛÜYÝ\\ÐÓH]È˜[˜XÚÈÈÜË™[š\›Û‹‚ˆˆˆ‚ˆYˆ›Ý˜[YN‚ˆ™]\›ˆˆ‚ˆÚ]ÛÛ^X‹œÝ\™\ÜÊ^Ù\[ÛŠN‚ˆœ›ÛHYÙ[œÙXÜ™]ÜØÛÜH[\Ü[œØÛÜYÙXÜ™]\œ›Ü‹Ù]ÜÙXÜ™]ˆÚ]ÛÛ^X‹œÝ\™\ÜÊ[œØÛÜYÙXÜ™]\œ›ÜŠN‚ˆ™]\›ˆ
+Ù]ÜÙXÜ™]
+˜[YJHÜˆˆŠKœÝš\
+
+Bˆ™]\›ˆ
+ÜË™Ù][Š˜[YJHÜˆˆŠKœÝš\
+
+B‚‚ˆÈÛÙ^™\ÜÛœÙ\È8¡¤ˆÚ]˜ÛÛ\][ÛœÈY\\‹ÛÈ]^ÛÛœÝ[Y\œÈ™YY›ÈÚ[™Ù\Ë‚™YˆÜ\œÙWØÛÙ^Ùš[˜[Ü™\ÜÛœÙJš[˜[ˆ[žJHOˆ\VÓ\ÝÜÝ—K\ÝÐ[žWK[žWN‚ˆˆˆ”Ü]HÛÛ\]Y™\ÜÛœÙ\ÈØš™XÝ[È
+^Ü\ËÛÛØØ[Ë\ØYÙJH[ˆÚ]˜ÛÛ\][ÛœÈÚ\Kˆˆˆ‚ˆ^Ü\Îˆ\ÝÜÝ—HH×BˆÛÛØØ[×Ü˜]Îˆ\ÝÐ[žWHH×Bˆ›Üˆ][H[ˆ
+Ù]]Šš[˜[›Ý]]‹›Û™JHÜˆ×JN‚ˆ][WÝ\HHÙšY[
+][K\HŠBˆYˆ][WÝ\HOH›Y\ÜØYÙHŽ‚ˆ›Üˆ\[ˆ
+ÙšY[
+][K˜ÛÛ[ŠHÜˆ×JN‚ˆYˆÙšY[
+\\HŠH[ˆÈ›Ý]]Ý^‹^ŸN‚ˆ^Ü\Ë˜\[™
+ÙšY[
+\^‹ˆŠJBˆ[Yˆ][WÝ\HOH™[˜Ý[Û—ØØ[Ž‚ˆÛÛØØ[×Ü˜]Ë˜\[™
+Ú[\S˜[Y\ÜXÙJˆYWÙšY[
+][K˜Ø[ÚY‹ˆŠK\OH™[˜Ý[Ûˆ‹ˆ[˜Ý[ÛTÚ[\S˜[Y\ÜXÙJˆ˜[YOWÙšY[
+][K›˜[YH‹ˆŠK\™Ý[Y[ÏWÙšY[
+][K˜\™Ý[Y[È‹žßHŠJJJBˆ\ØYÙHH›Û™Bˆ™\ÜÝ\ØYÙHHÙ]]Šš[˜[\ØYÙH‹›Û™JBˆYˆ™\ÜÝ\ØYÙN‚ˆYˆÝJÙ^NˆÝŠHOˆ[‚ˆ™]\›ˆÙ]]Š™\ÜÝ\ØYÙKÙ^K
+HÜˆ
+™\ÜÝ\ØYÙK™Ù]
+Ù^K
+HYˆ\Ú[œÝ[˜ÙJ™\ÜÝ\ØYÙKXÝ
+H[ÙH
+Bˆ\ØYÙHHÚ[\S˜[Y\ÜXÙJˆ›Û\ÝÚÙ[œÏWÝJš[œ]ÝÚÙ[œÈŠKÛÛ\][Û—ÝÚÙ[œÏWÝJ›Ý]]ÝÚÙ[œÈŠKˆÝ[ÝÚÙ[œÏWÝJÝ[ÝÚÙ[œÈŠJBˆ™]\›ˆ^Ü\ËÛÛØØ[×Ü˜]Ë\ØYÙB‚‚™YˆØÛÜÙWÜ]ZY]J\™Ù]ˆ[žK˜Z[\™WÛ›ÝNˆÜ[Û˜[ÜÝ—JHOˆ›Û™N‚ˆˆˆØ[\™Ù]˜ÛÜÙJ
+XYˆ™\Ù[ÈH˜Z[\™H\ÈXYË[ÙÙÙY[™\ˆ˜Z[\™WÛ›ÝX
+Ú[[Ú[ˆ›Û™JKˆˆˆ‚ˆÛÜÙHHÙ]]Š\™Ù]˜ÛÜÙH‹›Û™JBˆYˆØ[X›JÛÜÙJN‚ˆžN‚ˆÛÜÙJ
+Bˆ^Ù\^Ù\[ÛŽ‚ˆYˆ˜Z[\™WÛ›ÝN‚ˆÙÙÙ\‹™XYÊÛÙ^]^[X\žNˆ	\È‹˜Z[\™WÛ›ÝK^×Ú[™›ÏUYJB‚‚˜Û\ÜÈÐÛÙ^Ý™X[QÝX\™‚ˆˆˆ”›ÙÜ™\ÜËX]Ø\™HXY[™H
+È‘\ØY™H[Y[Ý]Ø]ÚÙÈ›ÜˆÛ™HÛÙ^]^Ý™X[H][\‚‚ˆ
+JHHš\œÝÝXœÝ[]™H^[ØY]\Ý\œš]™HÚ][ˆ›×Ü›ÙÜ™\Ü×Ý[Y[Ý]ÜˆÙH˜Z[˜\Ý[ÂˆHØ[\‰ÜÈ™]žKÙ˜[˜XÚÈÚZ[ˆ
+HXYÜˆÙY\[]™K[Û›H›ÛXšYH]\Ý›ÝÛHYÙ]
+NÂˆ
+ŠHXXÚÝXœÝ[]™H]™[™KX\›\È]Ú[™ÝÈ
+ÙY\[]™KÛY™XÞXÛHœ˜[Y\ÈÈ“ÕZ\œ›Üš[™ÂˆÛÛ[Z]Y™[˜ÙHØ][™ÊHÛÈH]™HÝ™X[H\È™]™\ˆÚ[YžH[ˆXœÛÛ]HÝ[È
+ÊHH\™ÙZ[[™Âˆœ›ÛHØ]^ÜÝ™X[WÝÝ[ØÙZ[[™ØÝ[\›Z[˜]\ÈH]ÛÙÚXØ[š\‚ˆˆˆ‚‚ˆYˆ×Ú[š]×ÊÙ[‹ÛY[ˆ[žKÝ[Ý[Y[Ý]ˆÜ[Û˜[Ù›Ø]JN‚ˆÙ[‹—ØÛY[HÛY[ˆÙ[‹Ý[Ý[Y[Ý]HÝ[Ý[Y[Ý]ˆÙ[‹—ÜÝ\H[YK›[Û›ÝÛšXÊ
+BˆÙ[‹››×Ü›ÙÜ™\Ü×Ý[Y[Ý]HÐUVÔÕ‘PSWÓ“×Ô“ÑÔ‘TÔ×ÕSQSÕUÔÑPÓÓ‘ÂˆÈ›ÙÜ™\ÜËX]Ø\™HÝ™X[HXY[™\È
+Ý\\œÙY\ÈHÛÚ[™ÛHXœÛÛ]HÚ[]Ý[Ý[Y[Ý]
+K‚ˆÈ™YH™YÚ[Y\ÎˆKˆš\œÝÚÙ[ŽˆHÝ™X[H]\Ý›ÙXÙH]Èš\œÝÝXœÝ[]™H^[ØYÚ][‚ˆÈ›×Ü›ÙÜ™\Ü×Ý[Y[Ý]
+ŒÈY˜][
+HÜˆÙH˜Z[˜\Ý[™]HØ[\‰ÜÈ›Ü›X[™]žKÙ˜[˜XÚÂˆÈÚZ[ˆ[ˆ8 %HXY
+ÜˆÙY\[]™K[Û›H›ÛXšYJHÛÙ^Ý™X[H›ÈÛ™Ù\ˆÛÈH[ÌÂˆÈÛÛ\™\ÜÚ[ÛˆYÙ]™Y›Ü™H˜[[™È˜XÚÈ
+X\ÛÜšXH™\Ü]YÈŒŽˆÈÝXÚÙYÌÈØZ]ÈOˆŒ
+ÈZ[‚ˆÈÝXÚÈÛˆ”Ý[[X\š^š[™ÈŠKˆ‹ˆÝ™X[Z[™Îˆ]™\žHÝXœÝ[]™H]™[™KX\›\ÈHXY[™HžBˆÈ›×Ü›ÙÜ™\Ü×Ý[Y[Ý]8 %H]™HÝ™X[H\È™]™\ˆÚ[YžH[ˆXœÛÛ]HÝ[ÛÈHÛ™È™X\ÛÛš[™ÂˆÈÝ[[X\žH]\ÈXÝX[H›ÙXÚ[™ÈÚÙ[œÈÛÛ\]\È[œÝXYÙˆ[Z[™ÈÝ]]ÌÈ[™˜[[™È˜XÚÂˆÈ
+ÍMLMIÜÈÜšYÚ[˜[ÛÛ\Z[š^Y›Ü\›JKˆÙY\[]™KÛY™XÞXÛHœ˜[Y\ÈÈ“Õ™KX\›KZ\œ›Üš[™ÂˆÈHÛÛ[Z]Y™[˜ÙH›ÙÜ™\ÜÈØ][™È
+ÎMÌÊKˆËˆ\™ÙZ[[™Îˆ[ˆXœÛÛ]H˜XÚÜÝÜœ›ÛBˆÈØ]^ÜÝ™X[WÝÝ[ØÙZ[[™Ø
+X^
+ŒËÛÛ™šYÝ\™Y[Y[Ý]
+H8 %HØ[YH›Ý[™HÝ™X[YYˆÈÚ]˜ÛÛ\][ÛœÈ]\Ù\ÊHÛÈH]ÛÙÚXØ[Û™K]ÚÙ[‹\\‹MN\Èš\Ý[\›Z[˜]\Ë‚ˆYˆÝ[Ý[Y[Ý]\È›Ý›Û™N‚ˆÙ[‹››×Ü›ÙÜ™\Ü×Ý[Y[Ý]HZ[ŠÙ[‹››×Ü›ÙÜ™\Ü×Ý[Y[Ý]›Ø]
+Ý[Ý[Y[Ý]
+JBˆÙ[‹š\™ÙXY[™HHÙ[‹—ÜÝ\
+ÈØ]^ÜÝ™X[WÝÝ[ØÙZ[[™ÊÝ[Ý[Y[Ý]
+BˆÈHØZ][™ÈÜÝ	ÜÈXœÛÛ]HXY[™HÛ[\ÈHÙZ[[™ÈÛÈHØ]ÚÙÈ[Y\ˆÙ]™\œÂˆÈHÛØÚÙ]H[œÝ[HÜÝÝÜÈØZ][™È8 %HÝ™X[H›ØÚÙY™]ÙY[ˆ]™[ÂˆÈØ[‰Ý™HÝÜYžHH\‹Y]™[ÚXÚË‚ˆÜÝÙXY[™HHØÝ\œ™[Ø]^ÜÝ™X[WÙXY[™J
+BˆYˆ\Ú[œÝ[˜ÙJÜÝÙXY[™K
+[›Ø]
+JH[™ÜÝÙXY[™HÙ[‹š\™ÙXY[™N‚ˆÙ[‹š\™ÙXY[™HH›Ø]
+ÜÝÙXY[™JBˆÙ[‹—ÙXY[™WÛØÚÈH™XY[™Ë“ØÚÊ
+BˆÙ[‹—Ü›ÙÜ™\Ü×ÙXY[™HHÙ[‹—ÜÝ\
+ÈÙ[‹››×Ü›ÙÜ™\Ü×Ý[Y[Ý]ˆÙ[‹œØ]×ØÛÛ[H™XY[™Ë‘]™[
+
+BˆÙ[‹[YYÛÝ]H™XY[™Ë‘]™[
+
+BˆÈÙ]Û›HÚ[ˆH[Y[Ý]ÓÓˆ
+›ÝÚ[ˆHÝÛ™\ˆ\™XØ[˜Ù[Yš\œÝ
+Nˆ[ÈBˆÈÝÛ™\‰ÜÈš[˜[XHÚ\™YÛY[	ÜÈ‘ÈÝ[™YYH™X[ÛÜÙK‚ˆÙ[‹[Y[Ý]Ü™[X\ÙWÜ[™[™ÈH™XY[™Ë‘]™[
+
+BˆÙ[‹œÝ™X[WÙš[š\ÚYH™XY[™Ë‘]™[
+
+BˆÙ[‹—Ý[Y\ˆH›Û™BˆÈHÝÛ™\ˆX^H™]\›ˆÛˆ\™Ø[˜Ù[Ú[H\È][\\ÈÝ[›ØÚÙY[ˆHÑÂˆÈÝ™X[Kˆ[Y\ˆ™XYÈÛ‰Ý[š\š]HÛÜšÙ\‰ÜÈ™XY[ØØ[›ÝXÝ[ÛˆÝ]KÛÂˆÈœ™Y^™HH\™XØ[˜Ù[ÛÝ\˜ÙH™Y›Ü™HÜ™X][™ÈH[Y\‹‚ˆÙ[‹—Ü›ÝXÝYØØ[˜Ù[ØÚXÚÈHØØ\\™WØ]^ØØ[˜Ù[ØÚXÚÊ
+HYˆØ]^Ú[\œ\Ü›ÝXÝY
+
+H[ÙH›Û™BˆÙ[‹—Ø][\ÜÝ™X[WÛØÚÈH™XY[™Ë“ØÚÊ
+BˆÙ[‹—Ø][\ÜÝ™X[Nˆ[žHH›Û™BˆÈH™\]Y\ÝYš]š[™È™XYÝÛœÈH˜[œÜÜ‘È8 %ÙYHØÛÜÙWØÛY[ÛÛ—Ý[Y[Ý]‚ˆÙ[‹—ÛÝÛ™\—ÝYH™XY[™Ë™Ù]ÚY[
+
+B‚ˆYˆY™™XÝ]™WÙXY[™JÙ[ŠHOˆ›Ø]‚ˆÚ]Ù[‹—ÙXY[™WÛØÚÎ‚ˆ™]\›ˆZ[ŠÙ[‹š\™ÙXY[™KÙ[‹—Ü›ÙÜ™\Ü×ÙXY[™JB‚ˆYˆØ[˜Ù[Ü™\]Y\ÝY
+Ù[ŠHOˆ›ÛÛ‚ˆˆˆ•YHÚ[ˆHœ›Þ™[ˆ\™XØ[˜Ù[ÛÝ\˜ÙHØ^\ÈHÝÛ™\ˆ[™XYHØ[˜Ù[Yˆˆˆ‚ˆÚXÚÈHÙ[‹—Ü›ÝXÝYØØ[˜Ù[ØÚXÚÂˆ™]\›ˆØ[X›JÚXÚÊH[™ØØ\\™YØ]^ØØ[˜Ù[Ü™\]Y\ÝY
+ÚXÚÊB‚ˆYˆYÜÜÝ™X[JÙ[‹Ý™X[Nˆ[žJHOˆ›Û™N‚ˆÚ]Ù[‹—Ø][\ÜÝ™X[WÛØÚÎ‚ˆÙ[‹—Ø][\ÜÝ™X[HHÝ™X[B‚ˆYˆ™[X\ÙWÜÝ™X[JÙ[‹Ý™X[Nˆ[žJHOˆ›Û™N‚ˆˆˆ“ÝÛ™\‹\ÚYNˆÛÜÙHH][\Ý™X[HÚ[[H[™›Ü™Ù]]ˆˆˆ‚ˆØÛÜÙWÜ]ZY]JÝ™X[K›Û™JBˆÚ]Ù[‹—Ø][\ÜÝ™X[WÛØÚÎ‚ˆÙ[‹—Ø][\ÜÝ™X[HH›Û™B‚ˆYˆÛÜÙWØ][\ÜÝ™X[JÙ[‹˜Z[\™WÛ›ÝNˆÝŠHOˆ›Û™N‚ˆˆˆÛÜÙ\ÈÛ›H\È][\	ÜÈÝ™X[H8 %™]™\ˆH›ØÙ\ÜË\Ú\™YÛY[ˆˆˆ‚ˆÚ]Ù[‹—Ø][\ÜÝ™X[WÛØÚÎ‚ˆÝ™X[HHÙ[‹—Ø][\ÜÝ™X[BˆØÛÜÙWÜ]ZY]JÝ™X[K˜Z[\™WÛ›ÝJB‚ˆYˆ™XÛÜ™Ü›ÙÜ™\ÜÊÙ[ŠHOˆ›Û™N‚ˆˆˆ”ÝXœÝ[]™H^[ØY™KX\›\ÈH›Ë\›ÙÜ™\ÜÈÚ[™ÝÎÈH\™ÙZ[[™È™]™\ˆ[Ý™\Ëˆˆˆ‚ˆÚ]Ù[‹—ÙXY[™WÛØÚÎ‚ˆÙ[‹—Ü›ÙÜ™\Ü×ÙXY[™HH[YK›[Û›ÝÛšXÊ
+H
+ÈÙ[‹››×Ü›ÙÜ™\Ü×Ý[Y[Ý]‚ˆYˆ[Y[Ý]ÛY\ÜØYÙJÙ[ŠHOˆÝŽ‚ˆ[\ÙYH[YK›[Û›ÝÛšXÊ
+HHÙ[‹—ÜÝ\ˆYˆ[YK›[Û›ÝÛšXÊ
+HHÙ[‹š\™ÙXY[™N‚ˆ™]\›ˆˆÛÙ^]^[X\žH™\ÜÛœÙ\ÈÝ™X[H^ÙYYYÜÙ[‹š\™ÙXY[™HHÙ[‹—ÜÝ\‹ŒYŸ\È\™ÙZ[[™È‚ˆYˆ›ÝÙ[‹œØ]×ØÛÛ[š\×ÜÙ]
+
+N‚ˆ™]\›ˆ
+ˆÛÙ^]^[X\žH™\ÜÛœÙ\ÈÝ™X[H›ÙXÙY›ÈÝ]]‚ˆˆÚ][ˆÙ›Ø]
+Ù[‹››×Ü›ÙÜ™\Ü×Ý[Y[Ý]
+N‹ŒYŸ\È
+›Ë\›ÙÜ™\ÜÈ[Y[Ý]Ù[\ÙY‹ŒYŸ\È[\ÙY
+HŠBˆ™]\›ˆ
+ˆÛÙ^]^[X\žH™\ÜÛœÙ\ÈÝ™X[HÝ[Yˆ›È™]ÈÝ]]‚ˆˆ™›ÜˆÙ›Ø]
+Ù[‹››×Ü›ÙÜ™\Ü×Ý[Y[Ý]
+N‹ŒYŸ\È
+Ù[\ÙY‹ŒYŸ\È[\ÙY
+HŠB‚ˆYˆØÛÜÙWØÛY[ÛÛ—Ý[Y[Ý]
+Ù[ŠHOˆ›Û™N‚ˆ™YÚ[—Ý[Y[Ý]ØÛX[\HÙ]]ŠÙ[‹—Ü›ÝXÝYØØ[˜Ù[ØÚXÚË˜™YÚ[—Ý[Y[Ý]ØÛX[\‹›Û™JBˆYˆØ[X›J™YÚ[—Ý[Y[Ý]ØÛX[\
+N‚ˆ[Y[Ý]ÝÛÛˆH›ÛÛ
+™YÚ[—Ý[Y[Ý]ØÛX[\
+
+JBˆ[ÙN‚ˆ[Y[Ý]ÝÛÛˆH›ÝÙ[‹˜Ø[˜Ù[Ü™\]Y\ÝY
+
+BˆÈX›\Ú˜[œÜÜ[Y[Ý]Û›HY\ˆH][\[ØØ[XÚ\Ú[Ûˆ\Èš^YÛÈÝÛ™\‚ˆÈÛ[™ÈØ[››ÝØœÙ\™HÛÛ\][Ûˆ[ˆ™]ÙY[‹‚ˆÙ[‹[YYÛÝ]œÙ]
+
+BˆYˆ›Ý[Y[Ý]ÝÛÛŽ‚ˆÈÝÛ™\ˆ[™XYH\™XØ[˜Ù[YˆHÜ[RHÛY[\È›ØÙ\ÜË\Ú\™YÛÈ™]™\‚ˆÈÛÜÙKÙ]šXÝ]\™NÈØZÙHÛ›H\È][\	ÜÈÝ™X[HYˆ™\ÜÛœÙ\Ë˜Ü™X]J
+BˆÈ™]\›™YÛ™K[ÙH™[HÛˆH›Ý[™YÑÈ[Y[Ý]‚ˆÙ[‹˜ÛÜÙWØ][\ÜÝ™X[J˜Ø[˜Ù[Y][\Ý™X[HÛÜÙH\š[™È[Y[Ý]˜Z[YŠBˆ™]\›‚ˆÈ‘[ÝÛ™\œÚ\ÛÛ˜XÝˆÛ›HH™XYš]š[™ÈH™\]Y\ÝX^HÛÜÙJ
+X\ÂˆÈÛY[	ÜÈ‘Ëˆœ›ÛHHÝ˜[™Ù\ˆ™XY
+HØ]ÚÙÈ[Y\ŠHÛ›HÚ]ÝÛŠ
+X\ÂˆÈ‘\ØY™H8 %ÛÜÙJ
+X™[X\Ù\ÈH˜]ÈÈ™Ú[HHÝÛ™\‰ÜÈÜ[”ÔÓ’SÈÝ[ˆÈØXÚ\È]HÙ\›™[™XÞXÛ\È]
+K™Ëˆ[ÈHÔS]H[™JK[™HÝÛ™\‰ÜÈÂˆÈ›\ÚÛÜœ\È]š[KˆHÝÛ™\ˆÙ\ÈH™X[ÛÜÙH[ˆ]Èš[˜[X‚ˆÈ\ÈØ[˜XÚÈ\ÈÛÈØ[\œÈ8 %ØÚXÚ×ØØ[˜Ù[YÛˆHÝÛš[™È™XY[™HY[[ÛˆØ]ÚÙÂˆÈ™XY[™Ë•[Y\˜ÚXÚ\ÈHÝ˜[™Ù\ˆ™XYˆHÝÛš[™È™XY\™›Ü›\ÈH™X[ÛÜÙH[ˆBˆÈš[˜[X™[ÝËÚXÚ\ÈÚ\™HH‘™[X\ÙH™[Û™ÜËˆÙYHÍÌÍÌË‚ˆÙ[‹[Y[Ý]Ü™[X\ÙWÜ[™[™ËœÙ]
+
+BˆYˆ™XY[™Ë™Ù]ÚY[
+
+HOHÙ[‹—ÛÝÛ™\—ÝY‚ˆØÛÜÙWÜ]ZY]JÙ[‹—ØÛY[˜ÛY[ÛÜÙH\š[™È[Y[Ý]˜Z[YŠBˆ[ÙN‚ˆžN‚ˆœ›ÛHYÙ[˜YÙ[Ü[[YWÚ[\œÈ[\Ü›Ü˜ÙWØÛÜÙWÝÜÜÛØÚÙ]ÂˆÚ]ÝÛ—ØÛÝ[H›Ü˜ÙWØÛÜÙWÝÜÜÛØÚÙ]ÊÙ[‹—ØÛY[
+BˆÙÙÙ\‹š[™›ÊˆÛÙ^]^[X\žHÛY[X›ÜY
+[Y[Ý]ÜÙ›Ü˜ÙWØÛÜÙYIY‚ˆ™Y™\œ™YØÛÜÙO\Ý˜[™Ù\—Ý™XY
+H‹Ú]ÝÛ—ØÛÝ[
+Bˆ^Ù\^Ù\[ÛŽ‚ˆÙÙÙ\‹™XYÊÛÙ^]^[X\žNˆÛY[X›Ü\š[™È[Y[Ý]˜Z[Y‹^×Ú[™›ÏUYJBˆÈÛØÚÙ]Ú]ÝÛˆÛ›HØZÙ\ÈH™XY\ˆÛˆH‘PS˜[œÜÜÈHÝÛ™\ˆX^H™H›ØÚÙYˆÈ[œÚYHHÑÉÜÈ]™[Ý™X[H
+ÜˆHÛØÚÙ]\ÜÈ\ÝÝX›JKˆÛÜÚ[™ÈBˆÈ][\[ÝÛ™YÝ™X[H™[X\Ù\È]Ú]Ý]ÝXÚ[™ÈÚ\™Y‘Ë‚ˆÙ[‹˜ÛÜÙWØ][\ÜÝ™X[J˜][\Ý™X[HÛÜÙH\š[™ÈÝ˜[™Ù\‹]™XY[Y[Ý]˜Z[YŠBˆÈH]^ÛY[ØXÚHÜ˜\È\ÈØ[YHÛY[È›ÜH[žHÛÈH™^]^Ø[ˆÈÙ\Û‰Ý™]\ÙHHXY˜[œÜÜ[™˜Z[˜\Ý‚ˆžN‚ˆÈY\ˆÙHÛÜÙHH˜[œÜÜX›Ý™KHØXÚH]\Ý›Ü][žH8 %Ý\Ú\ÙHH™^ˆÈ]^[X\žHØ[
+ÛÛ\™\ÜÚ[Ûˆ™]žKY[[ÜžH›\Ú]ËŠH™]\Ù\ÈHXYÛY[[™˜Z[È˜\ÝˆÈÚ]HÛÛ›™XÝ[Ûˆ\œ›Ü‹ˆÙYH\ÜÝYHÌŒÍÌ‹‚ˆÙ]šXÝØØXÚYØÛY[Ú[œÝ[˜ÙJÙ[‹—ØÛY[
+Bˆ^Ù\^Ù\[ÛŽ‚ˆÙÙÙ\‹™XYÊÛÙ^]^[X\žNˆØXÚH]šXÝ[ÛˆÛˆ[Y[Ý]˜Z[Y‹^×Ú[™›ÏUYJB‚ˆYˆÚXÚ×ØØ[˜Ù[Y
+Ù[ŠHOˆ›Û™N‚ˆYˆÙ[‹Ý[Ý[Y[Ý]\È›Ý›Û™H[™[YK›[Û›ÝÛšXÊ
+HHÙ[‹™Y™™XÝ]™WÙXY[™J
+N‚ˆYˆ›ÝÙ[‹[YYÛÝ]š\×ÜÙ]
+
+N‚ˆÙ[‹—ØÛÜÙWØÛY[ÛÛ—Ý[Y[Ý]
+
+Bˆ˜Z\ÙH[Y[Ý]\œ›ÜŠÙ[‹[Y[Ý]ÛY\ÜØYÙJ
+JBˆžN‚ˆœ›ÛHÛÛËš[\œ\[\Ü\×Ú[\œ\YˆÈ›ÝXÝY]ÛZXÈ]^\ÚÜÈ
+ÛÛ\™\ÜÚ[ÛŠH]\Ý›ÝX›ÜÛˆHZYY›YÚØ]]Ø^BˆÈ[\œ\
+YÜ˜YY˜[˜XÚÈX\šÙ\ŠNÈ^XÚ]ÜÝØ[˜Ù[\È]ÈÝÛˆ^Ù\[Û‹‚ˆYˆØ]^Ú[\œ\ØØ[˜Ù[Ü™\]Y\ÝY
+
+N‚ˆ˜Z\ÙH]^[X\žQ^XÚ]Ø[˜Ù[][ÛŠ
+BˆÈ^XÚ]ÜÝØ[˜Ù[][Ûˆ\È]ÈÝÛˆœ›Þ™[ˆ^Ù\[ÛŽÈ[Y[Ý]ÈX›Ý™HÝ[š\™H[™Ý\‚ˆÈ]^\ÚÜÈ™[XZ[ˆ[\œ\X›KˆÙYHÌŒÎMÍK‚ˆYˆ\×Ú[\œ\Y
+
+H[™›ÝØ]^Ú[\œ\Ü›ÝXÝY
+
+N‚ˆ˜Z\ÙH[\œ\Y\œ›ÜŠÛÙ^]^[X\žH™\ÜÛœÙ\ÈÝ™X[H[\œ\YŠBˆ^Ù\[\œ\Y\œ›ÜŽ‚ˆ˜Z\ÙBˆ^Ù\^Ù\[ÛŽ‚ˆÈ[\œ\Ý]H\È™\ÝYY™›ÜVÈ™]™\ˆH™]È˜Z[\™H[ÙK‚ˆ\ÜÂ‚ˆYˆÝØ]ÚÙ×Ùš\™JÙ[ŠHOˆ›Û™N‚ˆÈ™KX\›XX›NˆYˆ›ÙÜ™\ÜÈ[Ý™YHXY[™H›ÜØ\™™\ØÚY[H[œÝXYÙˆÚ[[™ÈBˆÈ]™HÝ™X[K‚ˆ™[XZ[š[™ÈHÙ[‹™Y™™XÝ]™WÙXY[™J
+HH[YK›[Û›ÝÛšXÊ
+BˆYˆ™[XZ[š[™Èˆ‚ˆYˆ›Ý
+Ù[‹[YYÛÝ]š\×ÜÙ]
+
+HÜˆÙ[‹œÝ™X[WÙš[š\ÚYš\×ÜÙ]
+
+JN‚ˆÙ[‹—Ø\›WÝ[Y\Š™[XZ[š[™ÊBˆ™]\›‚ˆÙ[‹—ØÛÜÙWØÛY[ÛÛ—Ý[Y[Ý]
+
+B‚ˆYˆØ\›WÝ[Y\ŠÙ[‹[^Nˆ›Ø]
+HOˆ›Û™N‚ˆÙ[‹—Ý[Y\ˆHH™XY[™Ë•[Y\Š[^KÙ[‹—ÝØ]ÚÙ×Ùš\™JBˆ™Y[[ÛˆHYBˆœÝ\
+
+B‚ˆYˆÝ\
+Ù[ŠHOˆ›Û™N‚ˆˆˆ\›HHØ]ÚÙÈ
+Ú[ˆHÝ[[Y[Ý]^\ÝÊH[™[ˆHš\œÝØ[˜Ù[ÚXÚËˆˆˆ‚ˆYˆÙ[‹Ý[Ý[Y[Ý]‚ˆÙ[‹—Ø\›WÝ[Y\ŠX^
+Ù[‹™Y™™XÝ]™WÙXY[™J
+HH[YK›[Û›ÝÛšXÊ
+KŒ
+JBˆÙ[‹˜ÚXÚ×ØØ[˜Ù[Y
+
+B‚ˆYˆÛ—Ù]™[
+Ù[‹Ù]™[ˆ[žJHOˆ›Û™N‚ˆÈ”[[Y]žH™XÛÜ™È]™\žHœ˜[YK]›ÜØ\™›ÙÜ™\ÜÈ
+ÛÛ\™\ÜÚ[ÛˆÛÛ[Z]™[˜ÙKˆÈ›Ë\›ÙÜ™\ÜÈÚ[™ÝÊHÛÝ[ÈÛ›HÝXœÝ[]™H^[ØYÈ8 %ÙY\[]™\È]\Ý›Ý™KX\›KˆÈÛÈH›ÛXšYHÝ™X[HY\È]HØ[YHÚ[™ÝÈ\ÈHXYÛÛ›™XÝ[Û‹‚ˆÈÎLÍLˆÙY\[ÈÚ\™KY›Ü›X]^[ØYÝ]ÙˆHÑÉÜÈÒSZÛ[™È™\]Y\Ý˜[œÙ›Ü›HÛˆ]^[X\žBˆÈØ[ÈÛË‚ˆYˆØÛÙ^Ù]™[Ú\×ØÛÛ[
+Ù]™[
+N‚ˆÙ[‹œ™XÛÜ™Ü›ÙÜ™\ÜÊ
+BˆÙ[‹œØ]×ØÛÛ[œÙ]
+
+BˆÛ›ÝYžWØ]^Ü›ÝšY\—Ü™\ÜÛœÙJ
+Bˆ[ÙN‚ˆÛ›ÝYžWØ]^Ý[Z[™×Ü™\ÜÛœÙJ
+BˆÙ[‹˜ÚXÚ×ØØ[˜Ù[Y
+
+B‚ˆYˆš[š\Ú
+Ù[ŠHOˆ›Û™N‚ˆˆˆ“ÝÛ™\ˆš[˜[XˆÝÜHØ]ÚÙÈ[™™[X\ÙH‘ÈHÝ˜[™Ù\‹]™XY[Y[Ý]Û›HÚ]ÝÛ‹ˆˆˆ‚ˆÙ[‹œÝ™X[WÙš[š\ÚYœÙ]
+
+BˆYˆÙ[‹—Ý[Y\ˆ\È›Ý›Û™N‚ˆÙ[‹—Ý[Y\‹˜Ø[˜Ù[
+
+BˆÈØ]YÛˆ[Y[Ý]Ü™[X\ÙWÜ[™[™Ë“Õ[YYÛÝ]ˆY\ˆH\™XØ[˜Ù[HÚ\™YˆÈÛY[]\ÝÝ^H\ØX›H›ÜˆÝ\ˆÙ\ÜÚ[ÛœË‚ˆYˆÙ[‹[Y[Ý]Ü™[X\ÙWÜ[™[™Ëš\×ÜÙ]
+
+N‚ˆØÛÜÙWÜ]ZY]JÙ[‹—ØÛY[›ÝÛ™\‹]™XYÛÜÙHY\ˆ[Y[Ý]˜Z[YŠB‚‚˜Û\ÜÈÐÛÙ^ÛÛ\][ÛœÐY\\Ž‚ˆˆˆ‘›ÜZ[ˆÚ[H›Ý][™ÈÚ]˜ÛÛ\][ÛœË˜Ü™X]J
+HÝØ\™ÜÈ›ÝYÚÛÙ^™\ÜÛœÙ\ÈÝ™X[Z[™Ëˆˆˆ‚‚ˆYˆ×Ú[š]×ÊÙ[‹™X[ØÛY[ˆÜ[RK[Ù[ˆÝŠN‚ˆÙ[‹—ØÛY[H™X[ØÛY[ˆÙ[‹—Û[Ù[H[Ù[‚ˆYˆØZ[Ü™\ÜÛœÙ\×ÚÝØ\™ÜÊÙ[‹ÝØ\™ÜÎˆXÝÜÝ‹[žWJHOˆ\VÑXÝÜÝ‹[žWKÝ‹[žWN‚ˆˆˆ˜Ú]˜ÛÛ\][ÛœÈÝØ\™ÜÈ8¡¤ˆ™\ÜÛœÙ\ÈTHÝØ\™ÜË
+™\ÜÚÝØ\™ÜË[Ù[[Y[Ý]
+XÈZ\œ›ÜœÈÛÙ^œNŽ˜Z[ÚÝØ\™ÜËˆˆˆ‚ˆœ›ÛH][È[\Ü˜\ÙWÝ\›ÚÜÝÛX]Ú\ÂˆÈÙ\\˜]HÞ\Ý[KÚ[œÝXÝ[ÛœÈœ›ÛH™\^XX›HÛÛ™\œØ][ÛˆY\ÜØYÙ\Ë[ˆ›Ý]HH™\Ý›ÝYÚˆÈHÒS‘ÓHÚ\™YÚ]O”™\ÜÛœÙ\ÈÛÛ™\\ˆ\ÙYžHHXZ[ˆYÙ[˜[œÜÜˆÈ
+YÙ[Ý˜[œÜÜËØÛÙ^œJKˆXZ[Z[š[™ÈHš]˜]HÛÛ™\œÚ[ÛˆÛÜ\™H]Ú]\Ý[HY\ÜØYÙ\ÂˆÈÚ]›ÛOHÛÛˆXZÈÝ˜ZYÚ[È™\ÜÛœÙ\È[œ]×H8 %ÚXÚH™\ÜÛœÙ\ÈTH™Z™XÝÈÚ]ˆÈ’[˜[Y˜[YNˆ	ÝÛÛ	ËˆÝ\ÜY˜[Y\È\™Nˆ	Ø\ÜÚ\Ý[	Ë	ÜÞ\Ý[IË	Ù]™[Ü\‰Ë[™	Ý\Ù\‰Ëˆ‚ˆÈ
+\ÜÝYHÍMÌK]\™žH›\ÚÛY[[ÜšY\Ê
+HÈÛÛ\™\ÜÚ[Ûˆ™\^Z[™È™X[Ù\ÜÚ[Ûˆ\ÝÜžH]ˆÈ[˜ÛY\È\ÜÚ\Ý[ÛÛØØ[È
+È›ÛOHÛÛˆ™\Ý[ÊKˆHÚ\™YÛÛ™\\ˆ[˜ÛÙ\È\ÜÚ\Ý[ÛÛˆÈØ[È\È[˜Ý[Û—ØØ[][\È[™ÛÛ™\Ý[È\È[˜Ý[Û—ØØ[ÛÝ]]][\ÈÚ]H˜[YˆÈØ[ÚYÛÈ]™\žH™\ÜÛœÙ\È]›Ü›X[^™\ÈÛÛ\ÝÜžHY[XØ[H[™Ø[››ÝšY‚ˆœ›ÛHYÙ[˜ÛÙ^Ü™\ÜÛœÙ\×ØY\\ˆ[\ÜØÚ]ÛY\ÜØYÙ\×Ý×Ü™\ÜÛœÙ\×Ú[œ]ˆ[Ù[HÝØ\™ÜË™Ù]
+›[Ù[‹Ù[‹—Û[Ù[
+BˆÜÝHÝŠÙ]]ŠÙ[‹—ØÛY[˜˜\ÙWÝ\›‹ˆŠHÜˆˆŠBˆ\×ÞZHH˜\ÙWÝ\›ÚÜÝÛX]Ú\ÊÜÝž˜ZHŠHÜˆ˜\ÙWÝ\›ÚÜÝÛX]Ú\ÊÜÝ˜\Kž˜ZHŠBˆ\×ØÛÜ[ÝH˜\ÙWÝ\›ÚÜÝÛX]Ú\ÊÜÝ™Ú]X˜ÛÜ[Ý˜ÛÛHŠBˆ\×ÙÚ]XˆH\×ØÛÜ[ÝÜˆ˜\ÙWÝ\›ÚÜÝÛX]Ú\ÊÜÝ›[Ù[Ë™Ú]X‹˜ZHŠBˆÈÞ\Ý[H8¡¤ˆ[œÝXÝ[ÛœØÈH™\ÝÛÙ\È›ÝYÚHÒS‘ÓHÚ\™YÚ]8¡¤”™\ÜÛœÙ\ÂˆÈÛÛ™\\ˆ
+Hš]˜]HÛÜ\™HÛ˜ÙH]›ÛOHÛÛˆXZÈ[È[œ]×NÈHÚ\™YÛ™BˆÈ[˜ÛÙ\ÈÛÛ\ÝÜžH\È[˜Ý[Û—ØØ[Ù[˜Ý[Û—ØØ[ÛÝ]]
+K‚ˆ[œÝXÝ[ÛœÈH–[ÝH\™HH[[\ÜÚ\Ý[ˆ‚ˆ™\^WÛY\ÜØYÙ\Îˆ\ÝÑXÝÜÝ‹[žWWHH×Bˆ›Üˆ\ÙÈ[ˆÝØ\™ÜË™Ù]
+›Y\ÜØYÙ\È‹×JN‚ˆÛÛ[H\ÙË™Ù]
+˜ÛÛ[ŠHÜˆˆ‚ˆYˆ\ÙË™Ù]
+œ›ÛH‹\Ù\ˆŠHOHœÞ\Ý[HŽ‚ˆ[œÝXÝ[ÛœÈHÛÛ[Yˆ\Ú[œÝ[˜ÙJÛÛ[ÝŠH[ÙHÝŠÛÛ[
+Bˆ[ÙN‚ˆ™\^WÛY\ÜØYÙ\Ë˜\[™
+\ÙÊBˆÈÛÜ[Ýš[™È™\^YYÛÙ^ÛY\ÜØYÙWÚ][\ÈYÈÈH˜XÚÙ[™ÛÛ›™XÝ[Ûˆ]Ù\Û‰ÝˆÈÝ\š]™HÜ™Y[X[›Ý][Ûˆ
+HÛˆ™\^JH8 %Ø[YHÝX\™\ÈZ[ÚÝØ\™ÜËˆ]^Ø[ÂˆÈ™]™\ˆÙ[™ÛÛ^ÛX[˜YÙ[Y[
+XZ[‹]\›ˆ™X]\™JNˆ›ÈÛÛ\XÝ[ÛˆÚXÚÜÚ[‚ˆÈ]^[X\žHØ[È
+ÛÛ^ÛÛ\™\ÜÚ[Û‹›\ÚÛY[[ÜšY\Ë[ÐHYÙÜ™YØ][ÛŠHÛÈ›ÝYÚ\ÈY\\‚ˆÈ[œÝXYÙˆYÙ[Ý˜[œÜÜËØÛÙ^œIÜÈZ[ÚÝØ\™ÜËÛÈ^H™YYHØ[YHÝX\™\YYˆÈ[™\[™[KˆÙYHÌÌÌM‹‚ˆ[œ]Ú][\ÈHØÚ]ÛY\ÜØYÙ\×Ý×Ü™\ÜÛœÙ\×Ú[œ]
+ˆ™\^WÛY\ÜØYÙ\Ë\×ÙÚ]X—Ü™\ÜÛœÙ\ÏZ\×ØÛÜ[Ý˜]]™WØÛÛ\XÝ[Û—Ù[YÚX›OQ˜[ÙBˆ
+Bˆ™\ÜÚÝØ\™ÜÎˆXÝÜÝ‹[žWHHÂˆÈÛÙ^Û›HÛ›ÝÜÈH˜\ÙHÛYÎÈÝš\H\›Y\ÈNLØXÚÙ\ˆÝY™š^‚ˆ›[Ù[ŽˆÜÝš\ØÛÙ^ØÝÝ˜\šX[
+[Ù[
+Kš[œÝXÝ[ÛœÈŽˆ[œÝXÝ[ÛœËˆš[œ]Žˆ[œ]Ú][\ÈÜˆÞÈœ›ÛHŽˆ\Ù\ˆ‹˜ÛÛ[ŽˆˆŸWKœÝÜ™HŽˆ˜[ÙKˆBˆÈ›ÜØ\™HÚ]˜ÛÛ\][ÛœÈ[Y[Ý]ÈÝ\Ú\ÙHHÛÙ^Ý™X[HØ[ˆÚ]™Z[™BˆÈXY[ÛÚÚ[™ÈÓH[[H\Ù\ˆ›Ü˜ÙKZ[\œ\Ë‚ˆ[Y[Ý]HÝØ\™ÜË™Ù]
+[Y[Ý]ŠBˆYˆ[Y[Ý]\È›Ý›Û™N‚ˆ™\ÜÚÝØ\™ÜÖÈ[Y[Ý]—HH[Y[Ý]ˆÈ\‹\™\]Y\ÝXY\œÈ
+Ü[ÛÙHÙ\ÜÚ[ÛˆY™š[š]KÛÜ[ÝZ[š]X]ÜŠHX\È™X[ˆÈXY\œÈšXHHÑÈÝØ\™È8 %›ÜØ\™[K‚ˆYˆ\Ú[œÝ[˜ÙJÝØ\™ÜË™Ù]
+™^˜WÚXY\œÈŠKXÝ
+H[™ÝØ\™ÜÖÈ™^˜WÚXY\œÈ—N‚ˆ™\ÜÚÝØ\™ÜÖÈ™^˜WÚXY\œÈ—HHXÝ
+ÝØ\™ÜÖÈ™^˜WÚXY\œÈ—JBˆÈHÛÙ^[™Ú[™Z™XÝÈX^ÛÝ]]ÝÚÙ[œËÝ[\\˜]\™H
+
+H8 %ÛZ]‚ˆ^˜WØ›ÙHHÝØ\™ÜË™Ù]
+™^˜WØ›ÙHŠHÜˆßBˆYˆ\Ú[œÝ[˜ÙJ^˜WØ›ÙKXÝ
+N‚ˆÈÙ\šXÙWÝY\ˆ
+˜\Ý[ÙJH\ÈHÜ[]™[™\ÜÛœÙ\ÈšY[ÈRIÜÈ[™Ú[™Z™XÝÈ]‚ˆÙ\šXÙWÝY\ˆH^˜WØ›ÙK™Ù]
+œÙ\šXÙWÝY\ˆŠBˆYˆ\Ú[œÝ[˜ÙJÙ\šXÙWÝY\‹ÝŠH[™Ù\šXÙWÝY\‹œÝš\
+
+H[™›Ý\×ÞZN‚ˆ™\ÜÚÝØ\™ÜÖÈœÙ\šXÙWÝY\ˆ—HHÙ\šXÙWÝY\‹œÝš\
+
+Bˆ™X\ÛÛš[™×ØÙ™ÈH^˜WØ›ÙK™Ù]
+œ™X\ÛÛš[™ÈŠBˆÈ[˜X›Yˆ˜[ÙXX]™\È™X\ÛÛš[™ËÚ[˜ÛYH[œÙ]
+ÛÙ^Ý[[šÜÈžHY˜][
+K‚ˆYˆ\Ú[œÝ[˜ÙJ™X\ÛÛš[™×ØÙ™ËXÝ
+H[™™X\ÛÛš[™×ØÙ™Ë™Ù]
+™[˜X›YŠH\È›Ý˜[ÙN‚ˆÈ]K[Û›NˆÛÙ^ÈÛˆK™ËˆÈ™Y™›ÜŽˆ[KÛÈ˜[ÞH8¡¤ˆY˜][ˆÚ\™YˆÈ\‹[[Ù[Û[\Ú]HXZ[ˆ˜[œÜÜ
+›X^ˆ\ÈÜMK‹[Û›NÈ›Z[š[X[‹È[˜Hˆ™Z™XÝY
+K‚ˆœ›ÛHYÙ[˜ÛÙ^Ü™\ÜÛœÙ\×ØY\\ˆ[\ÜÛ\ÜÚYžWÜ™\ÜÛœÙ\×Ü›Ý]Bˆœ›ÛHYÙ[œ™X\ÛÛš[™×ÙY™›Ü[\ÜÛ[\ÙY™›Üˆœ›ÛHYÙ[˜[œÜÜË˜ÛÙ^[\ÜØÛÙ^ÙY™›Ü×Ù›Ü—Ü›Ý]Bˆ\×ØÛÙ^Ø˜XÚÙ[™HÛ\ÜÚYžWÜ™\ÜÛœÙ\×Ü›Ý]JÚ[\S˜[Y\ÜXÙJ˜\ÙWÝ\›ZÜÝ
+JKš\×ØÛÙ^Ø˜XÚÙ[™ˆY™›ÜHÛ[\ÙY™›Ü
+ˆ™X\ÛÛš[™×ØÙ™Ë™Ù]
+™Y™›ÜŠHÜˆ›YY][H‹ˆØÛÙ^ÙY™›Ü×Ù›Ü—Ü›Ý]J[Ù[ÜÝ\×ØÛÙ^Ø˜XÚÙ[™Z\×ØÛÙ^Ø˜XÚÙ[™
+Kˆ
+Bˆ™\ÜÚÝØ\™ÜÖÈœ™X\ÛÛš[™È—HHÈ™Y™›ÜŽˆY™›ÜœÝ[[X\žHŽˆ˜]]ÈŸBˆ™\ÜÚÝØ\™ÜÖÈš[˜ÛYH—HHÈœ™X\ÛÛš[™Ë™[˜Üž\YØÛÛ[—BˆÛÛÈHÝØ\™ÜË™Ù]
+ÛÛÈŠBˆYˆÛÛÎ‚ˆÈRH™\ÜÛœÙ\È™Z™XÝÈ]\›˜Ø›Ü›X]”ÓÓˆØÚ[XHÙ^]ÛÜ™È
+
+NÈÝš\›Ü‚ˆÈÚ]ØÛÛ\][Û—Ú[\œËœH\š]KˆY\XÛÜHš\œÝ8 %Ø[š]^™\œÈ]]]H[›™\ˆXÝÂˆÈ[ˆXÙH[™ÛÝ[Ýš\HØ[\‰ÜÈÛÛ™YÚ\ÝžK‚ˆžN‚ˆ[\ÜÛÜH\ÈØÛÜBˆœ›ÛHÛÛËœØÚ[XWÜØ[š]^™\ˆ[\ÜÝš\Ü]\›—Ø[™Ù›Ü›X]Ýš\ÜÛ\ÚÙ[[BˆÛÛÈHØÛÜK™Y\ÛÜJ\Ý
+ÛÛÊJBˆÛÛËÈHÝš\Ü]\›—Ø[™Ù›Ü›X]
+ÛÛÊBˆÛÛËÈHÝš\ÜÛ\ÚÙ[[JÛÛÊBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙÙÙ\‹Ø\›š[™Êˆ]^[X\žHÛY[ˆ˜Z[YÈØ[š]^™HÛÛØÚ[X\È›Üˆ‚ˆÛÙ^ÞRH™\ÜÛœÙ\È]ˆ	\È‹^Ëˆ
+BˆÛÛ™\YH×Bˆ›Üˆ[ˆÛÛÎ‚ˆ›ˆH™Ù]
+™[˜Ý[Ûˆ‹ßJHYˆ\Ú[œÝ[˜ÙJXÝ
+H[ÙHßBˆ˜[YHH›‹™Ù]
+›˜[YHŠBˆYˆ˜[YN‚ˆÛÛ™\Y˜\[™
+Âˆ\HŽˆ™[˜Ý[Ûˆ‹›˜[YHŽˆ˜[YK™\ØÜš\[ÛˆŽˆ›‹™Ù]
+™\ØÜš\[Ûˆ‹ˆŠKˆœ\˜[Y]\œÈŽˆ›‹™Ù]
+œ\˜[Y]\œÈ‹ßJKˆJBˆYˆÛÛ™\Y‚ˆ™\ÜÚÝØ\™ÜÖÈÛÛÈ—HHÛÛ™\YˆÈÝX›H›Û\XØXÚH›Ý][™ÎˆÙ^H\ÈÛÛ[XY™\ÜÙYœ›ÛHHÝ]XÈ™Yš^ˆÈ
+[œÝXÝ[ÛœÈ
+ÈÛÛØÚ[X\ÊHÛÈ]Ý\š]™\ÈXÜ›ÜÜÈ\›œËØÛÜYžHHÝÛš[™ÂˆÈÛÛ™\œØ][Ûˆ
+›Ý][Û‹\ÝX›HÙÚXØ[ØÛÜK[ÙHH\ÚXØ[Ù\ÜÚ[ÛˆY
+KˆÚÚ\BˆÈÙ^HÚ\™HHXZ[ˆ˜[œÜÜÙ\ÎˆRHZÙ\È][ˆ^˜WØ›ÙKÚ]XˆÜÈÝ]‚ˆžN‚ˆÈ™]\ÙHH™\ÜÛœÙ\È˜[œÜÜ	ÜÈÚ[™ÛH]]Üš]]]™H\Ú[ÛÜš]H[™Ù\ÜÚ[Û‹\ØÛÜBˆÈ›Ü›X[^˜][ÛˆÛÈ\]Z]˜[[Ý]XÈ™Yš^\È›Ý]HÈHØ[YHØXÚHXÚÙ]XÜ›ÜÜÈ[Ù\ËˆÈÚ]Ý]ÛÛ˜Ù[˜][™È[œ™[]YÙ\ÜÚ[ÛœÈ[ÈÛ™HÚ\™YXÚÙ]
+ÙYHÍÎMJK‚ˆœ›ÛHYÙ[˜[œÜÜË˜ÛÙ^[\ÜØØXÚWÜØÛÜWÙœ›ÛWÜÙ\ÜÚ[Û—ÚYØÛÛ[ØØXÚWÚÙ^Bˆœ›ÛHYÙ[˜[œÜÜË˜ÛÙ^[\ÜÙY˜][Ü›Û\ØØXÚWÜ™][[Û—Ù›Ü—Ü™\]Y\ÝˆYˆ›Ý
+\×ÞZHÜˆ\×ÙÚ]XŠH[™œ›Û\ØØXÚWÚÙ^Hˆ›Ý[ˆ™\ÜÚÝØ\™ÜÎ‚ˆØÛÜHHØØXÚWÜØÛÜWÙœ›ÛWÜÙ\ÜÚ[Û—ÚY
+ˆÜ[[YWÛXZ[—Ý˜[YJ˜ØXÚWÜØÛÜHŠHÜˆÜ[[YWÛXZ[—Ý˜[YJœÙ\ÜÚ[Û—ÚYŠBˆ
+BˆØXÚWÚÙ^HHØÛÛ[ØØXÚWÚÙ^J™\ÜÚÝØ\™ÜÖÈš[œÝXÝ[ÛœÈ—K™\ÜÚÝØ\™ÜË™Ù]
+ÛÛÈŠKØÛÜJBˆYˆØXÚWÚÙ^N‚ˆ™\ÜÚÝØ\™ÜÖÈœ›Û\ØØXÚWÚÙ^H—HHØXÚWÚÙ^BˆYˆœ›Û\ØØXÚWÜ™][[Ûˆˆ›Ý[ˆ™\ÜÚÝØ\™ÜÎ‚ˆØXÚWÜ™][[ÛˆHÙY˜][Ü›Û\ØØXÚWÜ™][[Û—Ù›Ü—Ü™\]Y\Ý
+[Ù[ÜÝ
+BˆYˆØXÚWÜ™][[ÛŽ‚ˆ™\ÜÚÝØ\™ÜÖÈœ›Û\ØØXÚWÜ™][[Ûˆ—HHØXÚWÜ™][[Û‚ˆ^Ù\^Ù\[ÛŽ‚ˆÙÙÙ\‹™XYÊÛÙ^]^[X\žNˆ›Û\ØØXÚWÚÙ^H\š]˜][ÛˆÚÚ\Y‹^×Ú[™›ÏUYJBˆÈ\ÝZÙHHXZ[ˆ˜[œÜÜˆØ[\ˆ^˜WØ›ÙH]\Ý›Ý]H™Z™XÝY\Ý˜HšY[˜XÚË‚ˆœ›ÛHYÙ[˜[œÜÜË˜ÛÙ^[\ÜÜØ[š]^™WØ\Ý˜WÜ™\]Y\ÝÚÝØ\™ÜÂˆÜØ[š]^™WØ\Ý˜WÜ™\]Y\ÝÚÝØ\™ÜÊ™\ÜÚÝØ\™ÜË[Ù[ÜÝ
+Bˆ™]\›ˆ™\ÜÚÝØ\™ÜË[Ù[[Y[Ý]‚ˆYˆÜ™X]JÙ[‹
+ŠšÝØ\™ÜÊHOˆ[žN‚ˆÈÝË[]™[™\ÜÛœÙ\Ë˜Ü™X]JÝ™X[OUYJX[™\ÜÙ[X›HHš[˜[™\ÜÛœÙHÝ\œÙ[™\ÂˆÈœ›ÛH™\ÜÛœÙK›Ý]]Ú][K™Û™XˆHYÚ[]™[™\ÜÛœÙ\ËœÝ™X[J
+X™XZ[Èœ›ÛBˆÈ™\ÜÛœÙK˜ÛÛ\]Yœ™\ÜÛœÙK›Ý]]ÚXÚÛÙ^™]\›œÈ\È[
+ÑÈÜ˜\Ú
+K‚ˆ™\ÜÚÝØ\™ÜË[Ù[[Y[Ý]HÙ[‹—ØZ[Ü™\ÜÛœÙ\×ÚÝØ\™ÜÊÝØ\™ÜÊBˆÝ[Ý[Y[Ý]H[Y[Ý]Yˆ\Ú[œÝ[˜ÙJ[Y[Ý]
+[›Ø]
+JH[™[Y[Ý]ˆ[ÙH›Û™BˆÝX\™HÐÛÙ^Ý™X[QÝX\™
+Ù[‹—ØÛY[Ý[Ý[Y[Ý]
+BˆžN‚ˆÝX\™œÝ\
+
+Bˆœ›ÛHYÙ[˜ÛÙ^Ü[[YH[\ÜØž\\Ü×ÜÙ×Ü™\]Y\ÝÝ˜[œÙ›Ü›KØÛÛœÝ[YWØÛÙ^Ù]™[ÜÝ™X[BˆÈÙY\[ÈÚ\™H^[ØYÝ]ÙˆHÑÉÜÈÒSZÛ[™È™\]Y\Ý˜[œÙ›Ü›K‚ˆÝ™X[WÚÝØ\™ÜÈHØž\\Ü×ÜÙ×Ü™\]Y\ÝÝ˜[œÙ›Ü›JÊŠœ™\ÜÚÝØ\™ÜËœÝ™X[HŽˆY_JBˆ]™[ÜÝ™X[HHÙ[‹—ØÛY[œ™\ÜÛœÙ\Ë˜Ü™X]J
+ŠœÝ™X[WÚÝØ\™ÜÊBˆÝX\™˜YÜÜÝ™X[J]™[ÜÝ™X[JBˆÈH[Y\ˆX^Hš\™HÚ[H™\ÜÛœÙ\Ë˜Ü™X]J
+H\È›ØÚÙYÈYˆHØ[˜Ù[Y][\ˆÈY›ÈÝ™X[HÈÛÜÙH[‹ÛÜÙH]›ÝÈ]]\È][\[ÝÛ™Y8 %™]™\ˆHÚ\™YÛY[‚ˆYˆÝX\™[YYÛÝ]š\×ÜÙ]
+
+H[™ÝX\™˜Ø[˜Ù[Ü™\]Y\ÝY
+
+N‚ˆÝX\™˜ÛÜÙWØ][\ÜÝ™X[J›]HØ[˜Ù[Y][\Ý™X[HÛÜÙH˜Z[YŠBˆžN‚ˆÈÛÛYHÛÙ^XÛÛ\]X›HÜÝÈXØÙ\Ý™X[OUYX]™]\›ˆHÛÛ\]YˆÈ™\ÜÛœÙ\ÈØš™XÝ
+›Ý]\˜X›JH8 %Û‰Ý[™]ÈHÛÛœÝ[Y\‹‚ˆYˆ\Ø]Š]™[ÜÝ™X[K›Ý]]ŠN‚ˆš[˜[H]™[ÜÝ™X[Bˆ[ÙN‚ˆš[˜[HØÛÛœÝ[YWØÛÙ^Ù]™[ÜÝ™X[Jˆ]™[ÜÝ™X[K[Ù[\ÝŠ™\ÜÚÝØ\™ÜË™Ù]
+›[Ù[ŠHÜˆ[Ù[
+KÛ—Ù]™[YÝX\™›Û—Ù]™[ˆ
+Bˆš[˜[N‚ˆÝX\™œ™[X\ÙWÜÝ™X[J]™[ÜÝ™X[JBˆYˆš[˜[\È›Û™N‚ˆ˜Z\ÙH[[YQ\œ›ÜŠÛÙ^]^[X\žH™\ÜÛœÙ\ÈÝ™X[HY›Ý™]\›ˆHš[˜[™\ÜÛœÙHŠBˆ^Ü\ËÛÛØØ[×Ü˜]Ë\ØYÙHHÜ\œÙWØÛÙ^Ùš[˜[Ü™\ÜÛœÙJš[˜[
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆYˆÝX\™[YYÛÝ]š\×ÜÙ]
+
+N‚ˆ˜Z\ÙH[Y[Ý]\œ›ÜŠÝX\™[Y[Ý]ÛY\ÜØYÙJ
+JHœ›ÛH^ÂˆÙÙÙ\‹™XYÊÛÙ^]^[X\žH™\ÜÛœÙ\ÈTHØ[˜Z[Yˆ	\È‹^ÊBˆ˜Z\ÙBˆš[˜[N‚ˆÝX\™™š[š\Ú
+
+BˆÈÚ\HH™\Ý[ZÙHÚ]˜ÛÛ\][ÛœË‚ˆY\ÜØYÙHHÚ[\S˜[Y\ÜXÙJˆ›ÛOH˜\ÜÚ\Ý[‹ÛÛ[Hˆ‹š›Ú[Š^Ü\ÊKœÝš\
+
+HÜˆ›Û™KˆÛÛØØ[Ï]ÛÛØØ[×Ü˜]ÈÜˆ›Û™Kˆ
+BˆÚÚXÙHHÚ[\S˜[Y\ÜXÙJˆ[™^LY\ÜØYÙO[Y\ÜØYÙKš[š\ÚÜ™X\ÛÛHœÝÜˆYˆ›ÝÛÛØØ[×Ü˜]È[ÙHÛÛØØ[È‚ˆ
+Bˆ™]\›ˆÚ[\S˜[Y\ÜXÙJÚÚXÙ\ÏVØÚÚXÙWK[Ù[[[Ù[\ØYÙO]\ØYÙJB‚‚˜Û\ÜÈÐÚ]Ú[N‚ˆˆˆ‘^ÜÙ\ÈÛY[˜Ú]˜ÛÛ\][ÛœË˜Ü™X]J
+XÝ™\ˆHÞ[˜ÈÜˆ\Þ[˜ÈY\\‹ˆˆˆ‚‚ˆYˆ×Ú[š]×ÊÙ[‹Y\\Žˆ[žJN‚ˆÙ[‹˜ÛÛ\][ÛœÈHY\\‚‚‚˜Û\ÜÈÐ\Þ[˜ÐÛÛ\][ÛœÐY\\Ž‚ˆˆˆ\Þ[˜ÈY\\Žˆ[œÈHÞ[˜ÈY\\‰ÜÈÜ™X]XšXH\Þ[˜Ú[Ë×Ý™XY
+
+Kˆˆˆ‚‚ˆYˆ×Ú[š]×ÊÙ[‹Þ[˜×ØY\\Žˆ[žJN‚ˆÙ[‹—ÜÞ[˜ÈHÞ[˜×ØY\\‚‚ˆ\Þ[˜ÈYˆÜ™X]JÙ[‹
+ŠšÝØ\™ÜÊHOˆ[žN‚ˆ[\Ü\Þ[˜Ú[Âˆ™]\›ˆ]ØZ]\Þ[˜Ú[Ë×Ý™XY
+Ù[‹—ÜÞ[˜Ë˜Ü™X]K
+ŠšÝØ\™ÜÊB‚‚˜Û\ÜÈÐ\Þ[˜Ð]^[X\žPÛY[˜\ÙN‚ˆˆˆ\Þ[˜ËXÛÛ\]X›HÜ˜\\ˆX]Ú[™È\Þ[˜ÓÜ[RK˜Ú]˜ÛÛ\][ÛœË˜Ü™X]J
+K‚‚ˆZ\œ›ÜœÈÜ™X[ØÛY[
+Ú[ˆHÞ[˜ÈÜ˜\\ˆ\ÈÛ™JHÛÈØXÚH]šXÝ[ÛˆžBˆXYˆÜ[RHÛY[›ÜÈ\È\Þ[˜È[žHÛÈ[œÝXYÙˆ™]\Ú[™ÈHÛÜÙY˜[œÜÜ‚ˆˆˆ‚‚ˆYˆ×Ú[š]×ÊÙ[‹Þ[˜×ÝÜ˜\\Žˆ[žJN‚ˆÙ[‹˜Ú]HÐÚ]Ú[JÐ\Þ[˜ÐÛÛ\][ÛœÐY\\ŠÞ[˜×ÝÜ˜\\‹˜Ú]˜ÛÛ\][ÛœÊJBˆÙ[‹˜\WÚÙ^HHÞ[˜×ÝÜ˜\\‹˜\WÚÙ^BˆÙ[‹˜˜\ÙWÝ\›HÞ[˜×ÝÜ˜\\‹˜˜\ÙWÝ\›ˆYˆ\Ø]ŠÞ[˜×ÝÜ˜\\‹—Ü™X[ØÛY[ŠN‚ˆÈZ\œ›ÜˆHÞ[˜ÈÜ˜\\‰ÜÈÜ™X[ØÛY[ÛÈØXÚH]šXÝ[ÛˆžHXYˆÜ[RHÛY[
+K™Ë‚ˆÈØÛÜÙWØÛY[ÛÛ—Ý[Y[Ý][ˆÌŒÍŠH›ÜÈ\È\Þ[˜È[žHÛËˆÚ]Ý]\ËÞ[˜È[™\Þ[˜ÂˆÈØXÚH[šY\È]™\™ÙHÛˆÚ\ÛÛš[™ÎˆHÞ[˜È[žH\È]šXÝY]H\Þ[˜È[žHÙY\ÂˆÈ™]\Ú[™ÈHÛÜÙY˜[œÜÜ˜Z[[™È]™\žHÝXœÙ\]Y[\Þ[˜È]^Ø[Ú]	ÐÛÛ›™XÝ[Ûˆ\œ›Ü‰ÂˆÈ[[HØ]]Ø^H™\Ý\Ë‚ˆÙ[‹—Ü™X[ØÛY[HÞ[˜×ÝÜ˜\\‹—Ü™X[ØÛY[‚‚—Ð\Þ[˜Ð[›ÜXÐÛÛ\][ÛœÐY\\ˆHÐ\Þ[˜ÐÛÛ\][ÛœÐY\\ˆÈ[\ÜYžH\ÝÂ‚‚˜Û\ÜÈÛÙ^]^[X\žPÛY[‚ˆˆˆ“Ü[RKXÛY[XÛÛ\]X›HÜ˜\\ˆ›Ý][™È›ÝYÚHÛÙ^™\ÜÛœÙ\ÈTH
+˜\WÚÙ^KË˜˜\ÙWÝ\››Üˆ[›ÜÜXÝ[ÛŠKˆˆˆ‚‚ˆYˆ×Ú[š]×ÊÙ[‹™X[ØÛY[ˆÜ[RK[Ù[ˆÝŠN‚ˆÙ[‹—Ü™X[ØÛY[H™X[ØÛY[ˆÙ[‹˜Ú]HÐÚ]Ú[JÐÛÙ^ÛÛ\][ÛœÐY\\Š™X[ØÛY[[Ù[
+JBˆÙ[‹˜\WÚÙ^HH™X[ØÛY[˜\WÚÙ^BˆÙ[‹˜˜\ÙWÝ\›H™X[ØÛY[˜˜\ÙWÝ\›‚ˆYˆÛÜÙJÙ[ŠN‚ˆÙ[‹—Ü™X[ØÛY[˜ÛÜÙJ
+B‚‚˜Û\ÜÈ\Þ[˜ÐÛÙ^]^[X\žPÛY[
+Ð\Þ[˜Ð]^[X\žPÛY[˜\ÙJN‚ˆ\ÜÂ‚‚™YˆÝ˜[œÛ]WØ[›ÜX×Ü™\ÜÛœÙWÙ›Ü›X]
+[›ÜX×ÚÝØ\™ÜÎˆXÝÜÝ‹[žWK™\ÜÛœÙWÙ›Ü›X]ˆ[žJHOˆ›Û™N‚ˆˆˆ“Y\™ÙH[ˆÜ[RH™\ÜÛœÙH›Ü›X][È[›ÜXÈÝ]]ØÛÛ™šYØˆˆˆ‚ˆYˆ›Ý\Ú[œÝ[˜ÙJ™\ÜÛœÙWÙ›Ü›X]XÝ
+N‚ˆ™]\›‚ˆ›Ü›X]Ý\HH™\ÜÛœÙWÙ›Ü›X]™Ù]
+\HŠBˆYˆ›Ü›X]Ý\HOHšœÛÛ—ÜØÚ[XHŽ‚ˆœÛÛ—ÜØÚ[XHH™\ÜÛœÙWÙ›Ü›X]™Ù]
+šœÛÛ—ÜØÚ[XHŠBˆYˆ›Ý\Ú[œÝ[˜ÙJœÛÛ—ÜØÚ[XKXÝ
+HÜˆœØÚ[XHˆ›Ý[ˆœÛÛ—ÜØÚ[XN‚ˆ™]\›‚ˆØÚ[XHHœÛÛ—ÜØÚ[XVÈœØÚ[XH—Bˆ[Yˆ›Ü›X]Ý\HOHšœÛÛ—ÛØš™XÝŽ‚ˆÈ[›ÜXÈÑÈ\È›ÈØÚ[XK[\ÜÈ”ÓÓˆ[ÙNÈÛ›HœÛÛ—ÜØÚ[XX‚ˆØÚ[XHHÈ\HŽˆ›Øš™XÝŸBˆ[ÙN‚ˆ™]\›‚ˆÝ]]ØÛÛ™šYÈH[›ÜX×ÚÝØ\™ÜË™Ù]
+›Ý]]ØÛÛ™šYÈŠBˆYˆ›Ý\Ú[œÝ[˜ÙJÝ]]ØÛÛ™šYËXÝ
+N‚ˆÝ]]ØÛÛ™šYÈHßBˆ[›ÜX×ÚÝØ\™ÜÖÈ›Ý]]ØÛÛ™šYÈ—HHÝ]]ØÛÛ™šYÂˆÝ]]ØÛÛ™šYÖÈ™›Ü›X]—HHÈ\HŽˆšœÛÛ—ÜØÚ[XH‹œØÚ[XHŽˆØÚ[X_B‚‚˜Û\ÜÈÐ[›ÜXÐÛÛ\][ÛœÐY\\Ž‚ˆˆˆ“Ü[RKXÛY[XÛÛ\]X›HY\\ˆ›Üˆ[›ÜXÈY\ÜØYÙ\ÈTKˆˆˆ‚‚ˆYˆ×Ú[š]×ÊÙ[‹™X[ØÛY[ˆ[žK[Ù[ˆÝ‹\×ÛØ]]ˆ›ÛÛH˜[ÙK˜\ÙWÝ\›ˆÝˆ›Û™HH›Û™JN‚ˆÙ[‹—ØÛY[H™X[ØÛY[ˆÙ[‹—Û[Ù[H[Ù[ˆÙ[‹—Ú\×ÛØ]]H\×ÛØ]]ˆÈØ[\ˆT“š\œÝÈ˜[˜XÚÈÈHÑÈÛY[	ÜÈÜÝÛ›H›Üˆ›Ý\ÈÜ[8 %H›[šÙ]ˆÈ˜[˜XÚÈÛÝ[›\Z[šSX^Öš\H]^Y\\œÈÈ\™\\H[™[™È
+Ýš\È[šÚ[™ÈÚYÜÊK‚ˆÙ[‹—Ø˜\ÙWÝ\›H˜\ÙWÝ\›Üˆ›Û™BˆYˆ›ÝÙ[‹—Ø˜\ÙWÝ\›‚ˆØ[™Y]HHÝŠÙ]]Š™X[ØÛY[˜˜\ÙWÝ\›‹ˆŠHÜˆˆŠHÜˆ›Û™BˆYˆØ[™Y]N‚ˆÚ]ÛÛ^X‹œÝ\™\ÜÊ^Ù\[ÛŠN‚ˆœ›ÛHYÙ[˜[›ÜX×Ù[™Ú[È[\ÜÚ\×Û›Ý\×ÜÜ[Ù[™Ú[ˆYˆÚ\×Û›Ý\×ÜÜ[Ù[™Ú[
+Ø[™Y]JN‚ˆÙ[‹—Ø˜\ÙWÝ\›HØ[™Y]B‚ˆYˆÜ™X]JÙ[‹
+ŠšÝØ\™ÜÊHOˆ[žN‚ˆœ›ÛHYÙ[˜[›ÜX×ØY\\ˆ[\ÜZ[Ø[›ÜX×ÚÝØ\™ÜËÜ™X]WØ[›ÜX×ÛY\ÜØYÙBˆœ›ÛHYÙ[˜[œÜÜÈ[\ÜÙ]Ý˜[œÜÜˆ[Ù[HÝØ\™ÜË™Ù]
+›[Ù[‹Ù[‹—Û[Ù[
+BˆÈRIÜÈ[›ÜXÈ[™Ú[™Z™XÝÈX^ÝÚÙ[œÈÛˆš\Ú[Ûˆ[Ù[È
+ÛÙHLŒL
+NÂˆÈØ[\œÈÚYÛ˜[\ÈšXHÜÚÚ\Þ˜ZWÛX^ÝÚÙ[œË‚ˆYˆÝØ\™ÜËœÜ
+—ÜÚÚ\Þ˜ZWÛX^ÝÚÙ[œÈ‹˜[ÙJN‚ˆX^ÝÚÙ[œÈH›Û™Bˆ[ÙN‚ˆX^ÝÚÙ[œÈHÝØ\™ÜË™Ù]
+›X^ÝÚÙ[œÈŠHÜˆÝØ\™ÜË™Ù]
+›X^ØÛÛ\][Û—ÝÚÙ[œÈŠBˆ[\\˜]\™HHÝØ\™ÜË™Ù]
+[\\˜]\™HŠBˆÈ™X\ÛÛš[™Èš[Üš]Nˆ^XÚ]\‹XØ[Ü™X\ÛÛš[™×ØÛÛ™šYÈ
+[ÐH\‹\ÛÝ
+HÚ[œÈÝ™\‚ˆÈ^˜WØ›ÙKœ™X\ÛÛš[™ÎÈZ[Ø[›ÜX×ÚÝØ\™ÜÈ˜[œÛ]\ÈÈ[šÚ[™Ø‚ˆ™X\ÛÛš[™×ØÙ™ÈHÝØ\™ÜË™Ù]
+—Ü™X\ÛÛš[™×ØÛÛ™šYÈŠBˆYˆ™X\ÛÛš[™×ØÙ™È\È›Û™N‚ˆÙXˆHÝØ\™ÜË™Ù]
+™^˜WØ›ÙHŠBˆÜ˜ÈHÙX‹™Ù]
+œ™X\ÛÛš[™ÈŠHYˆ\Ú[œÝ[˜ÙJÙX‹XÝ
+H[ÙH›Û™BˆYˆ\Ú[œÝ[˜ÙJÜ˜ËXÝ
+N‚ˆ™X\ÛÛš[™×ØÙ™ÈHÜ˜ÂˆÈÜ[RHÛÛØÚÚXÙH
+ÝˆÜˆXÝ
+H8¡¤ˆ[›ÜXË\Ý[H˜[YKÛ[ÙHÝš[™Ë‚ˆÛÛØÚÚXÙHHÝØ\™ÜË™Ù]
+ÛÛØÚÚXÙHŠBˆYˆ\Ú[œÝ[˜ÙJÛÛØÚÚXÙKXÝ
+N‚ˆÚÚXÙWÝ\HHÝŠÛÛØÚÚXÙK™Ù]
+\H‹ˆŠJK›ÝÙ\Š
+BˆYˆÚÚXÙWÝ\HOH™[˜Ý[ÛˆŽ‚ˆÛÛØÚÚXÙHHÛÛØÚÚXÙK™Ù]
+™[˜Ý[Ûˆ‹ßJK™Ù]
+›˜[YHŠBˆ[ÙN‚ˆÛÛØÚÚXÙHHÚÚXÙWÝ\HYˆÚÚXÙWÝ\H[ˆÈ˜]]È‹œ™\]Z\™Y‹››Û™HŸH[ÙH›Û™Bˆ[Yˆ›Ý\Ú[œÝ[˜ÙJÛÛØÚÚXÙKÝŠN‚ˆÛÛØÚÚXÙHH›Û™Bˆ[›ÜX×ÚÝØ\™ÜÈHZ[Ø[›ÜX×ÚÝØ\™ÜÊˆ[Ù[[[Ù[Y\ÜØYÙ\ÏZÝØ\™ÜË™Ù]
+›Y\ÜØYÙ\È‹×JKÛÛÏZÝØ\™ÜË™Ù]
+ÛÛÈŠKˆX^ÝÚÙ[œÏ[X^ÝÚÙ[œË™X\ÛÛš[™×ØÛÛ™šYÏ\™X\ÛÛš[™×ØÙ™ËÛÛØÚÚXÙO]ÛÛØÚÚXÙKˆ\×ÛØ]]\Ù[‹—Ú\×ÛØ]]ˆÈÜ[›Ý]\ÈÛˆ[›ÜXËÏÛYÏ˜YÈ[™™\^\ÈÚYÛ™Y[šÚ[™ÂˆÈÙ^YYÙ™ˆ˜\ÙWÝ\›ÈÛZ][™È]œ™XZÜÈÜ[[Ù[™\ÛÛ][Û‹‚ˆ˜\ÙWÝ\›\Ù[‹—Ø˜\ÙWÝ\›ˆ
+BˆÈÜ\ÈÊÈ™Z™XÝÈ›Û‹YY˜][[\\˜]\™KÝÜÜÝÜÚÎÈZ[Ø[›ÜX×ÚÝØ\™ÜÂˆÈ[ÛÈÝš\È\ÙH\ÈHØY™]H™]8 %ÙY\›Ý^Y\œË‚ˆYˆ[\\˜]\™H\È›Ý›Û™N‚ˆœ›ÛHYÙ[˜[›ÜX×ØY\\ˆ[\ÜÙ›Ü˜šY×ÜØ[\[™×Ü\˜[\ÂˆYˆ›ÝÙ›Ü˜šY×ÜØ[\[™×Ü\˜[\Ê[Ù[
+N‚ˆ[›ÜX×ÚÝØ\™ÜÖÈ[\\˜]\™H—HH[\\˜]\™BˆÈ\‹\™\]Y\ÝXY\œÈ
+Ü[ÛÙHÙ\ÜÚ[ÛˆY™š[š]JH8 %H[›ÜXÈÑÈXØÙ\ÂˆÈ^˜WÚXY\œØÛˆY\ÜØYÙ\Ë˜Ü™X]KÜÝ™X[HÛË‚ˆYˆ\Ú[œÝ[˜ÙJÝØ\™ÜË™Ù]
+™^˜WÚXY\œÈŠKXÝ
+H[™ÝØ\™ÜÖÈ™^˜WÚXY\œÈ—N‚ˆ[›ÜX×ÚÝØ\™ÜÖÈ™^˜WÚXY\œÈ—HHÂˆ
+ŠŠ[›ÜX×ÚÝØ\™ÜË™Ù]
+™^˜WÚXY\œÈŠHÜˆßJKˆ
+ŠšÝØ\™ÜÖÈ™^˜WÚXY\œÈ—KˆBˆÈ™\ÜÛœÙWÙ›Ü›X]ˆÜ[]™[Ù]ÈHØ[YH˜[œÛ][Ûˆ\ÈH^˜WØ›ÙH›Ü›NÈÚ[ˆ›ÝˆÈ\™H™\Ù[H^˜WØ›ÙH›Ü›HÚ[œËˆ\ÜÝ›ÝYÚ^ÛY\È™X\ÛÛš[™ØØ™\ÜÛœÙWÙ›Ü›X]ˆÈ
+[™XYHS”ÓUQÈ˜]]™HšY[È8 %˜]ÈÛÝ[ÛˆÝšXÝØ]]Ø^\ÊH[™Ø\›Y\È[Xš[™Ë‚ˆÈHY\\ˆZ[ÈHY\ÜØYÙ\È›ÙHœ›ÛHHš^Y[ÝË[\ÝÙˆÝØ\™ÜËÛÈ™Y›Ü™H\È[‚ˆÈ[œ™XÛÙÛš^™YÜ[]™[ÝØ\™ÈØ\È›ÜYÛˆH›ÛÜŽˆH™\]Y\ÝÝXØÙYYY]HØÚ[XBˆÈÛÛ˜XÝÚ[[H™XØ[YH›Û\ÛÛ\X[˜ÙH
+ÎMŒˆ™]šY]ËÚ[ŠK‚ˆÜÛ]™[Ü™\ÜÛœÙWÙ›Ü›X]HÝØ\™ÜË™Ù]
+œ™\ÜÛœÙWÙ›Ü›X]ŠBˆYˆÜÛ]™[Ü™\ÜÛœÙWÙ›Ü›X]\È›Ý›Û™N‚ˆÝ˜[œÛ]WØ[›ÜX×Ü™\ÜÛœÙWÙ›Ü›X]
+[›ÜX×ÚÝØ\™ÜËÜÛ]™[Ü™\ÜÛœÙWÙ›Ü›X]
+BˆØ[\—Ù^˜WØ›ÙHHÝØ\™ÜË™Ù]
+™^˜WØ›ÙHŠBˆYˆØ[\—Ù^˜WØ›ÙH[™\Ú[œÝ[˜ÙJØ[\—Ù^˜WØ›ÙKXÝ
+N‚ˆÝ˜[œÛ]WØ[›ÜX×Ü™\ÜÛœÙWÙ›Ü›X]
+[›ÜX×ÚÝØ\™ÜËØ[\—Ù^˜WØ›ÙK™Ù]
+œ™\ÜÛœÙWÙ›Ü›X]ŠJBˆ\ÜÝ›ÝYÚHÂˆÎˆˆ›ÜˆËˆ[ˆØ[\—Ù^˜WØ›ÙKš][\Ê
+BˆYˆÈ›Ý[ˆÈœ™X\ÛÛš[™È‹œ™\ÜÛœÙWÙ›Ü›X]ŸH[™›ÝÝŠÊKœÝ\ÝÚ]
+—ÈŠBˆBˆYˆ\ÜÝ›ÝYÚ‚ˆ^\Ý[™ÈH[›ÜX×ÚÝØ\™ÜË™Ù]
+™^˜WØ›ÙHŠHÜˆßBˆYˆ›Ý\Ú[œÝ[˜ÙJ^\Ý[™ËXÝ
+N‚ˆ^\Ý[™ÈHßBˆ[›ÜX×ÚÝØ\™ÜÖÈ™^˜WØ›ÙH—HHÊŠ™^\Ý[™Ë
+Šœ\ÜÝ›ÝYÚBˆ™\ÜÛœÙHHÜ™X]WØ[›ÜX×ÛY\ÜØYÙJˆÙ[‹—ØÛY[ˆ[›ÜX×ÚÝØ\™ÜËˆÈ™XÛÜ™›ÝšY\‹\™\ÜÛœÙH[Z[™È]™\žH]™[]XÚÈ›ÜØ\™›ÙÜ™\ÜÈÛ›H›Ü‚ˆÈÝXœÝ[]™H^[ØYÈÛÈÙY\[]™\ÈØ[‰ÝÛHÝ[YÝ[[X\žHÜ[‹ˆ›Û™HÙY\ÂˆÈH˜\ÝÙ]Ùš[˜[ÛY\ÜØYÙH]‚ˆÛ—ÜÝ™X[WÙ]™[JØ[›ÜX×Ø]^ÜÝ™X[WÙ]™[ÚÛÚÊ
+HYˆØ]^Ü›ÙÜ™\Ü×ØXÝ]™J
+H[ÙH›Û™JKˆ
+BˆÛœˆHÙ]Ý˜[œÜÜ
+˜[›ÜX×ÛY\ÜØYÙ\ÈŠK››Ü›X[^™WÜ™\ÜÛœÙJ™\ÜÛœÙKÝš\ÝÛÛÜ™Yš^\Ù[‹—Ú\×ÛØ]]
+Bˆ\ØYÙHH›Û™BˆYˆ\Ø]Š™\ÜÛœÙK\ØYÙHŠH[™™\ÜÛœÙK\ØYÙN‚ˆ›Û\ÝÚÙ[œÈHÙ]]Š™\ÜÛœÙK\ØYÙKš[œ]ÝÚÙ[œÈ‹
+HÜˆˆÛÛ\][Û—ÝÚÙ[œÈHÙ]]Š™\ÜÛœÙK\ØYÙK›Ý]]ÝÚÙ[œÈ‹
+HÜˆˆ\ØYÙHHÚ[\S˜[Y\ÜXÙJˆ›Û\ÝÚÙ[œÏ\›Û\ÝÚÙ[œËÛÛ\][Û—ÝÚÙ[œÏXÛÛ\][Û—ÝÚÙ[œËˆÝ[ÝÚÙ[œÏYÙ]]Š™\ÜÛœÙK\ØYÙKÝ[ÝÚÙ[œÈ‹
+HÜˆ
+›Û\ÝÚÙ[œÈ
+ÈÛÛ\][Û—ÝÚÙ[œÊKˆ
+BˆÈÛÛØ[[™XYHXÚË]\\È\ÈÜ[RHÚ\HšXH›Ü\Y\Ë‚ˆÚÚXÙHHÚ[\S˜[Y\ÜXÙJˆ[™^LˆY\ÜØYÙOTÚ[\S˜[Y\ÜXÙJÛÛ[WÛœ‹˜ÛÛ[ÛÛØØ[ÏWÛœ‹ÛÛØØ[Ë™X\ÛÛš[™ÏWÛœ‹œ™X\ÛÛš[™ÊKˆš[š\ÚÜ™X\ÛÛWÛœ‹™š[š\ÚÜ™X\ÛÛ‹ˆ
+Bˆ™]\›ˆÚ[\S˜[Y\ÜXÙJÚÚXÙ\ÏVØÚÚXÙWK[Ù[[[Ù[\ØYÙO]\ØYÙJB‚‚˜Û\ÜÈ[›ÜXÐ]^[X\žPÛY[‚ˆˆˆ“Ü[RKXÛY[XÛÛ\]X›HÜ˜\\ˆÝ™\ˆH˜]]™H[›ÜXÈÛY[ˆˆˆ‚‚ˆYˆ×Ú[š]×ÊÙ[‹™X[ØÛY[ˆ[žK[Ù[ˆÝ‹\WÚÙ^NˆÝ‹˜\ÙWÝ\›ˆÝ‹\×ÛØ]]ˆ›ÛÛH˜[ÙJN‚ˆÙ[‹—Ü™X[ØÛY[H™X[ØÛY[ˆÙ[‹˜Ú]HÐÚ]Ú[JÐ[›ÜXÐÛÛ\][ÛœÐY\\Š™X[ØÛY[[Ù[\×ÛØ]]Z\×ÛØ]]˜\ÙWÝ\›X˜\ÙWÝ\›
+JBˆÙ[‹˜\WÚÙ^HH\WÚÙ^BˆÙ[‹˜˜\ÙWÝ\›H˜\ÙWÝ\›‚ˆYˆÛÜÙJÙ[ŠN‚ˆÛÜÙWÙ›ˆHÙ]]ŠÙ[‹—Ü™X[ØÛY[˜ÛÜÙH‹›Û™JBˆYˆØ[X›JÛÜÙWÙ›ŠN‚ˆÛÜÙWÙ›Š
+B‚‚˜Û\ÜÈ\Þ[˜Ð[›ÜXÐ]^[X\žPÛY[
+Ð\Þ[˜Ð]^[X\žPÛY[˜\ÙJN‚ˆ\ÜÂ‚‚˜Û\ÜÈÐ™Y›ØÚÐÛÛ\][ÛœÐY\\Ž‚ˆˆˆ•˜[œÛ]\ÈÚ]˜ÛÛ\][ÛœË˜Ü™X]J
+ŠšÝØ\™ÜÊX[È™Y›ØÚÈÛÛ™\œÙKˆˆˆ‚‚ˆYˆ×Ú[š]×ÊÙ[‹™YÚ[ÛŽˆÝ‹[Ù[ˆÝŠN‚ˆÙ[‹—Ü™YÚ[ÛˆH™YÚ[Û‚ˆÙ[‹—Û[Ù[H[Ù[‚ˆYˆÜ™X]JÙ[‹
+ŠšÝØ\™ÜÊHOˆ[žN‚ˆœ›ÛHYÙ[˜™Y›ØÚ×ØY\\ˆ[\ÜØ[ØÛÛ™\œÙBˆ[Ù[HÝØ\™ÜË™Ù]
+›[Ù[‹Ù[‹—Û[Ù[
+BˆX^ÝÚÙ[œÈHÝØ\™ÜË™Ù]
+›X^ÝÚÙ[œÈŠHÜˆÝØ\™ÜË™Ù]
+›X^ØÛÛ\][Û—ÝÚÙ[œÈŠBˆÈÜ[RHXØÙ\ÈÝÜ\ÈÝˆÜˆ\ÝÈÛÛ™\œÙH™\]Z\™\ÈH\Ý‚ˆÝÜHÝØ\™ÜË™Ù]
+œÝÜŠBˆYˆ\Ú[œÝ[˜ÙJÝÜÝŠN‚ˆÝÜHÜÝÜBˆYˆÝØ\™ÜË™Ù]
+ÛÛØÚÚXÙHŠH\È›Ý›Û™N‚ˆÈÛÛ™\œÙHÛÛÚÚXÙH\Û‰ÝÚ\™Y›ÝYÚØ[ØÛÛ™\œÙJ
+NÈÝ\™˜XÙHH›Ü‚ˆÙÙÙ\‹™XYÊˆ™Y›ØÚÐ]^[X\žPÛY[ˆÛÛØÚÚXÙOI\ˆ›ÝÝ\ÜYžHH‚ˆÛÛ™\œÙHÚ[H8 %YÛ›Ü™Yˆ‹ÝØ\™ÜË™Ù]
+ÛÛØÚÚXÙHŠKˆ
+BˆYˆÝØ\™ÜË™Ù]
+œÝ™X[HŠN‚ˆÈÛÛ™\œÙHÝ™X[Z[™È\Û‰ÝÚ\™Y\™NÈØ[ÛIÜÈÝ™X[Z[™ÈÛÛœÝ[Y\‚ˆÈ]XÝÈHš[˜[Øš™XÝ[™ÝÛ™Ü˜Y\ÈÈ›Û‹[]™HÝ]]‚ˆÙÙÙ\‹™XYÊˆ™Y›ØÚÐ]^[X\žPÛY[ˆÝ™X[OUYH™\]Y\ÝY›Üˆ	\È8 %™]\›š[™ÈHÛÛ\]H™\ÜÛœÙH‚ˆŠÛÛ™\œÙHÚ[HÙ\È›ÝÝ™X[JNÈØ[\ˆÝÛ™Ü˜Y\ÈÈ›Û‹\Ý™X[Z[™Ëˆ‹[Ù[ˆ
+Bˆ™\ÜÛœÙHHØ[ØÛÛ™\œÙJˆ™YÚ[Û\Ù[‹—Ü™YÚ[Û‹[Ù[[[Ù[Y\ÜØYÙ\ÏZÝØ\™ÜË™Ù]
+›Y\ÜØYÙ\È‹×JKÛÛÏZÝØ\™ÜË™Ù]
+ÛÛÈŠKˆÈÛÛ™\œÙHÜXÚYšXØ[HY˜][ÈÈH[Ù[X^[][HÚ[ˆÛZ]Y‚ˆÈ][™\ÜÈZ\œ›ÜœÈH[›ÜXÈÚ[Nˆ^XÚ]YX[œÈÛZ]‚ˆX^ÝÚÙ[œÏZ[
+X^ÝÚÙ[œÊHYˆX^ÝÚÙ[œÈ[ÙH›Û™K[\\˜]\™OZÝØ\™ÜË™Ù]
+[\\˜]\™HŠKˆÜÜZÝØ\™ÜË™Ù]
+ÜÜŠKÝÜÜÙ\]Y[˜Ù\Ï\ÝÜˆ
+BˆÈÛÛ™\œÙH\ÈÛÛ\]K\™\ÜÛœÙH\™NˆX\šÈ›ÝšY\ˆ›ÙÜ™\ÜÈÛ›HY\‚ˆÈ™]\›ˆÛÈ”™Y›XÝÈ™X[™Y›ØÚÈ][˜ÞK›Ý\Ü]ÚÜÙ]\‚ˆÛ›ÝYžWØ]^Ü›ÝšY\—Ü™\ÜÛœÙJ
+Bˆ™]\›ˆ™\ÜÛœÙB‚‚˜Û\ÜÈ™Y›ØÚÐ]^[X\žPÛY[‚ˆˆˆ“Ü[RKXÛY[XÛÛ\]X›HÜ˜\\ˆÝ™\ˆUÔÈ™Y›ØÚÈÛÛ™\œÙHTKˆˆˆ‚‚ˆYˆ×Ú[š]×ÊÙ[‹™YÚ[ÛŽˆÝ‹[Ù[ˆÝŠN‚ˆÙ[‹—Ü™YÚ[ÛˆH™YÚ[Û‚ˆÙ[‹—Û[Ù[H[Ù[ˆÙ[‹˜Ú]HÐÚ]Ú[JÐ™Y›ØÚÐÛÛ\][ÛœÐY\\Š™YÚ[Û‹[Ù[
+JBˆÙ[‹˜\WÚÙ^HH˜]ÜË\ÙÈ‚ˆÙ[‹˜˜\ÙWÝ\›HˆšÎ‹ËØ™Y›ØÚË\[[YKžÜ™YÚ[ÛŸK˜[X^›Û˜]ÜË˜ÛÛH‚‚ˆYˆÛÜÙJÙ[ŠN‚ˆ\ÜÂ‚‚˜Û\ÜÈ\Þ[˜Ð™Y›ØÚÐ]^[X\žPÛY[
+Ð\Þ[˜Ð]^[X\žPÛY[˜\ÙJN‚ˆ\ÜÂ‚‚™YˆÙ[™Ú[ÜÜXZÜ×Ø[›ÜX×ÛY\ÜØYÙ\Ê˜\ÙWÝ\›ˆÝŠHOˆ›ÛÛ‚ˆˆˆ•YHYˆ˜\ÙWÝ\›ÜXZÜÈ[›ÜXÈY\ÜØYÙ\Ë›ÝÜ[RHÚ]˜ÛÛ\][ÛœË‚‚ˆZ\œ›ÜœÈ\›Y\×ØÛKœ[[YWÜ›ÝšY\‹—Ù]XÝØ\WÛ[ÙWÙ›Ü—Ý\›ÛÈ]^[™XZ[ˆYÜ™YNˆ[žBˆØ[›ÜXØT“
+Z[šSX^š\K]SJK\KšÚ[ZK˜ÛÛKØÛÙ[™Ø
+Ú]ÊK\K˜[›ÜXË˜ÛÛX‚ˆˆˆ‚ˆ›Ü›X[^™YH
+˜\ÙWÝ\›ÜˆˆŠKœÝš\
+
+K›ÝÙ\Š
+KœœÝš\
+‹ÈŠBˆYˆ›Ý›Ü›X[^™Y‚ˆ™]\›ˆ˜[ÙBˆYˆ\›\œÙJ›Ü›X[^™Y
+Kœ]œœÝš\
+‹ÈŠK™[™ÝÚ]
+
+‹Ø[›ÜXÈ‹‹Ø[›ÜXËÝŒHŠJN‚ˆ™]\›ˆYBˆÜÝ˜[YHH˜\ÙWÝ\›ÚÜÝ˜[YJ›Ü›X[^™Y
+Bˆ™]\›ˆÜÝ˜[YHOH˜\K˜[›ÜXË˜ÛÛHˆÜˆ›ÛÛ
+ÜÝ˜[YHOH˜\KšÚ[ZK˜ÛÛHˆ[™‹ØÛÙ[™Èˆ[ˆ›Ü›X[^™Y
+B‚‚™YˆÛX^X™WÝÜ˜\Ø[›ÜXÊˆÛY[ÛØšŽˆ[žK[Ù[ˆÝ‹\WÚÙ^NˆÝ‹˜\ÙWÝ\›ˆÝ‹\WÛ[ÙNˆÜ[Û˜[ÜÝ—HH›Û™BŠHOˆ[žN‚ˆˆˆ”™]Ü˜\HZ[ˆÜ[RHÛY[[ˆ[›ÜXÐ]^[X\žPÛY[Ú[ˆH[™Ú[ÜXZÜÈ[›ÜXÈY\ÜØYÙ\Ë‚‚ˆÚ[™ÛH˜[œÜÜXÛÜœ™XÝ[ÛˆÚÚÙ\Ú[]H[™Ùˆ]™\žH™\ÛÛ™WÜ›ÝšY\—ØÛY[œ˜[˜ÚÈ™]\›œÂˆÛY[ÛØš˜[˜Ú[™ÙY›Üˆ›Ø™HÝXœËÜÜXÚX[^™YY\\œËÜ[RK]Ú\™K^XÚ]›Û‹P[›ÜXÂˆ\WÛ[ÙXÜˆZ\ÜÚ[™È[›ÜXØÑË‚ˆˆˆ‚ˆÈ[›ÜXËÐ™Y›ØÚËÐÛÙ^Ü˜\\œË\È[žHÛY[XÛ\š[™ÈT“QT×ÔÒÒTÕS”ÔÔ•ÕÔTˆÈ
+˜]]™KÐPÔÚ[\Ë[‹]™YHÜˆYÚ[ŠK]\Ý™]™\ˆ™H™KY\Ü]ÚY›ÝYÚHÚ\™HY\\ˆ8 %ˆÈHÛ\ÜËX]šX]HXÛ\˜][Ûˆ˜]\ˆ[ˆ\Ú[œÝ[˜ÙHÛÈ\ÈÝ]™]™\ˆ[\ÜÈ[K‚ˆYˆ
+ˆ\Ú[œÝ[˜ÙJÛY[ÛØš‹Ð]^›Ø™PÛY[ÝXŠBˆÜˆÜØY™WÚ\Ú[œÝ[˜ÙJÛY[ÛØš‹
+[›ÜXÐ]^[X\žPÛY[™Y›ØÚÐ]^[X\žPÛY[ÛÙ^]^[X\žPÛY[
+JBˆÜˆØÛY[ÙXÛ\™\ÊÛY[ÛØš‹’T“QT×ÔÒÒTÕS”ÔÔ•ÕÔTŠBˆ
+N‚ˆ™]\›ˆÛY[ÛØš‚ˆÈ^XÚ]›Û‹X[›ÜXÈ\WÛ[ÙHÚ[œÈÝ™\ˆT“]\š\ÝXÜË‚ˆYˆ\WÛ[ÙHOH˜[›ÜX×ÛY\ÜØYÙ\Èˆ[™
+\WÛ[ÙHÜˆ›ÝÙ[™Ú[ÜÜXZÜ×Ø[›ÜX×ÛY\ÜØYÙ\Ê˜\ÙWÝ\›
+JN‚ˆ™]\›ˆÛY[ÛØš‚ˆžN‚ˆœ›ÛHYÙ[˜[›ÜX×ØY\\ˆ[\ÜZ[Ø[›ÜX×ØÛY[ˆ^Ù\[\Ü\œ›ÜŽ‚ˆÙÙÙ\‹Ø\›š[™Êˆ‘[™Ú[	\ÈÜXZÜÈ[›ÜXÈY\ÜØYÙ\È]H[›ÜXÈÑÈ\È‚ˆ››Ý[œÝ[Y8 %˜[[™È˜XÚÈÈÜ[RK]Ú\™H
+Ú[ZÙ[H
+Kˆ‹ˆ˜\ÙWÝ\›ˆ
+Bˆ™]\›ˆÛY[ÛØš‚ˆžN‚ˆ™X[ØÛY[HZ[Ø[›ÜX×ØÛY[
+\WÚÙ^K˜\ÙWÝ\›
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙÙÙ\‹Ø\›š[™Êˆ‘˜Z[YÈZ[[›ÜXÈÛY[›Üˆ	\È
+	\ÊH8 %˜[[™È˜XÚÈÈ‚ˆ“Ü[RK]Ú\™HÛY[ˆ‹˜\ÙWÝ\›^Ëˆ
+Bˆ™]\›ˆÛY[ÛØš‚ˆÙÙÙ\‹™XYÊˆ]^[X\žH˜[œÜÜˆÜ˜\[™ÈÛY[[ˆ[›ÜXÐ]^[X\žPÛY[‚ˆŠ[Ù[I\Ë˜\ÙWÝ\›I\Ë\WÛ[ÙOI\ÊH‹ˆ[Ù[˜\ÙWÝ\›ÎŒHYˆ˜\ÙWÝ\›[ÙHˆ‹\WÛ[ÙHÜˆ˜]]ËY]XÝY‹ˆ
+Bˆ™]\›ˆ[›ÜXÐ]^[X\žPÛY[
+™X[ØÛY[[Ù[\WÚÙ^K˜\ÙWÝ\›\×ÛØ]]Q˜[ÙJB‚‚™YˆÜ™XYÛ›Ý\×Ø]]
+
+HOˆÜ[Û˜[ÙXÝN‚ˆˆˆ“›Ý\È›ÝšY\ˆÝ]HXÝœ›ÛHHÜ™Y[X[ÛÛÜˆ‹Ëš\›Y\ËØ]]šœÛÛŽÈ›Û™HÚ[ˆ›ÝXÝ]™HÚ]ÚÙ[œËˆˆˆ‚ˆÛÛÜ™\Ù[[žHHÜÙ[XÝÜÛÛÙ[žJ››Ý\ÈŠBˆYˆÛÛÜ™\Ù[‚ˆYˆ[žH\È›Û™N‚ˆ™]\›ˆ›Û™Bˆ™]\›ˆÂˆ˜XØÙ\Ü×ÝÚÙ[ˆŽˆÙ]]Š[žK˜XØÙ\Ü×ÝÚÙ[ˆ‹ˆŠKˆœ™Yœ™\ÚÝÚÙ[ˆŽˆÙ]]Š[žKœ™Yœ™\ÚÝÚÙ[ˆ‹›Û™JKˆ˜YÙ[ÚÙ^HŽˆÙ]]Š[žK˜YÙ[ÚÙ^H‹›Û™JKˆš[™™\™[˜ÙWØ˜\ÙWÝ\›ŽˆÜÛÛÜ[[YWØ˜\ÙWÝ\›
+[žKÓ“ÕT×ÑQUSÐTÑWÕT“
+KˆœÜ[Ø˜\ÙWÝ\›ŽˆÙ]]Š[žKœÜ[Ø˜\ÙWÝ\›‹›Û™JKˆ˜ÛY[ÚYŽˆÙ]]Š[žK˜ÛY[ÚY‹›Û™JKˆœØÛÜHŽˆÙ]]Š[žKœØÛÜH‹›Û™JKˆÚÙ[—Ý\HŽˆÙ]]Š[žKÚÙ[—Ý\H‹™X\™\ˆŠKˆœÛÝ\˜ÙHŽˆœÛÛ‹ˆBˆžN‚ˆYˆ›ÝÐUUÒ”ÓÓ—ÔUš\×Ùš[J
+N‚ˆ™]\›ˆ›Û™Bˆ]HHœÛÛ‹›ØYÊÐUUÒ”ÓÓ—ÔUœ™XYÝ^
+[˜ÛÙ[™ÏH]‹N\ÚYÈŠJBˆYˆ]K™Ù]
+˜XÝ]™WÜ›ÝšY\ˆŠHOH››Ý\ÈŽ‚ˆ™]\›ˆ›Û™Bˆ›ÝšY\ˆH]K™Ù]
+œ›ÝšY\œÈ‹ßJK™Ù]
+››Ý\È‹ßJBˆÈ]\Ý]™H]X\Ý[ˆXØÙ\Ü×ÝÚÙ[ˆÜˆYÙ[ÚÙ^K‚ˆYˆ›Ý›ÝšY\‹™Ù]
+˜YÙ[ÚÙ^HŠH[™›Ý›ÝšY\‹™Ù]
+˜XØÙ\Ü×ÝÚÙ[ˆŠN‚ˆ™]\›ˆ›Û™Bˆ™]\›ˆ›ÝšY\‚ˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙÙÙ\‹™XYÊÛÝ[›Ý™XY›Ý\È]]ˆ	\È‹^ÊBˆ™]\›ˆ›Û™B‚‚™YˆÛ›Ý\×Ø\WÚÙ^J›ÝšY\ŽˆXÝ
+HOˆÝŽ‚ˆˆˆ‘^˜XÝH\ØX›H›Ý\È[™™\™[˜ÙH•Õœ›ÛHÝÜ™Y]]Ý]Kˆˆˆ‚ˆœ›ÛH\›Y\×ØÛK˜]][\ÜÛ›Ý\×Ú[›ÚÙWÚÝÚ\×Ý\ØX›Bˆ›ÜˆÚÙ[—ÚÙ^K^\žWÚÙ^H[ˆ
+
+˜YÙ[ÚÙ^H‹˜YÙ[ÚÙ^WÙ^\™\×Ø]ŠK
+˜XØÙ\Ü×ÝÚÙ[ˆ‹™^\™\×Ø]ŠJN‚ˆÚÙ[ˆH›ÝšY\‹™Ù]
+ÚÙ[—ÚÙ^JBˆYˆ›Ý\Ú[œÝ[˜ÙJÚÙ[‹ÝŠHÜˆ›ÝÚÙ[‹œÝš\
+
+N‚ˆÛÛ[YBˆYˆÛ›Ý\×Ú[›ÚÙWÚÝÚ\×Ý\ØX›JÚÙ[‹ØÛÜO\›ÝšY\‹™Ù]
+œØÛÜHŠK^\™\×Ø]\›ÝšY\‹™Ù]
+^\žWÚÙ^JJN‚ˆ™]\›ˆÚÙ[‚ˆ™]\›ˆˆ‚‚‚™YˆÜ™\ÛÛ™WÛ›Ý\×ÜÛÛÜ[[YWØ\J
+‹›Ü˜ÙWÜ™Yœ™\Úˆ›ÛÛH˜[ÙJHOˆÜ[Û˜[Ý\VÜÝ‹Ý—WN‚ˆˆˆ”™\ÛÛ™H›Ý\È]^[X\žHÜ™Y[X[Èœ›ÛHHÙ[XÝYÛÛ[žKˆˆˆ‚ˆžN‚ˆœ›ÛH\›Y\×ØÛK˜]][\ÜØYÙ[ÚÙ^WÚ\×Ý\ØX›BˆÛÛHØYÜÛÛ
+››Ý\ÈŠBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙÙÙ\‹™XYÊ]^[X\žH›Ý\ÈÛÛÜ™Y[X[™\ÛÛ][Ûˆ˜Z[Yˆ	\È‹^ÊBˆ™]\›ˆ›Û™BˆYˆ›ÝÛÛÜˆ›ÝÛÛš\×ØÜ™Y[X[Ê
+N‚ˆ™]\›ˆ›Û™BˆžN‚ˆ[žHHÛÛœÙ[XÝ
+
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙÙÙ\‹™XYÊ]^[X\žH›Ý\ÈÛÛÙ[XÝ[Ûˆ˜Z[Yˆ	\È‹^ÊBˆ™]\›ˆ›Û™BˆYˆ[žH\È›Û™N‚ˆ™]\›ˆ›Û™B‚ˆYˆÙ[žWÜÝ]JNˆ[žJHOˆXÝÜÝ‹[žWN‚ˆ™]\›ˆÚÎˆÙ]]ŠKË›Û™JH›ÜˆÈ[ˆ
+ˆ˜YÙ[ÚÙ^H‹˜YÙ[ÚÙ^WÙ^\™\×Ø]‹˜XØÙ\Ü×ÝÚÙ[ˆ‹™^\™\×Ø]‹œØÛÜHŠ_B‚ˆYˆ›Ü˜ÙWÜ™Yœ™\ÚÜˆ›ÝØYÙ[ÚÙ^WÚ\×Ý\ØX›JÙ[žWÜÝ]J[žJKÛ›Ý\×ÛZ[—ÚÙ^WÝÜÙXÛÛ™Ê
+JN‚ˆžN‚ˆ™Yœ™\ÚYHÛÛžWÜ™Yœ™\ÚØÝ\œ™[
+
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙÙÙ\‹™XYÊ]^[X\žH›Ý\ÈÛÛ™Yœ™\Ú˜Z[Yˆ	\È‹^ÊBˆ™Yœ™\ÚYH›Û™BˆYˆ™Yœ™\ÚY\È›Û™N‚ˆ™]\›ˆ›Û™Bˆ[žHH™Yœ™\ÚYˆ\WÚÙ^HHÛ›Ý\×Ø\WÚÙ^JÙ[žWÜÝ]J[žJJBˆ˜\ÙWÝ\›HÜÛÛÜ[[YWØ˜\ÙWÝ\›
+[žKÓ“ÕT×ÑQUSÐTÑWÕT“
+BˆYˆ›Ý\WÚÙ^HÜˆ›Ý˜\ÙWÝ\›‚ˆ™]\›ˆ›Û™Bˆ™]\›ˆ\WÚÙ^K˜\ÙWÝ\›‚‚™YˆÜ™\ÛÛ™WÛ›Ý\×Ü[[YWØ\Jˆ
+‹›Ü˜ÙWÜ™Yœ™\Úˆ›ÛÛH˜[ÙKÝ[WØXØÙ\Ü×ÝÚÙ[ŽˆÜ[Û˜[ÜÝ—HH›Û™BŠHOˆÜ[Û˜[Ý\VÜÝ‹Ý—WN‚ˆˆˆ‘œ™\Ú›Ý\È[[YHÜ™Y[X[È
+ÛÛš\œÝ[ˆ]]ÝÜ™H
+È•Õ™Yœ™\Ú
+H8 %Z\œ›ÜœÈHXZ[‚ˆYÙ[	ÜÈH™XÛÝ™\žKˆÝ[WØXØÙ\Ü×ÝÚÙ[˜\ÈH™X\™\ˆ]\ÝIÙÈÚ]›Ü˜ÙWÜ™Yœ™\Úˆ]]ÈH]]ÝÜ™HYÜHÚX›[™È›ØÙ\ÜÉÜÈ›Ý][Ûˆ[œÝXYÙˆ™KTÔÕ[™ÈHÚ\™YÜ˜[ˆˆˆ‚ˆÛÛYHÜ™\ÛÛ™WÛ›Ý\×ÜÛÛÜ[[YWØ\J›Ü˜ÙWÜ™Yœ™\ÚY›Ü˜ÙWÜ™Yœ™\Ú
+BˆYˆÛÛY\È›Ý›Û™N‚ˆ™]\›ˆÛÛYˆžN‚ˆœ›ÛH\›Y\×ØÛK˜]][\Ü™\ÛÛ™WÛ›Ý\×Ü[[YWØÜ™Y[X[ÂˆÜ™YÈH™\ÛÛ™WÛ›Ý\×Ü[[YWØÜ™Y[X[Êˆ[Y[Ý]ÜÙXÛÛ™ÏY[—Ù›Ø]
+’T“QT×Ó“ÕT×ÕSQSÕUÔÑPÓÓ‘È‹MJKˆ›Ü˜ÙWÜ™Yœ™\ÚY›Ü˜ÙWÜ™Yœ™\ÚˆÝ[WØXØÙ\Ü×ÝÚÙ[\Ý[WØXØÙ\Ü×ÝÚÙ[ˆÜˆ›Û™Kˆ
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙÙÙ\‹™XYÊ]^[X\žH›Ý\È[[YHÜ™Y[X[™\ÛÛ][Ûˆ˜Z[Yˆ	\È‹^ÊBˆ™]\›ˆ›Û™Bˆ™]\›ˆØÜ™Y×ÜZ\ŠÜ™YÊB‚‚™YˆØÜ™Y×ÜZ\ŠÜ™YÎˆXÝÜÝ‹[žWJHOˆÜ[Û˜[Õ\VÜÝ‹Ý—WN‚ˆˆˆ˜
+\WÚÙ^K˜\ÙWÝ\›
+Xœ›ÛHH[[YKXÜ™Y[X[ÈXÝÜˆ›Û™HÚ[ˆZ]\ˆ\ÈZ\ÜÚ[™Ëˆˆˆ‚ˆ\WÚÙ^HHÝŠÜ™YË™Ù]
+˜\WÚÙ^HŠHÜˆˆŠKœÝš\
+
+Bˆ˜\ÙWÝ\›HÝŠÜ™YË™Ù]
+˜˜\ÙWÝ\›ŠHÜˆˆŠKœÝš\
+
+KœœÝš\
+‹ÈŠBˆYˆ›Ý\WÚÙ^HÜˆ›Ý˜\ÙWÝ\›‚ˆ™]\›ˆ›Û™Bˆ™]\›ˆ\WÚÙ^K˜\ÙWÝ\›‚‚™YˆÜ™\ÛÛ™WÞZWÛØ]]Ù›Ü—Ø]^
+
+HOˆÜ[Û˜[Õ\VÜÝ‹Ý—WN‚ˆˆˆ‘œ™\ÚRHÐ]]
+\WÚÙ^K˜\ÙWÝ\›
+H›Üˆ]^ÛY[ËÜˆ›Û™K‚‚ˆÛÛš\œÝ
+ÛÛYHRHÐ]]ÙÚ[œÈ^\ÝÛ›H\ÈÛÛ[šY\ÊK[ˆHÚ[™Û]Ûˆ]]\ÝÜ™H™\ÛÛ™\‹‚ˆˆˆ‚ˆžN‚ˆœ›ÛH\›Y\×ØÛK˜]][\ÜQUSÖRWÓÐUUÐTÑWÕT“ÞZWÝ˜[Y]WÚ[™™\™[˜ÙWØ˜\ÙWÝ\›ˆÛÛHØYÜÛÛ
+žZK[Ø]]ŠBˆYˆÛÛ[™ÛÛš\×ØÜ™Y[X[Ê
+N‚ˆ[žHHÛÛœÙ[XÝ
+
+BˆYˆ[žH\È›Ý›Û™N‚ˆ\WÚÙ^HHÝŠˆÙ]]Š[žKœ[[YWØ\WÚÙ^H‹›Û™JHÜˆÙ]]Š[žK˜XØÙ\Ü×ÝÚÙ[ˆ‹ˆŠHÜˆˆ‚ˆ
+KœÝš\
+
+BˆÝ\›H[X™HŽˆÝŠˆÜˆˆŠKœÝš\
+
+KœœÝš\
+‹ÈŠHÈ›ÜXNˆMÌÌBˆ˜\ÙWÝ\›HÞZWÝ˜[Y]WÚ[™™\™[˜ÙWØ˜\ÙWÝ\›
+ˆÝ\›
+ÜË™Ù][Š’T“QT×ÖRWÐTÑWÕT“‹ˆŠJBˆÜˆÝ\›
+ÜË™Ù][Š–RWÐTÑWÕT“‹ˆŠJBˆÜˆÝ\›
+Ù]]Š[žKœ[[YWØ˜\ÙWÝ\›‹›Û™JJBˆÜˆÝ\›
+Ù]]Š[žK˜˜\ÙWÝ\›‹›Û™JJKˆ˜[˜XÚÏQQUSÖRWÓÐUUÐTÑWÕT“ˆ
+BˆYˆ\WÚÙ^H[™˜\ÙWÝ\›‚ˆ™]\›ˆ\WÚÙ^K˜\ÙWÝ\›ˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙÙÙ\‹™XYÊ]^[X\žHRHÐ]]ÛÛÜ™Y[X[™\ÛÛ][Ûˆ˜Z[Yˆ	\È‹^ÊBˆžN‚ˆœ›ÛH\›Y\×ØÛK˜]][\Ü™\ÛÛ™WÞZWÛØ]]Ü[[YWØÜ™Y[X[ÂˆÜ™YÈH™\ÛÛ™WÞZWÛØ]]Ü[[YWØÜ™Y[X[Ê
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙÙÙ\‹™XYÊ]^[X\žHRHÐ]][[YHÜ™Y[X[™\ÛÛ][Ûˆ˜Z[Yˆ	\È‹^ÊBˆ™]\›ˆ›Û™Bˆ™]\›ˆØÜ™Y×ÜZ\ŠÜ™YÊB‚‚™YˆÜ™XYØÛÙ^ØXØÙ\Ü×ÝÚÙ[Š
+HOˆÜ[Û˜[ÜÝ—N‚ˆˆˆ•˜[Y›Û‹Y^\™YÛÙ^Ð]]XØÙ\ÜÈÚÙ[ŽÈ[ˆ^]\ÝYÛÛ˜[È˜XÚÈÈH›Ùš[IÜÈ]]šœÛÛˆÚÙ[‹ˆˆˆ‚ˆÛÛÜ™\Ù[[žHHÜÙ[XÝÜÛÛÙ[žJ›Ü[˜ZKXÛÙ^ŠBˆYˆÛÛÜ™\Ù[‚ˆÚÙ[ˆHÜÛÛÜ[[YWØ\WÚÙ^J[žJBˆYˆÚÙ[Ž‚ˆ™]\›ˆÚÙ[‚ˆžN‚ˆœ›ÛH\›Y\×ØÛK˜]][\ÜÜ™XYØÛÙ^ÝÚÙ[œÂˆXØÙ\Ü×ÝÚÙ[ˆHÜ™XYØÛÙ^ÝÚÙ[œÊ
+K™Ù]
+ÚÙ[œÈ‹ßJK™Ù]
+˜XØÙ\Ü×ÝÚÙ[ˆŠBˆYˆ›Ý\Ú[œÝ[˜ÙJXØÙ\Ü×ÝÚÙ[‹ÝŠHÜˆ›ÝXØÙ\Ü×ÝÚÙ[‹œÝš\
+
+N‚ˆ™]\›ˆ›Û™BˆÈ^\™Y•ÕÈÛÝ[›ØÚÈH]]ÈÚZ[ˆ[™™]™[˜[˜XÚÈÈÛÜšÚ[™È›ÝšY\œË‚ˆžN‚ˆ[\Ü˜\ÙMˆ^[ØYHXØÙ\Ü×ÝÚÙ[‹œÜ]
+‹ˆŠVÌWBˆ^[ØY
+ÏHHˆ
+ˆ
+[[Š^[ØY
+H	H
+Bˆ^HœÛÛ‹›ØYÊ˜\ÙM\›ØY™WØXÛÙJ^[ØY
+JK™Ù]
+™^‹
+BˆYˆ^[™[YK[YJ
+Hˆ^‚ˆÙÙÙ\‹™XYÊÛÙ^XØÙ\ÜÈÚÙ[ˆ^\™Y
+^I\ÊKÚÚ\[™È‹^
+Bˆ™]\›ˆ›Û™Bˆ^Ù\^Ù\[ÛŽ‚ˆ\ÜÈÈ›Û‹R•ÕÚÙ[ˆÜˆXÛÙH\œ›Üˆ8 %\ÙH\ËZ\Âˆ™]\›ˆXØÙ\Ü×ÝÚÙ[‹œÝš\
+
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙÙÙ\‹™XYÊÛÝ[›Ý™XYÛÙ^]]›Üˆ]^[X\žHÛY[ˆ	\È‹^ÊBˆ™]\›ˆ›Û™B‚‚™YˆÜ™\ÛÛ™WØ\WÚÙ^WÜ›ÝšY\Š
+HOˆ\VÓÜ[Û˜[ÓÜ[RWKÜ[Û˜[ÜÝ—WN‚ˆˆˆ•žHXXÚTKZÙ^H›ÝšY\ˆ[ˆ“Õ’QT—Ô‘QÒTÕ–HÜ™\ŽÈ
+ÛY[[Ù[
+HÜˆ
+›Û™K›Û™JKˆˆˆ‚ˆžN‚ˆœ›ÛH\›Y\×ØÛK˜]][\Ü“Õ’QT—Ô‘QÒTÕ–K™\ÛÛ™WØ\WÚÙ^WÜ›ÝšY\—ØÜ™Y[X[Âˆ^Ù\[\Ü\œ›ÜŽ‚ˆÙÙÙ\‹™XYÊÛÝ[›Ý[\Ü“Õ’QT—Ô‘QÒTÕ–H›ÜˆTKZÙ^H˜[˜XÚÈŠBˆ™]\›ˆ›Û™K›Û™Bˆ›Üˆ›ÝšY\—ÚYÛÛ™šYÈ[ˆ“Õ’QT—Ô‘QÒTÕ–Kš][\Ê
+N‚ˆYˆÛÛ™šYË˜]]Ý\HOH˜\WÚÙ^HŽ‚ˆÛÛ[YBˆYˆÚ\×Ü›ÝšY\—Ý[šX[J›ÝšY\—ÚY
+N‚ˆÙÙÙ\‹™XYÊ]^[X\žH\KZÙ^HÚZ[Žˆ	\È\È[šX[KÚÚ\[™È‹›ÝšY\—ÚY
+BˆÛÛ[YBˆYˆ›ÝšY\—ÚYOH˜[›ÜXÈŽ‚ˆÈ^XÚ]XÛÛ™šYÈØ]NˆÛ]YHÛÙHÜ™Y[X[È]\Ý›ÝÚ[[H™XÛÛYH]^˜[˜XÚË‚ˆÚ]ÛÛ^X‹œÝ\™\ÜÊ[\Ü\œ›ÜŠN‚ˆœ›ÛH\›Y\×ØÛK˜]][\Ü\×Ü›ÝšY\—Ù^XÚ]WØÛÛ™šYÝ\™YˆYˆ›Ý\×Ü›ÝšY\—Ù^XÚ]WØÛÛ™šYÝ\™Y
+˜[›ÜXÈŠN‚ˆÛÛ[YBˆ™]\›ˆÝžWØ[›ÜXÊ
+BˆÛÛÜ™\Ù[[žHHÜÙ[XÝÜÛÛÙ[žJ›ÝšY\—ÚY
+BˆYˆÛÛÜ™\Ù[‚ˆ\WÚÙ^HHÜÛÛÜ[[YWØ\WÚÙ^J[žJBˆYˆ›Ý\WÚÙ^N‚ˆÛÛ[YBˆ˜]×Ø˜\ÙWÝ\›HÜÛÛÜ[[YWØ˜\ÙWÝ\›
+[žKÛÛ™šYËš[™™\™[˜ÙWØ˜\ÙWÝ\›
+HÜˆÛÛ™šYËš[™™\™[˜ÙWØ˜\ÙWÝ\›ˆšXHHˆšXHÛÛ‚ˆ[ÙN‚ˆÜ™YÈH™\ÛÛ™WØ\WÚÙ^WÜ›ÝšY\—ØÜ™Y[X[Ê›ÝšY\—ÚY
+Bˆ\WÚÙ^HHÝŠÜ™YË™Ù]
+˜\WÚÙ^H‹ˆŠJKœÝš\
+
+BˆYˆ›Ý\WÚÙ^N‚ˆÛÛ[YBˆ˜]×Ø˜\ÙWÝ\›HÝŠÜ™YË™Ù]
+˜˜\ÙWÝ\›‹ˆŠJKœÝš\
+
+KœœÝš\
+‹ÈŠHÜˆÛÛ™šYËš[™™\™[˜ÙWØ˜\ÙWÝ\›ˆšXHHˆ‚ˆ[Ù[HÙÙ]Ø]^Û[Ù[Ù›Ü—Ü›ÝšY\Š›ÝšY\—ÚY
+HÜˆ›Û™BˆYˆ[Ù[\È›Û™N‚ˆÛÛ[YHÈÚÚ\›ÝšY\ˆYˆÙHÛ‰ÝÛ›ÝÈH˜[Y]^[Ù[ˆÙÙÙ\‹™XYÊ]^[X\žH^ÛY[ˆ	\È
+	\ÊI\È‹ÛÛ™šYË›˜[YK[Ù[šXJBˆÈ˜]]™HÙ[Z[šK[ÙHÜ[RK]Ú\™H
+È[›ÜXÈ™]Ü˜\‚ˆ˜\ÙWÝ\›HÝ×ÛÜ[˜ZWØ˜\ÙWÝ\›
+˜]×Ø˜\ÙWÝ\›
+BˆYˆ›ÝšY\—ÚYOH™Ù[Z[šHŽ‚ˆœ›ÛHYÙ[™Ù[Z[šWÛ˜]]™WØY\\ˆ[\ÜÙ[Z[šS˜]]™PÛY[\×Û˜]]™WÙÙ[Z[šWØ˜\ÙWÝ\›ˆYˆ\×Û˜]]™WÙÙ[Z[šWØ˜\ÙWÝ\›
+˜\ÙWÝ\›
+N‚ˆ™]\›ˆÙ[Z[šS˜]]™PÛY[
+\WÚÙ^OX\WÚÙ^K˜\ÙWÝ\›X˜\ÙWÝ\›
+K[Ù[ˆYˆ˜\ÙWÝ\›ÚÜÝÛX]Ú\Ê˜\ÙWÝ\›˜\KšÚ[ZK˜ÛÛHŠN‚ˆXY\œÈHÈ•\Ù\‹PYÙ[Žˆ˜Û]YKXÛÙKÌŒKŒŸBˆ[Yˆ˜\ÙWÝ\›ÚÜÝÛX]Ú\Ê˜\ÙWÝ\›™Ú]X˜ÛÜ[Ý˜ÛÛHŠN‚ˆœ›ÛH\›Y\×ØÛK›[Ù[È[\ÜÛÜ[ÝÙY˜][ÚXY\œÂˆXY\œÈHÛÜ[ÝÙY˜][ÚXY\œÊ
+Bˆ[Yˆ˜\ÙWÝ\›ÚÜÝÛX]Ú\Ê˜\ÙWÝ\›š[YÜ˜]K˜\K›šYXK˜ÛÛHŠN‚ˆXY\œÈHZ[ÛšYXWÛš[WÚXY\œÊ˜\ÙWÝ\›
+Bˆ[ÙN‚ˆXY\œÈHÜ›Ùš[WÙY˜][ÚXY\œÊ›ÝšY\—ÚY
+Bˆ^˜HHÈ™Y˜][ÚXY\œÈŽˆXY\œßHYˆXY\œÈ[ÙHßBˆY\™ÙYHØ\WÝ\Ù\—ÙY˜][ÚXY\œÊ^˜K™Ù]
+™Y˜][ÚXY\œÈŠJBˆYˆY\™ÙY‚ˆ^˜VÈ™Y˜][ÚXY\œÈ—HHY\™ÙYˆÛY[HØÜ™X]WÛÜ[˜ZWØÛY[
+\WÚÙ^OX\WÚÙ^K˜\ÙWÝ\›X˜\ÙWÝ\›
+Š™^˜JBˆ™]\›ˆÛX^X™WÝÜ˜\Ø[›ÜXÊÛY[[Ù[\WÚÙ^K˜]×Ø˜\ÙWÝ\›
+K[Ù[ˆ™]\›ˆ›Û™K›Û™B‚‚™YˆÙ[™Ú[ÙY˜][ÚXY\œÊˆ˜\ÙWÝ\›ˆÝ‹›ÝšY\ŽˆÝ‹
+‹\×Ýš\Ú[ÛŽˆ›ÛÛH˜[ÙKZNˆ›ÛÛH˜[ÙKŠHOˆÜ[Û˜[ÙXÝN‚ˆˆˆ”›ÝšY\‹\ÜXÚYšXÈÛY[XY\œÈžH[™Ú[ÜÝY\™ÙYÚ]\Ù\ˆ[Ù[™Y˜][ÚXY\œØ‚‚ˆÚ[ZHÛÙH™YYÈHÛ]YKXÛÙH\Ù\‹PYÙ[ÈÛÜ[Ý™YYÈ]È™\]Y\ÝXY\œÂˆ
+\×Ýš\Ú[Û˜YÈÛÜ[ÝUš\Ú[Û‹T™\]Y\Ý
+NÈ•’QPH’SH[™
+Ü[Û˜[JHRH]™BˆZ\ˆÝÛˆš[™Ù\œš[ÎÈ[ž][™È[ÙH˜[È˜XÚÈÈH›ÝšY\ˆ›Ùš[K‚ˆˆˆ‚ˆYˆ˜\ÙWÝ\›ÚÜÝÛX]Ú\Ê˜\ÙWÝ\›˜\KšÚ[ZK˜ÛÛHŠN‚ˆXY\œÎˆXÝHÈ•\Ù\‹PYÙ[Žˆ˜Û]YKXÛÙKÌŒKŒŸBˆ[Yˆ˜\ÙWÝ\›ÚÜÝÛX]Ú\Ê˜\ÙWÝ\›™Ú]X˜ÛÜ[Ý˜ÛÛHŠN‚ˆœ›ÛH\›Y\×ØÛK˜ÛÜ[ÝØ]][\ÜÛÜ[ÝÜ™\]Y\ÝÚXY\œÂˆXY\œÈHXÝ
+ÛÜ[ÝÜ™\]Y\ÝÚXY\œÊ\×ØYÙ[Ý\›UYK\×Ýš\Ú[ÛZ\×Ýš\Ú[ÛŠJBˆ[Yˆ˜\ÙWÝ\›ÚÜÝÛX]Ú\Ê˜\ÙWÝ\›š[YÜ˜]K˜\K›šYXK˜ÛÛHŠN‚ˆXY\œÈHXÝ
+Z[ÛšYXWÛš[WÚXY\œÊ˜\ÙWÝ\›
+JBˆ[YˆZH[™˜\ÙWÝ\›ÚÜÝÛX]Ú\Ê˜\ÙWÝ\›ž˜ZHŠN‚ˆœ›ÛHÛÛËžZWÚ[\Ü\›Y\×ÞZWÙY˜][ÚXY\œÂˆXY\œÈHXÝ
+\›Y\×ÞZWÙY˜][ÚXY\œÊ
+JBˆ[ÙN‚ˆXY\œÈHÜ›Ùš[WÙY˜][ÚXY\œÊ›ÝšY\ŠHÜˆßBˆ™]\›ˆØ\WÝ\Ù\—ÙY˜][ÚXY\œÊXY\œÈÜˆ›Û™JHÜˆ›Û™B‚‚™YˆÜ›Ùš[WÙY˜][ÚXY\œÊ›ÝšY\ŽˆÝŠHOˆÜ[Û˜[ÙXÝN‚ˆˆˆÛY[[]™[]šX][ÛˆXY\œÈœ›ÛHH›ÝšY\ˆ›Ùš[H
+K™ËˆÓRH\Ù\‹PYÙ[
+KÜˆ›Û™Kˆˆˆ‚ˆYˆ›Ý›ÝšY\Ž‚ˆ™]\›ˆ›Û™BˆÚ]ÛÛ^X‹œÝ\™\ÜÊ^Ù\[ÛŠN‚ˆœ›ÛH›ÝšY\œÈ[\ÜÙ]Ü›ÝšY\—Ü›Ùš[Bˆ›Ùš[HHÙ]Ü›ÝšY\—Ü›Ùš[J›ÝšY\ŠBˆYˆ›Ùš[H[™›Ùš[K™Y˜][ÚXY\œÎ‚ˆ™]\›ˆXÝ
+›Ùš[K™Y˜][ÚXY\œÊBˆ™]\›ˆ›Û™B‚‚ˆÈ›ÝšY\ˆ™\ÛÛ][Ûˆ[\œÂ‚—ÜZYÛ[™WÝØ\›™YˆÙ]HÙ]
+
+B‚‚™YˆÚ\×Ùœ™YWÛ[Ù[
+[Ù[ˆÜ[Û˜[ÜÝ—JHOˆ›ÛÛ‚ˆˆˆ•YHÚ[ˆ[Ù[\ÈHœ™YHÒÕH
+™œ™YXÝY™š^ÜˆÝX[Ø™Yš^
+H8 %˜[Z[™ËXÛÛ™[[Ûˆ\Ýˆˆˆ‚ˆYˆ›Ý[Ù[‚ˆ™]\›ˆ˜[ÙBˆ›Ü›X[^™YHÝŠ[Ù[
+KœÝš\
+
+Bˆ™]\›ˆ›Ü›X[^™Y™[™ÝÚ]
+Ž™œ™YHŠHÜˆ›Ü›X[^™YœÝ\ÝÚ]
+œÝX[ÈŠB‚‚™YˆØ]^ÛÜ[œ›Ý]\—ÜÙ][™ÜÊ
+HOˆ\VØ›ÛÛÝ—N‚ˆˆˆ”™XY
+œ™YWÛÛ›KÜ[œ›Ý]\—Û[Ù[
+Hœ›ÛHÛÛ™šYÎÈ
+˜[ÙKÓÔS”“ÕUT—ÓSÑS
+HÛˆ˜Z[\™Kˆˆˆ‚ˆžN‚ˆœ›ÛH\›Y\×ØÛK˜ÛÛ™šYÈ[\ÜÙ™×ÙÙ]ØYØÛÛ™šY×Ü™XYÛ›BˆÙ™ÈHØYØÛÛ™šY×Ü™XYÛ›J
+Bˆœ™YWÛÛ›HH›ÛÛ
+Ù™×ÙÙ]
+Ù™Ë˜]^[X\žH‹™œ™YWÛÛ›H‹Y˜][Q˜[ÙJJBˆ˜[HÙ™×ÙÙ]
+Ù™Ë˜]^[X\žH‹›Ü[œ›Ý]\—Û[Ù[ŠBˆ[Ù[H˜[œÝš\
+
+HYˆ\Ú[œÝ[˜ÙJ˜[ÝŠH[™˜[œÝš\
+
+H[ÙHÓÔS”“ÕUT—ÓSÑSˆ™]\›ˆœ™YWÛÛ›K[Ù[ˆ^Ù\^Ù\[ÛŽ‚ˆ™]\›ˆ˜[ÙKÓÔS”“ÕUT—ÓSÑS‚‚™YˆÝØ\›—ÜZYÛ[™WÛÛ˜ÙJ[Ù[ˆÝŠHOˆ›Û™N‚ˆˆˆ“ÙÈHÐT“’S‘ÈHš\œÝ[YHH›Û‹Yœ™YHÜ[”›Ý]\ˆ[Ù[\È[™ØYÙYˆˆˆ‚ˆYˆ[Ù[[ˆÜZYÛ[™WÝØ\›™Y‚ˆ™]\›‚ˆÜZYÛ[™WÝØ\›™Y˜Y
+[Ù[
+BˆÙÙÙ\‹Ø\›š[™Êˆ]^[X\žHÛY[ˆRQ[™H[™ØYÙY›Üˆ]^[X\žH\ÚÈ8 %Ü[”›Ý]\ˆ˜[˜XÚÈ[Ù[	\ˆ\È›Ý‚ˆ˜H™œ™YHÒÕH[™X^H[˜Ý\ˆ™X[Ü[™ˆÙ]]^[X\žK™œ™YWÛÛ›NˆYHÈ™\ÝšXÝ]^[X\žH‚ˆ™˜[˜XÚÜÈÈœ™YH[Ù[ËÜˆ]^[X\žK›Ü[œ›Ý]\—Û[Ù[ÈH™œ™YH[Ù[ˆ‹[Ù[ˆ
+B‚‚™YˆÝžWÛÜ[œ›Ý]\Š^XÚ]Ø\WÚÙ^NˆÝˆH›Û™K[Ù[ˆÝˆH›Û™JHOˆ\VÓÜ[Û˜[ÓÜ[RWKÜ[Û˜[ÜÝ—WN‚ˆœ™YWÛÛ›KÙ™×Û[Ù[HØ]^ÛÜ[œ›Ý]\—ÜÙ][™ÜÊ
+BˆÜ—Û[Ù[H[Ù[ÜˆÙ™×Û[Ù[ˆYˆœ™YWÛÛ›H[™›ÝÚ\×Ùœ™YWÛ[Ù[
+Ü—Û[Ù[
+N‚ˆÙÙÙ\‹Ø\›š[™Êˆ]^[X\žHÛY[ˆ]^[X\žK™œ™YWÛÛ›H\È[˜X›Y]HÜ[”›Ý]\ˆ˜[˜XÚÈ[Ù[	\ˆ\È‚ˆ››ÝH™œ™YHÒÕH8 %ÚÚ\[™ÈHÜ[”›Ý]\ˆ˜[˜XÚËˆÙ]]^[X\žK›Ü[œ›Ý]\—Û[Ù[ÈH‚ˆŽ™œ™YH[Ù[
+K™ËˆšYXKÛ™[[Ý›Û‹LË][˜KMML‹XMMXŽ™œ™YJHÜˆ\ØX›H]^[X\žK™œ™YWÛÛ›Kˆ‹ˆÜ—Û[Ù[ˆ
+Bˆ™]\›ˆ›Û™K›Û™BˆYˆ›ÝÚ\×Ùœ™YWÛ[Ù[
+Ü—Û[Ù[
+N‚ˆÝØ\›—ÜZYÛ[™WÛÛ˜ÙJÜ—Û[Ù[
+BˆÛÛÜ™\Ù[[žHHÜÙ[XÝÜÛÛÙ[žJ›Ü[œ›Ý]\ˆŠBˆYˆÛÛÜ™\Ù[‚ˆÜ—ÚÙ^HH^XÚ]Ø\WÚÙ^HÜˆÜÛÛÜ[[YWØ\WÚÙ^J[žJBˆYˆÜ—ÚÙ^N‚ˆ˜\ÙWÝ\›HÜÛÛÜ[[YWØ˜\ÙWÝ\›
+[žKÔS”“ÕUT—ÐTÑWÕT“
+HÜˆÔS”“ÕUT—ÐTÑWÕT“ˆÙÙÙ\‹™XYÊ]^[X\žHÛY[ˆÜ[”›Ý]\ˆšXHÛÛŠBˆ™]\›ˆØÜ™X]WÛÜ[˜ZWØÛY[
+ˆ\WÚÙ^O[Ü—ÚÙ^K˜\ÙWÝ\›X˜\ÙWÝ\›Y˜][ÚXY\œÏXZ[ÛÜ—ÚXY\œÊ
+Bˆ
+KÜ—Û[Ù[ˆÈ^]\ÝYÛÛˆ˜[›ÝYÚÈÔS”“ÕUT—ÐTWÒÑVH˜]\ˆ[ˆ˜Z[‚ˆÙÙÙ\‹™XYÊ]^[X\žHÛY[ˆÜ[”›Ý]\ˆÛÛ^]\ÝYžZ[™ÈÔS”“ÕUT—ÐTWÒÑVHŠBˆÜ—ÚÙ^HH^XÚ]Ø\WÚÙ^HÜˆÜØÛÜYÚÙ^WÙ[Š“ÔS”“ÕUT—ÐTWÒÑVHŠBˆYˆ›ÝÜ—ÚÙ^N‚ˆÛX\š×Ü›ÝšY\—Ý[šX[J›Ü[œ›Ý]\ˆ‹MŒ
+Bˆ™]\›ˆ›Û™K›Û™BˆÙÙÙ\‹™XYÊ]^[X\žHÛY[ˆÜ[”›Ý]\ˆŠBˆ™]\›ˆØÜ™X]WÛÜ[˜ZWØÛY[
+ˆ\WÚÙ^O[Ü—ÚÙ^K˜\ÙWÝ\›SÔS”“ÕUT—ÐTÑWÕT“Y˜][ÚXY\œÏXZ[ÛÜ—ÚXY\œÊ
+Bˆ
+KÜ—Û[Ù[‚‚™YˆÙ\ØÜšX™WÛÜ[œ›Ý]\—Ý[˜]˜Z[X›J[Ù[ˆÝˆH›Û™JHOˆÝŽ‚ˆˆˆ”™]\›ˆHÛXÞHÜˆÜ™Y[X[™X\ÛÛˆÜ[”›Ý]\ˆØ\È[˜]˜Z[X›Kˆˆˆ‚ˆœ™YWÛÛ›KÙ™×Û[Ù[HØ]^ÛÜ[œ›Ý]\—ÜÙ][™ÜÊ
+BˆÜ—Û[Ù[H[Ù[ÜˆÙ™×Û[Ù[ˆYˆœ™YWÛÛ›H[™›ÝÚ\×Ùœ™YWÛ[Ù[
+Ü—Û[Ù[
+N‚ˆ™]\›ˆ
+ˆˆ˜]^[X\žK™œ™YWÛÛ›H™Z™XÝY›Û‹Yœ™YH[Ù[ÛÜ—Û[Ù[\ŸNÈ‚ˆH™\]Y\ÝØ\ÈÚÚ\Y™Y›Ü™H›ÝšY\ˆ]˜Z[Xš[]HÚXÚÜÈ‚ˆ
+BˆÛÛÜ™\Ù[[žHHÜÙ[XÝÜÛÛÙ[žJ›Ü[œ›Ý]\ˆŠBˆYˆÛÛÜ™\Ù[‚ˆYˆ[žH\È›Û™N‚ˆ™]\›ˆ“Ü[”›Ý]\ˆÜ™Y[X[ÛÛ\È›È\ØX›H[šY\È
+Ü™Y[X[ÈX^H™H^]\ÝY
+H‚ˆYˆ›ÝÜÛÛÜ[[YWØ\WÚÙ^J[žJN‚ˆ™]\›ˆ“Ü[”›Ý]\ˆÜ™Y[X[ÛÛ[žH\ÈZ\ÜÚ[™ÈH[[YHTHÙ^H‚ˆYˆ›ÝÜØÛÜYÚÙ^WÙ[Š“ÔS”“ÕUT—ÐTWÒÑVHŠN‚ˆ™]\›ˆ“ÔS”“ÕUT—ÐTWÒÑVH›ÝÙ]‚ˆ™]\›ˆ››È\ØX›HÜ[”›Ý]\ˆÜ™Y[X[È›Ý[™‚‚‚™YˆÝžWÛ›Ý\Êš\Ú[ÛŽˆ›ÛÛH˜[ÙJHOˆ\VÓÜ[Û˜[ÓÜ[RWKÜ[Û˜[ÜÝ—WN‚ˆÈÜ›ÜÜË\Ù\ÜÚ[Ûˆ˜]HÝX\™ˆ[›Ý\ˆÙ\ÜÚ[Û‰ÜÈŽHYX[œÈÚÚ\›Ý\È˜]\ˆ[ˆ[HÛÈH\Y”XÚÙ]‚ˆÚ]ÛÛ^X‹œÝ\™\ÜÊ^Ù\[ÛŠN‚ˆœ›ÛHYÙ[››Ý\×Ü˜]WÙÝX\™[\Ü›Ý\×Ü˜]WÛ[Z]Ü™[XZ[š[™ÂˆÜ™[XZ[š[™ÈH›Ý\×Ü˜]WÛ[Z]Ü™[XZ[š[™Ê
+BˆYˆÜ™[XZ[š[™È\È›Ý›Û™H[™Ü™[XZ[š[™Èˆ‚ˆÙÙÙ\‹™XYÊ]^[X\žNˆÚÚ\[™È›Ý\ÈÜ[
+˜]K[[Z]Y™\Ù]È[ˆ	KŒœÊH‹Ü™[XZ[š[™ÊBˆÛX\š×Ü›ÝšY\—Ý[šX[J››Ý\È‹WÜ™[XZ[š[™ÊBˆ™]\›ˆ›Û™K›Û™Bˆ›Ý\ÈHÜ™XYÛ›Ý\×Ø]]
+
+Bˆ[[YHHÜ™\ÛÛ™WÛ›Ý\×Ü[[YWØ\J›Ü˜ÙWÜ™Yœ™\ÚQ˜[ÙJBˆYˆ[[YH\È›Û™H[™›Ý›Ý\Î‚ˆÙÙÙ\‹Ø\›š[™Ê]^[X\žH›Ý\ÈÛY[[˜]˜Z[X›Nˆ›È›Ý\È]][XØ][Ûˆ›Ý[™
+[Žˆ\›Y\È]]
+KˆŠBˆÛX\š×Ü›ÝšY\—Ý[šX[J››Ý\È‹MŒ
+Bˆ™]\›ˆ›Û™K›Û™BˆYˆ[[YH\È›Û™H[™›Ý\Î‚ˆÙÙÙ\‹™XYÊ]^[X\žH›Ý\Îˆ[[YH•Õ™Yœ™\Ú˜Z[YÈÚXÚÚ[™ÈÝÜ™Y]]šœÛÛˆÚÙ[‹ˆŠBˆÛØ˜[]^[X\žWÚ\×Û›Ý\Âˆ]^[X\žWÚ\×Û›Ý\ÈHYBˆÙÙÙ\‹™XYÊ]^[X\žHÛY[ˆ›Ý\ÈÜ[ŠBˆÈÜ[™XÛÛ[Y[™Y[[Ù[È\È]]Üš]]]™H
+Y\‹X]Ø\™JNÈÓ“ÕT×ÓSÑSÚ[ˆ[œ™XXÚX›KÛ[‚ˆÈ›Ø™\ÈÚÚ\HÛÚÝ\ˆ^XÝ[Ù[\È\œ™[]˜[[™]]ÈH™]ÛÜšË‚ˆ[Ù[HÓ“ÕT×ÓSÑSˆ[™HHš\Ú[ÛˆˆYˆš\Ú[Ûˆ[ÙH^‚ˆYˆ›ÝØ]^Ü›Ø™WØXÝ]™J
+N‚ˆžN‚ˆœ›ÛH\›Y\×ØÛK›[Ù[È[\ÜÙ]Û›Ý\×Ü™XÛÛ[Y[™YØ]^Û[Ù[ˆ™XÛÛ[Y[™YHÙ]Û›Ý\×Ü™XÛÛ[Y[™YØ]^Û[Ù[
+š\Ú[Û]š\Ú[ÛŠBˆYˆ™XÛÛ[Y[™Y‚ˆ[Ù[H™XÛÛ[Y[™YˆÙÙÙ\‹™XYÊ]^[X\žKÉ\Îˆ\Ú[™ÈÜ[\™XÛÛ[Y[™Y[Ù[	\È‹[™K[Ù[
+Bˆ[ÙN‚ˆÙÙÙ\‹™XYÊ]^[X\žKÉ\Îˆ›ÈÜ[™XÛÛ[Y[™][Û‹˜[[™È˜XÚÈÈ	\È‹[™K[Ù[
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙÙÙ\‹™XYÊˆ]^[X\žKÉ\Îˆ™XÛÛ[Y[™Y[[Ù[ÈÛÚÝ\˜Z[Y
+	\ÊNÈ‚ˆ™˜[[™È˜XÚÈÈ	\È‹ˆ[™K^Ë[Ù[ˆ
+BˆYˆ[[YH\È›Ý›Û™N‚ˆ\WÚÙ^K˜\ÙWÝ\›H[[YBˆ[ÙN‚ˆ\WÚÙ^HHÛ›Ý\×Ø\WÚÙ^J›Ý\ÈÜˆßJBˆYˆ›Ý\WÚÙ^N‚ˆÙÙÙ\‹Ø\›š[™Êˆ]^[X\žH›Ý\ÈÛY[[˜]˜Z[X›Nˆ›È\ØX›H[™™\™[˜ÙH•Õ›Ý[™‚ˆŠ[Žˆ\›Y\È]]Y›Ý\ÊKˆ‚ˆ
+BˆÛX\š×Ü›ÝšY\—Ý[šX[J››Ý\È‹MŒ
+Bˆ™]\›ˆ›Û™K›Û™Bˆ˜\ÙWÝ\›HÝŠˆ
+›Ý\ÈÜˆßJK™Ù]
+š[™™\™[˜ÙWØ˜\ÙWÝ\›ŠHÜˆÜË™Ù][Š““ÕT×ÒS‘‘T‘SÑWÐTÑWÕT“‹Ó“ÕT×ÑQUSÐTÑWÕT“
+Bˆ
+KœœÝš\
+‹ÈŠBˆ™]\›ˆØÜ™X]WÛÜ[˜ZWØÛY[
+\WÚÙ^OX\WÚÙ^K˜\ÙWÝ\›X˜\ÙWÝ\›
+K[Ù[‚‚™YˆÜ™Yœ™\ÚÛ›Ý\×Ü™XÛÛ[Y[™YÛ[Ù[
+
+‹š\Ú[ÛŽˆ›ÛÛÝ[WÛ[Ù[ˆÜ[Û˜[ÜÝ—JHOˆÜ[Û˜[ÜÝ—N‚ˆˆˆ‘œ™\ÚÜ[™XÛÛ[Y[™Y[Ù[Y\ˆHÝ[K[[Ù[
+Û™Ë[]™Y›ØÙ\ÜÙ\È[ˆ›ÜY[Ù[ÊK‚‚ˆ™]\›œÈHœ™\Ú™XÛÛ[Y[™][Û‹[ÙHÓ“ÕT×ÓSÑSÚXÚ]™\ˆY™™\œÈœ›ÛHÝ[WÛ[Ù[È›Û™HYˆ™Z]\‹‚ˆˆˆ‚ˆÝ[HH
+Ý[WÛ[Ù[ÜˆˆŠKœÝš\
+
+K›ÝÙ\Š
+Bˆœ™\ÚˆÜ[Û˜[ÜÝ—HH›Û™BˆžN‚ˆœ›ÛH\›Y\×ØÛK›[Ù[È[\ÜÙ]Û›Ý\×Ü™XÛÛ[Y[™YØ]^Û[Ù[ˆœ™\ÚHÙ]Û›Ý\×Ü™XÛÛ[Y[™YØ]^Û[Ù[
+š\Ú[Û]š\Ú[Û‹›Ü˜ÙWÜ™Yœ™\ÚUYJBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙÙÙ\‹™XYÊ“›Ý\È™XÛÛ[Y[™Y[[Ù[™Yœ™\Ú˜Z[Y
+	\ÊNÈ\Ú[™ÈY˜][	\È‹^ËÓ“ÕT×ÓSÑS
+BˆYˆœ™\Ú[™œ™\ÚœÝš\
+
+K›ÝÙ\Š
+HOHÝ[N‚ˆ™]\›ˆœ™\Úˆ™]\›ˆÓ“ÕT×ÓSÑSYˆÓ“ÕT×ÓSÑSœÝš\
+
+K›ÝÙ\Š
+HOHÝ[H[ÙH›Û™B‚‚™YˆÜ™XYÛXZ[—ÙšY[
+šY[ˆÝ‹
+‹™XYÛ›Nˆ›ÛÛÝÙ\Žˆ›ÛÛH˜[ÙJHOˆÝŽ‚ˆˆˆ“XZ[ˆ[Ù[šY[˜ˆ[[YHÝ™\œšYH
+Ù]Ü[[YWÛXZ[˜
+Hš\œÝ[ˆÛÛ™šYËžX[[‚‚ˆHÝ™\œšYHÚ[œÈÛÈ˜XÝ]™HXZ[ˆ[Ù[ˆØ]\ÈÙYHH]™HÓKÙØ]]Ø^H[[YK›ÝH\œÚ\ÝYˆY˜][ˆ™XYÛ›XXÚÜÈØYØÛÛ™šY×Ü™XYÛ›X
+[Ù[Ü›ÝšY\ŠHœÈØYØÛÛ™šYØ
+\WÚÙ^KØ˜\ÙWÝ\›
+K‚ˆˆˆ‚ˆÝ™\œšYHHÜ[[YWÛXZ[—Ý˜[YJšY[
+BˆYˆ\Ú[œÝ[˜ÙJÝ™\œšYKÝŠH[™Ý™\œšYKœÝš\
+
+N‚ˆ˜[YHHÝ™\œšYKœÝš\
+
+Bˆ™]\›ˆ˜[YK›ÝÙ\Š
+HYˆÝÙ\ˆ[ÙH˜[YBˆÚ]ÛÛ^X‹œÝ\™\ÜÊ^Ù\[ÛŠN‚ˆœ›ÛH\›Y\×ØÛH[\ÜÛÛ™šYÈ\ÈØÙ™×Û[ÙˆÙ™ÈH
+ØÙ™×Û[Ù›ØYØÛÛ™šY×Ü™XYÛ›HYˆ™XYÛ›H[ÙHØÙ™×Û[Ù›ØYØÛÛ™šYÊJ
+Bˆ[Ù[ØÙ™ÈHÙ™Ë™Ù]
+›[Ù[‹ßJBˆYˆšY[OH›[Ù[ˆ[™\Ú[œÝ[˜ÙJ[Ù[ØÙ™ËÝŠH[™[Ù[ØÙ™ËœÝš\
+
+N‚ˆ™]\›ˆ[Ù[ØÙ™ËœÝš\
+
+BˆYˆ\Ú[œÝ[˜ÙJ[Ù[ØÙ™ËXÝ
+N‚ˆ˜[YHH[Ù[ØÙ™Ë™Ù]
+™Y˜][ˆYˆšY[OH›[Ù[ˆ[ÙHšY[ˆŠBˆYˆ\Ú[œÝ[˜ÙJ˜[YKÝŠH[™˜[YKœÝš\
+
+N‚ˆ˜[YHH˜[YKœÝš\
+
+Bˆ™]\›ˆ˜[YK›ÝÙ\Š
+HYˆÝÙ\ˆ[ÙH˜[YBˆ™]\›ˆˆ‚‚‚ˆÈ[Ù[K[]™[Ø[X›\È
+\ÝÈ]Ú[JNˆ[Ù[Ü›ÝšY\ˆ
+ÝÙ\˜Ø\ÙY
+H™XYH™XYÛ›HÛÛ™šYÎÂˆÈ\WÚÙ^KØ˜\ÙWÝ\›™XYH[ÛÛ™šYÈÛÈÝ\ÝÛX]^\ÚÜÈØ[ˆ[š\š]XZ[ˆÜ™YË‚—Ü™XYÛXZ[—Û[Ù[H[˜ÝÛÛËœ\X[
+Ü™XYÛXZ[—ÙšY[›[Ù[‹™XYÛ›OUYJB—Ü™XYÛXZ[—Ü›ÝšY\ˆH[˜ÝÛÛËœ\X[
+Ü™XYÛXZ[—ÙšY[œ›ÝšY\ˆ‹™XYÛ›OUYKÝÙ\UYJB—Ü™XYÛXZ[—Ø\WÚÙ^HH[˜ÝÛÛËœ\X[
+Ü™XYÛXZ[—ÙšY[˜\WÚÙ^H‹™XYÛ›OQ˜[ÙJB—Ü™XYÛXZ[—Ø˜\ÙWÝ\›H[˜ÝÛÛËœ\X[
+Ü™XYÛXZ[—ÙšY[˜˜\ÙWÝ\›‹™XYÛ›OQ˜[ÙJB‚‚™YˆÜ™\ÛÛ™WÛ[ØWØYÙÜ™YØ]ÜŠ™\Ù]Û˜[YNˆÜ[Û˜[ÜÝ—JHOˆ\VÓÜ[Û˜[ÜÝ—KÜ[Û˜[ÜÝ—WN‚ˆˆˆ“[ÐH™\Ù]8¡¤ˆYÙÜ™YØ]Üˆ
+›ÝšY\‹[Ù[
+NÈ
+›Û™K›Û™JHYˆ[œ™\ÛÛ˜X›Kˆ›Û™KÈˆˆHY˜][™\Ù]‚‚ˆ›[ØHˆ\Èš\X[8 %]^\ÚÜÈÚÚ\H˜[‹[Ý][™\ÙHHYÙÜ™YØ]ÜˆÛÝÈÚ\™YÛÈÛÚÝ\Ø[‰ÝšY‚ˆˆˆ‚ˆžN‚ˆœ›ÛH\›Y\×ØÛK˜ÛÛ™šYÈ[\ÜØYØÛÛ™šYÂˆœ›ÛH\›Y\×ØÛK›[ØWØÛÛ™šYÈ[\Ü™\ÛÛ™WÛ[ØWÜ™\Ù]ˆ™\Ù]H™\ÛÛ™WÛ[ØWÜ™\Ù]
+ØYØÛÛ™šYÊ
+K™Ù]
+›[ØHŠHÜˆßK™\Ù]Û˜[YHÜˆ›Û™JBˆYÙÈH™\Ù]™Ù]
+˜YÙÜ™YØ]ÜˆŠHÜˆßBˆYÙ×Ü›ÝšY\ˆHÝŠYÙË™Ù]
+œ›ÝšY\ˆŠHÜˆˆŠKœÝš\
+
+BˆYÙ×Û[Ù[HÝŠYÙË™Ù]
+›[Ù[ŠHÜˆˆŠKœÝš\
+
+BˆYˆYÙ×Ü›ÝšY\ˆ[™YÙ×Û[Ù[[™YÙ×Ü›ÝšY\‹›ÝÙ\Š
+HOH›[ØHŽ‚ˆ™]\›ˆYÙ×Ü›ÝšY\‹YÙ×Û[Ù[ˆ^Ù\^Ù\[ÛŽ‚ˆÙÙÙ\‹™XYÊ“[ÐHYÙÜ™YØ]Üˆ™\ÛÛ][Ûˆ˜Z[Y›Üˆ™\Ù]	\ˆ‹™\Ù]Û˜[YK^×Ú[™›ÏUYJBˆ™]\›ˆ›Û™K›Û™B‚‚™YˆÜ™XYÛXZ[—Û[Ù[Ù›Ü—Ø]^
+
+HOˆÝŽ‚ˆˆˆ“XZ[ˆ[Ù[Ú][ÐH™\Ù]È[Ü˜\YÈHYÙÜ™YØ]Ü‰ÜÈ[Ù[ÈˆˆÚ[ˆ[œ™\ÛÛ˜X›H
+H™\Ù]˜[YHÛÝ[
+Kˆˆˆ‚ˆ[Ù[HÜ™XYÛXZ[—Û[Ù[
+
+BˆYˆ
+Ü™XYÛXZ[—Ü›ÝšY\Š
+HÜˆˆŠKœÝš\
+
+K›ÝÙ\Š
+HOH›[ØHŽ‚ˆËYÙ×Û[Ù[HÜ™\ÛÛ™WÛ[ØWØYÙÜ™YØ]ÜŠ[Ù[
+Bˆ™]\›ˆYÙ×Û[Ù[Üˆˆ‚ˆ™]\›ˆ[Ù[‚‚™YˆÜ™XYÛXZ[—Ø\WÚÙ^WÚY—ÜØ[YWÚÜÝ
+]^Ø˜\ÙWÝ\›ˆÝŠHOˆÝŽ‚ˆˆˆ“XZ[ˆ\WÚÙ^HÛ›HÚ[ˆ
+˜]^Ø˜\ÙWÝ\›
+ˆÚ\™\ÈHXZ[ˆ˜\ÙWÝ\›	ÜÈÜÝ‚‚ˆ[˜ÛÛ™][Û˜[[š\š][˜ÙHÛÝ[XZÈHÜ™Y[X[È[žHZ\ØÛÛ™šYÝ\™YÜÝÈZ\ÛX]ÚÙY\È›ËZÙ^K\™\]Z\™Y8¡¤ˆK‚ˆˆˆ‚ˆ]^ÚÜÝH˜\ÙWÝ\›ÚÜÝ˜[YJ]^Ø˜\ÙWÝ\›
+BˆYˆ›Ý]^ÚÜÝÜˆ]^ÚÜÝOH˜\ÙWÝ\›ÚÜÝ˜[YJÜ™XYÛXZ[—Ø˜\ÙWÝ\›
+
+JN‚ˆ™]\›ˆˆ‚ˆ™]\›ˆÜ™XYÛXZ[—Ø\WÚÙ^J
+B‚‚ˆÈÛÛ\]Xš[]HZ\œ›ÜœÈ›ÜˆÛ\ˆ™XY\œËÝ\ÝÎÈHÛÛ^˜\ˆ™[ÝÈ\ÂˆÈ]]Üš]]]™H
+Ý™\›\[™ÈØ]]Ø^HÙ\ÜÚ[ÛœÈXZÙHH›ØÙ\ÜËYÛØ˜[[œØY™JK‚—Ô•S•SQWÓPRS—Ô“Õ’QTŽˆÝˆHˆ‚—Ô•S•SQWÓPRS—ÓSÑSˆÝˆHˆ‚—Ô•S•SQWÓPRS—ÐTÑWÕT“ˆÝˆHˆ‚—Ô•S•SQWÓPRS—ÐTWÒÑVNˆ[žHHˆ‚—Ô•S•SQWÓPRS—ÐTWÓSÑNˆÝˆHˆ‚—Ô•S•SQWÓPRS—ÐUUÓSÑNˆÝˆHˆ‚—Ô•S•SQWÓPRS—ÐÓÓ•VˆÛÛ^˜\œËÛÛ^˜\–ÓÜ[Û˜[ÑXÝÜÝ‹[žWWWHH
+ˆÛÛ^˜\œËÛÛ^˜\Š˜]^[X\žWÜ[[YWÛXZ[ˆ‹Y˜][S›Û™JBŠB‚—Ô‘SVWÐUVÐÐSÐÓÓ•VˆÛÛ^˜\œËÛÛ^˜\–ÓÜ[Û˜[ÑXÝÜÝ‹[žWWWHH
+ˆÛÛ^˜\œËÛÛ^˜\Š˜]^[X\žWÜ™[^WØØ[‹Y˜][S›Û™JBŠB‚‚ÛÛ^X‹˜ÛÛ^X[˜YÙ\‚™YˆÜ™[^WØ]^ØØ[ÜØÛÜJ\™ÜÎˆ\KÝØ\™ÜÎˆXÝ
+N‚ˆˆˆš[™Hœ™\Ú™[^HØ[ÛÛ^›ÜˆÛ™H]^[X\žHØ[ÈX\šÈ]˜Z[YÛˆ[žH^Ù\[Û‹ˆˆˆ‚ˆ\ÚÈH\™ÜÖÌHYˆ\™ÜÈ[ÙHÝØ\™ÜË™Ù]
+\ÚÈŠBˆÚÙ[ˆHÔ‘SVWÐUVÐÐSÐÓÓ•VœÙ]
+Âˆ\ÚÈŽˆÝŠ\ÚÈÜˆ[šÛ›ÝÛˆŠKˆœ™\]Y\ÝÚYŽˆˆ˜]^^Ý]ZY]ZY
+
+Kš^H‹ˆ˜][\ØÛÝ[Žˆˆœ›ÝšY\ˆŽˆˆ‹ˆ›[Ù[Žˆˆ‹ˆœ™\ÜÛœÙWÛ[Ù[Žˆ›Û™Kˆ˜\WÛ[ÙHŽˆ˜Ú]ØÛÛ\][ÛœÈ‹ˆJBˆžN‚ˆZY[ˆ^Ù\˜\ÙQ^Ù\[ÛŽ‚ˆÙ˜Z[Ü™[^WØ]^[X\žWØØ[
+
+Bˆ˜Z\ÙBˆš[˜[N‚ˆÔ‘SVWÐUVÐÐSÐÓÓ•Vœ™\Ù]
+ÚÙ[ŠB‚‚™YˆÜ™[^WØ]^[X\žWØØ[
+Ø[˜XÚÊN‚ˆˆˆ‘Ú]™H]™\žH\ÚXØ[™]žH[ˆÛ™H]^[X\žHØ[HÚ\™Y™[^HY[]Kˆˆˆ‚ˆ[˜ÝÛÛËÜ˜\ÊØ[˜XÚÊBˆYˆÜ˜\Y
+
+˜\™ÜË
+ŠšÝØ\™ÜÊN‚ˆÚ]Ü™[^WØ]^ØØ[ÜØÛÜJ\™ÜËÝØ\™ÜÊN‚ˆ™]\›ˆØ[˜XÚÊ
+˜\™ÜË
+ŠšÝØ\™ÜÊBˆ™]\›ˆÜ˜\Y‚‚™YˆÜ™[^WØ]^[X\žWØØ[Ø\Þ[˜ÊØ[˜XÚÊN‚ˆˆˆ\Þ[˜ÈÛÝ[\œ\È™[˜Î˜Ü™[^WØ]^[X\žWØØ[ˆˆˆ‚ˆ[˜ÝÛÛËÜ˜\ÊØ[˜XÚÊBˆ\Þ[˜ÈYˆÜ˜\Y
+
+˜\™ÜË
+ŠšÝØ\™ÜÊN‚ˆÚ]Ü™[^WØ]^ØØ[ÜØÛÜJ\™ÜËÝØ\™ÜÊN‚ˆ™]\›ˆ]ØZ]Ø[˜XÚÊ
+˜\™ÜË
+ŠšÝØ\™ÜÊBˆ™]\›ˆÜ˜\Y‚‚™YˆÜÙ]Ü™[^WØ]^[X\žWÜ›Ý]J›ÝšY\ŽˆÝˆ›Û™K[Ù[ˆÝˆ›Û™K\WÛ[ÙNˆÝˆ›Û™JHOˆ›Û™N‚ˆÛÛ^HÔ‘SVWÐUVÐÐSÐÓÓ•V™Ù]
+
+BˆYˆÛÛ^\È›Û™N‚ˆ™]\›‚ˆÛÛ^Èœ›ÝšY\ˆ—HHÝŠ›ÝšY\ˆÜˆ˜]^[X\žHŠBˆÛÛ^È›[Ù[—HHÝŠ[Ù[Üˆ[šÛ›ÝÛˆŠBˆÛÛ^Èœ™\ÜÛœÙWÛ[Ù[—HH›Û™BˆÛÛ^È˜\WÛ[ÙH—HHÝŠ\WÛ[ÙHÜˆ˜Ú]ØÛÛ\][ÛœÈŠB‚‚™YˆÜ™XÛÜ™Ü›Ý]WÚ[™›Êˆ›Ý]WÚ[™›ÎˆÜ[Û˜[ÑXÝÜÝ‹Ý—WK›ÝšY\ŽˆÜ[Û˜[ÜÝ—K[Ù[ˆÜ[Û˜[ÜÝ—BŠHOˆ›Û™N‚ˆˆˆ‘^ÜÙHHÛÛ˜Ü™]H›Ý]HÙ[XÝY›ÜˆÛ™H]^[X\žHØ[ˆˆˆ‚ˆYˆ›Ý]WÚ[™›È\È›Ý›Û™N‚ˆ›Ý]WÚ[™›ÖÈœ›ÝšY\ˆ—HH›ÝšY\ˆÜˆ˜]]È‚ˆ›Ý]WÚ[™›ÖÈ›[Ù[—HH[Ù[Üˆ™Y˜][‚‚‚™YˆÜ™[^WØ]^[X\žWÛY]Y]Jˆ
+‹›ÝšY\ŽˆÝˆ›Û™HH›Û™K\WÛ[ÙNˆÝˆ›Û™HH›Û™BŠHOˆ\VÜÝ‹Ý‹XÝÜÝ‹[žWWH›Û™N‚ˆÛÛ^HÔ‘SVWÐUVÐÐSÐÓÓ•V™Ù]
+
+BˆYˆÛÛ^\È›Û™N‚ˆ™]\›ˆ›Û™Bˆ][\ØÛÝ[H[
+ÛÛ^™Ù]
+˜][\ØÛÝ[ŠHÜˆ
+BˆÛÛ^È˜][\ØÛÝ[—HH][\ØÛÝ[
+ÈBˆ›ÝšY\—Û˜[YHHÝŠ›ÝšY\ˆÜˆÛÛ^™Ù]
+œ›ÝšY\ˆŠHÜˆ˜]^[X\žHŠBˆ[Ù[Û˜[YHHÝŠÛÛ^™Ù]
+›[Ù[ŠHÜˆ[šÛ›ÝÛˆŠBˆ™]\›ˆ›ÝšY\—Û˜[YK[Ù[Û˜[YKÂˆ˜\WÛ[ÙHŽˆÝŠ\WÛ[ÙHÜˆÛÛ^™Ù]
+˜\WÛ[ÙHŠHÜˆ˜Ú]ØÛÛ\][ÛœÈŠKˆ˜\WÜ™\]Y\ÝÚYŽˆÝŠÛÛ^Èœ™\]Y\ÝÚY—JKˆ˜Ø[Ü›ÛHŽˆˆ˜]^[X\žNžØÛÛ^ÉÝ\ÚÉ×_H‹ˆœ™]žWØÛÝ[Žˆ][\ØÛÝ[ˆ˜]^[X\žWÝ\ÚÈŽˆÝŠÛÛ^È\ÚÈ—JKˆB‚‚™YˆÜ™[^WÜÞ[˜×ØÛÛ\][ÛŠˆÛY[ˆ[žKÝØ\™ÜÎˆXÝÜÝ‹[žWK
+‹›ÝšY\ŽˆÝˆ›Û™HH›Û™Kˆ\WÛ[ÙNˆÝˆ›Û™HH›Û™KÜ™X]NˆØ[X›VÖÙXÝÜÝ‹[žWWK[žWH›Û™HH›Û™KŠHOˆ[žN‚ˆœ›ÛHYÙ[˜]^[X\žWÝÚ\™H[\Ü™\\™WØÚ]ÛY\ÜØYÙ\Â‚ˆÝØ\™ÜÈH™\\™WØÚ]ÛY\ÜØYÙ\ÊÛY[ÝØ\™ÜÊBˆØ[˜XÚÈHÜ™X]HÜˆ
+[X™H™\]Y\ÝˆÛY[˜Ú]˜ÛÛ\][ÛœË˜Ü™X]J
+Šœ™\]Y\Ý
+JBˆ›Ý]HHÜ™[^WØ]^[X\žWÛY]Y]J›ÝšY\\›ÝšY\‹\WÛ[ÙOX\WÛ[ÙJBˆÈ\ÛÛ]HÛ›HH›ÝšY\ˆØ[˜XÚÈÛÈHÝÛš[™È™XYØ[ˆ[Ú[™]ÈX\ÙKÑ‚ˆÈ˜[œØXÝ[ÛˆÛˆ\™Ø[˜Ù[Ú]Ý]ÝXÚ[™ÈHÚ\™YÛY[‚ˆYˆ›Ý]H\È›Û™N‚ˆ™]\›ˆÜ[—Ü›ÝXÝYÜÞ[˜×Ü›ÝšY\—ØØ[
+Ø[˜XÚËÝØ\™ÜÊBˆ›ÝšY\—Û˜[YK˜[˜XÚ×Û[Ù[Y]Y]HH›Ý]Bˆœ›ÛHYÙ[[\Ü™[^WÛBˆ™]\›ˆ™[^WÛK™^XÝ]WØÝ\œ™[
+ˆÝØ\™ÜË[X™H™\]Y\ÝˆÜ[—Ü›ÝXÝYÜÞ[˜×Ü›ÝšY\—ØØ[
+Ø[˜XÚË™\]Y\Ý
+Kˆ˜[YO\›ÝšY\—Û˜[YK[Ù[Û˜[YO\ÝŠÝØ\™ÜË™Ù]
+›[Ù[ŠHÜˆ˜[˜XÚ×Û[Ù[
+KˆY]Y]O[Y]Y]KY™\—ÛÙÚXØ[ØÛÛ\][ÛUYKˆ
+B‚‚˜\Þ[˜ÈYˆÜ™[^WØ\Þ[˜×ØÛÛ\][ÛŠˆÛY[ˆ[žKÝØ\™ÜÎˆXÝÜÝ‹[žWK
+‹›ÝšY\ŽˆÝˆ›Û™HH›Û™Kˆ\WÛ[ÙNˆÝˆ›Û™HH›Û™KÜ™X]NˆØ[X›VÖÙXÝÜÝ‹[žWWK[žWH›Û™HH›Û™KŠHOˆ[žN‚ˆœ›ÛHYÙ[˜]^[X\žWÝÚ\™H[\Ü™\\™WØÚ]ÛY\ÜØYÙ\Â‚ˆÝØ\™ÜÈH™\\™WØÚ]ÛY\ÜØYÙ\ÊÛY[ÝØ\™ÜÊBˆØ[˜XÚÈHÜ™X]HÜˆ
+[X™H™\]Y\ÝˆÛY[˜Ú]˜ÛÛ\][ÛœË˜Ü™X]J
+Šœ™\]Y\Ý
+JBˆ›Ý]HHÜ™[^WØ]^[X\žWÛY]Y]J›ÝšY\\›ÝšY\‹\WÛ[ÙOX\WÛ[ÙJBˆYˆ›Ý]H\È›Û™N‚ˆ™]\›ˆ]ØZ]Ø[˜XÚÊÝØ\™ÜÊBˆ›ÝšY\—Û˜[YK˜[˜XÚ×Û[Ù[Y]Y]HH›Ý]Bˆœ›ÛHYÙ[[\Ü™[^WÛBˆ™]\›ˆ]ØZ]™[^WÛK™^XÝ]WØÝ\œ™[Ø\Þ[˜ÊˆÝØ\™ÜËØ[˜XÚË˜[YO\›ÝšY\—Û˜[YK[Ù[Û˜[YO\ÝŠÝØ\™ÜË™Ù]
+›[Ù[ŠHÜˆ˜[˜XÚ×Û[Ù[
+KˆY]Y]O[Y]Y]KY™\—ÛÙÚXØ[ØÛÛ\][ÛUYKˆ
+B‚‚™YˆÜ™[^WÜÞ[˜×ÜÝ™X[JˆÛY[ˆ[žKÝØ\™ÜÎˆXÝÜÝ‹[žWK
+‹›ÝšY\ŽˆÝˆ›Û™HH›Û™K\WÛ[ÙNˆÝˆ›Û™HH›Û™BŠHOˆ[žN‚ˆœ›ÛHYÙ[˜]^[X\žWÝÚ\™H[\Ü™\\™WØÚ]ÛY\ÜØYÙ\Â‚ˆÝØ\™ÜÈH™\\™WØÚ]ÛY\ÜØYÙ\ÊÛY[ÝØ\™ÜÊBˆ›Ý]HHÜ™[^WØ]^[X\žWÛY]Y]J›ÝšY\\›ÝšY\‹\WÛ[ÙOX\WÛ[ÙJBˆYˆ›Ý]H\È›Û™N‚ˆ™]\›ˆÛY[˜Ú]˜ÛÛ\][ÛœË˜Ü™X]J
+ŠšÝØ\™ÜÊBˆ›ÝšY\—Û˜[YK˜[˜XÚ×Û[Ù[Y]Y]HH›Ý]Bˆœ›ÛHYÙ[[\Ü™[^WÛBˆ™]\›ˆ™[^WÛKœÝ™X[WØÝ\œ™[
+ˆÝØ\™ÜË[X™H™\]Y\ÝˆÛY[˜Ú]˜ÛÛ\][ÛœË˜Ü™X]J
+Šœ™\]Y\Ý
+K˜[YO\›ÝšY\—Û˜[YKˆ[Ù[Û˜[YO\ÝŠÝØ\™ÜË™Ù]
+›[Ù[ŠHÜˆ˜[˜XÚ×Û[Ù[
+Kš[˜[^™\YXÝY]Y]O[Y]Y]KˆÛÛ\]YÜ™\ÜÛœÙWÜ™YXØ]O[[X™H˜[YNˆ\Ø]Š˜[YK˜ÚÚXÙ\ÈŠKˆ
+B‚‚—Ô•S•SQWÓPRS—ÐÓÓTUÔÓTÒÕˆ\VÐ[žK‹‹—HH
+ˆ‹ˆ‹ˆ‹ˆ‹ˆ‹ˆŠB—Ô•S•SQWÓPRS—ÐÓÓTUÓÐÒÈH™XY[™Ë“ØÚÊ
+B‚‚™YˆÜX›\ÚÜ[[YWÛXZ[—ÛZ\œ›ÜœÊ˜[Y\Îˆ\VÐ[žK‹‹—JHOˆ›Û™N‚ˆˆˆ•Üš]HHYØXÞHÛØ˜[È
+ÈÛÛ\]Û˜\ÚÝ
+ÓPRS—Ô•S•SQWÑ’QSØÜ™\ŠH[™\ˆHØÚËˆˆˆ‚ˆÛØ˜[Ô•S•SQWÓPRS—Ô“Õ’QT‹Ô•S•SQWÓPRS—ÓSÑSÔ•S•SQWÓPRS—ÐTÑWÕT“Ô•S•SQWÓPRS—ÐTWÒÑVBˆÛØ˜[Ô•S•SQWÓPRS—ÐTWÓSÑKÔ•S•SQWÓPRS—ÐUUÓSÑKÔ•S•SQWÓPRS—ÐÓÓTUÔÓTÒÕˆÚ]Ô•S•SQWÓPRS—ÐÓÓTUÓÐÒÎ‚ˆ
+Ô•S•SQWÓPRS—Ô“Õ’QT‹Ô•S•SQWÓPRS—ÓSÑSÔ•S•SQWÓPRS—ÐTÑWÕT“ˆÔ•S•SQWÓPRS—ÐTWÒÑVKÔ•S•SQWÓPRS—ÐTWÓSÑKÔ•S•SQWÓPRS—ÐUUÓSÑJHH˜[Y\ÂˆÔ•S•SQWÓPRS—ÐÓÓTUÔÓTÒÕH\J˜[Y\ÊB‚‚™YˆØÛÛ\]Ü[[YWÛXZ[Š
+HOˆÜ[Û˜[ÑXÝÜÝ‹[žWWN‚ˆˆˆ‘^ÜÙH[X™\˜][H]ÚYYØXÞHÛØ˜[È\ÈHXZ[ˆÛÛ^‚‚ˆZ\œ›ÜœÈ]\Ý™]™\ˆ™XÛÛYH[[YH[œ]ÎˆH\™XÝ]ÚÛÝ[ÈÛ›HÚ[ˆ]Y™™\œÈœ›ÛBˆHZ\œ›Ü™YÛ˜\ÚÝ[™Û›HÛˆHXZ[ˆ™XY‚ˆˆˆ‚ˆYˆ™XY[™Ë˜Ý\œ™[Ý™XY
+
+H\È›Ý™XY[™Ë›XZ[—Ý™XY
+
+N‚ˆ™]\›ˆ›Û™Bˆ˜[Y\ÈH
+Ô•S•SQWÓPRS—Ô“Õ’QT‹Ô•S•SQWÓPRS—ÓSÑSÔ•S•SQWÓPRS—ÐTÑWÕT“ˆÔ•S•SQWÓPRS—ÐTWÒÑVKÔ•S•SQWÓPRS—ÐTWÓSÑKÔ•S•SQWÓPRS—ÐUUÓSÑJBˆYˆ˜[Y\ÈOHÔ•S•SQWÓPRS—ÐÓÓTUÔÓTÒÕ‚ˆ™]\›ˆ›Û™Bˆ™]\›ˆXÝ
+š\
+ÓPRS—Ô•S•SQWÑ’QSË˜[Y\ÊJB‚‚™YˆÜ[[YWÛXZ[—Ý˜[YJšY[ˆÝŠHOˆ[žN‚ˆˆˆ”™XYÛ™H[[YHšY[›ÝYÚÛÛ^[ØØ[ØÛÛ›ÛYYØXÞHÝ]Kˆˆˆ‚ˆ[[YHHÔ•S•SQWÓPRS—ÐÓÓ•V™Ù]
+
+BˆYˆ[[YH\È›Û™N‚ˆ[[YHHØÛÛ\]Ü[[YWÛXZ[Š
+Bˆ™]\›ˆ
+[[YK™Ù]
+šY[
+HÜˆˆŠHYˆ\Ú[œÝ[˜ÙJ[[YKXÝ
+H[ÙHˆ‚‚‚™YˆÙ]Ü[[YWÛXZ[Šˆ›ÝšY\ŽˆÝ‹[Ù[ˆÝ‹
+‹™\]Y\ÝYÜ›ÝšY\ŽˆÝˆHˆ‹˜\ÙWÝ\›ˆÝˆHˆ‹ˆ\WÚÙ^Nˆ[žHHˆ‹\WÛ[ÙNˆÝˆHˆ‹]]Û[ÙNˆÝˆHˆ‹Ù\ÜÚ[Û—ÚYˆÝˆHˆ‹ˆØXÚWÜØÛÜNˆÝˆHˆ‹ŠHOˆÛÛ^˜\œË•ÚÙ[Ž‚ˆˆˆ”™XÛÜ™HÝ\œ™[ÛÛ^	ÜÈ]™HXZ[ˆ[[YH›Üˆ]^[X\žH›Ý][™Ë‚‚ˆÛÛ^[ØØ[ÛÈÛÛ˜Ý\œ™[Ø]]Ø^HÙ\ÜÚ[ÛœÈÛ‰ÝÛØ˜™\ˆXXÚÝ\ŽÈYØXÞHZ\œ›ÜœÈ\™Bˆ\]Y›ÜˆÛ™XY\œËˆØXÚWÜØÛÜX\ÈH›Ý][Û‹\ÝX›HÙÚXØ[ØXÚHØÛÜKˆ™Y™\œ™YÝ™\ˆÙ\ÜÚ[Û—ÚY›Üˆ›Û\ØØXÚWÚÙ^H\š]˜][Û‹‚‚ˆØXÚWÜØÛÜX\ÈH›Ý][Û‹\ÝX›HÙÚXØ[ØXÚHØÛÜH
+ÛÛ\™\ÜÚ[Û‹H[™XYÙH›ÛÝ8 %ˆYÙ[Ü›Û\ØØXÚWÜØÛÜKœJH™\ÛÛ™YÛ˜ÙH\ˆ\›ˆžH\›—ØÛÛ^È]^[X\žH™\ÜÛœÙ\ÈØ[È™Y™\ˆ]ˆÝ™\ˆÙ\ÜÚ[Û—ÚY›Üˆ›Û\ØØXÚWÚÙ^H\š]˜][Ûˆ
+ÍÎLMÊK‚ˆˆˆ‚ˆ[[YHHÂˆœ›ÝšY\ˆŽˆ
+›ÝšY\ˆÜˆˆŠKœÝš\
+
+K›ÝÙ\Š
+Kˆœ™\]Y\ÝYÜ›ÝšY\ˆŽˆ
+™\]Y\ÝYÜ›ÝšY\ˆÜˆˆŠKœÝš\
+
+K›ÝÙ\Š
+Kˆ›[Ù[Žˆ
+[Ù[ÜˆˆŠKœÝš\
+
+Kˆ˜˜\ÙWÝ\›Žˆ
+˜\ÙWÝ\›ÜˆˆŠKœÝš\
+
+Kˆ˜\WÚÙ^HŽˆ\WÚÙ^KœÝš\
+
+HYˆ\Ú[œÝ[˜ÙJ\WÚÙ^KÝŠH[ÙH\WÚÙ^HYˆØ[X›J\WÚÙ^JH[ÙHˆ‹ˆ˜\WÛ[ÙHŽˆ
+\WÛ[ÙHÜˆˆŠKœÝš\
+
+Kˆ˜]]Û[ÙHŽˆ
+]]Û[ÙHÜˆˆŠKœÝš\
+
+K›ÝÙ\Š
+KˆœÙ\ÜÚ[Û—ÚYŽˆ
+Ù\ÜÚ[Û—ÚYÜˆˆŠKœÝš\
+
+Kˆ˜ØXÚWÜØÛÜHŽˆ
+ØXÚWÜØÛÜHÜˆˆŠKœÝš\
+
+KˆBˆÈX›\Ú]]Üš]]]™HÛÛ^™Y›Ü™H\][™ÈHØÚÙYZ\œ›ÜœË‚ˆÚÙ[ˆHÔ•S•SQWÓPRS—ÐÓÓ•VœÙ]
+[[YJBˆÜX›\ÚÜ[[YWÛXZ[—ÛZ\œ›ÜœÊ\J[[YVÙšY[H›ÜˆšY[[ˆÓPRS—Ô•S•SQWÑ’QSÊJBˆ™]\›ˆÚÙ[‚‚‚™Yˆ™\Ù]Ü[[YWÛXZ[ŠÚÙ[ŽˆÛÛ^˜\œË•ÚÙ[ŠHOˆ›Û™N‚ˆˆˆ”™\ÝÜ™HH[[YHš[™[™È]™XÙYYÛ™HØÛÜY\›‹ˆˆˆ‚ˆYˆÚÙ[ˆ\È›Û™N‚ˆ™]\›‚ˆžN‚ˆÔ•S•SQWÓPRS—ÐÓÓ•Vœ™\Ù]
+ÚÙ[ŠBˆ^Ù\
+[[YQ\œ›Ü‹˜[YQ\œ›ÜŠN‚ˆ\ÜÈÈÚÙ[œÈØ[‰Ý™H™\Ù]œ›ÛHHÛÜYYÛÛ^
+ÛÜšÙ\œÈ[š\š]˜[Y\Ë›ÝÚÙ[ˆÝÛ™\œÚ\
+K‚‚‚ÛÛ^X‹˜ÛÛ^X[˜YÙ\‚™YˆØÛÜYÜ[[YWÛXZ[ŠXZ[—Ü[[YNˆÜ[Û˜[ÑXÝÜÝ‹[žWWJN‚ˆˆˆ•[\Ü˜\š[Hš[™[ˆ^XÚ][[YHÚ]Ý]ÝXÚ[™ÈYØXÞHZ\œ›ÜœËˆˆˆ‚ˆ[[YHHÛ›Ü›X[^™WÛXZ[—Ü[[YJXZ[—Ü[[YJBˆÚÙ[ˆHÔ•S•SQWÓPRS—ÐÓÓ•VœÙ]
+[[YHÜˆ›Û™JBˆžN‚ˆZY[[[YBˆš[˜[N‚ˆÔ•S•SQWÓPRS—ÐÓÓ•Vœ™\Ù]
+ÚÙ[ŠB‚‚™YˆÛX\—Ü[[YWÛXZ[Š
+HOˆ›Û™N‚ˆˆˆÛX\ˆH[[YHÝ™\œšYH[ˆHÝ\œ™[ÛÛ^ˆˆˆ‚ˆÔ•S•SQWÓPRS—ÐÓÓ•VœÙ]
+›Û™JBˆÜX›\ÚÜ[[YWÛXZ[—ÛZ\œ›ÜœÊ
+ˆ‹ˆ‹ˆ‹ˆ‹ˆ‹ˆŠJB‚‚™YˆÜ™\ÛÛ™WØÝ\ÝÛWÜ[[YJ
+HOˆ\VÓÜ[Û˜[ÜÝ—KÜ[Û˜[ÜÝ—KÜ[Û˜[ÜÝ—WN‚ˆˆˆ”™\ÛÛ™HHXÝ]™HÝ\ÝÛKÛXZ[ˆ[™Ú[ZÙHHXZ[ˆÓH
+[ˆÔSRWÐTÑWÕT“ÜˆÛÛ™šYË\Ø]™Y
+Kˆˆˆ‚ˆžN‚ˆœ›ÛH\›Y\×ØÛKœ[[YWÜ›ÝšY\ˆ[\Ü™\ÛÛ™WÜ[[YWÜ›ÝšY\‚ˆ[[YHH™\ÛÛ™WÜ[[YWÜ›ÝšY\Š™\]Y\ÝYH˜Ý\ÝÛHŠBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙÙÙ\‹™XYÊ]^[X\žHÛY[ˆÝ\ÝÛH[[YH™\ÛÛ][Ûˆ˜Z[Yˆ	\È‹^ÊBˆ[[YHH›Û™BˆYˆ›Ý\Ú[œÝ[˜ÙJ[[YKXÝ
+N‚ˆÜ[˜ZWØ˜\ÙHHÜË™Ù][Š“ÔSRWÐTÑWÕT“‹ˆŠKœÝš\
+
+KœœÝš\
+‹ÈŠBˆYˆ›ÝÜ[˜ZWØ˜\ÙN‚ˆ™]\›ˆ›Û™K›Û™K›Û™Bˆ[[YHHÈ˜˜\ÙWÝ\›ŽˆÜ[˜ZWØ˜\ÙK˜\WÚÙ^HŽˆÜØÛÜYÚÙ^WÙ[Š“ÔSRWÐTWÒÑVHŠ_BˆÝ\ÝÛWØ˜\ÙHH[[YK™Ù]
+˜˜\ÙWÝ\›ŠBˆÝ\ÝÛWÚÙ^HH[[YK™Ù]
+˜\WÚÙ^HŠBˆÝ\ÝÛWÛ[ÙHH[[YK™Ù]
+˜\WÛ[ÙHŠBˆYˆ›Ý\Ú[œÝ[˜ÙJÝ\ÝÛWØ˜\ÙKÝŠHÜˆ›ÝÝ\ÝÛWØ˜\ÙKœÝš\
+
+N‚ˆ™]\›ˆ›Û™K›Û™K›Û™BˆÝ\ÝÛWØ˜\ÙHHÝ\ÝÛWØ˜\ÙKœÝš\
+
+KœœÝš\
+‹ÈŠBˆYˆ˜\ÙWÝ\›ÚÜÝÛX]Ú\ÊÝ\ÝÛWØ˜\ÙK›Ü[œ›Ý]\‹˜ZHŠN‚ˆ™]\›ˆ›Û™K›Û™K›Û™HÈ™\]Y\ÝYIØÝ\ÝÛIÈ˜[È˜XÚÈÈÜ[”›Ý]\ˆÚ[ˆ[˜ÛÛ™šYÝ\™Y‚ˆÈØØ[Ù\™\œÈ
+Û[XK“K‹‹ŠHYÛ›Ü™H]]]HÑÈ™YYÈH›Û‹Y[\HÙ^K‚ˆÈ\ÙHHXÙZÛ\ˆÙ^H8 %HÜ[RHÑÈ™\]Z\™\ÈH›Û‹Y[\HÝš[™È]ØØ[Ù\™\œÈYÛ›Ü™HBˆÈ]]Üš^˜][ÛˆXY\‹ˆØ[YHš^\ÈÛKœHÙ[œÝ\™WÜ[[YWØÜ™Y[X[Ê
+H
+ˆÌMMŠK‚ˆYˆ›Ý\Ú[œÝ[˜ÙJÝ\ÝÛWÚÙ^KÝŠHÜˆ›ÝÝ\ÝÛWÚÙ^KœÝš\
+
+N‚ˆÝ\ÝÛWÚÙ^HH››ËZÙ^K\™\]Z\™Y‚ˆYˆ›Ý\Ú[œÝ[˜ÙJÝ\ÝÛWÛ[ÙKÝŠHÜˆ›ÝÝ\ÝÛWÛ[ÙKœÝš\
+
+N‚ˆÝ\ÝÛWÛ[ÙHH›Û™Bˆ™]\›ˆÝ\ÝÛWØ˜\ÙKÝ\ÝÛWÚÙ^KœÝš\
+
+KÝ\ÝÛWÛ[ÙB‚‚™YˆØÝ\œ™[ØÝ\ÝÛWØ˜\ÙWÝ\›
+
+HOˆÝŽ‚ˆÝ\ÝÛWØ˜\ÙKËÈHÜ™\ÛÛ™WØÝ\ÝÛWÜ[[YJ
+Bˆ™]\›ˆÝ\ÝÛWØ˜\ÙHÜˆˆ‚‚‚™YˆÝ˜[Y]WÜ›ÞWÙ[—Ý\›Ê
+HOˆ›Û™N‚ˆˆˆ‘˜Z[˜\ÝÛˆX[›Ü›YY›ÞH[ˆT“È
+HÚ[\ÈZÙHŒMLÙ^ÜÝ\Ú\ÙHÝ\™˜XÙ\È\ÈHÜž\XÈ[˜[YÜ
+Kˆˆˆ‚ˆœ›ÛH\›X‹œ\œÙH[\Ü\›\œÙBˆ›Ü›X[^™WÜ›ÞWÙ[—Ý˜\œÊ
+Bˆ›ÜˆÙ^H[ˆ
+’×Ô“ÖH‹’Ô“ÖH‹SÔ“ÖH‹š×Ü›ÞH‹šÜ›ÞH‹˜[Ü›ÞHŠN‚ˆ˜[YHHÝŠÜË™[š\›Û‹™Ù]
+Ù^JHÜˆˆŠKœÝš\
+
+BˆYˆ›Ý˜[YN‚ˆÛÛ[YBˆžN‚ˆ\œÙYH\›\œÙJ˜[YJBˆYˆ\œÙYœØÚ[YN‚ˆÈH\œÙYœÜÈ˜Z\Ù\È˜[YQ\œ›Üˆ›ÜˆK™Ëˆ	ÍŒMLÙ^Ü	Âˆ^Ù\˜[YQ\œ›Üˆ\È^Î‚ˆ˜Z\ÙH[[YQ\œ›ÜŠˆˆ“X[›Ü›YY›ÞH[š\›Û›Y[˜\šXX›HÚÙ^_O^Ý˜[YH\ŸKˆ‚ˆ‘š^Üˆ[œÙ][Ý\ˆ›ÞHÙ][™ÜÈ[™žHYØZ[‹ˆ‚ˆ
+Hœ›ÛH^Â‚‚™YˆÝ˜[Y]WØ˜\ÙWÝ\›
+˜\ÙWÝ\›ˆÝŠHOˆ›Û™N‚ˆˆˆ”™Z™XÝØš[Ý\ÛHœ›ÚÙ[ˆÝ\ÝÛH[™Ú[T“È™Y›Ü™H^H™XXÚˆˆˆ‚ˆœ›ÛH\›X‹œ\œÙH[\Ü\›\œÙBˆØ[™Y]HHÝŠ˜\ÙWÝ\›ÜˆˆŠKœÝš\
+
+BˆYˆ›ÝØ[™Y]HÜˆØ[™Y]KœÝ\ÝÚ]
+˜XÜ‹ËÈŠN‚ˆ™]\›‚ˆžN‚ˆ\œÙYH\›\œÙJØ[™Y]JBˆYˆ\œÙYœØÚ[YH[ˆÈš‹šÈŸN‚ˆÈH\œÙYœÜÈ˜Z\Ù\È˜[YQ\œ›Üˆ›ÜˆX[›Ü›YYÜÂˆ^Ù\˜[YQ\œ›Üˆ\È^Î‚ˆ˜Z\ÙH[[YQ\œ›ÜŠˆˆ“X[›Ü›YYÝ\ÝÛH[™Ú[T“ˆØØ[™Y]H\ŸKˆ‚ˆ”[ˆ\›Y\ÈÙ]\Üˆ\›Y\È[Ù[[™[\ˆH˜[Y
+ÊH˜\ÙHT“ˆ‚ˆ
+Hœ›ÛH^Â‚‚™YˆÝžWØÝ\ÝÛWÙ[™Ú[
+
+HOˆ\VÓÜ[Û˜[Ð[žWKÜ[Û˜[ÜÝ—WN‚ˆ[[YHHÜ™\ÛÛ™WØÝ\ÝÛWÜ[[YJ
+BˆÝ\ÝÛWØ˜\ÙKÝ\ÝÛWÚÙ^KÝ\ÝÛWÛ[ÙHH
+
+œ[[YK›Û™JHYˆ[Š[[YJHOHˆ[ÙH[[YBˆYˆ›ÝÝ\ÝÛWØ˜\ÙHÜˆ›ÝÝ\ÝÛWÚÙ^N‚ˆ™]\›ˆ›Û™K›Û™BˆYˆÝ\ÝÛWØ˜\ÙK›ÝÙ\Š
+KœÝ\ÝÚ]
+ÐÓÑVÐUVÐTÑWÕT“›ÝÙ\Š
+JN‚ˆ™]\›ˆ›Û™K›Û™Bˆ[Ù[HÜ™XYÛXZ[—Û[Ù[Ù›Ü—Ø]^
+
+HÜˆ™ÜMË[Z[šH‚ˆÙÙÙ\‹™XYÊ]^[X\žHÛY[ˆÝ\ÝÛH[™Ú[
+	\Ë\WÛ[ÙOI\ÊH‹[Ù[Ý\ÝÛWÛ[ÙHÜˆ˜Ú]ØÛÛ\][ÛœÈŠBˆØÛX[—Ø˜\ÙKÙHHÙ^˜XÝÝ\›Ü]Y\žWÜ\˜[\ÊÝ\ÝÛWØ˜\ÙJBˆÙ^˜HHÈ™Y˜][Ü]Y\žHŽˆÙ_HYˆÙH[ÙHßBˆÈ\Ù\ˆ[Ù[™Y˜][ÚXY\œÈÝ™\œšYHÑÈš[™Ù\œš[XY\œÈ
+\ÈÛˆHXZ[ˆÛY[
+H›ÜˆÝšXÝØ]]Ø^\ËÕÐQœË‚ˆØÝ\ÝÛWÚXY\œÈHØ\WÝ\Ù\—ÙY˜][ÚXY\œÊ›Û™JBˆYˆØÝ\ÝÛWÚXY\œÎ‚ˆÙ^˜VÈ™Y˜][ÚXY\œÈ—HHØÝ\ÝÛWÚXY\œÂˆYˆÝ\ÝÛWÛ[ÙHOH˜ÛÙ^Ü™\ÜÛœÙ\ÈŽ‚ˆ™X[ØÛY[HØÜ™X]WÛÜ[˜ZWØÛY[
+\WÚÙ^OXÝ\ÝÛWÚÙ^K˜\ÙWÝ\›WØÛX[—Ø˜\ÙK
+Š—Ù^˜JBˆ™]\›ˆÛÙ^]^[X\žPÛY[
+™X[ØÛY[[Ù[
+K[Ù[ˆYˆÝ\ÝÛWÛ[ÙHOH˜[›ÜX×ÛY\ÜØYÙ\ÈŽ‚ˆÈ\™\\H[›ÜXËXÛÛ\]X›HØ]]Ø^H8 %™]™\ˆÐ]]
+]	ÜÈ\K˜[›ÜXË˜ÛÛHÛ›JK‚ˆžN‚ˆœ›ÛHYÙ[˜[›ÜX×ØY\\ˆ[\ÜZ[Ø[›ÜX×ØÛY[ˆ™X[ØÛY[HZ[Ø[›ÜX×ØÛY[
+Ý\ÝÛWÚÙ^KÝ\ÝÛWØ˜\ÙJBˆ^Ù\[\Ü\œ›ÜŽ‚ˆÙÙÙ\‹Ø\›š[™ÊˆÝ\ÝÛH[™Ú[XÛ\™\È\WÛ[ÙOX[›ÜX×ÛY\ÜØYÙ\È]H‚ˆ˜[›ÜXÈÑÈ\È›Ý[œÝ[Y8 %˜[[™È˜XÚÈÈÜ[RK]Ú\™Kˆ‚ˆ
+Bˆ™]\›ˆØÜ™X]WÛÜ[˜ZWØÛY[
+\WÚÙ^OXÝ\ÝÛWÚÙ^K˜\ÙWÝ\›WØÛX[—Ø˜\ÙK
+Š—Ù^˜JK[Ù[ˆ™]\›ˆ[›ÜXÐ]^[X\žPÛY[
+™X[ØÛY[[Ù[Ý\ÝÛWÚÙ^KÝ\ÝÛWØ˜\ÙK\×ÛØ]]Q˜[ÙJK[Ù[ˆÈT“X˜\ÙY[›ÜXÈ]XÝ[Ûˆ›ÜˆÝ\ÝÛH[™Ú[ÈÚ]Ý]^XÚ]\WÛ[ÙK‚ˆÙ˜[˜XÚ×ØÛY[HØÜ™X]WÛÜ[˜ZWØÛY[
+\WÚÙ^OXÝ\ÝÛWÚÙ^K˜\ÙWÝ\›WØÛX[—Ø˜\ÙK
+Š—Ù^˜JBˆ™]\›ˆÛX^X™WÝÜ˜\Ø[›ÜXÊÙ˜[˜XÚ×ØÛY[[Ù[Ý\ÝÛWÚÙ^KÝ\ÝÛWØ˜\ÙKÝ\ÝÛWÛ[ÙJK[Ù[‚‚™YˆØZ[ÞZWÛØ]]Ø]^ØÛY[
+[Ù[ˆÝŠHOˆ\VÓÜ[Û˜[Ð[žWKÜ[Û˜[ÜÝ—WN‚ˆˆˆÛÙ^]^[X\žPÛY[›ÜˆRHÜ›ÚÈÐ]]
+™\ÜÛœÙ\ÈTJNÈ
+›Û™K›Û™JHYˆ›Ý]]Y‚‚ˆØ[\ˆ]\Ý\ÜÈ[ˆ^XÚ][Ù[8 %H[›™YÜ›ÚÈY˜][ÛÝ[›Ý\ÈRIÜÈ[ÝÛ\ÝšYË‚ˆˆˆ‚ˆYˆ›Ý[Ù[‚ˆÙÙÙ\‹Ø\›š[™Êˆ]^[X\žHÛY[ˆZK[Ø]]™\]Y\ÝYÚ]Ý]H[Ù[È‚ˆœ\ÜÈ[Ù[^XÚ]H
+]^[X\žK\ÚÏ‹›[Ù[[ˆÛÛ™šYËžX[[
+Kˆ‚ˆ
+Bˆ™]\›ˆ›Û™K›Û™Bˆ™\ÛÛ™YHÜ™\ÛÛ™WÞZWÛØ]]Ù›Ü—Ø]^
+
+BˆYˆ™\ÛÛ™Y\È›Û™N‚ˆ™]\›ˆ›Û™K›Û™Bˆ\WÚÙ^K˜\ÙWÝ\›H™\ÛÛ™YˆÙÙÙ\‹™XYÊ]^[X\žHÛY[ˆRHÐ]]
+	\ÈšXH™\ÜÛœÙ\ÈTJH‹[Ù[
+Bˆœ›ÛHÛÛËžZWÚ[\Ü\›Y\×ÞZWÙY˜][ÚXY\œÂˆ™X[ØÛY[HØÜ™X]WÛÜ[˜ZWØÛY[
+ˆ\WÚÙ^OX\WÚÙ^K˜\ÙWÝ\›X˜\ÙWÝ\›Y˜][ÚXY\œÏZ\›Y\×ÞZWÙY˜][ÚXY\œÊ
+Bˆ
+Bˆ™]\›ˆÛÙ^]^[X\žPÛY[
+™X[ØÛY[[Ù[
+K[Ù[‚‚™YˆØZ[ØÛÙ^ØÛY[
+[Ù[ˆÝŠHOˆ\VÓÜ[Û˜[Ð[žWKÜ[Û˜[ÜÝ—WN‚ˆˆˆÛÙ^]^[X\žPÛY[›Üˆ[ˆ^XÚ][Ù[È
+›Û™K›Û™JHÚ]Ý]HÛÙ^Ð]]ÚÙ[‹‚‚ˆ›È]]Ë\Ù[XÝYY˜][ˆHÛÙ^[Ù[[ÝË[\Ý\È[™ØÝ[Y[Y[™šYË‚ˆˆˆ‚ˆYˆ›Ý[Ù[‚ˆÙÙÙ\‹Ø\›š[™Êˆ]^[X\žHÛY[ˆÜ[˜ZKXÛÙ^™\]Y\ÝYÚ]Ý]H[Ù[È‚ˆœ\ÜÈ[Ù[^XÚ]H
+]^[X\žK\ÚÏ‹›[Ù[[ˆÛÛ™šYËžX[[
+Kˆ‚ˆ
+Bˆ™]\›ˆ›Û™K›Û™BˆÛÛÜ™\Ù[[žHHÜÙ[XÝÜÛÛÙ[žJ›Ü[˜ZKXÛÙ^ŠBˆÛÙ^ÝÚÙ[ˆHÜÛÛÜ[[YWØ\WÚÙ^J[žJHYˆÛÛÜ™\Ù[[ÙH›Û™BˆYˆÛÙ^ÝÚÙ[Ž‚ˆ˜\ÙWÝ\›HÜÛÛÜ[[YWØ˜\ÙWÝ\›
+[žKÐÓÑVÐUVÐTÑWÕT“
+HÜˆÐÓÑVÐUVÐTÑWÕT“ˆ[ÙN‚ˆÛÙ^ÝÚÙ[ˆHÜ™XYØÛÙ^ØXØÙ\Ü×ÝÚÙ[Š
+BˆYˆ›ÝÛÙ^ÝÚÙ[Ž‚ˆ™]\›ˆ›Û™K›Û™Bˆ˜\ÙWÝ\›HÐÓÑVÐUVÐTÑWÕT“ˆÙÙÙ\‹™XYÊ]^[X\žHÛY[ˆÛÙ^Ð]]
+	\ÈšXH™\ÜÛœÙ\ÈTJH‹[Ù[
+Bˆ™X[ØÛY[HØÜ™X]WÛÜ[˜ZWØÛY[
+ˆ\WÚÙ^OXÛÙ^ÝÚÙ[‹˜\ÙWÝ\›X˜\ÙWÝ\›ˆY˜][ÚXY\œÏWØÛÙ^ØÛÝY›\™WÚXY\œÊÛÙ^ÝÚÙ[‹˜\ÙWÝ\›X˜\ÙWÝ\›
+Kˆ
+Bˆ™]\›ˆÛÙ^]^[X\žPÛY[
+™X[ØÛY[[Ù[
+K[Ù[‚‚™YˆÝžWØ^\™WÙ›Ý[™žJˆ
+‹[Ù[ˆÜ[Û˜[ÜÝ—HH›Û™K^XÚ]Ø\WÚÙ^NˆÜ[Û˜[ÜÝ—HH›Û™Kˆ^XÚ]Ø˜\ÙWÝ\›ˆÜ[Û˜[ÜÝ—HH›Û™K\WÛ[ÙNˆÜ[Û˜[ÜÝ—HH›Û™KŠHOˆ\VÓÜ[Û˜[Ð[žWKÜ[Û˜[ÜÝ—WN‚ˆˆˆ^\™H›Ý[™žH]^ÛY[šXHHXZ[ˆYÙ[	ÜÈÜ™\ÛÛ™WØ^\™WÙ›Ý[™žWÜ[[YX
+\WÚÙ^HœÈ[˜BˆØ[X›H™X\™\‹\‹[[Ù[\WÛ[ÙK˜\ÙWÝ\›Ý™\œšY\ÊKˆ™]\›œÈ
+ÛY[[Ù[
+XÜˆ
+›Û™K›Û™JXˆˆˆ‚ˆžN‚ˆœ›ÛH\›Y\×ØÛKœ[[YWÜ›ÝšY\ˆ[\ÜÜ™\ÛÛ™WØ^\™WÙ›Ý[™žWÜ[[YBˆœ›ÛH\›Y\×ØÛK˜]][\Ü]]\œ›Ü‚ˆœ›ÛH\›Y\×ØÛK˜ÛÛ™šYÈ[\ÜØYØÛÛ™šY×Ü™XYÛ›Bˆ^Ù\[\Ü\œ›ÜŽ‚ˆ™]\›ˆ›Û™K›Û™BˆžN‚ˆÙ™ÈHØYØÛÛ™šY×Ü™XYÛ›J
+Bˆ[Ù[ØÙ™ÈHÙ™Ë™Ù]
+›[Ù[ŠHYˆ\Ú[œÝ[˜ÙJÙ™ËXÝ
+H[ÙHßBˆYˆ›Ý\Ú[œÝ[˜ÙJ[Ù[ØÙ™ËXÝ
+N‚ˆ[Ù[ØÙ™ÈHßBˆ^Ù\^Ù\[ÛŽ‚ˆ[Ù[ØÙ™ÈHßBˆžN‚ˆ[[YHHÜ™\ÛÛ™WØ^\™WÙ›Ý[™žWÜ[[YJˆ™\]Y\ÝYÜ›ÝšY\H˜^\™KY›Ý[™žH‹[Ù[ØÙ™Ï[[Ù[ØÙ™Ëˆ^XÚ]Ø\WÚÙ^OY^XÚ]Ø\WÚÙ^K^XÚ]Ø˜\ÙWÝ\›Y^XÚ]Ø˜\ÙWÝ\›ˆ\™Ù]Û[Ù[[[Ù[ˆ
+Bˆ^Ù\]]\œ›Üˆ\È^Î‚ˆÙÙÙ\‹™XYÊ]^[X\žH^\™KY›Ý[™žNˆ	\È‹^ÊBˆ™]\›ˆ›Û™K›Û™Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙÙÙ\‹™XYÊ]^[X\žH^\™KY›Ý[™žH[[YH\œ›ÜŽˆ	\È‹^ÊBˆ™]\›ˆ›Û™K›Û™Bˆ\WÚÙ^HH[[YK™Ù]
+˜\WÚÙ^HŠBˆ˜\ÙWÝ\›HÝŠ[[YK™Ù]
+˜˜\ÙWÝ\›‹ˆŠHÜˆˆŠBˆ[[YWØ\WÛ[ÙHH\WÛ[ÙHÜˆ[[YK™Ù]
+˜\WÛ[ÙHŠHÜˆ˜Ú]ØÛÛ\][ÛœÈ‚ˆÈ\WÚÙ^HX^H™HHØ[X›HÚÙ[ˆ›ÝšY\ŽÈ˜Z[Û›HÛˆ›Û™KÈˆ‹‚ˆYˆ›Ý
+Ø[X›J\WÚÙ^JHÜˆ\WÚÙ^JHÜˆ›Ý˜\ÙWÝ\›‚ˆ™]\›ˆ›Û™K›Û™Bˆš[˜[Û[Ù[HÛ›Ü›X[^™WÜ™\ÛÛ™YÛ[Ù[
+[Ù[ÜˆÝŠ[Ù[ØÙ™Ë™Ù]
+™Y˜][ŠHÜˆˆŠK˜^\™KY›Ý[™žHŠBˆYˆ›Ýš[˜[Û[Ù[‚ˆÈ›È˜[˜XÚÈ]^[Ù[›Üˆ^\™H
+™YYÈH\Þ[Y[˜[YJNˆ]H]]ÈÚZ[ˆ˜[›ÝYÚ[œÝXYÙˆ[™Ë‚ˆÙÙÙ\‹™XYÊˆ]^[X\žH^\™KY›Ý[™žNˆ›È[Ù[™\ÛÛ™Y
+[Ù[I\‹Y˜][I\ŠH‹ˆ[Ù[[Ù[ØÙ™Ë™Ù]
+™Y˜][ŠKˆ
+Bˆ™]\›ˆ›Û™K›Û™BˆÈHÑÈ›ÜÈ\K]™\œÚ[Ûˆ]Y\žH\˜[\Èœ›ÛHH˜\ÙHT“È\ÜÈšXHY˜][Ü]Y\žK‚ˆØÛX[—Ø˜\ÙKÙHHÙ^˜XÝÝ\›Ü]Y\žWÜ\˜[\Ê˜\ÙWÝ\›
+Bˆ^˜NˆXÝÜÝ‹[žWHHÈ™Y˜][Ü]Y\žHŽˆÙ_HYˆÙH[ÙHßBˆÛY[HØÜ™X]WÛÜ[˜ZWØÛY[
+\WÚÙ^OX\WÚÙ^K˜\ÙWÝ\›WØÛX[—Ø˜\ÙK
+Š™^˜JBˆYˆ[[YWØ\WÛ[ÙHOH˜ÛÙ^Ü™\ÜÛœÙ\ÈŽ‚ˆ™]\›ˆÛÙ^]^[X\žPÛY[
+ÛY[š[˜[Û[Ù[
+Kš[˜[Û[Ù[ˆYˆ[[YWØ\WÛ[ÙHOH˜[›ÜX×ÛY\ÜØYÙ\ÈŽ‚ˆÈ\WÚÙ^H›ÜØ\™Y™\˜˜][H
+Ýš[™ÈÜˆ[˜HØ[X›NÈZ[Ø[›ÜX×ØÛY[[œÝ[ÈH™X\™\ˆÛÚÊK‚ˆ™]\›ˆÛX^X™WÝÜ˜\Ø[›ÜXÊÛY[š[˜[Û[Ù[\WÚÙ^K˜\ÙWÝ\›[[YWØ\WÛ[ÙJKš[˜[Û[Ù[ˆ™]\›ˆÛY[š[˜[Û[Ù[‚‚™YˆÝžWØ[›ÜXÊ^XÚ]Ø\WÚÙ^NˆÝˆH›Û™JHOˆ\VÓÜ[Û˜[Ð[žWKÜ[Û˜[ÜÝ—WN‚ˆžN‚ˆœ›ÛHYÙ[˜[›ÜX×ØY\\ˆ[\ÜZ[Ø[›ÜX×ØÛY[ˆœ›ÛHYÙ[˜[›ÜX×ØÜ™Y[X[È[\Ü™\ÛÛ™WØ[›ÜX×ÝÚÙ[‚ˆ^Ù\[\Ü\œ›ÜŽ‚ˆ™]\›ˆ›Û™K›Û™BˆÛÛÜ™\Ù[[žHHÜÙ[XÝÜÛÛÙ[žJ˜[›ÜXÈŠBˆYˆÛÛÜ™\Ù[[™[žH\È›Ý›Û™N‚ˆÚÙ[ˆH^XÚ]Ø\WÚÙ^HÜˆÜÛÛÜ[[YWØ\WÚÙ^J[žJBˆ[ÙN‚ˆÈÛÛXœÙ[Ù[\NˆYØXÞH™\ÛÛ™\ˆÛÈHXYÛÛ[žHØ[‰ÝÙYÙH]^\ÚÜÈÚ[ˆHÝ[™[Û™HÜ™Y[X[^\ÝË‚ˆ[žHH›Û™BˆÚÙ[ˆH^XÚ]Ø\WÚÙ^HÜˆ™\ÛÛ™WØ[›ÜX×ÝÚÙ[Š
+BˆYˆ›ÝÚÙ[Ž‚ˆ™]\›ˆ›Û™K›Û™BˆÈÛ›ÜˆÛÛ™šYËžX[[[Ù[˜˜\ÙWÝ\›Û›HÚ[ˆ›ÝšY\ˆ\È[›ÜXÈS‘HT“\ÂˆÈ[›ÜXËXÛÛ\]X›NÈH›Ü™ZYÛˆÜÝ
+ÛÙ^Ü[”›Ý]\ŠHÛÝ[H]™\žH]^Ø[‚ˆ˜\ÙWÝ\›HÜÛÛÜ[[YWØ˜\ÙWÝ\›
+[žKÐS•“ÔP×ÑQUSÐTÑWÕT“
+HYˆÛÛÜ™\Ù[[ÙHÐS•“ÔP×ÑQUSÐTÑWÕT“ˆÚ]ÛÛ^X‹œÝ\™\ÜÊ^Ù\[ÛŠN‚ˆœ›ÛH\›Y\×ØÛK˜ÛÛ™šYÈ[\ÜØYØÛÛ™šY×Ü™XYÛ›BˆÙ™ÈHØYØÛÛ™šY×Ü™XYÛ›J
+Bˆ[Ù[ØÙ™ÈHÙ™Ë™Ù]
+›[Ù[ŠBˆYˆ\Ú[œÝ[˜ÙJ[Ù[ØÙ™ËXÝ
+N‚ˆÙ™×Ü›ÝšY\ˆHÝŠ[Ù[ØÙ™Ë™Ù]
+œ›ÝšY\ˆŠHÜˆˆŠKœÝš\
+
+K›ÝÙ\Š
+BˆYˆÙ™×Ü›ÝšY\ˆOH˜[›ÜXÈŽ‚ˆÙ™×Ø˜\ÙWÝ\›H
+[Ù[ØÙ™Ë™Ù]
+˜˜\ÙWÝ\›ŠHÜˆˆŠKœÝš\
+
+KœœÝš\
+‹ÈŠBˆYˆÙ™×Ø˜\ÙWÝ\›[™Ú\×Ø[›ÜX×ØÛÛ\]X›WÚÜÝ
+Ù™×Ø˜\ÙWÝ\›
+N‚ˆ˜\ÙWÝ\›HÙ™×Ø˜\ÙWÝ\›ˆœ›ÛHYÙ[˜[›ÜX×ØÜ™Y[X[È[\ÜÚ\×ÛØ]]ÝÚÙ[‚ˆ\×ÛØ]]HÚ\×ÛØ]]ÝÚÙ[ŠÚÙ[ŠBˆ[Ù[HÙÙ]Ø]^Û[Ù[Ù›Ü—Ü›ÝšY\Š˜[›ÜXÈŠHÜˆ˜Û]YKZZZÝKMMKLŒLLH‚ˆYˆØ]^Ü›Ø™WØXÝ]™J
+N‚ˆÈ›Ø™NˆÚÙ[ˆ
+ÈY\\ˆ[\Ü™\ÛÛ™YÈÚÚ\™X[ÛY[ÛÛœÝXÝ[Û‹‚ˆ™]\›ˆÐ]^›Ø™PÛY[ÝXŠ\WÚÙ^OHˆ‹˜\ÙWÝ\›X˜\ÙWÝ\›
+K[Ù[ˆÙÙÙ\‹™XYÊ]^[X\žHÛY[ˆ[›ÜXÈ˜]]™H
+	\ÊH]	\È
+Ø]]I\ÊH‹[Ù[˜\ÙWÝ\›\×ÛØ]]
+BˆžN‚ˆ™X[ØÛY[HZ[Ø[›ÜX×ØÛY[
+ÚÙ[‹˜\ÙWÝ\›
+Bˆ^Ù\[\Ü\œ›ÜŽ‚ˆ™]\›ˆ›Û™K›Û™HÈY\\ˆ[\ÜÈš[™H]H[›ÜXÈÑÈ]Ù[ˆ\ÈZ\ÜÚ[™Ë‚ˆ™]\›ˆ[›ÜXÐ]^[X\žPÛY[
+™X[ØÛY[[Ù[ÚÙ[‹˜\ÙWÝ\›\×ÛØ]]Z\×ÛØ]]
+K[Ù[‚‚—ÓPRS—Ô•S•SQWÑ’QSÈH
+œ›ÝšY\ˆ‹›[Ù[‹˜˜\ÙWÝ\›‹˜\WÚÙ^H‹˜\WÛ[ÙH‹˜]]Û[ÙHŠB—ÓPRS—Ô•S•SQWÐÓÓ•VÑ’QSÈHÓPRS—Ô•S•SQWÑ’QSÈ
+È
+œ™\]Y\ÝYÜ›ÝšY\ˆ‹
+B‚‚™YˆÛ›Ü›X[^™WÛXZ[—Ü[[YJXZ[—Ü[[YNˆÜ[Û˜[ÑXÝÜÝ‹[žWWJHOˆXÝÜÝ‹[žWN‚ˆˆˆ”™]\›ˆHØ[š]^™YÛÜHÙˆH]™HXZ[‹\[[YHÝ™\œšYK‚‚ˆ\WÚÙ^XX^H™HH™\›ËX\™ÈØ[X›H
+[˜HQÚÙ[ˆ›ÝšY\‹XØÙ\YžHHÜ[RHÑÊBˆ8 %™\Ù\™Y\ËZ\ÈÛÈ]^ÛY[ÈÚ\™HXZ[‹XYÙ[]]‚ˆˆˆ‚ˆYˆXZ[—Ü[[YH\È›Û™N‚ˆÈÛÛ^[ØØ[Ý]Hš\œÝÈÛÛ\]Z\œ›ÜœÈX^HÛ[›Ý\ˆÛÛ˜Ý\œ™[Ù\ÜÚ[Û‰ÜÈ[™Ú[ÚÙ^K‚ˆXZ[—Ü[[YHHÔ•S•SQWÓPRS—ÐÓÓ•V™Ù]
+
+BˆYˆXZ[—Ü[[YH\È›Û™N‚ˆXZ[—Ü[[YHHØÛÛ\]Ü[[YWÛXZ[Š
+BˆYˆ›Ý\Ú[œÝ[˜ÙJXZ[—Ü[[YKXÝ
+N‚ˆ™]\›ˆßBˆ›Ü›X[^™YˆXÝÜÝ‹[žWHHßBˆ›ÜˆšY[[ˆÓPRS—Ô•S•SQWÐÓÓ•VÑ’QSÎ‚ˆ˜[YHHXZ[—Ü[[YK™Ù]
+šY[
+BˆYˆšY[OH˜\WÚÙ^Hˆ[™Ø[X›J˜[YJH[™›Ý\Ú[œÝ[˜ÙJ˜[YKÝŠN‚ˆ›Ü›X[^™YÙšY[HH˜[YBˆ[Yˆ\Ú[œÝ[˜ÙJ˜[YKÝŠH[™˜[YKœÝš\
+
+N‚ˆ›Ü›X[^™YÙšY[HH˜[YKœÝš\
+
+Bˆ›ÜˆY[]WÙšY[[ˆ
+œ›ÝšY\ˆ‹œ™\]Y\ÝYÜ›ÝšY\ˆŠN‚ˆY[]HH›Ü›X[^™Y™Ù]
+Y[]WÙšY[
+BˆYˆ\Ú[œÝ[˜ÙJY[]KÝŠN‚ˆ›Ü›X[^™YÚY[]WÙšY[HHY[]K›ÝÙ\Š
+Bˆ™]\›ˆ›Ü›X[^™Y‚‚™YˆÙÙ]Ü›ÝšY\—ØÚZ[Š
+HOˆ\ÝÝ\WN‚ˆˆˆ“Ü™\™Y›ÝšY\ˆ]XÝ[ÛˆÚZ[‹Z[]Ø[[YHÛÈÝžWÊ˜]Ú\È\™HXÚÙY\‚‚ˆÜ[˜ZKXÛÙ^\È[X™\˜][HXœÙ[
+ÚY[™È[ÝË[\Ýœ™XZÜÈÝY\ÜÙY[[Ù[˜[˜XÚÊK‚ˆˆˆ‚ˆ™]\›ˆÂˆ
+›Ü[œ›Ý]\ˆ‹ÝžWÛÜ[œ›Ý]\ŠK
+››Ý\È‹ÝžWÛ›Ý\ÊKˆ
+›ØØ[ØÝ\ÝÛH‹ÝžWØÝ\ÝÛWÙ[™Ú[
+K
+˜\KZÙ^H‹Ü™\ÛÛ™WØ\WÚÙ^WÜ›ÝšY\ŠKˆB‚‚ˆÈ”™XÙ[H‰Ùˆ[šX[K\›ÝšY\ˆØXÚNˆH\]Y›ÝšY\ˆÝ^\ÈÛÈ›ÜˆÝ\œËÛÈY[™È]ˆÈ›ÜˆHØ]™\È[ˆ•\ˆ]^Ø[ˆ[‹\›ØÙ\ÜÈÛ›H
+›Ùš[\ÈX^H\ÙHY™™\™[Ù^\ÊK‚—ÐUVÕS’PSWÕÔÑPÓÓ‘ÈHŒÈLZ[]\Â—Ø]^Ý[šX[WÝ[[ˆXÝÐ[žK›Ø]HHßB—Ø]^Ý[šX[WÛÙÙÙYØ]ˆXÝÐ[žK›Ø]HHßBˆÈ™\ÛÛ™YÜ›ÝšY\ˆÈ^XÚ]XÛÛ™šYÈ˜[Y\È8¡¤ˆÚZ[ˆX™[Ë‚—ÐUVÕS’PSWÓP‘SÐSPTÑTÈHÂˆ›Ü[œ›Ý]\ˆŽˆ›Ü[œ›Ý]\ˆ‹››Ý\ÈŽˆ››Ý\È‹˜Ý\ÝÛHŽˆ›ØØ[ØÝ\ÝÛH‹ˆ›ØØ[ØÝ\ÝÛHŽˆ›ØØ[ØÝ\ÝÛH‹›Ü[˜ZKXÛÙ^Žˆ›Ü[˜ZKXÛÙ^‹˜ÛÙ^Žˆ›Ü[˜ZKXÛÙ^‹ŸB‚‚™YˆÛ›Ü›X[^™WØÚZ[—ÛX™[
+›ÝšY\ŽˆÝŠHOˆÝŽ‚ˆˆˆœ™\ÛÛ™YÜ›ÝšY\ˆ8¡¤ˆÚZ[ˆX™[È[šÛ›ÝÛˆTKZÙ^H›ÝšY\œÈ˜[˜XÚÈÈHÝÙ\˜Ø\ÙY[œ]ˆˆˆ‚ˆYˆ›Ý›ÝšY\Ž‚ˆ™]\›ˆˆ‚ˆHÝŠ›ÝšY\ŠKœÝš\
+
+K›ÝÙ\Š
+Bˆ™]\›ˆÐUVÕS’PSWÓP‘SÐSPTÑTË™Ù]
+
+B‚‚™YˆÛX\š×Ü›ÝšY\—Ý[šX[Jˆ›ÝšY\ŽˆÝ‹ˆÜ[Û˜[Ù›Ø]HH›Û™K
+‹˜\ÙWÝ\›ˆÜ[Û˜[ÜÝ—HH›Û™KŠHOˆ›Û™N‚ˆˆˆ’YHÛ™H›ÝšY\ˆ[™Ú[[[H^\™\ÈY\ˆHÛÛ™š\›YY^[Y[\œ›Ü‹ˆˆˆ‚ˆX™[HÛ›Ü›X[^™WØÚZ[—ÛX™[
+›ÝšY\ŠBˆYˆ›ÝX™[‚ˆ™]\›‚ˆÙ^HHÝ[šX[WØØXÚWÚÙ^JX™[˜\ÙWÝ\›
+BˆHÐUVÕS’PSWÕÔÑPÓÓ‘ÈYˆ\È›Û™H[ÙHˆ^\™\×Ø]H[YK[YJ
+H
+ÈˆØ]^Ý[šX[WÝ[[ÚÙ^WHH^\™\×Ø]ˆÙÙÙ\‹Ø\›š[™Êˆ]^[X\žNˆX\šÚ[™È	\È[šX[H›Üˆ	YÈ
+^[Y[ÈÜ™Y]\œ›ÜŠKˆ‚ˆ”ÝXœÙ\]Y[]^[X\žHØ[ÈÚ[ÚÚ\][[	\Ëˆ‹ˆX™[[
+
+K[YKœÝ™[YJ‰R‰SN‰TÈ‹[YK›ØØ[[YJ^\™\×Ø]
+JKˆ
+B‚‚™YˆÚ\×Ü›ÝšY\—Ý[šX[JX™[ˆÝ‹˜\ÙWÝ\›ˆÜ[Û˜[ÜÝ—HH›Û™JHOˆ›ÛÛ‚ˆˆˆ•YHY™ˆ\È›ÝšY\ˆ[™Ú[\È[šX[H[™[™^\™YÈ^š[H]šXÝÈ^\™Y[šY\Ëˆˆˆ‚ˆYˆ›ÝX™[‚ˆ™]\›ˆ˜[ÙBˆÙ^HHÝ[šX[WØØXÚWÚÙ^JX™[˜\ÙWÝ\›
+Bˆ^\™\×Ø]HØ]^Ý[šX[WÝ[[™Ù]
+Ù^JBˆYˆ^\™\×Ø]\È›Û™N‚ˆ™]\›ˆ˜[ÙBˆYˆ[YK[YJ
+HH^\™\×Ø]‚ˆØ]^Ý[šX[WÝ[[œÜ
+Ù^K›Û™JBˆØ]^Ý[šX[WÛÙÙÙYØ]œÜ
+Ù^K›Û™JBˆ™]\›ˆ˜[ÙBˆ™]\›ˆYB‚‚™YˆÛÙ×ÜÚÚ\Ý[šX[JˆX™[ˆÝ‹\ÚÎˆÜ[Û˜[ÜÝ—HH›Û™K
+‹˜\ÙWÝ\›ˆÜ[Û˜[ÜÝ—HH›Û™KŠHOˆ›Û™N‚ˆˆˆ“ÙÈHÚÚ\Y[šX[H›ÝšY\ˆ][ÜÝÛ˜ÙH\ˆZ[]H\ˆX™[ˆˆˆ‚ˆ›ÝÈH[YK[YJ
+BˆÙ^HHÝ[šX[WØØXÚWÚÙ^JX™[˜\ÙWÝ\›
+BˆYˆ›ÝÈHØ]^Ý[šX[WÛÙÙÙYØ]™Ù]
+Ù^KŒ
+HHŒ‚ˆØ]^Ý[šX[WÛÙÙÙYØ]ÚÙ^WHH›ÝÂˆ^\™\×Ø]HØ]^Ý[šX[WÝ[[™Ù]
+Ù^K›ÝÊBˆÙÙÙ\‹š[™›Êˆ]^[X\žH	\ÎˆÚÚ\[™È	\È
+™XÙ[H™]\›™Y^[Y[\œ›Ü‹™]žH[ˆ	YÊH‹ˆ\ÚÈÜˆ˜Ø[‹X™[X^
+[
+^\™\×Ø]H›ÝÊJKˆ
+B‚‚™YˆÜ™\Ù]Ø]^Ý[šX[WØØXÚJ
+HOˆ›Û™N‚ˆˆˆÛX\ˆH[šX[HØXÚH
+\ÝÈÈ^XÚ]\Ù\ˆ™\Ù]
+Kˆˆˆ‚ˆØ]^Ý[šX[WÝ[[˜ÛX\Š
+BˆØ]^Ý[šX[WÛÙÙÙYØ]˜ÛX\Š
+B‚‚™YˆØÛÛZ[œ×Ø[žJ^ˆÝ‹™YY\Îˆ\VÜÝ‹‹‹—JHOˆ›ÛÛ‚ˆˆˆ•YHÚ[ˆ[žH™YYH\ÈHÝXœÝš[™ÈÙˆ^ˆˆˆ‚ˆ™]\›ˆ[žJÝÈ[ˆ^›ÜˆÝÈ[ˆ™YY\ÊB‚‚ˆÈš[[™ËX›ÙHX\šÙ\œÈ
+Ü™Y]^]\Ý[ÛˆÜ˜\Y[ˆ‹ÍËÍÍŽH›ÙY\ÊK\ÈZ[KÝÙYZÛH][ÝBˆÈ^]\Ý[Ûˆ
+[˜Ý[Û˜[HÜ™Y]^]\Ý[ÛŽÈœ™\ÛÝ\˜ÙH^]\ÝYˆ\ÈH™\^ÙÔ”È][ÝH˜\Ú[™È8 %ˆÈ[ÛÈÙ\šX[^™YžHÑÈÜ˜\\œÈ[™’SH\È‘TÓÕTÑWÑVUTÕQÈ™\ÛÝ\˜ÙQ^]\ÝYÈ™\ÛÝ\˜ÙKY^]\ÝY
+K‚—ÔVSQS•ÒÑVUÓÔ‘ÈH
+ˆ˜Ü™Y]È‹š[œÝY™šXÚY[[™È‹˜Ø[ˆÛ›HY™›Ü™‹˜š[[™È‹œ^[Y[™\]Z\™Y‹ˆ›Ý]Ùˆ[™È‹œ[ˆÝ]Ùˆ[™È‹˜˜[[˜ÙWÙ\]Y‹››È\ØX›HÜ™Y]È‹ˆ›[Ù[Û›ÝÜÝ\ÜYÛÛ—Ùœ™YWÝY\ˆ‹››Ý]˜Z[X›HÛˆHœ™YHY\ˆ‹ˆœ™\]Z\™\ÈHÝXœØÜš\[Ûˆ‹\Ü˜YH›ÜˆXØÙ\ÜÈ‹\Ü˜YH›ÜˆYÚ\ˆ[Z]È‹ˆœ™XXÚY[Ý\ˆÙ\ÜÚ[Ûˆ\ØYÙH[Z]‹œ][ÝH^ÙYYY‹œ][ÝWÙ^ÙYYY‹ˆÛÈX[žHÚÙ[œÈ\ˆ^H‹™Z[H[Z]‹ÚÙ[œÈ\ˆ^H‹™Z[H][ÝH‹œ™\ÛÝ\˜ÙH^]\ÝY‹ˆœ™\ÛÝ\˜ÙWÙ^]\ÝY‹œ™\ÛÝ\˜ÙKY^]\ÝY‹œ™\ÛÝ\˜ÙY^]\ÝY‹ˆÙYZÛH\ØYÙH[Z]‹ÙYZÛH[Z]‹ŠB‚‚™YˆÚ\×Ü^[Y[Ù\œ›ÜŠ^Îˆ^Ù\[ÛŠHOˆ›ÛÛ‚ˆˆˆ”^[Y[ØÜ™Y]Ü][ÝH^]\Ý[ÛŽˆ‹ÜˆHš[[™ËÜ][ÝH›ÙHÛˆËÍÍŽKÛ›Ë\Ý]\Ëˆˆˆ‚ˆÝ]\ÈHÙ]]Š^ËœÝ]\×ØÛÙH‹›Û™JBˆ™]\›ˆÝ]\ÈOHˆÜˆ
+ˆÝ]\È[ˆÍËŽK›Û™_H[™ØÛÛZ[œ×Ø[žJÝŠ^ÊK›ÝÙ\Š
+KÔVSQS•ÒÑVUÓÔ‘ÊBˆ
+B‚‚™YˆÛ›Ý\×ÜÜ[ØXØÛÝ[Ú\×Ùœ™\ÚÜZYØXØÙ\ÜÊ
+HOˆ›ÛÛ‚ˆˆˆ”™]\›ˆYHÛ›HÚ[ˆHœ™\Ú›Ý\ÈXØÛÝ[THØ^\ÈZYXØÙ\ÜÈ\È[ÝÙYˆˆˆ‚ˆžN‚ˆœ›ÛH\›Y\×ØÛK››Ý\×ØXØÛÝ[[\ÜÙ]Û›Ý\×ÜÜ[ØXØÛÝ[Ú[™›Âˆ™]\›ˆÙ]Û›Ý\×ÜÜ[ØXØÛÝ[Ú[™›Ê›Ü˜ÙWÙœ™\ÚUYJKœZYÜÙ\šXÙWØXØÙ\ÜÈ\ÈYBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙÙÙ\‹™XYÊ]^[X\žH›Ý\ÈZYY[][Y[™Yœ™\ÚÚXÚÈ˜Z[Yˆ	\È‹^ÊBˆ™]\›ˆ˜[ÙB‚‚—ÔUWÓSRUÒÑVUÓÔ‘ÈH
+ˆœ˜]H[Z]‹œ˜]WÛ[Z]‹ÛÈX[žH™\]Y\ÝÈ‹žHYØZ[ˆ‹œ™]žHY\ˆ‹œ™\Ù]È[ˆ‚ŠB—ÔUWÓSRUÐ’SS‘×ÒÑVUÓÔ‘ÈH
+ˆ˜Ü™Y]È‹š[œÝY™šXÚY[[™È‹˜š[[™È‹œ^[Y[™\]Z\™Y‹˜Ø[ˆÛ›HY™›Ü™‹ˆ›Ý]Ùˆ[™È‹œ[ˆÝ]Ùˆ[™È‹˜˜[[˜ÙWÙ\]Y‹››È\ØX›HÜ™Y]È‹ˆ›[Ù[Û›ÝÜÝ\ÜYÛÛ—Ùœ™YWÝY\ˆ‹››Ý]˜Z[X›HÛˆHœ™YHY\ˆ‹ŠB‚‚™YˆÚ\×Ü˜]WÛ[Z]Ù\œ›ÜŠ^Îˆ^Ù\[ÛŠHOˆ›ÛÛ‚ˆˆˆŽH˜]H[Z]
+›Ýš[[™ËÜ][ÝKÚXÚÚ\×Ü^[Y[Ù\œ›ÜˆÝÛœÊK‚‚ˆÜ[RIÜÈ˜]S[Z]\œ›ÜˆX^HÛZ]œÝ]\×ØÛÙH8 %X]ÚYžHÛ\ÜÈ˜[YKˆHÙ[™\šXÈŽHÚ]Ý]ˆš[[™ÈÙ^]ÛÜ™ÈÛÝ[È\ÈH˜]H[Z]‚ˆˆˆ‚ˆÈ
+ˆÎŒÈ]\›ŠBˆYˆ\J^ÊK—×Û˜[YW×ÈOH”˜]S[Z]\œ›ÜˆŽ‚ˆ™]\›ˆYBˆYˆÙ]]Š^ËœÝ]\×ØÛÙH‹›Û™JHOHŽN‚ˆ6ïN:¶‰žËkºwµç]ŠÛY[˜˜\ÙWÝ\›‹ˆŠHÜˆˆŠKØÚÙ^JBˆ™]\›ˆÜ›Ý]WØÛY[
+™\KÛY[š[˜[Û[Ù[
+BˆÙÙÙ\‹Ø\›š[™Êœ™\ÛÛ™WÜ›ÝšY\—ØÛY[ˆÝ\ÝÛKÛXZ[ˆ™\]Y\ÝY]›È[™Ú[Ü™Y[X[È›Ý[™ŠBˆ™]\›ˆ›Û™K›Û™B‚‚™YˆÛ˜[YYØÝ\ÝÛWÛÜ[˜ZWÝÚ\™WØÛY[
+Ý\ÝÛWØ˜\ÙNˆÝ‹Ý\ÝÛWÚÙ^Nˆ[žJN‚ˆˆˆ”Z[ˆÜ[RHÛY[ÛˆHÝŒH\]Z]˜[[ÙˆH˜[YYÝ\ÝÛH[žIÜÈ˜\ÙHT“ˆˆˆ‚ˆØÛX[—Ø˜\ÙKÙHHÙ^˜XÝÝ\›Ü]Y\žWÜ\˜[\ÊÝ×ÛÜ[˜ZWØ˜\ÙWÝ\›
+Ý\ÝÛWØ˜\ÙJJBˆÙ^˜HHÈ™Y˜][Ü]Y\žHŽˆÙ_HYˆÙH[ÙHßBˆÚXY\œÈHØ\WÝ\Ù\—ÙY˜][ÚXY\œÊ›Û™JBˆYˆÚXY\œÎ‚ˆÙ^˜VÈ™Y˜][ÚXY\œÈ—HHÚXY\œÂˆ™]\›ˆØÜ™X]WÛÜ[˜ZWØÛY[
+\WÚÙ^OXÝ\ÝÛWÚÙ^K˜\ÙWÝ\›WØÛX[—Ø˜\ÙK
+Š—Ù^˜JB‚‚™YˆÜ™\ÛÛ™WÛ˜[YYØÝ\ÝÛWØœ˜[˜Ú
+™\NˆÔ™\ÛÛ™T™\]Y\Ý
+HOˆÜ[Û˜[×Ô™\ÛÛ™T™\Ý[N‚ˆˆˆ“˜[YYÝ\ÝÛH›ÝšY\ˆ
+ÛÛ™šYËžX[[›ÝšY\œÈXÝÈÝ\ÝÛWÜ›ÝšY\œÈ\Ý
+NÈ›Û™HYˆ›È[žHX]Ú\Ëˆˆˆ‚ˆœ›ÛH\›Y\×ØÛKœ[[YWÜ›ÝšY\ˆ[\ÜÙÙ]Û˜[YYØÝ\ÝÛWÜ›ÝšY\‚ˆ›ÝšY\ˆH™\Kœ›ÝšY\‚ˆÈYˆH˜]È˜[YH\È[ˆ[X\È
+Ú[ZX8¡¤ˆÚ[ZKXÛÙ[™Ø
+H[™HÝ\ÝÛWÜ›ÝšY\œÈ[žH^\ÝÂˆÈ[™\ˆ]HÝ\ÝÛH[žHÚ[œÈÝ™\ˆ[X\È™]Üš][™ËˆÛ›H›Üˆ[X\Ù\ËÛÈ[šY\ÈX]Ú[™ÈBˆÈØ[›ÛšXØ[˜[YH
+K™Ëˆ›Ý\Ø
+HÝ[Y™\ˆÈHZ[Z[‹‚ˆÝ\ÝÛWÙ[žHH›Û™BˆYˆ™\K›ÜšYÚ[˜[Ü›ÝšY\ˆ[™™\K›ÜšYÚ[˜[Ü›ÝšY\ˆOH›ÝšY\Ž‚ˆÝ\ÝÛWÙ[žHHÙÙ]Û˜[YYØÝ\ÝÛWÜ›ÝšY\Š™\K›ÜšYÚ[˜[Ü›ÝšY\ŠBˆYˆÝ\ÝÛWÙ[žH\È›Û™N‚ˆÝ\ÝÛWÙ[žHHÙÙ]Û˜[YYØÝ\ÝÛWÜ›ÝšY\Š›ÝšY\ŠBˆYˆ›ÝÝ\ÝÛWÙ[žN‚ˆ™]\›ˆ›Û™BˆÝ\ÝÛWØ˜\ÙHH
+Ý\ÝÛWÙ[žK™Ù]
+˜˜\ÙWÝ\›ŠHÜˆˆŠKœÝš\
+
+BˆÝ\ÝÛWÚÙ^HHÛ˜[YYØÝ\ÝÛWØ\WÚÙ^JÝ\ÝÛWÙ[žK›ÝšY\‹Ý\ÝÛWØ˜\ÙJBˆYˆÝ\ÝÛWÚÙ^HOH››ËZÙ^K\™\]Z\™YŽ‚ˆÙÙÙ\‹Ø\›š[™Êœ™\ÛÛ™WÜ›ÝšY\—ØÛY[ˆ˜[YYÝ\ÝÛH›ÝšY\ˆ	\ˆ\È›È™\ÛÛ˜X›H‚ˆ˜\WÚÙ^H8 %™\]Y\ÝÚ[™HÙ[Ú]XÙZÛ\ˆ›ËZÙ^K\™\]Z\™Y‚ˆ˜[™Ú[HÛˆ]]\™\]Z\™Y[™Ú[È‹Ý\ÝÛWÙ[žK™Ù]
+›˜[YHŠHÜˆ›ÝšY\ŠBˆÈ^XÚ]\‹]\ÚÈ\WÛ[ÙHÝ™\œšYHÚ[œÈÝ™\ˆH›ÝšY\ˆ[žIÜË‚ˆ[žWØ\WÛ[ÙHH
+™\K˜\WÛ[ÙHÜˆÝ\ÝÛWÙ[žK™Ù]
+˜\WÛ[ÙHŠHÜˆˆŠKœÝš\
+
+BˆYˆ›ÝÝ\ÝÛWØ˜\ÙN‚ˆÙÙÙ\‹Ø\›š[™Êœ™\ÛÛ™WÜ›ÝšY\—ØÛY[ˆ˜[YYÝ\ÝÛH›ÝšY\ˆ	\ˆ\È›È˜\ÙWÝ\›‹›ÝšY\ŠBˆ™]\›ˆ›Û™K›Û™Bˆš[˜[Û[Ù[HÛ›Ü›X[^™WÜ™\ÛÛ™YÛ[Ù[
+ˆ™\K›[Ù[ˆÜˆÝ\ÝÛWÙ[žK™Ù]
+›[Ù[ŠBˆÜˆ
+™\K›XZ[—Ü[[YK™Ù]
+›[Ù[ŠHYˆ™\K›XZ[—Ü[[YH[ÙH›Û™JBˆÜˆÜ™XYÛXZ[—Û[Ù[Ù›Ü—Ø]^
+
+BˆÜˆ™ÜMË[Z[šH‹ˆ›ÝšY\‹ˆ
+BˆÙÙÙ\‹™XYÊœ™\ÛÛ™WÜ›ÝšY\—ØÛY[ˆ˜[YYÝ\ÝÛH›ÝšY\ˆ	\ˆ
+	\Ë\WÛ[ÙOI\ÊH‹ˆ›ÝšY\‹š[˜[Û[Ù[[žWØ\WÛ[ÙHÜˆ˜Ú]ØÛÛ\][ÛœÈŠBˆÈ[›ÜX×ÛY\ÜØYÙ\Îˆ›Ý]HšXH[›ÜXÐ]^[X\žPÛY[
+Z\œ›ÜœÈÝžWØÝ\ÝÛWÙ[™Ú[
+NÂˆÈH[›ÜXÈÑÈÙY\ÈHÜšYÚ[˜[
+[‹\™]Üš][ŠHT“‚ˆÈZ\œ›ÜœÈH[›Ûž[[Ý\ËXÝ\ÝÛHœ˜[˜Ú[ˆÝžWØÝ\ÝÛWÙ[™Ú[
+
+KˆÙYHÌMLÌË‚ˆYˆ[žWØ\WÛ[ÙHOH˜[›ÜX×ÛY\ÜØYÙ\ÈŽ‚ˆžN‚ˆœ›ÛHYÙ[˜[›ÜX×ØY\\ˆ[\ÜZ[Ø[›ÜX×ØÛY[ˆ™X[ØÛY[HZ[Ø[›ÜX×ØÛY[
+Ý\ÝÛWÚÙ^KÝ\ÝÛWØ˜\ÙJBˆ^Ù\[\Ü\œ›ÜŽ‚ˆÙÙÙ\‹Ø\›š[™Ê“˜[YYÝ\ÝÛH›ÝšY\ˆ	\ˆXÛ\™\È\WÛ[ÙOX[›ÜX×ÛY\ÜØYÙ\È]H[›ÜXÈÑÈ‚ˆš\È›Ý[œÝ[Y8 %˜[[™È˜XÚÈÈÜ[RK]Ú\™Kˆ‹›ÝšY\ŠBˆ™]\›ˆÜ›Ý]WØÛY[
+™\KÛ˜[YYØÝ\ÝÛWÛÜ[˜ZWÝÚ\™WØÛY[
+Ý\ÝÛWØ˜\ÙKÝ\ÝÛWÚÙ^JKš[˜[Û[Ù[
+Bˆ™]\›ˆÜ›Ý]WØÛY[
+ˆ™\K[›ÜXÐ]^[X\žPÛY[
+™X[ØÛY[š[˜[Û[Ù[Ý\ÝÛWÚÙ^KÝ\ÝÛWØ˜\ÙK\×ÛØ]]Q˜[ÙJKš[˜[Û[Ù[
+BˆÛY[HÛ˜[YYØÝ\ÝÛWÛÜ[˜ZWÝÚ\™WØÛY[
+Ý\ÝÛWØ˜\ÙKÝ\ÝÛWÚÙ^JBˆÈÛÙ^Ü™\ÜÛœÙ\ËÜˆ]]ËY]XÝšXHÝÜ˜\Ý˜[œÜÜ
+ÚXÚ™XYÈH\ÚË[]™[\WÛ[ÙJK‚ˆYˆ[žWØ\WÛ[ÙHOH˜ÛÙ^Ü™\ÜÛœÙ\ÈŽ‚ˆÛY[HÛÙ^]^[X\žPÛY[
+ÛY[š[˜[Û[Ù[
+Bˆ[ÙN‚ˆÛY[HÝÜ˜\Ý˜[œÜÜ
+™\KÛY[š[˜[Û[Ù[Ý\ÝÛWØ˜\ÙKÝ\ÝÛWÚÙ^JBˆ™]\›ˆÜ›Ý]WØÛY[
+™\KÛY[š[˜[Û[Ù[
+B‚‚™YˆÜ™\ÛÛ™WØ^\™WÙ›Ý[™žWØœ˜[˜Ú
+™\NˆÔ™\ÛÛ™T™\]Y\Ý
+HOˆÔ™\ÛÛ™T™\Ý[‚ˆˆˆ^\™H›Ý[™žHšXHH[[YH™\ÛÛ™\ŽˆHÙ[™\šXÈ“Õ’QT—Ô‘QÒTÕ–H]Û›HÛ›ÝÜÈHÝ]XÂˆV•T‘WÑ“ÕS‘–WÐTWÒÑVH[ˆ˜\‹Z\ÜÚ[™È]]Û[ÙNˆ[˜WÚY
+Ø[X›H™X\™\ŠH[™ÛÛ™šYÈ˜\ÙWÝ\›Ý™\œšY\Ëˆˆˆ‚ˆÛY[Y˜][Û[Ù[HÝžWØ^\™WÙ›Ý[™žJ[Ù[\™\K›[Ù[^XÚ]Ø\WÚÙ^O\™\K™^XÚ]Ø\WÚÙ^Kˆ^XÚ]Ø˜\ÙWÝ\›\™\K™^XÚ]Ø˜\ÙWÝ\›\WÛ[ÙO\™\K˜\WÛ[ÙJBˆ™]\›ˆÜ›Ý]WÛÜ—ÝØ\›Š™\KÛY[Y˜][Û[Ù[ˆœ™\ÛÛ™WÜ›ÝšY\—ØÛY[ˆ^\™KY›Ý[™žH™\]Y\ÝY]‚ˆœ[[YH™\ÛÛ][Ûˆ˜Z[Y
+[Žˆ\›Y\ÈØÝÜˆ›ÜˆXYÛ›ÜÝXÜÊHŠB‚‚™YˆÜ™\ÛÛ™WØ\WÚÙ^WØœ˜[˜Ú
+™\NˆÔ™\ÛÛ™T™\]Y\ÝÛÛ™šYÎˆ[žK™\ÛÛ™WØÜ™YÎˆØ[X›JHOˆÔ™\ÛÛ™T™\Ý[‚ˆˆˆ”“Õ’QT—Ô‘QÒTÕ–H\WÚÙ^X›ÝšY\œÈ
+[›ÜXÈšXH]ÈÝÛˆ™\ÛÛ™\ŠKÛ›Ý\š[™È^XÚ]Ý™\œšY\Ëˆˆˆ‚ˆ›ÝšY\ˆH™\Kœ›ÝšY\‚ˆYˆ›ÝšY\ˆOH˜[›ÜXÈŽ‚ˆÛY[Y˜][Û[Ù[HÝžWØ[›ÜXÊ^XÚ]Ø\WÚÙ^O\™\K™^XÚ]Ø\WÚÙ^JBˆ™]\›ˆÜ›Ý]WÛÜ—ÝØ\›Š™\KÛY[Y˜][Û[Ù[ˆœ™\ÛÛ™WÜ›ÝšY\—ØÛY[ˆ[›ÜXÈ™\]Y\ÝY]›È[›ÜXÈÜ™Y[X[È›Ý[™ŠBˆÜ™YÈH™\ÛÛ™WØÜ™YÊ›ÝšY\ŠBˆ\WÚÙ^HHÝŠÜ™YË™Ù]
+˜\WÚÙ^H‹ˆŠJKœÝš\
+
+BˆÈ^XÚ]\WÚÙ^HÝ™\œšYH
+˜[˜XÚ×Û[Ù[ÈÝ\ÝÛWÜ›ÝšY\œÈ[žJH]ÈØ[\œÂˆÈ]][XØ]HÚ\™H›ÈZ[Z[ˆÜ™Y[X[\È™YÚ\Ý\™Y›Üˆ\È[X\Ë‚ˆYˆ™\K™^XÚ]Ø\WÚÙ^N‚ˆ\WÚÙ^HH™\K™^XÚ]Ø\WÚÙ^KœÝš\
+
+HÜˆ\WÚÙ^Bˆ˜]×Ø˜\ÙWÝ\›HÝŠÜ™YË™Ù]
+˜˜\ÙWÝ\›‹ˆŠJKœÝš\
+
+KœœÝš\
+‹ÈŠHÜˆÛÛ™šYËš[™™\™[˜ÙWØ˜\ÙWÝ\›ˆYˆ™\K™^XÚ]Ø˜\ÙWÝ\›‚ˆ˜]×Ø˜\ÙWÝ\›H™\K™^XÚ]Ø˜\ÙWÝ\›œÝš\
+
+KœœÝš\
+‹ÈŠBˆÈÜ[ÛÙH™[ˆœ™YHY\ˆ
+
+‹Yœ™YHÛYÜÊH\ÈÙ\™Y[›Ûž[[Ý\ÛHÛˆH™[ˆ™[^HÛ›NÂˆÈ[žH™X\™\ˆ
+]™[ˆHÛÈÝXœØÜš\[ÛˆÙ^JH\È™Z™XÝYÛÈ›Ý]HÙ^[\ÜÈ™YØ\™\ÜÈÙˆÜ™YË‚ˆžN‚ˆœ›ÛH\›Y\×ØÛK›[Ù[È[\ÜÜ[˜ÛÙWÞ™[—Ùœ™YWÜ[[YH\ÈÛØ×Ùœ™YWÜˆÙœ™YWÜHÛØ×Ùœ™YWÜ
+›ÝšY\‹™\K›[Ù[
+Bˆ^Ù\^Ù\[ÛŽ‚ˆÙœ™YWÜH›Û™BˆYˆÙœ™YWÜ\È›Ý›Û™N‚ˆ\WÚÙ^HHÙœ™YWÜÈ˜\WÚÙ^H—Bˆ˜]×Ø˜\ÙWÝ\›HÝŠÙœ™YWÜÈ˜˜\ÙWÝ\›—JKœœÝš\
+‹ÈŠBˆYˆ›ÝšY\ˆOH˜XÝX[Ž‚ˆÚ]ÛÛ^X‹œÝ\™\ÜÊ^Ù\[ÛŠN‚ˆœ›ÛH\›Y\×ØÛK˜]][\Ü
+ˆPÕPSÓÐÐSÓ“ÐUUÔPÑRÓT‹\×ØXÝX[ÛØØ[Ø˜\ÙWÝ\››Ü›X[^™WØXÝX[Ø˜\ÙWÝ\›ˆ
+Bˆ˜]×Ø˜\ÙWÝ\›H›Ü›X[^™WØXÝX[Ø˜\ÙWÝ\›
+˜]×Ø˜\ÙWÝ\›
+BˆYˆ›Ý\WÚÙ^H[™\×ØXÝX[ÛØØ[Ø˜\ÙWÝ\›
+˜]×Ø˜\ÙWÝ\›
+N‚ˆ\WÚÙ^HHPÕPSÓÐÐSÓ“ÐUUÔPÑRÓT‚ˆYˆ›Ý\WÚÙ^N‚ˆšYYÜÛÝ\˜Ù\ÈH\Ý
+ÛÛ™šYË˜\WÚÙ^WÙ[—Ý˜\œÊH
+È
+È™Ú]]ÚÙ[ˆ—HYˆ›ÝšY\ˆOH˜ÛÜ[Ýˆ[ÙH×JBˆÙÙÙ\‹™XYÊœ™\ÛÛ™WÜ›ÝšY\—ØÛY[ˆ›ÝšY\ˆ	\È\È›ÈTHÙ^HÛÛ™šYÝ\™Y
+šYYˆ	\ÊH‹ˆ›ÝšY\‹‹‹š›Ú[ŠšYYÜÛÝ\˜Ù\ÊJBˆ™]\›ˆ›Û™K›Û™Bˆ˜\ÙWÝ\›HÝ×ÛÜ[˜ZWØ˜\ÙWÝ\›
+˜]×Ø˜\ÙWÝ\›
+BˆÈ^XÚ]˜\ÙWÝ\›Ý™\œšYNˆH˜[˜XÚ×Û[Ù[ØÝ\ÝÛWÜ›ÝšY\œÈ[žHÚ[[™ÈHZ[Z[ˆ˜[YH[Ù]Ú\™K‚ˆYˆ™\K™^XÚ]Ø˜\ÙWÝ\›‚ˆ˜\ÙWÝ\›HÝ×ÛÜ[˜ZWØ˜\ÙWÝ\›
+™\K™^XÚ]Ø˜\ÙWÝ\›œÝš\
+
+KœœÝš\
+‹ÈŠJBˆš[˜[Û[Ù[HÛ›Ü›X[^™WÜ™\ÛÛ™YÛ[Ù[
+™\K›[Ù[ÜˆÙÙ]Ø]^Û[Ù[Ù›Ü—Ü›ÝšY\Š›ÝšY\ŠK›ÝšY\ŠBˆYˆ›ÝšY\ˆOH™Ù[Z[šHŽ‚ˆœ›ÛHYÙ[™Ù[Z[šWÛ˜]]™WØY\\ˆ[\ÜÙ[Z[šS˜]]™PÛY[\×Û˜]]™WÙÙ[Z[šWØ˜\ÙWÝ\›ˆYˆ\×Û˜]]™WÙÙ[Z[šWØ˜\ÙWÝ\›
+˜\ÙWÝ\›
+N‚ˆÛY[HÙ[Z[šS˜]]™PÛY[
+\WÚÙ^OX\WÚÙ^K˜\ÙWÝ\›X˜\ÙWÝ\›
+BˆÙÙÙ\‹™XYÊœ™\ÛÛ™WÜ›ÝšY\—ØÛY[ˆ	\È
+	\ÊH‹›ÝšY\‹š[˜[Û[Ù[
+Bˆ™]\›ˆÜ›Ý]WØÛY[
+™\KÛY[š[˜[Û[Ù[
+BˆXY\œÈHÙ[™Ú[ÙY˜][ÚXY\œÊ˜\ÙWÝ\››ÝšY\‹\×Ýš\Ú[Û\™\Kš\×Ýš\Ú[Û‹ZOUYJBˆÛY[HØÜ™X]WÛÜ[˜ZWØÛY[
+\WÚÙ^OX\WÚÙ^K˜\ÙWÝ\›X˜\ÙWÝ\›
+ŠŠÈ™Y˜][ÚXY\œÈŽˆXY\œßHYˆXY\œÈ[ÙHßJJBˆÈÛÜ[ÝÔMJÈ[Ù[È
+^Ù\ÜMK[Z[šJH\™HÛ›H™XXÚX›HšXHH™\ÜÛœÙ\ÈTNÂˆÈÜ˜\ÛÈØ[ÛJ
+H˜[œÜ\™[H›Ý]\È›ÝYÚ™\ÜÛœÙ\ËœÝ™X[J
+K‚ˆYˆ›ÝšY\ˆOH˜ÛÜ[Ýˆ[™š[˜[Û[Ù[[™›Ý™\Kœ˜]×ØÛÙ^‚ˆÚ]ÛÛ^X‹œÝ\™\ÜÊ[\Ü\œ›ÜŠN‚ˆœ›ÛH\›Y\×ØÛK›[Ù[È[\ÜÜÚÝ[Ý\ÙWØÛÜ[ÝÜ™\ÜÛœÙ\×Ø\BˆYˆÜÚÝ[Ý\ÙWØÛÜ[ÝÜ™\ÜÛœÙ\×Ø\Jš[˜[Û[Ù[
+N‚ˆÙÙÙ\‹™XYÊœ™\ÛÛ™WÜ›ÝšY\—ØÛY[ˆÛÜ[Ý[Ù[	\È™YYÈ‚ˆ”™\ÜÛœÙ\ÈTH8 %Ü˜\[™ÈÚ]ÛÙ^]^[X\žPÛY[‹š[˜[Û[Ù[
+BˆÛY[HÛÙ^]^[X\žPÛY[
+ÛY[š[˜[Û[Ù[
+BˆÈ\WÛ[ÙH[™[™È›Üˆ[žHTKZÙ^H›ÝšY\ˆ
+\™XÝÜ[RH
+ÈÛÙ^[Ù[
+H[™[›ÜXË]Ú\™BˆÈ[™Ú[È
+\KšÚ[ZK˜ÛÛKØÛÙ[™ËØ[›ÜXÈØ]]Ø^\ÊHÚ]Ý]\‹\›ÝšY\ˆœ˜[˜Ú\Ë‚ˆÛY[HÝÜ˜\Ý˜[œÜÜ
+™\KÛY[š[˜[Û[Ù[˜]×Ø˜\ÙWÝ\›\WÚÙ^JBˆÙÙÙ\‹™XYÊœ™\ÛÛ™WÜ›ÝšY\—ØÛY[ˆ	\È
+	\ÊH‹›ÝšY\‹š[˜[Û[Ù[
+Bˆ™]\›ˆÜ›Ý]WØÛY[
+™\KÛY[š[˜[Û[Ù[
+B‚‚™YˆÜ™\ÛÛ™WÙ^\›˜[Ü›ØÙ\Ü×Øœ˜[˜Ú
+™\NˆÔ™\ÛÛ™T™\]Y\ÝÜ™YÎˆXÝÜÝ‹[žWJHOˆÔ™\ÛÛ™T™\Ý[‚ˆˆˆ”“Õ’QT—Ô‘QÒTÕ–H^\›˜[Ü›ØÙ\ÜØ›ÝšY\œËÙ\™YšXHZ\ˆ™YÚ\Ý\™Y›Ùš[Kˆˆˆ‚ˆ›ÝšY\ˆH™\Kœ›ÝšY\‚ˆš[˜[Û[Ù[HÛ›Ü›X[^™WÜ™\ÛÛ™YÛ[Ù[
+ˆ™\K›[Ù[Üˆ
+™\K›XZ[—Ü[[YK™Ù]
+›[Ù[ŠHYˆ™\K›XZ[—Ü[[YH[ÙH›Û™JHÜˆÜ™XYÛXZ[—Û[Ù[Ù›Ü—Ø]^
+
+Kˆ›ÝšY\‹ˆ
+BˆÈÙ^YYÛˆH™YÚ\Ý\™Y›Ùš[K›ÝH›ÝšY\ˆ˜[YKÛÈ[ˆÝ][Ù‹]™YHPÔ›ÝšY\ˆ™XXÚ\ÂˆÈH]^[X\žH]
+ÛÛ\™\ÜÚ[Û‹š\Ú[Û‹˜XÚÙÜ›Ý[™™]šY]ÊH^XÝHZÙHH[‹]™YHÛ™K‚ˆžN‚ˆœ›ÛH›ÝšY\œÈ[\ÜÙ]Ü›ÝšY\—Ü›Ùš[H\ÈÙÙ]Ü›ÝšY\—Ü›Ùš[BˆÙ^›Ø×Ü›Ùš[HHÙÙ]Ü›ÝšY\—Ü›Ùš[J›ÝšY\ŠBˆ^Ù\^Ù\[ÛŽ‚ˆÙ^›Ø×Ü›Ùš[HH›Û™BˆYˆÙ^›Ø×Ü›Ùš[H\È›Ý›Û™N‚ˆ\WÚÙ^HHÝŠÜ™YË™Ù]
+˜\WÚÙ^H‹ˆŠJKœÝš\
+
+Bˆ˜\ÙWÝ\›HÝŠÜ™YË™Ù]
+˜˜\ÙWÝ\›‹ˆŠJKœÝš\
+
+BˆYˆ›Ýš[˜[Û[Ù[‚ˆÙÙÙ\‹Ø\›š[™Êœ™\ÛÛ™WÜ›ÝšY\—ØÛY[ˆ	\È™\]Y\ÝY]›È[Ù[Ø\È›ÝšYYÜˆÛÛ™šYÝ\™Y‹›ÝšY\ŠBˆ™]\›ˆ›Û™K›Û™BˆYˆ›Ý\WÚÙ^HÜˆ›Ý˜\ÙWÝ\›‚ˆÙÙÙ\‹Ø\›š[™Êœ™\ÛÛ™WÜ›ÝšY\—ØÛY[ˆ	\È™\]Y\ÝY]^\›˜[›ØÙ\ÜÈÜ™Y[X[È\™H[˜ÛÛ\]H‹›ÝšY\ŠBˆ™]\›ˆ›Û™K›Û™BˆžN‚ˆÛY[HÙ^›Ø×Ü›Ùš[K˜Ü™X]WØÛY[
+ˆ\WÚÙ^OX\WÚÙ^K˜\ÙWÝ\›X˜\ÙWÝ\›ˆÛÛ[X[™\ÝŠÜ™YË™Ù]
+˜ÛÛ[X[™‹ˆŠJKœÝš\
+
+HÜˆ›Û™K\™ÜÏ[\Ý
+Ü™YË™Ù]
+˜\™ÜÈŠHÜˆ×JJBˆ^Ù\^Ù\[ÛŽ‚ˆÙÙÙ\‹Ø\›š[™Êœ™\ÛÛ™WÜ›ÝšY\—ØÛY[ˆ›Ùš[H	\ˆ˜Z[YÈÜ™X]H[ˆ^\›˜[\›ØÙ\ÜÈÛY[‹ˆ›ÝšY\‹^×Ú[™›ÏUYJBˆÛY[H›Û™BˆYˆÛY[\È›Ý›Û™N‚ˆÙÙÙ\‹™XYÊœ™\ÛÛ™WÜ›ÝšY\—ØÛY[ˆ	\È
+	\ÊH‹›ÝšY\‹š[˜[Û[Ù[
+Bˆ™]\›ˆÜ›Ý]WØÛY[
+™\KÛY[š[˜[Û[Ù[
+BˆÛÙ×ÛÛ˜ÙWÙXYÊÓÑÑÑQÕS”ÕTÔ•QÑV“Ð×ÒÑVTË›ÝšY\‹ˆœ™\ÛÛ™WÜ›ÝšY\—ØÛY[ˆ^\›˜[\›ØÙ\ÜÈ›ÝšY\ˆ	\È›Ý‚ˆ™\™XÝHÝ\ÜY‹›ÝšY\ŠBˆ™]\›ˆ›Û™K›Û™B‚‚™YˆÜ™\ÛÛ™WÜ™YÚ\ÝžWØœ˜[˜Ú
+™\NˆÔ™\ÛÛ™T™\]Y\Ý
+HOˆÔ™\ÛÛ™T™\Ý[‚ˆˆˆ”“Õ’QT—Ô‘QÒTÕ–H›ÝšY\œË\Ü]ÚYÛˆ]]Ý\XÈ[šÛ›ÝÛˆ›ÝšY\œÈÙÈÛ˜ÙKˆˆˆ‚ˆ›ÝšY\ˆH™\Kœ›ÝšY\‚ˆžN‚ˆœ›ÛH\›Y\×ØÛK˜]][\Ü
+ˆ“Õ’QT—Ô‘QÒTÕ–K™\ÛÛ™WØ\WÚÙ^WÜ›ÝšY\—ØÜ™Y[X[Ëˆ™\ÛÛ™WÙ^\›˜[Ü›ØÙ\Ü×Ü›ÝšY\—ØÜ™Y[X[Ëˆ
+Bˆ^Ù\[\Ü\œ›ÜŽ‚ˆÙÙÙ\‹™XYÊš\›Y\×ØÛK˜]]›Ý]˜Z[X›H›Üˆ›ÝšY\ˆ	\È‹›ÝšY\ŠBˆ™]\›ˆ›Û™K›Û™BˆÛÛ™šYÈH“Õ’QT—Ô‘QÒTÕ–K™Ù]
+›ÝšY\ŠBˆYˆÛÛ™šYÈ\È›Û™N‚ˆÛÙ×ÛÛ˜ÙWÙXYÊÓÑÑÑQÕS’Ó“ÕÓ—Ô“Õ’QT—ÒÑVTË›ÝšY\‹ˆœ™\ÛÛ™WÜ›ÝšY\—ØÛY[ˆ[šÛ›ÝÛˆ›ÝšY\ˆ	\ˆ‹›ÝšY\ŠBˆ™]\›ˆ›Û™K›Û™Bˆ]]Ý\HHÛÛ™šYË˜]]Ý\BˆYˆ]]Ý\HOH˜\WÚÙ^HŽ‚ˆ™]\›ˆÜ™\ÛÛ™WØ\WÚÙ^WØœ˜[˜Ú
+™\KÛÛ™šYË™\ÛÛ™WØ\WÚÙ^WÜ›ÝšY\—ØÜ™Y[X[ÊBˆYˆ]]Ý\HOH™^\›˜[Ü›ØÙ\ÜÈŽ‚ˆ™]\›ˆÜ™\ÛÛ™WÙ^\›˜[Ü›ØÙ\Ü×Øœ˜[˜Ú
+™\K™\ÛÛ™WÙ^\›˜[Ü›ØÙ\Ü×Ü›ÝšY\—ØÜ™Y[X[Ê›ÝšY\ŠJBˆYˆ]]Ý\HOH™\^Ž‚ˆÛY[š[˜[Û[Ù[HØZ[Ý™\^ØÛY[
+›ÝšY\‹™\K›[Ù[
+Bˆ[Yˆ]]Ý\HOH˜]Ü×ÜÙÈŽ‚ˆÛY[š[˜[Û[Ù[HØZ[Ø™Y›ØÚ×ØÛY[
+›ÝšY\‹™\K›[Ù[˜]×ØÛÙ^\™\Kœ˜]×ØÛÙ^
+Bˆ[Yˆ]]Ý\H[ˆÈ›Ø]]Ù]šXÙWØÛÙH‹›Ø]]Ù^\›˜[ŸN‚ˆÈ›Ý\ÈÈÜ[˜ZKXÛÙ^ÈZK[Ø]][™XYH™]\›™Yœ›ÛHZ\ˆ^XÚ]œ˜[˜Ú\Ë‚ˆÛÙ×ÛÛ˜ÙWÙXYÊÓÑÑÑQÕS”ÕTÔ•QÓÐUUÒÑVTË›ÝšY\‹ˆœ™\ÛÛ™WÜ›ÝšY\—ØÛY[ˆÐ]]›ÝšY\ˆ	\È›Ý‚ˆ™\™XÝHÝ\ÜYžH	Ø]]ÉÈ‹›ÝšY\ŠBˆ™]\›ˆ›Û™K›Û™Bˆ[ÙN‚ˆÈHš\œÝØØÝ\œ™[˜ÙHÝ\™˜XÙ\ÈH™X[ØÚ[XKYšYYÎÈ\‹XØ[™]šY\ÈÝ^HÚ[[‚ˆÛÙ×ÛÛ˜ÙWÙXYÊÓÑÑÑQÕS’S‘QÐUUTWÒÑVTË
+]]Ý\K›ÝšY\ŠKˆœ™\ÛÛ™WÜ›ÝšY\—ØÛY[ˆ[š[™Y]]Ý\H	\È›Üˆ	\È‹ˆ]]Ý\K›ÝšY\ŠBˆ™]\›ˆ›Û™K›Û™Bˆ™]\›ˆÜ›Ý]WØÛY[
+™\KÛY[š[˜[Û[Ù[
+HYˆÛY[\È›Ý›Û™H[ÙH
+›Û™K›Û™JB‚‚ˆÈ^XÚ]›ÝšY\œÈÚ]HYXØ]Yœ˜[˜ÚÈ[ž][™È[ÙH˜[È›ÝYÚÈ˜[YYÝ\ÝÛBˆÈ›ÝšY\œÈ8¡¤ˆ^\™KY›Ý[™žH8¡¤ˆ“Õ’QT—Ô‘QÒTÕ–H
+Ü™\ˆ™\Ù\™Yœ›ÛHHÜšYÚ[˜[Y‹XÚZ[ŠK‚—ÑVPÒUÔ“Õ’QT—Ð”SÒTÎˆXÝÜÝ‹Ø[X›VÖ×Ô™\ÛÛ™T™\]Y\ÝKÔ™\ÛÛ™T™\Ý[WHHÂˆ˜]]ÈŽˆÜ™\ÛÛ™WØ]]×Øœ˜[˜Úˆ›Ü[œ›Ý]\ˆŽˆÜ™\ÛÛ™WÛÜ[œ›Ý]\—Øœ˜[˜Úˆ››Ý\ÈŽˆÜ™\ÛÛ™WÛ›Ý\×Øœ˜[˜Úˆ›Ü[˜ZKXÛÙ^ŽˆÜ™\ÛÛ™WÛÜ[˜ZWØÛÙ^Øœ˜[˜ÚˆžZK[Ø]]ŽˆÜ™\ÛÛ™WÞZWÛØ]]Øœ˜[˜Úˆ˜Ý\ÝÛHŽˆÜ™\ÛÛ™WØÝ\ÝÛWØœ˜[˜ÚŸB‚‚™Yˆ™\ÛÛ™WÜ›ÝšY\—ØÛY[
+ˆ›ÝšY\ŽˆÝ‹[Ù[ˆÝˆH›Û™K\Þ[˜×Û[ÙNˆ›ÛÛH˜[ÙK˜]×ØÛÙ^ˆ›ÛÛH˜[ÙKˆ^XÚ]Ø˜\ÙWÝ\›ˆÝˆH›Û™K^XÚ]Ø\WÚÙ^NˆÝˆH›Û™K\WÛ[ÙNˆÝˆH›Û™KˆXZ[—Ü[[YNˆÜ[Û˜[ÑXÝÜÝ‹[žWWHH›Û™K\×Ýš\Ú[ÛŽˆ›ÛÛH˜[ÙKˆ\ÚÎˆÜ[Û˜[ÜÝ—HH›Û™KŠHOˆ\VÓÜ[Û˜[Ð[žWKÜ[Û˜[ÜÝ—WN‚ˆˆˆÙ[˜[›Ý]\Žˆ™]\›ˆHÛÛ™šYÝ\™YÛY[
+]]˜\ÙHT“TH›Ü›X]
+H›ÜˆH›ÝšY\ˆ
+ÈÜ[Û˜[[Ù[‚ˆHÛY[[Ø^\È^ÜÙ\È˜Ú]˜ÛÛ\][ÛœË˜Ü™X]J
+XÈÛÙ^Ô™\ÜÛœÙ\È›ÝšY\œÈÙ][ˆY\\‹‚ˆ›ÝšY\˜ˆZ[Z[ˆ˜[YKÝ\ÝÛN˜[YO˜˜Ý\ÝÛHˆ
+ÔSRWÐTÑWÕT“
+ÈÔSRWÐTWÒÑVJHÜˆ˜]]È‚ˆ
+[]]ËY]XÝ[ÛˆÚZ[ŠKˆ[Ù[S›Û™X8¡¤ˆ›ÝšY\‰ÜÈY˜][]^[Ù[ˆ˜]×ØÛÙ^8¡¤ˆ˜\™HÜ[RBˆÛY[›Üˆ™\ÜÛœÙ\ËœÝ™X[J
+XØ[\œËˆ\WÛ[ÙX›Ü˜Ù\È˜ÛÙ^Ü™\ÜÛœÙ\È‹È˜Ú]ØÛÛ\][ÛœÈ‹Âˆ˜[›ÜX×ÛY\ÜØYÙ\Èˆ[œÝXYÙˆ]]ËY]XÝˆ™]\›œÈ
+ÛY[™\ÛÛ™YÛ[Ù[
+HÜˆ
+›Û™K›Û™JKˆˆˆ‚ˆÝ˜[Y]WÜ›ÞWÙ[—Ý\›Ê
+BˆÈÙY\H™KX[X\È˜[YHÛÈHÝ\ÝÛWÜ›ÝšY\œÈ[žH˜[YYZÙHHZ[Z[ˆ[X\ÂˆÈ
+K™ËˆšÚ[ZHˆ8¡¤ˆšÚ[ZKXÛÙ[™ÈŠH\ÈÝ[™XXÚX›HšXHH˜[YYXÝ\ÝÛHœ˜[˜Ú‚ˆÜšYÚ[˜[Ü›ÝšY\ˆH
+›ÝšY\ˆÜˆˆŠKœÝš\
+
+K›ÝÙ\Š
+Bˆ›ÝšY\ˆHÛ›Ü›X[^™WØ]^Ü›ÝšY\Š›ÝšY\ŠBˆÈ[ÐHÚÚÙ\Ú[ˆ›[ØHˆ\È›Ý[ˆ›ÝšY\ŽÈ™\ÛÛ™HÈHYÙÜ™YØ]ÜˆÛÈ\™XÝØ[\œÈÛ‰ÝˆÈXYY[™[ˆ[šÛ›ÝÛ‹\›ÝšY\‹ˆ[œ™\ÛÛ˜X›H™\Ù]8¡¤ˆX]™H[ÝXÚY›ÜˆH›Ü›X[XYÛ›ÜÝXË‚ˆYˆ›ÝšY\ˆOH›[ØHŽ‚ˆØYÙ×Ü›ÝšY\‹ØYÙ×Û[Ù[HÜ™\ÛÛ™WÛ[ØWØYÙÜ™YØ]ÜŠ[Ù[
+BˆYˆØYÙ×Ü›ÝšY\ˆ[™ØYÙ×Û[Ù[‚ˆÜšYÚ[˜[Ü›ÝšY\ˆHØYÙ×Ü›ÝšY\‹œÝš\
+
+K›ÝÙ\Š
+Bˆ›ÝšY\ˆHÛ›Ü›X[^™WØ]^Ü›ÝšY\ŠØYÙ×Ü›ÝšY\ŠBˆ[Ù[HØYÙ×Û[Ù[ˆÈH[ØN‹ËÈ˜XØYH[™Ú[ÚÙ^H™[Û™ÈÈHš\X[[[YK›ÝHYÙÜ™YØ]Ü‹‚ˆYˆ^XÚ]Ø˜\ÙWÝ\›[™ÝŠ^XÚ]Ø˜\ÙWÝ\›
+K›ÝÙ\Š
+KœÝ\ÝÚ]
+›[ØN‹ËÈŠN‚ˆ^XÚ]Ø˜\ÙWÝ\›H›Û™Bˆ^XÚ]Ø\WÚÙ^HH›Û™BˆÈ[Ù[›ÜˆÛÛ˜Ü™]H›ÝšY\œÎˆØ[\ˆ[Ù[8¡¤ˆØ][ÙÈY˜][
+[\H›ÜˆÐ]]YØ]Y›ÝšY\œÈÚÜÙBˆÈ\ÝÈšY
+H8¡¤ˆÛÛ™šYÝ\™YXZ[ˆ[Ù[
+[ÐH8¡¤ˆYÙÜ™YØ]ÜŠKÙY\[™ÈÐ]]]^\ÚÜÈÙ™ˆHÝ\Lˆ˜[˜XÚË‚ˆÈ^ÛYYˆ]]Ø
+HÝ[HXZ[ˆÛYÈÛÝ[Z\ˆÚ][žHXÚÙY›ÝšY\ŠH[™›Ý\È
+Èš\Ú[Ûˆ
+BˆÈÜ[	ÜÈY\‹X]Ø\™Hš\Ú[Ûˆ™XÛÛ[Y[™][Ûˆ]\ÝÚ[ˆÝ™\ˆH^[Û›H[Ù[
+K‚ˆYˆ›Ý[Ù[[™›ÝšY\ˆOH˜]]Èˆ[™›Ý
+›ÝšY\ˆOH››Ý\Èˆ[™\×Ýš\Ú[ÛŠN‚ˆÈ]]Ø\È[[[Û˜[H^ÛYYˆÜ™\ÛÛ™WØ]]×Ü›Ý]JXZ[—Ü[[YOK‹‹ŠX™]\›œÈH[Ù[Z\™YˆÈÚ]H›ÝšY\ˆ]XÝX[HÙ[XÝYˆ™KYš[[™È[ˆ]]ÈØ[œ›ÛHÜ™XYÛXZ[—Û[Ù[
+
+XØ[‚ˆÈXZÈHÝ[H›ØÙ\ÜËYÛØ˜[[[YH[ÈHY™™\™[›ÝšY\ˆ
+›Üˆ^[\HÛ]YH[Ù[ÛYÈÛ‚ˆÈÛÙ^Ð]]
+H[™Ý™\œšYH]ÛÜœ™XÝH™\ÛÛ™Y[Ù[ˆKˆ[Ù[\™Ý[Y[
+Ø[\ˆÛ™]ÈÚ]ˆÈ^HØ[Y
+H‹ˆ›ÝšY\‰ÜÈØ][ÙÈY˜][8 %ÚX\Ù˜\Ý[Ù[H›ÝšY\ˆ™YÚ\Ý\™YšXBˆÈ›ÝšY\”›Ùš[K™Y˜][Ø]^Û[Ù[ÜˆHYØXÞHÐTWÒÑVWÔ“Õ’QT—ÐUVÓSÑS×ÑSPÒØˆÈXÝˆËˆ\Ù\‰ÜÈXZ[ˆ[Ù[œ›ÛH[Ù[›[Ù[[ˆÛÛ™šYËžX[[ˆ\È\ÈHØYX™X\š[™ÈÝ\›Ü‚ˆÈÐ]]›ÝšY\œÎˆ[ˆZK[Ø]]\Ù\ˆÚ]Ü›ÚËMŒÈÛÛ™šYÝ\™YÙ]ÈÜ›ÚËMŒÈ›Üˆ]HÙ[™\˜][Û‚ˆÈ[œÝXYÙˆÚ[[H›Ü[™ÈÈÚ]]™\ˆÝ\Lˆ˜[˜XÚÈ
+ÌÌNJKˆÚ[ˆHXZ[ˆ›ÝšY\ˆ\È[ÐKˆÈÜ™XYÛXZ[—Û[Ù[Ù›Ü—Ø]^
+
+XÝXœÝ]]\ÈH™\Ù]	ÜÈYÙÜ™YØ]Üˆ[Ù[8 %H™\Ù]SQH\ÂˆÈ™]™\ˆH˜[YÚ\™H[Ù[YÛÈ[œÙ]]^[Ù[ÈY˜][ÈH™\Ù]	ÜÈXÝ[™È[Ù[[œÝXY‚ˆÈXXÚ›ÝšY\ˆœ˜[˜Ú™[ÝÈÙY\ÈH›Û‹Y[\H[Ù[Ú[™]™\ˆH\Ù\ˆ\È
+˜[ž][™ÊˆÛÛ™šYÝ\™YˆÈ8 %›È›ÝšY\‹\ÜXÚYšXÈ[\K[[Ù[ÝX\™È™YYYˆÚ[ˆH\Ù\ˆ\È“ÕS‘ÈÛÛ™šYÝ\™Y
+œ™\ÚˆÈ[œÝ[XZ[—Û[Ù[[ÛÈ[\JKHœ˜[˜Ú\ÈÝ[]Z\ˆÝÛˆZ\ÜÚ[™ËXÜ™Y[X[È™]\›œÈ[™ˆÈÜ™\ÛÛ™WØ]]×Ü›Ý]X˜[È›ÝYÚÈHÝ\LˆÚZ[ˆ\È™Y›Ü™KˆÈ“Õ™KYš[H›[šÈ]]ØˆÈ™\]Y\Ýœ›ÛHHÛÛ™šYËÛXZ[ˆY˜][\™KˆÛ]YH[Ù[Ù[ÈÛÙ^Y\ˆHXZ[ˆ[™H™[ˆÈ˜XÚÈÈÜMKJKˆ]Ü™\ÛÛ™WØ]]×Ü›Ý]J
+H™]\›ˆHXÝX[Ý\œ™[[[YH[Ù[Ú[ˆHØ[\ˆYˆÈ›Ý^XÚ]H™\]Y\ÝÛ™Kˆ
+ÈÛÛ\™\ÜÚ[Û‹XÝ\œ™[[[Ù[
+H›Ý\È
+Èš\Ú[Ûˆ\ÈHÛ™HØ\™K[Ý]ˆBˆÈœ˜[˜Ú™[ÝÈ™\ÛÛ™\È]È[Ù[œ›ÛHHÜ[	ÜÈY\‹X]Ø\™Hš\Ú[Ûˆ™XÛÛ[Y[™][Û‚ˆÈ
+ÝžWÛ›Ý\Êš\Ú[ÛHYJX
+K[™š[˜[Û[Ù[H[Ù[ÜˆY˜][YX[œÈ[ž][™È™KYš[YˆÈ\™HÚ[œÈÝ™\ˆ]ˆHXZ[ˆÚ][Ù[\È›Ý][™[H^[Û›H
+K™ËˆH™œ™YXÚ]ÒÕJKÛÂˆÈ™KYš[[™È]Ù[™ÈH[XYÙHÈH[Ù[]Ø[››ÝXØÙ\Û™H[™HÜ[ËˆX]™BˆÈ[Ù[[œÙ][™]HÜ[ÛÝ›ÝYÚÈÛ›H[ˆ^XÚ]Ø[\ˆ[Ù[X^HÝ™\œšYH]‚ˆ[Ù[HÙÙ]Ø]^Û[Ù[Ù›Ü—Ü›ÝšY\Š›ÝšY\ŠHÜˆÜ™XYÛXZ[—Û[Ù[Ù›Ü—Ø]^
+
+HÜˆ[Ù[ˆ™\HHÔ™\ÛÛ™T™\]Y\Ý
+ˆ›ÝšY\‹ÜšYÚ[˜[Ü›ÝšY\‹[Ù[\Þ[˜×Û[ÙK˜]×ØÛÙ^ˆ^XÚ]Ø˜\ÙWÝ\›^XÚ]Ø\WÚÙ^K\WÛ[ÙKXZ[—Ü[[YK\×Ýš\Ú[Û‹\ÚËˆ
+Bˆœ˜[˜ÚHÑVPÒUÔ“Õ’QT—Ð”SÒTË™Ù]
+›ÝšY\ŠBˆYˆœ˜[˜Ú\È›Ý›Û™N‚ˆ™]\›ˆœ˜[˜Ú
+™\JBˆÈ˜[YYÝ\ÝÛH›ÝšY\œÎÈ[ˆ[\Ü\œ›Üˆ[ž]Ú\™H[ˆH\›H˜[È›ÝYÚÈHZ[Z[œË‚ˆžN‚ˆ™\Ý[HÜ™\ÛÛ™WÛ˜[YYØÝ\ÝÛWØœ˜[˜Ú
+™\JBˆ^Ù\[\Ü\œ›ÜŽ‚ˆ™\Ý[H›Û™BˆYˆ™\Ý[\È›Ý›Û™N‚ˆ™]\›ˆ™\Ý[ˆYˆ›ÝšY\ˆOH˜^\™KY›Ý[™žHŽ‚ˆ™]\›ˆÜ™\ÛÛ™WØ^\™WÙ›Ý[™žWØœ˜[˜Ú
+™\JBˆ™]\›ˆÜ™\ÛÛ™WÜ™YÚ\ÝžWØœ˜[˜Ú
+™\JB‚‚ˆÈ8¥ 8¥ X›XÈTH8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ 8¥ ‚™YˆÙ]Ý^Ø]^[X\žWØÛY[
+\ÚÎˆÝˆHˆ‹
+‹XZ[—Ü[[YNˆÜ[Û˜[ÑXÝÜÝ‹[žWWHH›Û™JHOˆ\VÓÜ[Û˜[ÓÜ[RWKÜ[Û˜[ÜÝ—WN‚ˆˆˆ”™]\›ˆ
+ÛY[Y˜][Û[Ù[ÜÛYÊH›Üˆ^[Û›H]^\ÚÜÎÈ\ÚØÙ[XÝÈ]^[X\žK\ÚÏˆÝ™\œšY\Ëˆˆˆ‚ˆ›ÝšY\‹[Ù[˜\ÙWÝ\›\WÚÙ^K\WÛ[ÙHHÜ™\ÛÛ™WÝ\Ú×Ü›ÝšY\—Û[Ù[
+\ÚÈÜˆ›Û™JBˆ™]\›ˆ™\ÛÛ™WÜ›ÝšY\—ØÛY[
+ˆ›ÝšY\‹[Ù[[[Ù[^XÚ]Ø˜\ÙWÝ\›X˜\ÙWÝ\›^XÚ]Ø\WÚÙ^OX\WÚÙ^Kˆ\WÛ[ÙOX\WÛ[ÙKXZ[—Ü[[YO[XZ[—Ü[[YKˆ
+B‚‚—Õ’TÒSÓ—ÐUU×Ô“Õ’QT—ÓÔ‘TˆH
+›Ü[œ›Ý]\ˆ‹››Ý\È‹™Y\[™œ˜HŠB‚‚™YˆÛXZ[—Û[Ù[ÜÝ\Ü×Ýš\Ú[ÛŠ›ÝšY\ŽˆÝ‹[Ù[ˆÜ[Û˜[ÜÝ—JHOˆ›ÛÛ‚ˆˆˆ•YHÚ[ˆ›ÝšY\˜Ø[Ù[\ÈÛ›ÝÛˆÈXØÙ\[XYÙH[œ]È[šÛ›ÝÛˆØ\Xš[]H8¡¤ˆYH
+][\HØ[
+Kˆˆˆ‚ˆžN‚ˆœ›ÛHYÙ[š[XYÙWÜ›Ý][™È[\ÜÛÛÚÝ\ÜÝ\Ü×Ýš\Ú[Û‚ˆœ›ÛH\›Y\×ØÛK˜ÛÛ™šYÈ[\ÜØYØÛÛ™šY×Ü™XYÛ›Bˆ^Ù\[\Ü\œ›ÜŽ‚ˆ™]\›ˆYBˆžN‚ˆÝ\ÜÈHÛÛÚÝ\ÜÝ\Ü×Ýš\Ú[ÛŠ›ÝšY\‹[Ù[ØYØÛÛ™šY×Ü™XYÛ›J
+JBˆ^Ù\^Ù\[ÛŽˆÈ˜YÛXNˆ›ÈÛÝ™\ˆHY™[œÚ]™Bˆ™]\›ˆYBˆYˆÝ\ÜÈ\È›Û™N‚ˆÈ[šÛ›ÝÛˆ\™\\H›ÝšY\œÈ™[XZ[ˆ\›Z\ÜÚ]™K]HÛ›ÝÛˆ\™XÝˆÈ^[Û›H[™Ú[]\Ý›Ý™XÙZ]™H[XYÙHÛÛ[Y\™[H™XØ]\ÙHBˆÈØ\Xš[]HØ][ÙÈ\ÈÙ™›[™HÜˆÛÛ‚ˆ™]\›ˆ›ÝšY\‹œÝš\
+
+K›ÝÙ\Š
+H›Ý[ˆÒÓ“ÕÓ—ÕVÓÓ“WÕÒS—ÕSÐUSÑÕQQˆ™]\›ˆ›ÛÛ
+Ý\ÜÊB‚‚™YˆÛ›Ü›X[^™WÝš\Ú[Û—Ü›ÝšY\Š›ÝšY\ŽˆÜ[Û˜[ÜÝ—JHOˆÝŽ‚ˆ™]\›ˆÛ›Ü›X[^™WØ]^Ü›ÝšY\Š›ÝšY\ŠB‚‚™YˆÙY\[™œ˜WÜÝšXÝÝš\Ú[Û—Ø˜XÚÙ[™
+[Ù[ˆÜ[Û˜[ÜÝ—JHOˆ\VÓÜ[Û˜[Ð[žWKÜ[Û˜[ÜÝ—WN‚ˆˆˆ‘Y\[™œ˜Hš\Ú[ÛŽˆY˜][[Ù[\È\ØÛÝ™\™Y]™HšXHY˜][Ýš\Ú[Û—Û[Ù[
+
+HÛÈ›È\™ÛÙYYØ[ˆ›Ýˆˆˆ‚ˆš\Ú[Û—Û[Ù[H[Ù[ÜˆÜ™\ÛÛ™WÜ›ÝšY\—Ýš\Ú[Û—ÙY˜][
+™Y\[™œ˜HŠBˆYˆ›Ýš\Ú[Û—Û[Ù[‚ˆÙÙÙ\‹™XYÊ•š\Ú[Ûˆ]]ËY]XÝˆY\[™œ˜HØ][ÙÈ[œ™XXÚX›HÜˆ™]\›™Y›Èš\Ú[Û‹]YÙÙY[Ù[È8 %ÚÚ\[™ÈŠBˆ™]\›ˆ›Û™K›Û™Bˆ™]\›ˆ™\ÛÛ™WÜ›ÝšY\—ØÛY[
+™Y\[™œ˜H‹š\Ú[Û—Û[Ù[\×Ýš\Ú[ÛUYJB‚‚ˆÈÝšXÝ
+^XÚ]H™\]Y\ÝY
+Hš\Ú[Ûˆ˜XÚÙ[™ÈžH›Ü›X[^™Y›ÝšY\ˆ˜[YKˆ›Ý\ÈUTÕÛÂˆÈ›ÝYÚ™\ÛÛ™WÜ›ÝšY\—ØÛY[ÛÈ[›ÜXËÊˆXÚÜÈÜ˜\ÛÈÝŒKÛY\ÜØYÙ\È
+H˜\™HÝžWÛ›Ý\ÂˆÈÛY[ÊKˆÜ[˜ZKXÛÙ^\È›ÈØY™HY˜][[Ù[ÈØ[\œÈÙ]]^[X\žK\ÚÏ‹›[Ù[‚—ÔÕ’PÕÕ’TÒSÓ—ÐPÒÑS‘ÎˆXÝÜÝ‹Ø[X›VÖÓÜ[Û˜[ÜÝ—WK\VÓÜ[Û˜[Ð[žWKÜ[Û˜[ÜÝ—WWWHHÂˆ˜ÛÜ[ÝŽˆ[X™H[Ù[ˆ™\ÛÛ™WÜ›ÝšY\—ØÛY[
+˜ÛÜ[Ý‹[Ù[\×Ýš\Ú[ÛUYJKˆ›Ü[œ›Ý]\ˆŽˆ[X™H[Ù[ˆÝžWÛÜ[œ›Ý]\Š[Ù[[[Ù[
+Kˆ››Ý\ÈŽˆ[X™H[Ù[ˆ™\ÛÛ™WÜ›ÝšY\—ØÛY[
+››Ý\È‹[Ù[\×Ýš\Ú[ÛUYJKˆ›Ü[˜ZKXÛÙ^Žˆ[X™H[Ù[ˆ™\ÛÛ™WÜ›ÝšY\—ØÛY[
+›Ü[˜ZKXÛÙ^‹[Ù[\×Ýš\Ú[ÛUYJKˆ˜[›ÜXÈŽˆ[X™H[Ù[ˆÝžWØ[›ÜXÊ
+Kˆ™Y\[™œ˜HŽˆÙY\[™œ˜WÜÝšXÝÝš\Ú[Û—Ø˜XÚÙ[™ˆ˜Ý\ÝÛHŽˆ[X™H[Ù[ˆÝžWØÝ\ÝÛWÙ[™Ú[
+
+KŸB‚‚™YˆÜ™\ÛÛ™WÜÝšXÝÝš\Ú[Û—Ø˜XÚÙ[™
+›ÝšY\ŽˆÝ‹[Ù[ˆÜ[Û˜[ÜÝ—HH›Û™JHOˆ\VÓÜ[Û˜[Ð[žWKÜ[Û˜[ÜÝ—WN‚ˆ˜XÚÙ[™HÔÕ’PÕÕ’TÒSÓ—ÐPÒÑS‘Ë™Ù]
+Û›Ü›X[^™WÝš\Ú[Û—Ü›ÝšY\Š›ÝšY\ŠJBˆ™]\›ˆ˜XÚÙ[™
+[Ù[
+HYˆ˜XÚÙ[™\È›Ý›Û™H[ÙH
+›Û™K›Û™JB‚‚™YˆÙ]Ø]˜Z[X›WÝš\Ú[Û—Ø˜XÚÙ[™Ê
+HOˆ\ÝÜÝ—N‚ˆˆˆ]˜Z[X›Hš\Ú[Ûˆ˜XÚÙ[™È[ˆ]]Ë\Ù[XÝ[ÛˆÜ™\ˆ
+XÝ]™H›ÝšY\ˆ8¡¤ˆÜ[”›Ý]\ˆ8¡¤ˆ›Ý\È8¡¤ˆY\[™œ˜JK‚‚ˆÚ[™ÛHÛÝ\˜ÙHÙˆ]›ÜˆÙ]\ÛÛØ][™Ë[™[[YH]]Ë\›Ý][™Ë‚ˆˆˆ‚ˆ]˜Z[X›Nˆ\ÝÜÝ—HH×BˆXZ[—Ü›ÝšY\ˆHÜ™XYÛXZ[—Ü›ÝšY\Š
+BˆYˆXZ[—Ü›ÝšY\ˆ[™XZ[—Ü›ÝšY\ˆ›Ý[ˆÈ˜]]È‹ˆŸN‚ˆYˆXZ[—Ü›ÝšY\ˆ[ˆÕ’TÒSÓ—ÐUU×Ô“Õ’QT—ÓÔ‘TŽ‚ˆXZ[—ÛÚÈHÜ™\ÛÛ™WÜÝšXÝÝš\Ú[Û—Ø˜XÚÙ[™
+XZ[—Ü›ÝšY\ŠVÌH\È›Ý›Û™Bˆ[ÙN‚ˆXZ[—ÛÚÈH™\ÛÛ™WÜ›ÝšY\—ØÛY[
+XZ[—Ü›ÝšY\‹Ü™XYÛXZ[—Û[Ù[
+
+JVÌH\È›Ý›Û™BˆYˆXZ[—ÛÚÎ‚ˆ]˜Z[X›K˜\[™
+XZ[—Ü›ÝšY\ŠBˆ›Üˆ[ˆÕ’TÒSÓ—ÐUU×Ô“Õ’QT—ÓÔ‘TŽˆÈÚÚ\Yˆ[™XYHÛÝ™\™YžHXZ[ˆ›ÝšY\‚ˆYˆ›Ý[ˆ]˜Z[X›H[™Ü™\ÛÛ™WÜÝšXÝÝš\Ú[Û—Ø˜XÚÙ[™
+
+VÌH\È›Ý›Û™N‚ˆ]˜Z[X›K˜\[™
+
+Bˆ™]\›ˆ]˜Z[X›B‚‚™YˆÙš[˜[^™WÝš\Ú[Û—ØÛY[
+ˆ™\ÛÛ™YÜ›ÝšY\ŽˆÝ‹Þ[˜×ØÛY[ˆ[žKY˜][Û[Ù[ˆÜ[Û˜[ÜÝ—Kˆ™\ÛÛ™YÛ[Ù[ˆÜ[Û˜[ÜÝ—K\Þ[˜×Û[ÙNˆ›ÛÛŠHOˆ\VÓÜ[Û˜[ÜÝ—KÜ[Û˜[Ð[žWKÜ[Û˜[ÜÝ—WN‚ˆˆˆ\HH^XÚ][Ù[Ý™\œšYH
+[™\Þ[˜ÈÜ˜\[™ÊHÈH™\ÛÛ™Yš\Ú[ÛˆÛY[ˆˆˆ‚ˆYˆÞ[˜×ØÛY[\È›Û™N‚ˆ™]\›ˆ™\ÛÛ™YÜ›ÝšY\‹›Û™K›Û™Bˆš[˜[Û[Ù[H™\ÛÛ™YÛ[Ù[ÜˆY˜][Û[Ù[ˆYˆ\Þ[˜×Û[ÙN‚ˆ\Þ[˜×ØÛY[\Þ[˜×Û[Ù[HÝ×Ø\Þ[˜×ØÛY[
+Þ[˜×ØÛY[š[˜[Û[Ù[\×Ýš\Ú[ÛUYJBˆ™]\›ˆ™\ÛÛ™YÜ›ÝšY\‹\Þ[˜×ØÛY[\Þ[˜×Û[Ù[ˆ™]\›ˆ™\ÛÛ™YÜ›ÝšY\‹Þ[˜×ØÛY[š[˜[Û[Ù[‚‚™YˆÝš\Ú[Û—ÛXZ[—Ü›ÝšY\—ØÛY[
+ˆXZ[—Ü›ÝšY\ŽˆÝ‹XZ[—Û[Ù[ˆÝ‹[[YNˆXÝÜÝ‹[žWK™\ÛÛ™YÛ[Ù[ˆÜ[Û˜[ÜÝ—Kˆ™\ÛÛ™YØ\WÛ[ÙNˆÜ[Û˜[ÜÝ—KŠHOˆ\VÓÜ[Û˜[Ð[žWKÜ[Û˜[ÜÝ—WN‚ˆˆˆ]]ËY]XÝÝ\NˆžHHXZ[ˆ›ÝšY\ŽÈ
+›Û™K›Û™JH˜[È›ÝYÚÈHYÙÜ™YØ]ÜˆÚZ[‹ˆˆˆ‚ˆÈH›ÝšY\ˆš\Ú[ÛˆY˜][
+Ý]XÈÝ™\œšYHÜˆØ][ÙÈ\ØÛÝ™\žJH\ÈH
+šÛ›ÝÛŠˆ][[[Ù[ˆÈ[Ù[ÈH[›™YÚ][Ù[\ÝX[H\Û‰ÝÛÈÛ›H˜[˜XÚÈÈ]Ú[ˆ›ÈY˜][^\ÝË‚ˆ›ÝšY\—Ýš\Ú[Û—ÙY˜][HÜ™\ÛÛ™WÜ›ÝšY\—Ýš\Ú[Û—ÙY˜][
+XZ[—Ü›ÝšY\ŠBˆš\Ú[Û—Û[Ù[H›ÝšY\—Ýš\Ú[Û—ÙY˜][ÜˆXZ[—Û[Ù[ˆYˆXZ[—Ü›ÝšY\ˆOH››Ý\ÈŽ‚ˆÈ›Ý\ÈXÚÜÈ]Èš\Ú[Ûˆ[Ù[œ›ÛHÜ[Y\‹X]Ø\™HÛÝÈ[œÚYHÝžWÛ›Ý\Êš\Ú[ÛUYJNÂˆÈ\ÜÚ[™ÈHÚ][Ù[ÛÝ[Ý™\œšYH][™ˆÛ›H]^[X\žKš\Ú[Û‹›[Ù[X^K‚ˆÞ[˜×ØÛY[Y˜][Û[Ù[HÜ™\ÛÛ™WÜÝšXÝÝš\Ú[Û—Ø˜XÚÙ[™
+XZ[—Ü›ÝšY\‹™\ÛÛ™YÛ[Ù[Üˆ›ÝšY\—Ýš\Ú[Û—ÙY˜][
+BˆYˆÞ[˜×ØÛY[\È›Û™N‚ˆ™]\›ˆ›Û™K›Û™BˆÙÙÙ\‹š[™›Ê•š\Ú[Ûˆ]]ËY]XÝˆ\Ú[™ÈXZ[ˆ›ÝšY\ˆ	\È
+	\ÊH‹XZ[—Ü›ÝšY\‹Y˜][Û[Ù[Üˆ™\ÛÛ™YÛ[Ù[ÜˆXZ[—Û[Ù[
+Bˆ™]\›ˆÞ[˜×ØÛY[Y˜][Û[Ù[ˆYˆXZ[—Ü›ÝšY\ˆ[ˆÔ“Õ’QT”×ÕÒUÕUÕ’TÒSÓŽˆÈ[™Ú[™Z™XÝÈ[XYÙH[œ][\™[BˆÙÙÙ\‹™XYÊ•š\Ú[Ûˆ]]ËY]XÝˆÚÚ\[™ÈXZ[ˆ›ÝšY\ˆ	\È
+›Èš\Ú[ÛˆÝ\Ü
+H8 %˜[[™È›ÝYÚÈYÙÜ™YØ]ÜˆÚZ[ˆ‹XZ[—Ü›ÝšY\ŠBˆ™]\›ˆ›Û™K›Û™BˆYˆ›ÝÛXZ[—Û[Ù[ÜÝ\Ü×Ýš\Ú[ÛŠXZ[—Ü›ÝšY\‹š\Ú[Û—Û[Ù[
+N‚ˆÈÛ›ÝÛˆ^[Û›H[Ù[ˆÙÈÛ›HH›ÝšY\ˆ˜[YH
+ÛÙTSÛX\‹]^[ÙÙÚ[™È”ÊK‚ˆÙÙÙ\‹™XYÊˆ•š\Ú[Ûˆ]]ËY]XÝˆÚÚ\[™ÈXZ[ˆ›ÝšY\ˆ	\È
+™\ÜÈ›Èš\Ú[ÛˆØ\Xš[]JH8 %˜[[™È›ÝYÚÈYÙÜ™YØ]ÜˆÚZ[ˆ‹ˆXZ[—Ü›ÝšY\‹ˆ
+Bˆ™]\›ˆ›Û™K›Û™BˆÈÝ\ÝÛH[™Ú[ÈØ\œžH›ÈZ[Z[ˆ˜\ÙWÝ\›Ø\WÚÙ^Nˆ™XÛÝ™\ˆH]™HXZ[ˆ[™Ú[œ›ÛBˆÈÙ]Ü[[YWÛXZ[Š
+HÜ‹Ú]›È]™H[[YH™XÛÜ™YHÛÛ™šYÝ\™YÝ\ÝÛH[™Ú[‚ˆœ×Ø˜\ÙWÝ\›Hœ×Ø\WÚÙ^HH›Û™Bˆœ×Ø\WÛ[ÙHH™\ÛÛ™YØ\WÛ[ÙBˆYˆXZ[—Ü›ÝšY\ˆOH˜Ý\ÝÛHˆÜˆXZ[—Ü›ÝšY\‹œÝ\ÝÚ]
+˜Ý\ÝÛNˆŠN‚ˆYˆ[[YK™Ù]
+˜˜\ÙWÝ\›ŠN‚ˆÝ\ÝÛWØ˜\ÙKÝ\ÝÛWÚÙ^KÝ\ÝÛWÛ[ÙHH[[YK™Ù]
+˜˜\ÙWÝ\›ŠK[[YK™Ù]
+˜\WÚÙ^HŠHÜˆ›Û™K[[YK™Ù]
+˜\WÛ[ÙHŠBˆ[ÙN‚ˆÝ\ÝÛWØ˜\ÙKÝ\ÝÛWÚÙ^KÝ\ÝÛWÛ[ÙHHÜ™\ÛÛ™WØÝ\ÝÛWÜ[[YJ
+BˆYˆÝ\ÝÛWØ˜\ÙN‚ˆœ×Ø˜\ÙWÝ\›œ×Ø\WÚÙ^HHÝ\ÝÛWØ˜\ÙKÝ\ÝÛWÚÙ^Bˆœ×Ø\WÛ[ÙHH™\ÛÛ™YØ\WÛ[ÙHÜˆÝ\ÝÛWÛ[ÙHÜˆ›Û™Bˆœ×ØÛY[œ×Û[Ù[H™\ÛÛ™WÜ›ÝšY\—ØÛY[
+ˆXZ[—Ü›ÝšY\‹š\Ú[Û—Û[Ù[\WÛ[ÙO\œ×Ø\WÛ[ÙK^XÚ]Ø˜\ÙWÝ\›\œ×Ø˜\ÙWÝ\›ˆ^XÚ]Ø\WÚÙ^O\œ×Ø\WÚÙ^KXZ[—Ü[[YO\[[YK\×Ýš\Ú[ÛUYJBˆYˆœ×ØÛY[\È›Û™N‚ˆ™]\›ˆ›Û™K›Û™BˆÙÙÙ\‹š[™›Ê•š\Ú[Ûˆ]]ËY]XÝˆ\Ú[™ÈXZ[ˆ›ÝšY\ˆ	\È
+	\ÊH‹XZ[—Ü›ÝšY\‹œ×Û[Ù[Üˆš\Ú[Û—Û[Ù[
+Bˆ™]\›ˆœ×ØÛY[œ×Û[Ù[Üˆš\Ú[Û—Û[Ù[‚‚™YˆÝš\Ú[Û—Ø]]×Ü›Ý]Jˆ[[YNˆXÝÜÝ‹[žWK™\ÛÛ™YÛ[Ù[ˆÜ[Û˜[ÜÝ—K™\ÛÛ™YØ\WÛ[ÙNˆÜ[Û˜[ÜÝ—Kˆ\Þ[˜×Û[ÙNˆ›ÛÛŠHOˆ\VÓÜ[Û˜[ÜÝ—KÜ[Û˜[Ð[žWKÜ[Û˜[ÜÝ—WN‚ˆˆˆ]]ËY]XÝÜ™\ŽˆKˆXZ[ˆ›ÝšY\ˆ
+È[Ù[‹ˆÜ[”›Ý]\‹Ëˆ›Ý\ÈÜ[ˆY\[™œ˜KKˆÝÜˆˆˆ‚ˆXZ[—Ü›ÝšY\ˆHÝŠ[[YK™Ù]
+œ›ÝšY\ˆŠHÜˆÜ™XYÛXZ[—Ü›ÝšY\Š
+JBˆXZ[—Û[Ù[HÝŠ[[YK™Ù]
+›[Ù[ŠHÜˆÜ™XYÛXZ[—Û[Ù[
+
+JBˆYˆXZ[—Ü›ÝšY\‹œÝš\
+
+K›ÝÙ\Š
+HOH›[ØHŽ‚ˆÈ[ÐHXZ[—Û[Ù[\ÈH™\Ù]SQK›ÝHÚ\™H[Ù[8 %[Ü˜\ÈH™\Ù]	ÜÈYÙÜ™YØ]Ü‚ˆÈÛÝˆH[ØN‹ËÈ˜XØYH[™Ú[™[Û™ÜÈÈHš\X[›ÝšY\‹›ÝH™X[Û™K‚ˆØYÙ×Ü›ÝšY\‹ØYÙ×Û[Ù[HÜ™\ÛÛ™WÛ[ØWØYÙÜ™YØ]ÜŠXZ[—Û[Ù[
+BˆYˆØYÙ×Ü›ÝšY\ˆ[™ØYÙ×Û[Ù[‚ˆXZ[—Ü›ÝšY\‹XZ[—Û[Ù[HØYÙ×Ü›ÝšY\‹ØYÙ×Û[Ù[ˆ[[YHHXÝ
+[[YK˜\ÙWÝ\›Hˆ‹\WÚÙ^OHˆ‹\WÛ[ÙOHˆŠBˆYˆXZ[—Ü›ÝšY\ˆ[™XZ[—Ü›ÝšY\ˆ›Ý[ˆÈ˜]]È‹ˆ‹›[ØHŸN‚ˆÛY[Y˜][Û[Ù[HÝš\Ú[Û—ÛXZ[—Ü›ÝšY\—ØÛY[
+XZ[—Ü›ÝšY\‹XZ[—Û[Ù[[[YK™\ÛÛ™YÛ[Ù[™\ÛÛ™YØ\WÛ[ÙJBˆYˆÛY[\È›Ý›Û™N‚ˆ™]\›ˆÙš[˜[^™WÝš\Ú[Û—ØÛY[
+XZ[—Ü›ÝšY\‹ÛY[Y˜][Û[Ù[™\ÛÛ™YÛ[Ù[\Þ[˜×Û[ÙJBˆÈYÙÜ™YØ]ÜœÈ\ÙHZ\ˆYXØ]Yš\Ú[Ûˆ[Ù[›ÝH\Ù\‰ÜÈXZ[ˆ[Ù[‚ˆ›ÜˆØ[™Y]H[ˆÕ’TÒSÓ—ÐUU×Ô“Õ’QT—ÓÔ‘TŽ‚ˆYˆØ[™Y]HOHXZ[—Ü›ÝšY\Ž‚ˆÛÛ[YHÈ[™XYHšYYX›Ý™BˆÞ[˜×ØÛY[Y˜][Û[Ù[HÜ™\ÛÛ™WÜÝšXÝÝš\Ú[Û—Ø˜XÚÙ[™
+Ø[™Y]JBˆYˆÞ[˜×ØÛY[\È›Ý›Û™N‚ˆ™]\›ˆÙš[˜[^™WÝš\Ú[Û—ØÛY[
+Ø[™Y]KÞ[˜×ØÛY[Y˜][Û[Ù[™\ÛÛ™YÛ[Ù[\Þ[˜×Û[ÙJBˆÙÙÙ\‹™XYÊ]^[X\žHš\Ú[ÛˆÛY[ˆ›Û™H]˜Z[X›HŠBˆ™]\›ˆ›Û™K›Û™K›Û™B‚‚ˆÈRHš\Ú[Ûˆ]\Ý\ÙHHÜ[RKXÛÛ\]X›H[™Ú[ˆH[›ÜXÈÚ\™H™Z™XÝÈX^ÝÚÙ[œÈÛ‚ˆÈ][[[Ù[Ø[È
+\œ›ÜˆLŒL
+K‚—ÖRWÓÔSRWÕ’TÒSÓ—ÕT“ÈH
+šÎ‹ËÛÜ[‹˜šYÛ[Ù[˜Û‹Ø\KÜX\ËÝ‹šÎ‹ËØ\Kž‹˜ZKØ\KÜX\ËÝŠB‚‚™Yˆ™\ÛÛ™WÝš\Ú[Û—Ü›ÝšY\—ØÛY[
+ˆ›ÝšY\ŽˆÜ[Û˜[ÜÝ—HH›Û™K[Ù[ˆÜ[Û˜[ÜÝ—HH›Û™K
+‹˜\ÙWÝ\›ˆÜ[Û˜[ÜÝ—HH›Û™Kˆ\WÚÙ^NˆÜ[Û˜[ÜÝ—HH›Û™K\Þ[˜×Û[ÙNˆ›ÛÛH˜[ÙKˆXZ[—Ü[[YNˆÜ[Û˜[ÑXÝÜÝ‹[žWWHH›Û™KŠHOˆ\VÓÜ[Û˜[ÜÝ—KÜ[Û˜[Ð[žWKÜ[Û˜[ÜÝ—WN‚ˆˆˆ”™\ÛÛ™HHÛY[XÝX[H\ÙY›Üˆš\Ú[Ûˆ\ÚÜË‚‚ˆ\™XÝ[™Ú[Ý™\œšY\È™X]›ÝšY\ˆÙ[XÝ[ÛŽÈ^XÚ]›ÝšY\œÈX^H›Ü˜ÙBˆ^\š[Y[[˜XÚÙ[™ÎÈ]]È[ÙHÛ›HšY\È˜XÚÙ[™ÈÛ›ÝÛˆÈÛÜšË‚ˆˆˆ‚ˆ[[YHHÛ›Ü›X[^™WÛXZ[—Ü[[YJXZ[—Ü[[YJBˆ™\]Y\ÝY™\ÛÛ™YÛ[Ù[™\ÛÛ™YØ˜\ÙWÝ\›™\ÛÛ™YØ\WÚÙ^K™\ÛÛ™YØ\WÛ[ÙHHÜ™\ÛÛ™WÝ\Ú×Ü›ÝšY\—Û[Ù[
+ˆš\Ú[Ûˆ‹›ÝšY\‹[Ù[˜\ÙWÝ\›\WÚÙ^Bˆ
+Bˆ™\]Y\ÝYHÛ›Ü›X[^™WÝš\Ú[Û—Ü›ÝšY\Š™\]Y\ÝY
+BˆYˆ™\ÛÛ™YØ˜\ÙWÝ\›‚ˆ›ÝšY\—Ù›Ü—Ø˜\ÙWÛÝ™\œšYHH™\]Y\ÝYYˆ™\]Y\ÝY[™™\]Y\ÝY›Ý[ˆÈˆ‹˜]]ÈŸH[ÙH˜Ý\ÝÛH‚ˆÛY[š[˜[Û[Ù[H™\ÛÛ™WÜ›ÝšY\—ØÛY[
+ˆ›ÝšY\—Ù›Ü—Ø˜\ÙWÛÝ™\œšYK[Ù[\™\ÛÛ™YÛ[Ù[\Þ[˜×Û[ÙOX\Þ[˜×Û[ÙKˆ^XÚ]Ø˜\ÙWÝ\›\™\ÛÛ™YØ˜\ÙWÝ\›^XÚ]Ø\WÚÙ^O\™\ÛÛ™YØ\WÚÙ^Kˆ\WÛ[ÙO\™\ÛÛ™YØ\WÛ[ÙKXZ[—Ü[[YO\[[YKˆ
+Bˆ™]\›ˆ›ÝšY\—Ù›Ü—Ø˜\ÙWÛÝ™\œšYKÛY[
+š[˜[Û[Ù[YˆÛY[\È›Ý›Û™H[ÙH›Û™JBˆYˆ™\]Y\ÝYOH˜]]ÈŽ‚ˆ™]\›ˆÝš\Ú[Û—Ø]]×Ü›Ý]J[[YK™\ÛÛ™YÛ[Ù[™\ÛÛ™YØ\WÛ[ÙK\Þ[˜×Û[ÙJBˆYˆ™\]Y\ÝY[ˆÕ’TÒSÓ—ÐUU×Ô“Õ’QT—ÓÔ‘TŽ‚ˆÞ[˜×ØÛY[Y˜][Û[Ù[HÜ™\ÛÛ™WÜÝšXÝÝš\Ú[Û—Ø˜XÚÙ[™
+™\]Y\ÝY™\ÛÛ™YÛ[Ù[
+Bˆ™]\›ˆÙš[˜[^™WÝš\Ú[Û—ØÛY[
+™\]Y\ÝYÞ[˜×ØÛY[Y˜][Û[Ù[™\ÛÛ™YÛ[Ù[\Þ[˜×Û[ÙJBˆYˆ™\]Y\ÝYOHž˜ZHŽ‚ˆ›ÜˆÞ˜ZWÝ\›[ˆÖRWÓÔSRWÕ’TÒSÓ—ÕT“Î‚ˆÛY[š[˜[Û[Ù[HÙÙ]ØØXÚYØÛY[
+ˆ™\]Y\ÝY™\ÛÛ™YÛ[Ù[\Þ[˜×Û[ÙK˜\ÙWÝ\›WÞ˜ZWÝ\›ˆ\WÚÙ^O\™\ÛÛ™YØ\WÚÙ^HÜˆ›Û™K\WÛ[ÙOH˜Ú]ØÛÛ\][ÛœÈ‹XZ[—Ü[[YO\[[YKˆ\×Ýš\Ú[ÛUYKˆ
+BˆYˆÛY[\È›Ý›Û™N‚ˆ™]\›ˆÙš[˜[^™WÝš\Ú[Û—ØÛY[
+™\]Y\ÝYÛY[š[˜[Û[Ù[™\ÛÛ™YÛ[Ù[\Þ[˜×Û[ÙJBˆÈ˜[˜XÚÎˆžHÚ]Ý]^XÚ]˜\ÙWÝ\›
+Û™Z]š[ÜŠBˆÛY[š[˜[Û[Ù[HÙÙ]ØØXÚYØÛY[
+ˆ™\]Y\ÝY™\ÛÛ™YÛ[Ù[\Þ[˜×Û[ÙK\WÛ[ÙO\™\ÛÛ™YØ\WÛ[ÙKXZ[—Ü[[YO\[[YK\×Ýš\Ú[ÛUYKˆ
+Bˆ™]\›ˆ™\]Y\ÝYÛY[
+š[˜[Û[Ù[YˆÛY[\È›Ý›Û™H[ÙH›Û™JB‚‚™YˆÙ]Ø]^[X\žWÙ^˜WØ›ÙJ
+HOˆXÝ‚ˆˆˆ”™]\›ˆ^˜WØ›ÙHÝØ\™ÜÈ
+›Ý\ÈÜ[›ÙXÝYÜÈÚ[ˆ›Ý\ËX˜XÚÙY[ÙHßJKˆˆˆ‚ˆ™]\›ˆÛ›Ý\×Ù^˜WØ›ÙJ
+HYˆ]^[X\žWÚ\×Û›Ý\È[ÙHßB‚‚™Yˆ]^[X\žWÛX^ÝÚÙ[œ×Ü\˜[J˜[YNˆ[
+‹[Ù[ˆÜ[Û˜[ÜÝ—HH›Û™JHOˆXÝ‚ˆˆˆ“X^]ÚÙ[œÈÝØ\™È›ÜˆH]^[X\žH›ÝšY\Žˆ\™XÝÜ[RKÐÛÜ[Ý[™™]Ù\ˆÜ[RKY˜[Z[Bˆ[Ù[È
+žH[Ù[˜[YKÛÈÝ\ÝÛH[™Ú[Èœ›Û[™ÈÜMKž\™HØ]YÚ
+H™YYX^ØÛÛ\][Û—ÝÚÙ[œËˆˆˆ‚ˆØÝ\ÝÛWÚÜÝH˜\ÙWÝ\›ÚÜÝ˜[YJØÝ\œ™[ØÝ\ÝÛWØ˜\ÙWÝ\›
+
+JHÜˆˆ‚ˆ\™XÝÛÜ[˜ZWÙ˜[Z[HH
+ˆ›ÝÜØÛÜYÚÙ^WÙ[Š“ÔS”“ÕUT—ÐTWÒÑVHŠH[™Ü™XYÛ›Ý\×Ø]]
+
+H\È›Û™Bˆ[™
+ØÝ\ÝÛWÚÜÝ[ˆ
+˜\K›Ü[˜ZK˜ÛÛH‹˜\K™Ú]X˜ÛÜ[Ý˜ÛÛHŠHÜˆØÝ\ÝÛWÚÜÝ™[™ÝÚ]
+‹™Ú]X˜ÛÜ[Ý˜ÛÛHŠJBˆ
+BˆYˆ\™XÝÛÜ[˜ZWÙ˜[Z[HÜˆ[Ù[Ù›Ü˜Ù\×ÛX^ØÛÛ\][Û—ÝÚÙ[œÊ[Ù[
+N‚ˆ™]\›ˆÈ›X^ØÛÛ\][Û—ÝÚÙ[œÈŽˆ˜[Y_Bˆ™]\›ˆÈ›X^ÝÚÙ[œÈŽˆ˜[Y_B‚‚ˆÈ8¥ 8¥ Ù[˜[^™YHØ[TNˆØ[ÛJ
+KØ\Þ[˜×ØØ[ÛJ
+HÝÛˆ™\ÛÛ™H8¡¤ˆØXÚYÛY[8¡¤ˆÚ\BˆÈ™\]Y\Ý8¡¤ˆØ[8¡¤ˆ™]\›‹ˆ]™\žH]^[X\žHHÛÛœÝ[Y\ˆÚÝ[\ÙH\ÙK‚‚ˆÈÛY[ØXÚNˆ
+›ÝšY\‹\Þ[˜×Û[ÙK˜\ÙWÝ\›\WÚÙ^K\WÛ[ÙK[[YWÚÙ^JHOˆ
+ÛY[Y˜][Û[Ù[ÛÜ
+BˆÈÛÜY[]H\È“Õ\ÙˆHÙ^NˆÝ[K[ÛÜ[šY\È\™H™\XÙY[ˆXÙHÛˆ\Þ[˜È]ËˆÈ›Ý[™[™ÈÜ›ÝÝÈÛ™H[žH\ˆ›ÝšY\ˆÛÛ™šYÈ
+]›ÚYÈ™XØÝ[][][Ûˆ[ˆØ]]Ø^\ÊK‚ˆÈ\È›Ý[™ÈØXÚHÜ›ÝÝÈÛ™H[žH\ˆ[š\]YH›ÝšY\ˆÛÛ™šYÈ˜]\ˆ[ˆÛ™H\ˆ
+ÛÛ™šYÈ0åÂˆÈ]™[[ÛÜ
+KÚXÚ™]š[Ý\ÛHØ]\ÙY[˜›Ý[™Y™XØÝ[][][Ûˆ[ˆÛ™Ë\[›š[™ÈØ]]Ø^H›ØÙ\ÜÙ\È
+ÌLŒ
+K‚—ØÛY[ØØXÚNˆXÝÝ\K\WHHßB—ØÛY[ØØXÚWÛØÚÈH™XY[™Ë“ØÚÊ
+B—ÐÓQS•ÐÐPÒWÓPVÔÒV‘HHÈØY™]H™[8 %]šXÝÛ\ÝÚ[ˆ^ÙYYY‚‚˜Û\ÜÈÐØ[X›PØXÚQ\ØÜš[Z[˜]ÜŽ‚ˆˆˆ’\ÚHÜ™Y[X[Ø[˜XÚÈžHY[]HÚ]Ý]^ÜÚ[™È]ÈÝ]Kˆˆˆ‚‚ˆ×ÜÛÝ××ÈH
+—ØØ[˜XÚÈ‹
+B‚ˆYˆ×Ú[š]×ÊÙ[‹Ø[˜XÚÎˆ[žJHOˆ›Û™N‚ˆÙ[‹—ØØ[˜XÚÈHØ[˜XÚÈÈ™]Z[™YÛÈ]ÈYØ[››Ý™H™]\ÙYÚ[HØXÚY‚ˆYˆ×Ú\Ú×ÊÙ[ŠHOˆ[‚ˆ™]\›ˆY
+Ù[‹—ØØ[˜XÚÊB‚ˆYˆ×Ù\W×ÊÙ[‹Ý\ŽˆØš™XÝ
+HOˆ›ÛÛ‚ˆ™]\›ˆ\Ú[œÝ[˜ÙJÝ\‹ÐØ[X›PØXÚQ\ØÜš[Z[˜]ÜŠH[™Ù[‹—ØØ[˜XÚÈ\ÈÝ\‹—ØØ[˜XÚÂ‚ˆYˆ×Ü™\—×ÊÙ[ŠHOˆÝŽ‚ˆ™]\›ˆØ[X›KX\KZÙ^Oˆ‚‚‚™YˆÜ[[YWØØXÚWÙ\ØÜš[Z[˜]ÜŠšY[ˆÝ‹˜[YNˆ[žJHOˆ[žN‚ˆˆˆ”™]\›ˆH\ÚX›KÙXÜ™]\ØY™H[[YHØXÚKZÙ^HÛÛ\Û™[ˆˆˆ‚ˆYˆšY[OH˜\WÚÙ^Hˆ[™Ø[X›J˜[YJN‚ˆ™]\›ˆÐØ[X›PØXÚQ\ØÜš[Z[˜]ÜŠ˜[YJBˆYˆšY[OH˜\WÚÙ^Hˆ[™\Ú[œÝ[˜ÙJ˜[YKÝŠH[™˜[YN‚ˆ™]\›ˆ
+˜\KZÙ^KYYÙ\Ý‹\ÚX‹˜›ZÙL˜Š˜[YK™[˜ÛÙJ]‹NŠKYÙ\ÝÜÚ^™OLMŠK™YÙ\Ý
+
+JBˆ™]\›ˆ˜[YB‚‚™YˆØÛY[ØØXÚWÚÙ^Jˆ›ÝšY\ŽˆÝ‹
+‹\Þ[˜×Û[ÙNˆ›ÛÛ˜\ÙWÝ\›ˆÜ[Û˜[ÜÝ—HH›Û™Kˆ\WÚÙ^NˆÜ[Û˜[ÜÝ—HH›Û™K\WÛ[ÙNˆÜ[Û˜[ÜÝ—HH›Û™KˆXZ[—Ü[[YNˆÜ[Û˜[ÑXÝÜÝ‹[žWWHH›Û™K\×Ýš\Ú[ÛŽˆ›ÛÛH˜[ÙKˆ\ÚÎˆÜ[Û˜[ÜÝ—HH›Û™K[Ù[ˆÜ[Û˜[ÜÝ—HH›Û™KŠHOˆ\N‚ˆ[[YHHÛ›Ü›X[^™WÛXZ[—Ü[[YJXZ[—Ü[[YJBˆÈ]]Ø™\ÛÛ™\È›ÝYÚHXZ[ˆ[[YH[™\ÚË\ÜXÚYšXÈÛXÞKÛÈ›Ý›Ú[ˆHÙ^K‚ˆ[[YWÚÙ^HH\JÜ[[YWØØXÚWÙ\ØÜš[Z[˜]ÜŠ‹[[YK™Ù]
+‹ˆŠJH›Üˆˆ[ˆÓPRS—Ô•S•SQWÑ’QSÊHYˆ›ÝšY\ˆOH˜]]Èˆ[ÙH
+
+Bˆ\Ú×ÚÙ^HH
+\ÚÈÜˆˆ‹Ý\Ú×Ü™Y™\œ×Ù˜\ÝÛ[Ù[
+\ÚÊJHYˆ›ÝšY\ˆOH˜]]Èˆ[ÙHˆ‚ˆÛÛÚ[HÜÛÛØØXÚWÚ[
+›ÝšY\‹XZ[—Ü[[YO[XZ[—Ü[[YJBˆÈ[Ù[UTÕ™H[ˆHÙ^NˆÛÛ˜Ý\œ™[Ø[ÈÈHØ[YH[™Ú[Ú]Y™™\™[[Ù[ÈÛÝ[ˆÈÚ\™H[ˆ[žK[™HÙXÛÛ™Z[\‰ÜÈÜÝÜ™WØØXÚYØÛY[ÛÝ[ÛÜÙHHš\œÝ	ÜÈÛY[‚ˆ[Ù[ÚÙ^HH[Ù[Üˆ[[YK™Ù]
+›[Ù[‹ˆŠBˆ\WÚÙ^WÚÙ^HHÜ[[YWØØXÚWÙ\ØÜš[Z[˜]ÜŠ˜\WÚÙ^H‹\WÚÙ^HÜˆˆŠBˆ™]\›ˆ
+›ÝšY\‹\Þ[˜×Û[ÙK˜\ÙWÝ\›Üˆˆ‹\WÚÙ^WÚÙ^K\WÛ[ÙHÜˆˆ‹[[YWÚÙ^K\×Ýš\Ú[Û‹\Ú×ÚÙ^KÛÛÚ[[Ù[ÚÙ^JB‚‚™YˆØÝ\œ™[Ù]™[ÛÛÜ
+
+HOˆ[žN‚ˆˆˆ˜\Þ[˜Ú[Ë™Ù]Ù]™[ÛÛÜ
+
+XÜˆ›Û™HÚ[ˆ›ÈÛÜØ[ˆ™HØZ[™Y
+\Þ[˜ÈØXÚKZÙ^Hš[™[™ÊKˆˆˆ‚ˆžN‚ˆ[\Ü\Þ[˜Ú[È\ÈØZ[Âˆ™]\›ˆØZ[Ë™Ù]Ù]™[ÛÛÜ
+
+Bˆ^Ù\[[YQ\œ›ÜŽ‚ˆ™]\›ˆ›Û™B‚‚™YˆÜÝÜ™WØØXÚYØÛY[
+ØXÚWÚÙ^Nˆ\KÛY[ˆ[žKY˜][Û[Ù[ˆÜ[Û˜[ÜÝ—K
+‹›Ý[™ÛÛÜˆ[žHH›Û™JHOˆ›Û™N‚ˆYˆ\Ú[œÝ[˜ÙJÛY[Ð]^›Ø™PÛY[ÝXŠN‚ˆ™]\›ˆÈ›Ø™HÝXœÈ]\Ý™]™\ˆ™HØXÚY8 %H™^]ÛÝ[Ù]HYÛY[ˆÚ]ØÛY[ØØXÚWÛØÚÎ‚ˆÛÙ[žHHØÛY[ØØXÚK™Ù]
+ØXÚWÚÙ^JBˆYˆÛÙ[žH\È›Ý›Û™H[™ÛÙ[žVÌH\È›ÝÛY[‚ˆØÛÜÙWØØXÚYØÛY[
+ÛÙ[žVÌJBˆØÛY[ØØXÚVØØXÚWÚÙ^WHH
+ÛY[Y˜][Û[Ù[›Ý[™ÛÛÜ
+B‚‚™YˆÜ™Yœ™\ÚÛ›Ý\×Ø]^[X\žWØÛY[
+ˆ
+‹ØXÚWÜ›ÝšY\ŽˆÝ‹[Ù[ˆÜ[Û˜[ÜÝ—K\Þ[˜×Û[ÙNˆ›ÛÛ˜\ÙWÝ\›ˆÜ[Û˜[ÜÝ—HH›Û™Kˆ\WÚÙ^NˆÜ[Û˜[ÜÝ—HH›Û™K\WÛ[ÙNˆÜ[Û˜[ÜÝ—HH›Û™KˆXZ[—Ü[[YNˆÜ[Û˜[ÑXÝÜÝ‹[žWWHH›Û™K\×Ýš\Ú[ÛŽˆ›ÛÛH˜[ÙKˆÛÚÝ\Û[Ù[ˆÜ[Û˜[ÜÝ—HH›Û™KÛÚÝ\Ý\ÚÎˆÜ[Û˜[ÜÝ—HH›Û™KŠHOˆ\VÓÜ[Û˜[Ð[žWKÜ[Û˜[ÜÝ—WN‚ˆˆˆ”™Yœ™\Ú›Ý\È[[YHÜ™YË™XZ[HÛY[[™™\XÙHHØXÚH[žK‚‚ˆ[Ù[\ÈH™\ÛÛ™YÚ\™H[Ù[ÝÜ™Y\ÈH[žIÜÈ\ØX›H[Ù[[™™]\›™YˆBˆØXÚHÑVHUTÕ™HZ[œ›ÛHÛÚÝ\Û[Ù[ØÛÚÝ\Ý\ÚØ8 %H[Ù[[™\ÚÈ\È\ÜÙYˆÈÙÙ]ØØXÚYØÛY[Ú[ˆHÝ[HÛY[Ø\ÈXÜ]Z\™Y8 %ÛÈHœ™\ÚÛY[Ý™\Üš]\ÂˆH^XÝ[žHHÝ[HÛ™H\ÈÙ\™Yœ›ÛKˆÙ^Z[™ÈÛˆH™\ÛÛ™Y[Ù[Üˆ[ˆ[\H\ÚÂˆÛÝ[X]™HH^\™YÛY[[[[Ü[[™]™\žH]^[X\žHØ[Z[™È›Ü™]™\‹‚‚ˆÙYHÍMŽK‚ˆ›Üˆ›ÝšY\ˆOH˜]]È˜H\ÚÈ\XÚ\]\È[ˆHØXÚHÙ^H
+\ÚË\ÜXÚYšXÈ˜[˜XÚÈÛXÞJKÛÈ]ˆUTÕ™HØ\œšYY[ÈHÙ^H\™H›ÜˆHØ[YH™X\ÛÛˆ\ÈÛÚÝ\Û[Ù[ÈÝ\Ú\ÙH[ˆ]]Ë\›ÝšY\‚ˆÛY[™Yœ™\ÚYÛˆHH[™È[™\ˆH\ÚÏHˆ˜Ù^HÚ[HHÝ[H[žHÝ\š]™\È[™\ˆBˆ\ÚË\ØÛÜYÙ^H
+ÍNM
+K‚ˆˆˆ‚ˆ[[YHHÜ™\ÛÛ™WÛ›Ý\×Ü[[YWØ\J›Ü˜ÙWÜ™Yœ™\ÚUYKÝ[WØXØÙ\Ü×ÝÚÙ[X\WÚÙ^JBˆYˆ[[YH\È›Û™N‚ˆ™]\›ˆ›Û™K[Ù[ˆœ™\ÚÚÙ^Kœ™\ÚØ˜\ÙWÝ\›H[[YBˆÞ[˜×ØÛY[HØÜ™X]WÛÜ[˜ZWØÛY[
+\WÚÙ^OYœ™\ÚÚÙ^K˜\ÙWÝ\›Yœ™\ÚØ˜\ÙWÝ\›
+BˆÝ\œ™[ÛÛÜHØÝ\œ™[Ù]™[ÛÛÜ
+
+HYˆ\Þ[˜×Û[ÙH[ÙH›Û™BˆYˆ\Þ[˜×Û[ÙN‚ˆÛY[š[˜[Û[Ù[HÝ×Ø\Þ[˜×ØÛY[
+Þ[˜×ØÛY[[Ù[Üˆˆ‹\×Ýš\Ú[ÛZ\×Ýš\Ú[ÛŠBˆ[ÙN‚ˆÛY[š[˜[Û[Ù[HÞ[˜×ØÛY[[Ù[ˆØXÚWÚÙ^HHØÛY[ØØXÚWÚÙ^JˆØXÚWÜ›ÝšY\‹\Þ[˜×Û[ÙOX\Þ[˜×Û[ÙK˜\ÙWÝ\›X˜\ÙWÝ\›\WÚÙ^OX\WÚÙ^Kˆ\WÛ[ÙOX\WÛ[ÙKXZ[—Ü[[YO[XZ[—Ü[[YK\×Ýš\Ú[ÛZ\×Ýš\Ú[Û‹\ÚÏ[ÛÚÝ\Ý\ÚËˆ[Ù[[ÛÚÝ\Û[Ù[ˆ
+BˆÜÝÜ™WØØXÚYØÛY[
+ØXÚWÚÙ^KÛY[š[˜[Û[Ù[›Ý[™ÛÛÜXÝ\œ™[ÛÛÜ
+Bˆ™]\›ˆÛY[š[˜[Û[Ù[‚‚™Yˆ™]]\—Ø\Þ[˜×ÚÙ[
+
+HOˆ›Û™N‚ˆˆˆ“[ÛšÙ^K\]Ú\Þ[˜ÒÛY[Ü˜\\‹—×Ù[×ØÈ™HH›Ë[Ü‚‚ˆHÑÉÜÈ×Ù[×ØØÚY[\ÈXÛÜÙJ
+XÛˆH
+œ[›š[™ÊˆÛÜ]H˜[œÜÜ\Âˆ›Ý[™ÈHÛÜHÛY[Ø\ÈÜ™X]YÛŽÈÚ[ˆ]ÛÜ\ÈXY\È˜Z\Ù\È‘]™[ÛÜˆ\ÈÛÜÙYˆ[È›Û\ÝÛÛÚ]	ÜÈÛÜˆØY™H™XØ]\ÙHØXÚYÛY[È\™HÛÜÙY^XÚ]H[™ˆHÔÈ™X\ÈH™\ÝˆØ[Û˜ÙH]ÓHÝ\\™Y›Ü™H[žH\Þ[˜ÓÜ[RX\ÈÜ™X]Y‚ˆˆˆ‚ˆžN‚ˆœ›ÛHÜ[˜ZK—Ø˜\ÙWØÛY[[\Ü\Þ[˜ÒÛY[Ü˜\\‚ˆ\Þ[˜ÒÛY[Ü˜\\‹—×Ù[×ÈH[X™HÙ[Žˆ›Û™HÈ\NˆYÛ›Ü™VØ\ÜÚYÛ›Y[Bˆ^Ù\
+[\Ü\œ›Ü‹]šX]Q\œ›ÜŠN‚ˆ\ÜÈÈÜ˜XÙY[YÜ˜Y][ÛˆYˆHÑÈÚ[™Ù\È]È[\›˜[Â‚‚™YˆÙ›Ü˜ÙWØÛÜÙWØ\Þ[˜×Ú
+ÛY[ˆ[žJHOˆ›Û™N‚ˆˆˆ“X\šÈH\Þ[˜ÐÛY[[œÚYH[ˆ\Þ[˜ÓÜ[RHÛY[\ÈÛÜÙYÛÈ×Ù[×ØÛÛ‰ÝˆØÚY[HXÛÜÙJ
+XÛˆHXYÛÜˆÚÚ\ÈH[\Þ[˜ÈÛÜÙH8 %HÔÈ›ÜÈÛÛ›™XÝ[ÛœËˆˆˆ‚ˆÚ]ÛÛ^X‹œÝ\™\ÜÊ^Ù\[ÛŠN‚ˆœ›ÛH—ØÛY[[\ÜÛY[Ý]Bˆ[›™\ˆHÙ]]ŠÛY[—ØÛY[‹›Û™JBˆYˆ[›™\ˆ\È›Ý›Û™H[™›ÝÙ]]Š[›™\‹š\×ØÛÜÙY‹YJN‚ˆ[›™\‹—ÜÝ]HHÛY[Ý]KÓÔÑQ‚‚™YˆÜØÚY[WØ\Þ[˜×ØÛÜÙJÛÜÙWÜ™\Ý[ˆ[žKÛY[ˆ[žJHOˆ›Û™N‚ˆˆˆ‘š[š\Ú[ˆ\Þ[˜ÈÛÜÙHÚ]Ý]XZÚ[™È[ˆ[˜]ØZ]YÛÜ›Ý][™Kˆˆˆ‚ˆ\Þ[˜ÈYˆØ]ØZ]ØÛÜÙJ
+HOˆ›Û™N‚ˆžN‚ˆ]ØZ]ÛÜÙWÜ™\Ý[ˆ^Ù\^Ù\[ÛŽ‚ˆ\ÜÂˆš[˜[N‚ˆÙ›Ü˜ÙWØÛÜÙWØ\Þ[˜×Ú
+ÛY[
+Bˆ[›™\ˆHØ]ØZ]ØÛÜÙJ
+BˆžN‚ˆ[\Ü\Þ[˜Ú[È\ÈØZ[ÂˆžN‚ˆÛÜHØZ[Ë™Ù]Ü[›š[™×ÛÛÜ
+
+Bˆ^Ù\[[YQ\œ›ÜŽ‚ˆØZ[Ëœ[Š[›™\ŠBˆ[ÙN‚ˆ\ÚÈHÛÜ˜Ü™X]WÝ\ÚÊ[›™\ŠB‚ˆYˆØÛÛœÝ[YJÛÛ\]YÝ\ÚÊHOˆ›Û™N‚ˆÚ]ÛÛ^X‹œÝ\™\ÜÊ˜\ÙQ^Ù\[ÛŠN‚ˆÛÛ\]YÝ\ÚË™^Ù\[ÛŠ
+Bˆ\ÚË˜YÙÛ™WØØ[˜XÚÊØÛÛœÝ[YJBˆ[›™\ˆH›Û™Bˆ^Ù\^Ù\[ÛŽ‚ˆYˆ[›™\ˆ\È›Ý›Û™N‚ˆÚ]ÛÛ^X‹œÝ\™\ÜÊ^Ù\[ÛŠN‚ˆ[›™\‹˜ÛÜÙJ
+BˆÙ›Ü˜ÙWØÛÜÙWØ\Þ[˜×Ú
+ÛY[
+B‚‚™YˆØÛÜÙWØØXÚYØÛY[
+ÛY[ˆ[žK
+‹ÛÜÙWØ\Þ[˜Îˆ›ÛÛH˜[ÙJHOˆ›Û™N‚ˆˆˆÛÜÙHÛ™HØXÚYÛY[]ØZ][™È\Þ[˜È˜[œÜÜÈÛ›HÚ[ˆØY™Kˆˆˆ‚ˆYˆÛY[\È›Û™N‚ˆ™]\›‚ˆÛÜÙWÙ›ˆHÙ]]ŠÛY[˜ÛÜÙH‹›Û™JBˆYˆ›ÝØ[X›JÛÜÙWÙ›ŠN‚ˆÙ›Ü˜ÙWØÛÜÙWØ\Þ[˜×Ú
+ÛY[
+Bˆ™]\›‚ˆžN‚ˆÛÜÙWÜ™\Ý[HÛÜÙWÙ›Š
+Bˆ^Ù\^Ù\[ÛŽ‚ˆÙ›Ü˜ÙWØÛÜÙWØ\Þ[˜×Ú
+ÛY[
+Bˆ™]\›‚ˆYˆ[œÜXÝš\Ø]ØZ]X›JÛÜÙWÜ™\Ý[
+N‚ˆYˆÛÜÙWØ\Þ[˜Î‚ˆÜØÚY[WØ\Þ[˜×ØÛÜÙJÛÜÙWÜ™\Ý[ÛY[
+Bˆ[ÙN‚ˆÈ™]™\ˆ]ØZ]HÛY[ÝÛ™YžH[›Ý\ˆ]™HÛÜÈÛÜÙHHÛÜ›Ý][™H
+›ÂˆÈ[˜]ØZ]YØ\›š[™ÊH[™™]]\ˆH˜[œÜÜ‚ˆÚ]ÛÛ^X‹œÝ\™\ÜÊ^Ù\[ÛŠN‚ˆÛÜÙWÜ™\Ý[˜ÛÜÙJ
+BˆÙ›Ü˜ÙWØÛÜÙWØ\Þ[˜×Ú
+ÛY[
+Bˆ™]\›‚ˆÙ›Ü˜ÙWØÛÜÙWØ\Þ[˜×Ú
+ÛY[
+B‚‚™YˆÚ]ÝÛ—ØØXÚYØÛY[Ê
+HOˆ›Û™N‚ˆˆˆÛÜÙH[ØXÚYÛY[ÎÈØ[]ÓHÚ]ÝÛˆ
+˜™Y›Ü™JˆHÛÜÛÜÙ\Ë‚‚ˆÛ˜\ÚÝ
+ØÛX\ˆ[™\ˆHØÚËÛÜÙHÝ]ÚYH]ˆ\Þ[˜ÈX\™ÝÛˆØ[ˆ›ØÚÈÚ[H[ˆÝÛ™\‚ˆÛÜ˜Z[œË[™Û[™ÈHØÚÈÛÝ[ÛÛ›ÞH]™\žHØ[\‹‚ˆˆˆ‚ˆÚ]ØÛY[ØØXÚWÛØÚÎ‚ˆÛY[ÈHÊ[žVÌK[žVÌ—JH›Üˆ[žH[ˆØÛY[ØØXÚK˜[Y\Ê
+HYˆ[žVÌH\È›Ý›Û™WBˆØÛY[ØØXÚK˜ÛX\Š
+BˆžN‚ˆ[\Ü\Þ[˜Ú[È\ÈØZ[Âˆ[›š[™×ÛÛÜHØZ[Ë™Ù]Ü[›š[™×ÛÛÜ
+
+Bˆ^Ù\[[YQ\œ›ÜŽ‚ˆ[›š[™×ÛÛÜH›Û™Bˆ›ÜˆÛY[ÝÛ™\—ÛÛÜ[ˆÛY[Î‚ˆÈH]™H›Ü™ZYÛˆÛÜÝÛœÈ]È˜[œÜÜ8 %™]]\ˆÛ›H[™]]š[š\ÚX\™ÝÛ‹‚ˆÈÛÜÙYÛÜÈ[™HÝ\œ™[ÛÜ\™HØY™HÈ˜Z[ˆ\™K‚ˆÛÜÙWØ\Þ[˜ÈHÝÛ™\—ÛÛÜ\È›Ý›Û™H[™
+ÝÛ™\—ÛÛÜš\×ØÛÜÙY
+
+HÜˆÝÛ™\—ÛÛÜ\È[›š[™×ÛÛÜ
+BˆØÛÜÙWØØXÚYØÛY[
+ÛY[ÛÜÙWØ\Þ[˜ÏXÛÜÙWØ\Þ[˜ÊB‚‚™YˆÛX[\ÜÝ[WØ\Þ[˜×ØÛY[Ê
+HOˆ›Û™N‚ˆˆˆ‘›Ü˜ÙKXÛÜÙHØXÚY\Þ[˜ÈÛY[ÈÚÜÙHÛÜ\ÈÛÜÙYÈØ[Y\ˆXXÚYÙ[\›‚ˆ
+Y™[œÙKZ[‹Y\™Z[™™]]\—Ø\Þ[˜×ÚÙ[
+Kˆˆˆ‚ˆÚ]ØÛY[ØØXÚWÛØÚÎ‚ˆÝ[HHÊÙ^K[žVÌJH›ÜˆÙ^K[žH[ˆØÛY[ØØXÚKš][\Ê
+HYˆ[žVÌ—H\È›Ý›Û™H[™[žVÌ—Kš\×ØÛÜÙY
+
+WBˆ›ÜˆÙ^KØÛY[[ˆÝ[N‚ˆ[ØÛY[ØØXÚVÚÙ^WBˆ›ÜˆÚÙ^KÛY[[ˆÝ[N‚ˆØÛÜÙWØØXÚYØÛY[
+ÛY[ÛÜÙWØ\Þ[˜ÏUYJB‚‚™YˆØÛÛ\]Û[Ù[
+ÛY[ˆ[žK[Ù[ˆÜ[Û˜[ÜÝ—KØXÚYÙY˜][ˆÜ[Û˜[ÜÝ—JHOˆÜ[Û˜[ÜÝ—N‚ˆˆˆ’ÙY\Û\ÚX™X\š[™È[Ù[QÈÛ›H›ÜˆØXÚYÛY[È]XØÙ\™[™Ü‹Û[Ù[
+Ü[”›Ý]\‚ˆÜˆHÛ\ÚX™X\š[™ÈY˜][
+KˆZ\œ›ÜœÈH™\ÛÛ™WÜ›ÝšY\—ØÛY[
+
+HÝX\™ÚXÚØXÚH]ÈÚÚ\ˆˆˆ‚ˆYˆ[Ù[[™‹Èˆ[ˆ[Ù[‚ˆXØÙ\×ÜÛ\ÚH[žJˆØšˆ[™˜\ÙWÝ\›ÚÜÝÛX]Ú\ÊÝŠÙ]]ŠØš‹˜˜\ÙWÝ\›‹ˆŠHÜˆˆŠK›Ü[œ›Ý]\‹˜ZHŠBˆ›ÜˆØšˆ[ˆ
+ÛY[Ù]]ŠÛY[—ØÛY[‹›Û™JKÙ]]ŠÛY[˜ÛY[‹›Û™JJBˆ
+HÜˆ›ÛÛ
+ØXÚYÙY˜][[™‹Èˆ[ˆØXÚYÙY˜][
+BˆYˆ›ÝXØÙ\×ÜÛ\Ú‚ˆ™]\›ˆØXÚYÙY˜][ˆ™]\›ˆ[Ù[ÜˆØXÚYÙY˜][‚‚™YˆÙÙ]ØØXÚYØÛY[
+ˆ›ÝšY\ŽˆÝ‹[Ù[ˆÝˆH›Û™K\Þ[˜×Û[ÙNˆ›ÛÛH˜[ÙK˜\ÙWÝ\›ˆÝˆH›Û™Kˆ\WÚÙ^NˆÝˆH›Û™K\WÛ[ÙNˆÝˆH›Û™KXZ[—Ü[[YNˆÜ[Û˜[ÑXÝÜÝ‹[žWWHH›Û™Kˆ\×Ýš\Ú[ÛŽˆ›ÛÛH˜[ÙK\ÚÎˆÜ[Û˜[ÜÝ—HH›Û™KŠHOˆ\VÓÜ[Û˜[Ð[žWKÜ[Û˜[ÜÝ—WN‚ˆˆˆ‘Ù]ÜˆÜ™X]HHØXÚYÛY[›ÜˆHÚ]™[ˆ›ÝšY\‹‚‚ˆ\Þ[˜ÈÛY[Èš[™ÈHÛÜ^HÙ\™HÜ™X]YÛ‹ÛÈ]™\žH\Þ[˜È]˜[Y]\ÈHØXÚYˆÛÜ\ÈHÝ\œ™[Ü[ˆÛÜÈÝ[H[šY\È\™H™\XÙY[ˆXÙH
+›Ý[™Y›ÈÜ›ÜÜË[ÛÜ™]\ÙJK‚‚ˆ\ÈÙY\ÈØXÚHÚ^™H›Ý[™YÈÛ™H[žH\ˆ[š\]YH›ÝšY\ˆÛÛ™šYË™]™[[™ÈH™Y^]\Ý[Ûˆ]ˆ™]š[Ý\ÛHØØÝ\œ™Y[ˆÛ™Ë\[›š[™ÈØ]]Ø^\ÈÚ\™H™XÞXÛYÛÜšÙ\ˆ™XYÈÜ™X]Y[˜›Ý[™Y[šY\Âˆ
+ÌLŒ
+K‚ˆˆˆ‚ˆÝ\œ™[ÛÛÜHØÝ\œ™[Ù]™[ÛÛÜ
+
+HYˆ\Þ[˜×Û[ÙH[ÙH›Û™Bˆ[[YHHÛ›Ü›X[^™WÛXZ[—Ü[[YJXZ[—Ü[[YJBˆØXÚWÚÙ^HHØÛY[ØØXÚWÚÙ^Jˆ›ÝšY\‹\Þ[˜×Û[ÙOX\Þ[˜×Û[ÙK˜\ÙWÝ\›X˜\ÙWÝ\›\WÚÙ^OX\WÚÙ^K\WÛ[ÙOX\WÛ[ÙKˆXZ[—Ü[[YO[XZ[—Ü[[YK\×Ýš\Ú[ÛZ\×Ýš\Ú[Û‹\ÚÏ]\ÚË[Ù[[[Ù[ˆ
+BˆÚ]ØÛY[ØØXÚWÛØÚÎ‚ˆYˆØXÚWÚÙ^H[ˆØÛY[ØØXÚN‚ˆØXÚYØÛY[ØXÚYÙY˜][ØXÚYÛÛÜHØÛY[ØØXÚVØØXÚWÚÙ^WBˆÛÜÛÚÈH›Ý\Þ[˜×Û[ÙHÜˆ
+ˆØXÚYÛÛÜ\È›Ý›Û™H[™ØXÚYÛÛÜ\ÈÝ\œ™[ÛÛÜ[™›ÝØXÚYÛÛÜš\×ØÛÜÙY
+
+Bˆ
+BˆYˆÛÜÛÚÎ‚ˆ™]\›ˆØXÚYØÛY[ØÛÛ\]Û[Ù[
+ØXÚYØÛY[[Ù[ØXÚYÙY˜][
+BˆÈÝ[H\Þ[˜È[žH8 %]šXÝˆÛ›HHÛÜÙYÝÛ™\ˆÛÜX^H™H]ØZ]Y\™NÈH]™BˆÈ›Ü™ZYÛˆÛÜÝ^\È›Ü˜ÙK[™]]\™Y‚ˆØÛÜÙWØØXÚYØÛY[
+ØXÚYØÛY[ÛÜÙWØ\Þ[˜ÏXØXÚYÛÛÜ\È›Ý›Û™H[™ØXÚYÛÛÜš\×ØÛÜÙY
+
+JBˆ[ØÛY[ØØXÚVØØXÚWÚÙ^WBˆÈZ[Ý]ÚYHHØÚËˆ›ÜˆÛÛX˜XÚÙY›ÝšY\œÈ\š]™HHÙ^Hœ›ÛHHÛÛ[žN‚ˆÈ™\ÛÛ™WØ\WÚÙ^WÜ›ÝšY\—ØÜ™Y[X[È™Y™\œÈ[ˆ˜\œËÚXÚÛÝ[ž\\ÜÈÛÛ›Ý][Û‚ˆÈ[™™]žH[ˆ^]\ÝYÙ^K‚ˆY™™XÝ]™WØ\WÚÙ^HH\WÚÙ^BˆYˆ›ÝY™™XÝ]™WØ\WÚÙ^N‚ˆÜHHÜYZ×ÜÛÛÙ[žJÛ›Ü›X[^™WØ]^Ü›ÝšY\Š›ÝšY\ŠJBˆYˆÜH\È›Ý›Û™N‚ˆY™™XÝ]™WØ\WÚÙ^HHÜÛÛÜ[[YWØ\WÚÙ^JÜJHÜˆ\WÚÙ^BˆÛY[Y˜][Û[Ù[H™\ÛÛ™WÜ›ÝšY\—ØÛY[
+ˆ›ÝšY\‹[Ù[\Þ[˜×Û[ÙK^XÚ]Ø˜\ÙWÝ\›X˜\ÙWÝ\›^XÚ]Ø\WÚÙ^OYY™™XÝ]™WØ\WÚÙ^Kˆ\WÛ[ÙOX\WÛ[ÙKXZ[—Ü[[YO\[[YK\×Ýš\Ú[ÛZ\×Ýš\Ú[Û‹\ÚÏ]\ÚËˆ
+BˆYˆÛY[\È›Ý›Û™N‚ˆÚ]ØÛY[ØØXÚWÛØÚÎ‚ˆYˆØXÚWÚÙ^H›Ý[ˆØÛY[ØØXÚN‚ˆÈ’Q“ÈØY™]KX™[]šXÝ[Û‹ˆÈ“ÕÛÜÙH]šXÝYÛY[Îˆ[›Ý\ˆØ[\ˆX^H™BˆÈZY\™\]Y\ÝÛˆÛ™NÈ™Y˜ÛÝ[ÑÐÈ[™\È]‚ˆÚ[H[ŠØÛY[ØØXÚJHHÐÓQS•ÐÐPÒWÓPVÔÒV‘N‚ˆ[ØÛY[ØØXÚVÛ™^
+]\ŠØÛY[ØØXÚJJWBˆØÛY[ØØXÚVØØXÚWÚÙ^WHH
+ÛY[Y˜][Û[Ù[Ý\œ™[ÛÛÜ
+Bˆ[ÙN‚ˆZ[ØÛY[HÛY[ˆÛY[Y˜][Û[Ù[ÈHØÛY[ØØXÚVØØXÚWÚÙ^WBˆÈ˜XÙHÜÙ\ˆØ\È™]™\ˆ^ÜÙYÈHØ[\ˆ8 %ØY™HÈÛÜÙH›ÝË‚ˆØÛÜÙWØØXÚYØÛY[
+Z[ØÛY[ÛÜÙWØ\Þ[˜ÏX\Þ[˜×Û[ÙJBˆ™]\›ˆÛY[[Ù[ÜˆY˜][Û[Ù[‚‚ˆÈ[X\Ù\È›Üˆ\™XÝ‘TÕT\È›Ý[Ù[Y[ˆ“Õ’QT—Ô‘QÒTÕ–KÛÈ]^[X\žK\ÚÏ‹œ›ÝšY\Ž‚ˆÈÜ[˜ZX™\ÛÛ™\ÈÈHÛÜšÚ[™ÈÝ\ÝÛX[™Ú[
+ÔSRWÐTWÒÑVH
+È\K›Ü[˜ZK˜ÛÛJH[œÝXYÙ‚ˆÈÚ[[H˜[[™È˜XÚÈÈHXZ[ˆ›ÝšY\ˆ[™Ù[™[™ÈÜ[RH[Ù[˜[Y\È[Ù]Ú\™K‚—ÐUVÑT‘PÕÐTWÐTÑWÕT“ÎˆXÝÜÝ‹Ý—HHÈ›Ü[˜ZHŽˆšÎ‹ËØ\K›Ü[˜ZK˜ÛÛKÝŒHŸB‚‚ˆÈ[ÐHš\X[›ÝšY\Žˆ[ˆ
+™^XÚ]
+ˆ›ÝšY\Žˆ[ØXÝ™\œšYH
+Z]\ˆHØ[\‹\\ÜÙY›ÝšY\˜\™ÈÜ‚ˆÈ]^[X\žK\ÚÏ‹œ›ÝšY\˜[ˆÛÛ™šYËžX[[
+H™XXÚ\È\È[˜Ý[Ûˆ\™XÝH8 %]™]™\ˆÛÙ\È›ÝYÚˆÈÜ™\ÛÛ™WØ]]×Ü›Ý]J
+KÚXÚÛ›H[Ü˜\ÈH
+š[\XÚ]
+ˆ›XZ[ˆ›ÝšY\ˆ\È[ØHˆØ\ÙH
+ÍLÎÊKˆY\ËZ\Ë›[ØH‚ˆÈ\È™]\›™Y™\˜˜][H[™™\ÛÛ™WÜ›ÝšY\—ØÛY[
+
+HÛÚÜÈ]\[ˆ“Õ’QT—Ô‘QÒTÕ–H
+ÚXÚ\È›È›[ØH‚ˆÈ[žH8 %]	ÜÈ›ÝH™X[›ÝšY\ŠK˜[ÈÈH[šÛ›ÝÛ‹\›ÝšY\ˆXY[™[™Ø[ÛHÝ\™˜XÙ\ÈBˆÈ›ÛœÙ[œÚXØ[“SÐWÐTWÒÑVH[š\›Û›Y[˜\šXX›Hˆ\œ›Üˆ›ÜˆH›ÝšY\ˆ]Ø\È™]™\ˆYX[È™H™XXÚYˆÈÝ™\ˆHÚ\™Kˆ]^[X\žH\ÚÜÈÛ‰Ý™YYH™Y™\™[˜ÙH˜[‹[Ý]8 %™\ÛÛ™HÈH™\Ù]	ÜÈYÙÜ™YØ]ÜˆÛÝˆÈ[œÝXY^XÝHZÙHH[\XÚ]]Ù\È
+Ú\™Y[\ŽˆÜ™\ÛÛ™WÛ[ØWØYÙÜ™YØ]ÜŠK‚™YˆÝ[Ü˜\Û[ØWÜ›ÝšY\Š›ÝŽˆÝ‹YˆÜ[Û˜[ÜÝ—JHOˆ\VÜÝ‹Ü[Û˜[ÜÝ—WN‚ˆˆˆ”™\ÛÛ™H[ˆ
+™^XÚ]
+ˆ›ÝšY\Žˆ[ØXÈ]È™\Ù]	ÜÈYÙÜ™YØ]ÜˆÛÝ
+Ü™\ÛÛ™WØ]]×Ü›Ý]J
+BˆÛ›H[Ü˜\ÈH[\XÚ]Ø\ÙNÈ›[ØHˆ\Û‰Ý[ˆ“Õ’QT—Ô‘QÒTÕ–H[™ÛÝ[XYY[™
+Kˆˆˆ‚ˆYˆ›Ý‹œÝš\
+
+K›ÝÙ\Š
+HOH›[ØHŽ‚ˆ™]\›ˆ›Ý‹YˆYÙ×Ü›ÝšY\‹YÙ×Û[Ù[HÜ™\ÛÛ™WÛ[ØWØYÙÜ™YØ]ÜŠY
+BˆYˆYÙ×Ü›ÝšY\ˆ[™YÙ×Û[Ù[‚ˆ™]\›ˆYÙ×Ü›ÝšY\‹YÙ×Û[Ù[ˆ™]\›ˆ›Ý‹Y‚‚™YˆÙ^[™Ù\™XÝØ\WØ[X\Ê›ÝŽˆÜ[Û˜[ÜÝ—K^\Ý[™×Ø˜\ÙNˆÜ[Û˜[ÜÝ—JHOˆ\VÓÜ[Û˜[ÜÝ—KÜ[Û˜[ÜÝ—WN‚ˆˆˆ˜›ÝšY\ŽˆÜ[˜ZX8¡¤ˆÝ\ÝÛH
+È\K›Ü[˜ZK˜ÛÛKÝŒNÈH\Ù\ˆ˜\ÙWÝ\›\ÈÙ\]H›ÝšY\ˆÝ[™XÛÛY\ÈÝ\ÝÛKˆˆˆ‚ˆYˆ›Ý›ÝŽ‚ˆ™]\›ˆ›Ý‹^\Ý[™×Ø˜\ÙBˆ\™Ù]Ø˜\ÙHHÐUVÑT‘PÕÐTWÐTÑWÕT“Ë™Ù]
+›Ý‹œÝš\
+
+K›ÝÙ\Š
+JBˆYˆ\™Ù]Ø˜\ÙH\È›Û™N‚ˆ™]\›ˆ›Ý‹^\Ý[™×Ø˜\ÙBˆ™]\›ˆ˜Ý\ÝÛH‹^\Ý[™×Ø˜\ÙHÜˆ\™Ù]Ø˜\ÙB‚‚™YˆÜ™\Ù\™WÜ›ÝšY\—ÝÚ]Ø˜\ÙWÝ\›
+›ÝŽˆÜ[Û˜[ÜÝ—JHOˆ›ÛÛ‚ˆˆˆ•YHÚ[ˆHš\œÝXÛ\ÜÈ›ÝšY\ˆÙY\È]ÈY[]H[Û™ÜÚYH[ˆ^XÚ]˜\ÙWÝ\›ˆˆˆ‚ˆ›Ü›X[^™YHÝŠ›ÝˆÜˆˆŠKœÝš\
+
+K›ÝÙ\Š
+BˆYˆ›Ü›X[^™Y[ˆÈˆ‹˜]]È‹˜Ý\ÝÛHŸHÜˆ›Ü›X[^™YœÝ\ÝÚ]
+˜Ý\ÝÛNˆŠN‚ˆ™]\›ˆ˜[ÙBˆžN‚ˆœ›ÛH\›Y\×ØÛKœ›ÝšY\œÈ[\ÜÙ]Ü›ÝšY\‚ˆ™]\›ˆÙ]Ü›ÝšY\Š›Ü›X[^™Y
+H\È›Ý›Û™Bˆ^Ù\^Ù\[ÛŽˆÈÙY\›ÝšY\‹X˜XÚÙY›Ý]\ÈØY™HÚ[ˆHØ][ÙÈØ[‰ÝØYˆ™]\›ˆ›Ü›X[^™Y[ˆÂˆ˜[›ÜXÈ‹˜ÛÜ[Ý‹˜ÛÜ[ÝXXÜ‹›Z[š[X^[Ø]]‹››Ý\È‹›Ü[˜ZKXÛÙ^‹œ]Ù[‹[Ø]]‹žZK[Ø]]‹ˆB‚‚™YˆÜ™\ÛÛ™WÝ\Ú×Ü›ÝšY\—Û[Ù[
+ˆ\ÚÎˆÝˆH›Û™K›ÝšY\ŽˆÝˆH›Û™K[Ù[ˆÝˆH›Û™K˜\ÙWÝ\›ˆÜ[Û˜[ÜÝ—HH›Û™Kˆ\WÚÙ^NˆÜ[Û˜[ÜÝ—HH›Û™KŠHOˆ\VÜÝ‹Ü[Û˜[ÜÝ—KÜ[Û˜[ÜÝ—KÜ[Û˜[ÜÝ—KÜ[Û˜[ÜÝ—WN‚ˆˆˆ‘]\›Z[™H
+›ÝšY\‹[Ù[˜\ÙWÝ\›\WÚÙ^K\WÛ[ÙJH›ÜˆHØ[‚‚ˆš[Üš]Nˆ^XÚ]\™ÜÈˆÛÛ™šYÈ]^[X\žKžÝ\ÚßKŠˆˆ˜]]È‹ˆH˜\™H˜\ÙWÝ\›YX[œÈÝ\ÝÛKˆ]Hš\œÝXÛ\ÜÈ›ÝšY\ˆ
+È˜\ÙWÝ\›ÙY\ÈH›ÝšY\ˆY[]HÛÈ]È]]Ý˜[œÜÜˆÚ\[™ÈÝ[\Y\Ëˆ\WÛ[ÙH\È˜Ú]ØÛÛ\][ÛœÈ‹˜ÛÙ^Ü™\ÜÛœÙ\È‹Üˆ›Û™H
+]]ÊK‚ˆˆˆ‚ˆÙ™×Ü›ÝšY\ˆHÙ™×Û[Ù[HÙ™×Ø˜\ÙWÝ\›HÙ™×Ø\WÚÙ^HH™\ÛÛ™YØ\WÛ[ÙHH›Û™BˆYˆ\ÚÎ‚ˆ\Ú×ØÛÛ™šYÈHÙÙ]Ø]^[X\žWÝ\Ú×ØÛÛ™šYÊ\ÚÊBˆÙ™×Ü›ÝšY\ˆHÝŠ\Ú×ØÛÛ™šYË™Ù]
+œ›ÝšY\ˆ‹ˆŠJKœÝš\
+
+HÜˆ›Û™BˆÙ™×Û[Ù[HÝŠ\Ú×ØÛÛ™šYË™Ù]
+›[Ù[‹ˆŠJKœÝš\
+
+HÜˆ›Û™BˆÙ™×Ø˜\ÙWÝ\›HÝŠ\Ú×ØÛÛ™šYË™Ù]
+˜˜\ÙWÝ\›‹ˆŠJKœÝš\
+
+HÜˆ›Û™BˆÙ™×Ø\WÚÙ^HHÝŠ\Ú×ØÛÛ™šYË™Ù]
+˜\WÚÙ^H‹ˆŠJKœÝš\
+
+HÜˆ›Û™BˆYˆ›ÝÙ™×Ø\WÚÙ^NˆÈÙ^WÙ[ˆ8¡¤ˆ[ˆ˜\ˆÚ[ˆ\WÚÙ^H\È›ÝÙ]\™XÝBˆÙ™×ÚÙ^WÙ[ˆHÝŠ\Ú×ØÛÛ™šYË™Ù]
+šÙ^WÙ[ˆŠHÜˆ\Ú×ØÛÛ™šYË™Ù]
+˜\WÚÙ^WÙ[ˆŠHÜˆˆŠKœÝš\
+
+BˆYˆÙ™×ÚÙ^WÙ[Ž‚ˆÙ™×Ø\WÚÙ^HHÜØÛÜYÚÙ^WÙ[ŠÙ™×ÚÙ^WÙ[ŠHÜˆ›Û™Bˆ™\ÛÛ™YØ\WÛ[ÙHHÝŠ\Ú×ØÛÛ™šYË™Ù]
+˜\WÛ[ÙH‹ˆŠJKœÝš\
+
+HÜˆ›Û™BˆÈ	Ø]]ÉÈ\ÈHÙ[[™[
+š[š\š]È]]ËY]XÝŠK›ÝH[Ù[Y8 %XZÚ[™È]ÈHÚ\™BˆÈZY[ÈHŒÚ][ˆ\œ›Ü‹]^›ÙH]ÛÛœÝ[Y\œÈXØÙ\\ÈÝ]]ˆH^XÚ][Ù[ˆÈÝØ\™È™YYÈHØ[YH›Ü›X[^˜][ÛŽˆ[ÐHÛÝÈ›ÜØ\™™\Ù][Ù[˜šY[È›ÝYÚ]‚ˆYˆ[Ù[[™[Ù[›ÝÙ\Š
+HOH˜]]ÈŽ‚ˆ[Ù[H›Û™BˆYˆÙ™×Û[Ù[[™Ù™×Û[Ù[›ÝÙ\Š
+HOH˜]]ÈŽ‚ˆÙ™×Û[Ù[H›Û™Bˆ™\ÛÛ™YÛ[Ù[H[Ù[ÜˆÙ™×Û[Ù[ˆÈ[žH[ØN‹ËÈ˜XØYH[™Ú[™[Û™ÜÈÈH˜XØYK›ÝHYÙÜ™YØ]Ü‰ÜÈ™X[›ÝšY\ˆ8 %ˆÈ›Ü]
+Z\œ›ÜœÈÜ™\ÛÛ™WØ]]×Ü›Ý]J
+JK‚ˆYˆ›ÝšY\ˆ[™ÝŠ›ÝšY\ŠKœÝš\
+
+K›ÝÙ\Š
+HOH›[ØHŽ‚ˆ›ÝšY\‹™\ÛÛ™YÛ[Ù[HÝ[Ü˜\Û[ØWÜ›ÝšY\Š›ÝšY\‹™\ÛÛ™YÛ[Ù[
+BˆYˆ›ÝšY\ˆ[™›ÝšY\‹›ÝÙ\Š
+HOH›[ØHŽ‚ˆ˜\ÙWÝ\›H›Û™Bˆ\WÚÙ^HH›Û™Bˆ[YˆÙ™×Ü›ÝšY\ˆ[™ÝŠÙ™×Ü›ÝšY\ŠKœÝš\
+
+K›ÝÙ\Š
+HOH›[ØHŽ‚ˆÙ™×Ü›ÝšY\‹Ù™×Û[Ù[HÝ[Ü˜\Û[ØWÜ›ÝšY\ŠÙ™×Ü›ÝšY\‹™\ÛÛ™YÛ[Ù[
+BˆYˆÙ™×Ü›ÝšY\ˆ[™Ù™×Ü›ÝšY\‹›ÝÙ\Š
+HOH›[ØHŽ‚ˆ™\ÛÛ™YÛ[Ù[HÙ™×Û[Ù[ˆÙ™×Ø˜\ÙWÝ\›H›Û™BˆÙ™×Ø\WÚÙ^HH›Û™BˆYˆ›ÝšY\Ž‚ˆ›ÝšY\‹˜\ÙWÝ\›HÙ^[™Ù\™XÝØ\WØ[X\Ê›ÝšY\‹˜\ÙWÝ\›
+BˆYˆÙ™×Ü›ÝšY\Ž‚ˆÙ™×Ü›ÝšY\‹Ù™×Ø˜\ÙWÝ\›HÙ^[™Ù\™XÝØ\WØ[X\ÊÙ™×Ü›ÝšY\‹Ù™×Ø˜\ÙWÝ\›
+BˆÈ[ˆ^XÚ]›ÝšY\ˆÚ]Ý]˜\ÙWÝ\›YÜÈH\ÚÉÜÈÛÛ™šYÝ\™Y[™Ú[
+Ø[YHÜ‚ˆÈ[›˜[YY›ÝšY\ŠHÛÈHX\›H™]\›ˆ™[ÝÈØ\œšY\È]ˆ^XÚ]˜]]Èˆ\È^ÛYY8 %]ˆÈ]\ÝÙY\›ÝÚ[™È›ÝYÚ]]Ë\™\ÛÛ][Û‹‚ˆÈÙYHÍNLMK‚ˆYˆ›ÝšY\ˆ[™›ÝšY\ˆOH˜]]Èˆ[™›Ý˜\ÙWÝ\›[™Ù™×Ø˜\ÙWÝ\›[™Ù™×Ü›ÝšY\ˆ[ˆ
+›Û™K›ÝšY\ŠN‚ˆ˜\ÙWÝ\›HÙ™×Ø˜\ÙWÝ\›ˆYˆ›Ý\WÚÙ^N‚ˆ\WÚÙ^HHÙ™×Ø\WÚÙ^BˆYˆ˜\ÙWÝ\›‚ˆÙ\H›ÝšY\ˆYˆÜ™\Ù\™WÜ›ÝšY\—ÝÚ]Ø˜\ÙWÝ\›
+›ÝšY\ŠH[ÙH˜Ý\ÝÛH‚ˆ™]\›ˆÙ\™\ÛÛ™YÛ[Ù[˜\ÙWÝ\›\WÚÙ^K™\ÛÛ™YØ\WÛ[ÙBˆYˆ›ÝšY\Ž‚ˆ™]\›ˆ›ÝšY\‹™\ÛÛ™YÛ[Ù[˜\ÙWÝ\›\WÚÙ^K™\ÛÛ™YØ\WÛ[ÙBˆYˆÙ™×Ø˜\ÙWÝ\›[™Ù™×Ø\WÚÙ^N‚ˆ™]\›ˆ˜Ý\ÝÛH‹™\ÛÛ™YÛ[Ù[Ù™×Ø˜\ÙWÝ\›Ù™×Ø\WÚÙ^K™\ÛÛ™YØ\WÛ[ÙBˆYˆÙ™×Ø˜\ÙWÝ\›[™Ù™×Ü›ÝšY\ˆ[™Ù™×Ü›ÝšY\ˆOH˜]]ÈŽ‚ˆÈ˜\ÙWÝ\›Ú]Ý]\WÚÙ^NˆÙY\H›ÝšY\ˆÛÈ]Ø[ˆ™\ÛÛ™HÜ™Y[X[Èœ›ÛH[‚ˆÈ˜\œÈ[œÝXYÙˆØÚÚ[™È[È˜Ý\ÝÛH‹‚ˆ™]\›ˆÙ™×Ü›ÝšY\‹™\ÛÛ™YÛ[Ù[Ù™×Ø˜\ÙWÝ\››Û™K™\ÛÛ™YØ\WÛ[ÙBˆYˆÙ™×Ü›ÝšY\ˆ[™Ù™×Ü›ÝšY\ˆOH˜]]ÈŽ‚ˆ™]\›ˆÙ™×Ü›ÝšY\‹™\ÛÛ™YÛ[Ù[Ù™×Ø˜\ÙWÝ\›Ù™×Ø\WÚÙ^K™\ÛÛ™YØ\WÛ[ÙBˆ™]\›ˆ˜]]È‹™\ÛÛ™YÛ[Ù[›Û™K›Û™K™\ÛÛ™YØ\WÛ[ÙB‚‚—ÑQUSÐUVÕSQSÕUHÌŒ‚ˆÈ™X\ÛÛš[™ÈÛÛ\™\ÜÚ[Ûˆ[Ù[ÈØ[ˆ^ÙYYHY˜][LŒÈÛÛ™šYÈ[Y[Ý]˜[[™È˜XÚÈÈBˆÈ]\›Z[š\ÝXÈX\šÙ\‹ˆ›Ý[™Y
+™›ÛÜŠˆ›ÜˆÛÛ™šYËY\š]™YÛÛ\™\ÜÚ[Ûˆ[Y[Ý]ÈÛ›NÈ™]™\‚ˆÈÝ™\œšY\È[ˆ^XÚ]\‹XØ[[Y[Ý]‚ˆÈÛÛ\™\ÜÚ[ÛˆÝ[[X\š\Ù\È\™ÙHÛÛ™\œØ][Ûˆ\ÝÜšY\ÎÈH™X\ÛÛš[™È]^[X\žH[Ù[
+K™ËˆÛÙ^ÈÔMKJBˆÈØ[ˆYÚ][X][HZÙHÛ™Ù\ˆ[ˆHY˜][]^[X\žK˜ÛÛ\™\ÜÚ[Û‹[Y[Ý]
+LŒÊKØ]\Ú[™ÈBˆÈÝ™X[HÈ[YHÝ][™HÛÛ\™\ÜÛÜˆÈ˜[˜XÚÈÈH]\›Z[š\ÝXÈÛÛ^X\šÙ\ˆ
+ÍMLMJKˆH›ÛÜ‚ˆÈ\È\›[\ÜÈ›Üˆ˜\ÝÛÛ\™\ÜÚ[Ûˆ[Ù[È
+^Hš[š\Ú™Y›Ü™HHXY[™JH[™\ÈHZ[š[][KÛÈHYÚ\‚ˆÈÛÛ™šYÈ˜[YH\ÈÙ\[˜Ú[™ÙY‚—ÐÓÓT‘TÔÒSÓ—ÕSQSÕUÑ“ÓÔ—ÔÑPÓÓ‘ÈHÌŒ‚‚™YˆÙÙ]Ø]^[X\žWÝ\Ú×ØÛÛ™šYÊ\ÚÎˆÝŠHOˆXÝÜÝ‹[žWN‚ˆˆˆÛÛ™šYÈXÝ›Üˆ]^[X\žK\ÚÏ‹ÜˆßHÚ[ˆ[˜]˜Z[X›KˆYÚ[‹\™YÚ\Ý\™Y\ÚÜÈÙ]Z\‚ˆXÛ\™YY˜][È^Y\™Y[™\ˆ\Ù\ˆÛÛ™šYÈ
+\Ù\ˆÚ[œÊNÈZ[Z[ˆY˜][È]™H[ˆQUSÐÓÓ‘’QËˆˆˆ‚ˆYˆ›Ý\ÚÎ‚ˆ™]\›ˆßBˆžN‚ˆœ›ÛH\›Y\×ØÛK˜ÛÛ™šYÈ[\ÜØYØÛÛ™šY×Ü™XYÛ›BˆÛÛ™šYÈHØYØÛÛ™šY×Ü™XYÛ›J
+Bˆ^Ù\[\Ü\œ›ÜŽ‚ˆ™]\›ˆßBˆ]^HÛÛ™šYË™Ù]
+˜]^[X\žH‹ßJHYˆ\Ú[œÝ[˜ÙJÛÛ™šYËXÝ
+H[ÙHßBˆ\Ú×ØÛÛ™šYÈH]^™Ù]
+\ÚËßJHYˆ\Ú[œÝ[˜ÙJ]^XÝ
+H[ÙHßBˆYˆ›Ý\Ú[œÝ[˜ÙJ\Ú×ØÛÛ™šYËXÝ
+N‚ˆ\Ú×ØÛÛ™šYÈHßBˆžN‚ˆœ›ÛH\›Y\×ØÛKœYÚ[œÈ[\ÜÙ]ÜYÚ[—Ø]^[X\žWÝ\ÚÜÂˆ›ÜˆÙ[žH[ˆÙ]ÜYÚ[—Ø]^[X\žWÝ\ÚÜÊ
+N‚ˆYˆÙ[žK™Ù]
+šÙ^HŠHOH\ÚÎ‚ˆÙY˜][ÈHÙ[žK™Ù]
+™Y˜][ÈŠHÜˆßBˆYˆ\Ú[œÝ[˜ÙJÙY˜][ËXÝ
+N‚ˆ™]\›ˆÊŠ—ÙY˜][Ë
+Š\Ú×ØÛÛ™šYßBˆœ™XZÂˆ^Ù\^Ù\[ÛŽ‚ˆ\ÜÈÈYÚ[ˆ\ØÛÝ™\žH˜Z[\™H]\Ý›Ýœ™XZÈ]^\ÚÈÛÛ™šYÈ™XYÂˆ™]\›ˆ\Ú×ØÛÛ™šYÂ‚‚˜Û\ÜÈÛÛ\™\ÜÚ[Û‘˜\Ý[™J˜[YY\JN‚ˆˆˆ‘^XÚ]›Û‹\™X\ÛÛš[™ÈÛÛ\™\ÜÚ[Ûˆ›Ý]Kˆˆˆ‚‚ˆÙ\YšYYÛ›Û—Ü™X\ÛÛš[™Îˆ›ÛÛˆ™X\ÛÛš[™×ØÛÛ™šYÎˆÜ[Û˜[ÑXÝÜÝ‹[žWWB‚‚™YˆÙ˜\ÝÛ[™WØÛÛ™šY×ÙšY[ÊÛÛ™šYÎˆXÝÜÝ‹[žWJHOˆ\VÜÝ‹Ý‹›ÛÛN‚ˆˆˆ“Û›H^XÚ]™X\ÛÛš[™È\ØX›[Y[Ù\YšY\ÈH›Û‹\™X\ÛÛš[™È›Ý]Kˆˆˆ‚ˆœ›ÛH\›Y\×ØÛÛœÝ[È[\Ü\œÙWÜ™X\ÛÛš[™×ÙY™›Üˆ›ÝšY\ˆHÝŠÛÛ™šYË™Ù]
+œ›ÝšY\ˆŠHÜˆˆŠKœÝš\
+
+K›ÝÙ\Š
+Bˆ[Ù[HÝŠÛÛ™šYË™Ù]
+›[Ù[ŠHÜˆˆŠKœÝš\
+
+Bˆ\œÙYÙY™›ÜH\œÙWÜ™X\ÛÛš[™×ÙY™›Ü
+ÛÛ™šYË™Ù]
+œ™X\ÛÛš[™×ÙY™›ÜŠJBˆ›Û—Ü™X\ÛÛš[™ÈH\œÙYÙY™›Ü\È›Ý›Û™H[™\œÙYÙY™›Ü™Ù]
+™[˜X›YŠH\È˜[ÙBˆ™]\›ˆ›ÝšY\‹[Ù[›Û—Ü™X\ÛÛš[™Â‚‚™Yˆ™\ÛÛ™WØÛÛ\™\ÜÚ[Û—Ù˜\ÝÛ[™JˆXÝX[Ü›ÝšY\ŽˆÝ‹XÝX[Û[Ù[ˆÜ[Û˜[ÜÝ—K
+‹™\]Y\ÝYÜ›ÝšY\ŽˆÜ[Û˜[ÜÝ—HH›Û™Kˆ™\]Y\ÝYÛ[Ù[ˆÜ[Û˜[ÜÝ—HH›Û™K›Ý]WØÛÛ™šYÎˆÜ[Û˜[ÑXÝÜÝ‹[žWWHH›Û™KŠHOˆÛÛ\™\ÜÚ[Û‘˜\Ý[™N‚ˆˆˆÙ\YžH^XÚ]›Û‹\™X\ÛÛš[™ÈÙ][™ÜÈÛ›HÛˆHX]Ú[™È\Ý[˜][Û‹ˆˆˆ‚ˆÛÛ™šYÈH›Ý]WØÛÛ™šYÈYˆ›Ý]WØÛÛ™šYÈ\È›Ý›Û™H[ÙHÙÙ]Ø]^[X\žWÝ\Ú×ØÛÛ™šYÊ˜ÛÛ\™\ÜÚ[ÛˆŠBˆÙ™×Ü›ÝšY\‹Ù™×Û[Ù[›Û—Ü™X\ÛÛš[™ÈHÙ˜\ÝÛ[™WØÛÛ™šY×ÙšY[ÊÛÛ™šYÊBˆ›ÝšY\ˆHÝŠ™\]Y\ÝYÜ›ÝšY\ˆÜˆˆŠKœÝš\
+
+K›ÝÙ\Š
+HÜˆÙ™×Ü›ÝšY\‚ˆ[Ù[HÝŠ™\]Y\ÝYÛ[Ù[ÜˆˆŠKœÝš\
+
+HÜˆÙ™×Û[Ù[ˆ^XÚ]Ü›Ý]HH›ÝšY\ˆ›Ý[ˆÈˆ‹˜]]ÈŸH[™[Ù[›ÝÙ\Š
+H›Ý[ˆÈˆ‹˜]]ÈŸBˆXÝX[Û›Ü›HHÛ›Ü›X[^™WØ]^Ü›ÝšY\ŠÙ˜[˜XÚ×Ü›ÝšY\—Ùœ›ÛWÛX™[
+ÝŠXÝX[Ü›ÝšY\ˆÜˆˆŠJJBˆ›ÝšY\—ÛX]Ú\ÈHXÝX[Û›Ü›HOHÛ›Ü›X[^™WØ]^Ü›ÝšY\Š›ÝšY\ŠBˆ[Ù[ÛX]Ú\ÈHÝŠXÝX[Û[Ù[ÜˆˆŠKœÝš\
+
+K›ÝÙ\Š
+HOH[Ù[›ÝÙ\Š
+BˆYˆ^XÚ]Ü›Ý]H[™›ÝšY\—ÛX]Ú\È[™[Ù[ÛX]Ú\È[™›Û—Ü™X\ÛÛš[™Î‚ˆ™]\›ˆÛÛ\™\ÜÚ[Û‘˜\Ý[™JYKÈ™[˜X›YŽˆ˜[ÙK™Y™›ÜŽˆ››Û™HŸJBˆ™]\›ˆÛÛ\™\ÜÚ[Û‘˜\Ý[™J˜[ÙK›Û™JB‚‚™YˆØÛÛ\™\ÜÚ[Û—ØÛÛ™šY×ØÛZ[\×Ù˜\ÝÛ[™JÛÛ™šYÎˆXÝÜÝ‹[žWJHOˆ›ÛÛ‚ˆˆˆ•Ú]\ˆ\ÚÈÛÛ™šYÈXÛ\™\È˜\Ý[Û›HÛÛ›ÛÈ]Ø[››ÝXZËˆˆˆ‚ˆ›ÝšY\‹[Ù[›Û—Ü™X\ÛÛš[™ÈHÙ˜\ÝÛ[™WØÛÛ™šY×ÙšY[ÊÛÛ™šYÊBˆ™]\›ˆ›ÝšY\ˆ›Ý[ˆÈˆ‹˜]]ÈŸH[™[Ù[›ÝÙ\Š
+H›Ý[ˆÈˆ‹˜]]ÈŸH[™›Û—Ü™X\ÛÛš[™Â‚‚™YˆØÛÛ\™\ÜÚ[Û—Ù˜\ÝÛ[™WØÛÛ›ÛÊˆ\ÚÎˆÝˆ›Û™K
+‹XÝX[Ü›ÝšY\ŽˆÝ‹XÝX[Û[Ù[ˆÝˆ›Û™Kˆ™\]Y\ÝYÜ›ÝšY\ŽˆÝˆ›Û™K™\]Y\ÝYÛ[Ù[ˆÝˆ›Û™K›Ý]WØÛÛ™šYÎˆXÝÜÝ‹[žWKˆXZ×ÙÝX\™ØÛÛ™šYÎˆXÝÜÝ‹[žWKX^ÝÚÙ[œÎˆ[›Û™K^˜WØ›ÙNˆXÝÜÝ‹[žWKŠHOˆ\VÚ[›Û™KXÝÜÝ‹[žWWN‚ˆˆˆ\HHÙ\YšYYÛÛ\™\ÜÚ[ÛˆÛÛ›ÛÈÈÛ™H™\ÛÛ™Y›Ý]Kˆˆˆ‚ˆYˆ\ÚÈOH˜ÛÛ\™\ÜÚ[ÛˆˆÜˆX^ÝÚÙ[œÈ\È›Ý›Û™N‚ˆ™]\›ˆX^ÝÚÙ[œË^˜WØ›ÙBˆ›ÙHHXÝ
+^˜WØ›ÙJBˆ[™HH™\ÛÛ™WØÛÛ\™\ÜÚ[Û—Ù˜\ÝÛ[™JˆXÝX[Ü›ÝšY\‹XÝX[Û[Ù[™\]Y\ÝYÜ›ÝšY\\™\]Y\ÝYÜ›ÝšY\‹™\]Y\ÝYÛ[Ù[\™\]Y\ÝYÛ[Ù[›Ý]WØÛÛ™šYÏ\›Ý]WØÛÛ™šYËˆ
+BˆYˆ[™Kœ™X\ÛÛš[™×ØÛÛ™šYÈ\È›Ý›Û™N‚ˆYˆœ™X\ÛÛš[™Èˆ›Ý[ˆ›ÙN‚ˆ›ÙVÈœ™X\ÛÛš[™È—HH[™Kœ™X\ÛÛš[™×ØÛÛ™šYÂˆ[YˆØÛÛ\™\ÜÚ[Û—ØÛÛ™šY×ØÛZ[\×Ù˜\ÝÛ[™JXZ×ÙÝX\™ØÛÛ™šYÊN‚ˆ›ÙKœÜ
+œ™X\ÛÛš[™È‹›Û™JBˆ™]\›ˆX^ÝÚÙ[œË›ÙB‚‚™YˆÙÙ]Ý\Ú×Ý[Y[Ý]
+\ÚÎˆÝ‹Y˜][ˆ›Ø]HÑQUSÐUVÕSQSÕU
+HOˆ›Ø]‚ˆˆˆ˜]^[X\žK\ÚÏ‹[Y[Ý]œ›ÛHÛÛ™šYË[ÙH
+™Y˜][
+‹ˆˆˆ‚ˆYˆ›Ý\ÚÎ‚ˆ™]\›ˆY˜][ˆ˜]ÈHÙÙ]Ø]^[X\žWÝ\Ú×ØÛÛ™šYÊ\ÚÊK™Ù]
+[Y[Ý]ŠBˆYˆ˜]È\È›Ý›Û™N‚ˆÚ]ÛÛ^X‹œÝ\™\ÜÊ˜[YQ\œ›Ü‹\Q\œ›ÜŠN‚ˆ™]\›ˆ›Ø]
+˜]ÊBˆ™]\›ˆY˜][‚‚™YˆÙY™™XÝ]™WØ]^Ý[Y[Ý]
+\ÚÎˆÝ‹[Y[Ý]ˆÜ[Û˜[Ù›Ø]JHOˆ›Ø]‚ˆˆˆ‘^XÚ][Y[Ý]Ú[œË[ÙHÛÛ™šYÎÈÛÛ\™\ÜÚ[ÛˆÙ]ÈH›ÛÜˆÛÈH™X\ÛÛš[™È[Ù[ˆÝ[[X\š\Ú[™ÈH\™ÙHÛÛ^\Û‰ÝÝ]Ù™‹ˆˆˆ‚ˆYˆ[Y[Ý]\È›Ý›Û™N‚ˆ™]\›ˆ[Y[Ý]ˆY™™XÝ]™HHÙÙ]Ý\Ú×Ý[Y[Ý]
+\ÚÊBˆ™]\›ˆX^
+Y™™XÝ]™KÐÓÓT‘TÔÒSÓ—ÕSQSÕUÑ“ÓÔ—ÔÑPÓÓ‘ÊHYˆ\ÚÈOH˜ÛÛ\™\ÜÚ[Ûˆˆ[ÙHY™™XÝ]™B‚‚™YˆÙÙ]Ý\Ú×Ù^˜WØ›ÙJ\ÚÎˆÝŠHOˆXÝÜÝ‹[žWN‚ˆˆˆ”Ú[ÝÈÛÜHÙˆ]^[X\žK\ÚÏ‹™^˜WØ›ÙXÚ]™X\ÛÛš[™×ÙY™›Ü›ÛY[Âˆ™X\ÛÛš[™Ø[›\ÜÈÛ™H\ÈÛÛ™šYÝ\™Y
+[Ü™HÜXÚYšXÈÚ[œÊKˆ[ÐH\ÚÜÈ\™H^ÛYYˆZ\‚ˆ™X\ÛÛš[™È\\È\‹\ÛÝ[ˆH™\Ù]ˆˆˆ‚ˆ\Ú×ØÛÛ™šYÈHÙÙ]Ø]^[X\žWÝ\Ú×ØÛÛ™šYÊ\ÚÊBˆ˜]ÈH\Ú×ØÛÛ™šYË™Ù]
+™^˜WØ›ÙHŠBˆ™\Ý[HXÝ
+˜]ÊHYˆ\Ú[œÝ[˜ÙJ˜]ËXÝ
+H[ÙHßBˆYˆœ™X\ÛÛš[™Èˆ[ˆ™\Ý[‚ˆ™]\›ˆ™\Ý[ˆY™›ÜH\Ú×ØÛÛ™šYË™Ù]
+œ™X\ÛÛš[™×ÙY™›ÜŠBˆYˆY™›Ü\È›Û™HÜˆY™›ÜOHˆŽ‚ˆ™]\›ˆ™\Ý[ˆYˆ\ÚÈ[ˆ
+›[ØWÜ™Y™\™[˜ÙH‹›[ØWØYÙÜ™YØ]ÜˆŠN‚ˆÙÙÙ\‹Ø\›š[™Êˆ˜]^[X\žK‰\Ëœ™X\ÛÛš[™×ÙY™›Ü\È›ÝÝ\ÜY8 %[ÐH™X\ÛÛš[™È\\È\‹\ÛÝˆÙ]™X\ÛÛš[™×ÙY™›Ü‚ˆ›ÛˆH™\Ù]	ÜÈ™Y™\™[˜ÙWÛ[Ù[È[šY\ÈÈYÙÜ™YØ]Üˆ[œÝXY
+[ØKœ™\Ù]Ë˜[YO‹‹‹ŠKˆYÛ›Üš[™Ëˆ‹ˆ\ÚËˆ
+Bˆ™]\›ˆ™\Ý[ˆœ›ÛH\›Y\×ØÛÛœÝ[È[\Ü\œÙWÜ™X\ÛÛš[™×ÙY™›Üˆ\œÙYH\œÙWÜ™X\ÛÛš[™×ÙY™›Ü
+Y™›Ü
+BˆYˆ\œÙY\È›Ý›Û™N‚ˆ™\Ý[Èœ™X\ÛÛš[™È—HH\œÙYˆ[ÙN‚ˆÙÙÙ\‹Ø\›š[™Êˆ˜]^[X\žK‰\Ëœ™X\ÛÛš[™×ÙY™›Ü	\ˆ\È›ÝH˜[Y]™[
+›Û™KZ[š[X[ÝËYY][KYÚYÚX^[˜JH8 %YÛ›Üš[™È‹ˆ\ÚËY™›Üˆ
+Bˆ™]\›ˆ™\Ý[‚‚ˆÈ\‹]\ÚÈÛÛ˜Ý\œ™[˜ÞH[Z][™ÎˆX[žHÙ\ÜÚ[ÛœÈØ[ˆÜ]Ûˆ[˜›Ý[™Y˜XÚÙÜ›Ý[™]^Ø[ËXXÚˆÈ™]žZ[™ÈXÜ›ÜÜÈH˜[˜XÚÈÚZ[ˆ\š[™È[˜ÚY[Ë‚ˆÈ\š[™È›ÝšY\ˆ[˜ÚY[ÈXXÚØ[[ÛÈ™]šY\ÈÈ˜[œÈÝ]XÜ›ÜÜÈH˜[˜XÚÈÚZ[‹][\Z[™È™\]Y\ÝˆÈ›Û[YHÛˆ[™XYKYYÜ˜YY[™Ú[ËˆH\‹]\ÚÈÙ[X\Ü™HØ\È[‹Y›YÚØ[ÈÛÈ™]žH[\YšXØ][Û‚ˆÈÝ^\È›Ý[™YˆÙYHÌŒÌÌ‚—Ø]^ÜÞ[˜×ÜÙ[X\Ü™\ÎˆXÝÜÝ‹\VÚ[™XY[™Ë›Ý[™YÙ[X\Ü™WWHHßB—Ø]^Ø\Þ[˜×ÜÙ[X\Ü™\ÎˆXÝÕ\VÜÝ‹[K\VÚ[[žWWHHßB—Ø]^ÜÙ[WÛØÚÈH™XY[™Ë“ØÚÊ
+B‚‚™YˆÙÙ]Ý\Ú×ÛX^ØÛÛ˜Ý\œ™[˜ÞJ\ÚÎˆÜ[Û˜[ÜÝ—JHOˆÜ[Û˜[Ú[N‚ˆˆˆ˜]^[X\žK\ÚÏ‹›X^ØÛÛ˜Ý\œ™[˜ÞX\ÈHÜÚ]]™H[Üˆ›Û™Kˆš\Ú[Ûˆ\Ù\È\ÈÙ^H›Ü‚ˆ]È[˜ÛÙKÜ™\Ú^™HÔHÛÛÈ]ÈHØ[ÈÝ^HÛÛ˜Ý\œ™[ˆˆˆ‚ˆYˆ›Ý\ÚÈÜˆ\ÚÈOHš\Ú[ÛˆŽ‚ˆ™]\›ˆ›Û™BˆžN‚ˆ˜[YHH[
+ÙÙ]Ø]^[X\žWÝ\Ú×ØÛÛ™šYÊ\ÚÊK™Ù]
+›X^ØÛÛ˜Ý\œ™[˜ÞHŠJBˆ^Ù\
+\Q\œ›Ü‹˜[YQ\œ›ÜŠNˆÈZ\ÜÚ[™È
+›Û™JHÜˆX[›Ü›YYˆ™]\›ˆ›Û™Bˆ™]\›ˆ˜[YHYˆ˜[YHˆ[ÙH›Û™B‚‚™YˆØØXÚYÜÙ[X\Ü™JÝÜ™NˆXÝÙ^Nˆ[žK[Z]ˆ[˜XÝÜžNˆØ[X›VÖÚ[K[žWJHOˆ[žN‚ˆˆˆ”™]\›ˆHØXÚYÙ[X\Ü™H›ÜˆÙ^X™XZ[[™È]Ú[ˆH[Z]Ú[™ÙYˆˆˆ‚ˆÚ]Ø]^ÜÙ[WÛØÚÎ‚ˆ[žHHÝÜ™K™Ù]
+Ù^JBˆYˆ[žH\È›Û™HÜˆ[žVÌHOH[Z]‚ˆÝÜ™VÚÙ^WHH[žHH
+[Z]˜XÝÜžJ[Z]
+JBˆ™]\›ˆ[žVÌWB‚‚™YˆØXÜ]Z\™WÜÞ[˜×Ø]^ÜÙ[X\Ü™J\ÚÎˆÜ[Û˜[ÜÝ—JHOˆÜ[Û˜[Ý™XY[™Ë›Ý[™YÙ[X\Ü™WN‚ˆˆˆ‘Ù]H\‹]\ÚÈÞ[˜ÈÙ[X\Ü™K™XZ[[™È]Y\ˆHÛÛ™šYÈÚ[™ÙKˆˆˆ‚ˆ[Z]HÙÙ]Ý\Ú×ÛX^ØÛÛ˜Ý\œ™[˜ÞJ\ÚÊBˆ™]\›ˆ›Û™HYˆ[Z]\È›Û™H[ÙHØØXÚYÜÙ[X\Ü™JØ]^ÜÞ[˜×ÜÙ[X\Ü™\Ë\ÚË[Z]™XY[™Ë›Ý[™YÙ[X\Ü™JB‚‚™YˆØXÜ]Z\™WØ\Þ[˜×Ø]^ÜÙ[X\Ü™J\ÚÎˆÜ[Û˜[ÜÝ—JN‚ˆˆˆ‘Ù]H\‹]\ÚË\‹Y]™[[ÛÜ\Þ[˜ÈÙ[X\Ü™HY\ˆÛÛ™šYÈÛÚÝ\ˆˆˆ‚ˆ[Z]HÙÙ]Ý\Ú×ÛX^ØÛÛ˜Ý\œ™[˜ÞJ\ÚÊBˆYˆ[Z]\È›Û™N‚ˆ™]\›ˆ›Û™Bˆ[\Ü\Þ[˜Ú[ÂˆžN‚ˆÛÜH\Þ[˜Ú[Ë™Ù]Ü[›š[™×ÛÛÜ
+
+Bˆ^Ù\[[YQ\œ›ÜŽ‚ˆ™]\›ˆ›Û™Bˆ™]\›ˆØØXÚYÜÙ[X\Ü™JØ]^Ø\Þ[˜×ÜÙ[X\Ü™\Ë
+\ÚËY
+ÛÜ
+JK[Z]\Þ[˜Ú[Ë”Ù[X\Ü™JB‚‚™YˆÜ™\Ù]Ø]^ÜÙ[X\Ü™\Ê
+HOˆ›Û™N‚ˆˆˆ‘›ÜØXÚYÙ[X\Ü™\È
+\Ý[\ŠKˆˆˆ‚ˆÚ]Ø]^ÜÙ[WÛØÚÎ‚ˆØ]^ÜÞ[˜×ÜÙ[X\Ü™\Ë˜ÛX\Š
+BˆØ]^Ø\Þ[˜×ÜÙ[X\Ü™\Ë˜ÛX\Š
+B‚‚ˆÈ[›ÜXËXÛÛ\]X›H[™Ú[È™XXÚYšXHHÜ[RHÑÈÜ˜\\ŽÈZ\ˆ[XYÙHÛÛ[›ØÚÜÂˆÈ]\Ý\ÙH[›ÜXÈ›Ü›X]‚—ÐS•“ÔP×ÐÓÓTUÔ“Õ’QT”ÈHœ›Þ™[œÙ]
+È›Z[š[X^‹›Z[š[X^[Ø]]‹›Z[š[X^XÛˆŸJB‚‚™YˆÚ\×Ø[›ÜX×ØÛÛ\]Ù[™Ú[
+›ÝšY\ŽˆÝ‹˜\ÙWÝ\›ˆÝŠHOˆ›ÛÛ‚ˆˆˆ•YH›ÜˆÛ›ÝÛˆ[›ÜXËXÛÛ\]X›H›ÝšY\œÈÜˆ[žHØ[›ÜXØT“]ˆˆˆ‚ˆ™]\›ˆ›ÝšY\ˆ[ˆÐS•“ÔP×ÐÓÓTUÔ“Õ’QT”ÈÜˆ‹Ø[›ÜXÈˆ[ˆ
+˜\ÙWÝ\›ÜˆˆŠK›ÝÙ\Š
+B‚‚ˆÈÜ[RH›ØÚÈ\H8¡¤ˆ
+[›ÜXÈ›ØÚÈ\KY˜][YYXH\H›Üˆ]NˆT“ÊKˆZ[šSX^	ÜÂˆÈ[›ÜXËXÛÛ\]X›H[™Ú[Ø[È\OHšY[Èˆ
+›ÝšY[×Ý\›‹Èš[œ]ÝšY[ÈŠHÚ]HØ[YBˆÈÛÝ\˜ÙXÚ\H\Èš[XYÙH‹‚—ÐS•“ÔP×ÓQQPWÐ“ÐÒÔÈHÈš[XYÙWÝ\›Žˆ
+š[XYÙH‹š[XYÙKÜ™ÈŠKšY[×Ý\›Žˆ
+šY[È‹šY[ËÛ\Š_B‚‚™YˆØÛÛ™\ÛÜ[˜ZWÚ[XYÙ\×Ý×Ø[›ÜXÊY\ÜØYÙ\Îˆ\Ý
+HOˆ\Ý‚ˆˆˆÛÛ™\Ü[RH[XYÙWÝ\›ØšY[×Ý\››ØÚÜÈÈ[›ÜXÈ[XYÙXØšY[ØÂˆÛ›H\ÝXÛÛ[Y\ÜØYÙ\ÈÚ]ÝXÚ›ØÚÜÈÚ[™ÙKˆˆˆ‚ˆÛÛ™\YH×Bˆ›Üˆ\ÙÈ[ˆY\ÜØYÙ\Î‚ˆÛÛ[H\ÙË™Ù]
+˜ÛÛ[ŠBˆYˆ›Ý\Ú[œÝ[˜ÙJÛÛ[\Ý
+N‚ˆÛÛ™\Y˜\[™
+\ÙÊBˆÛÛ[YBˆ™]×ØÛÛ[H×BˆÚ[™ÙYH˜[ÙBˆ›Üˆ›ØÚÈ[ˆÛÛ[‚ˆ›ØÚ×Ý\HH›ØÚË™Ù]
+\HŠBˆYˆ›ØÚ×Ý\H›Ý[ˆÐS•“ÔP×ÓQQPWÐ“ÐÒÔÎ‚ˆ™]×ØÛÛ[˜\[™
+›ØÚÊBˆÛÛ[YBˆ\›H
+›ØÚË™Ù]
+›ØÚ×Ý\JHÜˆßJK™Ù]
+\›‹ˆŠBˆ[Ý\KYYXWÝ\HHÐS•“ÔP×ÓQQPWÐ“ÐÒÔÖØ›ØÚ×Ý\WBˆYˆ\›œÝ\ÝÚ]
+™]NˆŠN‚ˆXY\‹Ë]HH\›œ\][ÛŠ‹ŠBˆYˆŽˆˆ[ˆXY\ˆ[™ŽÈˆ[ˆXY\Ž‚ˆYYXWÝ\HHXY\‹œÜ]
+Žˆ‹JVÌWKœÜ]
+ŽÈ‹JVÌBˆÛÝ\˜ÙHHÈ\HŽˆ˜˜\ÙM‹›YYXWÝ\HŽˆYYXWÝ\K™]HŽˆ]_Bˆ[ÙN‚ˆÛÝ\˜ÙHHÈ\HŽˆ\›‹\›Žˆ\›Bˆ™]×ØÛÛ[˜\[™
+È\HŽˆ[Ý\KœÛÝ\˜ÙHŽˆÛÝ\˜Ù_JBˆÚ[™ÙYHYBˆÛÛ™\Y˜\[™
+ÊŠ›\ÙË˜ÛÛ[Žˆ™]×ØÛÛ[HYˆÚ[™ÙY[ÙH\ÙÊBˆ™]\›ˆÛÛ™\Y‚‚—Ô“Ñ’SWÔ‘PTÓÓ’S‘×ÒÑVTÈHÂˆœ™X\ÛÛš[™È‹œ™X\ÛÛš[™×ÙY™›Ü‹[šÚ[™È‹[šÚ[™×ØÛÛ™šYÈ‹[šÚ[™ØÛÛ™šYÈ‹ˆ[šÚ[™×ØYÙ]‹[šÚ[™ØYÙ]‹™[˜X›WÝ[šÚ[™È‹[šÈ‹™\˜›ÜÚ]H‹ŸB‚‚™YˆØÛÛZ[œ×Ü›Ùš[WÜ™X\ÛÛš[™×ÙšY[Ê˜[YNˆ[žJHOˆ›ÛÛ‚ˆˆˆ”™]\›ˆÚ]\ˆH›Ùš[H^[ØYÛÛZ[œÈH™X\ÛÛš[™ÈÚ\™HÛÛ›Û
+™XÝ\œÚ]™JKˆˆˆ‚ˆYˆ›Ý\Ú[œÝ[˜ÙJ˜[YKXÝ
+N‚ˆ™]\›ˆ˜[ÙBˆ™]\›ˆ[žJˆÝŠÙ^JKœÝš\
+
+K›ÝÙ\Š
+H[ˆÔ“Ñ’SWÔ‘PTÓÓ’S‘×ÒÑVTÈÜˆØÛÛZ[œ×Ü›Ùš[WÜ™X\ÛÛš[™×ÙšY[Ê™\ÝY
+Bˆ›ÜˆÙ^K™\ÝY[ˆ˜[YKš][\Ê
+Bˆ
+B‚‚—Ó“ÕT×Ô“Õ’QT—ÓSQTÈHœ›Þ™[œÙ]
+È››Ý\È‹››Ý\Ë\Ü[‹››Ý\Ü™\ÙX\˜ÚŸJB‚‚™YˆÛ›Ý\×ÛÛ—ÛY\ÜØYÙ\×ÝÚ\™J›ÝšY\—Û›Ü›NˆÝ‹[Ù[ˆÝŠHOˆ›ÛÛ‚ˆˆˆ•YHÚ[ˆH›Ý\ÈÜ[›Ý]HÙ\™\È[Ù[Ý™\ˆÝŒKÛY\ÜØYÙ\È
+X[]Ú\™HØ][ÙÊKˆˆˆ‚ˆYˆ›ÝšY\—Û›Ü›H›Ý[ˆÓ“ÕT×Ô“Õ’QT—ÓSQTÎ‚ˆ™]\›ˆ˜[ÙBˆœ›ÛH\›Y\×ØÛKœ›ÝšY\œÈ[\Ü›Ý\×Ø\WÛ[ÙBˆ™]\›ˆ›Ý\×Ø\WÛ[ÙJ[Ù[
+HOH˜[›ÜX×ÛY\ÜØYÙ\È‚‚‚—Ó•’QPWÔ“Õ’QT—ÓSQTÈHÈ›šYXH‹›šYXK[š[H‹›š[H‹˜Z[[šYXH‹›™[[Ý›ÛˆŸB—ÑÑSRS’WÓUU‘WÔ“Õ’QT—ÓSQTÈHÈ™Ù[Z[šH‹™ÛÛÙÛH‹™ÛÛÙÛKYÙ[Z[šH‹™ÛÛÙÛKXZK\ÝY[ÈŸB‚‚™YˆÚ\×ÙÙ[Z[šWÛ˜]]™WÜ›Ý]J›ÝšY\—Û›Ü›NˆÝ‹Y™™XÝ]™WØ˜\ÙNˆÝŠHOˆ›ÛÛ‚ˆˆˆ‘Ù[Z[šH˜]]™HžH›ÝšY\ˆ˜[YK[ÙH
+™\ÝYY™›Ü
+HžH˜\ÙHT“Ú\Kˆˆˆ‚ˆYˆ›ÝšY\—Û›Ü›H[ˆÑÑSRS’WÓUU‘WÔ“Õ’QT—ÓSQTÎ‚ˆ™]\›ˆYBˆYˆ›ÝY™™XÝ]™WØ˜\ÙN‚ˆ™]\›ˆ˜[ÙBˆžN‚ˆœ›ÛHYÙ[™Ù[Z[šWÛ˜]]™WØY\\ˆ[\Ü\×Û˜]]™WÙÙ[Z[šWØ˜\ÙWÝ\›ˆ™]\›ˆ\×Û˜]]™WÙÙ[Z[šWØ˜\ÙWÝ\›
+Y™™XÝ]™WØ˜\ÙJBˆ^Ù\^Ù\[ÛŽ‚ˆ™]\›ˆ˜[ÙB‚‚™YˆÙ›ÜØ\™×ÛX^ÝÚÙ[œÊ›ÝšY\ŽˆÝ‹›ÝšY\—Û›Ü›NˆÝ‹[Ù[ˆÝ‹Y™™XÝ]™WØ˜\ÙNˆÝ‹\ÚÎˆÜ[Û˜[ÜÝ—JHOˆ›ÛÛ‚ˆˆˆ•Ú]\ˆ[ˆ^XÚ]X^ÝÚÙ[œÈ\È›ÜØ\™YÛˆ\È›Ý]K‚‚ˆ›ÈY˜][Ø\[Ù]Ú\™H
+ÛZ]YH›ÝšY\ˆY˜][È]›ÚYÈX^ØÛÛ\][Û—ÝÚÙ[œÈÈRK]š\Ú[Û‚ˆ]Z\šÜÊKˆ›ÜØ\™Û›HÚ\™HX[™]ÜžHÜˆÛ›Ü™Yˆ[›ÜXÈY\ÜØYÙ\ÈÚ\™H
+Ú]Ý]]
+NÂˆ•’QPH’SH
+[\HÚÚXÙ\Ö×HÚ[ˆÛZ]Y
+NÈ[ÐH™Y™\™[˜ÙHÛÝÎÈÙ[Z[šH˜]]™H
+š^YKLÍBˆÙZ[[™ÈÝ\Ú\ÙJNÈÜ[”›Ý]\ˆ
+YÙ]ÈH•SÚ[™ÝÈÚ[ˆÛZ]Y8¡¤ˆˆÛˆÝÈÜ™Y]
+NÂˆX[˜YÙYØØ[[XK\Ù\™\ˆ
+[˜Ø\YXÛÙHÚ]›ÈSÔÈ\›œÈHÔHÈHÛÛ^Ú[™ÝÊK‚ˆˆˆ‚ˆ™]\›ˆ
+ˆÚ\×Ø[›ÜX×ØÛÛ\]Ù[™Ú[
+›ÝšY\‹Y™™XÝ]™WØ˜\ÙJBˆÜˆÛ›Ý\×ÛÛ—ÛY\ÜØYÙ\×ÝÚ\™J›ÝšY\—Û›Ü›K[Ù[
+BˆÜˆ›ÝšY\—Û›Ü›H[ˆÓ•’QPWÔ“Õ’QT—ÓSQTÂˆÜˆ˜\ÙWÝ\›ÚÜÝÛX]Ú\ÊY™™XÝ]™WØ˜\ÙKš[YÜ˜]K˜\K›šYXK˜ÛÛHŠBˆÜˆÝŠ\ÚÊHOH›[ØWÜ™Y™\™[˜ÙH‚ˆÜˆÚ\×ÙÙ[Z[šWÛ˜]]™WÜ›Ý]J›ÝšY\—Û›Ü›KY™™XÝ]™WØ˜\ÙJBˆÜˆ›ÝšY\—Û›Ü›HOH›Ü[œ›Ý]\ˆ‚ˆÜˆ˜\ÙWÝ\›ÚÜÝÛX]Ú\ÊY™™XÝ]™WØ˜\ÙK›Ü[œ›Ý]\‹˜ZHŠBˆÜˆÚ\×ÛX[˜YÙYÛØØ[Ù[™Ú[
+Y™™XÝ]™WØ˜\ÙJBˆ
+B‚‚™YˆÙY\WÝÛÛÛ˜[Y\ÊÛÛÎˆ\Ý›ÝšY\ŽˆÝ‹[Ù[ˆÝŠHOˆ\Ý‚ˆˆˆ‘›Ü\XØ]HÛÛ˜[Y\È
+™\^Ð^\™KÐ™Y›ØÚÈÛˆ[JHÚ]HØ\›š[™Ëˆˆˆ‚ˆÙY[ŽˆÙ]HÙ]
+
+BˆY\Yˆ\ÝH×Bˆ›ÜˆÛÛ[ˆÛÛÎ‚ˆ˜[YHH
+ÛÛ™Ù]
+™[˜Ý[ÛˆŠHÜˆßJK™Ù]
+›˜[YH‹ˆŠBˆYˆ˜[YH[™˜[YH[ˆÙY[Ž‚ˆÙÙÙ\‹Ø\›š[™Ê—ØZ[ØØ[ÚÝØ\™ÜÎˆ\XØ]HÛÛ˜[YH	É\ÉÈ™[[Ý™Y
+›ÝšY\I\È[Ù[I\ÊH‹˜[YK›ÝšY\‹[Ù[
+BˆÛÛ[YBˆYˆ˜[YN‚ˆÙY[‹˜Y
+˜[YJBˆY\Y˜\[™
+ÛÛ
+Bˆ™]\›ˆY\Y‚‚˜Û\ÜÈÔ›Ùš[T›Ú™XÝ[ÛŠ˜[YY\JN‚ˆ›ÙNˆXÝÜÝ‹[žWBˆ™X\ÛÛš[™×Ù^˜NˆXÝÜÝ‹[žWBˆÜÛ]™[ˆXÝÜÝ‹[žWBˆ[™\×Ü™X\ÛÛš[™Îˆ›ÛÛ‚‚™YˆÜ›Ú™XÝÜ›ÝšY\—Ü›Ùš[Jˆ›ÝšY\ŽˆÝ‹›ÝšY\—Û›Ü›NˆÝ‹[Ù[ˆÝ‹Y™™XÝ]™WØ˜\ÙNˆÝ‹™X\ÛÛš[™×ØÛÛ™šYÎˆÜ[Û˜[ÙXÝKŠHOˆÔ›Ùš[T›Ú™XÝ[ÛŽ‚ˆˆˆ”›ÝšY\ˆ›Ùš[IÜÈ^˜WØ›ÙHÈÝØ\™ÜÈ›Ú™XÝ[ÛŽÈ\X[Ûˆ˜Z[\™Kˆˆˆ‚ˆ›ÙNˆXÝÜÝ‹[žWHHßBˆ™X\ÛÛš[™×Ù^˜NˆXÝÜÝ‹[žWHHßBˆÜÛ]™[ˆXÝÜÝ‹[žWHHßBˆ[™\×Ü™X\ÛÛš[™ÈH˜[ÙBˆžN‚ˆœ›ÛH›ÝšY\œÈ[\ÜÙ]Ü›ÝšY\—Ü›Ùš[Bˆœ›ÛH›ÝšY\œË˜˜\ÙH[\Ü›ÝšY\”›Ùš[Bˆ›Ùš[HHÙ]Ü›ÝšY\—Ü›Ùš[J›ÝšY\—Û›Ü›JBˆYˆ›Ùš[H\È›Ý›Û™N‚ˆ›ÙHH›Ùš[K˜Z[Ù^˜WØ›ÙJ[Ù[[[Ù[˜\ÙWÝ\›YY™™XÝ]™WØ˜\ÙK™X\ÛÛš[™×ØÛÛ™šYÏ\™X\ÛÛš[™×ØÛÛ™šYÊHÜˆßBˆ™X\ÛÛš[™×Ù^˜KÜÛ]™[H›Ùš[K˜Z[Ø\WÚÝØ\™Ü×Ù^˜\Êˆ™X\ÛÛš[™×ØÛÛ™šYÏ\™X\ÛÛš[™×ØÛÛ™šYËÝ\Ü×Ü™X\ÛÛš[™Ï\™X\ÛÛš[™×ØÛÛ™šYÈ\È›Ý›Û™Kˆ[Ù[[[Ù[˜\ÙWÝ\›YY™™XÝ]™WØ˜\ÙKˆ
+Bˆ™X\ÛÛš[™×Ù^˜HH™X\ÛÛš[™×Ù^˜HÜˆßBˆÜÛ]™[HÜÛ]™[ÜˆßBˆ[™\×Ü™X\ÛÛš[™ÈH
+ˆ\J›Ùš[JK˜Z[Ø\WÚÝØ\™Ü×Ù^˜\È\È›Ý›ÝšY\”›Ùš[K˜Z[Ø\WÚÝØ\™Ü×Ù^˜\ÂˆÜˆØÛÛZ[œ×Ü›Ùš[WÜ™X\ÛÛš[™×ÙšY[Ê›ÙJBˆÜˆØÛÛZ[œ×Ü›Ùš[WÜ™X\ÛÛš[™×ÙšY[Ê™X\ÛÛš[™×Ù^˜JBˆÜˆØÛÛZ[œ×Ü›Ùš[WÜ™X\ÛÛš[™×ÙšY[ÊÜÛ]™[
+Bˆ
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙÙÙ\‹™XYÊ—ØZ[ØØ[ÚÝØ\™ÜÎˆ›ÝšY\ˆ›Ùš[H›Ú™XÝ[Ûˆ˜Z[Y›Üˆ	\Îˆ	\È‹›ÝšY\‹^ÊBˆ™]\›ˆÔ›Ùš[T›Ú™XÝ[ÛŠ›ÙK™X\ÛÛš[™×Ù^˜KÜÛ]™[[™\×Ü™X\ÛÛš[™ÊB‚‚™YˆÛY\™ÙWØ]^Ù^˜WØ›ÙJˆ^˜WØ›ÙNˆÜ[Û˜[ÙXÝK›Ú™XÝ[ÛŽˆÔ›Ùš[T›Ú™XÝ[Û‹™X\ÛÛš[™×ØÛÛ™šYÎˆÜ[Û˜[ÙXÝK›ÝšY\—Û›Ü›NˆÝ‹ŠHOˆXÝÜÝ‹[žWN‚ˆˆˆØ[\ˆ^˜WØ›ÙH
+È›Ùš[H›ÙKÜ™X\ÛÛš[™È
+ÈÙ[™\šXÈ™X\ÛÛš[™È˜[˜XÚÈ
+È›Ý\ÈYÜËˆˆˆ‚ˆY\™ÙYÙ^˜HHXÝ
+^˜WØ›ÙHÜˆßJBˆY\™ÙYÙ^˜K\]J›Ú™XÝ[Û‹˜›ÙJBˆY\™ÙYÙ^˜K\]J›Ú™XÝ[Û‹œ™X\ÛÛš[™×Ù^˜JBˆYˆ™X\ÛÛš[™×ØÛÛ™šYÈ[™\Ú[œÝ[˜ÙJ™X\ÛÛš[™×ØÛÛ™šYËXÝ
+H[™›Ý›Ú™XÝ[Û‹š[™\×Ü™X\ÛÛš[™Î‚ˆYˆ™X\ÛÛš[™×ØÛÛ™šYË™Ù]
+™[˜X›YŠH\È˜[ÙN‚ˆY\™ÙYÙ^˜VÈœ™X\ÛÛš[™È—HHÈ™[˜X›YŽˆ˜[Ù_Bˆ[ÙN‚ˆY\™ÙYÙ^˜VÈœ™X\ÛÛš[™È—HHÈ™[˜X›YŽˆYK™Y™›ÜŽˆ™X\ÛÛš[™×ØÛÛ™šYË™Ù]
+™Y™›ÜŠHÜˆ›YY][HŸBˆÈÜ[YÜÈ
+ÈÝXÚÞHÙ\ÜÚ[Û—ÚY˜[˜XÚÈÚ[ˆH›Ùš[HY‰ÝÝ\H[NÈÙ\ÜÚ[Û—ÚYˆÈÙY\È]^Ø[ÈÛˆHXZ[ˆ\›‰ÜÈ\Ý™X[H[œÝ[˜ÙH
+ØXÚHØ\›]
+H8 %YÜÈ[Û™H\™H›ÝˆÈ[›ÝYÚÛˆÝŒKÛY\ÜØYÙ\Ë‚ˆYˆ›ÝšY\—Û›Ü›H[ˆÓ“ÕT×Ô“Õ’QT—ÓSQTÎ‚ˆYˆYÜÈˆ›Ý[ˆY\™ÙYÙ^˜N‚ˆY\™ÙYÙ^˜VÈYÜÈ—HHÛ›Ý\×ÜÜ[ÝYÜÊ
+BˆYˆœÙ\ÜÚ[Û—ÚYˆ›Ý[ˆY\™ÙYÙ^˜N‚ˆžN‚ˆœ›ÛHYÙ[œÜ[ÝYÜÈ[\ÜÙ]ØÛÛ™\œØ][Û—ØÛÛ^ˆÝXÚÞWÚÙ^HHÙ]ØÛÛ™\œØ][Û—ØÛÛ^
+
+Bˆ^Ù\^Ù\[ÛŽ‚ˆÝXÚÞWÚÙ^HH›Û™BˆYˆÝXÚÞWÚÙ^N‚ˆY\™ÙYÙ^˜VÈœÙ\ÜÚ[Û—ÚY—HHÝXÚÞWÚÙ^Bˆ™]\›ˆY\™ÙYÙ^˜B‚‚™YˆØZ[ØØ[ÚÝØ\™ÜÊˆ›ÝšY\ŽˆÝ‹[Ù[ˆÝ‹Y\ÜØYÙ\Îˆ\Ý[\\˜]\™NˆÜ[Û˜[Ù›Ø]HH›Û™KˆX^ÝÚÙ[œÎˆÜ[Û˜[Ú[HH›Û™KÛÛÎˆÜ[Û˜[Û\ÝHH›Û™K[Y[Ý]ˆ›Ø]HÌŒˆ^˜WØ›ÙNˆÜ[Û˜[ÙXÝHH›Û™K™X\ÛÛš[™×ØÛÛ™šYÎˆÜ[Û˜[ÙXÝHH›Û™Kˆ˜\ÙWÝ\›ˆÜ[Û˜[ÜÝ—HH›Û™K\ÚÎˆÜ[Û˜[ÜÝ—HH›Û™KŠHOˆXÝ‚ˆˆˆZ[ÝØ\™ÜÈ›Üˆ˜Ú]˜ÛÛ\][ÛœË˜Ü™X]J
+HÚ][Ù[Ü›ÝšY\ˆY\ÝY[Ëˆˆˆ‚ˆÝØ\™ÜÎˆXÝÜÝ‹[žWHHÈ›[Ù[Žˆ[Ù[›Y\ÜØYÙ\ÈŽˆY\ÜØYÙ\Ë[Y[Ý]Žˆ[Y[Ý]BˆÈ\‹[[Ù[š^YÛÛZ]Y[\\˜]\™K[ˆÜ\ÈÊÈØ[\[™È˜[œÎˆ]™Z™XÝÈ[žBˆÈ›Û‹YY˜][[\\˜]\™KÝÜÜÝÜÚËÛÈ›ÜÚ[[H˜]\ˆ[ˆÚ[ˆH]^[Ù[›\Ë‚ˆš^YÝ[\\˜]\™HHÙš^YÝ[\\˜]\™WÙ›Ü—Û[Ù[
+[Ù[˜\ÙWÝ\›
+BˆYˆš^YÝ[\\˜]\™H\ÈÓRUÕSTTUT‘N‚ˆ[\\˜]\™HH›Û™HÈÝš\8 %]Ù\™\ˆÚÛÜÙBˆ[Yˆš^YÝ[\\˜]\™H\È›Ý›Û™N‚ˆ[\\˜]\™HHš^YÝ[\\˜]\™BˆYˆ[\\˜]\™H\È›Ý›Û™N‚ˆœ›ÛHYÙ[˜[›ÜX×ØY\\ˆ[\ÜÙ›Ü˜šY×ÜØ[\[™×Ü\˜[\ÂˆYˆ›ÝÙ›Ü˜šY×ÜØ[\[™×Ü\˜[\Ê[Ù[
+N‚ˆÝØ\™ÜÖÈ[\\˜]\™H—HH[\\˜]\™BˆY™™XÝ]™WØ˜\ÙHH˜\ÙWÝ\›Üˆ
+ØÝ\œ™[ØÝ\ÝÛWØ˜\ÙWÝ\›
+
+HYˆ›ÝšY\ˆOH˜Ý\ÝÛHˆ[ÙHˆŠBˆ›ÝšY\—Û›Ü›HHÝŠ›ÝšY\ˆÜˆˆŠKœÝš\
+
+K›ÝÙ\Š
+BˆYˆX^ÝÚÙ[œÈ\È›Ý›Û™H[™Ù›ÜØ\™×ÛX^ÝÚÙ[œÊ›ÝšY\‹›ÝšY\—Û›Ü›K[Ù[Y™™XÝ]™WØ˜\ÙK\ÚÊN‚ˆÝØ\™ÜË\]J]^[X\žWÛX^ÝÚÙ[œ×Ü\˜[JX^ÝÚÙ[œË[Ù[[[Ù[
+JHÈXÚÜÈX^ØÛÛ\][Û—ÝÚÙ[œÈÚ\™H™YYYˆYˆÛÛÎ‚ˆÝØ\™ÜÖÈÛÛÈ—HHÙY\WÝÛÛÛ˜[Y\ÊÛÛË›ÝšY\‹[Ù[
+BˆÈ›ÝšY\ˆ›Ùš[\È\™HHÛÝ\˜ÙHÙˆ]›Üˆ™X\ÛÛš[™ÈÚ\™HÚ\\È
+Ü[]™[™\ÝY›ÙKˆÈÜˆ^˜WØ›ÙKœ™X\ÛÛš[™ÊNÈ›ÝšY\œÈÚ]Ý]H™X\ÛÛš[™ËX]Ø\™H›Ùš[HÙY\HÙ[™\šXÂˆÈ^˜WØ›ÙKœ™X\ÛÛš[™Ø˜[˜XÚË‚ˆ›Ú™XÝ[ÛˆHÜ›Ú™XÝÜ›ÝšY\—Ü›Ùš[J›ÝšY\‹›ÝšY\—Û›Ü›K[Ù[Y™™XÝ]™WØ˜\ÙK™X\ÛÛš[™×ØÛÛ™šYÊBˆÝØ\™ÜË\]J›Ú™XÝ[Û‹ÜÛ]™[
+BˆYˆY\™ÙYÙ^˜HHÛY\™ÙWØ]^Ù^˜WØ›ÙJ^˜WØ›ÙK›Ú™XÝ[Û‹™X\ÛÛš[™×ØÛÛ™šYË›ÝšY\—Û›Ü›JN‚ˆÝØ\™ÜÖÈ™^˜WØ›ÙH—HHY\™ÙYÙ^˜BˆÈ[›ÜXÈY\ÜØYÙ\ÈY\\œÈZÙH™X\ÛÛš[™ÈšXHHš]˜]HÝØ\™È]Z[ˆÜ[RHÑÈÛY[ÂˆÈÛÝ[™Z™XÝÈÜ[Û]YH\ÈX[]Ú\™KÛÈ[˜ÛYH]Û›HÚ[ˆHØ][ÙÈYÙ[XÝÂˆÈÝŒKÛY\ÜØYÙ\Ë‚ˆYˆ™X\ÛÛš[™×ØÛÛ™šYÈ[™\Ú[œÝ[˜ÙJ™X\ÛÛš[™×ØÛÛ™šYËXÝ
+N‚ˆ˜]×Ø˜\ÙHH˜\ÙWÝ\›Üˆˆ‚ˆYˆ
+ˆ›ÝšY\—Û›Ü›HOH˜[›ÜXÈˆÜˆÛ›Ý\×ÛÛ—ÛY\ÜØYÙ\×ÝÚ\™J›ÝšY\—Û›Ü›K[Ù[
+BˆÜˆÙ[™Ú[ÜÜXZÜ×Ø[›ÜX×ÛY\ÜØYÙ\Ê˜]×Ø˜\ÙJHÜˆÚ\×Ø[›ÜX×ØÛÛ\]Ù[™Ú[
+›ÝšY\—Û›Ü›K˜]×Ø˜\ÙJBˆ
+N‚ˆÝØ\™ÜÖÈ—Ü™X\ÛÛš[™×ØÛÛ™šYÈ—HHXÝ
+™X\ÛÛš[™×ØÛÛ™šYÊBˆÈÜ[ÛÙH™[^HÙ\ÜÚ[ÛˆY™š[š]H8 %Ø[YHÙ^H\ÈHXZ[ˆ\›ˆÛÈÛÛ\™\ÜÚ[Û‹Ý]KÝš\Ú[Û‚ˆÈØ[ÈÝ^HÛˆHÛÛ™\œØ][Û‰ÜÈØ\›H˜XÚÙ[™‚ˆœ›ÛHYÙ[›Ü[˜ÛÙWØY™š[š]H[\ÜY\™ÙWÛÜ[˜ÛÙWÜÙ\ÜÚ[Û—ÚXY\œÂˆ™]\›ˆY\™ÙWÛÜ[˜ÛÙWÜÙ\ÜÚ[Û—ÚXY\œÊÝØ\™ÜË›ÝšY\‹˜\ÙWÝ\›Ü[[YWÛXZ[—Ý˜[YJœÙ\ÜÚ[Û—ÚYŠHÜˆ›Û™JB‚‚™YˆÝ˜[Y]WÛWÜ™\ÜÛœÙJˆ™\ÜÛœÙNˆ[žK\ÚÎˆÜ[Û˜[ÜÝ—HH›Û™K›ÝšY\ŽˆÜ[Û˜[ÜÝ—HH›Û™K˜\ÙWÝ\›ˆÜ[Û˜[ÜÝ—HH›Û™KŠHOˆ[žN‚ˆˆˆ•˜[Y]HH˜ÚÚXÙ\ÖÌK›Y\ÜØYÙHÚ\H
+˜Z[˜\Ý›ÝHÝÛœÝ™X[H]šX]Q\œ›ÜŠK‚‚ˆ[ÛÈHÚ[™ÛH]^]\ØYÙHXØÛÝ[[™ÈÚÚÙ\Ú[ˆ]™\žHÝXØÙ\ÜÙ[›Û‹\Ý™X[Z[™È™\ÜÛœÙBˆ\ÜÙ\È\™H^XÝHÛ˜ÙNÈ
+œ›ÝšY\Š‹Ê˜˜\ÙWÝ\›
+ˆ\™HÜ[Û˜[[Ë‚‚ˆÙYHÍÌ‚ˆ™XÛÜ™[™È\È™\ÝYY™›Ü[™™]™\ˆY™™XÝÈ˜[Y][Û‹ˆ
+œ›ÝšY\Š‹Ê˜˜\ÙWÝ\›
+ˆ\™HÜ[Û˜[XØÛÝ[[™Âˆ[È8 %˜[˜XÚË\]Ø[ÈÛZ][H[™H›ÝÈÙY\ÈH[Ù[
+™XYœ›ÛHH™\ÜÛœÙH]Ù[ŠHÚ]ˆ[ˆ[\H›Ý]KˆÙYHÌŒÌÌ‚ˆˆˆ‚ˆYˆ™\ÜÛœÙH\È›Û™N‚ˆ˜Z\ÙH[[YQ\œ›ÜŠˆ]^[X\žHÝ\ÚÈÜˆ	ØØ[	ßNˆH™]\›™Y›Û™H™\ÜÛœÙHŠBˆœ›ÛHYÙ[˜]^ØXØÛÝ[[™È[\Ü™XÛÜ™Ø]^Ý\ØYÙBˆ™XÛÜ™Ø]^Ý\ØYÙJ™\ÜÛœÙK\ÚË›ÝšY\\›ÝšY\‹˜\ÙWÝ\›X˜\ÙWÝ\›
+BˆÈY\\ˆÚ[\S˜[Y\ÜXÙH™\ÜÛœÙ\È\™Hš[™H8 %^H]™H˜ÚÚXÙ\ÖÌK›Y\ÜØYÙK‚ˆžN‚ˆÚÚXÙ\ÈH™\ÜÛœÙK˜ÚÚXÙ\ÂˆYˆ›ÝÚÚXÙ\ÈÜˆ›Ý\Ø]ŠÚÚXÙ\ÖÌK›Y\ÜØYÙHŠN‚ˆ˜Z\ÙH]šX]Q\œ›ÜŠ›Z\ÜÚ[™ÈÚÚXÙ\ÖÌK›Y\ÜØYÙHŠBˆ^Ù\
+]šX]Q\œ›Ü‹\Q\œ›Ü‹[™^\œ›ÜŠH\È^Î‚ˆ™XÛÝ™\™YHÜ™XÛÝ™\—Ø]^Ü™\ÜÛœÙWÛY\ÜØYÙJ™\ÜÛœÙJBˆYˆ™XÛÝ™\™Y\È›Û™N‚ˆ˜Z\ÙH[[YQ\œ›ÜŠˆˆ]^[X\žHÝ\ÚÈÜˆ	ØØ[	ßNˆH™]\›™Y[˜[Y™\ÜÛœÙH
+\O^Ý\J™\ÜÛœÙJK—×Û˜[YW×ßJNˆ‚ˆˆžÜÝŠ™\ÜÛœÙJVÎŒLŒH\ŸKˆ^XÝYØš™XÝÚ]˜ÚÚXÙ\ÖÌK›Y\ÜØYÙH8 %ÚXÚÈ›ÝšY\ˆ‚ˆˆ˜Y\\ˆÜˆÝ\ÝÛH[™Ú[ÛÛ\]Xš[]Kˆ‚ˆ
+Hœ›ÛH^Âˆ™\ÜÛœÙHH™XÛÝ™\™YˆÈ™]Z[ˆH›ÝšY\‹\™\ÜY[Ù[›Üˆ\›Z[˜[™[^H›Ý]H]šX][Û‹‚ˆÛÛ^HÔ‘SVWÐUVÐÐSÐÓÓ•V™Ù]
+
+BˆYˆÛÛ^\È›Ý›Û™N‚ˆ[Ù[HÙšY[
+™\ÜÛœÙK›[Ù[ŠBˆYˆ\Ú[œÝ[˜ÙJ[Ù[ÝŠH[™[Ù[œÝš\
+
+N‚ˆÛÛ^Èœ™\ÜÛœÙWÛ[Ù[—HH[Ù[ˆØÛÛ\]WÜ™[^WØ]^[X\žWØØ[
+
+Bˆ™]\›ˆ™\ÜÛœÙB‚‚™YˆØÛÛ\]WÜ™[^WØ]^[X\žWØØ[
+
+‹Ý]ÛÛYNˆÝˆHœÝXØÙ\ÜÈŠHOˆ›Û™N‚ˆˆˆÛÜÙHÛ™H]^[X\žHÙÚXØ[Ø[Y\ˆXØÙ\[˜ÙHÜˆ\›Z[˜[˜Z[\™Kˆˆˆ‚ˆÛÛ^HÔ‘SVWÐUVÐÐSÐÓÓ•V™Ù]
+
+BˆYˆÛÛ^\È›Û™N‚ˆ™]\›‚ˆœ›ÛHYÙ[[\Ü™[^WÛBˆ™[^WÛK˜ÛÛ\]WÛÙÚXØ[ØØ[
+ˆÝŠÛÛ^™Ù]
+œ™\]Y\ÝÚYŠHÜˆˆŠKÝ]ÛÛYO[Ý]ÛÛYKˆ[Ù[Û˜[YO\ÝŠÛÛ^™Ù]
+›[Ù[ŠHÜˆ[šÛ›ÝÛˆŠKˆ›ÝšY\—Û˜[YO\ÝŠÛÛ^™Ù]
+œ›ÝšY\ˆŠHÜˆ˜]^[X\žHŠKˆ™\ÜÛœÙWÛ[Ù[Û˜[YOXÛÛ^™Ù]
+œ™\ÜÛœÙWÛ[Ù[ŠKˆ
+B‚‚™YˆÙ˜Z[Ü™[^WØ]^[X\žWØØ[
+
+HOˆ›Û™N‚ˆˆˆÛÜÙHH\›Z[˜[H˜Z[YØ[Ú]Ý]™\XÚ[™È]ÈÜšYÚ[˜[\œ›Ü‹ˆˆˆ‚ˆžN‚ˆØÛÛ\]WÜ™[^WØ]^[X\žWØØ[
+Ý]ÛÛYOH™˜Z[YŠBˆ^Ù\^Ù\[ÛŽ‚ˆÙÙÙ\‹Ø\›š[™Ê”™[^H]^[X\žH˜Z[\™Hš[˜[^˜][Ûˆ˜Z[Y‹^×Ú[™›ÏUYJB‚‚™YˆÜ™XÛÝ™\—Ø]^Ü™\ÜÛœÙWÛY\ÜØYÙJ™\ÜÛœÙNˆ[žJHOˆÜ[Û˜[Ð[žWN‚ˆˆˆ”Þ[\Ú^™HÚ]XÛÛ\][ÛœÈÚ\Hœ›ÛH™\ÜÛœÙ\Ë\Ý[H^
+Ý]]Ý^ˆÝ]]][\ÊH]ÛÛYHÛÛ\]X›H[™Ú[È™]\›ˆÝ]ÚYHÚÚXÙ\Øˆˆˆ‚ˆ^HÙ^˜XÝØ]^Ü™\ÜÛœÙWÝ^
+™\ÜÛœÙJBˆYˆ›Ý^‚ˆ™]\›ˆ›Û™BˆÚÚXÙHHÚ[\S˜[Y\ÜXÙJY\ÜØYÙOTÚ[\S˜[Y\ÜXÙJÛÛ[]^
+Kš[š\ÚÜ™X\ÛÛYÙ]]Š™\ÜÛœÙK™š[š\ÚÜ™X\ÛÛˆ‹›Û™JHÜˆœÝÜŠBˆžN‚ˆ™\ÜÛœÙK˜ÚÚXÙ\ÈHØÚÚXÙWBˆ™]\›ˆ™\ÜÛœÙBˆ^Ù\^Ù\[ÛŽ‚ˆ™]\›ˆÚ[\S˜[Y\ÜXÙJˆYYÙ]]Š™\ÜÛœÙKšY‹ˆŠK[Ù[YÙ]]Š™\ÜÛœÙK›[Ù[‹ˆŠKˆØš™XÝYÙ]]Š™\ÜÛœÙK›Øš™XÝ‹˜Ú]˜ÛÛ\][ÛˆŠKÚÚXÙ\ÏVØÚÚXÙWKˆ\ØYÙOYÙ]]Š™\ÜÛœÙK\ØYÙH‹›Û™JKˆ
+B‚‚™YˆÙ^˜XÝØ]^Ü™\ÜÛœÙWÝ^
+™\ÜÛœÙNˆ[žJHOˆÝŽ‚ˆˆˆ•^œ›ÛH™\ÜÛœÙ\Ë\Ý[HÝ]]Ý^ÜˆÝ]]×K˜ÛÛ[×K^ˆˆˆ‚ˆÝ]]Ý^HÙšY[
+™\ÜÛœÙK›Ý]]Ý^ŠBˆYˆ\Ú[œÝ[˜ÙJÝ]]Ý^ÝŠH[™Ý]]Ý^œÝš\
+
+N‚ˆ™]\›ˆÝ]]Ý^œÝš\
+
+BˆÝ]]HÙšY[
+™\ÜÛœÙK›Ý]]ŠBˆYˆ›Ý\Ú[œÝ[˜ÙJÝ]]\Ý
+N‚ˆ™]\›ˆˆ‚ˆ\Îˆ\ÝÜÝ—HH×Bˆ›Üˆ][H[ˆÝ]]‚ˆ][WÝ\HHÙšY[
+][K\HŠBˆYˆ][WÝ\H[™][WÝ\HOH›Y\ÜØYÙHŽ‚ˆÛÛ[YBˆ›Üˆ\[ˆ
+ÙšY[
+][K˜ÛÛ[ŠHÜˆ×JN‚ˆYˆÙšY[
+\\HŠH[ˆÈ›Ý]]Ý^‹^‹›Û™_N‚ˆ^HÙšY[
+\^ŠBˆYˆ\Ú[œÝ[˜ÙJ^ÝŠH[™^œÝš\
+
+N‚ˆ\Ë˜\[™
+^œÝš\
+
+JBˆ™]\›ˆ—ˆ‹š›Ú[Š\ÊKœÝš\
+
+B‚‚ˆÈÝ™X[YYYÙÜ™YØ][Ûˆ›Üˆ›ÙÜ™\ÜËZÛÚÙY]^Ø[Îˆ[Y[Ý]™XÛÛY\È[ˆ[\‹XÚ[šÈYBˆÈ[Y[Ý]
+™XY[Y[Ý]\È\ˆ™XY
+KXXÚÚ[šÈXÚÜÈÝ]\ˆØ]ÚÙÜÎÈHÝ[ÙZ[[™ÂˆÈ›Ý[™ÈšXÚÛ\Ë‚—ÐUVÔÕ‘PSWÐÑRSS‘×Ñ“ÓÔ—ÔÑPÓÓ‘ÈHŒŒ—ÐUVÔÕ‘PSWÐÑRSS‘×ÓUSTQTˆHŒ‚‚™YˆØ]^ÜÝ™X[WÝÝ[ØÙZ[[™ÊY™™XÝ]™WÝ[Y[Ý]ˆÜ[Û˜[Ù›Ø]JHOˆ›Ø]‚ˆˆˆXœÛÛ]HØ[XÛØÚÈ›Ý[™›ÜˆHÝ™X[YY]^Ø[ÈÙ[™\›Ý\ÈžH\ÚYÛˆ
+HYBˆ[Y[Ý]\ÈH™X[ÝX\™8 %\ÈÛ›HÝÜÈHÛ™K]ÚÙ[‹\\‹ZYK]Ú[™ÝÈšXÚÛJKˆˆˆ‚ˆžN‚ˆ[Y[Ý]H›Ø]
+Y™™XÝ]™WÝ[Y[Ý]
+HYˆY™™XÝ]™WÝ[Y[Ý]\È›Ý›Û™H[ÙHŒˆ^Ù\
+\Q\œ›Ü‹˜[YQ\œ›ÜŠN‚ˆ[Y[Ý]HŒˆ™]\›ˆX^
+ÐUVÔÕ‘PSWÐÑRSS‘×Ñ“ÓÔ—ÔÑPÓÓ‘ËÐUVÔÕ‘PSWÐÑRSS‘×ÓUSTQTˆ
+ˆ[Y[Ý]
+B‚‚™YˆØÛY[ÜÝ™X[\×Ú[\›˜[JÛY[ˆ[žJHOˆ›ÛÛ‚ˆˆˆY\\œÈ]Ý™X[H[œÚYH˜Ü™X]J
+HXÚÈHÛÚÈ[\Ù[™\È
+ÛÙ^[›ÜXÊHÜ‚ˆØ[››ÝÝ™X[H
+™Y›ØÚÊNÈ›Û™HXØÙ\Ý™X[OUYXœ›ÛH\Ëˆˆˆ‚ˆ™]\›ˆ\Ú[œÝ[˜ÙJÛY[
+ÛÙ^]^[X\žPÛY[[›ÜXÐ]^[X\žPÛY[™Y›ØÚÐ]^[X\žPÛY[
+JB‚‚—ÓPSQÑQÓÐÐSÔÕUWÕÔÈHMKŒ—ÛX[˜YÙYÛØØ[ØØXÚNˆ\VÙ›Ø]Ý—HˆH
+ŒˆŠB‚‚™YˆÛX[˜YÙYÛØØ[Û™]ØÊ
+HOˆÝŽ‚ˆˆˆšÜÝœÜÙˆHX[˜YÙYØØ[[XK\Ù\™\ˆ
+ˆˆÚ[ˆ›Û™JK™XYÚ]HÚÜœ›ÛBˆHÝ\\š\ÛÜˆÝ]Hš[H›ÝšY\ˆ™\ÛÛ][Ûˆ[ÛÈ\Ù\È
+^XÝX]Ú
+Kˆˆˆ‚ˆÛØ˜[ÛX[˜YÙYÛØØ[ØØXÚBˆ›ÝÈH[YK›[Û›ÝÛšXÊ
+BˆËØXÚYHÛX[˜YÙYÛØØ[ØØXÚBˆYˆ›ÝÈHÈÓPSQÑQÓÐÐSÔÕUWÕÔÎ‚ˆ™]\›ˆØXÚYˆžN‚ˆœ›ÛH\›Y\×ØÛK›ØØ[Ü[[YKœÝ\\š\ÛÜˆ[\ÜÝ]WÜ]ˆ˜]ÈHÝ]WÜ]
+
+Kœ™XYÝ^
+[˜ÛÙ[™ÏH]‹NŠBˆ˜\ÙHHÝŠ
+œÛÛ‹›ØYÊ˜]ÊHÜˆßJK™Ù]
+˜˜\ÙWÝ\›‹ˆŠJBˆ™]ØÈH\›\œÙJ˜\ÙJK›™]ØË›ÝÙ\Š
+Bˆ^Ù\^Ù\[ÛŽ‚ˆ™]ØÈHˆ‚ˆÛX[˜YÙYÛØØ[ØØXÚHH
+›ÝË™]ØÊBˆ™]\›ˆ™]ØÂ‚‚™YˆÚ\×ÛX[˜YÙYÛØØ[Ù[™Ú[
+˜\ÙWÝ\›ˆÜ[Û˜[ÜÝ—JHOˆ›ÛÛ‚ˆˆˆ•YHÚ[ˆ
+˜˜\ÙWÝ\›
+ˆ\™Ù]ÈH[XK\Ù\™\ˆ\È\›Y\ÈX[˜YÙ\Ëˆˆˆ‚ˆYˆ›Ý˜\ÙWÝ\›‚ˆ™]\›ˆ˜[ÙBˆX[˜YÙYHÛX[˜YÙYÛØØ[Û™]ØÊ
+BˆYˆ›ÝX[˜YÙY‚ˆ™]\›ˆ˜[ÙBˆžN‚ˆ™]\›ˆ\›\œÙJÝŠ˜\ÙWÝ\›
+JK›™]ØË›ÝÙ\Š
+HOHX[˜YÙYˆ^Ù\^Ù\[ÛŽ‚ˆ™]\›ˆ˜[ÙB‚‚™YˆÜ›ÝšY\—Ü™\]Z\™\×ÜÝ™X[J›ÝšY\ŽˆÝ‹˜\ÙWÝ\›ˆÜ[Û˜[ÜÝ—JHOˆ›ÛÛ‚ˆˆˆ”›ÝšY\œÈ]Û›HXØÙ\Ý™X[Z[™È
+›Û‹\Ý™X[HH
+Nˆ[˜Ù[ÛÜ[Ý[žBˆ]^[X\žKœÝ™X[WÛÛ›WØ˜\ÙWÝ\›ØÝXœÝš[™Ë[™HX[˜YÙYØØ[[XK\Ù\™\‚ˆ
+Ý™X[YY›ÜˆØ[˜Ù[][Ûˆ8 %]Û›H›ÝXÙ\ÈHXYÛY[ÛˆÛØÚÙ]Üš]JKˆˆˆ‚ˆÝ\›HÝŠ˜\ÙWÝ\›ÜˆˆŠK›ÝÙ\Š
+BˆYˆ›ÝÝ\›‚ˆ™]\›ˆ˜[ÙBˆYˆ˜\ÙWÝ\›ÚÜÝÛX]Ú\ÊÝ\›˜ÛÜ[Ý[˜Ù[˜ÛÛHŠHÜˆÚ\×ÛX[˜YÙYÛØØ[Ù[™Ú[
+Ý\›
+N‚ˆ™]\›ˆYBˆžN‚ˆœ›ÛH\›Y\×ØÛK˜ÛÛ™šYÈ[\ÜØYØÛÛ™šYÂˆX\šÙ\œÈH
+ØYØÛÛ™šYÊ
+HÜˆßJK™Ù]
+˜]^[X\žH‹ßJK™Ù]
+œÝ™X[WÛÛ›WØ˜\ÙWÝ\›ÈŠHÜˆ×BˆYˆ\Ú[œÝ[˜ÙJX\šÙ\œË
+\Ý\JJN‚ˆ™]\›ˆ[žJˆ\Ú[œÝ[˜ÙJX\šÙ\‹ÝŠH[™X\šÙ\‹œÝš\
+
+H[™X\šÙ\‹œÝš\
+
+K›ÝÙ\Š
+H[ˆÝ\›ˆ›ÜˆX\šÙ\ˆ[ˆX\šÙ\œÊBˆ^Ù\^Ù\[ÛŽ‚ˆ\ÜÈÈÛÛ™šYÈ™XY\È™\ÝYY™›ÜÈ™]™\ˆœ™XZÈ[ˆ]^Ø[Ý™\ˆ]‚ˆ™]\›ˆ˜[ÙB‚‚—ÐQ‘“Ô‘P“WÕÒÑS”×Ô‘HH™K˜ÛÛ\[Jˆ˜Ø[ˆÛ›HY™›Ü™ÊÊÌNWVÌNKJŠH‹™K’QÓ“Ô‘PÐTÑJBˆÈ™[ÝÈH›ÛÜˆHY™›Ü™X›HYÙ]Ø[‰Ýš]H\ÙY[]^Ý]]8 %™X]\È^]\Ý[ÛŽÂˆÈHX\™Ú[ˆÙY\È›ÝšY\‹\ÚYHÚÙ[‹XÛÝ[›Ý[™[™Èœ›ÛH‹Z[™ÈH™]žK‚—ÐQ‘“Ô‘P“WÔ‘U–WÑ“ÓÔ—ÕÒÑS”ÈHLL‚ˆÈÙYHÍMÎK‚—ÐQ‘“Ô‘P“WÔ‘U–WÓPT‘ÒS—ÕÒÑS”ÈH‚‚™YˆØY™›Ü™X›WÛX^ÝÚÙ[œ×Ùœ›ÛWÙ\œ›ÜŠ^Îˆ^Ù\[ÛŠHOˆÜ[Û˜[Ú[N‚ˆˆˆY™›Ü™X›HÝ]]YÙ]
+Z[\ÈX\™Ú[ŠHœ›ÛH[ˆÜ[”›Ý]\ˆÜ™Y][[Z]Y‚ˆ
+‹‹‹˜]Ø[ˆÛ›HY™›Ü™ÌLMÈŽˆÜ™Y]^\ÝËHØ\Ø\ÈÛÈ\™ÙJNÈ›Û™XˆÚ[ˆ›ÈÛÝ[\È™\Ù[ÜˆHYÙ]\ÈÛÈÛX[È™H\ÙY[ˆˆˆ‚ˆYˆ›ÝÚ\×Ü^[Y[Ù\œ›ÜŠ^ÊN‚ˆ™]\›ˆ›Û™BˆX]ÚHÐQ‘“Ô‘P“WÕÒÑS”×Ô‘KœÙX\˜Ú
+ÝŠ^ÊJBˆYˆ›ÝX]Ú‚ˆ™]\›ˆ›Û™BˆžN‚ˆY™›Ü™X›HH[
+X]Ú™Ü›Ý\
+JKœ™\XÙJ‹‹ˆŠJBˆ^Ù\
+\Q\œ›Ü‹˜[YQ\œ›ÜŠN‚ˆ™]\›ˆ›Û™BˆØ\YHY™›Ü™X›HHÐQ‘“Ô‘P“WÔ‘U–WÓPT‘ÒS—ÕÒÑS”Âˆ™]\›ˆØ\YYˆØ\YHÐQ‘“Ô‘P“WÔ‘U–WÑ“ÓÔ—ÕÒÑS”È[ÙH›Û™B‚‚™YˆØÜ™X]WÝÚ]Ü›ÙÜ™\ÜÊˆÛY[ˆ[žKÝØ\™ÜÎˆXÝÜÝ‹[žWK\ÚÎˆÜ[Û˜[ÜÝ—HH›Û™K
+‹›Ü˜ÙWÜÝ™X[Nˆ›ÛÛH˜[ÙBŠHOˆ[žN‚ˆˆˆÜ™Y]X]Ø\™H™[˜Î˜ØÜ™X]WÝÚ]Ü›ÙÜ™\Ü×ÛÛ˜ÙXˆHˆ˜[Z[™È[ˆY™›Ü™X›BˆYÙ]™]šY\ÈÓÑHÚ]]Ø\
+Û›H]™\ˆÝÙ\š[™ÊNÈ[ž][™È[ÙH™K\˜Z\Ù\Ëˆˆˆ‚ˆžN‚ˆ™]\›ˆØÜ™X]WÝÚ]Ü›ÙÜ™\Ü×ÛÛ˜ÙJÛY[ÝØ\™ÜË\ÚË›Ü˜ÙWÜÝ™X[OY›Ü˜ÙWÜÝ™X[JBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆY™›Ü™X›HHØY™›Ü™X›WÛX^ÝÚÙ[œ×Ùœ›ÛWÙ\œ›ÜŠ^ÊBˆYˆY™›Ü™X›H\È›Û™N‚ˆ˜Z\ÙBˆ^\Ý[™×ØØ\HÝØ\™ÜË™Ù]
+›X^ÝÚÙ[œÈŠHÜˆÝØ\™ÜË™Ù]
+›X^ØÛÛ\][Û—ÝÚÙ[œÈŠBˆYˆ\Ú[œÝ[˜ÙJ^\Ý[™×ØØ\
+[›Ø]
+JH[™^\Ý[™×ØØ\HY™›Ü™X›N‚ˆ˜Z\ÙHÈ[™XYHÚ][ˆYÙ]8 %H\œ›Üˆ\ÈÛÛY][™È[ÙNÈÛ‰ÝÜ[‹‚ˆ™]žWÚÝØ\™ÜÈHXÝ
+ÝØ\™ÜÊBˆ™]žWÚÝØ\™ÜËœÜ
+›X^ÝÚÙ[œÈ‹›Û™JBˆ™]žWÚÝØ\™ÜËœÜ
+›X^ØÛÛ\][Û—ÝÚÙ[œÈ‹›Û™JBˆ™]žWÚÝØ\™ÜË\]Jˆ]^[X\žWÛX^ÝÚÙ[œ×Ü\˜[JY™›Ü™X›K[Ù[\ÝŠÝØ\™ÜË™Ù]
+›[Ù[ŠHÜˆˆŠHÜˆ›Û™JJBˆÙÙÙ\‹š[™›Ê]^[X\žH	\ÎˆÜ™Y][[Z]Yˆ
+Y™›Ü™X›OIYÚÙ[œÊNÈ‚ˆœ™]žZ[™ÈÛ˜ÙHÚ]HÛ[\YÝ]]Ø\[œÝXYÙˆ˜Z[[™Îˆ	\È‹ˆ\ÚÈÜˆ˜Ø[‹Y™›Ü™X›K^ÊBˆ™]\›ˆØÜ™X]WÝÚ]Ü›ÙÜ™\Ü×ÛÛ˜ÙJÛY[™]žWÚÝØ\™ÜË\ÚË›Ü˜ÙWÜÝ™X[OY›Ü˜ÙWÜÝ™X[JB‚‚™YˆÜÝ™X[WÜ™\]Y\ÝÜ[ŠÝØ\™ÜÎˆXÝÜÝ‹[žWJHOˆ•\VÑXÝÜÝ‹[žWKÝ‹›Ø]HŽ‚ˆˆˆŠÝ™X[HÝØ\™ÜË[Ù[˜[YKÝ[ÙZ[[™ÊH›ÜˆHÝ™X[YY™KXYÙÜ™YØ][Û‹ˆˆˆ‚ˆÝ™X[WÚÝØ\™ÜÈHXÝ
+ÝØ\™ÜÊBˆÝ™X[WÚÝØ\™ÜÖÈœÝ™X[H—HHYBˆÝ™X[WÚÝØ\™ÜÖÈœÝ™X[WÛÜ[ÛœÈ—HHÈš[˜ÛYWÝ\ØYÙHŽˆY_Bˆ™]\›ˆ
+Ý™X[WÚÝØ\™ÜËÝŠÝØ\™ÜË™Ù]
+›[Ù[ŠHÜˆˆŠKˆØ]^ÜÝ™X[WÝÝ[ØÙZ[[™ÊÝØ\™ÜË™Ù]
+[Y[Ý]ŠJJB‚‚™YˆØÜ™X]WÝÚ]Ü›ÙÜ™\Ü×ÛÛ˜ÙJˆÛY[ˆ[žKÝØ\™ÜÎˆXÝÜÝ‹[žWK\ÚÎˆÜ[Û˜[ÜÝ—HH›Û™K
+‹›Ü˜ÙWÜÝ™X[Nˆ›ÛÛH˜[ÙBŠHOˆ[žN‚ˆˆˆ˜Ü™X]J
+H]Ý™X[\È
+[™™KXYÙÜ™YØ]\ËXÚÚ[™ÈHÛÚÈ\ˆÝXœÝ[]™HÚ[šÊHÚ[ˆBˆ›ÙÜ™\ÜÈÛÚÈ\ÈXÝ]™HÜˆH›ÝšY\ˆ\ÈÝ™X[K[Û›NÈZ[ˆÜ™X]J
+ŠšÝØ\™ÜÊXÝ\Ú\ÙBˆÜˆÚ[ˆHY\\ˆÝ™X[\È[\›˜[KˆÝ™X[Z[™È™Z™XÝ[ÛœÈ˜[˜XÚÈÈHZ[ˆØ[8 %ˆ^Ù\[™\ˆ›Ü˜ÙWÜÝ™X[X‚‚ˆ™Z]š[Üˆ\Èž]KY›Ü‹Xž]HY[XØ[ÈHZ[ˆÜ™X]J
+ŠšÝØ\™ÜÊXÚ[ˆ™Z]\ˆšYÙÙ\ˆ\Y\È
+]™\žBˆ^\Ý[™ÈØ[\‹Ý\ÚÊHÜˆÚ[ˆHÛY[	ÜÈÚ\™HY\\ˆÝ™X[\È[\›˜[KˆÚ]HÛÚÈ
+ÈBˆÚ[šËXØ\X›HÛY[H™\]Y\Ý\ÈÙ[Ú]Ý™X[OUYX[™YÙÜ™YØ]YXÚÚ[™ÈHÛÚÈÛ›H›Ü‚ˆÝXœÝ[]™HÚ[šÜËˆHÛÛ™šYÝ\™Y[Y[Ý]XÝÈ\ˆÝ™X[H™XY
+YJH˜]\ˆ[ˆ\ÈHÝ[ˆYÙ][™Ý]\ˆ]™[™\ÜÈØ]ÚÙÜÈÙYHÚÙ[œÈ[Ýš[™Ëˆ›Ü˜ÙWÜÝ™X[OUYX
+Ý™X[K[Û›H›ÝšY\œÂˆÝXÚ\È[˜Ù[ÛÜ[Ý8 %Ü™Y]ÝYNˆÍŒŽŠHZÙ\ÈHØ[YHÝ™X[YY]]™[ˆÚ]Ý]HÛÚË‚ˆ›ÝšY\œÈ]™Z™XÝHÝ™X[YY™\]Y\Ý˜[˜XÚÈÈHZ[ˆ›Û‹\Ý™X[Z[™ÈØ[8 %^Ù\[™\‚ˆ›Ü˜ÙWÜÝ™X[XÚ\™HHÝ™X[K[Û›H›ÝšY\ˆ™Z™XÝÈHZ[ˆØ[žHYš[š][Û‹ÛÈHÜšYÚ[˜[ˆ\œ›Üˆ\ÈÝ\™˜XÙYÈH›Ü›X[™XÛÝ™\žHÚZ[œÈ[œÝXY‚ˆˆˆ‚ˆÛ›ÝYžWØ]^Ù\Ü]Ú
+
+BˆÛ›ÝYžWØ]^Ü›ÙÜ™\ÜÊ
+HÈ™\Ù\™HHØ]ÚÙÉÜÈ\ÝÜšXØ[\Ü]ÚXÚË‚ˆYˆ
+›ÝØ]^Ü›ÙÜ™\Ü×ØXÝ]™J
+H[™›Ý›Ü˜ÙWÜÝ™X[JHÜˆØÛY[ÜÝ™X[\×Ú[\›˜[JÛY[
+N‚ˆ™\ÜÛœÙHHÛY[˜Ú]˜ÛÛ\][ÛœË˜Ü™X]J
+ŠšÝØ\™ÜÊBˆYˆ›ÝØÛY[ÜÝ™X[\×Ú[\›˜[JÛY[
+N‚ˆÛ›ÝYžWØ]^Ü›ÝšY\—Ü™\ÜÛœÙJ
+Bˆ™]\›ˆ™\ÜÛœÙBˆÝ™X[WÚÝØ\™ÜË[Ù[Ý[ØÙZ[[™ÈHÜÝ™X[WÜ™\]Y\ÝÜ[ŠÝØ\™ÜÊBˆžN‚ˆÚ[šÜÈHÛY[˜Ú]˜ÛÛ\][ÛœË˜Ü™X]J
+ŠœÝ™X[WÚÝØ\™ÜÊBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÈÙ[Z[™H›ÝšY\ˆ˜Z[\™\È\™[‰ÝÝ™X[Z[™ÉÜÈ˜][8 %Ý\™˜XÙH[˜Ú[™ÙYÛÈBˆÈ™XÛÝ™\žHÚZ[œÈÙYHHØ[YH\œ›Üˆ\ÈHZ[ˆØ[‚ˆYˆ
+›Ü˜ÙWÜÝ™X[HÜˆÚ\×Ý˜[œÚY[Ý˜[œÜÜÙ\œ›ÜŠ^ÊHÜˆÚ\×Ø]]Ù\œ›ÜŠ^ÊBˆÜˆÚ\×Ü^[Y[Ù\œ›ÜŠ^ÊHÜˆÚ\×Ü˜]WÛ[Z]Ù\œ›ÜŠ^ÊJN‚ˆ˜Z\ÙBˆÈÜÜÚX›HHÝ™X[Z[™Ë\ÜXÚYšXÈ™Z™XÝ[ÛŽˆ™]žH›Û‹\Ý™X[Z[™ÈÛ˜ÙNÈHÙ[Z[™[H˜YˆÈ™\]Y\Ý™\›ÙXÙ\ÈH™X[\œ›Üˆ›ÜˆH^Ù\XÚZ[œË‚ˆÙÙÙ\‹™XYÊ]^[X\žH	\ÎˆÝ™X[YY™\]Y\Ý˜Z[Y
+	\ÊNÈ™]žZ[™È›Û‹\Ý™X[Z[™È‹ˆ\ÚÈÜˆ˜Ø[‹^ÊBˆÛ›ÝYžWØ]^Ù\Ü]Ú
+
+Bˆ™\ÜÛœÙHHÛY[˜Ú]˜ÛÛ\][ÛœË˜Ü™X]J
+ŠšÝØ\™ÜÊBˆÛ›ÝYžWØ]^Ü›ÝšY\—Ü™\ÜÛœÙJ
+Bˆ™]\›ˆ™\ÜÛœÙBˆÈÛÛYHÚ[\È
+[ÐH]ZY][ÙKY™[œÚ]™HY\\œÊH™]\›ˆHÛÛ\]H™\ÜÛœÙH\Ü]BˆÈÝ™X[OUYNÈ]ÛÝ[È\È›ÝšY\ˆ™\ÜÛœÙH
+È›ÜØ\™›ÙÜ™\ÜË‚ˆYˆ\Ø]ŠÚ[šÜË˜ÚÚXÙ\ÈŠN‚ˆÛ›ÝYžWØ]^Ü›ÝšY\—Ü™\ÜÛœÙJ
+Bˆ™]\›ˆÚ[šÜÂˆ™]\›ˆØYÙÜ™YØ]WØÚ]ÜÝ™X[JÚ[šÜË[Ù[[[Ù[Ý[ØÙZ[[™Ï]Ý[ØÙZ[[™ÊB‚‚™YˆØÛÜÙWØÚ[š×ÜÝ™X[JÚ[šÜÎˆ[žK
+‹[Ý×ØXÛÜÙNˆ›ÛÛH˜[ÙJHOˆ[žN‚ˆˆˆ™\ÝYY™›ÜÛÜÙJ
+X
+ÜˆXÛÜÙJ
+X
+NÈ™]\›œÈH[™[™È]ØZ]X›HÜˆ›Û™Kˆˆˆ‚ˆÛÜÙWÙ›ˆHÙ]]ŠÚ[šÜË˜ÛÜÙH‹›Û™JHÜˆ
+ˆÙ]]ŠÚ[šÜË˜XÛÜÙH‹›Û™JHYˆ[Ý×ØXÛÜÙH[ÙH›Û™JBˆYˆ›ÝØ[X›JÛÜÙWÙ›ŠN‚ˆ™]\›ˆ›Û™BˆžN‚ˆ™\Ý[HÛÜÙWÙ›Š
+Bˆ^Ù\^Ù\[ÛŽ‚ˆ™]\›ˆ›Û™Bˆ™]\›ˆ™\Ý[Yˆ[œÜXÝš\Ø]ØZ]X›J™\Ý[
+H[ÙH›Û™B‚‚™YˆØYÙÜ™YØ]WØÚ]ÜÝ™X[JˆÚ[šÜÎˆ[žK
+‹[Ù[ˆÝˆHˆ‹Ý[ØÙZ[[™ÎˆÜ[Û˜[Ù›Ø]HH›Û™BŠHOˆ[žN‚ˆˆˆÛÛœÝ[YHHÚ[šÈÝ™X[H[ÈHÛÛ\]H™\ÜÛœÙNÈ[Y[Ý]\œ›Üˆ
+˜\ÙY[YYÝ]ˆÛÂˆÚ\×Ý[Y[Ý]Ù\œ›Ü˜X]Ú\ÊHÚ[ˆ
+Ý[ØÙZ[[™Êˆ[\Ù\Ëˆˆˆ‚ˆXØÈHÐÚ]Ý™X[PXØÝ[][]ÜŠˆ[Ù[[[Ù[Ý[ØÙZ[[™Ï]Ý[ØÙZ[[™ËÜÝÙXY[™OWØÝ\œ™[Ø]^ÜÝ™X[WÙXY[™J
+JBˆžN‚ˆ›ÜˆÚ[šÈ[ˆÚ[šÜÎ‚ˆXØË™™YY
+Ú[šÊBˆš[˜[N‚ˆØÛÜÙWØÚ[š×ÜÝ™X[JÚ[šÜÊBˆ™]\›ˆXØË™š[š\Ú
+
+B‚‚ˆÈ™X\ÛÛš[™ËY]Z[šY[ÈÚÜÙH›Û‹Y[\H^ÛÝ[È\È›ÜØ\™›ÙÜ™\ÜË‚—Ô‘PTÓÓ’S‘×ÑURSÕVÑ’QSÈH
+œÝ[[X\žH‹[šÚ[™È‹˜ÛÛ[‹^ŠB‚‚˜Û\ÜÈÐÚ]Ý™X[PXØÝ[][]ÜŽ‚ˆˆˆ”Ú\™Y\‹XÚ[šÈXØÝ[][][ÛˆÛÈÞ[˜È[™\Þ[˜ÈYÙÜ™YØ][ÛˆØ[››ÝšYˆˆˆ‚‚ˆYˆ×Ú[š]×ÊÙ[‹[Ù[ˆÝˆHˆ‹Ý[ØÙZ[[™ÎˆÜ[Û˜[Ù›Ø]HH›Û™KˆÜÝÙXY[™NˆÜ[Û˜[Ù›Ø]HH›Û™JN‚ˆÙ[‹—ÜÝ\YH[YK›[Û›ÝÛšXÊ
+BˆÙ[‹—ÝÝ[ØÙZ[[™ÈHÝ[ØÙZ[[™ÂˆÈXœÛÛ]H[œÝ[HØZ][™ÈÜÝÚ]™\È\ÈÚXÚÙY[Û™ÜÚYH
+›Ý[œÝXYÙŠHBˆÈÙZ[[™Ë[™[˜Y™™XÝYžH™KXÛÛœÝXÝ[Ûˆ\Ü]ÚÕ•‚ˆÈÚXÚÙY\ÈÙ[\È
+›Ý[œÝXYÙŠHHÙZ[[™ÈX›Ý™NˆHÙZ[[™ÈÝ[›Ý[™ÈØ[\œÈÚ]›ÂˆÈÜÝXY[™K[™HÜÝXY[™H\ÈXœÛÛ]KÛÈ]\È[˜Y™™XÝYžHÝÙ]™\ˆÛ™È\Ü]Ú[™ˆÈ•ÛÚÈ™Y›Ü™H\ÈXØÝ[][]ÜˆØ\ÈÛÛœÝXÝYˆÙYHÎNMŽL‹‚ˆÙ[‹—ÚÜÝÙXY[™HHÜÝÙXY[™BˆÙ[‹˜ÛÛ[Ü\Îˆ\ÝÜÝ—HH×BˆÙ[‹œ™X\ÛÛš[™×Ü\Îˆ\ÝÜÝ—HH×BˆÙ[‹œ™X\ÛÛš[™×Ù]Z[Îˆ\ÝÐ[žWHH×BˆÙ[‹ÛÛØØ[×ØXØÎˆXÝÚ[XÝÜÝ‹[žWWHHßBˆÙ[‹™š[š\ÚÜ™X\ÛÛˆHÙ[‹\ØYÙHH›Û™BˆÙ[‹œ™\ÜÚYHˆ‚ˆÙ[‹œ™\ÜÛ[Ù[H[Ù[Üˆˆ‚‚ˆYˆØÚXÚ×ÙXY[™\ÊÙ[ŠHOˆ›Û™N‚ˆˆˆ”˜Z\ÙH[Y[Ý]\œ›Üˆ\ÝHÝ[ÙZ[[™ÈÜˆHÜÝXY[™Kˆˆˆ‚ˆ›ÝÈH[YK›[Û›ÝÛšXÊ
+BˆYˆÙ[‹—ÝÝ[ØÙZ[[™È\È›Ý›Û™H[™
+›ÝÈHÙ[‹—ÜÝ\Y
+HHÙ[‹—ÝÝ[ØÙZ[[™Î‚ˆ˜Z\ÙH[Y[Ý]\œ›ÜŠˆ]^[X\žHÝ™X[YYØ[[YYÝ]Y\ˆÜÙ[‹—ÝÝ[ØÙZ[[™Î‹ŒŸ\È‚ˆÝ[ÙZ[[™È
+Ý™X[HÝ[Ü[ˆ]Ý™\ˆYÙ]
+HŠBˆYˆÙ[‹—ÚÜÝÙXY[™H\È›Ý›Û™H[™›ÝÈHÙ[‹—ÚÜÝÙXY[™N‚ˆ˜Z\ÙH[Y[Ý]\œ›ÜŠ]^[X\žHÝ™X[YYØ[[YYÝ]]HÜÝÛÛ\™\ÜÚ[Ûˆ‚ˆˆ™XY[™HY\ˆÝ[YK›[Û›ÝÛšXÊ
+HHÙ[‹—ÜÝ\Y‹ŒŸ\È‚ˆŠHØ[\ˆ[™XYHÝÜYØZ][™ÎÈÝ™X[Z[™ÈÛˆÛÝ[Û›H‚ˆœ[ˆ]ÈÙ\ÜÚ[ÛˆX\ÙJHŠB‚ˆYˆÙ™YYÜ™X\ÛÛš[™×Ù]Z[ÊÙ[‹[Nˆ[žJHOˆ›ÛÛ‚ˆˆˆÛÛXÝ™X\ÛÛš[™×Ù]Z[Ø
+Ü[”›Ý]\‹\Ý[H[šÚ[™ÊNÈYHÛ›HÚ[ˆH]Z[ˆØ\œšY\È^ÛÈÝXÝ\˜[ÜÚYÛ™Y[™[Ü\ÈØ[‰ÝÙY\HÝ[[]™Kˆˆˆ‚ˆ™X\ÛÛš[™×Ù]Z[ÈHÙ]]Š[Kœ™X\ÛÛš[™×Ù]Z[È‹›Û™JBˆYˆ™X\ÛÛš[™×Ù]Z[È\È›Û™N‚ˆ[Ù[Ù^˜HHÙ]]Š[K›[Ù[Ù^˜H‹›Û™JBˆYˆ\Ú[œÝ[˜ÙJ[Ù[Ù^˜KXÝ
+N‚ˆ™X\ÛÛš[™×Ù]Z[ÈH[Ù[Ù^˜K™Ù]
+œ™X\ÛÛš[™×Ù]Z[ÈŠBˆYˆ›Ý\Ú[œÝ[˜ÙJ™X\ÛÛš[™×Ù]Z[Ë\Ý
+N‚ˆ™]\›ˆ˜[ÙBˆXYWÜ›ÙÜ™\ÜÈH˜[ÙBˆ›Üˆ]Z[[ˆ™X\ÛÛš[™×Ù]Z[Î‚ˆÙ[‹œ™X\ÛÛš[™×Ù]Z[Ë˜\[™
+]Z[
+BˆYˆ\Ú[œÝ[˜ÙJ]Z[XÝ
+H[™[žJˆ\Ú[œÝ[˜ÙJ]Z[™Ù]
+ŠKÝŠH[™]Z[Ù—H›Üˆˆ[ˆÔ‘PTÓÓ’S‘×ÑURSÕVÑ’QSÊN‚ˆXYWÜ›ÙÜ™\ÜÈHYBˆ™]\›ˆXYWÜ›ÙÜ™\ÜÂ‚ˆYˆÙ™YYÝÛÛØØ[ÊÙ[‹[Nˆ[žJHOˆ›ÛÛ‚ˆˆˆ“Y\™ÙHÛÛXØ[œ˜YÛY[ÈžH[™^ÈYHÚ[ˆ[žHœ˜YÛY[Ø\œšYY]Kˆˆˆ‚ˆXYWÜ›ÙÜ™\ÜÈH˜[ÙBˆ›ÜˆÈ[ˆ
+Ù]]Š[KÛÛØØ[È‹›Û™JHÜˆ×JN‚ˆYHÙ]]ŠËš[™^‹
+HÜˆˆXØÈHÙ[‹ÛÛØØ[×ØXØËœÙ]Y˜][
+YÈšYŽˆˆ‹›˜[YHŽˆˆ‹˜\™Ý[Y[ÈŽˆ×_JBˆYˆÙ]]ŠËšY‹›Û™JN‚ˆXØÖÈšY—HHËšYˆXYWÜ›ÙÜ™\ÜÈHYBˆ›ˆHÙ]]ŠË™[˜Ý[Ûˆ‹›Û™JBˆYˆ›ˆ\È›Ý›Û™N‚ˆYˆÙ]]Š›‹›˜[YH‹›Û™JN‚ˆXØÖÈ›˜[YH—HH›‹›˜[YBˆXYWÜ›ÙÜ™\ÜÈHYBˆYˆÙ]]Š›‹˜\™Ý[Y[È‹›Û™JN‚ˆXØÖÈ˜\™Ý[Y[È—K˜\[™
+›‹˜\™Ý[Y[ÊBˆXYWÜ›ÙÜ™\ÜÈHYBˆ™]\›ˆXYWÜ›ÙÜ™\ÜÂ‚ˆYˆ™YY
+Ù[‹Ú[šÎˆ[žJHOˆ›Û™N‚ˆÈ]™\žHœ˜[YH™XÛÜ™È˜[œÜÜ[Z[™È
+”
+NÈÛ›HHÝXœÝ[]™H^[ØYXÚÜÈBˆÈ›ÜØ\™\›ÙÜ™\ÜÈÛÚÈ]ÙY\ÈÛÛ\™\ÜÚ[Ûˆ[]™K‚ˆÛ›ÝYžWØ]^Ý[Z[™×Ü™\ÜÛœÙJ
+BˆÙ[‹—ØÚXÚ×ÙXY[™\Ê
+BˆÙ[‹œ™\ÜÚYHÙ]]ŠÚ[šËšY‹›Û™JHÜˆÙ[‹œ™\ÜÚYˆÙ[‹œ™\ÜÛ[Ù[HÙ]]ŠÚ[šË›[Ù[‹›Û™JHÜˆÙ[‹œ™\ÜÛ[Ù[ˆÚ[š×Ý\ØYÙHHÙ]]ŠÚ[šË\ØYÙH‹›Û™JBˆYˆÚ[š×Ý\ØYÙN‚ˆÙ[‹\ØYÙHHÚ[š×Ý\ØYÙBˆÚÚXÙ\ÈHÙ]]ŠÚ[šË˜ÚÚXÙ\È‹›Û™JHÜˆ×BˆYˆ›ÝÚÚXÙ\Î‚ˆ™]\›‚ˆÚÚXÙHHÚÚXÙ\ÖÌBˆÙ[‹™š[š\ÚÜ™X\ÛÛˆHÙ]]ŠÚÚXÙK™š[š\ÚÜ™X\ÛÛˆ‹›Û™JHÜˆÙ[‹™š[š\ÚÜ™X\ÛÛ‚ˆ[HHÙ]]ŠÚÚXÙK™[H‹›Û™JBˆYˆ[H\È›Û™N‚ˆ™]\›‚ˆXYWÜ›ÙÜ™\ÜÈH˜[ÙBˆœ›ÛHYÙ[›Y\ÜØYÙWØÛÛ[[\Ü›][—ÛY\ÜØYÙWÝ^‚ˆYXÙHH›][—ÛY\ÜØYÙWÝ^
+Ù]]Š[K˜ÛÛ[‹›Û™JKÙ\HˆŠBˆYˆYXÙN‚ˆÙ[‹˜ÛÛ[Ü\Ë˜\[™
+YXÙJBˆXYWÜ›ÙÜ™\ÜÈHYBˆ™X\ÛÛš[™×ÜYXÙHHÙ]]Š[Kœ™X\ÛÛš[™È‹›Û™JHÜˆÙ]]Š[Kœ™X\ÛÛš[™×ØÛÛ[‹›Û™JBˆ™X\ÛÛš[™×ÜYXÙHH›][—ÛY\ÜØYÙWÝ^
+™X\ÛÛš[™×ÜYXÙKÙ\HˆŠBˆYˆ™X\ÛÛš[™×ÜYXÙN‚ˆÙ[‹œ™X\ÛÛš[™×Ü\Ë˜\[™
+™X\ÛÛš[™×ÜYXÙJBˆXYWÜ›ÙÜ™\ÜÈHYBˆÈ]˜[X]H›Ý[˜ÛÛ™][Û˜[Nˆ^HXØÝ[][]HÝ]K›Ý\Ý›ÙÜ™\ÜË‚ˆXYWÜ›ÙÜ™\ÜÈHÙ[‹—Ù™YYÜ™X\ÛÛš[™×Ù]Z[Ê[JBˆXYWÜ›ÙÜ™\ÜÈHÙ[‹—Ù™YYÝÛÛØØ[Ê[JBˆYˆXYWÜ›ÙÜ™\ÜÎ‚ˆÛ›ÝYžWØ]^Ü›ÙÜ™\ÜÊ
+B‚ˆYˆš[š\Ú
+Ù[ŠHOˆ[žN‚ˆÛÛØØ[ÈH›Û™BˆYˆÙ[‹ÛÛØØ[×ØXØÎ‚ˆÛÛØØ[ÈHÂˆÚ[\S˜[Y\ÜXÙJYXXØÖÈšY—K\OH™[˜Ý[Ûˆ‹[˜Ý[ÛTÚ[\S˜[Y\ÜXÙJˆ˜[YOXXØÖÈ›˜[YH—K\™Ý[Y[ÏHˆ‹š›Ú[ŠXØÖÈ˜\™Ý[Y[È—JJJBˆ›ÜˆÚYXØÈ[ˆÛÜY
+Ù[‹ÛÛØØ[×ØXØËš][\Ê
+JWBˆY\ÜØYÙHHÚ[\S˜[Y\ÜXÙJˆ›ÛOH˜\ÜÚ\Ý[‹ÛÛ[Hˆ‹š›Ú[ŠÙ[‹˜ÛÛ[Ü\ÊKÛÛØØ[Ï]ÛÛØØ[Ëˆ™X\ÛÛš[™ÏHˆ‹š›Ú[ŠÙ[‹œ™X\ÛÛš[™×Ü\ÊHÜˆ›Û™Kˆ™X\ÛÛš[™×Ù]Z[Ï\Ù[‹œ™X\ÛÛš[™×Ù]Z[ÈÜˆ›Û™Kˆ
+BˆÚÚXÙHHÚ[\S˜[Y\ÜXÙJ[™^LY\ÜØYÙO[Y\ÜØYÙKš[š\ÚÜ™X\ÛÛ\Ù[‹™š[š\ÚÜ™X\ÛÛˆÜˆœÝÜŠBˆ™]\›ˆÚ[\S˜[Y\ÜXÙJY\Ù[‹œ™\ÜÚY[Ù[\Ù[‹œ™\ÜÛ[Ù[Øš™XÝH˜Ú]˜ÛÛ\][Ûˆ‹ˆÚÚXÙ\ÏVØÚÚXÙWK\ØYÙO\Ù[‹\ØYÙJB‚‚˜\Þ[˜ÈYˆØYÙÜ™YØ]WØÚ]ÜÝ™X[WØ\Þ[˜ÊˆÚ[šÜÎˆ[žK
+‹[Ù[ˆÝˆHˆ‹Ý[ØÙZ[[™ÎˆÜ[Û˜[Ù›Ø]HH›Û™BŠHOˆ[žN‚ˆˆˆ\Þ[˜ÈZ\œ›ÜˆÙˆ™[˜Î˜ØYÙÜ™YØ]WØÚ]ÜÝ™X[X
+\Þ[˜ÓÜ[RHÝ™X[\È™YY\Þ[˜È›Ü˜
+Kˆˆˆ‚ˆXØÈHÐÚ]Ý™X[PXØÝ[][]ÜŠˆ[Ù[[[Ù[Ý[ØÙZ[[™Ï]Ý[ØÙZ[[™ËÜÝÙXY[™OWØÝ\œ™[Ø]^ÜÝ™X[WÙXY[™J
+JBˆžN‚ˆ\Þ[˜È›ÜˆÚ[šÈ[ˆÚ[šÜÎ‚ˆXØË™™YY
+Ú[šÊBˆš[˜[N‚ˆ[™[™ÈHØÛÜÙWØÚ[š×ÜÝ™X[JÚ[šÜË[Ý×ØXÛÜÙOUYJBˆYˆ[™[™È\È›Ý›Û™N‚ˆÚ]ÛÛ^X‹œÝ\™\ÜÊ^Ù\[ÛŠN‚ˆ]ØZ][™[™Âˆ™]\›ˆXØË™š[š\Ú
+
+B‚‚˜\Þ[˜ÈYˆØXÜ™X]WÝÚ]ÜÝ™X[JÛY[ˆ[žKÝØ\™ÜÎˆXÝÜÝ‹[žWK\ÚÎˆÜ[Û˜[ÜÝ—HH›Û™JHOˆ[žN‚ˆˆˆ\Þ[˜ÈÜ™X]J
+H›ÜˆÝ™X[K[Û›H›ÝšY\œÎˆÝ™X[OUYX
+ÈYÙÜ™YØ]HH\Þ[˜ÈÚ[šÜËˆˆˆ‚ˆÝ™X[WÚÝØ\™ÜË[Ù[Ý[ØÙZ[[™ÈHÜÝ™X[WÜ™\]Y\ÝÜ[ŠÝØ\™ÜÊBˆÚ[šÜÈH]ØZ]ÛY[˜Ú]˜ÛÛ\][ÛœË˜Ü™X]J
+ŠœÝ™X[WÚÝØ\™ÜÊBˆYˆ\Ø]ŠÚ[šÜË˜ÚÚXÙ\ÈŠNˆÈÚ[\ÈX^H[™˜XÚÈHÛÛ\]H™\ÜÛœÙH\Ü]HÝ™X[OUYBˆ™]\›ˆÚ[šÜÂˆ™]\›ˆ]ØZ]ØYÙÜ™YØ]WØÚ]ÜÝ™X[WØ\Þ[˜ÊÚ[šÜË[Ù[[[Ù[Ý[ØÙZ[[™Ï]Ý[ØÙZ[[™ÊB‚‚ˆÈÚ\™Y™\]Y\ÝXY
+È™XÛÝ™\žHY\ˆ›ÜˆØ[ÛHÈ\Þ[˜×ØØ[ÛNˆH[žHÚ[ÈY™™\‚ˆÈÛ›H[ˆÝÈH™\]Y\Ý\È]ØZ]YÛÈ›Ý]H™\ÛÛ][Ûˆ[™HÜ™\™Y™XÛÝ™\žHY\ˆ\™BˆÈÜš][ˆÛ˜ÙKˆHY\ˆ\ÈHÙ[™\˜]ÜˆZY[[™ÈÓY\”Ý\™\]Y\ÝÈ[™™XÙZ]š[™ÈBˆÈ™\ÜÛœÙH
+Üˆ›ÝÛˆ^Ù\[ÛŠKÛÈ[™ÈÔ‘Tˆ[™XØÙ\Ü™K\˜Z\ÙHÛÛ˜XÝÈX]ÚÛˆ›ÝÚ\™\Ë‚—Ô™\ÛÛ™Y]^›Ý]HH˜[YY\J—Ô™\ÛÛ™Y]^›Ý]H‹Âˆ
+˜ÛY[‹[žJK
+™š[˜[Û[Ù[‹Ü[Û˜[ÜÝ—JK
+œ™\ÛÛ™YÜ›ÝšY\ˆ‹ÝŠKˆ
+™Y™™XÝ]™WÜ›ÝšY\ˆ‹ÝŠWJB‚‚™YˆÜ™\ÛÛ™WØØ[ØÛY[
+ˆ\ÚÎˆÜ[Û˜[ÜÝ—K
+‹›ÝšY\ŽˆÜ[Û˜[ÜÝ—K[Ù[ˆÜ[Û˜[ÜÝ—K˜\ÙWÝ\›ˆÜ[Û˜[ÜÝ—Kˆ\WÚÙ^NˆÜ[Û˜[ÜÝ—K™\ÛÛ™YÜ›ÝšY\ŽˆÝ‹™\ÛÛ™YÛ[Ù[ˆÜ[Û˜[ÜÝ—Kˆ™\ÛÛ™YØ˜\ÙWÝ\›ˆÜ[Û˜[ÜÝ—K™\ÛÛ™YØ\WÚÙ^NˆÜ[Û˜[ÜÝ—Kˆ™\ÛÛ™YØ\WÛ[ÙNˆÜ[Û˜[ÜÝ—KXZ[—Ü[[YNˆÜ[Û˜[ÑXÝÜÝ‹[žWWK\Þ[˜×Û[ÙNˆ›ÛÛŠHOˆÔ™\ÛÛ™Y]^›Ý]N‚ˆˆˆ”™\ÛÛ™HHÛY[›ÜˆÛ™H]^Ø[ˆš\Ú[ÛˆÚZ[‹ÜˆØXÚY^ÛY[Ú]Bˆ^XÚ]\›ÝšY\ˆ˜[˜XÚ×ØÚZ[ˆÈ]]ËXÚZ[ˆ™\ØÝYNÈ[[YQ\œ›ÜˆÚ[ˆ›Ý[™È\ÈÛÛ™šYÝ\™Yˆˆˆ‚ˆY™™XÝ]™WÜ›ÝšY\ˆH™\ÛÛ™YÜ›ÝšY\‚ˆYˆ\ÚÈOHš\Ú[ÛˆŽ‚ˆY™™XÝ]™WÜ›ÝšY\‹ÛY[š[˜[Û[Ù[H™\ÛÛ™WÝš\Ú[Û—Ü›ÝšY\—ØÛY[
+ˆ›ÝšY\\™\ÛÛ™YÜ›ÝšY\ˆYˆ™\ÛÛ™YÜ›ÝšY\ˆOH˜]]Èˆ[ÙH›ÝšY\‹ˆ[Ù[\™\ÛÛ™YÛ[Ù[Üˆ[Ù[˜\ÙWÝ\›\™\ÛÛ™YØ˜\ÙWÝ\›Üˆ˜\ÙWÝ\›ˆ\WÚÙ^O\™\ÛÛ™YØ\WÚÙ^HÜˆ\WÚÙ^K\Þ[˜×Û[ÙOX\Þ[˜×Û[ÙKXZ[—Ü[[YO[XZ[—Ü[[YKˆ
+BˆYˆÛY[\È›Û™H[™™\ÛÛ™YÜ›ÝšY\ˆOH˜]]Èˆ[™›Ý™\ÛÛ™YØ˜\ÙWÝ\›‚ˆÙÙÙ\‹Ø\›š[™Ê•š\Ú[Ûˆ›ÝšY\ˆ	\È[˜]˜Z[X›K˜[[™È˜XÚÈÈ]]Èš\Ú[Ûˆ˜XÚÙ[™È‹ˆ™\ÛÛ™YÜ›ÝšY\ŠBˆY™™XÝ]™WÜ›ÝšY\‹ÛY[š[˜[Û[Ù[H™\ÛÛ™WÝš\Ú[Û—Ü›ÝšY\—ØÛY[
+ˆ›ÝšY\H˜]]È‹[Ù[\™\ÛÛ™YÛ[Ù[\Þ[˜×Û[ÙOX\Þ[˜×Û[ÙKˆXZ[—Ü[[YO[XZ[—Ü[[YJBˆYˆÛY[\È›Ý›Û™N‚ˆ™\ÛÛ™YÜ›ÝšY\ˆHY™™XÝ]™WÜ›ÝšY\ˆÜˆ™\ÛÛ™YÜ›ÝšY\‚ˆ[ÙN‚ˆÛY[š[˜[Û[Ù[HÙÙ]ØØXÚYØÛY[
+ˆ™\ÛÛ™YÜ›ÝšY\‹™\ÛÛ™YÛ[Ù[\Þ[˜×Û[ÙOX\Þ[˜×Û[ÙK˜\ÙWÝ\›\™\ÛÛ™YØ˜\ÙWÝ\›ˆ\WÚÙ^O\™\ÛÛ™YØ\WÚÙ^K\WÛ[ÙO\™\ÛÛ™YØ\WÛ[ÙKXZ[—Ü[[YO[XZ[—Ü[[YKˆ\ÚÏ]\ÚÊBˆY™™XÝ]™WÜ›ÝšY\ˆHÙY™™XÝ]™WÜ›ÝšY\—Ù›Ü—ØÛY[
+ÛY[™\ÛÛ™YÜ›ÝšY\ŠBˆYˆÛY[\È›Û™N‚ˆÈ^XÚ]›ÝšY\ˆÚ]›ÈÜ™Y[X[ÎˆÛ›ÜˆH\ÚÈ˜[˜XÚ×ØÚZ[ˆ™Y›Ü™BˆÈ˜Z\Ú[™È
+˜[˜XÚÈ[šY\ÈX^H\ÙHÐ]]ÈÜ™Y[X[\ÛÛ]]
+K‚ˆÙ^XÚ]H
+™\ÛÛ™YÜ›ÝšY\ˆÜˆˆŠKœÝš\
+
+K›ÝÙ\Š
+BˆYˆÙ^XÚ][™Ù^XÚ]›Ý[ˆÈ˜]]È‹›Ü[œ›Ý]\ˆ‹˜Ý\ÝÛHŸN‚ˆ˜—ØÛY[˜—Û[Ù[˜—ÛX™[HÝžWØÛÛ™šYÝ\™YÙ˜[˜XÚ×Ù›Ü—Ý[˜]˜Z[X›WØÛY[
+ˆ\ÚËÙ^XÚ]
+BˆYˆ˜—ØÛY[\È›Û™N‚ˆ˜Z\ÙH[[YQ\œ›ÜŠˆˆ”›ÝšY\ˆ	Þ×Ù^XÚ]IÈ\ÈÙ][ˆÛÛ™šYËžX[[]›ÈTHÙ^HØ\È›Ý[™ˆ‚ˆˆ”Ù]H×Ù^XÚ]\\Š
+_WÐTWÒÑVH[š\›Û›Y[˜\šXX›KÜˆÝÚ]ÚÈ‚ˆˆ˜HY™™\™[›ÝšY\ˆÚ]\›Y\È[Ù[ˆŠBˆÛY[š[˜[Û[Ù[H˜—ØÛY[˜—Û[Ù[ˆYˆ\Þ[˜×Û[ÙN‚ˆÛY[š[˜[Û[Ù[HÝ×Ø\Þ[˜×ØÛY[
+ˆ˜—ØÛY[˜—Û[Ù[Üˆˆ‹\×Ýš\Ú[ÛJ\ÚÈOHš\Ú[ÛˆŠJBˆ™\ÛÛ™YÜ›ÝšY\ˆH˜—ÛX™[Üˆ™\ÛÛ™YÜ›ÝšY\‚ˆY™™XÝ]™WÜ›ÝšY\ˆH™\ÛÛ™YÜ›ÝšY\‚ˆÈ]]ËØÝ\ÝÛHÚ]›ÈÜ™Y[X[ÎˆØ[ÈH[]]ÈÚZ[ˆ
+›Ý\ÝÜ[”›Ý]\ŠK‚ˆÈ[Ù[S›Û™HÛÈXXÚ›ÝšY\ˆ\Ù\È]ÈÝÛˆY˜][‚ˆYˆÛY[\È›Û™H[™›Ý™\ÛÛ™YØ˜\ÙWÝ\›‚ˆÙÙÙ\‹š[™›Ê]^[X\žH	\Îˆ›ÝšY\ˆ	\È[˜]˜Z[X›KžZ[™È]]ËY]XÝ[ÛˆÚZ[ˆ‹ˆ\ÚÈÜˆ˜Ø[‹™\ÛÛ™YÜ›ÝšY\ŠBˆÛY[š[˜[Û[Ù[HÙÙ]ØØXÚYØÛY[
+ˆ˜]]È‹\Þ[˜×Û[ÙOX\Þ[˜×Û[ÙKXZ[—Ü[[YO[XZ[—Ü[[YK\ÚÏ]\ÚÊBˆY™™XÝ]™WÜ›ÝšY\ˆHÙY™™XÝ]™WÜ›ÝšY\—Ù›Ü—ØÛY[
+ÛY[˜]]ÈŠBˆYˆÛY[\È›Û™N‚ˆ˜Z\ÙH[[YQ\œ›ÜŠˆ“›ÈH›ÝšY\ˆÛÛ™šYÝ\™Y›Üˆ\ÚÏ^Ý\ÚßH‚ˆˆœ›ÝšY\^Ü™\ÛÛ™YÜ›ÝšY\ŸKˆ[Žˆ\›Y\ÈÙ]\ŠBˆ™]\›ˆÔ™\ÛÛ™Y]^›Ý]JÛY[š[˜[Û[Ù[™\ÛÛ™YÜ›ÝšY\‹Y™™XÝ]™WÜ›ÝšY\ŠB‚‚—Ô™\\™Y]^™\]Y\ÝH˜[YY\J—Ô™\\™Y]^™\]Y\Ý‹Âˆ
+˜ÛY[‹[žJK
+™š[˜[Û[Ù[‹Ü[Û˜[ÜÝ—JK
+šÝØ\™ÜÈ‹XÝÜÝ‹[žWJKˆ
+œ™\ÛÛ™YÜ›ÝšY\ˆ‹ÝŠK
+œ™\]Y\ÝÜ›ÝšY\ˆ‹ÝŠK
+œ™\ÛÛ™YÛ[Ù[‹Ü[Û˜[ÜÝ—JKˆ
+œ™\ÛÛ™YØ˜\ÙWÝ\›‹Ü[Û˜[ÜÝ—JK
+œ™\ÛÛ™YØ\WÚÙ^H‹Ü[Û˜[ÜÝ—JKˆ
+œ™\ÛÛ™YØ\WÛ[ÙH‹Ü[Û˜[ÜÝ—JK
+™Y™™XÝ]™WÝ[Y[Ý]‹›Ø]
+Kˆ
+™Y™™XÝ]™WÙ^˜WØ›ÙH‹XÝÜÝ‹[žWJK
+˜˜\ÙWÚ[™›È‹ÝŠWJB‚‚™YˆÜ™\\™WØ]^Ü™\]Y\Ý
+ˆ\ÚÎˆÜ[Û˜[ÜÝ—K
+‹›ÝšY\ŽˆÜ[Û˜[ÜÝ—K[Ù[ˆÜ[Û˜[ÜÝ—K˜\ÙWÝ\›ˆÜ[Û˜[ÜÝ—Kˆ\WÚÙ^NˆÜ[Û˜[ÜÝ—KXZ[—Ü[[YNˆXÝÜÝ‹[žWKY\ÜØYÙ\Îˆ\Ýˆ[\\˜]\™NˆÜ[Û˜[Ù›Ø]KX^ÝÚÙ[œÎˆÜ[Û˜[Ú[KÛÛÎˆÜ[Û˜[Û\ÝKˆ[Y[Ý]ˆÜ[Û˜[Ù›Ø]K^˜WØ›ÙNˆÜ[Û˜[ÙXÝK™X\ÛÛš[™×ØÛÛ™šYÎˆÜ[Û˜[ÙXÝKˆ^˜WÚXY\œÎˆÜ[Û˜[ÑXÝÜÝ‹Ý—WK\WÛ[ÙNˆÜ[Û˜[ÜÝ—Kˆ›Ý]WÚ[™›ÎˆÜ[Û˜[ÑXÝÜÝ‹Ý—WK\Þ[˜×Û[ÙNˆ›ÛÛŠHOˆÔ™\\™Y]^™\]Y\Ý‚ˆˆˆ”Ú\™YXYÙˆØ[ÛKØ\Þ[˜×ØØ[ÛNˆ™\ÛÛ™H›Ý]H
+ÈÛY[X›\Ú]Z[™\]Y\ÝÝØ\™ÜË‚ˆÞ[˜Ë[Û›NˆÛÛ\™\ÜÚ[Ûˆ˜\Ý[™K\‹\™\]Y\Ý^˜WÚXY\œØ[™˜\ÙWÚ[™›Ø˜[[™Âˆ˜XÚÈÈH™\ÛÛ™Y˜\ÙWÝ\›Ú[ˆHÛY[^ÜÙ\È›Û™Kˆˆˆ‚ˆ™\ÛÛ™YÜ›ÝšY\‹™\ÛÛ™YÛ[Ù[™\ÛÛ™YØ˜\ÙWÝ\›™\ÛÛ™YØ\WÚÙ^K™\ÛÛ™YØ\WÛ[ÙHHÜ™\ÛÛ™WÝ\Ú×Ü›ÝšY\—Û[Ù[
+ˆ\ÚË›ÝšY\‹[Ù[˜\ÙWÝ\›\WÚÙ^JBˆYˆ\WÛ[ÙN‚ˆ™\ÛÛ™YØ\WÛ[ÙHH\WÛ[ÙBˆY™™XÝ]™WÙ^˜WØ›ÙHHÙÙ]Ý\Ú×Ù^˜WØ›ÙJ\ÚÊBˆY™™XÝ]™WÙ^˜WØ›ÙK\]J^˜WØ›ÙHÜˆßJBˆÛY[š[˜[Û[Ù[™\ÛÛ™YÜ›ÝšY\‹Y™™XÝ]™WÜ›ÝšY\ˆHÜ™\ÛÛ™WØØ[ØÛY[
+ˆ\ÚË›ÝšY\\›ÝšY\‹[Ù[[[Ù[˜\ÙWÝ\›X˜\ÙWÝ\›\WÚÙ^OX\WÚÙ^Kˆ™\ÛÛ™YÜ›ÝšY\\™\ÛÛ™YÜ›ÝšY\‹™\ÛÛ™YÛ[Ù[\™\ÛÛ™YÛ[Ù[ˆ™\ÛÛ™YØ˜\ÙWÝ\›\™\ÛÛ™YØ˜\ÙWÝ\›™\ÛÛ™YØ\WÚÙ^O\™\ÛÛ™YØ\WÚÙ^Kˆ™\ÛÛ™YØ\WÛ[ÙO\™\ÛÛ™YØ\WÛ[ÙKXZ[—Ü[[YO[XZ[—Ü[[YK\Þ[˜×Û[ÙOX\Þ[˜×Û[ÙKˆ
+BˆY™™XÝ]™WÝ[Y[Ý]HÙY™™XÝ]™WØ]^Ý[Y[Ý]
+\ÚË[Y[Ý]
+Bˆ™\]Y\ÝÜ›ÝšY\ˆHY™™XÝ]™WÜ›ÝšY\ˆÜˆ™\ÛÛ™YÜ›ÝšY\‚ˆYˆ›Ý\Þ[˜×Û[ÙN‚ˆÛÛ\™\ÜÚ[Û—ØÛÛ™šYÈHÙÙ]Ø]^[X\žWÝ\Ú×ØÛÛ™šYÊ˜ÛÛ\™\ÜÚ[ÛˆŠHYˆ\ÚÈOH˜ÛÛ\™\ÜÚ[Ûˆˆ[ÙHßBˆËY™™XÝ]™WÙ^˜WØ›ÙHHØÛÛ\™\ÜÚ[Û—Ù˜\ÝÛ[™WØÛÛ›ÛÊˆ\ÚËXÝX[Ü›ÝšY\\™\]Y\ÝÜ›ÝšY\‹XÝX[Û[Ù[Yš[˜[Û[Ù[ˆ™\]Y\ÝYÜ›ÝšY\\›ÝšY\‹™\]Y\ÝYÛ[Ù[[[Ù[›Ý]WØÛÛ™šYÏXÛÛ\™\ÜÚ[Û—ØÛÛ™šYËˆXZ×ÙÝX\™ØÛÛ™šYÏXÛÛ\™\ÜÚ[Û—ØÛÛ™šYËX^ÝÚÙ[œÏ[X^ÝÚÙ[œËˆ^˜WØ›ÙOYY™™XÝ]™WÙ^˜WØ›ÙKˆ
+BˆÜÙ]Ü™[^WØ]^[X\žWÜ›Ý]J™\]Y\ÝÜ›ÝšY\‹š[˜[Û[Ù[™\ÛÛ™YØ\WÛ[ÙJBˆÜ™XÛÜ™Ü›Ý]WÚ[™›Ê›Ý]WÚ[™›ËÙ˜[˜XÚ×Ü›ÝšY\—Ùœ›ÛWÛX™[
+™\]Y\ÝÜ›ÝšY\ŠKš[˜[Û[Ù[
+BˆYˆ\Þ[˜×Û[ÙN‚ˆ˜\ÙWÚ[™›ÈHÝŠÙ]]ŠÛY[˜˜\ÙWÝ\›‹ˆŠHÜˆˆŠBˆ[ÙN‚ˆ˜\ÙWÚ[™›ÈHÝŠÙ]]ŠÛY[˜˜\ÙWÝ\›‹™\ÛÛ™YØ˜\ÙWÝ\›
+HÜˆˆŠBˆYˆ\ÚÎ‚ˆÙÙÙ\‹š[™›Ê]^[X\žH	\Îˆ\Ú[™È	\È
+	\ÊI\È‹ˆ\ÚË™\]Y\ÝÜ›ÝšY\ˆÜˆ˜]]È‹š[˜[Û[Ù[Üˆ™Y˜][‹ˆˆˆ]Ø˜\ÙWÚ[™›ßHˆYˆ˜\ÙWÚ[™›È[™›Ü[œ›Ý]\ˆˆ›Ý[ˆ˜\ÙWÚ[™›È[ÙHˆŠBˆÈÛY[	ÜÈXÝX[˜\ÙWÝ\›ÛÈ[™Ú[\ÜXÚYšXÈ[\\˜]\™HÝ™\œšY\ÈÛÜšÈÛ‚ˆÈ]]ËY]XÝY›Ý]\È
+\K›[ÛÛœÚÝ˜ZHœÈ\KšÚ[ZK˜ÛÛKØÛÙ[™ÊK‚ˆÝØ\™ÜÈHØZ[ØØ[ÚÝØ\™ÜÊˆ™\]Y\ÝÜ›ÝšY\‹š[˜[Û[Ù[Y\ÜØYÙ\Ë[\\˜]\™O][\\˜]\™KX^ÝÚÙ[œÏ[X^ÝÚÙ[œËˆÛÛÏ]ÛÛË[Y[Ý]YY™™XÝ]™WÝ[Y[Ý]^˜WØ›ÙOYY™™XÝ]™WÙ^˜WØ›ÙKˆ™X\ÛÛš[™×ØÛÛ™šYÏ\™X\ÛÛš[™×ØÛÛ™šYË˜\ÙWÝ\›X˜\ÙWÚ[™›ÈÜˆ™\ÛÛ™YØ˜\ÙWÝ\›\ÚÏ]\ÚÊBˆYˆ^˜WÚXY\œÎ‚ˆÝØ\™ÜÖÈ™^˜WÚXY\œÈ—HHXÝ
+^˜WÚXY\œÊBˆÈÛÛ™\[XYÙH›ØÚÜÈ›Üˆ[›ÜXËXÛÛ\]X›H[™Ú[È
+K™ËˆZ[šSX^
+BˆÛY[Ø˜\ÙHHÝŠÙ]]ŠÛY[˜˜\ÙWÝ\›‹ˆŠHÜˆˆŠBˆYˆÚ\×Ø[›ÜX×ØÛÛ\]Ù[™Ú[
+™\]Y\ÝÜ›ÝšY\‹ÛY[Ø˜\ÙJN‚ˆÝØ\™ÜÖÈ›Y\ÜØYÙ\È—HHØÛÛ™\ÛÜ[˜ZWÚ[XYÙ\×Ý×Ø[›ÜXÊÝØ\™ÜÖÈ›Y\ÜØYÙ\È—JBˆ™]\›ˆÔ™\\™Y]^™\]Y\Ý
+ˆÛY[š[˜[Û[Ù[ÝØ\™ÜË™\ÛÛ™YÜ›ÝšY\‹™\]Y\ÝÜ›ÝšY\‹™\ÛÛ™YÛ[Ù[ˆ™\ÛÛ™YØ˜\ÙWÝ\›™\ÛÛ™YØ\WÚÙ^K™\ÛÛ™YØ\WÛ[ÙKY™™XÝ]™WÝ[Y[Ý]ˆY™™XÝ]™WÙ^˜WØ›ÙK˜\ÙWÚ[™›ÊB‚‚˜Û\ÜÈÓY\”Ý\
+˜[YY\JN‚ˆˆˆH›ÝšY\ˆ™\]Y\ÝHY\ˆ\ÚÜÈ]Èš]™\ˆÈ\™›Ü›KˆÚ[™ˆ˜Ø[ˆ
+ÛY[ÝØ\™ÜÊHˆœ™]žWÜØ[YWÜ›ÝšY\ˆˆ
+›ÝšY\‹[Ù[
+H™˜[˜XÚÈˆ
+˜—ØÛY[˜—Û[Ù[˜—ÛX™[
+Kˆˆˆ‚ˆÚ[™ˆÝ‚ˆ\™ÜÎˆ\B‚‚—Ô‘TRTÑWÓÔ’QÒSSHØš™XÝ
+
+B‚ˆÈÜ™\™Y
+™YXØ]K™X\ÛÛŠHZ\œÈ›ÜˆH›ÝšY\‹Y˜[˜XÚÈ[™Îˆš\œÝX]ÚˆÈÚ[œËÛÈH^[Y[Y›]›Ý\™YŽH™XYÈ\Èœ^[Y[\œ›Üˆ‹›Ýœ˜]H[Z]‹‚—ÑSPÒ×Ô‘PTÓÓ”Îˆ\VÕ\VÐØ[X›VÖÑ^Ù\[Û—K›ÛÛKÝ—K‹‹—HH
+ˆ
+Ú\×Ø]]Ù\œ›Ü‹˜]]\œ›ÜˆŠK
+Ú\×Ü^[Y[Ù\œ›Ü‹œ^[Y[\œ›ÜˆŠKˆ
+Ú\×Ü˜]WÛ[Z]Ù\œ›Ü‹œ˜]H[Z]ŠK
+Ú\×Û[Ù[Ú[˜ÛÛ\]X›WÙ\œ›Ü‹›[Ù[[˜ÛÛ\]X›HÚ]›Ý]HŠKˆ
+Ú\×Ú[˜[YØ]^Ü™\ÜÛœÙWÙ\œ›Ü‹š[˜[Y›ÝšY\ˆ™\ÜÛœÙHŠK
+Ú\×ØÛÛ›™XÝ[Û—Ù\œ›Ü‹˜ÛÛ›™XÝ[Ûˆ\œ›ÜˆŠKŠB‚‚™YˆÜ[™ÊÝ\ˆ—ÓY\”Ý\‹XØÙ\ˆØ[X›VÖÑ^Ù\[Û—K›ÛÛJN‚ˆˆˆ“Û™HY\ˆ[™Îˆ\™›Ü›HÝ\ÈZY[È
+™\ÜÛœÙK›Û™JXÛˆÝXØÙ\ÜËˆ
+›Û™K^ÊXÚ[ˆXØÙ\
+^ÊX]ÈH™^[™È[™H][ÙH™K\˜Z\Ù\Ëˆˆˆ‚ˆžN‚ˆ™\Ý[HZY[Ý\ˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆYˆ›ÝXØÙ\
+^ÊN‚ˆ˜Z\ÙBˆ™]\›ˆ›Û™K^Âˆ™]\›ˆ™\Ý[›Û™B‚‚™YˆÜ\˜[WÜ[™×ØXØÙ\Ê^Îˆ^Ù\[ÛŠHOˆ›ÛÛ‚ˆˆˆY\ˆH\˜[Y]\‹\Ýš\™]žNˆ˜[›ÝYÚÈHX^ÝÚÙ[œËÜ^[Y[Ø]]ˆÚZ[œÈÚ]HÝš\YÝØ\™ÜÎÈ™K\˜Z\ÙH[ž][™ÈÜÙHÚZ[œÈÛÛ‰Ý[™Kˆˆˆ‚ˆ™]\›ˆ
+Ú\×Ü^[Y[Ù\œ›ÜŠ^ÊHÜˆÚ\×ØÛÛ›™XÝ[Û—Ù\œ›ÜŠ^ÊHÜˆÚ\×Ø]]Ù\œ›ÜŠ^ÊBˆÜˆ›X^ÝÚÙ[œÈˆ[ˆÝŠ^ÊHÜˆ[œÝ\ÜYÜ\˜[Y]\ˆˆ[ˆÝŠ^ÊJB‚‚™YˆØÜ™Y[X[Ü[™×ØXØÙ\Ê^Îˆ^Ù\[ÛŠHOˆ›ÛÛ‚ˆ™]\›ˆÚ\×Ø]]Ù\œ›ÜŠ^ÊHÜˆÚ\×Ü^[Y[Ù\œ›ÜŠ^ÊHÜˆÚ\×Ü˜]WÛ[Z]Ù\œ›ÜŠ^ÊB‚‚ˆÈ[[]]X›H›Ý]HÛÛ^Ú\™YžHH™XÛÝ™\žH[™ÜË‚—ÓY\”›Ý]HH˜[YY\J—ÓY\”›Ý]H‹Âˆ
+˜ÛY[‹[žJK
+\ÚÈ‹Ü[Û˜[ÜÝ—JK
+YÈ‹ÝŠK
+˜\Þ[˜×Û[ÙH‹›ÛÛ
+K
+˜˜\ÙWÚ[™›È‹ÝŠKˆ
+œ™\ÛÛ™YÜ›ÝšY\ˆ‹ÝŠK
+œ™\ÛÛ™YÛ[Ù[‹Ü[Û˜[ÜÝ—JK
+œ™\ÛÛ™YØ˜\ÙWÝ\›‹Ü[Û˜[ÜÝ—JKˆ
+œ™\ÛÛ™YØ\WÚÙ^H‹Ü[Û˜[ÜÝ—JK
+œ™\ÛÛ™YØ\WÛ[ÙH‹Ü[Û˜[ÜÝ—JKˆ
+™š[˜[Û[Ù[‹Ü[Û˜[ÜÝ—JK
+›XZ[—Ü[[YH‹Ü[Û˜[ÑXÝÜÝ‹[žWWJKˆ
+œ›Ý]WÚ[™›È‹Ü[Û˜[ÑXÝÜÝ‹Ý—WJK—JB‚‚™YˆÛY\—Ü\˜[Y]\—Ü[™ÜÊˆš\œÝÙ\œŽˆ^Ù\[Û‹›Ý]NˆÓY\”›Ý]KÝØ\™ÜÎˆXÝÜÝ‹[žWKX^ÝÚÙ[œÎˆÜ[Û˜[Ú[KŠN‚ˆˆˆ”[™ÜÈKLÎˆ™]žHÚ]Ý][\\˜]\™HÈÝXÝ\™Y[Ý]]›Ü›X]ÈX^ÝÚÙ[œË‚ˆ™]\›œÈ
+™\ÜÛœÙK›Û™KÝØ\™ÜÊXÜˆ
+›Û™K˜\œ›ÝÙYÙ\œ‹Ýš\YÚÝØ\™ÜÊXˆˆˆ‚ˆÛY[\ÚËYÈH›Ý]K˜ÛY[›Ý]K\ÚË›Ý]KYÂˆYˆ[\\˜]\™Hˆ[ˆÝØ\™ÜÈ[™Ú\×Ý[œÝ\ÜYÜ\˜[Y]\—Ù\œ›ÜŠš\œÝÙ\œ‹[\\˜]\™HŠN‚ˆ™]žWÚÝØ\™ÜÈHÚÎˆˆ›ÜˆËˆ[ˆÝØ\™ÜËš][\Ê
+HYˆÈOH[\\˜]\™HŸBˆÙÙÙ\‹š[™›Ê]^[X\žH	\É\Îˆ›ÝšY\ˆ™Z™XÝY[\\˜]\™NÈ™]žZ[™ÈÛ˜ÙHÚ]Ý]]‹ˆ\ÚÈÜˆ˜Ø[‹YÊBˆ™\Üš\œÝÙ\œˆHZY[œ›ÛHÜ[™ÊˆÓY\”Ý\
+˜Ø[‹
+ÛY[™]žWÚÝØ\™ÜÊJKÜ\˜[WÜ[™×ØXØÙ\ÊBˆYˆš\œÝÙ\œˆ\È›Û™N‚ˆ™]\›ˆ™\Ü›Û™K™]žWÚÝØ\™ÜÂˆÝØ\™ÜÈH™]žWÚÝØ\™ÜÂˆYˆÚ\×ÜÝXÝ\™YÛÝ]]Ü™Z™XÝ[ÛŠš\œÝÙ\œŠN‚ˆ™]žWÚÝØ\™ÜÈHÝÚ]Ý]ÜÝXÝ\™YÛÝ]]Ù›Ü›X]
+ÝØ\™ÜÊBˆYˆ™]žWÚÝØ\™ÜÈ\È›Ý›Û™N‚ˆÙÙÙ\‹š[™›Ê]^[X\žH	\É\Îˆ›ÝšY\ˆ™Z™XÝYHÝXÝ\™Y[Ý]]‚ˆ™›Ü›X]šY[È™]žZ[™ÈÛ˜ÙHÚ]Ý]]
+ØÚ[XH‚ˆ™[™›Ü˜Ù[Y[YÜ˜Y\ÈÈ›Û\ÛÛ\X[˜ÙJNˆ	\È‹\ÚÈÜˆ˜Ø[‹YËš\œÝÙ\œŠBˆ™\Üš\œÝÙ\œˆHZY[œ›ÛHÜ[™ÊˆÓY\”Ý\
+˜Ø[‹
+ÛY[™]žWÚÝØ\™ÜÊJKÜ\˜[WÜ[™×ØXØÙ\ÊBˆYˆš\œÝÙ\œˆ\È›Û™N‚ˆ™]\›ˆ™\Ü›Û™K™]žWÚÝØ\™ÜÂˆÝØ\™ÜÈH™]žWÚÝØ\™ÜÂˆ\œ—ÜÝˆHÝŠš\œÝÙ\œŠBˆÈRHš\Ú[Ûˆ[Ù[È™Z™XÝX^ÝÚÙ[œÈÚ]ÛÙHLŒL[™HY\ÜØYÙH]™]™\‚ˆÈY[[ÛœÈ›X^ÝÚÙ[œÈ‹ÛÈ]XÝ]^XÚ]K‚ˆÚ\×Þ˜ZWÜ\˜[WÙ\œ›ÜˆHŒLŒLˆ[ˆ\œ—ÜÝˆ[™˜šYÛ[Ù[ˆ[ˆÝŠÙ]]ŠÛY[˜˜\ÙWÝ\›‹ˆŠJBˆYˆX^ÝÚÙ[œÈ\È›Ý›Û™H[™
+ˆ›X^ÝÚÙ[œÈˆ[ˆ\œ—ÜÝˆÜˆ[œÝ\ÜYÜ\˜[Y]\ˆˆ[ˆ\œ—ÜÝ‚ˆÜˆÚ\×Ý[œÝ\ÜYÜ\˜[Y]\—Ù\œ›ÜŠš\œÝÙ\œ‹›X^ÝÚÙ[œÈŠHÜˆÚ\×Þ˜ZWÜ\˜[WÙ\œ›Ü‚ˆ
+N‚ˆÝØ\™ÜËœÜ
+›X^ÝÚÙ[œÈ‹›Û™JBˆÝØ\™ÜËœÜ
+›X^ØÛÛ\][Û—ÝÚÙ[œÈ‹›Û™JBˆ™\Üš\œÝÙ\œˆHZY[œ›ÛHÜ[™ÊˆÓY\”Ý\
+˜Ø[‹
+ÛY[ÝØ\™ÜÊJKˆ[X™H^ÎˆÚ\×Ü^[Y[Ù\œ›ÜŠ^ÊHÜˆÚ\×ØÛÛ›™XÝ[Û—Ù\œ›ÜŠ^ÊHÜˆÚ\×Ü˜]WÛ[Z]Ù\œ›ÜŠ^ÊKˆ
+BˆYˆš\œÝÙ\œˆ\È›Û™N‚ˆ™]\›ˆ™\Ü›Û™KÝØ\™ÜÂˆ™]\›ˆ›Û™Kš\œÝÙ\œ‹ÝØ\™ÜÂ‚‚™YˆÜ™Yœ™\ÚYÛ›Ý\×ÜÝ\
+›Ý]NˆÓY\”›Ý]KÝØ\™ÜÎˆXÝÜÝ‹[žWKY\ÜØYÙNˆÝŠHOˆÜ[Û˜[×ÓY\”Ý\N‚ˆˆˆ”™XZ[H›Ý\ÈÛY[Y\ˆHÜ™Y[X[]™[È›Û™HÚ[ˆ›Ý[™È™Yœ™\ÚYˆˆˆ‚ˆ™Yœ™\ÚYØÛY[™Yœ™\ÚYÛ[Ù[HÜ™Yœ™\ÚÛ›Ý\×Ø]^[X\žWØÛY[
+ˆØXÚWÜ›ÝšY\\›Ý]Kœ™\ÛÛ™YÜ›ÝšY\ˆÜˆ››Ý\È‹[Ù[\›Ý]K™š[˜[Û[Ù[ˆÛÚÝ\Û[Ù[\›Ý]Kœ™\ÛÛ™YÛ[Ù[ÛÚÝ\Ý\ÚÏ\›Ý]K\ÚË\Þ[˜×Û[ÙO\›Ý]K˜\Þ[˜×Û[ÙKˆ˜\ÙWÝ\›\›Ý]Kœ™\ÛÛ™YØ˜\ÙWÝ\›\WÚÙ^O\›Ý]Kœ™\ÛÛ™YØ\WÚÙ^Kˆ\WÛ[ÙO\›Ý]Kœ™\ÛÛ™YØ\WÛ[ÙKXZ[—Ü[[YO\›Ý]K›XZ[—Ü[[YKˆ\×Ýš\Ú[ÛJ›Ý]K\ÚÈOHš\Ú[ÛˆŠKˆ
+BˆYˆ™Yœ™\ÚYØÛY[\È›Û™N‚ˆ™]\›ˆ›Û™BˆÙÙÙ\‹š[™›ÊY\ÜØYÙK›Ý]K\ÚÈÜˆ˜Ø[‹›Ý]KYÊBˆYˆ™Yœ™\ÚYÛ[Ù[[™™Yœ™\ÚYÛ[Ù[OHÝØ\™ÜË™Ù]
+›[Ù[ŠN‚ˆÝØ\™ÜÖÈ›[Ù[—HH™Yœ™\ÚYÛ[Ù[ˆ™]\›ˆÓY\”Ý\
+˜Ø[‹
+™Yœ™\ÚYØÛY[ÝØ\™ÜÊJB‚‚™YˆÛY\—Û›Ý\×Ü[™ÜÊˆš\œÝÙ\œŽˆ^Ù\[Û‹›Ý]NˆÓY\”›Ý]KÝØ\™ÜÎˆXÝÜÝ‹[žWKÛY[Ú\×Û›Ý\Îˆ›ÛÛŠN‚ˆˆˆ“›Ý\Ë[Û›H[™ÜÎˆÝ[K[[Ù[Ù[‹ZX[ZYXXØÛÝ[™Yœ™\ÚH™Yœ™\Ú‚ˆ™]\›œÈ
+™\ÜÛœÙK›Û™JXÜˆ
+›Û™Kš\œÝÙ\œŠXÈ˜[›ÝYÚˆˆˆ‚ˆÛY[\ÚËYÈH›Ý]K˜ÛY[›Ý]K\ÚË›Ý]KYÂˆÈHÛ™Ë[]™Y›ØÙ\ÜÈØ[ˆ[ˆHÜ[[Ù[Ú[˜ÙH›ÜYœ›ÛHHØ][ÙÈ
+]™\žHØ[ˆÈÊNÈ›Ü˜ÙHHœ™\ÚÜ[™]Ú[™™]žHÛ˜ÙK‚ˆYˆÚ\×Û[Ù[Û›ÝÙ›Ý[™Ù\œ›ÜŠš\œÝÙ\œŠH[™ÛY[Ú\×Û›Ý\Î‚ˆX[YÛ[Ù[HÜ™Yœ™\ÚÛ›Ý\×Ü™XÛÛ[Y[™YÛ[Ù[
+ˆš\Ú[ÛJ\ÚÈOHš\Ú[ÛˆŠKÝ[WÛ[Ù[ZÝØ\™ÜË™Ù]
+›[Ù[ŠJBˆYˆX[YÛ[Ù[[™X[YÛ[Ù[OHÝØ\™ÜË™Ù]
+›[Ù[ŠN‚ˆÙÙÙ\‹Ø\›š[™Ê]^[X\žH	\É\Îˆ[Ù[	\ˆ›ÈÛ™Ù\ˆ[ˆ›Ý\ÈØ][ÙÎÈ‚ˆœ™]žZ[™ÈÚ]™Yœ™\ÚY™XÛÛ[Y[™][Ûˆ	\ˆ‹ˆ\ÚÈÜˆ˜Ø[‹YËÝØ\™ÜË™Ù]
+›[Ù[ŠKX[YÛ[Ù[
+BˆÝØ\™ÜÖÈ›[Ù[—HHX[YÛ[Ù[ˆ™\Üš\œÝÙ\œˆHZY[œ›ÛHÜ[™ÊÓY\”Ý\
+˜Ø[‹
+ÛY[ÝØ\™ÜÊJK[X™H^ÎˆYJBˆYˆš\œÝÙ\œˆ\È›Û™N‚ˆ™]\›ˆ™\Ü›Û™BˆÈ]]™Yœ™\Ú\š]HÚ]HXZ[ˆYÙ[‚ˆYˆÚ\×Ü^[Y[Ù\œ›ÜŠš\œÝÙ\œŠH[™ÛY[Ú\×Û›Ý\È[™Û›Ý\×ÜÜ[ØXØÛÝ[Ú\×Ùœ™\ÚÜZYØXØÙ\ÜÊ
+N‚ˆÝ\HÜ™Yœ™\ÚYÛ›Ý\×ÜÝ\
+ˆ›Ý]KÝØ\™ÜËˆ]^[X\žH	\É\Îˆ™Yœ™\ÚY›Ý\È[[YHÜ™Y[X[ÈY\ˆZYXØÛÝ[ÚXÚË™]žZ[™ÈŠBˆYˆÝ\\È›Ý›Û™N‚ˆ™\Üš\œÝÙ\œˆHZY[œ›ÛHÜ[™ÊˆÝ\[X™H^ÎˆØÜ™Y[X[Ü[™×ØXØÙ\Ê^ÊHÜˆÚ\×ØÛÛ›™XÝ[Û—Ù\œ›ÜŠ^ÊJBˆYˆš\œÝÙ\œˆ\È›Û™N‚ˆ™]\›ˆ™\Ü›Û™BˆYˆÚ\×Ø]]Ù\œ›ÜŠš\œÝÙ\œŠH[™ÛY[Ú\×Û›Ý\Î‚ˆÝ\HÜ™Yœ™\ÚYÛ›Ý\×ÜÝ\
+ˆ›Ý]KÝØ\™ÜË]^[X\žH	\É\Îˆ™Yœ™\ÚY›Ý\È[[YHÜ™Y[X[ÈY\ˆK™]žZ[™ÈŠBˆYˆÝ\\È›Ý›Û™N‚ˆ™]\›ˆ
+ZY[Ý\
+K›Û™Bˆ™]\›ˆ›Û™Kš\œÝÙ\œ‚‚‚™YˆÛY\—ØÜ™Y[X[Ü[™ÜÊˆš\œÝÙ\œŽˆ^Ù\[Û‹›Ý]NˆÓY\”›Ý]KÝØ\™ÜÎˆXÝÜÝ‹[žWKÛY[Ú\×Û›Ý\Îˆ›ÛÛŠN‚ˆˆˆ“Ð]]Ü™Y[X[™Yœ™\Ú
+ÈØ[YK\›ÝšY\ˆ™]žK[ˆÜ™Y[X[\ÛÛ›Ý][Û‹‚ˆ™]\›œÈ
+™\ÜÛœÙK›Û™JXÜˆ
+›Û™Kš\œÝÙ\œŠXÈ˜[›ÝYÚˆˆˆ‚ˆÛY[\ÚËYË™\ÛÛ™YÜ›ÝšY\ˆH›Ý]K˜ÛY[›Ý]K\ÚË›Ý]KYË›Ý]Kœ™\ÛÛ™YÜ›ÝšY\‚ˆ]]Ü™Yœ™\ÚÜ›ÝšY\ˆHØ]]Ü™Yœ™\ÚÜ›ÝšY\—Ù›Ü—Ü›Ý]J™\ÛÛ™YÜ›ÝšY\‹›Ý]K˜˜\ÙWÚ[™›ÊBˆYˆ
+Ú\×Ø]]Ù\œ›ÜŠš\œÝÙ\œŠH[™]]Ü™Yœ™\ÚÜ›ÝšY\ˆ›Ý[ˆÈ˜]]È‹ˆ‹›Û™_Bˆ[™›ÝÛY[Ú\×Û›Ý\ÊN‚ˆ™Yœ™\ÚÚÝØ\™ÜÈH
+È™˜Z[YØ\WÚÙ^HŽˆÙ]]ŠÛY[˜\WÚÙ^H‹ˆŠ_BˆYˆ]]Ü™Yœ™\ÚÜ›ÝšY\ˆOH˜[›ÜXÈˆ[ÙHßJBˆYˆÜ™Yœ™\ÚÜ›ÝšY\—ØÜ™Y[X[Ê]]Ü™Yœ™\ÚÜ›ÝšY\‹
+Šœ™Yœ™\ÚÚÝØ\™ÜÊN‚ˆYˆ]]Ü™Yœ™\ÚÜ›ÝšY\ˆOHÛ›Ü›X[^™WØ]^Ü›ÝšY\Š™\ÛÛ™YÜ›ÝšY\ŠN‚ˆÈHÝ[HÛY[\ÈØXÚY[™\ˆH›Ý]HX™[
+K™Ëˆ˜]]ÈŠK›ÝBˆÈÛÛ˜Ü™]H˜XÚÙ[™ÙH™Yœ™\ÚY‚ˆÙ]šXÝØØXÚYØÛY[Ê™\ÛÛ™YÜ›ÝšY\ŠBˆÙÙÙ\‹š[™›Ê]^[X\žH	\É\Îˆ™Yœ™\ÚY	\ÈÜ™Y[X[ÈY\ˆ]]\œ›Ü‹™]žZ[™È‹ˆ\ÚÈÜˆ˜Ø[‹YË]]Ü™Yœ™\ÚÜ›ÝšY\ŠBˆ™]\›ˆ
+ZY[ÓY\”Ý\
+ˆœ™]žWÜØ[YWÜ›ÝšY\ˆ‹ˆ
+]]Ü™Yœ™\ÚÜ›ÝšY\‹›Ý]Kœ™\ÛÛ™YÛ[Ù[Üˆ›Ý]K™š[˜[Û[Ù[
+JJK›Û™BˆÛÛÜ›ÝšY\ˆHÜ™XÛÝ™\˜X›WÜÛÛÜ›ÝšY\Š™\ÛÛ™YÜ›ÝšY\‹ÛY[XZ[—Ü[[YO\›Ý]K›XZ[—Ü[[YJBˆÈØ\\™HH^XÝÙ^H\ÙYÛÈ™XÛÝ™\žHš[™ÈHšYÚÛÛ[žH]™[ˆYˆ[›Ý\‚ˆÈ›ØÙ\ÜÈ›Ý]YHÛÛYX[Ú[H
+Ý\œ™[
+
+HÛÝ[™H›Û™JK‚ˆØÛY[Ø\WÚÙ^HHÝŠÙ]]ŠÛY[˜\WÚÙ^H‹ˆŠHÜˆˆŠBˆYˆÛÛÜ›ÝšY\ˆ[™ØÜ™Y[X[Ü[™×ØXØÙ\Êš\œÝÙ\œŠN‚ˆ™XÛÝ™\žWÙ\œˆHš\œÝÙ\œ‚ˆÈÚÚ\H^˜H™]žH›ÜˆÛX\ˆ^[Y[Ü][ÝH\œ›ÜœÈ8 %H[™Ú[ÛÛ‰ÝXØÙ\ˆÈ[›Ý\ˆ™\]Y\ÝÚ]HØ[YH^]\ÝYÙ^K‚ˆYˆÚ\×Ü˜]WÛ[Z]Ù\œ›ÜŠš\œÝÙ\œŠH[™›ÝÚ\×Ü^[Y[Ù\œ›ÜŠš\œÝÙ\œŠN‚ˆ™\Ü™XÛÝ™\žWÙ\œˆHZY[œ›ÛHÜ[™ÊˆÓY\”Ý\
+˜Ø[‹
+ÛY[ÝØ\™ÜÊJKØÜ™Y[X[Ü[™×ØXØÙ\ÊBˆYˆ™XÛÝ™\žWÙ\œˆ\È›Û™N‚ˆ™]\›ˆ™\Ü›Û™BˆYˆÜ™XÛÝ™\—Ü›ÝšY\—ÜÛÛ
+ÛÛÜ›ÝšY\‹™XÛÝ™\žWÙ\œ‹˜Z[YØ\WÚÙ^OWØÛY[Ø\WÚÙ^JN‚ˆÙÙÙ\‹š[™›Ê]^[X\žH	\É\Îˆ™XÛÝ™\™Y	\ÈšXHÜ™Y[X[\ÛÛ›Ý][ÛˆY\ˆ	\È‹ˆ\ÚÈÜˆ˜Ø[‹YËÛÛÜ›ÝšY\‹\J™XÛÝ™\žWÙ\œŠK—×Û˜[YW×ÊBˆžN‚ˆ™]\›ˆ
+ZY[ÓY\”Ý\
+ˆœ™]žWÜØ[YWÜ›ÝšY\ˆ‹
+™\ÛÛ™YÜ›ÝšY\‹›Ý]Kœ™\ÛÛ™YÛ[Ù[
+JJK›Û™Bˆ^Ù\^Ù\[Ûˆ\È™]žL—Ù\œŽ‚ˆÈ›Ý]YÙ^H[ÛÈ]HØ[ˆX\šÈ]›ÝÈÛÈÛÛ˜Ý\œ™[›ØÙ\ÜÙ\ÈÚÚ\]ˆÈ[ˆ˜[›ÝYÚÈH›ÝšY\ˆ˜[˜XÚË‚ˆYˆ
+Ú\×Ü^[Y[Ù\œ›ÜŠ™]žL—Ù\œŠHÜˆÚ\×Ø]]Ù\œ›ÜŠ™]žL—Ù\œŠBˆÜˆÚ\×Ü˜]WÛ[Z]Ù\œ›ÜŠ™]žL—Ù\œŠJN‚ˆÜ™XÛÝ™\—Ü›ÝšY\—ÜÛÛ
+ÛÛÜ›ÝšY\‹™]žL—Ù\œŠBˆš\œÝÙ\œˆH™]žL—Ù\œ‚ˆ[ÙN‚ˆ˜Z\ÙBˆ™]\›ˆ›Û™Kš\œÝÙ\œ‚‚‚™YˆÛY\—Ü›ÝšY\—Ù˜[˜XÚÊš\œÝÙ\œŽˆ^Ù\[Û‹›Ý]NˆÓY\”›Ý]JN‚ˆˆˆ“\Ý[™ÎˆÝ\ˆ›ÝšY\œÈ
+\‹]\ÚÈÚZ[ŽÈ[ˆ]]ÎˆXZ[ˆ˜[˜XÚÈÚZ[ˆ
+È\ØÛÝ™\žBˆÚZ[‹^XÚ]ˆXZ[‹XYÙ[[[Ù[™]
+Kˆ™]\›œÈH™\ÜÛœÙHÜˆ›Û™K‚ˆØ\XÚ]H\œ›ÜœÈ
+^[Y[Ü][ÝKÛÛ›™XÝ[Û‹^]\ÝYŽK[Ù[[˜ÛÛ\]X›KX[›Ü›YYˆ™\ÜÛœÙJHž\\ÜÈH^XÚ]\›ÝšY\ˆØ]H8 %H›ÝšY\ˆØ[››ÝÙ\™H\È™\]Y\Ýˆ™YØ\™\ÜÈÙˆ\Ù\ˆ[[ˆ]]\œ›ÜœÈÛ›H˜[˜XÚÈ[ˆ]]È[ÙKˆˆˆ‚ˆ\ÚËYË™\ÛÛ™YÜ›ÝšY\ˆH›Ý]K\ÚË›Ý]KYË›Ý]Kœ™\ÛÛ™YÜ›ÝšY\‚ˆÈ™\ÜXÝ^XÚ]›ÝšY\ˆÚÚXÙH›Üˆ˜[œÚY[\œ›ÜœÈ
+]]™\]Y\Ý˜[Y][Û‹]ËŠH][ÝÂˆÈ˜[˜XÚÈÚ[ˆH›ÝšY\ˆÛX\›HØ[››ÝÙ\™HH™\]Y\ÝYHÈØ\XÚ]Nˆ^[Y[Ü][ÝH^]\Ý[Û‚ˆÈ[™ÛÛ›™XÝ[Ûˆ˜Z[\™\È\™HØ\XÚ]H›Ø›[\Ë›Ý™\]Y\ÝÛÛœÝ˜Z[ËˆÙYHÌŽÎˆZ[HÚÙ[ˆ][ÝBˆÈ
+ŽH
+ÈÛÈX[žHÚÙ[œÈ\ˆ^HŠH]\Ý˜[˜XÚÈ\ÝZÙHHˆÜ™Y]\œ›Ü‹‚ˆÈ˜]H[Z]È\™H[˜ÛYYˆY\ˆ™]šY\È\™H^]\ÝYHŽHYX[œÈH›ÝšY\ˆ\È]Ø\XÚ]KˆÙYBˆÈÍLŒŒŽˆÙYHÌŽÎˆZ[HÚÙ[ˆ][ÝH]\Ý˜[˜XÚÈZÙHHˆÜ™Y]\œ›Ü‹‚ˆ\×Ø]]ÈH™\ÛÛ™YÜ›ÝšY\ˆ[ˆÈ˜]]È‹ˆ‹›Û™_Bˆ™X\ÛÛˆH™^
+
+X™[›Üˆ™YXØ]KX™[[ˆÑSPÒ×Ô‘PTÓÓ”ÈYˆ™YXØ]Jš\œÝÙ\œŠJK›Û™JBˆ\×ØØ\XÚ]WÙ\œ›ÜˆH[žJˆ™YXØ]Jš\œÝÙ\œŠH›Üˆ™YXØ]KX™[[ˆÑSPÒ×Ô‘PTÓÓ”ÈYˆX™[OH˜]]\œ›ÜˆŠBˆYˆ™X\ÛÛˆ\È›Û™HÜˆ›Ý
+\×Ø]]ÈÜˆ\×ØØ\XÚ]WÙ\œ›ÜŠN‚ˆ™]\›ˆ›Û™BˆYˆ™X\ÛÛˆOHœ^[Y[\œ›ÜˆŽ‚ˆÈX\šÈHÛÛ˜Ü™]H˜XÚÙ[™
+›ÝH˜]]ÈˆX™[
+H[šX[HÛÈ]\ˆ]^Ø[ÈÚÚ\ˆÈ][œÝXYÙˆ^Z[™È[›Ý\ˆÛÛYY•‚ˆÛX\š×Ü›ÝšY\—Ý[šX[JˆÜ™XÛÝ™\˜X›WÜÛÛÜ›ÝšY\Š™\ÛÛ™YÜ›ÝšY\‹›Ý]K˜ÛY[XZ[—Ü[[YO\›Ý]K›XZ[—Ü[[YJBˆÜˆ™\ÛÛ™YÜ›ÝšY\‹˜\ÙWÝ\›\›Ý]K˜˜\ÙWÚ[™›ÊBˆÙÙÙ\‹š[™›Ê]^[X\žH	\É\Îˆ	\ÈÛˆ	\È
+	\ÊKžZ[™È˜[˜XÚÈ‹ˆ\ÚÈÜˆ˜Ø[‹YË™X\ÛÛ‹™\ÛÛ™YÜ›ÝšY\‹š\œÝÙ\œŠBˆÈÚÚ\Û›HH˜Z[Y[Ù[›Üˆ[Ù[\ÜXÚYšXÈ˜Z[\™\ÎÈKÍˆ\™H›ÝšY\‹]ÚYKÛÂˆÈ]]ÙY\ÈÚÚ\[™ÈHÜ™Y[X[Ý\™˜XÙKÚ[Hš[[™È\ÈØÛÜYÈH[™Ú[‚ˆÈÙ\\˜]HÝ\ÝÛHT“ÈØ[ˆØ\œžHÙ\\˜]HÜ™Y[X[È
+Üˆ›Èš[[™È™[][ÛœÚ\][
+K‚ˆØÚZ[—Ù˜Z[YÛ[Ù[H›Û™HYˆ™X\ÛÛˆ[ˆ
+˜]]\œ›Üˆ‹œ^[Y[\œ›ÜˆŠH[ÙH›Ý]K™š[˜[Û[Ù[ˆœ›ÛHYÙ[˜˜XÚÙ[™ÚY[]H[\Ü˜Z[\™TØÛÜBˆØÚZ[—Ù˜Z[\™WÜØÛÜHH
+ˆ˜Z[\™TØÛÜK‘S‘ÒS•ˆYˆ™X\ÛÛˆOHœ^[Y[\œ›Üˆˆ[™ØÝ\ÝÛWÚX[Ø˜\ÙWÝ\›
+™\ÛÛ™YÜ›ÝšY\‹›Ý]K˜˜\ÙWÚ[™›ÊBˆ[ÙH›Û™Bˆ
+Bˆ˜—ØÛY[˜—Û[Ù[˜—ÛX™[HÝžWØÛÛ™šYÝ\™YÙ˜[˜XÚ×ØÚZ[Šˆ\ÚË™\ÛÛ™YÜ›ÝšY\ˆÜˆ˜]]È‹™X\ÛÛ\™X\ÛÛ‹˜Z[YÛ[Ù[WØÚZ[—Ù˜Z[YÛ[Ù[ˆ˜Z[YØ˜\ÙWÝ\›\›Ý]K˜˜\ÙWÚ[™›Ë˜Z[\™WÜØÛÜOWØÚZ[—Ù˜Z[\™WÜØÛÜJBˆYˆ˜—ØÛY[\È›Û™H[™\×Ø]]Î‚ˆ˜—ØÛY[˜—Û[Ù[˜—ÛX™[HÝžWÛXZ[—Ù˜[˜XÚ×ØÚZ[Šˆ\ÚË™\ÛÛ™YÜ›ÝšY\ˆÜˆ˜]]È‹™X\ÛÛ\™X\ÛÛ‹˜Z[YÛ[Ù[WØÚZ[—Ù˜Z[YÛ[Ù[ˆ˜Z[YØ˜\ÙWÝ\›\›Ý]K˜˜\ÙWÚ[™›Ë˜Z[\™WÜØÛÜOWØÚZ[—Ù˜Z[\™WÜØÛÜJBˆYˆ˜—ØÛY[\È›Û™N‚ˆ˜—ØÛY[˜—Û[Ù[˜—ÛX™[HÝžWÜ^[Y[Ù˜[˜XÚÊˆ™\ÛÛ™YÜ›ÝšY\‹\ÚË™X\ÛÛ\™X\ÛÛ‹˜Z[YØ˜\ÙWÝ\›\›Ý]K˜˜\ÙWÚ[™›Ëˆ˜Z[\™WÜØÛÜOWØÚZ[—Ù˜Z[\™WÜØÛÜJBˆ[Yˆ˜—ØÛY[\È›Û™N‚ˆ˜—ØÛY[˜—Û[Ù[˜—ÛX™[HÝžWÛXZ[—ØYÙ[Û[Ù[Ù˜[˜XÚÊˆ™\ÛÛ™YÜ›ÝšY\‹\ÚË™X\ÛÛ\™X\ÛÛ‹˜Z[YÛ[Ù[WØÚZ[—Ù˜Z[YÛ[Ù[ˆ˜Z[YØ˜\ÙWÝ\›\›Ý]K˜˜\ÙWÚ[™›Ë˜Z[\™WÜØÛÜOWØÚZ[—Ù˜Z[\™WÜØÛÜJBˆYˆ˜—ØÛY[\È›Ý›Û™N‚ˆÈÙXÛÛ™\ÜÎˆHØ[™Y]HÜ™Y[X[Ø\ÈÝ[H[™]X\˜[[™Y8 %Ø[ÈH\ØÛÝ™\žBˆÈÚZ[ˆÛ˜ÙH[Ü™H
+[šX[H[šY\È\™HÚÚ\Y
+K‚ˆ›ÜˆÜ\ÜÈ[ˆ˜[™ÙJŠN‚ˆÜ™XÛÜ™Ü›Ý]WÚ[™›Ê›Ý]Kœ›Ý]WÚ[™›ËÙ˜[˜XÚ×Ü›ÝšY\—Ùœ›ÛWÛX™[
+˜—ÛX™[
+K˜—Û[Ù[
+Bˆ˜—Ü™\ÜHZY[ÓY\”Ý\
+™˜[˜XÚÈ‹
+˜—ØÛY[˜—Û[Ù[˜—ÛX™[
+JBˆYˆ˜—Ü™\Ü\È›Ý›Û™N‚ˆ™]\›ˆ˜—Ü™\ÜˆYˆÜ\ÜÈOH‚ˆ˜—ØÛY[˜—Û[Ù[˜—ÛX™[HÝžWÜ^[Y[Ù˜[˜XÚÊˆ™\ÛÛ™YÜ›ÝšY\‹\ÚË™X\ÛÛHœÝ[H˜[˜XÚÈÜ™Y[X[‹ˆ˜Z[YØ˜\ÙWÝ\›\›Ý]K˜˜\ÙWÚ[™›Ë˜Z[\™WÜØÛÜOWØÚZ[—Ù˜Z[\™WÜØÛÜJBˆYˆ˜—ØÛY[\È›Û™N‚ˆœ™XZÂˆÈ[˜[˜XÚÈ^Y\œÈ^]\ÝY8 %Û™H\Ù\‹]š\ÚX›HØ\›š[™Ë[ˆ™K\˜Z\ÙK‚ˆÙÙÙ\‹Ø\›š[™Ê]^[X\žH	\É\Îˆ	\ÈÛˆ	\È[™[˜[˜XÚÜÈ^]\ÝY‚ˆÈ[˜[˜XÚÈ^Y\œÈ^]\ÝY8 %[Z]HÚ[™ÛH\Ù\‹]š\ÚX›HØ\›š[™ÈÛÈHÜ\˜]Ü‚ˆÈÛ›ÝÜÈ]^\ÚÈ\ÈX›Ý]È˜Z[ˆ
+ÌŽŠHH\œ›Üˆ]Ù[ˆ\È™K\˜Z\ÙY™[ÝË‚ˆÈ
+ÌŽŠBˆŠ˜[˜XÚ×ØÚZ[ˆ
+ÈXZ[ˆYÙ[[Ù[
+Kˆ˜Z\Ú[™ÈÜšYÚ[˜[\œ›Ü‹ˆ‹ˆ\ÚÈÜˆ˜Ø[‹YË™X\ÛÛ‹™\ÛÛ™YÜ›ÝšY\ŠBˆ™]\›ˆ›Û™B‚‚™YˆØ]^Ü™XÛÝ™\žWÛY\Šˆš\œÝÙ\œŽˆ^Ù\[Û‹
+‹ÛY[ˆ[žKÝØ\™ÜÎˆXÝÜÝ‹[žWK\ÚÎˆÜ[Û˜[ÜÝ—Kˆ\Þ[˜×Û[ÙNˆ›ÛÛ˜\ÙWÚ[™›ÎˆÝ‹™\ÛÛ™YÜ›ÝšY\ŽˆÝ‹™\ÛÛ™YÛ[Ù[ˆÜ[Û˜[ÜÝ—Kˆ™\ÛÛ™YØ˜\ÙWÝ\›ˆÜ[Û˜[ÜÝ—K™\ÛÛ™YØ\WÚÙ^NˆÜ[Û˜[ÜÝ—Kˆ™\ÛÛ™YØ\WÛ[ÙNˆÜ[Û˜[ÜÝ—Kš[˜[Û[Ù[ˆÜ[Û˜[ÜÝ—KX^ÝÚÙ[œÎˆÜ[Û˜[Ú[KˆXZ[—Ü[[YNˆÜ[Û˜[ÑXÝÜÝ‹[žWWK›Ý]WÚ[™›ÎˆÜ[Û˜[ÑXÝÜÝ‹Ý—WKŠN‚ˆˆˆ“Ü™\™Y™XÛÝ™\žH[™ÜÈY\ˆHš[X\žH™\]Y\Ý˜Z[Y
+Ù[™\˜]ÜŠNˆ\˜[Y]\‚ˆÝš\È8¡¤ˆ›Ý\ÈX[Ü™Yœ™\Ú8¡¤ˆÜ™Y[X[™Yœ™\ÚÜÛÛ›Ý][Ûˆ8¡¤ˆ›ÝšY\ˆ˜[˜XÚË‚ˆXXÚ[™È™]\›œÈH™\ÜÛœÙK˜\œ›ÝÜÈš\œÝÙ\œ˜[™˜[È›ÝYÚÜˆ™K\˜Z\Ù\Ë‚ˆ™]\›œÈÔ‘TRTÑWÓÔ’QÒSSÚ[ˆ^]\ÝY
+Y\ˆ]šXÝ[™ÈHÛÛ›™XÝ[Û‹\Ú\ÛÛ™YÛY[
+Kˆˆˆ‚ˆYÈHˆ
+\Þ[˜ÊHˆYˆ\Þ[˜×Û[ÙH[ÙHˆ‚ˆ›Ý]HHÓY\”›Ý]JˆÛY[\ÚËYË\Þ[˜×Û[ÙK˜\ÙWÚ[™›Ë™\ÛÛ™YÜ›ÝšY\‹™\ÛÛ™YÛ[Ù[ˆ™\ÛÛ™YØ˜\ÙWÝ\›™\ÛÛ™YØ\WÚÙ^K™\ÛÛ™YØ\WÛ[ÙKš[˜[Û[Ù[XZ[—Ü[[YK›Ý]WÚ[™›ÊBˆ™\Üš\œÝÙ\œ‹ÝØ\™ÜÈHZY[œ›ÛHÛY\—Ü\˜[Y]\—Ü[™ÜÊš\œÝÙ\œ‹›Ý]KÝØ\™ÜËX^ÝÚÙ[œÊBˆYˆš\œÝÙ\œˆ\È›Û™N‚ˆ™]\›ˆ™\ÜˆÛY[Ú\×Û›Ý\ÈH
+™\ÛÛ™YÜ›ÝšY\ˆOH››Ý\È‚ˆÜˆ˜\ÙWÝ\›ÚÜÝÛX]Ú\Ê˜\ÙWÚ[™›Ëš[™™\™[˜ÙKX\K››Ý\Ü™\ÙX\˜Ú˜ÛÛHŠJBˆ™\Üš\œÝÙ\œˆHZY[œ›ÛHÛY\—Û›Ý\×Ü[™ÜÊš\œÝÙ\œ‹›Ý]KÝØ\™ÜËÛY[Ú\×Û›Ý\ÊBˆYˆš\œÝÙ\œˆ\È›Û™N‚ˆ™]\›ˆ™\Üˆ™\Üš\œÝÙ\œˆHZY[œ›ÛHÛY\—ØÜ™Y[X[Ü[™ÜÊš\œÝÙ\œ‹›Ý]KÝØ\™ÜËÛY[Ú\×Û›Ý\ÊBˆYˆš\œÝÙ\œˆ\È›Û™N‚ˆ™]\›ˆ™\Üˆ™\ÜHZY[œ›ÛHÛY\—Ü›ÝšY\—Ù˜[˜XÚÊš\œÝÙ\œ‹›Ý]JBˆYˆ™\Ü\È›Ý›Û™N‚ˆ™]\›ˆ™\ÜˆÈÛÛ›™XÝ[Û‹Ý[Y[Ý]\œ›ÜœÈÚ\ÛÛˆHØXÚYÛY[
+ÛÜÙY˜[œÜÜ[‹\™XYˆÈÝ™X[JNÈ]šXÝÛÈH™^]^Ø[™XZ[ÈHœ™\ÚÛ™K‚ˆÈ›Ü]œ›ÛHHØXÚH™YØ\™\ÜÈÙˆÚ]\ˆÙH›Ý[™H˜[˜XÚÈX›Ý™HÛÈH™^]^[X\žHØ[ˆÈ™XZ[ÈHœ™\ÚÛY[[œÝXYÙˆ™]\Ú[™ÈHXYÛ™KˆÙYH\ÜÝYHÌŒÍÌ‹‚ˆÈZ\œ›ÜˆHÞ[˜È]ˆ›ÜÚ\ÛÛ™YÛY[ÈÛˆÛÛ›™XÝ[Û‹Ý[Y[Ý]ÛÈH™^]^Ø[™XZ[ËˆÙYBˆÈ\ÜÝYHÌŒÍÌ‹‚ˆYˆÚ\×ØÛÛ›™XÝ[Û—Ù\œ›ÜŠš\œÝÙ\œŠN‚ˆžN‚ˆÙ]šXÝØØXÚYØÛY[Ú[œÝ[˜ÙJÛY[
+Bˆ^Ù\^Ù\[ÛŽ‚ˆÙÙÙ\‹™XYÊ]^[X\žI\ÎˆØXÚH]šXÝ[ÛˆY\ˆÛÛ›™XÝ[Ûˆ\œ›Üˆ˜Z[Y‹ˆYË^×Ú[™›ÏUYJBˆ™]\›ˆÔ‘TRTÑWÓÔ’QÒSS‚‚™YˆÙš]™WÛY\ŠY\‹\™›Ü›NˆØ[X›VÖ×ÓY\”Ý\K[žWJHOˆ[žN‚ˆˆˆ”[ˆHY\ˆÙ[™\˜]Ü‹™YY[™ÈXXÚÝ\	ÜÈ™\Ý[
+Üˆ^Ù\[ÛŠH˜XÚÈ[‹ˆˆˆ‚ˆžN‚ˆÝ\H™^
+Y\ŠBˆÚ[HYN‚ˆžN‚ˆ™\Ý[H\™›Ü›JÝ\
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÝ\HY\‹›ÝÊ^ÊBˆ[ÙN‚ˆÝ\HY\‹œÙ[™
+™\Ý[
+Bˆ^Ù\ÝÜ]\˜][Ûˆ\ÈÝÜ‚ˆ™]\›ˆÝÜ˜[YB‚‚˜\Þ[˜ÈYˆÙš]™WÛY\—Ø\Þ[˜ÊY\‹\™›Ü›NˆØ[X›VÖ×ÓY\”Ý\K[žWJHOˆ[žN‚ˆˆˆ\Þ[˜ÈÚ[ˆÙˆ™[˜Î˜Ùš]™WÛY\˜
+\™›Ü›X\È]ØZ]Y
+Kˆˆˆ‚ˆžN‚ˆÝ\H™^
+Y\ŠBˆÚ[HYN‚ˆžN‚ˆ™\Ý[H]ØZ]\™›Ü›JÝ\
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÝ\HY\‹›ÝÊ^ÊBˆ[ÙN‚ˆÝ\HY\‹œÙ[™
+™\Ý[
+Bˆ^Ù\ÝÜ]\˜][Ûˆ\ÈÝÜ‚ˆ™]\›ˆÝÜ˜[YB‚‚™YˆÙ[\ÙYÛ\ÊÝ\YØ]ˆ›Ø]›ÝÎˆÜ[Û˜[Ù›Ø]HH›Û™JHOˆ[‚ˆˆˆ•ÚÛHZ[\ÙXÛÛ™ÈÚ[˜ÙHÝ\YØ]
+Û[\Y]
+Kˆˆˆ‚ˆ™]\›ˆX^
+[
+
+
+[YK›[Û›ÝÛšXÊ
+HYˆ›ÝÈ\È›Û™H[ÙH›ÝÊHHÝ\YØ]
+H
+ˆL
+JB‚‚™YˆÜÝ[\Û][˜ÞWÛÛ˜ÙJ][˜ÞWÚ[™›ÎˆÜ[Û˜[ÑXÝÜÝ‹[WKÙ^NˆÝ‹Ý\YØ]ˆ›Ø]
+HOˆ›Û™N‚ˆˆˆ”™XÛÜ™Ù^X[ˆ][˜ÞWÚ[™›ØHš\œÝ[YH]š\™\Ëˆˆˆ‚ˆYˆ][˜ÞWÚ[™›È\È›Ý›Û™H[™Ù^H›Ý[ˆ][˜ÞWÚ[™›Î‚ˆ][˜ÞWÚ[™›ÖÚÙ^WHHÙ[\ÙYÛ\ÊÝ\YØ]
+B‚‚Ü™[^WØ]^[X\žWØØ[™YˆØ[ÛJˆ\ÚÎˆÝˆH›Û™K
+‹›ÝšY\ŽˆÝˆH›Û™K[Ù[ˆÝˆH›Û™K˜\ÙWÝ\›ˆÝˆH›Û™Kˆ\WÚÙ^NˆÝˆH›Û™KXZ[—Ü[[YNˆÜ[Û˜[ÑXÝÜÝ‹[žWWHH›Û™KY\ÜØYÙ\Îˆ\Ýˆ[\\˜]\™NˆÜ[Û˜[Ù›Ø]HH›Û™KX^ÝÚÙ[œÎˆ[H›Û™KÛÛÎˆ\ÝH›Û™Kˆ[Y[Ý]ˆ›Ø]H›Û™K^˜WØ›ÙNˆXÝH›Û™K™X\ÛÛš[™×ØÛÛ™šYÎˆÜ[Û˜[ÙXÝHH›Û™Kˆ^˜WÚXY\œÎˆÜ[Û˜[ÑXÝÜÝ‹Ý—WHH›Û™K\WÛ[ÙNˆÝˆH›Û™KÝ™X[Nˆ›ÛÛH˜[ÙKˆÝ™X[WÛÜ[ÛœÎˆXÝH›Û™K›Ý]WÚ[™›ÎˆÜ[Û˜[ÑXÝÜÝ‹Ý—WHH›Û™Kˆ][˜ÞWÚ[™›ÎˆÜ[Û˜[ÑXÝÜÝ‹[WHH›Û™KŠHOˆ[žN‚ˆˆˆ”[ˆ[ˆ]^[X\žHH™\]Y\Ý\Z[™ÈHÛÛ™šYÝ\™Y\ÚÈ[Z]ˆˆˆ‚ˆ]Y]YWÜÝ\YØ]H[YK›[Û›ÝÛšXÊ
+BˆÙ[X\Ü™HHØXÜ]Z\™WÜÞ[˜×Ø]^ÜÙ[X\Ü™J\ÚÊBˆYˆÙ[X\Ü™H\È›Ý›Û™N‚ˆÙ[X\Ü™K˜XÜ]Z\™J
+Bˆ™\]Y\ÝÜÝ\YØ]H[YK›[Û›ÝÛšXÊ
+BˆYˆ][˜ÞWÚ[™›È\È›Ý›Û™N‚ˆ][˜ÞWÚ[™›ÖÈœ]Y]YWÝØZ]Û\È—HHÙ[\ÙYÛ\Ê]Y]YWÜÝ\YØ]™\]Y\ÝÜÝ\YØ]
+Bˆš[Ü—Ü›ÙÜ™\Ü×ÚÛÚÈHÙ]]ŠØ]^Ü›ÙÜ™\ÜËšÛÚÈ‹›Û™JBˆžN‚ˆÚ]
+ˆ]^Ü›ÙÜ™\Ü×ÚÛÚÊˆš[Ü—Ü›ÙÜ™\Ü×ÚÛÚÂˆYˆØ[X›Jš[Ü—Ü›ÙÜ™\Ü×ÚÛÚÊBˆ[ÙH
+
+[X™Nˆ›Û™JHYˆ][˜ÞWÚ[™›È\È›Ý›Û™H[ÙH›Û™JBˆ
+KˆØ]^Ý™XYÛØØ[ÚÛÚÊØ]^Ù\Ü]Ú[˜ÝÛÛËœ\X[
+ˆÜÝ[\Û][˜ÞWÛÛ˜ÙK][˜ÞWÚ[™›Ëœ›ÝšY\—Ù\Ü]ÚÛ\È‹™\]Y\ÝÜÝ\YØ]
+JKˆØ]^Ý™XYÛØØ[ÚÛÚÊØ]^Ü›ÝšY\—Ü™\ÜÛœÙK[˜ÝÛÛËœ\X[
+ˆÜÝ[\Û][˜ÞWÛÛ˜ÙK][˜ÞWÚ[™›Ë[YWÝ×Ùš\œÝÜ›ÙÜ™\Ü×Û\È‹™\]Y\ÝÜÝ\YØ]
+JKˆ
+N‚ˆ™\ÜÛœÙHHØØ[ÛWÚ[\
+ˆ\ÚÏ]\ÚË›ÝšY\\›ÝšY\‹[Ù[[[Ù[˜\ÙWÝ\›X˜\ÙWÝ\›\WÚÙ^OX\WÚÙ^KˆXZ[—Ü[[YO[XZ[—Ü[[YKY\ÜØYÙ\Ï[Y\ÜØYÙ\Ë[\\˜]\™O][\\˜]\™KˆX^ÝÚÙ[œÏ[X^ÝÚÙ[œËÛÛÏ]ÛÛË[Y[Ý]][Y[Ý]^˜WØ›ÙOY^˜WØ›ÙKˆ™X\ÛÛš[™×ØÛÛ™šYÏ\™X\ÛÛš[™×ØÛÛ™šYË^˜WÚXY\œÏY^˜WÚXY\œË\WÛ[ÙOX\WÛ[ÙKˆÝ™X[O\Ý™X[KÝ™X[WÛÜ[ÛœÏ\Ý™X[WÛÜ[ÛœË›Ý]WÚ[™›Ï\›Ý]WÚ[™›Ëˆ
+BˆYˆÝ™X[H[™Ù[X\Ü™H\È›Ý›Û™N‚ˆÝ™X[WÜÙ[X\Ü™HHÙ[X\Ü™BˆÙ[X\Ü™HH›Û™Bˆ™]\›ˆÜ™[X\ÙWÜÞ[˜×ÜÙ[X\Ü™WØY\—ÜÝ™X[J™\ÜÛœÙKÝ™X[WÜÙ[X\Ü™JBˆ™]\›ˆ™\ÜÛœÙBˆš[˜[N‚ˆYˆ][˜ÞWÚ[™›È\È›Ý›Û™N‚ˆ][˜ÞWÚ[™›ÖÈœÝ[[X\žWÙÙ[™\˜][Û—Û\È—HHÙ[\ÙYÛ\Ê™\]Y\ÝÜÝ\YØ]
+BˆYˆÙ[X\Ü™H\È›Ý›Û™N‚ˆÙ[X\Ü™Kœ™[X\ÙJ
+B‚‚™YˆÜ™[X\ÙWÜÞ[˜×ÜÙ[X\Ü™WØY\—ÜÝ™X[JÝ™X[Nˆ[žKÙ[X\Ü™Nˆ™XY[™Ë›Ý[™YÙ[X\Ü™JN‚ˆˆˆ”™[X\ÙHH\›Z]Û›HY\ˆHÝ™X[Z[™È™\ÜÛœÙH\ÈÛÛœÝ[YYÜˆÛÜÙYˆˆˆ‚ˆžN‚ˆZY[œ›ÛHÝ™X[Bˆš[˜[N‚ˆžN‚ˆÛÜÙHHÙ]]ŠÝ™X[K˜ÛÜÙH‹›Û™JBˆYˆØ[X›JÛÜÙJN‚ˆÛÜÙJ
+Bˆš[˜[N‚ˆÙ[X\Ü™Kœ™[X\ÙJ
+B‚‚™YˆÜ[—Ø]^ØØ[
+ˆ\ÚÎˆÜ[Û˜[ÜÝ—K
+‹\Þ[˜×Û[ÙNˆ›ÛÛ›ÝšY\ŽˆÜ[Û˜[ÜÝ—K[Ù[ˆÜ[Û˜[ÜÝ—Kˆ˜\ÙWÝ\›ˆÜ[Û˜[ÜÝ—K\WÚÙ^NˆÜ[Û˜[ÜÝ—KXZ[—Ü[[YNˆÜ[Û˜[ÑXÝÜÝ‹[žWWKˆY\ÜØYÙ\Îˆ\Ý[\\˜]\™NˆÜ[Û˜[Ù›Ø]KX^ÝÚÙ[œÎˆÜ[Û˜[Ú[KÛÛÎˆÜ[Û˜[Û\ÝKˆ[Y[Ý]ˆÜ[Û˜[Ù›Ø]K^˜WØ›ÙNˆÜ[Û˜[ÙXÝK™X\ÛÛš[™×ØÛÛ™šYÎˆÜ[Û˜[ÙXÝKˆ^˜WÚXY\œÎˆÜ[Û˜[ÑXÝÜÝ‹Ý—WK\WÛ[ÙNˆÜ[Û˜[ÜÝ—Kˆ›Ý]WÚ[™›ÎˆÜ[Û˜[ÑXÝÜÝ‹Ý—WKŠHOˆ\V×Ô™\\™Y]^™\]Y\ÝXÝÜÝ‹[žWKXÝÜÝ‹[žWWN‚ˆˆˆ”Ú\™YXYÙˆ›ÝØ[[\Îˆ™\\™HH™\]Y\Ý[™[™HHÝØ\™ÜÈH™XÛÝ™\žBˆš]™\œÈ\ÜÈÈÜ™]žWÜØ[YWÜ›ÝšY\—Ê˜ÈØØ[Ù˜[˜XÚ×ØØ[™Y]WÊ˜ˆÛ™H[[]]X›Bˆ[[YHÛ˜\ÚÝ›ÜˆÙ^Z[™ËÜ™\ÛÛ][Û‹Ü™]šY\ËÙ˜[˜XÚÜËÛÈHÛÛ˜Ý\œ™[Û[Ù[ÝÚ]ÚˆØ[‰ÝZ^Ù^H[™ÛY[œ›ÛHY™™\™[[[Y\Ëˆˆˆ‚ˆXZ[—Ü[[YHHÛ›Ü›X[^™WÛXZ[—Ü[[YJXZ[—Ü[[YJBˆ™\HHÜ™\\™WØ]^Ü™\]Y\Ý
+ˆ\ÚË›ÝšY\\›ÝšY\‹[Ù[[[Ù[˜\ÙWÝ\›X˜\ÙWÝ\›\WÚÙ^OX\WÚÙ^KˆXZ[—Ü[[YO[XZ[—Ü[[YKY\ÜØYÙ\Ï[Y\ÜØYÙ\Ë[\\˜]\™O][\\˜]\™KˆX^ÝÚÙ[œÏ[X^ÝÚÙ[œËÛÛÏ]ÛÛË[Y[Ý]][Y[Ý]^˜WØ›ÙOY^˜WØ›ÙKˆ™X\ÛÛš[™×ØÛÛ™šYÏ\™X\ÛÛš[™×ØÛÛ™šYË^˜WÚXY\œÏY^˜WÚXY\œËˆ\WÛ[ÙOX\WÛ[ÙK›Ý]WÚ[™›Ï\›Ý]WÚ[™›Ë\Þ[˜×Û[ÙOX\Þ[˜×Û[ÙKˆ
+BˆØ[™Y]WÚÝØ\™ÜÈHXÝ
+ˆ\ÚÏ]\ÚËY\ÜØYÙ\Ï[Y\ÜØYÙ\Ë[\\˜]\™O][\\˜]\™KX^ÝÚÙ[œÏ[X^ÝÚÙ[œËˆÛÛÏ]ÛÛËY™™XÝ]™WÝ[Y[Ý]\™\K™Y™™XÝ]™WÝ[Y[Ý]ˆY™™XÝ]™WÙ^˜WØ›ÙO\™\K™Y™™XÝ]™WÙ^˜WØ›ÙK™X\ÛÛš[™×ØÛÛ™šYÏ\™X\ÛÛš[™×ØÛÛ™šYËˆ
+Bˆ™]žWÚÝØ\™ÜÈHXÝ
+ˆØ[™Y]WÚÝØ\™ÜË™\ÛÛ™YØ˜\ÙWÝ\›\™\Kœ™\ÛÛ™YØ˜\ÙWÝ\›ˆ™\ÛÛ™YØ\WÚÙ^O\™\Kœ™\ÛÛ™YØ\WÚÙ^K™\ÛÛ™YØ\WÛ[ÙO\™\Kœ™\ÛÛ™YØ\WÛ[ÙKˆXZ[—Ü[[YO[XZ[—Ü[[YKš[˜[Û[Ù[\™\K™š[˜[Û[Ù[^˜WÚXY\œÏY^˜WÚXY\œËˆ
+Bˆ™]\›ˆ™\K™]žWÚÝØ\™ÜËØ[™Y]WÚÝØ\™ÜÂ‚‚™YˆÜÚÝ[Ü™]žWÜØ[YWÜ›ÝšY\Š\ÚÎˆÜ[Û˜[ÜÝ—K^Îˆ^Ù\[Û‹YÎˆÝŠHOˆ›ÛÛ‚ˆˆˆ•YHÚ[ˆ^Ø\ÈH˜[œÚY[˜[œÜÜ›\ÛÜHØ[YK\›ÝšY\ˆ™]žNÈÜš]XØ[\]ˆ\ÚÜÈÚÚ\]ÛˆH[XYÙ][Y[Ý]
+ÜÚÝ[ÜÚÚ\ÜØ[YWÜ›ÝšY\—Ü™]žX
+H[™ÛÈÝ˜ZYÚˆÈ˜[˜XÚËˆˆˆ‚ˆYˆ›ÝÚ\×Ý˜[œÚY[Ý˜[œÜÜÙ\œ›ÜŠ^ÊN‚ˆ™]\›ˆ˜[ÙBˆYˆÜÚÝ[ÜÚÚ\ÜØ[YWÜ›ÝšY\—Ü™]žJ\ÚË^ÊN‚ˆÙÙÙ\‹š[™›Ê]^[X\žH	\É\Îˆ[Y[Ý]ÛˆHÜš]XØ[]È‚ˆœÚÚ\[™ÈØ[YK\›ÝšY\ˆ™]žH[™˜[[™È˜XÚÎˆ	\È‹\ÚËYË^ÊBˆ™]\›ˆ˜[ÙBˆ™]\›ˆYB‚‚™YˆÛY\—ÜÝ\ØØ[
+ˆÝ\ˆÓY\”Ý\™\NˆÔ™\\™Y]^™\]Y\Ý™]žWÚÝØ\™ÜÎˆXÝÜÝ‹[žWKØ[™Y]WÚÝØ\™ÜÎˆXÝÜÝ‹[žWKŠHOˆ\VÜÝ‹\KXÝÜÝ‹[žWWN‚ˆˆˆ”™\ÛÛ™HHY\ˆÝ\[È
+Ú[™\™ÜËÝØ\™ÜÊX›ÜˆHÞ[˜ËØ\Þ[˜È\™›Ü›Y\‹ˆˆˆ‚ˆYˆÝ\šÚ[™OH˜Ø[Ž‚ˆ™]\›ˆ˜Ø[‹Ý\˜\™ÜËXÝ
+›ÝšY\\™\Kœ™\ÛÛ™YÜ›ÝšY\‹\WÛ[ÙO\™\Kœ™\ÛÛ™YØ\WÛ[ÙJBˆYˆÝ\šÚ[™OHœ™]žWÜØ[YWÜ›ÝšY\ˆŽ‚ˆ™]žWÜ›ÝšY\‹™]žWÛ[Ù[HÝ\˜\™ÜÂˆ™]\›ˆœ™]žH‹
+
+KXÝ
+™]žWÚÝØ\™ÜË™\ÛÛ™YÜ›ÝšY\\™]žWÜ›ÝšY\‹™\ÛÛ™YÛ[Ù[\™]žWÛ[Ù[
+Bˆ™]\›ˆ™˜[˜XÚÈ‹Ý\˜\™ÜËØ[™Y]WÚÝØ\™ÜÂ‚‚™YˆÜÝ\Ü™XÛÝ™\žWÛY\Šˆš\œÝÙ\œŽˆ^Ù\[Û‹™\NˆÔ™\\™Y]^™\]Y\Ý™]žWÚÝØ\™ÜÎˆXÝÜÝ‹[žWK
+‹ˆ\ÚÎˆÜ[Û˜[ÜÝ—K\Þ[˜×Û[ÙNˆ›ÛÛ›Ý]WÚ[™›ÎˆÜ[Û˜[ÑXÝÜÝ‹Ý—WKŠN‚ˆˆˆZ[H™XÛÝ™\žK[Y\ˆÙ[™\˜]Üˆ›ÜˆH˜Z[Yš[X\žH™\]Y\Ýˆˆˆ‚ˆ™]\›ˆØ]^Ü™XÛÝ™\žWÛY\Šˆš\œÝÙ\œ‹ÛY[\™\K˜ÛY[ÝØ\™ÜÏ\™\KšÝØ\™ÜË\ÚÏ]\ÚË\Þ[˜×Û[ÙOX\Þ[˜×Û[ÙKˆ˜\ÙWÚ[™›Ï\™\K˜˜\ÙWÚ[™›Ë™\ÛÛ™YÜ›ÝšY\\™\Kœ™\ÛÛ™YÜ›ÝšY\‹ˆ™\ÛÛ™YÛ[Ù[\™\Kœ™\ÛÛ™YÛ[Ù[™\ÛÛ™YØ˜\ÙWÝ\›\™\Kœ™\ÛÛ™YØ˜\ÙWÝ\›ˆ™\ÛÛ™YØ\WÚÙ^O\™\Kœ™\ÛÛ™YØ\WÚÙ^K™\ÛÛ™YØ\WÛ[ÙO\™\Kœ™\ÛÛ™YØ\WÛ[ÙKˆš[˜[Û[Ù[\™\K™š[˜[Û[Ù[X^ÝÚÙ[œÏ\™]žWÚÝØ\™ÜÖÈ›X^ÝÚÙ[œÈ—KˆXZ[—Ü[[YO\™]žWÚÝØ\™ÜÖÈ›XZ[—Ü[[YH—K›Ý]WÚ[™›Ï\›Ý]WÚ[™›ÊB‚‚™YˆØØ[ÛWÚ[\
+ˆ\ÚÎˆÝˆH›Û™K
+‹›ÝšY\ŽˆÝˆH›Û™K[Ù[ˆÝˆH›Û™K˜\ÙWÝ\›ˆÝˆH›Û™Kˆ\WÚÙ^NˆÝˆH›Û™KXZ[—Ü[[YNˆÜ[Û˜[ÑXÝÜÝ‹[žWWHH›Û™KY\ÜØYÙ\Îˆ\Ýˆ[\\˜]\™NˆÜ[Û˜[Ù›Ø]HH›Û™KX^ÝÚÙ[œÎˆ[H›Û™KÛÛÎˆ\ÝH›Û™Kˆ[Y[Ý]ˆ›Ø]H›Û™K^˜WØ›ÙNˆXÝH›Û™K™X\ÛÛš[™×ØÛÛ™šYÎˆÜ[Û˜[ÙXÝHH›Û™Kˆ^˜WÚXY\œÎˆÜ[Û˜[ÑXÝÜÝ‹Ý—WHH›Û™K\WÛ[ÙNˆÝˆH›Û™KÝ™X[Nˆ›ÛÛH˜[ÙKˆÝ™X[WÛÜ[ÛœÎˆXÝH›Û™K›Ý]WÚ[™›ÎˆÜ[Û˜[ÑXÝÜÝ‹Ý—WHH›Û™KŠHOˆ[žN‚ˆˆˆÙ[˜[^™YÞ[˜Ú›Û›Ý\ÈHØ[ˆ™\ÛÛ™H›ÝšY\‹Û[Ù[]]ÝØ\™ÜË˜[˜XÚÜË‚ˆ\ÚÎˆ]^\ÚÈÚÜÙH›ÝšY\Ž›[Ù[ÛÛY\Èœ›ÛHÛÛ™šYÈ
+YÛ›Ü™YYˆ›ÝšY\ˆÙ]
+NÈ\WÛ[ÙBˆÝ™\œšY\È\ÚÈÛÛ™šYÎÈ[Y[Ý]S›Û™H™XYÈ]^[X\žKžÝ\ÚßK[Y[Ý]È^˜WÚXY\œÈÝ™\œšYBˆÛY[Y˜][ËˆÝ™X[OUYH™]\›œÈH˜]ÈÑÈÝ™X[H
+Ø[\ˆÛÛœÝ[Y\ËÙ˜[È˜XÚÊBˆ[œÝXYÙˆH˜[Y]Y™\ÜÛœÙKˆ[[YQ\œ›ÜˆYˆ›È›ÝšY\ˆ\ÈÛÛ™šYÝ\™Yˆˆˆ‚ˆ™\K™]žWÚÝØ\™ÜËØ[™Y]WÚÝØ\™ÜÈHÜ[—Ø]^ØØ[
+ˆ\ÚË\Þ[˜×Û[ÙOQ˜[ÙK›ÝšY\\›ÝšY\‹[Ù[[[Ù[˜\ÙWÝ\›X˜\ÙWÝ\›ˆ\WÚÙ^OX\WÚÙ^KXZ[—Ü[[YO[XZ[—Ü[[YKY\ÜØYÙ\Ï[Y\ÜØYÙ\Ëˆ[\\˜]\™O][\\˜]\™KX^ÝÚÙ[œÏ[X^ÝÚÙ[œËÛÛÏ]ÛÛË[Y[Ý]][Y[Ý]ˆ^˜WØ›ÙOY^˜WØ›ÙK™X\ÛÛš[™×ØÛÛ™šYÏ\™X\ÛÛš[™×ØÛÛ™šYËˆ^˜WÚXY\œÏY^˜WÚXY\œË\WÛ[ÙOX\WÛ[ÙK›Ý]WÚ[™›Ï\›Ý]WÚ[™›Ëˆ
+BˆÛY[ÝØ\™ÜË™\]Y\ÝÜ›ÝšY\ˆH™\K˜ÛY[™\KšÝØ\™ÜË™\Kœ™\]Y\ÝÜ›ÝšY\‚ˆÈÝ™X[Z[™È]
+[ÐHYÙÜ™YØ]ÜŠNˆ™]\›ˆH˜]ÈÑÈÝ™X[KÚÚ\[™È˜[Y][Ûˆ[™ˆÈH˜[˜XÚÈÚZ[ˆ
+^H\ÜÝ[YHHÛÛ\]H™\ÜÛœÙJNÈHØ[\ˆÝÛœÈ™X\ÜÙ[X›KÙ˜[˜XÚË‚ˆYˆÝ™X[N‚ˆÝØ\™ÜÖÈœÝ™X[H—HHYBˆYˆÝ™X[WÛÜ[ÛœÎ‚ˆÝØ\™ÜÖÈœÝ™X[WÛÜ[ÛœÈ—HHÝ™X[WÛÜ[ÛœÂˆYˆ\ÚÈOH›[ØWØYÙÜ™YØ]Üˆˆ[™\Ú[œÝ[˜ÙJÛY[ÛÙ^]^[X\žPÛY[
+N‚ˆÈ™\ÜÛœÙ\Ë\Ú[HÛY[ÈÛÛœÝ[YHHÝ™X[H[\›˜[H[™™]\›ˆHÛÛ\]YˆÈØš™XÝ™[^IÜÈX[˜YÙYÝ™X[HÛÝ[]\˜]NÈH[ÐH˜XØYHÜ˜\È]\ÈÛ™HÚ[šË‚ˆ™]\›ˆÛY[˜Ú]˜ÛÛ\][ÛœË˜Ü™X]J
+ŠšÝØ\™ÜÊBˆ™]\›ˆÜ™[^WÜÞ[˜×ÜÝ™X[JÛY[ÝØ\™ÜË›ÝšY\\™\]Y\ÝÜ›ÝšY\‹\WÛ[ÙO\™\Kœ™\ÛÛ™YØ\WÛ[ÙJB‚ˆYˆÜš[X\žJ
+Š˜[Y]WÚÝÎˆ[žJHOˆ[žN‚ˆÈ™]žHÛˆHØ[YH›ÝšY\ˆ›ÜˆH˜[œÚY[˜[œÜÜ›\
+ÛÛ›™XÝ[Ûˆ™\Ù]ÈÝ™X[Z[™ËXÛÜÙHÂˆÈ[˜ÛÛ\]HÚ[šÙY™XYÈ^È
+H™Y›Ü™HH^Ù\XÚZ[ˆ™[ÝÈ\ØØ[]\ÈÈ›ÝšY\‹Û[Ù[ˆÈ˜[˜XÚËˆH›ÜYÛÛ›™XÝ[ÛˆÚÝ[‰ÝX˜[™Ûˆ[ˆÝ\Ú\ÙKZX[H›ÝšY\ˆ8 %\È\ÜXÚX[BˆÈX]\œÈ›Üˆ[›™Y]^[X\žHØ[ÈZÙH[ÐH™Y™\™[˜ÙHYš\ÛÜœËÚ\™H™˜[˜XÚÈÈ[›Ý\‚ˆÈ›ÝšY\ˆˆ\È›ÝHYX[š[™Ù[™XÛÝ™\žH
+HYš\ÛÜˆ\ÈHÜXÚYšXÈ[Ù[
+KÛÈH˜[œÚY[›\]ˆÈ\Û‰Ý™]šYYÚ[\HÜÙ\È]Yš\ÛÜˆ›ÜˆH\›ˆ
+›ÛÝÙˆH[ŒˆÝX›KXYš\ÛÜˆÛÛ›™XÝ[Û‚ˆÈ\œ›ÜˆˆÛÛ\ÙH8 %HÙ[Z[™H\Ý™X[H›\][™È›Ý\˜[[Yš\ÛÜœÈ]Û˜ÙJKˆ][\È\™BˆÈ›Ý[™Y[™\ÙH^Û™[X[˜XÚÛÙ™‹ˆÛÝ[\ÈÛÛ™šYÝ\˜X›HšXH]^[X\žK˜[œÚY[Ü™]šY\ÂˆÈ
+Y˜][ˆ™]šY\È8¡¤ˆÈÝ[][\ÊNÈHÙXÛÛ™Ý\™˜Z[\™HÜˆ[žH›Û‹]˜[œÚY[\œ›Üˆ˜[ÂˆÈ›ÝYÚÈš\œÝÙ\œ˜[™H^\Ý[™È˜[˜XÚÈ[™[™È[˜Ú[™ÙYˆ[šYšYYÛYH›ÜˆBˆÈ˜[œÚY[™]žH]™\žH]^[X\žH\ÚÈÚ\™\Ëˆ
+ˆÌMNÊBˆ™]\›ˆÝ˜[Y]WÛWÜ™\ÜÛœÙJˆÜ™[^WÜÞ[˜×ØÛÛ\][ÛŠˆÛY[ÝØ\™ÜË›ÝšY\\™\]Y\ÝÜ›ÝšY\‹\WÛ[ÙO\™\Kœ™\ÛÛ™YØ\WÛ[ÙKˆÜ™X]O[[X™H™\]Y\ÝˆØÜ™X]WÝÚ]Ü›ÙÜ™\ÜÊˆÛY[™\]Y\Ý\ÚËˆ›Ü˜ÙWÜÝ™X[OWÜ›ÝšY\—Ü™\]Z\™\×ÜÝ™X[Jˆ™\]Y\ÝÜ›ÝšY\‹™\K˜˜\ÙWÚ[™›ÈÜˆ™\Kœ™\ÛÛ™YØ˜\ÙWÝ\›
+Kˆ
+Kˆ
+Kˆ\ÚË
+Š˜[Y]WÚÝËˆ
+BˆžN‚ˆÈ›Ý[™YØ[YK\›ÝšY\ˆ™]žH
+^Û™[X[˜XÚÛÙ™‹]^[X\žK˜[œÚY[Ü™]šY\ÊH›Ü‚ˆÈ˜[œÚY[›\È™Y›Ü™H\ØØ[][™ÈÈ˜[˜XÚÈ8 %H›ÜYÛÛ›™XÝ[ÛˆÚÝ[‰ÝˆÈX˜[™ÛˆHX[H›ÝšY\ˆ
+X]\œÈ›Üˆ[›™Y[ÐHYš\ÛÜœÊK‚ˆžN‚ˆ™]\›ˆÜš[X\žJ›ÝšY\\™\]Y\ÝÜ›ÝšY\‹˜\ÙWÝ\›\™\K˜˜\ÙWÚ[™›ÊBˆ^Ù\^Ù\[Ûˆ\È˜[œÚY[Ù\œŽ‚ˆYˆ›ÝÜÚÝ[Ü™]žWÜØ[YWÜ›ÝšY\Š\ÚË˜[œÚY[Ù\œ‹ˆŠN‚ˆ˜Z\ÙBˆÛX^Ý˜[œÚY[Ü™]šY\ÈHÝ˜[œÚY[Ü™]žWØÛÝ[
+
+BˆÛ\ÝÝ˜[œÚY[H˜[œÚY[Ù\œ‚ˆ›ÜˆØ][\[ˆ˜[™ÙJKÛX^Ý˜[œÚY[Ü™]šY\È
+ÈJN‚ˆØ˜XÚÛÙ™ˆHZ[ŠÕS”ÒQS•Ô‘U–WÐPÒÓÑ‘—ÐTÑH
+ˆ
+‹Œ
+Šˆ
+Ø][\HJJKŒ
+BˆÙÙÙ\‹š[™›Ê]^[X\žH	\Îˆ˜[œÚY[˜[œÜÜ\œ›Üˆ
+][\	YÉY
+NÈ‚ˆœ™]žZ[™ÈØ[YH›ÝšY\ˆY\ˆ	KŒYœÈ™Y›Ü™H˜[˜XÚÎˆ	\È‹ˆ\ÚÈÜˆ˜Ø[‹Ø][\ÛX^Ý˜[œÚY[Ü™]šY\ËØ˜XÚÛÙ™‹Û\ÝÝ˜[œÚY[
+Bˆ[YKœÛY\
+Ø˜XÚÛÙ™ŠBˆžN‚ˆ™]\›ˆÜš[X\žJ
+Bˆ^Ù\^Ù\[Ûˆ\È™]žWÝ˜[œÚY[‚ˆYˆ›ÝÚ\×Ý˜[œÚY[Ý˜[œÜÜÙ\œ›ÜŠ™]žWÝ˜[œÚY[
+N‚ˆ˜Z\ÙBˆÛ\ÝÝ˜[œÚY[H™]žWÝ˜[œÚY[ˆ˜Z\ÙHÛ\ÝÝ˜[œÚY[ˆ^Ù\^Ù\[Ûˆ\Èš\œÝÙ\œŽ‚ˆYˆÜ\™›Ü›JÝ\ˆÓY\”Ý\
+HOˆ[žN‚ˆÚ[™\™ÜËÝÈHÛY\—ÜÝ\ØØ[
+Ý\™\K™]žWÚÝØ\™ÜËØ[™Y]WÚÝØ\™ÜÊBˆYˆÚ[™OH˜Ø[Ž‚ˆ™]\›ˆÝ˜[Y]WÛWÜ™\ÜÛœÙJÜ™[^WÜÞ[˜×ØÛÛ\][ÛŠ
+˜\™ÜË
+ŠšÝÊK\ÚÊBˆYˆÚ[™OHœ™]žHŽ‚ˆ™]\›ˆÜ™]žWÜØ[YWÜ›ÝšY\—ÜÞ[˜Ê
+ŠšÝÊBˆ™]\›ˆØØ[Ù˜[˜XÚ×ØØ[™Y]WÜÞ[˜Ê
+˜\™ÜË
+ŠšÝÊBˆ™\Ý[HÙš]™WÛY\ŠˆÜÝ\Ü™XÛÝ™\žWÛY\Šš\œÝÙ\œ‹™\K™]žWÚÝØ\™ÜË\ÚÏ]\ÚË\Þ[˜×Û[ÙOQ˜[ÙK›Ý]WÚ[™›Ï\›Ý]WÚ[™›ÊKˆÜ\™›Ü›JBˆYˆ™\Ý[\ÈÔ‘TRTÑWÓÔ’QÒSS‚ˆ˜Z\ÙBˆ™]\›ˆ™\Ý[‚‚™YˆØÛÙ\˜ÙWÛWÛY\ÜØYÙJ™\ÜÛœÙJN‚ˆˆˆ”[HY\ÜØYÙH
+XÝØš™XÝÜˆÝŠHÝ]ÙˆH™\ÜÛœÙK[Ü‹[Y\ÜØYÙH˜[YNˆXÝ\Ú\Yˆ™\ÜÛœÙ\ËØ˜\™HY\ÜØYÙ\È
+ÛÛ\™\ÜÚ[Û‹›ÞY\ÊH[™Ú]ÛÛ\][ÛˆØš™XÝÎÈXYÚXÓ[ØÚÂˆ™X\ÛÛš[™×Ê˜]œÈ\™H[X™\˜][H›ÝÝš[™ÜËˆˆˆ‚ˆYˆ™\ÜÛœÙH\È›Û™HÜˆ\Ú[œÝ[˜ÙJ™\ÜÛœÙKÝŠN‚ˆ™]\›ˆ™\ÜÛœÙBˆYˆ\Ú[œÝ[˜ÙJ™\ÜÛœÙKXÝ
+N‚ˆYˆ˜ÚÚXÙ\Èˆ›Ý[ˆ™\ÜÛœÙN‚ˆ™]\›ˆ™\ÜÛœÙBˆÚÚXÙ\ÈH™\ÜÛœÙK™Ù]
+˜ÚÚXÙ\ÈŠHÜˆ×Bˆ[ÙN‚ˆÚÚXÙ\ÈHÙ]]Š™\ÜÛœÙK˜ÚÚXÙ\È‹›Û™JBˆYˆ›ÝÚÚXÙ\Î‚ˆ™]\›ˆ™\ÜÛœÙBˆ™]\›ˆÛY\ÜØYÙWÙšY[
+ÚÚXÙ\ÖÌK›Y\ÜØYÙHŠHYˆÚÚXÙ\È[ÙH›Û™B‚‚™YˆÛY\ÜØYÙWÙšY[
+\ÙË˜[YJN‚ˆ™]\›ˆ\ÙË™Ù]
+˜[YJHYˆ\Ú[œÝ[˜ÙJ\ÙËXÝ
+H[ÙHÙ]]Š\ÙË˜[YK›Û™JB‚‚™Yˆ^˜XÝØÛÛ[ÛÜ—Ü™X\ÛÛš[™Ê™\ÜÛœÙK
+‹X^Ü™X\ÛÛš[™×ØÚ\œÎˆ[›Û™HH›Û™JHOˆÝŽ‚ˆˆˆ‘^˜XÝÛÛ[œ›ÛH[ˆH™\ÜÛœÙK˜[[™È˜XÚÈÈ™X\ÛÛš[™ÈšY[Ë‚ˆÜ™\ŽˆÛÛ[
+[›[™H[šÈ›ØÚÜÈÝš\Y
+H8¡¤ˆ™X\ÛÛš[™ØØ™X\ÛÛš[™×ØÛÛ[8¡¤‚ˆ™X\ÛÛš[™×Ù]Z[Ø
+Ü[”›Ý]\ˆ\œ˜^JKˆXØÙ\ÈH™\ÜÛœÙHÜˆ˜\™HY\ÜØYÙNÂˆX^Ü™X\ÛÛš[™×ØÚ\œØ›Ý[™ÈH™X\ÛÛš[™È˜[˜XÚÈÛÈ[˜›Ý[™YÚZ[‹[Ù‹]ÝYÚØ[‰Ýˆ™XÛÛYHHÛÛ\XÝ[ÛˆÝ[[X\žKˆ™]\›œÈˆ˜Yˆ›Ý[™È›Ý[™ˆˆˆ‚ˆ\ÙÈHØÛÙ\˜ÙWÛWÛY\ÜØYÙJ™\ÜÛœÙJBˆYˆ\ÙÈ\È›Û™N‚ˆ™]\›ˆˆ‚ˆYˆ\Ú[œÝ[˜ÙJ\ÙËÝŠN‚ˆ™]\›ˆ\ÙËœÝš\
+
+Bˆ˜]ÈHÛY\ÜØYÙWÙšY[
+\ÙË˜ÛÛ[ŠBˆYˆ›Ý\Ú[œÝ[˜ÙJ˜]ËÝŠN‚ˆ˜]ÈHÝŠ˜]ÊHYˆ˜]È[ÙHˆ‚ˆÛÛ[H˜]ËœÝš\
+
+BˆYˆÛÛ[‚ˆÈZ\œ›ÜœÈÜÝš\Ý[š×Ø›ØÚÜÂˆÛX[™YH™KœÝXŠˆˆ
+Î[šß[šÚ[™ß™X\ÛÛš[™ßÝYÚ‘PTÓÓ’S‘×ÔÐÔUÒQ
+Oˆ‚ˆˆ‹ŠÈ‚ˆˆÊÎ[šß[šÚ[™ß™X\ÛÛš[™ßÝYÚ‘PTÓÓ’S‘×ÔÐÔUÒQ
+Oˆ‹ˆˆ‹ÛÛ[›YÜÏ\™K‘ÕS™K’QÓ“Ô‘PÐTÑKˆ
+KœÝš\
+
+BˆYˆÛX[™Y‚ˆ™]\›ˆÛX[™YˆÈÛÛ[\È[\HÜˆ™X\ÛÛš[™Ë[Û›H8 %žHÝXÝ\™Y™X\ÛÛš[™ÈšY[Âˆ™X\ÛÛš[™×Ü\Îˆ\ÝÜÝ—HH×Bˆ›ÜˆšY[[ˆ
+œ™X\ÛÛš[™È‹œ™X\ÛÛš[™×ØÛÛ[ŠN‚ˆ˜[HÛY\ÜØYÙWÙšY[
+\ÙËšY[
+BˆYˆ˜[[™\Ú[œÝ[˜ÙJ˜[ÝŠH[™˜[œÝš\
+
+H[™˜[›Ý[ˆ™X\ÛÛš[™×Ü\Î‚ˆ™X\ÛÛš[™×Ü\Ë˜\[™
+˜[œÝš\
+
+JBˆ]Z[ÈHÛY\ÜØYÙWÙšY[
+\ÙËœ™X\ÛÛš[™×Ù]Z[ÈŠBˆYˆ]Z[È[™\Ú[œÝ[˜ÙJ]Z[Ë\Ý
+N‚ˆ›Üˆ]Z[[ˆ]Z[Î‚ˆYˆ\Ú[œÝ[˜ÙJ]Z[XÝ
+N‚ˆÝ[[X\žHH]Z[™Ù]
+œÝ[[X\žHŠHÜˆ]Z[™Ù]
+˜ÛÛ[ŠHÜˆ]Z[™Ù]
+^ŠBˆYˆÝ[[X\žH[™Ý[[X\žH›Ý[ˆ™X\ÛÛš[™×Ü\Î‚ˆ™X\ÛÛš[™×Ü\Ë˜\[™
+Ý[[X\žKœÝš\
+
+HYˆ\Ú[œÝ[˜ÙJÝ[[X\žKÝŠH[ÙHÝŠÝ[[X\žJJBˆYˆ›Ý™X\ÛÛš[™×Ü\Î‚ˆ™]\›ˆˆ‚ˆ^H——ˆ‹š›Ú[Š™X\ÛÛš[™×Ü\ÊBˆYˆX^Ü™X\ÛÛš[™×ØÚ\œÈ\È›Ý›Û™H[™[Š^
+HˆX^Ü™X\ÛÛš[™×ØÚ\œÎ‚ˆÙÙÙ\‹Ø\›š[™Ê™™[˜XÚÈÈ™X\ÛÛš[™ÈšY[È
+	YÚ\œÊNÈ[˜Ø][™ÈÈ	Y‹ˆ[Š^
+KX^Ü™X\ÛÛš[™×ØÚ\œÊBˆ™]\›ˆ^Î›X^Ü™X\ÛÛš[™×ØÚ\œ×Bˆ™]\›ˆ^‚‚Ü™[^WØ]^[X\žWØØ[Ø\Þ[˜Â˜\Þ[˜ÈYˆ\Þ[˜×ØØ[ÛJˆ\ÚÎˆÝˆH›Û™K
+‹›ÝšY\ŽˆÝˆH›Û™K[Ù[ˆÝˆH›Û™K˜\ÙWÝ\›ˆÝˆH›Û™Kˆ\WÚÙ^NˆÝˆH›Û™KXZ[—Ü[[YNˆÜ[Û˜[ÑXÝÜÝ‹[žWWHH›Û™KY\ÜØYÙ\Îˆ\Ýˆ[\\˜]\™NˆÜ[Û˜[Ù›Ø]HH›Û™KX^ÝÚÙ[œÎˆ[H›Û™KÛÛÎˆ\ÝH›Û™Kˆ[Y[Ý]ˆ›Ø]H›Û™K^˜WØ›ÙNˆXÝH›Û™K™X\ÛÛš[™×ØÛÛ™šYÎˆÜ[Û˜[ÙXÝHH›Û™Kˆ›Ý]WÚ[™›ÎˆÜ[Û˜[ÑXÝÜÝ‹Ý—WHH›Û™KŠHOˆ[žN‚ˆˆˆ”[ˆ[ˆ\Þ[˜Ú›Û›Ý\È]^[X\žHH™\]Y\Ý[™\ˆHÛÛ™šYÝ\™Y[Z]ˆˆˆ‚ˆÙ[X\Ü™HHØXÜ]Z\™WØ\Þ[˜×Ø]^ÜÙ[X\Ü™J\ÚÊBˆYˆÙ[X\Ü™H\È›Ý›Û™N‚ˆ]ØZ]Ù[X\Ü™K˜XÜ]Z\™J
+BˆžN‚ˆ™]\›ˆ]ØZ]Ø\Þ[˜×ØØ[ÛWÚ[\
+ˆ\ÚÏ]\ÚË›ÝšY\\›ÝšY\‹[Ù[[[Ù[˜\ÙWÝ\›X˜\ÙWÝ\›\WÚÙ^OX\WÚÙ^KˆXZ[—Ü[[YO[XZ[—Ü[[YKY\ÜØYÙ\Ï[Y\ÜØYÙ\Ë[\\˜]\™O][\\˜]\™KˆX^ÝÚÙ[œÏ[X^ÝÚÙ[œËÛÛÏ]ÛÛË[Y[Ý]][Y[Ý]^˜WØ›ÙOY^˜WØ›ÙKˆ™X\ÛÛš[™×ØÛÛ™šYÏ\™X\ÛÛš[™×ØÛÛ™šYË›Ý]WÚ[™›Ï\›Ý]WÚ[™›Ëˆ
+Bˆš[˜[N‚ˆYˆÙ[X\Ü™H\È›Ý›Û™N‚ˆÙ[X\Ü™Kœ™[X\ÙJ
+B‚‚˜\Þ[˜ÈYˆØ\Þ[˜×ØØ[ÛWÚ[\
+ˆ\ÚÎˆÝˆH›Û™K
+‹›ÝšY\ŽˆÝˆH›Û™K[Ù[ˆÝˆH›Û™K˜\ÙWÝ\›ˆÝˆH›Û™Kˆ\WÚÙ^NˆÝˆH›Û™KXZ[—Ü[[YNˆÜ[Û˜[ÑXÝÜÝ‹[žWWHH›Û™KY\ÜØYÙ\Îˆ\Ýˆ[\\˜]\™NˆÜ[Û˜[Ù›Ø]HH›Û™KX^ÝÚÙ[œÎˆ[H›Û™KÛÛÎˆ\ÝH›Û™Kˆ[Y[Ý]ˆ›Ø]H›Û™K^˜WØ›ÙNˆXÝH›Û™K™X\ÛÛš[™×ØÛÛ™šYÎˆÜ[Û˜[ÙXÝHH›Û™Kˆ›Ý]WÚ[™›ÎˆÜ[Û˜[ÑXÝÜÝ‹Ý—WHH›Û™KŠHOˆ[žN‚ˆˆˆÙ[˜[^™Y\Þ[˜Ú›Û›Ý\ÈHØ[ÈÙYHØ[ÛJ
+H›Üˆ[ØÝ[Y[][Û‹‚ˆ›È\‹\™\]Y\ÝXY\ˆÈ\WÛ[ÙHÝ™\œšYHÛˆH\Þ[˜È[žHÚ[ˆˆˆ‚ˆ™\K™]žWÚÝØ\™ÜËØ[™Y]WÚÝØ\™ÜÈHÜ[—Ø]^ØØ[
+ˆ\ÚË\Þ[˜×Û[ÙOUYK›ÝšY\\›ÝšY\‹[Ù[[[Ù[˜\ÙWÝ\›X˜\ÙWÝ\›ˆ\WÚÙ^OX\WÚÙ^KXZ[—Ü[[YO[XZ[—Ü[[YKY\ÜØYÙ\Ï[Y\ÜØYÙ\Ëˆ[\\˜]\™O][\\˜]\™KX^ÝÚÙ[œÏ[X^ÝÚÙ[œËÛÛÏ]ÛÛË[Y[Ý]][Y[Ý]ˆ^˜WØ›ÙOY^˜WØ›ÙK™X\ÛÛš[™×ØÛÛ™šYÏ\™X\ÛÛš[™×ØÛÛ™šYËˆ^˜WÚXY\œÏS›Û™K\WÛ[ÙOS›Û™K›Ý]WÚ[™›Ï\›Ý]WÚ[™›Ëˆ
+BˆÛY[ÝØ\™ÜË™\]Y\ÝÜ›ÝšY\ˆH™\K˜ÛY[™\KšÝØ\™ÜË™\Kœ™\]Y\ÝÜ›ÝšY\‚ˆžN‚ˆÈ™]žHÓÑHÛˆHØ[YH›ÝšY\ˆ›ÜˆH˜[œÚY[›\™Y›Ü™H˜[˜XÚÈ
+ÙYHØ[ÛJ
+JK‚ˆÈ
+ˆÌMNÊBˆÙ›Ü˜ÙWÜÝ™X[WØ\Þ[˜ÈH
+ˆÜ›ÝšY\—Ü™\]Z\™\×ÜÝ™X[J™\]Y\ÝÜ›ÝšY\‹™\K˜˜\ÙWÚ[™›ÈÜˆ™\Kœ™\ÛÛ™YØ˜\ÙWÝ\›
+Bˆ[™›Ý\Ú[œÝ[˜ÙJÛY[
+ˆ\Þ[˜ÐÛÙ^]^[X\žPÛY[\Þ[˜Ð[›ÜXÐ]^[X\žPÛY[\Þ[˜Ð™Y›ØÚÐ]^[X\žPÛY[
+JJB‚ˆ\Þ[˜ÈYˆØXÜ™X]JÚÝØ\™ÜÎˆXÝÜÝ‹[žWJHOˆ[žN‚ˆYˆÙ›Ü˜ÙWÜÝ™X[WØ\Þ[˜Î‚ˆ™]\›ˆ]ØZ]ØXÜ™X]WÝÚ]ÜÝ™X[JÛY[ÚÝØ\™ÜË\ÚÊBˆ™]\›ˆ]ØZ]ÛY[˜Ú]˜ÛÛ\][ÛœË˜Ü™X]J
+Š—ÚÝØ\™ÜÊB‚ˆ\Þ[˜ÈYˆÜš[X\žJ
+Š˜[Y]WÚÝÎˆ[žJHOˆ[žN‚ˆ™]\›ˆÝ˜[Y]WÛWÜ™\ÜÛœÙJˆ]ØZ]Ü™[^WØ\Þ[˜×ØÛÛ\][ÛŠˆÛY[ÝØ\™ÜË›ÝšY\\™\]Y\ÝÜ›ÝšY\‹\WÛ[ÙO\™\Kœ™\ÛÛ™YØ\WÛ[ÙKˆÜ™X]OWØXÜ™X]JKˆ\ÚË
+Š˜[Y]WÚÝÊBˆžN‚ˆ™]\›ˆ]ØZ]Üš[X\žJ›ÝšY\\™\]Y\ÝÜ›ÝšY\‹˜\ÙWÝ\›\™\K˜˜\ÙWÚ[™›ÊBˆ^Ù\^Ù\[Ûˆ\È˜[œÚY[Ù\œŽ‚ˆÈH\Þ[˜ÈÛÙ^Y\\ˆÜ˜\ÈHÞ[˜ÈÝ™X[HšXH×Ý™XYˆØ[YH[Y[Ý]\œ›Üˆ\™K‚ˆYˆ›ÝÜÚÝ[Ü™]žWÜØ[YWÜ›ÝšY\Š\ÚË˜[œÚY[Ù\œ‹ˆ
+\Þ[˜ÊHŠN‚ˆ˜Z\ÙBˆÙÙÙ\‹š[™›Ê]^[X\žH	\È
+\Þ[˜ÊNˆ˜[œÚY[˜[œÜÜ\œ›ÜŽÈ™]žZ[™È‚ˆ›Û˜ÙHÛˆHØ[YH›ÝšY\ˆ™Y›Ü™H˜[˜XÚÎˆ	\È‹\ÚÈÜˆ˜Ø[‹˜[œÚY[Ù\œŠBˆ™]\›ˆ]ØZ]Üš[X\žJ
+Bˆ^Ù\^Ù\[Ûˆ\Èš\œÝÙ\œŽ‚ˆ\Þ[˜ÈYˆÜ\™›Ü›JÝ\ˆÓY\”Ý\
+HOˆ[žN‚ˆÚ[™\™ÜËÝÈHÛY\—ÜÝ\ØØ[
+Ý\™\K™]žWÚÝØ\™ÜËØ[™Y]WÚÝØ\™ÜÊBˆYˆÚ[™OH˜Ø[Ž‚ˆ™]\›ˆÝ˜[Y]WÛWÜ™\ÜÛœÙJ]ØZ]Ü™[^WØ\Þ[˜×ØÛÛ\][ÛŠ
+˜\™ÜË
+ŠšÝÊK\ÚÊBˆYˆÚ[™OHœ™]žHŽ‚ˆ™]\›ˆ]ØZ]Ü™]žWÜØ[YWÜ›ÝšY\—Ø\Þ[˜Ê
+ŠšÝÊBˆ˜—ØÛY[˜—Û[Ù[˜—ÛX™[H\™ÜÂˆ˜—ØÛY[ÈHÝ×Ø\Þ[˜×ØÛY[
+˜—ØÛY[˜—Û[Ù[Üˆˆ‹\×Ýš\Ú[ÛJ\ÚÈOHš\Ú[ÛˆŠJBˆ™]\›ˆ]ØZ]ØØ[Ù˜[˜XÚ×ØØ[™Y]WØ\Þ[˜Ê˜—ØÛY[˜—Û[Ù[˜—ÛX™[
+ŠšÝÊBˆ™\Ý[H]ØZ]Ùš]™WÛY\—Ø\Þ[˜ÊˆÜÝ\Ü™XÛÝ™\žWÛY\Šš\œÝÙ\œ‹™\K™]žWÚÝØ\™ÜË\ÚÏ]\ÚË\Þ[˜×Û[ÙOUYK›Ý]WÚ[™›Ï\›Ý]WÚ[™›ÊKˆÜ\™›Ü›JBˆYˆ™\Ý[\ÈÔ‘TRTÑWÓÔ’QÒSS‚ˆ˜Z\ÙBˆ™]\›ˆ™\Ý[‚‚ˆÈKKKH‘QÒSˆQÒS‹PÓÓTU
+™]™\\ØÚY[YÈÙYHÓÓTUÓPS’Q‘TÕ›Y
+HKKKBˆÈ˜[Y\È^\›˜[YÚ[œÈ[\ÜYœ›ÛH\È[Ù[H™Y›Ü™HHÙ\ŒˆXÛÛ\ÜÚ][Û‹‚ˆÈ[\›˜[ÛÙHUTÕ“Õ\ÙH\ÙH
+ØÜš\ËØÚXÚ×ØÛÛ\]ÜÚ[\œËœH˜Z[ÈÒHYˆ]Ù\ÊK‚ˆÈHÚÛH›ØÚÈ\È™[[Ý™YžH™]™\[™ÈHÛÛ[Z]]YY]‚™œ›ÛH]Xˆ[\Ü]È›ÜXNˆKM‚š[\ÜÛÜHÈ›ÜXNˆKM‚‚““ÕT×ÑVWÐ“ÑHHÛ›Ý\×Ù^˜WØ›ÙJ
+B‚™YˆÙ]Ø\Þ[˜×Ý^Ø]^[X\žWØÛY[
+\ÚÎˆÝˆHˆ‹
+‹XZ[—Ü[[YNˆÜ[Û˜[ÑXÝÜÝ‹[žWWHH›Û™JN‚ˆˆˆ”™]\›ˆ
+\Þ[˜×ØÛY[[Ù[ÜÛYÊH›Üˆ\Þ[˜ÈÛÛœÝ[Y\œË‚‚ˆ›ÜˆÝ[™\™›ÝšY\œÈ™]\›œÈ
+\Þ[˜ÓÜ[RK[Ù[
+Kˆ›ÜˆÛÙ^™]\›œÂˆ
+\Þ[˜ÐÛÙ^]^[X\žPÛY[[Ù[
+HÚXÚÜ˜\ÈH™\ÜÛœÙ\ÈTK‚ˆ™]\›œÈ
+›Û™K›Û™JHÚ[ˆ›È›ÝšY\ˆ\È]˜Z[X›K‚ˆˆˆ‚ˆ›ÝšY\‹[Ù[˜\ÙWÝ\›\WÚÙ^K\WÛ[ÙHHÜ™\ÛÛ™WÝ\Ú×Ü›ÝšY\—Û[Ù[
+\ÚÈÜˆ›Û™JBˆ™]\›ˆ™\ÛÛ™WÜ›ÝšY\—ØÛY[
+ˆ›ÝšY\‹ˆ[Ù[[[Ù[ˆ\Þ[˜×Û[ÙOUYKˆ^XÚ]Ø˜\ÙWÝ\›X˜\ÙWÝ\›ˆ^XÚ]Ø\WÚÙ^OX\WÚÙ^Kˆ\WÛ[ÙOX\WÛ[ÙKˆXZ[—Ü[[YO[XZ[—Ü[[YKˆ
+BˆÈKKKHS‘QÒS‹PÓÓTUKKKB

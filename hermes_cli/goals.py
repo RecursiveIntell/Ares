@@ -1322,6 +1322,16 @@ class GoalManager:
     def state(self) -> Optional[GoalState]:
         return self._state
 
+    def _save(self) -> bool:
+        """Persist the current in-memory state after an external mutation.
+
+        GoalManager's public mutators save as they go, but a few lifecycle
+        owners update a barrier field before handing control back to the idle
+        loop. Keep that compatibility seam on the manager so the mutation is
+        durable before the next process observes it.
+        """
+        return bool(self._state is not None and save_goal(self.session_id, self._state))
+
     def is_active(self) -> bool:
         return self._state is not None and self._state.status == "active"
 
