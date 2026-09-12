@@ -200,9 +200,14 @@ export function useComposerDraft({
   // owns focus. A background reconnect must never steal the caret from another
   // input, button, terminal, or sidebar control.
   useEffect(() => {
-    // Routing identity and keyboard focus are separate: every mounted composer
-    // must claim its bus target, while only an unowned document may receive an
-    // automatic caret move.
+    // Keep-alive panes remain mounted while hidden. They must not claim the
+    // routing key or run the automatic-focus predicate until they are fronted;
+    // the visibility dependency below retries the same mount/runtime path when
+    // the pane becomes visible.
+    if (!paneVisible) {
+      return
+    }
+
     markActiveComposer(target)
 
     if (
@@ -215,7 +220,7 @@ export function useComposerDraft({
     ) {
       focusInput(false)
     }
-  }, [activeTreeGroup, focusInput, focusKey, inputDisabled, paneGroup, target])
+  }, [activeTreeGroup, focusInput, focusKey, inputDisabled, paneGroup, paneVisible, target])
 
   // Explicit focus-bus and programmatic insert requests ARE user intent and
   // retain the existing triple-focus behavior across React/browser commits.
