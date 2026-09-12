@@ -399,6 +399,25 @@ def test_pid_exists_zombie_via_psutil_returns_false(monkeypatch):
     assert status._pid_exists(4242) is False
 
 
+def test_pid_exists_falls_back_to_kernel_probe_when_psutil_is_namespace_blind(monkeypatch):
+    """A valid POSIX PID may be hidden from a sandbox's /proc mount."""
+    import sys
+    import types
+
+    from gateway import status
+
+    fake_psutil = types.SimpleNamespace()
+    fake_psutil.STATUS_ZOMBIE = "zombie"
+    fake_psutil.NoSuchProcess = type("NoSuchProcess", (Exception,), {})
+    fake_psutil.Process = lambda pid: (_ for _ in ()).throw(fake_psutil.NoSuchProcess())
+    fake_psutil.pid_exists = lambda pid: False
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+    monkeypatch.setattr(status, "_posix_is_zombie", lambda pid: False)
+    monkeypatch.setattr(status.os, "kill", lambda pid, sig: None)
+
+    assert status._pid_exists(4242) is True
+
+
 
 
 @pytest.mark.asyncio

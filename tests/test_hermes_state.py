@@ -903,19 +903,24 @@ class TestFTS5Search:
         ]
         assert all("context" in row and row["context"] for row in default)
 
-    def test_search_projection_skips_context_enrichment_queries(self, db):
+    def test_search_projection_skips_context_enrichment_queries(self, db, monkeypatch):
         db.create_session(session_id="s1", source="cli")
         db.append_message("s1", role="user", content="before")
         db.append_message("s1", role="assistant", content="projectionneedle")
         db.append_message("s1", role="user", content="after")
 
         statements = []
-        read_conn = db._get_read_conn() or db._conn
         traced_connections = [db._conn]
-        if read_conn is not db._conn:
-            traced_connections.append(read_conn)
-        for conn in traced_connections:
+        db._conn.set_trace_callback(statements.append)
+        real_connect_read_only = db._connect_read_only
+
+        def traced_connect_read_only(*args, **kwargs):
+            conn = real_connect_read_only(*args, **kwargs)
             conn.set_trace_callback(statements.append)
+            traced_connections.append(conn)
+            return conn
+
+        monkeypatch.setattr(db, "_connect_read_only", traced_connect_read_only)
 
         def context_query_count():
             normalized = (" ".join(sql.upper().split()) for sql in statements)
@@ -940,7 +945,7 @@ class TestFTS5Search:
             assert default[0]["context"]
             assert context_query_count() == 2
         finally:
-            for conn in traced_connections:
+            for conn in set(traced_connections):
                 conn.set_trace_callback(None)
 
     def test_sanitize_fts5_query_strips_dangerous_chars(self):
@@ -4371,7 +4376,9 @@ class TestApplyWalProbe:
         if sys.platform == "linux":
             import os
 
-            fd_dir = f"/proc/{os.getpid()}/fd"
+            # ``self`` resolves through the active procfs mount even when the
+            # test process's namespace PID is not visible by numeric path.
+            fd_dir = "/proc/self/fd"
             deleted_fds = []
             for fd_name in os.listdir(fd_dir):
                 try:

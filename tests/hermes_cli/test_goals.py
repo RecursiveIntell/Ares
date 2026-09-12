@@ -374,6 +374,7 @@ class TestStatusLineSubgoalCount:
 # ──────────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.live_system_guard_bypass
 class TestWaitBarrier:
     """The /goal wait barrier parks the loop on a live PID and resumes when
     the process exits, without burning turns or calling the judge."""
@@ -482,6 +483,7 @@ class TestGatherBackgroundProcessesOwnership:
 # ──────────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.live_system_guard_bypass
 class TestJudgeDrivenWait:
     """The judge returns a `wait` verdict (given live background-process
     context) and the loop parks automatically — no manual /goal wait."""

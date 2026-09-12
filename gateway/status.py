@@ -579,10 +579,32 @@ def _pid_exists(pid: int) -> bool:
             if psutil.Process(pid).status() == psutil.STATUS_ZOMBIE:
                 return False
         except getattr(psutil, "NoSuchProcess", ()):
-            return False
+            # A PID can be valid in the caller's PID namespace while the
+            # psutil /proc view is rooted in another namespace (for example,
+            # a sandboxed test runner). Keep the POSIX kernel probe below as
+            # the authoritative fallback instead of declaring that process
+            # dead solely because psutil cannot see it.
+            pass
         except Exception:
             pass
-        return bool(psutil.pid_exists(pid))
+        if psutil.pid_exists(pid):
+            return True
+        # psutil is authoritative when it can observe a process, but a
+        # namespace-mismatched /proc can report a false negative. On POSIX,
+        # confirm the PID with the non-destructive kernel probe. Preserve the
+        # zombie check before falling through: SIGTERM/SIGKILL cannot revive
+        # or reap a zombie and callers must treat it as dead.
+        if _IS_WINDOWS:
+            return False
+        if _posix_is_zombie(pid):
+            return False
+        try:
+            os.kill(pid, 0)  # windows-footgun: POSIX-only fallback
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
     except ImportError:
         pass  # Fall through to stdlib fallback.
     if _IS_WINDOWS:

@@ -74,7 +74,11 @@ def test_first_certified_call_negotiates_capabilities_before_key_binding(
     assert pass_fds == ()
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group witness")
+@pytest.mark.live_system_guard_bypass
+@pytest.mark.skipif(
+    os.name == "nt" or not Path(f"/proc/{os.getpid()}").exists(),
+    reason="POSIX process-group witness needs a /proc view in this PID namespace",
+)
 def test_timeout_kills_descendant_group_before_return(tmp_path: Path):
     sentinel = tmp_path / "survived"
     child = tmp_path / "child.py"
