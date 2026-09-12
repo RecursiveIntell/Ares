@@ -599,7 +599,7 @@ def _pid_exists(pid: int) -> bool:
         if _posix_is_zombie(pid):
             return False
         try:
-            os.kill(pid, 0)  # windows-footgun: POSIX-only fallback
+            os.kill(pid, 0)  # windows-footgun: ok — POSIX-only fallback
         except PermissionError:
             return True
         except OSError:
