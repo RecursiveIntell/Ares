@@ -815,6 +815,8 @@ class TestSharedBoardPaths:
         sc.reset_session_vars()
         for key in sc._VAR_MAP:
             monkeypatch.setenv(key, "stale-routing-value")
+        hostile_pythonpath = os.pathsep.join([str(tmp_path / "shadow"), "/tmp/userlib"])
+        monkeypatch.setenv("PYTHONPATH", hostile_pythonpath)
 
         captured = {}
 
@@ -847,6 +849,9 @@ class TestSharedBoardPaths:
         kb._default_spawn(task, str(tmp_path / "ws"))
 
         env = captured["env"]
+        pythonpath = env["PYTHONPATH"].split(os.pathsep)
+        assert Path(pythonpath[0]).resolve() == Path(kb.__file__).resolve().parent.parent
+        assert pythonpath[1:] == hostile_pythonpath.split(os.pathsep)
         assert env["HERMES_KANBAN_DB"] == str(default_home / "kanban.db")
         assert env["HERMES_KANBAN_WORKSPACES_ROOT"] == str(
             default_home / "kanban" / "workspaces"
@@ -1191,7 +1196,7 @@ def test_resolve_hermes_argv_falls_back_to_module_form_when_no_path_shim(monkeyp
     monkeypatch.delenv("HERMES_BIN", raising=False)
     monkeypatch.setattr(shutil, "which", lambda name: None)
     argv = kb._resolve_hermes_argv()
-    assert argv == [sys.executable, "-m", "hermes_cli.main"]
+    assert argv == [sys.executable, "-P", "-m", "hermes_cli.main"]
 
 
 def test_resolve_hermes_argv_module_actually_runs():
@@ -1212,7 +1217,17 @@ def test_resolve_hermes_argv_module_actually_runs():
         os.environ.pop("HERMES_BIN", None)
         with mock.patch.object(shutil, "which", return_value=None):
             argv = kb._resolve_hermes_argv()
-    r = subprocess.run(argv + ["--version"], capture_output=True, text=True, timeout=30)
+    from hermes_bootstrap import pin_runtime_pythonpath
+
+    env = os.environ.copy()
+    pin_runtime_pythonpath(env)
+    r = subprocess.run(
+        argv + ["--version"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
+    )
     assert r.returncode == 0, (
         f"`{' '.join(argv)} --version` failed (rc={r.returncode}); "
         f"stderr={r.stderr[:200]!r}"

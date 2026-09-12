@@ -30,12 +30,22 @@ import threading
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures.thread import _worker
+from contextvars import copy_context
 
 __all__ = ["DaemonThreadPoolExecutor"]
 
 
 class DaemonThreadPoolExecutor(ThreadPoolExecutor):
     """ThreadPoolExecutor variant whose workers do not block process exit."""
+
+    def submit(self, fn, /, *args, **kwargs):
+        """Submit a callable while propagating the caller's contextvars."""
+        ctx = copy_context()
+
+        def _run_with_context(*call_args, **call_kwargs):
+            return ctx.run(fn, *call_args, **call_kwargs)
+
+        return super().submit(_run_with_context, *args, **kwargs)
 
     def _adjust_thread_count(self) -> None:
         # Mirrors CPython's implementation with two changes: daemon=True and
@@ -63,8 +73,8 @@ class DaemonThreadPoolExecutor(ThreadPoolExecutor):
                 worker_args = (
                     executor_ref,
                     self._work_queue,
-                    self._initializer,
-                    self._initargs,
+                    getattr(self, "_initializer"),
+                    getattr(self, "_initargs"),
                 )
             t = threading.Thread(
                 name=thread_name,

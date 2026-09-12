@@ -165,6 +165,24 @@ def suppress_platform_ver_console() -> None:
         pass
 
 
+def pin_runtime_pythonpath(env: dict[str, str], src_root: str | None = None) -> None:
+    """Put the trusted Hermes source root first in a child environment.
+
+    Keep unrelated caller entries in order, but remove empty cwd aliases and
+    duplicate spellings of the runtime root. Pair this with Python ``-P`` so
+    neither implicit cwd nor inherited ``PYTHONPATH`` can outrank Hermes.
+    """
+    root = os.path.abspath(src_root or os.path.dirname(__file__))
+    normalized_root = os.path.normcase(os.path.realpath(root))
+    inherited = env.get("PYTHONPATH", "").split(os.pathsep)
+    retained = [
+        entry
+        for entry in inherited
+        if entry and os.path.normcase(os.path.realpath(entry)) != normalized_root
+    ]
+    env["PYTHONPATH"] = os.pathsep.join([root, *retained])
+
+
 def harden_import_path(src_root: str | None = None) -> None:
     """Stop a package in the current directory from shadowing Hermes modules.
 

@@ -14,6 +14,7 @@ import time
 
 from concurrent.futures.thread import _threads_queues
 
+import tools.daemon_pool as daemon_pool
 from tools.daemon_pool import DaemonThreadPoolExecutor
 
 
@@ -51,6 +52,48 @@ def test_initializer_runs_under_the_active_stdlib_worker_contract():
     pool = DaemonThreadPoolExecutor(max_workers=1, initializer=initialize)
     try:
         assert pool.submit(lambda: getattr(local, "initialized", False)).result(timeout=10)
+    finally:
+        pool.shutdown(wait=True)
+
+
+def test_worker_context_contract_does_not_require_legacy_initializer_fields(monkeypatch):
+    captured_args = []
+
+    class CapturedThread:
+        def __init__(self, *, name, target, args, daemon):
+            self.args = args
+            self.daemon = daemon
+
+        def start(self):
+            captured_args.append(self.args)
+
+    pool = DaemonThreadPoolExecutor(max_workers=1)
+    worker_context = object()
+    setattr(pool, "_create_worker_context", lambda: worker_context)
+    for legacy_field in ("_initializer", "_initargs"):
+        if hasattr(pool, legacy_field):
+            delattr(pool, legacy_field)
+    monkeypatch.setattr(daemon_pool.threading, "Thread", CapturedThread)
+    try:
+        pool._adjust_thread_count()
+    finally:
+        pool.shutdown(wait=False)
+
+    assert len(captured_args) == 1
+    executor_ref, context, work_queue = captured_args[0]
+    assert executor_ref() is pool
+    assert context is worker_context
+    assert work_queue is pool._work_queue
+
+
+def test_submit_propagates_caller_contextvars():
+    from contextvars import ContextVar
+
+    marker = ContextVar("daemon_pool_test_marker", default="missing")
+    pool = DaemonThreadPoolExecutor(max_workers=1)
+    try:
+        marker.set("profile-scope")
+        assert pool.submit(marker.get).result(timeout=10) == "profile-scope"
     finally:
         pool.shutdown(wait=True)
 
