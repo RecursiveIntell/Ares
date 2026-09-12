@@ -581,6 +581,9 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
     ) -> dict[str, Any]:
         capabilities = getattr(self, "_capabilities", None)
         if not isinstance(capabilities, dict):
+            self.probe_activation()
+            capabilities = getattr(self, "_capabilities", None)
+        if not isinstance(capabilities, dict):
             raise ContextGovernorProtocolError(
                 "certified call attempted before capability negotiation"
             )
