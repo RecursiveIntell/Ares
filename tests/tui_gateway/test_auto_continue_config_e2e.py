@@ -17,6 +17,10 @@ def _probe(home):
     env = os.environ.copy()
     env["HERMES_HOME"] = str(home)
     env["ARES_HOME"] = str(home)
+    repo_root = os.getcwd()
+    env["PYTHONPATH"] = os.pathsep.join(
+        part for part in (repo_root, env.get("PYTHONPATH", "")) if part
+    )
     result = subprocess.run(
         [sys.executable, "-P", "-c", _PROBE],
         cwd=os.getcwd(),
