@@ -27,7 +27,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "663017f6dcc3f51f492dcebc9c4dc148b3cc292f"
+          test "$(git rev-parse HEAD^)" = "6e34f93899d952e577b2b7cf88c2addb93b249c5"
           git fetch --no-tags origin main
           test "$(git rev-parse origin/main)" = "0451a66cbb765a3ede359660e37b1b2fbe857525"
           test -z "$(git status --porcelain)"
@@ -100,6 +100,44 @@ jobs:
               raise SystemExit("recoverable end-reason owner was not restored")
           PY
           git add hermes_state.py
+          git diff --cached --check
+
+      - name: Restore current-main GoalManager persistence contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+
+          path = Path("hermes_cli/goals.py")
+          merged = path.read_text(encoding="utf-8")
+          main = subprocess.check_output(
+              ["git", "show", "0451a66cbb765a3ede359660e37b1b2fbe857525:hermes_cli/goals.py"],
+              text=True,
+          )
+          start = "    def set(self, goal: str, *, max_turns: Optional[int] = None, contract: Optional[GoalContract] = None) -> GoalState:\n"
+          end = "    def add_collaboration_contract_ref(self, contract_ref: str) -> GoalState:\n"
+
+          def block(text: str) -> str:
+              if text.count(start) != 1 or text.count(end) != 1:
+                  raise SystemExit("unexpected GoalManager set/set_contract ownership shape")
+              a = text.index(start)
+              b = text.index(end, a)
+              return text[a:b]
+
+          main_block = block(main)
+          merged_block = block(merged)
+          if "self._save()" in main_block:
+              raise SystemExit("pinned main unexpectedly owns legacy GoalManager._save callsite")
+          if merged_block != main_block:
+              merged = merged.replace(merged_block, main_block, 1)
+              path.write_text(merged, encoding="utf-8")
+          checked = path.read_text(encoding="utf-8")
+          if block(checked) != main_block:
+              raise SystemExit("GoalManager persistence contract did not reconcile to pinned main")
+          PY
+          git add hermes_cli/goals.py
           git diff --cached --check
 
       - name: Install uv
