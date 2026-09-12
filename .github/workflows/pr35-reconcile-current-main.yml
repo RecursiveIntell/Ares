@@ -27,12 +27,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "59a26ba6170386417d5ef3707bf09aa229e83e27"
+          test "$(git rev-parse HEAD^)" = "0cce0a2d56c9d807486147478b9560b964496388"
           git fetch --no-tags origin main
           test "$(git rev-parse origin/main)" = "0451a66cbb765a3ede359660e37b1b2fbe857525"
           test -z "$(git status --porcelain)"
 
-      - name: Reconcile current main with conflict-hunk precedence
+      - name: Reconcile current main
         shell: bash
         run: |
           set -euo pipefail
@@ -42,39 +42,24 @@ jobs:
           test -z "$(git diff --name-only --diff-filter=U)"
           git diff --check
 
-      - name: Restore current-main hermes_state owners
+      - name: Restore canonical hermes_state owners
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
+
           path = Path("hermes_state.py")
           text = path.read_text(encoding="utf-8")
-
           sanitize_import = "from agent.memory_manager import sanitize_context\n"
           activity_anchor = "from agent.message_sanitization import _sanitize_surrogates\n"
           activity_owner = "from agent.session_activity import ActivityProvenance\n"
           activity_expected = activity_anchor + activity_owner
-          if sanitize_import not in text:
-              if text.count(activity_anchor) != 1:
-                  raise SystemExit("unexpected hermes_state message-sanitization import shape while restoring sanitize_context")
-              text = text.replace(activity_anchor, sanitize_import + activity_anchor, 1)
-          if activity_expected not in text:
-              if text.count(activity_anchor) != 1:
-                  raise SystemExit("unexpected hermes_state message-sanitization import shape")
-              text = text.replace(activity_anchor, activity_expected, 1)
-
           marker_import = (
               "from agent.context_compressor import (\n"
               "    _DB_PERSISTED_MARKER as _DB_PERSISTED_MARKER_KEY,\n"
               ")\n"
           )
-          marker_expected = activity_expected + marker_import
-          if marker_import not in text:
-              if text.count(activity_expected) != 1:
-                  raise SystemExit("unexpected top-level ActivityProvenance import block while restoring DB marker owner")
-              text = text.replace(activity_expected, marker_expected, 1)
-
           common_import = "from hermes_state_common import escape_like as _escape_like, stat_db_file_identity as _stat_db_file_identity\n"
           common_expected = (
               "from hermes_state_common import (\n"
@@ -83,6 +68,19 @@ jobs:
               "    stat_db_file_identity as _stat_db_file_identity,\n"
               ")\n"
           )
+
+          if sanitize_import not in text:
+              if text.count(activity_anchor) != 1:
+                  raise SystemExit("unexpected message-sanitization import shape")
+              text = text.replace(activity_anchor, sanitize_import + activity_anchor, 1)
+          if activity_expected not in text:
+              if text.count(activity_anchor) != 1:
+                  raise SystemExit("unexpected ActivityProvenance import shape")
+              text = text.replace(activity_anchor, activity_expected, 1)
+          if marker_import not in text:
+              if text.count(activity_expected) != 1:
+                  raise SystemExit("unexpected top-level activity import block")
+              text = text.replace(activity_expected, activity_expected + marker_import, 1)
           if common_expected not in text:
               if text.count(common_import) != 1:
                   raise SystemExit("unexpected hermes_state_common import shape")
@@ -90,19 +88,14 @@ jobs:
 
           path.write_text(text, encoding="utf-8")
           checked = path.read_text(encoding="utf-8")
-          if sanitize_import not in checked:
-              raise SystemExit("sanitize_context owner was not restored")
-          if activity_expected not in checked:
-              raise SystemExit("top-level ActivityProvenance owner was not restored")
-          if marker_import not in checked:
-              raise SystemExit("DB persisted marker owner was not restored")
-          if common_expected not in checked:
-              raise SystemExit("recoverable end-reason owner was not restored")
+          for owner in (sanitize_import, activity_expected, marker_import, common_expected):
+              if owner not in checked:
+                  raise SystemExit(f"canonical owner missing after repair: {owner!r}")
           PY
           git add hermes_state.py
           git diff --cached --check
 
-      - name: Reconcile GoalManager ownership and preserve delegation waits
+      - name: Reconcile GoalManager owners and Ares delegation behavior
         shell: bash
         run: |
           set -euo pipefail
@@ -114,48 +107,36 @@ jobs:
           path = Path("hermes_cli/goals.py")
           merged = path.read_text(encoding="utf-8")
           branch_shape = merged
-          main = subprocess.check_output(
-              ["git", "show", f"{PINNED_MAIN}:hermes_cli/goals.py"],
-              text=True,
-          )
+          main = subprocess.check_output(["git", "show", f"{PINNED_MAIN}:hermes_cli/goals.py"], text=True)
 
           def between(text: str, start: str, end: str) -> str:
               if text.count(start) != 1 or text.count(end) != 1:
-                  raise SystemExit(f"unexpected GoalManager ownership anchors: {start!r} -> {end!r}")
+                  raise SystemExit(f"unexpected GoalManager anchors: {start!r} -> {end!r}")
               a = text.index(start)
               b = text.index(end, a)
               return text[a:b]
 
           def replace_between(text: str, source: str, start: str, end: str) -> str:
-              current = between(text, start, end)
-              owner = between(source, start, end)
-              return text.replace(current, owner, 1)
+              return text.replace(between(text, start, end), between(source, start, end), 1)
 
-          # Current main owns direct persistence for set()/set_contract().
+          # Current main owns direct persistence for goal mutation.
           set_start = "    def set(self, goal: str, *, max_turns: Optional[int] = None, contract: Optional[GoalContract] = None) -> GoalState:\n"
           set_end = "    def add_collaboration_contract_ref(self, contract_ref: str) -> GoalState:\n"
           merged = replace_between(merged, main, set_start, set_end)
 
-          # Current main also owns the subgoal + quality-gate persistence surface.
-          # This removes stale helper callsites (_require_goal/_save) without
-          # resurrecting helpers main intentionally deleted.
+          # Current main owns subgoal + quality-gate persistence.
           subgoal_start = "    # --- /subgoal user controls ---------------------------------------\n"
           wait_start = "    # --- /goal wait barrier -------------------------------------------\n"
           merged = replace_between(merged, main, subgoal_start, wait_start)
 
-          # Rebase the wait barrier on current main's direct-persistence owner,
-          # then preserve the Ares delegation-aware/timeout semantics proven by
-          # commits 50a13d53, f8b87f56, and 8477292f.
+          # Current main owns persistence for barriers; Ares keeps the proven
+          # delegation-count early wake and bounded pid/session expiry behavior.
           checkpoint_start = "    def _checkpoint(self, outcome: str, reason: str, next_action: Optional[str], *, continuation: bool, metadata: Optional[Dict[str, Any]] = None) -> bool:\n"
-          branch_is_waiting = between(
-              branch_shape,
-              "    def is_waiting(self) -> bool:\n",
-              checkpoint_start,
-          )
+          branch_is_waiting = between(branch_shape, "    def is_waiting(self) -> bool:\n", checkpoint_start)
           main_wait = between(main, wait_start, checkpoint_start)
           is_waiting_start = "    def is_waiting(self) -> bool:\n"
           if main_wait.count(is_waiting_start) != 1:
-              raise SystemExit("unexpected current-main is_waiting owner inside wait block")
+              raise SystemExit("unexpected main is_waiting owner")
           main_is_waiting = main_wait[main_wait.index(is_waiting_start):]
           wait = main_wait.replace(main_is_waiting, branch_is_waiting, 1)
           wait = wait.replace(
@@ -168,7 +149,6 @@ jobs:
               "        self._state.waiting_until = time.time() + seconds\n        self._state.waiting_on_delegations = max(0, int(on_delegations))\n        self._state.waiting_reason = (reason or \"\").strip() or None\n",
               1,
           )
-          # pid/session waits and stop_waiting must clear any prior delegation count.
           wait = wait.replace(
               "        self._state.waiting_until = 0.0\n        self._state.waiting_reason = (reason or \"\").strip() or None\n",
               "        self._state.waiting_until = 0.0\n        self._state.waiting_on_delegations = 0\n        self._state.waiting_reason = (reason or \"\").strip() or None\n",
@@ -181,36 +161,94 @@ jobs:
           )
           merged = merged.replace(between(merged, wait_start, checkpoint_start), wait, 1)
 
-          # 50a13d53 explicitly added this parameter; later main reconciliation
-          # kept its callsite but dropped the binding from the method signature.
+          # Preserve Ares's delegation-aware judge contract (50a13d53 / 8477292f).
           eval_start = "    def evaluate_after_turn(\n"
-          eval_body = between(merged, eval_start, "        \"\"\"Run gates + judge and update state.")
-          if "active_delegations:" not in eval_body:
+          eval_doc = "        \"\"\"Run gates + judge and update state."
+          eval_header = between(merged, eval_start, eval_doc)
+          if "active_delegations:" not in eval_header:
               needle = "        background_processes: Optional[List[Dict[str, Any]]] = None,\n"
-              if eval_body.count(needle) != 1:
-                  raise SystemExit("unexpected evaluate_after_turn signature while restoring delegation owner")
-              fixed = eval_body.replace(
-                  needle,
-                  needle + "        active_delegations: int = 0,\n",
-                  1,
-              )
-              merged = merged.replace(eval_body, fixed, 1)
+              if eval_header.count(needle) != 1:
+                  raise SystemExit("unexpected evaluate_after_turn signature")
+              merged = merged.replace(eval_header, eval_header.replace(needle, needle + "        active_delegations: int = 0,\n", 1), 1)
+
+          # The refactored branch had two callsites to a helper removed by main.
+          # Keep the behavior, but route it through current lifecycle owners.
+          budget_start = "    def _budget_pause(self, state: GoalState, verdict: str, reason: str, note: str = \"\") -> Dict[str, Any]:\n"
+          budget_old = between(merged, budget_start, eval_start)
+          budget_new = '''    def _budget_pause(self, state: GoalState, verdict: str, reason: str, note: str = "") -> Dict[str, Any]:
+        state.status = "paused"
+        state.outcome = TURN_BUDGET_EXHAUSTED
+        state.paused_reason = f"turn budget exhausted ({state.turns_used}/{state.max_turns})"
+        if not self._checkpoint(
+            TURN_BUDGET_EXHAUSTED,
+            state.paused_reason,
+            "explicit /goal resume after inspecting cumulative budget",
+            continuation=False,
+        ):
+            return self._persistence_failure("turn budget stop could not be saved")
+        return _decision(
+            "paused", False, None, verdict, reason,
+            f"⏸ Goal paused — {state.turns_used}/{state.max_turns} turns used{note}. "
+            "Use /goal resume to keep going, or /goal clear to stop.",
+        )
+
+'''
+          merged = merged.replace(budget_old, budget_new, 1)
+
+          blocked_start = "        # BLOCKED is NOT done: pause so the user sees the judge's reason and can re-scope or override,\n"
+          done_start = "        if verdict == \"done\":\n"
+          blocked_old = between(merged, blocked_start, done_start)
+          blocked_new = '''        # BLOCKED is not completion. Use the canonical lifecycle stop owner
+        # so the pause, checkpoint, outcome, and persistence remain one transition.
+        if verdict == "blocked":
+            return self._execution_stop(GOAL_BLOCKED, reason, metadata=turn_metadata)
+
+'''
+          merged = merged.replace(blocked_old, blocked_new, 1)
+
+          # Current main owns both provider- and parse-failure auto-pause
+          # transitions. Copy them as one unit so persistence and returns cannot
+          # split from the state mutation again.
+          failure_start = "        # Auto-pause when the judge cannot reach the API at all N turns in a\n"
+          budget_check = "        if state.turns_used >= state.max_turns:\n"
+          merged = merged.replace(
+              between(merged, failure_start, budget_check),
+              between(main, failure_start, budget_check),
+              1,
+          )
 
           path.write_text(merged, encoding="utf-8")
           checked = path.read_text(encoding="utf-8")
           goal_class = between(checked, "class GoalManager:\n", "\n\n# ── Kanban worker goal loop")
-          for stale in ("self._save()", "self._require_goal()", "self._require_active()"):
+          for stale in ("self._save()", "self._require_goal()", "self._require_active()", "self._pause_decision("):
               if stale in goal_class:
-                  raise SystemExit(f"stale GoalManager helper call survived reconciliation: {stale}")
-          eval_header = between(checked, eval_start, "        \"\"\"Run gates + judge and update state.")
+                  raise SystemExit(f"stale GoalManager helper survived reconciliation: {stale}")
+          eval_header = between(checked, eval_start, eval_doc)
           if "active_delegations: int = 0" not in eval_header:
-              raise SystemExit("delegation-aware evaluate_after_turn signature was not restored")
+              raise SystemExit("delegation-aware evaluator signature missing")
           if "waiting_on_delegations = max(0, int(on_delegations))" not in goal_class:
-              raise SystemExit("delegation-aware timed wait was not preserved")
+              raise SystemExit("delegation-aware timed wait missing")
           if "live = count_active_delegations(self.session_id)" not in goal_class:
-              raise SystemExit("delegation early-wake behavior was not preserved")
+              raise SystemExit("delegation early wake missing")
+          if "malformed judge output threshold reached" not in goal_class:
+              raise SystemExit("parse-failure pause owner missing")
           PY
-          git add hermes_cli/goals.py
+
+          # One historical wait test still called the deleted private _save().
+          # Persist its deliberate timestamp mutation through the canonical store.
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("tests/hermes_cli/test_goals.py")
+          text = path.read_text(encoding="utf-8")
+          old = "            mgr._save()\n"
+          new = "            assert goals.save_goal(mgr.session_id, mgr.state)\n"
+          if text.count(old) != 1:
+              raise SystemExit("unexpected stale _save test shape")
+          text = text.replace(old, new, 1)
+          path.write_text(text, encoding="utf-8")
+          PY
+
+          git add hermes_cli/goals.py tests/hermes_cli/test_goals.py
           git diff --cached --check
 
       - name: Install uv
@@ -247,29 +285,14 @@ jobs:
           PY
 
       - name: Test context governor restore
-        id: context_governor
         shell: bash
-        run: |
-          set -uo pipefail
-          source .venv/bin/activate
-          log="$RUNNER_TEMP/context-governor-restore.log"
-          python -m pytest -q --tb=short tests/agent/test_context_governor_restore.py 2>&1 | tee "$log"
-          exit ${PIPESTATUS[0]}
-
-      - name: Upload context governor failure log
-        if: ${{ failure() && steps.context_governor.outcome == 'failure' }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: pr35-context-governor-failure
-          path: ${{ runner.temp }}/context-governor-restore.log
-          if-no-files-found: error
-          retention-days: 1
+        run: source .venv/bin/activate && python -m pytest -q tests/agent/test_context_governor_restore.py
 
       - name: Test Ares managed calls
         shell: bash
         run: source .venv/bin/activate && python -m pytest -q tests/ares_runtime/test_managed_calls.py
 
-      - name: Test goal lifecycle contract
+      - name: Test goal lifecycle and regression witnesses
         shell: bash
         run: source .venv/bin/activate && python -m pytest -q tests/hermes_cli/test_goal_lifecycle_contract.py tests/hermes_cli/test_goals.py
 
