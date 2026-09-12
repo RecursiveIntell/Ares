@@ -25,6 +25,10 @@ EXPLICIT_TARGETS = {
         "hermes_state_gateway.py",
         "SessionGatewayMixin",
     ),
+    "_check_transcript_write_guards": (
+        "hermes_state_messages.py",
+        "SessionMessagesMixin",
+    ),
     "get_resume_message_count": (
         "hermes_state_messages.py",
         "SessionMessagesMixin",
