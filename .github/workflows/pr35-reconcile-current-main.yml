@@ -27,7 +27,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "f5d358e5ee0319e7ab1719b2a9bffe3efe5bc92c"
+          test "$(git rev-parse HEAD^)" = "b4b625bc8dcb8316ffe3df9a140672746a9d5257"
           git fetch --no-tags origin main
           test "$(git rev-parse origin/main)" = "94a17d17521d92407b6418e57e755e279e40cc6f"
           test -z "$(git status --porcelain)"
@@ -81,6 +81,8 @@ jobs:
           assert hermes_state.SessionDB.RECOVERABLE_END_REASONS == hermes_state._RECOVERABLE_END_REASONS
           assert hermes_state._DB_PERSISTED_MARKER_KEY == context_compressor._DB_PERSISTED_MARKER
           assert hermes_state.sanitize_context is memory_manager.sanitize_context
+          assert callable(hermes_state._stat_db_file_identity)
+          assert callable(hermes_state._escape_like)
           assert "active_delegations" in inspect.signature(GoalManager.evaluate_after_turn).parameters
           for name in (
               "_MODEL_CONFIG_ROW_MISSING",
