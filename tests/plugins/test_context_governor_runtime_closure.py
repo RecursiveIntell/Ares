@@ -5,6 +5,7 @@ import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -26,6 +27,51 @@ def _capabilities():
             "stream": "stderr",
         }
     }
+
+
+def test_first_certified_call_negotiates_capabilities_before_key_binding(
+    monkeypatch,
+):
+    engine = ContextGovernorEngine.__new__(ContextGovernorEngine)
+    engine._capabilities = None
+    calls = []
+
+    def negotiate():
+        calls.append("probe")
+        engine._capabilities = _capabilities()
+        return engine._capabilities
+
+    class Binding:
+        pass_fds = ()
+
+        def command_args(self):
+            return ("--governed-snapshot-fd", "7")
+
+        def close(self):
+            calls.append("close")
+
+    object.__setattr__(
+        engine, "_key_state", SimpleNamespace(active_binding=lambda: Binding())
+    )
+
+    def run_json(
+        args: list[str], payload: dict[str, Any], *, pass_fds: tuple[int, ...]
+    ) -> dict[str, Any]:
+        calls.append((args, payload, pass_fds))
+        return {"ok": True}
+
+    monkeypatch.setattr(engine, "probe_activation", negotiate)
+    monkeypatch.setattr(engine, "_run_json", run_json)
+
+    result = engine._run_certified_json(["compact-v2"], {"messages": []})
+
+    assert result == {"ok": True}
+    assert calls[0] == "probe"
+    assert calls[-1] == "close"
+    args, payload, pass_fds = calls[1]
+    assert "--failure-envelope-v1" in args
+    assert payload == {"messages": []}
+    assert pass_fds == ()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX process-group witness")
