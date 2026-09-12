@@ -27,7 +27,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "bc73feeb1ddcade6609913d971148518545bacf3"
+          test "$(git rev-parse HEAD^)" = "52eebac3f9e8953ee42c7fc6fc226243941b4939"
           git fetch --no-tags origin main
           test "$(git rev-parse origin/main)" = "0451a66cbb765a3ede359660e37b1b2fbe857525"
           test -z "$(git status --porcelain)"
@@ -64,10 +64,11 @@ jobs:
               "    _DB_PERSISTED_MARKER as _DB_PERSISTED_MARKER_KEY,\n"
               ")\n"
           )
+          marker_expected = activity_expected + marker_import
           if marker_import not in text:
-              if text.count(activity_owner) != 1:
-                  raise SystemExit("unexpected ActivityProvenance import shape while restoring DB marker owner")
-              text = text.replace(activity_owner, activity_owner + marker_import, 1)
+              if text.count(activity_expected) != 1:
+                  raise SystemExit("unexpected top-level ActivityProvenance import block while restoring DB marker owner")
+              text = text.replace(activity_expected, marker_expected, 1)
 
           common_import = "from hermes_state_common import escape_like as _escape_like, stat_db_file_identity as _stat_db_file_identity\n"
           common_expected = (
@@ -123,6 +124,7 @@ jobs:
           PY
 
       - name: Test context governor restore
+        id: context_governor
         shell: bash
         run: |
           set -uo pipefail
@@ -132,7 +134,7 @@ jobs:
           exit ${PIPESTATUS[0]}
 
       - name: Upload context governor failure log
-        if: failure()
+        if: ${{ failure() && steps.context_governor.outcome == 'failure' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: pr35-context-governor-failure
@@ -173,7 +175,6 @@ jobs:
         run: |
           set -euo pipefail
           git rm .github/workflows/pr35-reconcile-current-main.yml
-          rm -f .github/pr35-context-failure.txt
           git add -A
           git diff --cached --check
           git commit -m "merge(main): reconcile PR 35 with current Ares main"
