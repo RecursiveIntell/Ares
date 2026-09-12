@@ -27,7 +27,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "6e34f93899d952e577b2b7cf88c2addb93b249c5"
+          test "$(git rev-parse HEAD^)" = "0611795427529689ce03216d7dfc17cc51047e1f"
           git fetch --no-tags origin main
           test "$(git rev-parse origin/main)" = "0451a66cbb765a3ede359660e37b1b2fbe857525"
           test -z "$(git status --porcelain)"
@@ -102,7 +102,7 @@ jobs:
           git add hermes_state.py
           git diff --cached --check
 
-      - name: Restore current-main GoalManager persistence contract
+      - name: Reconcile GoalManager ownership and preserve delegation waits
         shell: bash
         run: |
           set -euo pipefail
@@ -110,32 +110,102 @@ jobs:
           from pathlib import Path
           import subprocess
 
+          PINNED_MAIN = "0451a66cbb765a3ede359660e37b1b2fbe857525"
           path = Path("hermes_cli/goals.py")
           merged = path.read_text(encoding="utf-8")
+          branch_shape = merged
           main = subprocess.check_output(
-              ["git", "show", "0451a66cbb765a3ede359660e37b1b2fbe857525:hermes_cli/goals.py"],
+              ["git", "show", f"{PINNED_MAIN}:hermes_cli/goals.py"],
               text=True,
           )
-          start = "    def set(self, goal: str, *, max_turns: Optional[int] = None, contract: Optional[GoalContract] = None) -> GoalState:\n"
-          end = "    def add_collaboration_contract_ref(self, contract_ref: str) -> GoalState:\n"
 
-          def block(text: str) -> str:
+          def between(text: str, start: str, end: str) -> str:
               if text.count(start) != 1 or text.count(end) != 1:
-                  raise SystemExit("unexpected GoalManager set/set_contract ownership shape")
+                  raise SystemExit(f"unexpected GoalManager ownership anchors: {start!r} -> {end!r}")
               a = text.index(start)
               b = text.index(end, a)
               return text[a:b]
 
-          main_block = block(main)
-          merged_block = block(merged)
-          if "self._save()" in main_block:
-              raise SystemExit("pinned main unexpectedly owns legacy GoalManager._save callsite")
-          if merged_block != main_block:
-              merged = merged.replace(merged_block, main_block, 1)
-              path.write_text(merged, encoding="utf-8")
+          def replace_between(text: str, source: str, start: str, end: str) -> str:
+              current = between(text, start, end)
+              owner = between(source, start, end)
+              return text.replace(current, owner, 1)
+
+          # Current main owns direct persistence for set()/set_contract().
+          set_start = "    def set(self, goal: str, *, max_turns: Optional[int] = None, contract: Optional[GoalContract] = None) -> GoalState:\n"
+          set_end = "    def add_collaboration_contract_ref(self, contract_ref: str) -> GoalState:\n"
+          merged = replace_between(merged, main, set_start, set_end)
+
+          # Current main also owns the subgoal + quality-gate persistence surface.
+          # This removes stale helper callsites (_require_goal/_save) without
+          # resurrecting helpers main intentionally deleted.
+          subgoal_start = "    # --- /subgoal user controls ---------------------------------------\n"
+          wait_start = "    # --- /goal wait barrier -------------------------------------------\n"
+          merged = replace_between(merged, main, subgoal_start, wait_start)
+
+          # Rebase the wait barrier on current main's direct-persistence owner,
+          # then preserve the Ares delegation-aware/timeout semantics proven by
+          # commits 50a13d53, f8b87f56, and 8477292f.
+          checkpoint_start = "    def _checkpoint(self, outcome: str, reason: str, next_action: Optional[str], *, continuation: bool, metadata: Optional[Dict[str, Any]] = None) -> bool:\n"
+          branch_is_waiting = between(
+              branch_shape,
+              "    def is_waiting(self) -> bool:\n",
+              checkpoint_start,
+          )
+          main_wait = between(main, wait_start, checkpoint_start)
+          main_is_waiting = between(main_wait, "    def is_waiting(self) -> bool:\n", checkpoint_start)
+          wait = main_wait.replace(main_is_waiting, branch_is_waiting, 1)
+          wait = wait.replace(
+              "    def wait_for_seconds(self, seconds: int, reason: str = \"\") -> GoalState:\n",
+              "    def wait_for_seconds(self, seconds: int, reason: str = \"\", *, on_delegations: int = 0) -> GoalState:\n",
+              1,
+          )
+          wait = wait.replace(
+              "        self._state.waiting_until = time.time() + seconds\n        self._state.waiting_reason = (reason or \"\").strip() or None\n",
+              "        self._state.waiting_until = time.time() + seconds\n        self._state.waiting_on_delegations = max(0, int(on_delegations))\n        self._state.waiting_reason = (reason or \"\").strip() or None\n",
+              1,
+          )
+          # pid/session waits and stop_waiting must clear any prior delegation count.
+          wait = wait.replace(
+              "        self._state.waiting_until = 0.0\n        self._state.waiting_reason = (reason or \"\").strip() or None\n",
+              "        self._state.waiting_until = 0.0\n        self._state.waiting_on_delegations = 0\n        self._state.waiting_reason = (reason or \"\").strip() or None\n",
+              2,
+          )
+          wait = wait.replace(
+              "        self._state.waiting_until = 0.0\n        self._state.waiting_reason = None\n",
+              "        self._state.waiting_until = 0.0\n        self._state.waiting_on_delegations = 0\n        self._state.waiting_reason = None\n",
+              1,
+          )
+          merged = merged.replace(between(merged, wait_start, checkpoint_start), wait, 1)
+
+          # 50a13d53 explicitly added this parameter; later main reconciliation
+          # kept its callsite but dropped the binding from the method signature.
+          eval_start = "    def evaluate_after_turn(\n"
+          eval_body = between(merged, eval_start, "        \"\"\"Run gates + judge and update state.")
+          if "active_delegations:" not in eval_body:
+              needle = "        background_processes: Optional[List[Dict[str, Any]]] = None,\n"
+              if eval_body.count(needle) != 1:
+                  raise SystemExit("unexpected evaluate_after_turn signature while restoring delegation owner")
+              fixed = eval_body.replace(
+                  needle,
+                  needle + "        active_delegations: int = 0,\n",
+                  1,
+              )
+              merged = merged.replace(eval_body, fixed, 1)
+
+          path.write_text(merged, encoding="utf-8")
           checked = path.read_text(encoding="utf-8")
-          if block(checked) != main_block:
-              raise SystemExit("GoalManager persistence contract did not reconcile to pinned main")
+          goal_class = between(checked, "class GoalManager:\n", "\n\n# ── Kanban worker goal loop")
+          for stale in ("self._save()", "self._require_goal()", "self._require_active()"):
+              if stale in goal_class:
+                  raise SystemExit(f"stale GoalManager helper call survived reconciliation: {stale}")
+          eval_header = between(checked, eval_start, "        \"\"\"Run gates + judge and update state.")
+          if "active_delegations: int = 0" not in eval_header:
+              raise SystemExit("delegation-aware evaluate_after_turn signature was not restored")
+          if "waiting_on_delegations = max(0, int(on_delegations))" not in goal_class:
+              raise SystemExit("delegation-aware timed wait was not preserved")
+          if "live = count_active_delegations(self.session_id)" not in goal_class:
+              raise SystemExit("delegation early-wake behavior was not preserved")
           PY
           git add hermes_cli/goals.py
           git diff --cached --check
@@ -156,18 +226,21 @@ jobs:
           uv python install 3.11
           uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web
 
-      - name: Validate hermes_state owner contract
+      - name: Validate reconciled owner contracts
         shell: bash
         run: |
           set -euo pipefail
           source .venv/bin/activate
           python - <<'PY'
+          import inspect
           import hermes_state
           import agent.context_compressor as context_compressor
           import agent.memory_manager as memory_manager
+          from hermes_cli.goals import GoalManager
           assert hermes_state.SessionDB.RECOVERABLE_END_REASONS == hermes_state._RECOVERABLE_END_REASONS
           assert hermes_state._DB_PERSISTED_MARKER_KEY == context_compressor._DB_PERSISTED_MARKER
           assert hermes_state.sanitize_context is memory_manager.sanitize_context
+          assert "active_delegations" in inspect.signature(GoalManager.evaluate_after_turn).parameters
           PY
 
       - name: Test context governor restore
@@ -195,7 +268,7 @@ jobs:
 
       - name: Test goal lifecycle contract
         shell: bash
-        run: source .venv/bin/activate && python -m pytest -q tests/hermes_cli/test_goal_lifecycle_contract.py
+        run: source .venv/bin/activate && python -m pytest -q tests/hermes_cli/test_goal_lifecycle_contract.py tests/hermes_cli/test_goals.py
 
       - name: Test context governor fd ownership
         shell: bash
