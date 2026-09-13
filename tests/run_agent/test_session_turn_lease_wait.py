@@ -110,3 +110,62 @@ def test_run_conversation_passes_resolved_wait_to_durable_lease(tmp_path, monkey
         assert captured == [2.5]
     finally:
         db.close()
+
+
+def test_no_wait_lease_contention_does_not_execute_waiting_model(tmp_path, monkeypatch):
+    db_path = tmp_path / "state.db"
+    holder_db = SessionDB(db_path=db_path)
+    waiting_db = SessionDB(db_path=db_path)
+    session_id = "lease-contention"
+    holder = "other-process-turn"
+    holder_db.create_session(session_id, source="test")
+    assert holder_db.acquire_session_turn_lease(
+        session_id,
+        holder,
+        ttl_seconds=30,
+        wait_seconds=0,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"agent": {"session_turn_lease_wait_seconds": 0}},
+    )
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content="must-not-run", tool_calls=None),
+                finish_reason="stop",
+            )
+        ],
+        model="test",
+        usage=None,
+    )
+
+    try:
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+        ):
+            agent = run_agent.AIAgent(
+                api_key="test-key",
+                base_url="https://example.invalid",
+                provider="test",
+                model="test",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                session_db=waiting_db,
+                session_id=session_id,
+            )
+        agent._session_db_created = True
+        agent.client = MagicMock()
+        agent.client.chat.completions.create.return_value = response
+
+        result = agent.run_conversation("waiting message")
+
+        assert result["completed"] is False
+        assert result["error"] == f"session_turn_lease_timeout:{session_id}"
+        assert agent.client.chat.completions.create.call_count == 0
+    finally:
+        holder_db.release_session_turn_lease(session_id, holder)
+        holder_db.close()
+        waiting_db.close()
