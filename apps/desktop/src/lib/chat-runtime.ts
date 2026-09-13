@@ -28,6 +28,7 @@ export function createClientSessionState(
     cwd: '',
     model: '',
     provider: '',
+    pendingModelSelection: null,
     reasoningEffort: '',
     serviceTier: '',
     fast: false,

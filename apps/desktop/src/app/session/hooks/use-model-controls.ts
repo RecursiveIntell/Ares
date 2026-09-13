@@ -221,19 +221,49 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
         ? ($sessionStates.get()[liveSessionId]?.storedSessionId ?? (touchesPrimary ? $selectedStoredSessionId.get() : null))
         : null
 
+      const updateLiveRuntimeSelection = (model: string, provider: string, optimistic = true) => {
+        if (!liveSessionId) {
+          return
+        }
+
+        // Every live surface (including the primary pane) renders model metadata
+        // from its runtime slice. Updating only the primary global composer
+        // atoms leaves the picker reading the old runtime model until a later
+        // session.info arrives — or indefinitely if that event is delayed.
+        sessionTileDelegate()?.updateSession(liveSessionId, state => {
+          const pendingModelSelection = optimistic
+            ? {
+                model,
+                provider,
+                previousModel: prevModel,
+                previousProvider: prevProvider
+              }
+            : null
+
+          const pendingMatches =
+            pendingModelSelection === null
+              ? state.pendingModelSelection === null
+              : state.pendingModelSelection?.model === pendingModelSelection.model &&
+                state.pendingModelSelection.provider === pendingModelSelection.provider &&
+                state.pendingModelSelection.previousModel === pendingModelSelection.previousModel &&
+                state.pendingModelSelection.previousProvider === pendingModelSelection.previousProvider
+
+          return state.model === model && state.provider === provider && pendingMatches
+            ? state
+            : { ...state, model, provider, pendingModelSelection }
+        })
+      }
+
       const paintSelection = () => {
         if (touchesPrimary) {
+          // Retain the draft/global mirror for no-runtime and legacy composer
+          // consumers, but it is not the live pane's source of truth.
           setCurrentModel(selection.model)
           setCurrentProvider(selection.provider)
           markComposerSelectionManual()
-        } else if (liveSessionId) {
-          // Optimistic tile paint — session.info will confirm; rollback on error.
-          sessionTileDelegate()?.updateSession(liveSessionId, state => ({
-            ...state,
-            model: selection.model,
-            provider: selection.provider
-          }))
         }
+
+        updateLiveRuntimeSelection(selection.model, selection.provider)
       }
 
       const cacheSelection = (provider: string, model: string) => {
@@ -245,6 +275,11 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
         ($activeSessionId.get() === liveSessionId && (!storedSessionId || $selectedStoredSessionId.get() === storedSessionId))
 
       const rollbackSelection = () => {
+        // Roll back the owning runtime even if its primary surface lost focus
+        // while the RPC was pending. That state is separate from the current
+        // foreground globals and must not remain as a false applied switch.
+        updateLiveRuntimeSelection(prevModel, prevProvider, false)
+
         if (touchesPrimary) {
           if (!stillOwnsPrimarySelection()) {
             return
@@ -253,12 +288,6 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
           setCurrentModel(prevModel)
           setCurrentProvider(prevProvider)
           setCurrentModelSource(prevSource)
-        } else if (liveSessionId) {
-          sessionTileDelegate()?.updateSession(liveSessionId, state => ({
-            ...state,
-            model: prevModel,
-            provider: prevProvider
-          }))
         }
 
         cacheSelection(prevProvider, prevModel)
@@ -320,6 +349,10 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
           }
 
           liveSessionId = recoveredRuntimeId
+          // session.resume minted a new runtime slice. Repaint that owner before
+          // retrying so the picker never falls back to the pre-switch model in
+          // the recovery gap.
+          paintSelection()
           cacheSelection(selection.provider, selection.model)
 
           return requestSwitch(confirmExpensiveModel)

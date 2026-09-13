@@ -64,8 +64,11 @@ export function formatErrorDiagnostics(input: {
 }): string {
   // The descriptor's identity (captured when the turn failed) beats the
   // caller-supplied fallback (typically the foreground composer's atoms).
-  const provider = input.surface?.provider || input.provider
-  const model = input.surface?.model || input.model
+  // Local runtime/gateway/disk failures can occur before any provider call, so
+  // do not attribute those to whichever model happens to be selected now.
+  const canUseCallerIdentity = !input.surface || !['disk', 'gateway', 'runtime'].includes(input.surface.layer)
+  const provider = input.surface?.provider || (canUseCallerIdentity ? input.provider : undefined)
+  const model = input.surface?.model || (canUseCallerIdentity ? input.model : undefined)
 
   const lines = [
     '── Hermes error details ──',

@@ -107,6 +107,30 @@ describe('session.info model-options invalidation gating', () => {
     expect(invalidate).not.toHaveBeenCalled()
   })
 
+  it('preserves a pending model pick when a delayed heartbeat repeats the previous model', () => {
+    mountStream()
+    sessionStates!.set(
+      ACTIVE_SID,
+      {
+        ...createClientSessionState('stored-active'),
+        model: 'model-b',
+        provider: 'provider-b',
+        pendingModelSelection: {
+          model: 'model-b',
+          provider: 'provider-b',
+          previousModel: 'model-a',
+          previousProvider: 'provider-a'
+        }
+      } as ClientSessionState
+    )
+
+    // This event was queued before the local config.set selection. It must not
+    // repaint the picker back to A merely because it arrives later.
+    sessionInfo(ACTIVE_SID, { model: 'model-a', provider: 'provider-a', running: true })
+
+    expect(sessionStates!.get(ACTIVE_SID)).toMatchObject({ model: 'model-b', provider: 'provider-b' })
+  })
+
   it('invalidates when the session model actually changes', () => {
     mountStream()
     const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
@@ -132,6 +156,20 @@ describe('session.info settles a turn that produced no assistant payload', () =>
 
   const startTurn = (sessionId: string) =>
     act(() => stream.handleEvent({ payload: {}, session_id: sessionId, type: 'message.start' }))
+
+  it('does not let a retired runtime terminal heartbeat settle reconnecting activity', () => {
+    mountStream()
+    sessionStates!.set(ACTIVE_SID, {
+      ...createClientSessionState('stored-active'),
+      reconnecting: true
+    })
+
+    // Reconnect reconciliation retired this runtime. A delayed terminal event
+    // from its old socket is not durable proof that the stored turn completed.
+    sessionInfo(ACTIVE_SID, { running: false })
+
+    expect(sessionStates!.get(ACTIVE_SID)).toMatchObject({ busy: false, reconnecting: true })
+  })
 
   it('leaves the session sendable after a started turn ends with no payload', async () => {
     mountStream()
