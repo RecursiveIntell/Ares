@@ -193,6 +193,37 @@ describe('useSessionTileDelegate resumeTile', () => {
     expect(requestGateway).not.toHaveBeenCalled()
   })
 
+  it('forces an owner-routed resume when recovery knows the warm runtime was reaped', async () => {
+    setSessions([row({ id: 'stored-reaped', profile: 'default' })])
+
+    const staleState = { busy: false, messages: [{ id: 'm1' }], storedSessionId: 'stored-reaped' }
+    const runtimeIdByStoredSessionIdRef = { current: new Map([['stored-reaped', 'runtime-dead']]) }
+    const sessionStateByRuntimeIdRef = { current: new Map([['runtime-dead', staleState]]) }
+    const requestGateway = vi.fn(async () => ({}) as never)
+
+    vi.mocked(requestGatewayForProfile).mockResolvedValueOnce({ session_id: 'runtime-fresh' } as never)
+
+    renderTile(requestGateway, { runtimeIdByStoredSessionIdRef, sessionStateByRuntimeIdRef })
+
+    const delegate = sessionTileDelegate() as unknown as {
+      resumeTile(storedSessionId: string, options?: { force?: boolean }): Promise<string>
+    }
+
+    await expect(delegate.resumeTile('stored-reaped', { force: true })).resolves.toBe('runtime-fresh')
+    expect(requestGatewayForProfile).toHaveBeenCalledWith(
+      'default',
+      'session.resume',
+      {
+        session_id: 'stored-reaped',
+        cols: 96,
+        profile: 'default',
+        omit_messages: true
+      },
+      undefined,
+      undefined
+    )
+  })
+
   it('falls through to a real resume when the warm binding has no transcript (post-wake empty tile)', async () => {
     // Sleep/wake regression: a released/stale cached state (messages: []) must
     // NOT satisfy the warm path — reusing it re-bound the tile to a dead

@@ -90,7 +90,7 @@ export function liveSessionScopes(): Set<string> {
   const scopes = new Set<string>()
 
   for (const [runtimeId, state] of Object.entries($sessionStates.get())) {
-    if (!state || (!state.busy && !state.needsInput)) {
+    if (!state || (!state.busy && !state.needsInput && !state.reconnecting)) {
       continue
     }
 
@@ -424,7 +424,7 @@ function runtimeReferenced(runtimeId: string, storedSessionId: null | string): b
  *  `needsInput` states stay — the sidebar's attention dot reads them. */
 function evictable(runtimeId: string, state: ClientSessionState): boolean {
   return (
-    !state.busy && !state.needsInput && !state.awaitingResponse && !runtimeReferenced(runtimeId, state.storedSessionId)
+    !state.busy && !state.reconnecting && !state.needsInput && !state.awaitingResponse && !runtimeReferenced(runtimeId, state.storedSessionId)
   )
 }
 
@@ -546,25 +546,12 @@ export function clearAllSessionStates() {
  *  runtimes (primary/local events record no scope). Neither can clear live
  *  work riding a different, still-healthy connection.
  *
- *  Direction of failure is deliberate: a turn that IS still live (transient
- *  socket blip, same backend) re-asserts busy on its next event or inflight
- *  snapshot within a beat, so at worst its arc blinks once. A dead turn's
- *  state, by contrast, would never clear on its own. `needsInput` is left
- *  untouched — a blocking prompt is the one claim the user must explicitly
- *  answer, and post-reconnect refresh re-asserts or retires it via its own
- *  path. Transition side-effects run through publishSessionState, so
- *  watchdogs disarm, stall hints drop, and settle/unread bookkeeping stays
- *  consistent.
- *
- *  The downgrade goes through the delegate's `retireBusyClaim` (the wiring
- *  cache's updateSessionState), not straight into this mirror: the claim has
- *  four holders — wiring cache, mirror, the focused view's draft latches,
- *  busyRef — and retiring only the mirror left Send silently no-oping behind
- *  a stale busy until restart (#93059). The mirror publish stays as the
- *  fallback for runtimes the cache never held (background-sync rows, no
- *  wiring mounted). A PRIMARY reconcile also clears the focused draft
- *  latches, which outlive the state they mirrored; a scoped one leaves them
- *  alone — a background socket says nothing about the primary composer. */
+ *  Direction of failure is deliberate: the old runtime ID is no longer a
+ *  trustworthy activity source. It is retired so a stale busy flag cannot pin
+ *  the UI forever, but the durable session enters `reconnecting` rather than
+ *  confirmed idle until a fresh runtime binds or durable terminal evidence
+ *  arrives. `needsInput` is left untouched — a blocking prompt is the one claim
+ *  the user must explicitly answer. */
 export function reconcileBusyStatesOnReconnect(scope?: string) {
   const states = $sessionStates.get()
 
@@ -581,17 +568,28 @@ export function reconcileBusyStatesOnReconnect(scope?: string) {
 
     sessionTileDelegate()?.retireBusyClaim?.(runtimeId)
 
-    // Re-read — the write path may have republished (and released) this entry.
+    // Re-read after the wiring cache retired its own claim. The runtime id is
+    // stale either way; retain an explicit unresolved phase for the visible
+    // durable session instead of collapsing the loss into idle.
     const published = $sessionStates.get()[runtimeId]
 
-    if (published?.busy || published?.awaitingResponse) {
-      publishSessionState(runtimeId, { ...published, awaitingResponse: false, busy: false })
+    if (published) {
+      publishSessionState(runtimeId, {
+        ...published,
+        awaitingResponse: false,
+        busy: false,
+        reconnecting: true
+      })
     }
   }
 
   if (scope === undefined) {
-    setBusy(false)
-    setAwaitingResponse(false)
+    const active = $activeSessionId.get()
+    const state = active ? $sessionStates.get()[active] : undefined
+    const unresolved = Boolean(state?.busy || state?.reconnecting)
+
+    setBusy(unresolved)
+    setAwaitingResponse(Boolean(state?.awaitingResponse || state?.reconnecting))
   }
 }
 
@@ -1215,8 +1213,9 @@ export interface SessionTileDelegate {
    *  right pane" bug). Bindings re-record from live post-reconnect events. */
   invalidateRuntimeBindings?(preserveStoredSessionIds?: ReadonlySet<string>): void
   /** Bind a live runtime id for a stored session (resume without touching
-   *  the main view). Returns the runtime id, or throws. */
-  resumeTile(storedSessionId: string): Promise<string>
+   *  the main view). `force` bypasses a warm cache only after an RPC proved
+   *  that cached runtime is gone. Returns the runtime id, or throws. */
+  resumeTile(storedSessionId: string, options?: { force?: boolean }): Promise<string>
   /** Retire one runtime's busy/awaiting claim through the wiring cache
    *  (updateSessionState), so cache, focused view, busyRef, and tile mirrors
    *  settle together. Returns false when the cache holds no busy state for

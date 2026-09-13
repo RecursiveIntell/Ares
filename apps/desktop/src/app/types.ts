@@ -184,6 +184,9 @@ export interface ClientSessionState {
   yolo: boolean
   personality: string
   busy: boolean
+  /** The runtime id was invalidated by reconnect/reap and the durable session is
+   *  being rebound. This is unresolved activity, not confirmed idle. */
+  reconnecting: boolean
   awaitingResponse: boolean
   streamId: string | null
   sawAssistantPayload: boolean

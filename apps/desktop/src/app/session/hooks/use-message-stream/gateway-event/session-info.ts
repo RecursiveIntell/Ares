@@ -258,7 +258,7 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
         state => {
           const busy = Boolean(payload!.running)
 
-          if (state.busy === busy && (busy || !state.awaitingResponse)) {
+          if (state.busy === busy && (busy || !state.awaitingResponse) && !state.reconnecting) {
             return state
           }
 
@@ -282,6 +282,7 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
             return {
               ...state,
               busy,
+              reconnecting: false,
               // running=true from the backend is turn-live proof, same as
               // message.start (e.g. resuming an already-running session
               // that never replays its start event).
@@ -337,6 +338,7 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
             ...state,
             awaitingResponse: false,
             busy,
+            reconnecting: false,
             // The turn is over but its streaming bubble may still say
             // pending — running=false from the agent loop's finally block
             // is the ONLY settle signal when message.complete never

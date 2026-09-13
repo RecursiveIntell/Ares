@@ -17,7 +17,6 @@ import {
   resumeDesktopBootForRetry,
   setDesktopBootStep
 } from '@/store/boot'
-import { resetBackgroundPollingGuard } from '@/store/composer-status'
 import {
   $gateway,
   activeGatewayConnectionId,
@@ -371,11 +370,9 @@ export function useGatewayBoot({
         resetTileRuntimeBindings(
           primaryRuntimeConnectionId(conn) ?? { liveConnectionIds: liveSecondaryConnectionIds() }
         )
-        // The status-stack poll guard latches session ids the OLD runtime
-        // reported gone (4001). A respawned backend re-mints runtimes, so
-        // those ids may be live again after re-resume — clear the latch with
-        // the same lifetime as the runtime bindings it shadows.
-        resetBackgroundPollingGuard()
+        // Keep terminal 4001 latches on the retired runtime ids. A reconnect is
+        // not proof that an old id became valid again; only a fresh resume may
+        // publish a new id and begin polling it.
         // Same staleness, other half: pre-reconnect busy flags are keyed by
         // those dead runtime ids and would never receive their terminal
         // busy:false — clear them or the sidebar running arc lies forever

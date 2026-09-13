@@ -1376,6 +1376,7 @@ describe('resumeSession failure recovery', () => {
             personality: '',
             provider: '',
             reasoningEffort: '',
+            reconnecting: false,
             sawAssistantPayload: false,
             serviceTier: '',
             storedSessionId: 'stored-1',

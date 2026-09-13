@@ -13,6 +13,7 @@ import {
   $activeSessionId,
   $currentModel,
   $currentProvider,
+  $selectedStoredSessionId,
   getComposerSelectionGeneration,
   getCurrentModelSource,
   markComposerSelectionManual,
@@ -20,12 +21,19 @@ import {
   setCurrentModelSource,
   setCurrentProvider
 } from '@/store/session'
+import { isSessionGoneError } from '@/store/session-gone'
 import { $sessionStates, sessionTileDelegate } from '@/store/session-states'
 import type { ModelOptionsResponse } from '@/types/hermes'
 
 interface ModelControlsOptions {
   queryClient: QueryClient
   requestGateway: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
+  /**
+   * Rebind a stored session through the surface that owns its runtime map.
+   * The primary caller performs its full foreground resume; a tile caller
+   * rebinds only that tile. Returning null refuses a retry after route drift.
+   */
+  recoverRuntime?: (storedSessionId: string, staleRuntimeId: string) => Promise<null | string>
 }
 
 interface ModelSwitchResponse {
@@ -34,7 +42,10 @@ interface ModelSwitchResponse {
   deferred?: boolean
 }
 
-export function useModelControls({ queryClient, requestGateway }: ModelControlsOptions) {
+/** A recovery owner declined to rebind because the user moved on. */
+class ModelSwitchRecoveryAborted extends Error {}
+
+export function useModelControls({ queryClient, recoverRuntime, requestGateway }: ModelControlsOptions) {
   const { t } = useI18n()
   const copy = t.desktop
   const profileRefreshEpochRef = useRef(0)
@@ -191,7 +202,7 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
   const selectModel = useCallback(
     async (selection: ModelSelection): Promise<boolean> => {
       const primaryRuntimeId = $activeSessionId.get()
-      const liveSessionId = 'sessionId' in selection ? (selection.sessionId ?? null) : primaryRuntimeId
+      let liveSessionId = 'sessionId' in selection ? (selection.sessionId ?? null) : primaryRuntimeId
       const touchesPrimary = !liveSessionId || liveSessionId === primaryRuntimeId
 
       const prevModel = touchesPrimary ? $currentModel.get() : ($sessionStates.get()[liveSessionId!]?.model ?? '')
@@ -202,6 +213,13 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
 
       const prevSource = getCurrentModelSource()
       const liveGatewayProfile = $activeGatewayProfile.get()
+
+      // A runtime id is ephemeral. Keep its durable owner while the switch is
+      // in flight so a 4001 can be resumed by the correct surface instead of
+      // being reported as a model failure.
+      const storedSessionId = liveSessionId
+        ? ($sessionStates.get()[liveSessionId]?.storedSessionId ?? (touchesPrimary ? $selectedStoredSessionId.get() : null))
+        : null
 
       const paintSelection = () => {
         if (touchesPrimary) {
@@ -222,8 +240,16 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
         updateModelOptionsCache(liveSessionId, provider, model, touchesPrimary && !liveSessionId, liveGatewayProfile)
       }
 
+      const stillOwnsPrimarySelection = () =>
+        !touchesPrimary ||
+        ($activeSessionId.get() === liveSessionId && (!storedSessionId || $selectedStoredSessionId.get() === storedSessionId))
+
       const rollbackSelection = () => {
         if (touchesPrimary) {
+          if (!stillOwnsPrimarySelection()) {
+            return
+          }
+
           setCurrentModel(prevModel)
           setCurrentProvider(prevProvider)
           setCurrentModelSource(prevSource)
@@ -272,6 +298,34 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
           ...(confirmExpensiveModel ? { confirm_expensive_model: true } : {})
         })
 
+      let recoveryAttempted = false
+
+      const requestSwitchWithRecovery = async (confirmExpensiveModel = false): Promise<ModelSwitchResponse | undefined> => {
+        try {
+          return await requestSwitch(confirmExpensiveModel)
+        } catch (error) {
+          if (!isSessionGoneError(error) || recoveryAttempted || !recoverRuntime || !storedSessionId || !liveSessionId) {
+            throw error
+          }
+
+          recoveryAttempted = true
+          const staleRuntimeId = liveSessionId
+          const recoveredRuntimeId = await recoverRuntime(storedSessionId, staleRuntimeId)
+
+          // A recovery owner returns null after route drift or a failed durable
+          // resume that it already surfaced. Do not roll the old picker back
+          // over a newer session or show its stale error toast.
+          if (!recoveredRuntimeId || recoveredRuntimeId === staleRuntimeId) {
+            throw new ModelSwitchRecoveryAborted()
+          }
+
+          liveSessionId = recoveredRuntimeId
+          cacheSelection(selection.provider, selection.model)
+
+          return requestSwitch(confirmExpensiveModel)
+        }
+      }
+
       const finishSwitch = (result: ModelSwitchResponse | undefined) => {
         // A pick made DURING a turn is queued by the gateway and applied at the
         // next turn start (`deferred`). Re-fetching now would answer with the
@@ -284,7 +338,7 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
       }
 
       try {
-        const result = await requestSwitch()
+        const result = await requestSwitchWithRecovery()
 
         if (result?.confirm_required) {
           rollbackSelection()
@@ -302,7 +356,7 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
             // matches the snapshot this notification was created for.
             isStale: () =>
               touchesPrimary
-                ? $activeSessionId.get() !== liveSessionId ||
+                ? !stillOwnsPrimarySelection() ||
                   $currentModel.get() !== prevModel ||
                   $currentProvider.get() !== prevProvider
                 : !liveSessionId ||
@@ -312,7 +366,7 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
               paintSelection()
               cacheSelection(selection.provider, selection.model)
             },
-            requestConfirmed: () => requestSwitch(true),
+            requestConfirmed: () => requestSwitchWithRecovery(true),
             rollback: rollbackSelection
           })
 
@@ -323,6 +377,10 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
 
         return true
       } catch (err) {
+        if (err instanceof ModelSwitchRecoveryAborted) {
+          return false
+        }
+
         // An OLDER gateway refuses a mid-turn switch outright (4009) instead of
         // deferring it. Don't punish the user for a backend they haven't
         // updated: keep the pick painted as the composer's selection, which is
@@ -338,7 +396,7 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
         return false
       }
     },
-    [copy.modelSwitchFailed, queryClient, requestGateway, t.common.confirm, updateModelOptionsCache]
+    [copy.modelSwitchFailed, queryClient, recoverRuntime, requestGateway, t.common.confirm, updateModelOptionsCache]
   )
 
   return { applySavedMainModel, refreshCurrentModel, selectModel }

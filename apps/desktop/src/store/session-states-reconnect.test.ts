@@ -13,6 +13,7 @@ import {
 } from './session'
 import {
   $attentionSessionIds,
+  $sessionStates,
   $stalledSessionIds,
   $workingSessionIds,
   clearAllSessionStates,
@@ -193,6 +194,18 @@ describe('reconcileBusyStatesOnReconnect', () => {
 
     expect($busy.get()).toBe(true)
     expect($awaitingResponse.get()).toBe(true)
+  })
+
+  it('keeps an active rebind visibly unresolved instead of falsely idle', () => {
+    $activeSessionId.set('rt1')
+    publishSessionState('rt1', state({ awaitingResponse: true, busy: true, storedSessionId: 's1' }))
+
+    reconcileBusyStatesOnReconnect()
+
+    const reconnecting = $sessionStates.get()['rt1']
+    expect(reconnecting).toMatchObject({ busy: false, reconnecting: true })
+    // Composer consumers read the global mirror during the rebind window.
+    expect($busy.get()).toBe(true)
   })
 
   it('a live turn re-asserting busy after reconcile re-arms the arc', () => {

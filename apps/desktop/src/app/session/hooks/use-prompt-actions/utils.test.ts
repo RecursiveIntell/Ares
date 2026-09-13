@@ -104,6 +104,7 @@ describe('isTargetSessionBusy', () => {
   it('reads the target session slice, not the leftover foreground flag', () => {
     expect(isTargetSessionBusy({ a: { busy: true }, b: { busy: false } }, 'b', true)).toBe(false)
     expect(isTargetSessionBusy({ a: { busy: true } }, 'b', true)).toBe(false)
+    expect(isTargetSessionBusy({ reconnecting: { busy: false, reconnecting: true } }, 'reconnecting', false)).toBe(true)
   })
 
   it('uses the focused draft flag only when there is no session id', () => {

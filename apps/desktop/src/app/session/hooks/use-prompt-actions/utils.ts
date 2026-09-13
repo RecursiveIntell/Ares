@@ -246,7 +246,7 @@ export async function withSessionNotFoundResume<T>(
  * busy, not a process-global lock.
  */
 export function isTargetSessionBusy(
-  sessionStates: Record<string, { busy: boolean }>,
+  sessionStates: Record<string, { busy: boolean; reconnecting?: boolean }>,
   sessionId: null | string,
   foregroundBusy: boolean
 ): boolean {
@@ -254,7 +254,9 @@ export function isTargetSessionBusy(
     return foregroundBusy
   }
 
-  return Boolean(sessionStates[sessionId]?.busy)
+  const state = sessionStates[sessionId]
+
+  return Boolean(state?.busy || state?.reconnecting)
 }
 
 // Gateway JSON-RPC calls reject with "request timed out: <method>" when the

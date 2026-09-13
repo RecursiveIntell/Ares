@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { clearClarifyRequest, setClarifyRequest } from './clarify'
 import {
@@ -17,6 +17,7 @@ import {
   setSudoRequest
 } from './prompts'
 import { $activeSessionId } from './session'
+import { resetSessionGone } from './session-gone'
 
 // Prompts are parked per-session; the exported $*Request views are scoped to the
 // active session, so each test focuses the session it's asserting on.
@@ -27,6 +28,7 @@ beforeEach(() => {
 afterEach(() => {
   clearAllPrompts()
   clearClarifyRequest()
+  resetSessionGone()
   $activeSessionId.set(null)
 })
 
@@ -128,6 +130,19 @@ describe('approval prompt store', () => {
       ['approval.pending', { session_id: 's1' }],
       ['approval.received', { request_id: 'r1', session_id: 's1' }]
     ])
+  })
+
+  it('latches a reaped runtime after approval.pending returns session not found', async () => {
+    const request = vi.fn(async () => {
+      throw new Error('session not found')
+    })
+
+    const gateway = { request }
+
+    await replayPendingApproval(gateway, 's1')
+    await replayPendingApproval(gateway, 's1')
+
+    expect(request).toHaveBeenCalledTimes(1)
   })
 })
 

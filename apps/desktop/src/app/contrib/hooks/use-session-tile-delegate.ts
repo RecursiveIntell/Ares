@@ -182,7 +182,7 @@ export function useSessionTileDelegate({
           }
         )
       },
-      resumeTile: async storedSessionId => {
+      resumeTile: async (storedSessionId, options = {}) => {
         const existing = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
         const cached = existing ? sessionStateByRuntimeIdRef.current.get(existing) : undefined
 
@@ -192,7 +192,10 @@ export function useSessionTileDelegate({
         // transcript or a stale pre-reconnect survivor; reusing it painted the
         // post-sleep/wake tile permanently empty. Fall through to a real
         // resume instead — it's idempotent for a genuinely live session.
-        if (existing && cached?.storedSessionId === storedSessionId && (cached.busy || cached.messages.length > 0)) {
+        // A recovery call reaches here only after a session-scoped RPC returned
+        // 4001 for this runtime, so its populated transcript is not evidence it
+        // is live. Force the durable resume only for that proven-gone path.
+        if (!options.force && existing && cached?.storedSessionId === storedSessionId && (cached.busy || cached.messages.length > 0)) {
           publishSessionState(existing, cached)
 
           return existing

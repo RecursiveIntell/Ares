@@ -2,6 +2,7 @@ import { atom, computed, type ReadableAtom } from 'nanostores'
 
 import { $clarifyRequest, $clarifyRequests } from './clarify'
 import { $activeSessionId } from './session'
+import { isSessionGone, isSessionGoneError, markSessionGone } from './session-gone'
 
 // Blocking interactive prompts the gateway raises mid-turn. Each maps to a
 // `*.request` event the Python side emits while it blocks the agent thread
@@ -96,6 +97,7 @@ export function parseProductionPermitRequest(value: unknown): ProductionPermitRe
   const raw = value as Record<string, unknown>
   const call = raw.call
   const constraints = raw.constraints
+
   if (
     raw.schema !== 'recursive-agent.desktop-production-approval-request/v1' ||
     typeof raw.approval_id !== 'string' ||
@@ -112,6 +114,7 @@ export function parseProductionPermitRequest(value: unknown): ProductionPermitRe
   const c = constraints as Record<string, unknown>
   const typedCall = call as Record<string, unknown>
   const args = typedCall.args
+
   if (
     typedCall.tool !== 'write_file' ||
     typedCall.frozen_clock !== null ||
@@ -193,13 +196,25 @@ export async function receiveApprovalRequest(gateway: ApprovalGateway | null, re
 }
 
 export async function replayPendingApproval(gateway: ApprovalGateway | null, sessionId: string | null): Promise<void> {
-  if (!gateway || !sessionId) {
+  if (!gateway || !sessionId || isSessionGone(sessionId)) {
     return
   }
 
-  const rawResult = await gateway.request('approval.pending', {
-    session_id: sessionId
-  })
+  let rawResult: unknown
+
+  try {
+    rawResult = await gateway.request('approval.pending', {
+      session_id: sessionId
+    })
+  } catch (error) {
+    if (isSessionGoneError(error)) {
+      markSessionGone(sessionId)
+
+      return
+    }
+
+    throw error
+  }
 
   const result =
     rawResult && typeof rawResult === 'object' ? (rawResult as { approvals?: PendingApprovalPayload[] }) : {}

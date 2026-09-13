@@ -1,11 +1,15 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { $goalsBySession, applyGoalStatusText, clearSessionGoal } from './goals'
+import { $gateway } from './gateway'
+import { $goalsBySession, applyGoalStatusText, clearSessionGoal, refreshSessionGoal } from './goals'
+import { resetSessionGone } from './session-gone'
 
 describe('goal store', () => {
   afterEach(() => {
     vi.useRealTimers()
     $goalsBySession.set({})
+    $gateway.set(null as never)
+    resetSessionGone()
   })
 
   it('stores active goals from /goal output', () => {
@@ -87,6 +91,21 @@ describe('goal store', () => {
     applyGoalStatusText('s1', '✓ Goal done (12/20 turns): ship the feature', { hydrate: true })
 
     expect($goalsBySession.get().s1).toBeUndefined()
+  })
+
+  it('latches a reaped runtime after a terminal goal poll failure', async () => {
+    const request = vi.fn(async () => {
+      throw new Error('session not found')
+    })
+
+    $gateway.set({ request } as never)
+
+    await refreshSessionGoal('dead-runtime')
+    await refreshSessionGoal('dead-runtime')
+
+    // The second call is suppressed: a reaped runtime id cannot recover just
+    // because the status stack remounted or retried a background poll.
+    expect(request).toHaveBeenCalledTimes(1)
   })
 
   it('hydration drops a lingering done chip already on screen', () => {
