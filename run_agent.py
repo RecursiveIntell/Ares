@@ -66,6 +66,35 @@ from types import SimpleNamespace
 from hermes_constants import get_hermes_home
 
 
+def _resolved_session_turn_lease_wait_seconds() -> float:
+    """Return the bounded cross-process turn-lease wait from config.
+
+    The durable lease protects transcript serialization, but waiting forever
+    makes a second Desktop/CLI owner look like a frozen session. Keep the
+    default finite and fail closed on malformed configuration. ``0`` is a
+    deliberate no-wait admission attempt.
+    """
+    default = 30.0
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        agent_cfg = cfg.get("agent") if isinstance(cfg, dict) else None
+        raw = (
+            agent_cfg.get("session_turn_lease_wait_seconds")
+            if isinstance(agent_cfg, dict)
+            else None
+        )
+        if raw is None:
+            return default
+        value = float(raw)
+        if value < 0 or value != value:
+            return default
+        return min(value, 1800.0)
+    except Exception:
+        return default
+
+
 def _launch_cwd_for_session(source: str) -> Optional[str]:
     """Working directory to stamp on a new session row, or None.
 
@@ -8656,7 +8685,7 @@ class AIAgent:
                     session_id,
                     _durable_holder,
                     ttl_seconds=_lease_ttl,
-                    wait_seconds=1800.0,
+                    wait_seconds=_resolved_session_turn_lease_wait_seconds(),
                     on_wait=_on_session_turn_lease_wait,
                     should_abort=lambda: getattr(self, "_interrupt_requested", False),
                 ):

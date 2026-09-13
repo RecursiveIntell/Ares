@@ -9185,7 +9185,7 @@ def _fail_inflight_turn(
 # marker and let the recovered partial transcript speak for itself — the
 # user can ask to continue manually.
 
-_AUTO_CONTINUE_ENABLED_DEFAULT = True
+_AUTO_CONTINUE_ENABLED_DEFAULT = False
 _AUTO_CONTINUE_FRESHNESS_MINUTES_DEFAULT = 15
 _AUTO_CONTINUE_MAX_ATTEMPTS_DEFAULT = 2
 

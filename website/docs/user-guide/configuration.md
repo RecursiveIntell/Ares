@@ -974,6 +974,26 @@ automatically requeue the message because doing so without durable ordering and
 idempotency could process it twice. Non-positive values use the 1800-second
 default.
 
+### Cross-process session-turn lease wait
+
+The AIAgent durable turn lease is a separate boundary from the gateway's
+routing-key lease above. It protects the full load → run → flush region when a
+second Hermes process opens the same persisted session. To avoid making a
+Desktop session look frozen while another process owns the turn, the waiting
+budget is finite by default:
+
+```yaml
+agent:
+  session_turn_lease_wait_seconds: 30
+```
+
+`0` makes one immediate acquisition attempt. Values above `1800` are capped.
+When the budget expires, Hermes does not load the transcript or run the model
+for the waiting turn; it returns an explicit retry notice. The waiting message
+is not automatically requeued, because durable ordering and idempotency are
+not established by this lease alone. This setting does not provide global
+single-flight worker ownership.
+
 ## Session Stall Watchdog
 
 The gateway runs a notify-only stall watchdog (`agent.session_stall_timeout`, default `300` seconds, `0` = disabled). When a busy session has a **pending inbound follow-up** and the agent's shared activity clock has been idle for at least this long, the gateway logs a WARNING and sends the user a one-shot notification:

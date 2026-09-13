@@ -295,6 +295,12 @@ DEFAULT_CONFIG = {
         # from gateway_timeout (which kills the turn) and
         # gateway_notify_interval ("still working" heartbeats). 0 = disable.
         "session_stall_timeout": 300,
+        # Maximum time (seconds) a second process waits for the durable
+        # session-turn lease before refusing the turn with an explicit retry
+        # result. A long model/tool turn may legitimately hold the lease, but
+        # an unbounded cross-process wait freezes a Desktop session and hides
+        # the ownership conflict. 0 means try once without waiting.
+        "session_turn_lease_wait_seconds": 30,
         # Long-lived reconnect-loop escalation (seconds). A platform that has
         # been continuously failing/reconnecting for this long gets
         # needs_attention flagged in gateway runtime status (visible in
@@ -3850,11 +3856,13 @@ DEFAULT_CONFIG = {
         # ad-hoc signing (identifier-pinned requirement).
         "macos_signing_identity": "",
         # Auto-continue a turn that was killed mid-run by an app/backend/machine
-        # crash: resuming that session re-submits the interrupted prompt (shown
-        # as a "resumed interrupted turn" event) if the interruption is fresh.
-        # A stale interruption just shows the recovered partial transcript.
+        # crash. Disabled by default: a restart may have more than one live
+        # client/process racing to resume the same durable session, so replay is
+        # an explicit operator action until a single-flight continuation claim
+        # has been acquired. A stale interruption just shows the recovered
+        # partial transcript.
         "auto_continue": {
-            "enabled": True,
+            "enabled": False,
             # How recent the interruption must be to auto-continue (minutes).
             "freshness_minutes": 15,
             # Crash-loop breaker: max automatic re-runs of one interrupted turn.
