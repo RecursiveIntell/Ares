@@ -59,12 +59,19 @@ def _invoke(tmp_path: Path, runtime: Path, workspace: Path) -> subprocess.Comple
         capture_output=True,
         text=True,
         timeout=20,
-        env={**os.environ, "HOME": str(home)},
+        env={
+            **os.environ,
+            "HOME": str(home),
+            "TERMINAL_CWD": "/hostile/controller-workspace",
+        },
     )
 
 
 def test_profile_process_imports_runtime_not_workspace_shadow(tmp_path: Path) -> None:
-    runtime = _runtime(tmp_path, "print('runtime-owner')\n")
+    runtime = _runtime(
+        tmp_path,
+        "import os\nprint('runtime-owner')\nprint(os.environ.get('TERMINAL_CWD'))\n",
+    )
     workspace = tmp_path / "workspace"
     shadow = workspace / "hermes_cli"
     shadow.mkdir(parents=True)
@@ -83,7 +90,7 @@ def test_profile_process_imports_runtime_not_workspace_shadow(tmp_path: Path) ->
     panel = json.loads((tmp_path / "receipt" / "panel.json").read_text(encoding="utf-8"))
     result = panel["results"][0]
     stdout = (tmp_path / "receipt" / result["stdout_path"]).read_text(encoding="utf-8")
-    assert stdout.strip() == "runtime-owner"
+    assert stdout.splitlines() == ["runtime-owner", str(workspace)]
     assert result["session_archive_outcome"] == "not_created"
     assert not poison.exists()
 

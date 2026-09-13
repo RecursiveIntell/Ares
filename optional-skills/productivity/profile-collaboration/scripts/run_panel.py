@@ -39,7 +39,7 @@ PROFILES = (
 
 DEFAULT_PROFILE_TIMEOUT_SECONDS = 180.0
 DEFAULT_PANEL_TIMEOUT_SECONDS = 600.0
-PANEL_CHILD_ENVIRONMENT_POLICY = "runtime_safe_path_v1"
+PANEL_CHILD_ENVIRONMENT_POLICY = "runtime_safe_path_workspace_bound_v2"
 DAEMON_POOL_BLOCK_MARKERS = (
     b"every inspection tool failed",
     b"all execution and file-inspection tools failed",
@@ -349,6 +349,8 @@ def run_one(
             "HERMES_ONESHOT_SESSION_ID": session_id,
             "HERMES_ONESHOT_ARCHIVE_SESSION": "1",
             "ARES_MANAGED_RUNTIME": "1",
+            "ARES_PANEL_WORKSPACE": str(workspace),
+            "TERMINAL_CWD": str(workspace),
             "PYTHONPATH": str(runtime),
         }
     )

@@ -1,7 +1,7 @@
 ---
 name: profile-collaboration
 description: Route substantive work to relevant Ares profiles.
-version: 1.2.1
+version: 1.2.2
 author: Josh Stevenson / RecursiveIntell Ares
 license: MIT
 platforms: [linux, macos, windows]
@@ -120,6 +120,8 @@ selection. All eight profiles require `full_panel_explicit: true`.
    implicit all-profile invocation, isolates each selected `HERMES_HOME`, uses
    bounded concurrency and process-group cleanup, launches the runtime with
    Python safe-path mode so the assigned workspace cannot shadow Hermes modules,
+   and binds `TERMINAL_CWD` to that workspace rather than inheriting the
+   controller's current directory,
    requests automatic archival
    of automation-owned oneshot sessions, and writes a machine-readable receipt
    under `~/.ares/profile-collaboration/receipts/`.
