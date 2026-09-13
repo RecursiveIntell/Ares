@@ -149,6 +149,10 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
     // cached runtime state, captured before the state patch below applies;
     // composer atoms as the fallback for an uncached session) invalidates.
     const knownState = sessionId ? sessionStateByRuntimeIdRef.current.get(sessionId) : undefined
+    // A reconnect retires the old runtime id. It may still have buffered
+    // session.info frames, but those frames cannot prove the durable turn has
+    // settled: only a fresh runtime binding or durable hydrate may do that.
+    const retiredRuntime = Boolean(knownState?.reconnecting)
     const modelValueChanged = modelChanged && payload!.model !== (knownState?.model ?? $currentModel.get())
 
     const providerValueChanged =
@@ -228,12 +232,39 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
     if (sessionId && hasStatePatch) {
       updateSessionState(
         sessionId,
-        state => ({
-          ...state,
-          ...statePatch,
-          branch: statePatch.branch ?? state.branch,
-          cwd: statePatch.cwd ?? state.cwd
-        }),
+        state => {
+          const pending = state.pendingModelSelection
+          const hasIncomingModelMetadata = statePatch.model !== undefined || statePatch.provider !== undefined
+
+          // A model click updates the owning runtime slice immediately. A
+          // session.info heartbeat that was queued before that click can arrive
+          // later with the exact previous pair; it is stale relative to the
+          // local intent, not evidence that the click failed. A matching pick
+          // or genuinely different backend-normalized pair remains authoritative
+          // and settles the pending selection.
+          const repeatsPreviousModel =
+            Boolean(pending) &&
+            hasIncomingModelMetadata &&
+            (statePatch.model === undefined || statePatch.model === pending?.previousModel) &&
+            (statePatch.provider === undefined || statePatch.provider === pending?.previousProvider)
+
+          const { model: _incomingModel, provider: _incomingProvider, ...nonModelStatePatch } = statePatch
+          const effectiveStatePatch = repeatsPreviousModel ? nonModelStatePatch : statePatch
+
+          const pendingModelSelection = repeatsPreviousModel
+            ? pending
+            : hasIncomingModelMetadata
+              ? null
+              : pending
+
+          return {
+            ...state,
+            ...effectiveStatePatch,
+            branch: effectiveStatePatch.branch ?? state.branch,
+            cwd: effectiveStatePatch.cwd ?? state.cwd,
+            pendingModelSelection
+          }
+        },
         payload?.stored_session_id || undefined
       )
     }
@@ -246,7 +277,7 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
     // its dot without the user opening it. updateSessionState only
     // mutates the per-runtime cache entry, and syncSessionStateToView
     // guards the view publish to the active session, so this is safe.
-    if (runningChanged && sessionId) {
+    if (runningChanged && sessionId && !retiredRuntime) {
       // Set when THIS event released a turn that ended without ever
       // producing an assistant payload, so the catch-up side effects below
       // run on that edge only. The updater is invoked exactly once,
@@ -258,7 +289,7 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
         state => {
           const busy = Boolean(payload!.running)
 
-          if (state.busy === busy && (busy || !state.awaitingResponse)) {
+          if (state.busy === busy && (busy || !state.awaitingResponse) && !state.reconnecting) {
             return state
           }
 
@@ -282,6 +313,7 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
             return {
               ...state,
               busy,
+              reconnecting: false,
               // running=true from the backend is turn-live proof, same as
               // message.start (e.g. resuming an already-running session
               // that never replays its start event).
@@ -337,6 +369,7 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
             ...state,
             awaitingResponse: false,
             busy,
+            reconnecting: false,
             // The turn is over but its streaming bubble may still say
             // pending — running=false from the agent loop's finally block
             // is the ONLY settle signal when message.complete never

@@ -336,11 +336,6 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
   const { refreshHermesConfig, sttEnabled, voiceMaxRecordingSeconds } = useHermesConfig({ activeSessionIdRef })
 
-  const { applySavedMainModel, refreshCurrentModel, selectModel } = useModelControls({
-    queryClient,
-    requestGateway
-  })
-
   const openProviderSettings = useCallback(() => navigate(`${SETTINGS_ROUTE}?tab=providers`), [navigate])
 
   // Palette "Keyboard shortcuts" entry dispatches a custom event (contributions
@@ -503,6 +498,31 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     sessionStateByRuntimeIdRef,
     syncSessionStateToView,
     updateSessionState
+  })
+
+  const recoverModelRuntime = useCallback(
+    async (storedSessionId: string, staleRuntimeId: string): Promise<null | string> => {
+      // A model click is user intent for the currently visible session. Do not
+      // let a late 4001 re-home the workspace after the user selected another.
+      if ($activeSessionId.get() !== staleRuntimeId || $selectedStoredSessionId.get() !== storedSessionId) {
+        return null
+      }
+
+      await resumeSession(storedSessionId)
+
+      const recoveredRuntimeId = $activeSessionId.get()
+
+      return recoveredRuntimeId && recoveredRuntimeId !== staleRuntimeId && $selectedStoredSessionId.get() === storedSessionId
+        ? recoveredRuntimeId
+        : null
+    },
+    [resumeSession]
+  )
+
+  const { applySavedMainModel, refreshCurrentModel, selectModel } = useModelControls({
+    queryClient,
+    recoverRuntime: recoverModelRuntime,
+    requestGateway
   })
 
   // A profile switch/create drops to a fresh new-session draft so the

@@ -183,6 +183,12 @@ def build_error_surface_from_result(
         if result.get("billing_block") or reason in ("billing", "billing_unverified"):
             return _surface(LAYER_BILLING, reason or "billing", False, provider, model)
 
+        # This is emitted by the local durable session admission lock before the
+        # model provider is called. Do not report it as a provider failure or
+        # attach a selected provider/model as if either rejected the request.
+        if error_text.startswith("session_turn_lease_timeout:"):
+            return _surface(LAYER_RUNTIME, "session_turn_lease_timeout", True)
+
         if not reason:
             # Failed result without a classified reason (legacy paths).
             if _looks_like_stream_drop(error_text):

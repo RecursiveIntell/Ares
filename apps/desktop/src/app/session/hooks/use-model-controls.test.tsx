@@ -9,6 +9,7 @@ import {
   $activeSessionId,
   $currentModel,
   $currentProvider,
+  $selectedStoredSessionId,
   getCurrentModelSource,
   setCurrentModel,
   setCurrentModelSource,
@@ -82,6 +83,7 @@ describe('useModelControls', () => {
   beforeEach(() => {
     $activeGatewayProfile.set('default')
     $activeSessionId.set(null)
+    $selectedStoredSessionId.set(null)
     setCurrentModel('')
     setCurrentModelSource('')
     setCurrentProvider('')
@@ -92,6 +94,7 @@ describe('useModelControls', () => {
     vi.restoreAllMocks()
     $activeGatewayProfile.set('default')
     $activeSessionId.set(null)
+    $selectedStoredSessionId.set(null)
     setCurrentModel('')
     setCurrentModelSource('')
     setCurrentProvider('')
@@ -274,6 +277,80 @@ describe('useModelControls', () => {
       value: 'claude-sonnet-4.6 --provider anthropic --global'
     })
     expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
+  })
+
+  it('resumes a stored primary session and retries config.set after its runtime was reaped', async () => {
+    $activeSessionId.set('runtime-dead')
+    $selectedStoredSessionId.set('stored-older-session')
+    setCurrentModel('gpt-5.6-terra-900k')
+    setCurrentProvider('openai-codex')
+
+    const recoverRuntime = vi.fn(async (storedSessionId: string, staleRuntimeId: string) => {
+      expect(storedSessionId).toBe('stored-older-session')
+      expect(staleRuntimeId).toBe('runtime-dead')
+
+      return 'runtime-fresh'
+    })
+
+    const requestGateway = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('session not found'))
+      .mockResolvedValueOnce({ key: 'model', scope: 'global', value: 'claude-sonnet-4.6' })
+
+    const options = {
+      queryClient: new QueryClient(),
+      requestGateway,
+      recoverRuntime
+    }
+
+    const { result } = renderHook(() => useModelControls(options))
+
+    await expect(result.current.selectModel({ model: 'claude-sonnet-4.6', provider: 'anthropic' })).resolves.toBe(true)
+
+    expect(recoverRuntime).toHaveBeenCalledExactlyOnceWith('stored-older-session', 'runtime-dead')
+    expect(requestGateway).toHaveBeenNthCalledWith(1, 'config.set', {
+      session_id: 'runtime-dead',
+      key: 'model',
+      value: 'claude-sonnet-4.6 --provider anthropic --global'
+    })
+    expect(requestGateway).toHaveBeenNthCalledWith(2, 'config.set', {
+      session_id: 'runtime-fresh',
+      key: 'model',
+      value: 'claude-sonnet-4.6 --provider anthropic --global'
+    })
+    expect(notifyError).not.toHaveBeenCalled()
+  })
+
+  it('does not roll back a newer session when stale-model recovery detects route drift', async () => {
+    $activeSessionId.set('runtime-dead')
+    $selectedStoredSessionId.set('stored-older-session')
+    setCurrentModel('gpt-5.6-terra-900k')
+    setCurrentProvider('openai-codex')
+
+    const recoverRuntime = vi.fn(async () => {
+      $activeSessionId.set('runtime-newer')
+      $selectedStoredSessionId.set('stored-newer-session')
+      setCurrentModel('gpt-5.6-sol-900k')
+      setCurrentProvider('openai-codex')
+
+      return null
+    })
+
+    const requestGateway = vi.fn().mockRejectedValueOnce(new Error('session not found'))
+
+    const { result } = renderHook(() =>
+      useModelControls({
+        queryClient: new QueryClient(),
+        recoverRuntime,
+        requestGateway
+      })
+    )
+
+    await expect(result.current.selectModel({ model: 'claude-sonnet-4.6', provider: 'anthropic' })).resolves.toBe(false)
+
+    expect($currentModel.get()).toBe('gpt-5.6-sol-900k')
+    expect($currentProvider.get()).toBe('openai-codex')
+    expect(notifyError).not.toHaveBeenCalled()
   })
 
   it('keeps a mid-turn pick painted and skips the refetch that would repaint the old model', async () => {

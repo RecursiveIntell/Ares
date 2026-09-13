@@ -21,7 +21,6 @@ import {
   dismissBackgroundProcess,
   groupStatusItems,
   refreshBackgroundProcesses,
-  resetBackgroundPollingGuard,
   type StatusGroup,
   stopBackgroundProcess
 } from '@/store/composer-status'
@@ -103,13 +102,11 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
   const groups = useMemo(() => groupStatusItems(items), [items])
 
   // Seed from the registry on session open; event-driven refreshes (terminal /
-  // process tool completions) live in use-message-stream.
+  // process tool completions) live in use-message-stream. A remount is not a
+  // fresh runtime binding: dead runtime ids remain latched until a real resume
+  // publishes a different id.
   useEffect(() => {
     if (sessionId) {
-      // Opening/rebinding a session is a fresh runtime binding: clear any
-      // gone-latch left by a previous runtime under this id so the poll below
-      // is allowed to run again (see resetBackgroundPollingGuard).
-      resetBackgroundPollingGuard(sessionId)
       void refreshBackgroundProcesses(sessionId)
       void refreshSessionGoal(sessionId)
     }

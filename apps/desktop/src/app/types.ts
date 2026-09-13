@@ -171,6 +171,16 @@ export interface SidebarNavItem {
   keybindActionId?: string
 }
 
+export interface PendingModelSelection {
+  model: string
+  provider: string
+  /** The runtime metadata seen before the user made this local selection. A
+   * delayed heartbeat repeating this exact pair is stale relative to the pick,
+   * while a genuinely different backend-normalized value can still settle it. */
+  previousModel: string
+  previousProvider: string
+}
+
 export interface ClientSessionState {
   storedSessionId: string | null
   messages: ChatMessage[]
@@ -178,12 +188,18 @@ export interface ClientSessionState {
   cwd: string
   model: string
   provider: string
+  /** Local model intent awaiting a matching or normalized backend metadata
+   * update. A heartbeat repeating `previous*` is stale, not a rejection. */
+  pendingModelSelection?: null | PendingModelSelection
   reasoningEffort: string
   serviceTier: string
   fast: boolean
   yolo: boolean
   personality: string
   busy: boolean
+  /** The runtime id was invalidated by reconnect/reap and the durable session is
+   *  being rebound. This is unresolved activity, not confirmed idle. */
+  reconnecting: boolean
   awaitingResponse: boolean
   streamId: string | null
   sawAssistantPayload: boolean

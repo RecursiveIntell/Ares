@@ -241,8 +241,8 @@ export function useSessionStateCache({
     viewSessionIdRef.current = pending.sessionId
 
     syncRuntimeMetadataToView(pending.state)
-    setBusy(pending.state.busy)
-    setMutableRef(busyRef, pending.state.busy)
+    setBusy(pending.state.busy || pending.state.reconnecting)
+    setMutableRef(busyRef, pending.state.busy || pending.state.reconnecting)
     setAwaitingResponse(pending.state.awaitingResponse)
     // Mirror the focused session's per-session turn clock into the global
     // atom the statusbar timer reads. Keeps a backgrounded turn's elapsed

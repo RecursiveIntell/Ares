@@ -113,7 +113,7 @@ function buildTileView(storedSessionId: string): SessionView {
   return {
     kind: 'tile',
     $awaitingResponse: computed($state, state => Boolean(state?.awaitingResponse)),
-    $busy: computed($state, state => Boolean(state?.busy)),
+    $busy: computed($state, state => Boolean(state?.busy || state?.reconnecting)),
     $cwd: computed($state, state => state?.cwd ?? ''),
     $fast: computed($state, state => Boolean(state?.fast)),
     $lastVisibleIsUser: computed($messages, lastVisibleMessageIsUser),
@@ -165,7 +165,31 @@ function TileChat({
     [ownerRoute, requestGateway]
   )
 
-  const { selectModel } = useModelControls({ queryClient, requestGateway: requestTileGateway })
+  const recoverTileModelRuntime = useCallback(
+    async (targetStoredSessionId: string, staleRuntimeId: string): Promise<null | string> => {
+      if (targetStoredSessionId !== storedSessionId || staleRuntimeId !== runtimeId) {
+        return null
+      }
+
+      const recoveredRuntimeId = await sessionTileDelegate()?.resumeTile(targetStoredSessionId, { force: true })
+
+      if (!recoveredRuntimeId || recoveredRuntimeId === staleRuntimeId) {
+        return null
+      }
+
+      patchSessionTile(targetStoredSessionId, { error: undefined, runtimeId: recoveredRuntimeId })
+
+      return recoveredRuntimeId
+    },
+    [runtimeId, storedSessionId]
+  )
+
+  const { selectModel } = useModelControls({
+    queryClient,
+    recoverRuntime: recoverTileModelRuntime,
+    requestGateway: requestTileGateway
+  })
+
   const activeGatewayProfile = useStore($activeGatewayProfile)
   const cwd = useStore(view.$cwd)
   const gatewayOpen = useStore($gatewayState) === 'open'

@@ -416,6 +416,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
                 ? finalizeInterruptedMessages(state.messages, state.streamId)
                 : [...finalizeInterruptedMessages(state.messages, state.streamId), buildUserMessage()],
             busy: true,
+            reconnecting: false,
             awaitingResponse: true,
             pendingBranchGroup: null,
             sawAssistantPayload: false,

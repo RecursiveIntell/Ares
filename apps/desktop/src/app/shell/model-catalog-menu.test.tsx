@@ -37,7 +37,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup()
-  vi.clearAllMocks()
+  vi.resetAllMocks()
 })
 
 // A minimal controller — these tests are about the CATALOG's own behaviour
@@ -73,6 +73,19 @@ function renderMenu() {
 // the kanban board would end up disagreeing about what "my models" means —
 // which is exactly the drift extracting this component was meant to prevent.
 describe('the catalog owns model curation', () => {
+  it('recovers a transient empty catalog without closing or restarting the picker', async () => {
+    getGlobalModelOptions
+      .mockResolvedValueOnce({ providers: [] })
+      .mockResolvedValueOnce({ providers: [{ models: ['gemini-3.1-pro'], name: 'Google', slug: 'google' }] })
+
+    renderMenu()
+
+    await screen.findByText('No models found')
+    await screen.findByText(/Gemini 3\.1 Pro/i, {}, { timeout: 1_000 })
+
+    expect(getGlobalModelOptions).toHaveBeenCalledTimes(2)
+  })
+
   it('honours the stored Edit Models shortlist', async () => {
     setVisibleModels(new Set([modelVisibilityKey('google', 'gemini-2.5-flash')]))
 

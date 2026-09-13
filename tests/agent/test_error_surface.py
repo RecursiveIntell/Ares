@@ -11,6 +11,7 @@ from agent.error_surface import (
     LAYER_ENDPOINT,
     LAYER_GATEWAY,
     LAYER_PROVIDER,
+    LAYER_RUNTIME,
     LAYER_STREAMING,
     build_error_surface_from_exception,
     build_error_surface_from_result,
@@ -140,6 +141,21 @@ def test_result_stream_drop_text_maps_to_streaming():
 def test_result_unclassified_failure_defaults_to_provider_unknown():
     surface = build_error_surface_from_result(_failed_result(error="something odd"))
     assert surface == {"layer": LAYER_PROVIDER, "code": "unknown", "retryable": True}
+
+
+def test_result_session_turn_lease_timeout_is_local_runtime_contention():
+    surface = build_error_surface_from_result(
+        _failed_result(
+            error="session_turn_lease_timeout:20260912_034100_55fef9"
+        ),
+        provider="openai-codex",
+        model="gpt-5.6-terra-900k",
+    )
+    assert surface == {
+        "layer": LAYER_RUNTIME,
+        "code": "session_turn_lease_timeout",
+        "retryable": True,
+    }
 
 
 def test_result_disk_full_wins_over_reason():

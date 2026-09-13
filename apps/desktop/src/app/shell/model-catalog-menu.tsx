@@ -112,6 +112,8 @@ interface ProviderGroup {
   provider: ModelOptionProvider
 }
 
+const EMPTY_CATALOG_RETRY_DELAYS_MS = [250, 1_000, 3_000] as const
+
 /**
  * THE model catalog menu: searchable, provider-grouped, `-fast` families
  * collapsed to one row, per-row hover submenu for thinking/effort/fast, full
@@ -148,7 +150,15 @@ export function ModelCatalogMenu({
     queryFn: (): Promise<ModelOptionsResponse> => requestModelOptions({ gateway, profile, request, sessionId })
   })
 
-  const loading = modelOptions.isPending && !modelOptions.data
+  const {
+    data: modelOptionsData,
+    isFetching: modelOptionsFetching,
+    refetch: refetchModelOptions
+  } = modelOptions
+
+  const [emptyCatalogRetryAttempt, setEmptyCatalogRetryAttempt] = useState(0)
+
+  const loading = modelOptions.isPending && !modelOptionsData
 
   const error = modelOptions.error
     ? modelOptions.error instanceof Error
@@ -169,6 +179,35 @@ export function ModelCatalogMenu({
     () => providers?.filter(provider => provider.slug.toLowerCase() !== 'moa') ?? [],
     [providers]
   )
+
+  useEffect(() => {
+    setEmptyCatalogRetryAttempt(0)
+  }, [profile, sessionId])
+
+  // `model.options` can briefly report a successful-but-empty catalog while a
+  // gateway/provider is still hydrating. A success result does not trigger
+  // React Query's error retry, so retry the read from the mounted menu a bounded
+  // number of times. We leave an actually unconfigured profile visibly empty
+  // after that budget; no synthetic model or unbounded background polling.
+  useEffect(() => {
+    if (pickerProviders.some(provider => (provider.models?.length ?? 0) > 0)) {
+      if (emptyCatalogRetryAttempt !== 0) {
+        setEmptyCatalogRetryAttempt(0)
+      }
+
+      return
+    }
+
+    if (!modelOptionsData || modelOptionsFetching || emptyCatalogRetryAttempt >= EMPTY_CATALOG_RETRY_DELAYS_MS.length) {
+      return
+    }
+
+    const timer = window.setTimeout(() => {
+      void refetchModelOptions().finally(() => setEmptyCatalogRetryAttempt(attempt => attempt + 1))
+    }, EMPTY_CATALOG_RETRY_DELAYS_MS[emptyCatalogRetryAttempt])
+
+    return () => window.clearTimeout(timer)
+  }, [emptyCatalogRetryAttempt, modelOptionsData, modelOptionsFetching, pickerProviders, refetchModelOptions])
 
   const current = controller.current
 

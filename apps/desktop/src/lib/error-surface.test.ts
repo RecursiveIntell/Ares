@@ -63,6 +63,19 @@ describe('formatErrorDiagnostics', () => {
     expect(text).toContain('error: boom')
   })
 
+  it('does not attach a selected provider/model to a local runtime failure', () => {
+    const text = formatErrorDiagnostics({
+      errorText: 'session_turn_lease_timeout:20260912_034100_55fef9',
+      model: 'gpt-5.6-terra-900k',
+      provider: 'openai-codex',
+      surface: { layer: 'runtime', code: 'session_turn_lease_timeout', retryable: true }
+    })
+
+    expect(text).toContain('layer: runtime')
+    expect(text).not.toContain('provider: openai-codex')
+    expect(text).not.toContain('model: gpt-5.6-terra-900k')
+  })
+
   it('prefers the descriptor identity over the caller fallback', () => {
     const text = formatErrorDiagnostics({
       errorText: 'boom',

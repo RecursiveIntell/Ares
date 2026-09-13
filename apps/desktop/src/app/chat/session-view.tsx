@@ -89,7 +89,7 @@ const $primaryMessages = primaryField<ChatMessage[]>(state => state.messages, $m
  * new chat (no stored id) so the first-send optimistic lock still paints.
  */
 const $primaryBusy = computed([$primaryState, $busy, $selectedStoredSessionId], (state, draftBusy, selected) =>
-  state ? state.busy : selected ? false : draftBusy
+  state ? state.busy || state.reconnecting : selected ? false : draftBusy
 )
 
 export const PRIMARY_SESSION_VIEW: SessionView = {
