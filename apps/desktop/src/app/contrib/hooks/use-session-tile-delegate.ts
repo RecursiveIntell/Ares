@@ -195,7 +195,12 @@ export function useSessionTileDelegate({
         // A recovery call reaches here only after a session-scoped RPC returned
         // 4001 for this runtime, so its populated transcript is not evidence it
         // is live. Force the durable resume only for that proven-gone path.
-        if (!options.force && existing && cached?.storedSessionId === storedSessionId && (cached.busy || cached.messages.length > 0)) {
+        if (
+          !options.force &&
+          existing &&
+          cached?.storedSessionId === storedSessionId &&
+          (cached.busy || cached.messages.length > 0)
+        ) {
           publishSessionState(existing, cached)
 
           return existing

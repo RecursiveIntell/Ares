@@ -512,7 +512,9 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
       const recoveredRuntimeId = $activeSessionId.get()
 
-      return recoveredRuntimeId && recoveredRuntimeId !== staleRuntimeId && $selectedStoredSessionId.get() === storedSessionId
+      return recoveredRuntimeId &&
+        recoveredRuntimeId !== staleRuntimeId &&
+        $selectedStoredSessionId.get() === storedSessionId
         ? recoveredRuntimeId
         : null
     },

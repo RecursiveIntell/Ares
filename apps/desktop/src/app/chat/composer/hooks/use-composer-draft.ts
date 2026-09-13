@@ -129,10 +129,13 @@ export function useComposerDraft({
 
   const [focusRequestId, setFocusRequestId] = useState(0)
 
-  const focusInput = useCallback((retry = true) => {
-    focusComposerInput(editorRef.current, { retry })
-    markActiveComposer(target)
-  }, [target])
+  const focusInput = useCallback(
+    (retry = true) => {
+      focusComposerInput(editorRef.current, { retry })
+      markActiveComposer(target)
+    },
+    [target]
+  )
 
   const requestMainFocus = useCallback(() => {
     setFocusRequestId(id => id + 1)

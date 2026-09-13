@@ -56,6 +56,7 @@ export function createBackendOrphanReaper(
         .then(pids => {
           onReaped(pids)
         })
+
       const tracked = sweep.finally(() => {
         if (inFlight === tracked) {
           inFlight = null
