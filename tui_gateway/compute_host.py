@@ -268,6 +268,8 @@ class ComputeHost:
         kind = str(frame.get("type") or "")
         if kind == "session.seed":
             self._handle_seed(frame)
+        elif kind == "session.lookup":
+            self._handle_session_lookup(frame)
         elif kind == "turn.start":
             self._handle_turn_start(frame)
         elif kind == "interrupt":
@@ -303,6 +305,44 @@ class ComputeHost:
             history = []
         self._sessions[sid] = HostSession(sid=sid, agent=SpikeAgent(sid, list(history)))
         self.emit({"type": "session.seeded", "sid": sid, "request_id": frame.get("request_id")})
+
+    def _handle_session_lookup(self, frame: dict[str, Any]) -> None:
+        """Report the authoritative host runtime for one durable session key."""
+        session_key = str(frame.get("session_key") or "")
+        sessions: list[dict[str, Any]] = []
+        if session_key:
+            try:
+                from tui_gateway import server
+
+                for sid, session in list(server._sessions.items()):
+                    if str(session.get("session_key") or "") != session_key:
+                        continue
+                    with session.get("history_lock", threading.Lock()):
+                        agent = session.get("agent")
+                        sessions.append(
+                            {
+                                "session_id": sid,
+                                "running": bool(session.get("running")),
+                                "session_info": server._session_info(agent, session),
+                            }
+                        )
+            except Exception as exc:
+                self.emit(
+                    {
+                        "type": "error",
+                        "request_id": frame.get("request_id"),
+                        "message": f"session lookup failed: {exc}",
+                    }
+                )
+                return
+        self.emit(
+            {
+                "type": "session.lookup.ack",
+                "request_id": frame.get("request_id"),
+                "session_key": session_key,
+                "sessions": sessions,
+            }
+        )
 
     def _track_turn_future(self, future: concurrent.futures.Future, sid: str) -> None:
         """Register an in-flight turn against the session running it.
@@ -677,6 +717,39 @@ class ComputeHost:
                 return
             if route == "idle-gated" and session.get("running"):
                 self.emit({"type": "control.error", "sid": sid, "request_id": request_id, "message": "session busy"})
+                return
+            if route_name == "config.set.model":
+                params = frame.get("params")
+                if not isinstance(params, dict):
+                    params = {}
+                response = server._methods["config.set"](
+                    request_id,
+                    {
+                        **params,
+                        "key": "model",
+                        "session_id": sid,
+                    },
+                )
+                if "error" in response:
+                    self.emit(
+                        {
+                            "type": "control.error",
+                            "sid": sid,
+                            "request_id": request_id,
+                            "message": str(response["error"].get("message") or "model switch failed"),
+                        }
+                    )
+                    return
+                self.emit(
+                    {
+                        "type": "control.ack",
+                        "sid": sid,
+                        "request_id": request_id,
+                        "route_name": route_name,
+                        "result": response.get("result") or {},
+                        "session_info": server._session_info(session.get("agent"), session),
+                    }
+                )
                 return
             if route_name == "reload.mcp":
                 self._handle_reload_mcp({**frame, "type": "reload_mcp"})

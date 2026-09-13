@@ -9924,6 +9924,52 @@ def _claim_or_reuse_live(
             # client (storm killer — see _cancel_ws_orphan_reap).
             _cancel_ws_orphan_reap(live[0])
             return live
+        # The serving process can lose a detached websocket mirror while its
+        # persistent compute host is still running the real agent. Query that
+        # owner before minting another runtime ID: otherwise both IDs submit to
+        # one state.db session, the durable lease blocks one for 30 minutes, and
+        # Stop/model controls hit the non-holder. The host is authoritative for
+        # this lookup; the parent record below is only a mirror for routing.
+        if _turn_isolation_enabled() and session_key:
+            try:
+                supervisor = _get_compute_host_supervisor()
+                owner = supervisor.lookup_session_key(session_key)
+            except Exception:
+                logger.warning(
+                    "compute-host owner lookup failed for stored session %s; refusing to mint a duplicate runtime",
+                    session_key,
+                    exc_info=True,
+                )
+                if lease is not None:
+                    lease.release()
+                raise
+            if owner is not None:
+                owner_sid = str(owner.get("session_id") or "")
+                if not owner_sid:
+                    if lease is not None:
+                        lease.release()
+                    raise RuntimeError("compute-host owner lookup omitted its runtime session id")
+                record["running"] = bool(owner.get("running"))
+                record["_compute_host_active"] = True
+                host_info = owner.get("session_info")
+                if isinstance(host_info, dict):
+                    _apply_compute_host_metadata_mirror(
+                        record,
+                        {"session_key": session_key, "session_info": host_info},
+                    )
+                with _sessions_lock:
+                    _sessions[owner_sid] = record
+                    _register_session_cwd(record)
+
+                def _on_host_owner_terminal(frame: dict) -> None:
+                    _on_compute_host_turn_done(
+                        "recovered-compute-host-owner", owner_sid, record, frame
+                    )
+
+                supervisor.observe_session(owner_sid, _on_host_owner_terminal)
+                if lease is not None:
+                    lease.release()
+                return owner_sid, record
         with _sessions_lock:
             _sessions[sid] = record
             _register_session_cwd(_sessions[sid])
@@ -13321,6 +13367,39 @@ def _(rid, params: dict) -> dict:
         try:
             if not value:
                 return _err(rid, 4002, "model value required")
+            if session is not None and _session_uses_compute_host(session):
+                sid = str(params.get("session_id") or "")
+                host_params = {"key": "model", "value": value}
+                if params.get("confirm_expensive_model"):
+                    host_params["confirm_expensive_model"] = True
+                try:
+                    ack = _send_compute_host_control(
+                        sid,
+                        route_name="config.set.model",
+                        payload={"params": host_params},
+                        wait=True,
+                        timeout=30.0,
+                    )
+                except Exception as exc:
+                    return _err(rid, 5019, f"compute-host model switch failed: {exc}")
+                if ack.get("type") in {"control.error", "error"}:
+                    return _err(rid, 5001, str(ack.get("message") or "compute-host model switch failed"))
+                result = ack.get("result")
+                if not isinstance(result, dict):
+                    return _err(rid, 5001, "compute-host model switch returned an invalid response")
+                _apply_compute_host_metadata_mirror(session, ack)
+                return _ok(
+                    rid,
+                    {
+                        "key": key,
+                        "value": result.get("value", ""),
+                        "warning": result.get("warning", ""),
+                        "confirm_required": result.get("confirm_required", False),
+                        "confirm_message": result.get("confirm_message", ""),
+                        "scope": result.get("scope", "session"),
+                        **({"deferred": result["deferred"]} if "deferred" in result else {}),
+                    },
+                )
             if session:
                 from hermes_cli.model_switch import parse_model_switch_args
 

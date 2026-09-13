@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 _Thread = threading.Thread
 
 MUTATOR_ROUTE_TABLE: dict[str, str] = {
+    "config.set.model": "run-concurrent",
     "prompt.submit": "turn-path",
     "session.interrupt": "turn-path",
     "reload.mcp": "run-concurrent",
@@ -180,6 +181,7 @@ class HostSupervisor:
         self._restart_times: list[float] = []
         self._pending_turns: dict[str, tuple[str, Callable[[dict], None] | None]] = {}
         self._pending_controls: dict[str, queue.Queue[dict]] = {}
+        self._session_observers: dict[str, Callable[[dict], None]] = {}
         self._stderr_tail: list[str] = []
         self._last_progress_counter = 0
 
@@ -282,6 +284,56 @@ class HostSupervisor:
     def interrupt(self, sid: str, *, request_id: str | None = None) -> None:
         self.start()
         self._send_frame({"type": "interrupt", "sid": sid, "request_id": request_id or uuid.uuid4().hex})
+
+    def lookup_session_key(self, session_key: str, *, timeout: float = 2.0) -> dict[str, Any] | None:
+        """Return the host-side owner of one stored session, if exactly one exists.
+
+        The serving process may have reaped its websocket-facing mirror while the
+        persistent compute host still owns the live agent.  A resume must adopt
+        that owner rather than create a second runtime ID for the same durable
+        transcript.  Multiple owners are deliberately an error: guessing would
+        make Stop and model controls target an arbitrary turn.
+        """
+        key = str(session_key or "")
+        if not key:
+            return None
+        self.start()
+        request_id = f"session-lookup-{uuid.uuid4().hex}"
+        q: queue.Queue[dict] = queue.Queue(maxsize=1)
+        with self._lock:
+            self._pending_controls[request_id] = q
+        try:
+            self._send_frame(
+                {
+                    "type": "session.lookup",
+                    "request_id": request_id,
+                    "session_key": key,
+                }
+            )
+            frame = q.get(timeout=timeout)
+        finally:
+            with self._lock:
+                self._pending_controls.pop(request_id, None)
+        if frame.get("type") == "error":
+            raise RuntimeError(str(frame.get("message") or "compute-host session lookup failed"))
+        matches = frame.get("sessions")
+        if not isinstance(matches, list):
+            raise RuntimeError("compute-host session lookup returned an invalid response")
+        matches = [item for item in matches if isinstance(item, dict) and item.get("session_id")]
+        if not matches:
+            return None
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"compute host has {len(matches)} live runtimes for stored session {key}; refusing ambiguous ownership"
+            )
+        return dict(matches[0])
+
+    def observe_session(self, sid: str, callback: Callable[[dict], None]) -> None:
+        """Receive the next terminal frame for a re-adopted host session."""
+        if not sid:
+            return
+        with self._lock:
+            self._session_observers[sid] = callback
 
     def reload_mcp(self, sid: str, *, request_id: str | None = None) -> dict:
         return self.control(
@@ -468,7 +520,14 @@ class HostSupervisor:
         if ftype in {"turn.end", "turn.error"}:
             self._complete_turn(frame)
             return
-        if ftype in {"control.ack", "control.error", "interrupt.ack", "reload_mcp.ack", "shutdown.ack"}:
+        if ftype in {
+            "control.ack",
+            "control.error",
+            "interrupt.ack",
+            "reload_mcp.ack",
+            "session.lookup.ack",
+            "shutdown.ack",
+        }:
             request_id = str(frame.get("request_id") or "")
             with self._lock:
                 q = self._pending_controls.get(request_id)
@@ -490,16 +549,24 @@ class HostSupervisor:
 
     def _complete_turn(self, frame: dict[str, Any]) -> None:
         request_id = str(frame.get("request_id") or "")
+        sid = str(frame.get("sid") or "")
         with self._lock:
             pending = self._pending_turns.pop(request_id, None)
+            observer = self._session_observers.pop(sid, None)
         if pending is None:
-            return
-        _sid, cb = pending
+            cb = None
+        else:
+            _sid, cb = pending
         if cb is not None:
             try:
                 cb(frame)
             except Exception:
                 logger.exception("compute host turn completion callback failed")
+        if observer is not None:
+            try:
+                observer(frame)
+            except Exception:
+                logger.exception("compute host session observer failed")
 
     def _wait_for_exit(self, proc: subprocess.Popen[str]) -> None:
         code = proc.wait()
