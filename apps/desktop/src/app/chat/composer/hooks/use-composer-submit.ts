@@ -202,7 +202,7 @@ export function useComposerSubmit({
         triggerHaptic('submit')
         clearDraft()
         dispatchSubmit(text)
-      } else if (!compacting && !blockingPrompt && !attachments.length && text.trim()) {
+      } else if (!compacting && !blockingPrompt && !!onSteer && !attachments.length && text.trim()) {
         // Cursor-style stop-and-correct: interrupt the live turn and redirect
         // it with this text. redirect() preserves the shown reasoning/work; if
         // the turn already ended, steerDraft re-queues so nothing is lost.
@@ -213,6 +213,10 @@ export function useComposerSubmit({
         // an approval/sudo/secret prompt: a steer can't reach the model while
         // the tool batch is blocked, so the message runs as the next turn.
         queueCurrentDraft()
+      } else if (compacting) {
+        // Compaction owns the active turn. With no draft there is nothing to
+        // queue, and clicking the queue-labelled primary must never become an
+        // implicit interrupt.
       } else {
         // Stop button (the only way to reach here while busy with an empty
         // composer — empty Enter is short-circuited in the keydown handler).
