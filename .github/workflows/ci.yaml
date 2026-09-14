@@ -131,9 +131,10 @@ jobs:
     # (#76499 → #76562 → #76575): the mock-backend Electron window never
     # gets a title, so boot/chat/setup/interim specs all fail identically
     # regardless of the PR's diff (verified on #76573 and the docs-only
-    # #76582). Tracking issue: #76627 (assigned: Ari). To re-enable,
-    # delete the `false &&` below — nothing else changed.
-    if: ${{ false && (needs.detect.outputs.python_prod == 'true' || needs.detect.outputs.frontend == 'true') }}
+    # #76582). Tracking issue: #76627 (assigned: Ari). The lane remains
+    # explicitly disabled until that issue is resolved; changing this to true
+    # is a separate workflow admission decision.
+    if: false
     uses: ./.github/workflows/e2e-desktop.yml
 
   docs-site:
@@ -219,6 +220,10 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────
   all-checks-pass:
     name: All required checks pass
+    # This job executes the PR-controlled evaluator; do not inherit the
+    # workflow-wide permissions needed by unrelated reporting jobs.
+    permissions:
+      contents: read
     needs:
       - detect
       - tests
@@ -247,29 +252,42 @@ jobs:
     outputs:
       needs-json: ${{ steps.evaluate.outputs.needs-json }}
     steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install pinned actionlint
+        env:
+          ACTIONLINT_VERSION: 1.7.11
+          ACTIONLINT_SHA256: 900919a84f2229bac68ca9cd4103ea297abc35e9689ebb842c6e34a3d1b01b0a
+        run: |
+          set -euo pipefail
+          archive="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${archive}"
+          python3 - "$archive" "$url" <<'PY'
+          import pathlib
+          import sys
+          import urllib.request
+
+          destination = pathlib.Path(sys.argv[1])
+          request = urllib.request.Request(sys.argv[2], headers={"User-Agent": "RecursiveIntell-actionlint"})
+          with urllib.request.urlopen(request, timeout=30) as response:
+              destination.write_bytes(response.read())
+          PY
+          printf '%s  %s\n' "$ACTIONLINT_SHA256" "$archive" | sha256sum --check --status -
+          tar -xzf "$archive" actionlint
+          chmod 0755 actionlint
+
+      - name: Lint GitHub Actions workflows
+        # The disabled Desktop lane is an explicit CI-01 applicability exception.
+        # Keep actionlint strict for all other syntax/expressions.
+        run: ./actionlint -ignore 'constant expression "false" in condition'
+
       - name: Evaluate job results
         id: evaluate
         env:
-          NEEDS: ${{ toJSON(needs) }}
-        run: |
-          echo "$NEEDS" | python3 -c "
-          import json, sys
-          needs = json.load(sys.stdin)
-          # Emit compact {job_name: result} for the comment assembler.
-          compact = {name: info['result'] for name, info in needs.items()}
-          print(f'needs-json={json.dumps(compact)}')
-          with open('$GITHUB_OUTPUT', 'a') as f:
-              f.write(f'needs-json={json.dumps(compact)}\n')
-          failed = [name for name, info in needs.items() if info['result'] == 'failure']
-          for name, info in sorted(needs.items()):
-              result = info['result']
-              icon = '✅' if result in ('success', 'skipped') else '❌'
-              print(f'{icon} {name}: {result}')
-          if failed:
-              print(f'::error::{len(failed)} job(s) failed: {\", \".join(failed)}')
-              sys.exit(1)
-          print('All checks passed (or were skipped)')
-          "
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          CLASSIFIER_JSON: ${{ toJSON(needs.detect.outputs) }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: python3 scripts/ci/evaluate_required_checks.py
 
   # ─────────────────────────────────────────────────────────────────────
   # CI timing report: collect per-job/step durations from the GitHub API,
