@@ -11,18 +11,18 @@ import { notifyError } from '@/store/notifications'
 import { $activeGatewayProfile } from '@/store/profile'
 import {
   $activeSessionId,
+  $currentFastMode,
   $currentModel,
   $currentProvider,
-  $currentFastMode,
   $currentReasoningEffort,
   $selectedStoredSessionId,
   getComposerSelectionGeneration,
   getCurrentModelSource,
   markComposerSelectionManual,
+  setCurrentFastMode,
   setCurrentModel,
   setCurrentModelSource,
   setCurrentProvider,
-  setCurrentFastMode,
   setCurrentReasoningEffort
 } from '@/store/session'
 import { isSessionGoneError } from '@/store/session-gone'
@@ -359,9 +359,9 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
       const scope = persistsAsDefault ? '--global' : '--session'
 
       const runtimeOptionIntentId = `desktop-model-options-${++runtimeOptionIntentSequenceRef.current}`
-      const requestSwitch = (confirmExpensiveModel = false) => {
+      const requestSwitch = async (confirmExpensiveModel = false) => {
         if (selection.options && Object.keys(selection.options).length > 0) {
-          return requestGateway<ModelSwitchResponse>('session.runtime.configure', {
+          const compoundParams = {
             intent_id: runtimeOptionIntentId,
             model: {
               confirm_expensive_model: confirmExpensiveModel,
@@ -379,7 +379,44 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
               : {}),
             ...(selection.options.fast !== undefined ? { fast: selection.options.fast ? 'fast' : 'normal' } : {}),
             session_id: liveSessionId
-          })
+          }
+
+          try {
+            return await requestGateway<ModelSwitchResponse>('session.runtime.configure', compoundParams)
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error ?? '')
+            if (!/method not found|unknown method|-32601/i.test(message)) {
+              throw error
+            }
+
+            // Older gateways do not know the compound method. Keep the
+            // compatibility fallback narrow: only the exact unknown-method
+            // response may use the legacy sequence.
+            const legacy = await requestGateway<ModelSwitchResponse>('config.set', {
+              session_id: liveSessionId,
+              key: 'model',
+              value: `${selection.model} --provider ${selection.provider} ${scope}`,
+              ...(confirmExpensiveModel ? { confirm_expensive_model: true } : {})
+            })
+            if (legacy.confirm_required || legacy.deferred) {
+              return legacy
+            }
+            if (selection.options.effort !== undefined) {
+              await requestGateway('config.set', {
+                key: 'reasoning',
+                session_id: liveSessionId,
+                value: selection.options.effort
+              })
+            }
+            if (selection.options.fast !== undefined) {
+              await requestGateway('config.set', {
+                key: 'fast',
+                session_id: liveSessionId,
+                value: selection.options.fast ? 'fast' : 'normal'
+              })
+            }
+            return legacy
+          }
         }
 
         return requestGateway<ModelSwitchResponse>('config.set', {

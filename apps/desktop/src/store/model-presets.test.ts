@@ -1,10 +1,10 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 
 import { createClientSessionState } from '@/lib/chat-runtime'
-import { type SessionTileDelegate, setSessionTileDelegate } from './session-states'
 
 import { $modelPresets, applyModelPreset, getModelPreset, modelPresetKey, setModelPreset } from './model-presets'
 import { $currentFastMode, $currentReasoningEffort, setCurrentFastMode, setCurrentReasoningEffort } from './session'
+import { type SessionTileDelegate, setSessionTileDelegate } from './session-states'
 
 describe('model presets', () => {
   beforeEach(() => {

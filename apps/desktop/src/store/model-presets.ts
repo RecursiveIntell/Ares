@@ -7,6 +7,7 @@ import { setCurrentFastMode, setCurrentReasoningEffort } from './session'
 import { sessionTileDelegate } from './session-states'
 
 const STORAGE_KEY = 'hermes.desktop.model-presets'
+const STORAGE_KEY_V2 = 'hermes.desktop.model-presets.v2'
 
 /** Per-model reasoning/fast preset, remembered globally across sessions and
  *  re-applied to the session whenever that model is selected. Unset dimensions
@@ -26,9 +27,23 @@ function nextRuntimeOptionIntentId(): string {
 }
 
 /** Stable `provider::model` key (matches the visibility-store format). */
-export const modelPresetKey = (provider: string, model: string): string => `${provider}::${model}`
+export const modelPresetKey = (provider: string, model: string, scope = 'default'): string =>
+  scope === 'default' ? `${provider}::${model}` : `${scope}::${provider}::${model}`
 
 function load(): Record<string, ModelPreset> {
+  const versioned = storedString(STORAGE_KEY_V2)
+
+  if (versioned) {
+    try {
+      const parsed = JSON.parse(versioned)
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? (parsed as Record<string, ModelPreset>)
+        : {}
+    } catch {
+      return {}
+    }
+  }
+
   const raw = storedString(STORAGE_KEY)
 
   if (!raw) {
@@ -38,7 +53,11 @@ function load(): Record<string, ModelPreset> {
   try {
     const parsed = JSON.parse(raw)
 
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as Record<string, ModelPreset>) : {}
+    const legacy = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as Record<string, ModelPreset>) : {}
+    if (Object.keys(legacy).length > 0) {
+      persistString(STORAGE_KEY_V2, JSON.stringify(legacy))
+    }
+    return legacy
   } catch {
     return {}
   }
@@ -46,17 +65,17 @@ function load(): Record<string, ModelPreset> {
 
 export const $modelPresets = atom<Record<string, ModelPreset>>(load())
 
-export function getModelPreset(provider: string, model: string): ModelPreset {
-  return $modelPresets.get()[modelPresetKey(provider, model)] ?? {}
+export function getModelPreset(provider: string, model: string, scope = 'default'): ModelPreset {
+  return $modelPresets.get()[modelPresetKey(provider, model, scope)] ?? {}
 }
 
 /** Merge a partial preset for one model and persist. */
-export function setModelPreset(provider: string, model: string, patch: ModelPreset): void {
-  const key = modelPresetKey(provider, model)
+export function setModelPreset(provider: string, model: string, patch: ModelPreset, scope = 'default'): void {
+  const key = modelPresetKey(provider, model, scope)
   const next = { ...$modelPresets.get(), [key]: { ...$modelPresets.get()[key], ...patch } }
 
   $modelPresets.set(next)
-  persistString(STORAGE_KEY, JSON.stringify(next))
+  persistString(STORAGE_KEY_V2, JSON.stringify(next))
 }
 
 /** Apply a model's preset to the composer, then push it to a live session.

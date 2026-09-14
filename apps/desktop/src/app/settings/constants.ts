@@ -766,7 +766,6 @@ export const SECTIONS: DesktopConfigSection[] = [
       'checkpoints.max_snapshots',
       'agent.max_turns',
       'agent.api_max_retries',
-      'agent.service_tier',
       'agent.tool_use_enforcement',
       'delegation.model',
       'delegation.provider',

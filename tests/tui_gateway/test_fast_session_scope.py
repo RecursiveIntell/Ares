@@ -174,3 +174,32 @@ def test_runtime_configure_applies_a_compound_inline_option_request() -> None:
     assert resp["result"]["status"] == "applied"
     assert agent.reasoning_config == {"enabled": True, "effort": "high"}
     assert agent.service_tier == "priority"
+
+
+def test_pending_runtime_options_are_consumed_at_turn_start() -> None:
+    agent = _agent(None)
+    session = {
+        "session_key": "pending",
+        "agent": agent,
+        "pending_runtime_options": {
+            "reasoning": {"effort": "high", "mode": "effort"},
+            "fast": "fast",
+        },
+    }
+    calls = []
+
+    with patch.dict(server._sessions, {"pending-runtime": session}, clear=False), \
+            patch.object(server, "_emit"), \
+            patch.object(server, "_persist_live_session_runtime"), \
+            patch.object(
+                server,
+                "_methods",
+                {"config.set": lambda _rid, params: calls.append(params) or {"result": {"value": params["value"]}}},
+            ):
+        server._apply_pending_runtime_options("pending-runtime", session)
+
+    assert calls == [
+        {"session_id": "pending-runtime", "key": "reasoning", "value": "high"},
+        {"session_id": "pending-runtime", "key": "fast", "value": "fast"},
+    ]
+    assert "pending_runtime_options" not in session

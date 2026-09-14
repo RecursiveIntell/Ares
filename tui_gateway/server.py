@@ -6486,6 +6486,35 @@ def _apply_pending_model_switch(sid: str, session: dict) -> None:
         )
 
 
+def _apply_pending_runtime_options(sid: str, session: dict) -> None:
+    """Apply non-model options queued with a deferred model switch."""
+    pending = session.pop("pending_runtime_options", None)
+    if not isinstance(pending, dict) or session.get("agent") is None:
+        return
+
+    try:
+        reasoning = pending.get("reasoning")
+        if isinstance(reasoning, dict) and reasoning.get("mode") != "inherit":
+            value = "none" if reasoning.get("mode") == "off" else reasoning.get("effort", "")
+            response = _methods["config.set"](
+                f"pending-options-{sid}",
+                {"session_id": sid, "key": "reasoning", "value": value},
+            )
+            if "error" in response:
+                raise RuntimeError(str(response["error"].get("message") or "reasoning option failed"))
+
+        fast = pending.get("fast")
+        if fast in {"fast", "normal"}:
+            response = _methods["config.set"](
+                f"pending-options-{sid}",
+                {"session_id": sid, "key": "fast", "value": fast},
+            )
+            if "error" in response:
+                raise RuntimeError(str(response["error"].get("message") or "fast option failed"))
+    except Exception as exc:
+        _emit("error", sid, {"message": f"Could not apply pending runtime options: {exc}"})
+
+
 class CompressionLockHeld(Exception):
     """Raised by _compress_session_history when compression skipped due
     to a concurrent lock on the session's compression_locks row."""
@@ -12200,6 +12229,7 @@ def _run_prompt_submit(
                 # so this turn runs on the model the user chose. Runs before the
                 # config sync so an explicit pick wins over a config.yaml change.
                 _apply_pending_model_switch(sid, session)
+                _apply_pending_runtime_options(sid, session)
                 _sync_agent_model_with_config(sid, session)
                 _sync_agent_compression_with_config(sid, session)
             # Bot Chat capability sync — adopt Settings→Capabilities edits
@@ -13383,6 +13413,51 @@ def _runtime_configure_inline(rid, params: dict) -> dict:
     if session is None:
         return _err(rid, 4001, "session not found")
 
+    agent = session.get("agent")
+    agent_snapshot = _snapshot_agent_model_runtime(agent) if agent is not None else None
+    reasoning_snapshot = copy.deepcopy(getattr(agent, "reasoning_config", None)) if agent is not None else None
+    service_tier_snapshot = getattr(agent, "service_tier", None) if agent is not None else None
+    request_overrides_snapshot = copy.deepcopy(getattr(agent, "request_overrides", {})) if agent is not None else None
+    model_override_snapshot = copy.deepcopy(session.get("model_override"))
+    reasoning_override_snapshot = copy.deepcopy(session.get("create_reasoning_override"))
+    unset = object()
+    service_tier_override_snapshot = session.get("create_service_tier_override", unset)
+    global_model_snapshot = None
+    if isinstance(normalized.get("model"), dict) and normalized["model"].get("persist_profile_default"):
+        model_cfg = (_load_cfg() or {}).get("model") or {}
+        if isinstance(model_cfg, dict):
+            global_model_snapshot = {
+                "default": model_cfg.get("default"),
+                "provider": model_cfg.get("provider"),
+                "base_url": model_cfg.get("base_url")
+            }
+
+    def rollback_partial() -> None:
+        if agent is not None:
+            _restore_agent_model_runtime(agent, agent_snapshot)
+            agent.reasoning_config = copy.deepcopy(reasoning_snapshot)
+            agent.service_tier = service_tier_snapshot
+            agent.request_overrides = copy.deepcopy(request_overrides_snapshot or {})
+        if model_override_snapshot is None:
+            session.pop("model_override", None)
+        else:
+            session["model_override"] = copy.deepcopy(model_override_snapshot)
+        if reasoning_override_snapshot is None:
+            session.pop("create_reasoning_override", None)
+        else:
+            session["create_reasoning_override"] = copy.deepcopy(reasoning_override_snapshot)
+        if service_tier_override_snapshot is unset:
+            session.pop("create_service_tier_override", None)
+        else:
+            session["create_service_tier_override"] = service_tier_override_snapshot
+        if agent is not None:
+            _persist_live_session_runtime(session)
+        if global_model_snapshot is not None:
+            from cli import save_config_value
+
+            for config_key, config_value in global_model_snapshot.items():
+                save_config_value(f"model.{config_key}", config_value)
+
     results: dict[str, Any] = {}
     model = normalized.get("model")
     if model is not None:
@@ -13420,6 +13495,7 @@ def _runtime_configure_inline(rid, params: dict) -> dict:
             {"session_id": sid, "key": "reasoning", "value": value},
         )
         if "error" in response:
+            rollback_partial()
             return response
         results["reasoning"] = response.get("result") or {}
 
@@ -13430,6 +13506,7 @@ def _runtime_configure_inline(rid, params: dict) -> dict:
             {"session_id": sid, "key": "fast", "value": fast},
         )
         if "error" in response:
+            rollback_partial()
             return response
         results["fast"] = response.get("result") or {}
 
