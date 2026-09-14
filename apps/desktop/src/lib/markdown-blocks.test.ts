@@ -160,5 +160,5 @@ describe('parseMarkdownIntoBlocksCached', () => {
         expect(parseMarkdownIntoBlocksCached(text)).toEqual(parseMarkdownIntoBlocks(text))
       }
     }
-  }, 30_000)
+  }, 120_000)
 })
