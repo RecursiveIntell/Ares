@@ -12139,6 +12139,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         include_inactive: bool = False,
         repair_alternation: bool = False,
         include_row_ids: bool = False,
+        include_summary_markers: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Load messages in the OpenAI conversation format (role + content dicts).
@@ -12186,6 +12187,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             include_ancestors=include_ancestors,
             repair_alternation=repair_alternation,
             include_row_ids=include_row_ids,
+            include_summary_markers=include_summary_markers,
         )
 
     # Columns every conversation projection decodes. Shared by
