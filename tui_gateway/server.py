@@ -6917,11 +6917,10 @@ def _session_info(agent, session: dict | None = None) -> dict:
     host_owned = bool(
         session
         and (session.get("_compute_host_active") or session.get("agent_ready") is not None)
-        and mirror
     )
     reasoning_config = None if host_owned else getattr(agent, "reasoning_config", None)
     reasoning_effort = ""
-    if host_owned and "reasoning_effort" in mirror:
+    if host_owned:
         reasoning_effort = str(mirror.get("reasoning_effort") or "")
     elif isinstance(reasoning_config, dict):
         if reasoning_config.get("enabled") is False:
@@ -6934,7 +6933,7 @@ def _session_info(agent, session: dict | None = None) -> dict:
             reasoning_effort = str(reasoning_config.get("effort", "") or "")
     service_tier = (
         str(mirror.get("service_tier") or "")
-        if host_owned and "service_tier" in mirror
+        if host_owned
         else getattr(agent, "service_tier", None) or mirror.get("service_tier") or ""
     )
     # Effective approval-bypass state — the same three sources that
@@ -6974,15 +6973,13 @@ def _session_info(agent, session: dict | None = None) -> dict:
     )
 
     info: dict = {
-        "model": pending_model or mirror.get("model", getattr(agent, "model", "")),
+        "model": pending_model or (mirror.get("model", "") if host_owned else mirror.get("model", getattr(agent, "model", ""))),
         "provider": pending_provider
-        or mirror.get("provider", getattr(agent, "provider", "")),
+        or (mirror.get("provider", "") if host_owned else mirror.get("provider", getattr(agent, "provider", ""))),
         "reasoning_effort": reasoning_effort,
         "service_tier": service_tier,
         "fast": (
-            bool(mirror.get("fast"))
-            if host_owned and "fast" in mirror
-            else service_tier == "priority"
+            bool(mirror.get("fast")) if host_owned else service_tier == "priority"
         ),
         "yolo": yolo,
         "approval_mode": approval_mode,
@@ -13438,7 +13435,12 @@ def _(rid, params: dict) -> dict:
                 except Exception as exc:
                     return _err(rid, 5019, f"compute-host model switch failed: {exc}")
                 if ack.get("type") in {"control.error", "error"}:
-                    return _err(rid, 5001, str(ack.get("message") or "compute-host model switch failed"))
+                    code = ack.get("code")
+                    return _err(
+                        rid,
+                        int(code) if isinstance(code, int) else 5001,
+                        str(ack.get("message") or "compute-host model switch failed"),
+                    )
                 result = ack.get("result")
                 if not isinstance(result, dict):
                     return _err(rid, 5001, "compute-host model switch returned an invalid response")

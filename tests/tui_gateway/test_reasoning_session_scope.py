@@ -72,6 +72,15 @@ class TestSessionInfoReasoningEffort:
         assert info["reasoning_effort"] == "high"
         assert info["fast"] is False
 
+    def test_host_without_mirror_does_not_publish_shadow_options(self) -> None:
+        info = _session_info(
+            _agent({"enabled": True, "effort": "xhigh"}),
+            {"_compute_host_active": True, "session_key": "host-session"},
+        )
+        assert info["model"] == ""
+        assert info["reasoning_effort"] == ""
+        assert info["fast"] is False
+
 
 class TestConfigSetReasoningSessionScope:
     """Session-targeted reasoning changes must not touch global config."""
