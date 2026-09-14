@@ -52,6 +52,26 @@ class TestSessionInfoReasoningEffort:
         info = _session_info(_agent(None))
         assert info["reasoning_effort"] == ""
 
+    def test_host_mirror_is_authoritative_for_runtime_options(self) -> None:
+        agent = _agent({"enabled": True, "effort": "xhigh"})
+        info = _session_info(
+            agent,
+            {
+                "_compute_host_active": True,
+                "_metadata_mirror": {
+                    "model": "gpt-5.6-sol-900k",
+                    "provider": "openai-codex",
+                    "reasoning_effort": "high",
+                    "service_tier": "",
+                    "fast": False,
+                },
+                "session_key": "host-session",
+            },
+        )
+        assert info["model"] == "gpt-5.6-sol-900k"
+        assert info["reasoning_effort"] == "high"
+        assert info["fast"] is False
+
 
 class TestConfigSetReasoningSessionScope:
     """Session-targeted reasoning changes must not touch global config."""
@@ -80,6 +100,19 @@ class TestConfigSetReasoningSessionScope:
             resp = self._dispatch({"key": "reasoning", "value": "low"})
         assert resp["result"]["value"] == "low"
         write_key.assert_called_once_with("agent.reasoning_effort", "low")
+
+    def test_unknown_explicit_session_is_terminal_and_never_global(self) -> None:
+        with patch.object(server, "_write_config_key") as write_key:
+            resp = self._dispatch(
+                {
+                    "key": "reasoning",
+                    "session_id": "missing-runtime",
+                    "value": "low",
+                }
+            )
+
+        assert resp["error"]["code"] == 4001
+        write_key.assert_not_called()
 
     def test_unknown_value_rejected(self) -> None:
         resp = self._dispatch({"key": "reasoning", "value": "bogus"})

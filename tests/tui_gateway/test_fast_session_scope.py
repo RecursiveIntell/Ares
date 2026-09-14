@@ -107,6 +107,19 @@ class TestConfigSetFastSessionScope:
         assert resp["result"]["value"] == "normal"
         write_key.assert_called_once_with("agent.service_tier", "normal")
 
+    def test_unknown_explicit_session_is_terminal_and_never_global(self) -> None:
+        with patch.object(server, "_write_config_key") as write_key:
+            resp = _set(
+                {
+                    "key": "fast",
+                    "session_id": "missing-runtime",
+                    "value": "normal",
+                }
+            )
+
+        assert resp["error"]["code"] == 4001
+        write_key.assert_not_called()
+
 
 class TestConfigGetFastSessionScope:
     def test_reads_prebuild_pin(self) -> None:

@@ -6914,9 +6914,16 @@ def _session_info(agent, session: dict | None = None) -> dict:
     )
     cfg_personality = ((_load_cfg().get("display") or {}).get("personality") or "")
     personality = (session or {}).get("personality", cfg_personality)
-    reasoning_config = getattr(agent, "reasoning_config", None)
+    host_owned = bool(
+        session
+        and (session.get("_compute_host_active") or session.get("agent_ready") is not None)
+        and mirror
+    )
+    reasoning_config = None if host_owned else getattr(agent, "reasoning_config", None)
     reasoning_effort = ""
-    if isinstance(reasoning_config, dict):
+    if host_owned and "reasoning_effort" in mirror:
+        reasoning_effort = str(mirror.get("reasoning_effort") or "")
+    elif isinstance(reasoning_config, dict):
         if reasoning_config.get("enabled") is False:
             # Disabled must be distinguishable from unset ("" = provider
             # default). Reporting "" here made the desktop adopt the empty
@@ -6925,7 +6932,11 @@ def _session_info(agent, session: dict | None = None) -> dict:
             reasoning_effort = "none"
         else:
             reasoning_effort = str(reasoning_config.get("effort", "") or "")
-    service_tier = getattr(agent, "service_tier", None) or mirror.get("service_tier") or ""
+    service_tier = (
+        str(mirror.get("service_tier") or "")
+        if host_owned and "service_tier" in mirror
+        else getattr(agent, "service_tier", None) or mirror.get("service_tier") or ""
+    )
     # Effective approval-bypass state — the same three sources that
     # check_all_command_guards() ORs together: persistent config
     # (approvals.mode=off), the process-scoped --yolo env, and the
@@ -6968,7 +6979,11 @@ def _session_info(agent, session: dict | None = None) -> dict:
         or mirror.get("provider", getattr(agent, "provider", "")),
         "reasoning_effort": reasoning_effort,
         "service_tier": service_tier,
-        "fast": service_tier == "priority",
+        "fast": (
+            bool(mirror.get("fast"))
+            if host_owned and "fast" in mirror
+            else service_tier == "priority"
+        ),
         "yolo": yolo,
         "approval_mode": approval_mode,
         "tools": dict(mirror.get("tools") or {}) if isinstance(mirror.get("tools"), dict) else {},
@@ -13361,7 +13376,42 @@ def _respond(rid, params, key, *, allow_expired=False):
 @method("config.set")
 def _(rid, params: dict) -> dict:
     key, value = params.get("key", ""), params.get("value", "")
-    session = _sessions.get(params.get("session_id", ""))
+    requested_session_id = params.get("session_id")
+    session = _sessions.get(requested_session_id or "")
+
+    # A supplied runtime id is an identity claim, not a best-effort hint. A
+    # missing explicit runtime must recover through the durable-session owner;
+    # it must never fall through to the profile-global write branches below.
+    if requested_session_id not in (None, "") and session is None:
+        return _err(rid, 4001, "session not found")
+
+    # In turn-isolation mode the serving process may retain a warm shadow agent,
+    # but the compute host owns the live agent and durable metadata. Route these
+    # session-scoped option mutations to that owner before the inline handlers
+    # can touch the shadow.
+    if (
+        key in {"fast", "reasoning"}
+        and session is not None
+        and _session_uses_compute_host(session)
+    ):
+        sid = str(requested_session_id or "")
+        try:
+            ack = _send_compute_host_control(
+                sid,
+                route_name="session.runtime.configure",
+                payload={"params": {"key": key, "value": value}},
+                wait=True,
+                timeout=30.0,
+            )
+        except Exception as exc:
+            return _err(rid, 5019, f"compute-host runtime option update failed: {exc}")
+        if ack.get("type") in {"control.error", "error"}:
+            return _err(rid, 5001, str(ack.get("message") or "runtime option update failed"))
+        _apply_compute_host_metadata_mirror(session, ack)
+        result = ack.get("result")
+        if not isinstance(result, dict):
+            return _err(rid, 5001, "compute-host runtime option update returned an invalid response")
+        return _ok(rid, result)
 
     if key == "model":
         try:

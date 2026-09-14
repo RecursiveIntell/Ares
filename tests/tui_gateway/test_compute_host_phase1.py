@@ -6,6 +6,7 @@ import threading
 import time
 import types
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -147,6 +148,7 @@ def test_compute_host_workers_inherit_tui_pool_env_or_8(monkeypatch):
 def test_mutator_route_table_matches_prd_inventory():
     assert MUTATOR_ROUTE_TABLE == {
         "config.set.model": "run-concurrent",
+        "session.runtime.configure": "run-concurrent",
         "prompt.submit": "turn-path",
         "session.interrupt": "turn-path",
         "reload.mcp": "run-concurrent",
@@ -161,6 +163,57 @@ def test_mutator_route_table_matches_prd_inventory():
         "session.history.reload": "idle-gated",
         "slash.retry": "idle-gated",
     }
+
+
+def test_runtime_options_are_a_compute_host_mutator():
+    assert MUTATOR_ROUTE_TABLE["session.runtime.configure"] == "run-concurrent"
+
+
+def test_compute_host_runtime_options_dispatch_to_config_set(monkeypatch):
+    agent = types.SimpleNamespace(
+        model="gpt-5.6-sol-900k",
+        provider="openai-codex",
+        service_tier=None,
+        request_overrides={},
+        reasoning_config=None,
+        session_id="host-sid",
+    )
+    session = {
+        "agent": agent,
+        "session_key": "stored-host-session",
+        "history": [],
+        "history_lock": threading.Lock(),
+        "running": False,
+    }
+    monkeypatch.setattr(server, "_sessions", {"host-sid": session}, raising=False)
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: False)
+    monkeypatch.setattr(server, "_persist_live_session_runtime", lambda _session: None)
+    monkeypatch.setattr(server, "_session_info", lambda *_args: {"fast": True})
+
+    output = io.StringIO()
+    host = ComputeHost(stdout=output, heartbeat_secs=0)
+    try:
+        with patch(
+            "hermes_cli.models.resolve_fast_mode_overrides",
+            return_value={"service_tier": "priority"},
+        ):
+            host._handle_control(
+                {
+                    "type": "control",
+                    "sid": "host-sid",
+                    "request_id": "options-r1",
+                    "route_name": "session.runtime.configure",
+                    "params": {"key": "fast", "value": "fast"},
+                }
+            )
+    finally:
+        host.close()
+
+    frames = _json_lines(output)
+    assert frames[-1]["type"] == "control.ack"
+    assert frames[-1]["route_name"] == "session.runtime.configure"
+    assert frames[-1]["result"]["value"] == "fast"
+    assert agent.service_tier == "priority"
 
 
 def test_append_log_record_single_write_lines(tmp_path):
