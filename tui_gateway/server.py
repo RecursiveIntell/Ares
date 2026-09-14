@@ -13406,7 +13406,12 @@ def _(rid, params: dict) -> dict:
         except Exception as exc:
             return _err(rid, 5019, f"compute-host runtime option update failed: {exc}")
         if ack.get("type") in {"control.error", "error"}:
-            return _err(rid, 5001, str(ack.get("message") or "runtime option update failed"))
+            code = ack.get("code")
+            return _err(
+                rid,
+                int(code) if isinstance(code, int) else 5001,
+                str(ack.get("message") or "runtime option update failed"),
+            )
         _apply_compute_host_metadata_mirror(session, ack)
         result = ack.get("result")
         if not isinstance(result, dict):

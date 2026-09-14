@@ -120,6 +120,17 @@ class TestConfigSetFastSessionScope:
         assert resp["error"]["code"] == 4001
         write_key.assert_not_called()
 
+    def test_unknown_explicit_model_session_is_terminal(self) -> None:
+        resp = server._methods["config.set"](
+            "rid-model",
+            {
+                "key": "model",
+                "session_id": "missing-runtime",
+                "value": "gpt-5.6-sol-900k --provider openai-codex",
+            },
+        )
+        assert resp["error"]["code"] == 4001
+
 
 class TestConfigGetFastSessionScope:
     def test_reads_prebuild_pin(self) -> None:

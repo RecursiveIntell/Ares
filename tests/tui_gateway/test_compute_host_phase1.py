@@ -216,6 +216,47 @@ def test_compute_host_runtime_options_dispatch_to_config_set(monkeypatch):
     assert agent.service_tier == "priority"
 
 
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [("fast", "normal"), ("reasoning", "high")],
+)
+def test_serving_process_forwards_runtime_options_to_compute_host(monkeypatch, key, value):
+    agent = types.SimpleNamespace(
+        model="gpt-5.6-sol-900k",
+        provider="openai-codex",
+        service_tier="priority",
+        request_overrides={"service_tier": "priority"},
+        reasoning_config={"enabled": True, "effort": "xhigh"},
+    )
+    session = {
+        "agent": agent,
+        "agent_ready": threading.Event(),
+        "_compute_host_active": True,
+        "session_key": "stored-host-session",
+        "history_lock": threading.Lock(),
+    }
+    calls = []
+    monkeypatch.setattr(server, "_sessions", {"host-sid": session}, raising=False)
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: True)
+    monkeypatch.setattr(server, "_apply_compute_host_metadata_mirror", lambda *_args: None)
+    monkeypatch.setattr(
+        server,
+        "_send_compute_host_control",
+        lambda *args, **kwargs: calls.append((args, kwargs))
+        or {"type": "control.ack", "result": {"key": key, "value": value}},
+    )
+
+    response = server._methods["config.set"](
+        "rid-options",
+        {"session_id": "host-sid", "key": key, "value": value},
+    )
+
+    assert response["result"] == {"key": key, "value": value}
+    assert calls[0][1]["route_name"] == "session.runtime.configure"
+    assert calls[0][1]["payload"]["params"] == {"key": key, "value": value}
+    assert agent.service_tier == "priority"
+
+
 def test_append_log_record_single_write_lines(tmp_path):
     path = tmp_path / "agent.log"
 

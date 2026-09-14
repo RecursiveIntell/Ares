@@ -736,6 +736,7 @@ class ComputeHost:
                             "type": "control.error",
                             "sid": sid,
                             "request_id": request_id,
+                            "code": response["error"].get("code"),
                             "message": str(response["error"].get("message") or "model switch failed"),
                         }
                     )
@@ -768,6 +769,7 @@ class ComputeHost:
                             "type": "control.error",
                             "sid": sid,
                             "request_id": request_id,
+                            "code": response["error"].get("code"),
                             "message": str(response["error"].get("message") or "runtime option update failed"),
                         }
                     )
