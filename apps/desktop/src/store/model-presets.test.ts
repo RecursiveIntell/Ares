@@ -1,5 +1,8 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 
+import { createClientSessionState } from '@/lib/chat-runtime'
+import { type SessionTileDelegate, setSessionTileDelegate } from './session-states'
+
 import { $modelPresets, applyModelPreset, getModelPreset, modelPresetKey, setModelPreset } from './model-presets'
 import { $currentFastMode, $currentReasoningEffort, setCurrentFastMode, setCurrentReasoningEffort } from './session'
 
@@ -8,6 +11,7 @@ describe('model presets', () => {
     $modelPresets.set({})
     setCurrentFastMode(false)
     setCurrentReasoningEffort('')
+    setSessionTileDelegate({} as never)
   })
 
   it('round-trips a preset and merges patches without dropping prior fields', () => {
@@ -54,5 +58,23 @@ describe('model presets', () => {
     expect($currentReasoningEffort.get()).toBe('high')
     expect($currentFastMode.get()).toBe(true)
     expect(calls).toEqual([])
+  })
+
+  it('updates the primary runtime slice when applying a live-session preset', async () => {
+    let state = createClientSessionState('stored-1')
+    setSessionTileDelegate({
+      updateSession: (_runtimeId: string, updater: Parameters<SessionTileDelegate['updateSession']>[1]) => {
+        state = updater(state)
+        return state
+      }
+    } as SessionTileDelegate)
+
+    await applyModelPreset(
+      { effort: 'high', fast: true },
+      { failMessage: 'x', primary: true, request: async <T>() => ({} as T), sessionId: 'runtime-1' }
+    )
+
+    expect(state.reasoningEffort).toBe('high')
+    expect(state.fast).toBe(true)
   })
 })

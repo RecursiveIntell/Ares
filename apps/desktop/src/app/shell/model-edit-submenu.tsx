@@ -76,7 +76,10 @@ interface ModelEditSubmenuProps {
   /** This row's model id. */
   model: string
   /** Switch to a specific model id (used to swap base ⇄ -fast variant). */
-  onSelectModel: (model: string) => Promise<boolean | void> | void
+  onSelectModel: (
+    model: string,
+    options?: { fast?: boolean; presetModel?: string }
+  ) => Promise<boolean | void> | void
   /** Report an option change. This submenu is PURE: it never writes to a
    *  session, a preset store, or the gateway itself — the owning surface's
    *  controller decides what an edit means. That's what lets the same submenu
@@ -107,6 +110,7 @@ function ModelEditSubmenuBody({
   effort,
   fastControl,
   isActive,
+  model,
   onSelectModel,
   onSetOptions,
   reasoning
@@ -120,13 +124,15 @@ function ModelEditSubmenuBody({
 
   const setFast = (enabled: boolean) => {
     if (fastControl.kind === 'variant') {
-      // Fast is a separate model id. Report the choice so the controller can
-      // record it against the base model, and only swap models now if this is
-      // the active row — inactive edits stay preference-only.
-      onSetOptions({ fast: enabled })
-
+      // Fast is a separate model id. The active row is a model transition,
+      // not a service-tier parameter write. Inactive rows remain preference-only.
       if (isActive) {
-        void onSelectModel(enabled ? fastControl.fastId : fastControl.baseId)
+        void onSelectModel(enabled ? fastControl.fastId : fastControl.baseId, {
+          fast: enabled,
+          presetModel: model
+        })
+      } else {
+        onSetOptions({ fast: enabled })
       }
 
       return

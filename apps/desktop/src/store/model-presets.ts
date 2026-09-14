@@ -72,8 +72,16 @@ export async function applyModelPreset(
     if (fast !== undefined) {
       setCurrentFastMode(fast)
     }
+
+    if (ctx.sessionId) {
+      sessionTileDelegate()?.updateSession?.(ctx.sessionId, state => ({
+        ...state,
+        ...(effort !== undefined ? { reasoningEffort: effort } : {}),
+        ...(fast !== undefined ? { fast } : {})
+      }))
+    }
   } else if (ctx.sessionId) {
-    sessionTileDelegate()?.updateSession(ctx.sessionId, state => ({
+    sessionTileDelegate()?.updateSession?.(ctx.sessionId, state => ({
       ...state,
       ...(effort !== undefined ? { reasoningEffort: effort } : {}),
       ...(fast !== undefined ? { fast } : {})

@@ -1,6 +1,6 @@
 import { useStore } from '@nanostores/react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 
 import { useSessionView } from '@/app/chat/session-view'
 import { Codicon } from '@/components/ui/codicon'
@@ -52,6 +52,7 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
   const { t } = useI18n()
   const copy = t.shell.modelMenu
   const [refreshing, setRefreshing] = useState(false)
+  const optionGenerationRef = useRef(0)
   const queryClient = useQueryClient()
   // Bind to THIS surface's SessionView (primary or tile) so each pane's menu
   // shows/switches its own model — not the primary-only globals.
@@ -125,10 +126,14 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
 
   // Push a reasoning change onto the session that owns it, with rollback.
   const patchReasoning = async (next: string, previous: string, provider: string, model: string) => {
+    const generation = ++optionGenerationRef.current
+
     if (touchesPrimary) {
       markComposerSelectionManual()
       setCurrentReasoningEffort(next)
-    } else if (activeSessionId) {
+    }
+
+    if (activeSessionId) {
       sessionTileDelegate()?.updateSession(activeSessionId, state => ({ ...state, reasoningEffort: next }))
     }
 
@@ -142,22 +147,28 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
     try {
       await requestGateway('config.set', { key: 'reasoning', session_id: activeSessionId, value: next })
     } catch (err) {
-      if (touchesPrimary) {
-        setCurrentReasoningEffort(previous)
-      } else {
-        sessionTileDelegate()?.updateSession(activeSessionId, state => ({ ...state, reasoningEffort: previous }))
+      if (generation !== optionGenerationRef.current) {
+        return
       }
 
+      if (touchesPrimary) {
+        setCurrentReasoningEffort(previous)
+      }
+      sessionTileDelegate()?.updateSession(activeSessionId, state => ({ ...state, reasoningEffort: previous }))
       setModelPreset(provider, model, { effort: previous })
       notifyError(err, t.shell.modelOptions.updateFailed)
     }
   }
 
   const patchFast = async (enabled: boolean, provider: string, model: string) => {
+    const generation = ++optionGenerationRef.current
+
     if (touchesPrimary) {
       markComposerSelectionManual()
       setCurrentFastMode(enabled)
-    } else if (activeSessionId) {
+    }
+
+    if (activeSessionId) {
       sessionTileDelegate()?.updateSession(activeSessionId, state => ({ ...state, fast: enabled }))
     }
 
@@ -172,12 +183,14 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
         value: enabled ? 'fast' : 'normal'
       })
     } catch (err) {
-      if (touchesPrimary) {
-        setCurrentFastMode(!enabled)
-      } else {
-        sessionTileDelegate()?.updateSession(activeSessionId, state => ({ ...state, fast: !enabled }))
+      if (generation !== optionGenerationRef.current) {
+        return
       }
 
+      if (touchesPrimary) {
+        setCurrentFastMode(!enabled)
+      }
+      sessionTileDelegate()?.updateSession(activeSessionId, state => ({ ...state, fast: !enabled }))
       setModelPreset(provider, model, { fast: !enabled })
       notifyError(err, t.shell.modelOptions.fastFailed)
     }
@@ -210,7 +223,16 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
     // scopes the switch to that session; with none it's UI state shipped on the
     // next session.create. Always stamp sessionId from this surface so a tile
     // switch never hits the primary (busy) session by accident.
-    select: (model, provider) => onSelectModel({ model, provider, sessionId: activeSessionId || null }),
+    select: (
+      model: string,
+      provider: string,
+      options?: { fast?: boolean; presetModel?: string }
+    ) => {
+      if (options?.fast !== undefined) {
+        setModelPreset(provider, options.presetModel ?? model, { fast: options.fast })
+      }
+      return onSelectModel({ model, provider, sessionId: activeSessionId || null })
+    },
 
     setOptions: (patch, row) => {
       // Editing always records the model's global preset (keyed by

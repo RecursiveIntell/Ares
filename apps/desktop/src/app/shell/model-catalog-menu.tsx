@@ -80,7 +80,11 @@ export interface ModelMenuController {
   current: ModelChoice
   presetFor: (provider: string, model: string) => { effort?: string; fast?: boolean }
   /** Commit a model row. Return false to abort (a failed session switch). */
-  select: (model: string, provider: string) => Promise<boolean | void> | void
+  select: (
+    model: string,
+    provider: string,
+    options?: { fast?: boolean; presetModel?: string }
+  ) => Promise<boolean | void> | void
   /** Edit ONE option on a row. `isActive` says whether it's the current model. */
   setOptions: (
     patch: { effort?: string; fast?: boolean },
@@ -507,7 +511,7 @@ export function ModelCatalogMenu({
                           fastControl={fastControl}
                           isActive={isCurrent}
                           model={family.id}
-                          onSelectModel={nextModel => controller.select(nextModel, group.provider.slug)}
+                          onSelectModel={(nextModel, options) => controller.select(nextModel, group.provider.slug, options)}
                           onSetOptions={patch =>
                             controller.setOptions(patch, {
                               isActive: isCurrent,
