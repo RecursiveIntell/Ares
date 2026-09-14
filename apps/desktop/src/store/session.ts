@@ -1139,6 +1139,9 @@ export const setCurrentReasoningEffort = (next: Updater<string>) => {
   persistString(COMPOSER_EFFORT_KEY, $currentReasoningEffort.get() || null)
 }
 
+/** Mirror live-session metadata without changing the next-draft preference. */
+export const setCurrentReasoningEffortTransient = (next: Updater<string>) => updateAtom($currentReasoningEffort, next)
+
 // The profile's `agent.reasoning_effort`, mirrored from config so surfaces that
 // need to render or apply "the default" resolve the user's configured level
 // instead of assuming DEFAULT_REASONING_EFFORT (lib/reasoning-effort). Empty
@@ -1153,6 +1156,9 @@ export const setCurrentFastMode = (next: Updater<boolean>) => {
   updateAtom($currentFastMode, next)
   persistBoolean(COMPOSER_FAST_KEY, $currentFastMode.get())
 }
+
+/** Mirror live-session metadata without changing the next-draft preference. */
+export const setCurrentFastModeTransient = (next: Updater<boolean>) => updateAtom($currentFastMode, next)
 
 export const setYoloActive = (next: Updater<boolean>) => updateAtom($yoloActive, next)
 

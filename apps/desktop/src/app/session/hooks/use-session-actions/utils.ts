@@ -19,11 +19,11 @@ import {
   setCronSessions,
   setCurrentBranch,
   setCurrentCwdTransient,
-  setCurrentFastMode,
+  setCurrentFastModeTransient,
   setCurrentModel,
   setCurrentPersonality,
   setCurrentProvider,
-  setCurrentReasoningEffort,
+  setCurrentReasoningEffortTransient,
   setCurrentServiceTier,
   setCurrentUsage,
   setMessagingSessions,
@@ -1582,7 +1582,7 @@ function publishRuntimeToComposer(state: SessionRuntimeStatePatch): void {
   }
 
   if (state.reasoningEffort !== undefined) {
-    setCurrentReasoningEffort(state.reasoningEffort)
+    setCurrentReasoningEffortTransient(state.reasoningEffort)
   }
 
   if (state.serviceTier !== undefined) {
@@ -1590,7 +1590,7 @@ function publishRuntimeToComposer(state: SessionRuntimeStatePatch): void {
   }
 
   if (state.fast !== undefined) {
-    setCurrentFastMode(state.fast)
+    setCurrentFastModeTransient(state.fast)
   }
 
   if (state.yolo !== undefined) {
@@ -1678,9 +1678,9 @@ export function applyStoredSessionPreviewRuntimeInfo(
 ) {
   setCurrentModel(stored?.model || '')
   setCurrentProvider('')
-  setCurrentReasoningEffort('')
+  setCurrentReasoningEffortTransient('')
   setCurrentServiceTier('')
-  setCurrentFastMode(false)
+  setCurrentFastModeTransient(false)
   setYoloActive(false)
   setCurrentPersonality('')
 
