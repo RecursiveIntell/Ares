@@ -756,7 +756,12 @@ class ComputeHost:
                 params = frame.get("params")
                 if not isinstance(params, dict):
                     params = {}
-                response = server._methods["config.set"](
+                method_name = (
+                    "session.runtime.configure"
+                    if "intent_id" in params or "model" in params or "reasoning" in params or "fast" in params
+                    else "config.set"
+                )
+                response = server._methods[method_name](
                     request_id,
                     {
                         **params,

@@ -13,13 +13,17 @@ import {
   $activeSessionId,
   $currentModel,
   $currentProvider,
+  $currentFastMode,
+  $currentReasoningEffort,
   $selectedStoredSessionId,
   getComposerSelectionGeneration,
   getCurrentModelSource,
   markComposerSelectionManual,
   setCurrentModel,
   setCurrentModelSource,
-  setCurrentProvider
+  setCurrentProvider,
+  setCurrentFastMode,
+  setCurrentReasoningEffort
 } from '@/store/session'
 import { isSessionGoneError } from '@/store/session-gone'
 import { $sessionStates, sessionTileDelegate } from '@/store/session-states'
@@ -49,6 +53,7 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
   const { t } = useI18n()
   const copy = t.desktop
   const profileRefreshEpochRef = useRef(0)
+  const runtimeOptionIntentSequenceRef = useRef(0)
 
   // All callbacks here read reactive session state from the store (.get())
   // rather than capturing it as a prop. The actions bag in wiring.tsx mutates
@@ -211,6 +216,12 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
         ? $currentProvider.get()
         : ($sessionStates.get()[liveSessionId!]?.provider ?? '')
 
+      const prevReasoningEffort = touchesPrimary
+        ? $currentReasoningEffort.get()
+        : ($sessionStates.get()[liveSessionId!]?.reasoningEffort ?? '')
+
+      const prevFast = touchesPrimary ? $currentFastMode.get() : ($sessionStates.get()[liveSessionId!]?.fast ?? false)
+
       const prevSource = getCurrentModelSource()
       const liveGatewayProfile = $activeGatewayProfile.get()
 
@@ -221,7 +232,12 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
         ? ($sessionStates.get()[liveSessionId]?.storedSessionId ?? (touchesPrimary ? $selectedStoredSessionId.get() : null))
         : null
 
-      const updateLiveRuntimeSelection = (model: string, provider: string, optimistic = true) => {
+      const updateLiveRuntimeSelection = (
+        model: string,
+        provider: string,
+        optimistic = true,
+        options: ModelSelection['options'] = selection.options
+      ) => {
         if (!liveSessionId) {
           return
         }
@@ -248,9 +264,22 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
                 state.pendingModelSelection.previousModel === pendingModelSelection.previousModel &&
                 state.pendingModelSelection.previousProvider === pendingModelSelection.previousProvider
 
-          return state.model === model && state.provider === provider && pendingMatches
+          const nextState = {
+            ...state,
+            model,
+            provider,
+            ...(options?.effort !== undefined ? { reasoningEffort: options.effort } : {}),
+            ...(options?.fast !== undefined ? { fast: options.fast } : {}),
+            pendingModelSelection
+          }
+
+          return state.model === nextState.model &&
+            state.provider === nextState.provider &&
+            state.reasoningEffort === nextState.reasoningEffort &&
+            state.fast === nextState.fast &&
+            pendingMatches
             ? state
-            : { ...state, model, provider, pendingModelSelection }
+            : nextState
         })
       }
 
@@ -280,6 +309,14 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
         // foreground globals and must not remain as a false applied switch.
         updateLiveRuntimeSelection(prevModel, prevProvider, false)
 
+        if (liveSessionId) {
+          sessionTileDelegate()?.updateSession?.(liveSessionId, state => ({
+            ...state,
+            reasoningEffort: prevReasoningEffort,
+            fast: prevFast
+          }))
+        }
+
         if (touchesPrimary) {
           if (!stillOwnsPrimarySelection()) {
             return
@@ -287,6 +324,8 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
 
           setCurrentModel(prevModel)
           setCurrentProvider(prevProvider)
+          setCurrentReasoningEffort(prevReasoningEffort)
+          setCurrentFastMode(prevFast)
           setCurrentModelSource(prevSource)
         }
 
@@ -319,13 +358,37 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
       const persistsAsDefault = touchesPrimary && !isSessionOnlyPreset
       const scope = persistsAsDefault ? '--global' : '--session'
 
-      const requestSwitch = (confirmExpensiveModel = false) =>
-        requestGateway<ModelSwitchResponse>('config.set', {
+      const runtimeOptionIntentId = `desktop-model-options-${++runtimeOptionIntentSequenceRef.current}`
+      const requestSwitch = (confirmExpensiveModel = false) => {
+        if (selection.options && Object.keys(selection.options).length > 0) {
+          return requestGateway<ModelSwitchResponse>('session.runtime.configure', {
+            intent_id: runtimeOptionIntentId,
+            model: {
+              confirm_expensive_model: confirmExpensiveModel,
+              id: selection.model,
+              persist_profile_default: persistsAsDefault,
+              provider: selection.provider
+            },
+            ...(selection.options.effort !== undefined
+              ? {
+                  reasoning:
+                    selection.options.effort === 'none'
+                      ? { mode: 'off' }
+                      : { effort: selection.options.effort, mode: 'effort' }
+                }
+              : {}),
+            ...(selection.options.fast !== undefined ? { fast: selection.options.fast ? 'fast' : 'normal' } : {}),
+            session_id: liveSessionId
+          })
+        }
+
+        return requestGateway<ModelSwitchResponse>('config.set', {
           session_id: liveSessionId,
           key: 'model',
           value: `${selection.model} --provider ${selection.provider} ${scope}`,
           ...(confirmExpensiveModel ? { confirm_expensive_model: true } : {})
         })
+      }
 
       let recoveryAttempted = false
 

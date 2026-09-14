@@ -30,6 +30,7 @@ export { ModelMenuCloseContext } from './model-catalog-menu'
 export interface ModelSelection {
   model: string
   provider: string
+  options?: { effort?: string; fast?: boolean }
   /** Runtime id of the surface that opened the menu. When set, the switch
    *  targets that session (a tile) instead of the primary `$activeSessionId`. */
   sessionId?: null | string
@@ -145,7 +146,11 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
     }
 
     try {
-      await requestGateway('config.set', { key: 'reasoning', session_id: activeSessionId, value: next })
+      await requestGateway('session.runtime.configure', {
+        session_id: activeSessionId,
+        intent_id: `desktop-runtime-options-${generation}`,
+        reasoning: next === 'none' ? { mode: 'off' } : { effort: next, mode: 'effort' }
+      })
     } catch (err) {
       if (generation !== optionGenerationRef.current) {
         return
@@ -177,10 +182,10 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
     }
 
     try {
-      await requestGateway('config.set', {
-        key: 'fast',
+      await requestGateway('session.runtime.configure', {
         session_id: activeSessionId,
-        value: enabled ? 'fast' : 'normal'
+        intent_id: `desktop-runtime-options-${generation}`,
+        fast: enabled ? 'fast' : 'normal'
       })
     } catch (err) {
       if (generation !== optionGenerationRef.current) {
@@ -226,12 +231,35 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
     select: (
       model: string,
       provider: string,
-      options?: { fast?: boolean; presetModel?: string }
-    ) => {
-      if (options?.fast !== undefined) {
-        setModelPreset(provider, options.presetModel ?? model, { fast: options.fast })
+      options?: {
+        applyFast?: boolean
+        preset?: { effort?: string; fast?: boolean }
+        presetModel?: string
       }
-      return onSelectModel({ model, provider, sessionId: activeSessionId || null })
+    ) => {
+      const preset = options?.preset
+      if (preset) {
+        setModelPreset(provider, options.presetModel ?? model, preset)
+        if (!activeSessionId) {
+          if (preset.effort !== undefined) {
+            setCurrentReasoningEffort(preset.effort)
+          }
+          if (preset.fast !== undefined) {
+            setCurrentFastMode(preset.fast)
+          }
+        }
+      }
+      return onSelectModel({
+        model,
+        options: preset
+          ? {
+              ...(preset.effort !== undefined ? { effort: preset.effort } : {}),
+              ...(options?.applyFast !== false && preset.fast !== undefined ? { fast: preset.fast } : {})
+            }
+          : undefined,
+        provider,
+        sessionId: activeSessionId || null
+      })
     },
 
     setOptions: (patch, row) => {

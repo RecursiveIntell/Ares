@@ -200,6 +200,7 @@ describe('ModelMenuPanel search', () => {
     await vi.waitFor(() => {
       expect(onSelectModel).toHaveBeenCalledWith({
         model: 'gemini-3.1-pro',
+        options: { effort: 'medium' },
         provider: 'google',
         sessionId: 'runtime-1'
       })
@@ -237,6 +238,7 @@ describe('ModelMenuPanel search', () => {
     await vi.waitFor(() => {
       expect(onSelectModel).toHaveBeenCalledWith({
         model: 'gemini-2.5-flash',
+        options: { effort: 'medium' },
         provider: 'google',
         sessionId: 'runtime-1'
       })

@@ -41,7 +41,14 @@ describe('model presets', () => {
     await applyModelPreset({ effort: 'high' }, { failMessage: 'x', request, sessionId: 's1' })
     await applyModelPreset({}, { failMessage: 'x', request, sessionId: 's1' })
 
-    expect(calls).toEqual([{ method: 'config.set', params: { key: 'reasoning', session_id: 's1', value: 'high' } }])
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toMatchObject({
+      method: 'session.runtime.configure',
+      params: {
+        reasoning: { effort: 'high', mode: 'effort' },
+        session_id: 's1'
+      }
+    })
   })
 
   it('applies a fresh-draft preset locally without mutating gateway config', async () => {

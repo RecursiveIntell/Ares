@@ -83,7 +83,11 @@ export interface ModelMenuController {
   select: (
     model: string,
     provider: string,
-    options?: { fast?: boolean; presetModel?: string }
+    options?: {
+      applyFast?: boolean
+      preset?: { effort?: string; fast?: boolean }
+      presetModel?: string
+    }
   ) => Promise<boolean | void> | void
   /** Edit ONE option on a row. `isActive` says whether it's the current model. */
   setOptions: (
@@ -248,17 +252,20 @@ export function ModelCatalogMenu({
     const variantFast = !(caps?.fast ?? false) && !!family.fastId
     const targetId = variantFast && preset.fast === true ? family.fastId! : family.id
 
-    if ((await controller.select(targetId, provider.slug)) === false) {
-      return
+    const resolvedPreset = {
+      effort: (caps?.reasoning ?? true) ? (preset.effort ?? defaultEffort) : undefined,
+      fast: (caps?.fast ?? false) ? (preset.fast ?? false) : undefined
     }
 
-    controller.applyPreset(
-      {
-        effort: (caps?.reasoning ?? true) ? (preset.effort ?? defaultEffort) : undefined,
-        fast: (caps?.fast ?? false) ? (preset.fast ?? false) : undefined
-      },
-      { model: family.id, provider: provider.slug }
-    )
+    if (
+      (await controller.select(targetId, provider.slug, {
+        applyFast: caps?.fast ?? false,
+        preset: resolvedPreset,
+        presetModel: family.id
+      })) === false
+    ) {
+      return
+    }
   }
 
   const selectMoaPreset = async (preset: string) => {

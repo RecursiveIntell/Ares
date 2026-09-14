@@ -13370,6 +13370,121 @@ def _respond(rid, params, key, *, allow_expired=False):
 # NOTE: config.set intentionally stays in server.py for now — the in-flight
 # opt/model-resolution-core PR touches its body; move it to methods_config.py
 # in a follow-up once that PR lands.
+def _runtime_configure_inline(rid, params: dict) -> dict:
+    from tui_gateway.session_runtime_options import model_switch_value, normalize_runtime_configure
+
+    try:
+        normalized = normalize_runtime_configure(params)
+    except ValueError as exc:
+        return _err(rid, 4002, str(exc))
+
+    sid = normalized["session_id"]
+    session = _sessions.get(sid)
+    if session is None:
+        return _err(rid, 4001, "session not found")
+
+    results: dict[str, Any] = {}
+    model = normalized.get("model")
+    if model is not None:
+        response = _methods["config.set"](
+            rid,
+            {
+                "session_id": sid,
+                "key": "model",
+                "value": model_switch_value(model),
+                **({"confirm_expensive_model": True} if model["confirm_expensive_model"] else {}),
+            },
+        )
+        if "error" in response:
+            return response
+        model_result = response.get("result") or {}
+        if model_result.get("confirm_required"):
+            return response
+        results["model"] = model_result
+        if model_result.get("deferred"):
+            session["pending_runtime_options"] = normalized
+            return _ok(
+                rid,
+                {
+                    "intent_id": normalized["intent_id"],
+                    "status": "deferred",
+                    "model": model_result,
+                },
+            )
+
+    reasoning = normalized.get("reasoning")
+    if reasoning is not None and reasoning["mode"] != "inherit":
+        value = "none" if reasoning["mode"] == "off" else reasoning["effort"]
+        response = _methods["config.set"](
+            rid,
+            {"session_id": sid, "key": "reasoning", "value": value},
+        )
+        if "error" in response:
+            return response
+        results["reasoning"] = response.get("result") or {}
+
+    fast = normalized.get("fast")
+    if fast is not None and fast != "inherit":
+        response = _methods["config.set"](
+            rid,
+            {"session_id": sid, "key": "fast", "value": fast},
+        )
+        if "error" in response:
+            return response
+        results["fast"] = response.get("result") or {}
+
+    return _ok(
+        rid,
+        {
+            "intent_id": normalized["intent_id"],
+            "status": "applied",
+            "results": results,
+            "session_info": _session_info(session.get("agent"), session),
+        },
+    )
+
+
+@method("session.runtime.configure")
+def _(rid, params: dict) -> dict:
+    from tui_gateway.session_runtime_options import normalize_runtime_configure
+
+    try:
+        normalized = normalize_runtime_configure(params)
+    except ValueError as exc:
+        return _err(rid, 4002, str(exc))
+
+    sid = normalized["session_id"]
+    session = _sessions.get(sid)
+    if session is None:
+        return _err(rid, 4001, "session not found")
+
+    if _session_uses_compute_host(session):
+        try:
+            ack = _send_compute_host_control(
+                sid,
+                route_name="session.runtime.configure",
+                payload={"params": normalized},
+                wait=True,
+                timeout=30.0,
+            )
+        except Exception as exc:
+            return _err(rid, 5019, f"compute-host runtime option update failed: {exc}")
+        if ack.get("type") in {"control.error", "error"}:
+            code = ack.get("code")
+            return _err(
+                rid,
+                int(code) if isinstance(code, int) else 5001,
+                str(ack.get("message") or "runtime option update failed"),
+            )
+        _apply_compute_host_metadata_mirror(session, ack)
+        result = ack.get("result")
+        if not isinstance(result, dict):
+            return _err(rid, 5001, "compute-host runtime option update returned an invalid response")
+        return _ok(rid, result)
+
+    return _runtime_configure_inline(rid, normalized)
+
+
 @method("config.set")
 def _(rid, params: dict) -> dict:
     key, value = params.get("key", ""), params.get("value", "")

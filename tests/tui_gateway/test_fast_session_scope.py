@@ -148,3 +148,29 @@ class TestConfigGetFastSessionScope:
         with patch.object(server, "_load_service_tier", return_value="priority"):
             resp = _get({"key": "fast"})
         assert resp["result"]["value"] == "fast"
+
+
+def test_runtime_configure_applies_a_compound_inline_option_request() -> None:
+    agent = _agent(None)
+    session = {"session_key": "compound", "agent": agent, "running": False}
+    with patch.dict(server._sessions, {"compound-runtime": session}, clear=False), \
+            patch.object(server, "_persist_live_session_runtime"), \
+            patch.object(server, "_emit"), \
+            patch.object(server, "_session_info", return_value={"fast": True}), \
+            patch(
+                "hermes_cli.models.resolve_fast_mode_overrides",
+                return_value=FAST_OVERRIDES,
+            ):
+        resp = server._methods["session.runtime.configure"](
+            "compound-rid",
+            {
+                "session_id": "compound-runtime",
+                "intent_id": "intent-1",
+                "reasoning": {"mode": "effort", "effort": "high"},
+                "fast": "fast",
+            },
+        )
+
+    assert resp["result"]["status"] == "applied"
+    assert agent.reasoning_config == {"enabled": True, "effort": "high"}
+    assert agent.service_tier == "priority"

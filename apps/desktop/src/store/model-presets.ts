@@ -18,6 +18,13 @@ export interface ModelPreset {
 
 type RequestGateway = <T>(method: string, params?: Record<string, unknown>) => Promise<T>
 
+let runtimeOptionIntentSequence = 0
+
+function nextRuntimeOptionIntentId(): string {
+  runtimeOptionIntentSequence += 1
+  return `desktop-runtime-options-${runtimeOptionIntentSequence}`
+}
+
 /** Stable `provider::model` key (matches the visibility-store format). */
 export const modelPresetKey = (provider: string, model: string): string => `${provider}::${model}`
 
@@ -92,14 +99,25 @@ export async function applyModelPreset(
     return
   }
 
+  if (effort === undefined && fast === undefined) {
+    return
+  }
+
   try {
+    const options: Record<string, unknown> = {
+      session_id: ctx.sessionId,
+      intent_id: nextRuntimeOptionIntentId()
+    }
+
     if (effort !== undefined) {
-      await ctx.request('config.set', { key: 'reasoning', session_id: ctx.sessionId, value: effort })
+      options.reasoning = effort === 'none' ? { mode: 'off' } : { effort, mode: 'effort' }
     }
 
     if (fast !== undefined) {
-      await ctx.request('config.set', { key: 'fast', session_id: ctx.sessionId, value: fast ? 'fast' : 'normal' })
+      options.fast = fast ? 'fast' : 'normal'
     }
+
+    await ctx.request('session.runtime.configure', options)
   } catch (err) {
     notifyError(err, ctx.failMessage)
   }
