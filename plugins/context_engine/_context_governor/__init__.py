@@ -50,6 +50,11 @@ from plugins.context_engine._context_governor.protocol import (
 
 logger = logging.getLogger(__name__)
 
+# These certified commands intentionally return arrays on success. Keep the
+# allow-list explicit so malformed/object-vs-array responses from every other
+# command remain protocol failures rather than being widened implicitly.
+_CERTIFIED_LIST_RESULT_COMMANDS = frozenset({"pending-v2", "search"})
+
 # The provenance manifest is authenticated receipt metadata, not prompt-visible
 # context. Keep it bounded, but large enough for a real first compaction of a
 # 900K–1M-token session: the historical 128 KiB default rejected a receipt
@@ -578,7 +583,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
 
     def _run_certified_json(
         self, args: list[str], payload: dict[str, Any]
-    ) -> dict[str, Any]:
+    ) -> Any:
         capabilities = getattr(self, "_capabilities", None)
         if not isinstance(capabilities, dict):
             self.probe_activation()
@@ -2106,6 +2111,15 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             metadata["tool_calls"] = msg["tool_calls"]
         if msg.get("tool_call_id"):
             metadata["tool_call_id"] = msg["tool_call_id"]
+        if msg.get("_compressed_summary") is True or (
+            isinstance(msg.get("metadata"), dict)
+            and msg["metadata"].get("_compressed_summary") is True
+        ):
+            # This is the host's existing durable projection marker. Translate
+            # it back to the Context Governor-owned marker so recursive
+            # allocation can recompact derived summaries instead of promoting
+            # their text to an exact structural floor.
+            metadata["compressed_summary"] = True
         if metadata:
             out["metadata"] = metadata
         return out
@@ -2129,12 +2143,21 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             out["id"] = msg.get("id")
         # Restore OpenAI-specific fields from metadata
         if isinstance(metadata, dict):
+            governor_projection = metadata.get("compressed_summary") is True
             if isinstance(metadata.get("hermes_metadata"), dict):
                 out["metadata"] = copy.deepcopy(metadata["hermes_metadata"])
+                governor_projection = governor_projection or (
+                    out["metadata"].get("_compressed_summary") is True
+                )
             if metadata.get("tool_calls"):
                 out["tool_calls"] = metadata["tool_calls"]
             if metadata.get("tool_call_id"):
                 out["tool_call_id"] = metadata["tool_call_id"]
+            if governor_projection:
+                # Preserve the existing host marker across SessionDB's
+                # projection while keeping raw governor metadata off provider
+                # input. The next _message_to_governor call maps it back.
+                out["_compressed_summary"] = True
         return out
 
     @staticmethod
@@ -3474,7 +3497,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         payload: dict[str, Any],
         *,
         pass_fds: tuple[int, ...] = (),
-    ) -> dict[str, Any]:
+    ) -> Any:
         expect_failure_envelope = FAILURE_FLAG in args
         command = [str(self.binary), *args]
         popen_kwargs: dict[str, Any] = {
@@ -3528,10 +3551,17 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                     "Context Governor returned invalid JSON success output"
                 ) from exc
             raise
-        if not isinstance(result, dict) and expect_failure_envelope:
-            raise ContextGovernorProtocolError(
-                "Context Governor returned non-object certified success output"
-            )
+        if expect_failure_envelope:
+            command_name = args[0] if args else ""
+            if command_name in _CERTIFIED_LIST_RESULT_COMMANDS:
+                if not isinstance(result, list):
+                    raise ContextGovernorProtocolError(
+                        f"Context Governor {command_name} returned a non-array certified success output"
+                    )
+            elif not isinstance(result, dict):
+                raise ContextGovernorProtocolError(
+                    "Context Governor returned non-object certified success output"
+                )
         return result
 
     @staticmethod
@@ -3928,9 +3958,13 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                     session_db,
                     candidate_id,
                     repair_alternation=False,
+                    include_summary_markers=True,
                 )
             except TypeError:
-                durable = getter(session_db, candidate_id)
+                # A legacy reader without the authenticated projection marker
+                # cannot prove the pending host boundary. Do not fall back to a
+                # marker-free read or manufacture recovery success.
+                continue
             except Exception:
                 continue
             if isinstance(durable, list) and durable:

@@ -8,7 +8,7 @@ import { expect, test } from './test'
 
 const REPO_ROOT = path.resolve(import.meta.dirname, '..', '..', '..')
 const ARES_ROOT = REPO_ROOT
-const RUST_ROOT = path.resolve(REPO_ROOT, '..', 'recursive-agent-production-permit-20260830')
+const RUST_ROOT = path.resolve(REPO_ROOT, '..', 'recursive-agent')
 
 let fixture: NoProviderFixture | null = null
 

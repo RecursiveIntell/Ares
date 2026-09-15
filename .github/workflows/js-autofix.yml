@@ -206,6 +206,7 @@ jobs:
           if [ -z "$PR_NUM" ]; then
             # gh pr create prints the PR URL. Extract the number from it
             # (https://github.com/<org>/<repo>/pull/<number>).
+            # shellcheck disable=SC2016 # backticks are literal Markdown in CLI text
             PR_URL=$(gh pr create \
               --head "$BOT_BRANCH" --base main \
               --title 'fmt(js): `npm run fix` auto-fix' \
@@ -234,7 +235,7 @@ jobs:
           # Poll every 15s for up to ~10 minutes. Auto-merge will handle the
           # PR even if this job times out — the polling is for cleanup only
           # (auto-close on CI failure, conflicts, or main moving).
-          for i in $(seq 1 40); do
+          for _ in $(seq 1 40); do
             sleep 15
 
             STATE=$(gh pr view "$PR_NUM" --json state --jq '.state')

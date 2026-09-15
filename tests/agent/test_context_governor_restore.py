@@ -129,6 +129,26 @@ def test_protocol_probe_exercises_the_certified_two_phase_wire_contract():
 
 
 
+def test_governor_compressed_summary_marker_survives_host_roundtrip():
+    with patch("hermes_cli.config.load_config", return_value={}):
+        engine = ContextGovernorEngine(binary="/tmp/context-governor")
+
+    raw_summary = {
+        "id": "summary_ctxp_fixture",
+        "role": "assistant",
+        "name": "context_governor",
+        "content": "derived projection",
+        "metadata": {"compressed_summary": True},
+    }
+
+    host_summary = engine._message_from_governor(raw_summary)
+    assert host_summary.get("_compressed_summary") is True
+
+    roundtripped = engine._message_to_governor(host_summary, 0)
+    assert roundtripped["metadata"]["compressed_summary"] is True
+
+
+
 def test_legacy_rehydration_stops_at_bounded_store_size(monkeypatch, tmp_path):
     """A missing catalog must not scan every receipt in a large archive."""
     store = tmp_path / "governor"
@@ -533,9 +553,15 @@ def test_restart_reconciliation_failure_stays_bound_for_next_turn_retry():
     activation_attempts = 0
 
     class RestartedSessionDB:
-        def get_messages_as_conversation(self, session_id, repair_alternation=False):
+        def get_messages_as_conversation(
+            self,
+            session_id,
+            repair_alternation=False,
+            include_summary_markers=False,
+        ):
             assert session_id == "restart-lineage"
             assert repair_alternation is False
+            assert include_summary_markers is True
             return copy.deepcopy(messages)
 
         def get_compression_tip(self, session_id):
@@ -1767,6 +1793,76 @@ def test_host_alternation_repair_is_bound_into_the_receipt_projection():
 
 
 @pytest.mark.integration
+
+def test_real_binary_eight_generations_preserve_parent_prefix(tmp_path, monkeypatch):
+    """The live V2 engine must support a bounded eight-generation chain."""
+    binary = os.environ.get("CONTEXT_GOVERNOR_BINARY") or shutil.which(
+        "context-governor"
+    )
+    if binary is None:
+        pytest.skip("context-governor binary is not installed")
+
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    binding = ContextGovernorKeyState(home, binary).initialize_first_install()
+    binding.close()
+
+    store = home / "context-governor"
+    config = {
+        "context": {
+            "governor": {
+                "summary_mode": "llm",
+                "checkpoint_strategy": "after_n:999",
+                "token_budget": 512,
+                "min_net_savings_tokens": 0,
+                "allocator": "deterministic_v1",
+                "budget_mode": "hard_cascade",
+                "protect_first_n": 0,
+                "protect_last_n": 1,
+                # This fixture isolates recursive lineage. Advisory telemetry
+                # remains separately bounded and tested; it must not turn this
+                # deterministic owner-chain witness into a protected-floor
+                # refusal merely because the synthetic suffix is long.
+                "telemetry_max_additional_protected_messages": 0,
+                "max_lineage_generation": 8,
+            }
+        }
+    }
+
+    with patch("hermes_cli.config.load_config", return_value=config):
+        engine = ContextGovernorEngine(binary=binary, store_dir=store)
+        engine.on_session_start("eight-generation-e2e")
+        engine.update_model("fixture", context_length=16_000, provider="openai-codex")
+        messages = [
+            {"role": "user", "content": "Preserve the root human intent."},
+            {"role": "assistant", "content": "initial context " * 300},
+            {"role": "user", "content": "background event 0"},
+        ]
+
+        for generation in range(8):
+            compacted = engine.compress(messages, current_tokens=100)
+            assert engine._pending_admission is not None
+            assert engine.validate_pending_compression(compacted) is True
+            engine.commit_pending_compression(compacted)
+            assert engine.compression_count == generation + 1
+            assert engine.last_error is None
+            assert engine.last_receipt_id is not None
+            assert engine._pending_admission is None
+            if generation < 7:
+                messages = compacted + [
+                    {
+                        "role": "assistant",
+                        "content": f"new context {generation + 1} " * 300,
+                    },
+                    {
+                        "role": "user",
+                        "content": f"background event {generation + 1}",
+                    },
+                ]
+
+
+@pytest.mark.integration
 def test_real_binary_background_notification_compacts_across_generations(
     tmp_path, monkeypatch
 ):
@@ -1790,12 +1886,17 @@ def test_real_binary_background_notification_compacts_across_generations(
             "governor": {
                 "summary_mode": "llm",
                 "checkpoint_strategy": "after_n:999",
-                "token_budget": 64,
-                "min_net_savings_tokens": 128,
+                "token_budget": 512,
+                "min_net_savings_tokens": 0,
                 "allocator": "deterministic_v1",
                 "budget_mode": "hard_cascade",
                 "protect_first_n": 0,
                 "protect_last_n": 1,
+                # This witness isolates background-notification continuity;
+                # advisory retention and minimum-savings policy have their
+                # own gates and must not make the continuity fixture
+                # structurally impossible.
+                "telemetry_max_additional_protected_messages": 0,
                 "max_lineage_generation": 8,
             }
         }

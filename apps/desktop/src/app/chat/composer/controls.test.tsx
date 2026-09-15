@@ -138,10 +138,10 @@ describe('ComposerControls shortcut tooltips', () => {
     await expectShortcutTooltip('Send', '↵')
   })
 
-  it('keeps Send (not Steer) while a turn is running if there is a payload', async () => {
+  it('shows Steer while a text payload redirects a running turn', async () => {
     renderControls({ busy: true, busyAction: 'steer' })
 
-    await expectShortcutTooltip('Send', '↵')
+    await expectShortcutTooltip('Steer the current run', '↵')
   })
 
   it('shows Stop only when the composer is empty mid-turn', async () => {
@@ -151,9 +151,23 @@ describe('ComposerControls shortcut tooltips', () => {
   })
 
   it('shows Ctrl+Enter for Queue as the secondary mid-turn action', async () => {
-    renderControls({ busy: true, busyAction: 'queue' })
+    renderControls({ busy: true, busyAction: 'steer' })
 
     await expectShortcutTooltip('Queue message', 'Ctrl+↵')
+  })
+
+  it('shows Queue as the primary action while compaction owns the turn', () => {
+    renderControls({ busy: true, busyAction: 'queue', hasComposerPayload: false })
+
+    expect(screen.getByLabelText('Queue message')).toBeTruthy()
+    expect(screen.queryByLabelText('Stop')).toBeNull()
+  })
+
+  it('keeps Send for an idle payload', () => {
+    renderControls({ busy: false, busyAction: 'queue', hasComposerPayload: true })
+
+    expect(screen.getByLabelText('Send')).toBeTruthy()
+    expect(screen.queryByLabelText('Queue message')).toBeNull()
   })
 })
 
