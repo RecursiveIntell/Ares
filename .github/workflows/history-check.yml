@@ -42,6 +42,7 @@ jobs:
           # so the failure message is clear regardless of which signal fires
           # first.
           if ! BASE=$(git merge-base origin/main HEAD 2>/dev/null) || [ -z "$BASE" ]; then
+            # shellcheck disable=SC2016 # backticks are literal Markdown in JSON
             STATUS='[{"source":"unrelated histories","results":[{"kind":"action_required","title":"Unrelated histories","summary":"This PR has no common ancestor with main.","detail":"","how_to_fix":"Rebase your changes onto current main:\n```\ngit fetch origin main\ngit checkout -b fix-branch origin/main\n# re-apply your changes (cherry-pick, copy files, etc.)\ngit push -f origin fix-branch\n```\n"}]}]'
             echo "review_status=${STATUS}" >> "$GITHUB_OUTPUT"
             echo "review_status=${STATUS}" > review-status.json

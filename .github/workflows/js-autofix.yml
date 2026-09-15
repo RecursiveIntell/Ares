@@ -206,6 +206,7 @@ jobs:
           if [ -z "$PR_NUM" ]; then
             # gh pr create prints the PR URL. Extract the number from it
             # (https://github.com/<org>/<repo>/pull/<number>).
+            # shellcheck disable=SC2016 # backticks are literal Markdown in CLI text
             PR_URL=$(gh pr create \
               --head "$BOT_BRANCH" --base main \
               --title 'fmt(js): `npm run fix` auto-fix' \

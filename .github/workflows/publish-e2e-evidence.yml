@@ -55,7 +55,7 @@ jobs:
           # The head-SHA match skips runs that a newer push superseded.
           PR_NUMBER=$(gh api -X GET "repos/$SOURCE_REPO/pulls" \
             -f head="$HEAD_OWNER:$HEAD_BRANCH" -f state=open \
-            --jq '.[] | select(.head.sha == $ENV.HEAD_SHA) | .number' \
+            --jq ".[] | select(.head.sha == \$ENV.HEAD_SHA) | .number" \
             | head -n1)
           if [ -z "$PR_NUMBER" ]; then
             echo "No open pull request has head $HEAD_OWNER:$HEAD_BRANCH at $HEAD_SHA (CI run $SOURCE_RUN_ID)."

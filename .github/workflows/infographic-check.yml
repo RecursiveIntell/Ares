@@ -54,6 +54,7 @@ jobs:
 
           if [ -n "$OFFENDERS" ]; then
             COUNT=$(printf '%s\n' "$OFFENDERS" | wc -l | tr -d ' ')
+            # shellcheck disable=SC2016 # backticks are literal Markdown in JSON
             STATUS='[{"source":"committed infographics","results":[{"kind":"action_required","title":"PR infographic committed to the repo","summary":"Infographic images belong in the PR description, never in git.","detail":"","how_to_fix":"Untrack the image and reference the provider URL from the PR body instead:\n```\ngit rm --cached <path-to-image>\n```\nThen put it in the PR description:\n```\n## Infographic\n\n![slug](https://<provider-url>)\n```\n"}]}]'
             echo "review_status=${STATUS}" >> "$GITHUB_OUTPUT"
             echo ""
