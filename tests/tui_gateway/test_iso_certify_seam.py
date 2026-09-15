@@ -41,8 +41,18 @@ def test_synth_seam_dead_when_env_unset(monkeypatch):
     assert maybe_build_synthetic_agent("sid") is None
 
 
-def test_harness_percentile_and_guard():
+def test_dashboard_child_env_does_not_inherit_compute_host_marker(monkeypatch):
+    """The top-level certification dashboard must not look like a host child."""
     iso = _load_iso_certify()
+    monkeypatch.setenv("HERMES_COMPUTE_HOST_CHILD", "1")
+    monkeypatch.setenv("ISO_CERTIFY_SENTINEL", "preserve")
+
+    env = iso._dashboard_process_env()
+
+    assert "HERMES_COMPUTE_HOST_CHILD" not in env
+    assert env["ISO_CERTIFY_SENTINEL"] == "preserve"
+
+
     assert iso.percentile([], 99) == 0.0
     assert iso.percentile([5.0], 99) == 5.0
     vals = [float(i) for i in range(1, 101)]  # 1..100

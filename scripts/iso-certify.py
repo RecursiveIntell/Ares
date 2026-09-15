@@ -127,6 +127,16 @@ def seed_scratch_home(home: Path, *, isolation: str, heartbeat_secs: int, respaw
     (home / ".env").write_text("OPENAI_API_KEY=sk-synthetic-not-used\n", encoding="utf-8")
 
 
+def _dashboard_process_env(base: dict[str, str] | None = None) -> dict[str, str]:
+    """Build a top-level dashboard environment without the child-only marker."""
+    env = dict(os.environ if base is None else base)
+    # The controller may itself run inside an Ares compute host. Propagating
+    # this marker would make the scratch dashboard disable turn isolation and
+    # invalidate the ON certification measurement.
+    env.pop("HERMES_COMPUTE_HOST_CHILD", None)
+    return env
+
+
 # ── dashboard process ───────────────────────────────────────────────────
 class ScratchDashboard:
     def __init__(
@@ -165,7 +175,7 @@ class ScratchDashboard:
     def __enter__(self) -> "ScratchDashboard":
         venv_py = REPO_ROOT / "venv" / "bin" / "python"
         python = str(venv_py) if venv_py.exists() else sys.executable
-        env = dict(os.environ)
+        env = _dashboard_process_env()
         env.update(self.env_extra)
         env["HERMES_HOME"] = str(self.home)
         env["HOME"] = str(self.home.parent) if str(self.home.parent) else env.get("HOME", "")
