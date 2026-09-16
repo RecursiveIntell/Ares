@@ -366,6 +366,40 @@ class SessionRunCustodyMixin:
                         checkpoint=checkpoint, expires_monotonic_ns=_ttl(ttl_seconds))
         return self._commit_run(raw, value, predecessor_expires_ns=old.expires_monotonic_ns)
 
+    def transition_run_source(self, run_id, *, owner_token, expected_generation,
+                              expected_source_digest, new_source_digest,
+                              observation_ref, observation_digest, ttl_seconds=300):
+        """Record an explicit caller-observed source change, not permission.
+
+        The opaque observation reference is bounded text; its digest is bound
+        but not fetched or verified here. The controller must independently
+        observe the old/new source and verify the referenced evidence. Ordinary
+        publication and resume checks retain their strict source equality.
+        """
+        raw, old = self._owned_run(run_id, owner_token, expected_generation)
+        if expected_source_digest != old.checkpoint.source_digest:
+            raise RunCustodyError("SOURCE_MISMATCH")
+        _digest(new_source_digest)
+        _text(observation_ref)
+        _digest(observation_digest)
+        if new_source_digest == expected_source_digest:
+            raise RunCustodyError("SOURCE_UNCHANGED")
+        member = (f"source-transition:{old.generation + 1}", _json({
+            "schema": "RunSourceTransitionV1",
+            "old_source_digest": expected_source_digest,
+            "new_source_digest": new_source_digest,
+            "observation_ref": observation_ref,
+            "observation_digest": observation_digest,
+        }))
+        # Construct, never accept, the new checkpoint: every other field is
+        # retained exactly. Duplicate names are refused by RunCheckpoint.
+        checkpoint = replace(old.checkpoint, source_digest=new_source_digest,
+                             members=old.checkpoint.members + (member,))
+        value = replace(old, generation=old.generation + 1,
+                        predecessor_digest=_load(raw)["digest"], checkpoint=checkpoint,
+                        expires_monotonic_ns=_ttl(ttl_seconds))
+        return self._commit_run(raw, value, predecessor_expires_ns=old.expires_monotonic_ns)
+
     def refresh_run_custody(self, run_id, *, owner_token, expected_generation, ttl_seconds=300):
         _raw, old = self._owned_run(run_id, owner_token, expected_generation)
         return self.publish_run_checkpoint(run_id, owner_token=owner_token,

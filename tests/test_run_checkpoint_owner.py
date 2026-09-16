@@ -126,6 +126,113 @@ def test_publish_can_append_members_without_replacing_bound_values(db, api):
     assert db.read_run_checkpoint("test-run", generation=1) == owner
 
 
+def transition(db, owner, **changes):
+    assert hasattr(db, "transition_run_source"), "explicit source transition API missing"
+    kwargs = dict(owner_token=owner.owner_token, expected_generation=owner.generation,
+        expected_source_digest=owner.checkpoint.source_digest,
+        new_source_digest=digest("source-after-change"),
+        observation_ref="receipt:source-observation-2", observation_digest=digest("observation"),
+        ttl_seconds=60)
+    kwargs.update(changes)
+    return db.transition_run_source("test-run", **kwargs)
+
+
+def test_explicit_source_transition_preserves_checkpoint_and_history(db, api):
+    owner = claim(db, api)
+    after = transition(db, owner)
+    assert after.generation == owner.generation + 1
+    assert after.checkpoint.source_digest == digest("source-after-change")
+    assert after.checkpoint.members[:-1] == owner.checkpoint.members
+    name, raw = after.checkpoint.members[-1]
+    assert name == "source-transition:2"
+    assert json.loads(raw) == {
+        "schema": "RunSourceTransitionV1", "old_source_digest": owner.checkpoint.source_digest,
+        "new_source_digest": after.checkpoint.source_digest,
+        "observation_ref": "receipt:source-observation-2", "observation_digest": digest("observation")}
+    unchanged = dataclasses.replace(after.checkpoint, source_digest=owner.checkpoint.source_digest,
+        members=owner.checkpoint.members)
+    assert unchanged == owner.checkpoint
+    assert db.read_run_checkpoint("test-run", generation=1) == owner
+    assert db.read_run_custody("test-run") == after
+    with pytest.raises(api.RunCustodyError, match="SOURCE_MISMATCH"):
+        db.validate_run_resume("test-run", owner_token=after.owner_token,
+            expected_generation=2, source_digest=owner.checkpoint.source_digest,
+            plan_digest=owner.checkpoint.plan_digest, contract_digest=owner.checkpoint.contract_digest)
+    assert db.validate_run_resume("test-run", owner_token=after.owner_token,
+        expected_generation=2, source_digest=after.checkpoint.source_digest,
+        plan_digest=after.checkpoint.plan_digest, contract_digest=after.checkpoint.contract_digest) == after
+
+
+@pytest.mark.parametrize("changes,code", [
+    ({"expected_source_digest": digest("wrong")}, "SOURCE_MISMATCH"),
+    ({"expected_generation": 2}, "FENCE_MISMATCH"),
+    ({"owner_token": "wrong"}, "STALE_OWNER"),
+    ({"new_source_digest": digest("source")}, "SOURCE_UNCHANGED"),
+    ({"new_source_digest": None}, "INVALID_DIGEST"),
+    ({"observation_ref": " "}, "INVALID_TEXT"),
+    ({"observation_ref": None}, "INVALID_TEXT"),
+    ({"observation_ref": "x" * 1_000_001}, "INVALID_TEXT"),
+    ({"observation_digest": "invalid"}, "INVALID_DIGEST"),
+])
+def test_source_transition_refusal_does_not_write(db, api, changes, code):
+    owner = claim(db, api)
+    with pytest.raises(api.RunCustodyError, match=code):
+        transition(db, owner, **changes)
+    assert db.read_run_custody("test-run") == owner
+    assert db.get_meta(api.generation_key("test-run", 2)) is None
+
+
+def test_source_transition_released_owner_refuses(db, api):
+    owner = claim(db, api)
+    released = db.release_run_custody("test-run", owner_token=owner.owner_token,
+        expected_generation=1)
+    with pytest.raises(api.RunCustodyError, match="STALE_OWNER"):
+        transition(db, released)
+    assert db.read_run_custody("test-run") == released
+
+
+def test_source_transition_expired_owner_refuses(db, api, monkeypatch):
+    owner = claim(db, api)
+    monkeypatch.setattr(api.time, "monotonic_ns", lambda: owner.expires_monotonic_ns)
+    with pytest.raises(api.RunCustodyError, match="OWNER_EXPIRED"):
+        transition(db, owner)
+    assert db.read_run_custody("test-run") == owner
+
+
+def test_source_transition_head_failure_rolls_back_member(db, api):
+    import sqlite3
+    owner = claim(db, api)
+    db._conn.execute("CREATE TRIGGER reject_transition BEFORE UPDATE ON state_meta "
+        "WHEN NEW.key LIKE 'run-custody:%:head' "
+        "BEGIN SELECT RAISE(ABORT, 'injected transition failure'); END")
+    with pytest.raises(sqlite3.IntegrityError):
+        transition(db, owner)
+    assert db.read_run_custody("test-run") == owner
+    assert db.get_meta(api.generation_key("test-run", 2)) is None
+
+
+def test_source_transition_preserves_reserved_member_collision(db, api):
+    owner = db.claim_run_custody("test-run", expected_generation=0,
+        checkpoint=checkpoint(api, members=checkpoint(api).members + (("source-transition:2", "retained"),)),
+        origin_session_id="origin", current_session_id="current",
+        historical_goal_digest=digest("cancelled"), ttl_seconds=60)
+    with pytest.raises(api.RunCustodyError, match="DUPLICATE_MEMBER"):
+        transition(db, owner)
+    assert db.read_run_custody("test-run") == owner
+
+
+def test_source_transition_expiry_during_admission_refuses(db, api, monkeypatch):
+    owner = claim(db, api)
+    real_write = db._execute_write
+    def delayed_write(fn, *args, **kwargs):
+        monkeypatch.setattr(api.time, "monotonic_ns", lambda: owner.expires_monotonic_ns + 1)
+        return real_write(fn, *args, **kwargs)
+    monkeypatch.setattr(db, "_execute_write", delayed_write)
+    with pytest.raises(api.RunCustodyError, match="OWNER_EXPIRED"):
+        transition(db, owner)
+    assert db.read_run_custody("test-run") == owner
+
+
 def test_source_drift_refuses_publish_and_resume(db, api):
     owner = claim(db, api)
     with pytest.raises(api.RunCustodyError, match="SOURCE_MISMATCH"):
@@ -272,9 +379,25 @@ if mode == "crash-before-head":
 print("ready", flush=True)
 assert sys.stdin.readline().strip() == "go"
 try:
-    value = store.claim_run_custody("test-run", expected_generation=0,
-        checkpoint=checkpoint, origin_session_id="origin", current_session_id="worker",
-        historical_goal_digest=sys.argv[4], ttl_seconds=60)
+    if mode in {"publish", "transition"}:
+        owner = store.read_run_custody("test-run")
+        # Generation one is deliberately fixed before admission. Both workers
+        # were started only after the parent claimed it and before either go.
+        if mode == "publish":
+            value = store.publish_run_checkpoint("test-run", owner_token=owner.owner_token,
+                expected_generation=1, expected_source_digest=checkpoint.source_digest,
+                checkpoint=checkpoint, ttl_seconds=60)
+        else:
+            import hashlib
+            value = store.transition_run_source("test-run", owner_token=owner.owner_token,
+                expected_generation=1, expected_source_digest=checkpoint.source_digest,
+                new_source_digest=hashlib.sha256(str(os.getpid()).encode()).hexdigest(),
+                observation_ref="test:independent-observation", observation_digest=sys.argv[4],
+                ttl_seconds=60)
+    else:
+        value = store.claim_run_custody("test-run", expected_generation=0,
+            checkpoint=checkpoint, origin_session_id="origin", current_session_id="worker",
+            historical_goal_digest=sys.argv[4], ttl_seconds=60)
     if mode == "crash-after-commit":
         os._exit(82)
     print(json.dumps({"result":"won", "value":asdict(value)}), flush=True)
@@ -347,6 +470,39 @@ def test_independent_process_claims_have_one_native_winner(tmp_path, api):
     finally:
         for worker in workers:
             cleanup(worker)
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("mode", ["publish", "transition"])
+def test_independent_publishers_have_one_committed_generation(tmp_path, api, mode):
+    store = SessionDB(db_path=tmp_path / "state.db")
+    owner = claim(store, api)
+    workers = []
+    try:
+        for _ in range(2):
+            worker = start_worker(tmp_path, api, mode)
+            workers.append(worker)
+            ready(worker)
+        for worker in workers:
+            worker.stdin.write("go\n")
+            worker.stdin.flush()
+        outcomes = []
+        for worker in workers:
+            out, err = worker.communicate(timeout=20)
+            assert worker.returncode == 0, err
+            outcomes.append(json.loads(out))
+        assert sorted(x["result"] for x in outcomes) == ["FENCE_MISMATCH", "won"]
+        winner = next(x["value"] for x in outcomes if x["result"] == "won")
+        observed = store.read_run_custody("test-run")
+        assert observed is not None
+        assert observed.generation == 2
+        assert dataclasses.asdict(observed) == dataclasses.asdict(api.RunCustody.from_dict(winner))
+        assert store.read_run_checkpoint("test-run", generation=1) == owner
+        assert store.get_meta(api.generation_key("test-run", 3)) is None
+    finally:
+        for worker in workers:
+            cleanup(worker)
+        store.close()
 
 
 @pytest.mark.linux_only
