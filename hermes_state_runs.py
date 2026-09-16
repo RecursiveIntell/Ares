@@ -9,6 +9,7 @@ SessionDB SQLite/filesystem configuration; no extra power-loss guarantee.
 from dataclasses import asdict, dataclass, fields, replace
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -249,6 +250,8 @@ class SessionRunCustodyMixin:
         def get_meta(self, key: str) -> str | None: ...
         def _execute_write(self, fn: Callable[[sqlite3.Connection], T],
                            patience_s: float | None = None) -> T: ...
+        def _session_turn_lease_key_on_conn(self, conn: sqlite3.Connection,
+                                            session_id: str) -> str: ...
 
     def _read_run_head(self, run_id):
         raw = self.get_meta(_head_key(run_id))
@@ -288,8 +291,34 @@ class SessionRunCustodyMixin:
             value = self._read_run_member(run_id, value.generation - 1, value.predecessor_digest)
         return value
 
+    def _check_run_claim_bindings(self, conn, value, lease_holder):
+        """Native checks on the admitted connection, not external authority."""
+        session = conn.execute("SELECT ended_at,end_reason FROM sessions WHERE id=?",
+                               (value.current_session_id,)).fetchone()
+        if session is None:
+            raise RunCustodyError("SESSION_MISMATCH")
+        if session["ended_at"] is not None or session["end_reason"] is not None:
+            raise RunCustodyError("SESSION_NOT_CURRENT")
+        root = self._session_turn_lease_key_on_conn(conn, value.current_session_id)
+        lease = conn.execute("SELECT holder,expires_at FROM session_turn_leases "
+                             "WHERE conversation_id=?", (root,)).fetchone()
+        if lease is None or lease["holder"] != lease_holder:
+            raise RunCustodyError("LEASE_MISMATCH")
+        try:
+            expiry = float(lease["expires_at"])
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RunCustodyError("LEASE_MISMATCH") from exc
+        if not math.isfinite(expiry) or expiry <= time.time():
+            raise RunCustodyError("LEASE_MISMATCH")
+        goal_key = dict(value.checkpoint.members).get("historical-goal-key")
+        if not goal_key:
+            raise RunCustodyError("HISTORICAL_GOAL_BINDING_MISSING")
+        goal = conn.execute("SELECT value FROM state_meta WHERE key=?", (goal_key,)).fetchone()
+        if goal is None or type(goal[0]) is not str or _sha(goal[0]) != value.historical_goal_digest:
+            raise RunCustodyError("HISTORICAL_GOAL_MISMATCH")
+
     def _commit_run(self, expected_head, value, *, require_live_owner=True,
-                    predecessor_expires_ns=None):
+                    predecessor_expires_ns=None, claim_lease_holder=None):
         raw = _json(asdict(value))
         head = _json({"generation": value.generation, "digest": _sha(raw)})
         key = _head_key(value.run_id)
@@ -309,6 +338,8 @@ class SessionRunCustodyMixin:
                     raise RunCustodyError("OWNER_EXPIRED")
             if conn.execute("SELECT 1 FROM state_meta WHERE key=?", (member_key,)).fetchone():
                 raise RunCustodyError("INTEGRITY_GENERATION_EXISTS")
+            if claim_lease_holder is not None:
+                self._check_run_claim_bindings(conn, value, claim_lease_holder)
             conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?)", (member_key, raw))
             conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?) "
                          "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, head))
@@ -318,6 +349,33 @@ class SessionRunCustodyMixin:
     def claim_run_custody(self, run_id, *, expected_generation, checkpoint,
                           origin_session_id, current_session_id,
                           historical_goal_digest, ttl_seconds=300, controller_pid=None):
+        """Low-level metadata claim; does not establish session/goal bindings."""
+        raw, value = self._prepare_run_claim(run_id, expected_generation=expected_generation,
+            checkpoint=checkpoint, origin_session_id=origin_session_id,
+            current_session_id=current_session_id, historical_goal_digest=historical_goal_digest,
+            ttl_seconds=ttl_seconds, controller_pid=controller_pid)
+        return self._commit_run(raw, value)
+
+    def claim_run_custody_checked(self, run_id, *, lease_holder, expected_generation,
+                                  checkpoint, origin_session_id, current_session_id,
+                                  historical_goal_digest, ttl_seconds=300, controller_pid=None):
+        """Claim with native session/lease/goal checks in the commit transaction.
+
+        The historical-goal key comes from the checkpoint's bound member.
+        Caller-observed file digests and goal semantics are not verified here.
+        This is not downstream effect authorization or filesystem atomicity;
+        other mutation methods remain low-level custody primitives.
+        """
+        _text(lease_holder)  # Invalid/missing bindings must never disable checks.
+        raw, value = self._prepare_run_claim(run_id, expected_generation=expected_generation,
+            checkpoint=checkpoint, origin_session_id=origin_session_id,
+            current_session_id=current_session_id, historical_goal_digest=historical_goal_digest,
+            ttl_seconds=ttl_seconds, controller_pid=controller_pid)
+        return self._commit_run(raw, value, claim_lease_holder=lease_holder)
+
+    def _prepare_run_claim(self, run_id, *, expected_generation, checkpoint,
+                           origin_session_id, current_session_id,
+                           historical_goal_digest, ttl_seconds, controller_pid):
         _integer(expected_generation, 0)
         if type(checkpoint) is not RunCheckpoint:
             raise RunCustodyError("INVALID_CHECKPOINT")
@@ -339,7 +397,7 @@ class SessionRunCustodyMixin:
             None if old is None else _load(raw)["digest"], secrets.token_hex(32), pid,
             identity, origin_session_id, current_session_id, historical_goal_digest,
             _ttl(ttl_seconds), "active", checkpoint)
-        return self._commit_run(raw, value)
+        return raw, value
 
     def _owned_run(self, run_id, owner_token, expected_generation, *, allow_expired=False):
         _integer(expected_generation)
