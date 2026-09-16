@@ -94,6 +94,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _PREVIEW_SCAFFOLDED_SQL,
 )
 from hermes_state_portability import SessionPortabilityMixin
+from hermes_state_runs import SessionRunCustodyMixin
 from hermes_state_schema import SessionSchemaMixin
 from hermes_state_search import SessionSearchMixin
 
@@ -4279,7 +4280,7 @@ def classify_session_status(
     return SESSION_STATUS_COMPLETE
 
 
-class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin):
+class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin, SessionRunCustodyMixin):
     """
     SQLite-backed session storage with FTS5 search.
 
