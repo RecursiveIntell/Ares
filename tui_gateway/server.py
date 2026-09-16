@@ -242,6 +242,9 @@ _LONG_HANDLERS = frozenset(
         "subscription.upgrade",
         "usage.bars",
         "session.usage",
+        # Bounded source/file observations and SQLite admission must not stall
+        # the reader's interrupt/approval path. No automatic claim or retry.
+        "session.run_checkpoint.claim",
         "billing.step_up",
         "browser.manage",
         "cli.exec",

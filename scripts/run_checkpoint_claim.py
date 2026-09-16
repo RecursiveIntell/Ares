@@ -23,7 +23,8 @@ class ClaimOutcomeUnknown(RuntimeError):
 
 def claim_from_files(db, *, run_id, expected_generation, request_path,
                      expected_request_digest, origin_session_id,
-                     historical_goal_digest, controller_pid, ttl_seconds):
+                     historical_goal_digest, controller_pid, ttl_seconds,
+                     expected_session_id=None, expected_lease_holder=None):
     """Claim through the native owner and compare its exact persisted value.
 
     An initial claim has caller-selected inventory; this does not authenticate
@@ -36,6 +37,16 @@ def claim_from_files(db, *, run_id, expected_generation, request_path,
         reader = BoundFileReader()
         request = strict_json(reader.verified(str(request_path), expected_request_digest))
         exact_keys(request, ("checkpoint", "files", "session_id", "lease_holder"))
+        # The live dispatcher supplies both bindings from its selected agent,
+        # never from RPC params. Other private callers retain native-only checks.
+        if expected_session_id is not None or expected_lease_holder is not None:
+            if (type(expected_session_id) is not str or not expected_session_id
+                    or type(expected_lease_holder) is not str or not expected_lease_holder):
+                raise ClaimRefusal("INVALID_LIVE_BINDING")
+            if request["session_id"] != expected_session_id:
+                raise ClaimRefusal("SESSION_MISMATCH")
+            if request["lease_holder"] != expected_lease_holder:
+                raise ClaimRefusal("LEASE_MISMATCH")
         checkpoint = RunCheckpoint.from_dict(request["checkpoint"])
         source_count = verify_checkpoint_files(checkpoint, request["files"], reader)
     except (ResumeRefusal, RunCustodyError) as exc:
