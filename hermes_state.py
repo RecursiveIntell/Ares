@@ -14201,8 +14201,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     def compare_and_set_meta_many(
         self, items: List[Tuple[str, Optional[str], str]]
     ) -> bool:
-        """Atomically publish several meta rows if every preimage matches."""
+        """Atomically publish several meta rows if every preimage matches.
+
+        Each normalized key must occur only once. Otherwise two writes can
+        validate the same preimage and silently overwrite one another within
+        an apparently successful batch. Reject before entering the transaction.
+        """
         normalized = [(str(key), expected, str(value)) for key, expected, value in items]
+        if len({key for key, _expected, _value in normalized}) != len(normalized):
+            raise ValueError("duplicate keys in metadata compare-and-set batch")
         if not normalized:
             return True
 
