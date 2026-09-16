@@ -1,0 +1,68 @@
+"""Private file-bound client of SessionDB's checked claim API.
+
+The coordinator supplies its already-open writable SessionDB. This module never
+opens, migrates, repairs, closes or substitutes a store, acquires a session lease,
+or executes downstream work. Caller-supplied digests bind observations, not
+permission. Files are observed before the native transaction, not atomically
+with it. Unknown write/readback outcomes require reconciliation, never retry.
+"""
+from hermes_state import SessionDB
+from hermes_state_runs import RunCheckpoint, RunCustodyError
+from scripts.run_checkpoint_resume import (
+    BoundFileReader, ResumeRefusal, exact_keys, strict_json, verify_checkpoint_files,
+)
+
+
+class ClaimRefusal(RuntimeError):
+    """Stable code: preflight or native admission refused this invocation."""
+
+
+class ClaimOutcomeUnknown(RuntimeError):
+    """A write may have committed; reconcile native head before any new action."""
+
+
+def claim_from_files(db, *, run_id, expected_generation, request_path,
+                     expected_request_digest, origin_session_id,
+                     historical_goal_digest, controller_pid, ttl_seconds):
+    """Claim through the native owner and compare its exact persisted value.
+
+    An initial claim has caller-selected inventory; this does not authenticate
+    its completeness. Takeover remains bound to the native exact checkpoint.
+    This function deliberately has no low-level fallback or automatic retry.
+    """
+    if not isinstance(db, SessionDB) or db.read_only:
+        raise ClaimRefusal("WRITABLE_OWNER_REQUIRED")
+    try:
+        reader = BoundFileReader()
+        request = strict_json(reader.verified(str(request_path), expected_request_digest))
+        exact_keys(request, ("checkpoint", "files", "session_id", "lease_holder"))
+        checkpoint = RunCheckpoint.from_dict(request["checkpoint"])
+        source_count = verify_checkpoint_files(checkpoint, request["files"], reader)
+    except (ResumeRefusal, RunCustodyError) as exc:
+        raise ClaimRefusal(str(exc)) from None
+    except (TypeError, ValueError, KeyError, RecursionError):
+        raise ClaimRefusal("INVALID_REQUEST") from None
+    try:
+        value = db.claim_run_custody_checked(run_id,
+            expected_generation=expected_generation, checkpoint=checkpoint,
+            origin_session_id=origin_session_id, current_session_id=request["session_id"],
+            lease_holder=request["lease_holder"], historical_goal_digest=historical_goal_digest,
+            controller_pid=controller_pid, ttl_seconds=ttl_seconds)
+    except RunCustodyError as exc:
+        raise ClaimRefusal(exc.code) from None
+    except Exception:
+        # Even a transport-looking error can be a lost ACK after commit.
+        raise ClaimOutcomeUnknown("CLAIM_OUTCOME_UNKNOWN") from None
+    try:
+        current = db.read_run_custody(run_id)
+    except Exception:
+        raise ClaimOutcomeUnknown("CLAIM_READBACK_UNKNOWN") from None
+    if current != value:
+        raise ClaimOutcomeUnknown("CLAIM_READBACK_MISMATCH")
+    return {"status": "claim_observed", "run_id": value.run_id,
+            "generation": value.generation, "custody_changed": True,
+            "resume_authorized": False, "downstream_effects_executed": False,
+            "source_files": source_count, "members": len(checkpoint.members),
+            "unresolved_effects": len(checkpoint.unresolved_effects),
+            "unresolved_findings": len(checkpoint.unresolved_findings),
+            "restrictions": len(checkpoint.restrictions)}

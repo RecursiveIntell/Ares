@@ -124,26 +124,53 @@ def check_goal(db, owner):
         raise ResumeRefusal("HISTORICAL_GOAL_MISMATCH")
 
 
+class BoundFileReader:
+    """One bounded observation budget; no authority or atomic snapshot."""
+
+    def __init__(self):
+        self.total = 0
+
+    def read(self, path):
+        raw = read_file_bytes(path)
+        self.total += len(raw)
+        if self.total > MAX_TOTAL_BYTES:
+            raise ResumeRefusal("READ_BUDGET_EXCEEDED")
+        return raw
+
+    def verified(self, path, digest):
+        if type(digest) is not str or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise ResumeRefusal("INVALID_DIGEST")
+        raw = self.read(path)
+        if hashlib.sha256(raw).hexdigest() != digest:
+            raise ResumeRefusal("FILE_DIGEST_MISMATCH")
+        return raw
+
+
+def verify_checkpoint_files(checkpoint, files, reader):
+    """Compare caller-selected files with explicit checkpoint bindings."""
+    exact_keys(files, ("plan", "contract", "source", "members"))
+    reader.verified(files["plan"], checkpoint.plan_digest)
+    reader.verified(files["contract"], checkpoint.contract_digest)
+    inventory = strict_json(reader.verified(files["source"], checkpoint.source_digest))
+    if type(inventory) is not dict or not 1 <= len(inventory) <= MAX_SOURCE_FILES:
+        raise ResumeRefusal("INVALID_SOURCE_INVENTORY")
+    for source, digest in inventory.items():
+        reader.verified(source, digest)
+    members = dict(checkpoint.members)
+    if type(files["members"]) is not dict or set(files["members"]) != set(members):
+        raise ResumeRefusal("MEMBER_BINDINGS_MISMATCH")
+    for name, raw in members.items():
+        if reader.read(files["members"][name]) != raw.encode("utf-8"):
+            raise ResumeRefusal("MEMBER_MISMATCH")
+    return len(inventory)
+
+
 def inspect_resume(db_path, run_id, generation, request_path):
     path = Path(db_path)
     if not path.is_absolute() or path.is_symlink() or not path.is_file():
         raise ResumeRefusal("INVALID_DB")
-    total = 0
-    def read(path):
-        nonlocal total
-        raw = read_file_bytes(path)
-        total += len(raw)
-        if total > MAX_TOTAL_BYTES:
-            raise ResumeRefusal("READ_BUDGET_EXCEEDED")
-        return raw
-    def verified(path, digest):
-        if type(digest) is not str or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
-            raise ResumeRefusal("INVALID_DIGEST")
-        raw = read(path)
-        if hashlib.sha256(raw).hexdigest() != digest:
-            raise ResumeRefusal("FILE_DIGEST_MISMATCH")
-        return raw
-    request = strict_json(read(str(request_path)))
+    reader = BoundFileReader()
+    request = strict_json(reader.read(str(request_path)))
     exact_keys(request, ("checkpoint", "files", "session_id", "lease_holder"))
     files = request["files"]
     exact_keys(files, ("plan", "contract", "source", "members"))
@@ -165,24 +192,12 @@ def inspect_resume(db_path, run_id, generation, request_path):
             check_lease(db, owner, request)
             check_goal(db, owner)
         native_check()
-        verified(files["plan"], checkpoint.plan_digest)
-        verified(files["contract"], checkpoint.contract_digest)
-        inventory = strict_json(verified(files["source"], checkpoint.source_digest))
-        if type(inventory) is not dict or not 1 <= len(inventory) <= MAX_SOURCE_FILES:
-            raise ResumeRefusal("INVALID_SOURCE_INVENTORY")
-        for source, digest in inventory.items():
-            verified(source, digest)
-        members = dict(checkpoint.members)
-        if type(files["members"]) is not dict or set(files["members"]) != set(members):
-            raise ResumeRefusal("MEMBER_BINDINGS_MISMATCH")
-        for name, raw in members.items():
-            if read(files["members"][name]) != raw.encode("utf-8"):
-                raise ResumeRefusal("MEMBER_MISMATCH")
+        source_count = verify_checkpoint_files(checkpoint, files, reader)
         native_check()
         return {"status": "resume_consistency", "run_id": owner.run_id,
                 "generation": owner.generation, "resume_authorized": False,
-                "effects_executed": False, "source_files": len(inventory),
-                "members": len(members), "unresolved_effects": len(checkpoint.unresolved_effects),
+                "effects_executed": False, "source_files": source_count,
+                "members": len(checkpoint.members), "unresolved_effects": len(checkpoint.unresolved_effects),
                 "unresolved_findings": len(checkpoint.unresolved_findings),
                 "restrictions": len(checkpoint.restrictions)}
     except RunCustodyError as exc:
