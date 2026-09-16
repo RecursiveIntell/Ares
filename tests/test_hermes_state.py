@@ -814,7 +814,7 @@ class TestFTS5Search:
         ]
         assert all("context" in row and row["context"] for row in default)
 
-    @pytest.mark.parametrize("read_path", ["pooled", "writer-fallback"])
+    @pytest.mark.parametrize("read_path", ["journal-default", "writer-fallback"])
     def test_search_projection_skips_context_enrichment_queries(
         self, db, monkeypatch, read_path
     ):
@@ -896,10 +896,30 @@ class TestFTS5Search:
 
         assert borrowed_connections
         assert all(conn is borrowed_connections[0] for conn in borrowed_connections)
-        if read_path == "pooled":
+        # The default path is pooled only when the runtime admits WAL.
+        # DELETE journal mode deliberately uses the locked writer instead.
+        journal_mode = db._conn.execute("PRAGMA journal_mode").fetchone()[0]
+        assert db._wal_active == (journal_mode == "wal")
+        if read_path == "journal-default" and db._wal_active:
             assert borrowed_connections[0] is not db._conn
         else:
             assert borrowed_connections[0] is db._conn
+
+    def test_search_projection_with_wal_safety_fallback(self, tmp_path, monkeypatch):
+        # Select the existing restrictive policy before opening a real DB.
+        # Never force WAL on a host whose SQLite safety gate rejects it.
+        monkeypatch.setattr(
+            hermes_state, "is_sqlite_wal_reset_vulnerable", lambda version_info=None: True
+        )
+        db = SessionDB(db_path=tmp_path / "wal_safety_fallback.db")
+        try:
+            assert not db._wal_active
+            assert db._conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+            self.test_search_projection_skips_context_enrichment_queries(
+                db, monkeypatch, "journal-default"
+            )
+        finally:
+            db.close()
 
     def test_sanitize_fts5_query_strips_dangerous_chars(self):
         """Unit test for _sanitize_fts5_query static method."""
