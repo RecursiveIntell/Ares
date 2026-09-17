@@ -76,6 +76,9 @@ def live(tmp_path, monkeypatch):
                   origin_session_id="old", historical_goal_digest=sha(goal.encode()), ttl_seconds=120)
     agent = SimpleNamespace(_session_db=db, session_id="current",
                             _active_session_turn_lease_holder="active-holder")
+    from agent.run_checkpoint_custody import TurnRunCustody
+    agent._run_checkpoint_custody = TurnRunCustody(db)
+    agent._run_checkpoint_custody.begin_turn("active-holder")
     ready = threading.Event()
     ready.set()
     transport = ReplyTransport()
@@ -92,6 +95,58 @@ def live(tmp_path, monkeypatch):
     # gateway teardown, which intentionally opens stores to finalize sessions.
     server._sessions.clear()
     db.close()
+
+
+def rpc_method(f, name, params):
+    result = server.dispatch({"jsonrpc": "2.0", "id": 9, "method": name, "params": params}, f.transport)
+    return result if result is not None else f.transport.responses.get(timeout=10)
+
+
+def test_rpc_manages_refresh_and_release_without_exposing_handle(live):
+    assert "result" in dispatch(live)
+    params = {"session_id": "runtime-sid", "run_id": "rpc-fixture", "expected_generation": 1, "ttl_seconds": 120}
+    refreshed = rpc_method(live, "session.run_checkpoint.refresh", params)
+    assert refreshed["result"]["generation"] == 2
+    del params["ttl_seconds"]
+    params["expected_generation"] = 2
+    released = rpc_method(live, "session.run_checkpoint.release", params)
+    assert released["result"]["status"] == "release_observed"
+    value = live.db.read_run_custody("rpc-fixture")
+    assert value.disposition == "released"
+    assert value.owner_token not in json.dumps([refreshed, released])
+    assert "active-holder" not in json.dumps([refreshed, released])
+
+
+def test_gateway_routes_isolated_claim_without_using_local_owner(live, monkeypatch):
+    calls = []
+    def control(sid, **kwargs):
+        calls.append((sid, kwargs))
+        return {"type": "control.ack", "sid": sid, "route_name": METHOD,
+                "response": {"jsonrpc": "2.0", "id": "private", "result": {"status": "claim_observed"}}}
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda s: True)
+    monkeypatch.setattr(server, "_compute_host_supervisor", SimpleNamespace(control=control))
+    live.session["_compute_host_active"] = True
+    live.agent._session_db = None
+    before = rows(live.db)
+    response = dispatch(live)
+    assert response["result"]["status"] == "claim_observed"
+    assert len(calls) == 1
+    assert calls[0][1]["payload"]["params"] == live.params
+    assert rows(live.db) == before
+
+
+def test_isolated_control_timeout_is_unknown_not_retried(live, monkeypatch):
+    calls = []
+    def control(*a, **kw):
+        calls.append(1)
+        raise TimeoutError("lost acknowledgement")
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda s: True)
+    monkeypatch.setattr(server, "_compute_host_supervisor", SimpleNamespace(control=control))
+    live.session["_compute_host_active"] = True
+    response = dispatch(live)
+    assert response["error"]["data"]["status"] == "unknown"
+    assert response["error"]["data"]["automatic_retry"] is False
+    assert len(calls) == 1
 
 
 def rewrite(f):
@@ -281,18 +336,22 @@ def test_post_commit_uncertainty_is_not_retry_or_refusal(live, monkeypatch, faul
     assert owner.generation == 1
     assert owner.owner_token not in json.dumps(response)
     before = rows(live.db)
-    refused(dispatch(live), "FENCE_MISMATCH")  # explicit operator retry, not hidden
-    assert len(calls) == 2
+    # The new private handle preserves quarantine even on an explicit repeat;
+    # do not perform another native mutation to rediscover the unknown outcome.
+    repeated = dispatch(live)
+    assert repeated["error"]["data"]["status"] == "unknown"
+    assert len(calls) == 1
     assert rows(live.db) == before
 
 
 def test_concurrent_rpc_claims_admit_exactly_one_generation(live, monkeypatch):
-    original = live.db.claim_run_custody_checked
+    original = server._methods[METHOD]
     barrier = threading.Barrier(2)
     def race(*a, **kw):
         barrier.wait(timeout=8)
         return original(*a, **kw)
-    monkeypatch.setattr(live.db, "claim_run_custody_checked", race)
+    # Meet at the RPC boundary, before the per-owner serialization lock.
+    monkeypatch.setitem(server._methods, METHOD, race)
     req = {"jsonrpc": "2.0", "id": 1, "method": METHOD, "params": live.params}
     assert server.dispatch(req, live.transport) is None
     assert server.dispatch({**req, "id": 2}, live.transport) is None

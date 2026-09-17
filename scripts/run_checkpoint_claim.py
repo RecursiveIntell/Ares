@@ -24,7 +24,7 @@ class ClaimOutcomeUnknown(RuntimeError):
 def claim_from_files(db, *, run_id, expected_generation, request_path,
                      expected_request_digest, origin_session_id,
                      historical_goal_digest, controller_pid, ttl_seconds,
-                     expected_session_id=None, expected_lease_holder=None):
+                     expected_session_id=None, expected_lease_holder=None, _on_claim=None):
     """Claim through the native owner and compare its exact persisted value.
 
     An initial claim has caller-selected inventory; this does not authenticate
@@ -61,12 +61,16 @@ def claim_from_files(db, *, run_id, expected_generation, request_path,
             controller_pid=controller_pid, ttl_seconds=ttl_seconds)
     except RunCustodyError as exc:
         raise ClaimRefusal(exc.code) from None
-    except Exception:
+    except BaseException:  # Cancellation can follow a committed native mutation.
         # Even a transport-looking error can be a lost ACK after commit.
         raise ClaimOutcomeUnknown("CLAIM_OUTCOME_UNKNOWN") from None
     try:
+        # Private executing-owner hook: retain the native handle before readback.
+        # It never crosses the RPC boundary and does not authorize other effects.
+        if _on_claim is not None:
+            _on_claim(value)
         current = db.read_run_custody(run_id)
-    except Exception:
+    except BaseException:  # Cancellation can follow a committed native mutation.
         raise ClaimOutcomeUnknown("CLAIM_READBACK_UNKNOWN") from None
     if current != value:
         raise ClaimOutcomeUnknown("CLAIM_READBACK_MISMATCH")

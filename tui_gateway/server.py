@@ -245,6 +245,8 @@ _LONG_HANDLERS = frozenset(
         # Bounded source/file observations and SQLite admission must not stall
         # the reader's interrupt/approval path. No automatic claim or retry.
         "session.run_checkpoint.claim",
+        "session.run_checkpoint.refresh",
+        "session.run_checkpoint.release",
         "billing.step_up",
         "browser.manage",
         "cli.exec",
@@ -794,6 +796,28 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     """
     if not session or session.get("_finalized"):
         return
+    from agent.run_checkpoint_custody import TurnRunCustody
+    agent = session.get("agent")
+    custody = getattr(agent, "_run_checkpoint_custody", None)
+    with session.get("history_lock") or _sessions_lock:
+        holder = getattr(agent, "_active_session_turn_lease_holder", None)
+        run_thread = session.get("_run_thread")
+        defer_custody = (isinstance(custody, TurnRunCustody) and holder and
+            (session.get("running") or (run_thread is not None and run_thread.is_alive())))
+        if defer_custody:
+            session["_run_checkpoint_finalize_deferred"] = end_reason
+    if defer_custody:
+        # Never release custody, close relay scopes or finalize native session
+        # state underneath a live owning turn. Its finally is the release owner.
+        with _sessions_lock:
+            sid = session.get("_sid") or next((key for key, value in _sessions.items() if value is session), None)
+        if sid:
+            _interrupt_session_turn(sid, session)
+        else:
+            from agent.interrupt_compat import request_hard_interrupt
+            request_hard_interrupt(agent)
+        return
+    session.pop("_run_checkpoint_finalize_deferred", None)
     session["_finalized"] = True
     history_ready = session.get("resume_history_ready")
     if history_ready is not None and not history_ready.is_set():
@@ -805,6 +829,13 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
         stop_event.set()
 
     agent = session.get("agent")
+    from agent.run_checkpoint_custody import TurnRunCustody
+    custody = getattr(agent, "_run_checkpoint_custody", None)
+    if isinstance(custody, TurnRunCustody):
+        errors = custody.finish_turn(getattr(agent, "_active_session_turn_lease_holder", None))
+        if errors:
+            session["_run_checkpoint_cleanup_errors"] = errors
+            logger.error("Run checkpoint finalization requires reconciliation: %s", errors)
     lock = session.get("history_lock")
     if lock is not None:
         with lock:
@@ -979,6 +1010,10 @@ def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") ->
     if not session:
         return
     _finalize_session(session, end_reason=end_reason)
+    with session.get("history_lock") or _sessions_lock:
+        if session.get("_run_checkpoint_finalize_deferred"):
+            session["_run_checkpoint_teardown_deferred"] = end_reason
+            return
     _announce_session_reclaimed(session, end_reason)
     try:
         from tools.approval import unregister_gateway_notify
@@ -12944,6 +12979,13 @@ def _run_prompt_submit(
             _retire_turn_marker(session, marker_key)
             session.pop("_auto_continue_scheduled", None)
             _emit_settled_session_info(sid, session, agent)
+            with session["history_lock"]:
+                deferred_teardown = session.pop("_run_checkpoint_teardown_deferred", None)
+                deferred_finalize = session.pop("_run_checkpoint_finalize_deferred", None)
+            if deferred_teardown:
+                _teardown_session(session, end_reason=deferred_teardown)
+            elif deferred_finalize:
+                _finalize_session(session, end_reason=deferred_finalize)
 
         # A user prompt that arrived mid-turn (interrupt + queue) wins over
         # every auto follow-up below — drain it first and skip them this cycle;
