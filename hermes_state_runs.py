@@ -249,6 +249,76 @@ def _preserve(old, new):
         raise RunCustodyError("PLAN_CONTRACT_MISMATCH")
 
 
+_REFRESH_SCHEMA = "SessionDBRunCustodyRefreshV1"
+
+
+def _refresh_parts(document):
+    """Decode only the explicit compact storage envelope, never widen V1."""
+    if (type(document) is not dict or
+            set(document) != {"schema", "custody", "checkpoint_reference"} or
+            document["schema"] != _REFRESH_SCHEMA):
+        raise RunCustodyError("INTEGRITY_REFRESH_SCHEMA")
+    metadata, reference = document["custody"], document["checkpoint_reference"]
+    if (type(metadata) is not dict or
+            set(metadata) != {f.name for f in fields(RunCustody)} - {"checkpoint"} or
+            type(reference) is not dict or set(reference) != {"generation", "digest"}):
+        raise RunCustodyError("INTEGRITY_REFRESH_SCHEMA")
+    _integer(reference["generation"])
+    _digest(reference["digest"])
+    return metadata, reference
+
+
+def _decode_run_record(run_id, generation, expected_digest, read_value):
+    """Materialize one V1 logical value from a full or versioned compact record.
+
+    Compact records refer directly to a full immutable checkpoint, never to
+    another compact record. The immediate predecessor binds that same reference
+    and ownership. Each historical read validates its own link without recursive
+    expansion of an arbitrarily long refresh chain.
+    """
+    def load(number, digest):
+        raw = read_value(generation_key(run_id, number))
+        if raw is None or _sha(raw) != digest:
+            raise RunCustodyError("INTEGRITY_MEMBER")
+        document = _load(raw)
+        if type(document) is not dict:
+            raise RunCustodyError("INTEGRITY_SCHEMA")
+        return document
+
+    document = load(generation, expected_digest)
+    if document.get("schema") == "SessionDBRunCustodyV1":
+        value = RunCustody.from_dict(document)
+    else:
+        metadata, reference = _refresh_parts(document)
+        if reference["generation"] >= generation:
+            raise RunCustodyError("INTEGRITY_REFRESH_REFERENCE")
+        anchor_document = load(reference["generation"], reference["digest"])
+        anchor = RunCustody.from_dict(anchor_document)
+        if anchor.run_id != run_id or anchor.generation != reference["generation"]:
+            raise RunCustodyError("INTEGRITY_REFRESH_REFERENCE")
+        # Use validated wire lists, not dataclass tuples: V1's strict decoder
+        # must continue rejecting non-JSON inventory shapes.
+        checkpoint = anchor_document["checkpoint"]
+        value = RunCustody.from_dict({**metadata, "checkpoint": checkpoint})
+        prior_document = load(generation - 1, value.predecessor_digest)
+        if prior_document.get("schema") == "SessionDBRunCustodyV1":
+            prior = RunCustody.from_dict(prior_document)
+            prior_reference = {"generation": generation - 1, "digest": value.predecessor_digest}
+        else:
+            prior_metadata, prior_reference = _refresh_parts(prior_document)
+            prior = RunCustody.from_dict({**prior_metadata, "checkpoint": checkpoint})
+        if (prior_reference != reference or prior.run_id != run_id or
+                prior.generation != generation - 1 or value.disposition != "active"):
+            raise RunCustodyError("INTEGRITY_REFRESH_REFERENCE")
+        for field in fields(RunCustody):
+            if field.name not in {"generation", "predecessor_digest", "expires_monotonic_ns"}:
+                if getattr(prior, field.name) != getattr(value, field.name):
+                    raise RunCustodyError("INTEGRITY_REFRESH_OWNERSHIP")
+    if value.run_id != run_id or value.generation != generation:
+        raise RunCustodyError("INTEGRITY_IDENTITY")
+    return value
+
+
 class SessionRunCustodyMixin:
     """Typed run APIs on SessionDB's existing transaction/key-value owner."""
 
@@ -275,13 +345,7 @@ class SessionRunCustodyMixin:
         return raw, value
 
     def _read_run_member(self, run_id, generation, expected_digest):
-        raw = self.get_meta(generation_key(run_id, generation))
-        if raw is None or _sha(raw) != expected_digest:
-            raise RunCustodyError("INTEGRITY_MEMBER")
-        value = RunCustody.from_dict(_load(raw))
-        if value.run_id != run_id or value.generation != generation:
-            raise RunCustodyError("INTEGRITY_IDENTITY")
-        return value
+        return _decode_run_record(run_id, generation, expected_digest, self.get_meta)
 
     def read_run_custody(self, run_id):
         """Read committed native metadata; does not authorize continuation."""
@@ -325,8 +389,14 @@ class SessionRunCustodyMixin:
             raise RunCustodyError("HISTORICAL_GOAL_MISMATCH")
 
     def _commit_run(self, expected_head, value, *, require_live_owner=True,
-                    predecessor_expires_ns=None, claim_lease_holder=None):
-        raw = _json(asdict(value))
+                    predecessor_expires_ns=None, claim_lease_holder=None,
+                    refresh_reference=None):
+        document = asdict(value)
+        if refresh_reference is not None:
+            document.pop("checkpoint")
+            document = {"schema": _REFRESH_SCHEMA, "custody": document,
+                        "checkpoint_reference": refresh_reference}
+        raw = _json(document)
         head = _json({"generation": value.generation, "digest": _sha(raw)})
         key = _head_key(value.run_id)
         member_key = generation_key(value.run_id, value.generation)
@@ -347,6 +417,14 @@ class SessionRunCustodyMixin:
                 raise RunCustodyError("INTEGRITY_GENERATION_EXISTS")
             if claim_lease_holder is not None:
                 self._check_run_claim_bindings(conn, value, claim_lease_holder)
+            if refresh_reference is not None:
+                def read_value(record_key):
+                    if record_key == member_key:
+                        return raw
+                    row = conn.execute("SELECT value FROM state_meta WHERE key=?", (record_key,)).fetchone()
+                    return None if row is None else row[0]
+                if _decode_run_record(value.run_id, value.generation, _sha(raw), read_value) != value:
+                    raise RunCustodyError("INTEGRITY_REFRESH_VALUE")
             conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?)", (member_key, raw))
             conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?) "
                          "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, head))
@@ -466,10 +544,20 @@ class SessionRunCustodyMixin:
         return self._commit_run(raw, value, predecessor_expires_ns=old.expires_monotonic_ns)
 
     def refresh_run_custody(self, run_id, *, owner_token, expected_generation, ttl_seconds=300):
-        _raw, old = self._owned_run(run_id, owner_token, expected_generation)
-        return self.publish_run_checkpoint(run_id, owner_token=owner_token,
-            expected_generation=expected_generation, expected_source_digest=old.checkpoint.source_digest,
-            checkpoint=old.checkpoint, ttl_seconds=ttl_seconds)
+        raw, old = self._owned_run(run_id, owner_token, expected_generation)
+        member = self.get_meta(generation_key(run_id, old.generation))
+        old_digest = _load(raw)["digest"]
+        if member is None or _sha(member) != old_digest:
+            raise RunCustodyError("INTEGRITY_MEMBER")
+        document = _load(member)
+        if document.get("schema") == "SessionDBRunCustodyV1":
+            reference = {"generation": old.generation, "digest": old_digest}
+        else:
+            _, reference = _refresh_parts(document)
+        value = replace(old, generation=old.generation + 1, predecessor_digest=old_digest,
+                        expires_monotonic_ns=_ttl(ttl_seconds))
+        return self._commit_run(raw, value, predecessor_expires_ns=old.expires_monotonic_ns,
+                                refresh_reference=reference)
 
     def release_run_custody(self, run_id, *, owner_token, expected_generation):
         raw, old = self._owned_run(run_id, owner_token, expected_generation, allow_expired=True)

@@ -320,13 +320,6 @@ def test_malformed_checkpoint_is_refused_without_head(db, api, field, value):
     assert db.read_run_custody("test-run") is None
 
 
-def test_owner_module_is_in_the_installable_module_set():
-    import tomllib
-    root = Path(__file__).resolve().parents[1]
-    project = tomllib.loads((root / "pyproject.toml").read_text())
-    assert "hermes_state_runs" in project["tool"]["setuptools"]["py-modules"]
-
-
 def test_expiry_while_waiting_for_write_lock_cannot_refresh(db, api, monkeypatch):
     old = claim(db, api)
     real_write = db._execute_write

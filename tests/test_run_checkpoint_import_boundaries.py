@@ -79,8 +79,11 @@ def test_wheel_contains_only_the_two_required_scripts_modules(built_wheel):
 def test_required_rpc_client_imports_from_extracted_wheel(built_wheel):
     work, installed, _ = built_wheel
     result = isolated(
-        "import json; from pathlib import Path; import scripts.run_checkpoint_claim as c; "
+        "from pathlib import Path; import hermes_state_runs as owner; "
+        "from hermes_state import SessionDB; import scripts.run_checkpoint_claim as c; "
         "import scripts.run_checkpoint_resume as r; "
+        "assert Path(owner.__file__).is_relative_to(Path(sys.argv[1])); "
+        "assert issubclass(SessionDB, owner.SessionRunCustodyMixin); "
         "assert Path(c.__file__).is_relative_to(Path(sys.argv[1])); "
         "assert Path(r.__file__).is_relative_to(Path(sys.argv[1])); "
         "assert callable(c.claim_from_files); assert callable(r.verify_checkpoint_files); print('wheel-import-ok')",
