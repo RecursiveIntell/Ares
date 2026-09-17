@@ -403,14 +403,10 @@ class ComputeHost:
             if session is None:
                 self.emit({"type": "interrupt.ack", "sid": sid, "request_id": frame.get("request_id"), "applied": False})
                 return
-            agent = session.get("agent")
-            if agent is not None:
-                request_hard_interrupt(agent)
-            with session.get("history_lock", threading.Lock()):
-                session["_turn_cancel_requested"] = True
-                session["queued_prompt"] = None
-                session.pop("queued_prompts", None)
-                session["_queued_prompt_generation"] = int(session.get("_queued_prompt_generation", 0)) + 1
+            # Use the same owner-side Stop contract as a non-isolated turn:
+            # hard interrupt plus pending clarify/approval wakeup and queue clear.
+            # The child marker disables forwarding back through a supervisor.
+            server._interrupt_session_turn(sid, session, request_id=frame.get("request_id"))
             self.emit({"type": "interrupt.ack", "sid": sid, "request_id": frame.get("request_id"), "applied": True, "applied_ns": now_ns()})
         except Exception as exc:
             self.emit({"type": "interrupt.ack", "sid": sid, "request_id": frame.get("request_id"), "applied": False, "message": str(exc)})
@@ -717,6 +713,22 @@ class ComputeHost:
                 return
             if route == "idle-gated" and session.get("running"):
                 self.emit({"type": "control.error", "sid": sid, "request_id": request_id, "message": "session busy"})
+                return
+            if route_name in {"session.run_checkpoint.claim", "session.run_checkpoint.refresh", "session.run_checkpoint.release"}:
+                from tui_gateway.transport import bind_transport, reset_transport
+                params = frame.get("params")
+                if type(params) is not dict or params.get("session_id") != sid:
+                    self.emit({"type": "control.error", "sid": sid, "request_id": request_id, "message": "checkpoint session mismatch"})
+                    return
+                transport_token = bind_transport(self._transport)
+                session_token = server._current_runtime_session_record.set(session)
+                try:
+                    response = server._methods[route_name](request_id, params)
+                finally:
+                    server._current_runtime_session_record.reset(session_token)
+                    reset_transport(transport_token)
+                self.emit({"type": "control.ack", "sid": sid, "request_id": request_id,
+                           "route_name": route_name, "response": response})
                 return
             if route_name == "config.set.model":
                 params = frame.get("params")

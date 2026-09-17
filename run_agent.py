@@ -8575,6 +8575,7 @@ class AIAgent:
         relay_lease = None
         relay_turn = None
         durable_turn_lease = None
+        turn_run_custody = None
         durable_turn_lease_stop = None
         durable_turn_lease_thread = None
         durable_turn_lease_activity_lock = threading.Lock()
@@ -8756,6 +8757,14 @@ class AIAgent:
                 # the agent attr so a late flush after reclaim is fenced in
                 # the same SQLite write transaction as the transcript insert.
                 durable_turn_lease = _durable_holder
+                from agent.run_checkpoint_custody import TurnRunCustody
+                turn_run_custody = getattr(self, "_run_checkpoint_custody", None)
+                if turn_run_custody is None:
+                    turn_run_custody = TurnRunCustody(_turn_db)
+                    self._run_checkpoint_custody = turn_run_custody
+                if turn_run_custody.db is not _turn_db:
+                    raise RuntimeError("run checkpoint store owner changed")
+                turn_run_custody.begin_turn(_durable_holder)
                 self._active_session_turn_lease_holder = _durable_holder
                 self._active_session_turn_lease_ttl_seconds = _lease_ttl
                 if _lease_waited:
@@ -8969,6 +8978,15 @@ class AIAgent:
                     # late interrupt does not survive into the next turn.
                     _clear_durable_turn_lease_interrupt()
                     if durable_turn_lease is not None:
+                        if turn_run_custody is not None:
+                            try:
+                                cleanup_errors = turn_run_custody.finish_turn(durable_turn_lease)
+                                if cleanup_errors:
+                                    self._run_checkpoint_cleanup_errors = cleanup_errors
+                                    logger.error("Run checkpoint cleanup requires reconciliation: %s", cleanup_errors)
+                                    self._emit_warning("Run checkpoint cleanup is unresolved; reconcile native custody before continuing that run.")
+                            except Exception:
+                                logger.error("Run checkpoint cleanup outcome unknown; reconciliation required")
                         try:
                             _turn_db.release_session_turn_lease(
                                 session_id, durable_turn_lease

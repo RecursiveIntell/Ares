@@ -11,6 +11,27 @@ method = _registry.method
 _profile_scoped = _registry.profile_scoped
 
 
+@method("session.run_checkpoint.claim")
+def _(rid, params: dict) -> dict:
+    from tui_gateway import server
+    from tui_gateway.run_checkpoint_rpc import handle
+    return handle(server, rid, params, "claim")
+
+
+@method("session.run_checkpoint.refresh")
+def _(rid, params: dict) -> dict:
+    from tui_gateway import server
+    from tui_gateway.run_checkpoint_rpc import handle
+    return handle(server, rid, params, "refresh")
+
+
+@method("session.run_checkpoint.release")
+def _(rid, params: dict) -> dict:
+    from tui_gateway import server
+    from tui_gateway.run_checkpoint_rpc import handle
+    return handle(server, rid, params, "release")
+
+
 @method("session.create")
 def _(rid, params: dict) -> dict:
     sid = uuid.uuid4().hex[:8]

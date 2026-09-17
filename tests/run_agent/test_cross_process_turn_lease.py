@@ -66,6 +66,114 @@ def _agent_with_db(db, *, session_id="stale-parent", platform="desktop"):
     return agent
 
 
+def test_real_turn_finally_releases_custody_before_session_lease(tmp_path, monkeypatch):
+    import dataclasses
+    import hashlib
+    import json
+    import pytest
+    from hermes_state_runs import RunCheckpoint
+
+    def digest(data):
+        return hashlib.sha256(data).hexdigest()
+
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("checkpoint-current", source="desktop")
+    goal = '{"status":"cleared","outcome":"CANCELLED"}'
+    db.set_meta("goal:old", goal)
+    source = tmp_path / "source"
+    source.write_bytes(b"source")
+    files = {"members": {}}
+    payloads = {"plan": b"plan", "contract": b"contract", "source": json.dumps({str(source): digest(b"source")}).encode()}
+    for name, data in payloads.items():
+        path = tmp_path / (name + "-bound")
+        path.write_bytes(data)
+        files[name] = str(path)
+    member = tmp_path / "goal-key"
+    member.write_text("goal:old")
+    files["members"]["historical-goal-key"] = str(member)
+    cp = RunCheckpoint(digest(b"plan"), digest(b"contract"), digest(payloads["source"]),
+                       "observe", (("historical-goal-key", "goal:old"),), (), (), ("no effects",))
+    released = []
+    original_release = db.release_session_turn_lease
+
+    def ordered_release(session_id, holder):
+        assert db.read_run_custody("wrapper-run").disposition == "released"
+        released.append(1)
+        return original_release(session_id, holder)
+
+    monkeypatch.setattr(db, "release_session_turn_lease", ordered_release)
+    agent = _agent_with_db(db, session_id="checkpoint-current")
+    generation = 0
+    try:
+        for mode in ("normal", "error", "finalize"):
+            claimed, finish, cancelled = threading.Event(), threading.Event(), threading.Event()
+            def loop(current, *args, **kwargs):
+                request = tmp_path / "request.json"
+                request.write_text(json.dumps({"checkpoint": dataclasses.asdict(cp), "files": files,
+                    "session_id": current.session_id, "lease_holder": current._active_session_turn_lease_holder}))
+                current._run_checkpoint_custody.claim(current._active_session_turn_lease_holder,
+                    session_id=current.session_id, run_id="wrapper-run", expected_generation=generation,
+                    request_path=str(request), expected_request_digest=digest(request.read_bytes()),
+                    origin_session_id="old", historical_goal_digest=digest(goal.encode()), ttl_seconds=120)
+                if mode == "finalize":
+                    claimed.set()
+                    assert finish.wait(10)
+                if mode == "error":
+                    raise RuntimeError("injected model-loop failure")
+                return {"final_response": "ok", "messages": [], "failed": False}
+            monkeypatch.setattr("agent.conversation_loop.run_conversation", loop)
+            if mode == "finalize":
+                from contextlib import nullcontext
+                from tui_gateway import server
+                failures = []
+                def run():
+                    try:
+                        AIAgent.run_conversation(agent, "test", conversation_history=[])
+                    except BaseException as exc:
+                        failures.append(exc)
+                worker = threading.Thread(target=run)
+                worker.start()
+                try:
+                    assert claimed.wait(10)
+                    session = {"agent": agent, "running": True, "_run_thread": worker,
+                        "history_lock": threading.Lock(), "session_key": agent.session_id,
+                        "history": [], "source": "desktop"}
+                    with monkeypatch.context() as patcher:
+                        patcher.setattr(server, "_sessions", {"runtime": session})
+                        patcher.setattr(server, "_session_db", lambda s: nullcontext(db))
+                        patcher.setattr(agent, "hard_interrupt", lambda *a, **k: cancelled.set())
+                        server._finalize_session(session)
+                    assert cancelled.is_set(), "finalization must request turn cancellation"
+                    assert not session.get("_finalized")
+                    assert session.get("_run_checkpoint_finalize_deferred")
+                    assert db.read_run_custody("wrapper-run").disposition == "active"
+                    assert db._conn.execute("SELECT count(*) FROM session_turn_leases").fetchone()[0] == 1
+                finally:
+                    finish.set()
+                    worker.join(timeout=10)
+                assert not worker.is_alive()
+                assert not failures
+                with monkeypatch.context() as patcher:
+                    patcher.setattr(server, "_session_db", lambda s: nullcontext(db))
+                    session["running"] = False
+                    server._finalize_session(session)
+                assert session["_finalized"] is True
+                assert "_run_checkpoint_finalize_deferred" not in session
+            elif mode == "error":
+                with pytest.raises(RuntimeError, match="injected model-loop failure"):
+                    AIAgent.run_conversation(agent, "test", conversation_history=[])
+            else:
+                assert AIAgent.run_conversation(agent, "test", conversation_history=[])["final_response"] == "ok"
+            current = db.read_run_custody("wrapper-run")
+            assert current.disposition == "released"
+            generation = current.generation
+            assert agent._active_session_turn_lease_holder is None
+            assert db.get_meta("goal:old") == goal
+        assert len(released) == 3
+    finally:
+        db.close()
+
+
 def test_run_conversation_acquires_then_reloads_latest_tip(monkeypatch):
     db = _DB()
     agent = _agent_with_db(db)

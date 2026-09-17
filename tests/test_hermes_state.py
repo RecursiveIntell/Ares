@@ -4,6 +4,7 @@ import sqlite3
 import time
 import json
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
@@ -813,45 +814,112 @@ class TestFTS5Search:
         ]
         assert all("context" in row and row["context"] for row in default)
 
-    def test_search_projection_skips_context_enrichment_queries(self, db):
+    @pytest.mark.parametrize("read_path", ["journal-default", "writer-fallback"])
+    def test_search_projection_skips_context_enrichment_queries(
+        self, db, monkeypatch, read_path
+    ):
         db.create_session(session_id="s1", source="cli")
         db.append_message("s1", role="user", content="before")
         db.append_message("s1", role="assistant", content="projectionneedle")
         db.append_message("s1", role="user", content="after")
 
+        if read_path == "writer-fallback":
+            # Exercise the real locked-writer path without faking query results.
+            monkeypatch.setattr(db, "_checkout_read_conn", lambda: None)
+
         statements = []
-        read_conn = db._get_read_conn() or db._conn
-        traced_connections = [db._conn]
-        if read_conn is not db._conn:
-            traced_connections.append(read_conn)
-        for conn in traced_connections:
-            conn.set_trace_callback(statements.append)
+        borrowed_connections = []
+        original_read_ctx = db._read_ctx
+
+        @contextmanager
+        def traced_read_ctx():
+            # A direct _get_read_conn() opens an unpooled handle that search
+            # never uses. Trace only the actual borrow, before it is returned.
+            with original_read_ctx() as conn:
+                borrowed_connections.append(conn)
+                conn.set_trace_callback(statements.append)
+                try:
+                    yield conn
+                finally:
+                    conn.set_trace_callback(None)
+
+        monkeypatch.setattr(db, "_read_ctx", traced_read_ctx)
 
         def context_query_count():
             normalized = (" ".join(sql.upper().split()) for sql in statements)
             return sum("WITH TARGET AS (" in sql for sql in normalized)
 
+        # Positive control: absent tracing must not look like zero query work.
+        with db._read_ctx() as conn:
+            assert conn.execute(
+                "WITH target AS (SELECT 1) SELECT * FROM target"
+            ).fetchone()[0] == 1
+        assert context_query_count() == 1
+        statements.clear()
+
+        projected = db.search_messages(
+            "projectionneedle", fields=("session_id", "snippet")
+        )
+        assert len(projected) == 1
+        assert context_query_count() == 0
+        assert statements  # The projection did execute real search SQL.
+
+        expected_context = [
+            {"role": "user", "content": "before"},
+            {"role": "assistant", "content": "projectionneedle"},
+            {"role": "user", "content": "after"},
+        ]
+        full = db.search_messages(
+            "projectionneedle", fields=("session_id", "context")
+        )
+        assert len(full) == 1
+        assert full[0]["context"] == expected_context
+        assert context_query_count() == 1
+
+        default = db.search_messages("projectionneedle")
+        assert len(default) == 1
+        assert default[0]["context"] == expected_context
+        assert context_query_count() == 2
+
+        # Both normal and exceptional exits must detach the callback. Borrow
+        # through the original owner to check cleanup without reinstalling it.
+        before_cleanup_probe = list(statements)
+        with original_read_ctx() as conn:
+            conn.execute("SELECT 1").fetchone()
+        assert statements == before_cleanup_probe
+        with pytest.raises(RuntimeError, match="observer cleanup"):
+            with db._read_ctx():
+                raise RuntimeError("observer cleanup")
+        with original_read_ctx() as conn:
+            conn.execute("SELECT 1").fetchone()
+        assert statements == before_cleanup_probe
+
+        assert borrowed_connections
+        assert all(conn is borrowed_connections[0] for conn in borrowed_connections)
+        # The default path is pooled only when the runtime admits WAL.
+        # DELETE journal mode deliberately uses the locked writer instead.
+        journal_mode = db._conn.execute("PRAGMA journal_mode").fetchone()[0]
+        assert db._wal_active == (journal_mode == "wal")
+        if read_path == "journal-default" and db._wal_active:
+            assert borrowed_connections[0] is not db._conn
+        else:
+            assert borrowed_connections[0] is db._conn
+
+    def test_search_projection_with_wal_safety_fallback(self, tmp_path, monkeypatch):
+        # Select the existing restrictive policy before opening a real DB.
+        # Never force WAL on a host whose SQLite safety gate rejects it.
+        monkeypatch.setattr(
+            hermes_state, "is_sqlite_wal_reset_vulnerable", lambda version_info=None: True
+        )
+        db = SessionDB(db_path=tmp_path / "wal_safety_fallback.db")
         try:
-            projected = db.search_messages(
-                "projectionneedle", fields=("session_id", "snippet")
+            assert not db._wal_active
+            assert db._conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+            self.test_search_projection_skips_context_enrichment_queries(
+                db, monkeypatch, "journal-default"
             )
-            assert len(projected) == 1
-            assert context_query_count() == 0
-
-            full = db.search_messages(
-                "projectionneedle", fields=("session_id", "context")
-            )
-            assert len(full) == 1
-            assert full[0]["context"]
-            assert context_query_count() == 1
-
-            default = db.search_messages("projectionneedle")
-            assert len(default) == 1
-            assert default[0]["context"]
-            assert context_query_count() == 2
         finally:
-            for conn in traced_connections:
-                conn.set_trace_callback(None)
+            db.close()
 
     def test_sanitize_fts5_query_strips_dangerous_chars(self):
         """Unit test for _sanitize_fts5_query static method."""

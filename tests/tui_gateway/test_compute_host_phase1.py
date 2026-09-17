@@ -36,6 +36,25 @@ def _wait_for_frame(out: io.StringIO, predicate, timeout: float = 2.0) -> dict:
     raise AssertionError(f"timed out waiting for frame; saw={_json_lines(out)}")
 
 
+def test_host_interrupt_clears_child_pending_prompt(monkeypatch):
+    monkeypatch.setenv("HERMES_COMPUTE_HOST_CHILD", "1")
+    pending = threading.Event()
+    agent = types.SimpleNamespace(interrupt=lambda *a, **k: None, session_id="current")
+    session = {"agent": agent, "running": True, "history_lock": threading.Lock(),
+               "session_key": "current", "source": "desktop",
+               "_run_thread": types.SimpleNamespace(is_alive=lambda: True)}
+    monkeypatch.setattr(server, "_sessions", {"child": session})
+    monkeypatch.setattr(server, "_pending", {"prompt": ("child", pending)})
+    monkeypatch.setattr(server, "_finalize_session", lambda *a, **k: None)
+    host = ComputeHost(stdout=io.StringIO(), heartbeat_secs=0)
+    try:
+        host._handle_interrupt({"sid": "child", "request_id": "stop"})
+        assert pending.is_set(), "child-owned blocking prompt must be woken on Stop"
+        assert session["_turn_cancel_requested"] is True
+    finally:
+        host.close()
+
+
 def test_ensure_server_session_fallback_uses_canonical_source_resolver(monkeypatch):
     """A side-machinery failure must not abort a real host turn.
 
@@ -151,6 +170,9 @@ def test_mutator_route_table_matches_prd_inventory():
         "session.interrupt": "turn-path",
         "reload.mcp": "run-concurrent",
         "session.save": "run-concurrent",
+        "session.run_checkpoint.claim": "run-concurrent",
+        "session.run_checkpoint.refresh": "run-concurrent",
+        "session.run_checkpoint.release": "run-concurrent",
         "session.compress": "idle-gated",
         "prompt.submit.truncate": "idle-gated",
         "slash.model": "idle-gated",
