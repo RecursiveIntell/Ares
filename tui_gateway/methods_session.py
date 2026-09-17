@@ -11,6 +11,91 @@ method = _registry.method
 _profile_scoped = _registry.profile_scoped
 
 
+@method("session.run_checkpoint.claim")
+def _(rid, params: dict) -> dict:
+    """Explicit claim-only RPC; borrow the selected live agent's native owner.
+
+    Existing authenticated transport/session routing is the invocation boundary,
+    not hostile same-UID isolation. File digests bind observations, not authority.
+    A successful claim neither authorizes resume nor dispatches downstream work.
+    """
+    from hermes_state import SessionDB
+    from hermes_state_runs import RunCustodyError, _digest, _integer, _run_id, _ttl
+    from scripts.run_checkpoint_claim import ClaimOutcomeUnknown, ClaimRefusal, claim_from_files
+
+    def refuse(code, rpc_code=-32040):
+        return _err(rid, rpc_code, code, {"status": "refused", "custody_changed": False,
+                    "automatic_retry": False, "resume_authorized": False,
+                    "downstream_effects_executed": False})
+
+    fields = {"session_id", "run_id", "expected_generation", "request_path",
+              "expected_request_digest", "origin_session_id", "historical_goal_digest", "ttl_seconds"}
+    if set(params) != fields:
+        return refuse("INVALID_PARAMS", -32602)
+    try:
+        _run_id(params["run_id"])
+        _integer(params["expected_generation"], 0)
+        _ttl(params["ttl_seconds"])
+        _digest(params["expected_request_digest"])
+        _digest(params["historical_goal_digest"])
+        for name in ("session_id", "origin_session_id"):
+            value = params[name]
+            if type(value) is not str or not value.strip() or len(value) > 256 or "\x00" in value:
+                return refuse("INVALID_PARAMS", -32602)
+        path = params["request_path"]
+        if (type(path) is not str or not path or len(path) > 4096 or "\x00" in path
+                or not Path(path).is_absolute()):
+            return refuse("INVALID_PARAMS", -32602)
+    except RunCustodyError:
+        return refuse("INVALID_PARAMS", -32602)
+
+    # Never _sess/_sess_building, _get_db, _session_db, or _db_for_profile:
+    # those can build an agent or open/repair/migrate another store.
+    session, error = _sess_nowait(params, rid)
+    if error:
+        return error
+    transport, selected = _current_session_steer_authority(params["session_id"])
+    if transport is None or selected is not session:
+        return refuse("LIVE_SESSION_MISMATCH")
+    ready = session.get("agent_ready")
+    agent = session.get("agent")
+    if (agent is None or ready is None or not ready.is_set() or session.get("agent_error")
+            or session.get("running") is not True or session.get("_finalized")
+            or session.get("_turn_cancel_requested")):
+        return refuse("ACTIVE_AGENT_REQUIRED")
+    sid = getattr(agent, "session_id", None)
+    holder = getattr(agent, "_active_session_turn_lease_holder", None)
+    if type(sid) is not str or not sid or type(holder) is not str or not holder:
+        return refuse("ACTIVE_AGENT_REQUIRED")
+    db = getattr(agent, "_session_db", None)
+    if (not isinstance(db, SessionDB) or db.read_only or db._conn is None
+            or db._read_conns_closed):
+        return refuse("WRITABLE_OWNER_REQUIRED")
+    try:
+        if Path(db.db_path).resolve(strict=True) != (_session_home(session) / "state.db").resolve(strict=True):
+            return refuse("OWNER_STORE_MISMATCH")
+    except (OSError, ValueError, RuntimeError):
+        return refuse("OWNER_STORE_MISMATCH")
+
+    # Native admission rechecks currentness/lease/history/generation in its
+    # transaction. The paired bindings are compared on the single request read.
+    try:
+        result = claim_from_files(db, run_id=params["run_id"],
+            expected_generation=params["expected_generation"], request_path=path,
+            expected_request_digest=params["expected_request_digest"],
+            origin_session_id=params["origin_session_id"],
+            historical_goal_digest=params["historical_goal_digest"],
+            controller_pid=os.getpid(), ttl_seconds=params["ttl_seconds"],
+            expected_session_id=sid, expected_lease_holder=holder)
+    except ClaimRefusal as exc:
+        return refuse(str(exc))
+    except ClaimOutcomeUnknown as exc:
+        return _err(rid, -32041, str(exc), {"status": "unknown", "custody_changed": None,
+                    "automatic_retry": False, "resume_authorized": False,
+                    "downstream_effects_executed": False})
+    return _ok(rid, result)
+
+
 @method("session.create")
 def _(rid, params: dict) -> dict:
     sid = uuid.uuid4().hex[:8]
