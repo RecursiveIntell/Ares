@@ -17,7 +17,10 @@ import sqlite3
 import time
 from typing import TYPE_CHECKING, Callable, TypeVar
 
-import psutil
+try:  # Match SessionDB's scaffold import boundary without admitting custody.
+    import psutil
+except ImportError:
+    psutil = None
 
 T = TypeVar("T")
 
@@ -95,6 +98,8 @@ def _exact_keys(value, cls):
 
 
 def _process_identity(pid):
+    if psutil is None:
+        raise RunCustodyError("PROCESS_INSPECTION_UNAVAILABLE")
     try:
         process = psutil.Process(pid)
         if process.status() == psutil.STATUS_ZOMBIE:
@@ -108,6 +113,8 @@ def _process_identity(pid):
 
 def _controller(pid):
     _integer(pid)
+    if psutil is None:
+        raise RunCustodyError("PROCESS_INSPECTION_UNAVAILABLE")
     # Permit a short-lived command child of the real controller, never an
     # arbitrary caller-chosen unrelated process as an immortal lease holder.
     try:

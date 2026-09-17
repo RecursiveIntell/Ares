@@ -443,6 +443,10 @@ py-modules = [
   "hermes_logging",
   "utils",
   "mcp_serve",
+  # Runtime RPC imports: include only these private namespace modules, not
+  # the unrelated operational scripts in the same source directory.
+  "scripts.run_checkpoint_claim",
+  "scripts.run_checkpoint_resume",
 ]
 
 [tool.setuptools.packages.find]
