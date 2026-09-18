@@ -1338,6 +1338,14 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         compacted = self._sanitize_tool_pairs(compacted)
         compacted = self._ensure_latest_user_last(source_messages, compacted)
         compacted = self._preserve_multimodal_tail(source_messages, compacted)
+        from agent.conversation_compression import (
+            _ensure_compressed_has_user_turn,
+        )
+
+        # Reserve only for host material the certified candidate actually lacks.
+        # This projection is also applied idempotently immediately before
+        # finalize-v2, so the measured token delta matches the persisted shape.
+        _ensure_compressed_has_user_turn(source_messages, compacted)
         return pending_receipt, pending_receipt_id, compacted
 
     def _compact_v2_candidate(
@@ -1480,9 +1488,10 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         # otherwise the Rust store correctly rejects the child because the
         # parent's final user message is no longer an exact prefix.
         source_messages = self._without_host_todo_snapshots(messages)
-        post_finalize_reserve_tokens = self._host_finalization_reserve_tokens(
-            source_messages
-        )
+        # Start with no speculative human-anchor reserve. The first certified
+        # candidate is projected through the exact host transformations below;
+        # only an observed token increase may trigger the one bounded retry.
+        post_finalize_reserve_tokens = 0
         metrics["post_finalize_reserve_tokens"] = post_finalize_reserve_tokens
 
         # Advisory telemetry can conservatively protect a bounded few messages;
@@ -2063,42 +2072,6 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 ]
         return normalized
 
-    def _host_finalization_reserve_tokens(
-        self, messages: List[Dict[str, Any]]
-    ) -> int:
-        """Reserve Rust-enforced room for a mandatory restored human anchor.
-
-        Background/process notifications are user-role runtime scaffolding. If
-        one is the latest user row, the host boundary may restore the latest
-        real human message after deterministic compaction. The request declares
-        that exact potential addition so Rust can allocate below the admitted
-        final target while retaining authority over the budget check.
-        """
-        from agent.conversation_compression import _is_real_user_message
-
-        latest_user = next(
-            (
-                message
-                for message in reversed(messages)
-                if isinstance(message, dict) and message.get("role") == "user"
-            ),
-            None,
-        )
-        if latest_user is None or _is_real_user_message(latest_user):
-            return 0
-        anchor = next(
-            (
-                message
-                for message in reversed(messages)
-                if _is_real_user_message(message)
-            ),
-            None,
-        )
-        if anchor is None:
-            return 0
-
-        return self._estimate_message_tokens(anchor)
-
     def _rehydrate_legacy_parent_prefix(
         self,
         governor_messages: List[Dict[str, Any]],
@@ -2638,6 +2611,26 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         except (TypeError, ValueError):
             return 0
 
+    def _checkpoint_compaction_ordinal(
+        self, receipt: dict[str, Any]
+    ) -> int | None:
+        """Return a monotonic ordinal from the authenticated epoch coordinate."""
+        generation = receipt.get("generation")
+        lineage_epoch = receipt.get("lineage_epoch", 0)
+        maximum_generation = self._policy.get("max_lineage_generation")
+        if (
+            type(generation) is not int
+            or generation < 1
+            or type(lineage_epoch) is not int
+            or lineage_epoch < 0
+        ):
+            return None
+        if type(maximum_generation) is not int or maximum_generation < 1:
+            return generation if lineage_epoch == 0 else None
+        if generation > maximum_generation:
+            return None
+        return lineage_epoch * maximum_generation + generation
+
     def _llm_checkpoint_decision(
         self,
         response: dict[str, Any],
@@ -2657,10 +2650,12 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         reason = "checkpoint_strategy_unrecognized"
         if isinstance(strategy, dict) and "after_n" in strategy:
             every = int(strategy["after_n"])
-            # Receipt generation is the durable compaction ordinal. Process
-            # counters reset whenever Desktop/gateway restarts and therefore
-            # cannot own a deterministic checkpoint schedule.
-            ordinal = int(receipt["generation"])
+            # The authenticated (epoch, generation) coordinate is the durable
+            # compaction ordinal. Process counters reset on restart, while
+            # generation alone resets after an authenticated continuation.
+            ordinal = self._checkpoint_compaction_ordinal(receipt)
+            if ordinal is None:
+                return False, "checkpoint_lineage_coordinate_invalid"
             due = ordinal % every == 0
             reason = f"after_n:{every}:ordinal:{ordinal}"
         elif strategy == "ineffective_only":

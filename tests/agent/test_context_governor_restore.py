@@ -1179,6 +1179,22 @@ def test_hybrid_checkpoint_requests_zero_minimum_net_savings():
     assert engine._fixture_compact_requests[0]["policy"]["min_net_savings_tokens"] == 0
 
 
+def test_after_n_checkpoint_uses_epoch_aware_durable_ordinal():
+    engine, _llm = _checkpoint_engine(
+        target_tokens=950,
+        llm_output=_valid_llm_summary(),
+        checkpoint_strategy="after_n:3",
+    )
+    engine._policy["max_lineage_generation"] = 32
+    response = _checkpoint_response(1, session_id=engine._governor_session_id())
+    response["receipt"]["lineage_epoch"] = 1
+
+    due, reason = engine._llm_checkpoint_decision(response, target_tokens=950)
+
+    assert due is True
+    assert reason == "after_n:3:ordinal:33"
+
+
 def test_governor_config_reaches_rust_policy_owner():
     config = {
         "context": {
@@ -1811,15 +1827,14 @@ def test_host_projection_growth_retries_once_with_rust_enforced_reserve():
     ]["policy"]["post_finalize_reserve_tokens"]
 
 
-def test_synthetic_notification_reserves_latest_real_user_for_host_finalization():
+def test_synthetic_notification_does_not_reserve_anchor_already_in_candidate():
     engine, _llm = _checkpoint_engine(
         target_tokens=128_000,
         llm_output=_valid_llm_summary(),
         checkpoint_strategy="after_n:999",
     )
-    human_anchor = "human intent " * 20
     messages = [
-        {"role": "user", "content": human_anchor},
+        {"role": "user", "content": "human intent " * 20},
         {"role": "assistant", "content": "historical work " * 400},
         {
             "role": "user",
@@ -1830,17 +1845,70 @@ def test_synthetic_notification_reserves_latest_real_user_for_host_finalization(
         },
     ]
 
-    engine.compress(messages, current_tokens=200_000)
+    compacted = engine.compress(messages, current_tokens=200_000)
 
-    request = getattr(engine, "_fixture_compact_requests")[0]
-    assert request["policy"]["target_tokens"] == 128_000
-    assert request["policy"]["post_finalize_reserve_tokens"] == max(
-        1, len(human_anchor) // 4
-    ) + 4
+    requests = getattr(engine, "_fixture_compact_requests")
+    anchor_tokens = engine._estimate_message_tokens(messages[0])
+    assert requests[0]["policy"]["post_finalize_reserve_tokens"] == 0
+    assert all(
+        request["policy"]["post_finalize_reserve_tokens"] < anchor_tokens
+        for request in requests
+    )
+    assert not any(
+        messages[0]["content"] in str(message.get("content") or "")
+        for message in compacted
+        if isinstance(message, dict)
+    )
     assert engine.last_compaction_metrics is not None
-    assert engine.last_compaction_metrics["post_finalize_reserve_tokens"] == request[
-        "policy"
-    ]["post_finalize_reserve_tokens"]
+
+
+def test_synthetic_notification_reserves_missing_real_user_for_host_finalization():
+    engine, _llm = _checkpoint_engine(
+        target_tokens=128_000,
+        llm_output=_valid_llm_summary(),
+        checkpoint_strategy="after_n:999",
+    )
+    human_anchor = "human intent " * 20
+    synthetic_notification = (
+        "[IMPORTANT: Background process proc_fixture completed normally "
+        "(exit code 0).]"
+    )
+    original_run_json = engine._run_json
+
+    def run_json(args, payload, *, pass_fds=()):
+        assert not pass_fds
+        response = original_run_json(args, payload)
+        if args and args[0] in {"compact-v2", "compact-continue-v2"}:
+            response = copy.deepcopy(response)
+            response["compacted_messages"][-1] = {
+                "role": "user",
+                "content": synthetic_notification,
+            }
+        return response
+
+    engine._run_json = run_json
+    messages = [
+        {"role": "user", "content": human_anchor},
+        {"role": "assistant", "content": "historical work " * 400},
+        {"role": "user", "content": synthetic_notification},
+    ]
+
+    compacted = engine.compress(messages, current_tokens=200_000)
+
+    requests = getattr(engine, "_fixture_compact_requests")
+    assert len(requests) == 2
+    assert requests[0]["policy"]["post_finalize_reserve_tokens"] == 0
+    assert requests[1]["policy"]["post_finalize_reserve_tokens"] > 0
+    assert any(
+        human_anchor in str(message.get("content") or "")
+        for message in compacted
+        if isinstance(message, dict)
+    )
+    assert engine.last_compaction_metrics is not None
+    assert engine.last_compaction_metrics["host_projection_reserve_retry"] is True
+    assert engine.last_compaction_metrics["post_finalize_reserve_tokens"] == requests[
+        1
+    ]["policy"]["post_finalize_reserve_tokens"]
 
 
 def test_background_notification_compaction_binds_host_real_user_anchor():
