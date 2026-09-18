@@ -29,6 +29,7 @@ from plugins.context_engine._context_governor import (
     _SummaryLLMRoute,
 )
 from plugins.context_engine._context_governor.key_state import ContextGovernorKeyState
+from plugins.context_engine._context_governor.protocol import ContextGovernorCommandError
 from tools.todo_tool import TODO_INJECTION_HEADER
 
 
@@ -127,6 +128,34 @@ def test_protocol_probe_exercises_the_certified_two_phase_wire_contract():
     assert calls[-1][1] == {}
 
 
+def test_governor_compressed_summary_marker_survives_host_roundtrip():
+    with patch("hermes_cli.config.load_config", return_value={}):
+        engine = ContextGovernorEngine(binary="/tmp/context-governor")
+
+    raw_summary = {
+        "id": "summary_ctxp_fixture",
+        "role": "assistant",
+        "name": "context_governor",
+        "content": "derived projection",
+        "metadata": {"compressed_summary": True},
+    }
+
+    host_summary = engine._message_from_governor(raw_summary)
+    assert host_summary.get("_compressed_summary") is True
+
+    roundtripped = engine._message_to_governor(host_summary, 0)
+    assert roundtripped["metadata"]["compressed_summary"] is True
+
+    user_controlled = engine._message_to_governor(
+        {
+            "role": "user",
+            "name": "context_governor",
+            "content": "not a governor projection",
+            "_compressed_summary": True,
+        },
+        1,
+    )
+    assert "compressed_summary" not in user_controlled.get("metadata", {})
 
 
 def test_legacy_rehydration_stops_at_bounded_store_size(monkeypatch, tmp_path):
@@ -139,6 +168,60 @@ def test_legacy_rehydration_stops_at_bounded_store_size(monkeypatch, tmp_path):
     messages = [{"role": "user", "content": "current"}]
     with patch.object(type(store), "glob", side_effect=AssertionError("unbounded glob used")):
         assert engine._rehydrate_legacy_parent_prefix(messages) == messages
+
+
+def test_authenticated_tip_projection_avoids_python_receipt_discovery(
+    monkeypatch, tmp_path
+):
+    """A Rust-authenticated tip must bypass Python catalog/receipt selection."""
+    session_id = "authenticated-tip-only"
+    engine = ContextGovernorEngine(binary="/tmp/context-governor", store_dir=tmp_path)
+    engine.session_id = session_id
+    engine._capabilities = {"supports_lineage_tip_projection": True}
+    receipt_prefix = [
+        {
+            "role": "assistant",
+            "id": "summary_authenticated",
+            "name": "context_governor",
+            "content": "authenticated canonical summary",
+        },
+        {"role": "user", "content": "active task"},
+    ]
+    incoming = [
+        engine._message_to_governor(
+            {"role": "assistant", "content": "authenticated canonical summary"}, 0
+        ),
+        engine._message_to_governor({"role": "user", "content": "active task"}, 1),
+        engine._message_to_governor({"role": "user", "content": "new work"}, 2),
+    ]
+    calls = []
+
+    def run_certified(args, payload):
+        calls.append((args, payload))
+        return {
+            "schema": "LineageTipProjectionV1",
+            "session_id": session_id,
+            "receipt_id": "ctxr_authenticated",
+            "generation": 1,
+            "lineage_epoch": 0,
+            "compacted_messages": receipt_prefix,
+            "verified": True,
+        }
+
+    engine._run_certified_json = run_certified
+    monkeypatch.setattr(
+        type(tmp_path),
+        "iterdir",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Python receipt discovery must not run")
+        ),
+    )
+
+    assert engine._rehydrate_legacy_parent_prefix(incoming) == receipt_prefix + [
+        {"role": "user", "content": "new work"}
+    ]
+    assert len(calls) == 1
+    assert calls[0][0][0] == "lineage-tip-v2"
 
 
 def _valid_llm_summary(body: str = "checkpoint") -> str:
@@ -264,8 +347,24 @@ def _checkpoint_engine(
     def run_json(args, payload):
         nonlocal candidate_finalize_failed, generation
         if args[:3] == ["compact-v2", "--dir", str(engine.store_dir)]:
-            compact_requests.append(copy.deepcopy(payload))
-            generation += 1
+            current = copy.deepcopy(payload)
+            same_generation_retry = bool(
+                compact_requests
+                and compact_requests[-1].get("messages") == current.get("messages")
+                and int(
+                    (current.get("policy") or {}).get(
+                        "post_finalize_reserve_tokens", 0
+                    )
+                )
+                > int(
+                    (compact_requests[-1].get("policy") or {}).get(
+                        "post_finalize_reserve_tokens", 0
+                    )
+                )
+            )
+            compact_requests.append(current)
+            if not same_generation_retry:
+                generation += 1
             return _checkpoint_response(
                 generation,
                 session_id=session_id,
@@ -374,11 +473,109 @@ def _checkpoint_engine(
     return engine, llm
 
 
+def test_generation_limit_invokes_one_bounded_continuation_with_projection_retry():
+    engine, _llm = _checkpoint_engine(
+        target_tokens=900,
+        llm_output=_valid_llm_summary(),
+        checkpoint_strategy="after_n:999",
+    )
+    engine._capabilities = {"supports_lineage_continuation": True}
+    original_run_json = engine._run_json
+    commands = []
+
+    def run_json(args, payload):
+        command = args[0]
+        commands.append(command)
+        if command == "compact-v2":
+            raise ContextGovernorCommandError(
+                "compact-v2",
+                "lineage_generation_limit",
+                {"generation": 33, "maximum_generation": 32},
+            )
+        if command == "compact-continue-v2":
+            response = _checkpoint_response(
+                1,
+                session_id=engine._governor_session_id(),
+            )
+            response["receipt"]["lineage_epoch"] = 1
+            response["receipt"]["parent_receipt"] = {
+                "receipt_id": _receipt_id(32),
+                "generation": 32,
+                "lineage_epoch": 0,
+            }
+            response["receipt"]["supersedes_receipt_id"] = _receipt_id(32)
+            return response
+        return original_run_json(args, payload)
+
+    engine._run_json = run_json
+    compacted = engine._compress_once(
+        [
+            {"role": "assistant", "content": "old context " * 400},
+            {"role": "user", "content": "continue after the epoch boundary"},
+        ],
+        current_tokens=100,
+    )
+
+    assert commands.count("compact-v2") == 2
+    assert commands.count("compact-continue-v2") == 2
+    assert engine.last_compaction_metrics is not None
+    assert engine.last_compaction_metrics["host_projection_reserve_retry"] is True
+    assert engine._pending_admission is not None
+    assert engine.last_outcome["kind"] == "compacted_pending_host_commit"
+    assert engine.last_outcome["lineage_epoch"] == 1
+    assert engine.validate_pending_compression(compacted) is True
+
+
 def test_below_threshold_does_not_schedule_governor_compaction():
     engine = ContextGovernorEngine(binary="/tmp/context-governor")
     engine.update_model("fixture", context_length=1_000)
 
     assert engine.should_compress(499) is False
+
+
+def test_generation_limit_rejects_invalid_continuation_transition():
+    engine, _llm = _checkpoint_engine(
+        target_tokens=900,
+        llm_output=_valid_llm_summary(),
+        checkpoint_strategy="after_n:999",
+    )
+    engine._capabilities = {"supports_lineage_continuation": True}
+    original_run_json = engine._run_json
+
+    def run_json(args, payload):
+        if args[0] == "compact-v2":
+            raise ContextGovernorCommandError(
+                "compact-v2",
+                "lineage_generation_limit",
+                {"generation": 33, "maximum_generation": 32},
+            )
+        if args[0] == "compact-continue-v2":
+            response = _checkpoint_response(
+                1,
+                session_id=engine._governor_session_id(),
+            )
+            response["receipt"]["lineage_epoch"] = 0
+            response["receipt"]["parent_receipt"] = {
+                "receipt_id": _receipt_id(32),
+                "generation": 32,
+                "lineage_epoch": 0,
+            }
+            response["receipt"]["supersedes_receipt_id"] = _receipt_id(32)
+            return response
+        return original_run_json(args, payload)
+
+    engine._run_json = MagicMock(side_effect=run_json)
+    messages = [
+        {"role": "assistant", "content": "old context " * 400},
+        {"role": "user", "content": "continue after the epoch boundary"},
+    ]
+    compacted = engine._compress_once(messages, current_tokens=100)
+
+    assert compacted == messages
+    assert engine._pending_admission is None
+    assert engine.last_outcome is not None
+    assert engine.last_outcome["kind"] == "compaction_failed_closed"
+    assert "invalid authenticated epoch transition" in str(engine.last_error)
 
 
 def test_governor_failure_is_reported_as_abort_not_successful_noop():
@@ -533,9 +730,15 @@ def test_restart_reconciliation_failure_stays_bound_for_next_turn_retry():
     activation_attempts = 0
 
     class RestartedSessionDB:
-        def get_messages_as_conversation(self, session_id, repair_alternation=False):
+        def get_messages_as_conversation(
+            self,
+            session_id,
+            repair_alternation=False,
+            include_summary_markers=False,
+        ):
             assert session_id == "restart-lineage"
             assert repair_alternation is False
+            assert include_summary_markers is True
             return copy.deepcopy(messages)
 
         def get_compression_tip(self, session_id):
@@ -576,6 +779,43 @@ def test_restart_reconciliation_failure_stays_bound_for_next_turn_retry():
     assert engine._pending_admission is None
     assert engine.compression_count == 1
     assert engine.last_error == "synthetic next compaction reached"
+
+
+def test_restart_reconciliation_refuses_marker_blind_reader():
+    engine = ContextGovernorEngine(binary="/tmp/context-governor")
+    _bind_fixture(engine)
+    engine.session_id = "marker-blind-restart"
+    engine._lineage_session_id = "marker-blind-restart"
+    receipt_id = _receipt_id(80)
+    expected = [{"role": "user", "content": "durable projection"}]
+    calls = []
+
+    class MarkerBlindSessionDB:
+        def get_messages_as_conversation(self, session_id):
+            raise AssertionError("marker-blind fallback must not be called")
+
+    def run_json(args, payload):
+        calls.append(args[0])
+        if args[0] == "pending-v2":
+            return [
+                {
+                    "schema": "PendingReceiptInfoV2",
+                    "receipt_id": receipt_id,
+                    "session_id": "marker-blind-restart",
+                    "generation": 1,
+                    "expected_compacted_messages": expected,
+                    "verified": True,
+                }
+            ]
+        if args[0] == "activate-v2":
+            raise AssertionError("marker-blind durable state cannot authorize activation")
+        raise AssertionError(f"unexpected command: {args}")
+
+    engine._run_json = MagicMock(side_effect=run_json)
+    engine._reconcile_pending_receipts(MarkerBlindSessionDB(), "marker-blind-restart")
+
+    assert calls == ["pending-v2"]
+    assert engine._pending_admission is None
 
 
 def test_ineffective_checkpoint_is_reachable_when_deterministic_result_fits_target():
@@ -937,6 +1177,22 @@ def test_hybrid_checkpoint_requests_zero_minimum_net_savings():
     )
 
     assert engine._fixture_compact_requests[0]["policy"]["min_net_savings_tokens"] == 0
+
+
+def test_after_n_checkpoint_uses_epoch_aware_durable_ordinal():
+    engine, _llm = _checkpoint_engine(
+        target_tokens=950,
+        llm_output=_valid_llm_summary(),
+        checkpoint_strategy="after_n:3",
+    )
+    engine._policy["max_lineage_generation"] = 32
+    response = _checkpoint_response(1, session_id=engine._governor_session_id())
+    response["receipt"]["lineage_epoch"] = 1
+
+    due, reason = engine._llm_checkpoint_decision(response, target_tokens=950)
+
+    assert due is True
+    assert reason == "after_n:3:ordinal:33"
 
 
 def test_governor_config_reaches_rust_policy_owner():
@@ -1413,9 +1669,10 @@ def test_host_todo_snapshot_does_not_block_recursive_llm_checkpoint():
     engine._call_summary_llm = llm
     parent_projection = None
     generation = 0
+    last_compact_payload = None
 
     def run_json(args, payload):
-        nonlocal generation, parent_projection
+        nonlocal generation, parent_projection, last_compact_payload
         if args[:3] == ["compact-v2", "--dir", str(engine.store_dir)]:
             incoming = payload["messages"]
             if (
@@ -1425,7 +1682,23 @@ def test_host_todo_snapshot_does_not_block_recursive_llm_checkpoint():
                 raise RuntimeError(
                     "parent compacted transcript is not the exact child-input prefix"
                 )
-            generation += 1
+            same_generation_retry = bool(
+                last_compact_payload
+                and last_compact_payload.get("messages") == payload.get("messages")
+                and int(
+                    (payload.get("policy") or {}).get(
+                        "post_finalize_reserve_tokens", 0
+                    )
+                )
+                > int(
+                    (last_compact_payload.get("policy") or {}).get(
+                        "post_finalize_reserve_tokens", 0
+                    )
+                )
+            )
+            if not same_generation_retry:
+                generation += 1
+            last_compact_payload = copy.deepcopy(payload)
             return _checkpoint_response(generation, session_id="hermes-session")
         if args == ["render-prompt-v2"]:
             return {"system": "system", "user": "prompt"}
@@ -1511,6 +1784,131 @@ def test_host_todo_snapshot_does_not_block_recursive_llm_checkpoint():
     )
     assert engine.last_compaction_metrics["exact_fallback_available"] is True
     assert engine.last_error is None
+
+
+def test_host_projection_growth_retries_once_with_rust_enforced_reserve():
+    compacted_prefix = [
+        {
+            "role": "assistant",
+            "content": "",
+            "metadata": {
+                "tool_calls": [
+                    {
+                        "id": "call_missing_result",
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": "{}"},
+                    }
+                ]
+            },
+        }
+    ]
+    engine, _llm = _checkpoint_engine(
+        target_tokens=128_000,
+        llm_output=_valid_llm_summary(),
+        checkpoint_strategy="after_n:999",
+        compacted_prefix=compacted_prefix,
+    )
+    messages = [
+        {"role": "user", "content": "continue the verified task"},
+        {"role": "assistant", "content": "historical work " * 400},
+        {"role": "user", "content": "current task"},
+    ]
+
+    engine.compress(messages, current_tokens=200_000)
+
+    requests = getattr(engine, "_fixture_compact_requests")
+    assert len(requests) == 2
+    assert requests[0]["policy"]["post_finalize_reserve_tokens"] == 0
+    assert requests[1]["policy"]["post_finalize_reserve_tokens"] > 0
+    assert engine.last_compaction_metrics is not None
+    assert engine.last_compaction_metrics["host_projection_reserve_retry"] is True
+    assert engine.last_compaction_metrics["post_finalize_reserve_tokens"] == requests[
+        1
+    ]["policy"]["post_finalize_reserve_tokens"]
+
+
+def test_synthetic_notification_does_not_reserve_anchor_already_in_candidate():
+    engine, _llm = _checkpoint_engine(
+        target_tokens=128_000,
+        llm_output=_valid_llm_summary(),
+        checkpoint_strategy="after_n:999",
+    )
+    messages = [
+        {"role": "user", "content": "human intent " * 20},
+        {"role": "assistant", "content": "historical work " * 400},
+        {
+            "role": "user",
+            "content": (
+                "[IMPORTANT: Background process proc_fixture completed normally "
+                "(exit code 0).]"
+            ),
+        },
+    ]
+
+    compacted = engine.compress(messages, current_tokens=200_000)
+
+    requests = getattr(engine, "_fixture_compact_requests")
+    anchor_tokens = engine._estimate_message_tokens(messages[0])
+    assert requests[0]["policy"]["post_finalize_reserve_tokens"] == 0
+    assert all(
+        request["policy"]["post_finalize_reserve_tokens"] < anchor_tokens
+        for request in requests
+    )
+    assert not any(
+        messages[0]["content"] in str(message.get("content") or "")
+        for message in compacted
+        if isinstance(message, dict)
+    )
+    assert engine.last_compaction_metrics is not None
+
+
+def test_synthetic_notification_reserves_missing_real_user_for_host_finalization():
+    engine, _llm = _checkpoint_engine(
+        target_tokens=128_000,
+        llm_output=_valid_llm_summary(),
+        checkpoint_strategy="after_n:999",
+    )
+    human_anchor = "human intent " * 20
+    synthetic_notification = (
+        "[IMPORTANT: Background process proc_fixture completed normally "
+        "(exit code 0).]"
+    )
+    original_run_json = engine._run_json
+
+    def run_json(args, payload, *, pass_fds=()):
+        assert not pass_fds
+        response = original_run_json(args, payload)
+        if args and args[0] in {"compact-v2", "compact-continue-v2"}:
+            response = copy.deepcopy(response)
+            response["compacted_messages"][-1] = {
+                "role": "user",
+                "content": synthetic_notification,
+            }
+        return response
+
+    engine._run_json = run_json
+    messages = [
+        {"role": "user", "content": human_anchor},
+        {"role": "assistant", "content": "historical work " * 400},
+        {"role": "user", "content": synthetic_notification},
+    ]
+
+    compacted = engine.compress(messages, current_tokens=200_000)
+
+    requests = getattr(engine, "_fixture_compact_requests")
+    assert len(requests) == 2
+    assert requests[0]["policy"]["post_finalize_reserve_tokens"] == 0
+    assert requests[1]["policy"]["post_finalize_reserve_tokens"] > 0
+    assert any(
+        human_anchor in str(message.get("content") or "")
+        for message in compacted
+        if isinstance(message, dict)
+    )
+    assert engine.last_compaction_metrics is not None
+    assert engine.last_compaction_metrics["host_projection_reserve_retry"] is True
+    assert engine.last_compaction_metrics["post_finalize_reserve_tokens"] == requests[
+        1
+    ]["policy"]["post_finalize_reserve_tokens"]
 
 
 def test_background_notification_compaction_binds_host_real_user_anchor():
@@ -1652,6 +2050,7 @@ def test_host_alternation_repair_is_bound_into_the_receipt_projection():
     engine._target_tokens = lambda current_tokens: 900
     parent_projection = None
     generation = 0
+    last_compact_payload = None
 
     def compact_response(gen: int) -> dict:
         return {
@@ -1683,7 +2082,7 @@ def test_host_alternation_repair_is_bound_into_the_receipt_projection():
         }
 
     def run_json(args, payload):
-        nonlocal generation, parent_projection
+        nonlocal generation, parent_projection, last_compact_payload
         if args[:3] == ["compact-v2", "--dir", str(engine.store_dir)]:
             incoming = payload["messages"]
             if (
@@ -1693,7 +2092,23 @@ def test_host_alternation_repair_is_bound_into_the_receipt_projection():
                 raise RuntimeError(
                     "parent compacted transcript is not the exact child-input prefix"
                 )
-            generation += 1
+            same_generation_retry = bool(
+                last_compact_payload
+                and last_compact_payload.get("messages") == payload.get("messages")
+                and int(
+                    (payload.get("policy") or {}).get(
+                        "post_finalize_reserve_tokens", 0
+                    )
+                )
+                > int(
+                    (last_compact_payload.get("policy") or {}).get(
+                        "post_finalize_reserve_tokens", 0
+                    )
+                )
+            )
+            if not same_generation_retry:
+                generation += 1
+            last_compact_payload = copy.deepcopy(payload)
             return compact_response(generation)
         if args[:3] == ["search", "--dir", str(engine.store_dir)]:
             return []
@@ -1826,6 +2241,7 @@ def test_real_binary_background_notification_compacts_across_generations(
 
         second_input = first + [
             {"role": "assistant", "content": "new context " * 800},
+            {"role": "user", "content": "Please continue the verified task."},
             {
                 "role": "user",
                 "content": (
@@ -1843,6 +2259,100 @@ def test_real_binary_background_notification_compacts_across_generations(
 
     assert engine.compression_count == 2
     assert engine.last_error is None
+    assert not list((store / ".pending").glob("*.json"))
+
+
+@pytest.mark.integration
+def test_real_binary_continuation_epoch_survives_restart_and_next_generation(
+    tmp_path, monkeypatch
+):
+    binary = os.environ.get("CONTEXT_GOVERNOR_BINARY") or shutil.which(
+        "context-governor"
+    )
+    if binary is None:
+        pytest.skip("context-governor binary is not installed")
+
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    binding = ContextGovernorKeyState(home, binary).initialize_first_install()
+    binding.close()
+
+    store = home / "context-governor"
+    session_id = "continuation-epoch-e2e"
+    config = {
+        "context": {
+            "governor": {
+                "summary_mode": "llm",
+                "checkpoint_strategy": "after_n:999",
+                "token_budget": 1024,
+                "min_net_savings_tokens": 0,
+                "allocator": "deterministic_v1",
+                "budget_mode": "hard_cascade",
+                "protect_first_n": 0,
+                "protect_last_n": 1,
+                "telemetry_max_additional_protected_messages": 0,
+                "max_lineage_generation": 2,
+            }
+        }
+    }
+    messages = [
+        {"role": "user", "content": "Preserve the root human intent."},
+        {"role": "assistant", "content": "initial context " * 300},
+        {"role": "user", "content": "continue generation zero"},
+    ]
+    coordinates = []
+    engine = None
+
+    for ordinal in range(4):
+        with patch("hermes_cli.config.load_config", return_value=config):
+            engine = ContextGovernorEngine(binary=binary, store_dir=store)
+            engine.on_session_start(session_id)
+            engine.update_model(
+                "fixture", context_length=16_000, provider="openai-codex"
+            )
+            compacted = engine.compress(messages, current_tokens=100)
+            assert engine._pending_admission is not None, (
+                f"ordinal={ordinal} outcome={engine.last_outcome!r} error={engine.last_error!r}"
+            )
+            receipt = engine._pending_admission["response"]["receipt"]
+            coordinates.append(
+                (receipt.get("lineage_epoch", 0), receipt.get("generation"))
+            )
+            assert engine.validate_pending_compression(compacted) is True
+            engine.commit_pending_compression(compacted)
+            assert engine.last_error is None
+            assert engine._pending_admission is None
+
+        if ordinal < 3:
+            messages = compacted + [
+                {
+                    "role": "assistant",
+                    "content": f"new context {ordinal + 1} " * 300,
+                },
+                {
+                    "role": "user",
+                    "content": f"continue generation {ordinal + 1}",
+                },
+            ]
+
+    assert coordinates == [(0, 1), (0, 2), (1, 1), (1, 2)]
+    assert engine is not None
+    assert engine.last_outcome["kind"] == "compacted_pending_host_commit"
+    assert engine._run_certified_json(
+        [
+            "search",
+            "--dir",
+            str(store),
+            "--query",
+            "definitely-absent-checkpoint-marker",
+            "--scope",
+            "summary",
+            "--top-k",
+            "1",
+        ],
+        {},
+    ) == []
     assert not list((store / ".pending").glob("*.json"))
 
 

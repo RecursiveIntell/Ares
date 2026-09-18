@@ -233,6 +233,13 @@ def test_compressed_summary_marker_survives_restart_via_resume_history(tmp_path)
     plain = reopened.get_messages_as_conversation("s1")
     assert all("_compressed_summary" not in m for m in plain)
 
+    marker_aware = reopened.get_messages_as_conversation(
+        "s1", include_summary_markers=True
+    )
+    marker_aware_by_content = {m.get("content"): m for m in marker_aware}
+    assert marker_aware_by_content["derivative summary"]["_compressed_summary"] is True
+    assert "_compressed_summary" not in marker_aware_by_content["durable user evidence"]
+
 
 def test_compressed_summary_column_is_added_to_legacy_databases(tmp_path):
     """Pre-upgrade databases gain the marker column via declarative reconcile.
