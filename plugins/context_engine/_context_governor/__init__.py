@@ -50,6 +50,11 @@ from plugins.context_engine._context_governor.protocol import (
 
 logger = logging.getLogger(__name__)
 
+# These certified lifecycle/query operations return JSON arrays. Keep the
+# exception exact; every other certified command remains object-shaped and
+# fails closed on protocol drift.
+_CERTIFIED_ARRAY_RESULT_COMMANDS = frozenset({"pending-v2", "search"})
+
 # The provenance manifest is authenticated receipt metadata, not prompt-visible
 # context. Keep it bounded, but large enough for a real first compaction of a
 # 900K–1M-token session: the historical 128 KiB default rejected a receipt
@@ -435,6 +440,9 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             or any(capabilities.get(key) != value for key, value in required.items())
             or not capabilities.get("supports_recursive_lineage")
             or not capabilities.get("supports_certified_receipt_store")
+            or not capabilities.get("supports_lineage_continuation")
+            or not capabilities.get("supports_lineage_tip_projection")
+            or not capabilities.get("supports_host_finalization_reserve")
         ):
             raise ContextGovernorActivationError(
                 f"governor capability mismatch: {capabilities!r}"
@@ -578,7 +586,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
 
     def _run_certified_json(
         self, args: list[str], payload: dict[str, Any]
-    ) -> dict[str, Any]:
+    ) -> Any:
         capabilities = getattr(self, "_capabilities", None)
         if not isinstance(capabilities, dict):
             self.probe_activation()
@@ -1256,6 +1264,152 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                     return messages
             return self._compress_once(messages, current_tokens, focus_topic)
 
+    def _estimate_message_tokens(self, message: Dict[str, Any]) -> int:
+        """Mirror Context Governor's configured deterministic token counter."""
+        text = self._content_to_text(message.get("content"))
+        counter = str(self._policy.get("token_counter") or "approx_chars")
+        if counter == "approx_words":
+            text_tokens = sum(
+                len(token) // 4
+                + int(token.endswith((".", ",", ";", "!", "?")))
+                for token in text.split()
+            )
+            text_tokens = max(1, text_tokens)
+        else:
+            char_estimate = max(1, len(text) // 4)
+            whitespace_tokens = len(text.split())
+            punctuation_tokens = sum(
+                character in '{}[]:,"`/\\' for character in text
+            ) // 4
+            provider_estimate = max(
+                1, char_estimate, whitespace_tokens + punctuation_tokens
+            )
+            if counter == "approx_chars":
+                text_tokens = char_estimate
+            elif counter == "tiktoken_cl100k":
+                text_tokens = max(provider_estimate, len(text.encode("utf-8")))
+            else:
+                text_tokens = provider_estimate
+        role = str(message.get("role") or "assistant")
+        overhead = {"system": 5, "user": 4, "assistant": 4, "tool": 7}.get(
+            role, 4
+        )
+        message_name = message.get("name") or message.get("tool_name")
+        return text_tokens + overhead + int(bool(message_name))
+
+    def _estimate_messages_tokens(self, messages: List[Dict[str, Any]]) -> int:
+        return sum(
+            self._estimate_message_tokens(message)
+            for message in messages
+            if isinstance(message, dict)
+        )
+
+    def _project_compaction_candidate(
+        self,
+        response: dict[str, Any],
+        source_messages: List[Dict[str, Any]],
+    ) -> tuple[dict[str, Any], str, List[Dict[str, Any]]]:
+        """Apply deterministic host projection before receipt finalization."""
+        pending_receipt = response.get("receipt") or {}
+        if pending_receipt.get("schema") != "ContextCompactionReceiptV2":
+            raise ValueError(
+                "compact-v2 returned a non-V2 receipt; recursive provenance is required"
+            )
+        pending_receipt_id = pending_receipt.get("receipt_id")
+        if not isinstance(pending_receipt_id, str) or not pending_receipt_id:
+            raise ValueError("compact returned no receipt_id")
+        raw_compacted = response.get("compacted_messages") or []
+        expected_summary_id = self._expected_summary_message_id(response)
+        summary_matches = 0
+        compacted: List[Dict[str, Any]] = []
+        for raw_message in raw_compacted:
+            if not isinstance(raw_message, dict):
+                continue
+            host_message = self._message_from_governor(raw_message)
+            if self._is_exact_summary_message(raw_message, expected_summary_id):
+                summary_matches += 1
+                host_message["_context_governor_summary_id"] = expected_summary_id
+            compacted.append(host_message)
+        if summary_matches > 1:
+            raise ValueError(
+                "compact-v2 returned multiple messages for one allocation-plan summary"
+            )
+        compacted = self._ensure_latest_user_last(source_messages, compacted)
+        compacted = self._sanitize_tool_pairs(compacted)
+        compacted = self._ensure_latest_user_last(source_messages, compacted)
+        compacted = self._preserve_multimodal_tail(source_messages, compacted)
+        return pending_receipt, pending_receipt_id, compacted
+
+    def _compact_v2_candidate(
+        self, request: dict[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, int] | None]:
+        """Run ordinary compaction, then one explicit Rust-owned continuation.
+
+        Python neither chooses an epoch nor constructs a parent edge. It may
+        request the typed continuation operation only after Rust reports the
+        configured generation ceiling, and then validates the returned owner
+        transition before the normal finalize/prepare lifecycle continues.
+        """
+        command = ["compact-v2", "--dir", str(self.store_dir)]
+        try:
+            response = self._run_certified_json(command, request)
+            if not isinstance(response, dict):
+                raise ContextGovernorProtocolError(
+                    "compact-v2 returned a non-object candidate"
+                )
+            return response, None
+        except ContextGovernorCommandError as exc:
+            if exc.code != "lineage_generation_limit":
+                raise
+            capabilities = getattr(self, "_capabilities", None)
+            if not isinstance(capabilities, dict) or not capabilities.get(
+                "supports_lineage_continuation"
+            ):
+                raise ContextGovernorProtocolError(
+                    "governor reported a generation ceiling without the authenticated continuation capability"
+                ) from exc
+            attempted_generation = exc.details.get("generation")
+            maximum_generation = exc.details.get("maximum_generation")
+            if (
+                type(attempted_generation) is not int
+                or attempted_generation < 2
+                or type(maximum_generation) is not int
+                or maximum_generation < 1
+                or attempted_generation != maximum_generation + 1
+            ):
+                raise ContextGovernorProtocolError(
+                    "generation-limit failure omitted a valid continuation boundary"
+                ) from exc
+
+            response = self._run_certified_json(
+                ["compact-continue-v2", "--dir", str(self.store_dir)],
+                request,
+            )
+            receipt = response.get("receipt") if isinstance(response, dict) else None
+            parent = receipt.get("parent_receipt") if isinstance(receipt, dict) else None
+            lineage_epoch = receipt.get("lineage_epoch") if isinstance(receipt, dict) else None
+            parent_receipt_id = parent.get("receipt_id") if isinstance(parent, dict) else None
+            if (
+                not isinstance(response, dict)
+                or not isinstance(receipt, dict)
+                or receipt.get("schema") != "ContextCompactionReceiptV2"
+                or receipt.get("generation") != 1
+                or type(lineage_epoch) is not int
+                or lineage_epoch < 1
+                or not isinstance(parent, dict)
+                or parent.get("generation") != maximum_generation
+                or not isinstance(parent_receipt_id, str)
+                or not parent_receipt_id
+                or receipt.get("supersedes_receipt_id") != parent_receipt_id
+            ):
+                raise ContextGovernorProtocolError(
+                    "compact-continue-v2 returned an invalid authenticated epoch transition"
+                )
+            return response, {
+                "lineage_epoch": lineage_epoch,
+                "parent_generation": maximum_generation,
+            }
+
     def _compress_once(
         self,
         messages: List[Dict[str, Any]],
@@ -1303,6 +1457,9 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             "exact_fallback_available": False,
             "fallback_events": self.fallback_event_count,
             "integrity_result": "not_persisted",
+            "lineage_continuation": None,
+            "post_finalize_reserve_tokens": 0,
+            "host_projection_reserve_retry": False,
             "elapsed_ms": None,
         }
         self.last_compaction_metrics = metrics
@@ -1323,6 +1480,10 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         # otherwise the Rust store correctly rejects the child because the
         # parent's final user message is no longer an exact prefix.
         source_messages = self._without_host_todo_snapshots(messages)
+        post_finalize_reserve_tokens = self._host_finalization_reserve_tokens(
+            source_messages
+        )
+        metrics["post_finalize_reserve_tokens"] = post_finalize_reserve_tokens
 
         # Advisory telemetry can conservatively protect a bounded few messages;
         # it never creates causal claims or authorizes check skipping.
@@ -1353,6 +1514,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             "messages": governor_messages,
             "policy": {
                 "target_tokens": target_tokens,
+                "post_finalize_reserve_tokens": post_finalize_reserve_tokens,
                 "protect_first_n": self.protect_first_n,
                 "protect_last_n": telemetry_protect_last_n,
                 "summary_max_chars": self._policy["summary_max_chars"],
@@ -1373,55 +1535,40 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             "focus": focus_topic,
         }
         try:
-            response = self._run_certified_json(
-                [
-                    "compact-v2",
-                    "--dir",
-                    str(self.store_dir),
-
-                ],
-                request,
-            )
-            pending_receipt = response.get("receipt") or {}
-            if pending_receipt.get("schema") != "ContextCompactionReceiptV2":
-                raise ValueError(
-                    "compact-v2 returned a non-V2 receipt; recursive provenance is required"
+            lineage_continuation = None
+            for projection_attempt in range(2):
+                response, lineage_continuation = self._compact_v2_candidate(request)
+                pending_receipt, pending_receipt_id, compacted = (
+                    self._project_compaction_candidate(response, source_messages)
                 )
-            pending_receipt_id = pending_receipt.get("receipt_id")
-            if not isinstance(pending_receipt_id, str) or not pending_receipt_id:
-                raise ValueError("compact returned no receipt_id")
-            raw_compacted = response.get("compacted_messages") or []
-            expected_summary_id = self._expected_summary_message_id(response)
-            summary_matches = 0
-            compacted = []
-            for raw_message in raw_compacted:
-                if not isinstance(raw_message, dict):
-                    continue
-                host_message = self._message_from_governor(raw_message)
-                if self._is_exact_summary_message(raw_message, expected_summary_id):
-                    summary_matches += 1
-                    # Transient adapter identity. _message_to_governor ignores
-                    # underscore-prefixed host fields, so this can select the
-                    # Rust-owned summary without becoming provider input or
-                    # receipt metadata.
-                    host_message["_context_governor_summary_id"] = expected_summary_id
-                compacted.append(host_message)
-            if summary_matches > 1:
-                raise ValueError(
-                    "compact-v2 returned multiple messages for one allocation-plan summary"
+                raw_compacted = [
+                    message
+                    for message in (response.get("compacted_messages") or [])
+                    if isinstance(message, dict)
+                ]
+                raw_tokens = self._estimate_messages_tokens(raw_compacted)
+                host_tokens = self._estimate_messages_tokens(compacted)
+                required_reserve = max(
+                    post_finalize_reserve_tokens,
+                    max(0, host_tokens - raw_tokens),
                 )
-            compacted = self._ensure_latest_user_last(source_messages, compacted)
-            # A result whose companion call was compacted away is not valid
-            # provider input.  Do not convert that raw result into ordinary
-            # assistant prose: doing so promotes terminal/search/file payloads
-            # into durable user-visible transcript content.  The pair repair
-            # below drops orphan results and retains a bounded stub only for a
-            # surviving call that lacks its result.
-            compacted = self._sanitize_tool_pairs(compacted)
-            # Tool-pair repair may insert a synthetic result after the active
-            # instruction. Reassert the host contract before finalization.
-            compacted = self._ensure_latest_user_last(source_messages, compacted)
-            compacted = self._preserve_multimodal_tail(source_messages, compacted)
+                declared_reserve = int(
+                    request["policy"].get("post_finalize_reserve_tokens") or 0
+                )
+                if required_reserve <= declared_reserve:
+                    break
+                if projection_attempt != 0:
+                    raise ContextGovernorProtocolError(
+                        "host finalization reserve did not converge after one deterministic retry"
+                    )
+                request["policy"]["post_finalize_reserve_tokens"] = required_reserve
+                metrics["post_finalize_reserve_tokens"] = required_reserve
+                metrics["host_projection_reserve_retry"] = True
+            else:  # pragma: no cover - bounded loop always breaks or raises
+                raise ContextGovernorProtocolError(
+                    "host finalization reserve retry exhausted"
+                )
+            metrics["lineage_continuation"] = copy.deepcopy(lineage_continuation)
 
             deterministic_tokens = sum(
                 max(1, len(self._content_to_text(message.get("content"))) // 4)
@@ -1617,6 +1764,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 # durable transcript boundary. This prevents an unrelated
                 # concurrent caller from activating or discarding this receipt.
                 "host_boundary_accepted": False,
+                "lineage_continuation": copy.deepcopy(lineage_continuation),
             }
             self.last_error = None
             self.last_outcome = {
@@ -1625,6 +1773,8 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 "target_tokens": target_tokens,
                 "final_tokens": finalized_tokens,
             }
+            if lineage_continuation is not None:
+                self.last_outcome.update(lineage_continuation)
 
             return compacted or messages
         except Exception as exc:
@@ -1913,6 +2063,42 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 ]
         return normalized
 
+    def _host_finalization_reserve_tokens(
+        self, messages: List[Dict[str, Any]]
+    ) -> int:
+        """Reserve Rust-enforced room for a mandatory restored human anchor.
+
+        Background/process notifications are user-role runtime scaffolding. If
+        one is the latest user row, the host boundary may restore the latest
+        real human message after deterministic compaction. The request declares
+        that exact potential addition so Rust can allocate below the admitted
+        final target while retaining authority over the budget check.
+        """
+        from agent.conversation_compression import _is_real_user_message
+
+        latest_user = next(
+            (
+                message
+                for message in reversed(messages)
+                if isinstance(message, dict) and message.get("role") == "user"
+            ),
+            None,
+        )
+        if latest_user is None or _is_real_user_message(latest_user):
+            return 0
+        anchor = next(
+            (
+                message
+                for message in reversed(messages)
+                if _is_real_user_message(message)
+            ),
+            None,
+        )
+        if anchor is None:
+            return 0
+
+        return self._estimate_message_tokens(anchor)
+
     def _rehydrate_legacy_parent_prefix(
         self,
         governor_messages: List[Dict[str, Any]],
@@ -1933,9 +2119,71 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             return governor_messages
 
         candidates: list[tuple[int, str, List[Dict[str, Any]]]] = []
+        capabilities = getattr(self, "_capabilities", None)
+        authenticated_tip_bound = bool(
+            isinstance(capabilities, dict)
+            and capabilities.get("supports_lineage_tip_projection")
+        )
+        if authenticated_tip_bound:
+            try:
+                tip = self._run_certified_json(
+                    [
+                        "lineage-tip-v2",
+                        "--dir",
+                        str(self.store_dir),
+                        "--session",
+                        governor_session_id,
+                    ],
+                    {},
+                )
+            except Exception:
+                logger.warning(
+                    "context-governor: authenticated lineage-tip projection unavailable",
+                    exc_info=True,
+                )
+                return governor_messages
+            compacted = tip.get("compacted_messages") if isinstance(tip, dict) else None
+            receipt_id = tip.get("receipt_id") if isinstance(tip, dict) else None
+            generation = tip.get("generation") if isinstance(tip, dict) else None
+            lineage_epoch = tip.get("lineage_epoch") if isinstance(tip, dict) else None
+            valid_empty_tip = (
+                compacted == []
+                and receipt_id is None
+                and generation is None
+                and lineage_epoch == 0
+            )
+            valid_active_tip = (
+                isinstance(compacted, list)
+                and bool(compacted)
+                and all(isinstance(message, dict) for message in compacted)
+                and isinstance(receipt_id, str)
+                and bool(receipt_id)
+                and type(generation) is int
+                and generation >= 1
+                and type(lineage_epoch) is int
+                and lineage_epoch >= 0
+            )
+            if (
+                not isinstance(tip, dict)
+                or tip.get("schema") != "LineageTipProjectionV1"
+                or tip.get("verified") is not True
+                or tip.get("session_id") != governor_session_id
+                or not (valid_empty_tip or valid_active_tip)
+            ):
+                return governor_messages
+            if valid_active_tip:
+                assert isinstance(compacted, list)
+                assert isinstance(receipt_id, str)
+                assert type(generation) is int
+                candidates = [(generation, receipt_id, compacted)]
+
         index_path = self.store_dir / ".receipt-index.sqlite3"
         receipt_paths: list[tuple[str, int, str]] = []
-        if index_path.is_file():
+        if authenticated_tip_bound:
+            # Rust already selected and authenticated the unique tip. Do not
+            # inspect the host-side catalog or receipt payloads in this path.
+            pass
+        elif index_path.is_file():
             # The catalog is a rebuildable selector, not receipt authority. It
             # bounds this compatibility bridge to the target lineage; the core
             # still authenticates the selected receipt and its complete chain.
@@ -2065,7 +2313,14 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                     legacy_projection(message) for message in current_prefix
                 ]:
                     continue
-                if durable_projection == current_prefix:
+                if authenticated_tip_bound:
+                    # Equality with the lossy durable projection is precisely
+                    # the case that needs canonical field restoration.
+                    if compacted == current_prefix:
+                        continue
+                elif durable_projection == current_prefix:
+                    # Historical fixture/legacy behavior has no authenticated
+                    # tip selector and must not promote a guessed receipt.
                     continue
                 logger.info(
                     "context-governor: rehydrated authenticated receipt prefix "
@@ -2106,6 +2361,17 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             metadata["tool_calls"] = msg["tool_calls"]
         if msg.get("tool_call_id"):
             metadata["tool_call_id"] = msg["tool_call_id"]
+        if (
+            msg.get("_compressed_summary") is True
+            and (
+                msg.get("tool_name") == "context_governor"
+                or (role == "assistant" and msg.get("name") == "context_governor")
+            )
+            and role in {"assistant", "user"}
+        ):
+            # Map only the host's existing durable marker. Rust still owns the
+            # exact summary identity and allocation-plan checks.
+            metadata["compressed_summary"] = True
         if metadata:
             out["metadata"] = metadata
         return out
@@ -2129,12 +2395,19 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             out["id"] = msg.get("id")
         # Restore OpenAI-specific fields from metadata
         if isinstance(metadata, dict):
+            governor_projection = bool(
+                metadata.get("compressed_summary") is True
+                and msg.get("name") == "context_governor"
+                and msg.get("role") in {"assistant", "user"}
+            )
             if isinstance(metadata.get("hermes_metadata"), dict):
                 out["metadata"] = copy.deepcopy(metadata["hermes_metadata"])
             if metadata.get("tool_calls"):
                 out["tool_calls"] = metadata["tool_calls"]
             if metadata.get("tool_call_id"):
                 out["tool_call_id"] = metadata["tool_call_id"]
+            if governor_projection:
+                out["_compressed_summary"] = True
         return out
 
     @staticmethod
@@ -3474,7 +3747,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         payload: dict[str, Any],
         *,
         pass_fds: tuple[int, ...] = (),
-    ) -> dict[str, Any]:
+    ) -> Any:
         expect_failure_envelope = FAILURE_FLAG in args
         command = [str(self.binary), *args]
         popen_kwargs: dict[str, Any] = {
@@ -3528,10 +3801,17 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                     "Context Governor returned invalid JSON success output"
                 ) from exc
             raise
-        if not isinstance(result, dict) and expect_failure_envelope:
-            raise ContextGovernorProtocolError(
-                "Context Governor returned non-object certified success output"
-            )
+        if expect_failure_envelope:
+            command_name = args[0] if args else ""
+            if command_name in _CERTIFIED_ARRAY_RESULT_COMMANDS:
+                if not isinstance(result, list):
+                    raise ContextGovernorProtocolError(
+                        f"Context Governor {command_name} returned a non-array certified success output"
+                    )
+            elif not isinstance(result, dict):
+                raise ContextGovernorProtocolError(
+                    "Context Governor returned non-object certified success output"
+                )
         return result
 
     @staticmethod
@@ -3928,9 +4208,12 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                     session_db,
                     candidate_id,
                     repair_alternation=False,
+                    include_summary_markers=True,
                 )
             except TypeError:
-                durable = getter(session_db, candidate_id)
+                # A marker-free legacy reader cannot prove the authenticated
+                # pending projection. Never manufacture restart success.
+                continue
             except Exception:
                 continue
             if isinstance(durable, list) and durable:
