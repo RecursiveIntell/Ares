@@ -2058,7 +2058,16 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             if isinstance(content, str):
                 marker = content.find(TODO_INJECTION_HEADER)
                 if marker >= 0:
-                    message["content"] = content[:marker].rstrip()
+                    prefix = content[:marker]
+                    # The host appends the todo block with exactly two newline
+                    # separator bytes. Remove only those owned bytes: ``rstrip``
+                    # also erased receipt-bound whitespace from the real user
+                    # message (notably the trailing newline from --query-file),
+                    # so pending validation rejected an otherwise exact live
+                    # continuation projection.
+                    if prefix.endswith("\n\n"):
+                        prefix = prefix[:-2]
+                    message["content"] = prefix
             elif isinstance(content, list):
                 message["content"] = [
                     part
