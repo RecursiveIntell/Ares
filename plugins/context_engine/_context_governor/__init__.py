@@ -2241,6 +2241,20 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         def legacy_projection(message: Dict[str, Any]) -> Dict[str, Any]:
             projection = copy.deepcopy(message)
             projection.pop("name", None)
+            # An authenticated Rust tip may restore only leading/trailing
+            # whitespace removed by SessionDB replay's final ``.strip()``.
+            # Deliberately do not mirror ``sanitize_context`` here: that
+            # sanitizer also removes internal memory-context blocks and fence
+            # tags, and equality through that broader lossy view must not
+            # authorize reintroducing provider-hidden content. Keep the
+            # unauthenticated legacy/catalog path fully content-exact.
+            if authenticated_tip_bound and projection.get("role") in {
+                "user",
+                "assistant",
+            }:
+                content = projection.get("content")
+                if isinstance(content, str):
+                    projection["content"] = content.strip()
             # Hermes never had a durable generic message-id column.  The
             # adapter intentionally retains tool-call identity, but assistant
             # summary ids from old receipts were not persisted.
@@ -2267,6 +2281,19 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             host_messages = [
                 self._message_from_governor(message) for message in compacted
             ]
+            if authenticated_tip_bound:
+                # SessionDB applies its final ``.strip()`` to each durable
+                # user/assistant row before resume-time alternation repair.
+                # Preserve that order for whitespace recovery only: stripping
+                # after two user rows merge leaves the first row's former
+                # trailing newline internal. Do not apply the broader
+                # ``sanitize_context`` transformation here (see above).
+                for message in host_messages:
+                    if message.get("role") not in {"user", "assistant"}:
+                        continue
+                    content = message.get("content")
+                    if isinstance(content, str):
+                        message["content"] = content.strip()
             try:
                 from agent.agent_runtime_helpers import repair_message_sequence
 

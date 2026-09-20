@@ -261,6 +261,141 @@ def test_authenticated_tip_projection_avoids_python_receipt_discovery(
     assert calls[0][0][0] == "lineage-tip-v2"
 
 
+def test_authenticated_tip_restores_sessiondb_sanitized_trailing_whitespace(tmp_path):
+    """A verified tip restores bytes lost only by the durable replay sanitizer."""
+    session_id = "authenticated-whitespace-tip"
+    engine = ContextGovernorEngine(binary="/tmp/context-governor", store_dir=tmp_path)
+    engine.session_id = session_id
+    engine._lineage_session_id = session_id
+    engine._capabilities = {"supports_lineage_tip_projection": True}
+    receipt_prefix = [
+        {
+            "role": "assistant",
+            "id": "summary_authenticated",
+            "name": "context_governor",
+            "content": "authenticated canonical summary",
+        },
+        {"role": "user", "content": "active task\n"},
+    ]
+    suffix = {"role": "assistant", "content": "post-compaction answer"}
+    incoming = [
+        engine._message_to_governor(
+            {"role": "assistant", "content": "authenticated canonical summary"}, 0
+        ),
+        engine._message_to_governor({"role": "user", "content": "active task"}, 1),
+        engine._message_to_governor(suffix, 2),
+    ]
+
+    def run_certified(args, payload):
+        return {
+            "schema": "LineageTipProjectionV1",
+            "session_id": session_id,
+            "receipt_id": "ctxr_authenticated_whitespace",
+            "generation": 1,
+            "lineage_epoch": 1,
+            "compacted_messages": receipt_prefix,
+            "verified": True,
+        }
+
+    engine._run_certified_json = run_certified
+
+    assert engine._rehydrate_legacy_parent_prefix(incoming) == receipt_prefix + [suffix]
+
+    incoming[1]["content"] = "different active task"
+    assert engine._rehydrate_legacy_parent_prefix(incoming) == incoming
+
+
+def test_authenticated_tip_does_not_restore_non_whitespace_sanitizer_loss(tmp_path):
+    """Provider-hidden memory blocks cannot ride the whitespace recovery bridge."""
+    session_id = "authenticated-non-whitespace-loss"
+    engine = ContextGovernorEngine(binary="/tmp/context-governor", store_dir=tmp_path)
+    engine.session_id = session_id
+    engine._lineage_session_id = session_id
+    engine._capabilities = {"supports_lineage_tip_projection": True}
+    receipt_prefix = [
+        {
+            "role": "assistant",
+            "id": "summary_authenticated",
+            "name": "context_governor",
+            "content": "authenticated canonical summary",
+        },
+        {
+            "role": "user",
+            "content": "active task<memory-context>provider-hidden</memory-context>",
+        },
+    ]
+    incoming = [
+        engine._message_to_governor(
+            {"role": "assistant", "content": "authenticated canonical summary"}, 0
+        ),
+        engine._message_to_governor({"role": "user", "content": "active task"}, 1),
+        engine._message_to_governor(
+            {"role": "assistant", "content": "post-compaction answer"}, 2
+        ),
+    ]
+
+    def run_certified(args, payload):
+        return {
+            "schema": "LineageTipProjectionV1",
+            "session_id": session_id,
+            "receipt_id": "ctxr_authenticated_non_whitespace",
+            "generation": 1,
+            "lineage_epoch": 1,
+            "compacted_messages": receipt_prefix,
+            "verified": True,
+        }
+
+    engine._run_certified_json = run_certified
+
+    assert engine._rehydrate_legacy_parent_prefix(incoming) == incoming
+
+
+def test_authenticated_tip_restores_whitespace_before_provider_role_repair(tmp_path):
+    """SessionDB row sanitation precedes deterministic adjacent-role merging."""
+    session_id = "authenticated-repaired-whitespace-tip"
+    engine = ContextGovernorEngine(binary="/tmp/context-governor", store_dir=tmp_path)
+    engine.session_id = session_id
+    engine._lineage_session_id = session_id
+    engine._capabilities = {"supports_lineage_tip_projection": True}
+    receipt_prefix = [
+        {
+            "role": "assistant",
+            "id": "summary_authenticated",
+            "name": "context_governor",
+            "content": "authenticated canonical summary",
+        },
+        {"role": "user", "content": "prior task\n"},
+        {"role": "user", "content": "active task\n"},
+    ]
+    suffix = {"role": "assistant", "content": "post-compaction answer"}
+    incoming_host = [
+        {"role": "assistant", "content": "authenticated canonical summary"},
+        {"role": "user", "content": "prior task"},
+        {"role": "user", "content": "active task"},
+        copy.deepcopy(suffix),
+    ]
+    repair_message_sequence(None, incoming_host)
+    incoming = [
+        engine._message_to_governor(message, index)
+        for index, message in enumerate(incoming_host)
+    ]
+
+    def run_certified(args, payload):
+        return {
+            "schema": "LineageTipProjectionV1",
+            "session_id": session_id,
+            "receipt_id": "ctxr_authenticated_repaired_whitespace",
+            "generation": 1,
+            "lineage_epoch": 1,
+            "compacted_messages": receipt_prefix,
+            "verified": True,
+        }
+
+    engine._run_certified_json = run_certified
+
+    assert engine._rehydrate_legacy_parent_prefix(incoming) == receipt_prefix + [suffix]
+
+
 def _valid_llm_summary(body: str = "checkpoint") -> str:
     return (
         "=== ACTIVE TASK ===\nfinal\n\n"
