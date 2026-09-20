@@ -158,6 +158,43 @@ def test_governor_compressed_summary_marker_survives_host_roundtrip():
     assert "compressed_summary" not in user_controlled.get("metadata", {})
 
 
+@pytest.mark.parametrize("trailing_whitespace", ["\n", "  ", "\n  "])
+def test_todo_snapshot_removal_preserves_exact_user_trailing_whitespace(
+    trailing_whitespace,
+):
+    """Host-only todo cleanup must not mutate receipt-bound user bytes."""
+    with patch("hermes_cli.config.load_config", return_value={}):
+        engine = ContextGovernorEngine(binary="/tmp/context-governor")
+
+    user_content = "recovery probe" + trailing_whitespace
+    committed = [
+        {
+            "role": "user",
+            "content": (
+                user_content
+                + "\n\n"
+                + TODO_INJECTION_HEADER
+                + "\n- [ ] preserve exact bytes (in_progress)"
+            ),
+        }
+    ]
+
+    normalized = engine._without_host_todo_snapshots(committed)
+    engine._pending_admission = {
+        "pending_info": {
+            "expected_compacted_messages": [
+                engine._message_to_governor(
+                    {"role": "user", "content": user_content}, 0
+                )
+            ]
+        }
+    }
+
+    assert normalized == [{"role": "user", "content": user_content}]
+    assert engine.validate_pending_compression(committed) is True
+    assert committed[0]["content"].endswith("(in_progress)")
+
+
 def test_legacy_rehydration_stops_at_bounded_store_size(monkeypatch, tmp_path):
     """A missing catalog must not scan every receipt in a large archive."""
     store = tmp_path / "governor"
