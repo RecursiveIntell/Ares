@@ -167,7 +167,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         stdout, stderr = result.pop("stdout"), result.pop("stderr")
         (out / f"{name}.stdout").write_bytes(stdout)
         (out / f"{name}.stderr").write_bytes(stderr)
-        report["steps"].append({"name": name, **result,
+        report["steps"].append({"name": name, "argv": list(argv), **result,
                                 "stdout_sha256": digest(stdout), "stderr_sha256": digest(stderr)})
         require(result["state"] == "completed", f"{name} did not complete")
         return stdout
@@ -200,7 +200,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         report["status"] = "checked"
         report["evidence_sha256"] = digest(evidence_raw)
         report["evidence_verdict"] = json.loads(evidence_raw)["verdict"]
-    except (ValueError, OSError, subprocess.SubprocessError, UnicodeError) as exc:
+    except (ValueError, OSError, subprocess.SubprocessError, UnicodeError, KeyError, TypeError) as exc:
         report["status"] = "failed"
         report["failure_type"] = type(exc).__name__
     encoded = (json.dumps(report, sort_keys=True, indent=2) + "\n").encode()

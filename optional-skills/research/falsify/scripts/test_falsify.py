@@ -74,6 +74,14 @@ class RunnerTests(unittest.TestCase):
         with self.assertRaises(OSError):
             falsify.backend_identity(self.root)
 
+    def test_skill_description_meets_dispatch_limit(self):
+        skill = Path(__file__).parent.parent / "SKILL.md"
+        frontmatter = skill.read_text(encoding="utf-8").split("---", 2)[1]
+        description = next(line.removeprefix("description: ") for line in frontmatter.splitlines()
+                           if line.startswith("description: "))
+        self.assertLessEqual(len(description), 60)
+        self.assertTrue(description.endswith("."))
+
 
 @unittest.skipUnless(os.environ.get("FALSIFY_TEST_CLAIMLEDGER_ROOT"), "explicit ClaimLedger checkout not selected")
 class RealIntegration(unittest.TestCase):
@@ -96,6 +104,9 @@ class RealIntegration(unittest.TestCase):
                 self.assertEqual(result["status"], "checked", result)
                 self.assertEqual(result["evidence_verdict"], "finite_problem_infeasible")
                 self.assertEqual(result["support_admission"], "not_performed")
+                self.assertTrue(result["steps"])
+                self.assertTrue(all(step["argv"] and all(type(arg) is str for arg in step["argv"])
+                                    for step in result["steps"]))
                 with self.assertRaises(FileExistsError):
                     falsify.run(args)
                 args.out = work/"mismatch"

@@ -1,6 +1,6 @@
 ---
 name: falsify
-description: Check declared scientific contracts and finite constitutive witnesses with replayable evidence.
+description: Check scientific contracts and exact finite witnesses.
 version: 0.1.0
 author: Josh Stevenson / RecursiveIntell
 license: MIT
@@ -73,9 +73,10 @@ The output directory must not already exist and its parent must exist.
 
 The runner uses fixed Python module operations, isolated interpreter mode,
 a scrubbed environment, per-step deadlines, streamed output limits, and process
--group cleanup. Defaults: 20 seconds per step, 256 KiB per output stream, 64 KiB
-per input. `solve` uses at most five subprocess steps. The timeout is per step,
-not an assertion that the entire research problem will complete within a limit.
+-group cleanup. Its private report records the exact argv and exit state for
+each step. Defaults: 20 seconds per step, 256 KiB per output stream, 64 KiB per
+input. `solve` uses at most five subprocess steps. The timeout is per step, not
+an assertion that the entire research problem will complete within a limit.
 
 Reports contain the selected inputs and may be sensitive. Keep the output
 private. This is **not** an OS sandbox: explicitly trusted backend code executes
