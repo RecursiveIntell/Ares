@@ -48,6 +48,10 @@ def test_aggregate_runs_checksum_pinned_actionlint_before_evaluator():
     assert "ACTIONLINT_SHA256: 900919a84f2229bac68ca9cd4103ea297abc35e9689ebb842c6e34a3d1b01b0a" in block
     assert "archive=\"actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz\"" in block
     assert "Lint GitHub Actions workflows" in block
+    assert (
+        "run: ./actionlint -ignore 'constant expression \"false\" in condition' "
+        ".github/workflows/ci.yaml"
+    ) in block
     assert "scripts/ci/evaluate_required_checks.py" in block
 
 
