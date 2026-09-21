@@ -4,6 +4,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from scripts.ci.evaluate_required_checks import KNOWN_JOBS
+
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yaml"
@@ -52,6 +54,8 @@ def test_aggregate_runs_checksum_pinned_actionlint_before_evaluator():
         "run: ./actionlint -ignore 'constant expression \"false\" in condition' "
         ".github/workflows/ci.yaml"
     ) in block
+    assert "for attempt in range(1, 4):" in block
+    assert "time.sleep(attempt * 2)" in block
     assert "scripts/ci/evaluate_required_checks.py" in block
 
 
@@ -71,25 +75,5 @@ def test_aggregate_has_always_and_complete_known_need_set():
     assert aggregate is not None
     block = aggregate.group(0)
     assert re.search(r"^    if: always\(\)\s*$", block, re.MULTILINE)
-    expected = {
-        "detect",
-        "tests",
-        "tests-os",
-        "lint",
-        "js-tests",
-        "installer-tests",
-        "rust-tests",
-        "e2e-desktop",
-        "docs-site",
-        "history-check",
-        "contributor-check",
-        "uv-lockfile",
-        "infographic-check",
-        "lockfile-diff",
-        "docker-lint",
-        "supply-chain",
-        "review-labels",
-        "osv-scanner",
-    }
     needs = set(re.findall(r"^      - ([a-z0-9_-]+)\s*$", block, re.MULTILINE))
-    assert expected == needs
+    assert KNOWN_JOBS == needs
