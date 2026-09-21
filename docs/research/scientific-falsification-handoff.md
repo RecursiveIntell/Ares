@@ -1,16 +1,16 @@
 # Scientific falsification: implementation handoff and program tracker
 
-Recorded 2026-09-20. Status: implemented experimental vertical slice in three draft PRs; no merge, installation, runtime activation, support admission, publication, or theorem certification.
+Recorded 2026-09-20 and revalidated 2026-09-21. Status: review-ready experimental vertical slice in three draft PRs; no merge, installation, runtime activation, support admission, publication, or theorem certification.
 
 ## Entry points and source pins
 
 | Owner | PR | Code revision exercised |
 |---|---|---|
-| Libraries: exact finite witness kernel and synthetic corpus | RecursiveIntell/Libraries#26 | `6b73cc69076c7db0047316eca54684f2d6858e23` |
-| ClaimLedger: scientific evidence checking and replay | RecursiveIntell/ClaimLedger#1 | `852ea813d66cdc338f914072da26aecda6fa24a9` |
-| Ares: optional falsify skill and bounded runner | RecursiveIntell/Ares#59 | `05b013f2bdb26486271c54ea43ca32ebe89d5e81` |
+| Libraries: exact finite witness kernel and synthetic corpus | RecursiveIntell/Libraries#26 | `fab2349572e3c576b8e60579ea113cd460919ab9` |
+| ClaimLedger: scientific evidence checking and replay | RecursiveIntell/ClaimLedger#1 | `403a9256a7ed5c36ef3a1184c4ad4bec72ab4aa4` |
+| Ares: optional falsify skill and bounded runner | RecursiveIntell/Ares#59 | `942d96c664a3568296e75a83f35731899ca1250a` |
 
-These are the tested code revisions, not an assertion that later documentation-only commits were included in those runs. Changes after these pins require appropriate revalidation. Existing repo instructions, ownership, and merge gates still apply.
+These are the tested code revisions. A later documentation-only commit may update this handoff without changing the exercised code. Changes to executable code after these pins require appropriate revalidation. Existing repo instructions, ownership, and merge gates still apply.
 
 ## What is implemented
 
@@ -24,13 +24,13 @@ Libraries is an isolated nested Cargo workspace, not a root default member. The 
 
 ## Observed validation
 
-- Libraries scoped CI run **35540287469**: 14 Rust tests passed, actual CLI built, all seven native corpus results independently rechecked. Rust/Cargo 1.98.1, Ubuntu 24.04. Source was the PR merge tree for the Libraries code pin above.
-- ClaimLedger scoped CI run **35540345772**: scientific tests, compile checks and repository-policy lint passed. Its `pinned-three-repo-smoke` job **106156734215** checked out the exact code pins above and passed all seven real kernel -> evidence -> runner cases.
-- Ares scoped workflow **35540446940** completed successfully. Its isolated job intentionally does not select the private ClaimLedger checkout; the real cross-repo lane is the separately pinned ClaimLedger job.
-- Local verification of byte-matched new Python surfaces: **29 ClaimLedger tests passed**, **11 Ares tests passed**, including the explicitly selected real ClaimLedger integration test. Python compile checks passed. Local static corpus check passed all seven cases.
-- No local Rust compiler or Ruff executable was available; Rust compilation and lint evidence come from the actual CI jobs, not a substituted local run. Local source material was a bounded checkout of the new surfaces and existing required helpers, not all three full repositories.
+- Libraries scoped CI run **35557609650** passed formatting, strict Clippy, 14 Rust tests, the actual CLI build, all seven independently rechecked native corpus outcomes, and the declared Rust 1.75 floor.
+- ClaimLedger scoped CI run **35557643920** passed 29 scientific tests, compile checks and repository-policy lint on Python 3.11. Its pinned three-repo job checked out the exact revisions above and passed all seven real kernel -> evidence -> runner cases. Corporate release-quality run **35557644021** passed on Python 3.11 and 3.12.
+- Ares optional-skill workflow **35556955457**, Docker workflow **35556955554**, and Nix workflow **35556955423** passed. Full CI run **35556956074** passed every technical job; only the intentional `ci-reviewed` label gate and its aggregate remained blocked for operator review.
+- Local verification of byte-matched new Python surfaces: **29 ClaimLedger tests passed** on Python 3.11 and 3.12; **12 Ares tests passed** on Python 3.11, including the explicitly selected real ClaimLedger integration test; targeted Ruff checks passed; Ares authoring standards passed **1214 tests**. Local static corpus checking passed all seven cases.
+- No local Rust compiler was available; native Rust, formatting, Clippy and MSRV evidence comes from CI, not a substituted local run.
 
-Public scoped CI: https://github.com/RecursiveIntell/Libraries/actions/runs/35540287469 and https://github.com/RecursiveIntell/Ares/actions/runs/35540446940 . Authorized operators can inspect the integration evidence at https://github.com/RecursiveIntell/ClaimLedger/actions/runs/35540345772 .
+Public CI: https://github.com/RecursiveIntell/Libraries/actions/runs/35557609650 and https://github.com/RecursiveIntell/Ares/actions/runs/35556955457 . Authorized operators can inspect the integration evidence at https://github.com/RecursiveIntell/ClaimLedger/actions/runs/35557643920 .
 
 Corpus digest: `bb38cfb08e05db0fc797382a2a0d6148ad83454313cea0106efb690170b69484`.
 Observed outcomes: four infeasible finite systems, two feasible controls, and one intentionally unresolved budget-exhaustion case. All seven expected behaviors passed; this does not mean all seven claims were refuted.
@@ -62,9 +62,9 @@ No OS containment is claimed: trusted backend code has local account authority. 
 
 ### Before merging or packaging
 
-- [ ] Independent adversarial code and contract review.
-- [ ] Repository-wide merge gates on final heads; feature CI alone is insufficient. Broader Libraries hardening and Ares CI/Nix jobs were still pending at the initial closeout observation.
-- [ ] Rust MSRV, Python minimum versions, supported OS matrix, formatting and reproducible dependency qualification. The declared Rust 1.75 floor was not tested in this pass.
+- [ ] Operator review and explicit merge decision. The Ares `ci-reviewed` label is deliberately not self-applied.
+- [x] Scoped final-head gates: Rust format/Clippy/native corpus/MSRV, ClaimLedger Python 3.11 evidence and Python 3.11/3.12 release quality, Ares optional skill/Docker/Nix and all technical full-CI jobs.
+- [ ] Broader supported-OS and reproducible dependency qualification beyond the exercised Linux CI lanes.
 - [ ] Explicit decision on root-workspace/package integration and optional skill installation, with rollback and real target-host evidence.
 
 ### Research and capability expansion
