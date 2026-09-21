@@ -210,8 +210,10 @@ jobs:
 
   # ─────────────────────────────────────────────────────────────────────
   # Gate: runs after everything. ``if: always()`` ensures it reports a
-  # status even when some deps were skipped. Only actual ``failure``
-  # results cause it to fail; ``skipped`` is treated as success.
+  # terminal status even when dependencies fail or are skipped. The evaluator
+  # enforces the classifier-derived applicability contract: applicable jobs
+  # must succeed, non-applicable jobs must be explicitly skipped, and missing,
+  # malformed, cancelled, or unexpected required-job results fail closed.
   #
   # Branch protection should require ONLY this check.
   #
