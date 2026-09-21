@@ -240,9 +240,10 @@ class SemanticMemoryWitnessedPort:
         except ContractError:
             raise
         except Exception:
-            if requirement is MemoryRequirement.REQUIRED:
-                raise ContractError("MEMORY_REQUIRED_UNAVAILABLE") from None
-            return self._unavailable(requirement, request_id)
+            # A received response that fails validation is not an outage.
+            # Optional memory may be omitted on unavailability, never on
+            # malformed/corrupt input or a failed validation operation.
+            raise ContractError("MEMORY_OWNER_RESPONSE_MALFORMED") from None
 
     def _unavailable(
         self, requirement: MemoryRequirement, request_id: str
@@ -295,6 +296,8 @@ class SemanticMemoryWitnessedPort:
             or not isinstance(response, Mapping)
         ):
             raise ContractError("MEMORY_OWNER_RESPONSE_MALFORMED")
+        if witness.get("schema_version") != "retrieval_witness_v1":
+            raise ContractError("MEMORY_OWNER_RESPONSE_MALFORMED")
         snapshot = authority.get("snapshot_id")
         epoch = authority.get("retrieval_epoch")
         if (
@@ -308,17 +311,17 @@ class SemanticMemoryWitnessedPort:
         ):
             raise ContractError("MEMORY_OWNER_STATE_MALFORMED")
         stage_rows = witness.get("stage_outcomes")
-        if not isinstance(stage_rows, list):
-            raise ContractError("MEMORY_OWNER_RESPONSE_MALFORMED")
-        stage_map = {
-            row[0]: row[1]
-            for row in stage_rows
-            if isinstance(row, list) and len(row) == 2 and isinstance(row[0], str)
-        }
+        # Current v1 owner emits this exact ordered sequence. Do not reduce
+        # rows to a map: duplicate or malformed rows must not disappear.
+        expected_stages = ["retrieval", "authority_filter", "coherence_recheck"]
         if (
-            stage_map.get("authority_filter") != "applied"
-            or stage_map.get("coherence_recheck") != "applied"
+            not isinstance(stage_rows, list)
+            or len(stage_rows) != len(expected_stages)
+            or any(not isinstance(row, list) or len(row) != 2 for row in stage_rows)
+            or [row[0] for row in stage_rows] != expected_stages
         ):
+            raise ContractError("MEMORY_OWNER_RESPONSE_MALFORMED")
+        if any(row[1] != "applied" for row in stage_rows):
             raise ContractError("MEMORY_OWNER_AUTHORITY_UNAVAILABLE")
         results = response.get("results")
         decisions = response.get("decisions")
@@ -342,7 +345,11 @@ class SemanticMemoryWitnessedPort:
         allowed_decisions: list[Mapping[str, Any]] = []
         denied_decisions: list[Mapping[str, Any]] = []
         for decision in decisions:
-            if not isinstance(decision, Mapping):
+            if (
+                not isinstance(decision, Mapping)
+                or decision.get("schema_version") != "origin_authority_decision_v1"
+                or decision.get("policy_version") != "governed_access_policy_v1"
+            ):
                 raise ContractError("MEMORY_OWNER_RESPONSE_MALFORMED")
             if decision.get("allowed") is True:
                 allowed_decisions.append(decision)
@@ -385,6 +392,12 @@ class SemanticMemoryWitnessedPort:
                 or not _is_algorithm_digest(decision.get("policy_digest"), "blake3")
             ):
                 raise ContractError("MEMORY_OWNER_RESULT_MISMATCH")
+            # Rust owner strings are UTF-8. Escaping a lone surrogate in JSON
+            # must not make invalid owner content admissible in Python.
+            try:
+                result["content"].encode("utf-8")
+            except UnicodeEncodeError:
+                raise ContractError("MEMORY_OWNER_RESPONSE_MALFORMED") from None
             normalized_results.append({
                 "result_ref": result_id,
                 "result_digest": result_digest,
@@ -903,8 +916,9 @@ class GovernedContextMaterializer:
                     "content": result["content"],
                 }
                 for result in raw_memory["results"]
+                if raw_memory["state"] == MemoryResolutionState.APPLIED.value
             ]
-            included_slice_refs.extend(raw_memory["result_refs"])
+            included_slice_refs.extend(result["ref"] for result in memory_results)
             memory_values = {
                 "owner": raw_memory["owner"],
                 "state": raw_memory["state"],
