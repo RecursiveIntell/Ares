@@ -99,11 +99,19 @@ def _job_result(needs: Mapping[str, Any], job: str) -> str:
 def _output_bool(needs: Mapping[str, Any], job: str, key: str) -> bool:
     info = needs.get(job)
     if not isinstance(info, Mapping):
+        raise ValueError(f"job {job} is unavailable while reading output {key}")
+    result = info.get("result")
+    if result == "skipped":
         return False
+    if result != "success":
+        raise ValueError(f"job {job} result {result!r} cannot authorize output {key}")
     outputs = info.get("outputs")
     if not isinstance(outputs, Mapping):
-        return False
-    return outputs.get(key) == "true"
+        raise ValueError(f"job {job} outputs are unavailable while reading {key}")
+    value = outputs.get(key)
+    if value not in ("true", "false"):
+        raise ValueError(f"job {job} output {key} is not true/false")
+    return value == "true"
 
 
 def _applicable(event_name: str, flags: Mapping[str, bool], needs: Mapping[str, Any], job: str) -> bool:
@@ -183,6 +191,11 @@ def evaluate(
         except ValueError as exc:
             failures.append(str(exc))
             continue
+        if job == "supply-chain" and result == "success":
+            try:
+                _output_bool(needs_map, "supply-chain", "critical_findings")
+            except ValueError as exc:
+                failures.append(str(exc))
         if job in DISABLED_JOBS:
             explicit_exceptions.append(job)
             if result != "skipped":

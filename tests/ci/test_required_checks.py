@@ -55,10 +55,12 @@ def jobs_for(classifier_values: dict[str, str], *, event: str = "pull_request") 
         result[job] = {"result": "success" if applies else "skipped"}
     result["history-check"] = {"result": "success" if event == "pull_request" else "skipped"}
     result["infographic-check"] = {"result": "success"}
+    supply_chain_applies = event == "pull_request" and (
+        classifier_values["scan"] == "true" or classifier_values["deps"] == "true"
+    )
     result["supply-chain"] = {
-        "result": "success"
-        if event == "pull_request" and (classifier_values["scan"] == "true" or classifier_values["deps"] == "true")
-        else "skipped"
+        "result": "success" if supply_chain_applies else "skipped",
+        "outputs": {"critical_findings": "false"} if supply_chain_applies else {},
     }
     result["review-labels"] = {
         "result": "success"
@@ -161,3 +163,19 @@ def test_critical_supply_chain_finding_requires_review_label_gate():
     result = run(values, jobs=jobs)
     assert result["status"] == "FAIL"
     assert any("review-labels" in failure for failure in result["failures"])
+
+
+@pytest.mark.parametrize(
+    "outputs",
+    [None, {"critical_findings": None}, {"critical_findings": "unknown"}],
+)
+def test_missing_or_malformed_critical_findings_fails_closed(outputs):
+    values = classifier(scan="true")
+    jobs = jobs_for(values)
+    if outputs is None:
+        jobs["supply-chain"].pop("outputs")
+    else:
+        jobs["supply-chain"]["outputs"] = outputs
+    result = run(values, jobs=jobs)
+    assert result["status"] == "FAIL"
+    assert any("critical_findings" in failure for failure in result["failures"])
