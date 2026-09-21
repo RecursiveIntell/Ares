@@ -2447,7 +2447,12 @@ class AIAgent:
                     )
                     or 300.0,
                 )
-                for _written in _batch_msgs:
+                for _written, _row in zip(_batch_msgs, _batch_rows):
+                    # SessionDB publishes these coordinates only after commit.
+                    # Preserve that projection across serialization copies;
+                    # it is not producer authentication or execution authority.
+                    if "_row_id" in _row:
+                        _written["_row_id"] = _row["_row_id"]
                     _written[_DB_PERSISTED_MARKER] = True
             # The intrinsic markers are now the sole source of truth. Reset the
             # one-shot seed so no id() outlives this flush to alias a message

@@ -7031,7 +7031,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                     time.time(),
                 ),
             )
-            total_messages, total_tool_calls = self._insert_message_rows(
+            total_messages, total_tool_calls, row_ids = self._insert_message_rows(
                 conn, child_session_id, messages
             )
             if watermark is not None:
@@ -7086,8 +7086,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                 raise RuntimeError(
                     f"Compression parent changed during publication: {parent_session_id}"
                 )
+            return row_ids
 
-        self._execute_write(_do)
+        row_ids = self._execute_write(_do)
+        self._publish_message_row_ids(messages, row_ids)
 
     def end_session(self, session_id: str, end_reason: str) -> None:
         """Mark a session as ended.
@@ -11004,7 +11006,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                 turn_lease_holder=turn_lease_holder,
                 turn_lease_ttl_seconds=turn_lease_ttl_seconds,
             )
-            inserted, tool_calls_total = self._insert_message_rows(
+            inserted, tool_calls_total, row_ids = self._insert_message_rows(
                 conn, session_id, messages
             )
             # One aggregated counter update for the whole batch.
@@ -11019,12 +11021,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                     "UPDATE sessions SET message_count = message_count + ? WHERE id = ?",
                     (inserted, session_id),
                 )
-            return inserted
+            return inserted, row_ids
 
         # Same criticality as append_message: this IS the turn's transcript.
-        return self._execute_write(
+        inserted, row_ids = self._execute_write(
             _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
         )
+        self._publish_message_row_ids(messages, row_ids)
+        return inserted
 
     def set_latest_matching_message_display_kind(
         self, session_id: str, *, role: str, content: str, display_kind: str,
@@ -11365,18 +11369,35 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
 
         return row[0] if row else None
 
-    def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> tuple[int, int]:
+    @staticmethod
+    def _publish_message_row_ids(
+        messages: List[Dict[str, Any]], row_ids: tuple[Optional[int], ...]
+    ) -> None:
+        """Project committed coordinates only after the owner transaction returns.
+
+        A repeated dict retains the last occurrence's coordinate, as before;
+        one mutable dict cannot represent both rows. IDs do not attest origin.
+        """
+        for msg, row_id in zip(messages, row_ids):
+            if isinstance(msg, dict) and row_id is not None:
+                msg["_row_id"] = row_id
+
+    def _insert_message_rows(
+        self, conn, session_id: str, messages: List[Dict[str, Any]]
+    ) -> tuple[int, int, tuple[Optional[int], ...]]:
         """Insert *messages* as fresh active rows for *session_id*.
 
         Shared by :meth:`replace_messages` (delete-then-insert) and
         :meth:`archive_and_compact` (soft-archive-then-insert). Runs inside the
         caller's write transaction (takes the live ``conn``). Returns
-        ``(inserted_count, tool_call_count)``. Does NOT touch sessions.* counters
-        — the caller owns that, since the two flows reconcile counts differently.
+        ``(inserted_count, tool_call_count, provisional_row_ids)``. Does NOT
+        mutate input dictionaries or touch sessions.* counters. The caller
+        reconciles counters and publishes coordinates only after commit.
         """
         now_ts = time.time()
         inserted = 0
         tool_calls_total = 0
+        row_ids = []
         for msg in messages:
             role = msg.get("role", "unknown")
             tool_calls = msg.get("tool_calls")
@@ -11449,15 +11470,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                     self._encode_display_metadata(msg.get("display_metadata")),
                 ),
             )
-            if isinstance(msg, dict) and cur.lastrowid is not None:
-                msg["_row_id"] = cur.lastrowid
+            row_ids.append(cur.lastrowid)
             inserted += 1
             if tool_calls is not None:
                 tool_calls_total += (
                     len(tool_calls) if isinstance(tool_calls, list) else 1
                 )
             now_ts = max(now_ts + 1e-6, message_timestamp + 1e-6)
-        return inserted, tool_calls_total
+        return inserted, tool_calls_total, tuple(row_ids)
 
     def replace_messages(
         self,
@@ -11549,15 +11569,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                 "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?",
                 (session_id,),
             )
-            total_messages, total_tool_calls = self._insert_message_rows(
+            total_messages, total_tool_calls, row_ids = self._insert_message_rows(
                 conn, session_id, messages
             )
             conn.execute(
                 "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
                 (total_messages, total_tool_calls, session_id),
             )
+            return row_ids
 
-        self._execute_write(_do)
+        row_ids = self._execute_write(_do)
+        self._publish_message_row_ids(messages, row_ids)
 
     def has_archived_messages(self, session_id: str) -> bool:
         """Return True if the session has any soft-archived (``active = 0``) rows.
@@ -11704,7 +11726,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                 "WHERE session_id = ? AND active = 1",
                 (session_id,),
             )
-            inserted, tool_calls_total = self._insert_message_rows(
+            inserted, tool_calls_total, row_ids = self._insert_message_rows(
                 conn, session_id, compacted_messages
             )
 
@@ -11740,9 +11762,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                     "model_config = ? WHERE id = ?",
                     (inserted, tool_calls_total, patched_model_config, session_id),
                 )
-            return inserted
+            return inserted, row_ids
 
-        return self._execute_write(_do)
+        inserted, row_ids = self._execute_write(_do)
+        self._publish_message_row_ids(compacted_messages, row_ids)
+        return inserted
 
     def _message_column_names(self, conn) -> List[str]:
         """Column names of the messages table, cached per-connection era."""
