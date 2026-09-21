@@ -264,3 +264,41 @@ async def test_generation_scoped_continuation_consumes_only_its_checkpoint(herme
     }
     assert await runner._consume_goal_continuation_at_turn_start(event, entry) is True
     assert goals.GoalManager(session_id).state.continuation_pending is False
+
+
+@pytest.mark.asyncio
+async def test_turn_start_rejects_checkpoint_corrupted_after_enqueue(hermes_home):
+    """Matching FIFO identity cannot bypass the canonical checkpoint check."""
+    from gateway.run import GatewayRunner
+    from hermes_cli import goals
+
+    session_id = "goal-corrupt-after-enqueue"
+    mgr = goals.GoalManager(session_id)
+    mgr.set("consume only a valid checkpoint")
+    mgr.checkpoint_recovery("RETRYABLE_FAILURE")
+    assert mgr.state is not None
+    assert mgr.state.checkpoint is not None
+    identity = {
+        "goal_id": mgr.state.goal_id,
+        "checkpoint_revision": mgr.state.checkpoint_revision,
+        "continuation_token": mgr.state.continuation_token,
+    }
+    assert mgr.claim_continuation("scratch-scheduler") is True
+    assert mgr.release_continuation(queued=True) is True
+    mgr.state.checkpoint["goal_id"] = "foreign-goal"
+    assert goals.save_goal(session_id, mgr.state) is True
+    db = goals._get_session_db()
+    assert db is not None
+    before = db.get_meta(goals._meta_key(session_id))
+    event = MessageEvent(
+        text=CONTINUATION_TEXT,
+        message_type=MessageType.TEXT,
+        source=_slack_thread_source(),
+        internal=True,
+        metadata={"goal_continuation": identity},
+    )
+    runner = object.__new__(GatewayRunner)
+    assert await runner._consume_goal_continuation_at_turn_start(
+        event, SimpleNamespace(session_id=session_id)
+    ) is False
+    assert db.get_meta(goals._meta_key(session_id)) == before
