@@ -50,6 +50,7 @@ KNOWN_JOBS = frozenset(
         "history-check",
         "contributor-check",
         "uv-lockfile",
+        "infographic-check",
         "lockfile-diff",
         "docker-lint",
         "supply-chain",
@@ -106,7 +107,7 @@ def _output_bool(needs: Mapping[str, Any], job: str, key: str) -> bool:
 
 
 def _applicable(event_name: str, flags: Mapping[str, bool], needs: Mapping[str, Any], job: str) -> bool:
-    if job in DISABLED_JOBS or job in {"detect", "osv-scanner"}:
+    if job in DISABLED_JOBS or job in {"detect", "infographic-check", "osv-scanner"}:
         return True
     if job in {"tests", "tests-os", "lint", "contributor-check"}:
         return flags["python"]

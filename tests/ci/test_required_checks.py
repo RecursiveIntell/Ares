@@ -54,6 +54,7 @@ def jobs_for(classifier_values: dict[str, str], *, event: str = "pull_request") 
             applies = applies and event == "pull_request"
         result[job] = {"result": "success" if applies else "skipped"}
     result["history-check"] = {"result": "success" if event == "pull_request" else "skipped"}
+    result["infographic-check"] = {"result": "success"}
     result["supply-chain"] = {
         "result": "success"
         if event == "pull_request" and (classifier_values["scan"] == "true" or classifier_values["deps"] == "true")
@@ -147,3 +148,16 @@ def test_disabled_desktop_lane_must_remain_an_explicit_skip():
     jobs["e2e-desktop"] = {"result": "success"}
     result = run(values, jobs=jobs)
     assert result["status"] == "FAIL"
+
+
+def test_critical_supply_chain_finding_requires_review_label_gate():
+    values = classifier(scan="true")
+    jobs = jobs_for(values)
+    jobs["supply-chain"]["outputs"] = {"critical_findings": "true"}
+    jobs["review-labels"] = {"result": "success"}
+    assert run(values, jobs=jobs)["status"] == "PASS"
+
+    jobs["review-labels"] = {"result": "skipped"}
+    result = run(values, jobs=jobs)
+    assert result["status"] == "FAIL"
+    assert any("review-labels" in failure for failure in result["failures"])

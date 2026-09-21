@@ -237,6 +237,7 @@ jobs:
       - history-check
       - contributor-check
       - uv-lockfile
+      - infographic-check
       - lockfile-diff
       - docker-lint
       - supply-chain

@@ -80,6 +80,7 @@ def test_aggregate_has_always_and_complete_known_need_set():
         "history-check",
         "contributor-check",
         "uv-lockfile",
+        "infographic-check",
         "lockfile-diff",
         "docker-lint",
         "supply-chain",
@@ -87,4 +88,4 @@ def test_aggregate_has_always_and_complete_known_need_set():
         "osv-scanner",
     }
     needs = set(re.findall(r"^      - ([a-z0-9_-]+)\s*$", block, re.MULTILINE))
-    assert expected <= needs
+    assert expected == needs
