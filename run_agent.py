@@ -4801,11 +4801,12 @@ class AIAgent:
 
     def _hydrate_todo_store(self, history: List[Dict[str, Any]]) -> None:
         """
-        Recover todo state from conversation history.
-        
-        The gateway creates a fresh AIAgent per message, so the in-memory
-        TodoStore is empty. We scan the history for the most recent todo
-        tool response and replay it to reconstruct the state.
+        Prefer the exact SessionDB owner's selection, including empty state.
+
+        Owner validation errors abort recovery, never fall through to history.
+        SessionDB's application provenance is not authentication against a
+        privileged writer. The legacy paired-history path below remains only
+        a structural compatibility reconstruction when no owner version exists.
 
         Hydration is restricted to tool results that are paired with an
         earlier assistant ``todo`` tool call. The gateway/API server accepts
@@ -4815,6 +4816,28 @@ class AIAgent:
         (GHSA-5g4g-6jrg-mw3g).
         """
         from tools.todo_tool import MAX_TODO_RESULT_CHARS
+
+        db = getattr(self, "_session_db", None)
+        if db is not None and not getattr(self, "_persist_disabled", False):
+            from hermes_state import TodoSnapshotError
+
+            selection = db.get_todo_recovery_state(self.session_id)
+            if selection.state == "selected":
+                self._todo_store.write(selection.snapshot["todos"], merge=False)
+                return
+            if selection.state == "cleared_by_rewind":
+                self._todo_store.write([], merge=False)
+                return
+            if selection.state == "missing_session":
+                if getattr(self, "_session_db_created", False):
+                    raise TodoSnapshotError("session")
+            elif selection.state != "never_committed":
+                raise TodoSnapshotError("selection")
+
+        # Legacy hydration is only for an empty local store. Canonical selection
+        # above runs every turn, including when an old local list is nonempty.
+        if self._todo_store.has_items():
+            return
 
         # Walk history backwards to find the most recent todo tool response
         last_todo_response = None

@@ -420,6 +420,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     profile_name TEXT,
     rewind_count INTEGER NOT NULL DEFAULT 0,
     todo_current_snapshot_id INTEGER,
+    todo_clear_baseline_operation_id TEXT,
     archived INTEGER NOT NULL DEFAULT 0,
     pinned INTEGER NOT NULL DEFAULT 0,
     hidden INTEGER NOT NULL DEFAULT 0,
@@ -485,13 +486,15 @@ CREATE TABLE IF NOT EXISTS todo_lifecycle_operations (
     kind TEXT NOT NULL,
     source_session_id TEXT NOT NULL,
     destination_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    source_current_snapshot_id INTEGER NOT NULL,
+    source_current_snapshot_id INTEGER,
     source_rewind_count INTEGER NOT NULL,
     destination_rewind_count INTEGER NOT NULL,
     boundary_message_id INTEGER NOT NULL,
     watermark INTEGER,
     watermark_ceiling INTEGER,
     created_at REAL NOT NULL,
+    selection_kind TEXT NOT NULL DEFAULT 'snapshot',
+    source_clear_operation_id TEXT,
     UNIQUE(destination_session_id, boundary_message_id)
 );
 

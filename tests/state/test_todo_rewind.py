@@ -238,15 +238,97 @@ def test_legacy_unrecorded_lifecycle_does_not_get_invented_evidence(db):
         db.get_current_todo_snapshot("s")
 
 
+def assert_single_owner_statement(issued, traces):
+    import re
+
+    # Virtual-table PRAGMA functions emit internal trace records even when the
+    # application issues only one SELECT. Do not hide arbitrary SQL comments.
+    internal = re.compile(
+        r"-- PRAGMA (?:'main'\.(?:table_xinfo|foreign_key_list|index_list)="
+        r"'todo_lifecycle_operations'|'main'\.index_xinfo="
+        r"'sqlite_autoindex_todo_lifecycle_operations_[12]'|"
+        r"table_list='todo_lifecycle_operations')"
+    )
+    assert len(issued) == 1
+    assert issued[0].startswith("WITH RECURSIVE ")
+    assert "SELECT t.*," in issued[0]
+    # SQLite can initialize existing FTS virtual tables while evaluating
+    # pragma_table_list. These exact internal records are not extra execute
+    # calls; the independent issued-call assertion above still counts them if
+    # issued by the application. Unknown internal forms continue to fail.
+    fts_internal = {
+        "-- SELECT k, v FROM 'main'.'messages_fts_config'",
+        "-- SELECT k, v FROM 'main'.'messages_fts_trigram_config'",
+    }
+    top_level = [q for q in traces if not internal.fullmatch(q) and q not in fts_internal]
+    assert len(top_level) == 1
+    assert top_level[0].startswith("WITH RECURSIVE ")
+    assert "SELECT t.*," in top_level[0]
+
+
 def test_current_read_uses_one_statement(db):
     first = write(db, "first")
     write(db, "second", first["snapshot_id"])
     db.rewind_to_message("s", user_for(db, "second"))
-    queries = []
+    queries, issued = [], []
     with db._read_ctx() as conn:
+        class Witness:
+            def execute(self, sql, *args):
+                issued.append(sql)
+                return conn.execute(sql, *args)
+
+            def __getattr__(self, name):
+                return getattr(conn, name)
+
         conn.set_trace_callback(queries.append)
         try:
-            assert db._current_todo_snapshot_on_conn(conn, "s") == first
+            assert db._current_todo_snapshot_on_conn(Witness(), "s") == first
         finally:
             conn.set_trace_callback(None)
-    assert len(queries) == 1
+    assert_single_owner_statement(issued, queries)
+
+
+def test_single_statement_witness_accepts_only_exact_engine_internals():
+    owner = "WITH RECURSIVE s AS (SELECT 1) SELECT t.*,s.* FROM t,s"
+    internals = [
+        "-- PRAGMA 'main'.table_xinfo='todo_lifecycle_operations'",
+        "-- PRAGMA 'main'.foreign_key_list='todo_lifecycle_operations'",
+        "-- PRAGMA 'main'.index_list='todo_lifecycle_operations'",
+        "-- PRAGMA 'main'.index_xinfo='sqlite_autoindex_todo_lifecycle_operations_1'",
+        "-- PRAGMA 'main'.index_xinfo='sqlite_autoindex_todo_lifecycle_operations_2'",
+        "-- PRAGMA table_list='todo_lifecycle_operations'",
+        "-- SELECT k, v FROM 'main'.'messages_fts_config'",
+        "-- SELECT k, v FROM 'main'.'messages_fts_trigram_config'",
+    ]
+    assert_single_owner_statement([owner], [owner, *internals])
+    for internal in internals:
+        with pytest.raises(AssertionError):
+            assert_single_owner_statement([owner, internal], [owner, *internals])
+
+
+@pytest.mark.parametrize("extra", [
+    "-- SELECT k, v FROM main.messages_fts_config",
+    "-- SELECT k, v FROM 'main'.'messages_fts_config' ",
+    "-- SELECT k, v FROM 'main'.'messages_fts_config'; SELECT 1",
+    "-- SELECT k, v FROM 'main'.'other_fts_config'",
+    "-- SELECT k, v FROM 'temp'.'messages_fts_config'",
+])
+def test_single_statement_witness_rejects_fts_near_misses(extra):
+    owner = "WITH RECURSIVE s AS (SELECT 1) SELECT t.*,s.* FROM t,s"
+    with pytest.raises(AssertionError):
+        assert_single_owner_statement([owner], [owner, extra])
+
+
+@pytest.mark.parametrize("extra", [
+    "SELECT 1", "SAVEPOINT hidden", "BEGIN", "UPDATE sessions SET title='x'",
+    "-- hidden\nSELECT 1", "-- PRAGMA 'main'.table_info='sessions'",
+    "-- PRAGMA 'main'.table_xinfo='todo_lifecycle_operations'",
+])
+def test_single_statement_witness_cannot_hide_extra_application_sql(extra):
+    owner = "WITH RECURSIVE s AS (SELECT 1) SELECT t.*,s.* FROM t,s"
+    with pytest.raises(AssertionError):
+        assert_single_owner_statement([owner, extra], [owner, extra])
+    # Even an exact allowed internal trace cannot hide an application call.
+    if extra != "-- PRAGMA 'main'.table_xinfo='todo_lifecycle_operations'":
+        with pytest.raises(AssertionError):
+            assert_single_owner_statement([owner], [owner, extra])

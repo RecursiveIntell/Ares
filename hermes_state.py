@@ -55,7 +55,7 @@ from hermes_constants import get_hermes_home
 from hermes_cli.sqlite_runtime import (
     is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
 )
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, TypeVar
+from typing import Any, Callable, Dict, List, Literal, NamedTuple, Optional, Set, Tuple, TypeVar
 
 from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _BRANCH_CHILD_SQL,
@@ -95,7 +95,10 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
 )
 from hermes_state_portability import SessionPortabilityMixin
 from hermes_state_runs import SessionRunCustodyMixin
-from hermes_state_schema import SessionSchemaMixin
+from hermes_state_schema import (
+    SessionSchemaMixin, TODO_LIFECYCLE_SHAPE_SQL,
+    todo_lifecycle_shape_from_row, _todo_lifecycle_supported_shapes,
+)
 from hermes_state_search import SessionSearchMixin
 
 try:  # Hard dependency, but tolerate scaffold-phase imports before pip install.
@@ -3792,6 +3795,13 @@ class MessageCopyError(RuntimeError):
     def __init__(self, reason: str):
         self.reason = reason
         super().__init__(f"Message copy refused: {reason}")
+
+
+class TodoRecoveryState(NamedTuple):
+    """Read-only projection of owner selection, not a producer credential."""
+
+    state: Literal["selected", "never_committed", "cleared_by_rewind", "missing_session"]
+    snapshot: Optional[Dict[str, Any]]
 
 
 class TodoSnapshotError(RuntimeError):
@@ -10805,10 +10815,41 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
         # physical coordinates to the same read snapshot (also for pooled WAL).
         selected = "s.todo_current_snapshot_id" if snapshot_id is None else "?"
         args = (session_id,) if snapshot_id is None else (snapshot_id, session_id)
+        # The clear baseline is historical provenance, not a second current
+        # task selector. Aggregate its explicit lineage in this SAME statement.
+        clear_columns = (
+            "operation_id", "schema_version", "kind", "selection_kind",
+            "source_session_id", "destination_session_id", "source_current_snapshot_id",
+            "source_clear_operation_id", "source_rewind_count", "destination_rewind_count",
+            "boundary_message_id", "watermark", "watermark_ceiling",
+        )
+        clear_json = ",".join(f"'{name}',co.{name}" for name in clear_columns)
         try:
             rows = conn.execute(
-                "WITH RECURSIVE selected_session AS (SELECT s.*, " + selected + " AS selected_id "
-                "FROM sessions s WHERE s.id=?), history(snapshot_id) AS ("
+                "WITH RECURSIVE lifecycle_shape AS MATERIALIZED (" + TODO_LIFECYCLE_SHAPE_SQL +
+                "), selected_session AS (SELECT s.*, " + selected + " AS selected_id "
+                "FROM sessions s WHERE s.id=?), clear_ids(operation_id) AS ("
+                "SELECT todo_clear_baseline_operation_id FROM selected_session UNION "
+                "SELECT co.source_clear_operation_id FROM todo_lifecycle_operations co "
+                "JOIN clear_ids ci ON ci.operation_id=co.operation_id "
+                "WHERE co.source_clear_operation_id IS NOT NULL), clear_evidence AS ("
+                "SELECT json_group_array(json_object(" + clear_json + ","
+                "'boundary_session',cb.session_id,'source_current_rewind',cs.rewind_count,"
+                "'destination_current_rewind',cd.rewind_count,"
+                "'root_schema',cr.schema_version,'root_state',cr.state,"
+                "'root_after',cr.todo_after_snapshot_id,'root_target',cr.target_message_id,"
+                "'root_watermark',cr.physical_watermark_id,'root_target_session',rt.session_id,"
+                "'root_target_role',rt.role,'root_watermark_session',rw.session_id,"
+                "'source_latest',(SELECT MAX(ct.snapshot_id) FROM todo_snapshots ct "
+                "WHERE ct.session_id=co.source_session_id))) AS evidence "
+                "FROM clear_ids ci JOIN todo_lifecycle_operations co ON co.operation_id=ci.operation_id "
+                "LEFT JOIN messages cb ON cb.id=co.boundary_message_id "
+                "LEFT JOIN sessions cs ON cs.id=co.source_session_id "
+                "LEFT JOIN sessions cd ON cd.id=co.destination_session_id "
+                "LEFT JOIN session_rewinds cr ON cr.session_id=co.source_session_id "
+                "AND cr.rewind_count=co.source_rewind_count "
+                "LEFT JOIN messages rt ON rt.id=cr.target_message_id "
+                "LEFT JOIN messages rw ON rw.id=cr.physical_watermark_id), history(snapshot_id) AS ("
                 "SELECT selected_id FROM selected_session UNION "
                 "SELECT t.lifecycle_source_snapshot_id FROM todo_snapshots t "
                 "JOIN history h ON h.snapshot_id=t.snapshot_id "
@@ -10820,7 +10861,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                 "SELECT t.supersedes_snapshot_id FROM todo_snapshots t "
                 "JOIN history h ON h.snapshot_id=t.snapshot_id "
                 "WHERE t.supersedes_snapshot_id IS NOT NULL) "
-                "SELECT t.*,s.selected_id,s.todo_current_snapshot_id AS current_id,"
+                "SELECT t.*,lifecycle_shape.*,s.id AS selected_session_id,"
+                "s.selected_id,s.todo_current_snapshot_id AS current_id,"
+                "s.todo_clear_baseline_operation_id AS clear_id,"
+                "(SELECT evidence FROM clear_evidence) AS clear_evidence,"
+                "(SELECT count(*) FROM todo_lifecycle_operations clo WHERE "
+                "clo.destination_session_id=s.id AND clo.selection_kind='cleared_by_rewind') AS clear_count,"
+                "(SELECT MAX(clo.boundary_message_id) FROM todo_lifecycle_operations clo WHERE "
+                "clo.destination_session_id=s.id AND clo.selection_kind='cleared_by_rewind') AS latest_clear_boundary,"
                 "s.rewind_count AS current_rewind,s.ended_at,s.end_reason,"
                 "owner.rewind_count AS owner_rewind,"
                 "a.session_id AS anchor_session,a.role AS anchor_role,"
@@ -10840,6 +10888,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                 "r.schema_version AS rewind_schema,r.state AS rewind_state,"
                 "r.todo_before_snapshot_id AS before_id,r.todo_after_snapshot_id AS after_id,"
                 "o.schema_version AS op_schema,o.kind AS op_kind,"
+                "o.selection_kind AS op_selection_kind,o.source_clear_operation_id AS op_clear_source,"
                 "o.source_session_id AS op_source,o.destination_session_id AS op_destination,"
                 "o.source_current_snapshot_id AS op_snapshot,o.source_rewind_count AS op_rewind,"
                 "o.destination_rewind_count AS op_destination_rewind,"
@@ -10851,7 +10900,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                 "source_owner.rewind_count AS source_owner_rewind,"
                 "src.anchor_message_id AS source_anchor,src.head_message_id AS source_head,"
                 "(SELECT MAX(v.snapshot_id) FROM todo_snapshots v WHERE v.session_id=s.id) AS latest_id "
-                "FROM selected_session s LEFT JOIN history history_row ON 1=1 "
+                "FROM lifecycle_shape LEFT JOIN selected_session s ON 1=1 "
+                "LEFT JOIN history history_row ON 1=1 "
                 "LEFT JOIN todo_snapshots t ON t.snapshot_id=history_row.snapshot_id "
                 "LEFT JOIN sessions owner ON owner.id=t.session_id "
                 "LEFT JOIN messages a ON a.id=t.anchor_message_id "
@@ -10866,7 +10916,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                 "LEFT JOIN session_rewinds r ON r.session_id=s.id AND r.rewind_count=s.rewind_count "
                 , args,
             ).fetchall()
-            if not rows:
+            if not rows or todo_lifecycle_shape_from_row(rows[0]) != _todo_lifecycle_supported_shapes()[0]:
+                raise TodoSnapshotError("unsupported_schema")
+            if rows[0]["selected_session_id"] is None:
                 return None
             # UNION terminates malformed cycles; the binding validator rejects
             # every non-decreasing source/predecessor edge. Follow only explicit
@@ -10876,7 +10928,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
             result["historical_sources"] = [r for r in rows if r is not row]
             return result
         except sqlite3.OperationalError as exc:
-            if "no such table:" in str(exc) or "no such column:" in str(exc):
+            if ("no such table:" in str(exc) or "no such column:" in str(exc)
+                    or "unsupported todo lifecycle schema" in str(exc)):
                 raise TodoSnapshotError("unsupported_schema") from exc
             raise
 
@@ -10969,6 +11022,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
         watermark, ceiling = row["op_watermark"], row["op_ceiling"]
         if (
             row["op_schema"] != (2 if row["schema_version"] == 3 else 1)
+            or row["op_selection_kind"] != "snapshot"
+            or row["op_clear_source"] is not None
             or row["boundary_session"] != row["session_id"]
             or row["op_kind"] not in ("in_place_compaction", "compression_child")
             or not isinstance(row["lifecycle_operation_id"], str)
@@ -11071,10 +11126,125 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
             ):
                 raise TodoSnapshotError("lifecycle_binding")
 
-    def _todo_compaction_baseline_on_conn(self, conn, session_id, messages, watermark, ceiling=None):
-        current = self._current_todo_snapshot_on_conn(conn, session_id)
-        if current is None:
+    @staticmethod
+    def _validate_todo_clear_baseline(row, session_id):
+        """Validate historical clear provenance, not current source authority."""
+        pointer = row["clear_id"]
+        if pointer is None:
+            if row["clear_count"]:
+                raise TodoSnapshotError("clear_binding")
             return None
+        if not isinstance(pointer, str) or not pointer:
+            raise TodoSnapshotError("clear_binding")
+        try:
+            evidence = json.loads(row["clear_evidence"])
+            operations = {op["operation_id"]: op for op in evidence}
+        except (TypeError, ValueError, KeyError) as exc:
+            raise TodoSnapshotError("clear_binding") from exc
+        selected = operations.get(pointer)
+        if (selected is None or selected["destination_session_id"] != session_id
+                or selected["boundary_message_id"] != row["latest_clear_boundary"]):
+            raise TodoSnapshotError("clear_binding")
+        seen = set()
+        while pointer is not None:
+            op = operations.get(pointer)
+            if op is None or pointer in seen:
+                raise TodoSnapshotError("clear_binding")
+            seen.add(pointer)
+            source_rewind = op["source_rewind_count"]
+            destination_rewind = op["destination_rewind_count"]
+            boundary = op["boundary_message_id"]
+            watermark, ceiling = op["watermark"], op["watermark_ceiling"]
+            if (
+                op["schema_version"] != 3
+                or op["selection_kind"] != "cleared_by_rewind"
+                or op["source_current_snapshot_id"] is not None
+                or op["kind"] not in ("in_place_compaction", "compression_child")
+                or (op["source_session_id"] == op["destination_session_id"])
+                != (op["kind"] == "in_place_compaction")
+                or type(source_rewind) is not int
+                or type(op["source_current_rewind"]) is not int
+                or not 0 <= source_rewind <= op["source_current_rewind"]
+                or type(destination_rewind) is not int
+                or type(op["destination_current_rewind"]) is not int
+                or not 0 <= destination_rewind <= op["destination_current_rewind"]
+                or type(boundary) is not int or boundary <= 0
+                or op["boundary_session"] != op["destination_session_id"]
+                or (watermark is not None and (type(watermark) is not int or watermark < 0))
+                or (ceiling is not None and (type(ceiling) is not int or ceiling < 0
+                    or (watermark is not None and ceiling < watermark)))
+                or (op["kind"] == "in_place_compaction" and (
+                    ceiling is not None or source_rewind != destination_rewind))
+                or (op["kind"] == "compression_child" and destination_rewind != 0)
+            ):
+                raise TodoSnapshotError("clear_binding")
+            prior_id = op["source_clear_operation_id"]
+            if prior_id is not None:
+                prior = operations.get(prior_id)
+                if (prior is None or prior["destination_session_id"] != op["source_session_id"]
+                        or type(prior["boundary_message_id"]) is not int
+                        or prior["boundary_message_id"] >= boundary
+                        or type(prior["destination_rewind_count"]) is not int
+                        or prior["destination_rewind_count"] > source_rewind):
+                    raise TodoSnapshotError("clear_binding")
+                needs_rewind = source_rewind != prior["destination_rewind_count"]
+            else:
+                needs_rewind = True
+                if op["source_latest"] is None:
+                    raise TodoSnapshotError("clear_binding")
+            if needs_rewind and (
+                source_rewind <= 0 or op["root_schema"] != 2
+                or op["root_state"] not in ("pending", "restored")
+                or op["root_after"] is not None
+                or op["root_target_session"] != op["source_session_id"]
+                or op["root_target_role"] != "user"
+                or op["root_watermark_session"] != op["source_session_id"]
+                or type(op["root_target"]) is not int
+                or type(op["root_watermark"]) is not int
+                or not 0 < op["root_target"] <= op["root_watermark"] < boundary
+            ):
+                raise TodoSnapshotError("clear_binding")
+            pointer = prior_id
+        return selected
+
+    def _project_todo_clear_on_conn(
+        self, conn, source_session, destination_session, baseline, row_ids,
+        kind, watermark, ceiling,
+    ):
+        """Publish an explicit null baseline in the caller's owner transaction."""
+        import uuid
+
+        if not row_ids:
+            raise TodoSnapshotError("lifecycle_boundary")
+        _, source_rewind, prior_clear = baseline
+        destination_rewind = conn.execute(
+            "SELECT rewind_count FROM sessions WHERE id=?", (destination_session,),
+        ).fetchone()[0]
+        operation = uuid.uuid4().hex
+        conn.execute(
+            "INSERT INTO todo_lifecycle_operations (operation_id,schema_version,kind,"
+            "source_session_id,destination_session_id,source_current_snapshot_id,"
+            "source_rewind_count,destination_rewind_count,boundary_message_id,"
+            "watermark,watermark_ceiling,created_at,selection_kind,source_clear_operation_id) "
+            "VALUES (?,3,?,?,?,NULL,?,?,?,?,?,?,'cleared_by_rewind',?)",
+            (operation, kind, source_session, destination_session, source_rewind,
+             destination_rewind, row_ids[0], watermark, ceiling, time.time(), prior_clear),
+        )
+        conn.execute(
+            "UPDATE sessions SET todo_clear_baseline_operation_id=?,"
+            "todo_current_snapshot_id=NULL WHERE id=?", (operation, destination_session),
+        )
+        self._current_todo_snapshot_on_conn(conn, destination_session)
+
+    def _todo_compaction_baseline_on_conn(self, conn, session_id, messages, watermark, ceiling=None):
+        row = self._todo_snapshot_row_on_conn(conn, session_id)
+        current = self._selected_todo_snapshot(row, session_id)
+        if current is None:
+            if row["clear_id"] is None and row["latest_id"] is None:
+                return None
+            if not messages:
+                raise TodoSnapshotError("lifecycle_boundary")
+            return [], row["current_rewind"], row["clear_id"]
         if not messages:
             raise TodoSnapshotError("lifecycle_boundary")
         if watermark is not None and (type(watermark) is not int or watermark < 0):
@@ -11108,6 +11278,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
             return
         import uuid
 
+        if not baseline[0]:
+            self._project_todo_clear_on_conn(
+                conn, source_session, destination_session, baseline, row_ids, kind, watermark, ceiling,
+            )
+            return
         versions, source_rewind = baseline
         current = versions[-1]
         tail = watermark is not None and current["head_message_id"] > watermark
@@ -11166,13 +11341,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
 
     def _current_todo_snapshot_on_conn(self, conn, session_id: str):
         row = self._todo_snapshot_row_on_conn(conn, session_id)
+        return self._selected_todo_snapshot(row, session_id)
+
+    def _selected_todo_snapshot(self, row, session_id: str):
         if row is None:
             raise TodoSnapshotError("session")
         if row["ended_at"] is not None and row["end_reason"] == "compression":
             raise TodoSnapshotError("closed_session")
-        # NULL is only missing, never a fallback from an unreadable selection.
+        clear = self._validate_todo_clear_baseline(row, session_id)
+        # NULL with a clear baseline is explicit owner provenance, not an empty
+        # dispatch snapshot. A local rewind still needs its exact transition.
         if row["current_id"] is None and row["latest_id"] is None:
-            return None
+            if clear is None or row["current_rewind"] == clear["destination_rewind_count"]:
+                return None
         if row["current_id"] is not None and (
             type(row["current_id"]) is not int or row["current_id"] <= 0
             or row["snapshot_id"] != row["current_id"]
@@ -11200,6 +11381,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
         """
         with self._read_ctx() as conn:
             return self._current_todo_snapshot_on_conn(conn, session_id)
+
+    def get_todo_recovery_state(self, session_id: str) -> TodoRecoveryState:
+        """Project validated selection without conflating a rewind with absence.
+
+        Uses the same single-statement read and validator as the snapshot API.
+        A missing session is explicit for first-turn consumers; it is never a
+        selected empty state. No transcript, parent traversal, or writes.
+        """
+        with self._read_ctx() as conn:
+            row = self._todo_snapshot_row_on_conn(conn, session_id)
+            if row is None:
+                return TodoRecoveryState("missing_session", None)
+            snapshot = self._selected_todo_snapshot(row, session_id)
+            if snapshot is not None:
+                return TodoRecoveryState("selected", snapshot)
+            if row["latest_id"] is None and row["clear_id"] is None:
+                return TodoRecoveryState("never_committed", None)
+            return TodoRecoveryState("cleared_by_rewind", None)
 
     def _todo_before_rewind_on_conn(self, conn, session_id, removed_ids):
         current = self._current_todo_snapshot_on_conn(conn, session_id)
