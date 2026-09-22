@@ -13,6 +13,8 @@ Graph, and Recursive Agent owners.
 from __future__ import annotations
 
 import base64
+import copy
+import math
 import hashlib
 import json
 import os
@@ -40,7 +42,8 @@ from .collaboration import (
 )
 
 SEMANTIC_MEMORY_OWNER = "semantic-memory"
-SEMANTIC_MEMORY_WITNESSED_TOOL = "sm_search_governed_witnessed"
+SEMANTIC_MEMORY_WITNESSED_TOOL = "sm_search_governed_witnessed_v2"
+_MEMORY_PAYLOAD_MAX_BYTES = 1_048_576
 MATERIALIZER_VERSION = "ares-governed-context-materializer-1"
 _RENDER_SCHEMA = "ares.managed-context-render/v1"
 _MEMORY_SCHEMA = "ares.semantic-memory-observation/v1"
@@ -155,7 +158,10 @@ class SemanticMemoryWitnessedPort:
         *,
         call_owner_tool: Callable[[str, dict[str, Any]], Mapping[str, Any]],
         resolve_current_state: Callable[[], Mapping[str, Any]],
+        prepare_access_request: Callable[[dict[str, Any]], Mapping[str, Any]],
     ) -> None:
+        # Explicit owner acquisition; injected callbacks are not authentication.
+        self._prepare_access_request = prepare_access_request
         self._call_owner_tool = call_owner_tool
         self._resolve_current_state = resolve_current_state
 
@@ -211,17 +217,46 @@ class SemanticMemoryWitnessedPort:
             raise ContractError("MEMORY_SCOPE_WIDENING")
         if len(requested) != 1:
             raise ContractError("MEMORY_MULTI_NAMESPACE_SPLIT_REQUIRED")
-        arguments = {
-            "query": query,
-            "top_k": top_k,
-            "request_id": request_id,
+        intent = {
             "caller": caller,
             "subject": subject,
             "audiences": normalized_audiences,
-            "scope": {"namespace": requested[0]},
+            "purpose": "recall",
+            "scope": {
+                "namespace": requested[0], "domain": None,
+                "workspace_id": None, "repo_id": None,
+            },
         }
         try:
-            raw = self._call_owner_tool(SEMANTIC_MEMORY_WITNESSED_TOOL, arguments)
+            prepared = self._prepare_access_request(copy.deepcopy(intent))
+        except Exception:
+            if requirement is MemoryRequirement.REQUIRED:
+                raise ContractError("MEMORY_REQUIRED_UNAVAILABLE") from None
+            return self._unavailable(requirement, request_id)
+        # Validation stays outside the availability catch. Malformed optional
+        # responses cannot become a successful omission.
+        expected_access = _memory_json_copy(prepared)
+        expected_fields = {
+            "principal": caller, "audience": normalized_audiences[0],
+            "namespace": requested[0], **intent,
+            "delegation_or_elevation": None,
+            "policy_version": "governed_access_policy_v1",
+        }
+        _memory_closed_object(expected_access, set(expected_fields) | {"policy_digest"})
+        if (
+            any(expected_access[key] != value for key, value in expected_fields.items())
+            or not _is_algorithm_digest(expected_access["policy_digest"], "blake3")
+        ):
+            raise ContractError("MEMORY_OWNER_REQUEST_MISMATCH")
+        # Never derive/repair the owner-owned BLAKE3 access-request digest.
+        expected_binding = {
+            "query": query, "top_k": top_k, "request_id": request_id,
+            "access_request": expected_access,
+        }
+        try:
+            raw = self._call_owner_tool(
+                SEMANTIC_MEMORY_WITNESSED_TOOL, copy.deepcopy(expected_binding)
+            )
         except Exception:
             if requirement is MemoryRequirement.REQUIRED:
                 raise ContractError("MEMORY_REQUIRED_UNAVAILABLE") from None
@@ -236,6 +271,7 @@ class SemanticMemoryWitnessedPort:
                 caller,
                 subject,
                 normalized_audiences,
+                expected_binding,
             )
         except ContractError:
             raise
@@ -277,12 +313,13 @@ class SemanticMemoryWitnessedPort:
         caller: str,
         subject: str,
         audiences: Sequence[str],
+        expected_binding: Mapping[str, Any],
     ) -> SemanticMemoryObservationV1:
+        raw, owner_payload_digest = _decode_memory_v2(raw, expected_binding)
         if not isinstance(raw, Mapping):
             raise ContractError("MEMORY_OWNER_RESPONSE_MALFORMED")
         if (
             raw.get("schema_version") != "governed_witnessed_search_response_v1"
-            or raw.get("ok") is not True
         ):
             raise ContractError("MEMORY_OWNER_RESPONSE_MALFORMED")
         if raw.get("state_view") != "Current":
@@ -442,7 +479,8 @@ class SemanticMemoryWitnessedPort:
             "state": state.value,
             "requirement": requirement.value,
             "request_id": request_id,
-            "receipt_ref": f"witness:{request_id}",
+            # Content-addressed integrity evidence, never an authorization token.
+            "receipt_ref": f"witness-v2:{owner_payload_digest}",
             "authority_snapshot_ref": snapshot,
             "retrieval_epoch": epoch,
             "query_digest": query_digest,
@@ -1226,6 +1264,86 @@ def _qualified_blake3(value: Any) -> str | None:
     if _is_algorithm_digest(value, "blake3"):
         return str(value).lower()
     return None
+
+
+def _memory_closed_object(value: Any, fields: set[str]) -> None:
+    if type(value) is not dict or set(value) != fields:
+        raise ContractError("MEMORY_OWNER_RESPONSE_MALFORMED")
+
+
+def _memory_json_copy(value: Any) -> Any:
+    """Validate JSON-native values and detach caller-owned mutable containers."""
+    try:
+        if type(value) is dict:
+            if not all(type(key) is str for key in value):
+                raise ValueError("non-string key")
+            return {_memory_json_copy(key): _memory_json_copy(item) for key, item in value.items()}
+        if type(value) is list:
+            return [_memory_json_copy(item) for item in value]
+        if type(value) is str:
+            value.encode("utf-8")
+            return value
+        if value is None or type(value) in (bool, int):
+            return value
+        if type(value) is float and math.isfinite(value):
+            return value
+    except (UnicodeError, ValueError, RecursionError):
+        raise ContractError("MEMORY_OWNER_RESPONSE_MALFORMED") from None
+    raise ContractError("MEMORY_OWNER_RESPONSE_MALFORMED")
+
+
+def _decode_memory_v2(raw: Mapping[str, Any], expected: Mapping[str, Any]) -> tuple[dict, str]:
+    _memory_closed_object(raw, {"schema_version", "payload_json", "payload_sha256"})
+    if raw["schema_version"] != "governed_witnessed_search_response_v2":
+        raise ContractError("MEMORY_OWNER_RESPONSE_MALFORMED")
+    text = raw["payload_json"]
+    if type(text) is not str or len(text) > _MEMORY_PAYLOAD_MAX_BYTES:
+        raise ContractError("MEMORY_OWNER_PAYLOAD_INVALID")
+    try:
+        payload_bytes = text.encode("utf-8")
+    except UnicodeError:
+        raise ContractError("MEMORY_OWNER_PAYLOAD_INVALID") from None
+    if len(payload_bytes) > _MEMORY_PAYLOAD_MAX_BYTES:
+        raise ContractError("MEMORY_OWNER_PAYLOAD_INVALID")
+    value_digest = "sha256:" + hashlib.sha256(payload_bytes).hexdigest()
+    if raw["payload_sha256"] != value_digest:
+        raise ContractError("MEMORY_OWNER_PAYLOAD_DIGEST_MISMATCH")
+    # No parse/re-dump or cross-language BLAKE3 reconstruction before this check.
+    payload = _memory_json_copy(_strict_json_bytes(payload_bytes))
+    _memory_closed_object(payload, {"schema_version", "request", "response"})
+    if payload["schema_version"] != "governed_witnessed_search_payload_v2":
+        raise ContractError("MEMORY_OWNER_RESPONSE_MALFORMED")
+    binding = payload["request"]
+    _memory_closed_object(binding, {"request_id", "query", "top_k", "access_request"})
+    if type(binding["top_k"]) is not int or binding != expected:
+        raise ContractError("MEMORY_OWNER_REQUEST_MISMATCH")
+    response = payload["response"]
+    _memory_closed_object(response, {"schema_version", "state_view", "authority_state", "response", "retrieval_witness"})
+    _memory_closed_object(response["authority_state"], {"snapshot_id", "retrieval_epoch"})
+    _memory_closed_object(response["response"], {"results", "decisions"})
+    _memory_closed_object(response["retrieval_witness"], {
+        "schema_version", "request_id", "evaluated_at", "authority_snapshot_id",
+        "retrieval_epoch", "query_digest", "config_digest", "ordered_result_ids",
+        "ordered_result_digests", "stage_outcomes", "degradations", "cached_witness_parent",
+    })
+    rows = response["response"]
+    if type(rows["results"]) is not list or type(rows["decisions"]) is not list:
+        raise ContractError("MEMORY_OWNER_RESPONSE_MALFORMED")
+    for result in rows["results"]:
+        _memory_closed_object(result, {
+            "content", "source", "score", "bm25_rank", "vector_rank", "cosine_similarity",
+        })
+        _memory_closed_object(result["source"], {"fact"})
+        _memory_closed_object(result["source"]["fact"], {"fact_id", "namespace"})
+    for decision in rows["decisions"]:
+        _memory_closed_object(decision, {
+            "schema_version", "fact_id", "principal", "audience_compat", "purpose",
+            "allowed", "reasons", "origin_label_digest", "revocation_reference",
+            "decision_digest", "caller", "subject", "audience", "scope",
+            "policy_version", "policy_digest", "outcome", "lease_id",
+        })
+        _memory_closed_object(decision["scope"], {"namespace", "domain", "workspace_id", "repo_id"})
+    return response, value_digest
 
 
 def _strict_json_bytes(payload: bytes) -> Any:

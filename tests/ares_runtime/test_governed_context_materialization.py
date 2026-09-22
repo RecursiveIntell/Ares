@@ -199,8 +199,33 @@ class MemoryOwnerFixture:
         if self.unavailable:
             raise OSError("owner unavailable with private /srv/memory.db detail")
         response = copy.deepcopy(self.response)
+        if type(response) is not dict:
+            # Preserve hostile callback objects as received, not JSON-laundered.
+            return response
         response["retrieval_witness"]["request_id"] = arguments["request_id"]
-        return response
+        response.pop("ok")  # Rust V1 payload has no tool-framing boolean.
+        payload_json = json.dumps({
+            "schema_version": "governed_witnessed_search_payload_v2",
+            "request": copy.deepcopy(arguments),
+            "response": response,
+        }, ensure_ascii=True, separators=(",", ":"))
+        return {
+            "schema_version": "governed_witnessed_search_response_v2",
+            "payload_json": payload_json,
+            "payload_sha256": "sha256:" + hashlib.sha256(payload_json.encode("utf-8")).hexdigest(),
+        }
+
+    def prepare(self, intent):
+        # Synthetic unit fixture only; concrete Rust bytes have separate coverage.
+        return {
+            **copy.deepcopy(intent),
+            "principal": intent["caller"],
+            "audience": intent["audiences"][0],
+            "namespace": intent["scope"]["namespace"],
+            "delegation_or_elevation": None,
+            "policy_version": "governed_access_policy_v1",
+            "policy_digest": "blake3:" + "3" * 64,
+        }
 
     def current_state(self):
         return dict(self.state)
@@ -209,6 +234,7 @@ class MemoryOwnerFixture:
         return SemanticMemoryWitnessedPort(
             call_owner_tool=self.call,
             resolve_current_state=self.current_state,
+            prepare_access_request=self.prepare,
         )
 
 
@@ -548,7 +574,7 @@ def test_auth_04_retrieved_instruction_is_data_and_cannot_change_route_or_effect
 def test_mem_01_only_semantic_memory_witnessed_owner_is_called_and_no_fallback_exists():
     fixture = MemoryOwnerFixture()
     result, fixture, *_ = materialize(memory_owner=fixture)
-    assert [name for name, _ in fixture.calls] == ["sm_search_governed_witnessed"]
+    assert [name for name, _ in fixture.calls] == ["sm_search_governed_witnessed_v2"]
     assert result.materialization.to_dict()["memory"]["owner"] == "semantic-memory"
     assert "fallback" not in SemanticMemoryWitnessedPort.__init__.__code__.co_varnames
 
@@ -719,7 +745,7 @@ def test_optional_degraded_memory_is_omitted_from_actual_bytes_and_admitted_refs
     assert sentinel not in result.provider_request["prompt"]
     receipt = result.materialization.to_dict()
     assert receipt["memory"]["state"] == MemoryResolutionState.STALE.value
-    assert receipt["memory"]["receipt_ref"] == "witness:memory-request:1"
+    assert receipt["memory"]["receipt_ref"].startswith("witness-v2:sha256:")
     assert receipt["memory"]["observation_digest"]
     assert "fact:1" not in receipt["included_slices"]
     assert "fact:1" not in result.sealed_invocation.to_dict()["included_refs"]
