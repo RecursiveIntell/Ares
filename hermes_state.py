@@ -3778,6 +3778,14 @@ class SessionCompressionInProgressError(CompressionSessionBusyError):
     """
 
 
+class RewindRestoreError(RuntimeError):
+    """Exact owner rewind membership or restore projection is unavailable."""
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(f"Rewind restore refused: {reason}")
+
+
 class MessageCopyError(RuntimeError):
     """Owner copy correspondence is unsupported or inconsistent."""
 
@@ -13187,7 +13195,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
 
             cursor = conn.execute(
                 "SELECT id FROM messages "
-                "WHERE session_id = ? AND id >= ? AND active = 1",
+                "WHERE session_id = ? AND id >= ? AND active = 1 ORDER BY id",
                 (session_id, target_message_id),
             )
             ids = [r[0] for r in cursor.fetchall()]
@@ -13221,6 +13229,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
             new_head_id = (
                 head_row[0] if head_row and head_row[0] is not None else None
             )
+            post_ids = [int(row[0]) for row in conn.execute(
+                "SELECT id FROM messages WHERE session_id=? AND active=1 ORDER BY id",
+                (session_id,),
+            )]
+            watermark = conn.execute(
+                "SELECT MAX(id) FROM messages WHERE session_id=?", (session_id,)
+            ).fetchone()[0]
+            rewind_count = conn.execute(
+                "SELECT rewind_count FROM sessions WHERE id=?", (session_id,)
+            ).fetchone()[0]
+            conn.execute(
+                "INSERT INTO session_rewinds (session_id,rewind_count,schema_version,"
+                "target_message_id,target_was_active,removed_message_ids,replacement_message_id,"
+                "post_rewind_active_ids,physical_watermark_id,state,created_at) "
+                "VALUES (?,?,1,?,?,?,?,?,?,'pending',?)",
+                (session_id, rewind_count, target_message_id, int(bool(target_row["active"])),
+                 json.dumps(ids, separators=(",", ":")), replacement_message_id,
+                 json.dumps(post_ids, separators=(",", ":")), watermark, time.time()),
+            )
             return target_row, ids, new_head_id, replacement_message_id
 
         target_row, rewound, new_head_id, replacement_message_id = (
@@ -13241,26 +13268,112 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
         return result
 
     def restore_rewound(self, session_id: str, since_message_id: int) -> int:
-        """Mark inactive messages with id >= *since_message_id* active again.
+        """Undo only the latest owner-recorded rewind with this exact target.
 
-        Returns the number of rows flipped back to ``active=1``.
-        Intended for undo-of-rewind and test cleanup; not wired to a
-        slash command in v1.
+        Legacy/unrecorded thresholds are refused, never inferred. Retry returns
+        zero only while the complete restored projection still matches. This is
+        internal physical membership, not todo currentness or execution authority.
         """
+        if type(since_message_id) is not int or since_message_id <= 0:
+            raise RewindRestoreError("target_mismatch")
+
+        def decode_ids(raw):
+            try:
+                ids = json.loads(raw)
+                if (not isinstance(ids, list)
+                        or any(type(value) is not int or value <= 0 for value in ids)
+                        or ids != sorted(set(ids))
+                        or json.dumps(ids, separators=(",", ":")) != raw):
+                    raise RewindRestoreError("malformed_membership")
+                return ids
+            except (TypeError, ValueError, RecursionError) as exc:
+                raise RewindRestoreError("malformed_membership") from exc
+
         def _do(conn):
-            cursor = conn.execute(
-                "SELECT id FROM messages "
-                "WHERE session_id = ? AND id >= ? AND active = 0",
-                (session_id, since_message_id),
+            self._check_transcript_write_guards(
+                conn, session_id, None, reject_active_turn_lease=True,
+                reject_active_compression_lock=True,
             )
-            ids = [r[0] for r in cursor.fetchall()]
-            if ids:
-                placeholders = ",".join("?" for _ in ids)
-                conn.execute(
-                    f"UPDATE messages SET active = 1 WHERE id IN ({placeholders})",
-                    ids,
-                )
-            return len(ids)
+            try:
+                operation = conn.execute(
+                    "SELECT r.rewind_count,r.schema_version,r.target_message_id,"
+                    "r.target_was_active,r.removed_message_ids,r.replacement_message_id,"
+                    "r.post_rewind_active_ids,r.physical_watermark_id,r.state,r.restored_at,"
+                    "s.rewind_count AS current_count FROM session_rewinds r "
+                    "JOIN sessions s ON s.id=r.session_id WHERE r.session_id=? "
+                    "ORDER BY r.rewind_count DESC LIMIT 1", (session_id,),
+                ).fetchone()
+            except sqlite3.OperationalError as exc:
+                raise RewindRestoreError("unsupported_schema") from exc
+            if operation is None:
+                raise RewindRestoreError("unknown_operation")
+            if operation["schema_version"] != 1:
+                raise RewindRestoreError("unsupported_schema")
+            if operation["rewind_count"] != operation["current_count"]:
+                raise RewindRestoreError("not_latest")
+            if operation["target_message_id"] != since_message_id:
+                raise RewindRestoreError("target_mismatch")
+            if operation["state"] not in ("pending", "restored"):
+                raise RewindRestoreError("malformed_membership")
+            removed = decode_ids(operation["removed_message_ids"])
+            post_ids = decode_ids(operation["post_rewind_active_ids"])
+            replacement = operation["replacement_message_id"]
+            watermark = operation["physical_watermark_id"]
+            target_was_active = operation["target_was_active"]
+            if (type(target_was_active) is not int or target_was_active not in (0, 1)
+                    or bool(target_was_active) != (since_message_id in removed)
+                    or type(watermark) is not int or watermark < since_message_id
+                    or set(removed).intersection(post_ids)
+                    or any(value < since_message_id or value > watermark for value in removed)
+                    or any(value > watermark for value in post_ids)
+                    or (replacement is not None and (
+                        type(replacement) is not int or replacement not in post_ids
+                        or replacement != watermark or since_message_id not in removed))
+                    or any(value >= since_message_id and value != replacement for value in post_ids)):
+                raise RewindRestoreError("malformed_membership")
+            rows = conn.execute(
+                "SELECT id,role,active FROM messages WHERE session_id=? ORDER BY id",
+                (session_id,),
+            ).fetchall()
+            by_id = {row["id"]: row for row in rows}
+            required = set(removed) | set(post_ids) | {since_message_id}
+            if not required.issubset(by_id):
+                raise RewindRestoreError("missing_member")
+            if by_id[since_message_id]["role"] != "user":
+                raise RewindRestoreError("malformed_membership")
+            if not rows or rows[-1]["id"] != watermark:
+                raise RewindRestoreError("watermark_mismatch")
+            restored = operation["state"] == "restored"
+            if by_id[since_message_id]["active"] != int(restored and target_was_active):
+                raise RewindRestoreError("membership_state_mismatch")
+            if any(by_id[value]["active"] != int(restored) for value in removed):
+                raise RewindRestoreError("membership_state_mismatch")
+            if replacement is not None and by_id[replacement]["active"] != int(not restored):
+                raise RewindRestoreError("replacement_mismatch")
+            restored_ids = sorted((set(post_ids) - {replacement}) | set(removed))
+            expected = restored_ids if restored else post_ids
+            if [row["id"] for row in rows if row["active"] == 1] != expected:
+                raise RewindRestoreError("active_projection_mismatch")
+            if restored:
+                return 0
+            conn.executemany(
+                "UPDATE messages SET active=1 WHERE id=? AND session_id=?",
+                [(value, session_id) for value in removed],
+            )
+            if replacement is not None:
+                conn.execute("UPDATE messages SET active=0 WHERE id=? AND session_id=?",
+                             (replacement, session_id))
+            message_count, tool_call_count = self._active_transcript_counts(conn, session_id)
+            conn.execute(
+                "UPDATE sessions SET message_count=?,tool_call_count=? WHERE id=?",
+                (message_count, tool_call_count, session_id),
+            )
+            conn.execute(
+                "UPDATE session_rewinds SET state='restored',restored_at=? "
+                "WHERE session_id=? AND rewind_count=?",
+                (time.time(), session_id, operation["rewind_count"]),
+            )
+            return len(removed)
 
         return self._execute_write(_do)
 

@@ -326,7 +326,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
     )
 
 
-SCHEMA_VERSION = 27
+SCHEMA_VERSION = 28
 
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
@@ -486,6 +486,24 @@ CREATE TABLE IF NOT EXISTS message_copy_edges (
 );
 CREATE INDEX IF NOT EXISTS idx_message_copy_edges_source
     ON message_copy_edges(source_message_id);
+
+-- Exact owner rewind membership. Message IDs are retained evidence, not FKs:
+-- deleting a message must invalidate restore, not erase its operation record.
+CREATE TABLE IF NOT EXISTS session_rewinds (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    rewind_count INTEGER NOT NULL,
+    schema_version INTEGER NOT NULL,
+    target_message_id INTEGER NOT NULL,
+    target_was_active INTEGER NOT NULL,
+    removed_message_ids TEXT NOT NULL,
+    replacement_message_id INTEGER,
+    post_rewind_active_ids TEXT NOT NULL,
+    physical_watermark_id INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    restored_at REAL,
+    PRIMARY KEY (session_id, rewind_count)
+);
 
 CREATE TABLE IF NOT EXISTS session_model_usage (
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
