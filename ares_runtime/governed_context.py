@@ -229,6 +229,9 @@ class SemanticMemoryWitnessedPort:
         }
         try:
             prepared = self._prepare_access_request(copy.deepcopy(intent))
+        except ContractError:
+            # A typed owner refusal is not a transport outage.
+            raise
         except Exception:
             if requirement is MemoryRequirement.REQUIRED:
                 raise ContractError("MEMORY_REQUIRED_UNAVAILABLE") from None
@@ -257,6 +260,8 @@ class SemanticMemoryWitnessedPort:
             raw = self._call_owner_tool(
                 SEMANTIC_MEMORY_WITNESSED_TOOL, copy.deepcopy(expected_binding)
             )
+        except ContractError:
+            raise
         except Exception:
             if requirement is MemoryRequirement.REQUIRED:
                 raise ContractError("MEMORY_REQUIRED_UNAVAILABLE") from None

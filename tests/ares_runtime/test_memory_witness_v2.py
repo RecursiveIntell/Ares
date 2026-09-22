@@ -164,6 +164,30 @@ def test_owner_request_is_frozen_before_untrusted_callback_mutates_arguments():
         make_port(case, call=call).resolve(**arguments(case, MemoryRequirement.REQUIRED))
 
 
+@pytest.mark.parametrize("stage", ["prepare", "retrieve"])
+@pytest.mark.parametrize("requirement", [MemoryRequirement.REQUIRED, MemoryRequirement.OPTIONAL])
+def test_callback_contract_refusal_does_not_become_unavailability(stage, requirement):
+    case = CASES[1]
+    calls = []
+
+    def refuse(*args):
+        raise ContractError("MEMORY_OWNER_SCOPE_DENIED")
+
+    def retrieve(name, request):
+        calls.append(name)
+        return copy.deepcopy(case["response"])
+
+    port = make_port(
+        case,
+        prepare=refuse if stage == "prepare" else None,
+        call=refuse if stage == "retrieve" else retrieve,
+    )
+    with pytest.raises(ContractError) as error:
+        port.resolve(**arguments(case, requirement))
+    assert error.value.code == "MEMORY_OWNER_SCOPE_DENIED"
+    assert calls == []
+
+
 def test_invalid_prepared_request_is_not_owner_unavailability():
     case = CASES[1]
     calls = []
