@@ -470,10 +470,30 @@ CREATE TABLE IF NOT EXISTS todo_snapshots (
     supersedes_snapshot_id INTEGER,
     todos_json TEXT NOT NULL,
     created_at REAL NOT NULL,
+    lifecycle_source_snapshot_id INTEGER,
+    lifecycle_operation_id TEXT,
+    lifecycle_kind TEXT,
     UNIQUE(session_id, execution_id)
 );
 CREATE INDEX IF NOT EXISTS idx_todo_snapshots_session
     ON todo_snapshots(session_id, snapshot_id DESC);
+
+-- Owner compaction coordinates, not a second task store or execution permit.
+CREATE TABLE IF NOT EXISTS todo_lifecycle_operations (
+    operation_id TEXT PRIMARY KEY,
+    schema_version INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    source_session_id TEXT NOT NULL,
+    destination_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    source_current_snapshot_id INTEGER NOT NULL,
+    source_rewind_count INTEGER NOT NULL,
+    destination_rewind_count INTEGER NOT NULL,
+    boundary_message_id INTEGER NOT NULL,
+    watermark INTEGER,
+    watermark_ceiling INTEGER,
+    created_at REAL NOT NULL,
+    UNIQUE(destination_session_id, boundary_message_id)
+);
 
 -- Physical one-hop copies made by owner compaction transactions. These edges
 -- are historical correspondence, not currentness or execution authority.
@@ -611,6 +631,8 @@ CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
 # existing databases. SCHEMA_SQL above is run by sqlite executescript
 # which would otherwise fail on legacy DBs ("no such column: active").
 DEFERRED_INDEX_SQL = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_todo_lifecycle_source
+    ON todo_snapshots(lifecycle_operation_id, lifecycle_source_snapshot_id);
 CREATE INDEX IF NOT EXISTS idx_messages_session_active
     ON messages(session_id, active, timestamp);
 CREATE INDEX IF NOT EXISTS idx_messages_active_null
