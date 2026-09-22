@@ -3778,6 +3778,14 @@ class SessionCompressionInProgressError(CompressionSessionBusyError):
     """
 
 
+class MessageCopyError(RuntimeError):
+    """Owner copy correspondence is unsupported or inconsistent."""
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(f"Message copy refused: {reason}")
+
+
 class TodoSnapshotError(RuntimeError):
     """Owner storage refused a todo version; never a transcript fallback signal."""
 
@@ -7060,17 +7068,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                 ).fetchall()
                 if tail_rows:
                     tail_ids = [int(r["id"]) for r in tail_rows]
-                    placeholders = ",".join("?" for _ in tail_ids)
-                    clone_cols = [
-                        c for c in self._message_column_names(conn)
-                        if c not in ("id", "session_id", "active", "compacted")
-                    ]
-                    col_list = ", ".join(clone_cols)
-                    conn.execute(
-                        f"INSERT INTO messages ({col_list}, session_id, active, compacted) "
-                        f"SELECT {col_list}, ?, 1, 0 FROM messages "
-                        f"WHERE id IN ({placeholders}) ORDER BY id",
-                        [child_session_id, *tail_ids],
+                    self._copy_message_tail_on_conn(
+                        conn, parent_session_id, child_session_id, tail_ids,
+                        "compression_child_tail",
                     )
                     total_messages += len(tail_ids)
                     for r in tail_rows:
@@ -11833,8 +11833,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
         except ``id`` — content, api_content, platform_message_id, token
         counts, reasoning sidecars all survive byte-exact, and the FTS
         triggers index the clones naturally), and the originals are archived.
-        NOTE: re-sequencing assigns the tail rows fresh ids; consumers that
-        reference durable row ids re-resolve by content (see 3e8ab0610).
+        Re-sequencing assigns fresh ids; exact one-hop correspondence is
+        retained atomically in ``message_copy_edges``. It is historical copy
+        evidence, not a currentness or execution-authority claim.
         ``watermark=None`` preserves the historical archive-everything
         behavior.
 
@@ -11918,17 +11919,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                 # Re-sequence the concurrent tail after the compacted set via
                 # a pure-SQL column clone: no decode/re-encode round trip, no
                 # field drift — new id, active=1, compacted=0, all else exact.
-                placeholders = ",".join("?" for _ in tail_ids)
-                clone_cols = [
-                    c for c in self._message_column_names(conn)
-                    if c not in ("id", "active", "compacted")
-                ]
-                col_list = ", ".join(clone_cols)
-                conn.execute(
-                    f"INSERT INTO messages ({col_list}, active, compacted) "
-                    f"SELECT {col_list}, 1, 0 FROM messages "
-                    f"WHERE id IN ({placeholders}) ORDER BY id",
-                    tail_ids,
+                self._copy_message_tail_on_conn(
+                    conn, session_id, session_id, tail_ids, "in_place_tail",
                 )
                 inserted += len(tail_ids)
                 tool_calls_total += tail_tool_calls
@@ -11951,6 +11943,93 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
         inserted, row_ids = self._execute_write(_do)
         self._publish_message_row_ids(compacted_messages, row_ids)
         return inserted
+
+    def _copy_message_tail_on_conn(
+        self, conn, source_session_id: str, destination_session_id: str,
+        source_ids: List[int], copy_kind: str,
+    ) -> None:
+        """Clone SQL bytes and record actual row IDs in the caller transaction.
+
+        Only the two canonical compaction paths call this helper. No content,
+        imported row ID, or model identifier supplies copy correspondence.
+        """
+        if copy_kind not in ("in_place_tail", "compression_child_tail"):
+            raise MessageCopyError("kind")
+        if (source_session_id == destination_session_id) != (copy_kind == "in_place_tail"):
+            raise MessageCopyError("scope")
+        columns = [
+            '"' + column.replace('"', '""') + '"'
+            for column in self._message_column_names(conn)
+            if column not in ("id", "session_id", "active", "compacted")
+        ]
+        col_list = ", ".join(columns)
+        for source_id in source_ids:
+            cursor = conn.execute(
+                f"INSERT INTO messages ({col_list}, session_id, active, compacted) "
+                f"SELECT {col_list}, ?, 1, 0 FROM messages WHERE id=? AND session_id=?",
+                (destination_session_id, source_id, source_session_id),
+            )
+            if cursor.rowcount != 1:
+                raise MessageCopyError("scope")
+            conn.execute(
+                "INSERT INTO message_copy_edges "
+                "(schema_version,copy_kind,source_session_id,source_message_id,"
+                "destination_session_id,destination_message_id) VALUES (1,?,?,?,?,?)",
+                (copy_kind, source_session_id, source_id,
+                 destination_session_id, cursor.lastrowid),
+            )
+
+    def get_message_copy_origin(self, session_id: str, message_id: int):
+        """Read scoped one-hop copy history, never currentness or authority.
+
+        None means no edge for this destination scope. Malformed stored edges
+        raise instead of being rematched by content or parent-session lineage.
+        Arbitrary privileged writes to this DB are outside this boundary.
+        """
+        with self._read_ctx() as conn:
+            try:
+                # One statement binds both message rows and the edge to the
+                # same read snapshot. Include the actual destination scope to
+                # detect a corrupt recorded scope rather than hide its edge.
+                row = conn.execute(
+                    "SELECT e.schema_version, e.copy_kind, e.source_session_id, "
+                    "e.source_message_id, e.destination_session_id, e.destination_message_id, "
+                    "s.session_id AS actual_source_session, "
+                    "d.session_id AS actual_destination_session "
+                    "FROM message_copy_edges e "
+                    "LEFT JOIN messages s ON s.id=e.source_message_id "
+                    "LEFT JOIN messages d ON d.id=e.destination_message_id "
+                    "WHERE e.destination_message_id=? AND "
+                    "(e.destination_session_id=? OR d.session_id=?)",
+                    (message_id, session_id, session_id),
+                ).fetchone()
+            except sqlite3.OperationalError as exc:
+                if (
+                    "no such table: message_copy_edges" in str(exc)
+                    or str(exc).startswith("no such column: e.")
+                ):
+                    raise MessageCopyError("unsupported_schema") from exc
+                raise
+        if row is None:
+            return None
+        if row["schema_version"] != 1:
+            raise MessageCopyError("schema")
+        if row["copy_kind"] not in ("in_place_tail", "compression_child_tail"):
+            raise MessageCopyError("kind")
+        if (
+            row["actual_source_session"] != row["source_session_id"]
+            or row["actual_destination_session"] != row["destination_session_id"]
+            or row["destination_session_id"] != session_id
+            or not isinstance(row["source_message_id"], int)
+            or row["source_message_id"] >= row["destination_message_id"]
+            or (row["source_session_id"] == row["destination_session_id"])
+            != (row["copy_kind"] == "in_place_tail")
+        ):
+            raise MessageCopyError("scope")
+        return {key: row[key] for key in (
+            "schema_version", "copy_kind", "source_session_id", "source_message_id",
+            "destination_session_id", "destination_message_id",
+        )}
 
     def _message_column_names(self, conn) -> List[str]:
         """Column names of the messages table, cached per-connection era."""

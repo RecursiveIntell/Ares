@@ -326,7 +326,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
     )
 
 
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 27
 
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
@@ -473,6 +473,19 @@ CREATE TABLE IF NOT EXISTS todo_snapshots (
 );
 CREATE INDEX IF NOT EXISTS idx_todo_snapshots_session
     ON todo_snapshots(session_id, snapshot_id DESC);
+
+-- Physical one-hop copies made by owner compaction transactions. These edges
+-- are historical correspondence, not currentness or execution authority.
+CREATE TABLE IF NOT EXISTS message_copy_edges (
+    destination_message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+    source_message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    source_session_id TEXT NOT NULL,
+    destination_session_id TEXT NOT NULL,
+    schema_version INTEGER NOT NULL,
+    copy_kind TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_message_copy_edges_source
+    ON message_copy_edges(source_message_id);
 
 CREATE TABLE IF NOT EXISTS session_model_usage (
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
