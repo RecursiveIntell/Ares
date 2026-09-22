@@ -18,6 +18,11 @@ class _DB:
         self.session_exists = session_exists
         self.acquire_result = acquire_result
 
+    def create_session(self, session_id, **kwargs):
+        self.events.append(("create", session_id))
+        self.session_exists = True
+        return session_id
+
     def get_session(self, session_id):
         return {"id": session_id} if self.session_exists else None
 
@@ -50,6 +55,8 @@ def _agent_with_db(db, *, session_id="stale-parent", platform="desktop"):
     agent.model = "test-model"
     agent._session_db = db
     agent._session_db_created = True
+    agent._session_init_model_config = None
+    agent._cached_system_prompt = None
     agent._persist_disabled = False
     agent._parent_session_id = None
     agent._relay_pending_turn_id = None
@@ -282,7 +289,37 @@ def test_run_conversation_acquires_lease_when_session_probe_raises(monkeypatch):
     ]
 
 
-def test_fresh_session_keeps_caller_seed_without_durable_lease(monkeypatch):
+def test_fresh_probe_failure_still_creates_under_custody(monkeypatch):
+    """An inconclusive probe cannot suppress fresh-row creation."""
+    db = _DB(session_exists=False)
+
+    def locked_get_session(_session_id):
+        raise sqlite3.OperationalError("database is locked")
+
+    db.get_session = locked_get_session
+    agent = _agent_with_db(db, session_id="fresh-probe-failure")
+    agent._session_db_created = False
+    observed = {}
+
+    def observe_run(_agent, _message, _system, history, *_args, **_kwargs):
+        assert db.session_exists
+        assert _agent._session_db_created is True
+        assert [event[0] for event in db.events] == ["acquire", "create"]
+        observed["history"] = history
+        return {"final_response": "ok", "messages": history, "failed": False}
+
+    monkeypatch.setattr("agent.conversation_loop.run_conversation", observe_run)
+    seed = [{"role": "user", "content": "fresh supplied seed"}]
+    result = AIAgent.run_conversation(agent, "work", conversation_history=seed)
+
+    assert result["final_response"] == "ok"
+    assert observed["history"] is seed
+    assert [event[0] for event in db.events] == ["acquire", "create", "release"]
+    assert db.events[0][1:] == db.events[-1][1:]
+    assert agent._active_session_turn_lease_holder is None
+
+
+def test_fresh_session_keeps_caller_seed_with_durable_lease(monkeypatch):
     db = _DB(session_exists=False)
     agent = _agent_with_db(db, session_id="fresh", platform="subagent")
     agent._session_db_created = False
@@ -301,7 +338,7 @@ def test_fresh_session_keeps_caller_seed_without_durable_lease(monkeypatch):
     AIAgent.run_conversation(agent, "work", conversation_history=seed)
 
     assert observed["history"] is seed
-    assert db.events == []
+    assert [event[0] for event in db.events] == ["acquire", "create", "release"]
 
 
 def test_run_conversation_lease_timeout_returns_resend_notice(monkeypatch):

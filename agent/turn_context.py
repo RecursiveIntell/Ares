@@ -683,9 +683,9 @@ def build_turn_context(
     # event time. Preserve either value and cover any legacy unstamped handoff.
     stamp_message_timestamp(user_msg, timestamp=persist_user_timestamp)
 
-    # Hydrate todo store from conversation history.
-    if conversation_history and not agent._todo_store.has_items():
-        agent._hydrate_todo_store(conversation_history)
+    # Owner selection must also replace stale local state and explicit empty
+    # state on history-free restarts. Legacy fallback stays inside hydration.
+    agent._hydrate_todo_store(conversation_history or [])
 
     # Hydrate per-session nudge counters from persisted history (issue #22357).
     if conversation_history and agent._user_turn_count == 0:

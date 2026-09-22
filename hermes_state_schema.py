@@ -12,6 +12,7 @@ import logging
 import json
 import sqlite3
 import time
+from functools import lru_cache
 from typing import Dict, Optional, Sequence
 
 from hermes_constants import get_hermes_home
@@ -56,6 +57,94 @@ _READ_PROBE_STATEMENTS: Optional[tuple] = None
 # against the DDL those triggers actually come from.
 _FTS_TRIGRAM_TRIGGERS = tuple(n for n in _FTS_TRIGGERS if "_trigram_" in n)
 _FTS_BASE_TRIGGERS = tuple(n for n in _FTS_TRIGGERS if n not in _FTS_TRIGRAM_TRIGGERS)
+
+
+# Scalar aggregates guarantee one metadata row even for a missing table/session.
+# Keep this projection inside the owner selection statement: no live shape cache
+# or separate metadata probe may authorize a subsequent selection snapshot.
+TODO_LIFECYCLE_SHAPE_SQL = """
+SELECT
+  (SELECT json_group_array(json_array(cid,name,type,"notnull",dflt_value,pk,hidden))
+   FROM (SELECT * FROM pragma_table_xinfo('todo_lifecycle_operations','main') ORDER BY cid))
+   AS lifecycle_columns,
+  (SELECT json_group_array(json_array(seq,"table","from","to",on_update,on_delete,match))
+   FROM (SELECT * FROM pragma_foreign_key_list('todo_lifecycle_operations','main')
+         ORDER BY seq,"table","from","to",on_update,on_delete,match))
+   AS lifecycle_foreign_keys,
+  (SELECT json_group_array(json_array(origin,partial,json(keys))) FROM (
+    SELECT il.origin,il.partial,
+      (SELECT json_group_array(json_array(seqno,cid,name,desc,coll,key))
+       FROM (SELECT * FROM pragma_index_xinfo(il.name,'main') ORDER BY seqno)) AS keys
+    FROM pragma_index_list('todo_lifecycle_operations','main') il
+    WHERE il."unique"=1 ORDER BY il.origin,il.partial,il.name))
+   AS lifecycle_unique_keys,
+  (SELECT json_array(type,wr,strict) FROM pragma_table_list('todo_lifecycle_operations')
+   WHERE schema='main' AND name='todo_lifecycle_operations') AS lifecycle_table
+"""
+
+
+def todo_lifecycle_shape_from_row(row) -> tuple:
+    """Decode statement-local metadata; compare only declaration-owned semantics.
+
+    This covers column/PK/FK/unique-key/table-option metadata, not all DDL
+    semantics (e.g. CHECK expressions). Index names, nonunique indexes and
+    triggers confer no supported-schema status.
+    """
+    def tuples(value):
+        return tuple(tuples(v) for v in value) if isinstance(value, list) else value
+
+    try:
+        columns, foreign_keys, unique_keys, table = (
+            tuples(json.loads(row[name])) for name in (
+                "lifecycle_columns", "lifecycle_foreign_keys",
+                "lifecycle_unique_keys", "lifecycle_table",
+            )
+        )
+        return columns, tuple(sorted(foreign_keys)), tuple(sorted(unique_keys, key=repr)), table
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        raise sqlite3.OperationalError("unsupported todo lifecycle schema") from exc
+
+
+def _todo_lifecycle_shape(conn) -> tuple:
+    row = conn.execute(TODO_LIFECYCLE_SHAPE_SQL).fetchone()
+    names = ("lifecycle_columns", "lifecycle_foreign_keys", "lifecycle_unique_keys", "lifecycle_table")
+    # Missing table is meaningful only to the explicit schema-creation owner.
+    if row[3] is None:
+        return (), (), (), ()
+    return todo_lifecycle_shape_from_row(dict(zip(names, row)))
+
+
+@lru_cache(maxsize=1)
+def _todo_lifecycle_supported_shapes() -> tuple:
+    # Rebuildable declaration projection, never cached live-schema acceptance.
+    declaration = SCHEMA_SQL.split(
+        "CREATE TABLE IF NOT EXISTS todo_lifecycle_operations (", 1
+    )[1].split(";", 1)[0]
+    reference = sqlite3.connect(":memory:")
+    try:
+        reference.execute("CREATE TABLE todo_lifecycle_operations (" + declaration)
+        current = _todo_lifecycle_shape(reference)
+    finally:
+        reference.close()
+    legacy_columns = tuple(
+        (row[:3] + (1,) + row[4:] if row[1] == "source_current_snapshot_id" else row)
+        for row in current[0]
+    )
+    # The only admitted predecessor has NOT NULL snapshot identity and lacks
+    # the two appended clear fields. The reconciler's intermediate form has
+    # those fields but has not yet relaxed the old NOT NULL constraint.
+    legacy = (legacy_columns[:-2], *current[1:])
+    reconciled_legacy = (legacy_columns, *current[1:])
+    return current, legacy, reconciled_legacy
+
+
+def validate_todo_lifecycle_schema(conn, *, allow_legacy=False, allow_missing=False):
+    shape = _todo_lifecycle_shape(conn)
+    if allow_missing and not shape[0] and not shape[3]:
+        return
+    supported = _todo_lifecycle_supported_shapes()
+    if shape not in (supported if allow_legacy else supported[:1]):
+        raise sqlite3.OperationalError("unsupported todo lifecycle schema")
 
 
 def schema_read_probe_statements() -> tuple:
@@ -935,6 +1024,47 @@ class SessionSchemaMixin:
         finally:
             cursor.execute("PRAGMA foreign_keys=ON")
 
+    def _migrate_todo_clear_lifecycle(self):
+        """Relax the owner operation's snapshot requirement atomically.
+
+        Old rows retain their exact columns and IDs. Never infer a cleared
+        selection from legacy NULL pointers. Databases using clear operations
+        require a compatible reader; deleting this evidence is not a downgrade.
+        """
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            validate_todo_lifecycle_schema(conn, allow_legacy=True)
+            fields = conn.execute("PRAGMA table_info(todo_lifecycle_operations)").fetchall()
+            if not next(row[3] for row in fields if row[1] == "source_current_snapshot_id"):
+                conn.execute("COMMIT")
+                return
+            declaration = SCHEMA_SQL.split(
+                "CREATE TABLE IF NOT EXISTS todo_lifecycle_operations (", 1
+            )[1].split(";", 1)[0]
+            conn.execute("CREATE TABLE todo_lifecycle_operations_clear_migration (" + declaration)
+            target_fields = {row[1] for row in conn.execute(
+                "PRAGMA table_info(todo_lifecycle_operations_clear_migration)")}
+            names = [row[1] for row in fields]
+            if set(names) != target_fields:
+                raise sqlite3.OperationalError("unsupported todo lifecycle migration columns")
+            objects = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE tbl_name='todo_lifecycle_operations' "
+                "AND type IN ('index','trigger') AND sql IS NOT NULL"
+            ).fetchall()
+            columns = ','.join('"' + name.replace('"', '""') + '"' for name in names)
+            conn.execute("INSERT INTO todo_lifecycle_operations_clear_migration (" + columns
+                         + ") SELECT " + columns + " FROM todo_lifecycle_operations")
+            conn.execute("DROP TABLE todo_lifecycle_operations")
+            conn.execute("ALTER TABLE todo_lifecycle_operations_clear_migration RENAME TO todo_lifecycle_operations")
+            for row in objects:
+                conn.execute(row[0])
+            conn.execute("INSERT OR REPLACE INTO state_meta(key,value) VALUES ('todo_clear_lifecycle_v1','1')")
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+
     def _init_schema(self):
         """Create tables and FTS if they don't exist, reconcile columns.
 
@@ -948,6 +1078,9 @@ class SessionSchemaMixin:
         The schema_version table is retained for future data migrations
         (transforming existing rows) which cannot be handled declaratively.
         """
+        # Reject unknown lineage-bearing shapes BEFORE reconciliation can add
+        # columns or any CREATE statement can mutate the database.
+        validate_todo_lifecycle_schema(self._conn, allow_legacy=True, allow_missing=True)
         cursor = self._conn.cursor()
 
         cursor.executescript(SCHEMA_SQL)
@@ -958,6 +1091,29 @@ class SessionSchemaMixin:
         # migration was skipped (e.g. due to version renumbering), the
         # column gets created here.
         self._reconcile_columns(cursor)
+        self._migrate_todo_clear_lifecycle()
+
+        # A one-time data transition, not a repair of malformed selected state.
+        # Recheck inside the write lock: concurrent openers must never reset a
+        # pointer already advanced/rewound by another owner. The marker commits
+        # with the backfill, independently of FTS/schema-version bookkeeping.
+        cursor.execute("BEGIN IMMEDIATE")
+        try:
+            migrated = cursor.execute(
+                "SELECT 1 FROM state_meta WHERE key='todo_current_pointer_v1'"
+            ).fetchone()
+            if migrated is None:
+                cursor.execute(
+                    "UPDATE sessions SET todo_current_snapshot_id="
+                    "(SELECT MAX(t.snapshot_id) FROM todo_snapshots t WHERE t.session_id=sessions.id)"
+                )
+                cursor.execute(
+                    "INSERT INTO state_meta(key,value) VALUES ('todo_current_pointer_v1','1')"
+                )
+            cursor.execute("COMMIT")
+        except BaseException:
+            cursor.execute("ROLLBACK")
+            raise
 
         # Rebuild gateway_routing if it still carries the pre-scope PRIMARY
         # KEY (session_key alone). ADD COLUMN cannot fix a PK, so this is

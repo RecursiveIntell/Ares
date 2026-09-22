@@ -44,6 +44,15 @@ def rows(db):
         return conn.execute("SELECT key,value FROM state_meta ORDER BY key").fetchall()
 
 
+def assert_first_claim_delta(before, after):
+    """Preserve all prior metadata; admit only the first custody generation."""
+    before, after = dict(before), dict(after)
+    assert set(after) - set(before) == {
+        "run-custody:rpc-fixture:head", "run-custody:rpc-fixture:generation:1",
+    }
+    assert all(key in after and after[key] == value for key, value in before.items())
+
+
 @pytest.fixture
 def live(tmp_path, monkeypatch):
     db = SessionDB(db_path=tmp_path / "state.db")
@@ -164,6 +173,7 @@ def refused(response, code=None):
 
 
 def test_rpc_dispatch_claims_real_owner_without_opening_or_closing_store(live):
+    before = rows(live.db)
     response = dispatch(live)
     assert "result" in response, response
     result = response["result"]
@@ -176,12 +186,38 @@ def test_rpc_dispatch_claims_real_owner_without_opening_or_closing_store(live):
     assert owner.controller_pid == os.getpid()
     assert owner.current_session_id == live.agent.session_id
     native = rows(live.db)
-    assert len(native) == 3  # historical goal, head, generation
+    assert_first_claim_delta(before, native)
     assert ("goal:old", live.goal) in native
     assert owner.owner_token not in json.dumps(response)
     assert "active-holder" not in json.dumps(response)
     live.db.set_meta("still-borrowed", "usable")
     assert live.db.get_meta("still-borrowed") == "usable"
+
+
+@pytest.mark.parametrize("fault", [
+    "prior-update", "prior-delete", "unexpected-key", "missing-head",
+    "missing-generation", "extra-generation",
+])
+def test_claim_delta_oracle_rejects_unexpected_metadata_changes(live, fault):
+    # Scratch-store mutations prove the oracle does not hide unrelated rows.
+    live.db.set_meta("unrelated-sentinel", "preserve-exactly")
+    before = rows(live.db)
+    assert "result" in dispatch(live)
+    assert_first_claim_delta(before, rows(live.db))
+    key = {
+        "prior-update": "unrelated-sentinel", "prior-delete": "unrelated-sentinel",
+        "unexpected-key": "unexpected", "missing-head": "run-custody:rpc-fixture:head",
+        "missing-generation": "run-custody:rpc-fixture:generation:1",
+        "extra-generation": "run-custody:rpc-fixture:generation:2",
+    }[fault]
+    if fault in {"prior-delete", "missing-head", "missing-generation"}:
+        live.db._execute_write(lambda conn: conn.execute(
+            "DELETE FROM state_meta WHERE key=?", (key,),
+        ))
+    else:
+        live.db.set_meta(key, "unexpected-value")
+    with pytest.raises(AssertionError):
+        assert_first_claim_delta(before, rows(live.db))
 
 
 def test_claim_uses_worker_dispatch_so_file_reads_do_not_block_reader(live, monkeypatch):
@@ -345,6 +381,7 @@ def test_post_commit_uncertainty_is_not_retry_or_refusal(live, monkeypatch, faul
 
 
 def test_concurrent_rpc_claims_admit_exactly_one_generation(live, monkeypatch):
+    before = rows(live.db)
     original = server._methods[METHOD]
     barrier = threading.Barrier(2)
     def race(*a, **kw):
@@ -359,11 +396,12 @@ def test_concurrent_rpc_claims_admit_exactly_one_generation(live, monkeypatch):
     assert sum("result" in r for r in replies) == 1
     refused(next(r for r in replies if "error" in r), "FENCE_MISMATCH")
     assert live.db.read_run_custody("rpc-fixture").generation == 1
-    assert len(rows(live.db)) == 3
+    assert_first_claim_delta(before, rows(live.db))
 
 
 @pytest.mark.parametrize("fault", ["session", "holder"])
 def test_selected_agent_and_native_binding_change_before_admission_is_refused(live, monkeypatch, fault):
+    before = rows(live.db)
     original = live.db.claim_run_custody_checked
     def changed(*a, **kw):
         if fault == "session":
@@ -378,7 +416,7 @@ def test_selected_agent_and_native_binding_change_before_admission_is_refused(li
     monkeypatch.setattr(live.db, "claim_run_custody_checked", changed)
     refused(dispatch(live))
     assert live.db.read_run_custody("rpc-fixture") is None
-    assert rows(live.db) == [("goal:old", live.goal)]
+    assert rows(live.db) == before
 
 
 def test_launch_profile_uses_existing_launch_home_not_ambient_profile(live, monkeypatch):

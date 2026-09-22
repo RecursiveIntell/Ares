@@ -199,8 +199,33 @@ class MemoryOwnerFixture:
         if self.unavailable:
             raise OSError("owner unavailable with private /srv/memory.db detail")
         response = copy.deepcopy(self.response)
+        if type(response) is not dict:
+            # Preserve hostile callback objects as received, not JSON-laundered.
+            return response
         response["retrieval_witness"]["request_id"] = arguments["request_id"]
-        return response
+        response.pop("ok")  # Rust V1 payload has no tool-framing boolean.
+        payload_json = json.dumps({
+            "schema_version": "governed_witnessed_search_payload_v2",
+            "request": copy.deepcopy(arguments),
+            "response": response,
+        }, ensure_ascii=True, separators=(",", ":"))
+        return {
+            "schema_version": "governed_witnessed_search_response_v2",
+            "payload_json": payload_json,
+            "payload_sha256": "sha256:" + hashlib.sha256(payload_json.encode("utf-8")).hexdigest(),
+        }
+
+    def prepare(self, intent):
+        # Synthetic unit fixture only; concrete Rust bytes have separate coverage.
+        return {
+            **copy.deepcopy(intent),
+            "principal": intent["caller"],
+            "audience": intent["audiences"][0],
+            "namespace": intent["scope"]["namespace"],
+            "delegation_or_elevation": None,
+            "policy_version": "governed_access_policy_v1",
+            "policy_digest": "blake3:" + "3" * 64,
+        }
 
     def current_state(self):
         return dict(self.state)
@@ -209,6 +234,7 @@ class MemoryOwnerFixture:
         return SemanticMemoryWitnessedPort(
             call_owner_tool=self.call,
             resolve_current_state=self.current_state,
+            prepare_access_request=self.prepare,
         )
 
 
@@ -548,7 +574,7 @@ def test_auth_04_retrieved_instruction_is_data_and_cannot_change_route_or_effect
 def test_mem_01_only_semantic_memory_witnessed_owner_is_called_and_no_fallback_exists():
     fixture = MemoryOwnerFixture()
     result, fixture, *_ = materialize(memory_owner=fixture)
-    assert [name for name, _ in fixture.calls] == ["sm_search_governed_witnessed"]
+    assert [name for name, _ in fixture.calls] == ["sm_search_governed_witnessed_v2"]
     assert result.materialization.to_dict()["memory"]["owner"] == "semantic-memory"
     assert "fallback" not in SemanticMemoryWitnessedPort.__init__.__code__.co_varnames
 
@@ -616,6 +642,126 @@ def test_required_degraded_or_stale_memory_blocks_and_empty_is_distinct_no_match
         result.materialization.to_dict()["memory"]["state"]
         == MemoryResolutionState.NO_MATCH.value
     )
+
+
+@pytest.mark.parametrize("requirement", [MemoryRequirement.REQUIRED, MemoryRequirement.OPTIONAL])
+@pytest.mark.parametrize(
+    "stages",
+    [
+        [["authority_filter", "failed"], ["retrieval", "applied"],
+         ["authority_filter", "applied"], ["coherence_recheck", "applied"]],
+        [["retrieval", "applied"], ["authority_filter", "applied"],
+         ["authority_filter", "applied"], ["coherence_recheck", "applied"]],
+        [["authority_filter", "applied"], ["coherence_recheck", "applied"]],
+        [["retrieval", "failed"], ["authority_filter", "applied"],
+         ["coherence_recheck", "applied"]],
+        [["coherence_recheck", "applied"], ["authority_filter", "applied"],
+         ["retrieval", "applied"]],
+        [["retrieval", "applied"], ["authority_filter", "applied"],
+         ["coherence_recheck", "applied"], ["unknown", "applied"]],
+        [["retrieval", "applied"], ["authority_filter", "applied"],
+         ["coherence_recheck", "applied"], None],
+    ],
+    ids=["conflicting-duplicate", "duplicate", "missing-retrieval", "failed-retrieval",
+         "reordered", "unknown-stage", "malformed-row"],
+)
+def test_invalid_memory_stages_reject_before_serialization(requirement, stages):
+    response = memory_response()
+    response["retrieval_witness"]["stage_outcomes"] = stages
+    serialized = []
+
+    def serializer(value):
+        serialized.append(value)
+        return serialize_request(value)
+
+    with pytest.raises(ContractError, match="MEMORY_OWNER_"):
+        materialize(memory_owner=MemoryOwnerFixture(response),
+                    memory_requirement=requirement, serializer=serializer)
+    assert serialized == []
+
+
+@pytest.mark.parametrize("requirement", [MemoryRequirement.REQUIRED, MemoryRequirement.OPTIONAL])
+@pytest.mark.parametrize("version", [None, "unsupported_v999"])
+@pytest.mark.parametrize("field", ["witness", "decision", "policy"])
+def test_unsupported_memory_versions_reject_before_serialization(requirement, version, field):
+    response = memory_response()
+    if field == "witness":
+        response["retrieval_witness"]["schema_version"] = version
+    elif field == "decision":
+        response["response"]["decisions"][0]["schema_version"] = version
+    else:
+        response["response"]["decisions"][0]["policy_version"] = version
+    serialized = []
+
+    def serializer(value):
+        serialized.append(value)
+        return serialize_request(value)
+
+    with pytest.raises(ContractError, match="MEMORY_OWNER_"):
+        materialize(memory_owner=MemoryOwnerFixture(response),
+                    memory_requirement=requirement, serializer=serializer)
+    assert serialized == []
+
+
+@pytest.mark.parametrize("requirement", [MemoryRequirement.REQUIRED, MemoryRequirement.OPTIONAL])
+def test_invalid_owner_text_is_not_reclassified_as_outage(requirement):
+    # The Rust owner cannot emit a non-UTF-8 scalar. JSON escaping in the host
+    # must not launder this corrupt content into an accepted observation.
+    fixture = MemoryOwnerFixture(memory_response(content="private-owner-\ud800"))
+    serialized = []
+
+    def serializer(value):
+        serialized.append(value)
+        return serialize_request(value)
+
+    with pytest.raises(ContractError) as error:
+        materialize(memory_owner=fixture, memory_requirement=requirement,
+                    serializer=serializer)
+    assert error.value.code == "MEMORY_OWNER_RESPONSE_MALFORMED"
+    assert "private-owner" not in str(error.value)
+    assert serialized == []
+
+
+@pytest.mark.parametrize("requirement", [MemoryRequirement.REQUIRED, MemoryRequirement.OPTIONAL])
+def test_owner_response_validation_exception_is_not_an_optional_outage(requirement):
+    class InvalidResponse(dict):
+        def get(self, *args):
+            raise ValueError("private owner validation detail")
+
+    fixture = MemoryOwnerFixture(InvalidResponse(memory_response()))
+    with pytest.raises(ContractError) as error:
+        materialize(memory_owner=fixture, memory_requirement=requirement)
+    assert error.value.code == "MEMORY_OWNER_RESPONSE_MALFORMED"
+    assert "private owner" not in str(error.value)
+
+
+def test_optional_degraded_memory_is_omitted_from_actual_bytes_and_admitted_refs():
+    sentinel = "STALE_MEMORY_MUST_NOT_REACH_PROVIDER"
+    fixture = MemoryOwnerFixture(memory_response(content=sentinel, degraded=True))
+    result, fixture, owner, basis = materialize(
+        memory_owner=fixture, memory_requirement=MemoryRequirement.OPTIONAL,
+    )
+    assert sentinel.encode() not in result.serialized_request
+    assert sentinel not in result.provider_request["prompt"]
+    receipt = result.materialization.to_dict()
+    assert receipt["memory"]["state"] == MemoryResolutionState.STALE.value
+    assert receipt["memory"]["receipt_ref"].startswith("witness-v2:sha256:")
+    assert receipt["memory"]["observation_digest"]
+    assert "fact:1" not in receipt["included_slices"]
+    assert "fact:1" not in result.sealed_invocation.to_dict()["included_refs"]
+    assert {"class": "memory", "count": 1, "reason": "stale_or_degraded"} in receipt["omissions"]
+    authorize(result, fixture, owner, basis)
+    loaded = result._receipt_store.load(result.materialization.artifact_digest)
+    assert loaded.serialized_request == result.serialized_request
+
+
+def test_optional_transport_outage_still_omits_memory():
+    result, *_ = materialize(memory_owner=MemoryOwnerFixture(unavailable=True),
+                             memory_requirement=MemoryRequirement.OPTIONAL)
+    receipt = result.materialization.to_dict()
+    assert receipt["memory"]["state"] == MemoryResolutionState.UNAVAILABLE.value
+    assert "remembered evidence" not in result.provider_request["prompt"]
+    assert {"class": "memory", "count": 1, "reason": "unavailable"} in receipt["omissions"]
 
 
 def test_memory_authority_epoch_change_after_seal_denies_egress():

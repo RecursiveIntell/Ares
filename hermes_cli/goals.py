@@ -1895,7 +1895,11 @@ class GoalManager:
         self._state = None
 
     def validate_checkpoint(self) -> Tuple[bool, str]:
-        state = self._state
+        return self._validate_checkpoint(self._state)
+
+    @staticmethod
+    def _validate_checkpoint(state: Optional[GoalState]) -> Tuple[bool, str]:
+        """Validate one loaded snapshot without publishing or mutating it."""
         if state is None or not state.continuation_pending:
             return True, "no pending checkpoint"
         cp = state.checkpoint
@@ -1903,16 +1907,25 @@ class GoalManager:
             return False, "checkpoint payload is missing"
         if cp.get("goal_id") != state.goal_id:
             return False, "checkpoint goal identity does not match current goal"
-        if int(cp.get("checkpoint_revision", -1)) != state.checkpoint_revision:
+        try:
+            revision = int(cp.get("checkpoint_revision", -1))
+            remaining = int(cp.get("remaining_goal_turns", -1))
+        except (TypeError, ValueError, OverflowError):
+            return False, "checkpoint revision or budget is malformed"
+        if revision != state.checkpoint_revision:
             return False, "checkpoint revision does not match current state"
         if cp.get("outcome") != state.outcome:
             return False, "checkpoint outcome does not match current state"
-        if int(cp.get("remaining_goal_turns", -1)) != max(0, state.max_turns - state.turns_used):
+        if remaining != max(0, state.max_turns - state.turns_used):
             return False, "checkpoint budget does not match cumulative state"
         if not cp.get("next_admissible_action"):
             return False, "checkpoint has no next admissible action"
         if state.continuation_token:
-            expected = str(uuid.uuid5(uuid.UUID(state.goal_id), f"continuation:{state.turns_used}:{state.last_stop_reason}"))
+            try:
+                goal_uuid = uuid.UUID(state.goal_id)
+            except (TypeError, ValueError, AttributeError):
+                return False, "checkpoint goal identity is malformed"
+            expected = str(uuid.uuid5(goal_uuid, f"continuation:{state.turns_used}:{state.last_stop_reason}"))
             if state.continuation_token != expected:
                 return False, "continuation token does not match checkpoint stop reason"
         return True, "checkpoint is current"
@@ -2055,7 +2068,10 @@ class GoalManager:
             and state.continuation_token != expected_continuation_token
         ):
             return False
-        self._state = state
+        valid, _reason = self._validate_checkpoint(state)
+        if not valid:
+            return False
+        # Keep this proposed transition private until the canonical CAS commits.
         state.continuation_pending = False
         state.continuation_claimed_by = None
         state.continuation_claimed_at = 0.0
@@ -2064,11 +2080,19 @@ class GoalManager:
         state.next_action = "evaluate the current continuation turn"
         state.migration.pop("continuation_enqueued_at", None)
         payload = state.to_json()
-        return bool(
-            db.compare_and_set_meta(_meta_key(self.session_id), expected_raw, payload)
-            if hasattr(db, "compare_and_set_meta")
-            else False
-        )
+        try:
+            saved = bool(
+                db.compare_and_set_meta(_meta_key(self.session_id), expected_raw, payload)
+                if hasattr(db, "compare_and_set_meta")
+                else False
+            )
+        except Exception as exc:
+            # An uncertain write is not permission to dispatch or retry. Reload
+            # the owner row below; unavailable/unparseable state clears the cache.
+            logger.warning("GoalManager: continuation consume failed: %s", exc)
+            saved = False
+        self._state = state if saved else load_goal(self.session_id)
+        return saved
 
     def confirm_completion(self, evidence: str, *, source: str = "user") -> bool:
         if not self._state or self._state.status not in {"active", "paused"}:

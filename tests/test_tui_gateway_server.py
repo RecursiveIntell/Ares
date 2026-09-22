@@ -20144,16 +20144,19 @@ def test_prompt_submit_truncation_archives_instead_of_deleting(monkeypatch):
         server._sessions.pop("archive-trunc-sid", None)
 
 
-def test_insert_message_rows_sets_row_id_on_fresh_dicts(tmp_path):
-    """#82959: _insert_message_rows must assign _row_id on freshly inserted message dicts."""
+def test_append_messages_batch_sets_row_id_on_committed_fresh_dicts(tmp_path):
+    """#82959: the transaction owner publishes row IDs after commit."""
     from hermes_state import SessionDB
     db = SessionDB(db_path=tmp_path / "state.db")
     db.create_session("fresh-msg-row-id-sid", "cli")
     msg = {"role": "user", "content": "fresh turn without pre-existing _row_id"}
-    with db._lock:
-        db._insert_message_rows(db._conn, "fresh-msg-row-id-sid", [msg])
-    assert "_row_id" in msg, "New message dict did not receive _row_id"
-    assert isinstance(msg["_row_id"], int) and msg["_row_id"] > 0
+    try:
+        db.append_messages_batch("fresh-msg-row-id-sid", [msg])
+        assert "_row_id" in msg, "New message dict did not receive _row_id"
+        assert isinstance(msg["_row_id"], int) and msg["_row_id"] > 0
+        assert msg["_row_id"] == db.get_messages("fresh-msg-row-id-sid")[0]["id"]
+    finally:
+        db.close()
 
 
 def test_prompt_submit_unmatched_row_id_refuses_even_with_ordinal(monkeypatch):
@@ -20341,9 +20344,7 @@ def test_prompt_submit_row_id_real_sessiondb_resolve_without_memory_stamps(
         {"role": "user", "content": "third"},
         {"role": "assistant", "content": "reply 3"},
     ]
-    with db._lock:
-        db._insert_message_rows(db._conn, session_key, msgs)
-        db._conn.commit()
+    db.append_messages_batch(session_key, msgs)
     row_ids = [m["_row_id"] for m in msgs]
     assert all(isinstance(r, int) and r > 0 for r in row_ids)
 
@@ -20407,9 +20408,7 @@ def test_prompt_submit_row_id_real_sessiondb_unknown_refuses_despite_ordinal(
         {"role": "user", "content": "second"},
         {"role": "assistant", "content": "reply 2"},
     ]
-    with db._lock:
-        db._insert_message_rows(db._conn, session_key, msgs)
-        db._conn.commit()
+    db.append_messages_batch(session_key, msgs)
 
     live_history = [{"role": m["role"], "content": m["content"]} for m in msgs]
     sess = _session(history=list(live_history), session_key=session_key)
@@ -20465,9 +20464,7 @@ def test_prompt_submit_row_id_misaligned_memory_refuses_content_swap(
         {"role": "user", "content": "B"},
         {"role": "assistant", "content": "rb"},
     ]
-    with db._lock:
-        db._insert_message_rows(db._conn, session_key, msgs)
-        db._conn.commit()
+    db.append_messages_batch(session_key, msgs)
     rid_b = msgs[2]["_row_id"]
     original_row_ids = [message["_row_id"] for message in msgs]
 
@@ -20536,9 +20533,7 @@ def test_prompt_submit_row_id_misaligned_memory_role_shift_targets_real_turn(
         {"role": "user", "content": "B"},
         {"role": "assistant", "content": "rb"},
     ]
-    with db._lock:
-        db._insert_message_rows(db._conn, session_key, msgs)
-        db._conn.commit()
+    db.append_messages_batch(session_key, msgs)
     rid_b = msgs[2]["_row_id"]
     original_row_ids = [message["_row_id"] for message in msgs]
 
@@ -20690,9 +20685,7 @@ def test_prompt_submit_consecutive_rewinds_with_returned_survivor_row_ids(
         {"role": "user", "content": "third"},
         {"role": "assistant", "content": "reply 3"},
     ]
-    with db._lock:
-        db._insert_message_rows(db._conn, session_key, msgs)
-        db._conn.commit()
+    db.append_messages_batch(session_key, msgs)
     original_row_ids = [m["_row_id"] for m in msgs]
 
     sess = _session(history=[dict(m) for m in msgs], session_key=session_key)
@@ -20810,9 +20803,7 @@ def test_prompt_submit_rebind_map_clears_active_row_hidden_by_sequence_repair(
         {"role": "user", "content": "target"},
         {"role": "assistant", "content": "target reply"},
     ]
-    with db._lock:
-        db._insert_message_rows(db._conn, session_key, physical)
-        db._conn.commit()
+    db.append_messages_batch(session_key, physical)
     physical_ids = [message["_row_id"] for message in physical]
     repaired = db.get_messages_as_conversation(
         session_key, repair_alternation=True, include_row_ids=True

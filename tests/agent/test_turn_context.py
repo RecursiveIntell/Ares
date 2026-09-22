@@ -197,6 +197,56 @@ def _build(agent, **overrides):
     return build_turn_context(**kwargs)
 
 
+@pytest.mark.parametrize("items", [[], [{"id": "a", "content": "Owner state", "status": "pending"}]])
+@pytest.mark.parametrize("initial", [[], [{"id": "old", "content": "Stale local", "status": "completed"}]])
+def test_turn_preparation_hydrates_real_owner_without_history(tmp_path, items, initial):
+    import json
+    from run_agent import AIAgent
+    from tools.todo_tool import TodoStore
+
+    with SessionDB(tmp_path / "state.db") as db:
+        db.create_session("sess-1", source="test")
+        anchor = db.append_message("sess-1", "assistant", "Execution boundary")
+        assert db.try_acquire_session_turn_lease("sess-1", "holder", ttl_seconds=60)
+        db.commit_todo_snapshot(
+            session_id="sess-1", owner_execution_id="owned-execution",
+            anchor_assistant_row_id=anchor, expected_head_id=anchor,
+            turn_lease_holder="holder", expected_prior_snapshot_id=None,
+            todos_json=json.dumps(items, sort_keys=True, separators=(",", ":")),
+        )
+        db.release_session_turn_lease("sess-1", "holder")
+        agent = _FakeAgent()
+        agent._session_db = db
+        agent._session_db_created = True
+        agent._todo_store = TodoStore()
+        agent._todo_store.write(initial)
+        agent._hydrate_todo_store = types.MethodType(AIAgent._hydrate_todo_store, agent)
+        context = _build(agent, conversation_history=None)
+        assert agent._todo_store.read() == items
+        assert context.active_system_prompt == "SYSTEM"
+        assert agent._cached_system_prompt == "SYSTEM"
+
+
+def test_turn_owner_validation_failure_precedes_session_creation(tmp_path):
+    from run_agent import AIAgent
+    from tools.todo_tool import TodoStore
+    from hermes_state import TodoSnapshotError
+
+    with SessionDB(tmp_path / "state.db") as db:
+        db.create_session("sess-1", source="test")
+        db._conn.execute("UPDATE sessions SET todo_current_snapshot_id=999")
+        db._conn.commit()
+        agent = _FakeAgent()
+        agent._session_db = db
+        agent._session_db_created = True
+        agent._todo_store = TodoStore()
+        agent._hydrate_todo_store = types.MethodType(AIAgent._hydrate_todo_store, agent)
+        with pytest.raises(TodoSnapshotError, match="pointer"):
+            _build(agent)
+        assert agent._ensure_db_prompt_at_call == "<unset>"
+        assert agent._todo_store.read() == []
+
+
 def test_returns_turn_context_with_user_message_appended():
     agent = _FakeAgent()
     ctx = _build(agent)

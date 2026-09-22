@@ -326,7 +326,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
     )
 
 
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 29
 
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
@@ -419,6 +419,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     compression_ineffective_count INTEGER NOT NULL DEFAULT 0,
     profile_name TEXT,
     rewind_count INTEGER NOT NULL DEFAULT 0,
+    todo_current_snapshot_id INTEGER,
+    todo_clear_baseline_operation_id TEXT,
     archived INTEGER NOT NULL DEFAULT 0,
     pinned INTEGER NOT NULL DEFAULT 0,
     hidden INTEGER NOT NULL DEFAULT 0,
@@ -452,6 +454,81 @@ CREATE TABLE IF NOT EXISTS messages (
     api_content TEXT,
     display_kind TEXT,
     display_metadata TEXT
+);
+
+-- Dedicated owner state, never hydrated from imported transcript payloads.
+-- Row coordinates are checked on read instead of cascading message deletion:
+-- rewrites must make unsupported causal state unavailable, not silently empty.
+CREATE TABLE IF NOT EXISTS todo_snapshots (
+    snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    schema_version INTEGER NOT NULL,
+    producer TEXT NOT NULL,
+    execution_id TEXT NOT NULL,
+    anchor_message_id INTEGER NOT NULL,
+    head_message_id INTEGER NOT NULL,
+    rewind_count INTEGER NOT NULL,
+    supersedes_snapshot_id INTEGER,
+    todos_json TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    lifecycle_source_snapshot_id INTEGER,
+    lifecycle_operation_id TEXT,
+    lifecycle_kind TEXT,
+    UNIQUE(session_id, execution_id)
+);
+CREATE INDEX IF NOT EXISTS idx_todo_snapshots_session
+    ON todo_snapshots(session_id, snapshot_id DESC);
+
+-- Owner compaction coordinates, not a second task store or execution permit.
+CREATE TABLE IF NOT EXISTS todo_lifecycle_operations (
+    operation_id TEXT PRIMARY KEY,
+    schema_version INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    source_session_id TEXT NOT NULL,
+    destination_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    source_current_snapshot_id INTEGER,
+    source_rewind_count INTEGER NOT NULL,
+    destination_rewind_count INTEGER NOT NULL,
+    boundary_message_id INTEGER NOT NULL,
+    watermark INTEGER,
+    watermark_ceiling INTEGER,
+    created_at REAL NOT NULL,
+    selection_kind TEXT NOT NULL DEFAULT 'snapshot',
+    source_clear_operation_id TEXT,
+    UNIQUE(destination_session_id, boundary_message_id)
+);
+
+-- Physical one-hop copies made by owner compaction transactions. These edges
+-- are historical correspondence, not currentness or execution authority.
+CREATE TABLE IF NOT EXISTS message_copy_edges (
+    destination_message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+    source_message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    source_session_id TEXT NOT NULL,
+    destination_session_id TEXT NOT NULL,
+    schema_version INTEGER NOT NULL,
+    copy_kind TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_message_copy_edges_source
+    ON message_copy_edges(source_message_id);
+
+-- Exact owner rewind membership. Message IDs are retained evidence, not FKs:
+-- deleting a message must invalidate restore, not erase its operation record.
+CREATE TABLE IF NOT EXISTS session_rewinds (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    rewind_count INTEGER NOT NULL,
+    schema_version INTEGER NOT NULL,
+    target_message_id INTEGER NOT NULL,
+    target_was_active INTEGER NOT NULL,
+    removed_message_ids TEXT NOT NULL,
+    replacement_message_id INTEGER,
+    post_rewind_active_ids TEXT NOT NULL,
+    physical_watermark_id INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    restored_at REAL,
+    todo_before_snapshot_id INTEGER,
+    todo_after_snapshot_id INTEGER,
+    PRIMARY KEY (session_id, rewind_count)
 );
 
 CREATE TABLE IF NOT EXISTS session_model_usage (
@@ -557,6 +634,8 @@ CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
 # existing databases. SCHEMA_SQL above is run by sqlite executescript
 # which would otherwise fail on legacy DBs ("no such column: active").
 DEFERRED_INDEX_SQL = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_todo_lifecycle_source
+    ON todo_snapshots(lifecycle_operation_id, lifecycle_source_snapshot_id);
 CREATE INDEX IF NOT EXISTS idx_messages_session_active
     ON messages(session_id, active, timestamp);
 CREATE INDEX IF NOT EXISTS idx_messages_active_null
