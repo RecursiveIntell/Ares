@@ -8667,16 +8667,14 @@ class AIAgent:
                         "will acquire rather than run without serialization",
                         exc_info=True,
                     )
-                    _durable_session_exists = True
+                    # The probe did not establish existence. Admission below
+                    # still takes the lease, then ensures the row before effects.
             if (
                 _turn_db is not None
                 and session_id
                 and not getattr(self, "_persist_disabled", False)
-                # A fresh session id is process-unique and has no durable
-                # transcript to race over. More importantly, subagent/new-turn
-                # callers may intentionally supply an in-memory seed before the
-                # row exists; reloading an absent row would erase that seed.
-                and _durable_session_exists
+                # Fresh turns need custody too: todo publication is fenced by
+                # this owner. Reload only after contention, preserving fresh seeds.
                 # Test doubles and third-party DB shims may accept arbitrary
                 # MagicMock attributes without implementing the protocol. Check
                 # the concrete type so only real implementations opt in.
@@ -8684,10 +8682,10 @@ class AIAgent:
                     getattr(type(_turn_db), "acquire_session_turn_lease", None)
                 )
             ):
-                # Resumed agents also defer their create check until the turn
-                # prologue. We just proved this row exists, so suppress the
-                # redundant create attempt after acquiring it.
-                self._session_db_created = True
+                # Only a positive probe suppresses lazy creation. An absent row
+                # must be established under custody before the loop can act.
+                if _durable_session_exists:
+                    self._session_db_created = True
                 _durable_holder = (
                     f"pid={os.getpid()}:turn={relay_turn_id}:platform="
                     f"{task_context['platform'] or 'unknown'}"
@@ -8815,6 +8813,20 @@ class AIAgent:
                         repair_alternation=True,
                         include_row_ids=True,
                     )
+
+                self._ensure_db_session()
+                if not self._session_db_created:
+                    # _ensure_db_session logs transient errors for retry on a
+                    # later turn; they must not admit this turn without storage.
+                    # The outer finally releases the already-acquired lease.
+                    return {
+                        "final_response": "Session storage could not be established. Your message was not processed.",
+                        "messages": list(conversation_history or []),
+                        "api_calls": 0,
+                        "completed": False,
+                        "failed": True,
+                        "error": f"session_persistence_admission_failed:{self.session_id}",
+                    }
 
                 # Long model/tool/compression turns outlive a fixed TTL. Refresh
                 # in a daemon thread; holder-qualified UPDATE and DELETE fence a
