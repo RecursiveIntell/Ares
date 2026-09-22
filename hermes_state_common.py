@@ -454,6 +454,26 @@ CREATE TABLE IF NOT EXISTS messages (
     display_metadata TEXT
 );
 
+-- Dedicated owner state, never hydrated from imported transcript payloads.
+-- Row coordinates are checked on read instead of cascading message deletion:
+-- rewrites must make unsupported causal state unavailable, not silently empty.
+CREATE TABLE IF NOT EXISTS todo_snapshots (
+    snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    schema_version INTEGER NOT NULL,
+    producer TEXT NOT NULL,
+    execution_id TEXT NOT NULL,
+    anchor_message_id INTEGER NOT NULL,
+    head_message_id INTEGER NOT NULL,
+    rewind_count INTEGER NOT NULL,
+    supersedes_snapshot_id INTEGER,
+    todos_json TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    UNIQUE(session_id, execution_id)
+);
+CREATE INDEX IF NOT EXISTS idx_todo_snapshots_session
+    ON todo_snapshots(session_id, snapshot_id DESC);
+
 CREATE TABLE IF NOT EXISTS session_model_usage (
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     model TEXT NOT NULL,

@@ -3778,6 +3778,14 @@ class SessionCompressionInProgressError(CompressionSessionBusyError):
     """
 
 
+class TodoSnapshotError(RuntimeError):
+    """Owner storage refused a todo version; never a transcript fallback signal."""
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(f"Todo snapshot refused: {reason}")
+
+
 class SessionTurnLeaseLostError(RuntimeError):
     """A transcript write presented a turn-lease holder that no longer owns it.
 
@@ -10755,6 +10763,182 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
             and session["end_reason"] == "compression"
         ):
             raise CompressionSessionClosedError(session_id)
+
+    @staticmethod
+    def _validate_todo_snapshot_payload(raw: str) -> list:
+        from tools.todo_tool import MAX_TODO_ITEMS, MAX_TODO_RESULT_CHARS, TodoStore
+
+        if not isinstance(raw, str) or len(raw) > MAX_TODO_RESULT_CHARS:
+            raise TodoSnapshotError("payload")
+        try:
+            items = json.loads(raw)
+            if not isinstance(items, list) or len(items) > MAX_TODO_ITEMS:
+                raise TodoSnapshotError("payload")
+            normalized = TodoStore().write(items)
+            canonical = json.dumps(
+                normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            )
+        except (ValueError, TypeError, RecursionError) as exc:
+            raise TodoSnapshotError("payload") from exc
+        if canonical != raw:
+            raise TodoSnapshotError("payload")
+        return normalized
+
+    def _current_todo_snapshot_on_conn(self, conn, session_id: str):
+        # A single statement pins the latest record AND all causal coordinates
+        # to the same SQLite read snapshot, including on pooled WAL readers.
+        try:
+            row = conn.execute(
+                "SELECT t.*, s.rewind_count AS current_rewind, s.ended_at, s.end_reason, "
+                "a.session_id AS anchor_session, a.role AS anchor_role, "
+                "a.active AS anchor_active, a.compacted AS anchor_compacted, "
+                "h.session_id AS head_session, h.active AS head_active, "
+                "h.compacted AS head_compacted, "
+                "(SELECT MAX(p.snapshot_id) FROM todo_snapshots p "
+                " WHERE p.session_id=s.id AND p.snapshot_id<t.snapshot_id) AS prior_id "
+                "FROM sessions s LEFT JOIN todo_snapshots t ON t.snapshot_id="
+                "(SELECT MAX(v.snapshot_id) FROM todo_snapshots v WHERE v.session_id=s.id) "
+                "LEFT JOIN messages a ON a.id=t.anchor_message_id "
+                "LEFT JOIN messages h ON h.id=t.head_message_id WHERE s.id=?",
+                (session_id,),
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if "no such table: todo_snapshots" in str(exc):
+                raise TodoSnapshotError("unsupported_schema") from exc
+            raise
+        if row is None:
+            raise TodoSnapshotError("session")
+        if row["ended_at"] is not None and row["end_reason"] == "compression":
+            raise TodoSnapshotError("closed_session")
+        if row["snapshot_id"] is None:
+            return None
+        if row["schema_version"] != 1:
+            raise TodoSnapshotError("schema")
+        if row["producer"] != "todo_dispatch_v1":
+            raise TodoSnapshotError("producer")
+        items = self._validate_todo_snapshot_payload(row["todos_json"])
+        if (
+            row["session_id"] != session_id
+            or row["rewind_count"] != row["current_rewind"]
+            or row["anchor_session"] != session_id
+            or row["anchor_role"] != "assistant"
+            or row["anchor_active"] != 1 or row["anchor_compacted"] != 0
+            or row["head_session"] != session_id
+            or row["head_active"] != 1 or row["head_compacted"] != 0
+            or row["anchor_message_id"] > row["head_message_id"]
+        ):
+            raise TodoSnapshotError("causal_scope")
+        if row["supersedes_snapshot_id"] != row["prior_id"]:
+            raise TodoSnapshotError("predecessor")
+        result = {key: row[key] for key in (
+            "snapshot_id", "session_id", "schema_version", "producer", "execution_id",
+            "anchor_message_id", "head_message_id", "rewind_count",
+            "supersedes_snapshot_id", "todos_json", "created_at",
+        )}
+        result["todos"] = items
+        return result
+
+    def get_current_todo_snapshot(self, session_id: str):
+        """Read the exact latest owner version, distinct from missing/empty.
+
+        Storage prerequisite only: no implicit inheritance, transcript fallback,
+        or lifecycle mapping. Compacted/rewound coordinates fail closed. This API
+        does not authenticate arbitrary privileged code sharing the process/DB.
+        """
+        with self._read_ctx() as conn:
+            return self._current_todo_snapshot_on_conn(conn, session_id)
+
+    def commit_todo_snapshot(
+        self, *, session_id: str, owner_execution_id: str,
+        anchor_assistant_row_id: int, expected_head_id: int,
+        turn_lease_holder: str, expected_prior_snapshot_id: Optional[int],
+        todos_json: str,
+    ):
+        """Commit a normalized full replacement under existing owner custody.
+
+        Internal application API, not a model tool/import surface. The future
+        dispatcher must supply server execution correlation and committed causal
+        coordinates under its lease. IDs/producer labels are not capabilities.
+        No runtime seam is activated by this storage-only prerequisite.
+        """
+        self._validate_todo_snapshot_payload(todos_json)
+        if (not isinstance(owner_execution_id, str)
+                or not owner_execution_id.strip() or len(owner_execution_id) > 256):
+            raise TodoSnapshotError("execution_id")
+        if not isinstance(turn_lease_holder, str) or not turn_lease_holder:
+            raise TodoSnapshotError("lease")
+        if type(anchor_assistant_row_id) is not int or anchor_assistant_row_id <= 0:
+            raise TodoSnapshotError("anchor")
+        if type(expected_head_id) is not int or expected_head_id <= 0:
+            raise TodoSnapshotError("head")
+        if expected_prior_snapshot_id is not None and (
+            type(expected_prior_snapshot_id) is not int or expected_prior_snapshot_id <= 0
+        ):
+            raise TodoSnapshotError("stale_version")
+
+        def _do(conn):
+            # Unlike ordinary transcript append's renewal policy, this new owner
+            # mutation requires a presently live lease, without implicit renewal.
+            key = self._session_turn_lease_key_on_conn(conn, session_id)
+            lease = conn.execute(
+                "SELECT holder, expires_at FROM session_turn_leases WHERE conversation_id=?",
+                (key,),
+            ).fetchone()
+            if (lease is None or lease["holder"] != turn_lease_holder
+                    or float(lease["expires_at"]) <= time.time()):
+                raise TodoSnapshotError("lease")
+            # Lease admission is strict and owned above. Reuse only the shared
+            # closed-session guard here: passing the holder would authorize its
+            # ordinary transcript renewal policy, which this API must not use.
+            self._check_transcript_write_guards(conn, session_id, None)
+            head = conn.execute(
+                "SELECT MAX(id) FROM messages WHERE session_id=? AND active=1 AND compacted=0",
+                (session_id,),
+            ).fetchone()[0]
+            if head != expected_head_id:
+                raise TodoSnapshotError("head")
+            anchor = conn.execute(
+                "SELECT id FROM messages WHERE id=? AND session_id=? AND role='assistant' "
+                "AND active=1 AND compacted=0 AND id<=?",
+                (anchor_assistant_row_id, session_id, expected_head_id),
+            ).fetchone()
+            if anchor is None:
+                raise TodoSnapshotError("anchor")
+            current = self._current_todo_snapshot_on_conn(conn, session_id)
+            existing = conn.execute(
+                "SELECT snapshot_id FROM todo_snapshots WHERE session_id=? AND execution_id=?",
+                (session_id, owner_execution_id),
+            ).fetchone()
+            if existing is not None:
+                if current is None or existing["snapshot_id"] != current["snapshot_id"]:
+                    raise TodoSnapshotError("stale_version")
+                if (current["anchor_message_id"] != anchor_assistant_row_id
+                        or current["head_message_id"] != expected_head_id
+                        or current["todos_json"] != todos_json
+                        or current["supersedes_snapshot_id"] != expected_prior_snapshot_id):
+                    raise TodoSnapshotError("execution_conflict")
+                if float(lease["expires_at"]) <= time.time():
+                    raise TodoSnapshotError("lease")
+                return current
+            if (current["snapshot_id"] if current else None) != expected_prior_snapshot_id:
+                raise TodoSnapshotError("stale_version")
+            rewind_count = conn.execute(
+                "SELECT rewind_count FROM sessions WHERE id=?", (session_id,)
+            ).fetchone()[0]
+            # BEGIN IMMEDIATE fences takeover; elapsed time does not extend the
+            # original lease. Recheck after payload/causal validation, at insert.
+            if float(lease["expires_at"]) <= time.time():
+                raise TodoSnapshotError("lease")
+            conn.execute(
+                "INSERT INTO todo_snapshots (session_id,schema_version,producer,execution_id,"
+                "anchor_message_id,head_message_id,rewind_count,supersedes_snapshot_id,"
+                "todos_json,created_at) VALUES (?,1,'todo_dispatch_v1',?,?,?,?,?,?,?)",
+                (session_id, owner_execution_id, anchor_assistant_row_id, expected_head_id,
+                 rewind_count, expected_prior_snapshot_id, todos_json, time.time()),
+            )
+            return self._current_todo_snapshot_on_conn(conn, session_id)
+
+        return self._execute_write(_do)
 
     @staticmethod
     def _decode_display_metadata(raw: Any) -> Optional[Dict[str, Any]]:
