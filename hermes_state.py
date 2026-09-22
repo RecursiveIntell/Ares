@@ -7020,7 +7020,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
             if not messages:
                 raise RuntimeError("Compression child handoff must not be empty")
             todo_baseline = self._todo_compaction_baseline_on_conn(
-                conn, parent_session_id, messages, watermark,
+                conn, parent_session_id, messages, watermark, watermark_ceiling,
             )
             system_prompt_hash = self._store_system_prompt(conn, system_prompt)
 
@@ -7061,10 +7061,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
             total_messages, total_tool_calls, row_ids = self._insert_message_rows(
                 conn, child_session_id, messages
             )
-            self._project_todo_baseline_on_conn(
-                conn, parent_session_id, child_session_id, todo_baseline, row_ids,
-                "compression_child", watermark, watermark_ceiling,
-            )
             if watermark is not None:
                 # Clone the parent's concurrent tail (rows landed after the
                 # watermark, at or below the ceiling — see docstring) into the
@@ -7096,6 +7092,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                                 total_tool_calls += len(parsed) if isinstance(parsed, list) else 0
                             except (TypeError, ValueError):
                                 pass
+            self._project_todo_baseline_on_conn(
+                conn, parent_session_id, child_session_id, todo_baseline, row_ids,
+                "compression_child", watermark, watermark_ceiling,
+            )
             conn.execute(
                 "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
                 (total_messages, total_tool_calls, child_session_id),
@@ -10812,7 +10812,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                 "SELECT selected_id FROM selected_session UNION "
                 "SELECT t.lifecycle_source_snapshot_id FROM todo_snapshots t "
                 "JOIN history h ON h.snapshot_id=t.snapshot_id "
-                "WHERE t.schema_version=2 AND t.lifecycle_source_snapshot_id IS NOT NULL UNION "
+                "WHERE t.schema_version IN (2,3) AND t.lifecycle_source_snapshot_id IS NOT NULL UNION "
+                "SELECT o.source_current_snapshot_id FROM todo_snapshots t "
+                "JOIN history h ON h.snapshot_id=t.snapshot_id "
+                "JOIN todo_lifecycle_operations o ON o.operation_id=t.lifecycle_operation_id "
+                "WHERE t.schema_version=3 UNION "
                 "SELECT t.supersedes_snapshot_id FROM todo_snapshots t "
                 "JOIN history h ON h.snapshot_id=t.snapshot_id "
                 "WHERE t.supersedes_snapshot_id IS NOT NULL) "
@@ -10824,6 +10828,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                 "h.session_id AS head_session,h.active AS head_active,h.compacted AS head_compacted,"
                 "p.snapshot_id AS prior_id,p.session_id AS prior_session,"
                 "p.head_message_id AS prior_head,p.rewind_count AS prior_rewind,"
+                "p.schema_version AS prior_schema,p.lifecycle_operation_id AS prior_operation,"
+                "p.lifecycle_source_snapshot_id AS prior_source,"
+                "b.session_id AS boundary_session,"
+                "ca.schema_version AS anchor_copy_schema,ca.copy_kind AS anchor_copy_kind,"
+                "ca.source_session_id AS anchor_copy_scope,ca.source_message_id AS anchor_copy_source,"
+                "ca.destination_session_id AS anchor_copy_destination,"
+                "ch.schema_version AS head_copy_schema,ch.copy_kind AS head_copy_kind,"
+                "ch.source_session_id AS head_copy_scope,ch.source_message_id AS head_copy_source,"
+                "ch.destination_session_id AS head_copy_destination,"
                 "r.schema_version AS rewind_schema,r.state AS rewind_state,"
                 "r.todo_before_snapshot_id AS before_id,r.todo_after_snapshot_id AS after_id,"
                 "o.schema_version AS op_schema,o.kind AS op_kind,"
@@ -10846,6 +10859,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                 "LEFT JOIN todo_snapshots p ON p.snapshot_id=t.supersedes_snapshot_id "
                 "LEFT JOIN todo_lifecycle_operations o ON o.operation_id=t.lifecycle_operation_id "
                 "LEFT JOIN todo_snapshots src ON src.snapshot_id=t.lifecycle_source_snapshot_id "
+                "LEFT JOIN messages b ON b.id=o.boundary_message_id "
+                "LEFT JOIN message_copy_edges ca ON ca.destination_message_id=t.anchor_message_id "
+                "LEFT JOIN message_copy_edges ch ON ch.destination_message_id=t.head_message_id "
                 "LEFT JOIN sessions source_owner ON source_owner.id=src.session_id "
                 "LEFT JOIN session_rewinds r ON r.session_id=s.id AND r.rewind_count=s.rewind_count "
                 , args,
@@ -10864,17 +10880,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                 raise TodoSnapshotError("unsupported_schema") from exc
             raise
 
-    def _validate_todo_snapshot_identity(self, row):
+    def _validate_todo_snapshot_identity(self, row, history=None):
         if row is None or row["snapshot_id"] is None:
             raise TodoSnapshotError("pointer")
-        if row["schema_version"] not in (1, 2):
+        if row["schema_version"] not in (1, 2, 3):
             raise TodoSnapshotError("schema")
-        lifecycle = row["schema_version"] == 2
-        expected_producer = "todo_lifecycle_projection_v1" if lifecycle else "todo_dispatch_v1"
+        lifecycle = row["schema_version"] in (2, 3)
+        expected_producer = {1: "todo_dispatch_v1", 2: "todo_lifecycle_projection_v1",
+                             3: "todo_lifecycle_projection_v2"}[row["schema_version"]]
         if row["producer"] != expected_producer:
             raise TodoSnapshotError("producer")
         if lifecycle:
-            self._validate_todo_lifecycle_binding(row)
+            self._validate_todo_lifecycle_binding(row, history)
         elif any(row[key] is not None for key in (
             "lifecycle_source_snapshot_id", "lifecycle_operation_id", "lifecycle_kind",
         )):
@@ -10889,7 +10906,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
     def _validate_todo_snapshot_coordinates(row, session_id, rewind_count):
         # Physical scope and predecessor order survive archival. Active and
         # uncompacted membership are separate current-selection obligations.
-        lifecycle = row["schema_version"] == 2
+        lifecycle = row["schema_version"] in (2, 3)
         if (
             row["session_id"] != session_id
             or type(row["rewind_count"]) is not int
@@ -10915,14 +10932,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
             raise TodoSnapshotError("predecessor")
 
     def _validate_todo_snapshot_row(self, row, session_id, *, active_ids=None):
-        items = self._validate_todo_snapshot_identity(row)
+        history = {r["snapshot_id"]: r for r in [row, *row["historical_sources"]]}
+        items = self._validate_todo_snapshot_identity(row, history)
         # Preserve the selected row's error precedence before traversing a
         # missing/malformed historical predecessor.
         self._validate_todo_snapshot_coordinates(row, session_id, row["current_rewind"])
         for historical in row["historical_sources"]:
             # Historical sources may be compacted or belong to a closed parent;
             # this validates evidence, not current recall or authorization.
-            self._validate_todo_snapshot_identity(historical)
+            self._validate_todo_snapshot_identity(historical, history)
             self._validate_todo_snapshot_coordinates(
                 historical, historical["session_id"], historical["owner_rewind"],
             )
@@ -10943,15 +10961,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
         return result
 
     @staticmethod
-    def _validate_todo_lifecycle_binding(row):
+    def _validate_todo_lifecycle_binding(row, history):
         # Bind historical correspondence and bound the recorded coordinate by
         # source-owner history. This is not independent selection attestation,
         # current source authority, or privileged-DB tamper resistance.
         source = row["source_id"]
         watermark, ceiling = row["op_watermark"], row["op_ceiling"]
         if (
-            row["lifecycle_kind"] != "baseline"
-            or row["op_schema"] != 1
+            row["op_schema"] != (2 if row["schema_version"] == 3 else 1)
+            or row["boundary_session"] != row["session_id"]
             or row["op_kind"] not in ("in_place_compaction", "compression_child")
             or not isinstance(row["lifecycle_operation_id"], str)
             or not row["lifecycle_operation_id"]
@@ -10959,16 +10977,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
             or (row["op_source"] == row["op_destination"])
             != (row["op_kind"] == "in_place_compaction")
             or type(source) is not int or not 0 < source < row["snapshot_id"]
-            or row["op_snapshot"] != source
             or row["op_source"] != row["source_session"]
             or (row["source_schema"], row["source_producer"]) not in (
                 (1, "todo_dispatch_v1"), (2, "todo_lifecycle_projection_v1"),
+                (3, "todo_lifecycle_projection_v2"),
             )
             or row["todos_json"] != row["source_payload"]
             or row["execution_id"] != f"todo-lifecycle:{row['lifecycle_operation_id']}:{source}"
-            or row["supersedes_snapshot_id"] is not None
-            or row["anchor_message_id"] != row["op_boundary"]
-            or row["head_message_id"] != row["op_boundary"]
             or row["rewind_count"] != row["op_destination_rewind"]
             or type(row["op_rewind"]) is not int
             or type(row["source_rewind"]) is not int
@@ -10978,7 +10993,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
             or type(row["source_head"]) is not int
             or not 0 < row["source_anchor"] <= row["source_head"] < row["op_boundary"]
             or (watermark is not None and (
-                type(watermark) is not int or row["source_head"] > watermark
+                type(watermark) is not int or watermark < 0
             ))
             or (ceiling is not None and (
                 type(ceiling) is not int or ceiling < 0
@@ -10991,7 +11006,72 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
         ):
             raise TodoSnapshotError("lifecycle_binding")
 
-    def _todo_compaction_baseline_on_conn(self, conn, session_id, messages, watermark):
+        if row["schema_version"] == 2:
+            if (row["lifecycle_kind"] != "baseline" or row["op_snapshot"] != source
+                    or row["supersedes_snapshot_id"] is not None
+                    or row["anchor_message_id"] != row["op_boundary"]
+                    or row["head_message_id"] != row["op_boundary"]
+                    or (watermark is not None and row["source_head"] > watermark)):
+                raise TodoSnapshotError("lifecycle_binding")
+            return
+
+        if type(watermark) is not int or not history:
+            raise TodoSnapshotError("lifecycle_binding")
+        # Reconstruct only the operation-selected source branch. Retain the
+        # newest prefix, then every tail version, never an equal-content sibling.
+        sequence = []
+        current = row["op_snapshot"]
+        while current is not None:
+            item = history.get(current)
+            if (item is None or type(current) is not int
+                    or not 0 < current < row["snapshot_id"]
+                    or item["session_id"] != row["op_source"]
+                    or type(item["head_message_id"]) is not int
+                    or type(item["rewind_count"]) is not int
+                    or not 0 <= item["rewind_count"] <= row["op_rewind"]
+                    or (ceiling is not None and item["head_message_id"] > ceiling)):
+                raise TodoSnapshotError("lifecycle_binding")
+            sequence.append(current)
+            if item["head_message_id"] <= watermark:
+                break
+            prior = item["supersedes_snapshot_id"]
+            if prior is not None and (type(prior) is not int or not 0 < prior < current):
+                raise TodoSnapshotError("lifecycle_binding")
+            current = prior
+        sequence.reverse()
+        if (source not in sequence or not sequence
+                or history[sequence[-1]]["head_message_id"] <= watermark):
+            raise TodoSnapshotError("lifecycle_binding")
+        index = sequence.index(source)
+        if index == 0:
+            if row["supersedes_snapshot_id"] is not None:
+                raise TodoSnapshotError("lifecycle_binding")
+        elif (row["prior_schema"] != 3
+                or row["prior_operation"] != row["lifecycle_operation_id"]
+                or row["prior_source"] != sequence[index - 1]):
+            raise TodoSnapshotError("lifecycle_binding")
+        expected_kind = "tail" if row["source_head"] > watermark else "baseline"
+        if row["lifecycle_kind"] != expected_kind:
+            raise TodoSnapshotError("lifecycle_binding")
+        for coordinate in ("anchor", "head"):
+            original = row[f"source_{coordinate}"]
+            destination = row[f"{coordinate}_message_id"]
+            if original <= watermark:
+                if destination != row["op_boundary"]:
+                    raise TodoSnapshotError("lifecycle_binding")
+            elif (
+                type(destination) is not int or destination <= row["op_boundary"]
+                or row[f"{coordinate}_copy_schema"] != 1
+                or row[f"{coordinate}_copy_kind"] != (
+                    "in_place_tail" if row["op_kind"] == "in_place_compaction"
+                    else "compression_child_tail")
+                or row[f"{coordinate}_copy_scope"] != row["op_source"]
+                or row[f"{coordinate}_copy_destination"] != row["session_id"]
+                or row[f"{coordinate}_copy_source"] != original
+            ):
+                raise TodoSnapshotError("lifecycle_binding")
+
+    def _todo_compaction_baseline_on_conn(self, conn, session_id, messages, watermark, ceiling=None):
         current = self._current_todo_snapshot_on_conn(conn, session_id)
         if current is None:
             return None
@@ -10999,18 +11079,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
             raise TodoSnapshotError("lifecycle_boundary")
         if watermark is not None and (type(watermark) is not int or watermark < 0):
             raise TodoSnapshotError("lifecycle_boundary")
-        # Read and validate the whole selected branch before archiving anything.
-        # Baseline-only support must not silently discard an unmapped tail.
-        version = current
+        if ceiling is not None and (
+                type(ceiling) is not int or ceiling < 0
+                or (watermark is not None and ceiling < watermark)):
+            raise TodoSnapshotError("lifecycle_boundary")
+        # Validate the whole selected branch before archiving; retain only its
+        # latest prefix and all successors. No scan of unrelated snapshot rows.
+        version, versions, prefix_found = current, [], False
         while version is not None:
-            if watermark is not None and version["head_message_id"] > watermark:
-                raise TodoSnapshotError("unsupported_tail")
+            if not prefix_found:
+                if (watermark is not None and version["head_message_id"] > watermark
+                        and ceiling is not None and version["head_message_id"] > ceiling):
+                    raise TodoSnapshotError("lifecycle_boundary")
+                versions.append(version)
+                prefix_found = watermark is None or version["head_message_id"] <= watermark
             prior = version["supersedes_snapshot_id"]
             version = None if prior is None else self._validate_todo_snapshot_row(
                 self._todo_snapshot_row_on_conn(conn, session_id, prior), session_id,
             )
         rewind = conn.execute("SELECT rewind_count FROM sessions WHERE id=?", (session_id,)).fetchone()[0]
-        return current, rewind
+        return list(reversed(versions)), rewind
 
     def _project_todo_baseline_on_conn(
         self, conn, source_session, destination_session, baseline, row_ids,
@@ -11020,7 +11108,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
             return
         import uuid
 
-        current, source_rewind = baseline
+        versions, source_rewind = baseline
+        current = versions[-1]
+        tail = watermark is not None and current["head_message_id"] > watermark
         if not row_ids:
             raise TodoSnapshotError("lifecycle_boundary")
         # The FIRST INSERTED row is the explicit canonical lifecycle boundary.
@@ -11034,21 +11124,44 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
             "INSERT INTO todo_lifecycle_operations (operation_id,schema_version,kind,"
             "source_session_id,destination_session_id,source_current_snapshot_id,"
             "source_rewind_count,destination_rewind_count,boundary_message_id,"
-            "watermark,watermark_ceiling,created_at) VALUES (?,1,?,?,?,?,?,?,?,?,?,?)",
-            (operation, kind, source_session, destination_session, current["snapshot_id"],
+            "watermark,watermark_ceiling,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (operation, 2 if tail else 1, kind, source_session, destination_session, current["snapshot_id"],
              source_rewind, destination_rewind, boundary, watermark, ceiling, time.time()),
         )
-        cursor = conn.execute(
-            "INSERT INTO todo_snapshots (session_id,schema_version,producer,execution_id,"
-            "anchor_message_id,head_message_id,rewind_count,supersedes_snapshot_id,"
-            "todos_json,created_at,lifecycle_source_snapshot_id,lifecycle_operation_id,lifecycle_kind) "
-            "VALUES (?,2,'todo_lifecycle_projection_v1',?,?,?,?,NULL,?,?,?,?,'baseline')",
-            (destination_session, f"todo-lifecycle:{operation}:{current['snapshot_id']}",
-             boundary, boundary, destination_rewind, current["todos_json"], time.time(),
-             current["snapshot_id"], operation),
-        )
+        prior = None
+        for version in versions:
+            coordinates = []
+            for key in ("anchor_message_id", "head_message_id"):
+                original = version[key]
+                if not tail or original <= watermark:
+                    coordinates.append(boundary)
+                    continue
+                copies = conn.execute(
+                    "SELECT destination_message_id FROM message_copy_edges "
+                    "WHERE source_session_id=? AND source_message_id=? "
+                    "AND destination_session_id=? AND destination_message_id>? "
+                    "AND schema_version=1 AND copy_kind=?",
+                    (source_session, original, destination_session, boundary,
+                     "in_place_tail" if kind == "in_place_compaction" else "compression_child_tail"),
+                ).fetchall()
+                if len(copies) != 1:
+                    raise TodoSnapshotError("lifecycle_binding")
+                coordinates.append(copies[0][0])
+            cursor = conn.execute(
+                "INSERT INTO todo_snapshots (session_id,schema_version,producer,execution_id,"
+                "anchor_message_id,head_message_id,rewind_count,supersedes_snapshot_id,"
+                "todos_json,created_at,lifecycle_source_snapshot_id,lifecycle_operation_id,lifecycle_kind) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (destination_session, 3 if tail else 2,
+                 "todo_lifecycle_projection_v2" if tail else "todo_lifecycle_projection_v1",
+                 f"todo-lifecycle:{operation}:{version['snapshot_id']}",
+                 *coordinates, destination_rewind, prior, version["todos_json"], time.time(),
+                 version["snapshot_id"], operation,
+                 "tail" if tail and version["head_message_id"] > watermark else "baseline"),
+            )
+            prior = cursor.lastrowid
         conn.execute("UPDATE sessions SET todo_current_snapshot_id=? WHERE id=?",
-                     (cursor.lastrowid, destination_session))
+                     (prior, destination_session))
         self._current_todo_snapshot_on_conn(conn, destination_session)
 
     def _current_todo_snapshot_on_conn(self, conn, session_id: str):
@@ -12177,11 +12290,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
             inserted, tool_calls_total, row_ids = self._insert_message_rows(
                 conn, session_id, compacted_messages
             )
-            self._project_todo_baseline_on_conn(
-                conn, session_id, session_id, todo_baseline, row_ids,
-                "in_place_compaction", watermark,
-            )
-
             if tail_ids:
                 # Re-sequence the concurrent tail after the compacted set via
                 # a pure-SQL column clone: no decode/re-encode round trip, no
@@ -12192,6 +12300,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                 inserted += len(tail_ids)
                 tool_calls_total += tail_tool_calls
 
+            self._project_todo_baseline_on_conn(
+                conn, session_id, session_id, todo_baseline, row_ids,
+                "in_place_compaction", watermark,
+            )
             # message_count / tool_call_count reflect the LIVE (active) set —
             # the archived rows are still on disk but not part of the live count.
             if model_config_patch is None:

@@ -112,14 +112,23 @@ def test_repeated_compaction_new_commit_rewind_and_restore(db, kind):
 
 
 @pytest.mark.parametrize("kind", ["in_place", "child"])
-def test_todo_tail_refuses_without_losing_selected_owner_state(db, kind):
+def test_todo_tail_preserves_selected_versions_and_owner_copy_coordinates(db, kind):
     first = write(db, "first")
-    write(db, "tail", prior=first["snapshot_id"])
-    before = state(db)
-    with pytest.raises(TodoSnapshotError) as exc:
-        compact(db, kind, watermark=first["head_message_id"])
-    assert exc.value.reason == "unsupported_tail"
-    assert state(db) == before
+    tail = write(db, "tail", prior=first["snapshot_id"])
+    destination = compact(db, kind, watermark=first["head_message_id"])
+    with SessionDB(db.db_path, read_only=True) as reopened:
+        selected = reopened.get_current_todo_snapshot(destination)
+        assert selected["todos_json"] == tail["todos_json"]
+        assert selected["snapshot_id"] != tail["snapshot_id"]
+        for key in ("anchor_message_id", "head_message_id"):
+            origin = reopened.get_message_copy_origin(destination, selected[key])
+            assert origin["source_message_id"] == tail[key]
+        target = next(m["id"] for m in reopened.get_messages(destination)
+                      if m["role"] == "user" and m["content"] == "tail")
+    db.rewind_to_message(destination, target)
+    assert db.get_current_todo_snapshot(destination)["todos_json"] == first["todos_json"]
+    db.restore_rewound(destination, target)
+    assert db.get_current_todo_snapshot(destination) == selected
 
 
 @pytest.mark.parametrize("kind", ["in_place", "child"])
@@ -432,4 +441,201 @@ def test_duplicate_source_projection_within_operation_is_rejected(db):
             "head_message_id,rewind_count,supersedes_snapshot_id,todos_json,created_at,"
             "lifecycle_source_snapshot_id,lifecycle_operation_id,lifecycle_kind "
             "FROM todo_snapshots WHERE schema_version=2"))
+    assert state(db) == before
+
+
+@pytest.mark.parametrize("kind", ["in_place", "child"])
+@pytest.mark.parametrize("prefix", [False, True])
+def test_tail_multiple_versions_empty_state_and_recompaction(db, kind, prefix):
+    first = write(db, "prefix") if prefix else None
+    watermark = first["head_message_id"] if first else 0
+    tail = write(db, "tail-one", prior=first["snapshot_id"] if first else None)
+    cleared = write(db, "tail-empty", prior=tail["snapshot_id"], items=[])
+    destination = compact(db, kind, watermark=watermark)
+    selected = db.get_current_todo_snapshot(destination)
+    assert selected is not None and selected["todos"] == []
+    target = next(m["id"] for m in db.get_messages(destination)
+                  if m["role"] == "user" and m["content"] == "tail-empty")
+    db.rewind_to_message(destination, target)
+    assert db.get_current_todo_snapshot(destination)["todos_json"] == tail["todos_json"]
+    db.restore_rewound(destination, target)
+    destination = compact(db, kind, source=destination, child="grandchild")
+    with SessionDB(db.db_path, read_only=True) as reopened:
+        assert reopened.get_current_todo_snapshot(destination)["todos_json"] == cleared["todos_json"]
+    current = db.get_current_todo_snapshot(destination)
+    new = write(db, "new", session=destination, prior=current["snapshot_id"])
+    assert db.get_current_todo_snapshot(destination) == new
+
+
+@pytest.mark.parametrize("kind", ["in_place", "child"])
+def test_tail_crossing_anchor_uses_boundary_and_exact_copied_head(db, kind):
+    first = write(db, "first")
+    anchor = db.append_message("s", "assistant", "crossing")
+    head = db.append_message("s", "tool", "result")
+    assert db.try_acquire_session_turn_lease("s", "writer", ttl_seconds=60)
+    try:
+        crossing = db.commit_todo_snapshot(
+            session_id="s", owner_execution_id="crossing", anchor_assistant_row_id=anchor,
+            expected_head_id=head, turn_lease_holder="writer",
+            expected_prior_snapshot_id=first["snapshot_id"], todos_json="[]",
+        )
+    finally:
+        db.release_session_turn_lease("s", "writer")
+    destination = compact(db, kind, watermark=anchor)
+    current = db.get_current_todo_snapshot(destination)
+    assert current["anchor_message_id"] == db.get_messages(destination)[0]["id"]
+    assert db.get_message_copy_origin(destination, current["head_message_id"])["source_message_id"] == head
+    assert current["todos_json"] == crossing["todos_json"]
+
+
+def test_child_todo_beyond_clone_ceiling_refuses_atomically(db):
+    first = write(db, "first")
+    write(db, "tail", prior=first["snapshot_id"])
+    before = state(db)
+    with pytest.raises(TodoSnapshotError):
+        compact(db, "child", watermark=first["head_message_id"], ceiling=first["head_message_id"])
+    assert state(db) == before
+
+
+@pytest.mark.parametrize("kind", ["in_place", "child"])
+@pytest.mark.parametrize("repeated", [False, True])
+@pytest.mark.parametrize("mutation", ["missing_copy", "copy_source", "copy_scope", "copy_kind", "copy_schema", "prior", "operation", "payload", "selected_source"])
+def test_tail_rejects_corruption_including_historical_copies(db, kind, repeated, mutation):
+    first = write(db, "first")
+    write(db, "tail", prior=first["snapshot_id"])
+    destination = compact(db, kind, watermark=first["head_message_id"])
+    tail = db.get_current_todo_snapshot(destination)
+    if repeated:
+        destination = compact(db, kind, source=destination, child="grandchild")
+
+    def corrupt(c):
+        if mutation == "missing_copy":
+            c.execute("DELETE FROM message_copy_edges WHERE destination_message_id=?", (tail["head_message_id"],))
+        elif mutation.startswith("copy_"):
+            col, value = {
+                "copy_source": ("source_message_id", first["head_message_id"]),
+                "copy_scope": ("source_session_id", "wrong"),
+                "copy_kind": ("copy_kind", "import"), "copy_schema": ("schema_version", 99),
+            }[mutation]
+            c.execute(f"UPDATE message_copy_edges SET {col}=? WHERE destination_message_id=?",
+                      (value, tail["head_message_id"]))
+        elif mutation == "selected_source":
+            c.execute("UPDATE todo_lifecycle_operations SET source_current_snapshot_id=? "
+                      "WHERE operation_id=(SELECT lifecycle_operation_id FROM todo_snapshots WHERE snapshot_id=?)",
+                      (first["snapshot_id"], tail["snapshot_id"]))
+        else:
+            col, value = {"prior": ("supersedes_snapshot_id", None),
+                          "operation": ("lifecycle_operation_id", "wrong"),
+                          "payload": ("todos_json", "[]")}[mutation]
+            c.execute(f"UPDATE todo_snapshots SET {col}=? WHERE snapshot_id=?", (value, tail["snapshot_id"]))
+    db._execute_write(corrupt)
+    before = state(db)
+    with pytest.raises(TodoSnapshotError):
+        db.get_current_todo_snapshot(destination)
+    with pytest.raises(TodoSnapshotError):
+        compact(db, kind, source=destination, child="rejected")
+    assert state(db) == before
+
+
+@pytest.mark.parametrize("kind", ["in_place", "child"])
+def test_tail_insert_failure_rolls_back_copies_and_selection(db, kind):
+    import sqlite3
+
+    first = write(db, "first")
+    write(db, "tail", prior=first["snapshot_id"])
+    db._execute_write(lambda c: c.execute(
+        "CREATE TRIGGER fail_tail BEFORE INSERT ON todo_snapshots "
+        "WHEN NEW.schema_version=3 AND NEW.lifecycle_kind='tail' "
+        "BEGIN SELECT RAISE(ABORT,'tail-fault'); END"))
+    before = state(db)
+    with pytest.raises(sqlite3.IntegrityError, match="tail-fault"):
+        compact(db, kind, watermark=first["head_message_id"])
+    assert state(db) == before
+
+
+@pytest.mark.parametrize("kind", ["in_place", "child"])
+@pytest.mark.parametrize("mutation", ["schema", "producer", "kind", "source", "skip_prior", "op_schema", "boundary_scope"])
+def test_tail_sequence_schema_and_equal_payloads_cannot_substitute_identity(db, kind, mutation):
+    first = write(db, "prefix", items=[])
+    second = write(db, "tail-one", prior=first["snapshot_id"], items=[])
+    write(db, "tail-two", prior=second["snapshot_id"], items=[])
+    destination = compact(db, kind, watermark=first["head_message_id"])
+    current = db.get_current_todo_snapshot(destination)
+    assert current["schema_version"] == 3
+    with db._read_ctx() as c:
+        rows = c.execute("SELECT * FROM todo_snapshots WHERE schema_version=3 ORDER BY snapshot_id").fetchall()
+        assert len(rows) == 3
+        assert [r["lifecycle_kind"] for r in rows] == ["baseline", "tail", "tail"]
+        assert rows[0]["supersedes_snapshot_id"] is None
+        assert rows[1]["supersedes_snapshot_id"] == rows[0]["snapshot_id"]
+        assert rows[2]["supersedes_snapshot_id"] == rows[1]["snapshot_id"]
+
+    def corrupt(c):
+        if mutation == "op_schema":
+            c.execute("UPDATE todo_lifecycle_operations SET schema_version=1")
+        elif mutation == "boundary_scope":
+            c.execute("UPDATE messages SET session_id='wrong' WHERE id=?", (rows[0]["head_message_id"],))
+        else:
+            column, value = {
+                "schema": ("schema_version", 2),
+                "producer": ("producer", "todo_lifecycle_projection_v1"),
+                "kind": ("lifecycle_kind", "baseline"),
+                "source": ("lifecycle_source_snapshot_id", first["snapshot_id"]),
+                "skip_prior": ("supersedes_snapshot_id", rows[0]["snapshot_id"]),
+            }[mutation]
+            c.execute(f"UPDATE todo_snapshots SET {column}=? WHERE snapshot_id=?", (value, current["snapshot_id"]))
+    db.create_session("wrong", source="test")
+    # A source swap conflicts with the existing unique operation/source index.
+    if mutation == "source":
+        import sqlite3
+        with pytest.raises(sqlite3.IntegrityError):
+            db._execute_write(corrupt)
+        assert db.get_current_todo_snapshot(destination) == current
+    else:
+        db._execute_write(corrupt)
+        with pytest.raises(TodoSnapshotError):
+            db.get_current_todo_snapshot(destination)
+
+
+@pytest.mark.parametrize("kind", ["in_place", "child"])
+def test_tail_selected_sibling_and_repeat_tail_compaction(db, kind):
+    first = write(db, "prefix")
+    discarded = write(db, "discarded", prior=first["snapshot_id"])
+    target = next(m["id"] for m in db.get_messages("s")
+                  if m["role"] == "user" and m["content"] == "discarded")
+    db.rewind_to_message("s", target)
+    selected = write(db, "selected", prior=first["snapshot_id"])
+    destination = compact(db, kind, watermark=first["head_message_id"])
+    current = db.get_current_todo_snapshot(destination)
+    assert current["todos_json"] == selected["todos_json"]
+    with db._read_ctx() as c:
+        assert not c.execute("SELECT 1 FROM todo_snapshots WHERE lifecycle_source_snapshot_id=?",
+                             (discarded["snapshot_id"],)).fetchone()
+    watermark = db.get_messages(destination)[0]["id"]
+    destination = compact(db, kind, source=destination, child="grandchild", watermark=watermark)
+    current = db.get_current_todo_snapshot(destination)
+    assert current["schema_version"] == 3
+    assert current["todos_json"] == selected["todos_json"]
+    target = next(m["id"] for m in db.get_messages(destination)
+                  if m["role"] == "user" and m["content"] == "selected")
+    db.rewind_to_message(destination, target)
+    assert db.get_current_todo_snapshot(destination)["todos_json"] == first["todos_json"]
+    db.restore_rewound(destination, target)
+    assert db.get_current_todo_snapshot(destination) == current
+
+
+@pytest.mark.parametrize("kind", ["in_place", "child"])
+@pytest.mark.parametrize("table", ["messages", "message_copy_edges"])
+def test_tail_copy_write_failure_aborts_whole_transaction(db, kind, table):
+    import sqlite3
+
+    first = write(db, "first")
+    write(db, "tail", prior=first["snapshot_id"])
+    predicate = " WHEN NEW.content='tail'" if table == "messages" else ""
+    db._execute_write(lambda c: c.execute(
+        f"CREATE TRIGGER copy_fault BEFORE INSERT ON {table}{predicate} "
+        "BEGIN SELECT RAISE(ABORT,'copy-fault'); END"))
+    before = state(db)
+    with pytest.raises(sqlite3.IntegrityError, match="copy-fault"):
+        compact(db, kind, watermark=first["head_message_id"])
     assert state(db) == before
