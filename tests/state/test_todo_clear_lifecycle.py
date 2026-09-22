@@ -320,6 +320,75 @@ def test_drift_never_becomes_missing_session(db, session):
         db.get_todo_recovery_state(session)
 
 
+def test_schema_and_pointer_hold_delete_reader_until_writer_can_commit(db):
+    import json
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    first = write(db, "first")
+    second = write(db, "second", prior=first["snapshot_id"])
+    db._conn.execute("UPDATE sessions SET todo_current_snapshot_id=? WHERE id='s'",
+                     (first["snapshot_id"],))
+    db._conn.commit()
+    assert db._conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
+    entered, blocked, released, committed = (threading.Event() for _ in range(4))
+    projected = []
+
+    def gate(columns):
+        projected.append(json.loads(columns))
+        entered.set()
+        assert blocked.wait(10), "writer did not reach blocked commit"
+        assert not committed.is_set(), "writer committed during the owner read"
+        return 1
+
+    def mutate():
+        assert entered.wait(10), "owner statement never evaluated schema projection"
+        # Zero busy timeout makes contention observable without timing guesses.
+        writer = sqlite3.connect(db.db_path, timeout=0)
+        try:
+            assert writer.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+            writer.execute("BEGIN IMMEDIATE")
+            writer.execute("ALTER TABLE todo_lifecycle_operations ADD COLUMN future_field TEXT")
+            writer.execute("UPDATE sessions SET todo_current_snapshot_id=? WHERE id='s'",
+                           (second["snapshot_id"],))
+            with pytest.raises(sqlite3.OperationalError) as failure:
+                writer.commit()
+            assert failure.value.sqlite_errorcode == sqlite3.SQLITE_BUSY
+            blocked.set()
+            assert released.wait(10), "reader did not release its statement snapshot"
+            writer.commit()
+            committed.set()
+        finally:
+            writer.close()
+
+    class GatedConnection:
+        def __getattr__(self, name):
+            return getattr(db._conn, name)
+
+        def execute(self, sql, *args):
+            if sql.startswith("WITH RECURSIVE "):
+                sql = sql.replace("SELECT t.*,", "SELECT todo_schema_gate(lifecycle_columns),t.*,", 1)
+            return db._conn.execute(sql, *args)
+
+    db._conn.create_function("todo_schema_gate", 1, gate)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(mutate)
+        try:
+            row = db._todo_snapshot_row_on_conn(GatedConnection(), "s")
+        finally:
+            entered.set()
+            released.set()
+            db._conn.create_function("todo_schema_gate", 1, None)
+        future.result(timeout=15)
+    assert blocked.is_set() and committed.is_set()
+    assert projected and all(c[-1][1] == "source_clear_operation_id" for c in projected)
+    assert row["current_id"] == first["snapshot_id"]
+    assert db._conn.execute("SELECT todo_current_snapshot_id FROM sessions WHERE id='s'").fetchone()[0] == second["snapshot_id"]
+    with pytest.raises(TodoSnapshotError, match="unsupported_schema"):
+        db.get_todo_recovery_state("s")
+
+
+@pytest.mark.requires_wal
 def test_schema_and_pointer_share_one_wal_statement_snapshot(db):
     import json
     import threading
