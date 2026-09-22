@@ -10792,51 +10792,75 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
             raise TodoSnapshotError("payload")
         return normalized
 
-    def _current_todo_snapshot_on_conn(self, conn, session_id: str):
-        # A single statement pins the latest record AND all causal coordinates
-        # to the same SQLite read snapshot, including on pooled WAL readers.
+    @staticmethod
+    def _todo_snapshot_row_on_conn(conn, session_id, snapshot_id=None):
+        # One statement binds pointer, selected row, predecessor, lifecycle and
+        # physical coordinates to the same read snapshot (also for pooled WAL).
+        selected = "s.todo_current_snapshot_id" if snapshot_id is None else "?"
+        args = (session_id,) if snapshot_id is None else (snapshot_id, session_id)
         try:
-            row = conn.execute(
-                "SELECT t.*, s.rewind_count AS current_rewind, s.ended_at, s.end_reason, "
-                "a.session_id AS anchor_session, a.role AS anchor_role, "
-                "a.active AS anchor_active, a.compacted AS anchor_compacted, "
-                "h.session_id AS head_session, h.active AS head_active, "
-                "h.compacted AS head_compacted, "
-                "(SELECT MAX(p.snapshot_id) FROM todo_snapshots p "
-                " WHERE p.session_id=s.id AND p.snapshot_id<t.snapshot_id) AS prior_id "
-                "FROM sessions s LEFT JOIN todo_snapshots t ON t.snapshot_id="
-                "(SELECT MAX(v.snapshot_id) FROM todo_snapshots v WHERE v.session_id=s.id) "
+            return conn.execute(
+                "SELECT t.*,s.todo_current_snapshot_id AS current_id,"
+                "s.rewind_count AS current_rewind,s.ended_at,s.end_reason,"
+                "a.session_id AS anchor_session,a.role AS anchor_role,"
+                "a.active AS anchor_active,a.compacted AS anchor_compacted,"
+                "h.session_id AS head_session,h.active AS head_active,h.compacted AS head_compacted,"
+                "p.snapshot_id AS prior_id,p.session_id AS prior_session,"
+                "p.head_message_id AS prior_head,p.rewind_count AS prior_rewind,"
+                "r.schema_version AS rewind_schema,r.state AS rewind_state,"
+                "r.todo_before_snapshot_id AS before_id,r.todo_after_snapshot_id AS after_id,"
+                "(SELECT MAX(v.snapshot_id) FROM todo_snapshots v WHERE v.session_id=s.id) AS latest_id "
+                "FROM sessions s LEFT JOIN todo_snapshots t ON t.snapshot_id=" + selected + " "
                 "LEFT JOIN messages a ON a.id=t.anchor_message_id "
-                "LEFT JOIN messages h ON h.id=t.head_message_id WHERE s.id=?",
-                (session_id,),
+                "LEFT JOIN messages h ON h.id=t.head_message_id "
+                "LEFT JOIN todo_snapshots p ON p.snapshot_id=t.supersedes_snapshot_id "
+                "LEFT JOIN session_rewinds r ON r.session_id=s.id AND r.rewind_count=s.rewind_count "
+                "WHERE s.id=?", args,
             ).fetchone()
         except sqlite3.OperationalError as exc:
-            if "no such table: todo_snapshots" in str(exc):
+            if "no such table:" in str(exc) or "no such column:" in str(exc):
                 raise TodoSnapshotError("unsupported_schema") from exc
             raise
-        if row is None:
-            raise TodoSnapshotError("session")
-        if row["ended_at"] is not None and row["end_reason"] == "compression":
-            raise TodoSnapshotError("closed_session")
-        if row["snapshot_id"] is None:
-            return None
+
+    def _validate_todo_snapshot_row(self, row, session_id, *, active_ids=None):
+        if row is None or row["snapshot_id"] is None:
+            raise TodoSnapshotError("pointer")
         if row["schema_version"] != 1:
             raise TodoSnapshotError("schema")
         if row["producer"] != "todo_dispatch_v1":
             raise TodoSnapshotError("producer")
         items = self._validate_todo_snapshot_payload(row["todos_json"])
+        if (not isinstance(row["execution_id"], str) or not row["execution_id"].strip()
+                or len(row["execution_id"]) > 256):
+            raise TodoSnapshotError("execution_id")
         if (
             row["session_id"] != session_id
-            or row["rewind_count"] != row["current_rewind"]
-            or row["anchor_session"] != session_id
-            or row["anchor_role"] != "assistant"
-            or row["anchor_active"] != 1 or row["anchor_compacted"] != 0
+            or type(row["rewind_count"]) is not int
+            or type(row["current_rewind"]) is not int
+            or not 0 <= row["rewind_count"] <= row["current_rewind"]
+            or row["anchor_session"] != session_id or row["anchor_role"] != "assistant"
             or row["head_session"] != session_id
-            or row["head_active"] != 1 or row["head_compacted"] != 0
+            or row["anchor_compacted"] != 0 or row["head_compacted"] != 0
+            or type(row["anchor_message_id"]) is not int
+            or type(row["head_message_id"]) is not int
             or row["anchor_message_id"] > row["head_message_id"]
         ):
             raise TodoSnapshotError("causal_scope")
-        if row["supersedes_snapshot_id"] != row["prior_id"]:
+        if active_ids is None:
+            active = row["anchor_active"] == 1 and row["head_active"] == 1
+        else:
+            active = row["anchor_message_id"] in active_ids and row["head_message_id"] in active_ids
+        if not active:
+            raise TodoSnapshotError("causal_scope")
+        prior = row["supersedes_snapshot_id"]
+        if prior is not None and (
+            type(prior) is not int or prior <= 0 or prior >= row["snapshot_id"]
+            or row["prior_id"] != prior or row["prior_session"] != session_id
+            or type(row["prior_head"]) is not int
+            or row["prior_head"] > row["head_message_id"]
+            or type(row["prior_rewind"]) is not int
+            or not 0 <= row["prior_rewind"] <= row["rewind_count"]
+        ):
             raise TodoSnapshotError("predecessor")
         result = {key: row[key] for key in (
             "snapshot_id", "session_id", "schema_version", "producer", "execution_id",
@@ -10846,15 +10870,59 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
         result["todos"] = items
         return result
 
-    def get_current_todo_snapshot(self, session_id: str):
-        """Read the exact latest owner version, distinct from missing/empty.
+    def _current_todo_snapshot_on_conn(self, conn, session_id: str):
+        row = self._todo_snapshot_row_on_conn(conn, session_id)
+        if row is None:
+            raise TodoSnapshotError("session")
+        if row["ended_at"] is not None and row["end_reason"] == "compression":
+            raise TodoSnapshotError("closed_session")
+        # NULL is only missing, never a fallback from an unreadable selection.
+        if row["current_id"] is None and row["latest_id"] is None:
+            return None
+        if row["current_id"] is not None and (
+            type(row["current_id"]) is not int or row["current_id"] <= 0
+            or row["snapshot_id"] != row["current_id"]
+        ):
+            raise TodoSnapshotError("pointer")
+        needs_transition = (row["current_id"] is None
+                            or row["rewind_count"] != row["current_rewind"])
+        if needs_transition:
+            if (row["rewind_schema"] != 2
+                    or row["rewind_state"] not in ("pending", "restored")):
+                raise TodoSnapshotError("causal_scope")
+            expected = row["after_id"] if row["rewind_state"] == "pending" else row["before_id"]
+            if row["current_id"] != expected:
+                raise TodoSnapshotError("pointer")
+        if row["current_id"] is None:
+            return None
+        return self._validate_todo_snapshot_row(row, session_id)
 
-        Storage prerequisite only: no implicit inheritance, transcript fallback,
-        or lifecycle mapping. Compacted/rewound coordinates fail closed. This API
-        does not authenticate arbitrary privileged code sharing the process/DB.
+    def get_current_todo_snapshot(self, session_id: str):
+        """Read the owner-selected version, distinct from missing/empty.
+
+        Ordinary rewind/restore is owner-recorded; compaction and agent hydration
+        remain unactivated. No transcript/ancestry fallback or privileged-writer
+        authentication is implied by this internal storage API.
         """
         with self._read_ctx() as conn:
             return self._current_todo_snapshot_on_conn(conn, session_id)
+
+    def _todo_before_rewind_on_conn(self, conn, session_id, removed_ids):
+        current = self._current_todo_snapshot_on_conn(conn, session_id)
+        before = current["snapshot_id"] if current else None
+        removed = set(removed_ids)
+        # Traverse only the selected immutable branch. Validate every row before
+        # deciding eligibility; malformed history is not permission to skip it.
+        while current is not None:
+            if not removed.intersection((current["anchor_message_id"], current["head_message_id"])):
+                return before, current["snapshot_id"]
+            prior = current["supersedes_snapshot_id"]
+            if prior is None:
+                break
+            current = self._validate_todo_snapshot_row(
+                self._todo_snapshot_row_on_conn(conn, session_id, prior), session_id,
+            )
+        return before, None
 
     def commit_todo_snapshot(
         self, *, session_id: str, owner_execution_id: str,
@@ -10944,6 +11012,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                 (session_id, owner_execution_id, anchor_assistant_row_id, expected_head_id,
                  rewind_count, expected_prior_snapshot_id, todos_json, time.time()),
             )
+            snapshot_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            conn.execute("UPDATE sessions SET todo_current_snapshot_id=? WHERE id=?",
+                         (snapshot_id, session_id))
             return self._current_todo_snapshot_on_conn(conn, session_id)
 
         return self._execute_write(_do)
@@ -13199,6 +13270,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                 (session_id, target_message_id),
             )
             ids = [r[0] for r in cursor.fetchall()]
+            todo_before, todo_after = self._todo_before_rewind_on_conn(conn, session_id, ids)
             if ids:
                 placeholders = ",".join("?" for _ in ids)
                 conn.execute(
@@ -13210,9 +13282,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                 inserted = conn.execute("SELECT last_insert_rowid()").fetchone()
                 replacement_message_id = int(inserted[0])
             conn.execute(
-                "UPDATE sessions SET rewind_count = COALESCE(rewind_count, 0) + 1 "
-                "WHERE id = ?",
-                (session_id,),
+                "UPDATE sessions SET rewind_count = COALESCE(rewind_count, 0) + 1, "
+                "todo_current_snapshot_id=? WHERE id = ?",
+                (todo_after, session_id),
             )
             message_count, tool_call_count = self._active_transcript_counts(
                 conn, session_id
@@ -13242,11 +13314,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
             conn.execute(
                 "INSERT INTO session_rewinds (session_id,rewind_count,schema_version,"
                 "target_message_id,target_was_active,removed_message_ids,replacement_message_id,"
-                "post_rewind_active_ids,physical_watermark_id,state,created_at) "
-                "VALUES (?,?,1,?,?,?,?,?,?,'pending',?)",
+                "post_rewind_active_ids,physical_watermark_id,state,created_at,"
+                "todo_before_snapshot_id,todo_after_snapshot_id) "
+                "VALUES (?,?,2,?,?,?,?,?,?,'pending',?,?,?)",
                 (session_id, rewind_count, target_message_id, int(bool(target_row["active"])),
                  json.dumps(ids, separators=(",", ":")), replacement_message_id,
-                 json.dumps(post_ids, separators=(",", ":")), watermark, time.time()),
+                 json.dumps(post_ids, separators=(",", ":")), watermark, time.time(),
+                 todo_before, todo_after),
             )
             return target_row, ids, new_head_id, replacement_message_id
 
@@ -13272,7 +13346,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
 
         Legacy/unrecorded thresholds are refused, never inferred. Retry returns
         zero only while the complete restored projection still matches. This is
-        internal physical membership, not todo currentness or execution authority.
+        internal physical membership and versioned todo selection, not execution authority.
         """
         if type(since_message_id) is not int or since_message_id <= 0:
             raise RewindRestoreError("target_mismatch")
@@ -13299,7 +13373,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                     "SELECT r.rewind_count,r.schema_version,r.target_message_id,"
                     "r.target_was_active,r.removed_message_ids,r.replacement_message_id,"
                     "r.post_rewind_active_ids,r.physical_watermark_id,r.state,r.restored_at,"
-                    "s.rewind_count AS current_count FROM session_rewinds r "
+                    "r.todo_before_snapshot_id,r.todo_after_snapshot_id,"
+                    "s.todo_current_snapshot_id,s.rewind_count AS current_count FROM session_rewinds r "
                     "JOIN sessions s ON s.id=r.session_id WHERE r.session_id=? "
                     "ORDER BY r.rewind_count DESC LIMIT 1", (session_id,),
                 ).fetchone()
@@ -13307,7 +13382,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                 raise RewindRestoreError("unsupported_schema") from exc
             if operation is None:
                 raise RewindRestoreError("unknown_operation")
-            if operation["schema_version"] != 1:
+            if operation["schema_version"] not in (1, 2):
                 raise RewindRestoreError("unsupported_schema")
             if operation["rewind_count"] != operation["current_count"]:
                 raise RewindRestoreError("not_latest")
@@ -13354,8 +13429,32 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
             expected = restored_ids if restored else post_ids
             if [row["id"] for row in rows if row["active"] == 1] != expected:
                 raise RewindRestoreError("active_projection_mismatch")
+            current = self._current_todo_snapshot_on_conn(conn, session_id)
+            if operation["schema_version"] == 1:
+                # Physical-only legacy records never acquire invented task edges.
+                if current is not None or conn.execute(
+                    "SELECT 1 FROM todo_snapshots WHERE session_id=? LIMIT 1", (session_id,)
+                ).fetchone() is not None:
+                    raise RewindRestoreError("unsupported_todo_lifecycle")
+            else:
+                before_id = operation["todo_before_snapshot_id"]
+                after_id = operation["todo_after_snapshot_id"]
+                expected_id = before_id if restored else after_id
+                if operation["todo_current_snapshot_id"] != expected_id:
+                    raise RewindRestoreError("todo_state_advanced")
+                for pointer, projection in ((before_id, restored_ids), (after_id, post_ids)):
+                    if pointer is not None:
+                        if type(pointer) is not int or pointer <= 0:
+                            raise TodoSnapshotError("pointer")
+                        self._validate_todo_snapshot_row(
+                            self._todo_snapshot_row_on_conn(conn, session_id, pointer),
+                            session_id, active_ids=set(projection),
+                        )
             if restored:
                 return 0
+            if operation["schema_version"] == 2:
+                conn.execute("UPDATE sessions SET todo_current_snapshot_id=? WHERE id=?",
+                             (operation["todo_before_snapshot_id"], session_id))
             conn.executemany(
                 "UPDATE messages SET active=1 WHERE id=? AND session_id=?",
                 [(value, session_id) for value in removed],

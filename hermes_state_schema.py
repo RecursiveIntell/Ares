@@ -959,6 +959,28 @@ class SessionSchemaMixin:
         # column gets created here.
         self._reconcile_columns(cursor)
 
+        # A one-time data transition, not a repair of malformed selected state.
+        # Recheck inside the write lock: concurrent openers must never reset a
+        # pointer already advanced/rewound by another owner. The marker commits
+        # with the backfill, independently of FTS/schema-version bookkeeping.
+        cursor.execute("BEGIN IMMEDIATE")
+        try:
+            migrated = cursor.execute(
+                "SELECT 1 FROM state_meta WHERE key='todo_current_pointer_v1'"
+            ).fetchone()
+            if migrated is None:
+                cursor.execute(
+                    "UPDATE sessions SET todo_current_snapshot_id="
+                    "(SELECT MAX(t.snapshot_id) FROM todo_snapshots t WHERE t.session_id=sessions.id)"
+                )
+                cursor.execute(
+                    "INSERT INTO state_meta(key,value) VALUES ('todo_current_pointer_v1','1')"
+                )
+            cursor.execute("COMMIT")
+        except BaseException:
+            cursor.execute("ROLLBACK")
+            raise
+
         # Rebuild gateway_routing if it still carries the pre-scope PRIMARY
         # KEY (session_key alone). ADD COLUMN cannot fix a PK, so this is
         # the one table-shape repair reconciliation can't express.

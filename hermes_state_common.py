@@ -326,7 +326,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
     )
 
 
-SCHEMA_VERSION = 28
+SCHEMA_VERSION = 29
 
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
@@ -419,6 +419,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     compression_ineffective_count INTEGER NOT NULL DEFAULT 0,
     profile_name TEXT,
     rewind_count INTEGER NOT NULL DEFAULT 0,
+    todo_current_snapshot_id INTEGER,
     archived INTEGER NOT NULL DEFAULT 0,
     pinned INTEGER NOT NULL DEFAULT 0,
     hidden INTEGER NOT NULL DEFAULT 0,
@@ -502,6 +503,8 @@ CREATE TABLE IF NOT EXISTS session_rewinds (
     state TEXT NOT NULL,
     created_at REAL NOT NULL,
     restored_at REAL,
+    todo_before_snapshot_id INTEGER,
+    todo_after_snapshot_id INTEGER,
     PRIMARY KEY (session_id, rewind_count)
 );
 
