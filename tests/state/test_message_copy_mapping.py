@@ -7,9 +7,13 @@ import hermes_state
 from hermes_state import SessionDB
 
 
-@pytest.fixture
-def db(tmp_path):
+@pytest.fixture(params=["default", "DELETE"])
+def db(tmp_path, request, monkeypatch):
+    if request.param == "DELETE":
+        monkeypatch.setattr(hermes_state, "resolve_journal_mode", lambda: "delete")
     with SessionDB(tmp_path / "state.db") as store:
+        if request.param == "DELETE":
+            assert not store._wal_active
         store.create_session("source", source="test")
         yield store
 
@@ -62,21 +66,23 @@ def test_real_copy_retains_ordered_exact_correspondence_after_reopen(db, kind):
     copied = [row for row in db.get_messages(destination) if row["id"] > summary_id]
     assert len(copied) == len(source_ids)
     assert origin(db, destination, summary_id) is None
-    with db._read_ctx() as conn:
-        for source_id, dest in zip(source_ids, copied):
-            edge = origin(db, destination, dest["id"])
-            assert edge == {
-                "schema_version": 1, "copy_kind": kind,
-                "source_session_id": "source", "source_message_id": source_id,
-                "destination_session_id": destination, "destination_message_id": dest["id"],
-            }
+    for source_id, dest in zip(source_ids, copied):
+        # Public reads must not nest inside the raw-row context: DELETE mode
+        # serializes reads through the owner's non-reentrant writer lock.
+        edge = origin(db, destination, dest["id"])
+        assert edge == {
+            "schema_version": 1, "copy_kind": kind,
+            "source_session_id": "source", "source_message_id": source_id,
+            "destination_session_id": destination, "destination_message_id": dest["id"],
+        }
+        with db._read_ctx() as conn:
             before = dict(conn.execute("SELECT * FROM messages WHERE id=?", (source_id,)).fetchone())
             after = dict(conn.execute("SELECT * FROM messages WHERE id=?", (dest["id"],)).fetchone())
-            excluded = {"id", "session_id", "active", "compacted"}
-            assert {k: v for k, v in before.items() if k not in excluded} == {
-                k: v for k, v in after.items() if k not in excluded
-            }
-            assert after["active"] == 1 and after["compacted"] == 0
+        excluded = {"id", "session_id", "active", "compacted"}
+        assert {k: v for k, v in before.items() if k not in excluded} == {
+            k: v for k, v in after.items() if k not in excluded
+        }
+        assert after["active"] == 1 and after["compacted"] == 0
     with SessionDB(db.db_path, read_only=True) as reopened:
         for source_id, dest in zip(source_ids, copied):
             assert origin(reopened, destination, dest["id"])["source_message_id"] == source_id
