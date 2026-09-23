@@ -174,10 +174,22 @@ class _BatchAbandoned(BaseException):
 
 
 def _parse_tool_arguments(raw_arguments: Any) -> tuple[dict, Optional[str]]:
-    """Parse model-emitted arguments without repairing or coercing them."""
+    """Parse model-emitted arguments without repairing or coercing them.
+
+    Reject duplicate object keys at every depth before a lossy dict conversion,
+    including keys spelled with equivalent JSON escapes.
+    """
+    def unique_pairs(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate tool argument key")
+            result[key] = value
+        return result
+
     try:
-        arguments = json.loads(raw_arguments)
-    except (json.JSONDecodeError, TypeError):
+        arguments = json.loads(raw_arguments, object_pairs_hook=unique_pairs)
+    except (json.JSONDecodeError, TypeError, ValueError):
         arguments = None
     if isinstance(arguments, dict):
         return arguments, None
