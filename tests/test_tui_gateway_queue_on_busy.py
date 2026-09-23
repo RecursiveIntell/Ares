@@ -617,6 +617,46 @@ def test_busy_image_prompts_keep_b_and_c_attachments_in_submission_order(monkeyp
 
 # ── _drain_queued_prompt ───────────────────────────────────────────────────
 
+def test_required_compute_host_queued_prompt_cannot_run_inline(monkeypatch):
+    session = _session(queued_prompt={"text": "queued", "transport": None})
+    inline = []
+    events = []
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"dashboard": {
+        "turn_isolation": True, "require_compute_host": True,
+    }})
+    monkeypatch.setattr(server, "_run_prompt_submit", lambda *a, **k: inline.append(a))
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: events.append(a))
+
+    assert server._drain_queued_prompt("queue-required", "sid", session) is True
+    assert inline == []
+    assert session["running"] is False
+    assert session["inflight_turn"]["user"] == "queued"
+    assert session["inflight_turn"]["status"] == "error"
+    assert any(event[0] == "error" for event in events)
+
+
+def test_required_compute_host_queued_dispatch_error_preserves_followup(monkeypatch):
+    session = _session(
+        agent_ready=threading.Event(),
+        queued_prompt={"text": "first", "transport": None},
+        queued_prompts=[{"text": "second", "transport": None}],
+    )
+    attempts = []
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"dashboard": {
+        "turn_isolation": True, "require_compute_host": True,
+    }})
+    monkeypatch.setattr(server, "_submit_prompt_to_compute_host",
+                        lambda *a, **k: attempts.append(a[3]) or
+                        {"error": {"code": 5019, "message": "test-only failed send"}})
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+    assert server._drain_queued_prompt("queued-error", "sid", session) is True
+    assert attempts == ["first"]
+    assert session["running"] is False
+    assert session["inflight_turn"]["user"] == "first"
+    assert session["inflight_turn"]["status"] == "error"
+    assert session["queued_prompt"]["text"] == "second"
+
+
 def test_drain_fires_queued_prompt_and_claims_running(monkeypatch):
     fired = {}
     monkeypatch.setattr(

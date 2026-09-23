@@ -220,6 +220,7 @@ def test_dashboard_process_isolation_config_defaults_without_default_merge(monke
 
     assert server._load_dashboard_process_isolation_config() == {
         "turn_isolation": False,
+        "require_compute_host": False,
         "compute_host_heartbeat_secs": 15,
         "compute_host_respawn_max": 3,
         "detached_execution_max_s": 300,
@@ -237,6 +238,7 @@ def test_dashboard_process_isolation_config_coerces_raw_values():
 
     assert server._load_dashboard_process_isolation_config(cfg) == {
         "turn_isolation": True,
+        "require_compute_host": False,
         "compute_host_heartbeat_secs": 30,
         "compute_host_respawn_max": 0,
         "detached_execution_max_s": 300,
@@ -245,6 +247,7 @@ def test_dashboard_process_isolation_config_coerces_raw_values():
     malformed = {"dashboard": "enabled"}
     assert server._load_dashboard_process_isolation_config(malformed) == {
         "turn_isolation": False,
+        "require_compute_host": False,
         "compute_host_heartbeat_secs": 15,
         "compute_host_respawn_max": 3,
         "detached_execution_max_s": 300,
@@ -256,6 +259,7 @@ def test_default_config_seeds_dashboard_process_isolation_keys():
 
     dashboard = DEFAULT_CONFIG["dashboard"]
     assert dashboard["turn_isolation"] is False
+    assert dashboard["require_compute_host"] is False
     assert dashboard["compute_host_heartbeat_secs"] == 15
     assert dashboard["compute_host_respawn_max"] == 3
     assert dashboard["detached_execution_max_s"] == 300
@@ -284,7 +288,8 @@ def test_detached_execution_policy_without_timestamp_requires_legacy_interrupt()
     assert server._detached_execution_policy(session, now=0.0, max_seconds=1.0) == "interrupt"
 
 
-def test_prompt_submit_dispatches_to_compute_host_when_turn_isolation_enabled(monkeypatch):
+@pytest.mark.parametrize("required", [False, True])
+def test_prompt_submit_dispatches_to_compute_host_when_turn_isolation_enabled(monkeypatch, required):
     class FakeSupervisor:
         def __init__(self):
             self.frames = []
@@ -304,7 +309,7 @@ def test_prompt_submit_dispatches_to_compute_host_when_turn_isolation_enabled(mo
     monkeypatch.setattr(
         server,
         "_load_cfg",
-        lambda: {"dashboard": {"turn_isolation": True}},
+        lambda: {"dashboard": {"turn_isolation": True, "require_compute_host": required}},
     )
     monkeypatch.setattr(
         server,
@@ -523,6 +528,96 @@ def test_prompt_submit_fails_open_inline_when_compute_host_dispatch_breaks(monke
     }
     assert inline_calls == [("fallback-turn", "iso-fallback", "hello")]
     assert session.get("_compute_host_active") is not True
+
+
+def test_require_compute_host_denies_dispatch_failure_without_inline_retry(monkeypatch):
+    """Opt-in delivery must not silently become a serving-process turn."""
+    class _BrokenSupervisor:
+        def submit_turn(self, _frame, *, on_complete=None):
+            raise BrokenPipeError("test-only broken pipe")
+
+    sid = "required-compute-host-failure"
+    session = _session(agent=None, agent_ready=threading.Event(),
+                       history=[{"role": "user", "content": "prior"}])
+    server._sessions[sid] = session
+    writes = []
+    inline = []
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"dashboard": {
+        "turn_isolation": True, "require_compute_host": True,
+    }})
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: _BrokenSupervisor())
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda *_: writes.append("db"))
+    monkeypatch.setattr(server, "_persist_branch_seed", lambda *_: writes.append("seed"))
+    monkeypatch.setattr(server, "_run_prompt_submit", lambda *a, **k: inline.append(a))
+    try:
+        denied = server.handle_request({"id": "required-1", "method": "prompt.submit",
+                                        "params": {"session_id": sid, "text": "new"}})
+        assert denied["error"]["code"] == 5019
+        assert inline == [] and writes == []
+        assert session["running"] is False
+        assert session["history"] == [{"role": "user", "content": "prior"}]
+        assert session["inflight_turn"]["user"] == "new"
+        assert session["inflight_turn"]["status"] == "error"
+        assert session["inflight_turn"]["recoverable"] is True
+        assert session["inflight_turn"]["error_surface"]["code"] == "compute_host_dispatch_failed"
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_require_compute_host_blocks_direct_serving_process_turn(monkeypatch):
+    """Auto-continue, goal and notification callers also reach this central entry."""
+    sid = "required-direct-turn"
+    session = _session(running=True, history=[{"role": "user", "content": "prior"}])
+    events = []
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"dashboard": {
+        "turn_isolation": True, "require_compute_host": True,
+    }})
+    monkeypatch.setattr(server, "_inside_compute_host_child", lambda: False)
+
+    def on_event(event, *_args, **_kwargs):
+        events.append(event)
+        if event == "message.start":
+            raise AssertionError("direct agent turn started outside required compute host")
+
+    monkeypatch.setattr(server, "_emit", on_event)
+    assert server._run_prompt_submit("direct", sid, session, "new") is False
+    assert session["running"] is False
+    assert session["history"] == [{"role": "user", "content": "prior"}]
+    assert session["inflight_turn"]["user"] == "new"
+    assert session["inflight_turn"]["status"] == "error"
+    assert "error" in events
+
+
+def test_require_compute_host_config_invalid_value_cannot_enable_inline_fallback():
+    # An explicit but malformed requirement must not be interpreted as permission
+    # to run the turn in the serving process.
+    cfg = server._load_dashboard_process_isolation_config({"dashboard": {
+        "turn_isolation": True, "require_compute_host": "not-a-boolean",
+    }})
+    assert cfg["require_compute_host"] is True
+    disabled = server._load_dashboard_process_isolation_config({"dashboard": {
+        "turn_isolation": True, "require_compute_host": "no",
+    }})
+    assert disabled["require_compute_host"] is False
+
+
+def test_require_compute_host_denies_when_session_cannot_route_to_child(monkeypatch):
+    sid = "required-compute-host-non-deferred"
+    session = _session(history=[{"role": "user", "content": "prior"}])
+    server._sessions[sid] = session
+    inline = []
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"dashboard": {
+        "turn_isolation": True, "require_compute_host": True,
+    }})
+    monkeypatch.setattr(server, "_run_prompt_submit", lambda *a, **k: inline.append(a))
+    try:
+        denied = server.handle_request({"id": "required-2", "method": "prompt.submit",
+                                        "params": {"session_id": sid, "text": "new"}})
+        assert denied["error"]["code"] == 5019
+        assert inline == [] and session["running"] is False
+        assert session["history"] == [{"role": "user", "content": "prior"}]
+    finally:
+        server._sessions.pop(sid, None)
 
 
 def test_compute_host_turn_end_updates_metadata_mirror(monkeypatch):

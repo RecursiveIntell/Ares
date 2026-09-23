@@ -357,6 +357,8 @@ def _(rid, params: dict) -> dict:
         )
     isolation_cfg = _load_dashboard_process_isolation_config()
     turn_isolation = _session_uses_compute_host(session, isolation_cfg)
+    if isolation_cfg["require_compute_host"] and not turn_isolation and not _inside_compute_host_child():
+        return _err(rid, 5019, "compute host required but this session cannot route to it")
     # Re-bind to the current client transport for this request. This keeps
     # streaming events on the active websocket even if an earlier disconnect
     # or fallback moved the session transport to stdio.
@@ -828,6 +830,19 @@ def _(rid, params: dict) -> dict:
                 ] = survivor_user_row_ids
             if survivor_row_id_map is not None:
                 isolated_response["result"]["survivor_row_id_map"] = survivor_row_id_map
+            return isolated_response
+        if isolation_cfg["require_compute_host"]:
+            # A failed dispatch cannot become an inline provider/tool turn.
+            # Keep the user's attempted prompt as a resumable failed snapshot,
+            # without persisting a new message or retrying an ambiguous effect.
+            with session["history_lock"]:
+                session["running"] = False
+                session["last_active"] = time.time()
+                _fail_inflight_turn(
+                    session,
+                    (isolated_response["error"] or {}).get("message", "compute-host dispatch failed"),
+                    error_surface={"layer": "runtime", "code": "compute_host_dispatch_failed", "retryable": True},
+                )
             return isolated_response
         logger.warning(
             "compute-host dispatch failed for session %s; falling back inline: %s",

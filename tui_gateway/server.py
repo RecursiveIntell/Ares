@@ -2561,9 +2561,10 @@ def _submit_prompt_to_compute_host(
 
     def _complete(done: dict) -> None:
         # submit_turn reports a synchronous pipe failure through the callback
-        # before re-raising. Leave the parent session untouched so prompt.submit
-        # can fail open to the historical in-process path without emitting a
-        # duplicate terminal error.
+        # before re-raising. Leave the parent session untouched; the submit
+        # handler either denies the turn when require_compute_host is enabled,
+        # or uses the legacy inline availability fallback when disabled.
+        # Neither mode grants OS isolation.
         if done.get("reason") == "send_failed":
             return
         _on_compute_host_turn_done(rid, sid, session, done)
@@ -4124,6 +4125,17 @@ def _coerce_int_config_value(value: Any, default: int, *, min_value: int) -> int
         return default
     return coerced if coerced >= min_value else default
 
+def _require_compute_host_value(value: Any) -> bool:
+    """An explicit malformed requirement must never authorize inline fallback.
+
+    This is a dispatch-location requirement, NOT an OS isolation guarantee.
+    """
+    if value is None or value is False:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "0", "false", "no", "off"}
+    return value != 0
+
 
 def _load_dashboard_process_isolation_config(cfg: dict | None = None) -> dict[str, Any]:
     """Return dashboard process-isolation config with read-site defaults.
@@ -4142,6 +4154,9 @@ def _load_dashboard_process_isolation_config(cfg: dict | None = None) -> dict[st
         "turn_isolation": is_truthy_value(
             dashboard.get("turn_isolation"),
             default=_DASHBOARD_TURN_ISOLATION_DEFAULT,
+        ),
+        "require_compute_host": _require_compute_host_value(
+            dashboard.get("require_compute_host"),
         ),
         "compute_host_heartbeat_secs": _coerce_int_config_value(
             dashboard.get("compute_host_heartbeat_secs"),
@@ -9647,6 +9662,10 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         if queued.get("transport") is not None:
             session["transport"] = queued["transport"]
     use_compute_host = _session_uses_compute_host(session)
+    require_compute_host = (
+        _load_dashboard_process_isolation_config()["require_compute_host"]
+        and not _inside_compute_host_child()
+    )
     with session["history_lock"]:
         if int(session.get("_queued_prompt_generation", 0)) != queue_generation:
             # Generation cancelled the claim (Stop, compress re-anchor, …).
@@ -9666,6 +9685,17 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                 session.pop("queued_prompts", None)
             session["running"] = False
             return True
+    if not use_compute_host and require_compute_host:
+        message = "compute host required but queued session cannot route to it"
+        with session["history_lock"]:
+            session["running"] = False
+            _start_inflight_turn(session, queued["text"])
+            _fail_inflight_turn(
+                session, message,
+                error_surface={"layer": "runtime", "code": "compute_host_dispatch_failed", "retryable": True},
+            )
+        _emit("error", sid, {"message": message})
+        return True
     dispatch_failed = False
     try:
         if use_compute_host:
@@ -9686,7 +9716,14 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                 message = str(((resp.get("error") or {}).get("message")) or "queued prompt failed")
                 with session["history_lock"]:
                     session["running"] = False
-                    _clear_inflight_turn(session)
+                    if require_compute_host:
+                        _start_inflight_turn(session, queued["text"])
+                        _fail_inflight_turn(
+                            session, message,
+                            error_surface={"layer": "runtime", "code": "compute_host_dispatch_failed", "retryable": True},
+                        )
+                    else:
+                        _clear_inflight_turn(session)
                 _emit("error", sid, {"message": message})
                 dispatch_failed = True
         else:
@@ -9715,8 +9752,17 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         )
         with session["history_lock"]:
             session["running"] = False
+            if require_compute_host:
+                _start_inflight_turn(session, queued["text"])
+                _fail_inflight_turn(
+                    session, "queued prompt dispatch failed",
+                    error_surface={"layer": "runtime", "code": "compute_host_dispatch_failed", "retryable": True},
+                )
         dispatch_failed = True
     if dispatch_failed:
+        # Never auto-retry another prompt on an ambiguous child dispatch.
+        if require_compute_host:
+            return True
         with session["history_lock"]:
             drain_next = bool(session.get("queued_prompt")) and not session.get(
                 "_turn_cancel_requested"
@@ -12109,6 +12155,26 @@ def _run_prompt_submit(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
 ) -> bool:
+    # The central inline entry also serves auto-continue, goal wakeups and
+    # notification follow-ups. Guard it, not just prompt.submit's RPC branch.
+    if (not _inside_compute_host_child()
+            and _load_dashboard_process_isolation_config()["require_compute_host"]):
+        message = "compute host required; serving-process turn denied"
+        with session["history_lock"]:
+            if session.get("_closing") or (
+                queued_prompt_generation is not None
+                and int(session.get("_queued_prompt_generation", 0)) != queued_prompt_generation
+            ):
+                session["running"] = False
+                return False
+            session["running"] = False
+            _start_inflight_turn(session, text)
+            _fail_inflight_turn(
+                session, message,
+                error_surface={"layer": "runtime", "code": "compute_host_dispatch_failed", "retryable": True},
+            )
+        _emit("error", sid, {"message": message})
+        return False
     with session["history_lock"]:
         if session.get("_closing"):
             session["running"] = False
