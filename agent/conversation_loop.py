@@ -2648,6 +2648,8 @@ def run_conversation(
         # system text.
         _previous_preflight_pressure = _last_preflight_pressure
         _last_preflight_pressure = None
+        _context_rebase_reason = None
+        _context_rebase_lock_deferred = False
         if (
             _previous_preflight_pressure is not None
             and request_pressure_tokens >= _preflight_threshold
@@ -2662,6 +2664,7 @@ def run_conversation(
             # request truly does not fit, its error handler may still compact
             # with that stronger signal.
             _preflight_compression_blocked = True
+            _context_rebase_reason = "insufficient_progress"
             logger.warning(
                 "Pre-API compression made insufficient progress: ~%s -> "
                 "~%s request tokens; skipping additional preflight passes",
@@ -2745,6 +2748,7 @@ def run_conversation(
                 # soft compression_deferred result with that stronger signal.
                 compression_attempts -= 1
                 _last_preflight_pressure = None
+                _context_rebase_lock_deferred = True
                 if pending_moa_prepared_request is _moa_prepared_request:
                     pending_moa_prepared_request = None
             else:
@@ -2814,6 +2818,7 @@ def run_conversation(
             except Exception:
                 _block_reason = None
             if _block_reason:
+                _context_rebase_reason = str(_block_reason)
                 agent._warn_context_overflow_blocked(
                     _block_reason,
                     request_pressure_tokens,
@@ -2846,6 +2851,106 @@ def run_conversation(
                 )
                 if callable(_warn_fn):
                     _warn_fn(request_pressure_tokens, _ctx_len)
+
+        # Automatic context rebase is admitted only at this pre-API
+        # boundary, after prior tool results are settled and before the next
+        # provider/effect attempt. A temporary compression-lock loss remains a
+        # defer, never evidence that a fresh working set is needed.
+        if (
+            getattr(agent, "context_rebase_enabled", False)
+            and agent.compression_enabled
+            and not _review_fork_first_request_pending(agent)
+            and not _context_rebase_lock_deferred
+            and not _defer_preflight(request_pressure_tokens)
+            and _preflight_threshold > 0
+            and request_pressure_tokens >= _preflight_threshold
+        ):
+            if _context_rebase_reason is None and (
+                _preflight_compression_blocked
+                or compression_attempts >= max_compression_attempts
+            ):
+                _context_rebase_reason = "compression_exhausted"
+            if _context_rebase_reason is None:
+                _info = getattr(_compressor, "should_compress_info", None)
+                if callable(_info):
+                    try:
+                        _context_rebase_reason = _info(request_pressure_tokens)[1]
+                    except Exception:
+                        _context_rebase_reason = None
+
+            if _context_rebase_reason:
+                from ares_runtime.continuity.runtime import (
+                    AutomaticRebaseStatus,
+                    attempt_turn_start_context_rebase,
+                )
+
+                _rebase = attempt_turn_start_context_rebase(
+                    agent,
+                    messages,
+                    conversation_history=conversation_history,
+                    active_system_prompt=active_system_prompt,
+                    before_tokens=request_pressure_tokens,
+                )
+                if _rebase.status is AutomaticRebaseStatus.READY:
+                    if _moa_prepared_request is not None:
+                        pending_moa_prepared_request = _moa_prepared_request
+                    messages = list(_rebase.messages)
+                    conversation_history = list(_rebase.messages)
+                    active_system_prompt = _rebase.system_prompt
+                    current_turn_user_idx = next(
+                        (
+                            idx
+                            for idx in range(len(messages) - 1, -1, -1)
+                            if messages[idx].get("role") == "user"
+                        ),
+                        len(messages) - 1,
+                    )
+                    agent._persist_user_message_idx = current_turn_user_idx
+                    _preflight_compression_blocked = False
+                    _last_preflight_pressure = None
+                    compression_attempts = 0
+                    agent._empty_content_retries = 0
+                    agent._thinking_prefill_retries = 0
+                    agent._last_content_with_tools = None
+                    agent._last_content_tools_all_housekeeping = False
+                    agent._mute_post_response = False
+                    _clear_warn = getattr(agent, "_clear_context_overflow_warn", None)
+                    if callable(_clear_warn):
+                        _clear_warn()
+                    agent._emit_status(
+                        "↻ Context working set rebased from durable state; "
+                        "rebuilding provider request..."
+                    )
+                    # This iteration never reaches the provider.
+                    api_call_count -= 1
+                    agent._api_call_count = api_call_count
+                    agent.iteration_budget.refund()
+                    continue
+                if (
+                    _rebase.status
+                    is AutomaticRebaseStatus.RECONCILIATION_REQUIRED
+                ):
+                    agent._persist_session(messages, conversation_history)
+                    _final_response = (
+                        "Context rebase committed but owner reconciliation is "
+                        "required before ordinary execution can continue."
+                    )
+                    return {
+                        "final_response": _final_response,
+                        "messages": messages,
+                        "completed": False,
+                        "api_calls": max(0, api_call_count - 1),
+                        "error": "CONTEXT_REBASE_RECONCILIATION_REQUIRED",
+                        "partial": True,
+                        "failed": True,
+                        "context_rebase_reconciliation_required": True,
+                    }
+                if _rebase.status is AutomaticRebaseStatus.BLOCKED:
+                    agent._warn_context_overflow_blocked(
+                        f"context-rebase:{_rebase.reason}",
+                        request_pressure_tokens,
+                        _preflight_threshold,
+                    )
 
         # Thinking spinner for quiet mode (animated during API call)
         thinking_spinner = None
