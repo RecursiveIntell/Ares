@@ -129,6 +129,22 @@ class TurnRunCustody:
             value = self._mutate(handle, self.db.refresh_run_custody, ttl_seconds=ttl_seconds)
             return self._summary(value, "refresh_observed")
 
+    def transfer_session(self, holder, *, old_session_id, new_session_id, ttl_seconds):
+        """Transfer every owned run handle across one already-published session edge."""
+        with self._lock:
+            self._active(holder)
+            summaries = []
+            for run_id, handle in list(self._handles.items()):
+                if handle.holder != holder or handle.status != "owned":
+                    continue
+                value = self._mutate(
+                    handle, self.db.transfer_run_session,
+                    expected_session_id=old_session_id, new_session_id=new_session_id,
+                    ttl_seconds=ttl_seconds,
+                )
+                summaries.append(self._summary(value, "session_transfer_observed"))
+            return summaries
+
     def release(self, holder, *, run_id, expected_generation):
         with self._lock:
             handle = self._handle(holder, run_id, expected_generation)

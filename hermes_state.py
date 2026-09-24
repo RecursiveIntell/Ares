@@ -95,6 +95,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
 )
 from hermes_state_portability import SessionPortabilityMixin
 from hermes_state_runs import SessionRunCustodyMixin
+from hermes_state_continuity import ContextContinuationError, SessionContextContinuityMixin
 from hermes_state_schema import (
     SessionSchemaMixin, TODO_LIFECYCLE_SHAPE_SQL,
     todo_lifecycle_shape_from_row, _todo_lifecycle_supported_shapes,
@@ -4314,7 +4315,7 @@ def classify_session_status(
     return SESSION_STATUS_COMPLETE
 
 
-class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin, SessionRunCustodyMixin):
+class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin, SessionRunCustodyMixin, SessionContextContinuityMixin):
     """
     SQLite-backed session storage with FTS5 search.
 
@@ -7829,7 +7830,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
             )
 
     def _session_turn_lease_key_on_conn(self, conn, session_id: str) -> str:
-        """Walk compression parents on ``conn`` to the conversation lease key.
+        """Walk canonical continuation parents on ``conn`` to the conversation lease key.
 
         Must run on the same connection as the lease INSERT/UPDATE/DELETE.
         A prior ``get_session`` failure must not compute a child id that the
@@ -7860,14 +7861,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
             ):
                 break
             parent = _row(parent_id)
-            if not parent or parent.get("end_reason") != "compression":
+            if not parent:
+                break
+            parent_reason = parent.get("end_reason")
+            if parent_reason == "compression":
+                pass
+            elif parent_reason == "context_rebase":
+                if not self._context_rebase_child_matches(current, parent_id):
+                    break
+            else:
                 break
             seen.add(parent_id)
             current = parent
         return str(current.get("id") or session_id) if current else session_id
 
     def _session_turn_lease_key(self, session_id: str) -> str:
-        """Return the stable serialization key for every compression segment.
+        """Return the stable serialization key for every continuation segment.
 
         Acquire/refresh/release resolve this inside their write transaction.
         This helper is for tests and diagnostics; it does not swallow lock
@@ -11346,7 +11355,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
     def _selected_todo_snapshot(self, row, session_id: str):
         if row is None:
             raise TodoSnapshotError("session")
-        if row["ended_at"] is not None and row["end_reason"] == "compression":
+        if row["ended_at"] is not None and row["end_reason"] in ("compression", "context_rebase"):
             raise TodoSnapshotError("closed_session")
         clear = self._validate_todo_clear_baseline(row, session_id)
         # NULL with a clear baseline is explicit owner provenance, not an empty
@@ -12942,7 +12951,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
         # never hijack the resume. This is the fix for the desktop "I came back
         # and the reply isn't there" report on large sessions.
         try:
-            tip = self.get_compression_tip(session_id)
+            tip = self.get_context_continuation_tip(session_id)
+        except ContextContinuationError:
+            raise
         except Exception:
             tip = session_id
         if tip and tip != session_id:

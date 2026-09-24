@@ -390,7 +390,7 @@ class SessionRunCustodyMixin:
 
     def _commit_run(self, expected_head, value, *, require_live_owner=True,
                     predecessor_expires_ns=None, claim_lease_holder=None,
-                    refresh_reference=None):
+                    refresh_reference=None, validate_conn=None):
         document = asdict(value)
         if refresh_reference is not None:
             document.pop("checkpoint")
@@ -417,6 +417,8 @@ class SessionRunCustodyMixin:
                 raise RunCustodyError("INTEGRITY_GENERATION_EXISTS")
             if claim_lease_holder is not None:
                 self._check_run_claim_bindings(conn, value, claim_lease_holder)
+            if validate_conn is not None:
+                validate_conn(conn)
             if refresh_reference is not None:
                 def read_value(record_key):
                     if record_key == member_key:
@@ -542,6 +544,64 @@ class SessionRunCustodyMixin:
                         predecessor_digest=_load(raw)["digest"], checkpoint=checkpoint,
                         expires_monotonic_ns=_ttl(ttl_seconds))
         return self._commit_run(raw, value, predecessor_expires_ns=old.expires_monotonic_ns)
+
+    def transfer_run_session(self, run_id, *, owner_token, expected_generation,
+                             expected_session_id, new_session_id, ttl_seconds=300):
+        """Fence one live custody owner onto a published continuation session.
+
+        This retains the same checkpoint, historical binding, owner token and
+        process identity. It is not a release/reclaim and grants no downstream
+        effect authority. Both old and new session identities are checked in
+        the same SessionDB write transaction that advances custody generation.
+        """
+        _text(expected_session_id)
+        _text(new_session_id)
+        raw, old = self._owned_run(run_id, owner_token, expected_generation)
+        if old.current_session_id != expected_session_id:
+            raise RunCustodyError("SESSION_MISMATCH")
+        value = replace(
+            old,
+            generation=old.generation + 1,
+            predecessor_digest=_load(raw)["digest"],
+            current_session_id=new_session_id,
+            expires_monotonic_ns=_ttl(ttl_seconds),
+        )
+
+        def validate(conn):
+            prior = conn.execute(
+                "SELECT ended_at,end_reason FROM sessions WHERE id=?",
+                (expected_session_id,),
+            ).fetchone()
+            child = conn.execute(
+                "SELECT ended_at,parent_session_id,model_config FROM sessions WHERE id=?",
+                (new_session_id,),
+            ).fetchone()
+            if (
+                prior is None
+                or prior["ended_at"] is None
+                or prior["end_reason"] not in ("compression", "context_rebase")
+                or child is None
+                or child["ended_at"] is not None
+                or child["parent_session_id"] != expected_session_id
+            ):
+                raise RunCustodyError("SESSION_TRANSITION_MISMATCH")
+            if prior["end_reason"] == "context_rebase":
+                try:
+                    config = json.loads(child["model_config"] or "{}")
+                except (TypeError, ValueError) as exc:
+                    raise RunCustodyError("SESSION_TRANSITION_MISMATCH") from exc
+                if (
+                    type(config) is not dict
+                    or config.get("_context_rebase_from") != expected_session_id
+                ):
+                    raise RunCustodyError("SESSION_TRANSITION_MISMATCH")
+
+        return self._commit_run(
+            raw,
+            value,
+            predecessor_expires_ns=old.expires_monotonic_ns,
+            validate_conn=validate,
+        )
 
     def refresh_run_custody(self, run_id, *, owner_token, expected_generation, ttl_seconds=300):
         raw, old = self._owned_run(run_id, owner_token, expected_generation)
