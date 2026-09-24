@@ -240,3 +240,29 @@ def test_governor_lineage_does_not_follow_fake_rebase_marker(db):
         profile_name="p1",
     )
     assert ContextGovernorEngine._context_lineage_root(db, "fake") == "fake"
+
+
+def test_post_publish_ambiguity_enters_reconciliation_required(db):
+    transition = _publish(db)
+    updated = db.mark_context_rebase_reconciliation_required(transition.transition_id)
+    assert updated.state == "reconciliation_required"
+    assert updated.ready_at is None
+    assert db.mark_context_rebase_reconciliation_required(transition.transition_id) == updated
+    with pytest.raises(ContextContinuationError, match="CONTEXT_REBASE_NOT_ACTIVATABLE"):
+        db.mark_context_rebase_ready(
+            transition.transition_id,
+            expected_continuation_digest=transition.continuation_digest,
+            expected_child_session_id=transition.child_session_id,
+        )
+
+
+def test_ready_rebase_cannot_be_demoted_to_reconciliation(db):
+    transition = _publish(db)
+    ready = db.mark_context_rebase_ready(
+        transition.transition_id,
+        expected_continuation_digest=transition.continuation_digest,
+        expected_child_session_id=transition.child_session_id,
+    )
+    assert ready.state == "ready"
+    with pytest.raises(ContextContinuationError, match="CONTEXT_REBASE_NOT_RECONCILABLE"):
+        db.mark_context_rebase_reconciliation_required(transition.transition_id)
