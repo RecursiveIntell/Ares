@@ -8,6 +8,9 @@ model-quality limits. No state, quotas, credentials or provider calls live here.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
+import json
+from typing import Any
 from enum import Enum
 
 
@@ -194,3 +197,52 @@ def decide_pressure(
         if candidate.tokens + next_segment_growth >= trigger:
             return result(Disposition.BLOCKED, "SUCCESSOR_HAS_INSUFFICIENT_RUNWAY")
     return result(Disposition.REBASE_CANDIDATE, "CANDIDATE_REQUIRES_OWNER_VALIDATION")
+
+
+
+def stateless_payload_token_upper_bound(
+    *,
+    route_ref: str,
+    system_prompt: str,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+) -> InputCount:
+    """Return a conservative token upper bound for rebuilt stateless payloads.
+
+    For UTF-8/BPE-style text tokenizers, ordinary payload tokens cannot exceed
+    the number of serialized UTF-8 bytes. Provider-added framing/special tokens
+    are not visible in the payload, so reserve a deliberately large fixed +
+    per-item allowance. This contract is qualified only for routes that rebuild
+    their complete request from this payload; callers must not use it for
+    server-retained threads or opaque native state.
+    """
+    _identity(route_ref, "INVALID_ROUTE")
+    if not isinstance(system_prompt, str) or not isinstance(messages, list):
+        raise BudgetError("INVALID_STATELESS_PAYLOAD")
+    if tools is not None and not isinstance(tools, list):
+        raise BudgetError("INVALID_STATELESS_PAYLOAD")
+    try:
+        payload = json.dumps(
+            {
+                "system": system_prompt,
+                "messages": messages,
+                "tools": tools or [],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8", errors="strict")
+    except (TypeError, ValueError, UnicodeError, RecursionError):
+        raise BudgetError("INVALID_STATELESS_PAYLOAD") from None
+
+    item_count = len(messages) + len(tools or [])
+    framing_reserve = 8192 + 64 * item_count
+    tokens = len(payload) + framing_reserve
+    digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+    return InputCount(
+        route_ref,
+        digest,
+        tokens,
+        CountMethod.QUALIFIED_UPPER_BOUND,
+    )
