@@ -9,6 +9,7 @@ on:
       - 'ares_runtime/continuity/**'
       - 'tests/ares_runtime/test_continuity*'
       - 'hermes_state_continuity.py'
+      - 'scripts/run_checkpoint_context.py'
       - 'docs/context-continuity/**'
 
 permissions:
@@ -41,5 +42,5 @@ jobs:
           .venv/bin/python --version
           HERMES_PYTHON="$PWD/.venv/bin/python" HERMES_TEST_WORKERS=2 HERMES_TEST_FILE_RETRIES=0 \
             scripts/run_tests.sh tests/ares_runtime/test_continuity*.py \
-            tests/ares_runtime/test_managed_calls.py -- -q
-          .venv/bin/ruff check ares_runtime/continuity tests/ares_runtime/test_continuity*.py
+            tests/ares_runtime/test_managed_calls.py tests/test_turn_run_custody.py -- -q
+          .venv/bin/ruff check ares_runtime/continuity tests/ares_runtime/test_continuity*.py scripts/run_checkpoint_context.py
