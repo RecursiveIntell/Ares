@@ -287,3 +287,22 @@ def test_ready_child_allows_ordinary_turn_admission(db):
 
 def test_non_rebase_session_has_no_continuity_admission_requirement(db):
     assert db.assert_context_rebase_ready_for_turn("s0") is None
+
+
+def test_rebase_tip_projects_as_one_listed_conversation(db):
+    assert db.set_session_title("s0", "Queue repair")
+    _publish(db)
+    sessions = db.list_sessions_rich(limit=20)
+    ids = [row["id"] for row in sessions]
+    assert ids.count("s1") == 1
+    assert "s0" not in ids
+    projected = next(row for row in sessions if row["id"] == "s1")
+    assert projected["_lineage_root_id"] == "s0"
+
+
+def test_title_transfers_from_rebase_ancestor_to_live_tip(db):
+    assert db.set_session_title("s0", "Queue repair")
+    _publish(db)
+    assert db.set_session_title("s1", "Queue repair")
+    assert db.get_session_title("s0") is None
+    assert db.get_session_title("s1") == "Queue repair"
