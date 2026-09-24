@@ -539,6 +539,44 @@ class SessionContextContinuityMixin:
 
         return self._execute_write(_do)
 
+    def mark_context_rebase_reconciliation_required(
+        self,
+        transition_id: str,
+    ) -> ContextRebaseTransition:
+        """Persist post-publication owner ambiguity without reopening the parent.
+
+        This state is intentionally terminal for ordinary turn admission until
+        the existing owners reconcile the committed successor.  Repeated calls
+        are idempotent; READY/CANCELLED transitions are never silently demoted.
+        """
+        key = self._context_rebase_key(transition_id)
+
+        def _do(conn):
+            row = conn.execute("SELECT value FROM state_meta WHERE key=?", (key,)).fetchone()
+            if row is None:
+                raise ContextContinuationError("CONTEXT_REBASE_NOT_FOUND")
+            old = ContextRebaseTransition.from_raw(row[0])
+            if old.state == "reconciliation_required":
+                return old
+            if old.state != "committed_pending_activation":
+                raise ContextContinuationError("CONTEXT_REBASE_NOT_RECONCILABLE")
+            updated = ContextRebaseTransition(
+                old.schema, old.transition_id, old.parent_session_id,
+                old.child_session_id, old.context_epoch,
+                old.continuation_digest, old.control_revision,
+                old.input_watermark, "reconciliation_required",
+                old.created_at, None,
+            )
+            cursor = conn.execute(
+                "UPDATE state_meta SET value=? WHERE key=? AND value=?",
+                (updated.raw(), key, row[0]),
+            )
+            if cursor.rowcount != 1:
+                raise ContextContinuationError("CONTEXT_REBASE_STATE_CHANGED")
+            return updated
+
+        return self._execute_write(_do)
+
     def get_context_continuation_tip(self, session_id: str, *, max_depth: int = 1000) -> Optional[str]:
         """Follow compression + authenticated context-rebase edges to one tip.
 
