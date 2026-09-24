@@ -211,3 +211,33 @@ def test_ready_rebase_carries_goal_recurring_state_and_title(setup):
     assert LoopState.from_json(db.get_meta(f"loop:{result.session_id}")).status == "active"
     assert db.get_session_title("s0") is None
     assert db.get_session_title(result.session_id) == "Queue repair"
+
+
+def test_multimodal_successor_is_not_published_without_qualified_accounting(setup):
+    db, agent, _messages, _history, _ = setup
+    db.append_message(
+        "s0",
+        "user",
+        [
+            {
+                "type": "image_url",
+                "image_url": {"url": "https://example.invalid/short-ref.png"},
+            },
+            {"type": "text", "text": "Inspect this image and continue."},
+        ],
+    )
+    messages = db.get_messages_as_conversation(
+        "s0", repair_alternation=False, include_row_ids=True
+    )
+    before = db.get_session("s0")
+    result = attempt_turn_start_context_rebase(
+        agent,
+        messages,
+        conversation_history=messages[:-1],
+        active_system_prompt=agent._cached_system_prompt,
+        before_tokens=100_000,
+    )
+    assert result.status is AutomaticRebaseStatus.BLOCKED
+    assert result.reason == "SUCCESSOR_MULTIMODAL_ACCOUNTING_UNQUALIFIED"
+    after = db.get_session("s0")
+    assert after["ended_at"] == before["ended_at"] is None
