@@ -129,6 +129,21 @@ class TurnRunCustody:
             value = self._mutate(handle, self.db.refresh_run_custody, ttl_seconds=ttl_seconds)
             return self._summary(value, "refresh_observed")
 
+    def assert_goal_migration_safe(self, holder, *, session_id):
+        """Refuse to mutate a goal row that an owned checkpoint binds as history."""
+        with self._lock:
+            self._active(holder)
+            mutable_key = f"goal:{session_id}"
+            for handle in self._handles.values():
+                if handle.holder != holder or handle.status != "owned" or handle.value is None:
+                    continue
+                historical_key = dict(handle.value.checkpoint.members).get(
+                    "historical-goal-key"
+                )
+                if historical_key == mutable_key:
+                    raise ClaimRefusal("HISTORICAL_GOAL_ALIAS_COLLISION")
+        return True
+
     def transfer_session(self, holder, *, old_session_id, new_session_id, ttl_seconds):
         """Transfer every owned run handle across one already-published session edge."""
         with self._lock:
