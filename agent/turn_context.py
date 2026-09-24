@@ -491,6 +491,19 @@ def build_turn_context(
     if recovered_history is not None:
         conversation_history = recovered_history
 
+    # A context-rebase child is a durable local successor before it is
+    # necessarily safe for ordinary work. Crash/restart must not turn
+    # committed_pending_activation or reconciliation_required into implicit
+    # READY simply because resume routing found the child.
+    _continuity_db = getattr(agent, "_session_db", None)
+    _ready_check = (
+        getattr(type(_continuity_db), "assert_context_rebase_ready_for_turn", None)
+        if _continuity_db is not None
+        else None
+    )
+    if callable(_ready_check) and getattr(agent, "session_id", None):
+        _ready_check(_continuity_db, agent.session_id)
+
     # NOTE: the DB session row is created later, AFTER the system prompt is
     # restored/built (see _ensure_db_session() below the system-prompt block).
     # Creating it here — before _cached_system_prompt is populated — inserts a
