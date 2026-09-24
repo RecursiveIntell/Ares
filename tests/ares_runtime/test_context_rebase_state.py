@@ -266,3 +266,24 @@ def test_ready_rebase_cannot_be_demoted_to_reconciliation(db):
     assert ready.state == "ready"
     with pytest.raises(ContextContinuationError, match="CONTEXT_REBASE_NOT_RECONCILABLE"):
         db.mark_context_rebase_reconciliation_required(transition.transition_id)
+
+
+def test_pending_child_refuses_ordinary_turn_admission(db):
+    transition = _publish(db)
+    assert transition.state == "committed_pending_activation"
+    with pytest.raises(ContextContinuationError, match="CONTEXT_REBASE_NOT_READY"):
+        db.assert_context_rebase_ready_for_turn("s1")
+
+
+def test_ready_child_allows_ordinary_turn_admission(db):
+    transition = _publish(db)
+    ready = db.mark_context_rebase_ready(
+        transition.transition_id,
+        expected_continuation_digest=transition.continuation_digest,
+        expected_child_session_id=transition.child_session_id,
+    )
+    assert db.assert_context_rebase_ready_for_turn("s1") == ready
+
+
+def test_non_rebase_session_has_no_continuity_admission_requirement(db):
+    assert db.assert_context_rebase_ready_for_turn("s0") is None
