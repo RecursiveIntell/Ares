@@ -339,6 +339,49 @@ class SessionContextContinuityMixin:
         raw = self.get_meta(self._context_rebase_key(transition_id))
         return None if raw is None else ContextRebaseTransition.from_raw(raw)
 
+    def context_rebase_transition_for_session(
+        self, session_id: str
+    ) -> Optional[ContextRebaseTransition]:
+        """Resolve a marker-bound child to its durable transition record."""
+        _identity(session_id, "INVALID_CHILD_SESSION")
+        row = self.get_session(session_id)
+        if not isinstance(row, dict):
+            return None
+        config = row.get("model_config") or {}
+        if isinstance(config, str):
+            try:
+                config = json.loads(config)
+            except (TypeError, ValueError):
+                raise ContextContinuationError("CONTEXT_EPOCH_METADATA_INVALID") from None
+        if not isinstance(config, dict):
+            raise ContextContinuationError("CONTEXT_EPOCH_METADATA_INVALID")
+        transition_id = config.get("_context_rebase_transition")
+        parent_id = config.get("_context_rebase_from")
+        if transition_id is None and parent_id is None:
+            return None
+        if not isinstance(transition_id, str) or not isinstance(parent_id, str):
+            raise ContextContinuationError("CONTEXT_REBASE_MARKER_INVALID")
+        transition = self.read_context_rebase_transition(transition_id)
+        if transition is None:
+            raise ContextContinuationError("CONTEXT_REBASE_RECORD_MISSING")
+        if (
+            transition.child_session_id != session_id
+            or transition.parent_session_id != parent_id
+        ):
+            raise ContextContinuationError("CONTEXT_REBASE_COMMIT_CORRUPT")
+        return transition
+
+    def assert_context_rebase_ready_for_turn(
+        self, session_id: str
+    ) -> Optional[ContextRebaseTransition]:
+        """Fail closed when a committed successor is not READY for normal work."""
+        transition = self.context_rebase_transition_for_session(session_id)
+        if transition is None:
+            return None
+        if transition.state != "ready":
+            raise ContextContinuationError("CONTEXT_REBASE_NOT_READY")
+        return transition
+
     def publish_context_rebase_child(
         self,
         *,
