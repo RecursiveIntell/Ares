@@ -7,6 +7,9 @@ from ares_runtime.continuity.runtime import (
     attempt_turn_start_context_rebase,
 )
 from hermes_state import SessionDB
+from hermes_cli.goals import GoalState
+from hermes_cli.heartbeat import HeartbeatState
+from hermes_cli.loops import LoopState
 
 
 @pytest.fixture
@@ -173,3 +176,38 @@ def test_candidate_without_meaningful_reduction_does_not_close_parent(setup):
         "SUCCESSOR_INSUFFICIENT_REDUCTION",
     }
     assert db.get_session("s0")["ended_at"] is None
+
+
+def test_ready_rebase_carries_goal_recurring_state_and_title(setup):
+    db, agent, messages, history, _ = setup
+    goal = GoalState(goal="Fix the queue", created_at=1.0)
+    db.set_meta("goal:s0", goal.to_json())
+    db.set_meta(
+        "heartbeat:s0",
+        HeartbeatState("check queue", 600, created_at=1.0).to_json(),
+    )
+    db.set_meta(
+        "loop:s0",
+        LoopState("keep testing", interval_seconds=60, created_at=1.0).to_json(),
+    )
+    assert db.set_session_title("s0", "Queue repair")
+
+    result = attempt_turn_start_context_rebase(
+        agent,
+        messages,
+        conversation_history=history,
+        active_system_prompt=agent._cached_system_prompt,
+        before_tokens=100_000,
+    )
+    assert result.status is AutomaticRebaseStatus.READY
+
+    parent_goal = GoalState.from_json(db.get_meta("goal:s0"))
+    child_goal = GoalState.from_json(db.get_meta(f"goal:{result.session_id}"))
+    assert parent_goal.status == "cleared"
+    assert child_goal.status == "active"
+    assert HeartbeatState.from_json(
+        db.get_meta(f"heartbeat:{result.session_id}")
+    ).status == "active"
+    assert LoopState.from_json(db.get_meta(f"loop:{result.session_id}")).status == "active"
+    assert db.get_session_title("s0") is None
+    assert db.get_session_title(result.session_id) == "Queue repair"
