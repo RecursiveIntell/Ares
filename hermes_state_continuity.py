@@ -43,7 +43,7 @@ def _identity(value: str, code: str) -> str:
 
 def _digest(value: str) -> str:
     if type(value) is not str or _SHA256_RE.fullmatch(value) is None:
-        raise ContextContinuationError("INVALID_MATERIALIZATION_DIGEST")
+        raise ContextContinuationError("INVALID_CONTINUATION_DIGEST")
     return value
 
 
@@ -88,7 +88,7 @@ class ContextRebaseTransition:
     parent_session_id: str
     child_session_id: str
     context_epoch: int
-    materialization_digest: str
+    continuation_digest: str
     control_revision: int
     input_watermark: int
     state: str
@@ -102,7 +102,7 @@ class ContextRebaseTransition:
         _identity(self.parent_session_id, "INVALID_PARENT_SESSION")
         _identity(self.child_session_id, "INVALID_CHILD_SESSION")
         _nonnegative_int(self.context_epoch, "INVALID_CONTEXT_EPOCH")
-        _digest(self.materialization_digest)
+        _digest(self.continuation_digest)
         _nonnegative_int(self.control_revision, "INVALID_CONTROL_REVISION")
         _nonnegative_int(self.input_watermark, "INVALID_INPUT_WATERMARK")
         if self.state not in _ALLOWED_STATES:
@@ -120,7 +120,7 @@ class ContextRebaseTransition:
     def from_raw(cls, raw: str) -> "ContextRebaseTransition":
         value = _strict_json(raw)
         if set(value) != {"schema", "transition_id", "parent_session_id", "child_session_id",
-                          "context_epoch", "materialization_digest", "control_revision",
+                          "context_epoch", "continuation_digest", "control_revision",
                           "input_watermark", "state", "created_at", "ready_at"}:
             raise ContextContinuationError("CONTEXT_REBASE_RECORD_INVALID")
         try:
@@ -131,6 +131,26 @@ class ContextRebaseTransition:
     def raw(self) -> str:
         return _canonical(asdict(self))
 
+
+
+
+@dataclass(frozen=True)
+class ContextRebaseSnapshot:
+    """One bounded SessionDB read for successor compilation, never authority."""
+
+    session_id: str
+    conversation_root: str
+    profile_name: Optional[str]
+    cwd: Optional[str]
+    git_branch: Optional[str]
+    git_repo_root: Optional[str]
+    input_watermark: int
+    first_user: Optional[Dict[str, Any]]
+    current_users: tuple[Dict[str, Any], ...]
+    latest_summary: Optional[Dict[str, Any]]
+    recent_events: tuple[Dict[str, Any], ...]
+    goal_raw: Optional[str]
+    todo_json: Optional[str]
 
 class SessionContextContinuityMixin:
     """Local SessionDB continuity owner; external activation remains separate."""
@@ -169,6 +189,152 @@ class SessionContextContinuityMixin:
             and value.get("_context_epoch") >= 1
         )
 
+    def read_context_rebase_snapshot(
+        self, session_id: str, *, recent_limit: int = 12, user_limit: int = 32
+    ) -> ContextRebaseSnapshot:
+        """Read one bounded compilation snapshot under a single SQLite read context."""
+        _identity(session_id, "INVALID_PARENT_SESSION")
+        if type(recent_limit) is not int or not 1 <= recent_limit <= 64:
+            raise ContextContinuationError("INVALID_RECENT_LIMIT")
+        if type(user_limit) is not int or not 1 <= user_limit <= 128:
+            raise ContextContinuationError("INVALID_USER_LIMIT")
+
+        with self._read_ctx() as conn:
+            session = conn.execute(
+                "SELECT id,profile_name,cwd,git_branch,git_repo_root,ended_at FROM sessions WHERE id=?",
+                (session_id,),
+            ).fetchone()
+            if session is None or session["ended_at"] is not None:
+                raise ContextContinuationError("CONTEXT_REBASE_PARENT_NOT_LIVE")
+            root = self._session_turn_lease_key_on_conn(conn, session_id)
+            watermark_row = conn.execute(
+                "SELECT COALESCE(MAX(id),0) AS watermark FROM messages WHERE session_id=? AND active=1",
+                (session_id,),
+            ).fetchone()
+            watermark = int(watermark_row["watermark"] if watermark_row else 0)
+            if watermark <= 0:
+                raise ContextContinuationError("CONTEXT_REBASE_PARENT_EMPTY")
+
+            # Only traverse canonical continuation parents. Explicit branches
+            # have their own copied transcript and therefore root at themselves.
+            lineage = [session_id]
+            current = session_id
+            seen = {current}
+            for _ in range(1000):
+                row = conn.execute(
+                    "SELECT parent_session_id,model_config FROM sessions WHERE id=?",
+                    (current,),
+                ).fetchone()
+                if row is None or not row["parent_session_id"]:
+                    break
+                parent_id = row["parent_session_id"]
+                if parent_id in seen:
+                    raise ContextContinuationError("CONTINUATION_CYCLE")
+                parent = conn.execute(
+                    "SELECT end_reason FROM sessions WHERE id=?", (parent_id,),
+                ).fetchone()
+                if parent is None:
+                    break
+                reason = parent["end_reason"]
+                if reason == "compression":
+                    # Match the same explicit fork boundary used by the turn lease.
+                    config = json.loads(row["model_config"] or "{}")
+                    if (type(config) is not dict
+                            or config.get("_branched_from") == parent_id
+                            or config.get("_delegate_from") == parent_id):
+                        break
+                elif reason == _CONTEXT_REBASE_END_REASON:
+                    if not self._context_rebase_child_matches(row, parent_id):
+                        break
+                else:
+                    break
+                lineage.append(parent_id)
+                seen.add(parent_id)
+                current = parent_id
+            else:
+                raise ContextContinuationError("CONTINUATION_DEPTH_LIMIT")
+
+            first_user = None
+            for sid in reversed(lineage):
+                row = conn.execute(
+                    "SELECT id,content,timestamp FROM messages "
+                    "WHERE session_id=? AND active=1 AND role='user' ORDER BY id ASC LIMIT 1",
+                    (sid,),
+                ).fetchone()
+                if row is not None:
+                    first_user = {
+                        "row_id": int(row["id"]),
+                        "content": self._decode_content(row["content"]),
+                        "timestamp": row["timestamp"],
+                    }
+                    break
+
+            summary = conn.execute(
+                "SELECT id,content,timestamp FROM messages "
+                "WHERE session_id=? AND active=1 AND _compressed_summary=1 "
+                "ORDER BY id DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            summary_id = int(summary["id"]) if summary is not None else 0
+            latest_summary = None if summary is None else {
+                "row_id": summary_id,
+                "content": self._decode_content(summary["content"]),
+                "timestamp": summary["timestamp"],
+            }
+
+            user_rows = conn.execute(
+                "SELECT id,content,timestamp FROM messages "
+                "WHERE session_id=? AND active=1 AND role='user' AND id>? "
+                "ORDER BY id ASC LIMIT ?",
+                (session_id, summary_id, user_limit + 1),
+            ).fetchall()
+            if len(user_rows) > user_limit:
+                raise ContextContinuationError("TOO_MANY_UNSUMMARIZED_USER_CHANGES")
+            current_users = tuple({
+                "row_id": int(row["id"]),
+                "content": self._decode_content(row["content"]),
+                "timestamp": row["timestamp"],
+            } for row in user_rows)
+            if not current_users:
+                raise ContextContinuationError("CONTEXT_REBASE_USER_ANCHOR_MISSING")
+
+            event_rows = conn.execute(
+                "SELECT id,role,content,tool_name,tool_call_id,finish_reason,timestamp,_compressed_summary "
+                "FROM messages WHERE session_id=? AND active=1 AND id>? "
+                "ORDER BY id DESC LIMIT ?",
+                (session_id, summary_id, recent_limit),
+            ).fetchall()
+            recent_events = tuple({
+                "row_id": int(row["id"]),
+                "role": row["role"],
+                "content": self._decode_content(row["content"]),
+                "tool_name": row["tool_name"],
+                "tool_call_id": row["tool_call_id"],
+                "finish_reason": row["finish_reason"],
+                "timestamp": row["timestamp"],
+                "compressed_summary": bool(row["_compressed_summary"]),
+            } for row in reversed(event_rows))
+
+            goal_row = conn.execute(
+                "SELECT value FROM state_meta WHERE key=?", (f"goal:{session_id}",),
+            ).fetchone()
+            goal_raw = None if goal_row is None else goal_row[0]
+            todo = self._current_todo_snapshot_on_conn(conn, session_id)
+            todo_json = None if todo is None else todo["todos_json"]
+
+            # Recheck the local read coordinates inside this same read transaction.
+            final = conn.execute(
+                "SELECT COALESCE(MAX(id),0) AS watermark FROM messages WHERE session_id=? AND active=1",
+                (session_id,),
+            ).fetchone()
+            if int(final["watermark"] if final else 0) != watermark:
+                raise ContextContinuationError("CONTEXT_REBASE_SNAPSHOT_CHANGED")
+            return ContextRebaseSnapshot(
+                session_id, str(root), session["profile_name"], session["cwd"],
+                session["git_branch"], session["git_repo_root"], watermark,
+                first_user, current_users, latest_summary, recent_events, goal_raw, todo_json,
+            )
+
     def read_context_rebase_transition(self, transition_id: str) -> Optional[ContextRebaseTransition]:
         raw = self.get_meta(self._context_rebase_key(transition_id))
         return None if raw is None else ContextRebaseTransition.from_raw(raw)
@@ -179,7 +345,7 @@ class SessionContextContinuityMixin:
         transition_id: str,
         parent_session_id: str,
         child_session_id: str,
-        materialization_digest: str,
+        continuation_digest: str,
         control_revision: int,
         input_watermark: int,
         turn_lease_holder: str,
@@ -201,7 +367,7 @@ class SessionContextContinuityMixin:
         transition_id = _identity(transition_id, "INVALID_TRANSITION_ID")
         parent_session_id = _identity(parent_session_id, "INVALID_PARENT_SESSION")
         child_session_id = _identity(child_session_id, "INVALID_CHILD_SESSION")
-        _digest(materialization_digest)
+        _digest(continuation_digest)
         _nonnegative_int(control_revision, "INVALID_CONTROL_REVISION")
         _nonnegative_int(input_watermark, "INVALID_INPUT_WATERMARK")
         if type(turn_lease_holder) is not str or not turn_lease_holder:
@@ -216,7 +382,7 @@ class SessionContextContinuityMixin:
             "transition_id": transition_id,
             "parent_session_id": parent_session_id,
             "child_session_id": child_session_id,
-            "materialization_digest": materialization_digest,
+            "continuation_digest": continuation_digest,
             "control_revision": control_revision,
             "input_watermark": input_watermark,
         }
@@ -322,7 +488,7 @@ class SessionContextContinuityMixin:
                 raise ContextContinuationError("CONTEXT_REBASE_PARENT_CHANGED")
             transition = ContextRebaseTransition(
                 _CONTEXT_REBASE_SCHEMA, transition_id, parent_session_id, child_session_id,
-                child_epoch, materialization_digest, control_revision, input_watermark,
+                child_epoch, continuation_digest, control_revision, input_watermark,
                 "committed_pending_activation", now, None,
             )
             conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?)", (key, transition.raw()))
@@ -337,12 +503,12 @@ class SessionContextContinuityMixin:
         self,
         transition_id: str,
         *,
-        expected_materialization_digest: str,
+        expected_continuation_digest: str,
         expected_child_session_id: str,
     ) -> ContextRebaseTransition:
         """Mark the local transition ready after external owner reconciliation."""
         key = self._context_rebase_key(transition_id)
-        _digest(expected_materialization_digest)
+        _digest(expected_continuation_digest)
         _identity(expected_child_session_id, "INVALID_CHILD_SESSION")
 
         def _do(conn):
@@ -350,7 +516,7 @@ class SessionContextContinuityMixin:
             if row is None:
                 raise ContextContinuationError("CONTEXT_REBASE_NOT_FOUND")
             old = ContextRebaseTransition.from_raw(row[0])
-            if (old.materialization_digest != expected_materialization_digest
+            if (old.continuation_digest != expected_continuation_digest
                     or old.child_session_id != expected_child_session_id):
                 raise ContextContinuationError("CONTEXT_REBASE_READY_BINDING_MISMATCH")
             if old.state == "ready":
@@ -362,7 +528,7 @@ class SessionContextContinuityMixin:
                 raise ContextContinuationError("CONTEXT_REBASE_CHILD_NOT_LIVE")
             ready = ContextRebaseTransition(
                 old.schema, old.transition_id, old.parent_session_id, old.child_session_id,
-                old.context_epoch, old.materialization_digest, old.control_revision,
+                old.context_epoch, old.continuation_digest, old.control_revision,
                 old.input_watermark, "ready", old.created_at, time.time(),
             )
             cursor = conn.execute("UPDATE state_meta SET value=? WHERE key=? AND value=?",

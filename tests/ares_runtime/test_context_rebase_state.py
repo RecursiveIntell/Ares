@@ -36,7 +36,7 @@ def _publish(db, *, transition="tx1", parent="s0", child="s1", digest=None, wate
         transition_id=transition,
         parent_session_id=parent,
         child_session_id=child,
-        materialization_digest=digest or ("sha256:" + "a" * 64),
+        continuation_digest=digest or ("sha256:" + "a" * 64),
         control_revision=7,
         input_watermark=watermark,
         turn_lease_holder="holder",
@@ -83,7 +83,7 @@ def test_turn_lease_holder_is_required_and_must_match(db):
     with pytest.raises(ContextContinuationError, match="TURN_LEASE_MISMATCH"):
         db.publish_context_rebase_child(
             transition_id="tx1", parent_session_id="s0", child_session_id="s1",
-            materialization_digest="sha256:" + "a" * 64, control_revision=7,
+            continuation_digest="sha256:" + "a" * 64, control_revision=7,
             input_watermark=watermark, turn_lease_holder="other", source="cli",
             messages=_messages(), model="test", profile_name="p1",
         )
@@ -100,15 +100,15 @@ def test_retry_same_transition_is_idempotent_but_changed_binding_refuses(db):
     assert db.message_count("s1") == 2
 
 
-def test_ready_requires_exact_child_and_materialization(db):
+def test_ready_requires_exact_child_and_continuation(db):
     _publish(db)
     with pytest.raises(ContextContinuationError, match="CONTEXT_REBASE_READY_BINDING_MISMATCH"):
-        db.mark_context_rebase_ready("tx1", expected_materialization_digest="sha256:" + "b" * 64,
+        db.mark_context_rebase_ready("tx1", expected_continuation_digest="sha256:" + "b" * 64,
                                      expected_child_session_id="s1")
-    ready = db.mark_context_rebase_ready("tx1", expected_materialization_digest="sha256:" + "a" * 64,
+    ready = db.mark_context_rebase_ready("tx1", expected_continuation_digest="sha256:" + "a" * 64,
                                          expected_child_session_id="s1")
     assert ready.state == "ready" and ready.ready_at is not None
-    assert db.mark_context_rebase_ready("tx1", expected_materialization_digest="sha256:" + "a" * 64,
+    assert db.mark_context_rebase_ready("tx1", expected_continuation_digest="sha256:" + "a" * 64,
                                         expected_child_session_id="s1") == ready
 
 
@@ -188,3 +188,37 @@ def test_custody_transfer_refuses_unrelated_child(db):
             expected_generation=owner.generation, expected_session_id="s0",
             new_session_id="branch", ttl_seconds=300)
     assert db.read_run_custody("run1") == owner
+
+
+def test_bounded_snapshot_carries_first_user_current_users_and_owner_state(db):
+    db.append_message("s0", "assistant", "older summary", _compressed_summary=True)
+    db.append_message("s0", "user", "new correction: still do not publish")
+    db.append_message("s0", "assistant", "working on it")
+    db.set_meta("goal:s0", '{"goal":"same task","status":"active"}')
+    snapshot = db.read_context_rebase_snapshot("s0", recent_limit=4)
+    assert snapshot.conversation_root == "s0"
+    assert snapshot.first_user["content"] == "original task"
+    assert [item["content"] for item in snapshot.current_users] == [
+        "new correction: still do not publish"
+    ]
+    assert snapshot.latest_summary["content"] == "older summary"
+    assert snapshot.goal_raw == '{"goal":"same task","status":"active"}'
+    assert snapshot.input_watermark == db.get_active_message_watermark("s0")
+
+
+def test_snapshot_refuses_too_many_user_changes_since_summary(db):
+    db.append_message("s0", "assistant", "summary", _compressed_summary=True)
+    for index in range(3):
+        db.append_message("s0", "user", f"correction {index}")
+    with pytest.raises(ContextContinuationError, match="TOO_MANY_UNSUMMARIZED_USER_CHANGES"):
+        db.read_context_rebase_snapshot("s0", user_limit=2)
+
+
+def test_snapshot_after_rebase_preserves_original_first_user(db):
+    _publish(db)
+    db.append_message("s1", "assistant", "summary child", _compressed_summary=True)
+    db.append_message("s1", "user", "latest correction")
+    snapshot = db.read_context_rebase_snapshot("s1")
+    assert snapshot.first_user["content"] == "original task"
+    assert snapshot.current_users[-1]["content"] == "latest correction"
+    assert snapshot.conversation_root == "s0"
