@@ -317,6 +317,25 @@ def attempt_turn_start_context_rebase(
         )
 
     transition_id, child_session_id = _stable_ids(candidate.continuation_digest)
+
+    # Goal migration archives the parent goal row. Refuse before publication
+    # when an owned run checkpoint treats that mutable row as immutable history.
+    if _active_goal_required(db, parent_session_id):
+        custody = getattr(agent, "_run_checkpoint_custody", None)
+        checker = getattr(custody, "assert_goal_migration_safe", None)
+        if callable(checker):
+            try:
+                checker(holder, session_id=parent_session_id)
+            except Exception:
+                return AutomaticRebaseResult(
+                    AutomaticRebaseStatus.BLOCKED,
+                    "HISTORICAL_GOAL_ALIAS_COLLISION",
+                    parent_session_id,
+                    transition_id=transition_id,
+                    before_tokens=before_tokens,
+                    after_tokens=after_tokens,
+                )
+
     try:
         parent = db.get_session(parent_session_id) or {}
         model_config = parent.get("model_config") or {}
