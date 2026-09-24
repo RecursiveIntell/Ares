@@ -1987,6 +1987,79 @@ def run_conversation(
     # on the next loop iteration. This prevents a second advisor fan-out.
     pending_moa_prepared_request = None
 
+    def _attempt_provider_overflow_rebase(pressure_tokens: int):
+        """Try one durable context rebase after the provider proves overflow.
+
+        The failed provider attempt remains charged. This helper only replaces
+        the working set for the next retry; it never turns an output-cap error
+        or a blocked owner transition into a successful turn.
+        """
+        nonlocal messages, conversation_history, active_system_prompt
+        nonlocal current_turn_user_idx, compression_attempts
+        nonlocal _preflight_compression_blocked, _last_preflight_pressure
+        if not getattr(agent, "context_rebase_enabled", False):
+            return None
+        if type(pressure_tokens) is not int or pressure_tokens <= 0:
+            return None
+        from ares_runtime.continuity.runtime import (
+            AutomaticRebaseStatus,
+            attempt_turn_start_context_rebase,
+        )
+
+        result = attempt_turn_start_context_rebase(
+            agent,
+            messages,
+            conversation_history=conversation_history,
+            active_system_prompt=active_system_prompt,
+            before_tokens=pressure_tokens,
+        )
+        if result.status is AutomaticRebaseStatus.READY:
+            messages = list(result.messages)
+            conversation_history = list(result.messages)
+            active_system_prompt = result.system_prompt
+            current_turn_user_idx = next(
+                (
+                    idx
+                    for idx in range(len(messages) - 1, -1, -1)
+                    if messages[idx].get("role") == "user"
+                ),
+                len(messages) - 1,
+            )
+            agent._persist_user_message_idx = current_turn_user_idx
+            compression_attempts = 0
+            _preflight_compression_blocked = False
+            _last_preflight_pressure = None
+            agent._empty_content_retries = 0
+            agent._thinking_prefill_retries = 0
+            agent._last_content_with_tools = None
+            agent._last_content_tools_all_housekeeping = False
+            agent._mute_post_response = False
+            _clear_warn = getattr(agent, "_clear_context_overflow_warn", None)
+            if callable(_clear_warn):
+                _clear_warn()
+            agent._emit_status(
+                "↻ Provider context overflow recovered from durable state; "
+                "rebuilding request..."
+            )
+        elif result.status is AutomaticRebaseStatus.RECONCILIATION_REQUIRED:
+            agent._persist_session(messages, conversation_history)
+        return result
+
+    def _context_rebase_reconciliation_result():
+        return {
+            "final_response": (
+                "Context rebase committed but owner reconciliation is required "
+                "before ordinary execution can continue."
+            ),
+            "messages": messages,
+            "completed": False,
+            "api_calls": api_call_count,
+            "error": "CONTEXT_REBASE_RECONCILIATION_REQUIRED",
+            "partial": True,
+            "failed": True,
+            "context_rebase_reconciliation_required": True,
+        }
+
     # Per-turn tally of consecutive successful credential-pool token refreshes,
     # keyed by (provider, pool-entry-id). A persistent upstream 401 lets
     # ``try_refresh_current()`` "succeed" forever on a single-entry OAuth pool,
