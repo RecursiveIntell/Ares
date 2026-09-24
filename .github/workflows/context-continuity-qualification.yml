@@ -19,30 +19,27 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  source-evidence:
+  focused-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
           fetch-depth: 1
-      - name: Record exact tracked source (no credentials or working state)
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+        with:
+          version: '0.9.28'
+      - name: Install locked test dependencies
+        run: uv sync --frozen --extra dev --python 3.13
+      - name: Run actual continuity modules through the canonical test runner
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/continuity-source"
-          git rev-parse HEAD > "$RUNNER_TEMP/continuity-source/HEAD.txt"
-          git ls-tree -r HEAD > "$RUNNER_TEMP/continuity-source/TREE.txt"
-          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/continuity-source/source.tar.gz"
-          (cd "$RUNNER_TEMP/continuity-source" && sha256sum HEAD.txt TREE.txt source.tar.gz > SHA256SUMS)
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: continuity-source-${{ github.event.pull_request.head.sha || github.sha }}
-          path: ${{ runner.temp }}/continuity-source/
-          retention-days: 7
-          if-no-files-found: error
-
-  # Real product-test jobs are added with their implementation. Exporting an
-  # exact source archive is preflight evidence, never a product PASS.
+          git rev-parse HEAD
+          .venv/bin/python --version
+          HERMES_PYTHON="$PWD/.venv/bin/python" HERMES_TEST_WORKERS=2 HERMES_TEST_FILE_RETRIES=0 \
+            scripts/run_tests.sh tests/ares_runtime/test_continuity*.py \
+            tests/ares_runtime/test_managed_calls.py -- -q
+          .venv/bin/ruff check ares_runtime/continuity tests/ares_runtime/test_continuity*.py
