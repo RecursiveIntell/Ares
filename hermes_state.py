@@ -60,6 +60,7 @@ from typing import Any, Callable, Dict, List, Literal, NamedTuple, Optional, Set
 from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _BRANCH_CHILD_SQL,
     _COMPRESSION_CHILD_SQL,
+    _CONTEXT_REBASE_CHILD_SQL,
     _FTS_CJK_TRIGGERS,
     _FTS_TRIGGERS,
     _LISTABLE_CHILD_SQL,
@@ -9466,7 +9467,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
             return False
         # Walk parent links up from the descendant, following only compression
         # continuation edges, and check whether ancestor_id is reached.
-        edge = _COMPRESSION_CHILD_SQL.format(a="child")
+        compression_edge = _COMPRESSION_CHILD_SQL.format(a="child")\n        rebase_edge = _CONTEXT_REBASE_CHILD_SQL.format(a="child")
         row = conn.execute(
             f"""
             WITH RECURSIVE ancestors(id) AS (
@@ -9476,7 +9477,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                 FROM ancestors a
                 JOIN sessions child ON child.id = a.id
                 JOIN sessions parent ON parent.id = child.parent_session_id
-                WHERE {edge}
+                WHERE ({compression_edge}) OR ({rebase_edge})
             )
             SELECT 1 FROM ancestors WHERE id = ? AND id != ? LIMIT 1
             """,
@@ -10389,9 +10390,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                     FROM chain c
                     JOIN sessions parent ON parent.id = c.cur_id
                     JOIN sessions child ON child.parent_session_id = c.cur_id
-                    WHERE parent.end_reason = 'compression'
-                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
-                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
+                    WHERE (
+                        (
+                          parent.end_reason = 'compression'
+                          AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
+                          AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
+                        )
+                        OR (
+                          parent.end_reason = 'context_rebase'
+                          AND json_extract(COALESCE(child.model_config, '{{}}'), '$._context_rebase_from') = parent.id
+                          AND json_extract(COALESCE(child.model_config, '{{}}'), '$._context_rebase_transition') IS NOT NULL
+                        )
+                      )
                       AND COALESCE(child.source, '') != 'tool'
                 ),
                 chain_max AS (
@@ -10508,9 +10518,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
             # every tip id first, then fetch all tip rows in a single query.
             tip_ids_by_root: Dict[str, str] = {}
             for s in sessions:
-                if s.get("end_reason") != "compression":
+                if s.get("end_reason") not in {"compression", "context_rebase"}:
                     continue
-                tip_id = self.get_compression_tip(s["id"])
+                tip_id = self.get_context_continuation_tip(s["id"])
                 if tip_id != s["id"]:
                     tip_ids_by_root[s["id"]] = tip_id
 
