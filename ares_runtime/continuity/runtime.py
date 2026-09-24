@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from enum import Enum
 import hashlib
 import json
-from typing import Any, Iterable
+from typing import Any
 
 from agent.model_metadata import estimate_request_tokens_rough
 from hermes_cli.goals import GoalState, migrate_goal_to_session
@@ -61,7 +61,7 @@ def _merged_system_prompt(base: str | None, addendum: str) -> str:
     return f"{base}\n\n{addendum}".strip()
 
 
-def _stable_ids(parent_session_id: str, continuation_digest: str) -> tuple[str, str]:
+def _stable_ids(continuation_digest: str) -> tuple[str, str]:
     if not continuation_digest.startswith("sha256:"):
         raise AutomaticRebaseError("INVALID_CONTINUATION_DIGEST")
     suffix = continuation_digest[7:39]
@@ -316,9 +316,7 @@ def attempt_turn_start_context_rebase(
             after_tokens=after_tokens,
         )
 
-    transition_id, child_session_id = _stable_ids(
-        parent_session_id, candidate.continuation_digest
-    )
+    transition_id, child_session_id = _stable_ids(candidate.continuation_digest)
     try:
         parent = db.get_session(parent_session_id) or {}
         model_config = parent.get("model_config") or {}
@@ -326,7 +324,7 @@ def attempt_turn_start_context_rebase(
             model_config = json.loads(model_config or "{}")
         if not isinstance(model_config, dict):
             model_config = {}
-        transition = db.publish_context_rebase_child(
+        db.publish_context_rebase_child(
             transition_id=transition_id,
             parent_session_id=parent_session_id,
             child_session_id=child_session_id,
