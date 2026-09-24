@@ -9467,7 +9467,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
             return False
         # Walk parent links up from the descendant, following only compression
         # continuation edges, and check whether ancestor_id is reached.
-        compression_edge = _COMPRESSION_CHILD_SQL.format(a="child")\n        rebase_edge = _CONTEXT_REBASE_CHILD_SQL.format(a="child")
+        compression_edge = _COMPRESSION_CHILD_SQL.format(a="child")
+        rebase_edge = _CONTEXT_REBASE_CHILD_SQL.format(a="child")
         row = conn.execute(
             f"""
             WITH RECURSIVE ancestors(id) AS (
