@@ -1071,7 +1071,7 @@ def clear_goal(session_id: str) -> bool:
     return save_goal(session_id, state)
 
 
-def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason: str = "") -> bool:
+def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason: str = "", session_db=None) -> bool:
     """Carry a persistent /goal from a parent session to its continuation.
 
     Context compression rotates ``session_id`` to a fresh child session,
@@ -1089,7 +1089,7 @@ def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason:
     if not old_session_id or not new_session_id or old_session_id == new_session_id:
         return False
     try:
-        db = _get_session_db()
+        db = session_db if session_db is not None else _get_session_db()
         if db is None:
             return False
         parent_raw = db.get_meta(_meta_key(old_session_id))
