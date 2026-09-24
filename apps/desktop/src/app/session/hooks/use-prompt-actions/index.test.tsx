@@ -2288,6 +2288,64 @@ describe('usePromptActions submit / queue drain semantics', () => {
     )
   })
 
+  it('does not settle an existing turn when a rejected submit loses the busy race', async () => {
+    let rejectSubmit: (reason: Error) => void = () => undefined
+    const states: Record<string, unknown>[] = []
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'prompt.submit') {
+        return new Promise<never>((_resolve, reject) => {
+          rejectSubmit = reject
+        })
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        onSeedState={state => states.push(state)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+      />
+    )
+
+    const sending = handle!.submitTextRaw('raced with a live turn')
+    await vi.waitFor(() => expect(requestGateway).toHaveBeenCalledWith('prompt.submit', expect.anything(), expect.anything()))
+    // The gateway reports the original turn live while the second submit is pending.
+    handle!.replaceState({ ...states.at(-1), busy: true, awaitingResponse: true, turnLive: true, streamId: 'original' })
+    rejectSubmit(new Error('4009: session busy'))
+    expect(await sending).toBe(false)
+    expect(states.at(-1)).toMatchObject({ busy: true, awaitingResponse: true, turnLive: true, streamId: 'original' })
+  })
+
+  it('keeps the target busy when the gateway rejects a submit before a live event arrives', async () => {
+    const states: Record<string, unknown>[] = []
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'prompt.submit') {
+        throw new Error('4009: session busy')
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        onSeedState={state => states.push(state)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+      />
+    )
+
+    expect(await handle!.submitText('my follow-up')).toBe(false)
+    expect(states.at(-1)).toMatchObject({ busy: true })
+  })
+
   it('a normal (non-queue) submit is blocked when the target session is busy', async () => {
     publishSessionState(RUNTIME_SESSION_ID, {
       ...createClientSessionState(RUNTIME_SESSION_ID),
