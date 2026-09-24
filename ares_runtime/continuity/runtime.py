@@ -20,6 +20,7 @@ from typing import Any
 from agent.model_metadata import estimate_request_tokens_rough
 from hermes_cli.goals import GoalState, migrate_goal_to_session
 
+from .budget import stateless_payload_token_upper_bound
 from .compiler import Mode
 from .live import LiveContinuationError, build_live_candidate
 
@@ -45,6 +46,7 @@ class AutomaticRebaseResult:
     transition_id: str | None = None
     before_tokens: int | None = None
     after_tokens: int | None = None
+    qualified_after_tokens: int | None = None
 
     @property
     def ready(self) -> bool:
@@ -262,9 +264,22 @@ def attempt_turn_start_context_rebase(
             before_tokens=before_tokens,
         )
 
-    # Codex app-server owns its server-side thread/compaction state.  A local
-    # SessionDB child is not proof that the remote thread was reset.
-    if str(getattr(agent, "api_mode", "") or "") == "codex_app_server":
+    # Only transports that rebuild their complete provider input from the
+    # supplied messages/system/tools are qualified by the stateless payload
+    # upper-bound contract. Codex app-server and ACP own opaque remote state.
+    api_mode = str(getattr(agent, "api_mode", "") or "")
+    base_url = str(getattr(agent, "base_url", "") or "").lower()
+    qualified_modes = {
+        "chat_completions",
+        "codex_responses",
+        "anthropic_messages",
+        "bedrock_converse",
+    }
+    if (
+        api_mode not in qualified_modes
+        or base_url.startswith("acp://")
+        or base_url.startswith("acp+tcp://")
+    ):
         return AutomaticRebaseResult(
             AutomaticRebaseStatus.BLOCKED,
             "PROVIDER_CONTEXT_RESET_UNQUALIFIED",
@@ -321,6 +336,30 @@ def attempt_turn_start_context_rebase(
         getattr(getattr(agent, "context_compressor", None), "threshold_tokens", 0)
         or 0
     )
+    route_ref = ":".join(
+        part.replace(" ", "_")
+        for part in (
+            str(getattr(agent, "provider", "") or "unknown"),
+            api_mode,
+            str(getattr(agent, "model", "") or "unknown"),
+        )
+    )
+    try:
+        qualified_after = stateless_payload_token_upper_bound(
+            route_ref=route_ref,
+            system_prompt=new_system_prompt,
+            messages=[dict(item) for item in candidate.child_messages],
+            tools=getattr(agent, "tools", None) or None,
+        )
+    except Exception:
+        return AutomaticRebaseResult(
+            AutomaticRebaseStatus.BLOCKED,
+            "SUCCESSOR_QUALIFIED_COUNT_UNAVAILABLE",
+            parent_session_id,
+            before_tokens=before_tokens,
+            after_tokens=after_tokens,
+        )
+
     if after_tokens >= before_tokens:
         return AutomaticRebaseResult(
             AutomaticRebaseStatus.BLOCKED,
@@ -338,13 +377,18 @@ def attempt_turn_start_context_rebase(
             before_tokens=before_tokens,
             after_tokens=after_tokens,
         )
-    if threshold > 0 and after_tokens * 10000 >= threshold * max_candidate_threshold_bps:
+    if (
+        threshold <= 0
+        or qualified_after.tokens * 10000
+        >= threshold * max_candidate_threshold_bps
+    ):
         return AutomaticRebaseResult(
             AutomaticRebaseStatus.BLOCKED,
             "SUCCESSOR_INSUFFICIENT_RUNWAY",
             parent_session_id,
             before_tokens=before_tokens,
             after_tokens=after_tokens,
+            qualified_after_tokens=qualified_after.tokens,
         )
 
     transition_id, child_session_id = _stable_ids(candidate.continuation_digest)
@@ -457,12 +501,13 @@ def attempt_turn_start_context_rebase(
         )
 
     return AutomaticRebaseResult(
-        AutomaticRebaseStatus.READY,
-        "CONTEXT_REBASE_READY",
-        child_session_id,
-        tuple(durable_messages),
-        new_system_prompt,
-        transition_id,
-        before_tokens,
-        after_tokens,
+        status=AutomaticRebaseStatus.READY,
+        reason="CONTEXT_REBASE_READY",
+        session_id=child_session_id,
+        messages=tuple(durable_messages),
+        system_prompt=new_system_prompt,
+        transition_id=transition_id,
+        before_tokens=before_tokens,
+        after_tokens=after_tokens,
+        qualified_after_tokens=qualified_after.tokens,
     )
