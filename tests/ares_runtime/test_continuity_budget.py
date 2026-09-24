@@ -126,3 +126,40 @@ def test_foreign_route_candidate_is_rejected():
 def test_policy_order_and_types(patch):
     with pytest.raises(BudgetError):
         PressurePolicy(**patch)
+
+
+def test_stateless_payload_upper_bound_accounts_system_messages_and_tools():
+    count = stateless_payload_token_upper_bound(
+        route_ref="openrouter:chat_completions:test",
+        system_prompt="trusted system " * 50,
+        messages=[
+            {"role": "user", "content": "do the work " * 100},
+            {"role": "assistant", "content": "state " * 80},
+        ],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "description": "bounded test tool",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                    },
+                },
+            }
+        ],
+    )
+    assert count.method is CountMethod.QUALIFIED_UPPER_BOUND
+    assert count.tokens > len(("trusted system " * 50).encode())
+    assert count.payload_digest.startswith("sha256:")
+
+
+def test_stateless_payload_upper_bound_rejects_nonserializable_payload():
+    with pytest.raises(BudgetError, match="INVALID_STATELESS_PAYLOAD"):
+        stateless_payload_token_upper_bound(
+            route_ref="test:chat_completions:model",
+            system_prompt="system",
+            messages=[{"role": "user", "content": object()}],
+            tools=None,
+        )
