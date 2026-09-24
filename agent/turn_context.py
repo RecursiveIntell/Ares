@@ -903,6 +903,8 @@ def build_turn_context(
     # issue #27405 (a few very large messages slipping past the count gate).
     _preflight_compressed = False
     _preflight_compression_blocked = False
+    _preflight_tokens = None
+    _compress_block_reason = None
     agent._turn_received_provider_response = False
     agent._turn_preflight_display_snapshot = None
     if (
@@ -970,7 +972,6 @@ def build_turn_context(
         )()
 
         _should_compress_now = False
-        _compress_block_reason = None
         if _preflight_deferred:
             logger.info(
                 "Skipping preflight compression: rough estimate ~%s >= %s, "
@@ -1257,6 +1258,74 @@ def build_turn_context(
                     )
                     if callable(_clear_warn):
                         _clear_warn()
+
+    # Once ordinary turn-start compaction has proved blocked or stopped
+    # making useful progress, an explicitly qualified route may replace the
+    # model working set with a fresh source-bound continuation. This remains
+    # before the first provider/tool admission of the turn.
+    if (
+        getattr(agent, "context_rebase_enabled", False)
+        and isinstance(_preflight_tokens, int)
+        and _preflight_tokens > 0
+        and not _codex_native_auto
+        and (
+            _preflight_compression_blocked
+            or (
+                _compress_block_reason
+                and _preflight_tokens >= getattr(_compressor, "threshold_tokens", 0)
+            )
+        )
+    ):
+        from ares_runtime.continuity.runtime import (
+            AutomaticRebaseError,
+            AutomaticRebaseStatus,
+            attempt_turn_start_context_rebase,
+        )
+
+        _rebase = attempt_turn_start_context_rebase(
+            agent,
+            messages,
+            conversation_history=conversation_history,
+            active_system_prompt=active_system_prompt,
+            before_tokens=_preflight_tokens,
+        )
+        if _rebase.status is AutomaticRebaseStatus.READY:
+            messages = list(_rebase.messages)
+            conversation_history = list(_rebase.messages)
+            active_system_prompt = _rebase.system_prompt
+            _preflight_tokens = int(_rebase.after_tokens or 0)
+            _preflight_compressed = True
+            _preflight_compression_blocked = False
+            _compress_block_reason = None
+            agent._empty_content_retries = 0
+            agent._thinking_prefill_retries = 0
+            agent._last_content_with_tools = None
+            agent._last_content_tools_all_housekeeping = False
+            agent._mute_post_response = False
+            _clear_warn = getattr(agent, "_clear_context_overflow_warn", None)
+            if callable(_clear_warn):
+                _clear_warn()
+            agent._emit_status(
+                "↻ Context working set rebased from durable state; continuing turn..."
+            )
+        elif _rebase.status is AutomaticRebaseStatus.RECONCILIATION_REQUIRED:
+            agent._emit_warning(
+                "⚠ Context rebase was published but owner reconciliation did not "
+                "complete. Ordinary model/tool execution is stopped until the "
+                "committed successor is reconciled."
+            )
+            raise AutomaticRebaseError("CONTEXT_REBASE_RECONCILIATION_REQUIRED")
+        elif _rebase.status is AutomaticRebaseStatus.BLOCKED:
+            _compress_block_reason = f"context-rebase:{_rebase.reason}"
+            _warn = getattr(agent, "_warn_context_overflow_blocked", None)
+            if callable(_warn) and _preflight_tokens >= getattr(
+                _compressor, "threshold_tokens", 0
+            ):
+                _warn(
+                    _compress_block_reason,
+                    _preflight_tokens,
+                    _compressor.threshold_tokens,
+                )
 
     if _preflight_compressed:
         # Compression rebuilt the list (tail messages are fresh compaction
