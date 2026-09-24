@@ -94,33 +94,64 @@ def _mark_reconciliation_required(db: Any, transition_id: str) -> None:
         pass
 
 
-def _carry_session_scoped_state(old_session_id: str, new_session_id: str) -> None:
-    """Mirror existing compression-boundary migrations.
+def _carry_session_scoped_state(
+    db: Any, old_session_id: str, new_session_id: str
+) -> None:
+    """Move existing recurring/UI state through its canonical owners.
 
-    Goal migration is handled separately because its success is mandatory when
-    an active goal exists. Heartbeat/loop migrations remain owner operations;
-    an exception makes this automatic transition fail closed instead of
-    silently losing recurring work.
+    A missing owner row is not an error. If an active row exists, migration is
+    mandatory before READY; returning False cannot be silently interpreted as
+    "nothing to do".
     """
     try:
-        from hermes_cli.heartbeat import migrate_heartbeat_to_session
+        from hermes_cli.heartbeat import HeartbeatState, migrate_heartbeat_to_session
 
-        migrate_heartbeat_to_session(old_session_id, new_session_id)
-    except ImportError:
-        pass
+        raw = db.get_meta(f"heartbeat:{old_session_id}")
+        active = False
+        if raw:
+            state = HeartbeatState.from_json(raw)
+            active = state.status != "cleared"
+        if active and not migrate_heartbeat_to_session(
+            old_session_id, new_session_id, session_db=db
+        ):
+            raise AutomaticRebaseError("HEARTBEAT_RECONCILIATION_FAILED")
+    except AutomaticRebaseError:
+        raise
     except Exception:
         raise AutomaticRebaseError("HEARTBEAT_RECONCILIATION_FAILED") from None
 
     try:
-        from hermes_cli.loops import migrate_loop_to_session
+        from hermes_cli.loops import LoopState, migrate_loop_to_session
 
-        migrate_loop_to_session(
-            old_session_id, new_session_id, reason="context_rebase"
-        )
-    except ImportError:
-        pass
+        raw = db.get_meta(f"loop:{old_session_id}")
+        active = False
+        if raw:
+            state = LoopState.from_json(raw)
+            active = state.status != "cleared"
+        if active and not migrate_loop_to_session(
+            old_session_id,
+            new_session_id,
+            reason="context_rebase",
+            session_db=db,
+        ):
+            raise AutomaticRebaseError("LOOP_RECONCILIATION_FAILED")
+    except AutomaticRebaseError:
+        raise
     except Exception:
         raise AutomaticRebaseError("LOOP_RECONCILIATION_FAILED") from None
+
+    try:
+        title = db.get_session_title(old_session_id)
+        if title:
+            source = db.get_session_title_source(old_session_id)
+            if not db.set_session_title(new_session_id, title):
+                raise AutomaticRebaseError("TITLE_RECONCILIATION_FAILED")
+            if source is not None:
+                db.set_session_title_source(new_session_id, source)
+    except AutomaticRebaseError:
+        raise
+    except Exception:
+        raise AutomaticRebaseError("TITLE_RECONCILIATION_FAILED") from None
 
 
 def _transfer_run_custody(agent: Any, old_session_id: str, new_session_id: str) -> None:
@@ -379,7 +410,7 @@ def attempt_turn_start_context_rebase(
                 session_db=db,
             ):
                 raise AutomaticRebaseError("GOAL_RECONCILIATION_FAILED")
-        _carry_session_scoped_state(parent_session_id, child_session_id)
+        _carry_session_scoped_state(db, parent_session_id, child_session_id)
         _transfer_run_custody(agent, parent_session_id, child_session_id)
 
         agent.session_id = child_session_id
