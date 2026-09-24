@@ -318,6 +318,22 @@ def attempt_turn_start_context_rebase(
     new_system_prompt = _merged_system_prompt(
         active_system_prompt, candidate.system_addendum
     )
+    # The current qualified upper-bound contract covers serialized text/tool
+    # payloads. A short remote image/file reference can expand to many model
+    # tokens outside its serialized byte size, so automatic publication must
+    # refuse multimodal/opaque successor content until that route supplies its
+    # own qualified accounting contract.
+    if any(
+        not isinstance(item.get("content"), str)
+        for item in candidate.child_messages
+        if isinstance(item, dict)
+    ):
+        return AutomaticRebaseResult(
+            AutomaticRebaseStatus.BLOCKED,
+            "SUCCESSOR_MULTIMODAL_ACCOUNTING_UNQUALIFIED",
+            parent_session_id,
+            before_tokens=before_tokens,
+        )
     try:
         after_tokens = estimate_request_tokens_rough(
             list(candidate.child_messages),
