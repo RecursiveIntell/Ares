@@ -6,6 +6,7 @@ import pytest
 from hermes_state import SessionDB
 from hermes_state_continuity import ContextContinuationError
 from hermes_state_runs import RunCheckpoint, RunCustodyError
+from plugins.context_engine._context_governor import ContextGovernorEngine
 
 
 def _sha(value: str) -> str:
@@ -222,3 +223,20 @@ def test_snapshot_after_rebase_preserves_original_first_user(db):
     assert snapshot.first_user["content"] == "original task"
     assert snapshot.current_users[-1]["content"] == "latest correction"
     assert snapshot.conversation_root == "s0"
+
+
+def test_governor_logical_lineage_survives_context_rebase(db):
+    _publish(db)
+    assert ContextGovernorEngine._context_lineage_root(db, "s1") == "s0"
+    assert ContextGovernorEngine._compression_lineage_root(db, "s1") == "s0"
+
+
+def test_governor_lineage_does_not_follow_fake_rebase_marker(db):
+    db.create_session(
+        "fake",
+        source="cli",
+        parent_session_id="s0",
+        model_config={"_context_rebase_from": "wrong", "_context_epoch": 1},
+        profile_name="p1",
+    )
+    assert ContextGovernorEngine._context_lineage_root(db, "fake") == "fake"
