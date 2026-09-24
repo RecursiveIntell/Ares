@@ -4,7 +4,7 @@ import pytest
 
 from ares_runtime.continuity.budget import (
     BudgetError, Cause, CountMethod, Disposition, InputCount, PressurePolicy,
-    RouteBudget, decide_pressure,
+    RouteBudget, decide_pressure, stateless_payload_token_upper_bound,
 )
 
 
