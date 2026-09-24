@@ -2292,6 +2292,12 @@ def init_agent(
     compression_in_place = is_truthy_value(
         _compression_cfg.get("in_place"), default=True
     )
+    # Automatic working-context rebase is deliberately opt-in until the
+    # selected provider/effect route has passed continuity qualification.
+    # Source support may ship disabled without widening live authority.
+    compression_context_rebase = is_truthy_value(
+        _compression_cfg.get("context_rebase_enabled"), default=False
+    )
     # Opt-in (default False): a micro-compaction pass rewrites already-sent
     # history every turn, which breaks the provider prompt-cache prefix on a
     # per-turn cadence rather than at an episodic boundary. That is the cost
@@ -2807,6 +2813,7 @@ def init_agent(
             pass
     agent.compression_enabled = compression_enabled
     agent.compression_in_place = compression_in_place
+    agent.context_rebase_enabled = compression_context_rebase
     # Apply micro-compaction settings to the compressor (feature is opt-in)
     _cc = getattr(agent, "context_compressor", None)
     # compression.checkpoint_required: micro-compaction is a lossy rewrite
