@@ -849,43 +849,53 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           return false
         }
 
-        releaseBusy()
+        releaseSubmitLock()
+        const backendBusy = isSessionBusyError(err)
 
-        // A queued drain that raced a not-yet-settled turn gets a transient
-        // "session busy" (4009). Don't surface an error bubble/toast — the entry
-        // stays queued and the composer's bounded auto-drain retries when idle.
-        if (options?.fromQueue && isSessionBusyError(err)) {
+        // A queued drain stays queued; it cannot settle the other turn.
+        if (options?.fromQueue && backendBusy) {
           return false
         }
 
         const message = inlineErrorMessage(err, copy.promptFailed)
         const occurredAt = Date.now() / 1000
 
-        updateSessionState(
+        const afterFailure = updateSessionState(
           sessionId,
-          state => ({
-            ...state,
-            messages: [
-              ...state.messages,
-              {
-                id: `assistant-error-${Date.now()}`,
-                role: 'assistant',
-                parts: [],
-                error: message || copy.promptFailed,
-                branchGroupId: state.pendingBranchGroup ?? undefined,
-                completedAt: occurredAt,
-                timestamp: occurredAt
-              }
-            ],
-            busy: false,
-            awaitingResponse: false,
-            pendingBranchGroup: null,
-            sawAssistantPayload: true,
-            // The failed submit's clock seed dies with the turn it never got.
-            turnStartedAt: null
-          }),
+          state => {
+            // A rejected submit cannot settle a turn that already owns this
+            // session. 4009 is busy evidence even without a start event.
+            const existingTurnLive = state.turnLive && (state.busy || state.awaitingResponse)
+
+            return {
+              ...state,
+              messages: [
+                ...state.messages,
+                {
+                  id: `assistant-error-${Date.now()}`,
+                  role: 'assistant',
+                  parts: [],
+                  error: message || copy.promptFailed,
+                  branchGroupId: state.pendingBranchGroup ?? undefined,
+                  completedAt: occurredAt,
+                  timestamp: occurredAt
+                }
+              ],
+              busy: existingTurnLive || backendBusy,
+              awaitingResponse: existingTurnLive ? state.awaitingResponse : false,
+              pendingBranchGroup: existingTurnLive ? state.pendingBranchGroup : null,
+              sawAssistantPayload: existingTurnLive ? state.sawAssistantPayload : true,
+              turnStartedAt: existingTurnLive ? state.turnStartedAt : null
+            }
+          },
           targetStoredSessionId
         )
+
+        if (targetIsCurrentView()) {
+          setMutableRef(busyRef, afterFailure.busy)
+          scope.setBusy(afterFailure.busy)
+          scope.setAwaitingResponse(afterFailure.awaitingResponse)
+        }
 
         if (targetIsCurrentView() && isProviderSetupError(err)) {
           requestDesktopOnboarding(copy.providerCredentialRequired)
