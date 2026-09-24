@@ -166,6 +166,7 @@ def test_compute_host_workers_inherit_tui_pool_env_or_8(monkeypatch):
 def test_mutator_route_table_matches_prd_inventory():
     assert MUTATOR_ROUTE_TABLE == {
         "config.set.model": "run-concurrent",
+        "config.set.fast": "idle-gated",
         "prompt.submit": "turn-path",
         "session.interrupt": "turn-path",
         "reload.mcp": "run-concurrent",
@@ -697,6 +698,114 @@ def test_isolated_model_switch_is_applied_by_the_compute_host_owner(monkeypatch)
         assert session["_metadata_mirror"]["model"] == "new-model"
     finally:
         server._sessions.pop(sid, None)
+
+
+def test_isolated_fast_switch_uses_compute_host_owner_not_parent_mirror(monkeypatch):
+    sid = "fast-host-owner"
+    stale_agent = types.SimpleNamespace(model="openai/gpt-5.4", service_tier="priority", request_overrides={"service_tier": "priority"})
+    session = {"agent": stale_agent, "history_lock": threading.Lock(), "session_key": "stored-fast",
+               "running": False, "_compute_host_active": True}
+    calls = []
+
+    class _Supervisor:
+        def control(self, control_sid, *, route_name, payload, wait=True, timeout=30.0):
+            calls.append((control_sid, route_name, payload))
+            return {"type": "control.ack", "result": {"key": "fast", "value": "normal"},
+                    "session_info": {"service_tier": "normal", "fast": False}}
+
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: True)
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: _Supervisor())
+    monkeypatch.setattr(server, "_write_config_key", lambda *_: pytest.fail("scoped fast must not write global config"))
+    try:
+        response = server.handle_request({"id": "fast-off", "method": "config.set",
+                                          "params": {"session_id": sid, "key": "fast", "value": "normal"}})
+        assert response["result"]["value"] == "normal"
+        assert len(calls) == 1
+        assert calls[0][:2] == (sid, "config.set.fast")
+        assert calls[0][2]["params"] == {"key": "fast", "value": "normal"}
+        assert stale_agent.service_tier == "priority"
+        assert session["_metadata_mirror"]["fast"] is False
+        assert server._session_info(stale_agent, session)["fast"] is False
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_stale_scoped_fast_id_never_writes_global_default(monkeypatch):
+    monkeypatch.setattr(server, "_write_config_key", lambda *_: pytest.fail("stale scoped id mutated global default"))
+    response = server.handle_request({"id": "stale-fast", "method": "config.set",
+                                      "params": {"session_id": "missing-fast-runtime", "key": "fast", "value": "normal"}})
+    assert response["error"]["code"] == 4001
+
+
+def test_fast_choice_before_first_compute_host_turn_is_pinned_not_sent(monkeypatch):
+    sid = "pre-host-fast"
+    session = {"agent": None, "agent_ready": threading.Event(), "history_lock": threading.Lock(),
+               "model_override": {"model": "openai/gpt-5.4"}, "session_key": "new-chat"}
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: True)
+    monkeypatch.setattr(server, "_send_compute_host_control",
+                        lambda *_a, **_kw: pytest.fail("host does not yet own this session"))
+    monkeypatch.setattr("hermes_cli.models.resolve_fast_mode_overrides",
+                        lambda _model: {"service_tier": "priority"})
+    try:
+        response = server.handle_request({"id": "pre-fast", "method": "config.set",
+                                          "params": {"session_id": sid, "key": "fast", "value": "fast"}})
+        assert response["result"]["value"] == "fast"
+        assert session["create_service_tier_override"] == "priority"
+        assert server._compute_host_turn_frame("turn", sid, session, "hello")["service_tier_override"] == "priority"
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_existing_compute_host_agent_applies_fast_off_and_on_at_owner(monkeypatch):
+    sid = "host-fast-live"
+    agent = types.SimpleNamespace(model="openai/gpt-5.4", provider="openai", service_tier="priority",
+                                  request_overrides={"service_tier": "priority", "foo": "bar"})
+    session = {"agent": agent, "history_lock": threading.Lock(), "session_key": "stored-fast",
+               "running": False, "history": []}
+    output = io.StringIO()
+    host = ComputeHost(stdout=output, heartbeat_secs=0)
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_write_config_key", lambda *_: pytest.fail("host scoped control wrote global config"))
+    monkeypatch.setattr(server, "_persist_live_session_runtime", lambda *_: None)
+    monkeypatch.setattr("hermes_cli.models.resolve_fast_mode_overrides",
+                        lambda _model: {"service_tier": "priority"})
+    try:
+        host._handle_control({"sid": sid, "request_id": "off", "route_name": "config.set.fast",
+                              "params": {"value": "normal"}})
+        frames = _json_lines(output)
+        assert frames[-1]["type"] == "control.ack"
+        assert frames[-1]["session_info"]["fast"] is False
+        assert agent.service_tier is None
+        assert agent.request_overrides == {"foo": "bar"}
+        assert session["create_service_tier_override"] == ""
+
+        host._handle_control({"sid": sid, "request_id": "on", "route_name": "config.set.fast",
+                              "params": {"value": "fast"}})
+        frames = _json_lines(output)
+        assert frames[-1]["type"] == "control.ack"
+        assert frames[-1]["session_info"]["fast"] is True
+        assert agent.request_overrides == {"foo": "bar", "service_tier": "priority"}
+    finally:
+        server._sessions.pop(sid, None)
+        host.close()
+
+
+def test_busy_compute_host_fast_control_rejects_without_mutation(monkeypatch):
+    sid = "host-fast-busy"
+    agent = types.SimpleNamespace(service_tier="priority", request_overrides={"service_tier": "priority"})
+    server._sessions[sid] = {"agent": agent, "running": True}
+    output = io.StringIO()
+    host = ComputeHost(stdout=output, heartbeat_secs=0)
+    try:
+        host._handle_control({"sid": sid, "request_id": "busy", "route_name": "config.set.fast",
+                              "params": {"value": "normal"}})
+        assert _json_lines(output)[-1]["type"] == "control.error"
+        assert agent.service_tier == "priority"
+    finally:
+        server._sessions.pop(sid, None)
+        host.close()
 
 
 def test_reclaimed_compute_host_owner_receives_stop_for_the_original_runtime(monkeypatch):

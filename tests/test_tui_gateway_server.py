@@ -3596,6 +3596,36 @@ def test_session_resume_deferred_history_acknowledges_and_reuses(monkeypatch):
                 server._sessions.pop(sid, None)
 
 
+def test_deferred_history_failure_logs_last_stage_without_transcript(monkeypatch, caplog):
+    sid = "hydration-runtime"
+    stored_id = "hydration-stored"
+    event = threading.Event()
+    session = {"resume_history_ready": event, "agent_ready": threading.Event(),
+               "history_lock": threading.Lock(), "history": [],
+               "profile_home": "/tmp/test-profile"}
+
+    class FakeDB:
+        def reopen_session(self, _target):
+            pass
+
+        def get_resume_conversations(self, _target):
+            raise RuntimeError("sensitive-transcript-sentinel")
+
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_emit", lambda *_: None)
+    try:
+        with caplog.at_level("WARNING", logger="tui_gateway.server"):
+            server._schedule_resume_hydration(sid, stored_id, FakeDB())
+            assert event.wait(timeout=2.0)
+        lines = [record.getMessage() for record in caplog.records if "resume hydration failed" in record.getMessage()]
+        assert len(lines) == 1
+        assert "stage=history_read" in lines[0]
+        assert stored_id in lines[0] and sid in lines[0]
+        assert "sensitive-transcript-sentinel" not in lines[0]
+    finally:
+        server._sessions.pop(sid, None)
+
+
 def test_session_resume_deferred_history_failure_can_retry(monkeypatch):
     first_released = threading.Event()
     build_started = threading.Event()
