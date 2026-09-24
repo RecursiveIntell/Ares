@@ -7,12 +7,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { getSession } from '@/hermes'
 import { textPart } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
+import { GatewayDeliveryUnknownError } from '@/lib/gateway-delivery'
 import { $composerAttachments, $composerDraft, type ComposerAttachment, setComposerDraft } from '@/store/composer'
-import { $queuedPromptsBySession, getQueuedPrompts } from '@/store/composer-queue'
+import { $queuedPromptsBySession, enqueueQueuedPrompt, getQueuedPrompts, isQueueParked } from '@/store/composer-queue'
 import { requestGatewayForAgent } from '@/store/gateway'
 import { $goalsBySession, setSessionGoal } from '@/store/goals'
 import { $hudMode } from '@/store/hud'
 import { $notifications, clearNotifications } from '@/store/notifications'
+import { $activeGatewayProfile } from '@/store/profile'
+import { clearAllPrompts, hasBlockingPromptRequest, setApprovalRequest } from '@/store/prompts'
 import {
   $busy,
   $connection,
@@ -24,6 +27,7 @@ import {
   $turnStartedAt,
   setCurrentUsage,
   setMessages,
+  setSessionOwnerHint,
   setSessions
 } from '@/store/session'
 import { dropSessionState, publishSessionState } from '@/store/session-states'
@@ -61,6 +65,8 @@ vi.mock('@/store/gateway', async importOriginal => ({
 // the stored sessions table and 404s on a runtime id. session.title accepts
 // the runtime id directly.
 const RUNTIME_SESSION_ID = 'rt-abc123'
+const OWNER_STORED_SESSION_ID = 'stored-owner-route'
+const OWNER_LOCAL_PROFILE_STORED_SESSION_ID = 'stored-local-profile-owner-route'
 
 function sessionInfo(overrides: Partial<SessionInfo> = {}): SessionInfo {
   return {
@@ -96,6 +102,8 @@ async function actRender(ui: React.ReactElement) {
 interface HarnessHandle {
   activeSessionIdRef: MutableRefObject<string | null>
   cancelRun: () => Promise<void>
+  cancelRunRaw: () => Promise<void>
+  replaceState: (state: Record<string, unknown>) => void
   editMessage: (edited: Parameters<ReturnType<typeof usePromptActions>['editMessage']>[0]) => Promise<void>
   reloadFromMessage: (parentId: null | string) => Promise<void>
   restoreToMessage: (messageId: string, target?: { text?: string; userOrdinal?: number | null }) => Promise<void>
@@ -121,6 +129,8 @@ function Harness({
   resumeStoredSession,
   runtimeIdByStoredSessionIdRef: runtimeIdByStoredSessionIdRefProp,
   seedMessages,
+  seedBusy,
+  seedInterrupted,
   seedStreamId,
   seedTurnStartedAt,
   selectedStoredSessionIdRef: selectedStoredSessionIdRefProp,
@@ -146,6 +156,8 @@ function Harness({
   resumeStoredSession?: (storedSessionId: string) => Promise<void> | void
   runtimeIdByStoredSessionIdRef?: MutableRefObject<Map<string, string>>
   seedMessages?: unknown[]
+  seedBusy?: boolean
+  seedInterrupted?: boolean
   seedStreamId?: null | string
   seedTurnStartedAt?: null | number
   selectedStoredSessionIdRef?: MutableRefObject<string | null>
@@ -177,9 +189,9 @@ function Harness({
 
   const stateRef = useRef({
     messages: seedMessages ?? [],
-    busy: false,
+    busy: seedBusy ?? false,
     awaitingResponse: false,
-    interrupted: true,
+    interrupted: seedInterrupted ?? true,
     streamId: seedStreamId ?? null,
     turnStartedAt: seedTurnStartedAt ?? null,
     interimBoundaryPending: false
@@ -214,11 +226,16 @@ function Harness({
     }
   })
 
+  // eslint-disable-next-line no-restricted-syntax -- test-only callback injects a newer turn to exercise stale-ACK fencing.
   useEffect(() => {
     onReady({
       activeSessionIdRef,
       cancelRun: (...args: Parameters<typeof actions.cancelRun>) =>
         act(async () => actions.cancelRun(...args)) as Promise<void>,
+      cancelRunRaw: actions.cancelRun,
+      replaceState: state => {
+        stateRef.current = state as never
+      },
       editMessage: (...args: Parameters<typeof actions.editMessage>) =>
         act(async () => actions.editMessage(...args)) as Promise<void>,
       reloadFromMessage: (...args: Parameters<typeof actions.reloadFromMessage>) =>
@@ -3583,10 +3600,153 @@ describe('usePromptActions sleep/wake session recovery', () => {
     expect(calls[2]?.params).toEqual({ session_id: RECOVERED_SESSION_ID })
   })
 
-  it('clears the active and cached turn clocks when stopping a turn', async () => {
+  it.each(['session.interrupt', 'session.redirect'])(
+    'routes primary %s through the stored session owner instead of the ambient gateway',
+    async method => {
+      setSessionOwnerHint(OWNER_STORED_SESSION_ID, { connectionId: 'owner-source', profile: 'worker' })
+      vi.mocked(requestGatewayForAgent).mockImplementation(
+        async (_connectionId, _profile, routedMethod) =>
+          (routedMethod === 'session.redirect' ? { status: 'redirected' } : { status: 'interrupted' }) as never
+      )
+      const requestGateway = vi.fn(async () => ({ status: 'redirected' }) as never)
+
+      let handle: HarnessHandle | null = null
+      await actRender(
+        <Harness
+          onReady={h => (handle = h)}
+          refreshSessions={async () => undefined}
+          requestGateway={requestGateway}
+          seedBusy
+          seedInterrupted={false}
+          selectedStoredSessionIdRef={{ current: OWNER_STORED_SESSION_ID }}
+          storedSessionId={OWNER_STORED_SESSION_ID}
+        />
+      )
+      await waitFor(() => expect(handle).not.toBeNull())
+
+      if (method === 'session.interrupt') {
+        await handle!.cancelRun()
+      } else {
+        await expect(handle!.redirectPrompt('owner-bound correction')).resolves.toBe(true)
+      }
+
+      expect(requestGatewayForAgent).toHaveBeenCalledWith(
+        'owner-source',
+        'worker',
+        method,
+        method === 'session.redirect'
+          ? { session_id: RUNTIME_SESSION_ID, text: 'owner-bound correction' }
+          : { session_id: RUNTIME_SESSION_ID },
+        undefined
+      )
+      expect(requestGateway).not.toHaveBeenCalledWith(method, expect.anything())
+    }
+  )
+
+  it('routes a stored local-profile owner even when another profile is active', async () => {
+    const previousProfile = $activeGatewayProfile.get()
+    $activeGatewayProfile.set('default')
+    setSessionOwnerHint(OWNER_LOCAL_PROFILE_STORED_SESSION_ID, { connectionId: 'local', profile: 'worker' })
+    vi.mocked(requestGatewayForAgent).mockResolvedValue({ status: 'redirected' } as never)
+    const requestGateway = vi.fn(async () => ({ status: 'redirected' }) as never)
+    let handle: HarnessHandle | null = null
+
+    try {
+      await actRender(
+        <Harness
+          onReady={h => (handle = h)}
+          refreshSessions={async () => undefined}
+          requestGateway={requestGateway}
+          seedBusy
+          seedInterrupted={false}
+          selectedStoredSessionIdRef={{ current: OWNER_LOCAL_PROFILE_STORED_SESSION_ID }}
+          storedSessionId={OWNER_LOCAL_PROFILE_STORED_SESSION_ID}
+        />
+      )
+      await waitFor(() => expect(handle).not.toBeNull())
+      await expect(handle!.redirectPrompt('local-owner correction')).resolves.toBe(true)
+
+      expect(requestGatewayForAgent).toHaveBeenCalledWith(
+        'local',
+        'worker',
+        'session.redirect',
+        { session_id: RUNTIME_SESSION_ID, text: 'local-owner correction' },
+        undefined
+      )
+      expect(requestGateway).not.toHaveBeenCalled()
+    } finally {
+      $activeGatewayProfile.set(previousProfile)
+      setSessionOwnerHint(OWNER_LOCAL_PROFILE_STORED_SESSION_ID, { connectionId: 'local', profile: 'default' })
+    }
+  })
+
+  it('fails closed rather than routing Stop or redirect through an ambiguous owner', async () => {
+    const storedId = 'same-stored-id-on-two-sources'
+    setSessionOwnerHint(storedId, { connectionId: 'source-a', profile: 'default' })
+    setSessionOwnerHint(storedId, { connectionId: 'source-b', profile: 'default' })
+    const requestGateway = vi.fn(async () => ({ status: 'redirected' }) as never)
+    vi.mocked(requestGatewayForAgent).mockClear()
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        seedBusy
+        seedInterrupted={false}
+        selectedStoredSessionIdRef={{ current: storedId }}
+        storedSessionId={storedId}
+      />
+    )
+    await handle!.cancelRun()
+    await expect(handle!.redirectPrompt('do not misroute')).rejects.toThrow('Session owner is ambiguous')
+    expect(requestGatewayForAgent).not.toHaveBeenCalled()
+    expect(requestGateway).not.toHaveBeenCalled()
+  })
+
+  it('keeps an ambiguous redirect out of the automatic queue fallback', async () => {
     const states: Record<string, unknown>[] = []
-    const requestGateway = vi.fn(async () => ({}) as never)
-    $turnStartedAt.set(1_700_000_000_000)
+    const failure = new GatewayDeliveryUnknownError('session.redirect', new Error('connection closed'))
+
+    const requestGateway = vi.fn(async () => {
+      throw failure
+    })
+
+    let handle: HarnessHandle | null = null
+
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        onSeedState={state => states.push(state)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        seedBusy
+        seedInterrupted={false}
+      />
+    )
+
+    await waitFor(() => expect(handle).not.toBeNull())
+    await expect(handle!.redirectPrompt('possibly delivered correction')).rejects.toBeInstanceOf(
+      GatewayDeliveryUnknownError
+    )
+    expect(requestGateway).toHaveBeenCalledTimes(1)
+    expect(
+      (states.at(-1)?.messages as { parts?: { text?: string }[] }[]).some(message =>
+        message.parts?.some(part => part.text === 'possibly delivered correction')
+      )
+    ).toBe(false)
+  })
+
+  it('keeps the turn clock running until the backend confirms Stop has settled', async () => {
+    const states: Record<string, unknown>[] = []
+    const requestGateway = vi.fn(async () => ({ status: 'interrupted' }) as never)
+    const startedAt = 1_700_000_000_000
+    $turnStartedAt.set(startedAt)
+    publishSessionState(RUNTIME_SESSION_ID, {
+      ...createClientSessionState(RUNTIME_SESSION_ID),
+      busy: true,
+      turnStartedAt: startedAt
+    })
 
     let handle: HarnessHandle | null = null
     await actRender(
@@ -3595,19 +3755,247 @@ describe('usePromptActions sleep/wake session recovery', () => {
         onSeedState={state => states.push(state)}
         refreshSessions={async () => undefined}
         requestGateway={requestGateway}
+        seedBusy
+        seedInterrupted={false}
+        seedTurnStartedAt={startedAt}
       />
     )
 
     await handle!.cancelRun()
 
-    expect($turnStartedAt.get()).toBeNull()
+    expect($turnStartedAt.get()).toBe(startedAt)
     expect(states.at(-1)).toMatchObject({
       awaitingResponse: false,
-      busy: false,
+      busy: true,
       interrupted: true,
-      turnStartedAt: null
+      interruptPending: false,
+      turnStartedAt: startedAt
     })
   })
+
+  it('keeps the live turn busy until interrupt acceptance and backend settlement', async () => {
+    const originalMessages = [
+      { id: 'assistant-live', parts: [textPart('partial answer')], role: 'assistant', timestamp: 1, pending: true }
+    ]
+
+    publishSessionState(RUNTIME_SESSION_ID, {
+      ...createClientSessionState(RUNTIME_SESSION_ID),
+      busy: true,
+      streamId: 'assistant-live'
+    })
+
+    let resolveInterrupt!: () => void
+    let lastState: Record<string, unknown> = { busy: true, interrupted: false, messages: originalMessages }
+    let handle: HarnessHandle | null = null
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.interrupt') {
+        await new Promise<void>(resolve => {
+          resolveInterrupt = resolve
+        })
+      }
+
+      return {} as never
+    })
+
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        onSeedState={state => (lastState = state)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        seedBusy
+        seedInterrupted={false}
+        seedMessages={originalMessages}
+        seedStreamId="assistant-live"
+      />
+    )
+
+    let stop!: Promise<void>
+    act(() => {
+      stop = handle!.cancelRunRaw()
+    })
+
+    expect(resolveInterrupt).toBeTypeOf('function')
+    expect(lastState).toMatchObject({ busy: true, interrupted: false, messages: originalMessages })
+
+    await act(async () => {
+      const finish = stop
+      resolveInterrupt()
+      await finish
+
+      // Acceptance finalizes partial output but busy is cleared only by the
+      // authoritative terminal event.
+      expect(lastState).toMatchObject({
+        busy: true,
+        interrupted: true,
+        messages: [expect.objectContaining({ pending: false })]
+      })
+    })
+  })
+
+  it('does not let a late Stop acknowledgement interrupt a newer turn', async () => {
+    const firstStartedAt = 1_700_000_000_000
+    const nextStartedAt = firstStartedAt + 10_000
+    publishSessionState(RUNTIME_SESSION_ID, {
+      ...createClientSessionState(STORED_SESSION_ID),
+      busy: true,
+      streamId: 'assistant-first',
+      turnStartedAt: firstStartedAt,
+      turnLive: true
+    })
+
+    let resolveInterrupt!: () => void
+    let lastState: Record<string, unknown> = {}
+    let handle: HarnessHandle | null = null
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.interrupt') {
+        await new Promise<void>(resolve => {
+          resolveInterrupt = resolve
+        })
+      }
+
+      return {} as never
+    })
+
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        onSeedState={state => (lastState = state)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        seedBusy
+        seedInterrupted={false}
+        seedStreamId="assistant-first"
+        seedTurnStartedAt={firstStartedAt}
+        storedSessionId={STORED_SESSION_ID}
+      />
+    )
+
+    let stop!: Promise<void>
+    act(() => {
+      stop = handle!.cancelRunRaw()
+    })
+
+    handle!.replaceState({
+      ...createClientSessionState(STORED_SESSION_ID),
+      busy: true,
+      streamId: 'assistant-next',
+      turnStartedAt: nextStartedAt,
+      turnLive: true
+    })
+
+    await act(async () => {
+      resolveInterrupt()
+      await stop
+    })
+
+    expect(lastState).toMatchObject({
+      busy: true,
+      interruptPending: false,
+      interrupted: false,
+      streamId: 'assistant-next',
+      turnStartedAt: nextStartedAt
+    })
+    dropSessionState(RUNTIME_SESSION_ID)
+  })
+
+  it('does not treat missing pre-start turn markers as a wildcard for a late Stop ACK', async () => {
+    publishSessionState(RUNTIME_SESSION_ID, {
+      ...createClientSessionState(STORED_SESSION_ID),
+      busy: true
+    })
+    let resolveInterrupt!: () => void
+    let lastState: Record<string, unknown> = {}
+    let handle: HarnessHandle | null = null
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.interrupt') {
+        await new Promise<void>(resolve => {
+          resolveInterrupt = resolve
+        })
+      }
+
+      return {} as never
+    })
+
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        onSeedState={state => (lastState = state)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        seedBusy
+        seedInterrupted={false}
+        storedSessionId={STORED_SESSION_ID}
+      />
+    )
+    let stop!: Promise<void>
+    act(() => {
+      stop = handle!.cancelRunRaw()
+    })
+    handle!.replaceState({
+      ...createClientSessionState(STORED_SESSION_ID),
+      busy: true,
+      streamId: 'new-turn',
+      turnStartedAt: 1_700_000_010_000
+    })
+    await act(async () => {
+      resolveInterrupt()
+      await stop
+    })
+    expect(lastState).toMatchObject({
+      busy: true,
+      interrupted: false,
+      interruptPending: false,
+      streamId: 'new-turn'
+    })
+    dropSessionState(RUNTIME_SESSION_ID)
+  })
+
+  it.each(['connection closed', 'compute-host interrupt failed'])(
+    'does not claim idle or finalize the transcript when Stop fails: %s',
+    async message => {
+      const originalMessages = [
+        { id: 'assistant-live', parts: [textPart('partial answer')], role: 'assistant', timestamp: 1, pending: true }
+      ]
+
+      let lastState: Record<string, unknown> = { busy: true, interrupted: false, messages: originalMessages }
+      let handle: HarnessHandle | null = null
+
+      const requestGateway = vi.fn(async () => {
+        throw new Error(message)
+      })
+
+      setApprovalRequest({
+        command: 'rm -rf /tmp/unsafe',
+        description: 'test pending approval',
+        requestId: 'approval-live-stop',
+        sessionId: RUNTIME_SESSION_ID
+      })
+
+      await actRender(
+        <Harness
+          onReady={h => (handle = h)}
+          onSeedState={state => (lastState = state)}
+          refreshSessions={async () => undefined}
+          requestGateway={requestGateway}
+          seedBusy
+          seedInterrupted={false}
+          seedMessages={originalMessages}
+        />
+      )
+
+      await waitFor(() => expect(handle).not.toBeNull())
+      await act(async () => handle!.cancelRunRaw())
+
+      expect(lastState).toMatchObject({ busy: true, interrupted: false, messages: originalMessages })
+      expect(hasBlockingPromptRequest(RUNTIME_SESSION_ID)).toBe(true)
+      expect(requestGateway).toHaveBeenCalledTimes(1)
+      clearAllPrompts(RUNTIME_SESSION_ID)
+    }
+  )
 
   it('surfaces the original error (no resume) when the failure is not "session not found"', async () => {
     const calls: string[] = []
@@ -3669,29 +4057,46 @@ describe('usePromptActions sleep/wake session recovery', () => {
     expect(calls).not.toContain('session.resume')
   })
 
-  it('recovers via session.resume when prompt.submit TIMES OUT and a stored session is selected (#55578)', async () => {
-    // A starved gateway loop rejects with "request timed out: prompt.submit".
-    // With a stored session selected, that must recover exactly like
-    // "session not found" — resume + retry — not surface an error that leaves
-    // activeSessionId null and lets the next send mint a new session.
+  it('does not replay prompt.submit after a timeout leaves delivery uncertain', async () => {
     const calls: { method: string; params?: Record<string, unknown> }[] = []
-    let submitAttempts = 0
+    const states: Record<string, unknown>[] = []
 
     const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
       calls.push({ method, params })
 
       if (method === 'prompt.submit') {
-        submitAttempts += 1
-
-        if (submitAttempts === 1) {
-          throw new Error('request timed out: prompt.submit')
-        }
-
-        return {} as never
+        throw new Error('request timed out: prompt.submit')
       }
 
-      if (method === 'session.resume') {
-        return { session_id: RECOVERED_SESSION_ID } as never
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        onSeedState={state => states.push(state)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        storedSessionId={STORED_SESSION_ID}
+      />
+    )
+
+    const ok = await handle!.submitText('message during starved loop')
+
+    expect(ok).toBe(false)
+    expect(calls.map(c => c.method)).toEqual(['prompt.submit'])
+    expect(states.at(-1)).toMatchObject({ busy: true, awaitingResponse: true })
+    expect((states.at(-1)?.messages as { error?: string }[]).some(message => Boolean(message.error))).toBe(false)
+  })
+
+  it('parks a queued prompt whose submit acknowledgement is lost', async () => {
+    const queued = enqueueQueuedPrompt(STORED_SESSION_ID, { text: 'queued correction', attachments: [] })
+    expect(queued).not.toBeNull()
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'prompt.submit') {
+        throw new Error('request timed out: prompt.submit')
       }
 
       return {} as never
@@ -3707,19 +4112,16 @@ describe('usePromptActions sleep/wake session recovery', () => {
       />
     )
 
-    const ok = await handle!.submitText('message during starved loop')
-
-    expect(ok).toBe(true)
-    expect(calls.map(c => c.method)).toEqual(['prompt.submit', 'session.resume', 'prompt.submit'])
-    expect(calls[1]?.params).toEqual({
-      session_id: STORED_SESSION_ID,
-      source: 'desktop',
-      omit_messages: true
-    })
-    expect(calls[2]?.params).toEqual({
-      session_id: RECOVERED_SESSION_ID,
-      text: 'message during starved loop'
-    })
+    expect(
+      await handle!.submitText('queued correction', {
+        fromQueue: true,
+        queueEntryId: queued!.id,
+        storedSessionId: STORED_SESSION_ID
+      })
+    ).toBe(false)
+    expect(isQueueParked(STORED_SESSION_ID)).toBe(true)
+    expect(getQueuedPrompts(STORED_SESSION_ID)[0]).toMatchObject({ id: queued!.id, deliveryUnknown: true })
+    expect(requestGateway).toHaveBeenCalledTimes(1)
   })
 
   it('resumes the SELECTED stored session instead of minting a new one when activeSessionId is null (#55578 split)', async () => {
@@ -4174,7 +4576,7 @@ describe('usePromptActions submit session-context isolation (#54527)', () => {
     expect(calls.some(c => c.method === 'prompt.submit')).toBe(true)
   })
 
-  it('aborts recovery submit when the user switches sessions during timeout resume', async () => {
+  it('aborts recovery submit when the user switches sessions during explicit stale-session resume', async () => {
     const calls: { method: string; params?: Record<string, unknown> }[] = []
     let submitAttempts = 0
 
@@ -4189,7 +4591,7 @@ describe('usePromptActions submit session-context isolation (#54527)', () => {
         submitAttempts += 1
 
         if (submitAttempts === 1) {
-          throw new Error('request timed out: prompt.submit')
+          throw new Error('session not found')
         }
       }
 

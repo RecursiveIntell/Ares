@@ -1,6 +1,7 @@
 import { act, cleanup, renderHook, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { GatewayDeliveryUnknownError } from '@/lib/gateway-delivery'
 import {
   $parkedQueueSessions,
   $queuedPromptsBySession,
@@ -161,6 +162,52 @@ describe('useComposerQueue park integration', () => {
     hook.rerender({ busy: false })
     await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
     expect(onSubmit.mock.calls[0]?.[0]).toBe('kept on reject')
+  })
+
+  it('parks an uncertain queued steer instead of auto-draining a possible duplicate', async () => {
+    const entry = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'possibly already delivered' })
+
+    const onSteer = vi.fn(async () => {
+      throw new GatewayDeliveryUnknownError('session.redirect', new Error('connection closed'))
+    })
+
+    const { hook, onSubmit } = renderQueueHook({ busy: true, onSteer })
+
+    await act(async () => {
+      await expect(hook.result.current.steerQueuedNow(entry!.id)).resolves.toBe(false)
+    })
+
+    expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(1)
+    expect(isQueueParked(SESSION_KEY)).toBe(true)
+    expect(getQueuedPrompts(SESSION_KEY)[0]?.deliveryUnknown).toBe(true)
+    $parkedQueueSessions.set({}) // process restart loses only the ephemeral park
+    hook.rerender({ busy: false })
+    await act(async () => {
+      await Promise.resolve()
+    })
+    expect(onSubmit).not.toHaveBeenCalled()
+  })
+
+  it('coalesces rapid queued Steer clicks while its first delivery is unresolved', async () => {
+    const entry = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'redirect once' })!
+    let resolve!: (value: boolean) => void
+    const onSteer = vi.fn(
+      () =>
+        new Promise<boolean>(r => {
+          resolve = r
+        })
+    )
+    const { hook } = renderQueueHook({ busy: true, onSteer })
+
+    let first!: Promise<boolean>
+    await act(async () => {
+      first = hook.result.current.steerQueuedNow(entry.id)
+      expect(await hook.result.current.steerQueuedNow(entry.id)).toBe(false)
+      expect(onSteer).toHaveBeenCalledTimes(1)
+      resolve(true)
+      expect(await first).toBe(true)
+    })
+    expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(0)
   })
 
   it('steerQueuedNow refuses unsteerable entries (slash commands execute, never steer)', async () => {

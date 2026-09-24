@@ -16,7 +16,9 @@ const state: ChatBarState = {
   voice: { active: false, enabled: false }
 }
 
-function renderControls(overrides: Partial<React.ComponentProps<typeof ComposerControls>> = {}) {
+function renderControls(
+  overrides: Partial<React.ComponentProps<typeof ComposerControls>> & { onStop?: () => void } = {}
+) {
   return render(
     <I18nProvider configClient={null} initialLocale="en">
       <ComposerControls
@@ -154,6 +156,29 @@ describe('ComposerControls shortcut tooltips', () => {
     renderControls({ busy: true, busyAction: 'queue' })
 
     await expectShortcutTooltip('Queue message', 'Ctrl+↵')
+  })
+
+  it('keeps Send and separately exposes a keyboard-reachable Stop while a draft is present', () => {
+    const onStop = vi.fn()
+    renderControls({ busy: true, busyAction: 'steer', hasComposerPayload: true, minimal: true, onStop })
+
+    const stop = screen.getByRole('button', { name: 'Stop' })
+
+    expect(screen.getByRole('button', { name: 'Send' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Queue message' })).toBeNull()
+    fireEvent.click(stop)
+    expect(onStop).toHaveBeenCalledOnce()
+  })
+
+  it('keeps the draft and prevents duplicate sends while Stop is pending', () => {
+    renderControls({ busy: true, busyAction: 'steer', hasComposerPayload: true, interruptPending: true, onStop: vi.fn() })
+
+    const stop = screen.getByRole('button', { name: 'Stop' })
+    const send = screen.getByRole('button', { name: 'Send' })
+
+    expect(stop.getAttribute('aria-busy')).toBe('true')
+    expect(stop.hasAttribute('disabled')).toBe(true)
+    expect(send.hasAttribute('disabled')).toBe(true)
   })
 })
 

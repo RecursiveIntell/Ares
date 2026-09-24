@@ -7,7 +7,11 @@ import { MAIN_COMPOSER_SCOPE } from './composer/scope'
 const requestGatewayMock = vi.hoisted(() => vi.fn())
 
 const { $activeSessionId, $sessions, setSessions } = await import('@/store/session')
-const { $sessionTiles, setSessionTileDelegate } = await import('@/store/session-states')
+const { createClientSessionState } = await import('@/lib/chat-runtime')
+
+const { $sessionTiles, clearAllSessionStates, publishSessionState, setSessionTileDelegate } =
+  await import('@/store/session-states')
+
 const { listTileSessionRow, useSessionTileActions } = await import('./session-tile-actions')
 
 const RUNTIME_SESSION_ID = 'rt-tile-current'
@@ -92,8 +96,122 @@ describe('useSessionTileActions sleep/wake session recovery', () => {
     $activeSessionId.set(null)
     setSessions([])
     $sessionTiles.set([])
+    clearAllSessionStates()
     requestGatewayMock.mockReset()
     vi.restoreAllMocks()
+  })
+
+  it.each(['source-a', 'source-b'])(
+    'does not route an owner-less tile through the first colliding row (%s first)',
+    async first => {
+      const second = first === 'source-a' ? 'source-b' : 'source-a'
+      setSessions([
+        { id: STORED_SESSION_ID, profile: 'default', connection_id: first },
+        { id: STORED_SESSION_ID, profile: 'default', connection_id: second }
+      ] as never)
+      requestGatewayMock.mockResolvedValue({ status: 'interrupted' })
+      const { result } = renderTileActions()
+      await act(async () => result.current.cancelRun())
+      expect(requestGatewayMock).not.toHaveBeenCalled()
+    }
+  )
+
+  it('keeps the tile live and preserves partial output when interrupt is rejected', async () => {
+    const originalMessages = [
+      {
+        id: 'assistant-live',
+        parts: [{ type: 'text', text: 'partial answer' }],
+        role: 'assistant',
+        timestamp: 1,
+        pending: true
+      }
+    ]
+
+    let state: Record<string, unknown> = {
+      attachedImages: [],
+      busy: true,
+      cwd: null,
+      interrupted: false,
+      messages: originalMessages,
+      model: null,
+      streamId: 'assistant-live',
+      storedSessionId: STORED_SESSION_ID
+    }
+
+    setSessionTileDelegate({
+      archiveSession: vi.fn(async () => undefined),
+      branchSession: vi.fn(async () => undefined),
+      deleteSession: vi.fn(async () => undefined),
+      executeSlash: vi.fn(async () => undefined),
+      interruptSession: vi.fn(async () => undefined),
+      resumeTile: vi.fn(async () => RUNTIME_SESSION_ID),
+      submitToSession: vi.fn(async () => undefined),
+      updateSession: vi.fn((_runtimeId, updater) => {
+        state = updater(state as never) as unknown as Record<string, unknown>
+
+        return state as never
+      })
+    })
+    requestGatewayMock.mockRejectedValueOnce(new Error('connection closed'))
+
+    const { result } = renderTileActions()
+    await act(async () => result.current.cancelRun())
+
+    expect(state).toMatchObject({ busy: true, interrupted: false, messages: originalMessages })
+    expect(requestGatewayMock).toHaveBeenCalledWith('session.interrupt', { session_id: RUNTIME_SESSION_ID })
+  })
+
+  it('finalizes the tile partial only after interrupt acknowledgement and keeps it busy until settle', async () => {
+    publishSessionState(RUNTIME_SESSION_ID, {
+      ...createClientSessionState(STORED_SESSION_ID),
+      busy: true,
+      streamId: 'assistant-live'
+    })
+
+    let state: Record<string, unknown> = {
+      attachedImages: [],
+      busy: true,
+      cwd: null,
+      interrupted: false,
+      messages: [
+        {
+          id: 'assistant-live',
+          parts: [{ type: 'text', text: 'partial answer' }],
+          role: 'assistant',
+          timestamp: 1,
+          pending: true
+        }
+      ],
+      model: null,
+      streamId: 'assistant-live',
+      storedSessionId: STORED_SESSION_ID
+    }
+
+    setSessionTileDelegate({
+      archiveSession: vi.fn(async () => undefined),
+      branchSession: vi.fn(async () => undefined),
+      deleteSession: vi.fn(async () => undefined),
+      executeSlash: vi.fn(async () => undefined),
+      interruptSession: vi.fn(async () => undefined),
+      resumeTile: vi.fn(async () => RUNTIME_SESSION_ID),
+      submitToSession: vi.fn(async () => undefined),
+      updateSession: vi.fn((_runtimeId, updater) => {
+        state = updater(state as never) as unknown as Record<string, unknown>
+
+        return state as never
+      })
+    })
+    requestGatewayMock.mockResolvedValueOnce({ status: 'interrupted' })
+
+    const { result } = renderTileActions()
+    await act(async () => result.current.cancelRun())
+
+    expect(state).toMatchObject({
+      busy: true,
+      interrupted: true,
+      interruptPending: false,
+      messages: [expect.objectContaining({ pending: false })]
+    })
   })
 
   it('resumes the stored session and retries once when session.interrupt reports "session not found"', async () => {

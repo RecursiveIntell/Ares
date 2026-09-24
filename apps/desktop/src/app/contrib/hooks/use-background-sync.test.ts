@@ -14,6 +14,7 @@ import {
 } from '@/store/session'
 import {
   $attentionSessionIds,
+  $sessionStates,
   $stalledSessionIds,
   $workingSessionIds,
   clearAllSessionStates,
@@ -682,17 +683,35 @@ describe('rehydrateLiveSessionStatuses', () => {
     expect($stalledSessionIds.get()).toEqual([])
   })
 
-  it('ignores idle, starting, and malformed live-session rows', () => {
+  it('keeps idle and malformed live-session rows out of the running projection', () => {
     rehydrateLiveSessionStatuses({
       sessions: [
         { id: 'runtime-idle', session_key: 'idle-session', status: 'idle' },
-        { id: 'runtime-starting', session_key: 'starting-session', status: 'starting' },
         { id: 'runtime-malformed', status: 'working' }
       ]
     })
 
     expect($workingSessionIds.get()).toEqual([])
     expect($attentionSessionIds.get()).toEqual([])
+    expect($stalledSessionIds.get()).toEqual([])
+  })
+
+  it('keeps a submitted turn in deferred agent construction busy', () => {
+    $sessionStates.set({
+      'runtime-starting': {
+        ...createClientSessionState('starting-session'),
+        awaitingResponse: true,
+        busy: true,
+        sawAssistantPayload: false
+      }
+    })
+
+    rehydrateLiveSessionStatuses({
+      sessions: [{ id: 'runtime-starting', session_key: 'starting-session', status: 'starting' }]
+    })
+
+    expect($workingSessionIds.get()).toEqual(['starting-session'])
+    expect($sessionStates.get()['runtime-starting']?.busy).toBe(true)
     expect($stalledSessionIds.get()).toEqual([])
   })
 })

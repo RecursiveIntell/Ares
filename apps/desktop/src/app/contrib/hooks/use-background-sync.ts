@@ -365,13 +365,19 @@ export function rehydrateLiveSessionStatuses(
 
     const existing = $sessionStates.get()[runtimeSessionId]
 
+    // `starting` may be an incidental lazy build, not a user turn. Preserve it
+    // as busy only when this renderer already knows a prompt/turn is active;
+    // otherwise merely opening a session would show a false running spinner.
+    const startingTurn =
+      session.status === 'starting' && Boolean(existing?.busy || existing?.awaitingResponse)
+
     // A turn we just submitted is not yet running as far as the backend is
     // concerned, so the snapshot honestly reports it idle — but the local
     // stream is already waiting on its first token, and it is the newer
     // information. The stream path refuses to clear busy in exactly this window
     // (`awaitingResponse && !sawAssistantPayload`); without the same refusal
     // here a poll lands between submit and first token and darkens the row.
-    const busy = working || Boolean(existing?.awaitingResponse && !existing.sawAssistantPayload)
+    const busy = working || startingTurn || Boolean(existing?.awaitingResponse && !existing.sawAssistantPayload)
 
     // Avoid re-arming the watchdog on every poll. Publish only when the
     // authoritative live snapshot differs from the renderer mirror; normal
@@ -385,6 +391,7 @@ export function rehydrateLiveSessionStatuses(
       publishSessionState(runtimeSessionId, {
         ...(existing ?? createClientSessionState(storedSessionId)),
         busy,
+        interruptPending: working || startingTurn ? Boolean(existing?.interruptPending) : false,
         needsInput,
         storedSessionId
       })
