@@ -25,7 +25,6 @@ import { pushSnapshot } from './spawnHistoryStore.js'
 import { archiveDoneTodos, getTurnState, patchTurnState, resetTurnState } from './turnStore.js'
 import { getUiState, patchUiState } from './uiStore.js'
 
-const INTERRUPT_COOLDOWN_MS = 1500
 const ACTIVITY_LIMIT = 8
 const TRAIL_LIMIT = 8
 
@@ -133,6 +132,9 @@ class TurnController {
   private streamTimer: Timer = null
   private streamDelay = STREAM_IDLE_BATCH_MS
   private toolProgressTimer: Timer = null
+  private turnEpoch = 0
+  private interruptPending = false
+  private messageStarted = false
 
   // ── Credits notice machinery (Strategy B) ───────────────────────────
   //
@@ -277,7 +279,7 @@ class TurnController {
     patchTurnState({ reasoningActive: false, reasoningStreaming: false })
   }
 
-  idle() {
+  idle({ keepBusy = false }: { keepBusy?: boolean } = {}) {
     this.endReasoningPhase()
     this.activeTools = []
     this.streamTimer = clear(this.streamTimer)
@@ -293,7 +295,11 @@ class TurnController {
       tools: [],
       turnTrail: []
     })
-    patchUiState({ busy: false })
+
+    if (!keepBusy) {
+      patchUiState({ busy: false })
+    }
+
     resetFlowOverlays()
   }
 
@@ -302,9 +308,40 @@ class TurnController {
   // while `interrupted`) instead of racing the still-unwinding turn — the race
   // duplicated the user bubble, leaked a "queued: …" note, and surfaced the
   // cancelled turn's "[interrupted]" reply.
-  interruptTurn({ appendMessage, gw, sid, sys }: InterruptDeps, opts: { keepBusy?: boolean } = {}) {
+  async interruptTurn({ appendMessage, gw, sid, sys }: InterruptDeps, _opts: { keepBusy?: boolean } = {}) {
+    if (this.interruptPending || !getUiState().busy) {
+      return
+    }
+
+    this.interruptPending = true
+    const epoch = this.turnEpoch
+    patchUiState({ status: 'interrupting…' })
+
+    try {
+      const response = await gw.request<SessionInterruptResponse>('session.interrupt', { session_id: sid })
+
+      if (response?.status !== 'interrupted') {
+        throw new Error('gateway did not confirm interruption')
+      }
+    } catch (error) {
+      if (epoch === this.turnEpoch && getUiState().sid === sid && getUiState().busy) {
+        const detail = error instanceof Error ? error.message : String(error)
+        sys(`Stop was not confirmed: ${detail}`)
+        patchUiState({ status: 'Stop failed — still running' })
+      }
+
+      return
+    } finally {
+      if (epoch === this.turnEpoch) {
+        this.interruptPending = false
+      }
+    }
+
+    if (epoch !== this.turnEpoch || getUiState().sid !== sid || !getUiState().busy) {
+      return
+    }
+
     this.interrupted = true
-    gw.request<SessionInterruptResponse>('session.interrupt', { session_id: sid }).catch(() => {})
 
     this.closeReasoningSegment()
 
@@ -313,9 +350,8 @@ class TurnController {
     const tools = this.pendingSegmentTools
 
     // Drain streaming/segment state off the nanostore before writing the
-    // preserved snapshot to the transcript — otherwise each flushed segment
-    // appears in both `turn.streamSegments` and the transcript for one frame.
-    this.idle()
+    // preserved snapshot, without announcing idle before backend settlement.
+    this.idle({ keepBusy: true })
     this.clearReasoning()
     this.turnTools = []
     patchTurnState({ activity: [], outcome: '' })
@@ -340,22 +376,9 @@ class TurnController {
 
     this.clearStatusTimer()
 
-    if (opts.keepBusy) {
-      // `idle()` already cleared busy; re-assert it so the drain waits for settle.
-      patchUiState({ busy: true, status: 'interrupting…' })
-
-      return
-    }
-
-    patchUiState({ status: 'interrupted' })
-
-    this.statusTimer = setTimeout(() => {
-      this.statusTimer = null
-      patchUiState({ status: 'ready' })
-    }, INTERRUPT_COOLDOWN_MS)
-
-    // Real turn end: surface any notice held back while busy.
-    this.flushPendingNotice()
+    // An ACK accepts Stop but does not settle the turn. message.complete/error
+    // owns the busy→idle transition for both plain Stop and force-send.
+    patchUiState({ busy: true, status: 'interrupting…' })
   }
 
   pruneTransient() {
@@ -552,6 +575,9 @@ class TurnController {
   }
 
   recordError() {
+    this.turnEpoch++
+    this.interruptPending = false
+    this.messageStarted = false
     this.idle()
     this.clearReasoning()
     this.clearStatusTimer()
@@ -570,6 +596,9 @@ class TurnController {
     response_previewed?: boolean
     text?: string
   }) {
+    this.turnEpoch++
+    this.interruptPending = false
+    this.messageStarted = false
     this.closeReasoningSegment()
 
     // Ink renders markdown via <Md>; the gateway's Rich-rendered ANSI
@@ -925,6 +954,9 @@ class TurnController {
   }
 
   reset() {
+    this.turnEpoch++
+    this.interruptPending = false
+    this.messageStarted = false
     this.clearReasoning()
     this.clearStatusTimer()
     this.idle()
@@ -987,6 +1019,14 @@ class TurnController {
   }
 
   startMessage() {
+    // The first start can arrive after a pre-start Stop request; it is still
+    // the same turn. A second start before settlement is a successor.
+    if (this.messageStarted) {
+      this.turnEpoch++
+      this.interruptPending = false
+    }
+
+    this.messageStarted = true
     this.endReasoningPhase()
     this.clearReasoning()
     this.activeTools = []
