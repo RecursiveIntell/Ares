@@ -15,6 +15,7 @@ import type { ClientSessionState } from '@/app/types'
 import { useI18n } from '@/i18n'
 import { textPart } from '@/lib/chat-messages'
 import { SLASH_COMMAND_RE } from '@/lib/chat-runtime'
+import { gatewayDeliveryUnknownError } from '@/lib/gateway-delivery'
 import { triggerHaptic } from '@/lib/haptics'
 import { clearClarifyRequest } from '@/store/clarify'
 import type { ComposerAttachment } from '@/store/composer'
@@ -22,7 +23,13 @@ import { resetSessionBackground } from '@/store/composer-status'
 import { notifyError } from '@/store/notifications'
 import { clearPreviewArtifacts } from '@/store/preview-status'
 import { clearAllPrompts } from '@/store/prompts'
-import { $sessions, knownSessionOwner, ownerLookupSessionRows, sessionMatchesStoredId } from '@/store/session'
+import {
+  $sessions,
+  getSessionOwnerHints,
+  knownSessionOwner,
+  ownerLookupSessionRows,
+  sessionMatchesStoredId
+} from '@/store/session'
 import {
   requestForSessionProfile,
   type SessionOwnerScope,
@@ -176,16 +183,43 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
   // Tile session RPCs must follow the tile's composite owner even when the
   // active gateway has moved to a same-named profile on another source.
   const requestSessionGateway = useCallback(
-    <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number, signal?: AbortSignal) => {
+    async <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number, signal?: AbortSignal) => {
+      const storedId = storedIdRef.current
+      const tileRoute = sessionTileOwnerRoute(storedId)
+      const rows = ownerLookupSessionRows()
+
+      const routes = new Map(
+        [
+          ...getSessionOwnerHints(storedId),
+          ...rows
+            .filter(row => sessionMatchesStoredId(row, storedId) && row.connection_id)
+            .map(row => ({ connectionId: row.connection_id!.trim(), profile: row.profile?.trim() || 'default' }))
+        ].map(route => [`${route.connectionId}\u0000${route.profile}`, route])
+      )
+
+      if (!tileRoute && routes.size > 1) {
+        throw new Error('Session owner is ambiguous; select the exact source before sending a live control')
+      }
+
       const knownOwner: SessionOwnerScope =
-        sessionTileOwnerRoute(storedIdRef.current) ?? knownSessionOwner(ownerLookupSessionRows(), storedIdRef.current)
+        tileRoute ?? (routes.size === 1 ? [...routes.values()][0] : knownSessionOwner(rows, storedId))
 
       // A bare profile is the legacy/unknown tile shape. Preserve its ambient
       // behavior; only a composite route is strong enough to retarget a tile
       // across same-named sources.
       const owner: SessionOwnerScope = knownOwner && typeof knownOwner === 'object' ? knownOwner : undefined
 
-      return requestForSessionProfile<T>(owner, requestGateway, method, params ?? {}, timeoutMs, signal)
+      try {
+        return await requestForSessionProfile<T>(owner, requestGateway, method, params ?? {}, timeoutMs, signal)
+      } catch (error) {
+        const unknown = gatewayDeliveryUnknownError(method, error)
+
+        if (unknown) {
+          throw unknown
+        }
+
+        throw error
+      }
     },
     [requestGateway]
   )
@@ -326,42 +360,86 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
 
   const cancelRun = useCallback(async () => {
     const sessionId = runtimeIdRef.current
+    const turnAtStop = readState()
 
-    // Frontend busy clears immediately; gateway wind-down can lag (#83855).
-    markSessionRecentlyInterrupted(sessionId)
+    if (!sessionId || turnAtStop?.interruptPending) {
+      return
+    }
 
-    update(state => ({
-      ...state,
-      messages: finalizeInterruptedMessages(state.messages, state.streamId),
-      busy: false,
-      awaitingResponse: false,
-      streamId: null,
-      pendingBranchGroup: null,
-      needsInput: false,
-      interrupted: true
-    }))
-
-    clearSessionTodos(sessionId)
-    clearSessionSubagents(sessionId)
-    resetSessionBackground(sessionId)
-    setSessionDraftingTool(sessionId, '')
-    clearAllPrompts(sessionId)
-    clearClarifyRequest(undefined, sessionId)
+    update(state => ({ ...state, interruptPending: true }))
+    let interruptedSessionId = sessionId
 
     try {
-      await withSessionNotFoundResume(
+      const recovered = await withSessionNotFoundResume(
         sessionId,
         storedIdRef.current,
         liveId => requestSessionGateway('session.interrupt', { session_id: liveId }),
         {
           requestGateway: requestSessionGateway,
-          onRecovered: bindRecoveredRuntime
+          onRecovered: recoveredId => {
+            interruptedSessionId = recoveredId
+            bindRecoveredRuntime(recoveredId)
+            sessionTileDelegate()?.updateSession(sessionId, state => ({ ...state, interruptPending: false }))
+            sessionTileDelegate()?.updateSession(recoveredId, state => ({ ...state, interruptPending: true }))
+          }
         }
       )
+
+      interruptedSessionId = recovered.sessionId
+
+      let acceptedForCurrentTurn = false
+
+      const acceptedState = sessionTileDelegate()?.updateSession(interruptedSessionId, state => {
+        const sameTurn = Boolean(
+          (turnAtStop?.turnStartedAt != null || turnAtStop?.streamId) &&
+          (turnAtStop?.turnStartedAt == null || state.turnStartedAt === turnAtStop.turnStartedAt) &&
+          (!turnAtStop?.streamId || state.streamId === turnAtStop.streamId)
+        )
+
+        acceptedForCurrentTurn = sameTurn && (state.busy || state.awaitingResponse || state.reconnecting)
+
+        return {
+          ...state,
+          interruptPending: false,
+          // The interrupt RPC acknowledges a request, not turn settlement. Keep
+          // busy and the transcript intact until the backend's terminal event.
+          ...(acceptedForCurrentTurn
+            ? {
+                interrupted: true,
+                messages: finalizeInterruptedMessages(state.messages, state.streamId),
+                needsInput: false,
+                pendingBranchGroup: null
+              }
+            : {})
+        }
+      })
+
+      if (acceptedForCurrentTurn) {
+        markSessionRecentlyInterrupted(interruptedSessionId)
+        clearSessionTodos(interruptedSessionId)
+        clearSessionSubagents(interruptedSessionId)
+        resetSessionBackground(interruptedSessionId)
+        setSessionDraftingTool(interruptedSessionId, '')
+      }
+
+      if (
+        acceptedForCurrentTurn ||
+        !(acceptedState?.busy || acceptedState?.awaitingResponse || acceptedState?.reconnecting)
+      ) {
+        clearAllPrompts(interruptedSessionId)
+        clearClarifyRequest(undefined, interruptedSessionId)
+      }
     } catch (err) {
-      notifyError(err, copy.stopFailed)
+      sessionTileDelegate()?.updateSession(interruptedSessionId, state =>
+        state.interruptPending ? { ...state, interruptPending: false } : state
+      )
+      const current = $sessionStates.get()[interruptedSessionId]
+
+      if (current?.busy || current?.reconnecting || !current) {
+        notifyError(err, copy.stopFailed)
+      }
     }
-  }, [bindRecoveredRuntime, copy.stopFailed, requestSessionGateway, update])
+  }, [bindRecoveredRuntime, copy.stopFailed, readState, requestSessionGateway, update])
 
   const steerPrompt = useCallback(
     async (rawText: string): Promise<boolean> => {
@@ -430,9 +508,17 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
 
           return true
         }
-      } catch {
+      } catch (err) {
         discardOptimisticMessage()
-        // Swallow — the caller queues the text so nothing is lost.
+        const unknown = gatewayDeliveryUnknownError('session.redirect', err)
+
+        if (unknown) {
+          notifyError(unknown, copy.promptFailed)
+
+          throw unknown
+        }
+
+        // Explicit rejection/settle race is safe to queue for the next turn.
 
         return false
       }
@@ -441,7 +527,7 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
 
       return false
     },
-    [bindRecoveredRuntime, requestSessionGateway]
+    [bindRecoveredRuntime, copy.promptFailed, requestSessionGateway]
   )
 
   // Rewind primitive (interrupt-first for live turns, busy-retry) — shared with

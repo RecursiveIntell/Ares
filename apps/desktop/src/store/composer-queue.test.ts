@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ComposerAttachment } from './composer'
 import {
@@ -9,6 +9,7 @@ import {
   enqueueQueuedPrompt,
   getQueuedPrompts,
   isQueueParked,
+  markQueuedPromptDeliveryUnknown,
   migrateQueuedPrompts,
   parkQueuedPrompts,
   promoteQueuedPrompt,
@@ -258,5 +259,27 @@ describe('parked queue sessions', () => {
     migrateQueuedPrompts('rt-old', 'rt-new')
 
     expect(isQueueParked('rt-new')).toBe(false)
+  })
+
+  it('retains uncertain delivery on the exact entry through a module reload', async () => {
+    const entry = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'possibly accepted' })!
+    expect(markQueuedPromptDeliveryUnknown(SESSION_KEY, entry.id)).toBe(true)
+    expect(JSON.parse(window.localStorage.getItem(QUEUE_STORAGE_KEY)!)?.[SESSION_KEY]?.[0]).toMatchObject({
+      id: entry.id,
+      deliveryUnknown: true
+    })
+
+    vi.resetModules()
+    const restored = await import('./composer-queue')
+    const entries = restored.getQueuedPrompts(SESSION_KEY)
+    expect(entries).toHaveLength(1)
+    expect(entries[0]).toMatchObject({ id: entry.id, deliveryUnknown: true })
+    expect(
+      restored.shouldAutoDrain({
+        isBusy: false,
+        parked: entries.some(e => e.deliveryUnknown),
+        queueLength: entries.length
+      })
+    ).toBe(false)
   })
 })

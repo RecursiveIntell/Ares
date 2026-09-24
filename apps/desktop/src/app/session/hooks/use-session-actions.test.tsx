@@ -1368,6 +1368,7 @@ describe('resumeSession failure recovery', () => {
             fast: false,
             interimBoundaryPending: false,
             interrupted: false,
+            interruptPending: false,
             messages: [],
             adoptedRunningTurn: false,
             model: '',

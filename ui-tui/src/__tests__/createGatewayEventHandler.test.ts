@@ -1397,7 +1397,7 @@ describe('createGatewayEventHandler', () => {
     expect(getTurnState().activity.filter(a => a.text.includes('/agents'))).toHaveLength(0)
   })
 
-  it('drops stale reasoning/tool/todos events after ctrl-c until the next message starts', () => {
+  it('drops stale reasoning/tool/todos events after ctrl-c acceptance until the next message starts', async () => {
     // Repro for the discord report: ctrl-c interrupts, but late reasoning/tool
     // events from the still-winding-down agent loop kept populating the UI for
     // ~1s, making it look like the interrupt had been ignored.
@@ -1429,7 +1429,7 @@ describe('createGatewayEventHandler', () => {
       // Pre-interrupt todos should land in turn state.
       expect(getTurnState().todos).toEqual([{ content: 'pre-interrupt', id: 'todo-1', status: 'pending' }])
 
-      turnController.interruptTurn({
+      await turnController.interruptTurn({
         appendMessage: (msg: Msg) => appended.push(msg),
         gw: ctx.gateway.gw,
         sid: 'sess-1',
@@ -1478,7 +1478,110 @@ describe('createGatewayEventHandler', () => {
     }
   })
 
-  it('keepBusy interrupt holds busy until the gateway settles and suppresses the cancelled turn’s final_response', () => {
+  it('preserves a live turn and reports failure when TUI Stop is rejected', async () => {
+    const appended: Msg[] = []
+    const ctx = buildCtx(appended)
+    ctx.gateway.gw.request = vi.fn(async () => {
+      throw new Error('compute host unavailable')
+    })
+    const onEvent = createGatewayEventHandler(ctx)
+    patchUiState({ sid: 'sess-1' })
+    onEvent({ payload: {}, type: 'message.start' } as any)
+    onEvent({ payload: { text: 'still responding' }, type: 'message.delta' } as any)
+    const before = turnController.bufRef
+
+    await turnController.interruptTurn({
+      appendMessage: (msg: Msg) => appended.push(msg),
+      gw: ctx.gateway.gw,
+      sid: 'sess-1',
+      sys: ctx.system.sys
+    })
+
+    expect(getUiState().busy).toBe(true)
+    expect(turnController.interrupted).toBe(false)
+    expect(turnController.bufRef).toBe(before)
+    expect(getUiState().status).toContain('Stop failed')
+    onEvent({ payload: { text: ' more' }, type: 'message.delta' } as any)
+    expect(turnController.bufRef).toContain(' more')
+  })
+
+  it('keeps the TUI turn live when the interrupt RPC resolves without acceptance', async () => {
+    const ctx = buildCtx([])
+    ctx.gateway.gw.request = vi.fn(async () => ({ status: 'rejected' })) as any
+    const onEvent = createGatewayEventHandler(ctx)
+    patchUiState({ sid: 'sess-1' })
+    onEvent({ payload: {}, type: 'message.start' } as any)
+
+    await turnController.interruptTurn({
+      appendMessage: vi.fn(),
+      gw: ctx.gateway.gw,
+      sid: 'sess-1',
+      sys: ctx.system.sys
+    })
+
+    expect(getUiState().busy).toBe(true)
+    expect(turnController.interrupted).toBe(false)
+    expect(getUiState().status).toContain('Stop failed')
+  })
+
+  it('ignores a late Stop acknowledgement after the old turn settles and a new turn starts', async () => {
+    const ctx = buildCtx([])
+    let resolve!: (value: unknown) => void
+    ctx.gateway.gw.request = vi.fn(
+      () =>
+        new Promise(r => {
+          resolve = r
+        })
+    ) as any
+    const onEvent = createGatewayEventHandler(ctx)
+    patchUiState({ sid: 'sess-1' })
+    onEvent({ payload: {}, type: 'message.start' } as any)
+
+    const stop = turnController.interruptTurn({
+      appendMessage: vi.fn(),
+      gw: ctx.gateway.gw,
+      sid: 'sess-1',
+      sys: ctx.system.sys
+    })
+
+    onEvent({ payload: { text: 'old turn done' }, type: 'message.complete' } as any)
+    onEvent({ payload: {}, type: 'message.start' } as any)
+    resolve({ status: 'interrupted' })
+    await stop
+
+    expect(getUiState().busy).toBe(true)
+    expect(turnController.interrupted).toBe(false)
+    onEvent({ payload: { text: 'new turn output' }, type: 'message.delta' } as any)
+    expect(turnController.bufRef).toContain('new turn output')
+  })
+
+  it('does not let an old Stop release a newer turn’s pending interrupt latch', async () => {
+    const ctx = buildCtx([])
+    const resolves: Array<(value: unknown) => void> = []
+    ctx.gateway.gw.request = vi.fn(
+      () =>
+        new Promise(r => {
+          resolves.push(r)
+        })
+    ) as any
+    const onEvent = createGatewayEventHandler(ctx)
+    patchUiState({ sid: 'sess-1' })
+    onEvent({ payload: {}, type: 'message.start' } as any)
+    const deps = { appendMessage: vi.fn(), gw: ctx.gateway.gw, sid: 'sess-1', sys: ctx.system.sys }
+    const oldStop = turnController.interruptTurn(deps)
+    onEvent({ payload: { text: 'old done' }, type: 'message.complete' } as any)
+    onEvent({ payload: {}, type: 'message.start' } as any)
+    const newStop = turnController.interruptTurn(deps)
+    resolves[0]!({ status: 'interrupted' })
+    await oldStop
+    await turnController.interruptTurn(deps)
+    expect(ctx.gateway.gw.request).toHaveBeenCalledTimes(2)
+    resolves[1]!({ status: 'interrupted' })
+    await newStop
+    expect(turnController.interrupted).toBe(true)
+  })
+
+  it('keepBusy interrupt holds busy until the gateway settles and suppresses the cancelled turn’s final_response', async () => {
     // Force-send: interrupt holds busy so the drain waits for the real settle
     // instead of racing it (the race duplicated the bubble, leaked a "queued: …"
     // note, and surfaced the cancelled turn's "Operation interrupted…" reply).
@@ -1492,7 +1595,7 @@ describe('createGatewayEventHandler', () => {
     onEvent({ payload: { text: 'thinking…' }, type: 'reasoning.delta' } as any)
     expect(getUiState().busy).toBe(true)
 
-    turnController.interruptTurn(
+    await turnController.interruptTurn(
       { appendMessage: (msg: Msg) => appended.push(msg), gw: ctx.gateway.gw, sid: 'sess-1', sys: ctx.system.sys },
       { keepBusy: true }
     )
@@ -1725,7 +1828,7 @@ describe('createGatewayEventHandler', () => {
       expect(getUiState().notice).toMatchObject({ key: 'credits.90', text: '⚠ 90% used' })
     })
 
-    it('flushes a held notice at interruptTurn (turn-end via ctrl-c)', () => {
+    it('flushes a held notice only at settlement after accepted Stop', async () => {
       vi.useFakeTimers()
 
       try {
@@ -1741,13 +1844,15 @@ describe('createGatewayEventHandler', () => {
         } as any)
         expect(getUiState().notice).toBeNull()
 
-        turnController.interruptTurn({
+        await turnController.interruptTurn({
           appendMessage: vi.fn(),
           gw: ctx.gateway.gw,
           sid: 'sess-1',
           sys: ctx.system.sys
         })
 
+        expect(getUiState().notice).toBeNull()
+        onEvent({ payload: { text: 'interrupted' }, type: 'message.complete' } as any)
         expect(getUiState().notice).toMatchObject({ key: 'credits.depleted', text: '✕ out' })
       } finally {
         vi.runAllTimers()

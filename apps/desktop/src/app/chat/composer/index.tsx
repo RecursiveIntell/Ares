@@ -1,5 +1,6 @@
 import { ComposerPrimitive } from '@assistant-ui/react'
 import { useStore } from '@nanostores/react'
+import { computed } from 'nanostores'
 import { type ClipboardEvent, type FormEvent, type KeyboardEvent, useCallback, useEffect, useMemo, useRef } from 'react'
 
 import { useHudComposerDrag } from '@/app/hud/composer-drag'
@@ -22,6 +23,7 @@ import { $hudMode } from '@/store/hud'
 import { sessionBlockingPrompt } from '@/store/prompts'
 import { toggleReview } from '@/store/review'
 import { $gatewayState } from '@/store/session'
+import { $sessionStates } from '@/store/session-states'
 import { $threadScrolledUp } from '@/store/thread-scroll'
 import { $autoSpeakReplies } from '@/store/voice-prefs'
 import { useTheme } from '@/themes'
@@ -107,6 +109,13 @@ export function ChatBar({
   onTranscribeAudio
 }: ChatBarProps) {
   const hudMode = useStore($hudMode)
+
+  const $interruptPending = useMemo(
+    () => computed($sessionStates, states => Boolean(sessionId && states[sessionId]?.interruptPending)),
+    [sessionId]
+  )
+
+  const interruptPending = useStore($interruptPending)
   const hudWindowing = window.hermesDesktop?.hud?.windowing
   const hudNativeDrag = hudMode && hudWindowing?.nativeDrag === true
 
@@ -354,7 +363,7 @@ export function ChatBar({
 
   // The submit engine — the orchestration seam where draft + queue meet. Owns
   // the submit decision tree, the send-with-restore primitive, and steer.
-  const { queueDraft, steerDraft, submitDraft } = useComposerSubmit({
+  const { queueDraft, steerDraft, steeringPending, submitDraft } = useComposerSubmit({
     activeQueueSessionKey,
     activeQueueSessionKeyRef,
     attachments,
@@ -992,11 +1001,14 @@ export function ChatBar({
       disabled={disabled}
       foldVoice={foldVoice}
       hasComposerPayload={hasComposerPayload}
+      interruptPending={interruptPending}
       minimal={minimal}
       onDictate={dictate}
       onQueue={queueDraft}
+      onStop={haltRun}
       onToggleAutoSpeak={handleToggleAutoSpeak}
       state={state}
+      steeringPending={steeringPending}
       voiceStatus={voiceStatus}
     />
   )
@@ -1004,7 +1016,7 @@ export function ChatBar({
   const input = (
     <div className={cn('relative', stacked ? 'w-full' : 'min-w-(--composer-input-inline-min-width) flex-1')}>
       <div
-        aria-disabled={inputDisabled ? true : undefined}
+        aria-disabled={inputDisabled || steeringPending ? true : undefined}
         aria-label={t.composer.message}
         autoCapitalize="off"
         autoCorrect="off"
@@ -1018,7 +1030,7 @@ export function ChatBar({
           // becomes unclickable. Buttons use the global no-drag rule.
           hudNativeDrag && '[-webkit-app-region:no-drag]'
         )}
-        contentEditable={!inputDisabled}
+        contentEditable={!inputDisabled && !steeringPending}
         data-placeholder={placeholder}
         data-slot={RICH_INPUT_SLOT}
         onBeforeInput={handleEditorBeforeInput}

@@ -1,4 +1,4 @@
-import { type RefObject, useLayoutEffect, useRef } from 'react'
+import { type RefObject, useLayoutEffect, useRef, useState } from 'react'
 
 import { usePaneVisible } from '@/components/pane-shell/pane-visibility'
 import { SLASH_COMMAND_RE } from '@/lib/chat-runtime'
@@ -77,6 +77,9 @@ export function useComposerSubmit({
   setComposerText,
   stashAt
 }: UseComposerSubmitArgs) {
+  const [steeringPending, setSteeringPending] = useState(false)
+  const steeringPendingRef = useRef(false)
+
   const paneVisible = usePaneVisible()
   const scope = useComposerScope()
   const surfaceId = useComposerSurfaceId()
@@ -241,17 +244,32 @@ export function useComposerSubmit({
 
     // Guard on live editor state, not the render-lagged `canSteer`: a redirect
     // fired on a fast Enter must not be dropped because state hasn't synced.
-    if (!onSteer || !text || attachments.length > 0 || SLASH_COMMAND_RE.test(text)) {
+    if (!onSteer || !text || attachments.length > 0 || SLASH_COMMAND_RE.test(text) || steeringPendingRef.current) {
       return
     }
 
+    steeringPendingRef.current = true
+    setSteeringPending(true)
     triggerHaptic('submit')
-    clearDraft()
 
     void Promise.resolve(onSteer(text)).then(accepted => {
       if (!accepted && activeQueueSessionKey) {
         enqueueQueuedPrompt(activeQueueSessionKey, { text, attachments: [] })
       }
+
+      // Keep the text in the composer until its delivery path has an explicit
+      // result. On a transport-unknown rejection the unchanged draft remains
+      // available for an informed retry instead of auto-queueing.
+      if (draftRef.current.trim() === text) {
+        clearDraft()
+      }
+    }).catch(() => {
+      // The caller surfaces the typed unknown-delivery error. Do not discard
+      // the text or convert uncertainty into an automatic queue retry.
+    }).finally(() => {
+      steeringPendingRef.current = false
+      setSteeringPending(false)
+      focusInput()
     })
   }
 
@@ -264,5 +282,5 @@ export function useComposerSubmit({
     focusInput()
   }
 
-  return { dispatchSubmit, queueDraft, steerDraft, submitDraft }
+  return { dispatchSubmit, queueDraft, steerDraft, steeringPending, submitDraft }
 }

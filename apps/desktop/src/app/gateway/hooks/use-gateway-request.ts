@@ -3,6 +3,11 @@ import { useStore } from '@nanostores/react'
 import { useCallback, useEffect, useRef } from 'react'
 
 import type { HermesGateway } from '@/hermes'
+import {
+  gatewayDeliveryUnknownError,
+  isGatewayTransportFailure,
+  NON_REPLAYABLE_GATEWAY_METHODS
+} from '@/lib/gateway-delivery'
 import { RECONNECT_ATTEMPT_TIMEOUT_MS, withTimeout } from '@/lib/with-timeout'
 import { $gateway, ensureActiveGatewayOpen, isActivePrimary } from '@/store/gateway'
 import { $activeGatewayProfile } from '@/store/profile'
@@ -131,7 +136,15 @@ export function useGatewayRequest() {
       try {
         return await gateway.request<T>(method, params, timeoutMs, signal)
       } catch (error) {
-        if (!isGatewayTransportError(error)) {
+        const deliveryUnknown = NON_REPLAYABLE_GATEWAY_METHODS.has(method)
+          ? gatewayDeliveryUnknownError(method, error)
+          : null
+
+        if (deliveryUnknown && !isGatewayTransportFailure(error)) {
+          throw deliveryUnknown
+        }
+
+        if (!isGatewayTransportFailure(error)) {
           throw error
         }
 
@@ -140,6 +153,13 @@ export function useGatewayRequest() {
         // connection-owned reconnect path, including composite remote/SSH
         // sources.
         const recovered = isActivePrimary() ? await ensureGatewayOpen() : await ensureActiveGatewayOpen()
+
+        // The socket is restored for future work, but this mutating request is
+        // intentionally not replayed. A later readback or user decision must
+        // resolve the unknown delivery outcome.
+        if (deliveryUnknown) {
+          throw deliveryUnknown
+        }
 
         if (!recovered) {
           // Prefer the reauth error from the failed reconnect (OAuth session
@@ -161,43 +181,4 @@ export function useGatewayRequest() {
   )
 
   return { connectionRef, gateway, gatewayRef, requestGateway }
-}
-
-const GATEWAY_TRANSPORT_ERROR_CODES = new Set([
-  'ECONNABORTED',
-  'ECONNREFUSED',
-  'ECONNRESET',
-  'EHOSTUNREACH',
-  'ENETUNREACH',
-  'ENOTFOUND',
-  'EPIPE',
-  'ETIMEDOUT',
-  'ERR_NETWORK',
-  'ERR_SOCKET_CLOSED'
-])
-
-function errorCode(value: unknown): string | null {
-  if (typeof value !== 'object' || value === null) {
-    return null
-  }
-
-  const code = (value as { code?: unknown }).code
-
-  return typeof code === 'string' ? code.toUpperCase() : null
-}
-
-function isGatewayTransportError(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error)
-
-  if (/not connected|connection closed|connection reset|ECONNRESET/i.test(message)) {
-    return true
-  }
-
-  const cause = typeof error === 'object' && error !== null ? (error as { cause?: unknown }).cause : undefined
-
-  return [error, cause].some(value => {
-    const code = errorCode(value)
-
-    return code !== null && GATEWAY_TRANSPORT_ERROR_CODES.has(code)
-  })
 }

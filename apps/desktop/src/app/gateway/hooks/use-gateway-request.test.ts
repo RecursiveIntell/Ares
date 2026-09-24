@@ -262,11 +262,11 @@ describe('useGatewayRequest', () => {
     const { result } = renderHook(() => useGatewayRequest())
 
     await act(async () => {
-      await expect(result.current.requestGateway('prompt.submit', { text: 'first' })).resolves.toEqual({ turn: 1 })
+      await expect(result.current.requestGateway('session.list', { text: 'first' })).resolves.toEqual({ turn: 1 })
     })
     gateway.connectionState = 'closed'
     await act(async () => {
-      await expect(result.current.requestGateway('prompt.submit', { text: 'second' })).resolves.toEqual({ turn: 2 })
+      await expect(result.current.requestGateway('session.list', { text: 'second' })).resolves.toEqual({ turn: 2 })
     })
 
     expect(desktop.getConnectionFor).toHaveBeenCalledTimes(2)
@@ -276,6 +276,33 @@ describe('useGatewayRequest', () => {
     expect(desktop.getConnection).not.toHaveBeenCalled()
     expect(desktop.getGatewayWsUrl).not.toHaveBeenCalled()
     expect(gateway.connect).toHaveBeenLastCalledWith(expect.stringContaining('ticket=fresh-2'))
+  })
+
+  it.each(['session.interrupt', 'session.redirect', 'session.steer', 'prompt.submit']) (
+    'does not replay non-idempotent %s after transport failure',
+    async method => {
+      const { gateway } = await activateRemoteGateway()
+      gateway.request.mockRejectedValueOnce(new Error('connection closed'))
+
+      const { result } = renderHook(() => useGatewayRequest())
+
+      await expect(
+        result.current.requestGateway(method, { session_id: 'runtime-a', text: 'test-only payload' })
+      ).rejects.toThrow(/delivery status is unknown/i)
+      expect(gateway.request).toHaveBeenCalledTimes(1)
+    }
+  )
+
+  it('classifies a non-idempotent RPC timeout as an unknown delivery outcome', async () => {
+    const { gateway } = await activateRemoteGateway()
+    gateway.request.mockRejectedValueOnce(new Error('request timed out after 30s: session.redirect'))
+
+    const { result } = renderHook(() => useGatewayRequest())
+
+    await expect(
+      result.current.requestGateway('session.redirect', { session_id: 'runtime-a', text: 'test-only payload' })
+    ).rejects.toThrow(/delivery status is unknown/i)
+    expect(gateway.request).toHaveBeenCalledTimes(1)
   })
 
   it('does not reconnect for a non-transport request failure', async () => {

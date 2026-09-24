@@ -6,6 +6,8 @@ import type { ComposerAttachment } from './composer'
 
 export interface QueuedPromptEntry {
   id: string
+  /** Gateway may have accepted this send; never auto-replay after reload. */
+  deliveryUnknown?: boolean
   text: string
   /** What the queue panel and the sent bubble show, when it differs from the
    *  text the agent receives. A queued `/skill` invocation carries the whole
@@ -121,6 +123,22 @@ export const getQueuedPrompts = (key: string | null | undefined): QueuedPromptEn
   const sid = sidOf(key)
 
   return sid ? queueFor(sid) : []
+}
+
+export const markQueuedPromptDeliveryUnknown = (key: string | null | undefined, id: string): boolean => {
+  const sid = sidOf(key)
+
+  if (!sid || !queueFor(sid).some(entry => entry.id === id)) {
+    return false
+  }
+
+  writeSession(
+    sid,
+    queueFor(sid).map(entry => (entry.id === id ? { ...entry, deliveryUnknown: true } : entry))
+  )
+  setParked(sid, true)
+
+  return true
 }
 
 export const enqueueQueuedPrompt = (
