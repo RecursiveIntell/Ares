@@ -5834,6 +5834,20 @@ def run_conversation(
                 if is_payload_too_large:
                     compression_attempts += 1
                     if compression_attempts > max_compression_attempts:
+                        _rebase = _attempt_provider_overflow_rebase(
+                            estimate_request_tokens_rough(
+                                api_messages, tools=agent.tools or None
+                            )
+                        )
+                        if _rebase is not None and _rebase.ready:
+                            _retry.restart_with_compressed_messages = True
+                            break
+                        if (
+                            _rebase is not None
+                            and getattr(_rebase.status, "value", "")
+                            == "reconciliation_required"
+                        ):
+                            return _context_rebase_reconciliation_result()
                         # Terminal — surface the buffered retry trace.
                         agent._flush_status_buffer()
                         agent._vprint(f"{agent.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached for payload-too-large error.", force=True)
@@ -5905,6 +5919,20 @@ def run_conversation(
                             )
                             continue
 
+                        _rebase = _attempt_provider_overflow_rebase(
+                            estimate_request_tokens_rough(
+                                api_messages, tools=agent.tools or None
+                            )
+                        )
+                        if _rebase is not None and _rebase.ready:
+                            _retry.restart_with_compressed_messages = True
+                            break
+                        if (
+                            _rebase is not None
+                            and getattr(_rebase.status, "value", "")
+                            == "reconciliation_required"
+                        ):
+                            return _context_rebase_reconciliation_result()
                         # Terminal — surface buffered context so the user
                         # sees what compression attempts were made.
                         agent._flush_status_buffer()
@@ -5985,6 +6013,18 @@ def run_conversation(
                         # loop forever if the error keeps recurring.
                         compression_attempts += 1
                         if compression_attempts > max_compression_attempts:
+                            _rebase = _attempt_provider_overflow_rebase(
+                                request_input_estimate
+                            )
+                            if _rebase is not None and _rebase.ready:
+                                _retry.restart_with_compressed_messages = True
+                                break
+                            if (
+                                _rebase is not None
+                                and getattr(_rebase.status, "value", "")
+                                == "reconciliation_required"
+                            ):
+                                return _context_rebase_reconciliation_result()
                             agent._flush_status_buffer()
                             agent._vprint(f"{agent.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached.", force=True)
                             agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
@@ -6139,6 +6179,20 @@ def run_conversation(
 
                     compression_attempts += 1
                     if compression_attempts > max_compression_attempts:
+                        _rebase = _attempt_provider_overflow_rebase(
+                            estimate_request_tokens_rough(
+                                api_messages, tools=agent.tools or None
+                            )
+                        )
+                        if _rebase is not None and _rebase.ready:
+                            _retry.restart_with_compressed_messages = True
+                            break
+                        if (
+                            _rebase is not None
+                            and getattr(_rebase.status, "value", "")
+                            == "reconciliation_required"
+                        ):
+                            return _context_rebase_reconciliation_result()
                         agent._flush_status_buffer()
                         agent._vprint(f"{agent.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached.", force=True)
                         agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
