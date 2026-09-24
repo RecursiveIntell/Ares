@@ -298,24 +298,31 @@ class HeartbeatManager:
         return s.render_prompt()
 
 
-def migrate_heartbeat_to_session(old_session_id: str, new_session_id: str) -> bool:
-    """Carry a heartbeat across a compression session rotation.
-
-    Same shape as ``goals.migrate_goal_to_session`` — copy to the child,
-    archive the parent row, never raise.
-    """
+def migrate_heartbeat_to_session(
+    old_session_id: str, new_session_id: str, *, session_db=None
+) -> bool:
+    """Carry heartbeat state through one atomic SessionDB owner transition."""
     if not old_session_id or not new_session_id or old_session_id == new_session_id:
         return False
     try:
-        state = load_heartbeat(old_session_id)
-        if state is None:
+        db = session_db if session_db is not None else _get_session_db()
+        if db is None or not hasattr(db, "compare_and_set_meta_many"):
             return False
-        if load_heartbeat(new_session_id) is not None:
+        parent_key = _meta_key(old_session_id)
+        child_key = _meta_key(new_session_id)
+        parent_raw = db.get_meta(parent_key)
+        if not parent_raw:
             return False
-        save_heartbeat(new_session_id, state)
-        state.status = "cleared"
-        save_heartbeat(old_session_id, state)
-        return True
+        state = HeartbeatState.from_json(parent_raw)
+        if state.status == "cleared" or db.get_meta(child_key) is not None:
+            return False
+        child = HeartbeatState.from_json(parent_raw)
+        archived = HeartbeatState.from_json(parent_raw)
+        archived.status = "cleared"
+        return bool(db.compare_and_set_meta_many([
+            (parent_key, parent_raw, archived.to_json()),
+            (child_key, None, child.to_json()),
+        ]))
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("HeartbeatManager: migration failed: %s", exc)
         return False
