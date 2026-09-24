@@ -189,6 +189,15 @@ _COMPRESSION_CHILD_SQL = (
 )
 
 
+_CONTEXT_REBASE_CHILD_SQL = (
+    "EXISTS (SELECT 1 FROM sessions p"
+    "        WHERE p.id = {a}.parent_session_id"
+    "        AND p.end_reason = 'context_rebase'"
+    "        AND json_extract(COALESCE({a}.model_config, '{{}}'), '$._context_rebase_from') = p.id"
+    "        AND json_extract(COALESCE({a}.model_config, '{{}}'), '$._context_rebase_transition') IS NOT NULL)"
+)
+
+
 _RESET_END_REASONS = (
     "session_reset",
     # switch_session() never creates a child row, but pre-marker DBs can hold
@@ -264,14 +273,16 @@ _LISTABLE_CHILD_SQL = (
 
 
 def _ephemeral_child_sql(alias: str = "s") -> str:
-    """Subagent runs, not branch, reset, or compression children."""
+    """Subagent runs, not branch, reset, compression, or context-rebase children."""
     branch = _BRANCH_CHILD_SQL.format(a=alias)
     compression = _COMPRESSION_CHILD_SQL.format(a=alias)
+    rebase = _CONTEXT_REBASE_CHILD_SQL.format(a=alias)
     reset = _RESET_CHILD_SQL.format(a=alias)
     return (
         f"({alias}.parent_session_id IS NOT NULL"
         f" AND NOT ({branch})"
         f" AND NOT ({compression})"
+        f" AND NOT ({rebase})"
         f" AND NOT ({reset}))"
     )
 
