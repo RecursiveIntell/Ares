@@ -373,7 +373,10 @@ def attempt_turn_start_context_rebase(
     try:
         if _active_goal_required(db, parent_session_id):
             if not migrate_goal_to_session(
-                parent_session_id, child_session_id, reason="context_rebase"
+                parent_session_id,
+                child_session_id,
+                reason="context_rebase",
+                session_db=db,
             ):
                 raise AutomaticRebaseError("GOAL_RECONCILIATION_FAILED")
         _carry_session_scoped_state(parent_session_id, child_session_id)
