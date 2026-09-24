@@ -463,30 +463,41 @@ def list_active_loops() -> List[Tuple[str, LoopState]]:
     return out
 
 
-def migrate_loop_to_session(old_session_id: str, new_session_id: str, *, reason: str = "") -> bool:
-    """Carry a persistent /loop from a parent session to its continuation.
-
-    Context compression rotates ``session_id`` to a fresh child session;
-    without this the loop silently dies at the compaction boundary (the
-    same hazard /goal hit in #33618). Copies the loop onto the new session
-    and archives the old row as ``cleared`` so exactly one active loop row
-    exists per logical conversation. Best-effort and never raises.
-    """
+def migrate_loop_to_session(
+    old_session_id: str,
+    new_session_id: str,
+    *,
+    reason: str = "",
+    session_db=None,
+) -> bool:
+    """Carry a persistent /loop through one atomic SessionDB owner transition."""
     if not old_session_id or not new_session_id or old_session_id == new_session_id:
         return False
     try:
-        state = load_loop(old_session_id)
-        if state is None or state.status == "cleared":
+        db = session_db if session_db is not None else _get_session_db()
+        if db is None or not hasattr(db, "compare_and_set_meta_many"):
             return False
-        if load_loop(new_session_id) is not None:
+        parent_key = _meta_key(old_session_id)
+        child_key = _meta_key(new_session_id)
+        parent_raw = db.get_meta(parent_key)
+        if not parent_raw:
             return False
-        save_loop(new_session_id, state)
-        clear_loop(old_session_id)
-        logger.debug(
-            "LoopManager: migrated loop %s -> %s (%s)",
-            old_session_id, new_session_id, reason or "rotation",
-        )
-        return True
+        state = LoopState.from_json(parent_raw)
+        if state.status == "cleared" or db.get_meta(child_key) is not None:
+            return False
+        child = LoopState.from_json(parent_raw)
+        archived = LoopState.from_json(parent_raw)
+        archived.status = "cleared"
+        migrated = bool(db.compare_and_set_meta_many([
+            (parent_key, parent_raw, archived.to_json()),
+            (child_key, None, child.to_json()),
+        ]))
+        if migrated:
+            logger.debug(
+                "LoopManager: migrated loop %s -> %s (%s)",
+                old_session_id, new_session_id, reason or "rotation",
+            )
+        return migrated
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("LoopManager: loop migration failed: %s", exc)
         return False
