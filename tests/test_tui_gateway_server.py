@@ -6900,6 +6900,51 @@ def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
             isolated_queue.get_nowait()
 
 
+def test_notification_poller_failed_delivery_claim_releases_running(monkeypatch):
+    """Losing the durable delivery claim must not leave the UI falsely busy."""
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    session = _session(session_key="claim-owner")
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg-already-claimed",
+        "session_key": "claim-owner",
+        "origin_ui_session_id": "sid-claim-owner",
+    }
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(
+        "tools.process_registry.format_process_notification",
+        lambda _event: "delegation completed",
+    )
+    monkeypatch.setattr(
+        "tools.async_delegation.claim_event_delivery",
+        lambda _event, _consumer: None,
+    )
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *args, **kwargs: pytest.fail("unclaimed event must not dispatch"),
+    )
+    server._sessions["sid-claim-owner"] = session
+
+    try:
+        server._notification_poller_loop(
+            _StopAfterOneNotificationPoll(),
+            "sid-claim-owner",
+            session,
+        )
+
+        assert session["running"] is False
+        assert isolated_queue.empty()
+    finally:
+        server._sessions.pop("sid-claim-owner", None)
+
+
 def test_completion_ownership_lineage_lookup_failure_fails_closed(monkeypatch):
     """A provenance lookup failure cannot turn an addressed event into ours."""
     import queue as _queue_mod

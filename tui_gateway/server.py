@@ -11704,6 +11704,12 @@ def _notification_poller_loop(
         )
         _claim = claim_event_delivery(evt, "tui-poller")
         if _claim is None:
+            # Another durable consumer already owns delivery. We claimed the
+            # local UI turn slot before consulting the durable arbiter, so
+            # release that speculative busy state instead of leaving the
+            # session permanently stuck as running.
+            with session["history_lock"]:
+                session["running"] = False
             continue
         try:
             _emit("message.start", sid)
@@ -11786,6 +11792,12 @@ def _notification_poller_loop(
         )
         _claim = claim_event_delivery(evt, "tui-poller")
         if _claim is None:
+            # Another durable consumer already owns delivery. We claimed the
+            # local UI turn slot before consulting the durable arbiter, so
+            # release that speculative busy state instead of leaving the
+            # session permanently stuck as running.
+            with session["history_lock"]:
+                session["running"] = False
             continue
         try:
             _emit("message.start", sid)
