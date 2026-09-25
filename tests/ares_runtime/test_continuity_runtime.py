@@ -241,3 +241,121 @@ def test_multimodal_successor_is_not_published_without_qualified_accounting(setu
     assert result.reason == "SUCCESSOR_MULTIMODAL_ACCOUNTING_UNQUALIFIED"
     after = db.get_session("s0")
     assert after["ended_at"] == before["ended_at"] is None
+
+
+def test_runtime_blocks_third_rebase_without_provider_recovery(setup):
+    db, agent, messages, history, _ = setup
+    agent.context_rebase_max_no_progress = 2
+
+    first = attempt_turn_start_context_rebase(
+        agent,
+        messages,
+        conversation_history=history,
+        active_system_prompt=agent._cached_system_prompt,
+        before_tokens=100_000,
+    )
+    assert first.ready
+    assert db.read_context_rebase_episode(agent.session_id).attempts_without_recovery == 1
+
+    second = attempt_turn_start_context_rebase(
+        agent,
+        list(first.messages),
+        conversation_history=list(first.messages),
+        active_system_prompt=first.system_prompt,
+        before_tokens=100_000,
+    )
+    assert second.ready
+    assert db.read_context_rebase_episode(agent.session_id).attempts_without_recovery == 2
+
+    third = attempt_turn_start_context_rebase(
+        agent,
+        list(second.messages),
+        conversation_history=list(second.messages),
+        active_system_prompt=second.system_prompt,
+        before_tokens=100_000,
+    )
+    assert third.status is AutomaticRebaseStatus.BLOCKED
+    assert third.reason == "NO_PROGRESS_REBASE_LIMIT"
+    assert db.get_session(agent.session_id)["ended_at"] is None
+
+
+def test_twelve_runtime_rebases_preserve_requirement_after_each_recovery(tmp_path):
+    db = SessionDB(db_path=tmp_path / "long.db")
+    db.create_session(
+        "s0", source="cli", profile_name="p1", model="test", cwd=str(tmp_path)
+    )
+    db.append_message(
+        "s0", "user",
+        "Implement the queue fix. Do not push or merge under any circumstance.",
+    )
+    db.append_message(
+        "s0", "assistant", "Initial verified state.", _compressed_summary=True
+    )
+    db.append_message("s0", "user", "Continue the exact task.")
+    assert db.try_acquire_session_turn_lease("s0", "holder", ttl_seconds=300)
+    db.set_meta("goal:s0", GoalState(goal="Fix queue", created_at=1.0).to_json())
+
+    agent = SimpleNamespace(
+        context_rebase_enabled=True,
+        context_rebase_max_no_progress=2,
+        _session_db=db,
+        session_id="s0",
+        _active_session_turn_lease_holder="holder",
+        _active_session_turn_lease_ttl_seconds=300.0,
+        _run_checkpoint_custody=None,
+        _flush_messages_to_session_db=lambda *_args, **_kwargs: True,
+        _transition_context_engine_session=lambda **_kwargs: None,
+        context_compressor=SimpleNamespace(threshold_tokens=50_000),
+        tools=[],
+        api_mode="chat_completions",
+        provider="test",
+        model="test",
+        base_url="",
+        platform="cli",
+        _session_db_created=True,
+        _cached_system_prompt="trusted base prompt",
+        _flushed_db_message_ids=set(),
+        _last_flushed_db_idx=0,
+        _flushed_db_message_session_id="s0",
+    )
+
+    messages = db.get_messages_as_conversation(
+        "s0", repair_alternation=True, include_row_ids=True
+    )
+    system_prompt = agent._cached_system_prompt
+    transition_ids = []
+    for _index in range(12):
+        result = attempt_turn_start_context_rebase(
+            agent,
+            list(messages),
+            conversation_history=list(messages),
+            active_system_prompt=system_prompt,
+            before_tokens=100_000,
+        )
+        assert result.ready, result.reason
+        transition_ids.append(result.transition_id)
+        messages = list(result.messages)
+        system_prompt = result.system_prompt
+        assert "Do not push or merge under any circumstance." in messages[0]["content"]
+        assert db.read_context_rebase_episode(
+            agent.session_id
+        ).attempts_without_recovery == 1
+        # This represents the provider-confirmed prompt-below-threshold event.
+        db.reset_context_rebase_episode(agent.session_id)
+        assert db.read_context_rebase_episode(
+            agent.session_id
+        ).attempts_without_recovery == 0
+
+    assert len(set(transition_ids)) == 12
+    assert db.get_context_continuation_tip("s0", max_depth=20) == agent.session_id
+    assert json.loads(db.get_session(agent.session_id)["model_config"])[
+        "_context_epoch"
+    ] == 12
+    active_goals = []
+    for key, raw in db.list_meta("goal:").items():
+        state = GoalState.from_json(raw)
+        if state.status != "cleared":
+            active_goals.append((key, state.goal_id))
+    assert len(active_goals) == 1
+    assert active_goals[0][0] == f"goal:{agent.session_id}"
+    db.close()
