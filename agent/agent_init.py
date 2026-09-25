@@ -2207,6 +2207,20 @@ def init_agent(
         compression_max_attempts = 3
     compression_max_attempts = min(compression_max_attempts, 10)
 
+    _raw_rebase_no_progress = _compression_cfg.get(
+        "context_rebase_max_no_progress", 2
+    )
+    if isinstance(_raw_rebase_no_progress, bool):
+        context_rebase_max_no_progress = 2
+    else:
+        try:
+            context_rebase_max_no_progress = int(_raw_rebase_no_progress)
+        except (TypeError, ValueError):
+            context_rebase_max_no_progress = 2
+    if context_rebase_max_no_progress < 1:
+        context_rebase_max_no_progress = 2
+    context_rebase_max_no_progress = min(context_rebase_max_no_progress, 100)
+
     def _parse_prune_int(raw, default):
         # Same parser semantics as compression.max_attempts above: reject
         # booleans (bool subclasses int — YAML `true` would coerce to 1),
@@ -2842,6 +2856,7 @@ def init_agent(
     agent.codex_responses_native_compaction = codex_responses_native_compaction
     agent.codex_responses_compact_threshold = codex_responses_compact_threshold
     agent.max_compression_attempts = compression_max_attempts
+    agent.context_rebase_max_no_progress = context_rebase_max_no_progress
     agent.compression_idle_compact_after_seconds = (
         compression_idle_compact_after_seconds
     )
