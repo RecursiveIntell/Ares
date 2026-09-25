@@ -8,8 +8,28 @@ on:
       - '.github/workflows/context-continuity-qualification.yml'
       - 'ares_runtime/continuity/**'
       - 'tests/ares_runtime/test_continuity*'
+      - 'tests/ares_runtime/test_context_rebase_state.py'
+      - 'tests/ares_runtime/test_managed_calls.py'
+      - 'tests/hermes_cli/test_goals.py'
+      - 'tests/hermes_cli/test_heartbeat.py'
+      - 'tests/hermes_cli/test_loops.py'
+      - 'tests/test_run_checkpoint_import_boundaries.py'
+      - 'tests/test_turn_run_custody.py'
+      - 'agent/agent_init.py'
+      - 'agent/conversation_loop.py'
+      - 'agent/run_checkpoint_custody.py'
+      - 'agent/turn_context.py'
+      - 'cli.py'
+      - 'hermes_cli/goals.py'
+      - 'hermes_cli/heartbeat.py'
+      - 'hermes_cli/loops.py'
+      - 'hermes_state.py'
+      - 'hermes_state_common.py'
       - 'hermes_state_continuity.py'
+      - 'hermes_state_runs.py'
+      - 'plugins/context_engine/_context_governor/**'
       - 'scripts/run_checkpoint_context.py'
+      - 'tui_gateway/server.py'
       - 'docs/context-continuity/**'
 
 permissions:
@@ -34,13 +54,26 @@ jobs:
           version: '0.9.28'
       - name: Install locked test dependencies
         run: uv sync --frozen --extra dev --python 3.13
-      - name: Run actual continuity modules through the canonical test runner
+      - name: Run continuity and adjacent ownership surfaces
         shell: bash
         run: |
           set -euo pipefail
           git rev-parse HEAD
           .venv/bin/python --version
-          HERMES_PYTHON="$PWD/.venv/bin/python" HERMES_TEST_WORKERS=2 HERMES_TEST_FILE_RETRIES=0 \
-            scripts/run_tests.sh tests/ares_runtime/test_continuity*.py \
-            tests/ares_runtime/test_managed_calls.py tests/test_turn_run_custody.py -- -q
-          .venv/bin/ruff check ares_runtime/continuity tests/ares_runtime/test_continuity*.py scripts/run_checkpoint_context.py
+          HERMES_PYTHON="$PWD/.venv/bin/python" HERMES_TEST_WORKERS=4 HERMES_TEST_FILE_RETRIES=0 \
+            scripts/run_tests.sh \
+            tests/ares_runtime/test_continuity*.py \
+            tests/ares_runtime/test_context_rebase_state.py \
+            tests/ares_runtime/test_managed_calls.py \
+            tests/hermes_cli/test_goals.py \
+            tests/hermes_cli/test_heartbeat.py \
+            tests/hermes_cli/test_loops.py \
+            tests/test_run_checkpoint_import_boundaries.py \
+            tests/test_turn_run_custody.py \
+            tests/tui_gateway/test_inline_rpc_gil_starvation.py -- -q
+          .venv/bin/ruff check \
+            ares_runtime/continuity \
+            hermes_state_continuity.py \
+            tests/ares_runtime/test_continuity*.py \
+            tests/ares_runtime/test_context_rebase_state.py \
+            scripts/run_checkpoint_context.py
