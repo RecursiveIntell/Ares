@@ -357,6 +357,10 @@ def _(rid, params: dict) -> dict:
         )
     isolation_cfg = _load_dashboard_process_isolation_config()
     turn_isolation = _session_uses_compute_host(session, isolation_cfg)
+    from . import server as _server
+    require_compute_host = (
+        bool(isolation_cfg.get("require_compute_host")) and not _server._inside_compute_host_child()
+    )
     # Re-bind to the current client transport for this request. This keeps
     # streaming events on the active websocket even if an earlier disconnect
     # or fallback moved the session transport to stdio.
@@ -854,11 +858,31 @@ def _(rid, params: dict) -> dict:
             if survivor_row_id_map is not None:
                 isolated_response["result"]["survivor_row_id_map"] = survivor_row_id_map
             return isolated_response
+        if require_compute_host:
+            message = str(isolated_response["error"].get("message") or "compute host unavailable")
+            with session["history_lock"]:
+                session["running"] = False
+                _server._fail_inflight_turn(
+                    session, message,
+                    error_surface={"layer": "runtime", "code": "compute_host_dispatch_failed", "retryable": True},
+                )
+            _server._emit("error", sid, {"message": message})
+            return _server._err(rid, 5019, message)
         logger.warning(
             "compute-host dispatch failed for session %s; falling back inline: %s",
             sid,
             isolated_response["error"].get("message", "unknown error"),
         )
+    elif require_compute_host:
+        message = "compute host required but session cannot route to it"
+        with session["history_lock"]:
+            session["running"] = False
+            _server._fail_inflight_turn(
+                session, message,
+                error_surface={"layer": "runtime", "code": "compute_host_dispatch_failed", "retryable": True},
+            )
+        _server._emit("error", sid, {"message": message})
+        return _server._err(rid, 5019, message)
 
     # Persist the DB row lazily, now that the user has actually sent a message.
     # Disk-full must fail the RPC (not stream silently): desktop maps the error

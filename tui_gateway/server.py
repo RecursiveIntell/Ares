@@ -1556,8 +1556,28 @@ def _shutdown_sessions() -> None:
         pass
     with _sessions_lock:
         sids = list(_sessions)
-    for sid in sids:
-        _close_session_by_id(sid, end_reason="tui_shutdown")
+    if _inside_compute_host_child():
+        # ComputeHost.shutdown already gave active turns a bounded drain. This
+        # later atexit pass must not consume their one-shot finalization latch
+        # or release the active-session lease. Recheck at the atomic pop.
+        def closeable_after_drain(session: dict) -> bool:
+            if session.get("running"):
+                return False
+            thread = session.get("_run_thread")
+            if thread is None:
+                return True
+            try:
+                return not thread.is_alive()
+            except Exception:
+                return False
+
+        for sid in sids:
+            _close_session_by_id(
+                sid, end_reason="tui_shutdown", predicate=closeable_after_drain,
+            )
+    else:
+        for sid in sids:
+            _close_session_by_id(sid, end_reason="tui_shutdown")
 
 
 # Last-resort net for any disconnect path that slips past the WS finally. TTL is
@@ -2518,6 +2538,7 @@ def _apply_compute_host_metadata_mirror(session: dict, frame: dict | None) -> No
 
 def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -> None:
     is_error = frame.get("type") == "turn.error"
+    child_crashed = is_error and frame.get("reason") == "crash"
     with session["history_lock"]:
         if frame.get("session_key"):
             session["session_key"] = str(frame.get("session_key"))
@@ -2531,7 +2552,16 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
                 pass
         session["running"] = False
         session["last_active"] = time.time()
-        _clear_inflight_turn(session)
+        if child_crashed:
+            # The child may have reached a provider or tool before its exit.
+            # Keep the visible prompt/partial reply for reconciliation, but
+            # never auto-dispatch the next queued effect on an unknown outcome.
+            _fail_inflight_turn(
+                session, frame.get("message") or "compute host exited",
+                error_surface={"layer": "runtime", "code": "compute_host_crash", "retryable": False},
+            )
+        else:
+            _clear_inflight_turn(session)
     if is_error:
         message = str(frame.get("message") or "compute host turn failed")
         _emit("message.complete", sid, {"text": f"Error: {message}", "status": "error"})
@@ -2542,7 +2572,8 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
         info = _session_info(session.get("agent"))
     if not frame.get("session_info_emitted"):
         _emit("session.info", sid, info)
-    _drain_queued_prompt(rid, sid, session)
+    if not child_crashed:
+        _drain_queued_prompt(rid, sid, session)
 
 
 def _submit_prompt_to_compute_host(
@@ -3622,7 +3653,7 @@ def _register_session_cwd(session: dict | None) -> None:
         pass
 
 
-def _ensure_session_db_row(session: dict) -> None:
+def _ensure_session_db_row(session: dict, *, require_durable: bool = False) -> None:
     """Idempotently persist the session's DB row on first real activity.
 
     Called from prompt.submit so a row only exists once the user actually sends
@@ -3646,6 +3677,8 @@ def _ensure_session_db_row(session: dict) -> None:
     """
     key = session.get("session_key")
     if not key:
+        if require_durable:
+            raise RuntimeError("compute-host session row requires a session key")
         return
     # Persist into the session's own profile db (global remote mode), not the
     # launch profile's — otherwise the row lands in the wrong state.db, the
@@ -3656,7 +3689,9 @@ def _ensure_session_db_row(session: dict) -> None:
 
         try:
             db = SessionDB(db_path=Path(profile_home) / "state.db")
-        except Exception:
+        except Exception as exc:
+            if require_durable:
+                raise RuntimeError("compute-host profile session DB unavailable") from exc
             logger.debug("failed to open profile db for session row", exc_info=True)
             return
         close_db = True
@@ -3664,6 +3699,8 @@ def _ensure_session_db_row(session: dict) -> None:
         db = _get_db()
         close_db = False
     if db is None:
+        if require_durable:
+            raise RuntimeError("compute-host session DB unavailable")
         return
     # The session's own model/effort/fast pick — the composer override shipped on
     # session.create, or a restored /model switch — must own the row's model +
@@ -3736,7 +3773,20 @@ def _ensure_session_db_row(session: dict) -> None:
             # into one list can't rely on which file a row came from alone. NULL
             # means the launch/default profile (matches run_agent's convention).
             profile_name=Path(profile_home).name if profile_home else None,
+            # In strict compute-child admission the canonical SessionDB owner
+            # checks this identity inside its BEGIN IMMEDIATE write transaction.
+            **({"expected_profile_name": Path(profile_home).name}
+               if require_durable and profile_home else {}),
         )
+        if require_durable:
+            row = db.get_session(key)
+            if row is None or row.get("id") != key:
+                raise RuntimeError("compute-host session row readback missing")
+            # create_session is idempotent: an existing row can win its INSERT
+            # and belong to a different profile. Readback must bind the row to
+            # the profile DB that this child is serving, not merely to the ID.
+            if profile_home and row.get("profile_name") != Path(profile_home).name:
+                raise RuntimeError("compute-host session row profile mismatch")
         # A session can be born hidden (session.create hidden=true, or a
         # session.set_hidden that arrived before the row existed): apply the
         # deferred intent now that the row exists, mirroring pending_title.
@@ -3753,6 +3803,8 @@ def _ensure_session_db_row(session: dict) -> None:
 
         if is_disk_full_error(exc):
             raise
+        if require_durable:
+            raise RuntimeError("compute-host session row persistence unavailable") from exc
         logger.debug("failed to persist desktop session row", exc_info=True)
     finally:
         if close_db:
@@ -4138,6 +4190,15 @@ def _coerce_int_config_value(value: Any, default: int, *, min_value: int) -> int
     return coerced if coerced >= min_value else default
 
 
+def _require_compute_host_value(value: Any) -> bool:
+    """Malformed explicit requirements deny inline fallback, never waive it."""
+    if value is None or value is False:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "0", "false", "no", "off"}
+    return value != 0
+
+
 def _load_dashboard_process_isolation_config(cfg: dict | None = None) -> dict[str, Any]:
     """Return dashboard process-isolation config with read-site defaults.
 
@@ -4155,6 +4216,9 @@ def _load_dashboard_process_isolation_config(cfg: dict | None = None) -> dict[st
         "turn_isolation": is_truthy_value(
             dashboard.get("turn_isolation"),
             default=_DASHBOARD_TURN_ISOLATION_DEFAULT,
+        ),
+        "require_compute_host": _require_compute_host_value(
+            dashboard.get("require_compute_host"),
         ),
         "compute_host_heartbeat_secs": _coerce_int_config_value(
             dashboard.get("compute_host_heartbeat_secs"),
@@ -8947,24 +9011,24 @@ def _expand_skill_invocation_for_replay(text: str, task_id: str) -> str:
         return text
 
 
-# Opening of the crash-recovery note synthesized by _auto_continue_note.
-# Matched (not just built) so a row persisted before the display type was
-# stamped at turn start still reads as a timeline event, and to recognize the
-# messaging gateway's twin note.
-_AUTO_CONTINUE_NOTE_PREFIX = "[System note: Your previous turn was interrupted mid-run"
+# Historical untyped rows must still render as continuation notes. Keep the
+# exact old prefix as a read-only classifier; new notes use uncertainty wording.
+_LEGACY_AUTO_CONTINUE_NOTE_PREFIX = "[System note: Your previous turn was interrupted mid-run"
+_AUTO_CONTINUE_NOTE_PREFIX = "[System note: A previous turn may have been interrupted"
 
 
 def _legacy_display_kind(role: str, text: str) -> str | None:
     """Infer the display type of a synthetic row persisted without one.
 
     Turn-start typing (see ``persist_user_display_kind``) covers everything
-    written from here on. Sessions already on disk carry untyped rows — and a
-    turn killed mid-run never reached the post-turn stamp at all, which is
-    exactly the auto-continue case — so the raw recovery note would paint as a
-    user bubble forever. Sniffing the one fixed synthetic prefix is the
-    migration for those rows; it is not how new rows get typed.
+    written from here on. Sessions already on disk can carry untyped notes;
+    a missing post-turn stamp must not make a synthetic note paint as an ordinary
+    user bubble. Recognize only the two explicit synthetic prefixes for
+    historical rows; new rows carry a declared display kind.
     """
-    if role == "user" and text.lstrip().startswith(_AUTO_CONTINUE_NOTE_PREFIX):
+    if role == "user" and text.lstrip().startswith(
+        (_AUTO_CONTINUE_NOTE_PREFIX, _LEGACY_AUTO_CONTINUE_NOTE_PREFIX)
+    ):
         return "auto_continue"
     return None
 
@@ -9229,17 +9293,15 @@ def _fail_inflight_turn(
     session["inflight_turn"] = turn
 
 
-# ── Auto-continue: resume a turn killed by a process/machine death ────
+# ── Auto-continue: optional resume from an interrupted-turn marker ────
 #
-# A turn that concludes — success, handled error, interrupt — clears its
-# durable marker (see tui_gateway/turn_marker.py) in _run_prompt_submit's
-# finally. Only a process death leaves the marker behind, so a marker found
-# at session.resume time is positive proof the turn never finished AND the
-# client never saw a terminal frame. If the interruption is fresh, re-submit
-# the interrupted prompt automatically (the messaging gateway has done this
-# for restart-interrupted sessions since #27856); if it's stale, clear the
-# marker and let the recovered partial transcript speak for itself — the
-# user can ask to continue manually.
+# A concluded turn normally clears its best-effort sidecar marker. A surviving
+# marker suggests interruption, but a same-UID writer can alter it and a failed
+# clear may leave one behind. It proves neither process death nor that a client
+# missed a terminal frame or that any provider/tool effect did not occur.
+# Automatic continuation is an explicit opt-in with freshness/attempt bounds;
+# when disabled, cold resume only projects an outcome-unknown UI snapshot and
+# does not turn marker text into model history or task authority.
 
 _AUTO_CONTINUE_ENABLED_DEFAULT = False
 _AUTO_CONTINUE_FRESHNESS_MINUTES_DEFAULT = 15
@@ -9272,14 +9334,12 @@ def _session_home(session: dict) -> Path:
 
 
 def _retire_turn_marker(session: dict, *keys: str) -> None:
-    """Drop the crash marker for a turn whose outcome is about to reach the client.
+    """Attempt to clear a turn's best-effort hint before its terminal frame.
 
-    Called immediately before the terminal frame rather than at the end of the
-    turn thread: post-turn work (titles, memory sync, goal hooks) runs for a
-    second or more after the client has its answer, and quitting inside that
-    window would leave a marker that looks like a crash — re-running a finished
-    turn on the next launch. Extra ``keys`` cover a session_key that
-    compression rotated mid-turn.
+    Post-turn work can continue after the client receives an answer. Clearing
+    here reduces stale-marker auto-continue risk in that window; a failed clear
+    or a same-UID edit can still leave a misleading marker. Extra keys cover a
+    session_key that compression rotated mid-turn.
     """
     home = _session_home(session)
     for key in dict.fromkeys((*keys, str(session.get("session_key") or ""))):
@@ -9288,28 +9348,51 @@ def _retire_turn_marker(session: dict, *keys: str) -> None:
 
 
 def _auto_continue_note(prompt: str) -> str:
-    # Same opening as the messaging gateway's recovery notes so transcript
-    # tooling recognizes both. The original prompt is embedded because a hard
-    # crash persists nothing of the interrupted turn to the session DB — this
-    # note is the only copy the model will see.
+    # Keep historical classification through _LEGACY_AUTO_CONTINUE_NOTE_PREFIX;
+    # new notes use a separate uncertainty-prefixed identity. Marker text is
+    # advisory, not proof that any provider/tool effect did or did not occur.
     return (
-        f"{_AUTO_CONTINUE_NOTE_PREFIX} — the app or its backend process "
-        "stopped before the turn could finish. Some of the work may already "
-        "be complete; check the current state before redoing anything, then "
-        "finish the task. The interrupted request was:]\n\n"
+        f"{_AUTO_CONTINUE_NOTE_PREFIX} — a best-effort marker remains, but the "
+        "prior outcome is unknown. Check authoritative state before repeating "
+        "any effect; do not treat this note as a permit. The prior request was:]\n\n"
         f"{prompt}"
     )
 
 
+def _cold_interrupted_turn_projection(session: dict, session_key: str) -> dict | None:
+    """Advisory UI snapshot of an interrupted prompt, never retry authority.
+
+    The marker is a best-effort sidecar, not authenticated task or effect state.
+    Only the disabled auto-continue route uses it to keep the user's prompt
+    visible after a cold resume. It must not enter model history automatically.
+    """
+    if _auto_continue_config()[0]:
+        return None
+    marker = read_turn_marker(_session_home(session), session_key)
+    if marker is None:
+        return None
+    return {
+        "user": marker["prompt"],
+        "assistant": "",
+        "started_at": marker["started_at"],
+        "streaming": False,
+        "status": "error",
+        "error": "Possible interrupted turn; outcome unknown. Check effects before retrying.",
+        "error_surface": {
+            "layer": "runtime", "code": "interrupted_turn_unknown", "retryable": False,
+        },
+        "recoverable": True,
+    }
+
+
 def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> dict | None:
-    """Kick off a continuation turn for a crash-interrupted session.
+    """Optionally schedule a continuation from an advisory retained marker.
 
     Called from session.resume's cold paths after the live record is
-    registered. Returns a small descriptor for the resume payload when a
-    continuation was scheduled, else None. The turn itself runs on a
-    background thread after the (deferred) agent build finishes, through the
-    same _run_prompt_submit machinery as every other synthesized turn — so
-    the client that just resumed streams it live.
+    registered. A marker is not authenticated outcome/effect evidence; this
+    opt-in behavior has freshness and attempt bounds but does not make
+    re-execution safe for unsettled effects. Returns a descriptor when
+    scheduled, otherwise None.
     """
     home = _session_home(session)
     marker = read_turn_marker(home, session_key)
@@ -9317,9 +9400,12 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
         return None
     enabled, freshness_secs, max_attempts = _auto_continue_config()
     age = time.time() - marker["started_at"]
-    if not enabled or age > freshness_secs or marker["attempts"] >= max_attempts:
-        # Stale, disabled, or crash-looping: stop trying. The journal/partial
-        # transcript still shows what happened; a manual message continues it.
+    if not enabled:
+        # Disabling replay is not permission to erase the only remaining prompt
+        # hint. Keep the advisory sidecar until a later turn clears it or a
+        # future marker write prunes it (there is no passive expiry on reads).
+        return None
+    if age > freshness_secs or marker["attempts"] >= max_attempts:
         clear_turn_marker(home, session_key)
         return None
     if session.get("_auto_continue_scheduled"):
@@ -9728,6 +9814,10 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         if queued.get("transport") is not None:
             session["transport"] = queued["transport"]
     use_compute_host = _session_uses_compute_host(session)
+    require_compute_host = (
+        _load_dashboard_process_isolation_config()["require_compute_host"]
+        and not _inside_compute_host_child()
+    )
     with session["history_lock"]:
         if int(session.get("_queued_prompt_generation", 0)) != queue_generation:
             # Generation cancelled the claim (Stop, compress re-anchor, …).
@@ -9747,6 +9837,17 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                 session.pop("queued_prompts", None)
             session["running"] = False
             return True
+    if not use_compute_host and require_compute_host:
+        message = "compute host required but queued session cannot route to it"
+        with session["history_lock"]:
+            session["running"] = False
+            _start_inflight_turn(session, queued["text"])
+            _fail_inflight_turn(
+                session, message,
+                error_surface={"layer": "runtime", "code": "compute_host_dispatch_failed", "retryable": True},
+            )
+        _emit("error", sid, {"message": message})
+        return True
     dispatch_failed = False
     try:
         if use_compute_host:
@@ -9769,7 +9870,14 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                 message = str(((resp.get("error") or {}).get("message")) or "queued prompt failed")
                 with session["history_lock"]:
                     session["running"] = False
-                    _clear_inflight_turn(session)
+                    if require_compute_host:
+                        _start_inflight_turn(session, queued["text"])
+                        _fail_inflight_turn(
+                            session, message,
+                            error_surface={"layer": "runtime", "code": "compute_host_dispatch_failed", "retryable": True},
+                        )
+                    else:
+                        _clear_inflight_turn(session)
                 _emit("error", sid, {"message": message})
                 dispatch_failed = True
         else:
@@ -9800,8 +9908,20 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         )
         with session["history_lock"]:
             session["running"] = False
+            if require_compute_host:
+                _start_inflight_turn(session, queued["text"])
+                _fail_inflight_turn(
+                    session, exc,
+                    error_surface={"layer": "runtime", "code": "compute_host_dispatch_failed", "retryable": True},
+                )
+        if require_compute_host:
+            _emit("error", sid, {"message": str(exc)})
         dispatch_failed = True
     if dispatch_failed:
+        # Do not consume a different queued prompt after ambiguous child dispatch
+        # when the operator explicitly required this dispatch location.
+        if require_compute_host:
+            return True
         with session["history_lock"]:
             drain_next = bool(session.get("queued_prompt")) and not session.get(
                 "_turn_cancel_requested"
@@ -12243,6 +12363,26 @@ def _run_prompt_submit(
     queued_prompt_generation: int | None = None,
     context_input_event_id: str | None = None,
 ) -> bool:
+    # This entry also serves auto-continue and goal follow-ups. Required host
+    # dispatch cannot fall back to a serving-process turn on those routes.
+    if (not _inside_compute_host_child()
+            and _load_dashboard_process_isolation_config()["require_compute_host"]):
+        message = "compute host required; serving-process turn denied"
+        with session["history_lock"]:
+            if session.get("_closing") or (
+                queued_prompt_generation is not None
+                and int(session.get("_queued_prompt_generation", 0)) != queued_prompt_generation
+            ):
+                session["running"] = False
+                return False
+            session["running"] = False
+            _start_inflight_turn(session, text)
+            _fail_inflight_turn(
+                session, message,
+                error_surface={"layer": "runtime", "code": "compute_host_dispatch_failed", "retryable": True},
+            )
+        _emit("error", sid, {"message": message})
+        return False
     with session["history_lock"]:
         if session.get("_closing"):
             session["running"] = False
@@ -12313,12 +12453,12 @@ def _run_prompt_submit(
         # True once a failed turn's snapshot was retained for resume replay —
         # tells the finally below to skip the normal inflight clear.
         turn_error_retained = False
-        # Durable crash marker: written before the turn runs, retired the
-        # moment its outcome reaches the client (see _retire_turn_marker).
-        # Any concluded turn — success, handled error, interrupt — retires
-        # it, so a marker that survives means the process died mid-turn;
-        # session.resume auto-continues from it. Compression can rotate
-        # session_key mid-turn, so remember the key we wrote under.
+        # Best-effort crash hint: recorded before the turn, normally retired
+        # near its terminal frame. A surviving marker is not authenticated
+        # evidence of process death or effect outcome (failed clear and same-UID
+        # writes are possible). Disabled auto-continue only projects it for UI
+        # review; enabled auto-continue has separate freshness/attempt bounds.
+        # Compression can rotate session_key, so retain the key written here.
         marker_home = _session_home(session)
         marker_key = str(session.get("session_key") or "")
         marker_attempt = int(session.pop("_auto_continue_attempt", 0) or 0)
