@@ -763,6 +763,22 @@ class ComputeHost:
                     }
                 )
                 return
+            if route_name == "config.set.fast":
+                params = frame.get("params")
+                if not isinstance(params, dict):
+                    params = {}
+                response = server._methods["config.set"](
+                    request_id,
+                    {"key": "fast", "value": params.get("value", ""), "session_id": sid},
+                )
+                if "error" in response:
+                    self.emit({"type": "control.error", "sid": sid, "request_id": request_id,
+                               "message": str(response["error"].get("message") or "fast switch failed")})
+                    return
+                self.emit({"type": "control.ack", "sid": sid, "request_id": request_id,
+                           "route_name": route_name, "result": response.get("result") or {},
+                           "session_info": server._session_info(session.get("agent"), session)})
+                return
             if route_name == "reload.mcp":
                 self._handle_reload_mcp({**frame, "type": "reload_mcp"})
                 return

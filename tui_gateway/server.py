@@ -3011,6 +3011,11 @@ def _start_agent_build(sid: str, session: dict) -> None:
             history_ready = current.get("resume_history_ready")
             if history_ready is not None:
                 if not history_ready.wait(timeout=300.0):
+                    logger.warning(
+                        "resume hydration timeout runtime=%s stored=%s profile=%s stage=%s",
+                        sid, key, Path(profile_home).name if profile_home else "default",
+                        current.get("resume_hydration_stage", "unknown"),
+                    )
                     raise TimeoutError("session history hydration timed out")
                 if history_error := current.get("resume_history_error"):
                     raise RuntimeError(str(history_error))
@@ -6967,7 +6972,12 @@ def _session_info(agent, session: dict | None = None) -> dict:
             reasoning_effort = "none"
         else:
             reasoning_effort = str(reasoning_config.get("effort", "") or "")
-    service_tier = getattr(agent, "service_tier", None) or mirror.get("service_tier") or ""
+    if session is not None and _session_uses_compute_host(session) and "service_tier" in mirror:
+        # The compute host owns the live agent. An explicit normal/off value
+        # must win over a stale serving-process agent and profile default.
+        service_tier = mirror["service_tier"] or ""
+    else:
+        service_tier = getattr(agent, "service_tier", None) or mirror.get("service_tier") or ""
     # Effective approval-bypass state — the same three sources that
     # check_all_command_guards() ORs together: persistent config
     # (approvals.mode=off), the process-scoped --yolo env, and the
@@ -10098,6 +10108,8 @@ def _schedule_resume_hydration(
 
     def _run() -> None:
         session = _sessions.get(sid)
+        stage = "starting"
+        started_at = time.monotonic()
         try:
             if session is None:
                 return
@@ -10106,9 +10118,13 @@ def _schedule_resume_hydration(
                 sid,
                 {"phase": "history", "status": "loading"},
             )
+            stage = session["resume_hydration_stage"] = "reopen"
             db.reopen_session(stored_id)
+            stage = session["resume_hydration_stage"] = "history_read"
             raw_history, display_history = db.get_resume_conversations(stored_id)
+            stage = session["resume_hydration_stage"] = "ancestor_read"
             prefix = db.get_ancestor_display_prefix(stored_id)
+            stage = session["resume_hydration_stage"] = "replay_projection"
             history = sanitize_replay_history(raw_history)
 
             if _sessions.get(sid) is not session:
@@ -10133,6 +10149,13 @@ def _schedule_resume_hydration(
         except Exception as exc:
             if _sessions.get(sid) is not session:
                 return
+            profile_label = (session or {}).get("profile_home")
+            logger.warning(
+                "resume hydration failed runtime=%s stored=%s profile=%s stage=%s elapsed_ms=%d error_type=%s",
+                sid, stored_id, Path(profile_label).name if profile_label else "default",
+                stage,
+                int((time.monotonic() - started_at) * 1000), type(exc).__name__,
+            )
             message = f"resume failed: {exc}"
             session["resume_hydrating"] = False
             session["resume_history_error"] = message
@@ -13575,6 +13598,28 @@ def _(rid, params: dict) -> dict:
             return _err(rid, 5001, str(e))
 
     if key == "fast":
+        if params.get("session_id") and session is None:
+            return _err(rid, 4001, "session not found")
+        if session is not None and session.get("_compute_host_active") and _session_uses_compute_host(session):
+            sid = str(params["session_id"])
+            try:
+                ack = _send_compute_host_control(
+                    sid,
+                    route_name="config.set.fast",
+                    payload={"params": {"key": "fast", "value": value}},
+                    wait=True,
+                    timeout=30.0,
+                )
+            except Exception as exc:
+                return _err(rid, 5019, f"compute-host fast switch failed: {exc}")
+            if ack.get("type") in {"control.error", "error"}:
+                return _err(rid, 5001, str(ack.get("message") or "compute-host fast switch failed"))
+            result = ack.get("result")
+            if not isinstance(result, dict) or result.get("key") != "fast":
+                return _err(rid, 5001, "compute-host fast switch returned an invalid response")
+            _apply_compute_host_metadata_mirror(session, ack)
+            _emit("session.info", sid, _session_info(session.get("agent"), session))
+            return _ok(rid, result)
         raw = str(value or "").strip().lower()
         agent = session.get("agent") if session else None
         if agent is not None:

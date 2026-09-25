@@ -1071,6 +1071,7 @@ describe('profile-aware plugin session opens', () => {
 
   it('names the phase in the wake log so a stuck dial is not read as a slow transcript', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => undefined)
 
     vi.mocked(ensureGatewayProfile).mockImplementationOnce(() => new Promise<void>(() => undefined))
 
@@ -1096,8 +1097,16 @@ describe('profile-aware plugin session opens', () => {
     // would send a support bundle reader looking at transcript size.
     expect(payload.profileActivationMs).toBeGreaterThan(0)
     expect(payload.hydrationWaitMs).toBe(0)
+    const diagnostic = errorLog.mock.calls.find(call => String(call[0]).startsWith('[bot-wake] timeout '))
+    expect(diagnostic).toBeDefined()
+    expect(diagnostic).toHaveLength(1)
+    expect(JSON.parse(String(diagnostic?.[0]).slice('[bot-wake] timeout '.length))).toMatchObject({
+      phase: 'activation', storedSessionId: 'wedged-chat', profile: 'medicina',
+      hydrationWaitMs: 0
+    })
 
     warn.mockRestore()
+    errorLog.mockRestore()
   })
 
   it('gives hydration its own full budget after a slow but successful activation', async () => {
