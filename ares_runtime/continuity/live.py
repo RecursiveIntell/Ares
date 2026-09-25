@@ -14,6 +14,8 @@ from typing import Any, Callable
 
 from ares_runtime.collaboration import canonical_json
 from hermes_cli.goals import GoalState
+from hermes_cli.heartbeat import HeartbeatState
+from hermes_cli.loops import LoopState
 from hermes_state import SessionDB
 from hermes_state_continuity import ContextRebaseSnapshot
 
@@ -126,6 +128,49 @@ def _goal_projection(raw: str | None) -> tuple[str | None, bytes | None]:
         "contract": contract,
     }
     return state.goal_id, _canonical_bytes(projection)
+
+
+def _heartbeat_projection(raw: str | None) -> bytes | None:
+    if raw is None:
+        return None
+    try:
+        state = HeartbeatState.from_json(raw)
+    except Exception:
+        raise LiveContinuationError("LIVE_HEARTBEAT_STATE_INVALID") from None
+    if state.status == "cleared":
+        return None
+    return _canonical_bytes({
+        "prompt": state.prompt,
+        "interval_seconds": state.interval_seconds,
+        "status": state.status,
+        "last_fired_at": state.last_fired_at,
+        "fire_count": state.fire_count,
+    })
+
+
+def _loop_projection(raw: str | None) -> bytes | None:
+    if raw is None:
+        return None
+    try:
+        state = LoopState.from_json(raw)
+    except Exception:
+        raise LiveContinuationError("LIVE_LOOP_STATE_INVALID") from None
+    if state.status == "cleared":
+        return None
+    return _canonical_bytes({
+        "prompt": state.prompt,
+        "status": state.status,
+        "mode": state.mode,
+        "interval_seconds": state.interval_seconds,
+        "current_delay": state.current_delay,
+        "times": state.times,
+        "until": state.until,
+        "max_ticks": state.max_ticks,
+        "ticks_fired": state.ticks_fired,
+        "awaiting_response": state.awaiting_response,
+        "paused_reason": state.paused_reason,
+        "last_stop_reason": state.last_stop_reason,
+    })
 
 
 def _event_projection(event: dict[str, Any]) -> bytes:
@@ -307,6 +352,34 @@ def build_live_candidate(
             "record:goal:current", f"goal-state:{goal_id}", f"goal-revision:{control_revision}", goal_raw,
             kind=SourceKind.OWNER_STATE, status=EvidenceStatus.OBSERVED,
             freshness=Freshness.CURRENT, section=Section.FRONTIER, required=True,
+        )
+
+    heartbeat_raw = _heartbeat_projection(snapshot.heartbeat_raw)
+    if heartbeat_raw is not None:
+        add(
+            "record:heartbeat:current",
+            _opaque_ref("heartbeat-state", snapshot.session_id),
+            source_digest(heartbeat_raw),
+            heartbeat_raw,
+            kind=SourceKind.OWNER_STATE,
+            status=EvidenceStatus.OBSERVED,
+            freshness=Freshness.CURRENT,
+            section=Section.FRONTIER,
+            required=True,
+        )
+
+    loop_raw = _loop_projection(snapshot.loop_raw)
+    if loop_raw is not None:
+        add(
+            "record:loop:current",
+            _opaque_ref("loop-state", snapshot.session_id),
+            source_digest(loop_raw),
+            loop_raw,
+            kind=SourceKind.OWNER_STATE,
+            status=EvidenceStatus.OBSERVED,
+            freshness=Freshness.CURRENT,
+            section=Section.FRONTIER,
+            required=True,
         )
 
     if snapshot.todo_json is not None:
