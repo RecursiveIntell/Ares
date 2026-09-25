@@ -483,7 +483,21 @@ def migrate_loop_to_session(
         if not parent_raw:
             return False
         state = LoopState.from_json(parent_raw)
-        if state.status == "cleared" or db.get_meta(child_key) is not None:
+        child_raw = db.get_meta(child_key)
+        if child_raw is not None:
+            try:
+                existing = LoopState.from_json(child_raw)
+            except Exception:
+                return False
+            left = asdict(state)
+            right = asdict(existing)
+            left["status"] = right["status"]
+            return bool(
+                state.status == "cleared"
+                and existing.status != "cleared"
+                and left == right
+            )
+        if state.status == "cleared":
             return False
         child = LoopState.from_json(parent_raw)
         archived = LoopState.from_json(parent_raw)
