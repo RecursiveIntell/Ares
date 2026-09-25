@@ -20,7 +20,9 @@ from hermes_state_common import _sql_session_last_active
 
 
 _CONTEXT_REBASE_SCHEMA = "SessionDBContextRebaseV1"
+_CONTEXT_REBASE_EPISODE_SCHEMA = "SessionDBContextRebaseEpisodeV1"
 _CONTEXT_REBASE_KEY_PREFIX = "context-rebase:"
+_CONTEXT_REBASE_EPISODE_KEY_PREFIX = "context-rebase-episode:"
 _CONTEXT_REBASE_END_REASON = "context_rebase"
 _ALLOWED_STATES = {"committed_pending_activation", "ready", "reconciliation_required", "cancelled"}
 _ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,191}")
@@ -132,6 +134,58 @@ class ContextRebaseTransition:
         return _canonical(asdict(self))
 
 
+@dataclass(frozen=True)
+class ContextRebaseEpisode:
+    """Conversation-level anti-thrash state; physical session IDs cannot reset it."""
+
+    schema: str
+    conversation_root: str
+    attempts_without_recovery: int
+    last_transition_id: Optional[str]
+    last_before_tokens: Optional[int]
+    last_after_tokens: Optional[int]
+    updated_at: float
+    recovered_at: Optional[float]
+
+    def __post_init__(self) -> None:
+        if self.schema != _CONTEXT_REBASE_EPISODE_SCHEMA:
+            raise ContextContinuationError("CONTEXT_REBASE_EPISODE_SCHEMA")
+        _identity(self.conversation_root, "INVALID_CONVERSATION_ROOT")
+        _nonnegative_int(
+            self.attempts_without_recovery,
+            "INVALID_CONTEXT_REBASE_EPISODE_ATTEMPTS",
+        )
+        if self.last_transition_id is not None:
+            _identity(self.last_transition_id, "INVALID_TRANSITION_ID")
+        for value in (self.last_before_tokens, self.last_after_tokens):
+            if value is not None:
+                _nonnegative_int(value, "INVALID_CONTEXT_REBASE_EPISODE_TOKENS")
+        if type(self.updated_at) not in (int, float) or self.updated_at <= 0:
+            raise ContextContinuationError("CONTEXT_REBASE_EPISODE_INVALID")
+        if self.recovered_at is not None and (
+            type(self.recovered_at) not in (int, float) or self.recovered_at <= 0
+        ):
+            raise ContextContinuationError("CONTEXT_REBASE_EPISODE_INVALID")
+
+    @classmethod
+    def from_raw(cls, raw: str) -> "ContextRebaseEpisode":
+        value = _strict_json(raw)
+        expected = {
+            "schema", "conversation_root", "attempts_without_recovery",
+            "last_transition_id", "last_before_tokens", "last_after_tokens",
+            "updated_at", "recovered_at",
+        }
+        if set(value) != expected:
+            raise ContextContinuationError("CONTEXT_REBASE_EPISODE_INVALID")
+        try:
+            return cls(**value)
+        except TypeError as exc:
+            raise ContextContinuationError("CONTEXT_REBASE_EPISODE_INVALID") from exc
+
+    def raw(self) -> str:
+        return _canonical(asdict(self))
+
+
 
 
 @dataclass(frozen=True)
@@ -157,6 +211,82 @@ class SessionContextContinuityMixin:
 
     def _context_rebase_key(self, transition_id: str) -> str:
         return _CONTEXT_REBASE_KEY_PREFIX + _identity(transition_id, "INVALID_TRANSITION_ID")
+
+    @staticmethod
+    def _context_rebase_episode_key(conversation_root: str) -> str:
+        return (
+            _CONTEXT_REBASE_EPISODE_KEY_PREFIX
+            + _identity(conversation_root, "INVALID_CONVERSATION_ROOT")
+        )
+
+    def read_context_rebase_episode(self, session_id: str) -> ContextRebaseEpisode:
+        """Read durable no-progress state for the whole logical conversation."""
+        _identity(session_id, "INVALID_CHILD_SESSION")
+        with self._read_ctx() as conn:
+            root = str(self._session_turn_lease_key_on_conn(conn, session_id))
+            key = self._context_rebase_episode_key(root)
+            row = conn.execute(
+                "SELECT value FROM state_meta WHERE key=?", (key,)
+            ).fetchone()
+        if row is None:
+            now = time.time()
+            return ContextRebaseEpisode(
+                _CONTEXT_REBASE_EPISODE_SCHEMA,
+                root,
+                0,
+                None,
+                None,
+                None,
+                now,
+                now,
+            )
+        return ContextRebaseEpisode.from_raw(row[0])
+
+    def reset_context_rebase_episode(
+        self, session_id: str
+    ) -> ContextRebaseEpisode:
+        """Record provider-confirmed recovery for the logical conversation."""
+        _identity(session_id, "INVALID_CHILD_SESSION")
+
+        def _do(conn):
+            root = str(self._session_turn_lease_key_on_conn(conn, session_id))
+            key = self._context_rebase_episode_key(root)
+            row = conn.execute(
+                "SELECT value FROM state_meta WHERE key=?", (key,)
+            ).fetchone()
+            old = (
+                None
+                if row is None
+                else ContextRebaseEpisode.from_raw(row[0])
+            )
+            now = time.time()
+            updated = ContextRebaseEpisode(
+                _CONTEXT_REBASE_EPISODE_SCHEMA,
+                root,
+                0,
+                None if old is None else old.last_transition_id,
+                None if old is None else old.last_before_tokens,
+                None if old is None else old.last_after_tokens,
+                now,
+                now,
+            )
+            if row is None:
+                conn.execute(
+                    "INSERT INTO state_meta(key,value) VALUES(?,?)",
+                    (key, updated.raw()),
+                )
+            else:
+                cursor = conn.execute(
+                    "UPDATE state_meta SET value=? WHERE key=? AND value=?",
+                    (updated.raw(), key, row[0]),
+                )
+                if cursor.rowcount != 1:
+                    raise ContextContinuationError(
+                        "CONTEXT_REBASE_EPISODE_CHANGED"
+                    )
+            return updated
+
+        return self._execute_write(_do)
 
     @staticmethod
     def _context_epoch_from_model_config(raw: Any) -> int:
@@ -548,11 +678,18 @@ class SessionContextContinuityMixin:
         *,
         expected_continuation_digest: str,
         expected_child_session_id: str,
+        before_tokens: Optional[int] = None,
+        after_tokens: Optional[int] = None,
     ) -> ContextRebaseTransition:
         """Mark the local transition ready after external owner reconciliation."""
         key = self._context_rebase_key(transition_id)
         _digest(expected_continuation_digest)
         _identity(expected_child_session_id, "INVALID_CHILD_SESSION")
+        if (before_tokens is None) != (after_tokens is None):
+            raise ContextContinuationError("CONTEXT_REBASE_EPISODE_TOKENS_REQUIRED")
+        if before_tokens is not None:
+            _nonnegative_int(before_tokens, "INVALID_CONTEXT_REBASE_EPISODE_TOKENS")
+            _nonnegative_int(after_tokens, "INVALID_CONTEXT_REBASE_EPISODE_TOKENS")
 
         def _do(conn):
             row = conn.execute("SELECT value FROM state_meta WHERE key=?", (key,)).fetchone()
@@ -578,6 +715,47 @@ class SessionContextContinuityMixin:
                                   (ready.raw(), key, row[0]))
             if cursor.rowcount != 1:
                 raise ContextContinuationError("CONTEXT_REBASE_STATE_CHANGED")
+
+            if before_tokens is not None:
+                root = str(
+                    self._session_turn_lease_key_on_conn(
+                        conn, old.child_session_id
+                    )
+                )
+                episode_key = self._context_rebase_episode_key(root)
+                episode_row = conn.execute(
+                    "SELECT value FROM state_meta WHERE key=?",
+                    (episode_key,),
+                ).fetchone()
+                previous = (
+                    None
+                    if episode_row is None
+                    else ContextRebaseEpisode.from_raw(episode_row[0])
+                )
+                episode = ContextRebaseEpisode(
+                    _CONTEXT_REBASE_EPISODE_SCHEMA,
+                    root,
+                    1 if previous is None else previous.attempts_without_recovery + 1,
+                    old.transition_id,
+                    before_tokens,
+                    after_tokens,
+                    ready.ready_at,
+                    None if previous is None else previous.recovered_at,
+                )
+                if episode_row is None:
+                    conn.execute(
+                        "INSERT INTO state_meta(key,value) VALUES(?,?)",
+                        (episode_key, episode.raw()),
+                    )
+                else:
+                    ep_cursor = conn.execute(
+                        "UPDATE state_meta SET value=? WHERE key=? AND value=?",
+                        (episode.raw(), episode_key, episode_row[0]),
+                    )
+                    if ep_cursor.rowcount != 1:
+                        raise ContextContinuationError(
+                            "CONTEXT_REBASE_EPISODE_CHANGED"
+                        )
             return ready
 
         return self._execute_write(_do)
