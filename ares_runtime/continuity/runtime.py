@@ -444,16 +444,21 @@ def _carry_session_scoped_state(
         raise AutomaticRebaseError("TITLE_RECONCILIATION_FAILED") from None
 
 
-def _transfer_run_custody(agent: Any, old_session_id: str, new_session_id: str) -> None:
+def _transfer_run_custody(agent: Any, old_session_id: str, new_session_id: str, *, reservation: dict) -> tuple:
     custody = getattr(agent, "_run_checkpoint_custody", None)
     if custody is None:
         db = getattr(agent, "_session_db", None)
         if db is not None and db.list_run_custody_for_session(new_session_id):
             raise AutomaticRebaseError("RUN_CUSTODY_RECONCILIATION_REQUIRED")
-        return
+        return ()
     holder = getattr(agent, "_active_session_turn_lease_holder", None)
     try:
-        custody.reconcile_context_rebase(holder, new_session_id)
+        return custody.reconcile_context_rebase(
+            holder, new_session_id, recovery_reservation={
+                "transition_id": reservation["transition_id"], "attempt": reservation["attempts"],
+                "control_digest": reservation["action_control_digest"],
+            },
+        )
     except Exception:
         raise AutomaticRebaseError("RUN_CUSTODY_RECONCILIATION_FAILED") from None
 
@@ -850,7 +855,10 @@ def reconcile_context_rebase(
         # Old publications may not have local owner transfers. Their absent
         # recovery intent is rejected above rather than silently upgraded.
         _carry_session_scoped_state(db, parent_session_id, child_session_id)
-        _transfer_run_custody(agent, parent_session_id, child_session_id)
+        reconciled_custody = _transfer_run_custody(
+            agent, parent_session_id, child_session_id,
+            reservation=reservation,
+        )
         child = db.get_session(child_session_id)
         if not isinstance(child, dict) or child.get("ended_at") is not None:
             raise AutomaticRebaseError("CONTEXT_REBASE_CHILD_NOT_LIVE")
@@ -869,6 +877,8 @@ def reconcile_context_rebase(
             expected_child_session_id=child_session_id,
             before_tokens=before_tokens, after_tokens=after_tokens,
             turn_lease_holder=holder, recovery_attempt=reservation["attempts"],
+            expected_control_digest=reservation["action_control_digest"],
+            expected_custody=reconciled_custody,
         )
         agent.session_id = child_session_id
         agent._session_db_created = True

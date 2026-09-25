@@ -1005,6 +1005,8 @@ class SessionContextContinuityMixin:
                 raise ContextContinuationError("CONTEXT_REBASE_RECOVERY_INVALID")
             if recovery["attempts"] >= 3 or time.time() >= recovery["deadline_at"]:
                 raise ContextContinuationError("CONTEXT_REBASE_RECOVERY_EXHAUSTED")
+            snapshot = self._read_context_rebase_snapshot_on_conn(conn, transition.child_session_id)
+            recovery["action_control_digest"] = snapshot.action_control_digest
             recovery["attempts"] += 1
             recovery["holder_digest"] = hashlib.sha256(turn_lease_holder.encode()).hexdigest()
             recovery["next_check_at"] = time.time()
@@ -1012,6 +1014,36 @@ class SessionContextContinuityMixin:
             return recovery
 
         return self._execute_write(write)
+
+    def _assert_context_recovery_reservation_on_conn(self, conn, session_id, holder, expected):
+        """Recheck the bounded recovery reservation at each native mutation."""
+        if type(expected) is not dict or set(expected) != {"transition_id", "attempt", "control_digest"}:
+            raise ContextContinuationError("CONTEXT_REBASE_RECOVERY_FENCE_MISMATCH")
+        key = self._context_rebase_key(expected["transition_id"])
+        row = conn.execute("SELECT value FROM state_meta WHERE key=?", (key,)).fetchone()
+        if row is None:
+            raise ContextContinuationError("CONTEXT_REBASE_NOT_FOUND")
+        transition = ContextRebaseTransition.from_raw(row[0])
+        if (transition.child_session_id != session_id
+                or transition.state not in {"committed_pending_activation", "reconciliation_required"}):
+            raise ContextContinuationError("CONTEXT_REBASE_NOT_ACTIVATABLE")
+        row = conn.execute("SELECT value FROM state_meta WHERE key=?", (
+            _CONTEXT_REBASE_RECOVERY_PREFIX + expected["transition_id"],
+        )).fetchone()
+        recovery = {} if row is None else _strict_json(row[0])
+        if (recovery.get("schema") != "SessionDBContextRebaseRecoveryV1"
+                or recovery.get("transition_id") != transition.transition_id
+                or recovery.get("child_session_id") != session_id
+                or recovery.get("continuation_digest") != transition.continuation_digest
+                or type(expected["attempt"]) is not int or not 1 <= expected["attempt"] <= 3
+                or recovery.get("attempts") != expected["attempt"]
+                or recovery.get("action_control_digest") != expected["control_digest"]
+                or recovery.get("holder_digest") != hashlib.sha256(holder.encode()).hexdigest()):
+            raise ContextContinuationError("CONTEXT_REBASE_RECOVERY_FENCE_MISMATCH")
+        if (type(recovery.get("deadline_at")) not in (int, float)
+                or not math.isfinite(recovery["deadline_at"])
+                or time.time() >= recovery["deadline_at"]):
+            raise ContextContinuationError("CONTEXT_REBASE_RECOVERY_EXHAUSTED")
 
     def publish_context_rebase_child(
         self,
@@ -1262,6 +1294,8 @@ class SessionContextContinuityMixin:
         after_tokens: Optional[int] = None,
         turn_lease_holder: Optional[str] = None,
         recovery_attempt: Optional[int] = None,
+        expected_control_digest: Optional[str] = None,
+        expected_custody: tuple = (),
     ) -> ContextRebaseTransition:
         """Mark the local transition ready after external owner reconciliation."""
         key = self._context_rebase_key(transition_id)
@@ -1305,6 +1339,14 @@ class SessionContextContinuityMixin:
                     or not math.isfinite(recovery["deadline_at"])
                     or time.time() >= recovery["deadline_at"]):
                 raise ContextContinuationError("CONTEXT_REBASE_RECOVERY_EXHAUSTED")
+            if (not isinstance(expected_control_digest, str)
+                    or recovery.get("action_control_digest") != expected_control_digest):
+                raise ContextContinuationError("CONTEXT_REBASE_RECOVERY_CONTROL_MISMATCH")
+            self._check_run_control_on_conn(conn, old.child_session_id,
+                                             expected_control_digest.removeprefix("sha256:"))
+            self._check_context_ready_custodies_on_conn(
+                conn, old.child_session_id, expected_custody, turn_lease_holder,
+            )
             recovery["completed_attempt"] = recovery_attempt
             conn.execute("UPDATE state_meta SET value=? WHERE key=?", (_canonical(recovery), recovery_key))
             child = conn.execute("SELECT ended_at,model_config FROM sessions WHERE id=?", (old.child_session_id,)).fetchone()

@@ -76,7 +76,9 @@
         "ares_runtime/continuity/runtime.py"
       ],
       "supporting_test_files": [
-        "tests/ares_runtime/test_continuity_runtime.py"
+        "tests/ares_runtime/test_continuity_runtime.py",
+        "tests/test_run_task_custody.py",
+        "tests/tui_gateway/test_run_checkpoint_claim_rpc.py"
       ],
       "remaining_gate": "Installed tuple, native owner capabilities, compatibility and real binary baseline remain unqualified.",
       "acceptance_oracle": "Document checked custody requirements and a real goal-less task binding; keep V1 historical-goal checks intact.",
@@ -692,7 +694,8 @@
       ],
       "supporting_test_files": [
         "tests/ares_runtime/test_context_rebase_state.py",
-        "tests/ares_runtime/test_continuity_snapshot_races.py"
+        "tests/ares_runtime/test_continuity_snapshot_races.py",
+        "tests/test_run_custody_cold_recovery.py"
       ],
       "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete.",
       "acceptance_oracle": "Local child, continuation edge/tip, applicable goal/task transfer, custody revision and durable dispatch intent commit together with expected revisions. Only states sharing this owner transaction are local; external task/Graph state is referenced and reconciled, never duplicated as authority.",
@@ -792,7 +795,8 @@
       ],
       "supporting_test_files": [
         "tests/ares_runtime/test_context_rebase_state.py",
-        "tests/ares_runtime/test_continuity_snapshot_races.py"
+        "tests/ares_runtime/test_continuity_snapshot_races.py",
+        "tests/test_run_custody_cold_recovery.py"
       ],
       "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete.",
       "acceptance_oracle": "Unknown mutations are inspected through canonical owner readback; no second unchecked claim or replay.",
@@ -854,8 +858,10 @@
         "ares_runtime/continuity/runtime.py"
       ],
       "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_dispatch.py",
         "tests/ares_runtime/test_continuity_runtime.py",
-        "tests/ares_runtime/test_continuity_dispatch.py"
+        "tests/test_run_task_custody.py",
+        "tests/tui_gateway/test_run_checkpoint_claim_rpc.py"
       ],
       "remaining_gate": "Actual caller refusal is locally exercised with provider doubles. Live useful-work continuation, cold owner recovery, and sealed provider/effect attempts remain unqualified.",
       "acceptance_oracle": "A versioned goal-or-task binding or existing task owner is used through the real goal-less route; V1 remains strict.",
@@ -959,8 +965,9 @@
         "ares_runtime/continuity/runtime.py"
       ],
       "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_dispatch.py",
         "tests/ares_runtime/test_continuity_runtime.py",
-        "tests/ares_runtime/test_continuity_dispatch.py"
+        "tests/test_run_custody_cold_recovery.py"
       ],
       "remaining_gate": "Actual caller refusal is locally exercised with provider doubles. Live useful-work continuation, cold owner recovery, and sealed provider/effect attempts remain unqualified.",
       "acceptance_oracle": "Restart after publication adopts the same tip and reconciles state before admission, without relying on an old in-memory handle.",
@@ -1132,7 +1139,8 @@
       ],
       "supporting_test_files": [
         "tests/ares_runtime/test_continuity_dispatch.py",
-        "tests/ares_runtime/test_continuity_snapshot_races.py"
+        "tests/ares_runtime/test_continuity_snapshot_races.py",
+        "tests/test_run_custody_cold_recovery.py"
       ],
       "remaining_gate": "Local negative witnesses and repeat-rebase tests are not cross-owner crash/fault injection or real repeated provider rollovers.",
       "acceptance_oracle": "Disposable real stores/processes cover delayed acknowledgments, conflicting readers, disk full, cancellation and restart at every protocol step.",

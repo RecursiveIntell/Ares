@@ -92,19 +92,20 @@
     "Final pinned canonical gate: 26 files, 1289 passed, 0 failed, exit 0; raw log retained in repair-test-run.log."
   ],
   "blocked_gates": [
-    "No installed native capability tuple, paid-provider canary or external-owner qualification in this environment."
+    "Installed selected subscription-route tuple and live qualification are unavailable in this workspace."
   ],
   "remaining_delta": [
-    "External/native owner fencing and acknowledgment closure",
-    "Root-scoped input and controller recovery wakeup",
-    "Goal-less checked binding and cold-process custody recovery",
-    "Current workspace/evidence/policy and retrieval qualification",
-    "Objective progress and shared recovery caps",
-    "Compatibility, selected route, canary and endurance qualification"
+    "Durable root input ordering and authentic ingress before acceptance",
+    "Existing controller wake scheduling and already-READY cold-start integration",
+    "Native external effect-owner fence, incarnation and acknowledgement closure",
+    "Working source, conditional writes and current policy/retrieval",
+    "Objective progress and shared physical-attempt/recovery limits",
+    "Reader compatibility, backup/rollback qualification",
+    "Installed selected-route capability/calibration, subscription canaries and endurance"
   ],
-  "next_gate": "Hosted socket integration and remaining V4 construction/qualification; a passed repair is not the requested stop condition.",
+  "next_gate": "Durable ingress/controller construction, native owner closure and remaining exact-route V4 qualification.",
   "qualification": "Bounded source repair passed; full V4 program remains incomplete.",
-  "scope": "Cumulative PR80 implementation; latest repair is local final tool control, rollback protection and operator episode rearm.",
-  "latest_repair_evidence": "docs/context-continuity/control-progress-evidence.json",
+  "scope": "Cumulative PR80 implementation; latest repair is pending-child cold custody recovery, native READY seals and cleanup retention.",
+  "latest_repair_evidence": "docs/context-continuity/cold-custody-evidence.json",
   "latest_repair_audit": "pass_bounded"
 }

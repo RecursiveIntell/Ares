@@ -19,6 +19,7 @@ class _Handle:
     value: RunCustody | RunCustodyV2 | None = field(default=None, repr=False)
     status: str = "pending"
     error: str = "CLAIM_OUTCOME_UNKNOWN"
+    recovery_pending: bool = False
 
 
 class TurnRunCustody:
@@ -129,6 +130,23 @@ class TurnRunCustody:
             value = self._mutate(handle, self.db.refresh_run_custody, ttl_seconds=ttl_seconds)
             return self._summary(value, "refresh_observed")
 
+    def bind_recovery_files(self, holder, *, run_id, expected_generation, files, ttl_seconds=300):
+        """Explicit checked locator renewal after checkpoint/source advancement."""
+        from scripts.run_checkpoint_resume import BoundFileReader, ResumeRefusal, verify_checkpoint_files
+        with self._lock:
+            self._active(holder)
+            handle = self._handle(holder, run_id, expected_generation)
+            value = handle.value
+            try:
+                control = self.db.read_context_rebase_snapshot(value.current_session_id).action_control_digest
+                verify_checkpoint_files(value.checkpoint, files, BoundFileReader())
+            except (ResumeRefusal, RunCustodyError) as exc:
+                raise ClaimRefusal(str(exc)) from None
+            updated = self._mutate(handle, self.db.bind_run_recovery_files_checked,
+                lease_holder=holder, expected_control_digest=control.removeprefix("sha256:"),
+                files=files, ttl_seconds=ttl_seconds)
+            return self._summary(updated, "recovery_files_bound")
+
     def assert_goal_migration_safe(self, holder, *, session_id):
         """Refuse to mutate a goal row that an owned checkpoint binds as history."""
         with self._lock:
@@ -188,15 +206,20 @@ class TurnRunCustody:
                 for handle in handles:
                     handle.status = "unknown"
                 raise ClaimOutcomeUnknown("CONTEXT_REBASE_CUSTODY_UNKNOWN") from None
+            for handle in handles:
+                handle.recovery_pending = True
             self.reconcile_context_rebase(holder, result.child_session_id)
             return result
 
-    def reconcile_context_rebase(self, holder, child_session_id):
+    def reconcile_context_rebase(self, holder, child_session_id, *, recovery_reservation=None):
         """Resolve a lost publication ACK by readback, without a second mutation."""
         with self._lock:
             self._active(holder)
             for run_id, handle in self._handles.items():
-                if handle.holder != holder or handle.value is None:
+                if handle.status != "owned" and handle.error != "CONTEXT_REBASE_CUSTODY_UNKNOWN":
+                    raise ClaimOutcomeUnknown(handle.error)
+                if (handle.value is None or handle.holder != holder
+                        and not (handle.recovery_pending and handle.status == "owned")):
                     raise ClaimOutcomeUnknown("CONTEXT_REBASE_CUSTODY_UNKNOWN")
                 old = handle.value
                 current = self.db.read_run_custody(run_id)
@@ -208,10 +231,42 @@ class TurnRunCustody:
                     handle.status, handle.error = "unknown", "CONTEXT_REBASE_CUSTODY_UNKNOWN"
                     raise ClaimOutcomeUnknown(handle.error)
                 handle.value, handle.status = current, "owned"
+                handle.holder = holder
+                if recovery_reservation is not None:
+                    handle.recovery_pending = True
+            native = self.db.list_run_custody_for_session(child_session_id)
+            if len(native) > 16:
+                raise ClaimRefusal("CUSTODY_HANDLE_LIMIT")
+            if recovery_reservation is not None:
+                # Recovery is entered only under the runtime's durable bounded
+                # reservation. A missing handle is distinct from an uncertain
+                # same-process mutation, which was refused above.
+                for value in native:
+                    if value.run_id in self._handles:
+                        continue
+                    handle = _Handle(holder, recovery_pending=True)
+                    self._handles[value.run_id] = handle
+                    def captured(updated):
+                        handle.value = updated
+                    try:
+                        claim_client.recover_from_files(self.db, value,
+                            expected_session_id=child_session_id, expected_lease_holder=holder,
+                            expected_control_digest=recovery_reservation["control_digest"].removeprefix("sha256:"),
+                            recovery_reservation=recovery_reservation, controller_pid=os.getpid(),
+                            ttl_seconds=300, _on_claim=captured)
+                    except ClaimRefusal:
+                        del self._handles[value.run_id]
+                        raise
+                    except BaseException as exc:
+                        handle.status = "unknown"
+                        handle.error = str(exc) if isinstance(exc, ClaimOutcomeUnknown) else "CLAIM_OUTCOME_UNKNOWN"
+                        raise ClaimOutcomeUnknown(handle.error) from None
+                    handle.status = "owned"
             owned = {run_id for run_id, handle in self._handles.items() if handle.status == "owned"}
             current_ids = {value.run_id for value in self.db.list_run_custody_for_session(child_session_id)}
             if current_ids != owned:
                 raise ClaimOutcomeUnknown("CONTEXT_REBASE_CUSTODY_HANDLE_REQUIRED")
+            return tuple(self._handles[run_id].value for run_id in sorted(owned))
 
     def release(self, holder, *, run_id, expected_generation):
         with self._lock:
@@ -234,6 +289,17 @@ class TurnRunCustody:
                 if handle.status == "released":
                     del self._handles[run_id]
                     continue
+                if handle.status == "owned" and handle.recovery_pending:
+                    try:
+                        transition = self.db.context_rebase_transition_for_session(handle.value.current_session_id)
+                        completed = transition is not None and transition.state == "ready"
+                    except Exception:
+                        completed = False
+                    if not completed:
+                        errors.append({"run_id": run_id, "status": "recovery_pending",
+                                       "code": "RUN_CUSTODY_RECOVERY_PENDING"})
+                        continue
+                    handle.recovery_pending = False
                 if handle.status == "owned":
                     try:
                         self.release(holder, run_id=run_id, expected_generation=handle.value.generation)

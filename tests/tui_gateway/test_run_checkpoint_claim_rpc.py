@@ -49,6 +49,7 @@ def assert_first_claim_delta(before, after):
     before, after = dict(before), dict(after)
     assert set(after) - set(before) == {
         "run-custody:rpc-fixture:head", "run-custody:rpc-fixture:generation:1",
+        "run-custody:rpc-fixture:generation:1:files", "run-custody:rpc-fixture:recovery-files",
     }
     assert all(key in after and after[key] == value for key, value in before.items())
 

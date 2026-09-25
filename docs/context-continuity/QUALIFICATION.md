@@ -4,6 +4,35 @@ The V4 packet dated 2026-09-23 remains the full acceptance contract. This is
 an implementation branch. Qualification is tied to source hashes and named
 oracles; passing unit tests does not qualify a selected provider route.
 
+## Pending-child cold custody recovery
+
+File-bound checked claims now persist versioned recovery locators in the same
+SessionDB transaction. They contain paths bound to exact checkpoint/history
+identities, never a replayable request or old lease. Recovery independently
+reads the files and proves the previous process identity is gone; expiry alone
+cannot transfer ownership. Native admission repeats those checks, including
+the current lease, controls and bounded recovery reservation/deadline.
+
+The existing runtime recovery path can reconstruct missing private handles
+without creating a second child. A partial group remains pending through normal
+turn cleanup, a new lease and controller exit. Unknown mutation/readback
+outcomes remain quarantined. READY checks exact custody and controls inside the
+native transaction. Explicit release retains its previous meaning. Stale locator
+bindings require explicit checked renewal after checkpoint/source advancement.
+
+The exact local gate passed 536 tests across 30 files. Independent post-audit
+passed 32 tests and closed AUD-C1. The 24 cold-recovery cases include separate
+publisher/recovery processes, immutable V1 history, current V2 bindings, partial
+cleanup/restart, deadline races, READY races and lost acknowledgements.
+`cold-custody-evidence.json` binds source and raw logs. The existing host still
+needs durable wake scheduling and recovery integration for already-READY cold
+starts; this gate covers committed pending children, not the entire controller.
+
+Hosted CI on `ab7c2af` exposed a goal-command test fixture without a canonical
+session row. The fixture now creates the isolated durable session corresponding
+to its simulated completed turn. All 12 goal-command tests pass locally and the
+file is included in the focused hosted gate.
+
 ## Ordinary-task custody repair
 
 `SessionDBRunCustodyV2` binds an ordinary task to a genuine, active SessionDB
@@ -21,9 +50,8 @@ mixed schemas and lost acknowledgements refuse without silent reclaim.
 
 The local gate passed 500 tests across 28 files, including the real pinned
 Governor. Independent post-audit passed 155 tests across six files.
-`task-custody-evidence.json` records exact hashes and boundaries. Automatic cold
-recovery still requires persisted file locators and controller integration;
-this explicit checked-takeover proof does not certify that remaining seam.
+`task-custody-evidence.json` records exact hashes and boundaries. This explicit checked-takeover gate is supplemented by the pending-child
+recovery proof above; broader controller integration remains separate.
 
 The preceding `050ddf9` hosted qualification passed 1,630 tests in 44 files,
 with five existing skips, including all 44 execute-code tests. This closes the

@@ -21,7 +21,9 @@ on:
       - 'tests/test_run_checkpoint_import_boundaries.py'
       - 'tests/test_run_checkpoint*.py'
       - 'tests/test_run_task_custody.py'
+      - 'tests/test_run_custody_cold_recovery.py'
       - 'tests/tui_gateway/test_run_checkpoint_claim_rpc.py'
+      - 'tests/tui_gateway/test_goal_command.py'
       - 'tests/test_turn_run_custody.py'
       - 'tests/tui_gateway/test_inline_rpc_gil_starvation.py'
       - 'tests/tui_gateway/test_kanban_notify_poller.py'
@@ -126,7 +128,9 @@ jobs:
             tests/test_run_checkpoint_claim_client.py \
             tests/test_run_checkpoint_resume.py \
             tests/test_run_task_custody.py \
+            tests/test_run_custody_cold_recovery.py \
             tests/tui_gateway/test_run_checkpoint_claim_rpc.py \
+            tests/tui_gateway/test_goal_command.py \
             tests/test_turn_run_custody.py \
             tests/tui_gateway/test_inline_rpc_gil_starvation.py \
             tests/tui_gateway/test_kanban_notify_poller.py \
@@ -151,4 +155,5 @@ jobs:
             scripts/run_checkpoint_context.py
           .venv/bin/ruff check hermes_state_runs.py agent/run_checkpoint_custody.py \
             scripts/run_checkpoint_claim.py scripts/run_checkpoint_resume.py \
-            tui_gateway/run_checkpoint_rpc.py tests/test_run_task_custody.py
+            tui_gateway/run_checkpoint_rpc.py tests/test_run_task_custody.py \
+            tests/test_run_custody_cold_recovery.py
