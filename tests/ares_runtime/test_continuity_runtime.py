@@ -40,16 +40,29 @@ def setup(tmp_path):
     transitions = []
 
     def flush(rows, conversation_history=None):
-        # The historical prefix was materialized from SessionDB and is already
-        # durable. Persist only the current user row, matching the real flush
-        # contract relevant to this boundary.
-        existing = db.get_messages_as_conversation("s0")
+        # Persist the latest live user row under the current physical session,
+        # matching the production flush boundary without replaying the durable
+        # historical prefix.
+        latest_user = next(
+            (row for row in reversed(rows) if row.get("role") == "user"),
+            None,
+        )
+        if latest_user is None:
+            return True
+        target = agent.session_id
+        existing = db.get_messages_as_conversation(target)
         if not any(
             row.get("role") == "user"
-            and row.get("content") == current["content"]
+            and row.get("content") == latest_user.get("content")
             for row in existing
         ):
-            db.append_message("s0", "user", current["content"])
+            db.append_message(
+                target,
+                "user",
+                latest_user.get("content"),
+                display_kind=latest_user.get("display_kind"),
+                display_metadata=latest_user.get("display_metadata"),
+            )
         return True
 
     def transition_engine(**kwargs):
