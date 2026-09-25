@@ -6844,8 +6844,19 @@ def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
     monkeypatch.setattr(server, "_get_db", lambda: None)
     monkeypatch.setattr(server, "_emit", lambda *args, **_kwargs: emitted.append(args))
 
-    def _deliver(_rid, sid, session, text):
+    dispatch_metadata = []
+
+    def _deliver(
+        _rid,
+        sid,
+        session,
+        text,
+        *,
+        display_kind=None,
+        display_metadata=None,
+    ):
         delivered["a" if sid == "sid-a-live-handoff" else "b"].append(text)
+        dispatch_metadata.append((display_kind, display_metadata))
         session["running"] = False
 
     monkeypatch.setattr(server, "_run_prompt_submit", _deliver)
@@ -6874,6 +6885,12 @@ def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
         assert len(delivered["a"]) == 1
         assert "proc-live-handoff completed normally" in delivered["a"][0]
         assert delivered["b"] == []
+        assert dispatch_metadata == [
+            (
+                "internal_notification",
+                {"synthetic_source": "background_notification"},
+            )
+        ]
         assert isolated_queue.empty()
     finally:
         server._sessions.pop("sid-a-live-handoff", None)

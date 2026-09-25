@@ -98,7 +98,11 @@ class TestCliResumeRestartsWork:
             "— otherwise the goal sits idle until the user types something"
         )
         queued = cli._pending_input.get_nowait()
-        assert queued.startswith("[Continuing toward your standing goal]")
+        assert queued.text.startswith("[Continuing toward your standing goal]")
+        assert queued.display_kind == "internal_notification"
+        assert queued.display_metadata == {
+            "synthetic_source": "goal_continuation",
+        }
 
         state = goals.GoalManager(sid).state
         assert state.status == "active"

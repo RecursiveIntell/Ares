@@ -180,7 +180,11 @@ class TestHealthyTurnStillRuns:
         # Continuation prompt must be queued.
         assert not cli._pending_input.empty()
         queued = cli._pending_input.get_nowait()
-        assert "Continuing toward your standing goal" in queued
+        assert "Continuing toward your standing goal" in queued.text
+        assert queued.display_kind == "internal_notification"
+        assert queued.display_metadata == {
+            "synthetic_source": "goal_continuation",
+        }
         assert mgr.state.status == "active"
 
     def test_clean_response_waits_for_completion_authority(self, hermes_home):
