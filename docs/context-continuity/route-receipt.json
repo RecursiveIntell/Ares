@@ -163,6 +163,15 @@
         "docs/context-continuity/owner-recovery-audit-verdict.json"
       ],
       "receipt": "2865 local and 72 independent tests pass; native EF3/4 source compiles and Clippy passes, hosted runtime pending; full V4 incomplete."
+    },
+    {
+      "name": "native-scoped-authority-source",
+      "source_commit": "6afa7d634fbf1f7cbc2524f244d761a02afbe2a5",
+      "status": "source-reviewed-runtime-pending",
+      "evidence": [
+        "docs/context-continuity/native-external-owner.json",
+        "docs/context-continuity/native-context-authority-audit.json"
+      ]
     }
   ]
 }

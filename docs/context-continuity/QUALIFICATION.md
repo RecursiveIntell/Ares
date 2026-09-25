@@ -4,6 +4,28 @@ The V4 packet dated 2026-09-23 remains the full acceptance contract. This is
 an implementation branch. Qualification is tied to source hashes and named
 oracles; passing unit tests does not qualify a selected provider route.
 
+## Native scoped authority source increment
+
+The exact native candidate now implements authenticated context scope/generation
+admission in `DurablePermitStore`: operator-owned controller grants, incarnation,
+current policy and approval-verifier identity, global single-use V1 approval
+reservation, legacy admission fencing, and atomic retirement/activation with
+immutable readback. Consumed effects remain explicit obligations after retirement;
+reported outcomes are not external confirmation. Configuration and transition
+history are replayed to validate persisted admission projections.
+
+The independent source review closed CA-1, CA-2 and CA-3. Formatting, Clippy and
+policy/daemon test compilation passed. The exact patch/tree is submitted to the
+existing hosted native workspace gate; this increment's behavioral result is
+pending. Ares controller enrollment and continuity-saga integration remain next.
+This source increment does not close the EF-1/EF-2 cross-owner acceptance or V4.
+
+The preceding Ares commit `bd6c579a` passed every applicable hosted workflow,
+including full CI, Nix, Docker, exact export, and paired continuity qualification.
+Its focused gate passed 2,913 tests, zero failures, six skips across 90 files;
+its real native workspace gate passed, including the EF-3/EF-4 lost-ACK and
+locked-expiry witnesses. These results apply to that preceding exact source.
+
 ## Retained recovery custody and external receipt reconciliation
 
 The native SessionDB owner now renews an expired retained handle only for the

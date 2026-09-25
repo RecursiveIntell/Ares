@@ -2,19 +2,33 @@
   "schema": "ares.native-owner-patch/v1",
   "repository": "RecursiveIntell/recursive-agent",
   "base_commit": "11fefae304d43d9d72f7a238f9d2df77862b51c6",
-  "candidate_commit": "d0e5431ecab35f1eaf21bed1ff5fca3eab5bda17",
-  "candidate_tree": "e56714033d5c09d41d922d9b29f981032f3fe3a0",
+  "candidate_commit": "6afa7d634fbf1f7cbc2524f244d761a02afbe2a5",
+  "candidate_tree": "29744f31bc9b2d2a03472fbb6c76ad45ce45e980",
   "libraries_commit": "0b099ec416de60f6adafb182f1d1e83795d05c56",
-  "patch_sha256": "3792aa2394cb6b5c732ed74a33e5839a1ba33b62a86d1094f0e19672571669dc",
+  "patch_sha256": "c3f6b26e1827d2665b34e63dd20ef9916daf01f5cdbba912c3a3d67e5a54476f",
   "scope": [
     "external permit semantic outcome idempotency",
     "exact-binding read-only receipt lookup",
-    "trusted consumption time under native lock"
+    "trusted consumption time under native lock",
+    "operator-enrolled store/profile/root and controller capability",
+    "native incarnation and durable current approval-verifier/configuration fence",
+    "single-use approval reservation across context generations",
+    "atomic retirement/activation with immutable readback and consumed-obligation references",
+    "legacy bypass fence, historical settlement, native history consistency validation"
   ],
   "not_implemented": [
-    "context generation retirement",
-    "current-policy/incarnation fence"
+    "Ares authenticated controller enrollment and continuity saga integration",
+    "independently confirmed external outcome and task completion",
+    "installed route qualification and full V4 acceptance"
   ],
   "hosted_runner_contract": "recursive-agent@11fefae304d43d9d72f7a238f9d2df77862b51c6/.github/workflows/ci.yml",
-  "native_runtime_status": "pending_hosted_execution"
+  "native_runtime_status": "pending_hosted_execution_for_scoped_authority",
+  "previous_candidate_hosted_proof": {
+    "ares_commit": "bd6c579aa7e2d60bb8fbe10de0e5880f5c86600c",
+    "native_candidate": "d0e5431ecab35f1eaf21bed1ff5fca3eab5bda17",
+    "workflow_run": 36149215075,
+    "native_job": 108117936005,
+    "conclusion": "success",
+    "scope": "EF-3/EF-4 prerequisite only; whole native workspace gates passed"
+  }
 }
