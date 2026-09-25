@@ -92,7 +92,6 @@ test('descriptor-only pools never evict', () => {
   assert.deepEqual(selectPoolEvictions(entries, 2, NOW, FRESH_MS), [])
 })
 
-
 // ── #95189 — Keepalive-fresh window must tolerate transient missed pings ──
 // Symptom: gateway restarts every ~2 minutes on WSL2. Root cause: the renderer
 // pings every 60s; the LRU cap declared a backend "stale" if `lastActiveAt`

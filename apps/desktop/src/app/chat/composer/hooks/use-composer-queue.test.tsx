@@ -191,12 +191,14 @@ describe('useComposerQueue park integration', () => {
   it('coalesces rapid queued Steer clicks while its first delivery is unresolved', async () => {
     const entry = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'redirect once' })!
     let resolve!: (value: boolean) => void
+
     const onSteer = vi.fn(
       () =>
         new Promise<boolean>(r => {
           resolve = r
         })
     )
+
     const { hook } = renderQueueHook({ busy: true, onSteer })
 
     let first!: Promise<boolean>

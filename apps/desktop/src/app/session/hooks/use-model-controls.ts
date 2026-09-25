@@ -218,7 +218,8 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
       // in flight so a 4001 can be resumed by the correct surface instead of
       // being reported as a model failure.
       const storedSessionId = liveSessionId
-        ? ($sessionStates.get()[liveSessionId]?.storedSessionId ?? (touchesPrimary ? $selectedStoredSessionId.get() : null))
+        ? ($sessionStates.get()[liveSessionId]?.storedSessionId ??
+          (touchesPrimary ? $selectedStoredSessionId.get() : null))
         : null
 
       const updateLiveRuntimeSelection = (model: string, provider: string, optimistic = true) => {
@@ -272,7 +273,8 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
 
       const stillOwnsPrimarySelection = () =>
         !touchesPrimary ||
-        ($activeSessionId.get() === liveSessionId && (!storedSessionId || $selectedStoredSessionId.get() === storedSessionId))
+        ($activeSessionId.get() === liveSessionId &&
+          (!storedSessionId || $selectedStoredSessionId.get() === storedSessionId))
 
       const rollbackSelection = () => {
         // Roll back the owning runtime even if its primary surface lost focus
@@ -329,11 +331,19 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
 
       let recoveryAttempted = false
 
-      const requestSwitchWithRecovery = async (confirmExpensiveModel = false): Promise<ModelSwitchResponse | undefined> => {
+      const requestSwitchWithRecovery = async (
+        confirmExpensiveModel = false
+      ): Promise<ModelSwitchResponse | undefined> => {
         try {
           return await requestSwitch(confirmExpensiveModel)
         } catch (error) {
-          if (!isSessionGoneError(error) || recoveryAttempted || !recoverRuntime || !storedSessionId || !liveSessionId) {
+          if (
+            !isSessionGoneError(error) ||
+            recoveryAttempted ||
+            !recoverRuntime ||
+            !storedSessionId ||
+            !liveSessionId
+          ) {
             throw error
           }
 

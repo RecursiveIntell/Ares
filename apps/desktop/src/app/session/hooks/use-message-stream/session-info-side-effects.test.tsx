@@ -109,20 +109,17 @@ describe('session.info model-options invalidation gating', () => {
 
   it('preserves a pending model pick when a delayed heartbeat repeats the previous model', () => {
     mountStream()
-    sessionStates!.set(
-      ACTIVE_SID,
-      {
-        ...createClientSessionState('stored-active'),
+    sessionStates!.set(ACTIVE_SID, {
+      ...createClientSessionState('stored-active'),
+      model: 'model-b',
+      provider: 'provider-b',
+      pendingModelSelection: {
         model: 'model-b',
         provider: 'provider-b',
-        pendingModelSelection: {
-          model: 'model-b',
-          provider: 'provider-b',
-          previousModel: 'model-a',
-          previousProvider: 'provider-a'
-        }
-      } as ClientSessionState
-    )
+        previousModel: 'model-a',
+        previousProvider: 'provider-a'
+      }
+    } as ClientSessionState)
 
     // This event was queued before the local config.set selection. It must not
     // repaint the picker back to A merely because it arrives later.

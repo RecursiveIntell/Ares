@@ -150,11 +150,7 @@ export function ModelCatalogMenu({
     queryFn: (): Promise<ModelOptionsResponse> => requestModelOptions({ gateway, profile, request, sessionId })
   })
 
-  const {
-    data: modelOptionsData,
-    isFetching: modelOptionsFetching,
-    refetch: refetchModelOptions
-  } = modelOptions
+  const { data: modelOptionsData, isFetching: modelOptionsFetching, refetch: refetchModelOptions } = modelOptions
 
   const [emptyCatalogRetryAttempt, setEmptyCatalogRetryAttempt] = useState(0)
 

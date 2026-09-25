@@ -148,7 +148,11 @@ export function ComposerControls({
             type="button"
             variant="ghost"
           >
-            {interruptPending ? <Loader2 className={cn(iconSize.sm, 'animate-spin')} /> : <Square className={iconSize.sm} />}
+            {interruptPending ? (
+              <Loader2 className={cn(iconSize.sm, 'animate-spin')} />
+            ) : (
+              <Square className={iconSize.sm} />
+            )}
           </Button>
         </Tip>
       ) : null}
@@ -191,12 +195,10 @@ export function ComposerControls({
               ) : (
                 <span className="block size-2.5 rounded-[0.1875rem] bg-current" />
               )
+            ) : steeringPending && busyAction === 'steer' ? (
+              <Loader2 className={cn(iconSize.sm, 'animate-spin')} />
             ) : (
-              steeringPending && busyAction === 'steer' ? (
-                <Loader2 className={cn(iconSize.sm, 'animate-spin')} />
-              ) : (
-                <Codicon name="arrow-up" size="0.875rem" />
-              )
+              <Codicon name="arrow-up" size="0.875rem" />
             )}
           </Button>
         </Tip>

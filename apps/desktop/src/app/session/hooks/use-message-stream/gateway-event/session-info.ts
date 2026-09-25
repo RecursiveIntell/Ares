@@ -251,11 +251,7 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
           const { model: _incomingModel, provider: _incomingProvider, ...nonModelStatePatch } = statePatch
           const effectiveStatePatch = repeatsPreviousModel ? nonModelStatePatch : statePatch
 
-          const pendingModelSelection = repeatsPreviousModel
-            ? pending
-            : hasIncomingModelMetadata
-              ? null
-              : pending
+          const pendingModelSelection = repeatsPreviousModel ? pending : hasIncomingModelMetadata ? null : pending
 
           return {
             ...state,
