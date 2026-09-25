@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -103,6 +104,158 @@ def test_ensure_server_session_fallback_uses_canonical_source_resolver(monkeypat
     assert session["source"] == "iso-certify"
 
 
+@pytest.mark.parametrize("failure", ["open", "write"])
+def test_real_turn_refuses_when_profile_session_row_cannot_open(tmp_path, monkeypatch, failure):
+    """A child must not claim a turn started without a durable owner row."""
+    import hermes_state
+
+    profile_home = tmp_path / "isolated-profile"
+    profile_home.mkdir()
+    sid = "profile-db-unavailable"
+    session = {
+        "agent": types.SimpleNamespace(session_id=sid),
+        "session_key": sid, "profile_home": str(profile_home),
+        "model_override": {"model": "synthetic-heavy"},
+        "history": [], "history_lock": threading.Lock(),
+        "history_version": 0, "running": False,
+    }
+    monkeypatch.setattr(server, "_sessions", {sid: session})
+
+    class _BrokenDB:
+        def __init__(self, *args, **kwargs):
+            if failure == "open":
+                raise OSError("test-owned DB unavailable")
+
+        def create_session(self, *args, **kwargs):
+            raise OSError("test-owned row write unavailable")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(hermes_state, "SessionDB", _BrokenDB)
+    dispatched = []
+    monkeypatch.setattr(server, "_run_prompt_submit", lambda *a, **k: dispatched.append(a))
+    output = io.StringIO()
+    host = ComputeHost(stdout=output, heartbeat_secs=0)
+    monkeypatch.setattr(host, "_ensure_server_session", lambda _server, _frame: session)
+    try:
+        host._run_real_turn({"sid": sid, "request_id": "r1", "text": "hello"})
+    finally:
+        host.close()
+    frames = _json_lines(output)
+    assert [frame["type"] for frame in frames] == ["turn.error"]
+    assert frames[0]["reason"] == "exception"
+    assert dispatched == []
+    assert session["running"] is False
+
+
+def test_strict_profile_row_admission_has_independent_db_readback(tmp_path):
+    from hermes_state import SessionDB
+
+    profile_home = tmp_path / "fixture-profile"
+    profile_home.mkdir()
+    key = "durable-compute-turn"
+    server._ensure_session_db_row(
+        {"session_key": key, "profile_home": str(profile_home),
+         "source": "desktop", "model_override": {"model": "fixture-model"}},
+        require_durable=True,
+    )
+    db = SessionDB(db_path=profile_home / "state.db")
+    try:
+        row = db.get_session(key)
+        assert row is not None and row["id"] == key
+        assert row["profile_name"] == profile_home.name
+    finally:
+        db.close()
+
+
+def test_strict_profile_row_admission_rejects_existing_wrong_profile(tmp_path):
+    from hermes_state import SessionDB
+
+    profile_home = tmp_path / "fixture-profile"
+    profile_home.mkdir()
+    key = "colliding-compute-turn"
+    db = SessionDB(db_path=profile_home / "state.db")
+    try:
+        db.create_session(key, source="desktop", profile_name="different-profile")
+    finally:
+        db.close()
+    with pytest.raises(RuntimeError, match="persistence unavailable"):
+        server._ensure_session_db_row(
+            {"session_key": key, "profile_home": str(profile_home),
+             "source": "desktop", "model_override": {"model": "fixture-model"}},
+            require_durable=True,
+        )
+    db = SessionDB(db_path=profile_home / "state.db")
+    try:
+        row = db.get_session(key)
+        assert row is not None and row["profile_name"] == "different-profile"
+        # Denial must precede the idempotent upsert, which would otherwise
+        # enrich the other profile's existing row with our model config.
+        assert row["model_config"] is None
+    finally:
+        db.close()
+
+
+def test_compute_child_exit_preserves_admitted_row_for_independent_owner_readback(tmp_path):
+    """Child exit cannot erase the DB row admitted before turn.started.
+
+    The downstream prompt is stubbed; this is not provider or recovery proof.
+    """
+    repo = Path(__file__).resolve().parents[2]
+    home = tmp_path / "child-home"
+    home.mkdir()
+    code = """
+import io, json, sys, threading
+from types import SimpleNamespace
+from tui_gateway import server
+from tui_gateway.compute_host import ComputeHost
+home = sys.argv[1]
+sid = 'child-exit-row'
+session = {
+    'agent': SimpleNamespace(session_id=sid), 'session_key': sid,
+    'profile_home': home, 'source': 'desktop',
+    'model_override': {'model': 'fixture-model'},
+    'history': [], 'history_lock': threading.Lock(),
+    'history_version': 0, 'running': False,
+}
+server._sessions = {sid: session}
+server._start_inflight_turn = lambda *a, **k: None
+server._persist_branch_seed = lambda *a, **k: None
+server._run_prompt_submit = lambda *a, **k: None
+server._session_info = lambda *a, **k: {}
+out = io.StringIO()
+host = ComputeHost(stdout=out, heartbeat_secs=0)
+host._ensure_server_session = lambda _server, _frame: session
+host._run_real_turn({'sid': sid, 'request_id': 'test-turn', 'text': 'fixture'})
+host.close()
+sys.__stdout__.write(json.dumps([json.loads(line)['type'] for line in out.getvalue().splitlines()]) + '\\n')
+sys.__stdout__.flush()
+"""
+    env = {
+        "HOME": str(home), "HERMES_HOME": str(home), "TMPDIR": str(home),
+        "XDG_CONFIG_HOME": str(home), "XDG_CACHE_HOME": str(home),
+        "XDG_DATA_HOME": str(home), "PYTHONPATH": str(repo),
+        "HERMES_COMPUTE_HOST_CHILD": "1",
+        "PATH": os.pathsep.join((str(Path(sys.executable).parent), "/usr/bin", "/bin")),
+        "LANG": "C.UTF-8",
+    }
+    child = subprocess.run(
+        [sys.executable, "-c", code, str(home)], cwd=repo, env=env,
+        capture_output=True, text=True, timeout=20, check=False,
+    )
+    assert child.returncode == 0, child.stderr
+    assert json.loads(child.stdout.strip()) == ["turn.started", "turn.end"]
+    from hermes_state import SessionDB
+    db = SessionDB(db_path=home / "state.db")
+    try:
+        row = db.get_session("child-exit-row")
+        assert row is not None and row["id"] == "child-exit-row"
+        assert row["profile_name"] == home.name
+    finally:
+        db.close()
+
+
 def test_real_turn_accepts_void_session_persistence_contract(monkeypatch):
     """A successful void persistence helper must admit the host turn."""
     class _Agent:
@@ -120,7 +273,7 @@ def test_real_turn_accepts_void_session_persistence_contract(monkeypatch):
         "_turn_cancel_requested": False,
     }
     monkeypatch.setattr(server, "_sessions", {"real-sid": session}, raising=False)
-    monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: None)
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session, *, require_durable=False: None)
     monkeypatch.setattr(server, "_persist_branch_seed", lambda _session: None)
     monkeypatch.setattr(server, "_start_inflight_turn", lambda *args, **kwargs: None)
     monkeypatch.setattr(server, "_run_prompt_submit", lambda *args, **kwargs: None)
@@ -188,6 +341,27 @@ def test_required_compute_host_dispatch_error_never_falls_back_inline(monkeypatc
         assert session["running"] is False
     finally:
         server._sessions.pop(sid, None)
+
+
+def test_compute_child_atexit_keeps_active_turn_and_closes_idle(monkeypatch):
+    """The later atexit pass must not consume a still-live child turn."""
+    active = {"running": True, "_run_thread": types.SimpleNamespace(is_alive=lambda: True)}
+    idle = {"running": False, "_run_thread": types.SimpleNamespace(is_alive=lambda: False)}
+    monkeypatch.setattr(server, "_sessions", {"active": active, "idle": idle})
+    monkeypatch.setattr(server, "_inside_compute_host_child", lambda: True)
+    monkeypatch.setattr(server, "_flush_sessions_before_exit", lambda: None)
+    monkeypatch.setattr(server, "_release_gateway_wake_owner", lambda: None)
+    closed = []
+
+    def close(sid, *, end_reason, predicate=None):
+        if predicate is None or predicate(server._sessions[sid]):
+            closed.append((sid, end_reason))
+            server._sessions.pop(sid)
+
+    monkeypatch.setattr(server, "_close_session_by_id", close)
+    server._shutdown_sessions()
+    assert closed == [("idle", "tui_shutdown")]
+    assert server._sessions == {"active": active}
 
 
 def test_mutator_route_table_matches_prd_inventory():

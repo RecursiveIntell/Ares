@@ -1556,8 +1556,28 @@ def _shutdown_sessions() -> None:
         pass
     with _sessions_lock:
         sids = list(_sessions)
-    for sid in sids:
-        _close_session_by_id(sid, end_reason="tui_shutdown")
+    if _inside_compute_host_child():
+        # ComputeHost.shutdown already gave active turns a bounded drain. This
+        # later atexit pass must not consume their one-shot finalization latch
+        # or release the active-session lease. Recheck at the atomic pop.
+        def closeable_after_drain(session: dict) -> bool:
+            if session.get("running"):
+                return False
+            thread = session.get("_run_thread")
+            if thread is None:
+                return True
+            try:
+                return not thread.is_alive()
+            except Exception:
+                return False
+
+        for sid in sids:
+            _close_session_by_id(
+                sid, end_reason="tui_shutdown", predicate=closeable_after_drain,
+            )
+    else:
+        for sid in sids:
+            _close_session_by_id(sid, end_reason="tui_shutdown")
 
 
 # Last-resort net for any disconnect path that slips past the WS finally. TTL is
@@ -3618,7 +3638,7 @@ def _register_session_cwd(session: dict | None) -> None:
         pass
 
 
-def _ensure_session_db_row(session: dict) -> None:
+def _ensure_session_db_row(session: dict, *, require_durable: bool = False) -> None:
     """Idempotently persist the session's DB row on first real activity.
 
     Called from prompt.submit so a row only exists once the user actually sends
@@ -3642,6 +3662,8 @@ def _ensure_session_db_row(session: dict) -> None:
     """
     key = session.get("session_key")
     if not key:
+        if require_durable:
+            raise RuntimeError("compute-host session row requires a session key")
         return
     # Persist into the session's own profile db (global remote mode), not the
     # launch profile's — otherwise the row lands in the wrong state.db, the
@@ -3652,7 +3674,9 @@ def _ensure_session_db_row(session: dict) -> None:
 
         try:
             db = SessionDB(db_path=Path(profile_home) / "state.db")
-        except Exception:
+        except Exception as exc:
+            if require_durable:
+                raise RuntimeError("compute-host profile session DB unavailable") from exc
             logger.debug("failed to open profile db for session row", exc_info=True)
             return
         close_db = True
@@ -3660,7 +3684,21 @@ def _ensure_session_db_row(session: dict) -> None:
         db = _get_db()
         close_db = False
     if db is None:
+        if require_durable:
+            raise RuntimeError("compute-host session DB unavailable")
         return
+    if require_durable and profile_home:
+        # Reject a pre-existing foreign row before the idempotent upsert can
+        # enrich it. The post-write check below still catches identity drift;
+        # this read alone is not a transactional cross-process admission fence.
+        try:
+            existing = db.get_session(key)
+            if existing is not None and existing.get("profile_name") != Path(profile_home).name:
+                raise RuntimeError("compute-host session row profile mismatch")
+        except Exception as exc:
+            if close_db:
+                db.close()
+            raise RuntimeError("compute-host session row persistence unavailable") from exc
     # The session's own model/effort/fast pick — the composer override shipped on
     # session.create, or a restored /model switch — must own the row's model +
     # model_config. The agent isn't built yet at first prompt.submit, so derive
@@ -3733,6 +3771,15 @@ def _ensure_session_db_row(session: dict) -> None:
             # means the launch/default profile (matches run_agent's convention).
             profile_name=Path(profile_home).name if profile_home else None,
         )
+        if require_durable:
+            row = db.get_session(key)
+            if row is None or row.get("id") != key:
+                raise RuntimeError("compute-host session row readback missing")
+            # create_session is idempotent: an existing row can win its INSERT
+            # and belong to a different profile. Readback must bind the row to
+            # the profile DB that this child is serving, not merely to the ID.
+            if profile_home and row.get("profile_name") != Path(profile_home).name:
+                raise RuntimeError("compute-host session row profile mismatch")
         # A session can be born hidden (session.create hidden=true, or a
         # session.set_hidden that arrived before the row existed): apply the
         # deferred intent now that the row exists, mirroring pending_title.
@@ -3749,6 +3796,8 @@ def _ensure_session_db_row(session: dict) -> None:
 
         if is_disk_full_error(exc):
             raise
+        if require_durable:
+            raise RuntimeError("compute-host session row persistence unavailable") from exc
         logger.debug("failed to persist desktop session row", exc_info=True)
     finally:
         if close_db:
