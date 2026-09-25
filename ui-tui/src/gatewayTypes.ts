@@ -322,6 +322,7 @@ export interface SessionCloseResponse {
 
 export interface SessionInterruptResponse {
   ok?: boolean
+  status?: 'interrupted'
 }
 
 export interface SessionSteerResponse {

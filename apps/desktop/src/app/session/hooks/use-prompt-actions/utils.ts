@@ -710,6 +710,8 @@ export interface SubmitTextOptions {
    *  still receives the text as a normal user turn. */
   displayKind?: 'hidden'
   fromQueue?: boolean
+  /** Exact queue entry whose uncertain delivery must survive a restart. */
+  queueEntryId?: string
   /** A one-shot /goal resume dispatch. The backend consumes its canonical
    * checkpoint only after agent readiness, at actual turn start. */
   goalContinuation?: boolean

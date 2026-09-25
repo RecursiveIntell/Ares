@@ -122,6 +122,7 @@ function renderSubmitHook({
 
   return {
     clearDraft,
+    draftRef,
     hook,
     onCancel,
     onSteer,
@@ -284,6 +285,61 @@ describe('useComposerSubmit busy-turn routing', () => {
     expect(queueCurrentDraft).not.toHaveBeenCalled()
     expect(onCancel).not.toHaveBeenCalled()
     expect(onSubmit).not.toHaveBeenCalled()
+  })
+
+  it('keeps a live correction in the composer until the redirect outcome is known', async () => {
+    const { clearDraft, draftRef, hook, onSteer, queueCurrentDraft } = renderSubmitHook({
+      busy: true,
+      text: 'change course'
+    })
+
+    let acceptSteer!: (accepted: boolean) => void
+    onSteer.mockImplementation(
+      () =>
+        new Promise(resolve => {
+          acceptSteer = resolve
+        })
+    )
+
+    act(() => hook.result.current.steerDraft())
+
+    expect(clearDraft).not.toHaveBeenCalled()
+    expect(draftRef.current).toBe('change course')
+    expect(queueCurrentDraft).not.toHaveBeenCalled()
+
+    await act(async () => {
+      acceptSteer(true)
+      await Promise.resolve()
+    })
+    expect(clearDraft).toHaveBeenCalledOnce()
+  })
+
+  it('retains an uncertain live correction without auto-queueing it', async () => {
+    const { clearDraft, draftRef, hook, onSteer, queueCurrentDraft } = renderSubmitHook({
+      busy: true,
+      text: 'change course'
+    })
+
+    let rejectSteer!: (error: Error) => void
+    onSteer.mockImplementation(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectSteer = reject
+        })
+    )
+
+    act(() => hook.result.current.steerDraft())
+    expect(hook.result.current.steeringPending).toBe(true)
+
+    await act(async () => {
+      rejectSteer(new Error('delivery status is unknown'))
+      await Promise.resolve()
+    })
+
+    expect(hook.result.current.steeringPending).toBe(false)
+    expect(draftRef.current).toBe('change course')
+    expect(clearDraft).not.toHaveBeenCalled()
+    expect(queueCurrentDraft).not.toHaveBeenCalled()
   })
 
   it('queues a plain-text follow-up while the active turn is compacting', () => {

@@ -369,6 +369,7 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
             ...state,
             awaitingResponse: false,
             busy,
+            interruptPending: busy ? state.interruptPending : false,
             reconnecting: false,
             // The turn is over but its streaming bubble may still say
             // pending — running=false from the agent loop's finally block

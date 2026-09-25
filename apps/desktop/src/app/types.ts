@@ -211,6 +211,9 @@ export interface ClientSessionState {
   adoptedRunningTurn: boolean
   pendingBranchGroup: string | null
   interrupted: boolean
+  /** A session.interrupt RPC is outstanding. The session remains busy until
+   *  the backend reports terminal state; this is only a per-session UI latch. */
+  interruptPending: boolean
   /** True after message.interim finalized a bubble in the still-running turn. */
   interimBoundaryPending: boolean
   /** A blocking clarify prompt is waiting on the user for this session. Drives

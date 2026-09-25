@@ -42,10 +42,13 @@ export function ComposerControls({
   foldVoice = false,
   hasComposerPayload,
   minimal = false,
+  interruptPending = false,
+  steeringPending = false,
   state,
   voiceStatus,
   onDictate,
   onQueue,
+  onStop,
   onToggleAutoSpeak
 }: {
   autoSpeak: boolean
@@ -58,11 +61,14 @@ export function ComposerControls({
   foldVoice?: boolean
   hasComposerPayload: boolean
   minimal?: boolean
+  interruptPending?: boolean
+  steeringPending?: boolean
   state: ChatBarState
   voiceStatus: VoiceStatus
   onDictate: () => void
   onQueue: () => void
   onToggleAutoSpeak: () => void
+  onStop?: () => void
 }) {
   const { t } = useI18n()
   const c = t.composer
@@ -73,16 +79,17 @@ export function ComposerControls({
   }
 
   const showVoicePrimary = !busy && !hasComposerPayload
-  // Steer is just send: a payload keeps the Send affordance mid-turn. Stop
-  // only when the composer is empty and a turn is running.
+  // Steer is just send: a payload keeps Send. Stop has its own secondary
+  // control while a turn is running, including when the user has a draft.
   const showStop = busy && !hasComposerPayload
-  const showQueueButton = busyAction !== 'stop' && hasComposerPayload
+  const showSecondaryStop = busy && hasComposerPayload && Boolean(onStop)
+  const showQueueButton = busyAction !== 'stop' && hasComposerPayload && !minimal
   // The HUD is a Spotlight bar a few hundred pixels wide, so the four separate
   // voice toggles fold into one menu there and leave the row to the input. A
   // narrow tile hits the same wall from the other direction and folds for the
   // same reason — same controls, same state, different budget. Below that
-  // even the menu goes: at `minimal` the row is the send button and nothing
-  // else, which is the one thing that must survive every width.
+  // the menu and visible Queue control go; Send remains, with Stop added only
+  // during a live turn.
   const foldedVoice = hudMode || foldVoice
 
   const voiceControls = foldedVoice ? (
@@ -116,13 +123,32 @@ export function ComposerControls({
           <Button
             aria-label={c.queueMessage}
             className={GHOST_ICON_BTN}
-            disabled={disabled}
+            disabled={disabled || interruptPending || steeringPending}
             onClick={onQueue}
             size="icon"
             type="button"
             variant="ghost"
           >
             <Layers3 className={iconSize.sm} />
+          </Button>
+        </Tip>
+      ) : null}
+      {showSecondaryStop ? (
+        <Tip label={c.stop}>
+          <Button
+            aria-busy={interruptPending || undefined}
+            aria-label={c.stop}
+            className={GHOST_ICON_BTN}
+            disabled={disabled || interruptPending}
+            onClick={() => {
+              triggerHaptic('cancel')
+              onStop?.()
+            }}
+            size="icon"
+            type="button"
+            variant="ghost"
+          >
+            {interruptPending ? <Loader2 className={cn(iconSize.sm, 'animate-spin')} /> : <Square className={iconSize.sm} />}
           </Button>
         </Tip>
       ) : null}
@@ -153,15 +179,24 @@ export function ComposerControls({
           }
         >
           <Button
+            aria-busy={showStop && interruptPending ? true : undefined}
             aria-label={showStop ? c.stop : c.send}
             className={PRIMARY_ICON_BTN}
-            disabled={disabled || !canSubmit}
+            disabled={disabled || !canSubmit || interruptPending || steeringPending}
             type="submit"
           >
             {showStop ? (
-              <span className="block size-2.5 rounded-[0.1875rem] bg-current" />
+              interruptPending ? (
+                <Loader2 className={cn(iconSize.sm, 'animate-spin')} />
+              ) : (
+                <span className="block size-2.5 rounded-[0.1875rem] bg-current" />
+              )
             ) : (
-              <Codicon name="arrow-up" size="0.875rem" />
+              steeringPending && busyAction === 'steer' ? (
+                <Loader2 className={cn(iconSize.sm, 'animate-spin')} />
+              ) : (
+                <Codicon name="arrow-up" size="0.875rem" />
+              )
             )}
           </Button>
         </Tip>

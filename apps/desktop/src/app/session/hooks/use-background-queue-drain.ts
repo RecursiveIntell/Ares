@@ -122,6 +122,7 @@ export function useBackgroundQueueDrain({
             submitTextRef.current(liveEntry.text, {
               attachments: liveEntry.attachments,
               fromQueue: true,
+              queueEntryId: liveEntry.id,
               sessionId: runtimeSessionId,
               storedSessionId: sessionKey
             })
@@ -172,7 +173,7 @@ export function useBackgroundQueueDrain({
         drainingSessionIdsRef.current.has(sessionKey) ||
         !shouldAutoDrain({
           isBusy,
-          parked: Boolean(parkedQueueSessions[sessionKey]),
+          parked: Boolean(parkedQueueSessions[sessionKey] || entries.some(entry => entry.deliveryUnknown)),
           queueLength: entries.length
         })
       ) {

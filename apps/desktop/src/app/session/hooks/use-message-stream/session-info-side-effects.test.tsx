@@ -188,6 +188,44 @@ describe('session.info settles a turn that produced no assistant payload', () =>
     expect(busyFor(ACTIVE_SID)).toBe(false)
   })
 
+  it('clears a pending Stop when the authoritative running=false event settles the turn', () => {
+    mountStream()
+    sessionStates!.set(ACTIVE_SID, {
+      ...createClientSessionState('stored-active'),
+      awaitingResponse: true,
+      busy: true,
+      interruptPending: true,
+      turnStartedAt: Date.now(),
+      turnLive: true
+    })
+
+    sessionInfo(ACTIVE_SID, { running: false })
+
+    expect(sessionStates!.get(ACTIVE_SID)).toMatchObject({
+      awaitingResponse: false,
+      busy: false,
+      interruptPending: false,
+      turnStartedAt: null
+    })
+  })
+
+  it('clears interrupt pending when message.complete settles an accepted Stop', () => {
+    mountStream()
+    sessionStates!.set(ACTIVE_SID, {
+      ...createClientSessionState('stored-active'),
+      awaitingResponse: true,
+      busy: true,
+      interrupted: true,
+      interruptPending: true,
+      turnStartedAt: Date.now(),
+      turnLive: true
+    })
+
+    act(() => stream.handleEvent({ payload: { text: '' }, session_id: ACTIVE_SID, type: 'message.complete' }))
+
+    expect(sessionStates!.get(ACTIVE_SID)).toMatchObject({ busy: false, interruptPending: false })
+  })
+
   it('keeps waiting when running=false lands before the turn ever started', async () => {
     mountStream()
 

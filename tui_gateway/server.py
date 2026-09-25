@@ -358,6 +358,10 @@ _LONG_HANDLERS = frozenset(
         # so a delayed status rehydrate cannot block runtime readiness, prompt
         # submission, or interrupts queued behind it on the same socket.
         "session.active_list",
+        # Loading a durable transcript can scan a long lineage and materialize
+        # every message/row id. Keep that read off the WS reader so Stop and
+        # live message RPCs later on the same socket remain admissible.
+        "session.history",
         "session.branch",
         "session.compress",
         "session.list",

@@ -5,6 +5,7 @@ import type { Translations } from '@/i18n'
 import { type ChatMessage, textPart } from '@/lib/chat-messages'
 import { optimisticAttachmentRef } from '@/lib/chat-runtime'
 import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
+import { isGatewayDeliveryUnknownError } from '@/lib/gateway-delivery'
 import { setMutableRef } from '@/lib/mutable-ref'
 import {
   isVoicePlaybackActive,
@@ -18,6 +19,7 @@ import {
   mainComposerScope,
   terminalContextBlocksFromDraft
 } from '@/store/composer'
+import { markQueuedPromptDeliveryUnknown, parkQueuedPrompts } from '@/store/composer-queue'
 import { $hudMode } from '@/store/hud'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { consumePendingCredentialWarning, requestDesktopOnboarding } from '@/store/onboarding'
@@ -772,11 +774,10 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           ...(options?.fromQueue && { queued: true })
         })
 
-        // On sleep/wake the gateway's in-memory session may have been cleared
-        // while the desktop app still holds the old session ID. The shared
-        // resolver re-registers the stored session and retries once; every
-        // other session-scoped RPC (attach, /compress, rewind, interrupt) goes
-        // through the same helper so one policy covers the whole bug class.
+        // An explicit "session not found" is safe to recover by re-registering
+        // the stored session. A request timeout is not: the server may already
+        // have accepted this non-idempotent user message, so retain it and do
+        // not resume/replay it without an operation-level idempotency contract.
         let submitErr: unknown = null
 
         try {
@@ -797,11 +798,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
                   setActiveSessionId(recoveredId)
                 }
               }
-            },
-            // A starved backend loop (#55578 symptom d) rejects the submit even
-            // though the stored session is fine — recover it like a dead id
-            // instead of erroring out and losing the session binding.
-            { alsoTimeout: true }
+            }
           )
         } catch (firstErr) {
           if (firstErr instanceof SessionRecoveryAborted) {
@@ -831,43 +828,74 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
         return true
       } catch (err) {
-        releaseBusy()
+        if (isGatewayDeliveryUnknownError(err)) {
+          // The gateway may already be running this turn. Keep its optimistic
+          // user row and busy state until an authoritative event/readback, and
+          // never auto-drain the same queued text a second time.
+          releaseSubmitLock()
 
-        // A queued drain that raced a not-yet-settled turn gets a transient
-        // "session busy" (4009). Don't surface an error bubble/toast — the entry
-        // stays queued and the composer's bounded auto-drain retries when idle.
-        if (options?.fromQueue && isSessionBusyError(err)) {
+          if (options?.fromQueue && targetStoredSessionId) {
+            if (options.queueEntryId) {
+              markQueuedPromptDeliveryUnknown(targetStoredSessionId, options.queueEntryId)
+            } else {
+              parkQueuedPrompts(targetStoredSessionId)
+            }
+          }
+
+          if (targetIsCurrentView()) {
+            notifyError(err, copy.promptFailed)
+          }
+
+          return false
+        }
+
+        releaseSubmitLock()
+        const backendBusy = isSessionBusyError(err)
+
+        // A queued drain stays queued; it cannot settle the other turn.
+        if (options?.fromQueue && backendBusy) {
           return false
         }
 
         const message = inlineErrorMessage(err, copy.promptFailed)
         const occurredAt = Date.now() / 1000
 
-        updateSessionState(
+        const afterFailure = updateSessionState(
           sessionId,
-          state => ({
-            ...state,
-            messages: [
-              ...state.messages,
-              {
-                id: `assistant-error-${Date.now()}`,
-                role: 'assistant',
-                parts: [],
-                error: message || copy.promptFailed,
-                branchGroupId: state.pendingBranchGroup ?? undefined,
-                completedAt: occurredAt,
-                timestamp: occurredAt
-              }
-            ],
-            busy: false,
-            awaitingResponse: false,
-            pendingBranchGroup: null,
-            sawAssistantPayload: true,
-            // The failed submit's clock seed dies with the turn it never got.
-            turnStartedAt: null
-          }),
+          state => {
+            // A rejected submit cannot settle a turn that already owns this
+            // session. 4009 is busy evidence even without a start event.
+            const existingTurnLive = state.turnLive && (state.busy || state.awaitingResponse)
+
+            return {
+              ...state,
+              messages: [
+                ...state.messages,
+                {
+                  id: `assistant-error-${Date.now()}`,
+                  role: 'assistant',
+                  parts: [],
+                  error: message || copy.promptFailed,
+                  branchGroupId: state.pendingBranchGroup ?? undefined,
+                  completedAt: occurredAt,
+                  timestamp: occurredAt
+                }
+              ],
+              busy: existingTurnLive || backendBusy,
+              awaitingResponse: existingTurnLive ? state.awaitingResponse : false,
+              pendingBranchGroup: existingTurnLive ? state.pendingBranchGroup : null,
+              sawAssistantPayload: existingTurnLive ? state.sawAssistantPayload : true,
+              turnStartedAt: existingTurnLive ? state.turnStartedAt : null
+            }
+          },
           targetStoredSessionId
         )
+
+        if (targetIsCurrentView()) {
+          setMutableRef(busyRef, afterFailure.busy)
+          scope.setBusy(afterFailure.busy)
+          scope.setAwaitingResponse(afterFailure.awaitingResponse)
+        }
 
         if (targetIsCurrentView() && isProviderSetupError(err)) {
           requestDesktopOnboarding(copy.providerCredentialRequired)

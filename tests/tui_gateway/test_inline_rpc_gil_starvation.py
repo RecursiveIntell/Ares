@@ -93,6 +93,10 @@ FRONTEND_POLLED_RPCS = [
     "setup.status",          # provider configured check — config/credential scan
 ]
 
+# Transcript reads materialize durable history and can be much larger than the
+# sidebar page. They must not block a later Stop request on the same WebSocket.
+CONTROL_LATENCY_RPCS = ["session.history"]
+
 
 @pytest.mark.parametrize("method", FRONTEND_POLLED_RPCS)
 def test_frontend_polled_rpc_is_pool_routed(server, method):
@@ -104,7 +108,15 @@ def test_frontend_polled_rpc_is_pool_routed(server, method):
     )
 
 
-def test_dispatch_inline_rpc_does_not_block_under_gil_pressure(server):
+@pytest.mark.parametrize("method", CONTROL_LATENCY_RPCS)
+def test_history_read_is_pool_routed_so_controls_remain_admissible(server, method):
+    assert method in server._LONG_HANDLERS, (
+        f"{method!r} is not in _LONG_HANDLERS — durable history reads can block "
+        "the WS reader before session.interrupt is admitted."
+    )
+
+
+def test_slow_history_does_not_block_same_socket_interrupt_admission(server):
     """A slow inline-turned-long handler must not prevent a concurrent fast
     handler from completing. This is the core invariant: dispatch() must
     return immediately for _LONG_HANDLERS so the WS read loop stays free.
@@ -115,28 +127,97 @@ def test_dispatch_inline_rpc_does_not_block_under_gil_pressure(server):
     """
     released = threading.Event()
 
-    def slow_session_list(rid, params):
+    def slow_session_history(rid, params):
         released.wait(timeout=5)
-        return server._ok(rid, {"sessions": []})
+        return server._ok(rid, {"messages": [], "count": 0})
 
-    server._methods["session.list"] = slow_session_list
-    server._methods["fast.check"] = lambda rid, params: server._ok(rid, {"ok": True})
+    server._methods["session.history"] = slow_session_history
+    server._methods["session.interrupt"] = lambda rid, params: server._ok(rid, {"status": "interrupted"})
 
-    t0 = time.monotonic()
-    # session.list is in _LONG_HANDLERS → dispatch returns None immediately
-    assert server.dispatch({"id": "slow", "method": "session.list", "params": {}}) is None
+    try:
+        t0 = time.monotonic()
+        # The actual WS loop awaits dispatch; the pooled history call must
+        # return immediately so it can read the following interrupt frame.
+        assert server.dispatch({"id": "history", "method": "session.history", "params": {}}) is None
 
-    # fast.check is inline → dispatch runs it synchronously and returns the result
-    fast_resp = server.dispatch({"id": "fast", "method": "fast.check", "params": {}})
-    fast_elapsed = time.monotonic() - t0
+        interrupt_resp = server.dispatch({"id": "stop", "method": "session.interrupt", "params": {}})
+        fast_elapsed = time.monotonic() - t0
 
-    assert fast_resp["result"] == {"ok": True}
-    assert fast_elapsed < 2.0, (
-        f"fast handler blocked for {fast_elapsed:.2f}s behind slow session.list — "
-        f"the WS read loop would stall, causing false 'needs setup' (#50005)."
+        assert interrupt_resp["result"] == {"status": "interrupted"}
+        assert fast_elapsed < 2.0, (
+            f"session.interrupt admission blocked for {fast_elapsed:.2f}s behind "
+            "a slow session.history read on the same WS reader."
+        )
+    finally:
+        released.set()
+
+
+def test_websocket_reader_reaches_stop_after_a_slow_history_request(monkeypatch, server):
+    """Exercise the real WS receive loop, not only direct dispatch()."""
+    import asyncio
+
+    from tui_gateway import ws as ws_mod
+
+    ws_server = ws_mod.server
+    released = threading.Event()
+
+    def slow_history(rid, params):
+        released.wait(timeout=5)
+        return server._ok(rid, {"messages": [], "count": 0})
+
+    monkeypatch.setitem(ws_server._methods, "session.history", slow_history)
+    monkeypatch.setitem(
+        ws_server._methods,
+        "session.interrupt",
+        lambda rid, params: ws_server._ok(rid, {"status": "interrupted"}),
     )
+    monkeypatch.setattr(ws_server, "_schedule_startup_orphan_sweep", lambda: None)
+    monkeypatch.setattr(ws_server, "resolve_skin", lambda: "default")
+    monkeypatch.setattr(ws_server, "_ensure_skin_watcher", lambda: None)
+    monkeypatch.setattr(ws_server, "register_live_transport", lambda *_a, **_k: None)
+    monkeypatch.setattr(ws_server, "unregister_live_transport", lambda *_a, **_k: None)
+    monkeypatch.setattr(ws_server, "_release_wake_for_transport", lambda *_a, **_k: None)
+    monkeypatch.setattr(ws_server, "_close_sessions_for_transport", lambda *_a, **_k: (0, 0))
 
-    released.set()
+    class FakeWS:
+        def __init__(self):
+            self.reads = 0
+            self.sent = []
+            self.interrupt_read = asyncio.Event()
+
+        async def accept(self, **kwargs):
+            return None
+
+        async def send_text(self, line):
+            self.sent.append(json.loads(line))
+
+        async def receive_text(self):
+            self.reads += 1
+            if self.reads == 1:
+                return json.dumps({"id": "history", "method": "session.history", "params": {}})
+            if self.reads == 2:
+                self.interrupt_read.set()
+                return json.dumps({"id": "stop", "method": "session.interrupt", "params": {}})
+            raise ws_mod._WebSocketDisconnect()
+
+        async def close(self):
+            return None
+
+    async def run():
+        fake = FakeWS()
+        task = asyncio.create_task(ws_mod.handle_ws(fake))
+        try:
+            await asyncio.wait_for(fake.interrupt_read.wait(), timeout=2.5)
+        finally:
+            released.set()
+        await task
+        return fake.sent
+
+    sent = asyncio.run(run())
+    assert any(
+        frame.get("id") == "stop" and frame.get("result", {}).get("status") == "interrupted"
+        for frame in sent
+    )
 
 
 def test_rpc_pool_workers_supports_concurrent_long_handlers(server):
