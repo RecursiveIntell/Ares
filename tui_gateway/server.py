@@ -9007,24 +9007,24 @@ def _expand_skill_invocation_for_replay(text: str, task_id: str) -> str:
         return text
 
 
-# Opening of the crash-recovery note synthesized by _auto_continue_note.
-# Matched (not just built) so a row persisted before the display type was
-# stamped at turn start still reads as a timeline event, and to recognize the
-# messaging gateway's twin note.
-_AUTO_CONTINUE_NOTE_PREFIX = "[System note: Your previous turn was interrupted mid-run"
+# Historical untyped rows must still render as continuation notes. Keep the
+# exact old prefix as a read-only classifier; new notes use uncertainty wording.
+_LEGACY_AUTO_CONTINUE_NOTE_PREFIX = "[System note: Your previous turn was interrupted mid-run"
+_AUTO_CONTINUE_NOTE_PREFIX = "[System note: A previous turn may have been interrupted"
 
 
 def _legacy_display_kind(role: str, text: str) -> str | None:
     """Infer the display type of a synthetic row persisted without one.
 
     Turn-start typing (see ``persist_user_display_kind``) covers everything
-    written from here on. Sessions already on disk carry untyped rows — and a
-    turn killed mid-run never reached the post-turn stamp at all, which is
-    exactly the auto-continue case — so the raw recovery note would paint as a
-    user bubble forever. Sniffing the one fixed synthetic prefix is the
-    migration for those rows; it is not how new rows get typed.
+    written from here on. Sessions already on disk can carry untyped notes;
+    a missing post-turn stamp must not make a synthetic note paint as an ordinary
+    user bubble. Recognize only the two explicit synthetic prefixes for
+    historical rows; new rows carry a declared display kind.
     """
-    if role == "user" and text.lstrip().startswith(_AUTO_CONTINUE_NOTE_PREFIX):
+    if role == "user" and text.lstrip().startswith(
+        (_AUTO_CONTINUE_NOTE_PREFIX, _LEGACY_AUTO_CONTINUE_NOTE_PREFIX)
+    ):
         return "auto_continue"
     return None
 
@@ -9289,17 +9289,15 @@ def _fail_inflight_turn(
     session["inflight_turn"] = turn
 
 
-# ── Auto-continue: resume a turn killed by a process/machine death ────
+# ── Auto-continue: optional resume from an interrupted-turn marker ────
 #
-# A turn that concludes — success, handled error, interrupt — clears its
-# durable marker (see tui_gateway/turn_marker.py) in _run_prompt_submit's
-# finally. Only a process death leaves the marker behind, so a marker found
-# at session.resume time is positive proof the turn never finished AND the
-# client never saw a terminal frame. If the interruption is fresh, re-submit
-# the interrupted prompt automatically (the messaging gateway has done this
-# for restart-interrupted sessions since #27856); if it's stale, clear the
-# marker and let the recovered partial transcript speak for itself — the
-# user can ask to continue manually.
+# A concluded turn normally clears its best-effort sidecar marker. A surviving
+# marker suggests interruption, but a same-UID writer can alter it and a failed
+# clear may leave one behind. It proves neither process death nor that a client
+# missed a terminal frame or that any provider/tool effect did not occur.
+# Automatic continuation is an explicit opt-in with freshness/attempt bounds;
+# when disabled, cold resume only projects an outcome-unknown UI snapshot and
+# does not turn marker text into model history or task authority.
 
 _AUTO_CONTINUE_ENABLED_DEFAULT = False
 _AUTO_CONTINUE_FRESHNESS_MINUTES_DEFAULT = 15
@@ -9332,14 +9330,12 @@ def _session_home(session: dict) -> Path:
 
 
 def _retire_turn_marker(session: dict, *keys: str) -> None:
-    """Drop the crash marker for a turn whose outcome is about to reach the client.
+    """Attempt to clear a turn's best-effort hint before its terminal frame.
 
-    Called immediately before the terminal frame rather than at the end of the
-    turn thread: post-turn work (titles, memory sync, goal hooks) runs for a
-    second or more after the client has its answer, and quitting inside that
-    window would leave a marker that looks like a crash — re-running a finished
-    turn on the next launch. Extra ``keys`` cover a session_key that
-    compression rotated mid-turn.
+    Post-turn work can continue after the client receives an answer. Clearing
+    here reduces stale-marker auto-continue risk in that window; a failed clear
+    or a same-UID edit can still leave a misleading marker. Extra keys cover a
+    session_key that compression rotated mid-turn.
     """
     home = _session_home(session)
     for key in dict.fromkeys((*keys, str(session.get("session_key") or ""))):
@@ -9348,28 +9344,51 @@ def _retire_turn_marker(session: dict, *keys: str) -> None:
 
 
 def _auto_continue_note(prompt: str) -> str:
-    # Same opening as the messaging gateway's recovery notes so transcript
-    # tooling recognizes both. The original prompt is embedded because a hard
-    # crash persists nothing of the interrupted turn to the session DB — this
-    # note is the only copy the model will see.
+    # Keep historical classification through _LEGACY_AUTO_CONTINUE_NOTE_PREFIX;
+    # new notes use a separate uncertainty-prefixed identity. Marker text is
+    # advisory, not proof that any provider/tool effect did or did not occur.
     return (
-        f"{_AUTO_CONTINUE_NOTE_PREFIX} — the app or its backend process "
-        "stopped before the turn could finish. Some of the work may already "
-        "be complete; check the current state before redoing anything, then "
-        "finish the task. The interrupted request was:]\n\n"
+        f"{_AUTO_CONTINUE_NOTE_PREFIX} — a best-effort marker remains, but the "
+        "prior outcome is unknown. Check authoritative state before repeating "
+        "any effect; do not treat this note as a permit. The prior request was:]\n\n"
         f"{prompt}"
     )
 
 
+def _cold_interrupted_turn_projection(session: dict, session_key: str) -> dict | None:
+    """Advisory UI snapshot of an interrupted prompt, never retry authority.
+
+    The marker is a best-effort sidecar, not authenticated task or effect state.
+    Only the disabled auto-continue route uses it to keep the user's prompt
+    visible after a cold resume. It must not enter model history automatically.
+    """
+    if _auto_continue_config()[0]:
+        return None
+    marker = read_turn_marker(_session_home(session), session_key)
+    if marker is None:
+        return None
+    return {
+        "user": marker["prompt"],
+        "assistant": "",
+        "started_at": marker["started_at"],
+        "streaming": False,
+        "status": "error",
+        "error": "Possible interrupted turn; outcome unknown. Check effects before retrying.",
+        "error_surface": {
+            "layer": "runtime", "code": "interrupted_turn_unknown", "retryable": False,
+        },
+        "recoverable": True,
+    }
+
+
 def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> dict | None:
-    """Kick off a continuation turn for a crash-interrupted session.
+    """Optionally schedule a continuation from an advisory retained marker.
 
     Called from session.resume's cold paths after the live record is
-    registered. Returns a small descriptor for the resume payload when a
-    continuation was scheduled, else None. The turn itself runs on a
-    background thread after the (deferred) agent build finishes, through the
-    same _run_prompt_submit machinery as every other synthesized turn — so
-    the client that just resumed streams it live.
+    registered. A marker is not authenticated outcome/effect evidence; this
+    opt-in behavior has freshness and attempt bounds but does not make
+    re-execution safe for unsettled effects. Returns a descriptor when
+    scheduled, otherwise None.
     """
     home = _session_home(session)
     marker = read_turn_marker(home, session_key)
@@ -9377,9 +9396,12 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
         return None
     enabled, freshness_secs, max_attempts = _auto_continue_config()
     age = time.time() - marker["started_at"]
-    if not enabled or age > freshness_secs or marker["attempts"] >= max_attempts:
-        # Stale, disabled, or crash-looping: stop trying. The journal/partial
-        # transcript still shows what happened; a manual message continues it.
+    if not enabled:
+        # Disabling replay is not permission to erase the only remaining prompt
+        # hint. Keep the advisory sidecar until a later turn clears it or a
+        # future marker write prunes it (there is no passive expiry on reads).
+        return None
+    if age > freshness_secs or marker["attempts"] >= max_attempts:
         clear_turn_marker(home, session_key)
         return None
     if session.get("_auto_continue_scheduled"):
@@ -12324,12 +12346,12 @@ def _run_prompt_submit(
         # True once a failed turn's snapshot was retained for resume replay —
         # tells the finally below to skip the normal inflight clear.
         turn_error_retained = False
-        # Durable crash marker: written before the turn runs, retired the
-        # moment its outcome reaches the client (see _retire_turn_marker).
-        # Any concluded turn — success, handled error, interrupt — retires
-        # it, so a marker that survives means the process died mid-turn;
-        # session.resume auto-continues from it. Compression can rotate
-        # session_key mid-turn, so remember the key we wrote under.
+        # Best-effort crash hint: recorded before the turn, normally retired
+        # near its terminal frame. A surviving marker is not authenticated
+        # evidence of process death or effect outcome (failed clear and same-UID
+        # writes are possible). Disabled auto-continue only projects it for UI
+        # review; enabled auto-continue has separate freshness/attempt bounds.
+        # Compression can rotate session_key, so retain the key written here.
         marker_home = _session_home(session)
         marker_key = str(session.get("session_key") or "")
         marker_attempt = int(session.pop("_auto_continue_attempt", 0) or 0)

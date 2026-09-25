@@ -777,6 +777,10 @@ def _(rid, params: dict) -> dict:
             record["resume_message_count"] = int(found.get("message_count") or 0)
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
                 return _reuse_live_response(*live)
+            interrupted = _cold_interrupted_turn_projection(record, target)
+            if interrupted is not None:
+                with record["history_lock"]:
+                    record["inflight_turn"] = interrupted
 
             _schedule_resume_hydration(sid, target, db, close_db=owns_db)
             # The hydration worker now owns a profile-scoped handle and closes it
@@ -798,7 +802,7 @@ def _(rid, params: dict) -> dict:
                         provider=overrides.get("provider_override") or "",
                         profile=profile,
                     ),
-                    "inflight": None,
+                    "inflight": interrupted,
                     "running": False,
                     "session_key": target,
                     "started_at": record["created_at"],
@@ -875,6 +879,13 @@ def _(rid, params: dict) -> dict:
             _schedule_agent_build(sid)
             _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
             auto_continue = _maybe_schedule_auto_continue(sid, record, target)
+            interrupted = (
+                _cold_interrupted_turn_projection(record, target)
+                if auto_continue is None else None
+            )
+            if interrupted is not None:
+                with record["history_lock"]:
+                    record["inflight_turn"] = interrupted
 
             messages = [] if omit_messages else _history_to_messages(display_history)
             payload = {
@@ -889,7 +900,7 @@ def _(rid, params: dict) -> dict:
                     provider=overrides.get("provider_override") or "",
                     profile=profile,
                 ),
-                "inflight": None,
+                "inflight": interrupted,
                 "running": False,
                 "session_key": target,
                 "started_at": record["created_at"],
@@ -1084,6 +1095,13 @@ def _(rid, params: dict) -> dict:
     auto_continue = (
         _maybe_schedule_auto_continue(sid, session, target) if session else None
     )
+    interrupted = (
+        _cold_interrupted_turn_projection(session, target)
+        if session and auto_continue is None else None
+    )
+    if interrupted is not None:
+        with session["history_lock"]:
+            session["inflight_turn"] = interrupted
     payload = {
         "session_id": sid,
         "resumed": target,
@@ -1091,7 +1109,7 @@ def _(rid, params: dict) -> dict:
         "messages": messages,
         "messages_omitted": omit_messages,
         "info": _session_info(agent, session),
-        "inflight": None,
+        "inflight": interrupted,
         "running": False,
         "session_key": target,
         "started_at": float(session.get("created_at") or time.time()),
