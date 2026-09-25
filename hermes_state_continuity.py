@@ -208,6 +208,8 @@ class ContextRebaseSnapshot:
     recent_events: tuple[Dict[str, Any], ...]
     unresolved_effects: tuple[Dict[str, Any], ...]
     goal_raw: Optional[str]
+    heartbeat_raw: Optional[str]
+    loop_raw: Optional[str]
     todo_json: Optional[str]
 
 class SessionContextContinuityMixin:
@@ -573,6 +575,16 @@ class SessionContextContinuityMixin:
                 "SELECT value FROM state_meta WHERE key=?", (f"goal:{session_id}",),
             ).fetchone()
             goal_raw = None if goal_row is None else goal_row[0]
+            heartbeat_row = conn.execute(
+                "SELECT value FROM state_meta WHERE key=?",
+                (f"heartbeat:{session_id}",),
+            ).fetchone()
+            heartbeat_raw = None if heartbeat_row is None else heartbeat_row[0]
+            loop_row = conn.execute(
+                "SELECT value FROM state_meta WHERE key=?",
+                (f"loop:{session_id}",),
+            ).fetchone()
+            loop_raw = None if loop_row is None else loop_row[0]
             todo = self._current_todo_snapshot_on_conn(conn, session_id)
             todo_json = None if todo is None else todo["todos_json"]
 
@@ -587,7 +599,8 @@ class SessionContextContinuityMixin:
                 session_id, str(root), session["profile_name"], session["cwd"],
                 session["git_branch"], session["git_repo_root"], watermark,
                 control_revision, first_user, authentic_users, current_users,
-                latest_summary, recent_events, unresolved_effects, goal_raw, todo_json,
+                latest_summary, recent_events, unresolved_effects, goal_raw,
+                heartbeat_raw, loop_raw, todo_json,
             )
 
     def read_context_rebase_transition(self, transition_id: str) -> Optional[ContextRebaseTransition]:
