@@ -396,3 +396,69 @@ def test_twenty_rebases_preserve_one_lineage_and_run_custody(db):
     assert current.checkpoint.restrictions == ("no publish",)
     assert current.generation == owner.generation
     assert db.read_context_rebase_episode("s20").attempts_without_recovery == 20
+
+
+def test_restart_after_pending_publication_refuses_ordinary_work(tmp_path):
+    path = tmp_path / "pending.db"
+    db = SessionDB(db_path=path)
+    db.create_session("s0", source="cli", profile_name="p1", model="test")
+    db.append_message("s0", "user", "original task")
+    assert db.try_acquire_session_turn_lease("s0", "holder", ttl_seconds=300)
+    transition = _publish(db)
+    assert transition.state == "committed_pending_activation"
+    db.close()
+
+    reopened = SessionDB(db_path=path)
+    assert reopened.resolve_resume_session_id("s0") == "s1"
+    with pytest.raises(ContextContinuationError, match="CONTEXT_REBASE_NOT_READY"):
+        reopened.assert_context_rebase_ready_for_turn("s1")
+    assert reopened.read_context_rebase_transition("tx1").state == (
+        "committed_pending_activation"
+    )
+    reopened.close()
+
+
+def test_restart_after_reconciliation_required_remains_fail_closed(tmp_path):
+    path = tmp_path / "reconcile.db"
+    db = SessionDB(db_path=path)
+    db.create_session("s0", source="cli", profile_name="p1", model="test")
+    db.append_message("s0", "user", "original task")
+    assert db.try_acquire_session_turn_lease("s0", "holder", ttl_seconds=300)
+    transition = _publish(db)
+    db.mark_context_rebase_reconciliation_required(transition.transition_id)
+    db.close()
+
+    reopened = SessionDB(db_path=path)
+    assert reopened.resolve_resume_session_id("s0") == "s1"
+    with pytest.raises(ContextContinuationError, match="CONTEXT_REBASE_NOT_READY"):
+        reopened.assert_context_rebase_ready_for_turn("s1")
+    assert reopened.read_context_rebase_transition("tx1").state == (
+        "reconciliation_required"
+    )
+    reopened.close()
+
+
+def test_restart_after_ready_preserves_admission_and_episode(tmp_path):
+    path = tmp_path / "ready.db"
+    db = SessionDB(db_path=path)
+    db.create_session("s0", source="cli", profile_name="p1", model="test")
+    db.append_message("s0", "user", "original task")
+    assert db.try_acquire_session_turn_lease("s0", "holder", ttl_seconds=300)
+    transition = _publish(db)
+    ready = db.mark_context_rebase_ready(
+        transition.transition_id,
+        expected_continuation_digest=transition.continuation_digest,
+        expected_child_session_id="s1",
+        before_tokens=100_000,
+        after_tokens=20_000,
+    )
+    db.close()
+
+    reopened = SessionDB(db_path=path)
+    assert reopened.resolve_resume_session_id("s0") == "s1"
+    assert reopened.assert_context_rebase_ready_for_turn("s1") == ready
+    episode = reopened.read_context_rebase_episode("s1")
+    assert episode.attempts_without_recovery == 1
+    assert episode.last_transition_id == "tx1"
+    assert reopened.message_count("s1") == 2
+    reopened.close()
