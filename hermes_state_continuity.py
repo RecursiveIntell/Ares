@@ -466,17 +466,31 @@ class SessionContextContinuityMixin:
             control_revision = int(authentic_users[-1]["row_id"])
 
             summary = conn.execute(
-                "SELECT id,content,timestamp FROM messages "
+                "SELECT id,content,timestamp,display_metadata FROM messages "
                 "WHERE session_id=? AND active=1 AND _compressed_summary=1 "
                 "ORDER BY id DESC LIMIT 1",
                 (session_id,),
             ).fetchone()
             summary_id = int(summary["id"]) if summary is not None else 0
-            latest_summary = None if summary is None else {
-                "row_id": summary_id,
-                "content": self._decode_content(summary["content"]),
-                "timestamp": summary["timestamp"],
-            }
+            summary_metadata = (
+                self._decode_display_metadata(summary["display_metadata"])
+                if summary is not None and summary["display_metadata"]
+                else None
+            )
+            is_derived_rebase_brief = bool(
+                isinstance(summary_metadata, dict)
+                and summary_metadata.get("continuation_kind")
+                == "context_rebase_brief"
+            )
+            latest_summary = (
+                None
+                if summary is None or is_derived_rebase_brief
+                else {
+                    "row_id": summary_id,
+                    "content": self._decode_content(summary["content"]),
+                    "timestamp": summary["timestamp"],
+                }
+            )
 
             user_rows = conn.execute(
                 "SELECT id,content,timestamp,display_kind,display_metadata "
