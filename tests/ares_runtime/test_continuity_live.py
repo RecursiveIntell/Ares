@@ -5,6 +5,8 @@ import pytest
 from ares_runtime.continuity.compiler import Mode
 from ares_runtime.continuity.live import LiveContinuationError, build_live_candidate
 from hermes_state import SessionDB
+from hermes_cli.heartbeat import HeartbeatState
+from hermes_cli.loops import LoopState
 
 
 @pytest.fixture
@@ -200,3 +202,56 @@ def test_unknown_effect_is_mandatory_obligation_not_duplicated_event(db):
     assert matches[0]["status"] == "UNKNOWN"
     assert matches[0]["section"] == "OBLIGATIONS AND UNCERTAINTY"
     assert matches[0]["required"] is True
+
+
+def test_recurring_owner_state_is_presented_independently_of_wakeup_text(db):
+    db.set_meta(
+        "heartbeat:s0",
+        HeartbeatState(
+            "check queue health", 600, status="active", created_at=1.0,
+            last_fired_at=2.0, fire_count=3,
+        ).to_json(),
+    )
+    db.set_meta(
+        "loop:s0",
+        LoopState(
+            "run regression until stable",
+            status="active",
+            mode="interval",
+            interval_seconds=60,
+            current_delay=60,
+            times=10,
+            until="all tests pass",
+            max_ticks=20,
+            ticks_fired=4,
+            created_at=1.0,
+            awaiting_response=True,
+        ).to_json(),
+    )
+    db.append_message(
+        "s0",
+        "user",
+        "[/loop wakeup #4]\nrun regression until stable",
+        display_kind="internal_notification",
+        display_metadata={"synthetic_source": "loop"},
+    )
+    candidate = build_live_candidate(db, session_id="s0")
+    records = [
+        json.loads(line)
+        for line in candidate.brief.evidence_text.splitlines()
+        if line.startswith("{")
+    ]
+    by_ref = {record["record_ref"]: record for record in records}
+    assert by_ref["record:heartbeat:current"]["kind"] == "OWNER_STATE"
+    assert "check queue health" in by_ref["record:heartbeat:current"]["excerpt"]
+    assert by_ref["record:loop:current"]["kind"] == "OWNER_STATE"
+    assert "all tests pass" in by_ref["record:loop:current"]["excerpt"]
+
+    synthetic = [
+        record for record in records
+        if "run regression until stable" in str(record.get("excerpt", ""))
+        and record["record_ref"].startswith("record:synthetic-user:")
+    ]
+    assert len(synthetic) == 1
+    assert synthetic[0]["kind"] == "APPLICATION_STATE"
+    assert candidate.child_messages[-1]["display_kind"] == "internal_notification"
