@@ -201,6 +201,8 @@ class LiveContinuationCandidate:
     child_messages: tuple[dict[str, Any], ...]
     system_addendum: str
     continuation_digest: str
+    snapshot_digest: str
+    unresolved_effects: bool
 
     def __post_init__(self) -> None:
         if not self.child_messages or self.child_messages[-1].get("role") != "user":
@@ -214,6 +216,8 @@ class LiveContinuationCandidate:
             "control_revision": self.control_revision,
             "input_watermark": self.input_watermark,
             "mode": self.mode.value,
+            "snapshot_digest": self.snapshot_digest,
+            "unresolved_effects": self.unresolved_effects,
         })).hexdigest()
         if self.continuation_digest != expected:
             raise LiveContinuationError("LIVE_CONTINUATION_DIGEST_MISMATCH")
@@ -236,6 +240,8 @@ def _candidate_digest(
         "control_revision": control_revision,
         "input_watermark": snapshot.input_watermark,
         "mode": mode.value,
+        "snapshot_digest": snapshot.digest,
+        "unresolved_effects": bool(snapshot.unresolved_effects),
     })).hexdigest()
 
 
@@ -554,4 +560,6 @@ def build_live_candidate(
         tuple(child_messages),
         TRUSTED_CONTINUATION_RULES,
         digest,
+        snapshot.digest,
+        bool(snapshot.unresolved_effects),
     )

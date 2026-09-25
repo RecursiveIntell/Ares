@@ -2045,20 +2045,12 @@ def run_conversation(
             agent._persist_session(messages, conversation_history)
         return result
 
-    def _context_rebase_reconciliation_result():
-        return {
-            "final_response": (
-                "Context rebase committed but owner reconciliation is required "
-                "before ordinary execution can continue."
-            ),
-            "messages": messages,
-            "completed": False,
-            "api_calls": api_call_count,
-            "error": "CONTEXT_REBASE_RECONCILIATION_REQUIRED",
-            "partial": True,
-            "failed": True,
-            "context_rebase_reconciliation_required": True,
-        }
+    def _context_rebase_stopped_result(result, *, calls=None):
+        from ares_runtime.continuity.runtime import context_rebase_failure_result
+
+        return context_rebase_failure_result(
+            result, messages, api_calls=api_call_count if calls is None else calls,
+        )
 
     # Per-turn tally of consecutive successful credential-pool token refreshes,
     # keyed by (provider, pool-entry-id). A persistent upstream 401 lets
@@ -2999,31 +2991,17 @@ def run_conversation(
                     agent._api_call_count = api_call_count
                     agent.iteration_budget.refund()
                     continue
-                if (
-                    _rebase.status
-                    is AutomaticRebaseStatus.RECONCILIATION_REQUIRED
-                ):
+                if _rebase.status in {
+                    AutomaticRebaseStatus.RECONCILIATION_REQUIRED,
+                    AutomaticRebaseStatus.BLOCKED,
+                }:
                     agent._persist_session(messages, conversation_history)
-                    _final_response = (
-                        "Context rebase committed but owner reconciliation is "
-                        "required before ordinary execution can continue."
-                    )
-                    return {
-                        "final_response": _final_response,
-                        "messages": messages,
-                        "completed": False,
-                        "api_calls": max(0, api_call_count - 1),
-                        "error": "CONTEXT_REBASE_RECONCILIATION_REQUIRED",
-                        "partial": True,
-                        "failed": True,
-                        "context_rebase_reconciliation_required": True,
-                    }
-                if _rebase.status is AutomaticRebaseStatus.BLOCKED:
-                    agent._warn_context_overflow_blocked(
-                        f"context-rebase:{_rebase.reason}",
-                        request_pressure_tokens,
-                        _preflight_threshold,
-                    )
+                    # This iteration did not admit a provider request. Preserve
+                    # cumulative accounting by refunding only this reservation.
+                    api_call_count -= 1
+                    agent._api_call_count = api_call_count
+                    agent.iteration_budget.refund()
+                    return _context_rebase_stopped_result(_rebase)
 
         # Thinking spinner for quiet mode (animated during API call)
         thinking_spinner = None
@@ -5871,9 +5849,9 @@ def run_conversation(
                         if (
                             _rebase is not None
                             and getattr(_rebase.status, "value", "")
-                            == "reconciliation_required"
+                            in {"reconciliation_required", "blocked"}
                         ):
-                            return _context_rebase_reconciliation_result()
+                            return _context_rebase_stopped_result(_rebase)
                         # Terminal — surface the buffered retry trace.
                         agent._flush_status_buffer()
                         agent._vprint(f"{agent.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached for payload-too-large error.", force=True)
@@ -5956,9 +5934,9 @@ def run_conversation(
                         if (
                             _rebase is not None
                             and getattr(_rebase.status, "value", "")
-                            == "reconciliation_required"
+                            in {"reconciliation_required", "blocked"}
                         ):
-                            return _context_rebase_reconciliation_result()
+                            return _context_rebase_stopped_result(_rebase)
                         # Terminal — surface buffered context so the user
                         # sees what compression attempts were made.
                         agent._flush_status_buffer()
@@ -6048,9 +6026,9 @@ def run_conversation(
                             if (
                                 _rebase is not None
                                 and getattr(_rebase.status, "value", "")
-                                == "reconciliation_required"
+                                in {"reconciliation_required", "blocked"}
                             ):
-                                return _context_rebase_reconciliation_result()
+                                return _context_rebase_stopped_result(_rebase)
                             agent._flush_status_buffer()
                             agent._vprint(f"{agent.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached.", force=True)
                             agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
@@ -6216,9 +6194,9 @@ def run_conversation(
                         if (
                             _rebase is not None
                             and getattr(_rebase.status, "value", "")
-                            == "reconciliation_required"
+                            in {"reconciliation_required", "blocked"}
                         ):
-                            return _context_rebase_reconciliation_result()
+                            return _context_rebase_stopped_result(_rebase)
                         agent._flush_status_buffer()
                         agent._vprint(f"{agent.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached.", force=True)
                         agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)

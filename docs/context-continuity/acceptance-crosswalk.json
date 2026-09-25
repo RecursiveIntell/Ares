@@ -1,0 +1,2011 @@
+{
+  "schema": "ares.continuity-qualification-crosswalk/v1",
+  "plan_id": "ares-context-continuity-20260923-v4",
+  "source_baseline": "e25246701ad00338d51961b35be87e2fde690b45",
+  "input_packet_sha256": "ac37e1f2bbbb50f4330fbb2b7c812bac24ea651ff7d05f9051a1f31d8b6f9da7",
+  "acceptance_catalog_sha256": "86ee435085fd587d8fec7bcf05be9f460aaf7eb4112967697867f7b92c47690b",
+  "claim": "Supporting test locations only. No CT case is promoted to full qualification by this inventory; do not turn passing file counts into a percentage of program completion.",
+  "cases": [
+    {
+      "id": "CT-001",
+      "work_order": "CC-00",
+      "title": "Freeze source and active identities",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "agent/agent_init.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_runtime.py"
+      ],
+      "remaining_gate": "Installed tuple, native owner capabilities, compatibility and real binary baseline remain unqualified."
+    },
+    {
+      "id": "CT-002",
+      "work_order": "CC-00",
+      "title": "Preserve inherited completion scope",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "agent/agent_init.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_runtime.py"
+      ],
+      "remaining_gate": "Installed tuple, native owner capabilities, compatibility and real binary baseline remain unqualified."
+    },
+    {
+      "id": "CT-003",
+      "work_order": "CC-00",
+      "title": "Resolve actual route capabilities",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "agent/agent_init.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_runtime.py"
+      ],
+      "remaining_gate": "Installed tuple, native owner capabilities, compatibility and real binary baseline remain unqualified."
+    },
+    {
+      "id": "CT-004",
+      "work_order": "CC-00",
+      "title": "Identify task and goal binding owners",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "agent/agent_init.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_runtime.py"
+      ],
+      "remaining_gate": "Installed tuple, native owner capabilities, compatibility and real binary baseline remain unqualified."
+    },
+    {
+      "id": "CT-005",
+      "work_order": "CC-00",
+      "title": "Negotiate reader compatibility",
+      "required": true,
+      "required_stage": "canary_readiness",
+      "required_evidence_class": "EXACT_RELEASE_READINESS",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "agent/agent_init.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_runtime.py"
+      ],
+      "remaining_gate": "Installed tuple, native owner capabilities, compatibility and real binary baseline remain unqualified."
+    },
+    {
+      "id": "CT-006",
+      "work_order": "CC-00",
+      "title": "Rehearse owner-consistent backup",
+      "required": true,
+      "required_stage": "canary_readiness",
+      "required_evidence_class": "EXACT_RELEASE_READINESS",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "agent/agent_init.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_runtime.py"
+      ],
+      "remaining_gate": "Installed tuple, native owner capabilities, compatibility and real binary baseline remain unqualified."
+    },
+    {
+      "id": "CT-007",
+      "work_order": "CC-00",
+      "title": "Bound authority and resources",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "agent/agent_init.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_runtime.py"
+      ],
+      "remaining_gate": "Installed tuple, native owner capabilities, compatibility and real binary baseline remain unqualified."
+    },
+    {
+      "id": "CT-008",
+      "work_order": "CC-00",
+      "title": "Retain real Governor baseline",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "agent/agent_init.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_runtime.py"
+      ],
+      "remaining_gate": "Installed tuple, native owner capabilities, compatibility and real binary baseline remain unqualified."
+    },
+    {
+      "id": "CT-009",
+      "work_order": "CC-01",
+      "title": "Preserve effective instructions",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "hermes_state_continuity.py",
+        "ares_runtime/continuity/checkpoint.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_checkpoint.py",
+        "tests/ares_runtime/test_context_rebase_state.py"
+      ],
+      "remaining_gate": "Local snapshots and checkpoint inspection exist; continuous complete workspace/effect/process capture is not established."
+    },
+    {
+      "id": "CT-010",
+      "work_order": "CC-01",
+      "title": "Separate synthetic from human input",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "hermes_state_continuity.py",
+        "ares_runtime/continuity/checkpoint.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_checkpoint.py",
+        "tests/ares_runtime/test_context_rebase_state.py"
+      ],
+      "remaining_gate": "Local snapshots and checkpoint inspection exist; continuous complete workspace/effect/process capture is not established."
+    },
+    {
+      "id": "CT-011",
+      "work_order": "CC-01",
+      "title": "Keep epistemic statuses distinct",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "hermes_state_continuity.py",
+        "ares_runtime/continuity/checkpoint.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_checkpoint.py",
+        "tests/ares_runtime/test_context_rebase_state.py"
+      ],
+      "remaining_gate": "Local snapshots and checkpoint inspection exist; continuous complete workspace/effect/process capture is not established."
+    },
+    {
+      "id": "CT-012",
+      "work_order": "CC-01",
+      "title": "Capture progress before pressure failure",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "hermes_state_continuity.py",
+        "ares_runtime/continuity/checkpoint.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_checkpoint.py",
+        "tests/ares_runtime/test_context_rebase_state.py"
+      ],
+      "remaining_gate": "Local snapshots and checkpoint inspection exist; continuous complete workspace/effect/process capture is not established."
+    },
+    {
+      "id": "CT-013",
+      "work_order": "CC-01",
+      "title": "Preserve the entire working change set",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "hermes_state_continuity.py",
+        "ares_runtime/continuity/checkpoint.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_checkpoint.py",
+        "tests/ares_runtime/test_context_rebase_state.py"
+      ],
+      "remaining_gate": "Local snapshots and checkpoint inspection exist; continuous complete workspace/effect/process capture is not established."
+    },
+    {
+      "id": "CT-014",
+      "work_order": "CC-01",
+      "title": "Bind tests to evidence freshness",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "hermes_state_continuity.py",
+        "ares_runtime/continuity/checkpoint.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_checkpoint.py",
+        "tests/ares_runtime/test_context_rebase_state.py"
+      ],
+      "remaining_gate": "Local snapshots and checkpoint inspection exist; continuous complete workspace/effect/process capture is not established."
+    },
+    {
+      "id": "CT-015",
+      "work_order": "CC-01",
+      "title": "Preserve effect and process identity",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "hermes_state_continuity.py",
+        "ares_runtime/continuity/checkpoint.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_checkpoint.py",
+        "tests/ares_runtime/test_context_rebase_state.py"
+      ],
+      "remaining_gate": "Local snapshots and checkpoint inspection exist; continuous complete workspace/effect/process capture is not established."
+    },
+    {
+      "id": "CT-016",
+      "work_order": "CC-01",
+      "title": "Represent missing state explicitly",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "hermes_state_continuity.py",
+        "ares_runtime/continuity/checkpoint.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_checkpoint.py",
+        "tests/ares_runtime/test_context_rebase_state.py"
+      ],
+      "remaining_gate": "Local snapshots and checkpoint inspection exist; continuous complete workspace/effect/process capture is not established."
+    },
+    {
+      "id": "CT-017",
+      "work_order": "CC-02",
+      "title": "Select mandatory refs before truncation",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "ares_runtime/continuity/compiler.py",
+        "ares_runtime/continuity/live.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_compiler.py",
+        "tests/ares_runtime/test_continuity_live.py"
+      ],
+      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration."
+    },
+    {
+      "id": "CT-018",
+      "work_order": "CC-02",
+      "title": "Preserve prompt role boundaries",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "ares_runtime/continuity/compiler.py",
+        "ares_runtime/continuity/live.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_compiler.py",
+        "tests/ares_runtime/test_continuity_live.py"
+      ],
+      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration."
+    },
+    {
+      "id": "CT-019",
+      "work_order": "CC-02",
+      "title": "Keep legal tool transcripts",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "ares_runtime/continuity/compiler.py",
+        "ares_runtime/continuity/live.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_compiler.py",
+        "tests/ares_runtime/test_continuity_live.py"
+      ],
+      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration."
+    },
+    {
+      "id": "CT-020",
+      "work_order": "CC-02",
+      "title": "Materialize essential content",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "ares_runtime/continuity/compiler.py",
+        "ares_runtime/continuity/live.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_compiler.py",
+        "tests/ares_runtime/test_continuity_live.py"
+      ],
+      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration."
+    },
+    {
+      "id": "CT-021",
+      "work_order": "CC-02",
+      "title": "Preserve dependency and decision rationale",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "ares_runtime/continuity/compiler.py",
+        "ares_runtime/continuity/live.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_compiler.py",
+        "tests/ares_runtime/test_continuity_live.py"
+      ],
+      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration."
+    },
+    {
+      "id": "CT-022",
+      "work_order": "CC-02",
+      "title": "Handle native and multimodal content honestly",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "ares_runtime/continuity/compiler.py",
+        "ares_runtime/continuity/live.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_compiler.py",
+        "tests/ares_runtime/test_continuity_live.py"
+      ],
+      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration."
+    },
+    {
+      "id": "CT-023",
+      "work_order": "CC-02",
+      "title": "Respect new user revisions",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "ares_runtime/continuity/compiler.py",
+        "ares_runtime/continuity/live.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_compiler.py",
+        "tests/ares_runtime/test_continuity_live.py"
+      ],
+      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration."
+    },
+    {
+      "id": "CT-024",
+      "work_order": "CC-02",
+      "title": "Version deterministic content and bound each delivery",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "ares_runtime/continuity/compiler.py",
+        "ares_runtime/continuity/live.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_compiler.py",
+        "tests/ares_runtime/test_continuity_live.py"
+      ],
+      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration."
+    },
+    {
+      "id": "CT-025",
+      "work_order": "CC-03",
+      "title": "Account final provider payload",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "ares_runtime/continuity/budget.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_budget.py",
+        "tests/ares_runtime/test_continuity_transport_bounds.py"
+      ],
+      "remaining_gate": "Pure pressure policy and serialized-request bounds exist; hard shared budget reservation, actual route accounting and calibration remain unqualified."
+    },
+    {
+      "id": "CT-026",
+      "work_order": "CC-03",
+      "title": "Label token measurements correctly",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "ares_runtime/continuity/budget.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_budget.py",
+        "tests/ares_runtime/test_continuity_transport_bounds.py"
+      ],
+      "remaining_gate": "Pure pressure policy and serialized-request bounds exist; hard shared budget reservation, actual route accounting and calibration remain unqualified."
+    },
+    {
+      "id": "CT-027",
+      "work_order": "CC-03",
+      "title": "Separate threshold from qualification",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "ares_runtime/continuity/budget.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_budget.py",
+        "tests/ares_runtime/test_continuity_transport_bounds.py"
+      ],
+      "remaining_gate": "Pure pressure policy and serialized-request bounds exist; hard shared budget reservation, actual route accounting and calibration remain unqualified."
+    },
+    {
+      "id": "CT-028",
+      "work_order": "CC-03",
+      "title": "Reserve a useful execution horizon",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "ares_runtime/continuity/budget.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_budget.py",
+        "tests/ares_runtime/test_continuity_transport_bounds.py"
+      ],
+      "remaining_gate": "Pure pressure policy and serialized-request bounds exist; hard shared budget reservation, actual route accounting and calibration remain unqualified."
+    },
+    {
+      "id": "CT-029",
+      "work_order": "CC-03",
+      "title": "Cause-specific feasible successor",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "ares_runtime/continuity/budget.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_budget.py",
+        "tests/ares_runtime/test_continuity_transport_bounds.py"
+      ],
+      "remaining_gate": "Pure pressure policy and serialized-request bounds exist; hard shared budget reservation, actual route accounting and calibration remain unqualified."
+    },
+    {
+      "id": "CT-030",
+      "work_order": "CC-03",
+      "title": "Handle irreducible context without loops",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "ares_runtime/continuity/budget.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_budget.py",
+        "tests/ares_runtime/test_continuity_transport_bounds.py"
+      ],
+      "remaining_gate": "Pure pressure policy and serialized-request bounds exist; hard shared budget reservation, actual route accounting and calibration remain unqualified."
+    },
+    {
+      "id": "CT-031",
+      "work_order": "CC-03",
+      "title": "Keep cumulative recovery budgets",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "ares_runtime/continuity/budget.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_budget.py",
+        "tests/ares_runtime/test_continuity_transport_bounds.py"
+      ],
+      "remaining_gate": "Pure pressure policy and serialized-request bounds exist; hard shared budget reservation, actual route accounting and calibration remain unqualified."
+    },
+    {
+      "id": "CT-032",
+      "work_order": "CC-03",
+      "title": "Use soft bootstrap targets safely",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "ares_runtime/continuity/budget.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_budget.py",
+        "tests/ares_runtime/test_continuity_transport_bounds.py"
+      ],
+      "remaining_gate": "Pure pressure policy and serialized-request bounds exist; hard shared budget reservation, actual route accounting and calibration remain unqualified."
+    },
+    {
+      "id": "CT-033",
+      "work_order": "CC-04",
+      "title": "Fence old external admissions",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "hermes_state_continuity.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_context_rebase_state.py",
+        "tests/ares_runtime/test_continuity_snapshot_races.py"
+      ],
+      "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete."
+    },
+    {
+      "id": "CT-034",
+      "work_order": "CC-04",
+      "title": "Publish only durable artifact references",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "hermes_state_continuity.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_context_rebase_state.py",
+        "tests/ares_runtime/test_continuity_snapshot_races.py"
+      ],
+      "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete."
+    },
+    {
+      "id": "CT-035",
+      "work_order": "CC-04",
+      "title": "Commit local ownership atomically",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "hermes_state_continuity.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_context_rebase_state.py",
+        "tests/ares_runtime/test_continuity_snapshot_races.py"
+      ],
+      "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete."
+    },
+    {
+      "id": "CT-036",
+      "work_order": "CC-04",
+      "title": "Reconcile independent owners explicitly",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "hermes_state_continuity.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_context_rebase_state.py",
+        "tests/ares_runtime/test_continuity_snapshot_races.py"
+      ],
+      "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete."
+    },
+    {
+      "id": "CT-037",
+      "work_order": "CC-04",
+      "title": "Validate source and obligation transitions",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "hermes_state_continuity.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_context_rebase_state.py",
+        "tests/ares_runtime/test_continuity_snapshot_races.py"
+      ],
+      "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete."
+    },
+    {
+      "id": "CT-038",
+      "work_order": "CC-04",
+      "title": "Distinguish identity clocks",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "hermes_state_continuity.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_context_rebase_state.py",
+        "tests/ares_runtime/test_continuity_snapshot_races.py"
+      ],
+      "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete."
+    },
+    {
+      "id": "CT-039",
+      "work_order": "CC-04",
+      "title": "Recover every publication boundary",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "hermes_state_continuity.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_context_rebase_state.py",
+        "tests/ares_runtime/test_continuity_snapshot_races.py"
+      ],
+      "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete."
+    },
+    {
+      "id": "CT-040",
+      "work_order": "CC-04",
+      "title": "Reconcile uncertain custody acknowledgment",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "hermes_state_continuity.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_context_rebase_state.py",
+        "tests/ares_runtime/test_continuity_snapshot_races.py"
+      ],
+      "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete."
+    },
+    {
+      "id": "CT-041",
+      "work_order": "CC-05",
+      "title": "Continue an ordinary live task automatically",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "agent/conversation_loop.py",
+        "agent/turn_context.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_runtime.py",
+        "tests/ares_runtime/test_continuity_dispatch.py"
+      ],
+      "remaining_gate": "Actual caller refusal is locally exercised with provider doubles. Live useful-work continuation, cold owner recovery, and sealed provider/effect attempts remain unqualified."
+    },
+    {
+      "id": "CT-042",
+      "work_order": "CC-05",
+      "title": "Continue actual goals without budget resets",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "agent/conversation_loop.py",
+        "agent/turn_context.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_runtime.py",
+        "tests/ares_runtime/test_continuity_dispatch.py"
+      ],
+      "remaining_gate": "Actual caller refusal is locally exercised with provider doubles. Live useful-work continuation, cold owner recovery, and sealed provider/effect attempts remain unqualified."
+    },
+    {
+      "id": "CT-043",
+      "work_order": "CC-05",
+      "title": "Support goal-less checked execution",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "agent/conversation_loop.py",
+        "agent/turn_context.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_runtime.py",
+        "tests/ares_runtime/test_continuity_dispatch.py"
+      ],
+      "remaining_gate": "Actual caller refusal is locally exercised with provider doubles. Live useful-work continuation, cold owner recovery, and sealed provider/effect attempts remain unqualified."
+    },
+    {
+      "id": "CT-044",
+      "work_order": "CC-05",
+      "title": "Actually reset provider working context",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "agent/conversation_loop.py",
+        "agent/turn_context.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_runtime.py",
+        "tests/ares_runtime/test_continuity_dispatch.py"
+      ],
+      "remaining_gate": "Actual caller refusal is locally exercised with provider doubles. Live useful-work continuation, cold owner recovery, and sealed provider/effect attempts remain unqualified."
+    },
+    {
+      "id": "CT-045",
+      "work_order": "CC-05",
+      "title": "Preserve ongoing work and waits",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "agent/conversation_loop.py",
+        "agent/turn_context.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_runtime.py",
+        "tests/ares_runtime/test_continuity_dispatch.py"
+      ],
+      "remaining_gate": "Actual caller refusal is locally exercised with provider doubles. Live useful-work continuation, cold owner recovery, and sealed provider/effect attempts remain unqualified."
+    },
+    {
+      "id": "CT-046",
+      "work_order": "CC-05",
+      "title": "Make cancellation dominate continuation",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "agent/conversation_loop.py",
+        "agent/turn_context.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_runtime.py",
+        "tests/ares_runtime/test_continuity_dispatch.py"
+      ],
+      "remaining_gate": "Actual caller refusal is locally exercised with provider doubles. Live useful-work continuation, cold owner recovery, and sealed provider/effect attempts remain unqualified."
+    },
+    {
+      "id": "CT-047",
+      "work_order": "CC-05",
+      "title": "Preserve queued user steering",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "agent/conversation_loop.py",
+        "agent/turn_context.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_runtime.py",
+        "tests/ares_runtime/test_continuity_dispatch.py"
+      ],
+      "remaining_gate": "Actual caller refusal is locally exercised with provider doubles. Live useful-work continuation, cold owner recovery, and sealed provider/effect attempts remain unqualified."
+    },
+    {
+      "id": "CT-048",
+      "work_order": "CC-05",
+      "title": "Cold-restart the same durable task",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "agent/conversation_loop.py",
+        "agent/turn_context.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_runtime.py",
+        "tests/ares_runtime/test_continuity_dispatch.py"
+      ],
+      "remaining_gate": "Actual caller refusal is locally exercised with provider doubles. Live useful-work continuation, cold owner recovery, and sealed provider/effect attempts remain unqualified."
+    },
+    {
+      "id": "CT-049",
+      "work_order": "CC-06",
+      "title": "Qualify current retrieval authority",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "hermes_state_continuity.py",
+        "plugins/context_engine/_context_governor/__init__.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_context_rebase_state.py"
+      ],
+      "remaining_gate": "Local lineage/branch tests are supporting evidence; current-policy retrieval, revocation, retention and unified live UI require route evidence."
+    },
+    {
+      "id": "CT-050",
+      "work_order": "CC-06",
+      "title": "Prevent revoked content resurrection",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "hermes_state_continuity.py",
+        "plugins/context_engine/_context_governor/__init__.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_context_rebase_state.py"
+      ],
+      "remaining_gate": "Local lineage/branch tests are supporting evidence; current-policy retrieval, revocation, retention and unified live UI require route evidence."
+    },
+    {
+      "id": "CT-051",
+      "work_order": "CC-06",
+      "title": "Test cross-epoch exact recovery",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "hermes_state_continuity.py",
+        "plugins/context_engine/_context_governor/__init__.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_context_rebase_state.py"
+      ],
+      "remaining_gate": "Local lineage/branch tests are supporting evidence; current-policy retrieval, revocation, retention and unified live UI require route evidence."
+    },
+    {
+      "id": "CT-052",
+      "work_order": "CC-06",
+      "title": "Bound long lineage and replay",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "hermes_state_continuity.py",
+        "plugins/context_engine/_context_governor/__init__.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_context_rebase_state.py"
+      ],
+      "remaining_gate": "Local lineage/branch tests are supporting evidence; current-policy retrieval, revocation, retention and unified live UI require route evidence."
+    },
+    {
+      "id": "CT-053",
+      "work_order": "CC-06",
+      "title": "Keep truthful unified UI",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "hermes_state_continuity.py",
+        "plugins/context_engine/_context_governor/__init__.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_context_rebase_state.py"
+      ],
+      "remaining_gate": "Local lineage/branch tests are supporting evidence; current-policy retrieval, revocation, retention and unified live UI require route evidence."
+    },
+    {
+      "id": "CT-054",
+      "work_order": "CC-06",
+      "title": "Isolate branches and delegates",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "hermes_state_continuity.py",
+        "plugins/context_engine/_context_governor/__init__.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_context_rebase_state.py"
+      ],
+      "remaining_gate": "Local lineage/branch tests are supporting evidence; current-policy retrieval, revocation, retention and unified live UI require route evidence."
+    },
+    {
+      "id": "CT-055",
+      "work_order": "CC-06",
+      "title": "Retain actual materialization controls",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "hermes_state_continuity.py",
+        "plugins/context_engine/_context_governor/__init__.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_context_rebase_state.py"
+      ],
+      "remaining_gate": "Local lineage/branch tests are supporting evidence; current-policy retrieval, revocation, retention and unified live UI require route evidence."
+    },
+    {
+      "id": "CT-056",
+      "work_order": "CC-06",
+      "title": "Bound retention without leaking private data",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "hermes_state_continuity.py",
+        "plugins/context_engine/_context_governor/__init__.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_context_rebase_state.py"
+      ],
+      "remaining_gate": "Local lineage/branch tests are supporting evidence; current-policy retrieval, revocation, retention and unified live UI require route evidence."
+    },
+    {
+      "id": "CT-057",
+      "work_order": "CC-07",
+      "title": "Run cross-owner crash/fault injection",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "ares_runtime/continuity/",
+        "hermes_state_continuity.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_dispatch.py",
+        "tests/ares_runtime/test_continuity_snapshot_races.py"
+      ],
+      "remaining_gate": "Local negative witnesses and repeat-rebase tests are not cross-owner crash/fault injection or real repeated provider rollovers."
+    },
+    {
+      "id": "CT-058",
+      "work_order": "CC-07",
+      "title": "Handle non-idempotent unknown effects",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "ares_runtime/continuity/",
+        "hermes_state_continuity.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_dispatch.py",
+        "tests/ares_runtime/test_continuity_snapshot_races.py"
+      ],
+      "remaining_gate": "Local negative witnesses and repeat-rebase tests are not cross-owner crash/fault injection or real repeated provider rollovers."
+    },
+    {
+      "id": "CT-059",
+      "work_order": "CC-07",
+      "title": "Reject malformed or adversarial artifacts",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "ares_runtime/continuity/",
+        "hermes_state_continuity.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_dispatch.py",
+        "tests/ares_runtime/test_continuity_snapshot_races.py"
+      ],
+      "remaining_gate": "Local negative witnesses and repeat-rebase tests are not cross-owner crash/fault injection or real repeated provider rollovers."
+    },
+    {
+      "id": "CT-060",
+      "work_order": "CC-07",
+      "title": "Kill implementation safety mutants",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "ares_runtime/continuity/",
+        "hermes_state_continuity.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_dispatch.py",
+        "tests/ares_runtime/test_continuity_snapshot_races.py"
+      ],
+      "remaining_gate": "Local negative witnesses and repeat-rebase tests are not cross-owner crash/fault injection or real repeated provider rollovers."
+    },
+    {
+      "id": "CT-061",
+      "work_order": "CC-07",
+      "title": "Force repeated real rollovers",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "ares_runtime/continuity/",
+        "hermes_state_continuity.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_dispatch.py",
+        "tests/ares_runtime/test_continuity_snapshot_races.py"
+      ],
+      "remaining_gate": "Local negative witnesses and repeat-rebase tests are not cross-owner crash/fault injection or real repeated provider rollovers."
+    },
+    {
+      "id": "CT-062",
+      "work_order": "CC-07",
+      "title": "Measure decision continuity",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "ares_runtime/continuity/",
+        "hermes_state_continuity.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_dispatch.py",
+        "tests/ares_runtime/test_continuity_snapshot_races.py"
+      ],
+      "remaining_gate": "Local negative witnesses and repeat-rebase tests are not cross-owner crash/fault injection or real repeated provider rollovers."
+    },
+    {
+      "id": "CT-063",
+      "work_order": "CC-07",
+      "title": "Reject false completion and wrong workspace",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "ares_runtime/continuity/",
+        "hermes_state_continuity.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_dispatch.py",
+        "tests/ares_runtime/test_continuity_snapshot_races.py"
+      ],
+      "remaining_gate": "Local negative witnesses and repeat-rebase tests are not cross-owner crash/fault injection or real repeated provider rollovers."
+    },
+    {
+      "id": "CT-064",
+      "work_order": "CC-07",
+      "title": "Exercise route-specific hard cases",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "ares_runtime/continuity/",
+        "hermes_state_continuity.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_dispatch.py",
+        "tests/ares_runtime/test_continuity_snapshot_races.py"
+      ],
+      "remaining_gate": "Local negative witnesses and repeat-rebase tests are not cross-owner crash/fault injection or real repeated provider rollovers."
+    },
+    {
+      "id": "CT-065",
+      "work_order": "CC-08",
+      "title": "Preregister calibration and budget",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [],
+      "supporting_test_files": [],
+      "remaining_gate": "No matched-budget selected-route calibration, held-out outcomes or measured cost/quality claim."
+    },
+    {
+      "id": "CT-066",
+      "work_order": "CC-08",
+      "title": "Compare meaningful baselines",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [],
+      "supporting_test_files": [],
+      "remaining_gate": "No matched-budget selected-route calibration, held-out outcomes or measured cost/quality claim."
+    },
+    {
+      "id": "CT-067",
+      "work_order": "CC-08",
+      "title": "Prevent evaluation leakage",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [],
+      "supporting_test_files": [],
+      "remaining_gate": "No matched-budget selected-route calibration, held-out outcomes or measured cost/quality claim."
+    },
+    {
+      "id": "CT-068",
+      "work_order": "CC-08",
+      "title": "Isolate layout and threshold experiments",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [],
+      "supporting_test_files": [],
+      "remaining_gate": "No matched-budget selected-route calibration, held-out outcomes or measured cost/quality claim."
+    },
+    {
+      "id": "CT-069",
+      "work_order": "CC-08",
+      "title": "Measure whole-task cost and reacquisition",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [],
+      "supporting_test_files": [],
+      "remaining_gate": "No matched-budget selected-route calibration, held-out outcomes or measured cost/quality claim."
+    },
+    {
+      "id": "CT-070",
+      "work_order": "CC-08",
+      "title": "Report uncertainty and worst strata",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [],
+      "supporting_test_files": [],
+      "remaining_gate": "No matched-budget selected-route calibration, held-out outcomes or measured cost/quality claim."
+    },
+    {
+      "id": "CT-071",
+      "work_order": "CC-08",
+      "title": "Keep adaptation constrained",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [],
+      "supporting_test_files": [],
+      "remaining_gate": "No matched-budget selected-route calibration, held-out outcomes or measured cost/quality claim."
+    },
+    {
+      "id": "CT-072",
+      "work_order": "CC-08",
+      "title": "Publish an exact calibrated candidate",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [],
+      "supporting_test_files": [],
+      "remaining_gate": "No matched-budget selected-route calibration, held-out outcomes or measured cost/quality claim."
+    },
+    {
+      "id": "CT-073",
+      "work_order": "CC-09",
+      "title": "Separate enablement from recovery",
+      "required": true,
+      "required_stage": "canary_readiness",
+      "required_evidence_class": "EXACT_RELEASE_READINESS",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [],
+      "supporting_test_files": [],
+      "remaining_gate": "No installed-profile canary, managed activation, rollback or inherited endurance qualification. Independent delta review is narrower than full implementation review."
+    },
+    {
+      "id": "CT-074",
+      "work_order": "CC-09",
+      "title": "Run a narrow authorized canary",
+      "required": true,
+      "required_stage": "live_canary",
+      "required_evidence_class": "OBSERVED_GRANTED_CANARY",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [],
+      "supporting_test_files": [],
+      "remaining_gate": "No installed-profile canary, managed activation, rollback or inherited endurance qualification. Independent delta review is narrower than full implementation review."
+    },
+    {
+      "id": "CT-075",
+      "work_order": "CC-09",
+      "title": "Retain broader operational endurance gate",
+      "required": true,
+      "required_stage": "retained_program",
+      "required_evidence_class": "RETAINED_CONTRACT_CLOSURE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [],
+      "supporting_test_files": [],
+      "remaining_gate": "No installed-profile canary, managed activation, rollback or inherited endurance qualification. Independent delta review is narrower than full implementation review."
+    },
+    {
+      "id": "CT-076",
+      "work_order": "CC-09",
+      "title": "Rehearse non-destructive rollback",
+      "required": true,
+      "required_stage": "canary_readiness",
+      "required_evidence_class": "EXACT_RELEASE_READINESS",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [],
+      "supporting_test_files": [],
+      "remaining_gate": "No installed-profile canary, managed activation, rollback or inherited endurance qualification. Independent delta review is narrower than full implementation review."
+    },
+    {
+      "id": "CT-077",
+      "work_order": "CC-09",
+      "title": "Require independent implementation review",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [],
+      "supporting_test_files": [],
+      "remaining_gate": "No installed-profile canary, managed activation, rollback or inherited endurance qualification. Independent delta review is narrower than full implementation review."
+    },
+    {
+      "id": "CT-078",
+      "work_order": "CC-09",
+      "title": "Expose legitimate blocked states",
+      "required": true,
+      "required_stage": "live_canary",
+      "required_evidence_class": "OBSERVED_GRANTED_CANARY",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [],
+      "supporting_test_files": [],
+      "remaining_gate": "No installed-profile canary, managed activation, rollback or inherited endurance qualification. Independent delta review is narrower than full implementation review."
+    },
+    {
+      "id": "CT-079",
+      "work_order": "CC-09",
+      "title": "Produce auditable final evidence",
+      "required": true,
+      "required_stage": "canary_readiness",
+      "required_evidence_class": "EXACT_RELEASE_READINESS",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [],
+      "supporting_test_files": [],
+      "remaining_gate": "No installed-profile canary, managed activation, rollback or inherited endurance qualification. Independent delta review is narrower than full implementation review."
+    },
+    {
+      "id": "CT-080",
+      "work_order": "CC-09",
+      "title": "Requalify integrated release",
+      "required": true,
+      "required_stage": "retained_program",
+      "required_evidence_class": "RETAINED_CONTRACT_CLOSURE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [],
+      "supporting_test_files": [],
+      "remaining_gate": "No installed-profile canary, managed activation, rollback or inherited endurance qualification. Independent delta review is narrower than full implementation review."
+    },
+    {
+      "id": "CT-081",
+      "work_order": "CC-04",
+      "title": "Abort after partial fencing has no safe resume contract",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "hermes_state_continuity.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_context_rebase_state.py",
+        "tests/ares_runtime/test_continuity_snapshot_races.py"
+      ],
+      "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete."
+    },
+    {
+      "id": "CT-082",
+      "work_order": "CC-04",
+      "title": "Recovery states can park forever without a durable wake condition",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "hermes_state_continuity.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_context_rebase_state.py",
+        "tests/ares_runtime/test_continuity_snapshot_races.py"
+      ],
+      "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete."
+    },
+    {
+      "id": "CT-083",
+      "work_order": "CC-03",
+      "title": "Unknown effects block the context needed to reconcile them",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "ares_runtime/continuity/budget.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_budget.py",
+        "tests/ares_runtime/test_continuity_transport_bounds.py"
+      ],
+      "remaining_gate": "Pure pressure policy and serialized-request bounds exist; hard shared budget reservation, actual route accounting and calibration remain unqualified."
+    },
+    {
+      "id": "CT-084",
+      "work_order": "CC-03",
+      "title": "Token reduction is incorrectly mandatory for every recovery cause",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "ares_runtime/continuity/budget.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_budget.py",
+        "tests/ares_runtime/test_continuity_transport_bounds.py"
+      ],
+      "remaining_gate": "Pure pressure policy and serialized-request bounds exist; hard shared budget reservation, actual route accounting and calibration remain unqualified."
+    },
+    {
+      "id": "CT-085",
+      "work_order": "CC-03",
+      "title": "Positive qualification facts default to true",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "ares_runtime/continuity/budget.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_budget.py",
+        "tests/ares_runtime/test_continuity_transport_bounds.py"
+      ],
+      "remaining_gate": "Pure pressure policy and serialized-request bounds exist; hard shared budget reservation, actual route accounting and calibration remain unqualified."
+    },
+    {
+      "id": "CT-086",
+      "work_order": "CC-02",
+      "title": "The presentation contract has no executable source-backed reference fixture",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "ares_runtime/continuity/compiler.py",
+        "ares_runtime/continuity/live.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_compiler.py",
+        "tests/ares_runtime/test_continuity_live.py"
+      ],
+      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration."
+    },
+    {
+      "id": "CT-087",
+      "work_order": "CC-02",
+      "title": "Deterministic content and per-attempt envelopes are conflated",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "ares_runtime/continuity/compiler.py",
+        "ares_runtime/continuity/live.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_compiler.py",
+        "tests/ares_runtime/test_continuity_live.py"
+      ],
+      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration."
+    },
+    {
+      "id": "CT-088",
+      "work_order": "CC-05",
+      "title": "Input preservation lacks an explicit root-scoped inbox watermark",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "agent/conversation_loop.py",
+        "agent/turn_context.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_runtime.py",
+        "tests/ares_runtime/test_continuity_dispatch.py"
+      ],
+      "remaining_gate": "Actual caller refusal is locally exercised with provider doubles. Live useful-work continuation, cold owner recovery, and sealed provider/effect attempts remain unqualified."
+    },
+    {
+      "id": "CT-089",
+      "work_order": "CC-04",
+      "title": "Durable references can be collected before publication or power recovery",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "hermes_state_continuity.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_context_rebase_state.py",
+        "tests/ares_runtime/test_continuity_snapshot_races.py"
+      ],
+      "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete."
+    },
+    {
+      "id": "CT-090",
+      "work_order": "CC-04",
+      "title": "Owner acknowledgments have no explicit transition and incarnation binding",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "hermes_state_continuity.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_context_rebase_state.py",
+        "tests/ares_runtime/test_continuity_snapshot_races.py"
+      ],
+      "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete."
+    },
+    {
+      "id": "CT-091",
+      "work_order": "CC-06",
+      "title": "Task fencing does not establish exclusive workspace mutation",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "hermes_state_continuity.py",
+        "plugins/context_engine/_context_governor/__init__.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_context_rebase_state.py"
+      ],
+      "remaining_gate": "Local lineage/branch tests are supporting evidence; current-policy retrieval, revocation, retention and unified live UI require route evidence."
+    },
+    {
+      "id": "CT-092",
+      "work_order": "CC-02",
+      "title": "Action-dependent selection is circular when the successor changes action",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "ares_runtime/continuity/compiler.py",
+        "ares_runtime/continuity/live.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_compiler.py",
+        "tests/ares_runtime/test_continuity_live.py"
+      ],
+      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration."
+    },
+    {
+      "id": "CT-093",
+      "work_order": "CC-07",
+      "title": "The base model allows an old ordinary effect during preparation",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "ares_runtime/continuity/",
+        "hermes_state_continuity.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_dispatch.py",
+        "tests/ares_runtime/test_continuity_snapshot_races.py"
+      ],
+      "remaining_gate": "Local negative witnesses and repeat-rebase tests are not cross-owner crash/fault injection or real repeated provider rollovers."
+    },
+    {
+      "id": "CT-094",
+      "work_order": "CC-00",
+      "title": "Packet verifier omits unexpected special files",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "agent/agent_init.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_runtime.py"
+      ],
+      "remaining_gate": "Installed tuple, native owner capabilities, compatibility and real binary baseline remain unqualified."
+    },
+    {
+      "id": "CT-095",
+      "work_order": "CC-03",
+      "title": "Retries can consume unbounded resources inside one rebase attempt",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "ares_runtime/continuity/budget.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_budget.py",
+        "tests/ares_runtime/test_continuity_transport_bounds.py"
+      ],
+      "remaining_gate": "Pure pressure policy and serialized-request bounds exist; hard shared budget reservation, actual route accounting and calibration remain unqualified."
+    },
+    {
+      "id": "CT-096",
+      "work_order": "CC-08",
+      "title": "Calibration can reward a safe system that never continues",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [],
+      "supporting_test_files": [],
+      "remaining_gate": "No matched-budget selected-route calibration, held-out outcomes or measured cost/quality claim."
+    },
+    {
+      "id": "CT-097",
+      "work_order": "CC-07",
+      "title": "Model exit criteria use optimization-removable assertions",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "ares_runtime/continuity/",
+        "hermes_state_continuity.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_dispatch.py",
+        "tests/ares_runtime/test_continuity_snapshot_races.py"
+      ],
+      "remaining_gate": "Local negative witnesses and repeat-rebase tests are not cross-owner crash/fault injection or real repeated provider rollovers."
+    },
+    {
+      "id": "CT-098",
+      "work_order": "CC-09",
+      "title": "Release stages and inherited catalog are not an executable closure boundary",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [],
+      "supporting_test_files": [],
+      "remaining_gate": "No installed-profile canary, managed activation, rollback or inherited endurance qualification. Independent delta review is narrower than full implementation review."
+    },
+    {
+      "id": "CT-099",
+      "work_order": "CC-02",
+      "title": "Required source and excerpt can be altered together",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "ares_runtime/continuity/compiler.py",
+        "ares_runtime/continuity/live.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_compiler.py",
+        "tests/ares_runtime/test_continuity_live.py"
+      ],
+      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration."
+    },
+    {
+      "id": "CT-100",
+      "work_order": "CC-02",
+      "title": "Task, control, mode and scope are outside the oracle",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "ares_runtime/continuity/compiler.py",
+        "ares_runtime/continuity/live.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_compiler.py",
+        "tests/ares_runtime/test_continuity_live.py"
+      ],
+      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration."
+    },
+    {
+      "id": "CT-101",
+      "work_order": "CC-02",
+      "title": "Malformed shapes and alternate entry points bypass bounded refusal",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "ares_runtime/continuity/compiler.py",
+        "ares_runtime/continuity/live.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_compiler.py",
+        "tests/ares_runtime/test_continuity_live.py"
+      ],
+      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration."
+    },
+    {
+      "id": "CT-102",
+      "work_order": "CC-07",
+      "title": "Directory breadth is unbounded in the inventory verifier",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "ares_runtime/continuity/",
+        "hermes_state_continuity.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_dispatch.py",
+        "tests/ares_runtime/test_continuity_snapshot_races.py"
+      ],
+      "remaining_gate": "Local negative witnesses and repeat-rebase tests are not cross-owner crash/fault injection or real repeated provider rollovers."
+    },
+    {
+      "id": "CT-103",
+      "work_order": "CC-07",
+      "title": "Post-extraction verification does not safely admit the ZIP itself",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "ares_runtime/continuity/",
+        "hermes_state_continuity.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_dispatch.py",
+        "tests/ares_runtime/test_continuity_snapshot_races.py"
+      ],
+      "remaining_gate": "Local negative witnesses and repeat-rebase tests are not cross-owner crash/fault injection or real repeated provider rollovers."
+    },
+    {
+      "id": "CT-104",
+      "work_order": "CC-09",
+      "title": "Stage metadata permits real-owner gates to look offline-qualified",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [],
+      "supporting_test_files": [],
+      "remaining_gate": "No installed-profile canary, managed activation, rollback or inherited endurance qualification. Independent delta review is narrower than full implementation review."
+    },
+    {
+      "id": "CT-105",
+      "work_order": "CC-04",
+      "title": "The required participant set can become a candidate-selected subset",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "hermes_state_continuity.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_context_rebase_state.py",
+        "tests/ares_runtime/test_continuity_snapshot_races.py"
+      ],
+      "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete."
+    },
+    {
+      "id": "CT-106",
+      "work_order": "CC-05",
+      "title": "Materialization refresh and dispatch attempt need one sealed binding",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "agent/conversation_loop.py",
+        "agent/turn_context.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_runtime.py",
+        "tests/ares_runtime/test_continuity_dispatch.py"
+      ],
+      "remaining_gate": "Actual caller refusal is locally exercised with provider doubles. Live useful-work continuation, cold owner recovery, and sealed provider/effect attempts remain unqualified."
+    },
+    {
+      "id": "CT-107",
+      "work_order": "CC-03",
+      "title": "Separate recovery budgets need a shared hard-cap accounting rule",
+      "required": true,
+      "required_stage": "isolated_route",
+      "required_evidence_class": "ACTUAL_SELECTED_ROUTE_ISOLATED",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "ares_runtime/continuity/budget.py",
+        "ares_runtime/continuity/runtime.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_budget.py",
+        "tests/ares_runtime/test_continuity_transport_bounds.py"
+      ],
+      "remaining_gate": "Pure pressure policy and serialized-request bounds exist; hard shared budget reservation, actual route accounting and calibration remain unqualified."
+    },
+    {
+      "id": "CT-108",
+      "work_order": "CC-01",
+      "title": "Single-epoch golden fixtures do not test partial requirement supersession",
+      "required": true,
+      "required_stage": "offline",
+      "required_evidence_class": "SOURCE_AND_DISPOSABLE",
+      "status": "NOT_QUALIFIED",
+      "source_surfaces": [
+        "hermes_state_continuity.py",
+        "ares_runtime/continuity/checkpoint.py"
+      ],
+      "supporting_test_files": [
+        "tests/ares_runtime/test_continuity_checkpoint.py",
+        "tests/ares_runtime/test_context_rebase_state.py"
+      ],
+      "remaining_gate": "Local snapshots and checkpoint inspection exist; continuous complete workspace/effect/process capture is not established."
+    }
+  ],
+  "inherited_program": {
+    "count": 172,
+    "catalog_sha256": "5b9d3aa028457c350a7f6961eda9e9d9e886701b838722a970cfadc34bdcbf4e",
+    "status": "RETAINED_NOT_REQUALIFIED",
+    "ids": [
+      "AF-00-G01",
+      "AF-00-G02",
+      "AF-00-G03",
+      "AF-00-G04",
+      "AF-00-G05",
+      "AF-01-G01",
+      "AF-01-G02",
+      "AF-01-G03",
+      "AF-02-G01",
+      "AF-02-G02",
+      "AF-02-G03",
+      "AF-02-G04",
+      "AF-02-G05",
+      "AF-03-G01",
+      "AF-03-G02",
+      "AF-03-G03",
+      "AF-03-G04",
+      "AF-03-G05",
+      "AF-03-G06",
+      "AF-03-G07",
+      "AF-03-G08",
+      "AF-03-G09",
+      "AF-04-G01",
+      "AF-04-G02",
+      "AF-04-G03",
+      "AF-04-G04",
+      "AF-04-G05",
+      "AF-04-G06",
+      "AF-05-G01",
+      "AF-05-G02",
+      "AF-05-G03",
+      "AF-05-G04",
+      "AF-05-G05",
+      "AF-05-G06",
+      "AF-05-G07",
+      "AF-05-G08",
+      "AF-06-G01",
+      "AF-06-G02",
+      "AF-06-G03",
+      "AF-06-G04",
+      "AF-06-G05",
+      "AF-06-G06",
+      "AF-06-G07",
+      "AF-06-G08",
+      "AF-06-G09",
+      "AF-07-G01",
+      "AF-07-G02",
+      "AF-07-G03",
+      "AF-07-G04",
+      "AF-07-G05",
+      "AF-07-G06",
+      "AF-07-G07",
+      "AF-07-G08",
+      "AF-07-G09",
+      "AF-07-G10",
+      "AF-07-G11",
+      "AF-07-G12",
+      "AF-07-G13",
+      "AF-07-G14",
+      "AF-08-G01",
+      "AF-08-G02",
+      "AF-08-G03",
+      "AF-08-G04",
+      "AF-08-G05",
+      "AF-08-G06",
+      "AF-09-G01",
+      "AF-09-G02",
+      "AF-09-G03",
+      "AF-09-G04",
+      "AF-09-G05",
+      "AF-09-G06",
+      "AF-09-G07",
+      "AF-10-G01",
+      "AF-10-G02",
+      "AF-10-G03",
+      "AF-10-G04",
+      "AF-10-G05",
+      "AF-10-G06",
+      "AF-10-G07",
+      "AF-10-G08",
+      "AF-10-G09",
+      "AF-10-G10",
+      "AF-11-G01",
+      "AF-11-G02",
+      "AF-11-G03",
+      "AF-11-G04",
+      "AF-11-G05",
+      "AF-11-G06",
+      "AF-11-G07",
+      "AF-11-G08",
+      "AF-12-G01",
+      "AF-12-G02",
+      "AF-12-G03",
+      "AF-12-G04",
+      "AF-12-G05",
+      "AF-12-G06",
+      "AF-13-G01",
+      "AF-13-G02",
+      "AF-13-G03",
+      "AF-13-G04",
+      "AF-13-G05",
+      "AF-13-G06",
+      "AF-13-G07",
+      "AF-14-G01",
+      "AF-14-G02",
+      "AF-14-G03",
+      "AF-14-G04",
+      "AF-14-G05",
+      "AC-00-G01",
+      "AC-00-G02",
+      "AC-00-G03",
+      "AC-00-G04",
+      "AC-01-G01",
+      "AC-01-G02",
+      "AC-01-G03",
+      "AC-01-G04",
+      "AC-02-G01",
+      "AC-02-G02",
+      "AC-02-G03",
+      "AC-02-G04",
+      "AC-03-G01",
+      "AC-03-G02",
+      "AC-03-G03",
+      "AC-03-G04",
+      "AC-04-G01",
+      "AC-04-G02",
+      "AC-04-G03",
+      "AC-04-G04",
+      "AC-05-G01",
+      "AC-05-G02",
+      "AC-05-G03",
+      "AC-05-G04",
+      "AC-06-G01",
+      "AC-06-G02",
+      "AC-06-G03",
+      "AC-06-G04",
+      "AC-07-G01",
+      "AC-07-G02",
+      "AC-07-G03",
+      "AC-07-G04",
+      "AC-08-G01",
+      "AC-08-G02",
+      "AC-08-G03",
+      "AC-08-G04",
+      "AC-09-G01",
+      "AC-09-G02",
+      "AC-09-G03",
+      "AC-09-G04",
+      "AC-10-G01",
+      "AC-10-G02",
+      "AC-10-G03",
+      "AC-10-G04",
+      "AC-11-G01",
+      "AC-11-G02",
+      "AC-11-G03",
+      "AC-11-G04",
+      "AC-12-G01",
+      "AC-12-G02",
+      "AC-12-G03",
+      "AC-12-G04",
+      "AC-13-G01",
+      "AC-13-G02",
+      "AC-13-G03",
+      "AC-13-G04",
+      "AC-14-G01",
+      "AC-14-G02",
+      "AC-14-G03",
+      "AC-14-G04",
+      "AC-15-G01",
+      "AC-15-G02",
+      "AC-15-G03",
+      "AC-15-G04"
+    ]
+  }
+}

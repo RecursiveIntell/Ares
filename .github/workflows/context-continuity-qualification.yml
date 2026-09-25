@@ -22,6 +22,10 @@ on:
       - 'tests/cli/test_cli_async_delegation_delivery.py'
       - 'tests/gateway/test_goal_resume_restart.py'
       - 'tests/agent/test_synthetic_turn_display_kind.py'
+      - 'tests/agent/test_turn_context.py'
+      - 'tests/run_agent/test_run_agent.py'
+      - 'tests/run_agent/test_1630_context_overflow_loop.py'
+      - 'tests/run_agent/test_compression_lock_defer.py'
       - 'agent/agent_init.py'
       - 'agent/conversation_loop.py'
       - 'agent/run_checkpoint_custody.py'
@@ -60,7 +64,7 @@ jobs:
         with:
           version: '0.9.28'
       - name: Install locked test dependencies
-        run: uv sync --frozen --extra dev --python 3.13
+        run: uv sync --frozen --extra dev --extra anthropic --python 3.13
       - name: Run continuity and adjacent ownership surfaces
         shell: bash
         run: |
@@ -83,7 +87,11 @@ jobs:
             tests/cli/test_cli_goal_interrupt.py \
             tests/cli/test_cli_async_delegation_delivery.py \
             tests/gateway/test_goal_resume_restart.py \
-            tests/agent/test_synthetic_turn_display_kind.py -- -q
+            tests/agent/test_synthetic_turn_display_kind.py \
+            tests/agent/test_turn_context.py \
+            tests/run_agent/test_run_agent.py \
+            tests/run_agent/test_1630_context_overflow_loop.py \
+            tests/run_agent/test_compression_lock_defer.py -- -q
           .venv/bin/ruff check \
             ares_runtime/continuity \
             hermes_state_continuity.py \

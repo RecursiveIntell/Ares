@@ -1,0 +1,105 @@
+{
+  "schema_version": "recursiveintell-route-receipt/v1",
+  "status": "partial",
+  "intent": "implement",
+  "domain": "generic",
+  "affected_domains": [
+    "generic",
+    "memory"
+  ],
+  "risk": "high",
+  "evidence_impact": "data-integrity",
+  "authority": "external-write",
+  "authorities": [
+    "local-write",
+    "evidence-write",
+    "external-write"
+  ],
+  "authorized_targets": [
+    "/workspace/scratch/bfe02ea97bc3/Ares",
+    "/workspace/scratch/bfe02ea97bc3/evidence",
+    "github:RecursiveIntell/Ares#80"
+  ],
+  "route_id": "high-risk-implement",
+  "selected_skills": [
+    "audit-repo-hostile",
+    "design-proofed-codex-pass",
+    "run-proofed-code-change",
+    "govern-memory-change"
+  ],
+  "skipped_skills": [],
+  "stages": [
+    {
+      "id": "audit@pre",
+      "status": "passed",
+      "evidence": [
+        "docs/context-continuity/repair-evidence.json",
+        "docs/context-continuity/QUALIFICATION.md"
+      ],
+      "receipt": "Confirmed mixed SQLite snapshot, stale local-owner publication, and blocked caller fallthrough."
+    },
+    {
+      "id": "plan@bounded",
+      "status": "passed",
+      "evidence": [
+        "docs/context-continuity/repair-evidence.json",
+        "docs/context-continuity/QUALIFICATION.md"
+      ],
+      "receipt": "Reuse V4 contract; narrow repair owns SessionDB observations and existing caller admission. Extend scope to callers and CI after executable fallthrough witnesses."
+    },
+    {
+      "id": "authority@local",
+      "status": "passed",
+      "evidence": [
+        "docs/context-continuity/repair-evidence.json",
+        "docs/context-continuity/QUALIFICATION.md"
+      ],
+      "receipt": "Continue existing PR80 implementation; no merge, live activation, paid providers or live state repair."
+    },
+    {
+      "id": "implement@bounded",
+      "status": "passed",
+      "evidence": [
+        "docs/context-continuity/repair-evidence.json",
+        "docs/context-continuity/QUALIFICATION.md"
+      ],
+      "receipt": "Implement snapshot and publication digest binding, unresolved-effect refusal, dispatcher stop, accounting and authentic-input persistence."
+    },
+    {
+      "id": "audit@post",
+      "status": "passed",
+      "evidence": [
+        "docs/context-continuity/repair-evidence.json",
+        "docs/context-continuity/QUALIFICATION.md"
+      ],
+      "receipt": "Independent read-only review passed default route; source hashes match final review; nondefault read limits remain unsupported."
+    }
+  ],
+  "mutations": [
+    {
+      "stage": "implement@bounded",
+      "authority": "local-write",
+      "action": "Repair snapshot/publication and caller admission; add behavioral regressions, CI selection, acceptance inventory and evidence.",
+      "target": "/workspace/scratch/bfe02ea97bc3/Ares"
+    }
+  ],
+  "validation": [
+    "Canonical baseline: 20 files, 946 passing tests.",
+    "Corrected baseline RED: 8 snapshot and 8 dispatch failures.",
+    "Independent review: five files, 74 passing tests; revised dispatch 12 passing tests.",
+    "Ruff and git diff --check passed.",
+    "108 continuity and 172 inherited IDs preserved with exact catalog metadata and hashes.",
+    "Final pinned canonical gate: 26 files, 1289 passed, 0 failed, exit 0; raw log retained in repair-test-run.log."
+  ],
+  "blocked_gates": [
+    "No installed native capability tuple, paid-provider canary or external-owner qualification in this environment."
+  ],
+  "remaining_delta": [
+    "Cross-owner fences/ACKs and durable crash/restart reconciliation.",
+    "Request-bound final dispatch admission and current-policy retrieval acceptance oracles.",
+    "Selected-route calibration, canary readiness, authorized live canaries and endurance.",
+    "Nondefault snapshot read limits and pre-digest transition replay/migration qualification."
+  ],
+  "next_gate": "Complete native cross-owner and final-dispatch owner protocol against V4 case-specific oracles.",
+  "qualification": "Bounded source repair passed; full V4 program remains incomplete."
+}

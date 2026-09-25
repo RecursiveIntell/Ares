@@ -11,6 +11,7 @@ context-engine/provider and other required owners have been reconciled.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import hashlib
 import json
 import re
 import time
@@ -212,6 +213,11 @@ class ContextRebaseSnapshot:
     loop_raw: Optional[str]
     todo_json: Optional[str]
 
+    @property
+    def digest(self) -> str:
+        """Exact bounded local read-set identity, not external-owner authority."""
+        return "sha256:" + hashlib.sha256(_canonical(asdict(self)).encode("utf-8")).hexdigest()
+
 class SessionContextContinuityMixin:
     """Local SessionDB continuity owner; external activation remains separate."""
 
@@ -352,270 +358,289 @@ class SessionContextContinuityMixin:
             raise ContextContinuationError("INVALID_AUTHENTIC_USER_LIMIT")
 
         with self._read_ctx() as conn:
-            session = conn.execute(
-                "SELECT id,profile_name,cwd,git_branch,git_repo_root,ended_at FROM sessions WHERE id=?",
-                (session_id,),
-            ).fetchone()
-            if session is None or session["ended_at"] is not None:
-                raise ContextContinuationError("CONTEXT_REBASE_PARENT_NOT_LIVE")
-            root = self._session_turn_lease_key_on_conn(conn, session_id)
-            watermark_row = conn.execute(
-                "SELECT COALESCE(MAX(id),0) AS watermark FROM messages WHERE session_id=? AND active=1",
-                (session_id,),
-            ).fetchone()
-            watermark = int(watermark_row["watermark"] if watermark_row else 0)
-            if watermark <= 0:
-                raise ContextContinuationError("CONTEXT_REBASE_PARENT_EMPTY")
-
-            # Only traverse canonical continuation parents. Explicit branches
-            # have their own copied transcript and therefore root at themselves.
-            lineage = [session_id]
-            current = session_id
-            seen = {current}
-            for _ in range(1000):
-                row = conn.execute(
-                    "SELECT parent_session_id,model_config FROM sessions WHERE id=?",
-                    (current,),
-                ).fetchone()
-                if row is None or not row["parent_session_id"]:
-                    break
-                parent_id = row["parent_session_id"]
-                if parent_id in seen:
-                    raise ContextContinuationError("CONTINUATION_CYCLE")
-                parent = conn.execute(
-                    "SELECT end_reason FROM sessions WHERE id=?", (parent_id,),
-                ).fetchone()
-                if parent is None:
-                    break
-                reason = parent["end_reason"]
-                if reason == "compression":
-                    # Match the same explicit fork boundary used by the turn lease.
-                    config = json.loads(row["model_config"] or "{}")
-                    if (type(config) is not dict
-                            or config.get("_branched_from") == parent_id
-                            or config.get("_delegate_from") == parent_id):
-                        break
-                elif reason == _CONTEXT_REBASE_END_REASON:
-                    if not self._context_rebase_child_matches(row, parent_id):
-                        break
-                else:
-                    break
-                lineage.append(parent_id)
-                seen.add(parent_id)
-                current = parent_id
-            else:
-                raise ContextContinuationError("CONTINUATION_DEPTH_LIMIT")
-
-            # Build one exact human-originated instruction ledger across the
-            # canonical continuation lineage. Physical rebase replay rows carry
-            # the same content into a child; deduplicate only those exact replay
-            # clones so an epoch boundary cannot multiply user authority.
-            authentic_user_list = []
-            authentic_seen = set()
-            for sid in reversed(lineage):
-                rows = conn.execute(
-                    "SELECT id,content,timestamp,display_kind,display_metadata "
-                    "FROM messages WHERE session_id=? AND active=1 AND role='user' "
-                    "ORDER BY id ASC",
-                    (sid,),
-                ).fetchall()
-                for row in rows:
-                    candidate = {
-                        "role": "user",
-                        "content": self._decode_content(row["content"]),
-                        "timestamp": row["timestamp"],
-                    }
-                    if row["display_kind"]:
-                        candidate["display_kind"] = row["display_kind"]
-                    if row["display_metadata"]:
-                        decoded_meta = self._decode_display_metadata(
-                            row["display_metadata"]
-                        )
-                        if decoded_meta is not None:
-                            candidate["display_metadata"] = decoded_meta
-                    live_view = user_originated_turn_view(candidate)
-                    if live_view is None:
-                        continue
-                    try:
-                        canonical_content = _canonical(live_view.get("content"))
-                    except ContextContinuationError:
-                        canonical_content = repr(live_view.get("content"))
-                    replay_key = (
-                        live_view.get("timestamp"),
-                        canonical_content,
-                    )
-                    if replay_key in authentic_seen:
-                        continue
-                    authentic_seen.add(replay_key)
-                    authentic_user_list.append({
-                        "row_id": int(row["id"]),
-                        "session_id": sid,
-                        "content": live_view.get("content"),
-                        "timestamp": live_view.get("timestamp"),
-                    })
-                    if len(authentic_user_list) > authentic_user_limit:
-                        raise ContextContinuationError(
-                            "TOO_MANY_AUTHENTIC_USER_INSTRUCTIONS"
-                        )
-            authentic_users = tuple(authentic_user_list)
-            if not authentic_users:
-                raise ContextContinuationError(
-                    "CONTEXT_REBASE_AUTHENTIC_USER_ANCHOR_MISSING"
+            # _read_ctx owns connection checkout/locking, not a SQLite snapshot.
+            # A savepoint composes with a borrowed transaction and also leaves
+            # pooled readers clean on every success/refusal path.
+            conn.execute("SAVEPOINT context_rebase_snapshot")
+            try:
+                return self._read_context_rebase_snapshot_on_conn(
+                    conn, session_id, recent_limit=recent_limit,
+                    user_limit=user_limit, unresolved_effect_limit=unresolved_effect_limit,
+                    authentic_user_limit=authentic_user_limit,
                 )
-            first_user = authentic_users[0]
-            control_revision = int(authentic_users[-1]["row_id"])
+            finally:
+                conn.execute("ROLLBACK TO context_rebase_snapshot")
+                conn.execute("RELEASE context_rebase_snapshot")
 
-            summary = conn.execute(
-                "SELECT id,content,timestamp,display_metadata FROM messages "
-                "WHERE session_id=? AND active=1 AND _compressed_summary=1 "
-                "ORDER BY id DESC LIMIT 1",
-                (session_id,),
+    def _read_context_rebase_snapshot_on_conn(
+        self, conn, session_id, *, recent_limit=12, user_limit=32,
+        unresolved_effect_limit=32, authentic_user_limit=128,
+    ) -> ContextRebaseSnapshot:
+        """Caller owns one read snapshot or the publication write transaction."""
+        session = conn.execute(
+            "SELECT id,profile_name,cwd,git_branch,git_repo_root,ended_at FROM sessions WHERE id=?",
+            (session_id,),
+        ).fetchone()
+        if session is None or session["ended_at"] is not None:
+            raise ContextContinuationError("CONTEXT_REBASE_PARENT_NOT_LIVE")
+        root = self._session_turn_lease_key_on_conn(conn, session_id)
+        watermark_row = conn.execute(
+            "SELECT COALESCE(MAX(id),0) AS watermark FROM messages WHERE session_id=? AND active=1",
+            (session_id,),
+        ).fetchone()
+        watermark = int(watermark_row["watermark"] if watermark_row else 0)
+        if watermark <= 0:
+            raise ContextContinuationError("CONTEXT_REBASE_PARENT_EMPTY")
+
+        # Only traverse canonical continuation parents. Explicit branches
+        # have their own copied transcript and therefore root at themselves.
+        lineage = [session_id]
+        current = session_id
+        seen = {current}
+        for _ in range(1000):
+            row = conn.execute(
+                "SELECT parent_session_id,model_config FROM sessions WHERE id=?",
+                (current,),
             ).fetchone()
-            summary_id = int(summary["id"]) if summary is not None else 0
-            summary_metadata = (
-                self._decode_display_metadata(summary["display_metadata"])
-                if summary is not None and summary["display_metadata"]
-                else None
-            )
-            is_derived_rebase_brief = bool(
-                isinstance(summary_metadata, dict)
-                and summary_metadata.get("continuation_kind")
-                == "context_rebase_brief"
-            )
-            latest_summary = (
-                None
-                if summary is None or is_derived_rebase_brief
-                else {
-                    "row_id": summary_id,
-                    "content": self._decode_content(summary["content"]),
-                    "timestamp": summary["timestamp"],
-                }
-            )
+            if row is None or not row["parent_session_id"]:
+                break
+            parent_id = row["parent_session_id"]
+            if parent_id in seen:
+                raise ContextContinuationError("CONTINUATION_CYCLE")
+            parent = conn.execute(
+                "SELECT end_reason FROM sessions WHERE id=?", (parent_id,),
+            ).fetchone()
+            if parent is None:
+                break
+            reason = parent["end_reason"]
+            if reason == "compression":
+                # Match the same explicit fork boundary used by the turn lease.
+                config = json.loads(row["model_config"] or "{}")
+                if (type(config) is not dict
+                        or config.get("_branched_from") == parent_id
+                        or config.get("_delegate_from") == parent_id):
+                    break
+            elif reason == _CONTEXT_REBASE_END_REASON:
+                if not self._context_rebase_child_matches(row, parent_id):
+                    break
+            else:
+                break
+            lineage.append(parent_id)
+            seen.add(parent_id)
+            current = parent_id
+        else:
+            raise ContextContinuationError("CONTINUATION_DEPTH_LIMIT")
 
-            user_rows = conn.execute(
+        # Build one exact human-originated instruction ledger across the
+        # canonical continuation lineage. Physical rebase replay rows carry
+        # the same content into a child; deduplicate only those exact replay
+        # clones so an epoch boundary cannot multiply user authority.
+        authentic_user_list = []
+        authentic_seen = set()
+        for sid in reversed(lineage):
+            rows = conn.execute(
                 "SELECT id,content,timestamp,display_kind,display_metadata "
-                "FROM messages WHERE session_id=? AND active=1 AND role='user' AND id>? "
-                "ORDER BY id ASC LIMIT ?",
-                (session_id, summary_id, user_limit + 1),
+                "FROM messages WHERE session_id=? AND active=1 AND role='user' "
+                "ORDER BY id ASC",
+                (sid,),
             ).fetchall()
-            if len(user_rows) > user_limit:
-                raise ContextContinuationError("TOO_MANY_UNSUMMARIZED_USER_CHANGES")
-            current_users_list = []
-            for row in user_rows:
-                item = {
-                    "row_id": int(row["id"]),
+            for row in rows:
+                candidate = {
+                    "role": "user",
                     "content": self._decode_content(row["content"]),
                     "timestamp": row["timestamp"],
-                    "display_kind": row["display_kind"],
                 }
-                decoded_meta = (
-                    self._decode_display_metadata(row["display_metadata"])
-                    if row["display_metadata"]
-                    else None
+                if row["display_kind"]:
+                    candidate["display_kind"] = row["display_kind"]
+                if row["display_metadata"]:
+                    decoded_meta = self._decode_display_metadata(
+                        row["display_metadata"]
+                    )
+                    if decoded_meta is not None:
+                        candidate["display_metadata"] = decoded_meta
+                live_view = user_originated_turn_view(candidate)
+                if live_view is None:
+                    continue
+                try:
+                    canonical_content = _canonical(live_view.get("content"))
+                except ContextContinuationError:
+                    canonical_content = repr(live_view.get("content"))
+                replay_key = (
+                    live_view.get("timestamp"),
+                    canonical_content,
                 )
-                if decoded_meta is not None:
-                    item["display_metadata"] = decoded_meta
-                live_view = user_originated_turn_view({
-                    "role": "user",
-                    "content": item["content"],
-                    "timestamp": item["timestamp"],
-                    **(
-                        {"display_kind": item["display_kind"]}
-                        if item["display_kind"]
-                        else {}
-                    ),
-                    **(
-                        {"display_metadata": decoded_meta}
-                        if decoded_meta is not None
-                        else {}
-                    ),
+                if replay_key in authentic_seen:
+                    continue
+                authentic_seen.add(replay_key)
+                authentic_user_list.append({
+                    "row_id": int(row["id"]),
+                    "session_id": sid,
+                    "content": live_view.get("content"),
+                    "timestamp": live_view.get("timestamp"),
                 })
-                item["authentic_user"] = live_view is not None
-                current_users_list.append(item)
-            current_users = tuple(current_users_list)
-            if not current_users:
-                raise ContextContinuationError("CONTEXT_REBASE_USER_ANCHOR_MISSING")
-
-            event_rows = conn.execute(
-                "SELECT id,role,content,tool_name,tool_call_id,effect_disposition,observed,"
-                "finish_reason,timestamp,_compressed_summary "
-                "FROM messages WHERE session_id=? AND active=1 AND id>? "
-                "ORDER BY id DESC LIMIT ?",
-                (session_id, summary_id, recent_limit),
-            ).fetchall()
-            recent_events = tuple({
-                "row_id": int(row["id"]),
-                "role": row["role"],
-                "content": self._decode_content(row["content"]),
-                "tool_name": row["tool_name"],
-                "tool_call_id": row["tool_call_id"],
-                "effect_disposition": row["effect_disposition"],
-                "observed": bool(row["observed"]),
-                "finish_reason": row["finish_reason"],
-                "timestamp": row["timestamp"],
-                "compressed_summary": bool(row["_compressed_summary"]),
-            } for row in reversed(event_rows))
-
-            unresolved_effects_list = []
-            for sid in reversed(lineage):
-                rows = conn.execute(
-                    "SELECT id,role,content,tool_name,tool_call_id,effect_disposition,"
-                    "observed,finish_reason,timestamp,_compressed_summary "
-                    "FROM messages WHERE session_id=? AND active=1 AND role='tool' "
-                    "AND effect_disposition='unknown' ORDER BY id ASC LIMIT ?",
-                    (sid, unresolved_effect_limit + 1),
-                ).fetchall()
-                for row in rows:
-                    unresolved_effects_list.append({
-                        "row_id": int(row["id"]),
-                        "session_id": sid,
-                        "role": row["role"],
-                        "content": self._decode_content(row["content"]),
-                        "tool_name": row["tool_name"],
-                        "tool_call_id": row["tool_call_id"],
-                        "effect_disposition": row["effect_disposition"],
-                        "observed": bool(row["observed"]),
-                        "finish_reason": row["finish_reason"],
-                        "timestamp": row["timestamp"],
-                        "compressed_summary": bool(row["_compressed_summary"]),
-                    })
-                    if len(unresolved_effects_list) > unresolved_effect_limit:
-                        raise ContextContinuationError(
-                            "TOO_MANY_UNRESOLVED_EFFECTS"
-                        )
-            unresolved_effects = tuple(unresolved_effects_list)
-
-            goal_row = conn.execute(
-                "SELECT value FROM state_meta WHERE key=?", (f"goal:{session_id}",),
-            ).fetchone()
-            goal_raw = None if goal_row is None else goal_row[0]
-            heartbeat_row = conn.execute(
-                "SELECT value FROM state_meta WHERE key=?",
-                (f"heartbeat:{session_id}",),
-            ).fetchone()
-            heartbeat_raw = None if heartbeat_row is None else heartbeat_row[0]
-            loop_row = conn.execute(
-                "SELECT value FROM state_meta WHERE key=?",
-                (f"loop:{session_id}",),
-            ).fetchone()
-            loop_raw = None if loop_row is None else loop_row[0]
-            todo = self._current_todo_snapshot_on_conn(conn, session_id)
-            todo_json = None if todo is None else todo["todos_json"]
-
-            # Recheck the local read coordinates inside this same read transaction.
-            final = conn.execute(
-                "SELECT COALESCE(MAX(id),0) AS watermark FROM messages WHERE session_id=? AND active=1",
-                (session_id,),
-            ).fetchone()
-            if int(final["watermark"] if final else 0) != watermark:
-                raise ContextContinuationError("CONTEXT_REBASE_SNAPSHOT_CHANGED")
-            return ContextRebaseSnapshot(
-                session_id, str(root), session["profile_name"], session["cwd"],
-                session["git_branch"], session["git_repo_root"], watermark,
-                control_revision, first_user, authentic_users, current_users,
-                latest_summary, recent_events, unresolved_effects, goal_raw,
-                heartbeat_raw, loop_raw, todo_json,
+                if len(authentic_user_list) > authentic_user_limit:
+                    raise ContextContinuationError(
+                        "TOO_MANY_AUTHENTIC_USER_INSTRUCTIONS"
+                    )
+        authentic_users = tuple(authentic_user_list)
+        if not authentic_users:
+            raise ContextContinuationError(
+                "CONTEXT_REBASE_AUTHENTIC_USER_ANCHOR_MISSING"
             )
+        first_user = authentic_users[0]
+        control_revision = int(authentic_users[-1]["row_id"])
+
+        summary = conn.execute(
+            "SELECT id,content,timestamp,display_metadata FROM messages "
+            "WHERE session_id=? AND active=1 AND _compressed_summary=1 "
+            "ORDER BY id DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        summary_id = int(summary["id"]) if summary is not None else 0
+        summary_metadata = (
+            self._decode_display_metadata(summary["display_metadata"])
+            if summary is not None and summary["display_metadata"]
+            else None
+        )
+        is_derived_rebase_brief = bool(
+            isinstance(summary_metadata, dict)
+            and summary_metadata.get("continuation_kind")
+            == "context_rebase_brief"
+        )
+        latest_summary = (
+            None
+            if summary is None or is_derived_rebase_brief
+            else {
+                "row_id": summary_id,
+                "content": self._decode_content(summary["content"]),
+                "timestamp": summary["timestamp"],
+            }
+        )
+
+        user_rows = conn.execute(
+            "SELECT id,content,timestamp,display_kind,display_metadata "
+            "FROM messages WHERE session_id=? AND active=1 AND role='user' AND id>? "
+            "ORDER BY id ASC LIMIT ?",
+            (session_id, summary_id, user_limit + 1),
+        ).fetchall()
+        if len(user_rows) > user_limit:
+            raise ContextContinuationError("TOO_MANY_UNSUMMARIZED_USER_CHANGES")
+        current_users_list = []
+        for row in user_rows:
+            item = {
+                "row_id": int(row["id"]),
+                "content": self._decode_content(row["content"]),
+                "timestamp": row["timestamp"],
+                "display_kind": row["display_kind"],
+            }
+            decoded_meta = (
+                self._decode_display_metadata(row["display_metadata"])
+                if row["display_metadata"]
+                else None
+            )
+            if decoded_meta is not None:
+                item["display_metadata"] = decoded_meta
+            live_view = user_originated_turn_view({
+                "role": "user",
+                "content": item["content"],
+                "timestamp": item["timestamp"],
+                **(
+                    {"display_kind": item["display_kind"]}
+                    if item["display_kind"]
+                    else {}
+                ),
+                **(
+                    {"display_metadata": decoded_meta}
+                    if decoded_meta is not None
+                    else {}
+                ),
+            })
+            item["authentic_user"] = live_view is not None
+            current_users_list.append(item)
+        current_users = tuple(current_users_list)
+        if not current_users:
+            raise ContextContinuationError("CONTEXT_REBASE_USER_ANCHOR_MISSING")
+
+        event_rows = conn.execute(
+            "SELECT id,role,content,tool_name,tool_call_id,effect_disposition,observed,"
+            "finish_reason,timestamp,_compressed_summary "
+            "FROM messages WHERE session_id=? AND active=1 AND id>? "
+            "ORDER BY id DESC LIMIT ?",
+            (session_id, summary_id, recent_limit),
+        ).fetchall()
+        recent_events = tuple({
+            "row_id": int(row["id"]),
+            "role": row["role"],
+            "content": self._decode_content(row["content"]),
+            "tool_name": row["tool_name"],
+            "tool_call_id": row["tool_call_id"],
+            "effect_disposition": row["effect_disposition"],
+            "observed": bool(row["observed"]),
+            "finish_reason": row["finish_reason"],
+            "timestamp": row["timestamp"],
+            "compressed_summary": bool(row["_compressed_summary"]),
+        } for row in reversed(event_rows))
+
+        unresolved_effects_list = []
+        for sid in reversed(lineage):
+            rows = conn.execute(
+                "SELECT id,role,content,tool_name,tool_call_id,effect_disposition,"
+                "observed,finish_reason,timestamp,_compressed_summary "
+                "FROM messages WHERE session_id=? AND active=1 AND role='tool' "
+                "AND effect_disposition='unknown' ORDER BY id ASC LIMIT ?",
+                (sid, unresolved_effect_limit + 1),
+            ).fetchall()
+            for row in rows:
+                unresolved_effects_list.append({
+                    "row_id": int(row["id"]),
+                    "session_id": sid,
+                    "role": row["role"],
+                    "content": self._decode_content(row["content"]),
+                    "tool_name": row["tool_name"],
+                    "tool_call_id": row["tool_call_id"],
+                    "effect_disposition": row["effect_disposition"],
+                    "observed": bool(row["observed"]),
+                    "finish_reason": row["finish_reason"],
+                    "timestamp": row["timestamp"],
+                    "compressed_summary": bool(row["_compressed_summary"]),
+                })
+                if len(unresolved_effects_list) > unresolved_effect_limit:
+                    raise ContextContinuationError(
+                        "TOO_MANY_UNRESOLVED_EFFECTS"
+                    )
+        unresolved_effects = tuple(unresolved_effects_list)
+
+        goal_row = conn.execute(
+            "SELECT value FROM state_meta WHERE key=?", (f"goal:{session_id}",),
+        ).fetchone()
+        goal_raw = None if goal_row is None else goal_row[0]
+        heartbeat_row = conn.execute(
+            "SELECT value FROM state_meta WHERE key=?",
+            (f"heartbeat:{session_id}",),
+        ).fetchone()
+        heartbeat_raw = None if heartbeat_row is None else heartbeat_row[0]
+        loop_row = conn.execute(
+            "SELECT value FROM state_meta WHERE key=?",
+            (f"loop:{session_id}",),
+        ).fetchone()
+        loop_raw = None if loop_row is None else loop_row[0]
+        todo = self._current_todo_snapshot_on_conn(conn, session_id)
+        todo_json = None if todo is None else todo["todos_json"]
+
+        # Recheck the local read coordinates inside this same read transaction.
+        final = conn.execute(
+            "SELECT COALESCE(MAX(id),0) AS watermark FROM messages WHERE session_id=? AND active=1",
+            (session_id,),
+        ).fetchone()
+        if int(final["watermark"] if final else 0) != watermark:
+            raise ContextContinuationError("CONTEXT_REBASE_SNAPSHOT_CHANGED")
+        return ContextRebaseSnapshot(
+            session_id, str(root), session["profile_name"], session["cwd"],
+            session["git_branch"], session["git_repo_root"], watermark,
+            control_revision, first_user, authentic_users, current_users,
+            latest_summary, recent_events, unresolved_effects, goal_raw,
+            heartbeat_raw, loop_raw, todo_json,
+        )
 
     def read_context_rebase_transition(self, transition_id: str) -> Optional[ContextRebaseTransition]:
         raw = self.get_meta(self._context_rebase_key(transition_id))
@@ -671,6 +696,7 @@ class SessionContextContinuityMixin:
         parent_session_id: str,
         child_session_id: str,
         continuation_digest: str,
+        expected_snapshot_digest: str,
         control_revision: int,
         input_watermark: int,
         turn_lease_holder: str,
@@ -693,6 +719,7 @@ class SessionContextContinuityMixin:
         parent_session_id = _identity(parent_session_id, "INVALID_PARENT_SESSION")
         child_session_id = _identity(child_session_id, "INVALID_CHILD_SESSION")
         _digest(continuation_digest)
+        _digest(expected_snapshot_digest)
         _nonnegative_int(control_revision, "INVALID_CONTROL_REVISION")
         _nonnegative_int(input_watermark, "INVALID_INPUT_WATERMARK")
         if type(turn_lease_holder) is not str or not turn_lease_holder:
@@ -723,6 +750,9 @@ class SessionContextContinuityMixin:
                                      (prior.child_session_id,)).fetchone()
                 if child is None or child["parent_session_id"] != prior.parent_session_id or not self._context_rebase_child_matches(child, prior.parent_session_id):
                     raise ContextContinuationError("CONTEXT_REBASE_COMMIT_CORRUPT")
+                config = json.loads(child["model_config"] or "{}")
+                if config.get("_context_rebase_snapshot_digest") != expected_snapshot_digest:
+                    raise ContextContinuationError("CONTEXT_REBASE_IDEMPOTENCY_MISMATCH")
                 return prior, None
 
             parent = conn.execute(
@@ -760,6 +790,16 @@ class SessionContextContinuityMixin:
             if int(row["watermark"] if row else 0) != input_watermark:
                 raise ContextContinuationError("CONTEXT_REBASE_STALE_INPUT")
 
+            # Compare all compiled SessionDB observations under this same
+            # BEGIN IMMEDIATE, before any successor row or parent closure.
+            try:
+                current_snapshot = self._read_context_rebase_snapshot_on_conn(conn, parent_session_id)
+            except ContextContinuationError:
+                raise ContextContinuationError("CONTEXT_REBASE_STALE_SNAPSHOT") from None
+            if (current_snapshot.digest != expected_snapshot_digest
+                    or current_snapshot.control_revision != control_revision):
+                raise ContextContinuationError("CONTEXT_REBASE_STALE_SNAPSHOT")
+
             parent_epoch = self._context_epoch_from_model_config(parent["model_config"])
             child_epoch = parent_epoch + 1
             config = dict(model_config or {})
@@ -767,6 +807,7 @@ class SessionContextContinuityMixin:
                 "_context_rebase_from": parent_session_id,
                 "_context_rebase_transition": transition_id,
                 "_context_epoch": child_epoch,
+                "_context_rebase_snapshot_digest": expected_snapshot_digest,
             }
             for field, expected in reserved.items():
                 if field in config and config[field] != expected:

@@ -53,6 +53,38 @@ class AutomaticRebaseResult:
         return self.status is AutomaticRebaseStatus.READY
 
 
+def context_rebase_failure_result(
+    result: AutomaticRebaseResult, messages: list[dict[str, Any]], *, api_calls: int,
+) -> dict[str, Any]:
+    """Project a stopped continuation without reclassifying it as completion.
+
+    All BLOCKED outcomes stop this pressure-recovery path. Falling through to
+    ordinary admission would retry the exhausted request or bypass a failed
+    source/owner/effect check. A later turn may reconsider current owner state.
+    """
+    if result.status not in {
+        AutomaticRebaseStatus.BLOCKED, AutomaticRebaseStatus.RECONCILIATION_REQUIRED,
+    }:
+        raise AutomaticRebaseError("CONTEXT_REBASE_NOT_A_FAILURE")
+    pending = result.status is AutomaticRebaseStatus.RECONCILIATION_REQUIRED
+    message = (
+        "Context rebase committed but owner reconciliation is required before ordinary execution can continue."
+        if pending else
+        f"Context continuation is blocked ({result.reason}); ordinary model/tool execution is stopped."
+    )
+    return {
+        "final_response": message,
+        "messages": messages,
+        "completed": False,
+        "api_calls": api_calls,
+        "error": result.reason,
+        "partial": True,
+        "failed": True,
+        "context_rebase_reconciliation_required": pending,
+        "context_rebase_blocked": not pending,
+    }
+
+
 def _merged_system_prompt(base: str | None, addendum: str) -> str:
     base = str(base or "").rstrip()
     addendum = str(addendum or "").strip()
@@ -339,6 +371,16 @@ def attempt_turn_start_context_rebase(
             before_tokens=before_tokens,
         )
 
+    if candidate.unresolved_effects:
+        # A prompt warning is not an effect barrier. This ordinary route has
+        # no qualified observation-only lane, so preserve the parent and refuse.
+        return AutomaticRebaseResult(
+            AutomaticRebaseStatus.BLOCKED,
+            "CONTEXT_REBASE_UNRESOLVED_EFFECTS",
+            parent_session_id,
+            before_tokens=before_tokens,
+        )
+
     new_system_prompt = _merged_system_prompt(
         active_system_prompt, candidate.system_addendum
     )
@@ -468,6 +510,7 @@ def attempt_turn_start_context_rebase(
             "_context_rebase_from",
             "_context_rebase_transition",
             "_context_epoch",
+            "_context_rebase_snapshot_digest",
         ):
             model_config.pop(reserved_key, None)
         db.publish_context_rebase_child(
@@ -475,6 +518,7 @@ def attempt_turn_start_context_rebase(
             parent_session_id=parent_session_id,
             child_session_id=child_session_id,
             continuation_digest=candidate.continuation_digest,
+            expected_snapshot_digest=candidate.snapshot_digest,
             control_revision=candidate.control_revision,
             input_watermark=candidate.input_watermark,
             turn_lease_holder=holder,

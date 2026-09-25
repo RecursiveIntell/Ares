@@ -1329,16 +1329,24 @@ def build_turn_context(
             )
             raise AutomaticRebaseError("CONTEXT_REBASE_RECONCILIATION_REQUIRED")
         elif _rebase.status is AutomaticRebaseStatus.BLOCKED:
-            _compress_block_reason = f"context-rebase:{_rebase.reason}"
-            _warn = getattr(agent, "_warn_context_overflow_blocked", None)
-            if callable(_warn) and _preflight_tokens >= getattr(
-                _compressor, "threshold_tokens", 0
-            ):
-                _warn(
-                    _compress_block_reason,
-                    _preflight_tokens,
-                    _compressor.threshold_tokens,
+            # A failed owner/source/effect check is not permission to send the
+            # stale or exhausted request through ordinary provider admission.
+            # Some refusals happen before the runtime's input flush. Preserve
+            # this authentic turn through the existing marker/lease-aware owner
+            # before exiting ahead of the normal late crash-resilience flush.
+            if _preflight_compressed:
+                agent._persist_user_message_idx = reanchor_current_turn_user_idx(
+                    messages, user_message
                 )
+            try:
+                if agent._flush_messages_to_session_db(
+                    messages, conversation_history=conversation_history
+                ) is False:
+                    agent._emit_warning("Blocked continuation input could not be persisted.")
+            except Exception:
+                logger.warning("Blocked continuation input persistence failed", exc_info=True)
+            agent._emit_warning(f"Context continuation blocked: {_rebase.reason}")
+            raise AutomaticRebaseError(_rebase.reason)
 
     if _preflight_compressed:
         # Compression rebuilt the list (tail messages are fresh compaction

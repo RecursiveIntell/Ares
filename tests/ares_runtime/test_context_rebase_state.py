@@ -33,12 +33,21 @@ def db(tmp_path):
 def _publish(db, *, transition="tx1", parent="s0", child="s1", digest=None, watermark=None):
     if watermark is None:
         watermark = db.get_active_message_watermark(parent)
+    prior = db.read_context_rebase_transition(transition)
+    if prior is None:
+        snapshot = db.read_context_rebase_snapshot(parent)
+        snapshot_digest, control_revision = snapshot.digest, snapshot.control_revision
+    else:
+        config = json.loads(db.get_session(prior.child_session_id)["model_config"])
+        snapshot_digest = config["_context_rebase_snapshot_digest"]
+        control_revision = prior.control_revision
     return db.publish_context_rebase_child(
         transition_id=transition,
         parent_session_id=parent,
         child_session_id=child,
         continuation_digest=digest or ("sha256:" + "a" * 64),
-        control_revision=7,
+        expected_snapshot_digest=snapshot_digest,
+        control_revision=control_revision,
         input_watermark=watermark,
         turn_lease_holder="holder",
         source="cli",
@@ -85,6 +94,7 @@ def test_turn_lease_holder_is_required_and_must_match(db):
         db.publish_context_rebase_child(
             transition_id="tx1", parent_session_id="s0", child_session_id="s1",
             continuation_digest="sha256:" + "a" * 64, control_revision=7,
+            expected_snapshot_digest=db.read_context_rebase_snapshot("s0").digest,
             input_watermark=watermark, turn_lease_holder="other", source="cli",
             messages=_messages(), model="test", profile_name="p1",
         )
