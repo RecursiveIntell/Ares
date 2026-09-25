@@ -436,6 +436,74 @@ def test_compute_host_crash_retains_failed_prompt_and_does_not_drain_queue(monke
                for event, _sid, payload in emitted)
 
 
+def test_real_child_exit_reports_crash_without_draining_parent_queue(tmp_path, monkeypatch):
+    """The supervisor's actual child-exit callback retains pending parent work."""
+    import tui_gateway.host_supervisor as supervisor_module
+
+    child_code = """
+import json, os, sys
+print(json.dumps({'type': 'hello', 'host_pid': os.getpid(), 'boot_id': 'fixture',
+                  'build_sha': 'unknown'}), flush=True)
+frame = json.loads(sys.stdin.readline())
+assert frame['type'] == 'turn.start'
+print(json.dumps({'type': 'turn.started', 'sid': frame['sid'],
+                  'request_id': frame['request_id']}), flush=True)
+os._exit(17)
+"""
+    # The fixture process does not need any live profile or provider secrets.
+    monkeypatch.setattr(
+        supervisor_module, "hermes_subprocess_env",
+        lambda **_kwargs: {
+            "HOME": str(tmp_path), "HERMES_HOME": str(tmp_path),
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+        },
+    )
+    import hermes_constants
+    monkeypatch.setattr(hermes_constants, "get_process_hermes_home", lambda: tmp_path)
+    session = {
+        "session_key": "child-exit-fixture", "history_lock": threading.Lock(),
+        "running": True, "history": [], "history_version": 0,
+        "queued_prompt": {"text": "later"},
+    }
+    server._start_inflight_turn(session, "original")
+    dispatched = []
+    emitted = []
+    completed = threading.Event()
+    frames = []
+    monkeypatch.setattr(server, "_drain_queued_prompt", lambda *args: dispatched.append(args))
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+    monkeypatch.setattr(server, "_session_info", lambda *_args: {})
+    supervisor = HostSupervisor(
+        registry_path=tmp_path / "child-registry.json",
+        argv=[sys.executable, "-u", "-c", child_code],
+        expected_build_sha="unknown", expected_hermes_home=str(tmp_path),
+        rpc_sink=lambda frame: frames.append(frame), respawn_max=0, autostart=False,
+    )
+    try:
+        def on_complete(frame):
+            server._on_compute_host_turn_done("r-crash", "s-crash", session, frame)
+            completed.set()
+
+        supervisor.submit_turn(
+            {"sid": "s-crash", "request_id": "r-crash", "text": "original"},
+            on_complete=on_complete,
+        )
+        assert completed.wait(timeout=10)
+        assert not supervisor.is_running()
+        assert not (tmp_path / "child-registry.json").exists()
+        assert "code 17" in session["inflight_turn"]["error"]
+        assert session["running"] is False
+        assert session["inflight_turn"]["user"] == "original"
+        assert session["inflight_turn"]["status"] == "error"
+        assert session["queued_prompt"] == {"text": "later"}
+        assert dispatched == []
+        assert any(item.get("params", {}).get("payload", {}).get("reason") == "crash"
+                   for item in frames)
+    finally:
+        supervisor.shutdown()
+
+
 def test_mutator_route_table_matches_prd_inventory():
     assert MUTATOR_ROUTE_TABLE == {
         "config.set.model": "run-concurrent",
