@@ -15,6 +15,11 @@
       "passed": 1,
       "exports": "same public symbols and owners; all resolved",
       "blockers": []
+    },
+    "late_review_closure": {
+      "passed": 85,
+      "files": 3,
+      "blockers": []
     }
   },
   "local_gates": {
@@ -31,7 +36,13 @@
       "files": 4
     }
   },
-  "portability_correction_hosted": "pending_exact_head",
+  "portability_correction_hosted": {
+    "commit": "e563576d947bfe753a3a5f592024be1e74ec7fbb",
+    "main_ci": 36174683195,
+    "windows_job": 108202712908,
+    "qualification": 36174682263,
+    "status": "passed"
+  },
   "remaining_live_evidence": [
     "installed-route canary",
     "real Desktop approval UX",
@@ -46,8 +57,40 @@
   "full_v4_qualification_claimed": false,
   "sources": {
     "ares_runtime/__init__.py": "a38bb06ac8a4ffc9eb631d1187c2d9022539b1938af6b8fbe88723b1a28d5514",
-    "ares_runtime/continuity/runtime.py": "15d6b052465013be6b178bdf78382b109475a008d32e1b3a18f78a3344468ef7",
+    "ares_runtime/continuity/runtime.py": "812756cdb1fda328e46f7a0259a9eae2d226ee0f333ed9be040dd8e673db94db",
     "ares_runtime/collaboration.py": "83df65b68b4f1c20bfac759471d39f93f2e30b7546555a8c75ee5870a2d822a8",
-    "hermes_state_context_authority.py": "3dc8319197ab04fcc92c728c87e0704d6a0843a371ca80230972bad125210c85"
+    "hermes_state_context_authority.py": "3dc8319197ab04fcc92c728c87e0704d6a0843a371ca80230972bad125210c85",
+    "agent/conversation_loop.py": "5170972daa2405ad83dcf04880e75610da1ee4ff9102b43838968951c6a33bc5",
+    "gateway/context_input.py": "14eb4fbf957b50d414433c81854f59492d504d05a2e637f84d3dc3c58b5d41ca",
+    "gateway/platforms/base.py": "3a765f7ad2f49951379fd11dfa90eb97321a49d10438e034af10ab10f5214a45",
+    "tui_gateway/methods_prompt.py": "732eb2fdc7a8294bd32da98dfc37a18aae699d86219412c8eec98ad6c377e650"
+  },
+  "native_merge": "5d3f87e467f1a3a6587e96364d2111dde001a763",
+  "late_review_corrections": {
+    "parent_commit": "e563576d947bfe753a3a5f592024be1e74ec7fbb",
+    "threads": [
+      "PRRT_kwDOTG8hvM6mHjXV",
+      "PRRT_kwDOTG8hvM6mHjXd",
+      "PRRT_kwDOTG8hvM6mHjXk",
+      "PRRT_kwDOTG8hvM6mHjXu"
+    ],
+    "changes": [
+      "Reject invalid TUI submissions before durable acceptance or busy ACK",
+      "Repair non-user sequence before continuity flush; preserve authentic occurrences and current-user anchor",
+      "Frame derived gateway content and require standalone authentic text during materialization",
+      "Serialize route admission with active and idle reset handoffs, including failure and cancellation"
+    ],
+    "local_gate": {
+      "passed": 783,
+      "failed": 0,
+      "files": 7
+    },
+    "hosted_status": "pending_exact_head; final PR merge checks are authoritative",
+    "adjacent_gate": {
+      "passed": 51,
+      "failed": 0,
+      "files": 2,
+      "overlaps_primary_gate": true
+    }
   }
 }

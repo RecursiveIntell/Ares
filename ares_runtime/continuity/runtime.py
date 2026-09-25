@@ -85,10 +85,11 @@ def prepare_context_dispatch(agent, messages, conversation_history):
             clean = getattr(agent, "_persist_user_message_override", None)
             if (index == getattr(agent, "_persist_user_message_idx", None)
                     and type(clean) is str and type(view.get("content")) is str
-                    and clean in view["content"]):
+                    and f"\n{clean}\n" in f"\n{view['content']}\n"):
                 # The prologue deliberately keeps API-only notes out of the
                 # canonical transcript. Match the clean current input only
-                # while its exact bytes remain present in the sent message.
+                # while it remains a standalone text span in the sent
+                # message, not an incidental substring of derived text.
                 view = {**view, "content": clean}
             materialized_users.append(identity(view))
         current_users = [identity(user_originated_turn_view({"role": "user", **source}))

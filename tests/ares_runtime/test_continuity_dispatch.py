@@ -30,6 +30,54 @@ def durable_agent(agent, tmp_path):
         db.close()
 
 
+def test_dispatch_repairs_before_durable_flush_and_preserves_user_occurrences(durable_agent):
+    from agent import conversation_loop
+
+    agent, db = durable_agent
+    original_build = conversation_loop.build_turn_context
+
+    def malformed_tail(*args, **kwargs):
+        context = original_build(*args, **kwargs)
+        context.messages[:0] = [
+            {"role": "tool", "tool_call_id": "missing", "content": "orphan"},
+            {"role": "assistant", "content": "first"},
+            {"role": "assistant", "content": "second"},
+            {"role": "user", "content": "Earlier correction", "timestamp": 1.0},
+        ]
+        context.current_turn_user_idx += 4
+        agent._persist_user_message_idx = context.current_turn_user_idx
+        return context
+
+    agent.client.chat.completions.create.return_value = _mock_response(content="Done", finish_reason="stop")
+    with (patch("agent.conversation_loop.build_turn_context", side_effect=malformed_tail),
+          patch.object(agent, "_persist_session"), patch.object(agent, "_save_trajectory"),
+          patch.object(agent, "_cleanup_task_resources")):
+        result = agent.run_conversation("Current correction")
+    assert result.get("error") is None, result
+    stored = db.get_messages_as_conversation(agent.session_id)
+    assert not any(row["role"] == "tool" for row in stored)
+    assistants = [row["content"] for row in stored if row["role"] == "assistant"]
+    assert assistants == ["first\nsecond", "Done"]
+    assert [row["content"] for row in stored if row["role"] == "user"] == [
+        "Earlier correction", "Current correction"]
+    sent = agent.client.chat.completions.create.call_args.kwargs["messages"]
+    assert any(row.get("content") == assistants[0] for row in sent)
+
+
+@pytest.mark.parametrize("api_text, admitted", [("token", False), ("prefix\n\nok\n\nsuffix", True)])
+def test_dispatch_requires_standalone_authentic_input(durable_agent, api_text, admitted):
+    agent, db = durable_agent
+    agent.client.chat.completions.create.return_value = _mock_response(content="Done", finish_reason="stop")
+    with patch.object(agent, "_save_trajectory"), patch.object(agent, "_cleanup_task_resources"):
+        result = agent.run_conversation(api_text, persist_user_message="ok")
+    assert agent.client.chat.completions.create.call_count == int(admitted)
+    if admitted:
+        assert result.get("error") is None, result
+    else:
+        assert result["error"] == "CONTEXT_DISPATCH_STALE_MATERIALIZATION"
+    assert [row["content"] for row in db.get_messages(agent.session_id) if row["role"] == "user"] == ["ok"]
+
+
 def test_actual_turn_recovers_committed_child_before_provider_dispatch(agent, tmp_path):
     from hermes_state import SessionDB
     from tests.ares_runtime.test_context_rebase_state import _publish

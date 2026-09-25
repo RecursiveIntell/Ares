@@ -3140,6 +3140,11 @@ class BasePlatformAdapter(ABC):
         # Without the owner-task map, an old task's finally block could delete
         # a newer task's guard, leaving stale busy state.
         self._active_sessions: Dict[str, asyncio.Event] = {}
+        # Admission shares this short route lock with reset handoffs. Ordinary
+        # turns release it after acceptance; resets retain it until the route
+        # owner has changed and the old adapter task has unwound. Weak values
+        # retire idle route locks while callers/waiters retain strong refs.
+        self._input_admission_locks = weakref.WeakValueDictionary()
         self._pending_messages: Dict[str, MessageEvent] = {}
         self._session_tasks: Dict[str, asyncio.Task] = {}
         # Legacy busy_text_mode env var; when unset the runner syncs the
@@ -6166,7 +6171,7 @@ class BasePlatformAdapter(ABC):
                 release_guard=False,
                 discard_pending=False,
             )
-        except Exception:
+        except BaseException:
             # On failure, restore the original guard if one still exists so
             # we don't leave the session in a half-reset state.
             if self._active_sessions.get(session_key) is command_guard:
@@ -6203,10 +6208,6 @@ class BasePlatformAdapter(ABC):
         if needs_topic_recovery:
             await asyncio.to_thread(self._apply_topic_recovery, event)
 
-        acceptor = getattr(self, "_input_acceptor", None)
-        if acceptor is not None and not await acceptor(event):
-            return
-
         session_key = build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
@@ -6223,6 +6224,25 @@ class BasePlatformAdapter(ABC):
                 session_key,
             )
             return
+
+        admission_lock = self._input_admission_locks.setdefault(session_key, asyncio.Lock())
+        async with admission_lock:
+            acceptor = getattr(self, "_input_acceptor", None)
+            if acceptor is not None and not await acceptor(event):
+                return
+            from hermes_cli.commands import is_interrupt_then_dispatch
+
+            cmd = event.get_command()
+            if cmd and is_interrupt_then_dispatch(cmd):
+                # Include idle resets: background dispatch would release the
+                # admission lock before the handler changes the route root.
+                self._discard_text_debounce(session_key)
+                try:
+                    await self._dispatch_active_session_command(event, session_key, cmd)
+                except Exception as exc:
+                    logger.error("[%s] Command '/%s' dispatch failed: %s",
+                                 self.name, cmd, exc, exc_info=True)
+                return
 
         # On-entry self-heal: if the adapter still has an _active_sessions
         # entry for this key but the owner task has already exited (done or
@@ -6245,28 +6265,9 @@ class BasePlatformAdapter(ABC):
             # session lifecycle and its cleanup races with the running task
             # (see PR #4926).
             cmd = event.get_command()
-            from hermes_cli.commands import (
-                is_interrupt_then_dispatch,
-                should_bypass_active_session,
-            )
+            from hermes_cli.commands import should_bypass_active_session
 
             if should_bypass_active_session(cmd):
-                # /stop, /new, /reset must cancel the in-flight adapter task
-                # and preserve ordering of queued follow-ups.  Route those
-                # through the dedicated handoff path that serializes
-                # cancellation + runner response + pending drain.
-                # (Registry-derived: busy_policy == "interrupt_then_dispatch".)
-                if cmd and is_interrupt_then_dispatch(cmd):
-                    self._discard_text_debounce(session_key)
-                    try:
-                        await self._dispatch_active_session_command(event, session_key, cmd)
-                    except Exception as e:
-                        logger.error(
-                            "[%s] Command '/%s' dispatch failed: %s",
-                            self.name, cmd, e, exc_info=True,
-                        )
-                    return
-
                 # Other bypass commands (/approve, /deny, /status,
                 # /background, /restart) just need direct dispatch — they
                 # don't cancel the running task.

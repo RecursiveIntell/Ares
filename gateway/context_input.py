@@ -249,6 +249,6 @@ def turn_input_api_content(bound, content):
     if type(bound) is not GatewayContextInput or type(content) is not str:
         raise ContextContinuationError("GATEWAY_INPUT_TEXT_ROUTE_REQUIRED")
     original = bound.receipt.content
-    if original in content:
+    if original == content:
         return content
     return original + "\n\n[Gateway context]\n" + content

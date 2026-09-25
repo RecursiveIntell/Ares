@@ -2263,6 +2263,10 @@ def run_conversation(
         # an assistant message makes the model echo it and self-replicate
         # (#81841). Dropping before repair lets repair_message_sequence fix
         # any user→user adjacency the filter creates.
+        _current_turn_user_msg = (
+            messages[current_turn_user_idx]
+            if 0 <= current_turn_user_idx < len(messages) else None
+        )
         messages = [
             msg for msg in messages
             if not (
@@ -2281,16 +2285,20 @@ def run_conversation(
             )
         ]
 
-        # Bind durable source before any provider materialization. Preserve a
-        # refusal until the existing request-budget error boundary below.
-        from ares_runtime.continuity.runtime import ContextDispatchError, prepare_context_dispatch
+        # Decide whether authentic occurrences must be preserved BEFORE
+        # repair. Bind durable source only after the non-user repairs below;
+        # an append-only flush cannot retract an orphan or merged assistant.
+        from ares_runtime.continuity.runtime import (
+            ContextDispatchError, context_dispatch_required, prepare_context_dispatch,
+        )
 
         _context_dispatch_error = None
         _context_dispatch_snapshot = None
         try:
-            _context_dispatch_snapshot = prepare_context_dispatch(agent, messages, conversation_history)
+            _preserve_context_users = context_dispatch_required(agent)
         except ContextDispatchError as exc:
             _context_dispatch_error = exc
+            _preserve_context_users = True
 
         # Defensive: repair malformed role-alternation before API call.
         # Catches cases where the history got wedged into a
@@ -2304,7 +2312,7 @@ def run_conversation(
         # so the turn-end flush doesn't skip the assistant/tool chain (#44837).
         from agent.agent_runtime_helpers import repair_message_sequence_with_cursor
         repaired_seq = repair_message_sequence_with_cursor(
-            agent, messages, preserve_user_messages=_context_dispatch_snapshot is not None or _context_dispatch_error is not None,
+            agent, messages, preserve_user_messages=_preserve_context_users,
         )
         if repaired_seq > 0:
             request_logger.info(
@@ -2312,6 +2320,17 @@ def run_conversation(
                 repaired_seq,
                 agent.session_id or "-",
             )
+
+        current_turn_user_idx = next(
+            (idx for idx, message in enumerate(messages) if message is _current_turn_user_msg),
+            reanchor_current_turn_user_idx(messages, user_message),
+        )
+        agent._persist_user_message_idx = current_turn_user_idx
+        if _context_dispatch_error is None:
+            try:
+                _context_dispatch_snapshot = prepare_context_dispatch(agent, messages, conversation_history)
+            except ContextDispatchError as exc:
+                _context_dispatch_error = exc
 
         api_messages = []
         for idx, msg in enumerate(messages):

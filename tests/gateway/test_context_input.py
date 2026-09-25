@@ -146,6 +146,76 @@ async def test_plugin_rewrite_is_api_context_and_hook_runs_once(ingress):
 
 
 @pytest.mark.asyncio
+async def test_plugin_substring_does_not_replace_authentic_input(ingress):
+    _, adapter, _, _ = ingress
+    incoming = event("ok")
+    with patch("hermes_cli.lifecycle.invoke_hook", return_value=[{"action": "rewrite", "text": "token"}]):
+        await adapter.handle_message(incoming)
+    binding = accepted_input(incoming)
+    assert turn_input_api_content(binding, incoming.text) == "ok\n\n[Gateway context]\ntoken"
+    assert turn_input_kwargs(binding)["persist_user_message"] == "ok"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("active", [False, True])
+@pytest.mark.parametrize("outcome", ["success", "failure", "cancel"])
+async def test_reset_handoff_precedes_followup_acceptance(ingress, active, outcome):
+    from gateway.context_input import validate_gateway_input
+
+    runner, adapter, db, started = ingress
+    command, followup = event("/reset"), event("After reset", "m2")
+    key = runner._session_key_for_source(command.source)
+    previous = runner.session_store.get_or_create_session(command.source)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def reset_handler(evt):
+        assert evt is command
+        entered.set()
+        await release.wait()
+        if outcome == "failure":
+            raise RuntimeError("reset refused")
+        runner.session_store.get_or_create_session(command.source, force_new=True)
+
+    adapter.set_message_handler(reset_handler)
+    adapter.set_busy_session_handler(None)
+    if active:
+        adapter._active_sessions[key] = asyncio.Event()
+        adapter._session_tasks[key] = asyncio.create_task(asyncio.Event().wait())
+    reset_task = asyncio.create_task(adapter.handle_message(command))
+    await asyncio.wait_for(entered.wait(), 2)
+    followup_task = asyncio.create_task(adapter.handle_message(followup))
+    try:
+        # Let the follow-up reach its first blocking await.
+        await asyncio.sleep(0)
+        assert not followup_task.done()
+        assert accepted_input(followup) is None
+        if outcome == "cancel":
+            reset_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await reset_task
+        else:
+            release.set()
+            await asyncio.wait_for(reset_task, 2)
+        await asyncio.wait_for(followup_task, 2)
+        current = runner.session_store.get_or_create_session(followup.source)
+        await validate_gateway_input(runner, followup, current)
+        binding = accepted_input(followup)
+        assert binding is not None
+        assert (binding.session_id != previous.session_id) == (outcome == "success")
+        assert db.read_pending_context_inputs(binding.session_id) == (binding.receipt,)
+        if outcome == "success" or not active:
+            assert started == [(followup, key)]
+        else:
+            assert adapter._pending_messages[key] is followup
+    finally:
+        release.set()
+        for task in [reset_task, followup_task, *adapter._session_tasks.values()]:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_hook_skip_never_enrolls_or_spawns(ingress):
     _, adapter, _, started = ingress
     incoming = event()

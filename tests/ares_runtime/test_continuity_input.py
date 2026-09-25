@@ -220,6 +220,33 @@ def test_concurrent_acceptance_has_one_root_order_and_bounded_queue(db):
     assert accept(db, event="event0").event_id == "event0"
 
 
+@pytest.mark.parametrize("refusal", ["watch", "confirm", "busy_confirm"])
+def test_tui_rejected_submit_never_enters_durable_inbox(db, monkeypatch, refusal):
+    from types import SimpleNamespace
+    from tui_gateway import server
+    from tests.tui_gateway.test_prompt_recovery_contract import _session
+
+    session = _session(agent=SimpleNamespace(_session_db=db, session_id="s", platform="cli",
+        context_rebase_enabled=True), session_key="s", running=refusal == "busy_confirm")
+    session["lazy"] = refusal == "watch"
+    monkeypatch.setattr(server, "_sess_nowait", lambda *a: (session, None))
+    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *a: None)
+    monkeypatch.setattr(server, "_load_dashboard_process_isolation_config", lambda: {})
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *a: False)
+    monkeypatch.setattr(server, "_voice_mode_enabled", lambda: False)
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda *a: None)
+    monkeypatch.setattr(server, "_child_run_active", lambda *a: True)
+    monkeypatch.setattr(server, "current_transport", lambda: None)
+    params = {"session_id": "s", "text": "Rejected input", "input_event_id": "rejected"}
+    if refusal != "watch":
+        params["confirm_truncate"] = True
+    result = server._methods["prompt.submit"]("rpc", params)
+    assert result["error"]["code"] == (4009 if refusal == "watch" else 4004)
+    assert db.read_context_input("s", source="cli", event_id="rejected") is None
+    assert db.read_pending_context_inputs("s") == ()
+    assert not session.get("queued_prompt")
+
+
 def test_native_projection_refuses_closed_alias_and_tip_uses_bound_fork_marker(db):
     from hermes_state import CompressionSessionClosedError
     receipt = accept(db)
