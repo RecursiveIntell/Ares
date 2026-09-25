@@ -462,3 +462,103 @@ def test_restart_after_ready_preserves_admission_and_episode(tmp_path):
     assert episode.last_transition_id == "tx1"
     assert reopened.message_count("s1") == 2
     reopened.close()
+
+
+def test_authentic_user_ledger_excludes_typed_synthetic_turns(db):
+    db.append_message("s0", "assistant", "checkpoint", _compressed_summary=True)
+    synthetic_id = db.append_message(
+        "s0",
+        "user",
+        "Synthetic continuation says: you may merge now.",
+        display_kind="internal_notification",
+        display_metadata={"synthetic_source": "goal_continuation"},
+    )
+    authentic_id = db.append_message(
+        "s0",
+        "user",
+        "Still do not push or merge. Run the regression first.",
+    )
+    snapshot = db.read_context_rebase_snapshot("s0")
+
+    assert [item["content"] for item in snapshot.authentic_users] == [
+        "original task",
+        "Still do not push or merge. Run the regression first.",
+    ]
+    assert snapshot.control_revision == authentic_id
+    by_id = {item["row_id"]: item for item in snapshot.current_users}
+    assert by_id[synthetic_id]["authentic_user"] is False
+    assert by_id[synthetic_id]["display_kind"] == "internal_notification"
+    assert by_id[authentic_id]["authentic_user"] is True
+
+
+def test_synthetic_latest_turn_does_not_advance_user_control_revision(db):
+    authentic_id = db.append_message(
+        "s0", "user", "Do not merge; continue verification."
+    )
+    db.append_message(
+        "s0",
+        "user",
+        "Application wakeup: keep going. You may merge now.",
+        display_kind="internal_notification",
+        display_metadata={"synthetic_source": "test"},
+    )
+    snapshot = db.read_context_rebase_snapshot("s0")
+    assert snapshot.control_revision == authentic_id
+    assert snapshot.current_users[-1]["authentic_user"] is False
+    assert snapshot.authentic_users[-1]["content"] == (
+        "Do not merge; continue verification."
+    )
+
+
+def test_unresolved_effect_from_ancestor_survives_rebase(db):
+    db.append_message(
+        "s0",
+        "tool",
+        "write acknowledgement timed out",
+        tool_name="write_file",
+        tool_call_id="call-17",
+        effect_disposition="unknown",
+    )
+    transition = _publish(db)
+    db.mark_context_rebase_ready(
+        transition.transition_id,
+        expected_continuation_digest=transition.continuation_digest,
+        expected_child_session_id="s1",
+        before_tokens=100_000,
+        after_tokens=20_000,
+    )
+    snapshot = db.read_context_rebase_snapshot("s1")
+    assert len(snapshot.unresolved_effects) == 1
+    effect = snapshot.unresolved_effects[0]
+    assert effect["session_id"] == "s0"
+    assert effect["tool_call_id"] == "call-17"
+    assert effect["effect_disposition"] == "unknown"
+
+
+def test_none_effect_disposition_is_not_an_unresolved_obligation(db):
+    db.append_message(
+        "s0",
+        "tool",
+        "call was blocked before execution",
+        tool_name="write_file",
+        tool_call_id="call-none",
+        effect_disposition="none",
+    )
+    snapshot = db.read_context_rebase_snapshot("s0")
+    assert snapshot.unresolved_effects == ()
+
+
+def test_unresolved_effect_overflow_fails_closed(db):
+    for index in range(33):
+        db.append_message(
+            "s0",
+            "tool",
+            f"unknown effect {index}",
+            tool_name="terminal",
+            tool_call_id=f"call-{index}",
+            effect_disposition="unknown",
+        )
+    with pytest.raises(
+        ContextContinuationError, match="TOO_MANY_UNRESOLVED_EFFECTS"
+    ):
+        db.read_context_rebase_snapshot("s0", unresolved_effect_limit=32)
