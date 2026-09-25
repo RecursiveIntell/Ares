@@ -4,6 +4,31 @@ The V4 packet dated 2026-09-23 remains the full acceptance contract. This is
 an implementation branch. Qualification is tied to source hashes and named
 oracles; passing unit tests does not qualify a selected provider route.
 
+## Ordinary-task custody repair
+
+`SessionDBRunCustodyV2` binds an ordinary task to a genuine, active SessionDB
+user row and canonical conversation/profile lineage. Its versioned compact
+refresh envelope is separate from V1; V1 historical-goal requirements remain
+strict. The checked claim revalidates current controls and the live root lease
+inside native write admission. The file client, active gateway RPC, turn owner
+and read-only context inspector accept the explicit V2 contract.
+
+Independent review closed cross-profile anchors, tool-child root confusion and
+invalid session transfers. A real child-process claim, confirmed process exit
+and checked takeover prove fresh generation/token fencing and exact checkpoint
+retention. Live owners, synthetic/deactivated/edited anchors, stale controls,
+mixed schemas and lost acknowledgements refuse without silent reclaim.
+
+The local gate passed 500 tests across 28 files, including the real pinned
+Governor. Independent post-audit passed 155 tests across six files.
+`task-custody-evidence.json` records exact hashes and boundaries. Automatic cold
+recovery still requires persisted file locators and controller integration;
+this explicit checked-takeover proof does not certify that remaining seam.
+
+The preceding `050ddf9` hosted qualification passed 1,630 tests in 44 files,
+with five existing skips, including all 44 execute-code tests. This closes the
+preceding local socket-environment validation gap.
+
 ## Current control and progress repair
 
 The follow-up from `9f5d4a310408f77cd41ad7d64cd7c4773a640e45` rechecks

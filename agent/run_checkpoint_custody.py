@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 import os
 import threading
 
-from hermes_state_runs import RunCustody, RunCustodyError
+from hermes_state_runs import RunCustody, RunCustodyV2, RunCustodyError
 from scripts import run_checkpoint_claim as claim_client
 from scripts.run_checkpoint_claim import ClaimOutcomeUnknown, ClaimRefusal
 
@@ -16,7 +16,7 @@ from scripts.run_checkpoint_claim import ClaimOutcomeUnknown, ClaimRefusal
 @dataclass
 class _Handle:
     holder: str = field(repr=False)
-    value: RunCustody | None = field(default=None, repr=False)
+    value: RunCustody | RunCustodyV2 | None = field(default=None, repr=False)
     status: str = "pending"
     error: str = "CLAIM_OUTCOME_UNKNOWN"
 
@@ -84,7 +84,7 @@ class TurnRunCustody:
             except BaseException:  # Cancellation can follow a committed native mutation.
                 handle.status, handle.error = "unknown", "CLAIM_OUTCOME_UNKNOWN"
                 raise ClaimOutcomeUnknown(handle.error) from None
-            if not isinstance(handle.value, RunCustody):
+            if type(handle.value) not in (RunCustody, RunCustodyV2):
                 handle.status, handle.error = "unknown", "CLAIM_HANDLE_UNKNOWN"
                 raise ClaimOutcomeUnknown(handle.error)
             handle.status = "owned"

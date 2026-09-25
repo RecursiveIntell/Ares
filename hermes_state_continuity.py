@@ -459,10 +459,12 @@ class SessionContextContinuityMixin:
         seen = {current}
         for _ in range(1000):
             row = conn.execute(
-                "SELECT parent_session_id,model_config FROM sessions WHERE id=?",
+                "SELECT parent_session_id,source,model_config FROM sessions WHERE id=?",
                 (current,),
             ).fetchone()
             if row is None or not row["parent_session_id"]:
+                break
+            if self._is_explicit_fork_child_row(dict(row)):
                 break
             parent_id = row["parent_session_id"]
             if parent_id in seen:

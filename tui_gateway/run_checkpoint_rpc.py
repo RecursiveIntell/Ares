@@ -3,7 +3,7 @@ from pathlib import Path
 
 from agent.run_checkpoint_custody import TurnRunCustody
 from hermes_state import SessionDB
-from hermes_state_runs import RunCustodyError, _digest, _integer, _run_id, _ttl
+from hermes_state_runs import RunCustodyError, RunTaskBinding, _digest, _integer, _run_id, _ttl
 from scripts.run_checkpoint_claim import ClaimOutcomeUnknown, ClaimRefusal
 
 
@@ -18,7 +18,9 @@ def handle(server, rid, params, operation):
 
     fields = {"session_id", "run_id", "expected_generation"}
     if operation == "claim":
-        fields |= {"request_path", "expected_request_digest", "origin_session_id", "historical_goal_digest", "ttl_seconds"}
+        fields |= {"request_path", "expected_request_digest", "origin_session_id", "ttl_seconds"}
+        v2 = type(params) is dict and "task_binding" in params
+        fields |= {"task_binding", "expected_control_digest"} if v2 else {"historical_goal_digest"}
     elif operation == "refresh":
         fields.add("ttl_seconds")
     elif operation != "release":
@@ -36,7 +38,11 @@ def handle(server, rid, params, operation):
                 return refuse("INVALID_PARAMS", -32602)
         if operation == "claim":
             _digest(params["expected_request_digest"])
-            _digest(params["historical_goal_digest"])
+            if v2:
+                RunTaskBinding.from_dict(params["task_binding"])
+                _digest(params["expected_control_digest"])
+            else:
+                _digest(params["historical_goal_digest"])
             path = params["request_path"]
             if type(path) is not str or not path or len(path) > 4096 or "\x00" in path or not Path(path).is_absolute():
                 return refuse("INVALID_PARAMS", -32602)

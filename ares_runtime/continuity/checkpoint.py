@@ -19,7 +19,7 @@ from typing import Mapping
 
 from ares_runtime.collaboration import canonical_json
 from hermes_state import SessionDB
-from hermes_state_runs import RunCustodyError
+from hermes_state_runs import RunCustodyError, RunCustodyV2
 from scripts.run_checkpoint_resume import (
     BoundFileReader, ResumeRefusal, strict_json, verify_checkpoint_files,
 )
@@ -139,7 +139,9 @@ def _read(db, run_id, generation, files, max_brief_bytes):
     # when inspecting a released owner. Reading is not permission to resume.
     goal_key = members.get("historical-goal-key")
     goal_raw = db.get_meta(goal_key) if goal_key else None
-    if goal_raw is None or hashlib.sha256(goal_raw.encode()).hexdigest() != owner.historical_goal_digest:
+    if type(owner) is RunCustodyV2:
+        db.validate_run_task_binding(owner)
+    elif goal_raw is None or hashlib.sha256(goal_raw.encode()).hexdigest() != owner.historical_goal_digest:
         raise CheckpointContextError("HISTORICAL_GOAL_MISMATCH")
     reader = _ObservedReader()
     source_files = verify_checkpoint_files(checkpoint, files, reader)
@@ -194,7 +196,10 @@ def _read(db, run_id, generation, files, max_brief_bytes):
         resolve_source=observations.__getitem__, max_brief_bytes=max_brief_bytes)
     if db.read_run_custody(run_id) != owner:
         raise CheckpointContextError("CHECKPOINT_CHANGED_DURING_READ")
-    if db.get_session(owner.current_session_id) != session or db.get_meta(goal_key) != goal_raw:
+    if type(owner) is RunCustodyV2:
+        db.validate_run_task_binding(owner)
+    if (db.get_session(owner.current_session_id) != session
+            or goal_key is not None and db.get_meta(goal_key) != goal_raw):
         raise CheckpointContextError("CHECKPOINT_BINDING_CHANGED_DURING_READ")
     checkpoint_digest = "sha256:" + hashlib.sha256(canonical_json(asdict(checkpoint))).hexdigest()
     return CheckpointContext(brief, run_id, generation, checkpoint_digest, owner.current_session_id, source_files)
