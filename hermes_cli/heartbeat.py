@@ -314,7 +314,25 @@ def migrate_heartbeat_to_session(
         if not parent_raw:
             return False
         state = HeartbeatState.from_json(parent_raw)
-        if state.status == "cleared" or db.get_meta(child_key) is not None:
+        child_raw = db.get_meta(child_key)
+        if child_raw is not None:
+            try:
+                existing = HeartbeatState.from_json(child_raw)
+            except Exception:
+                return False
+            same = (
+                state.prompt == existing.prompt
+                and state.interval_seconds == existing.interval_seconds
+                and state.created_at == existing.created_at
+                and state.last_fired_at == existing.last_fired_at
+                and state.fire_count == existing.fire_count
+            )
+            return bool(
+                state.status == "cleared"
+                and existing.status != "cleared"
+                and same
+            )
+        if state.status == "cleared":
             return False
         child = HeartbeatState.from_json(parent_raw)
         archived = HeartbeatState.from_json(parent_raw)
