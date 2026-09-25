@@ -68,6 +68,25 @@ describe('live session activation in-flight state', () => {
     expect(getTurnState().streaming).toBe('partial answer')
   })
 
+  it('displays an unknown-outcome warning for an advisory marker, without streaming a reply', () => {
+    const inflight = {
+      assistant: '',
+      error: 'Possible interrupted turn; outcome unknown. Check effects before retrying.',
+      error_surface: { code: 'interrupted_turn_unknown', retryable: false },
+      status: 'error',
+      streaming: false,
+      user: 'inspect before retrying'
+    }
+
+    expect(liveSessionInflightMessages(inflight)).toEqual([
+      { role: 'user', text: 'inspect before retrying' },
+      { role: 'system', text: 'Possible interrupted turn; outcome unknown. Check effects before retrying.' }
+    ])
+    hydrateLiveSessionInflight(inflight)
+    expect(turnController.bufRef).toBe('')
+    expect(getTurnState().streaming).toBe('')
+  })
+
   it('ignores empty in-flight payloads', () => {
     expect(liveSessionInflightMessages({ assistant: '', streaming: false, user: '   ' })).toEqual([])
 

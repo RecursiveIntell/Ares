@@ -58,7 +58,24 @@ export const writeActiveSessionFile = (sessionId: null | string, file = process.
 export const liveSessionInflightMessages = (inflight?: null | SessionInflightTurn): Msg[] => {
   const user = String(inflight?.user ?? '').trim()
 
-  return user ? [{ role: 'user', text: user }] : []
+  if (!user) {
+    return []
+  }
+
+  const messages: Msg[] = [{ role: 'user', text: user }]
+
+  // This is a display-only hint from an unauthenticated sidecar, not a
+  // recovered assistant message or permission to retry the prior effect.
+  if (inflight?.status === 'error' &&
+      inflight.error_surface?.code === 'interrupted_turn_unknown' &&
+      inflight.error_surface.retryable === false) {
+    messages.push({
+      role: 'system',
+      text: 'Possible interrupted turn; outcome unknown. Check effects before retrying.'
+    })
+  }
+
+  return messages
 }
 
 export const hydrateLiveSessionInflight = (inflight?: null | SessionInflightTurn) => {
