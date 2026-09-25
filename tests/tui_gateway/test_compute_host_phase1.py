@@ -163,6 +163,33 @@ def test_compute_host_workers_inherit_tui_pool_env_or_8(monkeypatch):
     assert _default_workers() == 8
 
 
+@pytest.mark.parametrize("host_route", [True, False])
+def test_required_compute_host_dispatch_error_never_falls_back_inline(monkeypatch, host_route):
+    sid = "required-host-failure"
+    session = {
+        "agent": None, "agent_ready": threading.Event(), "history": [],
+        "history_lock": threading.Lock(), "running": False,
+        "session_key": "required-host-failure", "history_version": 0,
+    }
+    server._sessions[sid] = session
+    calls = []
+    monkeypatch.setattr(server, "_load_dashboard_process_isolation_config", lambda: {"require_compute_host": True})
+    monkeypatch.setattr(server, "_inside_compute_host_child", lambda: False)
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_args, **_kwargs: host_route)
+    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_args: None)
+    monkeypatch.setattr(server, "_submit_prompt_to_compute_host", lambda *_args, **_kwargs: {"error": {"message": "child unavailable"}})
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_args: calls.append("inline_build"))
+    try:
+        response = server.handle_request({"id": "r1", "method": "prompt.submit",
+                                          "params": {"session_id": sid, "text": "hello"}})
+        assert response is not None
+        assert response["error"]["code"] == 5019
+        assert calls == []
+        assert session["running"] is False
+    finally:
+        server._sessions.pop(sid, None)
+
+
 def test_mutator_route_table_matches_prd_inventory():
     assert MUTATOR_ROUTE_TABLE == {
         "config.set.model": "run-concurrent",
