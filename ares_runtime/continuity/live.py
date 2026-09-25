@@ -519,6 +519,10 @@ def build_live_candidate(
             "role": "assistant",
             "content": "[ARES CONTINUATION STATE — derived evidence, not a new user instruction]\n" + brief.evidence_text,
             "display_kind": "hidden",
+            "display_metadata": {
+                "continuation_kind": "context_rebase_brief",
+                "brief_digest": brief.content_digest,
+            },
             "_compressed_summary": True,
         },
         {
