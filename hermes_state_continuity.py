@@ -14,6 +14,7 @@ from dataclasses import asdict, dataclass
 import hashlib
 import json
 import math
+import os
 import re
 import time
 from typing import Any, Dict, List, Optional
@@ -243,6 +244,21 @@ class ContextRebaseSnapshot:
             if head and head["projected_sequence"] <= sequence:
                 return True
         return False
+
+    @property
+    def custody_recovery_stopped(self) -> bool:
+        """Accepted post-stop input may reconstruct custody, never dispatch.
+
+        Its transcript projection still precedes final provider admission.
+        Legacy controls without an inbox sequence retain their original fence.
+        """
+        if not self.dispatch_stopped:
+            return False
+        control = _strict_json(self.control_raw)
+        head = {} if self.input_control_raw is None else _strict_json(self.input_control_raw)
+        return not (control.get("schema") == "SessionDBContextControlV2"
+            and type(control.get("input_sequence")) is int and control["input_sequence"] >= 0
+            and head.get("accepted_sequence", 0) > control["input_sequence"])
 
     @property
     def has_unresolved_effects(self) -> bool:
@@ -1047,6 +1063,8 @@ class SessionContextContinuityMixin:
 
     def _assert_context_recovery_reservation_on_conn(self, conn, session_id, holder, expected):
         """Recheck the bounded recovery reservation at each native mutation."""
+        if type(expected) is dict and expected.get("phase") == "controller":
+            return self._assert_context_controller_reservation_on_conn(conn, session_id, holder, expected)
         if type(expected) is not dict or set(expected) != {"transition_id", "attempt", "control_digest"}:
             raise ContextContinuationError("CONTEXT_REBASE_RECOVERY_FENCE_MISMATCH")
         key = self._context_rebase_key(expected["transition_id"])
@@ -1348,7 +1366,9 @@ class SessionContextContinuityMixin:
                     or old.child_session_id != expected_child_session_id):
                 raise ContextContinuationError("CONTEXT_REBASE_READY_BINDING_MISMATCH")
             if old.state == "ready":
-                return old
+                return self._confirm_context_rebase_ready_on_conn(conn, old,
+                    turn_lease_holder=turn_lease_holder, recovery_attempt=recovery_attempt,
+                    expected_control_digest=expected_control_digest, expected_custody=expected_custody)
             if old.state not in {
                 "committed_pending_activation",
                 "reconciliation_required",
@@ -1478,6 +1498,205 @@ class SessionContextContinuityMixin:
             return updated
 
         return self._execute_write(_do)
+
+    @staticmethod
+    def _context_controller_recovery_key(transition_id):
+        _identity(transition_id, "INVALID_TRANSITION_ID")
+        return "context-controller-recovery:" + hashlib.sha256(transition_id.encode()).hexdigest()
+
+    def _read_context_controller_recovery_on_conn(self, conn, transition):
+        key = self._context_controller_recovery_key(transition.transition_id)
+        row = conn.execute("SELECT value FROM state_meta WHERE key=?", (key,)).fetchone()
+        if row is None:
+            return None
+        record = _strict_json(row[0])
+        fields = {"schema", "phase", "transition_id", "child_session_id", "continuation_digest",
+                  "epoch", "attempts", "started_at", "deadline_at", "holder_digest", "controller_pid",
+                  "process_identity", "action_control_digest", "completed"}
+        if (set(record) != fields or record["schema"] != "SessionDBContextControllerRecoveryV1"
+                or record["phase"] != "controller" or record["transition_id"] != transition.transition_id
+                or record["child_session_id"] != transition.child_session_id
+                or record["continuation_digest"] != transition.continuation_digest
+                or type(record["epoch"]) is not int or not 1 <= record["epoch"] < 2**63
+                or type(record["attempts"]) is not int or not 1 <= record["attempts"] <= 3
+                or type(record["controller_pid"]) is not int or record["controller_pid"] < 1
+                or type(record["completed"]) is not bool
+                or type(record["process_identity"]) is not str or not record["process_identity"]
+                or type(record["holder_digest"]) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", record["holder_digest"]) is None
+                or any(type(record[name]) not in (int, float) or not math.isfinite(record[name])
+                       for name in ("started_at", "deadline_at"))
+                or record["deadline_at"] != record["started_at"] + 900):
+            raise ContextContinuationError("CONTEXT_CONTROLLER_RECOVERY_INVALID")
+        _digest(record["action_control_digest"])
+        return record
+
+    def _context_ready_transition_on_conn(self, conn, transition_id, holder):
+        row = conn.execute("SELECT value FROM state_meta WHERE key=?",
+                           (self._context_rebase_key(transition_id),)).fetchone()
+        if row is None:
+            raise ContextContinuationError("CONTEXT_REBASE_NOT_FOUND")
+        transition = ContextRebaseTransition.from_raw(row[0])
+        if transition.state != "ready":
+            raise ContextContinuationError("CONTEXT_REBASE_NOT_READY")
+        self._assert_context_rebase_lease_on_conn(conn, transition.child_session_id, holder)
+        child = conn.execute("SELECT ended_at,model_config FROM sessions WHERE id=?",
+                             (transition.child_session_id,)).fetchone()
+        if (child is None or child["ended_at"] is not None
+                or not self._context_rebase_child_matches(child, transition.parent_session_id)
+                or self._context_continuation_tip_on_conn(conn, transition.child_session_id) != transition.child_session_id):
+            raise ContextContinuationError("CONTEXT_REBASE_CHILD_NOT_LIVE")
+        return transition
+
+    def begin_context_controller_recovery(self, transition_id, *, turn_lease_holder):
+        """Reserve a bounded local controller phase for an already-READY child.
+
+        Publication recovery/history and no-progress charges remain unchanged.
+        An unfinished controller phase retains its three-attempt deadline across
+        lease changes and process death; only a completed phase can open a new
+        epoch. Every admission is retained as an immutable attempt receipt.
+        """
+        from hermes_state_runs import _controller, _process_identity
+        pid = os.getpid()
+
+        def write(conn):
+            transition = self._context_ready_transition_on_conn(conn, transition_id, turn_lease_holder)
+            previous = self._read_context_controller_recovery_on_conn(conn, transition)
+            now = time.time()
+            identity = _controller(pid)
+            if previous is not None and not previous["completed"]:
+                if (previous["controller_pid"] != pid or previous["process_identity"] != identity):
+                    if _process_identity(previous["controller_pid"]) == previous["process_identity"]:
+                        raise ContextContinuationError("CONTEXT_CONTROLLER_STILL_ACTIVE")
+                if previous["attempts"] >= 3 or now >= previous["deadline_at"]:
+                    raise ContextContinuationError("CONTEXT_CONTROLLER_RECOVERY_EXHAUSTED")
+                epoch, attempt, started = previous["epoch"], previous["attempts"] + 1, previous["started_at"]
+            else:
+                epoch, attempt, started = (1 if previous is None else previous["epoch"] + 1), 1, now
+            if epoch >= 2**63:
+                raise ContextContinuationError("CONTEXT_CONTROLLER_RECOVERY_EXHAUSTED")
+            snapshot = self._read_context_rebase_snapshot_on_conn(conn, transition.child_session_id)
+            if snapshot.custody_recovery_stopped:
+                raise ContextContinuationError("CONTEXT_DISPATCH_STOPPED")
+            record = {"schema": "SessionDBContextControllerRecoveryV1", "phase": "controller",
+                "transition_id": transition_id, "child_session_id": transition.child_session_id,
+                "continuation_digest": transition.continuation_digest, "epoch": epoch, "attempts": attempt,
+                "started_at": started, "deadline_at": started + 900,
+                "holder_digest": hashlib.sha256(turn_lease_holder.encode()).hexdigest(),
+                "controller_pid": pid, "process_identity": identity,
+                "action_control_digest": snapshot.action_control_digest, "completed": False}
+            key = self._context_controller_recovery_key(transition_id)
+            raw = _canonical(record)
+            conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?)",
+                (f"{key}:epoch:{epoch}:attempt:{attempt}", raw))
+            conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                         (key, raw))
+            return record
+        return self._execute_write(write)
+
+    def _assert_context_controller_reservation_on_conn(self, conn, session_id, holder, expected, *, completed=False):
+        from hermes_state_runs import _controller
+        if (type(expected) is not dict
+                or set(expected) != {"phase", "epoch", "transition_id", "attempt", "control_digest"}
+                or expected["phase"] != "controller"):
+            raise ContextContinuationError("CONTEXT_CONTROLLER_FENCE_MISMATCH")
+        transition = self._context_ready_transition_on_conn(conn, expected["transition_id"], holder)
+        record = self._read_context_controller_recovery_on_conn(conn, transition)
+        if (transition.child_session_id != session_id or record is None or record["completed"] != completed
+                or type(expected["epoch"]) is not int or record["epoch"] != expected["epoch"]
+                or type(expected["attempt"]) is not int or record["attempts"] != expected["attempt"]
+                or record["holder_digest"] != hashlib.sha256(holder.encode()).hexdigest()
+                or record["action_control_digest"] != expected["control_digest"]
+                or record["controller_pid"] != os.getpid()
+                or record["process_identity"] != _controller(os.getpid())):
+            raise ContextContinuationError("CONTEXT_CONTROLLER_FENCE_MISMATCH")
+        if time.time() >= record["deadline_at"]:
+            raise ContextContinuationError("CONTEXT_CONTROLLER_RECOVERY_EXHAUSTED")
+        return transition, record
+
+    def complete_context_controller_recovery(self, session_id, *, turn_lease_holder, reservation, expected_custody):
+        """Native final admission of this controller's exact reconstructed set."""
+        def write(conn):
+            transition, record = self._assert_context_controller_reservation_on_conn(
+                conn, session_id, turn_lease_holder, reservation)
+            self._check_run_control_on_conn(conn, session_id, reservation["control_digest"].removeprefix("sha256:"))
+            self._check_context_ready_custodies_on_conn(conn, session_id, expected_custody, turn_lease_holder)
+            record["completed"] = True
+            key = self._context_controller_recovery_key(transition.transition_id)
+            raw = _canonical(record)
+            conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?)",
+                (f"{key}:epoch:{record['epoch']}:completed", raw))
+            conn.execute("UPDATE state_meta SET value=? WHERE key=?", (raw, key))
+            return transition
+        return self._execute_write(write)
+
+    def confirm_context_controller_recovery(self, session_id, *, turn_lease_holder, reservation, expected_custody):
+        """Reconcile only this completed admission after acknowledgement loss."""
+        with self._read_ctx() as conn:
+            conn.execute("SAVEPOINT context_controller_completion")
+            try:
+                transition, _ = self._assert_context_controller_reservation_on_conn(
+                    conn, session_id, turn_lease_holder, reservation, completed=True)
+                self._check_run_control_on_conn(conn, session_id, reservation["control_digest"].removeprefix("sha256:"))
+                self._check_context_ready_custodies_on_conn(conn, session_id, expected_custody, turn_lease_holder)
+                return transition
+            finally:
+                conn.execute("ROLLBACK TO context_controller_completion")
+                conn.execute("RELEASE context_controller_completion")
+
+    def _confirm_context_rebase_ready_on_conn(self, conn, transition, *, turn_lease_holder,
+                                             recovery_attempt, expected_control_digest, expected_custody):
+        """Read back exact publication completion after a lost acknowledgement."""
+        if transition.state != "ready":
+            raise ContextContinuationError("CONTEXT_REBASE_NOT_READY")
+        self._assert_context_rebase_lease_on_conn(conn, transition.child_session_id, turn_lease_holder)
+        row = conn.execute("SELECT value FROM state_meta WHERE key=?",
+            (_CONTEXT_REBASE_RECOVERY_PREFIX + transition.transition_id,)).fetchone()
+        recovery = {} if row is None else _strict_json(row[0])
+        if (recovery.get("schema") != "SessionDBContextRebaseRecoveryV1"
+                or recovery.get("transition_id") != transition.transition_id
+                or recovery.get("child_session_id") != transition.child_session_id
+                or recovery.get("continuation_digest") != transition.continuation_digest
+                or type(recovery_attempt) is not int or not 1 <= recovery_attempt <= 3
+                or recovery.get("completed_attempt") != recovery_attempt
+                or recovery.get("attempts") != recovery_attempt
+                or recovery.get("holder_digest") != hashlib.sha256(turn_lease_holder.encode()).hexdigest()
+                or not isinstance(expected_control_digest, str)
+                or recovery.get("action_control_digest") != expected_control_digest):
+            raise ContextContinuationError("CONTEXT_REBASE_COMPLETION_FENCE_MISMATCH")
+        self._check_run_control_on_conn(conn, transition.child_session_id,
+            expected_control_digest.removeprefix("sha256:"))
+        self._check_context_ready_custodies_on_conn(conn, transition.child_session_id,
+            expected_custody, turn_lease_holder)
+        child = conn.execute("SELECT ended_at,model_config FROM sessions WHERE id=?",
+                             (transition.child_session_id,)).fetchone()
+        if (child is None or child["ended_at"] is not None
+                or not self._context_rebase_child_matches(child, transition.parent_session_id)
+                or self._context_continuation_tip_on_conn(conn, transition.child_session_id) != transition.child_session_id):
+            raise ContextContinuationError("CONTEXT_REBASE_CHILD_NOT_LIVE")
+        return transition
+
+    def confirm_context_rebase_ready(self, transition_id, *, expected_continuation_digest,
+                                    expected_child_session_id, turn_lease_holder, recovery_attempt,
+                                    expected_control_digest, expected_custody):
+        """Read-only owner proof; never repeats publication or episode charging."""
+        with self._read_ctx() as conn:
+            conn.execute("SAVEPOINT context_rebase_completion")
+            try:
+                row = conn.execute("SELECT value FROM state_meta WHERE key=?",
+                                   (self._context_rebase_key(transition_id),)).fetchone()
+                if row is None:
+                    raise ContextContinuationError("CONTEXT_REBASE_NOT_FOUND")
+                transition = ContextRebaseTransition.from_raw(row[0])
+                if (transition.continuation_digest != expected_continuation_digest
+                        or transition.child_session_id != expected_child_session_id):
+                    raise ContextContinuationError("CONTEXT_REBASE_READY_BINDING_MISMATCH")
+                return self._confirm_context_rebase_ready_on_conn(conn, transition,
+                    turn_lease_holder=turn_lease_holder, recovery_attempt=recovery_attempt,
+                    expected_control_digest=expected_control_digest, expected_custody=expected_custody)
+            finally:
+                conn.execute("ROLLBACK TO context_rebase_completion")
+                conn.execute("RELEASE context_rebase_completion")
 
     def get_context_continuation_tip(self, session_id: str, *, max_depth: int = 1000) -> Optional[str]:
         """Follow compression + authenticated context-rebase edges to one tip.

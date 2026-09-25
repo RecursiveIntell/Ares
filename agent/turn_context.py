@@ -503,7 +503,7 @@ def build_turn_context(
     )
     if callable(_ready_check) and getattr(agent, "session_id", None):
         _transition = _continuity_db.context_rebase_transition_for_session(agent.session_id)
-        if _transition is not None and _transition.state != "ready":
+        if _transition is not None:
             from ares_runtime.continuity.runtime import (
                 AutomaticRebaseError, reconcile_context_rebase,
             )

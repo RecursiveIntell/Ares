@@ -458,6 +458,14 @@ def _carry_session_scoped_state(
         raise AutomaticRebaseError("TITLE_RECONCILIATION_FAILED") from None
 
 
+def _custody_recovery_reservation(reservation):
+    result = {"transition_id": reservation["transition_id"], "attempt": reservation["attempts"],
+              "control_digest": reservation["action_control_digest"]}
+    if reservation.get("phase") == "controller":
+        result.update(phase="controller", epoch=reservation["epoch"])
+    return result
+
+
 def _transfer_run_custody(agent: Any, old_session_id: str, new_session_id: str, *, reservation: dict) -> tuple:
     custody = getattr(agent, "_run_checkpoint_custody", None)
     if custody is None:
@@ -468,10 +476,7 @@ def _transfer_run_custody(agent: Any, old_session_id: str, new_session_id: str, 
     holder = getattr(agent, "_active_session_turn_lease_holder", None)
     try:
         return custody.reconcile_context_rebase(
-            holder, new_session_id, recovery_reservation={
-                "transition_id": reservation["transition_id"], "attempt": reservation["attempts"],
-                "control_digest": reservation["action_control_digest"],
-            },
+            holder, new_session_id, recovery_reservation=_custody_recovery_reservation(reservation),
         )
     except Exception:
         raise AutomaticRebaseError("RUN_CUSTODY_RECONCILIATION_FAILED") from None
@@ -863,12 +868,13 @@ def reconcile_context_rebase(
             return AutomaticRebaseResult(AutomaticRebaseStatus.SKIPPED, "NO_PENDING_CONTEXT_REBASE", session_id)
         transition_id = transition.transition_id
         parent_session_id, child_session_id = transition.parent_session_id, transition.child_session_id
-        if transition.state == "ready":
-            return AutomaticRebaseResult(AutomaticRebaseStatus.SKIPPED, "CONTEXT_REBASE_ALREADY_READY", child_session_id)
-        reservation = db.begin_context_rebase_recovery(transition_id, turn_lease_holder=holder)
+        controller_recovery = transition.state == "ready"
+        begin = db.begin_context_controller_recovery if controller_recovery else db.begin_context_rebase_recovery
+        reservation = begin(transition_id, turn_lease_holder=holder)
         # Old publications may not have local owner transfers. Their absent
         # recovery intent is rejected above rather than silently upgraded.
-        _carry_session_scoped_state(db, parent_session_id, child_session_id)
+        if not controller_recovery:
+            _carry_session_scoped_state(db, parent_session_id, child_session_id)
         reconciled_custody = _transfer_run_custody(
             agent, parent_session_id, child_session_id,
             reservation=reservation,
@@ -879,21 +885,25 @@ def reconcile_context_rebase(
         new_system_prompt = child.get("system_prompt")
         if not isinstance(new_system_prompt, str):
             raise AutomaticRebaseError("CONTEXT_REBASE_SYSTEM_PROMPT_MISSING")
-        _rebind_context_engine(agent, db, parent_session_id, child_session_id)
+        _rebind_context_engine(agent, db, session_id if controller_recovery else parent_session_id, child_session_id)
         durable_messages = db.get_messages_as_conversation(
             child_session_id, repair_alternation=False,
             include_row_ids=True, include_summary_markers=True,
         )
-        if not durable_messages or durable_messages[-1].get("role") != "user":
+        if not durable_messages or not controller_recovery and durable_messages[-1].get("role") != "user":
             raise AutomaticRebaseError("SUCCESSOR_DURABLE_USER_ANCHOR_MISSING")
-        db.mark_context_rebase_ready(
-            transition_id, expected_continuation_digest=transition.continuation_digest,
-            expected_child_session_id=child_session_id,
-            before_tokens=before_tokens, after_tokens=after_tokens,
-            turn_lease_holder=holder, recovery_attempt=reservation["attempts"],
-            expected_control_digest=reservation["action_control_digest"],
-            expected_custody=reconciled_custody,
-        )
+        completion = dict(expected_continuation_digest=transition.continuation_digest,
+            expected_child_session_id=child_session_id, turn_lease_holder=holder,
+            recovery_attempt=reservation["attempts"],
+            expected_control_digest=reservation["action_control_digest"], expected_custody=reconciled_custody)
+        if not controller_recovery:
+            try:
+                db.mark_context_rebase_ready(transition_id, before_tokens=before_tokens,
+                    after_tokens=after_tokens, **completion)
+            except Exception:
+                # Native completion may have committed before its acknowledgement
+                # was lost. Only exact owner readback can admit local adoption.
+                db.confirm_context_rebase_ready(transition_id, **completion)
         agent.session_id = child_session_id
         agent._session_db_created = True
         agent._cached_system_prompt = new_system_prompt
@@ -901,6 +911,16 @@ def reconcile_context_rebase(
         agent._last_flushed_db_idx = 0
         agent._flushed_db_message_session_id = child_session_id
         _publish_runtime_session_context(agent, child_session_id)
+        if controller_recovery:
+            completion = dict(turn_lease_holder=holder,
+                reservation=_custody_recovery_reservation(reservation), expected_custody=reconciled_custody)
+            try:
+                db.complete_context_controller_recovery(child_session_id, **completion)
+            except Exception:
+                db.confirm_context_controller_recovery(child_session_id, **completion)
+        custody = getattr(agent, "_run_checkpoint_custody", None)
+        if custody is not None:
+            custody.complete_context_rebase_adoption(holder, child_session_id, reconciled_custody)
     except Exception as exc:
         if db is not None and transition_id is not None:
             _mark_reconciliation_required(db, transition_id)

@@ -22,6 +22,8 @@ on:
       - 'tests/test_run_checkpoint*.py'
       - 'tests/test_run_task_custody.py'
       - 'tests/test_run_custody_cold_recovery.py'
+      - 'tests/test_run_custody_ready_recovery.py'
+      - 'tests/hermes_state/test_append_messages_batch.py'
       - 'tests/tui_gateway/test_run_checkpoint_claim_rpc.py'
       - 'tests/tui_gateway/test_goal_command.py'
       - 'tests/test_turn_run_custody.py'
@@ -133,6 +135,8 @@ jobs:
             tests/test_run_checkpoint_resume.py \
             tests/test_run_task_custody.py \
             tests/test_run_custody_cold_recovery.py \
+            tests/test_run_custody_ready_recovery.py \
+            tests/hermes_state/test_append_messages_batch.py \
             tests/tui_gateway/test_run_checkpoint_claim_rpc.py \
             tests/tui_gateway/test_goal_command.py \
             tests/tui_gateway/test_protocol.py \
@@ -166,4 +170,4 @@ jobs:
             hermes_state_inbox.py agent/context_input.py \
             scripts/run_checkpoint_claim.py scripts/run_checkpoint_resume.py \
             tui_gateway/run_checkpoint_rpc.py tests/test_run_task_custody.py \
-            tests/test_run_custody_cold_recovery.py
+            tests/test_run_custody_cold_recovery.py tests/test_run_custody_ready_recovery.py

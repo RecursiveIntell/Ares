@@ -651,7 +651,7 @@ class SessionRunCustodyMixin:
             snapshot = self._read_context_rebase_snapshot_on_conn(conn, session_id)
             if snapshot.action_control_digest != "sha256:" + expected_control_digest:
                 raise RunCustodyError("TASK_CONTROL_CHANGED")
-            if snapshot.dispatch_stopped:
+            if snapshot.custody_recovery_stopped:
                 raise RunCustodyError("TASK_STOPPED")
         except ContextContinuationError as exc:
             raise RunCustodyError("TASK_CONTROL_UNAVAILABLE") from exc

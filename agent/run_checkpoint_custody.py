@@ -290,16 +290,9 @@ class TurnRunCustody:
                     del self._handles[run_id]
                     continue
                 if handle.status == "owned" and handle.recovery_pending:
-                    try:
-                        transition = self.db.context_rebase_transition_for_session(handle.value.current_session_id)
-                        completed = transition is not None and transition.state == "ready"
-                    except Exception:
-                        completed = False
-                    if not completed:
-                        errors.append({"run_id": run_id, "status": "recovery_pending",
-                                       "code": "RUN_CUSTODY_RECOVERY_PENDING"})
-                        continue
-                    handle.recovery_pending = False
+                    errors.append({"run_id": run_id, "status": "recovery_pending",
+                                   "code": "RUN_CUSTODY_RECOVERY_PENDING"})
+                    continue
                 if handle.status == "owned":
                     try:
                         self.release(holder, run_id=run_id, expected_generation=handle.value.generation)
@@ -308,3 +301,19 @@ class TurnRunCustody:
                 if handle.status != "owned" and run_id in self._handles:
                     errors.append({"run_id": run_id, "status": "unknown", "code": handle.error})
             return errors
+
+    def complete_context_rebase_adoption(self, holder, child_session_id, expected):
+        """Clear retention only after this controller has adopted runtime state.
+
+        Durable READY alone proves neither engine binding nor local adoption.
+        The runtime calls this after native final confirmation and all local
+        session/history assignments have succeeded.
+        """
+        with self._lock:
+            self._active(holder)
+            values = tuple(self._handles[key].value for key in sorted(self._handles))
+            if values != expected or any(handle.status != "owned" or handle.holder != holder
+                    or handle.value.current_session_id != child_session_id for handle in self._handles.values()):
+                raise ClaimOutcomeUnknown("CONTEXT_REBASE_ADOPTION_MISMATCH")
+            for handle in self._handles.values():
+                handle.recovery_pending = False

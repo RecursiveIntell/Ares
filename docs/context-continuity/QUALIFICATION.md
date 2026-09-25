@@ -4,6 +4,32 @@ The V4 packet dated 2026-09-23 remains the full acceptance contract. This is
 an implementation branch. Qualification is tied to source hashes and named
 oracles; passing unit tests does not qualify a selected provider route.
 
+## Already-READY controller recovery
+
+An already-READY successor now reconstructs process-owned custody and adopts its
+canonical history before an ordinary turn. Its bounded controller phase is
+separate from completed publication recovery; unfinished attempts retain the
+same deadline across lease changes. Final native admission binds the current
+phase, process, lease, controls and complete custody inventory. Lost completion
+acknowledgments use exact readback. Cleanup retains custody until local adoption
+has succeeded, including failed adoption after durable READY.
+
+One authentic input accepted after a stop may reconstruct custody before its
+transcript projection; provider admission still requires projection and the
+ordinary stop fence. Pre-stop queued input cannot resume execution. Real turn
+and separate-process regressions cover both paths and assistant-tail history.
+
+The pinned local gate passed 2,002 tests across 60 files with four existing skips;
+independent review passed 74 and closed AUD-RC1. See
+`ready-controller-evidence.json`. The hosted workflow retains the Unix-socket
+suite excluded locally. It also covers repairs to two failures discovered on
+`f8a87ad`: fault-injector keyword forwarding and disabled-continuity TUI scope.
+Nix and Docker passed on that published base.
+
+This closes local READY reconstruction, not autonomous wake scheduling or task
+completion. Released obligations and compacted task anchors remain required
+repairs, alongside the remaining full V4 qualification below.
+
 ## Durable input and selected TUI ingress
 
 The existing SessionDB owner now accepts immutable, root-sequenced authentic

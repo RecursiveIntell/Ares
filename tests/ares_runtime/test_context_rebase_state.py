@@ -64,9 +64,11 @@ def _ready(db, transition_id, **kwargs):
     transition = db.read_context_rebase_transition(transition_id)
     if transition.state != "ready":
         recovery = db.begin_context_rebase_recovery(transition_id, turn_lease_holder="holder")
-        kwargs.update(turn_lease_holder="holder", recovery_attempt=recovery["attempts"],
-                      expected_control_digest=recovery["action_control_digest"],
-                      expected_custody=tuple(db.list_run_custody_for_session(transition.child_session_id)))
+    else:
+        recovery = json.loads(db.get_meta("context-rebase-recovery:" + transition_id))
+    kwargs.update(turn_lease_holder="holder", recovery_attempt=recovery["attempts"],
+                  expected_control_digest=recovery["action_control_digest"],
+                  expected_custody=tuple(db.list_run_custody_for_session(transition.child_session_id)))
     return db.mark_context_rebase_ready(transition_id, **kwargs)
 
 

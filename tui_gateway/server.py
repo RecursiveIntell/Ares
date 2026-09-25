@@ -9388,6 +9388,13 @@ def _accept_tui_context_input(session, text, *, event_id=None, display_kind=None
     if display_kind:
         return None
     agent = session.get("agent")
+    if agent is not None:
+        owner = getattr(agent, "_session_db", None)
+        selected = getattr(agent, "context_rebase_enabled", False) is True
+        if not selected:
+            check = getattr(type(owner), "context_dispatch_required_for_session", None)
+            if not callable(check) or not check(owner, getattr(agent, "session_id", None) or session.get("session_key")):
+                return None
     profile_home = session.get("profile_home")
     home_token = set_hermes_home_override(str(profile_home or _hermes_home))
     db = None
