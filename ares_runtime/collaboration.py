@@ -1525,7 +1525,14 @@ class ConsumedPermitSettlement:
     _adapter: PermitOutcomeRecorder
 
     def record_receipt(self, receipt: Mapping[str, Any]) -> None:
-        self._adapter.record_receipt(dict(receipt))
+        bound = dict(receipt)
+        binding = self.facts.get("issued_binding")
+        if isinstance(binding, Mapping):
+            if (bound.get("permit_ref") != self.facts.get("canonical_permit_ref")
+                    or bound.get("preflight_receipt") != self.facts.get("receipt_artifact")):
+                raise ContractError("PERMIT_SETTLEMENT_IDENTITY_MISMATCH")
+            bound["permit_binding"] = dict(binding)
+        self._adapter.record_receipt(bound)
 
 
 class OperatorApprovalWitnessProvider(Protocol):
@@ -2182,6 +2189,7 @@ class DaemonPermitReceiptAdapter:
             )
         facts = dict(response)
         facts["canonical_permit_ref"] = permit_id
+        facts["issued_binding"] = dict(binding)
         return PermitBridgeOutcome(PermitBridgeState.CONSUMED, "PERMIT_CONSUMED", facts)
 
     def validate_and_consume_call(
@@ -2202,6 +2210,54 @@ class DaemonPermitReceiptAdapter:
             raise ContractError(outcome.code)
         return outcome.facts
 
+    def readback(
+        self, *, permit_id: str, binding: Mapping[str, Any],
+        preflight_receipt_digest: str,
+    ) -> Mapping[str, Any]:
+        """Read exact native history. This never returns an execution grant."""
+        if (not isinstance(permit_id, str) or not permit_id
+                or not isinstance(binding, Mapping) or not binding
+                or not isinstance(preflight_receipt_digest, str)
+                or len(preflight_receipt_digest) != 64):
+            raise ContractError("PERMIT_BRIDGE_MALFORMED")
+        request_id = "ares:" + secrets.token_hex(16)
+        request = {
+            "schema": self.REQUEST_SCHEMA, "protocol_version": self.PROTOCOL_VERSION,
+            "request_id": request_id,
+            "request": {"kind": "permit_readback", "permit_id": permit_id,
+                        "binding": dict(binding),
+                        "preflight_receipt_digest": preflight_receipt_digest},
+        }
+        try:
+            with self._connect() as stream:
+                self._send_frame(stream, request)
+                length = struct.unpack(">I", self._recv_exact(stream, 4))[0]
+                if length > self.MAX_FRAME_BYTES:
+                    raise ContractError("PERMIT_BRIDGE_MALFORMED")
+                response = json.loads(self._recv_exact(stream, length).decode("utf-8"))
+        except ContractError:
+            raise
+        except (OSError, UnicodeDecodeError, ValueError):
+            raise ContractError("PERMIT_BRIDGE_UNAVAILABLE") from None
+        if (not isinstance(response, Mapping) or response.get("request_id") != request_id
+                or response.get("permit_id") != permit_id):
+            raise ContractError("PERMIT_BRIDGE_MALFORMED")
+        if response.get("error") is not None:
+            raise ContractError("PERMIT_READBACK_DENIED")
+        result = response.get("readback")
+        if (not isinstance(result, Mapping)
+                or set(result) != {"schema", "permit_id", "binding", "state", "preflight", "outcome"}
+                or result.get("schema") != "recursive-agent.external-permit-readback/v1"
+                or result.get("permit_id") != permit_id or result.get("binding") != binding
+                or not isinstance(result.get("state"), Mapping)
+                or result["state"].get("state") != "consumed"):
+            raise ContractError("PERMIT_BRIDGE_MALFORMED")
+        preflight = result.get("preflight")
+        if (not isinstance(preflight, Mapping) or preflight.get("permit_id") != permit_id
+                or preflight.get("receipt_digest") != preflight_receipt_digest):
+            raise ContractError("PERMIT_BRIDGE_MALFORMED")
+        return dict(result)
+
     def record_receipt(self, receipt: Mapping[str, Any]) -> None:
         if not self._test_only_enabled() and not self._production_enabled():
             raise ContractError("TEST_ONLY_ECHO_DISABLED")
@@ -2215,7 +2271,7 @@ class DaemonPermitReceiptAdapter:
             or not isinstance(preflight, Mapping)
             or not isinstance(preflight.get("receipt_digest"), str)
             or state not in {"ok", "error", "ambiguous"}
-            or not isinstance(duration_ms, int)
+            or type(duration_ms) is not int
             or duration_ms < 0
             or error_type is not None
             and not isinstance(error_type, str)
@@ -2256,6 +2312,8 @@ class DaemonPermitReceiptAdapter:
                 },
             },
         }
+        response = None
+        uncertain = False
         try:
             with self._connect() as stream:
                 self._send_frame(stream, request)
@@ -2263,10 +2321,26 @@ class DaemonPermitReceiptAdapter:
                 if length > self.MAX_FRAME_BYTES:
                     raise ContractError("PERMIT_BRIDGE_MALFORMED")
                 response = json.loads(self._recv_exact(stream, length).decode("utf-8"))
-        except ContractError:
-            raise
+        except ContractError as exc:
+            if exc.code != "PERMIT_BRIDGE_UNAVAILABLE":
+                raise
+            uncertain = True
         except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
-            raise ContractError("PERMIT_BRIDGE_UNAVAILABLE") from None
+            uncertain = True
+        if uncertain:
+            binding = receipt.get("permit_binding")
+            if not isinstance(binding, Mapping) or not binding:
+                raise ContractError("PERMIT_BRIDGE_UNAVAILABLE")
+            # One bounded read after an uncertain mutation ACK. Never retry the
+            # mutation, reissue a permit, or dispatch the tool from this path.
+            recovered = self.readback(
+                permit_id=permit_id, binding=binding,
+                preflight_receipt_digest=preflight["receipt_digest"],
+            )
+            if recovered.get("outcome") is None:
+                raise ContractError("PERMIT_OUTCOME_UNCONFIRMED")
+            response = {"request_id": request_id, "permit_id": permit_id,
+                        "outcome_artifact": recovered["outcome"]}
         if (
             not isinstance(response, Mapping)
             or response.get("request_id") != request_id
@@ -2279,10 +2353,13 @@ class DaemonPermitReceiptAdapter:
             outcome_artifact, Mapping
         ):
             raise ContractError("PERMIT_BRIDGE_MALFORMED")
-        if (
-            state == "ambiguous"
-            and outcome_artifact.get("state") != "terminal_quarantine"
-        ):
+        if (set(outcome_artifact) != {"permit_id", "preflight_receipt_digest", "reported", "recorded_at", "receipt_digest"}
+                or outcome_artifact.get("permit_id") != permit_id
+                or outcome_artifact.get("preflight_receipt_digest") != preflight["receipt_digest"]
+                or outcome_artifact.get("reported") != request["request"]["reported"]
+                or not isinstance(outcome_artifact.get("recorded_at"), str)
+                or not isinstance(outcome_artifact.get("receipt_digest"), str)
+                or len(outcome_artifact["receipt_digest"]) != 64):
             raise ContractError("PERMIT_BRIDGE_MALFORMED")
 
 

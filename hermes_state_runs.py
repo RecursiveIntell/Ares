@@ -1105,6 +1105,43 @@ class SessionRunCustodyMixin:
         return self._commit_run(raw, value, predecessor_expires_ns=old.expires_monotonic_ns,
                                 refresh_reference=reference)
 
+    def renew_run_custody_for_context_recovery(self, run_id, *, owner_token, expected_generation,
+                                              lease_holder, recovery_reservation, files):
+        """Renew retained same-process custody only within a native recovery attempt.
+
+        Expiry is never proof of death or a generic renewal grant. The executing
+        controller must still hold its private token and re-observe checkpoint
+        files through the private file client. No checkpoint or task is advanced.
+        """
+        from hermes_state_continuity import ContextContinuationError
+        _text(lease_holder)
+        if type(recovery_reservation) is not dict:
+            raise RunCustodyError("RECOVERY_RESERVATION_REQUIRED")
+        raw, old = self._owned_run(run_id, owner_token, expected_generation, allow_expired=True)
+        if old.controller_pid != os.getpid():
+            raise RunCustodyError("RECOVERY_SAME_PROCESS_REQUIRED")
+        if time.monotonic_ns() < old.expires_monotonic_ns:
+            raise RunCustodyError("RECOVERY_OWNER_NOT_EXPIRED")
+        files = _recovery_files(files, old.checkpoint)
+        if files != self.read_run_recovery_files(old):
+            raise RunCustodyError("RECOVERY_FILES_CHANGED")
+        value = replace(old, generation=old.generation + 1, predecessor_digest=_load(raw)["digest"],
+                        expires_monotonic_ns=_ttl(300))
+        def validate(conn):
+            try:
+                self._assert_context_recovery_reservation_on_conn(
+                    conn, value.current_session_id, lease_holder, recovery_reservation)
+            except ContextContinuationError as exc:
+                raise RunCustodyError(exc.code) from None
+            control = recovery_reservation.get("control_digest")
+            if type(control) is not str or not control.startswith("sha256:"):
+                raise RunCustodyError("TASK_CONTROL_CHANGED")
+            self._check_run_control_on_conn(conn, value.current_session_id, control.removeprefix("sha256:"))
+            self._record_run_recovery_files_on_conn(conn, value, files)
+        # This explicit reservation replaces only the predecessor-expiry check.
+        # CAS, process liveness, new expiry and actual root lease remain native.
+        return self._commit_run(raw, value, claim_lease_holder=lease_holder, validate_conn=validate)
+
     def release_run_custody(self, run_id, *, owner_token, expected_generation):
         raw, old = self._owned_run(run_id, owner_token, expected_generation, allow_expired=True)
         value = replace(old, generation=old.generation + 1, predecessor_digest=_load(raw)["digest"],

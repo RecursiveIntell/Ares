@@ -1,0 +1,20 @@
+{
+  "schema": "ares.native-owner-patch/v1",
+  "repository": "RecursiveIntell/recursive-agent",
+  "base_commit": "11fefae304d43d9d72f7a238f9d2df77862b51c6",
+  "candidate_commit": "d0e5431ecab35f1eaf21bed1ff5fca3eab5bda17",
+  "candidate_tree": "e56714033d5c09d41d922d9b29f981032f3fe3a0",
+  "libraries_commit": "0b099ec416de60f6adafb182f1d1e83795d05c56",
+  "patch_sha256": "3792aa2394cb6b5c732ed74a33e5839a1ba33b62a86d1094f0e19672571669dc",
+  "scope": [
+    "external permit semantic outcome idempotency",
+    "exact-binding read-only receipt lookup",
+    "trusted consumption time under native lock"
+  ],
+  "not_implemented": [
+    "context generation retirement",
+    "current-policy/incarnation fence"
+  ],
+  "hosted_runner_contract": "recursive-agent@11fefae304d43d9d72f7a238f9d2df77862b51c6/.github/workflows/ci.yml",
+  "native_runtime_status": "pending_hosted_execution"
+}

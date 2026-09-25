@@ -294,6 +294,150 @@ def test_failure_after_takeover_retains_custody_through_cleanup(task):
     assert db.read_run_custody("task").disposition == "released"
 
 
+@pytest.mark.parametrize("v1", [False, True])
+def test_same_process_recovery_renews_expired_retained_handle_inside_original_budget(task, monkeypatch, v1):
+    import time
+    proc = publisher(task, v1=v1)
+    exited(proc)
+    db = task[0]
+    agent = fresh_agent(task)
+    def unavailable(**_):
+        raise RuntimeError("engine unavailable")
+    agent._transition_context_engine_session = unavailable
+    assert not reconcile_context_rebase(agent).ready
+    before = db.read_run_custody("task")
+    assert agent._run_checkpoint_custody.finish_turn("holder")[0]["status"] == "recovery_pending"
+    db.release_session_turn_lease("child", "holder")
+    later_wall = time.time() + 301
+    later_monotonic = time.monotonic_ns() + 301_000_000_000
+    monkeypatch.setattr(time, "time", lambda: later_wall)
+    monkeypatch.setattr(time, "monotonic_ns", lambda: later_monotonic)
+    assert db.try_acquire_session_turn_lease("child", "renew-holder")
+    agent._active_session_turn_lease_holder = "renew-holder"
+    agent._run_checkpoint_custody.begin_turn("renew-holder")
+    agent._transition_context_engine_session = lambda **_: None
+    with pytest.raises(RunCustodyError, match="OWNER_EXPIRED"):
+        db.refresh_run_custody("task", owner_token=before.owner_token, expected_generation=before.generation)
+    assert reconcile_context_rebase(agent).ready
+    after = db.read_run_custody("task")
+    assert after.generation == before.generation + 1
+    assert after.owner_token == before.owner_token
+    assert after.checkpoint == before.checkpoint
+    assert after.origin_session_id == before.origin_session_id
+    assert after.controller_pid == before.controller_pid
+    assert after.process_identity == before.process_identity
+    assert after.expires_monotonic_ns > later_monotonic
+    if v1:
+        assert after.historical_goal_digest == before.historical_goal_digest
+    else:
+        assert after.task_binding == before.task_binding
+    assert db.read_run_recovery_files(after)
+
+
+@pytest.mark.parametrize("fault", ["source", "deadline", "lost_ack", "lost_readback"])
+def test_retained_expiry_renewal_is_bounded_and_preserves_uncertainty(task, monkeypatch, fault):
+    import time
+    proc = publisher(task)
+    exited(proc)
+    db = task[0]
+    agent = fresh_agent(task)
+    def unavailable(**_):
+        raise RuntimeError("engine unavailable")
+    agent._transition_context_engine_session = unavailable
+    assert not reconcile_context_rebase(agent).ready
+    before = db.read_run_custody("task")
+    agent._run_checkpoint_custody.finish_turn("holder")
+    db.release_session_turn_lease("child", "holder")
+    seconds = 901 if fault == "deadline" else 301
+    later_wall = time.time() + seconds
+    later_mono = time.monotonic_ns() + seconds * 1_000_000_000
+    monkeypatch.setattr(time, "time", lambda: later_wall)
+    monkeypatch.setattr(time, "monotonic_ns", lambda: later_mono)
+    assert db.try_acquire_session_turn_lease("child", "renew-holder")
+    agent._active_session_turn_lease_holder = "renew-holder"
+    agent._run_checkpoint_custody.begin_turn("renew-holder")
+    agent._transition_context_engine_session = lambda **_: None
+    if fault == "source":
+        task[3].write_text("changed")
+    elif fault == "lost_ack":
+        native = db.renew_run_custody_for_context_recovery
+        def lost(*args, **kwargs):
+            native(*args, **kwargs)
+            raise OSError("lost renewal ACK")
+        monkeypatch.setattr(db, "renew_run_custody_for_context_recovery", lost)
+    elif fault == "lost_readback":
+        native = db.read_run_custody
+        def lost(run_id):
+            value = native(run_id)
+            if value.generation == before.generation + 1:
+                raise OSError("lost readback")
+            return value
+        monkeypatch.setattr(db, "read_run_custody", lost)
+    assert not reconcile_context_rebase(agent).ready
+    monkeypatch.undo()
+    after = db.read_run_custody("task")
+    if fault.startswith("lost"):
+        assert after.generation == before.generation + 1
+        assert not reconcile_context_rebase(agent).ready
+        assert db.read_run_custody("task") == after
+        assert agent._run_checkpoint_custody.finish_turn("renew-holder")[0]["status"] == "unknown"
+    else:
+        assert after == before
+
+
+@pytest.mark.parametrize("fault", ["token", "generation", "lease", "attempt", "control", "admission_deadline"])
+def test_expired_retained_renewal_rechecks_native_fences(task, monkeypatch, fault):
+    import time
+    proc = publisher(task)
+    exited(proc)
+    db = task[0]
+    agent = fresh_agent(task)
+    def unavailable(**_):
+        raise RuntimeError("engine unavailable")
+    agent._transition_context_engine_session = unavailable
+    assert not reconcile_context_rebase(agent).ready
+    before = db.read_run_custody("task")
+    agent._run_checkpoint_custody.finish_turn("holder")
+    db.release_session_turn_lease("child", "holder")
+    wall = [time.time() + 301]
+    mono = time.monotonic_ns() + 301_000_000_000
+    monkeypatch.setattr(time, "time", lambda: wall[0])
+    monkeypatch.setattr(time, "monotonic_ns", lambda: mono)
+    assert db.try_acquire_session_turn_lease("child", "renew-holder")
+    agent._active_session_turn_lease_holder = "renew-holder"
+    agent._run_checkpoint_custody.begin_turn("renew-holder")
+    agent._transition_context_engine_session = lambda **_: None
+    native = db.renew_run_custody_for_context_recovery
+    reached = []
+    def raced(*args, **kwargs):
+        reached.append(True)
+        if fault == "token":
+            kwargs["owner_token"] = "0" * 64
+        elif fault == "generation":
+            kwargs["expected_generation"] += 1
+        elif fault == "lease":
+            kwargs["lease_holder"] = "foreign-holder"
+        elif fault == "attempt":
+            kwargs["recovery_reservation"] = {**kwargs["recovery_reservation"], "attempt": 99}
+        elif fault == "control":
+            db.append_message("child", "user", "Stop for review", turn_lease_holder="renew-holder")
+        else:
+            write = db._execute_write
+            def delayed(operation):
+                def admitted(conn):
+                    wall[0] += 601
+                    return operation(conn)
+                return write(admitted)
+            with monkeypatch.context() as temporary:
+                temporary.setattr(db, "_execute_write", delayed)
+                return native(*args, **kwargs)
+        return native(*args, **kwargs)
+    monkeypatch.setattr(db, "renew_run_custody_for_context_recovery", raced)
+    assert not reconcile_context_rebase(agent).ready
+    assert reached == [True]
+    assert db.read_run_custody("task") == before
+
+
 def test_process_exit_after_partial_cleanup_retains_both_runs_for_next_controller(task):
     proc = publisher(task, second=True)
     exited(proc)

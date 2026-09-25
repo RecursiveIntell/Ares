@@ -4,6 +4,41 @@ The V4 packet dated 2026-09-23 remains the full acceptance contract. This is
 an implementation branch. Qualification is tied to source hashes and named
 oracles; passing unit tests does not qualify a selected provider route.
 
+## Retained recovery custody and external receipt reconciliation
+
+The native SessionDB owner now renews an expired retained handle only for the
+same process and private token, under the actual root lease and existing bounded
+recovery reservation. Checkpoint files are re-observed; generation, controls and
+deadline are checked again inside admission. V1 history and V2 task bindings are
+preserved. Generic expired refresh and dead-owner takeover remain unchanged.
+Lost renewal ACKs remain unknown and cannot trigger an automatic second mutation.
+
+Ares retains the consume-time binding and adapter for outcome settlement. A lost
+outcome ACK permits one exact native readback. It never reissues a permit or
+redispatches an effect. Response validation now uses the actual native reported
+outcome shape, including ambiguous reports. Reported success still does not mean
+independently confirmed external success or task completion.
+
+The native prerequisite is preserved as an exact patch against recursive-agent
+`11fefae`, with candidate tree and dependency identities in
+`native-external-owner.json`. It adds semantic outcome idempotency, closed exact
+readback IPC, and trusted-clock checks under the permit lock. Local compilation
+and Clippy passed. Native runtime execution is blocked by the local systemd user
+bus; the PR runs the native repository's existing supported hosted paired-root
+contract against that exact patched tree. The local test guard is unchanged.
+The patch is not a published native release or an installed capability.
+
+The frozen local Ares gate passed 2,865 tests across 89 files; independent review
+passed 72 and closed AUD-H1. Five existing skips remain. Unix sockets are denied
+in this workspace, so the local gate excludes five named collaboration socket
+tests and the code-execution file; hosted CI retains them. The sole full-CI
+failure on `dbbc704a`, an emergency-stop fake event missing native event fields,
+is reproduced and fixed with the real MessageEvent. Evidence and raw logs are
+in `owner-recovery-evidence.json` and its linked artifacts.
+
+EF-1/EF-2 native generation, incarnation, current-policy and retirement fencing
+remain open. This increment does not complete or qualify full V4.
+
 ## Native cold input recovery and response lifetime
 
 Accepted gateway input now carries immutable actor, route and transport-owner

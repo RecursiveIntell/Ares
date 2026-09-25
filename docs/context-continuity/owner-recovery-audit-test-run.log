@@ -1,0 +1,23 @@
+▶ running per-file parallel test suite via run_tests_parallel.py
+  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)
+▶ pre-compiling bytecode cache
+▶ launching test runner
+Discovered 4 test files (~44 tests) under ['tests/test_run_custody_cold_recovery.py', 'tests/test_run_custody_ready_recovery.py', 'tests/test_turn_run_custody.py', 'tests/ares_runtime/test_permit_readback.py']; running with -j 2
+[ 13.6% |     6/~44 | ✓12 | ✗ 0] ✓ tests/ares_runtime/test_permit_readback.py (12✓, 1.9s)
+[ 59.1% |    26/~44 | ✓48 | ✗ 0] ✓ tests/test_run_custody_cold_recovery.py (36✓, 12.1s)
+[ 86.4% |    38/~44 | ✓64 | ✗ 0] ✓ tests/test_run_custody_ready_recovery.py (16✓, 10.6s)
+[100.0% |    44/~44 | ✓72 | ✗ 0] ✓ tests/test_turn_run_custody.py (8✓, 0.7s)
+
+=== Summary: 4 files, 72 tests passed, 0 failed (100% complete) in 12.8s (2 workers) ===
+  Durations cached to test_durations.json (4 files)
+
+=== Per-file subprocess time distribution ===
+  Files:   4
+  Total subprocess CPU-wall: 25.3s  (runner wall: 12.8s, parallelism: 2x)
+  P50: 10.56s  P90: 12.13s  P95: 12.13s  P99: 12.13s  Max: 12.13s
+  <1s: 1 files (25%)  <2s: 2 files (50%)
+  Top 10 slowest:
+     12.13s  tests/test_run_custody_cold_recovery.py
+     10.56s  tests/test_run_custody_ready_recovery.py
+      1.92s  tests/ares_runtime/test_permit_readback.py
+      0.72s  tests/test_turn_run_custody.py

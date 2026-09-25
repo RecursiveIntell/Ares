@@ -18,7 +18,8 @@
   "authorized_targets": [
     "/workspace/scratch/bfe02ea97bc3/Ares",
     "/workspace/scratch/bfe02ea97bc3/evidence",
-    "github:RecursiveIntell/Ares#80"
+    "github:RecursiveIntell/Ares#80",
+    "/workspace/scratch/bfe02ea97bc3/recursive-agent-continuity"
   ],
   "route_id": "high-risk-implement",
   "selected_skills": [
@@ -61,7 +62,8 @@
       "status": "passed",
       "evidence": [
         "docs/context-continuity/repair-evidence.json",
-        "docs/context-continuity/QUALIFICATION.md"
+        "docs/context-continuity/QUALIFICATION.md",
+        "docs/context-continuity/owner-recovery-evidence.json"
       ],
       "receipt": "Implement snapshot and publication digest binding, unresolved-effect refusal, dispatcher stop, accounting and authentic-input persistence."
     },
@@ -70,10 +72,53 @@
       "status": "passed",
       "evidence": [
         "docs/context-continuity/repair-evidence.json",
-        "docs/context-continuity/QUALIFICATION.md"
+        "docs/context-continuity/QUALIFICATION.md",
+        "docs/context-continuity/owner-recovery-audit-verdict.json"
       ],
-      "receipt": "Independent read-only review passed default route; source hashes match final review; nondefault read limits remain unsupported."
+      "receipt": "Cumulative bounded repairs independently reviewed; latest 72 tests pass and source/pipeline checks pass. Full V4 and native hosted runtime remain pending."
+    }
+  ],
+  "mutations": [
+    {
+      "stage": "implement@bounded",
+      "authority": "local-write",
+      "action": "Repair snapshot/publication and caller admission; add behavioral regressions, CI selection, acceptance inventory and evidence.",
+      "target": "/workspace/scratch/bfe02ea97bc3/Ares"
     },
+    {
+      "stage": "implement@bounded",
+      "authority": "local-write",
+      "action": "Native receipt/readback/clock prerequisite isolated in recursive-agent worktree and preserved as exact Ares CI patch; no native remote publication or live activation.",
+      "target": "/workspace/scratch/bfe02ea97bc3/recursive-agent-continuity"
+    }
+  ],
+  "validation": [
+    "Canonical baseline: 20 files, 946 passing tests.",
+    "Corrected baseline RED: 8 snapshot and 8 dispatch failures.",
+    "Independent review: five files, 74 passing tests; revised dispatch 12 passing tests.",
+    "Ruff and git diff --check passed.",
+    "108 continuity and 172 inherited IDs preserved with exact catalog metadata and hashes.",
+    "Final pinned canonical gate: 26 files, 1289 passed, 0 failed, exit 0; raw log retained in repair-test-run.log.",
+    "Latest canonical owner-recovery gate:89 files,2865passed,0failed,5skipped; independent72passed; named local socket exclusions retained in hosted CI."
+  ],
+  "blocked_gates": [
+    "Installed selected subscription-route tuple and live qualification are unavailable in this workspace."
+  ],
+  "remaining_delta": [
+    "Remaining ingress/control and current role/upstream actor verification",
+    "Owner-qualified external effect settlement and task completion/progress",
+    "Native external effect-owner fence, incarnation and acknowledgement closure",
+    "Working source, conditional writes and current policy/retrieval",
+    "All shared physical-attempt and recovery-unit parent limits",
+    "Reader compatibility, backup/rollback qualification",
+    "Installed selected-route capability/calibration, subscription canaries and endurance"
+  ],
+  "next_gate": "Native hosted paired-root runtime proof, EF1/EF2 generation/current-policy/retirement fence, then remaining full V4 qualification.",
+  "qualification": "Bounded source repair passed; full V4 program remains incomplete.",
+  "scope": "Cumulative PR80 implementation; latest retained custody renewal and external receipt reconciliation",
+  "latest_repair_evidence": "docs/context-continuity/owner-recovery-evidence.json",
+  "latest_repair_audit": "pass_bounded",
+  "completed_increments": [
     {
       "id": "ready-controller@post",
       "status": "passed",
@@ -109,39 +154,15 @@
         "docs/context-continuity/cold-input-audit-verdict.json"
       ],
       "receipt": "2765 local tests and 136 independent audit tests passed; full V4 remains incomplete."
-    }
-  ],
-  "mutations": [
+    },
     {
-      "stage": "implement@bounded",
-      "authority": "local-write",
-      "action": "Repair snapshot/publication and caller admission; add behavioral regressions, CI selection, acceptance inventory and evidence.",
-      "target": "/workspace/scratch/bfe02ea97bc3/Ares"
+      "id": "owner-recovery@post",
+      "status": "passed",
+      "evidence": [
+        "docs/context-continuity/owner-recovery-evidence.json",
+        "docs/context-continuity/owner-recovery-audit-verdict.json"
+      ],
+      "receipt": "2865 local and 72 independent tests pass; native EF3/4 source compiles and Clippy passes, hosted runtime pending; full V4 incomplete."
     }
-  ],
-  "validation": [
-    "Canonical baseline: 20 files, 946 passing tests.",
-    "Corrected baseline RED: 8 snapshot and 8 dispatch failures.",
-    "Independent review: five files, 74 passing tests; revised dispatch 12 passing tests.",
-    "Ruff and git diff --check passed.",
-    "108 continuity and 172 inherited IDs preserved with exact catalog metadata and hashes.",
-    "Final pinned canonical gate: 26 files, 1289 passed, 0 failed, exit 0; raw log retained in repair-test-run.log."
-  ],
-  "blocked_gates": [
-    "Installed selected subscription-route tuple and live qualification are unavailable in this workspace."
-  ],
-  "remaining_delta": [
-    "Remaining ingress/control and current role/upstream actor verification",
-    "Owner-qualified external effect settlement and task completion/progress",
-    "Native external effect-owner fence, incarnation and acknowledgement closure",
-    "Working source, conditional writes and current policy/retrieval",
-    "All shared physical-attempt and recovery-unit parent limits",
-    "Reader compatibility, backup/rollback qualification",
-    "Installed selected-route capability/calibration, subscription canaries and endurance"
-  ],
-  "next_gate": "Native external owner closure, task completion/progress and remaining exact-route V4 qualification.",
-  "qualification": "Bounded source repair passed; full V4 program remains incomplete.",
-  "scope": "Cumulative PR80 implementation; latest selected native cold input recovery and response lifetime",
-  "latest_repair_evidence": "docs/context-continuity/cold-input-evidence.json",
-  "latest_repair_audit": "pass_bounded"
+  ]
 }

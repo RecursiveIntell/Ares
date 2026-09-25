@@ -7,6 +7,7 @@ retries them. Tokens and lease holders never appear in returned summaries.
 from dataclasses import dataclass, field
 import os
 import threading
+import time
 
 from hermes_state_runs import RunCustody, RunCustodyV2, RunCustodyError
 from scripts import run_checkpoint_claim as claim_client
@@ -234,6 +235,15 @@ class TurnRunCustody:
                 handle.holder = holder
                 if recovery_reservation is not None:
                     handle.recovery_pending = True
+                    if time.monotonic_ns() >= current.expires_monotonic_ns:
+                        from scripts.run_checkpoint_resume import BoundFileReader, ResumeRefusal, verify_checkpoint_files
+                        try:
+                            files = self.db.read_run_recovery_files(current)
+                            verify_checkpoint_files(current.checkpoint, files, BoundFileReader())
+                        except (RunCustodyError, ResumeRefusal) as exc:
+                            raise ClaimRefusal(str(exc)) from None
+                        self._mutate(handle, self.db.renew_run_custody_for_context_recovery,
+                            lease_holder=holder, recovery_reservation=recovery_reservation, files=files)
             native = self.db.list_run_custody_for_session(child_session_id)
             if len(native) > 16:
                 raise ClaimRefusal("CUSTODY_HANDLE_LIMIT")

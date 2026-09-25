@@ -1,0 +1,543 @@
+diff --git a/crates/recursive-agent-daemon/src/protocol.rs b/crates/recursive-agent-daemon/src/protocol.rs
+index c17cdba..3da6b6e 100644
+--- a/crates/recursive-agent-daemon/src/protocol.rs
++++ b/crates/recursive-agent-daemon/src/protocol.rs
+@@ -177,6 +177,13 @@ pub enum IpcRequestV1 {
+         /// local error, or an ambiguous outcome.
+         reported: ReportedEffectOutcomeV1,
+     },
++    /// Read-only exact-binding reconciliation. A consumed receipt is historical
++    /// evidence, never permission to execute after a lost consumption ACK.
++    PermitReadback {
++        permit_id: CurrentPermitId,
++        binding: Box<PermitBindingV1>,
++        preflight_receipt_digest: Option<recursive_agent_contracts::ContentDigest>,
++    },
+     /// Submit one distinct closed V3 provider-egress operation. This variant is
+     /// never decoded as or downgraded to the V1 operation family.
+     SubmitProviderEgressV3 {
+diff --git a/crates/recursive-agent-daemon/src/server.rs b/crates/recursive-agent-daemon/src/server.rs
+index 1d73698..d248aae 100644
+--- a/crates/recursive-agent-daemon/src/server.rs
++++ b/crates/recursive-agent-daemon/src/server.rs
+@@ -376,6 +376,22 @@ fn dispatch(
+                 "outcome_artifact": outcome,
+             }))
+         }
++        IpcRequestV1::PermitReadback {
++            permit_id,
++            binding,
++            preflight_receipt_digest,
++        } => {
++            let readback = runtime.read_external_permit(
++                permit_id,
++                binding,
++                preflight_receipt_digest.as_ref(),
++            )?;
++            Ok(serde_json::json!({
++                "request_id": request.request_id,
++                "permit_id": permit_id,
++                "readback": readback,
++            }))
++        }
+         IpcRequestV1::Submit { operation } => {
+             let handle = runtime.submit(operation)?;
+             Ok(serde_json::json!({
+diff --git a/crates/recursive-agent-daemon/tests/ipc_runtime.rs b/crates/recursive-agent-daemon/tests/ipc_runtime.rs
+index 955cca9..c4613da 100644
+--- a/crates/recursive-agent-daemon/tests/ipc_runtime.rs
++++ b/crates/recursive-agent-daemon/tests/ipc_runtime.rs
+@@ -316,6 +316,137 @@ fn daemon_consumes_and_records_external_permit_receipts_over_ipc() -> TestResult
+         recorded["outcome_artifact"]["reported"]["state"],
+         "outcome_ambiguous"
+     );
++    // Reconnect after an uncertain ACK: use an exact read-only identity. The
++    // daemon returns persisted artifacts and never consumes another permit.
++    drop(stream);
++    let mut stream = connect_with_retry(&socket_path, &server_thread)?;
++    let readback = serde_json::json!({
++        "schema": IPC_REQUEST_SCHEMA_V1,
++        "protocol_version": IPC_PROTOCOL_VERSION_V1,
++        "request_id": "permit-readback",
++        "request": {"kind": "permit_readback", "permit_id": permit.permit_id,
++            "binding": binding, "preflight_receipt_digest": digest},
++    });
++    stream.write_all(&frame(&serde_json::to_vec(&readback)?))?;
++    stream.flush()?;
++    let reconciled = read_response(&mut stream)?;
++    assert_eq!(
++        reconciled["readback"]["schema"],
++        "recursive-agent.external-permit-readback/v1"
++    );
++    assert_eq!(
++        reconciled["readback"]["preflight"],
++        consumed["preflight_artifact"]
++    );
++    assert_eq!(
++        reconciled["readback"]["outcome"],
++        recorded["outcome_artifact"]
++    );
++    let mut wrong = readback.clone();
++    wrong["request_id"] = serde_json::json!("permit-readback-wrong");
++    wrong["request"]["binding"]["actor"] = serde_json::json!("actor:foreign");
++    stream.write_all(&frame(&serde_json::to_vec(&wrong)?))?;
++    stream.flush()?;
++    assert!(read_response(&mut stream)?["error"].is_object());
++    Ok(())
++}
++
++#[test]
++fn dropped_external_consume_and_outcome_acks_reconcile_without_reexecution() -> TestResult {
++    let tmp = tempfile::tempdir()?;
++    let runtime_root = tmp.path().join("dropped-ack-root");
++    std::fs::create_dir(&runtime_root)?;
++    let call = ToolCallSpecV1 {
++        tool: "echo".into(),
++        args: serde_json::json!({"text": "lost-ack"}),
++        frozen_clock: None,
++    };
++    let binding = external_permit_binding(&call)?;
++    let root = std::fs::File::open(&runtime_root)?;
++    let permits = DurablePermitStore::from_dir_fd(&root)?;
++    let permit = permits.issue(&binding, FixedClock.now())?;
++    let service = native_service(&runtime_root)?;
++    let (listener, socket_path) = bind_private_socket(tmp.path(), "lost-ack.sock")?;
++    let server_thread = std::thread::spawn(move || {
++        let _ = serve(listener, Arc::new(service), 4);
++    });
++    let envelope = |id: &str, request: serde_json::Value| {
++        serde_json::json!({
++            "schema": IPC_REQUEST_SCHEMA_V1, "protocol_version": IPC_PROTOCOL_VERSION_V1,
++            "request_id": id, "request": request,
++        })
++    };
++    let mut stream = connect_with_retry(&socket_path, &server_thread)?;
++    let consume = envelope(
++        "lost-consume",
++        serde_json::json!({
++            "kind": "permit_consume", "permit_id": permit.permit_id, "binding": binding, "call": call,
++        }),
++    );
++    stream.write_all(&frame(&serde_json::to_vec(&consume)?))?;
++    stream.flush()?;
++    stream.shutdown(std::net::Shutdown::Both)?;
++    drop(stream); // No consume response is read.
++    let deadline = std::time::Instant::now() + Duration::from_secs(3);
++    let preflight = loop {
++        if let Some(receipt) = permits.state(&permit.permit_id)?.preflight_receipt {
++            break receipt;
++        }
++        if std::time::Instant::now() >= deadline {
++            return Err("consumption was not recorded".into());
++        }
++        std::thread::sleep(Duration::from_millis(5));
++    };
++    let mut stream = connect_with_retry(&socket_path, &server_thread)?;
++    let outcome = envelope(
++        "lost-outcome",
++        serde_json::json!({
++            "kind": "permit_outcome_record", "permit_id": permit.permit_id,
++            "preflight_receipt_digest": preflight.receipt_digest,
++            "reported": {"state": "outcome_ambiguous", "duration_ms": 9, "error_type": "lost_tool_ack"},
++        }),
++    );
++    stream.write_all(&frame(&serde_json::to_vec(&outcome)?))?;
++    stream.flush()?;
++    stream.shutdown(std::net::Shutdown::Both)?;
++    drop(stream); // No outcome response is read either.
++    let deadline = std::time::Instant::now() + Duration::from_secs(3);
++    let persisted = loop {
++        let record = permits.state(&permit.permit_id)?;
++        if record.outcome_receipt.is_some() {
++            break record;
++        }
++        if std::time::Instant::now() >= deadline {
++            return Err("outcome was not recorded".into());
++        }
++        std::thread::sleep(Duration::from_millis(5));
++    };
++    let mut stream = connect_with_retry(&socket_path, &server_thread)?;
++    let readback = envelope(
++        "recover",
++        serde_json::json!({
++            "kind": "permit_readback", "permit_id": permit.permit_id, "binding": binding,
++            "preflight_receipt_digest": preflight.receipt_digest,
++        }),
++    );
++    stream.write_all(&frame(&serde_json::to_vec(&readback)?))?;
++    stream.flush()?;
++    let recovered = read_response(&mut stream)?;
++    assert_eq!(
++        recovered["readback"]["preflight"],
++        serde_json::to_value(&preflight)?
++    );
++    assert_eq!(
++        recovered["readback"]["outcome"],
++        serde_json::to_value(&persisted.outcome_receipt)?
++    );
++    assert_eq!(permits.state(&permit.permit_id)?, persisted);
++    let mut replay = consume;
++    replay["request_id"] = serde_json::json!("replay-denied");
++    stream.write_all(&frame(&serde_json::to_vec(&replay)?))?;
++    stream.flush()?;
++    assert!(read_response(&mut stream)?["error"].is_object());
++    assert_eq!(permits.state(&permit.permit_id)?, persisted);
+     Ok(())
+ }
+ 
+diff --git a/crates/recursive-agent-policy/src/lib.rs b/crates/recursive-agent-policy/src/lib.rs
+index e21b1e7..b73667f 100644
+--- a/crates/recursive-agent-policy/src/lib.rs
++++ b/crates/recursive-agent-policy/src/lib.rs
+@@ -1141,6 +1141,26 @@ pub struct PermitPreflightReceiptV1 {
+     pub receipt_digest: ContentDigest,
+ }
+ 
++#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
++pub enum ExternalPermitReadbackSchemaV1 {
++    #[serde(rename = "recursive-agent.external-permit-readback/v1")]
++    V1,
++}
++
++/// Read-only reconciliation of one exact external binding. Historical receipts
++/// never grant permission to dispatch or replay an effect after an uncertain ACK.
++/// Missing receipts remain missing; legacy consumption is not reconstructed.
++#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct ExternalPermitReadbackV1 {
++    pub schema: ExternalPermitReadbackSchemaV1,
++    pub permit_id: CurrentPermitId,
++    pub binding: PermitBindingV1,
++    pub state: PermitStateV1,
++    pub preflight: Option<PermitPreflightReceiptV1>,
++    pub outcome: Option<PermitOutcomeReceiptV1>,
++}
++
+ impl PermitPreflightReceiptV1 {
+     fn create(evidence: PermitEvidenceV1, recorded_at: DateTime<Utc>) -> Result<Self, PolicyError> {
+         evidence.validate()?;
+@@ -3136,10 +3156,13 @@ impl DurablePermitStore {
+         &self,
+         permit_id: &CurrentPermitId,
+         dispatch: &PermitBindingV1,
+-        trusted_now: DateTime<Utc>,
++        clock: impl Fn() -> DateTime<Utc>,
+     ) -> Result<PermitPreflightReceiptV1, PolicyError> {
+         dispatch.validate()?;
+         self.with_lock(|| {
++            // The caller must supply its trusted clock, not a timestamp taken
++            // before waiting on another process's permit-store lock.
++            let trusted_now = clock();
+             let mut record = self.read_record_or_reject(permit_id)?;
+             if record.permit.binding.tool == NORMAL_CHAT_LANE {
+                 return Err(PolicyError::InvalidLease(
+@@ -3153,12 +3176,21 @@ impl DurablePermitStore {
+                     .map_err(|_| rejected(permit_id, PermitRejectionReasonV1::WrongParent))?;
+                 validate_parent_binding(&record.permit, &parent, trusted_now)?;
+             }
++            let final_now = clock();
++            if final_now < trusted_now {
++                return Err(PolicyError::InvalidLease("trusted clock regressed".into()));
++            }
++            validate_dispatch(permit_id, &record, dispatch, final_now)?;
++            if let Some(parent_id) = &record.permit.binding.parent_permit_id {
++                let parent = self.read_record(parent_id)?;
++                validate_parent_binding(&record.permit, &parent, final_now)?;
++            }
+             record.state = PermitStateV1::Consumed {
+-                consumed_at: trusted_now,
++                consumed_at: final_now,
+             };
+             let receipt = PermitPreflightReceiptV1::create(
+                 PermitEvidenceV1::from_record(&record)?,
+-                trusted_now,
++                final_now,
+             )?;
+             record.preflight_receipt = Some(receipt.clone());
+             self.replace_record(&record, None)?;
+@@ -3237,13 +3269,10 @@ impl DurablePermitStore {
+             }
+             if let Some(existing) = &record.outcome_receipt {
+                 existing.validate()?;
+-                let proposed = PermitOutcomeReceiptV1::create(
+-                    permit_id.clone(),
+-                    preflight_receipt_digest.clone(),
+-                    reported,
+-                    trusted_now,
+-                )?;
+-                if *existing == proposed {
++                // Identity is the exact semantic report bound to this consumed
++                // preflight. An ACK retry must return the persisted timestamp
++                // and digest, never mint a new receipt or overwrite ambiguity.
++                if existing.reported == reported {
+                     return Ok(existing.clone());
+                 }
+                 return Err(PolicyError::PermitStateConflict);
+@@ -3336,6 +3365,38 @@ impl DurablePermitStore {
+         self.with_lock(|| self.read_record_or_reject(permit_id))
+     }
+ 
++    pub fn read_external_permit(
++        &self,
++        permit_id: &CurrentPermitId,
++        expected_binding: &PermitBindingV1,
++        expected_preflight: Option<&ContentDigest>,
++    ) -> Result<ExternalPermitReadbackV1, PolicyError> {
++        expected_binding.validate()?;
++        self.with_lock(|| {
++            let record = self.read_record_or_reject(permit_id)?;
++            if record.permit.binding != *expected_binding
++                || record.permit.binding.tool == NORMAL_CHAT_LANE
++                || expected_preflight.is_some_and(|digest| {
++                    record
++                        .preflight_receipt
++                        .as_ref()
++                        .map(|receipt| &receipt.receipt_digest)
++                        != Some(digest)
++                })
++            {
++                return Err(rejected(permit_id, PermitRejectionReasonV1::WrongAction));
++            }
++            Ok(ExternalPermitReadbackV1 {
++                schema: ExternalPermitReadbackSchemaV1::V1,
++                permit_id: permit_id.clone(),
++                binding: record.permit.binding,
++                state: record.state,
++                preflight: record.preflight_receipt,
++                outcome: record.outcome_receipt,
++            })
++        })
++    }
++
+     pub fn validate_parent_authority(
+         &self,
+         child_permit_id: &CurrentPermitId,
+diff --git a/crates/recursive-agent-policy/tests/normal_chat_permit.rs b/crates/recursive-agent-policy/tests/normal_chat_permit.rs
+index 360e9e2..ead74b1 100644
+--- a/crates/recursive-agent-policy/tests/normal_chat_permit.rs
++++ b/crates/recursive-agent-policy/tests/normal_chat_permit.rs
+@@ -538,7 +538,7 @@ fn run_fixture_with_retention(
+         .consume(&permit.permit_id, &effect_binding, dispatch_time)
+         .is_err());
+     assert!(store
+-        .consume_with_preflight(&permit.permit_id, &effect_binding, dispatch_time)
++        .consume_with_preflight(&permit.permit_id, &effect_binding, || dispatch_time)
+         .is_err());
+     assert!(store
+         .consume_with_interruption(&permit.permit_id, &effect_binding, dispatch_time, None)
+diff --git a/crates/recursive-agent-policy/tests/permit_lifecycle.rs b/crates/recursive-agent-policy/tests/permit_lifecycle.rs
+index ebc3c51..d925291 100644
+--- a/crates/recursive-agent-policy/tests/permit_lifecycle.rs
++++ b/crates/recursive-agent-policy/tests/permit_lifecycle.rs
+@@ -420,7 +420,7 @@ fn receipt_record(
+     let mut binding = binding()?;
+     binding.actor = ActorPrincipalV1::try_new(actor)?;
+     let permit = store.issue(&binding, now())?;
+-    let preflight = store.consume_with_preflight(&permit.permit_id, &binding, now())?;
++    let preflight = store.consume_with_preflight(&permit.permit_id, &binding, now)?;
+     if with_outcome {
+         store.record_reported_outcome(
+             &permit.permit_id,
+@@ -663,15 +663,15 @@ fn receipt_roundtrip_preserves_idempotency_and_legacy_consumption() -> TestResul
+         )?,
+         *outcome
+     );
+-    assert!(matches!(
++    assert_eq!(
+         reopened.record_reported_outcome(
+             &selected.permit.permit_id,
+             &preflight.receipt_digest,
+             outcome.reported.clone(),
+             outcome.recorded_at + TimeDelta::seconds(1),
+-        ),
+-        Err(PolicyError::PermitStateConflict)
+-    ));
++        )?,
++        *outcome
++    );
+     assert_eq!(reopened.state(&selected.permit.permit_id)?, selected);
+     let legacy_binding = binding()?;
+     let legacy = store.issue(&legacy_binding, now())?;
+@@ -693,3 +693,150 @@ fn receipt_roundtrip_preserves_idempotency_and_legacy_consumption() -> TestResul
+         .is_err());
+     Ok(())
+ }
++
++#[test]
++fn external_readback_reconciles_reopen_without_consuming_or_replaying() -> TestResult {
++    let root = tempfile::tempdir()?;
++    let store = open_store(root.path())?;
++    let binding = binding()?;
++    let permit = store.issue(&binding, now())?;
++    let issued = store.read_external_permit(&permit.permit_id, &binding, None)?;
++    assert_eq!(issued.state, PermitStateV1::Issued);
++    assert!(issued.preflight.is_none() && issued.outcome.is_none());
++    let preflight = store.consume_with_preflight(&permit.permit_id, &binding, now)?;
++    drop(store); // Consumption ACK was lost. Readback grants no second consumption.
++    let reopened = open_store(root.path())?;
++    let readback = reopened.read_external_permit(
++        &permit.permit_id,
++        &binding,
++        Some(&preflight.receipt_digest),
++    )?;
++    assert_eq!(readback.preflight, Some(preflight.clone()));
++    assert!(readback.outcome.is_none());
++    assert!(reopened
++        .consume_with_preflight(&permit.permit_id, &binding, now)
++        .is_err());
++    let outcome = reopened.record_reported_outcome(
++        &permit.permit_id,
++        &preflight.receipt_digest,
++        reported_success(),
++        now(),
++    )?;
++    let after = open_store(root.path())?.read_external_permit(
++        &permit.permit_id,
++        &binding,
++        Some(&preflight.receipt_digest),
++    )?;
++    assert_eq!(after.outcome, Some(outcome));
++    let mut wrong_binding = binding.clone();
++    wrong_binding.actor = ActorPrincipalV1::try_new("actor:other")?;
++    assert!(reopened
++        .read_external_permit(&permit.permit_id, &wrong_binding, None)
++        .is_err());
++    assert!(reopened
++        .read_external_permit(
++            &permit.permit_id,
++            &binding,
++            Some(&content_digest(&"foreign")?),
++        )
++        .is_err());
++    let mut conflicting = reported_success();
++    conflicting.duration_ms += 1;
++    assert!(matches!(
++        reopened.record_reported_outcome(
++            &permit.permit_id,
++            &preflight.receipt_digest,
++            conflicting,
++            now() + TimeDelta::seconds(3),
++        ),
++        Err(PolicyError::PermitStateConflict)
++    ));
++    assert_eq!(
++        reopened.read_external_permit(&permit.permit_id, &binding, None)?,
++        after
++    );
++    Ok(())
++}
++
++#[test]
++fn external_preflight_clock_is_sampled_after_store_lock_wait() -> TestResult {
++    use std::os::fd::AsFd;
++    use std::sync::{
++        atomic::{AtomicBool, Ordering},
++        mpsc, Arc,
++    };
++    use std::time::Duration;
++    let root = tempfile::tempdir()?;
++    let store = open_store(root.path())?;
++    let binding = binding()?;
++    let permit = store.issue(&binding, now())?;
++    let lock = std::fs::OpenOptions::new()
++        .read(true)
++        .write(true)
++        .open(root.path().join(".permit.lock"))?;
++    rustix::fs::flock(lock.as_fd(), rustix::fs::FlockOperation::LockExclusive)?;
++    let expired = Arc::new(AtomicBool::new(false));
++    let selected_expired = Arc::clone(&expired);
++    let selected_id = permit.permit_id.clone();
++    let selected_binding = binding.clone();
++    let (started_tx, started_rx) = mpsc::channel();
++    let (sample_tx, sample_rx) = mpsc::channel();
++    let worker = std::thread::spawn(move || {
++        let _ = started_tx.send(());
++        store.consume_with_preflight(&selected_id, &selected_binding, || {
++            let _ = sample_tx.send(());
++            if selected_expired.load(Ordering::SeqCst) {
++                selected_binding.expires_at
++            } else {
++                now()
++            }
++        })
++    });
++    started_rx.recv_timeout(Duration::from_secs(2))?;
++    assert!(matches!(
++        sample_rx.recv_timeout(Duration::from_millis(50)),
++        Err(mpsc::RecvTimeoutError::Timeout)
++    ));
++    expired.store(true, Ordering::SeqCst);
++    rustix::fs::flock(lock.as_fd(), rustix::fs::FlockOperation::Unlock)?;
++    assert!(matches!(
++        worker.join().map_err(|_| "consume thread panicked")?,
++        Err(PolicyError::PermitRejected {
++            reason: PermitRejectionReasonV1::Expired,
++            ..
++        })
++    ));
++    assert_eq!(
++        open_store(root.path())?.state(&permit.permit_id)?.state,
++        PermitStateV1::Issued
++    );
++    Ok(())
++}
++
++#[test]
++fn external_preflight_rechecks_final_clock_and_rejects_regression() -> TestResult {
++    use std::cell::Cell;
++    for final_time in [
++        now() + TimeDelta::seconds(60),
++        now() - TimeDelta::seconds(1),
++    ] {
++        let root = tempfile::tempdir()?;
++        let store = open_store(root.path())?;
++        let binding = binding()?;
++        let permit = store.issue(&binding, now())?;
++        let calls = Cell::new(0);
++        assert!(store
++            .consume_with_preflight(&permit.permit_id, &binding, || {
++                calls.set(calls.get() + 1);
++                if calls.get() == 1 {
++                    now()
++                } else {
++                    final_time
++                }
++            })
++            .is_err());
++        assert_eq!(calls.get(), 2);
++        assert_eq!(store.state(&permit.permit_id)?.state, PermitStateV1::Issued);
++    }
++    Ok(())
++}
+diff --git a/crates/recursive-agent-runner/src/runtime.rs b/crates/recursive-agent-runner/src/runtime.rs
+index c1b9e3a..da286b9 100644
+--- a/crates/recursive-agent-runner/src/runtime.rs
++++ b/crates/recursive-agent-runner/src/runtime.rs
+@@ -597,13 +597,20 @@ impl RuntimeService {
+         dispatch.args_digest = content_digest(&call.args)?;
+         let root = std::fs::File::open(self.dependencies.output_root())?;
+         let permits = DurablePermitStore::from_dir_fd(&root)?;
+-        Ok(
+-            permits.consume_with_preflight(
+-                permit_id,
+-                &dispatch,
+-                self.dependencies.clock().now(),
+-            )?,
+-        )
++        Ok(permits
++            .consume_with_preflight(permit_id, &dispatch, || self.dependencies.clock().now())?)
++    }
++
++    /// Read persisted external permit receipts without granting dispatch or retry.
++    pub fn read_external_permit(
++        &self,
++        permit_id: &CurrentPermitId,
++        binding: &recursive_agent_policy::PermitBindingV1,
++        preflight_receipt_digest: Option<&recursive_agent_contracts::ContentDigest>,
++    ) -> Result<recursive_agent_policy::ExternalPermitReadbackV1, RuntimeServiceError> {
++        let root = std::fs::File::open(self.dependencies.output_root())?;
++        let permits = DurablePermitStore::from_dir_fd(&root)?;
++        Ok(permits.read_external_permit(permit_id, binding, preflight_receipt_digest)?)
+     }
+ 
+     /// Persist a bounded executor-reported outcome bound to a consumed
