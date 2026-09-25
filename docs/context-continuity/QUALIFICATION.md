@@ -25,13 +25,18 @@ the pinned real Governor binary. Native daemon compilation and Rust formatting
 passed. The local daemon link lacks libseccomp development files, and Unix socket
 binding is unavailable in this workspace. Hosted qualification therefore runs
 the exact paired daemon, including a real signed scope, rollover, restart,
-approval route, disposable file effect and native outcome receipt. That current
-hosted result is pending until recorded below; the previous native candidate's
-successful run is not evidence for later edits.
+approval route, disposable file effect and native outcome receipt. The `7e243e2` hosted run `36173940893` passed both the paired-daemon
+job `108199879563` and the complete focused job `108199879876`. Native PR20
+run `36173563708` also passed its workspace and relocated-root gates. The
+following portability correction still requires exact-head hosted confirmation.
 
 The native companion is recursive-agent PR20, commit `2297e944`, tree
 `a0269beec181dd24e3af5a3255db857444c19f34`. Operator commands and preserved stopped
 recovery cases are documented in [NATIVE_OPERATIONS.md](NATIVE_OPERATIONS.md).
+The full CI Windows lane found eager optional-runtime imports loading `fcntl`
+during ordinary SessionDB import. Public Ares exports now load on demand with
+the same symbol/module mapping. The targeted correction passed 55 tests;
+independent review reproduced the no-fcntl import and checked every export.
 No live profile is enrolled. Unqualified external-effect owners and consumed
 obligations without independent dispositions fail closed; reported success is
 not task completion. Full V4 acceptance and installed-route/endurance claims are

@@ -1,0 +1,53 @@
+{
+  "schema": "AresContinuityMergeReviewV1",
+  "operator_merge_authorized": true,
+  "live_activation_authorized": false,
+  "native_commit": "2297e9444922ff0aef1eb21358084dbfe3e13ec4",
+  "integration_commit": "7e243e2a53e81657a7090fd1d3ca40647861599c",
+  "native_paired_ci": 36173563708,
+  "ares_paired_qualification": 36173940893,
+  "independent_review": {
+    "binding_dispatch_controls": {
+      "passed": 35,
+      "blockers": []
+    },
+    "portability_import_boundary": {
+      "passed": 1,
+      "exports": "same public symbols and owners; all resolved",
+      "blockers": []
+    }
+  },
+  "local_gates": {
+    "governor_continuity": {
+      "passed": 328,
+      "files": 23
+    },
+    "routing_binding_live": {
+      "passed": 36,
+      "files": 3
+    },
+    "portability_dispatch": {
+      "passed": 55,
+      "files": 4
+    }
+  },
+  "portability_correction_hosted": "pending_exact_head",
+  "remaining_live_evidence": [
+    "installed-route canary",
+    "real Desktop approval UX",
+    "real-workload receipts",
+    "endurance"
+  ],
+  "preserved_recovery_stops": [
+    "consumed effects without independently qualified dispositions",
+    "prepublication ambiguity after native retirement",
+    "unqualified external effect owners"
+  ],
+  "full_v4_qualification_claimed": false,
+  "sources": {
+    "ares_runtime/__init__.py": "a38bb06ac8a4ffc9eb631d1187c2d9022539b1938af6b8fbe88723b1a28d5514",
+    "ares_runtime/continuity/runtime.py": "15d6b052465013be6b178bdf78382b109475a008d32e1b3a18f78a3344468ef7",
+    "ares_runtime/collaboration.py": "83df65b68b4f1c20bfac759471d39f93f2e30b7546555a8c75ee5870a2d822a8",
+    "hermes_state_context_authority.py": "3dc8319197ab04fcc92c728c87e0704d6a0843a371ca80230972bad125210c85"
+  }
+}
