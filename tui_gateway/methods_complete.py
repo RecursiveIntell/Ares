@@ -477,7 +477,7 @@ def _(rid, params: dict) -> dict:
         # is spawned, IT owns the live provider/model/base_url. Empty
         # agent attributes must NOT clobber disk config (with_overrides
         # is truthy-only).
-        ctx = _model_picker_context(agent)
+        ctx = _model_picker_context(agent, session)
         payload = build_model_options_payload(
             ctx,
             explicit_only=bool(params.get("explicit_only")),

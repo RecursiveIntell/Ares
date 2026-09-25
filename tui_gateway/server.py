@@ -5896,24 +5896,27 @@ def _apply_model_switch(
         current_base_url = getattr(agent, "base_url", "") or ""
         current_api_key = getattr(agent, "api_key", "") or ""
     else:
-        current_model = _resolve_model()
+        selected_override = session.get("model_override")
+        if not isinstance(selected_override, dict):
+            selected_override = {}
+        current_model = str(selected_override.get("model") or _resolve_model())
         current_provider = explicit_provider.strip()
         current_base_url = ""
         current_api_key = ""
         if not explicit_provider:
-            runtime = resolve_runtime_provider(requested=None)
-            current_provider = str(runtime.get("provider", "") or "")
-            current_base_url = str(runtime.get("base_url", "") or "")
-            # Preserve a callable api_key (Azure Foundry Entra ID bearer
-            # provider) unchanged — ``str(...)`` would produce
-            # ``"<function ...>"`` and poison downstream switch_model
-            # validation. Match the agent-present branch's behavior at the
-            # top of this block.
-            _runtime_key = runtime.get("api_key", "")
-            if callable(_runtime_key) and not isinstance(_runtime_key, str):
-                current_api_key = _runtime_key
+            if selected_override.get("provider"):
+                # A cold-resumed session's saved selection outranks this
+                # process's profile default when the user omits --provider.
+                current_provider = str(selected_override["provider"])
+                current_base_url = str(selected_override.get("base_url") or "")
+                current_api_key = selected_override.get("api_key") or ""
             else:
-                current_api_key = str(_runtime_key or "")
+                runtime = resolve_runtime_provider(requested=None)
+                current_provider = str(runtime.get("provider", "") or "")
+                current_base_url = str(runtime.get("base_url", "") or "")
+                # Preserve callable Azure Foundry token providers unchanged.
+                _runtime_key = runtime.get("api_key", "")
+                current_api_key = _runtime_key if callable(_runtime_key) and not isinstance(_runtime_key, str) else str(_runtime_key or "")
 
     # Load user-defined providers so switch_model can resolve named custom
     # endpoints (e.g. "ollama-launch") and validate against saved model lists.
@@ -7004,6 +7007,13 @@ def _session_info(agent, session: dict | None = None) -> dict:
     pending_switch = (session or {}).get("pending_model_switch") or {}
     pending_model = str(pending_switch.get("display_model") or "").strip()
     pending_provider = str(pending_switch.get("display_provider") or "").strip()
+    prehost_override = {}
+    if session is not None and _session_uses_compute_host(session) and not session.get("_compute_host_active"):
+        selected = session.get("model_override")
+        if isinstance(selected, dict):
+            # The host has not built an agent yet; a prewarmed parent agent
+            # and old host mirror cannot describe the next turn's model.
+            prehost_override = selected
     # Epoch seconds the current turn started, or None when idle. Lets the
     # desktop preserve the turn-elapsed timer across session switches (cold
     # resume path) instead of resetting it to 0:00.
@@ -7015,8 +7025,8 @@ def _session_info(agent, session: dict | None = None) -> dict:
     )
 
     info: dict = {
-        "model": pending_model or mirror.get("model", getattr(agent, "model", "")),
-        "provider": pending_provider
+        "model": pending_model or prehost_override.get("model") or mirror.get("model", getattr(agent, "model", "")),
+        "provider": pending_provider or prehost_override.get("provider")
         or mirror.get("provider", getattr(agent, "provider", "")),
         "reasoning_effort": reasoning_effort,
         "service_tier": service_tier,
@@ -13439,8 +13449,40 @@ def _(rid, params: dict) -> dict:
         try:
             if not value:
                 return _err(rid, 4002, "model value required")
+            # An explicit runtime target must never fall through to a global
+            # model write when that runtime was reaped or routed elsewhere.
+            if params.get("session_id") and session is None:
+                return _err(rid, 4001, "session not found")
             if session is not None and _session_uses_compute_host(session):
                 sid = str(params.get("session_id") or "")
+                if not session.get("_compute_host_active"):
+                    # A cold resume is host-routed for its first TURN, but the
+                    # child does not own this SID until turn.start. Do not send
+                    # a model control to a child that cannot yet receive it.
+                    # The same lock serializes the pick with turn admission.
+                    with session["history_lock"]:
+                        if _sessions.get(sid) is not session:
+                            return _err(rid, 5032, "session owner changed before model selection")
+                        if (session.get("_compute_host_active") or session.get("running")
+                            or session.get("_compute_host_active_request_id")
+                            or session.get("_host_admission_pending") or session.get("_host_delivery_uncertain")
+                            or session.get("_queued_delivery_uncertain") or session.get("_stop_pending")
+                            or session.get("_stop_uncertain") or session.get("_stop_settlement_failed")
+                            or session.get("_active_goal_id") or session.get("_turn_goal_id")
+                            or session.get("queued_prompt") or session.get("queued_prompts")):
+                            return _err(rid, 5032, "host turn admission or queued work in progress; model not changed")
+                        # A prewarmed parent agent is not the host owner. Run
+                        # validation against a detached record and commit only
+                        # the confirmed override to this exact session.
+                        staging = {"agent": None, "session_key": session.get("session_key"),
+                                   "model_override": dict(session.get("model_override") or {})}
+                        result = _apply_model_switch(
+                            sid, staging, value,
+                            confirm_expensive_model=bool(params.get("confirm_expensive_model", False)),
+                        )
+                        if not result.get("confirm_required") and staging.get("model_override"):
+                            session["model_override"] = staging["model_override"]
+                    return _ok(rid, {"key": key, **result})
                 host_params = {"key": "model", "value": value}
                 if params.get("confirm_expensive_model"):
                     host_params["confirm_expensive_model"] = True
@@ -15378,13 +15420,19 @@ def _details_completions(text: str) -> list[dict] | None:
     return []
 
 
-def _model_picker_context(agent):
-    """Layer live session state onto config without losing custom identity."""
+def _model_picker_context(agent, session: dict | None = None):
+    """Layer the owning session's selection onto config without losing custom identity."""
     from hermes_cli.inventory import load_picker_context
 
     ctx = load_picker_context()
-    provider = getattr(agent, "provider", "") if agent else ""
-    base_url = getattr(agent, "base_url", "") if agent else ""
+    selected = {}
+    if session is not None and _session_uses_compute_host(session) and not session.get("_compute_host_active"):
+        override = session.get("model_override")
+        if isinstance(override, dict):
+            selected = override
+    provider = selected.get("provider") or (getattr(agent, "provider", "") if agent else "")
+    model = selected.get("model") or (getattr(agent, "model", "") if agent else "")
+    base_url = selected.get("base_url") if selected else (getattr(agent, "base_url", "") if agent else "")
     if str(provider or "").strip().lower() == "custom":
         try:
             from hermes_cli.runtime_provider import canonical_custom_identity
@@ -15393,8 +15441,7 @@ def _model_picker_context(agent):
                 canonical_custom_identity(
                     base_url=base_url or None,
                     config_provider=ctx.current_provider,
-                    model=(getattr(agent, "model", "") if agent else "")
-                    or None,
+                    model=model or None,
                 )
                 or provider
             )
@@ -15404,12 +15451,19 @@ def _model_picker_context(agent):
                 exc_info=True,
             )
 
-    return ctx.with_overrides(
+    picked = ctx.with_overrides(
         current_provider=provider,
-        current_model=(getattr(agent, "model", "") if agent else "")
-        or _resolve_model(),
+        current_model=model or _resolve_model(),
         current_base_url=base_url,
     )
+    if selected:
+        # ConfigContext.with_overrides is truthy-only: an empty URL is an
+        # intentional session selection, not permission to inherit a stale
+        # parent-agent or profile URL from another provider.
+        from dataclasses import replace
+
+        return replace(picked, current_base_url=str(base_url or ""))
+    return picked
 
 
 # ── Methods: slash.exec ──────────────────────────────────────────────
