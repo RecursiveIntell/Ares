@@ -1605,6 +1605,12 @@ def _build_gateway_agent_history(
 
         content = msg.get("content")
         if separate_observed_context and msg.get("observed") and role == "user" and content:
+            # Observed group rows become API-only context before the ordinary
+            # user replay filter. Apply the same synthetic-note rule here first
+            # so a timestamp cannot hide the prefix or replay a prior request.
+            content = _strip_auto_continue_noise(content)
+            if not content:
+                continue
             if inject_timestamps and isinstance(content, str):
                 content = _render_msg_ts(content, msg.get("timestamp"), tz=_msg_tz)
             observed_group_context.append(str(content).strip())
