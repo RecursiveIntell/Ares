@@ -4365,6 +4365,32 @@ def run_conversation(
                         getattr(agent.context_compressor, "threshold_tokens", 0)
                         or 0
                     )
+                    # A physical context epoch earns a fresh rebase budget only
+                    # after the provider proves the rebuilt request is healthy.
+                    # Session rotation/publication alone never clears the
+                    # conversation-level no-progress counter.
+                    if (
+                        getattr(agent, "context_rebase_enabled", False)
+                        and prompt_tokens > 0
+                        and _compression_threshold > 0
+                        and prompt_tokens < _compression_threshold
+                    ):
+                        _continuity_db = getattr(agent, "_session_db", None)
+                        if _continuity_db is not None:
+                            try:
+                                _episode = _continuity_db.read_context_rebase_episode(
+                                    agent.session_id
+                                )
+                                if _episode.attempts_without_recovery > 0:
+                                    _continuity_db.reset_context_rebase_episode(
+                                        agent.session_id
+                                    )
+                            except Exception:
+                                logger.warning(
+                                    "Could not record provider-confirmed context "
+                                    "rebase recovery; preserving no-progress budget",
+                                    exc_info=True,
+                                )
                     if _should_rearm_compression_budget(
                         compression_attempts,
                         completed_compaction_pending=_completed_compaction_pending,
