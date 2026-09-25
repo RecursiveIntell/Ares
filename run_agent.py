@@ -8586,6 +8586,7 @@ class AIAgent:
         moa_config: Optional[dict[str, Any]] = None,
         persist_user_event_id: Optional[str] = None,
         persist_user_input_receipt: Optional[Any] = None,
+        persist_user_input_authorizer: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         # A review deliberately shares this agent's session_id for prompt-cache
@@ -8839,6 +8840,9 @@ class AIAgent:
                 # the same SQLite write transaction as the transcript insert.
                 durable_turn_lease = _durable_holder
                 self._context_input_receipt = input_receipt
+                self._context_input_authorizer = persist_user_input_authorizer
+                self._context_input_phase = None
+                self._context_input_existing_message = None
                 from agent.run_checkpoint_custody import TurnRunCustody
                 turn_run_custody = getattr(self, "_run_checkpoint_custody", None)
                 if turn_run_custody is None:
@@ -9068,6 +9072,8 @@ class AIAgent:
         finally:
             if durable_turn_lease is not None:
                 self._context_input_receipt = None
+                self._context_input_authorizer = None
+                self._context_input_existing_message = None
             try:
                 if relay_turn is not None:
                     relay_runtime.SESSION_COORDINATOR.end_turn(
@@ -9092,6 +9098,13 @@ class AIAgent:
                     # late interrupt does not survive into the next turn.
                     _clear_durable_turn_lease_interrupt()
                     if durable_turn_lease is not None:
+                        if input_receipt is not None:
+                            try:
+                                _turn_db.release_context_input_turn(self.session_id,
+                                    turn_lease_holder=durable_turn_lease)
+                            except Exception:
+                                logger.error("Input execution release requires native reconciliation", exc_info=True)
+                        self._context_input_phase = None
                         if turn_run_custody is not None:
                             try:
                                 cleanup_errors = turn_run_custody.finish_turn(durable_turn_lease)

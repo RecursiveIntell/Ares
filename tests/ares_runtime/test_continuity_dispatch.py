@@ -400,6 +400,10 @@ def test_partial_failed_stream_is_discarded_before_qualified_retry(durable_agent
     assert result["final_response"] == "Accepted response"
     assert any(row["content"] == "Accepted response" for row in db.get_messages_as_conversation(agent.session_id))
     assert all("Unaccepted partial text" not in str(row) for row in db.get_messages_as_conversation(agent.session_id))
+    import json
+    settlements = [json.loads(raw) for _, raw in db.list_meta_prefix("context-dispatch-result:")]
+    assert {r["disposition"] for r in settlements} == {"response_discarded", "response_received"}
+    assert db.read_context_input_work(agent.session_id)["phase"]["state"] == "answered"
 
 
 def test_buffered_tool_stream_observer_failure_does_not_retry(durable_agent):

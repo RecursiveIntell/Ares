@@ -726,6 +726,10 @@ def build_turn_context(
     # CLI input is stamped when staged. Gateway input may carry the platform
     # event time. Preserve either value and cover any legacy unstamped handoff.
     stamp_message_timestamp(user_msg, timestamp=persist_user_timestamp)
+    existing_input = getattr(agent, "_context_input_existing_message", None)
+    if existing_input is not None:
+        user_msg = dict(existing_input)
+        user_msg["content"] = user_msg.get("api_content") or user_msg["content"]
 
     # Owner selection must also replace stale local state and explicit empty
     # state on history-free restarts. Legacy fallback stays inside hydration.

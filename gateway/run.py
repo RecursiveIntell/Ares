@@ -6982,6 +6982,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # secondary profiles do (#64674). Explicit config= injection (tests)
         # is left untouched.
         self.config = config if config is not None else load_gateway_config_for_runner()
+        self._context_primary_home = Path(get_hermes_home())
         # Mark the process as a profile multiplexer when configured. This flips
         # agent.secret_scope.get_secret() to fail-closed on any unscoped
         # credential read, so a missed migration crashes loudly instead of
@@ -12493,6 +12494,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         agent is already running are skipped regardless, so a session
         scheduled at startup is never resumed a second time.
         """
+        from gateway.context_input_recovery import schedule_input_recovery
+        native_scheduled, native_keys = schedule_input_recovery(self, platform)
         window = _auto_continue_freshness_window()
         try:
             with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
@@ -12500,6 +12503,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 candidates = [
                     entry for entry in self.session_store._entries.values()  # noqa: SLF001
                     if entry.resume_pending
+                    and entry.session_key not in native_keys
                     and not entry.suspended
                     and entry.origin is not None
                     and entry.resume_reason in self._AUTO_RESUME_REASONS
@@ -12507,7 +12511,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ]
         except Exception as exc:
             logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
-            return 0
+            return native_scheduled
 
         # Defense-3 (#30719): break the SIGTERM-respawn loop. Only count this
         # boot when there are restart-interrupted sessions to resume — a clean
@@ -12527,12 +12531,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _rlg.check_and_record(
                     _max_restarts, _window, max_gap_seconds=_max_gap
                 ):
-                    return 0
+                    return native_scheduled
             except Exception as exc:  # noqa: BLE001 — breaker must fail OPEN
                 logger.debug("Restart-loop guard check skipped: %s", exc)
 
         now = datetime.now()
-        scheduled = 0
+        scheduled = native_scheduled
         for entry in candidates:
             marker = entry.last_resume_marked_at or entry.updated_at
             if marker is not None and (now - marker).total_seconds() > window:
@@ -16310,6 +16314,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _primary_message_handler(self, *, handler=None):
         """Return the correctly scoped handler for a primary adapter."""
+        if getattr(self, "_context_primary_home", None) is None:
+            self._context_primary_home = Path(get_hermes_home())
         if getattr(self.config, "multiplex_profiles", False):
             return self._make_default_profile_message_handler(handler=handler)
         return handler or self._handle_message
@@ -22508,6 +22514,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     goal_blocks_loop_tick,
                     list_active_loops,
                 )
+                from gateway.context_input_recovery import schedule_input_recovery
+                schedule_input_recovery(self)
 
                 # Warm the cache off-loop once per scan. The scan reads
                 # every persisted loop, so a cold cache runs the state.db

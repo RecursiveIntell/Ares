@@ -11805,6 +11805,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                     "UPDATE sessions SET message_count = message_count + ? WHERE id = ?",
                     (inserted, session_id),
                 )
+            self._complete_input_response_batch_on_conn(conn, session_id, turn_lease_holder, messages, row_ids)
             return inserted, row_ids
 
         # Same criticality as append_message: this IS the turn's transcript.

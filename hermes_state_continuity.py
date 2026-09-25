@@ -993,6 +993,7 @@ class SessionContextContinuityMixin:
                       "action_control_digest": snapshot.action_control_digest,
                       "input_watermark": snapshot.input_watermark, "admitted_at": time.time()}
             conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?)", (key, _canonical(record)))
+            self._bind_input_turn_dispatch_on_conn(conn, session_id, turn_lease_holder, attempt_id)
             return record
         return self._execute_write(write)
 
@@ -1025,6 +1026,32 @@ class SessionContextContinuityMixin:
         reason = self._execute_write(write)
         if reason is not None:
             raise ContextContinuationError(reason)
+
+    def record_context_dispatch_discard(self, attempt_id, *, turn_lease_holder):
+        """Record a raised provider call whose buffered output was discarded.
+
+        This closes local response consumption, not billing or remote effects.
+        It is never evidence that the request was unsent and never permits a
+        cold replay of an unfinished input phase.
+        """
+        _identity(attempt_id, "INVALID_DISPATCH_ATTEMPT")
+        def write(conn):
+            row = conn.execute("SELECT value FROM state_meta WHERE key=?", ("context-dispatch:" + attempt_id,)).fetchone()
+            if row is None:
+                raise ContextContinuationError("CONTEXT_DISPATCH_NOT_ADMITTED")
+            admitted = _strict_json(row[0])
+            self._assert_context_rebase_lease_on_conn(conn, admitted["session_id"], turn_lease_holder)
+            key = "context-dispatch-result:" + attempt_id
+            prior = conn.execute("SELECT value FROM state_meta WHERE key=?", (key,)).fetchone()
+            if prior is not None:
+                if _strict_json(prior[0]).get("disposition") != "response_discarded":
+                    raise ContextContinuationError("CONTEXT_DISPATCH_RESPONSE_ALREADY_SETTLED")
+                return
+            record = {"schema": "SessionDBContextDispatchResultV1", "attempt_id": attempt_id,
+                "payload_digest": admitted["payload_digest"], "settled_at": time.time(),
+                "disposition": "response_discarded", "reason": "provider_call_raised"}
+            conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?)", (key, _canonical(record)))
+        self._execute_write(write)
 
     def assert_context_dispatch_current(self, attempt_id, *, turn_lease_holder):
         """Fence each buffered response delivery against the admitted source."""

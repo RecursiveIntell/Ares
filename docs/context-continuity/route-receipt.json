@@ -100,6 +100,15 @@
         "docs/context-continuity/gateway-input-audit-verdict.json"
       ],
       "receipt": "2720 local and 114 independent tests passed; all 20 reproduced hosted compatibility failures closed locally; full V4 incomplete."
+    },
+    {
+      "id": "cold-input@post",
+      "status": "passed",
+      "evidence": [
+        "docs/context-continuity/cold-input-evidence.json",
+        "docs/context-continuity/cold-input-audit-verdict.json"
+      ],
+      "receipt": "2765 local tests and 136 independent audit tests passed; full V4 remains incomplete."
     }
   ],
   "mutations": [
@@ -122,17 +131,17 @@
     "Installed selected subscription-route tuple and live qualification are unavailable in this workspace."
   ],
   "remaining_delta": [
-    "Remaining ingress/control routes, durable wake and task completion ownership",
-    "Existing controller autonomous wake scheduling",
+    "Remaining ingress/control and current role/upstream actor verification",
+    "Owner-qualified external effect settlement and task completion/progress",
     "Native external effect-owner fence, incarnation and acknowledgement closure",
     "Working source, conditional writes and current policy/retrieval",
-    "Objective progress and shared physical-attempt/recovery limits",
+    "All shared physical-attempt and recovery-unit parent limits",
     "Reader compatibility, backup/rollback qualification",
     "Installed selected-route capability/calibration, subscription canaries and endurance"
   ],
-  "next_gate": "Durable ingress/controller construction, native owner closure and remaining exact-route V4 qualification.",
+  "next_gate": "Native external owner closure, task completion/progress and remaining exact-route V4 qualification.",
   "qualification": "Bounded source repair passed; full V4 program remains incomplete.",
-  "scope": "Cumulative PR80 implementation; latest selected BaseAdapter durable text ingress and provisional-coordinate compatibility",
-  "latest_repair_evidence": "docs/context-continuity/gateway-input-evidence.json",
+  "scope": "Cumulative PR80 implementation; latest selected native cold input recovery and response lifetime",
+  "latest_repair_evidence": "docs/context-continuity/cold-input-evidence.json",
   "latest_repair_audit": "pass_bounded"
 }

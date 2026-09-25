@@ -14,6 +14,7 @@ import time
 
 from agent.context_compressor import user_originated_turn_view
 from hermes_state_continuity import ContextContinuationError, _canonical, _identity, _strict_json
+from hermes_state_input_turns import SessionContextInputTurnsMixin
 
 
 def _hash(value):
@@ -26,6 +27,47 @@ def _prefix(root):
 
 def _event_key(root, sequence):
     return f"{_prefix(root)}:event:{sequence}"
+
+
+_GATEWAY_ROUTE_FIELDS = frozenset({"platform", "chat_id", "chat_type", "user_id", "user_id_alt",
+    "chat_id_alt", "thread_id", "scope_id", "parent_chat_id", "prospective_thread_id", "profile", "is_bot"})
+
+
+def _transport_identity(value):
+    # Platform IDs are opaque (negative Telegram chat IDs, Matrix @users,
+    # email addresses, URL-like thread IDs). They are not native owner IDs.
+    if (type(value) is not str or not value or len(value) > 2048
+            or any(ord(char) < 32 for char in value)):
+        raise ContextContinuationError("CONTEXT_INPUT_ORIGIN_INVALID")
+
+
+def _gateway_origin(value):
+    """Closed transport evidence, not a serialized authorization decision."""
+    if (type(value) is not dict or set(value) != {"schema", "session_key", "route", "transport_profile",
+            "transport_fingerprint", "cold_recoverable", "routed_profile"}
+            or value["schema"] != "SessionDBGatewayInputOriginV1"
+            or type(value["route"]) is not dict or set(value["route"]) != _GATEWAY_ROUTE_FIELDS
+            or type(value["cold_recoverable"]) is not bool):
+        raise ContextContinuationError("CONTEXT_INPUT_ORIGIN_INVALID")
+    _transport_identity(value["session_key"])
+    _identity(value["transport_profile"], "CONTEXT_INPUT_ORIGIN_INVALID")
+    if value["routed_profile"] is not None:
+        _identity(value["routed_profile"], "CONTEXT_INPUT_ORIGIN_INVALID")
+    route = value["route"]
+    for key in ("platform", "chat_type"):
+        _identity(route[key], "CONTEXT_INPUT_ORIGIN_INVALID")
+    _transport_identity(route["chat_id"])
+    if type(route["is_bot"]) is not bool:
+        raise ContextContinuationError("CONTEXT_INPUT_ORIGIN_INVALID")
+    for key in _GATEWAY_ROUTE_FIELDS - {"platform", "chat_id", "chat_type", "is_bot"}:
+        if route[key] is not None:
+            _transport_identity(route[key])
+    fingerprint = value["transport_fingerprint"]
+    if fingerprint is not None and (type(fingerprint) is not str or re.fullmatch(r"[0-9a-f]{16}", fingerprint) is None):
+        raise ContextContinuationError("CONTEXT_INPUT_ORIGIN_INVALID")
+    if value["cold_recoverable"] and (fingerprint is None or not route["user_id"]):
+        raise ContextContinuationError("CONTEXT_INPUT_ORIGIN_INVALID")
+    return value
 
 
 @dataclass(frozen=True)
@@ -80,7 +122,7 @@ def context_input_turn_lease_scope(db, holder):
         _compaction_input_lease.reset(token)
 
 
-class SessionContextInboxMixin:
+class SessionContextInboxMixin(SessionContextInputTurnsMixin):
     def _normalize_compacted_context_messages_on_conn(self, conn, source_session, messages):
         """Keep accepted input clean and preserve its exact API-only sidecar."""
         projected = []
@@ -181,7 +223,7 @@ class SessionContextInboxMixin:
         return receipt
 
     def accept_context_input(self, session_id, *, source, event_id, content,
-                              timestamp=None, display_metadata=None):
+                              timestamp=None, display_metadata=None, gateway_origin=None):
         """Persist one authentic event before acknowledging its acceptance.
 
         The transport supplies a stable event identity. Same-ID changed payloads
@@ -205,6 +247,9 @@ class SessionContextInboxMixin:
         # Freeze the caller's mutable input before entering native admission.
         payload = _strict_json(raw_payload)
         digest = _hash(payload)
+        origin = None if gateway_origin is None else _gateway_origin(_strict_json(_canonical(gateway_origin)))
+        if origin is not None and origin["route"]["platform"] != source:
+            raise ContextContinuationError("CONTEXT_INPUT_ORIGIN_INVALID")
 
         def write(conn):
             root, profile = self._context_input_scope_on_conn(conn, session_id)
@@ -224,6 +269,10 @@ class SessionContextInboxMixin:
                 if (receipt.profile_name != profile or receipt.source != source or receipt.event_id != event_id
                         or receipt.payload_digest != digest or receipt.sequence > head["accepted_sequence"]):
                     raise ContextContinuationError("CONTEXT_INPUT_RECORD_INVALID")
+                if self._context_input_origin_on_conn(conn, receipt) != origin:
+                    # Neither missing evidence nor a new transport can be
+                    # backfilled onto an already accepted occurrence.
+                    raise ContextContinuationError("CONTEXT_INPUT_ORIGIN_COLLISION")
                 return receipt
             if head["accepted_sequence"] - head["projected_sequence"] >= 128:
                 raise ContextContinuationError("CONTEXT_INPUT_PENDING_LIMIT")
@@ -234,6 +283,11 @@ class SessionContextInboxMixin:
             raw = _canonical(asdict(receipt))
             ContextInputReceipt.from_raw(raw)
             conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?)", (_event_key(root, sequence), raw))
+            if origin is not None:
+                bound_origin = {"schema": "SessionDBContextInputOriginV1", "conversation_root": root,
+                    "profile_name": profile, "sequence": sequence, "payload_digest": digest, "origin": origin}
+                conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?)",
+                    (_event_key(root, sequence) + ":origin", _canonical(bound_origin)))
             conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?)",
                 (dedup, _canonical({"sequence": sequence, "payload_digest": digest})))
             head["accepted_sequence"] = sequence
@@ -241,6 +295,39 @@ class SessionContextInboxMixin:
                          (_prefix(root) + ":head", _canonical(head)))
             return receipt
         return self._execute_write(write)
+
+    def _context_input_origin_on_conn(self, conn, receipt):
+        row = conn.execute("SELECT value FROM state_meta WHERE key=?",
+            (_event_key(receipt.conversation_root, receipt.sequence) + ":origin",)).fetchone()
+        if row is None:
+            return None
+        value = _strict_json(row[0])
+        if (set(value) != {"schema", "conversation_root", "profile_name", "sequence", "payload_digest", "origin"}
+                or value["schema"] != "SessionDBContextInputOriginV1"
+                or value["conversation_root"] != receipt.conversation_root or value["profile_name"] != receipt.profile_name
+                or type(value["sequence"]) is not int or value["sequence"] != receipt.sequence
+                or value["payload_digest"] != receipt.payload_digest):
+            raise ContextContinuationError("CONTEXT_INPUT_ORIGIN_INVALID")
+        origin = _gateway_origin(value["origin"])
+        if origin["route"]["platform"] != receipt.source:
+            raise ContextContinuationError("CONTEXT_INPUT_ORIGIN_INVALID")
+        return origin
+
+    def read_context_input_origin(self, session_id, receipt):
+        """Read immutable actor/transport evidence; never restore auth flags."""
+        if type(receipt) is not ContextInputReceipt:
+            raise ContextContinuationError("CONTEXT_INPUT_RECORD_INVALID")
+        with self._read_ctx() as conn:
+            conn.execute("SAVEPOINT context_input_origin")
+            try:
+                if self._context_input_scope_on_conn(conn, session_id) != (receipt.conversation_root, receipt.profile_name):
+                    raise ContextContinuationError("CONTEXT_INPUT_SCOPE_MISMATCH")
+                if self._read_context_input_on_conn(conn, receipt.conversation_root, receipt.sequence) != receipt:
+                    raise ContextContinuationError("CONTEXT_INPUT_RECORD_INVALID")
+                return self._context_input_origin_on_conn(conn, receipt)
+            finally:
+                conn.execute("ROLLBACK TO context_input_origin")
+                conn.execute("RELEASE context_input_origin")
 
     def read_context_input(self, session_id, *, source, event_id):
         """Read the accepted receipt, never turn/effect authority."""

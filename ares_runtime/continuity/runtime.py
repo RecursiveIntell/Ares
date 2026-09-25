@@ -165,6 +165,8 @@ def admit_final_context_dispatch(agent, snapshot, payload, *, attempt_id,
         if getattr(agent, "_interrupt_requested", False) or getattr(agent, "_pending_redirect", None):
             raise ContextDispatchError("CONTEXT_DISPATCH_INTERRUPTED")
         try:
+            from agent.context_input import validate_turn_input_authority
+            validate_turn_input_authority(agent)
             return agent._session_db.admit_context_dispatch(
                 agent.session_id,
                 turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
@@ -175,10 +177,27 @@ def admit_final_context_dispatch(agent, snapshot, payload, *, attempt_id,
             raise ContextDispatchError(getattr(exc, "code", "CONTEXT_DISPATCH_OWNER_UNAVAILABLE")) from None
 
 
+@contextmanager
+def context_provider_response_scope(agent, admission):
+    """A raised call discards response bytes; its physical attempt stays spent."""
+    try:
+        yield
+    except Exception:
+        if admission is not None:
+            try:
+                agent._session_db.record_context_dispatch_discard(admission["attempt_id"],
+                    turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None))
+            except Exception as exc:
+                raise ContextDispatchError(getattr(exc, "code", "CONTEXT_DISPATCH_SETTLEMENT_UNKNOWN")) from None
+        raise
+
+
 def settle_final_context_dispatch(agent, admission):
     if admission is None:
         return
     try:
+        from agent.context_input import validate_turn_input_authority
+        validate_turn_input_authority(agent)
         agent._session_db.settle_context_dispatch_response(
             admission["attempt_id"],
             turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
@@ -224,6 +243,8 @@ def assert_context_tool_control_current(*, session_id=None):
             raise ContextDispatchError("CONTEXT_DISPATCH_INTERRUPTED")
         if not attempt_id or (session_id and session_id != bound_session):
             raise ContextDispatchError("CONTEXT_TOOL_RESPONSE_NOT_ADMITTED")
+        from agent.context_input import validate_turn_input_authority
+        validate_turn_input_authority(agent)
         db.assert_context_dispatch_control_current(
             attempt_id, session_id=bound_session, turn_lease_holder=holder,
         )
@@ -286,6 +307,8 @@ class ContextDispatchStreamBuffer:
             raise ContextDispatchError("CONTEXT_DISPATCH_STREAM_BUFFER_EXHAUSTED")
         for callback, args, kwargs in self.events:
             try:
+                from agent.context_input import validate_turn_input_authority
+                validate_turn_input_authority(self.agent)
                 self.agent._session_db.assert_context_dispatch_current(
                     self.admission["attempt_id"],
                     turn_lease_holder=getattr(self.agent, "_active_session_turn_lease_holder", None),

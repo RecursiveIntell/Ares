@@ -291,7 +291,9 @@ def test_parked_successor_input_projects_once_across_retry_and_recovery(agent, t
         with patch.object(agent.context_compressor, "on_session_start", side_effect=RuntimeError("unavailable"), create=True):
             with pytest.raises(AutomaticRebaseError, match="CONTEXT_ENGINE_REBIND_FAILED"):
                 agent.run_conversation("Park this correction", persist_user_event_id="parked")
-            with pytest.raises(ContextContinuationError, match="ALREADY_PROJECTED"):
+            # A native unfinished phase with no admitted request may retry
+            # its owner recovery without creating a second user occurrence.
+            with pytest.raises(AutomaticRebaseError, match="CONTEXT_ENGINE_REBIND_FAILED"):
                 agent.run_conversation("Park this correction", persist_user_event_id="parked")
         agent.client.chat.completions.create.assert_not_called()
         agent.client.chat.completions.create.return_value = _mock_response(content="Continued", finish_reason="stop")

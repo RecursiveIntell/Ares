@@ -4,6 +4,42 @@ The V4 packet dated 2026-09-23 remains the full acceptance contract. This is
 an implementation branch. Qualification is tied to source hashes and named
 oracles; passing unit tests does not qualify a selected provider route.
 
+## Native cold input recovery and response lifetime
+
+Accepted gateway input now carries immutable actor, route and transport-owner
+provenance in the same native transaction. The existing startup/reconnect and
+periodic controller can discover it without a new message. Current authorization
+covers every actor in the drained batch, including the request, response, buffered
+delivery and tool boundaries. Restored role/upstream trust flags are never used.
+
+The native input phase distinguishes projection, admitted execution and a
+successfully persisted response. Construction/recovery attempts retain fixed
+budgets across lease changes and new arrivals. A living controller cannot be
+replaced merely because its lease expired. Projected input with no admitted
+request can recover without another authentic transcript occurrence; admitted
+unfinished execution remains parked. Observed failed calls retain spent request
+records even when their buffered response bytes are discarded.
+
+Normal final text and its native response receipt commit together. Completion
+binds the last admitted request and a later, exact active assistant tail; lost
+publication acknowledgements use readback. A response receipt does not assert
+that the user's task or its external effects are complete. A completed phase
+also does not block separately owned synthetic work.
+
+The frozen local gate passed 2,765 tests across 86 files with five existing skips;
+independent review passed 136 tests. See `cold-input-evidence.json`, the source
+hash manifest, raw logs and audit verdict. The five hosted quick-command fixture
+failures on `120baddb` are reproduced and fixed using real events. Package replay
+includes the new native module. Focused qualification, Nix and Docker passed on
+that base; candidate hosted checks follow publication.
+
+This qualifies selected stateless text recovery only. Missing legacy provenance,
+tokenless cold transport identity and pending control ownership remain parked.
+Selected role/upstream-authorized routes refuse before enrollment until current
+actor verification is available. Other ingress, owner-qualified effect/task
+settlement, all shared parent budgets, workspace/current-policy ownership and
+installed subscription-route canary/endurance remain required for full V4.
+
 ## Selected gateway ingress
 
 The real BaseAdapter now awaits runner-owned native input acceptance before
@@ -26,9 +62,9 @@ on that published base; candidate hosted checks follow publication.
 This scope is stateless text through BaseAdapter. Active pending control replies,
 attachments and non-BaseAdapter transports remain unqualified. Proxy delivery
 refuses a typed native receipt. Invocation-only IDs do not promise redelivery
-deduplication. Cold inbox wake, actor reauthorization for the entire recovered
-batch, and execution/completion ownership remain required. Projection is not
-completion; unknown outcomes cannot authorize replay.
+deduplication. The later native cold-input increment above adds bounded wake,
+whole-batch actor checks and response lifetime. Task completion and effect
+settlement remain separate; unknown outcomes cannot authorize replay.
 
 ## Obligation lifetime and input provenance
 

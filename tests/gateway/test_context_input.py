@@ -33,7 +33,7 @@ def ingress(tmp_path, monkeypatch):
     runner.session_store = SessionStore(tmp_path / "sessions", runner.config)
     db = SessionDB(tmp_path / "ingress.db")
     runner.session_store._db = db
-    runner._is_user_authorized = lambda source: True
+    runner._is_user_authorized = lambda source, **kwargs: True
     runner._recover_telegram_topic_thread_id = lambda source: None
     runner._is_telegram_topic_lane = lambda source: False
     runner._cache_session_source = MagicMock()

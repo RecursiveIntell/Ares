@@ -3362,7 +3362,7 @@ def run_conversation(
                             is_github_responses=agent._is_copilot_url(),
                             sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
-                    from ares_runtime.continuity.runtime import admit_final_context_dispatch
+                    from ares_runtime.continuity.runtime import admit_final_context_dispatch, context_provider_response_scope
 
                     _admission = admit_final_context_dispatch(
                         agent, _context_dispatch_snapshot, next_api_kwargs,
@@ -3374,7 +3374,7 @@ def run_conversation(
                     if _use_streaming:
                         from ares_runtime.continuity.runtime import ContextDispatchStreamBuffer, settle_final_context_dispatch
 
-                        with ContextDispatchStreamBuffer(agent, _admission) as _delivery:
+                        with ContextDispatchStreamBuffer(agent, _admission) as _delivery, context_provider_response_scope(agent, _admission):
                             _response = agent._interruptible_streaming_api_call(
                                 next_api_kwargs, on_first_delta=_stop_spinner
                             )
@@ -3384,26 +3384,27 @@ def run_conversation(
                         return _response
                     from agent import relay_llm
 
-                    _response = relay_llm.execute(
-                        next_api_kwargs,
-                        agent._interruptible_api_call,
-                        session_id=str(agent.session_id or ""),
-                        name=str(agent.provider or "provider"),
-                        model_name=str(agent.model or ""),
-                        metadata={
-                            "api_mode": agent.api_mode,
-                            "api_request_id": api_request_id,
-                            "call_role": (
-                                "delegated"
-                                if getattr(agent, "is_subagent", False)
-                                else "fallback"
-                                if int(getattr(agent, "_fallback_index", 0) or 0) > 0
-                                else "primary"
-                            ),
-                            "retry_count": retry_count,
-                        },
-                        defer_logical_completion=True,
-                    )
+                    with context_provider_response_scope(agent, _admission):
+                        _response = relay_llm.execute(
+                            next_api_kwargs,
+                            agent._interruptible_api_call,
+                            session_id=str(agent.session_id or ""),
+                            name=str(agent.provider or "provider"),
+                            model_name=str(agent.model or ""),
+                            metadata={
+                                "api_mode": agent.api_mode,
+                                "api_request_id": api_request_id,
+                                "call_role": (
+                                    "delegated"
+                                    if getattr(agent, "is_subagent", False)
+                                    else "fallback"
+                                    if int(getattr(agent, "_fallback_index", 0) or 0) > 0
+                                    else "primary"
+                                ),
+                                "retry_count": retry_count,
+                            },
+                            defer_logical_completion=True,
+                        )
                     from ares_runtime.continuity.runtime import settle_final_context_dispatch
 
                     settle_final_context_dispatch(agent, _admission)
@@ -8689,7 +8690,9 @@ def run_conversation(
                 # no side effect follows and _persist_session retries the write.
                 # Full incident narrative: tests/run_agent/test_81641_*.py.
                 try:
-                    agent._flush_messages_to_session_db(messages, conversation_history)
+                    from agent.context_input import turn_input_response_scope
+                    with turn_input_response_scope(agent, messages, successful=not interrupted and not failed):
+                        agent._flush_messages_to_session_db(messages, conversation_history)
                 except Exception:
                     logger.warning(
                         "final text-turn flush failed (session=%s) — reply is "
