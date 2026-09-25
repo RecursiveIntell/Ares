@@ -366,7 +366,7 @@ def test_twelve_runtime_rebases_preserve_requirement_after_each_recovery(tmp_pat
         "_context_epoch"
     ] == 12
     active_goals = []
-    for key, raw in db.list_meta("goal:").items():
+    for key, raw in db.list_meta_prefix("goal:"):
         state = GoalState.from_json(raw)
         if state.status != "cleared":
             active_goals.append((key, state.goal_id))
