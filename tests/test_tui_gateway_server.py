@@ -6945,6 +6945,68 @@ def test_notification_poller_failed_delivery_claim_releases_running(monkeypatch)
         server._sessions.pop("sid-claim-owner", None)
 
 
+def test_notification_poller_shutdown_drain_keeps_background_turn_synthetic(
+    monkeypatch,
+):
+    """Shutdown delivery must not promote a background event to user authority."""
+    import queue as _queue_mod
+    import threading as _threading
+
+    from tools.process_registry import process_registry
+
+    session = _session(session_key="shutdown-owner")
+    event = {
+        "type": "completion",
+        "session_id": "proc-shutdown-typed",
+        "session_key": "shutdown-owner",
+        "command": "echo done",
+        "exit_code": 0,
+        "output": "done",
+    }
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(
+        "tools.process_registry.format_process_notification",
+        lambda _event: "background completion",
+    )
+    dispatched = []
+
+    def _deliver(
+        _rid,
+        _sid,
+        target_session,
+        text,
+        *,
+        display_kind=None,
+        display_metadata=None,
+    ):
+        dispatched.append((text, display_kind, display_metadata))
+        target_session["running"] = False
+
+    monkeypatch.setattr(server, "_run_prompt_submit", _deliver)
+    server._sessions["sid-shutdown-owner"] = session
+    process_registry._completion_consumed.discard(event["session_id"])
+    stop = _threading.Event()
+    stop.set()
+
+    try:
+        server._notification_poller_loop(stop, "sid-shutdown-owner", session)
+
+        assert dispatched == [
+            (
+                "background completion",
+                "internal_notification",
+                {"synthetic_source": "background_notification"},
+            )
+        ]
+        assert isolated_queue.empty()
+    finally:
+        server._sessions.pop("sid-shutdown-owner", None)
+        process_registry._completion_consumed.discard(event["session_id"])
+
+
 def test_completion_ownership_lineage_lookup_failure_fails_closed(monkeypatch):
     """A provenance lookup failure cannot turn an addressed event into ours."""
     import queue as _queue_mod
