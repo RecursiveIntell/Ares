@@ -2,10 +2,10 @@
   "schema": "ares.native-owner-patch/v1",
   "repository": "RecursiveIntell/recursive-agent",
   "base_commit": "11fefae304d43d9d72f7a238f9d2df77862b51c6",
-  "candidate_commit": "6afa7d634fbf1f7cbc2524f244d761a02afbe2a5",
-  "candidate_tree": "29744f31bc9b2d2a03472fbb6c76ad45ce45e980",
+  "candidate_commit": "5105d4e85d05ed9aacd12680d4209f98a196fef9",
+  "candidate_tree": "a25164902f862efb28a798e175212541d9f39e4e",
   "libraries_commit": "0b099ec416de60f6adafb182f1d1e83795d05c56",
-  "patch_sha256": "c3f6b26e1827d2665b34e63dd20ef9916daf01f5cdbba912c3a3d67e5a54476f",
+  "patch_sha256": "867e03eda73db56b8e25392898c8152cf28e408b6ab04d31ea053329612e3a2b",
   "scope": [
     "external permit semantic outcome idempotency",
     "exact-binding read-only receipt lookup",
@@ -30,5 +30,14 @@
     "native_job": 108117936005,
     "conclusion": "success",
     "scope": "EF-3/EF-4 prerequisite only; whole native workspace gates passed"
+  },
+  "first_scoped_hosted_run": {
+    "ares_commit": "a7812c0a767f752711e6e3f9b9d128a3129572fb",
+    "run_id": 36153447078,
+    "job_id": 108132154805,
+    "policy_scope_tests": "13 passed",
+    "failure": "new daemon test reused an IPC request ID; protocol rejected duplicate correlation ID",
+    "repair": "unique request IDs per message; public enrolled grant/verifier included in scope snapshot",
+    "runtime_status": "pending repaired candidate execution"
   }
 }

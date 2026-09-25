@@ -295,7 +295,7 @@ index 1d73698..da89672 100644
              let handle = runtime.submit(operation)?;
              Ok(serde_json::json!({
 diff --git a/crates/recursive-agent-daemon/tests/ipc_runtime.rs b/crates/recursive-agent-daemon/tests/ipc_runtime.rs
-index 955cca9..5e3f069 100644
+index 955cca9..8382755 100644
 --- a/crates/recursive-agent-daemon/tests/ipc_runtime.rs
 +++ b/crates/recursive-agent-daemon/tests/ipc_runtime.rs
 @@ -316,6 +316,137 @@ fn daemon_consumes_and_records_external_permit_receipts_over_ipc() -> TestResult
@@ -436,7 +436,7 @@ index 955cca9..5e3f069 100644
      Ok(())
  }
  
-@@ -455,6 +586,171 @@ fn production_witness(call: ToolCallSpecV1) -> ProductionApprovalWitnessV1 {
+@@ -455,6 +586,184 @@ fn production_witness(call: ToolCallSpecV1) -> ProductionApprovalWitnessV1 {
      }
  }
  
@@ -493,10 +493,15 @@ index 955cca9..5e3f069 100644
 +        let _ = serve(listener, server_service, 4);
 +    });
 +    let mut stream = connect_with_retry(&socket, &thread)?;
++    let sequence = std::sync::atomic::AtomicU64::new(0);
 +    let send = |stream: &mut UnixStream,
 +                body: serde_json::Value|
 +     -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-+        let request = serde_json::json!({"schema":IPC_REQUEST_SCHEMA_V1, "protocol_version":IPC_PROTOCOL_VERSION_V1, "request_id":"scope-test", "request":body});
++        let request_id = format!(
++            "scope-test-{}",
++            sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
++        );
++        let request = serde_json::json!({"schema":IPC_REQUEST_SCHEMA_V1, "protocol_version":IPC_PROTOCOL_VERSION_V1, "request_id":request_id, "request":body});
 +        stream.write_all(&frame(&serde_json::to_vec(&request)?))?;
 +        stream.flush()?;
 +        read_response(stream)
@@ -506,6 +511,14 @@ index 955cca9..5e3f069 100644
 +        serde_json::json!({"kind":"context_authority_readback", "incarnation":configuration.incarnation, "scope":scope}),
 +    )?;
 +    let authority = snapshot["snapshot"]["authority"].clone();
++    assert_eq!(
++        snapshot["snapshot"]["grant"],
++        serde_json::to_value(&configuration.grants[0])?
++    );
++    assert_eq!(
++        snapshot["snapshot"]["approval_verifier"],
++        serde_json::to_value(&configuration.approval_verifier)?
++    );
 +    let call = ToolCallSpecV1 {
 +        tool: "write_file".into(),
 +        args: serde_json::json!({"path":format!("{PRODUCTION_PERMIT_TARGET_ROOT}/out.txt"),"content":"approved"}),
@@ -610,10 +623,10 @@ index 955cca9..5e3f069 100644
  {
 diff --git a/crates/recursive-agent-policy/src/context_authority.rs b/crates/recursive-agent-policy/src/context_authority.rs
 new file mode 100644
-index 0000000..43ab093
+index 0000000..75bee7a
 --- /dev/null
 +++ b/crates/recursive-agent-policy/src/context_authority.rs
-@@ -0,0 +1,1350 @@
+@@ -0,0 +1,1354 @@
 +//! Scoped external-effect authority, owned by the existing permit store.
 +//!
 +//! The operator enrolls a controller for one store/profile/root. Controller
@@ -907,6 +920,8 @@ index 0000000..43ab093
 +#[serde(deny_unknown_fields)]
 +pub struct ContextAuthoritySnapshotV1 {
 +    pub authority: ContextAuthorityBindingV1,
++    pub grant: ContextScopeGrantV1,
++    pub approval_verifier: ContentDigest,
 +    pub configuration_revision: u64,
 +    pub enrolled: bool,
 +    pub effects_charged: u64,
@@ -1127,6 +1142,8 @@ index 0000000..43ab093
 +                .as_ref()
 +                .ok_or_else(|| denied("not enrolled"))?;
 +            Ok(ContextAuthoritySnapshotV1 {
++                grant: current.grant.clone(),
++                approval_verifier: configuration.approval_verifier.clone(),
 +                authority: ContextAuthorityBindingV1 {
 +                    incarnation: incarnation.clone(),
 +                    scope: scope.clone(),
