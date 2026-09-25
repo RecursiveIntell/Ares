@@ -351,6 +351,28 @@ class SessionRunCustodyMixin:
         """Read committed native metadata; does not authorize continuation."""
         return self._read_run_head(run_id)[1]
 
+    def list_run_custody_for_session(self, session_id, *, active_only=True):
+        """Read custody heads bound to one physical session; grants no authority."""
+        _text(session_id)
+        if type(active_only) is not bool:
+            raise RunCustodyError("INVALID_FILTER")
+        values = []
+        for key, _raw in self.list_meta_prefix("run-custody:"):
+            match = re.fullmatch(
+                r"run-custody:([A-Za-z0-9][A-Za-z0-9_.-]{0,127}):head",
+                key,
+            )
+            if match is None:
+                continue
+            value = self.read_run_custody(match.group(1))
+            if value is None or value.current_session_id != session_id:
+                continue
+            if active_only and value.disposition != "active":
+                continue
+            values.append(value)
+        values.sort(key=lambda value: value.run_id)
+        return values
+
     def read_run_checkpoint(self, run_id, *, generation):
         _integer(generation)
         value = self.read_run_custody(run_id)
