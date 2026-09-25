@@ -264,6 +264,30 @@ def attempt_turn_start_context_rebase(
             before_tokens=before_tokens,
         )
 
+    max_no_progress = getattr(agent, "context_rebase_max_no_progress", 2)
+    if (
+        type(max_no_progress) is not int
+        or max_no_progress < 1
+        or max_no_progress > 100
+    ):
+        max_no_progress = 2
+    try:
+        episode = db.read_context_rebase_episode(parent_session_id)
+    except Exception:
+        return AutomaticRebaseResult(
+            AutomaticRebaseStatus.BLOCKED,
+            "CONTEXT_REBASE_EPISODE_UNAVAILABLE",
+            parent_session_id,
+            before_tokens=before_tokens,
+        )
+    if episode.attempts_without_recovery >= max_no_progress:
+        return AutomaticRebaseResult(
+            AutomaticRebaseStatus.BLOCKED,
+            "NO_PROGRESS_REBASE_LIMIT",
+            parent_session_id,
+            before_tokens=before_tokens,
+        )
+
     # Only transports that rebuild their complete provider input from the
     # supplied messages/system/tools are qualified by the stateless payload
     # upper-bound contract. Codex app-server and ACP own opaque remote state.
@@ -499,6 +523,8 @@ def attempt_turn_start_context_rebase(
             transition_id,
             expected_continuation_digest=candidate.continuation_digest,
             expected_child_session_id=child_session_id,
+            before_tokens=before_tokens,
+            after_tokens=after_tokens,
         )
     except Exception as exc:
         _mark_reconciliation_required(db, transition_id)
