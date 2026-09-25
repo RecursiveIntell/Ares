@@ -405,6 +405,37 @@ def test_compute_child_atexit_keeps_active_turn_and_closes_idle(monkeypatch):
     assert server._sessions == {"active": active}
 
 
+def test_compute_host_crash_retains_failed_prompt_and_does_not_drain_queue(monkeypatch):
+    """Ambiguous child exit cannot discard the visible prompt or start later work."""
+    session = {
+        "session_key": "crashed-turn", "history_lock": threading.Lock(),
+        "running": True, "history": [], "history_version": 0,
+        "queued_prompt": {"text": "second prompt"},
+    }
+    server._start_inflight_turn(session, "first prompt")
+    server._append_inflight_delta(session, "partial reply")
+    emitted = []
+    drained = []
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+    monkeypatch.setattr(server, "_session_info", lambda *_args: {})
+    monkeypatch.setattr(server, "_drain_queued_prompt", lambda *args: drained.append(args))
+
+    server._on_compute_host_turn_done(
+        "r-crash", "s-crash", session,
+        {"type": "turn.error", "request_id": "r-crash", "reason": "crash",
+         "message": "child exited after provider attempt"},
+    )
+
+    assert session["running"] is False
+    assert session["inflight_turn"]["user"] == "first prompt"
+    assert session["inflight_turn"]["assistant"] == "partial reply"
+    assert session["inflight_turn"]["status"] == "error"
+    assert session["queued_prompt"]["text"] == "second prompt"
+    assert drained == []
+    assert any(event == "message.complete" and payload["status"] == "error"
+               for event, _sid, payload in emitted)
+
+
 def test_mutator_route_table_matches_prd_inventory():
     assert MUTATOR_ROUTE_TABLE == {
         "config.set.model": "run-concurrent",

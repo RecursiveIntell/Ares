@@ -2536,6 +2536,7 @@ def _apply_compute_host_metadata_mirror(session: dict, frame: dict | None) -> No
 
 def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -> None:
     is_error = frame.get("type") == "turn.error"
+    child_crashed = is_error and frame.get("reason") == "crash"
     with session["history_lock"]:
         if frame.get("session_key"):
             session["session_key"] = str(frame.get("session_key"))
@@ -2549,7 +2550,16 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
                 pass
         session["running"] = False
         session["last_active"] = time.time()
-        _clear_inflight_turn(session)
+        if child_crashed:
+            # The child may have reached a provider or tool before its exit.
+            # Keep the visible prompt/partial reply for reconciliation, but
+            # never auto-dispatch the next queued effect on an unknown outcome.
+            _fail_inflight_turn(
+                session, frame.get("message") or "compute host exited",
+                error_surface={"layer": "runtime", "code": "compute_host_crash", "retryable": False},
+            )
+        else:
+            _clear_inflight_turn(session)
     if is_error:
         message = str(frame.get("message") or "compute host turn failed")
         _emit("message.complete", sid, {"text": f"Error: {message}", "status": "error"})
@@ -2560,7 +2570,8 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
         info = _session_info(session.get("agent"))
     if not frame.get("session_info_emitted"):
         _emit("session.info", sid, info)
-    _drain_queued_prompt(rid, sid, session)
+    if not child_crashed:
+        _drain_queued_prompt(rid, sid, session)
 
 
 def _submit_prompt_to_compute_host(
