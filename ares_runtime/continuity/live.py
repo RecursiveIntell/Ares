@@ -203,6 +203,7 @@ class LiveContinuationCandidate:
     continuation_digest: str
     snapshot_digest: str
     unresolved_effects: bool
+    snapshot_read_limits: tuple[int, int, int, int] = (12, 32, 32, 128)
 
     def __post_init__(self) -> None:
         if not self.child_messages or self.child_messages[-1].get("role") != "user":
@@ -218,6 +219,7 @@ class LiveContinuationCandidate:
             "mode": self.mode.value,
             "snapshot_digest": self.snapshot_digest,
             "unresolved_effects": self.unresolved_effects,
+            "snapshot_read_limits": self.snapshot_read_limits,
         })).hexdigest()
         if self.continuation_digest != expected:
             raise LiveContinuationError("LIVE_CONTINUATION_DIGEST_MISMATCH")
@@ -241,7 +243,8 @@ def _candidate_digest(
         "input_watermark": snapshot.input_watermark,
         "mode": mode.value,
         "snapshot_digest": snapshot.digest,
-        "unresolved_effects": bool(snapshot.unresolved_effects),
+        "unresolved_effects": snapshot.has_unresolved_effects,
+        "snapshot_read_limits": snapshot.read_limits,
     })).hexdigest()
 
 
@@ -393,6 +396,15 @@ def build_live_candidate(
         add(
             "record:todo:current", _opaque_ref("todo-state", snapshot.session_id),
             f"message:{snapshot.input_watermark}", raw,
+            kind=SourceKind.OWNER_STATE, status=EvidenceStatus.OBSERVED,
+            freshness=Freshness.CURRENT, section=Section.FRONTIER, required=True,
+        )
+
+    for custody in snapshot.run_custodies:
+        raw = canonical_json(custody)
+        add(
+            f"record:run:{custody['run_id']}", f"run-custody:{custody['run_id']}",
+            f"generation:{custody['generation']}", raw,
             kind=SourceKind.OWNER_STATE, status=EvidenceStatus.OBSERVED,
             freshness=Freshness.CURRENT, section=Section.FRONTIER, required=True,
         )
@@ -561,5 +573,6 @@ def build_live_candidate(
         TRUSTED_CONTINUATION_RULES,
         digest,
         snapshot.digest,
-        bool(snapshot.unresolved_effects),
+        snapshot.has_unresolved_effects,
+        snapshot.read_limits,
     )

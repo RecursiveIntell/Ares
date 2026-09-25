@@ -1071,6 +1071,41 @@ def clear_goal(session_id: str) -> bool:
     return save_goal(session_id, state)
 
 
+def goal_session_migration(old_session_id, new_session_id, parent_raw, child_raw, *, reason=""):
+    """Return the owner's CAS mutations, suitable for a larger local transaction."""
+    if not parent_raw:
+        return False, []
+    state = GoalState.from_json(parent_raw)
+    if child_raw:
+        existing_child = GoalState.from_json(child_raw)
+        migrated_from = dict(existing_child.migration or {}).get("migrated_from_session")
+        return bool(
+            state.status == "cleared" and existing_child.status != "cleared"
+            and migrated_from == old_session_id and existing_child.goal_id == state.goal_id
+        ), []
+    if state.status == "cleared":
+        return False, []
+    child = GoalState.from_json(state.to_json())
+    child.migration = {
+        **dict(child.migration or {}),
+        "migrated_from_session": old_session_id,
+        "migration_reason": reason or "rotation",
+        "migrated_at": time.time(),
+    }
+    archived = GoalState.from_json(state.to_json())
+    archived.status = "cleared"
+    archived.outcome = CANCELLED
+    archived.last_stop_reason = f"MIGRATED_TO:{new_session_id}"
+    archived.next_action = None
+    archived.continuation_pending = False
+    archived.continuation_claimed_by = None
+    archived.continuation_claimed_at = 0.0
+    return True, [
+        (_meta_key(old_session_id), parent_raw, archived.to_json()),
+        (_meta_key(new_session_id), None, child.to_json()),
+    ]
+
+
 def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason: str = "", session_db=None) -> bool:
     """Carry a persistent /goal from a parent session to its continuation.
 
@@ -1092,55 +1127,15 @@ def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason:
         db = session_db if session_db is not None else _get_session_db()
         if db is None:
             return False
-        parent_raw = db.get_meta(_meta_key(old_session_id))
-        if not parent_raw:
-            return False
-        state = GoalState.from_json(parent_raw)
-        child_raw = db.get_meta(_meta_key(new_session_id))
-        if child_raw:
-            try:
-                existing_child = GoalState.from_json(child_raw)
-            except Exception:
-                return False
-            migrated_from = dict(existing_child.migration or {}).get(
-                "migrated_from_session"
-            )
-            if (
-                state.status == "cleared"
-                and existing_child.status != "cleared"
-                and migrated_from == old_session_id
-                and existing_child.goal_id == state.goal_id
-            ):
-                return True
-            return False
-        if state.status == "cleared":
-            return False
-
-        child = GoalState.from_json(state.to_json())
-        child.migration = {
-            **dict(child.migration or {}),
-            "migrated_from_session": old_session_id,
-            "migration_reason": reason or "rotation",
-            "migrated_at": time.time(),
-        }
-        archived = GoalState.from_json(state.to_json())
-        archived.status = "cleared"
-        archived.outcome = CANCELLED
-        archived.last_stop_reason = f"MIGRATED_TO:{new_session_id}"
-        archived.next_action = None
-        archived.continuation_pending = False
-        archived.continuation_claimed_by = None
-        archived.continuation_claimed_at = 0.0
-
-        child_payload = child.to_json()
-        archived_payload = archived.to_json()
+        migrated, changes = goal_session_migration(
+            old_session_id, new_session_id,
+            db.get_meta(_meta_key(old_session_id)), db.get_meta(_meta_key(new_session_id)),
+            reason=reason,
+        )
+        if not changes:
+            return migrated
         if hasattr(db, "compare_and_set_meta_many"):
-            migrated = db.compare_and_set_meta_many(
-                [
-                    (_meta_key(old_session_id), parent_raw, archived_payload),
-                    (_meta_key(new_session_id), None, child_payload),
-                ]
-            )
+            migrated = db.compare_and_set_meta_many(changes)
         else:
             # Test doubles and older external SessionDB implementations must
             # fail closed rather than recreate the old child-then-clear race.

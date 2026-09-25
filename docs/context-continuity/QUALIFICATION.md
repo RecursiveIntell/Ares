@@ -1,83 +1,70 @@
 # Context continuity qualification
 
-PR #80 is an implementation branch, not a qualified release. The V4 packet
-dated 2026-09-23 remains the acceptance contract. This report records the
-2026-09-25 repair against baseline
-`e25246701ad00338d51961b35be87e2fde690b45`.
+The V4 packet dated 2026-09-23 remains the full acceptance contract. This is
+an implementation branch. Qualification is tied to source hashes and named
+oracles; passing unit tests does not qualify a selected provider route.
 
-## Verified repair
+## Durable recovery and dispatch repair
 
-SessionDB now reads a continuation source under one SQLite snapshot. A
-savepoint preserves a caller's outer transaction and leaves pooled readers
-clean on both success and refusal. Compilation binds the resulting observation
-set to a digest. Publication reconstructs and compares that set under its
-existing `BEGIN IMMEDIATE` transaction before creating a child, closing the
-parent, or rebinding local owners. A message watermark alone did not detect
-changes to goals, heartbeats, loops, user text, effect state, or workspace.
+The repair from `68ec16bcb70a56fd6d7da54897b7aa38b0aa5091` makes child
+publication, canonical goal/heartbeat/loop migration, the complete native
+custody transfer set, and a bounded recovery intent one SessionDB transaction.
+Owner conflicts roll back the whole publication. Lost acknowledgments reconcile
+the committed child without publishing another child. READY requires the live
+turn lease and current, bounded recovery reservation. Engine lifecycle failures
+are propagated; the real Governor pending-receipt inventory must acknowledge
+its lineage before activation.
 
-Automatic NORMAL continuation refuses unresolved effects. Turn-start, pre-API,
-and provider-overflow callers stop on BLOCKED outcomes. They cannot fall
-through to another provider/tool admission. Unadmitted request reservations are
-refunded; already attempted provider requests remain charged. Early refusal
-saves the latest authentic input through the existing persistence owner.
+Requests bind durable source before materialization, including ordered human
+instruction occurrences. Final admission checks the unchanged route, exact
+materialization, output reserve, conservative text bound, current lease,
+stop/control state and immutable attempt identity. Unqualified middleware model,
+body and SDK merge overrides stop before provider egress. Incoming corrections
+invalidate the source seal. An unavailable durable stop cannot prevent local
+socket/tool/child cancellation and leaves an explicit unresolved stop flag.
 
-The independent review found the early-input persistence regression during this
-repair. The final version includes two real-store regression cases for it.
+Response settlement quarantines superseded attempts. Streaming continues at the
+transport for cancellation and health checks, but text, reasoning, completed
+Codex commentary, display/TTS and plugin events are buffered until settlement.
+Failed partial streams discard their buffer and return to the qualified outer
+retry boundary. Internal stream retries are disabled for the continuity route.
+Observer errors remain isolated from provider errors.
 
-## Evidence and reproduction
+## Reproduction
 
-The unchanged baseline passed the original 20-file gate (946 tests). Added
-regressions reproduced eight snapshot/publication failures and eight dispatcher
-failures on that baseline. The corrected snapshot fixture, rather than its
-initial missing-anchor probe, is the RED witness.
+`.github/workflows/context-continuity-qualification.yml` is the executable gate.
+It uses Python 3.13, frozen `dev` and `anthropic` extras, the canonical isolated
+per-file runner, four workers and zero per-file retries. It builds and tests
+Libraries `0b099ec416de60f6adafb182f1d1e83795d05c56` with Rust 1.94.0, then
+supplies that exact binary through `HERMES_TEST_CONTEXT_GOVERNOR_BIN`.
 
-The final test selection is maintained in
-`.github/workflows/context-continuity-qualification.yml`. Reproduce its install
-and test steps with Python 3.13, frozen `dev` and `anthropic` extras, four workers,
-and zero per-file retries. Use `scripts/run_tests.sh`; do not bypass its per-file
-isolation. The Anthropic extra is necessary for an existing caller test that
-imports the optional SDK. The missing-extra failure also reproduced on the
-unchanged baseline.
+The paired native tests exercise real descriptor/key transport and disposable
+stores: a pending receipt blocks acknowledgment, activated source bytes remain
+recoverable after rebase, and missing keys refuse acknowledgment. No configured
+provider or live profile is used by these tests. The native owner's own suite
+passed 198 tests with one ignored test. The integrated Python gate passed 1,471 tests across 36 files, with four
+existing skips. All three paired native tests executed. Independent follow-up
+review resolved eleven findings across the repair. Evidence, logs and source
+hashes are recorded in `recovery-dispatch-evidence.json`.
 
-The final pinned gate passed **1,289 tests in 26 files, zero failures**. Its
-raw output is retained in `repair-test-run.log`. A prior run was invalidated
-because an unpinned lint invocation recreated the Python environment during
-testing; that run contributes no qualification evidence.
+The prior snapshot repair remains documented in
+`snapshot-repair-qualification.md`, `repair-evidence.json` and
+`repair-test-run.log`. Those are historical evidence, not the current source
+identity. Nondefault snapshot read limits are now bound into candidate identity
+and the publication readback.
 
-Machine-readable results and source hashes are in `repair-evidence.json` and
-`route-receipt.json`. An independent, read-only review ran five relevant files
-(74 passing tests), then reran the final dispatch suite (12 passing tests).
-Its verdict is limited to the default automatic route.
+## Remaining contract gates
 
-## Compatibility boundaries
+The 108 CT IDs and 172 inherited IDs remain in `acceptance-crosswalk.json`.
+A whole V4 stage is not promoted by this repair. Required remaining work includes
+external/native effect-owner transition acknowledgments, a root-scoped queued
+input contract, autonomous recovery wakeups through the existing controller,
+goal-less checked task binding, recovery after loss of process-owned custody
+handles, source/worktree and current-policy retrieval qualification, objective
+progress and shared recovery-resource accounting, reader/backup compatibility,
+and selected-route behavioral/calibration/canary/endurance evidence.
 
-- Automatic compilation/publication uses the default snapshot limits. A direct
-  `build_live_candidate(recent_limit != 12)` call can produce an unchanged
-  candidate that publication refuses. Configurable publication is not qualified;
-  supporting it requires binding and validating the read limits.
-- New publications require the snapshot digest. Replay of transitions created
-  before that binding was introduced has not been migration-qualified. Existing
-  pending transitions must remain stopped until reconciled; do not reopen a
-  parent or delete committed lineage to make a retry succeed.
-- This pass did not change schemas, activate a live profile, invoke paid
-  providers, certify native Rust owners, or qualify external-service effects.
-  Before activation, rollback is a source revert of this repair. A source
-  rollback is not a protocol for repairing live committed state.
-
-## Remaining V4 gates
-
-`acceptance-crosswalk.json` preserves all 108 continuity case IDs, required
-stages and evidence classes, plus all 172 inherited program IDs. Its test-file
-references are supporting locations, not complete acceptance oracles. No case
-is promoted to whole-contract qualification by this inventory.
-
-The next implementation pass must close the actual owner protocol: native
-cross-owner fences and acknowledgments, crash/restart reconciliation, and
-request-bound custody/admission at the final dispatch boundary. It must also
-verify current-policy retrieval and the installed capability tuple against the
-case-specific oracles. Selected-route calibration, canary readiness, authorized
-live canaries, and endurance evidence remain separate mandatory gates.
-
-These are source and qualification gaps, not merely a request to run the current
-unit suite again. Do not merge, activate, or describe the V4 program as complete
-on the strength of this report.
+Unsupported or ambiguous state remains a typed refusal. Earlier transitions
+without the new recovery intent are not silently promoted. A code rollback is
+not a live-state repair protocol: do not reopen a committed parent, remove
+lineage, replace owner tokens, or replay uncertain effects.

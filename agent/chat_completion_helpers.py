@@ -4786,7 +4786,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     def _call():
         import httpx as _httpx
 
-        _max_stream_retries = env_int("HERMES_STREAM_RETRIES", 2)
+        # Continuity admission owns each physical attempt. Let its outer
+        # boundary revalidate durable control/source state before any retry.
+        _max_stream_retries = 0 if getattr(agent, "context_rebase_enabled", False) else env_int("HERMES_STREAM_RETRIES", 2)
 
         try:
             for _stream_attempt in range(_max_stream_retries + 1):
@@ -5327,6 +5329,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted during streaming API call (post-worker)")
     if result["error"] is not None:
+        if getattr(agent, "_context_stream_delivery_buffered", False):
+            # No text has reached an observer yet. The partial-delivery
+            # accumulator intentionally remains empty, so it cannot form an
+            # accepted partial response. Discard this attempt's buffer and
+            # return to the outer durable admission boundary for any retry.
+            raise result["error"]
         if deltas_were_sent["yes"]:
             # Streaming failed AFTER some tokens were already delivered to
             # the platform.  Re-raising would let the outer retry loop make

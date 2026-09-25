@@ -28,6 +28,8 @@ on:
       - 'tests/run_agent/test_compression_lock_defer.py'
       - 'agent/agent_init.py'
       - 'agent/conversation_loop.py'
+      - 'agent/chat_completion_helpers.py'
+      - 'agent/codex_runtime.py'
       - 'agent/run_checkpoint_custody.py'
       - 'agent/turn_context.py'
       - 'cli.py'
@@ -40,6 +42,11 @@ on:
       - 'hermes_state_runs.py'
       - 'plugins/context_engine/_context_governor/**'
       - 'scripts/run_checkpoint_context.py'
+      - 'scripts/run_tests.sh'
+      - 'tests/run_agent/test_streaming.py'
+      - 'tests/run_agent/test_run_agent_codex_responses.py'
+      - 'tests/run_agent/test_codex_sdk_transform_bypass.py'
+      - 'tests/plugins/test_context_governor*.py'
       - 'tui_gateway/server.py'
       - 'docs/context-continuity/**'
 
@@ -65,13 +72,27 @@ jobs:
           version: '0.9.28'
       - name: Install locked test dependencies
         run: uv sync --frozen --extra dev --extra anthropic --python 3.13
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: RecursiveIntell/Libraries
+          ref: 0b099ec416de60f6adafb182f1d1e83795d05c56
+          path: native-owner-source
+          persist-credentials: false
+      - name: Build and test pinned native Governor
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.94.0 --profile minimal
+          cargo +1.94.0 test --locked --manifest-path native-owner-source/context-governor/Cargo.toml
+          sha256sum native-owner-source/context-governor/target/debug/context-governor
       - name: Run continuity and adjacent ownership surfaces
         shell: bash
         run: |
           set -euo pipefail
           git rev-parse HEAD
           .venv/bin/python --version
-          HERMES_PYTHON="$PWD/.venv/bin/python" HERMES_TEST_WORKERS=4 HERMES_TEST_FILE_RETRIES=0 \
+          HERMES_TEST_CONTEXT_GOVERNOR_BIN="$PWD/native-owner-source/context-governor/target/debug/context-governor" \
+            HERMES_PYTHON="$PWD/.venv/bin/python" HERMES_TEST_WORKERS=4 HERMES_TEST_FILE_RETRIES=0 \
             scripts/run_tests.sh \
             tests/ares_runtime/test_continuity*.py \
             tests/ares_runtime/test_context_rebase_state.py \
@@ -91,7 +112,11 @@ jobs:
             tests/agent/test_turn_context.py \
             tests/run_agent/test_run_agent.py \
             tests/run_agent/test_1630_context_overflow_loop.py \
-            tests/run_agent/test_compression_lock_defer.py -- -q
+            tests/run_agent/test_compression_lock_defer.py \
+            tests/run_agent/test_streaming.py \
+            tests/run_agent/test_run_agent_codex_responses.py \
+            tests/run_agent/test_codex_sdk_transform_bypass.py \
+            tests/plugins/test_context_governor*.py -- -q
           .venv/bin/ruff check \
             ares_runtime/continuity \
             hermes_state_continuity.py \

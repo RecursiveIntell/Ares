@@ -2300,6 +2300,17 @@ def run_conversation(
                 agent.session_id or "-",
             )
 
+        # Bind durable source before any provider materialization. Preserve a
+        # refusal until the existing request-budget error boundary below.
+        from ares_runtime.continuity.runtime import ContextDispatchError, prepare_context_dispatch
+
+        _context_dispatch_error = None
+        _context_dispatch_snapshot = None
+        try:
+            _context_dispatch_snapshot = prepare_context_dispatch(agent, messages, conversation_history)
+        except ContextDispatchError as exc:
+            _context_dispatch_error = exc
+
         api_messages = []
         for idx, msg in enumerate(messages):
 
@@ -3039,6 +3050,7 @@ def run_conversation(
         finish_reason = "stop"
         response = None  # Guard against UnboundLocalError if all retries fail
         api_kwargs = None  # Guard against UnboundLocalError in except handler
+        _context_provider_attempted = False
         api_request_id = f"{turn_id}:api:{api_call_count}"
         agent._current_api_request_id = api_request_id
 
@@ -3096,6 +3108,11 @@ def run_conversation(
 
             try:
                 agent._reset_stream_delivery_tracking()
+                if _context_dispatch_error is not None:
+                    raise _context_dispatch_error
+                from ares_runtime.continuity.runtime import context_dispatch_route_identity
+
+                _context_route_identity = context_dispatch_route_identity(agent)
                 # api_messages is built once, before this retry loop, while the
                 # primary provider is active.  A mid-conversation fallback can
                 # switch to a require-side provider (DeepSeek / Kimi / MiMo) that
@@ -3159,6 +3176,11 @@ def run_conversation(
                     _xh["x-initiator"] = "user"
                     api_kwargs["extra_headers"] = _xh
                     agent._is_user_initiated_turn = False
+                from ares_runtime.continuity.runtime import context_dispatch_payload_digest
+
+                _context_materialization_digest = (
+                    context_dispatch_payload_digest(api_kwargs) if _context_dispatch_snapshot is not None else None
+                )
                 try:
                     from hermes_cli.middleware import apply_llm_request_middleware
 
@@ -3330,6 +3352,7 @@ def run_conversation(
                         _use_streaming = False
 
                 def _perform_api_call(next_api_kwargs):
+                    nonlocal _context_provider_attempted
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
                             next_api_kwargs,
@@ -3337,13 +3360,29 @@ def run_conversation(
                             is_github_responses=agent._is_copilot_url(),
                             sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
+                    from ares_runtime.continuity.runtime import admit_final_context_dispatch
+
+                    _admission = admit_final_context_dispatch(
+                        agent, _context_dispatch_snapshot, next_api_kwargs,
+                        attempt_id=f"{api_request_id}:{retry_count}",
+                        materialization_digest=_context_materialization_digest,
+                        route_identity=_context_route_identity,
+                    )
+                    _context_provider_attempted = True
                     if _use_streaming:
-                        return agent._interruptible_streaming_api_call(
-                            next_api_kwargs, on_first_delta=_stop_spinner
-                        )
+                        from ares_runtime.continuity.runtime import ContextDispatchStreamBuffer, settle_final_context_dispatch
+
+                        with ContextDispatchStreamBuffer(agent, _admission) as _delivery:
+                            _response = agent._interruptible_streaming_api_call(
+                                next_api_kwargs, on_first_delta=_stop_spinner
+                            )
+
+                        settle_final_context_dispatch(agent, _admission)
+                        _delivery.deliver()
+                        return _response
                     from agent import relay_llm
 
-                    return relay_llm.execute(
+                    _response = relay_llm.execute(
                         next_api_kwargs,
                         agent._interruptible_api_call,
                         session_id=str(agent.session_id or ""),
@@ -3363,6 +3402,10 @@ def run_conversation(
                         },
                         defer_logical_completion=True,
                     )
+                    from ares_runtime.continuity.runtime import settle_final_context_dispatch
+
+                    settle_final_context_dispatch(agent, _admission)
+                    return _response
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 
@@ -4636,6 +4679,19 @@ def run_conversation(
                     thinking_spinner = None
                 if agent.thinking_callback:
                     agent.thinking_callback("")
+
+                from ares_runtime.continuity.runtime import (
+                    AutomaticRebaseResult, AutomaticRebaseStatus, ContextDispatchError,
+                )
+                if isinstance(api_error, ContextDispatchError):
+                    if not _context_provider_attempted:
+                        api_call_count = max(0, api_call_count - 1)
+                        agent._api_call_count = api_call_count
+                        agent.iteration_budget.refund()
+                    agent._persist_session(messages, conversation_history)
+                    return _context_rebase_stopped_result(AutomaticRebaseResult(
+                        AutomaticRebaseStatus.BLOCKED, str(api_error), agent.session_id,
+                    ))
 
                 # -----------------------------------------------------------
                 # UnicodeEncodeError recovery.  Two common causes:

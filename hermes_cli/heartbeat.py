@@ -298,6 +298,27 @@ class HeartbeatManager:
         return s.render_prompt()
 
 
+def heartbeat_session_migration(old_session_id, new_session_id, parent_raw, child_raw):
+    """Return the canonical heartbeat transfer without opening a transaction."""
+    if not parent_raw:
+        return False, []
+    state = HeartbeatState.from_json(parent_raw)
+    if child_raw is not None:
+        existing = HeartbeatState.from_json(child_raw)
+        same = all(getattr(state, field) == getattr(existing, field) for field in (
+            "prompt", "interval_seconds", "created_at", "last_fired_at", "fire_count",
+        ))
+        return bool(state.status == "cleared" and existing.status != "cleared" and same), []
+    if state.status == "cleared":
+        return False, []
+    archived = HeartbeatState.from_json(parent_raw)
+    archived.status = "cleared"
+    return True, [
+        (_meta_key(old_session_id), parent_raw, archived.to_json()),
+        (_meta_key(new_session_id), None, state.to_json()),
+    ]
+
+
 def migrate_heartbeat_to_session(
     old_session_id: str, new_session_id: str, *, session_db=None
 ) -> bool:
@@ -308,39 +329,11 @@ def migrate_heartbeat_to_session(
         db = session_db if session_db is not None else _get_session_db()
         if db is None or not hasattr(db, "compare_and_set_meta_many"):
             return False
-        parent_key = _meta_key(old_session_id)
-        child_key = _meta_key(new_session_id)
-        parent_raw = db.get_meta(parent_key)
-        if not parent_raw:
-            return False
-        state = HeartbeatState.from_json(parent_raw)
-        child_raw = db.get_meta(child_key)
-        if child_raw is not None:
-            try:
-                existing = HeartbeatState.from_json(child_raw)
-            except Exception:
-                return False
-            same = (
-                state.prompt == existing.prompt
-                and state.interval_seconds == existing.interval_seconds
-                and state.created_at == existing.created_at
-                and state.last_fired_at == existing.last_fired_at
-                and state.fire_count == existing.fire_count
-            )
-            return bool(
-                state.status == "cleared"
-                and existing.status != "cleared"
-                and same
-            )
-        if state.status == "cleared":
-            return False
-        child = HeartbeatState.from_json(parent_raw)
-        archived = HeartbeatState.from_json(parent_raw)
-        archived.status = "cleared"
-        return bool(db.compare_and_set_meta_many([
-            (parent_key, parent_raw, archived.to_json()),
-            (child_key, None, child.to_json()),
-        ]))
+        migrated, changes = heartbeat_session_migration(
+            old_session_id, new_session_id,
+            db.get_meta(_meta_key(old_session_id)), db.get_meta(_meta_key(new_session_id)),
+        )
+        return bool(db.compare_and_set_meta_many(changes)) if changes else migrated
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("HeartbeatManager: migration failed: %s", exc)
         return False

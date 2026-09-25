@@ -160,6 +160,59 @@ class TurnRunCustody:
                 summaries.append(self._summary(value, "session_transfer_observed"))
             return summaries
 
+    def publish_context_rebase(self, holder, **publication):
+        """Keep local handles aligned with atomic native child/custody publication."""
+        from hermes_state_continuity import ContextContinuationError
+
+        with self._lock:
+            self._active(holder)
+            handles = []
+            for handle in self._handles.values():
+                if handle.holder != holder:
+                    raise ClaimRefusal("TURN_NOT_ACTIVE")
+                if handle.status != "owned" or handle.value is None:
+                    raise ClaimOutcomeUnknown(handle.error)
+                handles.append(handle)
+            for handle in handles:
+                handle.status, handle.error = "pending", "CONTEXT_REBASE_CUSTODY_UNKNOWN"
+            try:
+                result = self.db.publish_context_rebase_child(
+                    **publication, custody_transfers=tuple(handle.value for handle in handles),
+                )
+            except (ContextContinuationError, RunCustodyError):
+                # Native typed refusal rolls the entire owner transaction back.
+                for handle in handles:
+                    handle.status = "owned"
+                raise
+            except BaseException:
+                for handle in handles:
+                    handle.status = "unknown"
+                raise ClaimOutcomeUnknown("CONTEXT_REBASE_CUSTODY_UNKNOWN") from None
+            self.reconcile_context_rebase(holder, result.child_session_id)
+            return result
+
+    def reconcile_context_rebase(self, holder, child_session_id):
+        """Resolve a lost publication ACK by readback, without a second mutation."""
+        with self._lock:
+            self._active(holder)
+            for run_id, handle in self._handles.items():
+                if handle.holder != holder or handle.value is None:
+                    raise ClaimOutcomeUnknown("CONTEXT_REBASE_CUSTODY_UNKNOWN")
+                old = handle.value
+                current = self.db.read_run_custody(run_id)
+                if (current is None or current.current_session_id != child_session_id
+                        or current.owner_token != old.owner_token
+                        or current.checkpoint != old.checkpoint
+                        or current.generation not in {old.generation, old.generation + 1}
+                        or current.disposition != "active"):
+                    handle.status, handle.error = "unknown", "CONTEXT_REBASE_CUSTODY_UNKNOWN"
+                    raise ClaimOutcomeUnknown(handle.error)
+                handle.value, handle.status = current, "owned"
+            owned = {run_id for run_id, handle in self._handles.items() if handle.status == "owned"}
+            current_ids = {value.run_id for value in self.db.list_run_custody_for_session(child_session_id)}
+            if current_ids != owned:
+                raise ClaimOutcomeUnknown("CONTEXT_REBASE_CUSTODY_HANDLE_REQUIRED")
+
     def release(self, holder, *, run_id, expected_generation):
         with self._lock:
             handle = self._handle(holder, run_id, expected_generation)

@@ -726,6 +726,7 @@ class AIAgent:
         previous_messages: Optional[list] = None,
         carry_over_context: bool = False,
         reset_engine: bool = True,
+        strict: bool = False,
         **extra_context,
     ) -> None:
         """Notify the active context engine about a host session transition.
@@ -745,12 +746,16 @@ class AIAgent:
             try:
                 engine.on_session_end(old_session_id, previous_messages)
             except Exception as exc:
+                if strict:
+                    raise
                 logger.debug("context engine on_session_end during transition: %s", exc)
 
         if reset_engine and hasattr(engine, "on_session_reset"):
             try:
                 engine.on_session_reset()
             except Exception as exc:
+                if strict:
+                    raise
                 logger.debug("context engine on_session_reset during transition: %s", exc)
 
         should_start = bool(
@@ -774,6 +779,8 @@ class AIAgent:
             try:
                 engine.on_session_start(target_session_id, **start_context)
             except Exception as exc:
+                if strict:
+                    raise
                 logger.debug("context engine on_session_start during transition: %s", exc)
 
         if (
@@ -785,6 +792,8 @@ class AIAgent:
             try:
                 engine.carry_over_new_session_context(old_session_id, target_session_id)
             except Exception as exc:
+                if strict:
+                    raise
                 logger.debug("context engine carry_over_new_session_context during transition: %s", exc)
 
     def reset_session_state(
@@ -3465,6 +3474,18 @@ class AIAgent:
                     child.interrupt(message)
             except Exception as e:
                 logger.debug("Failed to propagate interrupt to child agent: %s", e)
+        # Cancel sockets, tools, children and the compression fence before a
+        # storage operation can block. A missing durable acknowledgement must
+        # never turn a local stop into permission to resume.
+        if hard_cancel and getattr(self, "context_rebase_enabled", False):
+            db = getattr(self, "_session_db", None)
+            self._context_stop_unacknowledged = True
+            if db is not None and getattr(self, "session_id", None):
+                try:
+                    db.record_context_stop(self.session_id)
+                    self._context_stop_unacknowledged = False
+                except Exception:
+                    logger.error("Context stop cancelled locally; durable acknowledgement failed", exc_info=True)
         if not self.quiet_mode:
             print("\n⚡ Interrupt requested" + (f": '{message[:40]}...'" if message and len(message) > 40 else f": '{message}'" if message else ""))
 

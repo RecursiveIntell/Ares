@@ -15,10 +15,12 @@ from dataclasses import dataclass
 from enum import Enum
 import hashlib
 import json
+import logging
+from contextlib import nullcontext
 from typing import Any
 
 from agent.model_metadata import estimate_request_tokens_rough
-from hermes_cli.goals import GoalState, migrate_goal_to_session
+from hermes_cli.goals import GoalState
 
 from .budget import stateless_payload_token_upper_bound
 from .compiler import Mode
@@ -27,6 +29,197 @@ from .live import LiveContinuationError, build_live_candidate
 
 class AutomaticRebaseError(RuntimeError):
     """Stable refusal code only; never carries prompt/source payloads."""
+
+
+class ContextDispatchError(AutomaticRebaseError):
+    """A final request was not admitted; never route through provider retry."""
+
+
+def prepare_context_dispatch(agent, messages, conversation_history):
+    """Bind the source before request middleware may run or accept new input."""
+    if not getattr(agent, "context_rebase_enabled", False):
+        return None
+    db = getattr(agent, "_session_db", None)
+    if db is None:
+        raise ContextDispatchError("CONTEXT_DISPATCH_OWNER_UNAVAILABLE")
+    if getattr(agent, "_context_stop_unacknowledged", False):
+        raise ContextDispatchError("CONTEXT_DISPATCH_STOP_UNACKNOWLEDGED")
+    if agent._flush_messages_to_session_db(messages, conversation_history=conversation_history) is False:
+        raise ContextDispatchError("CONTEXT_DISPATCH_INPUT_NOT_DURABLE")
+    try:
+        db.assert_context_rebase_ready_for_turn(agent.session_id)
+        snapshot = db.read_context_rebase_snapshot(agent.session_id)
+        # Do not bless a transcript that was loaded before a durable human
+        # correction. Check exact current human content before deriving any
+        # provider roles, merging messages or running request middleware.
+        from agent.context_compressor import user_originated_turn_view
+
+        def identity(view):
+            return view.get("timestamp"), view.get("content")
+
+        materialized_users = [identity(view) for message in messages
+                              if (view := user_originated_turn_view(message)) is not None]
+        current_users = [identity(user_originated_turn_view({"role": "user", **source}))
+                         for source in snapshot.current_users if source.get("authentic_user")]
+        if current_users and materialized_users[-len(current_users):] != current_users:
+            raise ContextDispatchError("CONTEXT_DISPATCH_STALE_MATERIALIZATION")
+        return snapshot
+    except ContextDispatchError:
+        raise
+    except Exception as exc:
+        raise ContextDispatchError(getattr(exc, "code", "CONTEXT_DISPATCH_SOURCE_UNAVAILABLE")) from None
+
+
+def context_dispatch_route_identity(agent):
+    """In-process route binding; credentials never enter persisted receipts."""
+    return tuple(getattr(agent, name, None) for name in ("provider", "api_mode", "model", "base_url")) + (
+        id(getattr(agent, "client", None)),
+        getattr(getattr(agent, "context_compressor", None), "context_length", None),
+    )
+
+
+def context_dispatch_payload_digest(payload):
+    from .budget import BudgetError, final_request_upper_bound
+
+    try:
+        return final_request_upper_bound(route_ref="materialization", payload=payload).payload_digest
+    except BudgetError as exc:
+        raise ContextDispatchError(str(exc)) from None
+
+
+def admit_final_context_dispatch(agent, snapshot, payload, *, attempt_id,
+                                 materialization_digest=None, route_identity=None):
+    """Count and seal the final text request at the real dispatch boundary."""
+    if snapshot is None:
+        return None
+    from .budget import BudgetError, RouteBudget, final_request_upper_bound
+
+    mode = str(getattr(agent, "api_mode", ""))
+    if route_identity is not None and route_identity != context_dispatch_route_identity(agent):
+        raise ContextDispatchError("CONTEXT_DISPATCH_ROUTE_CHANGED")
+    if payload.get("model", payload.get("modelId")) != getattr(agent, "model", None):
+        raise ContextDispatchError("CONTEXT_DISPATCH_ROUTE_CHANGED")
+    extra = payload.get("extra_body")
+    # The SDK merges extra_body into the actual wire body after this call.
+    # Permit provider extensions, but never hidden overrides of source,
+    # route, output reserve, tools or retained provider state.
+    protected = {"model", "modelId", "messages", "input", "system", "instructions", "tools",
+                 "max_tokens", "max_completion_tokens", "max_output_tokens", "inferenceConfig",
+                 "previous_response_id", "conversation"}
+    if extra is not None and (type(extra) is not dict or protected.intersection(extra)):
+        raise ContextDispatchError("CONTEXT_DISPATCH_WIRE_OVERRIDE_UNQUALIFIED")
+    if mode not in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse"}:
+        raise ContextDispatchError("PROVIDER_CONTEXT_RESET_UNQUALIFIED")
+    if str(getattr(agent, "base_url", "")).lower().startswith(("acp://", "acp+tcp://")):
+        raise ContextDispatchError("PROVIDER_CONTEXT_RESET_UNQUALIFIED")
+    route = ":".join(str(getattr(agent, name, "unknown") or "unknown").replace(" ", "_")
+                     for name in ("provider", "api_mode", "model"))
+    output = payload.get("max_output_tokens", payload.get("max_completion_tokens", payload.get("max_tokens")))
+    if output is None:
+        output = getattr(agent, "max_tokens", None)
+    if type(output) is not int or output <= 0:
+        raise ContextDispatchError("CONTEXT_DISPATCH_OUTPUT_BUDGET_UNQUALIFIED")
+    context_limit = getattr(getattr(agent, "context_compressor", None), "context_length", None)
+    try:
+        count = final_request_upper_bound(route_ref=route, payload=payload)
+        budget = RouteBudget(route, None, context_limit, output, 0)
+        if count.tokens > budget.usable_input:
+            raise ContextDispatchError("CONTEXT_DISPATCH_FINAL_PAYLOAD_TOO_LARGE")
+        if materialization_digest is not None and count.payload_digest != materialization_digest:
+            raise ContextDispatchError("CONTEXT_DISPATCH_MATERIALIZATION_CHANGED")
+    except BudgetError as exc:
+        raise ContextDispatchError(str(exc)) from None
+    lock = getattr(agent, "_pending_redirect_lock", None)
+    with lock if lock is not None else nullcontext():
+        if getattr(agent, "_interrupt_requested", False) or getattr(agent, "_pending_redirect", None):
+            raise ContextDispatchError("CONTEXT_DISPATCH_INTERRUPTED")
+        try:
+            return agent._session_db.admit_context_dispatch(
+                agent.session_id,
+                turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
+                attempt_id=attempt_id, expected_snapshot_digest=snapshot.digest,
+                payload_digest=count.payload_digest, route_ref=route,
+            )
+        except Exception as exc:
+            raise ContextDispatchError(getattr(exc, "code", "CONTEXT_DISPATCH_OWNER_UNAVAILABLE")) from None
+
+
+def settle_final_context_dispatch(agent, admission):
+    if admission is None:
+        return
+    try:
+        agent._session_db.settle_context_dispatch_response(
+            admission["attempt_id"],
+            turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
+        )
+    except Exception as exc:
+        raise ContextDispatchError(getattr(exc, "code", "CONTEXT_DISPATCH_SETTLEMENT_UNKNOWN")) from None
+
+
+class ContextDispatchStreamBuffer:
+    """Keep display, TTS and plugin response consumption behind settlement.
+
+    The provider still streams for cancellation and transport health. A turn
+    has one writer; wrappers are restored before any accepted event is sent.
+    The queue is bounded and discarded on uncertainty, never replayed into a
+    later attempt.
+    """
+
+    def __init__(self, agent, admission):
+        self.agent, self.admission = agent, admission
+        self.events, self.originals = [], {}
+        self.bytes, self.overflow = 0, False
+
+    def __enter__(self):
+        if self.admission is None:
+            return self
+        self.previous_buffered = getattr(self.agent, "_context_stream_delivery_buffered", False)
+        self.agent._context_stream_delivery_buffered = True
+        for name in ("_fire_stream_delta", "_fire_reasoning_delta", "_fire_tool_gen_started",
+                     "_fire_streamed_codex_commentary", "interim_assistant_callback",
+                     "_emit_stream_start", "_emit_stream_end", "_emit_stream_drop",
+                     "_record_streamed_assistant_text", "stream_delta_callback", "_stream_callback",
+                     "reasoning_callback", "tool_gen_callback"):
+            callback = getattr(self.agent, name, None)
+            if not callable(callback):
+                continue
+            self.originals[name] = (name in vars(self.agent), callback)
+
+            def buffer(*args, _callback=callback, **kwargs):
+                self.bytes += sum(len(value.encode("utf-8")) for value in (*args, *kwargs.values()) if isinstance(value, str))
+                if self.bytes > 8 * 1024 * 1024 or len(self.events) >= 65536:
+                    self.overflow = True
+                    return
+                self.events.append((_callback, args, kwargs))
+
+            setattr(self.agent, name, buffer)
+        return self
+
+    def __exit__(self, *_):
+        if self.admission is not None:
+            self.agent._context_stream_delivery_buffered = self.previous_buffered
+        for name, (instance_owned, callback) in self.originals.items():
+            if instance_owned:
+                setattr(self.agent, name, callback)
+            else:
+                delattr(self.agent, name)
+
+    def deliver(self):
+        if self.overflow:
+            raise ContextDispatchError("CONTEXT_DISPATCH_STREAM_BUFFER_EXHAUSTED")
+        for callback, args, kwargs in self.events:
+            try:
+                self.agent._session_db.assert_context_dispatch_current(
+                    self.admission["attempt_id"],
+                    turn_lease_holder=getattr(self.agent, "_active_session_turn_lease_holder", None),
+                )
+            except Exception as exc:
+                raise ContextDispatchError(getattr(exc, "code", "CONTEXT_DISPATCH_SETTLEMENT_UNKNOWN")) from None
+            try:
+                callback(*args, **kwargs)
+            except Exception:
+                logging.getLogger(__name__).debug("Buffered stream observer failed", exc_info=True)
+        self.events.clear()
 
 
 class AutomaticRebaseStatus(str, Enum):
@@ -191,18 +384,13 @@ def _carry_session_scoped_state(
 def _transfer_run_custody(agent: Any, old_session_id: str, new_session_id: str) -> None:
     custody = getattr(agent, "_run_checkpoint_custody", None)
     if custody is None:
+        db = getattr(agent, "_session_db", None)
+        if db is not None and db.list_run_custody_for_session(new_session_id):
+            raise AutomaticRebaseError("RUN_CUSTODY_RECONCILIATION_REQUIRED")
         return
     holder = getattr(agent, "_active_session_turn_lease_holder", None)
-    ttl = float(
-        getattr(agent, "_active_session_turn_lease_ttl_seconds", 300.0) or 300.0
-    )
     try:
-        custody.transfer_session(
-            holder,
-            old_session_id=old_session_id,
-            new_session_id=new_session_id,
-            ttl_seconds=ttl,
-        )
+        custody.reconcile_context_rebase(holder, new_session_id)
     except Exception:
         raise AutomaticRebaseError("RUN_CUSTODY_RECONCILIATION_FAILED") from None
 
@@ -220,11 +408,14 @@ def _rebind_context_engine(
             previous_messages=None,
             carry_over_context=False,
             reset_engine=False,
-            extra_context={
-                "boundary_reason": "context_rebase",
-                "session_db": db,
-            },
+            strict=True,
+            boundary_reason="context_rebase",
+            session_db=db,
         )
+        engine = getattr(agent, "context_compressor", None)
+        validator = getattr(engine, "validate_context_rebase_binding", None)
+        if callable(validator):
+            validator(session_db=db, session_id=new_session_id)
     except Exception:
         raise AutomaticRebaseError("CONTEXT_ENGINE_REBIND_FAILED") from None
 
@@ -513,12 +704,17 @@ def attempt_turn_start_context_rebase(
             "_context_rebase_snapshot_digest",
         ):
             model_config.pop(reserved_key, None)
-        db.publish_context_rebase_child(
+        custody = getattr(agent, "_run_checkpoint_custody", None)
+        publisher = db.publish_context_rebase_child if custody is None else (
+            lambda **kwargs: custody.publish_context_rebase(holder, **kwargs)
+        )
+        publisher(
             transition_id=transition_id,
             parent_session_id=parent_session_id,
             child_session_id=child_session_id,
             continuation_digest=candidate.continuation_digest,
             expected_snapshot_digest=candidate.snapshot_digest,
+            snapshot_read_limits=candidate.snapshot_read_limits,
             control_revision=candidate.control_revision,
             input_watermark=candidate.input_watermark,
             turn_lease_holder=holder,
@@ -531,6 +727,17 @@ def attempt_turn_start_context_rebase(
             profile_name=parent.get("profile_name"),
         )
     except Exception as exc:
+        # A transport/ACK failure can follow the native COMMIT. Read the
+        # canonical transition before describing it as a precommit refusal.
+        try:
+            committed = db.read_context_rebase_transition(transition_id)
+        except Exception:
+            committed = None
+        if committed is not None:
+            return reconcile_context_rebase(
+                agent, transition_id=transition_id, before_tokens=before_tokens,
+                after_tokens=after_tokens, qualified_after_tokens=qualified_after.tokens,
+            )
         code = getattr(exc, "code", "CONTEXT_REBASE_PUBLICATION_FAILED")
         return AutomaticRebaseResult(
             AutomaticRebaseStatus.BLOCKED,
@@ -541,71 +748,86 @@ def attempt_turn_start_context_rebase(
             after_tokens=after_tokens,
         )
 
+    return reconcile_context_rebase(
+        agent, transition_id=transition_id, before_tokens=before_tokens,
+        after_tokens=after_tokens, qualified_after_tokens=qualified_after.tokens,
+    )
+
+
+def reconcile_context_rebase(
+    agent: Any, *, transition_id: str | None = None,
+    before_tokens: int | None = None, after_tokens: int | None = None,
+    qualified_after_tokens: int | None = None,
+) -> AutomaticRebaseResult:
+    """Resume one durable publication; never compile or publish a second child.
+
+    The normal turn lease fences this deterministic recovery. Missing legacy
+    intent, unavailable owners or exhausted recovery budgets remain explicit
+    stops. No model/tool operation is used to wake or complete this path.
+    """
+    db = getattr(agent, "_session_db", None)
+    session_id = str(getattr(agent, "session_id", "") or "")
+    holder = getattr(agent, "_active_session_turn_lease_holder", None)
+    child_session_id = session_id
     try:
-        if _active_goal_required(db, parent_session_id):
-            if not migrate_goal_to_session(
-                parent_session_id,
-                child_session_id,
-                reason="context_rebase",
-                session_db=db,
-            ):
-                raise AutomaticRebaseError("GOAL_RECONCILIATION_FAILED")
+        if db is None:
+            raise AutomaticRebaseError("CONTEXT_REBASE_OWNER_UNAVAILABLE")
+        if transition_id is None:
+            tip = db.get_context_continuation_tip(session_id)
+            transition = db.context_rebase_transition_for_session(tip)
+        else:
+            transition = db.read_context_rebase_transition(transition_id)
+        if transition is None:
+            return AutomaticRebaseResult(AutomaticRebaseStatus.SKIPPED, "NO_PENDING_CONTEXT_REBASE", session_id)
+        transition_id = transition.transition_id
+        parent_session_id, child_session_id = transition.parent_session_id, transition.child_session_id
+        if transition.state == "ready":
+            return AutomaticRebaseResult(AutomaticRebaseStatus.SKIPPED, "CONTEXT_REBASE_ALREADY_READY", child_session_id)
+        reservation = db.begin_context_rebase_recovery(transition_id, turn_lease_holder=holder)
+        # Old publications may not have local owner transfers. Their absent
+        # recovery intent is rejected above rather than silently upgraded.
         _carry_session_scoped_state(db, parent_session_id, child_session_id)
         _transfer_run_custody(agent, parent_session_id, child_session_id)
-
-        agent.session_id = child_session_id
-        agent._session_db_created = True
-        agent._cached_system_prompt = new_system_prompt
-        _publish_runtime_session_context(agent, child_session_id)
+        child = db.get_session(child_session_id)
+        if not isinstance(child, dict) or child.get("ended_at") is not None:
+            raise AutomaticRebaseError("CONTEXT_REBASE_CHILD_NOT_LIVE")
+        new_system_prompt = child.get("system_prompt")
+        if not isinstance(new_system_prompt, str):
+            raise AutomaticRebaseError("CONTEXT_REBASE_SYSTEM_PROMPT_MISSING")
         _rebind_context_engine(agent, db, parent_session_id, child_session_id)
-
         durable_messages = db.get_messages_as_conversation(
-            child_session_id,
-            repair_alternation=True,
-            include_row_ids=True,
-            include_summary_markers=True,
+            child_session_id, repair_alternation=True,
+            include_row_ids=True, include_summary_markers=True,
         )
         if not durable_messages or durable_messages[-1].get("role") != "user":
             raise AutomaticRebaseError("SUCCESSOR_DURABLE_USER_ANCHOR_MISSING")
-
-        # The child rows were inserted by publish_context_rebase_child.  Reset
-        # flush cursors and use born-durable materialized rows so the turn-end
-        # flush cannot append the bootstrap a second time.
+        db.mark_context_rebase_ready(
+            transition_id, expected_continuation_digest=transition.continuation_digest,
+            expected_child_session_id=child_session_id,
+            before_tokens=before_tokens, after_tokens=after_tokens,
+            turn_lease_holder=holder, recovery_attempt=reservation["attempts"],
+        )
+        agent.session_id = child_session_id
+        agent._session_db_created = True
+        agent._cached_system_prompt = new_system_prompt
         agent._flushed_db_message_ids = set()
         agent._last_flushed_db_idx = 0
         agent._flushed_db_message_session_id = child_session_id
-
-        db.mark_context_rebase_ready(
-            transition_id,
-            expected_continuation_digest=candidate.continuation_digest,
-            expected_child_session_id=child_session_id,
-            before_tokens=before_tokens,
-            after_tokens=after_tokens,
-        )
+        _publish_runtime_session_context(agent, child_session_id)
     except Exception as exc:
-        _mark_reconciliation_required(db, transition_id)
-        code = (
-            str(exc)
-            if isinstance(exc, AutomaticRebaseError)
-            else getattr(exc, "code", "CONTEXT_REBASE_RECONCILIATION_FAILED")
+        if db is not None and transition_id is not None:
+            _mark_reconciliation_required(db, transition_id)
+        code = str(exc) if isinstance(exc, AutomaticRebaseError) else getattr(
+            exc, "code", "CONTEXT_REBASE_RECONCILIATION_FAILED"
         )
         return AutomaticRebaseResult(
-            AutomaticRebaseStatus.RECONCILIATION_REQUIRED,
-            str(code),
-            child_session_id,
-            transition_id=transition_id,
-            before_tokens=before_tokens,
-            after_tokens=after_tokens,
+            AutomaticRebaseStatus.RECONCILIATION_REQUIRED, str(code), child_session_id,
+            transition_id=transition_id, before_tokens=before_tokens, after_tokens=after_tokens,
         )
-
     return AutomaticRebaseResult(
-        status=AutomaticRebaseStatus.READY,
-        reason="CONTEXT_REBASE_READY",
-        session_id=child_session_id,
-        messages=tuple(durable_messages),
-        system_prompt=new_system_prompt,
-        transition_id=transition_id,
-        before_tokens=before_tokens,
-        after_tokens=after_tokens,
-        qualified_after_tokens=qualified_after.tokens,
+        status=AutomaticRebaseStatus.READY, reason="CONTEXT_REBASE_READY",
+        session_id=child_session_id, messages=tuple(durable_messages),
+        system_prompt=new_system_prompt, transition_id=transition_id,
+        before_tokens=before_tokens, after_tokens=after_tokens,
+        qualified_after_tokens=qualified_after_tokens,
     )

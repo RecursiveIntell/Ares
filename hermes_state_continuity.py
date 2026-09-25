@@ -13,6 +13,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+import math
 import re
 import time
 from typing import Any, Dict, List, Optional
@@ -25,6 +26,7 @@ _CONTEXT_REBASE_SCHEMA = "SessionDBContextRebaseV1"
 _CONTEXT_REBASE_EPISODE_SCHEMA = "SessionDBContextRebaseEpisodeV1"
 _CONTEXT_REBASE_KEY_PREFIX = "context-rebase:"
 _CONTEXT_REBASE_EPISODE_KEY_PREFIX = "context-rebase-episode:"
+_CONTEXT_REBASE_RECOVERY_PREFIX = "context-rebase-recovery:"
 _CONTEXT_REBASE_END_REASON = "context_rebase"
 _ALLOWED_STATES = {"committed_pending_activation", "ready", "reconciliation_required", "cancelled"}
 _ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,191}")
@@ -212,6 +214,15 @@ class ContextRebaseSnapshot:
     heartbeat_raw: Optional[str]
     loop_raw: Optional[str]
     todo_json: Optional[str]
+    run_custodies: tuple[Dict[str, Any], ...] = ()
+    read_limits: tuple[int, int, int, int] = (12, 32, 32, 128)
+    control_raw: Optional[str] = None
+
+    @property
+    def has_unresolved_effects(self) -> bool:
+        return bool(self.unresolved_effects or any(
+            value["checkpoint"]["unresolved_effects"] for value in self.run_custodies
+        ))
 
     @property
     def digest(self) -> str:
@@ -634,13 +645,128 @@ class SessionContextContinuityMixin:
         ).fetchone()
         if int(final["watermark"] if final else 0) != watermark:
             raise ContextContinuationError("CONTEXT_REBASE_SNAPSHOT_CHANGED")
+        custody = self._run_custodies_for_session_on_conn(conn, session_id)
+        safe_custody = tuple({
+            "run_id": value.run_id,
+            "generation": value.generation,
+            "origin_session_id": value.origin_session_id,
+            "current_session_id": value.current_session_id,
+            "checkpoint": asdict(value.checkpoint),
+        } for _, value in sorted(custody.values(), key=lambda item: item[1].run_id))
+        control_row = conn.execute("SELECT value FROM state_meta WHERE key=?", (
+            "context-control:" + str(root),
+        )).fetchone()
         return ContextRebaseSnapshot(
             session_id, str(root), session["profile_name"], session["cwd"],
             session["git_branch"], session["git_repo_root"], watermark,
             control_revision, first_user, authentic_users, current_users,
             latest_summary, recent_events, unresolved_effects, goal_raw,
-            heartbeat_raw, loop_raw, todo_json,
+            heartbeat_raw, loop_raw, todo_json, safe_custody,
+            (recent_limit, user_limit, unresolved_effect_limit, authentic_user_limit),
+            None if control_row is None else control_row[0],
         )
+
+    def record_context_stop(self, session_id):
+        """Linearize an explicit user stop with the existing dispatch owner."""
+        def write(conn):
+            root = str(self._session_turn_lease_key_on_conn(conn, session_id))
+            key = "context-control:" + root
+            row = conn.execute("SELECT value FROM state_meta WHERE key=?", (key,)).fetchone()
+            previous = {} if row is None else _strict_json(row[0])
+            watermark = conn.execute("SELECT COALESCE(MAX(id),0) FROM messages").fetchone()[0]
+            value = {"schema": "SessionDBContextControlV1", "revision": previous.get("revision", 0) + 1,
+                     "stopped": True, "stopped_at": time.time(), "input_watermark": watermark}
+            conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                         (key, _canonical(value)))
+            return value
+        return self._execute_write(write)
+
+    def admit_context_dispatch(self, session_id, *, turn_lease_holder, attempt_id,
+                               expected_snapshot_digest, payload_digest, route_ref):
+        """Seal one final request and consume its intent in the native owner.
+
+        The admitted record is immutable. Repeated delivery never replays an
+        effect; a caller must settle the existing attempt through owner state.
+        """
+        _digest(expected_snapshot_digest)
+        _digest(payload_digest)
+        _identity(attempt_id, "INVALID_DISPATCH_ATTEMPT")
+        if type(route_ref) is not str or not route_ref or len(route_ref) > 2048:
+            raise ContextContinuationError("INVALID_DISPATCH_ROUTE")
+        key = "context-dispatch:" + attempt_id
+
+        def write(conn):
+            self._assert_context_rebase_lease_on_conn(conn, session_id, turn_lease_holder)
+            snapshot = self._read_context_rebase_snapshot_on_conn(conn, session_id)
+            if snapshot.control_raw is not None:
+                control = _strict_json(snapshot.control_raw)
+                if (control.get("schema") != "SessionDBContextControlV1"
+                        or type(control.get("input_watermark")) is not int
+                        or snapshot.control_revision <= control["input_watermark"]):
+                    raise ContextContinuationError("CONTEXT_DISPATCH_STOPPED")
+            if snapshot.digest != expected_snapshot_digest:
+                raise ContextContinuationError("CONTEXT_DISPATCH_STALE_MATERIALIZATION")
+            if snapshot.has_unresolved_effects:
+                raise ContextContinuationError("CONTEXT_DISPATCH_UNRESOLVED_EFFECTS")
+            prior = conn.execute("SELECT value FROM state_meta WHERE key=?", (key,)).fetchone()
+            if prior is not None:
+                old = _strict_json(prior[0])
+                if old.get("payload_digest") != payload_digest or old.get("session_id") != session_id:
+                    raise ContextContinuationError("CONTEXT_DISPATCH_INTENT_COLLISION")
+                raise ContextContinuationError("CONTEXT_DISPATCH_ALREADY_ADMITTED")
+            record = {"schema": "SessionDBContextDispatchV1", "attempt_id": attempt_id,
+                      "session_id": session_id, "conversation_root": snapshot.conversation_root,
+                      "snapshot_digest": expected_snapshot_digest, "payload_digest": payload_digest,
+                      "route_ref": route_ref, "control_revision": snapshot.control_revision,
+                      "input_watermark": snapshot.input_watermark, "admitted_at": time.time()}
+            conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?)", (key, _canonical(record)))
+            return record
+        return self._execute_write(write)
+
+    def settle_context_dispatch_response(self, attempt_id, *, turn_lease_holder):
+        """Attach response disposition to its attempt and reject stale consumption."""
+        _identity(attempt_id, "INVALID_DISPATCH_ATTEMPT")
+
+        def write(conn):
+            row = conn.execute("SELECT value FROM state_meta WHERE key=?", ("context-dispatch:" + attempt_id,)).fetchone()
+            if row is None:
+                raise ContextContinuationError("CONTEXT_DISPATCH_NOT_ADMITTED")
+            admitted = _strict_json(row[0])
+            key = "context-dispatch-result:" + attempt_id
+            if conn.execute("SELECT 1 FROM state_meta WHERE key=?", (key,)).fetchone() is not None:
+                return "CONTEXT_DISPATCH_RESPONSE_ALREADY_SETTLED"
+            reason = None
+            try:
+                self._assert_context_rebase_lease_on_conn(conn, admitted["session_id"], turn_lease_holder)
+                snapshot = self._read_context_rebase_snapshot_on_conn(conn, admitted["session_id"])
+                if snapshot.digest != admitted["snapshot_digest"]:
+                    reason = "CONTEXT_DISPATCH_RESPONSE_SUPERSEDED"
+            except ContextContinuationError as exc:
+                reason = exc.code
+            result = {"schema": "SessionDBContextDispatchResultV1", "attempt_id": attempt_id,
+                      "payload_digest": admitted["payload_digest"], "settled_at": time.time(),
+                      "disposition": "quarantined" if reason else "response_received",
+                      "reason": reason}
+            conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?)", (key, _canonical(result)))
+            return reason
+        reason = self._execute_write(write)
+        if reason is not None:
+            raise ContextContinuationError(reason)
+
+    def assert_context_dispatch_current(self, attempt_id, *, turn_lease_holder):
+        """Fence each buffered response delivery against the admitted source."""
+        _identity(attempt_id, "INVALID_DISPATCH_ATTEMPT")
+
+        def read(conn):
+            row = conn.execute("SELECT value FROM state_meta WHERE key=?", ("context-dispatch:" + attempt_id,)).fetchone()
+            if row is None:
+                raise ContextContinuationError("CONTEXT_DISPATCH_NOT_ADMITTED")
+            admitted = _strict_json(row[0])
+            self._assert_context_rebase_lease_on_conn(conn, admitted["session_id"], turn_lease_holder)
+            current = self._read_context_rebase_snapshot_on_conn(conn, admitted["session_id"])
+            if current.digest != admitted["snapshot_digest"]:
+                raise ContextContinuationError("CONTEXT_DISPATCH_RESPONSE_SUPERSEDED")
+        self._execute_write(read)
 
     def read_context_rebase_transition(self, transition_id: str) -> Optional[ContextRebaseTransition]:
         raw = self.get_meta(self._context_rebase_key(transition_id))
@@ -689,6 +815,60 @@ class SessionContextContinuityMixin:
             raise ContextContinuationError("CONTEXT_REBASE_NOT_READY")
         return transition
 
+    def _assert_context_rebase_lease_on_conn(self, conn, session_id, holder):
+        root = self._session_turn_lease_key_on_conn(conn, session_id)
+        lease = conn.execute(
+            "SELECT holder,expires_at FROM session_turn_leases WHERE conversation_id=?", (root,)
+        ).fetchone()
+        try:
+            expiry = float(lease["expires_at"]) if lease is not None else 0
+        except (TypeError, ValueError, OverflowError):
+            expiry = 0
+        if (not holder or lease is None or lease["holder"] != holder
+                or not math.isfinite(expiry) or expiry <= time.time()):
+            raise ContextContinuationError("TURN_LEASE_MISMATCH")
+
+    def begin_context_rebase_recovery(self, transition_id, *, turn_lease_holder):
+        """Reserve bounded deterministic reconciliation under the live turn owner.
+
+        The wake dependency and attempts belong to the existing SessionDB
+        transition, not another scheduler. Restart may retry the same intent;
+        it cannot mint a fresh child or reset its deadline and attempt budget.
+        """
+        key = self._context_rebase_key(transition_id)
+
+        def write(conn):
+            row = conn.execute("SELECT value FROM state_meta WHERE key=?", (key,)).fetchone()
+            if row is None:
+                raise ContextContinuationError("CONTEXT_REBASE_NOT_FOUND")
+            transition = ContextRebaseTransition.from_raw(row[0])
+            self._assert_context_rebase_lease_on_conn(conn, transition.child_session_id, turn_lease_holder)
+            if transition.state not in {"committed_pending_activation", "reconciliation_required"}:
+                raise ContextContinuationError("CONTEXT_REBASE_NOT_ACTIVATABLE")
+            recovery_key = _CONTEXT_REBASE_RECOVERY_PREFIX + transition_id
+            row = conn.execute("SELECT value FROM state_meta WHERE key=?", (recovery_key,)).fetchone()
+            if row is None:
+                raise ContextContinuationError("CONTEXT_REBASE_LEGACY_RECOVERY_REQUIRED")
+            recovery = _strict_json(row[0])
+            if (recovery.get("schema") != "SessionDBContextRebaseRecoveryV1"
+                    or recovery.get("transition_id") != transition_id
+                    or recovery.get("child_session_id") != transition.child_session_id
+                    or recovery.get("continuation_digest") != transition.continuation_digest
+                    or type(recovery.get("attempts")) is not int
+                    or type(recovery.get("deadline_at")) not in (int, float)
+                    or not math.isfinite(recovery["deadline_at"])
+                    or recovery["attempts"] < 0):
+                raise ContextContinuationError("CONTEXT_REBASE_RECOVERY_INVALID")
+            if recovery["attempts"] >= 3 or time.time() >= recovery["deadline_at"]:
+                raise ContextContinuationError("CONTEXT_REBASE_RECOVERY_EXHAUSTED")
+            recovery["attempts"] += 1
+            recovery["holder_digest"] = hashlib.sha256(turn_lease_holder.encode()).hexdigest()
+            recovery["next_check_at"] = time.time()
+            conn.execute("UPDATE state_meta SET value=? WHERE key=?", (_canonical(recovery), recovery_key))
+            return recovery
+
+        return self._execute_write(write)
+
     def publish_context_rebase_child(
         self,
         *,
@@ -707,6 +887,8 @@ class SessionContextContinuityMixin:
         system_prompt: str = None,
         cwd: str = None,
         profile_name: str = None,
+        custody_transfers: tuple = (),
+        snapshot_read_limits: tuple = (12, 32, 32, 128),
     ) -> ContextRebaseTransition:
         """Atomically publish one complete local successor and close its parent.
 
@@ -728,6 +910,10 @@ class SessionContextContinuityMixin:
             raise ContextContinuationError("CONTEXT_REBASE_EMPTY_CHILD")
         if type(model_config) not in (dict, type(None)):
             raise ContextContinuationError("CONTEXT_REBASE_MODEL_CONFIG")
+        if (type(snapshot_read_limits) is not tuple or len(snapshot_read_limits) != 4
+                or any(type(n) is not int or not 1 <= n <= maximum
+                       for n, maximum in zip(snapshot_read_limits, (64, 128, 128, 512)))):
+            raise ContextContinuationError("INVALID_SNAPSHOT_READ_LIMITS")
 
         key = self._context_rebase_key(transition_id)
         requested_identity = {
@@ -793,7 +979,12 @@ class SessionContextContinuityMixin:
             # Compare all compiled SessionDB observations under this same
             # BEGIN IMMEDIATE, before any successor row or parent closure.
             try:
-                current_snapshot = self._read_context_rebase_snapshot_on_conn(conn, parent_session_id)
+                current_snapshot = self._read_context_rebase_snapshot_on_conn(
+                    conn, parent_session_id, **dict(zip(
+                        ("recent_limit", "user_limit", "unresolved_effect_limit", "authentic_user_limit"),
+                        snapshot_read_limits,
+                    )),
+                )
             except ContextContinuationError:
                 raise ContextContinuationError("CONTEXT_REBASE_STALE_SNAPSHOT") from None
             if (current_snapshot.digest != expected_snapshot_digest
@@ -858,12 +1049,64 @@ class SessionContextContinuityMixin:
                 "committed_pending_activation", now, None,
             )
             conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?)", (key, transition.raw()))
+            self._transfer_context_rebase_custodies_on_conn(
+                conn, old_session_id=parent_session_id, new_session_id=child_session_id,
+                expected=custody_transfers, lease_holder=turn_lease_holder,
+            )
+            self._migrate_context_rebase_owners_on_conn(conn, parent_session_id, child_session_id)
+            recovery = {
+                "schema": "SessionDBContextRebaseRecoveryV1",
+                "transition_id": transition_id,
+                "child_session_id": child_session_id,
+                "continuation_digest": continuation_digest,
+                "attempts": 0,
+                "holder_digest": None,
+                "wake_dependency": "live_turn_lease_and_owner_reconciliation",
+                "next_check_at": now,
+                "deadline_at": now + 900,
+            }
+            conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?)", (
+                _CONTEXT_REBASE_RECOVERY_PREFIX + transition_id, _canonical(recovery),
+            ))
             return transition, row_ids
 
         transition, row_ids = self._execute_write(_do)
         if row_ids is not None:
             self._publish_message_row_ids(messages, row_ids)
         return transition
+
+    def _migrate_context_rebase_owners_on_conn(self, conn, parent_session_id, child_session_id):
+        """Apply owner-defined transformations in the child publication transaction."""
+        from hermes_cli.goals import GoalState, goal_session_migration
+        from hermes_cli.heartbeat import HeartbeatState, heartbeat_session_migration
+        from hermes_cli.loops import LoopState, loop_session_migration
+
+        def raw(key):
+            row = conn.execute("SELECT value FROM state_meta WHERE key=?", (key,)).fetchone()
+            return None if row is None else row[0]
+
+        changes = []
+        for owner, state_type, migrate in (
+            ("goal", GoalState, goal_session_migration),
+            ("heartbeat", HeartbeatState, heartbeat_session_migration),
+            ("loop", LoopState, loop_session_migration),
+        ):
+            try:
+                parent_raw = raw(f"{owner}:{parent_session_id}")
+                child_raw = raw(f"{owner}:{child_session_id}")
+                migrated, updates = migrate(
+                    parent_session_id, child_session_id,
+                    parent_raw, child_raw,
+                    **({"reason": "context_rebase"} if owner == "goal" else {}),
+                )
+                required = parent_raw is not None and state_type.from_json(parent_raw).status != "cleared"
+                if not migrated and (required or child_raw is not None):
+                    raise ValueError("unacknowledged owner transfer")
+            except Exception:
+                raise ContextContinuationError(f"{owner.upper()}_RECONCILIATION_FAILED") from None
+            changes.extend(updates)
+        if not self._compare_and_set_meta_many_on_conn(conn, changes):
+            raise ContextContinuationError("CONTEXT_REBASE_OWNER_CHANGED")
 
     def mark_context_rebase_ready(
         self,
@@ -873,6 +1116,8 @@ class SessionContextContinuityMixin:
         expected_child_session_id: str,
         before_tokens: Optional[int] = None,
         after_tokens: Optional[int] = None,
+        turn_lease_holder: Optional[str] = None,
+        recovery_attempt: Optional[int] = None,
     ) -> ContextRebaseTransition:
         """Mark the local transition ready after external owner reconciliation."""
         key = self._context_rebase_key(transition_id)
@@ -899,6 +1144,25 @@ class SessionContextContinuityMixin:
                 "reconciliation_required",
             }:
                 raise ContextContinuationError("CONTEXT_REBASE_NOT_ACTIVATABLE")
+            self._assert_context_rebase_lease_on_conn(conn, old.child_session_id, turn_lease_holder)
+            recovery_key = _CONTEXT_REBASE_RECOVERY_PREFIX + transition_id
+            recovery_row = conn.execute("SELECT value FROM state_meta WHERE key=?", (recovery_key,)).fetchone()
+            recovery = {} if recovery_row is None else _strict_json(recovery_row[0])
+            if (recovery.get("schema") != "SessionDBContextRebaseRecoveryV1"
+                    or recovery.get("transition_id") != old.transition_id
+                    or recovery.get("child_session_id") != old.child_session_id
+                    or recovery.get("continuation_digest") != old.continuation_digest
+                    or type(recovery_attempt) is not int
+                    or not 1 <= recovery_attempt <= 3
+                    or recovery.get("attempts") != recovery_attempt
+                    or recovery.get("holder_digest") != hashlib.sha256(turn_lease_holder.encode()).hexdigest()):
+                raise ContextContinuationError("CONTEXT_REBASE_RECOVERY_FENCE_MISMATCH")
+            if (type(recovery.get("deadline_at")) not in (int, float)
+                    or not math.isfinite(recovery["deadline_at"])
+                    or time.time() >= recovery["deadline_at"]):
+                raise ContextContinuationError("CONTEXT_REBASE_RECOVERY_EXHAUSTED")
+            recovery["completed_attempt"] = recovery_attempt
+            conn.execute("UPDATE state_meta SET value=? WHERE key=?", (_canonical(recovery), recovery_key))
             child = conn.execute("SELECT ended_at,model_config FROM sessions WHERE id=?", (old.child_session_id,)).fetchone()
             if child is None or child["ended_at"] is not None or not self._context_rebase_child_matches(child, old.parent_session_id):
                 raise ContextContinuationError("CONTEXT_REBASE_CHILD_NOT_LIVE")

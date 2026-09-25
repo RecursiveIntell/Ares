@@ -78,6 +78,46 @@ def test_unknown_effect_cannot_become_normal_execution_authority(setup):
     assert transitions == []
 
 
+def test_custody_owned_unknown_effect_is_not_omitted_from_candidate(setup):
+    import hashlib
+    from hermes_state_runs import RunCheckpoint
+
+    db, _, _, _, _ = setup
+    goal = GoalState(goal="Inspect", created_at=1.0).to_json()
+    db.set_meta("goal:immutable-history", goal)
+    digest = lambda text: hashlib.sha256(text.encode()).hexdigest()
+    checkpoint = RunCheckpoint(digest("plan"), digest("contract"), digest("source"), "inspect",
+                               (("historical-goal-key", "goal:immutable-history"),),
+                               ("external-write:unknown",), (), ("do not publish",))
+    db.claim_run_custody_checked("run1", lease_holder="holder", expected_generation=0,
+        checkpoint=checkpoint, origin_session_id="s0", current_session_id="s0",
+        historical_goal_digest=digest(goal))
+    result = _attempt(setup)
+    assert result.reason == "CONTEXT_REBASE_UNRESOLVED_EFFECTS"
+    assert db.get_session("s0")["ended_at"] is None
+
+
+def test_nondefault_snapshot_limits_are_bound_through_publication(setup):
+    from ares_runtime.continuity.live import build_live_candidate
+
+    db, agent, _, _, _ = setup
+    for index in range(6):
+        db.append_message("s0", "assistant", f"observation {index}")
+    db.append_message("s0", "user", "Current input")
+    candidate = build_live_candidate(db, session_id="s0", recent_limit=4)
+    result = db.publish_context_rebase_child(
+        transition_id="nondefault", parent_session_id="s0", child_session_id="nondefault-child",
+        continuation_digest=candidate.continuation_digest,
+        expected_snapshot_digest=candidate.snapshot_digest,
+        snapshot_read_limits=candidate.snapshot_read_limits,
+        control_revision=candidate.control_revision, input_watermark=candidate.input_watermark,
+        turn_lease_holder="holder", source="cli", messages=list(candidate.child_messages),
+        system_prompt=agent._cached_system_prompt, profile_name="p1",
+    )
+    assert result.state == "committed_pending_activation"
+    assert db.get_context_continuation_tip("s0") == "nondefault-child"
+
+
 def test_snapshot_is_one_wal_transaction_and_releases_reader(setup, monkeypatch):
     db, _, _, _, _ = setup
     if not db._wal_active:

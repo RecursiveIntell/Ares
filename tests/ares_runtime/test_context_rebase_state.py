@@ -30,7 +30,7 @@ def db(tmp_path):
     value.close()
 
 
-def _publish(db, *, transition="tx1", parent="s0", child="s1", digest=None, watermark=None):
+def _publish(db, *, transition="tx1", parent="s0", child="s1", digest=None, watermark=None, custody=()):
     if watermark is None:
         watermark = db.get_active_message_watermark(parent)
     prior = db.read_context_rebase_transition(transition)
@@ -56,7 +56,16 @@ def _publish(db, *, transition="tx1", parent="s0", child="s1", digest=None, wate
         model_config={"temperature": 0},
         system_prompt="trusted base prompt",
         profile_name="p1",
+        custody_transfers=custody,
     )
+
+
+def _ready(db, transition_id, **kwargs):
+    transition = db.read_context_rebase_transition(transition_id)
+    if transition.state != "ready":
+        recovery = db.begin_context_rebase_recovery(transition_id, turn_lease_holder="holder")
+        kwargs.update(turn_lease_holder="holder", recovery_attempt=recovery["attempts"])
+    return db.mark_context_rebase_ready(transition_id, **kwargs)
 
 
 def test_atomic_publication_creates_complete_pending_child_and_closes_parent(db):
@@ -114,12 +123,12 @@ def test_retry_same_transition_is_idempotent_but_changed_binding_refuses(db):
 def test_ready_requires_exact_child_and_continuation(db):
     _publish(db)
     with pytest.raises(ContextContinuationError, match="CONTEXT_REBASE_READY_BINDING_MISMATCH"):
-        db.mark_context_rebase_ready("tx1", expected_continuation_digest="sha256:" + "b" * 64,
+        _ready(db, "tx1", expected_continuation_digest="sha256:" + "b" * 64,
                                      expected_child_session_id="s1")
-    ready = db.mark_context_rebase_ready("tx1", expected_continuation_digest="sha256:" + "a" * 64,
+    ready = _ready(db, "tx1", expected_continuation_digest="sha256:" + "a" * 64,
                                          expected_child_session_id="s1")
     assert ready.state == "ready" and ready.ready_at is not None
-    assert db.mark_context_rebase_ready("tx1", expected_continuation_digest="sha256:" + "a" * 64,
+    assert _ready(db, "tx1", expected_continuation_digest="sha256:" + "a" * 64,
                                         expected_child_session_id="s1") == ready
 
 
@@ -129,6 +138,50 @@ def test_resume_and_turn_lease_follow_rebase_tip(db):
     assert db._session_turn_lease_key("s1") == db._session_turn_lease_key("s0")
     assert db.refresh_session_turn_lease("s1", "holder", ttl_seconds=300)
     assert not db.try_acquire_session_turn_lease("s1", "competing", ttl_seconds=300)
+
+
+@pytest.mark.parametrize("owner", ["goal", "heartbeat", "loop"])
+def test_conflicting_child_owner_rolls_back_whole_publication(db, owner):
+    from hermes_cli.goals import GoalState
+    from hermes_cli.heartbeat import HeartbeatState
+    from hermes_cli.loops import LoopState
+
+    parent, child = {
+        "goal": (GoalState(goal="Original", created_at=1), GoalState(goal="Unrelated", created_at=2)),
+        "heartbeat": (HeartbeatState(prompt="Original", interval_seconds=60, created_at=1),
+                      HeartbeatState(prompt="Unrelated", interval_seconds=60, created_at=2)),
+        "loop": (LoopState(prompt="Original", created_at=1), LoopState(prompt="Unrelated", created_at=2)),
+    }[owner]
+    db.set_meta(f"{owner}:s0", parent.to_json())
+    db.set_meta(f"{owner}:s1", child.to_json())
+    with pytest.raises(ContextContinuationError, match=f"{owner.upper()}_RECONCILIATION_FAILED"):
+        _publish(db)
+    assert db.get_session("s0")["ended_at"] is None
+    assert db.get_session("s1") is None
+    assert db.read_context_rebase_transition("tx1") is None
+    assert db.get_meta("context-rebase-recovery:tx1") is None
+    assert db.get_meta(f"{owner}:s0") == parent.to_json()
+    assert db.get_meta(f"{owner}:s1") == child.to_json()
+
+
+@pytest.mark.parametrize("invalid", ["omitted", "wrong_holder", "stale", "expired", "exhausted"])
+def test_native_ready_requires_current_bounded_recovery_reservation(db, invalid):
+    transition = _publish(db)
+    reservation = db.begin_context_rebase_recovery("tx1", turn_lease_holder="holder")
+    args = dict(turn_lease_holder="holder", recovery_attempt=reservation["attempts"])
+    if invalid == "omitted":
+        args = {}
+    elif invalid == "wrong_holder":
+        args["turn_lease_holder"] = "other"
+    elif invalid == "stale":
+        db.begin_context_rebase_recovery("tx1", turn_lease_holder="holder")
+    else:
+        reservation["deadline_at" if invalid == "expired" else "attempts"] = 0 if invalid == "expired" else 4
+        db.set_meta("context-rebase-recovery:tx1", json.dumps(reservation))
+    with pytest.raises(ContextContinuationError):
+        db.mark_context_rebase_ready("tx1", expected_continuation_digest=transition.continuation_digest,
+                                     expected_child_session_id="s1", **args)
+    assert db.read_context_rebase_transition("tx1").state == "committed_pending_activation"
 
 
 def test_explicit_branch_child_does_not_replace_rebase_tip(db):
@@ -171,11 +224,8 @@ def test_custody_transfer_preserves_owner_checkpoint_and_historical_binding(db):
         "run1", lease_holder="holder", expected_generation=0, checkpoint=checkpoint,
         origin_session_id="s0", current_session_id="s0", historical_goal_digest=_sha(goal),
     )
-    _publish(db)
-    moved = db.transfer_run_session(
-        "run1", owner_token=owner.owner_token, expected_generation=owner.generation,
-        expected_session_id="s0", new_session_id="s1", ttl_seconds=300,
-    )
+    _publish(db, custody=(owner,))
+    moved = db.read_run_custody("run1")
     assert moved.current_session_id == "s1"
     assert moved.origin_session_id == "s0"
     assert moved.owner_token == owner.owner_token
@@ -260,7 +310,7 @@ def test_post_publish_ambiguity_enters_reconciliation_required(db):
     assert db.mark_context_rebase_reconciliation_required(transition.transition_id) == updated
     with pytest.raises(ContextContinuationError, match="CONTEXT_REBASE_NOT_READY"):
         db.assert_context_rebase_ready_for_turn(transition.child_session_id)
-    recovered = db.mark_context_rebase_ready(
+    recovered = _ready(db,
         transition.transition_id,
         expected_continuation_digest=transition.continuation_digest,
         expected_child_session_id=transition.child_session_id,
@@ -272,7 +322,7 @@ def test_post_publish_ambiguity_enters_reconciliation_required(db):
 
 def test_ready_rebase_cannot_be_demoted_to_reconciliation(db):
     transition = _publish(db)
-    ready = db.mark_context_rebase_ready(
+    ready = _ready(db,
         transition.transition_id,
         expected_continuation_digest=transition.continuation_digest,
         expected_child_session_id=transition.child_session_id,
@@ -291,7 +341,7 @@ def test_pending_child_refuses_ordinary_turn_admission(db):
 
 def test_ready_child_allows_ordinary_turn_admission(db):
     transition = _publish(db)
-    ready = db.mark_context_rebase_ready(
+    ready = _ready(db,
         transition.transition_id,
         expected_continuation_digest=transition.continuation_digest,
         expected_child_session_id=transition.child_session_id,
@@ -324,7 +374,7 @@ def test_title_transfers_from_rebase_ancestor_to_live_tip(db):
 
 def test_rebase_episode_is_conversation_scoped_and_resets_only_explicitly(db):
     first = _publish(db, transition="tx1", parent="s0", child="s1")
-    db.mark_context_rebase_ready(
+    _ready(db,
         first.transition_id,
         expected_continuation_digest=first.continuation_digest,
         expected_child_session_id="s1",
@@ -336,7 +386,7 @@ def test_rebase_episode_is_conversation_scoped_and_resets_only_explicitly(db):
 
     db.append_message("s1", "user", "continue")
     second = _publish(db, transition="tx2", parent="s1", child="s2")
-    db.mark_context_rebase_ready(
+    _ready(db,
         second.transition_id,
         expected_continuation_digest=second.continuation_digest,
         expected_child_session_id="s2",
@@ -378,16 +428,10 @@ def test_twenty_rebases_preserve_one_lineage_and_run_custody(db):
             parent=parent,
             child=child,
             digest="sha256:" + f"{index:064x}",
+            custody=(owner,),
         )
-        owner = db.transfer_run_session(
-            "run-long",
-            owner_token=owner.owner_token,
-            expected_generation=owner.generation,
-            expected_session_id=parent,
-            new_session_id=child,
-            ttl_seconds=300,
-        )
-        db.mark_context_rebase_ready(
+        owner = db.read_run_custody("run-long")
+        _ready(db,
             transition.transition_id,
             expected_continuation_digest=transition.continuation_digest,
             expected_child_session_id=child,
@@ -459,7 +503,7 @@ def test_restart_after_ready_preserves_admission_and_episode(tmp_path):
     db.append_message("s0", "user", "original task")
     assert db.try_acquire_session_turn_lease("s0", "holder", ttl_seconds=300)
     transition = _publish(db)
-    ready = db.mark_context_rebase_ready(
+    ready = _ready(db,
         transition.transition_id,
         expected_continuation_digest=transition.continuation_digest,
         expected_child_session_id="s1",
@@ -534,7 +578,7 @@ def test_unresolved_effect_from_ancestor_survives_rebase(db):
         effect_disposition="unknown",
     )
     transition = _publish(db)
-    db.mark_context_rebase_ready(
+    _ready(db,
         transition.transition_id,
         expected_continuation_digest=transition.continuation_digest,
         expected_child_session_id="s1",

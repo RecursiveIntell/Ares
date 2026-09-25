@@ -463,6 +463,26 @@ def list_active_loops() -> List[Tuple[str, LoopState]]:
     return out
 
 
+def loop_session_migration(old_session_id, new_session_id, parent_raw, child_raw):
+    """Return the canonical loop transfer for an admitted owner transaction."""
+    if not parent_raw:
+        return False, []
+    state = LoopState.from_json(parent_raw)
+    if child_raw is not None:
+        existing = LoopState.from_json(child_raw)
+        left, right = asdict(state), asdict(existing)
+        left["status"] = right["status"]
+        return bool(state.status == "cleared" and existing.status != "cleared" and left == right), []
+    if state.status == "cleared":
+        return False, []
+    archived = LoopState.from_json(parent_raw)
+    archived.status = "cleared"
+    return True, [
+        (_meta_key(old_session_id), parent_raw, archived.to_json()),
+        (_meta_key(new_session_id), None, state.to_json()),
+    ]
+
+
 def migrate_loop_to_session(
     old_session_id: str,
     new_session_id: str,
@@ -477,35 +497,12 @@ def migrate_loop_to_session(
         db = session_db if session_db is not None else _get_session_db()
         if db is None or not hasattr(db, "compare_and_set_meta_many"):
             return False
-        parent_key = _meta_key(old_session_id)
-        child_key = _meta_key(new_session_id)
-        parent_raw = db.get_meta(parent_key)
-        if not parent_raw:
-            return False
-        state = LoopState.from_json(parent_raw)
-        child_raw = db.get_meta(child_key)
-        if child_raw is not None:
-            try:
-                existing = LoopState.from_json(child_raw)
-            except Exception:
-                return False
-            left = asdict(state)
-            right = asdict(existing)
-            left["status"] = right["status"]
-            return bool(
-                state.status == "cleared"
-                and existing.status != "cleared"
-                and left == right
-            )
-        if state.status == "cleared":
-            return False
-        child = LoopState.from_json(parent_raw)
-        archived = LoopState.from_json(parent_raw)
-        archived.status = "cleared"
-        migrated = bool(db.compare_and_set_meta_many([
-            (parent_key, parent_raw, archived.to_json()),
-            (child_key, None, child.to_json()),
-        ]))
+        migrated, changes = loop_session_migration(
+            old_session_id, new_session_id,
+            db.get_meta(_meta_key(old_session_id)), db.get_meta(_meta_key(new_session_id)),
+        )
+        if changes:
+            migrated = bool(db.compare_and_set_meta_many(changes))
         if migrated:
             logger.debug(
                 "LoopManager: migrated loop %s -> %s (%s)",

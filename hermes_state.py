@@ -15230,35 +15230,32 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
         validate the same preimage and silently overwrite one another within
         an apparently successful batch. Reject before entering the transaction.
         """
+        return bool(self._execute_write(
+            lambda conn: self._compare_and_set_meta_many_on_conn(conn, items)
+        ))
+
+    @staticmethod
+    def _compare_and_set_meta_many_on_conn(conn, items) -> bool:
+        """Compose metadata CAS with an existing SessionDB write transaction."""
         normalized = [(str(key), expected, str(value)) for key, expected, value in items]
         if len({key for key, _expected, _value in normalized}) != len(normalized):
             raise ValueError("duplicate keys in metadata compare-and-set batch")
         if not normalized:
             return True
 
-        def _do(conn):
-            for key, expected, _value in normalized:
-                if expected is None:
-                    row = conn.execute(
-                        "SELECT 1 FROM state_meta WHERE key = ?", (key,)
-                    ).fetchone()
-                    if row is not None:
-                        return False
-                else:
-                    row = conn.execute(
-                        "SELECT value FROM state_meta WHERE key = ?", (key,)
-                    ).fetchone()
-                    if row is None or row[0] != expected:
-                        return False
-            for key, _expected, value in normalized:
-                conn.execute(
-                    "INSERT INTO state_meta (key, value) VALUES (?, ?) "
-                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                    (key, value),
-                )
-            return True
-
-        return bool(self._execute_write(_do))
+        for key, expected, _value in normalized:
+            row = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?", (key,)
+            ).fetchone()
+            if (None if row is None else row[0]) != expected:
+                return False
+        for key, _expected, value in normalized:
+            conn.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+        return True
 
     def retag_kanban_worker_sessions(self, workspaces_root: str) -> int:
         """Retag legacy kanban worker rows from ``cli`` to ``kanban``.

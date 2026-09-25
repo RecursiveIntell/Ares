@@ -95,11 +95,16 @@
     "No installed native capability tuple, paid-provider canary or external-owner qualification in this environment."
   ],
   "remaining_delta": [
-    "Cross-owner fences/ACKs and durable crash/restart reconciliation.",
-    "Request-bound final dispatch admission and current-policy retrieval acceptance oracles.",
-    "Selected-route calibration, canary readiness, authorized live canaries and endurance.",
-    "Nondefault snapshot read limits and pre-digest transition replay/migration qualification."
+    "External/native owner fencing and acknowledgment closure",
+    "Root-scoped input and controller recovery wakeup",
+    "Goal-less checked binding and cold-process custody recovery",
+    "Current workspace/evidence/policy and retrieval qualification",
+    "Objective progress and shared recovery caps",
+    "Compatibility, selected route, canary and endurance qualification"
   ],
-  "next_gate": "Complete native cross-owner and final-dispatch owner protocol against V4 case-specific oracles.",
-  "qualification": "Bounded source repair passed; full V4 program remains incomplete."
+  "next_gate": "Complete remaining V4 source and selected-route qualification; current repair is not the task stop condition.",
+  "qualification": "Bounded source repair passed; full V4 program remains incomplete.",
+  "scope": "Cumulative PR80 implementation; latest repair is durable owner recovery and sealed final dispatch.",
+  "latest_repair_evidence": "docs/context-continuity/recovery-dispatch-evidence.json",
+  "latest_repair_audit": "passed"
 }

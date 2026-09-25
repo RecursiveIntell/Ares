@@ -799,6 +799,27 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         if self._previous_summary is None:
             self._load_prior_session_context()
 
+    def validate_context_rebase_binding(self, *, session_db, session_id) -> None:
+        """Read the real receipt owner before acknowledging a rebase binding.
+
+        Ordinary lifecycle hooks remain best-effort for legacy callers. Context
+        continuation requires a positive readback and cannot turn a warning
+        from bind_session_state into an activation acknowledgment.
+        """
+        if self._session_db is not session_db or self.session_id != session_id:
+            raise RuntimeError("GOVERNOR_REBASE_BINDING_MISMATCH")
+        expected_root = self._context_lineage_root(session_db, session_id)
+        if self._lineage_session_id != expected_root:
+            raise RuntimeError("GOVERNOR_REBASE_LINEAGE_MISMATCH")
+        records = self._run_certified_json(["pending-v2", "--dir", str(self.store_dir)], {})
+        if not isinstance(records, list):
+            raise RuntimeError("GOVERNOR_PENDING_INVENTORY_INVALID")
+        for record in records:
+            if not isinstance(record, dict) or record.get("schema") != "PendingReceiptInfoV2":
+                raise RuntimeError("GOVERNOR_PENDING_INVENTORY_INVALID")
+            if record.get("session_id") == self._governor_session_id():
+                raise RuntimeError("GOVERNOR_PENDING_RECONCILIATION_REQUIRED")
+
     def _load_prior_session_context(self) -> None:
         """Load the most recent receipt from the store as prior context.
 

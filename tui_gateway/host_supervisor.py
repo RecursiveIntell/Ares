@@ -30,6 +30,7 @@ _Thread = threading.Thread
 
 MUTATOR_ROUTE_TABLE: dict[str, str] = {
     "config.set.model": "run-concurrent",
+    "config.set.fast": "idle-gated",
     "prompt.submit": "turn-path",
     "session.interrupt": "turn-path",
     "reload.mcp": "run-concurrent",

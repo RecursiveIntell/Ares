@@ -128,6 +128,47 @@ class PressureDecision:
     execution_authorized: bool = field(default=False, init=False)
 
 
+def final_request_upper_bound(*, route_ref: str, payload: dict[str, Any]) -> InputCount:
+    """Count the final text request after middleware and transport conversion.
+
+    Byte counting is an upper bound for the supported byte-tokenized text
+    routes, not an exact tokenizer. Remote/opaque media require a different
+    owner counter. Transport timeout/header controls contain no model input.
+    """
+    _identity(route_ref, "INVALID_ROUTE")
+    if type(payload) is not dict:
+        raise BudgetError("INVALID_FINAL_PAYLOAD")
+    body = {key: value for key, value in payload.items() if key not in {
+        "timeout", "extra_headers", "headers",
+    }}
+
+    def check(value, depth=0):
+        if depth > 64:
+            raise BudgetError("INVALID_FINAL_PAYLOAD")
+        if isinstance(value, dict):
+            if value.get("type") in {
+                "image", "image_url", "input_image", "input_file", "file", "audio", "input_audio",
+                "compaction", "computer_screenshot",
+            } or any(key in value for key in ("encrypted_content", "previous_response_id", "conversation")):
+                raise BudgetError("FINAL_PAYLOAD_OPAQUE_ACCOUNTING_UNQUALIFIED")
+            for item in value.values():
+                check(item, depth + 1)
+        elif isinstance(value, list):
+            for item in value:
+                check(item, depth + 1)
+
+    check(body)
+    try:
+        raw = json.dumps(body, ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":"), allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError, RecursionError):
+        raise BudgetError("INVALID_FINAL_PAYLOAD") from None
+    items = body.get("messages", body.get("input", []))
+    count = len(items) if isinstance(items, list) else 1
+    return InputCount(route_ref, "sha256:" + hashlib.sha256(raw).hexdigest(),
+                      len(raw) + 8192 + 64 * count, CountMethod.QUALIFIED_UPPER_BOUND)
+
+
 def decide_pressure(
     budget: RouteBudget,
     current: InputCount,

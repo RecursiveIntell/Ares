@@ -120,13 +120,13 @@ function ModelEditSubmenuBody({
 
   const setFast = (enabled: boolean) => {
     if (fastControl.kind === 'variant') {
-      // Fast is a separate model id. Report the choice so the controller can
-      // record it against the base model, and only swap models now if this is
-      // the active row — inactive edits stay preference-only.
-      onSetOptions({ fast: enabled })
-
+      // A catalog-backed -fast sibling is a MODEL change, not a speed
+      // parameter on the current model. Inactive edits remain preset-only;
+      // the active row must not also send config.set fast to the old model.
       if (isActive) {
         void onSelectModel(enabled ? fastControl.fastId : fastControl.baseId)
+      } else {
+        onSetOptions({ fast: enabled })
       }
 
       return

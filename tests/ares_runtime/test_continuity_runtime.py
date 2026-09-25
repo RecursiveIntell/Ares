@@ -146,8 +146,8 @@ def test_turn_start_rebase_publishes_rebinds_and_marks_ready(setup):
     assert transition.state == "ready"
     assert transitions[-1]["old_session_id"] == "s0"
     assert transitions[-1]["new_session_id"] == result.session_id
-    assert transitions[-1]["extra_context"]["boundary_reason"] == "context_rebase"
-    assert transitions[-1]["extra_context"]["session_db"] is db
+    assert transitions[-1]["boundary_reason"] == "context_rebase"
+    assert transitions[-1]["session_db"] is db
     child_rows = db.get_messages_as_conversation(result.session_id)
     assert child_rows[-1]["role"] == "user"
     assert child_rows[-1]["content"] == "Run the concurrency regression next."

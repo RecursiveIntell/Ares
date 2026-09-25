@@ -413,6 +413,17 @@ class SessionRunCustodyMixin:
     def _commit_run(self, expected_head, value, *, require_live_owner=True,
                     predecessor_expires_ns=None, claim_lease_holder=None,
                     refresh_reference=None, validate_conn=None):
+        return self._execute_write(lambda conn: self._commit_run_on_conn(
+            conn, expected_head, value, require_live_owner=require_live_owner,
+            predecessor_expires_ns=predecessor_expires_ns,
+            claim_lease_holder=claim_lease_holder,
+            refresh_reference=refresh_reference, validate_conn=validate_conn,
+        ))
+
+    def _commit_run_on_conn(self, conn, expected_head, value, *, require_live_owner=True,
+                            predecessor_expires_ns=None, claim_lease_holder=None,
+                            refresh_reference=None, validate_conn=None):
+        """Native custody checks/writes composable with one admitted owner transaction."""
         document = asdict(value)
         if refresh_reference is not None:
             document.pop("checkpoint")
@@ -423,36 +434,34 @@ class SessionRunCustodyMixin:
         key = _head_key(value.run_id)
         member_key = generation_key(value.run_id, value.generation)
 
-        def write(conn):
-            row = conn.execute("SELECT value FROM state_meta WHERE key=?", (key,)).fetchone()
-            if (None if row is None else row[0]) != expected_head:
-                raise RunCustodyError("FENCE_MISMATCH")
-            # Recheck after waiting for SQLite admission, not only before it.
-            if require_live_owner:
-                if predecessor_expires_ns is not None and time.monotonic_ns() >= predecessor_expires_ns:
-                    raise RunCustodyError("OWNER_EXPIRED")
-                if _controller(value.controller_pid) != value.process_identity:
-                    raise RunCustodyError("STALE_PROCESS")
-                if time.monotonic_ns() >= value.expires_monotonic_ns:
-                    raise RunCustodyError("OWNER_EXPIRED")
-            if conn.execute("SELECT 1 FROM state_meta WHERE key=?", (member_key,)).fetchone():
-                raise RunCustodyError("INTEGRITY_GENERATION_EXISTS")
-            if claim_lease_holder is not None:
-                self._check_run_claim_bindings(conn, value, claim_lease_holder)
-            if validate_conn is not None:
-                validate_conn(conn)
-            if refresh_reference is not None:
-                def read_value(record_key):
-                    if record_key == member_key:
-                        return raw
-                    row = conn.execute("SELECT value FROM state_meta WHERE key=?", (record_key,)).fetchone()
-                    return None if row is None else row[0]
-                if _decode_run_record(value.run_id, value.generation, _sha(raw), read_value) != value:
-                    raise RunCustodyError("INTEGRITY_REFRESH_VALUE")
-            conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?)", (member_key, raw))
-            conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?) "
-                         "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, head))
-        self._execute_write(write)
+        row = conn.execute("SELECT value FROM state_meta WHERE key=?", (key,)).fetchone()
+        if (None if row is None else row[0]) != expected_head:
+            raise RunCustodyError("FENCE_MISMATCH")
+        # Recheck after waiting for SQLite admission, not only before it.
+        if require_live_owner:
+            if predecessor_expires_ns is not None and time.monotonic_ns() >= predecessor_expires_ns:
+                raise RunCustodyError("OWNER_EXPIRED")
+            if _controller(value.controller_pid) != value.process_identity:
+                raise RunCustodyError("STALE_PROCESS")
+            if time.monotonic_ns() >= value.expires_monotonic_ns:
+                raise RunCustodyError("OWNER_EXPIRED")
+        if conn.execute("SELECT 1 FROM state_meta WHERE key=?", (member_key,)).fetchone():
+            raise RunCustodyError("INTEGRITY_GENERATION_EXISTS")
+        if claim_lease_holder is not None:
+            self._check_run_claim_bindings(conn, value, claim_lease_holder)
+        if validate_conn is not None:
+            validate_conn(conn)
+        if refresh_reference is not None:
+            def read_value(record_key):
+                if record_key == member_key:
+                    return raw
+                row = conn.execute("SELECT value FROM state_meta WHERE key=?", (record_key,)).fetchone()
+                return None if row is None else row[0]
+            if _decode_run_record(value.run_id, value.generation, _sha(raw), read_value) != value:
+                raise RunCustodyError("INTEGRITY_REFRESH_VALUE")
+        conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?)", (member_key, raw))
+        conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?) "
+                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, head))
         return value
 
     def claim_run_custody(self, run_id, *, expected_generation, checkpoint,
@@ -624,6 +633,60 @@ class SessionRunCustodyMixin:
             predecessor_expires_ns=old.expires_monotonic_ns,
             validate_conn=validate,
         )
+
+    def _run_custodies_for_session_on_conn(self, conn, session_id):
+        heads = conn.execute(
+            "SELECT key,value FROM state_meta WHERE key GLOB 'run-custody:*:head' LIMIT 1025"
+        ).fetchall()
+        if len(heads) > 1024:
+            raise RunCustodyError("CUSTODY_INVENTORY_BOUND_EXCEEDED")
+
+        def read(key):
+            row = conn.execute("SELECT value FROM state_meta WHERE key=?", (key,)).fetchone()
+            return None if row is None else row[0]
+
+        current = {}
+        for key, raw in heads:
+            match = re.fullmatch(r"run-custody:([A-Za-z0-9][A-Za-z0-9_.-]{0,127}):head", key)
+            if match is None:
+                raise RunCustodyError("INTEGRITY_HEAD")
+            head = _load(raw)
+            value = _decode_run_record(match.group(1), head["generation"], head["digest"], read)
+            if value.disposition == "active" and value.current_session_id == session_id:
+                current[value.run_id] = (raw, value)
+        return current
+
+    def _transfer_context_rebase_custodies_on_conn(
+        self, conn, *, old_session_id, new_session_id, expected, lease_holder,
+    ):
+        """Transfer the complete native custody set inside child publication.
+
+        The supplied handles prove ownership, never select the participant set.
+        The native store derives that set and refuses omissions or stale heads.
+        """
+        if type(expected) is not tuple or any(type(value) is not RunCustody for value in expected):
+            raise RunCustodyError("INVALID_CUSTODY_TRANSFER_SET")
+        requested = {value.run_id: value for value in expected}
+        if len(requested) != len(expected):
+            raise RunCustodyError("INVALID_CUSTODY_TRANSFER_SET")
+        current = self._run_custodies_for_session_on_conn(conn, old_session_id)
+        if set(current) != set(requested):
+            raise RunCustodyError("CONTEXT_REBASE_CUSTODY_SET_MISMATCH")
+        updated = []
+        for run_id, (raw, old) in current.items():
+            if requested[run_id] != old:
+                raise RunCustodyError("FENCE_MISMATCH")
+            if dict(old.checkpoint.members).get("historical-goal-key") == f"goal:{old_session_id}":
+                raise RunCustodyError("HISTORICAL_GOAL_ALIAS_COLLISION")
+            value = replace(
+                old, generation=old.generation + 1,
+                predecessor_digest=_load(raw)["digest"], current_session_id=new_session_id,
+            )
+            updated.append(self._commit_run_on_conn(
+                conn, raw, value, predecessor_expires_ns=old.expires_monotonic_ns,
+                claim_lease_holder=lease_holder,
+            ))
+        return tuple(updated)
 
     def refresh_run_custody(self, run_id, *, owner_token, expected_generation, ttl_seconds=300):
         raw, old = self._owned_run(run_id, owner_token, expected_generation)

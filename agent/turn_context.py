@@ -502,6 +502,28 @@ def build_turn_context(
         else None
     )
     if callable(_ready_check) and getattr(agent, "session_id", None):
+        _transition = _continuity_db.context_rebase_transition_for_session(agent.session_id)
+        if _transition is not None and _transition.state != "ready":
+            from ares_runtime.continuity.runtime import (
+                AutomaticRebaseError, reconcile_context_rebase,
+            )
+            _recovery = reconcile_context_rebase(agent)
+            if _recovery.ready:
+                conversation_history = list(_recovery.messages)
+            else:
+                # Preserve the arriving input even when recovery must park.
+                # Use the native transcript owner and its turn lease guard;
+                # a pending continuation must never acknowledge lost input.
+                _incoming = persist_user_message if persist_user_message is not None else user_message
+                if _incoming:
+                    _continuity_db.append_message(
+                        _transition.child_session_id, "user", _incoming,
+                        timestamp=persist_user_timestamp,
+                        display_kind=persist_user_display_kind,
+                        display_metadata=persist_user_display_metadata,
+                        turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
+                    )
+                raise AutomaticRebaseError(_recovery.reason)
         _ready_check(_continuity_db, agent.session_id)
 
     # NOTE: the DB session row is created later, AFTER the system prompt is
