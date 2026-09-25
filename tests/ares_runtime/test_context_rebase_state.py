@@ -248,12 +248,16 @@ def test_post_publish_ambiguity_enters_reconciliation_required(db):
     assert updated.state == "reconciliation_required"
     assert updated.ready_at is None
     assert db.mark_context_rebase_reconciliation_required(transition.transition_id) == updated
-    with pytest.raises(ContextContinuationError, match="CONTEXT_REBASE_NOT_ACTIVATABLE"):
-        db.mark_context_rebase_ready(
-            transition.transition_id,
-            expected_continuation_digest=transition.continuation_digest,
-            expected_child_session_id=transition.child_session_id,
-        )
+    with pytest.raises(ContextContinuationError, match="CONTEXT_REBASE_NOT_READY"):
+        db.assert_context_rebase_ready_for_turn(transition.child_session_id)
+    recovered = db.mark_context_rebase_ready(
+        transition.transition_id,
+        expected_continuation_digest=transition.continuation_digest,
+        expected_child_session_id=transition.child_session_id,
+    )
+    assert recovered.state == "ready"
+    assert recovered.ready_at is not None
+    assert db.assert_context_rebase_ready_for_turn(transition.child_session_id) == recovered
 
 
 def test_ready_rebase_cannot_be_demoted_to_reconciliation(db):
@@ -392,7 +396,7 @@ def test_twenty_rebases_preserve_one_lineage_and_run_custody(db):
     assert current.origin_session_id == "s0"
     assert current.owner_token == owner.owner_token
     assert current.checkpoint.unresolved_effects == ("effect:unknown",)
-    assert current.checkpoint.findings == ("finding:open",)
+    assert current.checkpoint.unresolved_findings == ("finding:open",)
     assert current.checkpoint.restrictions == ("no publish",)
     assert current.generation == owner.generation
     assert db.read_context_rebase_episode("s20").attempts_without_recovery == 20
