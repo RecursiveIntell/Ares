@@ -18,6 +18,8 @@ MESSAGES = [
     },
     {"role": "user", "content": "Continue without pushing or merging."},
 ]
+FULL_MESSAGES = [{"role": "system", "content": SYSTEM}, *MESSAGES]
+
 TOOLS = [
     {
         "type": "function",
@@ -97,3 +99,63 @@ def test_bedrock_conversion_stays_below_qualified_bound():
     assert _wire_bytes(
         {"system": SYSTEM, "messages": converted_messages, "tools": converted_tools}
     ) < _bound("bedrock_converse").tokens
+
+
+def test_chat_completions_final_kwargs_stay_below_qualified_bound():
+    transport = ChatCompletionsTransport()
+    kwargs = transport.build_kwargs(
+        "test-model",
+        FULL_MESSAGES,
+        TOOLS,
+        max_tokens=4096,
+        max_tokens_param_fn=lambda value: {"max_tokens": value},
+        reasoning_config={"enabled": False},
+        base_url="https://example.invalid/v1",
+        session_id="session-test",
+    )
+    assert _wire_bytes(kwargs) < _bound("chat_completions").tokens
+
+
+def test_responses_final_kwargs_stay_below_qualified_bound():
+    transport = ResponsesApiTransport()
+    kwargs = transport.build_kwargs(
+        "gpt-5.6",
+        MESSAGES,
+        TOOLS,
+        instructions=SYSTEM,
+        reasoning_config={"enabled": True, "effort": "medium"},
+        max_tokens=4096,
+        base_url="https://api.openai.com/v1",
+        session_id="session-test",
+        cache_scope_id="conversation-root",
+        replay_encrypted_reasoning=False,
+    )
+    assert _wire_bytes(kwargs) < _bound("codex_responses").tokens
+
+
+def test_anthropic_final_kwargs_stay_below_qualified_bound():
+    transport = AnthropicTransport()
+    kwargs = transport.build_kwargs(
+        "claude-sonnet-4-6",
+        FULL_MESSAGES,
+        TOOLS,
+        max_tokens=4096,
+        reasoning_config={"enabled": False},
+        base_url="https://api.anthropic.com",
+    )
+    assert _wire_bytes(kwargs) < _bound("anthropic_messages").tokens
+
+
+def test_bedrock_final_kwargs_stay_below_qualified_bound():
+    transport = BedrockTransport()
+    kwargs = transport.build_kwargs(
+        "anthropic.claude-test",
+        FULL_MESSAGES,
+        TOOLS,
+        max_tokens=4096,
+        temperature=0.2,
+        region="us-east-1",
+    )
+    # Dispatch-only sentinel fields are serialized here too, making this
+    # stricter than the boto3 payload that eventually leaves the process.
+    assert _wire_bytes(kwargs) < _bound("bedrock_converse").tokens
