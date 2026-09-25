@@ -651,12 +651,8 @@ class SessionRunCustodyMixin:
             snapshot = self._read_context_rebase_snapshot_on_conn(conn, session_id)
             if snapshot.action_control_digest != "sha256:" + expected_control_digest:
                 raise RunCustodyError("TASK_CONTROL_CHANGED")
-            if snapshot.control_raw is not None:
-                control = _load(snapshot.control_raw)
-                if (type(control) is not dict or control.get("schema") != "SessionDBContextControlV1"
-                        or type(control.get("input_watermark")) is not int
-                        or snapshot.control_revision <= control["input_watermark"]):
-                    raise RunCustodyError("TASK_STOPPED")
+            if snapshot.dispatch_stopped:
+                raise RunCustodyError("TASK_STOPPED")
         except ContextContinuationError as exc:
             raise RunCustodyError("TASK_CONTROL_UNAVAILABLE") from exc
 

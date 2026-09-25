@@ -362,6 +362,13 @@ def _(rid, params: dict) -> dict:
     # or fallback moved the session transport to stdio.
     if (t := current_transport()) is not None:
         session["transport"] = t
+    input_receipt = None
+    if not has_truncation:
+        try:
+            input_receipt = _accept_tui_context_input(session, text,
+                event_id=params.get("input_event_id"), display_kind=display_kind)
+        except Exception as exc:
+            return _err(rid, 5071, str(exc))
     while True:
         busy_transport = None
         with session["history_lock"]:
@@ -376,6 +383,7 @@ def _(rid, params: dict) -> dict:
         busy_response = _handle_busy_submit(
             rid, sid, session, text, busy_transport,
             queued=bool(params.get("queued")),
+            **({"context_input_event_id": input_receipt.event_id} if input_receipt is not None else {}),
         )
         if busy_response is not None:
             return busy_response
@@ -815,8 +823,18 @@ def _(rid, params: dict) -> dict:
         _start_inflight_turn(session, text)
 
     if turn_isolation:
+        if has_truncation:
+            try:
+                input_receipt = _accept_tui_context_input(session, text,
+                    event_id=params.get("input_event_id"), display_kind=display_kind)
+            except Exception as exc:
+                with session["history_lock"]:
+                    session["running"] = False
+                    _clear_inflight_turn(session)
+                return _err(rid, 5071, str(exc))
         isolated_response = _submit_prompt_to_compute_host(
-            rid, sid, session, text, display_kind=display_kind
+            rid, sid, session, text, display_kind=display_kind,
+            **({"context_input_event_id": input_receipt.event_id} if input_receipt is not None else {}),
         )
         if not isolated_response.get("error"):
             if survivor_user_row_ids is not None and requested_rebind_ids is None:
@@ -843,6 +861,9 @@ def _(rid, params: dict) -> dict:
         # A branch becomes real here: copy its parent's transcript into the row so it
         # resumes with full context (the agent won't persist the seed itself).
         _persist_branch_seed(session)
+        if has_truncation:
+            input_receipt = _accept_tui_context_input(session, text,
+                event_id=params.get("input_event_id"), display_kind=display_kind)
     except Exception as exc:
         from hermes_state import is_disk_full_error
 
@@ -908,7 +929,8 @@ def _(rid, params: dict) -> dict:
                     },
                 )
                 return
-        _run_prompt_submit(rid, sid, session, text, display_kind=display_kind)
+        _run_prompt_submit(rid, sid, session, text, display_kind=display_kind,
+            **({"context_input_event_id": input_receipt.event_id} if input_receipt is not None else {}))
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
     # Keep a handle so session.interrupt can tell a live turn from a stuck
@@ -919,6 +941,7 @@ def _(rid, params: dict) -> dict:
         rid,
         {
             "status": "streaming",
+            **({"input_event_id": input_receipt.event_id} if input_receipt is not None else {}),
             **(
                 {"survivor_user_row_ids": survivor_user_row_ids}
                 if survivor_user_row_ids is not None

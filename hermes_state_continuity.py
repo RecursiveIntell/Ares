@@ -217,6 +217,32 @@ class ContextRebaseSnapshot:
     run_custodies: tuple[Dict[str, Any], ...] = ()
     read_limits: tuple[int, int, int, int] = (12, 32, 32, 128)
     control_raw: Optional[str] = None
+    input_control_raw: Optional[str] = None
+
+    @property
+    def has_pending_inputs(self) -> bool:
+        head = {} if self.input_control_raw is None else _strict_json(self.input_control_raw)
+        return head.get("accepted_sequence", 0) != head.get("projected_sequence", 0)
+
+    @property
+    def dispatch_stopped(self) -> bool:
+        if self.control_raw is None:
+            return False
+        control = _strict_json(self.control_raw)
+        if (control.get("schema") not in {"SessionDBContextControlV1", "SessionDBContextControlV2"}
+                or type(control.get("input_watermark")) is not int
+                or self.control_revision <= control["input_watermark"]):
+            return True
+        if control["schema"] == "SessionDBContextControlV2":
+            # A queued event accepted before stop is not a subsequent user
+            # instruction merely because its transcript row is inserted later.
+            head = {} if self.input_control_raw is None else _strict_json(self.input_control_raw)
+            sequence = control.get("input_sequence")
+            if type(sequence) is not int or sequence < 0:
+                return True
+            if head and head["projected_sequence"] <= sequence:
+                return True
+        return False
 
     @property
     def has_unresolved_effects(self) -> bool:
@@ -235,7 +261,7 @@ class ContextRebaseSnapshot:
         value = {"session_id": self.session_id, "conversation_root": self.conversation_root,
                  "authentic_users": self.authentic_users, "control_raw": self.control_raw,
                  "goal_raw": self.goal_raw, "heartbeat_raw": self.heartbeat_raw,
-                 "loop_raw": self.loop_raw}
+                 "loop_raw": self.loop_raw, "input_control_raw": self.input_control_raw}
         return "sha256:" + hashlib.sha256(_canonical(value).encode("utf-8")).hexdigest()
 
 class SessionContextContinuityMixin:
@@ -247,6 +273,8 @@ class SessionContextContinuityMixin:
         with self._read_ctx() as conn:
             conn.execute("SAVEPOINT context_dispatch_required")
             try:
+                if self._context_input_control_on_conn(conn, session_id) is not None:
+                    return True
                 for sid in self._context_rebase_lineage_on_conn(conn, session_id):
                     row = conn.execute("SELECT model_config,end_reason FROM sessions WHERE id=?", (sid,)).fetchone()
                     if row is None:
@@ -780,6 +808,7 @@ class SessionContextContinuityMixin:
             heartbeat_raw, loop_raw, todo_json, safe_custody,
             (recent_limit, user_limit, unresolved_effect_limit, authentic_user_limit),
             None if control_row is None else control_row[0],
+            self._context_input_control_on_conn(conn, session_id),
         )
 
     def record_context_stop(self, session_id):
@@ -790,8 +819,11 @@ class SessionContextContinuityMixin:
             row = conn.execute("SELECT value FROM state_meta WHERE key=?", (key,)).fetchone()
             previous = {} if row is None else _strict_json(row[0])
             watermark = conn.execute("SELECT COALESCE(MAX(id),0) FROM messages").fetchone()[0]
-            value = {"schema": "SessionDBContextControlV1", "revision": previous.get("revision", 0) + 1,
-                     "stopped": True, "stopped_at": time.time(), "input_watermark": watermark}
+            input_raw = self._context_input_control_on_conn(conn, session_id)
+            sequence = 0 if input_raw is None else _strict_json(input_raw)["accepted_sequence"]
+            value = {"schema": "SessionDBContextControlV2", "revision": previous.get("revision", 0) + 1,
+                     "stopped": True, "stopped_at": time.time(), "input_watermark": watermark,
+                     "input_sequence": sequence}
             conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                          (key, _canonical(value)))
             return value
@@ -814,12 +846,10 @@ class SessionContextContinuityMixin:
         def write(conn):
             self._assert_context_rebase_lease_on_conn(conn, session_id, turn_lease_holder)
             snapshot = self._read_context_rebase_snapshot_on_conn(conn, session_id)
-            if snapshot.control_raw is not None:
-                control = _strict_json(snapshot.control_raw)
-                if (control.get("schema") != "SessionDBContextControlV1"
-                        or type(control.get("input_watermark")) is not int
-                        or snapshot.control_revision <= control["input_watermark"]):
-                    raise ContextContinuationError("CONTEXT_DISPATCH_STOPPED")
+            if snapshot.has_pending_inputs:
+                raise ContextContinuationError("CONTEXT_DISPATCH_INPUT_PENDING")
+            if snapshot.dispatch_stopped:
+                raise ContextContinuationError("CONTEXT_DISPATCH_STOPPED")
             if snapshot.digest != expected_snapshot_digest:
                 raise ContextContinuationError("CONTEXT_DISPATCH_STALE_MATERIALIZATION")
             if snapshot.has_unresolved_effects:
@@ -1166,6 +1196,8 @@ class SessionContextContinuityMixin:
             if (current_snapshot.digest != expected_snapshot_digest
                     or current_snapshot.control_revision != control_revision):
                 raise ContextContinuationError("CONTEXT_REBASE_STALE_SNAPSHOT")
+            if current_snapshot.has_pending_inputs:
+                raise ContextContinuationError("CONTEXT_REBASE_INPUT_PENDING")
 
             parent_epoch = self._context_epoch_from_model_config(parent["model_config"])
             child_epoch = parent_epoch + 1
@@ -1459,52 +1491,57 @@ class SessionContextContinuityMixin:
             return session_id
         if type(max_depth) is not int or max_depth < 1 or max_depth > 10000:
             raise ContextContinuationError("INVALID_CONTINUATION_DEPTH")
+        with self._read_ctx() as conn:
+            conn.execute("SAVEPOINT context_continuation_tip")
+            try:
+                return self._context_continuation_tip_on_conn(conn, session_id, max_depth=max_depth)
+            finally:
+                conn.execute("ROLLBACK TO context_continuation_tip")
+                conn.execute("RELEASE context_continuation_tip")
+
+    def _context_continuation_tip_on_conn(self, conn, session_id, *, max_depth=1000):
         current = session_id
         seen = {current}
         for _ in range(max_depth):
-            with self._lock:
-                parent = self._conn.execute(
-                    "SELECT id,end_reason FROM sessions WHERE id=?", (current,),
+            parent = conn.execute(
+                "SELECT id,end_reason FROM sessions WHERE id=?", (current,),
+            ).fetchone()
+            if parent is None:
+                return current
+            reason = parent["end_reason"]
+            if reason == "compression":
+                row = conn.execute(
+                    f"""SELECT child.id
+                        FROM sessions child
+                        WHERE child.parent_session_id=?
+                          {self._NON_CONTINUATION_CHILD_FILTER_SQL.format(alias='child.')}
+                        ORDER BY CASE WHEN child.end_reason='compression' THEN 0 WHEN child.ended_at IS NULL THEN 1 ELSE 2 END,
+                                 {_sql_session_last_active('child')} DESC,
+                                 child.started_at DESC, child.id DESC
+                        LIMIT 1""",
+                    (current, current, current),
                 ).fetchone()
-                if parent is None:
-                    return current
-                reason = parent["end_reason"]
-                if reason == "compression":
-                    row = self._conn.execute(
-                        f"""SELECT child.id
-                            FROM sessions child
-                            WHERE child.parent_session_id=?
-                              AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
-                              AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
-                              AND COALESCE(child.source, '') != 'tool'
-                            ORDER BY CASE WHEN child.end_reason='compression' THEN 0 WHEN child.ended_at IS NULL THEN 1 ELSE 2 END,
-                                     {_sql_session_last_active('child')} DESC,
-                                     child.started_at DESC, child.id DESC
-                            LIMIT 1""",
-                        (current,),
-                    ).fetchone()
-                    child_id = None if row is None else row["id"]
-                elif reason == _CONTEXT_REBASE_END_REASON:
-                    rows = self._conn.execute(
-                        """SELECT id,model_config FROM sessions
-                           WHERE parent_session_id=? AND COALESCE(source,'')!='tool'
-                           ORDER BY started_at ASC,id ASC""",
-                        (current,),
-                    ).fetchall()
-                    matches = [row for row in rows if self._context_rebase_child_matches(row, current)]
-                    if len(matches) > 1:
-                        raise ContextContinuationError("AMBIGUOUS_CONTEXT_REBASE")
-                    child_id = matches[0]["id"] if matches else None
-                else:
-                    return current
+                child_id = None if row is None else row["id"]
+            elif reason == _CONTEXT_REBASE_END_REASON:
+                rows = conn.execute(
+                    """SELECT id,model_config FROM sessions
+                       WHERE parent_session_id=? AND COALESCE(source,'')!='tool'
+                       ORDER BY started_at ASC,id ASC""",
+                    (current,),
+                ).fetchall()
+                matches = [row for row in rows if self._context_rebase_child_matches(row, current)]
+                if len(matches) > 1:
+                    raise ContextContinuationError("AMBIGUOUS_CONTEXT_REBASE")
+                child_id = matches[0]["id"] if matches else None
+            else:
+                return current
             if not child_id:
                 return current
             if child_id in seen:
                 raise ContextContinuationError("CONTINUATION_CYCLE")
             seen.add(child_id)
             current = child_id
-        with self._lock:
-            row = self._conn.execute("SELECT end_reason FROM sessions WHERE id=?", (current,)).fetchone()
+        row = conn.execute("SELECT end_reason FROM sessions WHERE id=?", (current,)).fetchone()
         if row is not None and row["end_reason"] in {"compression", _CONTEXT_REBASE_END_REASON}:
             raise ContextContinuationError("CONTINUATION_DEPTH_LIMIT")
         return current

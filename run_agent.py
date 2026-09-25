@@ -2407,6 +2407,7 @@ class AIAgent:
                     "codex_message_items": msg.get("codex_message_items"),
                     "_compressed_summary": bool(msg.get(COMPRESSED_SUMMARY_METADATA_KEY)),
                     "timestamp": _row_timestamp,
+                    "_context_input": msg.get("_context_input"),
                     "api_content": _row_api_content,
                     # Standalone reference handoffs are always hidden, even
                     # when the summarized transcript contained a user turn —
@@ -8583,6 +8584,7 @@ class AIAgent:
         persist_user_display_kind: Optional[str] = None,
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        persist_user_event_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         # A review deliberately shares this agent's session_id for prompt-cache
@@ -8639,6 +8641,7 @@ class AIAgent:
         task_started = False
         task_finished = False
         relay_outcome = "failed"
+        input_receipt = None
 
         def _stop_durable_turn_lease_refresher() -> None:
             nonlocal durable_turn_lease_turn_active
@@ -8712,6 +8715,21 @@ class AIAgent:
                 # must be established under custody before the loop can act.
                 if _durable_session_exists:
                     self._session_db_created = True
+                from ares_runtime.continuity.runtime import context_dispatch_required
+                if context_dispatch_required(self):
+                    from hermes_state_continuity import ContextContinuationError
+                    # Create only the canonical session identity before input
+                    # acceptance. Transcript projection still requires custody.
+                    self._ensure_db_session()
+                    if not self._session_db_created:
+                        raise ContextContinuationError("CONTEXT_INPUT_SESSION_MISSING")
+                    from agent.context_input import accept_turn_input
+                    input_receipt = accept_turn_input(self, user_message=user_message,
+                        persist_user_message=persist_user_message, timestamp=persist_user_timestamp,
+                        display_kind=persist_user_display_kind, display_metadata=persist_user_display_metadata,
+                        event_id=persist_user_event_id)
+                    if input_receipt is not None:
+                        persist_user_timestamp = input_receipt.timestamp
                 _durable_holder = (
                     f"pid={os.getpid()}:turn={relay_turn_id}:platform="
                     f"{task_context['platform'] or 'unknown'}"
@@ -8751,6 +8769,8 @@ class AIAgent:
                             "Stopped waiting for another Hermes process on "
                             "this session. Your message was not processed."
                         )
+                        if input_receipt is not None:
+                            interrupt_msg = "Stopped waiting. Your message is durably queued and has not been processed."
                         interrupt_result = {
                             "final_response": interrupt_msg,
                             "messages": list(conversation_history or []),
@@ -8782,6 +8802,8 @@ class AIAgent:
                         "long. Your message was not processed - wait for the "
                         "other process to finish, then send it again."
                     )
+                    if input_receipt is not None:
+                        timeout_msg = "The conversation is still busy. Your message is durably queued and has not been processed."
                     logger.error(
                         "session turn lease wait timed out for %s",
                         session_id,
@@ -8808,6 +8830,7 @@ class AIAgent:
                 # the agent attr so a late flush after reclaim is fenced in
                 # the same SQLite write transaction as the transcript insert.
                 durable_turn_lease = _durable_holder
+                self._context_input_receipt = input_receipt
                 from agent.run_checkpoint_custody import TurnRunCustody
                 turn_run_custody = getattr(self, "_run_checkpoint_custody", None)
                 if turn_run_custody is None:
@@ -8853,6 +8876,19 @@ class AIAgent:
                         "failed": True,
                         "error": f"session_persistence_admission_failed:{self.session_id}",
                     }
+
+                if input_receipt is not None:
+                    # The addressed alias may have advanced without contention
+                    # in this process. Resolve it under the root lease.
+                    tip = _turn_db.get_context_continuation_tip(self.session_id)
+                    if tip != self.session_id:
+                        self.session_id = tip
+                        task_context["session_id"] = tip
+                        conversation_history = _turn_db.get_messages_as_conversation(
+                            tip, repair_alternation=False, include_row_ids=True)
+                    from agent.context_input import project_turn_inputs
+                    conversation_history = project_turn_inputs(self, input_receipt,
+                        holder=_durable_holder, conversation_history=conversation_history)
 
                 # Long model/tool/compression turns outlive a fixed TTL. Refresh
                 # in a daemon thread; holder-qualified UPDATE and DELETE fence a
@@ -9019,6 +9055,8 @@ class AIAgent:
                 finish_task_run(**task_context, error=exc)
             raise
         finally:
+            if durable_turn_lease is not None:
+                self._context_input_receipt = None
             try:
                 if relay_turn is not None:
                     relay_runtime.SESSION_COORDINATOR.end_turn(

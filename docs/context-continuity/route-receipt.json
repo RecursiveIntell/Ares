@@ -95,7 +95,7 @@
     "Installed selected subscription-route tuple and live qualification are unavailable in this workspace."
   ],
   "remaining_delta": [
-    "Durable root input ordering and authentic ingress before acceptance",
+    "Gateway/remaining ingress integration, durable wake and task completion ownership",
     "Existing controller wake scheduling and already-READY cold-start integration",
     "Native external effect-owner fence, incarnation and acknowledgement closure",
     "Working source, conditional writes and current policy/retrieval",
@@ -105,7 +105,7 @@
   ],
   "next_gate": "Durable ingress/controller construction, native owner closure and remaining exact-route V4 qualification.",
   "qualification": "Bounded source repair passed; full V4 program remains incomplete.",
-  "scope": "Cumulative PR80 implementation; latest repair is pending-child cold custody recovery, native READY seals and cleanup retention.",
-  "latest_repair_evidence": "docs/context-continuity/cold-custody-evidence.json",
+  "scope": "Cumulative PR80 implementation; latest repair is durable root input, selected TUI pre-ack acceptance, ordered projection and dispatch/control fencing.",
+  "latest_repair_evidence": "docs/context-continuity/input-evidence.json",
   "latest_repair_audit": "pass_bounded"
 }

@@ -516,13 +516,22 @@ def build_turn_context(
                 # a pending continuation must never acknowledge lost input.
                 _incoming = persist_user_message if persist_user_message is not None else user_message
                 if _incoming:
-                    _continuity_db.append_message(
-                        _transition.child_session_id, "user", _incoming,
-                        timestamp=persist_user_timestamp,
-                        display_kind=persist_user_display_kind,
-                        display_metadata=persist_user_display_metadata,
-                        turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
-                    )
+                    _receipt = getattr(agent, "_context_input_receipt", None)
+                    if _receipt is not None:
+                        _continuity_db.append_messages_batch(_transition.child_session_id, [{
+                            "role": "user", "content": _receipt.content, "timestamp": _receipt.timestamp,
+                            "display_metadata": _receipt.display_metadata, "_context_input": {
+                                "conversation_root": _receipt.conversation_root, "sequence": _receipt.sequence,
+                                "payload_digest": _receipt.payload_digest},
+                        }], turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None))
+                    else:
+                        _continuity_db.append_message(
+                            _transition.child_session_id, "user", _incoming,
+                            timestamp=persist_user_timestamp,
+                            display_kind=persist_user_display_kind,
+                            display_metadata=persist_user_display_metadata,
+                            turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
+                        )
                 raise AutomaticRebaseError(_recovery.reason)
         _ready_check(_continuity_db, agent.session_id)
 
@@ -748,6 +757,10 @@ def build_turn_context(
         if persist_user_display_metadata:
             user_msg["display_metadata"] = persist_user_display_metadata
 
+    receipt = getattr(agent, "_context_input_receipt", None)
+    if receipt is not None:
+        user_msg["_context_input"] = {"conversation_root": receipt.conversation_root,
+            "sequence": receipt.sequence, "payload_digest": receipt.payload_digest}
     append_message(messages, user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx

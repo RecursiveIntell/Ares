@@ -531,6 +531,8 @@ class ComputeHost:
                 session,
                 text,
                 display_kind=frame.get("display_kind") or None,
+                **({"context_input_event_id": frame["context_input_event_id"]}
+                   if frame.get("context_input_event_id") is not None else {}),
             )
             run_thread = session.get("_run_thread")
             if run_thread is not None and hasattr(run_thread, "join"):

@@ -66,6 +66,8 @@ def prepare_context_dispatch(agent, messages, conversation_history):
     try:
         db.assert_context_rebase_ready_for_turn(agent.session_id)
         snapshot = db.read_context_rebase_snapshot(agent.session_id)
+        if snapshot.has_pending_inputs:
+            raise ContextDispatchError("CONTEXT_DISPATCH_INPUT_PENDING")
         # Do not bless a transcript that was loaded before a durable human
         # correction. Check exact current human content before deriving any
         # provider roles, merging messages or running request middleware.
@@ -74,8 +76,20 @@ def prepare_context_dispatch(agent, messages, conversation_history):
         def identity(view):
             return view.get("timestamp"), view.get("content")
 
-        materialized_users = [identity(view) for message in messages
-                              if (view := user_originated_turn_view(message)) is not None]
+        materialized_users = []
+        for index, message in enumerate(messages):
+            view = user_originated_turn_view(message)
+            if view is None:
+                continue
+            clean = getattr(agent, "_persist_user_message_override", None)
+            if (index == getattr(agent, "_persist_user_message_idx", None)
+                    and type(clean) is str and type(view.get("content")) is str
+                    and clean in view["content"]):
+                # The prologue deliberately keeps API-only notes out of the
+                # canonical transcript. Match the clean current input only
+                # while its exact bytes remain present in the sent message.
+                view = {**view, "content": clean}
+            materialized_users.append(identity(view))
         current_users = [identity(user_originated_turn_view({"role": "user", **source}))
                          for source in snapshot.current_users if source.get("authentic_user")]
         if current_users and materialized_users[-len(current_users):] != current_users:

@@ -45,6 +45,7 @@ on:
       - 'agent/codex_runtime.py'
       - 'agent/run_checkpoint_custody.py'
       - 'agent/turn_context.py'
+      - 'agent/context_input.py'
       - 'cli.py'
       - 'hermes_cli/goals.py'
       - 'hermes_cli/heartbeat.py'
@@ -52,6 +53,7 @@ on:
       - 'hermes_state.py'
       - 'hermes_state_common.py'
       - 'hermes_state_continuity.py'
+      - 'hermes_state_inbox.py'
       - 'hermes_state_runs.py'
       - 'plugins/context_engine/_context_governor/**'
       - 'scripts/run_checkpoint_context.py'
@@ -64,6 +66,8 @@ on:
       - 'tests/run_agent/test_codex_sdk_transform_bypass.py'
       - 'tests/plugins/test_context_governor*.py'
       - 'tui_gateway/server.py'
+      - 'tui_gateway/methods_prompt.py'
+      - 'tui_gateway/compute_host.py'
       - 'docs/context-continuity/**'
 
 permissions:
@@ -131,6 +135,11 @@ jobs:
             tests/test_run_custody_cold_recovery.py \
             tests/tui_gateway/test_run_checkpoint_claim_rpc.py \
             tests/tui_gateway/test_goal_command.py \
+            tests/tui_gateway/test_protocol.py \
+            tests/tui_gateway/test_compute_host_phase1.py \
+            tests/tui_gateway/test_session_profile_db.py \
+            tests/tui_gateway/test_composite_carrier_rewind.py \
+            tests/tui_gateway/test_prompt_recovery_contract.py \
             tests/test_turn_run_custody.py \
             tests/tui_gateway/test_inline_rpc_gil_starvation.py \
             tests/tui_gateway/test_kanban_notify_poller.py \
@@ -154,6 +163,7 @@ jobs:
             tests/ares_runtime/test_context_rebase_state.py \
             scripts/run_checkpoint_context.py
           .venv/bin/ruff check hermes_state_runs.py agent/run_checkpoint_custody.py \
+            hermes_state_inbox.py agent/context_input.py \
             scripts/run_checkpoint_claim.py scripts/run_checkpoint_resume.py \
             tui_gateway/run_checkpoint_rpc.py tests/test_run_task_custody.py \
             tests/test_run_custody_cold_recovery.py

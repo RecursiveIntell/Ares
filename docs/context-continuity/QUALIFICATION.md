@@ -4,6 +4,36 @@ The V4 packet dated 2026-09-23 remains the full acceptance contract. This is
 an implementation branch. Qualification is tied to source hashes and named
 oracles; passing unit tests does not qualify a selected provider route.
 
+## Durable input and selected TUI ingress
+
+The existing SessionDB owner now accepts immutable, root-sequenced authentic
+input before the executing turn lease. Stable transport IDs deduplicate exact
+redelivery and reject changed payloads. Ordered transcript projection requires
+the current root lease and live continuation tip, and commits its receipt in the
+same transaction. New accepted input invalidates stale dispatch and tool controls
+before its transcript row exists. Versioned stop controls bind the accepted-input
+sequence, so projecting a pre-stop queue cannot resume work.
+
+The real agent loop and selected TUI ingress use this owner. TUI queues preserve
+distinct submissions and forward identity through compute-host dispatch. Deferred
+sessions resolve their own profile database and configuration. Clean input stays
+exact while API-only notes and file-reference expansion retain their sidecar.
+A parked successor projects arriving input once across retry and recovery.
+
+The local canonical gate passed 1,020 tests across 42 files with the pinned
+Governor; independent audit passed 24 tests and closed AUD-I1/I2/I3. See
+`input-evidence.json`, `input-test-run.log`, and `input-audit-verdict.json`.
+All hosted baseline checks on `cc06a62` passed. Candidate checks follow publication.
+The attempted generic wheel build was refused by the repository's intentional
+packaging guard; no bypass was used. Supported packaging remains editable install,
+Docker and Nix.
+
+Gateway ingress, autonomous cold inbox draining, task completion ownership, native
+external fences and full selected-route qualification remain separate required
+V4 work. Projection is not completion, and a duplicate already-projected event
+cannot silently start a second execution. Generated IDs cover only an invocation;
+cross-delivery deduplication requires the transport's stable ID.
+
 ## Pending-child cold custody recovery
 
 File-bound checked claims now persist versioned recovery locators in the same

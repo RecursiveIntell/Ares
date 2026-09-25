@@ -97,6 +97,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
 from hermes_state_portability import SessionPortabilityMixin
 from hermes_state_runs import SessionRunCustodyMixin
 from hermes_state_continuity import ContextContinuationError, SessionContextContinuityMixin
+from hermes_state_inbox import SessionContextInboxMixin
 from hermes_state_schema import (
     SessionSchemaMixin, TODO_LIFECYCLE_SHAPE_SQL,
     todo_lifecycle_shape_from_row, _todo_lifecycle_supported_shapes,
@@ -4316,7 +4317,7 @@ def classify_session_status(
     return SESSION_STATUS_COMPLETE
 
 
-class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin, SessionRunCustodyMixin, SessionContextContinuityMixin):
+class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin, SessionRunCustodyMixin, SessionContextContinuityMixin, SessionContextInboxMixin):
     """
     SQLite-backed session storage with FTS5 search.
 
@@ -11782,8 +11783,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                 turn_lease_holder=turn_lease_holder,
                 turn_lease_ttl_seconds=turn_lease_ttl_seconds,
             )
+            if any(msg.get("_context_input") is not None for msg in messages):
+                self._assert_context_rebase_lease_on_conn(conn, session_id, turn_lease_holder)
             inserted, tool_calls_total, row_ids = self._insert_message_rows(
-                conn, session_id, messages
+                conn, session_id, messages, bind_context_inputs=True
             )
             # One aggregated counter update for the whole batch.
             if tool_calls_total > 0:
@@ -12159,7 +12162,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                 msg["_row_id"] = row_id
 
     def _insert_message_rows(
-        self, conn, session_id: str, messages: List[Dict[str, Any]]
+        self, conn, session_id: str, messages: List[Dict[str, Any]], *, bind_context_inputs=False
     ) -> tuple[int, int, tuple[Optional[int], ...]]:
         """Insert *messages* as fresh active rows for *session_id*.
 
@@ -12175,6 +12178,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
         tool_calls_total = 0
         row_ids = []
         for msg in messages:
+            receipt, projection = self._prepare_context_input_projection_on_conn(
+                conn, session_id, msg) if bind_context_inputs else (None, None)
+            if projection is not None:
+                row_ids.append(projection["row_id"])
+                continue
             role = msg.get("role", "unknown")
             tool_calls = msg.get("tool_calls")
             message_timestamp = now_ts
@@ -12247,6 +12255,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                 ),
             )
             row_ids.append(cur.lastrowid)
+            if receipt is not None:
+                self._commit_context_input_projection_on_conn(conn, receipt, session_id, cur.lastrowid)
             inserted += 1
             if tool_calls is not None:
                 tool_calls_total += (
