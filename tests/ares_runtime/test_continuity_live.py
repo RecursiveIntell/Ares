@@ -154,7 +154,7 @@ def test_synthetic_latest_turn_is_frontier_not_user_authority(db):
     records = [
         json.loads(line)
         for line in candidate.brief.evidence_text.splitlines()
-        if line.startswith("{")
+        if line.startswith("{") and '"record_ref"' in line
     ]
     merge_text = [
         record for record in records
@@ -192,7 +192,7 @@ def test_unknown_effect_is_mandatory_obligation_not_duplicated_event(db):
     records = [
         json.loads(line)
         for line in candidate.brief.evidence_text.splitlines()
-        if line.startswith("{")
+        if line.startswith("{") and '"record_ref"' in line
     ]
     matches = [
         record for record in records
@@ -239,7 +239,7 @@ def test_recurring_owner_state_is_presented_independently_of_wakeup_text(db):
     records = [
         json.loads(line)
         for line in candidate.brief.evidence_text.splitlines()
-        if line.startswith("{")
+        if line.startswith("{") and '"record_ref"' in line
     ]
     by_ref = {record["record_ref"]: record for record in records}
     assert by_ref["record:heartbeat:current"]["kind"] == "OWNER_STATE"
