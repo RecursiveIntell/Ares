@@ -15,6 +15,13 @@ on:
       - 'tests/hermes_cli/test_loops.py'
       - 'tests/test_run_checkpoint_import_boundaries.py'
       - 'tests/test_turn_run_custody.py'
+      - 'tests/tui_gateway/test_inline_rpc_gil_starvation.py'
+      - 'tests/tui_gateway/test_kanban_notify_poller.py'
+      - 'tests/test_tui_gateway_server.py'
+      - 'tests/cli/test_cli_goal_interrupt.py'
+      - 'tests/cli/test_cli_async_delegation_delivery.py'
+      - 'tests/gateway/test_goal_resume_restart.py'
+      - 'tests/agent/test_synthetic_turn_display_kind.py'
       - 'agent/agent_init.py'
       - 'agent/conversation_loop.py'
       - 'agent/run_checkpoint_custody.py'
@@ -70,7 +77,13 @@ jobs:
             tests/hermes_cli/test_loops.py \
             tests/test_run_checkpoint_import_boundaries.py \
             tests/test_turn_run_custody.py \
-            tests/tui_gateway/test_inline_rpc_gil_starvation.py -- -q
+            tests/tui_gateway/test_inline_rpc_gil_starvation.py \
+            tests/tui_gateway/test_kanban_notify_poller.py \
+            tests/test_tui_gateway_server.py \
+            tests/cli/test_cli_goal_interrupt.py \
+            tests/cli/test_cli_async_delegation_delivery.py \
+            tests/gateway/test_goal_resume_restart.py \
+            tests/agent/test_synthetic_turn_display_kind.py -- -q
           .venv/bin/ruff check \
             ares_runtime/continuity \
             hermes_state_continuity.py \
