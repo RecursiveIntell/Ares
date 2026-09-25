@@ -11358,7 +11358,11 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
                             return
                         session["running"] = True
                     _emit("message.start", sid)
-                    _run_prompt_submit(rid, sid, session, payload["message"])
+                    _run_prompt_submit(
+                        rid, sid, session, payload["message"],
+                        display_kind="internal_notification",
+                        display_metadata={"synthetic_source": "loop"},
+                    )
                     return
             except Exception:
                 pass
@@ -11367,7 +11371,11 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
                 _emit("status.update", sid, {"kind": "loop", "text": decision["message"]})
             return
         _emit("message.start", sid)
-        _run_prompt_submit(rid, sid, session, wakeup)
+        _run_prompt_submit(
+            rid, sid, session, wakeup,
+            display_kind="internal_notification",
+            display_metadata={"synthetic_source": "loop"},
+        )
     except Exception as exc:
         print(
             f"[tui_gateway] loop wakeup dispatch failed: "
@@ -11605,7 +11613,11 @@ def _notification_poller_loop(
                     rid = f"__notif__{int(time.time() * 1000)}"
                     try:
                         _emit("message.start", sid)
-                        _run_prompt_submit(rid, sid, session, "\n".join(_batch))
+                        _run_prompt_submit(
+                            rid, sid, session, "\n".join(_batch),
+                            display_kind="internal_notification",
+                            display_metadata={"synthetic_source": "kanban_notification"},
+                        )
                     except Exception as exc:
                         print(
                             f"[tui_gateway] kanban notification dispatch failed: "
@@ -11701,7 +11713,11 @@ def _notification_poller_loop(
                     display_metadata=_async_delegation_display_metadata(evt),
                 )
             else:
-                _run_prompt_submit(rid, sid, session, text)
+                _run_prompt_submit(
+                    rid, sid, session, text,
+                    display_kind="internal_notification",
+                    display_metadata={"synthetic_source": "background_notification"},
+                )
             complete_event_delivery(evt, _claim)
         except Exception as exc:
             release_event_delivery(evt, _claim)
@@ -13018,7 +13034,11 @@ def _run_prompt_submit(
                 session["running"] = True
             try:
                 _emit("message.start", sid)
-                _run_prompt_submit(rid, sid, session, goal_followup)
+                _run_prompt_submit(
+                    rid, sid, session, goal_followup,
+                    display_kind="internal_notification",
+                    display_metadata={"synthetic_source": "goal_continuation"},
+                )
             except Exception as _cont_exc:
                 print(
                     f"[tui_gateway] goal continuation dispatch failed: "
@@ -13064,7 +13084,11 @@ def _run_prompt_submit(
                     continue
                 try:
                     _emit("message.start", sid)
-                    _run_prompt_submit(rid, sid, session, synth)
+                    _run_prompt_submit(
+                        rid, sid, session, synth,
+                        display_kind="internal_notification",
+                        display_metadata={"synthetic_source": "completion_notification"},
+                    )
                     complete_event_delivery(_evt, _claim)
                 except Exception as _n_exc:
                     release_event_delivery(_evt, _claim)
