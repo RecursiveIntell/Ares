@@ -306,3 +306,93 @@ def test_title_transfers_from_rebase_ancestor_to_live_tip(db):
     assert db.set_session_title("s1", "Queue repair")
     assert db.get_session_title("s0") is None
     assert db.get_session_title("s1") == "Queue repair"
+
+
+def test_rebase_episode_is_conversation_scoped_and_resets_only_explicitly(db):
+    first = _publish(db, transition="tx1", parent="s0", child="s1")
+    db.mark_context_rebase_ready(
+        first.transition_id,
+        expected_continuation_digest=first.continuation_digest,
+        expected_child_session_id="s1",
+        before_tokens=90_000,
+        after_tokens=20_000,
+    )
+    assert db.read_context_rebase_episode("s0").attempts_without_recovery == 1
+    assert db.read_context_rebase_episode("s1").attempts_without_recovery == 1
+
+    db.append_message("s1", "user", "continue")
+    second = _publish(db, transition="tx2", parent="s1", child="s2")
+    db.mark_context_rebase_ready(
+        second.transition_id,
+        expected_continuation_digest=second.continuation_digest,
+        expected_child_session_id="s2",
+        before_tokens=91_000,
+        after_tokens=21_000,
+    )
+    assert db.read_context_rebase_episode("s2").attempts_without_recovery == 2
+
+    recovered = db.reset_context_rebase_episode("s2")
+    assert recovered.attempts_without_recovery == 0
+    assert recovered.last_transition_id == "tx2"
+    assert db.read_context_rebase_episode("s0").attempts_without_recovery == 0
+
+
+def test_twenty_rebases_preserve_one_lineage_and_run_custody(db):
+    goal = '{"goal":"same task","status":"active"}'
+    db.set_meta("goal:history", goal)
+    checkpoint = RunCheckpoint(
+        _sha("plan"), _sha("contract"), _sha("source"), "continue",
+        (("historical-goal-key", "goal:history"),),
+        ("effect:unknown",), ("finding:open",), ("no publish",),
+    )
+    owner = db.claim_run_custody_checked(
+        "run-long",
+        lease_holder="holder",
+        expected_generation=0,
+        checkpoint=checkpoint,
+        origin_session_id="s0",
+        current_session_id="s0",
+        historical_goal_digest=_sha(goal),
+    )
+
+    parent = "s0"
+    for index in range(1, 21):
+        child = f"s{index}"
+        transition = _publish(
+            db,
+            transition=f"tx{index}",
+            parent=parent,
+            child=child,
+            digest="sha256:" + f"{index:064x}",
+        )
+        owner = db.transfer_run_session(
+            "run-long",
+            owner_token=owner.owner_token,
+            expected_generation=owner.generation,
+            expected_session_id=parent,
+            new_session_id=child,
+            ttl_seconds=300,
+        )
+        db.mark_context_rebase_ready(
+            transition.transition_id,
+            expected_continuation_digest=transition.continuation_digest,
+            expected_child_session_id=child,
+            before_tokens=100_000 + index,
+            after_tokens=20_000 + index,
+        )
+        if index < 20:
+            db.append_message(child, "user", f"continue epoch {index}")
+        parent = child
+
+    assert db.get_context_continuation_tip("s0", max_depth=25) == "s20"
+    assert db.resolve_resume_session_id("s0") == "s20"
+    assert json.loads(db.get_session("s20")["model_config"])["_context_epoch"] == 20
+    current = db.read_run_custody("run-long")
+    assert current.current_session_id == "s20"
+    assert current.origin_session_id == "s0"
+    assert current.owner_token == owner.owner_token
+    assert current.checkpoint.unresolved_effects == ("effect:unknown",)
+    assert current.checkpoint.findings == ("finding:open",)
+    assert current.checkpoint.restrictions == ("no publish",)
+    assert current.generation == owner.generation
+    assert db.read_context_rebase_episode("s20").attempts_without_recovery == 20
