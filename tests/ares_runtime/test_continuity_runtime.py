@@ -66,7 +66,7 @@ def setup(tmp_path):
         _transition_context_engine_session=transition_engine,
         context_compressor=SimpleNamespace(threshold_tokens=50_000),
         tools=[],
-        api_mode="openai",
+        api_mode="chat_completions",
         model="test",
         platform="cli",
         _session_db_created=True,
