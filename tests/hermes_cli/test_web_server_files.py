@@ -375,3 +375,15 @@ def test_credential_dir_trees_blocked_on_subdir_descent(forced_files_client):
     assert [e["name"] for e in mcp_listing.json()["entries"]] == []
 
 
+def test_context_controller_keys_cannot_be_browsed_or_downloaded(forced_files_client):
+    client, root = forced_files_client
+    path = root / "context-controller-keys" / "controller.key"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"private-test-key")
+    listing = client.get("/api/files", params={"path": str(root)}).json()
+    assert "context-controller-keys" not in [e["name"] for e in listing["entries"]]
+    for route in ("read", "download", "stream"):
+        response = client.get("/api/files/" + route, params={"path": str(path)})
+        assert response.status_code == 403
+        assert b"private-test-key" not in response.content
+

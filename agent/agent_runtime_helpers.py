@@ -559,7 +559,7 @@ def note_turn_persisted(agent):
     agent._inflight_turn_session_id = None
 
 
-def repair_message_sequence(agent, messages: List[Dict]) -> int:
+def repair_message_sequence(agent, messages: List[Dict], *, preserve_user_messages: bool = False) -> int:
     """Collapse malformed role-alternation left in the live history.
 
     Providers (OpenAI, OpenRouter, Anthropic) expect strict alternation:
@@ -771,6 +771,11 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
             and merged[-1].get("role") == "user"
         ):
             prev = merged[-1]
+            if preserve_user_messages:
+                # Continuity binds exact authentic occurrences. Merge only
+                # the later provider copy, never these durable source rows.
+                merged.append(msg)
+                continue
             # A summary carrier followed by a new user row is a deliberate
             # durable shape after retry/rewind.  Do not absorb the fresh ask
             # into the already-persisted carrier: mutating that dict can make
@@ -811,7 +816,7 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
     return repairs
 
 
-def repair_message_sequence_with_cursor(agent, messages: List[Dict]) -> int:
+def repair_message_sequence_with_cursor(agent, messages: List[Dict], *, preserve_user_messages: bool = False) -> int:
     """Run :func:`repair_message_sequence` and keep the SessionDB flush
     cursor consistent with the compacted list (#44837).
 
@@ -835,7 +840,7 @@ def repair_message_sequence_with_cursor(agent, messages: List[Dict]) -> int:
     if isinstance(flush_cursor, int) and flush_cursor > 0:
         pre_repair_flushed_ids = {id(m) for m in messages[:flush_cursor]}
 
-    repairs = repair_message_sequence(agent, messages)
+    repairs = repair_message_sequence(agent, messages, preserve_user_messages=preserve_user_messages)
 
     if repairs > 0 and hasattr(agent, "_last_flushed_db_idx"):
         if pre_repair_flushed_ids is not None:

@@ -4998,6 +4998,25 @@ class _VoiceInputMessage:
         return self.text
 
 
+class _SyntheticInputMessage:
+    """Durably typed application-authored user-role turn queued by the CLI."""
+
+    __slots__ = ("text", "display_kind", "display_metadata")
+
+    def __init__(
+        self,
+        text: str,
+        display_kind: str = "internal_notification",
+        display_metadata: Optional[dict] = None,
+    ):
+        self.text = text
+        self.display_kind = display_kind
+        self.display_metadata = dict(display_metadata or {})
+
+    def __str__(self) -> str:
+        return self.text
+
+
 class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     """
     Interactive CLI for the Hermes Agent.
@@ -12790,6 +12809,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._goal_manager = mgr
         return mgr
 
+    def _queue_internal_input(
+        self,
+        text: str,
+        *,
+        source: str,
+        display_kind: str = "internal_notification",
+    ) -> None:
+        """Queue one application-authored turn without granting user authority."""
+        self._pending_input.put(
+            _SyntheticInputMessage(
+                text,
+                display_kind=display_kind,
+                display_metadata={"synthetic_source": source},
+            )
+        )
+
     def _get_heartbeat_manager(self):
         """Return the HeartbeatManager bound to the current session_id.
 
@@ -12848,7 +12883,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             continue
                         prompt = mgr.due_prompt()
                         if prompt:
-                            self._pending_input.put(prompt)
+                            self._queue_internal_input(prompt, source="heartbeat")
                     except Exception as exc:
                         logging.debug("heartbeat watchdog tick failed: %s", exc)
             finally:
@@ -12923,7 +12958,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             state = mgr.state
             tick_no = state.ticks_fired if state else "?"
             _cprint(f"  {_DIM}↻ /loop wakeup #{tick_no} firing…{_RST}")
-            self._pending_input.put(wakeup)
+            self._queue_internal_input(wakeup, source="loop")
         except Exception as exc:
             logging.debug("loop tick injection failed: %s", exc)
             try:
@@ -13047,7 +13082,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             claim = claim_event_delivery(event, consumer)
             if claim is None:
                 continue
-            self._pending_input.put(synthetic_message)
+            self._queue_internal_input(
+                synthetic_message,
+                source="async_delegation_complete",
+                display_kind="async_delegation_complete",
+            )
             complete_event_delivery(event, claim)
 
     def _drain_interrupt_queue_to_pending_input(self) -> None:
@@ -13204,7 +13243,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     _cprint(f"  {_DIM}⚠ Continuation already claimed by another worker; checkpoint retained.{_RST}")
                     return
                 try:
-                    self._pending_input.put(prompt)
+                    self._queue_internal_input(prompt, source="goal_continuation")
                     mgr.release_continuation(queued=True)
                 except Exception as exc:
                     mgr.release_continuation(queued=False)
@@ -16326,7 +16365,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception:
                 pass
 
-    def chat(self, message, images: list = None, voice_input: bool = False) -> Optional[str]:
+    def chat(
+        self,
+        message,
+        images: list = None,
+        voice_input: bool = False,
+        *,
+        persist_user_display_kind: Optional[str] = None,
+        persist_user_display_metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
         """
         Send a message to the agent and get a response.
         
@@ -16497,6 +16544,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             staged_user_message = stamp_message_timestamp(
                 {"role": "user", "content": message}
             )
+            if persist_user_display_kind:
+                staged_user_message["display_kind"] = persist_user_display_kind
+                if persist_user_display_metadata:
+                    staged_user_message["display_metadata"] = dict(
+                        persist_user_display_metadata
+                    )
             agent._pending_cli_user_message = staged_user_message
             self.conversation_history.append(staged_user_message)
 
@@ -16687,6 +16740,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         stream_callback=stream_callback,
                         task_id=self.session_id,
                         persist_user_message=_persist_clean_user_message,
+                        persist_user_display_kind=persist_user_display_kind,
+                        persist_user_display_metadata=persist_user_display_metadata,
                         moa_config=_moa_cfg,
                     )
                     if getattr(self, "_pending_moa_disable_after_turn", False):
@@ -20429,6 +20484,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                                 pass
                         continue
 
+                    # Queue entries distinguish authentic user input from
+                    # application-authored continuation/wakeup turns before
+                    # any string transforms erase their origin.
+                    synthetic_kind = None
+                    synthetic_metadata = None
+                    if isinstance(user_input, _SyntheticInputMessage):
+                        synthetic_kind = user_input.display_kind
+                        synthetic_metadata = dict(user_input.display_metadata)
+                        user_input = user_input.text
+
                     # Voice-transcribed messages arrive wrapped in a sentinel
                     # so only genuine STT output gets the voice prefix (#65827).
                     is_voice_input = isinstance(user_input, _VoiceInputMessage)
@@ -20549,7 +20614,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     app.invalidate()  # Refresh status line
 
                     try:
-                        self.chat(user_input, images=submit_images or None, voice_input=is_voice_input)
+                        self.chat(
+                            user_input,
+                            images=submit_images or None,
+                            voice_input=is_voice_input,
+                            persist_user_display_kind=synthetic_kind,
+                            persist_user_display_metadata=synthetic_metadata,
+                        )
                     finally:
                         self._agent_running = False
                         self._spinner_text = ""

@@ -2894,7 +2894,13 @@ class CLICommandsMixin:
                 queued = False
                 if prompt:
                     try:
-                        self._pending_input.put(prompt)
+                        queue_internal = getattr(
+                            self, "_queue_internal_input", None
+                        )
+                        if callable(queue_internal):
+                            queue_internal(prompt, source="goal_continuation")
+                        else:
+                            self._pending_input.put(prompt)
                         queued = True
                     except Exception:
                         pass

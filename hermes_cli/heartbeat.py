@@ -298,24 +298,42 @@ class HeartbeatManager:
         return s.render_prompt()
 
 
-def migrate_heartbeat_to_session(old_session_id: str, new_session_id: str) -> bool:
-    """Carry a heartbeat across a compression session rotation.
+def heartbeat_session_migration(old_session_id, new_session_id, parent_raw, child_raw):
+    """Return the canonical heartbeat transfer without opening a transaction."""
+    if not parent_raw:
+        return False, []
+    state = HeartbeatState.from_json(parent_raw)
+    if child_raw is not None:
+        existing = HeartbeatState.from_json(child_raw)
+        same = all(getattr(state, field) == getattr(existing, field) for field in (
+            "prompt", "interval_seconds", "created_at", "last_fired_at", "fire_count",
+        ))
+        return bool(state.status == "cleared" and existing.status != "cleared" and same), []
+    if state.status == "cleared":
+        return False, []
+    archived = HeartbeatState.from_json(parent_raw)
+    archived.status = "cleared"
+    return True, [
+        (_meta_key(old_session_id), parent_raw, archived.to_json()),
+        (_meta_key(new_session_id), None, state.to_json()),
+    ]
 
-    Same shape as ``goals.migrate_goal_to_session`` — copy to the child,
-    archive the parent row, never raise.
-    """
+
+def migrate_heartbeat_to_session(
+    old_session_id: str, new_session_id: str, *, session_db=None
+) -> bool:
+    """Carry heartbeat state through one atomic SessionDB owner transition."""
     if not old_session_id or not new_session_id or old_session_id == new_session_id:
         return False
     try:
-        state = load_heartbeat(old_session_id)
-        if state is None:
+        db = session_db if session_db is not None else _get_session_db()
+        if db is None or not hasattr(db, "compare_and_set_meta_many"):
             return False
-        if load_heartbeat(new_session_id) is not None:
-            return False
-        save_heartbeat(new_session_id, state)
-        state.status = "cleared"
-        save_heartbeat(old_session_id, state)
-        return True
+        migrated, changes = heartbeat_session_migration(
+            old_session_id, new_session_id,
+            db.get_meta(_meta_key(old_session_id)), db.get_meta(_meta_key(new_session_id)),
+        )
+        return bool(db.compare_and_set_meta_many(changes)) if changes else migrated
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("HeartbeatManager: migration failed: %s", exc)
         return False

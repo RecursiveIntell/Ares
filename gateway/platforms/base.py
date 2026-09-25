@@ -1408,6 +1408,7 @@ def _media_delivery_denied_paths() -> List[Path]:
     # tag can't deliver a live bearer token as a native attachment.
     # (session/kanban SQLite stores are handled by #41071 — kept out here.)
     _ROOT_CREDENTIAL_DIRS = (
+        "context-controller-keys",
         "pairing",
         "mcp-tokens",
     )
@@ -1433,6 +1434,8 @@ def _path_under_denied_prefix(resolved: Path) -> bool:
     only un-block a plain file sitting in the running user's home tree, never a
     credential location or another user's home.
     """
+    if "context-controller-keys" in resolved.parts:
+        return True
     try:
         home = Path(os.path.expanduser("~")).resolve(strict=False)
     except (OSError, RuntimeError, ValueError):
@@ -2467,6 +2470,11 @@ class MessageEvent:
     # Proactive plugin events set this to False so untrusted payload text
     # remains conversational input.
     allow_gateway_control: bool = True
+    # Process-local native ingress binding. Never reconstructed from metadata.
+    _context_input: Any = field(default=None, repr=False, compare=False)
+    _context_event_id: Optional[str] = field(default=None, repr=False, compare=False)
+    _context_original_text: Optional[str] = field(default=None, repr=False, compare=False)
+    _context_pre_dispatch_applied: bool = field(default=False, repr=False, compare=False)
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
@@ -3132,6 +3140,11 @@ class BasePlatformAdapter(ABC):
         # Without the owner-task map, an old task's finally block could delete
         # a newer task's guard, leaving stale busy state.
         self._active_sessions: Dict[str, asyncio.Event] = {}
+        # Admission shares this short route lock with reset handoffs. Ordinary
+        # turns release it after acceptance; resets retain it until the route
+        # owner has changed and the old adapter task has unwound. Weak values
+        # retire idle route locks while callers/waiters retain strong refs.
+        self._input_admission_locks = weakref.WeakValueDictionary()
         self._pending_messages: Dict[str, MessageEvent] = {}
         self._session_tasks: Dict[str, asyncio.Task] = {}
         # Legacy busy_text_mode env var; when unset the runner syncs the
@@ -3765,6 +3778,10 @@ class BasePlatformAdapter(ABC):
         an optional response string.
         """
         self._message_handler = handler
+
+    def set_input_acceptor(self, handler) -> None:
+        """Install the runner-owned durable ordinary-input admission boundary."""
+        self._input_acceptor = handler
 
     def set_platform_event_handler(
         self,
@@ -6154,7 +6171,7 @@ class BasePlatformAdapter(ABC):
                 release_guard=False,
                 discard_pending=False,
             )
-        except Exception:
+        except BaseException:
             # On failure, restore the original guard if one still exists so
             # we don't leave the session in a half-reset state.
             if self._active_sessions.get(session_key) is command_guard:
@@ -6208,6 +6225,25 @@ class BasePlatformAdapter(ABC):
             )
             return
 
+        admission_lock = self._input_admission_locks.setdefault(session_key, asyncio.Lock())
+        async with admission_lock:
+            acceptor = getattr(self, "_input_acceptor", None)
+            if acceptor is not None and not await acceptor(event):
+                return
+            from hermes_cli.commands import is_interrupt_then_dispatch
+
+            cmd = event.get_command()
+            if cmd and is_interrupt_then_dispatch(cmd):
+                # Include idle resets: background dispatch would release the
+                # admission lock before the handler changes the route root.
+                self._discard_text_debounce(session_key)
+                try:
+                    await self._dispatch_active_session_command(event, session_key, cmd)
+                except Exception as exc:
+                    logger.error("[%s] Command '/%s' dispatch failed: %s",
+                                 self.name, cmd, exc, exc_info=True)
+                return
+
         # On-entry self-heal: if the adapter still has an _active_sessions
         # entry for this key but the owner task has already exited (done or
         # cancelled), the lock is stale.  Clear it and fall through to
@@ -6229,28 +6265,9 @@ class BasePlatformAdapter(ABC):
             # session lifecycle and its cleanup races with the running task
             # (see PR #4926).
             cmd = event.get_command()
-            from hermes_cli.commands import (
-                is_interrupt_then_dispatch,
-                should_bypass_active_session,
-            )
+            from hermes_cli.commands import should_bypass_active_session
 
             if should_bypass_active_session(cmd):
-                # /stop, /new, /reset must cancel the in-flight adapter task
-                # and preserve ordering of queued follow-ups.  Route those
-                # through the dedicated handoff path that serializes
-                # cancellation + runner response + pending drain.
-                # (Registry-derived: busy_policy == "interrupt_then_dispatch".)
-                if cmd and is_interrupt_then_dispatch(cmd):
-                    self._discard_text_debounce(session_key)
-                    try:
-                        await self._dispatch_active_session_command(event, session_key, cmd)
-                    except Exception as e:
-                        logger.error(
-                            "[%s] Command '/%s' dispatch failed: %s",
-                            self.name, cmd, e, exc_info=True,
-                        )
-                    return
-
                 # Other bypass commands (/approve, /deny, /status,
                 # /background, /restart) just need direct dispatch — they
                 # don't cancel the running task.
@@ -6341,6 +6358,8 @@ class BasePlatformAdapter(ABC):
                         return
                 except Exception as e:
                     logger.error("[%s] Busy-session handler failed: %s", self.name, e, exc_info=True)
+                    if event._context_input is not None:
+                        raise
 
             # Special case: photo bursts/albums frequently arrive as multiple near-
             # simultaneous messages. Queue them without interrupting the active run,

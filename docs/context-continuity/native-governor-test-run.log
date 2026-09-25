@@ -1,0 +1,536 @@
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded aead v0.5.2
+  Downloaded arrayref v0.3.9
+  Downloaded ahash v0.8.12
+  Downloaded aes-gcm v0.10.3
+  Downloaded block-buffer v0.10.4
+  Downloaded arrayvec v0.7.7
+  Downloaded bitflags v2.13.0
+  Downloaded hex v0.4.3
+  Downloaded crypto-common v0.1.7
+  Downloaded cpufeatures v0.2.17
+  Downloaded cpufeatures v0.3.0
+  Downloaded inout v0.1.4
+  Downloaded ghash v0.5.1
+  Downloaded generic-array v0.14.7
+  Downloaded fallible-streaming-iterator v0.1.9
+  Downloaded constant_time_eq v0.4.2
+  Downloaded cfg-if v1.0.4
+  Downloaded errno v0.3.14
+  Downloaded digest v0.10.7
+  Downloaded universal-hash v0.5.1
+  Downloaded autocfg v1.5.1
+  Downloaded rand_chacha v0.3.1
+  Downloaded opaque-debug v0.3.1
+  Downloaded ppv-lite86 v0.2.21
+  Downloaded polyval v0.6.2
+  Downloaded once_cell v1.21.4
+  Downloaded serde_derive v1.0.228
+  Downloaded pkg-config v0.3.33
+  Downloaded memchr v2.8.2
+  Downloaded rand_core v0.6.4
+  Downloaded num-traits v0.2.19
+  Downloaded thiserror-impl v2.0.18
+  Downloaded shlex v2.0.1
+  Downloaded sha2 v0.10.9
+  Downloaded serde v1.0.228
+  Downloaded tempfile v3.27.0
+  Downloaded zstd-safe v7.3.0
+  Downloaded zmij v1.0.21
+  Downloaded version_check v0.9.5
+  Downloaded subtle v2.6.1
+  Downloaded zstd v0.13.3
+  Downloaded jobserver v0.1.35
+  Downloaded itoa v1.0.18
+  Downloaded hashlink v0.9.1
+  Downloaded iana-time-zone v0.1.65
+  Downloaded serde_core v1.0.228
+  Downloaded hmac v0.12.1
+  Downloaded quote v1.0.46
+  Downloaded proc-macro2 v1.0.106
+  Downloaded smallvec v1.15.2
+  Downloaded cc v1.2.65
+  Downloaded uuid v1.23.4
+  Downloaded rand v0.8.7
+  Downloaded unicode-ident v1.0.24
+  Downloaded serde_json v1.0.150
+  Downloaded thiserror v2.0.18
+  Downloaded getrandom v0.4.3
+  Downloaded rusqlite v0.32.1
+  Downloaded blake3 v1.8.5
+  Downloaded typenum v1.20.1
+  Downloaded hashbrown v0.14.5
+  Downloaded vcpkg v0.2.15
+  Downloaded aes v0.8.4
+  Downloaded getrandom v0.2.17
+  Downloaded find-msvc-tools v0.1.9
+  Downloaded fastrand v2.4.1
+  Downloaded fallible-iterator v0.3.0
+  Downloaded chrono v0.4.45
+  Downloaded ctr v0.9.2
+  Downloaded zerocopy v0.8.54
+  Downloaded cipher v0.4.4
+  Downloaded syn v2.0.118
+  Downloaded rustix v1.1.4
+  Downloaded zstd-sys v2.1.0+zstd.1.5.7
+  Downloaded libc v0.2.186
+  Downloaded linux-raw-sys v0.12.1
+  Downloaded libsqlite3-sys v0.30.1
+   Compiling cfg-if v1.0.4
+   Compiling version_check v0.9.5
+   Compiling libc v0.2.186
+   Compiling typenum v1.20.1
+   Compiling shlex v2.0.1
+   Compiling find-msvc-tools v0.1.9
+   Compiling pkg-config v0.3.33
+   Compiling proc-macro2 v1.0.106
+   Compiling zerocopy v0.8.54
+   Compiling generic-array v0.14.7
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.46
+   Compiling serde_core v1.0.228
+   Compiling subtle v2.6.1
+   Compiling ahash v0.8.12
+   Compiling once_cell v1.21.4
+   Compiling cpufeatures v0.2.17
+   Compiling getrandom v0.4.3
+   Compiling autocfg v1.5.1
+   Compiling syn v2.0.118
+   Compiling zmij v1.0.21
+   Compiling vcpkg v0.2.15
+   Compiling getrandom v0.2.17
+   Compiling jobserver v0.1.35
+   Compiling inout v0.1.4
+   Compiling block-buffer v0.10.4
+   Compiling rand_core v0.6.4
+   Compiling num-traits v0.2.19
+   Compiling zstd-safe v7.3.0
+   Compiling cc v1.2.65
+   Compiling crypto-common v0.1.7
+   Compiling bitflags v2.13.0
+   Compiling serde v1.0.228
+   Compiling universal-hash v0.5.1
+   Compiling cipher v0.4.4
+   Compiling serde_json v1.0.150
+   Compiling opaque-debug v0.3.1
+   Compiling polyval v0.6.2
+   Compiling digest v0.10.7
+   Compiling itoa v1.0.18
+   Compiling thiserror v2.0.18
+   Compiling memchr v2.8.2
+   Compiling ghash v0.5.1
+   Compiling aes v0.8.4
+   Compiling ctr v0.9.2
+   Compiling aead v0.5.2
+   Compiling rustix v1.1.4
+   Compiling cpufeatures v0.3.0
+   Compiling fallible-iterator v0.3.0
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling constant_time_eq v0.4.2
+   Compiling smallvec v1.15.2
+   Compiling arrayvec v0.7.7
+   Compiling iana-time-zone v0.1.65
+   Compiling arrayref v0.3.9
+   Compiling uuid v1.23.4
+   Compiling aes-gcm v0.10.3
+   Compiling zstd-sys v2.1.0+zstd.1.5.7
+   Compiling libsqlite3-sys v0.30.1
+   Compiling blake3 v1.8.5
+   Compiling hmac v0.12.1
+   Compiling sha2 v0.10.9
+   Compiling linux-raw-sys v0.12.1
+   Compiling serde_derive v1.0.228
+   Compiling thiserror-impl v2.0.18
+   Compiling hex v0.4.3
+   Compiling hashbrown v0.14.5
+   Compiling ppv-lite86 v0.2.21
+   Compiling fastrand v2.4.1
+   Compiling rand_chacha v0.3.1
+   Compiling hashlink v0.9.1
+   Compiling rand v0.8.7
+   Compiling tempfile v3.27.0
+   Compiling chrono v0.4.45
+   Compiling zstd v0.13.3
+   Compiling rusqlite v0.32.1
+   Compiling context-governor v0.2.0 (/workspace/scratch/bfe02ea97bc3/Libraries/context-governor)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 29.19s
+     Running unittests src/lib.rs (context-governor/target/debug/deps/context_governor-dcc9ac65ed08b622)
+
+running 25 tests
+test lineage::tests::generation_boundary_fails_closed_instead_of_saturating ... ok
+test llm_summary::tests::includes_exact_store_content_when_enabled ... ok
+test llm_summary::tests::excludes_exact_store_content_when_disabled ... ok
+test llm_summary::tests::includes_new_messages_section ... ok
+test llm_summary::tests::focus_override_takes_precedence ... ok
+test llm_summary::tests::parse_summary_output_handles_missing_sections ... ok
+test llm_summary::tests::estimate_prompt_tokens_positive ... ok
+test llm_summary::tests::parse_summary_output_extracts_all_sections ... ok
+test llm_summary::tests::includes_loss_report_when_enabled ... ok
+test llm_summary::tests::includes_step_graph_when_enabled ... ok
+test llm_summary::tests::truncate_content_counts_unicode_scalar_characters ... ok
+test llm_summary::tests::full_render_roundtrip ... ok
+test llm_summary::tests::parse_summary_output_handles_none_values ... ok
+test llm_summary::tests::truncate_content_keeps_exact_unicode_boundary_without_marker ... ok
+test llm_summary::tests::renders_system_prompt_with_all_rules ... ok
+test llm_summary::tests::truncate_content_preserves_short_content ... ok
+test reducers::tests::compiler_reducer_extracts_errors_and_test_counts ... ok
+test reducers::tests::diff_reducer_extracts_file_paths_and_hunks ... ok
+test reducers::tests::markdown_reducer_extracts_headings_and_decisions ... ok
+test reducers::tests::json_reducer_extracts_keys_and_errors ... ok
+test llm_summary::tests::truncate_content_truncates_long_content ... ok
+test reducers::tests::search_reducer_extracts_paths_and_lines ... ok
+test llm_summary::tests::renders_user_prompt_with_sections ... ok
+test reducers::tests::shell_reducer_extracts_command_and_status ... ok
+test v3::tests::encrypted_blob_round_trip_is_authenticated ... ok
+
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running unittests src/main.rs (context-governor/target/debug/deps/context_governor-d6afefc8a87e91cd)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/boundary_audit_cli.rs (context-governor/target/debug/deps/boundary_audit_cli-ac6d3b151cc9e6a5)
+
+running 2 tests
+test boundary_audit_cli_reports_unsafe_relinked_summary ... ok
+test boundary_audit_cli_allows_safe_summary ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/boundary_safety.rs (context-governor/target/debug/deps/boundary_safety-451726e929b5cd8a)
+
+running 3 tests
+test boundary_audit_empty_summary_is_safe ... ok
+test boundary_audit_passes_safe_summary ... ok
+test boundary_audit_detects_relinking_risk ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/cli.rs (context-governor/target/debug/deps/cli-35beadaf4b65d217)
+
+running 8 tests
+test v2_cli_rejects_caller_selected_hmac_path ... ok
+test no_args_cli_remains_backwards_compatible_compact ... ok
+test finalize_cli_binds_receipt_to_adapter_emitted_messages ... ok
+test v2_prompt_provenance_projection_is_bounded_without_losing_receipt_manifest ... ok
+test cli_compact_diff_store_search_and_expand_round_trip ... ok
+test v2_cli_finalize_prepare_recover_and_activate_is_two_phase ... ok
+test v2_cli_restarts_from_store_tip_and_expands_ancestor_source ... ok
+test v2_cli_continues_with_authenticated_epoch_after_generation_ceiling ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+
+     Running tests/compaction.rs (context-governor/target/debug/deps/compaction-f27246f2ab6539a5)
+
+running 21 tests
+test artifact_recall_can_be_background_when_query_explicitly_matches ... ok
+test acceptance_gate_with_speculation_stays_exact ... ok
+test host_finalization_reserve_cannot_consume_the_entire_target ... ok
+test archived_durable_items_have_exact_store_records_even_when_kept ... ok
+test latest_user_identity_is_final_and_not_deduplicated ... ok
+test latest_user_preserved_with_zero_tail_protection ... ok
+test latest_user_with_speculation_stays_exact_when_tail_protection_is_disabled ... ok
+test hard_cascade_keeps_minimal_recovery_pointer_when_it_fits ... ok
+test host_finalization_reserve_reduces_pre_finalize_budget_only ... ok
+test speculative_and_artifact_recall_are_not_authoritative ... ok
+test finalize_compacted_response_rebinds_receipt_to_adapter_output ... ok
+test host_finalization_reserve_is_enforced_under_soft_warn ... ok
+test tool_text_cannot_self_promote_into_authoritative_plan_state ... ok
+test verified_error_with_speculation_stays_exact ... ok
+test receipt_hash_matches_final_compacted_messages_after_receipt_id_injection ... ok
+test compact_only_exact_recovery_is_in_response_not_persisted ... ok
+test unsafe_relinked_summary_is_replaced_before_reinjection ... ok
+test hard_cascade_reports_when_protected_overflow_cannot_fit ... ok
+test preserves_latest_user_acceptance_gates_and_errors_verbatim ... ok
+test summary_is_inserted_before_latest_user_so_latest_task_stays_active ... ok
+test compacted_summary_is_reference_only_and_has_expand_handles ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/content_compression.rs (context-governor/target/debug/deps/content_compression-b7dce3b6d0368da4)
+
+running 3 tests
+test json_summary_keeps_keys_and_search_still_finds_exact_payload ... ok
+test content_aware_summary_keeps_cargo_error_lines_not_bulk_noise ... ok
+test search_result_summary_keeps_paths_and_match_lines_not_bulk_noise ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/content_kind.rs (context-governor/target/debug/deps/content_kind-90fb354845789233)
+
+running 2 tests
+test detects_search_results_before_generic_tool_logs ... ok
+test detects_json_diff_cargo_rust_markdown_and_plain_text ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/failure_envelope.rs (context-governor/target/debug/deps/failure_envelope-ae083280f3e92f54)
+
+running 3 tests
+test failure_envelope_is_machine_readable_and_does_not_depend_on_display_text ... ok
+test human_cli_error_remains_human_without_negotiation_flag ... ok
+test capabilities_advertise_failure_envelope_v1 ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/high_roi_research.rs (context-governor/target/debug/deps/high_roi_research-7183e6262f74ad95)
+
+running 10 tests
+test agent_memory_metrics_require_all_core_modules ... ok
+test compression_boundary_audit_scans_sources_and_summary_separately ... ok
+test cheap_conflict_screen_detects_numeric_and_negation_disagreement ... ok
+test governed_memory_harness_scores_all_four_fleet_failures ... ok
+test leakage_free_rag_gate_requires_closed_book_degradation ... ok
+test mcp_tool_surface_audit_detects_split_threshold_payloads_across_tools ... ok
+test recursive_pass_two_boundary_findings_keep_source_span_receipts ... ok
+test retrieval_route_gate_keeps_simple_flat_and_escalates_hard_queries ... ok
+test projection_receipt_records_sources_hash_and_staleness ... ok
+test semantic_kv_retention_plan_marks_hosted_api_boundary ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/hmac_key_lifecycle.rs (context-governor/target/debug/deps/hmac_key_lifecycle-0f2d8da7071d00c1)
+
+running 14 tests
+test determinism ... ok
+test fingerprint_differs_for_different_keys ... ok
+test fingerprint_is_deterministic ... ok
+test legacy_keyring_loader_accepts_short_v1_verification_key_only ... ok
+test generate_sign_verify_cycle ... ok
+test multi_key_ring_verifies_old_receipts ... ok
+test tampered_content_rejected ... ok
+test wrong_key_rejected ... ok
+test literal_v1_eight_hex_signature_with_legacy_key_length_verifies ... ok
+test batch_verification_is_read_only_and_detects_tampering ... ok
+test save_load_cycle ... ok
+test rotation_preserves_old_key ... ok
+test rotated_key_ring_loads_retired_key_and_verifies_old_signature ... ok
+test durable_store_re_signs_final_receipt_and_rejects_keyless_signed_write ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/invariants.rs (context-governor/target/debug/deps/invariants-3f040510c52953bf)
+
+running 5 tests
+test default_unsafe_summary_policy_is_fallback_extract ... ok
+test checkpoint_policy_defaults_and_serializes ... ok
+test unsafe_summary_policy_roundtrips_through_json ... ok
+test latest_user_survives_after_many_cycles ... ok
+test latest_user_survives_all_budget_modes ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/key_authority.rs (context-governor/target/debug/deps/key_authority-41b4feb3cccaf014)
+
+running 4 tests
+test held_descriptors_establish_the_only_signing_authority ... ok
+test forged_snapshot_active_metadata_is_rejected ... ok
+test governed_v2_authority_rejects_legacy_short_key_material ... ok
+test missing_historical_descriptor_is_rejected ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/lineage.rs (context-governor/target/debug/deps/lineage-cbf723689f8b8672)
+
+running 38 tests
+test certified_growth_measurement_through_generation_thirty_two ... ignored, release certification gate: run cargo test --release --test lineage certified_growth_measurement_through_generation_thirty_two -- --ignored --nocapture
+test checkpoint_candidate_survives_min_net_gate_for_host_llm ... ok
+test catalog_hmac_tampering_fails_closed_until_explicit_rebuild ... ok
+test certified_store_rejects_tampered_ancestry_before_expand_or_parent_selection ... ok
+test ancestor_provenance_tampering_fails_closed ... ok
+test corrupt_lineage_index_fails_closed_until_explicit_rebuild ... ok
+test existing_v1_receipt_remains_readable_exact_and_parentless ... ok
+test duplicate_child_and_cyclic_parent_graph_fail_closed ... ok
+test derived_index_rebuild_does_not_change_lineage_authority ... ok
+test governed_rebuild_rejects_unsigned_v1_receipts ... ok
+test explicit_v1_bridge_preserves_only_proven_legacy_exact_sources ... ok
+test epoch_zero_wire_omits_new_optional_fields_and_roundtrips_identically ... ok
+test certified_v2_policy_rejects_generation_and_provenance_budget_growth ... ok
+test legacy_receipts_are_never_auto_selected_as_v2_parent ... ok
+test lineage_construction_has_deterministic_replay_digest ... ok
+test missing_lineage_index_fails_closed_until_explicit_rebuild ... ok
+test duplicate_continuation_candidates_have_one_activation_winner ... ok
+test mandatory_two_generation_restart_recovers_exact_omitted_marker ... ok
+test pending_receipt_can_be_authenticated_and_discarded_after_host_abort ... ok
+test projection_finalization_cannot_invent_or_mutate_provenance ... ok
+test recomputed_attacker_provenance_cannot_cross_finalize_or_store_authority ... ok
+test explicit_continuation_rolls_epoch_after_generation_ceiling ... ok
+test missing_parent_receipt_fails_closed_after_restart ... ok
+test newest_summary_tampering_is_detected_without_blocking_exact_source_recovery ... ok
+test pending_receipt_is_inert_until_matching_committed_projection_activates ... ok
+test persisted_loader_authenticates_original_json_before_normalization ... ok
+test source_identity_manifest_has_no_duplicate_entries ... ok
+test recursive_lineage_still_rejects_parent_text_drift ... ok
+test signer_admission_failure_never_publishes_and_valid_retry_succeeds ... ok
+test recursive_lineage_rejects_host_loss_of_non_text_message_metadata ... ok
+test retention_cannot_remove_ancestry_required_by_a_retained_descendant ... ok
+test v2_authoritative_operations_fail_closed_without_governed_authority ... ok
+test superseded_receipt_remains_directly_recoverable ... ok
+test v2_save_is_append_only_and_hmac_covers_issued_bytes ... ok
+test missing_or_hash_mismatched_original_source_fails_closed ... ok
+test same_tip_activation_race_has_exactly_one_winner ... ok
+test generation_four_and_eight_survive_restart_between_every_generation ... ok
+test unrelated_lineages_activate_concurrently ... ok
+
+test result: ok. 37 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 7.80s
+
+     Running tests/memory_sink.rs (context-governor/target/debug/deps/memory_sink-a01ddeb3bb04b9f9)
+
+running 2 tests
+test semantic_memory_enabled_without_sink_fails_loud_not_silent ... ok
+test memory_archive_records_are_explicit_and_result_bound ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/policy.rs (context-governor/target/debug/deps/policy-5ff2732796c4062f)
+
+running 3 tests
+test token_counter_kind_is_recorded_in_receipt ... ok
+test fail_closed_errors_when_exact_preserve_exceeds_budget ... ok
+test hard_cascade_keeps_output_under_budget_when_possible ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/receipt_index_scale.rs (context-governor/target/debug/deps/receipt_index_scale-5143f908371022d8)
+
+running 1 test
+test receipt_index_scales_to_10k_compactions ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.13s
+
+     Running tests/receipt_integrity.rs (context-governor/target/debug/deps/receipt_integrity-4cf7dd8069604390)
+
+running 4 tests
+test hmac_is_deterministic_same_key_same_content ... ok
+test hmac_rejects_wrong_key ... ok
+test hmac_rejects_tampered_content ... ok
+test hmac_verifies_same_content ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/replay_answerability.rs (context-governor/target/debug/deps/replay_answerability-55895d9630b9272a)
+
+running 1 test
+test replay_answerability_scores_operational_questions_after_compaction ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/replay_benchmark.rs (context-governor/target/debug/deps/replay_benchmark-7d5ab896d2412f37)
+
+running 5 tests
+test replay_probe_extraction_finds_operational_anchors ... ok
+test replay_probe_extraction_uses_literal_substrings_for_long_active_task ... ok
+test latest_user_duplicate_still_preserves_active_task_verbatim ... ok
+test replay_fixture_scores_full_head_tail_and_context_governor ... ok
+test aggressive_replay_compaction_hits_budget_without_losing_exact_recovery ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+     Running tests/step_graph.rs (context-governor/target/debug/deps/step_graph-ed942cbedb306464)
+
+running 6 tests
+test build_context_steps_detects_errors ... ok
+test build_context_steps_groups_by_user_turns ... ok
+test build_context_steps_detects_active_instructions ... ok
+test build_context_steps_preserves_tool_result_parts ... ok
+test build_context_steps_handles_single_message ... ok
+test extract_plan_state_finds_acceptance_gates_and_decisions ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/store.rs (context-governor/target/debug/deps/store-b0158424e8725aca)
+
+running 15 tests
+test corrupt_legacy_index_is_migrated_to_a_compact_rebuildable_index ... ok
+test expand_rejects_tampered_exact_content ... ok
+test file_context_store_status_reports_lifecycle_bytes_and_cleans_tmp_files ... ok
+test corrupt_compact_index_rebuilds_from_authoritative_receipts ... ok
+test concurrent_same_id_writers_publish_one_complete_receipt_and_leave_no_temp_files ... ok
+test invalid_overwrite_is_rejected_before_replacing_valid_receipt ... ok
+test file_context_store_round_trips_receipt_and_exact_fallback ... ok
+test external_receipt_replacement_is_reconciled_without_stale_hits ... ok
+test corrupt_trigram_signature_falls_back_exactly_and_is_quarantined ... ok
+test save_with_status_finalizes_exact_recovery_and_pruning_removes_it ... ok
+test file_context_store_persists_search_index_across_instances_and_prunes ... ok
+test summary_projection_tamper_is_rejected_but_exact_fallback_remains_available ... ok
+test indexed_search_matches_authoritative_scan_for_punctuated_substrings ... ok
+test overwriting_a_receipt_updates_the_persisted_index_in_place ... ok
+test saving_a_new_receipt_updates_an_existing_index_in_place ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+     Running tests/structured_summary.rs (context-governor/target/debug/deps/structured_summary-254f2d816166ff1e)
+
+running 1 test
+test structured_summary_extracts_operational_anchors ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/token_counter.rs (context-governor/target/debug/deps/token_counter-357c7ff8f35ae7b2)
+
+running 5 tests
+test approximate_token_counter_records_provider_budget_warning ... ok
+test approx_words_counter_is_used_for_item_accounting ... ok
+test tiktoken_counter_surface_falls_back_loudly_without_native_feature ... ok
+test provider_chat_approx_records_mode_and_overhead_warning ... ok
+test hard_cascade_summary_truncation_uses_the_selected_counter_not_chars ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/tools.rs (context-governor/target/debug/deps/tools-408d9b59949301e6)
+
+running 3 tests
+test diff_reports_policy_counts ... ok
+test search_finds_receipt_and_exact_store_content_without_dumping_everything ... ok
+test expand_recovers_exact_omitted_text_by_item_id ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/unicode_search.rs (context-governor/target/debug/deps/unicode_search-df203ddfbcb80d51)
+
+running 1 test
+test context_search_handles_multibyte_char_boundaries ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/utility_allocator.rs (context-governor/target/debug/deps/utility_allocator-5980212a507d60ad)
+
+running 6 tests
+test utility_v2_prefers_focus_relevant_middle_item_at_tight_budget ... ok
+test utility_v2_penalizes_duplicate_optional_content_against_novel_focus_content ... ok
+test utility_v2_is_stable_and_exposes_selection_evidence ... ok
+test deterministic_v1_explicit_mode_matches_default_semantics ... ok
+test utility_v2_reserves_mandatory_system_gate_error_and_latest_user ... ok
+test utility_v2_hot_path_membership_work_is_linear_for_large_inputs ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+
+     Running tests/v3_regressions.rs (context-governor/target/debug/deps/v3_regressions-6797ce10fcd6af28)
+
+running 3 tests
+test missing_source_directory_is_not_successful_empty_migration ... ok
+test corrupt_existing_blob_cannot_be_reported_as_completed_resume ... ok
+test shared_encrypted_evidence_remains_readable_for_every_receipt ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.51s
+
+     Running tests/v3_verifier.rs (context-governor/target/debug/deps/v3_verifier-84ba7f1facb86cfa)
+
+running 5 tests
+test existing_projection_is_verified_read_only_and_wrong_key_fails_closed ... ok
+test concurrent_fresh_migrations_have_one_projection_owner ... ok
+test projection_verification_detects_manifest_tampering ... ok
+test projection_verification_detects_source_snapshot_drift ... ok
+test projection_verification_rejects_symlinked_blob ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.36s
+
+   Doc-tests context_governor
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

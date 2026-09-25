@@ -88,6 +88,10 @@ def session(server):
         "cols": 120,
     }
     server._sessions[sid] = s
+    # Resume is a transaction on the canonical goal/episode/session owner.
+    # The transport fixture must include its durable session, as production does.
+    from hermes_cli.goals import _get_session_db
+    _get_session_db().create_session(session_key, source="tui")
     return sid, session_key, s
 
 

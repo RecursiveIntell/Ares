@@ -1987,6 +1987,71 @@ def run_conversation(
     # on the next loop iteration. This prevents a second advisor fan-out.
     pending_moa_prepared_request = None
 
+    def _attempt_provider_overflow_rebase(pressure_tokens: int):
+        """Try one durable context rebase after the provider proves overflow.
+
+        The failed provider attempt remains charged. This helper only replaces
+        the working set for the next retry; it never turns an output-cap error
+        or a blocked owner transition into a successful turn.
+        """
+        nonlocal messages, conversation_history, active_system_prompt
+        nonlocal current_turn_user_idx, compression_attempts
+        nonlocal _preflight_compression_blocked, _last_preflight_pressure
+        if not getattr(agent, "context_rebase_enabled", False):
+            return None
+        if type(pressure_tokens) is not int or pressure_tokens <= 0:
+            return None
+        from ares_runtime.continuity.runtime import (
+            AutomaticRebaseStatus,
+            attempt_turn_start_context_rebase,
+        )
+
+        result = attempt_turn_start_context_rebase(
+            agent,
+            messages,
+            conversation_history=conversation_history,
+            active_system_prompt=active_system_prompt,
+            before_tokens=pressure_tokens,
+        )
+        if result.status is AutomaticRebaseStatus.READY:
+            messages = list(result.messages)
+            conversation_history = list(result.messages)
+            active_system_prompt = result.system_prompt
+            current_turn_user_idx = next(
+                (
+                    idx
+                    for idx in range(len(messages) - 1, -1, -1)
+                    if messages[idx].get("role") == "user"
+                ),
+                len(messages) - 1,
+            )
+            agent._persist_user_message_idx = current_turn_user_idx
+            compression_attempts = 0
+            _preflight_compression_blocked = False
+            _last_preflight_pressure = None
+            agent._empty_content_retries = 0
+            agent._thinking_prefill_retries = 0
+            agent._last_content_with_tools = None
+            agent._last_content_tools_all_housekeeping = False
+            agent._mute_post_response = False
+            _clear_warn = getattr(agent, "_clear_context_overflow_warn", None)
+            if callable(_clear_warn):
+                _clear_warn()
+            agent._emit_status(
+                "↻ Provider context overflow recovered from durable state; "
+                "rebuilding request..."
+            )
+        elif result.status is AutomaticRebaseStatus.RECONCILIATION_REQUIRED:
+            agent._persist_session(messages, conversation_history)
+        return result
+
+    def _context_rebase_stopped_result(result, *, calls=None):
+        from ares_runtime.continuity.runtime import context_rebase_failure_result
+
+        return context_rebase_failure_result(
+            result, messages, api_calls=api_call_count if calls is None else calls,
+        )
+
     # Per-turn tally of consecutive successful credential-pool token refreshes,
     # keyed by (provider, pool-entry-id). A persistent upstream 401 lets
     # ``try_refresh_current()`` "succeed" forever on a single-entry OAuth pool,
@@ -2198,6 +2263,10 @@ def run_conversation(
         # an assistant message makes the model echo it and self-replicate
         # (#81841). Dropping before repair lets repair_message_sequence fix
         # any user→user adjacency the filter creates.
+        _current_turn_user_msg = (
+            messages[current_turn_user_idx]
+            if 0 <= current_turn_user_idx < len(messages) else None
+        )
         messages = [
             msg for msg in messages
             if not (
@@ -2216,6 +2285,21 @@ def run_conversation(
             )
         ]
 
+        # Decide whether authentic occurrences must be preserved BEFORE
+        # repair. Bind durable source only after the non-user repairs below;
+        # an append-only flush cannot retract an orphan or merged assistant.
+        from ares_runtime.continuity.runtime import (
+            ContextDispatchError, context_dispatch_required, prepare_context_dispatch,
+        )
+
+        _context_dispatch_error = None
+        _context_dispatch_snapshot = None
+        try:
+            _preserve_context_users = context_dispatch_required(agent)
+        except ContextDispatchError as exc:
+            _context_dispatch_error = exc
+            _preserve_context_users = True
+
         # Defensive: repair malformed role-alternation before API call.
         # Catches cases where the history got wedged into a
         # ``tool → user`` or ``user → user`` tail (e.g. after empty-
@@ -2227,13 +2311,26 @@ def run_conversation(
         # flush cursor (_last_flushed_db_idx) when repair compacts the list,
         # so the turn-end flush doesn't skip the assistant/tool chain (#44837).
         from agent.agent_runtime_helpers import repair_message_sequence_with_cursor
-        repaired_seq = repair_message_sequence_with_cursor(agent, messages)
+        repaired_seq = repair_message_sequence_with_cursor(
+            agent, messages, preserve_user_messages=_preserve_context_users,
+        )
         if repaired_seq > 0:
             request_logger.info(
                 "Repaired %s message-alternation violations before request (session=%s)",
                 repaired_seq,
                 agent.session_id or "-",
             )
+
+        current_turn_user_idx = next(
+            (idx for idx, message in enumerate(messages) if message is _current_turn_user_msg),
+            reanchor_current_turn_user_idx(messages, user_message),
+        )
+        agent._persist_user_message_idx = current_turn_user_idx
+        if _context_dispatch_error is None:
+            try:
+                _context_dispatch_snapshot = prepare_context_dispatch(agent, messages, conversation_history)
+            except ContextDispatchError as exc:
+                _context_dispatch_error = exc
 
         api_messages = []
         for idx, msg in enumerate(messages):
@@ -2648,6 +2745,8 @@ def run_conversation(
         # system text.
         _previous_preflight_pressure = _last_preflight_pressure
         _last_preflight_pressure = None
+        _context_rebase_reason = None
+        _context_rebase_lock_deferred = False
         if (
             _previous_preflight_pressure is not None
             and request_pressure_tokens >= _preflight_threshold
@@ -2662,6 +2761,7 @@ def run_conversation(
             # request truly does not fit, its error handler may still compact
             # with that stronger signal.
             _preflight_compression_blocked = True
+            _context_rebase_reason = "insufficient_progress"
             logger.warning(
                 "Pre-API compression made insufficient progress: ~%s -> "
                 "~%s request tokens; skipping additional preflight passes",
@@ -2745,6 +2845,7 @@ def run_conversation(
                 # soft compression_deferred result with that stronger signal.
                 compression_attempts -= 1
                 _last_preflight_pressure = None
+                _context_rebase_lock_deferred = True
                 if pending_moa_prepared_request is _moa_prepared_request:
                     pending_moa_prepared_request = None
             else:
@@ -2814,6 +2915,7 @@ def run_conversation(
             except Exception:
                 _block_reason = None
             if _block_reason:
+                _context_rebase_reason = str(_block_reason)
                 agent._warn_context_overflow_blocked(
                     _block_reason,
                     request_pressure_tokens,
@@ -2846,6 +2948,92 @@ def run_conversation(
                 )
                 if callable(_warn_fn):
                     _warn_fn(request_pressure_tokens, _ctx_len)
+
+        # Automatic context rebase is admitted only at this pre-API
+        # boundary, after prior tool results are settled and before the next
+        # provider/effect attempt. A temporary compression-lock loss remains a
+        # defer, never evidence that a fresh working set is needed.
+        if (
+            getattr(agent, "context_rebase_enabled", False)
+            and agent.compression_enabled
+            and not _review_fork_first_request_pending(agent)
+            and not _context_rebase_lock_deferred
+            and not _defer_preflight(request_pressure_tokens)
+            and _preflight_threshold > 0
+            and request_pressure_tokens >= _preflight_threshold
+        ):
+            if _context_rebase_reason is None and (
+                _preflight_compression_blocked
+                or compression_attempts >= max_compression_attempts
+            ):
+                _context_rebase_reason = "compression_exhausted"
+            if _context_rebase_reason is None:
+                _info = getattr(_compressor, "should_compress_info", None)
+                if callable(_info):
+                    try:
+                        _context_rebase_reason = _info(request_pressure_tokens)[1]
+                    except Exception:
+                        _context_rebase_reason = None
+
+            if _context_rebase_reason:
+                from ares_runtime.continuity.runtime import (
+                    AutomaticRebaseStatus,
+                    attempt_turn_start_context_rebase,
+                )
+
+                _rebase = attempt_turn_start_context_rebase(
+                    agent,
+                    messages,
+                    conversation_history=conversation_history,
+                    active_system_prompt=active_system_prompt,
+                    before_tokens=request_pressure_tokens,
+                )
+                if _rebase.status is AutomaticRebaseStatus.READY:
+                    if _moa_prepared_request is not None:
+                        pending_moa_prepared_request = _moa_prepared_request
+                    messages = list(_rebase.messages)
+                    conversation_history = list(_rebase.messages)
+                    active_system_prompt = _rebase.system_prompt
+                    current_turn_user_idx = next(
+                        (
+                            idx
+                            for idx in range(len(messages) - 1, -1, -1)
+                            if messages[idx].get("role") == "user"
+                        ),
+                        len(messages) - 1,
+                    )
+                    agent._persist_user_message_idx = current_turn_user_idx
+                    _preflight_compression_blocked = False
+                    _last_preflight_pressure = None
+                    compression_attempts = 0
+                    agent._empty_content_retries = 0
+                    agent._thinking_prefill_retries = 0
+                    agent._last_content_with_tools = None
+                    agent._last_content_tools_all_housekeeping = False
+                    agent._mute_post_response = False
+                    _clear_warn = getattr(agent, "_clear_context_overflow_warn", None)
+                    if callable(_clear_warn):
+                        _clear_warn()
+                    agent._emit_status(
+                        "↻ Context working set rebased from durable state; "
+                        "rebuilding provider request..."
+                    )
+                    # This iteration never reaches the provider.
+                    api_call_count -= 1
+                    agent._api_call_count = api_call_count
+                    agent.iteration_budget.refund()
+                    continue
+                if _rebase.status in {
+                    AutomaticRebaseStatus.RECONCILIATION_REQUIRED,
+                    AutomaticRebaseStatus.BLOCKED,
+                }:
+                    agent._persist_session(messages, conversation_history)
+                    # This iteration did not admit a provider request. Preserve
+                    # cumulative accounting by refunding only this reservation.
+                    api_call_count -= 1
+                    agent._api_call_count = api_call_count
+                    agent.iteration_budget.refund()
+                    return _context_rebase_stopped_result(_rebase)
 
         # Thinking spinner for quiet mode (animated during API call)
         thinking_spinner = None
@@ -2883,6 +3071,7 @@ def run_conversation(
         finish_reason = "stop"
         response = None  # Guard against UnboundLocalError if all retries fail
         api_kwargs = None  # Guard against UnboundLocalError in except handler
+        _context_provider_attempted = False
         api_request_id = f"{turn_id}:api:{api_call_count}"
         agent._current_api_request_id = api_request_id
 
@@ -2940,6 +3129,11 @@ def run_conversation(
 
             try:
                 agent._reset_stream_delivery_tracking()
+                if _context_dispatch_error is not None:
+                    raise _context_dispatch_error
+                from ares_runtime.continuity.runtime import context_dispatch_route_identity
+
+                _context_route_identity = context_dispatch_route_identity(agent)
                 # api_messages is built once, before this retry loop, while the
                 # primary provider is active.  A mid-conversation fallback can
                 # switch to a require-side provider (DeepSeek / Kimi / MiMo) that
@@ -3003,6 +3197,11 @@ def run_conversation(
                     _xh["x-initiator"] = "user"
                     api_kwargs["extra_headers"] = _xh
                     agent._is_user_initiated_turn = False
+                from ares_runtime.continuity.runtime import context_dispatch_payload_digest
+
+                _context_materialization_digest = (
+                    context_dispatch_payload_digest(api_kwargs) if _context_dispatch_snapshot is not None else None
+                )
                 try:
                     from hermes_cli.middleware import apply_llm_request_middleware
 
@@ -3174,6 +3373,7 @@ def run_conversation(
                         _use_streaming = False
 
                 def _perform_api_call(next_api_kwargs):
+                    nonlocal _context_provider_attempted
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
                             next_api_kwargs,
@@ -3181,32 +3381,53 @@ def run_conversation(
                             is_github_responses=agent._is_copilot_url(),
                             sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
+                    from ares_runtime.continuity.runtime import admit_final_context_dispatch, context_provider_response_scope
+
+                    _admission = admit_final_context_dispatch(
+                        agent, _context_dispatch_snapshot, next_api_kwargs,
+                        attempt_id=f"{api_request_id}:{retry_count}",
+                        materialization_digest=_context_materialization_digest,
+                        route_identity=_context_route_identity,
+                    )
+                    _context_provider_attempted = True
                     if _use_streaming:
-                        return agent._interruptible_streaming_api_call(
-                            next_api_kwargs, on_first_delta=_stop_spinner
-                        )
+                        from ares_runtime.continuity.runtime import ContextDispatchStreamBuffer, settle_final_context_dispatch
+
+                        with ContextDispatchStreamBuffer(agent, _admission) as _delivery, context_provider_response_scope(agent, _admission):
+                            _response = agent._interruptible_streaming_api_call(
+                                next_api_kwargs, on_first_delta=_stop_spinner
+                            )
+
+                        settle_final_context_dispatch(agent, _admission)
+                        _delivery.deliver()
+                        return _response
                     from agent import relay_llm
 
-                    return relay_llm.execute(
-                        next_api_kwargs,
-                        agent._interruptible_api_call,
-                        session_id=str(agent.session_id or ""),
-                        name=str(agent.provider or "provider"),
-                        model_name=str(agent.model or ""),
-                        metadata={
-                            "api_mode": agent.api_mode,
-                            "api_request_id": api_request_id,
-                            "call_role": (
-                                "delegated"
-                                if getattr(agent, "is_subagent", False)
-                                else "fallback"
-                                if int(getattr(agent, "_fallback_index", 0) or 0) > 0
-                                else "primary"
-                            ),
-                            "retry_count": retry_count,
-                        },
-                        defer_logical_completion=True,
-                    )
+                    with context_provider_response_scope(agent, _admission):
+                        _response = relay_llm.execute(
+                            next_api_kwargs,
+                            agent._interruptible_api_call,
+                            session_id=str(agent.session_id or ""),
+                            name=str(agent.provider or "provider"),
+                            model_name=str(agent.model or ""),
+                            metadata={
+                                "api_mode": agent.api_mode,
+                                "api_request_id": api_request_id,
+                                "call_role": (
+                                    "delegated"
+                                    if getattr(agent, "is_subagent", False)
+                                    else "fallback"
+                                    if int(getattr(agent, "_fallback_index", 0) or 0) > 0
+                                    else "primary"
+                                ),
+                                "retry_count": retry_count,
+                            },
+                            defer_logical_completion=True,
+                        )
+                    from ares_runtime.continuity.runtime import settle_final_context_dispatch
+
+                    settle_final_context_dispatch(agent, _admission)
+                    return _response
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 
@@ -4187,6 +4408,9 @@ def run_conversation(
                         getattr(agent.context_compressor, "threshold_tokens", 0)
                         or 0
                     )
+                    # Healthy request size proves compaction effectiveness,
+                    # not task progress. Continuity episodes are rearmed only
+                    # by their canonical progress/operator transaction.
                     if _should_rearm_compression_budget(
                         compression_attempts,
                         completed_compaction_pending=_completed_compaction_pending,
@@ -4454,6 +4678,19 @@ def run_conversation(
                     thinking_spinner = None
                 if agent.thinking_callback:
                     agent.thinking_callback("")
+
+                from ares_runtime.continuity.runtime import (
+                    AutomaticRebaseResult, AutomaticRebaseStatus, ContextDispatchError,
+                )
+                if isinstance(api_error, ContextDispatchError):
+                    if not _context_provider_attempted:
+                        api_call_count = max(0, api_call_count - 1)
+                        agent._api_call_count = api_call_count
+                        agent.iteration_budget.refund()
+                    agent._persist_session(messages, conversation_history)
+                    return _context_rebase_stopped_result(AutomaticRebaseResult(
+                        AutomaticRebaseStatus.BLOCKED, str(api_error), agent.session_id,
+                    ))
 
                 # -----------------------------------------------------------
                 # UnicodeEncodeError recovery.  Two common causes:
@@ -5656,6 +5893,20 @@ def run_conversation(
                 if is_payload_too_large:
                     compression_attempts += 1
                     if compression_attempts > max_compression_attempts:
+                        _rebase = _attempt_provider_overflow_rebase(
+                            estimate_request_tokens_rough(
+                                api_messages, tools=agent.tools or None
+                            )
+                        )
+                        if _rebase is not None and _rebase.ready:
+                            _retry.restart_with_compressed_messages = True
+                            break
+                        if (
+                            _rebase is not None
+                            and getattr(_rebase.status, "value", "")
+                            in {"reconciliation_required", "blocked"}
+                        ):
+                            return _context_rebase_stopped_result(_rebase)
                         # Terminal — surface the buffered retry trace.
                         agent._flush_status_buffer()
                         agent._vprint(f"{agent.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached for payload-too-large error.", force=True)
@@ -5727,6 +5978,20 @@ def run_conversation(
                             )
                             continue
 
+                        _rebase = _attempt_provider_overflow_rebase(
+                            estimate_request_tokens_rough(
+                                api_messages, tools=agent.tools or None
+                            )
+                        )
+                        if _rebase is not None and _rebase.ready:
+                            _retry.restart_with_compressed_messages = True
+                            break
+                        if (
+                            _rebase is not None
+                            and getattr(_rebase.status, "value", "")
+                            in {"reconciliation_required", "blocked"}
+                        ):
+                            return _context_rebase_stopped_result(_rebase)
                         # Terminal — surface buffered context so the user
                         # sees what compression attempts were made.
                         agent._flush_status_buffer()
@@ -5807,6 +6072,18 @@ def run_conversation(
                         # loop forever if the error keeps recurring.
                         compression_attempts += 1
                         if compression_attempts > max_compression_attempts:
+                            _rebase = _attempt_provider_overflow_rebase(
+                                request_input_estimate
+                            )
+                            if _rebase is not None and _rebase.ready:
+                                _retry.restart_with_compressed_messages = True
+                                break
+                            if (
+                                _rebase is not None
+                                and getattr(_rebase.status, "value", "")
+                                in {"reconciliation_required", "blocked"}
+                            ):
+                                return _context_rebase_stopped_result(_rebase)
                             agent._flush_status_buffer()
                             agent._vprint(f"{agent.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached.", force=True)
                             agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
@@ -5961,6 +6238,20 @@ def run_conversation(
 
                     compression_attempts += 1
                     if compression_attempts > max_compression_attempts:
+                        _rebase = _attempt_provider_overflow_rebase(
+                            estimate_request_tokens_rough(
+                                api_messages, tools=agent.tools or None
+                            )
+                        )
+                        if _rebase is not None and _rebase.ready:
+                            _retry.restart_with_compressed_messages = True
+                            break
+                        if (
+                            _rebase is not None
+                            and getattr(_rebase.status, "value", "")
+                            in {"reconciliation_required", "blocked"}
+                        ):
+                            return _context_rebase_stopped_result(_rebase)
                         agent._flush_status_buffer()
                         agent._vprint(f"{agent.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached.", force=True)
                         agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
@@ -7458,6 +7749,15 @@ def run_conversation(
 
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
+                if getattr(agent, "_context_tool_control_failure", None):
+                    from ares_runtime.continuity.runtime import AutomaticRebaseResult, AutomaticRebaseStatus
+
+                    agent._persist_session(messages, conversation_history)
+                    return _context_rebase_stopped_result(AutomaticRebaseResult(
+                        AutomaticRebaseStatus.BLOCKED, agent._context_tool_control_failure,
+                        agent.session_id,
+                    ))
+
                 if getattr(agent, "_incremental_persistence_failed", False):
                     # A tool result could not be made canonical. Do not send
                     # the in-memory result back to the model or project any
@@ -8409,7 +8709,9 @@ def run_conversation(
                 # no side effect follows and _persist_session retries the write.
                 # Full incident narrative: tests/run_agent/test_81641_*.py.
                 try:
-                    agent._flush_messages_to_session_db(messages, conversation_history)
+                    from agent.context_input import turn_input_response_scope
+                    with turn_input_response_scope(agent, messages, successful=not interrupted and not failed):
+                        agent._flush_messages_to_session_db(messages, conversation_history)
                 except Exception:
                     logger.warning(
                         "final text-turn flush failed (session=%s) — reply is "

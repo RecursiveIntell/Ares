@@ -2188,6 +2188,7 @@ _SENSITIVE_MANAGED_FILE_BASENAMES = frozenset({
 # so these trees are blocked wherever they appear under the browsable root,
 # without needing to resolve them relative to HERMES_HOME.
 _SENSITIVE_MANAGED_DIR_NAMES = frozenset({
+    "context-controller-keys",
     "mcp-tokens",
     "pairing",
 })

@@ -176,7 +176,7 @@ def _clone_all_copytree_ignore(source_dir: Path):
         for entry in names:
             # Universal exclusions at any depth.
             if (
-                entry == "__pycache__"
+                entry in {"__pycache__", "context-controller-keys"}
                 or entry.endswith((".pyc", ".pyo", ".sock", ".tmp"))
             ):
                 ignored.append(entry)
@@ -2184,7 +2184,7 @@ def _default_export_ignore(root_dir: Path):
         ignored: set = set()
         for entry in contents:
             # Universal exclusions (any depth)
-            if entry == "__pycache__" or entry.endswith((".sock", ".tmp")):
+            if entry in {"__pycache__", "context-controller-keys"} or entry.endswith((".sock", ".tmp")):
                 ignored.add(entry)
             # npm lockfiles can appear at root
             elif entry in {"package.json", "package-lock.json"}:
@@ -2316,6 +2316,8 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
     def _stage_extras(staged: Path) -> None:
         for rel, content in (extra_files or {}).items():
             parts = _normalize_profile_archive_parts(rel)
+            if "context-controller-keys" in parts:
+                raise ValueError("Context controller credentials cannot be exported")
             target = staged.joinpath(*parts)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, encoding="utf-8")
@@ -2340,7 +2342,7 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
     # Named profiles — stage a filtered copy to exclude credentials
     with tempfile.TemporaryDirectory() as tmpdir:
         staged = Path(tmpdir) / canon
-        _CREDENTIAL_FILES = {"auth.json", ".env"}
+        _CREDENTIAL_FILES = {"auth.json", ".env", "context-controller-keys"}
         shutil.copytree(
             profile_dir,
             staged,
@@ -2380,6 +2382,8 @@ def _safe_extract_profile_archive(archive: Path, destination: Path) -> None:
     with tarfile.open(archive, "r:gz") as tf:
         for member in tf.getmembers():
             parts = _normalize_profile_archive_parts(member.name)
+            if "context-controller-keys" in parts:
+                raise ValueError("Profile archive contains a nonportable context controller credential")
             target = destination.joinpath(*parts)
 
             if member.isdir():

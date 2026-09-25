@@ -16,6 +16,7 @@ def _manager(monkeypatch, tmp_path, sid="lifecycle-test", max_turns=4):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     (tmp_path / ".hermes").mkdir(exist_ok=True)
     goals._DB_CACHE.clear()
+    goals._get_session_db().create_session(sid, source="cli")
     return goals.GoalManager(sid, default_max_turns=max_turns)
 
 

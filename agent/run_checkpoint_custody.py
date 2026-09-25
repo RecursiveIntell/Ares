@@ -7,8 +7,9 @@ retries them. Tokens and lease holders never appear in returned summaries.
 from dataclasses import dataclass, field
 import os
 import threading
+import time
 
-from hermes_state_runs import RunCustody, RunCustodyError
+from hermes_state_runs import RunCustody, RunCustodyV2, RunCustodyError
 from scripts import run_checkpoint_claim as claim_client
 from scripts.run_checkpoint_claim import ClaimOutcomeUnknown, ClaimRefusal
 
@@ -16,9 +17,10 @@ from scripts.run_checkpoint_claim import ClaimOutcomeUnknown, ClaimRefusal
 @dataclass
 class _Handle:
     holder: str = field(repr=False)
-    value: RunCustody | None = field(default=None, repr=False)
+    value: RunCustody | RunCustodyV2 | None = field(default=None, repr=False)
     status: str = "pending"
     error: str = "CLAIM_OUTCOME_UNKNOWN"
+    recovery_pending: bool = False
 
 
 class TurnRunCustody:
@@ -84,7 +86,7 @@ class TurnRunCustody:
             except BaseException:  # Cancellation can follow a committed native mutation.
                 handle.status, handle.error = "unknown", "CLAIM_OUTCOME_UNKNOWN"
                 raise ClaimOutcomeUnknown(handle.error) from None
-            if not isinstance(handle.value, RunCustody):
+            if type(handle.value) not in (RunCustody, RunCustodyV2):
                 handle.status, handle.error = "unknown", "CLAIM_HANDLE_UNKNOWN"
                 raise ClaimOutcomeUnknown(handle.error)
             handle.status = "owned"
@@ -129,6 +131,153 @@ class TurnRunCustody:
             value = self._mutate(handle, self.db.refresh_run_custody, ttl_seconds=ttl_seconds)
             return self._summary(value, "refresh_observed")
 
+    def bind_recovery_files(self, holder, *, run_id, expected_generation, files, ttl_seconds=300):
+        """Explicit checked locator renewal after checkpoint/source advancement."""
+        from scripts.run_checkpoint_resume import BoundFileReader, ResumeRefusal, verify_checkpoint_files
+        with self._lock:
+            self._active(holder)
+            handle = self._handle(holder, run_id, expected_generation)
+            value = handle.value
+            try:
+                control = self.db.read_context_rebase_snapshot(value.current_session_id).action_control_digest
+                verify_checkpoint_files(value.checkpoint, files, BoundFileReader())
+            except (ResumeRefusal, RunCustodyError) as exc:
+                raise ClaimRefusal(str(exc)) from None
+            updated = self._mutate(handle, self.db.bind_run_recovery_files_checked,
+                lease_holder=holder, expected_control_digest=control.removeprefix("sha256:"),
+                files=files, ttl_seconds=ttl_seconds)
+            return self._summary(updated, "recovery_files_bound")
+
+    def assert_goal_migration_safe(self, holder, *, session_id):
+        """Refuse to mutate a goal row that an owned checkpoint binds as history."""
+        with self._lock:
+            self._active(holder)
+            mutable_key = f"goal:{session_id}"
+            for handle in self._handles.values():
+                if handle.holder != holder or handle.status != "owned" or handle.value is None:
+                    continue
+                historical_key = dict(handle.value.checkpoint.members).get(
+                    "historical-goal-key"
+                )
+                if historical_key == mutable_key:
+                    raise ClaimRefusal("HISTORICAL_GOAL_ALIAS_COLLISION")
+        return True
+
+    def transfer_session(self, holder, *, old_session_id, new_session_id, ttl_seconds):
+        """Transfer every owned run handle across one already-published session edge."""
+        with self._lock:
+            self._active(holder)
+            summaries = []
+            for run_id, handle in list(self._handles.items()):
+                if handle.holder != holder or handle.status != "owned":
+                    continue
+                value = self._mutate(
+                    handle, self.db.transfer_run_session,
+                    expected_session_id=old_session_id, new_session_id=new_session_id,
+                    ttl_seconds=ttl_seconds,
+                )
+                summaries.append(self._summary(value, "session_transfer_observed"))
+            return summaries
+
+    def publish_context_rebase(self, holder, **publication):
+        """Keep local handles aligned with atomic native child/custody publication."""
+        from hermes_state_continuity import ContextContinuationError
+
+        with self._lock:
+            self._active(holder)
+            handles = []
+            for handle in self._handles.values():
+                if handle.holder != holder:
+                    raise ClaimRefusal("TURN_NOT_ACTIVE")
+                if handle.status != "owned" or handle.value is None:
+                    raise ClaimOutcomeUnknown(handle.error)
+                handles.append(handle)
+            for handle in handles:
+                handle.status, handle.error = "pending", "CONTEXT_REBASE_CUSTODY_UNKNOWN"
+            try:
+                result = self.db.publish_context_rebase_child(
+                    **publication, custody_transfers=tuple(handle.value for handle in handles),
+                )
+            except (ContextContinuationError, RunCustodyError):
+                # Native typed refusal rolls the entire owner transaction back.
+                for handle in handles:
+                    handle.status = "owned"
+                raise
+            except BaseException:
+                for handle in handles:
+                    handle.status = "unknown"
+                raise ClaimOutcomeUnknown("CONTEXT_REBASE_CUSTODY_UNKNOWN") from None
+            for handle in handles:
+                handle.recovery_pending = True
+            self.reconcile_context_rebase(holder, result.child_session_id)
+            return result
+
+    def reconcile_context_rebase(self, holder, child_session_id, *, recovery_reservation=None):
+        """Resolve a lost publication ACK by readback, without a second mutation."""
+        with self._lock:
+            self._active(holder)
+            for run_id, handle in self._handles.items():
+                if handle.status != "owned" and handle.error != "CONTEXT_REBASE_CUSTODY_UNKNOWN":
+                    raise ClaimOutcomeUnknown(handle.error)
+                if (handle.value is None or handle.holder != holder
+                        and not (handle.recovery_pending and handle.status == "owned")):
+                    raise ClaimOutcomeUnknown("CONTEXT_REBASE_CUSTODY_UNKNOWN")
+                old = handle.value
+                current = self.db.read_run_custody(run_id)
+                if (current is None or current.current_session_id != child_session_id
+                        or current.owner_token != old.owner_token
+                        or current.checkpoint != old.checkpoint
+                        or current.generation not in {old.generation, old.generation + 1}
+                        or current.disposition != "active"):
+                    handle.status, handle.error = "unknown", "CONTEXT_REBASE_CUSTODY_UNKNOWN"
+                    raise ClaimOutcomeUnknown(handle.error)
+                handle.value, handle.status = current, "owned"
+                handle.holder = holder
+                if recovery_reservation is not None:
+                    handle.recovery_pending = True
+                    if time.monotonic_ns() >= current.expires_monotonic_ns:
+                        from scripts.run_checkpoint_resume import BoundFileReader, ResumeRefusal, verify_checkpoint_files
+                        try:
+                            files = self.db.read_run_recovery_files(current)
+                            verify_checkpoint_files(current.checkpoint, files, BoundFileReader())
+                        except (RunCustodyError, ResumeRefusal) as exc:
+                            raise ClaimRefusal(str(exc)) from None
+                        self._mutate(handle, self.db.renew_run_custody_for_context_recovery,
+                            lease_holder=holder, recovery_reservation=recovery_reservation, files=files)
+            native = self.db.list_run_custody_for_session(child_session_id)
+            if len(native) > 16:
+                raise ClaimRefusal("CUSTODY_HANDLE_LIMIT")
+            if recovery_reservation is not None:
+                # Recovery is entered only under the runtime's durable bounded
+                # reservation. A missing handle is distinct from an uncertain
+                # same-process mutation, which was refused above.
+                for value in native:
+                    if value.run_id in self._handles:
+                        continue
+                    handle = _Handle(holder, recovery_pending=True)
+                    self._handles[value.run_id] = handle
+                    def captured(updated):
+                        handle.value = updated
+                    try:
+                        claim_client.recover_from_files(self.db, value,
+                            expected_session_id=child_session_id, expected_lease_holder=holder,
+                            expected_control_digest=recovery_reservation["control_digest"].removeprefix("sha256:"),
+                            recovery_reservation=recovery_reservation, controller_pid=os.getpid(),
+                            ttl_seconds=300, _on_claim=captured)
+                    except ClaimRefusal:
+                        del self._handles[value.run_id]
+                        raise
+                    except BaseException as exc:
+                        handle.status = "unknown"
+                        handle.error = str(exc) if isinstance(exc, ClaimOutcomeUnknown) else "CLAIM_OUTCOME_UNKNOWN"
+                        raise ClaimOutcomeUnknown(handle.error) from None
+                    handle.status = "owned"
+            owned = {run_id for run_id, handle in self._handles.items() if handle.status == "owned"}
+            current_ids = {value.run_id for value in self.db.list_run_custody_for_session(child_session_id)}
+            if current_ids != owned:
+                raise ClaimOutcomeUnknown("CONTEXT_REBASE_CUSTODY_HANDLE_REQUIRED")
+            return tuple(self._handles[run_id].value for run_id in sorted(owned))
+
     def release(self, holder, *, run_id, expected_generation):
         with self._lock:
             handle = self._handle(holder, run_id, expected_generation)
@@ -150,6 +299,10 @@ class TurnRunCustody:
                 if handle.status == "released":
                     del self._handles[run_id]
                     continue
+                if handle.status == "owned" and handle.recovery_pending:
+                    errors.append({"run_id": run_id, "status": "recovery_pending",
+                                   "code": "RUN_CUSTODY_RECOVERY_PENDING"})
+                    continue
                 if handle.status == "owned":
                     try:
                         self.release(holder, run_id=run_id, expected_generation=handle.value.generation)
@@ -158,3 +311,19 @@ class TurnRunCustody:
                 if handle.status != "owned" and run_id in self._handles:
                     errors.append({"run_id": run_id, "status": "unknown", "code": handle.error})
             return errors
+
+    def complete_context_rebase_adoption(self, holder, child_session_id, expected):
+        """Clear retention only after this controller has adopted runtime state.
+
+        Durable READY alone proves neither engine binding nor local adoption.
+        The runtime calls this after native final confirmation and all local
+        session/history assignments have succeeded.
+        """
+        with self._lock:
+            self._active(holder)
+            values = tuple(self._handles[key].value for key in sorted(self._handles))
+            if values != expected or any(handle.status != "owned" or handle.holder != holder
+                    or handle.value.current_session_id != child_session_id for handle in self._handles.values()):
+                raise ClaimOutcomeUnknown("CONTEXT_REBASE_ADOPTION_MISMATCH")
+            for handle in self._handles.values():
+                handle.recovery_pending = False

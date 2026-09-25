@@ -2446,6 +2446,7 @@ def _compute_host_turn_frame(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     display_kind: str | None = None,
+    context_input_event_id: str | None = None,
 ) -> dict:
     with session["history_lock"]:
         history = list(session.get("history", []))
@@ -2462,6 +2463,7 @@ def _compute_host_turn_frame(
         "session_key": session.get("session_key") or sid,
         "text": text,
         **({"display_kind": display_kind} if display_kind else {}),
+        **({"context_input_event_id": context_input_event_id} if context_input_event_id is not None else {}),
         "history": history,
         "history_version": history_version,
         "cols": int(session.get("cols", 80) or 80),
@@ -2551,6 +2553,7 @@ def _submit_prompt_to_compute_host(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     display_kind: str | None = None,
+    context_input_event_id: str | None = None,
 ) -> dict:
     cfg = _load_dashboard_process_isolation_config()
     frame = _compute_host_turn_frame(
@@ -2561,6 +2564,7 @@ def _submit_prompt_to_compute_host(
         image_paths=image_paths,
         queued_prompt_generation=queued_prompt_generation,
         display_kind=display_kind,
+        context_input_event_id=context_input_event_id,
     )
 
     def _complete(done: dict) -> None:
@@ -9379,11 +9383,60 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
     return {"attempt": attempt, "interrupted_at": marker["started_at"]}
 
 
+def _accept_tui_context_input(session, text, *, event_id=None, display_kind=None):
+    """Commit authentic input before the RPC acknowledges a queued submission."""
+    if display_kind:
+        return None
+    agent = session.get("agent")
+    if agent is not None:
+        owner = getattr(agent, "_session_db", None)
+        selected = getattr(agent, "context_rebase_enabled", False) is True
+        if not selected:
+            check = getattr(type(owner), "context_dispatch_required_for_session", None)
+            if not callable(check) or not check(owner, getattr(agent, "session_id", None) or session.get("session_key")):
+                return None
+    profile_home = session.get("profile_home")
+    home_token = set_hermes_home_override(str(profile_home or _hermes_home))
+    db = None
+    owns_db = False
+    try:
+        if agent is not None:
+            db = getattr(agent, "_session_db", None)
+        elif profile_home:
+            db = _open_profile_session_db(profile_home)
+            owns_db = True
+        else:
+            db = _get_db()
+        key = getattr(agent, "session_id", None) or session.get("session_key")
+        required = (getattr(agent, "context_rebase_enabled", False) is True if agent is not None else
+            is_truthy_value((_load_cfg().get("compression") or {}).get("context_rebase_enabled"), default=False))
+        if not required and callable(getattr(type(db), "context_dispatch_required_for_session", None)):
+            required = db.context_dispatch_required_for_session(key)
+        if not required:
+            return None
+        from hermes_state_continuity import ContextContinuationError
+        if db is None:
+            raise ContextContinuationError("CONTEXT_INPUT_OWNER_UNAVAILABLE")
+        if profile_home and Path(db.db_path).resolve() != (Path(profile_home) / "state.db").resolve():
+            raise ContextContinuationError("CONTEXT_INPUT_STORE_MISMATCH")
+        if type(text) is not str or session.get("attached_images"):
+            raise ContextContinuationError("CONTEXT_INPUT_TEXT_ROUTE_REQUIRED")
+        _ensure_session_db_row(session)
+        source = str(getattr(agent, "platform", None) or _session_source(session))
+        return db.accept_context_input(key, source=source,
+            event_id=event_id if event_id is not None else str(uuid.uuid4()), content=text)
+    finally:
+        if owns_db and db is not None:
+            db.close()
+        reset_hermes_home_override(home_token)
+
+
 def _enqueue_prompt(
     session: dict,
     text: Any,
     transport: Any,
     image_paths: list[str] | None = None,
+    context_input_event_id: str | None = None,
 ) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
@@ -9402,7 +9455,7 @@ def _enqueue_prompt(
     # Never queue a text-only self-copy of the live inflight user prompt. The
     # live turn already owns that text; draining it after settle would restart
     # the same user turn as a fresh agent invocation.
-    if not image_paths and isinstance(text, str):
+    if context_input_event_id is None and not image_paths and isinstance(text, str):
         turn = session.get("inflight_turn")
         original = (
             str(turn.get("user") or "").strip() if isinstance(turn, dict) else ""
@@ -9410,11 +9463,18 @@ def _enqueue_prompt(
         if original and text.strip() == original:
             return
     queued = {"text": text, "transport": transport}
+    if context_input_event_id is not None:
+        if any(entry.get("context_input_event_id") == context_input_event_id
+               for entry in [session.get("queued_prompt") or {}, *(session.get("queued_prompts") or [])]):
+            return
+        queued["context_input_event_id"] = context_input_event_id
     if image_paths:
         queued["image_paths"] = image_paths
     existing = session.get("queued_prompt")
     if (
         existing
+        and context_input_event_id is None
+        and not existing.get("context_input_event_id")
         and isinstance(existing.get("text"), str)
         and isinstance(text, str)
         and not existing.get("image_paths")
@@ -9442,6 +9502,8 @@ def _sanitize_queued_entry_vs_inflight_user(
     lost and the original is not re-fired (#84417). Image-bearing envelopes
     are left alone — their chronology/ownership is load-bearing.
     """
+    if isinstance(entry, dict) and entry.get("context_input_event_id"):
+        return entry
     if not original or not isinstance(entry, dict):
         return entry if isinstance(entry, dict) else None
     if entry.get("image_paths"):
@@ -9542,7 +9604,8 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
 
 
 def _handle_busy_submit(
-    rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False
+    rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False,
+    context_input_event_id: str | None = None,
 ) -> dict | None:
     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
     a turn is in flight, instead of rejecting it with ``session busy``.
@@ -9563,7 +9626,7 @@ def _handle_busy_submit(
     unwinding the turn) redirected the live turn with next-turn text — queue
     semantics betrayed by a millisecond race the user can't see.
     """
-    mode = "queue" if queued else _load_busy_input_mode()
+    mode = "queue" if queued or context_input_event_id is not None else _load_busy_input_mode()
     agent = session.get("agent")
     with session["history_lock"]:
         if not session.get("running"):
@@ -9620,7 +9683,8 @@ def _handle_busy_submit(
             if image_paths:
                 session["attached_images"] = image_paths + list(session.get("attached_images", []))
             return None
-        _enqueue_prompt(session, text, transport, image_paths=image_paths)
+        _enqueue_prompt(session, text, transport, image_paths=image_paths,
+                        context_input_event_id=context_input_event_id)
         session["last_active"] = time.time()
 
     # Attachments need a separate model invocation. Queue them without
@@ -9636,7 +9700,10 @@ def _handle_busy_submit(
     # FIFO in ``queued_prompt``/``queued_prompts`` and drained on turn end.
     if mode == "interrupt" and not image_paths:
         _interrupt_busy_session(sid, session, agent)
-    return _ok(rid, {"status": "queued"})
+    result = {"status": "queued"}
+    if context_input_event_id is not None:
+        result["input_event_id"] = context_input_event_id
+    return _ok(rid, result)
 
 
 def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
@@ -9694,7 +9761,9 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                 )
             else:
                 resp = _submit_prompt_to_compute_host(
-                    rid, sid, session, queued["text"], queued_prompt_generation=queue_generation
+                    rid, sid, session, queued["text"], queued_prompt_generation=queue_generation,
+                    **({"context_input_event_id": queued["context_input_event_id"]}
+                       if queued.get("context_input_event_id") else {}),
                 )
             if resp.get("error"):
                 message = str(((resp.get("error") or {}).get("message")) or "queued prompt failed")
@@ -9720,6 +9789,8 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     session,
                     queued["text"],
                     queued_prompt_generation=queue_generation,
+                    **({"context_input_event_id": queued["context_input_event_id"]}
+                       if queued.get("context_input_event_id") else {}),
                 )
     except Exception as exc:
         print(
@@ -11385,7 +11456,11 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
                             return
                         session["running"] = True
                     _emit("message.start", sid)
-                    _run_prompt_submit(rid, sid, session, payload["message"])
+                    _run_prompt_submit(
+                        rid, sid, session, payload["message"],
+                        display_kind="internal_notification",
+                        display_metadata={"synthetic_source": "loop"},
+                    )
                     return
             except Exception:
                 pass
@@ -11394,7 +11469,11 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
                 _emit("status.update", sid, {"kind": "loop", "text": decision["message"]})
             return
         _emit("message.start", sid)
-        _run_prompt_submit(rid, sid, session, wakeup)
+        _run_prompt_submit(
+            rid, sid, session, wakeup,
+            display_kind="internal_notification",
+            display_metadata={"synthetic_source": "loop"},
+        )
     except Exception as exc:
         print(
             f"[tui_gateway] loop wakeup dispatch failed: "
@@ -11632,7 +11711,11 @@ def _notification_poller_loop(
                     rid = f"__notif__{int(time.time() * 1000)}"
                     try:
                         _emit("message.start", sid)
-                        _run_prompt_submit(rid, sid, session, "\n".join(_batch))
+                        _run_prompt_submit(
+                            rid, sid, session, "\n".join(_batch),
+                            display_kind="internal_notification",
+                            display_metadata={"synthetic_source": "kanban_notification"},
+                        )
                     except Exception as exc:
                         print(
                             f"[tui_gateway] kanban notification dispatch failed: "
@@ -11715,6 +11798,12 @@ def _notification_poller_loop(
         )
         _claim = claim_event_delivery(evt, "tui-poller")
         if _claim is None:
+            # Another durable consumer already owns delivery. We claimed the
+            # local UI turn slot before consulting the durable arbiter, so
+            # release that speculative busy state instead of leaving the
+            # session permanently stuck as running.
+            with session["history_lock"]:
+                session["running"] = False
             continue
         try:
             _emit("message.start", sid)
@@ -11728,7 +11817,11 @@ def _notification_poller_loop(
                     display_metadata=_async_delegation_display_metadata(evt),
                 )
             else:
-                _run_prompt_submit(rid, sid, session, text)
+                _run_prompt_submit(
+                    rid, sid, session, text,
+                    display_kind="internal_notification",
+                    display_metadata={"synthetic_source": "background_notification"},
+                )
             complete_event_delivery(evt, _claim)
         except Exception as exc:
             release_event_delivery(evt, _claim)
@@ -11793,6 +11886,12 @@ def _notification_poller_loop(
         )
         _claim = claim_event_delivery(evt, "tui-poller")
         if _claim is None:
+            # Another durable consumer already owns delivery. We claimed the
+            # local UI turn slot before consulting the durable arbiter, so
+            # release that speculative busy state instead of leaving the
+            # session permanently stuck as running.
+            with session["history_lock"]:
+                session["running"] = False
             continue
         try:
             _emit("message.start", sid)
@@ -11806,7 +11905,14 @@ def _notification_poller_loop(
                     display_metadata=_async_delegation_display_metadata(evt),
                 )
             else:
-                _run_prompt_submit(rid, sid, session, text)
+                _run_prompt_submit(
+                    rid,
+                    sid,
+                    session,
+                    text,
+                    display_kind="internal_notification",
+                    display_metadata={"synthetic_source": "background_notification"},
+                )
             complete_event_delivery(evt, _claim)
         except Exception as exc:
             release_event_delivery(evt, _claim)
@@ -12135,6 +12241,7 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    context_input_event_id: str | None = None,
 ) -> bool:
     with session["history_lock"]:
         if session.get("_closing"):
@@ -12450,7 +12557,8 @@ def _run_prompt_submit(
                 "conversation_history": list(history),
                 "stream_callback": _stream,
                 "persist_user_message": (
-                    _build_persist_user_message(prompt, images, run_message) if images else prompt
+                    text if context_input_event_id is not None else (
+                        _build_persist_user_message(prompt, images, run_message) if images else prompt)
                 ),
             }
             # Type a synthesized turn at turn START so the crash persist writes
@@ -12465,6 +12573,10 @@ def _run_prompt_submit(
                 _run_params = {}
             if "task_id" in _run_params:
                 run_kwargs["task_id"] = session["session_key"]
+            if context_input_event_id is not None:
+                if "persist_user_event_id" not in _run_params:
+                    raise RuntimeError("CONTEXT_INPUT_READER_UNSUPPORTED")
+                run_kwargs["persist_user_event_id"] = context_input_event_id
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
@@ -13045,7 +13157,11 @@ def _run_prompt_submit(
                 session["running"] = True
             try:
                 _emit("message.start", sid)
-                _run_prompt_submit(rid, sid, session, goal_followup)
+                _run_prompt_submit(
+                    rid, sid, session, goal_followup,
+                    display_kind="internal_notification",
+                    display_metadata={"synthetic_source": "goal_continuation"},
+                )
             except Exception as _cont_exc:
                 print(
                     f"[tui_gateway] goal continuation dispatch failed: "
@@ -13088,10 +13204,29 @@ def _run_prompt_submit(
                 )
                 _claim = claim_event_delivery(_evt, "tui-post-turn")
                 if _claim is None:
+                    # The local slot was claimed before the durable arbiter.
+                    # Losing that claim must restore idle state or the session
+                    # wedges after an otherwise successful foreground turn.
+                    with session["history_lock"]:
+                        session["running"] = False
                     continue
                 try:
                     _emit("message.start", sid)
-                    _run_prompt_submit(rid, sid, session, synth)
+                    if _evt.get("type") == "async_delegation":
+                        _run_prompt_submit(
+                            rid,
+                            sid,
+                            session,
+                            synth,
+                            display_kind="async_delegation_complete",
+                            display_metadata=_async_delegation_display_metadata(_evt),
+                        )
+                    else:
+                        _run_prompt_submit(
+                            rid, sid, session, synth,
+                            display_kind="internal_notification",
+                            display_metadata={"synthetic_source": "completion_notification"},
+                        )
                     complete_event_delivery(_evt, _claim)
                 except Exception as _n_exc:
                     release_event_delivery(_evt, _claim)

@@ -1,0 +1,51 @@
+name: Context continuity isolated Rust bootstrap
+
+on:
+  push:
+    branches: [feat/context-continuity-v4-20260923]
+    paths: ['.github/workflows/context-continuity-rust-bootstrap.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  offline-build-inputs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: RecursiveIntell/Libraries
+          ref: 0b099ec416de60f6adafb182f1d1e83795d05c56
+          path: Libraries
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: RecursiveIntell/recursive-agent
+          ref: 11fefae304d43d9d72f7a238f9d2df77862b51c6
+          path: recursive-agent
+          persist-credentials: false
+      - name: Export compiler binaries and locked crate sources, never credentials
+        working-directory: recursive-agent
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/offline-rust"
+          mkdir -p "$out"
+          rustc -vV > "$out/rustc-version.txt"
+          cargo -V > "$out/cargo-version.txt"
+          git rev-parse HEAD > "$out/recursive-agent-head.txt"
+          git -C ../Libraries rev-parse HEAD > "$out/libraries-head.txt"
+          cp Cargo.lock "$out/Cargo.lock"
+          cargo vendor --locked "$RUNNER_TEMP/continuity-vendor" > "$out/vendor-config.txt"
+          tar -C "$RUNNER_TEMP/continuity-vendor" -czf "$out/vendor.tar.gz" .
+          sysroot="$(rustc --print sysroot)"
+          tar -C "$sysroot" --exclude='lib/rustlib/src' --exclude='lib/rustlib/rustc-src' \
+            -czf "$out/toolchain.tar.gz" bin lib
+          (cd "$out" && sha256sum *.txt *.tar.gz Cargo.lock > SHA256SUMS)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: continuity-offline-rust-inputs
+          path: ${{ runner.temp }}/offline-rust/
+          retention-days: 7
+          if-no-files-found: error

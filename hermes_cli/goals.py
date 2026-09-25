@@ -1071,7 +1071,42 @@ def clear_goal(session_id: str) -> bool:
     return save_goal(session_id, state)
 
 
-def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason: str = "") -> bool:
+def goal_session_migration(old_session_id, new_session_id, parent_raw, child_raw, *, reason=""):
+    """Return the owner's CAS mutations, suitable for a larger local transaction."""
+    if not parent_raw:
+        return False, []
+    state = GoalState.from_json(parent_raw)
+    if child_raw:
+        existing_child = GoalState.from_json(child_raw)
+        migrated_from = dict(existing_child.migration or {}).get("migrated_from_session")
+        return bool(
+            state.status == "cleared" and existing_child.status != "cleared"
+            and migrated_from == old_session_id and existing_child.goal_id == state.goal_id
+        ), []
+    if state.status == "cleared":
+        return False, []
+    child = GoalState.from_json(state.to_json())
+    child.migration = {
+        **dict(child.migration or {}),
+        "migrated_from_session": old_session_id,
+        "migration_reason": reason or "rotation",
+        "migrated_at": time.time(),
+    }
+    archived = GoalState.from_json(state.to_json())
+    archived.status = "cleared"
+    archived.outcome = CANCELLED
+    archived.last_stop_reason = f"MIGRATED_TO:{new_session_id}"
+    archived.next_action = None
+    archived.continuation_pending = False
+    archived.continuation_claimed_by = None
+    archived.continuation_claimed_at = 0.0
+    return True, [
+        (_meta_key(old_session_id), parent_raw, archived.to_json()),
+        (_meta_key(new_session_id), None, child.to_json()),
+    ]
+
+
+def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason: str = "", session_db=None) -> bool:
     """Carry a persistent /goal from a parent session to its continuation.
 
     Context compression rotates ``session_id`` to a fresh child session,
@@ -1089,44 +1124,18 @@ def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason:
     if not old_session_id or not new_session_id or old_session_id == new_session_id:
         return False
     try:
-        db = _get_session_db()
+        db = session_db if session_db is not None else _get_session_db()
         if db is None:
             return False
-        parent_raw = db.get_meta(_meta_key(old_session_id))
-        if not parent_raw:
-            return False
-        state = GoalState.from_json(parent_raw)
-        if state.status == "cleared":
-            return False
-        child_raw = db.get_meta(_meta_key(new_session_id))
-        if child_raw:
-            return False
-
-        child = GoalState.from_json(state.to_json())
-        child.migration = {
-            **dict(child.migration or {}),
-            "migrated_from_session": old_session_id,
-            "migration_reason": reason or "rotation",
-            "migrated_at": time.time(),
-        }
-        archived = GoalState.from_json(state.to_json())
-        archived.status = "cleared"
-        archived.outcome = CANCELLED
-        archived.last_stop_reason = f"MIGRATED_TO:{new_session_id}"
-        archived.next_action = None
-        archived.continuation_pending = False
-        archived.continuation_claimed_by = None
-        archived.continuation_claimed_at = 0.0
-
-        child_payload = child.to_json()
-        archived_payload = archived.to_json()
+        migrated, changes = goal_session_migration(
+            old_session_id, new_session_id,
+            db.get_meta(_meta_key(old_session_id)), db.get_meta(_meta_key(new_session_id)),
+            reason=reason,
+        )
+        if not changes:
+            return migrated
         if hasattr(db, "compare_and_set_meta_many"):
-            migrated = db.compare_and_set_meta_many(
-                [
-                    (_meta_key(old_session_id), parent_raw, archived_payload),
-                    (_meta_key(new_session_id), None, child_payload),
-                ]
-            )
+            migrated = db.compare_and_set_meta_many(changes)
         else:
             # Test doubles and older external SessionDB implementations must
             # fail closed rather than recreate the old child-then-clear race.
@@ -1640,6 +1649,59 @@ def _extract_json_object(raw: str) -> Optional[Dict[str, Any]]:
 # ──────────────────────────────────────────────────────────────────────
 
 
+def _apply_goal_checkpoint(state: GoalState, outcome: str, reason: str,
+                           next_action: Optional[str], *, continuation: bool,
+                           metadata: Optional[Dict[str, Any]] = None) -> None:
+    """Canonical checkpoint transformation shared by transactional owners."""
+    state.outcome = outcome if outcome in _ALLOWED_OUTCOMES else EXECUTION_FAILED
+    state.last_stop_reason = reason
+    state.next_action = next_action
+    state.continuation_pending = bool(continuation)
+    if continuation:
+        state.continuation_token = str(uuid.uuid5(uuid.UUID(state.goal_id), f"continuation:{state.turns_used}:{reason}"))
+    state.checkpoint_revision += 1
+    metadata = metadata or {}
+    task_list = list(state.subgoals) or [state.goal]
+    state.checkpoint = {
+        "goal_id": state.goal_id,
+        "checkpoint_revision": state.checkpoint_revision,
+        "current_task": metadata.get("current_task") or task_list[0],
+        "verified_completed_work": list(metadata.get("verified_completed_work") or []),
+        "unfinished_work": list(metadata.get("unfinished_work") or task_list),
+        "stop_reason": reason,
+        "next_admissible_action": next_action,
+        "graph_run_ids": list(metadata.get("graph_run_ids") or []),
+        "receipt_ids": list(metadata.get("receipt_ids") or []),
+        "required_artifacts": list(metadata.get("required_artifacts") or []),
+        "remaining_goal_turns": max(0, state.max_turns - state.turns_used),
+        "blockers": list(metadata.get("blockers") or []),
+        "required_authority": metadata.get("required_authority"),
+        "outcome": state.outcome,
+        "updated_at": time.time(),
+    }
+
+
+def goal_resume_state(before: str, *, reset_budget: bool, operator_action_id: str) -> GoalState:
+    """Prepare one explicit operator resume without writing or deferring state."""
+    state = GoalState.from_json(before)
+    state.status = "active"
+    state.paused_reason = None
+    state.waiting_on_pid = None
+    state.waiting_on_session = None
+    state.waiting_until = 0.0
+    state.waiting_reason = None
+    state.waiting_since = 0.0
+    if reset_budget:
+        state.turns_used = 0
+    state.recovery_episode_attempts = 0
+    state.last_recovery_reason = None
+    _apply_goal_checkpoint(state, CONTINUATION_REQUIRED, "USER_RESUMED",
+                           "run the next admissible turn", continuation=True)
+    state.continuation_token = str(uuid.uuid5(uuid.UUID(state.goal_id),
+        f"operator-resume:{state.checkpoint_revision}:{operator_action_id}"))
+    return state
+
+
 class GoalManager:
     """Per-session goal state + continuation decisions.
 
@@ -1851,6 +1913,17 @@ class GoalManager:
     def resume(self, *, reset_budget: bool = False) -> Optional[GoalState]:
         if not self._state:
             return None
+        # Missing ownership is not permission to queue half of this action.
+        # A resume requires the canonical session, goal and episode owner.
+        db = _get_session_db()
+        try:
+            if (not callable(getattr(type(db), "resume_context_goal", None))
+                    or db.get_session(self.session_id) is None):
+                logger.error("Goal resume requires the canonical live session owner")
+                return None
+        except Exception:
+            logger.error("Goal resume owner is unavailable", exc_info=True)
+            return None
         valid, reason = self.validate_checkpoint()
         if not valid:
             self._state.status = "paused"
@@ -1859,29 +1932,31 @@ class GoalManager:
             self._state.next_action = "inspect or repair the checkpoint before resuming"
             save_goal(self.session_id, self._state)
             return self._state
-        self._state.status = "active"
-        self._state.paused_reason = None
-        # Resuming starts fresh — clear any stale barrier.
-        self._state.waiting_on_pid = None
-        self._state.waiting_on_session = None
-        self._state.waiting_until = 0.0
-        self._state.waiting_reason = None
-        self._state.waiting_since = 0.0
-        if reset_budget:
-            self._state.turns_used = 0
-        self._state.recovery_episode_attempts = 0
-        self._state.last_recovery_reason = None
-        # Resume is a durable dispatch request, not merely a status mutation.
-        # Keep it pending until the ordinary prompt consumer starts the turn so
-        # replayed/duplicate dispatches are rejected by start_continuation().
-        if not self._checkpoint(
-            CONTINUATION_REQUIRED,
-            "USER_RESUMED",
-            "run the next admissible turn",
-            continuation=True,
-        ):
-            return None
-        return self._state
+        before = self._state.to_json()
+        action_id = str(uuid.uuid4())
+        try:
+            basis = db.read_context_resume_basis(self.session_id)
+            if GoalState.from_json(basis["expected_goal_raw"]).to_json() != before:
+                raise RuntimeError("CONTEXT_REBASE_GOAL_CHANGED")
+            raw = db.resume_context_goal(
+                self.session_id, **basis, reset_budget=reset_budget,
+                operator_action_id=action_id,
+            )
+            self._state = GoalState.from_json(raw)
+            return self._state
+        except Exception:
+            logger.warning("Goal resume outcome requires canonical readback", exc_info=True)
+            # A transport error may follow COMMIT. Never leave a writable
+            # stale object behind for pause/checkpoint/clear to republish.
+            self._state = None
+            try:
+                raw, acknowledged = db.read_context_resume_outcome(self.session_id, action_id)
+                if raw is not None:
+                    self._state = GoalState.from_json(raw)
+                return self._state if acknowledged else None
+            except Exception:
+                logger.error("Goal resume remains unresolved; stale manager writes are disabled", exc_info=True)
+                return None
 
     def clear(self) -> None:
         if self._state is None:
@@ -2421,32 +2496,8 @@ class GoalManager:
         if state is None:
             return False
         before = state.to_json()
-        state.outcome = outcome if outcome in _ALLOWED_OUTCOMES else EXECUTION_FAILED
-        state.last_stop_reason = reason
-        state.next_action = next_action
-        state.continuation_pending = bool(continuation)
-        if continuation:
-            state.continuation_token = str(uuid.uuid5(uuid.UUID(state.goal_id), f"continuation:{state.turns_used}:{reason}"))
-        state.checkpoint_revision += 1
-        metadata = metadata or {}
-        task_list = list(state.subgoals) or [state.goal]
-        state.checkpoint = {
-            "goal_id": state.goal_id,
-            "checkpoint_revision": state.checkpoint_revision,
-            "current_task": metadata.get("current_task") or task_list[0],
-            "verified_completed_work": list(metadata.get("verified_completed_work") or []),
-            "unfinished_work": list(metadata.get("unfinished_work") or task_list),
-            "stop_reason": reason,
-            "next_admissible_action": next_action,
-            "graph_run_ids": list(metadata.get("graph_run_ids") or []),
-            "receipt_ids": list(metadata.get("receipt_ids") or []),
-            "required_artifacts": list(metadata.get("required_artifacts") or []),
-            "remaining_goal_turns": max(0, state.max_turns - state.turns_used),
-            "blockers": list(metadata.get("blockers") or []),
-            "required_authority": metadata.get("required_authority"),
-            "outcome": state.outcome,
-            "updated_at": time.time(),
-        }
+        _apply_goal_checkpoint(state, outcome, reason, next_action,
+                               continuation=continuation, metadata=metadata)
         if not save_goal(self.session_id, state):
             self._state = GoalState.from_json(before)
             return False

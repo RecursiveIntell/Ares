@@ -49,6 +49,7 @@ def assert_first_claim_delta(before, after):
     before, after = dict(before), dict(after)
     assert set(after) - set(before) == {
         "run-custody:rpc-fixture:head", "run-custody:rpc-fixture:generation:1",
+        "run-custody:rpc-fixture:generation:1:files", "run-custody:rpc-fixture:recovery-files",
     }
     assert all(key in after and after[key] == value for key, value in before.items())
 
@@ -109,6 +110,29 @@ def live(tmp_path, monkeypatch):
 def rpc_method(f, name, params):
     result = server.dispatch({"jsonrpc": "2.0", "id": 9, "method": name, "params": params}, f.transport)
     return result if result is not None else f.transport.responses.get(timeout=10)
+
+
+def test_rpc_accepts_strict_task_binding_without_historical_goal(live):
+    f = live
+    f.db._execute_write(lambda conn: conn.execute("UPDATE sessions SET profile_name='p' WHERE id='current'"))
+    row = f.db.append_message("current", "user", "Fix the queue", turn_lease_holder="active-holder")
+    binding, control = f.db.read_run_task_basis(run_id="rpc-fixture", origin_session_id="current",
+        current_session_id="current", input_row_id=row)
+    request = f.request
+    request["checkpoint"]["members"] = [["authority", "No downstream effects"]]
+    del request["files"]["members"]["historical-goal-key"]
+    path = Path(f.params["request_path"])
+    path.write_text(json.dumps(request))
+    params = {key: value for key, value in f.params.items() if key != "historical_goal_digest"}
+    params.update(origin_session_id="current", expected_request_digest=sha(path.read_bytes()),
+                  task_binding=dataclasses.asdict(binding), expected_control_digest=control)
+    # Mixed caller schemas cannot choose the weaker branch.
+    mixed = dispatch(f, {**params, "historical_goal_digest": sha(f.goal.encode())})
+    assert mixed["error"]["message"] == "INVALID_PARAMS"
+    response = dispatch(f, params)
+    assert response["result"]["generation"] == 1
+    assert f.db.read_run_custody("rpc-fixture").schema == "SessionDBRunCustodyV2"
+    assert f.db.get_meta("goal:old") == f.goal
 
 
 def test_rpc_manages_refresh_and_release_without_exposing_handle(live):

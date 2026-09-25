@@ -463,30 +463,52 @@ def list_active_loops() -> List[Tuple[str, LoopState]]:
     return out
 
 
-def migrate_loop_to_session(old_session_id: str, new_session_id: str, *, reason: str = "") -> bool:
-    """Carry a persistent /loop from a parent session to its continuation.
+def loop_session_migration(old_session_id, new_session_id, parent_raw, child_raw):
+    """Return the canonical loop transfer for an admitted owner transaction."""
+    if not parent_raw:
+        return False, []
+    state = LoopState.from_json(parent_raw)
+    if child_raw is not None:
+        existing = LoopState.from_json(child_raw)
+        left, right = asdict(state), asdict(existing)
+        left["status"] = right["status"]
+        return bool(state.status == "cleared" and existing.status != "cleared" and left == right), []
+    if state.status == "cleared":
+        return False, []
+    archived = LoopState.from_json(parent_raw)
+    archived.status = "cleared"
+    return True, [
+        (_meta_key(old_session_id), parent_raw, archived.to_json()),
+        (_meta_key(new_session_id), None, state.to_json()),
+    ]
 
-    Context compression rotates ``session_id`` to a fresh child session;
-    without this the loop silently dies at the compaction boundary (the
-    same hazard /goal hit in #33618). Copies the loop onto the new session
-    and archives the old row as ``cleared`` so exactly one active loop row
-    exists per logical conversation. Best-effort and never raises.
-    """
+
+def migrate_loop_to_session(
+    old_session_id: str,
+    new_session_id: str,
+    *,
+    reason: str = "",
+    session_db=None,
+) -> bool:
+    """Carry a persistent /loop through one atomic SessionDB owner transition."""
     if not old_session_id or not new_session_id or old_session_id == new_session_id:
         return False
     try:
-        state = load_loop(old_session_id)
-        if state is None or state.status == "cleared":
+        db = session_db if session_db is not None else _get_session_db()
+        if db is None or not hasattr(db, "compare_and_set_meta_many"):
             return False
-        if load_loop(new_session_id) is not None:
-            return False
-        save_loop(new_session_id, state)
-        clear_loop(old_session_id)
-        logger.debug(
-            "LoopManager: migrated loop %s -> %s (%s)",
-            old_session_id, new_session_id, reason or "rotation",
+        migrated, changes = loop_session_migration(
+            old_session_id, new_session_id,
+            db.get_meta(_meta_key(old_session_id)), db.get_meta(_meta_key(new_session_id)),
         )
-        return True
+        if changes:
+            migrated = bool(db.compare_and_set_meta_many(changes))
+        if migrated:
+            logger.debug(
+                "LoopManager: migrated loop %s -> %s (%s)",
+                old_session_id, new_session_id, reason or "rotation",
+            )
+        return migrated
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("LoopManager: loop migration failed: %s", exc)
         return False

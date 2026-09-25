@@ -1,0 +1,1342 @@
+▶ running per-file parallel test suite via run_tests_parallel.py
+  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)
+▶ pre-compiling bytecode cache
+▶ launching test runner
+Discovered 2 test files (~23 tests) under ['tests/state/test_message_row_publication.py', 'tests/test_compression_watermark_commit.py']; running with -j 2
+[ 34.8% |     8/~23 | ✓15 | ✗ 8] ✗ tests/state/test_message_row_publication.py (15✓ 8✗, 3.3s)
+
+  ╔╍ Failed: tests/state/test_message_row_publication.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║     def _record_context_message_projections_on_conn(self, conn, source_session, destination_session,
+  ║                                                     messages, row_ids, *, kind, source_rows=None):
+  ║         """Record owner-derived rows; unflushed first occurrences stay authentic.
+  ║     
+  ║         A row coordinate is a locator, never proof by itself. The native owner
+  ║         binds its exact source and inserted payload in the same transaction.
+  ║         No matching by content or timestamp can manufacture correspondence.
+  ║         """
+  ║         if kind not in {"in_place", "compression_child", "context_rebase"}:
+  ║             raise ContextContinuationError("CONTEXT_PROJECTION_KIND_INVALID")
+  ║         lineage = set(self._context_rebase_lineage_on_conn(conn, source_session))
+  ║         for index, (msg, destination_id) in enumerate(zip(messages, row_ids)):
+  ║             source_id = (source_rows or {}).get(index, msg.get("_row_id"))
+  ║             if source_id is None:
+  ║                 continue
+  ║             if type(source_id) is not int or source_id < 1 or source_id >= destination_id:
+  ║ >               raise ContextContinuationError("CONTEXT_PROJECTION_SOURCE_INVALID")
+  ║ E               hermes_state_continuity.ContextContinuationError: CONTEXT_PROJECTION_SOURCE_INVALID
+  ║ 
+  ║ hermes_state_continuity.py:608: ContextContinuationError
+  ║ =========================== short test summary info ============================
+  ║ FAILED tests/state/test_message_row_publication.py::test_failed_write_does_not_publish_coordinates[counter-compact]
+  ║ FAILED tests/state/test_message_row_publication.py::test_failed_write_does_not_publish_coordinates[counter-child]
+  ║ FAILED tests/state/test_message_row_publication.py::test_failed_write_does_not_publish_coordinates[commit-compact]
+  ║ FAILED tests/state/test_message_row_publication.py::test_failed_write_does_not_publish_coordinates[commit-child]
+  ║ FAILED tests/state/test_message_row_publication.py::test_success_publishes_exact_committed_coordinates[compact]
+  ║ FAILED tests/state/test_message_row_publication.py::test_success_publishes_exact_committed_coordinates[child]
+  ║ FAILED tests/state/test_message_row_publication.py::test_tail_clone_does_not_shift_input_coordinate_mapping[compact]
+  ║ FAILED tests/state/test_message_row_publication.py::test_tail_clone_does_not_shift_input_coordinate_mapping[child]
+  ║ ========================= 8 failed, 15 passed in 3.03s =========================
+  ║
+  ║  Repro: python -m pytest tests/state/test_message_row_publication.py
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[100.0% |    23/~23 | ✓19 | ✗20] ✗ tests/test_compression_watermark_commit.py (4✓ 12✗, 19.4s)
+
+  ╔╍ Failed: tests/test_compression_watermark_commit.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║         A row coordinate is a locator, never proof by itself. The native owner
+  ║         binds its exact source and inserted payload in the same transaction.
+  ║         No matching by content or timestamp can manufacture correspondence.
+  ║         """
+  ║         if kind not in {"in_place", "compression_child", "context_rebase"}:
+  ║             raise ContextContinuationError("CONTEXT_PROJECTION_KIND_INVALID")
+  ║         lineage = set(self._context_rebase_lineage_on_conn(conn, source_session))
+  ║         for index, (msg, destination_id) in enumerate(zip(messages, row_ids)):
+  ║             source_id = (source_rows or {}).get(index, msg.get("_row_id"))
+  ║             if source_id is None:
+  ║                 continue
+  ║             if type(source_id) is not int or source_id < 1 or source_id >= destination_id:
+  ║ >               raise ContextContinuationError("CONTEXT_PROJECTION_SOURCE_INVALID")
+  ║ E               hermes_state_continuity.ContextContinuationError: CONTEXT_PROJECTION_SOURCE_INVALID
+  ║ 
+  ║ hermes_state_continuity.py:608: ContextContinuationError
+  ║ =========================== short test summary info ============================
+  ║ FAILED tests/test_compression_watermark_commit.py::TestWatermarkCommit::test_tail_clone_preserves_every_column
+  ║ FAILED tests/test_compression_watermark_commit.py::TestWatermarkCommit::test_conversation_load_is_correct_after_commit
+  ║ FAILED tests/test_compression_watermark_commit.py::TestWatermarkCommit::test_no_tail_behaves_identically_to_legacy
+  ║ FAILED tests/test_compression_watermark_commit.py::TestWatermarkCommit::test_none_watermark_preserves_historical_behavior
+  ║ FAILED tests/test_compression_watermark_commit.py::TestWatermarkCommit::test_archived_rows_stay_recoverable
+  ║ FAILED tests/test_compression_watermark_commit.py::TestWatermarkCommit::test_session_counters_include_tail
+  ║ FAILED tests/test_compression_watermark_commit.py::TestCommitFence::test_commit_allowed_for_live_holder
+  ║ FAILED tests/test_compression_watermark_commit.py::TestConcurrentAppendDuringCompaction::test_append_racing_the_commit_transaction
+  ║ FAILED tests/test_compression_watermark_commit.py::TestRotationPathWatermark::test_tail_clones_into_the_child[text]
+  ║ FAILED tests/test_compression_watermark_commit.py::TestRotationPathWatermark::test_tail_clones_into_the_child[multimodal]
+  ║ FAILED tests/test_compression_watermark_commit.py::TestRotationPathWatermark::test_ceiling_excludes_the_rotators_own_flush
+  ║ FAILED tests/test_compression_watermark_commit.py::TestRotationPathWatermark::test_no_watermark_keeps_historical_rotation
+  ║ ======================== 12 failed, 4 passed in 19.06s =========================
+  ║
+  ║  Repro: python -m pytest tests/test_compression_watermark_commit.py
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+
+=== Summary: 2 files, 19 tests passed, 20 failed (100% complete) in 19.4s (2 workers) ===
+  Durations cached to test_durations.json (2 files)
+
+=== Per-file subprocess time distribution ===
+  Files:   2
+  Total subprocess CPU-wall: 22.7s  (runner wall: 19.4s, parallelism: 2x)
+  P50: 19.42s  P90: 19.42s  P95: 19.42s  P99: 19.42s  Max: 19.42s
+  <1s: 0 files (0%)  <2s: 0 files (0%)
+  Top 10 slowest:
+     19.42s  tests/test_compression_watermark_commit.py
+      3.32s  tests/state/test_message_row_publication.py
+
+=== Failure output ===
+
+--- tests/state/test_message_row_publication.py ---
+============================= test session starts ==============================
+platform linux -- Python 3.13.15, pytest-9.1.1, pluggy-1.6.0
+rootdir: /workspace/scratch/bfe02ea97bc3/Ares
+configfile: pyproject.toml
+plugins: anyio-4.12.1, asyncio-1.3.0
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 23 items
+
+tests/state/test_message_row_publication.py ......FF..FF..FF.....FF      [100%]
+
+=================================== FAILURES ===================================
+_______ test_failed_write_does_not_publish_coordinates[counter-compact] ________
+
+db = <hermes_state.SessionDB object at 0x7fe8a4376b10>
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fe8a426e450>
+operation = 'compact', failure = 'counter'
+
+    @pytest.mark.parametrize("operation", OPERATIONS)
+    @pytest.mark.parametrize("failure", ["second_insert", "counter", "commit"])
+    def test_failed_write_does_not_publish_coordinates(db, monkeypatch, operation, failure):
+        rows = [{"role": "user", "content": "first", "_row_id": -77},
+                {"role": "assistant", "content": "reject"}]
+        before_rows = copy.deepcopy(rows)
+        before_db = canonical_state(db)
+        if failure == "second_insert":
+            db._conn.execute("""CREATE TRIGGER reject_row BEFORE INSERT ON messages
+                WHEN NEW.content = 'reject'
+                BEGIN SELECT RAISE(ABORT, 'injected insert failure'); END""")
+        elif failure == "counter":
+            db._conn.execute("""CREATE TRIGGER reject_counter BEFORE UPDATE OF message_count ON sessions
+                WHEN NEW.message_count > 0
+                BEGIN SELECT RAISE(ABORT, 'injected counter failure'); END""")
+        else:
+            def reject_commit():
+                raise sqlite3.OperationalError("injected commit failure")
+            monkeypatch.setattr(db._conn, "commit", reject_commit)
+        with pytest.raises(sqlite3.Error, match="injected"):
+>           write(db, operation, rows)
+
+tests/state/test_message_row_publication.py:67: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/state/test_message_row_publication.py:33: in write
+    return db.archive_and_compact("parent", rows, lock_holder="owner")
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+hermes_state.py:12561: in archive_and_compact
+    inserted, row_ids = self._execute_write(_do)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^
+hermes_state.py:5238: in _execute_write
+    result = fn(self._conn)
+             ^^^^^^^^^^^^^^
+hermes_state.py:12530: in _do
+    self._record_context_message_projections_on_conn(conn, session_id,
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hermes_state.SessionDB object at 0x7fe8a4376b10>
+conn = <hermes_cli.sqlite_safe_read.TrackedConnection object at 0x7fe8a426e150>
+source_session = 'parent', destination_session = 'parent'
+messages = [{'role': 'user', 'content': 'first', '_row_id': -77}, {'role': 'assistant', 'content': 'reject'}]
+row_ids = (2, 3), kind = 'in_place', source_rows = {}
+
+    def _record_context_message_projections_on_conn(self, conn, source_session, destination_session,
+                                                    messages, row_ids, *, kind, source_rows=None):
+        """Record owner-derived rows; unflushed first occurrences stay authentic.
+    
+        A row coordinate is a locator, never proof by itself. The native owner
+        binds its exact source and inserted payload in the same transaction.
+        No matching by content or timestamp can manufacture correspondence.
+        """
+        if kind not in {"in_place", "compression_child", "context_rebase"}:
+            raise ContextContinuationError("CONTEXT_PROJECTION_KIND_INVALID")
+        lineage = set(self._context_rebase_lineage_on_conn(conn, source_session))
+        for index, (msg, destination_id) in enumerate(zip(messages, row_ids)):
+            source_id = (source_rows or {}).get(index, msg.get("_row_id"))
+            if source_id is None:
+                continue
+            if type(source_id) is not int or source_id < 1 or source_id >= destination_id:
+>               raise ContextContinuationError("CONTEXT_PROJECTION_SOURCE_INVALID")
+E               hermes_state_continuity.ContextContinuationError: CONTEXT_PROJECTION_SOURCE_INVALID
+
+hermes_state_continuity.py:608: ContextContinuationError
+________ test_failed_write_does_not_publish_coordinates[counter-child] _________
+
+db = <hermes_state.SessionDB object at 0x7fe8a423ab10>
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fe8a4f0f4d0>
+operation = 'child', failure = 'counter'
+
+    @pytest.mark.parametrize("operation", OPERATIONS)
+    @pytest.mark.parametrize("failure", ["second_insert", "counter", "commit"])
+    def test_failed_write_does_not_publish_coordinates(db, monkeypatch, operation, failure):
+        rows = [{"role": "user", "content": "first", "_row_id": -77},
+                {"role": "assistant", "content": "reject"}]
+        before_rows = copy.deepcopy(rows)
+        before_db = canonical_state(db)
+        if failure == "second_insert":
+            db._conn.execute("""CREATE TRIGGER reject_row BEFORE INSERT ON messages
+                WHEN NEW.content = 'reject'
+                BEGIN SELECT RAISE(ABORT, 'injected insert failure'); END""")
+        elif failure == "counter":
+            db._conn.execute("""CREATE TRIGGER reject_counter BEFORE UPDATE OF message_count ON sessions
+                WHEN NEW.message_count > 0
+                BEGIN SELECT RAISE(ABORT, 'injected counter failure'); END""")
+        else:
+            def reject_commit():
+                raise sqlite3.OperationalError("injected commit failure")
+            monkeypatch.setattr(db._conn, "commit", reject_commit)
+        with pytest.raises(sqlite3.Error, match="injected"):
+>           write(db, operation, rows)
+
+tests/state/test_message_row_publication.py:67: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/state/test_message_row_publication.py:34: in write
+    return db.publish_compression_child(
+hermes_state.py:7132: in publish_compression_child
+    row_ids = self._execute_write(_do)
+              ^^^^^^^^^^^^^^^^^^^^^^^^
+hermes_state.py:5238: in _execute_write
+    result = fn(self._conn)
+             ^^^^^^^^^^^^^^
+hermes_state.py:7080: in _do
+    self._record_context_message_projections_on_conn(conn, parent_session_id,
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hermes_state.SessionDB object at 0x7fe8a423ab10>
+conn = <hermes_cli.sqlite_safe_read.TrackedConnection object at 0x7fe8a426fa50>
+source_session = 'parent', destination_session = 'child'
+messages = [{'role': 'user', 'content': 'first', '_row_id': -77}, {'role': 'assistant', 'content': 'reject'}]
+row_ids = (2, 3), kind = 'compression_child', source_rows = {}
+
+    def _record_context_message_projections_on_conn(self, conn, source_session, destination_session,
+                                                    messages, row_ids, *, kind, source_rows=None):
+        """Record owner-derived rows; unflushed first occurrences stay authentic.
+    
+        A row coordinate is a locator, never proof by itself. The native owner
+        binds its exact source and inserted payload in the same transaction.
+        No matching by content or timestamp can manufacture correspondence.
+        """
+        if kind not in {"in_place", "compression_child", "context_rebase"}:
+            raise ContextContinuationError("CONTEXT_PROJECTION_KIND_INVALID")
+        lineage = set(self._context_rebase_lineage_on_conn(conn, source_session))
+        for index, (msg, destination_id) in enumerate(zip(messages, row_ids)):
+            source_id = (source_rows or {}).get(index, msg.get("_row_id"))
+            if source_id is None:
+                continue
+            if type(source_id) is not int or source_id < 1 or source_id >= destination_id:
+>               raise ContextContinuationError("CONTEXT_PROJECTION_SOURCE_INVALID")
+E               hermes_state_continuity.ContextContinuationError: CONTEXT_PROJECTION_SOURCE_INVALID
+
+hermes_state_continuity.py:608: ContextContinuationError
+________ test_failed_write_does_not_publish_coordinates[commit-compact] ________
+
+db = <hermes_state.SessionDB object at 0x7fe8a423a650>
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fe8a3f2a5f0>
+operation = 'compact', failure = 'commit'
+
+    @pytest.mark.parametrize("operation", OPERATIONS)
+    @pytest.mark.parametrize("failure", ["second_insert", "counter", "commit"])
+    def test_failed_write_does_not_publish_coordinates(db, monkeypatch, operation, failure):
+        rows = [{"role": "user", "content": "first", "_row_id": -77},
+                {"role": "assistant", "content": "reject"}]
+        before_rows = copy.deepcopy(rows)
+        before_db = canonical_state(db)
+        if failure == "second_insert":
+            db._conn.execute("""CREATE TRIGGER reject_row BEFORE INSERT ON messages
+                WHEN NEW.content = 'reject'
+                BEGIN SELECT RAISE(ABORT, 'injected insert failure'); END""")
+        elif failure == "counter":
+            db._conn.execute("""CREATE TRIGGER reject_counter BEFORE UPDATE OF message_count ON sessions
+                WHEN NEW.message_count > 0
+                BEGIN SELECT RAISE(ABORT, 'injected counter failure'); END""")
+        else:
+            def reject_commit():
+                raise sqlite3.OperationalError("injected commit failure")
+            monkeypatch.setattr(db._conn, "commit", reject_commit)
+        with pytest.raises(sqlite3.Error, match="injected"):
+>           write(db, operation, rows)
+
+tests/state/test_message_row_publication.py:67: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/state/test_message_row_publication.py:33: in write
+    return db.archive_and_compact("parent", rows, lock_holder="owner")
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+hermes_state.py:12561: in archive_and_compact
+    inserted, row_ids = self._execute_write(_do)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^
+hermes_state.py:5238: in _execute_write
+    result = fn(self._conn)
+             ^^^^^^^^^^^^^^
+hermes_state.py:12530: in _do
+    self._record_context_message_projections_on_conn(conn, session_id,
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hermes_state.SessionDB object at 0x7fe8a423a650>
+conn = <hermes_cli.sqlite_safe_read.TrackedConnection object at 0x7fe8a39a0250>
+source_session = 'parent', destination_session = 'parent'
+messages = [{'role': 'user', 'content': 'first', '_row_id': -77}, {'role': 'assistant', 'content': 'reject'}]
+row_ids = (2, 3), kind = 'in_place', source_rows = {}
+
+    def _record_context_message_projections_on_conn(self, conn, source_session, destination_session,
+                                                    messages, row_ids, *, kind, source_rows=None):
+        """Record owner-derived rows; unflushed first occurrences stay authentic.
+    
+        A row coordinate is a locator, never proof by itself. The native owner
+        binds its exact source and inserted payload in the same transaction.
+        No matching by content or timestamp can manufacture correspondence.
+        """
+        if kind not in {"in_place", "compression_child", "context_rebase"}:
+            raise ContextContinuationError("CONTEXT_PROJECTION_KIND_INVALID")
+        lineage = set(self._context_rebase_lineage_on_conn(conn, source_session))
+        for index, (msg, destination_id) in enumerate(zip(messages, row_ids)):
+            source_id = (source_rows or {}).get(index, msg.get("_row_id"))
+            if source_id is None:
+                continue
+            if type(source_id) is not int or source_id < 1 or source_id >= destination_id:
+>               raise ContextContinuationError("CONTEXT_PROJECTION_SOURCE_INVALID")
+E               hermes_state_continuity.ContextContinuationError: CONTEXT_PROJECTION_SOURCE_INVALID
+
+hermes_state_continuity.py:608: ContextContinuationError
+_________ test_failed_write_does_not_publish_coordinates[commit-child] _________
+
+db = <hermes_state.SessionDB object at 0x7fe8a423a780>
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fe8a414ca10>
+operation = 'child', failure = 'commit'
+
+    @pytest.mark.parametrize("operation", OPERATIONS)
+    @pytest.mark.parametrize("failure", ["second_insert", "counter", "commit"])
+    def test_failed_write_does_not_publish_coordinates(db, monkeypatch, operation, failure):
+        rows = [{"role": "user", "content": "first", "_row_id": -77},
+                {"role": "assistant", "content": "reject"}]
+        before_rows = copy.deepcopy(rows)
+        before_db = canonical_state(db)
+        if failure == "second_insert":
+            db._conn.execute("""CREATE TRIGGER reject_row BEFORE INSERT ON messages
+                WHEN NEW.content = 'reject'
+                BEGIN SELECT RAISE(ABORT, 'injected insert failure'); END""")
+        elif failure == "counter":
+            db._conn.execute("""CREATE TRIGGER reject_counter BEFORE UPDATE OF message_count ON sessions
+                WHEN NEW.message_count > 0
+                BEGIN SELECT RAISE(ABORT, 'injected counter failure'); END""")
+        else:
+            def reject_commit():
+                raise sqlite3.OperationalError("injected commit failure")
+            monkeypatch.setattr(db._conn, "commit", reject_commit)
+        with pytest.raises(sqlite3.Error, match="injected"):
+>           write(db, operation, rows)
+
+tests/state/test_message_row_publication.py:67: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/state/test_message_row_publication.py:34: in write
+    return db.publish_compression_child(
+hermes_state.py:7132: in publish_compression_child
+    row_ids = self._execute_write(_do)
+              ^^^^^^^^^^^^^^^^^^^^^^^^
+hermes_state.py:5238: in _execute_write
+    result = fn(self._conn)
+             ^^^^^^^^^^^^^^
+hermes_state.py:7080: in _do
+    self._record_context_message_projections_on_conn(conn, parent_session_id,
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hermes_state.SessionDB object at 0x7fe8a423a780>
+conn = <hermes_cli.sqlite_safe_read.TrackedConnection object at 0x7fe8a39a0150>
+source_session = 'parent', destination_session = 'child'
+messages = [{'role': 'user', 'content': 'first', '_row_id': -77}, {'role': 'assistant', 'content': 'reject'}]
+row_ids = (2, 3), kind = 'compression_child', source_rows = {}
+
+    def _record_context_message_projections_on_conn(self, conn, source_session, destination_session,
+                                                    messages, row_ids, *, kind, source_rows=None):
+        """Record owner-derived rows; unflushed first occurrences stay authentic.
+    
+        A row coordinate is a locator, never proof by itself. The native owner
+        binds its exact source and inserted payload in the same transaction.
+        No matching by content or timestamp can manufacture correspondence.
+        """
+        if kind not in {"in_place", "compression_child", "context_rebase"}:
+            raise ContextContinuationError("CONTEXT_PROJECTION_KIND_INVALID")
+        lineage = set(self._context_rebase_lineage_on_conn(conn, source_session))
+        for index, (msg, destination_id) in enumerate(zip(messages, row_ids)):
+            source_id = (source_rows or {}).get(index, msg.get("_row_id"))
+            if source_id is None:
+                continue
+            if type(source_id) is not int or source_id < 1 or source_id >= destination_id:
+>               raise ContextContinuationError("CONTEXT_PROJECTION_SOURCE_INVALID")
+E               hermes_state_continuity.ContextContinuationError: CONTEXT_PROJECTION_SOURCE_INVALID
+
+hermes_state_continuity.py:608: ContextContinuationError
+_________ test_success_publishes_exact_committed_coordinates[compact] __________
+
+db = <hermes_state.SessionDB object at 0x7fe8a423b490>, operation = 'compact'
+
+    @pytest.mark.parametrize("operation", OPERATIONS)
+    def test_success_publishes_exact_committed_coordinates(db, operation):
+        rows = [{"role": "user", "content": "same bytes", "_row_id": -77},
+                {"role": "assistant", "content": "same bytes"}]
+>       result = write(db, operation, rows)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/state/test_message_row_publication.py:76: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/state/test_message_row_publication.py:33: in write
+    return db.archive_and_compact("parent", rows, lock_holder="owner")
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+hermes_state.py:12561: in archive_and_compact
+    inserted, row_ids = self._execute_write(_do)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^
+hermes_state.py:5238: in _execute_write
+    result = fn(self._conn)
+             ^^^^^^^^^^^^^^
+hermes_state.py:12530: in _do
+    self._record_context_message_projections_on_conn(conn, session_id,
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hermes_state.SessionDB object at 0x7fe8a423b490>
+conn = <hermes_cli.sqlite_safe_read.TrackedConnection object at 0x7fe8a426fc50>
+source_session = 'parent', destination_session = 'parent'
+messages = [{'role': 'user', 'content': 'same bytes', '_row_id': -77}, {'role': 'assistant', 'content': 'same bytes'}]
+row_ids = (2, 3), kind = 'in_place', source_rows = {}
+
+    def _record_context_message_projections_on_conn(self, conn, source_session, destination_session,
+                                                    messages, row_ids, *, kind, source_rows=None):
+        """Record owner-derived rows; unflushed first occurrences stay authentic.
+    
+        A row coordinate is a locator, never proof by itself. The native owner
+        binds its exact source and inserted payload in the same transaction.
+        No matching by content or timestamp can manufacture correspondence.
+        """
+        if kind not in {"in_place", "compression_child", "context_rebase"}:
+            raise ContextContinuationError("CONTEXT_PROJECTION_KIND_INVALID")
+        lineage = set(self._context_rebase_lineage_on_conn(conn, source_session))
+        for index, (msg, destination_id) in enumerate(zip(messages, row_ids)):
+            source_id = (source_rows or {}).get(index, msg.get("_row_id"))
+            if source_id is None:
+                continue
+            if type(source_id) is not int or source_id < 1 or source_id >= destination_id:
+>               raise ContextContinuationError("CONTEXT_PROJECTION_SOURCE_INVALID")
+E               hermes_state_continuity.ContextContinuationError: CONTEXT_PROJECTION_SOURCE_INVALID
+
+hermes_state_continuity.py:608: ContextContinuationError
+__________ test_success_publishes_exact_committed_coordinates[child] ___________
+
+db = <hermes_state.SessionDB object at 0x7fe8a423b950>, operation = 'child'
+
+    @pytest.mark.parametrize("operation", OPERATIONS)
+    def test_success_publishes_exact_committed_coordinates(db, operation):
+        rows = [{"role": "user", "content": "same bytes", "_row_id": -77},
+                {"role": "assistant", "content": "same bytes"}]
+>       result = write(db, operation, rows)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/state/test_message_row_publication.py:76: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/state/test_message_row_publication.py:34: in write
+    return db.publish_compression_child(
+hermes_state.py:7132: in publish_compression_child
+    row_ids = self._execute_write(_do)
+              ^^^^^^^^^^^^^^^^^^^^^^^^
+hermes_state.py:5238: in _execute_write
+    result = fn(self._conn)
+             ^^^^^^^^^^^^^^
+hermes_state.py:7080: in _do
+    self._record_context_message_projections_on_conn(conn, parent_session_id,
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hermes_state.SessionDB object at 0x7fe8a423b950>
+conn = <hermes_cli.sqlite_safe_read.TrackedConnection object at 0x7fe8a39a1150>
+source_session = 'parent', destination_session = 'child'
+messages = [{'role': 'user', 'content': 'same bytes', '_row_id': -77}, {'role': 'assistant', 'content': 'same bytes'}]
+row_ids = (2, 3), kind = 'compression_child', source_rows = {}
+
+    def _record_context_message_projections_on_conn(self, conn, source_session, destination_session,
+                                                    messages, row_ids, *, kind, source_rows=None):
+        """Record owner-derived rows; unflushed first occurrences stay authentic.
+    
+        A row coordinate is a locator, never proof by itself. The native owner
+        binds its exact source and inserted payload in the same transaction.
+        No matching by content or timestamp can manufacture correspondence.
+        """
+        if kind not in {"in_place", "compression_child", "context_rebase"}:
+            raise ContextContinuationError("CONTEXT_PROJECTION_KIND_INVALID")
+        lineage = set(self._context_rebase_lineage_on_conn(conn, source_session))
+        for index, (msg, destination_id) in enumerate(zip(messages, row_ids)):
+            source_id = (source_rows or {}).get(index, msg.get("_row_id"))
+            if source_id is None:
+                continue
+            if type(source_id) is not int or source_id < 1 or source_id >= destination_id:
+>               raise ContextContinuationError("CONTEXT_PROJECTION_SOURCE_INVALID")
+E               hermes_state_continuity.ContextContinuationError: CONTEXT_PROJECTION_SOURCE_INVALID
+
+hermes_state_continuity.py:608: ContextContinuationError
+_______ test_tail_clone_does_not_shift_input_coordinate_mapping[compact] _______
+
+db = <hermes_state.SessionDB object at 0x7fe8a423a650>, operation = 'compact'
+
+    @pytest.mark.parametrize("operation", ["compact", "child"])
+    def test_tail_clone_does_not_shift_input_coordinate_mapping(db, operation):
+        watermark = db.get_active_message_watermark("parent")
+        db.append_message("parent", "user", "concurrent tail", compression_lock_holder="owner")
+        rows = [{"role": "user", "content": "handoff", "_row_id": -77}]
+        if operation == "compact":
+>           assert db.archive_and_compact("parent", rows, watermark=watermark, lock_holder="owner") == 2
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/state/test_message_row_publication.py:167: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+hermes_state.py:12561: in archive_and_compact
+    inserted, row_ids = self._execute_write(_do)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^
+hermes_state.py:5238: in _execute_write
+    result = fn(self._conn)
+             ^^^^^^^^^^^^^^
+hermes_state.py:12530: in _do
+    self._record_context_message_projections_on_conn(conn, session_id,
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hermes_state.SessionDB object at 0x7fe8a423a650>
+conn = <hermes_cli.sqlite_safe_read.TrackedConnection object at 0x7fe8a39a0650>
+source_session = 'parent', destination_session = 'parent'
+messages = [{'role': 'user', 'content': 'handoff', '_row_id': -77}]
+row_ids = (3,), kind = 'in_place', source_rows = {}
+
+    def _record_context_message_projections_on_conn(self, conn, source_session, destination_session,
+                                                    messages, row_ids, *, kind, source_rows=None):
+        """Record owner-derived rows; unflushed first occurrences stay authentic.
+    
+        A row coordinate is a locator, never proof by itself. The native owner
+        binds its exact source and inserted payload in the same transaction.
+        No matching by content or timestamp can manufacture correspondence.
+        """
+        if kind not in {"in_place", "compression_child", "context_rebase"}:
+            raise ContextContinuationError("CONTEXT_PROJECTION_KIND_INVALID")
+        lineage = set(self._context_rebase_lineage_on_conn(conn, source_session))
+        for index, (msg, destination_id) in enumerate(zip(messages, row_ids)):
+            source_id = (source_rows or {}).get(index, msg.get("_row_id"))
+            if source_id is None:
+                continue
+            if type(source_id) is not int or source_id < 1 or source_id >= destination_id:
+>               raise ContextContinuationError("CONTEXT_PROJECTION_SOURCE_INVALID")
+E               hermes_state_continuity.ContextContinuationError: CONTEXT_PROJECTION_SOURCE_INVALID
+
+hermes_state_continuity.py:608: ContextContinuationError
+________ test_tail_clone_does_not_shift_input_coordinate_mapping[child] ________
+
+db = <hermes_state.SessionDB object at 0x7fe8a423aea0>, operation = 'child'
+
+    @pytest.mark.parametrize("operation", ["compact", "child"])
+    def test_tail_clone_does_not_shift_input_coordinate_mapping(db, operation):
+        watermark = db.get_active_message_watermark("parent")
+        db.append_message("parent", "user", "concurrent tail", compression_lock_holder="owner")
+        rows = [{"role": "user", "content": "handoff", "_row_id": -77}]
+        if operation == "compact":
+            assert db.archive_and_compact("parent", rows, watermark=watermark, lock_holder="owner") == 2
+        else:
+>           db.publish_compression_child(
+                parent_session_id="parent", child_session_id="child", source="test",
+                messages=rows, watermark=watermark, compression_lock_holder="owner",
+            )
+
+tests/state/test_message_row_publication.py:169: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+hermes_state.py:7132: in publish_compression_child
+    row_ids = self._execute_write(_do)
+              ^^^^^^^^^^^^^^^^^^^^^^^^
+hermes_state.py:5238: in _execute_write
+    result = fn(self._conn)
+             ^^^^^^^^^^^^^^
+hermes_state.py:7080: in _do
+    self._record_context_message_projections_on_conn(conn, parent_session_id,
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hermes_state.SessionDB object at 0x7fe8a423aea0>
+conn = <hermes_cli.sqlite_safe_read.TrackedConnection object at 0x7fe8a39a0d50>
+source_session = 'parent', destination_session = 'child'
+messages = [{'role': 'user', 'content': 'handoff', '_row_id': -77}]
+row_ids = (3,), kind = 'compression_child', source_rows = {}
+
+    def _record_context_message_projections_on_conn(self, conn, source_session, destination_session,
+                                                    messages, row_ids, *, kind, source_rows=None):
+        """Record owner-derived rows; unflushed first occurrences stay authentic.
+    
+        A row coordinate is a locator, never proof by itself. The native owner
+        binds its exact source and inserted payload in the same transaction.
+        No matching by content or timestamp can manufacture correspondence.
+        """
+        if kind not in {"in_place", "compression_child", "context_rebase"}:
+            raise ContextContinuationError("CONTEXT_PROJECTION_KIND_INVALID")
+        lineage = set(self._context_rebase_lineage_on_conn(conn, source_session))
+        for index, (msg, destination_id) in enumerate(zip(messages, row_ids)):
+            source_id = (source_rows or {}).get(index, msg.get("_row_id"))
+            if source_id is None:
+                continue
+            if type(source_id) is not int or source_id < 1 or source_id >= destination_id:
+>               raise ContextContinuationError("CONTEXT_PROJECTION_SOURCE_INVALID")
+E               hermes_state_continuity.ContextContinuationError: CONTEXT_PROJECTION_SOURCE_INVALID
+
+hermes_state_continuity.py:608: ContextContinuationError
+=========================== short test summary info ============================
+FAILED tests/state/test_message_row_publication.py::test_failed_write_does_not_publish_coordinates[counter-compact]
+FAILED tests/state/test_message_row_publication.py::test_failed_write_does_not_publish_coordinates[counter-child]
+FAILED tests/state/test_message_row_publication.py::test_failed_write_does_not_publish_coordinates[commit-compact]
+FAILED tests/state/test_message_row_publication.py::test_failed_write_does_not_publish_coordinates[commit-child]
+FAILED tests/state/test_message_row_publication.py::test_success_publishes_exact_committed_coordinates[compact]
+FAILED tests/state/test_message_row_publication.py::test_success_publishes_exact_committed_coordinates[child]
+FAILED tests/state/test_message_row_publication.py::test_tail_clone_does_not_shift_input_coordinate_mapping[compact]
+FAILED tests/state/test_message_row_publication.py::test_tail_clone_does_not_shift_input_coordinate_mapping[child]
+========================= 8 failed, 15 passed in 3.03s =========================
+
+--- tests/test_compression_watermark_commit.py ---
+============================= test session starts ==============================
+platform linux -- Python 3.13.15, pytest-9.1.1, pluggy-1.6.0
+rootdir: /workspace/scratch/bfe02ea97bc3/Ares
+configfile: pyproject.toml
+plugins: anyio-4.12.1, asyncio-1.3.0
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 16 items
+
+tests/test_compression_watermark_commit.py .FFFFFF..F.FFFFF              [100%]
+
+=================================== FAILURES ===================================
+__________ TestWatermarkCommit.test_tail_clone_preserves_every_column __________
+
+self = <tests.test_compression_watermark_commit.TestWatermarkCommit object at 0x7fc40dff25d0>
+db = <hermes_state.SessionDB object at 0x7fc40ddc5450>
+
+    def test_tail_clone_preserves_every_column(self, db: SessionDB) -> None:
+        """The pure-SQL clone must carry sidecar fields byte-exact."""
+        _seed(db, 2)
+        watermark = db.get_active_message_watermark("sess1")
+        db.append_message(
+            "sess1",
+            role="assistant",
+            content="tool caller",
+            tool_calls=[{"id": "c1", "type": "function",
+                         "function": {"name": "terminal", "arguments": "{}"}}],
+        )
+        db.append_message(
+            "sess1", role="tool", content="tool output",
+            tool_call_id="c1", tool_name="terminal",
+        )
+    
+>       db.archive_and_compact("sess1", SUMMARY, watermark=watermark)
+
+tests/test_compression_watermark_commit.py:79: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+hermes_state.py:12561: in archive_and_compact
+    inserted, row_ids = self._execute_write(_do)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^
+hermes_state.py:5238: in _execute_write
+    result = fn(self._conn)
+             ^^^^^^^^^^^^^^
+hermes_state.py:12530: in _do
+    self._record_context_message_projections_on_conn(conn, session_id,
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hermes_state.SessionDB object at 0x7fc40ddc5450>
+conn = <hermes_cli.sqlite_safe_read.TrackedConnection object at 0x7fc40df41f50>
+source_session = 'sess1', destination_session = 'sess1'
+messages = [{'role': 'user', 'content': '[CONTEXT COMPACTION] summary of turns 0-5', '_row_id': 9}, {'role': 'assistant', 'content': 'Continuing from the summary.', '_row_id': 10}]
+row_ids = (5, 6), kind = 'in_place', source_rows = {}
+
+    def _record_context_message_projections_on_conn(self, conn, source_session, destination_session,
+                                                    messages, row_ids, *, kind, source_rows=None):
+        """Record owner-derived rows; unflushed first occurrences stay authentic.
+    
+        A row coordinate is a locator, never proof by itself. The native owner
+        binds its exact source and inserted payload in the same transaction.
+        No matching by content or timestamp can manufacture correspondence.
+        """
+        if kind not in {"in_place", "compression_child", "context_rebase"}:
+            raise ContextContinuationError("CONTEXT_PROJECTION_KIND_INVALID")
+        lineage = set(self._context_rebase_lineage_on_conn(conn, source_session))
+        for index, (msg, destination_id) in enumerate(zip(messages, row_ids)):
+            source_id = (source_rows or {}).get(index, msg.get("_row_id"))
+            if source_id is None:
+                continue
+            if type(source_id) is not int or source_id < 1 or source_id >= destination_id:
+>               raise ContextContinuationError("CONTEXT_PROJECTION_SOURCE_INVALID")
+E               hermes_state_continuity.ContextContinuationError: CONTEXT_PROJECTION_SOURCE_INVALID
+
+hermes_state_continuity.py:608: ContextContinuationError
+______ TestWatermarkCommit.test_conversation_load_is_correct_after_commit ______
+
+self = <tests.test_compression_watermark_commit.TestWatermarkCommit object at 0x7fc40e054fc0>
+db = <hermes_state.SessionDB object at 0x7fc40ddc5810>
+
+    def test_conversation_load_is_correct_after_commit(self, db: SessionDB) -> None:
+        """The live conversation projection sees summary + tail, in order."""
+        _seed(db)
+        watermark = db.get_active_message_watermark("sess1")
+        db.append_message("sess1", role="user", content="late arrival")
+    
+>       db.archive_and_compact("sess1", SUMMARY, watermark=watermark)
+
+tests/test_compression_watermark_commit.py:98: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+hermes_state.py:12561: in archive_and_compact
+    inserted, row_ids = self._execute_write(_do)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^
+hermes_state.py:5238: in _execute_write
+    result = fn(self._conn)
+             ^^^^^^^^^^^^^^
+hermes_state.py:12530: in _do
+    self._record_context_message_projections_on_conn(conn, session_id,
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hermes_state.SessionDB object at 0x7fc40ddc5810>
+conn = <hermes_cli.sqlite_safe_read.TrackedConnection object at 0x7fc40df43450>
+source_session = 'sess1', destination_session = 'sess1'
+messages = [{'role': 'user', 'content': '[CONTEXT COMPACTION] summary of turns 0-5', '_row_id': 9}, {'role': 'assistant', 'content': 'Continuing from the summary.', '_row_id': 10}]
+row_ids = (8, 9), kind = 'in_place', source_rows = {}
+
+    def _record_context_message_projections_on_conn(self, conn, source_session, destination_session,
+                                                    messages, row_ids, *, kind, source_rows=None):
+        """Record owner-derived rows; unflushed first occurrences stay authentic.
+    
+        A row coordinate is a locator, never proof by itself. The native owner
+        binds its exact source and inserted payload in the same transaction.
+        No matching by content or timestamp can manufacture correspondence.
+        """
+        if kind not in {"in_place", "compression_child", "context_rebase"}:
+            raise ContextContinuationError("CONTEXT_PROJECTION_KIND_INVALID")
+        lineage = set(self._context_rebase_lineage_on_conn(conn, source_session))
+        for index, (msg, destination_id) in enumerate(zip(messages, row_ids)):
+            source_id = (source_rows or {}).get(index, msg.get("_row_id"))
+            if source_id is None:
+                continue
+            if type(source_id) is not int or source_id < 1 or source_id >= destination_id:
+>               raise ContextContinuationError("CONTEXT_PROJECTION_SOURCE_INVALID")
+E               hermes_state_continuity.ContextContinuationError: CONTEXT_PROJECTION_SOURCE_INVALID
+
+hermes_state_continuity.py:608: ContextContinuationError
+________ TestWatermarkCommit.test_no_tail_behaves_identically_to_legacy ________
+
+self = <tests.test_compression_watermark_commit.TestWatermarkCommit object at 0x7fc40e055220>
+db = <hermes_state.SessionDB object at 0x7fc40ddc5090>
+
+    def test_no_tail_behaves_identically_to_legacy(self, db: SessionDB) -> None:
+        _seed(db)
+        watermark = db.get_active_message_watermark("sess1")
+>       count = db.archive_and_compact("sess1", SUMMARY, watermark=watermark)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/test_compression_watermark_commit.py:110: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+hermes_state.py:12561: in archive_and_compact
+    inserted, row_ids = self._execute_write(_do)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^
+hermes_state.py:5238: in _execute_write
+    result = fn(self._conn)
+             ^^^^^^^^^^^^^^
+hermes_state.py:12530: in _do
+    self._record_context_message_projections_on_conn(conn, session_id,
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hermes_state.SessionDB object at 0x7fc40ddc5090>
+conn = <hermes_cli.sqlite_safe_read.TrackedConnection object at 0x7fc40df43c50>
+source_session = 'sess1', destination_session = 'sess1'
+messages = [{'role': 'user', 'content': '[CONTEXT COMPACTION] summary of turns 0-5', '_row_id': 9}, {'role': 'assistant', 'content': 'Continuing from the summary.', '_row_id': 10}]
+row_ids = (7, 8), kind = 'in_place', source_rows = {}
+
+    def _record_context_message_projections_on_conn(self, conn, source_session, destination_session,
+                                                    messages, row_ids, *, kind, source_rows=None):
+        """Record owner-derived rows; unflushed first occurrences stay authentic.
+    
+        A row coordinate is a locator, never proof by itself. The native owner
+        binds its exact source and inserted payload in the same transaction.
+        No matching by content or timestamp can manufacture correspondence.
+        """
+        if kind not in {"in_place", "compression_child", "context_rebase"}:
+            raise ContextContinuationError("CONTEXT_PROJECTION_KIND_INVALID")
+        lineage = set(self._context_rebase_lineage_on_conn(conn, source_session))
+        for index, (msg, destination_id) in enumerate(zip(messages, row_ids)):
+            source_id = (source_rows or {}).get(index, msg.get("_row_id"))
+            if source_id is None:
+                continue
+            if type(source_id) is not int or source_id < 1 or source_id >= destination_id:
+>               raise ContextContinuationError("CONTEXT_PROJECTION_SOURCE_INVALID")
+E               hermes_state_continuity.ContextContinuationError: CONTEXT_PROJECTION_SOURCE_INVALID
+
+hermes_state_continuity.py:608: ContextContinuationError
+____ TestWatermarkCommit.test_none_watermark_preserves_historical_behavior _____
+
+self = <tests.test_compression_watermark_commit.TestWatermarkCommit object at 0x7fc40dfe2d50>
+db = <hermes_state.SessionDB object at 0x7fc40ddc6d50>
+
+    def test_none_watermark_preserves_historical_behavior(self, db: SessionDB) -> None:
+        """watermark=None archives everything — the pre-#75316 contract."""
+        _seed(db)
+        db.append_message("sess1", role="user", content="gets archived")
+>       count = db.archive_and_compact("sess1", SUMMARY, watermark=None)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/test_compression_watermark_commit.py:120: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+hermes_state.py:12561: in archive_and_compact
+    inserted, row_ids = self._execute_write(_do)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^
+hermes_state.py:5238: in _execute_write
+    result = fn(self._conn)
+             ^^^^^^^^^^^^^^
+hermes_state.py:12530: in _do
+    self._record_context_message_projections_on_conn(conn, session_id,
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hermes_state.SessionDB object at 0x7fc40ddc6d50>
+conn = <hermes_cli.sqlite_safe_read.TrackedConnection object at 0x7fc40de98a50>
+source_session = 'sess1', destination_session = 'sess1'
+messages = [{'role': 'user', 'content': '[CONTEXT COMPACTION] summary of turns 0-5', '_row_id': 9}, {'role': 'assistant', 'content': 'Continuing from the summary.', '_row_id': 10}]
+row_ids = (8, 9), kind = 'in_place', source_rows = {}
+
+    def _record_context_message_projections_on_conn(self, conn, source_session, destination_session,
+                                                    messages, row_ids, *, kind, source_rows=None):
+        """Record owner-derived rows; unflushed first occurrences stay authentic.
+    
+        A row coordinate is a locator, never proof by itself. The native owner
+        binds its exact source and inserted payload in the same transaction.
+        No matching by content or timestamp can manufacture correspondence.
+        """
+        if kind not in {"in_place", "compression_child", "context_rebase"}:
+            raise ContextContinuationError("CONTEXT_PROJECTION_KIND_INVALID")
+        lineage = set(self._context_rebase_lineage_on_conn(conn, source_session))
+        for index, (msg, destination_id) in enumerate(zip(messages, row_ids)):
+            source_id = (source_rows or {}).get(index, msg.get("_row_id"))
+            if source_id is None:
+                continue
+            if type(source_id) is not int or source_id < 1 or source_id >= destination_id:
+>               raise ContextContinuationError("CONTEXT_PROJECTION_SOURCE_INVALID")
+E               hermes_state_continuity.ContextContinuationError: CONTEXT_PROJECTION_SOURCE_INVALID
+
+hermes_state_continuity.py:608: ContextContinuationError
+___________ TestWatermarkCommit.test_archived_rows_stay_recoverable ____________
+
+self = <tests.test_compression_watermark_commit.TestWatermarkCommit object at 0x7fc40eac97b0>
+db = <hermes_state.SessionDB object at 0x7fc40ddc79d0>
+
+    def test_archived_rows_stay_recoverable(self, db: SessionDB) -> None:
+        """Originals (snapshot AND tail source rows) survive as archived."""
+        _seed(db, 4)
+        watermark = db.get_active_message_watermark("sess1")
+        db.append_message("sess1", role="user", content="tail row")
+>       db.archive_and_compact("sess1", SUMMARY, watermark=watermark)
+
+tests/test_compression_watermark_commit.py:130: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+hermes_state.py:12561: in archive_and_compact
+    inserted, row_ids = self._execute_write(_do)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^
+hermes_state.py:5238: in _execute_write
+    result = fn(self._conn)
+             ^^^^^^^^^^^^^^
+hermes_state.py:12530: in _do
+    self._record_context_message_projections_on_conn(conn, session_id,
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hermes_state.SessionDB object at 0x7fc40ddc79d0>
+conn = <hermes_cli.sqlite_safe_read.TrackedConnection object at 0x7fc40de98950>
+source_session = 'sess1', destination_session = 'sess1'
+messages = [{'role': 'user', 'content': '[CONTEXT COMPACTION] summary of turns 0-5', '_row_id': 9}, {'role': 'assistant', 'content': 'Continuing from the summary.', '_row_id': 10}]
+row_ids = (6, 7), kind = 'in_place', source_rows = {}
+
+    def _record_context_message_projections_on_conn(self, conn, source_session, destination_session,
+                                                    messages, row_ids, *, kind, source_rows=None):
+        """Record owner-derived rows; unflushed first occurrences stay authentic.
+    
+        A row coordinate is a locator, never proof by itself. The native owner
+        binds its exact source and inserted payload in the same transaction.
+        No matching by content or timestamp can manufacture correspondence.
+        """
+        if kind not in {"in_place", "compression_child", "context_rebase"}:
+            raise ContextContinuationError("CONTEXT_PROJECTION_KIND_INVALID")
+        lineage = set(self._context_rebase_lineage_on_conn(conn, source_session))
+        for index, (msg, destination_id) in enumerate(zip(messages, row_ids)):
+            source_id = (source_rows or {}).get(index, msg.get("_row_id"))
+            if source_id is None:
+                continue
+            if type(source_id) is not int or source_id < 1 or source_id >= destination_id:
+>               raise ContextContinuationError("CONTEXT_PROJECTION_SOURCE_INVALID")
+E               hermes_state_continuity.ContextContinuationError: CONTEXT_PROJECTION_SOURCE_INVALID
+
+hermes_state_continuity.py:608: ContextContinuationError
+____________ TestWatermarkCommit.test_session_counters_include_tail ____________
+
+self = <tests.test_compression_watermark_commit.TestWatermarkCommit object at 0x7fc40e4569c0>
+db = <hermes_state.SessionDB object at 0x7fc40ddc7c50>
+
+    def test_session_counters_include_tail(self, db: SessionDB) -> None:
+        _seed(db)
+        watermark = db.get_active_message_watermark("sess1")
+        db.append_message(
+            "sess1", role="assistant", content="tail with tools",
+            tool_calls=[{"id": "t1", "type": "function",
+                         "function": {"name": "x", "arguments": "{}"}}],
+        )
+>       db.archive_and_compact("sess1", SUMMARY, watermark=watermark)
+
+tests/test_compression_watermark_commit.py:147: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+hermes_state.py:12561: in archive_and_compact
+    inserted, row_ids = self._execute_write(_do)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^
+hermes_state.py:5238: in _execute_write
+    result = fn(self._conn)
+             ^^^^^^^^^^^^^^
+hermes_state.py:12530: in _do
+    self._record_context_message_projections_on_conn(conn, session_id,
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hermes_state.SessionDB object at 0x7fc40ddc7c50>
+conn = <hermes_cli.sqlite_safe_read.TrackedConnection object at 0x7fc40df43250>
+source_session = 'sess1', destination_session = 'sess1'
+messages = [{'role': 'user', 'content': '[CONTEXT COMPACTION] summary of turns 0-5', '_row_id': 9}, {'role': 'assistant', 'content': 'Continuing from the summary.', '_row_id': 10}]
+row_ids = (8, 9), kind = 'in_place', source_rows = {}
+
+    def _record_context_message_projections_on_conn(self, conn, source_session, destination_session,
+                                                    messages, row_ids, *, kind, source_rows=None):
+        """Record owner-derived rows; unflushed first occurrences stay authentic.
+    
+        A row coordinate is a locator, never proof by itself. The native owner
+        binds its exact source and inserted payload in the same transaction.
+        No matching by content or timestamp can manufacture correspondence.
+        """
+        if kind not in {"in_place", "compression_child", "context_rebase"}:
+            raise ContextContinuationError("CONTEXT_PROJECTION_KIND_INVALID")
+        lineage = set(self._context_rebase_lineage_on_conn(conn, source_session))
+        for index, (msg, destination_id) in enumerate(zip(messages, row_ids)):
+            source_id = (source_rows or {}).get(index, msg.get("_row_id"))
+            if source_id is None:
+                continue
+            if type(source_id) is not int or source_id < 1 or source_id >= destination_id:
+>               raise ContextContinuationError("CONTEXT_PROJECTION_SOURCE_INVALID")
+E               hermes_state_continuity.ContextContinuationError: CONTEXT_PROJECTION_SOURCE_INVALID
+
+hermes_state_continuity.py:608: ContextContinuationError
+_____________ TestCommitFence.test_commit_allowed_for_live_holder ______________
+
+self = <tests.test_compression_watermark_commit.TestCommitFence object at 0x7fc40e055350>
+db = <hermes_state.SessionDB object at 0x7fc40ddc6490>
+
+    def test_commit_allowed_for_live_holder(self, db: SessionDB) -> None:
+        _seed(db)
+        watermark = db.get_active_message_watermark("sess1")
+        assert db.try_acquire_compression_lock("sess1", "worker-A") is True
+>       count = db.archive_and_compact(
+            "sess1", SUMMARY, watermark=watermark, lock_holder="worker-A"
+        )
+
+tests/test_compression_watermark_commit.py:184: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+hermes_state.py:12561: in archive_and_compact
+    inserted, row_ids = self._execute_write(_do)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^
+hermes_state.py:5238: in _execute_write
+    result = fn(self._conn)
+             ^^^^^^^^^^^^^^
+hermes_state.py:12530: in _do
+    self._record_context_message_projections_on_conn(conn, session_id,
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hermes_state.SessionDB object at 0x7fc40ddc6490>
+conn = <hermes_cli.sqlite_safe_read.TrackedConnection object at 0x7fc40de99550>
+source_session = 'sess1', destination_session = 'sess1'
+messages = [{'role': 'user', 'content': '[CONTEXT COMPACTION] summary of turns 0-5', '_row_id': 9}, {'role': 'assistant', 'content': 'Continuing from the summary.', '_row_id': 10}]
+row_ids = (7, 8), kind = 'in_place', source_rows = {}
+
+    def _record_context_message_projections_on_conn(self, conn, source_session, destination_session,
+                                                    messages, row_ids, *, kind, source_rows=None):
+        """Record owner-derived rows; unflushed first occurrences stay authentic.
+    
+        A row coordinate is a locator, never proof by itself. The native owner
+        binds its exact source and inserted payload in the same transaction.
+        No matching by content or timestamp can manufacture correspondence.
+        """
+        if kind not in {"in_place", "compression_child", "context_rebase"}:
+            raise ContextContinuationError("CONTEXT_PROJECTION_KIND_INVALID")
+        lineage = set(self._context_rebase_lineage_on_conn(conn, source_session))
+        for index, (msg, destination_id) in enumerate(zip(messages, row_ids)):
+            source_id = (source_rows or {}).get(index, msg.get("_row_id"))
+            if source_id is None:
+                continue
+            if type(source_id) is not int or source_id < 1 or source_id >= destination_id:
+>               raise ContextContinuationError("CONTEXT_PROJECTION_SOURCE_INVALID")
+E               hermes_state_continuity.ContextContinuationError: CONTEXT_PROJECTION_SOURCE_INVALID
+
+hermes_state_continuity.py:608: ContextContinuationError
+_ TestConcurrentAppendDuringCompaction.test_append_racing_the_commit_transaction _
+
+self = <tests.test_compression_watermark_commit.TestConcurrentAppendDuringCompaction object at 0x7fc40dff2850>
+db = <hermes_state.SessionDB object at 0x7fc40ddc7610>
+
+    def test_append_racing_the_commit_transaction(self, db: SessionDB) -> None:
+        """An append serialized behind the commit lands AFTER it — never lost.
+    
+        SQLite's write lock serializes the two transactions; whichever side
+        wins, the append must end up in the live transcript.
+        """
+        _seed(db)
+        watermark = db.get_active_message_watermark("sess1")
+    
+        barrier = threading.Barrier(2, timeout=10)
+        append_err: list = []
+    
+        def _racer():
+            barrier.wait()
+            try:
+                db.append_message("sess1", role="user", content="racer")
+            except Exception as exc:  # pragma: no cover
+                append_err.append(exc)
+    
+        t = threading.Thread(target=_racer, daemon=True)
+        t.start()
+        barrier.wait()
+>       db.archive_and_compact("sess1", SUMMARY, watermark=watermark)
+
+tests/test_compression_watermark_commit.py:223: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+hermes_state.py:12561: in archive_and_compact
+    inserted, row_ids = self._execute_write(_do)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^
+hermes_state.py:5238: in _execute_write
+    result = fn(self._conn)
+             ^^^^^^^^^^^^^^
+hermes_state.py:12530: in _do
+    self._record_context_message_projections_on_conn(conn, session_id,
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hermes_state.SessionDB object at 0x7fc40ddc7610>
+conn = <hermes_cli.sqlite_safe_read.TrackedConnection object at 0x7fc40de99150>
+source_session = 'sess1', destination_session = 'sess1'
+messages = [{'role': 'user', 'content': '[CONTEXT COMPACTION] summary of turns 0-5', '_row_id': 9}, {'role': 'assistant', 'content': 'Continuing from the summary.', '_row_id': 10}]
+row_ids = (7, 8), kind = 'in_place', source_rows = {}
+
+    def _record_context_message_projections_on_conn(self, conn, source_session, destination_session,
+                                                    messages, row_ids, *, kind, source_rows=None):
+        """Record owner-derived rows; unflushed first occurrences stay authentic.
+    
+        A row coordinate is a locator, never proof by itself. The native owner
+        binds its exact source and inserted payload in the same transaction.
+        No matching by content or timestamp can manufacture correspondence.
+        """
+        if kind not in {"in_place", "compression_child", "context_rebase"}:
+            raise ContextContinuationError("CONTEXT_PROJECTION_KIND_INVALID")
+        lineage = set(self._context_rebase_lineage_on_conn(conn, source_session))
+        for index, (msg, destination_id) in enumerate(zip(messages, row_ids)):
+            source_id = (source_rows or {}).get(index, msg.get("_row_id"))
+            if source_id is None:
+                continue
+            if type(source_id) is not int or source_id < 1 or source_id >= destination_id:
+>               raise ContextContinuationError("CONTEXT_PROJECTION_SOURCE_INVALID")
+E               hermes_state_continuity.ContextContinuationError: CONTEXT_PROJECTION_SOURCE_INVALID
+
+hermes_state_continuity.py:608: ContextContinuationError
+_______ TestRotationPathWatermark.test_tail_clones_into_the_child[text] ________
+
+self = <tests.test_compression_watermark_commit.TestRotationPathWatermark object at 0x7fc40dff2c10>
+db = <hermes_state.SessionDB object at 0x7fc40eaa5f90>
+tail_content = 'mid-rotation steer'
+
+    @pytest.mark.parametrize(
+        "tail_content",
+        [
+            "mid-rotation steer",
+            [
+                {"type": "text", "text": "inspect this"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,AA=="},
+                },
+            ],
+        ],
+        ids=["text", "multimodal"],
+    )
+    def test_tail_clones_into_the_child(self, db: SessionDB, tail_content) -> None:
+        _seed(db)
+        watermark = db.get_active_message_watermark("sess1")
+        assert db.try_acquire_compression_lock("sess1", "rotator") is True
+        db.append_message("sess1", role="user", content=tail_content)
+        # Ceiling captured AFTER the foreign append, BEFORE the rotation
+        # path's own pre-publish flush (which this test has none of).
+        ceiling = db.get_active_message_watermark("sess1")
+    
+>       db.publish_compression_child(
+            parent_session_id="sess1",
+            child_session_id="child1",
+            source="test",
+            messages=SUMMARY,
+            compression_lock_holder="rotator",
+            require_compression_lease=True,
+            watermark=watermark,
+            watermark_ceiling=ceiling,
+        )
+
+tests/test_compression_watermark_commit.py:259: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+hermes_state.py:7132: in publish_compression_child
+    row_ids = self._execute_write(_do)
+              ^^^^^^^^^^^^^^^^^^^^^^^^
+hermes_state.py:5238: in _execute_write
+    result = fn(self._conn)
+             ^^^^^^^^^^^^^^
+hermes_state.py:7080: in _do
+    self._record_context_message_projections_on_conn(conn, parent_session_id,
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hermes_state.SessionDB object at 0x7fc40eaa5f90>
+conn = <hermes_cli.sqlite_safe_read.TrackedConnection object at 0x7fc40de9a250>
+source_session = 'sess1', destination_session = 'child1'
+messages = [{'role': 'user', 'content': '[CONTEXT COMPACTION] summary of turns 0-5', '_row_id': 9}, {'role': 'assistant', 'content': 'Continuing from the summary.', '_row_id': 10}]
+row_ids = (8, 9), kind = 'compression_child', source_rows = {}
+
+    def _record_context_message_projections_on_conn(self, conn, source_session, destination_session,
+                                                    messages, row_ids, *, kind, source_rows=None):
+        """Record owner-derived rows; unflushed first occurrences stay authentic.
+    
+        A row coordinate is a locator, never proof by itself. The native owner
+        binds its exact source and inserted payload in the same transaction.
+        No matching by content or timestamp can manufacture correspondence.
+        """
+        if kind not in {"in_place", "compression_child", "context_rebase"}:
+            raise ContextContinuationError("CONTEXT_PROJECTION_KIND_INVALID")
+        lineage = set(self._context_rebase_lineage_on_conn(conn, source_session))
+        for index, (msg, destination_id) in enumerate(zip(messages, row_ids)):
+            source_id = (source_rows or {}).get(index, msg.get("_row_id"))
+            if source_id is None:
+                continue
+            if type(source_id) is not int or source_id < 1 or source_id >= destination_id:
+>               raise ContextContinuationError("CONTEXT_PROJECTION_SOURCE_INVALID")
+E               hermes_state_continuity.ContextContinuationError: CONTEXT_PROJECTION_SOURCE_INVALID
+
+hermes_state_continuity.py:608: ContextContinuationError
+____ TestRotationPathWatermark.test_tail_clones_into_the_child[multimodal] _____
+
+self = <tests.test_compression_watermark_commit.TestRotationPathWatermark object at 0x7fc40dff2d50>
+db = <hermes_state.SessionDB object at 0x7fc40ddc74d0>
+tail_content = [{'type': 'text', 'text': 'inspect this'}, {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,AA=='}}]
+
+    @pytest.mark.parametrize(
+        "tail_content",
+        [
+            "mid-rotation steer",
+            [
+                {"type": "text", "text": "inspect this"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,AA=="},
+                },
+            ],
+        ],
+        ids=["text", "multimodal"],
+    )
+    def test_tail_clones_into_the_child(self, db: SessionDB, tail_content) -> None:
+        _seed(db)
+        watermark = db.get_active_message_watermark("sess1")
+        assert db.try_acquire_compression_lock("sess1", "rotator") is True
+        db.append_message("sess1", role="user", content=tail_content)
+        # Ceiling captured AFTER the foreign append, BEFORE the rotation
+        # path's own pre-publish flush (which this test has none of).
+        ceiling = db.get_active_message_watermark("sess1")
+    
+>       db.publish_compression_child(
+            parent_session_id="sess1",
+            child_session_id="child1",
+            source="test",
+            messages=SUMMARY,
+            compression_lock_holder="rotator",
+            require_compression_lease=True,
+            watermark=watermark,
+            watermark_ceiling=ceiling,
+        )
+
+tests/test_compression_watermark_commit.py:259: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+hermes_state.py:7132: in publish_compression_child
+    row_ids = self._execute_write(_do)
+              ^^^^^^^^^^^^^^^^^^^^^^^^
+hermes_state.py:5238: in _execute_write
+    result = fn(self._conn)
+             ^^^^^^^^^^^^^^
+hermes_state.py:7080: in _do
+    self._record_context_message_projections_on_conn(conn, parent_session_id,
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hermes_state.SessionDB object at 0x7fc40ddc74d0>
+conn = <hermes_cli.sqlite_safe_read.TrackedConnection object at 0x7fc40df43650>
+source_session = 'sess1', destination_session = 'child1'
+messages = [{'role': 'user', 'content': '[CONTEXT COMPACTION] summary of turns 0-5', '_row_id': 9}, {'role': 'assistant', 'content': 'Continuing from the summary.', '_row_id': 10}]
+row_ids = (8, 9), kind = 'compression_child', source_rows = {}
+
+    def _record_context_message_projections_on_conn(self, conn, source_session, destination_session,
+                                                    messages, row_ids, *, kind, source_rows=None):
+        """Record owner-derived rows; unflushed first occurrences stay authentic.
+    
+        A row coordinate is a locator, never proof by itself. The native owner
+        binds its exact source and inserted payload in the same transaction.
+        No matching by content or timestamp can manufacture correspondence.
+        """
+        if kind not in {"in_place", "compression_child", "context_rebase"}:
+            raise ContextContinuationError("CONTEXT_PROJECTION_KIND_INVALID")
+        lineage = set(self._context_rebase_lineage_on_conn(conn, source_session))
+        for index, (msg, destination_id) in enumerate(zip(messages, row_ids)):
+            source_id = (source_rows or {}).get(index, msg.get("_row_id"))
+            if source_id is None:
+                continue
+            if type(source_id) is not int or source_id < 1 or source_id >= destination_id:
+>               raise ContextContinuationError("CONTEXT_PROJECTION_SOURCE_INVALID")
+E               hermes_state_continuity.ContextContinuationError: CONTEXT_PROJECTION_SOURCE_INVALID
+
+hermes_state_continuity.py:608: ContextContinuationError
+____ TestRotationPathWatermark.test_ceiling_excludes_the_rotators_own_flush ____
+
+self = <tests.test_compression_watermark_commit.TestRotationPathWatermark object at 0x7fc40e0555b0>
+db = <hermes_state.SessionDB object at 0x7fc40ddc5310>
+
+    def test_ceiling_excludes_the_rotators_own_flush(self, db: SessionDB) -> None:
+        """Rows the rotation path flushes AFTER the ceiling (its own input
+        transcript, already inside the handoff) must NOT be cloned."""
+        _seed(db)
+        watermark = db.get_active_message_watermark("sess1")
+        assert db.try_acquire_compression_lock("sess1", "rotator") is True
+        db.append_message("sess1", role="user", content="foreign steer")
+        ceiling = db.get_active_message_watermark("sess1")
+        # Simulates the #47202 pre-publish flush of the rotator's own input.
+        db.append_message(
+            "sess1", role="user", content="rotator's own flush",
+            compression_lock_holder="rotator",
+        )
+    
+>       db.publish_compression_child(
+            parent_session_id="sess1",
+            child_session_id="child1",
+            source="test",
+            messages=SUMMARY,
+            compression_lock_holder="rotator",
+            require_compression_lease=True,
+            watermark=watermark,
+            watermark_ceiling=ceiling,
+        )
+
+tests/test_compression_watermark_commit.py:308: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+hermes_state.py:7132: in publish_compression_child
+    row_ids = self._execute_write(_do)
+              ^^^^^^^^^^^^^^^^^^^^^^^^
+hermes_state.py:5238: in _execute_write
+    result = fn(self._conn)
+             ^^^^^^^^^^^^^^
+hermes_state.py:7080: in _do
+    self._record_context_message_projections_on_conn(conn, parent_session_id,
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hermes_state.SessionDB object at 0x7fc40ddc5310>
+conn = <hermes_cli.sqlite_safe_read.TrackedConnection object at 0x7fc40de99e50>
+source_session = 'sess1', destination_session = 'child1'
+messages = [{'role': 'user', 'content': '[CONTEXT COMPACTION] summary of turns 0-5', '_row_id': 9}, {'role': 'assistant', 'content': 'Continuing from the summary.', '_row_id': 10}]
+row_ids = (9, 10), kind = 'compression_child', source_rows = {}
+
+    def _record_context_message_projections_on_conn(self, conn, source_session, destination_session,
+                                                    messages, row_ids, *, kind, source_rows=None):
+        """Record owner-derived rows; unflushed first occurrences stay authentic.
+    
+        A row coordinate is a locator, never proof by itself. The native owner
+        binds its exact source and inserted payload in the same transaction.
+        No matching by content or timestamp can manufacture correspondence.
+        """
+        if kind not in {"in_place", "compression_child", "context_rebase"}:
+            raise ContextContinuationError("CONTEXT_PROJECTION_KIND_INVALID")
+        lineage = set(self._context_rebase_lineage_on_conn(conn, source_session))
+        for index, (msg, destination_id) in enumerate(zip(messages, row_ids)):
+            source_id = (source_rows or {}).get(index, msg.get("_row_id"))
+            if source_id is None:
+                continue
+            if type(source_id) is not int or source_id < 1 or source_id >= destination_id:
+>               raise ContextContinuationError("CONTEXT_PROJECTION_SOURCE_INVALID")
+E               hermes_state_continuity.ContextContinuationError: CONTEXT_PROJECTION_SOURCE_INVALID
+
+hermes_state_continuity.py:608: ContextContinuationError
+____ TestRotationPathWatermark.test_no_watermark_keeps_historical_rotation _____
+
+self = <tests.test_compression_watermark_commit.TestRotationPathWatermark object at 0x7fc40e0556e0>
+db = <hermes_state.SessionDB object at 0x7fc40ddc7c50>
+
+    def test_no_watermark_keeps_historical_rotation(self, db: SessionDB) -> None:
+        _seed(db)
+        assert db.try_acquire_compression_lock("sess1", "rotator") is True
+        db.append_message("sess1", role="user", content="stranded either way")
+>       db.publish_compression_child(
+            parent_session_id="sess1",
+            child_session_id="child1",
+            source="test",
+            messages=SUMMARY,
+            compression_lock_holder="rotator",
+            require_compression_lease=True,
+        )
+
+tests/test_compression_watermark_commit.py:329: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+hermes_state.py:7132: in publish_compression_child
+    row_ids = self._execute_write(_do)
+              ^^^^^^^^^^^^^^^^^^^^^^^^
+hermes_state.py:5238: in _execute_write
+    result = fn(self._conn)
+             ^^^^^^^^^^^^^^
+hermes_state.py:7080: in _do
+    self._record_context_message_projections_on_conn(conn, parent_session_id,
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hermes_state.SessionDB object at 0x7fc40ddc7c50>
+conn = <hermes_cli.sqlite_safe_read.TrackedConnection object at 0x7fc40de98250>
+source_session = 'sess1', destination_session = 'child1'
+messages = [{'role': 'user', 'content': '[CONTEXT COMPACTION] summary of turns 0-5', '_row_id': 9}, {'role': 'assistant', 'content': 'Continuing from the summary.', '_row_id': 10}]
+row_ids = (8, 9), kind = 'compression_child', source_rows = {}
+
+    def _record_context_message_projections_on_conn(self, conn, source_session, destination_session,
+                                                    messages, row_ids, *, kind, source_rows=None):
+        """Record owner-derived rows; unflushed first occurrences stay authentic.
+    
+        A row coordinate is a locator, never proof by itself. The native owner
+        binds its exact source and inserted payload in the same transaction.
+        No matching by content or timestamp can manufacture correspondence.
+        """
+        if kind not in {"in_place", "compression_child", "context_rebase"}:
+            raise ContextContinuationError("CONTEXT_PROJECTION_KIND_INVALID")
+        lineage = set(self._context_rebase_lineage_on_conn(conn, source_session))
+        for index, (msg, destination_id) in enumerate(zip(messages, row_ids)):
+            source_id = (source_rows or {}).get(index, msg.get("_row_id"))
+            if source_id is None:
+                continue
+            if type(source_id) is not int or source_id < 1 or source_id >= destination_id:
+>               raise ContextContinuationError("CONTEXT_PROJECTION_SOURCE_INVALID")
+E               hermes_state_continuity.ContextContinuationError: CONTEXT_PROJECTION_SOURCE_INVALID
+
+hermes_state_continuity.py:608: ContextContinuationError
+=========================== short test summary info ============================
+FAILED tests/test_compression_watermark_commit.py::TestWatermarkCommit::test_tail_clone_preserves_every_column
+FAILED tests/test_compression_watermark_commit.py::TestWatermarkCommit::test_conversation_load_is_correct_after_commit
+FAILED tests/test_compression_watermark_commit.py::TestWatermarkCommit::test_no_tail_behaves_identically_to_legacy
+FAILED tests/test_compression_watermark_commit.py::TestWatermarkCommit::test_none_watermark_preserves_historical_behavior
+FAILED tests/test_compression_watermark_commit.py::TestWatermarkCommit::test_archived_rows_stay_recoverable
+FAILED tests/test_compression_watermark_commit.py::TestWatermarkCommit::test_session_counters_include_tail
+FAILED tests/test_compression_watermark_commit.py::TestCommitFence::test_commit_allowed_for_live_holder
+FAILED tests/test_compression_watermark_commit.py::TestConcurrentAppendDuringCompaction::test_append_racing_the_commit_transaction
+FAILED tests/test_compression_watermark_commit.py::TestRotationPathWatermark::test_tail_clones_into_the_child[text]
+FAILED tests/test_compression_watermark_commit.py::TestRotationPathWatermark::test_tail_clones_into_the_child[multimodal]
+FAILED tests/test_compression_watermark_commit.py::TestRotationPathWatermark::test_ceiling_excludes_the_rotators_own_flush
+FAILED tests/test_compression_watermark_commit.py::TestRotationPathWatermark::test_no_watermark_keeps_historical_rotation
+======================== 12 failed, 4 passed in 19.06s =========================
+
+=== 2 files with test failures (20 tests failed) ===
+  tests/state/test_message_row_publication.py  (8 tests failed)
+  tests/test_compression_watermark_commit.py  (12 tests failed)

@@ -66,6 +66,7 @@ _QUICK_SNAPSHOTS_DIR = "state-snapshots"
 # exclude ``.archive`` here because the curator's ``skills/.archive/`` holds
 # restorable user skills that must survive a backup.
 _EXCLUDED_DIRS = {
+    "context-controller-keys",  # local authority credentials require explicit recovery
     "hermes-agent",     # the codebase repo — re-clone instead
     "__pycache__",      # bytecode caches — regenerated on import
     ".git",             # nested git dirs (profiles shouldn't have these, but safety)
@@ -308,6 +309,8 @@ def _iter_external_files(base: Path) -> List[Path]:
     """Yield regular files under *base* (a file or a directory), skipping
     symlinks, caches, and pyc files. *base* itself may be a file."""
     files: List[Path] = []
+    if "context-controller-keys" in base.parts:
+        return files
     if base.is_file() and not base.is_symlink():
         files.append(base)
         return files
@@ -1245,6 +1248,11 @@ def run_import(args) -> None:
         t0 = time.monotonic()
 
         for member in members:
+            # Credentials must not be restored from older or foreign archives,
+            # including their external-provider subtree.
+            if "context-controller-keys" in Path(member).parts:
+                skipped_runtime.append(member)
+                continue
             # External memory-provider state captured under the reserved
             # ``_external/`` arc prefix restores to its original home-relative
             # location (e.g. ~/.honcho/config.json), NOT under HERMES_HOME.

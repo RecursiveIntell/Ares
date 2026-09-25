@@ -60,6 +60,7 @@ from typing import Any, Callable, Dict, List, Literal, NamedTuple, Optional, Set
 from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _BRANCH_CHILD_SQL,
     _COMPRESSION_CHILD_SQL,
+    _CONTEXT_REBASE_CHILD_SQL,
     _FTS_CJK_TRIGGERS,
     _FTS_TRIGGERS,
     _LISTABLE_CHILD_SQL,
@@ -95,6 +96,8 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
 )
 from hermes_state_portability import SessionPortabilityMixin
 from hermes_state_runs import SessionRunCustodyMixin
+from hermes_state_continuity import ContextContinuationError, SessionContextContinuityMixin
+from hermes_state_inbox import SessionContextInboxMixin
 from hermes_state_schema import (
     SessionSchemaMixin, TODO_LIFECYCLE_SHAPE_SQL,
     todo_lifecycle_shape_from_row, _todo_lifecycle_supported_shapes,
@@ -4314,7 +4317,7 @@ def classify_session_status(
     return SESSION_STATUS_COMPLETE
 
 
-class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin, SessionRunCustodyMixin):
+class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin, SessionRunCustodyMixin, SessionContextContinuityMixin, SessionContextInboxMixin):
     """
     SQLite-backed session storage with FTS5 search.
 
@@ -7068,9 +7071,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                     time.time(),
                 ),
             )
+            input_messages = self._normalize_compacted_context_messages_on_conn(conn, parent_session_id, messages)
             total_messages, total_tool_calls, row_ids = self._insert_message_rows(
-                conn, child_session_id, messages
+                conn, child_session_id, input_messages
             )
+            input_sources = self._bind_compacted_context_inputs_on_conn(conn, parent_session_id,
+                child_session_id, input_messages, row_ids)
+            self._record_context_message_projections_on_conn(conn, parent_session_id,
+                child_session_id, input_messages, row_ids, kind="compression_child", source_rows=input_sources)
             if watermark is not None:
                 # Clone the parent's concurrent tail (rows landed after the
                 # watermark, at or below the ceiling — see docstring) into the
@@ -7829,7 +7837,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
             )
 
     def _session_turn_lease_key_on_conn(self, conn, session_id: str) -> str:
-        """Walk compression parents on ``conn`` to the conversation lease key.
+        """Walk canonical continuation parents on ``conn`` to the conversation lease key.
 
         Must run on the same connection as the lease INSERT/UPDATE/DELETE.
         A prior ``get_session`` failure must not compute a child id that the
@@ -7860,14 +7868,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
             ):
                 break
             parent = _row(parent_id)
-            if not parent or parent.get("end_reason") != "compression":
+            if not parent:
+                break
+            parent_reason = parent.get("end_reason")
+            if parent_reason == "compression":
+                pass
+            elif parent_reason == "context_rebase":
+                if not self._context_rebase_child_matches(current, parent_id):
+                    break
+            else:
                 break
             seen.add(parent_id)
             current = parent
         return str(current.get("id") or session_id) if current else session_id
 
     def _session_turn_lease_key(self, session_id: str) -> str:
-        """Return the stable serialization key for every compression segment.
+        """Return the stable serialization key for every continuation segment.
 
         Acquire/refresh/release resolve this inside their write transaction.
         This helper is for tests and diagnostics; it does not swallow lock
@@ -9457,7 +9473,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
             return False
         # Walk parent links up from the descendant, following only compression
         # continuation edges, and check whether ancestor_id is reached.
-        edge = _COMPRESSION_CHILD_SQL.format(a="child")
+        compression_edge = _COMPRESSION_CHILD_SQL.format(a="child")
+        rebase_edge = _CONTEXT_REBASE_CHILD_SQL.format(a="child")
         row = conn.execute(
             f"""
             WITH RECURSIVE ancestors(id) AS (
@@ -9467,7 +9484,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                 FROM ancestors a
                 JOIN sessions child ON child.id = a.id
                 JOIN sessions parent ON parent.id = child.parent_session_id
-                WHERE {edge}
+                WHERE ({compression_edge}) OR ({rebase_edge})
             )
             SELECT 1 FROM ancestors WHERE id = ? AND id != ? LIMIT 1
             """,
@@ -10380,9 +10397,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                     FROM chain c
                     JOIN sessions parent ON parent.id = c.cur_id
                     JOIN sessions child ON child.parent_session_id = c.cur_id
-                    WHERE parent.end_reason = 'compression'
-                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
-                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
+                    WHERE (
+                        (
+                          parent.end_reason = 'compression'
+                          AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
+                          AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
+                        )
+                        OR (
+                          parent.end_reason = 'context_rebase'
+                          AND json_extract(COALESCE(child.model_config, '{{}}'), '$._context_rebase_from') = parent.id
+                          AND json_extract(COALESCE(child.model_config, '{{}}'), '$._context_rebase_transition') IS NOT NULL
+                        )
+                      )
                       AND COALESCE(child.source, '') != 'tool'
                 ),
                 chain_max AS (
@@ -10499,9 +10525,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
             # every tip id first, then fetch all tip rows in a single query.
             tip_ids_by_root: Dict[str, str] = {}
             for s in sessions:
-                if s.get("end_reason") != "compression":
+                if s.get("end_reason") not in {"compression", "context_rebase"}:
                     continue
-                tip_id = self.get_compression_tip(s["id"])
+                tip_id = self.get_context_continuation_tip(s["id"])
                 if tip_id != s["id"]:
                     tip_ids_by_root[s["id"]] = tip_id
 
@@ -11346,7 +11372,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
     def _selected_todo_snapshot(self, row, session_id: str):
         if row is None:
             raise TodoSnapshotError("session")
-        if row["ended_at"] is not None and row["end_reason"] == "compression":
+        if row["ended_at"] is not None and row["end_reason"] in ("compression", "context_rebase"):
             raise TodoSnapshotError("closed_session")
         clear = self._validate_todo_clear_baseline(row, session_id)
         # NULL with a clear baseline is explicit owner provenance, not an empty
@@ -11762,8 +11788,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                 turn_lease_holder=turn_lease_holder,
                 turn_lease_ttl_seconds=turn_lease_ttl_seconds,
             )
+            if any(msg.get("_context_input") is not None for msg in messages):
+                self._assert_context_rebase_lease_on_conn(conn, session_id, turn_lease_holder)
             inserted, tool_calls_total, row_ids = self._insert_message_rows(
-                conn, session_id, messages
+                conn, session_id, messages, bind_context_inputs=True
             )
             # One aggregated counter update for the whole batch.
             if tool_calls_total > 0:
@@ -11777,6 +11805,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                     "UPDATE sessions SET message_count = message_count + ? WHERE id = ?",
                     (inserted, session_id),
                 )
+            self._complete_input_response_batch_on_conn(conn, session_id, turn_lease_holder, messages, row_ids)
             return inserted, row_ids
 
         # Same criticality as append_message: this IS the turn's transcript.
@@ -12139,7 +12168,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                 msg["_row_id"] = row_id
 
     def _insert_message_rows(
-        self, conn, session_id: str, messages: List[Dict[str, Any]]
+        self, conn, session_id: str, messages: List[Dict[str, Any]], *, bind_context_inputs=False
     ) -> tuple[int, int, tuple[Optional[int], ...]]:
         """Insert *messages* as fresh active rows for *session_id*.
 
@@ -12155,6 +12184,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
         tool_calls_total = 0
         row_ids = []
         for msg in messages:
+            receipt, projection = self._prepare_context_input_projection_on_conn(
+                conn, session_id, msg) if bind_context_inputs else (None, None)
+            if projection is not None:
+                row_ids.append(projection["row_id"])
+                continue
             role = msg.get("role", "unknown")
             tool_calls = msg.get("tool_calls")
             message_timestamp = now_ts
@@ -12227,6 +12261,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                 ),
             )
             row_ids.append(cur.lastrowid)
+            if receipt is not None:
+                self._commit_context_input_projection_on_conn(conn, receipt, session_id, cur.lastrowid)
             inserted += 1
             if tool_calls is not None:
                 tool_calls_total += (
@@ -12486,9 +12522,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                 "WHERE session_id = ? AND active = 1",
                 (session_id,),
             )
+            input_messages = self._normalize_compacted_context_messages_on_conn(conn, session_id, compacted_messages)
             inserted, tool_calls_total, row_ids = self._insert_message_rows(
-                conn, session_id, compacted_messages
+                conn, session_id, input_messages
             )
+            input_sources = self._bind_compacted_context_inputs_on_conn(conn, session_id,
+                session_id, input_messages, row_ids)
+            self._record_context_message_projections_on_conn(conn, session_id,
+                session_id, input_messages, row_ids, kind="in_place", source_rows=input_sources)
             if tail_ids:
                 # Re-sequence the concurrent tail after the compacted set via
                 # a pure-SQL column clone: no decode/re-encode round trip, no
@@ -12942,7 +12983,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
         # never hijack the resume. This is the fix for the desktop "I came back
         # and the reply isn't there" report on large sessions.
         try:
-            tip = self.get_compression_tip(session_id)
+            tip = self.get_context_continuation_tip(session_id)
+        except ContextContinuationError:
+            raise
         except Exception:
             tip = session_id
         if tip and tip != session_id:
@@ -15208,35 +15251,32 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
         validate the same preimage and silently overwrite one another within
         an apparently successful batch. Reject before entering the transaction.
         """
+        return bool(self._execute_write(
+            lambda conn: self._compare_and_set_meta_many_on_conn(conn, items)
+        ))
+
+    @staticmethod
+    def _compare_and_set_meta_many_on_conn(conn, items) -> bool:
+        """Compose metadata CAS with an existing SessionDB write transaction."""
         normalized = [(str(key), expected, str(value)) for key, expected, value in items]
         if len({key for key, _expected, _value in normalized}) != len(normalized):
             raise ValueError("duplicate keys in metadata compare-and-set batch")
         if not normalized:
             return True
 
-        def _do(conn):
-            for key, expected, _value in normalized:
-                if expected is None:
-                    row = conn.execute(
-                        "SELECT 1 FROM state_meta WHERE key = ?", (key,)
-                    ).fetchone()
-                    if row is not None:
-                        return False
-                else:
-                    row = conn.execute(
-                        "SELECT value FROM state_meta WHERE key = ?", (key,)
-                    ).fetchone()
-                    if row is None or row[0] != expected:
-                        return False
-            for key, _expected, value in normalized:
-                conn.execute(
-                    "INSERT INTO state_meta (key, value) VALUES (?, ?) "
-                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                    (key, value),
-                )
-            return True
-
-        return bool(self._execute_write(_do))
+        for key, expected, _value in normalized:
+            row = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?", (key,)
+            ).fetchone()
+            if (None if row is None else row[0]) != expected:
+                return False
+        for key, _expected, value in normalized:
+            conn.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+        return True
 
     def retag_kanban_worker_sessions(self, workspaces_root: str) -> int:
         """Retag legacy kanban worker rows from ``cli`` to ``kanban``.

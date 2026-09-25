@@ -233,6 +233,119 @@ class RunCustody:
         return cls(**{**value, "checkpoint": RunCheckpoint.from_dict(value["checkpoint"])})
 
 
+@dataclass(frozen=True)
+class RunTaskBinding:
+    """Historical task identity derived from an authentic native input row.
+
+    This is provenance, never current instruction or effect authority. Each
+    checked claim separately compares the current control projection.
+    """
+    schema: str
+    run_id: str
+    conversation_root: str
+    profile_name: str
+    origin_session_id: str
+    input_session_id: str
+    input_row_id: int
+    input_digest: str
+
+    def __post_init__(self):
+        if self.schema != "SessionDBRunTaskBindingV1":
+            raise RunCustodyError("INTEGRITY_TASK_SCHEMA")
+        _run_id(self.run_id)
+        for name in ("conversation_root", "profile_name", "origin_session_id", "input_session_id"):
+            _text(getattr(self, name))
+        _integer(self.input_row_id)
+        _digest(self.input_digest)
+
+    @classmethod
+    def from_dict(cls, value):
+        _exact_keys(value, cls)
+        return cls(**value)
+
+
+@dataclass(frozen=True)
+class RunCustodyV2:
+    schema: str
+    run_id: str
+    generation: int
+    predecessor_digest: str | None
+    owner_token: str
+    controller_pid: int
+    process_identity: str
+    origin_session_id: str
+    current_session_id: str
+    task_binding: RunTaskBinding
+    expires_monotonic_ns: int
+    disposition: str
+    checkpoint: RunCheckpoint
+
+    def __post_init__(self):
+        if self.schema != "SessionDBRunCustodyV2":
+            raise RunCustodyError("INTEGRITY_SCHEMA")
+        _run_id(self.run_id)
+        _integer(self.generation)
+        if self.generation == 1:
+            if self.predecessor_digest is not None:
+                raise RunCustodyError("INTEGRITY_PREDECESSOR")
+        else:
+            _digest(self.predecessor_digest)
+        _digest(self.owner_token)
+        _integer(self.controller_pid)
+        for name in ("process_identity", "origin_session_id", "current_session_id"):
+            _text(getattr(self, name))
+        if (type(self.task_binding) is not RunTaskBinding
+                or self.task_binding.run_id != self.run_id
+                or self.task_binding.origin_session_id != self.origin_session_id):
+            raise RunCustodyError("INTEGRITY_TASK_BINDING")
+        _integer(self.expires_monotonic_ns)
+        if self.disposition not in {"active", "released"}:
+            raise RunCustodyError("INTEGRITY_DISPOSITION")
+        if type(self.checkpoint) is not RunCheckpoint:
+            raise RunCustodyError("INVALID_CHECKPOINT")
+        if "historical-goal-key" in dict(self.checkpoint.members):
+            raise RunCustodyError("MIXED_TASK_BINDING")
+
+    @classmethod
+    def from_dict(cls, value):
+        _exact_keys(value, cls)
+        return cls(**{**value, "checkpoint": RunCheckpoint.from_dict(value["checkpoint"]),
+                      "task_binding": RunTaskBinding.from_dict(value["task_binding"])})
+
+
+_CUSTODY_SCHEMAS = {"SessionDBRunCustodyV1": RunCustody, "SessionDBRunCustodyV2": RunCustodyV2}
+
+
+def _custody_class(document):
+    cls = _CUSTODY_SCHEMAS.get(document.get("schema")) if type(document) is dict else None
+    if cls is None:
+        raise RunCustodyError("INTEGRITY_SCHEMA")
+    return cls
+
+
+def _checkpoint_digest(value):
+    return _sha(_json(asdict(value.checkpoint)))
+
+
+def _history_digest(value):
+    binding = (asdict(value.task_binding) if type(value) is RunCustodyV2 else
+               {"origin_session_id": value.origin_session_id,
+                "historical_goal_digest": value.historical_goal_digest})
+    return _sha(_json({"schema": value.schema, "run_id": value.run_id, "binding": binding}))
+
+
+def _recovery_files(files, checkpoint):
+    """Closed locator schema; bytes still require independent observation."""
+    if (type(files) is not dict or set(files) != {"plan", "contract", "source", "members"}
+            or type(files["members"]) is not dict
+            or set(files["members"]) != set(dict(checkpoint.members))):
+        raise RunCustodyError("RECOVERY_FILE_BINDINGS_MISMATCH")
+    for path in [files["plan"], files["contract"], files["source"], *files["members"].values()]:
+        if type(path) is not str or len(path) > 4096 or "\x00" in path or not os.path.isabs(path):
+            raise RunCustodyError("INVALID_RECOVERY_FILE")
+    return _load(_json(files))
+
+
 def _preserve(old, new):
     # No settlement/authority-change API is invented here. Those owners must
     # supply a separately reviewed transition before obligations can be removed.
@@ -250,18 +363,21 @@ def _preserve(old, new):
 
 
 _REFRESH_SCHEMA = "SessionDBRunCustodyRefreshV1"
+_REFRESH_SCHEMAS = {_REFRESH_SCHEMA: RunCustody, "SessionDBRunCustodyRefreshV2": RunCustodyV2}
 
 
 def _refresh_parts(document):
     """Decode only the explicit compact storage envelope, never widen V1."""
     if (type(document) is not dict or
             set(document) != {"schema", "custody", "checkpoint_reference"} or
-            document["schema"] != _REFRESH_SCHEMA):
+            document["schema"] not in _REFRESH_SCHEMAS):
         raise RunCustodyError("INTEGRITY_REFRESH_SCHEMA")
     metadata, reference = document["custody"], document["checkpoint_reference"]
     if (type(metadata) is not dict or
-            set(metadata) != {f.name for f in fields(RunCustody)} - {"checkpoint"} or
+            set(metadata) != {f.name for f in fields(_REFRESH_SCHEMAS[document["schema"]])} - {"checkpoint"} or
             type(reference) is not dict or set(reference) != {"generation", "digest"}):
+        raise RunCustodyError("INTEGRITY_REFRESH_SCHEMA")
+    if _custody_class(metadata) is not _REFRESH_SCHEMAS[document["schema"]]:
         raise RunCustodyError("INTEGRITY_REFRESH_SCHEMA")
     _integer(reference["generation"])
     _digest(reference["digest"])
@@ -286,31 +402,32 @@ def _decode_run_record(run_id, generation, expected_digest, read_value):
         return document
 
     document = load(generation, expected_digest)
-    if document.get("schema") == "SessionDBRunCustodyV1":
-        value = RunCustody.from_dict(document)
+    if document.get("schema") in _CUSTODY_SCHEMAS:
+        value = _custody_class(document).from_dict(document)
     else:
         metadata, reference = _refresh_parts(document)
         if reference["generation"] >= generation:
             raise RunCustodyError("INTEGRITY_REFRESH_REFERENCE")
         anchor_document = load(reference["generation"], reference["digest"])
-        anchor = RunCustody.from_dict(anchor_document)
+        cls = _custody_class(metadata)
+        anchor = cls.from_dict(anchor_document)
         if anchor.run_id != run_id or anchor.generation != reference["generation"]:
             raise RunCustodyError("INTEGRITY_REFRESH_REFERENCE")
         # Use validated wire lists, not dataclass tuples: V1's strict decoder
         # must continue rejecting non-JSON inventory shapes.
         checkpoint = anchor_document["checkpoint"]
-        value = RunCustody.from_dict({**metadata, "checkpoint": checkpoint})
+        value = cls.from_dict({**metadata, "checkpoint": checkpoint})
         prior_document = load(generation - 1, value.predecessor_digest)
-        if prior_document.get("schema") == "SessionDBRunCustodyV1":
-            prior = RunCustody.from_dict(prior_document)
+        if prior_document.get("schema") in _CUSTODY_SCHEMAS:
+            prior = cls.from_dict(prior_document)
             prior_reference = {"generation": generation - 1, "digest": value.predecessor_digest}
         else:
             prior_metadata, prior_reference = _refresh_parts(prior_document)
-            prior = RunCustody.from_dict({**prior_metadata, "checkpoint": checkpoint})
+            prior = cls.from_dict({**prior_metadata, "checkpoint": checkpoint})
         if (prior_reference != reference or prior.run_id != run_id or
                 prior.generation != generation - 1 or value.disposition != "active"):
             raise RunCustodyError("INTEGRITY_REFRESH_REFERENCE")
-        for field in fields(RunCustody):
+        for field in fields(cls):
             if field.name not in {"generation", "predecessor_digest", "expires_monotonic_ns"}:
                 if getattr(prior, field.name) != getattr(value, field.name):
                     raise RunCustodyError("INTEGRITY_REFRESH_OWNERSHIP")
@@ -351,6 +468,20 @@ class SessionRunCustodyMixin:
         """Read committed native metadata; does not authorize continuation."""
         return self._read_run_head(run_id)[1]
 
+    def list_run_custody_for_session(self, session_id, *, active_only=True):
+        """Read custody heads bound to one physical session; grants no authority."""
+        _text(session_id)
+        if type(active_only) is not bool:
+            raise RunCustodyError("INVALID_FILTER")
+        with self._read_ctx() as conn:
+            conn.execute("SAVEPOINT run_custody_inventory")
+            try:
+                inventory = self._run_custodies_for_session_on_conn(conn, session_id, active_only=active_only)
+                return [inventory[run_id][1] for run_id in sorted(inventory)]
+            finally:
+                conn.execute("ROLLBACK TO run_custody_inventory")
+                conn.execute("RELEASE run_custody_inventory")
+
     def read_run_checkpoint(self, run_id, *, generation):
         _integer(generation)
         value = self.read_run_custody(run_id)
@@ -361,6 +492,203 @@ class SessionRunCustodyMixin:
         while value.generation > generation:
             value = self._read_run_member(run_id, value.generation - 1, value.predecessor_digest)
         return value
+
+    def _task_binding_on_conn(self, conn, *, run_id, origin_session_id,
+                              current_session_id, input_row_id):
+        from hermes_state_continuity import ContextContinuationError, user_originated_turn_view
+
+        _run_id(run_id)
+        _text(origin_session_id)
+        _integer(input_row_id)
+        try:
+            lineage = self._context_rebase_lineage_on_conn(conn, current_session_id)
+            root = self._session_turn_lease_key_on_conn(conn, current_session_id)
+        except (ContextContinuationError, ValueError, TypeError) as exc:
+            raise RunCustodyError("TASK_LINEAGE_MISMATCH") from exc
+        if origin_session_id not in lineage:
+            raise RunCustodyError("TASK_LINEAGE_MISMATCH")
+        if self._session_turn_lease_key_on_conn(conn, origin_session_id) != root:
+            raise RunCustodyError("TASK_LINEAGE_MISMATCH")
+        origin = conn.execute("SELECT profile_name FROM sessions WHERE id=?", (origin_session_id,)).fetchone()
+        current = conn.execute("SELECT profile_name FROM sessions WHERE id=?", (current_session_id,)).fetchone()
+        profile_name = None if origin is None else ("default" if origin[0] is None else origin[0])
+        if (origin is None or current is None or not profile_name
+                or profile_name != ("default" if current[0] is None else current[0])):
+            raise RunCustodyError("TASK_PROFILE_MISMATCH")
+        for sid in lineage:
+            profile = conn.execute("SELECT profile_name FROM sessions WHERE id=?", (sid,)).fetchone()
+            if profile is None or ("default" if profile[0] is None else profile[0]) != profile_name:
+                raise RunCustodyError("TASK_PROFILE_MISMATCH")
+        origin_lineage = lineage[lineage.index(origin_session_id):]
+        row = conn.execute(
+            "SELECT session_id,role,content,timestamp,display_kind,display_metadata,active,_compressed_summary,compacted "
+            "FROM messages WHERE id=?", (input_row_id,),
+        ).fetchone()
+        if (row is None or row["session_id"] not in origin_lineage
+                or not (row["active"] == 1 or row["active"] == 0 and row["compacted"] == 1)):
+            raise RunCustodyError("TASK_INPUT_MISSING")
+        if self._session_turn_lease_key_on_conn(conn, row["session_id"]) != root:
+            raise RunCustodyError("TASK_LINEAGE_MISMATCH")
+        try:
+            _, derived = self._context_message_origin_on_conn(conn, input_row_id, lineage)
+        except ContextContinuationError as exc:
+            raise RunCustodyError("TASK_INPUT_PROVENANCE_INVALID") from exc
+        if derived:
+            raise RunCustodyError("TASK_AUTHENTIC_INPUT_REQUIRED")
+        # Bind raw native provenance, not caller-provided plan/contract text or
+        # a generated summary. Synthetic user-role messages are not task anchors.
+        candidate = {"role": row["role"], "content": self._decode_content(row["content"]),
+                     "timestamp": row["timestamp"], "display_kind": row["display_kind"],
+                     "display_metadata": self._decode_display_metadata(row["display_metadata"])}
+        if row["_compressed_summary"] or user_originated_turn_view(candidate) is None:
+            raise RunCustodyError("TASK_AUTHENTIC_INPUT_REQUIRED")
+        # V1 binding bytes predate the compacted column and include active=1.
+        # Native compaction archives exact provenance; normalize only that
+        # storage flag so existing immutable bindings remain readable. A rewind
+        # (inactive/noncompacted), edited content or synthetic source still fails.
+        provenance = dict(row)
+        provenance.pop("compacted")
+        provenance["active"] = 1
+        return RunTaskBinding("SessionDBRunTaskBindingV1", run_id, str(root), profile_name,
+                              origin_session_id, row["session_id"], input_row_id,
+                              _sha(_json(provenance)))
+
+    def read_run_task_basis(self, *, run_id, origin_session_id, current_session_id, input_row_id):
+        """Observe a task binding and current controls; grants no custody."""
+        from hermes_state_continuity import ContextContinuationError
+
+        with self._read_ctx() as conn:
+            conn.execute("SAVEPOINT run_task_basis")
+            try:
+                binding = self._task_binding_on_conn(conn, run_id=run_id,
+                    origin_session_id=origin_session_id, current_session_id=current_session_id,
+                    input_row_id=input_row_id)
+                snapshot = self._read_context_rebase_snapshot_on_conn(conn, current_session_id)
+                return binding, snapshot.action_control_digest.removeprefix("sha256:")
+            except ContextContinuationError as exc:
+                raise RunCustodyError("TASK_CONTROL_UNAVAILABLE") from exc
+            finally:
+                conn.execute("ROLLBACK TO run_task_basis")
+                conn.execute("RELEASE run_task_basis")
+
+    def validate_run_task_binding(self, value):
+        """Read-only provenance check, including released/cold V2 custody."""
+        if type(value) is not RunCustodyV2:
+            raise RunCustodyError("INTEGRITY_TASK_SCHEMA")
+        with self._read_ctx() as conn:
+            conn.execute("SAVEPOINT run_task_binding")
+            try:
+                self._check_task_binding_on_conn(conn, value)
+            finally:
+                conn.execute("ROLLBACK TO run_task_binding")
+                conn.execute("RELEASE run_task_binding")
+        return value.task_binding
+
+    def _check_task_binding_on_conn(self, conn, value):
+        observed = self._task_binding_on_conn(conn, run_id=value.run_id,
+            origin_session_id=value.origin_session_id, current_session_id=value.current_session_id,
+            input_row_id=value.task_binding.input_row_id)
+        if observed != value.task_binding:
+            raise RunCustodyError("TASK_BINDING_MISMATCH")
+
+    def _record_run_recovery_files_on_conn(self, conn, value, files):
+        document = {"schema": "SessionDBRunRecoveryFilesV1", "run_id": value.run_id,
+                    "generation": value.generation, "checkpoint_digest": _checkpoint_digest(value),
+                    "history_digest": _history_digest(value),
+                    "files": _recovery_files(files, value.checkpoint)}
+        raw = _json(document)
+        key = generation_key(value.run_id, value.generation) + ":files"
+        if conn.execute("SELECT 1 FROM state_meta WHERE key=?", (key,)).fetchone():
+            raise RunCustodyError("RECOVERY_FILES_GENERATION_EXISTS")
+        conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?)", (key, raw))
+        conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?) "
+                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                     (f"run-custody:{value.run_id}:recovery-files",
+                      _json({"generation": value.generation, "digest": _sha(raw)})))
+
+    def read_run_recovery_files(self, value):
+        """Return exact persisted locators for the current head, never file truth."""
+        with self._read_ctx() as conn:
+            conn.execute("SAVEPOINT run_recovery_files")
+            try:
+                def read(key):
+                    row = conn.execute("SELECT value FROM state_meta WHERE key=?", (key,)).fetchone()
+                    return None if row is None else row[0]
+                head = _load(read(_head_key(value.run_id)))
+                if _decode_run_record(value.run_id, head["generation"], head["digest"], read) != value:
+                    raise RunCustodyError("FENCE_MISMATCH")
+                pointer_raw = read(f"run-custody:{value.run_id}:recovery-files")
+                if pointer_raw is None:
+                    raise RunCustodyError("RECOVERY_FILES_MISSING")
+                pointer = _load(pointer_raw)
+                if type(pointer) is not dict or set(pointer) != {"generation", "digest"}:
+                    raise RunCustodyError("RECOVERY_FILES_INVALID")
+                _integer(pointer["generation"])
+                _digest(pointer["digest"])
+                if pointer["generation"] > value.generation:
+                    raise RunCustodyError("RECOVERY_FILES_INVALID")
+                raw = read(generation_key(value.run_id, pointer["generation"]) + ":files")
+                if raw is None or _sha(raw) != pointer["digest"]:
+                    raise RunCustodyError("RECOVERY_FILES_INVALID")
+                document = _load(raw)
+                if (type(document) is not dict or set(document) != {
+                        "schema", "run_id", "generation", "checkpoint_digest", "history_digest", "files"}
+                        or document["schema"] != "SessionDBRunRecoveryFilesV1"
+                        or document["run_id"] != value.run_id
+                        or document["generation"] != pointer["generation"]):
+                    raise RunCustodyError("RECOVERY_FILES_INVALID")
+                if (document["checkpoint_digest"] != _checkpoint_digest(value)
+                        or document["history_digest"] != _history_digest(value)):
+                    raise RunCustodyError("RECOVERY_FILES_STALE")
+                return _recovery_files(document["files"], value.checkpoint)
+            finally:
+                conn.execute("ROLLBACK TO run_recovery_files")
+                conn.execute("RELEASE run_recovery_files")
+
+    def _check_run_claim_predecessor_on_conn(self, conn, expected_head, value, *, require_dead):
+        if expected_head is None:
+            if require_dead:
+                raise RunCustodyError("RECOVERY_PREDECESSOR_REQUIRED")
+            return
+        head = _load(expected_head)
+        def read(key):
+            row = conn.execute("SELECT value FROM state_meta WHERE key=?", (key,)).fetchone()
+            return None if row is None else row[0]
+        prior = _decode_run_record(value.run_id, head["generation"], head["digest"], read)
+        if require_dead and prior.disposition != "active":
+            raise RunCustodyError("RECOVERY_ACTIVE_PREDECESSOR_REQUIRED")
+        if prior.disposition == "active" and _process_identity(prior.controller_pid) == prior.process_identity:
+            raise RunCustodyError("OWNER_ACTIVE")
+
+    def _check_run_control_on_conn(self, conn, session_id, expected_control_digest):
+        from hermes_state_continuity import ContextContinuationError
+        _digest(expected_control_digest)
+        try:
+            snapshot = self._read_context_rebase_snapshot_on_conn(conn, session_id)
+            if snapshot.action_control_digest != "sha256:" + expected_control_digest:
+                raise RunCustodyError("TASK_CONTROL_CHANGED")
+            if snapshot.custody_recovery_stopped:
+                raise RunCustodyError("TASK_STOPPED")
+        except ContextContinuationError as exc:
+            raise RunCustodyError("TASK_CONTROL_UNAVAILABLE") from exc
+
+    def bind_run_recovery_files_checked(self, run_id, *, owner_token, expected_generation,
+                                        lease_holder, expected_control_digest, files, ttl_seconds=300):
+        """Advance the owned generation with independently verified file locators.
+
+        Private file client performs observations. Native owner checks the head,
+        history, current controls and lease; no filesystem atomicity is implied.
+        """
+        _text(lease_holder)
+        raw, old = self._owned_run(run_id, owner_token, expected_generation)
+        files = _recovery_files(files, old.checkpoint)
+        value = replace(old, generation=old.generation + 1, predecessor_digest=_load(raw)["digest"],
+                        expires_monotonic_ns=_ttl(ttl_seconds))
+        def validate(conn):
+            self._check_run_control_on_conn(conn, value.current_session_id, expected_control_digest)
+            self._record_run_recovery_files_on_conn(conn, value, files)
+        return self._commit_run(raw, value, predecessor_expires_ns=old.expires_monotonic_ns,
+                                claim_lease_holder=lease_holder, validate_conn=validate)
 
     def _check_run_claim_bindings(self, conn, value, lease_holder):
         """Native checks on the admitted connection, not external authority."""
@@ -381,6 +709,9 @@ class SessionRunCustodyMixin:
             raise RunCustodyError("LEASE_MISMATCH") from exc
         if not math.isfinite(expiry) or expiry <= time.time():
             raise RunCustodyError("LEASE_MISMATCH")
+        if type(value) is RunCustodyV2:
+            self._check_task_binding_on_conn(conn, value)
+            return
         goal_key = dict(value.checkpoint.members).get("historical-goal-key")
         if not goal_key:
             raise RunCustodyError("HISTORICAL_GOAL_BINDING_MISSING")
@@ -390,45 +721,57 @@ class SessionRunCustodyMixin:
 
     def _commit_run(self, expected_head, value, *, require_live_owner=True,
                     predecessor_expires_ns=None, claim_lease_holder=None,
-                    refresh_reference=None):
+                    refresh_reference=None, validate_conn=None):
+        return self._execute_write(lambda conn: self._commit_run_on_conn(
+            conn, expected_head, value, require_live_owner=require_live_owner,
+            predecessor_expires_ns=predecessor_expires_ns,
+            claim_lease_holder=claim_lease_holder,
+            refresh_reference=refresh_reference, validate_conn=validate_conn,
+        ))
+
+    def _commit_run_on_conn(self, conn, expected_head, value, *, require_live_owner=True,
+                            predecessor_expires_ns=None, claim_lease_holder=None,
+                            refresh_reference=None, validate_conn=None):
+        """Native custody checks/writes composable with one admitted owner transaction."""
         document = asdict(value)
         if refresh_reference is not None:
             document.pop("checkpoint")
-            document = {"schema": _REFRESH_SCHEMA, "custody": document,
+            refresh_schema = "SessionDBRunCustodyRefreshV2" if type(value) is RunCustodyV2 else _REFRESH_SCHEMA
+            document = {"schema": refresh_schema, "custody": document,
                         "checkpoint_reference": refresh_reference}
         raw = _json(document)
         head = _json({"generation": value.generation, "digest": _sha(raw)})
         key = _head_key(value.run_id)
         member_key = generation_key(value.run_id, value.generation)
 
-        def write(conn):
-            row = conn.execute("SELECT value FROM state_meta WHERE key=?", (key,)).fetchone()
-            if (None if row is None else row[0]) != expected_head:
-                raise RunCustodyError("FENCE_MISMATCH")
-            # Recheck after waiting for SQLite admission, not only before it.
-            if require_live_owner:
-                if predecessor_expires_ns is not None and time.monotonic_ns() >= predecessor_expires_ns:
-                    raise RunCustodyError("OWNER_EXPIRED")
-                if _controller(value.controller_pid) != value.process_identity:
-                    raise RunCustodyError("STALE_PROCESS")
-                if time.monotonic_ns() >= value.expires_monotonic_ns:
-                    raise RunCustodyError("OWNER_EXPIRED")
-            if conn.execute("SELECT 1 FROM state_meta WHERE key=?", (member_key,)).fetchone():
-                raise RunCustodyError("INTEGRITY_GENERATION_EXISTS")
-            if claim_lease_holder is not None:
-                self._check_run_claim_bindings(conn, value, claim_lease_holder)
-            if refresh_reference is not None:
-                def read_value(record_key):
-                    if record_key == member_key:
-                        return raw
-                    row = conn.execute("SELECT value FROM state_meta WHERE key=?", (record_key,)).fetchone()
-                    return None if row is None else row[0]
-                if _decode_run_record(value.run_id, value.generation, _sha(raw), read_value) != value:
-                    raise RunCustodyError("INTEGRITY_REFRESH_VALUE")
-            conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?)", (member_key, raw))
-            conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?) "
-                         "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, head))
-        self._execute_write(write)
+        row = conn.execute("SELECT value FROM state_meta WHERE key=?", (key,)).fetchone()
+        if (None if row is None else row[0]) != expected_head:
+            raise RunCustodyError("FENCE_MISMATCH")
+        # Recheck after waiting for SQLite admission, not only before it.
+        if require_live_owner:
+            if predecessor_expires_ns is not None and time.monotonic_ns() >= predecessor_expires_ns:
+                raise RunCustodyError("OWNER_EXPIRED")
+            if _controller(value.controller_pid) != value.process_identity:
+                raise RunCustodyError("STALE_PROCESS")
+            if time.monotonic_ns() >= value.expires_monotonic_ns:
+                raise RunCustodyError("OWNER_EXPIRED")
+        if conn.execute("SELECT 1 FROM state_meta WHERE key=?", (member_key,)).fetchone():
+            raise RunCustodyError("INTEGRITY_GENERATION_EXISTS")
+        if claim_lease_holder is not None:
+            self._check_run_claim_bindings(conn, value, claim_lease_holder)
+        if validate_conn is not None:
+            validate_conn(conn)
+        if refresh_reference is not None:
+            def read_value(record_key):
+                if record_key == member_key:
+                    return raw
+                row = conn.execute("SELECT value FROM state_meta WHERE key=?", (record_key,)).fetchone()
+                return None if row is None else row[0]
+            if _decode_run_record(value.run_id, value.generation, _sha(raw), read_value) != value:
+                raise RunCustodyError("INTEGRITY_REFRESH_VALUE")
+        conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?)", (member_key, raw))
+        conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?) "
+                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, head))
         return value
 
     def claim_run_custody(self, run_id, *, expected_generation, checkpoint,
@@ -443,7 +786,9 @@ class SessionRunCustodyMixin:
 
     def claim_run_custody_checked(self, run_id, *, lease_holder, expected_generation,
                                   checkpoint, origin_session_id, current_session_id,
-                                  historical_goal_digest, ttl_seconds=300, controller_pid=None):
+                                  historical_goal_digest, ttl_seconds=300, controller_pid=None,
+                                  recovery_files=None, expected_control_digest=None,
+                                  require_dead_predecessor=False, recovery_reservation=None):
         """Claim with native session/lease/goal checks in the commit transaction.
 
         The historical-goal key comes from the checkpoint's bound member.
@@ -456,7 +801,22 @@ class SessionRunCustodyMixin:
             checkpoint=checkpoint, origin_session_id=origin_session_id,
             current_session_id=current_session_id, historical_goal_digest=historical_goal_digest,
             ttl_seconds=ttl_seconds, controller_pid=controller_pid)
-        return self._commit_run(raw, value, claim_lease_holder=lease_holder)
+        if type(require_dead_predecessor) is not bool:
+            raise RunCustodyError("INVALID_RECOVERY_MODE")
+        if require_dead_predecessor:
+            _digest(expected_control_digest)
+            _recovery_files(recovery_files, checkpoint)
+        def validate(conn):
+            self._check_run_claim_predecessor_on_conn(conn, raw, value, require_dead=require_dead_predecessor)
+            if recovery_reservation is not None:
+                if recovery_reservation.get("control_digest") != "sha256:" + expected_control_digest:
+                    raise RunCustodyError("TASK_CONTROL_CHANGED")
+                self._assert_context_recovery_reservation_on_conn(conn, current_session_id, lease_holder, recovery_reservation)
+            if expected_control_digest is not None:
+                self._check_run_control_on_conn(conn, current_session_id, expected_control_digest)
+            if recovery_files is not None:
+                self._record_run_recovery_files_on_conn(conn, value, recovery_files)
+        return self._commit_run(raw, value, claim_lease_holder=lease_holder, validate_conn=validate)
 
     def _prepare_run_claim(self, run_id, *, expected_generation, checkpoint,
                            origin_session_id, current_session_id,
@@ -470,6 +830,8 @@ class SessionRunCustodyMixin:
         if (0 if old is None else old.generation) != expected_generation:
             raise RunCustodyError("FENCE_MISMATCH")
         if old is not None:
+            if type(old) is not RunCustody:
+                raise RunCustodyError("HISTORY_SCHEMA_MISMATCH")
             if old.disposition == "active" and _process_identity(old.controller_pid) == old.process_identity:
                 # Expiry alone never grants a competing writer takeover.
                 raise RunCustodyError("OWNER_ACTIVE")
@@ -483,6 +845,56 @@ class SessionRunCustodyMixin:
             identity, origin_session_id, current_session_id, historical_goal_digest,
             _ttl(ttl_seconds), "active", checkpoint)
         return raw, value
+
+    def claim_run_task_custody_checked(self, run_id, *, lease_holder, expected_generation,
+                                       checkpoint, task_binding, current_session_id,
+                                       expected_control_digest, ttl_seconds=300, controller_pid=None,
+                                       recovery_files=None, require_dead_predecessor=False, recovery_reservation=None):
+        """V2 ordinary-task custody, always checked by the native owner.
+
+        No V1 migration, synthetic goal, or unchecked claim is implied. A dead
+        process takeover retains the exact binding/checkpoint and uses a fresh
+        token, generation, live root lease and current control observation.
+        """
+        _text(lease_holder)
+        _integer(expected_generation, 0)
+        _digest(expected_control_digest)
+        if type(require_dead_predecessor) is not bool:
+            raise RunCustodyError("INVALID_RECOVERY_MODE")
+        if type(checkpoint) is not RunCheckpoint or type(task_binding) is not RunTaskBinding:
+            raise RunCustodyError("INVALID_CHECKPOINT")
+        if require_dead_predecessor:
+            _recovery_files(recovery_files, checkpoint)
+        pid = os.getpid() if controller_pid is None else controller_pid
+        identity = _controller(pid)
+        raw, old = self._read_run_head(run_id)
+        if (0 if old is None else old.generation) != expected_generation:
+            raise RunCustodyError("FENCE_MISMATCH")
+        if old is not None:
+            if type(old) is not RunCustodyV2:
+                raise RunCustodyError("HISTORY_SCHEMA_MISMATCH")
+            if old.disposition == "active" and _process_identity(old.controller_pid) == old.process_identity:
+                raise RunCustodyError("OWNER_ACTIVE")
+            if task_binding != old.task_binding or current_session_id != old.current_session_id:
+                raise RunCustodyError("HISTORY_MISMATCH")
+            if checkpoint != old.checkpoint:
+                raise RunCustodyError("TAKEOVER_REQUIRES_EXACT_CHECKPOINT")
+        value = RunCustodyV2("SessionDBRunCustodyV2", run_id, expected_generation + 1,
+            None if old is None else _load(raw)["digest"], secrets.token_hex(32), pid, identity,
+            task_binding.origin_session_id, current_session_id, task_binding,
+            _ttl(ttl_seconds), "active", checkpoint)
+
+        def validate(conn):
+            self._check_run_claim_predecessor_on_conn(conn, raw, value, require_dead=require_dead_predecessor)
+            if recovery_reservation is not None:
+                if recovery_reservation.get("control_digest") != "sha256:" + expected_control_digest:
+                    raise RunCustodyError("TASK_CONTROL_CHANGED")
+                self._assert_context_recovery_reservation_on_conn(conn, current_session_id, lease_holder, recovery_reservation)
+            self._check_run_control_on_conn(conn, current_session_id, expected_control_digest)
+            if recovery_files is not None:
+                self._record_run_recovery_files_on_conn(conn, value, recovery_files)
+
+        return self._commit_run(raw, value, claim_lease_holder=lease_holder, validate_conn=validate)
 
     def _owned_run(self, run_id, owner_token, expected_generation, *, allow_expired=False):
         _integer(expected_generation)
@@ -543,6 +955,140 @@ class SessionRunCustodyMixin:
                         expires_monotonic_ns=_ttl(ttl_seconds))
         return self._commit_run(raw, value, predecessor_expires_ns=old.expires_monotonic_ns)
 
+    def transfer_run_session(self, run_id, *, owner_token, expected_generation,
+                             expected_session_id, new_session_id, ttl_seconds=300):
+        """Fence one live custody owner onto a published continuation session.
+
+        This retains the same checkpoint, historical binding, owner token and
+        process identity. It is not a release/reclaim and grants no downstream
+        effect authority. Both old and new session identities are checked in
+        the same SessionDB write transaction that advances custody generation.
+        """
+        _text(expected_session_id)
+        _text(new_session_id)
+        raw, old = self._owned_run(run_id, owner_token, expected_generation)
+        if old.current_session_id != expected_session_id:
+            raise RunCustodyError("SESSION_MISMATCH")
+        value = replace(
+            old,
+            generation=old.generation + 1,
+            predecessor_digest=_load(raw)["digest"],
+            current_session_id=new_session_id,
+            expires_monotonic_ns=_ttl(ttl_seconds),
+        )
+
+        def validate(conn):
+            prior = conn.execute(
+                "SELECT ended_at,end_reason FROM sessions WHERE id=?",
+                (expected_session_id,),
+            ).fetchone()
+            child = conn.execute(
+                "SELECT ended_at,parent_session_id,model_config FROM sessions WHERE id=?",
+                (new_session_id,),
+            ).fetchone()
+            if (
+                prior is None
+                or prior["ended_at"] is None
+                or prior["end_reason"] not in ("compression", "context_rebase")
+                or child is None
+                or child["ended_at"] is not None
+                or child["parent_session_id"] != expected_session_id
+            ):
+                raise RunCustodyError("SESSION_TRANSITION_MISMATCH")
+            if prior["end_reason"] == "context_rebase":
+                try:
+                    config = json.loads(child["model_config"] or "{}")
+                except (TypeError, ValueError) as exc:
+                    raise RunCustodyError("SESSION_TRANSITION_MISMATCH") from exc
+                if (
+                    type(config) is not dict
+                    or config.get("_context_rebase_from") != expected_session_id
+                ):
+                    raise RunCustodyError("SESSION_TRANSITION_MISMATCH")
+            if type(value) is RunCustodyV2:
+                self._check_task_binding_on_conn(conn, value)
+
+        return self._commit_run(
+            raw,
+            value,
+            predecessor_expires_ns=old.expires_monotonic_ns,
+            validate_conn=validate,
+        )
+
+    def _run_custodies_for_session_on_conn(self, conn, session_id, *, active_only=True):
+        return self._run_custodies_for_sessions_on_conn(conn, {session_id}, active_only=active_only)
+
+    def _run_custodies_for_sessions_on_conn(self, conn, session_ids, *, active_only=True):
+        """Read canonical heads once; release never settles their obligations."""
+        heads = conn.execute(
+            "SELECT key,value FROM state_meta WHERE key GLOB 'run-custody:*:head' LIMIT 1025"
+        ).fetchall()
+        if len(heads) > 1024:
+            raise RunCustodyError("CUSTODY_INVENTORY_BOUND_EXCEEDED")
+
+        def read(key):
+            row = conn.execute("SELECT value FROM state_meta WHERE key=?", (key,)).fetchone()
+            return None if row is None else row[0]
+
+        current = {}
+        for key, raw in heads:
+            match = re.fullmatch(r"run-custody:([A-Za-z0-9][A-Za-z0-9_.-]{0,127}):head", key)
+            if match is None:
+                raise RunCustodyError("INTEGRITY_HEAD")
+            head = _load(raw)
+            value = _decode_run_record(match.group(1), head["generation"], head["digest"], read)
+            if (not active_only or value.disposition == "active") and value.current_session_id in session_ids:
+                current[value.run_id] = (raw, value)
+        return current
+
+    def _check_context_ready_custodies_on_conn(self, conn, session_id, expected, lease_holder):
+        if type(expected) is not tuple or any(type(value) not in (RunCustody, RunCustodyV2) for value in expected):
+            raise RunCustodyError("INVALID_CUSTODY_TRANSFER_SET")
+        requested = {value.run_id: value for value in expected}
+        current = self._run_custodies_for_session_on_conn(conn, session_id)
+        if len(requested) != len(expected) or set(current) != set(requested):
+            raise RunCustodyError("CONTEXT_REBASE_CUSTODY_SET_MISMATCH")
+        for run_id, (_, value) in current.items():
+            if requested[run_id] != value:
+                raise RunCustodyError("FENCE_MISMATCH")
+            if _controller(value.controller_pid) != value.process_identity:
+                raise RunCustodyError("STALE_PROCESS")
+            if time.monotonic_ns() >= value.expires_monotonic_ns:
+                raise RunCustodyError("OWNER_EXPIRED")
+            self._check_run_claim_bindings(conn, value, lease_holder)
+
+    def _transfer_context_rebase_custodies_on_conn(
+        self, conn, *, old_session_id, new_session_id, expected, lease_holder,
+    ):
+        """Transfer the complete native custody set inside child publication.
+
+        The supplied handles prove ownership, never select the participant set.
+        The native store derives that set and refuses omissions or stale heads.
+        """
+        if type(expected) is not tuple or any(type(value) not in (RunCustody, RunCustodyV2) for value in expected):
+            raise RunCustodyError("INVALID_CUSTODY_TRANSFER_SET")
+        requested = {value.run_id: value for value in expected}
+        if len(requested) != len(expected):
+            raise RunCustodyError("INVALID_CUSTODY_TRANSFER_SET")
+        current = self._run_custodies_for_session_on_conn(conn, old_session_id)
+        if set(current) != set(requested):
+            raise RunCustodyError("CONTEXT_REBASE_CUSTODY_SET_MISMATCH")
+        updated = []
+        for run_id, (raw, old) in current.items():
+            if requested[run_id] != old:
+                raise RunCustodyError("FENCE_MISMATCH")
+            if dict(old.checkpoint.members).get("historical-goal-key") == f"goal:{old_session_id}":
+                raise RunCustodyError("HISTORICAL_GOAL_ALIAS_COLLISION")
+            value = replace(
+                old, generation=old.generation + 1,
+                predecessor_digest=_load(raw)["digest"], current_session_id=new_session_id,
+            )
+            updated.append(self._commit_run_on_conn(
+                conn, raw, value, predecessor_expires_ns=old.expires_monotonic_ns,
+                claim_lease_holder=lease_holder,
+            ))
+        return tuple(updated)
+
     def refresh_run_custody(self, run_id, *, owner_token, expected_generation, ttl_seconds=300):
         raw, old = self._owned_run(run_id, owner_token, expected_generation)
         member = self.get_meta(generation_key(run_id, old.generation))
@@ -550,7 +1096,7 @@ class SessionRunCustodyMixin:
         if member is None or _sha(member) != old_digest:
             raise RunCustodyError("INTEGRITY_MEMBER")
         document = _load(member)
-        if document.get("schema") == "SessionDBRunCustodyV1":
+        if document.get("schema") in _CUSTODY_SCHEMAS:
             reference = {"generation": old.generation, "digest": old_digest}
         else:
             _, reference = _refresh_parts(document)
@@ -558,6 +1104,43 @@ class SessionRunCustodyMixin:
                         expires_monotonic_ns=_ttl(ttl_seconds))
         return self._commit_run(raw, value, predecessor_expires_ns=old.expires_monotonic_ns,
                                 refresh_reference=reference)
+
+    def renew_run_custody_for_context_recovery(self, run_id, *, owner_token, expected_generation,
+                                              lease_holder, recovery_reservation, files):
+        """Renew retained same-process custody only within a native recovery attempt.
+
+        Expiry is never proof of death or a generic renewal grant. The executing
+        controller must still hold its private token and re-observe checkpoint
+        files through the private file client. No checkpoint or task is advanced.
+        """
+        from hermes_state_continuity import ContextContinuationError
+        _text(lease_holder)
+        if type(recovery_reservation) is not dict:
+            raise RunCustodyError("RECOVERY_RESERVATION_REQUIRED")
+        raw, old = self._owned_run(run_id, owner_token, expected_generation, allow_expired=True)
+        if old.controller_pid != os.getpid():
+            raise RunCustodyError("RECOVERY_SAME_PROCESS_REQUIRED")
+        if time.monotonic_ns() < old.expires_monotonic_ns:
+            raise RunCustodyError("RECOVERY_OWNER_NOT_EXPIRED")
+        files = _recovery_files(files, old.checkpoint)
+        if files != self.read_run_recovery_files(old):
+            raise RunCustodyError("RECOVERY_FILES_CHANGED")
+        value = replace(old, generation=old.generation + 1, predecessor_digest=_load(raw)["digest"],
+                        expires_monotonic_ns=_ttl(300))
+        def validate(conn):
+            try:
+                self._assert_context_recovery_reservation_on_conn(
+                    conn, value.current_session_id, lease_holder, recovery_reservation)
+            except ContextContinuationError as exc:
+                raise RunCustodyError(exc.code) from None
+            control = recovery_reservation.get("control_digest")
+            if type(control) is not str or not control.startswith("sha256:"):
+                raise RunCustodyError("TASK_CONTROL_CHANGED")
+            self._check_run_control_on_conn(conn, value.current_session_id, control.removeprefix("sha256:"))
+            self._record_run_recovery_files_on_conn(conn, value, files)
+        # This explicit reservation replaces only the predecessor-expiry check.
+        # CAS, process liveness, new expiry and actual root lease remain native.
+        return self._commit_run(raw, value, claim_lease_holder=lease_holder, validate_conn=validate)
 
     def release_run_custody(self, run_id, *, owner_token, expected_generation):
         raw, old = self._owned_run(run_id, owner_token, expected_generation, allow_expired=True)

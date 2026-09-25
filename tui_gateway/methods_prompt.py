@@ -362,9 +362,23 @@ def _(rid, params: dict) -> dict:
     # or fallback moved the session transport to stdio.
     if (t := current_transport()) is not None:
         session["transport"] = t
+    input_receipt = None
     while True:
         busy_transport = None
         with session["history_lock"]:
+            # Refusals must precede durable acceptance, including busy ACKs.
+            # A watch child's run belongs to its parent, so running alone
+            # cannot establish that this session is available for input.
+            if input_receipt is None and session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
+                return _err(rid, 4009, "subagent still running — wait for it to finish")
+            if is_truthy_value(params.get("confirm_truncate")) and not has_truncation:
+                return _err(rid, 4004, "confirm_truncate requires truncate_before_user_ordinal, truncate_before_message_id, or truncate_before_row_id")
+            if not has_truncation and input_receipt is None:
+                try:
+                    input_receipt = _accept_tui_context_input(session, text,
+                        event_id=params.get("input_event_id"), display_kind=display_kind)
+                except Exception as exc:
+                    return _err(rid, 5071, str(exc))
             if session.get("running"):
                 # Don't reject a mid-turn prompt — queue it (and, by default,
                 # interrupt the live turn) so it runs as the next turn. The
@@ -376,6 +390,7 @@ def _(rid, params: dict) -> dict:
         busy_response = _handle_busy_submit(
             rid, sid, session, text, busy_transport,
             queued=bool(params.get("queued")),
+            **({"context_input_event_id": input_receipt.event_id} if input_receipt is not None else {}),
         )
         if busy_response is not None:
             return busy_response
@@ -404,7 +419,7 @@ def _(rid, params: dict) -> dict:
         # racing the in-flight child on the same stored session (interleaved
         # transcript, stale fork). After the run completes, submitting is fine:
         # the upgrade resumes the child's transcript as a normal conversation.
-        if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
+        if has_truncation and session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
             return _err(rid, 4009, "subagent still running — wait for it to finish")
         truncate_message_id = params.get("truncate_before_message_id")
         truncate_row_id = params.get("truncate_before_row_id")
@@ -815,8 +830,18 @@ def _(rid, params: dict) -> dict:
         _start_inflight_turn(session, text)
 
     if turn_isolation:
+        if has_truncation:
+            try:
+                input_receipt = _accept_tui_context_input(session, text,
+                    event_id=params.get("input_event_id"), display_kind=display_kind)
+            except Exception as exc:
+                with session["history_lock"]:
+                    session["running"] = False
+                    _clear_inflight_turn(session)
+                return _err(rid, 5071, str(exc))
         isolated_response = _submit_prompt_to_compute_host(
-            rid, sid, session, text, display_kind=display_kind
+            rid, sid, session, text, display_kind=display_kind,
+            **({"context_input_event_id": input_receipt.event_id} if input_receipt is not None else {}),
         )
         if not isolated_response.get("error"):
             if survivor_user_row_ids is not None and requested_rebind_ids is None:
@@ -843,6 +868,9 @@ def _(rid, params: dict) -> dict:
         # A branch becomes real here: copy its parent's transcript into the row so it
         # resumes with full context (the agent won't persist the seed itself).
         _persist_branch_seed(session)
+        if has_truncation:
+            input_receipt = _accept_tui_context_input(session, text,
+                event_id=params.get("input_event_id"), display_kind=display_kind)
     except Exception as exc:
         from hermes_state import is_disk_full_error
 
@@ -908,7 +936,8 @@ def _(rid, params: dict) -> dict:
                     },
                 )
                 return
-        _run_prompt_submit(rid, sid, session, text, display_kind=display_kind)
+        _run_prompt_submit(rid, sid, session, text, display_kind=display_kind,
+            **({"context_input_event_id": input_receipt.event_id} if input_receipt is not None else {}))
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
     # Keep a handle so session.interrupt can tell a live turn from a stuck
@@ -919,6 +948,7 @@ def _(rid, params: dict) -> dict:
         rid,
         {
             "status": "streaming",
+            **({"input_event_id": input_receipt.event_id} if input_receipt is not None else {}),
             **(
                 {"survivor_user_row_ids": survivor_user_row_ids}
                 if survivor_user_row_ids is not None

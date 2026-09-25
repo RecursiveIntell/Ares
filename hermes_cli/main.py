@@ -14585,6 +14585,8 @@ def main():
     # profile command  (parser built in hermes_cli/subcommands/profile.py)
     # =========================================================================
     build_profile_parser(subparsers, cmd_profile=cmd_profile)
+    from hermes_cli.context_authority import build_context_authority_parser
+    build_context_authority_parser(subparsers)
 
     # =========================================================================
     # completion command

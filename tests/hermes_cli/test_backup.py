@@ -497,6 +497,27 @@ class TestImport:
 # ---------------------------------------------------------------------------
 
 class TestRoundTrip:
+    def test_import_preserves_local_controller_key_and_rejects_foreign_keys(self, tmp_path, monkeypatch):
+        from hermes_cli.backup import run_import
+
+        home = tmp_path / "home"
+        root = home / ".hermes"
+        keys = root / "context-controller-keys"
+        keys.mkdir(parents=True)
+        (keys / "local.key").write_bytes(b"local-only")
+        monkeypatch.setenv("HERMES_HOME", str(root))
+        monkeypatch.setattr(Path, "home", lambda: home)
+        archive = tmp_path / "foreign.zip"
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr("config.yaml", "model: test\n")
+            zf.writestr("context-controller-keys/local.key", "replacement")
+            zf.writestr("profiles/p/context-controller-keys/foreign.key", "foreign")
+            zf.writestr("_external/.hermes/context-controller-keys/external.key", "foreign")
+        run_import(Namespace(zipfile=str(archive), force=True))
+        assert (keys / "local.key").read_bytes() == b"local-only"
+        assert not (keys / "external.key").exists()
+        assert not (root / "profiles/p/context-controller-keys/foreign.key").exists()
+
     def test_backup_then_import(self, tmp_path, monkeypatch):
         """Full round-trip: backup -> import to a new location -> verify."""
         # Source
@@ -1850,7 +1871,6 @@ class TestMemoryProviderExternalPaths:
         assert (restored.stat().st_mode & 0o777) == 0o600
         # External state did NOT leak into HERMES_HOME.
         assert not (hermes_home / "_external").exists()
-
 
 
 
