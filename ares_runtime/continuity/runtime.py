@@ -458,6 +458,18 @@ def attempt_turn_start_context_rebase(
             model_config = json.loads(model_config or "{}")
         if not isinstance(model_config, dict):
             model_config = {}
+        else:
+            model_config = dict(model_config)
+        # These fields describe the physical continuation edge, not model
+        # configuration that may be inherited into the next epoch. The
+        # SessionDB owner derives the next epoch from the parent row and stamps
+        # a fresh authenticated edge below.
+        for reserved_key in (
+            "_context_rebase_from",
+            "_context_rebase_transition",
+            "_context_epoch",
+        ):
+            model_config.pop(reserved_key, None)
         db.publish_context_rebase_child(
             transition_id=transition_id,
             parent_session_id=parent_session_id,
