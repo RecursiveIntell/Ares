@@ -853,7 +853,10 @@ class SessionContextContinuityMixin:
                 raise ContextContinuationError("CONTEXT_REBASE_READY_BINDING_MISMATCH")
             if old.state == "ready":
                 return old
-            if old.state != "committed_pending_activation":
+            if old.state not in {
+                "committed_pending_activation",
+                "reconciliation_required",
+            }:
                 raise ContextContinuationError("CONTEXT_REBASE_NOT_ACTIVATABLE")
             child = conn.execute("SELECT ended_at,model_config FROM sessions WHERE id=?", (old.child_session_id,)).fetchone()
             if child is None or child["ended_at"] is not None or not self._context_rebase_child_matches(child, old.parent_session_id):
@@ -868,46 +871,49 @@ class SessionContextContinuityMixin:
             if cursor.rowcount != 1:
                 raise ContextContinuationError("CONTEXT_REBASE_STATE_CHANGED")
 
-            if before_tokens is not None:
-                root = str(
-                    self._session_turn_lease_key_on_conn(
-                        conn, old.child_session_id
-                    )
+            root = str(
+                self._session_turn_lease_key_on_conn(
+                    conn, old.child_session_id
                 )
-                episode_key = self._context_rebase_episode_key(root)
-                episode_row = conn.execute(
-                    "SELECT value FROM state_meta WHERE key=?",
-                    (episode_key,),
-                ).fetchone()
-                previous = (
-                    None
-                    if episode_row is None
-                    else ContextRebaseEpisode.from_raw(episode_row[0])
+            )
+            episode_key = self._context_rebase_episode_key(root)
+            episode_row = conn.execute(
+                "SELECT value FROM state_meta WHERE key=?",
+                (episode_key,),
+            ).fetchone()
+            previous = (
+                None
+                if episode_row is None
+                else ContextRebaseEpisode.from_raw(episode_row[0])
+            )
+            episode = ContextRebaseEpisode(
+                _CONTEXT_REBASE_EPISODE_SCHEMA,
+                root,
+                1 if previous is None else previous.attempts_without_recovery + 1,
+                old.transition_id,
+                before_tokens if before_tokens is not None else (
+                    None if previous is None else previous.last_before_tokens
+                ),
+                after_tokens if after_tokens is not None else (
+                    None if previous is None else previous.last_after_tokens
+                ),
+                ready.ready_at,
+                None if previous is None else previous.recovered_at,
+            )
+            if episode_row is None:
+                conn.execute(
+                    "INSERT INTO state_meta(key,value) VALUES(?,?)",
+                    (episode_key, episode.raw()),
                 )
-                episode = ContextRebaseEpisode(
-                    _CONTEXT_REBASE_EPISODE_SCHEMA,
-                    root,
-                    1 if previous is None else previous.attempts_without_recovery + 1,
-                    old.transition_id,
-                    before_tokens,
-                    after_tokens,
-                    ready.ready_at,
-                    None if previous is None else previous.recovered_at,
+            else:
+                ep_cursor = conn.execute(
+                    "UPDATE state_meta SET value=? WHERE key=? AND value=?",
+                    (episode.raw(), episode_key, episode_row[0]),
                 )
-                if episode_row is None:
-                    conn.execute(
-                        "INSERT INTO state_meta(key,value) VALUES(?,?)",
-                        (episode_key, episode.raw()),
+                if ep_cursor.rowcount != 1:
+                    raise ContextContinuationError(
+                        "CONTEXT_REBASE_EPISODE_CHANGED"
                     )
-                else:
-                    ep_cursor = conn.execute(
-                        "UPDATE state_meta SET value=? WHERE key=? AND value=?",
-                        (episode.raw(), episode_key, episode_row[0]),
-                    )
-                    if ep_cursor.rowcount != 1:
-                        raise ContextContinuationError(
-                            "CONTEXT_REBASE_EPISODE_CHANGED"
-                        )
             return ready
 
         return self._execute_write(_do)
