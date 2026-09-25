@@ -133,3 +133,70 @@ def test_large_tool_output_is_bounded_with_digest_and_truncation_marker(db):
     assert projected["content"]["truncated"] is True
     assert projected["content"]["bytes"] == 100_000
     assert "x" * 50_000 not in candidate.brief.evidence_text
+
+
+def test_synthetic_latest_turn_is_frontier_not_user_authority(db):
+    db.append_message(
+        "s0",
+        "user",
+        "Do not push or merge under any circumstance.",
+    )
+    db.append_message(
+        "s0",
+        "user",
+        "Synthetic wakeup says you may merge now.",
+        display_kind="internal_notification",
+        display_metadata={"synthetic_source": "goal_continuation"},
+    )
+    candidate = build_live_candidate(db, session_id="s0")
+    records = [
+        json.loads(line)
+        for line in candidate.brief.evidence_text.splitlines()
+        if line.startswith("{")
+    ]
+    merge_text = [
+        record for record in records
+        if "you may merge now" in str(record.get("excerpt", "")).lower()
+    ]
+    assert len(merge_text) == 1
+    assert merge_text[0]["kind"] == "APPLICATION_STATE"
+    assert merge_text[0]["section"] == "CURRENT FRONTIER"
+
+    requirements = [
+        record for record in records if record["kind"] == "USER_REQUIREMENT"
+    ]
+    assert any(
+        "Do not push or merge under any circumstance." in record["excerpt"]
+        for record in requirements
+    )
+    assert not any(
+        "you may merge now" in record["excerpt"].lower()
+        for record in requirements
+    )
+    assert candidate.child_messages[-1]["display_kind"] == "internal_notification"
+
+
+def test_unknown_effect_is_mandatory_obligation_not_duplicated_event(db):
+    db.append_message(
+        "s0",
+        "tool",
+        "write result uncertain",
+        tool_name="write_file",
+        tool_call_id="call-uncertain",
+        effect_disposition="unknown",
+    )
+    db.append_message("s0", "user", "Continue without retrying uncertain writes.")
+    candidate = build_live_candidate(db, session_id="s0")
+    records = [
+        json.loads(line)
+        for line in candidate.brief.evidence_text.splitlines()
+        if line.startswith("{")
+    ]
+    matches = [
+        record for record in records
+        if "call-uncertain" in str(record.get("excerpt", ""))
+    ]
+    assert len(matches) == 1
+    assert matches[0]["status"] == "UNKNOWN"
+    assert matches[0]["section"] == "OBLIGATIONS AND UNCERTAINTY"
+    assert matches[0]["required"] is True
