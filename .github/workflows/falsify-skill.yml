@@ -1,0 +1,22 @@
+name: Optional falsify skill
+on:
+  pull_request:
+    paths:
+      - 'optional-skills/research/falsify/**'
+      - '.github/workflows/falsify-skill.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  bounded-runner:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Compile optional scripts
+        run: python3 -m compileall -q optional-skills/research/falsify/scripts
+      - name: Test process and filesystem boundaries
+        working-directory: optional-skills/research/falsify/scripts
+        run: python3 -m unittest -v test_falsify
