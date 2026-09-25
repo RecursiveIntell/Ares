@@ -491,6 +491,50 @@ def build_turn_context(
     if recovered_history is not None:
         conversation_history = recovered_history
 
+    # A context-rebase child is a durable local successor before it is
+    # necessarily safe for ordinary work. Crash/restart must not turn
+    # committed_pending_activation or reconciliation_required into implicit
+    # READY simply because resume routing found the child.
+    _continuity_db = getattr(agent, "_session_db", None)
+    _ready_check = (
+        getattr(type(_continuity_db), "assert_context_rebase_ready_for_turn", None)
+        if _continuity_db is not None
+        else None
+    )
+    if callable(_ready_check) and getattr(agent, "session_id", None):
+        _transition = _continuity_db.context_rebase_transition_for_session(agent.session_id)
+        if _transition is not None:
+            from ares_runtime.continuity.runtime import (
+                AutomaticRebaseError, reconcile_context_rebase,
+            )
+            _recovery = reconcile_context_rebase(agent)
+            if _recovery.ready:
+                conversation_history = list(_recovery.messages)
+            else:
+                # Preserve the arriving input even when recovery must park.
+                # Use the native transcript owner and its turn lease guard;
+                # a pending continuation must never acknowledge lost input.
+                _incoming = persist_user_message if persist_user_message is not None else user_message
+                if _incoming:
+                    _receipt = getattr(agent, "_context_input_receipt", None)
+                    if _receipt is not None:
+                        _continuity_db.append_messages_batch(_transition.child_session_id, [{
+                            "role": "user", "content": _receipt.content, "timestamp": _receipt.timestamp,
+                            "display_metadata": _receipt.display_metadata, "_context_input": {
+                                "conversation_root": _receipt.conversation_root, "sequence": _receipt.sequence,
+                                "payload_digest": _receipt.payload_digest},
+                        }], turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None))
+                    else:
+                        _continuity_db.append_message(
+                            _transition.child_session_id, "user", _incoming,
+                            timestamp=persist_user_timestamp,
+                            display_kind=persist_user_display_kind,
+                            display_metadata=persist_user_display_metadata,
+                            turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
+                        )
+                raise AutomaticRebaseError(_recovery.reason)
+        _ready_check(_continuity_db, agent.session_id)
+
     # NOTE: the DB session row is created later, AFTER the system prompt is
     # restored/built (see _ensure_db_session() below the system-prompt block).
     # Creating it here — before _cached_system_prompt is populated — inserts a
@@ -682,6 +726,10 @@ def build_turn_context(
     # CLI input is stamped when staged. Gateway input may carry the platform
     # event time. Preserve either value and cover any legacy unstamped handoff.
     stamp_message_timestamp(user_msg, timestamp=persist_user_timestamp)
+    existing_input = getattr(agent, "_context_input_existing_message", None)
+    if existing_input is not None:
+        user_msg = dict(existing_input)
+        user_msg["content"] = user_msg.get("api_content") or user_msg["content"]
 
     # Owner selection must also replace stale local state and explicit empty
     # state on history-free restarts. Legacy fallback stays inside hydration.
@@ -713,6 +761,10 @@ def build_turn_context(
         if persist_user_display_metadata:
             user_msg["display_metadata"] = persist_user_display_metadata
 
+    receipt = getattr(agent, "_context_input_receipt", None)
+    if receipt is not None:
+        user_msg["_context_input"] = {"conversation_root": receipt.conversation_root,
+            "sequence": receipt.sequence, "payload_digest": receipt.payload_digest}
     append_message(messages, user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
@@ -903,6 +955,8 @@ def build_turn_context(
     # issue #27405 (a few very large messages slipping past the count gate).
     _preflight_compressed = False
     _preflight_compression_blocked = False
+    _preflight_tokens = None
+    _compress_block_reason = None
     agent._turn_received_provider_response = False
     agent._turn_preflight_display_snapshot = None
     if (
@@ -970,7 +1024,6 @@ def build_turn_context(
         )()
 
         _should_compress_now = False
-        _compress_block_reason = None
         if _preflight_deferred:
             logger.info(
                 "Skipping preflight compression: rough estimate ~%s >= %s, "
@@ -1257,6 +1310,82 @@ def build_turn_context(
                     )
                     if callable(_clear_warn):
                         _clear_warn()
+
+    # Once ordinary turn-start compaction has proved blocked or stopped
+    # making useful progress, an explicitly qualified route may replace the
+    # model working set with a fresh source-bound continuation. This remains
+    # before the first provider/tool admission of the turn.
+    if (
+        getattr(agent, "context_rebase_enabled", False)
+        and isinstance(_preflight_tokens, int)
+        and _preflight_tokens > 0
+        and not _codex_native_auto
+        and (
+            _preflight_compression_blocked
+            or (
+                _compress_block_reason
+                and _preflight_tokens >= getattr(_compressor, "threshold_tokens", 0)
+            )
+        )
+    ):
+        from ares_runtime.continuity.runtime import (
+            AutomaticRebaseError,
+            AutomaticRebaseStatus,
+            attempt_turn_start_context_rebase,
+        )
+
+        _rebase = attempt_turn_start_context_rebase(
+            agent,
+            messages,
+            conversation_history=conversation_history,
+            active_system_prompt=active_system_prompt,
+            before_tokens=_preflight_tokens,
+        )
+        if _rebase.status is AutomaticRebaseStatus.READY:
+            messages = list(_rebase.messages)
+            conversation_history = list(_rebase.messages)
+            active_system_prompt = _rebase.system_prompt
+            _preflight_tokens = int(_rebase.after_tokens or 0)
+            _preflight_compressed = True
+            _preflight_compression_blocked = False
+            _compress_block_reason = None
+            agent._empty_content_retries = 0
+            agent._thinking_prefill_retries = 0
+            agent._last_content_with_tools = None
+            agent._last_content_tools_all_housekeeping = False
+            agent._mute_post_response = False
+            _clear_warn = getattr(agent, "_clear_context_overflow_warn", None)
+            if callable(_clear_warn):
+                _clear_warn()
+            agent._emit_status(
+                "↻ Context working set rebased from durable state; continuing turn..."
+            )
+        elif _rebase.status is AutomaticRebaseStatus.RECONCILIATION_REQUIRED:
+            agent._emit_warning(
+                "⚠ Context rebase was published but owner reconciliation did not "
+                "complete. Ordinary model/tool execution is stopped until the "
+                "committed successor is reconciled."
+            )
+            raise AutomaticRebaseError("CONTEXT_REBASE_RECONCILIATION_REQUIRED")
+        elif _rebase.status is AutomaticRebaseStatus.BLOCKED:
+            # A failed owner/source/effect check is not permission to send the
+            # stale or exhausted request through ordinary provider admission.
+            # Some refusals happen before the runtime's input flush. Preserve
+            # this authentic turn through the existing marker/lease-aware owner
+            # before exiting ahead of the normal late crash-resilience flush.
+            if _preflight_compressed:
+                agent._persist_user_message_idx = reanchor_current_turn_user_idx(
+                    messages, user_message
+                )
+            try:
+                if agent._flush_messages_to_session_db(
+                    messages, conversation_history=conversation_history
+                ) is False:
+                    agent._emit_warning("Blocked continuation input could not be persisted.")
+            except Exception:
+                logger.warning("Blocked continuation input persistence failed", exc_info=True)
+            agent._emit_warning(f"Context continuation blocked: {_rebase.reason}")
+            raise AutomaticRebaseError(_rebase.reason)
 
     if _preflight_compressed:
         # Compression rebuilt the list (tail messages are fresh compaction

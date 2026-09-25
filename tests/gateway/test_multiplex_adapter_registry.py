@@ -145,6 +145,9 @@ class _SecondaryRecoveryAdapter:
     def set_message_handler(self, handler):
         self.message_handler = handler
 
+    def set_input_acceptor(self, handler):
+        self.input_acceptor = handler
+
     def set_fatal_error_handler(self, handler):
         self.fatal_error_handler = handler
 
@@ -846,5 +849,4 @@ class TestFeishuPortBindingConditional:
 
         connected = await runner._start_one_profile_adapters("reviewer", "/tmp/x", {})
         assert connected == 0  # no error, just nothing connected
-
 

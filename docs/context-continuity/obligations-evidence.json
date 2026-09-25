@@ -1,0 +1,48 @@
+{
+  "schema": "ares.context-continuity.obligations-evidence/v1",
+  "base_commit": "bc889de041f8a1387d644741ac70d1fe285e2306",
+  "source_sha256": {
+    "ares_runtime/continuity/live.py": "00222e39470b71352817e24d82df8a0e62f8a8734521270fb806f27c0421ea90",
+    "hermes_state.py": "c93ab1e3baa347e4b2861d6f362b486b6f62b13524a1a85d5ed339728b8faae2",
+    "hermes_state_continuity.py": "1dc9901a80632d346e00fa5af578754a4d0ec89f759238e27af0ab5a9bcee1a1",
+    "hermes_state_inbox.py": "c64cad856ed63e3b1305c8e9de53d95e69b8e372b9897e6a2452edfb98970b77",
+    "hermes_state_runs.py": "7b1406ca8c0014ff3d04c61cb1db9f7b0e78005fac3055dcbff36c5a398f64b3",
+    "run_agent.py": "83ec7095e97bf6127b16727c5623bc755842604c1e7ec7381657adf236adaa74",
+    "tests/test_run_custody_obligations.py": "80e2ba1a41a41ad48f8668b42bb3e815ed48fac39369776fcb546078380dd7e2"
+  },
+  "scope": "Released obligations, compacted task anchors and owner-bound input occurrence provenance",
+  "validation": {
+    "passed": 2334,
+    "failed": 0,
+    "skipped": 4,
+    "files": 65,
+    "log": "obligations-test-run.log",
+    "independent_audit_passed": 176,
+    "ruff": "passed",
+    "git_diff_check": "passed"
+  },
+  "proofs": [
+    "Released checkpoint obligations survive typed same-profile continuation without reclaiming ownership",
+    "Archived authentic anchors retain exact legacy task binding digest; revocation and edits refuse",
+    "Native copy/projection receipts distinguish derived rows from first durable authentic input",
+    "Distinct equal-text equal-timestamp inputs remain distinct native occurrences",
+    "Real AIAgent preflight compaction preserves clean input and exact API sidecar in place and across rotation",
+    "Native materializer and publication retain one authentic occurrence across 105 continuation edges"
+  ],
+  "limits": [
+    "Native 105-edge witness is not automatic runtime or provider endurance",
+    "Legacy rows without owner provenance are not heuristically backfilled",
+    "Effect settlement and task completion authority are not introduced",
+    "Local Unix socket restriction excludes execute_code; hosted workflow retains full suite",
+    "Gateway, autonomous wake, external owner fences and selected route qualification remain required"
+  ],
+  "hosted_base": {
+    "commit": "bc889de041f8a1387d644741ac70d1fe285e2306",
+    "full_ci": 36135758138,
+    "focused_pr": 36135756687,
+    "focused_push": 36135751673,
+    "nix": 36135756657,
+    "docker": 36135756676,
+    "all_conclusions": "success"
+  }
+}

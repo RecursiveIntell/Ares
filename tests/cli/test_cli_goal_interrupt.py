@@ -43,6 +43,9 @@ def _make_cli_with_goal(session_id: str, goal_text: str = "build a thing"):
     """Build a minimal HermesCLI stub with an active goal wired in."""
     from cli import HermesCLI
     from hermes_cli.goals import GoalManager
+    from hermes_cli.goals import _get_session_db
+
+    _get_session_db().create_session(session_id, source="cli")
 
     cli = HermesCLI.__new__(HermesCLI)
     # State the hook + helpers touch directly.
@@ -180,7 +183,11 @@ class TestHealthyTurnStillRuns:
         # Continuation prompt must be queued.
         assert not cli._pending_input.empty()
         queued = cli._pending_input.get_nowait()
-        assert "Continuing toward your standing goal" in queued
+        assert "Continuing toward your standing goal" in queued.text
+        assert queued.display_kind == "internal_notification"
+        assert queued.display_metadata == {
+            "synthetic_source": "goal_continuation",
+        }
         assert mgr.state.status == "active"
 
     def test_clean_response_waits_for_completion_authority(self, hermes_home):

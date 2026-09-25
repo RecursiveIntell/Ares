@@ -1,0 +1,64 @@
+{
+  "schema": "ares.continuity-repair-evidence/v1",
+  "date": "2026-09-25",
+  "baseline": {
+    "commit": "e25246701ad00338d51961b35be87e2fde690b45",
+    "original_gate_files": 20,
+    "tests_passed": 946
+  },
+  "source_sha256": {
+    "agent/turn_context.py": "8ed44c03e3c88b2bcbc3aeac2551db4836f0facc33c670e2319bda4bb0ac8960",
+    "agent/conversation_loop.py": "d0e1bdadf7545551bdb3f894d18475447281872102ecb0b103b83cabc0fe7def",
+    "ares_runtime/continuity/live.py": "96aedf9d847cfdcd31bbfa401f60512d0b6222adc07ee76a0e8873ccffafb612",
+    "ares_runtime/continuity/runtime.py": "3ce20ea623db2246e8197e5dc878ba2026b57ace1eba67dc1bc7406fb944ec9e",
+    "hermes_state_continuity.py": "3975ed4c68b03994fa5298d48a193bab3f28a5e8abaf004284d7273c0ef56d3f",
+    "tests/ares_runtime/test_continuity_dispatch.py": "9034cb868ed4c6816ec043824bd1aa76cca83ba6775ff4240e1d048e36f06041",
+    "tests/ares_runtime/test_continuity_snapshot_races.py": "46c0ca8c19cb1eaff42bc16b479aaffcbffe730c9317f5375e774aab4df22e2f",
+    "tests/ares_runtime/test_context_rebase_state.py": "0de74e542240a2ca6024991315dfbdf3e71bd7c5470917e0d9696fc53bb7481b"
+  },
+  "scope": "Default automatic continuation: snapshot/publication races and blocked admission. Not whole V4 qualification.",
+  "independent_audit": {
+    "status": "passed",
+    "five_file_tests_passed": 74,
+    "final_dispatch_tests_passed": 12,
+    "finding_fixed": "Early turn-start refusal now persists authentic input through the existing owner.",
+    "limitation": "Nondefault recent_limit compilation is not publication-compatible."
+  },
+  "red_witnesses": {
+    "snapshot_regressions_failed": 8,
+    "dispatcher_regressions_failed": 8,
+    "log_sha256": {
+      "snapshot-red-corrected.log": "fe6048111d88f8ddfbf38c0dcbd453aadfc810b971cab65c1916b75d6cc2cb71",
+      "dispatch-red.log": "e8f5df9f2a459d228c2c52d2a7c7e40c7259500f5bcbe7a8301c9e99c381b171"
+    }
+  },
+  "invalidated_runs": [
+    {
+      "log": "qualification-env-invalidated.log",
+      "reason": "Concurrent uv run selected Python 3.14 and recreated the test environment during the run; excluded from qualification."
+    }
+  ],
+  "live_activation": false,
+  "paid_provider_calls": false,
+  "merged": false,
+  "final_gate": {
+    "files": 26,
+    "tests_passed": 1289,
+    "tests_failed": 0,
+    "exit_code": 0,
+    "duration_seconds": 92.9,
+    "python": "3.13.15",
+    "dependency_install": "uv sync --frozen --extra dev --extra anthropic --python 3.13",
+    "workers": 4,
+    "file_retries": 0,
+    "runner": "scripts/run_tests.sh",
+    "selection": ".github/workflows/context-continuity-qualification.yml",
+    "log": "repair-test-run.log",
+    "log_sha256": "2d8104e19fabe1c47ae8c89a1aafe9516f2c2c60938d8ea99b2448816e627f3c",
+    "uv_lock_sha256": "73638c0da4e9de226ff7422fec042418931c5e0e391e1a83d516cab7be0dcf94"
+  },
+  "lint": {
+    "ruff": "passed",
+    "git_diff_check": "passed"
+  }
+}

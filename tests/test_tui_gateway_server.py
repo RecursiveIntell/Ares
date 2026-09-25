@@ -6878,8 +6878,19 @@ def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
     monkeypatch.setattr(server, "_get_db", lambda: None)
     monkeypatch.setattr(server, "_emit", lambda *args, **_kwargs: emitted.append(args))
 
-    def _deliver(_rid, sid, session, text):
+    dispatch_metadata = []
+
+    def _deliver(
+        _rid,
+        sid,
+        session,
+        text,
+        *,
+        display_kind=None,
+        display_metadata=None,
+    ):
         delivered["a" if sid == "sid-a-live-handoff" else "b"].append(text)
+        dispatch_metadata.append((display_kind, display_metadata))
         session["running"] = False
 
     monkeypatch.setattr(server, "_run_prompt_submit", _deliver)
@@ -6908,6 +6919,12 @@ def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
         assert len(delivered["a"]) == 1
         assert "proc-live-handoff completed normally" in delivered["a"][0]
         assert delivered["b"] == []
+        assert dispatch_metadata == [
+            (
+                "internal_notification",
+                {"synthetic_source": "background_notification"},
+            )
+        ]
         assert isolated_queue.empty()
     finally:
         server._sessions.pop("sid-a-live-handoff", None)
@@ -6915,6 +6932,113 @@ def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
         process_registry._completion_consumed.discard(event["session_id"])
         while not isolated_queue.empty():
             isolated_queue.get_nowait()
+
+
+def test_notification_poller_failed_delivery_claim_releases_running(monkeypatch):
+    """Losing the durable delivery claim must not leave the UI falsely busy."""
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    session = _session(session_key="claim-owner")
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg-already-claimed",
+        "session_key": "claim-owner",
+        "origin_ui_session_id": "sid-claim-owner",
+    }
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(
+        "tools.process_registry.format_process_notification",
+        lambda _event: "delegation completed",
+    )
+    monkeypatch.setattr(
+        "tools.async_delegation.claim_event_delivery",
+        lambda _event, _consumer: None,
+    )
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *args, **kwargs: pytest.fail("unclaimed event must not dispatch"),
+    )
+    server._sessions["sid-claim-owner"] = session
+
+    try:
+        server._notification_poller_loop(
+            _StopAfterOneNotificationPoll(),
+            "sid-claim-owner",
+            session,
+        )
+
+        assert session["running"] is False
+        assert isolated_queue.empty()
+    finally:
+        server._sessions.pop("sid-claim-owner", None)
+
+
+def test_notification_poller_shutdown_drain_keeps_background_turn_synthetic(
+    monkeypatch,
+):
+    """Shutdown delivery must not promote a background event to user authority."""
+    import queue as _queue_mod
+    import threading as _threading
+
+    from tools.process_registry import process_registry
+
+    session = _session(session_key="shutdown-owner")
+    event = {
+        "type": "completion",
+        "session_id": "proc-shutdown-typed",
+        "session_key": "shutdown-owner",
+        "command": "echo done",
+        "exit_code": 0,
+        "output": "done",
+    }
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(
+        "tools.process_registry.format_process_notification",
+        lambda _event: "background completion",
+    )
+    dispatched = []
+
+    def _deliver(
+        _rid,
+        _sid,
+        target_session,
+        text,
+        *,
+        display_kind=None,
+        display_metadata=None,
+    ):
+        dispatched.append((text, display_kind, display_metadata))
+        target_session["running"] = False
+
+    monkeypatch.setattr(server, "_run_prompt_submit", _deliver)
+    server._sessions["sid-shutdown-owner"] = session
+    process_registry._completion_consumed.discard(event["session_id"])
+    stop = _threading.Event()
+    stop.set()
+
+    try:
+        server._notification_poller_loop(stop, "sid-shutdown-owner", session)
+
+        assert dispatched == [
+            (
+                "background completion",
+                "internal_notification",
+                {"synthetic_source": "background_notification"},
+            )
+        ]
+        assert isolated_queue.empty()
+    finally:
+        server._sessions.pop("sid-shutdown-owner", None)
+        process_registry._completion_consumed.discard(event["session_id"])
 
 
 def test_completion_ownership_lineage_lookup_failure_fails_closed(monkeypatch):
@@ -6987,7 +7111,7 @@ def test_notification_poller_live_loop_drops_addressed_orphan(
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda _rid, _sid, _session, text: delivered.append(text),
+        lambda _rid, _sid, _session, text, **_kwargs: delivered.append(text),
     )
     server._sessions["sid-live-orphan"] = session
     process_registry._completion_consumed.discard(event["session_id"])
@@ -7028,7 +7152,7 @@ def test_notification_poller_drops_orphaned_events(monkeypatch, routing):
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda _rid, _sid, _session, text: delivered.append(text),
+        lambda _rid, _sid, _session, text, **_kwargs: delivered.append(text),
     )
     monkeypatch.setattr(server, "_get_db", lambda: None)
 
@@ -7094,7 +7218,7 @@ def test_notification_poller_delivers_owned_events(
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda _rid, _sid, _session, text: delivered.append(text),
+        lambda _rid, _sid, _session, text, **_kwargs: delivered.append(text),
     )
     monkeypatch.setattr(server, "_get_db", lambda: _CompressionDB())
 
@@ -7361,6 +7485,129 @@ def test_run_prompt_submit_delivers_completion_observed_by_poll(monkeypatch, tmp
         server._sessions.pop("sid_a", None)
         process_registry._completion_consumed.discard(event["session_id"])
         process_registry._poll_observed.discard(event["session_id"])
+
+
+def test_run_prompt_submit_lost_post_turn_delivery_claim_releases_running(
+    monkeypatch, tmp_path
+):
+    """A lost durable post-turn claim cannot leave the foreground session busy."""
+    from tools.process_registry import process_registry
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    turns = []
+    session = _session(
+        session_key="session-post-turn-claim",
+        agent=_RecordingAgent(turns),
+        running=True,
+    )
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg-post-turn-claimed-elsewhere",
+        "session_key": "session-post-turn-claim",
+        "origin_ui_session_id": "sid-post-turn-claim",
+    }
+    calls = {"drain": 0}
+
+    def _drain(**_kwargs):
+        calls["drain"] += 1
+        return [(event, "delegation completion")] if calls["drain"] == 1 else []
+
+    monkeypatch.setattr(process_registry, "drain_notifications", _drain)
+    monkeypatch.setattr(
+        "tools.async_delegation.claim_event_delivery",
+        lambda _event, _consumer: None,
+    )
+    server._sessions["sid-post-turn-claim"] = session
+
+    try:
+        server._run_prompt_submit(
+            "rid-post-turn-claim",
+            "sid-post-turn-claim",
+            session,
+            "foreground turn",
+        )
+
+        assert turns == ["foreground turn"]
+        assert session["running"] is False
+    finally:
+        server._sessions.pop("sid-post-turn-claim", None)
+
+
+def test_run_prompt_submit_types_post_turn_async_completion(
+    monkeypatch, tmp_path
+):
+    """Async completions keep the same provenance type on the post-turn drain."""
+    from tools.process_registry import process_registry
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    observed = []
+
+    class _TypedRecordingAgent(_RecordingAgent):
+        def run_conversation(
+            self,
+            prompt,
+            conversation_history=None,
+            stream_callback=None,
+            persist_user_display_kind=None,
+            persist_user_display_metadata=None,
+            **_kwargs,
+        ):
+            observed.append(
+                (
+                    prompt,
+                    persist_user_display_kind,
+                    persist_user_display_metadata,
+                )
+            )
+            return {"final_response": "", "messages": []}
+
+    session = _session(
+        session_key="session-post-turn-typed",
+        agent=_TypedRecordingAgent([]),
+        running=True,
+    )
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg-post-turn-typed",
+        "session_key": "session-post-turn-typed",
+        "origin_ui_session_id": "sid-post-turn-typed",
+        "results": [{"status": "completed"}],
+    }
+    calls = {"drain": 0}
+
+    def _drain(**_kwargs):
+        calls["drain"] += 1
+        return [(event, "delegation completion")] if calls["drain"] == 1 else []
+
+    monkeypatch.setattr(process_registry, "drain_notifications", _drain)
+    monkeypatch.setattr(
+        "tools.async_delegation.claim_event_delivery",
+        lambda _event, _consumer: "claim-post-turn",
+    )
+    monkeypatch.setattr(
+        "tools.async_delegation.complete_event_delivery",
+        lambda _event, _claim: None,
+    )
+    server._sessions["sid-post-turn-typed"] = session
+
+    try:
+        server._run_prompt_submit(
+            "rid-post-turn-typed",
+            "sid-post-turn-typed",
+            session,
+            "foreground turn",
+        )
+
+        assert observed[0] == ("foreground turn", None, None)
+        assert observed[1][0] == "delegation completion"
+        assert observed[1][1] == "async_delegation_complete"
+        assert observed[1][2]["delegation_id"] == "deleg-post-turn-typed"
+        assert observed[1][2]["task_count"] == 1
+        assert observed[1][2]["completed_count"] == 1
+        assert observed[1][2]["failed_count"] == 0
+        assert session["running"] is False
+    finally:
+        server._sessions.pop("sid-post-turn-typed", None)
 
 
 def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_threading(
@@ -17324,7 +17571,7 @@ def test_notification_poller_emits_distinct_watch_matches_once(monkeypatch):
     turns = []
     emitted = []
 
-    def _fake_run_prompt_submit(rid, sid, session, text):
+    def _fake_run_prompt_submit(rid, sid, session, text, **_kwargs):
         turns.append(text)
         with session["history_lock"]:
             session["running"] = False

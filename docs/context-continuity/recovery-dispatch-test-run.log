@@ -1,0 +1,61 @@
+▶ running per-file parallel test suite via run_tests_parallel.py
+  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)
+▶ pre-compiling bytecode cache
+▶ launching test runner
+Discovered 36 test files (~1325 tests) under ['tests/ares_runtime/test_continuity_budget.py', 'tests/ares_runtime/test_continuity_checkpoint.py', 'tests/ares_runtime/test_continuity_compiler.py', 'tests/ares_runtime/test_continuity_dispatch.py', 'tests/ares_runtime/test_continuity_live.py', 'tests/ares_runtime/test_continuity_native_governor.py', 'tests/ares_runtime/test_continuity_recovery.py', 'tests/ares_runtime/test_continuity_runtime.py', 'tests/ares_runtime/test_continuity_snapshot_races.py', 'tests/ares_runtime/test_continuity_transport_bounds.py', 'tests/ares_runtime/test_context_rebase_state.py', 'tests/ares_runtime/test_managed_calls.py', 'tests/hermes_cli/test_goals.py', 'tests/hermes_cli/test_heartbeat.py', 'tests/hermes_cli/test_loops.py', 'tests/test_run_checkpoint_import_boundaries.py', 'tests/test_turn_run_custody.py', 'tests/tui_gateway/test_inline_rpc_gil_starvation.py', 'tests/tui_gateway/test_kanban_notify_poller.py', 'tests/test_tui_gateway_server.py', 'tests/cli/test_cli_goal_interrupt.py', 'tests/cli/test_cli_async_delegation_delivery.py', 'tests/gateway/test_goal_resume_restart.py', 'tests/agent/test_synthetic_turn_display_kind.py', 'tests/agent/test_turn_context.py', 'tests/run_agent/test_run_agent.py', 'tests/run_agent/test_1630_context_overflow_loop.py', 'tests/run_agent/test_compression_lock_defer.py', 'tests/run_agent/test_streaming.py', 'tests/run_agent/test_run_agent_codex_responses.py', 'tests/run_agent/test_codex_sdk_transform_bypass.py', 'tests/plugins/test_context_governor_fd_ownership.py', 'tests/plugins/test_context_governor_key_state_v2.py', 'tests/plugins/test_context_governor_protocol.py', 'tests/plugins/test_context_governor_release_identity.py', 'tests/plugins/test_context_governor_runtime_closure.py']; running with -j 4
+[  1.2% |    16/~1325 | ✓40 | ✗ 0] ✓ tests/ares_runtime/test_continuity_budget.py (40✓, 0.6s)
+[  3.8% |    51/~1325 | ✓81 | ✗ 0] ✓ tests/ares_runtime/test_context_rebase_state.py (41✓, 1.6s)
+[  4.8% |    64/~1325 | ✓96 | ✗ 0] ✓ tests/ares_runtime/test_continuity_checkpoint.py (15✓, 1.6s)
+[  6.0% |    79/~1325 | ✓123 | ✗  0] ✓ tests/ares_runtime/test_continuity_compiler.py (27✓, 0.6s)
+[  6.1% |    81/~1325 | ✓125 | ✗  0] ✓ tests/agent/test_synthetic_turn_display_kind.py (2✓, 2.5s)
+[  6.9% |    92/~1325 | ✓136 | ✗  0] ✓ tests/ares_runtime/test_continuity_live.py (11✓, 0.8s)
+[  7.2% |    95/~1325 | ✓139 | ✗  0] ✓ tests/ares_runtime/test_continuity_native_governor.py (3✓, 1.0s)
+[  8.3% |   110/~1325 | ✓163 | ✗  0] ✓ tests/agent/test_turn_context.py (24✓, 3.7s)
+[  8.8% |   116/~1325 | ✓169 | ✗  0] ✓ tests/ares_runtime/test_continuity_recovery.py (6✓, 0.8s)
+[  9.4% |   125/~1325 | ✓178 | ✗  0] ✓ tests/ares_runtime/test_continuity_runtime.py (9✓, 0.8s)
+[ 10.0% |   132/~1325 | ✓191 | ✗  0] ✓ tests/ares_runtime/test_continuity_snapshot_races.py (13✓, 0.9s)
+[ 10.3% |   136/~1325 | ✓195 | ✗  0] ✓ tests/ares_runtime/test_managed_calls.py (4✓, 0.4s)
+[ 10.9% |   144/~1325 | ✓203 | ✗  0] ✓ tests/ares_runtime/test_continuity_transport_bounds.py (8✓, 1.2s)
+[ 11.1% |   147/~1325 | ✓206 | ✗  0] ✓ tests/cli/test_cli_async_delegation_delivery.py (3✓, 0.6s)
+[ 11.6% |   154/~1325 | ✓213 | ✗  0] ✓ tests/cli/test_cli_goal_interrupt.py (7✓, 0.7s)
+[ 11.9% |   158/~1325 | ✓217 | ✗  0] ✓ tests/gateway/test_goal_resume_restart.py (4✓, 0.9s)
+[ 14.7% |   195/~1325 | ✓254 | ✗  0] ✓ tests/hermes_cli/test_goals.py (37✓, 0.9s)
+[ 15.9% |   211/~1325 | ✓280 | ✗  0] ✓ tests/hermes_cli/test_heartbeat.py (26✓, 0.7s)
+[ 16.2% |   215/~1325 | ✓284 | ✗  0] ✓ tests/plugins/test_context_governor_fd_ownership.py (4✓, 0.5s)
+[ 16.5% |   218/~1325 | ✓287 | ✗  0] ✓ tests/plugins/test_context_governor_key_state_v2.py (3✓, 0.4s)
+[ 16.8% |   223/~1325 | ✓300 | ✗  0] ✓ tests/plugins/test_context_governor_protocol.py (13✓, 0.4s)
+[ 17.3% |   229/~1325 | ✓310 | ✗  0] ✓ tests/plugins/test_context_governor_release_identity.py (10✓, 0.4s)
+[ 22.0% |   292/~1325 | ✓373 | ✗  0] ✓ tests/hermes_cli/test_loops.py (63✓, 1.3s)
+[ 22.8% |   302/~1325 | ✓383 | ✗  0] ✓ tests/run_agent/test_1630_context_overflow_loop.py (10✓, 1.1s)
+[ 23.5% |   312/~1325 | ✓393 | ✗  0] ✓ tests/run_agent/test_codex_sdk_transform_bypass.py (10✓, 1.9s)
+[ 24.2% |   320/~1325 | ✓401 | ✗  0] ✓ tests/plugins/test_context_governor_runtime_closure.py (8✓, 2.1s)
+[ 24.7% |   327/~1325 | ✓408 | ✗  0] ✓ tests/run_agent/test_compression_lock_defer.py (7✓, 1.9s)
+[ 27.3% |   362/~1325 | ✓442 | ✗  0] ✓ tests/run_agent/test_streaming.py (34✓ 4s, 8.7s)
+[ 31.3% |   415/~1325 | ✓500 | ✗  0] ✓ tests/run_agent/test_run_agent_codex_responses.py (58✓, 13.9s)
+[ 32.5% |   431/~1325 | ✓534 | ✗  0] ✓ tests/ares_runtime/test_continuity_dispatch.py (34✓, 21.7s)
+[ 33.0% |   437/~1325 | ✓542 | ✗  0] ✓ tests/test_turn_run_custody.py (8✓, 1.1s)
+[ 33.3% |   441/~1325 | ✓547 | ✗  0] ✓ tests/test_run_checkpoint_import_boundaries.py (5✓, 7.0s)
+[ 33.7% |   446/~1325 | ✓557 | ✗  0] ✓ tests/tui_gateway/test_inline_rpc_gil_starvation.py (10✓, 1.9s)
+[ 34.7% |   460/~1325 | ✓571 | ✗  0] ✓ tests/tui_gateway/test_kanban_notify_poller.py (14✓, 4.3s)
+[ 80.5% |  1066/~1325 | ✓1192 | ✗   0] ✓ tests/test_tui_gateway_server.py (621✓, 24.9s)
+[100.0% |  1325/~1325 | ✓1471 | ✗   0] ✓ tests/run_agent/test_run_agent.py (279✓, 47.0s)
+
+=== Summary: 36 files, 1471 tests passed, 0 failed, 4 skipped (100% complete) in 56.1s (4 workers) ===
+  Durations cached to test_durations.json (36 files)
+
+=== Per-file subprocess time distribution ===
+  Files:   36
+  Total subprocess CPU-wall: 160.8s  (runner wall: 56.1s, parallelism: 4x)
+  P50: 1.15s  P90: 13.90s  P95: 24.92s  P99: 47.00s  Max: 47.00s
+  <1s: 16 files (44%)  <2s: 26 files (72%)
+  Top 10 slowest:
+     47.00s  tests/run_agent/test_run_agent.py
+     24.92s  tests/test_tui_gateway_server.py
+     21.66s  tests/ares_runtime/test_continuity_dispatch.py
+     13.90s  tests/run_agent/test_run_agent_codex_responses.py
+      8.67s  tests/run_agent/test_streaming.py
+      7.04s  tests/test_run_checkpoint_import_boundaries.py
+      4.26s  tests/tui_gateway/test_kanban_notify_poller.py
+      3.67s  tests/agent/test_turn_context.py
+      2.54s  tests/agent/test_synthetic_turn_display_kind.py
+      2.12s  tests/plugins/test_context_governor_runtime_closure.py

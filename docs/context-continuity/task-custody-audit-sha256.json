@@ -1,0 +1,11 @@
+{
+  "agent/run_checkpoint_custody.py": "a90f093e36fd2154a4235c3f50964a733ca7c99b821b1e4e67c9afb15692863e",
+  "ares_runtime/continuity/checkpoint.py": "20a3e2ef64e859941d5e98fee34d803346d824657f388b046ff6cb8b2e6ad171",
+  "hermes_state_continuity.py": "add424bd60aaf12f8c47a42c8b584b7c2c22d2689d0f172a5d3a3cf250ede4c8",
+  "hermes_state_runs.py": "27b1677809cea45cc1e38df27a52285f3ff4c9653642a98f509cfc2a5d14eaa8",
+  "scripts/run_checkpoint_claim.py": "c5b241c344d8c714654df735aa2b16e7302ba0d42baf7077365e869702d43ff3",
+  "scripts/run_checkpoint_resume.py": "5b17758a6b39f46fa1119087463a1415bfb16dad6f89196d23438d6cb4c47132",
+  "tests/tui_gateway/test_run_checkpoint_claim_rpc.py": "6d14d52736db8c749a9c50e0dce73d461ea9b3a9afb9a6c0015b3c71795761d7",
+  "tui_gateway/run_checkpoint_rpc.py": "cc470509d06de6758f0f6b6dc03b5ffc9db0d8f76cc984df659fbaf910e0985f",
+  "tests/test_run_task_custody.py": "bb4953851f00ced98c0a5db6f415aeb7965695c03375c0d8a064411ed590143e"
+}

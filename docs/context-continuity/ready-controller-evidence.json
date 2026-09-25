@@ -1,0 +1,57 @@
+{
+  "schema": "ares.context-continuity.ready-controller-evidence/v1",
+  "base_commit": "f8a87ada462cf7fa5ea2536f536b61ad03ea09a3",
+  "source_sha256": {
+    "agent/run_checkpoint_custody.py": "266453c890c25ea323ae8602a45365d2e06eb926fbb97dbcae221559bd9870dd",
+    "agent/turn_context.py": "9213b786689cd5b8750b7eb51633472781faf7ebc2c07218da782b5c34b3a6e5",
+    "ares_runtime/continuity/runtime.py": "003e00450d589f5440841eef1d5b699606ffada25e6fb3e7147d73c1a43f3ac1",
+    "hermes_state_continuity.py": "f233176b7953d78a70d45d1a7c98fb20eee1e055fce2e41da21a5f8809cc7a62",
+    "hermes_state_runs.py": "0fef373f6ab78b8130b38c17ee6866202cc35d82a7bf8f1531c27a01b9e12b68",
+    "tui_gateway/server.py": "105cbbffbb9745dbf3ce63923b56c04261e3dc21c41e0a4d5ac20e3b8d4b63d0",
+    "tests/test_run_custody_ready_recovery.py": "7c7fb84361375a35497b9293b80dbd841ae00d4e6b51ec3852b3572b7b3dbce3",
+    "tests/ares_runtime/test_continuity_input.py": "b6378de50ce4b1bbb206f8736f216ef659a5ee82b8b0b22e2c2a562ab3d64e6d",
+    "tests/ares_runtime/test_context_rebase_state.py": "94328a2a88361a7911abcf13200b6373378e7e37afb7d9492fd64744139712ac",
+    "tests/hermes_state/test_append_messages_batch.py": "acb9a96427b8fd80b8b4dcc95916044f4ee8e247f1966fe028f02277821e6a5f"
+  },
+  "scope": "Already-READY local controller reconstruction, ACK confirmation and adoption lifetime",
+  "validation": {
+    "passed": 2002,
+    "failed": 0,
+    "skipped": 4,
+    "files": 60,
+    "log": "ready-test-run.log",
+    "independent_audit_passed": 74,
+    "closed_findings": [
+      "AUD-RC1"
+    ],
+    "ruff": "passed",
+    "git_diff_check": "passed"
+  },
+  "proofs": [
+    "Separate real publisher and READY processes; fresh private custody reconstructs after process exit",
+    "Completed publication recovery and episode history remain unchanged by controller adoption",
+    "Incomplete controller phase retains three attempts and fixed deadline across lease changes",
+    "Final native admission checks phase, process, lease, control, deadline and complete custody inventory",
+    "Lost publication READY and controller completion ACKs reconcile by exact readback",
+    "Turn cleanup retains recovery custody until local history/context adoption",
+    "One authentic post-stop event can resume; pre-stop queued input cannot",
+    "Assistant-tail history is legal on an already-READY restart"
+  ],
+  "limits": [
+    "Autonomous wakes, gateway ingress and task completion lifetime remain required",
+    "Local socket restrictions exclude execute_code from this gate; hosted workflow retains it",
+    "No external effect-owner fence or selected provider qualification claimed"
+  ],
+  "hosted_repairs": {
+    "base_commit": "f8a87ada462cf7fa5ea2536f536b61ad03ea09a3",
+    "full_ci_run": 36133639797,
+    "fixed_failures": [
+      "Batch fault injector forwards the new bind_context_inputs keyword",
+      "Disabled continuity no longer enters unnecessary TUI profile scope"
+    ],
+    "packaging": [
+      "Nix passed on base",
+      "Docker passed on base"
+    ]
+  }
+}

@@ -1,0 +1,3360 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 6b9870c..1381909 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1289,6 +1289,7 @@ dependencies = [
+  "base64",
+  "chrono",
+  "clap",
++ "ed25519-dalek",
+  "llm-tool-runtime",
+  "nix",
+  "recursive-agent-contracts",
+diff --git a/crates/recursive-agent-daemon/Cargo.toml b/crates/recursive-agent-daemon/Cargo.toml
+index 0076c23..40eda80 100644
+--- a/crates/recursive-agent-daemon/Cargo.toml
++++ b/crates/recursive-agent-daemon/Cargo.toml
+@@ -25,6 +25,7 @@ nix = { version = "0.30.1", features = ["socket"] }
+ base64 = "0.22"
+ 
+ [dev-dependencies]
++ed25519-dalek = { workspace = true }
+ tempfile = "3"
+ async-trait = "0.1"
+ recursive-agent-policy = { path = "../recursive-agent-policy", features = ["test-only-approval-fixture"] }
+diff --git a/crates/recursive-agent-daemon/src/bin/ra-daemon.rs b/crates/recursive-agent-daemon/src/bin/ra-daemon.rs
+index 3eafb6d..df07b1d 100644
+--- a/crates/recursive-agent-daemon/src/bin/ra-daemon.rs
++++ b/crates/recursive-agent-daemon/src/bin/ra-daemon.rs
+@@ -8,6 +8,7 @@
+ //!   ra-daemon serve --root <runs> --socket <path> [--max-concurrent N]
+ 
+ use std::fs;
++use std::io::Read;
+ #[cfg(unix)]
+ use std::os::unix::fs::MetadataExt;
+ use std::path::PathBuf;
+@@ -67,6 +68,23 @@ enum Cmd {
+         /// Required whenever a production verifier enrollment is configured.
+         #[arg(long)]
+         production_write_root: Option<PathBuf>,
++        /// Operator-owned scope/controller enrollment. Scope grants cannot be
++        /// supplied through IPC. The native authority must be initialized first.
++        #[arg(long)]
++        context_authority_file: Option<PathBuf>,
++    },
++    /// Permanently fence a native external namespace and print its enrollment
++    /// challenge. Does not enroll a controller or authorize any effect.
++    InitializeContextAuthority {
++        #[arg(long)]
++        root: PathBuf,
++    },
++    /// Print the canonical public verifier digest used by scope enrollment.
++    DescribeProductionVerifier {
++        #[arg(long)]
++        production_verifier_file: PathBuf,
++        #[arg(long)]
++        production_write_root: PathBuf,
+     },
+     /// Emit one canonical native operation envelope as JSON (for the Hermes
+     /// integration and tests to submit over IPC).
+@@ -281,6 +299,37 @@ fn load_production_verifier(
+     )
+ }
+ 
++fn load_context_authority(
++    path: &std::path::Path,
++) -> Result<recursive_agent_policy::ContextAuthorityConfigurationV1, Box<dyn std::error::Error>> {
++    let fd = rustix::fs::open(
++        path,
++        rustix::fs::OFlags::RDONLY
++            | rustix::fs::OFlags::NOFOLLOW
++            | rustix::fs::OFlags::CLOEXEC
++            | rustix::fs::OFlags::NONBLOCK,
++        rustix::fs::Mode::empty(),
++    )?;
++    let file = fs::File::from(fd);
++    let metadata = file.metadata()?;
++    const MAX_BYTES: u64 = 1024 * 1024;
++    if !metadata.is_file()
++        || metadata.len() > MAX_BYTES
++        || metadata.uid() != rustix::process::getuid().as_raw()
++        || metadata.mode() & 0o077 != 0
++    {
++        return Err(
++            "context authority enrollment must be a bounded, owned mode-0600 regular file".into(),
++        );
++    }
++    let mut bytes = Vec::new();
++    file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
++    if bytes.len() as u64 > MAX_BYTES {
++        return Err("context authority enrollment exceeds bound".into());
++    }
++    Ok(serde_json::from_slice(&bytes)?)
++}
++
+ fn build_runtime(
+     root: &std::path::Path,
+     audit_root: Option<PathBuf>,
+@@ -318,6 +367,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
+             max_concurrent,
+             production_verifier_file,
+             production_write_root,
++            context_authority_file,
+         } => {
+             fs::create_dir_all(&root)?;
+             let production_verifier = match (production_verifier_file.as_deref(), production_write_root.as_deref()) {
+@@ -329,7 +379,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
+                     "production verifier file and production write root must be configured together".into(),
+                 ),
+             };
+-            let runtime = build_runtime(&root, audit_root, production_verifier)?;
++            let mut runtime = build_runtime(&root, audit_root, production_verifier)?;
++            if let Some(path) = context_authority_file {
++                runtime = runtime.with_context_authority(&load_context_authority(&path)?)?;
++            }
+             // The socket parent is the directory containing the socket path.
+             let parent = socket
+                 .parent()
+@@ -344,6 +397,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
+             serve(listener, Arc::new(runtime), max_concurrent)?;
+             Ok(())
+         }
++        Cmd::InitializeContextAuthority { root } => {
++            fs::create_dir_all(&root)?;
++            let store =
++                recursive_agent_policy::DurablePermitStore::from_dir_fd(&fs::File::open(root)?)?;
++            println!("{}", store.initialize_context_authority()?);
++            Ok(())
++        }
++        Cmd::DescribeProductionVerifier {
++            production_verifier_file,
++            production_write_root,
++        } => {
++            let verifier =
++                load_production_verifier(&production_verifier_file, &production_write_root)?;
++            println!("{}", verifier.context_authority_digest()?);
++            Ok(())
++        }
+         Cmd::EmitEnvelope { text } => {
+             let envelope = canonical_echo_envelope(&text)?;
+             println!(
+diff --git a/crates/recursive-agent-daemon/src/protocol.rs b/crates/recursive-agent-daemon/src/protocol.rs
+index c17cdba..d6571bb 100644
+--- a/crates/recursive-agent-daemon/src/protocol.rs
++++ b/crates/recursive-agent-daemon/src/protocol.rs
+@@ -167,6 +167,47 @@ pub enum IpcRequestV1 {
+     PermitIssueProduction {
+         witness: Box<ProductionApprovalWitnessV1>,
+     },
++    /// Separate scoped protocol; never downgraded to legacy permit calls.
++    ScopedPermitIssue {
++        witness: Box<ProductionApprovalWitnessV1>,
++        context: Box<recursive_agent_policy::ContextCallBindingV1>,
++    },
++    ScopedPermitConsume {
++        permit: Box<recursive_agent_policy::ScopedExecutionPermitV1>,
++        call: ToolCallSpecV1,
++    },
++    ScopedPermitReadback {
++        permit: Box<recursive_agent_policy::ScopedExecutionPermitV1>,
++    },
++    ScopedPermitOutcomeRecord {
++        permit: Box<recursive_agent_policy::ScopedExecutionPermitV1>,
++        preflight_receipt_digest: recursive_agent_contracts::ContentDigest,
++        reported: ReportedEffectOutcomeV1,
++    },
++    ContextAuthorityTransition {
++        transition: Box<recursive_agent_policy::ContextTransitionRequestV1>,
++    },
++    ContextAuthorityReadback {
++        incarnation: recursive_agent_contracts::ContentDigest,
++        scope: recursive_agent_policy::ContextScopeV1,
++    },
++    ContextTransitionReadback {
++        transition: Box<recursive_agent_policy::ContextTransitionRequestV1>,
++    },
++    /// Pure canonicalization for an Ares-owned random store nonce. This does
++    /// not enroll a scope or authenticate an Ares store association.
++    ContextStoreIdentity { nonce: [u8; 32] },
++    /// Pure typed signing material. Only the enrolled controller can sign it;
++    /// the separate production effect witness is still required at issuance.
++    ContextCallPrepare {
++        authority: Box<recursive_agent_policy::ContextAuthorityBindingV1>,
++        witness: Box<ProductionApprovalWitnessV1>,
++    },
++    ContextTransitionPrepare {
++        authority: Box<recursive_agent_policy::ContextAuthorityBindingV1>,
++        transition_ref: String,
++        action: recursive_agent_policy::ContextTransitionActionV1,
++    },
+     /// Record the bounded executor-reported outcome for one consumed preflight.
+     PermitOutcomeRecord {
+         /// Permit consumed by the paired preflight RPC.
+@@ -177,6 +218,13 @@ pub enum IpcRequestV1 {
+         /// local error, or an ambiguous outcome.
+         reported: ReportedEffectOutcomeV1,
+     },
++    /// Read-only exact-binding reconciliation. A consumed receipt is historical
++    /// evidence, never permission to execute after a lost consumption ACK.
++    PermitReadback {
++        permit_id: CurrentPermitId,
++        binding: Box<PermitBindingV1>,
++        preflight_receipt_digest: Option<recursive_agent_contracts::ContentDigest>,
++    },
+     /// Submit one distinct closed V3 provider-egress operation. This variant is
+     /// never decoded as or downgraded to the V1 operation family.
+     SubmitProviderEgressV3 {
+diff --git a/crates/recursive-agent-daemon/src/server.rs b/crates/recursive-agent-daemon/src/server.rs
+index 1d73698..da89672 100644
+--- a/crates/recursive-agent-daemon/src/server.rs
++++ b/crates/recursive-agent-daemon/src/server.rs
+@@ -376,6 +376,100 @@ fn dispatch(
+                 "outcome_artifact": outcome,
+             }))
+         }
++        IpcRequestV1::ScopedPermitIssue { witness, context } => {
++            let permit = runtime.issue_scoped_external_permit(witness, context)?;
++            Ok(serde_json::json!({"request_id": request.request_id, "permit": permit}))
++        }
++        IpcRequestV1::ScopedPermitConsume { permit, call } => {
++            let preflight = runtime.consume_scoped_external_permit(permit, call)?;
++            Ok(serde_json::json!({"request_id": request.request_id, "preflight": preflight}))
++        }
++        IpcRequestV1::ScopedPermitReadback { permit } => {
++            let record = runtime.read_scoped_external_permit(permit)?;
++            Ok(serde_json::json!({"request_id": request.request_id, "record": record}))
++        }
++        IpcRequestV1::ScopedPermitOutcomeRecord {
++            permit,
++            preflight_receipt_digest,
++            reported,
++        } => {
++            let outcome = runtime.settle_scoped_external_permit(
++                permit,
++                preflight_receipt_digest,
++                reported.clone(),
++            )?;
++            Ok(serde_json::json!({"request_id": request.request_id, "outcome": outcome}))
++        }
++        IpcRequestV1::ContextAuthorityTransition { transition } => {
++            let receipt = runtime.transition_context_authority(transition)?;
++            Ok(serde_json::json!({"request_id": request.request_id, "receipt": receipt}))
++        }
++        IpcRequestV1::ContextAuthorityReadback { incarnation, scope } => {
++            let snapshot = runtime.read_context_authority(incarnation, scope)?;
++            Ok(serde_json::json!({"request_id": request.request_id, "snapshot": snapshot}))
++        }
++        IpcRequestV1::ContextTransitionReadback { transition } => {
++            let receipt = runtime.read_context_transition(transition)?;
++            Ok(serde_json::json!({"request_id": request.request_id, "receipt": receipt}))
++        }
++        IpcRequestV1::ContextStoreIdentity { nonce } => {
++            let digest =
++                recursive_agent_contracts::content_digest(&("ares.context-store/v1", nonce))
++                    .map_err(|e| {
++                        ServerError::Runtime(recursive_agent_runner::RuntimeServiceError::Policy(
++                            recursive_agent_policy::PolicyError::Contract(e),
++                        ))
++                    })?;
++            Ok(serde_json::json!({"request_id": request.request_id, "store": digest}))
++        }
++        IpcRequestV1::ContextCallPrepare { authority, witness } => {
++            let material = recursive_agent_policy::prepare_context_call(authority, witness)
++                .map_err(|e| {
++                    ServerError::Runtime(recursive_agent_runner::RuntimeServiceError::Policy(e))
++                })?;
++            let bytes = material.signing_bytes().map_err(|e| {
++                ServerError::Runtime(recursive_agent_runner::RuntimeServiceError::Policy(e))
++            })?;
++            Ok(
++                serde_json::json!({"request_id": request.request_id, "material": material, "signing_bytes": bytes}),
++            )
++        }
++        IpcRequestV1::ContextTransitionPrepare {
++            authority,
++            transition_ref,
++            action,
++        } => {
++            let material = recursive_agent_policy::prepare_context_transition(
++                authority,
++                transition_ref,
++                action,
++            )
++            .map_err(|e| {
++                ServerError::Runtime(recursive_agent_runner::RuntimeServiceError::Policy(e))
++            })?;
++            let bytes = material.signing_bytes().map_err(|e| {
++                ServerError::Runtime(recursive_agent_runner::RuntimeServiceError::Policy(e))
++            })?;
++            Ok(
++                serde_json::json!({"request_id": request.request_id, "material": material, "signing_bytes": bytes}),
++            )
++        }
++        IpcRequestV1::PermitReadback {
++            permit_id,
++            binding,
++            preflight_receipt_digest,
++        } => {
++            let readback = runtime.read_external_permit(
++                permit_id,
++                binding,
++                preflight_receipt_digest.as_ref(),
++            )?;
++            Ok(serde_json::json!({
++                "request_id": request.request_id,
++                "permit_id": permit_id,
++                "readback": readback,
++            }))
++        }
+         IpcRequestV1::Submit { operation } => {
+             let handle = runtime.submit(operation)?;
+             Ok(serde_json::json!({
+diff --git a/crates/recursive-agent-daemon/tests/ipc_runtime.rs b/crates/recursive-agent-daemon/tests/ipc_runtime.rs
+index 955cca9..8382755 100644
+--- a/crates/recursive-agent-daemon/tests/ipc_runtime.rs
++++ b/crates/recursive-agent-daemon/tests/ipc_runtime.rs
+@@ -316,6 +316,137 @@ fn daemon_consumes_and_records_external_permit_receipts_over_ipc() -> TestResult
+         recorded["outcome_artifact"]["reported"]["state"],
+         "outcome_ambiguous"
+     );
++    // Reconnect after an uncertain ACK: use an exact read-only identity. The
++    // daemon returns persisted artifacts and never consumes another permit.
++    drop(stream);
++    let mut stream = connect_with_retry(&socket_path, &server_thread)?;
++    let readback = serde_json::json!({
++        "schema": IPC_REQUEST_SCHEMA_V1,
++        "protocol_version": IPC_PROTOCOL_VERSION_V1,
++        "request_id": "permit-readback",
++        "request": {"kind": "permit_readback", "permit_id": permit.permit_id,
++            "binding": binding, "preflight_receipt_digest": digest},
++    });
++    stream.write_all(&frame(&serde_json::to_vec(&readback)?))?;
++    stream.flush()?;
++    let reconciled = read_response(&mut stream)?;
++    assert_eq!(
++        reconciled["readback"]["schema"],
++        "recursive-agent.external-permit-readback/v1"
++    );
++    assert_eq!(
++        reconciled["readback"]["preflight"],
++        consumed["preflight_artifact"]
++    );
++    assert_eq!(
++        reconciled["readback"]["outcome"],
++        recorded["outcome_artifact"]
++    );
++    let mut wrong = readback.clone();
++    wrong["request_id"] = serde_json::json!("permit-readback-wrong");
++    wrong["request"]["binding"]["actor"] = serde_json::json!("actor:foreign");
++    stream.write_all(&frame(&serde_json::to_vec(&wrong)?))?;
++    stream.flush()?;
++    assert!(read_response(&mut stream)?["error"].is_object());
++    Ok(())
++}
++
++#[test]
++fn dropped_external_consume_and_outcome_acks_reconcile_without_reexecution() -> TestResult {
++    let tmp = tempfile::tempdir()?;
++    let runtime_root = tmp.path().join("dropped-ack-root");
++    std::fs::create_dir(&runtime_root)?;
++    let call = ToolCallSpecV1 {
++        tool: "echo".into(),
++        args: serde_json::json!({"text": "lost-ack"}),
++        frozen_clock: None,
++    };
++    let binding = external_permit_binding(&call)?;
++    let root = std::fs::File::open(&runtime_root)?;
++    let permits = DurablePermitStore::from_dir_fd(&root)?;
++    let permit = permits.issue(&binding, FixedClock.now())?;
++    let service = native_service(&runtime_root)?;
++    let (listener, socket_path) = bind_private_socket(tmp.path(), "lost-ack.sock")?;
++    let server_thread = std::thread::spawn(move || {
++        let _ = serve(listener, Arc::new(service), 4);
++    });
++    let envelope = |id: &str, request: serde_json::Value| {
++        serde_json::json!({
++            "schema": IPC_REQUEST_SCHEMA_V1, "protocol_version": IPC_PROTOCOL_VERSION_V1,
++            "request_id": id, "request": request,
++        })
++    };
++    let mut stream = connect_with_retry(&socket_path, &server_thread)?;
++    let consume = envelope(
++        "lost-consume",
++        serde_json::json!({
++            "kind": "permit_consume", "permit_id": permit.permit_id, "binding": binding, "call": call,
++        }),
++    );
++    stream.write_all(&frame(&serde_json::to_vec(&consume)?))?;
++    stream.flush()?;
++    stream.shutdown(std::net::Shutdown::Both)?;
++    drop(stream); // No consume response is read.
++    let deadline = std::time::Instant::now() + Duration::from_secs(3);
++    let preflight = loop {
++        if let Some(receipt) = permits.state(&permit.permit_id)?.preflight_receipt {
++            break receipt;
++        }
++        if std::time::Instant::now() >= deadline {
++            return Err("consumption was not recorded".into());
++        }
++        std::thread::sleep(Duration::from_millis(5));
++    };
++    let mut stream = connect_with_retry(&socket_path, &server_thread)?;
++    let outcome = envelope(
++        "lost-outcome",
++        serde_json::json!({
++            "kind": "permit_outcome_record", "permit_id": permit.permit_id,
++            "preflight_receipt_digest": preflight.receipt_digest,
++            "reported": {"state": "outcome_ambiguous", "duration_ms": 9, "error_type": "lost_tool_ack"},
++        }),
++    );
++    stream.write_all(&frame(&serde_json::to_vec(&outcome)?))?;
++    stream.flush()?;
++    stream.shutdown(std::net::Shutdown::Both)?;
++    drop(stream); // No outcome response is read either.
++    let deadline = std::time::Instant::now() + Duration::from_secs(3);
++    let persisted = loop {
++        let record = permits.state(&permit.permit_id)?;
++        if record.outcome_receipt.is_some() {
++            break record;
++        }
++        if std::time::Instant::now() >= deadline {
++            return Err("outcome was not recorded".into());
++        }
++        std::thread::sleep(Duration::from_millis(5));
++    };
++    let mut stream = connect_with_retry(&socket_path, &server_thread)?;
++    let readback = envelope(
++        "recover",
++        serde_json::json!({
++            "kind": "permit_readback", "permit_id": permit.permit_id, "binding": binding,
++            "preflight_receipt_digest": preflight.receipt_digest,
++        }),
++    );
++    stream.write_all(&frame(&serde_json::to_vec(&readback)?))?;
++    stream.flush()?;
++    let recovered = read_response(&mut stream)?;
++    assert_eq!(
++        recovered["readback"]["preflight"],
++        serde_json::to_value(&preflight)?
++    );
++    assert_eq!(
++        recovered["readback"]["outcome"],
++        serde_json::to_value(&persisted.outcome_receipt)?
++    );
++    assert_eq!(permits.state(&permit.permit_id)?, persisted);
++    let mut replay = consume;
++    replay["request_id"] = serde_json::json!("replay-denied");
++    stream.write_all(&frame(&serde_json::to_vec(&replay)?))?;
++    stream.flush()?;
++    assert!(read_response(&mut stream)?["error"].is_object());
++    assert_eq!(permits.state(&permit.permit_id)?, persisted);
+     Ok(())
+ }
+ 
+@@ -455,6 +586,184 @@ fn production_witness(call: ToolCallSpecV1) -> ProductionApprovalWitnessV1 {
+     }
+ }
+ 
++#[test]
++fn scoped_daemon_retirement_lost_ack_restart_and_old_verifier_fence() -> TestResult {
++    use ed25519_dalek::{Signer, SigningKey};
++    use recursive_agent_policy::{
++        ContextAdmissionModeV1, ContextAuthorityConfigurationV1, ContextAuthoritySchemaV1,
++        ContextHeadV1, ContextScopeGrantV1, ContextScopeV1, ScopedExecutionPermitV1,
++    };
++    let tmp = tempfile::tempdir()?;
++    let root = tmp.path().join("scoped");
++    std::fs::create_dir(&root)?;
++    let store = DurablePermitStore::from_dir_fd(&std::fs::File::open(&root)?)?;
++    let approver = ProductionApprovalSignerV1::from_seed("operator".into(), [9; 32]);
++    let controller = SigningKey::from_bytes(&[4; 32]);
++    let scope = ContextScopeV1 {
++        store: content_digest(&"ares-store")?,
++        profile: "work".into(),
++        root: "root-1".into(),
++    };
++    let mut configuration = ContextAuthorityConfigurationV1 {
++        schema: ContextAuthoritySchemaV1::V1,
++        incarnation: store.initialize_context_authority()?,
++        revision: 1,
++        approval_verifier: approver.verifier()?.context_authority_digest()?,
++        grants: vec![ContextScopeGrantV1 {
++            scope: scope.clone(),
++            controller_public_key: controller.verifying_key().to_bytes(),
++            actor: ActorPrincipalV1::try_new("ares-desktop:interactive")?,
++            policy_version: "production-permit-v1".into(),
++            policy_digest: content_digest(&"policy")?,
++            write_root: PRODUCTION_PERMIT_TARGET_ROOT.into(),
++            initial_head: ContextHeadV1 {
++                context: "parent".into(),
++                generation: 1,
++                mode: ContextAdmissionModeV1::Active,
++            },
++            not_before: FixedClock.now(),
++            expires_at: FixedClock.now() + chrono::TimeDelta::hours(1),
++            max_effects: 8,
++            max_transitions: 8,
++            previous_grant: None,
++        }],
++    };
++    let old_service = Arc::new(
++        native_service(&root)?
++            .with_production_approval_verifier(approver.verifier()?)
++            .with_context_authority(&configuration)?,
++    );
++    let (listener, socket) = bind_private_socket(tmp.path(), "scoped.sock")?;
++    let server_service = Arc::clone(&old_service);
++    let thread = std::thread::spawn(move || {
++        let _ = serve(listener, server_service, 4);
++    });
++    let mut stream = connect_with_retry(&socket, &thread)?;
++    let sequence = std::sync::atomic::AtomicU64::new(0);
++    let send = |stream: &mut UnixStream,
++                body: serde_json::Value|
++     -> Result<serde_json::Value, Box<dyn std::error::Error>> {
++        let request_id = format!(
++            "scope-test-{}",
++            sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
++        );
++        let request = serde_json::json!({"schema":IPC_REQUEST_SCHEMA_V1, "protocol_version":IPC_PROTOCOL_VERSION_V1, "request_id":request_id, "request":body});
++        stream.write_all(&frame(&serde_json::to_vec(&request)?))?;
++        stream.flush()?;
++        read_response(stream)
++    };
++    let snapshot = send(
++        &mut stream,
++        serde_json::json!({"kind":"context_authority_readback", "incarnation":configuration.incarnation, "scope":scope}),
++    )?;
++    let authority = snapshot["snapshot"]["authority"].clone();
++    assert_eq!(
++        snapshot["snapshot"]["grant"],
++        serde_json::to_value(&configuration.grants[0])?
++    );
++    assert_eq!(
++        snapshot["snapshot"]["approval_verifier"],
++        serde_json::to_value(&configuration.approval_verifier)?
++    );
++    let call = ToolCallSpecV1 {
++        tool: "write_file".into(),
++        args: serde_json::json!({"path":format!("{PRODUCTION_PERMIT_TARGET_ROOT}/out.txt"),"content":"approved"}),
++        frozen_clock: None,
++    };
++    let witness = approver.sign(production_witness(call.clone()))?;
++    let prepared = send(
++        &mut stream,
++        serde_json::json!({"kind":"context_call_prepare", "authority":authority,"witness":witness}),
++    )?;
++    let mut context = prepared["material"].clone();
++    let bytes: Vec<u8> = serde_json::from_value(prepared["signing_bytes"].clone())?;
++    context["signature"] = serde_json::to_value(controller.sign(&bytes).to_bytes().to_vec())?;
++    let issued = send(
++        &mut stream,
++        serde_json::json!({"kind":"scoped_permit_issue","witness":witness,"context":context}),
++    )?;
++    assert!(issued["error"].is_null(), "{issued}");
++    let permit: ScopedExecutionPermitV1 = serde_json::from_value(issued["permit"].clone())?;
++    let legacy = send(
++        &mut stream,
++        serde_json::json!({"kind":"permit_consume", "permit_id":permit.effect.permit_id,"binding":permit.effect.binding,"call":call}),
++    )?;
++    assert_eq!(legacy["error"]["code"], "runtime_error");
++    let consumed = send(
++        &mut stream,
++        serde_json::json!({"kind":"scoped_permit_consume", "permit":permit,"call":call}),
++    )?;
++    assert!(consumed["error"].is_null(), "{consumed}");
++    let prepared = send(
++        &mut stream,
++        serde_json::json!({"kind":"context_transition_prepare", "authority":authority,"transition_ref":"rebase:one", "action":{"action":"retire", "successor_context":"child"}}),
++    )?;
++    let mut transition = prepared["material"].clone();
++    let bytes: Vec<u8> = serde_json::from_value(prepared["signing_bytes"].clone())?;
++    transition["signature"] = serde_json::to_value(controller.sign(&bytes).to_bytes().to_vec())?;
++    // Submit retirement and close without accepting its ACK.
++    let request = serde_json::json!({"schema":IPC_REQUEST_SCHEMA_V1,"protocol_version":IPC_PROTOCOL_VERSION_V1,"request_id":"lost-retirement","request":{"kind":"context_authority_transition","transition":transition}});
++    stream.write_all(&frame(&serde_json::to_vec(&request)?))?;
++    stream.flush()?;
++    drop(stream);
++    let exact: recursive_agent_policy::ContextTransitionRequestV1 =
++        serde_json::from_value(transition.clone())?;
++    let deadline = std::time::Instant::now() + Duration::from_secs(5);
++    while store.read_context_transition(&exact)?.is_none() {
++        assert!(
++            std::time::Instant::now() < deadline,
++            "retirement did not persist"
++        );
++        std::thread::yield_now();
++    }
++    let restarted = native_service(&root)?
++        .with_production_approval_verifier(approver.verifier()?)
++        .with_context_authority(&configuration)?;
++    let receipt = restarted
++        .read_context_transition(&exact)?
++        .ok_or("missing receipt")?;
++    assert_eq!(receipt.consumed.len(), 1);
++    assert_eq!(receipt.consumed[0].permit_id, permit.permit_id);
++    assert_eq!(restarted.transition_context_authority(&exact)?, receipt);
++    assert!(restarted
++        .consume_scoped_external_permit(&permit, &call)
++        .is_err());
++    let preflight: recursive_agent_policy::ScopedPermitPreflightV1 =
++        serde_json::from_value(consumed["preflight"].clone())?;
++    restarted.settle_scoped_external_permit(
++        &permit,
++        &preflight.receipt_digest,
++        recursive_agent_policy::ReportedEffectOutcomeV1 {
++            state: recursive_agent_policy::ReportedEffectStateV1::OutcomeAmbiguous,
++            duration_ms: 1,
++            error_type: Some("lost_effect_ack".into()),
++        },
++    )?;
++    assert!(restarted
++        .read_scoped_external_permit(&permit)?
++        .outcome
++        .is_some());
++    assert!(native_service(&root)?
++        .with_context_authority(&configuration)
++        .is_err());
++    let new_approver = ProductionApprovalSignerV1::from_seed("operator-new".into(), [10; 32]);
++    assert!(native_service(&root)?
++        .with_production_approval_verifier(new_approver.verifier()?)
++        .with_context_authority(&configuration)
++        .is_err());
++    configuration.revision += 1;
++    configuration.approval_verifier = new_approver.verifier()?.context_authority_digest()?;
++    let _new_service = native_service(&root)?
++        .with_production_approval_verifier(new_approver.verifier()?)
++        .with_context_authority(&configuration)?;
++    // The old runtime remains alive, but its durable access was superseded.
++    assert!(old_service.transition_context_authority(&exact).is_err());
++    assert!(old_service
++        .consume_scoped_external_permit(&permit, &call)
++        .is_err());
++    Ok(())
++}
++
+ #[test]
+ fn daemon_issues_production_ed25519_witness_once_consumes_and_quarantines_ambiguity() -> TestResult
+ {
+diff --git a/crates/recursive-agent-policy/src/context_authority.rs b/crates/recursive-agent-policy/src/context_authority.rs
+new file mode 100644
+index 0000000..75bee7a
+--- /dev/null
++++ b/crates/recursive-agent-policy/src/context_authority.rs
+@@ -0,0 +1,1354 @@
++//! Scoped external-effect authority, owned by the existing permit store.
++//!
++//! The operator enrolls a controller for one store/profile/root. Controller
++//! signatures bind context and transitions; they never approve an effect.
++//! Every mutation is one bounded, fsynced replacement under `.permit.lock`.
++//! Legacy permit bytes stay unchanged and cannot bypass an enrolled namespace.
++
++use super::*;
++use serde::{Deserialize, Serialize};
++
++const STATE_FILE: &str = "context-authority-v1.json";
++const MAX_STATE_BYTES: u64 = 32 * 1024 * 1024;
++const MAX_PERMITS: usize = 1024;
++const MAX_TRANSITIONS: usize = 4096;
++const MAX_SCOPES: usize = 256;
++
++fn denied(message: &str) -> PolicyError {
++    PolicyError::InvalidLease(format!("context authority: {message}"))
++}
++
++fn identifier(value: &str) -> Result<(), PolicyError> {
++    if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
++        return Err(denied("invalid identifier"));
++    }
++    Ok(())
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub enum ContextAuthoritySchemaV1 {
++    #[serde(rename = "recursive-agent.context-authority/v1")]
++    V1,
++}
++
++/// Stable identity explicitly approved in the operator's startup enrollment.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct ContextScopeV1 {
++    pub store: ContentDigest,
++    pub profile: String,
++    pub root: String,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum ContextAdmissionModeV1 {
++    Sealed,
++    Active,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct ContextHeadV1 {
++    pub context: String,
++    pub generation: u64,
++    pub mode: ContextAdmissionModeV1,
++}
++
++impl ContextHeadV1 {
++    fn validate(&self) -> Result<(), PolicyError> {
++        identifier(&self.context)?;
++        if self.generation == 0 || self.generation > i64::MAX as u64 {
++            return Err(denied("invalid generation"));
++        }
++        Ok(())
++    }
++}
++
++/// Closed, operator-owned grant. Not an IPC enrollment request. Supersession
++/// retains all prior charges and outstanding effects; caps cannot increase.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct ContextScopeGrantV1 {
++    pub scope: ContextScopeV1,
++    pub controller_public_key: [u8; 32],
++    pub actor: ActorPrincipalV1,
++    pub policy_version: String,
++    pub policy_digest: ContentDigest,
++    pub write_root: String,
++    pub initial_head: ContextHeadV1,
++    pub not_before: DateTime<Utc>,
++    pub expires_at: DateTime<Utc>,
++    pub max_effects: u64,
++    pub max_transitions: u64,
++    pub previous_grant: Option<ContentDigest>,
++}
++
++impl ContextScopeGrantV1 {
++    fn validate(&self) -> Result<(), PolicyError> {
++        identifier(&self.scope.profile)?;
++        identifier(&self.scope.root)?;
++        identifier(&self.policy_version)?;
++        self.initial_head.validate()?;
++        ed25519_dalek::VerifyingKey::from_bytes(&self.controller_public_key)
++            .map_err(|_| denied("invalid controller public key"))?;
++        let root = Path::new(&self.write_root);
++        if self.not_before >= self.expires_at
++            || self.max_effects == 0
++            || self.max_effects > MAX_PERMITS as u64
++            || self.max_transitions == 0
++            || self.max_transitions > MAX_TRANSITIONS as u64
++            || !root.is_absolute()
++            || root == Path::new("/")
++            || root
++                .components()
++                .any(|part| matches!(part, std::path::Component::ParentDir))
++        {
++            return Err(denied("invalid grant bounds"));
++        }
++        Ok(())
++    }
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct ContextAuthorityConfigurationV1 {
++    pub schema: ContextAuthoritySchemaV1,
++    pub incarnation: ContentDigest,
++    pub revision: u64,
++    pub approval_verifier: ContentDigest,
++    pub grants: Vec<ContextScopeGrantV1>,
++}
++
++/// Non-serializable startup capability. A stale daemon cannot use a newer
++/// configuration or restore its old configuration after another daemon starts.
++#[derive(Clone)]
++pub struct ContextAuthorityAccess {
++    incarnation: ContentDigest,
++    configuration_digest: ContentDigest,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct ContextAuthorityBindingV1 {
++    pub incarnation: ContentDigest,
++    pub scope: ContextScopeV1,
++    pub grant_digest: ContentDigest,
++    pub policy_digest: ContentDigest,
++    pub head: ContextHeadV1,
++}
++
++/// Controller signature domain is distinct from transition and effect approval.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct ContextCallBindingV1 {
++    pub authority: ContextAuthorityBindingV1,
++    pub witness_digest: ContentDigest,
++    pub signature: Vec<u8>,
++}
++
++impl ContextCallBindingV1 {
++    pub fn signing_bytes(&self) -> Result<Vec<u8>, PolicyError> {
++        Ok(jcs_canonical(&(
++            "recursive-agent.context-call/v1",
++            &self.authority,
++            &self.witness_digest,
++        ))?)
++    }
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
++pub enum ContextTransitionActionV1 {
++    /// Retires the current generation and reserves the exact successor sealed.
++    /// Also used to return to a parent after a prepublication failure, always
++    /// at a higher generation; no retired token is reopened.
++    Retire { successor_context: String },
++    /// Exact sealed successor becomes active. No generation increment.
++    Activate { retirement_digest: ContentDigest },
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct ContextTransitionRequestV1 {
++    pub authority: ContextAuthorityBindingV1,
++    pub transition: ContentDigest,
++    pub action: ContextTransitionActionV1,
++    pub signature: Vec<u8>,
++}
++
++impl ContextTransitionRequestV1 {
++    pub fn signing_bytes(&self) -> Result<Vec<u8>, PolicyError> {
++        Ok(jcs_canonical(&(
++            "recursive-agent.context-transition/v1",
++            &self.authority,
++            &self.transition,
++            &self.action,
++        ))?)
++    }
++}
++
++/// Pure typed bytes from the canonical boundary owner. No authority is minted.
++pub fn prepare_context_call(
++    authority: &ContextAuthorityBindingV1,
++    witness: &ProductionApprovalWitnessV1,
++) -> Result<ContextCallBindingV1, PolicyError> {
++    authority.head.validate()?;
++    Ok(ContextCallBindingV1 {
++        authority: authority.clone(),
++        witness_digest: content_digest(witness)?,
++        signature: Vec::new(),
++    })
++}
++
++pub fn prepare_context_transition(
++    authority: &ContextAuthorityBindingV1,
++    transition_ref: &str,
++    action: &ContextTransitionActionV1,
++) -> Result<ContextTransitionRequestV1, PolicyError> {
++    identifier(transition_ref)?;
++    authority.head.validate()?;
++    Ok(ContextTransitionRequestV1 {
++        authority: authority.clone(),
++        transition: content_digest(&(
++            "recursive-agent.context-transition-ref/v1",
++            &authority.incarnation,
++            &authority.scope,
++            transition_ref,
++        ))?,
++        action: action.clone(),
++        signature: Vec::new(),
++    })
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct ScopedExecutionPermitV1 {
++    pub permit_id: CurrentPermitId,
++    pub effect: ExecutionPermitV1,
++    pub approval_verifier: ContentDigest,
++    pub context: ContextCallBindingV1,
++}
++
++impl ScopedExecutionPermitV1 {
++    fn derive_id(
++        effect: &ExecutionPermitV1,
++        context: &ContextCallBindingV1,
++        approval_verifier: &ContentDigest,
++    ) -> Result<CurrentPermitId, PolicyError> {
++        let mut material = effect.binding.identity_material()?;
++        material.binding_digest = content_digest(&(
++            "recursive-agent.scoped-external-permit/v1",
++            effect,
++            context,
++            approval_verifier,
++        ))?;
++        Ok(derive_permit_id(&material)?)
++    }
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct ScopedPermitPreflightV1 {
++    pub permit: ScopedExecutionPermitV1,
++    pub recorded_at: DateTime<Utc>,
++    pub receipt_digest: ContentDigest,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct ScopedPermitRecordV1 {
++    pub permit: ScopedExecutionPermitV1,
++    pub preflight: Option<ScopedPermitPreflightV1>,
++    pub outcome: Option<PermitOutcomeReceiptV1>,
++}
++
++/// Bounded receipt reference. Full historical evidence is fetched by exact
++/// permit readback; transition responses stay below the existing IPC frame cap.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct ScopedEffectObligationV1 {
++    pub permit_id: CurrentPermitId,
++    pub preflight_receipt_digest: ContentDigest,
++    pub outcome_receipt_digest: Option<ContentDigest>,
++    pub reported_state: Option<ReportedEffectStateV1>,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct ContextTransitionReceiptV1 {
++    pub request: ContextTransitionRequestV1,
++    pub successor: ContextHeadV1,
++    /// Exact consumed obligations at retirement/activation. A reported result
++    /// is not external confirmation; entries are never silently dropped.
++    pub consumed: Vec<ScopedEffectObligationV1>,
++    pub recorded_at: DateTime<Utc>,
++    pub receipt_digest: ContentDigest,
++}
++
++/// Observation only. It is neither a controller capability nor effect approval.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct ContextAuthoritySnapshotV1 {
++    pub authority: ContextAuthorityBindingV1,
++    pub grant: ContextScopeGrantV1,
++    pub approval_verifier: ContentDigest,
++    pub configuration_revision: u64,
++    pub enrolled: bool,
++    pub effects_charged: u64,
++    pub transitions_charged: u64,
++    pub consumed: Vec<ScopedEffectObligationV1>,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct ScopeState {
++    grant: ContextScopeGrantV1,
++    head: ContextHeadV1,
++    active: bool,
++    effects: u64,
++    transitions: u64,
++    retirement_digest: Option<ContentDigest>,
++}
++
++#[derive(Debug, Clone, Serialize, Deserialize)]
++#[serde(
++    tag = "event",
++    content = "value",
++    rename_all = "snake_case",
++    deny_unknown_fields
++)]
++enum AuthorityEvent {
++    Enrollment(ContextAuthorityConfigurationV1),
++    Transition(ContentDigest),
++}
++
++#[derive(Debug, Clone, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct AuthorityState {
++    journal: Vec<AuthorityEvent>,
++    schema: ContextAuthoritySchemaV1,
++    incarnation: ContentDigest,
++    root_identity: (u64, u64),
++    configuration: Option<ContextAuthorityConfigurationV1>,
++    scopes: BTreeMap<ContentDigest, ScopeState>,
++    permits: BTreeMap<CurrentPermitId, ScopedPermitRecordV1>,
++    /// Immutable reservation across scope, generation, policy and key changes.
++    approvals: BTreeMap<CurrentPermitId, CurrentPermitId>,
++    receipts: BTreeMap<ContentDigest, ContextTransitionReceiptV1>,
++}
++
++fn approval_verifier_digest(
++    verifier: &ProductionApprovalVerifierV1,
++) -> Result<ContentDigest, PolicyError> {
++    Ok(content_digest(&(
++        "recursive-agent.production-verifier/v1",
++        &verifier.key_id,
++        verifier.public_key.to_bytes(),
++        &verifier.target_root,
++    ))?)
++}
++
++impl ProductionApprovalVerifierV1 {
++    /// Public enrollment provenance, never private signing material.
++    pub fn context_authority_digest(&self) -> Result<ContentDigest, PolicyError> {
++        approval_verifier_digest(self)
++    }
++}
++
++fn verify(key: &[u8; 32], bytes: &[u8], signature: &[u8]) -> Result<(), PolicyError> {
++    let key = ed25519_dalek::VerifyingKey::from_bytes(key)
++        .map_err(|_| denied("invalid controller key"))?;
++    let signature = ed25519_dalek::Signature::from_slice(signature)
++        .map_err(|_| denied("invalid controller signature"))?;
++    key.verify_strict(bytes, &signature)
++        .map_err(|_| denied("controller signature rejected"))
++}
++
++impl AuthorityState {
++    fn access(&self, access: &ContextAuthorityAccess) -> Result<(), PolicyError> {
++        let configuration = self
++            .configuration
++            .as_ref()
++            .ok_or_else(|| denied("not enrolled"))?;
++        if self.incarnation != access.incarnation
++            || content_digest(configuration)? != access.configuration_digest
++        {
++            return Err(denied("stale configuration or incarnation"));
++        }
++        Ok(())
++    }
++
++    fn current(
++        &self,
++        binding: &ContextAuthorityBindingV1,
++        now: DateTime<Utc>,
++    ) -> Result<&ScopeState, PolicyError> {
++        binding.head.validate()?;
++        let scope = self
++            .scopes
++            .get(&content_digest(&binding.scope)?)
++            .ok_or_else(|| denied("scope not enrolled"))?;
++        if self.incarnation != binding.incarnation
++            || !scope.active
++            || scope.grant.scope != binding.scope
++            || content_digest(&scope.grant)? != binding.grant_digest
++            || scope.grant.policy_digest != binding.policy_digest
++            || scope.head != binding.head
++            || now < scope.grant.not_before
++            || now >= scope.grant.expires_at
++        {
++            return Err(denied("scope, policy, generation or validity changed"));
++        }
++        Ok(scope)
++    }
++
++    fn consumed(&self, scope: &ContextScopeV1) -> Vec<ScopedEffectObligationV1> {
++        self.permits
++            .values()
++            .filter_map(|record| {
++                if record.permit.context.authority.scope != *scope {
++                    return None;
++                }
++                record
++                    .preflight
++                    .as_ref()
++                    .map(|preflight| ScopedEffectObligationV1 {
++                        permit_id: record.permit.permit_id.clone(),
++                        preflight_receipt_digest: preflight.receipt_digest.clone(),
++                        outcome_receipt_digest: record
++                            .outcome
++                            .as_ref()
++                            .map(|outcome| outcome.receipt_digest.clone()),
++                        reported_state: record
++                            .outcome
++                            .as_ref()
++                            .map(|outcome| outcome.reported.state),
++                    })
++            })
++            .collect()
++    }
++}
++
++fn apply_configuration(
++    state: &mut AuthorityState,
++    configuration: &ContextAuthorityConfigurationV1,
++) -> Result<(), PolicyError> {
++    if configuration.incarnation != state.incarnation
++        || configuration.revision == 0
++        || configuration.grants.len() > MAX_SCOPES
++        || state
++            .configuration
++            .as_ref()
++            .is_some_and(|old| configuration.revision <= old.revision)
++    {
++        return Err(denied("configuration identity or revision rejected"));
++    }
++    let mut admitted = BTreeSet::new();
++    for grant in &configuration.grants {
++        grant.validate()?;
++        let key = content_digest(&grant.scope)?;
++        if !admitted.insert(key.clone()) {
++            return Err(denied("duplicate scope"));
++        }
++        if let Some(previous) = state.scopes.get_mut(&key) {
++            if previous.grant != *grant {
++                if grant.previous_grant != Some(content_digest(&previous.grant)?)
++                    || grant.initial_head != previous.head
++                    || grant.max_effects > previous.grant.max_effects
++                    || grant.max_transitions > previous.grant.max_transitions
++                    || grant.write_root != previous.grant.write_root
++                    || grant.actor != previous.grant.actor
++                {
++                    return Err(denied("grant supersession would reset or widen authority"));
++                }
++                previous.grant = grant.clone();
++            } else if !previous.active {
++                return Err(denied("revoked grant requires explicit supersession"));
++            }
++            previous.active = true;
++        } else {
++            if grant.previous_grant.is_some() || state.scopes.len() >= MAX_SCOPES {
++                return Err(denied("unknown predecessor or exhausted scope inventory"));
++            }
++            state.scopes.insert(
++                key,
++                ScopeState {
++                    grant: grant.clone(),
++                    head: grant.initial_head.clone(),
++                    active: true,
++                    effects: 0,
++                    transitions: 0,
++                    retirement_digest: None,
++                },
++            );
++        }
++    }
++    for (key, scope) in &mut state.scopes {
++        if !admitted.contains(key) {
++            scope.active = false;
++        }
++    }
++    state.configuration = Some(configuration.clone());
++    Ok(())
++}
++
++impl DurablePermitStore {
++    pub fn read_context_authority(
++        &self,
++        incarnation: &ContentDigest,
++        scope: &ContextScopeV1,
++    ) -> Result<ContextAuthoritySnapshotV1, PolicyError> {
++        self.with_lock(|| {
++            let state = self.context_state()?;
++            if state.incarnation != *incarnation {
++                return Err(denied("incarnation changed"));
++            }
++            let current = state
++                .scopes
++                .get(&content_digest(scope)?)
++                .ok_or_else(|| denied("scope absent"))?;
++            let configuration = state
++                .configuration
++                .as_ref()
++                .ok_or_else(|| denied("not enrolled"))?;
++            Ok(ContextAuthoritySnapshotV1 {
++                grant: current.grant.clone(),
++                approval_verifier: configuration.approval_verifier.clone(),
++                authority: ContextAuthorityBindingV1 {
++                    incarnation: incarnation.clone(),
++                    scope: scope.clone(),
++                    grant_digest: content_digest(&current.grant)?,
++                    policy_digest: current.grant.policy_digest.clone(),
++                    head: current.head.clone(),
++                },
++                configuration_revision: configuration.revision,
++                enrolled: current.active,
++                effects_charged: current.effects,
++                transitions_charged: current.transitions,
++                consumed: state.consumed(scope),
++            })
++        })
++    }
++
++    pub fn read_context_transition(
++        &self,
++        request: &ContextTransitionRequestV1,
++    ) -> Result<Option<ContextTransitionReceiptV1>, PolicyError> {
++        self.with_lock(|| {
++            let state = self.context_state()?;
++            if state.incarnation != request.authority.incarnation {
++                return Err(denied("incarnation changed"));
++            }
++            let Some(receipt) = state.receipts.get(&request.transition) else {
++                return Ok(None);
++            };
++            if receipt.request != *request {
++                return Err(denied("transition readback identity changed"));
++            }
++            Ok(Some(receipt.clone()))
++        })
++    }
++
++    /// Explicit operator action. Initialization permanently fences the legacy
++    /// namespace, even when later startup omits enrollment. OS randomness is a
++    /// nonce; the material identity is derived by the stack-ids digest owner.
++    pub fn initialize_context_authority(&self) -> Result<ContentDigest, PolicyError> {
++        self.with_lock(|| {
++            if let Some(existing) = self.read_context_state()? {
++                return Ok(existing.incarnation);
++            }
++            self.assert_no_legacy_consumption()?;
++            let mut nonce = [0_u8; 32];
++            File::open("/dev/urandom")?.read_exact(&mut nonce)?;
++            let incarnation = content_digest(&(
++                "recursive-agent.context-incarnation/v1",
++                nonce,
++                self.permit_root_identity(),
++            ))?;
++            let state = AuthorityState {
++                schema: ContextAuthoritySchemaV1::V1,
++                incarnation: incarnation.clone(),
++                root_identity: self.permit_root_identity(),
++                configuration: None,
++                journal: Vec::new(),
++                scopes: BTreeMap::new(),
++                permits: BTreeMap::new(),
++                approvals: BTreeMap::new(),
++                receipts: BTreeMap::new(),
++            };
++            self.replace_context_state(&state, None)?;
++            Ok(incarnation)
++        })
++    }
++
++    /// Trusted startup only. No IPC route accepts a grant or replaces a key.
++    pub fn enroll_context_authority(
++        &self,
++        configuration: &ContextAuthorityConfigurationV1,
++    ) -> Result<ContextAuthorityAccess, PolicyError> {
++        self.with_lock(|| {
++            let mut state = self.context_state()?;
++            if configuration.incarnation != state.incarnation
++                || configuration.revision == 0
++                || configuration.grants.len() > MAX_SCOPES
++            {
++                return Err(denied("configuration identity or bounds rejected"));
++            }
++            let digest = content_digest(configuration)?;
++            let access = ContextAuthorityAccess {
++                incarnation: state.incarnation.clone(),
++                configuration_digest: digest.clone(),
++            };
++            if let Some(existing) = &state.configuration {
++                if content_digest(existing)? == digest {
++                    return Ok(access);
++                }
++                if configuration.revision <= existing.revision {
++                    return Err(denied("configuration rollback"));
++                }
++            }
++            apply_configuration(&mut state, configuration)?;
++            state
++                .journal
++                .push(AuthorityEvent::Enrollment(configuration.clone()));
++            self.replace_context_state(&state, None)?;
++            Ok(access)
++        })
++    }
++
++    pub fn issue_scoped_external_permit(
++        &self,
++        access: &ContextAuthorityAccess,
++        verifier: &ProductionApprovalVerifierV1,
++        witness: &ProductionApprovalWitnessV1,
++        context: &ContextCallBindingV1,
++        clock: impl Fn() -> DateTime<Utc>,
++    ) -> Result<ScopedExecutionPermitV1, PolicyError> {
++        self.with_lock(|| {
++            let mut state = self.context_state()?;
++            state.access(access)?;
++            if state.configuration.as_ref().map(|c| &c.approval_verifier)
++                != Some(&approval_verifier_digest(verifier)?)
++            {
++                return Err(denied("approval verifier differs from current enrollment"));
++            }
++            let now = clock();
++            let scope = state.current(&context.authority, now)?;
++            verify(
++                &scope.grant.controller_public_key,
++                &context.signing_bytes()?,
++                &context.signature,
++            )?;
++            if context.witness_digest != content_digest(witness)?
++                || scope.head.mode != ContextAdmissionModeV1::Active
++            {
++                return Err(denied("call binding or admission mode rejected"));
++            }
++            let binding = verifier.verify_and_build_binding(witness, now)?;
++            if binding.actor != scope.grant.actor
++                || binding.policy_version != scope.grant.policy_version
++                || binding.effect.write_roots != vec![scope.grant.write_root.clone()]
++                || binding.expires_at > scope.grant.expires_at
++            {
++                return Err(denied("effect outside enrolled scope"));
++            }
++            let effect = ExecutionPermitV1::effect(binding, Vec::new())?;
++            let approval_verifier = approval_verifier_digest(verifier)?;
++            let permit = ScopedExecutionPermitV1 {
++                permit_id: ScopedExecutionPermitV1::derive_id(
++                    &effect,
++                    context,
++                    &approval_verifier,
++                )?,
++                effect,
++                approval_verifier,
++                context: context.clone(),
++            };
++            if let Some(reserved) = state.approvals.get(&permit.effect.permit_id) {
++                let record = state
++                    .permits
++                    .get(reserved)
++                    .ok_or_else(|| denied("approval reservation corrupted"))?;
++                return if record.permit == permit {
++                    Ok(record.permit.clone())
++                } else {
++                    Err(denied("effect approval already bound"))
++                };
++            }
++            // An approval used by V1 before enrollment stays spent. Neither a
++            // legacy issued record nor a missing ACK authorizes a V2 wrapper.
++            match self.read_record(&permit.effect.permit_id) {
++                Ok(_) => return Err(denied("effect approval already used by legacy namespace")),
++                Err(PolicyError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {}
++                Err(error) => return Err(error),
++            }
++            if scope.effects >= scope.grant.max_effects || state.permits.len() >= MAX_PERMITS {
++                return Err(denied("effect budget exhausted"));
++            }
++            let final_now = clock();
++            if final_now < now {
++                return Err(denied("clock regressed"));
++            }
++            state.current(&context.authority, final_now)?;
++            verifier.verify_and_build_binding(witness, final_now)?;
++            state
++                .scopes
++                .get_mut(&content_digest(&context.authority.scope)?)
++                .ok_or_else(|| denied("scope absent"))?
++                .effects += 1;
++            state
++                .approvals
++                .insert(permit.effect.permit_id.clone(), permit.permit_id.clone());
++            state.permits.insert(
++                permit.permit_id.clone(),
++                ScopedPermitRecordV1 {
++                    permit: permit.clone(),
++                    preflight: None,
++                    outcome: None,
++                },
++            );
++            self.replace_context_state(&state, None)?;
++            Ok(permit)
++        })
++    }
++
++    pub fn consume_scoped_external_permit(
++        &self,
++        access: &ContextAuthorityAccess,
++        verifier: &ProductionApprovalVerifierV1,
++        permit: &ScopedExecutionPermitV1,
++        call: &ToolCallSpecV1,
++        clock: impl Fn() -> DateTime<Utc>,
++    ) -> Result<ScopedPermitPreflightV1, PolicyError> {
++        self.with_lock(|| {
++            let mut state = self.context_state()?;
++            state.access(access)?;
++            if state.configuration.as_ref().map(|c| &c.approval_verifier)
++                != Some(&approval_verifier_digest(verifier)?)
++            {
++                return Err(denied("approval verifier differs from current enrollment"));
++            }
++            let now = clock();
++            let scope = state.current(&permit.context.authority, now)?;
++            verify(
++                &scope.grant.controller_public_key,
++                &permit.context.signing_bytes()?,
++                &permit.context.signature,
++            )?;
++            let record = state
++                .permits
++                .get(&permit.permit_id)
++                .ok_or_else(|| denied("permit not issued"))?;
++            if permit.approval_verifier != approval_verifier_digest(verifier)?
++                || record.permit != *permit
++                || record.preflight.is_some()
++                || scope.head.mode != ContextAdmissionModeV1::Active
++            {
++                return Err(denied("permit changed, consumed or sealed"));
++            }
++            let binding = &permit.effect.binding;
++            if binding.tool != call.tool
++                || binding.action_digest != content_digest(call)?
++                || binding.args_digest != content_digest(&call.args)?
++                || binding.policy_version != scope.grant.policy_version
++                || binding.actor != scope.grant.actor
++            {
++                return Err(denied("dispatch differs from approved call"));
++            }
++            let final_now = clock();
++            state.current(&permit.context.authority, final_now)?;
++            if final_now < now || final_now < binding.not_before || final_now >= binding.expires_at
++            {
++                return Err(denied("call validity changed"));
++            }
++            let preflight = ScopedPermitPreflightV1 {
++                permit: permit.clone(),
++                recorded_at: final_now,
++                receipt_digest: content_digest(&(
++                    "recursive-agent.scoped-external-preflight/v1",
++                    permit,
++                    final_now,
++                ))?,
++            };
++            state
++                .permits
++                .get_mut(&permit.permit_id)
++                .ok_or_else(|| denied("permit absent"))?
++                .preflight = Some(preflight.clone());
++            self.replace_context_state(&state, None)?;
++            Ok(preflight)
++        })
++    }
++
++    pub fn transition_context_authority(
++        &self,
++        access: &ContextAuthorityAccess,
++        request: &ContextTransitionRequestV1,
++        clock: impl Fn() -> DateTime<Utc>,
++        interrupt_after: Option<PermitTransitionStage>,
++    ) -> Result<ContextTransitionReceiptV1, PolicyError> {
++        self.with_lock(|| {
++            let mut state = self.context_state()?;
++            state.access(access)?;
++            // Readback after lost ACK returns the immutable original operation,
++            // even when its predecessor is no longer current. It grants no call.
++            if let Some(receipt) = state.receipts.get(&request.transition) {
++                return if receipt.request == *request {
++                    Ok(receipt.clone())
++                } else {
++                    Err(denied("conflicting transition identity"))
++                };
++            }
++            let now = clock();
++            let scope = state.current(&request.authority, now)?;
++            verify(
++                &scope.grant.controller_public_key,
++                &request.signing_bytes()?,
++                &request.signature,
++            )?;
++            if scope.transitions >= scope.grant.max_transitions
++                || state.receipts.len() >= MAX_TRANSITIONS
++            {
++                return Err(denied("transition budget exhausted"));
++            }
++            let successor = match &request.action {
++                ContextTransitionActionV1::Retire { successor_context } => {
++                    identifier(successor_context)?;
++                    ContextHeadV1 {
++                        context: successor_context.clone(),
++                        generation: scope
++                            .head
++                            .generation
++                            .checked_add(1)
++                            .ok_or_else(|| denied("generation exhausted"))?,
++                        mode: ContextAdmissionModeV1::Sealed,
++                    }
++                }
++                ContextTransitionActionV1::Activate { retirement_digest } => {
++                    if scope.head.mode != ContextAdmissionModeV1::Sealed
++                        || scope.retirement_digest.as_ref() != Some(retirement_digest)
++                    {
++                        return Err(denied("activation does not bind current retirement"));
++                    }
++                    ContextHeadV1 {
++                        mode: ContextAdmissionModeV1::Active,
++                        ..scope.head.clone()
++                    }
++                }
++            };
++            successor.validate()?;
++            let final_now = clock();
++            if final_now < now {
++                return Err(denied("clock regressed"));
++            }
++            state.current(&request.authority, final_now)?;
++            let consumed = state.consumed(&request.authority.scope);
++            let receipt = ContextTransitionReceiptV1 {
++                request: request.clone(),
++                successor: successor.clone(),
++                consumed: consumed.clone(),
++                recorded_at: final_now,
++                receipt_digest: content_digest(&(
++                    "recursive-agent.context-transition-receipt/v1",
++                    request,
++                    &successor,
++                    &consumed,
++                    final_now,
++                ))?,
++            };
++            let scope = state
++                .scopes
++                .get_mut(&content_digest(&request.authority.scope)?)
++                .ok_or_else(|| denied("scope absent"))?;
++            scope.head = successor;
++            scope.transitions += 1;
++            if matches!(request.action, ContextTransitionActionV1::Retire { .. }) {
++                scope.retirement_digest = Some(receipt.receipt_digest.clone());
++            }
++            state
++                .receipts
++                .insert(request.transition.clone(), receipt.clone());
++            state
++                .journal
++                .push(AuthorityEvent::Transition(request.transition.clone()));
++            self.replace_context_state(&state, interrupt_after)?;
++            Ok(receipt)
++        })
++    }
++
++    /// Historical readback requires exact full permit identity, never current
++    /// admission. Revocation must not erase a consumed effect's settlement path.
++    pub fn read_scoped_external_permit(
++        &self,
++        permit: &ScopedExecutionPermitV1,
++    ) -> Result<ScopedPermitRecordV1, PolicyError> {
++        self.with_lock(|| {
++            let state = self.context_state()?;
++            let record = state
++                .permits
++                .get(&permit.permit_id)
++                .ok_or_else(|| denied("permit absent"))?;
++            if record.permit != *permit {
++                return Err(denied("readback binding changed"));
++            }
++            Ok(record.clone())
++        })
++    }
++
++    pub fn settle_scoped_external_permit(
++        &self,
++        permit: &ScopedExecutionPermitV1,
++        preflight_digest: &ContentDigest,
++        reported: ReportedEffectOutcomeV1,
++        clock: impl Fn() -> DateTime<Utc>,
++    ) -> Result<PermitOutcomeReceiptV1, PolicyError> {
++        reported.validate()?;
++        self.with_lock(|| {
++            let mut state = self.context_state()?;
++            let record = state
++                .permits
++                .get_mut(&permit.permit_id)
++                .ok_or_else(|| denied("permit absent"))?;
++            if record.permit != *permit {
++                return Err(denied("settlement binding changed"));
++            }
++            let preflight = record
++                .preflight
++                .as_ref()
++                .ok_or_else(|| denied("permit not consumed"))?;
++            let now = clock();
++            if preflight.receipt_digest != *preflight_digest || now < preflight.recorded_at {
++                return Err(denied("settlement preflight changed"));
++            }
++            if let Some(existing) = &record.outcome {
++                return if existing.reported == reported {
++                    Ok(existing.clone())
++                } else {
++                    Err(denied("conflicting outcome"))
++                };
++            }
++            let outcome = PermitOutcomeReceiptV1::create(
++                permit.permit_id.clone(),
++                preflight_digest.clone(),
++                reported,
++                now,
++            )?;
++            record.outcome = Some(outcome.clone());
++            self.replace_context_state(&state, None)?;
++            Ok(outcome)
++        })
++    }
++
++    // Called only while the existing lock is held by a legacy mutation.
++    pub(super) fn reject_legacy_context_admission(&self) -> Result<(), PolicyError> {
++        if self.read_context_state()?.is_some() {
++            return Err(denied("legacy admission fenced"));
++        }
++        Ok(())
++    }
++
++    fn context_state(&self) -> Result<AuthorityState, PolicyError> {
++        self.read_context_state()?
++            .ok_or_else(|| denied("authority not initialized"))
++    }
++
++    fn assert_no_legacy_consumption(&self) -> Result<(), PolicyError> {
++        let entries =
++            rustix::fs::Dir::read_from(self.root.as_fd()).map_err(std::io::Error::from)?;
++        for (index, entry) in entries.enumerate() {
++            if index >= MAX_PERMITS {
++                return Err(denied("legacy inventory exceeds enrollment bound"));
++            }
++            let entry = entry.map_err(std::io::Error::from)?;
++            let name = entry.file_name().to_bytes();
++            if !name.starts_with(b"permit-") || !name.ends_with(b".json") {
++                continue;
++            }
++            let name =
++                std::str::from_utf8(name).map_err(|_| denied("invalid legacy record name"))?;
++            let fd = secure_open_at(
++                &self.root,
++                name,
++                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
++                Mode::empty(),
++            )?;
++            let file = File::from(fd);
++            if !file.metadata()?.is_file() || file.metadata()?.len() > MAX_PERMIT_RECORD_BYTES {
++                return Err(denied("invalid legacy record"));
++            }
++            let mut bytes = Vec::new();
++            file.take(MAX_PERMIT_RECORD_BYTES + 1)
++                .read_to_end(&mut bytes)?;
++            if bytes.len() as u64 > MAX_PERMIT_RECORD_BYTES {
++                return Err(denied("legacy record exceeds bound"));
++            }
++            let record: PermitRecordV1 = serde_json::from_slice(&bytes)?;
++            if state_name(&record.permit.permit_id)? != name {
++                return Err(denied("legacy record identity changed"));
++            }
++            let checked = self.read_record(&record.permit.permit_id)?;
++            // V1 has no scope or independently confirmed external settlement.
++            // Do not fabricate a migration or lose an already-admitted effect.
++            if matches!(checked.state, PermitStateV1::Consumed { .. }) {
++                return Err(denied(
++                    "legacy consumed effects require explicit owner migration",
++                ));
++            }
++        }
++        Ok(())
++    }
++
++    /// Validate the durable projection by replaying its authenticated history.
++    /// This detects inconsistent/corrupted projections; it is not a claim of
++    /// isolation from an operator replacing the entire store and all history.
++    fn validate_context_history(&self, state: &AuthorityState) -> Result<(), PolicyError> {
++        if state.journal.len() > MAX_TRANSITIONS * 2 {
++            return Err(denied("authority history exceeds bound"));
++        }
++        let mut replay = AuthorityState {
++            schema: ContextAuthoritySchemaV1::V1,
++            incarnation: state.incarnation.clone(),
++            root_identity: state.root_identity,
++            configuration: None,
++            scopes: BTreeMap::new(),
++            permits: BTreeMap::new(),
++            approvals: BTreeMap::new(),
++            receipts: BTreeMap::new(),
++            journal: Vec::new(),
++        };
++        let mut seen = BTreeSet::new();
++        let mut grants = BTreeMap::new();
++        let mut admitted_heads = BTreeSet::new();
++        for event in &state.journal {
++            match event {
++                AuthorityEvent::Enrollment(configuration) => {
++                    apply_configuration(&mut replay, configuration)?;
++                    for grant in &configuration.grants {
++                        grants.insert(content_digest(grant)?, grant);
++                    }
++                }
++                AuthorityEvent::Transition(key) => {
++                    if !seen.insert(key.clone()) {
++                        return Err(denied("duplicate historical transition"));
++                    }
++                    let receipt = state
++                        .receipts
++                        .get(key)
++                        .ok_or_else(|| denied("historical transition missing"))?;
++                    let request = &receipt.request;
++                    let scope = replay.current(&request.authority, receipt.recorded_at)?;
++                    verify(
++                        &scope.grant.controller_public_key,
++                        &request.signing_bytes()?,
++                        &request.signature,
++                    )?;
++                    if scope.transitions >= scope.grant.max_transitions {
++                        return Err(denied("historical transition exceeds grant"));
++                    }
++                    let successor = match &request.action {
++                        ContextTransitionActionV1::Retire { successor_context } => ContextHeadV1 {
++                            context: successor_context.clone(),
++                            generation: scope
++                                .head
++                                .generation
++                                .checked_add(1)
++                                .ok_or_else(|| denied("historical generation overflow"))?,
++                            mode: ContextAdmissionModeV1::Sealed,
++                        },
++                        ContextTransitionActionV1::Activate { retirement_digest } => {
++                            if scope.head.mode != ContextAdmissionModeV1::Sealed
++                                || scope.retirement_digest.as_ref() != Some(retirement_digest)
++                            {
++                                return Err(denied("historical activation mismatch"));
++                            }
++                            ContextHeadV1 {
++                                mode: ContextAdmissionModeV1::Active,
++                                ..scope.head.clone()
++                            }
++                        }
++                    };
++                    if successor != receipt.successor {
++                        return Err(denied("historical successor mismatch"));
++                    }
++                    let expected_ids: BTreeSet<_> = state
++                        .permits
++                        .iter()
++                        .filter(|(_, r)| {
++                            r.permit.context.authority.scope == request.authority.scope
++                                && r.preflight.is_some()
++                                && r.permit.context.authority.head.generation < successor.generation
++                        })
++                        .map(|(id, _)| id.clone())
++                        .collect();
++                    let actual_ids: BTreeSet<_> = receipt
++                        .consumed
++                        .iter()
++                        .map(|r| r.permit_id.clone())
++                        .collect();
++                    if expected_ids != actual_ids || actual_ids.len() != receipt.consumed.len() {
++                        return Err(denied("historical obligation inventory mismatch"));
++                    }
++                    for historical in &receipt.consumed {
++                        let current = state
++                            .permits
++                            .get(&historical.permit_id)
++                            .ok_or_else(|| denied("historical obligation absent"))?;
++                        let preflight = current
++                            .preflight
++                            .as_ref()
++                            .ok_or_else(|| denied("historical consumption absent"))?;
++                        if historical.preflight_receipt_digest != preflight.receipt_digest
++                            || preflight.recorded_at > receipt.recorded_at
++                            || historical.outcome_receipt_digest.is_some()
++                                != historical.reported_state.is_some()
++                        {
++                            return Err(denied("historical obligation binding mismatch"));
++                        }
++                        if let Some(digest) = &historical.outcome_receipt_digest {
++                            let outcome = current
++                                .outcome
++                                .as_ref()
++                                .ok_or_else(|| denied("historical outcome absent"))?;
++                            if outcome.receipt_digest != *digest
++                                || Some(outcome.reported.state) != historical.reported_state
++                                || outcome.recorded_at > receipt.recorded_at
++                            {
++                                return Err(denied("historical outcome mismatch"));
++                            }
++                        }
++                    }
++                    let scope = replay
++                        .scopes
++                        .get_mut(&content_digest(&request.authority.scope)?)
++                        .ok_or_else(|| denied("historical scope missing"))?;
++                    scope.head = successor;
++                    scope.transitions += 1;
++                    if matches!(request.action, ContextTransitionActionV1::Retire { .. }) {
++                        scope.retirement_digest = Some(receipt.receipt_digest.clone());
++                    }
++                }
++            }
++            for scope in replay
++                .scopes
++                .values()
++                .filter(|s| s.active && s.head.mode == ContextAdmissionModeV1::Active)
++            {
++                let authority = ContextAuthorityBindingV1 {
++                    incarnation: state.incarnation.clone(),
++                    scope: scope.grant.scope.clone(),
++                    grant_digest: content_digest(&scope.grant)?,
++                    policy_digest: scope.grant.policy_digest.clone(),
++                    head: scope.head.clone(),
++                };
++                let config = replay
++                    .configuration
++                    .as_ref()
++                    .ok_or_else(|| denied("historical configuration absent"))?;
++                admitted_heads.insert(content_digest(&(&authority, &config.approval_verifier))?);
++            }
++        }
++        if seen.len() != state.receipts.len()
++            || replay.configuration != state.configuration
++            || replay.scopes.len() != state.scopes.len()
++        {
++            return Err(denied("authority projection differs from history"));
++        }
++        for (key, actual) in &state.scopes {
++            let projected = replay
++                .scopes
++                .get_mut(key)
++                .ok_or_else(|| denied("scope projection absent"))?;
++            projected.effects = state
++                .permits
++                .values()
++                .filter(|r| r.permit.context.authority.scope == actual.grant.scope)
++                .count() as u64;
++            if projected != actual {
++                return Err(denied("scope projection differs from history"));
++            }
++        }
++        for record in state.permits.values() {
++            let permit = &record.permit;
++            let authority = &permit.context.authority;
++            let grant = grants
++                .get(&authority.grant_digest)
++                .ok_or_else(|| denied("historical grant absent"))?;
++            if !admitted_heads.contains(&content_digest(&(authority, &permit.approval_verifier))?)
++                || grant.scope != authority.scope
++                || grant.policy_digest != authority.policy_digest
++                || grant.policy_version != permit.effect.binding.policy_version
++                || grant.actor != permit.effect.binding.actor
++                || permit.effect.binding.effect.write_roots != vec![grant.write_root.clone()]
++                || permit.effect.binding.expires_at > grant.expires_at
++            {
++                return Err(denied("historical effect outside grant"));
++            }
++            verify(
++                &grant.controller_public_key,
++                &permit.context.signing_bytes()?,
++                &permit.context.signature,
++            )?;
++        }
++        Ok(())
++    }
++
++    fn read_context_state(&self) -> Result<Option<AuthorityState>, PolicyError> {
++        let fd = match secure_open_at(
++            &self.root,
++            STATE_FILE,
++            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
++            Mode::empty(),
++        ) {
++            Ok(fd) => fd,
++            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
++            Err(e) => return Err(e.into()),
++        };
++        let file = File::from(fd);
++        let metadata = file.metadata()?;
++        if !metadata.is_file() || metadata.len() > MAX_STATE_BYTES {
++            return Err(denied("invalid state file"));
++        }
++        let mut bytes = Vec::new();
++        file.take(MAX_STATE_BYTES + 1).read_to_end(&mut bytes)?;
++        if bytes.len() as u64 > MAX_STATE_BYTES {
++            return Err(denied("state exceeds bound"));
++        }
++        let state: AuthorityState = serde_json::from_slice(&bytes)?;
++        // Canonical equality also rejects duplicate object keys on disk.
++        if jcs_canonical(&state)? != bytes || state.root_identity != self.permit_root_identity() {
++            return Err(denied("noncanonical or substituted authority store"));
++        }
++        self.validate_context_state(&state)?;
++        Ok(Some(state))
++    }
++
++    fn validate_context_state(&self, state: &AuthorityState) -> Result<(), PolicyError> {
++        self.validate_context_history(state)?;
++        if state.scopes.len() > MAX_SCOPES
++            || state.permits.len() > MAX_PERMITS
++            || state.receipts.len() > MAX_TRANSITIONS
++            || state.approvals.len() != state.permits.len()
++        {
++            return Err(denied("invalid state inventory"));
++        }
++        for (key, scope) in &state.scopes {
++            scope.grant.validate()?;
++            scope.head.validate()?;
++            if content_digest(&scope.grant.scope)? != *key {
++                return Err(denied("scope identity corrupted"));
++            }
++            let effects = state
++                .permits
++                .values()
++                .filter(|r| r.permit.context.authority.scope == scope.grant.scope)
++                .count() as u64;
++            let transitions = state
++                .receipts
++                .values()
++                .filter(|r| r.request.authority.scope == scope.grant.scope)
++                .count() as u64;
++            if scope.effects != effects || scope.transitions != transitions {
++                return Err(denied("scope charges corrupted"));
++            }
++        }
++        for (key, record) in &state.permits {
++            let permit = &record.permit;
++            permit.effect.binding.validate()?;
++            if permit.permit_id != *key
++                || ScopedExecutionPermitV1::derive_id(
++                    &permit.effect,
++                    &permit.context,
++                    &permit.approval_verifier,
++                )? != *key
++                || derive_permit_id(&permit.effect.identity_material()?)? != permit.effect.permit_id
++                || state.approvals.get(&permit.effect.permit_id) != Some(key)
++                || permit.context.authority.incarnation != state.incarnation
++                || !state
++                    .scopes
++                    .contains_key(&content_digest(&permit.context.authority.scope)?)
++            {
++                return Err(denied("permit identity corrupted"));
++            }
++            if let Some(preflight) = &record.preflight {
++                if preflight.permit != *permit
++                    || preflight.receipt_digest
++                        != content_digest(&(
++                            "recursive-agent.scoped-external-preflight/v1",
++                            permit,
++                            preflight.recorded_at,
++                        ))?
++                    || preflight.recorded_at < permit.effect.binding.not_before
++                    || preflight.recorded_at >= permit.effect.binding.expires_at
++                {
++                    return Err(denied("preflight corrupted"));
++                }
++                if let Some(outcome) = &record.outcome {
++                    outcome.validate()?;
++                    if outcome.permit_id != *key
++                        || outcome.preflight_receipt_digest != preflight.receipt_digest
++                        || outcome.recorded_at < preflight.recorded_at
++                    {
++                        return Err(denied("outcome binding corrupted"));
++                    }
++                }
++            } else if record.outcome.is_some() {
++                return Err(denied("outcome without consumption"));
++            }
++        }
++        for (key, receipt) in &state.receipts {
++            if *key != receipt.request.transition
++                || receipt.receipt_digest
++                    != content_digest(&(
++                        "recursive-agent.context-transition-receipt/v1",
++                        &receipt.request,
++                        &receipt.successor,
++                        &receipt.consumed,
++                        receipt.recorded_at,
++                    ))?
++            {
++                return Err(denied("transition receipt corrupted"));
++            }
++        }
++        Ok(())
++    }
++
++    fn replace_context_state(
++        &self,
++        state: &AuthorityState,
++        interrupt_after: Option<PermitTransitionStage>,
++    ) -> Result<(), PolicyError> {
++        self.validate_context_state(state)?;
++        let bytes = jcs_canonical(state)?;
++        if bytes.len() as u64 > MAX_STATE_BYTES {
++            return Err(denied("state capacity exhausted"));
++        }
++        let (temp, mut file) = create_unique_temp(&self.root, ".context-authority.tmp")?;
++        file.write_all(&bytes)?;
++        if interrupt_after == Some(PermitTransitionStage::TempWrite) {
++            return Err(PolicyError::InjectedInterruption(
++                PermitTransitionStage::TempWrite,
++            ));
++        }
++        file.sync_all()?;
++        if interrupt_after == Some(PermitTransitionStage::TempFsync) {
++            return Err(PolicyError::InjectedInterruption(
++                PermitTransitionStage::TempFsync,
++            ));
++        }
++        rustix::fs::renameat(self.root.as_fd(), &temp, self.root.as_fd(), STATE_FILE)
++            .map_err(std::io::Error::from)?;
++        if interrupt_after == Some(PermitTransitionStage::Rename) {
++            return Err(PolicyError::InjectedInterruption(
++                PermitTransitionStage::Rename,
++            ));
++        }
++        self.root.sync_all()?;
++        if interrupt_after == Some(PermitTransitionStage::DirectoryFsync) {
++            return Err(PolicyError::InjectedInterruption(
++                PermitTransitionStage::DirectoryFsync,
++            ));
++        }
++        Ok(())
++    }
++}
+diff --git a/crates/recursive-agent-policy/src/lib.rs b/crates/recursive-agent-policy/src/lib.rs
+index e21b1e7..5997f27 100644
+--- a/crates/recursive-agent-policy/src/lib.rs
++++ b/crates/recursive-agent-policy/src/lib.rs
+@@ -1,5 +1,8 @@
+ //! Static allowlist and durable, single-use capability leases.
+ 
++mod context_authority;
++pub use context_authority::*;
++
+ use std::collections::{BTreeMap, BTreeSet};
+ use std::fs::File;
+ use std::io::{Read, Write};
+@@ -1141,6 +1144,26 @@ pub struct PermitPreflightReceiptV1 {
+     pub receipt_digest: ContentDigest,
+ }
+ 
++#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
++pub enum ExternalPermitReadbackSchemaV1 {
++    #[serde(rename = "recursive-agent.external-permit-readback/v1")]
++    V1,
++}
++
++/// Read-only reconciliation of one exact external binding. Historical receipts
++/// never grant permission to dispatch or replay an effect after an uncertain ACK.
++/// Missing receipts remain missing; legacy consumption is not reconstructed.
++#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct ExternalPermitReadbackV1 {
++    pub schema: ExternalPermitReadbackSchemaV1,
++    pub permit_id: CurrentPermitId,
++    pub binding: PermitBindingV1,
++    pub state: PermitStateV1,
++    pub preflight: Option<PermitPreflightReceiptV1>,
++    pub outcome: Option<PermitOutcomeReceiptV1>,
++}
++
+ impl PermitPreflightReceiptV1 {
+     fn create(evidence: PermitEvidenceV1, recorded_at: DateTime<Utc>) -> Result<Self, PolicyError> {
+         evidence.validate()?;
+@@ -2752,6 +2775,7 @@ impl DurablePermitStore {
+             ));
+         }
+         self.with_lock(|| {
++            self.reject_legacy_context_admission()?;
+             let parent = binding
+                 .parent_permit_id
+                 .as_ref()
+@@ -3046,6 +3070,7 @@ impl DurablePermitStore {
+         mut trusted_clock: impl FnMut() -> DateTime<Utc>,
+     ) -> Result<(PermitEvidenceV1, NormalChatConsumption), PolicyError> {
+         self.with_lock(|| {
++            self.reject_legacy_context_admission()?;
+             // Waiting for the process/thread lock may outlive admission validity.
+             // Sample inside the critical section, never reuse a pre-wait instant.
+             let trusted_now = trusted_clock();
+@@ -3136,10 +3161,14 @@ impl DurablePermitStore {
+         &self,
+         permit_id: &CurrentPermitId,
+         dispatch: &PermitBindingV1,
+-        trusted_now: DateTime<Utc>,
++        clock: impl Fn() -> DateTime<Utc>,
+     ) -> Result<PermitPreflightReceiptV1, PolicyError> {
+         dispatch.validate()?;
+         self.with_lock(|| {
++            self.reject_legacy_context_admission()?;
++            // The caller must supply its trusted clock, not a timestamp taken
++            // before waiting on another process's permit-store lock.
++            let trusted_now = clock();
+             let mut record = self.read_record_or_reject(permit_id)?;
+             if record.permit.binding.tool == NORMAL_CHAT_LANE {
+                 return Err(PolicyError::InvalidLease(
+@@ -3153,12 +3182,21 @@ impl DurablePermitStore {
+                     .map_err(|_| rejected(permit_id, PermitRejectionReasonV1::WrongParent))?;
+                 validate_parent_binding(&record.permit, &parent, trusted_now)?;
+             }
++            let final_now = clock();
++            if final_now < trusted_now {
++                return Err(PolicyError::InvalidLease("trusted clock regressed".into()));
++            }
++            validate_dispatch(permit_id, &record, dispatch, final_now)?;
++            if let Some(parent_id) = &record.permit.binding.parent_permit_id {
++                let parent = self.read_record(parent_id)?;
++                validate_parent_binding(&record.permit, &parent, final_now)?;
++            }
+             record.state = PermitStateV1::Consumed {
+-                consumed_at: trusted_now,
++                consumed_at: final_now,
+             };
+             let receipt = PermitPreflightReceiptV1::create(
+                 PermitEvidenceV1::from_record(&record)?,
+-                trusted_now,
++                final_now,
+             )?;
+             record.preflight_receipt = Some(receipt.clone());
+             self.replace_record(&record, None)?;
+@@ -3237,13 +3275,10 @@ impl DurablePermitStore {
+             }
+             if let Some(existing) = &record.outcome_receipt {
+                 existing.validate()?;
+-                let proposed = PermitOutcomeReceiptV1::create(
+-                    permit_id.clone(),
+-                    preflight_receipt_digest.clone(),
+-                    reported,
+-                    trusted_now,
+-                )?;
+-                if *existing == proposed {
++                // Identity is the exact semantic report bound to this consumed
++                // preflight. An ACK retry must return the persisted timestamp
++                // and digest, never mint a new receipt or overwrite ambiguity.
++                if existing.reported == reported {
+                     return Ok(existing.clone());
+                 }
+                 return Err(PolicyError::PermitStateConflict);
+@@ -3269,6 +3304,7 @@ impl DurablePermitStore {
+     ) -> Result<PermitRecordV1, PolicyError> {
+         dispatch.validate()?;
+         self.with_lock(|| {
++            self.reject_legacy_context_admission()?;
+             let mut record = self.read_record_or_reject(permit_id)?;
+             if record.permit.binding.tool == NORMAL_CHAT_LANE {
+                 return Err(PolicyError::InvalidLease(
+@@ -3336,6 +3372,38 @@ impl DurablePermitStore {
+         self.with_lock(|| self.read_record_or_reject(permit_id))
+     }
+ 
++    pub fn read_external_permit(
++        &self,
++        permit_id: &CurrentPermitId,
++        expected_binding: &PermitBindingV1,
++        expected_preflight: Option<&ContentDigest>,
++    ) -> Result<ExternalPermitReadbackV1, PolicyError> {
++        expected_binding.validate()?;
++        self.with_lock(|| {
++            let record = self.read_record_or_reject(permit_id)?;
++            if record.permit.binding != *expected_binding
++                || record.permit.binding.tool == NORMAL_CHAT_LANE
++                || expected_preflight.is_some_and(|digest| {
++                    record
++                        .preflight_receipt
++                        .as_ref()
++                        .map(|receipt| &receipt.receipt_digest)
++                        != Some(digest)
++                })
++            {
++                return Err(rejected(permit_id, PermitRejectionReasonV1::WrongAction));
++            }
++            Ok(ExternalPermitReadbackV1 {
++                schema: ExternalPermitReadbackSchemaV1::V1,
++                permit_id: permit_id.clone(),
++                binding: record.permit.binding,
++                state: record.state,
++                preflight: record.preflight_receipt,
++                outcome: record.outcome_receipt,
++            })
++        })
++    }
++
+     pub fn validate_parent_authority(
+         &self,
+         child_permit_id: &CurrentPermitId,
+diff --git a/crates/recursive-agent-policy/tests/context_authority.rs b/crates/recursive-agent-policy/tests/context_authority.rs
+new file mode 100644
+index 0000000..d9825a5
+--- /dev/null
++++ b/crates/recursive-agent-policy/tests/context_authority.rs
+@@ -0,0 +1,738 @@
++use chrono::{DateTime, TimeDelta, Utc};
++use ed25519_dalek::{Signer, SigningKey};
++use recursive_agent_contracts::{content_digest, jcs_canonical, ToolCallSpecV1};
++use recursive_agent_policy::*;
++use std::fs::File;
++
++type TestResult = Result<(), Box<dyn std::error::Error>>;
++
++fn now() -> DateTime<Utc> {
++    DateTime::<Utc>::UNIX_EPOCH + TimeDelta::seconds(1_700_000_000)
++}
++
++struct Fixture {
++    root: tempfile::TempDir,
++    store: DurablePermitStore,
++    configuration: ContextAuthorityConfigurationV1,
++    access: ContextAuthorityAccess,
++    controller: SigningKey,
++    approver: SigningKey,
++    verifier: ProductionApprovalVerifierV1,
++}
++
++impl Fixture {
++    fn new() -> Result<Self, Box<dyn std::error::Error>> {
++        let root = tempfile::tempdir()?;
++        let store = DurablePermitStore::from_dir_fd(&File::open(root.path())?)?;
++        let controller = SigningKey::from_bytes(&[3; 32]);
++        let approver = SigningKey::from_bytes(&[7; 32]);
++        let verifier = ProductionApprovalVerifierV1::from_public_key_bytes(
++            "desktop".into(),
++            approver.verifying_key().to_bytes(),
++        )?;
++        let configuration = ContextAuthorityConfigurationV1 {
++            schema: ContextAuthoritySchemaV1::V1,
++            incarnation: store.initialize_context_authority()?,
++            revision: 1,
++            approval_verifier: verifier.context_authority_digest()?,
++            grants: vec![ContextScopeGrantV1 {
++                scope: ContextScopeV1 {
++                    store: content_digest(&"ares-store")?,
++                    profile: "work".into(),
++                    root: "conversation-root".into(),
++                },
++                controller_public_key: controller.verifying_key().to_bytes(),
++                actor: ActorPrincipalV1::try_new("desktop:operator")?,
++                policy_version: "policy-v1".into(),
++                policy_digest: content_digest(&"policy-v1")?,
++                write_root: PRODUCTION_PERMIT_TARGET_ROOT.into(),
++                initial_head: ContextHeadV1 {
++                    context: "parent".into(),
++                    generation: 1,
++                    mode: ContextAdmissionModeV1::Active,
++                },
++                not_before: now(),
++                expires_at: now() + TimeDelta::hours(1),
++                max_effects: 8,
++                max_transitions: 20,
++                previous_grant: None,
++            }],
++        };
++        let access = store.enroll_context_authority(&configuration)?;
++        Ok(Self {
++            root,
++            store,
++            configuration,
++            access,
++            controller,
++            approver,
++            verifier,
++        })
++    }
++
++    fn authority(&self) -> Result<ContextAuthorityBindingV1, Box<dyn std::error::Error>> {
++        Ok(self
++            .store
++            .read_context_authority(
++                &self.configuration.incarnation,
++                &self.configuration.grants[0].scope,
++            )?
++            .authority)
++    }
++
++    fn witness(&self, id: &str) -> Result<ProductionApprovalWitnessV1, Box<dyn std::error::Error>> {
++        let mut witness = ProductionApprovalWitnessV1 {
++            approval_id: id.into(),
++            mission_ref: "mission".into(),
++            target_ref: "output".into(),
++            call: ToolCallSpecV1 {
++                tool: "write_file".into(),
++                args: serde_json::json!({"path":format!("{PRODUCTION_PERMIT_TARGET_ROOT}/out.txt"), "content":"approved"}),
++                frozen_clock: None,
++            },
++            actor: self.configuration.grants[0].actor.clone(),
++            effect: EffectScopeV1 {
++                scope_name: format!("production-per-call:{id}"),
++                read_roots: vec![],
++                write_roots: vec![PRODUCTION_PERMIT_TARGET_ROOT.into()],
++                network_allowed: false,
++            },
++            budget: PermitBudgetV1 {
++                max_wall_time_ms: 1000,
++                max_output_bytes: 4096,
++                max_artifact_bytes: 8192,
++            },
++            policy_version: self.configuration.grants[0].policy_version.clone(),
++            issued_at: now(),
++            not_before: now(),
++            expires_at: now() + TimeDelta::seconds(60),
++            retry: RetryPolicyV1::NoRetry,
++            delegation: DelegationPolicyV1::Forbidden,
++            outcome_policy: OutcomePolicyV1::TerminalQuarantine,
++            key_id: "desktop".into(),
++            signature: vec![],
++        };
++        let mut value = serde_json::to_value(&witness)?;
++        value
++            .as_object_mut()
++            .ok_or("witness object")?
++            .remove("signature");
++        witness.signature = self
++            .approver
++            .sign(&jcs_canonical(&value)?)
++            .to_bytes()
++            .to_vec();
++        Ok(witness)
++    }
++
++    fn context(
++        &self,
++        witness: &ProductionApprovalWitnessV1,
++    ) -> Result<ContextCallBindingV1, Box<dyn std::error::Error>> {
++        let mut context = ContextCallBindingV1 {
++            authority: self.authority()?,
++            witness_digest: content_digest(witness)?,
++            signature: vec![],
++        };
++        context.signature = self
++            .controller
++            .sign(&context.signing_bytes()?)
++            .to_bytes()
++            .to_vec();
++        Ok(context)
++    }
++
++    fn transition(
++        &self,
++        id: &str,
++        action: ContextTransitionActionV1,
++    ) -> Result<ContextTransitionRequestV1, Box<dyn std::error::Error>> {
++        let mut request = ContextTransitionRequestV1 {
++            authority: self.authority()?,
++            transition: content_digest(&id)?,
++            action,
++            signature: vec![],
++        };
++        request.signature = self
++            .controller
++            .sign(&request.signing_bytes()?)
++            .to_bytes()
++            .to_vec();
++        Ok(request)
++    }
++
++    fn issue(
++        &self,
++        id: &str,
++    ) -> Result<(ScopedExecutionPermitV1, ProductionApprovalWitnessV1), Box<dyn std::error::Error>>
++    {
++        let witness = self.witness(id)?;
++        let permit = self.store.issue_scoped_external_permit(
++            &self.access,
++            &self.verifier,
++            &witness,
++            &self.context(&witness)?,
++            now,
++        )?;
++        Ok((permit, witness))
++    }
++
++    fn retire_activate(&self) -> TestResult {
++        let request = self.transition(
++            "retirement",
++            ContextTransitionActionV1::Retire {
++                successor_context: "child".into(),
++            },
++        )?;
++        let receipt = self
++            .store
++            .transition_context_authority(&self.access, &request, now, None)?;
++        let activation = self.transition(
++            "activation",
++            ContextTransitionActionV1::Activate {
++                retirement_digest: receipt.receipt_digest,
++            },
++        )?;
++        self.store
++            .transition_context_authority(&self.access, &activation, now, None)?;
++        Ok(())
++    }
++}
++
++#[test]
++fn retirement_seals_old_calls_and_preserves_consumed_obligations_after_restart() -> TestResult {
++    let f = Fixture::new()?;
++    let (consumed, call) = f.issue("consumed")?;
++    let (unconsumed, call2) = f.issue("not-consumed")?;
++    let preflight = f.store.consume_scoped_external_permit(
++        &f.access,
++        &f.verifier,
++        &consumed,
++        &call.call,
++        now,
++    )?;
++    let request = f.transition(
++        "retire",
++        ContextTransitionActionV1::Retire {
++            successor_context: "child".into(),
++        },
++    )?;
++    let receipt = f
++        .store
++        .transition_context_authority(&f.access, &request, now, None)?;
++    assert_eq!(receipt.consumed.len(), 1);
++    assert_eq!(
++        receipt.consumed[0].preflight_receipt_digest,
++        preflight.receipt_digest
++    );
++    assert!(f
++        .store
++        .consume_scoped_external_permit(&f.access, &f.verifier, &unconsumed, &call2.call, now)
++        .is_err());
++    let reopened = DurablePermitStore::from_dir_fd(&File::open(f.root.path())?)?;
++    assert_eq!(
++        reopened.initialize_context_authority()?,
++        f.configuration.incarnation
++    );
++    assert_eq!(
++        reopened.read_context_transition(&request)?,
++        Some(receipt.clone())
++    );
++    assert_eq!(
++        reopened.transition_context_authority(
++            &f.access,
++            &request,
++            || now() + TimeDelta::seconds(1),
++            None
++        )?,
++        receipt
++    );
++    let report = ReportedEffectOutcomeV1 {
++        state: ReportedEffectStateV1::OutcomeAmbiguous,
++        duration_ms: 1,
++        error_type: Some("ack_lost".into()),
++    };
++    let outcome = reopened.settle_scoped_external_permit(
++        &consumed,
++        &preflight.receipt_digest,
++        report.clone(),
++        now,
++    )?;
++    assert_eq!(
++        reopened.settle_scoped_external_permit(
++            &consumed,
++            &preflight.receipt_digest,
++            report,
++            || now() + TimeDelta::seconds(3)
++        )?,
++        outcome
++    );
++    assert_eq!(
++        reopened.read_scoped_external_permit(&consumed)?.outcome,
++        Some(outcome)
++    );
++    let activation = f.transition(
++        "activate",
++        ContextTransitionActionV1::Activate {
++            retirement_digest: receipt.receipt_digest,
++        },
++    )?;
++    let active = reopened.transition_context_authority(&f.access, &activation, now, None)?;
++    assert_eq!(active.consumed.len(), 1); // unknown remains an obligation
++    assert!(reopened
++        .consume_scoped_external_permit(&f.access, &f.verifier, &consumed, &call.call, now)
++        .is_err());
++    Ok(())
++}
++
++#[test]
++fn approval_cannot_be_wrapped_again_in_a_new_generation_or_scope() -> TestResult {
++    let mut f = Fixture::new()?;
++    let (permit, witness) = f.issue("one-use")?;
++    assert_eq!(
++        f.store.issue_scoped_external_permit(
++            &f.access,
++            &f.verifier,
++            &witness,
++            &permit.context,
++            now
++        )?,
++        permit
++    );
++    f.retire_activate()?;
++    assert!(f
++        .store
++        .issue_scoped_external_permit(&f.access, &f.verifier, &witness, &f.context(&witness)?, now)
++        .is_err());
++    let mut another = f.configuration.grants[0].clone();
++    another.scope.root = "other-root".into();
++    f.configuration.grants.push(another.clone());
++    f.configuration.revision += 1;
++    f.access = f.store.enroll_context_authority(&f.configuration)?;
++    let mut context = f.context(&witness)?;
++    context.authority = f
++        .store
++        .read_context_authority(&f.configuration.incarnation, &another.scope)?
++        .authority;
++    context.signature = f
++        .controller
++        .sign(&context.signing_bytes()?)
++        .to_bytes()
++        .to_vec();
++    assert!(f
++        .store
++        .issue_scoped_external_permit(&f.access, &f.verifier, &witness, &context, now)
++        .is_err());
++    Ok(())
++}
++
++#[test]
++fn every_scope_coordinate_and_controller_signature_is_checked() -> TestResult {
++    let f = Fixture::new()?;
++    let witness = f.witness("scope-tests")?;
++    let context = f.context(&witness)?;
++    for variant in 0..8 {
++        let mut changed = context.clone();
++        match variant {
++            0 => changed.authority.scope.profile = "other".into(),
++            1 => changed.authority.scope.root = "other".into(),
++            2 => changed.authority.scope.store = content_digest(&"other")?,
++            3 => changed.authority.incarnation = content_digest(&"other")?,
++            4 => changed.authority.policy_digest = content_digest(&"other")?,
++            5 => changed.authority.head.generation += 1,
++            6 => changed.witness_digest = content_digest(&"other")?,
++            _ => {}
++        }
++        let key = if variant == 7 {
++            SigningKey::from_bytes(&[9; 32])
++        } else {
++            f.controller.clone()
++        };
++        changed.signature = key.sign(&changed.signing_bytes()?).to_bytes().to_vec();
++        assert!(
++            f.store
++                .issue_scoped_external_permit(&f.access, &f.verifier, &witness, &changed, now)
++                .is_err(),
++            "accepted variant {variant}"
++        );
++    }
++    assert!(f
++        .store
++        .issue_scoped_external_permit(&f.access, &f.verifier, &witness, &context, now)
++        .is_ok());
++    Ok(())
++}
++
++#[test]
++fn initialization_fences_all_legacy_entrypoints_and_preexisting_approvals() -> TestResult {
++    let f = Fixture::new()?;
++    let root = tempfile::tempdir()?;
++    let legacy = DurablePermitStore::from_dir_fd(&File::open(root.path())?)?;
++    let witness = f.witness("legacy")?;
++    let binding = f.verifier.verify_and_build_binding(&witness, now())?;
++    let permit = legacy.issue(&binding, now())?;
++    let incarnation = legacy.initialize_context_authority()?;
++    assert!(legacy.issue(&binding, now()).is_err());
++    assert!(legacy.consume(&permit.permit_id, &binding, now()).is_err());
++    assert!(legacy
++        .consume_with_preflight(&permit.permit_id, &binding, now)
++        .is_err());
++    let reopened = DurablePermitStore::from_dir_fd(&File::open(root.path())?)?;
++    assert!(reopened
++        .consume_with_interruption(&permit.permit_id, &binding, now(), None)
++        .is_err());
++    let mut configuration = f.configuration.clone();
++    configuration.incarnation = incarnation.clone();
++    let access = reopened.enroll_context_authority(&configuration)?;
++    let mut context = f.context(&witness)?;
++    context.authority.incarnation = incarnation;
++    context.signature = f
++        .controller
++        .sign(&context.signing_bytes()?)
++        .to_bytes()
++        .to_vec();
++    assert!(reopened
++        .issue_scoped_external_permit(&access, &f.verifier, &witness, &context, now)
++        .is_err());
++    assert_eq!(
++        reopened.state(&permit.permit_id)?.state,
++        PermitStateV1::Issued
++    );
++    Ok(())
++}
++
++#[test]
++fn grant_revocation_policy_change_and_key_rotation_preserve_charges() -> TestResult {
++    let mut f = Fixture::new()?;
++    let (permit, witness) = f.issue("old-policy")?;
++    let old_access = f.access.clone();
++    let old_config = f.configuration.clone();
++    let mut revoked = f.configuration.clone();
++    revoked.revision = 2;
++    revoked.grants.clear();
++    f.store.enroll_context_authority(&revoked)?;
++    assert!(f
++        .store
++        .consume_scoped_external_permit(&old_access, &f.verifier, &permit, &witness.call, now)
++        .is_err());
++    assert!(f.store.enroll_context_authority(&old_config).is_err());
++    f.configuration.revision = 3;
++    f.configuration.grants[0].previous_grant = Some(content_digest(&old_config.grants[0])?);
++    f.configuration.grants[0].policy_version = "policy-v2".into();
++    f.configuration.grants[0].policy_digest = content_digest(&"policy-v2")?;
++    f.configuration.grants[0].max_effects = 2;
++    f.controller = SigningKey::from_bytes(&[11; 32]);
++    f.configuration.grants[0].controller_public_key = f.controller.verifying_key().to_bytes();
++    f.access = f.store.enroll_context_authority(&f.configuration)?;
++    assert!(f
++        .store
++        .consume_scoped_external_permit(&f.access, &f.verifier, &permit, &witness.call, now)
++        .is_err());
++    f.issue("new-policy")?;
++    assert!(f.issue("over-budget").is_err());
++    let snapshot = f.store.read_context_authority(
++        &f.configuration.incarnation,
++        &f.configuration.grants[0].scope,
++    )?;
++    assert_eq!(snapshot.effects_charged, 2);
++    Ok(())
++}
++
++#[test]
++fn retirement_is_atomic_at_every_write_boundary_and_exact_retry_does_not_recharge() -> TestResult {
++    for stage in [
++        PermitTransitionStage::TempWrite,
++        PermitTransitionStage::TempFsync,
++        PermitTransitionStage::Rename,
++        PermitTransitionStage::DirectoryFsync,
++    ] {
++        let f = Fixture::new()?;
++        let request = f.transition(
++            "retire",
++            ContextTransitionActionV1::Retire {
++                successor_context: "child".into(),
++            },
++        )?;
++        assert!(f
++            .store
++            .transition_context_authority(&f.access, &request, now, Some(stage))
++            .is_err());
++        let reopened = DurablePermitStore::from_dir_fd(&File::open(f.root.path())?)?;
++        let before = reopened.read_context_authority(
++            &f.configuration.incarnation,
++            &f.configuration.grants[0].scope,
++        )?;
++        let receipt = reopened.read_context_transition(&request)?;
++        assert_eq!(before.transitions_charged, u64::from(receipt.is_some()));
++        assert_eq!(
++            before.authority.head.generation,
++            1 + u64::from(receipt.is_some())
++        );
++        let committed = reopened.transition_context_authority(&f.access, &request, now, None)?;
++        assert_eq!(
++            reopened.transition_context_authority(&f.access, &request, now, None)?,
++            committed
++        );
++        assert_eq!(
++            reopened
++                .read_context_authority(
++                    &f.configuration.incarnation,
++                    &f.configuration.grants[0].scope
++                )?
++                .transitions_charged,
++            1
++        );
++        let mut conflicting = request.clone();
++        conflicting.action = ContextTransitionActionV1::Retire {
++            successor_context: "different".into(),
++        };
++        assert!(reopened.read_context_transition(&conflicting).is_err());
++    }
++    Ok(())
++}
++
++#[test]
++fn consume_retirement_race_has_one_serial_order_and_never_loses_obligation() -> TestResult {
++    for _ in 0..12 {
++        let f = Fixture::new()?;
++        let (permit, witness) = f.issue("race")?;
++        let request = f.transition(
++            "race-retire",
++            ContextTransitionActionV1::Retire {
++                successor_context: "child".into(),
++            },
++        )?;
++        let store = DurablePermitStore::from_dir_fd(&File::open(f.root.path())?)?;
++        let access = f.access.clone();
++        let verifier = f.verifier.clone();
++        let task = std::thread::spawn(move || {
++            store.consume_scoped_external_permit(&access, &verifier, &permit, &witness.call, now)
++        });
++        let receipt = f
++            .store
++            .transition_context_authority(&f.access, &request, now, None)?;
++        let result = task.join().map_err(|_| "consumer panicked")?;
++        assert_eq!(receipt.consumed.len(), usize::from(result.is_ok()));
++    }
++    Ok(())
++}
++
++#[test]
++fn consume_rechecks_expiry_after_lock_wait_and_final_validation() -> TestResult {
++    use std::os::fd::AsFd;
++    use std::sync::{
++        atomic::{AtomicUsize, Ordering},
++        Arc,
++    };
++    let f = Fixture::new()?;
++    let (permit, witness) = f.issue("expiry")?;
++    let calls = AtomicUsize::new(0);
++    assert!(f
++        .store
++        .consume_scoped_external_permit(&f.access, &f.verifier, &permit, &witness.call, || {
++            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
++                now()
++            } else {
++                witness.expires_at
++            }
++        })
++        .is_err());
++    assert!(f
++        .store
++        .read_scoped_external_permit(&permit)?
++        .preflight
++        .is_none());
++    let held = File::open(f.root.path().join(".permit.lock"))?;
++    rustix::fs::flock(held.as_fd(), rustix::fs::FlockOperation::LockExclusive)?;
++    let sampled = Arc::new(AtomicUsize::new(0));
++    let clock_seen = Arc::clone(&sampled);
++    let store = DurablePermitStore::from_dir_fd(&File::open(f.root.path())?)?;
++    let access = f.access.clone();
++    let verifier = f.verifier.clone();
++    let (started, waiting) = std::sync::mpsc::channel();
++    let task = std::thread::spawn(move || {
++        let _ = started.send(());
++        store.consume_scoped_external_permit(&access, &verifier, &permit, &witness.call, || {
++            clock_seen.fetch_add(1, Ordering::SeqCst);
++            witness.expires_at
++        })
++    });
++    waiting.recv_timeout(std::time::Duration::from_secs(2))?;
++    assert_eq!(sampled.load(Ordering::SeqCst), 0);
++    rustix::fs::flock(held.as_fd(), rustix::fs::FlockOperation::Unlock)?;
++    assert!(task.join().map_err(|_| "consumer panicked")?.is_err());
++    assert!(sampled.load(Ordering::SeqCst) > 0);
++    Ok(())
++}
++
++#[test]
++fn copied_store_cannot_claim_original_incarnation() -> TestResult {
++    let f = Fixture::new()?;
++    let substituted = tempfile::tempdir()?;
++    std::fs::copy(
++        f.root.path().join("context-authority-v1.json"),
++        substituted.path().join("context-authority-v1.json"),
++    )?;
++    let store = DurablePermitStore::from_dir_fd(&File::open(substituted.path())?)?;
++    assert!(store.initialize_context_authority().is_err());
++    assert!(store.enroll_context_authority(&f.configuration).is_err());
++    assert!(store
++        .read_context_authority(
++            &f.configuration.incarnation,
++            &f.configuration.grants[0].scope
++        )
++        .is_err());
++    Ok(())
++}
++
++#[test]
++fn legacy_consumed_effect_cannot_disappear_into_empty_scoped_inventory() -> TestResult {
++    let f = Fixture::new()?;
++    let root = tempfile::tempdir()?;
++    let store = DurablePermitStore::from_dir_fd(&File::open(root.path())?)?;
++    let witness = f.witness("legacy-consumed")?;
++    let binding = f.verifier.verify_and_build_binding(&witness, now())?;
++    let permit = store.issue(&binding, now())?;
++    let preflight = store.consume_with_preflight(&permit.permit_id, &binding, now)?;
++    assert!(store.initialize_context_authority().is_err());
++    store.record_reported_outcome(
++        &permit.permit_id,
++        &preflight.receipt_digest,
++        ReportedEffectOutcomeV1 {
++            state: ReportedEffectStateV1::OutcomeAmbiguous,
++            duration_ms: 1,
++            error_type: Some("unknown".into()),
++        },
++        now(),
++    )?;
++    assert!(store.initialize_context_authority().is_err());
++    assert_eq!(
++        store
++            .read_external_permit(&permit.permit_id, &binding, Some(&preflight.receipt_digest))?
++            .preflight,
++        Some(preflight)
++    );
++    Ok(())
++}
++
++#[test]
++fn canonical_projection_damage_cannot_restore_old_admission() -> TestResult {
++    let f = Fixture::new()?;
++    let (permit, witness) = f.issue("old")?;
++    let old_head = f.authority()?.head;
++    f.retire_activate()?;
++    let path = f.root.path().join("context-authority-v1.json");
++    let original = std::fs::read(&path)?;
++    for variant in 0..4 {
++        let mut raw: serde_json::Value = serde_json::from_slice(&original)?;
++        let scope = raw["scopes"]
++            .as_object_mut()
++            .ok_or("scopes")?
++            .values_mut()
++            .next()
++            .ok_or("scope")?;
++        match variant {
++            0 => scope["head"] = serde_json::to_value(&old_head)?,
++            1 => scope["retirement_digest"] = serde_json::to_value(content_digest(&"wrong")?)?,
++            2 => scope["grant"]["controller_public_key"] = serde_json::to_value([0_u8; 32])?,
++            _ => scope["effects"] = serde_json::json!(0),
++        }
++        std::fs::write(&path, jcs_canonical(&raw)?)?;
++        let reopened = DurablePermitStore::from_dir_fd(&File::open(f.root.path())?)?;
++        assert!(reopened
++            .read_context_authority(
++                &f.configuration.incarnation,
++                &f.configuration.grants[0].scope
++            )
++            .is_err());
++        assert!(reopened
++            .consume_scoped_external_permit(&f.access, &f.verifier, &permit, &witness.call, now)
++            .is_err());
++    }
++    std::fs::write(&path, &original)?;
++    let mut config = f.configuration.clone();
++    config.revision += 1;
++    config.grants.clear();
++    f.store.enroll_context_authority(&config)?;
++    let mut raw: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
++    raw["scopes"]
++        .as_object_mut()
++        .ok_or("scopes")?
++        .values_mut()
++        .next()
++        .ok_or("scope")?["active"] = serde_json::json!(true);
++    std::fs::write(&path, jcs_canonical(&raw)?)?;
++    assert!(f
++        .store
++        .read_context_authority(
++            &f.configuration.incarnation,
++            &f.configuration.grants[0].scope
++        )
++        .is_err());
++    Ok(())
++}
++
++#[test]
++fn removed_or_rotated_approval_verifier_does_not_admit_an_issued_effect() -> TestResult {
++    let f = Fixture::new()?;
++    let (permit, witness) = f.issue("key-rotation")?;
++    let replaced = SigningKey::from_bytes(&[12; 32]);
++    let verifier = ProductionApprovalVerifierV1::from_public_key_bytes(
++        "desktop".into(),
++        replaced.verifying_key().to_bytes(),
++    )?;
++    assert!(f
++        .store
++        .consume_scoped_external_permit(&f.access, &verifier, &permit, &witness.call, now)
++        .is_err());
++    assert!(f
++        .store
++        .read_scoped_external_permit(&permit)?
++        .preflight
++        .is_none());
++    let renamed = ProductionApprovalVerifierV1::from_public_key_bytes(
++        "different-enrollment".into(),
++        f.approver.verifying_key().to_bytes(),
++    )?;
++    assert!(f
++        .store
++        .consume_scoped_external_permit(&f.access, &renamed, &permit, &witness.call, now)
++        .is_err());
++    assert!(f
++        .store
++        .consume_scoped_external_permit(&f.access, &f.verifier, &permit, &witness.call, now)
++        .is_ok());
++    Ok(())
++}
++
++#[test]
++fn approval_key_supersession_fences_a_still_running_old_daemon() -> TestResult {
++    let f = Fixture::new()?;
++    let (permit, witness) = f.issue("old-daemon")?;
++    let second = DurablePermitStore::from_dir_fd(&File::open(f.root.path())?)?;
++    let key = SigningKey::from_bytes(&[18; 32]);
++    let replacement = ProductionApprovalVerifierV1::from_public_key_bytes(
++        "desktop-new".into(),
++        key.verifying_key().to_bytes(),
++    )?;
++    let mut config = f.configuration.clone();
++    config.revision += 1;
++    config.approval_verifier = replacement.context_authority_digest()?;
++    let new_access = second.enroll_context_authority(&config)?;
++    assert!(f
++        .store
++        .consume_scoped_external_permit(&f.access, &f.verifier, &permit, &witness.call, now)
++        .is_err());
++    assert!(second
++        .consume_scoped_external_permit(&new_access, &f.verifier, &permit, &witness.call, now)
++        .is_err());
++    assert!(second
++        .consume_scoped_external_permit(&new_access, &replacement, &permit, &witness.call, now)
++        .is_err());
++    assert!(f.store.enroll_context_authority(&f.configuration).is_err());
++    assert!(second
++        .read_scoped_external_permit(&permit)?
++        .preflight
++        .is_none());
++    Ok(())
++}
+diff --git a/crates/recursive-agent-policy/tests/normal_chat_permit.rs b/crates/recursive-agent-policy/tests/normal_chat_permit.rs
+index 360e9e2..ead74b1 100644
+--- a/crates/recursive-agent-policy/tests/normal_chat_permit.rs
++++ b/crates/recursive-agent-policy/tests/normal_chat_permit.rs
+@@ -538,7 +538,7 @@ fn run_fixture_with_retention(
+         .consume(&permit.permit_id, &effect_binding, dispatch_time)
+         .is_err());
+     assert!(store
+-        .consume_with_preflight(&permit.permit_id, &effect_binding, dispatch_time)
++        .consume_with_preflight(&permit.permit_id, &effect_binding, || dispatch_time)
+         .is_err());
+     assert!(store
+         .consume_with_interruption(&permit.permit_id, &effect_binding, dispatch_time, None)
+diff --git a/crates/recursive-agent-policy/tests/permit_lifecycle.rs b/crates/recursive-agent-policy/tests/permit_lifecycle.rs
+index ebc3c51..d925291 100644
+--- a/crates/recursive-agent-policy/tests/permit_lifecycle.rs
++++ b/crates/recursive-agent-policy/tests/permit_lifecycle.rs
+@@ -420,7 +420,7 @@ fn receipt_record(
+     let mut binding = binding()?;
+     binding.actor = ActorPrincipalV1::try_new(actor)?;
+     let permit = store.issue(&binding, now())?;
+-    let preflight = store.consume_with_preflight(&permit.permit_id, &binding, now())?;
++    let preflight = store.consume_with_preflight(&permit.permit_id, &binding, now)?;
+     if with_outcome {
+         store.record_reported_outcome(
+             &permit.permit_id,
+@@ -663,15 +663,15 @@ fn receipt_roundtrip_preserves_idempotency_and_legacy_consumption() -> TestResul
+         )?,
+         *outcome
+     );
+-    assert!(matches!(
++    assert_eq!(
+         reopened.record_reported_outcome(
+             &selected.permit.permit_id,
+             &preflight.receipt_digest,
+             outcome.reported.clone(),
+             outcome.recorded_at + TimeDelta::seconds(1),
+-        ),
+-        Err(PolicyError::PermitStateConflict)
+-    ));
++        )?,
++        *outcome
++    );
+     assert_eq!(reopened.state(&selected.permit.permit_id)?, selected);
+     let legacy_binding = binding()?;
+     let legacy = store.issue(&legacy_binding, now())?;
+@@ -693,3 +693,150 @@ fn receipt_roundtrip_preserves_idempotency_and_legacy_consumption() -> TestResul
+         .is_err());
+     Ok(())
+ }
++
++#[test]
++fn external_readback_reconciles_reopen_without_consuming_or_replaying() -> TestResult {
++    let root = tempfile::tempdir()?;
++    let store = open_store(root.path())?;
++    let binding = binding()?;
++    let permit = store.issue(&binding, now())?;
++    let issued = store.read_external_permit(&permit.permit_id, &binding, None)?;
++    assert_eq!(issued.state, PermitStateV1::Issued);
++    assert!(issued.preflight.is_none() && issued.outcome.is_none());
++    let preflight = store.consume_with_preflight(&permit.permit_id, &binding, now)?;
++    drop(store); // Consumption ACK was lost. Readback grants no second consumption.
++    let reopened = open_store(root.path())?;
++    let readback = reopened.read_external_permit(
++        &permit.permit_id,
++        &binding,
++        Some(&preflight.receipt_digest),
++    )?;
++    assert_eq!(readback.preflight, Some(preflight.clone()));
++    assert!(readback.outcome.is_none());
++    assert!(reopened
++        .consume_with_preflight(&permit.permit_id, &binding, now)
++        .is_err());
++    let outcome = reopened.record_reported_outcome(
++        &permit.permit_id,
++        &preflight.receipt_digest,
++        reported_success(),
++        now(),
++    )?;
++    let after = open_store(root.path())?.read_external_permit(
++        &permit.permit_id,
++        &binding,
++        Some(&preflight.receipt_digest),
++    )?;
++    assert_eq!(after.outcome, Some(outcome));
++    let mut wrong_binding = binding.clone();
++    wrong_binding.actor = ActorPrincipalV1::try_new("actor:other")?;
++    assert!(reopened
++        .read_external_permit(&permit.permit_id, &wrong_binding, None)
++        .is_err());
++    assert!(reopened
++        .read_external_permit(
++            &permit.permit_id,
++            &binding,
++            Some(&content_digest(&"foreign")?),
++        )
++        .is_err());
++    let mut conflicting = reported_success();
++    conflicting.duration_ms += 1;
++    assert!(matches!(
++        reopened.record_reported_outcome(
++            &permit.permit_id,
++            &preflight.receipt_digest,
++            conflicting,
++            now() + TimeDelta::seconds(3),
++        ),
++        Err(PolicyError::PermitStateConflict)
++    ));
++    assert_eq!(
++        reopened.read_external_permit(&permit.permit_id, &binding, None)?,
++        after
++    );
++    Ok(())
++}
++
++#[test]
++fn external_preflight_clock_is_sampled_after_store_lock_wait() -> TestResult {
++    use std::os::fd::AsFd;
++    use std::sync::{
++        atomic::{AtomicBool, Ordering},
++        mpsc, Arc,
++    };
++    use std::time::Duration;
++    let root = tempfile::tempdir()?;
++    let store = open_store(root.path())?;
++    let binding = binding()?;
++    let permit = store.issue(&binding, now())?;
++    let lock = std::fs::OpenOptions::new()
++        .read(true)
++        .write(true)
++        .open(root.path().join(".permit.lock"))?;
++    rustix::fs::flock(lock.as_fd(), rustix::fs::FlockOperation::LockExclusive)?;
++    let expired = Arc::new(AtomicBool::new(false));
++    let selected_expired = Arc::clone(&expired);
++    let selected_id = permit.permit_id.clone();
++    let selected_binding = binding.clone();
++    let (started_tx, started_rx) = mpsc::channel();
++    let (sample_tx, sample_rx) = mpsc::channel();
++    let worker = std::thread::spawn(move || {
++        let _ = started_tx.send(());
++        store.consume_with_preflight(&selected_id, &selected_binding, || {
++            let _ = sample_tx.send(());
++            if selected_expired.load(Ordering::SeqCst) {
++                selected_binding.expires_at
++            } else {
++                now()
++            }
++        })
++    });
++    started_rx.recv_timeout(Duration::from_secs(2))?;
++    assert!(matches!(
++        sample_rx.recv_timeout(Duration::from_millis(50)),
++        Err(mpsc::RecvTimeoutError::Timeout)
++    ));
++    expired.store(true, Ordering::SeqCst);
++    rustix::fs::flock(lock.as_fd(), rustix::fs::FlockOperation::Unlock)?;
++    assert!(matches!(
++        worker.join().map_err(|_| "consume thread panicked")?,
++        Err(PolicyError::PermitRejected {
++            reason: PermitRejectionReasonV1::Expired,
++            ..
++        })
++    ));
++    assert_eq!(
++        open_store(root.path())?.state(&permit.permit_id)?.state,
++        PermitStateV1::Issued
++    );
++    Ok(())
++}
++
++#[test]
++fn external_preflight_rechecks_final_clock_and_rejects_regression() -> TestResult {
++    use std::cell::Cell;
++    for final_time in [
++        now() + TimeDelta::seconds(60),
++        now() - TimeDelta::seconds(1),
++    ] {
++        let root = tempfile::tempdir()?;
++        let store = open_store(root.path())?;
++        let binding = binding()?;
++        let permit = store.issue(&binding, now())?;
++        let calls = Cell::new(0);
++        assert!(store
++            .consume_with_preflight(&permit.permit_id, &binding, || {
++                calls.set(calls.get() + 1);
++                if calls.get() == 1 {
++                    now()
++                } else {
++                    final_time
++                }
++            })
++            .is_err());
++        assert_eq!(calls.get(), 2);
++        assert_eq!(store.state(&permit.permit_id)?.state, PermitStateV1::Issued);
++    }
++    Ok(())
++}
+diff --git a/crates/recursive-agent-runner/src/runtime.rs b/crates/recursive-agent-runner/src/runtime.rs
+index c1b9e3a..46a434b 100644
+--- a/crates/recursive-agent-runner/src/runtime.rs
++++ b/crates/recursive-agent-runner/src/runtime.rs
+@@ -461,6 +461,7 @@ pub struct RuntimeService {
+     scheduler: std::sync::Mutex<Option<crate::SchedulerStore>>,
+     operator_approval_verifier: Option<OperatorApprovalVerifierV1>,
+     production_approval_verifier: Option<ProductionApprovalVerifierV1>,
++    context_authority: Option<recursive_agent_policy::ContextAuthorityAccess>,
+ }
+ 
+ impl RuntimeService {
+@@ -486,6 +487,7 @@ impl RuntimeService {
+             scheduler: std::sync::Mutex::new(None),
+             operator_approval_verifier: None,
+             production_approval_verifier: None,
++            context_authority: None,
+         }
+     }
+ 
+@@ -503,6 +505,139 @@ impl RuntimeService {
+         self
+     }
+ 
++    /// Install an operator-owned startup enrollment through the native permit
++    /// owner. Ares cannot enroll keys or scope labels over IPC.
++    pub fn with_context_authority(
++        mut self,
++        configuration: &recursive_agent_policy::ContextAuthorityConfigurationV1,
++    ) -> Result<Self, RuntimeServiceError> {
++        let verifier = self
++            .production_approval_verifier
++            .as_ref()
++            .ok_or(RuntimeServiceError::PermitIssuanceDisabled)?;
++        if verifier.context_authority_digest()? != configuration.approval_verifier {
++            return Err(RuntimeServiceError::Policy(PolicyError::InvalidLease(
++                "context authority approval verifier enrollment mismatch".into(),
++            )));
++        }
++        let root = std::fs::File::open(self.dependencies.output_root())?;
++        let permits = DurablePermitStore::from_dir_fd(&root)?;
++        self.context_authority = Some(permits.enroll_context_authority(configuration)?);
++        Ok(self)
++    }
++
++    pub fn issue_scoped_external_permit(
++        &self,
++        witness: &ProductionApprovalWitnessV1,
++        context: &recursive_agent_policy::ContextCallBindingV1,
++    ) -> Result<recursive_agent_policy::ScopedExecutionPermitV1, RuntimeServiceError> {
++        let verifier = self
++            .production_approval_verifier
++            .as_ref()
++            .ok_or(RuntimeServiceError::PermitIssuanceDisabled)?;
++        let access = self
++            .context_authority
++            .as_ref()
++            .ok_or(RuntimeServiceError::PermitIssuanceDisabled)?;
++        let root = std::fs::File::open(self.dependencies.output_root())?;
++        Ok(
++            DurablePermitStore::from_dir_fd(&root)?.issue_scoped_external_permit(
++                access,
++                verifier,
++                witness,
++                context,
++                || self.dependencies.clock().now(),
++            )?,
++        )
++    }
++
++    pub fn consume_scoped_external_permit(
++        &self,
++        permit: &recursive_agent_policy::ScopedExecutionPermitV1,
++        call: &ToolCallSpecV1,
++    ) -> Result<recursive_agent_policy::ScopedPermitPreflightV1, RuntimeServiceError> {
++        let verifier = self
++            .production_approval_verifier
++            .as_ref()
++            .ok_or(RuntimeServiceError::PermitIssuanceDisabled)?;
++        let access = self
++            .context_authority
++            .as_ref()
++            .ok_or(RuntimeServiceError::PermitIssuanceDisabled)?;
++        let root = std::fs::File::open(self.dependencies.output_root())?;
++        Ok(
++            DurablePermitStore::from_dir_fd(&root)?.consume_scoped_external_permit(
++                access,
++                verifier,
++                permit,
++                call,
++                || self.dependencies.clock().now(),
++            )?,
++        )
++    }
++
++    pub fn transition_context_authority(
++        &self,
++        request: &recursive_agent_policy::ContextTransitionRequestV1,
++    ) -> Result<recursive_agent_policy::ContextTransitionReceiptV1, RuntimeServiceError> {
++        let access = self
++            .context_authority
++            .as_ref()
++            .ok_or(RuntimeServiceError::PermitIssuanceDisabled)?;
++        let root = std::fs::File::open(self.dependencies.output_root())?;
++        Ok(
++            DurablePermitStore::from_dir_fd(&root)?.transition_context_authority(
++                access,
++                request,
++                || self.dependencies.clock().now(),
++                None,
++            )?,
++        )
++    }
++
++    pub fn read_scoped_external_permit(
++        &self,
++        permit: &recursive_agent_policy::ScopedExecutionPermitV1,
++    ) -> Result<recursive_agent_policy::ScopedPermitRecordV1, RuntimeServiceError> {
++        let root = std::fs::File::open(self.dependencies.output_root())?;
++        Ok(DurablePermitStore::from_dir_fd(&root)?.read_scoped_external_permit(permit)?)
++    }
++
++    pub fn read_context_authority(
++        &self,
++        incarnation: &recursive_agent_contracts::ContentDigest,
++        scope: &recursive_agent_policy::ContextScopeV1,
++    ) -> Result<recursive_agent_policy::ContextAuthoritySnapshotV1, RuntimeServiceError> {
++        let root = std::fs::File::open(self.dependencies.output_root())?;
++        Ok(DurablePermitStore::from_dir_fd(&root)?.read_context_authority(incarnation, scope)?)
++    }
++
++    pub fn read_context_transition(
++        &self,
++        request: &recursive_agent_policy::ContextTransitionRequestV1,
++    ) -> Result<Option<recursive_agent_policy::ContextTransitionReceiptV1>, RuntimeServiceError>
++    {
++        let root = std::fs::File::open(self.dependencies.output_root())?;
++        Ok(DurablePermitStore::from_dir_fd(&root)?.read_context_transition(request)?)
++    }
++
++    pub fn settle_scoped_external_permit(
++        &self,
++        permit: &recursive_agent_policy::ScopedExecutionPermitV1,
++        preflight_digest: &recursive_agent_contracts::ContentDigest,
++        reported: ReportedEffectOutcomeV1,
++    ) -> Result<PermitOutcomeReceiptV1, RuntimeServiceError> {
++        let root = std::fs::File::open(self.dependencies.output_root())?;
++        Ok(
++            DurablePermitStore::from_dir_fd(&root)?.settle_scoped_external_permit(
++                permit,
++                preflight_digest,
++                reported,
++                || self.dependencies.clock().now(),
++            )?,
++        )
++    }
++
+     pub fn issue_production_permit(
+         &self,
+         witness: &ProductionApprovalWitnessV1,
+@@ -597,13 +732,20 @@ impl RuntimeService {
+         dispatch.args_digest = content_digest(&call.args)?;
+         let root = std::fs::File::open(self.dependencies.output_root())?;
+         let permits = DurablePermitStore::from_dir_fd(&root)?;
+-        Ok(
+-            permits.consume_with_preflight(
+-                permit_id,
+-                &dispatch,
+-                self.dependencies.clock().now(),
+-            )?,
+-        )
++        Ok(permits
++            .consume_with_preflight(permit_id, &dispatch, || self.dependencies.clock().now())?)
++    }
++
++    /// Read persisted external permit receipts without granting dispatch or retry.
++    pub fn read_external_permit(
++        &self,
++        permit_id: &CurrentPermitId,
++        binding: &recursive_agent_policy::PermitBindingV1,
++        preflight_receipt_digest: Option<&recursive_agent_contracts::ContentDigest>,
++    ) -> Result<recursive_agent_policy::ExternalPermitReadbackV1, RuntimeServiceError> {
++        let root = std::fs::File::open(self.dependencies.output_root())?;
++        let permits = DurablePermitStore::from_dir_fd(&root)?;
++        Ok(permits.read_external_permit(permit_id, binding, preflight_receipt_digest)?)
+     }
+ 
+     /// Persist a bounded executor-reported outcome bound to a consumed
+diff --git a/docs/context-authority-v1.md b/docs/context-authority-v1.md
+new file mode 100644
+index 0000000..151f2e6
+--- /dev/null
++++ b/docs/context-authority-v1.md
+@@ -0,0 +1,65 @@
++# Scoped external authority V1
++
++`DurablePermitStore` owns context-scoped external admission in the existing
++external output-root namespace. Initialization is an explicit operator action:
++
++```
++ra-daemon initialize-context-authority --root /absolute/native/output-root
++```
++
++It returns a native incarnation digest and permanently fences legacy admission
++in that namespace. Initialization refuses any legacy consumed permit because V1
++does not establish its conversation scope or independently confirmed settlement.
++An ordinary restart preserves the incarnation. A copied state file in a different
++directory is rejected; copying it is not an authority migration.
++
++The operator supplies an owned, bounded, mode-0600
++`ContextAuthorityConfigurationV1` file using `serve --context-authority-file`.
++The configuration includes the incarnation, monotonic revision, exact production
++approval-verifier digest, and grants binding each Ares store/profile/root to an
++Ed25519 controller key, actor, policy version/digest, write root, initial head,
++expiry and effect/transition caps. The production verifier enrollment and write
++root remain separate startup inputs. The runtime rejects missing or mismatched
++production verifier material. No IPC request enrolls a scope, approves a grant,
++or replaces a key.
++
++Controller authority permits only context binding and monotonic retirement or
++activation. It does not approve effects. Every issuance still requires the
++separate, unmodified Desktop Ed25519 V1 per-call witness. Native policy verifies
++both authorities and reserves the original V1 approval identity globally for
++one scoped permit. Rewrapping it after a rebase, key change or scope change does
++not create another use. The scoped permit binds current approval-verifier
++provenance; changing that verifier requires a new configuration revision and
++fences older live daemon instances.
++
++Retirement moves to a higher, sealed successor generation and returns an exact
++immutable receipt. Activation requires that retirement receipt and the same
++sealed head. A prepublication abort must retire again to a fresh higher parent
++generation. Neither operation restores old tokens. A lost ACK is reconciled by
++exact transition readback; a receipt is not a dispatch capability.
++
++Consumption checks scope, incarnation, grant, policy, generation, mode, exact
++call, current verifier and expiry under `.permit.lock`, sampling the trusted
++clock after waiting and again before mutation. Legacy issue and consume APIs
++also check the persistent fence. Already-consumed scoped effects retain their
++original outcome path after retirement, revocation and restart. Immutable
++reported outcomes do not claim independently confirmed external success.
++Retirement/snapshot inventories retain every consumed obligation, including
++ambiguous and reported-success outcomes, as exact bounded receipt references.
++
++All scoped mutations replace one canonical, fsynced state file. Its ordered
++configuration/transition history reconstructs the current grant, admission head,
++retirement reference and active membership. On read, the owner checks signatures,
++material IDs, counters and historical obligation references. This detects
++inconsistent records; it does not isolate authority from an operator replacing
++the entire store and its history. Limits are 32 MiB state, 256 scopes, 1,024
++effects and 4,096 transitions per namespace; supersession preserves charges and
++cannot widen a scope's caps, actor or write root.
++
++The new scoped IPC variants never downgrade to V1. `context_call_prepare`,
++`context_transition_prepare` and `context_store_identity` only return typed
++canonical signing material or a nonce digest. They perform no enrollment or
++admission. Ares must bind signing to its actual SessionDB owner and persist its
++exact transition intent before native mutation, then require the native receipt
++and consumed inventory before local readiness. These native primitives alone
++do not qualify an installed Ares continuation route or an endurance run.

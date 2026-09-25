@@ -1,0 +1,21 @@
+▶ running per-file parallel test suite via run_tests_parallel.py
+  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)
+▶ pre-compiling bytecode cache
+▶ launching test runner
+Discovered 3 test files (~63 tests) under ['tests/test_run_custody_ready_recovery.py', 'tests/ares_runtime/test_continuity_input.py', 'tests/ares_runtime/test_context_rebase_state.py']; running with -j 2
+[ 55.6% |    35/~63 | ✓41 | ✗ 0] ✓ tests/ares_runtime/test_context_rebase_state.py (41✓, 1.4s)
+[ 81.0% |    51/~63 | ✓58 | ✗ 0] ✓ tests/ares_runtime/test_continuity_input.py (17✓, 4.1s)
+[100.0% |    63/~63 | ✓74 | ✗ 0] ✓ tests/test_run_custody_ready_recovery.py (16✓, 8.6s)
+
+=== Summary: 3 files, 74 tests passed, 0 failed (100% complete) in 10.0s (2 workers) ===
+  Durations cached to test_durations.json (3 files)
+
+=== Per-file subprocess time distribution ===
+  Files:   3
+  Total subprocess CPU-wall: 14.1s  (runner wall: 10.0s, parallelism: 2x)
+  P50: 4.11s  P90: 8.56s  P95: 8.56s  P99: 8.56s  Max: 8.56s
+  <1s: 0 files (0%)  <2s: 1 files (33%)
+  Top 10 slowest:
+      8.56s  tests/test_run_custody_ready_recovery.py
+      4.11s  tests/ares_runtime/test_continuity_input.py
+      1.42s  tests/ares_runtime/test_context_rebase_state.py

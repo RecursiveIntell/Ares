@@ -455,10 +455,16 @@ def finalize_turn(
             except Exception as _mc_err:
                 logger.info("Micro-compaction failed: %s", _mc_err)
 
-        agent._persist_session(messages, conversation_history)
+        from agent.context_input import turn_input_response_scope
+        with turn_input_response_scope(agent, messages,
+                successful=completed and normal_text_response and not interrupted and not failed):
+            agent._persist_session(messages, conversation_history)
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
+        if getattr(agent, "_context_input_phase", None) is not None:
+            completed, failed = False, True
+            _turn_exit_reason = "context_input_completion_unconfirmed"
 
     # The gateway owns a separate in-memory history snapshot. Keep it current
     # even when finalization reports a cleanup error: a later prompt must not be

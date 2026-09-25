@@ -799,6 +799,27 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         if self._previous_summary is None:
             self._load_prior_session_context()
 
+    def validate_context_rebase_binding(self, *, session_db, session_id) -> None:
+        """Read the real receipt owner before acknowledging a rebase binding.
+
+        Ordinary lifecycle hooks remain best-effort for legacy callers. Context
+        continuation requires a positive readback and cannot turn a warning
+        from bind_session_state into an activation acknowledgment.
+        """
+        if self._session_db is not session_db or self.session_id != session_id:
+            raise RuntimeError("GOVERNOR_REBASE_BINDING_MISMATCH")
+        expected_root = self._context_lineage_root(session_db, session_id)
+        if self._lineage_session_id != expected_root:
+            raise RuntimeError("GOVERNOR_REBASE_LINEAGE_MISMATCH")
+        records = self._run_certified_json(["pending-v2", "--dir", str(self.store_dir)], {})
+        if not isinstance(records, list):
+            raise RuntimeError("GOVERNOR_PENDING_INVENTORY_INVALID")
+        for record in records:
+            if not isinstance(record, dict) or record.get("schema") != "PendingReceiptInfoV2":
+                raise RuntimeError("GOVERNOR_PENDING_INVENTORY_INVALID")
+            if record.get("session_id") == self._governor_session_id():
+                raise RuntimeError("GOVERNOR_PENDING_RECONCILIATION_REQUIRED")
+
     def _load_prior_session_context(self) -> None:
         """Load the most recent receipt from the store as prior context.
 
@@ -909,7 +930,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         if session_id:
             self.session_id = str(session_id)
         self._session_db = session_db
-        self._lineage_session_id = self._compression_lineage_root(
+        self._lineage_session_id = self._context_lineage_root(
             session_db,
             self.session_id or "default",
         )
@@ -917,14 +938,21 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             self._reconcile_pending_receipts(session_db, self.session_id)
 
     @staticmethod
-    def _compression_lineage_root(session_db: Any, session_id: str) -> str:
-        """Return the stable root following compression edges only."""
+    def _context_lineage_root(session_db: Any, session_id: str) -> str:
+        """Return the stable logical root across compression and context rebases.
+
+        Compression children historically share the Governor receipt DAG.  A
+        context rebase is the same logical conversation with a fresh provider
+        working set, so rebinding the Governor to the physical child must not
+        silently fork its authenticated lineage.  Explicit branch/delegate
+        children are not continuation edges and stop the walk.
+        """
         current = str(session_id or "default")
         getter = getattr(type(session_db), "get_session", None)
         if session_db is None or not callable(getter):
             return current
         seen: set[str] = set()
-        for _ in range(100):
+        for _ in range(1000):
             if not current or current in seen:
                 break
             seen.add(current)
@@ -935,13 +963,38 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             if not parent_id:
                 break
             parent = getter(session_db, parent_id)
-            if (
-                not isinstance(parent, dict)
-                or parent.get("end_reason") != "compression"
-            ):
+            if not isinstance(parent, dict):
+                break
+            reason = parent.get("end_reason")
+            config = row.get("model_config") or {}
+            if isinstance(config, str):
+                try:
+                    config = json.loads(config)
+                except (TypeError, ValueError):
+                    break
+            if not isinstance(config, dict):
+                break
+            if reason == "compression":
+                if (
+                    config.get("_branched_from") == parent_id
+                    or config.get("_delegate_from") == parent_id
+                ):
+                    break
+            elif reason == "context_rebase":
+                if (
+                    config.get("_context_rebase_from") != parent_id
+                    or not config.get("_context_rebase_transition")
+                    or type(config.get("_context_epoch")) is not int
+                    or config.get("_context_epoch") < 1
+                ):
+                    break
+            else:
                 break
             current = parent_id
         return current or str(session_id or "default")
+
+    # Back-compat for tests/extensions that still name the narrower helper.
+    _compression_lineage_root = _context_lineage_root
 
     def _governor_session_id(self) -> str:
         return self._lineage_session_id or self.session_id or "hermes-session"

@@ -1,0 +1,65 @@
+{
+  "schema": "ares.native-owner-patch/v1",
+  "repository": "RecursiveIntell/recursive-agent",
+  "base_commit": "11fefae304d43d9d72f7a238f9d2df77862b51c6",
+  "candidate_tree": "a0269beec181dd24e3af5a3255db857444c19f34",
+  "libraries_commit": "0b099ec416de60f6adafb182f1d1e83795d05c56",
+  "patch_sha256": "25c8bf703f2a5045f9b1c85d38de7d3bc117a5012186024391f2c19856433235",
+  "scope": [
+    "external permit semantic outcome idempotency",
+    "exact-binding read-only receipt lookup",
+    "trusted consumption time under native lock",
+    "operator-enrolled store/profile/root and controller capability",
+    "native incarnation and durable current approval-verifier/configuration fence",
+    "single-use approval reservation across context generations",
+    "atomic retirement/activation with immutable readback and consumed-obligation references",
+    "legacy bypass fence, historical settlement, native history consistency validation"
+  ],
+  "not_implemented": [
+    "Ares authenticated controller enrollment and continuity saga integration",
+    "independently confirmed external outcome and task completion",
+    "installed route qualification and full V4 acceptance"
+  ],
+  "hosted_runner_contract": "recursive-agent@11fefae304d43d9d72f7a238f9d2df77862b51c6/.github/workflows/ci.yml",
+  "native_runtime_status": "passed_hosted_exact_candidate",
+  "previous_candidate_hosted_proof": {
+    "ares_commit": "bd6c579aa7e2d60bb8fbe10de0e5880f5c86600c",
+    "native_candidate": "d0e5431ecab35f1eaf21bed1ff5fca3eab5bda17",
+    "workflow_run": 36149215075,
+    "native_job": 108117936005,
+    "conclusion": "success",
+    "scope": "EF-3/EF-4 prerequisite only; whole native workspace gates passed"
+  },
+  "first_scoped_hosted_run": {
+    "ares_commit": "a7812c0a767f752711e6e3f9b9d128a3129572fb",
+    "run_id": 36153447078,
+    "job_id": 108132154805,
+    "policy_scope_tests": "13 passed",
+    "failure": "new daemon test reused an IPC request ID; protocol rejected duplicate correlation ID",
+    "repair": "unique request IDs per message; public enrolled grant/verifier included in scope snapshot",
+    "runtime_status": "pending repaired candidate execution"
+  },
+  "scoped_authority_hosted_proof": {
+    "ares_commit": "1ca7b89d6229c02de5fc79d031942a3a85c9cca0",
+    "candidate_tree": "a25164902f862efb28a798e175212541d9f39e4e",
+    "workflow_run": 36154571672,
+    "native_job": 108135872634,
+    "focused_ares_job": 108135872750,
+    "conclusion": "success",
+    "scope": "Native paired source and focused Ares gates; not installed route or Ares scoped authority integration"
+  },
+  "previous_candidate_commit": "5105d4e85d05ed9aacd12680d4209f98a196fef9",
+  "candidate_commit": "2297e9444922ff0aef1eb21358084dbfe3e13ec4",
+  "current_candidate_delta": "Adds native public-verifier digest CLI for exact operator enrollment; prior runtime proof applies to the predecessor tree only.",
+  "candidate_pr": "https://github.com/RecursiveIntell/recursive-agent/pull/20",
+  "current_candidate_proof": {
+    "candidate_commit": "2297e9444922ff0aef1eb21358084dbfe3e13ec4",
+    "native_ci_run": 36173563708,
+    "native_ci_job": 108198650882,
+    "ares_commit": "7e243e2a53e81657a7090fd1d3ca40647861599c",
+    "ares_qualification_run": 36173940893,
+    "paired_daemon_job": 108199879563,
+    "status": "passed",
+    "scope": "Native workspace and relocated-root gates; actual Ares-to-native signed enrollment, rollover, restart, disposable file write and outcome receipt. No installed route or independent external settlement claim."
+  }
+}

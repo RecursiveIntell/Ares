@@ -1281,7 +1281,11 @@ def test_production_dispatcher_records_issue_consume_effect_and_outcome_without_
         return {
             "request_id": request["request_id"],
             "permit_id": "permit:e2e",
-            "outcome_artifact": {"receipt_digest": "b" * 64, "state": "succeeded"},
+            "outcome_artifact": {
+                "permit_id": "permit:e2e", "preflight_receipt_digest": "a" * 64,
+                "reported": reported, "recorded_at": "2026-09-25T00:00:00Z",
+                "receipt_digest": "b" * 64,
+            },
         }
 
     thread = _serve_permit_responses(socket_path, issued, consumed, recorded)
@@ -1428,8 +1432,10 @@ def test_daemon_adapter_forwards_bounded_and_ambiguous_quarantined_outcomes(tmp_
             "request_id": request["request_id"],
             "permit_id": "permit:one",
             "outcome_artifact": {
+                "permit_id": "permit:one", "preflight_receipt_digest": "a" * 64,
+                "reported": request["request"]["reported"],
+                "recorded_at": "2026-09-25T00:00:00Z",
                 "receipt_digest": "b" * 64,
-                "state": "terminal_quarantine",
             },
         }
 

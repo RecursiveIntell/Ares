@@ -1,0 +1,36 @@
+name: Context continuity exact Ares source export
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/context-continuity-ares-source.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Export exact tracked source
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/ares-source"
+          mkdir -p "$out"
+          git rev-parse HEAD > "$out/HEAD.txt"
+          git ls-tree -r HEAD > "$out/TREE.txt"
+          git archive --format=tar.gz HEAD > "$out/source.tar.gz"
+          (cd "$out" && sha256sum HEAD.txt TREE.txt source.tar.gz > SHA256SUMS)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: continuity-exact-ares-source
+          path: ${{ runner.temp }}/ares-source/
+          retention-days: 2
+          if-no-files-found: error

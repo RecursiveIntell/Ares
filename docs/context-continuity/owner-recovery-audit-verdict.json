@@ -1,0 +1,35 @@
+{
+  "schema": "ares.context-continuity-audit/v1",
+  "status": "pass_bounded",
+  "independent": true,
+  "tests": {
+    "passed": 72,
+    "failed": 0,
+    "files": 4
+  },
+  "closed_findings": [
+    "AUD-H1 retained same-process recovery custody expires before recovery deadline"
+  ],
+  "source_manifest": "owner-recovery-audit-sources.json",
+  "native": {
+    "source_review": "passed_bounded_EF3_EF4",
+    "compile": "passed",
+    "clippy": "passed",
+    "local_runtime": "blocked_required_systemd_user_bus",
+    "hosted_runtime": "pending"
+  },
+  "remaining": [
+    "EF-1 native generation/incarnation/current-policy fence",
+    "EF-2 durable retirement and unresolved consumed obligations",
+    "Full V4 qualification"
+  ],
+  "pipeline_review": {
+    "status": "passed_bounded",
+    "basis": "Independent final pipeline review after earlier eight-file manifest; exact patch/base/Libraries/tree binding and existing native hosted runner contract preserved. Both jobs must pass before runtime claim.",
+    "files": {
+      ".github/workflows/context-continuity-qualification.yml": "2765f5091f88c565feedde72294afdaa2c5342d337d1eb70a5944d665b18527f",
+      "docs/context-continuity/native-external-owner.json": "0693b6905b400665da5436b00b3e648857fd0831827c4b6d562ab76f799d683d",
+      "docs/context-continuity/native-external-owner.patch": "3792aa2394cb6b5c732ed74a33e5839a1ba33b62a86d1094f0e19672571669dc"
+    }
+  }
+}

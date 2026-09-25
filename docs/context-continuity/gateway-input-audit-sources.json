@@ -1,0 +1,22 @@
+{
+  "base_commit": "20728d31a2185a5f8f777168982cb76db922c32a",
+  "scope": "Gateway stateless text ingress plus native occurrence provenance and nonpositive-coordinate compatibility",
+  "sha256": {
+    "agent/context_input.py": "f737a3b79316379f29b92047f69f589db69163c8722c6e333429b88feab39b4c",
+    "ares_runtime/continuity/live.py": "00222e39470b71352817e24d82df8a0e62f8a8734521270fb806f27c0421ea90",
+    "gateway/context_input.py": "3d017ab89301b1478c58d0f7ba3145712a358423d41d52d5be7c667d5464801d",
+    "gateway/platforms/base.py": "d781f06758a300650ed553c856bcd14b6deedc4ffd3ed0a2780bacfb87f7104f",
+    "gateway/run.py": "258b6cf5be20a2b75c236e1a68188d0dc85926b2b8c5fa76ca2c86d61c0db0e1",
+    "gateway/turn_context.py": "0737b6e328eb57cba54f6dbf188ce16fc54e582237f599c4712d02023aea40b8",
+    "hermes_state.py": "c93ab1e3baa347e4b2861d6f362b486b6f62b13524a1a85d5ed339728b8faae2",
+    "hermes_state_continuity.py": "536fc19b16c99c4fd0cc80ccf67025c67c40fdd2daea792768f568226e106033",
+    "hermes_state_inbox.py": "94de6dd63593f9e12f6e7ea64a24d1dcfa7116c4fed25ee713f87f05fc832e53",
+    "hermes_state_runs.py": "7b1406ca8c0014ff3d04c61cb1db9f7b0e78005fac3055dcbff36c5a398f64b3",
+    "run_agent.py": "3d56db51b5eacf3de6f2617c447106867b37f270d9783c959ccc824fb655f171",
+    "tests/gateway/test_context_input.py": "75b72942864458f6a3d11bdca258a5edc5e3a906ca377fd664b28cc0c756f370",
+    "tests/gateway/test_multiplex_adapter_registry.py": "ab848d8c43ed700def5b47f411a33b996f85ee306e01da2ca704502acde7a683",
+    "tests/state/test_message_row_publication.py": "e7a64a19e0baa840d2771dc3efaff1404651f953f23a82e010351455b7099328",
+    "tests/test_compression_watermark_commit.py": "63000b179312cdaf1cc072a032cd772a75b13aff756f18cd704f94dba856b106",
+    "tests/test_run_custody_obligations.py": "13d9946630c29e55ecb08de160e6d3853e6942a8fb8fd6a1a9d8a796d073ce91"
+  }
+}
