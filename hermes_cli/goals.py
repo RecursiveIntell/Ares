@@ -1096,10 +1096,24 @@ def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason:
         if not parent_raw:
             return False
         state = GoalState.from_json(parent_raw)
-        if state.status == "cleared":
-            return False
         child_raw = db.get_meta(_meta_key(new_session_id))
         if child_raw:
+            try:
+                existing_child = GoalState.from_json(child_raw)
+            except Exception:
+                return False
+            migrated_from = dict(existing_child.migration or {}).get(
+                "migrated_from_session"
+            )
+            if (
+                state.status == "cleared"
+                and existing_child.status != "cleared"
+                and migrated_from == old_session_id
+                and existing_child.goal_id == state.goal_id
+            ):
+                return True
+            return False
+        if state.status == "cleared":
             return False
 
         child = GoalState.from_json(state.to_json())
