@@ -16,6 +16,7 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
+from agent.context_compressor import user_originated_turn_view
 from hermes_state_common import _sql_session_last_active
 
 
@@ -199,7 +200,9 @@ class ContextRebaseSnapshot:
     git_branch: Optional[str]
     git_repo_root: Optional[str]
     input_watermark: int
+    control_revision: int
     first_user: Optional[Dict[str, Any]]
+    authentic_users: tuple[Dict[str, Any], ...]
     current_users: tuple[Dict[str, Any], ...]
     latest_summary: Optional[Dict[str, Any]]
     recent_events: tuple[Dict[str, Any], ...]
@@ -327,6 +330,7 @@ class SessionContextContinuityMixin:
         recent_limit: int = 12,
         user_limit: int = 32,
         unresolved_effect_limit: int = 32,
+        authentic_user_limit: int = 128,
     ) -> ContextRebaseSnapshot:
         """Read one bounded compilation snapshot under a single SQLite read context."""
         _identity(session_id, "INVALID_PARENT_SESSION")
@@ -339,6 +343,11 @@ class SessionContextContinuityMixin:
             or not 1 <= unresolved_effect_limit <= 128
         ):
             raise ContextContinuationError("INVALID_UNRESOLVED_EFFECT_LIMIT")
+        if (
+            type(authentic_user_limit) is not int
+            or not 1 <= authentic_user_limit <= 512
+        ):
+            raise ContextContinuationError("INVALID_AUTHENTIC_USER_LIMIT")
 
         with self._read_ctx() as conn:
             session = conn.execute(
@@ -395,20 +404,64 @@ class SessionContextContinuityMixin:
             else:
                 raise ContextContinuationError("CONTINUATION_DEPTH_LIMIT")
 
-            first_user = None
+            # Build one exact human-originated instruction ledger across the
+            # canonical continuation lineage. Physical rebase replay rows carry
+            # the same content into a child; deduplicate only those exact replay
+            # clones so an epoch boundary cannot multiply user authority.
+            authentic_user_list = []
+            authentic_seen = set()
             for sid in reversed(lineage):
-                row = conn.execute(
-                    "SELECT id,content,timestamp FROM messages "
-                    "WHERE session_id=? AND active=1 AND role='user' ORDER BY id ASC LIMIT 1",
+                rows = conn.execute(
+                    "SELECT id,content,timestamp,display_kind,display_metadata "
+                    "FROM messages WHERE session_id=? AND active=1 AND role='user' "
+                    "ORDER BY id ASC",
                     (sid,),
-                ).fetchone()
-                if row is not None:
-                    first_user = {
-                        "row_id": int(row["id"]),
+                ).fetchall()
+                for row in rows:
+                    candidate = {
+                        "role": "user",
                         "content": self._decode_content(row["content"]),
                         "timestamp": row["timestamp"],
                     }
-                    break
+                    if row["display_kind"]:
+                        candidate["display_kind"] = row["display_kind"]
+                    if row["display_metadata"]:
+                        decoded_meta = self._decode_display_metadata(
+                            row["display_metadata"]
+                        )
+                        if decoded_meta is not None:
+                            candidate["display_metadata"] = decoded_meta
+                    live_view = user_originated_turn_view(candidate)
+                    if live_view is None:
+                        continue
+                    try:
+                        canonical_content = _canonical(live_view.get("content"))
+                    except ContextContinuationError:
+                        canonical_content = repr(live_view.get("content"))
+                    replay_key = (
+                        live_view.get("timestamp"),
+                        canonical_content,
+                    )
+                    if replay_key in authentic_seen:
+                        continue
+                    authentic_seen.add(replay_key)
+                    authentic_user_list.append({
+                        "row_id": int(row["id"]),
+                        "session_id": sid,
+                        "content": live_view.get("content"),
+                        "timestamp": live_view.get("timestamp"),
+                    })
+                    if len(authentic_user_list) > authentic_user_limit:
+                        raise ContextContinuationError(
+                            "TOO_MANY_AUTHENTIC_USER_INSTRUCTIONS"
+                        )
+            authentic_users = tuple(authentic_user_list)
+            if not authentic_users:
+                raise ContextContinuationError(
+                    "CONTEXT_REBASE_AUTHENTIC_USER_ANCHOR_MISSING"
+                )
+            first_user = authentic_users[0]
+            control_revision = int(authentic_users[-1]["row_id"])
 
             summary = conn.execute(
                 "SELECT id,content,timestamp FROM messages "
@@ -424,18 +477,46 @@ class SessionContextContinuityMixin:
             }
 
             user_rows = conn.execute(
-                "SELECT id,content,timestamp FROM messages "
-                "WHERE session_id=? AND active=1 AND role='user' AND id>? "
+                "SELECT id,content,timestamp,display_kind,display_metadata "
+                "FROM messages WHERE session_id=? AND active=1 AND role='user' AND id>? "
                 "ORDER BY id ASC LIMIT ?",
                 (session_id, summary_id, user_limit + 1),
             ).fetchall()
             if len(user_rows) > user_limit:
                 raise ContextContinuationError("TOO_MANY_UNSUMMARIZED_USER_CHANGES")
-            current_users = tuple({
-                "row_id": int(row["id"]),
-                "content": self._decode_content(row["content"]),
-                "timestamp": row["timestamp"],
-            } for row in user_rows)
+            current_users_list = []
+            for row in user_rows:
+                item = {
+                    "row_id": int(row["id"]),
+                    "content": self._decode_content(row["content"]),
+                    "timestamp": row["timestamp"],
+                    "display_kind": row["display_kind"],
+                }
+                decoded_meta = (
+                    self._decode_display_metadata(row["display_metadata"])
+                    if row["display_metadata"]
+                    else None
+                )
+                if decoded_meta is not None:
+                    item["display_metadata"] = decoded_meta
+                live_view = user_originated_turn_view({
+                    "role": "user",
+                    "content": item["content"],
+                    "timestamp": item["timestamp"],
+                    **(
+                        {"display_kind": item["display_kind"]}
+                        if item["display_kind"]
+                        else {}
+                    ),
+                    **(
+                        {"display_metadata": decoded_meta}
+                        if decoded_meta is not None
+                        else {}
+                    ),
+                })
+                item["authentic_user"] = live_view is not None
+                current_users_list.append(item)
+            current_users = tuple(current_users_list)
             if not current_users:
                 raise ContextContinuationError("CONTEXT_REBASE_USER_ANCHOR_MISSING")
 
@@ -505,8 +586,8 @@ class SessionContextContinuityMixin:
             return ContextRebaseSnapshot(
                 session_id, str(root), session["profile_name"], session["cwd"],
                 session["git_branch"], session["git_repo_root"], watermark,
-                first_user, current_users, latest_summary, recent_events,
-                unresolved_effects, goal_raw, todo_json,
+                control_revision, first_user, authentic_users, current_users,
+                latest_summary, recent_events, unresolved_effects, goal_raw, todo_json,
             )
 
     def read_context_rebase_transition(self, transition_id: str) -> Optional[ContextRebaseTransition]:
