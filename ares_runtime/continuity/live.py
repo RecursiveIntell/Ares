@@ -137,6 +137,8 @@ def _event_projection(event: dict[str, Any]) -> bytes:
         "role": role,
         "tool_name": event.get("tool_name"),
         "tool_call_id": event.get("tool_call_id"),
+        "effect_disposition": event.get("effect_disposition"),
+        "observed": bool(event.get("observed")),
         "finish_reason": event.get("finish_reason"),
         "timestamp": event.get("timestamp"),
         "content": _bounded_event_content(event.get("content")),
@@ -323,9 +325,31 @@ def build_live_candidate(
             freshness=Freshness.HISTORICAL, section=Section.EVIDENCE, required=True,
         )
 
+    unresolved_ids = {
+        (event.get("session_id"), event.get("row_id"))
+        for event in snapshot.unresolved_effects
+    }
+    for event in snapshot.unresolved_effects:
+        raw = _event_projection(event)
+        add(
+            f"record:effect:{event['session_id']}:{event['row_id']}",
+            f"session-effect:{event['session_id']}:{event['row_id']}",
+            f"message:{event['row_id']}",
+            raw,
+            kind=SourceKind.TOOL_OBSERVATION,
+            status=EvidenceStatus.UNKNOWN,
+            freshness=Freshness.CURRENT,
+            section=Section.OBLIGATIONS,
+            required=True,
+        )
+
     event_candidates = [
         event for event in snapshot.recent_events
-        if event.get("role") != "user" and not event.get("compressed_summary")
+        if (
+            event.get("role") != "user"
+            and not event.get("compressed_summary")
+            and (snapshot.session_id, event.get("row_id")) not in unresolved_ids
+        )
     ]
     required_event_ids = {
         event["row_id"] for event in event_candidates[-4:]
@@ -340,6 +364,7 @@ def build_live_candidate(
         status = (
             EvidenceStatus.UNKNOWN
             if event.get("role") == "tool"
+            and event.get("effect_disposition") == "unknown"
             else EvidenceStatus.OBSERVED
         )
         add(
