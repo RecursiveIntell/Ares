@@ -4,6 +4,31 @@ The V4 packet dated 2026-09-23 remains the full acceptance contract. This is
 an implementation branch. Qualification is tied to source hashes and named
 oracles; passing unit tests does not qualify a selected provider route.
 
+## Obligation lifetime and input provenance
+
+Released checkpoint obligations remain in the canonical conversation snapshot,
+including unresolved outcomes, restrictions and findings. They do not become new
+custody authority. Compacted authentic task anchors preserve their original V2
+binding digest; edited, revoked, synthetic and derived anchors refuse admission.
+
+Native copy/projection receipts preserve occurrence identity through compaction
+and context rebase. Equal text and timestamps do not conflate distinct inputs.
+Derived projections cannot become authentic instructions or task authority.
+First-time unflushed input and unknown tool results remain durable occurrences.
+Receipt-bound compaction atomically preserves clean input and its API sidecar
+under the existing turn lease, including real agent preflight paths.
+
+The pinned local gate passed 2,334 tests across 65 files with four existing skips.
+Independent review passed 176 tests and closed AUD-P1/P2 and the profile/default/
+occurrence findings. See `obligations-evidence.json` and the associated raw logs
+and audit verdict. All hosted checks on the preceding `bc889de` passed, including
+full CI, focused qualification, Nix and Docker. Candidate checks follow publication.
+
+The 105-edge native materializer witness proves bounded occurrence provenance,
+not automatic runtime endurance. Legacy rows without provenance are not inferred
+to be copies. Gateway ingress, autonomous wake, completion/effect ownership and
+full selected-route qualification remain required.
+
 ## Already-READY controller recovery
 
 An already-READY successor now reconstructs process-owned custody and adopts its
@@ -27,8 +52,8 @@ suite excluded locally. It also covers repairs to two failures discovered on
 Nix and Docker passed on that published base.
 
 This closes local READY reconstruction, not autonomous wake scheduling or task
-completion. Released obligations and compacted task anchors remain required
-repairs, alongside the remaining full V4 qualification below.
+completion. Released obligations and compacted task anchors are covered by the later
+increment above; the remaining full V4 qualification still applies.
 
 ## Durable input and selected TUI ingress
 

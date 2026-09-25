@@ -82,6 +82,15 @@
         "docs/context-continuity/ready-audit-verdict.json"
       ],
       "receipt": "Independent audit closed AUD-RC1; 2002 local tests passed; full V4 remains incomplete."
+    },
+    {
+      "id": "obligations@post",
+      "status": "passed",
+      "evidence": [
+        "docs/context-continuity/obligations-evidence.json",
+        "docs/context-continuity/obligations-audit-verdict.json"
+      ],
+      "receipt": "2334 local tests and 176 independent audit tests passed; full V4 remains incomplete."
     }
   ],
   "mutations": [
@@ -114,7 +123,7 @@
   ],
   "next_gate": "Durable ingress/controller construction, native owner closure and remaining exact-route V4 qualification.",
   "qualification": "Bounded source repair passed; full V4 program remains incomplete.",
-  "scope": "Cumulative PR80 implementation; latest repair is bounded already-READY controller reconstruction and adoption",
-  "latest_repair_evidence": "docs/context-continuity/ready-controller-evidence.json",
+  "scope": "Cumulative PR80 implementation; latest repair preserves released obligations and native input provenance",
+  "latest_repair_evidence": "docs/context-continuity/obligations-evidence.json",
   "latest_repair_audit": "pass_bounded"
 }

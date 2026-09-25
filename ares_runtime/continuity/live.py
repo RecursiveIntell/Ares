@@ -400,7 +400,9 @@ def build_live_candidate(
             freshness=Freshness.CURRENT, section=Section.FRONTIER, required=True,
         )
 
-    for custody in snapshot.run_custodies:
+    # The active handle set is an ownership inventory, not the lifetime of a
+    # task. Released heads and predecessor checkpoints retain their obligations.
+    for custody in snapshot.run_checkpoints or snapshot.run_custodies:
         raw = canonical_json(custody)
         add(
             f"record:run:{custody['run_id']}", f"run-custody:{custody['run_id']}",
@@ -546,6 +548,7 @@ def build_live_candidate(
         {
             "role": "user",
             "content": latest_content,
+            "_row_id": latest_user["row_id"],
             "timestamp": latest_user.get("timestamp"),
             **(
                 {"display_kind": latest_user.get("display_kind")}

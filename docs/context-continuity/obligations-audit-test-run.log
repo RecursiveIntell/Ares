@@ -1,0 +1,31 @@
+▶ running per-file parallel test suite via run_tests_parallel.py
+  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)
+▶ pre-compiling bytecode cache
+▶ launching test runner
+Discovered 8 test files (~122 tests) under ['tests/test_run_custody_obligations.py', 'tests/test_run_task_custody.py', 'tests/ares_runtime/test_continuity_input.py', 'tests/ares_runtime/test_continuity_live.py', 'tests/ares_runtime/test_continuity_snapshot_races.py', 'tests/state/test_message_copy_mapping.py', 'tests/run_agent/test_in_place_compaction.py', 'tests/agent/test_micro_compaction.py']; running with -j 2
+[ 29.5% |    36/~122 | ✓36 | ✗ 0] ✓ tests/agent/test_micro_compaction.py (36✓, 1.5s)
+[ 38.5% |    47/~122 | ✓47 | ✗ 0] ✓ tests/ares_runtime/test_continuity_live.py (11✓, 0.7s)
+[ 44.3% |    54/~122 | ✓60 | ✗ 0] ✓ tests/ares_runtime/test_continuity_snapshot_races.py (13✓, 0.8s)
+[ 57.4% |    70/~122 | ✓77 | ✗ 0] ✓ tests/ares_runtime/test_continuity_input.py (17✓, 4.0s)
+[ 67.2% |    82/~122 | ✓116 | ✗  0] ✓ tests/state/test_message_copy_mapping.py (39✓, 1.2s)
+[ 76.2% |    93/~122 | ✓127 | ✗  0] ✓ tests/run_agent/test_in_place_compaction.py (11✓, 5.1s)
+[ 85.2% |   104/~122 | ✓148 | ✗  0] ✓ tests/test_run_task_custody.py (21✓, 1.3s)
+[100.0% |   122/~122 | ✓176 | ✗  0] ✓ tests/test_run_custody_obligations.py (28✓, 6.6s)
+
+=== Summary: 8 files, 176 tests passed, 0 failed (100% complete) in 11.8s (2 workers) ===
+  Durations cached to test_durations.json (8 files)
+
+=== Per-file subprocess time distribution ===
+  Files:   8
+  Total subprocess CPU-wall: 21.2s  (runner wall: 11.8s, parallelism: 2x)
+  P50: 1.46s  P90: 6.61s  P95: 6.61s  P99: 6.61s  Max: 6.61s
+  <1s: 2 files (25%)  <2s: 5 files (62%)
+  Top 10 slowest:
+      6.61s  tests/test_run_custody_obligations.py
+      5.06s  tests/run_agent/test_in_place_compaction.py
+      3.98s  tests/ares_runtime/test_continuity_input.py
+      1.46s  tests/agent/test_micro_compaction.py
+      1.34s  tests/test_run_task_custody.py
+      1.16s  tests/state/test_message_copy_mapping.py
+      0.81s  tests/ares_runtime/test_continuity_snapshot_races.py
+      0.74s  tests/ares_runtime/test_continuity_live.py

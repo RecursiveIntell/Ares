@@ -23,6 +23,11 @@ on:
       - 'tests/test_run_task_custody.py'
       - 'tests/test_run_custody_cold_recovery.py'
       - 'tests/test_run_custody_ready_recovery.py'
+      - 'tests/test_run_custody_obligations.py'
+      - 'tests/state/test_message_copy_mapping.py'
+      - 'tests/state/test_todo_compaction.py'
+      - 'tests/run_agent/test_in_place_compaction.py'
+      - 'tests/agent/test_micro_compaction.py'
       - 'tests/hermes_state/test_append_messages_batch.py'
       - 'tests/tui_gateway/test_run_checkpoint_claim_rpc.py'
       - 'tests/tui_gateway/test_goal_command.py'
@@ -136,6 +141,11 @@ jobs:
             tests/test_run_task_custody.py \
             tests/test_run_custody_cold_recovery.py \
             tests/test_run_custody_ready_recovery.py \
+            tests/test_run_custody_obligations.py \
+            tests/state/test_message_copy_mapping.py \
+            tests/state/test_todo_compaction.py \
+            tests/run_agent/test_in_place_compaction.py \
+            tests/agent/test_micro_compaction.py \
             tests/hermes_state/test_append_messages_batch.py \
             tests/tui_gateway/test_run_checkpoint_claim_rpc.py \
             tests/tui_gateway/test_goal_command.py \
@@ -170,4 +180,5 @@ jobs:
             hermes_state_inbox.py agent/context_input.py \
             scripts/run_checkpoint_claim.py scripts/run_checkpoint_resume.py \
             tui_gateway/run_checkpoint_rpc.py tests/test_run_task_custody.py \
-            tests/test_run_custody_cold_recovery.py tests/test_run_custody_ready_recovery.py
+            tests/test_run_custody_cold_recovery.py tests/test_run_custody_ready_recovery.py \
+            tests/test_run_custody_obligations.py

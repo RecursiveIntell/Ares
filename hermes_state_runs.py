@@ -511,21 +511,30 @@ class SessionRunCustodyMixin:
             raise RunCustodyError("TASK_LINEAGE_MISMATCH")
         origin = conn.execute("SELECT profile_name FROM sessions WHERE id=?", (origin_session_id,)).fetchone()
         current = conn.execute("SELECT profile_name FROM sessions WHERE id=?", (current_session_id,)).fetchone()
-        if (origin is None or current is None or not origin[0] or origin[0] != current[0]):
+        profile_name = None if origin is None else ("default" if origin[0] is None else origin[0])
+        if (origin is None or current is None or not profile_name
+                or profile_name != ("default" if current[0] is None else current[0])):
             raise RunCustodyError("TASK_PROFILE_MISMATCH")
         for sid in lineage:
             profile = conn.execute("SELECT profile_name FROM sessions WHERE id=?", (sid,)).fetchone()
-            if profile is None or profile[0] != origin[0]:
+            if profile is None or ("default" if profile[0] is None else profile[0]) != profile_name:
                 raise RunCustodyError("TASK_PROFILE_MISMATCH")
         origin_lineage = lineage[lineage.index(origin_session_id):]
         row = conn.execute(
-            "SELECT session_id,role,content,timestamp,display_kind,display_metadata,active,_compressed_summary "
+            "SELECT session_id,role,content,timestamp,display_kind,display_metadata,active,_compressed_summary,compacted "
             "FROM messages WHERE id=?", (input_row_id,),
         ).fetchone()
-        if row is None or row["session_id"] not in origin_lineage or row["active"] != 1:
+        if (row is None or row["session_id"] not in origin_lineage
+                or not (row["active"] == 1 or row["active"] == 0 and row["compacted"] == 1)):
             raise RunCustodyError("TASK_INPUT_MISSING")
         if self._session_turn_lease_key_on_conn(conn, row["session_id"]) != root:
             raise RunCustodyError("TASK_LINEAGE_MISMATCH")
+        try:
+            _, derived = self._context_message_origin_on_conn(conn, input_row_id, lineage)
+        except ContextContinuationError as exc:
+            raise RunCustodyError("TASK_INPUT_PROVENANCE_INVALID") from exc
+        if derived:
+            raise RunCustodyError("TASK_AUTHENTIC_INPUT_REQUIRED")
         # Bind raw native provenance, not caller-provided plan/contract text or
         # a generated summary. Synthetic user-role messages are not task anchors.
         candidate = {"role": row["role"], "content": self._decode_content(row["content"]),
@@ -533,9 +542,16 @@ class SessionRunCustodyMixin:
                      "display_metadata": self._decode_display_metadata(row["display_metadata"])}
         if row["_compressed_summary"] or user_originated_turn_view(candidate) is None:
             raise RunCustodyError("TASK_AUTHENTIC_INPUT_REQUIRED")
-        return RunTaskBinding("SessionDBRunTaskBindingV1", run_id, str(root), origin[0],
+        # V1 binding bytes predate the compacted column and include active=1.
+        # Native compaction archives exact provenance; normalize only that
+        # storage flag so existing immutable bindings remain readable. A rewind
+        # (inactive/noncompacted), edited content or synthetic source still fails.
+        provenance = dict(row)
+        provenance.pop("compacted")
+        provenance["active"] = 1
+        return RunTaskBinding("SessionDBRunTaskBindingV1", run_id, str(root), profile_name,
                               origin_session_id, row["session_id"], input_row_id,
-                              _sha(_json(dict(row))))
+                              _sha(_json(provenance)))
 
     def read_run_task_basis(self, *, run_id, origin_session_id, current_session_id, input_row_id):
         """Observe a task binding and current controls; grants no custody."""
@@ -1000,6 +1016,10 @@ class SessionRunCustodyMixin:
         )
 
     def _run_custodies_for_session_on_conn(self, conn, session_id, *, active_only=True):
+        return self._run_custodies_for_sessions_on_conn(conn, {session_id}, active_only=active_only)
+
+    def _run_custodies_for_sessions_on_conn(self, conn, session_ids, *, active_only=True):
+        """Read canonical heads once; release never settles their obligations."""
         heads = conn.execute(
             "SELECT key,value FROM state_meta WHERE key GLOB 'run-custody:*:head' LIMIT 1025"
         ).fetchall()
@@ -1017,7 +1037,7 @@ class SessionRunCustodyMixin:
                 raise RunCustodyError("INTEGRITY_HEAD")
             head = _load(raw)
             value = _decode_run_record(match.group(1), head["generation"], head["digest"], read)
-            if (not active_only or value.disposition == "active") and value.current_session_id == session_id:
+            if (not active_only or value.disposition == "active") and value.current_session_id in session_ids:
                 current[value.run_id] = (raw, value)
         return current
 

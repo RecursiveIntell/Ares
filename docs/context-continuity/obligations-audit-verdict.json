@@ -1,0 +1,51 @@
+{
+  "stage": "independent-hostile-post-implementation-audit",
+  "status": "bounded_pass",
+  "reason": "Frozen obligation/provenance delta closes the reported profile, default-profile, occurrence-identity, compaction sidecar, and derived task-anchor defects. No remaining blocker identified in the audited increment.",
+  "audited_snapshot": "obligations-audit-sources.json",
+  "base_commit": "bc889de041f8a1387d644741ac70d1fe285e2306",
+  "finding_ids": [],
+  "closed_findings": [
+    {
+      "id": "AUD-P1",
+      "issue": "Receipt-bound compaction API sidecar mismatch",
+      "proof": "Native negative admission witnesses and real AIAgent in-place/rotation preflight compaction tests"
+    },
+    {
+      "id": "AUD-P2",
+      "issue": "Derived projection accepted as task authority",
+      "proof": "Same native occurrence resolver rejects derived and copied-derived task anchors in basis and checked claim"
+    },
+    {
+      "id": "profile_lineage_isolation",
+      "issue": "Released ancestor checkpoint crossed profile boundary",
+      "proof": "Snapshot rejects mismatched normalized profiles before instruction/checkpoint projection"
+    },
+    {
+      "id": "default_profile_binding",
+      "issue": "NULL native profile refused ordinary task basis",
+      "proof": "Exact NULL-to-default normalization agrees with inbox owner"
+    },
+    {
+      "id": "occurrence_identity",
+      "issue": "Global timestamp/content dedup conflated independent authentic inputs",
+      "proof": "Native occurrence IDs and validated copy/projection provenance preserve distinct native events; legacy lookalikes are not backfilled"
+    }
+  ],
+  "validation": {
+    "runner": "HERMES_TEST_WORKERS=2 HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh",
+    "files": 8,
+    "passed": 176,
+    "failed": 0,
+    "raw_log": "obligations-audit-test-run.log",
+    "hashes_unchanged_after_gate": true
+  },
+  "coverage_limits": [
+    "Bounded obligation/provenance increment only; full V4 readiness not certified",
+    "No effect settlement/completion authority is introduced; released unresolved checkpoints remain fences",
+    "Legacy rows without provenance receipts are not inferred to be copies",
+    "No gateway-ingress or autonomous-wakeup qualification in this audit"
+  ],
+  "remaining_delta": [],
+  "next_gate": "Continue remaining V4 implementation and integration qualification"
+}

@@ -219,6 +219,7 @@ class ContextRebaseSnapshot:
     read_limits: tuple[int, int, int, int] = (12, 32, 32, 128)
     control_raw: Optional[str] = None
     input_control_raw: Optional[str] = None
+    run_checkpoints: tuple[Dict[str, Any], ...] = ()
 
     @property
     def has_pending_inputs(self) -> bool:
@@ -263,7 +264,7 @@ class ContextRebaseSnapshot:
     @property
     def has_unresolved_effects(self) -> bool:
         return bool(self.unresolved_effects or any(
-            value["checkpoint"]["unresolved_effects"] for value in self.run_custodies
+            value["checkpoint"]["unresolved_effects"] for value in (*self.run_custodies, *self.run_checkpoints)
         ))
 
     @property
@@ -580,6 +581,95 @@ class SessionContextContinuityMixin:
                 conn.execute("ROLLBACK TO context_rebase_snapshot")
                 conn.execute("RELEASE context_rebase_snapshot")
 
+    @staticmethod
+    def _context_message_provenance_digest(row):
+        # Storage flags and read/display bookkeeping may change without
+        # changing source identity. Semantic provenance may not.
+        fields = ("role", "content", "timestamp", "display_kind", "display_metadata",
+                  "_compressed_summary", "tool_call_id", "tool_name", "tool_calls", "effect_disposition")
+        return "sha256:" + hashlib.sha256(_canonical({key: row[key] for key in fields}).encode()).hexdigest()
+
+    def _record_context_message_projections_on_conn(self, conn, source_session, destination_session,
+                                                    messages, row_ids, *, kind, source_rows=None):
+        """Record owner-derived rows; unflushed first occurrences stay authentic.
+
+        A row coordinate is a locator, never proof by itself. The native owner
+        binds its exact source and inserted payload in the same transaction.
+        No matching by content or timestamp can manufacture correspondence.
+        """
+        if kind not in {"in_place", "compression_child", "context_rebase"}:
+            raise ContextContinuationError("CONTEXT_PROJECTION_KIND_INVALID")
+        lineage = set(self._context_rebase_lineage_on_conn(conn, source_session))
+        for index, (msg, destination_id) in enumerate(zip(messages, row_ids)):
+            source_id = (source_rows or {}).get(index, msg.get("_row_id"))
+            if source_id is None:
+                continue
+            if type(source_id) is not int or source_id < 1 or source_id >= destination_id:
+                raise ContextContinuationError("CONTEXT_PROJECTION_SOURCE_INVALID")
+            source = conn.execute("SELECT * FROM messages WHERE id=?", (source_id,)).fetchone()
+            target = conn.execute("SELECT * FROM messages WHERE id=?", (destination_id,)).fetchone()
+            if (source is None or source["session_id"] not in lineage
+                    or not (source["active"] or source["compacted"])
+                    or target is None or target["session_id"] != destination_session):
+                raise ContextContinuationError("CONTEXT_PROJECTION_SOURCE_INVALID")
+            # Flatten only already-admitted provenance, retaining exact source
+            # bytes and avoiding an ever-growing chain of derived summaries.
+            source, _ = self._context_message_origin_on_conn(conn, source_id, lineage)
+            source_id = source["id"]
+            record = {"schema": "SessionDBContextProjectionV1", "kind": kind,
+                "source_session_id": source["session_id"], "source_row_id": source_id,
+                "destination_session_id": destination_session, "destination_row_id": destination_id,
+                "source_digest": self._context_message_provenance_digest(source),
+                "destination_digest": self._context_message_provenance_digest(target)}
+            conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?)",
+                (f"context-message-projection:{destination_id}", _canonical(record)))
+
+    def _context_message_origin_on_conn(self, conn, row_id, lineage):
+        """Resolve a native occurrence or derived projection in one snapshot."""
+        derived = False
+        row = conn.execute("SELECT * FROM messages WHERE id=?", (row_id,)).fetchone()
+        for _ in range(1000):
+            if (row is None or row["session_id"] not in lineage
+                    or not (row["active"] or row["compacted"])):
+                raise ContextContinuationError("CONTEXT_MESSAGE_SOURCE_UNAVAILABLE")
+            projection = conn.execute("SELECT value FROM state_meta WHERE key=?",
+                (f"context-message-projection:{row['id']}",)).fetchone()
+            edge = conn.execute("SELECT * FROM message_copy_edges WHERE destination_message_id=?",
+                                (row["id"],)).fetchone()
+            if projection is not None and edge is not None:
+                raise ContextContinuationError("CONTEXT_MESSAGE_PROVENANCE_AMBIGUOUS")
+            if projection is not None:
+                record = _strict_json(projection[0])
+                if (set(record) != {"schema", "kind", "source_session_id", "source_row_id",
+                        "destination_session_id", "destination_row_id", "source_digest", "destination_digest"}
+                        or record["schema"] != "SessionDBContextProjectionV1"
+                        or record["kind"] not in {"in_place", "compression_child", "context_rebase"}
+                        or record["destination_session_id"] != row["session_id"]
+                        or record["destination_row_id"] != row["id"]
+                        or record["destination_digest"] != self._context_message_provenance_digest(row)):
+                    raise ContextContinuationError("CONTEXT_MESSAGE_PROJECTION_CHANGED")
+                source_id, source_session = record["source_row_id"], record["source_session_id"]
+                digest = record["source_digest"]
+                derived = True
+            elif edge is not None:
+                if (edge["schema_version"] != 1 or edge["copy_kind"] not in {"in_place_tail", "compression_child_tail"}
+                        or edge["destination_session_id"] != row["session_id"]
+                        or (edge["source_session_id"] == edge["destination_session_id"])
+                           != (edge["copy_kind"] == "in_place_tail")):
+                    raise ContextContinuationError("CONTEXT_MESSAGE_COPY_INVALID")
+                source_id, source_session = edge["source_message_id"], edge["source_session_id"]
+                digest = self._context_message_provenance_digest(row)
+            else:
+                return row, derived
+            if type(source_id) is not int or not 0 < source_id < row["id"] or source_session not in lineage:
+                raise ContextContinuationError("CONTEXT_MESSAGE_COPY_INVALID")
+            source = conn.execute("SELECT * FROM messages WHERE id=?", (source_id,)).fetchone()
+            if (source is None or source["session_id"] != source_session
+                    or self._context_message_provenance_digest(source) != digest):
+                raise ContextContinuationError("CONTEXT_MESSAGE_SOURCE_CHANGED")
+            row = source
+        raise ContextContinuationError("CONTEXT_MESSAGE_PROVENANCE_DEPTH_LIMIT")
+
     def _read_context_rebase_snapshot_on_conn(
         self, conn, session_id, *, recent_limit=12, user_limit=32,
         unresolved_effect_limit=32, authentic_user_limit=128,
@@ -601,21 +691,33 @@ class SessionContextContinuityMixin:
             raise ContextContinuationError("CONTEXT_REBASE_PARENT_EMPTY")
 
         lineage = self._context_rebase_lineage_on_conn(conn, session_id)
+        profile_name = "default" if session["profile_name"] is None else session["profile_name"]
+        _identity(profile_name, "CONTEXT_REBASE_PROFILE_REQUIRED")
+        for sid in lineage:
+            profile = conn.execute("SELECT profile_name FROM sessions WHERE id=?", (sid,)).fetchone()
+            if profile is None or ("default" if profile[0] is None else profile[0]) != profile_name:
+                raise ContextContinuationError("CONTEXT_REBASE_PROFILE_MISMATCH")
 
-        # Build one exact human-originated instruction ledger across the
-        # canonical continuation lineage. Physical rebase replay rows carry
-        # the same content into a child; deduplicate only those exact replay
-        # clones so an epoch boundary cannot multiply user authority.
+        # Native occurrence identity preserves distinct identical submissions.
+        # Only owner-recorded copies/projections may collapse or omit a row.
         authentic_user_list = []
         authentic_seen = set()
+        physical_user_rows = 0
         for sid in reversed(lineage):
             rows = conn.execute(
                 "SELECT id,content,timestamp,display_kind,display_metadata "
-                "FROM messages WHERE session_id=? AND active=1 AND role='user' "
-                "ORDER BY id ASC",
+                "FROM messages WHERE session_id=? AND (active=1 OR compacted=1) AND role='user' "
+                "AND _compressed_summary=0 "
+                "ORDER BY id ASC LIMIT 4097",
                 (sid,),
             ).fetchall()
+            physical_user_rows += len(rows)
+            if physical_user_rows > 4096:
+                raise ContextContinuationError("CONTEXT_USER_SCAN_LIMIT")
             for row in rows:
+                row, derived = self._context_message_origin_on_conn(conn, row["id"], lineage)
+                if derived or row["id"] in authentic_seen:
+                    continue
                 candidate = {
                     "role": "user",
                     "content": self._decode_content(row["content"]),
@@ -632,20 +734,10 @@ class SessionContextContinuityMixin:
                 live_view = user_originated_turn_view(candidate)
                 if live_view is None:
                     continue
-                try:
-                    canonical_content = _canonical(live_view.get("content"))
-                except ContextContinuationError:
-                    canonical_content = repr(live_view.get("content"))
-                replay_key = (
-                    live_view.get("timestamp"),
-                    canonical_content,
-                )
-                if replay_key in authentic_seen:
-                    continue
-                authentic_seen.add(replay_key)
+                authentic_seen.add(row["id"])
                 authentic_user_list.append({
                     "row_id": int(row["id"]),
-                    "session_id": sid,
+                    "session_id": row["session_id"],
                     "content": live_view.get("content"),
                     "timestamp": live_view.get("timestamp"),
                 })
@@ -726,7 +818,8 @@ class SessionContextContinuityMixin:
                     else {}
                 ),
             })
-            item["authentic_user"] = live_view is not None
+            _, derived = self._context_message_origin_on_conn(conn, row["id"], lineage)
+            item["authentic_user"] = live_view is not None and not derived
             current_users_list.append(item)
         current_users = tuple(current_users_list)
         if not current_users:
@@ -753,18 +846,27 @@ class SessionContextContinuityMixin:
         } for row in reversed(event_rows))
 
         unresolved_effects_list = []
+        effects_seen = set()
+        physical_effect_rows = 0
         for sid in reversed(lineage):
             rows = conn.execute(
                 "SELECT id,role,content,tool_name,tool_call_id,effect_disposition,"
                 "observed,finish_reason,timestamp,_compressed_summary "
-                "FROM messages WHERE session_id=? AND active=1 AND role='tool' "
+                "FROM messages WHERE session_id=? AND (active=1 OR compacted=1) AND role='tool' "
                 "AND effect_disposition='unknown' ORDER BY id ASC LIMIT ?",
-                (sid, unresolved_effect_limit + 1),
+                (sid, 4097),
             ).fetchall()
+            physical_effect_rows += len(rows)
+            if physical_effect_rows > 4096:
+                raise ContextContinuationError("CONTEXT_EFFECT_SCAN_LIMIT")
             for row in rows:
+                row, derived = self._context_message_origin_on_conn(conn, row["id"], lineage)
+                if derived or row["id"] in effects_seen:
+                    continue
+                effects_seen.add(row["id"])
                 unresolved_effects_list.append({
                     "row_id": int(row["id"]),
-                    "session_id": sid,
+                    "session_id": row["session_id"],
                     "role": row["role"],
                     "content": self._decode_content(row["content"]),
                     "tool_name": row["tool_name"],
@@ -805,19 +907,23 @@ class SessionContextContinuityMixin:
         ).fetchone()
         if int(final["watermark"] if final else 0) != watermark:
             raise ContextContinuationError("CONTEXT_REBASE_SNAPSHOT_CHANGED")
-        custody = self._run_custodies_for_session_on_conn(conn, session_id)
-        safe_custody = tuple({
+        checkpoints = self._run_custodies_for_sessions_on_conn(conn, set(lineage), active_only=False)
+        safe_checkpoints = tuple({
             "run_id": value.run_id,
             "generation": value.generation,
             "origin_session_id": value.origin_session_id,
             "current_session_id": value.current_session_id,
+            "disposition": value.disposition,
             "checkpoint": asdict(value.checkpoint),
-        } for _, value in sorted(custody.values(), key=lambda item: item[1].run_id))
+        } for _, value in sorted(checkpoints.values(), key=lambda item: item[1].run_id))
+        safe_custody = tuple({key: value for key, value in item.items() if key != "disposition"}
+            for item in safe_checkpoints if item["disposition"] == "active"
+            and item["current_session_id"] == session_id)
         control_row = conn.execute("SELECT value FROM state_meta WHERE key=?", (
             "context-control:" + str(root),
         )).fetchone()
         return ContextRebaseSnapshot(
-            session_id, str(root), session["profile_name"], session["cwd"],
+            session_id, str(root), profile_name, session["cwd"],
             session["git_branch"], session["git_repo_root"], watermark,
             control_revision, first_user, authentic_users, current_users,
             latest_summary, recent_events, unresolved_effects, goal_raw,
@@ -825,6 +931,7 @@ class SessionContextContinuityMixin:
             (recent_limit, user_limit, unresolved_effect_limit, authentic_user_limit),
             None if control_row is None else control_row[0],
             self._context_input_control_on_conn(conn, session_id),
+            safe_checkpoints,
         )
 
     def record_context_stop(self, session_id):
@@ -1254,6 +1361,8 @@ class SessionContextContinuityMixin:
             total_messages, total_tool_calls, row_ids = self._insert_message_rows(
                 conn, child_session_id, messages
             )
+            self._record_context_message_projections_on_conn(conn, parent_session_id,
+                child_session_id, messages, row_ids, kind="context_rebase")
             self._project_todo_baseline_on_conn(
                 conn, parent_session_id, child_session_id, todo_baseline, row_ids,
                 "context_rebase_child", input_watermark, input_watermark,

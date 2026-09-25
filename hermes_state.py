@@ -7071,9 +7071,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                     time.time(),
                 ),
             )
+            input_messages = self._normalize_compacted_context_messages_on_conn(conn, parent_session_id, messages)
             total_messages, total_tool_calls, row_ids = self._insert_message_rows(
-                conn, child_session_id, messages
+                conn, child_session_id, input_messages
             )
+            input_sources = self._bind_compacted_context_inputs_on_conn(conn, parent_session_id,
+                child_session_id, input_messages, row_ids)
+            self._record_context_message_projections_on_conn(conn, parent_session_id,
+                child_session_id, input_messages, row_ids, kind="compression_child", source_rows=input_sources)
             if watermark is not None:
                 # Clone the parent's concurrent tail (rows landed after the
                 # watermark, at or below the ceiling — see docstring) into the
@@ -12516,9 +12521,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
                 "WHERE session_id = ? AND active = 1",
                 (session_id,),
             )
+            input_messages = self._normalize_compacted_context_messages_on_conn(conn, session_id, compacted_messages)
             inserted, tool_calls_total, row_ids = self._insert_message_rows(
-                conn, session_id, compacted_messages
+                conn, session_id, input_messages
             )
+            input_sources = self._bind_compacted_context_inputs_on_conn(conn, session_id,
+                session_id, input_messages, row_ids)
+            self._record_context_message_projections_on_conn(conn, session_id,
+                session_id, input_messages, row_ids, kind="in_place", source_rows=input_sources)
             if tail_ids:
                 # Re-sequence the concurrent tail after the compacted set via
                 # a pure-SQL column clone: no decode/re-encode round trip, no

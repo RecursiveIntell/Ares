@@ -64,7 +64,73 @@ class ContextInputReceipt:
         return cls(**value)
 
 
+from contextlib import contextmanager
+from contextvars import ContextVar
+
+_compaction_input_lease = ContextVar("compaction_input_lease", default=None)
+
+
+@contextmanager
+def context_input_turn_lease_scope(db, holder):
+    """Transport the already-owned turn credential to nested compaction calls."""
+    token = _compaction_input_lease.set((db, holder))
+    try:
+        yield
+    finally:
+        _compaction_input_lease.reset(token)
+
+
 class SessionContextInboxMixin:
+    def _normalize_compacted_context_messages_on_conn(self, conn, source_session, messages):
+        """Keep accepted input clean and preserve its exact API-only sidecar."""
+        projected = []
+        for msg in messages:
+            binding = msg.get("_context_input")
+            if binding is None:
+                projected.append(msg)
+                continue
+            if type(binding) is not dict or set(binding) != {"conversation_root", "sequence", "payload_digest"}:
+                raise ContextContinuationError("CONTEXT_INPUT_BINDING_INVALID")
+            root, profile = self._context_input_scope_on_conn(conn, source_session)
+            if binding["conversation_root"] != root:
+                raise ContextContinuationError("CONTEXT_INPUT_SCOPE_MISMATCH")
+            receipt = self._read_context_input_on_conn(conn, root, binding["sequence"])
+            if receipt.profile_name != profile or receipt.payload_digest != binding["payload_digest"]:
+                raise ContextContinuationError("CONTEXT_INPUT_PAYLOAD_MISMATCH")
+            api_content = msg.get("api_content") or msg.get("content")
+            if (type(receipt.content) is not str or type(api_content) is not str
+                    or receipt.content not in api_content):
+                raise ContextContinuationError("CONTEXT_INPUT_PAYLOAD_MISMATCH")
+            item = dict(msg, content=receipt.content)
+            if api_content != receipt.content:
+                item["api_content"] = api_content
+            projected.append(item)
+        return projected
+
+    def _bind_compacted_context_inputs_on_conn(self, conn, source_session, destination_session, messages, row_ids):
+        """First durable input projection shares the compaction transaction.
+
+        Existing projections supply source coordinates, never another inbox
+        consumption. Only a live credential for this exact native DB can bind
+        previously unprojected input. The ContextVar supplies no new authority.
+        """
+        sources = {}
+        for index, (msg, row_id) in enumerate(zip(messages, row_ids)):
+            receipt, existing = self._prepare_context_input_projection_on_conn(
+                conn, source_session, msg, allow_existing_alias=True)
+            if receipt is None:
+                continue
+            if existing is not None:
+                sources[index] = existing["row_id"]
+                continue
+            bound = _compaction_input_lease.get()
+            holder = bound[1] if bound is not None and bound[0] is self else None
+            self._assert_context_rebase_lease_on_conn(conn, source_session, holder)
+            if msg.get("_row_id") is not None:
+                raise ContextContinuationError("CONTEXT_INPUT_FIRST_PROJECTION_CONFLICT")
+            self._commit_context_input_projection_on_conn(conn, receipt, destination_session, row_id)
+        return sources
+
     def _assert_context_input_target_on_conn(self, conn, session_id, *, allow_alias=False):
         tip = self._context_continuation_tip_on_conn(conn, session_id)
         row = conn.execute("SELECT ended_at FROM sessions WHERE id=?", (tip,)).fetchone()
@@ -227,7 +293,7 @@ class SessionContextInboxMixin:
             raise ContextContinuationError("CONTEXT_INPUT_PROJECTION_CHANGED")
         return projection
 
-    def _prepare_context_input_projection_on_conn(self, conn, session_id, message):
+    def _prepare_context_input_projection_on_conn(self, conn, session_id, message, *, allow_existing_alias=False):
         binding = message.get("_context_input")
         if binding is None:
             return None, None
@@ -252,7 +318,7 @@ class SessionContextInboxMixin:
             raise ContextContinuationError("CONTEXT_INPUT_ORDER_MISMATCH")
         if existing is not None and receipt.sequence > head["projected_sequence"]:
             raise ContextContinuationError("CONTEXT_INPUT_PROJECTION_INVALID")
-        if existing is not None and existing["session_id"] != session_id:
+        if existing is not None and existing["session_id"] != session_id and not allow_existing_alias:
             raise ContextContinuationError("CONTEXT_INPUT_ALREADY_PROJECTED")
         return receipt, existing
 
