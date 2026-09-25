@@ -602,7 +602,10 @@ class SessionContextContinuityMixin:
         lineage = set(self._context_rebase_lineage_on_conn(conn, source_session))
         for index, (msg, destination_id) in enumerate(zip(messages, row_ids)):
             source_id = (source_rows or {}).get(index, msg.get("_row_id"))
-            if source_id is None:
+            # Legacy callers use nonpositive integer coordinates for rows
+            # that have not been published. They cannot name a native source
+            # and create no provenance receipt. Positive locators stay strict.
+            if source_id is None or type(source_id) is int and source_id <= 0:
                 continue
             if type(source_id) is not int or source_id < 1 or source_id >= destination_id:
                 raise ContextContinuationError("CONTEXT_PROJECTION_SOURCE_INVALID")

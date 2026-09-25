@@ -8585,6 +8585,7 @@ class AIAgent:
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
         persist_user_event_id: Optional[str] = None,
+        persist_user_input_receipt: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         # A review deliberately shares this agent's session_id for prompt-cache
@@ -8679,6 +8680,12 @@ class AIAgent:
             # process; this durable lease covers Desktop, CLI resume, gateway,
             # and background delivery processes sharing state.db (#84234).
             _turn_db = getattr(self, "_session_db", None)
+            if persist_user_input_receipt is not None and (
+                getattr(self, "_persist_disabled", False)
+                or not callable(getattr(type(_turn_db), "acquire_session_turn_lease", None))
+            ):
+                from hermes_state_continuity import ContextContinuationError
+                raise ContextContinuationError("CONTEXT_INPUT_OWNER_UNAVAILABLE")
             _durable_session_exists = False
             if _turn_db is not None and session_id:
                 try:
@@ -8716,7 +8723,7 @@ class AIAgent:
                 if _durable_session_exists:
                     self._session_db_created = True
                 from ares_runtime.continuity.runtime import context_dispatch_required
-                if context_dispatch_required(self):
+                if context_dispatch_required(self) or persist_user_input_receipt is not None:
                     from hermes_state_continuity import ContextContinuationError
                     # Create only the canonical session identity before input
                     # acceptance. Transcript projection still requires custody.
@@ -8727,9 +8734,10 @@ class AIAgent:
                     input_receipt = accept_turn_input(self, user_message=user_message,
                         persist_user_message=persist_user_message, timestamp=persist_user_timestamp,
                         display_kind=persist_user_display_kind, display_metadata=persist_user_display_metadata,
-                        event_id=persist_user_event_id)
+                        event_id=persist_user_event_id, accepted_receipt=persist_user_input_receipt)
                     if input_receipt is not None:
                         persist_user_timestamp = input_receipt.timestamp
+                        persist_user_display_metadata = input_receipt.display_metadata
                 _durable_holder = (
                     f"pid={os.getpid()}:turn={relay_turn_id}:platform="
                     f"{task_context['platform'] or 'unknown'}"

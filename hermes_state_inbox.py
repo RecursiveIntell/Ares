@@ -126,7 +126,8 @@ class SessionContextInboxMixin:
             bound = _compaction_input_lease.get()
             holder = bound[1] if bound is not None and bound[0] is self else None
             self._assert_context_rebase_lease_on_conn(conn, source_session, holder)
-            if msg.get("_row_id") is not None:
+            coordinate = msg.get("_row_id")
+            if coordinate is not None and not (type(coordinate) is int and coordinate <= 0):
                 raise ContextContinuationError("CONTEXT_INPUT_FIRST_PROJECTION_CONFLICT")
             self._commit_context_input_projection_on_conn(conn, receipt, destination_session, row_id)
         return sources
@@ -266,6 +267,31 @@ class SessionContextInboxMixin:
             finally:
                 conn.execute("ROLLBACK TO context_input_read")
                 conn.execute("RELEASE context_input_read")
+
+    def read_pending_context_inputs(self, session_id):
+        """Discover accepted, unprojected inputs from one native snapshot.
+
+        This is a scheduler observation, never a lease or execution grant.
+        Projected input may still require task/outcome reconciliation.
+        """
+        with self._read_ctx() as conn:
+            conn.execute("SAVEPOINT context_input_pending")
+            try:
+                root, profile = self._context_input_scope_on_conn(conn, session_id)
+                head = self._context_input_head_on_conn(conn, root, profile)
+                if head["accepted_sequence"] - head["projected_sequence"] > 128:
+                    raise ContextContinuationError("CONTEXT_INPUT_PENDING_LIMIT")
+                receipts = []
+                for sequence in range(head["projected_sequence"] + 1, head["accepted_sequence"] + 1):
+                    receipt = self._read_context_input_on_conn(conn, root, sequence)
+                    if (receipt.profile_name != profile
+                            or self._context_input_projection_on_conn(conn, receipt) is not None):
+                        raise ContextContinuationError("CONTEXT_INPUT_RECORD_INVALID")
+                    receipts.append(receipt)
+                return tuple(receipts)
+            finally:
+                conn.execute("ROLLBACK TO context_input_pending")
+                conn.execute("RELEASE context_input_pending")
 
     def _context_input_projection_on_conn(self, conn, receipt):
         row = conn.execute("SELECT value FROM state_meta WHERE key=?",

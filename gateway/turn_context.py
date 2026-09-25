@@ -91,6 +91,7 @@ class TurnContext:
     moa_config: Optional[dict] = None
     persist_user_message: Optional[Any] = None
     persist_user_timestamp: Optional[float] = None
+    context_input: Any = None
     # display_kind stamped on the persisted user row at turn start when this
     # turn was self-injected (MessageEvent.internal), e.g.
     # "internal_notification" for async-delegation/background notifications

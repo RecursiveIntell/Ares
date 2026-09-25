@@ -91,6 +91,15 @@
         "docs/context-continuity/obligations-audit-verdict.json"
       ],
       "receipt": "2334 local tests and 176 independent audit tests passed; full V4 remains incomplete."
+    },
+    {
+      "id": "gateway-input@post",
+      "status": "passed",
+      "evidence": [
+        "docs/context-continuity/gateway-input-evidence.json",
+        "docs/context-continuity/gateway-input-audit-verdict.json"
+      ],
+      "receipt": "2720 local and 114 independent tests passed; all 20 reproduced hosted compatibility failures closed locally; full V4 incomplete."
     }
   ],
   "mutations": [
@@ -113,7 +122,7 @@
     "Installed selected subscription-route tuple and live qualification are unavailable in this workspace."
   ],
   "remaining_delta": [
-    "Gateway/remaining ingress integration, durable wake and task completion ownership",
+    "Remaining ingress/control routes, durable wake and task completion ownership",
     "Existing controller autonomous wake scheduling",
     "Native external effect-owner fence, incarnation and acknowledgement closure",
     "Working source, conditional writes and current policy/retrieval",
@@ -123,7 +132,7 @@
   ],
   "next_gate": "Durable ingress/controller construction, native owner closure and remaining exact-route V4 qualification.",
   "qualification": "Bounded source repair passed; full V4 program remains incomplete.",
-  "scope": "Cumulative PR80 implementation; latest repair preserves released obligations and native input provenance",
-  "latest_repair_evidence": "docs/context-continuity/obligations-evidence.json",
+  "scope": "Cumulative PR80 implementation; latest selected BaseAdapter durable text ingress and provisional-coordinate compatibility",
+  "latest_repair_evidence": "docs/context-continuity/gateway-input-evidence.json",
   "latest_repair_audit": "pass_bounded"
 }

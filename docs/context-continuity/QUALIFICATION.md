@@ -4,6 +4,32 @@ The V4 packet dated 2026-09-23 remains the full acceptance contract. This is
 an implementation branch. Qualification is tied to source hashes and named
 oracles; passing unit tests does not qualify a selected provider route.
 
+## Selected gateway ingress
+
+The real BaseAdapter now awaits runner-owned native input acceptance before
+ordinary text is queued or spawned. Existing transport authorization and profile
+routing select the owner; stable transport IDs deduplicate redelivery without
+binding unstable receive-time defaults. Busy text retains distinct FIFO entries.
+Plugin rewrites and API enrichment preserve the original human input separately.
+The actual agent rereads the exact receipt against its current native root.
+Session reset drift refuses before turn preparation, and an agent construction
+failure leaves pending input without fabricating a second transcript occurrence.
+
+The final pinned local gate passed 2,720 tests across 83 files with five existing
+skips; independent review passed 114 tests. See `gateway-input-evidence.json`.
+This also repairs all 20 reproduced failures from full CI on `20728d3`: exact
+nonpositive integer row coordinates remain provisional, and watermark tests now
+own fresh summary dictionaries for their separate databases. Positive and
+malformed locators remain strict. Focused qualification, Nix and Docker passed
+on that published base; candidate hosted checks follow publication.
+
+This scope is stateless text through BaseAdapter. Active pending control replies,
+attachments and non-BaseAdapter transports remain unqualified. Proxy delivery
+refuses a typed native receipt. Invocation-only IDs do not promise redelivery
+deduplication. Cold inbox wake, actor reauthorization for the entire recovered
+batch, and execution/completion ownership remain required. Projection is not
+completion; unknown outcomes cannot authorize replay.
+
 ## Obligation lifetime and input provenance
 
 Released checkpoint obligations remain in the canonical conversation snapshot,

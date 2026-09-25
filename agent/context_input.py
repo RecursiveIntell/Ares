@@ -7,13 +7,25 @@ from hermes_state_continuity import ContextContinuationError
 
 
 def accept_turn_input(agent, *, user_message, persist_user_message, timestamp,
-                      display_kind, display_metadata, event_id):
+                      display_kind, display_metadata, event_id, accepted_receipt=None):
     """Durable acceptance precedes waiting for another controller's lease.
 
     Transport IDs are opaque, root-scoped deduplication keys. Callers without
     one receive a per-invocation identity; that is not cross-delivery dedup.
     Synthetic producers keep their existing typed owners.
     """
+    if accepted_receipt is not None:
+        from hermes_state_inbox import ContextInputReceipt
+        db = getattr(agent, "_session_db", None)
+        if (type(accepted_receipt) is not ContextInputReceipt or display_kind
+                or getattr(agent, "_persist_disabled", False)
+                or not callable(getattr(type(db), "read_context_input", None))):
+            raise ContextContinuationError("CONTEXT_INPUT_RECEIPT_INVALID")
+        current = db.read_context_input(agent.session_id,
+            source=accepted_receipt.source, event_id=accepted_receipt.event_id)
+        if current != accepted_receipt or persist_user_message != current.content:
+            raise ContextContinuationError("CONTEXT_INPUT_RECEIPT_MISMATCH")
+        return current
     if display_kind or getattr(agent, "_persist_disabled", False):
         return None
     from ares_runtime.continuity.runtime import context_dispatch_required

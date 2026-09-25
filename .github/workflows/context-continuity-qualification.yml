@@ -24,7 +24,29 @@ on:
       - 'tests/test_run_custody_cold_recovery.py'
       - 'tests/test_run_custody_ready_recovery.py'
       - 'tests/test_run_custody_obligations.py'
+      - 'tests/gateway/test_context_input.py'
+      - 'tests/gateway/test_pre_gateway_dispatch.py'
+      - 'tests/gateway/test_restart_resume_pending.py'
+      - 'tests/gateway/test_multiplex_session_db_profile_scope.py'
+      - 'tests/gateway/test_multiplex_adapter_registry.py'
+      - 'tests/gateway/test_adapter_startup_secret_scope.py'
+      - 'tests/gateway/test_startup_connect_parallel.py'
+      - 'tests/gateway/test_run_progress_topics.py'
+      - 'tests/gateway/test_42039_duplicate_user_message.py'
+      - 'tests/gateway/test_internal_event_never_interrupts_busy_session.py'
+      - 'tests/gateway/test_multiplex_busy_input_mode.py'
+      - 'tests/gateway/test_platform_base.py'
+      - 'tests/gateway/test_base_topic_sessions.py'
+      - 'tests/gateway/test_profile_routing.py'
+      - 'tests/gateway/test_busy_session_auth_bypass.py'
+      - 'tests/gateway/test_busy_session_ack.py'
+      - 'gateway/context_input.py'
+      - 'gateway/turn_context.py'
+      - 'gateway/platforms/base.py'
+      - 'gateway/run.py'
       - 'tests/state/test_message_copy_mapping.py'
+      - 'tests/state/test_message_row_publication.py'
+      - 'tests/test_compression_watermark_commit.py'
       - 'tests/state/test_todo_compaction.py'
       - 'tests/run_agent/test_in_place_compaction.py'
       - 'tests/agent/test_micro_compaction.py'
@@ -142,7 +164,25 @@ jobs:
             tests/test_run_custody_cold_recovery.py \
             tests/test_run_custody_ready_recovery.py \
             tests/test_run_custody_obligations.py \
+            tests/gateway/test_context_input.py \
+            tests/gateway/test_pre_gateway_dispatch.py \
+            tests/gateway/test_restart_resume_pending.py \
+            tests/gateway/test_multiplex_session_db_profile_scope.py \
+            tests/gateway/test_multiplex_adapter_registry.py \
+            tests/gateway/test_adapter_startup_secret_scope.py \
+            tests/gateway/test_startup_connect_parallel.py \
+            tests/gateway/test_run_progress_topics.py \
+            tests/gateway/test_42039_duplicate_user_message.py \
+            tests/gateway/test_internal_event_never_interrupts_busy_session.py \
+            tests/gateway/test_multiplex_busy_input_mode.py \
+            tests/gateway/test_platform_base.py \
+            tests/gateway/test_base_topic_sessions.py \
+            tests/gateway/test_profile_routing.py \
+            tests/gateway/test_busy_session_auth_bypass.py \
+            tests/gateway/test_busy_session_ack.py \
             tests/state/test_message_copy_mapping.py \
+            tests/state/test_message_row_publication.py \
+            tests/test_compression_watermark_commit.py \
             tests/state/test_todo_compaction.py \
             tests/run_agent/test_in_place_compaction.py \
             tests/agent/test_micro_compaction.py \
@@ -177,7 +217,8 @@ jobs:
             tests/ares_runtime/test_context_rebase_state.py \
             scripts/run_checkpoint_context.py
           .venv/bin/ruff check hermes_state_runs.py agent/run_checkpoint_custody.py \
-            hermes_state_inbox.py agent/context_input.py \
+            hermes_state_inbox.py agent/context_input.py gateway/context_input.py \
+            tests/gateway/test_context_input.py \
             scripts/run_checkpoint_claim.py scripts/run_checkpoint_resume.py \
             tui_gateway/run_checkpoint_rpc.py tests/test_run_task_custody.py \
             tests/test_run_custody_cold_recovery.py tests/test_run_custody_ready_recovery.py \

@@ -2467,6 +2467,11 @@ class MessageEvent:
     # Proactive plugin events set this to False so untrusted payload text
     # remains conversational input.
     allow_gateway_control: bool = True
+    # Process-local native ingress binding. Never reconstructed from metadata.
+    _context_input: Any = field(default=None, repr=False, compare=False)
+    _context_event_id: Optional[str] = field(default=None, repr=False, compare=False)
+    _context_original_text: Optional[str] = field(default=None, repr=False, compare=False)
+    _context_pre_dispatch_applied: bool = field(default=False, repr=False, compare=False)
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
@@ -3765,6 +3770,10 @@ class BasePlatformAdapter(ABC):
         an optional response string.
         """
         self._message_handler = handler
+
+    def set_input_acceptor(self, handler) -> None:
+        """Install the runner-owned durable ordinary-input admission boundary."""
+        self._input_acceptor = handler
 
     def set_platform_event_handler(
         self,
@@ -6191,6 +6200,10 @@ class BasePlatformAdapter(ABC):
         if needs_topic_recovery:
             await asyncio.to_thread(self._apply_topic_recovery, event)
 
+        acceptor = getattr(self, "_input_acceptor", None)
+        if acceptor is not None and not await acceptor(event):
+            return
+
         session_key = build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
@@ -6341,6 +6354,8 @@ class BasePlatformAdapter(ABC):
                         return
                 except Exception as e:
                     logger.error("[%s] Busy-session handler failed: %s", self.name, e, exc_info=True)
+                    if event._context_input is not None:
+                        raise
 
             # Special case: photo bursts/albums frequently arrive as multiple near-
             # simultaneous messages. Queue them without interrupting the active run,

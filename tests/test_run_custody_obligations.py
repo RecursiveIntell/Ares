@@ -272,13 +272,16 @@ def test_legacy_lookalikes_are_not_backfilled_as_copies(task):
 
 @pytest.mark.parametrize("rotate", [False, True])
 @pytest.mark.parametrize("sidecar", [False, True])
-def test_unflushed_inbox_input_binds_atomically_in_native_compaction(task, rotate, sidecar):
+@pytest.mark.parametrize("coordinate", [None, -77])
+def test_unflushed_inbox_input_binds_atomically_in_native_compaction(task, rotate, sidecar, coordinate):
     from hermes_state_inbox import context_input_turn_lease_scope
     from tests.ares_runtime.test_continuity_input import row
     db = task[0]
     receipt = db.accept_context_input("s", source="cli", event_id="new", content="New unflushed input")
     messages = [row(receipt), {"role": "tool", "content": "Unknown tool result", "tool_call_id": "new-op",
                              "effect_disposition": "unknown"}]
+    if coordinate is not None:
+        messages[0]["_row_id"] = coordinate
     if sidecar:
         messages[0]["content"] = "API-only note\n" + receipt.content
     before = db.get_messages("s")
@@ -359,3 +362,24 @@ def test_real_materializer_rebases_keep_one_authentic_occurrence_beyond_100_edge
     assert len(snapshot.authentic_users) == 1
     assert snapshot.authentic_users[0]["row_id"] == task[1]["task_binding"].input_row_id
     assert db.get_context_continuation_tip("s") == current
+
+
+@pytest.mark.parametrize("coordinate", [True, "-77", "missing", "foreign", "future"])
+def test_compaction_invalid_source_locators_still_refuse_atomically(task, coordinate):
+    db = task[0]
+    if coordinate == "foreign":
+        db.create_session("unrelated", source="cli", profile_name="p")
+        db.append_message("unrelated", "user", "Foreign source")
+        coordinate = db.get_messages("unrelated")[0]["id"]
+    elif coordinate == "missing":
+        db.append_message("s", "assistant", "Removed coordinate")
+        coordinate = db.get_messages("s")[-1]["id"]
+        db._execute_write(lambda conn: conn.execute("DELETE FROM messages WHERE id=?", (coordinate,)))
+    elif coordinate == "future":
+        coordinate = 2**62
+    before = db.get_messages("s", include_inactive=True)
+    messages = [{"role": "user", "content": "Unbound text", "_row_id": coordinate}]
+    with pytest.raises(ContextContinuationError, match="PROJECTION_SOURCE_INVALID"):
+        db.archive_and_compact("s", messages)
+    assert db.get_messages("s", include_inactive=True) == before
+    assert messages[0]["_row_id"] == coordinate
