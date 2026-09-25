@@ -197,6 +197,47 @@ def test_strict_profile_row_admission_rejects_existing_wrong_profile(tmp_path):
         db.close()
 
 
+def test_strict_profile_row_admission_does_not_enrich_racing_foreign_row(tmp_path, monkeypatch):
+    """An owner insert after the pre-read cannot acquire our model config."""
+    from hermes_state import SessionDB
+
+    profile_home = tmp_path / "fixture-profile"
+    profile_home.mkdir()
+    key = "racing-compute-turn"
+    original_create = SessionDB.create_session
+    inserted = False
+
+    def competing_create(self, session_id, source, **kwargs):
+        nonlocal inserted
+        if not inserted:
+            inserted = True
+            competitor = SessionDB(db_path=profile_home / "state.db")
+            try:
+                original_create(
+                    competitor, session_id, source="desktop",
+                    profile_name="different-profile",
+                )
+            finally:
+                competitor.close()
+        return original_create(self, session_id, source, **kwargs)
+
+    monkeypatch.setattr(SessionDB, "create_session", competing_create)
+    with pytest.raises(RuntimeError, match="persistence unavailable"):
+        server._ensure_session_db_row(
+            {"session_key": key, "profile_home": str(profile_home),
+             "source": "desktop", "model_override": {"model": "fixture-model"}},
+            require_durable=True,
+        )
+    assert inserted
+    db = SessionDB(db_path=profile_home / "state.db")
+    try:
+        row = db.get_session(key)
+        assert row is not None and row["profile_name"] == "different-profile"
+        assert row["model_config"] is None, "foreign owner row was enriched before denial"
+    finally:
+        db.close()
+
+
 def test_compute_child_exit_preserves_admitted_row_for_independent_owner_readback(tmp_path):
     """Child exit cannot erase the DB row admitted before turn.started.
 

@@ -3687,18 +3687,6 @@ def _ensure_session_db_row(session: dict, *, require_durable: bool = False) -> N
         if require_durable:
             raise RuntimeError("compute-host session DB unavailable")
         return
-    if require_durable and profile_home:
-        # Reject a pre-existing foreign row before the idempotent upsert can
-        # enrich it. The post-write check below still catches identity drift;
-        # this read alone is not a transactional cross-process admission fence.
-        try:
-            existing = db.get_session(key)
-            if existing is not None and existing.get("profile_name") != Path(profile_home).name:
-                raise RuntimeError("compute-host session row profile mismatch")
-        except Exception as exc:
-            if close_db:
-                db.close()
-            raise RuntimeError("compute-host session row persistence unavailable") from exc
     # The session's own model/effort/fast pick — the composer override shipped on
     # session.create, or a restored /model switch — must own the row's model +
     # model_config. The agent isn't built yet at first prompt.submit, so derive
@@ -3770,6 +3758,10 @@ def _ensure_session_db_row(session: dict, *, require_durable: bool = False) -> N
             # into one list can't rely on which file a row came from alone. NULL
             # means the launch/default profile (matches run_agent's convention).
             profile_name=Path(profile_home).name if profile_home else None,
+            # In strict compute-child admission the canonical SessionDB owner
+            # checks this identity inside its BEGIN IMMEDIATE write transaction.
+            **({"expected_profile_name": Path(profile_home).name}
+               if require_durable and profile_home else {}),
         )
         if require_durable:
             row = db.get_session(key)
