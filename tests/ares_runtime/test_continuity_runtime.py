@@ -354,8 +354,12 @@ def test_twelve_runtime_rebases_preserve_requirement_after_each_recovery(tmp_pat
         assert db.read_context_rebase_episode(
             agent.session_id
         ).attempts_without_recovery == 1
-        # This represents the provider-confirmed prompt-below-threshold event.
-        db.reset_context_rebase_episode(agent.session_id)
+        # Explicit operator resume starts a fresh bounded episode; request
+        # size alone is not objective progress.
+        import uuid
+        db.resume_context_goal(agent.session_id,
+            **db.read_context_resume_basis(agent.session_id),
+            operator_action_id=str(uuid.uuid4()))
         assert db.read_context_rebase_episode(
             agent.session_id
         ).attempts_without_recovery == 0

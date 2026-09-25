@@ -1604,42 +1604,47 @@ def handle_function_call(
         except Exception:
             reset_current_observability_context = None
         try:
-            # Final admission is deliberately after middleware, plugin hooks,
-            # and edit approval. The permit binds the exact payload that the
-            # registry will execute, never an earlier model payload.
-            if _ares_canary_enabled:
-                from ares_runtime.collaboration import dispatcher_boundary
-                _ares_allowed, _ares_code, _ares_permit = dispatcher_boundary(
-                    function_name,
-                    function_args,
-                    mission_ref=_ares_mission_ref,
-                    session_id=session_id,
-                    schema=_ares_schema,
-                    authorize_permit=True,
-                    consume_permit=True,
-                    production_context=_ares_canary_context,
+            # This callback is the final registry boundary, including callers
+            # whose tool execution middleware is still active (execute_code).
+            # Bind the native permit only after its final argument rewrite.
+            _dispatch_lock = threading.Lock()
+            _dispatch_started = False
+            _ares_effect_args = function_args
+
+            def _dispatch(next_args: Dict[str, Any]) -> Any:
+                nonlocal _ares_permit, _ares_effect_args, _dispatch_started
+                from ares_runtime.continuity.runtime import assert_context_tool_control_current
+
+                with _dispatch_lock:
+                    if _dispatch_started:
+                        raise RuntimeError("Tool registry callback invoked more than once")
+                    _dispatch_started = True
+                assert_context_tool_control_current(session_id=session_id)
+                _ares_effect_args = next_args
+                if _ares_canary_enabled:
+                    from ares_runtime.collaboration import dispatcher_boundary
+                    allowed, code, _ares_permit = dispatcher_boundary(
+                        function_name,
+                        next_args,
+                        mission_ref=_ares_mission_ref,
+                        session_id=session_id,
+                        schema=_ares_schema,
+                        authorize_permit=True,
+                        consume_permit=True,
+                        production_context=_ares_canary_context,
+                    )
+                    if not allowed:
+                        return tool_error(f"ARES_EFFECT_DENIED:{code}")
+                if function_name == "execute_code":
+                    sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
+                    return registry.dispatch(
+                        function_name, next_args, task_id=task_id,
+                        session_id=session_id, enabled_tools=sandbox_enabled,
+                    )
+                return registry.dispatch(
+                    function_name, next_args, task_id=task_id,
+                    session_id=session_id, user_task=user_task,
                 )
-                if not _ares_allowed:
-                    return tool_error(f"ARES_EFFECT_DENIED:{_ares_code}")
-            if function_name == "execute_code":
-                # Prefer the caller-provided list so subagents can't overwrite
-                # the parent's tool set via the process-global.
-                sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
-                def _dispatch(next_args: Dict[str, Any]) -> Any:
-                    return registry.dispatch(
-                        function_name, next_args,
-                        task_id=task_id,
-                        session_id=session_id,
-                        enabled_tools=sandbox_enabled,
-                    )
-            else:
-                def _dispatch(next_args: Dict[str, Any]) -> Any:
-                    return registry.dispatch(
-                        function_name, next_args,
-                        task_id=task_id,
-                        session_id=session_id,
-                        user_task=user_task,
-                    )
             if skip_tool_execution_middleware:
                 result = _dispatch(function_args)
             else:
@@ -1663,7 +1668,7 @@ def handle_function_call(
                     _record_ares_consumed_outcome(
                         _ares_permit,
                         function_name=function_name,
-                        function_args=function_args,
+                        function_args=_ares_effect_args,
                         mission_ref=_ares_mission_ref,
                         state="ambiguous",
                         duration_ms=duration_ms,
@@ -1691,7 +1696,7 @@ def handle_function_call(
                 _record_ares_consumed_outcome(
                     _ares_permit,
                     function_name=function_name,
-                    function_args=function_args,
+                    function_args=_ares_effect_args,
                     mission_ref=_ares_mission_ref,
                     state=_status,
                     duration_ms=duration_ms,

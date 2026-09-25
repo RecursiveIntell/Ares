@@ -729,7 +729,17 @@ def _run_agent_tool_execution_middleware(
         )
         _hb_thread.start()
         try:
-            return execute(final_args)
+            from ares_runtime.continuity.runtime import (
+                ContextDispatchError, assert_context_tool_control_current,
+                context_tool_control_scope,
+            )
+            try:
+                with context_tool_control_scope(agent):
+                    assert_context_tool_control_current(session_id=agent.session_id)
+                    return execute(final_args)
+            except ContextDispatchError as exc:
+                state["blocked"] = True
+                return json.dumps({"error": str(exc)}, ensure_ascii=False)
         finally:
             _hb_stop.set()
             _hb_thread.join(timeout=2.0)

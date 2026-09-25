@@ -21,7 +21,9 @@
       "supporting_test_files": [
         "tests/ares_runtime/test_continuity_runtime.py"
       ],
-      "remaining_gate": "Installed tuple, native owner capabilities, compatibility and real binary baseline remain unqualified."
+      "remaining_gate": "Installed tuple, native owner capabilities, compatibility and real binary baseline remain unqualified.",
+      "acceptance_oracle": "Record remote/local commits, dirty/staged/untracked state, dependency pins, installed binaries and selected provider/model/effort/configuration. Do not equate remote main with installed code.",
+      "negative_case": "Change installed binary or source dependency without updating candidate identity."
     },
     {
       "id": "CT-002",
@@ -38,7 +40,9 @@
       "supporting_test_files": [
         "tests/ares_runtime/test_continuity_runtime.py"
       ],
-      "remaining_gate": "Installed tuple, native owner capabilities, compatibility and real binary baseline remain unqualified."
+      "remaining_gate": "Installed tuple, native owner capabilities, compatibility and real binary baseline remain unqualified.",
+      "acceptance_oracle": "Crosswalk the prior 172 specifications to affected/new/unaffected gates by their original IDs before release; no deletion or silent replacement.",
+      "negative_case": "Drop a prior selected runtime-injection or UI gate from the release report."
     },
     {
       "id": "CT-003",
@@ -55,7 +59,9 @@
       "supporting_test_files": [
         "tests/ares_runtime/test_continuity_runtime.py"
       ],
-      "remaining_gate": "Installed tuple, native owner capabilities, compatibility and real binary baseline remain unqualified."
+      "remaining_gate": "Installed tuple, native owner capabilities, compatibility and real binary baseline remain unqualified.",
+      "acceptance_oracle": "Trace ordinary task and goal ingress to context assembly, memory, provider, tools, persistence and driver; record supported rebase operations and limits.",
+      "negative_case": "Enable a flag on a bypassed adapter and report route coverage."
     },
     {
       "id": "CT-004",
@@ -72,7 +78,9 @@
       "supporting_test_files": [
         "tests/ares_runtime/test_continuity_runtime.py"
       ],
-      "remaining_gate": "Installed tuple, native owner capabilities, compatibility and real binary baseline remain unqualified."
+      "remaining_gate": "Installed tuple, native owner capabilities, compatibility and real binary baseline remain unqualified.",
+      "acceptance_oracle": "Document checked custody requirements and a real goal-less task binding; keep V1 historical-goal checks intact.",
+      "negative_case": "Supply a fabricated goal or use unchecked custody for an ordinary task."
     },
     {
       "id": "CT-005",
@@ -89,7 +97,9 @@
       "supporting_test_files": [
         "tests/ares_runtime/test_continuity_runtime.py"
       ],
-      "remaining_gate": "Installed tuple, native owner capabilities, compatibility and real binary baseline remain unqualified."
+      "remaining_gate": "Installed tuple, native owner capabilities, compatibility and real binary baseline remain unqualified.",
+      "acceptance_oracle": "New continuation-edge/schema readers and activation compatibility are tested; incompatible old writers refuse before mutation.",
+      "negative_case": "Run an old binary that ignores a new edge and writes the old parent."
     },
     {
       "id": "CT-006",
@@ -106,7 +116,9 @@
       "supporting_test_files": [
         "tests/ares_runtime/test_continuity_runtime.py"
       ],
-      "remaining_gate": "Installed tuple, native owner capabilities, compatibility and real binary baseline remain unqualified."
+      "remaining_gate": "Installed tuple, native owner capabilities, compatibility and real binary baseline remain unqualified.",
+      "acceptance_oracle": "On a clone verify owner-produced DB/artifact snapshots and recovery, including required keys; do not copy a live DB file without its consistency mechanism.",
+      "negative_case": "Use a partial snapshot or omit an authentication key and call restore verified."
     },
     {
       "id": "CT-007",
@@ -123,7 +135,9 @@
       "supporting_test_files": [
         "tests/ares_runtime/test_continuity_runtime.py"
       ],
-      "remaining_gate": "Installed tuple, native owner capabilities, compatibility and real binary baseline remain unqualified."
+      "remaining_gate": "Installed tuple, native owner capabilities, compatibility and real binary baseline remain unqualified.",
+      "acceptance_oracle": "Record approved scopes, action grants, subscription/API route, quota, disk/inodes/RAM and private output paths; planning grants no new live writes.",
+      "negative_case": "Fall back to paid API, broaden filesystem access or expose private transcripts."
     },
     {
       "id": "CT-008",
@@ -140,7 +154,9 @@
       "supporting_test_files": [
         "tests/ares_runtime/test_continuity_runtime.py"
       ],
-      "remaining_gate": "Installed tuple, native owner capabilities, compatibility and real binary baseline remain unqualified."
+      "remaining_gate": "Installed tuple, native owner capabilities, compatibility and real binary baseline remain unqualified.",
+      "acceptance_oracle": "Run applicable pinned-binary compaction/prepare/activation/lineage regressions before changing behavior and record raw outcomes.",
+      "negative_case": "Replace a failed real-binary case with a mock pass."
     },
     {
       "id": "CT-009",
@@ -158,7 +174,9 @@
         "tests/ares_runtime/test_continuity_checkpoint.py",
         "tests/ares_runtime/test_context_rebase_state.py"
       ],
-      "remaining_gate": "Local snapshots and checkpoint inspection exist; continuous complete workspace/effect/process capture is not established."
+      "remaining_gate": "Local snapshots and checkpoint inspection exist; continuous complete workspace/effect/process capture is not established.",
+      "acceptance_oracle": "Every active requirement resolves to an authentic source span and explicit supersession; unrelated recent instructions do not erase older constraints.",
+      "negative_case": "Treat latest message alone as the complete user contract."
     },
     {
       "id": "CT-010",
@@ -176,7 +194,9 @@
         "tests/ares_runtime/test_continuity_checkpoint.py",
         "tests/ares_runtime/test_context_rebase_state.py"
       ],
-      "remaining_gate": "Local snapshots and checkpoint inspection exist; continuous complete workspace/effect/process capture is not established."
+      "remaining_gate": "Local snapshots and checkpoint inspection exist; continuous complete workspace/effect/process capture is not established.",
+      "acceptance_oracle": "Runtime continuation, tool output, memory and old assistant plans cannot acquire user or system authority.",
+      "negative_case": "Import a synthetic continuation as a new human approval."
     },
     {
       "id": "CT-011",
@@ -194,7 +214,9 @@
         "tests/ares_runtime/test_continuity_checkpoint.py",
         "tests/ares_runtime/test_context_rebase_state.py"
       ],
-      "remaining_gate": "Local snapshots and checkpoint inspection exist; continuous complete workspace/effect/process capture is not established."
+      "remaining_gate": "Local snapshots and checkpoint inspection exist; continuous complete workspace/effect/process capture is not established.",
+      "acceptance_oracle": "Facts, proposals, hypotheses, decisions, tests and verified completion carry distinct states and source links.",
+      "negative_case": "Promote a hypothesis or prior assistant done statement into verified state."
     },
     {
       "id": "CT-012",
@@ -212,7 +234,9 @@
         "tests/ares_runtime/test_continuity_checkpoint.py",
         "tests/ares_runtime/test_context_rebase_state.py"
       ],
-      "remaining_gate": "Local snapshots and checkpoint inspection exist; continuous complete workspace/effect/process capture is not established."
+      "remaining_gate": "Local snapshots and checkpoint inspection exist; continuous complete workspace/effect/process capture is not established.",
+      "acceptance_oracle": "At existing safe boundaries persist current frontier, change refs and concise source-backed rationale; cold bootstrap works without a final old-model summary.",
+      "negative_case": "Kill the model before handoff narration and lose the only next-action record."
     },
     {
       "id": "CT-013",
@@ -230,7 +254,9 @@
         "tests/ares_runtime/test_continuity_checkpoint.py",
         "tests/ares_runtime/test_context_rebase_state.py"
       ],
-      "remaining_gate": "Local snapshots and checkpoint inspection exist; continuous complete workspace/effect/process capture is not established."
+      "remaining_gate": "Local snapshots and checkpoint inspection exist; continuous complete workspace/effect/process capture is not established.",
+      "acceptance_oracle": "HEAD, index, unstaged/untracked relevant files and owned artifacts are represented with observed identity; no auto-stash, reset or mandatory commit.",
+      "negative_case": "Transfer only git HEAD and silently lose uncommitted modifications."
     },
     {
       "id": "CT-014",
@@ -248,7 +274,9 @@
         "tests/ares_runtime/test_continuity_checkpoint.py",
         "tests/ares_runtime/test_context_rebase_state.py"
       ],
-      "remaining_gate": "Local snapshots and checkpoint inspection exist; continuous complete workspace/effect/process capture is not established."
+      "remaining_gate": "Local snapshots and checkpoint inspection exist; continuous complete workspace/effect/process capture is not established.",
+      "acceptance_oracle": "Each test result records command, exit/disposition, source/dependency/environment identity and freshness; changed source invalidates applicability.",
+      "negative_case": "Carry tests green after the relevant source or fixture changed."
     },
     {
       "id": "CT-015",
@@ -266,7 +294,9 @@
         "tests/ares_runtime/test_continuity_checkpoint.py",
         "tests/ares_runtime/test_context_rebase_state.py"
       ],
-      "remaining_gate": "Local snapshots and checkpoint inspection exist; continuous complete workspace/effect/process capture is not established."
+      "remaining_gate": "Local snapshots and checkpoint inspection exist; continuous complete workspace/effect/process capture is not established.",
+      "acceptance_oracle": "Pending/settled/unknown operations have stable logical IDs; processes use owner/incarnation handles rather than PID alone.",
+      "negative_case": "Retry an unknown effect or attach to a reused PID."
     },
     {
       "id": "CT-016",
@@ -284,7 +314,9 @@
         "tests/ares_runtime/test_continuity_checkpoint.py",
         "tests/ares_runtime/test_context_rebase_state.py"
       ],
-      "remaining_gate": "Local snapshots and checkpoint inspection exist; continuous complete workspace/effect/process capture is not established."
+      "remaining_gate": "Local snapshots and checkpoint inspection exist; continuous complete workspace/effect/process capture is not established.",
+      "acceptance_oracle": "Known mandatory omissions block normal continuation; unavailable, denied, none and not-observed are distinguishable; owner obligations remain intact.",
+      "negative_case": "Replace an unreadable obligation set with an empty array."
     },
     {
       "id": "CT-017",
@@ -302,7 +334,9 @@
         "tests/ares_runtime/test_continuity_compiler.py",
         "tests/ares_runtime/test_continuity_live.py"
       ],
-      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration."
+      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration.",
+      "acceptance_oracle": "Mandatory requirement/dependency coverage is checked before any lexical sort, ref limit or optional pruning.",
+      "negative_case": "Keep only lexicographically first refs and omit a required constraint."
     },
     {
       "id": "CT-018",
@@ -320,7 +354,9 @@
         "tests/ares_runtime/test_continuity_compiler.py",
         "tests/ares_runtime/test_continuity_live.py"
       ],
-      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration."
+      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration.",
+      "acceptance_oracle": "Privileged rules are application-authored; untrusted evidence is escaped data in legal provider roles and cannot grant tools.",
+      "negative_case": "Place retrieved text or an old summary inside a developer instruction."
     },
     {
       "id": "CT-019",
@@ -338,7 +374,9 @@
         "tests/ares_runtime/test_continuity_compiler.py",
         "tests/ares_runtime/test_continuity_live.py"
       ],
-      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration."
+      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration.",
+      "acceptance_oracle": "Native tool-call/result structures remain valid, raw argument evidence remains bound, and unresolved pairs are not fabricated as successful.",
+      "negative_case": "Drop half of a tool pair or synthesize a successful result to fit the prompt."
     },
     {
       "id": "CT-020",
@@ -356,7 +394,9 @@
         "tests/ares_runtime/test_continuity_compiler.py",
         "tests/ares_runtime/test_continuity_live.py"
       ],
-      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration."
+      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration.",
+      "acceptance_oracle": "Current contract, decision frontier and required evidence are readable inline; references alone do not qualify an actionable brief.",
+      "negative_case": "Produce a short manifest-only prompt and assume the model knows its contents."
     },
     {
       "id": "CT-021",
@@ -374,7 +414,9 @@
         "tests/ares_runtime/test_continuity_compiler.py",
         "tests/ares_runtime/test_continuity_live.py"
       ],
-      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration."
+      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration.",
+      "acceptance_oracle": "Next-action dependencies, relevant rejected approaches and reasons survive; selection is not last-N-files only.",
+      "negative_case": "Drop the prior failed approach and repeatedly choose it again."
     },
     {
       "id": "CT-022",
@@ -392,7 +434,9 @@
         "tests/ares_runtime/test_continuity_compiler.py",
         "tests/ares_runtime/test_continuity_live.py"
       ],
-      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration."
+      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration.",
+      "acceptance_oracle": "Route-specific supported representations are preserved or explicitly unavailable; canonical UTF-8 recovery is not claimed to reconstruct images or opaque native state.",
+      "negative_case": "Replace an image-dependent finding with text and call it exact."
     },
     {
       "id": "CT-023",
@@ -410,7 +454,9 @@
         "tests/ares_runtime/test_continuity_compiler.py",
         "tests/ares_runtime/test_continuity_live.py"
       ],
-      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration."
+      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration.",
+      "acceptance_oracle": "New stop/steer/contract events invalidate stale context; actual newer human input is never overridden by a synthetic next action.",
+      "negative_case": "Append stale continuation instruction after a newer cancellation."
     },
     {
       "id": "CT-024",
@@ -428,7 +474,9 @@
         "tests/ares_runtime/test_continuity_compiler.py",
         "tests/ares_runtime/test_continuity_live.py"
       ],
-      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration."
+      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration.",
+      "acceptance_oracle": "Same frozen source selection/config produces the same deterministic brief/source-map identity. Every request independently binds its exact serialized provider body and attempt identity. Dynamic transport fields are not disguised as content determinism.",
+      "negative_case": "Reuse an old invocation identity or ignore a changed tool schema to keep a golden payload hash unchanged."
     },
     {
       "id": "CT-025",
@@ -446,7 +494,9 @@
         "tests/ares_runtime/test_continuity_budget.py",
         "tests/ares_runtime/test_continuity_transport_bounds.py"
       ],
-      "remaining_gate": "Pure pressure policy and serialized-request bounds exist; hard shared budget reservation, actual route accounting and calibration remain unqualified."
+      "remaining_gate": "Pure pressure policy and serialized-request bounds exist; hard shared budget reservation, actual route accounting and calibration remain unqualified.",
+      "acceptance_oracle": "All counted message, schema, framing, multimodal and native retained-state costs plus applicable output/error reserve fit real caps; invalid budgets refuse.",
+      "negative_case": "Count only message characters or fall back to raw context after negative usable budget."
     },
     {
       "id": "CT-026",
@@ -464,7 +514,9 @@
         "tests/ares_runtime/test_continuity_budget.py",
         "tests/ares_runtime/test_continuity_transport_bounds.py"
       ],
-      "remaining_gate": "Pure pressure policy and serialized-request bounds exist; hard shared budget reservation, actual route accounting and calibration remain unqualified."
+      "remaining_gate": "Pure pressure policy and serialized-request bounds exist; hard shared budget reservation, actual route accounting and calibration remain unqualified.",
+      "acceptance_oracle": "Measured provider usage, exact supported counter and calibrated estimates are distinct; near-bound uncertainty triggers conservative admission.",
+      "negative_case": "Label a whitespace/character heuristic provider-exact."
     },
     {
       "id": "CT-027",
@@ -482,7 +534,9 @@
         "tests/ares_runtime/test_continuity_budget.py",
         "tests/ares_runtime/test_continuity_transport_bounds.py"
       ],
-      "remaining_gate": "Pure pressure policy and serialized-request bounds exist; hard shared budget reservation, actual route accounting and calibration remain unqualified."
+      "remaining_gate": "Pure pressure policy and serialized-request bounds exist; hard shared budget reservation, actual route accounting and calibration remain unqualified.",
+      "acceptance_oracle": "Initial 50/20 settings are tunable candidates; pressure, horizon and successor feasibility each have explicit decisions.",
+      "negative_case": "Report that 50 percent or 48K is scientifically optimal."
     },
     {
       "id": "CT-028",
@@ -500,7 +554,9 @@
         "tests/ares_runtime/test_continuity_budget.py",
         "tests/ares_runtime/test_continuity_transport_bounds.py"
       ],
-      "remaining_gate": "Pure pressure policy and serialized-request bounds exist; hard shared budget reservation, actual route accounting and calibration remain unqualified."
+      "remaining_gate": "Pure pressure policy and serialized-request bounds exist; hard shared budget reservation, actual route accounting and calibration remain unqualified.",
+      "acceptance_oracle": "Bounded growth is checked before each relevant model/tool iteration; giant tool output is stored and projected within limits.",
+      "negative_case": "Approve a large tool batch based only on turn-start occupancy."
     },
     {
       "id": "CT-029",
@@ -518,7 +574,9 @@
         "tests/ares_runtime/test_continuity_budget.py",
         "tests/ares_runtime/test_continuity_transport_bounds.py"
       ],
-      "remaining_gate": "Pure pressure policy and serialized-request bounds exist; hard shared budget reservation, actual route accounting and calibration remain unqualified."
+      "remaining_gate": "Pure pressure policy and serialized-request bounds exist; hard shared budget reservation, actual route accounting and calibration remain unqualified.",
+      "acceptance_oracle": "PRESSURE requires positive measured runway gain and useful bounded horizon; PROVIDER_REPAIR may retain similar size only with a typed owner-observed fault, verified fresh-context route and full safety/coverage checks. No user-stop or quota bypass.",
+      "negative_case": "Use a model self-report of degraded quality as a repair bypass for a non-improving pressure loop."
     },
     {
       "id": "CT-030",
@@ -536,7 +594,9 @@
         "tests/ares_runtime/test_continuity_budget.py",
         "tests/ares_runtime/test_continuity_transport_bounds.py"
       ],
-      "remaining_gate": "Pure pressure policy and serialized-request bounds exist; hard shared budget reservation, actual route accounting and calibration remain unqualified."
+      "remaining_gate": "Pure pressure policy and serialized-request bounds exist; hard shared budget reservation, actual route accounting and calibration remain unqualified.",
+      "acceptance_oracle": "When mandatory content cannot fit, use already-authorized decomposition/windowing or durable explicit blocked/reconciliation state.",
+      "negative_case": "Repeatedly spawn epochs or silently drop mandatory content."
     },
     {
       "id": "CT-031",
@@ -554,7 +614,9 @@
         "tests/ares_runtime/test_continuity_budget.py",
         "tests/ares_runtime/test_continuity_transport_bounds.py"
       ],
-      "remaining_gate": "Pure pressure policy and serialized-request bounds exist; hard shared budget reservation, actual route accounting and calibration remain unqualified."
+      "remaining_gate": "Pure pressure policy and serialized-request bounds exist; hard shared budget reservation, actual route accounting and calibration remain unqualified.",
+      "acceptance_oracle": "Episode signatures and bounded retry accounting survive epoch/restart; reset only context-local cache metrics, not cancellation/quota/failure history. A changed diagnostic signature or housekeeping task revision alone never authorizes a new episode.",
+      "negative_case": "Treat a fresh epoch or heartbeat as progress and reset exhausted budgets."
     },
     {
       "id": "CT-032",
@@ -572,7 +634,9 @@
         "tests/ares_runtime/test_continuity_budget.py",
         "tests/ares_runtime/test_continuity_transport_bounds.py"
       ],
-      "remaining_gate": "Pure pressure policy and serialized-request bounds exist; hard shared budget reservation, actual route accounting and calibration remain unqualified."
+      "remaining_gate": "Pure pressure policy and serialized-request bounds exist; hard shared budget reservation, actual route accounting and calibration remain unqualified.",
+      "acceptance_oracle": "Content-aware packet sizing may exceed a soft target only under qualified hard constraints; no huge model window justifies huge default bootstraps.",
+      "negative_case": "Hard-trim a binding instruction to achieve an arbitrary token target."
     },
     {
       "id": "CT-033",
@@ -590,7 +654,9 @@
         "tests/ares_runtime/test_context_rebase_state.py",
         "tests/ares_runtime/test_continuity_snapshot_races.py"
       ],
-      "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete."
+      "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete.",
+      "acceptance_oracle": "Before committed switchover the real effect owner acknowledges a stale-owner fence; already-started effects have explicit disposition.",
+      "negative_case": "Change only a SessionDB row while an old worker can still invoke effects."
     },
     {
       "id": "CT-034",
@@ -608,7 +674,9 @@
         "tests/ares_runtime/test_context_rebase_state.py",
         "tests/ares_runtime/test_continuity_snapshot_races.py"
       ],
-      "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete."
+      "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete.",
+      "acceptance_oracle": "The chosen artifact owner confirms bytes/digest/durability before publication; missing blob prevents readiness.",
+      "negative_case": "Commit a successor pointing to an unflushed temporary file."
     },
     {
       "id": "CT-035",
@@ -626,7 +694,9 @@
         "tests/ares_runtime/test_context_rebase_state.py",
         "tests/ares_runtime/test_continuity_snapshot_races.py"
       ],
-      "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete."
+      "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete.",
+      "acceptance_oracle": "Local child, continuation edge/tip, applicable goal/task transfer, custody revision and durable dispatch intent commit together with expected revisions. Only states sharing this owner transaction are local; external task/Graph state is referenced and reconciled, never duplicated as authority.",
+      "negative_case": "Crash between parent closure and successor/dispatch publication."
     },
     {
       "id": "CT-036",
@@ -644,7 +714,9 @@
         "tests/ares_runtime/test_context_rebase_state.py",
         "tests/ares_runtime/test_continuity_snapshot_races.py"
       ],
-      "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete."
+      "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete.",
+      "acceptance_oracle": "Governor activation/native receipts/policy remain owned externally; READY requires required acknowledgments, not guessed distributed atomicity.",
+      "negative_case": "Interpret local COMMIT as proof every external owner activated."
     },
     {
       "id": "CT-037",
@@ -662,7 +734,9 @@
         "tests/ares_runtime/test_context_rebase_state.py",
         "tests/ares_runtime/test_continuity_snapshot_races.py"
       ],
-      "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete."
+      "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete.",
+      "acceptance_oracle": "Source/user/task/goal revisions and obligation preservation are checked; immutable historical goal evidence is not overwritten by migration.",
+      "negative_case": "Clear a historical goal key needed by a later custody check."
     },
     {
       "id": "CT-038",
@@ -680,7 +754,9 @@
         "tests/ares_runtime/test_context_rebase_state.py",
         "tests/ares_runtime/test_continuity_snapshot_races.py"
       ],
-      "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete."
+      "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete.",
+      "acceptance_oracle": "Heartbeat custody revisions, context epoch, Governor lineage generation, attempt, control and policy revisions cannot be substituted.",
+      "negative_case": "Increment context epoch whenever a custody lease refreshes."
     },
     {
       "id": "CT-039",
@@ -698,7 +774,9 @@
         "tests/ares_runtime/test_context_rebase_state.py",
         "tests/ares_runtime/test_continuity_snapshot_races.py"
       ],
-      "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete."
+      "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete.",
+      "acceptance_oracle": "Crash before/after artifact/DB/activation/wakeup steps resumes the same committed successor or safe parent; duplicate wakeups cannot fork.",
+      "negative_case": "Create another successor after lost publish acknowledgment."
     },
     {
       "id": "CT-040",
@@ -716,7 +794,9 @@
         "tests/ares_runtime/test_context_rebase_state.py",
         "tests/ares_runtime/test_continuity_snapshot_races.py"
       ],
-      "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete."
+      "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete.",
+      "acceptance_oracle": "Unknown mutations are inspected through canonical owner readback; no second unchecked claim or replay.",
+      "negative_case": "Blindly repeat a custody transfer after timeout."
     },
     {
       "id": "CT-041",
@@ -735,7 +815,9 @@
         "tests/ares_runtime/test_continuity_runtime.py",
         "tests/ares_runtime/test_continuity_dispatch.py"
       ],
-      "remaining_gate": "Actual caller refusal is locally exercised with provider doubles. Live useful-work continuation, cold owner recovery, and sealed provider/effect attempts remain unqualified."
+      "remaining_gate": "Actual caller refusal is locally exercised with provider doubles. Live useful-work continuation, cold owner recovery, and sealed provider/effect attempts remain unqualified.",
+      "acceptance_oracle": "At least one real supported ordinary task crosses a rebase and performs valid next work without human prompt or project restart.",
+      "negative_case": "Exercise only standalone packet generation and call autonomy complete."
     },
     {
       "id": "CT-042",
@@ -754,7 +836,9 @@
         "tests/ares_runtime/test_continuity_runtime.py",
         "tests/ares_runtime/test_continuity_dispatch.py"
       ],
-      "remaining_gate": "Actual caller refusal is locally exercised with provider doubles. Live useful-work continuation, cold owner recovery, and sealed provider/effect attempts remain unqualified."
+      "remaining_gate": "Actual caller refusal is locally exercised with provider doubles. Live useful-work continuation, cold owner recovery, and sealed provider/effect attempts remain unqualified.",
+      "acceptance_oracle": "Real /goal route preserves completion contract, turns, wait state and one active binding through rebase.",
+      "negative_case": "Copy the goal as a new task with fresh turn allowance."
     },
     {
       "id": "CT-043",
@@ -773,7 +857,9 @@
         "tests/ares_runtime/test_continuity_runtime.py",
         "tests/ares_runtime/test_continuity_dispatch.py"
       ],
-      "remaining_gate": "Actual caller refusal is locally exercised with provider doubles. Live useful-work continuation, cold owner recovery, and sealed provider/effect attempts remain unqualified."
+      "remaining_gate": "Actual caller refusal is locally exercised with provider doubles. Live useful-work continuation, cold owner recovery, and sealed provider/effect attempts remain unqualified.",
+      "acceptance_oracle": "A versioned goal-or-task binding or existing task owner is used through the real goal-less route; V1 remains strict.",
+      "negative_case": "Remove HISTORICAL_GOAL_BINDING_MISSING to make a test pass."
     },
     {
       "id": "CT-044",
@@ -792,7 +878,9 @@
         "tests/ares_runtime/test_continuity_runtime.py",
         "tests/ares_runtime/test_continuity_dispatch.py"
       ],
-      "remaining_gate": "Actual caller refusal is locally exercised with provider doubles. Live useful-work continuation, cold owner recovery, and sealed provider/effect attempts remain unqualified."
+      "remaining_gate": "Actual caller refusal is locally exercised with provider doubles. Live useful-work continuation, cold owner recovery, and sealed provider/effect attempts remain unqualified.",
+      "acceptance_oracle": "Captured successor payload/native thread state is bounded and does not implicitly reattach exhausted history; selected auth/billing/tool owner is unchanged.",
+      "negative_case": "Change a local session ID but reuse an old provider history pointer."
     },
     {
       "id": "CT-045",
@@ -811,7 +899,9 @@
         "tests/ares_runtime/test_continuity_runtime.py",
         "tests/ares_runtime/test_continuity_dispatch.py"
       ],
-      "remaining_gate": "Actual caller refusal is locally exercised with provider doubles. Live useful-work continuation, cold owner recovery, and sealed provider/effect attempts remain unqualified."
+      "remaining_gate": "Actual caller refusal is locally exercised with provider doubles. Live useful-work continuation, cold owner recovery, and sealed provider/effect attempts remain unqualified.",
+      "acceptance_oracle": "Long-running jobs remain discoverable by stable owner handles; no duplicate build/poll process or forced kill merely to rebase. Late results attach to original operations and cannot clobber newer control/task state.",
+      "negative_case": "Call agent close that destroys an active registered process."
     },
     {
       "id": "CT-046",
@@ -830,7 +920,9 @@
         "tests/ares_runtime/test_continuity_runtime.py",
         "tests/ares_runtime/test_continuity_dispatch.py"
       ],
-      "remaining_gate": "Actual caller refusal is locally exercised with provider doubles. Live useful-work continuation, cold owner recovery, and sealed provider/effect attempts remain unqualified."
+      "remaining_gate": "Actual caller refusal is locally exercised with provider doubles. Live useful-work continuation, cold owner recovery, and sealed provider/effect attempts remain unqualified.",
+      "acceptance_oracle": "Committed stop prevents subsequent new admissions; already-admitted work is reconciled under explicit cutoff semantics.",
+      "negative_case": "Activation or restart re-enables a stopped task."
     },
     {
       "id": "CT-047",
@@ -849,7 +941,9 @@
         "tests/ares_runtime/test_continuity_runtime.py",
         "tests/ares_runtime/test_continuity_dispatch.py"
       ],
-      "remaining_gate": "Actual caller refusal is locally exercised with provider doubles. Live useful-work continuation, cold owner recovery, and sealed provider/effect attempts remain unqualified."
+      "remaining_gate": "Actual caller refusal is locally exercised with provider doubles. Live useful-work continuation, cold owner recovery, and sealed provider/effect attempts remain unqualified.",
+      "acceptance_oracle": "Queue order and user sequence are preserved across old/new session IDs; stale plan cannot consume or bypass newer input.",
+      "negative_case": "Use an old queued continuation to consume a newer task checkpoint."
     },
     {
       "id": "CT-048",
@@ -868,7 +962,9 @@
         "tests/ares_runtime/test_continuity_runtime.py",
         "tests/ares_runtime/test_continuity_dispatch.py"
       ],
-      "remaining_gate": "Actual caller refusal is locally exercised with provider doubles. Live useful-work continuation, cold owner recovery, and sealed provider/effect attempts remain unqualified."
+      "remaining_gate": "Actual caller refusal is locally exercised with provider doubles. Live useful-work continuation, cold owner recovery, and sealed provider/effect attempts remain unqualified.",
+      "acceptance_oracle": "Restart after publication adopts the same tip and reconciles state before admission, without relying on an old in-memory handle.",
+      "negative_case": "Recover only when the pre-crash controller object still exists."
     },
     {
       "id": "CT-049",
@@ -885,7 +981,9 @@
       "supporting_test_files": [
         "tests/ares_runtime/test_context_rebase_state.py"
       ],
-      "remaining_gate": "Local lineage/branch tests are supporting evidence; current-policy retrieval, revocation, retention and unified live UI require route evidence."
+      "remaining_gate": "Local lineage/branch tests are supporting evidence; current-policy retrieval, revocation, retention and unified live UI require route evidence.",
+      "acceptance_oracle": "Required and optional retrieval have explicit policy/failure semantics; exact next-action dependencies are materialized before call.",
+      "negative_case": "Turn forbidden or corrupt mandatory evidence into optional no-match."
     },
     {
       "id": "CT-050",
@@ -902,7 +1000,9 @@
       "supporting_test_files": [
         "tests/ares_runtime/test_context_rebase_state.py"
       ],
-      "remaining_gate": "Local lineage/branch tests are supporting evidence; current-policy retrieval, revocation, retention and unified live UI require route evidence."
+      "remaining_gate": "Local lineage/branch tests are supporting evidence; current-policy retrieval, revocation, retention and unified live UI require route evidence.",
+      "acceptance_oracle": "Revocation is respected through cached memory, stored summaries, old briefs and exact historical expansion according to current owner policy. Define and test the enforceable egress-admission cutoff, including revocation after compilation; do not promise recall of already-disclosed data.",
+      "negative_case": "Reinject revoked plaintext from an older brief when current recall denies it."
     },
     {
       "id": "CT-051",
@@ -919,7 +1019,9 @@
       "supporting_test_files": [
         "tests/ares_runtime/test_context_rebase_state.py"
       ],
-      "remaining_gate": "Local lineage/branch tests are supporting evidence; current-policy retrieval, revocation, retention and unified live UI require route evidence."
+      "remaining_gate": "Local lineage/branch tests are supporting evidence; current-policy retrieval, revocation, retention and unified live UI require route evidence.",
+      "acceptance_oracle": "Resolve several-epoch-old required evidence via retained owner refs; missing/deleted content is explicitly unavailable.",
+      "negative_case": "Assume a digest alone guarantees retrieval or authorization."
     },
     {
       "id": "CT-052",
@@ -936,7 +1038,9 @@
       "supporting_test_files": [
         "tests/ares_runtime/test_context_rebase_state.py"
       ],
-      "remaining_gate": "Local lineage/branch tests are supporting evidence; current-policy retrieval, revocation, retention and unified live UI require route evidence."
+      "remaining_gate": "Local lineage/branch tests are supporting evidence; current-policy retrieval, revocation, retention and unified live UI require route evidence.",
+      "acceptance_oracle": "Exercise more than 100 continuations with correct unique tip, pagination and bounded current-state work; caps never silently choose stale tips.",
+      "negative_case": "Use an old depth-limited walk that silently returns an ancestor."
     },
     {
       "id": "CT-053",
@@ -953,7 +1057,9 @@
       "supporting_test_files": [
         "tests/ares_runtime/test_context_rebase_state.py"
       ],
-      "remaining_gate": "Local lineage/branch tests are supporting evidence; current-policy retrieval, revocation, retention and unified live UI require route evidence."
+      "remaining_gate": "Local lineage/branch tests are supporting evidence; current-policy retrieval, revocation, retention and unified live UI require route evidence.",
+      "acceptance_oracle": "One logical conversation/task remains; typed epoch events, event-ID dedup, meaningful resuming/reconciling/waiting/stopped states match owners.",
+      "negative_case": "Render successful continuation before activation or dedup different events by text."
     },
     {
       "id": "CT-054",
@@ -970,7 +1076,9 @@
       "supporting_test_files": [
         "tests/ares_runtime/test_context_rebase_state.py"
       ],
-      "remaining_gate": "Local lineage/branch tests are supporting evidence; current-policy retrieval, revocation, retention and unified live UI require route evidence."
+      "remaining_gate": "Local lineage/branch tests are supporting evidence; current-policy retrieval, revocation, retention and unified live UI require route evidence.",
+      "acceptance_oracle": "Continuation resolution never follows /new, explicit branches, delegates or other profiles/worktrees; control events stay scoped.",
+      "negative_case": "Pick newest child as the continuation regardless of edge type."
     },
     {
       "id": "CT-055",
@@ -987,7 +1095,9 @@
       "supporting_test_files": [
         "tests/ares_runtime/test_context_rebase_state.py"
       ],
-      "remaining_gate": "Local lineage/branch tests are supporting evidence; current-policy retrieval, revocation, retention and unified live UI require route evidence."
+      "remaining_gate": "Local lineage/branch tests are supporting evidence; current-policy retrieval, revocation, retention and unified live UI require route evidence.",
+      "acceptance_oracle": "Successor calls pass the same policy, memory, native admission and receipt path as selected normal calls; no fallback bypass.",
+      "negative_case": "Route rollover bootstrap through a less-governed auxiliary client."
     },
     {
       "id": "CT-056",
@@ -1004,7 +1114,9 @@
       "supporting_test_files": [
         "tests/ares_runtime/test_context_rebase_state.py"
       ],
-      "remaining_gate": "Local lineage/branch tests are supporting evidence; current-policy retrieval, revocation, retention and unified live UI require route evidence."
+      "remaining_gate": "Local lineage/branch tests are supporting evidence; current-policy retrieval, revocation, retention and unified live UI require route evidence.",
+      "acceptance_oracle": "Required current evidence is pinned under owner policy; log/packet growth and garbage collection are bounded and secret-safe.",
+      "negative_case": "Delete a reachable source blob or publish private transcript/keys with a PR."
     },
     {
       "id": "CT-057",
@@ -1022,7 +1134,9 @@
         "tests/ares_runtime/test_continuity_dispatch.py",
         "tests/ares_runtime/test_continuity_snapshot_races.py"
       ],
-      "remaining_gate": "Local negative witnesses and repeat-rebase tests are not cross-owner crash/fault injection or real repeated provider rollovers."
+      "remaining_gate": "Local negative witnesses and repeat-rebase tests are not cross-owner crash/fault injection or real repeated provider rollovers.",
+      "acceptance_oracle": "Disposable real stores/processes cover delayed acknowledgments, conflicting readers, disk full, cancellation and restart at every protocol step.",
+      "negative_case": "Replace external store acknowledgment with an always-true mock."
     },
     {
       "id": "CT-058",
@@ -1040,7 +1154,9 @@
         "tests/ares_runtime/test_continuity_dispatch.py",
         "tests/ares_runtime/test_continuity_snapshot_races.py"
       ],
-      "remaining_gate": "Local negative witnesses and repeat-rebase tests are not cross-owner crash/fault injection or real repeated provider rollovers."
+      "remaining_gate": "Local negative witnesses and repeat-rebase tests are not cross-owner crash/fault injection or real repeated provider rollovers.",
+      "acceptance_oracle": "Crash after possible effect before settlement yields reconciliation/blocked status, not retry; independent observer counts effects.",
+      "negative_case": "Treat missing receipt as proof no external effect happened."
     },
     {
       "id": "CT-059",
@@ -1058,7 +1174,9 @@
         "tests/ares_runtime/test_continuity_dispatch.py",
         "tests/ares_runtime/test_continuity_snapshot_races.py"
       ],
-      "remaining_gate": "Local negative witnesses and repeat-rebase tests are not cross-owner crash/fault injection or real repeated provider rollovers."
+      "remaining_gate": "Local negative witnesses and repeat-rebase tests are not cross-owner crash/fault injection or real repeated provider rollovers.",
+      "acceptance_oracle": "Strict parsing, size/depth limits, duplicate keys, stale digests, denied refs and forged roles fail without effects.",
+      "negative_case": "Repair corrupt identity/authority fields from attacker-controlled text."
     },
     {
       "id": "CT-060",
@@ -1076,7 +1194,9 @@
         "tests/ares_runtime/test_continuity_dispatch.py",
         "tests/ares_runtime/test_continuity_snapshot_races.py"
       ],
-      "remaining_gate": "Local negative witnesses and repeat-rebase tests are not cross-owner crash/fault injection or real repeated provider rollovers."
+      "remaining_gate": "Local negative witnesses and repeat-rebase tests are not cross-owner crash/fault injection or real repeated provider rollovers.",
+      "acceptance_oracle": "Remove real effect fence, memory hook, revision check, dedup, cancel check or budget check; corresponding integration gate must fail.",
+      "negative_case": "Increase assertion count while tests still pass with key control removed."
     },
     {
       "id": "CT-061",
@@ -1094,7 +1214,9 @@
         "tests/ares_runtime/test_continuity_dispatch.py",
         "tests/ares_runtime/test_continuity_snapshot_races.py"
       ],
-      "remaining_gate": "Local negative witnesses and repeat-rebase tests are not cross-owner crash/fault injection or real repeated provider rollovers."
+      "remaining_gate": "Local negative witnesses and repeat-rebase tests are not cross-owner crash/fault injection or real repeated provider rollovers.",
+      "acceptance_oracle": "A useful synthetic workflow crosses at least 20 tiny-window epochs, including a process restart, preserving task outcomes.",
+      "negative_case": "Use an idle loop, simulated messages only or a model-free test as the sole end-to-end witness."
     },
     {
       "id": "CT-062",
@@ -1112,7 +1234,9 @@
         "tests/ares_runtime/test_continuity_dispatch.py",
         "tests/ares_runtime/test_continuity_snapshot_races.py"
       ],
-      "remaining_gate": "Local negative witnesses and repeat-rebase tests are not cross-owner crash/fault injection or real repeated provider rollovers."
+      "remaining_gate": "Local negative witnesses and repeat-rebase tests are not cross-owner crash/fault injection or real repeated provider rollovers.",
+      "acceptance_oracle": "Fixtures require old constraints/dependencies, current failures and rejected alternatives; next action is judged against a permissible set, not exact prose.",
+      "negative_case": "Accept a fluent recap that takes a forbidden or previously-falsified action."
     },
     {
       "id": "CT-063",
@@ -1130,7 +1254,9 @@
         "tests/ares_runtime/test_continuity_dispatch.py",
         "tests/ares_runtime/test_continuity_snapshot_races.py"
       ],
-      "remaining_gate": "Local negative witnesses and repeat-rebase tests are not cross-owner crash/fault injection or real repeated provider rollovers."
+      "remaining_gate": "Local negative witnesses and repeat-rebase tests are not cross-owner crash/fault injection or real repeated provider rollovers.",
+      "acceptance_oracle": "Independent deterministic gates prevent done with unverified steps, wrong branch/root or unknown effects; task oracle sees actual artifacts.",
+      "negative_case": "Let the summarizer or same executor judge certify its own completion."
     },
     {
       "id": "CT-064",
@@ -1148,7 +1274,9 @@
         "tests/ares_runtime/test_continuity_dispatch.py",
         "tests/ares_runtime/test_continuity_snapshot_races.py"
       ],
-      "remaining_gate": "Local negative witnesses and repeat-rebase tests are not cross-owner crash/fault injection or real repeated provider rollovers."
+      "remaining_gate": "Local negative witnesses and repeat-rebase tests are not cross-owner crash/fault injection or real repeated provider rollovers.",
+      "acceptance_oracle": "Selected native opaque state, multimodal inputs, giant schemas, unavailable memory and resource limits have positive and refusal witnesses.",
+      "negative_case": "Claim all providers supported after testing a single plain-text mock."
     },
     {
       "id": "CT-065",
@@ -1160,7 +1288,9 @@
       "status": "NOT_QUALIFIED",
       "source_surfaces": [],
       "supporting_test_files": [],
-      "remaining_gate": "No matched-budget selected-route calibration, held-out outcomes or measured cost/quality claim."
+      "remaining_gate": "No matched-budget selected-route calibration, held-out outcomes or measured cost/quality claim.",
+      "acceptance_oracle": "Freeze representative tasks, primary metrics, meaningful non-inferiority margins, sample/sequential rule and total allowed usage before runs.",
+      "negative_case": "Keep sampling or changing metrics until a desired policy wins."
     },
     {
       "id": "CT-066",
@@ -1172,7 +1302,9 @@
       "status": "NOT_QUALIFIED",
       "source_surfaces": [],
       "supporting_test_files": [],
-      "remaining_gate": "No matched-budget selected-route calibration, held-out outcomes or measured cost/quality claim."
+      "remaining_gate": "No matched-budget selected-route calibration, held-out outcomes or measured cost/quality claim.",
+      "acceptance_oracle": "Compare incumbent, anchored structured update, exact-excerpt rebase and proposed hybrid at matched task/provider/effort budgets.",
+      "negative_case": "Compare different models or cripple baseline retrieval to claim gains."
     },
     {
       "id": "CT-067",
@@ -1184,7 +1316,9 @@
       "status": "NOT_QUALIFIED",
       "source_surfaces": [],
       "supporting_test_files": [],
-      "remaining_gate": "No matched-budget selected-route calibration, held-out outcomes or measured cost/quality claim."
+      "remaining_gate": "No matched-budget selected-route calibration, held-out outcomes or measured cost/quality claim.",
+      "acceptance_oracle": "Independent disposable workspaces and state/caches prevent cross-arm artifacts; split tasks, not near-duplicate checkpoints, into held-out sets.",
+      "negative_case": "Run candidate after baseline in the already-fixed repository."
     },
     {
       "id": "CT-068",
@@ -1196,7 +1330,9 @@
       "status": "NOT_QUALIFIED",
       "source_surfaces": [],
       "supporting_test_files": [],
-      "remaining_gate": "No matched-budget selected-route calibration, held-out outcomes or measured cost/quality claim."
+      "remaining_gate": "No matched-budget selected-route calibration, held-out outcomes or measured cost/quality claim.",
+      "acceptance_oracle": "First validate a layout at fixed policy, then screen a small policy set including the 70-percent placeholder baseline if viable; avoid unbounded factorial sweeps.",
+      "negative_case": "Change layout, model, retention and thresholds together and infer causality."
     },
     {
       "id": "CT-069",
@@ -1208,7 +1344,9 @@
       "status": "NOT_QUALIFIED",
       "source_surfaces": [],
       "supporting_test_files": [],
-      "remaining_gate": "No matched-budget selected-route calibration, held-out outcomes or measured cost/quality claim."
+      "remaining_gate": "No matched-budget selected-route calibration, held-out outcomes or measured cost/quality claim.",
+      "acceptance_oracle": "Report input/output/cached tokens, compaction/retrieval calls, quota/time, latency, repeated work and verified completion, not token ratio alone.",
+      "negative_case": "Count only smaller bootstrap prompts while hiding refetch and cache costs."
     },
     {
       "id": "CT-070",
@@ -1220,7 +1358,9 @@
       "status": "NOT_QUALIFIED",
       "source_surfaces": [],
       "supporting_test_files": [],
-      "remaining_gate": "No matched-budget selected-route calibration, held-out outcomes or measured cost/quality claim."
+      "remaining_gate": "No matched-budget selected-route calibration, held-out outcomes or measured cost/quality claim.",
+      "acceptance_oracle": "Report confidence intervals and small-sample limits by task/route/epoch depth; one unsafe outcome blocks rollout regardless of average.",
+      "negative_case": "Treat zero observed failures or a mean score as proof of indefinite reliability."
     },
     {
       "id": "CT-071",
@@ -1232,7 +1372,9 @@
       "status": "NOT_QUALIFIED",
       "source_surfaces": [],
       "supporting_test_files": [],
-      "remaining_gate": "No matched-budget selected-route calibration, held-out outcomes or measured cost/quality claim."
+      "remaining_gate": "No matched-budget selected-route calibration, held-out outcomes or measured cost/quality claim.",
+      "acceptance_oracle": "Learn policy choices offline; runtime never increases rights, global budget or safety limits from its own success score.",
+      "negative_case": "Autotune away a safety check to improve completion rate."
     },
     {
       "id": "CT-072",
@@ -1244,7 +1386,9 @@
       "status": "NOT_QUALIFIED",
       "source_surfaces": [],
       "supporting_test_files": [],
-      "remaining_gate": "No matched-budget selected-route calibration, held-out outcomes or measured cost/quality claim."
+      "remaining_gate": "No matched-budget selected-route calibration, held-out outcomes or measured cost/quality claim.",
+      "acceptance_oracle": "Freeze chosen renderer/policy/provider capability tuple and run held-out qualification without tuning on failures.",
+      "negative_case": "Use calibration results for a different source or policy hash."
     },
     {
       "id": "CT-073",
@@ -1256,7 +1400,9 @@
       "status": "NOT_QUALIFIED",
       "source_surfaces": [],
       "supporting_test_files": [],
-      "remaining_gate": "No installed-profile canary, managed activation, rollback or inherited endurance qualification. Independent delta review is narrower than full implementation review."
+      "remaining_gate": "No installed-profile canary, managed activation, rollback or inherited endurance qualification. Independent delta review is narrower than full implementation review.",
+      "acceptance_oracle": "Disabling new rebases preserves interpretation and reconciliation of already-committed continuation state.",
+      "negative_case": "Feature-flag off strands published successor/outbox state."
     },
     {
       "id": "CT-074",
@@ -1268,7 +1414,9 @@
       "status": "NOT_QUALIFIED",
       "source_surfaces": [],
       "supporting_test_files": [],
-      "remaining_gate": "No installed-profile canary, managed activation, rollback or inherited endurance qualification. Independent delta review is narrower than full implementation review."
+      "remaining_gate": "No installed-profile canary, managed activation, rollback or inherited endurance qualification. Independent delta review is narrower than full implementation review.",
+      "acceptance_oracle": "One approved profile/route does useful work with both permitted and denied actions, visible states and abort criteria.",
+      "negative_case": "Globally activate without a selected-route canary or exact grant."
     },
     {
       "id": "CT-075",
@@ -1280,7 +1428,9 @@
       "status": "NOT_QUALIFIED",
       "source_surfaces": [],
       "supporting_test_files": [],
-      "remaining_gate": "No installed-profile canary, managed activation, rollback or inherited endurance qualification. Independent delta review is narrower than full implementation review."
+      "remaining_gate": "No installed-profile canary, managed activation, rollback or inherited endurance qualification. Independent delta review is narrower than full implementation review.",
+      "acceptance_oracle": "Keep inherited 24-hour/18-hour uninterrupted-process useful-work requirements as separate larger-program gates; lower-context tests do not replace them.",
+      "negative_case": "Declare broader completion from accelerated or idle-only tests."
     },
     {
       "id": "CT-076",
@@ -1292,7 +1442,9 @@
       "status": "NOT_QUALIFIED",
       "source_surfaces": [],
       "supporting_test_files": [],
-      "remaining_gate": "No installed-profile canary, managed activation, rollback or inherited endurance qualification. Independent delta review is narrower than full implementation review."
+      "remaining_gate": "No installed-profile canary, managed activation, rollback or inherited endurance qualification. Independent delta review is narrower than full implementation review.",
+      "acceptance_oracle": "Rollback executable/config only with compatible readers or a tested recovery build; preserve latest task/effect history and new tip.",
+      "negative_case": "Restore a pre-rollover database then replay already-settled effects."
     },
     {
       "id": "CT-077",
@@ -1304,7 +1456,9 @@
       "status": "NOT_QUALIFIED",
       "source_surfaces": [],
       "supporting_test_files": [],
-      "remaining_gate": "No installed-profile canary, managed activation, rollback or inherited endurance qualification. Independent delta review is narrower than full implementation review."
+      "remaining_gate": "No installed-profile canary, managed activation, rollback or inherited endurance qualification. Independent delta review is narrower than full implementation review.",
+      "acceptance_oracle": "A separate reviewer checks exact source, real negative tests and owner readbacks; planner self-review is not substituted.",
+      "negative_case": "Label this packet or abstract BFS as independent product certification."
     },
     {
       "id": "CT-078",
@@ -1316,7 +1470,9 @@
       "status": "NOT_QUALIFIED",
       "source_surfaces": [],
       "supporting_test_files": [],
-      "remaining_gate": "No installed-profile canary, managed activation, rollback or inherited endurance qualification. Independent delta review is narrower than full implementation review."
+      "remaining_gate": "No installed-profile canary, managed activation, rollback or inherited endurance qualification. Independent delta review is narrower than full implementation review.",
+      "acceptance_oracle": "Unsafe/unrecoverable context or unknown effects leave durable reason, next reconciliation action and operator controls; no fabricated continuation success.",
+      "negative_case": "Hide blocked state under running animation or require a new chat as normal recovery."
     },
     {
       "id": "CT-079",
@@ -1328,7 +1484,9 @@
       "status": "NOT_QUALIFIED",
       "source_surfaces": [],
       "supporting_test_files": [],
-      "remaining_gate": "No installed-profile canary, managed activation, rollback or inherited endurance qualification. Independent delta review is narrower than full implementation review."
+      "remaining_gate": "No installed-profile canary, managed activation, rollback or inherited endurance qualification. Independent delta review is narrower than full implementation review.",
+      "acceptance_oracle": "Record changed files, commits, commands, exit codes, passed/failed/skipped reasons, live identities, unresolved risks and rollback receipt.",
+      "negative_case": "Promote test specifications or inherited numbers to new pass claims."
     },
     {
       "id": "CT-080",
@@ -1340,7 +1498,9 @@
       "status": "NOT_QUALIFIED",
       "source_surfaces": [],
       "supporting_test_files": [],
-      "remaining_gate": "No installed-profile canary, managed activation, rollback or inherited endurance qualification. Independent delta review is narrower than full implementation review."
+      "remaining_gate": "No installed-profile canary, managed activation, rollback or inherited endurance qualification. Independent delta review is narrower than full implementation review.",
+      "acceptance_oracle": "After dependencies/merge/installation changes, rerun affected joins and retained gates on the actual candidate; source-ready is distinct from live-verified.",
+      "negative_case": "Reuse pre-merge evidence without dependency/source applicability checks."
     },
     {
       "id": "CT-081",
@@ -1358,7 +1518,9 @@
         "tests/ares_runtime/test_context_rebase_state.py",
         "tests/ares_runtime/test_continuity_snapshot_races.py"
       ],
-      "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete."
+      "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete.",
+      "acceptance_oracle": "Use ABORTING on the same transition; reconcile every acknowledged fence. Before publication only, reacquire a strictly newer admission generation for the still-current parent, or remain parked. After publication recover the committed successor only.",
+      "negative_case": "Owner A retires the old admission generation; owner B times out. Reopening the parent dispatch gate does not restore legitimate authority and must not revive old tokens."
     },
     {
       "id": "CT-082",
@@ -1376,7 +1538,9 @@
         "tests/ares_runtime/test_context_rebase_state.py",
         "tests/ares_runtime/test_continuity_snapshot_races.py"
       ],
-      "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete."
+      "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete.",
+      "acceptance_oracle": "Each parked phase records dependency, bounded next check, deadline, attempt accounting and visible terminal reason. Reconcile by stable transition ID after lost acknowledgments. Stop ordinary polling after terminal budget exhaustion.",
+      "negative_case": "A receipt owner recovers after an outage, but no model turn occurs to poll it; READY is never reached and the user must bridge again."
     },
     {
       "id": "CT-083",
@@ -1394,7 +1558,9 @@
         "tests/ares_runtime/test_continuity_budget.py",
         "tests/ares_runtime/test_continuity_transport_bounds.py"
       ],
-      "remaining_gate": "Pure pressure policy and serialized-request bounds exist; hard shared budget reservation, actual route accounting and calibration remain unqualified."
+      "remaining_gate": "Pure pressure policy and serialized-request bounds exist; hard shared budget reservation, actual route accounting and calibration remain unqualified.",
+      "acceptance_oracle": "Separate NORMAL and RECONCILIATION candidate/readiness modes. Recovery-only mode uses a qualified narrow observation lane; it cannot repeat the effect or invoke unrestricted shell. Every provider disclosure still requires normal policy admission.",
+      "negative_case": "The qualifier has no mode for a cold recovery-only context, while the example expects the successor to observe an UNKNOWN operation."
     },
     {
       "id": "CT-084",
@@ -1412,7 +1578,9 @@
         "tests/ares_runtime/test_continuity_budget.py",
         "tests/ares_runtime/test_continuity_transport_bounds.py"
       ],
-      "remaining_gate": "Pure pressure policy and serialized-request bounds exist; hard shared budget reservation, actual route accounting and calibration remain unqualified."
+      "remaining_gate": "Pure pressure policy and serialized-request bounds exist; hard shared budget reservation, actual route accounting and calibration remain unqualified.",
+      "acceptance_oracle": "PRESSURE requires measured useful runway gain. PROVIDER_REPAIR requires a typed, observed route fault and a verified fresh-context capability instead; no semantic-quality claim may bypass the pressure predicate.",
+      "negative_case": "A provider thread is unusable even though the correct reconstructed prompt has the same small size. The numeric-only guard rejects a valid route repair."
     },
     {
       "id": "CT-085",
@@ -1430,7 +1598,9 @@
         "tests/ares_runtime/test_continuity_budget.py",
         "tests/ares_runtime/test_continuity_transport_bounds.py"
       ],
-      "remaining_gate": "Pure pressure policy and serialized-request bounds exist; hard shared budget reservation, actual route accounting and calibration remain unqualified."
+      "remaining_gate": "Pure pressure policy and serialized-request bounds exist; hard shared budget reservation, actual route accounting and calibration remain unqualified.",
+      "acceptance_oracle": "Require every qualification fact explicitly, reject non-boolean flags, and label all local decisions non-authorizing. Production must consume owner-bound witnesses rather than adopting these fixture booleans.",
+      "negative_case": "A caller omits both coverage and owner-currentness observations and the fixture qualifier still returns a valid candidate."
     },
     {
       "id": "CT-086",
@@ -1448,7 +1618,9 @@
         "tests/ares_runtime/test_continuity_compiler.py",
         "tests/ares_runtime/test_continuity_live.py"
       ],
-      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration."
+      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration.",
+      "acceptance_oracle": "Add a closed synthetic fixture format, an external required-ID oracle, exact UTF-8 span/digest verification, a pure renderer and golden-output tests. Keep it a prototype contract, not a replacement production compiler.",
+      "negative_case": "The supplied tests check words in handwritten Markdown, not preservation of required records, exact source spans, or the output of a deterministic renderer."
     },
     {
       "id": "CT-087",
@@ -1466,7 +1638,9 @@
         "tests/ares_runtime/test_continuity_compiler.py",
         "tests/ares_runtime/test_continuity_live.py"
       ],
-      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration."
+      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration.",
+      "acceptance_oracle": "Separate stable content projection digest from each exact serialized delivery/attempt receipt. Golden tests bind deterministic content and role mapping; transport nonces are fresh and explicitly bound, not removed after sealing.",
+      "negative_case": "A valid retry changes request/attempt IDs or observation time; requiring identical complete invocation bytes encourages reuse of stale transport identity."
     },
     {
       "id": "CT-088",
@@ -1485,7 +1659,9 @@
         "tests/ares_runtime/test_continuity_runtime.py",
         "tests/ares_runtime/test_continuity_dispatch.py"
       ],
-      "remaining_gate": "Actual caller refusal is locally exercised with provider doubles. Live useful-work continuation, cold owner recovery, and sealed provider/effect attempts remain unqualified."
+      "remaining_gate": "Actual caller refusal is locally exercised with provider doubles. Live useful-work continuation, cold owner recovery, and sealed provider/effect attempts remain unqualified.",
+      "acceptance_oracle": "Persist authentic input first in the existing ingress owner with logical-root sequence/dedup identity; bind the included high-watermark. Old-session aliases route to the owner tip, while branches remain distinct. Do not acknowledge unsaved input or consume it twice.",
+      "negative_case": "User input lands at an old physical session during publication. Both paths claim it was handled, or neither carries it into the new context."
     },
     {
       "id": "CT-089",
@@ -1503,7 +1679,9 @@
         "tests/ares_runtime/test_context_rebase_state.py",
         "tests/ares_runtime/test_continuity_snapshot_races.py"
       ],
-      "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete."
+      "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete.",
+      "acceptance_oracle": "Have the artifact owner establish a retention pin before publication and bind it to the transition; transfer/reconcile pin reachability after commit. Document process-crash versus power-loss assumptions, fsync/DB mode and bounded orphan retention.",
+      "negative_case": "A blob is written and acknowledged, then garbage collection removes its last temporary reference before the local transaction pins it."
     },
     {
       "id": "CT-090",
@@ -1521,7 +1699,9 @@
         "tests/ares_runtime/test_context_rebase_state.py",
         "tests/ares_runtime/test_continuity_snapshot_races.py"
       ],
-      "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete."
+      "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete.",
+      "acceptance_oracle": "Bind each owner receipt to transition, task/profile, expected predecessor/target, relevant artifact and admission generations, owner incarnation and status. Expiration alone proves neither death nor takeover. Revalidate under the actual owner contract.",
+      "negative_case": "An acknowledgment from an older transition or a restarted owner is replayed as the current fence/activation result."
     },
     {
       "id": "CT-091",
@@ -1538,7 +1718,9 @@
       "supporting_test_files": [
         "tests/ares_runtime/test_context_rebase_state.py"
       ],
-      "remaining_gate": "Local lineage/branch tests are supporting evidence; current-policy retrieval, revocation, retention and unified live UI require route evidence."
+      "remaining_gate": "Local lineage/branch tests are supporting evidence; current-policy retrieval, revocation, retention and unified live UI require route evidence.",
+      "acceptance_oracle": "Require an existing owner-enforced workspace lease or equivalent conditional write/snapshot isolation on touched paths. Noncooperating writers produce conflict and re-observation, never silent overwrite or auto-stash.",
+      "negative_case": "Another authorized task uses the same worktree and mutates a file between observation and effect; a task-only fence does not cover it."
     },
     {
       "id": "CT-092",
@@ -1556,7 +1738,9 @@
         "tests/ares_runtime/test_continuity_compiler.py",
         "tests/ares_runtime/test_continuity_live.py"
       ],
-      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration."
+      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration.",
+      "acceptance_oracle": "Use a bounded orientation/reconciliation view when no evidence-backed frontier exists. Proposed actions name prerequisites; new material dependencies require retrieval/re-materialization before the ordinary action. Declared coverage is never universal semantic completeness.",
+      "negative_case": "The model chooses a different permissible action with dependencies that were not in the planned working set."
     },
     {
       "id": "CT-093",
@@ -1574,7 +1758,9 @@
         "tests/ares_runtime/test_continuity_dispatch.py",
         "tests/ares_runtime/test_continuity_snapshot_races.py"
       ],
-      "remaining_gate": "Local negative witnesses and repeat-rebase tests are not cross-owner crash/fault injection or real repeated provider rollovers."
+      "remaining_gate": "Local negative witnesses and repeat-rebase tests are not cross-owner crash/fault injection or real repeated provider rollovers.",
+      "acceptance_oracle": "Add an explicit local admission gate and asynchronous operation phases to model/tests; test the gate independently of the external fence. Preserve original results as historical bounded evidence, not upgraded proof.",
+      "negative_case": "After request_rollover, the base model still offers effect_admitted_by_epoch_0 before fence acknowledgment. Its tests do not check the local freeze requirement."
     },
     {
       "id": "CT-094",
@@ -1591,7 +1777,9 @@
       "supporting_test_files": [
         "tests/ares_runtime/test_continuity_runtime.py"
       ],
-      "remaining_gate": "Installed tuple, native owner capabilities, compatibility and real binary baseline remain unqualified."
+      "remaining_gate": "Installed tuple, native owner capabilities, compatibility and real binary baseline remain unqualified.",
+      "acceptance_oracle": "Reject non-regular objects and symlinks; bound files/bytes/depth, hash checked open descriptors, and state immutable-snapshot assumptions. Byte integrity is still not origin authentication.",
+      "negative_case": "An unexpected FIFO is ignored and the verifier reports a complete matching inventory."
     },
     {
       "id": "CT-095",
@@ -1609,7 +1797,9 @@
         "tests/ares_runtime/test_continuity_budget.py",
         "tests/ares_runtime/test_continuity_transport_bounds.py"
       ],
-      "remaining_gate": "Pure pressure policy and serialized-request bounds exist; hard shared budget reservation, actual route accounting and calibration remain unqualified."
+      "remaining_gate": "Pure pressure policy and serialized-request bounds exist; hard shared budget reservation, actual route accounting and calibration remain unqualified.",
+      "acceptance_oracle": "Budget rebase admission once per transition and separately cap compilation/reconciliation calls, elapsed active recovery and output/retention bytes through the existing budget owner. Duplicate wakeups do not mint allowance; quota wait is not provider repair.",
+      "negative_case": "Two allowed rebase attempts each retry owner reads, source scans or candidate renders indefinitely."
     },
     {
       "id": "CT-096",
@@ -1621,7 +1811,9 @@
       "status": "NOT_QUALIFIED",
       "source_surfaces": [],
       "supporting_test_files": [],
-      "remaining_gate": "No matched-budget selected-route calibration, held-out outcomes or measured cost/quality claim."
+      "remaining_gate": "No matched-budget selected-route calibration, held-out outcomes or measured cost/quality claim.",
+      "acceptance_oracle": "Preregister intention-to-treat task denominators, eligible automatic-continuation rate, needless blocks/manual interventions and completion/time limits. Report correlated epoch failures at task level, not independent trials.",
+      "negative_case": "An arm refuses most difficult tasks, consumes little quota and reports no unsafe effects; successful-only metrics make it appear superior."
     },
     {
       "id": "CT-097",
@@ -1639,7 +1831,9 @@
         "tests/ares_runtime/test_continuity_dispatch.py",
         "tests/ares_runtime/test_continuity_snapshot_races.py"
       ],
-      "remaining_gate": "Local negative witnesses and repeat-rebase tests are not cross-owner crash/fault injection or real repeated provider rollovers."
+      "remaining_gate": "Local negative witnesses and repeat-rebase tests are not cross-owner crash/fault injection or real repeated provider rollovers.",
+      "acceptance_oracle": "Use explicit result validation and nonzero exit on an unexpected base or mutation result; test optimized Python execution with deliberately bad results.",
+      "negative_case": "Running a modified/broken model with Python optimization may suppress the checks that are intended to fail its command."
     },
     {
       "id": "CT-098",
@@ -1651,7 +1845,9 @@
       "status": "NOT_QUALIFIED",
       "source_surfaces": [],
       "supporting_test_files": [],
-      "remaining_gate": "No installed-profile canary, managed activation, rollback or inherited endurance qualification. Independent delta review is narrower than full implementation review."
+      "remaining_gate": "No installed-profile canary, managed activation, rollback or inherited endurance qualification. Independent delta review is narrower than full implementation review.",
+      "acceptance_oracle": "Include the recovered 172-ID catalog unchanged and a conservative applicability crosswalk. Separate offline-ready, isolated-route-qualified, canary-ready, live-verified and retained-program-complete predicates; no early stage claims later evidence.",
+      "negative_case": "A global all-required gate includes canary/live checks that can run only after staged activation. The 172 prior IDs also require an external lookup before an executor can enumerate them."
     },
     {
       "id": "CT-099",
@@ -1669,7 +1865,9 @@
         "tests/ares_runtime/test_continuity_compiler.py",
         "tests/ares_runtime/test_continuity_live.py"
       ],
-      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration."
+      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration.",
+      "acceptance_oracle": "Bind admitted source digests/classes and required-record spans/status/freshness to an externally supplied, immutable owner/test oracle. A production expectation must be acquired through the current authenticated owner, never constructed from the candidate being checked.",
+      "negative_case": "Changing the no-merge requirement, its source hash and exact excerpt together preserves the required ID and passes. Integrity against candidate-declared bytes is not authenticity against the admitted snapshot."
     },
     {
       "id": "CT-100",
@@ -1687,7 +1885,9 @@
         "tests/ares_runtime/test_continuity_compiler.py",
         "tests/ares_runtime/test_continuity_live.py"
       ],
-      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration."
+      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration.",
+      "acceptance_oracle": "Bind task, profile, worktree, audience, current control revision, mode and manifest identity in the external snapshot. Scope changes require new owner-approved observations. Retain source and control invalidation at actual dispatch.",
+      "negative_case": "A candidate can retain required IDs while changing task identity, control revision or recovery mode. Syntactic validity cannot establish current context ownership."
     },
     {
       "id": "CT-101",
@@ -1705,7 +1905,9 @@
         "tests/ares_runtime/test_continuity_compiler.py",
         "tests/ares_runtime/test_continuity_live.py"
       ],
-      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration."
+      "remaining_gate": "Local compiler tests do not qualify selected-route current disclosure authority, natural-language dependency completeness or native Rust render-prompt-v2 integration.",
+      "acceptance_oracle": "Apply a shared bounded tree/type/depth/aggregate-byte check before either parsed or direct validation. Reject duplicate keys, nonfinite values, lone surrogates, malformed collection members and unknown fields with explicit failures. No coercive recovery.",
+      "negative_case": "Unhashable lists raise TypeError; direct validation accepts 169,712 bytes despite the 128-KiB parser limit. A wrapper can misclassify unexpected exceptions or bypass raw-size checks."
     },
     {
       "id": "CT-102",
@@ -1723,7 +1925,9 @@
         "tests/ares_runtime/test_continuity_dispatch.py",
         "tests/ares_runtime/test_continuity_snapshot_races.py"
       ],
-      "remaining_gate": "Local negative witnesses and repeat-rebase tests are not cross-owner crash/fault injection or real repeated provider rollovers."
+      "remaining_gate": "Local negative witnesses and repeat-rebase tests are not cross-owner crash/fault injection or real repeated provider rollovers.",
+      "acceptance_oracle": "Count all filesystem entries, bound path length and directory depth, and reject empty/unmanifested directory branches in the immutable snapshot. Preserve nonregular/hardlink refusal.",
+      "negative_case": "File-count and depth limits do not bound the number of empty directories scanned. A shallow directory tree can exhaust work before a manifest mismatch."
     },
     {
       "id": "CT-103",
@@ -1741,7 +1945,9 @@
         "tests/ares_runtime/test_continuity_dispatch.py",
         "tests/ares_runtime/test_continuity_snapshot_races.py"
       ],
-      "remaining_gate": "Local negative witnesses and repeat-rebase tests are not cross-owner crash/fault injection or real repeated provider rollovers."
+      "remaining_gate": "Local negative witnesses and repeat-rebase tests are not cross-owner crash/fault injection or real repeated provider rollovers.",
+      "acceptance_oracle": "Provide a separately inspectable standard-library archive verifier/extractor with externally supplied archive hash, portable unique names, type/method/encryption/entry/expanded-byte limits, CRC checks, private new destination and cleanup on failure. The destination must not preexist.",
+      "negative_case": "A file verifier cannot prevent unsafe archive path, duplicate-name, special-file or oversized expansion behavior before extraction. The packet lacks a bounded admission procedure for that step."
     },
     {
       "id": "CT-104",
@@ -1753,7 +1959,9 @@
       "status": "NOT_QUALIFIED",
       "source_surfaces": [],
       "supporting_test_files": [],
-      "remaining_gate": "No installed-profile canary, managed activation, rollback or inherited endurance qualification. Independent delta review is narrower than full implementation review."
+      "remaining_gate": "No installed-profile canary, managed activation, rollback or inherited endurance qualification. Independent delta review is narrower than full implementation review.",
+      "acceptance_oracle": "Correct each gate stage and define explicit evidence scope. Validate result coverage, command/disposition, source/candidate tuple, reviewed evidence bindings and stage prerequisites. No summary boolean or packet test counts as actual-route evidence; stage evaluator is advisory and cannot grant activation.",
+      "negative_case": "CT-033 and several new owner/ingress cases are assigned offline; a DAG check verifies order only. There is no exact candidate/evidence-class stage predicate."
     },
     {
       "id": "CT-105",
@@ -1771,7 +1979,9 @@
         "tests/ares_runtime/test_context_rebase_state.py",
         "tests/ares_runtime/test_continuity_snapshot_races.py"
       ],
-      "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete."
+      "remaining_gate": "Local snapshot/publication races are covered. External fences/ACKs, atomic local custody/dispatch intent, and automatic post-commit recovery are not complete.",
+      "acceptance_oracle": "Derive the required participant closure from the qualified route/task owner configuration, bind its revision externally, and verify exact coverage at publication and readiness. Bind each ACK to transition/scope/artifact/generation/incarnation and disposition. Optional observers cannot substitute for required effect owners.",
+      "negative_case": "Per-owner ACK bindings do not establish that every necessary authority owner was included. Dropping a slow owner from the candidate participant set can falsely make all listed ACKs complete."
     },
     {
       "id": "CT-106",
@@ -1790,7 +2000,9 @@
         "tests/ares_runtime/test_continuity_runtime.py",
         "tests/ares_runtime/test_continuity_dispatch.py"
       ],
-      "remaining_gate": "Actual caller refusal is locally exercised with provider doubles. Live useful-work continuation, cold owner recovery, and sealed provider/effect attempts remain unqualified."
+      "remaining_gate": "Actual caller refusal is locally exercised with provider doubles. Live useful-work continuation, cold owner recovery, and sealed provider/effect attempts remain unqualified.",
+      "acceptance_oracle": "CAS-bind dispatch to the exact materialization digest/revision, task/control/inbox watermark, route/incarnation, attempt ID and admission generation. Before admission replace a stale pending intent; after admission never rewrite its payload. Settle or quarantine late responses under that attempt and current control. Operation-ID intent collisions explicitly refuse.",
+      "negative_case": "The same successor may have several immutable briefs; a queued or already-admitted request can refer to an older one. Stable successor identity alone cannot prevent stale dispatch or late-response tool admission."
     },
     {
       "id": "CT-107",
@@ -1808,7 +2020,9 @@
         "tests/ares_runtime/test_continuity_budget.py",
         "tests/ares_runtime/test_continuity_transport_bounds.py"
       ],
-      "remaining_gate": "Pure pressure policy and serialized-request bounds exist; hard shared budget reservation, actual route accounting and calibration remain unqualified."
+      "remaining_gate": "Pure pressure policy and serialized-request bounds exist; hard shared budget reservation, actual route accounting and calibration remain unqualified.",
+      "acceptance_oracle": "Use existing-owner atomic reservations keyed by stable attempt. Ordinary and recovery lanes share applicable parent hard caps, units and source authority; an explicitly granted recovery reserve is not a new allowance. Keep uncertain attempts charged/reserved until actual owner settlement. Unknown subscription usage is unknown, not zero or an inferred dollar cost.",
+      "negative_case": "A recovery-mode check can continue with no ordinary task budget. That is only valid for an independently authorized reservation that still respects any shared provider/task hard cap; two pending attempts cannot each spend the remaining balance."
     },
     {
       "id": "CT-108",
@@ -1826,7 +2040,9 @@
         "tests/ares_runtime/test_continuity_checkpoint.py",
         "tests/ares_runtime/test_context_rebase_state.py"
       ],
-      "remaining_gate": "Local snapshots and checkpoint inspection exist; continuous complete workspace/effect/process capture is not established."
+      "remaining_gate": "Local snapshots and checkpoint inspection exist; continuous complete workspace/effect/process capture is not established.",
+      "acceptance_oracle": "Add a source-bound multi-epoch requirement sequence with independently frozen expected active requirements after each control event. Replacing the test criterion or widening one file boundary must preserve the independent no-publish rule. Model notes cannot supersede user requirements; ambiguous changes stay unresolved.",
+      "negative_case": "A perfect snapshot fixture can still coexist with a broken reducer that drops an older unrelated prohibition during the second or third epoch. Required-set construction remains an untested semantic seam."
     }
   ],
   "inherited_program": {

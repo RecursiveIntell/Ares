@@ -2281,6 +2281,17 @@ def run_conversation(
             )
         ]
 
+        # Bind durable source before any provider materialization. Preserve a
+        # refusal until the existing request-budget error boundary below.
+        from ares_runtime.continuity.runtime import ContextDispatchError, prepare_context_dispatch
+
+        _context_dispatch_error = None
+        _context_dispatch_snapshot = None
+        try:
+            _context_dispatch_snapshot = prepare_context_dispatch(agent, messages, conversation_history)
+        except ContextDispatchError as exc:
+            _context_dispatch_error = exc
+
         # Defensive: repair malformed role-alternation before API call.
         # Catches cases where the history got wedged into a
         # ``tool → user`` or ``user → user`` tail (e.g. after empty-
@@ -2292,24 +2303,15 @@ def run_conversation(
         # flush cursor (_last_flushed_db_idx) when repair compacts the list,
         # so the turn-end flush doesn't skip the assistant/tool chain (#44837).
         from agent.agent_runtime_helpers import repair_message_sequence_with_cursor
-        repaired_seq = repair_message_sequence_with_cursor(agent, messages)
+        repaired_seq = repair_message_sequence_with_cursor(
+            agent, messages, preserve_user_messages=_context_dispatch_snapshot is not None or _context_dispatch_error is not None,
+        )
         if repaired_seq > 0:
             request_logger.info(
                 "Repaired %s message-alternation violations before request (session=%s)",
                 repaired_seq,
                 agent.session_id or "-",
             )
-
-        # Bind durable source before any provider materialization. Preserve a
-        # refusal until the existing request-budget error boundary below.
-        from ares_runtime.continuity.runtime import ContextDispatchError, prepare_context_dispatch
-
-        _context_dispatch_error = None
-        _context_dispatch_snapshot = None
-        try:
-            _context_dispatch_snapshot = prepare_context_dispatch(agent, messages, conversation_history)
-        except ContextDispatchError as exc:
-            _context_dispatch_error = exc
 
         api_messages = []
         for idx, msg in enumerate(messages):
@@ -4386,32 +4388,9 @@ def run_conversation(
                         getattr(agent.context_compressor, "threshold_tokens", 0)
                         or 0
                     )
-                    # A physical context epoch earns a fresh rebase budget only
-                    # after the provider proves the rebuilt request is healthy.
-                    # Session rotation/publication alone never clears the
-                    # conversation-level no-progress counter.
-                    if (
-                        getattr(agent, "context_rebase_enabled", False)
-                        and prompt_tokens > 0
-                        and _compression_threshold > 0
-                        and prompt_tokens < _compression_threshold
-                    ):
-                        _continuity_db = getattr(agent, "_session_db", None)
-                        if _continuity_db is not None:
-                            try:
-                                _episode = _continuity_db.read_context_rebase_episode(
-                                    agent.session_id
-                                )
-                                if _episode.attempts_without_recovery > 0:
-                                    _continuity_db.reset_context_rebase_episode(
-                                        agent.session_id
-                                    )
-                            except Exception:
-                                logger.warning(
-                                    "Could not record provider-confirmed context "
-                                    "rebase recovery; preserving no-progress budget",
-                                    exc_info=True,
-                                )
+                    # Healthy request size proves compaction effectiveness,
+                    # not task progress. Continuity episodes are rearmed only
+                    # by their canonical progress/operator transaction.
                     if _should_rearm_compression_budget(
                         compression_attempts,
                         completed_compaction_pending=_completed_compaction_pending,
@@ -7749,6 +7728,15 @@ def run_conversation(
                         pass
 
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+
+                if getattr(agent, "_context_tool_control_failure", None):
+                    from ares_runtime.continuity.runtime import AutomaticRebaseResult, AutomaticRebaseStatus
+
+                    agent._persist_session(messages, conversation_history)
+                    return _context_rebase_stopped_result(AutomaticRebaseResult(
+                        AutomaticRebaseStatus.BLOCKED, agent._context_tool_control_failure,
+                        agent.session_id,
+                    ))
 
                 if getattr(agent, "_incremental_persistence_failed", False):
                     # A tool result could not be made canonical. Do not send

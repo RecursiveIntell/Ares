@@ -47,6 +47,7 @@ def test_actual_turn_recovers_committed_child_before_provider_dispatch(agent, tm
         agent._cached_system_prompt = "trusted base prompt"
         agent.compression_enabled = False
         agent.max_iterations = 1
+        agent.max_tokens = 1000
         agent.client.chat.completions.create.return_value = _mock_response(content="continued", finish_reason="stop")
         with (
             patch.object(agent, "_save_trajectory"),
@@ -55,6 +56,7 @@ def test_actual_turn_recovers_committed_child_before_provider_dispatch(agent, tm
             result = agent.run_conversation("New authentic correction")
         assert db.read_context_rebase_transition(transition.transition_id).state == "ready"
         assert agent.session_id == "s1"
+        assert result.get("error") is None, result
         assert agent.client.chat.completions.create.call_count == 1
         assert result["api_calls"] == 1
         assert any(row["content"] == "New authentic correction" for row in db.get_messages_as_conversation("s1"))

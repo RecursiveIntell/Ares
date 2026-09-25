@@ -16,7 +16,8 @@ from enum import Enum
 import hashlib
 import json
 import logging
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from typing import Any
 
 from agent.model_metadata import estimate_request_tokens_rough
@@ -35,9 +36,25 @@ class ContextDispatchError(AutomaticRebaseError):
     """A final request was not admitted; never route through provider retry."""
 
 
+def context_dispatch_required(agent):
+    """Disabling publication must preserve readers and existing dispatch seals."""
+    if getattr(agent, "context_rebase_enabled", False):
+        return True
+    db = getattr(agent, "_session_db", None)
+    check = getattr(type(db), "context_dispatch_required_for_session", None)
+    if not callable(check) or not getattr(agent, "session_id", None):
+        return False
+    try:
+        return check(db, agent.session_id)
+    except Exception as exc:
+        raise ContextDispatchError(getattr(exc, "code", "CONTEXT_DISPATCH_OWNER_UNAVAILABLE")) from None
+
+
 def prepare_context_dispatch(agent, messages, conversation_history):
     """Bind the source before request middleware may run or accept new input."""
-    if not getattr(agent, "context_rebase_enabled", False):
+    agent._context_response_admission = None
+    agent._context_tool_control_failure = None
+    if not context_dispatch_required(agent):
         return None
     db = getattr(agent, "_session_db", None)
     if db is None:
@@ -152,8 +169,54 @@ def settle_final_context_dispatch(agent, admission):
             admission["attempt_id"],
             turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
         )
+        agent._context_response_admission = admission
     except Exception as exc:
         raise ContextDispatchError(getattr(exc, "code", "CONTEXT_DISPATCH_SETTLEMENT_UNKNOWN")) from None
+
+
+_tool_control = ContextVar("context_continuity_tool_control", default=None)
+
+
+@contextmanager
+def context_tool_control_scope(agent):
+    """Bind this response across existing tool and execute_code worker threads."""
+    binding = None
+    if context_dispatch_required(agent):
+        admission = getattr(agent, "_context_response_admission", None)
+        binding = (agent, getattr(agent, "_session_db", None), agent.session_id,
+                   getattr(agent, "_active_session_turn_lease_holder", None),
+                   admission.get("attempt_id") if isinstance(admission, dict) else None)
+    token = _tool_control.set(binding)
+    try:
+        yield
+    finally:
+        _tool_control.reset(token)
+
+
+def assert_context_tool_control_current(*, session_id=None):
+    """Check local control immediately before the existing tool/effect owner.
+
+    This is a precondition, not a replacement permit or proof that an
+    already-admitted external operation has been cancelled.
+    """
+    binding = _tool_control.get()
+    if binding is None:
+        return
+    agent, db, bound_session, holder, attempt_id = binding
+    try:
+        if (getattr(agent, "_interrupt_requested", False)
+                or getattr(agent, "_pending_redirect", None)
+                or getattr(agent, "_context_stop_unacknowledged", False)):
+            raise ContextDispatchError("CONTEXT_DISPATCH_INTERRUPTED")
+        if not attempt_id or (session_id and session_id != bound_session):
+            raise ContextDispatchError("CONTEXT_TOOL_RESPONSE_NOT_ADMITTED")
+        db.assert_context_dispatch_control_current(
+            attempt_id, session_id=bound_session, turn_lease_holder=holder,
+        )
+    except Exception as exc:
+        code = str(exc) if isinstance(exc, ContextDispatchError) else getattr(exc, "code", "CONTEXT_DISPATCH_OWNER_UNAVAILABLE")
+        agent._context_tool_control_failure = code
+        raise ContextDispatchError(code) from None
 
 
 class ContextDispatchStreamBuffer:
@@ -796,7 +859,7 @@ def reconcile_context_rebase(
             raise AutomaticRebaseError("CONTEXT_REBASE_SYSTEM_PROMPT_MISSING")
         _rebind_context_engine(agent, db, parent_session_id, child_session_id)
         durable_messages = db.get_messages_as_conversation(
-            child_session_id, repair_alternation=True,
+            child_session_id, repair_alternation=False,
             include_row_ids=True, include_summary_markers=True,
         )
         if not durable_messages or durable_messages[-1].get("role") != "user":

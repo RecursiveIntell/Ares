@@ -43,6 +43,9 @@ def _make_cli_with_goal(session_id: str, goal_text: str = "build a thing"):
     """Build a minimal HermesCLI stub with an active goal wired in."""
     from cli import HermesCLI
     from hermes_cli.goals import GoalManager
+    from hermes_cli.goals import _get_session_db
+
+    _get_session_db().create_session(session_id, source="cli")
 
     cli = HermesCLI.__new__(HermesCLI)
     # State the hook + helpers touch directly.

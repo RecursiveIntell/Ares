@@ -102,9 +102,9 @@
     "Objective progress and shared recovery caps",
     "Compatibility, selected route, canary and endurance qualification"
   ],
-  "next_gate": "Complete remaining V4 source and selected-route qualification; current repair is not the task stop condition.",
+  "next_gate": "Hosted socket integration and remaining V4 construction/qualification; a passed repair is not the requested stop condition.",
   "qualification": "Bounded source repair passed; full V4 program remains incomplete.",
-  "scope": "Cumulative PR80 implementation; latest repair is durable owner recovery and sealed final dispatch.",
-  "latest_repair_evidence": "docs/context-continuity/recovery-dispatch-evidence.json",
-  "latest_repair_audit": "passed"
+  "scope": "Cumulative PR80 implementation; latest repair is local final tool control, rollback protection and operator episode rearm.",
+  "latest_repair_evidence": "docs/context-continuity/control-progress-evidence.json",
+  "latest_repair_audit": "pass_bounded"
 }

@@ -4788,7 +4788,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
         # Continuity admission owns each physical attempt. Let its outer
         # boundary revalidate durable control/source state before any retry.
-        _max_stream_retries = 0 if getattr(agent, "context_rebase_enabled", False) else env_int("HERMES_STREAM_RETRIES", 2)
+        from ares_runtime.continuity.runtime import context_dispatch_required
+
+        _max_stream_retries = 0 if context_dispatch_required(agent) else env_int("HERMES_STREAM_RETRIES", 2)
 
         try:
             for _stream_attempt in range(_max_stream_retries + 1):

@@ -3477,15 +3477,20 @@ class AIAgent:
         # Cancel sockets, tools, children and the compression fence before a
         # storage operation can block. A missing durable acknowledgement must
         # never turn a local stop into permission to resume.
-        if hard_cancel and getattr(self, "context_rebase_enabled", False):
-            db = getattr(self, "_session_db", None)
-            self._context_stop_unacknowledged = True
-            if db is not None and getattr(self, "session_id", None):
-                try:
+        if hard_cancel:
+            try:
+                from ares_runtime.continuity.runtime import context_dispatch_required
+
+                if context_dispatch_required(self):
+                    db = getattr(self, "_session_db", None)
+                    self._context_stop_unacknowledged = True
+                    if db is None or not getattr(self, "session_id", None):
+                        raise RuntimeError("CONTEXT_DISPATCH_OWNER_UNAVAILABLE")
                     db.record_context_stop(self.session_id)
                     self._context_stop_unacknowledged = False
-                except Exception:
-                    logger.error("Context stop cancelled locally; durable acknowledgement failed", exc_info=True)
+            except Exception:
+                self._context_stop_unacknowledged = True
+                logger.error("Context stop cancelled locally; durable acknowledgement failed", exc_info=True)
         if not self.quiet_mode:
             print("\n⚡ Interrupt requested" + (f": '{message[:40]}...'" if message and len(message) > 40 else f": '{message}'" if message else ""))
 

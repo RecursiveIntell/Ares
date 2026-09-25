@@ -395,7 +395,12 @@ def test_rebase_episode_is_conversation_scoped_and_resets_only_explicitly(db):
     )
     assert db.read_context_rebase_episode("s2").attempts_without_recovery == 2
 
-    recovered = db.reset_context_rebase_episode("s2")
+    from hermes_cli.goals import GoalState
+    import uuid
+    goal = GoalState(goal="Explicitly resumed task", created_at=1.0).to_json()
+    db.set_meta("goal:s2", goal)
+    db.resume_context_goal("s2", **db.read_context_resume_basis("s2"), operator_action_id=str(uuid.uuid4()))
+    recovered = db.read_context_rebase_episode("s2")
     assert recovered.attempts_without_recovery == 0
     assert recovered.last_transition_id == "tx2"
     assert db.read_context_rebase_episode("s0").attempts_without_recovery == 0

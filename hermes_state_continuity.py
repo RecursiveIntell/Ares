@@ -229,8 +229,37 @@ class ContextRebaseSnapshot:
         """Exact bounded local read-set identity, not external-owner authority."""
         return "sha256:" + hashlib.sha256(_canonical(asdict(self)).encode("utf-8")).hexdigest()
 
+    @property
+    def action_control_digest(self) -> str:
+        """Control binding that survives this response's assistant/tool rows."""
+        value = {"session_id": self.session_id, "conversation_root": self.conversation_root,
+                 "authentic_users": self.authentic_users, "control_raw": self.control_raw,
+                 "goal_raw": self.goal_raw, "heartbeat_raw": self.heartbeat_raw,
+                 "loop_raw": self.loop_raw}
+        return "sha256:" + hashlib.sha256(_canonical(value).encode("utf-8")).hexdigest()
+
 class SessionContextContinuityMixin:
     """Local SessionDB continuity owner; external activation remains separate."""
+
+    def context_dispatch_required_for_session(self, session_id):
+        """Continue enforcing a committed lineage when publication is disabled."""
+        _identity(session_id, "INVALID_CHILD_SESSION")
+        with self._read_ctx() as conn:
+            conn.execute("SAVEPOINT context_dispatch_required")
+            try:
+                for sid in self._context_rebase_lineage_on_conn(conn, session_id):
+                    row = conn.execute("SELECT model_config,end_reason FROM sessions WHERE id=?", (sid,)).fetchone()
+                    if row is None:
+                        continue
+                    config = _strict_json(row["model_config"] or "{}")
+                    if (row["end_reason"] == _CONTEXT_REBASE_END_REASON
+                            or "_context_rebase_transition" in config
+                            or "_context_rebase_from" in config):
+                        return True
+                return False
+            finally:
+                conn.execute("ROLLBACK TO context_dispatch_required")
+                conn.execute("RELEASE context_dispatch_required")
 
     def _context_rebase_key(self, transition_id: str) -> str:
         return _CONTEXT_REBASE_KEY_PREFIX + _identity(transition_id, "INVALID_TRANSITION_ID")
@@ -265,51 +294,131 @@ class SessionContextContinuityMixin:
             )
         return ContextRebaseEpisode.from_raw(row[0])
 
-    def reset_context_rebase_episode(
-        self, session_id: str
-    ) -> ContextRebaseEpisode:
-        """Record provider-confirmed recovery for the logical conversation."""
-        _identity(session_id, "INVALID_CHILD_SESSION")
+    def reset_context_rebase_episode(self, session_id):
+        """Unattributed health/progress claims cannot replenish task attempts."""
+        raise ContextContinuationError("CONTEXT_REBASE_PROGRESS_EVIDENCE_REQUIRED")
 
-        def _do(conn):
+    def _reset_context_rebase_episode_on_conn(self, conn, session_id):
+        root = str(self._session_turn_lease_key_on_conn(conn, session_id))
+        key = self._context_rebase_episode_key(root)
+        row = conn.execute(
+            "SELECT value FROM state_meta WHERE key=?", (key,)
+        ).fetchone()
+        old = (
+            None
+            if row is None
+            else ContextRebaseEpisode.from_raw(row[0])
+        )
+        now = time.time()
+        updated = ContextRebaseEpisode(
+            _CONTEXT_REBASE_EPISODE_SCHEMA,
+            root,
+            0,
+            None if old is None else old.last_transition_id,
+            None if old is None else old.last_before_tokens,
+            None if old is None else old.last_after_tokens,
+            now,
+            now,
+        )
+        if row is None:
+            conn.execute(
+                "INSERT INTO state_meta(key,value) VALUES(?,?)",
+                (key, updated.raw()),
+            )
+        else:
+            cursor = conn.execute(
+                "UPDATE state_meta SET value=? WHERE key=? AND value=?",
+                (updated.raw(), key, row[0]),
+            )
+            if cursor.rowcount != 1:
+                raise ContextContinuationError(
+                    "CONTEXT_REBASE_EPISODE_CHANGED"
+                )
+        return updated
+
+
+    def read_context_resume_basis(self, session_id):
+        """Read the exact goal/episode CAS pair for an operator command."""
+        def read(conn):
             root = str(self._session_turn_lease_key_on_conn(conn, session_id))
-            key = self._context_rebase_episode_key(root)
-            row = conn.execute(
-                "SELECT value FROM state_meta WHERE key=?", (key,)
-            ).fetchone()
-            old = (
-                None
-                if row is None
-                else ContextRebaseEpisode.from_raw(row[0])
-            )
-            now = time.time()
-            updated = ContextRebaseEpisode(
-                _CONTEXT_REBASE_EPISODE_SCHEMA,
-                root,
-                0,
-                None if old is None else old.last_transition_id,
-                None if old is None else old.last_before_tokens,
-                None if old is None else old.last_after_tokens,
-                now,
-                now,
-            )
-            if row is None:
-                conn.execute(
-                    "INSERT INTO state_meta(key,value) VALUES(?,?)",
-                    (key, updated.raw()),
-                )
-            else:
-                cursor = conn.execute(
-                    "UPDATE state_meta SET value=? WHERE key=? AND value=?",
-                    (updated.raw(), key, row[0]),
-                )
-                if cursor.rowcount != 1:
-                    raise ContextContinuationError(
-                        "CONTEXT_REBASE_EPISODE_CHANGED"
-                    )
-            return updated
+            def raw(key):
+                row = conn.execute("SELECT value FROM state_meta WHERE key=?", (key,)).fetchone()
+                return None if row is None else row[0]
+            return {"expected_goal_raw": raw("goal:" + session_id),
+                    "expected_episode_raw": raw(self._context_rebase_episode_key(root))}
+        return self._execute_write(read)
 
-        return self._execute_write(_do)
+    def read_context_resume_outcome(self, session_id, operator_action_id):
+        """Resolve a lost command ACK without repeating its mutation."""
+        def read(conn):
+            goal = conn.execute("SELECT value FROM state_meta WHERE key=?", ("goal:" + session_id,)).fetchone()
+            receipt = conn.execute("SELECT value FROM state_meta WHERE key=?",
+                                   ("context-operator-resume:" + operator_action_id,)).fetchone()
+            raw = None if goal is None else goal[0]
+            if receipt is None:
+                return raw, False
+            value = _strict_json(receipt[0])
+            root = str(self._session_turn_lease_key_on_conn(conn, session_id))
+            if (value.get("schema") != "SessionDBContextOperatorResumeV1"
+                    or value.get("action_id") != operator_action_id
+                    or value.get("session_id") != session_id
+                    or value.get("conversation_root") != root):
+                raise ContextContinuationError("CONTEXT_REBASE_PROGRESS_RECEIPT_INVALID")
+            digest = None if raw is None else "sha256:" + hashlib.sha256(raw.encode()).hexdigest()
+            return raw, digest == value.get("resumed_goal_digest")
+        return self._execute_write(read)
+
+    def resume_context_goal(self, session_id, *, expected_goal_raw, expected_episode_raw,
+                            reset_budget=False, operator_action_id):
+        """Commit an explicit goal-owner resume and its one-use episode rearm.
+
+        Only the existing operator resume path calls this operation. Provider
+        response health and model-authored evidence never enter this API.
+        The owner builds the checkpoint; a supplied reason string is not proof.
+        """
+        import uuid
+        from hermes_cli.goals import goal_resume_state
+
+        _identity(session_id, "INVALID_CHILD_SESSION")
+        try:
+            action = uuid.UUID(operator_action_id)
+            if action.version != 4 or str(action) != operator_action_id:
+                raise ValueError()
+        except (ValueError, TypeError, AttributeError):
+            raise ContextContinuationError("INVALID_OPERATOR_ACTION") from None
+        if type(reset_budget) is not bool:
+            raise ContextContinuationError("INVALID_OPERATOR_ACTION")
+        _strict_json(expected_goal_raw)
+
+        def write(conn):
+            session = conn.execute("SELECT ended_at FROM sessions WHERE id=?", (session_id,)).fetchone()
+            if session is None or session["ended_at"] is not None:
+                raise ContextContinuationError("CONTEXT_REBASE_PARENT_NOT_LIVE")
+            root = str(self._session_turn_lease_key_on_conn(conn, session_id))
+            receipt_key = "context-operator-resume:" + operator_action_id
+            if conn.execute("SELECT 1 FROM state_meta WHERE key=?", (receipt_key,)).fetchone() is not None:
+                raise ContextContinuationError("CONTEXT_REBASE_PROGRESS_ALREADY_CONSUMED")
+            goal_key = "goal:" + session_id
+            before_episode = conn.execute("SELECT value FROM state_meta WHERE key=?",
+                                          (self._context_rebase_episode_key(root),)).fetchone()
+            if (None if before_episode is None else before_episode[0]) != expected_episode_raw:
+                raise ContextContinuationError("CONTEXT_REBASE_EPISODE_CHANGED")
+            resumed = goal_resume_state(expected_goal_raw, reset_budget=reset_budget,
+                                        operator_action_id=operator_action_id)
+            after = resumed.to_json()
+            if not self._compare_and_set_meta_many_on_conn(conn, [(goal_key, expected_goal_raw, after)]):
+                raise ContextContinuationError("CONTEXT_REBASE_GOAL_CHANGED")
+            updated = self._reset_context_rebase_episode_on_conn(conn, session_id)
+            receipt = {"schema": "SessionDBContextOperatorResumeV1", "action_id": operator_action_id,
+                       "conversation_root": root, "session_id": session_id,
+                       "goal_id": resumed.goal_id, "checkpoint_revision": resumed.checkpoint_revision,
+                       "previous_goal_digest": "sha256:" + hashlib.sha256(expected_goal_raw.encode()).hexdigest(),
+                       "resumed_goal_digest": "sha256:" + hashlib.sha256(after.encode()).hexdigest(),
+                       "previous_episode": None if before_episode is None else _strict_json(before_episode[0]),
+                       "episode": _strict_json(updated.raw()), "consumed_at": time.time()}
+            conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?)", (receipt_key, _canonical(receipt)))
+            return after
+        return self._execute_write(write)
 
     @staticmethod
     def _context_epoch_from_model_config(raw: Any) -> int:
@@ -341,6 +450,48 @@ class SessionContextContinuityMixin:
             and type(value.get("_context_epoch")) is int
             and value.get("_context_epoch") >= 1
         )
+
+    def _context_rebase_lineage_on_conn(self, conn, session_id):
+        # Only traverse canonical continuation parents. Explicit branches
+        # have their own copied transcript and therefore root at themselves.
+        lineage = [session_id]
+        current = session_id
+        seen = {current}
+        for _ in range(1000):
+            row = conn.execute(
+                "SELECT parent_session_id,model_config FROM sessions WHERE id=?",
+                (current,),
+            ).fetchone()
+            if row is None or not row["parent_session_id"]:
+                break
+            parent_id = row["parent_session_id"]
+            if parent_id in seen:
+                raise ContextContinuationError("CONTINUATION_CYCLE")
+            parent = conn.execute(
+                "SELECT end_reason FROM sessions WHERE id=?", (parent_id,),
+            ).fetchone()
+            if parent is None:
+                break
+            reason = parent["end_reason"]
+            if reason == "compression":
+                # Match the same explicit fork boundary used by the turn lease.
+                config = json.loads(row["model_config"] or "{}")
+                if (type(config) is not dict
+                        or config.get("_branched_from") == parent_id
+                        or config.get("_delegate_from") == parent_id):
+                    break
+            elif reason == _CONTEXT_REBASE_END_REASON:
+                if not self._context_rebase_child_matches(row, parent_id):
+                    break
+            else:
+                break
+            lineage.append(parent_id)
+            seen.add(parent_id)
+            current = parent_id
+        else:
+            raise ContextContinuationError("CONTINUATION_DEPTH_LIMIT")
+
+        return lineage
 
     def read_context_rebase_snapshot(
         self,
@@ -403,44 +554,7 @@ class SessionContextContinuityMixin:
         if watermark <= 0:
             raise ContextContinuationError("CONTEXT_REBASE_PARENT_EMPTY")
 
-        # Only traverse canonical continuation parents. Explicit branches
-        # have their own copied transcript and therefore root at themselves.
-        lineage = [session_id]
-        current = session_id
-        seen = {current}
-        for _ in range(1000):
-            row = conn.execute(
-                "SELECT parent_session_id,model_config FROM sessions WHERE id=?",
-                (current,),
-            ).fetchone()
-            if row is None or not row["parent_session_id"]:
-                break
-            parent_id = row["parent_session_id"]
-            if parent_id in seen:
-                raise ContextContinuationError("CONTINUATION_CYCLE")
-            parent = conn.execute(
-                "SELECT end_reason FROM sessions WHERE id=?", (parent_id,),
-            ).fetchone()
-            if parent is None:
-                break
-            reason = parent["end_reason"]
-            if reason == "compression":
-                # Match the same explicit fork boundary used by the turn lease.
-                config = json.loads(row["model_config"] or "{}")
-                if (type(config) is not dict
-                        or config.get("_branched_from") == parent_id
-                        or config.get("_delegate_from") == parent_id):
-                    break
-            elif reason == _CONTEXT_REBASE_END_REASON:
-                if not self._context_rebase_child_matches(row, parent_id):
-                    break
-            else:
-                break
-            lineage.append(parent_id)
-            seen.add(parent_id)
-            current = parent_id
-        else:
-            raise ContextContinuationError("CONTINUATION_DEPTH_LIMIT")
+        lineage = self._context_rebase_lineage_on_conn(conn, session_id)
 
         # Build one exact human-originated instruction ledger across the
         # canonical continuation lineage. Physical rebase replay rows carry
@@ -718,6 +832,7 @@ class SessionContextContinuityMixin:
                       "session_id": session_id, "conversation_root": snapshot.conversation_root,
                       "snapshot_digest": expected_snapshot_digest, "payload_digest": payload_digest,
                       "route_ref": route_ref, "control_revision": snapshot.control_revision,
+                      "action_control_digest": snapshot.action_control_digest,
                       "input_watermark": snapshot.input_watermark, "admitted_at": time.time()}
             conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?)", (key, _canonical(record)))
             return record
@@ -767,6 +882,33 @@ class SessionContextContinuityMixin:
             if current.digest != admitted["snapshot_digest"]:
                 raise ContextContinuationError("CONTEXT_DISPATCH_RESPONSE_SUPERSEDED")
         self._execute_write(read)
+
+    def assert_context_dispatch_control_current(self, attempt_id, *, session_id, turn_lease_holder):
+        """Recheck a settled response at the local tool-dispatch boundary.
+
+        Assistant and completed tool observations may advance the transcript;
+        authentic input and controls may not change beneath its tool proposals.
+        This local check does not consume or revoke an external owner's permit.
+        """
+        _identity(attempt_id, "INVALID_DISPATCH_ATTEMPT")
+
+        def check(conn):
+            row = conn.execute("SELECT value FROM state_meta WHERE key=?", ("context-dispatch:" + attempt_id,)).fetchone()
+            result = conn.execute("SELECT value FROM state_meta WHERE key=?", ("context-dispatch-result:" + attempt_id,)).fetchone()
+            if row is None or result is None:
+                raise ContextContinuationError("CONTEXT_TOOL_RESPONSE_NOT_ADMITTED")
+            admitted, settled = _strict_json(row[0]), _strict_json(result[0])
+            if (admitted.get("session_id") != session_id
+                    or settled.get("disposition") != "response_received"
+                    or settled.get("payload_digest") != admitted.get("payload_digest")):
+                raise ContextContinuationError("CONTEXT_TOOL_RESPONSE_NOT_ADMITTED")
+            self._assert_context_rebase_lease_on_conn(conn, session_id, turn_lease_holder)
+            current = self._read_context_rebase_snapshot_on_conn(conn, session_id)
+            if current.action_control_digest != admitted.get("action_control_digest"):
+                raise ContextContinuationError("CONTEXT_TOOL_CONTROL_SUPERSEDED")
+            if current.has_unresolved_effects:
+                raise ContextContinuationError("CONTEXT_DISPATCH_UNRESOLVED_EFFECTS")
+        self._execute_write(check)
 
     def read_context_rebase_transition(self, transition_id: str) -> Optional[ContextRebaseTransition]:
         raw = self.get_meta(self._context_rebase_key(transition_id))

@@ -4,6 +4,33 @@ The V4 packet dated 2026-09-23 remains the full acceptance contract. This is
 an implementation branch. Qualification is tied to source hashes and named
 oracles; passing unit tests does not qualify a selected provider route.
 
+## Current control and progress repair
+
+The follow-up from `9f5d4a310408f77cd41ad7d64cd7c4773a640e45` rechecks
+a settled response's authentic input, stop, goal/recurring controls and lease
+at tool execution and again at the registry after approval and middleware.
+The native permit now consumes the final rewritten arguments. These checks
+are local prerequisites; the required native cross-owner transition fence is
+still unqualified.
+
+Disabling new rebases preserves dispatch seals, streaming retry restrictions
+and durable cancellation for committed children and compression descendants.
+Continuity keeps authentic user occurrences distinct until provider projection.
+A small provider prompt no longer resets the conversation no-progress counter.
+Explicit `/goal resume` uses one native goal/episode CAS transaction and a
+one-use action receipt. Lost acknowledgements resolve through owner readback;
+unresolved readback disables stale manager writes. Missing owners cannot defer
+half of a resume.
+
+The exact local gate passed 1,587 tests in 43 files, with four existing skips.
+All three paired native Governor tests ran. Independent review closed the
+three initial findings and two follow-up acknowledgement/fallback findings.
+`control-progress-evidence.json` binds source hashes and raw logs. The complete
+Unix-socket `execute_code` suite is added to hosted qualification: this local
+workspace denies socket creation, so its 17 affected cases are not reported
+as passes. The pinned native Governor's separate release generation-32 test
+passed and is retained in `native-governor-release-lineage.log`.
+
 ## Durable recovery and dispatch repair
 
 The repair from `68ec16bcb70a56fd6d7da54897b7aa38b0aa5091` makes child

@@ -1598,7 +1598,9 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     from agent import relay_llm
 
     active_client = client or agent._ensure_primary_openai_client(reason="codex_stream_direct")
-    max_stream_retries = 0 if getattr(agent, "context_rebase_enabled", False) else 1
+    from ares_runtime.continuity.runtime import context_dispatch_required
+
+    max_stream_retries = 0 if context_dispatch_required(agent) else 1
     # Accumulate streamed text so callers / compat shims can read it.
     agent._codex_streamed_text_parts: list = []
 

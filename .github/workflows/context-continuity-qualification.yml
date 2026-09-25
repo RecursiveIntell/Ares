@@ -11,6 +11,11 @@ on:
       - 'tests/ares_runtime/test_context_rebase_state.py'
       - 'tests/ares_runtime/test_managed_calls.py'
       - 'tests/hermes_cli/test_goals.py'
+      - 'tests/hermes_cli/test_goal_lifecycle_contract.py'
+      - 'tests/test_model_tools.py'
+      - 'tests/tools/test_code_execution.py'
+      - 'tests/run_agent/test_message_sequence_repair.py'
+      - 'tests/run_agent/test_tool_executor_contextvar_propagation.py'
       - 'tests/hermes_cli/test_heartbeat.py'
       - 'tests/hermes_cli/test_loops.py'
       - 'tests/test_run_checkpoint_import_boundaries.py'
@@ -27,6 +32,9 @@ on:
       - 'tests/run_agent/test_1630_context_overflow_loop.py'
       - 'tests/run_agent/test_compression_lock_defer.py'
       - 'agent/agent_init.py'
+      - 'agent/agent_runtime_helpers.py'
+      - 'agent/tool_executor.py'
+      - 'model_tools.py'
       - 'agent/conversation_loop.py'
       - 'agent/chat_completion_helpers.py'
       - 'agent/codex_runtime.py'
@@ -98,6 +106,11 @@ jobs:
             tests/ares_runtime/test_context_rebase_state.py \
             tests/ares_runtime/test_managed_calls.py \
             tests/hermes_cli/test_goals.py \
+            tests/hermes_cli/test_goal_lifecycle_contract.py \
+            tests/test_model_tools.py \
+            tests/tools/test_code_execution.py \
+            tests/run_agent/test_message_sequence_repair.py \
+            tests/run_agent/test_tool_executor_contextvar_propagation.py \
             tests/hermes_cli/test_heartbeat.py \
             tests/hermes_cli/test_loops.py \
             tests/test_run_checkpoint_import_boundaries.py \
