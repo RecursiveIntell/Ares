@@ -223,7 +223,7 @@ def build_live_candidate(
         raise LiveContinuationError("LIVE_USER_ANCHOR_MISSING")
 
     latest_user = snapshot.current_users[-1]
-    control_revision = int(latest_user["row_id"])
+    control_revision = int(snapshot.control_revision)
     goal_id, goal_raw = _goal_projection(snapshot.goal_raw)
     conversation_ref = _opaque_ref("conversation", snapshot.conversation_root)
     task_ref = (
@@ -267,34 +267,38 @@ def build_live_candidate(
             freshness, 0, len(raw), section, required,
         ))
 
-    # Original task anchor survives compression/rebase ancestry.  It does not
-    # imply every original clause is still effective; newer exact user rows are
-    # carried beside it and retain chronology through their row IDs.
-    if snapshot.first_user is not None:
-        raw = _exact_user_bytes(snapshot.first_user["content"])
+    # Exact authentic-user requirements are carried independently of physical
+    # context epochs. Synthetic role=user wakeups (goal/loop/heartbeat/recovery)
+    # are context, not user authority, and are projected separately below.
+    latest_authentic_row = snapshot.authentic_users[-1]["row_id"]
+    for item in snapshot.authentic_users:
+        raw = _exact_user_bytes(item["content"])
+        is_latest = item["row_id"] == latest_authentic_row
         add(
-            "record:user:first",
-            f"session-message:{snapshot.first_user['row_id']}",
-            f"message:{snapshot.first_user['row_id']}",
+            f"record:user:{item['session_id']}:{item['row_id']}",
+            f"session-message:{item['session_id']}:{item['row_id']}",
+            f"message:{item['row_id']}",
             raw,
             kind=SourceKind.USER_REQUIREMENT,
             status=EvidenceStatus.OBSERVED,
-            freshness=Freshness.HISTORICAL,
+            freshness=Freshness.CURRENT if is_latest else Freshness.HISTORICAL,
             section=Section.TASK,
             required=True,
         )
 
     for item in snapshot.current_users:
+        if item.get("authentic_user"):
+            continue
         raw = _exact_user_bytes(item["content"])
         add(
-            f"record:user:{item['row_id']}",
-            f"session-message:{item['row_id']}",
+            f"record:synthetic-user:{item['row_id']}",
+            f"session-message:{snapshot.session_id}:{item['row_id']}",
             f"message:{item['row_id']}",
             raw,
-            kind=SourceKind.USER_REQUIREMENT,
+            kind=SourceKind.APPLICATION_STATE,
             status=EvidenceStatus.OBSERVED,
             freshness=Freshness.CURRENT,
-            section=Section.TASK,
+            section=Section.FRONTIER,
             required=True,
         )
 
@@ -448,6 +452,16 @@ def build_live_candidate(
             "role": "user",
             "content": latest_content,
             "timestamp": latest_user.get("timestamp"),
+            **(
+                {"display_kind": latest_user.get("display_kind")}
+                if latest_user.get("display_kind")
+                else {}
+            ),
+            **(
+                {"display_metadata": latest_user.get("display_metadata")}
+                if latest_user.get("display_metadata") is not None
+                else {}
+            ),
         },
     ]
     digest = _candidate_digest(
