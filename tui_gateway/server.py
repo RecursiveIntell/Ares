@@ -13104,14 +13104,29 @@ def _run_prompt_submit(
                 )
                 _claim = claim_event_delivery(_evt, "tui-post-turn")
                 if _claim is None:
+                    # The local slot was claimed before the durable arbiter.
+                    # Losing that claim must restore idle state or the session
+                    # wedges after an otherwise successful foreground turn.
+                    with session["history_lock"]:
+                        session["running"] = False
                     continue
                 try:
                     _emit("message.start", sid)
-                    _run_prompt_submit(
-                        rid, sid, session, synth,
-                        display_kind="internal_notification",
-                        display_metadata={"synthetic_source": "completion_notification"},
-                    )
+                    if _evt.get("type") == "async_delegation":
+                        _run_prompt_submit(
+                            rid,
+                            sid,
+                            session,
+                            synth,
+                            display_kind="async_delegation_complete",
+                            display_metadata=_async_delegation_display_metadata(_evt),
+                        )
+                    else:
+                        _run_prompt_submit(
+                            rid, sid, session, synth,
+                            display_kind="internal_notification",
+                            display_metadata={"synthetic_source": "completion_notification"},
+                        )
                     complete_event_delivery(_evt, _claim)
                 except Exception as _n_exc:
                     release_event_delivery(_evt, _claim)

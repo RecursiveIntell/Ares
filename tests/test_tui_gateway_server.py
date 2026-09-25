@@ -7453,6 +7453,129 @@ def test_run_prompt_submit_delivers_completion_observed_by_poll(monkeypatch, tmp
         process_registry._poll_observed.discard(event["session_id"])
 
 
+def test_run_prompt_submit_lost_post_turn_delivery_claim_releases_running(
+    monkeypatch, tmp_path
+):
+    """A lost durable post-turn claim cannot leave the foreground session busy."""
+    from tools.process_registry import process_registry
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    turns = []
+    session = _session(
+        session_key="session-post-turn-claim",
+        agent=_RecordingAgent(turns),
+        running=True,
+    )
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg-post-turn-claimed-elsewhere",
+        "session_key": "session-post-turn-claim",
+        "origin_ui_session_id": "sid-post-turn-claim",
+    }
+    calls = {"drain": 0}
+
+    def _drain(**_kwargs):
+        calls["drain"] += 1
+        return [(event, "delegation completion")] if calls["drain"] == 1 else []
+
+    monkeypatch.setattr(process_registry, "drain_notifications", _drain)
+    monkeypatch.setattr(
+        "tools.async_delegation.claim_event_delivery",
+        lambda _event, _consumer: None,
+    )
+    server._sessions["sid-post-turn-claim"] = session
+
+    try:
+        server._run_prompt_submit(
+            "rid-post-turn-claim",
+            "sid-post-turn-claim",
+            session,
+            "foreground turn",
+        )
+
+        assert turns == ["foreground turn"]
+        assert session["running"] is False
+    finally:
+        server._sessions.pop("sid-post-turn-claim", None)
+
+
+def test_run_prompt_submit_types_post_turn_async_completion(
+    monkeypatch, tmp_path
+):
+    """Async completions keep the same provenance type on the post-turn drain."""
+    from tools.process_registry import process_registry
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    observed = []
+
+    class _TypedRecordingAgent(_RecordingAgent):
+        def run_conversation(
+            self,
+            prompt,
+            conversation_history=None,
+            stream_callback=None,
+            persist_user_display_kind=None,
+            persist_user_display_metadata=None,
+            **_kwargs,
+        ):
+            observed.append(
+                (
+                    prompt,
+                    persist_user_display_kind,
+                    persist_user_display_metadata,
+                )
+            )
+            return {"final_response": "", "messages": []}
+
+    session = _session(
+        session_key="session-post-turn-typed",
+        agent=_TypedRecordingAgent([]),
+        running=True,
+    )
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg-post-turn-typed",
+        "session_key": "session-post-turn-typed",
+        "origin_ui_session_id": "sid-post-turn-typed",
+        "results": [{"status": "completed"}],
+    }
+    calls = {"drain": 0}
+
+    def _drain(**_kwargs):
+        calls["drain"] += 1
+        return [(event, "delegation completion")] if calls["drain"] == 1 else []
+
+    monkeypatch.setattr(process_registry, "drain_notifications", _drain)
+    monkeypatch.setattr(
+        "tools.async_delegation.claim_event_delivery",
+        lambda _event, _consumer: "claim-post-turn",
+    )
+    monkeypatch.setattr(
+        "tools.async_delegation.complete_event_delivery",
+        lambda _event, _claim: None,
+    )
+    server._sessions["sid-post-turn-typed"] = session
+
+    try:
+        server._run_prompt_submit(
+            "rid-post-turn-typed",
+            "sid-post-turn-typed",
+            session,
+            "foreground turn",
+        )
+
+        assert observed[0] == ("foreground turn", None, None)
+        assert observed[1][0] == "delegation completion"
+        assert observed[1][1] == "async_delegation_complete"
+        assert observed[1][2]["delegation_id"] == "deleg-post-turn-typed"
+        assert observed[1][2]["task_count"] == 1
+        assert observed[1][2]["completed_count"] == 1
+        assert observed[1][2]["failed_count"] == 0
+        assert session["running"] is False
+    finally:
+        server._sessions.pop("sid-post-turn-typed", None)
+
+
 def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_threading(
     monkeypatch, tmp_path
 ):
