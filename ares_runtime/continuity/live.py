@@ -182,6 +182,8 @@ def _event_projection(event: dict[str, Any]) -> bytes:
         "role": role,
         "tool_name": event.get("tool_name"),
         "tool_call_id": event.get("tool_call_id"),
+        # Exact serialized arguments remain source-bound, untrusted evidence.
+        "tool_calls": event.get("tool_calls"),
         "effect_disposition": event.get("effect_disposition"),
         "observed": bool(event.get("observed")),
         "finish_reason": event.get("finish_reason"),

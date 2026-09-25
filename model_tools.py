@@ -1312,11 +1312,14 @@ def handle_function_call(
     _ares_schema = None
     _ares_canary_context = None
     _ares_canary_enabled = False
+    _ares_native_enabled = False
     _ares_mission_ref = task_id or os.getenv("ARES_MISSION_REF")
     try:
         from ares_runtime.collaboration import dispatcher_boundary, production_permit_canary_context, production_permit_canary_enabled
+        from ares_runtime.continuity.runtime import native_tool_control_binding
+        _ares_native_enabled = native_tool_control_binding(session_id=session_id) is not None
         _ares_canary_context = production_permit_canary_context(session_id=session_id)
-        _ares_canary_enabled = _ares_canary_context is not None or production_permit_canary_enabled(session_id=session_id)
+        _ares_canary_enabled = _ares_native_enabled or _ares_canary_context is not None or production_permit_canary_enabled(session_id=session_id)
         if os.getenv("ARES_STRICT_EFFECT_TOOL_ARGS_V1", "0") == "1" or _ares_canary_enabled:
             for _ares_definition in get_tool_definitions(
                 enabled_toolsets=enabled_toolsets,
@@ -1341,6 +1344,9 @@ def handle_function_call(
         if not _ares_allowed:
             return tool_error(f"ARES_EFFECT_DENIED:{_ares_code}")
     except Exception as _ares_boundary_error:
+        from ares_runtime.continuity.runtime import ContextDispatchError
+        if isinstance(_ares_boundary_error, ContextDispatchError):
+            return tool_error(str(_ares_boundary_error))
         if _ares_canary_enabled or os.getenv("ARES_STRICT_EFFECT_TOOL_ARGS_V1", "0") == "1":
             return tool_error(f"ARES_EFFECT_BOUNDARY_ERROR:{type(_ares_boundary_error).__name__}")
 

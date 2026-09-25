@@ -1,8 +1,42 @@
 # Context continuity qualification
 
-The V4 packet dated 2026-09-23 remains the full acceptance contract. This is
-an implementation branch. Qualification is tied to source hashes and named
-oracles; passing unit tests does not qualify a selected provider route.
+The V4 packet dated 2026-09-23 remains the architecture and acceptance reference.
+On 2026-09-25 the operator authorized merging after completed implementation,
+repository checks and final review, with live use and receipts supplying ongoing
+operational validation. The real-route canary and 24-hour endurance run are now
+post-merge evidence work, not pre-merge gates. This changes the merge criterion;
+it does not label unobserved behavior qualified. No live profile activation is
+performed by this source change.
+
+Qualification remains tied to source hashes and named oracles. Passing unit tests
+does not qualify a selected provider route.
+
+## Protected controller and scoped dispatch integration (2026-09-25)
+
+The current candidate connects protected SessionDB controller enrollment to
+final tool dispatch and native retire/publish/activate recovery. A response and
+its physical generation are captured before worker submission. The authenticated
+approval route remains separate from the physical child session ID. All native
+RPC runs outside SQLite write transactions; uncertain acknowledgements resolve
+through exact readback. Existing recovery attempts and deadlines are retained.
+
+Local Governor/continuity qualification passed 328 tests across 23 files against
+the pinned real Governor binary. Native daemon compilation and Rust formatting
+passed. The local daemon link lacks libseccomp development files, and Unix socket
+binding is unavailable in this workspace. Hosted qualification therefore runs
+the exact paired daemon, including a real signed scope, rollover, restart,
+approval route, disposable file effect and native outcome receipt. That current
+hosted result is pending until recorded below; the previous native candidate's
+successful run is not evidence for later edits.
+
+The native companion is recursive-agent PR20, commit `2297e944`, tree
+`a0269beec181dd24e3af5a3255db857444c19f34`. Operator commands and preserved stopped
+recovery cases are documented in [NATIVE_OPERATIONS.md](NATIVE_OPERATIONS.md).
+No live profile is enrolled. Unqualified external-effect owners and consumed
+obligations without independent dispositions fail closed; reported success is
+not task completion. Full V4 acceptance and installed-route/endurance claims are
+not inferred from these repository tests. The operator authorized merge after
+final review, with live receipt validation after merge.
 
 ## Native scoped authority source increment
 
@@ -15,9 +49,8 @@ reported outcomes are not external confirmation. Configuration and transition
 history are replayed to validate persisted admission projections.
 
 The independent source review closed CA-1, CA-2 and CA-3. Formatting, Clippy and
-policy/daemon test compilation passed. The exact patch/tree is submitted to the
-existing hosted native workspace gate; this increment's behavioral result is
-pending. Ares controller enrollment and continuity-saga integration remain next.
+policy/daemon test compilation passed. The exact candidate tree `a2516490` passed the hosted native workspace gate
+on Ares `1ca7b89d` (run `36154571672`, native job `108135872634`). Ares controller enrollment and continuity-saga integration remain next.
 This source increment does not close the EF-1/EF-2 cross-owner acceptance or V4.
 
 The preceding Ares commit `bd6c579a` passed every applicable hosted workflow,

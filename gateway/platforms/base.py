@@ -1408,6 +1408,7 @@ def _media_delivery_denied_paths() -> List[Path]:
     # tag can't deliver a live bearer token as a native attachment.
     # (session/kanban SQLite stores are handled by #41071 — kept out here.)
     _ROOT_CREDENTIAL_DIRS = (
+        "context-controller-keys",
         "pairing",
         "mcp-tokens",
     )
@@ -1433,6 +1434,8 @@ def _path_under_denied_prefix(resolved: Path) -> bool:
     only un-block a plain file sitting in the running user's home tree, never a
     credential location or another user's home.
     """
+    if "context-controller-keys" in resolved.parts:
+        return True
     try:
         home = Path(os.path.expanduser("~")).resolve(strict=False)
     except (OSError, RuntimeError, ValueError):

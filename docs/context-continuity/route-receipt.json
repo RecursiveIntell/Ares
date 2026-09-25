@@ -19,7 +19,8 @@
     "/workspace/scratch/bfe02ea97bc3/Ares",
     "/workspace/scratch/bfe02ea97bc3/evidence",
     "github:RecursiveIntell/Ares#80",
-    "/workspace/scratch/bfe02ea97bc3/recursive-agent-continuity"
+    "/workspace/scratch/bfe02ea97bc3/recursive-agent-continuity",
+    "/workspace/scratch/bfe02ea97bc3/Ares-current"
   ],
   "route_id": "high-risk-implement",
   "selected_skills": [
@@ -101,9 +102,7 @@
     "Final pinned canonical gate: 26 files, 1289 passed, 0 failed, exit 0; raw log retained in repair-test-run.log.",
     "Latest canonical owner-recovery gate:89 files,2865passed,0failed,5skipped; independent72passed; named local socket exclusions retained in hosted CI."
   ],
-  "blocked_gates": [
-    "Installed selected subscription-route tuple and live qualification are unavailable in this workspace."
-  ],
+  "blocked_gates": [],
   "remaining_delta": [
     "Remaining ingress/control and current role/upstream actor verification",
     "Owner-qualified external effect settlement and task completion/progress",
@@ -173,5 +172,23 @@
         "docs/context-continuity/native-context-authority-audit.json"
       ]
     }
+  ],
+  "latest_authorization": {
+    "observed_user_instruction": "After final review we are merging; live use and receipts will provide ongoing validation.",
+    "date": "2026-09-25",
+    "merge_authorized": true,
+    "premerge_endurance_required": false,
+    "live_profile_activation_authorized": false,
+    "remaining_premerge_gates": [
+      "Complete remaining in-scope source integration",
+      "Run relevant repository checks",
+      "Resolve blocking final-review findings",
+      "Confirm exact-head required CI"
+    ]
+  },
+  "post_merge_evidence_work": [
+    "Installed selected-route capability/calibration",
+    "Subscription-route canaries",
+    "Real workload/endurance receipts; report observed coverage and unresolved outcomes"
   ]
 }

@@ -65,6 +65,7 @@ def prepare_context_dispatch(agent, messages, conversation_history):
         raise ContextDispatchError("CONTEXT_DISPATCH_INPUT_NOT_DURABLE")
     try:
         db.assert_context_rebase_ready_for_turn(agent.session_id)
+        db.verify_native_context_current(agent.session_id)
         snapshot = db.read_context_rebase_snapshot(agent.session_id)
         if snapshot.has_pending_inputs:
             raise ContextDispatchError("CONTEXT_DISPATCH_INPUT_PENDING")
@@ -203,6 +204,11 @@ def settle_final_context_dispatch(agent, admission):
             turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
         )
         agent._context_response_admission = admission
+        # Pin authority with the response, before any worker can be queued.
+        reader = getattr(type(agent._session_db), "read_native_context_authority", None)
+        agent._context_response_native_authority = (
+            reader(agent._session_db, agent.session_id) if callable(reader) else None
+        )
     except Exception as exc:
         raise ContextDispatchError(getattr(exc, "code", "CONTEXT_DISPATCH_SETTLEMENT_UNKNOWN")) from None
 
@@ -213,12 +219,18 @@ _tool_control = ContextVar("context_continuity_tool_control", default=None)
 @contextmanager
 def context_tool_control_scope(agent):
     """Bind this response across existing tool and execute_code worker threads."""
-    binding = None
-    if context_dispatch_required(agent):
+    binding = _tool_control.get()
+    if binding is not None and binding[0] is not agent:
+        raise ContextDispatchError("CONTEXT_TOOL_OWNER_MISMATCH")
+    if binding is None and context_dispatch_required(agent):
+        from copy import deepcopy
+        from tools.approval import get_current_session_key
         admission = getattr(agent, "_context_response_admission", None)
         binding = (agent, getattr(agent, "_session_db", None), agent.session_id,
                    getattr(agent, "_active_session_turn_lease_holder", None),
-                   admission.get("attempt_id") if isinstance(admission, dict) else None)
+                   admission.get("attempt_id") if isinstance(admission, dict) else None,
+                   deepcopy(getattr(agent, "_context_response_native_authority", None)),
+                   get_current_session_key(default=""))
     token = _tool_control.set(binding)
     try:
         yield
@@ -235,7 +247,7 @@ def assert_context_tool_control_current(*, session_id=None):
     binding = _tool_control.get()
     if binding is None:
         return
-    agent, db, bound_session, holder, attempt_id = binding
+    agent, db, bound_session, holder, attempt_id, registration, _approval_route = binding
     try:
         if (getattr(agent, "_interrupt_requested", False)
                 or getattr(agent, "_pending_redirect", None)
@@ -248,10 +260,32 @@ def assert_context_tool_control_current(*, session_id=None):
         db.assert_context_dispatch_control_current(
             attempt_id, session_id=bound_session, turn_lease_holder=holder,
         )
+        reader = getattr(type(db), "read_native_context_authority", None)
+        if callable(reader) and reader(db, bound_session) != registration:
+            raise ContextDispatchError("CONTEXT_AUTHORITY_GENERATION_CHANGED")
     except Exception as exc:
         code = str(exc) if isinstance(exc, ContextDispatchError) else getattr(exc, "code", "CONTEXT_DISPATCH_OWNER_UNAVAILABLE")
         agent._context_tool_control_failure = code
         raise ContextDispatchError(code) from None
+
+
+def context_bound_tool_batch(function):
+    """Capture on the submitting thread, including sequential timeout workers."""
+    from functools import wraps
+
+    @wraps(function)
+    def execute(agent, *args, **kwargs):
+        with context_tool_control_scope(agent):
+            return function(agent, *args, **kwargs)
+    return execute
+
+
+def native_tool_control_binding(*, session_id=None):
+    binding = _tool_control.get()
+    if binding is None:
+        return None
+    assert_context_tool_control_current(session_id=session_id)
+    return binding if binding[5] is not None else None
 
 
 class ContextDispatchStreamBuffer:
@@ -920,6 +954,8 @@ def reconcile_context_rebase(
             recovery_attempt=reservation["attempts"],
             expected_control_digest=reservation["action_control_digest"], expected_custody=reconciled_custody)
         if not controller_recovery:
+            db.activate_native_context_rebase(transition_id, session_id=child_session_id,
+                turn_lease_holder=holder, reservation=_custody_recovery_reservation(reservation))
             try:
                 db.mark_context_rebase_ready(transition_id, before_tokens=before_tokens,
                     after_tokens=after_tokens, **completion)
@@ -927,6 +963,8 @@ def reconcile_context_rebase(
                 # Native completion may have committed before its acknowledgement
                 # was lost. Only exact owner readback can admit local adoption.
                 db.confirm_context_rebase_ready(transition_id, **completion)
+        else:
+            db.verify_native_context_current(child_session_id)
         agent.session_id = child_session_id
         agent._session_db_created = True
         agent._cached_system_prompt = new_system_prompt

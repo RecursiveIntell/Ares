@@ -40,6 +40,18 @@ def test_goal_less_candidate_preserves_original_and_latest_user_with_hidden_deri
     assert candidate.control_revision > 0
 
 
+def test_exact_assistant_tool_arguments_survive_as_untrusted_source_evidence(db):
+    arguments = '{"path":"queue.py","content":"source bound value"}'
+    db.append_message("s0", "assistant", "", tool_calls=[{
+        "id": "call-original", "type": "function",
+        "function": {"name": "write_file", "arguments": arguments},
+    }])
+    candidate = build_live_candidate(db, session_id="s0")
+    assert "source bound value" in candidate.brief.evidence_text
+    assert "call-original" in candidate.brief.evidence_text
+    assert json.loads(candidate.brief.manifest)["execution_authorized"] is False
+
+
 def test_goal_candidate_carries_owner_projection_without_continuation_claim_token(db):
     db.set_meta("goal:s0", json.dumps({
         "goal": "Fix the queue",

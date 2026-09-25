@@ -23,7 +23,7 @@ index 0076c23..40eda80 100644
  async-trait = "0.1"
  recursive-agent-policy = { path = "../recursive-agent-policy", features = ["test-only-approval-fixture"] }
 diff --git a/crates/recursive-agent-daemon/src/bin/ra-daemon.rs b/crates/recursive-agent-daemon/src/bin/ra-daemon.rs
-index 3eafb6d..44e0668 100644
+index 3eafb6d..df07b1d 100644
 --- a/crates/recursive-agent-daemon/src/bin/ra-daemon.rs
 +++ b/crates/recursive-agent-daemon/src/bin/ra-daemon.rs
 @@ -8,6 +8,7 @@
@@ -34,7 +34,7 @@ index 3eafb6d..44e0668 100644
  #[cfg(unix)]
  use std::os::unix::fs::MetadataExt;
  use std::path::PathBuf;
-@@ -67,6 +68,16 @@ enum Cmd {
+@@ -67,6 +68,23 @@ enum Cmd {
          /// Required whenever a production verifier enrollment is configured.
          #[arg(long)]
          production_write_root: Option<PathBuf>,
@@ -48,10 +48,17 @@ index 3eafb6d..44e0668 100644
 +    InitializeContextAuthority {
 +        #[arg(long)]
 +        root: PathBuf,
++    },
++    /// Print the canonical public verifier digest used by scope enrollment.
++    DescribeProductionVerifier {
++        #[arg(long)]
++        production_verifier_file: PathBuf,
++        #[arg(long)]
++        production_write_root: PathBuf,
      },
      /// Emit one canonical native operation envelope as JSON (for the Hermes
      /// integration and tests to submit over IPC).
-@@ -281,6 +292,37 @@ fn load_production_verifier(
+@@ -281,6 +299,37 @@ fn load_production_verifier(
      )
  }
  
@@ -89,7 +96,7 @@ index 3eafb6d..44e0668 100644
  fn build_runtime(
      root: &std::path::Path,
      audit_root: Option<PathBuf>,
-@@ -318,6 +360,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
+@@ -318,6 +367,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
              max_concurrent,
              production_verifier_file,
              production_write_root,
@@ -97,7 +104,7 @@ index 3eafb6d..44e0668 100644
          } => {
              fs::create_dir_all(&root)?;
              let production_verifier = match (production_verifier_file.as_deref(), production_write_root.as_deref()) {
-@@ -329,7 +372,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
+@@ -329,7 +379,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                      "production verifier file and production write root must be configured together".into(),
                  ),
              };
@@ -109,7 +116,7 @@ index 3eafb6d..44e0668 100644
              // The socket parent is the directory containing the socket path.
              let parent = socket
                  .parent()
-@@ -344,6 +390,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
+@@ -344,6 +397,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
              serve(listener, Arc::new(runtime), max_concurrent)?;
              Ok(())
          }
@@ -118,6 +125,15 @@ index 3eafb6d..44e0668 100644
 +            let store =
 +                recursive_agent_policy::DurablePermitStore::from_dir_fd(&fs::File::open(root)?)?;
 +            println!("{}", store.initialize_context_authority()?);
++            Ok(())
++        }
++        Cmd::DescribeProductionVerifier {
++            production_verifier_file,
++            production_write_root,
++        } => {
++            let verifier =
++                load_production_verifier(&production_verifier_file, &production_write_root)?;
++            println!("{}", verifier.context_authority_digest()?);
 +            Ok(())
 +        }
          Cmd::EmitEnvelope { text } => {

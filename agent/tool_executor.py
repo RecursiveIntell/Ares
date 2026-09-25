@@ -46,6 +46,7 @@ from tools.terminal_tool import (
     get_active_env,
 )
 from tools.thread_context import propagate_context_to_thread
+from ares_runtime.continuity.runtime import context_bound_tool_batch
 from tools.tool_result_storage import (
     maybe_persist_tool_result,
     enforce_turn_budget,
@@ -1105,6 +1106,7 @@ def _begin_tool_execution(
             pass
 
 
+@context_bound_tool_batch
 def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
     """Execute multiple tool calls concurrently using a thread pool.
 
@@ -1959,6 +1961,7 @@ def _append_cancelled_tool_results(messages: list, tool_calls, *, reason: str) -
         ))
 
 
+@context_bound_tool_batch
 def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
     """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools.
 
@@ -2867,6 +2870,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
 
 
+@context_bound_tool_batch
 def execute_tool_calls_segmented(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, segments=None) -> None:
     """Execute a mixed tool-call batch as ordered parallel/sequential segments.
 

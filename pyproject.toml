@@ -436,6 +436,7 @@ py-modules = [
   "hermes_state",
   "hermes_state_common",
   "hermes_state_continuity",
+  "hermes_state_context_authority",
   "hermes_state_inbox",
   "hermes_state_input_turns",
   "hermes_state_portability",

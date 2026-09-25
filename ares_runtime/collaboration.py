@@ -1535,6 +1535,48 @@ class ConsumedPermitSettlement:
         self._adapter.record_receipt(bound)
 
 
+@dataclass(frozen=True)
+class ScopedPermitSettlement:
+    """Historical outcome sink; reporting never grants another execution."""
+
+    facts: Mapping[str, Any]
+    _adapter: "DaemonPermitReceiptAdapter"
+
+    def record_receipt(self, receipt: Mapping[str, Any]) -> None:
+        from ares_runtime.continuity.authority import closed, digest as native_digest
+
+        if (receipt.get("permit_ref") != self.facts["canonical_permit_ref"]
+                or receipt.get("preflight_receipt") != self.facts["receipt_artifact"]):
+            raise ContractError("PERMIT_SETTLEMENT_IDENTITY_MISMATCH")
+        states = {"ok": "succeeded", "error": "failed", "ambiguous": "outcome_ambiguous"}
+        if (receipt.get("state") not in states or type(receipt.get("duration_ms")) is not int
+                or receipt["duration_ms"] < 0):
+            raise ContractError("PERMIT_BRIDGE_MALFORMED")
+        reported = {"state": states[receipt["state"]], "duration_ms": receipt["duration_ms"],
+                    "error_type": receipt.get("error_type")}
+        if reported["error_type"] is not None:
+            value = reported["error_type"]
+            reported["error_type"] = value if type(value) is str and 0 < len(value) <= 256 and all(
+                not c.isspace() or c == " " for c in value) else "tool_error"
+        permit = self.facts["scoped_permit"]
+        preflight = self.facts["receipt_artifact"]["receipt_digest"]
+        try:
+            outcome = self._adapter.context_request("scoped_permit_outcome_record", permit=permit,
+                preflight_receipt_digest=preflight, reported=reported)["outcome"]
+        except ContractError:
+            # Exact readback resolves a lost acknowledgement, never retries an effect.
+            record = self._adapter.context_request("scoped_permit_readback", permit=permit)["record"]
+            closed(record, "permit preflight outcome")
+            if record["permit"] != permit or record["preflight"] != self.facts["receipt_artifact"]:
+                raise ContractError("PERMIT_SETTLEMENT_IDENTITY_MISMATCH")
+            outcome = record["outcome"]
+        closed(outcome, "permit_id preflight_receipt_digest reported recorded_at receipt_digest")
+        if (outcome["permit_id"] != permit["permit_id"] or outcome["preflight_receipt_digest"] != preflight
+                or outcome["reported"] != reported):
+            raise ContractError("PERMIT_SETTLEMENT_IDENTITY_MISMATCH")
+        native_digest(outcome["receipt_digest"])
+
+
 class OperatorApprovalWitnessProvider(Protocol):
     """Surface-owned source for a durable approval witness.
 
@@ -1973,6 +2015,62 @@ class DaemonPermitReceiptAdapter:
             raise ContractError("PERMIT_BRIDGE_UNAVAILABLE") from None
 
     _PRODUCTION_MODE = "production_per_call"
+
+    def context_request(self, kind: str, **fields) -> dict[str, Any]:
+        """One bounded native context RPC using this adapter's pinned transport.
+
+        No retries and no inferred success after a missing response. Callers
+        reconcile a mutating request through its exact native readback lane.
+        """
+        contracts = {
+            "context_store_identity": ({"nonce"}, {"store"}),
+            "context_authority_readback": ({"incarnation", "scope"}, {"snapshot"}),
+            "context_call_prepare": ({"authority", "witness"}, {"material", "signing_bytes"}),
+            "context_transition_prepare": ({"authority", "transition_ref", "action"}, {"material", "signing_bytes"}),
+            "context_authority_transition": ({"transition"}, {"receipt"}),
+            "context_transition_readback": ({"transition"}, {"receipt"}),
+            "scoped_permit_issue": ({"witness", "context"}, {"permit"}),
+            "scoped_permit_consume": ({"permit", "call"}, {"preflight"}),
+            "scoped_permit_readback": ({"permit"}, {"record"}),
+            "scoped_permit_outcome_record": ({"permit", "preflight_receipt_digest", "reported"}, {"outcome"}),
+        }
+        contract = contracts.get(kind)
+        if contract is None or set(fields) != contract[0]:
+            raise ContractError("CONTEXT_NATIVE_REQUEST_INVALID")
+        request_id = "ares:" + secrets.token_hex(16)
+        request = {"schema": self.REQUEST_SCHEMA, "protocol_version": self.PROTOCOL_VERSION,
+                   "request_id": request_id, "request": {"kind": kind, **fields}}
+
+        def pairs(items):
+            value = {}
+            for key, item in items:
+                if key in value:
+                    raise ContractError("CONTEXT_NATIVE_RESPONSE_INVALID")
+                value[key] = item
+            return value
+
+        def nonfinite(_):
+            raise ContractError("CONTEXT_NATIVE_RESPONSE_INVALID")
+
+        try:
+            with self._connect() as stream:
+                self._send_frame(stream, request)
+                length = struct.unpack(">I", self._recv_exact(stream, 4))[0]
+                if not 0 < length <= self.MAX_FRAME_BYTES:
+                    raise ContractError("CONTEXT_NATIVE_RESPONSE_INVALID")
+                response = json.loads(self._recv_exact(stream, length).decode("utf-8"),
+                                      object_pairs_hook=pairs, parse_constant=nonfinite)
+        except ContractError:
+            raise
+        except (OSError, ValueError, RecursionError):
+            raise ContractError("CONTEXT_NATIVE_ACK_UNKNOWN") from None
+        if type(response) is not dict or response.get("request_id") != request_id:
+            raise ContractError("CONTEXT_NATIVE_RESPONSE_INVALID")
+        if set(response) == {"request_id", "error"}:
+            raise ContractError("CONTEXT_NATIVE_REFUSED")
+        if set(response) != {"request_id"} | contract[1]:
+            raise ContractError("CONTEXT_NATIVE_RESPONSE_INVALID")
+        return {key: response[key] for key in contract[1]}
 
     def _production_enabled(self) -> bool:
         return self._config.get("mode") == self._PRODUCTION_MODE
@@ -2666,6 +2764,12 @@ def dispatcher_boundary(
     consume_permit: bool = True,
     production_context: ProductionPermitCanaryContext | None = None,
 ) -> tuple[bool, str | None, ConsumedPermitSettlement | None]:
+    from ares_runtime.continuity.runtime import native_tool_control_binding
+
+    bound = native_tool_control_binding(session_id=session_id)
+    if bound is not None:
+        return _scoped_dispatcher_boundary(bound, tool_name, args, mission_ref=mission_ref,
+                                          schema=schema, consume=authorize_permit and consume_permit)
     if production_context is not None and production_context.session_id != session_id:
         return False, "PRODUCTION_CANARY_SESSION_MISMATCH", None
     bridge = (
@@ -2717,6 +2821,55 @@ def dispatcher_boundary(
     except Exception:
         return False, "PERMIT_DENIED", None
     return True, None, ConsumedPermitSettlement(dict(permit), adapter)
+
+
+def _scoped_dispatcher_boundary(bound, tool_name, args, *, mission_ref, schema, consume):
+    """The enrolled route never falls through to legacy effect admission."""
+    from ares_runtime.continuity.authority import closed, digest as native_digest
+    from ares_runtime.continuity.runtime import assert_context_tool_control_current
+
+    # Native production V1 owns write_file only. Other external effect owners
+    # require their own qualified lane before this opt-in route can use them.
+    if tool_name in {"read_file", "search_files", "web_search", "web_extract",
+                     "tool_search", "tool_describe", "tool_call"}:
+        return True, None, None
+    if tool_name != "write_file":
+        return False, "CONTEXT_EFFECT_OWNER_UNQUALIFIED", None
+    try:
+        validate_effect_args(args, schema or _DEFAULT_EFFECT_SCHEMAS["write_file"])
+        if set(args) != {"path", "content"} or not mission_ref:
+            raise ContractError("PRODUCTION_WRITE_FILE_REQUIRED")
+        if not consume:
+            return True, None, None
+        _, db, session, holder, attempt_id, registration, approval_route = bound
+        provider = GatewayProductionApprovalWitnessProvider(
+            worktree_root=registration["enrollment_snapshot"]["grant"]["write_root"], session_key=approval_route)
+        adapter = DaemonPermitReceiptAdapter(registration["transport"], approval_witness_provider=provider)
+        call = {"tool": "write_file", "args": dict(args), "frozen_clock": None}
+        witness = adapter._production_approval_witness(mission_ref=mission_ref,
+                                                       target_ref=target_for(tool_name, args), call=call)
+        context = db.sign_native_context_call(session_id=session, turn_lease_holder=holder,
+                        attempt_id=attempt_id, registration=registration, witness=witness)
+        permit = adapter.context_request("scoped_permit_issue", witness=witness, context=context)["permit"]
+        closed(permit, "permit_id effect approval_verifier context")
+        if type(permit["permit_id"]) is not str or not 0 < len(permit["permit_id"]) <= 256:
+            raise ContractError("PERMIT_BRIDGE_MALFORMED")
+        if (permit["context"] != context
+                or permit["approval_verifier"] != registration["approval_verifier"]):
+            raise ContractError("CONTEXT_AUTHORITY_GENERATION_CHANGED")
+        assert_context_tool_control_current(session_id=session)
+        # A missing consume ACK is not permission to run. Native inventory owns
+        # that unresolved permit for recovery and later owner reconciliation.
+        preflight = adapter.context_request("scoped_permit_consume", permit=permit, call=call)["preflight"]
+        closed(preflight, "permit recorded_at receipt_digest")
+        if preflight["permit"] != permit:
+            raise ContractError("PERMIT_SETTLEMENT_IDENTITY_MISMATCH")
+        native_digest(preflight["receipt_digest"])
+        facts = {"canonical_permit_ref": permit["permit_id"], "receipt_artifact": preflight,
+                 "scoped_permit": permit}
+        return True, None, ScopedPermitSettlement(facts, adapter)
+    except Exception as exc:
+        return False, getattr(exc, "code", "CONTEXT_EFFECT_ADMISSION_FAILED"), None
 
 
 def record_receipt(receipt: Mapping[str, Any]) -> None:

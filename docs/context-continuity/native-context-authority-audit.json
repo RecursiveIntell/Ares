@@ -22,7 +22,7 @@
   "native_checks": {
     "fmt": "passed",
     "clippy_all_targets": "passed",
-    "runtime": "pending repaired hosted execution",
+    "runtime": "passed hosted exact candidate: run36154571672/job108135872634",
     "first_hosted_policy_scope_tests": "13 passed, zero failures",
     "first_hosted_daemon_result": "one new test fixture failure: duplicate request ID, repaired"
   },

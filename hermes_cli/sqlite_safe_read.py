@@ -65,6 +65,7 @@ import contextlib
 import logging
 import os
 import sqlite3
+import stat
 import threading
 from pathlib import Path
 from typing import Optional
@@ -150,6 +151,7 @@ class _TrackingMixin:
     """Untrack-on-close behaviour, mixable into any Connection subclass."""
 
     _hermes_tracked_path: str | None = None
+    _hermes_tracked_identity: tuple[int, int] | None = None
 
     def close(self) -> None:  # type: ignore[misc]
         with _live_lock:
@@ -161,6 +163,7 @@ class _TrackingMixin:
             super().close()  # type: ignore[misc]
             if path is not None:
                 self._hermes_tracked_path = None
+                self._hermes_tracked_identity = None
                 untrack_connection(path)
 
 
@@ -243,6 +246,10 @@ def connect_tracked(
     kwargs["factory"] = _tracking_factory(kwargs.get("factory", sqlite3.Connection))
 
     with _live_lock:
+        # Metadata only. Opening a second raw descriptor here would cancel
+        # this process's SQLite locks when that descriptor was closed.
+        candidate = _key(tracking_path if tracking_path is not None else path)
+        before = _regular_file_identity(candidate)
         conn = opener(str(path), **kwargs)
         try:
             resolved = (
@@ -261,6 +268,11 @@ def connect_tracked(
                 # connection whose database has silently lost probe safety.
                 conn = _retrofit_tracking(conn, resolved)
             conn._hermes_tracked_path = resolved
+            after = _regular_file_identity(resolved)
+            conn._hermes_tracked_identity = (
+                after if candidate == resolved and (before is None or before == after)
+                else None
+            )
             _live_connections[resolved] = _live_connections.get(resolved, 0) + 1
             return conn
         except Exception:
@@ -271,6 +283,29 @@ def connect_tracked(
             except Exception:
                 pass
             raise
+
+
+def _regular_file_identity(path: str) -> tuple[int, int] | None:
+    try:
+        node = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return None
+    return (node.st_dev, node.st_ino) if stat.S_ISREG(node.st_mode) else None
+
+
+def connection_file_identity(conn: sqlite3.Connection) -> tuple[int, int]:
+    """Reject a replaced path without byte-probing or reopening the database.
+
+    This binds controller credentials to an observed local database file. It
+    does not detect an in-place restore or defend against an OS-level attacker.
+    Untracked, URI-only and in-memory connections cannot supply this evidence.
+    """
+    with _live_lock:
+        path = getattr(conn, "_hermes_tracked_path", None)
+        identity = getattr(conn, "_hermes_tracked_identity", None)
+        if path is None or identity is None or _regular_file_identity(path) != identity:
+            raise ValueError("CONTEXT_CONTROLLER_DATABASE_REPLACED")
+        return identity
 
 
 def _retrofit_tracking(conn: sqlite3.Connection, resolved: str) -> sqlite3.Connection:

@@ -16,11 +16,13 @@ import json
 import math
 import os
 import re
+import secrets
 import time
 from typing import Any, Dict, List, Optional
 
 from agent.context_compressor import user_originated_turn_view
 from hermes_state_common import _sql_session_last_active
+from hermes_state_context_authority import SessionContextAuthorityMixin
 
 
 _CONTEXT_REBASE_SCHEMA = "SessionDBContextRebaseV1"
@@ -281,8 +283,217 @@ class ContextRebaseSnapshot:
                  "loop_raw": self.loop_raw, "input_control_raw": self.input_control_raw}
         return "sha256:" + hashlib.sha256(_canonical(value).encode("utf-8")).hexdigest()
 
-class SessionContextContinuityMixin:
+class SessionContextContinuityMixin(SessionContextAuthorityMixin):
     """Local SessionDB continuity owner; external activation remains separate."""
+
+    def _context_controller_on_conn(self, conn, *, require_ready=True):
+        from hermes_cli.sqlite_safe_read import connection_file_identity
+
+        try:
+            observed = list(connection_file_identity(conn))
+        except ValueError:
+            raise ContextContinuationError("CONTEXT_CONTROLLER_DATABASE_REPLACED") from None
+        row = conn.execute("SELECT value FROM state_meta WHERE key='context-controller:v1'").fetchone()
+        if row is None:
+            return None
+        value = _strict_json(row[0])
+        base = {"schema", "state", "database_identity", "key_ref", "store_nonce"}
+        ready = {"public_key", "key_file_identity", "directory_identity"}
+        if (value.get("schema") != "SessionDBContextControllerV1"
+                or value.get("state") not in {"planned", "ready"}
+                or set(value) - {"native_store"} != base | (ready if value["state"] == "ready" else set())
+                or value.get("database_identity") != observed
+                or type(value.get("store_nonce")) is not list or len(value["store_nonce"]) != 32
+                or any(type(v) is not int or not 0 <= v < 256 for v in value["store_nonce"])
+                or type(value.get("key_ref")) is not str
+                or re.fullmatch(r"[0-9a-f]{64}\.key", value["key_ref"]) is None):
+            raise ContextContinuationError("CONTEXT_CONTROLLER_IDENTITY_MISMATCH")
+        if "native_store" in value:
+            from ares_runtime.continuity.authority import digest
+            digest(value["native_store"])
+        if require_ready and value["state"] != "ready":
+            raise ContextContinuationError("CONTEXT_CONTROLLER_BOOTSTRAP_PENDING")
+        return value
+
+    def read_context_controller_identity(self):
+        """Public facts only; copied stores remain readable but cannot enroll/sign."""
+        with self._lock:
+            return self._context_controller_on_conn(self._conn)
+
+    def initialize_context_controller(self):
+        """Explicit operator bootstrap. Never called by a model or ordinary turn.
+
+        Persist the exact file intent before creating its private credential.
+        An interrupted bootstrap resumes that same file and nonce. A lost
+        SQLite acknowledgement is resolved by exact owner readback.
+        """
+        from ares_runtime.continuity.credentials import (
+            controller_credential, create_controller_credential,
+        )
+        from hermes_cli.sqlite_safe_read import connection_file_identity
+
+        if self.read_only:
+            raise ContextContinuationError("CONTEXT_CONTROLLER_READ_ONLY")
+        intent = None
+
+        def reserve(conn):
+            nonlocal intent
+            prior = self._context_controller_on_conn(conn, require_ready=False)
+            if prior is not None:
+                intent = prior
+                return prior
+            intent = {"schema": "SessionDBContextControllerV1", "state": "planned",
+                      "database_identity": list(connection_file_identity(conn)),
+                      "key_ref": secrets.token_hex(32) + ".key", "store_nonce": list(secrets.token_bytes(32))}
+            conn.execute("INSERT INTO state_meta(key,value) VALUES('context-controller:v1',?)",
+                         (_canonical(intent),))
+            return intent
+
+        try:
+            identity = self._execute_write(reserve)
+        except Exception:
+            with self._lock:
+                observed = self._context_controller_on_conn(self._conn, require_ready=False)
+            if intent is None or observed != intent:
+                raise ContextContinuationError("CONTEXT_CONTROLLER_BOOTSTRAP_UNKNOWN") from None
+            identity = observed
+        if identity["state"] == "ready":
+            with controller_credential(self.db_path, identity):
+                return identity
+        facts = create_controller_credential(self.db_path, identity["key_ref"])
+        completed = {**identity, **facts, "state": "ready"}
+
+        def complete(conn):
+            current = self._context_controller_on_conn(conn, require_ready=False)
+            if current == completed:
+                return completed
+            if current != identity:
+                raise ContextContinuationError("CONTEXT_CONTROLLER_BOOTSTRAP_CONFLICT")
+            conn.execute("UPDATE state_meta SET value=? WHERE key='context-controller:v1'",
+                         (_canonical(completed),))
+            return completed
+
+        try:
+            return self._execute_write(complete)
+        except Exception:
+            if self.read_context_controller_identity() != completed:
+                raise ContextContinuationError("CONTEXT_CONTROLLER_BOOTSTRAP_UNKNOWN") from None
+            return completed
+
+    def _context_native_scope_on_conn(self, conn, session_id, holder=None):
+        _identity(session_id, "INVALID_CHILD_SESSION")
+        if holder is not None:
+            self._assert_context_rebase_lease_on_conn(conn, session_id, holder)
+        root = str(self._session_turn_lease_key_on_conn(conn, session_id))
+        row = conn.execute("SELECT profile_name,ended_at FROM sessions WHERE id=?", (session_id,)).fetchone()
+        if row is None or row["ended_at"] is not None:
+            raise ContextContinuationError("CONTEXT_AUTHORITY_SESSION_NOT_LIVE")
+        return root, str(row["profile_name"] or "default")
+
+    def export_context_authority_identity(self, session_id, *, turn_lease_holder, transport):
+        """Public grant input for the operator; never enrolls native authority."""
+        from ares_runtime.collaboration import DaemonPermitReceiptAdapter
+        from ares_runtime.continuity.authority import digest, transport as validate_transport
+
+        transport = validate_transport(transport)
+        identity = self.initialize_context_controller()
+
+        def observe(conn):
+            root, profile = self._context_native_scope_on_conn(conn, session_id, turn_lease_holder)
+            if self._context_controller_on_conn(conn) != identity:
+                raise ContextContinuationError("CONTEXT_CONTROLLER_IDENTITY_MISMATCH")
+            return root, profile
+
+        root, profile = self._execute_write(observe)
+        adapter = DaemonPermitReceiptAdapter(transport)
+        native_store = digest(adapter.context_request("context_store_identity", nonce=identity["store_nonce"])["store"])
+
+        def bind_store(conn):
+            if self._context_native_scope_on_conn(conn, session_id, turn_lease_holder) != (root, profile):
+                raise ContextContinuationError("CONTEXT_AUTHORITY_SCOPE_CHANGED")
+            current = self._context_controller_on_conn(conn)
+            if current != identity or current.get("native_store", native_store) != native_store:
+                raise ContextContinuationError("CONTEXT_CONTROLLER_IDENTITY_MISMATCH")
+            conn.execute("UPDATE state_meta SET value=? WHERE key='context-controller:v1'",
+                         (_canonical({**current, "native_store": native_store}),))
+            return {"scope": {"store": native_store, "profile": profile, "root": root},
+                    "controller_public_key": current["public_key"],
+                    "initial_head": {"context": session_id, "generation": 1, "mode": "active"}}
+
+        return self._execute_write(bind_store)
+
+    def _native_context_authority_on_conn(self, conn, session_id):
+        from ares_runtime.continuity.authority import binding, closed, digest, transport
+
+        root = str(self._session_turn_lease_key_on_conn(conn, session_id))
+        row = conn.execute("SELECT value FROM state_meta WHERE key=?", ("native-context:" + root,)).fetchone()
+        if row is None:
+            return None
+        value = closed(_strict_json(row[0]), "schema authority approval_verifier transport enrollment_snapshot")
+        if value["schema"] != "SessionDBNativeContextAuthorityV1":
+            raise ContextContinuationError("CONTEXT_AUTHORITY_SCHEMA")
+        binding(value["authority"])
+        digest(value["approval_verifier"])
+        transport(value["transport"])
+        if value["authority"]["scope"]["root"] != root:
+            raise ContextContinuationError("CONTEXT_AUTHORITY_SCOPE_CHANGED")
+        return value
+
+    def read_native_context_authority(self, session_id):
+        """Read the persisted participation requirement even when config is off."""
+        with self._read_ctx() as conn:
+            return self._native_context_authority_on_conn(conn, session_id)
+
+    def enroll_native_context_authority(self, session_id, *, turn_lease_holder, transport, incarnation):
+        """Bind an existing operator-enrolled native grant to this actual store.
+
+        First attachment requires an unused initial generation. It cannot adopt
+        a newer head, reset native charges or recover a copied database.
+        """
+        from ares_runtime.collaboration import DaemonPermitReceiptAdapter
+        from ares_runtime.continuity.authority import digest, snapshot, transport as validate_transport
+        from ares_runtime.continuity.credentials import controller_credential
+
+        transport = validate_transport(transport)
+        digest(incarnation)
+        exported = self.export_context_authority_identity(session_id, turn_lease_holder=turn_lease_holder,
+                                                          transport=transport)
+        identity = self.read_context_controller_identity()
+        adapter = DaemonPermitReceiptAdapter(transport)
+        observed = snapshot(adapter.context_request("context_authority_readback", incarnation=incarnation,
+                           scope=exported["scope"])["snapshot"], scope=exported["scope"],
+                           public_key=identity["public_key"], incarnation=incarnation)
+        record = {"schema": "SessionDBNativeContextAuthorityV1", "authority": observed["authority"],
+                  "approval_verifier": observed["approval_verifier"], "transport": transport,
+                  "enrollment_snapshot": observed}
+
+        def attach(conn):
+            root, profile = self._context_native_scope_on_conn(conn, session_id, turn_lease_holder)
+            if (self._context_controller_on_conn(conn) != identity
+                    or exported["scope"] != {"store": identity["native_store"], "root": root, "profile": profile}):
+                raise ContextContinuationError("CONTEXT_AUTHORITY_SCOPE_CHANGED")
+            prior = self._native_context_authority_on_conn(conn, session_id)
+            if prior is not None:
+                if (prior["authority"] != observed["authority"] or prior["approval_verifier"] != observed["approval_verifier"]
+                        or prior["transport"] != transport):
+                    raise ContextContinuationError("CONTEXT_AUTHORITY_ALREADY_ENROLLED")
+                return prior
+            if (observed["authority"]["head"] != exported["initial_head"]
+                    or observed["grant"]["initial_head"] != exported["initial_head"]
+                    or observed["effects_charged"] != 0 or observed["transitions_charged"] != 0
+                    or observed["consumed"]):
+                raise ContextContinuationError("CONTEXT_AUTHORITY_INITIAL_HEAD_REQUIRED")
+            conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?)",
+                         ("native-context:" + root, _canonical(record)))
+            return record
+
+        try:
+            with controller_credential(self.db_path, identity):
+                return self._execute_write(attach)
+        except Exception:
+            if self.read_native_context_authority(session_id) != record:
+                raise
+            return record
 
     def context_dispatch_required_for_session(self, session_id):
         """Continue enforcing a committed lineage when publication is disabled."""
@@ -290,6 +501,8 @@ class SessionContextContinuityMixin:
         with self._read_ctx() as conn:
             conn.execute("SAVEPOINT context_dispatch_required")
             try:
+                if self._native_context_authority_on_conn(conn, session_id) is not None:
+                    return True
                 if self._context_input_control_on_conn(conn, session_id) is not None:
                     return True
                 for sid in self._context_rebase_lineage_on_conn(conn, session_id):
@@ -829,7 +1042,7 @@ class SessionContextContinuityMixin:
             raise ContextContinuationError("CONTEXT_REBASE_USER_ANCHOR_MISSING")
 
         event_rows = conn.execute(
-            "SELECT id,role,content,tool_name,tool_call_id,effect_disposition,observed,"
+            "SELECT id,role,content,tool_name,tool_call_id,tool_calls,effect_disposition,observed,"
             "finish_reason,timestamp,_compressed_summary "
             "FROM messages WHERE session_id=? AND active=1 AND id>? "
             "ORDER BY id DESC LIMIT ?",
@@ -841,6 +1054,7 @@ class SessionContextContinuityMixin:
             "content": self._decode_content(row["content"]),
             "tool_name": row["tool_name"],
             "tool_call_id": row["tool_call_id"],
+            "tool_calls": row["tool_calls"],
             "effect_disposition": row["effect_disposition"],
             "observed": bool(row["observed"]),
             "finish_reason": row["finish_reason"],
@@ -971,6 +1185,7 @@ class SessionContextContinuityMixin:
 
         def write(conn):
             self._assert_context_rebase_lease_on_conn(conn, session_id, turn_lease_holder)
+            self._assert_native_context_dispatch_on_conn(conn, session_id)
             snapshot = self._read_context_rebase_snapshot_on_conn(conn, session_id)
             if snapshot.has_pending_inputs:
                 raise ContextContinuationError("CONTEXT_DISPATCH_INPUT_PENDING")
@@ -1077,23 +1292,60 @@ class SessionContextContinuityMixin:
         """
         _identity(attempt_id, "INVALID_DISPATCH_ATTEMPT")
 
-        def check(conn):
-            row = conn.execute("SELECT value FROM state_meta WHERE key=?", ("context-dispatch:" + attempt_id,)).fetchone()
-            result = conn.execute("SELECT value FROM state_meta WHERE key=?", ("context-dispatch-result:" + attempt_id,)).fetchone()
-            if row is None or result is None:
-                raise ContextContinuationError("CONTEXT_TOOL_RESPONSE_NOT_ADMITTED")
-            admitted, settled = _strict_json(row[0]), _strict_json(result[0])
-            if (admitted.get("session_id") != session_id
-                    or settled.get("disposition") != "response_received"
-                    or settled.get("payload_digest") != admitted.get("payload_digest")):
-                raise ContextContinuationError("CONTEXT_TOOL_RESPONSE_NOT_ADMITTED")
+        self._execute_write(lambda conn: self._assert_context_dispatch_control_on_conn(
+            conn, attempt_id, session_id, turn_lease_holder))
+
+    def _assert_context_dispatch_control_on_conn(self, conn, attempt_id, session_id, holder):
+        _identity(attempt_id, "INVALID_DISPATCH_ATTEMPT")
+        self._assert_native_context_dispatch_on_conn(conn, session_id)
+        row = conn.execute("SELECT value FROM state_meta WHERE key=?", ("context-dispatch:" + attempt_id,)).fetchone()
+        result = conn.execute("SELECT value FROM state_meta WHERE key=?", ("context-dispatch-result:" + attempt_id,)).fetchone()
+        if row is None or result is None:
+            raise ContextContinuationError("CONTEXT_TOOL_RESPONSE_NOT_ADMITTED")
+        admitted, settled = _strict_json(row[0]), _strict_json(result[0])
+        if (admitted.get("session_id") != session_id
+                or settled.get("disposition") != "response_received"
+                or settled.get("payload_digest") != admitted.get("payload_digest")):
+            raise ContextContinuationError("CONTEXT_TOOL_RESPONSE_NOT_ADMITTED")
+        self._assert_context_rebase_lease_on_conn(conn, session_id, holder)
+        current = self._read_context_rebase_snapshot_on_conn(conn, session_id)
+        if current.action_control_digest != admitted.get("action_control_digest"):
+            raise ContextContinuationError("CONTEXT_TOOL_CONTROL_SUPERSEDED")
+        if current.has_unresolved_effects:
+            raise ContextContinuationError("CONTEXT_DISPATCH_UNRESOLVED_EFFECTS")
+
+    def sign_native_context_call(self, *, session_id, turn_lease_holder, attempt_id, registration, witness):
+        """Sign only for this settled response and captured native generation."""
+        from ares_runtime.collaboration import DaemonPermitReceiptAdapter
+        from ares_runtime.continuity.authority import signing_material, snapshot
+        from ares_runtime.continuity.credentials import controller_credential
+
+        identity = self.read_context_controller_identity()
+        if identity is None:
+            raise ContextContinuationError("CONTEXT_CONTROLLER_NOT_INITIALIZED")
+        authority = registration["authority"]
+        adapter = DaemonPermitReceiptAdapter(registration["transport"])
+        observed = snapshot(adapter.context_request("context_authority_readback", incarnation=authority["incarnation"],
+                            scope=authority["scope"])["snapshot"], scope=authority["scope"],
+                            public_key=identity["public_key"], incarnation=authority["incarnation"], expected=authority)
+        if observed["approval_verifier"] != registration["approval_verifier"]:
+            raise ContextContinuationError("CONTEXT_APPROVAL_VERIFIER_CHANGED")
+        prepared = adapter.context_request("context_call_prepare", authority=authority, witness=witness)
+        material, raw = signing_material(prepared, authority=authority)
+
+        def sign(conn):
+            self._assert_context_dispatch_control_on_conn(conn, attempt_id, session_id, turn_lease_holder)
+            root, profile = self._context_native_scope_on_conn(conn, session_id, turn_lease_holder)
+            current = self._native_context_authority_on_conn(conn, session_id)
+            if (current != registration or self._context_controller_on_conn(conn) != identity
+                    or authority["scope"] != {"store": identity.get("native_store"), "profile": profile, "root": root}
+                    or authority["head"]["context"] != session_id or authority["head"]["mode"] != "active"):
+                raise ContextContinuationError("CONTEXT_AUTHORITY_GENERATION_CHANGED")
             self._assert_context_rebase_lease_on_conn(conn, session_id, turn_lease_holder)
-            current = self._read_context_rebase_snapshot_on_conn(conn, session_id)
-            if current.action_control_digest != admitted.get("action_control_digest"):
-                raise ContextContinuationError("CONTEXT_TOOL_CONTROL_SUPERSEDED")
-            if current.has_unresolved_effects:
-                raise ContextContinuationError("CONTEXT_DISPATCH_UNRESOLVED_EFFECTS")
-        self._execute_write(check)
+            return {**material, "signature": list(key.sign(raw))}
+
+        with controller_credential(self.db_path, identity) as key:
+            return self._execute_write(sign)
 
     def read_context_rebase_transition(self, transition_id: str) -> Optional[ContextRebaseTransition]:
         raw = self.get_meta(self._context_rebase_key(transition_id))
@@ -1135,6 +1387,8 @@ class SessionContextContinuityMixin:
         self, session_id: str
     ) -> Optional[ContextRebaseTransition]:
         """Fail closed when a committed successor is not READY for normal work."""
+        with self._read_ctx() as conn:
+            self._assert_native_context_dispatch_on_conn(conn, session_id)
         transition = self.context_rebase_transition_for_session(session_id)
         if transition is None:
             return None
@@ -1286,6 +1540,11 @@ class SessionContextContinuityMixin:
             "input_watermark": input_watermark,
         }
 
+        self.retire_native_context_for_rebase(transition_id=transition_id,
+            parent_session_id=parent_session_id, child_session_id=child_session_id,
+            continuation_digest=continuation_digest, expected_snapshot_digest=expected_snapshot_digest,
+            snapshot_read_limits=snapshot_read_limits, turn_lease_holder=turn_lease_holder)
+
         def _do(conn):
             prior_row = conn.execute("SELECT value FROM state_meta WHERE key=?", (key,)).fetchone()
             if prior_row is not None:
@@ -1309,6 +1568,8 @@ class SessionContextContinuityMixin:
                    FROM sessions WHERE id=?""",
                 (parent_session_id,),
             ).fetchone()
+            self._assert_native_rebase_publication_on_conn(conn, parent_session_id, child_session_id,
+                                                         transition_id, continuation_digest)
             if parent is None:
                 raise ContextContinuationError("CONTEXT_REBASE_PARENT_MISSING")
             if parent["ended_at"] is not None or parent["end_reason"] is not None:
@@ -1430,7 +1691,7 @@ class SessionContextContinuityMixin:
                 "next_check_at": now,
                 "deadline_at": now + 900,
             }
-            conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?)", (
+            conn.execute("INSERT OR IGNORE INTO state_meta(key,value) VALUES(?,?)", (
                 _CONTEXT_REBASE_RECOVERY_PREFIX + transition_id, _canonical(recovery),
             ))
             return transition, row_ids
@@ -1538,6 +1799,7 @@ class SessionContextContinuityMixin:
             self._check_context_ready_custodies_on_conn(
                 conn, old.child_session_id, expected_custody, turn_lease_holder,
             )
+            self._assert_native_context_dispatch_on_conn(conn, old.child_session_id)
             recovery["completed_attempt"] = recovery_attempt
             conn.execute("UPDATE state_meta SET value=? WHERE key=?", (_canonical(recovery), recovery_key))
             child = conn.execute("SELECT ended_at,model_config FROM sessions WHERE id=?", (old.child_session_id,)).fetchone()
