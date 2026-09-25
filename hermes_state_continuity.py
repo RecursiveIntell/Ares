@@ -203,6 +203,7 @@ class ContextRebaseSnapshot:
     current_users: tuple[Dict[str, Any], ...]
     latest_summary: Optional[Dict[str, Any]]
     recent_events: tuple[Dict[str, Any], ...]
+    unresolved_effects: tuple[Dict[str, Any], ...]
     goal_raw: Optional[str]
     todo_json: Optional[str]
 
@@ -320,7 +321,12 @@ class SessionContextContinuityMixin:
         )
 
     def read_context_rebase_snapshot(
-        self, session_id: str, *, recent_limit: int = 12, user_limit: int = 32
+        self,
+        session_id: str,
+        *,
+        recent_limit: int = 12,
+        user_limit: int = 32,
+        unresolved_effect_limit: int = 32,
     ) -> ContextRebaseSnapshot:
         """Read one bounded compilation snapshot under a single SQLite read context."""
         _identity(session_id, "INVALID_PARENT_SESSION")
@@ -328,6 +334,11 @@ class SessionContextContinuityMixin:
             raise ContextContinuationError("INVALID_RECENT_LIMIT")
         if type(user_limit) is not int or not 1 <= user_limit <= 128:
             raise ContextContinuationError("INVALID_USER_LIMIT")
+        if (
+            type(unresolved_effect_limit) is not int
+            or not 1 <= unresolved_effect_limit <= 128
+        ):
+            raise ContextContinuationError("INVALID_UNRESOLVED_EFFECT_LIMIT")
 
         with self._read_ctx() as conn:
             session = conn.execute(
@@ -429,7 +440,8 @@ class SessionContextContinuityMixin:
                 raise ContextContinuationError("CONTEXT_REBASE_USER_ANCHOR_MISSING")
 
             event_rows = conn.execute(
-                "SELECT id,role,content,tool_name,tool_call_id,finish_reason,timestamp,_compressed_summary "
+                "SELECT id,role,content,tool_name,tool_call_id,effect_disposition,observed,"
+                "finish_reason,timestamp,_compressed_summary "
                 "FROM messages WHERE session_id=? AND active=1 AND id>? "
                 "ORDER BY id DESC LIMIT ?",
                 (session_id, summary_id, recent_limit),
@@ -440,10 +452,41 @@ class SessionContextContinuityMixin:
                 "content": self._decode_content(row["content"]),
                 "tool_name": row["tool_name"],
                 "tool_call_id": row["tool_call_id"],
+                "effect_disposition": row["effect_disposition"],
+                "observed": bool(row["observed"]),
                 "finish_reason": row["finish_reason"],
                 "timestamp": row["timestamp"],
                 "compressed_summary": bool(row["_compressed_summary"]),
             } for row in reversed(event_rows))
+
+            unresolved_effects_list = []
+            for sid in reversed(lineage):
+                rows = conn.execute(
+                    "SELECT id,role,content,tool_name,tool_call_id,effect_disposition,"
+                    "observed,finish_reason,timestamp,_compressed_summary "
+                    "FROM messages WHERE session_id=? AND active=1 AND role='tool' "
+                    "AND effect_disposition='unknown' ORDER BY id ASC LIMIT ?",
+                    (sid, unresolved_effect_limit + 1),
+                ).fetchall()
+                for row in rows:
+                    unresolved_effects_list.append({
+                        "row_id": int(row["id"]),
+                        "session_id": sid,
+                        "role": row["role"],
+                        "content": self._decode_content(row["content"]),
+                        "tool_name": row["tool_name"],
+                        "tool_call_id": row["tool_call_id"],
+                        "effect_disposition": row["effect_disposition"],
+                        "observed": bool(row["observed"]),
+                        "finish_reason": row["finish_reason"],
+                        "timestamp": row["timestamp"],
+                        "compressed_summary": bool(row["_compressed_summary"]),
+                    })
+                    if len(unresolved_effects_list) > unresolved_effect_limit:
+                        raise ContextContinuationError(
+                            "TOO_MANY_UNRESOLVED_EFFECTS"
+                        )
+            unresolved_effects = tuple(unresolved_effects_list)
 
             goal_row = conn.execute(
                 "SELECT value FROM state_meta WHERE key=?", (f"goal:{session_id}",),
@@ -462,7 +505,8 @@ class SessionContextContinuityMixin:
             return ContextRebaseSnapshot(
                 session_id, str(root), session["profile_name"], session["cwd"],
                 session["git_branch"], session["git_repo_root"], watermark,
-                first_user, current_users, latest_summary, recent_events, goal_raw, todo_json,
+                first_user, current_users, latest_summary, recent_events,
+                unresolved_effects, goal_raw, todo_json,
             )
 
     def read_context_rebase_transition(self, transition_id: str) -> Optional[ContextRebaseTransition]:
