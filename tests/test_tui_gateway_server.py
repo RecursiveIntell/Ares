@@ -9160,6 +9160,242 @@ def test_config_set_verbose_updates_session_mode_and_agent(tmp_path, monkeypatch
 
 
 
+def test_config_set_model_missing_explicit_runtime_never_becomes_global_write(monkeypatch):
+    calls = []
+    monkeypatch.setattr(server, "_apply_model_switch", lambda *_a, **_kw: calls.append(True))
+    resp = server.handle_request({"id": "missing", "method": "config.set", "params": {
+        "session_id": "stale-runtime", "key": "model",
+        "value": "new/model --provider openai-codex --global"}})
+    assert resp["error"]["code"] == 4001
+    assert calls == []
+
+
+def test_config_set_model_stages_cold_resumed_host_session_before_first_turn(monkeypatch):
+    parent_agent = types.SimpleNamespace(model="old/model", provider="old-provider")
+    session = _session(agent=parent_agent)
+    session.update(agent_ready=threading.Event(), running=False, session_key="stored-goal")
+    server._sessions["cold-runtime"] = session
+    monkeypatch.setattr(server, "_load_dashboard_process_isolation_config", lambda: {"turn_isolation": True})
+    host_calls = []
+    def no_child_control(*_args, **_kwargs):
+        host_calls.append(True)
+        return {"type": "control.error", "message": "session not found"}
+    monkeypatch.setattr(server, "_send_compute_host_control", no_child_control)
+    staged = []
+    def bind(_sid, detached, raw, **_kwargs):
+        staged.append((detached.get("agent"), raw))
+        detached["model_override"] = {"model": "new/model", "provider": "openai-codex"}
+        return {"value": "new/model", "warning": "", "scope": "session"}
+    monkeypatch.setattr(server, "_apply_model_switch", bind)
+    try:
+        resp = server.handle_request({"id": "cold", "method": "config.set", "params": {
+            "session_id": "cold-runtime", "key": "model",
+            "value": "new/model --provider openai-codex --session"}})
+        assert resp.get("result", {}).get("value") == "new/model", resp
+        assert host_calls == [], "the host has no child record until turn.start"
+        assert staged == [(None, "new/model --provider openai-codex --session")]
+        assert session["model_override"]["model"] == "new/model"
+        assert (parent_agent.model, parent_agent.provider) == ("old/model", "old-provider")
+        info = server._session_info(parent_agent, session)
+        assert (info["model"], info["provider"]) == ("new/model", "openai-codex")
+        assert server._compute_host_turn_frame("first", "cold-runtime", session, "user")["model_override"]["model"] == "new/model"
+    finally:
+        server._sessions.pop("cold-runtime", None)
+
+
+def test_model_options_uses_staged_prehost_override_not_parent_agent(monkeypatch):
+    from hermes_cli.inventory import ConfigContext
+
+    parent_agent = types.SimpleNamespace(model="old/model", provider="old-provider",
+                                         base_url="https://old-parent.invalid")
+    session = _session(agent=parent_agent)
+    session.update(agent_ready=threading.Event(), running=False, session_key="stored-goal",
+                   model_override={"model": "new/model", "provider": "openai-codex", "base_url": ""})
+    server._sessions["cold-runtime"] = session
+    monkeypatch.setattr(server, "_load_dashboard_process_isolation_config", lambda: {"turn_isolation": True})
+    monkeypatch.setattr("hermes_cli.inventory.load_picker_context", lambda: ConfigContext(
+        current_provider="global-provider", current_model="global-model",
+        current_base_url="https://global.invalid", user_providers={}, custom_providers=[]))
+    monkeypatch.setattr("hermes_cli.inventory.build_model_options_payload",
+                        lambda ctx, **_kw: {"current_model": ctx.current_model,
+                                            "current_provider": ctx.current_provider,
+                                            "current_base_url": ctx.current_base_url})
+    try:
+        resp = server._methods["model.options"]("options", {"session_id": "cold-runtime"})
+        assert resp["result"] == {"current_model": "new/model", "current_provider": "openai-codex",
+                                  "current_base_url": ""}
+        assert (parent_agent.model, parent_agent.provider) == ("old/model", "old-provider")
+    finally:
+        server._sessions.pop("cold-runtime", None)
+
+
+def test_cold_resumed_implicit_provider_uses_selected_session_override(monkeypatch):
+    session = _session(agent=None)
+    session.update(agent_ready=threading.Event(), running=False, session_key="stored-goal",
+                   model_override={"model": "old/session", "provider": "anthropic",
+                                   "base_url": "https://session.invalid", "api_key": "fixture-only"})
+    server._sessions["cold-runtime"] = session
+    monkeypatch.setattr(server, "_load_dashboard_process_isolation_config", lambda: {"turn_isolation": True})
+    monkeypatch.setattr(server, "_resolve_model", lambda: "global/default")
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider",
+                        lambda **_kw: {"provider": "global-provider", "base_url": "https://global.invalid"})
+    monkeypatch.setattr("hermes_cli.model_selection_guards.combined_selection_warning", lambda *_a, **_kw: None)
+    seen = []
+    def resolve(**kwargs):
+        seen.append(kwargs)
+        return types.SimpleNamespace(success=True, new_model="new/session",
+                                     target_provider="anthropic", api_key="fixture-only",
+                                     base_url="https://session.invalid", api_mode="chat_completions",
+                                     warning_message="", model_info=None)
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", resolve)
+    try:
+        resp = server.handle_request({"id": "implicit", "method": "config.set", "params": {
+            "session_id": "cold-runtime", "key": "model", "value": "new/session --session"}})
+        assert resp.get("result", {}).get("value") == "new/session", resp
+        assert seen[0]["current_model"] == "old/session"
+        assert seen[0]["current_provider"] == "anthropic"
+        assert seen[0]["current_base_url"] == "https://session.invalid"
+        assert session["model_override"]["model"] == "new/session"
+    finally:
+        server._sessions.pop("cold-runtime", None)
+
+
+def test_cold_resumed_invalid_pick_preserves_session_and_profile(monkeypatch):
+    session = _session(agent=None)
+    existing = {"model": "old/session", "provider": "openai-codex"}
+    session.update(agent_ready=threading.Event(), running=False, session_key="stored-goal",
+                   model_override=existing)
+    server._sessions["cold-runtime"] = session
+    monkeypatch.setattr(server, "_load_dashboard_process_isolation_config", lambda: {"turn_isolation": True})
+    monkeypatch.setattr(server, "_send_compute_host_control", lambda *_a, **_kw: pytest.fail("child absent"))
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", lambda **_kw: types.SimpleNamespace(
+        success=False, error_message="invalid selected model"))
+    writes = []
+    monkeypatch.setattr(server, "_persist_model_switch", lambda result: writes.append(result))
+    try:
+        resp = server.handle_request({"id": "invalid", "method": "config.set", "params": {
+            "session_id": "cold-runtime", "key": "model",
+            "value": "invalid/model --provider openai-codex --global"}})
+        assert resp["error"]["code"] == 5001
+        assert session["model_override"] is existing
+        assert writes == []
+    finally:
+        server._sessions.pop("cold-runtime", None)
+
+
+@pytest.mark.parametrize("scope,global_writes", [("--session", 0), ("--global", 1)])
+def test_cold_resumed_model_pick_preserves_explicit_scope(monkeypatch, scope, global_writes):
+    session = _session(agent=None)
+    session.update(agent_ready=threading.Event(), running=False, session_key="stored-goal")
+    server._sessions["cold-runtime"] = session
+    monkeypatch.setattr(server, "_load_dashboard_process_isolation_config", lambda: {"turn_isolation": True})
+    monkeypatch.setattr(server, "_send_compute_host_control", lambda *_a, **_kw: pytest.fail("child absent"))
+    result = types.SimpleNamespace(success=True, new_model="new/model", target_provider="openai-codex",
+                                   api_key="", base_url="", api_mode="codex_responses", model_info=None,
+                                   warning_message="")
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", lambda **_kw: result)
+    monkeypatch.setattr("hermes_cli.model_selection_guards.combined_selection_warning", lambda *_a, **_kw: None)
+    persisted = []
+    monkeypatch.setattr(server, "_persist_model_switch", lambda pick: persisted.append(pick))
+    try:
+        resp = server.handle_request({"id": "scope", "method": "config.set", "params": {
+            "session_id": "cold-runtime", "key": "model",
+            "value": f"new/model --provider openai-codex {scope}"}})
+        assert resp.get("result", {}).get("scope") == scope[2:], resp
+        assert session["model_override"]["model"] == "new/model"
+        assert len(persisted) == global_writes
+    finally:
+        server._sessions.pop("cold-runtime", None)
+
+
+def test_cold_model_pick_serializes_with_first_turn_admission(monkeypatch):
+    session = _session(agent=None)
+    session.update(agent_ready=threading.Event(), running=False, session_key="stored-goal")
+    server._sessions["cold-runtime"] = session
+    monkeypatch.setattr(server, "_load_dashboard_process_isolation_config", lambda: {"turn_isolation": True})
+    started = threading.Event()
+    release = threading.Event()
+    frame_started = threading.Event()
+    selected = []
+    frames = []
+    def validate(_sid, detached, _raw, **_kw):
+        started.set()
+        assert release.wait(2)
+        detached["model_override"] = {"model": "new/model", "provider": "openai-codex"}
+        return {"value": "new/model", "warning": "", "scope": "session"}
+    monkeypatch.setattr(server, "_apply_model_switch", validate)
+    def pick():
+        selected.append(server.handle_request({"id": "pick", "method": "config.set", "params": {
+            "session_id": "cold-runtime", "key": "model",
+            "value": "new/model --provider openai-codex --session"}}))
+    def admit():
+        frame_started.set()
+        with session["history_lock"]:
+            session["running"] = True
+        frames.append(server._compute_host_turn_frame("first", "cold-runtime", session, "user"))
+    pick_thread = threading.Thread(target=pick, daemon=True)
+    turn_thread = threading.Thread(target=admit, daemon=True)
+    try:
+        pick_thread.start()
+        assert started.wait(1)
+        turn_thread.start()
+        assert frame_started.wait(1)
+        assert not frames
+    finally:
+        release.set()
+        pick_thread.join(timeout=2)
+        turn_thread.join(timeout=2)
+        server._sessions.pop("cold-runtime", None)
+    assert not pick_thread.is_alive() and not turn_thread.is_alive()
+    assert selected[0]["result"]["value"] == "new/model"
+    assert frames[0]["model_override"]["model"] == "new/model"
+
+
+def test_config_set_model_refuses_host_owner_adopted_before_prehost_commit(monkeypatch):
+    session = _session(agent=None)
+    session.update(agent_ready=threading.Event(), running=False, session_key="stored-goal")
+    class OwnerFlipLock:
+        def __init__(self):
+            self.lock = threading.Lock()
+            self.flipped = False
+        def __enter__(self):
+            self.lock.acquire()
+            if not self.flipped:
+                session["_compute_host_active"] = True
+                self.flipped = True
+        def __exit__(self, *_exc):
+            self.lock.release()
+    session["history_lock"] = OwnerFlipLock()
+    server._sessions["cold-runtime"] = session
+    monkeypatch.setattr(server, "_load_dashboard_process_isolation_config", lambda: {"turn_isolation": True})
+    monkeypatch.setattr(server, "_apply_model_switch", lambda *_a, **_kw: pytest.fail("staged on changed owner"))
+    try:
+        resp = server.handle_request({"id": "changed", "method": "config.set", "params": {
+            "session_id": "cold-runtime", "key": "model",
+            "value": "new/model --provider openai-codex --session"}})
+        assert resp["error"]["code"] == 5032
+        assert session.get("model_override") is None
+    finally:
+        server._sessions.pop("cold-runtime", None)
+
+
+def test_config_set_model_refuses_accepted_prehost_turn_without_staging(monkeypatch):
+    session = _session(agent=None)
+    session.update(agent_ready=threading.Event(), running=True, session_key="stored-goal")
+    server._sessions["cold-runtime"] = session
+    monkeypatch.setattr(server, "_load_dashboard_process_isolation_config", lambda: {"turn_isolation": True})
+    monkeypatch.setattr(server, "_apply_model_switch", lambda *_a, **_kw: pytest.fail("mutated accepted turn"))
+    monkeypatch.setattr(server, "_send_compute_host_control", lambda *_a, **_kw: pytest.fail("host child not resident"))
+    try:
+        resp = server.handle_request({"id": "busy", "method": "config.set", "params": {
+            "session_id": "cold-runtime", "key": "model",
+            "value": "new/model --provider openai-codex --session"}})
+        assert resp["error"]["code"] == 5032
+        assert session.get("model_override") is None
+    finally:
+        server._sessions.pop("cold-runtime", None)
+
+
 def test_config_set_model_waits_for_lazy_agent_before_switch(monkeypatch):
     """A model switch against a lazy-created live session must apply to the
     real agent, not just process env, before the prompt is dispatched.

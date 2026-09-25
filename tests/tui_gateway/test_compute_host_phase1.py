@@ -649,6 +649,7 @@ def test_isolated_model_switch_is_applied_by_the_compute_host_owner(monkeypatch)
     session = {
         "agent": types.SimpleNamespace(model="old", provider="old-provider"),
         "agent_ready": threading.Event(),
+        "_compute_host_active": True,
         "history": [],
         "history_lock": threading.Lock(),
         "running": False,
