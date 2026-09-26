@@ -555,6 +555,7 @@ class ComputeHost:
                     "interrupted": interrupted,
                     "ended_ns": now_ns(),
                     "session_info": session_info,
+                    "model_override": session.get("model_override"),
                     "session_info_emitted": True,
                 }
             )
@@ -608,6 +609,16 @@ class ComputeHost:
                 # _make_agent that RAISES is the one path where nothing takes it.
                 session_db = SessionDB(db_path=Path(profile_home) / "state.db")
                 owns_db = True
+            # The serving gateway only mirrors host metadata. After a host
+            # restart its snapshot history can be older than the committed
+            # conversation, so restore the model-facing history from state.db.
+            history_db = session_db if session_db is not None else server._get_db()
+            if history_db.get_session(key) is not None:
+                persisted_history = history_db.get_messages_as_conversation(
+                    key, repair_alternation=True, include_row_ids=True
+                )
+                if persisted_history:
+                    history = server.sanitize_replay_history(persisted_history)
             agent = server._make_agent(
                 sid,
                 key,
@@ -711,8 +722,15 @@ class ComputeHost:
                 return
             session = server._sessions.get(sid)
             if session is None:
-                self.emit({"type": "control.error", "sid": sid, "request_id": request_id, "message": "session not found"})
-                return
+                snapshot = frame.get("session_snapshot")
+                if route_name == "config.set.model" and isinstance(snapshot, dict) and snapshot.get("sid") == sid:
+                    # A new draft has no host session until its first turn.
+                    # Rebuild from the serving gateway's committed snapshot;
+                    # this also repairs a host restart before another turn.
+                    session = self._ensure_server_session(server, snapshot)
+                else:
+                    self.emit({"type": "control.error", "sid": sid, "request_id": request_id, "message": "session not found"})
+                    return
             if route == "idle-gated" and session.get("running"):
                 self.emit({"type": "control.error", "sid": sid, "request_id": request_id, "message": "session busy"})
                 return
@@ -761,6 +779,7 @@ class ComputeHost:
                         "request_id": request_id,
                         "route_name": route_name,
                         "result": response.get("result") or {},
+                        "model_override": session.get("model_override"),
                         "session_info": server._session_info(session.get("agent"), session),
                     }
                 )

@@ -2423,6 +2423,22 @@ def _session_uses_compute_host(session: dict, cfg: dict | None = None) -> bool:
     return bool(session.get("_compute_host_active")) or session.get("agent_ready") is not None
 
 
+def _on_compute_host_crash() -> None:
+    # A restarted host recognizes no old runtime IDs until they are rebuilt.
+    # Keep the model override for reconstruction, but revoke readiness now.
+    with _sessions_lock:
+        affected = [
+            (sid, session)
+            for sid, session in _sessions.items()
+            if session.get("_compute_host_active")
+        ]
+    for sid, session in affected:
+        mirror = dict(_metadata_mirror(session))
+        mirror["model_ready"] = False
+        session["_metadata_mirror"] = mirror
+        _emit("session.info", sid, _session_info(session.get("agent"), session))
+
+
 def _get_compute_host_supervisor(cfg: dict | None = None):
     global _compute_host_supervisor
     isolation_cfg = cfg or _load_dashboard_process_isolation_config()
@@ -2432,6 +2448,7 @@ def _get_compute_host_supervisor(cfg: dict | None = None):
 
             _compute_host_supervisor = HostSupervisor(
                 rpc_sink=write_json,
+                on_crash=_on_compute_host_crash,
                 heartbeat_secs=int(isolation_cfg.get("compute_host_heartbeat_secs") or 15),
                 respawn_max=int(isolation_cfg.get("compute_host_respawn_max") or 3),
             )
@@ -2493,6 +2510,9 @@ def _apply_compute_host_metadata_mirror(session: dict, frame: dict | None) -> No
     if not isinstance(frame, dict):
         return
     with session.get("history_lock", threading.Lock()):
+        # An acknowledged host switch must survive a later host restart.
+        if "model_override" in frame:
+            session["model_override"] = frame["model_override"]
         if frame.get("session_key"):
             session["session_key"] = str(frame.get("session_key"))
         if frame.get("history_version") is not None:
@@ -2533,6 +2553,9 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
         session["last_active"] = time.time()
         _clear_inflight_turn(session)
     if is_error:
+        mirror = dict(_metadata_mirror(session))
+        mirror["model_ready"] = False
+        session["_metadata_mirror"] = mirror
         message = str(frame.get("message") or "compute host turn failed")
         _emit("message.complete", sid, {"text": f"Error: {message}", "status": "error"})
     _apply_compute_host_metadata_mirror(session, frame)
@@ -6023,7 +6046,6 @@ def _apply_model_switch(
         _append_model_switch_marker(
             session, model=result.new_model, provider=result.target_provider
         )
-        _emit("session.info", sid, _session_info(agent, session))
         if one_turn:
             session["one_turn_model_restore"] = restore_snapshot
         else:
@@ -6050,6 +6072,13 @@ def _apply_model_switch(
             "api_key": result.api_key,
             "api_mode": result.api_mode,
         }
+    if isinstance(session, dict):
+        session.pop("model_verified_for", None)
+        mirror = session.get("_metadata_mirror")
+        if isinstance(mirror, dict):
+            mirror["model_ready"] = False
+    if agent:
+        _emit("session.info", sid, _session_info(agent, session))
     if persist_global:
         _persist_model_switch(result)
     return {
@@ -7018,10 +7047,34 @@ def _session_info(agent, session: dict | None = None) -> dict:
         else None
     )
 
+    effective_model = pending_model or mirror.get("model", getattr(agent, "model", ""))
+    effective_provider = pending_provider or mirror.get("provider", getattr(agent, "provider", ""))
+    if not effective_model:
+        effective_model = _resolve_model()
+    if not effective_provider:
+        model_cfg = _load_cfg().get("model") or {}
+        effective_provider = str(model_cfg.get("provider") or "") if isinstance(model_cfg, dict) else ""
+    if session is not None and not session.get("_compute_host_active"):
+        override = session.get("model_override")
+        if isinstance(override, dict) and override.get("model"):
+            effective_model = override["model"]
+            effective_provider = override.get("provider") or effective_provider
+    identity = (str(effective_provider or ""), str(effective_model or ""))
+    model_ready = bool(
+        session is not None
+        and not pending_model
+        and (
+            bool(mirror.get("model_ready"))
+            if session.get("_compute_host_active")
+            else session.get("model_verified_for") == identity
+        )
+    )
+
     info: dict = {
-        "model": pending_model or mirror.get("model", getattr(agent, "model", "")),
-        "provider": pending_provider
-        or mirror.get("provider", getattr(agent, "provider", "")),
+        "session_id": next((sid for sid, record in _sessions.items() if record is session), ""),
+        "model": effective_model,
+        "provider": effective_provider,
+        "model_ready": model_ready,
         "reasoning_effort": reasoning_effort,
         "service_tier": service_tier,
         "fast": service_tier == "priority",
@@ -9888,6 +9941,7 @@ def _emit_terminal_turn_error(
             error_surface = None
     with session["history_lock"]:
         _fail_inflight_turn(session, error, error_surface=error_surface)
+        session.pop("model_verified_for", None)
         turn = session.get("inflight_turn") or {}
         message = str(turn.get("error") or "turn failed")
         partial = str(turn.get("assistant") or "")
@@ -9912,6 +9966,7 @@ def _emit_terminal_turn_error(
         payload["rendered"] = rendered
     _retire_turn_marker(session)
     _emit("message.complete", sid, payload)
+    _emit("session.info", sid, _session_info(agent, session))
 
 
 def _restore_agent_history_after_turn_error(session: dict, agent) -> bool:
@@ -9951,6 +10006,7 @@ def _queued_prompt_snapshot(session: dict) -> dict | None:
 def _lazy_resume_info(
     cwd: str,
     *,
+    session_id: str = "",
     model: str = "",
     provider: str = "",
     profile: str | None = None,
@@ -9958,6 +10014,8 @@ def _lazy_resume_info(
     """session.info for a not-yet-built session (the shape session.create
     returns). tools/skills land later when the deferred build emits session.info."""
     info = {
+        "session_id": session_id,
+        "model_ready": False,
         "cwd": cwd,
         "branch": _git_branch_for_cwd(cwd),
         "project": _project_info_for_cwd(cwd),
@@ -9968,8 +10026,7 @@ def _lazy_resume_info(
         "desktop_contract": DESKTOP_BACKEND_CONTRACT,
         "profile_name": _response_profile_name(profile),
     }
-    if provider:
-        info["provider"] = provider
+    info["provider"] = provider
     return info
 
 
@@ -10346,7 +10403,7 @@ def _find_live_session_by_key(session_key: str) -> tuple[str, dict] | None:
 def _fallback_session_info(session: dict) -> dict:
     agent = session.get("agent")
     if agent is not None:
-        return _session_info(agent)
+        return _session_info(agent, session)
     # The SESSION's own workspace, not the gateway's launch directory. Reporting
     # `_default_session_cwd()` here told a lazily-resumed session's client that
     # its workspace was wherever the gateway process happened to start, so the
@@ -10355,12 +10412,13 @@ def _fallback_session_info(session: dict) -> dict:
     # repo) so a client can clear a stale label instead of retaining it — the
     # same contract `_lazy_session_info` above already follows.
     cwd = _session_cwd(session)
+    info = _session_info(None, session)
     return {
+        **info,
         "cwd": cwd,
         "branch": _git_branch_for_cwd(cwd),
         "project": _project_info_for_cwd(cwd),
         "lazy": True,
-        "model": _resolve_model(),
         "skills": {},
         "tools": {},
         # A lazy session (agent not built yet) is still served by *this* backend,
@@ -12829,6 +12887,13 @@ def _run_prompt_submit(
                     turn_error_retained = True
                 else:
                     _clear_inflight_turn(session)
+                if status == "complete":
+                    session["model_verified_for"] = (
+                        str(getattr(agent, "provider", "") or ""),
+                        str(getattr(agent, "model", "") or ""),
+                    )
+                elif status == "error":
+                    session.pop("model_verified_for", None)
             if status == "error":
                 payload["error"] = str(
                     (result.get("error") if isinstance(result, dict) else "") or raw
@@ -12838,6 +12903,7 @@ def _run_prompt_submit(
                     payload["error_surface"] = _error_surface
             _retire_turn_marker(session, marker_key)
             _emit("message.complete", sid, payload)
+            _emit("session.info", sid, _session_info(agent, session))
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
             # After every TUI turn, if a /goal is active, ask the judge
@@ -13574,6 +13640,10 @@ def _(rid, params: dict) -> dict:
         try:
             if not value:
                 return _err(rid, 4002, "model value required")
+            # A session-scoped pick must never fall through to the global
+            # config path when its runtime id was detached or reaped.
+            if params.get("session_id") and session is None:
+                return _err(rid, 4001, "session not found")
             if session is not None and _session_uses_compute_host(session):
                 sid = str(params.get("session_id") or "")
                 host_params = {"key": "model", "value": value}
@@ -13583,9 +13653,12 @@ def _(rid, params: dict) -> dict:
                     ack = _send_compute_host_control(
                         sid,
                         route_name="config.set.model",
-                        payload={"params": host_params},
+                        payload={
+                            "params": host_params,
+                            "session_snapshot": _compute_host_turn_frame(rid, sid, session, ""),
+                        },
                         wait=True,
-                        timeout=30.0,
+                        timeout=90.0,
                     )
                 except Exception as exc:
                     return _err(rid, 5019, f"compute-host model switch failed: {exc}")
@@ -13594,7 +13667,9 @@ def _(rid, params: dict) -> dict:
                 result = ack.get("result")
                 if not isinstance(result, dict):
                     return _err(rid, 5001, "compute-host model switch returned an invalid response")
+                session["_compute_host_active"] = True
                 _apply_compute_host_metadata_mirror(session, ack)
+                _emit("session.info", sid, _session_info(session.get("agent"), session))
                 return _ok(
                     rid,
                     {

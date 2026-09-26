@@ -14,6 +14,7 @@ import type { ComposerActions, ComposerRefs, ComposerState, ComposerToken } from
 import { submitPrompt } from './submissionCore.js'
 import { turnController } from './turnController.js'
 import { getUiState, patchUiState } from './uiStore.js'
+import { idleModelStatus } from './modelReadiness.js'
 
 const DOUBLE_ENTER_MS = 450
 
@@ -125,7 +126,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
           }
         })
         .catch((e: Error) => sys(`error: ${e.message}`))
-        .finally(() => patchUiState({ busy: false, status: 'ready' }))
+        .finally(() => patchUiState(state => ({ ...state, busy: false, status: idleModelStatus(state.info, state.sid) })))
     },
     [appendMessage, gw, sys]
   )

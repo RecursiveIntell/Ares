@@ -63,6 +63,7 @@ import { useConfigSync } from './useConfigSync.js'
 import { useInputHandlers } from './useInputHandlers.js'
 import { useLongRunToolCharms } from './useLongRunToolCharms.js'
 import { useSessionLifecycle } from './useSessionLifecycle.js'
+import { idleModelStatus } from './modelReadiness.js'
 import { useSubmission } from './useSubmission.js'
 
 const BRACKET_PASTE_ON = '\x1b[?2004h'
@@ -1057,13 +1058,13 @@ export function useMainApp(gw: GatewayClient) {
 
       try {
         const result = (await session.closeSession(id)) as null | SessionCloseResponse
-        patchUiState({ status: 'ready' })
+        patchUiState(state => ({ ...state, status: idleModelStatus(state.info, state.sid) }))
 
         return result
       } catch (e: unknown) {
         const message = e instanceof Error ? e.message : String(e)
         sys(`error: ${message}`)
-        patchUiState({ status: 'ready' })
+        patchUiState(state => ({ ...state, status: idleModelStatus(state.info, state.sid) }))
 
         throw e
       }

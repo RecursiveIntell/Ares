@@ -154,6 +154,7 @@ def _(rid, params: dict) -> dict:
             "message_count": len(history),
             "messages": _history_to_messages(history),
             "info": {
+                "session_id": sid,
                 # Reflect the per-session model override (desktop composer pick)
                 # in the immediate response so the client doesn't briefly clobber
                 # its sticky pick with the global default before the deferred
@@ -166,8 +167,9 @@ def _(rid, params: dict) -> dict:
                 **(
                     {"provider": session_model_override["provider"]}
                     if session_model_override and session_model_override.get("provider")
-                    else {}
+                    else {"provider": str((_load_cfg().get("model") or {}).get("provider") or "") if isinstance(_load_cfg().get("model"), dict) else ""}
                 ),
+                "model_ready": False,
                 "tools": {},
                 "skills": {},
                 "cwd": _sessions[sid]["cwd"],
@@ -498,9 +500,8 @@ def _(rid, params: dict) -> dict:
                             "message_count": len(history),
                             "messages": [] if omit_messages else _history_to_messages(history),
                             "info": {
-                                "model": _resolve_model(),
+                                **_session_info(live.get("agent"), live),
                                 "lazy": True,
-                                "profile_name": profile or "",
                             },
                         },
                     )
@@ -730,7 +731,7 @@ def _(rid, params: dict) -> dict:
                     "message_count": len(display_history) if omit_messages else len(messages),
                     "messages": messages,
                     "messages_omitted": omit_messages,
-                    "info": _lazy_resume_info(cwd, profile=profile),
+                    "info": _lazy_resume_info(cwd, session_id=sid, profile=profile),
                     "inflight": None,
                     "running": child_running,
                     "session_key": target,
@@ -794,6 +795,7 @@ def _(rid, params: dict) -> dict:
                     "hydrating": True,
                     "info": _lazy_resume_info(
                         cwd,
+                        session_id=sid,
                         model=model_override.get("model") or "",
                         provider=overrides.get("provider_override") or "",
                         profile=profile,
@@ -885,6 +887,7 @@ def _(rid, params: dict) -> dict:
                 "messages_omitted": omit_messages,
                 "info": _lazy_resume_info(
                     cwd,
+                    session_id=sid,
                     model=model_override.get("model") or "",
                     provider=overrides.get("provider_override") or "",
                     profile=profile,
@@ -1117,12 +1120,7 @@ def _(rid, params: dict) -> dict:
     except ValueError as e:
         return _err(rid, 4017, str(e))
     agent = session.get("agent")
-    info = _session_info(agent, session) if agent is not None else {
-        "cwd": cwd,
-        "branch": _git_branch_for_cwd(cwd),
-        "project": _project_info_for_cwd(cwd),
-        "lazy": True,
-    }
+    info = _session_info(agent, session)
     _emit("session.info", params.get("session_id", ""), info)
     return _ok(rid, info)
 
@@ -1191,12 +1189,7 @@ def _(rid, params: dict) -> dict:
         except ValueError as e:
             return _err(rid, 4017, str(e))
         agent = live.get("agent")
-        info = _session_info(agent, live) if agent is not None else {
-            "cwd": resolved,
-            "branch": branch,
-            "project": _project_info_for_cwd(resolved),
-            "lazy": True,
-        }
+        info = _session_info(agent, live)
         _emit("session.info", live_sid, info)
 
     return _ok(rid, {"cwd": resolved, "branch": branch, "git_repo_root": root})

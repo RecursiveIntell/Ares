@@ -750,6 +750,7 @@ export type GatewayEvent =
         reasoning?: string
         rendered?: string
         response_previewed?: boolean
+        status?: string
         text?: string
         usage?: Usage
       }

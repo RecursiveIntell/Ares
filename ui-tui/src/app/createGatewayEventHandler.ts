@@ -32,6 +32,7 @@ import { flashGoodVibes, flashPet } from './petFlashStore.js'
 import { turnController } from './turnController.js'
 import { getTurnState } from './turnStore.js'
 import { getUiState, patchUiState } from './uiStore.js'
+import { idleModelStatus } from './modelReadiness.js'
 import { isWakeUserDisabled } from './wakeState.js'
 
 const NO_PROVIDER_RE = /\bNo (?:LLM|inference) provider configured\b/i
@@ -70,7 +71,10 @@ export const mergeUsageStable = (prev: Usage, patch: Partial<Usage> | undefined)
   return usageChanged(prev, merged) ? merged : prev
 }
 
-const statusFromBusy = () => (getUiState().busy ? 'running…' : 'ready')
+const statusFromBusy = () => {
+  const state = getUiState()
+  return state.busy ? 'running…' : idleModelStatus(state.info, state.sid)
+}
 
 // The last gateway skin, kept so the theme can be re-derived when the OSC-11
 // background answer arrives after (or without) gateway.ready.
@@ -772,10 +776,14 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
       case 'session.info': {
         const info = ev.payload
 
+        if (info.session_id && info.session_id !== getUiState().sid) {
+          return
+        }
+
         patchUiState(state => ({
           ...state,
           info,
-          status: state.status === 'starting agent…' ? 'ready' : state.status,
+          status: state.busy ? state.status : idleModelStatus(info, state.sid),
           usage: info.usage ? mergeUsageStable(state.usage, info.usage) : state.usage
         }))
 
@@ -839,7 +847,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
               ? '↻ goal continuing'
               : p.text.startsWith('⏸')
                 ? '⏸ goal paused'
-                : 'ready'
+                : idleModelStatus(getUiState().info, getUiState().sid)
 
           setStatus(brief)
           restoreStatusAfter(6000)
@@ -847,7 +855,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           return
         }
 
-        setStatus(p.text)
+        setStatus(p.text.trim().toLowerCase() === 'ready' ? idleModelStatus(getUiState().info, getUiState().sid) : p.text)
 
         if (p.kind === 'compressing') {
           sys(p.text)
@@ -1436,7 +1444,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           }
         }
 
-        setStatus('ready')
+        setStatus(ev.payload?.status === 'error' ? 'model unavailable' : 'model unverified')
 
         if (ev.payload?.usage) {
           patchUiState(state => ({ ...state, usage: mergeUsageStable(state.usage, ev.payload!.usage) }))
@@ -1491,7 +1499,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           }
 
           sys(`error: ${message}`)
-          setStatus('ready')
+          setStatus('model unavailable')
         }
     }
   }
