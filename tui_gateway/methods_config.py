@@ -181,6 +181,40 @@ def _(rid, params: dict) -> dict:
 @method("config.get")
 def _(rid, params: dict) -> dict:
     key = params.get("key", "")
+    sid = params.get("session_id")
+    if key in {"reasoning", "fast"} and sid not in (None, ""):
+        if not isinstance(sid, str):
+            return _err(rid, 4002, "session_id must be a string")
+        session = _sessions.get(sid)
+        if session is None:
+            return _err(rid, 4001, "session not found")
+        if _session_uses_compute_host(session):
+            # A lost write acknowledgement leaves both the serving agent and
+            # its metadata mirror potentially stale. Read the existing owner
+            # directly; absence or uncertainty must not become profile defaults.
+            session_key = _session_lookup_key(session, fallback=sid)
+            try:
+                owner = _get_compute_host_supervisor().lookup_session_key(
+                    session_key
+                )
+            except Exception:
+                return _err(rid, 5019, "session option readback unavailable")
+            if (_sessions.get(sid) is not session
+                    or _session_lookup_key(session, fallback=sid) != session_key
+                    or not isinstance(owner, dict)
+                    or owner.get("session_id") != sid):
+                return _err(rid, 5019, "session option owner could not be confirmed")
+            info = owner.get("session_info")
+            field = "reasoning_effort" if key == "reasoning" else "fast"
+            expected_type = str if key == "reasoning" else bool
+            if not isinstance(info, dict) or type(info.get(field)) is not expected_type:
+                return _err(rid, 5019, "session option readback is incomplete")
+            if key == "fast":
+                return _ok(rid, {"value": "fast" if info["fast"] else "normal",
+                                 "owner": "compute_host", "session_id": sid})
+            display = "show" if bool((_load_cfg().get("display") or {}).get("show_reasoning", True)) else "hide"
+            return _ok(rid, {"value": info["reasoning_effort"], "display": display,
+                             "owner": "compute_host", "session_id": sid})
     if key == "provider":
         try:
             from hermes_cli.models import list_available_providers, normalize_provider

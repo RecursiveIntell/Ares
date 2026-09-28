@@ -338,22 +338,10 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
         return true
       }
 
-      // The PRIMARY profile's main agent is the profile's default — its
-      // model/provider choice IS the default, so persist it to config.yaml
-      // (model.default + model.provider) via --global. This is what makes
-      // the selection "stick": a set model.provider outranks a leftover
-      // OPENAI_API_KEY env var in resolve_provider(), so the main agent
-      // keeps the chosen (e.g. subscription) provider across restarts
-      // instead of silently falling back to an env key.
-      //
-      // Two things stay --session, deliberately:
-      //  - a SECONDARY chat tile: picking a model there must not rewrite the
-      //    profile default (the cross-session-contamination guard).
-      //  - MoA (mixture-of-agents) presets: a transient orchestration choice
-      //    that must never become the persisted global gateway default.
-      const isSessionOnlyPreset = (selection.provider || '').toLowerCase() === 'moa'
-      const persistsAsDefault = touchesPrimary && !isSessionOnlyPreset
-      const scope = persistsAsDefault ? '--global' : '--session'
+      // Primary and tile composers both target their owning conversation.
+      // Persisted profile defaults belong to Settings → Model; layout identity
+      // must not silently widen a session selection into a profile-wide write.
+      const scope = '--session'
 
       const requestSwitch = (confirmExpensiveModel = false) =>
         requestGateway<ModelSwitchResponse>('config.set', {

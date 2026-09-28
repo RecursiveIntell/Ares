@@ -152,7 +152,7 @@ def test_slow_history_does_not_block_same_socket_interrupt_admission(server):
         released.set()
 
 
-@pytest.mark.parametrize("slow_method", ["session.history", "config.set"])
+@pytest.mark.parametrize("slow_method", ["session.history", "config.set", "config.get"])
 def test_websocket_reader_reaches_stop_after_a_slow_request(monkeypatch, server, slow_method):
     """Exercise the real WS receive loop, not only direct dispatch()."""
     import asyncio

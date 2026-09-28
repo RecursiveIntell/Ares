@@ -228,6 +228,8 @@ _DETAIL_MODES = frozenset({"hidden", "collapsed", "expanded"})
 # response writes are safe.
 _LONG_HANDLERS = frozenset(
     {
+        # Session option readback may wait for the bounded compute-host lookup.
+        "config.get",
         # Billing/usage reads each do a blocking portal HTTP fetch (state + usage
         # is two serial round-trips); keep them off the main stdin loop so a slow
         # portal can't stall approval.respond / session.interrupt / other RPCs.
