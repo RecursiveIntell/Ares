@@ -10534,6 +10534,7 @@ def _claim_or_reuse_live(
                         lease.release()
                     raise RuntimeError("compute-host owner lookup omitted its runtime session id")
                 owner_request_id = owner.get("request_id")
+                owner_boot_id = owner.get("host_boot_id")
                 if owner.get("running") and (type(owner_request_id) is not str or not owner_request_id):
                     if lease is not None:
                         lease.release()
@@ -10561,7 +10562,37 @@ def _claim_or_reuse_live(
                 if record["running"]:
                     assert isinstance(owner_request_id, str)  # validated before publication
                     supervisor.observe_session(owner_sid, _on_host_owner_terminal,
-                                               request_id=owner_request_id)
+                                               request_id=owner_request_id,
+                                               expected_boot_id=owner_boot_id)
+                    # A terminal can arrive after lookup but before observer
+                    # registration. The host owns the current running state;
+                    # retire only our still-unconsumed observer if it now says
+                    # this same runtime is idle. A concurrently queued terminal
+                    # wins the observer claim and settles the mirror instead.
+                    try:
+                        confirmed = supervisor.lookup_session_key(session_key)
+                    except Exception:
+                        logger.warning("compute-host owner readback after observer registration is unconfirmed",
+                                       exc_info=True)
+                        confirmed = None
+                    if (not isinstance(confirmed, dict)
+                            or confirmed.get("session_id") != owner_sid
+                            or confirmed.get("host_boot_id") != owner_boot_id
+                            or (confirmed.get("running") is True
+                                and confirmed.get("request_id") != owner_request_id)):
+                        # A failed or changed-owner read cannot revoke a turn
+                        # already admitted by the host. Keep its exact observer
+                        # and block further live input until it settles.
+                        with record["history_lock"]:
+                            if record.get("_compute_host_active_request_id") == owner_request_id:
+                                record["_host_delivery_uncertain"] = True
+                    elif (confirmed.get("running") is False
+                            and supervisor.unobserve_session(owner_sid, request_id=owner_request_id,
+                                                              expected_boot_id=owner_boot_id)):
+                        with record["history_lock"]:
+                            if record.get("_compute_host_active_request_id") == owner_request_id:
+                                record.pop("_compute_host_active_request_id", None)
+                                record["running"] = False
                 if lease is not None:
                     lease.release()
                 return owner_sid, record

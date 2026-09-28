@@ -79,6 +79,41 @@ def test_observer_registration_rejects_a_changed_boot(tmp_path):
     assert not host._session_observers
 
 
+def test_lookup_rejects_an_ack_from_a_retired_boot(tmp_path, monkeypatch):
+    host = HostSupervisor(registry_path=tmp_path/'host.json', autostart=False)
+    host._hello = {'boot_id': 'current'}
+
+    def answer(frame, *, expected_boot_id, deadline):
+        assert expected_boot_id == 'current'
+        host._handle_host_frame({
+            'type': 'session.lookup.ack', 'request_id': frame['request_id'],
+            '_host_boot_id': 'retired',
+            'sessions': [{'session_id': 's', 'request_id': 'A', 'running': True}],
+        })
+
+    monkeypatch.setattr(host, '_send_owner_control_bounded', answer)
+    with pytest.raises(HostBootMismatch):
+        host.lookup_session_key('stored')
+    assert not host._session_observers
+
+
+def test_lookup_carries_the_observed_boot_to_adoption(tmp_path, monkeypatch):
+    host = HostSupervisor(registry_path=tmp_path/'host.json', autostart=False)
+    host._hello = {'boot_id': 'current'}
+
+    def answer(frame, *, expected_boot_id, deadline):
+        host._handle_host_frame({
+            'type': 'session.lookup.ack', 'request_id': frame['request_id'],
+            '_host_boot_id': 'current',
+            'sessions': [{'session_id': 's', 'request_id': 'A', 'running': True}],
+        })
+
+    monkeypatch.setattr(host, '_send_owner_control_bounded', answer)
+    owner = host.lookup_session_key('stored')
+    assert owner is not None
+    assert owner['host_boot_id'] == 'current'
+
+
 def test_admission_boot_change_is_refused_before_pipe_bytes(tmp_path, monkeypatch):
     host = HostSupervisor(registry_path=tmp_path/'host.json', autostart=False)
     read_fd, write_fd = os.pipe()

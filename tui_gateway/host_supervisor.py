@@ -420,6 +420,11 @@ class HostSupervisor:
                 self._pending_controls.pop(request_id, None)
         if frame.get("type") == "error":
             raise RuntimeError(str(frame.get("message") or "compute-host session lookup failed"))
+        observed_boot_id = frame.get("_host_boot_id")
+        if (type(observed_boot_id) is not str or not observed_boot_id
+                or (expected_boot_id is not None and observed_boot_id != expected_boot_id)
+                or observed_boot_id != self.boot_id):
+            raise HostBootMismatch("compute-host owner lookup belongs to another or unknown boot")
         matches = frame.get("sessions")
         if not isinstance(matches, list):
             raise RuntimeError("compute-host session lookup returned an invalid response")
@@ -430,7 +435,7 @@ class HostSupervisor:
             raise RuntimeError(
                 f"compute host has {len(matches)} live runtimes for stored session {key}; refusing ambiguous ownership"
             )
-        return dict(matches[0])
+        return {**matches[0], "host_boot_id": observed_boot_id}
 
     def observe_session(self, sid: str, callback: Callable[[dict], None], *, request_id: str,
                         expected_boot_id: str | None = None) -> None:
@@ -441,6 +446,18 @@ class HostSupervisor:
             if expected_boot_id is not None and self.boot_id != expected_boot_id:
                 raise HostBootMismatch("compute-host boot changed before observer registration")
             self._session_observers[sid] = (request_id, callback, self.boot_id)
+
+    def unobserve_session(self, sid: str, *, request_id: str,
+                          expected_boot_id: str | None = None) -> bool:
+        """Retire only an unconsumed observer for this request and boot."""
+        with self._registry_lock:
+            observed = self._session_observers.get(sid)
+            if observed is None or observed[0] != request_id:
+                return False
+            if expected_boot_id is not None and observed[2] != expected_boot_id:
+                return False
+            self._session_observers.pop(sid)
+            return True
 
     def reload_mcp(self, sid: str, *, request_id: str | None = None) -> dict:
         return self.control(

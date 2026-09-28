@@ -620,12 +620,14 @@ def test_resume_claim_adopts_the_compute_host_owner_when_parent_mirror_is_gone(m
             return {
                 "session_id": owner_sid,
                 "request_id": "owner-request",
+                "host_boot_id": "boot-owner",
                 "session_info": {"model": "owner-model", "provider": "owner-provider"},
                 "running": True,
             }
 
-        def observe_session(self, sid, callback, *, request_id):
+        def observe_session(self, sid, callback, *, request_id, expected_boot_id):
             assert request_id == "owner-request"
+            assert expected_boot_id == "boot-owner"
             observed["sid"] = sid
             observed["callback"] = callback
 

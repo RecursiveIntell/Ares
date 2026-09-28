@@ -144,6 +144,95 @@ def test_unidentified_running_owner_is_not_published(monkeypatch):
     assert releases == [True]
 
 
+def test_terminal_before_observer_registration_reconciles_idle_owner(monkeypatch):
+    """A completed host request must not leave an adopted mirror running."""
+    monkeypatch.setattr(server, "_sessions", {})
+    monkeypatch.setattr(server, "_find_live_session_by_key", lambda *a: None)
+    monkeypatch.setattr(server, "_turn_isolation_enabled", lambda: True)
+    monkeypatch.setattr(server, "_register_session_cwd", lambda *a: None)
+    monkeypatch.setattr(server, "_apply_compute_host_metadata_mirror", lambda *a: None)
+    monkeypatch.setattr(server, "_cancel_ws_orphan_reap", lambda *a: None)
+    snapshots = iter([
+        {"session_id": "host", "request_id": "A", "running": True,
+         "host_boot_id": "boot-owner"},
+        {"session_id": "host", "running": False, "host_boot_id": "boot-owner"},
+    ])
+    observers = {}
+
+    def observe(sid, callback, *, request_id, expected_boot_id=None):
+        assert expected_boot_id == "boot-owner"
+        observers[sid] = (request_id, callback)
+
+    def unobserve(sid, *, request_id, expected_boot_id=None):
+        assert expected_boot_id == "boot-owner"
+        if observers.get(sid, (None,))[0] != request_id:
+            return False
+        observers.pop(sid)
+        return True
+
+    supervisor = types.SimpleNamespace(
+        lookup_session_key=lambda key: next(snapshots),
+        observe_session=observe,
+        unobserve_session=unobserve,
+    )
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda: supervisor)
+    released = []
+    lease = types.SimpleNamespace(release=lambda: released.append(True))
+    record = {"session_key": "stored", "history_lock": threading.Lock(), "running": False}
+    assert server._claim_or_reuse_live("new", "stored", record, lease) == ("host", record)
+    assert server._sessions["host"] is record
+    assert record["running"] is False
+    assert "_compute_host_active_request_id" not in record
+    assert not observers
+    assert released == [True]
+
+
+def test_unconfirmed_post_registration_read_preserves_observer_and_releases_lease(monkeypatch):
+    monkeypatch.setattr(server, "_sessions", {})
+    monkeypatch.setattr(server, "_find_live_session_by_key", lambda *a: None)
+    monkeypatch.setattr(server, "_turn_isolation_enabled", lambda: True)
+    monkeypatch.setattr(server, "_register_session_cwd", lambda *a: None)
+    monkeypatch.setattr(server, "_apply_compute_host_metadata_mirror", lambda *a: None)
+    monkeypatch.setattr(server, "_cancel_ws_orphan_reap", lambda *a: None)
+    reads = []
+    observers = {}
+
+    def lookup(_key):
+        reads.append(True)
+        if len(reads) == 1:
+            return {"session_id": "host", "request_id": "A", "running": True,
+                    "host_boot_id": "boot-owner"}
+        raise TimeoutError("host readback unconfirmed")
+
+    def observe(sid, callback, *, request_id, expected_boot_id):
+        observers[sid] = (request_id, expected_boot_id, callback)
+
+    supervisor = types.SimpleNamespace(lookup_session_key=lookup, observe_session=observe)
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda: supervisor)
+    released = []
+    lease = types.SimpleNamespace(release=lambda: released.append(True))
+    record = {"session_key": "stored", "history_lock": threading.Lock(), "running": False}
+    assert server._claim_or_reuse_live("new", "stored", record, lease) == ("host", record)
+    assert record["_host_delivery_uncertain"] is True
+    assert record["_compute_host_active_request_id"] == "A"
+    assert observers["host"][:2] == ("A", "boot-owner")
+    assert released == [True]
+
+
+def test_exact_unobserve_cannot_retire_newer_request_or_boot(tmp_path):
+    host = HostSupervisor(registry_path=tmp_path / "host.json", autostart=False)
+    old = []
+    new = []
+    host._hello = {"boot_id": "boot-new"}
+    host.observe_session("s", old.append, request_id="A")
+    host.observe_session("s", new.append, request_id="B")
+    assert host.unobserve_session("s", request_id="A") is False
+    assert host.unobserve_session("s", request_id="B", expected_boot_id="boot-old") is False
+    assert host._session_observers["s"][0] == "B"
+    assert host.unobserve_session("s", request_id="B", expected_boot_id="boot-new") is True
+    assert not host._session_observers
+
+
 @pytest.mark.parametrize("crash", [False, True])
 def test_real_host_lookup_and_exact_observer_settle_once(tmp_path, monkeypatch, crash):
     home = tmp_path / "home"
