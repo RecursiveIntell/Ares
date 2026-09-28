@@ -128,3 +128,83 @@ def test_projection_failure_retains_owner_and_does_not_repeat_emit(monkeypatch):
     assert len(calls) == 1
     assert session["_compute_host_active_request_id"] == "A"
     assert session["_compute_host_terminal"] == terminal
+
+
+def test_dequeued_terminal_after_abort_claim_publishes_and_drains_nothing(monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+
+    class PausedHistoryLock:
+        def __enter__(self):
+            entered.set()
+            assert release.wait(3), "projection did not resume"
+        def __exit__(self, *_exc):
+            return False
+
+    session = state(monkeypatch)
+    session["history_lock"] = PausedHistoryLock()
+    effects = []
+    monkeypatch.setattr(server, "_clear_inflight_turn", lambda *a: effects.append("clear"))
+    monkeypatch.setattr(server, "_emit", lambda *a: effects.append("emit"))
+    monkeypatch.setattr(server, "_session_info", lambda *a: {})
+    monkeypatch.setattr(server, "_drain_queued_prompt", lambda *a: effects.append("drain"))
+    terminal = {"type": "turn.end", "sid": "s", "request_id": "A"}
+    failures = []
+
+    def project():
+        try:
+            server._on_compute_host_turn_done("rpc", "s", session, terminal)
+        except Exception as exc:
+            failures.append(exc)
+
+    worker = threading.Thread(target=project)
+    worker.start()
+    try:
+        assert entered.wait(3), "terminal did not reach projection gate"
+        assert server._pop_session_by_id("s") is session
+    finally:
+        release.set()
+        worker.join(3)
+    assert not worker.is_alive()
+    assert not failures
+    assert effects == []
+    assert session["running"] is True
+    assert session["_compute_host_active_request_id"] == "A"
+
+
+def test_abort_after_terminal_claim_before_emit_publishes_and_drains_nothing(monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+    session = state(monkeypatch)
+    effects = []
+
+    def paused_clear(_session):
+        entered.set()
+        assert release.wait(3), "terminal projection did not resume"
+        effects.append("clear")
+
+    monkeypatch.setattr(server, "_clear_inflight_turn", paused_clear)
+    monkeypatch.setattr(server, "_emit", lambda *a: effects.append("emit"))
+    monkeypatch.setattr(server, "_session_info", lambda *a: {})
+    monkeypatch.setattr(server, "_drain_queued_prompt", lambda *a: effects.append("drain"))
+    failures = []
+
+    def project():
+        try:
+            server._on_compute_host_turn_done(
+                "rpc", "s", session, {"type": "turn.end", "sid": "s", "request_id": "A"})
+        except Exception as exc:
+            failures.append(exc)
+
+    worker = threading.Thread(target=project)
+    worker.start()
+    try:
+        assert entered.wait(3), "terminal did not claim projection"
+        assert server._pop_session_by_id("s") is session
+    finally:
+        release.set()
+        worker.join(3)
+    assert not worker.is_alive()
+    assert not failures
+    assert "emit" not in effects
+    assert "drain" not in effects

@@ -2766,6 +2766,11 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
         if _sessions.get(sid) is not session:
             return
     with session["history_lock"]:
+        if session.get("_closing"):
+            # The close/re-adoption owner detached this record while the
+            # terminal callback waited to project. Its queued work cannot
+            # publish or drain through a retired parent.
+            return
         owner = session.get("_compute_host_active_request_id")
         if (not owner or frame.get("request_id") != owner or frame.get("sid") != sid
                 or frame.get("type") not in {"turn.end", "turn.error"}
@@ -2795,6 +2800,8 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
         session["running"] = False
         session["last_active"] = time.time()
         _clear_inflight_turn(session)
+    if session.get("_closing"):
+        return
     if is_error:
         mirror = dict(_metadata_mirror(session))
         mirror["model_ready"] = False
@@ -2806,6 +2813,8 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
         info = _session_info(session.get("agent"), session)
     except TypeError:
         info = _session_info(session.get("agent"))
+    if session.get("_closing"):
+        return
     if not frame.get("session_info_emitted"):
         _emit("session.info", sid, info)
     with session["history_lock"]:
@@ -2815,6 +2824,8 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
         session.pop("_compute_host_settling_request_id", None)
         session.pop("_compute_host_terminal", None)
         session.pop("_host_delivery_uncertain", None)
+    if session.get("_closing"):
+        return
     _drain_queued_prompt(rid, sid, session)
 
 
