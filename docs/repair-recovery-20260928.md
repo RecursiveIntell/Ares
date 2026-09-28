@@ -87,11 +87,11 @@ Still required: busy-turn and compound outcomes, confirmed rollback under multip
 
 ### C41 — exhaustion and continuation: OPEN
 
-The recovered native goal explicitly records repeated compression exhaustion. This verifies the pause symptom, not its complete root cause. The nested continuation checkpoint is historical and not permission to revive the paused goal.
+The recovered native goal explicitly records repeated compression exhaustion. Read-only classification of the latest retained errors for this session found five successive `compact-v2` refusals with `lineage_integrity_mismatch` immediately preceding provider context-window errors and `Cannot compress further`. **The observed stop is integrity refusal, not `lineage_generation_limit`; epoch rollover must not be used to bypass it.** The exact authenticated parent/prefix divergence for this session has not yet been reconstructed. The nested continuation checkpoint is historical and not permission to revive the paused goal.
 
 The candidate includes no-progress estimated-over-window dispatch containment and the Rust-defined omitted epoch-zero adapter correction. Historical real-binary tests covered epoch/restart behavior. A separate copied-state lifecycle passed generation 2 and generation 3 with a synthetic continuation suffix; independent readback compared 1,802 original rows without changes, found no pending receipts and clean SQLite integrity. That scratch exercise **did not create a new epoch or recover the live session**.
 
-Still required: bind the latest incident to its exact authenticated receipt/error; distinguish generation ceiling from lineage-content mismatch; qualify owner-safe rollover/rebase, repeated transition and restart; retain authentic input, goal budget and unresolved effects. Do not enable physical rebase, increase a generation ceiling, delete receipts, or fabricate parentage merely to remove the error.
+Still required: bind this session's observed integrity failure to the exact authenticated receipt, current host-projected prefix and pending state on a consistent copy; preserve any non-whitespace disagreement. Only after resolving integrity through an owner-correct repair should the generation ceiling and owner-safe rollover/rebase be tested, with repeated transition and restart, authentic input, goal budget and unresolved effects. Do not enable physical rebase, increase a generation ceiling, delete receipts, or fabricate parentage merely to remove the error.
 
 ## Decomposer assignments retained, not seven new jobs
 
