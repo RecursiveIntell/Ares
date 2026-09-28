@@ -145,6 +145,9 @@ def test_real_reasoning_handler_can_persist_without_holding_reader(scoped, monke
     monkeypatch.setattr(server, "_session_uses_compute_host", lambda session: False)
     monkeypatch.setattr(server, "_load_cfg", lambda: {})
     monkeypatch.setattr(server, "_emit", lambda *args: None)
+    # This test measures reader freedom while persistence blocks, not the
+    # unrelated cwd/git/project lookups in the session-info projection.
+    monkeypatch.setattr(server, "_session_info", lambda *args: {})
 
     def persist(session):
         assert session is record
