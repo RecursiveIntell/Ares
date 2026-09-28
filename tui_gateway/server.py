@@ -3157,6 +3157,53 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
             return normalized
 
         _rid, method, _params = normalized
+        if (method == "config.set" and _params.get("key") in {"model", "reasoning", "fast"}
+                and _params.get("session_id") and _params.get("scope") != "global"):
+            # These handlers may wait for the host or durable storage. Never
+            # hold the connection reader while they run. Reserve one mutation
+            # per record before scheduling: a pool alone could reorder two
+            # writes or apply an old request to a reused runtime id.
+            sid = _params["session_id"]
+            reservation = object()
+            with _sessions_lock:
+                record = _sessions.get(sid)
+                if record is None:
+                    return _err(_rid, 4001, "session not found")
+                if record.get("_config_set_pending") is not None:
+                    return _err(_rid, 4009, "session option update already pending; request not applied")
+                record["_config_set_pending"] = reservation
+                owner_transport = record.get("transport")
+            ctx = contextvars.copy_context()
+
+            def release_setting():
+                with _sessions_lock:
+                    if record.get("_config_set_pending") is reservation:
+                        record.pop("_config_set_pending", None)
+
+            def run_setting():
+                owner_token = _current_runtime_session_record.set(record)
+                try:
+                    with _sessions_lock:
+                        current = (_sessions.get(sid) is record
+                                   and record.get("transport") is owner_transport)
+                    if not current:
+                        resp = _err(_rid, 4001, "session owner changed; request not applied")
+                    else:
+                        resp = handle_request(req)
+                except Exception as exc:
+                    resp = _err(_rid, -32000, f"handler error: {exc}")
+                finally:
+                    _current_runtime_session_record.reset(owner_token)
+                    release_setting()
+                if resp is not None:
+                    t.write(resp)
+
+            try:
+                _pool.submit(lambda: ctx.run(run_setting))
+            except Exception:
+                release_setting()
+                return _err(_rid, 4009, "option worker unavailable; request not applied")
+            return None
         if method not in _LONG_HANDLERS:
             return handle_request(req)
 
@@ -14006,6 +14053,9 @@ def _(rid, params: dict) -> dict:
     key, value = params.get("key", ""), params.get("value", "")
     requested_session_id = params.get("session_id")
     session = _sessions.get(requested_session_id or "")
+    expected_session = _current_runtime_session_record.get()
+    if expected_session is not None and session is not expected_session:
+        return _err(rid, 4001, "session owner changed; request not applied")
 
     # An explicit runtime target must never become a profile-global write
     # merely because that runtime was retired. Recover through session.resume.
