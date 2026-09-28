@@ -103,6 +103,41 @@ def test_ensure_server_session_fallback_uses_canonical_source_resolver(monkeypat
     assert session["source"] == "iso-certify"
 
 
+def test_cold_host_reconstruction_keeps_pinned_model_provider_not_process_default(monkeypatch):
+    """A cold host rebuild must receive the session's selected route verbatim."""
+    selected = {"model": "chosen-model", "provider": "chosen-provider", "base_url": "https://selected.invalid"}
+    parent = {
+        "session_key": "stored", "history_lock": threading.Lock(), "history": [],
+        "model_override": selected, "cwd": ".", "source": "desktop",
+    }
+    frame = server._compute_host_turn_frame("request", "runtime", parent, "next turn")
+    assert frame["model_override"] is selected
+    builds = []
+
+    def build(*args, **kwargs):
+        builds.append((args, kwargs))
+        return types.SimpleNamespace(session_id="stored", model="chosen-model", provider="chosen-provider")
+
+    monkeypatch.setattr(server, "_sessions", {}, raising=False)
+    monkeypatch.setattr(server, "_make_agent", build)
+    monkeypatch.setattr(server, "_transfer_db_to_agent", lambda *args, **kwargs: False)
+    monkeypatch.setattr(server, "_init_session", lambda *args, **kwargs: (_ for _ in ()).throw(
+        RuntimeError("optional session machinery unavailable")
+    ))
+    host = ComputeHost(stdout=io.StringIO(), heartbeat_secs=0)
+    try:
+        session = host._ensure_server_session(server, frame)
+    finally:
+        host.close()
+
+    assert len(builds) == 1
+    assert builds[0][0][:2] == ("runtime", "stored")
+    assert builds[0][1]["session_id"] == "stored"
+    assert builds[0][1]["model_override"] is selected
+    assert session["model_override"] is selected
+    assert session["agent"].model == "chosen-model"
+
+
 def test_real_turn_accepts_void_session_persistence_contract(monkeypatch):
     """A successful void persistence helper must admit the host turn."""
     class _Agent:
