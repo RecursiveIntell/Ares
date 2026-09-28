@@ -195,6 +195,7 @@ class SessionContextInputTurnsMixin:
             proof = self._input_stop_disposition_on_conn(conn, root, profile, value["phase_id"])
             if value["dispatch_attempts"] or proof is None or proof["after"] != value:
                 raise ContextContinuationError("CONTEXT_INPUT_STOP_DISPOSITION_INVALID")
+            self._cancelled_input_cut_on_conn(conn, root, profile, value)
         return value
 
     def _input_stop_disposition_on_conn(self, conn, root, profile, phase_id):
