@@ -45,3 +45,17 @@ def test_omitted_zero_does_not_weaken_authentication_or_content_checks(tmp_path,
     else:
         incoming[-1]["content"] += " extra human content"
     assert engine._rehydrate_legacy_parent_prefix(incoming) == incoming
+
+
+def test_production_projection_removes_host_todo_before_tip_restoration(tmp_path):
+    from tools.todo_tool import TODO_INJECTION_HEADER
+
+    engine, canonical, tip, incoming = fixture_engine(tmp_path, {})
+    incoming[-1]["content"] += "\n\n" + TODO_INJECTION_HEADER + "\n- [ ] fixture task (pending)"
+    original = copy.deepcopy(incoming)
+    # Match _compress_once ordering. Comparing raw persisted history directly
+    # to a receipt falsely diagnoses the host-owned suffix as content damage.
+    source = engine._without_host_todo_snapshots(incoming)
+    projected = [engine._message_to_governor(message, i) for i, message in enumerate(source)]
+    assert engine._rehydrate_legacy_parent_prefix(projected) == canonical
+    assert incoming == original
