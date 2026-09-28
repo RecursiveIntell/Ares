@@ -2839,7 +2839,12 @@ export const en: Translations = {
       max: 'Max',
       ultra: 'Ultra',
       updateFailed: 'Model option update failed',
-      fastFailed: 'Fast mode update failed'
+      fastFailed: 'Fast mode update failed',
+      unconfirmed: 'Model options unconfirmed',
+      unconfirmedObserved:
+        'The update outcome is unconfirmed. Showing the current host-reported setting; no write was retried.',
+      unconfirmedUnavailable:
+        'The update outcome is unknown. The selected value is not confirmed; no write was retried.'
     },
     gatewayMenu: {
       gateway: 'Gateway',

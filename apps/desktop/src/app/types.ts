@@ -194,6 +194,8 @@ export interface ClientSessionState {
   reasoningEffort: string
   serviceTier: string
   fast: boolean
+  /** Renderer-only uncertainty after a lost option acknowledgement/readback. */
+  unconfirmedRuntimeOptions?: ('effort' | 'fast')[]
   yolo: boolean
   personality: string
   busy: boolean

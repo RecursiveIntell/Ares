@@ -5,6 +5,7 @@ import { persistString, storedString } from '@/lib/storage'
 import { activeGatewayConnectionId } from './gateway'
 import { notifyError } from './notifications'
 import { $activeGatewayProfile } from './profile'
+import { clearRuntimeOptionUncertainty, reconcileRuntimeOptionFailure } from './runtime-option-recovery'
 import {
   $activeSessionId,
   $currentFastMode,
@@ -115,7 +116,7 @@ export async function applyModelPreset(
       typeof currentOwner === 'string' ? currentOwner : (currentOwner?.profile ?? $activeGatewayProfile.get())
     ])
 
-    return currentTarget === target && ownsRuntimeOptionIntent(target, dimension, tokens[dimension])
+    return Boolean(current) && currentTarget === target && ownsRuntimeOptionIntent(target, dimension, tokens[dimension])
   }
 
   const previousEffort = state?.reasoningEffort ?? (primary ? $currentReasoningEffort.get() : '')
@@ -143,9 +144,21 @@ export async function applyModelPreset(
   try {
     if (effort !== undefined) {
       await ctx.request('config.set', { key: 'reasoning', session_id: ctx.sessionId, value: effort })
+
+      if (owns('effort')) {
+        clearRuntimeOptionUncertainty(runtimeId, 'effort')
+      }
     }
   } catch (err) {
-    if (owns('effort')) {
+    const reconciled = await reconcileRuntimeOptionFailure(err, {
+      sessionId: runtimeId,
+      dimension: 'effort',
+      request: ctx.request,
+      owns: () => owns('effort'),
+      applyObserved: value => paint({ reasoningEffort: value as string })
+    })
+
+    if (!reconciled && owns('effort')) {
       paint({ reasoningEffort: previousEffort })
     }
 
@@ -153,7 +166,10 @@ export async function applyModelPreset(
     if (fast !== undefined && owns('fast')) {
       paint({ fast: previousFast })
     }
-    notifyError(err, ctx.failMessage)
+
+    if (!reconciled) {
+      notifyError(err, ctx.failMessage)
+    }
 
     return
   }
@@ -161,12 +177,29 @@ export async function applyModelPreset(
   if (fast !== undefined && owns('fast')) {
     try {
       await ctx.request('config.set', { key: 'fast', session_id: runtimeId, value: fast ? 'fast' : 'normal' })
+
+      if (owns('fast')) {
+        clearRuntimeOptionUncertainty(runtimeId, 'fast')
+      }
     } catch (err) {
+      if (
+        await reconcileRuntimeOptionFailure(err, {
+          sessionId: runtimeId,
+          dimension: 'fast',
+          request: ctx.request,
+          owns: () => owns('fast'),
+          applyObserved: value => paint({ fast: value as boolean })
+        })
+      ) {
+        return
+      }
+
       // The reasoning write is already acknowledged. Restore only the failed
       // Fast dimension; this sequence is intentionally not atomic.
       if (owns('fast')) {
         paint({ fast: previousFast })
       }
+
       notifyError(err, ctx.failMessage)
     }
   }

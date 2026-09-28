@@ -1,6 +1,7 @@
 import { useStore } from '@nanostores/react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { useState } from 'react'
+import { computed } from 'nanostores'
+import { useMemo, useState } from 'react'
 
 import { useSessionView } from '@/app/chat/session-view'
 import { Codicon } from '@/components/ui/codicon'
@@ -16,6 +17,7 @@ import { $modelPresets, applyModelPreset, modelPresetKey, setModelPreset } from 
 import { $visibleModels } from '@/store/model-visibility'
 import { notifyError } from '@/store/notifications'
 import { $activeGatewayProfile } from '@/store/profile'
+import { clearRuntimeOptionUncertainty, reconcileRuntimeOptionFailure } from '@/store/runtime-option-recovery'
 import {
   $activeSessionId,
   $defaultReasoningEffort,
@@ -63,6 +65,17 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
   // shows/switches its own model — not the primary-only globals.
   const view = useSessionView()
   const activeSessionId = useStore(view.$runtimeId)
+
+  const unconfirmedOptions = useStore(
+    useMemo(
+      () =>
+        computed($sessionStates, states =>
+          Boolean(activeSessionId && states[activeSessionId]?.unconfirmedRuntimeOptions?.length)
+        ),
+      [activeSessionId]
+    )
+  )
+
   const currentFastMode = useStore(view.$fast)
   const currentModel = useStore(view.$model)
   const currentProvider = useStore(view.$provider)
@@ -165,6 +178,7 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
     const token = beginRuntimeOptionIntent(target, [dimension])[dimension]
 
     const owns = () =>
+      Boolean($sessionStates.get()[runtimeId]) &&
       optionTarget(runtimeId) === target &&
       $sessionStates.get()[runtimeId]?.storedSessionId === storedSessionId &&
       ownsRuntimeOptionIntent(target, dimension, token)
@@ -194,6 +208,7 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
     if (touchesPrimary) {
       markComposerSelectionManual()
     }
+
     update(next)
 
     try {
@@ -202,10 +217,27 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
         session_id: runtimeId,
         value: dimension === 'fast' ? ((next as boolean) ? 'fast' : 'normal') : next
       })
+
+      if (owns()) {
+        clearRuntimeOptionUncertainty(runtimeId, dimension)
+      }
     } catch (err) {
+      if (
+        await reconcileRuntimeOptionFailure(err, {
+          sessionId: runtimeId,
+          dimension,
+          request: requestGateway,
+          owns,
+          applyObserved: update
+        })
+      ) {
+        return
+      }
+
       if (owns()) {
         update(previous)
       }
+
       notifyError(err, message)
     }
   }
@@ -266,17 +298,24 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
     <ModelCatalogMenu
       controller={controller}
       footer={
-        <DropdownMenuItem
-          className={cn(dropdownMenuRow, 'text-(--ui-text-tertiary)')}
-          disabled={refreshing}
-          onSelect={event => {
-            event.preventDefault()
-            void refreshModels()
-          }}
-        >
-          <Codicon className={cn(refreshing && 'animate-spin')} name="sync" size="0.75rem" />
-          {copy.refreshModels}
-        </DropdownMenuItem>
+        <>
+          {unconfirmedOptions && (
+            <div className="px-2 py-1 text-xs text-(--ui-text-secondary)" role="status">
+              {t.shell.modelOptions.unconfirmed}
+            </div>
+          )}
+          <DropdownMenuItem
+            className={cn(dropdownMenuRow, 'text-(--ui-text-tertiary)')}
+            disabled={refreshing}
+            onSelect={event => {
+              event.preventDefault()
+              void refreshModels()
+            }}
+          >
+            <Codicon className={cn(refreshing && 'animate-spin')} name="sync" size="0.75rem" />
+            {copy.refreshModels}
+          </DropdownMenuItem>
+        </>
       }
       gateway={gateway}
       includeMoa

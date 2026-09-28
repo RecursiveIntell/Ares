@@ -2392,7 +2392,10 @@ export const zhHant = defineLocale({
       max: '最高',
       ultra: '超高',
       updateFailed: '模型選項更新失敗',
-      fastFailed: '快速模式更新失敗'
+      fastFailed: '快速模式更新失敗',
+      unconfirmed: '模型選項尚未確認',
+      unconfirmedObserved: '更新結果尚未確認。現顯示主機回報的目前設定；未重試寫入。',
+      unconfirmedUnavailable: '更新結果未知。所選值尚未確認；未重試寫入。'
     },
     gatewayMenu: {
       gateway: '閘道',

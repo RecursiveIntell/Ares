@@ -32,15 +32,23 @@ vi.mock('@/hermes', () => ({
   setApiRequestProfile: vi.fn()
 }))
 vi.mock('@/i18n', () => ({
+  translateNow: (key: string) => key,
   useI18n: () => ({
     t: {
       common: { confirm: 'Confirm' },
       desktop: { modelSwitchFailed: 'Failed' },
-      shell: { modelMenu: { refreshModels: 'Refresh' }, modelOptions: { updateFailed: 'Failed', fastFailed: 'Failed' } }
+      shell: {
+        modelMenu: { refreshModels: 'Refresh' },
+        modelOptions: { updateFailed: 'Failed', fastFailed: 'Failed', unconfirmed: 'Model options unconfirmed' }
+      }
     }
   })
 }))
 vi.mock('@/store/notifications', () => ({ notify: vi.fn(), notifyError: vi.fn(), dismissNotification: vi.fn() }))
+vi.mock('@/components/ui/dropdown-menu', () => ({
+  DropdownMenuItem: ({ children }: any) => <div>{children}</div>,
+  dropdownMenuRow: ''
+}))
 vi.mock('@/lib/model-options', async importOriginal => ({
   ...(await importOriginal<any>()),
   requestModelOptions: async () => ({
@@ -50,10 +58,13 @@ vi.mock('@/lib/model-options', async importOriginal => ({
   })
 }))
 vi.mock('./model-catalog-menu', () => ({
-  ModelCatalogMenu: ({ controller }: any) => (
-    <button onClick={() => controller.setOptions({ effort: 'high' }, { isActive: true, model: 'a', provider: 'p' })}>
-      Set high
-    </button>
+  ModelCatalogMenu: ({ controller, footer }: any) => (
+    <>
+      <button onClick={() => controller.setOptions({ effort: 'high' }, { isActive: true, model: 'a', provider: 'p' })}>
+        Set high
+      </button>
+      {footer}
+    </>
   )
 }))
 
@@ -312,4 +323,76 @@ it('a primary preset updates its explicit draft preference as well as the live s
   )
   expect(PRIMARY_SESSION_VIEW.$reasoningEffort.get()).toBe('high')
   expect($currentReasoningEffort.get()).toBe('high')
+})
+
+it('an uncertain effort write reads host state rather than guessing a rollback or retrying the write', async () => {
+  const request = vi
+    .fn()
+    .mockRejectedValueOnce(new Error('request timed out after 30s: config.set'))
+    .mockResolvedValueOnce({ owner: 'compute_host', session_id: 'r1', value: 'low' })
+
+  panel(request)
+  await act(async () => fireEvent.click(screen.getByText('Set high')))
+  expect(request).toHaveBeenNthCalledWith(2, 'config.get', { key: 'reasoning', session_id: 'r1' })
+  expect(request.mock.calls.filter(([method]) => method === 'config.set')).toHaveLength(1)
+  expect(PRIMARY_SESSION_VIEW.$reasoningEffort.get()).toBe('low')
+  expect($currentReasoningEffort.get()).toBe('low')
+})
+
+it('unavailable readback leaves the desired effort visibly unconfirmed', async () => {
+  const request = vi.fn().mockRejectedValue(new Error('Hermes gateway connection closed'))
+  panel(request)
+  await act(async () => fireEvent.click(screen.getByText('Set high')))
+  expect(request.mock.calls.filter(([method]) => method === 'config.set')).toHaveLength(1)
+  expect($sessionStates.get().r1).toMatchObject({ reasoningEffort: 'high', unconfirmedRuntimeOptions: ['effort'] })
+  expect(screen.getByRole('status').textContent).toContain('unconfirmed')
+})
+
+it('a late preset recovery cannot recreate an unsaved runtime after close', async () => {
+  publishSessionState('r1', { ...$sessionStates.get().r1, storedSessionId: null })
+  let resolve!: (value: unknown) => void
+
+  const request = vi
+    .fn()
+    .mockRejectedValueOnce(new Error('request timed out'))
+    .mockImplementationOnce(
+      () =>
+        new Promise(r => {
+          resolve = r
+        })
+    )
+
+  const pending = applyModelPreset(
+    { effort: 'high', fast: true },
+    {
+      primary: false,
+      sessionId: 'r1',
+      failMessage: 'Failed',
+      request
+    }
+  )
+
+  await act(async () => {
+    await Promise.resolve()
+  })
+  expect(request).toHaveBeenCalledTimes(2)
+  $sessionStates.set({})
+  resolve({ owner: 'compute_host', session_id: 'r1', value: 'high' })
+  await pending
+  expect($sessionStates.get()).toEqual({})
+})
+
+it('an uncertain preset effort reads back but never sends the unattempted Fast write', async () => {
+  const request = vi
+    .fn()
+    .mockRejectedValueOnce(new Error('request timed out after 30s: config.set'))
+    .mockResolvedValueOnce({ owner: 'compute_host', session_id: 'r1', value: 'xhigh' })
+
+  await applyModelPreset(
+    { effort: 'high', fast: true },
+    { primary: false, sessionId: 'r1', failMessage: 'Failed', request }
+  )
+  expect(request).toHaveBeenCalledTimes(2)
+  expect(request).toHaveBeenLastCalledWith('config.get', { key: 'reasoning', session_id: 'r1' })
+  expect($sessionStates.get().r1).toMatchObject({ reasoningEffort: 'xhigh', fast: false })
 })
