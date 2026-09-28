@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { onComposerInsertRequest } from '@/app/chat/composer/focus'
 import { I18nProvider } from '@/i18n'
-import { clearClarifyRequest, setClarifyRequest } from '@/store/clarify'
+import { clearClarifyRequest, setClarifyRequest, skipClarifyRequest } from '@/store/clarify'
 import { $gateway } from '@/store/gateway'
 import { $profiles } from '@/store/profile'
 import { $activeSessionId, _resetSessionOwnerHintsForTests, setSessionOwnerHint } from '@/store/session'
@@ -839,6 +839,21 @@ describe('ClarifyTool owner routing', () => {
       expect(gatewayMocks.requestGatewayForAgent).toHaveBeenCalledTimes(1)
     })
     expectOwnerCall(1, { answer: '', request_id: 'request-batch' })
+    expect(ambient).not.toHaveBeenCalled()
+  })
+
+  it('composer skip routes to the clarify owner after the ambient profile switches', async () => {
+    const ambient = armCrossProfileOwner()
+    setClarifyRequest({
+      choices: ['staging', 'production'],
+      multiSelect: false,
+      question: 'Which deployment target?',
+      requestId: 'request-composer',
+      sessionId: 'session-a'
+    })
+
+    await expect(skipClarifyRequest('session-a')).resolves.toBe(true)
+    expectOwnerCall(1, { answer: '', request_id: 'request-composer' })
     expect(ambient).not.toHaveBeenCalled()
   })
 })

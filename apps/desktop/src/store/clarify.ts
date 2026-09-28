@@ -2,6 +2,7 @@ import { atom, computed } from 'nanostores'
 
 import { $gateway } from './gateway'
 import { $activeSessionId } from './session'
+import { requestForOwnedSession } from './session-states'
 
 export interface ClarifyQuestion {
   /** Server-generated wire id (q0..qN) — clarify.respond keys answers by it. */
@@ -202,7 +203,18 @@ export async function skipClarifyRequest(sessionId: string | null | undefined): 
   clearClarifyRequest(request.requestId, request.sessionId)
 
   try {
-    await $gateway.get()?.request('clarify.respond', { request_id: request.requestId, answer: '' })
+    const gateway = $gateway.get()
+
+    if (gateway) {
+      // The composer may now be focused on a different profile. The pending
+      // request's session, not the ambient socket, owns this skip response.
+      await requestForOwnedSession(
+        request.sessionId,
+        gateway.request.bind(gateway) as typeof gateway.request,
+        'clarify.respond',
+        { request_id: request.requestId, answer: '' }
+      )
+    }
   } catch {
     // The tool times out on its own; a failed skip must never swallow the
     // message the user is actually sending.
