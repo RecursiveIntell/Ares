@@ -61,7 +61,34 @@ def test_unconfirmed_write_never_paints_success(serving, monkeypatch, bad):
     monkeypatch.setattr(server, "_send_compute_host_control", send)
     result = dispatch()
     assert result["error"]["code"] == 5019
+    assert result["error"]["data"] == {"delivery": "uncertain"}
     assert serving["agent"].reasoning_config["effort"] == "low"
+    assert serving["_metadata_mirror"]["reasoning_effort"] == "low"
+    assert "create_reasoning_override" not in serving
+
+
+@pytest.mark.parametrize("host_code", [4001, 4002, 4009])
+def test_started_reasoning_host_error_remains_uncertain(serving, monkeypatch, host_code):
+    """A host error code after an offered write is not no-application proof."""
+    monkeypatch.setattr(server, "_send_compute_host_control", Mock(return_value={
+        "type": "control.error", "sid": "live", "code": host_code,
+        "message": "host returned error after control was offered",
+    }))
+    result = dispatch()
+    assert result["error"]["code"] == 5019
+    assert result["error"]["data"] == {"delivery": "uncertain", "host_code": host_code}
+    assert serving["_metadata_mirror"]["reasoning_effort"] == "low"
+    assert "create_reasoning_override" not in serving
+
+
+def test_reasoning_not_sent_is_distinguishable_from_started_write(serving, monkeypatch):
+    from tui_gateway.host_supervisor import HostSendNotSent
+
+    monkeypatch.setattr(server, "_send_compute_host_control",
+                        Mock(side_effect=HostSendNotSent("no bytes offered")))
+    result = dispatch()
+    assert result["error"]["code"] == 5019
+    assert result["error"]["data"] == {"delivery": "not_sent"}
     assert serving["_metadata_mirror"]["reasoning_effort"] == "low"
     assert "create_reasoning_override" not in serving
 
@@ -105,7 +132,9 @@ def test_replaced_parent_owner_does_not_accept_late_ack(serving, monkeypatch):
         return ack()
 
     monkeypatch.setattr(server, "_send_compute_host_control", replace_then_ack)
-    assert dispatch()["error"]["code"] == 5019
+    result = dispatch()
+    assert result["error"]["code"] == 5019
+    assert result["error"]["data"] == {"delivery": "uncertain"}
     assert replacement["_metadata_mirror"]["reasoning_effort"] == "medium"
     assert serving["_metadata_mirror"]["reasoning_effort"] == "low"
 

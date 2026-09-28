@@ -14695,6 +14695,8 @@ def _(rid, params: dict) -> dict:
             if parsed is None:
                 return _err(rid, 4002, f"unknown reasoning value: {value}")
             if session is not None and not global_scope and _session_uses_compute_host(session):
+                from tui_gateway.host_supervisor import HostSendNotSent
+
                 sid = str(requested_session_id)
                 route_name = "config.set.reasoning"
                 try:
@@ -14708,23 +14710,33 @@ def _(rid, params: dict) -> dict:
                         wait=True,
                         timeout=25.0,
                     )
+                except HostSendNotSent:
+                    return _err(rid, 5019, "reasoning update was not sent",
+                                {"delivery": "not_sent"})
                 except Exception:
-                    return _err(rid, 5019, "reasoning update unconfirmed; read back the session before retrying")
+                    return _err(rid, 5019, "reasoning update unconfirmed; read back the session before retrying",
+                                {"delivery": "uncertain"})
                 if _sessions.get(sid) is not session:
-                    return _err(rid, 5019, "reasoning update owner changed; resume and reconcile before retrying")
+                    return _err(rid, 5019, "reasoning update owner changed; resume and reconcile before retrying",
+                                {"delivery": "uncertain"})
                 if not isinstance(ack, dict) or ack.get("sid") != sid:
-                    return _err(rid, 5019, "reasoning update returned an unconfirmed owner")
+                    return _err(rid, 5019, "reasoning update returned an unconfirmed owner",
+                                {"delivery": "uncertain"})
                 if ack.get("type") in {"control.error", "error"}:
+                    # The control was offered; a host-reported error code is
+                    # not evidence that it did not apply before the reply.
                     code = ack.get("code")
-                    return _err(rid, code if type(code) is int else 5001,
-                                str(ack.get("message") or "reasoning update failed"))
+                    return _err(rid, 5019,
+                                str(ack.get("message") or "reasoning update unconfirmed"),
+                                {"delivery": "uncertain", **({"host_code": code} if type(code) is int else {})})
                 result, info = ack.get("result"), ack.get("session_info")
                 if (ack.get("type") != "control.ack" or ack.get("route_name") != route_name
                         or not isinstance(result, dict) or result.get("key") != "reasoning"
                         or result.get("value") != arg or not isinstance(info, dict)
                         or not isinstance(info.get("reasoning_effort"), str)
                         or parse_reasoning_effort(info["reasoning_effort"]) != parsed):
-                    return _err(rid, 5019, "reasoning update lacks confirmed owner readback")
+                    return _err(rid, 5019, "reasoning update lacks confirmed owner readback",
+                                {"delivery": "uncertain"})
                 # Persisted by the host handler. Never mutate or persist the
                 # serving shadow; retain only the acknowledged reconstruction pin.
                 session["create_reasoning_override"] = parsed
