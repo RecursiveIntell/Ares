@@ -3165,6 +3165,10 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
             # writes or apply an old request to a reused runtime id.
             sid = _params["session_id"]
             reservation = object()
+            # Admission expires before the desktop's 30s option RPC timeout.
+            # This only bounds queued starts; it cannot cancel a host write
+            # that has already begun or prove its outcome after a lost reply.
+            admission_deadline = time.monotonic() + 25.0
             with _sessions_lock:
                 record = _sessions.get(sid)
                 if record is None:
@@ -3188,6 +3192,8 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
                                    and record.get("transport") is owner_transport)
                     if not current:
                         resp = _err(_rid, 4001, "session owner changed; request not applied")
+                    elif time.monotonic() >= admission_deadline:
+                        resp = _err(_rid, 4009, "session option request expired before execution; not applied")
                     else:
                         resp = handle_request(req)
                 except Exception as exc:

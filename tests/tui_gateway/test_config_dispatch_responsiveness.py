@@ -168,3 +168,36 @@ def test_real_reasoning_handler_can_persist_without_holding_reader(scoped, monke
     assert transport.done.wait(2)
     assert transport.frames[0]["result"]["value"] == "xhigh"
     assert record["agent"].reasoning_config == {"enabled": True, "effort": "xhigh"}
+
+
+@pytest.mark.parametrize("queue_age,applied", [(24.0, True), (25.0, False), (60.0, False)])
+def test_setting_admission_expires_before_late_worker_mutation(scoped, monkeypatch, queue_age, applied):
+    transport, record = scoped
+    clock = [100.0]
+    queued, calls = [], []
+
+    class HeldPool:
+        def submit(self, fn):
+            queued.append(fn)
+
+    def handler(rid, params):
+        calls.append(rid)
+        return server._ok(rid, {"ok": True})
+
+    monkeypatch.setattr(server, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(server, "_pool", HeldPool())
+    monkeypatch.setitem(server._methods, "config.set", handler)
+    assert server.dispatch(request("aged"), transport) is None
+    clock[0] += queue_age
+    queued.pop(0)()
+    if applied:
+        assert calls == ["aged"]
+        assert transport.frames[-1]["result"] == {"ok": True}
+    else:
+        assert calls == []
+        assert transport.frames[-1]["error"]["code"] == 4009
+        assert "not applied" in transport.frames[-1]["error"]["message"]
+    # Expiry releases the old reservation; it never poisons a new intent.
+    assert server.dispatch(request("fresh"), transport) is None
+    queued.pop(0)()
+    assert calls[-1] == "fresh"
