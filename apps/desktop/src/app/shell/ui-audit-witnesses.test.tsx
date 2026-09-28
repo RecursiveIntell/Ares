@@ -329,7 +329,7 @@ it('an uncertain effort write reads host state rather than guessing a rollback o
   const request = vi
     .fn()
     .mockRejectedValueOnce(new Error('request timed out after 30s: config.set'))
-    .mockResolvedValueOnce({ owner: 'compute_host', session_id: 'r1', value: 'low' })
+    .mockResolvedValueOnce({ owner: 'compute_host', session_id: 'r1', host_boot_id: 'owner-boot', value: 'low' })
 
   panel(request)
   await act(async () => fireEvent.click(screen.getByText('Set high')))
@@ -386,7 +386,7 @@ it('an uncertain preset effort reads back but never sends the unattempted Fast w
   const request = vi
     .fn()
     .mockRejectedValueOnce(new Error('request timed out after 30s: config.set'))
-    .mockResolvedValueOnce({ owner: 'compute_host', session_id: 'r1', value: 'xhigh' })
+    .mockResolvedValueOnce({ owner: 'compute_host', session_id: 'r1', host_boot_id: 'owner-boot', value: 'xhigh' })
 
   await applyModelPreset(
     { effort: 'high', fast: true },

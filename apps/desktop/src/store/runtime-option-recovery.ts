@@ -81,7 +81,12 @@ export async function reconcileRuntimeOptionFailure(
       return true
     }
 
-    if (response?.owner === 'compute_host' && response.session_id === sessionId) {
+    if (
+      response?.owner === 'compute_host' &&
+      response.session_id === sessionId &&
+      typeof response.host_boot_id === 'string' &&
+      response.host_boot_id.trim().length > 0
+    ) {
       const value = response.value
 
       const validEffort =
