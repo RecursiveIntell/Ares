@@ -15,7 +15,8 @@ def owner(monkeypatch):
     monkeypatch.setattr(server, "_sessions", {"live": record})
     monkeypatch.setattr(server, "_session_uses_compute_host", lambda s: True)
     monkeypatch.setattr(server, "_load_cfg", lambda: {"agent": {"reasoning_effort": "high"}})
-    lookup = Mock(return_value={"session_id": "live", "session_info": {"reasoning_effort": "xhigh", "fast": False}})
+    lookup = Mock(return_value={"session_id": "live", "host_boot_id": "attested-boot",
+                                "session_info": {"reasoning_effort": "xhigh", "fast": False}})
     monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda: SimpleNamespace(lookup_session_key=lookup))
     return record, lookup
 
@@ -31,6 +32,7 @@ def test_option_read_fetches_fresh_owner_instead_of_shadow(owner, key, expected)
     assert response["result"]["value"] == expected
     assert response["result"]["owner"] == "compute_host"
     assert response["result"]["session_id"] == "live"
+    assert response["result"]["host_boot_id"] == "attested-boot"
     lookup.assert_called_once_with("stored")
     assert record["_metadata_mirror"] == {"reasoning_effort": "medium", "fast": True}
 
@@ -42,7 +44,7 @@ def test_explicit_owner_effort_is_not_replaced_with_default(owner, effort):
     assert read("reasoning")["result"]["value"] == effort
 
 
-@pytest.mark.parametrize("failure", ["timeout", "missing", "wrong-owner", "invalid-info", "replaced-parent", "changed-key"])
+@pytest.mark.parametrize("failure", ["timeout", "missing", "wrong-owner", "invalid-info", "missing-boot", "replaced-parent", "changed-key"])
 def test_unconfirmed_read_never_falls_back_to_cached_values(owner, failure):
     record, lookup = owner
     if failure == "timeout":
@@ -53,6 +55,8 @@ def test_unconfirmed_read_never_falls_back_to_cached_values(owner, failure):
         lookup.return_value["session_id"] = "other"
     elif failure == "invalid-info":
         lookup.return_value["session_info"] = {}
+    elif failure == "missing-boot":
+        lookup.return_value.pop("host_boot_id")
     else:
         def replace(key):
             if failure == "changed-key":

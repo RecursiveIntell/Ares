@@ -202,8 +202,11 @@ def _(rid, params: dict) -> dict:
             if (_sessions.get(sid) is not session
                     or _session_lookup_key(session, fallback=sid) != session_key
                     or not isinstance(owner, dict)
-                    or owner.get("session_id") != sid):
+                    or owner.get("session_id") != sid
+                    or type(owner.get("host_boot_id")) is not str
+                    or not owner["host_boot_id"]):
                 return _err(rid, 5019, "session option owner could not be confirmed")
+            boot_id = owner["host_boot_id"]
             info = owner.get("session_info")
             field = "reasoning_effort" if key == "reasoning" else "fast"
             expected_type = str if key == "reasoning" else bool
@@ -211,10 +214,10 @@ def _(rid, params: dict) -> dict:
                 return _err(rid, 5019, "session option readback is incomplete")
             if key == "fast":
                 return _ok(rid, {"value": "fast" if info["fast"] else "normal",
-                                 "owner": "compute_host", "session_id": sid})
+                                 "owner": "compute_host", "session_id": sid, "host_boot_id": boot_id})
             display = "show" if bool((_load_cfg().get("display") or {}).get("show_reasoning", True)) else "hide"
             return _ok(rid, {"value": info["reasoning_effort"], "display": display,
-                             "owner": "compute_host", "session_id": sid})
+                             "owner": "compute_host", "session_id": sid, "host_boot_id": boot_id})
     if key == "provider":
         try:
             from hermes_cli.models import list_available_providers, normalize_provider
