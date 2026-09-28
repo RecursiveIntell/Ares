@@ -36,6 +36,17 @@ _ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,191}")
 _SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}")
 
 
+def _valid_context_stop_v2(value) -> bool:
+    """Authenticate the exact V2 Stop control shape before reading a cancelled turn."""
+    return (type(value) is dict
+        and set(value) == {"schema", "revision", "stopped", "stopped_at", "input_watermark", "input_sequence"}
+        and value["schema"] == "SessionDBContextControlV2" and value["stopped"] is True
+        and type(value["revision"]) is int and value["revision"] > 0
+        and type(value["input_watermark"]) is int and value["input_watermark"] >= 0
+        and type(value["input_sequence"]) is int and value["input_sequence"] >= 0
+        and type(value["stopped_at"]) in (int, float) and math.isfinite(value["stopped_at"]))
+
+
 class ContextContinuationError(RuntimeError):
     """Typed continuity refusal with a stable payload-free code."""
 
