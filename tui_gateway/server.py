@@ -14710,6 +14710,11 @@ def _(rid, params: dict) -> dict:
                 sid = str(requested_session_id)
                 route_name = "config.set.reasoning"
                 try:
+                    supervisor = _get_compute_host_supervisor()
+                    boot_before = supervisor.boot_id
+                    if type(boot_before) is not str or not boot_before:
+                        return _err(rid, 5019, "reasoning update has no confirmed host boot",
+                                    {"delivery": "uncertain"})
                     ack = _send_compute_host_control(
                         sid,
                         route_name=route_name,
@@ -14740,7 +14745,14 @@ def _(rid, params: dict) -> dict:
                                 str(ack.get("message") or "reasoning update unconfirmed"),
                                 {"delivery": "uncertain", **({"host_code": code} if type(code) is int else {})})
                 result, info = ack.get("result"), ack.get("session_info")
+                try:
+                    boot_after = supervisor.boot_id
+                except Exception:
+                    return _err(rid, 5019, "reasoning update returned an unconfirmed host boot",
+                                {"delivery": "uncertain"})
                 if (ack.get("type") != "control.ack" or ack.get("route_name") != route_name
+                        or type(boot_after) is not str or boot_after != boot_before
+                        or ack.get("_host_boot_id") != boot_after
                         or not isinstance(result, dict) or result.get("key") != "reasoning"
                         or result.get("value") != arg or not isinstance(info, dict)
                         or not isinstance(info.get("reasoning_effort"), str)

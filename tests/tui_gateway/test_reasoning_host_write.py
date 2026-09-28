@@ -22,6 +22,7 @@ def serving(monkeypatch):
     monkeypatch.setattr(server, "_emit", Mock())
     monkeypatch.setattr(server, "_persist_live_session_runtime", Mock())
     monkeypatch.setattr(server, "_write_config_key", Mock(side_effect=AssertionError("global write")))
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda: SimpleNamespace(boot_id="owner-boot"))
     return record
 
 
@@ -31,6 +32,7 @@ def dispatch():
 
 def ack():
     return {"type": "control.ack", "sid": "live", "route_name": "config.set.reasoning",
+            "_host_boot_id": "owner-boot",
             "result": {"key": "reasoning", "value": "xhigh"},
             "session_info": {"reasoning_effort": "xhigh"}}
 
@@ -65,6 +67,36 @@ def test_unconfirmed_write_never_paints_success(serving, monkeypatch, bad):
     assert serving["agent"].reasoning_config["effort"] == "low"
     assert serving["_metadata_mirror"]["reasoning_effort"] == "low"
     assert "create_reasoning_override" not in serving
+
+
+@pytest.mark.parametrize("fault", ["ack_boot", "changed_boot", "probe_before", "probe_after", "empty_before"])
+def test_reasoning_ack_must_match_live_host_boot(serving, monkeypatch, fault):
+    class Supervisor:
+        probes = 0
+        @property
+        def boot_id(self):
+            self.probes += 1
+            if fault == "probe_before" or fault == "probe_after" and self.probes > 1:
+                raise OSError("boot probe unavailable")
+            if fault == "empty_before" and self.probes == 1:
+                return ""
+            return "new-boot" if fault == "changed_boot" and self.probes > 1 else "owner-boot"
+
+    supervisor = Supervisor()
+    response = ack()
+    if fault == "ack_boot":
+        response["_host_boot_id"] = "retired-boot"
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda: supervisor)
+    send = Mock(return_value=response)
+    monkeypatch.setattr(server, "_send_compute_host_control", send)
+    result = dispatch()
+    if fault == "empty_before":
+        send.assert_not_called()
+    assert result["error"]["code"] == 5019
+    assert result["error"]["data"] == {"delivery": "uncertain"}
+    assert serving["_metadata_mirror"]["reasoning_effort"] == "low"
+    assert "create_reasoning_override" not in serving
+    server._emit.assert_not_called()
 
 
 @pytest.mark.parametrize("host_code", [4001, 4002, 4009])
