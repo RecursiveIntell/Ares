@@ -7316,9 +7316,15 @@ def _session_info(agent, session: dict | None = None) -> dict:
     )
     cfg_personality = ((_load_cfg().get("display") or {}).get("personality") or "")
     personality = (session or {}).get("personality", cfg_personality)
-    reasoning_config = getattr(agent, "reasoning_config", None)
+    host_owned = session is not None and _session_uses_compute_host(session)
+    reasoning_config = None if host_owned else getattr(agent, "reasoning_config", None)
     reasoning_effort = ""
-    if isinstance(reasoning_config, dict):
+    if host_owned:
+        # Only owner-confirmed metadata may describe the executing agent.
+        # Empty/missing readback is unknown, not permission to revive a stale
+        # serving-process effort after a reconnect or host restart.
+        reasoning_effort = str(mirror.get("reasoning_effort") or "")
+    elif isinstance(reasoning_config, dict):
         if reasoning_config.get("enabled") is False:
             # Disabled must be distinguishable from unset ("" = provider
             # default). Reporting "" here made the desktop adopt the empty
@@ -13998,7 +14004,13 @@ def _respond(rid, params, key, *, allow_expired=False):
 @method("config.set")
 def _(rid, params: dict) -> dict:
     key, value = params.get("key", ""), params.get("value", "")
-    session = _sessions.get(params.get("session_id", ""))
+    requested_session_id = params.get("session_id")
+    session = _sessions.get(requested_session_id or "")
+
+    # An explicit runtime target must never become a profile-global write
+    # merely because that runtime was retired. Recover through session.resume.
+    if requested_session_id not in (None, "") and session is None:
+        return _err(rid, 4001, "session not found")
 
     if key == "model":
         try:
