@@ -14287,6 +14287,8 @@ def _(rid, params: dict) -> dict:
         if params.get("session_id") and session is None:
             return _err(rid, 4001, "session not found")
         if session is not None and session.get("_compute_host_active") and _session_uses_compute_host(session):
+            from tui_gateway.host_supervisor import HostSendNotSent
+
             sid = str(params["session_id"])
             route_name = "config.set.fast"
             try:
@@ -14299,19 +14301,26 @@ def _(rid, params: dict) -> dict:
                     wait=True,
                     timeout=30.0,
                 )
+            except HostSendNotSent:
+                return _err(rid, 5019, "fast update was not sent", {"delivery": "not_sent"})
             except Exception:
-                return _err(rid, 5019, "fast update unconfirmed; read back the session before retrying")
+                return _err(rid, 5019, "fast update unconfirmed; read back the session before retrying",
+                            {"delivery": "uncertain"})
             if _sessions.get(sid) is not session or not isinstance(ack, dict):
-                return _err(rid, 5019, "fast update returned an unconfirmed owner")
+                return _err(rid, 5019, "fast update returned an unconfirmed owner",
+                            {"delivery": "uncertain"})
             if ack.get("type") in {"control.error", "error"}:
                 # A host error after an offered write carries no proof that
                 # the mutation was not applied, regardless of its error code.
-                return _err(rid, 5019, str(ack.get("message") or "fast update unconfirmed"))
+                code = ack.get("code")
+                return _err(rid, 5019, str(ack.get("message") or "fast update unconfirmed"),
+                            {"delivery": "uncertain", **({"host_code": code} if type(code) is int else {})})
             result, info = ack.get("result"), ack.get("session_info")
             try:
                 boot_after = supervisor.boot_id
             except Exception:
-                return _err(rid, 5019, "fast update returned an unconfirmed host boot")
+                return _err(rid, 5019, "fast update returned an unconfirmed host boot",
+                            {"delivery": "uncertain"})
             effective = result.get("value") if isinstance(result, dict) else None
             tier = info.get("service_tier") if isinstance(info, dict) else None
             if (ack.get("type") != "control.ack" or ack.get("sid") != sid
@@ -14326,7 +14335,8 @@ def _(rid, params: dict) -> dict:
                     or tier not in ({"priority"} if effective == "fast" else {"", "normal"})
                     or type(info.get("fast")) is not bool
                     or info["fast"] != (effective == "fast")):
-                return _err(rid, 5019, "fast update lacks confirmed owner readback")
+                return _err(rid, 5019, "fast update lacks confirmed owner readback",
+                            {"delivery": "uncertain"})
             _apply_compute_host_metadata_mirror(session, ack)
             _emit("session.info", sid, _session_info(session.get("agent"), session))
             return _ok(rid, result)

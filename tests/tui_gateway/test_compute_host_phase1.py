@@ -812,12 +812,36 @@ def test_contradictory_fast_owner_readback_is_unknown_without_parent_paint(monke
         response = server.handle_request({"id": "fast-on", "method": "config.set",
                                           "params": {"session_id": sid, "key": "fast", "value": "fast"}})
         assert response["error"]["code"] == 5019
+        assert response["error"]["data"] == {"delivery": "uncertain"}
         assert session["_metadata_mirror"] == {"service_tier": "normal", "fast": False}
         assert "create_service_tier_override" not in session
         assert agent.service_tier is None
         assert emitted == []
     finally:
         server._sessions.pop(sid, None)
+
+
+def test_fast_proven_pre_send_refusal_has_not_sent_delivery(monkeypatch):
+    from tui_gateway.host_supervisor import HostSendNotSent
+
+    sid = "fast-unsent-owner"
+    session = {"agent": types.SimpleNamespace(model="openai/gpt-5.4", service_tier=None),
+               "session_key": "stored-fast", "_compute_host_active": True,
+               "_metadata_mirror": {"service_tier": "normal", "fast": False}}
+    class Supervisor:
+        boot_id = "owner-boot"
+        def control(self, *_args, **_kwargs):
+            raise HostSendNotSent("no bytes offered")
+    monkeypatch.setattr(server, "_sessions", {sid: session})
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _: True)
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda: Supervisor())
+    monkeypatch.setattr(server, "_emit", lambda *a: pytest.fail("unsent fast write painted success"))
+    response = server.handle_request({"id": "fast-unsent", "method": "config.set",
+                                      "params": {"session_id": sid, "key": "fast", "value": "fast"}})
+    assert response["error"]["code"] == 5019
+    assert response["error"]["data"] == {"delivery": "not_sent"}
+    assert session["_metadata_mirror"]["fast"] is False
+    assert "create_service_tier_override" not in session
 
 
 @pytest.mark.parametrize("host_code", [4001, 4002, 4009])
@@ -844,6 +868,7 @@ def test_started_fast_host_error_is_unknown_without_not_applied_proof(monkeypatc
         response = server.handle_request({"id": "fast-error", "method": "config.set",
                                           "params": {"session_id": sid, "key": "fast", "value": "fast"}})
         assert response["error"]["code"] == 5019
+        assert response["error"]["data"] == {"delivery": "uncertain", "host_code": host_code}
         assert session["_metadata_mirror"] == {"service_tier": "normal", "fast": False}
         assert "create_service_tier_override" not in session
         assert agent.service_tier is None
@@ -883,6 +908,7 @@ def test_fast_ack_cannot_paint_changed_owner_or_route(monkeypatch, change):
         response = server.handle_request({"id": "fast-owner", "method": "config.set",
                                           "params": {"session_id": sid, "key": "fast", "value": "fast"}})
         assert response is not None and response["error"]["code"] == 5019
+        assert response["error"]["data"] == {"delivery": "uncertain"}
         assert session["_metadata_mirror"] == {"service_tier": "normal", "fast": False}
         assert agent.service_tier is None
         assert "create_service_tier_override" not in session
@@ -922,6 +948,7 @@ def test_fast_supervisor_boot_probe_failure_is_typed_without_parent_paint(monkey
         response = server.handle_request({"id": "fast-probe", "method": "config.set",
                                           "params": {"session_id": sid, "key": "fast", "value": "fast"}})
         assert response is not None and response["error"]["code"] == 5019
+        assert response["error"]["data"] == {"delivery": "uncertain"}
         assert session["_metadata_mirror"] == {"service_tier": "normal", "fast": False}
         assert emitted == []
     finally:
