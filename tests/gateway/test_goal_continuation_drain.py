@@ -286,10 +286,14 @@ async def test_turn_start_rejects_checkpoint_corrupted_after_enqueue(hermes_home
     assert mgr.claim_continuation("scratch-scheduler") is True
     assert mgr.release_continuation(queued=True) is True
     mgr.state.checkpoint["goal_id"] = "foreign-goal"
-    assert goals.save_goal(session_id, mgr.state) is True
+    assert goals.save_goal(session_id, mgr.state) is False
     db = goals._get_session_db()
     assert db is not None
+    # Inject storage corruption only in the scratch DB so the turn consumer's
+    # independent validation is exercised despite the writer's rejection.
+    db.set_meta(goals._meta_key(session_id), mgr.state.to_json())
     before = db.get_meta(goals._meta_key(session_id))
+    assert before == mgr.state.to_json()
     event = MessageEvent(
         text=CONTINUATION_TEXT,
         message_type=MessageType.TEXT,

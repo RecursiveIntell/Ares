@@ -31,11 +31,19 @@ def test_busy_rejection_must_not_settle_another_live_turn_or_disable_stop(monkey
 
 def test_rejected_competing_turn_must_not_consume_recovered_owner_observer(tmp_path):
     supervisor = HostSupervisor(registry_path=tmp_path/'host.json',argv=[sys.executable,'-c',''],autostart=False)
-    live_callback, rejected_callback = Mock(), Mock()
-    supervisor.observe_session('runtime',live_callback)
-    supervisor._pending_turns['rejected-submit'] = ('runtime',rejected_callback)
+    rejected_done, live_done = threading.Event(), threading.Event()
+    live_callback = Mock(side_effect=lambda frame: live_done.set())
+    rejected_callback = Mock(side_effect=lambda frame: rejected_done.set())
+    supervisor.observe_session('runtime',live_callback, request_id='actual-live')
+    supervisor._pending_turns['rejected-submit'] = ('runtime',rejected_callback,supervisor.boot_id)
     supervisor._complete_turn({'type':'turn.error','sid':'runtime','request_id':'rejected-submit','message':'session busy'})
+    assert rejected_done.wait(2), 'rejected request callback did not settle'
     print({'live_observer_calls':live_callback.call_count,'observer_still_registered':'runtime' in supervisor._session_observers,
            'rejected_callback_calls':rejected_callback.call_count})
     assert not live_callback.called, 'session-only observer accepted another request terminal frame'
     assert 'runtime' in supervisor._session_observers
+    supervisor._complete_turn({'type':'turn.end','sid':'runtime','request_id':'actual-live'})
+    assert live_done.wait(2), 'the real owner terminal must still reach its observer'
+    live_callback.assert_called_once()
+    rejected_callback.assert_called_once()
+    assert 'runtime' not in supervisor._session_observers
