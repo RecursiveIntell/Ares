@@ -9,7 +9,9 @@ import {
   $currentModel,
   $currentProvider,
   $selectedStoredSessionId,
+  getCurrentModelSource,
   setCurrentModel,
+  setCurrentModelSource,
   setCurrentProvider
 } from '@/store/session'
 import {
@@ -114,5 +116,116 @@ describe('useModelControls runtime authority', () => {
     expect(PRIMARY_SESSION_VIEW.$model.get()).toBe('model-a')
     expect(PRIMARY_SESSION_VIEW.$provider.get()).toBe('provider-a')
     expect($sessionStates.get()[PRIMARY_RUNTIME_ID]).toMatchObject({ model: 'model-a', provider: 'provider-a' })
+  })
+
+  it.each([
+    { label: 'older rejection first', order: [0, 1] },
+    { label: 'newer rejection first', order: [1, 0] }
+  ])('restores the last confirmed owner after two overlapping model picks both reject ($label)', async ({ order }) => {
+    setCurrentModelSource('default')
+
+    const rejectRequests: Array<(reason: Error) => void> = []
+
+    const requestGateway = vi.fn(
+      () =>
+        new Promise<never>((_resolve, reject) => {
+          rejectRequests.push(reject)
+        })
+    )
+
+    const { result } = renderHook(() => useModelControls({ queryClient: new QueryClient(), requestGateway }))
+
+    const first = result.current.selectModel({ model: 'model-b', provider: 'provider-b' })
+    const second = result.current.selectModel({ model: 'model-c', provider: 'provider-c' })
+    expect(rejectRequests).toHaveLength(2)
+    expect(PRIMARY_SESSION_VIEW.$model.get()).toBe('model-c')
+
+    const picks = [first, second]
+
+    for (const index of order) {
+      rejectRequests[index](new Error(`${index === 0 ? 'B' : 'C'} rejected`))
+      await expect(picks[index]).resolves.toBe(false)
+    }
+
+    expect(PRIMARY_SESSION_VIEW.$model.get()).toBe('model-a')
+    expect(PRIMARY_SESSION_VIEW.$provider.get()).toBe('provider-a')
+    expect($sessionStates.get()[PRIMARY_RUNTIME_ID]).toMatchObject({
+      model: 'model-a',
+      provider: 'provider-a',
+      pendingModelSelection: null
+    })
+    expect($currentModel.get()).toBe('model-a')
+    expect($currentProvider.get()).toBe('provider-a')
+    expect(getCurrentModelSource()).toBe('default')
+  })
+
+  it.each([
+    { label: 'before', ackFirst: true },
+    { label: 'after', ackFirst: false }
+  ])('retains an acknowledged earlier pick when it settles $label the later rejection', async ({ ackFirst }) => {
+    const requests: Array<{
+      reject: (reason: Error) => void
+      resolve: (value: unknown) => void
+    }> = []
+
+    const requestGateway = vi.fn(
+      () =>
+        new Promise<never>((resolve, reject) => {
+          requests.push({ reject, resolve: value => resolve(value as never) })
+        })
+    )
+
+    const { result } = renderHook(() => useModelControls({ queryClient: new QueryClient(), requestGateway }))
+
+    const first = result.current.selectModel({ model: 'model-b', provider: 'provider-b' })
+    const second = result.current.selectModel({ model: 'model-c', provider: 'provider-c' })
+
+    if (ackFirst) {
+      requests[0].resolve({ key: 'model', scope: 'session', value: 'model-b' })
+      await expect(first).resolves.toBe(true)
+      requests[1].reject(new Error('C rejected'))
+      await expect(second).resolves.toBe(false)
+    } else {
+      requests[1].reject(new Error('C rejected'))
+      await expect(second).resolves.toBe(false)
+      requests[0].resolve({ key: 'model', scope: 'session', value: 'model-b' })
+      await expect(first).resolves.toBe(true)
+    }
+
+    expect(PRIMARY_SESSION_VIEW.$model.get()).toBe('model-b')
+    expect(PRIMARY_SESSION_VIEW.$provider.get()).toBe('provider-b')
+    expect($sessionStates.get()[PRIMARY_RUNTIME_ID]).toMatchObject({
+      model: 'model-b',
+      provider: 'provider-b',
+      pendingModelSelection: null
+    })
+    expect($currentModel.get()).toBe('model-b')
+    expect($currentProvider.get()).toBe('provider-b')
+  })
+
+  it('does not let an older acknowledgement repaint a newer successful choice', async () => {
+    const requests: Array<(value: unknown) => void> = []
+
+    const requestGateway = vi.fn(
+      () =>
+        new Promise<never>(resolve => {
+          requests.push(value => resolve(value as never))
+        })
+    )
+
+    const { result } = renderHook(() => useModelControls({ queryClient: new QueryClient(), requestGateway }))
+
+    const first = result.current.selectModel({ model: 'model-b', provider: 'provider-b' })
+    const second = result.current.selectModel({ model: 'model-c', provider: 'provider-c' })
+
+    requests[1]({ key: 'model', scope: 'session', value: 'model-c' })
+    await expect(second).resolves.toBe(true)
+    requests[0]({ key: 'model', scope: 'session', value: 'model-b' })
+    await expect(first).resolves.toBe(true)
+
+    expect(PRIMARY_SESSION_VIEW.$model.get()).toBe('model-c')
+    expect(PRIMARY_SESSION_VIEW.$provider.get()).toBe('provider-c')
+    expect($currentModel.get()).toBe('model-c')
+    expect($currentProvider.get()).toBe('provider-c')
   })
 })

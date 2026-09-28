@@ -215,6 +215,18 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
         : ($sessionStates.get()[liveSessionId!]?.provider ?? '')
 
       const prevSource = getCurrentModelSource()
+      const pendingBefore = liveSessionId ? $sessionStates.get()[liveSessionId]?.pendingModelSelection : null
+      const continuesOptimisticChain = pendingBefore?.model === prevModel && pendingBefore?.provider === prevProvider
+
+      const rollbackModel = continuesOptimisticChain
+        ? (pendingBefore?.rollbackModel ?? pendingBefore?.previousModel ?? prevModel)
+        : prevModel
+
+      const rollbackProvider = continuesOptimisticChain
+        ? (pendingBefore?.rollbackProvider ?? pendingBefore?.previousProvider ?? prevProvider)
+        : prevProvider
+
+      const rollbackSource = continuesOptimisticChain ? (pendingBefore?.rollbackSource ?? prevSource) : prevSource
       const liveGatewayProfile = $activeGatewayProfile.get()
 
       // A runtime id is ephemeral. Keep its durable owner while the switch is
@@ -260,7 +272,10 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
                 model,
                 provider,
                 previousModel: prevModel,
-                previousProvider: prevProvider
+                previousProvider: prevProvider,
+                rollbackModel,
+                rollbackProvider,
+                rollbackSource
               }
             : null
 
@@ -270,7 +285,10 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
               : state.pendingModelSelection?.model === pendingModelSelection.model &&
                 state.pendingModelSelection.provider === pendingModelSelection.provider &&
                 state.pendingModelSelection.previousModel === pendingModelSelection.previousModel &&
-                state.pendingModelSelection.previousProvider === pendingModelSelection.previousProvider
+                state.pendingModelSelection.previousProvider === pendingModelSelection.previousProvider &&
+                state.pendingModelSelection.rollbackModel === pendingModelSelection.rollbackModel &&
+                state.pendingModelSelection.rollbackProvider === pendingModelSelection.rollbackProvider &&
+                state.pendingModelSelection.rollbackSource === pendingModelSelection.rollbackSource
 
           const nextState = {
             ...state,
@@ -311,22 +329,31 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
           return
         }
 
+        const pending = liveSessionId ? $sessionStates.get()[liveSessionId]?.pendingModelSelection : null
+
+        const currentRollback =
+          pending?.model === selection.model && pending.provider === selection.provider ? pending : null
+
+        const appliedRollbackModel = currentRollback?.rollbackModel ?? rollbackModel
+        const appliedRollbackProvider = currentRollback?.rollbackProvider ?? rollbackProvider
+        const appliedRollbackSource = currentRollback?.rollbackSource ?? rollbackSource
+
         // Roll back the owning runtime even if its primary surface lost focus
         // while the RPC was pending. That state is separate from the current
         // foreground globals and must not remain as a false applied switch.
-        updateLiveRuntimeSelection(prevModel, prevProvider, false)
+        updateLiveRuntimeSelection(appliedRollbackModel, appliedRollbackProvider, false)
 
         if (touchesPrimary) {
           if (!stillOwnsPrimarySelection() || !owns('model')) {
             return
           }
 
-          setCurrentModel(prevModel)
-          setCurrentProvider(prevProvider)
-          setCurrentModelSource(prevSource)
+          setCurrentModel(appliedRollbackModel)
+          setCurrentProvider(appliedRollbackProvider)
+          setCurrentModelSource(appliedRollbackSource)
         }
 
-        cacheSelection(prevProvider, prevModel)
+        cacheSelection(appliedRollbackProvider, appliedRollbackModel)
       }
 
       paintSelection()
@@ -403,6 +430,59 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
 
       const finishSwitch = (result: ModelSwitchResponse | undefined) => {
         if (!owns('model')) {
+          // A prior pick may be acknowledged while a newer optimistic pick
+          // remains pending. Advance only that pick's rollback baseline.
+          if (
+            result &&
+            !result.deferred &&
+            liveSessionId &&
+            targetKey(liveSessionId, storedSessionId) === selectionTarget
+          ) {
+            let acknowledgedAfterRollback = false
+
+            sessionTileDelegate()?.updateSession(liveSessionId, state => {
+              const pending = state.pendingModelSelection
+
+              if (pending?.previousModel === selection.model && pending.previousProvider === selection.provider) {
+                return {
+                  ...state,
+                  pendingModelSelection: {
+                    ...pending,
+                    rollbackModel: selection.model,
+                    rollbackProvider: selection.provider,
+                    rollbackSource: touchesPrimary ? 'manual' : pending.rollbackSource
+                  }
+                }
+              }
+
+              // The newer pick already rejected and restored this request's
+              // baseline. The older acknowledged result can now be painted,
+              // but never over another pending or different successful pick.
+              if (pending === null && state.model === rollbackModel && state.provider === rollbackProvider) {
+                acknowledgedAfterRollback = true
+
+                return { ...state, model: selection.model, provider: selection.provider }
+              }
+
+              return state
+            })
+
+            if (acknowledgedAfterRollback) {
+              if (
+                touchesPrimary &&
+                stillOwnsPrimarySelection() &&
+                $currentModel.get() === rollbackModel &&
+                $currentProvider.get() === rollbackProvider
+              ) {
+                setCurrentModel(selection.model)
+                setCurrentProvider(selection.provider)
+                setCurrentModelSource('manual')
+              }
+
+              cacheSelection(selection.provider, selection.model)
+            }
+          }
+
           return
         }
 
