@@ -1,4 +1,9 @@
-# Session/control repair — incomplete preservation checkpoint
+# Session/control repair — historical preservation checkpoint
+
+> Historical snapshot of the initial preservation increment (`1f9a35090e7`).
+> For recovered later increments, the full remaining task/case denominator, and
+> current proof boundaries, see [the 2026-09-28 recovery checkpoint](repair-recovery-20260928.md).
+> The requirements below remain historical evidence, not the current progress projection.
 
 This branch preserves an in-progress repair, not a merge-ready or activated UI release.
 It retains the source baseline `ad547c6c4a31adf9a848d264734d2ec3cea90651`,
