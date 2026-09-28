@@ -14570,6 +14570,44 @@ def _(rid, params: dict) -> dict:
             parsed = parse_reasoning_effort(arg)
             if parsed is None:
                 return _err(rid, 4002, f"unknown reasoning value: {value}")
+            if session is not None and not global_scope and _session_uses_compute_host(session):
+                sid = str(requested_session_id)
+                route_name = "config.set.reasoning"
+                try:
+                    ack = _send_compute_host_control(
+                        sid,
+                        route_name=route_name,
+                        payload={
+                            "params": {"value": arg},
+                            "session_snapshot": _compute_host_turn_frame(rid, sid, session, ""),
+                        },
+                        wait=True,
+                        timeout=25.0,
+                    )
+                except Exception:
+                    return _err(rid, 5019, "reasoning update unconfirmed; read back the session before retrying")
+                if _sessions.get(sid) is not session:
+                    return _err(rid, 5019, "reasoning update owner changed; resume and reconcile before retrying")
+                if not isinstance(ack, dict) or ack.get("sid") != sid:
+                    return _err(rid, 5019, "reasoning update returned an unconfirmed owner")
+                if ack.get("type") in {"control.error", "error"}:
+                    code = ack.get("code")
+                    return _err(rid, code if type(code) is int else 5001,
+                                str(ack.get("message") or "reasoning update failed"))
+                result, info = ack.get("result"), ack.get("session_info")
+                if (ack.get("type") != "control.ack" or ack.get("route_name") != route_name
+                        or not isinstance(result, dict) or result.get("key") != "reasoning"
+                        or result.get("value") != arg or not isinstance(info, dict)
+                        or not isinstance(info.get("reasoning_effort"), str)
+                        or parse_reasoning_effort(info["reasoning_effort"]) != parsed):
+                    return _err(rid, 5019, "reasoning update lacks confirmed owner readback")
+                # Persisted by the host handler. Never mutate or persist the
+                # serving shadow; retain only the acknowledged reconstruction pin.
+                session["create_reasoning_override"] = parsed
+                session["_compute_host_active"] = True
+                _apply_compute_host_metadata_mirror(session, ack)
+                _emit("session.info", sid, _session_info(session.get("agent"), session))
+                return _ok(rid, result)
             if global_scope or session is None:
                 _write_config_key("agent.reasoning_effort", arg)
                 if session is not None:

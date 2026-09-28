@@ -167,6 +167,7 @@ def test_mutator_route_table_matches_prd_inventory():
     assert MUTATOR_ROUTE_TABLE == {
         "config.set.model": "run-concurrent",
         "config.set.fast": "idle-gated",
+        "config.set.reasoning": "idle-gated",
         "prompt.submit": "turn-path",
         "session.interrupt": "turn-path",
         "session.steer": "run-concurrent",

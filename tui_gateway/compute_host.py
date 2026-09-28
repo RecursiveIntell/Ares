@@ -830,7 +830,7 @@ class ComputeHost:
                 return
             if session is None:
                 snapshot = frame.get("session_snapshot")
-                if route_name == "config.set.model" and isinstance(snapshot, dict) and snapshot.get("sid") == sid:
+                if route_name in {"config.set.model", "config.set.reasoning"} and isinstance(snapshot, dict) and snapshot.get("sid") == sid:
                     # A new draft has no host session until its first turn.
                     # Rebuild from the serving gateway's committed snapshot;
                     # this also repairs a host restart before another turn.
@@ -891,17 +891,19 @@ class ComputeHost:
                     }
                 )
                 return
-            if route_name == "config.set.fast":
+            if route_name in {"config.set.fast", "config.set.reasoning"}:
+                option = route_name.removeprefix("config.set.")
                 params = frame.get("params")
                 if not isinstance(params, dict):
                     params = {}
                 response = server._methods["config.set"](
                     request_id,
-                    {"key": "fast", "value": params.get("value", ""), "session_id": sid},
+                    {"key": option, "value": params.get("value", ""), "session_id": sid},
                 )
                 if "error" in response:
                     self.emit({"type": "control.error", "sid": sid, "request_id": request_id,
-                               "message": str(response["error"].get("message") or "fast switch failed")})
+                               "code": response["error"].get("code"),
+                               "message": str(response["error"].get("message") or "option switch failed")})
                     return
                 self.emit({"type": "control.ack", "sid": sid, "request_id": request_id,
                            "route_name": route_name, "result": response.get("result") or {},
