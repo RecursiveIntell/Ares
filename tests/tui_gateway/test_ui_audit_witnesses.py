@@ -1,5 +1,7 @@
-"""Audit-only negative witnesses against deployed ad547c6; no production edits.
-Failures are desired-behavior assertions documenting current defects.
+"""Audit witnesses for hydration, scope and host-owned reasoning behavior.
+
+The host-control positive case must supply a confirmed boot and owner readback;
+a no-boot fixture can only prove a fail-closed refusal, not host delivery.
 """
 import threading
 from types import SimpleNamespace
@@ -55,12 +57,21 @@ def test_reasoning_change_must_reach_compute_host_owner(monkeypatch):
     parent = SimpleNamespace(model='fixture', provider='fixture', reasoning_config={'enabled':True,'effort':'medium'})
     record = {'session_key':'stored-audit','agent':parent,'_compute_host_active':True,'running':False,'history':[], 'history_lock':threading.Lock(), '_metadata_mirror':{'reasoning_effort':'medium'}}
     server._sessions['live'] = record
-    control = Mock(return_value={'type':'control.ack','result':{'key':'reasoning','value':'high'}})
+    control = Mock(return_value={
+        'type': 'control.ack', 'sid': 'live', 'route_name': 'config.set.reasoning',
+        '_host_boot_id': 'boot-audit',
+        'result': {'key': 'reasoning', 'value': 'high'},
+        'session_info': {'reasoning_effort': 'high'},
+    })
     monkeypatch.setattr(server, '_session_uses_compute_host', lambda s: True)
+    monkeypatch.setattr(server, '_get_compute_host_supervisor', lambda *a: SimpleNamespace(boot_id='boot-audit'))
     monkeypatch.setattr(server, '_send_compute_host_control', control)
     response = server.handle_request({'id':'host-reasoning','method':'config.set','params':{'key':'reasoning','session_id':'live','value':'high'}})
-    print({'response':response,'host_controls':control.call_count,'parent_reasoning':parent.reasoning_config,'mirror':record['_metadata_mirror']})
-    assert control.called, 'success acknowledgement only mutated serving-process agent'
+    assert isinstance(response, dict) and 'error' not in response, response
+    assert control.call_count == 1
+    assert parent.reasoning_config == {'enabled': True, 'effort': 'medium'}
+    assert record['create_reasoning_override'] == {'enabled': True, 'effort': 'high'}
+    assert record['_metadata_mirror']['reasoning_effort'] == 'high'
 
 
 def test_session_info_reports_owner_reasoning_not_stale_parent(monkeypatch):
