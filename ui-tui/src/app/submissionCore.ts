@@ -2,9 +2,9 @@ import type { GatewayClient } from '../gatewayClient.js'
 import type { InputDetectDropResponse, PromptSubmitResponse } from '../gatewayTypes.js'
 import type { Msg } from '../types.js'
 
+import { idleModelStatus } from './modelReadiness.js'
 import { turnController } from './turnController.js'
 import { getUiState, patchUiState } from './uiStore.js'
-import { idleModelStatus } from './modelReadiness.js'
 
 const SESSION_BUSY_RE = /session busy|waiting for model response/i
 

@@ -62,9 +62,19 @@ class TestFreeSlugDetection:
         assert not is_opencode_zen_free_model("model-freedom")
 
 
+@pytest.fixture
+def verified_keyless_catalog(monkeypatch):
+    # Admission tests must not depend on a rotating real promotion. Keep
+    # catalog membership explicit and independent of suffix recognition.
+    from hermes_cli import models
+
+    monkeypatch.setitem(models._PROVIDER_MODELS, "opencode-free", ["fixture-keyless-free"])
+
+
+@pytest.mark.usefixtures("verified_keyless_catalog")
 class TestFreeRuntime:
     def test_zen_provider_free_model(self):
-        rt = opencode_zen_free_runtime("opencode-zen", "x-preview-f-free")
+        rt = opencode_zen_free_runtime("opencode-zen", "fixture-keyless-free")
         assert rt is not None
         assert rt["base_url"] == "https://opencode.ai/zen/v1"
         assert rt["api_key"] == OPENCODE_ZEN_FREE_KEYLESS_PLACEHOLDER
@@ -74,7 +84,7 @@ class TestFreeRuntime:
     def test_go_provider_heals_to_zen(self):
         # Free slugs only exist on the Zen relay; a Go selection must be
         # routed to Zen (the Go relay rejects the model outright).
-        rt = opencode_zen_free_runtime("opencode-go", "x-preview-f-free")
+        rt = opencode_zen_free_runtime("opencode-go", "fixture-keyless-free")
         assert rt is not None
         assert rt["base_url"] == "https://opencode.ai/zen/v1"
 
@@ -98,6 +108,7 @@ class TestFreeRuntime:
         assert headers["X-Title"] == "Hermes Agent"
 
 
+@pytest.mark.usefixtures("verified_keyless_catalog")
 class TestRuntimeProviderKeylessRouting:
     @pytest.fixture(autouse=True)
     def _no_opencode_creds(self, monkeypatch):
@@ -114,13 +125,13 @@ class TestRuntimeProviderKeylessRouting:
             return resolve_runtime_provider(requested=provider, target_model=model)
 
     def test_zen_free_model_resolves_keyless(self):
-        rt = self._resolve("opencode-zen", "x-preview-f-free")
+        rt = self._resolve("opencode-zen", "fixture-keyless-free")
         assert rt["api_key"] == OPENCODE_ZEN_FREE_KEYLESS_PLACEHOLDER
         assert rt["base_url"] == "https://opencode.ai/zen/v1"
         assert rt["api_mode"] == "chat_completions"
 
     def test_go_free_model_resolves_keyless_on_zen(self):
-        rt = self._resolve("opencode-go", "x-preview-f-free")
+        rt = self._resolve("opencode-go", "fixture-keyless-free")
         assert rt["api_key"] == OPENCODE_ZEN_FREE_KEYLESS_PLACEHOLDER
         assert rt["base_url"] == "https://opencode.ai/zen/v1"
 

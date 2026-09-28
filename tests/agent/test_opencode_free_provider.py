@@ -91,9 +91,19 @@ class TestOpenCodeFreeModelLists:
         for mid in _PROVIDER_MODELS["opencode-free"]:
             assert is_opencode_zen_free_model(mid), mid
 
-    def test_ox_alpha_is_listed(self):
-        from hermes_cli.models import _PROVIDER_MODELS
-        assert "x-preview-f-free" in _PROVIDER_MODELS["opencode-free"]
+    def test_live_free_catalog_does_not_resurrect_retired_curated_model(self, monkeypatch):
+        from hermes_cli import models
+
+        monkeypatch.setitem(models._PROVIDER_MODELS, "opencode-free", ["retired-fixture-free"])
+        monkeypatch.setattr(models, "fetch_api_models", lambda *a, **kw: ["current-fixture-free", "paid-fixture"])
+        assert models.provider_model_ids("opencode-free", force_refresh=True) == ["current-fixture-free"]
+
+    def test_unavailable_live_catalog_does_not_offer_stale_model(self, monkeypatch):
+        from hermes_cli import models
+
+        monkeypatch.setitem(models._PROVIDER_MODELS, "opencode-free", ["retired-fixture-free"])
+        monkeypatch.setattr(models, "fetch_api_models", lambda *a, **kw: None)
+        assert models.provider_model_ids("opencode-free", force_refresh=True) == []
 
 
 class TestOpenCodeFreeRuntimeKeyless:

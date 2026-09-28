@@ -196,7 +196,11 @@ describe('createGatewayEventHandler', () => {
     expect(ctx.system.sys).toHaveBeenCalledWith('compressing 968 messages (~123,400 tok)…')
   })
 
-  it('keeps goal verdict text in transcript but shows a brief idle status (#goal statusbar)', () => {
+  it.each([false, true])('keeps goal verdict text and restores owner readiness=%s', modelReady => {
+    patchUiState({
+      sid: 'fixture-session',
+      info: { session_id: 'fixture-session', model_ready: modelReady, model: 'fixture', provider: 'fixture' } as any
+    })
     const appended: Msg[] = []
     const ctx = buildCtx(appended)
     const onEvent = createGatewayEventHandler(ctx)
@@ -214,7 +218,7 @@ describe('createGatewayEventHandler', () => {
       expect(getUiState().status).toBe('✓ goal complete')
 
       vi.advanceTimersByTime(6001)
-      expect(getUiState().status).toBe('ready')
+      expect(getUiState().status).toBe(modelReady ? 'ready' : 'model unverified')
     } finally {
       vi.useRealTimers()
     }
@@ -381,7 +385,11 @@ describe('createGatewayEventHandler', () => {
     }
   })
 
-  it('ignores late thinking.delta after the turn has already completed', () => {
+  it.each([false, true])('ignores late thinking.delta after completion with owner readiness=%s', modelReady => {
+    patchUiState({
+      sid: 'fixture-session',
+      info: { session_id: 'fixture-session', model_ready: modelReady, model: 'fixture', provider: 'fixture' } as any
+    })
     vi.useFakeTimers()
     const appended: Msg[] = []
     const onEvent = createGatewayEventHandler(buildCtx(appended))
@@ -390,12 +398,20 @@ describe('createGatewayEventHandler', () => {
       onEvent({ payload: {}, type: 'message.start' } as any)
       onEvent({ payload: { text: 'final answer' }, type: 'message.complete' } as any)
       expect(getUiState().busy).toBe(false)
-      expect(getUiState().status).toBe('ready')
+      // Completion alone is not backend model attestation. A subsequent
+      // owner-bound session.info controls readiness independently of text.
+      expect(getUiState().status).toBe('model unverified')
+      onEvent({
+        type: 'session.info',
+        session_id: 'fixture-session',
+        payload: { session_id: 'fixture-session', model_ready: modelReady, model: 'fixture', provider: 'fixture' }
+      } as any)
+      expect(getUiState().status).toBe(modelReady ? 'ready' : 'model unverified')
 
       onEvent({ payload: { text: 'thinking...' }, type: 'thinking.delta' } as any)
       vi.runOnlyPendingTimers()
 
-      expect(getUiState().status).toBe('ready')
+      expect(getUiState().status).toBe(modelReady ? 'ready' : 'model unverified')
       expect(getTurnState().reasoning).toBe('')
     } finally {
       vi.useRealTimers()
