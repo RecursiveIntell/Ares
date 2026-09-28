@@ -343,7 +343,7 @@ def test_prompt_submit_dispatches_to_compute_host_when_turn_isolation_enabled(mo
             {
                 "type": "turn.end",
                 "sid": "iso-sid",
-                "request_id": "submit",
+                "request_id": fake_supervisor.frames[0]["request_id"],
                 "history_version": 1,
             }
         )
@@ -465,7 +465,7 @@ def test_prompt_submit_unknown_session_logs_warning(caplog):
     )
 
 
-def test_prompt_submit_fails_open_inline_when_compute_host_dispatch_breaks(monkeypatch):
+def test_prompt_submit_does_not_replay_inline_when_host_delivery_is_unknown(monkeypatch):
     class _BrokenSupervisor:
         def submit_turn(self, frame, *, on_complete=None):
             if on_complete is not None:
@@ -516,12 +516,16 @@ def test_prompt_submit_fails_open_inline_when_compute_host_dispatch_breaks(monke
     finally:
         server._sessions.pop("iso-fallback", None)
 
-    assert resp == {
-        "jsonrpc": "2.0",
-        "id": "fallback-turn",
-        "result": {"status": "streaming"},
+    assert isinstance(resp, dict)
+    assert resp["id"] == "fallback-turn"
+    assert resp["error"]["code"] == 5019
+    assert resp["error"]["data"] == {
+        "delivery": "uncertain",
+        "host_request_id": session["_compute_host_active_request_id"],
     }
-    assert inline_calls == [("fallback-turn", "iso-fallback", "hello")]
+    assert inline_calls == []
+    assert session["_host_delivery_uncertain"] is True
+    assert session["running"] is True
     assert session.get("_compute_host_active") is not True
 
 
@@ -538,6 +542,7 @@ def test_compute_host_turn_end_updates_metadata_mirror(monkeypatch):
         agent_ready=threading.Event(),
         history=[{"role": "user", "content": "serving process must not read this"}],
         _compute_host_active=True,
+        _compute_host_active_request_id="turn-1",
     )
     server._sessions["iso-sid"] = session
     emitted = []
@@ -743,7 +748,17 @@ def test_prompt_submit_golden_transcript_matches_flag_off_and_on(monkeypatch):
         finally:
             server._sessions.pop("sid", None)
 
-    assert run_flag_on() == run_flag_off()
+    def without_duplicate_metadata(events):
+        # Metadata refreshes are idempotent; message deltas are NOT. Preserve
+        # every message and every changed metadata transition in the contract.
+        normalized = []
+        for event in events:
+            if event[0] == "session.info" and normalized and normalized[-1] == event:
+                continue
+            normalized.append(event)
+        return normalized
+
+    assert without_duplicate_metadata(run_flag_on()) == without_duplicate_metadata(run_flag_off())
 
 
 def test_session_context_explicit_cwd_for_ephemeral_task(monkeypatch, tmp_path):
@@ -15949,7 +15964,7 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
     monkeypatch.setattr(server, "_get_db", lambda: None)
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(server, "_session_info", lambda agent, _session=None: {"model": agent.model})
 
     def _emit(event, sid, payload=None):
         if event == "message.complete":
@@ -16016,7 +16031,7 @@ def test_session_activate_returns_prompt_queued_during_busy_turn(monkeypatch):
     that copy without leaking the transport object.
     """
     monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(server, "_session_info", lambda agent, _session=None: {"model": agent.model})
     agent = types.SimpleNamespace(model="model-live")
     session = _session(
         agent=agent,
@@ -16049,7 +16064,7 @@ def test_session_activate_returns_prompt_queued_during_busy_turn(monkeypatch):
 
 
 def test_session_activate_switches_live_session_without_closing_siblings(monkeypatch):
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(server, "_session_info", lambda agent, _session=None: {"model": agent.model})
     server._sessions["sid-a"] = _session(
         agent=types.SimpleNamespace(model="model-a"),
         history=[{"role": "user", "content": "old"}],
@@ -16086,7 +16101,7 @@ def test_session_activate_switches_live_session_without_closing_siblings(monkeyp
 
 
 def test_session_activate_can_omit_duplicate_desktop_transcript(monkeypatch):
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(server, "_session_info", lambda agent, _session=None: {"model": agent.model})
     server._sessions["sid-large"] = _session(
         agent=types.SimpleNamespace(model="model-large"),
         history=[

@@ -2,9 +2,20 @@ import { atom } from 'nanostores'
 
 import { persistString, storedString } from '@/lib/storage'
 
+import { activeGatewayConnectionId } from './gateway'
 import { notifyError } from './notifications'
-import { setCurrentFastMode, setCurrentReasoningEffort } from './session'
-import { sessionTileDelegate } from './session-states'
+import { $activeGatewayProfile } from './profile'
+import {
+  $activeSessionId,
+  $currentFastMode,
+  $currentReasoningEffort,
+  $selectedStoredSessionId,
+  beginRuntimeOptionIntent,
+  ownsRuntimeOptionIntent,
+  setCurrentFastMode,
+  setCurrentReasoningEffort
+} from './session'
+import { $sessionStates, knownOwnerForSession, sessionTileDelegate } from './session-states'
 
 const STORAGE_KEY = 'hermes.desktop.model-presets'
 
@@ -64,7 +75,7 @@ export async function applyModelPreset(
   { effort, fast }: ModelPreset,
   ctx: { failMessage: string; primary?: boolean; request: RequestGateway; sessionId: null | string }
 ): Promise<void> {
-  if (ctx.primary ?? true) {
+  if (!ctx.sessionId) {
     if (effort !== undefined) {
       setCurrentReasoningEffort(effort)
     }
@@ -72,27 +83,91 @@ export async function applyModelPreset(
     if (fast !== undefined) {
       setCurrentFastMode(fast)
     }
-  } else if (ctx.sessionId) {
-    sessionTileDelegate()?.updateSession(ctx.sessionId, state => ({
-      ...state,
-      ...(effort !== undefined ? { reasoningEffort: effort } : {}),
-      ...(fast !== undefined ? { fast } : {})
-    }))
-  }
 
-  if (!ctx.sessionId) {
     return
   }
+
+  const runtimeId = ctx.sessionId
+  const primary = (ctx.primary ?? true) && $activeSessionId.get() === runtimeId
+  const state = $sessionStates.get()[runtimeId]
+  const owner = knownOwnerForSession(runtimeId)
+
+  const target = JSON.stringify([
+    runtimeId,
+    state?.storedSessionId ?? null,
+    owner && typeof owner === 'object' ? owner.connectionId : activeGatewayConnectionId(),
+    typeof owner === 'string' ? owner : (owner?.profile ?? $activeGatewayProfile.get())
+  ])
+
+  const tokens = beginRuntimeOptionIntent(target, [
+    ...(effort !== undefined ? ['effort'] : []),
+    ...(fast !== undefined ? ['fast'] : [])
+  ])
+
+  const owns = (dimension: string) => {
+    const current = $sessionStates.get()[runtimeId]
+    const currentOwner = knownOwnerForSession(runtimeId)
+
+    const currentTarget = JSON.stringify([
+      runtimeId,
+      current?.storedSessionId ?? null,
+      currentOwner && typeof currentOwner === 'object' ? currentOwner.connectionId : activeGatewayConnectionId(),
+      typeof currentOwner === 'string' ? currentOwner : (currentOwner?.profile ?? $activeGatewayProfile.get())
+    ])
+
+    return currentTarget === target && ownsRuntimeOptionIntent(target, dimension, tokens[dimension])
+  }
+
+  const previousEffort = state?.reasoningEffort ?? (primary ? $currentReasoningEffort.get() : '')
+  const previousFast = state?.fast ?? (primary ? $currentFastMode.get() : false)
+
+  const paint = (patch: Partial<{ reasoningEffort: string; fast: boolean }>) => {
+    sessionTileDelegate()?.updateSession(runtimeId, current => ({ ...current, ...patch }))
+
+    if (primary && $activeSessionId.get() === runtimeId && $selectedStoredSessionId.get() === state?.storedSessionId) {
+      if (patch.reasoningEffort !== undefined) {
+        setCurrentReasoningEffort(patch.reasoningEffort)
+      }
+
+      if (patch.fast !== undefined) {
+        setCurrentFastMode(patch.fast)
+      }
+    }
+  }
+
+  paint({
+    ...(effort !== undefined ? { reasoningEffort: effort } : {}),
+    ...(fast !== undefined ? { fast } : {})
+  })
 
   try {
     if (effort !== undefined) {
       await ctx.request('config.set', { key: 'reasoning', session_id: ctx.sessionId, value: effort })
     }
-
-    if (fast !== undefined) {
-      await ctx.request('config.set', { key: 'fast', session_id: ctx.sessionId, value: fast ? 'fast' : 'normal' })
-    }
   } catch (err) {
+    if (owns('effort')) {
+      paint({ reasoningEffort: previousEffort })
+    }
+
+    // Fast was painted but never sent when the first write rejected.
+    if (fast !== undefined && owns('fast')) {
+      paint({ fast: previousFast })
+    }
     notifyError(err, ctx.failMessage)
+
+    return
+  }
+
+  if (fast !== undefined && owns('fast')) {
+    try {
+      await ctx.request('config.set', { key: 'fast', session_id: runtimeId, value: fast ? 'fast' : 'normal' })
+    } catch (err) {
+      // The reasoning write is already acknowledged. Restore only the failed
+      // Fast dimension; this sequence is intentionally not atomic.
+      if (owns('fast')) {
+        paint({ fast: previousFast })
+      }
+      notifyError(err, ctx.failMessage)
+    }
   }
 }

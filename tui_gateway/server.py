@@ -1186,6 +1186,214 @@ def _detached_execution_policy(
     return "interrupt" if clock - float(detached_at) >= max(1.0, max_seconds) else "retain"
 
 
+def _clear_interrupt_waiters(sid: str, session: dict) -> None:
+    _clear_pending(sid)
+    try:
+        from tools.approval import resolve_gateway_approval
+        resolve_gateway_approval(session["session_key"], "deny", resolve_all=True)
+    except Exception:
+        pass
+
+
+def _native_stop_requires_receipt(scope: dict) -> bool:
+    """Ask the existing DB owner whether this scope has governed input work."""
+    key = scope.get("session_key")
+    if type(key) is not str or not key:
+        raise RuntimeError("Stop input scope is unavailable")
+    with _session_db(scope) as db:
+        if db is None:
+            raise RuntimeError("Stop input storage owner is unavailable")
+        if db.get_session(key) is None:
+            return False
+        work = db.read_context_input_work(key)
+        phase = work["phase"]
+        return (bool(work["receipts"]) or phase is not None and phase["state"] not in {"answered", "cancelled"}
+                or db.context_dispatch_required_for_session(key))
+
+
+def _wait_for_stop_input_admission(rid, session: dict, *, deadline: float) -> dict | None:
+    """Wait outside history_lock, before the caller writes a native receipt."""
+    refused = {"durable_input_accepted": False}
+    while True:
+        with session["history_lock"]:
+            if session.get("_stop_uncertain"):
+                return _err(rid, 5032, "Stop requires reconciliation; durable input not accepted", refused)
+            pending = session.get("_stop_pending")
+            if not pending:
+                return None
+            event = pending.get("input_release") if isinstance(pending, dict) else None
+        if not isinstance(event, threading.Event):
+            return _err(rid, 5032, "Stop state is unconfirmed; durable input not accepted", refused)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not event.wait(remaining):
+            return _err(rid, 5032, "Stop settlement timed out; durable input not accepted", refused)
+
+
+def _verify_host_stop_receipt(session: dict, receipt: dict) -> dict:
+    """Verify host-reported control against the session's canonical DB owner."""
+    if (type(receipt) is not dict or set(receipt) != {"session_key", "control"}
+            or type(receipt.get("session_key")) is not str or not receipt["session_key"]
+            or type(receipt.get("control")) is not dict
+            or receipt["control"].get("schema") != "SessionDBContextControlV2"):
+        raise RuntimeError("invalid durable Stop receipt")
+    key = session.get("session_key")
+    if type(key) is not str or not key:
+        raise RuntimeError("durable Stop session identity unavailable")
+    with _session_db(session) as db:
+        if db is None:
+            raise RuntimeError("durable Stop storage owner unavailable")
+        expected = db.read_context_stop(key)
+        reported = db.read_context_stop(receipt["session_key"])
+        if expected is None or reported != expected or expected["control"] != receipt["control"]:
+            raise RuntimeError("durable Stop receipt scope or value changed")
+        return expected
+
+
+def _rollback_unsent_stop_cut(session: dict, token: dict) -> bool:
+    """Restore only this untouched local cut; caller holds history_lock."""
+    owner = session.get("_compute_host_active_request_id")
+    if (session.get("_stop_pending") is not token or token.get("ack") or token.get("durable_stop")
+            or session.get("session_key") != token["session_key"]
+            or session.get("profile_home") != token["profile_home"]
+            or session.get("_queued_prompt_generation") != token["queue_generation"]
+            or session.get("_last_stop_queue_generation") != token["queue_generation"]
+            or owner != token["target_request_id"] and not (owner is None and token.get("terminal"))):
+        return False
+    after = ([session["queued_prompt"]] if session.get("queued_prompt") else []) + list(session.get("queued_prompts") or [])
+    restored = []
+    receipts = {}
+    for entry in token["pre_cut_queue"] + after:
+        if not isinstance(entry, dict):
+            return False
+        event_id = entry.get("context_input_event_id")
+        if event_id is not None:
+            if type(event_id) is not str or not event_id:
+                return False
+            payload = (entry.get("text"), entry.get("image_paths") or [])
+            if event_id in receipts:
+                if receipts[event_id] != payload:
+                    return False
+                continue
+            receipts[event_id] = payload
+        restored.append(entry)
+    session["queued_prompt"] = restored[0] if restored else None
+    if len(restored) > 1:
+        session["queued_prompts"] = restored[1:]
+    else:
+        session.pop("queued_prompts", None)
+    for field, previous in (("_queued_prompt_generation", "previous_queue_generation"),
+                            ("_last_stop_queue_generation", "previous_stop_generation"),
+                            ("_turn_cancel_requested", "previous_cancel_requested")):
+        if token[previous] is None:
+            session.pop(field, None)
+        else:
+            session[field] = token[previous]
+    return True
+
+
+def _interrupt_owned_compute_host_turn(sid: str, session: dict, request_id: str | None) -> bool:
+    """Settle a known host Stop without deleting inputs arriving after its cut."""
+    from tui_gateway.host_supervisor import HostSendNotSent, HostSendUncertain
+
+    with session["history_lock"]:
+        if session.get("_stop_pending") or session.get("_stop_uncertain"):
+            raise RuntimeError("Stop is pending or requires owner reconciliation")
+        target = session.get("_compute_host_active_request_id")
+        if not target:
+            return False
+        generation = int(session.get("_queued_prompt_generation", 0)) + 1
+        token = {"request_id": request_id or uuid.uuid4().hex,
+                 "target_request_id": target, "queue_generation": generation,
+                 "session_key": session.get("session_key"),
+                 "profile_home": session.get("profile_home"),
+                 "input_release": threading.Event(),
+                 "previous_queue_generation": session.get("_queued_prompt_generation"),
+                 "previous_stop_generation": session.get("_last_stop_queue_generation"),
+                 "previous_cancel_requested": session.get("_turn_cancel_requested"),
+                 "pre_cut_queue": ([session["queued_prompt"]] if session.get("queued_prompt") else [])
+                                  + list(session.get("queued_prompts") or [])}
+        terminal = session.get("_compute_host_terminal")
+        if isinstance(terminal, dict) and terminal.get("request_id") == target:
+            token["terminal"] = dict(terminal)
+        session["_stop_pending"] = token
+        session["_turn_cancel_requested"] = True
+        session["queued_prompt"] = None
+        session.pop("queued_prompts", None)
+        session["_queued_prompt_generation"] = generation
+        session["_last_stop_queue_generation"] = generation
+    stop_scope = {"session_key": token["session_key"], "profile_home": token["profile_home"]}
+    try:
+        ack = _get_compute_host_supervisor().interrupt(
+            sid, request_id=token["request_id"], target_request_id=target, wait=True,
+        )
+        if (not isinstance(ack, dict) or ack.get("type") != "interrupt.ack"
+                or ack.get("sid") != sid or ack.get("request_id") != token["request_id"]
+                or ack.get("target_request_id") != target or ack.get("applied") is not True):
+            raise HostSendUncertain("compute-host Stop not confirmed by matching acknowledgement")
+        token["ack"] = dict(ack)
+        if ack.get("durable_stop_unconfirmed") is True:
+            token["durable_stop_unconfirmed"] = True
+            raise HostSendUncertain("durable Stop persistence not confirmed")
+        try:
+            if "stop_receipt" in ack:
+                token["durable_stop"] = _verify_host_stop_receipt(stop_scope, ack["stop_receipt"])
+            elif _native_stop_requires_receipt(stop_scope):
+                raise HostSendUncertain("durable Stop receipt is missing")
+        except Exception:
+            token["durable_stop_unconfirmed"] = True
+            raise
+        with session["history_lock"]:
+            same_owner = session.get("_compute_host_active_request_id") in {None, target}
+        if same_owner:
+            _clear_interrupt_waiters(sid, session)
+    except Exception as exc:
+        unsent = isinstance(exc, HostSendNotSent) and not token.get("ack")
+        if not unsent and not token.get("durable_stop"):
+            try:
+                if _native_stop_requires_receipt(stop_scope):
+                    token["durable_stop_unconfirmed"] = True
+            except Exception:
+                token["durable_stop_unconfirmed"] = True
+        rollback_failed = False
+        with session["history_lock"]:
+            if unsent and not _rollback_unsent_stop_cut(session, token):
+                token["local_state_unconfirmed"] = True
+                rollback_failed = True
+            if session.get("_stop_pending") is token:
+                session.pop("_stop_pending", None)
+            if rollback_failed or (not unsent and (not token.get("terminal") or token.get("durable_stop_unconfirmed"))):
+                session["_stop_uncertain"] = token
+            if token.get("terminal") and not session.get("_compute_host_active_request_id"):
+                session["running"] = False
+            token["input_release"].set()
+        if token.get("terminal"):
+            try:
+                _emit("session.info", sid, _session_info(session.get("agent"), session))
+            except Exception:
+                with session["history_lock"]:
+                    token["local_state_unconfirmed"] = True
+                    session["_stop_uncertain"] = token
+                raise
+            _drain_queued_prompt(token["request_id"], sid, session)
+        if rollback_failed:
+            raise HostSendNotSent(f"{exc}; Stop queue state changed; owner reconciliation required") from exc
+        raise
+    with session["history_lock"]:
+        if session.get("_stop_pending") is token:
+            session.pop("_stop_pending", None)
+        if token.get("terminal") and not session.get("_compute_host_active_request_id"):
+            session["running"] = False
+        token["input_release"].set()
+    try:
+        _emit("session.info", sid, _session_info(session.get("agent"), session))
+    except Exception:
+        with session["history_lock"]:
+            session["_stop_uncertain"] = token
+        raise
+    _drain_queued_prompt(token["request_id"], sid, session)
+    return True
+
+
 def _interrupt_session_turn(
     sid: str, session: dict, *, request_id: str | None = None
 ) -> bool:
@@ -1199,21 +1407,35 @@ def _interrupt_session_turn(
     use_compute_host = _session_uses_compute_host(session)
     should_interrupt = bool(session.get("running"))
     run_thread_alive = False
+    target_request_id = None
 
     if use_compute_host:
-        if should_interrupt:
-            _get_compute_host_supervisor().interrupt(sid, request_id=request_id)
+        if _interrupt_owned_compute_host_turn(sid, session, request_id):
+            return True
+        with session["history_lock"]:
+            target_request_id = session.get("_compute_host_active_request_id")
+        if should_interrupt or target_request_id:
+            _get_compute_host_supervisor().interrupt(
+                sid, request_id=request_id,
+                **({"target_request_id": target_request_id} if target_request_id else {}),
+            )
     else:
         run_thread = session.get("_run_thread")
         run_thread_alive = run_thread is not None and run_thread.is_alive()
 
     with session["history_lock"]:
+        if (use_compute_host and target_request_id
+                and session.get("_compute_host_active_request_id") not in {None, target_request_id}):
+            # The Stop was sent for the predecessor, not the new owner. Do not
+            # clear the successor's queue/cancellation state after that handoff.
+            return True
         session["_turn_cancel_requested"] = True
         session["queued_prompt"] = None
         session.pop("queued_prompts", None)
         session["_queued_prompt_generation"] = int(
             session.get("_queued_prompt_generation", 0)
         ) + 1
+        session["_last_stop_queue_generation"] = session["_queued_prompt_generation"]
 
     if not use_compute_host:
         if should_interrupt:
@@ -1226,13 +1448,7 @@ def _interrupt_session_turn(
                     session["running"] = False
                     _clear_inflight_turn(session)
 
-    _clear_pending(sid)
-    try:
-        from tools.approval import resolve_gateway_approval
-
-        resolve_gateway_approval(session["session_key"], "deny", resolve_all=True)
-    except Exception:
-        pass
+    _clear_interrupt_waiters(sid, session)
     return use_compute_host
 
 
@@ -2347,6 +2563,11 @@ def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
 
 
 def _emit(event: str, sid: str, payload: dict | None = None):
+    session = _sessions.get(sid) if event == "message.complete" else None
+    if session is not None and session.get("_host_turn_request_id") and _inside_compute_host_child():
+        # The bubble is complete; only the host's matching turn terminal can
+        # retire the accepted request (including any chained goal work).
+        payload = {**(payload or {}), "chain_pending": True}
     write_json(_event_frame(event, sid, payload))
 
 
@@ -2447,6 +2668,7 @@ def _get_compute_host_supervisor(cfg: dict | None = None):
             from tui_gateway.host_supervisor import HostSupervisor
 
             _compute_host_supervisor = HostSupervisor(
+                autostart=False,
                 rpc_sink=write_json,
                 on_crash=_on_compute_host_crash,
                 heartbeat_secs=int(isolation_cfg.get("compute_host_heartbeat_secs") or 15),
@@ -2538,7 +2760,26 @@ def _apply_compute_host_metadata_mirror(session: dict, frame: dict | None) -> No
 
 def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -> None:
     is_error = frame.get("type") == "turn.error"
+    with _sessions_lock:
+        if _sessions.get(sid) is not session:
+            return
     with session["history_lock"]:
+        owner = session.get("_compute_host_active_request_id")
+        if (not owner or frame.get("request_id") != owner or frame.get("sid") != sid
+                or frame.get("type") not in {"turn.end", "turn.error"}
+                or session.get("_compute_host_settling_request_id") == owner):
+            return
+        # Claim projection once. Keep its identity/frame if a later projection
+        # step fails; an uncertain UI emit is not permission to repeat it.
+        session["_compute_host_settling_request_id"] = owner
+        session["_compute_host_terminal"] = dict(frame)
+        for stop_field in ("_stop_pending", "_stop_uncertain"):
+            stop = session.get(stop_field)
+            if isinstance(stop, dict) and stop.get("target_request_id") == owner:
+                stop["terminal"] = dict(frame)
+                if (stop_field == "_stop_uncertain" and not stop.get("durable_stop_unconfirmed")
+                        and not stop.get("local_state_unconfirmed")):
+                    session.pop(stop_field, None)
         if frame.get("session_key"):
             session["session_key"] = str(frame.get("session_key"))
         if frame.get("history_version") is not None:
@@ -2565,6 +2806,13 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
         info = _session_info(session.get("agent"))
     if not frame.get("session_info_emitted"):
         _emit("session.info", sid, info)
+    with session["history_lock"]:
+        if session.get("_compute_host_active_request_id") != owner:
+            return
+        session.pop("_compute_host_active_request_id", None)
+        session.pop("_compute_host_settling_request_id", None)
+        session.pop("_compute_host_terminal", None)
+        session.pop("_host_delivery_uncertain", None)
     _drain_queued_prompt(rid, sid, session)
 
 
@@ -2578,9 +2826,14 @@ def _submit_prompt_to_compute_host(
     display_kind: str | None = None,
     context_input_event_id: str | None = None,
 ) -> dict:
+    from tui_gateway.host_supervisor import HostSendNotSent
+
     cfg = _load_dashboard_process_isolation_config()
+    # RPC IDs belong to one client connection and can repeat after reconnect.
+    # Each physical host admission needs independent execution correlation;
+    # context_input_event_id remains the canonical governed-input identity.
     frame = _compute_host_turn_frame(
-        rid,
+        f"host-turn-{uuid.uuid4().hex}",
         sid,
         session,
         text,
@@ -2591,23 +2844,84 @@ def _submit_prompt_to_compute_host(
     )
 
     def _complete(done: dict) -> None:
-        # submit_turn reports a synchronous pipe failure through the callback
-        # before re-raising. Leave the parent session untouched so prompt.submit
-        # can fail open to the historical in-process path without emitting a
-        # duplicate terminal error.
+        # A transport write failure is not a host terminal. Retain ownership
+        # for a late outcome rather than projecting idle or replaying inline.
         if done.get("reason") == "send_failed":
             return
         _on_compute_host_turn_done(rid, sid, session, done)
 
+    host_request_id = frame["request_id"]
+    with session["history_lock"]:
+        if (session.get("_compute_host_active_request_id") or session.get("_stop_pending")
+                or session.get("_stop_uncertain")):
+            return _err(rid, 4009, "compute-host request or Stop settlement still owns session",
+                        {"delivery": "owner_busy"})
+        session["_compute_host_active_request_id"] = host_request_id
+
     try:
         _get_compute_host_supervisor(cfg).submit_turn(frame, on_complete=_complete)
+    except HostSendNotSent as exc:
+        with session["history_lock"]:
+            if session.get("_compute_host_active_request_id") == host_request_id:
+                session.pop("_compute_host_active_request_id", None)
+        return _err(rid, 5019, f"compute-host dispatch refused before write: {exc}",
+                    {"delivery": "not_sent", "host_request_id": host_request_id})
     except Exception as exc:
-        return _err(rid, 5019, f"compute-host dispatch failed: {exc}")
+        with session["history_lock"]:
+            if session.get("_compute_host_active_request_id") == host_request_id:
+                session["_host_delivery_uncertain"] = True
+        return _err(rid, 5019, f"compute-host dispatch failed: {exc}",
+                    {"delivery": "uncertain", "host_request_id": host_request_id})
     with session["history_lock"]:
         session["_compute_host_active"] = True
         if image_paths is None:
             session["attached_images"] = []
     return _ok(rid, {"status": "streaming", "turn_isolation": True})
+
+
+def _send_host_live_input(rid, sid: str, session: dict, text: str, route: str) -> dict:
+    """Forward existing live-input semantics to the exact executing owner."""
+    from tui_gateway.host_supervisor import HostSendNotSent
+
+    supervisor = _get_compute_host_supervisor()
+    boot = supervisor.boot_id
+    with session["history_lock"]:
+        target = session.get("_compute_host_active_request_id")
+        if (not boot or not target or session.get("_stop_pending") or session.get("_stop_uncertain")
+                or session.get("_host_delivery_uncertain") or session.get("_compute_host_settling_request_id")):
+            return _err(rid, 5032, "live input owner unconfirmed; no retry attempted")
+    control_id = f"live-input-{uuid.uuid4().hex}"
+    try:
+        ack = supervisor.control(sid, route_name=route, expected_boot_id=boot, timeout=5.0,
+            payload={"request_id": control_id, "target_request_id": target, "params": {"text": text}})
+    except HostSendNotSent as exc:
+        return _err(rid, 4010, f"live input not sent: {exc}")
+    except Exception as exc:
+        return _err(rid, 5032, f"live input outcome unconfirmed; no retry attempted: {exc}")
+    if (not isinstance(ack, dict) or supervisor.boot_id != boot or ack.get("sid") != sid or ack.get("request_id") != control_id
+            or ack.get("target_request_id") != target or ack.get("route_name") != route):
+        return _err(rid, 5032, "live input acknowledgement owner changed or mismatched")
+    if ack.get("type") != "control.ack":
+        return _err(rid, 4010 if ack.get("not_applied") is True else 5032,
+                    str(ack.get("message") or "live input unconfirmed"))
+    response = ack.get("response")
+    if not isinstance(response, dict) or response.get("id") != control_id:
+        return _err(rid, 5032, "invalid live input acknowledgement")
+    if response.get("error"):
+        error = response["error"]
+        if not isinstance(error, dict):
+            return _err(rid, 5032, "invalid live input error acknowledgement")
+        return _err(rid, error.get("code", 5032), error.get("message", "live input failed"))
+    result = response.get("result")
+    allowed = {"queued", "rejected"} if route == "session.steer" else {"queued", "redirected", "rejected"}
+    if not isinstance(result, dict) or result.get("status") not in allowed:
+        return _err(rid, 5032, "invalid live input result")
+    if result.get("status") in {"queued", "redirected"}:
+        with session["history_lock"]:
+            if _sessions.get(sid) is session and session.get("_compute_host_active_request_id") == target:
+                _record_inflight_correction(session, text)
+                session["last_active"] = time.time()
+    return _ok(rid, result)
 
 
 def _send_compute_host_control(
@@ -2865,6 +3179,9 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
 
 
 def _wait_agent(session: dict, rid: str, timeout: float = 30.0) -> dict | None:
+    if session.get("_compute_host_active"):
+        # Readiness belongs to the existing host, not a phantom parent build.
+        return None
     ready = session.get("agent_ready")
     if ready is not None and not ready.wait(timeout=timeout):
         return _err(rid, 5032, "agent initialization timed out")
@@ -3000,6 +3317,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
     command that actually needs the agent), while retaining the same ready/error
     event contract for the frontend.
     """
+    if session.get("_compute_host_active"):
+        return
     ready = session.get("agent_ready")
     if ready is None:
         return
@@ -3024,7 +3343,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
     def _build() -> None:
         with _sessions_lock:
             current = _sessions.get(sid)
-        if current is None:
+        if current is not session:
             ready.set()
             return
 
@@ -5923,24 +6242,27 @@ def _apply_model_switch(
         current_base_url = getattr(agent, "base_url", "") or ""
         current_api_key = getattr(agent, "api_key", "") or ""
     else:
-        current_model = _resolve_model()
+        selected_override = session.get("model_override")
+        if not isinstance(selected_override, dict):
+            selected_override = {}
+        current_model = str(selected_override.get("model") or _resolve_model())
         current_provider = explicit_provider.strip()
         current_base_url = ""
         current_api_key = ""
         if not explicit_provider:
-            runtime = resolve_runtime_provider(requested=None)
-            current_provider = str(runtime.get("provider", "") or "")
-            current_base_url = str(runtime.get("base_url", "") or "")
-            # Preserve a callable api_key (Azure Foundry Entra ID bearer
-            # provider) unchanged — ``str(...)`` would produce
-            # ``"<function ...>"`` and poison downstream switch_model
-            # validation. Match the agent-present branch's behavior at the
-            # top of this block.
-            _runtime_key = runtime.get("api_key", "")
-            if callable(_runtime_key) and not isinstance(_runtime_key, str):
-                current_api_key = _runtime_key
+            if selected_override.get("provider"):
+                # A cold-resumed session's saved selection outranks this
+                # process's profile default when the user omits --provider.
+                current_provider = str(selected_override["provider"])
+                current_base_url = str(selected_override.get("base_url") or "")
+                current_api_key = selected_override.get("api_key") or ""
             else:
-                current_api_key = str(_runtime_key or "")
+                runtime = resolve_runtime_provider(requested=None)
+                current_provider = str(runtime.get("provider", "") or "")
+                current_base_url = str(runtime.get("base_url", "") or "")
+                # Preserve callable Azure Foundry token providers unchanged.
+                _runtime_key = runtime.get("api_key", "")
+                current_api_key = _runtime_key if callable(_runtime_key) and not isinstance(_runtime_key, str) else str(_runtime_key or "")
 
     # Load user-defined providers so switch_model can resolve named custom
     # endpoints (e.g. "ollama-launch") and validate against saved model lists.
@@ -7087,7 +7409,8 @@ def _session_info(agent, session: dict | None = None) -> dict:
         "project": _project_info_for_cwd(cwd),
         "terminal_backend": _effective_terminal_backend(),
         "personality": str(personality or ""),
-        "running": bool((session or {}).get("running")),
+        "running": bool((session or {}).get("running") or (session or {}).get("_host_turn_request_id")
+                        or (session or {}).get("_stop_pending") or (session or {}).get("_stop_uncertain")),
         "turn_started_at": turn_started_at,
         "title": _session_live_title(session or {}, session_key) if session_key else "",
         "stored_session_id": session_key or "",
@@ -9682,12 +10005,14 @@ def _handle_busy_submit(
     mode = "queue" if queued or context_input_event_id is not None else _load_busy_input_mode()
     agent = session.get("agent")
     with session["history_lock"]:
-        if not session.get("running"):
+        if session.get("_stop_pending") or session.get("_stop_uncertain"):
+            mode = "queue"
+        if not (session.get("running") or session.get("_stop_pending") or session.get("_stop_uncertain")):
             # The turn ended between prompt.submit's first busy check and this
             # helper. Let the caller retry and claim the now-idle session.
             return None
     with session["history_lock"]:
-        if not session.get("running"):
+        if not (session.get("running") or session.get("_stop_pending") or session.get("_stop_uncertain")):
             return None
         image_paths = list(session.get("attached_images", []))
         if image_paths:
@@ -9696,6 +10021,17 @@ def _handle_busy_submit(
             session["attached_images"] = []
     text_only = not image_paths and _is_text_only_busy_payload(text)
     plain_text = _coerce_message_text(text).strip() if text_only else ""
+    if mode in {"steer", "interrupt"} and text_only and plain_text and _session_uses_compute_host(session):
+        route = "session.steer" if mode == "steer" else "session.redirect"
+        response = _send_host_live_input(rid, sid, session, plain_text, route)
+        if response.get("error") and response["error"].get("code") != 4010:
+            return response
+        status = response.get("result", {}).get("status")
+        if status in {"queued", "redirected"}:
+            return _ok(rid, {"status": "steered" if route == "session.steer" else status})
+        # Proven refusal/rejection may become a next-turn queue entry, never
+        # a call on the unused parent agent or a second hard interrupt.
+        mode = "queue"
     if mode == "steer" and text_only and plain_text and agent is not None and hasattr(agent, "steer"):
         try:
             if agent.steer(plain_text):
@@ -9732,7 +10068,7 @@ def _handle_busy_submit(
     # provider or compute-host method while holding history_lock: an interrupt
     # can wait behind the very operation it is trying to cancel.
     with session["history_lock"]:
-        if not session.get("running"):
+        if not (session.get("running") or session.get("_stop_pending") or session.get("_stop_uncertain")):
             if image_paths:
                 session["attached_images"] = image_paths + list(session.get("attached_images", []))
             return None
@@ -9767,7 +10103,8 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     claim-under-lock pattern used by the goal-continuation re-fire.
     """
     with session["history_lock"]:
-        if session.get("_closing"):
+        if (session.get("_closing") or session.get("_compute_host_active_request_id")
+                or session.get("_stop_pending") or session.get("_stop_uncertain")):
             return False
         queued = session.get("queued_prompt")
         if not queued or session.get("running"):
@@ -9783,8 +10120,14 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     use_compute_host = _session_uses_compute_host(session)
     with session["history_lock"]:
         if int(session.get("_queued_prompt_generation", 0)) != queue_generation:
-            # Generation cancelled the claim (Stop, compress re-anchor, …).
-            # Do not dispatch — but put the claimed envelope back so a
+            if int(session.get("_last_stop_queue_generation", 0)) > queue_generation:
+                # This exact claim predates an explicit Stop cut. Restoring it
+                # would resurrect cancelled input ahead of post-cut arrivals.
+                if not session.get("_compute_host_active_request_id"):
+                    session["running"] = False
+                return True
+            # A non-Stop generation change (such as a compress re-anchor)
+            # invalidated the claim. Put the envelope back so a
             # legitimate follow-up is not silently dropped. Order: claimed
             # head first, then whatever advanced into the slot while we held
             # the claim (#84417 belt accuracy).
@@ -10129,7 +10472,15 @@ def _claim_or_reuse_live(
                     if lease is not None:
                         lease.release()
                     raise RuntimeError("compute-host owner lookup omitted its runtime session id")
+                owner_request_id = owner.get("request_id")
+                if owner.get("running") and (type(owner_request_id) is not str or not owner_request_id):
+                    if lease is not None:
+                        lease.release()
+                    raise RuntimeError("compute-host running owner omitted its request id")
                 record["running"] = bool(owner.get("running"))
+                record["session_id"] = owner_sid
+                if record["running"]:
+                    record["_compute_host_active_request_id"] = owner_request_id
                 record["_compute_host_active"] = True
                 host_info = owner.get("session_info")
                 if isinstance(host_info, dict):
@@ -10146,7 +10497,10 @@ def _claim_or_reuse_live(
                         "recovered-compute-host-owner", owner_sid, record, frame
                     )
 
-                supervisor.observe_session(owner_sid, _on_host_owner_terminal)
+                if record["running"]:
+                    assert isinstance(owner_request_id, str)  # validated before publication
+                    supervisor.observe_session(owner_sid, _on_host_owner_terminal,
+                                               request_id=owner_request_id)
                 if lease is not None:
                     lease.release()
                 return owner_sid, record
@@ -10230,16 +10584,17 @@ def _schedule_agent_build(sid: str, delay: float = 0.05) -> None:
 
 
 def _schedule_resume_hydration(
-    sid: str, stored_id: str, db, *, close_db: bool = False
+    sid: str, stored_id: str, db, *, close_db: bool = False,
+    expected_session: dict | None = None,
 ) -> None:
     """Load a cold resume's transcript off the JSON-RPC response path."""
+    session = expected_session if expected_session is not None else _sessions.get(sid)
 
     def _run() -> None:
-        session = _sessions.get(sid)
         stage = "starting"
         started_at = time.monotonic()
         try:
-            if session is None:
+            if session is None or _sessions.get(sid) is not session:
                 return
             _emit(
                 "session.resume_progress",
@@ -10272,8 +10627,9 @@ def _schedule_resume_hydration(
                     "status": "complete",
                 },
             )
-            _maybe_schedule_auto_continue(sid, session, stored_id)
-            _start_agent_build(sid, session)
+            if not session.get("_compute_host_active"):
+                _maybe_schedule_auto_continue(sid, session, stored_id)
+                _start_agent_build(sid, session)
         except Exception as exc:
             if _sessions.get(sid) is not session:
                 return
@@ -10287,21 +10643,29 @@ def _schedule_resume_hydration(
             message = f"resume failed: {exc}"
             session["resume_hydrating"] = False
             session["resume_history_error"] = message
-            session["agent_error"] = message
             session["resume_history_ready"].set()
-            session["agent_ready"].set()
+            if not session.get("_compute_host_active"):
+                session["agent_error"] = message
+                session["agent_ready"].set()
             _emit(
                 "session.resume_progress",
                 sid,
                 {"message": message, "phase": "history", "status": "failed"},
             )
             _emit("error", sid, {"message": message})
-            with _sessions_lock:
-                discarded = _sessions.pop(sid, None) if _sessions.get(sid) is session else None
-            lease = (discarded or {}).get("active_session_lease")
-            if lease is not None:
-                lease.release()
+            # A failed display-history read cannot revoke a live host's
+            # Stop/control route or turn it into a failed parent agent.
+            if not session.get("_compute_host_active"):
+                with _sessions_lock:
+                    discarded = _sessions.pop(sid, None) if _sessions.get(sid) is session else None
+                lease = (discarded or {}).get("active_session_lease")
+                if lease is not None:
+                    lease.release()
         finally:
+            if session is not None and _sessions.get(sid) is not session:
+                session["resume_hydrating"] = False
+                session.setdefault("resume_history_error", "session resume superseded")
+                session["resume_history_ready"].set()
             if close_db and hasattr(db, "close"):
                 try:
                     db.close()
@@ -12302,7 +12666,7 @@ def _run_prompt_submit(
     context_input_event_id: str | None = None,
 ) -> bool:
     with session["history_lock"]:
-        if session.get("_closing"):
+        if session.get("_closing") or session.get("_turn_cancel_requested"):
             session["running"] = False
             return False
         if (
@@ -15588,13 +15952,19 @@ def _details_completions(text: str) -> list[dict] | None:
     return []
 
 
-def _model_picker_context(agent):
-    """Layer live session state onto config without losing custom identity."""
+def _model_picker_context(agent, session: dict | None = None):
+    """Layer the owning session's selection onto config without losing custom identity."""
     from hermes_cli.inventory import load_picker_context
 
     ctx = load_picker_context()
-    provider = getattr(agent, "provider", "") if agent else ""
-    base_url = getattr(agent, "base_url", "") if agent else ""
+    selected = {}
+    if session is not None and _session_uses_compute_host(session) and not session.get("_compute_host_active"):
+        override = session.get("model_override")
+        if isinstance(override, dict):
+            selected = override
+    provider = selected.get("provider") or (getattr(agent, "provider", "") if agent else "")
+    model = selected.get("model") or (getattr(agent, "model", "") if agent else "")
+    base_url = selected.get("base_url") if selected else (getattr(agent, "base_url", "") if agent else "")
     if str(provider or "").strip().lower() == "custom":
         try:
             from hermes_cli.runtime_provider import canonical_custom_identity
@@ -15603,8 +15973,7 @@ def _model_picker_context(agent):
                 canonical_custom_identity(
                     base_url=base_url or None,
                     config_provider=ctx.current_provider,
-                    model=(getattr(agent, "model", "") if agent else "")
-                    or None,
+                    model=model or None,
                 )
                 or provider
             )
@@ -15614,12 +15983,19 @@ def _model_picker_context(agent):
                 exc_info=True,
             )
 
-    return ctx.with_overrides(
+    picked = ctx.with_overrides(
         current_provider=provider,
-        current_model=(getattr(agent, "model", "") if agent else "")
-        or _resolve_model(),
+        current_model=model or _resolve_model(),
         current_base_url=base_url,
     )
+    if selected:
+        # ConfigContext.with_overrides is truthy-only: an empty URL is an
+        # intentional session selection, not permission to inherit a stale
+        # parent-agent or profile URL from another provider.
+        from dataclasses import replace
+
+        return replace(picked, current_base_url=str(base_url or ""))
+    return picked
 
 
 # ── Methods: slash.exec ──────────────────────────────────────────────

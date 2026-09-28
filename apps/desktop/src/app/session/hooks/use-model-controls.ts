@@ -7,6 +7,7 @@ import { useI18n } from '@/i18n'
 import { isBusySessionModelSwitch } from '@/lib/gateway-rpc'
 import { surfaceModelSwitchConfirm } from '@/lib/guarded-model-switch'
 import { manualPickRemoved, modelOptionsQueryKey } from '@/lib/model-options'
+import { activeGatewayConnectionId } from '@/store/gateway'
 import { notifyError } from '@/store/notifications'
 import { $activeGatewayProfile } from '@/store/profile'
 import {
@@ -14,15 +15,17 @@ import {
   $currentModel,
   $currentProvider,
   $selectedStoredSessionId,
+  beginRuntimeOptionIntent,
   getComposerSelectionGeneration,
   getCurrentModelSource,
   markComposerSelectionManual,
+  ownsRuntimeOptionIntent,
   setCurrentModel,
   setCurrentModelSource,
   setCurrentProvider
 } from '@/store/session'
 import { isSessionGoneError } from '@/store/session-gone'
-import { $sessionStates, sessionTileDelegate } from '@/store/session-states'
+import { $sessionStates, knownOwnerForSession, sessionTileDelegate } from '@/store/session-states'
 import type { ModelOptionsResponse } from '@/types/hermes'
 
 interface ModelControlsOptions {
@@ -218,8 +221,29 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
       // in flight so a 4001 can be resumed by the correct surface instead of
       // being reported as a model failure.
       const storedSessionId = liveSessionId
-        ? ($sessionStates.get()[liveSessionId]?.storedSessionId ?? (touchesPrimary ? $selectedStoredSessionId.get() : null))
+        ? ($sessionStates.get()[liveSessionId]?.storedSessionId ??
+          (touchesPrimary ? $selectedStoredSessionId.get() : null))
         : null
+
+      const targetKey = (runtimeId: string | null, storedId: string | null) => {
+        const owner = runtimeId ? knownOwnerForSession(runtimeId) : undefined
+        const ownerConnection = owner && typeof owner === 'object' ? owner.connectionId : undefined
+        const ownerProfile = typeof owner === 'string' ? owner : owner?.profile
+
+        return JSON.stringify([
+          runtimeId,
+          (runtimeId && $sessionStates.get()[runtimeId]?.storedSessionId) || storedId,
+          ownerConnection ?? activeGatewayConnectionId(),
+          ownerProfile ?? $activeGatewayProfile.get()
+        ])
+      }
+
+      let selectionTarget = targetKey(liveSessionId, storedSessionId)
+      let intentTokens = beginRuntimeOptionIntent(selectionTarget, ['model'])
+
+      const owns = (dimension: string) =>
+        targetKey(liveSessionId, storedSessionId) === selectionTarget &&
+        ownsRuntimeOptionIntent(selectionTarget, dimension, intentTokens[dimension])
 
       const updateLiveRuntimeSelection = (model: string, provider: string, optimistic = true) => {
         if (!liveSessionId) {
@@ -248,9 +272,16 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
                 state.pendingModelSelection.previousModel === pendingModelSelection.previousModel &&
                 state.pendingModelSelection.previousProvider === pendingModelSelection.previousProvider
 
-          return state.model === model && state.provider === provider && pendingMatches
+          const nextState = {
+            ...state,
+            model,
+            provider,
+            pendingModelSelection
+          }
+
+          return state.model === nextState.model && state.provider === nextState.provider && pendingMatches
             ? state
-            : { ...state, model, provider, pendingModelSelection }
+            : nextState
         })
       }
 
@@ -272,16 +303,21 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
 
       const stillOwnsPrimarySelection = () =>
         !touchesPrimary ||
-        ($activeSessionId.get() === liveSessionId && (!storedSessionId || $selectedStoredSessionId.get() === storedSessionId))
+        ($activeSessionId.get() === liveSessionId &&
+          (!storedSessionId || $selectedStoredSessionId.get() === storedSessionId))
 
       const rollbackSelection = () => {
+        if (!owns('model')) {
+          return
+        }
+
         // Roll back the owning runtime even if its primary surface lost focus
         // while the RPC was pending. That state is separate from the current
         // foreground globals and must not remain as a false applied switch.
         updateLiveRuntimeSelection(prevModel, prevProvider, false)
 
         if (touchesPrimary) {
-          if (!stillOwnsPrimarySelection()) {
+          if (!stillOwnsPrimarySelection() || !owns('model')) {
             return
           }
 
@@ -329,17 +365,33 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
 
       let recoveryAttempted = false
 
-      const requestSwitchWithRecovery = async (confirmExpensiveModel = false): Promise<ModelSwitchResponse | undefined> => {
+      const requestSwitchWithRecovery = async (
+        confirmExpensiveModel = false
+      ): Promise<ModelSwitchResponse | undefined> => {
         try {
           return await requestSwitch(confirmExpensiveModel)
         } catch (error) {
-          if (!isSessionGoneError(error) || recoveryAttempted || !recoverRuntime || !storedSessionId || !liveSessionId) {
+          if (!owns('model')) {
+            throw error
+          }
+
+          if (
+            !isSessionGoneError(error) ||
+            recoveryAttempted ||
+            !recoverRuntime ||
+            !storedSessionId ||
+            !liveSessionId
+          ) {
             throw error
           }
 
           recoveryAttempted = true
           const staleRuntimeId = liveSessionId
           const recoveredRuntimeId = await recoverRuntime(storedSessionId, staleRuntimeId)
+
+          if (!owns('model')) {
+            throw new ModelSwitchRecoveryAborted()
+          }
 
           // A recovery owner returns null after route drift or a failed durable
           // resume that it already surfaced. Do not roll the old picker back
@@ -349,6 +401,8 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
           }
 
           liveSessionId = recoveredRuntimeId
+          selectionTarget = targetKey(liveSessionId, storedSessionId)
+          intentTokens = beginRuntimeOptionIntent(selectionTarget, ['model'])
           // session.resume minted a new runtime slice. Repaint that owner before
           // retrying so the picker never falls back to the pre-switch model in
           // the recovery gap.
@@ -360,6 +414,10 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
       }
 
       const finishSwitch = (result: ModelSwitchResponse | undefined) => {
+        if (!owns('model')) {
+          return
+        }
+
         // A pick made DURING a turn is queued by the gateway and applied at the
         // next turn start (`deferred`). Re-fetching now would answer with the
         // model still running and repaint the old name over the user's choice —
@@ -374,6 +432,10 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
         const result = await requestSwitchWithRecovery()
 
         if (result?.confirm_required) {
+          if (!owns('model')) {
+            return false
+          }
+
           rollbackSelection()
           // ONE shared applier for guarded switches (#95293): the same
           // confirm flow the Bots editor routes through — never fork this
@@ -388,13 +450,14 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
             // not clobber the newer choice: bail if the live state no longer
             // matches the snapshot this notification was created for.
             isStale: () =>
-              touchesPrimary
+              !owns('model') ||
+              (touchesPrimary
                 ? !stillOwnsPrimarySelection() ||
                   $currentModel.get() !== prevModel ||
                   $currentProvider.get() !== prevProvider
                 : !liveSessionId ||
                   $sessionStates.get()[liveSessionId]?.model !== prevModel ||
-                  $sessionStates.get()[liveSessionId]?.provider !== prevProvider,
+                  $sessionStates.get()[liveSessionId]?.provider !== prevProvider),
             repaint: () => {
               paintSelection()
               cacheSelection(selection.provider, selection.model)
@@ -410,7 +473,7 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
 
         return true
       } catch (err) {
-        if (err instanceof ModelSwitchRecoveryAborted) {
+        if (err instanceof ModelSwitchRecoveryAborted || !owns('model')) {
           return false
         }
 

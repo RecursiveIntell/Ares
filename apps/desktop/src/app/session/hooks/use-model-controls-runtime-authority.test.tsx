@@ -12,7 +12,12 @@ import {
   setCurrentModel,
   setCurrentProvider
 } from '@/store/session'
-import { $sessionStates, publishSessionState, type SessionTileDelegate, setSessionTileDelegate } from '@/store/session-states'
+import {
+  $sessionStates,
+  publishSessionState,
+  type SessionTileDelegate,
+  setSessionTileDelegate
+} from '@/store/session-states'
 
 import { useModelControls } from './use-model-controls'
 

@@ -12,12 +12,15 @@ import json
 import logging
 import os
 import queue
+import select
+import stat
 import signal
 import subprocess
 import sys
 import threading
 import time
 import uuid
+from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -33,6 +36,8 @@ MUTATOR_ROUTE_TABLE: dict[str, str] = {
     "config.set.fast": "idle-gated",
     "prompt.submit": "turn-path",
     "session.interrupt": "turn-path",
+    "session.steer": "run-concurrent",
+    "session.redirect": "run-concurrent",
     "reload.mcp": "run-concurrent",
     "session.save": "run-concurrent",
     "session.run_checkpoint.claim": "run-concurrent",
@@ -130,6 +135,18 @@ def is_compute_host_identity(pid: int) -> bool:
     return "tui_gateway.compute_host" in cmd
 
 
+class HostSendNotSent(TimeoutError):
+    """Transport refused this frame with proven zero bytes offered."""
+
+
+class HostSendUncertain(TimeoutError):
+    """Some bytes were offered; never replay this frame automatically."""
+
+
+class HostBootMismatch(HostSendNotSent, RuntimeError):
+    """Turn refused before any frame bytes were offered to a changed host."""
+
+
 class HostSupervisor:
     """Own one persistent compute-host child and relay its frames."""
 
@@ -176,6 +193,12 @@ class HostSupervisor:
                 raise RuntimeError("compute host owner/profile boundary mismatch")
 
         self._lock = threading.RLock()
+        self._registry_lock = threading.RLock()
+        self._control_lock = threading.Lock()
+        self._write_lock = threading.Lock()
+        self._startup_guard = threading.Lock()
+        self._startup_result = None
+        self._poisoned_proc = None
         self._proc: subprocess.Popen[str] | None = None
         self._stdout_thread: threading.Thread | None = None
         self._stderr_thread: threading.Thread | None = None
@@ -185,9 +208,11 @@ class HostSupervisor:
         self._closing = False
         self._stopped_respawning = False
         self._restart_times: list[float] = []
-        self._pending_turns: dict[str, tuple[str, Callable[[dict], None] | None]] = {}
+        self._pending_turns: dict[str, tuple[str, Callable[[dict], None] | None, str]] = {}
         self._pending_controls: dict[str, queue.Queue[dict]] = {}
-        self._session_observers: dict[str, Callable[[dict], None]] = {}
+        self._session_observers: dict[str, tuple[str, Callable[[dict], None], str]] = {}
+        self._terminal_queues: dict[str, deque[tuple[dict, Callable[[dict], None]]]] = {}
+        self._terminal_workers: set[str] = set()
         self._stderr_tail: list[str] = []
         self._last_progress_counter = 0
 
@@ -256,40 +281,111 @@ class HostSupervisor:
         self._remove_registry()
         return "terminated"
 
+    @property
+    def boot_id(self) -> str:
+        """Identity of the currently handshaken host, not its session ID."""
+        return str(self._hello.get("boot_id") or "")
+
     def submit_turn(
         self,
         frame: dict[str, Any],
         *,
         on_complete: Callable[[dict], None] | None = None,
+        timeout: float = 15.0,
     ) -> str:
-        self.start()
+        deadline = time.monotonic() + timeout
+        self._ensure_started_by(deadline)
         request_id = str(frame.get("request_id") or uuid.uuid4().hex)
         sid = str(frame.get("sid") or "")
         payload = dict(frame)
         payload["type"] = "turn.start"
         payload["request_id"] = request_id
-        with self._lock:
-            self._pending_turns[request_id] = (sid, on_complete)
+        if not self._registry_lock.acquire(timeout=max(0, deadline - time.monotonic())):
+            raise HostSendNotSent("compute-host admission deadline exceeded; not sent")
         try:
-            self._send_frame(payload)
-        except Exception as exc:
-            with self._lock:
+            if request_id in self._pending_turns:
+                raise ValueError("duplicate compute-host request ID")
+            boot = self.boot_id
+            self._pending_turns[request_id] = (sid, on_complete, boot)
+        finally:
+            self._registry_lock.release()
+        # Only a proven zero-byte refusal retires this registration. Partial
+        # or unknown writes retain it for a late terminal or host crash.
+        try:
+            self._send_frame(payload, deadline=deadline, expected_boot_id=boot)
+        except HostSendNotSent:
+            with self._registry_lock:
                 self._pending_turns.pop(request_id, None)
-            err = {
-                "type": "turn.error",
-                "sid": sid,
-                "request_id": request_id,
-                "reason": "send_failed",
-                "message": str(exc),
-            }
-            if on_complete is not None:
-                on_complete(err)
             raise
         return request_id
 
-    def interrupt(self, sid: str, *, request_id: str | None = None) -> None:
-        self.start()
-        self._send_frame({"type": "interrupt", "sid": sid, "request_id": request_id or uuid.uuid4().hex})
+    def _ensure_started_by(self, deadline: float) -> None:
+        """Share one startup attempt; a timeout never sends a delayed frame."""
+        if time.monotonic() >= deadline:
+            raise HostSendNotSent("compute-host startup deadline exceeded; not sent")
+        if self.is_running():
+            return
+        with self._startup_guard:
+            attempt = self._startup_result
+            if attempt is None or attempt[0].is_set():
+                done = threading.Event()
+                errors: list[Exception] = []
+                attempt = (done, errors)
+                self._startup_result = attempt
+                def start_once() -> None:
+                    try:
+                        self.start()
+                    except Exception as exc:
+                        errors.append(exc)
+                    finally:
+                        done.set()
+                try:
+                    _Thread(target=start_once, name="compute-host-startup", daemon=True).start()
+                except Exception as exc:
+                    errors.append(exc)
+                    done.set()
+        if not attempt[0].wait(max(0, deadline - time.monotonic())):
+            raise HostSendNotSent("compute-host startup deadline exceeded; not sent")
+        if attempt[1]:
+            raise HostSendNotSent(f"compute-host startup failed; not sent: {attempt[1][0]}") from attempt[1][0]
+
+    def _send_owner_control_bounded(self, frame: dict[str, Any], *, deadline: float,
+                                    expected_boot_id: str | None = None) -> None:
+        self._ensure_started_by(deadline)
+        self._send_frame(frame, deadline=deadline, expected_boot_id=expected_boot_id)
+
+    def interrupt(self, sid: str, *, request_id: str | None = None,
+                  target_request_id: str | None = None, wait: bool = False,
+                  timeout: float = 5.0, expected_boot_id: str | None = None) -> dict | None:
+        if target_request_id is not None and (type(target_request_id) is not str or not target_request_id):
+            raise ValueError("invalid host interrupt target request id")
+        deadline = time.monotonic() + timeout
+        interrupt_id = request_id or uuid.uuid4().hex
+        waiter = queue.Queue(maxsize=1) if wait else None
+        if waiter is not None:
+            with self._control_lock:
+                if interrupt_id in self._pending_controls:
+                    raise HostSendNotSent("duplicate host interrupt request id; not sent")
+                self._pending_controls[interrupt_id] = waiter
+        frame = {"type": "interrupt", "sid": sid, "request_id": interrupt_id,
+                 **({"target_request_id": target_request_id} if target_request_id is not None else {})}
+        try:
+            self._send_owner_control_bounded(frame, deadline=deadline, expected_boot_id=expected_boot_id)
+            if waiter is None:
+                return None
+            try:
+                ack = waiter.get(timeout=max(0, deadline - time.monotonic()))
+            except queue.Empty as exc:
+                raise HostSendUncertain("compute-host interrupt acknowledgement timed out; unconfirmed") from exc
+            if (ack.get("type") != "interrupt.ack" or ack.get("request_id") != interrupt_id
+                    or ack.get("sid") != sid or type(ack.get("applied")) is not bool
+                    or target_request_id is not None and ack.get("target_request_id") != target_request_id):
+                raise HostSendUncertain("compute-host interrupt acknowledgement mismatch; unconfirmed")
+            return ack
+        finally:
+            if waiter is not None:
+                with self._control_lock:
+                    self._pending_controls.pop(interrupt_id, None)
 
     def lookup_session_key(self, session_key: str, *, timeout: float = 2.0) -> dict[str, Any] | None:
         """Return the host-side owner of one stored session, if exactly one exists.
@@ -303,22 +399,23 @@ class HostSupervisor:
         key = str(session_key or "")
         if not key:
             return None
-        self.start()
+        deadline = time.monotonic() + timeout
+        expected_boot_id = self.boot_id or None
         request_id = f"session-lookup-{uuid.uuid4().hex}"
         q: queue.Queue[dict] = queue.Queue(maxsize=1)
-        with self._lock:
+        with self._control_lock:
             self._pending_controls[request_id] = q
         try:
-            self._send_frame(
-                {
-                    "type": "session.lookup",
-                    "request_id": request_id,
-                    "session_key": key,
-                }
+            self._send_owner_control_bounded(
+                {"type": "session.lookup", "request_id": request_id, "session_key": key},
+                deadline=deadline, expected_boot_id=expected_boot_id,
             )
-            frame = q.get(timeout=timeout)
+            try:
+                frame = q.get(timeout=max(0, deadline - time.monotonic()))
+            except queue.Empty as exc:
+                raise HostSendUncertain("compute-host owner lookup acknowledgement timed out; unconfirmed") from exc
         finally:
-            with self._lock:
+            with self._control_lock:
                 self._pending_controls.pop(request_id, None)
         if frame.get("type") == "error":
             raise RuntimeError(str(frame.get("message") or "compute-host session lookup failed"))
@@ -334,12 +431,15 @@ class HostSupervisor:
             )
         return dict(matches[0])
 
-    def observe_session(self, sid: str, callback: Callable[[dict], None]) -> None:
-        """Receive the next terminal frame for a re-adopted host session."""
-        if not sid:
-            return
-        with self._lock:
-            self._session_observers[sid] = callback
+    def observe_session(self, sid: str, callback: Callable[[dict], None], *, request_id: str,
+                        expected_boot_id: str | None = None) -> None:
+        """Receive only the exact re-adopted request's terminal frame."""
+        if not sid or type(request_id) is not str or not request_id:
+            raise ValueError("session and request identity required for host observation")
+        with self._registry_lock:
+            if expected_boot_id is not None and self.boot_id != expected_boot_id:
+                raise HostBootMismatch("compute-host boot changed before observer registration")
+            self._session_observers[sid] = (request_id, callback, self.boot_id)
 
     def reload_mcp(self, sid: str, *, request_id: str | None = None) -> dict:
         return self.control(
@@ -357,10 +457,11 @@ class HostSupervisor:
         payload: dict[str, Any] | None = None,
         wait: bool = True,
         timeout: float = 30.0,
+        expected_boot_id: str | None = None,
     ) -> dict:
         if route_name not in MUTATOR_ROUTE_TABLE:
             raise ValueError(f"unclassified host mutator route: {route_name}")
-        self.start()
+        deadline = time.monotonic() + timeout
         request_id = str((payload or {}).get("request_id") or uuid.uuid4().hex)
         frame = dict(payload or {})
         frame.setdefault("type", "control")
@@ -370,22 +471,26 @@ class HostSupervisor:
         q: queue.Queue[dict] | None = None
         if wait:
             q = queue.Queue(maxsize=1)
-            with self._lock:
+            with self._control_lock:
+                if request_id in self._pending_controls:
+                    raise HostSendNotSent("duplicate pending control request id; not sent")
                 self._pending_controls[request_id] = q
-        self._send_frame(frame)
-        if not wait or q is None:
-            return {"status": "sent", "request_id": request_id}
         try:
-            return q.get(timeout=timeout)
+            self._send_owner_control_bounded(frame, deadline=deadline, expected_boot_id=expected_boot_id)
+            if q is None:
+                return {"status": "sent", "request_id": request_id}
+            try:
+                return q.get(timeout=max(0, deadline - time.monotonic()))
+            except queue.Empty as exc:
+                raise HostSendUncertain("compute-host control acknowledgement timed out; unconfirmed") from exc
         finally:
-            with self._lock:
-                self._pending_controls.pop(request_id, None)
+            if q is not None:
+                with self._control_lock:
+                    self._pending_controls.pop(request_id, None)
 
     def _spawn_locked(self, *, reason: str) -> None:
         if self._stopped_respawning:
             raise RuntimeError("compute host respawn disabled after crash loop")
-        self._hello_event.clear()
-        self._hello = {}
         boundary = self._profile_env_boundary
         if boundary is not None:
             from agent.secret_scope import build_profile_env_boundary
@@ -435,7 +540,12 @@ class HostSupervisor:
             bufsize=1,
             start_new_session=True,
         )
-        self._proc = proc
+        # Reader provenance and publication of a new process share this gate.
+        # Never hold it while waiting for hello from the reader thread.
+        with self._registry_lock:
+            self._hello_event.clear()
+            self._hello = {}
+            self._proc = proc
         self._stdout_thread = _Thread(target=self._drain_stdout, args=(proc,), name="compute-host-stdout", daemon=True)
         self._stderr_thread = _Thread(target=self._drain_stderr, args=(proc,), name="compute-host-stderr", daemon=True)
         self._wait_thread = _Thread(target=self._wait_for_exit, args=(proc,), name="compute-host-wait", daemon=True)
@@ -481,13 +591,87 @@ class HostSupervisor:
         except Exception:
             logger.debug("failed to remove compute host registry", exc_info=True)
 
-    def _send_frame(self, frame: dict[str, Any]) -> None:
-        with self._lock:
-            proc = self._proc
-            if proc is None or proc.poll() is not None or proc.stdin is None:
-                raise RuntimeError("compute host is not running")
-            proc.stdin.write(json.dumps(frame, separators=(",", ":"), ensure_ascii=False) + "\n")
-            proc.stdin.flush()
+    def _send_frame(self, frame: dict[str, Any], *, deadline: float | None = None,
+                    expected_boot_id: str | None = None) -> None:
+        """Serialize one frame, with no sender thread or post-timeout replay.
+
+        Only POSIX pipes support this contract. Never call an arbitrary stream's
+        blocking write/flush. A partial line poisons that process's transport:
+        subsequent frames cannot safely be appended to it. Recovery belongs to
+        the process owner, not an implicit resend of an uncertain mutation.
+        """
+        if deadline is None:
+            deadline = time.monotonic() + 5.0
+        data = (json.dumps(frame, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8")
+        offered = 0
+        proc = None
+        boot = expected_boot_id
+
+        def failure(message: str) -> TimeoutError:
+            if offered:
+                self._poisoned_proc = proc
+                return HostSendUncertain(message + "; partial frame, unconfirmed")
+            return HostSendNotSent(message + "; not sent")
+
+        def acquire(lock: Any) -> None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not lock.acquire(timeout=remaining):
+                raise failure("compute-host transport deadline exceeded")
+
+        acquire(self._write_lock)
+        try:
+            while offered < len(data):
+                acquire(self._lock)
+                try:
+                    current = self._proc
+                    if proc is None:
+                        proc = current
+                        if boot is None:
+                            boot = self.boot_id
+                    if current is not proc or (boot is not None and self.boot_id != boot):
+                        if not offered:
+                            raise HostBootMismatch("compute-host boot changed before frame write")
+                        raise failure("compute-host boot changed during frame write")
+                    if expected_boot_id == "":
+                        raise HostBootMismatch("compute-host boot is not pinned")
+                    if proc is None or proc.poll() is not None or proc.stdin is None:
+                        raise failure("compute host is not running")
+                    if self._poisoned_proc is proc:
+                        raise failure("compute-host transport has an incomplete frame")
+                    try:
+                        if os.name != "posix":
+                            raise OSError("bounded pipe transport unsupported on this platform")
+                        fd = proc.stdin.fileno()
+                        if not stat.S_ISFIFO(os.fstat(fd).st_mode):
+                            raise OSError("bounded transport requires a POSIX pipe")
+                        os.set_blocking(fd, False)
+                        if time.monotonic() >= deadline:
+                            raise failure("compute-host transport deadline exceeded")
+                        # Replacement and this nonblocking syscall are atomic
+                        # under _lock; no registry is held across either.
+                        try:
+                            count = os.write(fd, data[offered:offered + 65536])
+                        except BlockingIOError:
+                            count = 0
+                        offered += count
+                    except (OSError, ValueError, AttributeError) as exc:
+                        if isinstance(exc, (HostSendNotSent, HostSendUncertain)):
+                            raise
+                        raise failure(str(exc)) from exc
+                finally:
+                    self._lock.release()
+                if offered < len(data):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise failure("compute-host transport deadline exceeded")
+                    try:
+                        # Short poll slices revalidate replacement even when
+                        # the old pipe remains full indefinitely.
+                        select.select([], [fd], [], min(remaining, 0.05))
+                    except (OSError, ValueError, AttributeError) as exc:
+                        raise failure(str(exc)) from exc
+        finally:
+            self._write_lock.release()
 
     def _drain_stdout(self, proc: subprocess.Popen[str]) -> None:
         assert proc.stdout is not None
@@ -498,7 +682,21 @@ class HostSupervisor:
                 logger.warning("compute host emitted invalid json: %r", raw[:200])
                 continue
             if isinstance(frame, dict):
-                self._handle_host_frame(frame)
+                with self._registry_lock:
+                    if self._proc is not proc:
+                        return
+                    # This tag is assigned by the pipe owner, not trusted from
+                    # an arbitrary payload. Hello establishes that owner's boot.
+                    if frame.get("type") != "hello":
+                        frame = {**frame, "_host_boot_id": self.boot_id}
+                    if frame.get("type") != "rpc":
+                        self._handle_host_frame(frame)
+                        continue
+                # Output delivery can block. It must not hold the ownership
+                # registry or prevent control/observer registration. Carry its
+                # observed origin with the event for consumer reconciliation.
+                if self._proc is proc:
+                    self._handle_host_frame(frame)
 
     def _drain_stderr(self, proc: subprocess.Popen[str]) -> None:
         assert proc.stderr is not None
@@ -521,6 +719,8 @@ class HostSupervisor:
         if ftype == "rpc":
             message = frame.get("message")
             if isinstance(message, dict):
+                if isinstance(message.get("params"), dict) and frame.get("_host_boot_id"):
+                    message = {**message, "params": {**message["params"], "host_boot_id": frame["_host_boot_id"]}}
                 self.rpc_sink(message)
             return
         if ftype in {"turn.end", "turn.error"}:
@@ -535,7 +735,7 @@ class HostSupervisor:
             "shutdown.ack",
         }:
             request_id = str(frame.get("request_id") or "")
-            with self._lock:
+            with self._control_lock:
                 q = self._pending_controls.get(request_id)
             if q is not None:
                 try:
@@ -545,7 +745,7 @@ class HostSupervisor:
             return
         if ftype == "error" and frame.get("request_id"):
             request_id = str(frame.get("request_id") or "")
-            with self._lock:
+            with self._control_lock:
                 q = self._pending_controls.get(request_id)
             if q is not None:
                 try:
@@ -556,23 +756,51 @@ class HostSupervisor:
     def _complete_turn(self, frame: dict[str, Any]) -> None:
         request_id = str(frame.get("request_id") or "")
         sid = str(frame.get("sid") or "")
-        with self._lock:
+        boot_id = str(frame.get("_host_boot_id", self.boot_id))
+        with self._registry_lock:
+            pending = self._pending_turns.get(request_id)
+            if pending is not None and (pending[0] != sid or pending[2] != boot_id):
+                # A malformed or stale terminal cannot consume another owner.
+                return
             pending = self._pending_turns.pop(request_id, None)
-            observer = self._session_observers.pop(sid, None)
-        if pending is None:
-            cb = None
-        else:
-            _sid, cb = pending
-        if cb is not None:
+            observed = self._session_observers.get(sid)
+            observer = None
+            if observed is not None and observed[0] == request_id and observed[2] == boot_id:
+                self._session_observers.pop(sid)
+                observer = observed[1]
+            # A re-adopted mirror is the sole current projection owner.
+            callback = observer if observer is not None else (pending[1] if pending is not None else None)
+            if callback is None:
+                return
+            self._terminal_queues.setdefault(sid, deque()).append((dict(frame), callback))
+            launch = sid not in self._terminal_workers
+            if launch:
+                self._terminal_workers.add(sid)
+        if launch:
             try:
-                cb(frame)
+                _Thread(target=self._settle_terminals, args=(sid,),
+                        name="compute-host-terminal", daemon=True).start()
             except Exception:
-                logger.exception("compute host turn completion callback failed")
-        if observer is not None:
+                with self._registry_lock:
+                    self._terminal_workers.discard(sid)
+                # Retain the unstarted work. Running it on this thread would
+                # reintroduce ACK starvation; publication failure is not success.
+                logger.exception("could not start terminal settlement worker for %s", sid)
+
+    def _settle_terminals(self, sid: str) -> None:
+        """One callback worker per SID; no callback executes on the ACK reader."""
+        while True:
+            with self._registry_lock:
+                waiting = self._terminal_queues.get(sid)
+                if not waiting:
+                    self._terminal_queues.pop(sid, None)
+                    self._terminal_workers.discard(sid)
+                    return
+                frame, callback = waiting.popleft()
             try:
-                observer(frame)
+                callback(frame)
             except Exception:
-                logger.exception("compute host session observer failed")
+                logger.exception("compute host terminal projection failed for %s", sid)
 
     def _wait_for_exit(self, proc: subprocess.Popen[str]) -> None:
         code = proc.wait()
@@ -581,7 +809,8 @@ class HostSupervisor:
         with self._lock:
             if self._proc is not proc:
                 return
-            self._proc = None
+            with self._registry_lock:
+                self._proc = None
         self._remove_registry()
         self._fail_pending_turns(reason="crash", message=f"compute host exited with code {code}")
         if self.on_crash is not None:
@@ -592,33 +821,33 @@ class HostSupervisor:
         self._maybe_respawn_after_crash()
 
     def _fail_pending_turns(self, *, reason: str, message: str) -> None:
-        with self._lock:
-            pending = self._pending_turns
-            self._pending_turns = {}
-        for request_id, (sid, cb) in pending.items():
+        with self._registry_lock:
+            pending = {(request_id, sid, boot) for request_id, (sid, _cb, boot) in self._pending_turns.items()}
+            pending.update((request_id, sid, boot) for sid, (request_id, _cb, boot) in self._session_observers.items())
+        for request_id, sid, boot in pending:
             frame = {
                 "type": "turn.error",
                 "sid": sid,
                 "request_id": request_id,
+                "_host_boot_id": boot,
                 "reason": reason,
                 "message": message,
             }
-            self.rpc_sink(
-                {
-                    "jsonrpc": "2.0",
-                    "method": "event",
-                    "params": {
-                        "type": "error",
-                        "session_id": sid,
-                        "payload": {"message": message, "reason": reason},
-                    },
-                }
-            )
-            if cb is not None:
-                try:
-                    cb(frame)
-                except Exception:
-                    logger.exception("compute host error callback failed")
+            try:
+                self.rpc_sink(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "event",
+                        "params": {
+                            "type": "error",
+                            "session_id": sid,
+                            "payload": {"message": message, "reason": reason},
+                        },
+                    }
+                )
+            except Exception:
+                logger.exception("compute host crash notification failed")
+            self._complete_turn(frame)
 
     def _maybe_respawn_after_crash(self) -> None:
         now = time.monotonic()

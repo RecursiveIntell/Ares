@@ -169,6 +169,8 @@ def test_mutator_route_table_matches_prd_inventory():
         "config.set.fast": "idle-gated",
         "prompt.submit": "turn-path",
         "session.interrupt": "turn-path",
+        "session.steer": "run-concurrent",
+        "session.redirect": "run-concurrent",
         "reload.mcp": "run-concurrent",
         "session.save": "run-concurrent",
         "session.run_checkpoint.claim": "run-concurrent",
@@ -281,6 +283,10 @@ def test_supervisor_spawn_keeps_final_child_env_sanitized(tmp_path, monkeypatch)
     monkeypatch.setattr(supervisor_mod, "_Thread", _NoopThread)
     monkeypatch.setattr(supervisor_mod.subprocess, "Popen", _fake_popen)
 
+    # This fixture checks environment construction, not a real pipe handshake.
+    # Native supervisor tests cover hello after process publication.
+    monkeypatch.setattr(supervisor._hello_event, "wait", lambda timeout=None: True)
+    monkeypatch.setattr(supervisor, "_validate_hello", lambda: None)
     set_multiplex_active(True)
     token = set_hermes_home_override(target)
     try:
@@ -365,6 +371,9 @@ def test_supervisor_contextless_respawn_uses_captured_profile_owner(
 
     monkeypatch.setattr(supervisor_mod, "_Thread", _NoopThread)
     monkeypatch.setattr(supervisor_mod.subprocess, "Popen", _fake_popen)
+    # Handshake mechanics are outside this credential-boundary fixture.
+    monkeypatch.setattr(supervisor._hello_event, "wait", lambda timeout=None: True)
+    monkeypatch.setattr(supervisor, "_validate_hello", lambda: None)
     try:
         # Rotate the target credential after construction. The respawn must
         # rebuild temporal authority from the captured owner identities rather
@@ -609,11 +618,13 @@ def test_resume_claim_adopts_the_compute_host_owner_when_parent_mirror_is_gone(m
             assert key == session_key
             return {
                 "session_id": owner_sid,
+                "request_id": "owner-request",
                 "session_info": {"model": "owner-model", "provider": "owner-provider"},
                 "running": True,
             }
 
-        def observe_session(self, sid, callback):
+        def observe_session(self, sid, callback, *, request_id):
+            assert request_id == "owner-request"
             observed["sid"] = sid
             observed["callback"] = callback
 
@@ -649,6 +660,7 @@ def test_isolated_model_switch_is_applied_by_the_compute_host_owner(monkeypatch)
     session = {
         "agent": types.SimpleNamespace(model="old", provider="old-provider"),
         "agent_ready": threading.Event(),
+        "_compute_host_active": True,
         "history": [],
         "history_lock": threading.Lock(),
         "running": False,
@@ -690,7 +702,10 @@ def test_isolated_model_switch_is_applied_by_the_compute_host_owner(monkeypatch)
         assert response["result"]["value"] == "new-model"
         assert len(calls) == 1
         control_sid, route_name, payload, wait, timeout = calls[0]
-        assert (control_sid, route_name, wait, timeout) == (sid, "config.set.model", True, 30.0)
+        assert (control_sid, route_name, wait) == (sid, "config.set.model", True)
+        # Preserve the active release's bounded model-probe envelope, rather
+        # than freezing the older donor's 30-second implementation literal.
+        assert 0 < timeout <= 90.0
         assert payload["params"] == {
             "key": "model",
             "value": "new-model --provider new-provider --session",
@@ -864,6 +879,7 @@ def test_compute_host_lookup_returns_session_owner_metadata(monkeypatch):
         lambda _agent, _session: {"model": "owner-model", "provider": "owner-provider"},
     )
     try:
+        host._active_request_ids[owner_sid] = "owner-request"
         host._handle_session_lookup(
             {"request_id": "lookup", "session_key": "stored-session"}
         )
@@ -879,6 +895,7 @@ def test_compute_host_lookup_returns_session_owner_metadata(monkeypatch):
             {
                 "session_id": owner_sid,
                 "running": True,
+                "request_id": "owner-request",
                 "session_info": {"model": "owner-model", "provider": "owner-provider"},
             }
         ],

@@ -14,7 +14,7 @@ import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
 
-from hermes_state_continuity import ContextContinuationError, _canonical, _strict_json
+from hermes_state_continuity import ContextContinuationError, _canonical, _strict_json, _valid_context_stop_v2
 
 
 def _hash(value):
@@ -43,6 +43,27 @@ def input_response_publication_scope(db, holder, phase_id, attempt_id, content):
 
 
 class SessionContextInputTurnsMixin:
+    def _context_input_stop_cut_on_conn(self, conn, root):
+        row = conn.execute("SELECT value FROM state_meta WHERE key=?",
+            ("context-control:" + root,)).fetchone()
+        if row is None:
+            return None
+        control = _strict_json(row[0])
+        if type(control) is dict and control.get("schema") == "SessionDBContextControlV1":
+            # No receipt cut in V1; its existing transcript watermark still
+            # gates dispatch. Never invent a sequence for a legacy record.
+            return None
+        if not _valid_context_stop_v2(control):
+            raise ContextContinuationError("CONTEXT_INPUT_STOP_UNCONFIRMED")
+        return control
+
+    def _assert_context_input_after_stop_on_conn(self, conn, root, receipt):
+        """A newer arrival cannot make a stopped receipt eligible again."""
+        control = self._context_input_stop_cut_on_conn(conn, root)
+        if control is not None and receipt.sequence <= control["input_sequence"]:
+            raise ContextContinuationError("CONTEXT_INPUT_STOPPED")
+        return control
+
     def _complete_input_response_batch_on_conn(self, conn, session_id, holder, messages, row_ids):
         bound = _final_input_response.get()
         if bound is None:
@@ -96,8 +117,9 @@ class SessionContextInputTurnsMixin:
                 raise ContextContinuationError("CONTEXT_INPUT_SCOPE_MISMATCH")
             if self._read_context_input_on_conn(conn, root, receipt.sequence) != receipt:
                 raise ContextContinuationError("CONTEXT_INPUT_RECORD_INVALID")
+            self._assert_context_input_after_stop_on_conn(conn, root, receipt)
             phase = self._input_turn_on_conn(conn, root, profile)
-            if phase is not None and phase["state"] != "answered" and phase["dispatch_attempts"]:
+            if phase is not None and phase["state"] not in {"answered", "cancelled"} and phase["dispatch_attempts"]:
                 raise ContextContinuationError("CONTEXT_INPUT_EXECUTION_UNCERTAIN")
             key = _key(root) + ":wake"
             row = conn.execute("SELECT value FROM state_meta WHERE key=?", (key,)).fetchone()
@@ -109,9 +131,13 @@ class SessionContextInputTurnsMixin:
                     or type(previous["started_at"]) not in (int, float)
                     or previous["deadline_at"] != previous["started_at"] + 900):
                 raise ContextContinuationError("CONTEXT_INPUT_WAKE_INVALID")
-            answered = phase is not None and phase["state"] == "answered"
+            resolved_through = None
+            if phase is not None and phase["state"] == "answered":
+                resolved_through = phase["last_sequence"]
+            elif phase is not None and phase["state"] == "cancelled":
+                resolved_through = self._cancelled_input_cut_on_conn(conn, root, profile, phase)
             now = time.time()
-            if previous is not None and not (answered and phase["last_sequence"] >= previous["through_sequence"]):
+            if previous is not None and not (resolved_through is not None and resolved_through >= previous["through_sequence"]):
                 if previous["attempts"] >= 3 or now >= previous["deadline_at"]:
                     raise ContextContinuationError("CONTEXT_INPUT_WAKE_EXHAUSTED")
                 value = dict(previous, attempts=previous["attempts"] + 1)
@@ -127,8 +153,14 @@ class SessionContextInputTurnsMixin:
         row = conn.execute("SELECT value FROM state_meta WHERE key=?", (_key(root),)).fetchone()
         if row is None:
             return None
-        value = _strict_json(row[0])
-        if (set(value) != _FIELDS or value["schema"] != "SessionDBContextInputTurnV1"
+        return self._validate_input_turn_on_conn(conn, root, profile, _strict_json(row[0]))
+
+    def _validate_input_turn_on_conn(self, conn, root, profile, value):
+        cancelled = (type(value) is dict and value.get("schema") == "SessionDBContextInputTurnV2"
+                     and value.get("state") == "cancelled")
+        expected_fields = _FIELDS | {"stop_disposition_digest"} if cancelled else _FIELDS
+        if (type(value) is not dict or set(value) != expected_fields
+                or not cancelled and value["schema"] != "SessionDBContextInputTurnV1"
                 or value["conversation_root"] != root or value["profile_name"] != profile
                 or any(type(value[k]) is not int for k in ("first_sequence", "last_sequence", "attempts", "controller_pid", "start_watermark"))
                 or not 1 <= value["first_sequence"] <= value["last_sequence"]
@@ -137,7 +169,7 @@ class SessionContextInputTurnsMixin:
                 or type(value["started_at"]) not in (float, int)
                 or not math.isfinite(value["started_at"])
                 or value["deadline_at"] != value["started_at"] + 900
-                or value["state"] not in {"active", "idle", "uncertain", "answered"}
+                or not cancelled and value["state"] not in {"active", "idle", "uncertain", "answered"}
                 or type(value["dispatch_attempts"]) is not list or len(value["dispatch_attempts"]) > 128
                 or any(type(item) is not str for item in value["dispatch_attempts"])
                 or len(set(value["dispatch_attempts"])) != len(value["dispatch_attempts"])):
@@ -159,7 +191,81 @@ class SessionContextInputTurnsMixin:
                 raise ContextContinuationError("CONTEXT_INPUT_TURN_INVALID")
         elif value["final_row"] is not None:
             raise ContextContinuationError("CONTEXT_INPUT_TURN_INVALID")
+        if cancelled:
+            proof = self._input_stop_disposition_on_conn(conn, root, profile, value["phase_id"])
+            if value["dispatch_attempts"] or proof is None or proof["after"] != value:
+                raise ContextContinuationError("CONTEXT_INPUT_STOP_DISPOSITION_INVALID")
         return value
+
+    def _input_stop_disposition_on_conn(self, conn, root, profile, phase_id):
+        row = conn.execute("SELECT value FROM state_meta WHERE key=?",
+            (f"{_key(root)}:phase:{phase_id}:cancelled",)).fetchone()
+        if row is None:
+            return None
+        proof = _strict_json(row[0])
+        fields = {"schema", "conversation_root", "profile_name", "phase_id", "before", "after", "control", "recorded_at"}
+        if (type(proof) is not dict or set(proof) != fields
+                or proof["schema"] != "SessionDBContextInputStopDispositionV1"
+                or proof["conversation_root"] != root or proof["profile_name"] != profile
+                or proof["phase_id"] != phase_id or type(proof["before"]) is not dict
+                or proof["before"].get("schema") != "SessionDBContextInputTurnV1"
+                or proof["before"].get("state") not in {"active", "idle"}
+                or type(proof["recorded_at"]) not in (int, float) or not math.isfinite(proof["recorded_at"])
+                or not _valid_context_stop_v2(proof["control"])):
+            raise ContextContinuationError("CONTEXT_INPUT_STOP_DISPOSITION_INVALID")
+        before = self._validate_input_turn_on_conn(conn, root, profile, proof["before"])
+        digest = _hash({"before": before, "control": proof["control"], "recorded_at": proof["recorded_at"]})
+        if (before["phase_id"] != phase_id or before["dispatch_attempts"]
+                or proof["control"]["input_sequence"] < before["last_sequence"]
+                or proof["control"]["input_sequence"] > self._context_input_head_on_conn(conn, root, profile)["accepted_sequence"]
+                or proof["after"] != dict(before, schema="SessionDBContextInputTurnV2", state="cancelled",
+                                          stop_disposition_digest=digest)):
+            raise ContextContinuationError("CONTEXT_INPUT_STOP_DISPOSITION_INVALID")
+        return proof
+
+    def read_context_input_stop_disposition(self, session_id, *, phase_id):
+        if type(phase_id) is not str or not phase_id:
+            raise ContextContinuationError("CONTEXT_INPUT_STOP_DISPOSITION_INVALID")
+        with self._read_ctx() as conn:
+            conn.execute("SAVEPOINT input_stop_disposition")
+            try:
+                root, profile = self._context_input_scope_on_conn(conn, session_id)
+                return self._input_stop_disposition_on_conn(conn, root, profile, phase_id)
+            finally:
+                conn.execute("ROLLBACK TO input_stop_disposition")
+                conn.execute("RELEASE input_stop_disposition")
+
+    def _cancel_undispatched_input_turn_on_conn(self, conn, session_id, control):
+        root = str(self._session_turn_lease_key_on_conn(conn, session_id))
+        if conn.execute("SELECT 1 FROM state_meta WHERE key=?", (_key(root),)).fetchone() is None:
+            return
+        root, profile = self._context_input_scope_on_conn(conn, session_id)
+        phase = self._input_turn_on_conn(conn, root, profile)
+        if phase is None or phase["state"] not in {"active", "idle"} or phase["dispatch_attempts"]:
+            return
+        if self._read_context_rebase_snapshot_on_conn(conn, session_id).has_unresolved_effects:
+            return
+        if not _valid_context_stop_v2(control) or control["input_sequence"] < phase["last_sequence"]:
+            raise ContextContinuationError("CONTEXT_INPUT_STOP_DISPOSITION_INVALID")
+        recorded_at = time.time()
+        digest = _hash({"before": phase, "control": control, "recorded_at": recorded_at})
+        cancelled = dict(phase, schema="SessionDBContextInputTurnV2", state="cancelled", stop_disposition_digest=digest)
+        proof = {"schema": "SessionDBContextInputStopDispositionV1", "conversation_root": root,
+                 "profile_name": profile, "phase_id": phase["phase_id"],
+                 "before": phase, "after": cancelled, "control": control, "recorded_at": recorded_at}
+        conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?)",
+            (f'{_key(root)}:phase:{phase["phase_id"]}:cancelled', _canonical(proof)))
+        self._write_input_turn_on_conn(conn, cancelled)
+
+    def _cancelled_input_cut_on_conn(self, conn, root, profile, phase):
+        proof = self._input_stop_disposition_on_conn(conn, root, profile, phase["phase_id"])
+        control = self._context_input_stop_cut_on_conn(conn, root)
+        if (proof is None or control is None
+                or control["revision"] < proof["control"]["revision"]
+                or control["revision"] == proof["control"]["revision"] and control != proof["control"]
+                or control["input_sequence"] < proof["control"]["input_sequence"]):
+            raise ContextContinuationError("CONTEXT_INPUT_STOP_UNCONFIRMED")
+        return control["input_sequence"]
 
     def _input_turn_receipts_on_conn(self, conn, value):
         receipts = tuple(self._read_context_input_on_conn(conn, value["conversation_root"], sequence)
@@ -185,13 +291,17 @@ class SessionContextInputTurnsMixin:
             raise ContextContinuationError("CONTEXT_INPUT_RECOVERY_EXHAUSTED")
 
     def read_context_input_work(self, session_id):
-        """Read one bounded unfinished phase or the pending native inbox."""
+        """Read unfinished-phase evidence or eligible post-cut inbox inputs.
+
+        Stopped receipts remain in the inbox; filtering this work projection
+        neither deletes their data nor marks them answered.
+        """
         with self._read_ctx() as conn:
             conn.execute("SAVEPOINT context_input_work")
             try:
                 root, profile = self._context_input_scope_on_conn(conn, session_id)
                 phase = self._input_turn_on_conn(conn, root, profile)
-                if phase is not None and phase["state"] != "answered":
+                if phase is not None and phase["state"] not in {"answered", "cancelled"}:
                     bound = phase
                     if not phase["dispatch_attempts"]:
                         head = self._context_input_head_on_conn(conn, root, profile)
@@ -203,8 +313,14 @@ class SessionContextInputTurnsMixin:
                     head = self._context_input_head_on_conn(conn, root, profile)
                     if head["accepted_sequence"] - head["projected_sequence"] > 128:
                         raise ContextContinuationError("CONTEXT_INPUT_PENDING_LIMIT")
+                    control = self._context_input_stop_cut_on_conn(conn, root)
+                    start = head["projected_sequence"] + 1
+                    if phase is not None and phase["state"] == "cancelled":
+                        start = max(start, self._cancelled_input_cut_on_conn(conn, root, profile, phase) + 1)
+                    elif control is not None:
+                        start = max(start, control["input_sequence"] + 1)
                     receipts = tuple(self._read_context_input_on_conn(conn, root, n)
-                        for n in range(head["projected_sequence"] + 1, head["accepted_sequence"] + 1))
+                        for n in range(start, head["accepted_sequence"] + 1))
                 return {"phase": phase, "receipts": receipts}
             finally:
                 conn.execute("ROLLBACK TO context_input_work")
@@ -225,10 +341,13 @@ class SessionContextInputTurnsMixin:
                 raise ContextContinuationError("CONTEXT_INPUT_SCOPE_MISMATCH")
             if self._read_context_input_on_conn(conn, root, receipt.sequence) != receipt:
                 raise ContextContinuationError("CONTEXT_INPUT_RECORD_INVALID")
+            stop_control = self._assert_context_input_after_stop_on_conn(conn, root, receipt)
             head = self._context_input_head_on_conn(conn, root, profile)
             previous = self._input_turn_on_conn(conn, root, profile)
+            if previous is not None and previous["state"] == "cancelled":
+                self._cancelled_input_cut_on_conn(conn, root, profile, previous)
             now = time.time()
-            if previous is not None and previous["state"] != "answered":
+            if previous is not None and previous["state"] not in {"answered", "cancelled"}:
                 if previous["dispatch_attempts"]:
                     raise ContextContinuationError("CONTEXT_INPUT_EXECUTION_UNCERTAIN")
                 if previous["last_sequence"] > receipt.sequence:
@@ -248,7 +367,8 @@ class SessionContextInputTurnsMixin:
                 if receipt.sequence <= head["projected_sequence"]:
                     raise ContextContinuationError("CONTEXT_INPUT_ALREADY_PROJECTED")
                 value = {"schema": "SessionDBContextInputTurnV1", "conversation_root": root, "profile_name": profile,
-                    "phase_id": uuid.uuid4().hex, "first_sequence": head["projected_sequence"] + 1,
+                    "phase_id": uuid.uuid4().hex, "first_sequence": max(head["projected_sequence"] + 1,
+                        1 if stop_control is None else stop_control["input_sequence"] + 1),
                     "last_sequence": receipt.sequence, "receipts_digest": "", "started_at": now, "deadline_at": now + 900,
                     "attempts": 1, "dispatch_attempts": [], "final_row": None,
                     "start_watermark": conn.execute("SELECT COALESCE(MAX(id),0) FROM messages").fetchone()[0]}
@@ -257,7 +377,7 @@ class SessionContextInputTurnsMixin:
                 value["receipts_digest"] = _hash([[r.sequence, r.payload_digest] for r in self._input_turn_receipts_on_conn(conn, value)])
             control = conn.execute("SELECT value FROM state_meta WHERE key=?", ("context-control:" + root,)).fetchone()
             control_raw = None if control is None else control[0]
-            if previous is not None and previous["state"] != "answered" and previous["control_raw"] != control_raw:
+            if previous is not None and previous["state"] not in {"answered", "cancelled"} and previous["control_raw"] != control_raw:
                 raise ContextContinuationError("CONTEXT_INPUT_CONTROL_CHANGED")
             value.update(holder_digest=_hash(turn_lease_holder), controller_pid=os.getpid(),
                 process_identity=_controller(os.getpid()), state="active", control_raw=control_raw)
