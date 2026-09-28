@@ -2180,7 +2180,10 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             compacted = tip.get("compacted_messages") if isinstance(tip, dict) else None
             receipt_id = tip.get("receipt_id") if isinstance(tip, dict) else None
             generation = tip.get("generation") if isinstance(tip, dict) else None
-            lineage_epoch = tip.get("lineage_epoch") if isinstance(tip, dict) else None
+            # Rust's LineageTipProjectionV1 uses serde(default) and omits
+            # lineage_epoch when zero. Absence is epoch zero in that wire
+            # contract; explicit null/bool/string values remain invalid below.
+            lineage_epoch = tip.get("lineage_epoch", 0) if isinstance(tip, dict) else None
             valid_empty_tip = (
                 compacted == []
                 and receipt_id is None
