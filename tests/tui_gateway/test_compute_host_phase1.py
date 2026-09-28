@@ -726,9 +726,13 @@ def test_isolated_fast_switch_uses_compute_host_owner_not_parent_mirror(monkeypa
     calls = []
 
     class _Supervisor:
+        boot_id = "owner-boot"
+
         def control(self, control_sid, *, route_name, payload, wait=True, timeout=30.0):
             calls.append((control_sid, route_name, payload))
-            return {"type": "control.ack", "result": {"key": "fast", "value": "normal"},
+            return {"type": "control.ack", "sid": control_sid, "route_name": route_name,
+                    "_host_boot_id": self.boot_id,
+                    "result": {"key": "fast", "value": "normal"},
                     "session_info": {"service_tier": "normal", "fast": False}}
 
     server._sessions[sid] = session
@@ -745,6 +749,146 @@ def test_isolated_fast_switch_uses_compute_host_owner_not_parent_mirror(monkeypa
         assert stale_agent.service_tier == "priority"
         assert session["_metadata_mirror"]["fast"] is False
         assert server._session_info(stale_agent, session)["fast"] is False
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_contradictory_fast_owner_readback_is_unknown_without_parent_paint(monkeypatch):
+    sid = "fast-contradictory-owner"
+    agent = types.SimpleNamespace(model="openai/gpt-5.4", service_tier=None)
+    session = {"agent": agent, "session_key": "stored-fast", "running": False,
+               "_compute_host_active": True, "_metadata_mirror": {"service_tier": "normal", "fast": False}}
+
+    class _Supervisor:
+        boot_id = "owner-boot"
+
+        def control(self, control_sid, *, route_name, payload, wait=True, timeout=30.0):
+            return {"type": "control.ack", "sid": control_sid, "route_name": route_name,
+                    "_host_boot_id": self.boot_id,
+                    "result": {"key": "fast", "value": "fast"},
+                    "session_info": {"service_tier": "normal", "fast": False}}
+
+    emitted = []
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: True)
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: _Supervisor())
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+    try:
+        response = server.handle_request({"id": "fast-on", "method": "config.set",
+                                          "params": {"session_id": sid, "key": "fast", "value": "fast"}})
+        assert response["error"]["code"] == 5019
+        assert session["_metadata_mirror"] == {"service_tier": "normal", "fast": False}
+        assert "create_service_tier_override" not in session
+        assert agent.service_tier is None
+        assert emitted == []
+    finally:
+        server._sessions.pop(sid, None)
+
+
+@pytest.mark.parametrize("host_code", [4001, 4002, 4009])
+def test_started_fast_host_error_is_unknown_without_not_applied_proof(monkeypatch, host_code):
+    sid = "fast-error-owner"
+    agent = types.SimpleNamespace(model="openai/gpt-5.4", service_tier=None)
+    session = {"agent": agent, "session_key": "stored-fast", "running": False,
+               "_compute_host_active": True, "_metadata_mirror": {"service_tier": "normal", "fast": False}}
+
+    class _Supervisor:
+        boot_id = "owner-boot"
+
+        def control(self, control_sid, *, route_name, payload, wait=True, timeout=30.0):
+            return {"type": "control.error", "sid": control_sid, "route_name": route_name,
+                    "_host_boot_id": self.boot_id, "code": host_code,
+                    "message": "host returned error after control was offered"}
+
+    emitted = []
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: True)
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: _Supervisor())
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+    try:
+        response = server.handle_request({"id": "fast-error", "method": "config.set",
+                                          "params": {"session_id": sid, "key": "fast", "value": "fast"}})
+        assert response["error"]["code"] == 5019
+        assert session["_metadata_mirror"] == {"service_tier": "normal", "fast": False}
+        assert "create_service_tier_override" not in session
+        assert agent.service_tier is None
+        assert emitted == []
+    finally:
+        server._sessions.pop(sid, None)
+
+
+@pytest.mark.parametrize("change", ["boot", "replacement", "wrong_sid", "wrong_route"])
+def test_fast_ack_cannot_paint_changed_owner_or_route(monkeypatch, change):
+    sid = "fast-owner-fence"
+    agent = types.SimpleNamespace(model="openai/gpt-5.4", service_tier=None)
+    session = {"agent": agent, "session_key": "stored-fast", "running": False,
+               "_compute_host_active": True, "_metadata_mirror": {"service_tier": "normal", "fast": False}}
+    replacement = {"session_key": "other-owner", "_metadata_mirror": {"fast": False}}
+
+    class _Supervisor:
+        boot_id = "owner-boot"
+
+        def control(self, control_sid, *, route_name, payload, wait=True, timeout=30.0):
+            if change == "boot":
+                self.boot_id = "replacement-boot"
+            if change == "replacement":
+                server._sessions[sid] = replacement
+            return {"type": "control.ack", "sid": "wrong" if change == "wrong_sid" else control_sid,
+                    "route_name": "config.set.reasoning" if change == "wrong_route" else route_name,
+                    "_host_boot_id": "owner-boot", "result": {"key": "fast", "value": "fast"},
+                    "session_info": {"service_tier": "priority", "fast": True}}
+
+    supervisor = _Supervisor()
+    emitted = []
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: True)
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: supervisor)
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+    try:
+        response = server.handle_request({"id": "fast-owner", "method": "config.set",
+                                          "params": {"session_id": sid, "key": "fast", "value": "fast"}})
+        assert response is not None and response["error"]["code"] == 5019
+        assert session["_metadata_mirror"] == {"service_tier": "normal", "fast": False}
+        assert agent.service_tier is None
+        assert "create_service_tier_override" not in session
+        assert replacement["_metadata_mirror"] == {"fast": False}
+        assert emitted == []
+    finally:
+        server._sessions.pop(sid, None)
+
+
+@pytest.mark.parametrize("probe", ["before", "after"])
+def test_fast_supervisor_boot_probe_failure_is_typed_without_parent_paint(monkeypatch, probe):
+    sid = "fast-supervisor-probe"
+    session = {"session_key": "stored-fast", "running": False, "_compute_host_active": True,
+               "_metadata_mirror": {"service_tier": "normal", "fast": False}}
+
+    class _Supervisor:
+        probes = 0
+
+        @property
+        def boot_id(self):
+            self.probes += 1
+            if probe == "before" or self.probes > 1:
+                raise OSError("supervisor boot unavailable")
+            return "owner-boot"
+
+        def control(self, control_sid, *, route_name, payload, wait=True, timeout=30.0):
+            return {"type": "control.ack", "sid": control_sid, "route_name": route_name,
+                    "_host_boot_id": "owner-boot", "result": {"key": "fast", "value": "fast"},
+                    "session_info": {"service_tier": "priority", "fast": True}}
+
+    emitted = []
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: True)
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: _Supervisor())
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+    try:
+        response = server.handle_request({"id": "fast-probe", "method": "config.set",
+                                          "params": {"session_id": sid, "key": "fast", "value": "fast"}})
+        assert response is not None and response["error"]["code"] == 5019
+        assert session["_metadata_mirror"] == {"service_tier": "normal", "fast": False}
+        assert emitted == []
     finally:
         server._sessions.pop(sid, None)
 

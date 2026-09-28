@@ -14288,21 +14288,45 @@ def _(rid, params: dict) -> dict:
             return _err(rid, 4001, "session not found")
         if session is not None and session.get("_compute_host_active") and _session_uses_compute_host(session):
             sid = str(params["session_id"])
+            route_name = "config.set.fast"
             try:
+                supervisor = _get_compute_host_supervisor()
+                boot_before = supervisor.boot_id
                 ack = _send_compute_host_control(
                     sid,
-                    route_name="config.set.fast",
+                    route_name=route_name,
                     payload={"params": {"key": "fast", "value": value}},
                     wait=True,
                     timeout=30.0,
                 )
-            except Exception as exc:
-                return _err(rid, 5019, f"compute-host fast switch failed: {exc}")
+            except Exception:
+                return _err(rid, 5019, "fast update unconfirmed; read back the session before retrying")
+            if _sessions.get(sid) is not session or not isinstance(ack, dict):
+                return _err(rid, 5019, "fast update returned an unconfirmed owner")
             if ack.get("type") in {"control.error", "error"}:
-                return _err(rid, 5001, str(ack.get("message") or "compute-host fast switch failed"))
-            result = ack.get("result")
-            if not isinstance(result, dict) or result.get("key") != "fast":
-                return _err(rid, 5001, "compute-host fast switch returned an invalid response")
+                # A host error after an offered write carries no proof that
+                # the mutation was not applied, regardless of its error code.
+                return _err(rid, 5019, str(ack.get("message") or "fast update unconfirmed"))
+            result, info = ack.get("result"), ack.get("session_info")
+            try:
+                boot_after = supervisor.boot_id
+            except Exception:
+                return _err(rid, 5019, "fast update returned an unconfirmed host boot")
+            effective = result.get("value") if isinstance(result, dict) else None
+            tier = info.get("service_tier") if isinstance(info, dict) else None
+            if (ack.get("type") != "control.ack" or ack.get("sid") != sid
+                    or ack.get("route_name") != route_name
+                    or not boot_after or (boot_before and boot_before != boot_after)
+                    or ack.get("_host_boot_id") != boot_after
+                    or not isinstance(result, dict) or result.get("key") != "fast"
+                    or type(effective) is not str or effective not in {"fast", "normal"}
+                    or (str(value or "").strip().lower() in {"fast", "on", "normal", "off"}
+                        and effective != ("fast" if str(value).strip().lower() in {"fast", "on"} else "normal"))
+                    or type(tier) is not str
+                    or tier not in ({"priority"} if effective == "fast" else {"", "normal"})
+                    or type(info.get("fast")) is not bool
+                    or info["fast"] != (effective == "fast")):
+                return _err(rid, 5019, "fast update lacks confirmed owner readback")
             _apply_compute_host_metadata_mirror(session, ack)
             _emit("session.info", sid, _session_info(session.get("agent"), session))
             return _ok(rid, result)
