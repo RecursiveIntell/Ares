@@ -225,7 +225,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: RecursiveIntell/Libraries
-          ref: 0b099ec416de60f6adafb182f1d1e83795d05c56
+          ref: 34fa0719ee84b01ba268b5849c2455ac8159ef49
           path: native-owner-source
           persist-credentials: false
       - name: Build and test pinned native Governor
