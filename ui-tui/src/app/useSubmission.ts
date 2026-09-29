@@ -11,10 +11,10 @@ import { hasInterpolation, INTERPOLATION_RE } from '../protocol/interpolation.js
 import type { Msg } from '../types.js'
 
 import type { ComposerActions, ComposerRefs, ComposerState, ComposerToken } from './interfaces.js'
+import { idleModelStatus } from './modelReadiness.js'
 import { submitPrompt } from './submissionCore.js'
 import { turnController } from './turnController.js'
 import { getUiState, patchUiState } from './uiStore.js'
-import { idleModelStatus } from './modelReadiness.js'
 
 const DOUBLE_ENTER_MS = 450
 

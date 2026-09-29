@@ -205,6 +205,20 @@ describe('createGatewayEventHandler', () => {
     vi.useFakeTimers()
 
     try {
+      // The idle restore shows the model-attestation status; seed a session
+      // the backend has already attested so the restore resolves to 'ready'.
+      patchUiState({
+        sid: 'goal-test-sid',
+        info: {
+          model: 'test-model',
+          provider: 'test-provider',
+          session_id: 'goal-test-sid',
+          model_ready: true,
+          skills: {},
+          tools: {}
+        } as any
+      })
+
       onEvent({
         payload: { kind: 'goal', text: verdict },
         type: 'status.update'
@@ -389,13 +403,15 @@ describe('createGatewayEventHandler', () => {
     try {
       onEvent({ payload: {}, type: 'message.start' } as any)
       onEvent({ payload: { text: 'final answer' }, type: 'message.complete' } as any)
+      // A completed turn resets to the model-attestation status until the
+      // backend's next session.info re-attests the live session.
       expect(getUiState().busy).toBe(false)
-      expect(getUiState().status).toBe('ready')
+      expect(getUiState().status).toBe('model unverified')
 
       onEvent({ payload: { text: 'thinking...' }, type: 'thinking.delta' } as any)
       vi.runOnlyPendingTimers()
 
-      expect(getUiState().status).toBe('ready')
+      expect(getUiState().status).toBe('model unverified')
       expect(getTurnState().reasoning).toBe('')
     } finally {
       vi.useRealTimers()

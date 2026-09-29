@@ -27,12 +27,12 @@ import type { Msg, SubagentProgress, SubagentStatus, Usage } from '../types.js'
 
 import { applyDelegationStatus, getDelegationState } from './delegationStore.js'
 import type { GatewayEventHandlerContext } from './interfaces.js'
+import { idleModelStatus } from './modelReadiness.js'
 import { getOverlayState, patchOverlayState } from './overlayStore.js'
 import { flashGoodVibes, flashPet } from './petFlashStore.js'
 import { turnController } from './turnController.js'
 import { getTurnState } from './turnStore.js'
 import { getUiState, patchUiState } from './uiStore.js'
-import { idleModelStatus } from './modelReadiness.js'
 import { isWakeUserDisabled } from './wakeState.js'
 
 const NO_PROVIDER_RE = /\bNo (?:LLM|inference) provider configured\b/i
@@ -73,6 +73,7 @@ export const mergeUsageStable = (prev: Usage, patch: Partial<Usage> | undefined)
 
 const statusFromBusy = () => {
   const state = getUiState()
+
   return state.busy ? 'running…' : idleModelStatus(state.info, state.sid)
 }
 
