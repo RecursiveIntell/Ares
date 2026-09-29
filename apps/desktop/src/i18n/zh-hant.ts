@@ -2774,6 +2774,8 @@ export const zhHant = defineLocale({
       notReady: '澄清請求尚未就緒',
       gatewayDisconnected: 'Hermes 閘道未連線',
       sendFailed: '無法傳送澄清回應',
+      responseExpired: '請求已逾期，答案未送達。請改以後續訊息傳送。',
+      responseRejected: '回應未被接受，已保留所選答案。',
       loadingQuestion: '正在載入問題…',
       other: '其他（輸入您的答案）',
       placeholder: '輸入您的答案…',
