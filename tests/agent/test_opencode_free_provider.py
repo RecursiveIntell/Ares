@@ -91,9 +91,14 @@ class TestOpenCodeFreeModelLists:
         for mid in _PROVIDER_MODELS["opencode-free"]:
             assert is_opencode_zen_free_model(mid), mid
 
-    def test_ox_alpha_is_listed(self):
+    def test_ox_alpha_is_demoted_after_keyless_401s(self):
+        """x-preview-f-free ("Ox Alpha") was demoted from the curated catalog:
+        its anonymous relay access started 401ing, so a stale curated entry
+        would look selectable in the picker and then fail at execution. The
+        live relay catalog (fetched on explicit refresh, probe at switch time)
+        is the source of truth for which free models are currently keyless."""
         from hermes_cli.models import _PROVIDER_MODELS
-        assert "x-preview-f-free" in _PROVIDER_MODELS["opencode-free"]
+        assert "x-preview-f-free" not in _PROVIDER_MODELS["opencode-free"]
 
 
 class TestOpenCodeFreeRuntimeKeyless:

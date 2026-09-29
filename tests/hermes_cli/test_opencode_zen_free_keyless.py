@@ -64,7 +64,7 @@ class TestFreeSlugDetection:
 
 class TestFreeRuntime:
     def test_zen_provider_free_model(self):
-        rt = opencode_zen_free_runtime("opencode-zen", "x-preview-f-free")
+        rt = opencode_zen_free_runtime("opencode-zen", "hy3-free")
         assert rt is not None
         assert rt["base_url"] == "https://opencode.ai/zen/v1"
         assert rt["api_key"] == OPENCODE_ZEN_FREE_KEYLESS_PLACEHOLDER
@@ -74,9 +74,17 @@ class TestFreeRuntime:
     def test_go_provider_heals_to_zen(self):
         # Free slugs only exist on the Zen relay; a Go selection must be
         # routed to Zen (the Go relay rejects the model outright).
-        rt = opencode_zen_free_runtime("opencode-go", "x-preview-f-free")
+        rt = opencode_zen_free_runtime("opencode-go", "hy3-free")
         assert rt is not None
         assert rt["base_url"] == "https://opencode.ai/zen/v1"
+
+    def test_demoted_ox_alpha_does_not_heal_keyless(self):
+        """x-preview-f-free's anonymous relay access 401s, so it was demoted
+        from the verified keyless catalog. The heal gate follows the catalog
+        (not the -free suffix): under opencode-zen/opencode-go it must fail
+        closed to the normal credential path instead of routing anonymously."""
+        assert opencode_zen_free_runtime("opencode-zen", "x-preview-f-free") is None
+        assert opencode_zen_free_runtime("opencode-go", "x-preview-f-free") is None
 
     def test_go_ox_alpha_free_does_not_heal_to_zen(self):
         """ox-alpha-free is a KEYED Go-subscription model despite its -free
@@ -114,15 +122,23 @@ class TestRuntimeProviderKeylessRouting:
             return resolve_runtime_provider(requested=provider, target_model=model)
 
     def test_zen_free_model_resolves_keyless(self):
-        rt = self._resolve("opencode-zen", "x-preview-f-free")
+        rt = self._resolve("opencode-zen", "hy3-free")
         assert rt["api_key"] == OPENCODE_ZEN_FREE_KEYLESS_PLACEHOLDER
         assert rt["base_url"] == "https://opencode.ai/zen/v1"
         assert rt["api_mode"] == "chat_completions"
 
     def test_go_free_model_resolves_keyless_on_zen(self):
-        rt = self._resolve("opencode-go", "x-preview-f-free")
+        rt = self._resolve("opencode-go", "hy3-free")
         assert rt["api_key"] == OPENCODE_ZEN_FREE_KEYLESS_PLACEHOLDER
         assert rt["base_url"] == "https://opencode.ai/zen/v1"
+
+    def test_demoted_ox_alpha_fails_closed_to_credential_path(self):
+        """The demoted slug routes through the normal credential path (no
+        keyless heal), so without a Zen/Go key it fails closed at resolution."""
+        from hermes_cli.auth import AuthError
+
+        with pytest.raises(AuthError):
+            self._resolve("opencode-zen", "x-preview-f-free")
 
     def test_paid_model_still_fails_closed_without_key(self):
         from hermes_cli.auth import AuthError

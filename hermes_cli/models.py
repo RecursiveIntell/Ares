@@ -4097,10 +4097,23 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
     # Free-model promotions end without a Hermes release. The relay's live
     # catalog is the only useful picker source; stale curated entries can 401
     # immediately even though they looked selectable (x-preview-f-free did).
+    # The fetch is disk-cached and only touches the network when this open is
+    # explicitly probing (`force_refresh`); every other open serves the warm
+    # catalog (or curated fallback) so a plain /model open never makes
+    # surprise network calls. Switch-time validation still probes the exact
+    # chosen model anonymously (probe_opencode_free_execution), so a stale
+    # picker entry fails closed at selection instead of mid-conversation.
     if normalized == "opencode-free":
-        live = fetch_api_models(
-            None, "https://opencode.ai/zen/v1", headers=opencode_zen_free_headers()
+        _zen_base_url = "https://opencode.ai/zen/v1"
+        live = cached_fetch_api_models(
+            None,
+            _zen_base_url,
+            headers=opencode_zen_free_headers(),
+            force_refresh=force_refresh,
+            cache_only=not force_refresh,
         )
+        if live is None and not force_refresh:
+            live = list(_PROVIDER_MODELS.get(normalized, []))
         return [model for model in (live or []) if is_opencode_zen_free_model(model)]
 
     # ── Profile-based generic live fetch (all simple api-key providers) ──
