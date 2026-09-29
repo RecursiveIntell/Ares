@@ -2870,8 +2870,10 @@ export const ja = defineLocale({
       gatewayDisconnected: 'Hermes ゲートウェイが接続されていません',
       sendFailed: '明確化応答を送信できませんでした',
       responseExpired:
-        'リクエストの期限が切れたため、回答は届いていません。フォローアップメッセージとして送信してください。',
+        'リクエストの期限が切れました。応答はエージェントに届いた可能性があります。再送前に会話を確認してください。',
       responseRejected: '応答が受け付けられませんでした。選択した回答は保持されています。',
+      responseUncertain:
+        '応答はエージェントに届いた可能性がありますが、確認できませんでした。再送する前に会話を確認してください。',
       loadingQuestion: '質問を読み込み中…',
       other: 'その他（回答を入力）',
       placeholder: '回答を入力…',

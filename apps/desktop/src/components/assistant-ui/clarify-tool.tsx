@@ -462,6 +462,9 @@ function ClarifyToolSinglePending({
   const [draft, setDraft] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [sendError, setSendError] = useState<string | null>(null)
+  // A transport failure does not tell us whether the server accepted the
+  // response. Keep that uncertainty through subsequent expired retries.
+  const deliveryUncertain = useRef(false)
   const [selectedChoices, setSelectedChoices] = useState<string[]>([])
   // The keyboard cursor. Indices 0..choices.length-1 are the options; the
   // trailing index (=== choices.length) is the "Other" free-text row.
@@ -493,6 +496,7 @@ function ClarifyToolSinglePending({
 
       setSubmitting(true)
       setSendError(null)
+      let responseReceived = false
 
       try {
         // Route through the session's OWNER (tile route → hint → tagged row);
@@ -512,8 +516,15 @@ function ClarifyToolSinglePending({
           }
         )
 
+        responseReceived = true
         if (outcome?.status !== 'ok') {
-          throw new Error(outcome?.status === 'expired' ? copy.responseExpired : copy.responseRejected)
+          throw new Error(
+            outcome?.status === 'expired'
+              ? deliveryUncertain.current
+                ? copy.responseUncertain
+                : copy.responseExpired
+              : copy.responseRejected
+          )
         }
 
         triggerHaptic('submit')
@@ -522,10 +533,16 @@ function ClarifyToolSinglePending({
         // settles it. Clearing here makes the batch card become a blank spinner.
       } catch (error) {
         notifyError(error, copy.sendFailed)
+        if (!responseReceived) {
+          deliveryUncertain.current = true
+        }
         setSendError(
-          error instanceof Error && (error.message === copy.responseExpired || error.message === copy.responseRejected)
-            ? error.message
-            : copy.sendFailed
+          !responseReceived || (error instanceof Error && error.message === copy.responseUncertain)
+            ? copy.responseUncertain
+            : error instanceof Error &&
+                (error.message === copy.responseExpired || error.message === copy.responseRejected)
+              ? error.message
+              : copy.sendFailed
         )
         setSubmitting(false)
       }
@@ -535,6 +552,7 @@ function ClarifyToolSinglePending({
       copy.notReady,
       copy.responseExpired,
       copy.responseRejected,
+      copy.responseUncertain,
       copy.sendFailed,
       gateway,
       matchingRequest,
@@ -1011,6 +1029,7 @@ function ClarifyToolBatchPending({
   const [staged, setStaged] = useState<Record<string, { choices: string[]; draft: string }>>({})
   const [submitting, setSubmitting] = useState(false)
   const [sendError, setSendError] = useState<string | null>(null)
+  const deliveryUncertain = useRef(false)
   const [expired, setExpired] = useState(false)
 
   // Reconnect replay: answers the server already locked (an earlier window's
@@ -1090,6 +1109,7 @@ function ClarifyToolBatchPending({
 
     setSubmitting(true)
     setSendError(null)
+    let responseReceived = false
 
     try {
       // Sequential, not Promise.all: the LAST lock resolves the blocked tool
@@ -1102,6 +1122,7 @@ function ClarifyToolBatchPending({
       // held this batch, which would leave the owner blocked.
       for (const question of questions) {
         const answer = stagedAnswer(question)
+        responseReceived = false
 
         const outcome = await requestForOwnedSession<{ status?: string }>(
           request.sessionId,
@@ -1114,11 +1135,18 @@ function ClarifyToolBatchPending({
           }
         )
 
+        responseReceived = true
         if (outcome?.status !== 'ok') {
           if (outcome?.status === 'expired') {
             setExpired(true)
           }
-          throw new Error(outcome?.status === 'expired' ? copy.responseExpired : copy.responseRejected)
+          throw new Error(
+            outcome?.status === 'expired'
+              ? deliveryUncertain.current
+                ? copy.responseUncertain
+                : copy.responseExpired
+              : copy.responseRejected
+          )
         }
       }
 
@@ -1128,10 +1156,16 @@ function ClarifyToolBatchPending({
       // Clearing the request here makes the batch card become a blank spinner.
     } catch (error) {
       notifyError(error, copy.sendFailed)
+      if (!responseReceived) {
+        deliveryUncertain.current = true
+      }
       setSendError(
-        error instanceof Error && (error.message === copy.responseExpired || error.message === copy.responseRejected)
-          ? error.message
-          : copy.sendFailed
+        !responseReceived || (error instanceof Error && error.message === copy.responseUncertain)
+          ? copy.responseUncertain
+          : error instanceof Error &&
+              (error.message === copy.responseExpired || error.message === copy.responseRejected)
+            ? error.message
+            : copy.sendFailed
       )
       setSubmitting(false)
     }

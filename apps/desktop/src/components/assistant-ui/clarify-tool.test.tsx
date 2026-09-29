@@ -231,7 +231,32 @@ describe('ClarifyTool choice selection', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: /Continue/ })).toBeTruthy())
     expect(screen.getByRole('button', { name: /staging/ }).getAttribute('aria-pressed')).toBe('true')
     expect(hasClarifyRequest('session-1')).toBe(true)
-    expect(screen.getByRole('alert').textContent).toMatch(/not delivered/)
+    expect(screen.getByRole('alert').textContent).toMatch(/Request expired/)
+  })
+  it('does not call a lost-ack single answer undelivered when retry expires', async () => {
+    const { request } = renderLiveClarify()
+    request.mockRejectedValueOnce(new Error('socket lost')).mockResolvedValueOnce({ status: 'expired' })
+    fireEvent.click(screen.getByRole('button', { name: /staging/ }))
+    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/may have reached/i))
+    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/may have reached/i))
+    expect(screen.getByRole('button', { name: /staging/ }).getAttribute('aria-pressed')).toBe('true')
+  })
+  it('does not assert non-delivery after a remount loses transport history', async () => {
+    const { request } = renderLiveClarify()
+    request.mockRejectedValueOnce(new Error('socket lost')).mockResolvedValue({ status: 'expired' })
+    fireEvent.click(screen.getByRole('button', { name: /staging/ }))
+    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/may have reached/i))
+    cleanup() // Reconnect/transcript remount: local refs are gone, request store remains.
+    renderClarify(<ClarifyTool {...liveClarifyProps()} />)
+    fireEvent.click(screen.getByRole('button', { name: /staging/ }))
+    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/check the conversation/i))
+    expect(screen.getByRole('alert').textContent).not.toMatch(/not delivered/i)
   })
 })
 
@@ -681,7 +706,7 @@ describe('ClarifyTool batch card', () => {
     fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'packet' } })
     fireEvent.click(screen.getByRole('button', { name: /Confirm and continue/ }))
 
-    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/not delivered/))
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/Request expired/))
     expect(request).toHaveBeenCalledTimes(2)
     expect(screen.getByText('2 of 2 answered')).toBeTruthy()
     expect(screen.getByRole('button', { name: /red/ }).getAttribute('aria-pressed')).toBe('true')
@@ -706,7 +731,24 @@ describe('ClarifyTool batch card', () => {
     expect(hasClarifyRequest('session-1')).toBe(true)
     expect(request).toHaveBeenCalledTimes(1)
     expect((screen.getByRole('button', { name: /Confirm and continue/ }) as HTMLButtonElement).disabled).toBe(true)
-    expect(screen.getByRole('alert').textContent).toMatch(/not delivered/)
+    expect(screen.getByRole('alert').textContent).toMatch(/Request expired/)
+  })
+
+  it('marks final-lock lost acknowledgement as uncertain when retry expires', async () => {
+    const request = renderLiveBatch()
+    request
+      .mockResolvedValueOnce({ status: 'ok', remaining: ['q1'] })
+      .mockRejectedValueOnce(new Error('socket lost'))
+      .mockResolvedValueOnce({ status: 'expired' })
+    fireEvent.click(screen.getByRole('button', { name: /red/ }))
+    fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'packet' } })
+    fireEvent.click(screen.getByRole('button', { name: /Confirm and continue/ }))
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/may have reached/i))
+    fireEvent.click(screen.getByRole('button', { name: /Confirm and continue/ }))
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(3))
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/may have reached/i))
+    expect((screen.getByRole('button', { name: /Confirm and continue/ }) as HTMLButtonElement).disabled).toBe(true)
+    expect(screen.getByText('2 of 2 answered')).toBeTruthy()
   })
 
   it('starts a distinct batch request with a fresh stage after the old request expires', async () => {
@@ -715,7 +757,7 @@ describe('ClarifyTool batch card', () => {
     fireEvent.click(screen.getByRole('button', { name: /red/ }))
     fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'packet' } })
     fireEvent.click(screen.getByRole('button', { name: /Confirm and continue/ }))
-    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/not delivered/))
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/Request expired/))
 
     act(() =>
       setClarifyRequest({

@@ -2803,6 +2803,7 @@ export interface Translations {
       gatewayDisconnected: string
       sendFailed: string
       responseExpired: string
+      responseUncertain: string
       responseRejected: string
       loadingQuestion: string
       other: string

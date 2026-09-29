@@ -3246,7 +3246,10 @@ export const en: Translations = {
       notReady: 'Clarify request is not ready yet',
       gatewayDisconnected: 'Hermes gateway is not connected',
       sendFailed: 'Could not send clarify response',
-      responseExpired: 'Request expired; your answer was not delivered. Send it as a follow-up message.',
+      responseExpired:
+        'Request expired. Your response may have reached the agent; check the conversation before sending it again.',
+      responseUncertain:
+        'Your response may have reached the agent, but confirmation was lost. Check the conversation before sending it again.',
       responseRejected: 'Response was not accepted; your answer remains selected.',
       loadingQuestion: 'Loading question…',
       other: 'Other (type your answer)',
