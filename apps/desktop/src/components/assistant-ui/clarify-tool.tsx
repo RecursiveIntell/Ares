@@ -375,10 +375,19 @@ function ClarifyToolPending(props: ToolCallMessagePartProps) {
   const request = useStore($request)
   const fromArgs = useMemo(() => readClarifyArgs(props.args), [props.args])
   const messageRunning = useAuiState(selectMessageRunning)
-  // Answering clears the request a beat before `tool.complete` swaps in the
-  // settled card. Latch submit so that gap doesn't demote; Stop also clears
-  // the request and must still collapse an unanswered card.
-  const [answered, setAnswered] = useState(false)
+  // Keep the request identity across store cleanup, but never carry a prior
+  // tool acknowledgement into a newly raised request on the same session.
+  const requestIdRef = useRef<string | null>(request?.requestId ?? null)
+  if (request?.requestId) {
+    requestIdRef.current = request.requestId
+  }
+  const [answeredRequestId, setAnsweredRequestId] = useState<string | null>(null)
+  const answered = answeredRequestId !== null && answeredRequestId === requestIdRef.current
+  const markAnswered = (requestId: string) => {
+    if (requestIdRef.current === requestId) {
+      setAnsweredRequestId(requestId)
+    }
+  }
 
   // Stopped mid-prompt with no result — don't leave a dead interactive panel.
   // `session.info` reports running=false while clarify is blocking, so the
@@ -391,10 +400,24 @@ function ClarifyToolPending(props: ToolCallMessagePartProps) {
   // Batch: the gateway request carries qid-keyed questions. Args alone can't
   // drive the form (no qids to respond with), so batch waits for the request.
   if (request?.questions?.length || fromArgs.questions) {
-    return <ClarifyToolBatchPending answered={answered} onAnswered={() => setAnswered(true)} request={request} />
+    return (
+      <ClarifyToolBatchPending
+        answered={answered}
+        key={requestIdRef.current}
+        onAnswered={markAnswered}
+        request={request}
+      />
+    )
   }
 
-  return <ClarifyToolSinglePending fromArgs={fromArgs} onAnswered={() => setAnswered(true)} request={request} />
+  return (
+    <ClarifyToolSinglePending
+      fromArgs={fromArgs}
+      key={requestIdRef.current}
+      onAnswered={markAnswered}
+      request={request}
+    />
+  )
 }
 
 function ClarifyToolSinglePending({
@@ -403,7 +426,7 @@ function ClarifyToolSinglePending({
   request
 }: {
   fromArgs: ClarifyArgs
-  onAnswered: () => void
+  onAnswered: (requestId: string) => void
   request: ClarifyRequest | null
 }) {
   const { t } = useI18n()
@@ -494,7 +517,7 @@ function ClarifyToolSinglePending({
         }
 
         triggerHaptic('submit')
-        onAnswered()
+        onAnswered(matchingRequest.requestId)
         // Keep the question visible until tool.complete or message.complete
         // settles it. Clearing here makes the batch card become a blank spinner.
       } catch (error) {
@@ -965,7 +988,7 @@ function ClarifyToolBatchPending({
   request
 }: {
   answered: boolean
-  onAnswered: () => void
+  onAnswered: (requestId: string) => void
   request: ClarifyRequest | null
 }) {
   const { t } = useI18n()
@@ -988,6 +1011,7 @@ function ClarifyToolBatchPending({
   const [staged, setStaged] = useState<Record<string, { choices: string[]; draft: string }>>({})
   const [submitting, setSubmitting] = useState(false)
   const [sendError, setSendError] = useState<string | null>(null)
+  const [expired, setExpired] = useState(false)
 
   // Reconnect replay: answers the server already locked (an earlier window's
   // partial progress) pre-stage their questions so the restored card shows
@@ -1055,6 +1079,9 @@ function ClarifyToolBatchPending({
   const allStaged = answeredCount === questions.length
 
   const confirmAll = useCallback(async () => {
+    if (expired) {
+      return
+    }
     if (!request || !gateway) {
       notifyError(new Error(request ? copy.gatewayDisconnected : copy.notReady), copy.sendFailed)
 
@@ -1088,12 +1115,15 @@ function ClarifyToolBatchPending({
         )
 
         if (outcome?.status !== 'ok') {
+          if (outcome?.status === 'expired') {
+            setExpired(true)
+          }
           throw new Error(outcome?.status === 'expired' ? copy.responseExpired : copy.responseRejected)
         }
       }
 
       triggerHaptic('submit')
-      onAnswered()
+      onAnswered(request.requestId)
       // Keep the staged card visible until tool.complete or message.complete.
       // Clearing the request here makes the batch card become a blank spinner.
     } catch (error) {
@@ -1105,7 +1135,7 @@ function ClarifyToolBatchPending({
       )
       setSubmitting(false)
     }
-  }, [copy, gateway, onAnswered, questions, request, stagedAnswer])
+  }, [copy, expired, gateway, onAnswered, questions, request, stagedAnswer])
 
   const toggleChoice = useCallback((question: ClarifyQuestion, choice: string) => {
     setStaged(current => {
@@ -1130,7 +1160,7 @@ function ClarifyToolBatchPending({
       return
     }
 
-    onAnswered()
+    onAnswered(request.requestId)
     clearClarifyRequest(request.requestId, request.sessionId)
 
     try {
@@ -1199,7 +1229,7 @@ function ClarifyToolBatchPending({
         <Button disabled={submitting} onClick={() => void cancelAll()} size="xs" type="button" variant="text">
           {copy.skip}
         </Button>
-        <Button disabled={submitting || !allStaged} size="xs" type="submit">
+        <Button disabled={submitting || expired || !allStaged} size="xs" type="submit">
           {submitting ? (
             <Loader2 className="size-3 animate-spin" />
           ) : (

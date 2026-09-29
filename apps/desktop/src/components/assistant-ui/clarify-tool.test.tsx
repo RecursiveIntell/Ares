@@ -686,6 +686,10 @@ describe('ClarifyTool batch card', () => {
     expect(screen.getByText('2 of 2 answered')).toBeTruthy()
     expect(screen.getByRole('button', { name: /red/ }).getAttribute('aria-pressed')).toBe('true')
     expect(hasClarifyRequest('session-1')).toBe(true)
+    const confirm = screen.getByRole('button', { name: /Confirm and continue/ }) as HTMLButtonElement
+    expect(confirm.disabled).toBe(true)
+    fireEvent.click(confirm)
+    expect(request).toHaveBeenCalledTimes(2)
   })
 
   it('keeps the staged batch when the first lock is expired and sends no later lock', async () => {
@@ -701,7 +705,108 @@ describe('ClarifyTool batch card', () => {
     expect(screen.getByText('2 of 2 answered')).toBeTruthy()
     expect(hasClarifyRequest('session-1')).toBe(true)
     expect(request).toHaveBeenCalledTimes(1)
+    expect((screen.getByRole('button', { name: /Confirm and continue/ }) as HTMLButtonElement).disabled).toBe(true)
     expect(screen.getByRole('alert').textContent).toMatch(/not delivered/)
+  })
+
+  it('starts a distinct batch request with a fresh stage after the old request expires', async () => {
+    const request = renderLiveBatch()
+    request.mockResolvedValue({ status: 'expired' })
+    fireEvent.click(screen.getByRole('button', { name: /red/ }))
+    fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'packet' } })
+    fireEvent.click(screen.getByRole('button', { name: /Confirm and continue/ }))
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/not delivered/))
+
+    act(() =>
+      setClarifyRequest({
+        choices: null,
+        multiSelect: false,
+        question: '',
+        questions: [
+          { choices: ['red', 'blue'], multiSelect: false, qid: 'q0', question: 'Color?' },
+          { choices: null, multiSelect: false, qid: 'q1', question: 'Name?' }
+        ],
+        requestId: 'new-request',
+        sessionId: 'session-1'
+      })
+    )
+    expect(screen.getByText('0 of 2 answered')).toBeTruthy()
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect((screen.getByRole('button', { name: /Confirm and continue/ }) as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.click(screen.getByRole('button', { name: /blue/ }))
+    fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'new' } })
+    expect((screen.getByRole('button', { name: /Confirm and continue/ }) as HTMLButtonElement).disabled).toBe(false)
+  })
+
+  it('does not treat a late old acknowledgement as answering a newer request', async () => {
+    let acceptOld!: (result: { status: string }) => void
+    const request = renderLiveBatch()
+    request.mockImplementationOnce(
+      () =>
+        new Promise(resolve => {
+          acceptOld = resolve
+        })
+    )
+    fireEvent.click(screen.getByRole('button', { name: /red/ }))
+    fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'packet' } })
+    fireEvent.click(screen.getByRole('button', { name: /Confirm and continue/ }))
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(1))
+
+    act(() =>
+      setClarifyRequest({
+        choices: null,
+        multiSelect: false,
+        question: '',
+        questions: [
+          { choices: ['red', 'blue'], multiSelect: false, qid: 'q0', question: 'Color?' },
+          { choices: null, multiSelect: false, qid: 'q1', question: 'Name?' }
+        ],
+        requestId: 'new-request',
+        sessionId: 'session-1'
+      })
+    )
+    await act(async () => acceptOld({ status: 'ok' }))
+    messageRunning = false
+    act(() => clearClarifyRequest('new-request', 'session-1'))
+    expect(screen.queryByText('0 of 2 answered')).toBeNull()
+    expect(screen.queryByRole('button', { name: /Confirm and continue/ })).toBeNull()
+  })
+
+  it('does not let a late old acknowledgement erase a newer accepted latch', async () => {
+    let acceptOld!: (result: { status: string }) => void
+    const request = renderLiveBatch()
+    request.mockImplementationOnce(
+      () =>
+        new Promise(resolve => {
+          acceptOld = resolve
+        })
+    )
+    fireEvent.click(screen.getByRole('button', { name: /red/ }))
+    fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'old' } })
+    fireEvent.click(screen.getByRole('button', { name: /Confirm and continue/ }))
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(1))
+
+    act(() =>
+      setClarifyRequest({
+        choices: null,
+        multiSelect: false,
+        question: '',
+        questions: [
+          { choices: ['red', 'blue'], multiSelect: false, qid: 'q0', question: 'Color?' },
+          { choices: null, multiSelect: false, qid: 'q1', question: 'Name?' }
+        ],
+        requestId: 'new-request',
+        sessionId: 'session-1'
+      })
+    )
+    fireEvent.click(screen.getByRole('button', { name: /blue/ }))
+    fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'new' } })
+    fireEvent.click(screen.getByRole('button', { name: /Confirm and continue/ }))
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(3))
+    await act(async () => acceptOld({ status: 'ok' }))
+    messageRunning = false
+    act(() => clearClarifyRequest('new-request', 'session-1'))
+    expect(screen.getByText('2 of 2 answered')).toBeTruthy()
   })
 
   it('a staged answer stays editable before confirm', async () => {
