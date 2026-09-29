@@ -6,6 +6,18 @@ import pytest
 from plugins.context_engine._context_governor import ContextGovernorEngine
 
 
+@pytest.mark.parametrize(
+    ('epoch_field', 'valid'),
+    [({}, True), ({'lineage_epoch': 0}, True),
+     ({'lineage_epoch': False}, False), ({'lineage_epoch': True}, False),
+     ({'lineage_epoch': None}, False), ({'lineage_epoch': 0.0}, False),
+     ({'lineage_epoch': '0'}, False)],
+)
+def test_empty_tip_accepts_only_omitted_or_integer_zero_epoch(epoch_field, valid):
+    tip = {'compacted_messages': [], 'receipt_id': None, 'generation': None, **epoch_field}
+    assert ContextGovernorEngine._empty_tip_shape_is_valid(tip) is valid
+
+
 def fixture_engine(tmp_path, epoch_field):
     engine = object.__new__(ContextGovernorEngine)
     engine.session_id = "epoch-wire-fixture"

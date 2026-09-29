@@ -2134,6 +2134,18 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 ]
         return normalized
 
+    @staticmethod
+    def _empty_tip_shape_is_valid(tip: dict) -> bool:
+        """Check the empty Rust tip shape; omitted epoch alone defaults to zero."""
+        epoch = tip.get("lineage_epoch", 0)
+        return (
+            tip.get("compacted_messages") == []
+            and tip.get("receipt_id") is None
+            and tip.get("generation") is None
+            and type(epoch) is int
+            and epoch == 0
+        )
+
     def _rehydrate_legacy_parent_prefix(
         self,
         governor_messages: List[Dict[str, Any]],
@@ -2184,12 +2196,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             # lineage_epoch when zero. Absence is epoch zero in that wire
             # contract; explicit null/bool/string values remain invalid below.
             lineage_epoch = tip.get("lineage_epoch", 0) if isinstance(tip, dict) else None
-            valid_empty_tip = (
-                compacted == []
-                and receipt_id is None
-                and generation is None
-                and lineage_epoch == 0
-            )
+            valid_empty_tip = isinstance(tip, dict) and self._empty_tip_shape_is_valid(tip)
             valid_active_tip = (
                 isinstance(compacted, list)
                 and bool(compacted)
