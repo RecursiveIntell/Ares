@@ -690,7 +690,7 @@ def test_isolated_model_switch_is_applied_by_the_compute_host_owner(monkeypatch)
         assert response["result"]["value"] == "new-model"
         assert len(calls) == 1
         control_sid, route_name, payload, wait, timeout = calls[0]
-        assert (control_sid, route_name, wait, timeout) == (sid, "config.set.model", True, 30.0)
+        assert (control_sid, route_name, wait, timeout) == (sid, "config.set.model", True, 90.0)
         assert payload["params"] == {
             "key": "model",
             "value": "new-model --provider new-provider --session",
