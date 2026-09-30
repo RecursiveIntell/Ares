@@ -2,7 +2,7 @@
 
 ## Profile-runtime V2
 
-The current Libraries owner at `02ee5dd96a3f5fb403bdd2b955d57a1456b929ea`
+The current Libraries owner at `9849d12adc8a5ef852d56e36abec4ffbb5122c62`
 exports `profile-runtime.resolved-policy-basis/v2`. Its outer reference binds
 the task-specific V1 projection digest. The legacy V1 reference names a
 composition receipt and can be shared by different task projections.
@@ -73,3 +73,27 @@ no-op in the inspected owner revision, but is neither called nor depended on
 by this profile-runtime validation path. Profile-runtime validates its own
 closed typed policy contract and validity window. The generic no-op remains
 explicitly out-of-path debt, not a claimed fixed Ares bypass.
+
+## Origin revocation adoption
+
+The current paired native, Governor and current-owner qualification selections
+all use Libraries `9849d12adc8a5ef852d56e36abec4ffbb5122c62`, including the
+canonical origin-revocation epoch fix from Libraries PR57. Historical proof
+objects retain their original tuple and do not certify this new selection.
+Native stays at `2ea67c4ffe70b0dce95a7792b241693a9f9f4dcc`; no unmerged native
+guard candidate is adopted.
+
+The current-owner lane builds a test-only peer against that exact source with
+an explicit MockEmbedder, brute-force backend and disposable stores. Ares calls
+its actual witnessed V2 owner API, persists a managed materialization, then
+checks final egress before and after an independently opened owner handle
+revokes the admitted fact. Every managed-call kind must reject the old witness
+with `MEMORY_AUTHORITY_CHANGED` for both required and optional memory. Exact
+revocation replay preserves state and cannot restore egress. Fresh recall must
+return no admitted revoked content. The fixture has no product command, remote
+transport, live-store input, operator credential or provider call.
+
+This is source-selection and consumer qualification only. Production task/profile
+authority derivation and an authenticated memory-owner transport remain separate
+open integration gates. Ordinary runtime bootstrap and installed adoption are
+not established by this test, by historical fixtures or by the pin change.

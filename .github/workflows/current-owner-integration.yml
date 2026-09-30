@@ -37,6 +37,8 @@ jobs:
     timeout-minutes: 25
     env:
       CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -46,7 +48,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: RecursiveIntell/Libraries
-          ref: 02ee5dd96a3f5fb403bdd2b955d57a1456b929ea
+          ref: 9849d12adc8a5ef852d56e36abec4ffbb5122c62
           path: Libraries
           persist-credentials: false
       - name: Generate inputs with the exact current canonical Rust owner
@@ -70,6 +72,21 @@ jobs:
             ares/tests/owner_integration/profile_runtime_fixture.rs \
             ares/tests/ares_runtime/fixtures/profile_runtime_v2_owner.json \
             > "$RUNNER_TEMP/owner-evidence/SHA256SUMS"
+      - name: Build disposable semantic-memory owner peer
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p Libraries/semantic-memory/examples
+          cp ares/tests/owner_integration/semantic_memory_revocation_owner.rs \
+            Libraries/semantic-memory/examples/ares_revocation_owner.rs
+          cargo +1.94.0 build --locked --manifest-path Libraries/Cargo.toml \
+            -p semantic-memory --no-default-features --features brute-force \
+            --example ares_revocation_owner
+          cp Libraries/target/debug/examples/ares_revocation_owner \
+            ares/tests/owner_integration/semantic_memory_revocation_owner
+          sha256sum Libraries/target/debug/examples/ares_revocation_owner \
+            ares/tests/owner_integration/semantic_memory_revocation_owner.rs \
+            >> "$RUNNER_TEMP/owner-evidence/SHA256SUMS"
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
         with:
           version: '0.9.28'
@@ -79,12 +96,15 @@ jobs:
         run: |
           set -euo pipefail
           uv sync --frozen --extra dev --extra anthropic --python 3.13
+          test -x tests/owner_integration/semantic_memory_revocation_owner
           HERMES_PYTHON="$PWD/.venv/bin/python" HERMES_TEST_WORKERS=1 \
             HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh \
+              tests/owner_integration/test_semantic_memory_revocation.py \
               tests/test_ares_collaboration.py \
               tests/ares_runtime/test_governed_context_materialization.py \
               tests/ares_runtime/test_memory_witness_v2.py \
-              tests/ares_runtime/test_policy_basis_v2.py -- -q
+              tests/ares_runtime/test_policy_basis_v2.py -- -q \
+              | tee "$RUNNER_TEMP/owner-evidence/consumer-tests.log"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
