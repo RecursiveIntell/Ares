@@ -1387,6 +1387,32 @@ def build_turn_context(
             agent._emit_warning(f"Context continuation blocked: {_rebase.reason}")
             raise AutomaticRebaseError(_rebase.reason)
 
+    _context_window = getattr(getattr(agent, "context_compressor", None), "context_length", None)
+    if (
+        _preflight_compression_blocked
+        and type(_preflight_tokens) is int
+        and type(_context_window) is int
+        and _context_window > 0
+        and _preflight_tokens > _context_window
+    ):
+        # A failed/no-progress compression is not admission to repeat an
+        # already over-window request. This guard does not mint a new epoch
+        # or bypass a Governor integrity error when rebase is unavailable.
+        from ares_runtime.continuity.runtime import ContextDispatchError
+
+        if _preflight_compressed:
+            agent._persist_user_message_idx = reanchor_current_turn_user_idx(messages, user_message)
+        try:
+            if agent._flush_messages_to_session_db(messages, conversation_history=conversation_history) is False:
+                agent._emit_warning("Blocked context input could not be persisted.")
+        except Exception:
+            logger.warning("Exhausted context input persistence failed", exc_info=True)
+        agent._emit_warning(
+            "Context remains over the model window after exhausted compression; "
+            "provider dispatch is blocked pending context recovery."
+        )
+        raise ContextDispatchError("CONTEXT_PREFLIGHT_EXHAUSTED")
+
     if _preflight_compressed:
         # Compression rebuilt the list (tail messages are fresh compaction
         # copies), so the pre-compression index of this turn's user message
