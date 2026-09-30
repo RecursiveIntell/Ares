@@ -2,9 +2,9 @@
   "schema": "ares.native-owner-patch/v1",
   "repository": "RecursiveIntell/recursive-agent",
   "base_commit": "11fefae304d43d9d72f7a238f9d2df77862b51c6",
-  "candidate_tree": "a0269beec181dd24e3af5a3255db857444c19f34",
+  "candidate_tree": "3cc9b29b063406acfb6c9b7ce73d8ae07dcc0355",
   "libraries_commit": "0b099ec416de60f6adafb182f1d1e83795d05c56",
-  "patch_sha256": "25c8bf703f2a5045f9b1c85d38de7d3bc117a5012186024391f2c19856433235",
+  "patch_sha256": "db21c261b430932dd778b39b0a4e9b9f59174ff722d073974fc89b2069852934",
   "scope": [
     "external permit semantic outcome idempotency",
     "exact-binding read-only receipt lookup",
@@ -16,7 +16,6 @@
     "legacy bypass fence, historical settlement, native history consistency validation"
   ],
   "not_implemented": [
-    "Ares authenticated controller enrollment and continuity saga integration",
     "independently confirmed external outcome and task completion",
     "installed route qualification and full V4 acceptance"
   ],
@@ -48,11 +47,58 @@
     "conclusion": "success",
     "scope": "Native paired source and focused Ares gates; not installed route or Ares scoped authority integration"
   },
-  "previous_candidate_commit": "5105d4e85d05ed9aacd12680d4209f98a196fef9",
-  "candidate_commit": "2297e9444922ff0aef1eb21358084dbfe3e13ec4",
-  "current_candidate_delta": "Adds native public-verifier digest CLI for exact operator enrollment; prior runtime proof applies to the predecessor tree only.",
-  "candidate_pr": "https://github.com/RecursiveIntell/recursive-agent/pull/20",
+  "previous_candidate_commit": "2297e9444922ff0aef1eb21358084dbfe3e13ec4",
+  "candidate_commit": "2ea67c4ffe70b0dce95a7792b241693a9f9f4dcc",
+  "current_candidate_delta": "Merged fixture-only retirement observer synchronization repair: preserve the lost ACK and five-second gate, wait for the established connection worker to finish, then require exact durable readback. Product native runtime code is unchanged from candidate 2297e9444922ff0aef1eb21358084dbfe3e13ec4; README and repair evidence also update. No installed runtime activation.",
+  "candidate_pr": "https://github.com/RecursiveIntell/recursive-agent/pull/21",
   "current_candidate_proof": {
+    "candidate_commit": "2ea67c4ffe70b0dce95a7792b241693a9f9f4dcc",
+    "candidate_tree": "3cc9b29b063406acfb6c9b7ce73d8ae07dcc0355",
+    "native_reviewed_head": "df9a6893d401cd2c98443c4eccde2d6655b57482",
+    "native_ci_tested_commit": "2ea67c4ffe70b0dce95a7792b241693a9f9f4dcc",
+    "native_ci_tested_tree": "3cc9b29b063406acfb6c9b7ce73d8ae07dcc0355",
+    "native_ci_run": 36767273417,
+    "native_ci_job": 110064483071,
+    "status": "passed",
+    "scope": "Merged native workspace and relocated-root gates; actual Ares-to-native signed enrollment, rollover, restart, disposable file write and exact outcome receipt against the hash-bound candidate. Source qualification only; no installed route, independent external settlement, deployment, or production fairness claim.",
+    "ares_commit": "7d6fe8e33910c573abd4c88164b577088fbd8ed1",
+    "ares_qualification_run": 36768167768,
+    "paired_daemon_job": 110067486755,
+    "focused_ares_job": 110067487346
+  },
+  "retirement_fixture_repair": {
+    "historical_ares_failure": {
+      "run_id": 36737828471,
+      "job_id": 109964075513,
+      "classification": "unattributed historical timeout; original replay cancelled"
+    },
+    "reproduced_native_failure": {
+      "commit": "c5801b59ec51b7592a4b8d95c8851d18e29a23e8",
+      "run_id": 36763736628,
+      "job_id": 110052530421,
+      "reader_polls": 401,
+      "writer_lock_wait_us": 5008347,
+      "classification": "observer-induced writer flock starvation reproduced"
+    },
+    "sensitivity_proof": {
+      "commit": "6dd70fdfe6301ffc1b35ac17ad927915d53d1462",
+      "run_id": 36764722513,
+      "job_id": 110055887291,
+      "positive_repetitions": 128,
+      "rejection_gate": "exact durable receipt assertion",
+      "delay_gate": "unchanged five-second timeout",
+      "temporary_hooks_removed": true
+    },
+    "retained_unrelated_failure": {
+      "run_id": 36765679464,
+      "failed_job_id": 110059113383,
+      "replay_passed_job_id": 110061959835,
+      "test": "undeclared_read_and_descendant_are_mandatorily_bounded",
+      "classification": "unchanged containment timeout; replay does not establish repair"
+    },
+    "source_receipt": "https://github.com/RecursiveIntell/recursive-agent/blob/2ea67c4ffe70b0dce95a7792b241693a9f9f4dcc/docs/receipts/2026-09-30-retirement-readback/REPAIR.md"
+  },
+  "previous_candidate_proof": {
     "candidate_commit": "2297e9444922ff0aef1eb21358084dbfe3e13ec4",
     "native_ci_run": 36173563708,
     "native_ci_job": 108198650882,
@@ -61,5 +107,28 @@
     "paired_daemon_job": 108199879563,
     "status": "passed",
     "scope": "Native workspace and relocated-root gates; actual Ares-to-native signed enrollment, rollover, restart, disposable file write and outcome receipt. No installed route or independent external settlement claim."
-  }
+  },
+  "historical_native_increment_limits": [
+    {
+      "candidate_commit": "2297e9444922ff0aef1eb21358084dbfe3e13ec4",
+      "scope": "Limitation of that native increment, not a current absence in Ares",
+      "description": "Ares authenticated controller enrollment and continuity saga integration"
+    }
+  ],
+  "ares_integration_scope": {
+    "source_pr": "https://github.com/RecursiveIntell/Ares/pull/80",
+    "source_merge_commit": "291d97709ba399f77a44896c273be0be7410ea0a",
+    "status": "implemented_in_ares_source",
+    "scope": "Protected controller bootstrap, operator enrollment, and durable retire/publish/activate are implemented in Ares. This manifest binds their native prerequisite. Installed-route qualification and independent external outcome confirmation remain unclaimed."
+  },
+  "qualification_history": [
+    {
+      "ares_commit": "7d6fe8e33910c573abd4c88164b577088fbd8ed1",
+      "general_ci_run": 36768168209,
+      "classification": "GitHub platform failure before any jobs started",
+      "observed_annotation": "An unexpected error has occurred and we've been automatically notified.",
+      "github_service_request_id": "ADDD:D337A:4B0F01:F5A4D6:6ABD6761",
+      "gate_waiver": false
+    }
+  ]
 }
