@@ -3815,6 +3815,10 @@ class TodoSnapshotError(RuntimeError):
         super().__init__(f"Todo snapshot refused: {reason}")
 
 
+class SessionProfileMismatchError(RuntimeError):
+    """A session row is already owned by a different profile in this store."""
+
+
 class SessionTurnLeaseLostError(RuntimeError):
     """A transcript write presented a turn-lease holder that no longer owns it.
 
@@ -5865,6 +5869,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
         parent_session_id: str = None,
         cwd: str = None,
         profile_name: str = None,
+        expected_profile_name: Optional[str] = None,
         git_repo_root: str = None,
         origin_json: str = None,
         display_name: str = None,
@@ -5905,6 +5910,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin,
         without a recoverable routing mapping (#59527).
         """
         def _do(conn):
+            if expected_profile_name is not None:
+                if not expected_profile_name or profile_name != expected_profile_name:
+                    raise SessionProfileMismatchError("profile admission identity mismatch")
+                # BEGIN IMMEDIATE in _execute_write excludes other SQLite
+                # writers until this check and the upsert commit together.
+                # A separate pre-read cannot protect the idempotent upsert.
+                existing = conn.execute(
+                    "SELECT profile_name FROM sessions WHERE id = ?", (session_id,)
+                ).fetchone()
+                if existing is not None and existing["profile_name"] != expected_profile_name:
+                    raise SessionProfileMismatchError("session row belongs to another profile")
             system_prompt_hash = self._store_system_prompt(conn, system_prompt)
             conn.execute(
                 """INSERT INTO sessions (

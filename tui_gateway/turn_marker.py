@@ -1,18 +1,18 @@
-"""Durable interrupted-turn markers for the desktop/TUI auto-continue path.
+"""Best-effort interrupted-turn hints for Desktop/TUI, not outcome authority.
 
-A running turn's progress lives only in process memory (the agent flushes to
-SQLite at turn end, not mid-turn), so an app/backend/machine death mid-turn
-leaves no durable trace of the interrupted prompt. This sidecar is that
-trace: a marker is written when a turn starts running and cleared when the
-turn concludes — success, handled error, or interrupt all clear it, so only
-a process death leaves one behind. ``session.resume`` reads the marker to
-decide whether to auto-continue the interrupted turn (see
-``_maybe_schedule_auto_continue`` in ``tui_gateway/server.py``).
+A running turn's progress can live only in process memory until SessionDB is
+updated, so an app/backend/machine death mid-turn may leave no durable prompt
+row. This sidecar records a bounded prompt hint at turn start and normally
+clears it at conclusion. A retained marker SUGGESTS interruption, but a failed
+write or clear, or a same-UID modification, means it cannot prove what ran,
+what effect occurred, or whether a terminal frame reached the client.
+``session.resume`` may present it as an advisory error snapshot; optional
+auto-continue is a separate explicit config path, not permission from a marker.
 
 Markers are stored per ``HERMES_HOME`` (callers pass the session's home so
-profile sessions keep their state in their own profile directory) and the
-file is bounded: writes prune entries older than ``_MAX_AGE_SECS`` and cap
-the total count, so an unlucky streak of crashes can't grow it unboundedly.
+profile sessions keep their state in their own profile directory). Future
+writes prune entries older than ``_MAX_AGE_SECS`` and cap the count; a quiet
+file does not expire itself on read.
 
 Every function is best-effort by design — marker bookkeeping must never
 break a turn — so I/O errors degrade to "no marker" instead of raising.
@@ -138,7 +138,7 @@ def clear_turn_marker(home: Path | str, session_key: str) -> None:
 
 
 def read_turn_marker(home: Path | str, session_key: str) -> dict[str, Any] | None:
-    """The marker left by a turn that never concluded, or None."""
+    """Return a surviving, unauthenticated prompt hint, or None."""
     if not session_key:
         return None
     try:

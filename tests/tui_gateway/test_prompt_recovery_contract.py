@@ -150,6 +150,66 @@ def _events(captured, name):
     return [payload for event, _sid, payload in captured if event == name]
 
 
+def test_required_compute_host_config_is_explicit_and_fail_closed():
+    assert server._load_dashboard_process_isolation_config(
+        {"dashboard": {"require_compute_host": True}}
+    )["require_compute_host"] is True
+    assert server._load_dashboard_process_isolation_config(
+        {"dashboard": {"require_compute_host": "no"}}
+    )["require_compute_host"] is False
+    assert server._load_dashboard_process_isolation_config(
+        {"dashboard": {"require_compute_host": "invalid"}}
+    )["require_compute_host"] is True
+
+
+def test_required_compute_host_refuses_central_inline_turn(emits, turn_env, monkeypatch):
+    calls = []
+    agent = types.SimpleNamespace(
+        session_id="required-host-session", model="fake-model", provider="fake-provider",
+        clear_interrupt=lambda: None,
+        run_conversation=lambda *a, **k: calls.append("provider") or {"final_response": "wrong"},
+    )
+    session = _session(agent=agent, running=True)
+    monkeypatch.setattr(server, "_inside_compute_host_child", lambda: False)
+    monkeypatch.setattr(server, "_load_dashboard_process_isolation_config", lambda: {"require_compute_host": True})
+    assert server._run_prompt_submit("rid", "sid", session, "do not send inline") is False
+    assert calls == []
+    assert session["running"] is False
+    assert any(event == "error" for event, _sid, _payload in emits)
+
+
+def test_required_compute_host_refuses_unroutable_queued_turn(emits, monkeypatch):
+    session = _session(running=False, queued_prompt={"text": "queued work"},
+                       _queued_prompt_generation=0)
+    calls = []
+    monkeypatch.setattr(server, "_inside_compute_host_child", lambda: False)
+    monkeypatch.setattr(server, "_load_dashboard_process_isolation_config", lambda: {"require_compute_host": True})
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: False)
+    monkeypatch.setattr(server, "_run_prompt_submit", lambda *args, **kwargs: calls.append("inline"))
+    assert server._drain_queued_prompt("rid", "sid", session) is True
+    assert calls == []
+    assert session["running"] is False
+    snapshot = server._inflight_snapshot(session)
+    assert snapshot is not None and snapshot["error"]
+    assert any(event == "error" for event, _sid, _payload in emits)
+
+
+def test_required_compute_host_preserves_failed_queued_dispatch(emits, monkeypatch):
+    session = _session(running=False, queued_prompt={"text": "queued work"},
+                       _queued_prompt_generation=0)
+    calls = []
+    monkeypatch.setattr(server, "_inside_compute_host_child", lambda: False)
+    monkeypatch.setattr(server, "_load_dashboard_process_isolation_config", lambda: {"require_compute_host": True})
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: True)
+    monkeypatch.setattr(server, "_submit_prompt_to_compute_host", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("child send failed")))
+    monkeypatch.setattr(server, "_run_prompt_submit", lambda *a, **k: calls.append("inline"))
+    assert server._drain_queued_prompt("rid", "sid", session) is True
+    snapshot = server._inflight_snapshot(session)
+    assert snapshot is not None and snapshot["error"] == "child send failed"
+    assert calls == []
+    assert session["running"] is False
+
+
 def test_returned_provider_error_is_terminal_and_replayable(emits, turn_env):
     agent = types.SimpleNamespace(
         session_id="prompt-recovery-session",
