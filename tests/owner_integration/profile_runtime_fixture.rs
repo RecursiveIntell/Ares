@@ -160,16 +160,114 @@ fn main() {
     let profiles = profile_set(&context);
     let rules = CompositionRuleSetV1::reference_v1();
     let outcome = compose_profile_runtime(
-        &context, &profiles, &rules, &contributions(), &[], "2026-09-05T20:00:02Z",
-    ).expect("canonical owner composition");
+        &context,
+        &profiles,
+        &rules,
+        &contributions(),
+        &[],
+        "2026-09-05T20:00:02Z",
+    )
+    .expect("canonical owner composition");
     let v1 = resolve_policy_basis(&context, &profiles, &rules, &outcome, task_context())
         .expect("canonical owner V1");
-    let first = profile_runtime::ResolvedPolicyBasisV2::from_v1(v1.clone())
-        .expect("canonical owner V2");
+    let first =
+        profile_runtime::ResolvedPolicyBasisV2::from_v1(v1.clone()).expect("canonical owner V2");
     let mut second_task = task_context();
     second_task.task_ref = "task:2".into();
     let second = profile_runtime::resolve_policy_basis_v2(
-        &context, &profiles, &rules, &outcome, second_task,
-    ).expect("second canonical owner task");
-    println!("{}", serde_json::json!({"v1": v1, "v2": first, "other_task_v2": second}));
+        &context,
+        &profiles,
+        &rules,
+        &outcome,
+        second_task,
+    )
+    .expect("second canonical owner task");
+    let mut temporal = serde_json::Map::new();
+    for (name, start, end) in [
+        ("z", "2026-09-05T00:00:00Z", "2030-01-01T00:00:00Z"),
+        (
+            "zero_offset",
+            "2026-09-05T00:00:00+00:00",
+            "2030-01-01T00:00:00+00:00",
+        ),
+        (
+            "positive_offset",
+            "2026-09-05T05:30:00+05:30",
+            "2030-01-01T05:30:00+05:30",
+        ),
+        (
+            "negative_offset",
+            "2026-09-04T17:00:00-07:00",
+            "2029-12-31T17:00:00-07:00",
+        ),
+        (
+            "expired",
+            "2026-09-04T00:00:00Z",
+            "2026-09-05T05:30:00+05:30",
+        ),
+        (
+            "future_nanosecond",
+            "2026-09-05T00:00:00.000000001Z",
+            "2030-01-01T00:00:00Z",
+        ),
+        (
+            "expires_nanosecond",
+            "2026-09-04T00:00:00Z",
+            "2026-09-05T00:00:00.000000001Z",
+        ),
+        ("lowercase", "2026-09-05t00:00:00z", "2030-01-01t00:00:00z"),
+        ("space", "2026-09-05 00:00:00Z", "2030-01-01 00:00:00Z"),
+        (
+            "long_fraction",
+            "2026-09-05T00:00:00.0000000009Z",
+            "2030-01-01T00:00:00Z",
+        ),
+        (
+            "unicode_minus",
+            "2026-09-04T17:00:00−07:00",
+            "2029-12-31T17:00:00−07:00",
+        ),
+        (
+            "year_zero",
+            "0000-02-29T00:00:00+23:59",
+            "2030-01-01T00:00:00Z",
+        ),
+        (
+            "leap_second",
+            "2016-12-31T23:59:60Z",
+            "2030-01-01T00:00:00Z",
+        ),
+        ("inverted", "2031-01-01T00:00:00Z", "2030-01-01T00:00:00Z"),
+        ("malformed", "20260905T00:00:00Z", "2030-01-01T00:00:00Z"),
+    ] {
+        let mut ctx = context.clone();
+        ctx.valid_as_of = start.into();
+        let mut inputs = contributions();
+        inputs.last_mut().expect("expiry contribution").expiry_at = Some(end.into());
+        let produced = compose_profile_runtime(
+            &ctx,
+            &profiles,
+            &rules,
+            &inputs,
+            &[],
+            "2026-09-05T20:00:02Z",
+        )
+        .expect("temporal composition");
+        let owner = profile_runtime::resolve_policy_basis_v2(
+            &ctx,
+            &profiles,
+            &rules,
+            &produced,
+            task_context(),
+        );
+        let result = match owner {
+            Ok(value) => serde_json::json!({"accepted": true, "owner": value}),
+            Err(_) => serde_json::json!({"accepted": false}),
+        };
+        temporal.insert(name.into(), result);
+    }
+    println!(
+        "{}",
+        serde_json::json!({"v1": v1, "v2": first, "other_task_v2": second, "temporal": temporal})
+    );
 }

@@ -140,3 +140,101 @@ def test_owner_callback_cannot_mutate_the_original_v2_request_into_agreement():
         ResolvedPolicyBasisV2.from_profile_runtime(
             raw, expected_task_ref="task:1", resolve_owner=mutate_original
         )
+
+
+@pytest.mark.parametrize("name", ["z", "zero_offset", "positive_offset", "negative_offset", "expires_nanosecond",
+                                 "lowercase", "space", "long_fraction", "unicode_minus", "year_zero", "leap_second"])
+@pytest.mark.parametrize("call_kind", MANAGED_MODEL_CALL_KINDS)
+def test_rust_temporal_owner_survives_persistence_and_egress(name, call_kind):
+    vector = OWNER["temporal"][name]
+    assert vector["accepted"]
+    raw = vector["owner"]
+    current = ResolvedPolicyBasisV2.from_profile_runtime(
+        raw, expected_task_ref="task:1", resolve_owner=lambda *_: copy.deepcopy(raw)
+    )
+    assert current.to_dict()["owner_projection"] == raw
+    result, memory, owner, current = materialize(
+        basis=current, owner=raw, call_kind=call_kind,
+        memory_requirement=MemoryRequirement.NOT_REQUIRED, memory_query=None,
+    )
+    assert result.materialization.to_dict()["policy_basis_digest"] == "blake3:" + raw["basis_digest"]
+    assert authorize(result, memory, owner, current) == result.serialized_request
+    replayed = ResolvedPolicyBasisV2.parse(current.to_dict())
+    assert replayed.to_dict()["owner_projection"] == raw
+    assert not replayed.owner_verified
+
+
+@pytest.mark.parametrize("name", ["expired", "future_nanosecond"])
+def test_rust_temporal_owner_denied_at_consumer_time(name):
+    vector = OWNER["temporal"][name]
+    assert vector["accepted"]
+    raw = vector["owner"]
+    current = ResolvedPolicyBasisV2.from_profile_runtime(
+        raw, expected_task_ref="task:1", resolve_owner=lambda *_: raw
+    )
+    with pytest.raises(ContractError, match="POLICY_(EXPIRED|NOT_YET_VALID)"):
+        materialize(basis=current, owner=raw, memory_requirement=MemoryRequirement.NOT_REQUIRED, memory_query=None)
+
+
+@pytest.mark.parametrize("start,end", [
+    ("2031-01-01T00:00:00Z", "2030-01-01T00:00:00Z"),
+    ("20260905T00:00:00Z", "2030-01-01T00:00:00Z"),
+    ("2026-09-05X00:00:00Z", "2030-01-01T00:00:00Z"),
+    ("2026-09-05T00:00:00+24:00", "2030-01-01T00:00:00Z"),
+    ("2026-09-05T00:00:00+00:60", "2030-01-01T00:00:00Z"),
+    ("2026-09-05T00:00:00", "2030-01-01T00:00:00Z"),
+    ("2026-02-30T00:00:00Z", "2030-01-01T00:00:00Z"),
+])
+def test_malformed_or_inverted_owner_window_is_rejected_before_readback(start, end):
+    raw = copy.deepcopy(OWNER["v2"])
+    raw["owner_projection"].update(not_before=start, not_after=end)
+    calls = []
+    with pytest.raises(ContractError, match="INVALID_POLICY_FIELD"):
+        ResolvedPolicyBasisV2.from_profile_runtime(
+            raw, expected_task_ref="task:1", resolve_owner=lambda *_: calls.append(True) or raw
+        )
+    assert not calls
+
+
+def test_rust_owner_rejects_malformed_and_inverted_windows():
+    assert OWNER["temporal"]["inverted"] == {"accepted": False}
+    assert OWNER["temporal"]["malformed"] == {"accepted": False}
+
+
+def test_nanosecond_expiry_is_rechecked_after_persistence_at_egress():
+    raw = OWNER["temporal"]["expires_nanosecond"]["owner"]
+    current = ResolvedPolicyBasisV2.from_profile_runtime(
+        raw, expected_task_ref="task:1", resolve_owner=lambda *_: raw
+    )
+    result, memory, owner, current = materialize(
+        basis=current, owner=raw, memory_requirement=MemoryRequirement.NOT_REQUIRED, memory_query=None,
+    )
+    assert authorize(result, memory, owner, current) == result.serialized_request
+    with pytest.raises(ContractError, match="POLICY_EXPIRED"):
+        authorize(result, memory, owner, current, now_utc="2026-09-05T05:30:00.000000001+05:30")
+
+
+@pytest.mark.parametrize("field,value", [
+    ("schema", "profile-runtime.resolved-policy-basis/v3"),
+    ("schema", True),
+    ("basis_digest", "sha256:" + "a" * 64),
+])
+def test_closed_outer_contract_rejects_unsupported_identity_before_readback(field, value):
+    raw = copy.deepcopy(OWNER["v2"])
+    raw[field] = value
+    calls = []
+    with pytest.raises(ContractError):
+        ResolvedPolicyBasisV2.from_profile_runtime(
+            raw, expected_task_ref="task:1", resolve_owner=lambda *_: calls.append(True) or raw
+        )
+    assert not calls
+
+
+def test_equivalent_instant_reencoding_does_not_match_current_owner_bytes():
+    raw = copy.deepcopy(OWNER["temporal"]["z"]["owner"])
+    reencoded = copy.deepcopy(raw)
+    reencoded["owner_projection"]["not_before"] = "2026-09-05T00:00:00+00:00"
+    with pytest.raises(ContractError, match="OWNER_POLICY_MISMATCH"):
+        ResolvedPolicyBasisV2.from_profile_runtime(
+            raw, expected_task_ref="task:1", resolve_owner=lambda *_: reencoded
+        )

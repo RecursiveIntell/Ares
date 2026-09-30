@@ -325,7 +325,8 @@ def materialize(
 
 
 def authorize(
-    result, memory_owner, owner, basis, *, request_bytes=None, route="managed_local"
+    result, memory_owner, owner, basis, *, request_bytes=None, route="managed_local",
+    now_utc="2026-09-05T00:00:00Z"
 ):
     request_bytes = request_bytes or result.serialized_request
     return GovernedContextMaterializer().authorize_egress(
@@ -335,7 +336,7 @@ def authorize(
         provider_identity="ollama:http://127.0.0.1:11434",
         model_ref="model:fixture-model",
         serialized_request=request_bytes,
-        now_utc="2026-09-05T00:00:00Z",
+        now_utc=now_utc,
         resolve_owner=lambda *_: owner,
         resolve_graph_obligation=lambda *_: True,
         memory_port=memory_owner.port(),
