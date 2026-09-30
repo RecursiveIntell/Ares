@@ -60,6 +60,47 @@ def _assert_pending_response_survives(agent, result):
     ]
 
 
+@pytest.mark.parametrize("kind", ["physical", "synthetic", "substituted", "unknown_model"])
+def test_route_witness_requires_same_accepted_physical_response(agent, kind):
+    agent.max_iterations = 3
+    agent._disable_streaming = True
+    token = object()
+    agent._route_turn_token = token
+    def physical_call(kw):
+        response = _response()
+        if kind == "unknown_model":
+            response.model = None
+        return response
+
+    agent._interruptible_api_call = physical_call
+
+    def execution(kwargs, callback, **_):
+        if kind == "synthetic":
+            return _response()
+        physical = callback(kwargs)
+        if kind == "substituted":
+            return _response()
+        return physical
+
+    with patch("hermes_cli.middleware.run_llm_execution_middleware", side_effect=execution):
+        result = agent.run_conversation("hello")
+
+    assert result["completed"] is True
+    route = result.get("accepted_response_route")
+    if kind == "physical":
+        assert route is not None
+        assert route.turn_token is token
+        assert route.session_id == "verify-budget-test"
+        assert (route.provider, route.model, route.served_model) == (
+            "openai-compat", "test/model", "test/model"
+        )
+        assert route.attempt_id.startswith(f"{route.turn_id}:api:")
+    elif kind == "unknown_model":
+        assert route is not None and route.served_model is None
+    else:
+        assert route is None
+
+
 def test_verify_on_stop_preserves_composed_report_at_budget_limit(agent, monkeypatch):
     def model_call(_api_kwargs):
         agent._turn_file_mutation_paths = {"changed.py"}

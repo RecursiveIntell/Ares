@@ -95,7 +95,7 @@ from agent.repetition_guard import is_repetition_dominated
 from agent.trajectory import has_incomplete_scratchpad
 # Bind before the turn starts so a source-tree swap cannot load a skewed
 # finalizer at turn end.
-from agent.turn_finalizer import finalize_turn
+from agent.turn_finalizer import AcceptedResponseRoute, finalize_turn
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent import empty_response_guard as _empty_guard
 from hermes_constants import PARTIAL_STREAM_STUB_ID
@@ -1926,6 +1926,10 @@ def run_conversation(
     active_system_prompt = _ctx.active_system_prompt
     effective_task_id = _ctx.effective_task_id
     turn_id = _ctx.turn_id
+    # Gateway-issued in-process turn identity, captured once; never consult a
+    # mutable end-of-turn agent route for the readiness projection.
+    _route_turn_token = getattr(agent, "_route_turn_token", None)
+    _accepted_response_route = None
     current_turn_user_idx = _ctx.current_turn_user_idx
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
@@ -3070,6 +3074,7 @@ def run_conversation(
 
         finish_reason = "stop"
         response = None  # Guard against UnboundLocalError if all retries fail
+        _accepted_response_route = None
         api_kwargs = None  # Guard against UnboundLocalError in except handler
         _context_provider_attempted = False
         api_request_id = f"{turn_id}:api:{api_call_count}"
@@ -3129,6 +3134,7 @@ def run_conversation(
 
             try:
                 agent._reset_stream_delivery_tracking()
+                _physical_responses = []  # (response identity, dispatched route)
                 if _context_dispatch_error is not None:
                     raise _context_dispatch_error
                 from ares_runtime.continuity.runtime import context_dispatch_route_identity
@@ -3390,12 +3396,40 @@ def run_conversation(
                         route_identity=_context_route_identity,
                     )
                     _context_provider_attempted = True
+                    # Record at the physical callback, not the middleware or
+                    # Relay return: either layer can substitute a response.
+                    _dispatched_model = next_api_kwargs.get("model")
+                    _dispatched_provider = agent.provider
+                    _dispatched_session = agent.session_id
+
+                    def _record_physical(call, kwargs):
+                        value = call(kwargs)
+                        if (
+                            _route_turn_token is not None
+                            and isinstance(_dispatched_model, str) and _dispatched_model
+                            and isinstance(_dispatched_provider, str) and _dispatched_provider
+                            and isinstance(_dispatched_session, str) and _dispatched_session
+                        ):
+                            _physical_responses.append((value, AcceptedResponseRoute(
+                                turn_token=_route_turn_token,
+                                turn_id=turn_id,
+                                session_id=_dispatched_session,
+                                attempt_id=f"{api_request_id}:{retry_count}",
+                                provider=_dispatched_provider,
+                                model=_dispatched_model,
+                                served_model=(getattr(value, "model", None)
+                                              if isinstance(getattr(value, "model", None), str)
+                                              else None),
+                            )))
+                        return value
+
                     if _use_streaming:
                         from ares_runtime.continuity.runtime import ContextDispatchStreamBuffer, settle_final_context_dispatch
 
                         with ContextDispatchStreamBuffer(agent, _admission) as _delivery, context_provider_response_scope(agent, _admission):
-                            _response = agent._interruptible_streaming_api_call(
-                                next_api_kwargs, on_first_delta=_stop_spinner
+                            _response = _record_physical(
+                                lambda kw: agent._interruptible_streaming_api_call(
+                                    kw, on_first_delta=_stop_spinner), next_api_kwargs
                             )
 
                         settle_final_context_dispatch(agent, _admission)
@@ -3406,7 +3440,7 @@ def run_conversation(
                     with context_provider_response_scope(agent, _admission):
                         _response = relay_llm.execute(
                             next_api_kwargs,
-                            agent._interruptible_api_call,
+                            lambda kw: _record_physical(agent._interruptible_api_call, kw),
                             session_id=str(agent.session_id or ""),
                             name=str(agent.provider or "provider"),
                             model_name=str(agent.model or ""),
@@ -7052,6 +7086,13 @@ def run_conversation(
             normalized = _transport.normalize_response(response, **_normalize_kwargs)
             assistant_message = normalized
             finish_reason = normalized.finish_reason
+            # Only the *same object* returned by a physical callback may be
+            # promoted after validation and normalization. A middleware/Relay
+            # substitute, discarded redirect, or superseded retry has no match.
+            _accepted_response_route = next(
+                (route for physical, route in reversed(_physical_responses)
+                 if physical is response), None
+            )
             
             # Normalize content to string — some OpenAI-compatible servers
             # (llama-server, etc.) return content as a dict or list instead
@@ -8904,6 +8945,7 @@ def run_conversation(
         _turn_exit_reason=_turn_exit_reason,
         _pending_verification_response=_pending_verification_response,
         _pending_verification_response_previewed=_pending_verification_response_previewed,
+        accepted_response_route=_accepted_response_route,
     )
 
 

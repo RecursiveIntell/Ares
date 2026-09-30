@@ -91,9 +91,20 @@ class TestOpenCodeFreeModelLists:
         for mid in _PROVIDER_MODELS["opencode-free"]:
             assert is_opencode_zen_free_model(mid), mid
 
-    def test_ox_alpha_is_listed(self):
-        from hermes_cli.models import _PROVIDER_MODELS
-        assert "x-preview-f-free" in _PROVIDER_MODELS["opencode-free"]
+    def test_picker_uses_live_keyless_catalog_not_stale_curated_models(self):
+        from hermes_cli.models import provider_model_ids
+
+        with patch("hermes_cli.models.fetch_api_models", return_value=[
+            "hy3-free", "paid-model", "x-preview-f-free"
+        ]) as fetch:
+            assert provider_model_ids("opencode-free", force_refresh=True) == [
+                "hy3-free", "x-preview-f-free"
+            ]
+        fetch.assert_called_once()
+
+        # An unavailable relay must not make a withdrawn curated model look usable.
+        with patch("hermes_cli.models.fetch_api_models", return_value=None):
+            assert provider_model_ids("opencode-free", force_refresh=True) == []
 
 
 class TestOpenCodeFreeRuntimeKeyless:

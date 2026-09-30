@@ -189,6 +189,9 @@ export interface SessionInfo {
   lazy?: boolean
   mcp_servers?: McpServerStatus[]
   model: string
+  model_ready?: boolean
+  provider?: string
+  session_id?: string
   profile_name?: string
   project?: null | ProjectInfo
   reasoning_effort?: string

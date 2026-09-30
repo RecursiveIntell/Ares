@@ -141,6 +141,7 @@ class HostSupervisor:
         cwd: str | Path | None = None,
         env: dict[str, str] | None = None,
         rpc_sink: Callable[[dict], None] | None = None,
+        on_crash: Callable[[], None] | None = None,
         respawn_max: int = 3,
         heartbeat_secs: int = 15,
         expected_build_sha: str | None = None,
@@ -152,6 +153,7 @@ class HostSupervisor:
         self.cwd = Path(cwd) if cwd is not None else _repo_root()
         self.env = env
         self.rpc_sink = rpc_sink or (lambda _obj: None)
+        self.on_crash = on_crash
         self.respawn_max = max(0, int(respawn_max))
         self.heartbeat_secs = max(1, int(heartbeat_secs))
         self.expected_build_sha = expected_build_sha if expected_build_sha is not None else _build_sha()
@@ -582,6 +584,11 @@ class HostSupervisor:
             self._proc = None
         self._remove_registry()
         self._fail_pending_turns(reason="crash", message=f"compute host exited with code {code}")
+        if self.on_crash is not None:
+            try:
+                self.on_crash()
+            except Exception:
+                logger.exception("compute host crash notification failed")
         self._maybe_respawn_after_crash()
 
     def _fail_pending_turns(self, *, reason: str, message: str) -> None:

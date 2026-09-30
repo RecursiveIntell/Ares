@@ -2,6 +2,7 @@ import type { GatewayClient } from '../gatewayClient.js'
 import type { InputDetectDropResponse, PromptSubmitResponse } from '../gatewayTypes.js'
 import type { Msg } from '../types.js'
 
+import { idleModelStatus } from './modelReadiness.js'
 import { turnController } from './turnController.js'
 import { getUiState, patchUiState } from './uiStore.js'
 
@@ -85,7 +86,7 @@ export function submitPrompt(
         // chat ended, no turn started) — release the busy latch; the
         // voice.transcript {stop_phrase} event handles the mode flags + notice.
         if (r?.voice_stopped) {
-          patchUiState({ busy: false, status: 'ready' })
+          patchUiState(state => ({ ...state, busy: false, status: idleModelStatus(state.info, state.sid) }))
         }
       })
       .catch((e: Error) => {
@@ -101,7 +102,7 @@ export function submitPrompt(
         }
 
         deps.sys(`error: ${e.message}`)
-        patchUiState({ busy: false, status: 'ready' })
+        patchUiState({ busy: false, status: 'model unavailable' })
       })
   }
 
