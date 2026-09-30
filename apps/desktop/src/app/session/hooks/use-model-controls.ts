@@ -7,6 +7,7 @@ import { useI18n } from '@/i18n'
 import { isBusySessionModelSwitch } from '@/lib/gateway-rpc'
 import { surfaceModelSwitchConfirm } from '@/lib/guarded-model-switch'
 import { manualPickRemoved, modelOptionsQueryKey } from '@/lib/model-options'
+import { activeGatewayConnectionId } from '@/store/gateway'
 import { notifyError } from '@/store/notifications'
 import { $activeGatewayProfile } from '@/store/profile'
 import {
@@ -14,15 +15,17 @@ import {
   $currentModel,
   $currentProvider,
   $selectedStoredSessionId,
+  beginRuntimeOptionIntent,
   getComposerSelectionGeneration,
   getCurrentModelSource,
   markComposerSelectionManual,
+  ownsRuntimeOptionIntent,
   setCurrentModel,
   setCurrentModelSource,
   setCurrentProvider
 } from '@/store/session'
 import { isSessionGoneError } from '@/store/session-gone'
-import { $sessionStates, sessionTileDelegate } from '@/store/session-states'
+import { $sessionStates, knownOwnerForSession, sessionTileDelegate } from '@/store/session-states'
 import type { ModelOptionsResponse } from '@/types/hermes'
 
 interface ModelControlsOptions {
@@ -212,14 +215,47 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
         : ($sessionStates.get()[liveSessionId!]?.provider ?? '')
 
       const prevSource = getCurrentModelSource()
+      const pendingBefore = liveSessionId ? $sessionStates.get()[liveSessionId]?.pendingModelSelection : null
+      const continuesOptimisticChain = pendingBefore?.model === prevModel && pendingBefore?.provider === prevProvider
+
+      const rollbackModel = continuesOptimisticChain
+        ? (pendingBefore?.rollbackModel ?? pendingBefore?.previousModel ?? prevModel)
+        : prevModel
+
+      const rollbackProvider = continuesOptimisticChain
+        ? (pendingBefore?.rollbackProvider ?? pendingBefore?.previousProvider ?? prevProvider)
+        : prevProvider
+
+      const rollbackSource = continuesOptimisticChain ? (pendingBefore?.rollbackSource ?? prevSource) : prevSource
       const liveGatewayProfile = $activeGatewayProfile.get()
 
       // A runtime id is ephemeral. Keep its durable owner while the switch is
       // in flight so a 4001 can be resumed by the correct surface instead of
       // being reported as a model failure.
       const storedSessionId = liveSessionId
-        ? ($sessionStates.get()[liveSessionId]?.storedSessionId ?? (touchesPrimary ? $selectedStoredSessionId.get() : null))
+        ? ($sessionStates.get()[liveSessionId]?.storedSessionId ??
+          (touchesPrimary ? $selectedStoredSessionId.get() : null))
         : null
+
+      const targetKey = (runtimeId: string | null, storedId: string | null) => {
+        const owner = runtimeId ? knownOwnerForSession(runtimeId) : undefined
+        const ownerConnection = owner && typeof owner === 'object' ? owner.connectionId : undefined
+        const ownerProfile = typeof owner === 'string' ? owner : owner?.profile
+
+        return JSON.stringify([
+          runtimeId,
+          (runtimeId && $sessionStates.get()[runtimeId]?.storedSessionId) || storedId,
+          ownerConnection ?? activeGatewayConnectionId(),
+          ownerProfile ?? $activeGatewayProfile.get()
+        ])
+      }
+
+      let selectionTarget = targetKey(liveSessionId, storedSessionId)
+      let intentTokens = beginRuntimeOptionIntent(selectionTarget, ['model'])
+
+      const owns = (dimension: string) =>
+        targetKey(liveSessionId, storedSessionId) === selectionTarget &&
+        ownsRuntimeOptionIntent(selectionTarget, dimension, intentTokens[dimension])
 
       const updateLiveRuntimeSelection = (model: string, provider: string, optimistic = true) => {
         if (!liveSessionId) {
@@ -236,7 +272,10 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
                 model,
                 provider,
                 previousModel: prevModel,
-                previousProvider: prevProvider
+                previousProvider: prevProvider,
+                rollbackModel,
+                rollbackProvider,
+                rollbackSource
               }
             : null
 
@@ -246,11 +285,21 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
               : state.pendingModelSelection?.model === pendingModelSelection.model &&
                 state.pendingModelSelection.provider === pendingModelSelection.provider &&
                 state.pendingModelSelection.previousModel === pendingModelSelection.previousModel &&
-                state.pendingModelSelection.previousProvider === pendingModelSelection.previousProvider
+                state.pendingModelSelection.previousProvider === pendingModelSelection.previousProvider &&
+                state.pendingModelSelection.rollbackModel === pendingModelSelection.rollbackModel &&
+                state.pendingModelSelection.rollbackProvider === pendingModelSelection.rollbackProvider &&
+                state.pendingModelSelection.rollbackSource === pendingModelSelection.rollbackSource
 
-          return state.model === model && state.provider === provider && pendingMatches
+          const nextState = {
+            ...state,
+            model,
+            provider,
+            pendingModelSelection
+          }
+
+          return state.model === nextState.model && state.provider === nextState.provider && pendingMatches
             ? state
-            : { ...state, model, provider, pendingModelSelection }
+            : nextState
         })
       }
 
@@ -272,25 +321,39 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
 
       const stillOwnsPrimarySelection = () =>
         !touchesPrimary ||
-        ($activeSessionId.get() === liveSessionId && (!storedSessionId || $selectedStoredSessionId.get() === storedSessionId))
+        ($activeSessionId.get() === liveSessionId &&
+          (!storedSessionId || $selectedStoredSessionId.get() === storedSessionId))
 
       const rollbackSelection = () => {
+        if (!owns('model')) {
+          return
+        }
+
+        const pending = liveSessionId ? $sessionStates.get()[liveSessionId]?.pendingModelSelection : null
+
+        const currentRollback =
+          pending?.model === selection.model && pending.provider === selection.provider ? pending : null
+
+        const appliedRollbackModel = currentRollback?.rollbackModel ?? rollbackModel
+        const appliedRollbackProvider = currentRollback?.rollbackProvider ?? rollbackProvider
+        const appliedRollbackSource = currentRollback?.rollbackSource ?? rollbackSource
+
         // Roll back the owning runtime even if its primary surface lost focus
         // while the RPC was pending. That state is separate from the current
         // foreground globals and must not remain as a false applied switch.
-        updateLiveRuntimeSelection(prevModel, prevProvider, false)
+        updateLiveRuntimeSelection(appliedRollbackModel, appliedRollbackProvider, false)
 
         if (touchesPrimary) {
-          if (!stillOwnsPrimarySelection()) {
+          if (!stillOwnsPrimarySelection() || !owns('model')) {
             return
           }
 
-          setCurrentModel(prevModel)
-          setCurrentProvider(prevProvider)
-          setCurrentModelSource(prevSource)
+          setCurrentModel(appliedRollbackModel)
+          setCurrentProvider(appliedRollbackProvider)
+          setCurrentModelSource(appliedRollbackSource)
         }
 
-        cacheSelection(prevProvider, prevModel)
+        cacheSelection(appliedRollbackProvider, appliedRollbackModel)
       }
 
       paintSelection()
@@ -302,22 +365,10 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
         return true
       }
 
-      // The PRIMARY profile's main agent is the profile's default — its
-      // model/provider choice IS the default, so persist it to config.yaml
-      // (model.default + model.provider) via --global. This is what makes
-      // the selection "stick": a set model.provider outranks a leftover
-      // OPENAI_API_KEY env var in resolve_provider(), so the main agent
-      // keeps the chosen (e.g. subscription) provider across restarts
-      // instead of silently falling back to an env key.
-      //
-      // Two things stay --session, deliberately:
-      //  - a SECONDARY chat tile: picking a model there must not rewrite the
-      //    profile default (the cross-session-contamination guard).
-      //  - MoA (mixture-of-agents) presets: a transient orchestration choice
-      //    that must never become the persisted global gateway default.
-      const isSessionOnlyPreset = (selection.provider || '').toLowerCase() === 'moa'
-      const persistsAsDefault = touchesPrimary && !isSessionOnlyPreset
-      const scope = persistsAsDefault ? '--global' : '--session'
+      // Primary and tile composers both target their owning conversation.
+      // Persisted profile defaults belong to Settings → Model; layout identity
+      // must not silently widen a session selection into a profile-wide write.
+      const scope = '--session'
 
       const requestSwitch = (confirmExpensiveModel = false) =>
         requestGateway<ModelSwitchResponse>('config.set', {
@@ -329,17 +380,33 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
 
       let recoveryAttempted = false
 
-      const requestSwitchWithRecovery = async (confirmExpensiveModel = false): Promise<ModelSwitchResponse | undefined> => {
+      const requestSwitchWithRecovery = async (
+        confirmExpensiveModel = false
+      ): Promise<ModelSwitchResponse | undefined> => {
         try {
           return await requestSwitch(confirmExpensiveModel)
         } catch (error) {
-          if (!isSessionGoneError(error) || recoveryAttempted || !recoverRuntime || !storedSessionId || !liveSessionId) {
+          if (!owns('model')) {
+            throw error
+          }
+
+          if (
+            !isSessionGoneError(error) ||
+            recoveryAttempted ||
+            !recoverRuntime ||
+            !storedSessionId ||
+            !liveSessionId
+          ) {
             throw error
           }
 
           recoveryAttempted = true
           const staleRuntimeId = liveSessionId
           const recoveredRuntimeId = await recoverRuntime(storedSessionId, staleRuntimeId)
+
+          if (!owns('model')) {
+            throw new ModelSwitchRecoveryAborted()
+          }
 
           // A recovery owner returns null after route drift or a failed durable
           // resume that it already surfaced. Do not roll the old picker back
@@ -349,6 +416,8 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
           }
 
           liveSessionId = recoveredRuntimeId
+          selectionTarget = targetKey(liveSessionId, storedSessionId)
+          intentTokens = beginRuntimeOptionIntent(selectionTarget, ['model'])
           // session.resume minted a new runtime slice. Repaint that owner before
           // retrying so the picker never falls back to the pre-switch model in
           // the recovery gap.
@@ -360,6 +429,63 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
       }
 
       const finishSwitch = (result: ModelSwitchResponse | undefined) => {
+        if (!owns('model')) {
+          // A prior pick may be acknowledged while a newer optimistic pick
+          // remains pending. Advance only that pick's rollback baseline.
+          if (
+            result &&
+            !result.deferred &&
+            liveSessionId &&
+            targetKey(liveSessionId, storedSessionId) === selectionTarget
+          ) {
+            let acknowledgedAfterRollback = false
+
+            sessionTileDelegate()?.updateSession(liveSessionId, state => {
+              const pending = state.pendingModelSelection
+
+              if (pending?.previousModel === selection.model && pending.previousProvider === selection.provider) {
+                return {
+                  ...state,
+                  pendingModelSelection: {
+                    ...pending,
+                    rollbackModel: selection.model,
+                    rollbackProvider: selection.provider,
+                    rollbackSource: touchesPrimary ? 'manual' : pending.rollbackSource
+                  }
+                }
+              }
+
+              // The newer pick already rejected and restored this request's
+              // baseline. The older acknowledged result can now be painted,
+              // but never over another pending or different successful pick.
+              if (pending === null && state.model === rollbackModel && state.provider === rollbackProvider) {
+                acknowledgedAfterRollback = true
+
+                return { ...state, model: selection.model, provider: selection.provider }
+              }
+
+              return state
+            })
+
+            if (acknowledgedAfterRollback) {
+              if (
+                touchesPrimary &&
+                stillOwnsPrimarySelection() &&
+                $currentModel.get() === rollbackModel &&
+                $currentProvider.get() === rollbackProvider
+              ) {
+                setCurrentModel(selection.model)
+                setCurrentProvider(selection.provider)
+                setCurrentModelSource('manual')
+              }
+
+              cacheSelection(selection.provider, selection.model)
+            }
+          }
+
+          return
+        }
+
         // A pick made DURING a turn is queued by the gateway and applied at the
         // next turn start (`deferred`). Re-fetching now would answer with the
         // model still running and repaint the old name over the user's choice —
@@ -374,6 +500,10 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
         const result = await requestSwitchWithRecovery()
 
         if (result?.confirm_required) {
+          if (!owns('model')) {
+            return false
+          }
+
           rollbackSelection()
           // ONE shared applier for guarded switches (#95293): the same
           // confirm flow the Bots editor routes through — never fork this
@@ -388,13 +518,14 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
             // not clobber the newer choice: bail if the live state no longer
             // matches the snapshot this notification was created for.
             isStale: () =>
-              touchesPrimary
+              !owns('model') ||
+              (touchesPrimary
                 ? !stillOwnsPrimarySelection() ||
                   $currentModel.get() !== prevModel ||
                   $currentProvider.get() !== prevProvider
                 : !liveSessionId ||
                   $sessionStates.get()[liveSessionId]?.model !== prevModel ||
-                  $sessionStates.get()[liveSessionId]?.provider !== prevProvider,
+                  $sessionStates.get()[liveSessionId]?.provider !== prevProvider),
             repaint: () => {
               paintSelection()
               cacheSelection(selection.provider, selection.model)
@@ -410,7 +541,7 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
 
         return true
       } catch (err) {
-        if (err instanceof ModelSwitchRecoveryAborted) {
+        if (err instanceof ModelSwitchRecoveryAborted || !owns('model')) {
           return false
         }
 

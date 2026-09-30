@@ -93,10 +93,15 @@ def _build_warn_agent(compressor: ContextCompressor) -> _WarnAgent:
 
 
 def _run_build(agent):
-    """Run build_turn_context with the prologue-side effects stubbed."""
+    """Exercise warning pressure above the 72K threshold, below the 96K window.
+
+    Exhausted over-window admission has its own provider-spy regressions. This
+    fixture tests warning deduplication, not permission to send an oversized
+    unchanged request after its no-op compressor has failed to make progress.
+    """
     with patch("agent.auxiliary_client.set_runtime_main", lambda *a, **k: None), \
          patch("agent.turn_context._should_run_preflight_estimate", return_value=True), \
-         patch("agent.turn_context.estimate_request_tokens_rough", return_value=999_999):
+         patch("agent.turn_context.estimate_request_tokens_rough", return_value=73_000):
         return build_turn_context(
             agent=agent,
             user_message="hello",

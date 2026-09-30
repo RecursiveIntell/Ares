@@ -2481,7 +2481,11 @@ export const ja = defineLocale({
       max: '最大',
       ultra: 'ウルトラ',
       updateFailed: 'モデルオプションの更新に失敗しました',
-      fastFailed: '高速モードの更新に失敗しました'
+      fastFailed: '高速モードの更新に失敗しました',
+      unconfirmed: 'モデル設定は未確認です',
+      unconfirmedObserved:
+        '更新結果は未確認です。現在ホストが報告する設定を表示しています。書き込みは再試行していません。',
+      unconfirmedUnavailable: '更新結果は不明です。選択した値は未確認です。書き込みは再試行していません。'
     },
     gatewayMenu: {
       gateway: 'ゲートウェイ',

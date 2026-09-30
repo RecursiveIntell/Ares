@@ -777,9 +777,19 @@ def _(rid, params: dict) -> dict:
             record["resume_hydrating"] = True
             record["resume_message_count"] = int(found.get("message_count") or 0)
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
+                # A surviving host adopted this newly allocated display mirror.
+                # Existing parent mirrors already own their hydration lifecycle.
+                if live[1] is record:
+                    _schedule_resume_hydration(
+                        live[0], target, db, close_db=owns_db, expected_session=record
+                    )
+                    if owns_db:
+                        owns_db = False
                 return _reuse_live_response(*live)
 
-            _schedule_resume_hydration(sid, target, db, close_db=owns_db)
+            _schedule_resume_hydration(
+                sid, target, db, close_db=owns_db, expected_session=record
+            )
             # The hydration worker now owns a profile-scoped handle and closes it
             # after the transcript read. The shared launch DB is process-owned.
             if owns_db:
@@ -3581,6 +3591,8 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    if _session_uses_compute_host(session):
+        return _send_host_live_input(rid, str(params.get("session_id") or ""), session, text, "session.steer")
     agent = session.get("agent")
     if agent is None or not hasattr(agent, "steer"):
         return _err(rid, 4010, "agent does not support steer")
@@ -3612,6 +3624,8 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    if _session_uses_compute_host(session):
+        return _send_host_live_input(rid, str(params.get("session_id") or ""), session, text, "session.redirect")
     agent = session.get("agent")
     # Turn-build window: a fresh turn flips running=True and kicks off an async
     # agent build, so session["agent"] is briefly None. That is not an

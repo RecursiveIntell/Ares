@@ -28,18 +28,28 @@ def fixture_db(tmp_path):
     assert before['schema'] == 'SessionDBContextInputTurnV1'
     control = db.record_context_stop('s')
     assert control['schema'] == 'SessionDBContextControlV2'
-    recorded_at = time.time()
-    proof_digest = digest({'before': before, 'control': control, 'recorded_at': recorded_at})
-    cancelled = dict(before, schema='SessionDBContextInputTurnV2', state='cancelled',
-                     stop_disposition_digest=proof_digest)
-    proof = {'schema': 'SessionDBContextInputStopDispositionV1', 'conversation_root': 's',
-             'profile_name': 'default', 'phase_id': before['phase_id'], 'before': before,
-             'after': cancelled, 'control': control, 'recorded_at': recorded_at}
     proof_key = f'{key("s")}:phase:{before["phase_id"]}:cancelled'
-    def stage(conn):
-        conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?)', (proof_key, _canonical(proof)))
-        conn.execute('UPDATE state_meta SET value=? WHERE key=?', (_canonical(cancelled), key('s')))
-    db._execute_write(stage)
+    phase = db.read_context_input_work('s')['phase']
+    if phase['schema'] == 'SessionDBContextInputTurnV1':
+        # The prior reader has no cancellation writer; stage the exact V2
+        # fixture it must accept. The current writer already commits this proof.
+        recorded_at = time.time()
+        proof_digest = digest({'before': before, 'control': control, 'recorded_at': recorded_at})
+        cancelled = dict(before, schema='SessionDBContextInputTurnV2', state='cancelled',
+                         stop_disposition_digest=proof_digest)
+        proof = {'schema': 'SessionDBContextInputStopDispositionV1', 'conversation_root': 's',
+                 'profile_name': 'default', 'phase_id': before['phase_id'], 'before': before,
+                 'after': cancelled, 'control': control, 'recorded_at': recorded_at}
+        def stage(conn):
+            conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?)', (proof_key, _canonical(proof)))
+            conn.execute('UPDATE state_meta SET value=? WHERE key=?', (_canonical(cancelled), key('s')))
+        db._execute_write(stage)
+    else:
+        assert phase['schema'] == 'SessionDBContextInputTurnV2' and phase['state'] == 'cancelled'
+        raw_proof = db.get_meta(proof_key)
+        assert raw_proof is not None
+        proof = json.loads(raw_proof)
+        assert proof['before'] == before and proof['after'] == phase and proof['control'] == control
     yield db, proof_key
     db.close()
 
