@@ -429,6 +429,38 @@ def test_clarify_batch_answer_update_overwrites_before_completion(server):
     assert json.loads(box["answer"])["answers"]["q0"] == "changed"
 
 
+def test_clarify_batch_final_lock_lost_ack_does_not_resolve_twice(server):
+    """Final lock may commit before its RPC ack is delivered to the client.
+
+    The blocked tool must resolve once; a retry against that same request ID
+    receives expired rather than creating a second completion.
+    """
+    thread, box, rid = _drain_batch_block(server, ["q0", "q1"])
+    first = server.handle_request({
+        "id": "a1", "method": "clarify.respond",
+        "params": {"request_id": rid, "question_id": "q0", "answer": "Coffee"},
+    })
+    assert first["result"]["remaining"] == ["q1"]
+    # Apply the final lock but intentionally discard its acknowledgement.
+    server.handle_request({
+        "id": "a2", "method": "clarify.respond",
+        "params": {"request_id": rid, "question_id": "q1", "answer": "Morning"},
+    })
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert json.loads(box["answer"]) == {
+        "answers": {"q0": "Coffee", "q1": "Morning"}
+    }
+    retry = server.handle_request({
+        "id": "retry", "method": "clarify.respond",
+        "params": {"request_id": rid, "question_id": "q0", "answer": "Coffee"},
+    })
+    assert retry["result"] == {"status": "expired"}
+    assert json.loads(box["answer"]) == {
+        "answers": {"q0": "Coffee", "q1": "Morning"}
+    }
+
+
 def test_clarify_batch_empty_answer_is_a_locked_skip(server):
     """Skipping one question locks an empty answer — it counts toward
     completion instead of leaving the batch waiting."""

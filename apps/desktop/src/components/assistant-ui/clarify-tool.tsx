@@ -375,10 +375,19 @@ function ClarifyToolPending(props: ToolCallMessagePartProps) {
   const request = useStore($request)
   const fromArgs = useMemo(() => readClarifyArgs(props.args), [props.args])
   const messageRunning = useAuiState(selectMessageRunning)
-  // Answering clears the request a beat before `tool.complete` swaps in the
-  // settled card. Latch submit so that gap doesn't demote; Stop also clears
-  // the request and must still collapse an unanswered card.
-  const [answered, setAnswered] = useState(false)
+  // Keep the request identity across store cleanup, but never carry a prior
+  // tool acknowledgement into a newly raised request on the same session.
+  const requestIdRef = useRef<string | null>(request?.requestId ?? null)
+  if (request?.requestId) {
+    requestIdRef.current = request.requestId
+  }
+  const [answeredRequestId, setAnsweredRequestId] = useState<string | null>(null)
+  const answered = answeredRequestId !== null && answeredRequestId === requestIdRef.current
+  const markAnswered = (requestId: string) => {
+    if (requestIdRef.current === requestId) {
+      setAnsweredRequestId(requestId)
+    }
+  }
 
   // Stopped mid-prompt with no result — don't leave a dead interactive panel.
   // `session.info` reports running=false while clarify is blocking, so the
@@ -391,10 +400,24 @@ function ClarifyToolPending(props: ToolCallMessagePartProps) {
   // Batch: the gateway request carries qid-keyed questions. Args alone can't
   // drive the form (no qids to respond with), so batch waits for the request.
   if (request?.questions?.length || fromArgs.questions) {
-    return <ClarifyToolBatchPending onAnswered={() => setAnswered(true)} request={request} />
+    return (
+      <ClarifyToolBatchPending
+        answered={answered}
+        key={requestIdRef.current}
+        onAnswered={markAnswered}
+        request={request}
+      />
+    )
   }
 
-  return <ClarifyToolSinglePending fromArgs={fromArgs} onAnswered={() => setAnswered(true)} request={request} />
+  return (
+    <ClarifyToolSinglePending
+      fromArgs={fromArgs}
+      key={requestIdRef.current}
+      onAnswered={markAnswered}
+      request={request}
+    />
+  )
 }
 
 function ClarifyToolSinglePending({
@@ -403,7 +426,7 @@ function ClarifyToolSinglePending({
   request
 }: {
   fromArgs: ClarifyArgs
-  onAnswered: () => void
+  onAnswered: (requestId: string) => void
   request: ClarifyRequest | null
 }) {
   const { t } = useI18n()
@@ -438,6 +461,10 @@ function ClarifyToolSinglePending({
 
   const [draft, setDraft] = useState('')
   const [submitting, setSubmitting] = useState(false)
+  const [sendError, setSendError] = useState<string | null>(null)
+  // A transport failure does not tell us whether the server accepted the
+  // response. Keep that uncertainty through subsequent expired retries.
+  const deliveryUncertain = useRef(false)
   const [selectedChoices, setSelectedChoices] = useState<string[]>([])
   // The keyboard cursor. Indices 0..choices.length-1 are the options; the
   // trailing index (=== choices.length) is the "Other" free-text row.
@@ -468,6 +495,8 @@ function ClarifyToolSinglePending({
       }
 
       setSubmitting(true)
+      setSendError(null)
+      let responseReceived = false
 
       try {
         // Route through the session's OWNER (tile route → hint → tagged row);
@@ -475,7 +504,7 @@ function ClarifyToolSinglePending({
         // The ambient socket follows foreground focus, so after a profile / Bot
         // Chat switch it can point at a backend that never held this clarify —
         // and the owner stays blocked (#91684 client half, like approval.respond).
-        await requestForOwnedSession<{ ok?: boolean }>(
+        const outcome = await requestForOwnedSession<{ status?: string }>(
           matchingRequest.sessionId,
           // Bound (not wrapped) so the ambient fallback keeps the exact 2-arg
           // call shape gateway.request callers assert on.
@@ -486,16 +515,50 @@ function ClarifyToolSinglePending({
             answer
           }
         )
+
+        responseReceived = true
+        if (outcome?.status !== 'ok') {
+          throw new Error(
+            outcome?.status === 'expired'
+              ? deliveryUncertain.current
+                ? copy.responseUncertain
+                : copy.responseExpired
+              : copy.responseRejected
+          )
+        }
+
         triggerHaptic('submit')
-        onAnswered()
-        clearClarifyRequest(matchingRequest.requestId, matchingRequest.sessionId)
-        // tool.complete lands next → ClarifyToolSettled.
+        onAnswered(matchingRequest.requestId)
+        // Keep the question visible until tool.complete or message.complete
+        // settles it. Clearing here makes the batch card become a blank spinner.
       } catch (error) {
         notifyError(error, copy.sendFailed)
+        if (!responseReceived) {
+          deliveryUncertain.current = true
+        }
+        setSendError(
+          !responseReceived || (error instanceof Error && error.message === copy.responseUncertain)
+            ? copy.responseUncertain
+            : error instanceof Error &&
+                (error.message === copy.responseExpired || error.message === copy.responseRejected)
+              ? error.message
+              : copy.sendFailed
+        )
         setSubmitting(false)
       }
     },
-    [copy.gatewayDisconnected, copy.notReady, copy.sendFailed, gateway, matchingRequest, onAnswered, ready]
+    [
+      copy.gatewayDisconnected,
+      copy.notReady,
+      copy.responseExpired,
+      copy.responseRejected,
+      copy.responseUncertain,
+      copy.sendFailed,
+      gateway,
+      matchingRequest,
+      onAnswered,
+      ready
+    ]
   )
 
   const trimmedDraft = draft.trim()
@@ -788,6 +851,11 @@ function ClarifyToolSinglePending({
           />
         )}
       </ClarifyShell>
+      {sendError ? (
+        <p className="text-destructive text-xs" role="alert">
+          {sendError}
+        </p>
+      ) : null}
 
       <div className="flex items-center justify-end gap-1">
         <Button disabled={submitting || !ready} onClick={() => void respond('')} size="xs" type="button" variant="text">
@@ -932,18 +1000,37 @@ const emptyStage = { choices: [] as string[], draft: '' }
  * back-to-back and completes the batch. Staged answers stay editable up to
  * that moment. The per-question wire protocol is unchanged (the TUI/CLI
  * still lock incrementally); this card just batches its locks at the end. */
-function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => void; request: ClarifyRequest | null }) {
+function ClarifyToolBatchPending({
+  answered,
+  onAnswered,
+  request
+}: {
+  answered: boolean
+  onAnswered: (requestId: string) => void
+  request: ClarifyRequest | null
+}) {
   const { t } = useI18n()
   const copy = t.assistant.clarify
   const gateway = useStore($gateway)
+  // A settled acknowledgement can race the transcript result or a session
+  // completion event that clears the store. Retain the last request for display
+  // only; submissions still require the live request below.
+  const lastRequest = useRef<ClarifyRequest | null>(request)
+  if (request) {
+    lastRequest.current = request
+  }
+  const visibleRequest = request ?? (answered ? lastRequest.current : null)
 
   // qids only exist on the gateway request — args are a hydration-race
   // fallback for display, never answerable (no ids to respond with).
-  const questions = request?.questions ?? []
-  const ready = Boolean(request?.requestId) && questions.length > 0
+  const questions = visibleRequest?.questions ?? []
+  const ready = Boolean(visibleRequest?.requestId) && questions.length > 0
 
   const [staged, setStaged] = useState<Record<string, { choices: string[]; draft: string }>>({})
   const [submitting, setSubmitting] = useState(false)
+  const [sendError, setSendError] = useState<string | null>(null)
+  const deliveryUncertain = useRef(false)
+  const [expired, setExpired] = useState(false)
 
   // Reconnect replay: answers the server already locked (an earlier window's
   // partial progress) pre-stage their questions so the restored card shows
@@ -1011,6 +1098,9 @@ function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => vo
   const allStaged = answeredCount === questions.length
 
   const confirmAll = useCallback(async () => {
+    if (expired) {
+      return
+    }
     if (!request || !gateway) {
       notifyError(new Error(request ? copy.gatewayDisconnected : copy.notReady), copy.sendFailed)
 
@@ -1018,6 +1108,8 @@ function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => vo
     }
 
     setSubmitting(true)
+    setSendError(null)
+    let responseReceived = false
 
     try {
       // Sequential, not Promise.all: the LAST lock resolves the blocked tool
@@ -1030,8 +1122,9 @@ function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => vo
       // held this batch, which would leave the owner blocked.
       for (const question of questions) {
         const answer = stagedAnswer(question)
+        responseReceived = false
 
-        await requestForOwnedSession<{ ok?: boolean }>(
+        const outcome = await requestForOwnedSession<{ status?: string }>(
           request.sessionId,
           gateway.request.bind(gateway) as typeof gateway.request,
           'clarify.respond',
@@ -1041,17 +1134,42 @@ function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => vo
             request_id: request.requestId
           }
         )
+
+        responseReceived = true
+        if (outcome?.status !== 'ok') {
+          if (outcome?.status === 'expired') {
+            setExpired(true)
+          }
+          throw new Error(
+            outcome?.status === 'expired'
+              ? deliveryUncertain.current
+                ? copy.responseUncertain
+                : copy.responseExpired
+              : copy.responseRejected
+          )
+        }
       }
 
       triggerHaptic('submit')
-      onAnswered()
-      // tool.complete lands next → ClarifyToolBatchSettled.
-      clearClarifyRequest(request.requestId, request.sessionId)
+      onAnswered(request.requestId)
+      // Keep the staged card visible until tool.complete or message.complete.
+      // Clearing the request here makes the batch card become a blank spinner.
     } catch (error) {
       notifyError(error, copy.sendFailed)
+      if (!responseReceived) {
+        deliveryUncertain.current = true
+      }
+      setSendError(
+        !responseReceived || (error instanceof Error && error.message === copy.responseUncertain)
+          ? copy.responseUncertain
+          : error instanceof Error &&
+              (error.message === copy.responseExpired || error.message === copy.responseRejected)
+            ? error.message
+            : copy.sendFailed
+      )
       setSubmitting(false)
     }
-  }, [copy, gateway, onAnswered, questions, request, stagedAnswer])
+  }, [copy, expired, gateway, onAnswered, questions, request, stagedAnswer])
 
   const toggleChoice = useCallback((question: ClarifyQuestion, choice: string) => {
     setStaged(current => {
@@ -1076,7 +1194,7 @@ function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => vo
       return
     }
 
-    onAnswered()
+    onAnswered(request.requestId)
     clearClarifyRequest(request.requestId, request.sessionId)
 
     try {
@@ -1135,12 +1253,17 @@ function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => vo
           />
         ))}
       </ClarifyShell>
+      {sendError ? (
+        <p className="text-destructive text-xs" role="alert">
+          {sendError}
+        </p>
+      ) : null}
 
       <div className="flex items-center justify-end gap-1">
         <Button disabled={submitting} onClick={() => void cancelAll()} size="xs" type="button" variant="text">
           {copy.skip}
         </Button>
-        <Button disabled={submitting || !allStaged} size="xs" type="submit">
+        <Button disabled={submitting || expired || !allStaged} size="xs" type="submit">
           {submitting ? (
             <Loader2 className="size-3 animate-spin" />
           ) : (

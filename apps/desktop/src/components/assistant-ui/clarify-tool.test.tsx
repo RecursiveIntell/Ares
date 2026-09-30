@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { onComposerInsertRequest } from '@/app/chat/composer/focus'
 import { I18nProvider } from '@/i18n'
-import { clearClarifyRequest, setClarifyRequest } from '@/store/clarify'
+import { clearClarifyRequest, hasClarifyRequest, setClarifyRequest, skipClarifyRequest } from '@/store/clarify'
 import { $gateway } from '@/store/gateway'
 import { $profiles } from '@/store/profile'
 import { $activeSessionId, _resetSessionOwnerHintsForTests, setSessionOwnerHint } from '@/store/session'
@@ -18,7 +18,7 @@ import { ClarifyTool, readClarifyBatchResult, readClarifyResult } from './clarif
 // `$gateway` remains the genuine ambient atom every other test in this file
 // drives.
 const gatewayMocks = vi.hoisted(() => ({
-  requestGatewayForAgent: vi.fn(async () => ({ ok: true }))
+  requestGatewayForAgent: vi.fn(async () => ({ status: 'ok' }))
 }))
 
 vi.mock('@/store/gateway', async importActual => ({
@@ -94,7 +94,7 @@ function liveClarifyProps(choices = ['staging', 'production']): ToolCallMessageP
 }
 
 function renderLiveClarify({ multiSelect = false }: { multiSelect?: boolean } = {}) {
-  const request = vi.fn().mockResolvedValue({ ok: true })
+  const request = vi.fn().mockResolvedValue({ status: 'ok' })
 
   $activeSessionId.set('session-1')
   $gateway.set({ request } as never)
@@ -219,6 +219,44 @@ describe('ClarifyTool choice selection', () => {
         request_id: 'request-1'
       })
     })
+  })
+  it('keeps the selected single answer when the server says the request expired', async () => {
+    const { request } = renderLiveClarify()
+    request.mockResolvedValue({ status: 'expired' })
+
+    fireEvent.click(screen.getByRole('button', { name: /staging/ }))
+    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
+
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(screen.getByRole('button', { name: /Continue/ })).toBeTruthy())
+    expect(screen.getByRole('button', { name: /staging/ }).getAttribute('aria-pressed')).toBe('true')
+    expect(hasClarifyRequest('session-1')).toBe(true)
+    expect(screen.getByRole('alert').textContent).toMatch(/Request expired/)
+  })
+  it('does not call a lost-ack single answer undelivered when retry expires', async () => {
+    const { request } = renderLiveClarify()
+    request.mockRejectedValueOnce(new Error('socket lost')).mockResolvedValueOnce({ status: 'expired' })
+    fireEvent.click(screen.getByRole('button', { name: /staging/ }))
+    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/may have reached/i))
+    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/may have reached/i))
+    expect(screen.getByRole('button', { name: /staging/ }).getAttribute('aria-pressed')).toBe('true')
+  })
+  it('does not assert non-delivery after a remount loses transport history', async () => {
+    const { request } = renderLiveClarify()
+    request.mockRejectedValueOnce(new Error('socket lost')).mockResolvedValue({ status: 'expired' })
+    fireEvent.click(screen.getByRole('button', { name: /staging/ }))
+    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/may have reached/i))
+    cleanup() // Reconnect/transcript remount: local refs are gone, request store remains.
+    renderClarify(<ClarifyTool {...liveClarifyProps()} />)
+    fireEvent.click(screen.getByRole('button', { name: /staging/ }))
+    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/check the conversation/i))
+    expect(screen.getByRole('alert').textContent).not.toMatch(/not delivered/i)
   })
 })
 
@@ -454,7 +492,7 @@ describe('ClarifyTool keyboard navigation', () => {
 
 describe('ClarifyTool recommended option', () => {
   it('dims the (Recommended) label and answers with the choice the backend sent', async () => {
-    const request = vi.fn().mockResolvedValue({ ok: true })
+    const request = vi.fn().mockResolvedValue({ status: 'ok' })
 
     $activeSessionId.set('session-1')
     $gateway.set({ request } as never)
@@ -501,7 +539,7 @@ describe('ClarifyTool pending marker', () => {
 
   it('does not mark a free-text (no-choice) pending card', () => {
     $activeSessionId.set('session-1')
-    $gateway.set({ request: vi.fn().mockResolvedValue({ ok: true }) } as never)
+    $gateway.set({ request: vi.fn().mockResolvedValue({ status: 'ok' }) } as never)
     setClarifyRequest({
       choices: null,
       multiSelect: false,
@@ -559,7 +597,7 @@ function liveBatchProps(): ToolCallMessagePartProps {
 }
 
 function renderLiveBatch(lockedAnswers?: Record<string, string>, multiSelect = false) {
-  const request = vi.fn().mockResolvedValue({ ok: true, remaining: [] })
+  const request = vi.fn().mockResolvedValue({ status: 'ok', remaining: [] })
 
   $activeSessionId.set('session-1')
   $gateway.set({ request } as never)
@@ -651,6 +689,166 @@ describe('ClarifyTool batch card', () => {
       question_id: 'q1',
       request_id: 'request-batch'
     })
+    expect(screen.getByText('2 of 2 answered')).toBeTruthy()
+    expect(screen.queryByRole('status', { name: /loading question/i })).toBeNull()
+    messageRunning = false
+    act(() => clearClarifyRequest('request-batch', 'session-1'))
+    expect(screen.getByText('Color?')).toBeTruthy()
+    expect(screen.getByText('2 of 2 answered')).toBeTruthy()
+    expect(screen.queryByRole('status', { name: /loading question/i })).toBeNull()
+  })
+
+  it('retains the full batch and stops after a later rejected lock', async () => {
+    const request = renderLiveBatch()
+    request.mockResolvedValueOnce({ status: 'ok', remaining: ['q1'] }).mockResolvedValueOnce({ status: 'expired' })
+
+    fireEvent.click(screen.getByRole('button', { name: /red/ }))
+    fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'packet' } })
+    fireEvent.click(screen.getByRole('button', { name: /Confirm and continue/ }))
+
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/Request expired/))
+    expect(request).toHaveBeenCalledTimes(2)
+    expect(screen.getByText('2 of 2 answered')).toBeTruthy()
+    expect(screen.getByRole('button', { name: /red/ }).getAttribute('aria-pressed')).toBe('true')
+    expect(hasClarifyRequest('session-1')).toBe(true)
+    const confirm = screen.getByRole('button', { name: /Confirm and continue/ }) as HTMLButtonElement
+    expect(confirm.disabled).toBe(true)
+    fireEvent.click(confirm)
+    expect(request).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps the staged batch when the first lock is expired and sends no later lock', async () => {
+    const request = renderLiveBatch()
+    request.mockResolvedValue({ status: 'expired' })
+
+    fireEvent.click(screen.getByRole('button', { name: /red/ }))
+    fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'packet' } })
+    fireEvent.click(screen.getByRole('button', { name: /Confirm and continue/ }))
+
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(screen.getByRole('button', { name: /Confirm and continue/ })).toBeTruthy())
+    expect(screen.getByText('2 of 2 answered')).toBeTruthy()
+    expect(hasClarifyRequest('session-1')).toBe(true)
+    expect(request).toHaveBeenCalledTimes(1)
+    expect((screen.getByRole('button', { name: /Confirm and continue/ }) as HTMLButtonElement).disabled).toBe(true)
+    expect(screen.getByRole('alert').textContent).toMatch(/Request expired/)
+  })
+
+  it('marks final-lock lost acknowledgement as uncertain when retry expires', async () => {
+    const request = renderLiveBatch()
+    request
+      .mockResolvedValueOnce({ status: 'ok', remaining: ['q1'] })
+      .mockRejectedValueOnce(new Error('socket lost'))
+      .mockResolvedValueOnce({ status: 'expired' })
+    fireEvent.click(screen.getByRole('button', { name: /red/ }))
+    fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'packet' } })
+    fireEvent.click(screen.getByRole('button', { name: /Confirm and continue/ }))
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/may have reached/i))
+    fireEvent.click(screen.getByRole('button', { name: /Confirm and continue/ }))
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(3))
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/may have reached/i))
+    expect((screen.getByRole('button', { name: /Confirm and continue/ }) as HTMLButtonElement).disabled).toBe(true)
+    expect(screen.getByText('2 of 2 answered')).toBeTruthy()
+  })
+
+  it('starts a distinct batch request with a fresh stage after the old request expires', async () => {
+    const request = renderLiveBatch()
+    request.mockResolvedValue({ status: 'expired' })
+    fireEvent.click(screen.getByRole('button', { name: /red/ }))
+    fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'packet' } })
+    fireEvent.click(screen.getByRole('button', { name: /Confirm and continue/ }))
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/Request expired/))
+
+    act(() =>
+      setClarifyRequest({
+        choices: null,
+        multiSelect: false,
+        question: '',
+        questions: [
+          { choices: ['red', 'blue'], multiSelect: false, qid: 'q0', question: 'Color?' },
+          { choices: null, multiSelect: false, qid: 'q1', question: 'Name?' }
+        ],
+        requestId: 'new-request',
+        sessionId: 'session-1'
+      })
+    )
+    expect(screen.getByText('0 of 2 answered')).toBeTruthy()
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect((screen.getByRole('button', { name: /Confirm and continue/ }) as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.click(screen.getByRole('button', { name: /blue/ }))
+    fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'new' } })
+    expect((screen.getByRole('button', { name: /Confirm and continue/ }) as HTMLButtonElement).disabled).toBe(false)
+  })
+
+  it('does not treat a late old acknowledgement as answering a newer request', async () => {
+    let acceptOld!: (result: { status: string }) => void
+    const request = renderLiveBatch()
+    request.mockImplementationOnce(
+      () =>
+        new Promise(resolve => {
+          acceptOld = resolve
+        })
+    )
+    fireEvent.click(screen.getByRole('button', { name: /red/ }))
+    fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'packet' } })
+    fireEvent.click(screen.getByRole('button', { name: /Confirm and continue/ }))
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(1))
+
+    act(() =>
+      setClarifyRequest({
+        choices: null,
+        multiSelect: false,
+        question: '',
+        questions: [
+          { choices: ['red', 'blue'], multiSelect: false, qid: 'q0', question: 'Color?' },
+          { choices: null, multiSelect: false, qid: 'q1', question: 'Name?' }
+        ],
+        requestId: 'new-request',
+        sessionId: 'session-1'
+      })
+    )
+    await act(async () => acceptOld({ status: 'ok' }))
+    messageRunning = false
+    act(() => clearClarifyRequest('new-request', 'session-1'))
+    expect(screen.queryByText('0 of 2 answered')).toBeNull()
+    expect(screen.queryByRole('button', { name: /Confirm and continue/ })).toBeNull()
+  })
+
+  it('does not let a late old acknowledgement erase a newer accepted latch', async () => {
+    let acceptOld!: (result: { status: string }) => void
+    const request = renderLiveBatch()
+    request.mockImplementationOnce(
+      () =>
+        new Promise(resolve => {
+          acceptOld = resolve
+        })
+    )
+    fireEvent.click(screen.getByRole('button', { name: /red/ }))
+    fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'old' } })
+    fireEvent.click(screen.getByRole('button', { name: /Confirm and continue/ }))
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(1))
+
+    act(() =>
+      setClarifyRequest({
+        choices: null,
+        multiSelect: false,
+        question: '',
+        questions: [
+          { choices: ['red', 'blue'], multiSelect: false, qid: 'q0', question: 'Color?' },
+          { choices: null, multiSelect: false, qid: 'q1', question: 'Name?' }
+        ],
+        requestId: 'new-request',
+        sessionId: 'session-1'
+      })
+    )
+    fireEvent.click(screen.getByRole('button', { name: /blue/ }))
+    fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'new' } })
+    fireEvent.click(screen.getByRole('button', { name: /Confirm and continue/ }))
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(3))
+    await act(async () => acceptOld({ status: 'ok' }))
+    messageRunning = false
+    act(() => clearClarifyRequest('new-request', 'session-1'))
+    expect(screen.getByText('2 of 2 answered')).toBeTruthy()
   })
 
   it('a staged answer stays editable before confirm', async () => {
@@ -741,7 +939,7 @@ function armCrossProfileOwner() {
   $profiles.set([{ name: OWNER_PROFILE }, { name: 'profile-b' }] as never)
   setSessionOwnerHint('session-a', { connectionId: OWNER_CONNECTION_ID, profile: OWNER_PROFILE })
 
-  const ambient = vi.fn().mockResolvedValue({ ok: true })
+  const ambient = vi.fn().mockResolvedValue({ status: 'ok' })
 
   $activeSessionId.set('session-a')
   $gateway.set({ request: ambient } as never)
@@ -839,6 +1037,21 @@ describe('ClarifyTool owner routing', () => {
       expect(gatewayMocks.requestGatewayForAgent).toHaveBeenCalledTimes(1)
     })
     expectOwnerCall(1, { answer: '', request_id: 'request-batch' })
+    expect(ambient).not.toHaveBeenCalled()
+  })
+
+  it('composer skip routes to the clarify owner after the ambient profile switches', async () => {
+    const ambient = armCrossProfileOwner()
+    setClarifyRequest({
+      choices: ['staging', 'production'],
+      multiSelect: false,
+      question: 'Which deployment target?',
+      requestId: 'request-composer',
+      sessionId: 'session-a'
+    })
+
+    await expect(skipClarifyRequest('session-a')).resolves.toBe(true)
+    expectOwnerCall(1, { answer: '', request_id: 'request-composer' })
     expect(ambient).not.toHaveBeenCalled()
   })
 })
