@@ -2,7 +2,7 @@ name: Context continuity qualification
 
 on:
   push:
-    branches: [feat/context-continuity-v4-20260923]
+    branches: [main, feat/context-continuity-v4-20260923]
   pull_request:
     paths:
       - '.github/workflows/context-continuity-qualification.yml'
@@ -150,7 +150,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: RecursiveIntell/Libraries
-          ref: 0b099ec416de60f6adafb182f1d1e83795d05c56
+          ref: 02ee5dd96a3f5fb403bdd2b955d57a1456b929ea
           path: Libraries
           persist-credentials: false
       - name: Bind the exact native candidate tree
@@ -225,7 +225,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: RecursiveIntell/Libraries
-          ref: 34fa0719ee84b01ba268b5849c2455ac8159ef49
+          ref: 02ee5dd96a3f5fb403bdd2b955d57a1456b929ea
           path: native-owner-source
           persist-credentials: false
       - name: Build and test pinned native Governor
@@ -233,6 +233,12 @@ jobs:
         run: |
           set -euo pipefail
           rustup toolchain install 1.94.0 --profile minimal
+          python3 - <<'PYTHON'
+          import json, pathlib, subprocess
+          manifest = json.loads(pathlib.Path("docs/context-continuity/native-external-owner.json").read_text())
+          actual = subprocess.check_output(["git", "-C", "native-owner-source", "rev-parse", "HEAD"], text=True).strip()
+          assert actual == manifest["libraries_commit"], "Governor and paired native Libraries selection diverged"
+          PYTHON
           cargo +1.94.0 test --locked --manifest-path native-owner-source/context-governor/Cargo.toml
           sha256sum native-owner-source/context-governor/target/debug/context-governor
       - name: Run continuity and adjacent ownership surfaces
