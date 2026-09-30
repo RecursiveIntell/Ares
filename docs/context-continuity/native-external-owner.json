@@ -3,7 +3,7 @@
   "repository": "RecursiveIntell/recursive-agent",
   "base_commit": "11fefae304d43d9d72f7a238f9d2df77862b51c6",
   "candidate_tree": "3cc9b29b063406acfb6c9b7ce73d8ae07dcc0355",
-  "libraries_commit": "02ee5dd96a3f5fb403bdd2b955d57a1456b929ea",
+  "libraries_commit": "9849d12adc8a5ef852d56e36abec4ffbb5122c62",
   "patch_sha256": "db21c261b430932dd778b39b0a4e9b9f59174ff722d073974fc89b2069852934",
   "scope": [
     "external permit semantic outcome idempotency",
@@ -132,11 +132,11 @@
     }
   ],
   "current_libraries_selection": {
-    "commit": "02ee5dd96a3f5fb403bdd2b955d57a1456b929ea",
-    "governor_commit": "02ee5dd96a3f5fb403bdd2b955d57a1456b929ea",
+    "commit": "9849d12adc8a5ef852d56e36abec4ffbb5122c62",
+    "governor_commit": "9849d12adc8a5ef852d56e36abec4ffbb5122c62",
     "status": "pending_exact_head_hosted_qualification",
-    "previous_native_libraries_commit": "0b099ec416de60f6adafb182f1d1e83795d05c56",
-    "previous_governor_libraries_commit": "34fa0719ee84b01ba268b5849c2455ac8159ef49",
+    "previous_native_libraries_commit": "02ee5dd96a3f5fb403bdd2b955d57a1456b929ea",
+    "previous_governor_libraries_commit": "02ee5dd96a3f5fb403bdd2b955d57a1456b929ea",
     "historical_proof_scope": "Existing proof objects above retain their original native/Libraries tuple; they do not qualify this updated Libraries selection.",
     "required_gates": [
       "locked native workspace metadata/check/clippy/tests/build",
@@ -145,6 +145,27 @@
       "adjacent focused Ares tests",
       "independent review and exact-head CI"
     ],
-    "installed_runtime_qualification": false
-  }
+    "installed_runtime_qualification": false,
+    "owner_tree": "bed0d7c73f887932358905d8b904887c6f106b74",
+    "source_pr": "https://github.com/RecursiveIntell/Libraries/pull/57",
+    "scope": "Current paired native and Governor source qualification for the canonical origin-revocation epoch change; no production bootstrap or installed adoption claim."
+  },
+  "previous_libraries_selections": [
+    {
+      "commit": "02ee5dd96a3f5fb403bdd2b955d57a1456b929ea",
+      "governor_commit": "02ee5dd96a3f5fb403bdd2b955d57a1456b929ea",
+      "status": "pending_exact_head_hosted_qualification",
+      "previous_native_libraries_commit": "0b099ec416de60f6adafb182f1d1e83795d05c56",
+      "previous_governor_libraries_commit": "34fa0719ee84b01ba268b5849c2455ac8159ef49",
+      "historical_proof_scope": "Existing proof objects above retain their original native/Libraries tuple; they do not qualify this updated Libraries selection.",
+      "required_gates": [
+        "locked native workspace metadata/check/clippy/tests/build",
+        "actual Ares paired-daemon tests",
+        "current Governor tests",
+        "adjacent focused Ares tests",
+        "independent review and exact-head CI"
+      ],
+      "installed_runtime_qualification": false
+    }
+  ]
 }
