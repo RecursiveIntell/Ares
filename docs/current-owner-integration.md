@@ -47,3 +47,29 @@ authenticated runtime-bootstrap gate.
 
 Rollback is the exact source PR revert. No data migration, profile activation,
 credential change, repair application or new persisted owner state is involved.
+
+## Owner validity-window wire contract
+
+Ares compares profile-runtime RFC3339 timestamps as UTC-second/nanosecond
+pairs without rewriting the original strings or recomputing owner digests.
+This follows the pinned owner's Chrono semantics: `Z`, signed offsets,
+lowercase/space separators, leap seconds and nanosecond precision (excess
+fraction digits are ignored for comparison only). An inverted window fails
+before owner readback; equal endpoints remain structurally valid but are
+never active because expiry is exclusive. Equivalent instants encoded with
+different wire strings do not satisfy an exact current-owner readback.
+
+The Rust qualification producer generates both accepted temporal V2
+envelopes and rejected malformed/inverted cases through the actual owner.
+Consumer tests exercise every managed-call kind through materialization,
+receipt persistence and egress, including nanosecond validity boundaries.
+This is a typed mapping boundary: it does not claim that an unimplemented
+raw JSON transport rejects duplicate keys or imposes wire size/depth limits.
+Those checks must be bound to the concrete authenticated transport when it
+is selected; qualification callbacks do not authenticate an owner.
+
+The generic Libraries `boundary-compiler::SchemaValidator::validate` is a
+no-op in the inspected owner revision, but is neither called nor depended on
+by this profile-runtime validation path. Profile-runtime validates its own
+closed typed policy contract and validity window. The generic no-op remains
+explicitly out-of-path debt, not a claimed fixed Ares bypass.

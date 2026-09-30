@@ -994,11 +994,46 @@ def _positive_int(value: Any, field: str) -> int:
     return value
 
 
-def _parse_utc(value: Any, field: str) -> datetime:
-    if not isinstance(value, str) or not value.endswith("Z"):
+_OWNER_RFC3339 = re.compile(
+    r"([0-9]{4})-([0-9]{2})-([0-9]{2})[Tt ]"
+    r"([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]+))?"
+    r"([Zz]|[+−-][0-9]{2}:[0-9]{2})"
+)
+
+
+def _parse_utc(value: Any, field: str) -> tuple[int, int]:
+    """Compare owner RFC3339 instants without rewriting their digested strings.
+
+    Match profile-runtime's Chrono parser, including nanoseconds and leap
+    seconds. Python's fromisoformat accepts other ISO shapes and silently
+    truncates to microseconds, which can admit a not-yet-valid policy.
+    """
+    match = _OWNER_RFC3339.fullmatch(value) if isinstance(value, str) else None
+    if match is None:
         raise ContractError("INVALID_POLICY_FIELD", field)
+    year, month, day, hour, minute, second = map(int, match.groups()[:6])
+    fraction, offset = match.groups()[6:]
     try:
-        return datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
+        # Chrono accepts year 0000; Gregorian leap years repeat every 400 years.
+        ordinal = datetime(year or 400, month, day).toordinal()
+        if year == 0:
+            ordinal -= 146097
+        if hour > 23 or minute > 59 or second > 60:
+            raise ValueError("invalid time")
+        offset_seconds = 0
+        if offset not in {"Z", "z"}:
+            offset_hour, offset_minute = int(offset[1:3]), int(offset[4:6])
+            if offset_hour > 23 or offset_minute > 59:
+                raise ValueError("invalid offset")
+            offset_seconds = (offset_hour * 60 + offset_minute) * 60
+            if offset[0] != "+":
+                offset_seconds = -offset_seconds
+        seconds = ordinal * 86400 + hour * 3600 + minute * 60 + min(second, 59)
+        # Chrono discards precision beyond nine digits, retaining the wire text.
+        nanos = int(((fraction or "")[:9]).ljust(9, "0"))
+        if second == 60:
+            nanos += 1_000_000_000
+        return seconds - offset_seconds, nanos
     except ValueError as exc:
         raise ContractError("INVALID_POLICY_FIELD", field) from exc
 
@@ -1106,8 +1141,10 @@ def _validate_profile_runtime_basis(raw: Any) -> dict[str, Any]:
         ):
             raise ContractError("INVALID_POLICY_FIELD", field)
         value[field] = sorted(set(items))
-    for field in ("not_before", "not_after"):
-        _parse_utc(value.get(field), field)
+    if _parse_utc(value.get("not_before"), "not_before") > _parse_utc(
+        value.get("not_after"), "not_after"
+    ):
+        raise ContractError("INVALID_POLICY_FIELD", "not_after")
     if value.get("status") not in {"admitted", "blocked"}:
         raise ContractError("INVALID_POLICY_FIELD", "status")
     if (

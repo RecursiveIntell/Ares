@@ -66,7 +66,8 @@ jobs:
           git -C ares rev-parse HEAD > "$RUNNER_TEMP/owner-evidence/ares-head.txt"
           cp ares/tests/ares_runtime/fixtures/profile_runtime_v2_owner.json \
             "$RUNNER_TEMP/owner-evidence/"
-          sha256sum ares/tests/owner_integration/profile_runtime_fixture.rs \
+          sha256sum Libraries/target/debug/examples/ares_policy_basis_fixture \
+            ares/tests/owner_integration/profile_runtime_fixture.rs \
             ares/tests/ares_runtime/fixtures/profile_runtime_v2_owner.json \
             > "$RUNNER_TEMP/owner-evidence/SHA256SUMS"
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
