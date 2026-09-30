@@ -1,3 +1,5 @@
+> **Ares documentation scope:** This directory contains the documentation site and inherited Hermes reference material. Use the [root Ares README](../README.md) for downstream installation, identity and runtime boundaries. A local Docusaurus build does not prove deployment or availability of a hosted documentation URL.
+
 # Website
 
 This website is built using [Docusaurus](https://docusaurus.io/), a modern static website generator.

@@ -1,3 +1,5 @@
+> **Ares 说明：** 本文件保留了上游 Hermes 的中文参考文档。Ares 的安装方式、差异和验证边界以 [Ares README](README.md) 为准。本文中的 Nous Research 安装程序与发行版本属于上游 Hermes，并非 Ares 的官方发行版。
+
 <p align="center">
   <img src="assets/banner.png" alt="Hermes Agent" width="100%">
 </p>

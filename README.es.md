@@ -1,3 +1,5 @@
+> **Nota sobre Ares:** Este archivo conserva la documentación en español de Hermes upstream. Para instalar Ares y consultar sus diferencias, límites y estado de verificación, usa el [README de Ares](README.md). Los instaladores y las versiones de Nous Research descritos aquí corresponden a Hermes, no a una distribución oficial de Ares.
+
 <p align="center">
   <img src="assets/banner.png" alt="Hermes Agent" width="100%">
 </p>

@@ -1,3 +1,5 @@
+> **Ares downstream scope:** This page documents the inherited Hermes Desktop. For the isolated Ares runtime and `ares desktop` launcher, follow the [Ares setup and runtime guide](../../README.md). Upstream prebuilt installers and `hermes update` are not proof that an Ares-managed release was built or selected.
+
 # Hermes Desktop ☤
 
 <p align="center">

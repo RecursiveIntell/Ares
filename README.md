@@ -2,7 +2,7 @@
   <img src="docs/ares-workbench.svg" width="100%" alt="Ares architecture: an isolated Hermes-compatible runtime feeds explicit plugins, MCP services, and an evidence boundary with optional governed integrations.">
 </p>
 
-<!-- last-verified: 2026-09-03 -->
+<!-- README source review: 2026-09-30; installed/runtime proof remains separately scoped -->
 
 # Ares
 
@@ -73,7 +73,7 @@ Ares does **not** claim that every optional service is installed, that every nat
 
 - Git
 - [uv](https://docs.astral.sh/uv/)
-- Python **3.11–3.14** is admitted by the current project metadata (`>=3.11,<3.15`). The inherited POSIX installer provisions 3.11 by default; the committed Desktop resolver explicitly probes 3.11–3.13. Treat 3.14 as metadata admission, not installer-wide or Desktop support, until the relevant source and install checks are published together.
+- Python **3.11–3.14** is admitted by the current project metadata (`>=3.11,<3.15`). The inherited POSIX installer provisions 3.11 by default; the committed Desktop resolver explicitly probes 3.11–3.14. Resolver support is a source-level admission decision, not proof that every native extension or installation path works on each Python minor and operating system.
 - A model provider configured through the normal Hermes setup flow
 
 - The Ares runtime controller is currently exercised through the Python module entry point on POSIX systems. `scripts/install.sh` and `scripts/install.ps1` are inherited Hermes installers; they do not create the Ares `ares` launcher or the Ares stable-runtime layout.
@@ -89,6 +89,8 @@ uv sync --locked --extra all --no-dev
 .venv/bin/python -m ares_runtime.local_runtime setup \
   --source "$PWD" --no-desktop --no-gateway
 ```
+
+Before running setup, review its migration boundary: `--seed-from` defaults to `~/.hermes` and may copy configuration, credentials, profiles, skills and plugins into the Ares home. Use an explicitly chosen empty directory as `--seed-from PATH` if you want an unseeded first setup. When the strict `ri-context-governor` engine is already selected, setup also provisions its governed key state if needed; it is not a passive filesystem inspection.
 
 A successful setup creates or selects:
 
@@ -107,7 +109,7 @@ ares status
 ares doctor
 ```
 
-The expected first-success signal is a selected Ares revision followed by `PASS` checks from `ares doctor`. Provider credentials are still your responsibility; setup does not create credentials or silently authorize external services. The first setup command above intentionally omits Desktop and the gateway so the CLI path can be validated without a desktop build or systemd user service.
+The expected first-success signal is a selected Ares revision followed by `PASS` checks from `ares doctor`. Doctor checks selected-runtime imports and SQLite, the configured strict governor, managed-process coherence, and enabled MCP readiness. Its MCP probe can start configured subprocess servers or contact configured endpoints, so review those server commands and destinations before running it. Provider credentials are still your responsibility; setup does not create credentials or silently authorize external services. The first setup command above intentionally omits Desktop and the gateway so the CLI path can be validated without a desktop build or systemd user service.
 
 ### Choose the Ares runtime surface
 
@@ -329,7 +331,7 @@ explicit disable or restriction gate:
 | Adapter | What it provides | Gate / limitation |
 |---|---|---|
 | `ri_llm` | Rust-backed `llm-pipeline` calls for OpenAI-compatible providers, including structured output | Native extension required; active by default when available; `HERMES_RI_PIPELINE=0` disables it; provider allowlists may be set with `HERMES_RI_PIPELINE_PROVIDERS` or config; failures fall back to the stock path |
-| `ri_context_compressor` | Deterministic Rust-first context compaction with an LLM summarizer fallback and receipt preservation | `context-governor` native extension and configured engine required; the CEA graph lane is advisory, read-only, and fails open |
+| `ri_context_compressor` | Legacy PyO3-backed context compressor with an LLM summarizer fallback and receipt preservation | Native extension required for this legacy lane; it is distinct from the configured CLI-backed engine below; the CEA graph lane is advisory, read-only, and fails open |
 | `ri_agent_graph` | Rust-backed in-process state plus read-only direct SQLite queries for runs, graphs, state, and receipts | Native extension required for the accelerator; active by default when available; writes remain MCP-mediated; `HERMES_RI_AGENT_GRAPH=0` disables the read accelerator; `HERMES_RI_AGENT_GRAPH_DB` selects the DB |
 | `ri_poly_kv` | Shape validation, synthetic-pool receipts, local cosine/top-k scoring, and compressed-domain integration points | Native extension required; `HERMES_RI_POLY_KV=0` disables; the adapter returns `None` on errors so callers can use the MCP path; the scorer is alpha |
 
@@ -338,11 +340,17 @@ install them, activate their external services, or certify their native
 artifacts. The CEA graph integration reads a separately configured graph
 binary/database and writes nothing from the compressor path.
 
+### Configured Context Governor engine
+
+The discoverable [`ri-context-governor` plugin](plugins/context_engine/ri-context-governor/__init__.py) is the selection owner for `context.engine: ri-context-governor`. It delegates to the [shared CLI adapter](plugins/context_engine/_context_governor/__init__.py), which invokes the Rust `context-governor` executable and checks governed key/protocol/receipt state. This path does not depend on the unrelated PyO3 compressor being installed.
+
+Choose the engine through the existing configuration workflow, then validate the installed executable and adapter together with the runtime's strict probe. A source-present plugin, a passing Python import, and an old closure document do not establish current activation or successful compaction on an existing long-running session. The legacy transport and configured engine have different owners and proof boundaries.
+
 ### Optional Recursive Agent plugin
 
 The Recursive Agent integration is a standalone plugin, not a bundled core tool. It requires a separately built and running local Recursive Agent daemon.
 
-From an existing `RecursiveIntell/recursive-agent` checkout:
+From the Ares checkout, pointing at an existing `RecursiveIntell/recursive-agent` checkout:
 
 ```bash
 bash install.sh --with-recursive-agent-source /path/to/recursive-agent
@@ -534,7 +542,9 @@ Where a page names upstream URLs or support channels, treat those as Hermes refe
 
 ## Status and claim boundary
 
-**Source review performed 2026-09-03 at commit `853d6a03f1e92b1de38b53ef0a654374648f2d56`.** The review covers that committed `main` snapshot plus this README-only change; no feature-branch, dirty-tree, or untracked implementation was used as evidence. It establishes the documented fork identity, installer boundary, Ares launcher command surface, stable-runtime controller, custody contracts, explicit specialist dispatch, specialist runner, and the presence of the integration code described above.
+**README source review: 2026-09-30, committed `main` snapshot `56d296c70d9fe7f1cf1e978c730b3122a57de44e`.** The installation/help, Python admission, configured engine and runtime-probe descriptions were reconciled against that source. Root and inherited POSIX installer syntax/help and the module CLI help were checked. The managed installer still calls `.venv/bin/ares` without a matching project-script declaration; the module-based setup remains the documented route.
+
+This documentation review did not run an installation, select an installed release, contact configured MCP servers or execute live compaction. The canonical distribution-test command was attempted but could not start because this review environment lacked a pytest-enabled project virtualenv. Do not treat documentation publication or unmerged PR descriptions as passing runtime evidence.
 
 That source review does **not** establish cross-platform support, public packaging of the Recursive Agent daemon, a managed service installer for every optional service, production readiness, security certification, performance superiority, or universal provider/platform support. Treat those as separate verification projects.
 
