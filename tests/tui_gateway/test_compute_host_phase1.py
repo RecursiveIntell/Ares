@@ -1,4 +1,5 @@
 import io
+from io import open as ioopen
 import json
 import os
 import sys
@@ -167,6 +168,9 @@ def test_mutator_route_table_matches_prd_inventory():
     assert MUTATOR_ROUTE_TABLE == {
         "config.set.model": "run-concurrent",
         "config.set.fast": "idle-gated",
+        "config.set.reasoning": "idle-gated",
+        "session.redirect": "run-concurrent",
+        "session.steer": "run-concurrent",
         "prompt.submit": "turn-path",
         "session.interrupt": "turn-path",
         "reload.mcp": "run-concurrent",
@@ -252,10 +256,42 @@ def test_supervisor_spawn_keeps_final_child_env_sanitized(tmp_path, monkeypatch)
     captured: dict = {}
 
     class _Proc:
-        pid = 4242
-        stdin = io.StringIO()
-        stdout = io.StringIO()
-        stderr = io.StringIO()
+        """Fake Popen honoring the supervisor's transport contract: live pipe
+        stdin (real fd for the nonblocking FIFO path), poll/terminate/wait."""
+
+        def __init__(self):
+            self.pid = 4242
+            r, w = os.pipe()
+            self.stdout = io.StringIO()
+            self.stderr = io.StringIO()
+            self.stdin = ioopen(w, "w")
+            self._r = r
+            self._returned = False
+
+        def poll(self):
+            return None if not self._returned else 0
+
+        def terminate(self):
+            self._close()
+
+        def kill(self):
+            self._close()
+
+        def wait(self, timeout=None):
+            self._close()
+            return 0
+
+        def _close(self):
+            if not self._returned:
+                self._returned = True
+                try:
+                    self.stdin.close()
+                except Exception:
+                    pass
+                try:
+                    os.close(self._r)
+                except Exception:
+                    pass
 
     class _NoopThread:
         def __init__(self, *args, **kwargs):
@@ -274,8 +310,14 @@ def test_supervisor_spawn_keeps_final_child_env_sanitized(tmp_path, monkeypatch)
 
     def _fake_popen(*args, **kwargs):
         captured["env"] = dict(kwargs["env"])
-        supervisor._hello = {"boot_id": "test"}
-        supervisor._hello_event.set()
+        # New-order spawn clears hello AFTER Popen returns; publish the fake
+        # hello on a short timer so it lands after the clear and satisfies
+        # the real wait + validate path.
+        def _publish():
+            time.sleep(0.05)
+            supervisor._hello = {"boot_id": "test"}
+            supervisor._hello_event.set()
+        threading.Timer(0.0, _publish).start()
         return _Proc()
 
     monkeypatch.setattr(supervisor_mod, "_Thread", _NoopThread)
@@ -330,10 +372,42 @@ def test_supervisor_contextless_respawn_uses_captured_profile_owner(
     captured: dict = {}
 
     class _Proc:
-        pid = 4243
-        stdin = io.StringIO()
-        stdout = io.StringIO()
-        stderr = io.StringIO()
+        """Fake Popen honoring the supervisor's transport contract: live pipe
+        stdin (real fd for the nonblocking FIFO path), poll/terminate/wait."""
+
+        def __init__(self):
+            self.pid = 4243
+            r, w = os.pipe()
+            self.stdout = io.StringIO()
+            self.stderr = io.StringIO()
+            self.stdin = ioopen(w, "w")
+            self._r = r
+            self._returned = False
+
+        def poll(self):
+            return None if not self._returned else 0
+
+        def terminate(self):
+            self._close()
+
+        def kill(self):
+            self._close()
+
+        def wait(self, timeout=None):
+            self._close()
+            return 0
+
+        def _close(self):
+            if not self._returned:
+                self._returned = True
+                try:
+                    self.stdin.close()
+                except Exception:
+                    pass
+                try:
+                    os.close(self._r)
+                except Exception:
+                    pass
 
     class _NoopThread:
         def __init__(self, *args, **kwargs):
@@ -356,11 +430,16 @@ def test_supervisor_contextless_respawn_uses_captured_profile_owner(
 
     def _fake_popen(*args, **kwargs):
         captured["env"] = dict(kwargs["env"])
-        supervisor._hello = {
-            "boot_id": "test",
-            "hermes_home": str(target),
-        }
-        supervisor._hello_event.set()
+        # New-order spawn clears hello AFTER Popen returns; publish the fake
+        # hello on a short timer so it lands after the clear.
+        def _publish():
+            time.sleep(0.05)
+            supervisor._hello = {
+                "boot_id": "test",
+                "hermes_home": str(target),
+            }
+            supervisor._hello_event.set()
+        threading.Timer(0.0, _publish).start()
         return _Proc()
 
     monkeypatch.setattr(supervisor_mod, "_Thread", _NoopThread)
@@ -611,11 +690,15 @@ def test_resume_claim_adopts_the_compute_host_owner_when_parent_mirror_is_gone(m
                 "session_id": owner_sid,
                 "session_info": {"model": "owner-model", "provider": "owner-provider"},
                 "running": True,
+                "request_id": "owner-request-1",
+                "host_boot_id": "test",
             }
 
-        def observe_session(self, sid, callback):
+        def observe_session(self, sid, callback, *, request_id, expected_boot_id=None):
             observed["sid"] = sid
             observed["callback"] = callback
+            observed["request_id"] = request_id
+            observed["expected_boot_id"] = expected_boot_id
 
     record = {
         "agent": None,
@@ -709,9 +792,14 @@ def test_isolated_fast_switch_uses_compute_host_owner_not_parent_mirror(monkeypa
     calls = []
 
     class _Supervisor:
-        def control(self, control_sid, *, route_name, payload, wait=True, timeout=30.0):
+        boot_id = "boot-fast-test"
+
+        def control(self, control_sid, *, route_name, payload, wait=True, timeout=30.0,
+                    expected_boot_id=None):
             calls.append((control_sid, route_name, payload))
-            return {"type": "control.ack", "result": {"key": "fast", "value": "normal"},
+            return {"type": "control.ack", "sid": control_sid, "route_name": route_name,
+                    "_host_boot_id": self.boot_id,
+                    "result": {"key": "fast", "value": "normal"},
                     "session_info": {"service_tier": "normal", "fast": False}}
 
     server._sessions[sid] = session
@@ -880,6 +968,7 @@ def test_compute_host_lookup_returns_session_owner_metadata(monkeypatch):
             {
                 "session_id": owner_sid,
                 "running": True,
+                "request_id": None,
                 "session_info": {"model": "owner-model", "provider": "owner-provider"},
             }
         ],

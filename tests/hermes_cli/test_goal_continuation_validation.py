@@ -47,8 +47,12 @@ def test_consumer_revalidates_checkpoint_after_enqueue(pending, field, value):
     manager, db = pending
     identity = _identity(manager.state)
     manager.state.checkpoint[field] = value
-    assert goals.save_goal(manager.session_id, manager.state) is True
+    # Inject damaged durable bytes directly into the disposable DB. The
+    # production writer now rejects same-revision checkpoint replacement;
+    # this test must still reach the consumer's independent validation.
+    db.set_meta(goals._meta_key(manager.session_id), manager.state.to_json())
     before = db.get_meta(goals._meta_key(manager.session_id))
+    assert before == manager.state.to_json()
 
     restarted = goals.GoalManager(manager.session_id)
     assert restarted.start_continuation(**identity) is False
@@ -68,8 +72,10 @@ def test_consumer_rejects_other_invalid_checkpoint_material(pending, damage):
     else:
         manager.state.goal_id = "not-a-uuid"
         manager.state.checkpoint["goal_id"] = "not-a-uuid"
-    assert goals.save_goal(manager.session_id, manager.state) is True
+    # Deliberate storage-corruption fixture, not an authorized goal write.
+    db.set_meta(goals._meta_key(manager.session_id), manager.state.to_json())
     before = db.get_meta(goals._meta_key(manager.session_id))
+    assert before == manager.state.to_json()
 
     restarted = goals.GoalManager(manager.session_id)
     assert restarted.start_continuation(**_identity(restarted.state)) is False
@@ -123,7 +129,11 @@ def test_racing_pause_wins_consumer_cas_and_cached_projection(pending, monkeypat
 
     def pause_then_compare(key, expected, updated):
         other = goals.GoalManager(manager.session_id)
-        assert other.pause("operator pause during consume") is not None
+        # pause itself now uses CAS. Inject one competing owner transition,
+        # not recursive pauses inside every nested conditional write.
+        with monkeypatch.context() as competing:
+            competing.setattr(db, "compare_and_set_meta", original)
+            assert other.pause("operator pause during consume") is not None
         paused_bytes.append(db.get_meta(key))
         return original(key, expected, updated)
 
@@ -188,7 +198,9 @@ def test_newer_checkpoint_wins_consumer_cas(pending, monkeypatch):
 
     def update_then_compare(*args):
         other = goals.GoalManager(manager.session_id)
-        other.checkpoint_recovery("NEW_FAILURE")
+        with monkeypatch.context() as competing:
+            competing.setattr(db, "compare_and_set_meta", compare)
+            other.checkpoint_recovery("NEW_FAILURE")
         return compare(*args)
 
     monkeypatch.setattr(db, "compare_and_set_meta", update_then_compare)

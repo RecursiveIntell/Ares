@@ -2404,6 +2404,9 @@ export interface Translations {
       ultra: string
       updateFailed: string
       fastFailed: string
+      unconfirmed: string
+      unconfirmedObserved: string
+      unconfirmedUnavailable: string
     }
     gatewayMenu: {
       gateway: string

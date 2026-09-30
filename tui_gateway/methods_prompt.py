@@ -357,15 +357,34 @@ def _(rid, params: dict) -> dict:
         )
     isolation_cfg = _load_dashboard_process_isolation_config()
     turn_isolation = _session_uses_compute_host(session, isolation_cfg)
+    if turn_isolation:
+        with session["history_lock"]:
+            if (session.get("_compute_host_active_request_id") or session.get("_stop_pending")
+                    or session.get("_stop_uncertain")):
+                # Goal handoff and uncertain delivery cannot admit a second
+                # execution just because the running projection reads idle.
+                session["running"] = True
     # Re-bind to the current client transport for this request. This keeps
     # streaming events on the active websocket even if an earlier disconnect
     # or fallback moved the session transport to stdio.
     if (t := current_transport()) is not None:
         session["transport"] = t
     input_receipt = None
+    stop_input_deadline = time.monotonic() + 5.0
     while True:
+        if input_receipt is None:
+            stop_error = _wait_for_stop_input_admission(rid, session, deadline=stop_input_deadline)
+            if stop_error is not None:
+                return stop_error
         busy_transport = None
         with session["history_lock"]:
+            if input_receipt is None and (session.get("_stop_pending") or session.get("_stop_uncertain")):
+                # Stop may have begun between the wait and lock acquisition.
+                # Retry outside the lock, before any durable input write.
+                if time.monotonic() >= stop_input_deadline:
+                    return _err(rid, 5032, "Stop settlement timed out; durable input not accepted",
+                                {"durable_input_accepted": False})
+                continue
             # Refusals must precede durable acceptance, including busy ACKs.
             # A watch child's run belongs to its parent, so running alone
             # cannot establish that this session is available for input.
@@ -853,6 +872,11 @@ def _(rid, params: dict) -> dict:
                 ] = survivor_user_row_ids
             if survivor_row_id_map is not None:
                 isolated_response["result"]["survivor_row_id_map"] = survivor_row_id_map
+            return isolated_response
+        delivery = isolated_response["error"].get("data")
+        if isinstance(delivery, dict) and delivery.get("delivery") in {"owner_busy", "uncertain"}:
+            # This request either conflicts with a retained owner or may have
+            # reached the host. An inline retry would create another executor.
             return isolated_response
         logger.warning(
             "compute-host dispatch failed for session %s; falling back inline: %s",

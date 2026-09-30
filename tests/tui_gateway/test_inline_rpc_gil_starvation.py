@@ -152,7 +152,8 @@ def test_slow_history_does_not_block_same_socket_interrupt_admission(server):
         released.set()
 
 
-def test_websocket_reader_reaches_stop_after_a_slow_history_request(monkeypatch, server):
+@pytest.mark.parametrize("slow_method", ["session.history", "config.set", "config.get"])
+def test_websocket_reader_reaches_stop_after_a_slow_request(monkeypatch, server, slow_method):
     """Exercise the real WS receive loop, not only direct dispatch()."""
     import asyncio
 
@@ -165,7 +166,8 @@ def test_websocket_reader_reaches_stop_after_a_slow_history_request(monkeypatch,
         released.wait(timeout=5)
         return server._ok(rid, {"messages": [], "count": 0})
 
-    monkeypatch.setitem(ws_server._methods, "session.history", slow_history)
+    monkeypatch.setitem(ws_server._methods, slow_method, slow_history)
+    monkeypatch.setitem(ws_server._sessions, "fixture-settings", {"session_key": "stored-fixture"})
     monkeypatch.setitem(
         ws_server._methods,
         "session.interrupt",
@@ -194,7 +196,8 @@ def test_websocket_reader_reaches_stop_after_a_slow_history_request(monkeypatch,
         async def receive_text(self):
             self.reads += 1
             if self.reads == 1:
-                return json.dumps({"id": "history", "method": "session.history", "params": {}})
+                return json.dumps({"id": "slow", "method": slow_method, "params": {
+                    "session_id": "fixture-settings", "key": "reasoning", "value": "xhigh"}})
             if self.reads == 2:
                 self.interrupt_read.set()
                 return json.dumps({"id": "stop", "method": "session.interrupt", "params": {}})

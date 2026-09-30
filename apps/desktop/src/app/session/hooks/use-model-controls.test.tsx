@@ -254,7 +254,7 @@ describe('useModelControls', () => {
     })
   })
 
-  it('persists an active primary-session picker change as the profile default via config.set --global', async () => {
+  it('keeps an active primary-session picker change scoped to that session', async () => {
     $activeSessionId.set('session-1')
     const requestGateway = vi.fn(async () => ({ key: 'model', value: 'claude-sonnet-4.6' }) as never)
     let controls!: Controls
@@ -268,13 +268,12 @@ describe('useModelControls', () => {
       })
     ).resolves.toBe(true)
 
-    // The primary main agent's pick IS the profile default, so it persists to
-    // config.yaml (model.default + model.provider) — which is what lets a
-    // chosen subscription provider outrank a leftover OPENAI_API_KEY env var.
+    // Composer intent targets this chat. Profile-default changes belong to
+    // the explicit Settings path, not primary-versus-tile layout identity.
     expect(requestGateway).toHaveBeenCalledWith('config.set', {
       session_id: 'session-1',
       key: 'model',
-      value: 'claude-sonnet-4.6 --provider anthropic --global'
+      value: 'claude-sonnet-4.6 --provider anthropic --session'
     })
     expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
   })
@@ -295,7 +294,7 @@ describe('useModelControls', () => {
     const requestGateway = vi
       .fn()
       .mockRejectedValueOnce(new Error('session not found'))
-      .mockResolvedValueOnce({ key: 'model', scope: 'global', value: 'claude-sonnet-4.6' })
+      .mockResolvedValueOnce({ key: 'model', scope: 'session', value: 'claude-sonnet-4.6' })
 
     const options = {
       queryClient: new QueryClient(),
@@ -311,12 +310,12 @@ describe('useModelControls', () => {
     expect(requestGateway).toHaveBeenNthCalledWith(1, 'config.set', {
       session_id: 'runtime-dead',
       key: 'model',
-      value: 'claude-sonnet-4.6 --provider anthropic --global'
+      value: 'claude-sonnet-4.6 --provider anthropic --session'
     })
     expect(requestGateway).toHaveBeenNthCalledWith(2, 'config.set', {
       session_id: 'runtime-fresh',
       key: 'model',
-      value: 'claude-sonnet-4.6 --provider anthropic --global'
+      value: 'claude-sonnet-4.6 --provider anthropic --session'
     })
     expect(notifyError).not.toHaveBeenCalled()
   })
@@ -429,7 +428,7 @@ describe('useModelControls', () => {
       confirm_expensive_model: true,
       key: 'model',
       session_id: 'session-1',
-      value: 'muse-spark-1.2-contributor --provider opencode-go --global'
+      value: 'muse-spark-1.2-contributor --provider opencode-go --session'
     })
     expect($currentModel.get()).toBe('muse-spark-1.2-contributor')
     expect($currentProvider.get()).toBe('opencode-go')

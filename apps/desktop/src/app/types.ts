@@ -179,6 +179,11 @@ export interface PendingModelSelection {
    * while a genuinely different backend-normalized value can still settle it. */
   previousModel: string
   previousProvider: string
+  /** Renderer-only baseline for explicit rejection after several optimistic
+   * picks. Separate from previous* (which belongs to heartbeat comparison). */
+  rollbackModel?: string
+  rollbackProvider?: string
+  rollbackSource?: '' | 'default' | 'manual'
 }
 
 export interface ClientSessionState {
@@ -194,6 +199,8 @@ export interface ClientSessionState {
   reasoningEffort: string
   serviceTier: string
   fast: boolean
+  /** Renderer-only uncertainty after a lost option acknowledgement/readback. */
+  unconfirmedRuntimeOptions?: ('effort' | 'fast')[]
   yolo: boolean
   personality: string
   busy: boolean

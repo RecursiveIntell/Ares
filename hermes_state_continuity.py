@@ -36,8 +36,15 @@ _ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,191}")
 _SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}")
 
 
+class ContextContinuationError(RuntimeError):
+    """Typed continuity refusal with a stable payload-free code."""
+
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
+
+
 def _valid_context_stop_v2(value) -> bool:
-    """Authenticate the exact V2 Stop control shape before reading a cancelled turn."""
     return (type(value) is dict
         and set(value) == {"schema", "revision", "stopped", "stopped_at", "input_watermark", "input_sequence"}
         and value["schema"] == "SessionDBContextControlV2" and value["stopped"] is True
@@ -45,14 +52,6 @@ def _valid_context_stop_v2(value) -> bool:
         and type(value["input_watermark"]) is int and value["input_watermark"] >= 0
         and type(value["input_sequence"]) is int and value["input_sequence"] >= 0
         and type(value["stopped_at"]) in (int, float) and math.isfinite(value["stopped_at"]))
-
-
-class ContextContinuationError(RuntimeError):
-    """Typed continuity refusal with a stable payload-free code."""
-
-    def __init__(self, code: str):
-        self.code = code
-        super().__init__(code)
 
 
 def _identity(value: str, code: str) -> str:
@@ -1162,6 +1161,24 @@ class SessionContextContinuityMixin(SessionContextAuthorityMixin):
             safe_checkpoints,
         )
 
+    def read_context_stop(self, session_id):
+        """Read the canonical Stop control and its conversation scope.
+
+        This is evidence readback, not a new Stop or an execution grant.
+        """
+        with self._read_ctx() as conn:
+            conn.execute("SAVEPOINT context_stop_read")
+            try:
+                root = str(self._session_turn_lease_key_on_conn(conn, session_id))
+                row = conn.execute("SELECT value FROM state_meta WHERE key=?",
+                    ("context-control:" + root,)).fetchone()
+                if row is None:
+                    return None
+                return {"conversation_root": root, "control": _strict_json(row[0])}
+            finally:
+                conn.execute("ROLLBACK TO context_stop_read")
+                conn.execute("RELEASE context_stop_read")
+
     def record_context_stop(self, session_id):
         """Linearize an explicit user stop with the existing dispatch owner."""
         def write(conn):
@@ -1177,6 +1194,7 @@ class SessionContextContinuityMixin(SessionContextAuthorityMixin):
                      "input_sequence": sequence}
             conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                          (key, _canonical(value)))
+            self._cancel_undispatched_input_turn_on_conn(conn, session_id, value)
             return value
         return self._execute_write(write)
 

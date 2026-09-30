@@ -762,6 +762,25 @@ _DEFERRED_GOAL_WRITES: Dict[Tuple[str, str], Dict[str, Any]] = {}
 _DEFERRED_WRITES_LOCK = threading.Lock()
 
 
+def _goal_write_conflicts(current: "GoalState", proposal: "GoalState", *, replacement_bound: bool = False) -> bool:
+    """A cached/deferred proposal cannot revoke a newer canonical decision."""
+    if current.goal_id != proposal.goal_id:
+        return not replacement_bound
+    if current.checkpoint_revision > proposal.checkpoint_revision:
+        return True
+    if current.status == "cleared" and proposal.status != "cleared":
+        return True
+    if current.status == "done" and proposal.status != "done":
+        return not (replacement_bound and proposal.status == "cleared")
+    # Genuine resume belongs to SessionDB.resume_context_goal, not an active
+    # flag or USER_RESUMED string carried by an old manager/deferred write.
+    if current.status == "paused" and proposal.status == "active":
+        return True
+    if current.checkpoint_revision == proposal.checkpoint_revision and current.checkpoint != proposal.checkpoint:
+        return True
+    return False
+
+
 def _defer_goal_write(session_id: str, state: "GoalState") -> None:
     """Remember a goal write that could not be persisted yet.
 
@@ -799,7 +818,18 @@ def _flush_deferred_goal_writes(home: str, db: Any) -> None:
         pending = {k: _DEFERRED_GOAL_WRITES[k] for k in keys}
     for (_home, session_id), entry in pending.items():
         try:
-            db.set_meta(_meta_key(session_id), entry["payload"])
+            key = _meta_key(session_id)
+            current_raw = db.get_meta(key)
+            if current_raw:
+                current = GoalState.from_json(current_raw)
+                deferred = GoalState.from_json(entry["payload"])
+                if _goal_write_conflicts(current, deferred):
+                    with _DEFERRED_WRITES_LOCK:
+                        if _DEFERRED_GOAL_WRITES.get((_home, session_id)) is entry:
+                            _DEFERRED_GOAL_WRITES.pop((_home, session_id), None)
+                    continue
+            if current_raw != entry["payload"] and not db.compare_and_set_meta(key, current_raw, entry["payload"]):
+                continue
         except Exception as exc:
             # Keep the entry for a later retry. It may have been replaced by a
             # newer state while this flush was in flight, so never delete or
@@ -1007,7 +1037,7 @@ def load_goal(session_id: str) -> Optional[GoalState]:
         return None
 
 
-def save_goal(session_id: str, state: GoalState) -> bool:
+def save_goal(session_id: str, state: GoalState, expected_raw: Optional[str] = None) -> bool:
     """Persist a goal and report durability failures to the owner."""
     if not session_id:
         logger.error("GoalManager: refusing to persist goal without session id")
@@ -1020,12 +1050,26 @@ def save_goal(session_id: str, state: GoalState) -> bool:
         _defer_goal_write(session_id, state)
         logger.error("GoalManager: SessionDB unavailable; goal state is not durable")
         return False
+    payload = None
     try:
-        db.set_meta(_meta_key(session_id), state.to_json())
-        return True
+        payload = state.to_json()
+        key = _meta_key(session_id)
+        current_raw = db.get_meta(key)
+        if current_raw == payload:
+            return True
+        if current_raw and _goal_write_conflicts(GoalState.from_json(current_raw), state,
+                replacement_bound=expected_raw is not None and expected_raw == current_raw):
+            return False
+        return bool(db.compare_and_set_meta(key, expected_raw if expected_raw is not None else current_raw, payload))
     except Exception as exc:
+        # A write may have committed before its acknowledgement failed.
+        try:
+            if payload is not None and db.get_meta(_meta_key(session_id)) == payload:
+                return True
+        except Exception:
+            pass
         _defer_goal_write(session_id, state)
-        logger.error("GoalManager: set_meta failed; goal state is not durable: %s", exc)
+        logger.error("GoalManager: conditional write failed; goal state is not durable: %s", exc)
         return False
 
 
@@ -1059,16 +1103,8 @@ def list_persisted_goals() -> List[Tuple[str, GoalState]]:
 
 
 def clear_goal(session_id: str) -> bool:
-    """Mark a goal cleared in the DB (preserved for audit)."""
-    state = load_goal(session_id)
-    if state is None:
-        return False
-    state.status = "cleared"
-    state.outcome = CANCELLED
-    state.last_stop_reason = "USER_CLEARED"
-    state.next_action = None
-    state.continuation_pending = False
-    return save_goal(session_id, state)
+    """Mark this goal cleared through the canonical conditional transition."""
+    return GoalManager(session_id).clear()
 
 
 def goal_session_migration(old_session_id, new_session_id, parent_raw, child_raw, *, reason=""):
@@ -1856,8 +1892,13 @@ class GoalManager:
             last_turn_at=0.0,
             contract=contract if contract is not None else GoalContract(),
         )
+        db = _get_session_db()
+        if db is None:
+            raise RuntimeError("goal state could not be persisted: storage unavailable")
+        expected_raw = db.get_meta(_meta_key(self.session_id))
+        if not save_goal(self.session_id, state, expected_raw):
+            raise RuntimeError("goal state could not be persisted; refresh before retrying")
         self._state = state
-        save_goal(self.session_id, state)
         return state
 
     def set_contract(self, contract: GoalContract) -> Optional[GoalState]:
@@ -1905,7 +1946,7 @@ class GoalManager:
         self._state.waiting_until = 0.0
         self._state.waiting_reason = None
         self._state.waiting_since = 0.0
-        if not save_goal(self.session_id, self._state):
+        if not save_goal(self.session_id, self._state, before):
             self._state = GoalState.from_json(before)
             return None
         return self._state
@@ -1958,16 +1999,34 @@ class GoalManager:
                 logger.error("Goal resume remains unresolved; stale manager writes are disabled", exc_info=True)
                 return None
 
-    def clear(self) -> None:
+    def clear(self) -> bool:
+        """Clear this goal identity, never a concurrently installed replacement."""
         if self._state is None:
-            return
-        self._state.status = "cleared"
-        self._state.outcome = CANCELLED
-        self._state.last_stop_reason = "USER_CLEARED"
-        self._state.next_action = None
-        self._state.continuation_pending = False
-        save_goal(self.session_id, self._state)
-        self._state = None
+            return False
+        goal_id = self._state.goal_id
+        db = _get_session_db()
+        if db is None:
+            return False
+        for _attempt in range(2):
+            try:
+                raw = db.get_meta(_meta_key(self.session_id))
+                current = GoalState.from_json(raw) if raw else None
+            except Exception:
+                return False
+            if current is None or current.goal_id != goal_id:
+                return False
+            if current.status == "cleared":
+                self._state = None
+                return True
+            current.status = "cleared"
+            current.outcome = CANCELLED
+            current.last_stop_reason = "USER_CLEARED"
+            current.next_action = None
+            current.continuation_pending = False
+            if save_goal(self.session_id, current, raw):
+                self._state = None
+                return True
+        return False
 
     def validate_checkpoint(self) -> Tuple[bool, str]:
         return self._validate_checkpoint(self._state)

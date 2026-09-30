@@ -1,5 +1,6 @@
 """Gateway /loop command tests — dispatch, routing capture, mid-run guard."""
 
+import asyncio
 import logging
 import time
 from unittest.mock import AsyncMock, Mock
@@ -108,21 +109,13 @@ async def test_gateway_loop_goal_note_when_goal_active(loop_env):
 
 
 @pytest.mark.asyncio
-async def test_gateway_loop_goal_note_survives_slow_db_init(tmp_path, monkeypatch):
-    """A slow state.db init must not swallow the active-/goal note.
+async def test_gateway_loop_goal_note_after_explicit_retry_of_slow_db_init(tmp_path, monkeypatch):
+    """No active goal is reported before durability; an explicit retry works.
 
-    Regression (CI run 33709241320, slice 11/12): on a loaded runner the
-    goals SessionDB bootstrap outlived its grace window, so
-    ``GoalManager.set()`` dropped the write. The later ``/loop`` warm-up
-    then found no persisted goal and the reply omitted the "an active
-    /goal is driving this session" note -- the reply silently disagreed
-    with the goal the user had just set. The write is now deferred and
-    flushed once the DB lands.
-
-    The ordering matters: the goal is set BEFORE anything warms the DB,
-    so the write hits a cold cache with no bootstrap in flight. That is
-    what expired the window in CI, and it is why widening the window
-    alone was never the fix.
+    Goal creation now requires a successful conditional write. A cold DB
+    timeout must not publish an active projection or silently activate later.
+    Once storage is available, the explicit retry must persist the goal and
+    the loop reply must agree with that canonical state.
     """
     import hermes_state
 
@@ -150,7 +143,16 @@ async def test_gateway_loop_goal_note_survives_slow_db_init(tmp_path, monkeypatc
         # Cold cache + slow init: this write cannot land inside the window.
         from hermes_cli.goals import GoalManager
 
-        GoalManager(session_id="sid-gateway-loop").set("finish the migration")
+        manager = GoalManager(session_id="sid-gateway-loop")
+        with pytest.raises(RuntimeError, match="storage unavailable"):
+            manager.set("finish the migration")
+        assert manager.state is None
+
+        db = await asyncio.to_thread(goals._get_session_db)
+        assert db is not None
+        assert goals.load_goal("sid-gateway-loop") is None
+        assert not goals._DEFERRED_GOAL_WRITES
+        manager.set("finish the migration")
 
         runner = _make_runner()
         response = await GatewayRunner._handle_loop_command(

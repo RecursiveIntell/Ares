@@ -1127,6 +1127,39 @@ export const setCurrentModelSource = (source: ComposerModelSource) => {
 // unchanged (value comparisons alone cannot detect re-selecting the same row).
 let composerSelectionGeneration = 0
 
+// Runtime option writes can be initiated by several mounted picker surfaces.
+// Keep their intent generations beside the session-owned composer state so a
+// stale callback from another hook instance cannot reclaim the same target.
+let runtimeOptionIntentSequence = 0
+const runtimeOptionIntents = new Map<string, number>()
+
+export function beginRuntimeOptionIntent(target: string, dimensions: readonly string[]): Record<string, number> {
+  const tokens: Record<string, number> = {}
+
+  for (const dimension of dimensions) {
+    const key = JSON.stringify([target, dimension])
+    const token = ++runtimeOptionIntentSequence
+    runtimeOptionIntents.set(key, token)
+    tokens[dimension] = token
+  }
+
+  // Keep this feature-local coordination bounded. Tokens are globally unique,
+  // so an evicted target can never accidentally validate an old callback.
+  while (runtimeOptionIntents.size > 2048) {
+    const oldest = runtimeOptionIntents.keys().next().value
+
+    if (oldest !== undefined) {
+      runtimeOptionIntents.delete(oldest)
+    }
+  }
+
+  return tokens
+}
+
+export function ownsRuntimeOptionIntent(target: string, dimension: string, token: number): boolean {
+  return runtimeOptionIntents.get(JSON.stringify([target, dimension])) === token
+}
+
 export const getComposerSelectionGeneration = (): number => composerSelectionGeneration
 
 export const markComposerSelectionManual = (): void => {
