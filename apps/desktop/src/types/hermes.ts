@@ -698,6 +698,7 @@ export interface SessionRuntimeInfo {
   fast?: boolean
   install_warning?: string
   model?: string
+  model_control_revision?: number
   personality?: string
   provider?: string
   reasoning_effort?: string

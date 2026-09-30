@@ -86,6 +86,7 @@ class TestGuardedPickAsksBeforeStashing:
         )
         assert result["confirm_message"].strip()
         assert result["deferred"] is False
+        assert "model_control_revision" not in result
 
     def test_leaves_the_session_untouched(self, running_session):
         _config_set_model(GUARDED_MODEL)
@@ -107,9 +108,11 @@ class TestGuardedPickAsksBeforeStashing:
         result = resp["result"]
         assert result["deferred"] is True
         assert result["confirm_required"] is False
+        assert isinstance(result["model_control_revision"], int)
 
         pending = running_session["pending_model_switch"]
         assert pending["raw"] == GUARDED_MODEL
+        assert pending["model_control_revision"] == result["model_control_revision"]
         assert pending["confirm_expensive_model"] is True, (
             "the ack must survive into the stash or _apply_pending_model_switch "
             "re-runs the guard at turn start and drops the confirmed pick"
@@ -126,6 +129,7 @@ class TestUnguardedPickStillDefers:
         assert result["confirm_required"] is False
         assert result["confirm_message"] == ""
         assert result["value"] == UNGUARDED_MODEL
+        assert isinstance(result["model_control_revision"], int)
 
     def test_stashes_the_pick_for_the_next_turn(self, running_session):
         _config_set_model(UNGUARDED_MODEL)
@@ -133,6 +137,9 @@ class TestUnguardedPickStillDefers:
         pending = running_session["pending_model_switch"]
         assert pending["raw"] == UNGUARDED_MODEL
         assert pending["confirm_expensive_model"] is False
+        assert pending["model_control_revision"] == server._session_info(running_session["agent"], running_session)[
+            "model_control_revision"
+        ]
 
     def test_explicit_provider_is_still_recorded_for_display(self, running_session):
         _config_set_model(f"{UNGUARDED_MODEL} --provider anthropic")
@@ -161,6 +168,54 @@ class TestGuardFailureIsNotFatal:
 
         assert result["deferred"] is True
         assert running_session["pending_model_switch"]["raw"] == GUARDED_MODEL
+
+
+@pytest.mark.parametrize("failure", ["error", "confirmation"])
+def test_session_model_mutations_serialize_and_never_reuse_failed_revisions(monkeypatch, failure):
+    first_entered, release_first, second_entered = (threading.Event() for _ in range(3))
+    ready = threading.Event()
+    ready.set()
+    record = _session(agent=types.SimpleNamespace(model="initial", provider="test"), agent_ready=ready)
+    server._sessions["sid"] = record
+    responses = {}
+
+    def controlled_apply(_sid, session, value, **_kwargs):
+        if value.startswith("first"):
+            first_entered.set()
+            assert release_first.wait(timeout=3.0)
+            if failure == "error":
+                raise RuntimeError("first switch refused")
+            return {"value": "first", "scope": "session", "confirm_required": True, "warning": "confirm first", "confirm_message": "confirm first"}
+        second_entered.set()
+        session["agent"].model = "second"
+        return {"value": "second", "scope": "session", "confirm_required": False, "warning": "", "confirm_message": ""}
+
+    monkeypatch.setattr(server, "_apply_model_switch", controlled_apply)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_: None)
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_: False)
+    first = threading.Thread(target=lambda: responses.update(first=_config_set_model("first --session")))
+    second = threading.Thread(target=lambda: responses.update(second=_config_set_model("second --session")))
+    try:
+        first.start()
+        assert first_entered.wait(timeout=1.0)
+        second.start()
+        assert not second_entered.wait(timeout=0.1)
+        release_first.set()
+        first.join(timeout=2.0)
+        second.join(timeout=2.0)
+        assert not first.is_alive() and not second.is_alive()
+        assert not responses["second"].get("error")
+        revision = responses["second"]["result"]["model_control_revision"]
+        assert revision >= 2
+        assert record["_model_control_revision"] == revision
+        assert server._session_info(record["agent"], record)["model_control_revision"] == revision
+        assert record["agent"].model == "second"
+    finally:
+        release_first.set()
+        first.join(timeout=2.0)
+        if second.ident is not None:
+            second.join(timeout=2.0)
+        server._sessions.pop("sid", None)
 
 
 class TestHelperContract:

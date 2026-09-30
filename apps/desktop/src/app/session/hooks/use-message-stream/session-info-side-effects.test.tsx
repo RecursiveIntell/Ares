@@ -109,26 +109,234 @@ describe('session.info model-options invalidation gating', () => {
 
   it('preserves a pending model pick when a delayed heartbeat repeats the previous model', () => {
     mountStream()
-    sessionStates!.set(
-      ACTIVE_SID,
-      {
-        ...createClientSessionState('stored-active'),
+    sessionStates!.set(ACTIVE_SID, {
+      ...createClientSessionState('stored-active'),
+      model: 'model-b',
+      provider: 'provider-b',
+      pendingModelSelection: {
         model: 'model-b',
         provider: 'provider-b',
-        pendingModelSelection: {
-          model: 'model-b',
-          provider: 'provider-b',
-          previousModel: 'model-a',
-          previousProvider: 'provider-a'
-        }
-      } as ClientSessionState
-    )
+        previousModel: 'model-a',
+        previousProvider: 'provider-a'
+      }
+    } as ClientSessionState)
 
     // This event was queued before the local config.set selection. It must not
     // repaint the picker back to A merely because it arrives later.
     sessionInfo(ACTIVE_SID, { model: 'model-a', provider: 'provider-a', running: true })
 
     expect(sessionStates!.get(ACTIVE_SID)).toMatchObject({ model: 'model-b', provider: 'provider-b' })
+  })
+
+  it.each([
+    { model: 'model-a', provider: 'provider-a' },
+    { model: 'model-b', provider: 'provider-b' },
+    { model: 'model-c', provider: 'provider-c' }
+  ])('keeps the latest choice when an earlier selection heartbeat arrives ($model)', stale => {
+    mountStream()
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
+    sessionStates!.set(ACTIVE_SID, {
+      ...createClientSessionState('stored-active'),
+      model: 'model-d',
+      provider: 'provider-d',
+      pendingModelSelection: {
+        model: 'model-d',
+        provider: 'provider-d',
+        intentToken: 4,
+        acknowledged: true,
+        modelControlRevision: 4,
+        previousModel: 'model-c',
+        previousProvider: 'provider-c',
+        rollbackModel: 'model-a',
+        rollbackProvider: 'provider-a',
+        supersededSelections: [
+          { model: 'model-a', provider: 'provider-a' },
+          { model: 'model-b', provider: 'provider-b' },
+          { model: 'model-c', provider: 'provider-c' }
+        ]
+      }
+    } as ClientSessionState)
+
+    sessionInfo(ACTIVE_SID, { ...stale, running: true })
+
+    expect(sessionStates!.get(ACTIVE_SID)).toMatchObject({
+      model: 'model-d',
+      provider: 'provider-d',
+      busy: true,
+      pendingModelSelection: { model: 'model-d', provider: 'provider-d' }
+    })
+    expect(invalidate).not.toHaveBeenCalled()
+    sessionInfo(ACTIVE_SID, { model: 'model-d', provider: 'provider-d', model_control_revision: 4, running: false })
+    expect(sessionStates!.get(ACTIVE_SID)).toMatchObject({
+      model: 'model-d',
+      provider: 'provider-d',
+      pendingModelSelection: null
+    })
+  })
+
+  it('ignores a partial old-provider heartbeat without mixing it into the selected pair', () => {
+    mountStream()
+    sessionStates!.set(ACTIVE_SID, {
+      ...createClientSessionState('stored-active'),
+      model: 'model-c',
+      provider: 'provider-c',
+      pendingModelSelection: {
+        model: 'model-c',
+        provider: 'provider-c',
+        previousModel: 'model-b',
+        previousProvider: 'provider-b',
+        rollbackModel: 'model-a',
+        rollbackProvider: 'provider-a'
+      }
+    } as ClientSessionState)
+    sessionInfo(ACTIVE_SID, { provider: 'provider-a' })
+    expect(sessionStates!.get(ACTIVE_SID)).toMatchObject({
+      model: 'model-c',
+      provider: 'provider-c',
+      pendingModelSelection: { model: 'model-c', provider: 'provider-c' }
+    })
+  })
+
+  it('does not let older metadata repaint after the latest revision settles', () => {
+    mountStream()
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
+    sessionStates!.set(ACTIVE_SID, {
+      ...createClientSessionState('stored-active'),
+      model: 'model-c',
+      provider: 'provider-p',
+      pendingModelSelection: {
+        model: 'model-c',
+        provider: 'provider-p',
+        intentToken: 3,
+        acknowledged: true,
+        modelControlRevision: 3,
+        previousModel: 'model-b',
+        previousProvider: 'provider-p',
+        rollbackModel: 'model-a',
+        rollbackProvider: 'provider-p',
+        supersededSelections: [
+          { model: 'model-a', provider: 'provider-p' },
+          { model: 'model-b', provider: 'provider-p' }
+        ]
+      }
+    } as ClientSessionState)
+
+    sessionInfo(ACTIVE_SID, {
+      model: 'model-c',
+      provider: 'provider-p',
+      model_control_revision: 3,
+      running: true
+    })
+    expect(sessionStates!.get(ACTIVE_SID)).toMatchObject({
+      model: 'model-c',
+      provider: 'provider-p',
+      busy: true,
+      pendingModelSelection: null,
+      modelSelectionFence: { model: 'model-c', provider: 'provider-p', modelControlRevision: 3 }
+    })
+
+    sessionInfo(ACTIVE_SID, {
+      model: 'model-b',
+      provider: 'provider-p',
+      model_control_revision: 2,
+      running: false
+    })
+    expect(sessionStates!.get(ACTIVE_SID)).toMatchObject({
+      model: 'model-c',
+      provider: 'provider-p',
+      busy: false,
+      pendingModelSelection: null,
+      modelSelectionFence: { model: 'model-c', provider: 'provider-p', modelControlRevision: 3 }
+    })
+    expect(invalidate).not.toHaveBeenCalled()
+  })
+
+  it('keeps A->B->A pending until the exact latest generation is acknowledged', () => {
+    mountStream()
+    sessionStates!.set(ACTIVE_SID, {
+      ...createClientSessionState('stored-active'),
+      model: 'model-a',
+      provider: 'provider-p',
+      pendingModelSelection: {
+        model: 'model-a',
+        provider: 'provider-p',
+        intentToken: 3,
+        previousModel: 'model-b',
+        previousProvider: 'provider-p',
+        rollbackModel: 'model-a',
+        rollbackProvider: 'provider-p',
+        supersededSelections: [
+          { model: 'model-a', provider: 'provider-p' },
+          { model: 'model-b', provider: 'provider-p' }
+        ]
+      }
+    } as ClientSessionState)
+
+    sessionInfo(ACTIVE_SID, { model: 'model-a', provider: 'provider-p', model_control_revision: 1 })
+    expect(sessionStates!.get(ACTIVE_SID)).toMatchObject({
+      model: 'model-a',
+      provider: 'provider-p',
+      pendingModelSelection: {
+        model: 'model-a',
+        provider: 'provider-p',
+        observedModelControlRevision: 1
+      }
+    })
+
+    sessionStates!.set(ACTIVE_SID, {
+      ...sessionStates!.get(ACTIVE_SID)!,
+      pendingModelSelection: {
+        ...sessionStates!.get(ACTIVE_SID)!.pendingModelSelection!,
+        acknowledged: true,
+        modelControlRevision: 3
+      }
+    })
+    sessionInfo(ACTIVE_SID, { model: 'model-a', provider: 'provider-p', model_control_revision: 3 })
+    expect(sessionStates!.get(ACTIVE_SID)).toMatchObject({
+      model: 'model-a',
+      provider: 'provider-p',
+      pendingModelSelection: null,
+      modelSelectionFence: { model: 'model-a', provider: 'provider-p', modelControlRevision: 3 }
+    })
+
+    sessionInfo(ACTIVE_SID, { model: 'model-b', provider: 'provider-p', model_control_revision: 2 })
+    expect(sessionStates!.get(ACTIVE_SID)).toMatchObject({
+      model: 'model-a',
+      provider: 'provider-p',
+      pendingModelSelection: null
+    })
+  })
+
+  it('does not settle a same-provider model switch from provider-only metadata', () => {
+    mountStream()
+    sessionStates!.set(ACTIVE_SID, {
+      ...createClientSessionState('stored-active'),
+      model: 'model-c',
+      provider: 'provider-p',
+      pendingModelSelection: {
+        model: 'model-c',
+        provider: 'provider-p',
+        intentToken: 2,
+        previousModel: 'model-b',
+        previousProvider: 'provider-p',
+        rollbackModel: 'model-b',
+        rollbackProvider: 'provider-p'
+      }
+    } as ClientSessionState)
+
+    sessionInfo(ACTIVE_SID, { provider: 'provider-p', model_control_revision: 2 })
+    expect(sessionStates!.get(ACTIVE_SID)).toMatchObject({
+      model: 'model-c',
+      provider: 'provider-p',
+      pendingModelSelection: { model: 'model-c', provider: 'provider-p' }
+    })
+
+    sessionInfo(ACTIVE_SID, { model: 'model-b', provider: 'provider-p', model_control_revision: 1 })
+    expect(sessionStates!.get(ACTIVE_SID)).toMatchObject({
+      model: 'model-c',
+      provider: 'provider-p',
+      pendingModelSelection: { model: 'model-c', provider: 'provider-p' }
+    })
   })
 
   it('invalidates when the session model actually changes', () => {

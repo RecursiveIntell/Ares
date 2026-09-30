@@ -2724,6 +2724,38 @@ def _metadata_mirror(session: dict | None) -> dict:
     return mirror if isinstance(mirror, dict) else {}
 
 
+def _next_model_control_revision(session: dict | None) -> int:
+    """Mint a session-owned model mutation revision."""
+    if not isinstance(session, dict):
+        return 0
+    with session.setdefault("_model_control_lock", threading.RLock()):
+        previous = session.get("_model_control_revision", 0)
+        if type(previous) is not int or previous < 0:
+            raise ValueError("invalid session model-control revision")
+        revision = previous + 1
+        session["_model_control_revision"] = revision
+        return revision
+
+
+def _serialize_session_model_controls(handler):
+    """One model mutation owner per session; other sessions remain independent."""
+    from functools import wraps
+
+    @wraps(handler)
+    def serialized(rid, params):
+        sid = params.get("session_id")
+        session = _sessions.get(sid) if sid else None
+        if params.get("key") != "model" or session is None:
+            return handler(rid, params)
+        with session.setdefault("_model_control_lock", threading.RLock()):
+            with _sessions_lock:
+                if _sessions.get(sid) is not session:
+                    return _err(rid, 4001, "session replaced before model change")
+            return handler(rid, params)
+
+    return serialized
+
+
 def _apply_compute_host_metadata_mirror(session: dict, frame: dict | None) -> None:
     """Mirror host-owned session metadata in the serving process.
 
@@ -2757,6 +2789,11 @@ def _apply_compute_host_metadata_mirror(session: dict, frame: dict | None) -> No
         mirror = dict(_metadata_mirror(session))
         mirror.update(info)
         session["_metadata_mirror"] = mirror
+        if isinstance(info.get("model_control_revision"), int):
+            session["_model_control_revision"] = max(
+                int(session.get("_model_control_revision") or 0),
+                int(info["model_control_revision"]),
+            )
         session["_metadata_mirror_updated_at"] = time.time()
 
 
@@ -3309,12 +3346,20 @@ def _wait_agent_for_prompt(session: dict, rid: str, sid: str) -> dict | None:
     caller's cancel branch owns that messaging), an ``_err`` dict otherwise.
     """
     ready = session.get("agent_ready")
-    if ready is None:
+    history_ready = session.get("resume_history_ready")
+    gates = [gate for gate in (ready, history_ready) if gate is not None]
+    if not gates:
         return None
     start = time.monotonic()
     cap = _agent_build_wait_cap()
     notified_slow = False
-    while not ready.wait(timeout=_AGENT_BUILD_WAIT_SLICE):
+    while not all(gate.is_set() for gate in gates):
+        wait_gate = next((gate for gate in gates if not gate.is_set()), None)
+        if wait_gate is None:
+            break
+        wait_gate.wait(timeout=_AGENT_BUILD_WAIT_SLICE)
+        if all(gate.is_set() for gate in gates):
+            break
         with session["history_lock"]:
             cancelled = session.get("_turn_cancel_requested") or not session.get(
                 "running"
@@ -3335,6 +3380,7 @@ def _wait_agent_for_prompt(session: dict, rid: str, sid: str) -> dict | None:
         if (
             build_thread is not None
             and not build_thread.is_alive()
+            and ready is not None
             and not ready.is_set()
         ):
             # _build's ``finally`` guarantees ready.set(); a dead thread with
@@ -3369,7 +3415,7 @@ def _wait_agent_for_prompt(session: dict, rid: str, sid: str) -> dict | None:
             )
     if notified_slow:
         _emit("notification.clear", sid, {"key": _AGENT_BUILD_SLOW_NOTICE_KEY})
-    err = session.get("agent_error")
+    err = session.get("resume_history_error") or session.get("agent_error")
     return _err(rid, 5032, err) if err else None
 
 
@@ -3380,12 +3426,11 @@ RESUME_HISTORY_GRACE_S = 120.0
 def _await_resume_history(current: dict, sid: str, key: str) -> str:
     """Wait for cold-resume history without holding agent init hostage.
 
-    The transcript is only display state; agent construction needs the
-    session's context/db/secrets/MCP, not the history rows. A slow hydration
-    (SQLite contention while several sessions resume at once) previously
-    killed agent init with TimeoutError after 300s. Now: bounded wait, a
-    visible slow+grace window, then degrade to a live agent with an empty
-    history — late hydration still fills in under history_lock.
+    Agent construction may proceed after the grace window, but history is
+    also model context: timeout never releases resume_history_ready. Prompt
+    admission independently waits for actual hydration, with cancellation
+    and the existing finite build-wait cap. Late hydration cannot race a
+    provider turn because no such turn is admitted before it completes.
     Returns "ready" | "degraded" | "vanish" (session replaced mid-wait).
     """
     history_ready = current.get("resume_history_ready")
@@ -3416,12 +3461,10 @@ def _await_resume_history(current: dict, sid: str, key: str) -> str:
         "session.resume_progress",
         sid,
         {"phase": "history", "status": "degraded_timeout", "stage": stage,
-         "message": f"history still loading ({stage}); agent started without it"},
+         "message": f"history still loading ({stage}); turns wait for complete history"},
     )
-    with current["history_lock"]:
-        current["resume_hydrating"] = False
-        current.setdefault("history", [])
-    history_ready.set()
+    # Only the hydration owner may publish history-ready. Agent-ready alone
+    # is not permission to execute a resumed conversation without its context.
     return "degraded"
 
 
@@ -6975,6 +7018,11 @@ def _apply_pending_model_switch(sid: str, session: dict) -> None:
     pending = session.pop("pending_model_switch", None)
     if not pending or session.get("agent") is None:
         return
+    if isinstance(pending.get("model_control_revision"), int):
+        session["_model_control_revision"] = max(
+            int(session.get("_model_control_revision") or 0),
+            int(pending["model_control_revision"]),
+        )
     try:
         result = _apply_model_switch(
             sid,
@@ -7513,6 +7561,11 @@ def _session_info(agent, session: dict | None = None) -> dict:
         "session_id": next((sid for sid, record in _sessions.items() if record is session), ""),
         "model": effective_model,
         "provider": effective_provider,
+        "model_control_revision": int(
+            (session or {}).get("_model_control_revision")
+            or mirror.get("model_control_revision")
+            or 0
+        ),
         "model_ready": model_ready,
         "reasoning_effort": reasoning_effort,
         "service_tier": service_tier,
@@ -12813,6 +12866,37 @@ def _run_prompt_submit(
     queued_prompt_generation: int | None = None,
     context_input_event_id: str | None = None,
 ) -> bool:
+    # Direct compute-host/queue/continuation callers must respect the same
+    # history gate as deferred prompt.submit before starting any provider turn.
+    history_ready = session.get("resume_history_ready")
+    if history_ready is not None and (not history_ready.is_set() or session.get("resume_history_error")):
+        with session["history_lock"]:
+            if (not session.get("running") or session.get("_closing")
+                    or session.get("_turn_cancel_requested")
+                    or (queued_prompt_generation is not None
+                        and int(session.get("_queued_prompt_generation", 0)) != queued_prompt_generation)):
+                session["running"] = False
+                return False
+            inflight = session.get("inflight_turn")
+            if not isinstance(inflight, dict) or inflight.get("status") == "error":
+                # Retain the accepted input on a hydration error without adding
+                # it to model history or admitting a provider turn.
+                _start_inflight_turn(session, text)
+        error = _wait_agent_for_prompt(session, rid, sid)
+        if error is not None:
+            _emit_terminal_turn_error(
+                sid, session, error["error"]["message"],
+                error_surface={"layer": "runtime", "code": "resume_history_unavailable", "retryable": True},
+            )
+            with session["history_lock"]:
+                session["running"] = False
+            return False
+        if not history_ready.is_set():
+            # None also means the wait was cancelled, not that the history
+            # became available. Never turn cancellation into an admission.
+            with session["history_lock"]:
+                session["running"] = False
+            return False
     with session["history_lock"]:
         if session.get("_closing") or session.get("_turn_cancel_requested"):
             session["running"] = False
@@ -14198,6 +14282,7 @@ def _respond(rid, params, key, *, allow_expired=False):
 # opt/model-resolution-core PR touches its body; move it to methods_config.py
 # in a follow-up once that PR lands.
 @method("config.set")
+@_serialize_session_model_controls
 def _(rid, params: dict) -> dict:
     key, value = params.get("key", ""), params.get("value", "")
     requested_session_id = params.get("session_id")
@@ -14254,6 +14339,11 @@ def _(rid, params: dict) -> dict:
                         "confirm_required": result.get("confirm_required", False),
                         "confirm_message": result.get("confirm_message", ""),
                         "scope": result.get("scope", "session"),
+                        **(
+                            {"model_control_revision": result["model_control_revision"]}
+                            if isinstance(result.get("model_control_revision"), int)
+                            else {}
+                        ),
                         **({"deferred": result["deferred"]} if "deferred" in result else {}),
                     },
                 )
@@ -14318,9 +14408,11 @@ def _(rid, params: dict) -> dict:
                                     "deferred": False,
                                 },
                             )
+                    revision = _next_model_control_revision(session)
                     session["pending_model_switch"] = {
                         "raw": value,
                         "confirm_expensive_model": confirmed,
+                        "model_control_revision": revision,
                         # The resolved model/provider the next turn will run on.
                         # _session_info reports these while the switch is pending
                         # so the end-of-turn settle keeps showing the user's pick
@@ -14338,6 +14430,7 @@ def _(rid, params: dict) -> dict:
                             "confirm_message": "",
                             "scope": "session",
                             "deferred": True,
+                            "model_control_revision": revision,
                         },
                     )
                 parsed_flags = parse_model_switch_args(value)
@@ -14350,6 +14443,10 @@ def _(rid, params: dict) -> dict:
                         return init_err
                     if session.get("agent") is None:
                         return _err(rid, 5032, "agent initialization failed")
+                # Revisions are never reused, including refused attempts. A
+                # gap is harmless; rewinding can relabel buffered metadata as
+                # belonging to a later successful mutation.
+                revision = _next_model_control_revision(session)
                 result = _apply_model_switch(
                     params.get("session_id", ""),
                     session,
@@ -14359,6 +14456,8 @@ def _(rid, params: dict) -> dict:
                     ),
                     parsed_flags=parsed_flags,
                 )
+                if not result.get("confirm_required"):
+                    result["model_control_revision"] = revision
             else:
                 result = _apply_model_switch(
                     "",
@@ -14377,6 +14476,11 @@ def _(rid, params: dict) -> dict:
                     "confirm_required": result.get("confirm_required", False),
                     "confirm_message": result.get("confirm_message", ""),
                     "scope": result.get("scope", "session"),
+                    **(
+                        {"model_control_revision": result["model_control_revision"]}
+                        if isinstance(result.get("model_control_revision"), int)
+                        else {}
+                    ),
                 },
             )
         except Exception as e:

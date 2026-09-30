@@ -174,16 +174,38 @@ export interface SidebarNavItem {
 export interface PendingModelSelection {
   model: string
   provider: string
+  /** Renderer intent token for this exact local request. Same values selected
+   * again get distinct tokens, so A->B->A cannot be acknowledged by old A. */
+  intentToken: number
+  /** Session-owned mutation revision returned by the gateway ack. Older
+   * runtimes omit it; keep pending explicit rather than manufacturing success. */
+  modelControlRevision?: number
+  observedModelControlRevision?: number
+  /** True only after the matching local RPC closure acknowledged this intent. */
+  acknowledged?: boolean
   /** The runtime metadata seen before the user made this local selection. A
    * delayed heartbeat repeating this exact pair is stale relative to the pick,
    * while a genuinely different backend-normalized value can still settle it. */
   previousModel: string
   previousProvider: string
+  /** Every earlier optimistic pair in this unresolved selection chain.
+   * Buffered metadata for any of these pairs must not repaint the latest pick. */
+  supersededSelections?: Array<{ model: string; provider: string }>
   /** Renderer-only baseline for explicit rejection after several optimistic
    * picks. Separate from previous* (which belongs to heartbeat comparison). */
   rollbackModel?: string
+  /** Highest acknowledged local intent and its owner-issued revision. */
+  rollbackIntentToken?: number
+  rollbackModelControlRevision?: number
   rollbackProvider?: string
   rollbackSource?: '' | 'default' | 'manual'
+}
+
+export interface ModelSelectionFence {
+  model: string
+  provider: string
+  modelControlRevision: number
+  supersededSelections: Array<{ model: string; provider: string }>
 }
 
 export interface ClientSessionState {
@@ -196,6 +218,9 @@ export interface ClientSessionState {
   /** Local model intent awaiting a matching or normalized backend metadata
    * update. A heartbeat repeating `previous*` is stale, not a rejection. */
   pendingModelSelection?: null | PendingModelSelection
+  /** Last confirmed local model-control revision. It remains after pending
+   * clears so obsolete metadata cannot repaint over the settled selection. */
+  modelSelectionFence?: null | ModelSelectionFence
   reasoningEffort: string
   serviceTier: string
   fast: boolean

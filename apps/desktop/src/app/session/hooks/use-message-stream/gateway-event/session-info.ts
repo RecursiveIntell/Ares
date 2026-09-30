@@ -1,3 +1,4 @@
+import type { ModelSelectionFence, PendingModelSelection } from '@/app/types'
 import { normalizePersonalityValue } from '@/lib/chat-runtime'
 import { modelOptionsQueryKey } from '@/lib/model-options'
 import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
@@ -109,6 +110,93 @@ function maybeRebindPaneToRebuiltRuntime(ctx: GatewayEventContext): boolean {
   return true
 }
 
+function sameModelPair(
+  pair: { model: string; provider: string },
+  patch: { model?: string; provider?: string }
+): boolean {
+  return patch.model === pair.model && patch.provider === pair.provider
+}
+
+function stalePairsForPending(pending: PendingModelSelection): Array<{ model: string; provider: string }> {
+  return [
+    ...(pending.supersededSelections ?? []),
+    { model: pending.previousModel, provider: pending.previousProvider },
+    {
+      model: pending.rollbackModel ?? pending.previousModel,
+      provider: pending.rollbackProvider ?? pending.previousProvider
+    }
+  ]
+}
+
+function stalePairsForFence(fence: ModelSelectionFence): Array<{ model: string; provider: string }> {
+  return fence.supersededSelections ?? []
+}
+
+function stripModelMetadataForOrdering(
+  pending: PendingModelSelection | null | undefined,
+  fence: ModelSelectionFence | null | undefined,
+  patch: { model?: string; provider?: string },
+  revision: number | undefined
+): boolean {
+  const hasModelMetadata = patch.model !== undefined || patch.provider !== undefined
+
+  if (!hasModelMetadata) {
+    return false
+  }
+
+  const completePair = patch.model !== undefined && patch.provider !== undefined
+
+  if (pending) {
+    if (!completePair) {
+      return true
+    }
+
+    if (sameModelPair(pending, patch)) {
+      return (
+        pending.modelControlRevision !== undefined &&
+        revision !== undefined &&
+        revision !== pending.modelControlRevision
+      )
+    }
+
+    if (stalePairsForPending(pending).some(pair => sameModelPair(pair, patch))) {
+      return true
+    }
+
+    if (
+      pending.modelControlRevision !== undefined &&
+      revision !== undefined &&
+      revision > pending.modelControlRevision
+    ) {
+      return false
+    }
+
+    return true
+  }
+
+  if (!fence) {
+    return false
+  }
+
+  if (!completePair) {
+    return true
+  }
+
+  if (revision === undefined) {
+    return true
+  }
+
+  if (revision < fence.modelControlRevision) {
+    return true
+  }
+
+  if (revision === fence.modelControlRevision) {
+    return !sameModelPair(fence, patch) || stalePairsForFence(fence).some(pair => sameModelPair(pair, patch))
+  }
+
+  return false
+}
+
 /** session.info / session.usage / session.title. */
 export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
   const { deps, event, payload, sessionId, explicitSid, isActiveEvent, occurredAt, fromActiveSource } = ctx
@@ -139,6 +227,10 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
     const hasStatePatch = hasSessionInfoStatePatch(statePatch)
     const modelChanged = typeof payload?.model === 'string'
     const providerChanged = typeof payload?.provider === 'string'
+
+    const modelControlRevision =
+      typeof payload?.model_control_revision === 'number' ? payload.model_control_revision : undefined
+
     const runningChanged = typeof payload?.running === 'boolean'
     // The backend stamps model/provider (as strings) on EVERY session.info,
     // so the presence flags above are true on every heartbeat/turn edge —
@@ -153,10 +245,21 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
     // session.info frames, but those frames cannot prove the durable turn has
     // settled: only a fresh runtime binding or durable hydrate may do that.
     const retiredRuntime = Boolean(knownState?.reconnecting)
-    const modelValueChanged = modelChanged && payload!.model !== (knownState?.model ?? $currentModel.get())
+
+    const supersededModelMetadata = stripModelMetadataForOrdering(
+      knownState?.pendingModelSelection,
+      knownState?.modelSelectionFence,
+      statePatch,
+      modelControlRevision
+    )
+
+    const modelValueChanged =
+      !supersededModelMetadata && modelChanged && payload!.model !== (knownState?.model ?? $currentModel.get())
 
     const providerValueChanged =
-      providerChanged && payload!.provider !== (knownState?.provider ?? $currentProvider.get())
+      !supersededModelMetadata &&
+      providerChanged &&
+      payload!.provider !== (knownState?.provider ?? $currentProvider.get())
 
     // Config is profile-scoped, but session.info also arrives for background
     // sessions. Only an active-session event from the currently active
@@ -235,34 +338,80 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
         state => {
           const pending = state.pendingModelSelection
           const hasIncomingModelMetadata = statePatch.model !== undefined || statePatch.provider !== undefined
+          const hasCompleteModelMetadata = statePatch.model !== undefined && statePatch.provider !== undefined
 
-          // A model click updates the owning runtime slice immediately. A
-          // session.info heartbeat that was queued before that click can arrive
-          // later with the exact previous pair; it is stale relative to the
-          // local intent, not evidence that the click failed. A matching pick
-          // or genuinely different backend-normalized pair remains authoritative
-          // and settles the pending selection.
-          const repeatsPreviousModel =
-            Boolean(pending) &&
-            hasIncomingModelMetadata &&
-            (statePatch.model === undefined || statePatch.model === pending?.previousModel) &&
-            (statePatch.provider === undefined || statePatch.provider === pending?.previousProvider)
+          // Ignore buffered, partial, or out-of-revision model metadata. Non-model
+          // status still reconciles.
+          const repeatsPreviousModel = stripModelMetadataForOrdering(
+            pending,
+            state.modelSelectionFence,
+            statePatch,
+            modelControlRevision
+          )
 
           const { model: _incomingModel, provider: _incomingProvider, ...nonModelStatePatch } = statePatch
           const effectiveStatePatch = repeatsPreviousModel ? nonModelStatePatch : statePatch
 
-          const pendingModelSelection = repeatsPreviousModel
-            ? pending
-            : hasIncomingModelMetadata
-              ? null
-              : pending
+          let pendingModelSelection = pending
+          let modelSelectionFence = state.modelSelectionFence ?? null
+
+          if (pending && !repeatsPreviousModel && hasCompleteModelMetadata && modelControlRevision !== undefined) {
+            if (sameModelPair(pending, statePatch)) {
+              const observedPending = {
+                ...pending,
+                observedModelControlRevision: modelControlRevision
+              }
+
+              if (pending.acknowledged && pending.modelControlRevision === modelControlRevision) {
+                pendingModelSelection = null
+                modelSelectionFence = {
+                  model: statePatch.model!,
+                  provider: statePatch.provider!,
+                  modelControlRevision,
+                  supersededSelections: [
+                    ...(pending.supersededSelections ?? []),
+                    { model: pending.previousModel, provider: pending.previousProvider }
+                  ]
+                }
+              } else {
+                pendingModelSelection = observedPending
+              }
+            } else if (
+              pending.modelControlRevision !== undefined &&
+              modelControlRevision > pending.modelControlRevision
+            ) {
+              pendingModelSelection = null
+              modelSelectionFence = {
+                model: statePatch.model!,
+                provider: statePatch.provider!,
+                modelControlRevision,
+                supersededSelections: []
+              }
+            }
+          } else if (
+            !pending &&
+            !repeatsPreviousModel &&
+            hasCompleteModelMetadata &&
+            modelControlRevision !== undefined
+          ) {
+            modelSelectionFence = {
+              model: statePatch.model!,
+              provider: statePatch.provider!,
+              modelControlRevision,
+              supersededSelections:
+                modelSelectionFence?.modelControlRevision === modelControlRevision
+                  ? (modelSelectionFence.supersededSelections ?? [])
+                  : []
+            }
+          }
 
           return {
             ...state,
             ...effectiveStatePatch,
             branch: effectiveStatePatch.branch ?? state.branch,
             cwd: effectiveStatePatch.cwd ?? state.cwd,
-            pendingModelSelection
+            pendingModelSelection,
+            modelSelectionFence
           }
         },
         payload?.stored_session_id || undefined

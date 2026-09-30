@@ -1,7 +1,7 @@
 import { computed, type ReadableAtom } from 'nanostores'
 import { createContext, useContext } from 'react'
 
-import type { ClientSessionState } from '@/app/types'
+import type { ClientSessionState, PendingModelSelection } from '@/app/types'
 import type { ChatMessage } from '@/lib/chat-messages'
 import {
   $activeSessionId,
@@ -55,6 +55,7 @@ export interface SessionView {
   $turnStartedAt: ReadableAtom<number | null>
   $cwd: ReadableAtom<string>
   $model: ReadableAtom<string>
+  $pendingModelSelection: ReadableAtom<PendingModelSelection | null | undefined>
   $provider: ReadableAtom<string>
   $fast: ReadableAtom<boolean>
   $reasoningEffort: ReadableAtom<string>
@@ -102,6 +103,10 @@ export const PRIMARY_SESSION_VIEW: SessionView = {
   $messages: $primaryMessages,
   $messagesEmpty: computed($primaryMessages, messages => messages.length === 0),
   $model: primaryField<string>(state => state.model, $currentModel),
+  $pendingModelSelection: primaryField<PendingModelSelection | null | undefined>(
+    state => state.pendingModelSelection,
+    computed($activeSessionId, () => null)
+  ),
   $provider: primaryField<string>(state => state.provider, $currentProvider),
   $reasoningEffort: primaryField<string>(state => state.reasoningEffort, $currentReasoningEffort),
   $runtimeId: $activeSessionId,
