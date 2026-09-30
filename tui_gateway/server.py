@@ -3373,6 +3373,58 @@ def _wait_agent_for_prompt(session: dict, rid: str, sid: str) -> dict | None:
     return _err(rid, 5032, err) if err else None
 
 
+RESUME_HISTORY_WAIT_S = 300.0
+RESUME_HISTORY_GRACE_S = 120.0
+
+
+def _await_resume_history(current: dict, sid: str, key: str) -> str:
+    """Wait for cold-resume history without holding agent init hostage.
+
+    The transcript is only display state; agent construction needs the
+    session's context/db/secrets/MCP, not the history rows. A slow hydration
+    (SQLite contention while several sessions resume at once) previously
+    killed agent init with TimeoutError after 300s. Now: bounded wait, a
+    visible slow+grace window, then degrade to a live agent with an empty
+    history — late hydration still fills in under history_lock.
+    Returns "ready" | "degraded" | "vanish" (session replaced mid-wait).
+    """
+    history_ready = current.get("resume_history_ready")
+    if history_ready is None:
+        return "ready"
+    if history_ready.wait(timeout=RESUME_HISTORY_WAIT_S):
+        return "ready"
+    with _sessions_lock:
+        if _sessions.get(sid) is not current:
+            return "vanish"
+    stage = current.get("resume_hydration_stage", "unknown")
+    profile_home = current.get("profile_home")
+    logger.warning(
+        "resume hydration slow; extending wait runtime=%s stored=%s profile=%s stage=%s",
+        sid, key, Path(profile_home).name if profile_home else "default", stage,
+    )
+    _emit("session.resume_progress", sid, {"phase": "history", "status": "slow", "stage": stage})
+    if history_ready.wait(timeout=RESUME_HISTORY_GRACE_S):
+        return "ready"
+    with _sessions_lock:
+        if _sessions.get(sid) is not current:
+            return "vanish"
+    logger.warning(
+        "resume hydration degraded; starting agent without history runtime=%s stored=%s profile=%s stage=%s",
+        sid, key, Path(profile_home).name if profile_home else "default", stage,
+    )
+    _emit(
+        "session.resume_progress",
+        sid,
+        {"phase": "history", "status": "degraded_timeout", "stage": stage,
+         "message": f"history still loading ({stage}); agent started without it"},
+    )
+    with current["history_lock"]:
+        current["resume_hydrating"] = False
+        current.setdefault("history", [])
+    history_ready.set()
+    return "degraded"
+
+
 def _start_agent_build(sid: str, session: dict) -> None:
     """Start building the real AIAgent for a TUI session, once.
 
@@ -3420,20 +3472,13 @@ def _start_agent_build(sid: str, session: dict) -> None:
         owns_db = False
         profile_home = current.get("profile_home")
         try:
-            history_ready = current.get("resume_history_ready")
-            if history_ready is not None:
-                if not history_ready.wait(timeout=300.0):
-                    logger.warning(
-                        "resume hydration timeout runtime=%s stored=%s profile=%s stage=%s",
-                        sid, key, Path(profile_home).name if profile_home else "default",
-                        current.get("resume_hydration_stage", "unknown"),
-                    )
-                    raise TimeoutError("session history hydration timed out")
-                if history_error := current.get("resume_history_error"):
-                    raise RuntimeError(str(history_error))
-                with _sessions_lock:
-                    if _sessions.get(sid) is not current:
-                        return
+            outcome = _await_resume_history(current, sid, key)
+            if outcome == "vanish":
+                return
+            if outcome == "ready" and (
+                history_error := current.get("resume_history_error")
+            ):
+                raise RuntimeError(str(history_error))
             tokens = _set_session_context(key)
             # Build against the session's profile (global-remote): bind its
             # HERMES_HOME so config/skills/model resolve to it, and hand the

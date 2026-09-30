@@ -3641,6 +3641,60 @@ def test_deferred_history_failure_logs_last_stage_without_transcript(monkeypatch
         server._sessions.pop(sid, None)
 
 
+def test_slow_resume_hydration_degrades_instead_of_killing_agent_init(monkeypatch, caplog):
+    sid = "hydration-degrade"
+    stored_id = "hydration-degrade-stored"
+    event = threading.Event()
+    session = {"resume_history_ready": event, "agent_ready": threading.Event(),
+               "history_lock": threading.Lock(), "history": [],
+               "resume_hydrating": True,
+               "resume_hydration_stage": "replay_projection",
+               "profile_home": None}
+    events = []
+    monkeypatch.setattr(server, "_emit", lambda name, _sid, payload: events.append((name, payload)))
+    monkeypatch.setattr(server, "RESUME_HISTORY_WAIT_S", 0.05)
+    monkeypatch.setattr(server, "RESUME_HISTORY_GRACE_S", 0.05)
+    server._sessions[sid] = session
+    try:
+        with caplog.at_level("WARNING", logger="tui_gateway.server"):
+            outcome = server._await_resume_history(session, sid, "hydration-degrade-key")
+        assert outcome == "degraded"
+        assert session["resume_hydrating"] is False
+        assert session["history"] == []
+        assert event.is_set()
+        statuses = [payload["status"] for name, payload in events
+                    if name == "session.resume_progress"]
+        assert statuses == ["slow", "degraded_timeout"]
+        assert "degraded" in caplog.text
+        assert "session history hydration timed out" not in caplog.text
+        # Late hydration still fills in behind history_lock after degrade.
+        with session["history_lock"]:
+            session["history"] = [{"role": "user", "content": "late-arrival"}]
+        assert session["history"][0]["content"] == "late-arrival"
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_resume_history_vanish_during_wait_emits_nothing(monkeypatch):
+    sid = "hydration-vanish"
+    event = threading.Event()
+    session = {"resume_history_ready": event, "agent_ready": threading.Event(),
+               "history_lock": threading.Lock(), "history": [], "profile_home": None}
+    events = []
+    monkeypatch.setattr(server, "_emit", lambda name, _sid, payload: events.append(name))
+    monkeypatch.setattr(server, "RESUME_HISTORY_WAIT_S", 0.05)
+    monkeypatch.setattr(server, "RESUME_HISTORY_GRACE_S", 0.05)
+    # Same id, different object: the original session was replaced mid-wait.
+    server._sessions[sid] = {"session_key": "somebody-else"}
+    try:
+        outcome = server._await_resume_history(session, sid, "k")
+        assert outcome == "vanish"
+        assert events == []
+        assert not event.is_set()
+    finally:
+        server._sessions.pop(sid, None)
+
+
 def test_session_resume_deferred_history_failure_can_retry(monkeypatch):
     first_released = threading.Event()
     build_started = threading.Event()
