@@ -44,7 +44,7 @@ Options:
                                     The Recursive Agent daemon is not installed or started by this option.
   -h, --help                        Show this help
 
-Prerequisites: git, uv (unless --no-venv), and Python 3.11 through 3.13.
+Prerequisites: git, uv (unless --no-venv), and Python 3.11 through 3.14.
 
 This installer does not create providers, credentials, MCP servers, hooks, or
 plugins except the explicitly requested Recursive Agent plugin. Run `ares setup`
@@ -117,7 +117,7 @@ install_stable_runtime() {
     [[ "$INSTALL_GATEWAY" == true ]] || setup_args+=(--no-gateway)
     if [[ "$USE_VENV" == true ]]; then
         ARES_HOME="$HERMES_HOME" ARES_BIN_DIR="$ARES_BIN_DIR" \
-            "$INSTALL_DIR/.venv/bin/ares" "${setup_args[@]}"
+            "$INSTALL_DIR/.venv/bin/python" -m ares_runtime.local_runtime "${setup_args[@]}"
     else
         ARES_HOME="$HERMES_HOME" ARES_BIN_DIR="$ARES_BIN_DIR" \
             python3 -m ares_runtime.local_runtime "${setup_args[@]}"

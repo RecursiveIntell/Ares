@@ -358,9 +358,8 @@ bash install.sh --with-recursive-agent-source /path/to/recursive-agent
 
 This is the source-defined integration path but is not end-to-end verified by
 the README checks. It does **not** build, configure, start, or grant authority
-to the Recursive Agent daemon. If the bootstrap reports a missing `ares`
-entry point, use the manual setup command in [Quick start](#quick-start), then
-run the plugin checkout's own installer; that checkout owns plugin rollback.
+to the Recursive Agent daemon. The bootstrap invokes the runtime module through
+the selected Python environment; the plugin checkout owns plugin rollback.
 
 This installs the plugin package into `~/.ares/plugins/recursive-agent-native`. It does **not** build, configure, start, or grant authority to the daemon. Start a fresh Ares/Hermes session after plugin installation so discovery can occur.
 
@@ -409,12 +408,15 @@ The current project admission range is `>=3.11,<3.15` (Python 3.11 through
 native extension, Desktop build, or optional service works on every minor and
 every operating system.
 
-**Installer proof boundary:** `bash install.sh --help` and shell syntax are
-validated here, but a full install is not. The root installer invokes
-`.venv/bin/ares` during its stable-runtime step, while the committed
-`pyproject.toml` does not currently declare an `ares` project-script entry
-point. Use the manual module-based setup in [Quick start](#quick-start) until
-that installer/entry-point drift is repaired.
+**Installer proof boundary:** the managed bootstrap invokes
+`.venv/bin/python -m ares_runtime.local_runtime`; it does not depend on an
+undeclared `ares` console script. A hermetic subprocess regression exercises
+managed and active-environment setup, option/environment forwarding, and
+fail-closed dependency-install errors. Git, dependency installation and the
+setup implementation are fixture boundaries in that test, so it is not a full
+installation or installed-runtime acceptance test. Shell syntax and help are
+checked separately. The manual module-based [Quick start](#quick-start) remains
+available.
 
 ## Security and trust boundaries
 
@@ -480,7 +482,7 @@ experimental/runtime-gated controls; they are not a security certification.
 
 | Path | Role |
 |---|---|
-| `install.sh` | Ares bootstrap installer for the Ares checkout, stable launcher, and optional Recursive Agent plugin; its full stable-runtime path currently has the entry-point drift documented above. |
+| `install.sh` | Ares bootstrap installer for the Ares checkout, runtime-module setup, stable launcher, and optional Recursive Agent plugin. |
 | `scripts/install.sh`, `scripts/install.ps1` | Inherited Hermes installers and dependency/bootstrap surfaces; they are not the Ares stable-runtime launcher. |
 | `ares_runtime/` | Stable runtime selection, materialization, activation, rollback, gateway handoff, and launcher implementation. |
 | `agent/transports/ri_*.py` | Optional RecursiveIntell transport integrations. |
@@ -542,7 +544,7 @@ Where a page names upstream URLs or support channels, treat those as Hermes refe
 
 ## Status and claim boundary
 
-**README source review: 2026-09-30, committed `main` snapshot `56d296c70d9fe7f1cf1e978c730b3122a57de44e`.** The installation/help, Python admission, configured engine and runtime-probe descriptions were reconciled against that source. Root and inherited POSIX installer syntax/help and the module CLI help were checked. The managed installer still calls `.venv/bin/ares` without a matching project-script declaration; the module-based setup remains the documented route.
+**README source review: 2026-09-30, committed `main` snapshot `56d296c70d9fe7f1cf1e978c730b3122a57de44e`, followed by the bootstrap invocation repair.** The installation/help, Python admission, configured engine and runtime-probe descriptions were reconciled against that source. Root and inherited POSIX installer syntax/help and the module CLI help were checked. The bootstrap follow-up replaces its undeclared console-script invocation with the runtime module and adds the bounded regression described above.
 
 This documentation review did not run an installation, select an installed release, contact configured MCP servers or execute live compaction. The canonical distribution-test command was attempted but could not start because this review environment lacked a pytest-enabled project virtualenv. Do not treat documentation publication or unmerged PR descriptions as passing runtime evidence.
 
