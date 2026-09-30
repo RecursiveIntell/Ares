@@ -12948,21 +12948,11 @@ def _run_prompt_submit(
                     payload["error_surface"] = _error_surface
             _retire_turn_marker(session, marker_key)
             _emit("message.complete", sid, payload)
-            # Readiness publish resolves the LIVE owner of this UI id: a
-            # transport rebind between turn completion and emit must not
-            # publish the old session's readiness onto the new owner. When
-            # the id has no live owner anymore, nothing is published.
-            _verified_session = _sessions.get(sid)
-            if _verified_session is not None:
-                _emit(
-                    "session.info",
-                    sid,
-                    _session_info(
-                        _verified_session.get("agent"), _verified_session
-                    ),
-                )
-            else:
-                _emit("session.info", sid, _session_info(agent, session))
+            # No readiness publish here: the single end-of-turn session.info
+            # is emitted by the turn-teardown backstop below, guarded by the
+            # live-owner check so a transport rebind cannot publish the old
+            # session's readiness onto a new owner (and so emission-count
+            # parity with the compute-host frame path is preserved).
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
             # After every TUI turn, if a /goal is active, ask the judge
