@@ -41,7 +41,7 @@ def schedule_input_recovery(runner, platform=None):
                 receipts, phase = work["receipts"], work["phase"]
                 if not receipts:
                     continue
-                if phase is not None and phase["state"] != "answered":
+                if phase is not None and phase["state"] not in {"answered", "cancelled"}:
                     if phase["dispatch_attempts"] or phase["attempts"] >= 3 or time.time() >= phase["deadline_at"]:
                         continue
                     if phase["state"] == "active" and _process_identity(phase["controller_pid"]) == phase["process_identity"]:

@@ -157,7 +157,10 @@ class ComputeHost:
         # know *whose* turn is still live, not merely that something is, so that
         # it can leave those sessions unfinalized; a bare set cannot answer that.
         self._turn_futures: dict[concurrent.futures.Future, str] = {}
-        self._turn_futures_lock = threading.Lock()
+        # A completed worker can invoke its done callback during registration.
+        self._turn_futures_lock = threading.RLock()
+        self._active_request_ids: dict[str, str] = {}
+        self._pending_interrupts: dict[str, str] = {}
         self._transport = _HostTransport(self.emit)
         self._heartbeat_secs = (
             float(heartbeat_secs)
@@ -317,12 +320,14 @@ class ComputeHost:
                 for sid, session in list(server._sessions.items()):
                     if str(session.get("session_key") or "") != session_key:
                         continue
-                    with session.get("history_lock", threading.Lock()):
+                    with self._turn_futures_lock, session.get("history_lock", threading.Lock()):
+                        request_id = self._active_request_ids.get(sid)
                         agent = session.get("agent")
                         sessions.append(
                             {
                                 "session_id": sid,
-                                "running": bool(session.get("running")),
+                                "running": bool(request_id or session.get("running")),
+                                "request_id": request_id,
                                 "session_info": server._session_info(agent, session),
                             }
                         )
@@ -359,13 +364,49 @@ class ComputeHost:
         with self._turn_futures_lock:
             self._turn_futures.pop(future, None)
 
+    def _emit_real_turn_terminal(self, frame: dict[str, Any]) -> None:
+        # The computation has reached its terminal point. Release only this
+        # request's admission before publishing; output I/O must not hold the
+        # admission lock. Future retirement is resource accounting and cannot
+        # revoke a queued successor's newly acquired ownership.
+        from tui_gateway import server
+
+        sid = str(frame.get("sid") or "")
+        request_id = str(frame.get("request_id") or "")
+        with self._turn_futures_lock:
+            session = server._sessions.get(sid)
+            if session is not None:
+                with session["history_lock"]:
+                    if session.get("_host_turn_request_id") == request_id:
+                        session.pop("_host_turn_request_id", None)
+            if self._active_request_ids.get(sid) == request_id:
+                self._active_request_ids.pop(sid, None)
+            if self._pending_interrupts.get(sid) == request_id:
+                self._pending_interrupts.pop(sid, None)
+        self.emit(frame)
+
     def _handle_turn_start(self, frame: dict[str, Any]) -> None:
         sid = str(frame.get("sid") or "")
         if sid in self._sessions:
             self._handle_spike_turn_start(frame)
             return
-        future = self._executor.submit(self._run_real_turn, dict(frame))
-        self._track_turn_future(future, sid)
+        payload = dict(frame)
+        request_id = str(payload.get("request_id") or uuid.uuid4().hex)
+        payload["request_id"] = request_id
+        with self._turn_futures_lock:
+            if sid not in self._active_request_ids:
+                self._active_request_ids[sid] = request_id
+                try:
+                    future = self._executor.submit(self._run_real_turn, payload)
+                except Exception:
+                    self._active_request_ids.pop(sid, None)
+                    if self._pending_interrupts.get(sid) == request_id:
+                        self._pending_interrupts.pop(sid, None)
+                    raise
+                self._track_turn_future(future, sid)
+                return
+        self.emit({"type": "turn.error", "sid": sid, "request_id": request_id,
+                   "message": "session busy", "reason": "admission_refused_busy"})
 
     def _handle_spike_turn_start(self, frame: dict[str, Any]) -> None:
         sid = str(frame.get("sid") or "")
@@ -385,6 +426,10 @@ class ComputeHost:
         sid = str(frame.get("sid") or "")
         spike = self._sessions.get(sid)
         if spike is not None:
+            if frame.get("target_request_id") is not None:
+                self.emit({"type": "interrupt.ack", "sid": sid, "request_id": frame.get("request_id"),
+                           "applied": False, "message": "targeted turn owner unavailable on spike route"})
+                return
             request_hard_interrupt(spike.agent)
             self.emit(
                 {
@@ -399,15 +444,39 @@ class ComputeHost:
         try:
             from tui_gateway import server
 
-            session = server._sessions.get(sid)
-            if session is None:
-                self.emit({"type": "interrupt.ack", "sid": sid, "request_id": frame.get("request_id"), "applied": False})
-                return
-            # Use the same owner-side Stop contract as a non-isolated turn:
-            # hard interrupt plus pending clarify/approval wakeup and queue clear.
-            # The child marker disables forwarding back through a supervisor.
-            server._interrupt_session_turn(sid, session, request_id=frame.get("request_id"))
-            self.emit({"type": "interrupt.ack", "sid": sid, "request_id": frame.get("request_id"), "applied": True, "applied_ns": now_ns()})
+            target = frame.get("target_request_id")
+            with self._turn_futures_lock:
+                session = server._sessions.get(sid)
+                ack = {"type": "interrupt.ack", "sid": sid,
+                       "request_id": frame.get("request_id"), "applied": False,
+                       **({"target_request_id": target} if target is not None else {})}
+                if target is not None and (type(target) is not str or not target):
+                    ack["message"] = "invalid target request id"
+                elif target is not None and self._active_request_ids.get(sid) != target:
+                    ack["message"] = "turn owner changed or unknown"
+                elif session is not None or target is not None:
+                    # Accepted requests can still be constructing their session.
+                    # Retain the exact cancellation through that window; the
+                    # worker checks it before admitting any agent turn.
+                    pending = session is None or not session.get("running")
+                    if target is not None:
+                        self._pending_interrupts[sid] = target
+                    if session is not None:
+                        # Fence admission through application so a late Stop
+                        # for A cannot cancel B on the same reused agent.
+                        agent = session.get("agent")
+                        previous_receipt = getattr(agent, "_context_stop_receipt", None)
+                        server._interrupt_session_turn(sid, session, request_id=frame.get("request_id"))
+                        receipt = getattr(agent, "_context_stop_receipt", None)
+                        if isinstance(receipt, dict) and receipt is not previous_receipt:
+                            ack["stop_receipt"] = {"session_key": receipt.get("session_key"),
+                                                   "control": receipt.get("control")}
+                        if getattr(agent, "_context_stop_unacknowledged", False) is True:
+                            ack["durable_stop_unconfirmed"] = True
+                    ack.update(applied=True, applied_ns=now_ns())
+                    if pending:
+                        ack["pending"] = True
+            self.emit(ack)
         except Exception as exc:
             self.emit({"type": "interrupt.ack", "sid": sid, "request_id": frame.get("request_id"), "applied": False, "message": str(exc)})
 
@@ -474,11 +543,17 @@ class ComputeHost:
         sid = str(frame.get("sid") or "")
         request_id = str(frame.get("request_id") or uuid.uuid4().hex)
         if not sid:
-            self.emit({"type": "turn.error", "sid": sid, "request_id": request_id, "message": "sid required"})
+            self._emit_real_turn_terminal({"type": "turn.error", "sid": sid, "request_id": request_id, "message": "sid required"})
             return
         try:
             from tui_gateway import server
 
+            with self._turn_futures_lock:
+                cancelled_before_construction = self._pending_interrupts.get(sid) == request_id
+            if cancelled_before_construction:
+                self._emit_real_turn_terminal({"type": "turn.end", "sid": sid, "request_id": request_id,
+                                               "interrupted": True, "ended_ns": now_ns()})
+                return
             session = self._ensure_server_session(server, frame)
             # The compute host is the canonical turn owner while isolation is
             # active. Admit durable session state before claiming running or
@@ -489,30 +564,33 @@ class ComputeHost:
             # return as false rejected every real compute-host turn before the
             # provider was invoked.
             server._ensure_session_db_row(session)
-            with session["history_lock"]:
+            terminal = None
+            with self._turn_futures_lock, session["history_lock"]:
                 queued_prompt_generation = frame.get("queued_prompt_generation")
-                if (
+                if self._pending_interrupts.get(sid) == request_id:
+                    session["_turn_cancel_requested"] = True
+                    session["running"] = False
+                    terminal = {"type": "turn.end", "sid": sid, "request_id": request_id,
+                                "interrupted": True, "ended_ns": now_ns()}
+                elif (
                     queued_prompt_generation is not None
                     and int(session.get("_queued_prompt_generation", 0))
                     != int(queued_prompt_generation)
                 ):
-                    self.emit(
-                        {
-                            "type": "turn.end",
-                            "sid": sid,
-                            "request_id": request_id,
-                            "interrupted": True,
-                            "ended_ns": now_ns(),
-                        }
-                    )
-                    return
-                if session.get("running"):
-                    self.emit({"type": "turn.error", "sid": sid, "request_id": request_id, "message": "session busy"})
-                    return
-                session["running"] = True
-                session["_turn_cancel_requested"] = False
-                session["last_active"] = time.time()
-                server._start_inflight_turn(session, frame.get("text") if "text" in frame else frame.get("prompt"))
+                    terminal = {"type": "turn.end", "sid": sid, "request_id": request_id,
+                                "interrupted": True, "ended_ns": now_ns()}
+                elif session.get("running"):
+                    terminal = {"type": "turn.error", "sid": sid, "request_id": request_id,
+                                "message": "session busy"}
+                else:
+                    session["running"] = True
+                    session["_host_turn_request_id"] = request_id
+                    session["_turn_cancel_requested"] = False
+                    session["last_active"] = time.time()
+                    server._start_inflight_turn(session, frame.get("text") if "text" in frame else frame.get("prompt"))
+            if terminal is not None:
+                self._emit_real_turn_terminal(terminal)
+                return
             self.emit({"type": "turn.started", "sid": sid, "request_id": request_id, "started_ns": now_ns()})
             try:
                 import hermes_undo
@@ -534,17 +612,27 @@ class ComputeHost:
                 **({"context_input_event_id": frame["context_input_event_id"]}
                    if frame.get("context_input_event_id") is not None else {}),
             )
+            # Goal/notification follow-ups install their next run thread before
+            # their predecessor exits. Keep the accepted request alive through
+            # that chain instead of publishing a false terminal at the handoff.
             run_thread = session.get("_run_thread")
-            if run_thread is not None and hasattr(run_thread, "join"):
+            while run_thread is not None and hasattr(run_thread, "join"):
                 run_thread.join()
+                with session["history_lock"]:
+                    successor = session.get("_run_thread")
+                if successor is run_thread:
+                    break
+                run_thread = successor
             with session["history_lock"]:
                 history_version = int(session.get("history_version", 0))
                 message_count = len(session.get("history") or [])
                 interrupted = bool(session.get("_turn_cancel_requested"))
+                running = bool(session.get("running"))
                 session_key = str(session.get("session_key") or "")
             session_info = server._session_info(session.get("agent"), session)
+            session_info["running"] = running
             self._bump_progress()
-            self.emit(
+            self._emit_real_turn_terminal(
                 {
                     "type": "turn.end",
                     "sid": sid,
@@ -556,7 +644,9 @@ class ComputeHost:
                     "ended_ns": now_ns(),
                     "session_info": session_info,
                     "model_override": session.get("model_override"),
-                    "session_info_emitted": True,
+                    # Child reply boundaries remain busy while this request
+                    # owns the chain. Parent settlement publishes the final info.
+                    "session_info_emitted": False,
                 }
             )
         except Exception as exc:
@@ -565,12 +655,14 @@ class ComputeHost:
 
                 session = server._sessions.get(sid)
                 if session is not None:
-                    with session.get("history_lock", threading.Lock()):
-                        session["running"] = False
-                        server._clear_inflight_turn(session)
+                    with self._turn_futures_lock, session.get("history_lock", threading.Lock()):
+                        owner = self._active_request_ids.get(sid)
+                        if owner is None or owner == request_id:
+                            session["running"] = False
+                            server._clear_inflight_turn(session)
             except Exception:
                 pass
-            self.emit({"type": "turn.error", "sid": sid, "request_id": request_id, "reason": "exception", "message": str(exc)})
+            self._emit_real_turn_terminal({"type": "turn.error", "sid": sid, "request_id": request_id, "reason": "exception", "message": str(exc)})
 
     def _ensure_server_session(self, server: Any, frame: dict[str, Any]) -> dict:
         sid = str(frame.get("sid") or "")
@@ -721,9 +813,24 @@ class ComputeHost:
                 self.emit({"type": "control.error", "sid": sid, "request_id": request_id, "message": f"unclassified route: {route_name}"})
                 return
             session = server._sessions.get(sid)
+            if route_name in {"session.steer", "session.redirect"}:
+                target = frame.get("target_request_id")
+                ack = {"type": "control.error", "sid": sid, "request_id": request_id,
+                       "route_name": route_name, "target_request_id": target,
+                       "not_applied": True, "message": "live turn owner changed or unavailable"}
+                with self._turn_futures_lock:
+                    if (type(target) is str and target and self._active_request_ids.get(sid) == target
+                            and session is not None and server._sessions.get(sid) is session and session.get("running")
+                            and not session.get("_turn_cancel_requested")):
+                        params = frame.get("params") if isinstance(frame.get("params"), dict) else {}
+                        response = server._methods[route_name](request_id, {**params, "session_id": sid})
+                        ack = {"type": "control.ack", "sid": sid, "request_id": request_id,
+                               "route_name": route_name, "target_request_id": target, "response": response}
+                self.emit(ack)
+                return
             if session is None:
                 snapshot = frame.get("session_snapshot")
-                if route_name == "config.set.model" and isinstance(snapshot, dict) and snapshot.get("sid") == sid:
+                if route_name in {"config.set.model", "config.set.reasoning"} and isinstance(snapshot, dict) and snapshot.get("sid") == sid:
                     # A new draft has no host session until its first turn.
                     # Rebuild from the serving gateway's committed snapshot;
                     # this also repairs a host restart before another turn.
@@ -784,17 +891,19 @@ class ComputeHost:
                     }
                 )
                 return
-            if route_name == "config.set.fast":
+            if route_name in {"config.set.fast", "config.set.reasoning"}:
+                option = route_name.removeprefix("config.set.")
                 params = frame.get("params")
                 if not isinstance(params, dict):
                     params = {}
                 response = server._methods["config.set"](
                     request_id,
-                    {"key": "fast", "value": params.get("value", ""), "session_id": sid},
+                    {"key": option, "value": params.get("value", ""), "session_id": sid},
                 )
                 if "error" in response:
                     self.emit({"type": "control.error", "sid": sid, "request_id": request_id,
-                               "message": str(response["error"].get("message") or "fast switch failed")})
+                               "code": response["error"].get("code"),
+                               "message": str(response["error"].get("message") or "option switch failed")})
                     return
                 self.emit({"type": "control.ack", "sid": sid, "request_id": request_id,
                            "route_name": route_name, "result": response.get("result") or {},

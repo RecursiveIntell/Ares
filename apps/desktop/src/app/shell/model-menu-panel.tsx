@@ -1,6 +1,7 @@
 import { useStore } from '@nanostores/react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { useState } from 'react'
+import { computed } from 'nanostores'
+import { useMemo, useState } from 'react'
 
 import { useSessionView } from '@/app/chat/session-view'
 import { Codicon } from '@/components/ui/codicon'
@@ -11,16 +12,23 @@ import { modelOptionsQueryKey, reconcileSelectionAfterCatalogRefresh, requestMod
 import { currentPickerSelection } from '@/lib/model-status-label'
 import { DEFAULT_REASONING_EFFORT } from '@/lib/reasoning-effort'
 import { cn } from '@/lib/utils'
+import { activeGatewayConnectionId } from '@/store/gateway'
 import { $modelPresets, applyModelPreset, modelPresetKey, setModelPreset } from '@/store/model-presets'
 import { $visibleModels } from '@/store/model-visibility'
 import { notifyError } from '@/store/notifications'
+import { $activeGatewayProfile } from '@/store/profile'
+import { clearRuntimeOptionUncertainty, reconcileRuntimeOptionFailure } from '@/store/runtime-option-recovery'
 import {
+  $activeSessionId,
   $defaultReasoningEffort,
+  $selectedStoredSessionId,
+  beginRuntimeOptionIntent,
   markComposerSelectionManual,
+  ownsRuntimeOptionIntent,
   setCurrentFastMode,
   setCurrentReasoningEffort
 } from '@/store/session'
-import { sessionTileDelegate } from '@/store/session-states'
+import { $sessionStates, knownOwnerForSession, sessionTileDelegate } from '@/store/session-states'
 import type { ModelOptionsResponse } from '@/types/hermes'
 
 import { ModelCatalogMenu, type ModelMenuController } from './model-catalog-menu'
@@ -57,6 +65,17 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
   // shows/switches its own model — not the primary-only globals.
   const view = useSessionView()
   const activeSessionId = useStore(view.$runtimeId)
+
+  const unconfirmedOptions = useStore(
+    useMemo(
+      () =>
+        computed($sessionStates, states =>
+          Boolean(activeSessionId && states[activeSessionId]?.unconfirmedRuntimeOptions?.length)
+        ),
+      [activeSessionId]
+    )
+  )
+
   const currentFastMode = useStore(view.$fast)
   const currentModel = useStore(view.$model)
   const currentProvider = useStore(view.$provider)
@@ -123,63 +142,103 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
     }
   }
 
-  // Push a reasoning change onto the session that owns it, with rollback.
-  const patchReasoning = async (next: string, previous: string, provider: string, model: string) => {
-    if (touchesPrimary) {
-      markComposerSelectionManual()
-      setCurrentReasoningEffort(next)
-    } else if (activeSessionId) {
-      sessionTileDelegate()?.updateSession(activeSessionId, state => ({ ...state, reasoningEffort: next }))
-    }
+  const optionTarget = (runtimeId: string) => {
+    const state = $sessionStates.get()[runtimeId]
+    const owner = knownOwnerForSession(runtimeId)
 
-    // Preset-only without a session: the gateway's `config.set` falls back to
-    // global config when none matches — so don't reach it (preset + optimistic
-    // store are the whole effect).
-    if (!activeSessionId) {
-      return
-    }
-
-    try {
-      await requestGateway('config.set', { key: 'reasoning', session_id: activeSessionId, value: next })
-    } catch (err) {
-      if (touchesPrimary) {
-        setCurrentReasoningEffort(previous)
-      } else {
-        sessionTileDelegate()?.updateSession(activeSessionId, state => ({ ...state, reasoningEffort: previous }))
-      }
-
-      setModelPreset(provider, model, { effort: previous })
-      notifyError(err, t.shell.modelOptions.updateFailed)
-    }
+    return JSON.stringify([
+      runtimeId,
+      state?.storedSessionId ?? null,
+      owner && typeof owner === 'object' ? owner.connectionId : activeGatewayConnectionId(),
+      typeof owner === 'string' ? owner : (owner?.profile ?? $activeGatewayProfile.get())
+    ])
   }
 
-  const patchFast = async (enabled: boolean, provider: string, model: string) => {
-    if (touchesPrimary) {
-      markComposerSelectionManual()
-      setCurrentFastMode(enabled)
-    } else if (activeSessionId) {
-      sessionTileDelegate()?.updateSession(activeSessionId, state => ({ ...state, fast: enabled }))
-    }
-
+  const patchRuntimeOption = async (
+    dimension: 'effort' | 'fast',
+    next: string | boolean,
+    previous: string | boolean,
+    message: string
+  ) => {
     if (!activeSessionId) {
+      if (dimension === 'effort') {
+        setCurrentReasoningEffort(next as string)
+      } else {
+        setCurrentFastMode(next as boolean)
+      }
+
+      markComposerSelectionManual()
+
       return
     }
+
+    const runtimeId = activeSessionId
+    const storedSessionId = $sessionStates.get()[runtimeId]?.storedSessionId
+    const target = optionTarget(runtimeId)
+    const token = beginRuntimeOptionIntent(target, [dimension])[dimension]
+
+    const owns = () =>
+      Boolean($sessionStates.get()[runtimeId]) &&
+      optionTarget(runtimeId) === target &&
+      $sessionStates.get()[runtimeId]?.storedSessionId === storedSessionId &&
+      ownsRuntimeOptionIntent(target, dimension, token)
+
+    const update = (value: string | boolean) => {
+      if (dimension === 'effort') {
+        sessionTileDelegate()?.updateSession(runtimeId, state => ({ ...state, reasoningEffort: value as string }))
+      } else {
+        sessionTileDelegate()?.updateSession(runtimeId, state => ({ ...state, fast: value as boolean }))
+      }
+
+      // Explicit primary choices still seed future drafts. An old callback
+      // may update its own runtime, but never another foreground draft.
+      if (
+        touchesPrimary &&
+        $activeSessionId.get() === runtimeId &&
+        $selectedStoredSessionId.get() === storedSessionId
+      ) {
+        if (dimension === 'effort') {
+          setCurrentReasoningEffort(value as string)
+        } else {
+          setCurrentFastMode(value as boolean)
+        }
+      }
+    }
+
+    if (touchesPrimary) {
+      markComposerSelectionManual()
+    }
+
+    update(next)
 
     try {
       await requestGateway('config.set', {
-        key: 'fast',
-        session_id: activeSessionId,
-        value: enabled ? 'fast' : 'normal'
+        key: dimension === 'effort' ? 'reasoning' : 'fast',
+        session_id: runtimeId,
+        value: dimension === 'fast' ? ((next as boolean) ? 'fast' : 'normal') : next
       })
+
+      if (owns()) {
+        clearRuntimeOptionUncertainty(runtimeId, dimension)
+      }
     } catch (err) {
-      if (touchesPrimary) {
-        setCurrentFastMode(!enabled)
-      } else {
-        sessionTileDelegate()?.updateSession(activeSessionId, state => ({ ...state, fast: !enabled }))
+      if (
+        await reconcileRuntimeOptionFailure(err, {
+          sessionId: runtimeId,
+          dimension,
+          request: requestGateway,
+          owns,
+          applyObserved: update
+        })
+      ) {
+        return
       }
 
-      setModelPreset(provider, model, { fast: !enabled })
-      notifyError(err, t.shell.modelOptions.fastFailed)
+      if (owns()) {
+        update(previous)
+      }
+
+      notifyError(err, message)
     }
   }
 
@@ -226,11 +285,11 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
       }
 
       if (patch.effort !== undefined) {
-        void patchReasoning(patch.effort, currentReasoningEffort, row.provider, row.model)
+        void patchRuntimeOption('effort', patch.effort, currentReasoningEffort, t.shell.modelOptions.updateFailed)
       }
 
       if (patch.fast !== undefined) {
-        void patchFast(patch.fast, row.provider, row.model)
+        void patchRuntimeOption('fast', patch.fast, currentFastMode, t.shell.modelOptions.fastFailed)
       }
     }
   }
@@ -239,17 +298,24 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
     <ModelCatalogMenu
       controller={controller}
       footer={
-        <DropdownMenuItem
-          className={cn(dropdownMenuRow, 'text-(--ui-text-tertiary)')}
-          disabled={refreshing}
-          onSelect={event => {
-            event.preventDefault()
-            void refreshModels()
-          }}
-        >
-          <Codicon className={cn(refreshing && 'animate-spin')} name="sync" size="0.75rem" />
-          {copy.refreshModels}
-        </DropdownMenuItem>
+        <>
+          {unconfirmedOptions && (
+            <div className="px-2 py-1 text-xs text-(--ui-text-secondary)" role="status">
+              {t.shell.modelOptions.unconfirmed}
+            </div>
+          )}
+          <DropdownMenuItem
+            className={cn(dropdownMenuRow, 'text-(--ui-text-tertiary)')}
+            disabled={refreshing}
+            onSelect={event => {
+              event.preventDefault()
+              void refreshModels()
+            }}
+          >
+            <Codicon className={cn(refreshing && 'animate-spin')} name="sync" size="0.75rem" />
+            {copy.refreshModels}
+          </DropdownMenuItem>
+        </>
       }
       gateway={gateway}
       includeMoa

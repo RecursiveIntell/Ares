@@ -198,7 +198,6 @@ def test_ready_idempotent_mark_requires_original_owner_confirmation(task):
 @pytest.mark.parametrize("accepted_before_stop", [False, True])
 def test_actual_ready_turn_resumes_only_with_one_authentic_post_stop_input(agent, tmp_path, accepted_before_stop):
     from hermes_state import SessionDB
-    from ares_runtime.continuity.runtime import AutomaticRebaseError
     from tests.ares_runtime.test_context_rebase_state import _publish, _ready
     with SessionDB(tmp_path / "ready-turn.db") as db:
         db.create_session("s0", source="cli", profile_name="p1")
@@ -220,7 +219,9 @@ def test_actual_ready_turn_resumes_only_with_one_authentic_post_stop_input(agent
         agent.client.chat.completions.create.return_value = _mock_response(content="Resumed", finish_reason="stop")
         with patch.object(agent, "_save_trajectory"), patch.object(agent, "_cleanup_task_resources"):
             if accepted_before_stop:
-                with pytest.raises(AutomaticRebaseError, match="CONTEXT_DISPATCH_STOPPED"):
+                # Stop now rejects the pre-cut receipt at input admission,
+                # before the later automatic-rebase/provider dispatch gate.
+                with pytest.raises(ContextContinuationError, match="^CONTEXT_INPUT_STOPPED$"):
                     agent.run_conversation("Continue with my correction", persist_user_event_id="resume")
                 agent.client.chat.completions.create.assert_not_called()
                 assert db.read_context_rebase_snapshot("s1").dispatch_stopped
@@ -232,7 +233,9 @@ def test_actual_ready_turn_resumes_only_with_one_authentic_post_stop_input(agent
                 assert not db.read_context_rebase_snapshot("s1").dispatch_stopped
         receipt = db.read_context_input("s1", source=source, event_id="resume")
         assert receipt.sequence == 1
-        assert [m["content"] for m in db.get_messages("s1")].count(receipt.content) == 1
+        assert receipt.content == "Continue with my correction"
+        expected_projection_count = 0 if accepted_before_stop else 1
+        assert [m["content"] for m in db.get_messages("s1")].count(receipt.content) == expected_projection_count
 
 
 def test_ready_custody_reconstruction_can_observe_post_stop_input_without_admitting_effects(task):

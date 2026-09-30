@@ -3479,6 +3479,7 @@ class AIAgent:
         # storage operation can block. A missing durable acknowledgement must
         # never turn a local stop into permission to resume.
         if hard_cancel:
+            self._context_stop_receipt = None
             try:
                 from ares_runtime.continuity.runtime import context_dispatch_required
 
@@ -3487,7 +3488,9 @@ class AIAgent:
                     self._context_stop_unacknowledged = True
                     if db is None or not getattr(self, "session_id", None):
                         raise RuntimeError("CONTEXT_DISPATCH_OWNER_UNAVAILABLE")
-                    db.record_context_stop(self.session_id)
+                    stop_session_id = self.session_id
+                    control = db.record_context_stop(stop_session_id)
+                    self._context_stop_receipt = {"session_key": stop_session_id, "control": control}
                     self._context_stop_unacknowledged = False
             except Exception:
                 self._context_stop_unacknowledged = True

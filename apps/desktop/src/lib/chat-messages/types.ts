@@ -79,6 +79,8 @@ export type GatewayEventPayload = {
   approval_mode?: string
   yolo?: boolean
   running?: boolean
+  // A completed bubble may still belong to an open host-owned turn.
+  chain_pending?: boolean
   turn_started_at?: number | null
   cwd?: string
   branch?: string

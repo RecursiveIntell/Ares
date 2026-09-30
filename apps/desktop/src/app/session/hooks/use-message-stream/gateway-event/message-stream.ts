@@ -317,6 +317,8 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
       return true
     }
 
+    const chainPending = payload?.chain_pending === true
+
     // Turn ended — drop any blocking prompt still open for THIS session
     // (e.g. interrupted, or the approval already resolved). Scoped to the
     // session so a background turn finishing can't wipe the active chat's
@@ -351,6 +353,13 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
 
     completeAssistantMessage(sessionId, finalText, payload?.response_previewed, failure, occurredAt)
 
+    if (chainPending) {
+      // This bubble ended, not the host-owned goal chain. Keep the existing
+      // per-runtime Stop control until a backend terminal session.info, even
+      // when a cooperative interrupt is still pending.
+      updateSessionState(sessionId, state => ({ ...state, busy: true, turnLive: true, awaitingResponse: !state.interrupted }))
+    }
+
     // Structured billing wall forwarded by the gateway (out of credits /
     // payment required) — cache it + raise a billing-specific toast.
     if (payload?.billing) {
@@ -358,14 +367,18 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
     }
 
     if (isActiveEvent) {
-      setTurnStartedAt(null)
+      if (!chainPending) {
+        setTurnStartedAt(null)
+      }
 
       // Pet beat: a finished turn always celebrates — go straight to the
       // jump, never linger on the run/reason pose. One atom update (clears
       // toolRunning/reasoning AND sets celebrate together) so no stray "run"
       // frame leaks to the sprite — including the popped-out overlay, which
       // mirrors each activity change. The jump runs ~2 loops, then settles.
-      flashPetActivity({ celebrate: true, reasoning: false, toolRunning: false }, 2200)
+      if (!chainPending) {
+        flashPetActivity({ celebrate: true, reasoning: false, toolRunning: false }, 2200)
+      }
 
       // Light up the pet's mail icon if the user wasn't looking when the turn
       // finished — a glanceable "new message" hint on the popped-out overlay.

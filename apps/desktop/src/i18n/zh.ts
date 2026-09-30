@@ -3003,7 +3003,10 @@ export const zh: Translations = {
       max: '最高',
       ultra: '超高',
       updateFailed: '模型选项更新失败',
-      fastFailed: '快速模式更新失败'
+      fastFailed: '快速模式更新失败',
+      unconfirmed: '模型选项尚未确认',
+      unconfirmedObserved: '更新结果尚未确认。现显示主机报告的当前设置；未重试写入。',
+      unconfirmedUnavailable: '更新结果未知。所选值尚未确认；未重试写入。'
     },
     gatewayMenu: {
       gateway: '网关',

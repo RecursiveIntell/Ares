@@ -1,7 +1,9 @@
-import { act, cleanup } from '@testing-library/react'
+import { act, cleanup, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { ComposerControls } from '@/app/chat/composer/controls'
 import type { ClientSessionState } from '@/app/types'
+import { I18nProvider } from '@/i18n'
 import { chatMessageText } from '@/lib/chat-messages'
 
 import { type MessageStreamHarness, renderMessageStream } from './test-harness'
@@ -111,5 +113,48 @@ describe('terminal error message.complete frames', () => {
     const bubble = lastAssistant()
     expect(bubble?.error).toBe('kaput')
     expect(bubble?.errorSurface).toBeUndefined()
+  })
+})
+
+describe('goal-chain reply boundary', () => {
+  afterEach(() => cleanup())
+
+  it('seals the reply without losing Stop before the host chain settles', async () => {
+    mountStream()
+    await start()
+    await delta('first step done')
+    await act(() => stream.handleEvent({
+      payload: { text: 'first step done', chain_pending: true },
+      session_id: SID, type: 'message.complete'
+    }))
+    expect(lastAssistant()?.pending).toBe(false)
+    expect(getState().busy).toBe(true)
+    expect(getState().turnLive).toBe(true)
+    render(
+      <I18nProvider configClient={null} initialLocale="en">
+        <ComposerControls
+          autoSpeak={false}
+          busy={getState().busy}
+          busyAction="stop"
+          canSubmit={true}
+          conversation={{ active: false, level: 0, muted: false, status: 'idle',
+            onEnd: vi.fn(), onStart: vi.fn(), onStopTurn: vi.fn(), onToggleMute: vi.fn() }}
+          disabled={false}
+          hasComposerPayload={false}
+          onDictate={vi.fn()}
+          onQueue={vi.fn()}
+          onToggleAutoSpeak={vi.fn()}
+          state={{ model: { canSwitch: false, model: '', provider: '' },
+            tools: { enabled: false, label: '' }, voice: { active: false, enabled: false } }}
+          voiceStatus="idle"
+        />
+      </I18nProvider>
+    )
+    expect(screen.getByRole('button', { name: 'Stop' })).toBeTruthy()
+
+    await act(() => stream.handleEvent({
+      payload: { running: false }, session_id: SID, type: 'session.info'
+    }))
+    expect(getState().busy).toBe(false)
   })
 })
