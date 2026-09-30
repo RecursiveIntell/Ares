@@ -2077,7 +2077,7 @@ def switch_model(
 
     # Override rejection if model is in the user's saved provider config.
     # API /v1/models may not list cloud/aliased models even though the server supports them.
-    if not validation.get("accepted"):
+    if not validation.get("accepted") and target_provider != "opencode-free":
         override = False
         if user_providers:
             from hermes_cli.config import is_provider_enabled
@@ -2124,6 +2124,15 @@ def switch_model(
                 is_global=is_global,
                 error_message=msg,
             )
+    elif not validation.get("accepted"):
+        return ModelSwitchResult(
+            success=False,
+            new_model=new_model,
+            target_provider=target_provider,
+            provider_label=provider_label,
+            is_global=is_global,
+            error_message=validation.get("message") or "Invalid OpenCode Free model",
+        )
 
     # Apply auto-correction if validation found a closer match
     if validation.get("corrected_model"):

@@ -214,7 +214,8 @@ describe('createGatewayEventHandler', () => {
       expect(getUiState().status).toBe('✓ goal complete')
 
       vi.advanceTimersByTime(6001)
-      expect(getUiState().status).toBe('ready')
+      // No backend session/model attestation was supplied in this fixture.
+      expect(getUiState().status).toBe('model unverified')
     } finally {
       vi.useRealTimers()
     }
@@ -362,6 +363,29 @@ describe('createGatewayEventHandler', () => {
     expect(appended[1]).toMatchObject({ role: 'assistant', text: 'final answer' })
   })
 
+  it('does not accept an ownerless ready frame for the current session', () => {
+    patchUiState({ sid: 'sid', status: 'model unverified' })
+    const onEvent = createGatewayEventHandler(buildCtx([]))
+
+    // A detached old record can still emit under the reused event sid while
+    // _session_info reports no registered session_id for its payload.
+    onEvent({
+      session_id: 'sid',
+      type: 'session.info',
+      payload: {
+        session_id: '',
+        model: 'configured-model',
+        provider: 'configured-provider',
+        model_ready: true,
+        skills: {},
+        tools: {}
+      }
+    } as any)
+
+    expect(getUiState().info?.model_ready).not.toBe(true)
+    expect(getUiState().status).toBe('model unverified')
+  })
+
   it('streams legacy thinking.delta into visible reasoning state', () => {
     vi.useFakeTimers()
     const appended: Msg[] = []
@@ -390,12 +414,13 @@ describe('createGatewayEventHandler', () => {
       onEvent({ payload: {}, type: 'message.start' } as any)
       onEvent({ payload: { text: 'final answer' }, type: 'message.complete' } as any)
       expect(getUiState().busy).toBe(false)
-      expect(getUiState().status).toBe('ready')
+      // Terminal completion does not attest a session/model in this fixture.
+      expect(getUiState().status).toBe('model unverified')
 
       onEvent({ payload: { text: 'thinking...' }, type: 'thinking.delta' } as any)
       vi.runOnlyPendingTimers()
 
-      expect(getUiState().status).toBe('ready')
+      expect(getUiState().status).toBe('model unverified')
       expect(getTurnState().reasoning).toBe('')
     } finally {
       vi.useRealTimers()

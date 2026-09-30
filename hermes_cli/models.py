@@ -495,7 +495,6 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     # discovery floor — live entries lead in the picker and stale curated
     # names never pollute the top.
     "opencode-zen": [
-        "x-preview-f-free",  # "Ox Alpha" stealth model — free, 1M ctx, ZDR
         "kimi-k3",
         "kimi-k2.5",
         "kimi-k2.6",
@@ -570,7 +569,6 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     # "opencode/latest"; we send honest Hermes attribution and don't
     # impersonate other clients — verified 2026-08-21).
     "opencode-free": [
-        "x-preview-f-free",  # "Ox Alpha" stealth model — free, 1M ctx, ZDR
         "hy3-free",
         "laguna-s-2.1-free",
         "nemotron-3-ultra-free",
@@ -4096,11 +4094,46 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
         except Exception:
             pass
 
-    # OpenCode Free: curated keyless list only. models.dev's cost.input==0
-    # filter lags reality (deepseek-v4-flash-free stayed "free" there after
-    # its promo ended and the relay began 401ing keyless requests), so the
-    # curated list — synced against anonymous live probes — is authoritative.
+    # Free-model promotions end without a Hermes release. The relay's live
+    # catalog is the only useful picker source; stale curated entries can 401
+    # immediately even though they looked selectable (x-preview-f-free did).
+    #
+    # Picker discipline (same class as #72762 / cached_fetch_api_models):
+    # the picker must NOT block on a live network round-trip when it opens.
+    # Serve a same-fingerprint cached entry immediately (TTL, then a bounded
+    # stale-serve window) and revalidate off-thread; a cold cache falls back
+    # to the curated keyless list rather than blocking the open.
     if normalized == "opencode-free":
+        if force_refresh:
+            live = fetch_api_models(
+                None, "https://opencode.ai/zen/v1", headers=opencode_zen_free_headers()
+            )
+            catalog = [model for model in (live or []) if is_opencode_zen_free_model(model)]
+            if catalog:
+                cache = _load_provider_models_cache()
+                cache[_OPENCODE_FREE_CACHE_KEY] = {
+                    "fp": None,
+                    "at": time.time(),
+                    "models": list(catalog),
+                }
+                _save_provider_models_cache(cache)
+            return catalog
+        cache = _load_provider_models_cache().get(_OPENCODE_FREE_CACHE_KEY)
+        fp = None
+        if _cache_entry_valid(cache if isinstance(cache, dict) else None, fp):
+            age = time.time() - cache["at"]
+            if age < _OPENCODE_FREE_CACHE_TTL:
+                return list(cache["models"])
+            if age < _OPENCODE_FREE_STALE_SERVE_MAX:
+                _spawn_swr_refresh(
+                    _OPENCODE_FREE_CACHE_KEY,
+                    lambda: _refresh_opencode_free_catalog(),
+                )
+                return list(cache["models"])
+            if _cache_entry_valid(
+                cache if isinstance(cache, dict) else None, fp
+            ):
+                return list(cache["models"])
         return list(_PROVIDER_MODELS.get(normalized, []))
 
     # ── Profile-based generic live fetch (all simple api-key providers) ──
@@ -4208,6 +4241,27 @@ _PROVIDER_MODELS_STALE_SERVE_MAX = 7 * 24 * 3600  # 7d
 # stack threads or duplicate network calls.
 _swr_refresh_inflight: set = set()
 _swr_refresh_lock = threading.Lock()
+
+# OpenCode Free relay catalog cache (keyless; fingerprint-free — the relay
+# catalog is global, not per-credential). TTL then bounded stale-serve, both
+# revalidated off-thread via _spawn_swr_refresh; cold cache serves curated.
+_OPENCODE_FREE_CACHE_KEY = "custom:https://opencode.ai/zen/v1#opencode-free"
+_OPENCODE_FREE_CACHE_TTL = 900  # 15 minutes
+_OPENCODE_FREE_STALE_SERVE_MAX = _PROVIDER_MODELS_STALE_SERVE_MAX
+
+
+def _refresh_opencode_free_catalog():
+    """Background refresh for the opencode-free cache entry (or None)."""
+    try:
+        live = fetch_api_models(
+            None, "https://opencode.ai/zen/v1", headers=opencode_zen_free_headers()
+        )
+    except Exception:
+        return None
+    catalog = [model for model in (live or []) if is_opencode_zen_free_model(model)]
+    if not catalog:
+        return None
+    return {"fp": None, "at": time.time(), "models": list(catalog)}
 
 
 def _spawn_swr_refresh(cache_key: str, refresh_fn=None) -> None:
@@ -5459,6 +5513,44 @@ def is_opencode_zen_free_model(model_id: Optional[str]) -> bool:
     return bare.endswith("-free") or bare in _OPENCODE_KEYLESS_EXTRA_SLUGS
 
 
+def probe_opencode_free_execution(model_id: str) -> tuple[bool, str]:
+    """Check that the anonymous relay will execute a listed free model."""
+    from urllib.error import HTTPError, URLError
+    from urllib.request import Request, urlopen
+
+    headers = {
+        **opencode_zen_free_headers(),
+        "Content-Type": "application/json",
+    }
+    request = Request(
+        "https://opencode.ai/zen/v1/chat/completions",
+        data=json.dumps({
+            "model": model_id,
+            "messages": [{"role": "user", "content": "OK"}],
+            "max_tokens": 1,
+        }).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=10) as response:
+            body = json.load(response)
+        if isinstance(body, dict) and body.get("choices"):
+            return True, ""
+        return False, "The OpenCode Free relay returned no completion."
+    except HTTPError as exc:
+        message = ""
+        try:
+            body = json.loads(exc.read(4096))
+            error = body.get("error") if isinstance(body, dict) else None
+            message = str(error.get("message") or "") if isinstance(error, dict) else ""
+        except Exception:
+            pass
+        return False, f"OpenCode Free rejected execution (HTTP {exc.code}): {message or exc.reason}"
+    except (OSError, URLError, ValueError) as exc:
+        return False, f"Could not verify OpenCode Free execution: {exc}"
+
+
 def opencode_zen_free_headers() -> dict:
     """Client default_headers for anonymous OpenCode Zen free-tier requests.
 
@@ -6353,6 +6445,28 @@ def validate_requested_model(
             "persist": False,
             "recognized": False,
             "message": "Model name cannot be empty.",
+        }
+
+    if normalized == "opencode-free":
+        # This provider is anonymous. Membership in a baked-in list is no
+        # evidence that the Zen relay still serves the model today.
+        live = provider_model_ids("opencode-free", force_refresh=True)
+        if requested_for_lookup in live:
+            executable, reason = probe_opencode_free_execution(requested_for_lookup)
+            return {
+                "accepted": executable,
+                "persist": executable,
+                "recognized": True,
+                "message": None if executable else reason,
+            }
+        return {
+            "accepted": False,
+            "persist": False,
+            "recognized": False,
+            "message": (
+                f"OpenCode Free does not currently list `{requested}`. "
+                "Refresh /model and choose a listed free model."
+            ),
         }
 
     if normalized == "moa":

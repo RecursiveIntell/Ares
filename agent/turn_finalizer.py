@@ -24,12 +24,31 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.context_compressor import _DB_PERSISTED_MARKER
 from agent.message_content import flatten_message_text
 from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.message_sanitization import _sanitize_surrogates
+
+
+@dataclass(frozen=True, eq=False)
+class AcceptedResponseRoute:
+    """In-process projection of one accepted physical response (not served-model proof).
+
+    The opaque token is minted by the gateway for its current turn; it is not
+    serialized or a provider attestation. The route is the dispatched request,
+    while served_model is the separately reported response identity.
+    """
+
+    turn_token: object
+    turn_id: str
+    session_id: str
+    attempt_id: str
+    provider: str
+    model: str
+    served_model: str | None
 
 
 def _is_pure_tool_call_tail(msg: dict) -> bool:
@@ -135,6 +154,7 @@ def finalize_turn(
     _turn_exit_reason,
     _pending_verification_response=None,
     _pending_verification_response_previewed=False,
+    accepted_response_route=None,
 ):
     """Run the post-loop finalization and return the turn ``result`` dict.
 
@@ -741,6 +761,15 @@ def finalize_turn(
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
+    # A route is evidence only for the accepted normal response, never a
+    # synthesized budget summary, interrupt, or failed turn. No mutable agent
+    # route is consulted when projecting this in-process witness.
+    if (
+        isinstance(accepted_response_route, AcceptedResponseRoute)
+        and completed and not failed and not interrupted
+        and not iteration_limit_fallback and normal_text_response
+    ):
+        result["accepted_response_route"] = accepted_response_route
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Persistence failures already set failed=True + an explanation in

@@ -51,6 +51,7 @@ import { createSlashHandler } from './createSlashHandler.js'
 import { planGatewayRecovery } from './gatewayRecovery.js'
 import { getInputSelection } from './inputSelectionStore.js'
 import { type GatewayRpc, type StateSetter, type TranscriptRow } from './interfaces.js'
+import { idleModelStatus } from './modelReadiness.js'
 import { $overlayState, patchOverlayState } from './overlayStore.js'
 import { $goodVibesTick } from './petFlashStore.js'
 import { scrollWithSelectionBy } from './scroll.js'
@@ -1057,13 +1058,13 @@ export function useMainApp(gw: GatewayClient) {
 
       try {
         const result = (await session.closeSession(id)) as null | SessionCloseResponse
-        patchUiState({ status: 'ready' })
+        patchUiState(state => ({ ...state, status: idleModelStatus(state.info, state.sid) }))
 
         return result
       } catch (e: unknown) {
         const message = e instanceof Error ? e.message : String(e)
         sys(`error: ${message}`)
-        patchUiState({ status: 'ready' })
+        patchUiState(state => ({ ...state, status: idleModelStatus(state.info, state.sid) }))
 
         throw e
       }
