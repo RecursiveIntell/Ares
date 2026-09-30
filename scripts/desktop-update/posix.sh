@@ -327,11 +327,18 @@ linux_gate() {
 }
 
 mac_swap() {
-  local rebuilt="" c
-  for c in "$INSTALL_ROOT/apps/desktop/release/mac-arm64/Hermes.app" \
-           "$INSTALL_ROOT/apps/desktop/release/mac/Hermes.app"; do
-    [ -d "$c" ] && { rebuilt="$c"; break; }
-  done
+  local rebuilt="" py
+  # Source discovery is independent of RELAUNCH_TARGET (the installed destination).
+  # Use the same manifest-derived identity and path validation as the CLI launcher.
+  py="$INSTALL_ROOT/venv/bin/python3"
+  [ -x "$py" ] || py="$(command -v python3 2>/dev/null)"
+  if [ "$FINAL_CODE" -eq 0 ]; then
+    if [ -z "$py" ] || ! rebuilt="$("$py" "$INSTALL_ROOT/hermes_cli/desktop_package.py" "$INSTALL_ROOT/apps/desktop")"; then
+      DONE_NOTE="Backend updated, but no valid rebuilt desktop app was found. The installed app was kept; rebuild or reinstall the desktop app."
+      log "WARNING: rebuilt app source discovery failed; keeping existing app"
+      return
+    fi
+  fi
 
   # Transactional swap: stage a full copy, move the old bundle aside, move
   # the copy in. Every step checked; a failed final move ROLLS BACK so the
