@@ -232,6 +232,7 @@ class ContextRebaseSnapshot:
     control_raw: Optional[str] = None
     input_control_raw: Optional[str] = None
     run_checkpoints: tuple[Dict[str, Any], ...] = ()
+    run_task_bindings: tuple[Dict[str, Any], ...] = ()
 
     @property
     def has_pending_inputs(self) -> bool:
@@ -291,6 +292,23 @@ class ContextRebaseSnapshot:
                  "authentic_users": self.authentic_users, "control_raw": self.control_raw,
                  "goal_raw": self.goal_raw, "heartbeat_raw": self.heartbeat_raw,
                  "loop_raw": self.loop_raw, "input_control_raw": self.input_control_raw}
+        return "sha256:" + hashlib.sha256(_canonical(value).encode("utf-8")).hexdigest()
+
+    @property
+    def dispatch_task_digest(self) -> str:
+        """Local response binding to the canonical task inventory and profile.
+
+        Keep this separate from recovery controls: a recovery saga intentionally
+        advances custody generations under one action_control_digest. A settled
+        response, however, cannot authorize further tool proposals after that
+        inventory changes. This is neither selection of one run nor a grant
+        from a profile, memory, graph or native permit owner.
+        """
+        value = {"schema": "SessionDBDispatchTaskBasisV1",
+                 "conversation_root": self.conversation_root,
+                 "profile_name": self.profile_name,
+                 "run_checkpoints": self.run_checkpoints,
+                 "run_task_bindings": self.run_task_bindings}
         return "sha256:" + hashlib.sha256(_canonical(value).encode("utf-8")).hexdigest()
 
 class SessionContextContinuityMixin(SessionContextAuthorityMixin):
@@ -1135,6 +1153,16 @@ class SessionContextContinuityMixin(SessionContextAuthorityMixin):
         if int(final["watermark"] if final else 0) != watermark:
             raise ContextContinuationError("CONTEXT_REBASE_SNAPSHOT_CHANGED")
         checkpoints = self._run_custodies_for_sessions_on_conn(conn, set(lineage), active_only=False)
+        # Derive task provenance from canonical immutable custody, never a
+        # caller's task label or optional goal projection. Released heads stay
+        # in the read set. Validate archived input provenance on this same
+        # connection without requiring historical sessions to remain live.
+        from hermes_state_runs import RunCustodyV2
+        task_bindings = []
+        for _, value in sorted(checkpoints.values(), key=lambda item: item[1].run_id):
+            if type(value) is RunCustodyV2:
+                self._check_task_binding_on_conn(conn, value)
+                task_bindings.append(asdict(value.task_binding))
         safe_checkpoints = tuple({
             "run_id": value.run_id,
             "generation": value.generation,
@@ -1159,6 +1187,7 @@ class SessionContextContinuityMixin(SessionContextAuthorityMixin):
             None if control_row is None else control_row[0],
             self._context_input_control_on_conn(conn, session_id),
             safe_checkpoints,
+            tuple(task_bindings),
         )
 
     def read_context_stop(self, session_id):
@@ -1230,11 +1259,12 @@ class SessionContextContinuityMixin(SessionContextAuthorityMixin):
                 if old.get("payload_digest") != payload_digest or old.get("session_id") != session_id:
                     raise ContextContinuationError("CONTEXT_DISPATCH_INTENT_COLLISION")
                 raise ContextContinuationError("CONTEXT_DISPATCH_ALREADY_ADMITTED")
-            record = {"schema": "SessionDBContextDispatchV1", "attempt_id": attempt_id,
+            record = {"schema": "SessionDBContextDispatchV2", "attempt_id": attempt_id,
                       "session_id": session_id, "conversation_root": snapshot.conversation_root,
                       "snapshot_digest": expected_snapshot_digest, "payload_digest": payload_digest,
                       "route_ref": route_ref, "control_revision": snapshot.control_revision,
                       "action_control_digest": snapshot.action_control_digest,
+                      "task_binding_digest": snapshot.dispatch_task_digest,
                       "input_watermark": snapshot.input_watermark, "admitted_at": time.time()}
             conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?)", (key, _canonical(record)))
             self._bind_input_turn_dispatch_on_conn(conn, session_id, turn_lease_holder, attempt_id)
@@ -1338,6 +1368,11 @@ class SessionContextContinuityMixin(SessionContextAuthorityMixin):
             raise ContextContinuationError("CONTEXT_TOOL_RESPONSE_NOT_ADMITTED")
         self._assert_context_rebase_lease_on_conn(conn, session_id, holder)
         current = self._read_context_rebase_snapshot_on_conn(conn, session_id)
+        # Old receipts without this basis fail closed. They remain readable
+        # execution history, but cannot authorize a new tool/signing operation.
+        if (admitted.get("schema") != "SessionDBContextDispatchV2"
+                or current.dispatch_task_digest != admitted.get("task_binding_digest")):
+            raise ContextContinuationError("CONTEXT_TOOL_TASK_SUPERSEDED")
         if current.action_control_digest != admitted.get("action_control_digest"):
             raise ContextContinuationError("CONTEXT_TOOL_CONTROL_SUPERSEDED")
         if current.has_unresolved_effects:
