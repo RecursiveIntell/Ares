@@ -38,6 +38,7 @@ _EXPORT_MODULES = {
     'ContextMaterializer': '.collaboration',
     'ContextPacketV1': '.collaboration',
     'ResolvedPolicyBasisV1': '.collaboration',
+    'ResolvedPolicyBasisV2': '.collaboration',
     'SealedInvocationV1': '.collaboration',
     'ContractBindings': '.collaboration',
     'ContractError': '.collaboration',

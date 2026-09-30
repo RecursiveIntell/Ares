@@ -1145,6 +1145,12 @@ class ResolvedPolicyBasisV1(ImmutableArtifact):
 
     _owner_capability: object | None = None
 
+    _validate_owner = staticmethod(_validate_profile_runtime_basis)
+
+    @staticmethod
+    def _policy_payload(owner: Mapping[str, Any]) -> dict[str, Any]:
+        return _validate_profile_runtime_basis(owner)
+
     @property
     def owner_verified(self) -> bool:
         return self._owner_capability is _OWNER_POLICY_CAPABILITY
@@ -1156,12 +1162,12 @@ class ResolvedPolicyBasisV1(ImmutableArtifact):
         *,
         resolve_owner: Callable[[str, str], Mapping[str, Any] | None],
     ) -> "ResolvedPolicyBasisV1":
-        owner = _validate_profile_runtime_basis(raw)
+        owner = cls._validate_owner(raw)
         basis_digest = "blake3:" + owner["basis_digest"]
         current = resolve_owner(owner["basis_ref"], basis_digest)
         if not isinstance(current, Mapping):
             raise ContractError("OWNER_POLICY_UNAVAILABLE")
-        current_owner = _validate_profile_runtime_basis(current)
+        current_owner = cls._validate_owner(current)
         if canonical_json(current_owner) != canonical_json(owner):
             raise ContractError("OWNER_POLICY_MISMATCH")
         projection = {
@@ -1177,7 +1183,7 @@ class ResolvedPolicyBasisV1(ImmutableArtifact):
     @classmethod
     def parse(cls, raw: Mapping[str, Any]) -> "ResolvedPolicyBasisV1":
         value = _strict_artifact(raw, _POLICY_BASIS_FIELDS, "projection_digest")
-        owner = _validate_profile_runtime_basis(value.get("owner_projection"))
+        owner = cls._validate_owner(value.get("owner_projection"))
         if (
             value.get("basis_ref") != owner["basis_ref"]
             or value.get("basis_digest") != "blake3:" + owner["basis_digest"]
@@ -1187,6 +1193,54 @@ class ResolvedPolicyBasisV1(ImmutableArtifact):
             {**value, "projection_digest": raw["projection_digest"]},
             "projection_digest",
         )
+
+
+class ResolvedPolicyBasisV2(ResolvedPolicyBasisV1):
+    """Task-bound V2 identity from profile-runtime, never an effect permit.
+
+    The nested V1 policy is interpreted without replacing the outer owner
+    identity. Digests stay opaque: only a current owner readback confers the
+    in-process verification capability, and egress repeats that readback.
+    """
+
+    @classmethod
+    def from_profile_runtime(
+        cls,
+        raw: Mapping[str, Any],
+        *,
+        expected_task_ref: str,
+        resolve_owner: Callable[[str, str], Mapping[str, Any] | None],
+    ) -> "ResolvedPolicyBasisV2":
+        _check_ref(expected_task_ref, "expected_task_ref")
+        owner = cls._validate_owner(raw)
+        if owner["owner_projection"]["task_ref"] != expected_task_ref:
+            raise ContractError("POLICY_TASK_MISMATCH")
+        return super().from_profile_runtime(owner, resolve_owner=resolve_owner)
+
+    @staticmethod
+    def _validate_owner(raw: Any) -> dict[str, Any]:
+        fields = {"schema", "basis_ref", "owner_projection", "basis_digest"}
+        value = _strict_keys(raw, fields, fields, "owner_projection")
+        if value["schema"] != "profile-runtime.resolved-policy-basis/v2":
+            raise ContractError("UNSUPPORTED_POLICY_OWNER", "schema")
+        policy = _validate_profile_runtime_basis(value["owner_projection"])
+        expected_ref = (
+            "profile-runtime:resolved-policy-basis/v2:" + policy["basis_digest"]
+        )
+        if value["basis_ref"] != expected_ref:
+            raise ContractError("OWNER_POLICY_MISMATCH", "basis_ref")
+        if not isinstance(value["basis_digest"], str) or not _is_algorithm_digest(
+            "blake3:" + value["basis_digest"], "blake3"
+        ):
+            raise ContractError("INVALID_DIGEST", "basis_digest")
+        # Retain exact owner wire fields, including omitted default arrays.
+        # Ares must not recompute or normalize the owner's V2 identity.
+        return _thaw(_freeze(value))
+
+    @staticmethod
+    def _policy_payload(owner: Mapping[str, Any]) -> dict[str, Any]:
+        value = ResolvedPolicyBasisV2._validate_owner(owner)
+        return _validate_profile_runtime_basis(value["owner_projection"])
 
 
 class SealedInvocationV1(ImmutableArtifact):
@@ -1245,7 +1299,7 @@ class ContextMaterializer:
         if not isinstance(basis, ResolvedPolicyBasisV1) or not basis.owner_verified:
             raise ContractError("OWNER_POLICY_UNAVAILABLE")
         payload = basis.to_dict()
-        return _validate_profile_runtime_basis(payload["owner_projection"])
+        return basis._policy_payload(payload["owner_projection"])
 
     @staticmethod
     def _require_graph_obligation(
@@ -1417,8 +1471,8 @@ class ContextMaterializer:
         if not isinstance(resolved_owner, Mapping):
             raise ContractError("OWNER_POLICY_UNAVAILABLE")
         if canonical_json(
-            _validate_profile_runtime_basis(resolved_owner)
-        ) != canonical_json(owner):
+            basis._validate_owner(resolved_owner)
+        ) != canonical_json(current["owner_projection"]):
             raise ContractError("POLICY_BASIS_MISMATCH")
         if (
             record["basis_ref"] != current["basis_ref"]
