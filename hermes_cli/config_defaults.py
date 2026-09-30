@@ -1622,6 +1622,10 @@ DEFAULT_CONFIG = {
         # Process-isolation rollout controls. Runtime reads these through the
         # raw config loader, so tui_gateway.server also owns explicit defaults.
         "turn_isolation": False,
+        # Opt-in dispatch-location guarantee: deny if a turn cannot reach the
+        # compute host. This is NOT OS isolation: the host inherits the user's
+        # process privileges and plugins may still load in the serving process.
+        "require_compute_host": False,
         "compute_host_heartbeat_secs": 15,
         "compute_host_respawn_max": 3,
         # Finite execution bound for an already-authorized turn after the last
