@@ -101,7 +101,19 @@ def child_environment(environment, root, python):
     return env
 
 
+def posix_capabilities(platform_name):
+    """Require real POSIX process-group cancellation before creating resources."""
+    if platform_name != "posix":
+        raise PolicyError("Reviewed installer requires POSIX process-group support")
+    group_signal = getattr(os, "killpg", None)
+    signals = tuple(getattr(signal, name, None) for name in ("SIGINT", "SIGTERM", "SIGHUP", "SIGKILL"))
+    if not callable(group_signal) or any(not isinstance(value, int) or isinstance(value, bool) or value <= 0 for value in signals):
+        raise PolicyError("Required POSIX cancellation capabilities are unavailable")
+    return group_signal, signals
+
+
 def run(root, uv, python, *, dry_run=False, check=False):
+    group_signal, (interrupt_signal, terminate_signal, hangup_signal, kill_signal) = posix_capabilities(os.name)
     root = Path(root).resolve(strict=True)
     python = Path(python).absolute()
     if python != root / "venv/bin/python" or not python.is_file() or not os.access(python, os.X_OK):
@@ -119,7 +131,7 @@ def run(root, uv, python, *, dry_run=False, check=False):
         projection = project_policy(tomllib.loads(original[0].decode("utf-8")))
     except (ValueError, TypeError, AttributeError, UnicodeError):
         raise PolicyError("Malformed reviewed project policy") from None
-    version = subprocess.run([uv, "--version"], env=env, cwd=root, capture_output=True, text=True)
+    version = subprocess.run([uv, "--version"], env=env, cwd=root, capture_output=True, text=True, encoding="utf-8", errors="strict")
     match = re.fullmatch(r"uv (\d+)\.(\d+)\.(\d+)(?: [^\n]*)?\n?", version.stdout)
     if version.returncode or not match or not ( (0, 9, 28) <= tuple(map(int, match.groups())) < (0, 13, 0)):
         raise PolicyError("Unsupported uv version; reviewed range is 0.9.28 through 0.12.x")
@@ -143,7 +155,7 @@ def run(root, uv, python, *, dry_run=False, check=False):
             raise InterruptedError(pending_signal)
 
     try:
-        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        for sig in (interrupt_signal, terminate_signal, hangup_signal):
             previous[sig] = signal.signal(sig, interrupted)
         acquiring = True
         try:
@@ -180,17 +192,17 @@ def run(root, uv, python, *, dry_run=False, check=False):
         if child is not None:
             # Also clean up descendants if their leader has already exited.
             try:
-                os.killpg(child.pid, signal.SIGTERM)
+                group_signal(child.pid, terminate_signal)
             except ProcessLookupError:
                 pass
             try:
                 child.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                os.killpg(child.pid, signal.SIGKILL)
+                group_signal(child.pid, kill_signal)
                 child.wait()
             # A descendant can ignore TERM even after the leader exits.
             try:
-                os.killpg(child.pid, signal.SIGKILL)
+                group_signal(child.pid, kill_signal)
             except ProcessLookupError:
                 pass
         if filename is not None:

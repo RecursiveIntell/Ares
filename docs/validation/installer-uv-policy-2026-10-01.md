@@ -83,3 +83,15 @@ Revert only this scoped helper/integration/tests/documentation change. Reverting
 restores the diagnosed policy-loss and unlocked-fallback behavior; it does not
 repair that behavior safely. Never regenerate a lock, add age exceptions, change
 trust settings, or delete retained failure evidence as a workaround.
+
+## Hosted scanner correction
+
+The first PR head failed the repository-wide Windows footgun gate because the
+version probe lacked explicit text encoding and cancellation used unguarded
+POSIX-only symbols. The correction decodes version output as strict UTF-8 and
+validates POSIX identity plus every required signal/process-group capability
+before executing uv or creating a temporary config. Missing capabilities fail
+closed; this does not add Windows support or weaken descendant cleanup.
+The scanner and its suppressions are unchanged. Regression coverage includes
+missing capabilities, unsupported platform input, and valid/invalid UTF-8 under
+an ASCII locale, alongside the existing cleanup and offline policy proofs.

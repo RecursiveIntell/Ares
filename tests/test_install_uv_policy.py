@@ -319,3 +319,34 @@ def test_signal_at_resource_ownership_boundary(tmp_path, monkeypatch, boundary):
     assert policy.run(project, str(uv), project / "venv/bin/python") == 143
     assert all(child.poll() is not None for child in children)
     assert not list(project.glob(".ares-reviewed-uv-*"))
+
+
+@pytest.mark.parametrize("module,name", [(os, "killpg"), (signal, "SIGINT"), (signal, "SIGTERM"), (signal, "SIGHUP"), (signal, "SIGKILL")])
+def test_missing_posix_capability_fails_before_execution(tmp_path, monkeypatch, module, name):
+    project, uv = fixture(tmp_path)
+    monkeypatch.setattr(module, name, None)
+    with pytest.raises(policy.PolicyError, match="capabilities are unavailable"):
+        policy.run(project, str(uv), project / "venv/bin/python")
+    assert not (tmp_path / "record").exists()
+    assert not list(project.glob(".ares-reviewed-uv-*"))
+
+
+@pytest.mark.parametrize("output,expected", [(b"uv 0.12.19 (caf\xc3\xa9)\n", 0), (b"uv 0.12.19 (bad\xff)\n", 2)])
+def test_version_probe_explicit_utf8_under_ascii_locale(tmp_path, output, expected):
+    project, uv = fixture(tmp_path)
+    original = uv.read_text()
+    # The version bytes are emitted directly, independent of the child locale.
+    uv.write_text(original.replace('print("uv 0.12.19"); sys.exit(0)', f'os.write(1, {output!r}); sys.exit(0)'))
+    env = clean_env(); env.update(LC_ALL="C", PYTHONUTF8="0", PYTHONCOERCECLOCALE="0")
+    result = subprocess.run(command(project, uv), env=env, capture_output=True)
+    assert result.returncode == expected, result.stderr
+    assert b"Traceback" not in result.stderr
+    if expected:
+        assert not (tmp_path / "record").exists()
+    assert not list(project.glob(".ares-reviewed-uv-*"))
+
+
+def test_unsupported_platform_contract_fails_closed():
+    # Platform is explicit input to the capability guard, not a mocked host.
+    with pytest.raises(policy.PolicyError, match="requires POSIX"):
+        policy.posix_capabilities("nt")
