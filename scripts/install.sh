@@ -2401,6 +2401,22 @@ configure_browser_env_from_system_browser() {
     log_success "Configured browser tools to use $browser_path"
 }
 
+report_npm_failure() {
+    local stage="$1" code="$2" started="$3" output="$4" py
+    local elapsed=$((SECONDS - started))
+    log_error "npm dependency install failed (stage $stage, exit $code, elapsed ${elapsed}s)"
+    [ "$code" -ne 124 ] || log_error "npm dependency command returned timeout status 124"
+    py="$INSTALL_DIR/venv/bin/python"
+    [ -x "$py" ] || py="$(command -v python3 2>/dev/null)"
+    if [ -n "$py" ] && [ -f "$INSTALL_DIR/scripts/npm_failure_diagnostics.py" ]; then
+        "$py" "$INSTALL_DIR/scripts/npm_failure_diagnostics.py" summarize \
+            --input "$output" --stage "$stage" --exit-code "$code" --elapsed "$elapsed" \
+            || log_warn "Sanitized npm diagnostics unavailable"
+    else
+        log_warn "Sanitized npm diagnostics unavailable"
+    fi
+}
+
 install_node_deps() {
     if [ "$HAS_NODE" = false ]; then
         log_info "Skipping Node.js dependencies (Node not installed)"
@@ -2423,18 +2439,15 @@ install_node_deps() {
         # installed", hiding the degradation from the user (#77003). Now it
         # fails the install outright instead of burying the warning (#85297).
         # Capture npm output so failures are diagnosable (#87340).
-        local npm_log
+        local npm_log npm_code=0 npm_started=$SECONDS
         npm_log="$(mktemp)"
-        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent \
-                >"$npm_log" 2>&1; then
-            log_error "npm install failed or timed out; Node.js dependencies were not installed"
-            if [ -s "$npm_log" ]; then
-                log_error "npm output:"
-                cat "$npm_log" >&2
-            fi
+        run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --loglevel=error \
+            >"$npm_log" 2>&1 || npm_code=$?
+        if [ "$npm_code" -ne 0 ]; then
+            report_npm_failure root "$npm_code" "$npm_started" "$npm_log"
             rm -f "$npm_log"
             restore_dirty_lockfiles "$INSTALL_DIR"
-            return 1
+            return "$npm_code"
         fi
         rm -f "$npm_log"
         log_success "Node.js dependencies installed"
@@ -2539,18 +2552,15 @@ install_node_deps() {
         # Report success only on actual success, same as node-deps above
         # (#77003) — and fail the install outright (#85297).
         # Capture npm output so failures are diagnosable (#87340).
-        local tui_npm_log
+        local tui_npm_log tui_npm_code=0 tui_npm_started=$SECONDS
         tui_npm_log="$(mktemp)"
-        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent \
-                >"$tui_npm_log" 2>&1; then
-            log_error "TUI npm install failed or timed out; TUI dependencies were not installed"
-            if [ -s "$tui_npm_log" ]; then
-                log_error "npm output:"
-                cat "$tui_npm_log" >&2
-            fi
+        run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --loglevel=error \
+            >"$tui_npm_log" 2>&1 || tui_npm_code=$?
+        if [ "$tui_npm_code" -ne 0 ]; then
+            report_npm_failure tui "$tui_npm_code" "$tui_npm_started" "$tui_npm_log"
             rm -f "$tui_npm_log"
             restore_dirty_lockfiles "$INSTALL_DIR"
-            return 1
+            return "$tui_npm_code"
         fi
         rm -f "$tui_npm_log"
         log_success "TUI dependencies installed"
