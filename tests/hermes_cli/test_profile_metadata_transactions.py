@@ -383,3 +383,30 @@ def test_gateway_write_failure_does_not_report_uncommitted_revisions(tmp_path, m
     assert applied["ui_meta"] is False
     assert "ui_meta_revisions" not in applied
     assert not (tmp_path / "profile.yaml").exists()
+
+
+def test_lock_descriptor_closes_if_binary_wrapper_construction_fails(tmp_path, monkeypatch):
+    original_open = os.open
+    descriptors = []
+    def tracked_open(*args, **kwargs):
+        descriptor = original_open(*args, **kwargs)
+        descriptors.append(descriptor)
+        return descriptor
+    def failed_fdopen(*args, **kwargs):
+        raise RuntimeError("simulated binary wrapper failure")
+    monkeypatch.setattr(os, "open", tracked_open)
+    monkeypatch.setattr(os, "fdopen", failed_fdopen)
+    try:
+        with pytest.raises(RuntimeError, match="simulated binary wrapper failure"):
+            profiles.write_profile_meta(tmp_path, description="not published")
+        assert len(descriptors) == 1
+        with pytest.raises(OSError):
+            os.fstat(descriptors[0])
+        assert not (tmp_path / "profile.yaml").exists()
+    finally:
+        # The red regression must not leak its descriptor into other tests.
+        for descriptor in descriptors:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass

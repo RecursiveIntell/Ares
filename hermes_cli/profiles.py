@@ -965,43 +965,48 @@ def _profile_metadata_lock(profile_dir: Path, timeout: float):
     _metadata_file_identity(lock_path)
     flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
     # A distinct descriptor per call also serializes threads in this process.
-    with os.fdopen(os.open(lock_path, flags, 0o600), "r+b", buffering=0) as handle:
-        opened = os.fstat(handle.fileno())
-        lock_id = opened.st_dev, opened.st_ino
-        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
-            raise ValueError("PROFILE_METADATA_FILE_ALIAS_OR_INVALID")
+    descriptor = os.open(lock_path, flags, 0o600)
+    try:
+        # Keep descriptor ownership here even if wrapper construction fails.
+        with os.fdopen(descriptor, "r+b", buffering=0, closefd=False) as handle:
+            opened = os.fstat(handle.fileno())
+            lock_id = opened.st_dev, opened.st_ino
+            if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+                raise ValueError("PROFILE_METADATA_FILE_ALIAS_OR_INVALID")
 
-        def validate_identity():
-            now = directory.stat()
-            parent_now = target_parent.stat()
-            if (
-                original.resolve(strict=True) != directory
-                or (now.st_dev, now.st_ino) != directory_id
-                or original_metadata.resolve() != metadata_path
-                or (parent_now.st_dev, parent_now.st_ino) != parent_id
-                or _metadata_file_identity(lock_path) != lock_id
-            ):
-                raise ValueError("PROFILE_METADATA_IDENTITY_CHANGED")
+            def validate_identity():
+                now = directory.stat()
+                parent_now = target_parent.stat()
+                if (
+                    original.resolve(strict=True) != directory
+                    or (now.st_dev, now.st_ino) != directory_id
+                    or original_metadata.resolve() != metadata_path
+                    or (parent_now.st_dev, parent_now.st_ino) != parent_id
+                    or _metadata_file_identity(lock_path) != lock_id
+                ):
+                    raise ValueError("PROFILE_METADATA_IDENTITY_CHANGED")
 
-        deadline = time.monotonic() + timeout
-        while True:
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    _try_profile_metadata_lock(handle, backend)
+                    break
+                except BlockingIOError:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("PROFILE_METADATA_LOCK_TIMEOUT") from None
+                    time.sleep(min(0.025, remaining))
             try:
-                _try_profile_metadata_lock(handle, backend)
-                break
-            except BlockingIOError:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError("PROFILE_METADATA_LOCK_TIMEOUT") from None
-                time.sleep(min(0.025, remaining))
-        try:
-            validate_identity()
-            yield metadata_path, validate_identity
-        finally:
-            if backend.__name__ == "fcntl":
-                backend.flock(handle.fileno(), backend.LOCK_UN)
-            else:
-                handle.seek(0)
-                backend.locking(handle.fileno(), backend.LK_UNLCK, 1)
+                validate_identity()
+                yield metadata_path, validate_identity
+            finally:
+                if backend.__name__ == "fcntl":
+                    backend.flock(handle.fileno(), backend.LOCK_UN)
+                else:
+                    handle.seek(0)
+                    backend.locking(handle.fileno(), backend.LK_UNLCK, 1)
+    finally:
+        os.close(descriptor)
     # Never unlink the lock file: waiters may still own its inode.
 
 
