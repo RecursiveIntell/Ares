@@ -11,6 +11,8 @@ import argparse
 import concurrent.futures
 import contextlib
 import json
+
+from tui_gateway.checkpoint_json import load_checkpoint_frame
 import os
 import signal
 import subprocess
@@ -841,7 +843,7 @@ class ComputeHost:
             if route == "idle-gated" and session.get("running"):
                 self.emit({"type": "control.error", "sid": sid, "request_id": request_id, "message": "session busy"})
                 return
-            if route_name in {"session.run_checkpoint.claim", "session.run_checkpoint.refresh", "session.run_checkpoint.release"}:
+            if route_name in {"session.run_checkpoint.claim", "session.run_checkpoint.refresh", "session.run_checkpoint.release", "session.run_checkpoint.basis"}:
                 from tui_gateway.transport import bind_transport, reset_transport
                 params = frame.get("params")
                 if type(params) is not dict or params.get("session_id") != sid:
@@ -1101,7 +1103,7 @@ def run_host(stdin: Any = None, stdout: Any = None) -> None:
             if host._closed.is_set():
                 break
             try:
-                frame = json.loads(raw)
+                frame = load_checkpoint_frame(raw)
             except json.JSONDecodeError as exc:
                 host.emit({"type": "error", "message": f"invalid json: {exc}"})
                 continue

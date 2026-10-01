@@ -11,6 +11,13 @@ method = _registry.method
 _profile_scoped = _registry.profile_scoped
 
 
+@method("session.run_checkpoint.basis")
+def _(rid, params: dict) -> dict:
+    from tui_gateway import server
+    from tui_gateway.run_checkpoint_rpc import handle
+    return handle(server, rid, params, "basis")
+
+
 @method("session.run_checkpoint.claim")
 def _(rid, params: dict) -> dict:
     from tui_gateway import server

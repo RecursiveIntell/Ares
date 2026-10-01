@@ -178,6 +178,7 @@ def test_mutator_route_table_matches_prd_inventory():
         "session.run_checkpoint.claim": "run-concurrent",
         "session.run_checkpoint.refresh": "run-concurrent",
         "session.run_checkpoint.release": "run-concurrent",
+        "session.run_checkpoint.basis": "run-concurrent",
         "session.compress": "idle-gated",
         "prompt.submit.truncate": "idle-gated",
         "slash.model": "idle-gated",

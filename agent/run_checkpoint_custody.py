@@ -4,7 +4,7 @@ No database is opened here and no renewal timer is created. Uncertain mutations
 retain a handle requiring reconciliation; neither teardown nor a later turn
 retries them. Tokens and lease holders never appear in returned summaries.
 """
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 import os
 import threading
 import time
@@ -123,6 +123,23 @@ class TurnRunCustody:
             raise ClaimOutcomeUnknown(handle.error) from None
         handle.status = "owned" if updated.disposition == "active" else "released"
         return updated
+
+    def observe_basis(self, holder, *, session_id, run_id, expected_generation):
+        """Observe an existing private handle without changing its state."""
+        with self._lock:
+            self._active(holder)
+            handle = self._handle(holder, run_id, expected_generation)
+            if handle.recovery_pending:
+                raise ClaimRefusal("CUSTODY_RECOVERY_PENDING")
+            try:
+                value = self.db.observe_owned_run(run_id, owner_token=handle.value.owner_token,
+                    expected_generation=expected_generation, expected_session_id=session_id,
+                    lease_holder=holder)
+            except RunCustodyError as exc:
+                raise ClaimRefusal(exc.code) from None
+            except Exception:
+                raise ClaimOutcomeUnknown("OBSERVATION_UNAVAILABLE") from None
+            return asdict(value)
 
     def refresh(self, holder, *, run_id, expected_generation, ttl_seconds):
         with self._lock:

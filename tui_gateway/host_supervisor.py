@@ -9,6 +9,8 @@ not contend with the serving process' event loop for the same GIL.
 from __future__ import annotations
 
 import json
+
+from tui_gateway.checkpoint_json import load_checkpoint_frame
 import logging
 import os
 import queue
@@ -44,6 +46,7 @@ MUTATOR_ROUTE_TABLE: dict[str, str] = {
     "session.run_checkpoint.claim": "run-concurrent",
     "session.run_checkpoint.refresh": "run-concurrent",
     "session.run_checkpoint.release": "run-concurrent",
+    "session.run_checkpoint.basis": "run-concurrent",
     "session.compress": "idle-gated",
     "prompt.submit.truncate": "idle-gated",
     "slash.model": "idle-gated",
@@ -695,9 +698,9 @@ class HostSupervisor:
         assert proc.stdout is not None
         for raw in proc.stdout:
             try:
-                frame = json.loads(raw)
+                frame = load_checkpoint_frame(raw)
             except json.JSONDecodeError:
-                logger.warning("compute host emitted invalid json: %r", raw[:200])
+                logger.warning("compute host emitted invalid json")
                 continue
             if isinstance(frame, dict):
                 with self._registry_lock:
