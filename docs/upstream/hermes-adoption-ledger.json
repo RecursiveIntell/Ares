@@ -1,6 +1,6 @@
 {
   "schema_version": "ares-upstream-adoption/v1",
-  "updated_at": "2026-10-01T05:24:00Z",
+  "updated_at": "2026-10-01T06:15:00Z",
   "upstream": {
     "repository": "NousResearch/hermes-agent",
     "cutoff": "d63c6eb87454fa7e693020d432d665ee77e30303",
@@ -10,7 +10,8 @@
   },
   "target": {
     "repository": "RecursiveIntell/Ares",
-    "candidate_base": "4f2b8ebb8f17978329cd0f97333054e08b794cfe"
+    "candidate_base": "4f2b8ebb8f17978329cd0f97333054e08b794cfe",
+    "last_reviewed_main": "4a78e4f58a689860df87dd01bf390386a0052498"
   },
   "historical": [
     {
@@ -30,7 +31,7 @@
   "groups": [
     {
       "id": "gemini-array-projection-20261001",
-      "status": "candidate_pending_independent_postaudit",
+      "status": "adopted_and_postmerge_qualified",
       "sources": [
         {
           "sha": "6a04ea67c0e75ef1218bf4ceaac071c2f16a0701",
@@ -83,11 +84,98 @@
         "generic_extraction_parity_cases": 180,
         "real_native_sync_async_loopback": true,
         "preaudit": "accepted_restricted_adaptation",
+        "postaudit": "passed; independent409tests plus720generic and840scalar comparisons",
+        "hosted_ci": "exact PR head and exact merge commit terminal required checks succeeded",
+        "post_merge_workflows": {
+          "CI": 36821340135,
+          "Context continuity qualification": 36821339011,
+          "Nix flake check": 36821339057
+        },
+        "docker_build": "conditional build skipped; no build claim",
+        "independent_behavior_parity": {
+          "generic_cases": 720,
+          "scalar_cases": 840,
+          "mismatches": 0
+        }
+      },
+      "adopted_target_commit": "0da983f04781e6718c768477bd6c770b514dc2eb",
+      "rollback": "Revert only this bounded adoption commit; no migrations, source pins or activation changed",
+      "merge_commit": "4a78e4f58a689860df87dd01bf390386a0052498",
+      "pull_request": "https://github.com/RecursiveIntell/Ares/pull/110",
+      "candidate_base": "4f2b8ebb8f17978329cd0f97333054e08b794cfe"
+    },
+    {
+      "id": "tui-keyboard-20261001",
+      "status": "locally_qualified_pending_independent_postaudit",
+      "candidate_base": "4a78e4f58a689860df87dd01bf390386a0052498",
+      "sources": [
+        {
+          "sha": "c3ce41645cb08f39e7dd5739dcfd72527096896f",
+          "author": "Franci Penov",
+          "decision": "adapt",
+          "reason": "Restore inserted shifted ASCII letters for existing CSI-u/modifyOtherKeys paths while retaining canonical command identity"
+        },
+        {
+          "sha": "6e2b8e070d28b1a3381a3fb290b6b8d6cce13cef",
+          "author": "Ben Barclay",
+          "decision": "adapt",
+          "reason": "Case-insensitive shifted redo requires Ares-specific Shift exclusion on the earlier undo branch and canonical command/text separation"
+        }
+      ],
+      "intentional_deferrals": [
+        {
+          "surface": "blanket raw-uppercase shortcut normalization",
+          "reason": "Would newly activate currently literal raw ESC-uppercase chords; preserve those outcomes outside the explicit redo correction"
+        },
+        {
+          "surface": "parser, platform policy, Unicode/IME, keyboard negotiation and broad TUI refactors",
+          "reason": "Unnecessary owner expansion; only existing ASCII enhanced-protocol mapping and local command dispatch are changed"
+        },
+        {
+          "surface": "native macOS/Windows and real terminal-emulator certification",
+          "reason": "Current local and hosted JS validation is Linux; native-host gates and terminal-emulator tests remain unexecuted"
+        }
+      ],
+      "validation": {
+        "preaudit": "restricted canonical-command adaptation and existing-name declaration projection accepted",
+        "baseline_regression_tests": {
+          "failed": 8,
+          "passed": 11,
+          "native_macos_skipped": 3
+        },
+        "targeted_candidate_tests": {
+          "passed": 19,
+          "native_macos_skipped": 3
+        },
+        "native_linux_word_compatibility_witnesses": 9,
+        "full_affected_checks": {
+          "ink_build": "passed",
+          "ink_typecheck": "passed",
+          "tui_typecheck": "passed",
+          "tui_suite": {
+            "files_passed": 160,
+            "tests_passed": 1734,
+            "tests_failed": 0,
+            "native_macos_tests_skipped": 3
+          },
+          "lint": "passed with two existing hook warnings; no new warnings",
+          "tui_bundle_build": "passed",
+          "python_registry_parity": "passed after canonical source materialization"
+        },
         "postaudit": "pending",
-        "hosted_ci": "pending"
+        "hosted_ci": "pending",
+        "local_environment": {
+          "platform": "Linux",
+          "node": "24.19.0",
+          "esbuild": "0.28.2",
+          "react": "19.2.7",
+          "vitest": "4.1.11",
+          "note": "reused installed dependencies; repository esbuild pin0.28.1 and hostedNode26 validation remain CI gates"
+        }
       },
       "adopted_target_commit": null,
-      "rollback": "Revert only this bounded adoption commit; no migrations, source pins or activation changed"
+      "rollback": "Revert isolated group and rebuild Ink/TUI artifact; no data migration, dependency rollback or activation involved",
+      "declaration_projection": "ui-tui/src/types/hermes-ink.d.ts now exposes existing optional readonly keypress.name; no runtime field introduced"
     }
   ]
 }
