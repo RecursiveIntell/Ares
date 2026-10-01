@@ -53,14 +53,14 @@ def _normalize_forward_env_names(forward_env: list[str] | None) -> list[str]:
 
     for item in forward_env or []:
         if not isinstance(item, str):
-            logger.warning("Ignoring non-string docker_forward_env entry: %r", item)
+            logger.warning("Ignoring non-string docker_forward_env entry")
             continue
 
         key = item.strip()
         if not key:
             continue
         if not _ENV_VAR_NAME_RE.match(key):
-            logger.warning("Ignoring invalid docker_forward_env entry: %r", item)
+            logger.warning("Ignoring invalid docker_forward_env entry")
             continue
         if key in seen:
             continue
@@ -75,17 +75,18 @@ def _normalize_env_dict(env: dict | None) -> dict[str, str]:
     """Validate and normalize a docker_env dict to {str: str}.
 
     Filters out entries with invalid variable names or non-string values.
+    Rejected keys and values may contain credentials; warnings never echo them.
     """
     if not env:
         return {}
     if not isinstance(env, dict):
-        logger.warning("docker_env is not a dict: %r", env)
+        logger.warning("docker_env is not a dict; ignoring it")
         return {}
 
     normalized: dict[str, str] = {}
     for key, value in env.items():
         if not isinstance(key, str) or not _ENV_VAR_NAME_RE.match(key.strip()):
-            logger.warning("Ignoring invalid docker_env key: %r", key)
+            logger.warning("Ignoring invalid docker_env key")
             continue
         key = key.strip()
         if not isinstance(value, str):
@@ -94,7 +95,7 @@ def _normalize_env_dict(env: dict | None) -> dict[str, str]:
             if isinstance(value, (int, float, bool)):
                 value = str(value)
             else:
-                logger.warning("Ignoring non-string docker_env value for %r: %r", key, value)
+                logger.warning("Ignoring non-string docker_env value")
                 continue
         normalized[key] = value
 

@@ -223,10 +223,10 @@ def load_user_credentials(email: Optional[str] = None) -> Optional[Any]:
         # passing scopes makes refresh validate them strictly. Same logic
         # as the google-workspace skill.
         creds = Credentials.from_authorized_user_file(str(token_path))
-    except Exception as exc:
+    except Exception:
+        # Parser exceptions can contain token material; keep this diagnostic static.
         logger.warning(
-            "[google_chat_user_oauth] token at %s is corrupt: %s",
-            token_path, exc,
+            "[google_chat_user_oauth] stored token is corrupt; re-run /setup-files",
         )
         return None
 
