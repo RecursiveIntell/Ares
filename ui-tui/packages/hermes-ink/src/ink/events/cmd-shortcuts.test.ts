@@ -12,6 +12,46 @@ function parseOne(sequence: string) {
 }
 
 describe('enhanced keyboard modifier parsing', () => {
+  it.each(['kitty', 'modifyOtherKeys'] as const)(
+    'restores shifted text while preserving canonical command names: %s',
+    protocol => {
+      for (const letter of ['a', 'r', 'z']) {
+        for (const reported of [letter, letter.toUpperCase()]) {
+          for (const modifier of [1, 2, 3, 4, 5, 6, 9, 10, 13, 14]) {
+            const code = reported.charCodeAt(0)
+            const sequence = protocol === 'kitty' ? `\u001b[${code};${modifier}u` : `\u001b[27;${modifier};${code}~`
+            const event = new InputEvent(parseOne(sequence))
+            const shifted = Boolean((modifier - 1) & 1)
+            const controlled = Boolean((modifier - 1) & 4)
+
+            expect(event.keypress.name).toBe(letter)
+            expect(event.key.shift).toBe(shifted)
+            expect(event.key.ctrl).toBe(controlled)
+            expect(event.input).toBe(shifted && !controlled ? letter.toUpperCase() : letter)
+            expect(event.input).not.toContain('\u001b')
+          }
+        }
+      }
+    }
+  )
+
+  it('keeps raw text and existing nonletter projections intact', () => {
+    for (const [sequence, input] of [
+      ['R', 'R'],
+      ['é', 'é'],
+      ['\u001b[32;2u', ' '],
+      ['\u001b[13;2u', ''],
+      ['\u001b[13;5u', ''],
+      ['\u001b[27;2u', ''],
+      ['\u001b[49;2u', '1'],
+      ['\u001b[46;2u', '.'],
+      ['\u001bOp', '0'],
+      ['\u001b[57358u', '']
+    ]) {
+      expect(new InputEvent(parseOne(sequence!)).input).toBe(input)
+    }
+  })
+
   it('detects modified Enter sequences for multiline composer shortcuts', () => {
     const shiftEnter = new InputEvent(parseOne('\u001b[13;2u'))
     const ctrlEnter = new InputEvent(parseOne('\u001b[13;5u'))
