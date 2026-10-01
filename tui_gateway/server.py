@@ -249,6 +249,7 @@ _LONG_HANDLERS = frozenset(
         "session.run_checkpoint.claim",
         "session.run_checkpoint.refresh",
         "session.run_checkpoint.release",
+        "session.run_checkpoint.basis",
         "billing.step_up",
         "browser.manage",
         "cli.exec",

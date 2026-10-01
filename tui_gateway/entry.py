@@ -11,6 +11,8 @@ import hermes_bootstrap
 hermes_bootstrap.harden_import_path()
 
 import json
+
+from tui_gateway.checkpoint_json import load_checkpoint_frame
 import logging
 import signal
 import threading
@@ -488,7 +490,7 @@ def main():
             continue
 
         try:
-            req = json.loads(line)
+            req = load_checkpoint_frame(line)
         except json.JSONDecodeError:
             if not write_json({"jsonrpc": "2.0", "error": {"code": -32700, "message": "parse error"}, "id": None}):
                 _log_exit("parse-error-response write failed (broken stdout pipe)")

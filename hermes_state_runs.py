@@ -265,6 +265,69 @@ class RunTaskBinding:
 
 
 @dataclass(frozen=True)
+class OwnedRunObservation:
+    """Redacted coherent observation, never a capability or a lasting fence."""
+    schema: str
+    owner_contract_revision: str
+    owner_schema: str
+    status: str
+    observation_only: bool
+    authorizes_effects: bool
+    custody_changed: bool
+    run_id: str
+    generation: int
+    head_digest: str
+    current_session_id: str
+    origin_session_id: str
+    conversation_root: str
+    profile_name: str
+    task_binding: RunTaskBinding
+    checkpoint_digest: str
+    action_control_digest: str
+    dispatch_task_digest: str
+    digest: str
+
+    def __post_init__(self):
+        if (self.schema != "SessionDBOwnedRunObservationV1"
+                or self.owner_contract_revision != "owned-run-observation/1"
+                or self.owner_schema != "SessionDBRunCustodyV2"
+                or self.status != "observed" or self.observation_only is not True
+                or self.authorizes_effects is not False or self.custody_changed is not False):
+            raise RunCustodyError("INVALID_OBSERVATION")
+        _run_id(self.run_id)
+        _integer(self.generation)
+        if self.generation > 2**63 - 1:
+            raise RunCustodyError("INVALID_OBSERVATION")
+        for name in ("current_session_id", "origin_session_id", "conversation_root", "profile_name"):
+            value = getattr(self, name)
+            if type(value) is not str or not value.strip() or len(value) > 256 or "\x00" in value:
+                raise RunCustodyError("INVALID_OBSERVATION")
+        binding = self.task_binding
+        if (type(binding) is not RunTaskBinding or binding.run_id != self.run_id
+                or binding.origin_session_id != self.origin_session_id
+                or binding.conversation_root != self.conversation_root
+                or binding.profile_name != self.profile_name
+                or binding.input_row_id > 2**63 - 1
+                or len(binding.input_session_id) > 256 or "\x00" in binding.input_session_id):
+            raise RunCustodyError("INVALID_OBSERVATION")
+        for name in ("head_digest", "checkpoint_digest", "action_control_digest", "dispatch_task_digest", "digest"):
+            _digest(getattr(self, name))
+        payload = asdict(self)
+        del payload["digest"]
+        if not secrets.compare_digest(self.digest, self.payload_digest(payload)):
+            raise RunCustodyError("INVALID_OBSERVATION_DIGEST")
+
+    @staticmethod
+    def payload_digest(payload):
+        return _sha("SessionDBOwnedRunObservationV1\n" + _json(payload))
+
+    @classmethod
+    def from_dict(cls, value):
+        _exact_keys(value, cls)
+        return cls(**{**value, "task_binding": RunTaskBinding.from_dict(value["task_binding"])})
+
+
+@dataclass(frozen=True)
 class RunCustodyV2:
     schema: str
     run_id: str
@@ -448,7 +511,10 @@ class SessionRunCustodyMixin:
                                             session_id: str) -> str: ...
 
     def _read_run_head(self, run_id):
-        raw = self.get_meta(_head_key(run_id))
+        return self._read_run_head_using(run_id, self.get_meta)
+
+    def _read_run_head_using(self, run_id, read_value):
+        raw = read_value(_head_key(run_id))
         if raw is None:
             return None, None
         head = _load(raw)
@@ -458,7 +524,7 @@ class SessionRunCustodyMixin:
         _digest(head["digest"])
         # The immutable member can be read after releasing the head read lock:
         # a legitimate publisher never changes/removes an existing generation.
-        value = self._read_run_member(run_id, head["generation"], head["digest"])
+        value = _decode_run_record(run_id, head["generation"], head["digest"], read_value)
         return raw, value
 
     def _read_run_member(self, run_id, generation, expected_digest):
@@ -899,6 +965,12 @@ class SessionRunCustodyMixin:
     def _owned_run(self, run_id, owner_token, expected_generation, *, allow_expired=False):
         _integer(expected_generation)
         raw, old = self._read_run_head(run_id)
+        self._check_owned_run(old, owner_token, expected_generation, allow_expired=allow_expired)
+        return raw, old
+
+    @staticmethod
+    def _check_owned_run(old, owner_token, expected_generation, *, allow_expired=False):
+        _integer(expected_generation)
         if old is None or old.generation != expected_generation:
             raise RunCustodyError("FENCE_MISMATCH")
         if old.disposition != "active" or not secrets.compare_digest(old.owner_token, owner_token):
@@ -907,7 +979,61 @@ class SessionRunCustodyMixin:
             raise RunCustodyError("STALE_PROCESS")
         if not allow_expired and time.monotonic_ns() >= old.expires_monotonic_ns:
             raise RunCustodyError("OWNER_EXPIRED")
-        return raw, old
+
+    def observe_owned_run(self, run_id, *, owner_token, expected_generation,
+                          expected_session_id, lease_holder):
+        """Read exact owned V2 head/task/control on one SQLite snapshot.
+
+        No custody mutation, external RPC, file observation, renewal or recovery.
+        A later writer may immediately stale this observation.
+        """
+        from hermes_state_continuity import ContextContinuationError
+
+        _run_id(run_id)
+        _text(expected_session_id)
+        with self._read_ctx() as conn:
+            conn.execute("SAVEPOINT owned_run_observation")
+            try:
+                def read(key):
+                    row = conn.execute("SELECT value FROM state_meta WHERE key=?", (key,)).fetchone()
+                    return None if row is None else row[0]
+
+                raw, value = self._read_run_head_using(run_id, read)
+                self._check_owned_run(value, owner_token, expected_generation)
+                if type(value) is not RunCustodyV2:
+                    raise RunCustodyError("INTEGRITY_TASK_SCHEMA")
+                if value.current_session_id != expected_session_id:
+                    raise RunCustodyError("SESSION_MISMATCH")
+                self._check_run_claim_bindings(conn, value, lease_holder)
+                snapshot = self._read_context_rebase_snapshot_on_conn(conn, expected_session_id)
+                if snapshot.dispatch_stopped:
+                    raise RunCustodyError("OBSERVATION_STOPPED")
+                if snapshot.has_pending_inputs:
+                    raise RunCustodyError("OBSERVATION_INPUT_PENDING")
+                if snapshot.has_unresolved_effects:
+                    raise RunCustodyError("OBSERVATION_EFFECT_UNRESOLVED")
+                payload = dict(schema="SessionDBOwnedRunObservationV1",
+                    owner_contract_revision="owned-run-observation/1", owner_schema=value.schema,
+                    status="observed", observation_only=True, authorizes_effects=False,
+                    custody_changed=False, run_id=value.run_id, generation=value.generation,
+                    head_digest=_load(raw)["digest"], current_session_id=value.current_session_id,
+                    origin_session_id=value.origin_session_id,
+                    conversation_root=value.task_binding.conversation_root,
+                    profile_name=value.task_binding.profile_name, task_binding=asdict(value.task_binding),
+                    checkpoint_digest=_checkpoint_digest(value),
+                    action_control_digest=snapshot.action_control_digest.removeprefix("sha256:"),
+                    dispatch_task_digest=snapshot.dispatch_task_digest.removeprefix("sha256:"))
+                observed = OwnedRunObservation.from_dict({**payload,
+                    "digest": OwnedRunObservation.payload_digest(payload)})
+                # Recheck owner clocks at the end, on the same DB snapshot.
+                self._check_run_claim_bindings(conn, value, lease_holder)
+                self._check_owned_run(value, owner_token, expected_generation)
+                return observed
+            except ContextContinuationError as exc:
+                raise RunCustodyError("OBSERVATION_CONTROL_UNAVAILABLE") from exc
+            finally:
+                conn.execute("ROLLBACK TO owned_run_observation")
+                conn.execute("RELEASE owned_run_observation")
 
     def publish_run_checkpoint(self, run_id, *, owner_token, expected_generation,
                                expected_source_digest, checkpoint, ttl_seconds=300):

@@ -3,7 +3,7 @@ from pathlib import Path
 
 from agent.run_checkpoint_custody import TurnRunCustody
 from hermes_state import SessionDB
-from hermes_state_runs import RunCustodyError, RunTaskBinding, _digest, _integer, _run_id, _ttl
+from hermes_state_runs import OwnedRunObservation, RunCustodyError, RunTaskBinding, _digest, _integer, _run_id, _ttl
 from scripts.run_checkpoint_claim import ClaimOutcomeUnknown, ClaimRefusal
 
 
@@ -13,7 +13,7 @@ def handle(server, rid, params, operation):
             "automatic_retry": False, "resume_authorized": False, "downstream_effects_executed": False})
 
     def unknown(code):
-        return server._err(rid, -32041, code, {"status": "unknown", "custody_changed": None,
+        return server._err(rid, -32041, code, {"status": "unknown", "custody_changed": False if operation == "basis" else None,
             "automatic_retry": False, "resume_authorized": False, "downstream_effects_executed": False})
 
     fields = {"session_id", "run_id", "expected_generation"}
@@ -23,14 +23,14 @@ def handle(server, rid, params, operation):
         fields |= {"task_binding", "expected_control_digest"} if v2 else {"historical_goal_digest"}
     elif operation == "refresh":
         fields.add("ttl_seconds")
-    elif operation != "release":
+    elif operation not in {"release", "basis"}:
         return refuse("INVALID_PARAMS", -32602)
     if type(params) is not dict or set(params) != fields:
         return refuse("INVALID_PARAMS", -32602)
     try:
         _run_id(params["run_id"])
         _integer(params["expected_generation"], 0 if operation == "claim" else 1)
-        if operation != "release":
+        if operation in {"claim", "refresh"}:
             _ttl(params["ttl_seconds"])
         for name in ("session_id", "origin_session_id") if operation == "claim" else ("session_id",):
             value = params[name]
@@ -51,7 +51,7 @@ def handle(server, rid, params, operation):
 
     session, error = server._sess_nowait(params, rid)
     if error:
-        return error
+        return refuse("LIVE_SESSION_UNAVAILABLE") if operation == "basis" else error
     transport, selected = server._current_session_steer_authority(params["session_id"])
     if transport is None or selected is not session:
         return refuse("LIVE_SESSION_MISMATCH")
@@ -75,6 +75,30 @@ def handle(server, rid, params, operation):
         response = ack["response"]
         if set(response) not in ({"jsonrpc", "id", "result"}, {"jsonrpc", "id", "error"}):
             return unknown("COMPUTE_HOST_READBACK_UNKNOWN")
+        if operation == "basis":
+            if response.get("jsonrpc") != "2.0":
+                return unknown("OBSERVATION_READBACK_UNKNOWN")
+            if "error" in response:
+                # Never relay host-supplied prose/data, even on a refusal.
+                error = response["error"]
+                if (type(error) is dict and set(error) == {"code", "message", "data"}
+                        and type(error["code"]) is int and error["code"] in {-32602, -32040}
+                        and type(error["data"]) is dict
+                        and error["data"] == {"status": "refused", "custody_changed": False,
+                            "automatic_retry": False, "resume_authorized": False,
+                            "downstream_effects_executed": False}
+                        and all(error["data"][key] is False for key in
+                            ("custody_changed", "automatic_retry", "resume_authorized", "downstream_effects_executed"))):
+                    return refuse("OBSERVATION_REFUSED")
+                return unknown("OBSERVATION_UNAVAILABLE")
+            try:
+                observed = OwnedRunObservation.from_dict(response["result"])
+                if (observed.run_id != params["run_id"]
+                        or observed.generation != params["expected_generation"]
+                        or observed.current_session_id != session.get("session_key")):
+                    return unknown("OBSERVATION_READBACK_UNKNOWN")
+            except (RunCustodyError, TypeError, ValueError, KeyError):
+                return unknown("OBSERVATION_READBACK_UNKNOWN")
         return {**response, "id": rid}
 
     agent = session.get("agent")
@@ -102,6 +126,8 @@ def handle(server, rid, params, operation):
     try:
         if operation == "claim":
             result = owner.claim(holder, session_id=sid, **args)
+        elif operation == "basis":
+            result = owner.observe_basis(holder, session_id=sid, **args)
         elif operation == "refresh":
             result = owner.refresh(holder, **args)
         else:
