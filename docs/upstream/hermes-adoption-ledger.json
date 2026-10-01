@@ -1,0 +1,93 @@
+{
+  "schema_version": "ares-upstream-adoption/v1",
+  "updated_at": "2026-10-01T05:24:00Z",
+  "upstream": {
+    "repository": "NousResearch/hermes-agent",
+    "cutoff": "d63c6eb87454fa7e693020d432d665ee77e30303",
+    "merge_base": "8966b0a70029cb226e35c49f91d0c2208ab1d8c4",
+    "ancestry_ahead_count": 20789,
+    "count_is_not_missing_functionality": true
+  },
+  "target": {
+    "repository": "RecursiveIntell/Ares",
+    "candidate_base": "4f2b8ebb8f17978329cd0f97333054e08b794cfe"
+  },
+  "historical": [
+    {
+      "pr": 34,
+      "status": "closed_unmerged",
+      "candidate_ports": 16,
+      "candidate_quarantines": 20,
+      "reason": "Historical branch outcomes do not establish adoption on main"
+    },
+    {
+      "pr": 35,
+      "status": "closed_unmerged",
+      "source": "2237be355906fbe6065ce1815711eee52b2d646e",
+      "reason": "Abandoned full reconciliation is not an imported current baseline"
+    }
+  ],
+  "groups": [
+    {
+      "id": "gemini-array-projection-20261001",
+      "status": "candidate_pending_independent_postaudit",
+      "sources": [
+        {
+          "sha": "6a04ea67c0e75ef1218bf4ceaac071c2f16a0701",
+          "author": "Max Freedom Pollard",
+          "decision": "adapt",
+          "reason": "Fix reproduced nullable-array enum crash; current generic normalization helper must be extracted without changing existing callers"
+        },
+        {
+          "sha": "bbcf1ee180f170032079996b87f296acf2af7456",
+          "author": "Teknium",
+          "decision": "adapt_partially",
+          "reason": "Preserve union alternatives and structural constraints; refuse unsupported enums rather than copying upstream constraint deletion"
+        },
+        {
+          "sha": "0d6106eab8a5b8afc3357d6e1030723b8be129f2",
+          "author": "Teknium",
+          "decision": "retain_invariant_intent",
+          "reason": "New focused invariant coverage preserves every existing Ares test; no literal test deletion"
+        }
+      ],
+      "intentional_deferrals": [
+        {
+          "surface": "real multi-type unions with enum",
+          "reason": "Exact branch-local enum fidelity is unproved; reject before HTTP rather than broadening accepted values"
+        },
+        {
+          "surface": "empty, all-null, unknown or nonstring type arrays; unsupported or empty array-type enums",
+          "reason": "No exact supported Gemini projection in this group; actionable value-free local refusal"
+        },
+        {
+          "surface": "broad upstream schema/refactor chain",
+          "reason": "Unnecessary dependency expansion; existing canonical generic behavior is extracted unchanged"
+        },
+        {
+          "surface": "live Google validation or model enforcement claims",
+          "reason": "No live provider requests; only local projection and loopback wire tested"
+        },
+        {
+          "surface": "upstream inventory outside this group",
+          "reason": "Unreviewed commits remain unreviewed, not rejected or adopted; independent owner-specific groups follow"
+        }
+      ],
+      "validation": {
+        "focused_tests": {
+          "passed": 409,
+          "failed": 0,
+          "skipped": 1,
+          "skip_reason": "Optional google.genai SDK unavailable"
+        },
+        "generic_extraction_parity_cases": 180,
+        "real_native_sync_async_loopback": true,
+        "preaudit": "accepted_restricted_adaptation",
+        "postaudit": "pending",
+        "hosted_ci": "pending"
+      },
+      "adopted_target_commit": null,
+      "rollback": "Revert only this bounded adoption commit; no migrations, source pins or activation changed"
+    }
+  ]
+}
