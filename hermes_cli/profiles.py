@@ -19,7 +19,9 @@ Usage::
     hermes profile delete coder          # remove profile + alias + service
 """
 
+import errno
 import json
+import math
 import logging
 import os
 import re
@@ -29,9 +31,10 @@ import stat
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from agent.skill_utils import is_excluded_skill_path
 
@@ -902,6 +905,152 @@ def read_profile_meta(profile_dir: Path) -> dict:
     }
 
 
+def _profile_metadata_lock_backend():
+    """Select a real advisory-lock backend; never silently run unlocked."""
+    try:
+        if os.name == "posix":
+            import fcntl
+            return fcntl
+        if os.name == "nt":
+            import msvcrt
+            return msvcrt
+    except ImportError as exc:
+        raise RuntimeError("PROFILE_METADATA_LOCK_UNSUPPORTED") from exc
+    raise RuntimeError("PROFILE_METADATA_LOCK_UNSUPPORTED")
+
+
+def _try_profile_metadata_lock(handle, backend) -> None:
+    if backend.__name__ == "fcntl":
+        backend.flock(handle.fileno(), backend.LOCK_EX | backend.LOCK_NB)
+    else:
+        # Windows permits locking a byte beyond EOF. Do not initialize or
+        # truncate this file: another process may already hold its first byte.
+        handle.seek(0)
+        try:
+            backend.locking(handle.fileno(), backend.LK_NBLCK, 1)
+        except OSError as exc:
+            if exc.errno in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                raise BlockingIOError(exc.errno, str(exc)) from exc
+            raise
+
+
+def _metadata_file_identity(path: Path):
+    """Reject file aliases; directory aliases are normalized by the owner."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise ValueError("PROFILE_METADATA_FILE_ALIAS_OR_INVALID")
+    return info.st_dev, info.st_ino
+
+
+@contextmanager
+def _profile_metadata_lock(profile_dir: Path, timeout: float):
+    backend = _profile_metadata_lock_backend()
+    if not math.isfinite(timeout) or timeout < 0:
+        raise ValueError("PROFILE_METADATA_LOCK_TIMEOUT_INVALID")
+    original = Path(profile_dir).absolute()
+    directory = original.resolve(strict=True)
+    before = directory.stat()
+    if not stat.S_ISDIR(before.st_mode):
+        raise FileNotFoundError(f"profile directory does not exist: {profile_dir}")
+    directory_id = before.st_dev, before.st_ino
+    original_metadata = directory / "profile.yaml"
+    metadata_path = original_metadata.resolve()
+    target_parent = metadata_path.parent
+    parent_info = target_parent.stat()
+    parent_id = parent_info.st_dev, parent_info.st_ino
+    lock_path = target_parent / f".{metadata_path.name}.metadata.lock"
+    _metadata_file_identity(lock_path)
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    # A distinct descriptor per call also serializes threads in this process.
+    with os.fdopen(os.open(lock_path, flags, 0o600), "r+b", buffering=0) as handle:
+        opened = os.fstat(handle.fileno())
+        lock_id = opened.st_dev, opened.st_ino
+        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+            raise ValueError("PROFILE_METADATA_FILE_ALIAS_OR_INVALID")
+
+        def validate_identity():
+            now = directory.stat()
+            parent_now = target_parent.stat()
+            if (
+                original.resolve(strict=True) != directory
+                or (now.st_dev, now.st_ino) != directory_id
+                or original_metadata.resolve() != metadata_path
+                or (parent_now.st_dev, parent_now.st_ino) != parent_id
+                or _metadata_file_identity(lock_path) != lock_id
+            ):
+                raise ValueError("PROFILE_METADATA_IDENTITY_CHANGED")
+
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                _try_profile_metadata_lock(handle, backend)
+                break
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("PROFILE_METADATA_LOCK_TIMEOUT") from None
+                time.sleep(min(0.025, remaining))
+        try:
+            validate_identity()
+            yield metadata_path, validate_identity
+        finally:
+            if backend.__name__ == "fcntl":
+                backend.flock(handle.fileno(), backend.LOCK_UN)
+            else:
+                handle.seek(0)
+                backend.locking(handle.fileno(), backend.LK_UNLCK, 1)
+    # Never unlink the lock file: waiters may still own its inode.
+
+
+def update_profile_metadata(
+    profile_dir: Path,
+    update: Callable[[dict], Optional[bool]],
+    *,
+    timeout: float = 5.0,
+) -> None:
+    """Serialize one existing profile's read/check/update among participants.
+
+    The callback runs under a bounded interprocess lock, against freshly read
+    metadata; returning False skips publication. Missing metadata starts as {},
+    but malformed existing YAML/known submaps are refused, never reset.
+    Callbacks must not nest metadata transactions.
+
+    Directory and metadata symlink aliases share a canonical target lock.
+    Hardlinked metadata and aliased lock files are refused. This is not a lifecycle lock, an external-editor exclusion, a
+    durable revision, or a crash-atomic publication guarantee. Existing YAML
+    replacement/fallback semantics remain those of utils.atomic_yaml_write.
+    """
+    import yaml
+    from utils import atomic_yaml_write
+
+    with _profile_metadata_lock(profile_dir, timeout) as (path, validate_identity):
+        file_id = _metadata_file_identity(path)
+        try:
+            metadata = yaml.safe_load(path.read_text(encoding="utf-8")) if file_id is not None else {}
+        except Exception as exc:
+            raise ValueError("PROFILE_METADATA_UNREADABLE") from exc
+        if not isinstance(metadata, dict):
+            raise ValueError("PROFILE_METADATA_INVALID")
+        for key in ("role_contract_refs", "ui_meta", "_ui_meta_revisions"):
+            if key in metadata and not isinstance(metadata[key], dict):
+                raise ValueError("PROFILE_METADATA_INVALID")
+        if any(
+            not isinstance(key, str) or not isinstance(value, int)
+            or isinstance(value, bool) or value < 0
+            for key, value in metadata.get("_ui_meta_revisions", {}).items()
+        ):
+            raise ValueError("PROFILE_METADATA_INVALID")
+        if update(metadata) is False:
+            return
+        validate_identity()
+        if _metadata_file_identity(path) != file_id:
+            raise ValueError("PROFILE_METADATA_IDENTITY_CHANGED")
+        atomic_yaml_write(path, metadata, sort_keys=False)
+
+
 def write_profile_meta(
     profile_dir: Path,
     *,
@@ -909,73 +1058,42 @@ def write_profile_meta(
     description_auto: Optional[bool] = None,
     display_name: Optional[str] = None,
 ) -> None:
-    """Update ``<profile_dir>/profile.yaml`` in place.
+    """Update supplied fields, preserving others; refuse malformed metadata.
 
-    Only the explicitly passed fields are overwritten; unspecified
-    fields preserve existing values. Creates the file if missing.
-    Profile directory itself must exist.
+    Creates profile.yaml if missing. The profile directory must exist.
     """
-    if not profile_dir.is_dir():
-        raise FileNotFoundError(f"profile directory does not exist: {profile_dir}")
-    import yaml
-    path = _profile_yaml_path(profile_dir)
-    existing: dict = {}
-    if path.is_file():
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                loaded = yaml.safe_load(f) or {}
-            if isinstance(loaded, dict):
-                existing = loaded
-        except Exception:
-            existing = {}
-    if description is not None:
-        existing["description"] = description.strip()
-    if description_auto is not None:
-        existing["description_auto"] = bool(description_auto)
-    if display_name is not None:
-        # Empty string clears the key (falls back to the canonical id).
-        if display_name.strip():
-            existing["display_name"] = display_name.strip()
-        else:
-            existing.pop("display_name", None)
-    # Atomic write: bare open("w") truncates before the dump, and the read
-    # path above swallows parse errors as {}, so a crashed write would
-    # silently drop unspecified fields on the next call (#51356, #16743).
-    from utils import atomic_yaml_write
+    def update(existing):
+        if description is not None:
+            existing["description"] = description.strip()
+        if description_auto is not None:
+            existing["description_auto"] = bool(description_auto)
+        if display_name is not None:
+            if display_name.strip():
+                existing["display_name"] = display_name.strip()
+            else:
+                existing.pop("display_name", None)
 
-    atomic_yaml_write(path, existing, sort_keys=False)
+    update_profile_metadata(profile_dir, update)
 
 
 def set_role_contract_ref(profile_name: str, role_id: str, contract_ref: str) -> None:
-    """Attach a content-addressed RoleContract reference to an existing profile.
+    """Unconditionally attach a role reference, preserving unrelated metadata.
 
-    Only the role identifier and digest reference are persisted in profile
-    metadata.  Contract bytes and provider credentials are never read or copied
-    from the profile's secret/config files.
+    This generic setter retains its ordinary overwrite semantics (including
+    specialist-v1); only specialist set/clear APIs require an expected value.
     """
     canon = normalize_profile_name(profile_name)
     profile_dir = get_profile_dir(canon)
-    if not profile_exists(canon):
-        raise FileNotFoundError(f"Profile '{canon}' does not exist.")
     role_id, contract_ref = str(role_id or "").strip(), str(contract_ref or "").strip()
     if not role_id or not contract_ref:
         raise ValueError("role_id and contract_ref are required")
-    import yaml
-    path = _profile_yaml_path(profile_dir)
-    existing: dict = {}
-    if path.is_file():
-        try:
-            loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-            if isinstance(loaded, dict):
-                existing = loaded
-        except Exception:
-            existing = {}
-    refs = existing.get("role_contract_refs")
-    refs = dict(refs) if isinstance(refs, dict) else {}
-    refs[role_id] = contract_ref
-    existing["role_contract_refs"] = dict(sorted(refs.items()))
-    from utils import atomic_yaml_write
-    atomic_yaml_write(path, existing, sort_keys=False)
+
+    def update(existing):
+        refs = dict(existing.get("role_contract_refs", {}))
+        refs[role_id] = contract_ref
+        existing["role_contract_refs"] = dict(sorted(refs.items()))
+
+    update_profile_metadata(profile_dir, update)
 
 
 def get_role_contract_ref(profile_name: str, role_id: str) -> Optional[str]:
@@ -991,26 +1109,6 @@ def get_role_contract_ref(profile_name: str, role_id: str) -> Optional[str]:
         return ref if isinstance(ref, str) and ref else None
     except Exception:
         return None
-
-
-def _strict_profile_metadata_for_binding(profile_name: str) -> tuple[str, Path, Path, dict, dict]:
-    """Load the one profile metadata object a descriptor binding may mutate."""
-    canon = normalize_profile_name(profile_name)
-    profile_dir = get_profile_dir(canon)
-    if not profile_exists(canon):
-        raise FileNotFoundError(f"Profile '{canon}' does not exist.")
-    path = _profile_yaml_path(profile_dir)
-    try:
-        import yaml
-        loaded = yaml.safe_load(path.read_text(encoding="utf-8")) if path.is_file() else {}
-    except Exception as exc:
-        raise ValueError("PROFILE_METADATA_UNREADABLE") from exc
-    if not isinstance(loaded, dict):
-        raise ValueError("PROFILE_METADATA_INVALID")
-    raw_refs = loaded.get("role_contract_refs", {})
-    if not isinstance(raw_refs, dict):
-        raise ValueError("PROFILE_METADATA_INVALID")
-    return canon, profile_dir, path, loaded, dict(raw_refs)
 
 
 def _validate_specialist_descriptor_ref(descriptor_ref: str) -> str:
@@ -1039,14 +1137,14 @@ def set_specialist_descriptor_ref(
         if expected_current is not None
         else None
     )
-    _canon, _profile_dir, path, metadata, refs = _strict_profile_metadata_for_binding(profile_name)
-    current = refs.get("specialist-v1")
-    if current != expected:
-        raise ValueError("SPECIALIST_DESCRIPTOR_BINDING_CONFLICT")
-    refs["specialist-v1"] = descriptor_ref
-    metadata["role_contract_refs"] = dict(sorted(refs.items()))
-    from utils import atomic_yaml_write
-    atomic_yaml_write(path, metadata, sort_keys=False)
+    def update(metadata):
+        refs = dict(metadata.get("role_contract_refs", {}))
+        if refs.get("specialist-v1") != expected:
+            raise ValueError("SPECIALIST_DESCRIPTOR_BINDING_CONFLICT")
+        refs["specialist-v1"] = descriptor_ref
+        metadata["role_contract_refs"] = dict(sorted(refs.items()))
+
+    update_profile_metadata(get_profile_dir(normalize_profile_name(profile_name)), update)
     return descriptor_ref
 
 
@@ -1059,16 +1157,17 @@ def get_specialist_descriptor_ref(profile_name: str) -> Optional[str]:
 def clear_specialist_descriptor_ref(profile_name: str, expected_current: str) -> None:
     """Atomically remove only an exactly matched specialist descriptor pointer."""
     expected = _validate_specialist_descriptor_ref(expected_current)
-    _canon, _profile_dir, path, metadata, refs = _strict_profile_metadata_for_binding(profile_name)
-    if refs.get("specialist-v1") != expected:
-        raise ValueError("SPECIALIST_DESCRIPTOR_BINDING_CONFLICT")
-    refs.pop("specialist-v1")
-    if refs:
-        metadata["role_contract_refs"] = dict(sorted(refs.items()))
-    else:
-        metadata.pop("role_contract_refs", None)
-    from utils import atomic_yaml_write
-    atomic_yaml_write(path, metadata, sort_keys=False)
+    def update(metadata):
+        refs = dict(metadata.get("role_contract_refs", {}))
+        if refs.get("specialist-v1") != expected:
+            raise ValueError("SPECIALIST_DESCRIPTOR_BINDING_CONFLICT")
+        refs.pop("specialist-v1")
+        if refs:
+            metadata["role_contract_refs"] = dict(sorted(refs.items()))
+        else:
+            metadata.pop("role_contract_refs", None)
+
+    update_profile_metadata(get_profile_dir(normalize_profile_name(profile_name)), update)
 
 
 def format_profile_label(name: str, display_name: Optional[str]) -> str:

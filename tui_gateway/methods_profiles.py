@@ -790,31 +790,15 @@ def _(rid, params: dict) -> dict:
                 if len(_json.dumps(incoming)) > 65536:
                     applied["ui_meta"] = False
                 else:
-                    import yaml as _yaml
+                    from hermes_cli.profiles import update_profile_metadata
 
                     expected = params.get("ui_meta_expected_revisions")
                     if expected is not None and not isinstance(expected, dict):
                         raise ValueError("ui_meta_expected_revisions must be an object")
 
-                    meta_path = profile_dir / "profile.yaml"
-                    with _profile_ui_meta_lock:
-                        existing = {}
-                        if meta_path.is_file():
-                            try:
-                                with open(meta_path, "r", encoding="utf-8") as f:
-                                    loaded = _yaml.safe_load(f) or {}
-                                if isinstance(loaded, dict):
-                                    existing = loaded
-                            except Exception:
-                                existing = {}
-
+                    def update_ui_meta(existing):
                         raw_revisions = existing.get("_ui_meta_revisions")
-                        revisions = dict(raw_revisions) if isinstance(raw_revisions, dict) else {}
-                        revisions = {
-                            str(key): max(0, int(value))
-                            for key, value in revisions.items()
-                            if isinstance(value, int) and not isinstance(value, bool)
-                        }
+                        revisions = dict(raw_revisions or {})
                         conflicts = {}
                         if isinstance(expected, dict):
                             for key in incoming:
@@ -834,6 +818,7 @@ def _(rid, params: dict) -> dict:
                             applied["ui_meta_revisions"] = {
                                 key: revisions.get(key, 0) for key in incoming
                             }
+                            return False
                         else:
                             current = existing.get("ui_meta")
                             if not isinstance(current, dict):
@@ -852,15 +837,15 @@ def _(rid, params: dict) -> dict:
                             # stale client must not recreate a removed key by
                             # presenting the initial revision again.
                             existing["_ui_meta_revisions"] = revisions
-                            from utils import atomic_yaml_write
-
-                            atomic_yaml_write(meta_path, existing, sort_keys=False)
                             applied["ui_meta"] = True
                             applied["ui_meta_revisions"] = {
                                 key: revisions[key] for key in incoming
                             }
+
+                    update_profile_metadata(profile_dir, update_ui_meta)
             except Exception:
                 applied["ui_meta"] = False
+                applied.pop("ui_meta_revisions", None)
 
         if isinstance(params.get("soul"), str):
             try:
