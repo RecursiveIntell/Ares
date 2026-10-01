@@ -137,7 +137,10 @@ if [ -n "$(git status --porcelain)" ]; then
   live outside the repo.)'
 fi
 
-mkdir -p "$LOG_DIR"
+# A reused parent must never pair this run's transcript with a stale diagnostic
+# from an earlier invocation. Keep each complete evidence set in its own directory.
+LOG_DIR="$(python3 "$REPO_ROOT/scripts/npm_failure_diagnostics.py" new-run --parent "$LOG_DIR")" \
+  || fail 'could not allocate current-run evidence directory'
 
 if [ "$KEEP" = false ]; then
   trap 'rm -rf -- "$SANDBOX_ROOT"' EXIT INT TERM
@@ -212,6 +215,11 @@ install_in_sandbox() {
   "${SANDBOX[@]}" "${args[@]}" 2>&1 | tee "$log" || status=$?
 
   if [ "$status" -ne 0 ]; then
+    # Export only validated structured facts emitted during THIS invocation.
+    # Never collect raw npm cache/debug logs, env, .npmrc, or auth configuration.
+    python3 "$REPO_ROOT/scripts/npm_failure_diagnostics.py" collect \
+      --input "$log" --output "$LOG_DIR/npm-diagnostics-$tag.json" \
+      || echo 'Sanitized npm diagnostic artifact unavailable' >&2
     collect_sandbox_logs "$tag"
     fail "$what failed (exit $status)"
   fi
