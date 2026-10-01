@@ -406,17 +406,59 @@ def test_observation_released_other_run_obligation_still_blocks(observation):
         observe(observation)
 
 
-def test_observation_snapshot_is_coherent_but_not_a_fence(observation, monkeypatch):
+@pytest.mark.parametrize("journal_policy", ["native", "delete"])
+def test_observation_snapshot_is_coherent_but_not_a_fence(request, monkeypatch, journal_policy, record_property):
+    import sqlite3
+    if journal_policy == "delete":
+        monkeypatch.setattr("hermes_state.resolve_journal_mode", lambda: "delete")
+    observation = request.getfixturevalue("observation")
     db, _, _ = observation
+    mode = db._conn.execute("PRAGMA journal_mode").fetchone()[0]
+    print(f"SQLite {sqlite3.sqlite_version}; requested={journal_policy}; actual={mode}")
+    record_property("sqlite_version", sqlite3.sqlite_version)
+    record_property("journal_policy", journal_policy)
+    record_property("journal_mode", mode)
+    assert mode in {"wal", "delete"}
+    if journal_policy == "delete":
+        assert mode == "delete"
     prior = observe(observation)
     original = db._read_context_rebase_snapshot_on_conn
-    with SessionDB(db_path=db.db_path) as writer:
+    from threading import Event
+    prepared, allow_commit = Event(), Event()
+    pending = []
+    with SessionDB(db_path=db.db_path) as writer, ThreadPoolExecutor(max_workers=1) as pool:
+        real_write = writer._execute_write
+
+        def gated_write(fn, **kwargs):
+            def write(conn):
+                result = fn(conn)  # Real Stop writes, not a synthetic receipt.
+                assert conn.in_transaction
+                prepared.set()
+                assert allow_commit.wait(10), "reader did not release writer"
+                return result
+            return real_write(write, **kwargs)
+
         def raced(conn, session_id):
-            writer.record_context_stop(session_id)
+            assert conn.in_transaction, "observation must retain its read snapshot"
+            pending.append(pool.submit(writer.record_context_stop, session_id))
+            assert prepared.wait(10), "writer did not prepare Stop"
+            if mode == "wal":
+                # WAL allows commit before the reader's remaining snapshot reads.
+                allow_commit.set()
+                assert pending[0].result(timeout=10)["stopped"] is True
+            # Rollback journaling must commit only after this reader closes.
             return original(conn, session_id)
+
+        monkeypatch.setattr(writer, "_execute_write", gated_write)
         monkeypatch.setattr(db, "_read_context_rebase_snapshot_on_conn", raced)
-        assert observe(observation) == prior
-    monkeypatch.setattr(db, "_read_context_rebase_snapshot_on_conn", original)
+        try:
+            assert observe(observation) == prior
+        finally:
+            monkeypatch.setattr(db, "_read_context_rebase_snapshot_on_conn", original)
+            allow_commit.set()
+            for future in pending:
+                assert future.result(timeout=10)["stopped"] is True
+    assert db.read_context_stop("s")["control"]["stopped"] is True
     with pytest.raises(ClaimRefusal, match="OBSERVATION_STOPPED"):
         observe(observation)
 
