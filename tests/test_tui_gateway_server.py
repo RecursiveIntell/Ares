@@ -3659,9 +3659,11 @@ def test_slow_resume_hydration_degrades_instead_of_killing_agent_init(monkeypatc
         with caplog.at_level("WARNING", logger="tui_gateway.server"):
             outcome = server._await_resume_history(session, sid, "hydration-degrade-key")
         assert outcome == "degraded"
-        assert session["resume_hydrating"] is False
+        # Timeout is not evidence that the transcript is ready. Agent setup
+        # may finish, but the authoritative history gate must remain closed.
+        assert session["resume_hydrating"] is True
         assert session["history"] == []
-        assert event.is_set()
+        assert not event.is_set()
         statuses = [payload["status"] for name, payload in events
                     if name == "session.resume_progress"]
         assert statuses == ["slow", "degraded_timeout"]
@@ -7468,6 +7470,152 @@ def test_run_prompt_submit_rejects_worker_when_close_wins_publication(
     assert dispatch_results == [False]
     assert session["running"] is False
     assert turns == []
+
+
+def test_delayed_real_history_hydration_blocks_provider_until_complete(monkeypatch, tmp_path):
+    from hermes_state import SessionDB
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path, immediate_threads=False)
+    db = SessionDB(db_path=tmp_path / "hydration.db")
+    stored_id = "hydration-real-stored"
+    sid = "hydration-real-runtime"
+    db.create_session(stored_id, source="tui")
+    db.append_message(stored_id, role="user", content="prior durable question")
+    db.append_message(stored_id, role="assistant", content="prior durable answer")
+    entered_read, release_read, provider_entered = (threading.Event() for _ in range(3))
+    original_read = db.get_resume_conversations
+    observed = []
+    turns = []
+
+    def delayed_read(target):
+        entered_read.set()
+        assert release_read.wait(timeout=5.0)
+        return original_read(target)
+
+    class CapturingAgent(_RecordingAgent):
+        def run_conversation(self, prompt, **kwargs):
+            observed.append(list(kwargs["conversation_history"]))
+            provider_entered.set()
+            return super().run_conversation(prompt, **kwargs)
+
+    ready = threading.Event()
+    ready.set()
+    session = _session(agent=CapturingAgent(turns), session_key=stored_id, running=True,
+        resume_history_ready=threading.Event(), resume_hydrating=True, agent_ready=ready)
+    server._sessions[sid] = session
+    monkeypatch.setattr(db, "get_resume_conversations", delayed_read)
+    monkeypatch.setattr(server, "_maybe_schedule_auto_continue", lambda *_: None)
+    monkeypatch.setattr(server, "RESUME_HISTORY_WAIT_S", 0.01)
+    monkeypatch.setattr(server, "RESUME_HISTORY_GRACE_S", 0.01)
+    monkeypatch.setattr(server, "_AGENT_BUILD_WAIT_SLICE", 0.01)
+    monkeypatch.setattr(server, "_agent_build_wait_cap", lambda: 2.0)
+    dispatched = []
+    dispatch = threading.Thread(target=lambda: dispatched.append(
+        server._run_prompt_submit("hydration-real-request", sid, session, "new question")))
+    try:
+        server._schedule_resume_hydration(sid, stored_id, db)
+        assert entered_read.wait(timeout=1.0)
+        assert server._await_resume_history(session, sid, stored_id) == "degraded"
+        dispatch.start()
+        assert not provider_entered.wait(timeout=0.1)
+        assert session["resume_hydrating"]
+        release_read.set()
+        assert provider_entered.wait(timeout=2.0)
+        dispatch.join(timeout=2.0)
+        worker = session.get("_run_thread")
+        if worker is not None:
+            worker.join(timeout=2.0)
+        assert dispatched == [True]
+        assert turns == ["new question"]
+        assert [row["content"] for row in observed[0]] == ["prior durable question", "prior durable answer"]
+        assert not session["resume_hydrating"]
+    finally:
+        release_read.set()
+        if dispatch.ident is not None:
+            dispatch.join(timeout=2.0)
+        server._sessions.pop(sid, None)
+        db.close()
+
+
+def test_hydration_failure_releases_waiter_without_provider_and_retains_prompt(monkeypatch, tmp_path):
+    from hermes_state import SessionDB
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path, immediate_threads=False)
+    db = SessionDB(db_path=tmp_path / "failure-hydration.db")
+    db.create_session("failed-history-stored", source="tui")
+    sid = "failed-history-runtime"
+    entered_read, release_read = threading.Event(), threading.Event()
+    turns = []
+    ready = threading.Event()
+    ready.set()
+    session = _session(agent=_RecordingAgent(turns), session_key="failed-history-stored",
+        agent_ready=ready, resume_history_ready=threading.Event(), resume_hydrating=True, running=True)
+    server._sessions[sid] = session
+
+    def failed_read(_target):
+        entered_read.set()
+        assert release_read.wait(timeout=3.0)
+        raise RuntimeError("injected history read failure")
+
+    monkeypatch.setattr(db, "get_resume_conversations", failed_read)
+    monkeypatch.setattr(server, "_AGENT_BUILD_WAIT_SLICE", 0.01)
+    monkeypatch.setattr(server, "_agent_build_wait_cap", lambda: 2.0)
+    dispatched = []
+    dispatch = threading.Thread(target=lambda: dispatched.append(
+        server._run_prompt_submit("failed-history-request", sid, session, "retained unsent question")))
+    try:
+        server._schedule_resume_hydration(sid, session["session_key"], db)
+        assert entered_read.wait(timeout=1.0)
+        dispatch.start()
+        release_read.set()
+        dispatch.join(timeout=2.0)
+        assert not dispatch.is_alive()
+        assert dispatched == [False]
+        assert turns == []
+        assert session["resume_history_ready"].is_set()
+        assert "history read failure" in session["resume_history_error"]
+        assert session["inflight_turn"]["status"] == "error"
+        assert session["inflight_turn"]["user"] == "retained unsent question"
+    finally:
+        release_read.set()
+        if dispatch.ident is not None:
+            dispatch.join(timeout=2.0)
+        server._sessions.pop(sid, None)
+        db.close()
+
+
+def test_cancelled_history_wait_cannot_fall_through_to_provider(monkeypatch, tmp_path):
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    turns = []
+    ready = threading.Event()
+    ready.set()
+    session = _session(agent=_RecordingAgent(turns), agent_ready=ready,
+        resume_history_ready=threading.Event(), running=False)
+    monkeypatch.setattr(server, "_AGENT_BUILD_WAIT_SLICE", 0.01)
+    server._sessions["cancelled-history-runtime"] = session
+    try:
+        assert server._run_prompt_submit("cancelled-history-request", "cancelled-history-runtime", session, "not admitted") is False
+        assert turns == []
+        assert not session["resume_history_ready"].is_set()
+    finally:
+        server._sessions.pop("cancelled-history-runtime", None)
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_prompt_history_wait_is_bounded_and_cancellable(monkeypatch, cancelled):
+    ready = threading.Event()
+    ready.set()
+    session = _session(agent_ready=ready, resume_history_ready=threading.Event(),
+        resume_hydrating=True, running=True, _turn_cancel_requested=cancelled)
+    monkeypatch.setattr(server, "_AGENT_BUILD_WAIT_SLICE", 0.01)
+    monkeypatch.setattr(server, "_agent_build_wait_cap", lambda: 0.03)
+    result = server._wait_agent_for_prompt(session, "history-wait", "history-runtime")
+    if cancelled:
+        assert result is None
+    else:
+        assert result["error"]["code"] == 5032
+    assert not session["resume_history_ready"].is_set()
+    assert session["history"] == []
 
 
 @pytest.mark.parametrize("exit_code", [0, 7])

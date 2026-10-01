@@ -72,6 +72,7 @@ export type GatewayEventPayload = {
   duration_s?: number
   todos?: unknown
   model?: string
+  model_control_revision?: number
   provider?: string
   reasoning_effort?: string
   service_tier?: string

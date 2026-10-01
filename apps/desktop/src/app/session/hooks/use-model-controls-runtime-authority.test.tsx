@@ -203,6 +203,124 @@ describe('useModelControls runtime authority', () => {
     expect($currentProvider.get()).toBe('provider-b')
   })
 
+  it('retains every superseded pair through rapid optimistic switches', async () => {
+    const requests: Array<(value: unknown) => void> = []
+
+    const requestGateway = vi.fn(
+      () =>
+        new Promise<never>(resolve => {
+          requests.push(value => resolve(value as never))
+        })
+    )
+
+    const { result } = renderHook(() => useModelControls({ queryClient: new QueryClient(), requestGateway }))
+    const first = result.current.selectModel({ model: 'model-b', provider: 'provider-b' })
+    const second = result.current.selectModel({ model: 'model-c', provider: 'provider-c' })
+    const third = result.current.selectModel({ model: 'model-d', provider: 'provider-d' })
+    expect($sessionStates.get()[PRIMARY_RUNTIME_ID].pendingModelSelection).toMatchObject({
+      model: 'model-d',
+      provider: 'provider-d',
+      supersededSelections: [
+        { model: 'model-a', provider: 'provider-a' },
+        { model: 'model-b', provider: 'provider-b' },
+        { model: 'model-c', provider: 'provider-c' }
+      ]
+    })
+
+    for (const [index, pick] of [first, second, third].entries()) {
+      requests[index]({ key: 'model', scope: 'session', value: `model-${['b', 'c', 'd'][index]}` })
+      await expect(pick).resolves.toBe(true)
+      expect(PRIMARY_SESSION_VIEW.$model.get()).toBe('model-d')
+    }
+  })
+
+  it('rolls the latest failed request back to the highest confirmed earlier revision', async () => {
+    setCurrentModelSource('default')
+
+    const requests: Array<{
+      reject: (reason: Error) => void
+      resolve: (value: unknown) => void
+    }> = []
+
+    const requestGateway = vi.fn(
+      () =>
+        new Promise<never>((resolve, reject) => {
+          requests.push({ reject, resolve: value => resolve(value as never) })
+        })
+    )
+
+    const { result } = renderHook(() => useModelControls({ queryClient: new QueryClient(), requestGateway }))
+
+    const first = result.current.selectModel({ model: 'model-b', provider: 'provider-b' })
+    const second = result.current.selectModel({ model: 'model-c', provider: 'provider-c' })
+    const third = result.current.selectModel({ model: 'model-d', provider: 'provider-d' })
+
+    expect(PRIMARY_SESSION_VIEW.$model.get()).toBe('model-d')
+    expect($sessionStates.get()[PRIMARY_RUNTIME_ID].pendingModelSelection).toMatchObject({
+      model: 'model-d',
+      provider: 'provider-d',
+      rollbackModel: 'model-a',
+      rollbackProvider: 'provider-a'
+    })
+
+    requests[0].resolve({ key: 'model', scope: 'session', value: 'model-b', model_control_revision: 1 })
+    await expect(first).resolves.toBe(true)
+    expect(PRIMARY_SESSION_VIEW.$model.get()).toBe('model-d')
+    expect($sessionStates.get()[PRIMARY_RUNTIME_ID].pendingModelSelection).toMatchObject({
+      model: 'model-d',
+      provider: 'provider-d',
+      rollbackModel: 'model-b',
+      rollbackProvider: 'provider-b'
+    })
+
+    requests[1].reject(new Error('C rejected'))
+    await expect(second).resolves.toBe(false)
+    expect(PRIMARY_SESSION_VIEW.$model.get()).toBe('model-d')
+
+    requests[2].reject(new Error('D rejected'))
+    await expect(third).resolves.toBe(false)
+    expect(PRIMARY_SESSION_VIEW.$model.get()).toBe('model-b')
+    expect(PRIMARY_SESSION_VIEW.$provider.get()).toBe('provider-b')
+    expect($sessionStates.get()[PRIMARY_RUNTIME_ID]).toMatchObject({
+      model: 'model-b',
+      provider: 'provider-b',
+      pendingModelSelection: null
+    })
+    expect($currentModel.get()).toBe('model-b')
+    expect($currentProvider.get()).toBe('provider-b')
+    expect(getCurrentModelSource()).toBe('manual')
+  })
+
+  it('keeps the highest confirmed choice when older acknowledgements arrive last', async () => {
+    const requests: Array<{ resolve: (value: unknown) => void; reject: (reason: Error) => void }> = []
+
+    const requestGateway = vi.fn(
+      () =>
+        new Promise<never>((resolve, reject) => {
+          requests.push({ resolve: value => resolve(value as never), reject })
+        })
+    )
+
+    const { result } = renderHook(() => useModelControls({ queryClient: new QueryClient(), requestGateway }))
+    const first = result.current.selectModel({ model: 'model-b', provider: 'provider-b' })
+    const second = result.current.selectModel({ model: 'model-c', provider: 'provider-c' })
+    const third = result.current.selectModel({ model: 'model-d', provider: 'provider-d' })
+    requests[1].resolve({ model_control_revision: 2 })
+    await second
+    requests[0].resolve({ model_control_revision: 1 })
+    await first
+    expect(PRIMARY_SESSION_VIEW.$model.get()).toBe('model-d')
+    requests[2].reject(new Error('D refused'))
+    await expect(third).resolves.toBe(false)
+    expect(PRIMARY_SESSION_VIEW.$model.get()).toBe('model-c')
+    expect($sessionStates.get()[PRIMARY_RUNTIME_ID]).toMatchObject({
+      model: 'model-c',
+      provider: 'provider-c',
+      pendingModelSelection: null,
+      modelSelectionFence: { model: 'model-c', provider: 'provider-c', modelControlRevision: 2 }
+    })
+  })
+
   it('does not let an older acknowledgement repaint a newer successful choice', async () => {
     const requests: Array<(value: unknown) => void> = []
 

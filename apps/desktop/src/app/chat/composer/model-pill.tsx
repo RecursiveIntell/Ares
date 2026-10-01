@@ -48,6 +48,7 @@ export function ModelPill({
   // Prefer the chat-bar snapshot (already view-scoped by ChatView); fall back
   // to the live SessionView atoms so a mid-flight session.info still paints.
   const viewModel = useStore(view.$model)
+  const pendingModelSelection = useStore(view.$pendingModelSelection)
   const viewProvider = useStore(view.$provider)
   const currentModel = model.model || viewModel
   const currentProvider = model.provider || viewProvider
@@ -110,6 +111,11 @@ export function ModelPill({
           data-testid="model-pinned-dot"
           role="img"
         />
+      )}
+      {pendingModelSelection && (
+        <span data-testid="model-pending-indicator">
+          <GlyphSpinner ariaLabel="Model switch pending" className="size-3 shrink-0 opacity-70" spinner="braille" />
+        </span>
       )}
       <ChevronDown className="size-2.5 shrink-0 opacity-50" />
     </>

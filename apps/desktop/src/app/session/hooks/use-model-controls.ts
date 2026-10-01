@@ -43,6 +43,7 @@ interface ModelSwitchResponse {
   confirm_message?: string
   confirm_required?: boolean
   deferred?: boolean
+  model_control_revision?: number
 }
 
 /** A recovery owner declined to rebind because the user moved on. */
@@ -218,6 +219,14 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
       const pendingBefore = liveSessionId ? $sessionStates.get()[liveSessionId]?.pendingModelSelection : null
       const continuesOptimisticChain = pendingBefore?.model === prevModel && pendingBefore?.provider === prevProvider
 
+      const supersededSelections = [
+        ...(continuesOptimisticChain ? (pendingBefore?.supersededSelections ?? []) : []),
+        { model: prevModel, provider: prevProvider }
+      ].filter(
+        (pair, index, pairs) =>
+          pairs.findIndex(other => other.model === pair.model && other.provider === pair.provider) === index
+      )
+
       const rollbackModel = continuesOptimisticChain
         ? (pendingBefore?.rollbackModel ?? pendingBefore?.previousModel ?? prevModel)
         : prevModel
@@ -271,9 +280,15 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
             ? {
                 model,
                 provider,
+                intentToken: intentTokens.model,
                 previousModel: prevModel,
                 previousProvider: prevProvider,
+                supersededSelections,
                 rollbackModel,
+                rollbackIntentToken: continuesOptimisticChain ? pendingBefore?.rollbackIntentToken : undefined,
+                rollbackModelControlRevision: continuesOptimisticChain
+                  ? pendingBefore?.rollbackModelControlRevision
+                  : undefined,
                 rollbackProvider,
                 rollbackSource
               }
@@ -282,19 +297,14 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
           const pendingMatches =
             pendingModelSelection === null
               ? state.pendingModelSelection === null
-              : state.pendingModelSelection?.model === pendingModelSelection.model &&
-                state.pendingModelSelection.provider === pendingModelSelection.provider &&
-                state.pendingModelSelection.previousModel === pendingModelSelection.previousModel &&
-                state.pendingModelSelection.previousProvider === pendingModelSelection.previousProvider &&
-                state.pendingModelSelection.rollbackModel === pendingModelSelection.rollbackModel &&
-                state.pendingModelSelection.rollbackProvider === pendingModelSelection.rollbackProvider &&
-                state.pendingModelSelection.rollbackSource === pendingModelSelection.rollbackSource
+              : JSON.stringify(state.pendingModelSelection) === JSON.stringify(pendingModelSelection)
 
           const nextState = {
             ...state,
             model,
             provider,
-            pendingModelSelection
+            pendingModelSelection,
+            modelSelectionFence: optimistic ? state.modelSelectionFence : null
           }
 
           return state.model === nextState.model && state.provider === nextState.provider && pendingMatches
@@ -342,6 +352,18 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
         // while the RPC was pending. That state is separate from the current
         // foreground globals and must not remain as a false applied switch.
         updateLiveRuntimeSelection(appliedRollbackModel, appliedRollbackProvider, false)
+
+        if (liveSessionId && currentRollback?.rollbackModelControlRevision !== undefined) {
+          sessionTileDelegate()?.updateSession(liveSessionId, state => ({
+            ...state,
+            modelSelectionFence: {
+              model: appliedRollbackModel,
+              provider: appliedRollbackProvider,
+              modelControlRevision: currentRollback.rollbackModelControlRevision!,
+              supersededSelections: currentRollback.supersededSelections ?? []
+            }
+          }))
+        }
 
         if (touchesPrimary) {
           if (!stillOwnsPrimarySelection() || !owns('model')) {
@@ -429,6 +451,9 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
       }
 
       const finishSwitch = (result: ModelSwitchResponse | undefined) => {
+        const resultRevision =
+          typeof result?.model_control_revision === 'number' ? result.model_control_revision : undefined
+
         if (!owns('model')) {
           // A prior pick may be acknowledged while a newer optimistic pick
           // remains pending. Advance only that pick's rollback baseline.
@@ -443,12 +468,21 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
             sessionTileDelegate()?.updateSession(liveSessionId, state => {
               const pending = state.pendingModelSelection
 
-              if (pending?.previousModel === selection.model && pending.previousProvider === selection.provider) {
+              if (
+                pending &&
+                (pending.rollbackIntentToken ?? 0) < intentTokens.model &&
+                ((pending.previousModel === selection.model && pending.previousProvider === selection.provider) ||
+                  pending.supersededSelections?.some(
+                    pair => pair.model === selection.model && pair.provider === selection.provider
+                  ))
+              ) {
                 return {
                   ...state,
                   pendingModelSelection: {
                     ...pending,
                     rollbackModel: selection.model,
+                    rollbackIntentToken: intentTokens.model,
+                    rollbackModelControlRevision: resultRevision,
                     rollbackProvider: selection.provider,
                     rollbackSource: touchesPrimary ? 'manual' : pending.rollbackSource
                   }
@@ -484,6 +518,44 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
           }
 
           return
+        }
+
+        if (liveSessionId && resultRevision !== undefined) {
+          sessionTileDelegate()?.updateSession(liveSessionId, state => {
+            const pending = state.pendingModelSelection
+
+            if (
+              pending?.intentToken !== intentTokens.model ||
+              pending.model !== selection.model ||
+              pending.provider !== selection.provider
+            ) {
+              return state
+            }
+
+            const acknowledgedPending = {
+              ...pending,
+              acknowledged: true,
+              modelControlRevision: resultRevision
+            }
+
+            if (pending.observedModelControlRevision === resultRevision) {
+              return {
+                ...state,
+                pendingModelSelection: null,
+                modelSelectionFence: {
+                  model: pending.model,
+                  provider: pending.provider,
+                  modelControlRevision: resultRevision,
+                  supersededSelections: [
+                    ...(pending.supersededSelections ?? []),
+                    { model: pending.previousModel, provider: pending.previousProvider }
+                  ]
+                }
+              }
+            }
+
+            return { ...state, pendingModelSelection: acknowledgedPending }
+          })
         }
 
         // A pick made DURING a turn is queued by the gateway and applied at the

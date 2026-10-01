@@ -95,6 +95,7 @@ describe('ModelPill per-surface model label', () => {
       $messages: atom([]),
       $messagesEmpty: atom(true),
       $model: atom('tile/claude-sonnet'),
+      $pendingModelSelection: atom(null),
       $provider: atom('anthropic'),
       $reasoningEffort: atom('high'),
       $runtimeId: atom('tile-runtime'),
@@ -113,5 +114,42 @@ describe('ModelPill per-surface model label', () => {
 
     expect(screen.getByText('Sonnet · High')).toBeTruthy()
     expect(screen.queryByText(/primary/i)).toBeNull()
+  })
+
+  it('shows an explicit pending indicator while a model switch is unconfirmed', () => {
+    const tileView: SessionView = {
+      kind: 'tile',
+      $awaitingResponse: atom(false),
+      $busy: atom(false),
+      $cwd: atom(''),
+      $fast: atom(false),
+      $lastVisibleIsUser: atom(false),
+      $messages: atom([]),
+      $messagesEmpty: atom(true),
+      $model: atom('tile/claude-sonnet'),
+      $pendingModelSelection: atom({
+        intentToken: 1,
+        model: 'tile/claude-sonnet',
+        previousModel: 'tile/old',
+        previousProvider: 'anthropic',
+        provider: 'anthropic'
+      }),
+      $provider: atom('anthropic'),
+      $reasoningEffort: atom(''),
+      $runtimeId: atom('tile-runtime'),
+      $storedId: atom('stored-tile'),
+      $turnStartedAt: atom<number | null>(null)
+    }
+
+    render(
+      <SessionViewProvider value={tileView}>
+        <ModelPill
+          disabled={false}
+          model={modelState({ model: 'tile/claude-sonnet', provider: 'anthropic', modelMenuContent: <div /> })}
+        />
+      </SessionViewProvider>
+    )
+
+    expect(screen.getByTestId('model-pending-indicator')).toBeTruthy()
   })
 })
