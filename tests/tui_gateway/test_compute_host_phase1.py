@@ -171,6 +171,8 @@ def test_mutator_route_table_matches_prd_inventory():
         "config.set.reasoning": "idle-gated",
         "session.redirect": "run-concurrent",
         "session.steer": "run-concurrent",
+        "clarify.snapshot": "run-concurrent",
+        "clarify.respond": "run-concurrent",
         "prompt.submit": "turn-path",
         "session.interrupt": "turn-path",
         "reload.mcp": "run-concurrent",
@@ -685,6 +687,9 @@ def test_resume_claim_adopts_the_compute_host_owner_when_parent_mirror_is_gone(m
     observed = {}
 
     class _Supervisor:
+        def wait_ready(self):
+            pass
+
         def lookup_session_key(self, key):
             assert key == session_key
             return {

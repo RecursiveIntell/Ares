@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
+import { fixtureAdmission, fixtureProjection } from './group-turn-wire-fixture.mjs'
 import vm from 'node:vm'
 
 // #91868/#94569: a REAL stop path for group-chat rounds. Before
@@ -60,10 +61,12 @@ function load({ reply = 'long answer', busyPolls = 0, onResumePoll = null } = {}
         throw err
       }
 
-      sessionSequence += 1
-      const runtime = `rt-${sessionSequence}`
-      session.runtime = runtime
-      runtimeToStored.set(runtime, session.stored)
+      if (!session.accepted_turn) {
+        sessionSequence += 1
+        session.runtime = `rt-${sessionSequence}`
+        runtimeToStored.set(session.runtime, session.stored)
+      }
+      const runtime = session.runtime
 
       // Post-submit polls: stay "busy" for the first `busyPolls` polls so a
       // stop can land mid-turn, then settle. `onResumePoll` lets a test fire
@@ -85,6 +88,7 @@ function load({ reply = 'long answer', busyPolls = 0, onResumePoll = null } = {}
         session_key: session.stored,
         message_count: busy ? 0 : session.messages.length,
         messages: busy ? [] : [...session.messages],
+        turn_outcomes: fixtureProjection(session, { state: busy ? 'running' : 'complete' }),
         inflight: busy,
         running: false
       }
@@ -101,7 +105,8 @@ function load({ reply = 'long answer', busyPolls = 0, onResumePoll = null } = {}
 
       session.messages.push({ role: 'user', content: params.text })
       session.messages.push({ role: 'assistant', content: reply })
-      return {}
+      session.finalized = [{ text: reply, status: 'complete' }]
+      return { accepted_turn: fixtureAdmission(session, `owned-${session.runtime}`) }
     }
 
     if (method === 'session.interrupt') {

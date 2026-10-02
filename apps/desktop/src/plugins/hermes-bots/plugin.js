@@ -499,17 +499,21 @@ function groupActivityLabel(event) {
   }
 
   const who = event?.member === 'You' ? 'You' : groupSpeakerLabel(event?.member || 'A bot')
+  const reason = ['failed', 'interrupted', 'unavailable', 'waiting'].includes(kind) && typeof event?.reason === 'string' ? event.reason.trim() : ''
 
-  return `${who} ${base}`
+  return `${who} ${base}${reason ? `: ${reason}` : ''}`
 }
 
 const GROUP_ACTIVITY_LABELS = {
   queued: 'sent a message',
   working: 'is working…',
+  waiting: 'is waiting',
   replied: 'replied',
   passed: 'passed',
   'timed-out': 'took too long',
   failed: 'hit an error',
+  interrupted: 'turn was interrupted',
+  unavailable: 'outcome is unavailable',
   cancelled: 'turn interrupted by a newer message',
   settled: 'turn settled',
   capped: 'turn stopped at the round/message cap',
@@ -521,10 +525,13 @@ const GROUP_ACTIVITY_LABELS = {
 const GROUP_ACTIVITY_GLYPHS = {
   queued: 'comment',
   working: 'sync',
+  waiting: 'debug-pause',
   replied: 'check',
   passed: 'circle-outline',
   'timed-out': 'clock',
   failed: 'error',
+  interrupted: 'close',
+  unavailable: 'error',
   cancelled: 'close',
   settled: 'check-all',
   capped: 'debug-step-over',
@@ -536,7 +543,7 @@ const GROUP_ACTIVITY_GLYPHS = {
 /** Text tone for an activity row: quiet for pass/cancel/settle, accent for
  *  work and real replies, destructive for failures and timeouts. */
 function groupActivityTone(kind) {
-  if (kind === 'failed' || kind === 'timed-out') {
+  if (kind === 'failed' || kind === 'timed-out' || kind === 'interrupted' || kind === 'unavailable') {
     return 'text-destructive'
   }
 
@@ -667,7 +674,8 @@ function groupChatSyncSnapshot(all = $groupChats.get(), deleted = {}) {
       },
       text: String(entry?.text || '').slice(0, GROUP_CHAT_SYNC_TEXT_CHARS),
       at: Number(entry?.at || 0),
-      ...(entry?.thread ? { thread: String(entry.thread).slice(0, 128) } : {})
+      ...(entry?.thread ? { thread: String(entry.thread).slice(0, 128) } : {}),
+      ...(groupTurnDeliveryKey(entry?.delivery) ? { delivery: entry.delivery } : {})
     }))
     const compact = {
       name: String(name).slice(0, 64),
@@ -704,6 +712,8 @@ function groupChatSyncSnapshot(all = $groupChats.get(), deleted = {}) {
 }
 
 function groupChatSyncEntryKey(entry) {
+  const deliveryKey = groupTurnDeliveryKey(entry?.delivery)
+  if (deliveryKey) return `turn:${deliveryKey}`
   if (entry?.id) {
     return `id:${String(entry.id)}`
   }
@@ -7359,13 +7369,14 @@ function normalizeGroupChatText(text) {
   return trimmed === GROUP_EMPTY_SENTINEL ? GROUP_EMPTY_FRIENDLY : trimmed
 }
 
-function appendGroupChatEntry(group, from, text, thread, images) {
+function appendGroupChatEntry(group, from, text, thread, images, delivery) {
   const entry = {
     id: groupChatEntryId(),
     at: Date.now(),
     from,
     text: normalizeGroupChatText(text),
-    thread: thread || 'legacy'
+    thread: thread || 'legacy',
+    ...(groupTurnDeliveryKey(delivery) ? { delivery } : {})
   }
 
   if (Array.isArray(images) && images.length) {
@@ -7381,7 +7392,11 @@ function appendGroupChatEntry(group, from, text, thread, images) {
   const priorLog = ($groupChats.get()[group] || {}).log || []
   const lastEntry = priorLog[priorLog.length - 1]
 
-  if (isDuplicateGroupAppend(lastEntry, from, entry.text, entry.thread)) {
+  const deliveryKey = groupTurnDeliveryKey(entry.delivery)
+  if (deliveryKey) {
+    const prior = priorLog.find(item => groupTurnDeliveryKey(item.delivery) === deliveryKey)
+    if (prior) return prior
+  } else if (isDuplicateGroupAppend(lastEntry, from, entry.text, entry.thread)) {
     return lastEntry
   }
 
@@ -7431,7 +7446,7 @@ function uniqueGroupChatName(base, taken) {
  *  title, which also covers rehydrated rooms whose sid was lost — reopens
  *  it after restarts. Cross-connection members route to their OWN source
  *  via requestForBot; the window's gateway never switches. */
-async function ensureGroupChatSession(group, member) {
+async function ensureGroupChatSession(group, member, requestMember = member) {
   const room = $groupChats.get()[group] || {}
   // New rooms title member sessions by their immutable roomId so a
   // same-name recreate never resumes the old room's sessions by title;
@@ -7458,7 +7473,7 @@ async function ensureGroupChatSession(group, member) {
     }
 
     try {
-      const res = await requestForBot(member, 'session.resume', {
+      const res = await requestForBot(requestMember, 'session.resume', {
         session_id: target,
         profile: member.name,
         omit_messages: true
@@ -7470,7 +7485,7 @@ async function ensureGroupChatSession(group, member) {
         if (stored) {
           updateGroupChat(group, current => {
             current.sessions = { ...(current.sessions || {}), [key]: stored }
-            current.sessionOwners = { ...(current.sessionOwners || {}), [key]: groupSessionOwner(member) }
+            current.sessionOwners = { ...(current.sessionOwners || {}), [key]: groupSessionOwner(requestMember) }
             return current
           })
         }
@@ -7486,7 +7501,7 @@ async function ensureGroupChatSession(group, member) {
     }
   }
 
-  const created = await requestForBot(member, 'session.create', {
+  const created = await requestForBot(requestMember, 'session.create', {
     profile: member.name,
     title,
     // Room member sessions are plumbing — always hidden from the sidebar.
@@ -7497,7 +7512,7 @@ async function ensureGroupChatSession(group, member) {
   if (stored) {
     updateGroupChat(group, r => {
       r.sessions = { ...(r.sessions || {}), [key]: stored }
-      r.sessionOwners = { ...(r.sessionOwners || {}), [key]: groupSessionOwner(member) }
+      r.sessionOwners = { ...(r.sessionOwners || {}), [key]: groupSessionOwner(requestMember) }
       return r
     })
   }
@@ -7570,9 +7585,9 @@ async function retainGroupTurnRoute(member) {
  *  the poll loop keeps a live fallback target. */
 async function submitGroupTurnPrompt(member, runtime, stored, text) {
   try {
-    await requestForBot(member, 'prompt.submit', { session_id: runtime, text })
+    const ack = await requestForBot(member, 'prompt.submit', { session_id: runtime, text })
 
-    return runtime
+    return { runtime, acceptedTurn: groupAcceptedTurn(ack?.accepted_turn, runtime) }
   } catch (error) {
     if (!isSessionGoneError(error) || !stored) {
       throw error
@@ -7589,9 +7604,9 @@ async function submitGroupTurnPrompt(member, runtime, stored, text) {
       throw error
     }
 
-    await requestForBot(member, 'prompt.submit', { session_id: fresh, text })
+    const ack = await requestForBot(member, 'prompt.submit', { session_id: fresh, text })
 
-    return fresh
+    return { runtime: fresh, acceptedTurn: groupAcceptedTurn(ack?.accepted_turn, fresh) }
   }
 }
 
@@ -7601,6 +7616,186 @@ async function submitGroupTurnPrompt(member, runtime, stored, text) {
 // timed out at 3 minutes, read as a pass, and its finished result never
 // reached the room (db's Aug 2026 report).
 const GROUP_TURN_HARD_CAP_MS = 20 * 60000
+
+/** A failed turn is retained for resume replay, not active work. Running,
+ *  streaming, and legacy inflight payloads still keep the member's slot. */
+function groupTurnTerminalError(state) {
+  const inflight = state?.inflight
+
+  if (!inflight || typeof inflight !== 'object' || state?.running || inflight.streaming || inflight.status !== 'error') {
+    return null
+  }
+
+  const message = typeof inflight.error === 'string' ? inflight.error.trim() : ''
+  const code = typeof inflight.error_surface?.code === 'string' ? inflight.error_surface.code.trim() : ''
+  const error = new Error(message || code || 'Member turn failed')
+  error.data = { reason: error.message }
+  return error
+}
+
+/** Process-local outcomes are execution receipts, independent of display-history
+ *  length, physical rows, timestamps, or content. Never infer a missing receipt. */
+function groupAcceptedTurn(value, runtime = value?.session_id) {
+  if (!value || typeof value.request_id !== 'string' || !value.request_id.trim() ||
+      typeof value.session_id !== 'string' || !value.session_id.trim() || value.session_id !== runtime ||
+      !['compute_host', 'inline'].includes(value.route) ||
+      (value.route === 'compute_host'
+        ? typeof value.host_boot_id !== 'string' || !value.host_boot_id.trim()
+        : value.host_boot_id !== null)) {
+    return null
+  }
+
+  return Object.freeze({ request_id: value.request_id, session_id: value.session_id,
+    route: value.route, host_boot_id: value.host_boot_id })
+}
+
+function groupAcceptedTurnKey(value) {
+  const ref = groupAcceptedTurn(value)
+  return ref ? JSON.stringify([ref.request_id, ref.session_id, ref.route, ref.host_boot_id]) : null
+}
+
+function groupTurnOwnerKey(owner) {
+  if (!owner || typeof owner.name !== 'string' || !owner.name) return null
+  if (!owner.connectionId) return JSON.stringify([owner.name, null])
+  const route = owner.route
+  if (typeof owner.connectionId !== 'string' || route?.connectionId !== owner.connectionId ||
+      route.profile !== owner.name || !['local', 'remote'].includes(route.mode) ||
+      typeof route.targetProfile !== 'string' || !route.targetProfile) return null
+  return JSON.stringify([owner.name, owner.connectionId, route.mode, route.profile, route.targetProfile])
+}
+
+function groupTurnDeliveryKey(delivery) {
+  const accepted = groupAcceptedTurnKey(delivery?.accepted_turn)
+  const owner = groupTurnOwnerKey(delivery?.owner)
+  return accepted && owner && typeof delivery.member_key === 'string' && delivery.member_key
+    ? JSON.stringify([delivery.member_key, owner, accepted]) : null
+}
+
+/** Keep local room keys compatible, while pinning RPCs to the connection that
+ *  accepted the turn whenever the host offers its explicit routing seam. */
+function captureGroupTurnMember(member) {
+  const route = botConnectionRoute(member)
+  const localConnection = host.state.connectionId?.get?.() || host.activeConnectionId?.() || ''
+  const pinnedRoute = route || (localConnection && typeof host.requestProfile === 'function'
+    ? { connectionId: localConnection, mode: localConnection === 'local' ? 'local' : 'remote',
+        profile: member.name, targetProfile: member.name }
+    : null)
+  const captured = Object.freeze({ ...member, ...(route ? { route: Object.freeze({ ...route }) } : {}) })
+  const requestMember = pinnedRoute
+    ? Object.freeze({ ...captured, sourceScoped: true, route: Object.freeze({ ...pinnedRoute }) })
+    : captured
+  return { member: captured, requestMember, owner: groupSessionOwner(requestMember) }
+}
+
+function readGroupTurnOutcome(state, delivery) {
+  const identity = groupAcceptedTurnKey(delivery?.accepted_turn)
+  const projection = state?.turn_outcomes
+  const unavailable = reason => ({ state: 'unavailable', reason })
+  if (!identity) return unavailable('Member turn admission identity is unavailable')
+  if (state?.session_id !== delivery.accepted_turn.session_id) {
+    return unavailable('Member runtime was replaced; its turn outcome is unavailable')
+  }
+  if (projection?.version !== 1 || projection.scope !== 'process_local' ||
+      projection.availability !== 'available' || !Array.isArray(projection.turns)) {
+    return unavailable('Member turn outcome is unavailable from this backend')
+  }
+  const matches = projection.turns.filter(turn => groupAcceptedTurnKey(turn?.accepted_turn) === identity)
+  if (matches.length !== 1) return unavailable('Accepted member turn outcome is missing or evicted')
+  const turn = matches[0]
+  if (turn.state === 'running' || turn.state === 'waiting') return { state: turn.state }
+  if (turn.state === 'complete') {
+    const complete = (Array.isArray(turn.finalized) ? turn.finalized : [])
+      .filter(entry => entry?.status === 'complete' && typeof entry.text === 'string' && entry.text.trim())
+      .map(entry => ({ role: 'assistant', content: entry.text }))
+    const reply = pickGroupTurnReply(complete, 0)
+    return reply === null ? unavailable('Completed member turn has no available finalized reply')
+      : { state: 'complete', reply }
+  }
+  if (turn.state === 'error' || turn.state === 'interrupted' || turn.state === 'unavailable') {
+    const final = Array.isArray(turn.finalized) ? turn.finalized.findLast(entry => entry?.status === turn.state) : null
+    const reason = [turn.reason, final?.error, final?.warning,
+      ...(turn.state === 'error' ? [groupTurnTerminalError(state)?.message] : [])]
+      .find(value => typeof value === 'string' && value.trim())
+    return { state: turn.state, reason: reason?.trim() ||
+      (turn.state === 'error' ? 'Member turn failed' : turn.state === 'interrupted'
+        ? 'Member turn was interrupted' : 'Member turn outcome is unavailable') }
+  }
+  return unavailable('Member turn outcome has an unsupported state')
+}
+
+function groupTurnOutcomeError(outcome) {
+  const error = new Error(outcome.reason)
+  error.data = { reason: outcome.reason, outcomeState: outcome.state }
+  return error
+}
+
+// A receipt in the existing durable stranded map is also the pending turn.
+// Only its current collector owns it; after a window reload the weak lease
+// disappears and the same receipt can be harvested without resubmitting.
+const collectingGroupTurnMarkers = new WeakMap()
+
+async function waitForGroupTurnCollector(group, memberKey, collector) {
+  const epoch = $groupChats.get()[group]?.epoch || 0
+  let timer, unbind
+  const cancelled = () => {
+    const room = $groupChats.get()[group]
+    return !room || room.tombstone || (room.epoch || 0) !== epoch || Boolean(room.holds?.[memberKey])
+  }
+  try {
+    const interrupted = new Promise(resolve => {
+      unbind = $groupChats.listen?.(() => { if (cancelled()) resolve('cancelled') })
+      if (cancelled()) resolve('cancelled')
+      timer = setTimeout(() => resolve('unavailable'), GROUP_TURN_HARD_CAP_MS)
+    })
+    const result = await Promise.race([collector.settled.then(() => 'settled'), interrupted])
+    return cancelled() ? 'cancelled' : result
+  } finally {
+    clearTimeout(timer)
+    unbind?.()
+  }
+}
+
+function groupTurnMarkerBlocksDispatch(room, memberKey) {
+  if (!Object.prototype.hasOwnProperty.call(room.stranded || {}, memberKey)) return false
+  const marker = room.stranded[memberKey]
+  // A newer user drive may supersede a live collector under the existing
+  // epoch policy. The old collector can no longer consume that receipt.
+  return !collectingGroupTurnMarkers.has(marker) || (room.epoch || 0) === marker.epoch || Boolean(room.holds?.[memberKey])
+}
+
+function consumeGroupTurnMarker(group, memberKey, marker) {
+  if ($groupChats.get()[group]?.stranded?.[memberKey] !== marker) return false
+  let consumed = false
+  updateGroupChat(group, room => {
+    if (room.stranded?.[memberKey] === marker) {
+      const next = { ...room.stranded }
+      delete next[memberKey]
+      room.stranded = next
+      consumed = true
+    }
+    return room
+  }, { sync: false })
+  return consumed
+}
+
+function groupTurnMarkerIntentIsCurrent(room, marker) {
+  if (!room || room.tombstone || room.holds?.[marker.delivery.member_key]) return false
+  const anchorIdx = room.log.findIndex(entry => entry.id === marker.anchor_id)
+  const tail = anchorIdx >= 0 ? room.log.slice(anchorIdx + 1) : room.log
+  const newerUser = tail.some(entry => entry.from?.kind === 'user' && groupThreadOf(entry) === marker.thread)
+  return shouldCommitMemberTurn(marker.epoch ?? 0, room.epoch || 0, newerUser)
+}
+
+function reportUnavailableGroupTurn(group, member, marker, reason) {
+  const memberKey = groupMemberKey(member)
+  if (marker?.reported || $groupChats.get()[group]?.stranded?.[memberKey] !== marker) return
+  updateGroupChat(group, room => {
+    room.stranded = { ...room.stranded, [memberKey]: { ...marker, reported: true, reason } }
+    return room
+  }, { sync: false })
+  recordGroupActivity(group, { kind: 'unavailable', member: member.name, thread: marker?.thread || 'legacy', reason })
+  noteBotAttention(memberKey, reason)
+}
 
 /** Mirror a member's pending prompt — clarify question OR command approval —
  *  from its resume snapshot into the room store, keyed
@@ -7621,6 +7816,7 @@ function syncGroupClarify(group, member, state) {
   const current = all[key]
 
   if (!requestId) {
+    if (state?.pending_clarify_unavailable && current?.kind === 'clarify') return true
     if (current) {
       const next = { ...all }
       delete next[key]
@@ -7709,6 +7905,13 @@ function clearGroupClarify(group) {
  *    keyed by session + request_id — the same wire the 1:1 approval card
  *    and native notifications use. */
 async function answerGroupClarify(entry, member, answers) {
+  const requireConfirmation = result => {
+    if (result?.status !== 'ok') {
+      throw new Error(result?.status === 'expired' ? 'The question expired.'
+        : result?.status === 'conflict' ? 'This question already has a different answer.'
+          : 'The answer acknowledgement is unconfirmed.')
+    }
+  }
   if (entry.kind === 'approval') {
     await requestForBot(member, 'approval.respond', {
       session_id: entry.sessionId || undefined,
@@ -7718,17 +7921,19 @@ async function answerGroupClarify(entry, member, answers) {
   } else if (entry.questions && entry.questions.length) {
     for (const question of entry.questions) {
       const qid = question?.qid ?? question?.id
-      await requestForBot(member, 'clarify.respond', {
+      requireConfirmation(await requestForBot(member, 'clarify.respond', {
+        session_id: entry.sessionId,
         request_id: entry.requestId,
         question_id: qid,
         answer: answers?.[qid] ?? ''
-      })
+      }))
     }
   } else {
-    await requestForBot(member, 'clarify.respond', {
+    requireConfirmation(await requestForBot(member, 'clarify.respond', {
+      session_id: entry.sessionId,
       request_id: entry.requestId,
       answer: typeof answers === 'string' ? answers : ''
-    })
+    }))
   }
 
   const all = $groupClarify.get()
@@ -7741,249 +7946,271 @@ async function answerGroupClarify(entry, member, answers) {
   }
 }
 
-/** One member turn, gateway-native: submit the room delta as a prompt into
- *  the member's per-group session, then poll the session until a NEW
- *  assistant message lands (or timeout → pass). While the session visibly
- *  reports work in flight the deadline extends (bounded by the hard cap),
- *  so slow models aren't cut off mid-run. A turn that still times out
- *  records a stranded marker so the finished reply can be harvested into
- *  the room at the member's next turn instead of being lost. */
-async function runGroupChatMemberTurn(group, member, prompt, thread, images) {
-  // #93602: hold the member's route socket for the whole turn. Without the
-  // lease, every RPC below rides its own request-scoped socket lease; the
-  // socket that minted `runtime` can close between RPCs, the gateway reaps
-  // the runtime session, and prompt.submit dies 4001 — the bot goes silent.
-  const releaseTurnLease = await retainGroupTurnRoute(member)
-
+/** Submit once, retain the backend's accepted identity, and collect only its
+ *  validated terminal projection. History is presentation, never completion. */
+async function runGroupChatMemberTurn(group, member, prompt, thread, images, deliveryResult) {
+  const captured = captureGroupTurnMember(member)
+  const releaseTurnLease = await retainGroupTurnRoute(captured.requestMember)
   try {
-    return await runGroupChatMemberTurnLeased(group, member, prompt, thread, images)
+    return await runGroupChatMemberTurnLeased(group, captured, prompt, thread, images, deliveryResult)
   } finally {
     releaseTurnLease()
   }
 }
 
-async function runGroupChatMemberTurnLeased(group, member, prompt, thread, images) {
-  const { runtime, stored } = await ensureGroupChatSession(group, member)
-
-  if (!runtime) {
+async function runGroupChatMemberTurnLeased(group, captured, prompt, thread, images, deliveryResult) {
+  const { member, requestMember, owner } = captured
+  const memberKey = groupMemberKey(member)
+  const discarded = () => {
+    if (deliveryResult) deliveryResult.discarded = true
     return null
   }
-
-  // #91868/#94569: remember the epoch this turn was dispatched under so the
-  // poll loop below can tell an explicit stop from ordinary room churn.
-  const dispatchEpoch = ($groupChats.get()[group] || {}).epoch || 0
-  const memberKey = groupMemberKey(member)
-
-  recordGroupActivity(group, { kind: 'working', member: member.name, thread })
-
-  // Baseline: how many messages exist before our submit.
-  let before = 0
-
+  while (true) {
+    const current = $groupChats.get()[group] || {}
+    const prior = current.stranded?.[memberKey]
+    const priorCollector = prior && collectingGroupTurnMarkers.get(prior)
+    if (!priorCollector) {
+      if (Object.prototype.hasOwnProperty.call(current.stranded || {}, memberKey)) {
+        throw groupTurnOutcomeError({ state: 'unavailable', reason: 'Previous member turn outcome is unresolved' })
+      }
+      break
+    }
+    if (prior.thread === (thread || 'legacy')) {
+      if ((current.epoch || 0) === prior.epoch || current.holds?.[memberKey]) return discarded()
+      break // newer intent in this thread supersedes the older collector
+    }
+    const waited = await waitForGroupTurnCollector(group, memberKey, priorCollector)
+    if (waited === 'cancelled') return discarded()
+    if (waited !== 'settled') {
+      throw groupTurnOutcomeError({ state: 'unavailable', reason: 'Earlier member turn did not settle within the wait limit' })
+    }
+    // Another waiter may have reserved the member. Recheck synchronously
+    // before any session preparation, attachments, or prompt admission.
+  }
+  const roomAtDispatch = $groupChats.get()[group] || {}
+  const dispatchEpoch = roomAtDispatch.epoch || 0
+  let marker = { delivery: { accepted_turn: null, member_key: memberKey, owner },
+    thread: thread || 'legacy', epoch: dispatchEpoch, anchor_id: roomAtDispatch.log?.at(-1)?.id || null }
+  let settleCollector
+  const collector = { settled: new Promise(resolve => { settleCollector = resolve }) }
+  collectingGroupTurnMarkers.set(marker, collector)
+  updateGroupChat(group, room => {
+    room.stranded = { ...(room.stranded || {}), [memberKey]: marker }
+    return room
+  }, { sync: false })
+  let submitAttempted = false
   try {
-    const pre = await requestForBot(member, 'session.resume', {
-      session_id: stored || runtime,
-      profile: member.name
-    })
-    before = Array.isArray(pre?.messages) ? pre.messages.length : pre?.message_count || 0
-  } catch {
-    /* lazy session — zero messages */
-  }
-
-  // Stage this delta's attachments into the member's session so the model
-  // receives the actual payload with the prompt — the same attach RPCs the
-  // 1:1 chat uses (they also work cross-connection, where the member's
-  // gateway can't see this machine's files). Images queue as vision tiles,
-  // PDFs render per-page via pdf.attach, and other files materialize in the
-  // session workspace (their @file: refs are appended to the prompt so the
-  // member's file tools can read them). A failed attach degrades that
-  // member to text-only; the transcript line still names the attachment so
-  // the member knows something was shared.
-  const fileRefs = []
-
-  for (const img of Array.isArray(images) ? images : []) {
-    if (!img || typeof img.data !== 'string' || !img.data) {
-      continue
+    const { runtime, stored } = await ensureGroupChatSession(group, member, requestMember)
+    const beforeSubmit = () => {
+      const room = $groupChats.get()[group] || {}
+      return room.stranded?.[memberKey] === marker && !room.tombstone &&
+        !((room.epoch || 0) !== dispatchEpoch && room.holds?.[memberKey])
     }
-
-    try {
-      if (img.kind === 'pdf') {
-        await requestForBot(member, 'pdf.attach', {
-          session_id: runtime,
-          content_base64: img.data,
-          filename: img.name || 'attachment.pdf'
-        })
-      } else if (img.kind === 'file') {
-        const res = await requestForBot(member, 'file.attach', {
-          session_id: runtime,
-          data_url: img.data,
-          name: img.name || 'attachment'
-        })
-
-        if (res?.ref_text) {
-          fileRefs.push(`${img.name || 'attachment'} → ${res.ref_text}`)
+    if (!runtime || !beforeSubmit()) {
+      consumeGroupTurnMarker(group, memberKey, marker)
+      return discarded()
+    }
+    recordGroupActivity(group, { kind: 'working', member: member.name, thread })
+    const fileRefs = []
+    for (const img of Array.isArray(images) ? images : []) {
+      if (!img || typeof img.data !== 'string' || !img.data) continue
+      try {
+        if (img.kind === 'pdf') {
+          await requestForBot(requestMember, 'pdf.attach', { session_id: runtime,
+            content_base64: img.data, filename: img.name || 'attachment.pdf' })
+        } else if (img.kind === 'file') {
+          const res = await requestForBot(requestMember, 'file.attach', { session_id: runtime,
+            data_url: img.data, name: img.name || 'attachment' })
+          if (res?.ref_text) fileRefs.push(`${img.name || 'attachment'} → ${res.ref_text}`)
+        } else {
+          await requestForBot(requestMember, 'image.attach_bytes', { session_id: runtime,
+            content_base64: img.data, filename: img.name || 'attachment.png' })
         }
-      } else {
-        await requestForBot(member, 'image.attach_bytes', {
-          session_id: runtime,
-          content_base64: img.data,
-          filename: img.name || 'attachment.png'
-        })
+      } catch {
+        /* text-only fallback for this member */
       }
-    } catch {
-      /* text-only fallback for this member */
     }
-  }
-
-  const turnText = fileRefs.length
-    ? `${prompt}\n\nAttached files staged in your session workspace:\n${fileRefs.join('\n')}`
-    : prompt
-
-  // #93602: one-shot recovery when the runtime session was reaped between
-  // minting and submitting. Tracks the runtime id the submit landed on so
-  // the poll fallback below targets a live session.
-  const liveRuntime = await submitGroupTurnPrompt(member, runtime, stored, turnText)
-
-  const started = Date.now()
-  let deadline = started + GROUP_TURN_TIMEOUT_MS
-
-  while (Date.now() < deadline) {
-    await new Promise(resolve => setTimeout(resolve, GROUP_TURN_POLL_MS))
-
-    // #91868/#94569: an explicit stop (stopGroupThread) bumped the epoch AND
-    // held this member — the member's session was interrupted, so nothing is
-    // coming; abandon the poll instead of grinding until the deadline. Both
-    // conditions on purpose: an ordinary newer send bumps the epoch WITHOUT
-    // a hold, and that turn must keep polling so finished work can still be
-    // delivered (the #93127 commit check decides its fate, not this loop).
-    const roomDuringPoll = $groupChats.get()[group] || {}
-
-    if ((roomDuringPoll.epoch || 0) !== dispatchEpoch && (roomDuringPoll.holds || {})[memberKey]) {
-      return null
+    const turnText = fileRefs.length
+      ? `${prompt}\n\nAttached files staged in your session workspace:\n${fileRefs.join('\n')}` : prompt
+    if (!beforeSubmit()) {
+      consumeGroupTurnMarker(group, memberKey, marker)
+      return discarded()
     }
-
-    let state = null
-
-    try {
-      state = await requestForBot(member, 'session.resume', {
-        session_id: stored || liveRuntime,
-        profile: member.name
-      })
-    } catch {
-      continue
-    }
-
-    const messages = Array.isArray(state?.messages) ? state.messages : []
-    const busy = Boolean(state?.inflight || state?.running)
-    // A clarify blocking inside the member's session is a question for the
-    // HUMAN (#90694) — mirror it into the room store so a card renders, and
-    // hold the turn open: the member isn't stalling, it's waiting on us.
-    const awaitingUser = syncGroupClarify(group, member, state)
-    const done = !busy && !awaitingUser
-
-    if (messages.length > before && done) {
-      const replyText = pickGroupTurnReply(messages, before)
-
-      if (replyText !== null) {
-        recordGroupActivity(group, {
-          kind: isGroupPassText(replyText) ? 'passed' : 'replied',
-          member: member.name,
-          thread
-        })
-
-        return replyText
+    submitAttempted = true
+    const submitted = await submitGroupTurnPrompt(requestMember, runtime, stored, turnText)
+    const previous = marker
+    marker = { ...marker, runtime: submitted.runtime,
+      delivery: { ...marker.delivery, accepted_turn: submitted.acceptedTurn } }
+    collectingGroupTurnMarkers.delete(previous)
+    collectingGroupTurnMarkers.set(marker, collector)
+    let owned = false
+    updateGroupChat(group, room => {
+      if (room.stranded?.[memberKey] === previous) {
+        room.stranded = { ...room.stranded, [memberKey]: marker }
+        owned = true
       }
-
-      recordGroupActivity(group, { kind: 'passed', member: member.name, thread })
-
-      return null
+      return room
+    }, { sync: false })
+    if (!owned) return discarded()
+    if (!submitted.acceptedTurn) {
+      throw groupTurnOutcomeError({ state: 'unavailable', reason: 'Member turn admission identity is unavailable' })
     }
-
-    // Still visibly working — or waiting on the user's answer to a clarify:
-    // extend the deadline (never past the hard cap). A pending question must
-    // outlive the base turn timeout or it dies unanswered at 3 minutes.
-    if (busy || awaitingUser) {
-      deadline = Math.min(started + GROUP_TURN_HARD_CAP_MS, Math.max(deadline, Date.now() + GROUP_TURN_TIMEOUT_MS))
+    const started = Date.now()
+    let deadline = started + GROUP_TURN_TIMEOUT_MS
+    let progress = 'working'
+    while (Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, GROUP_TURN_POLL_MS))
+      const roomDuringPoll = $groupChats.get()[group] || {}
+      if (roomDuringPoll.stranded?.[memberKey] !== marker) return discarded()
+      if ((roomDuringPoll.epoch || 0) !== dispatchEpoch && roomDuringPoll.holds?.[memberKey]) {
+        consumeGroupTurnMarker(group, memberKey, marker)
+        return discarded()
+      }
+      let state
+      try {
+        state = await requestForBot(requestMember, 'session.turn.poll', {
+          session_id: submitted.acceptedTurn.session_id, profile: member.name,
+          accepted_turn: submitted.acceptedTurn })
+      } catch (error) {
+        const roomAfterError = $groupChats.get()[group] || {}
+        if (roomAfterError.stranded?.[memberKey] !== marker) return discarded()
+        if ((roomAfterError.epoch || 0) !== dispatchEpoch && roomAfterError.holds?.[memberKey]) {
+          consumeGroupTurnMarker(group, memberKey, marker)
+          return discarded()
+        }
+        if (!groupTurnMarkerIntentIsCurrent(roomAfterError, marker)) return discarded()
+        // Observation failure grants no replay or resume authority. Surface it
+        // now and retain the accepted receipt for an explicit later harvest.
+        throw groupTurnOutcomeError({ state: 'unavailable',
+          reason: `Could not observe member turn: ${error?.message || 'gateway poll failed'}` })
+      }
+      const roomAfterResume = $groupChats.get()[group] || {}
+      if (roomAfterResume.stranded?.[memberKey] !== marker) return discarded()
+      if ((roomAfterResume.epoch || 0) !== dispatchEpoch && roomAfterResume.holds?.[memberKey]) {
+        consumeGroupTurnMarker(group, memberKey, marker)
+        return discarded()
+      }
+      const outcome = readGroupTurnOutcome(state, marker.delivery)
+      if (!groupTurnMarkerIntentIsCurrent(roomAfterResume, marker)) {
+        if (['complete', 'error', 'interrupted'].includes(outcome.state)) {
+          consumeGroupTurnMarker(group, memberKey, marker)
+        }
+        return discarded()
+      }
+      const awaitingUser = syncGroupClarify(group, member,
+        outcome.state === 'waiting' || outcome.state === 'running' ? state : null)
+      if (outcome.state === 'waiting' || outcome.state === 'running') {
+        const reason = state.pending_clarify_unavailable ? 'clarification state is temporarily unavailable'
+          : state.pending_clarify ? 'needs your answer' : state.pending_approval ? 'needs your approval' : ''
+        const kind = awaitingUser || outcome.state === 'waiting' || reason ? 'waiting' : 'working'
+        const nextProgress = `${kind}:${reason}`
+        if (nextProgress !== progress && !(progress === 'working' && kind === 'working')) {
+          recordGroupActivity(group, { kind, member: member.name, thread, reason })
+        }
+        progress = nextProgress
+      }
+      if (!awaitingUser && outcome.state === 'complete') {
+        if (!consumeGroupTurnMarker(group, memberKey, marker)) return discarded()
+        if (deliveryResult) deliveryResult.value = marker.delivery
+        recordGroupActivity(group, { kind: isGroupPassText(outcome.reply) ? 'passed' : 'replied', member: member.name, thread })
+        return outcome.reply
+      }
+      if (!awaitingUser && ['error', 'interrupted', 'unavailable'].includes(outcome.state)) {
+        if (outcome.state !== 'unavailable' && !consumeGroupTurnMarker(group, memberKey, marker)) return discarded()
+        throw groupTurnOutcomeError(outcome)
+      }
+      if (awaitingUser || outcome.state === 'running' || outcome.state === 'waiting') {
+        deadline = Math.min(started + GROUP_TURN_HARD_CAP_MS,
+          Math.max(deadline, Date.now() + GROUP_TURN_TIMEOUT_MS))
+      }
     }
+    recordGroupActivity(group, { kind: 'timed-out', member: member.name, thread })
+    syncGroupClarify(group, member, null)
+    return null
+  } catch (error) {
+    if (!submitAttempted) {
+      consumeGroupTurnMarker(group, memberKey, marker)
+      throw error
+    }
+    // An uncertain admission or unavailable projection must never be replayed.
+    // The round's existing catch surfaces the error once; harvest retains it.
+    if ($groupChats.get()[group]?.stranded?.[memberKey] === marker) {
+      updateGroupChat(group, room => {
+        room.stranded = { ...room.stranded, [memberKey]: { ...marker, reported: true,
+          reason: error?.data?.reason || error?.message || 'Member turn outcome is unavailable' } }
+        return room
+      }, { sync: false })
+    }
+    throw error
+  } finally {
+    collectingGroupTurnMarkers.delete(marker)
+    settleCollector()
   }
-
-  // Timeout — clear any still-mirrored question card (the server-side
-  // clarify timeout runs its own course) and read as a pass, but remember the baseline + thread
-  // (runtime-only) so the finished reply can be posted late into the RIGHT
-  // thread instead of vanishing.
-  recordGroupActivity(group, { kind: 'timed-out', member: member.name, thread })
-  syncGroupClarify(group, member, null)
-  updateGroupChat(group, r => {
-    r.stranded = { ...(r.stranded || {}), [groupMemberKey(member)]: { before, thread } }
-    return r
-  })
-
-  return null
 }
 
-/** Post a timed-out member's finished reply into the room, if it landed
- *  after we stopped waiting. Called at the member's next turn boundary and
- *  on user sends, so long-running work is delivered late rather than lost. */
+/** Harvest the captured admission from its source, never a newer session's
+ *  history. Missing/restarted/evicted receipts remain unresolved. */
 async function harvestStrandedGroupReply(group, member) {
   const memberKey = groupMemberKey(member)
   const room = $groupChats.get()[group] || {}
   const marker = room.stranded?.[memberKey]
-  // Markers were a bare number before threads; normalize both shapes.
-  const strandedBefore = typeof marker === 'number' ? marker : marker?.before
-  const strandedThread = (typeof marker === 'object' && marker?.thread) || 'legacy'
-
-  if (typeof strandedBefore !== 'number') {
+  if (marker === undefined || collectingGroupTurnMarkers.has(marker) || room.holds?.[memberKey]) return
+  const captured = captureGroupTurnMember(member)
+  if (!groupTurnDeliveryKey(marker?.delivery) || marker.delivery.member_key !== memberKey ||
+      groupTurnOwnerKey(marker.delivery.owner) !== groupTurnOwnerKey(captured.owner)) {
+    reportUnavailableGroupTurn(group, member, marker, 'Member turn admission or source identity is unavailable')
     return
   }
-
-  let state = null
-
+  let state
   try {
-    const stored = room.sessions?.[memberKey]
-    state = await requestForBot(member, 'session.resume', {
-      session_id: stored || `Group: ${room.roomId || group}`,
-      profile: member.name
-    })
-  } catch {
-    return // source unreachable — leave the marker for the next boundary
-  }
-
-  if (state?.inflight || state?.running) {
-    return // still grinding — keep waiting
-  }
-
-  // A stranded member blocked on a clarify is not "grinding" — surface the
-  // question card (#90694) and keep the marker until it resolves.
-  if (syncGroupClarify(group, member, state)) {
+    state = await requestForBot(captured.requestMember, 'session.turn.poll', {
+      session_id: marker.delivery.accepted_turn.session_id, profile: captured.member.name,
+      accepted_turn: marker.delivery.accepted_turn })
+  } catch (error) {
+    const current = $groupChats.get()[group]
+    if (current?.stranded?.[memberKey] !== marker || !groupTurnMarkerIntentIsCurrent(current, marker)) return
+    reportUnavailableGroupTurn(group, member, marker,
+      `Could not observe member turn: ${error?.message || 'gateway poll failed'}`)
     return
   }
-
-  // Done (or dead): the marker is consumed either way.
-  updateGroupChat(group, r => {
-    const next = { ...(r.stranded || {}) }
-    delete next[memberKey]
-    r.stranded = next
-    return r
-  })
-
-  const messages = Array.isArray(state?.messages) ? state.messages : []
-
-  if (messages.length <= strandedBefore) {
+  if ($groupChats.get()[group]?.stranded?.[memberKey] !== marker) return
+  const outcome = readGroupTurnOutcome(state, marker.delivery)
+  if (!groupTurnMarkerIntentIsCurrent($groupChats.get()[group], marker)) {
+    if (['complete', 'error', 'interrupted'].includes(outcome.state)) {
+      consumeGroupTurnMarker(group, memberKey, marker)
+    }
     return
   }
-
-  const reply = pickGroupTurnReply(messages, strandedBefore)
-
-  if (reply && !isGroupPassText(reply)) {
-    recordGroupActivity(group, { kind: 'delivered', member: member.name, thread: strandedThread })
-    appendGroupChatEntry(
-      group,
-      { kind: 'member', name: member.name, ...(member.remoteSource ? { source: member.connectionLabel || member.connectionId } : {}) },
-      reply,
-      strandedThread
-    )
-    updateGroupChat(group, r => {
-      r.watermarks[`${strandedThread}::${memberKey}`] = r.log.length
-      return r
+  if (syncGroupClarify(group, member, outcome.state === 'waiting' || outcome.state === 'running' ? state : null)) return
+  if (outcome.state === 'running' || outcome.state === 'waiting') return
+  if (outcome.state === 'unavailable') {
+    reportUnavailableGroupTurn(group, member, marker, outcome.reason)
+    return
+  }
+  const current = $groupChats.get()[group]
+  if (!current || current.tombstone || current.holds?.[memberKey]) return
+  const anchorIdx = current.log.findIndex(entry => entry.id === marker.anchor_id)
+  const tail = anchorIdx >= 0 ? current.log.slice(anchorIdx + 1) : current.log
+  const newerUser = tail.some(entry => entry.from?.kind === 'user' && groupThreadOf(entry) === marker.thread)
+  if (!shouldCommitMemberTurn(marker.epoch ?? 0, current.epoch || 0, newerUser)) {
+    consumeGroupTurnMarker(group, memberKey, marker)
+    return
+  }
+  if (!consumeGroupTurnMarker(group, memberKey, marker)) return
+  if (outcome.state === 'error' || outcome.state === 'interrupted') {
+    recordGroupActivity(group, { kind: outcome.state === 'error' ? 'failed' : 'interrupted',
+      member: captured.member.name, thread: marker.thread, reason: outcome.reason })
+    noteBotAttention(memberKey, outcome.reason)
+    return
+  }
+  if (!isGroupPassText(outcome.reply)) {
+    recordGroupActivity(group, { kind: 'delivered', member: captured.member.name, thread: marker.thread })
+    appendGroupChatEntry(group, { kind: 'member', name: captured.member.name,
+      ...(captured.member.remoteSource ? { source: captured.member.connectionLabel || captured.member.connectionId } : {}) },
+      outcome.reply, marker.thread, undefined, marker.delivery)
+    updateGroupChat(group, current => {
+      current.watermarks[`${marker.thread}::${memberKey}`] = current.log.length
+      return current
     })
   }
 }
@@ -8296,9 +8523,9 @@ async function runGroupChatRounds(group, members, thread) {
       // deletes it once the member is confirmed done/dead) — presence, not
       // value shape, since markers are a bare number pre-thread or
       // {before, thread} post-thread.
-      const strandedNow = ($groupChats.get()[group] || {}).stranded || {}
+      const roomForDispatch = $groupChats.get()[group] || {}
       const responders = rotateGroupSpeakers(resolveGroupResponders(roomLog, members), round)
-        .filter(member => !Object.prototype.hasOwnProperty.call(strandedNow, groupMemberKey(member)))
+        .filter(member => !groupTurnMarkerBlocksDispatch(roomForDispatch, groupMemberKey(member)))
       let spokeThisRound = 0
 
       for (const member of responders) {
@@ -8374,9 +8601,11 @@ async function runGroupChatRounds(group, members, thread) {
         })
 
         let reply = null
+        let unresolvedTurn = false
+        const deliveryResult = {}
 
         try {
-          reply = await runGroupChatMemberTurn(group, member, prompt, thread, deltaImages)
+          reply = await runGroupChatMemberTurn(group, member, prompt, thread, deltaImages, deliveryResult)
 
           // Needs-attention hook (#93091 item 3): a turn that produced a real
           // reply (or an explicit pass) is a good turn — clear the badge.
@@ -8386,9 +8615,11 @@ async function runGroupChatRounds(group, members, thread) {
             clearBotAttention(groupMemberKey(member))
           }
         } catch (error) {
+          unresolvedTurn = error?.data?.outcomeState === 'unavailable' ||
+            Object.prototype.hasOwnProperty.call(($groupChats.get()[group] || {}).stranded || {}, memberKey)
           const reason = String(error?.data?.reason || '').trim()
           recordGroupActivity(group, {
-            kind: 'failed',
+            kind: ['interrupted', 'unavailable'].includes(error?.data?.outcomeState) ? error.data.outcomeState : 'failed',
             member: member.name,
             thread,
             ...(reason ? { reason } : {})
@@ -8408,6 +8639,10 @@ async function runGroupChatRounds(group, members, thread) {
         // during-turn tail is anchored by entry id, not index — the history
         // trim drops entries from the FRONT, so an index slice could
         // overshoot after a mid-turn trim and silently commit a stale turn.
+        if (deliveryResult.discarded) {
+          recordGroupActivity(group, { kind: 'cancelled', member: member.name, thread })
+          return
+        }
         const roomNow = $groupChats.get()[group] || { log: [] }
         const epochNow = roomNow.epoch || 0
         const anchorId = room.log.length ? room.log[room.log.length - 1].id : null
@@ -8425,17 +8660,21 @@ async function runGroupChatRounds(group, members, thread) {
         }
 
         // The member has now seen everything up to the pre-reply log length.
-        updateGroupChat(group, r => {
-          r.watermarks[markKey] = r.log.length
-          return r
-        })
+        if (!unresolvedTurn) {
+          updateGroupChat(group, r => {
+            r.watermarks[markKey] = r.log.length
+            return r
+          })
+        }
 
         if (reply !== null && !isGroupPassText(reply)) {
           appendGroupChatEntry(
             group,
             { kind: 'member', name: member.name, ...(member.remoteSource ? { source: member.connectionLabel || member.connectionId } : {}) },
             reply,
-            thread
+            thread,
+            undefined,
+            deliveryResult.value
           )
           // Its own message counts as seen too.
           updateGroupChat(group, r => {
@@ -8466,9 +8705,9 @@ async function runGroupChatRounds(group, members, thread) {
           const citedMembers = members.filter(member => pendingKeys.includes(groupMemberKey(member)))
 
           if (citedMembers.length && posted < GROUP_CHAT_MAX_MESSAGES) {
-            const strandedNow = ($groupChats.get()[group] || {}).stranded || {}
+            const roomForDispatch = $groupChats.get()[group] || {}
             const continuationResponders = citedMembers.filter(
-              member => !Object.prototype.hasOwnProperty.call(strandedNow, groupMemberKey(member))
+              member => !groupTurnMarkerBlocksDispatch(roomForDispatch, groupMemberKey(member))
             )
 
             for (const member of continuationResponders) {
@@ -8511,34 +8750,46 @@ async function runGroupChatRounds(group, members, thread) {
               })
 
               let continuationReply = null
+              let unresolvedContinuation = false
+              const continuationDelivery = {}
 
               try {
-                continuationReply = await runGroupChatMemberTurn(group, member, prompt, thread)
+                continuationReply = await runGroupChatMemberTurn(group, member, prompt, thread, undefined, continuationDelivery)
 
                 if (continuationReply !== null) {
                   clearBotAttention(memberKey)
                 }
               } catch (error) {
-                recordGroupActivity(group, { kind: 'failed', member: member.name, thread })
+                unresolvedContinuation = error?.data?.outcomeState === 'unavailable' ||
+                  Object.prototype.hasOwnProperty.call(($groupChats.get()[group] || {}).stranded || {}, memberKey)
+                recordGroupActivity(group, {
+                  kind: ['interrupted', 'unavailable'].includes(error?.data?.outcomeState) ? error.data.outcomeState : 'failed',
+                  member: member.name, thread, reason: error?.data?.reason || error?.message
+                })
                 noteBotAttention(memberKey, error?.message || error)
                 continuationReply = null
               }
 
-              if (!isCurrent()) {
+              if (!isCurrent() || continuationDelivery.discarded) {
+                recordGroupActivity(group, { kind: 'cancelled', member: member.name, thread })
                 return
               }
 
-              updateGroupChat(group, r => {
-                r.watermarks[markKey] = r.log.length
-                return r
-              })
+              if (!unresolvedContinuation) {
+                updateGroupChat(group, r => {
+                  r.watermarks[markKey] = r.log.length
+                  return r
+                })
+              }
 
               if (continuationReply !== null && !isGroupPassText(continuationReply)) {
                 appendGroupChatEntry(
                   group,
                   { kind: 'member', name: member.name, ...(member.remoteSource ? { source: member.connectionLabel || member.connectionId } : {}) },
                   continuationReply,
-                  thread
+                  thread,
+                  undefined,
+                  continuationDelivery.value
                 )
                 updateGroupChat(group, r => {
                   r.watermarks[markKey] = r.log.length

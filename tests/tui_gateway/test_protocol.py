@@ -56,6 +56,7 @@ def server():
         mod._close_session_by_id(sid, end_reason="test_cleanup")
     mod._pending.clear()
     mod._answers.clear()
+    mod._clarify_response_receipts.clear()
     mod._live_transports.clear()
 
 
@@ -357,6 +358,30 @@ def test_late_prompt_response_is_idempotent(server, method, value_key):
 # ── clarify batch (multi-question) bridge ────────────────────────────
 
 
+def _drain_single_clarify_block(server, timeout=5):
+    """Run a single-question clarify block and return its request id."""
+    box = {}
+
+    def run():
+        box["answer"] = server._block(
+            "clarify.request",
+            "s1",
+            {"question": "Which option?"},
+            timeout=timeout,
+        )
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        with server._prompt_lock:
+            if server._pending:
+                rid = next(iter(server._pending))
+                return thread, box, rid
+        time.sleep(0.01)
+    raise AssertionError("single clarify request never registered")
+
+
 def _drain_batch_block(server, qids, timeout=5, payload=None):
     """Run a batch _block on a worker thread and return (thread, result box,
     emitted request payload). The caller resolves questions via
@@ -383,6 +408,66 @@ def _drain_batch_block(server, qids, timeout=5, payload=None):
                 return thread, box, rid
         time.sleep(0.01)
     raise AssertionError("batch clarify request never registered")
+
+
+def test_clarify_single_answer_retry_after_lost_ack_is_idempotent(server):
+    thread, box, rid = _drain_single_clarify_block(server)
+
+    # The answer was accepted; its RPC acknowledgement is lost in transit.
+    server.handle_request({
+        "id": "first", "method": "clarify.respond",
+        "params": {"request_id": rid, "answer": "staging"},
+    })
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert box["answer"] == "staging"
+
+    retry = server.handle_request({
+        "id": "retry", "method": "clarify.respond",
+        "params": {"request_id": rid, "answer": "staging"},
+    })
+    assert retry["result"] == {"status": "ok"}
+    assert box["answer"] == "staging"
+
+    # A replay with a different answer must not mutate the already-confirmed
+    # choice under the same request id.
+    changed = server.handle_request({
+        "id": "changed", "method": "clarify.respond",
+        "params": {"request_id": rid, "answer": "production"},
+    })
+    assert changed["result"] == {"status": "conflict"}
+    assert box["answer"] == "staging"
+
+
+def test_stale_clarify_id_cannot_alias_new_request_when_uuid_repeats(server, monkeypatch):
+    monkeypatch.setattr(server.uuid, "uuid4", lambda: types.SimpleNamespace(hex="a" * 32))
+
+    old_thread, old_box, old_rid = _drain_single_clarify_block(server)
+    with server._prompt_lock:
+        server._pending[old_rid][1].set()
+    old_thread.join(timeout=5)
+    assert not old_thread.is_alive()
+    assert old_box["answer"] == ""
+
+    new_thread, new_box, new_rid = _drain_single_clarify_block(server)
+    assert new_rid != old_rid
+
+    stale = server.handle_request({
+        "id": "stale", "method": "clarify.respond",
+        "params": {"request_id": old_rid, "answer": "from old card"},
+    })
+    assert stale["result"] == {"status": "expired"}
+    assert new_thread.is_alive()
+    assert "answer" not in new_box
+
+    current = server.handle_request({
+        "id": "current", "method": "clarify.respond",
+        "params": {"request_id": new_rid, "answer": "current answer"},
+    })
+    assert current["result"] == {"status": "ok"}
+    new_thread.join(timeout=5)
+    assert not new_thread.is_alive()
+    assert new_box["answer"] == "current answer"
 
 
 def test_clarify_batch_resolves_when_all_questions_locked(capture):
@@ -430,11 +515,8 @@ def test_clarify_batch_answer_update_overwrites_before_completion(server):
 
 
 def test_clarify_batch_final_lock_lost_ack_does_not_resolve_twice(server):
-    """Final lock may commit before its RPC ack is delivered to the client.
-
-    The blocked tool must resolve once; a retry against that same request ID
-    receives expired rather than creating a second completion.
-    """
+    """A replay of an accepted answer is acknowledged without re-resolving
+    the tool or changing its answer, including after the final lock."""
     thread, box, rid = _drain_batch_block(server, ["q0", "q1"])
     first = server.handle_request({
         "id": "a1", "method": "clarify.respond",
@@ -455,7 +537,12 @@ def test_clarify_batch_final_lock_lost_ack_does_not_resolve_twice(server):
         "id": "retry", "method": "clarify.respond",
         "params": {"request_id": rid, "question_id": "q0", "answer": "Coffee"},
     })
-    assert retry["result"] == {"status": "expired"}
+    assert retry["result"] == {"status": "ok", "remaining": []}
+    changed = server.handle_request({
+        "id": "changed", "method": "clarify.respond",
+        "params": {"request_id": rid, "question_id": "q0", "answer": "Espresso"},
+    })
+    assert changed["result"] == {"status": "conflict"}
     assert json.loads(box["answer"]) == {
         "answers": {"q0": "Coffee", "q1": "Morning"}
     }
@@ -513,6 +600,11 @@ def test_clarify_batch_timeout_keeps_locked_answers(capture):
     # The expire notification still fires for the un-finished batch.
     messages = [json.loads(line) for line in buf.getvalue().splitlines()]
     assert any(m["params"]["type"] == "clarify.expire" for m in messages)
+    late = server.handle_request({
+        "id": "late", "method": "clarify.respond",
+        "params": {"request_id": rid, "question_id": "q1", "answer": "too late"},
+    })
+    assert late["result"] == {"status": "expired"}
 
 
 def test_clarify_batch_cancel_all_returns_empty(server):
@@ -525,6 +617,34 @@ def test_clarify_batch_cancel_all_returns_empty(server):
     })
 
     thread.join(timeout=5)
+    assert box["answer"] == ""
+
+
+def test_clarify_batch_cancel_retry_after_lost_ack_is_idempotent(server):
+    """An acknowledged batch Skip can be retried without resolving twice."""
+    thread, box, rid = _drain_batch_block(server, ["q0", "q1"])
+
+    first = server.handle_request({
+        "id": "cancel", "method": "clarify.respond",
+        "params": {"request_id": rid, "answer": ""},
+    })
+    assert first["result"] == {"status": "ok"}
+
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert box["answer"] == ""
+
+    retry = server.handle_request({
+        "id": "retry", "method": "clarify.respond",
+        "params": {"request_id": rid, "answer": ""},
+    })
+    assert retry["result"] == {"status": "ok"}
+
+    changed = server.handle_request({
+        "id": "changed", "method": "clarify.respond",
+        "params": {"request_id": rid, "answer": "continue"},
+    })
+    assert changed["result"] == {"status": "conflict"}
     assert box["answer"] == ""
 
 
@@ -936,7 +1056,11 @@ def test_session_resume_active_turn_payload_matches_desktop_fixture(server, monk
 
     assert result["running"] is True
     assert result["turn_started_at"] == active_turn["started_at"]
-    assert result == fixture
+    # Keep the shared desktop fixture intact; this additive projection is
+    # unavailable until this process has an accepted execution identity.
+    assert result == {**fixture, "turn_outcomes": {
+        "version": 1, "scope": "process_local", "availability": "unavailable", "turns": []
+    }}
 
 
 def test_enforce_session_cap_evicts_oldest_detached_only(server, monkeypatch):
@@ -1328,3 +1452,60 @@ def test_unregister_live_transport_stops_delivery(capture):
     assert a.frames == []
     # No live transports left → fell back to stdio.
     assert json.loads(buf.getvalue())["params"]["type"] == "skin.changed"
+
+
+def test_clarify_rejects_wrong_session_before_and_after_completion(server):
+    thread, box, rid = _drain_single_clarify_block(server)
+    request = {'id': 'scope', 'method': 'clarify.respond',
+               'params': {'request_id': rid, 'session_id': 'other', 'answer': 'staging'}}
+    try:
+        assert server.handle_request(request)['error']['code'] == 4030
+        assert thread.is_alive()
+        request['params']['session_id'] = 's1'
+        assert server.handle_request(request)['result']['status'] == 'ok'
+        thread.join(5)
+        assert box['answer'] == 'staging'
+        request['params']['session_id'] = 'other'
+        assert server.handle_request(request)['error']['code'] == 4030
+    finally:
+        server._clear_pending()
+        thread.join(5)
+
+
+def test_clarify_transport_and_session_generation_binding(server):
+    owner, outsider, reconnected = MagicMock(), MagicMock(), MagicMock()
+    record = {'transport': owner}
+    server._sessions['s1'] = record
+    thread, box, request_id = _drain_single_clarify_block(server)
+    req = {'id': 'reply', 'method': 'clarify.respond',
+           'params': {'request_id': request_id, 'session_id': 's1', 'answer': 'staging'}}
+    try:
+        assert server.dispatch(req, outsider)['error']['code'] == 4030
+        assert thread.is_alive()
+        record['viewers'] = {reconnected: time.time()}
+        assert server.dispatch(req, reconnected)['result']['status'] == 'ok'
+        thread.join(5)
+        assert box['answer'] == 'staging'
+        assert server.dispatch(req, outsider)['error']['code'] == 4030
+        record['transport'] = reconnected
+        record['viewers'] = {}
+        assert server.dispatch(req, owner)['error']['code'] == 4030
+        assert server.dispatch(req, reconnected)['result']['status'] == 'ok'
+        server._sessions['s1'] = {'transport': reconnected}
+        assert server.dispatch(req, reconnected)['error']['code'] == 4030
+    finally:
+        server._clear_pending()
+        thread.join(5)
+        server._sessions.pop('s1', None)
+
+
+@pytest.mark.parametrize('event', ['secret.request', 'sudo.request', 'terminal.read.request'])
+def test_clarify_cannot_answer_other_prompt_kinds(server, event):
+    ev = threading.Event()
+    server._pending['other-kind'] = ('s1', ev)
+    server._pending_prompt_payloads['other-kind'] = (event, {})
+    reply = server.handle_request({'id': 'cross-kind', 'method': 'clarify.respond',
+                                  'params': {'request_id': 'other-kind', 'answer': 'wrong'}})
+    assert reply['error']['code'] == 4030
+    assert not ev.is_set()
+    assert 'other-kind' not in server._answers

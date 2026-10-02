@@ -2873,6 +2873,7 @@ export const ja = defineLocale({
       notReady: '明確化リクエストはまだ準備できていません',
       gatewayDisconnected: 'Hermes ゲートウェイが接続されていません',
       sendFailed: '明確化応答を送信できませんでした',
+      responseAccepted: '回答を受信しました',
       responseExpired:
         'リクエストの期限が切れました。応答はエージェントに届いた可能性があります。再送前に会話を確認してください。',
       responseRejected: '応答が受け付けられませんでした。選択した回答は保持されています。',

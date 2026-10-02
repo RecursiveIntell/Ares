@@ -3407,6 +3407,7 @@ export const zh: Translations = {
       notReady: '澄清请求尚未就绪',
       gatewayDisconnected: 'Hermes 网关未连接',
       sendFailed: '无法发送澄清响应',
+      responseAccepted: '已收到答案',
       responseExpired: '请求已过期。回应可能已送达智能体；重新发送前请检查对话。',
       responseRejected: '回应未被接受，所选答案已保留。',
       responseUncertain: '回应可能已送达智能体，但确认已丢失。重新发送前请检查对话。',

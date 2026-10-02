@@ -35,7 +35,7 @@ def test_host_interrupt_is_bound_to_current_request(monkeypatch, target, applied
 def test_supervisor_preserves_explicit_stop_target(tmp_path, monkeypatch):
     host = HostSupervisor(registry_path=tmp_path / "host.json", autostart=False)
     sent = []
-    monkeypatch.setattr(host, "start", lambda: None)
+    monkeypatch.setattr(host, "is_ready", lambda: True)
     monkeypatch.setattr(host, "_send_frame", lambda frame, **kwargs: sent.append(frame))
     host.interrupt("s", request_id="stop", target_request_id="A")
     assert sent == [{"type": "interrupt", "sid": "s", "request_id": "stop", "target_request_id": "A"}]

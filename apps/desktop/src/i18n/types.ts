@@ -2807,6 +2807,7 @@ export interface Translations {
       sendFailed: string
       responseExpired: string
       responseUncertain: string
+      responseAccepted: string
       responseRejected: string
       loadingQuestion: string
       other: string

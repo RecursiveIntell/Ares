@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 import uuid
+from tui_gateway.turn_outcomes import TurnOutcomeWindow, unavailable as _unavailable_turn_outcomes
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, NamedTuple, Optional
@@ -144,12 +145,22 @@ from tui_gateway.render import make_stream_renderer, render_diff, render_message
 _sessions: dict[str, dict] = {}
 _methods: dict[str, callable] = {}
 _pending: dict[str, tuple[str, threading.Event]] = {}
+_prompt_request_sequence = 0
 _pending_prompt_payloads: dict[str, tuple[str, dict]] = {}
 _answers: dict[str, str] = {}
 # Batch clarify accumulators: rid → {"qids": [...], "answers": {qid: answer}}.
 # Written by clarify.respond (per-question lock, update-in-place), read out by
 # _block on resolution/timeout so locked answers survive the deadline.
 _batch_clarify: dict[str, dict] = {}
+# Bounded, process-local acknowledgements for completed clarify responses.
+# Values are fingerprints rather than answer text, so a lost JSON-RPC ack can
+# be confirmed idempotently without retaining the user's answer in memory.
+_CLARIFY_RECEIPT_TTL_SECONDS = 60 * 60
+_CLARIFY_RECEIPT_LIMIT = 1024
+# Session lifecycle tokens hold no session history or answer plaintext.
+_clarify_request_owners: dict[str, tuple[str, object | None]] = {}
+_clarify_response_receipts: dict[str, tuple[float, tuple[str, object | None], dict[str, str]]] = {}
+_host_clarify_expected_generation = contextvars.ContextVar("host_clarify_expected_generation", default=None)
 _db = None
 _db_error: str | None = None
 _stdout_lock = threading.Lock()
@@ -244,6 +255,9 @@ _LONG_HANDLERS = frozenset(
         "subscription.upgrade",
         "usage.bars",
         "session.usage",
+        # An accepted-turn observation may make the existing bounded child
+        # clarification snapshot read; keep approval/Stop dispatch responsive.
+        "session.turn.poll",
         # Bounded source/file observations and SQLite admission must not stall
         # the reader's interrupt/approval path. No automatic claim or retry.
         "session.run_checkpoint.claim",
@@ -2565,8 +2579,49 @@ def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
     return {"jsonrpc": "2.0", "method": "event", "params": params}
 
 
+_turn_outcome_execution = contextvars.ContextVar("gateway_turn_outcome_execution", default=None)
+
+
+def _begin_turn_outcome(session, sid, request_id, route, boot_id=None, supervisor=None):
+    """Called under history_lock at existing admission, never from transcript reads."""
+    window = session.get("_turn_outcomes")
+    if (not isinstance(window, TurnOutcomeWindow) or not window.owns(session, sid)
+            or window.supervisor is not supervisor):
+        window = TurnOutcomeWindow(session, sid, supervisor=supervisor)
+        session["_turn_outcomes"] = window
+    return window.begin(request_id, route, boot_id)
+
+
+def _turn_outcomes_snapshot(sid, session):
+    window = session.get("_turn_outcomes")
+    if _sessions.get(sid) is not session or session.get("_closing") or not isinstance(window, TurnOutcomeWindow):
+        return _unavailable_turn_outcomes()
+    try:
+        return window.snapshot(session, sid, supervisor=_compute_host_supervisor)
+    except Exception:
+        logger.debug("turn outcome projection unavailable", exc_info=True)
+        return _unavailable_turn_outcomes()
+
+
 def _emit(event: str, sid: str, payload: dict | None = None):
     session = _sessions.get(sid) if event == "message.complete" else None
+    execution = _turn_outcome_execution.get() if session is not None else None
+    # Execution correlation is captured before starting the worker. A late old
+    # emitter must never borrow a newer request from the mutable session record.
+    if execution is not None and execution[0] is session and execution[1] == sid:
+        with session["history_lock"]:
+            window = session.get("_turn_outcomes")
+            if (_sessions.get(sid) is session and not session.get("_closing")
+                    and isinstance(window, TurnOutcomeWindow) and window.owns(session, sid)):
+                try:
+                    ref = window.append(execution[2], payload or {})
+                except Exception:
+                    ref = None
+                    if (turn := window.find(execution[2])) is not None:
+                        window.invalidate(turn, "projection_failed")
+                    logger.debug("finalized reply projection unavailable", exc_info=True)
+                if ref is not None:
+                    payload = {**(payload or {}), "request_id": ref["request_id"], "accepted_turn": ref}
     if session is not None and session.get("_host_turn_request_id") and _inside_compute_host_child():
         # The bubble is complete; only the host's matching turn terminal can
         # retire the accepted request (including any chained goal work).
@@ -2777,6 +2832,25 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
                 or frame.get("type") not in {"turn.end", "turn.error"}
                 or session.get("_compute_host_settling_request_id") == owner):
             return
+        window = session.get("_turn_outcomes")
+        if isinstance(window, TurnOutcomeWindow):
+            turn = window.find(owner)
+            ref = turn["accepted_turn"] if turn is not None else None
+            if ref is not None and ref["host_boot_id"] and window.owns(session, sid):
+                if (frame.get("_host_boot_id") != ref["host_boot_id"]
+                        or window.supervisor is not _compute_host_supervisor
+                        or window.supervisor.boot_id != ref["host_boot_id"]):
+                    window.invalidate(turn, "host_replaced")
+                else:
+                    try:
+                        window.accept_terminal(owner, frame)
+                    except Exception:
+                        window.invalidate(turn, "projection_failed")
+                        logger.debug("terminal reply projection unavailable", exc_info=True)
+            elif turn is not None:
+                # No admission receipt means no outcome proof. The projection
+                # must not change existing executor settlement semantics.
+                window.invalidate(turn, "admission_unavailable")
         # Claim projection once. Keep its identity/frame if a later projection
         # step fails; an uncertain UI emit is not permission to repeat it.
         session["_compute_host_settling_request_id"] = owner
@@ -2856,12 +2930,17 @@ def _submit_prompt_to_compute_host(
         display_kind=display_kind,
         context_input_event_id=context_input_event_id,
     )
+    supervisor = _get_compute_host_supervisor(cfg)
 
     def _complete(done: dict) -> None:
         # A transport write failure is not a host terminal. Retain ownership
         # for a late outcome rather than projecting idle or replaying inline.
         if done.get("reason") == "send_failed":
             return
+        with session["history_lock"]:
+            window = session.get("_turn_outcomes")
+            if isinstance(window, TurnOutcomeWindow) and window.owns(session, sid):
+                window.bind_boot(frame["request_id"], frame.get("_admitted_host_boot_id"))
         _on_compute_host_turn_done(rid, sid, session, done)
 
     host_request_id = frame["request_id"]
@@ -2871,13 +2950,19 @@ def _submit_prompt_to_compute_host(
             return _err(rid, 4009, "compute-host request or Stop settlement still owns session",
                         {"delivery": "owner_busy"})
         session["_compute_host_active_request_id"] = host_request_id
+        session.pop("_host_clarify_binding", None)
+        session.pop("_host_clarify_snapshot_unavailable", None)
+        admitted_turn = _begin_turn_outcome(session, sid, host_request_id, "compute_host", supervisor=supervisor)
 
     try:
-        _get_compute_host_supervisor(cfg).submit_turn(frame, on_complete=_complete)
+        supervisor.submit_turn(frame, on_complete=_complete)
     except HostSendNotSent as exc:
         with session["history_lock"]:
             if session.get("_compute_host_active_request_id") == host_request_id:
                 session.pop("_compute_host_active_request_id", None)
+                window = session.get("_turn_outcomes")
+                if isinstance(window, TurnOutcomeWindow) and (turn := window.find(host_request_id)) is not None:
+                    window.invalidate(turn, "not_sent")
         return _err(rid, 5019, f"compute-host dispatch refused before write: {exc}",
                     {"delivery": "not_sent", "host_request_id": host_request_id})
     except Exception as exc:
@@ -2887,10 +2972,20 @@ def _submit_prompt_to_compute_host(
         return _err(rid, 5019, f"compute-host dispatch failed: {exc}",
                     {"delivery": "uncertain", "host_request_id": host_request_id})
     with session["history_lock"]:
+        window = session.get("_turn_outcomes")
+        admitted_boot = frame.get("_admitted_host_boot_id")
+        if isinstance(window, TurnOutcomeWindow) and window.owns(session, sid):
+            window.bind_boot(host_request_id, admitted_boot)
+        # ACK correlation belongs to this admission, even if a fast terminal
+        # and successors already evicted its advisory projection window.
+        accepted_turn = {**admitted_turn, "host_boot_id": admitted_boot} if admitted_boot else None
         session["_compute_host_active"] = True
         if image_paths is None:
             session["attached_images"] = []
-    return _ok(rid, {"status": "streaming", "turn_isolation": True})
+    result = {"status": "streaming", "turn_isolation": True}
+    if accepted_turn is not None:
+        result["accepted_turn"] = accepted_turn
+    return _ok(rid, result)
 
 
 def _send_host_live_input(rid, sid: str, session: dict, text: str, route: str) -> dict:
@@ -2980,7 +3075,84 @@ def _approval_request_payload(data: dict | None) -> dict:
     return payload
 
 
-def _pending_clarify_request_payload(sid: str) -> dict | None:
+def _clarify_uses_host(session: dict) -> bool:
+    return not _inside_compute_host_child() and bool(
+        session.get("_compute_host_active") or session.get("_compute_host_active_request_id")
+    )
+
+
+def _call_host_clarify(sid: str, session: dict, route: str, params: dict | None = None,
+                       *, expected_host: tuple | None = None) -> dict:
+    """One bounded call to the existing child, pinned to its boot and record.
+
+    Snapshot reads establish the child session generation. Answer writes never
+    retarget a replacement child or retry after an uncertain acknowledgement.
+    """
+    supervisor = _compute_host_supervisor
+    boot = supervisor.boot_id if supervisor is not None else None
+    if expected_host is not None and (supervisor is not expected_host[0] or boot != expected_host[1]):
+        raise RuntimeError("clarification accepted host owner changed")
+    if not boot or not supervisor.is_ready():
+        raise RuntimeError("clarification child is unavailable")
+    with _sessions_lock:
+        if _sessions.get(sid) is not session or session.get("_closing"):
+            raise RuntimeError("clarification session owner changed")
+        binding = session.get("_host_clarify_binding")
+        if binding is not None and (binding[0] is not supervisor or binding[1] != boot):
+            raise RuntimeError("clarification child owner changed")
+    control_id = f"clarify-control-{uuid.uuid4().hex}"
+    ack = supervisor.control(sid, route_name=route, expected_boot_id=boot, timeout=2.0,
+        payload={"request_id": control_id, "params": params or {"session_id": sid},
+                 "clarify_generation": binding[2] if binding else None})
+    with _sessions_lock:
+        if (_sessions.get(sid) is not session or session.get("_closing")
+                or _compute_host_supervisor is not supervisor or supervisor.boot_id != boot
+                or session.get("_host_clarify_binding") is not binding):
+            raise RuntimeError("clarification owner changed during acknowledgement")
+        if (not isinstance(ack, dict) or ack.get("type") != "control.ack"
+                or ack.get("sid") != sid or ack.get("request_id") != control_id
+                or ack.get("route_name") != route):
+            raise RuntimeError("clarification acknowledgement owner mismatch")
+        result = ack.get("response")
+        if not isinstance(result, dict) or result.get("id") != control_id:
+            raise RuntimeError("invalid clarification acknowledgement")
+        if route == "clarify.snapshot":
+            snapshot = result.get("result")
+            generation = snapshot.get("generation") if isinstance(snapshot, dict) else None
+            if not isinstance(generation, str) or not generation or binding and generation != binding[2]:
+                raise RuntimeError("clarification child generation changed")
+            session["_host_clarify_binding"] = (supervisor, boot, generation)
+        return result
+
+
+def _respond_host_clarify(rid, params: dict) -> dict | None:
+    sid = params.get("session_id")
+    with _sessions_lock:
+        session = _sessions.get(sid) if isinstance(sid, str) else None
+        expected_record = _current_runtime_session_record.get()
+        if expected_record is not None and session is not expected_record:
+            return _err(rid, 4030, "clarify response session owner changed before execution")
+        if session is None or not _clarify_uses_host(session):
+            return None
+        owner = (sid, session.setdefault("_clarify_generation", object()))
+        if not _clarify_owner_matches(owner, params):
+            return _err(rid, 4030, "clarify response session owner mismatch")
+    try:
+        if session.get("_host_clarify_binding") is None:
+            _call_host_clarify(sid, session, "clarify.snapshot")
+        # Recheck transport authority immediately before the single answer call.
+        if not _clarify_owner_matches(owner, params):
+            return _err(rid, 4030, "clarify response session owner mismatch")
+        response = _call_host_clarify(sid, session, "clarify.respond", params)
+        if not _clarify_owner_matches(owner, params):
+            return _err(rid, 5032, "clarification owner changed after delivery; no retry attempted")
+        return {**response, "id": rid}
+    except Exception as exc:
+        return _err(rid, 5032, f"clarification delivery unconfirmed; no retry attempted: {exc}")
+
+
+def _pending_clarify_request_payload(sid: str, *, expected_session: dict | None = None,
+                                    expected_host: tuple | None = None) -> dict | None:
     """Read the clarify prompt still blocking a session, if there is one.
 
     Clarify prompts share `_block()`'s pending registry, so a reconnecting
@@ -2990,6 +3162,19 @@ def _pending_clarify_request_payload(sid: str) -> dict | None:
     read-only snapshot, the registry stays authoritative and `clarify.respond`
     with the embedded request_id resolves it.
     """
+    session = _sessions.get(sid)
+    if expected_session is not None and session is not expected_session:
+        raise RuntimeError("clarification accepted session owner changed")
+    if session is not None and _clarify_uses_host(session):
+        try:
+            result = (_call_host_clarify(sid, session, "clarify.snapshot") if expected_host is None
+                else _call_host_clarify(sid, session, "clarify.snapshot", expected_host=expected_host))
+            pending = result["result"].get("pending_clarify")
+            session.pop("_host_clarify_snapshot_unavailable", None)
+            return pending if isinstance(pending, dict) else None
+        except Exception:
+            session["_host_clarify_snapshot_unavailable"] = True
+            return None
     with _prompt_lock:
         for rid, (owner_sid, _ev) in _pending.items():
             if owner_sid != sid:
@@ -3224,21 +3409,34 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
                 release_setting()
                 return _err(_rid, 4009, "option worker unavailable; request not applied")
             return None
-        if method not in _LONG_HANDLERS:
+        clarify_sid = _params.get("session_id")
+        clarify_record = _sessions.get(clarify_sid) if method == "clarify.respond" and isinstance(clarify_sid, str) else None
+        if clarify_record is not None and not _clarify_uses_host(clarify_record):
+            clarify_record = None
+        if method not in _LONG_HANDLERS and clarify_record is None:
             return handle_request(req)
 
         # Snapshot the context so the pool worker sees the bound transport.
         ctx = contextvars.copy_context()
 
         def run():
+            owner_token = _current_runtime_session_record.set(clarify_record) if clarify_record is not None else None
             try:
                 resp = handle_request(req)
             except Exception as exc:
                 resp = _err(req.get("id"), -32000, f"handler error: {exc}")
+            finally:
+                if owner_token is not None:
+                    _current_runtime_session_record.reset(owner_token)
             if resp is not None:
                 t.write(resp)
 
-        _pool.submit(lambda: ctx.run(run))
+        try:
+            _pool.submit(lambda: ctx.run(run))
+        except Exception:
+            if clarify_record is not None:
+                return _err(_rid, 5032, "clarification worker unavailable; answer not sent")
+            raise
 
         return None
     finally:
@@ -4829,6 +5027,69 @@ def _enable_gateway_prompts() -> None:
 # ── Blocking prompt factory ──────────────────────────────────────────
 
 
+def _clarify_answer_fingerprint(question_id: str, answer: object) -> str:
+    payload = json.dumps(
+        [question_id, answer],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _prune_clarify_response_receipts() -> None:
+    """Prune completed-response fingerprints while `_prompt_lock` is held."""
+    now = time.monotonic()
+    expired = [
+        rid
+        for rid, (completed_at, _owner, _answers) in _clarify_response_receipts.items()
+        if now - completed_at >= _CLARIFY_RECEIPT_TTL_SECONDS
+    ]
+    for rid in expired:
+        _clarify_response_receipts.pop(rid, None)
+    while len(_clarify_response_receipts) > _CLARIFY_RECEIPT_LIMIT:
+        oldest = min(
+            _clarify_response_receipts,
+            key=lambda key: _clarify_response_receipts[key][0],
+        )
+        _clarify_response_receipts.pop(oldest, None)
+
+
+def _remember_clarify_response(rid: str, answers: dict[str, str], owner: tuple[str, object | None]) -> None:
+    """Keep a bounded idempotency receipt, never the answer text itself."""
+    _prune_clarify_response_receipts()
+    _clarify_response_receipts[rid] = (time.monotonic(), owner, answers)
+    _prune_clarify_response_receipts()
+
+
+def _get_clarify_response_receipt(rid: str) -> tuple[tuple[str, object | None], dict[str, str]] | None:
+    """Read a completed-response receipt while `_prompt_lock` is held."""
+    _prune_clarify_response_receipts()
+    receipt = _clarify_response_receipts.get(rid)
+    return (receipt[1], receipt[2]) if receipt else None
+
+
+def _clarify_owner_matches(owner: tuple[str, object | None], params: dict) -> bool:
+    """A reconnect must resume this session before confirming its answer."""
+    sid, generation = owner
+    if 'session_id' in params and params['session_id'] != sid:
+        return False
+    transport = current_transport()
+    with _sessions_lock:
+        session = _sessions.get(sid)
+        if generation is not None and (
+            session is None or session.get('_clarify_generation') is not generation
+        ):
+            return False
+        if transport is None:
+            # Legacy direct handler/stdio callers have no WebSocket context.
+            return True
+        if session is None:
+            return transport is _stdio_transport
+        return (session.get('transport') is transport
+                or transport in session.get('viewers', {}))
+
+
 def _block(
     event: str,
     sid: str,
@@ -4836,10 +5097,25 @@ def _block(
     timeout: float | None = 300,
     batch_qids: list[str] | None = None,
 ) -> str:
-    rid = uuid.uuid4().hex[:8]
+    global _prompt_request_sequence
+
+    owner = (sid, None)
+    if event == 'clarify.request':
+        with _sessions_lock:
+            session = _sessions.get(sid)
+            if session is not None:
+                owner = (sid, session.setdefault('_clarify_generation', object()))
     ev = threading.Event()
     with _prompt_lock:
+        _prompt_request_sequence += 1
+        # Retain all UUID entropy and append a process-local monotonic suffix:
+        # even a forced/repeated UUID value cannot let a stale reply alias a
+        # later request in this Gateway process.
+        rid = f"{uuid.uuid4().hex}-{_prompt_request_sequence:x}"
+        _prune_clarify_response_receipts()
         _pending[rid] = (sid, ev)
+        if event == 'clarify.request':
+            _clarify_request_owners[rid] = owner
         payload["request_id"] = rid
         _pending_prompt_payloads[rid] = (event, dict(payload))
         if batch_qids:
@@ -4860,12 +5136,29 @@ def _block(
     finally:
         with _prompt_lock:
             _pending.pop(rid, None)
+            _clarify_request_owners.pop(rid, None)
             _pending_prompt_payloads.pop(rid, None)
             answer_present = rid in _answers
             answer = _answers.pop(rid, "")
             batch_state = _batch_clarify.pop(rid, None)
             if batch_state is not None:
                 batch_answers = dict(batch_state["answers"])
+            if event == "clarify.request":
+                if answer_present:
+                    _remember_clarify_response(rid, {"": _clarify_answer_fingerprint("", answer)}, owner)
+                elif (
+                    batch_state is not None
+                    and batch_answers is not None
+                    and set(batch_state["qids"]).issubset(batch_answers)
+                ):
+                    _remember_clarify_response(
+                        rid,
+                        {
+                            qid: _clarify_answer_fingerprint(qid, batch_answers[qid])
+                            for qid in batch_state["qids"]
+                        },
+                        owner,
+                    )
 
     if batch_qids is not None:
         # Cancel-all (respond with no question_id) resolves via _answers with
@@ -10555,6 +10848,20 @@ def _claim_or_reuse_live(
     """Register ``record`` as the live session for ``session_key`` under the
     resume lock, or — if a concurrent resume already won — release ``lease`` and
     return the winner for the caller to reuse."""
+    # A cold host's hello has its own bounded readiness gate. Do not spend the
+    # short ownership-query deadline on imports/process startup, or hold the
+    # resume lock while waiting: session.close also needs that lock. Recheck the
+    # live winner below after readiness, since another resume may have won.
+    if _turn_isolation_enabled() and session_key:
+        with _session_resume_lock:
+            needs_owner_lookup = _find_live_session_by_key(session_key) is None
+        if needs_owner_lookup:
+            try:
+                _get_compute_host_supervisor().wait_ready()
+            except Exception:
+                if lease is not None:
+                    lease.release()
+                raise
     with _session_resume_lock:
         live = _find_live_session_by_key(session_key)
         if live is not None:
@@ -11050,6 +11357,7 @@ def _live_session_payload(
         inflight = _inflight_snapshot(session)
         queued = _queued_prompt_snapshot(session)
         running = bool(session.get("running"))
+        turn_outcomes = _turn_outcomes_snapshot(sid, session)
         inflight_turn = session.get("inflight_turn")
         turn_started_at = (
             float(inflight_turn["started_at"])
@@ -11069,6 +11377,8 @@ def _live_session_payload(
     else:
         with _session_db(session) as db:
             history = _live_visible_history(session, db, in_memory_history)
+    if _sessions.get(sid) is not session or session.get("_closing"):
+        turn_outcomes = _unavailable_turn_outcomes()
     payload = {
         "info": _fallback_session_info(session),
         "message_count": len(history),
@@ -11080,6 +11390,7 @@ def _live_session_payload(
         "session_key": _session_lookup_key(session, fallback=sid),
         "started_at": float(session.get("created_at") or time.time()),
         "status": _session_live_status(sid, session),
+        "turn_outcomes": turn_outcomes,
     }
     if inflight:
         payload["inflight"] = inflight
@@ -11089,6 +11400,12 @@ def _live_session_payload(
         payload["pending_approval"] = approval
     if clarify := _pending_clarify_request_payload(sid):
         payload["pending_clarify"] = clarify
+        if turn_outcomes["turns"] and running:
+            turn = turn_outcomes["turns"][-1]
+            if turn["state"] in {"running", "complete"}:
+                turn["state"] = "waiting"
+    elif session.get("_host_clarify_snapshot_unavailable"):
+        payload["pending_clarify_unavailable"] = True
     return payload
 
 
@@ -12814,6 +13131,19 @@ def _run_prompt_submit(
     queued_prompt_generation: int | None = None,
     context_input_event_id: str | None = None,
 ) -> bool:
+    execution = _turn_outcome_execution.get()
+    if execution is not None and (execution[0] is not session or execution[1] != sid):
+        execution = None
+    # Host rid is already the admission UUID, including chained successors.
+    # Inline rid is connection-local and is never used as an outcome identity.
+    if queued_prompt_generation is not None:
+        # A separately queued input did not receive this admission's ACK.
+        # Its dispatcher must not borrow its predecessor's outcome identity.
+        execution = (session, sid, None)
+    elif execution is None and _inside_compute_host_child():
+        window = session.get("_turn_outcomes")
+        if isinstance(window, TurnOutcomeWindow) and window.owns(session, sid) and window.find(rid) is not None:
+            execution = (session, sid, rid)
     with session["history_lock"]:
         if session.get("_closing") or session.get("_turn_cancel_requested"):
             session["running"] = False
@@ -12861,7 +13191,7 @@ def _run_prompt_submit(
     )
     _emit("message.start", sid)
 
-    def run():
+    def run_with_outcome():
         # The conversation runs on a fresh thread, so ContextVars from the RPC
         # dispatcher do not follow automatically. Rebind the exact transport
         # stored on this session generation before any tool can commission a
@@ -13877,7 +14207,15 @@ def _run_prompt_submit(
                 file=sys.stderr,
             )
 
+    def run():
+        outcome_token = _turn_outcome_execution.set(execution)
+        try:
+            run_with_outcome()
+        finally:
+            _turn_outcome_execution.reset(outcome_token)
+
     run_thread = threading.Thread(target=run, daemon=True)
+    run_thread._turn_outcome_execution = execution
     with _sessions_lock:
         registered = _sessions.get(sid)
         can_start = (
@@ -14162,17 +14500,61 @@ def _stage_session_file_attachment(
 # ── Methods: respond ─────────────────────────────────────────────────
 
 
-def _respond(rid, params, key, *, allow_expired=False):
+def _respond(rid, params, key, *, allow_expired=False, idempotent=False):
     r = params.get("request_id", "")
     question_id = str(params.get("question_id") or "")
-    with _prompt_lock:
+    answer = params.get(key, "")
+    # Session close/rebind takes sessions before prompts: preserve that order.
+    with (_sessions_lock if idempotent else contextlib.nullcontext()), _prompt_lock:
+        expected_generation = _host_clarify_expected_generation.get() if idempotent else None
+        if expected_generation is not None:
+            session = _sessions.get(params.get("session_id"))
+            if session is None or session.get("_clarify_host_generation") != expected_generation:
+                return _err(rid, 4030, "clarify response child generation mismatch")
         entry = _pending.get(r)
         if not entry:
             if allow_expired and r:
+                receipt = _get_clarify_response_receipt(r) if idempotent else None
+                if receipt is not None:
+                    owner, receipt = receipt
+                    if not _clarify_owner_matches(owner, params):
+                        return _err(rid, 4030, 'clarify response session owner mismatch')
+                    if question_id and question_id not in receipt:
+                        return _err(rid, 4002, f"unknown question_id {question_id!r}")
+                    fingerprint = receipt.get(question_id, "")
+                    if fingerprint == _clarify_answer_fingerprint(question_id, answer):
+                        result = {"status": "ok"}
+                        if question_id:
+                            result["remaining"] = []
+                        return _ok(rid, result)
+                    return _ok(rid, {"status": "conflict"})
                 return _ok(rid, {"status": "expired"})
             return _err(rid, 4009, f"no pending {key} request")
-        _, ev = entry
+        sid, ev = entry
+        if idempotent:
+            event, _payload = _pending_prompt_payloads.get(r, ('', {}))
+            if event != 'clarify.request' or not _clarify_owner_matches(
+                _clarify_request_owners.get(r, (sid, None)), params
+            ):
+                return _err(rid, 4030, 'clarify response session owner mismatch')
         batch = _batch_clarify.get(r)
+        if idempotent and ev.is_set():
+            if batch is not None and question_id:
+                if question_id not in batch["qids"]:
+                    return _err(rid, 4002, f"unknown question_id {question_id!r}")
+                existing = batch["answers"].get(question_id)
+                if (
+                    question_id in batch["answers"]
+                    and _clarify_answer_fingerprint(question_id, existing)
+                    == _clarify_answer_fingerprint(question_id, answer)
+                ):
+                    return _ok(rid, {"status": "ok", "remaining": []})
+                return _ok(rid, {"status": "conflict"})
+            if not question_id and r in _answers:
+                if _clarify_answer_fingerprint("", _answers[r]) == _clarify_answer_fingerprint("", answer):
+                    return _ok(rid, {"status": "ok"})
+                return _ok(rid, {"status": "conflict"})
+            return _ok(rid, {"status": "conflict"})
         if batch is not None and question_id:
             # Per-question lock (multi-question clarify). Update-in-place is
             # deliberate: a locked answer stays editable until the batch
@@ -14180,14 +14562,14 @@ def _respond(rid, params, key, *, allow_expired=False):
             # final lock is the Confirm-and-continue click.
             if question_id not in batch["qids"]:
                 return _err(rid, 4002, f"unknown question_id {question_id!r}")
-            batch["answers"][question_id] = params.get(key, "")
+            batch["answers"][question_id] = answer
             remaining = [
                 qid for qid in batch["qids"] if qid not in batch["answers"]
             ]
             if not remaining:
                 ev.set()
             return _ok(rid, {"status": "ok", "remaining": remaining})
-        _answers[r] = params.get(key, "")
+        _answers[r] = answer
         ev.set()
     return _ok(rid, {"status": "ok"})
 

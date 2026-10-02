@@ -18,7 +18,7 @@ from tui_gateway.host_supervisor import HostSupervisor
 
 def test_rejected_second_request_cannot_consume_owner_observer(tmp_path, monkeypatch):
     host = HostSupervisor(registry_path=tmp_path / "host.json", autostart=False)
-    monkeypatch.setattr(host, "start", lambda: None)
+    monkeypatch.setattr(host, "is_ready", lambda: True)
     monkeypatch.setattr(host, "_send_frame", lambda frame, **_kwargs: None)
     observed = []
     rejected = []
@@ -40,7 +40,7 @@ def test_rejected_second_request_cannot_consume_owner_observer(tmp_path, monkeyp
 
 def test_reclaimed_observer_supersedes_old_parent_callback(tmp_path, monkeypatch):
     host = HostSupervisor(registry_path=tmp_path / "host.json", autostart=False)
-    monkeypatch.setattr(host, "start", lambda: None)
+    monkeypatch.setattr(host, "is_ready", lambda: True)
     monkeypatch.setattr(host, "_send_frame", lambda frame, **_kwargs: None)
     old_parent = []
     new_parent = []
@@ -59,7 +59,7 @@ def test_reclaimed_observer_supersedes_old_parent_callback(tmp_path, monkeypatch
 @pytest.mark.parametrize("with_pending", [False, True])
 def test_crash_settles_only_current_projection_owner(tmp_path, monkeypatch, with_pending):
     host = HostSupervisor(registry_path=tmp_path / "host.json", autostart=False)
-    monkeypatch.setattr(host, "start", lambda: None)
+    monkeypatch.setattr(host, "is_ready", lambda: True)
     monkeypatch.setattr(host, "_send_frame", lambda frame, **_kwargs: None)
     old_parent = []
     new_parent = []
@@ -134,7 +134,7 @@ def test_unidentified_running_owner_is_not_published(monkeypatch):
     monkeypatch.setattr(server, "_sessions", {})
     monkeypatch.setattr(server, "_find_live_session_by_key", lambda *a: None)
     monkeypatch.setattr(server, "_turn_isolation_enabled", lambda: True)
-    supervisor = types.SimpleNamespace(lookup_session_key=lambda key: {"session_id": "s", "running": True})
+    supervisor = types.SimpleNamespace(wait_ready=lambda: None, lookup_session_key=lambda key: {"session_id": "s", "running": True})
     monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda: supervisor)
     releases = []
     lease = types.SimpleNamespace(release=lambda: releases.append(True))
@@ -171,6 +171,7 @@ def test_terminal_before_observer_registration_reconciles_idle_owner(monkeypatch
         return True
 
     supervisor = types.SimpleNamespace(
+        wait_ready=lambda: None,
         lookup_session_key=lambda key: next(snapshots),
         observe_session=observe,
         unobserve_session=unobserve,
@@ -207,7 +208,7 @@ def test_unconfirmed_post_registration_read_preserves_observer_and_releases_leas
     def observe(sid, callback, *, request_id, expected_boot_id):
         observers[sid] = (request_id, expected_boot_id, callback)
 
-    supervisor = types.SimpleNamespace(lookup_session_key=lookup, observe_session=observe)
+    supervisor = types.SimpleNamespace(wait_ready=lambda: None, lookup_session_key=lookup, observe_session=observe)
     monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda: supervisor)
     released = []
     lease = types.SimpleNamespace(release=lambda: released.append(True))

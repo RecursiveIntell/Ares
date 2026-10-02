@@ -666,6 +666,7 @@ export interface SessionResumeResponse {
   // The clarify question still blocking this session, if any. Same replay
   // class as pending_approval: emitted-while-detached prompts are restored
   // from the resume snapshot instead of being lost until server-side timeout.
+  pending_clarify_unavailable?: boolean
   pending_clarify?: {
     answers?: Record<string, unknown>
     choices?: null | string[]

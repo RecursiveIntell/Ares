@@ -916,7 +916,60 @@ def _(rid, params: dict) -> dict:
         )
     _start_agent_build(sid, session)
 
+    # Bind a server nonce before ACK/worker launch; the caller's RPC id may
+    # repeat after reconnect and cannot prove which execution finalized text.
+    with session["history_lock"]:
+        accepted_turn = _begin_turn_outcome(session, sid, f"inline-turn-{uuid.uuid4().hex}", "inline")
+    outcome_execution = (session, sid, accepted_turn["request_id"])
+
     def run_after_agent_ready() -> None:
+        token = _turn_outcome_execution.set(outcome_execution)
+        try:
+            run_owned_after_agent_ready()
+            # This existing admission thread observes the same successor chain
+            # the host observes. Bubble completion alone does not settle it.
+            with _sessions_lock:
+                run_thread = session.get("_run_thread")
+            while run_thread is not None and hasattr(run_thread, "join"):
+                if run_thread is threading.current_thread():
+                    break
+                captured = getattr(run_thread, "_turn_outcome_execution", None)
+                if (captured is None or captured[0] is not session
+                        or captured[1:] != outcome_execution[1:]):
+                    break
+                # Observe only this admission's threads. Detach/cancellation
+                # bounds this advisory observer, even if provider shutdown lags.
+                while run_thread.is_alive():
+                    with session["history_lock"]:
+                        window = session.get("_turn_outcomes")
+                        current_execution = getattr(session.get("_run_thread"), "_turn_outcome_execution", None)
+                        owns_current = (current_execution is not None and current_execution[0] is session
+                            and current_execution[1:] == outcome_execution[1:] and isinstance(window, TurnOutcomeWindow)
+                            and window.turns and window.turns[-1]["accepted_turn"]["request_id"] == outcome_execution[2])
+                        if (_sessions.get(sid) is not session or session.get("_closing")
+                                or (owns_current and session.get("_turn_cancel_requested"))):
+                            if isinstance(window, TurnOutcomeWindow) and (turn := window.find(outcome_execution[2])) is not None:
+                                window.invalidate(turn, "owner_lost_or_cancel_unconfirmed")
+                            return
+                    run_thread.join(timeout=0.25)
+                with _sessions_lock:
+                    successor = session.get("_run_thread")
+                if successor is run_thread:
+                    break
+                run_thread = successor
+        finally:
+            with session["history_lock"]:
+                window = session.get("_turn_outcomes")
+                if (isinstance(window, TurnOutcomeWindow) and window.owns(session, sid)
+                        and _sessions.get(sid) is session and not session.get("_closing")):
+                    current_execution = getattr(session.get("_run_thread"), "_turn_outcome_execution", None)
+                    owns_current = (current_execution is not None and current_execution[0] is session
+                        and current_execution[1:] == outcome_execution[1:] and window.turns
+                        and window.turns[-1]["accepted_turn"]["request_id"] == outcome_execution[2])
+                    window.finish(outcome_execution[2], interrupted=bool(owns_current and session.get("_turn_cancel_requested")))
+            _turn_outcome_execution.reset(token)
+
+    def run_owned_after_agent_ready() -> None:
         # Patient wait (#63078): the user's message is already the accepted
         # in-flight turn, so a slow deferred build must not eat it. The wait
         # delivers the prompt when the still-running build completes, honors a
@@ -964,6 +1017,7 @@ def _(rid, params: dict) -> dict:
             **({"context_input_event_id": input_receipt.event_id} if input_receipt is not None else {}))
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
+    run_thread._turn_outcome_execution = outcome_execution
     # Keep a handle so session.interrupt can tell a live turn from a stuck
     # `running` flag (a turn that died without clearing it) and recover the latter.
     session["_run_thread"] = run_thread
@@ -972,6 +1026,7 @@ def _(rid, params: dict) -> dict:
         rid,
         {
             "status": "streaming",
+            "accepted_turn": accepted_turn,
             **({"input_event_id": input_receipt.event_id} if input_receipt is not None else {}),
             **(
                 {"survivor_user_row_ids": survivor_user_row_ids}
@@ -1572,7 +1627,9 @@ def _(rid, params: dict) -> dict:
     # from _pending) while the card is still visible — common when a WebSocket
     # reconnect during the wait drops tool.complete. A late answer must resolve
     # gracefully instead of hitting the raw 4009 "no pending answer request".
-    return _respond(rid, params, "answer", allow_expired=True)
+    if (response := _respond_host_clarify(rid, params)) is not None:
+        return response
+    return _respond(rid, params, "answer", allow_expired=True, idempotent=True)
 
 
 @method("terminal.read.respond")

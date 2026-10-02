@@ -30,6 +30,9 @@ def test_resumed_record_has_a_reachable_hydration_completion(monkeypatch, host_e
             return ([{'role':'user','content':'audit fixture'}], [{'role':'user','content':'audit fixture'}])
         def get_ancestor_display_prefix(self, target): return []
     class Supervisor:
+        def wait_ready(self):
+            pass
+
         def lookup_session_key(self, key):
             return {'session_id':'host-owner','running':False,'session_info':{'model':'fixture','provider':'fixture','reasoning_effort':'medium'}} if host_exists else None
         def observe_session(self, sid, callback): pass

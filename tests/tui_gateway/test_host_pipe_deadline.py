@@ -23,6 +23,7 @@ def pipe(tmp_path):
     os.set_blocking(read, False)
     stream = os.fdopen(write, "wb", buffering=0)
     host._proc = SimpleNamespace(stdin=stream, poll=lambda: None)
+    host._ready_proc = host._proc
     host._hello = {"boot_id": "A"}
     yield host, read, write
     stream.close()

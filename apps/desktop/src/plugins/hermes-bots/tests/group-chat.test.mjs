@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
+import { fixtureAdmission, fixtureProjection } from './group-turn-wire-fixture.mjs'
 import vm from 'node:vm'
 
 const pluginSource = readFileSync(new URL('../plugin.js', import.meta.url), 'utf8')
@@ -8,7 +9,7 @@ const pluginSource = readFileSync(new URL('../plugin.js', import.meta.url), 'utf
 /** Load the plugin in a vm with a scripted cli.exec so member turns are
  *  deterministic. `turnScript(profile, prompt)` returns the member's reply
  *  text (or throws to simulate a failed turn). */
-function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approvalUntilResumeCall, conflictOnce = false, deferredTimers = false } = {}) {
+function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approvalUntilResumeCall, conflictOnce = false, deferredTimers = false, outcomesAvailable = true } = {}) {
   const values = new Map()
   const atom = initial => {
     const slot = { get: () => values.get(slot), set: value => {
@@ -39,7 +40,7 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
   let injectedConflict = false
 
   const resolveSession = (profile, target) => {
-    const stored = runtimeToStored.get(target) || (sessions.has(target) ? target : titleToStored.get(`${profile}::${target}`))
+    const stored = runtimeToStored.get(target) || [...sessions.values()].find(session => session.runtime === target)?.stored || (sessions.has(target) ? target : titleToStored.get(`${profile}::${target}`))
     return stored ? sessions.get(stored) : null
   }
   const context = {
@@ -158,6 +159,8 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
             session_key: session.stored,
             message_count: session.messages.length,
             messages: [...session.messages],
+            ...(outcomesAvailable ? { turn_outcomes: fixtureProjection(session, {
+              state: pendingClarify || pendingApproval ? 'waiting' : busy ? 'running' : 'complete' }) } : {}),
             inflight: busy,
             running: busy,
             ...(pendingClarify ? { pending_clarify: pendingClarify } : {}),
@@ -179,11 +182,13 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
           })
           const reply = turnScript(session.profile, params.text, calls.length, session)
           session.messages.push({ role: 'assistant', content: reply })
-          return {}
+          session.finalized = [{ text: reply, status: 'complete' }]
+          const accepted_turn = fixtureAdmission(session, `owned-${session.runtime}-${calls.length}`)
+          return outcomesAvailable ? { accepted_turn } : {}
         }
         if (method === 'clarify.respond') {
           clarifyResponds.push({ ...params })
-          return { ok: true }
+          return { status: 'ok' }
         }
         if (method === 'approval.respond') {
           approvalResponds.push({ ...params })
@@ -1497,10 +1502,21 @@ test('source contract: room messages carry the speaker avatar via the roster app
   assert.match(workspace, /children: members\.length > 0 && availableMembers < members\.length \? availabilityLabel : `\$\{members\.length\} bots`/)
 })
 
+function seedStrandedReceipt(gc, group, profile) {
+  const session = gc.sessions.get(`sid-${profile}`)
+  const accepted_turn = fixtureAdmission(session, `late-owned-${profile}`)
+  session.finalized = session.messages.filter(message => message.role === 'assistant')
+    .map(message => ({ text: message.content, status: 'complete' }))
+  const marker = { delivery: { accepted_turn, member_key: profile, owner: { name: profile } },
+    thread: 'legacy', epoch: gc.$groupChats.get()[group]?.epoch || 0, anchor_id: null }
+  gc.updateGroupChat(group, room => { room.stranded = { [profile]: marker }; return room })
+  return marker
+}
+
 test('stranded harvest: a timed-out turn whose reply landed late posts into the room and clears the marker', async () => {
   const gc = load(() => '(pass)')
 
-  // Room with a stranded marker for research: baseline 0 messages.
+  // A completed owned turn survives its timeout, independently of history length.
   gc.updateGroupChat('Late', r => {
     r.stranded = { research: 0 }
     r.sessions = { research: 'sid-research' }
@@ -1517,6 +1533,8 @@ test('stranded harvest: a timed-out turn whose reply landed late posts into the 
       { role: 'assistant', content: 'Here is the full research result, delivered late.' }
     ]
   })
+
+  seedStrandedReceipt(gc, 'Late', 'research')
 
   await gc.harvestStrandedGroupReply('Late', { name: 'research', title: '' })
 
@@ -1552,6 +1570,8 @@ test('stranded harvest: a rescued reply prefers the substantive answer over a tr
     ]
   })
 
+  seedStrandedReceipt(gc, 'Rescue', 'research')
+
   await gc.harvestStrandedGroupReply('Rescue', { name: 'research', title: '' })
 
   const log = roomLog(gc, 'Rescue')
@@ -1576,9 +1596,8 @@ test('stranded + still busy: the round loop never re-submits into a member whose
 
   // research's session is pre-seeded and resolvable, exactly like the
   // sibling stranded-harvest test above — its stranded marker is the
-  // pre-thread bare-number shape (still supported: harvestStrandedGroupReply
-  // normalizes both shapes, and presence in `stranded` is what the round-loop
-  // guard checks, not the marker's value shape).
+  // receipt captures the immutable admission; legacy length-only markers
+  // are explicitly unavailable, covered by the compatibility gate.
   gc.sessions.set('sid-research', {
     stored: 'sid-research',
     runtime: 'rt-research',
@@ -1602,6 +1621,8 @@ test('stranded + still busy: the round loop never re-submits into a member whose
     return r
   })
 
+  const marker = seedStrandedReceipt(gc, 'Grind', 'research')
+
   await gc.runGroupChatRounds('Grind', [{ name: 'research', title: '' }, { name: 'builder', title: '' }], 'legacy')
 
   assert.equal(
@@ -1611,13 +1632,13 @@ test('stranded + still busy: the round loop never re-submits into a member whose
   )
   assert.equal(
     gc.$groupChats.get().Grind.stranded.research,
-    0,
+    marker,
     'marker survives untouched — harvest confirmed research is still running'
   )
   assert.equal(gc.calls.filter(c => c.profile === 'builder').length, 1, 'builder (not stranded) still gets its turn')
 })
 
-test('stranded harvest: a late (pass) or no-new-message consumes the marker without posting', async () => {
+test('stranded harvest: an owned late pass consumes the marker without posting', async () => {
   const gc = load(() => '(pass)')
 
   gc.updateGroupChat('Quiet2', r => {
@@ -1636,6 +1657,8 @@ test('stranded harvest: a late (pass) or no-new-message consumes the marker with
       { role: 'assistant', content: '(pass)' }
     ]
   })
+
+  seedStrandedReceipt(gc, 'Quiet2', 'builder')
 
   await gc.harvestStrandedGroupReply('Quiet2', { name: 'builder', title: '' })
 
@@ -1879,12 +1902,12 @@ test('answerGroupClarify routes clarify.respond and clears the mirror', async ()
   const gc = load(() => '(pass)')
   const member = { name: 'research', title: '' }
 
-  gc.syncGroupClarify('Core', member, { pending_clarify: CLARIFY_PAYLOAD })
+  gc.syncGroupClarify('Core', member, { session_id: 'runtime-research', pending_clarify: CLARIFY_PAYLOAD })
   const entry = Object.values(gc.$groupClarify.get())[0]
 
   await gc.answerGroupClarify(entry, member, 'staging')
 
-  assert.equal(JSON.stringify(gc.clarifyResponds), JSON.stringify([{ request_id: 'req-clarify-1', answer: 'staging' }]))
+  assert.equal(JSON.stringify(gc.clarifyResponds), JSON.stringify([{ session_id: 'runtime-research', request_id: 'req-clarify-1', answer: 'staging' }]))
   assert.equal(Object.keys(gc.$groupClarify.get()).length, 0)
 })
 
@@ -1899,7 +1922,7 @@ test('answerGroupClarify sends one respond per batch question, in order', async 
     ]
   }
 
-  gc.syncGroupClarify('Core', member, { pending_clarify: batch })
+  gc.syncGroupClarify('Core', member, { session_id: 'runtime-research', pending_clarify: batch })
   const entry = Object.values(gc.$groupClarify.get())[0]
 
   await gc.answerGroupClarify(entry, member, { q0: 'staging', q1: 'eu-west' })
@@ -1907,8 +1930,8 @@ test('answerGroupClarify sends one respond per batch question, in order', async 
   assert.equal(
     JSON.stringify(gc.clarifyResponds),
     JSON.stringify([
-      { request_id: 'req-batch-1', question_id: 'q0', answer: 'staging' },
-      { request_id: 'req-batch-1', question_id: 'q1', answer: 'eu-west' }
+      { session_id: 'runtime-research', request_id: 'req-batch-1', question_id: 'q0', answer: 'staging' },
+      { session_id: 'runtime-research', request_id: 'req-batch-1', question_id: 'q1', answer: 'eu-west' }
     ])
   )
   assert.equal(Object.keys(gc.$groupClarify.get()).length, 0)
@@ -1927,13 +1950,18 @@ test('disband clears the room mirrored questions', async () => {
   assert.equal(remaining[0].group, 'Other')
 })
 
-test('source contract: room renders clarify cards and the poll gates on them', () => {
-  assert.match(pluginSource, /function GroupClarifyCard\(/)
-  assert.match(pluginSource, /syncGroupClarify\(group, member, state\)/)
-  assert.match(pluginSource, /const done = !busy && !awaitingUser/)
-  assert.match(pluginSource, /busy \|\| awaitingUser/)
-  assert.match(pluginSource, /roomClarifies\.map\(entry =>/)
-  assert.match(pluginSource, /'clarify\.respond'/)
+test('a legacy backend without v1 never replays a submitted turn or publishes its guessed history', async () => {
+  const gc = load(() => 'tempting old answer', { outcomesAvailable: false })
+  gc.sendToGroupChat('Legacy', [{ name: 'research' }], 'answer')
+  for (let i = 0; i < 200 && gc.$groupChats.get().Legacy?.running; i++) {
+    await new Promise(resolve => setImmediate(resolve))
+  }
+  assert.equal(roomLog(gc, 'Legacy').filter(entry => entry.from.kind === 'member').length, 0)
+  assert.ok(gc.$groupChats.get().Legacy.stranded.research)
+  await gc.harvestStrandedGroupReply('Legacy', { name: 'research' })
+  await gc.runGroupChatRounds('Legacy', [{ name: 'research' }], roomLog(gc, 'Legacy')[0].thread)
+  assert.equal(gc.calls.length, 1)
+  assert.ok(gc.$groupChats.get().Legacy.stranded.research)
 })
 
 // ── group approvals: same hidden-session class as clarify (#90694) ─────────
