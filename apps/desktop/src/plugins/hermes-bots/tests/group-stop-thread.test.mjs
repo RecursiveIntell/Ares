@@ -52,7 +52,7 @@ function load({ reply = 'long answer', busyPolls = 0, onResumePoll = null } = {}
       return { session_id: runtime, stored_session_id: stored, message_count: 0, messages: [] }
     }
 
-    if (method === 'session.resume') {
+    if (method === 'session.resume' || method === 'session.turn.poll') {
       const session = resolveSession(params.profile, params.session_id)
 
       if (!session) {
@@ -110,7 +110,7 @@ function load({ reply = 'long answer', busyPolls = 0, onResumePoll = null } = {}
     }
 
     if (method === 'session.interrupt') {
-      return { interrupted: true }
+      return { status: 'interrupted' }
     }
 
     return {}
@@ -300,7 +300,7 @@ test('an ordinary newer-send epoch bump WITHOUT a hold does not abandon the poll
 test('Stop button: workspace renders it while the room is running and wires it to stopGroupThread', () => {
   const workspace = pluginSource.slice(pluginSource.indexOf('function GroupChatWorkspace'))
   // Visible while a round is running…
-  assert.match(workspace, /room\.running\s*\?\s*jsx\('button'/, 'Stop button is gated on room.running')
+  assert.match(workspace, /room\.running \|\| roomClarifies\.length \|\| room\.turns\?\.length\)\s*\?\s*jsx\('button'/, 'Stop button is gated on room.running')
   // …and wired to the real primitive, not a per-member interrupt spray.
   assert.match(workspace, /stopGroupThread\(/, 'button calls the stopGroupThread primitive')
   assert.doesNotMatch(workspace, /stopAllBots/, 'the #94570 interrupt-only shell was rewired, not kept')

@@ -55,7 +55,7 @@ async function harness(scripts = {}, { baseline = 0, onPoll, onSubmit, ack, conn
       if (response.accepted_turn) session.ref = { ...response.accepted_turn }
       return response
     }
-    if (method === 'session.interrupt') return {}
+    if (method === 'session.interrupt') return { status: 'interrupted' }
     if (method === 'clarify.respond') return clarifyResult
     if (method.endsWith('.attach') || method.endsWith('.attach_bytes')) return {}
     if (method !== 'session.resume' && method !== 'session.turn.poll') throw new Error(`unexpected RPC: ${method}`)
@@ -337,7 +337,7 @@ test('concurrent stranded harvests and a serialized marker deliver the matching 
   assert.equal(posts(h)[0].text, 'late owned result')
   assert.equal(posts(h)[0].delivery.accepted_turn.request_id, 'owned-alpha-1')
   assert.equal(room(h).stranded.alpha, undefined)
-  assert.equal(room(h).watermarks['thread-1::alpha'], 2)
+  assert.equal(room(h).watermarks['thread-1::alpha'], 1, 'captured input consumed, appended reply never advances watermark')
   assert.equal(h.rpc('prompt.submit').length, 1)
 })
 
@@ -406,7 +406,7 @@ for (const terminal of ['complete', 'error']) {
     await h.gc.runGroupChatRounds('Room', [ALPHA, BETA], 'thread-1')
     assert.equal(posts(h).length, 0)
     assert.equal(room(h).watermarks['thread-1::alpha'], undefined)
-    assert.equal(h.rpc('prompt.submit').length, 1)
+    assert.equal(h.rpc('prompt.submit').length, 2, 'frozen siblings admitted before stale completion are discarded together')
   })
 }
 
@@ -498,10 +498,12 @@ test('newer same-thread intent supersedes its old collector without stale public
   await entered
   setRoom(h, { epoch: 2, running: true, log: [...room(h).log, { id: 'user-new', from: { kind: 'user', name: 'You' },
     text: 'newer question', thread: 'thread-1' }] })
-  await h.gc.runGroupChatRounds('Room', [ALPHA], 'thread-1')
-  const mark = room(h).watermarks['thread-1::alpha']
+  const second = h.gc.runGroupChatRounds('Room', [ALPHA], 'thread-1')
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(h.rpc('prompt.submit').length, 1, 'accepted old occurrence cannot be overwritten')
   releaseFirst()
-  await first
+  await Promise.all([first, second])
+  const mark = room(h).watermarks['thread-1::alpha']
   assert.deepEqual(posts(h).map(entry => entry.text), ['new answer'])
   assert.equal(room(h).watermarks['thread-1::alpha'], mark)
   assert.equal(h.rpc('prompt.submit').length, 2)
@@ -572,7 +574,7 @@ test('Stop cancels a settlement waiter before dispatch and releases its timer/li
 
 test('a newer drive cancels a waiting thread without replaying its command', async () => {
   const { h, first, second, releaseFirst } = await waitingPair()
-  setRoom(h, { epoch: 3 })
+  setRoom(h, { epoch: 3, log: [...room(h).log, { id: 'user-B-new', from: { kind: 'user', name: 'You' }, text: 'newer B', thread: 'thread-B' }] })
   await second
   assert.equal(h.rpc('prompt.submit').length, 1)
   assert.equal(room(h).watermarks['thread-B::alpha'], undefined)
@@ -608,7 +610,9 @@ test('a terminally failed collector settles its lease and permits the waiting th
 test('repeated collector RPC exceptions settle at the hard cap; waiter retains uncertainty without resubmit', async () => {
   const { h, first, second, releaseFirst } = await waitingPair('complete', true)
   releaseFirst()
-  await Promise.all([first, second])
+  await first
+  h.expireCollectorWait() // uncertainty keeps ownership; queued admission expires honestly
+  await second
   assert.equal(h.rpc('prompt.submit').length, 1)
   assert.ok(room(h).stranded.alpha)
   assert.equal(room(h).watermarks['thread-B::alpha'], undefined)

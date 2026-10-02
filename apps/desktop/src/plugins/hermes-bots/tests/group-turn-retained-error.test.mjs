@@ -188,7 +188,7 @@ test('a stale epoch drops a completed result and never starts the next member', 
     }
   })
   await h.gc.runGroupChatRounds('Room', MEMBERS, 'thread-1')
-  assert.equal(h.calls('prompt.submit').length, 1)
+  assert.equal(h.calls('prompt.submit').length, 2, 'frozen independent members admitted before stale completion')
   assert.equal(h.gc.$groupChats.get().Room.log.some(e => e.text === 'obsolete'), false)
   assert.equal(h.gc.$groupChats.get().Room.watermarks['thread-1::alpha'], undefined)
 })
@@ -204,7 +204,7 @@ test('stale terminal failure advances neither watermark nor next member', async 
     }
   })
   await h.gc.runGroupChatRounds('Room', MEMBERS, 'thread-1')
-  assert.equal(h.calls('prompt.submit').length, 1)
+  assert.equal(h.calls('prompt.submit').length, 2, 'frozen independent members admitted before stale completion')
   assert.equal(h.gc.$groupChats.get().Room.watermarks['thread-1::alpha'], undefined)
   assert.equal(h.gc.$groupChats.get().Room.log.filter(e => e.from.kind === 'member').length, 0)
 })

@@ -27,13 +27,15 @@ registerHooks({
         url: moduleURL(`const fixture = globalThis.__groupTurnTestFixtures.get(${JSON.stringify(id)});
           export const atom = fixture.atom, host = fixture.host;
           export const PALETTE_AREA = 'palette', COMPOSER_AREAS = { middleware: 'middleware' };
-          ${sdkNames.map(name => `export const ${name} = undefined;`).join('\n')}`)
+          ${sdkNames.map(name => `export const ${name} = fixture.sdk?.[${JSON.stringify(name)}];`).join('\n')}`)
       }
     }
     if (id && (specifier === 'react' || specifier === 'react/jsx-runtime')) {
       return {
         shortCircuit: true,
-        url: moduleURL('export const useEffect = undefined, useMemo = undefined, useRef = undefined, useState = undefined, jsx = undefined, jsxs = undefined;')
+        url: moduleURL(`const fixture = globalThis.__groupTurnTestFixtures.get(${JSON.stringify(id)});
+          export const useEffect = fixture.useEffect, useMemo = undefined, useRef = undefined, useState = fixture.useState;
+          export const jsx = (type, props, key) => ({ type, props, key }), jsxs = jsx;`)
       }
     }
     return nextResolve(specifier, context)
@@ -44,11 +46,18 @@ registerHooks({
     if (target.pathname === pluginURL.pathname && target.searchParams.has('groupTurnFixture')) {
       return {
         ...result,
-        source: `const { Date, setTimeout, clearTimeout } = globalThis.__groupTurnTestFixtures.get(${JSON.stringify(target.searchParams.get('groupTurnFixture'))});\n${result.source}\nexport { runGroupChatMemberTurn, runGroupChatRounds,
+        source: `const { Date, setTimeout, clearTimeout } = globalThis.__groupTurnTestFixtures.get(${JSON.stringify(target.searchParams.get('groupTurnFixture'))});
+          const fixturePorts = globalThis.__groupTurnTestFixtures.get(${JSON.stringify(target.searchParams.get('groupTurnFixture'))});
+          const document = fixturePorts.document ?? globalThis.document;
+          const setInterval = fixturePorts.setInterval ?? globalThis.setInterval;
+          const clearInterval = fixturePorts.clearInterval ?? globalThis.clearInterval;\n${result.source}\nexport { runGroupChatMemberTurn, runGroupChatRounds,
           harvestStrandedGroupReply, stopGroupChatServerSync, currentGroupActivity, groupActivityLabel,
           $groupChats, $groupClarify, $botAttention, appendGroupChatEntry, syncGroupClarify, answerGroupClarify,
           groupChatSyncSnapshot, groupChatSyncEntryKey, stopGroupThread,
-          mergeRemoteGroupChatSnapshotIntoRooms, durableGroupChatRooms, sendToGroupChat };\n
+          mergeRemoteGroupChatSnapshotIntoRooms, durableGroupChatRooms, sendToGroupChat,
+          groupRoomCoordinators, groupRuntimeSessionOwners, groupMemberKey, updateGroupChat,
+          groupBlockedMembers, GroupBlockedNotice, CreateGroupChatDialog, createFreshGroupChat,
+          groupComposerDraftKey, groupComposerDraftSnapshot, updateGroupComposerDraft };\n
           export function bindGroupTurnTestStorage(storage) { pluginCtx = { storage }; }\n`
       }
     }
