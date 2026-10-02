@@ -1,3 +1,4 @@
+import { getApiRequestConnection } from '@/api/client'
 import { type QueryClient } from '@tanstack/react-query'
 import { useCallback, useRef } from 'react'
 
@@ -6,7 +7,7 @@ import { getGlobalModelInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { isBusySessionModelSwitch } from '@/lib/gateway-rpc'
 import { surfaceModelSwitchConfirm } from '@/lib/guarded-model-switch'
-import { manualPickRemoved, modelOptionsQueryKey } from '@/lib/model-options'
+import { modelOptionsQueryKey } from '@/lib/model-options'
 import { activeGatewayConnectionId } from '@/store/gateway'
 import { notifyError } from '@/store/notifications'
 import { $activeGatewayProfile } from '@/store/profile'
@@ -64,7 +65,8 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
       provider: string,
       model: string,
       includeGlobal: boolean,
-      profile = $activeGatewayProfile.get()
+      profile = $activeGatewayProfile.get(),
+      connectionId = getApiRequestConnection()
     ) => {
       const patch = (prev: ModelOptionsResponse | undefined) => {
         // Selection state can update before the catalog query has resolved.
@@ -79,10 +81,10 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
         return { ...prev, provider, model, providers }
       }
 
-      queryClient.setQueryData<ModelOptionsResponse>(modelOptionsQueryKey(profile, sessionId), patch)
+      queryClient.setQueryData<ModelOptionsResponse>(modelOptionsQueryKey(profile, sessionId, connectionId), patch)
 
       if (includeGlobal) {
-        queryClient.setQueryData<ModelOptionsResponse>(modelOptionsQueryKey(profile), patch)
+        queryClient.setQueryData<ModelOptionsResponse>(modelOptionsQueryKey(profile, null, connectionId), patch)
       }
     },
     [queryClient]
@@ -95,11 +97,14 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
   // default-derived still lets the next fresh draft reseed from profile config.
   const applySavedMainModel = useCallback(
     (provider: string, model: string) => {
+      profileRefreshEpochRef.current += 1
       const liveSessionId = $activeSessionId.get()
 
-      setCurrentModelSource('default')
+      if (getCurrentModelSource() !== 'manual') {
+        setCurrentModelSource('default')
+      }
 
-      if (!liveSessionId) {
+      if (!liveSessionId && getCurrentModelSource() !== 'manual') {
         setCurrentProvider(provider)
         setCurrentModel(model)
       }
@@ -131,22 +136,8 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
           return
         }
 
-        // A manual pick stays sticky UNLESS it was removed from the catalog (its
-        // model no longer exists on the provider), in which case keeping it would
-        // 404 every new chat — fall through to reseed from the profile default.
-        // Reads the model-options cache the composer already populated; an
-        // unknown/not-yet-loaded catalog conservatively preserves the pick.
-        const keepManualPick = () => {
-          if (force || !$currentModel.get() || getCurrentModelSource() !== 'manual') {
-            return false
-          }
-
-          const options = queryClient.getQueryData<ModelOptionsResponse>(
-            modelOptionsQueryKey($activeGatewayProfile.get())
-          )
-
-          return !manualPickRemoved(options?.providers, $currentProvider.get(), $currentModel.get())
-        }
+        // Catalog churn must never silently replace a deliberate choice.
+        const keepManualPick = () => !force && Boolean($currentModel.get()) && getCurrentModelSource() === 'manual'
 
         if (keepManualPick()) {
           return
@@ -156,10 +147,14 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
         // that lands while getGlobalModelInfo is in flight wins over this older
         // default — value comparisons alone miss re-selecting the same row.
         const selectionGeneration = getComposerSelectionGeneration()
-        const result = await getGlobalModelInfo()
+        const connectionId = getApiRequestConnection()
+        const profile = $activeGatewayProfile.get()
+        const result = await getGlobalModelInfo(profile)
 
         if (
           profileRefreshEpochRef.current !== profileRefreshEpoch ||
+          $activeGatewayProfile.get() !== profile ||
+          getApiRequestConnection() !== connectionId ||
           $activeSessionId.get() ||
           getComposerSelectionGeneration() !== selectionGeneration ||
           keepManualPick()
@@ -227,7 +222,9 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
         : prevProvider
 
       const rollbackSource = continuesOptimisticChain ? (pendingBefore?.rollbackSource ?? prevSource) : prevSource
-      const liveGatewayProfile = $activeGatewayProfile.get()
+      const owner = knownOwnerForSession(liveSessionId)
+      const liveConnectionId = owner && typeof owner === 'object' ? owner.connectionId : owner ? 'local' : getApiRequestConnection()
+      const liveGatewayProfile = (typeof owner === 'string' ? owner : (owner?.targetProfile || owner?.profile)) || $activeGatewayProfile.get()
 
       // A runtime id is ephemeral. Keep its durable owner while the switch is
       // in flight so a 4001 can be resumed by the correct surface instead of
@@ -239,8 +236,8 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
 
       const targetKey = (runtimeId: string | null, storedId: string | null) => {
         const owner = runtimeId ? knownOwnerForSession(runtimeId) : undefined
-        const ownerConnection = owner && typeof owner === 'object' ? owner.connectionId : undefined
-        const ownerProfile = typeof owner === 'string' ? owner : owner?.profile
+        const ownerConnection = owner && typeof owner === 'object' ? owner.connectionId : owner ? 'local' : undefined
+        const ownerProfile = typeof owner === 'string' ? owner : (owner?.targetProfile || owner?.profile)
 
         return JSON.stringify([
           runtimeId,
@@ -316,7 +313,7 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
       }
 
       const cacheSelection = (provider: string, model: string) => {
-        updateModelOptionsCache(liveSessionId, provider, model, touchesPrimary && !liveSessionId, liveGatewayProfile)
+        updateModelOptionsCache(liveSessionId, provider, model, touchesPrimary && !liveSessionId, liveGatewayProfile, liveConnectionId)
       }
 
       const stillOwnsPrimarySelection = () =>
@@ -492,7 +489,7 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
         // the switch publishes session.info when it lands, and that is what
         // re-syncs every surface.
         if (!result?.deferred) {
-          void queryClient.invalidateQueries({ queryKey: modelOptionsQueryKey(liveGatewayProfile, liveSessionId) })
+          void queryClient.invalidateQueries({ queryKey: modelOptionsQueryKey(liveGatewayProfile, liveSessionId, liveConnectionId) })
         }
       }
 

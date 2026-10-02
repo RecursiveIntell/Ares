@@ -1,12 +1,12 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { useState } from 'react'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { useModelControls } from '@/app/session/hooks/use-model-controls'
 import { DropdownMenu, DropdownMenuContent } from '@/components/ui/dropdown-menu'
 import { $collapsedProviders, toggleCollapsedProvider } from '@/store/provider-collapse'
 import { $activeSessionId, $currentModel, $currentProvider } from '@/store/session'
+import { $sessions, _resetSessionOwnerHintsForTests, setSessionOwnerHint } from '@/store/session'
+import { setApiRequestConnection } from '@/api/client'
 
 import { ModelMenuPanel } from './model-menu-panel'
 
@@ -54,6 +54,8 @@ const GOOGLE_PROVIDER = {
 const MOCK_PROVIDERS = [DEEPSEEK_PROVIDER, GOOGLE_PROVIDER, MOA_PROVIDER]
 
 beforeEach(() => {
+  _resetSessionOwnerHintsForTests()
+  $sessions.set([])
   $activeSessionId.set('runtime-1')
   $currentModel.set('')
   $currentProvider.set('')
@@ -81,6 +83,26 @@ function renderPanel(onSelectModel = vi.fn()) {
 
   return { onSelectModel, content }
 }
+
+it.each(['legacy-local', 'remote-target'])('loads the known session owner catalog while ambient source differs (%s)', async kind => {
+  setApiRequestConnection('ambient-remote')
+  if (kind === 'legacy-local') {
+    $sessions.set([{ id: 'runtime-1', profile: 'local-specialist' }] as never)
+  } else {
+    setSessionOwnerHint('runtime-1', { connectionId: 'owner-remote', profile: 'logical', targetProfile: 'backend-target', mode: 'remote' })
+  }
+  try {
+    renderPanel()
+    await vi.waitFor(() => expect(getGlobalModelOptions).toHaveBeenCalledWith({ explicitOnly: true }, {
+      connectionId: kind === 'legacy-local' ? 'local' : 'owner-remote',
+      profile: kind === 'legacy-local' ? 'local-specialist' : 'backend-target'
+    }))
+  } finally {
+    setApiRequestConnection(null)
+    $sessions.set([])
+    _resetSessionOwnerHintsForTests()
+  }
+})
 
 describe('ModelMenuPanel MoA presets', () => {
   it('selecting a MoA preset switches PERSISTENTLY via onSelectModel (not the one-shot dispatch)', async () => {
@@ -412,7 +434,7 @@ describe('ModelMenuPanel provider collapse', () => {
     expect($collapsedProviders.get()).toContain('deepseek')
   })
 
-  it('switches the session model when Refresh Models drops the current pick', async () => {
+  it('preserves the session model when Refresh Models drops the current pick', async () => {
     $currentProvider.set('zhipu')
     $currentModel.set('glm-4.5-air')
     getGlobalModelOptions
@@ -433,13 +455,8 @@ describe('ModelMenuPanel provider collapse', () => {
 
     fireEvent.click(await content.findByText('Refresh Models'))
 
-    await vi.waitFor(() => {
-      expect(onSelectModel).toHaveBeenCalledWith({
-        model: 'deepseek-v4-pro',
-        provider: 'deepseek',
-        sessionId: 'runtime-1'
-      })
-    })
+    await content.findByText(/selected provider or model is unavailable in this profile/i)
+    expect(onSelectModel).not.toHaveBeenCalled()
   })
 
   it('does not switch when Refresh Models still lists the current pick', async () => {
@@ -459,107 +476,20 @@ describe('ModelMenuPanel provider collapse', () => {
   })
 })
 
-describe('ModelMenuPanel refresh reconcile × guarded-switch confirm handshake', () => {
-  // #95446 fix (reconcile after Refresh Models) composes with the
-  // confirm-handshake guard: when the reconcile target is itself a GUARDED
-  // model (contributor tier / expensive), the switch must surface the confirm
-  // flow — one config.set, a warning with a Confirm action, rollback until
-  // confirmed — never a silent retry loop and never a silently-painted pick.
-  function ConfirmHarness({
-    requestGateway
-  }: {
-    requestGateway: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
-  }) {
-    const [client] = useState(() => new QueryClient({ defaultOptions: { queries: { retry: false } } }))
-    const controls = useModelControls({ queryClient: client, requestGateway })
-
-    return (
-      <QueryClientProvider client={client}>
-        <DropdownMenu open>
-          <DropdownMenuContent>
-            <ModelMenuPanel onSelectModel={controls.selectModel} requestGateway={requestGateway as never} />
-          </DropdownMenuContent>
-        </DropdownMenu>
-      </QueryClientProvider>
-    )
-  }
-
-  it('reconcile-triggered switch to a guarded model surfaces confirm, not a silent retry', async () => {
-    $activeSessionId.set('runtime-1')
-    $currentProvider.set('zhipu')
-    $currentModel.set('glm-4.5-air')
+describe('ModelMenuPanel catalog refresh preserves a session selection', () => {
+  it('shows a configuration gap without sending a switch when refresh removes the selection', async () => {
+    $currentProvider.set('ollama-launch')
+    $currentModel.set('model-a')
     getGlobalModelOptions
-      .mockResolvedValueOnce({
-        providers: [{ models: ['glm-4.5-air'], name: 'Zhipu', slug: 'zhipu' }, MOA_PROVIDER]
-      })
-      // Refresh drops the current pick; the only remaining model is guarded.
-      .mockResolvedValueOnce({
-        providers: [{ models: ['muse-spark-1.2-contributor'], name: 'OpenCode', slug: 'opencode-go' }, MOA_PROVIDER]
-      })
-
-    // Method-aware gateway: the panel's catalog reads (`model.options`) fall
-    // back to the REST mock; `config.set` runs the guarded handshake —
-    // confirm_required first, success on the confirmed resend.
-    let configSets = 0
-
-    const requestGateway = vi.fn(async (method: string, _params?: Record<string, unknown>) => {
-      if (method !== 'config.set') {
-        throw new Error('use REST catalog')
-      }
-
-      configSets += 1
-
-      if (configSets === 1) {
-        return {
-          confirm_message: 'CONTRIBUTOR TIER: this model may train on your data.',
-          confirm_required: true,
-          key: 'model',
-          value: 'muse-spark-1.2-contributor'
-        }
-      }
-
-      return { key: 'model', scope: 'global', value: 'muse-spark-1.2-contributor' }
-    })
-
-    const content = render(<ConfirmHarness requestGateway={requestGateway as never} />)
-
-    await content.findByText(/Glm 4\.5 Air/i)
+      .mockResolvedValueOnce({ providers: [{ models: ['model-a'], name: 'Ollama', slug: 'ollama-launch' }] })
+      .mockResolvedValueOnce({ providers: [{ models: ['model-b'], name: 'Other', slug: 'other' }] })
+    const { content, onSelectModel } = renderPanel()
+    await content.findByText('Model A')
     fireEvent.click(await content.findByText('Refresh Models'))
-
-    // The reconcile fired exactly ONE switch attempt and it came back
-    // confirm_required → the confirm toast is up, nothing retried silently.
-    await vi.waitFor(() => {
-      expect(notify).toHaveBeenCalledWith(
-        expect.objectContaining({
-          action: expect.objectContaining({ label: expect.any(String) }),
-          kind: 'warning',
-          message: 'CONTRIBUTOR TIER: this model may train on your data.'
-        })
-      )
-    })
-
-    const configSetCalls = requestGateway.mock.calls.filter(([method]) => method === 'config.set')
-    expect(configSetCalls).toHaveLength(1)
-    expect(configSetCalls[0][1]).not.toHaveProperty('confirm_expensive_model')
-
-    // Pending confirmation = rolled back, not silently painted.
-    expect($currentModel.get()).toBe('glm-4.5-air')
-    expect($currentProvider.get()).toBe('zhipu')
-
-    // User confirms → ONE resend carrying confirm_expensive_model: true.
-    const lastNotify = notify.mock.calls.at(-1)?.[0] as { action: { onClick: () => Promise<void> } }
-
-    await act(async () => {
-      await lastNotify.action.onClick()
-    })
-
-    await vi.waitFor(() => {
-      const resend = requestGateway.mock.calls.filter(([method]) => method === 'config.set')
-      expect(resend).toHaveLength(2)
-      expect(resend[1][1]).toMatchObject({ confirm_expensive_model: true, session_id: 'runtime-1' })
-    })
-    expect($currentModel.get()).toBe('muse-spark-1.2-contributor')
-    expect($currentProvider.get()).toBe('opencode-go')
-    expect(notifyError).not.toHaveBeenCalled()
+    await content.findByText(/selected provider or model is unavailable in this profile/i)
+    expect(onSelectModel).not.toHaveBeenCalled()
+    expect($currentModel.get()).toBe('model-a')
+    expect($currentProvider.get()).toBe('ollama-launch')
+    expect(notify).not.toHaveBeenCalled()
   })
 })

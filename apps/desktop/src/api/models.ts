@@ -31,7 +31,7 @@ export function getGlobalModelOptions(
     includeUnconfigured?: boolean
     explicitOnly?: boolean
   },
-  profile?: null | string
+  profile?: ProfileScope
 ): Promise<ModelOptionsResponse> {
   const params = new URLSearchParams()
 
@@ -47,8 +47,9 @@ export function getGlobalModelOptions(
     params.set('explicit_only', '1')
   }
 
-  return hermesApi<ModelOptionsResponse>({
-    ...profileScoped(profile),
+  return window.hermesDesktop.api<ModelOptionsResponse>({
+    ...capabilityScoped(profile),
+    ...(profile && typeof profile === 'object' ? { connectionId: profile.connectionId || 'local' } : {}),
     path: params.size > 0 ? `/api/model/options?${params.toString()}` : '/api/model/options',
     timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
   })

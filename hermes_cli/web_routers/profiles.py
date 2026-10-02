@@ -1126,6 +1126,8 @@ async def update_profile_model_endpoint(name: str, body: ProfileModelUpdate):
         raise HTTPException(status_code=400, detail="provider and model are required")
     try:
         _write_profile_model(profile_dir, provider, model)
+    except HTTPException:
+        raise
     except Exception as e:
         _log.exception("PUT /api/profiles/%s/model failed", name)
         raise HTTPException(status_code=500, detail=str(e))

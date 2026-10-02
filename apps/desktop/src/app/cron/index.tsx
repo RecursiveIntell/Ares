@@ -1,6 +1,7 @@
 import { createCronTriggerController, type CronTriggerController } from '@hermes/shared'
 import { useStore } from '@nanostores/react'
 import { useQuery } from '@tanstack/react-query'
+import { getApiRequestConnection, getApiRequestProfile } from '@/api/client'
 import type * as React from 'react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
@@ -46,7 +47,7 @@ import {
 } from '@/hermes'
 import { type Translations, useI18n } from '@/i18n'
 import { AlertTriangle } from '@/lib/icons'
-import { requestModelOptions } from '@/lib/model-options'
+import { modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
 import { asText } from '@/lib/text'
 import { $cronFocusJobId, $cronJobs, invalidateCronJobsRequests, setCronFocusJobId } from '@/store/cron'
 import { $changeEventsAvailable, $cronChangeTick } from '@/store/live-sync'
@@ -1068,9 +1069,11 @@ function CronEditorDialog({
   // Same catalog the chat model picker uses: configured providers and their
   // actually-available models only. Script-only + blueprint forms never pick a
   // model here, so skip the fetch entirely for them.
+  const catalogConnection = getApiRequestConnection()
+  const catalogProfile = getApiRequestProfile()
   const modelOptions = useQuery({
-    queryKey: ['model-options', 'global'],
-    queryFn: () => requestModelOptions({}),
+    queryKey: modelOptionsQueryKey(catalogProfile, null, catalogConnection),
+    queryFn: () => requestModelOptions({ connectionId: catalogConnection, profile: catalogProfile }),
     enabled: open && !scriptOnlyJob && !isBlueprint
   })
 

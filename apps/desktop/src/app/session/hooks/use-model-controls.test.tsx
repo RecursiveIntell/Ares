@@ -184,7 +184,7 @@ describe('useModelControls', () => {
 
     // The global cache reflects the save, and the next fresh draft may reseed
     // from that default instead of preserving the old session's model.
-    expect(getCurrentModelSource()).toBe('default')
+    expect(getCurrentModelSource()).toBe('manual')
     expect(queryClient.getQueryData(modelOptionsQueryKey('default'))).toMatchObject({
       model: 'poolside/laguna-xs-2.1:free',
       provider: 'nous'
@@ -193,11 +193,11 @@ describe('useModelControls', () => {
     $activeSessionId.set(null)
     await result.current.refreshCurrentModel()
 
-    expect($currentModel.get()).toBe('poolside/laguna-xs-2.1:free')
+    expect($currentModel.get()).toBe('tencent/hy3:free')
     expect($currentProvider.get()).toBe('nous')
   })
 
-  it('paints a saved profile default immediately when no session is active', () => {
+  it('preserves a deliberate draft pin when a profile default is saved', () => {
     const queryClient = new QueryClient()
     setCurrentModel('tencent/hy3:free')
     setCurrentProvider('nous')
@@ -212,9 +212,9 @@ describe('useModelControls', () => {
 
     result.current.applySavedMainModel('nous', 'poolside/laguna-xs-2.1:free')
 
-    expect($currentModel.get()).toBe('poolside/laguna-xs-2.1:free')
+    expect($currentModel.get()).toBe('tencent/hy3:free')
     expect($currentProvider.get()).toBe('nous')
-    expect(getCurrentModelSource()).toBe('default')
+    expect(getCurrentModelSource()).toBe('manual')
     expect(queryClient.getQueryData(modelOptionsQueryKey('default'))).toEqual({
       model: 'poolside/laguna-xs-2.1:free',
       provider: 'nous',
@@ -567,7 +567,7 @@ describe('useModelControls', () => {
     expect($currentModel.get()).toBe('openai/gpt-5.5')
   })
 
-  it('reseeds a sticky manual pick that was removed from the catalog', async () => {
+  it('preserves a deliberate pin that was removed from the catalog', async () => {
     vi.mocked(getGlobalModelInfo).mockResolvedValue({ model: 'openai/gpt-5.5', provider: 'openai-codex' })
 
     const queryClient = new QueryClient()
@@ -588,8 +588,8 @@ describe('useModelControls', () => {
 
     await result.current.refreshCurrentModel()
 
-    expect($currentModel.get()).toBe('openai/gpt-5.5')
-    expect(getCurrentModelSource()).toBe('default')
+    expect($currentModel.get()).toBe('openrouter/owl-alpha')
+    expect(getCurrentModelSource()).toBe('manual')
   })
 
   it('keeps a sticky manual pick that is still in the catalog', async () => {
@@ -663,6 +663,19 @@ describe('useModelControls', () => {
 
     expect($currentModel.get()).toBe('profile-c-model')
     expect($currentProvider.get()).toBe('profile-c-provider')
+  })
+
+  it('does not let a default read started before Settings save undo the saved choice', async () => {
+    const stale = deferred<Awaited<ReturnType<typeof getGlobalModelInfo>>>()
+    vi.mocked(getGlobalModelInfo).mockReturnValueOnce(stale.promise)
+    setCurrentModelSource('default')
+    const { result } = renderHook(() => useModelControls({ queryClient: new QueryClient(), requestGateway: vi.fn() }))
+    const pending = result.current.refreshCurrentModel()
+    result.current.applySavedMainModel('ollama-launch', 'saved-model-b')
+    stale.resolve({ provider: 'openrouter', model: 'old-model-a' })
+    await pending
+    expect($currentModel.get()).toBe('saved-model-b')
+    expect($currentProvider.get()).toBe('ollama-launch')
   })
 
   it('refreshes legacy/default-derived composer state from the profile default', async () => {

@@ -9987,9 +9987,11 @@ function useModelOptions(bot = null) {
   const resolved = bot ? resolveBotConnectionRoute(bot) : null
   const route = resolved?.status === 'resolved' ? resolved.route : null
   const orphaned = resolved?.status === 'owner_removed'
+  const catalogProfile = bot ? botBackendProfileScope(route, bot.name) : (host.state.profile?.get?.() || 'default')
+  const catalogSource = route ? botRouteKey(route) : (host.state.connectionId?.get?.() || host.activeConnectionId?.() || 'local')
 
   return useQuery({
-    queryKey: [ID, 'model-options', route ? botRouteKey(route) : 'active'],
+    queryKey: [ID, 'model-options', catalogSource, catalogProfile],
     // No forced `refresh`: forcing a network read on EVERY mount bypassed the
     // staleTime cache, so each Bots view remount (tab re-front, dialog reopen,
     // pane visibility flip) knocked the picker back into its loading state and
@@ -9998,6 +10000,7 @@ function useModelOptions(bot = null) {
     queryFn: () =>
       boundedModelOptionsFetch(
         requestForBot(bot, 'model.options', {
+          profile: catalogProfile,
           include_unconfigured: true,
           explicit_only: false
         })
@@ -10021,8 +10024,18 @@ function ModelPicker({ bot = null, value, onChange, placeholderModel = 'gateway 
   const NONE = '__default__'
   const CUSTOM = '__custom__'
   const providers = (data?.providers || []).filter(p => p && p.slug)
+  const activeProvider = providers.find(p =>
+    [p.slug, p.name, ...(p.aliases || [])].some(alias => String(alias || '').toLowerCase() === value.provider.toLowerCase())
+  ) || null
   const isKnown =
-    !value.provider || value.provider === NONE || providers.some(p => p.slug === value.provider)
+    !value.provider || value.provider === NONE || Boolean(activeProvider)
+  const selectionNotice = data && !isKnown && !error
+    ? jsx('p', {
+        className: 'col-span-2 text-xs text-(--ui-text-secondary)',
+        role: 'status',
+        children: "The selected provider is absent from this profile's catalog. Configure it here or choose another provider. Your selection is preserved."
+      })
+    : null
   const [useFreeText, setUseFreeText] = useState(!isKnown)
 
   if (isLoading) {
@@ -10037,6 +10050,7 @@ function ModelPicker({ bot = null, value, onChange, placeholderModel = 'gateway 
     return jsxs('div', {
       style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' },
       children: [
+        selectionNotice,
         labeled(
           'Provider',
           jsx(Input, {
@@ -10061,6 +10075,7 @@ function ModelPicker({ bot = null, value, onChange, placeholderModel = 'gateway 
     return jsxs('div', {
       style: { display: 'flex', flexDirection: 'column', gap: '8px' },
       children: [
+        selectionNotice,
         jsxs('div', {
           style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' },
           children: [
@@ -10093,7 +10108,6 @@ function ModelPicker({ bot = null, value, onChange, placeholderModel = 'gateway 
     })
   }
 
-  const activeProvider = providers.find(p => p.slug === value.provider) || null
   const models = activeProvider
     ? (activeProvider.models || []).map(m => (typeof m === 'string' ? m : m.id || m.name || ''))
     : []
@@ -10101,10 +10115,11 @@ function ModelPicker({ bot = null, value, onChange, placeholderModel = 'gateway 
   return jsxs('div', {
     style: { display: 'grid', gridTemplateColumns: '1fr 1.4fr', gap: '10px' },
     children: [
+      selectionNotice,
       labeled(
         'Provider',
         jsxs(Select, {
-          value: value.provider || NONE,
+          value: activeProvider?.slug || value.provider || NONE,
           onValueChange: v => {
             if (v === NONE) {
               onChange({ provider: '', model: '' })
@@ -10880,6 +10895,18 @@ async function applyAdvancedConfig(bot, state) {
   return { ...result, ok: Object.values(merged).every(Boolean), applied: merged }
 }
 
+function advancedFailureMessage(result) {
+  const failed = Object.entries(result?.applied || {}).filter(([, ok]) => !ok).map(([section]) => section)
+  // Older gateways may omit the code. Render only bounded messages we own;
+  // never display arbitrary exception text from model_error.message.
+  const modelMessage = result?.model_error?.code === 'provider_configuration_unavailable'
+    ? 'The selected provider is missing, disabled, or incomplete in this profile. Configure it here or choose another provider. Your previous model is preserved.'
+    : result?.model_error?.code === 'model_save_failed'
+      ? 'The model could not be saved. Your previous model is preserved.'
+      : ''
+  return `Some sections failed: ${failed.join(', ')}${failed.includes('model') && modelMessage ? `. ${modelMessage}` : ''}`
+}
+
 // ── edit profile dialog ──────────────────────────────────────────────────────
 
 function labeled(label, control) {
@@ -10975,7 +11002,7 @@ function EditProfileDialog({ bot, open, onClose }) {
 
         if (failed.length) {
           advancedFailed = true
-          host.notify({ kind: 'error', message: `Some sections failed: ${failed.map(([k]) => k).join(', ')}` })
+          host.notify({ kind: 'error', message: advancedFailureMessage(res) })
         }
       } catch (err) {
         advancedFailed = true

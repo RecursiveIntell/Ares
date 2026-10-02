@@ -2355,6 +2355,8 @@ export interface Translations {
   }
 
   modelPicker: {
+    selectionUnavailable: string
+    sessionSelection: string
     title: string
     current: string
     unknown: string

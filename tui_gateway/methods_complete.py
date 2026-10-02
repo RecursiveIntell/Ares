@@ -468,10 +468,39 @@ def _(rid, params: dict) -> dict:
 
 @method("model.options")
 def _(rid, params: dict) -> dict:
+    token = None
     try:
         from hermes_cli.inventory import build_model_options_payload
+        from hermes_cli.profiles import get_profile_dir, normalize_profile_name, validate_profile_name
+
+        # A catalog belongs to one profile on this backend. Do not let an
+        # invalid target fall through to launch config, or borrow another
+        # session's selection while reading a different target's definitions.
+        requested_home = None
+        if params.get("profile") is not None:
+            profile = params["profile"]
+            if not isinstance(profile, str):
+                return _err(rid, 4033, "Invalid model catalog profile")
+            try:
+                profile = normalize_profile_name(profile)
+                validate_profile_name(profile)
+                requested_home = Path(get_profile_dir(profile)).resolve()
+            except (ValueError, TypeError):
+                return _err(rid, 4033, "Invalid model catalog profile")
+            if not requested_home.is_dir():
+                return _err(rid, 4033, "Model catalog profile does not exist")
 
         session = _sessions.get(params.get("session_id", ""))
+        if params.get("session_id") and session is None:
+            return _err(rid, 4001, "Session not found")
+        session_home = Path(session.get("profile_home") or _hermes_home).resolve() if session else None
+        if requested_home is not None and session_home is not None and requested_home != session_home:
+            return _err(rid, 4033, "Model catalog profile does not match the session owner")
+        home = session_home or requested_home
+        if home is not None:
+            if not home.is_dir():
+                return _err(rid, 4033, "Model catalog session owner does not exist")
+            token = set_hermes_home_override(str(home))
         agent = session.get("agent") if session else None
         # Layer agent-session state on top of disk config — once an agent
         # is spawned, IT owns the live provider/model/base_url. Empty
@@ -487,6 +516,9 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, payload)
     except Exception as e:
         return _err(rid, 5033, str(e))
+    finally:
+        if token is not None:
+            reset_hermes_home_override(token)
 
 
 @method("model.save_key")

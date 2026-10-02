@@ -1,98 +1,24 @@
+import { getApiRequestConnection, getApiRequestProfile, type ProfileScope } from '@/api/client'
 import { getGlobalModelOptions, type HermesGateway, type ModelOptionsResponse } from '@/hermes'
 import type { ModelOptionProvider } from '@/types/hermes'
 
-/**
- * True only when a persisted **manual** composer pick has been removed from the
- * catalog (its provider still ships models, but no longer this one) — so a new
- * chat would keep 404'ing the dead model. Deliberately conservative to never
- * clobber a still-valid pick: an unknown/absent provider, an empty model list
- * (re-auth / unconfigured), or a not-yet-loaded catalog all return false.
- */
-export function manualPickRemoved(
+/** Catalog absence is a visible configuration gap, never a new selection. */
+export function selectionUnavailable(
   providers: ModelOptionProvider[] | undefined,
   provider: string,
   model: string
 ): boolean {
-  if (!providers?.length || !provider || !model) {
+  if (!providers || !provider || !model) {
     return false
   }
 
-  const row = providers.find(p => p.slug === provider || p.name === provider)
+  const row = providers.find(p => p.slug === provider || p.name === provider || p.aliases?.includes(provider))
 
-  if (!row) {
-    return false
-  }
-
-  const models = row.models ?? []
-
-  // Empty list means the provider is present but unconfigured / awaiting
-  // re-auth, not that the model was dropped — leave the pick alone.
-  if (models.length === 0) {
-    return false
-  }
-
-  return !models.includes(model)
-}
-
-const MOA_PROVIDER_SLUG = 'moa'
-
-/** True when `model` appears in any provider's live list. Used after Refresh
- *  Models so a group/catalog swap can tell "still offered" from "gone". */
-export function selectionInCatalog(providers: ModelOptionProvider[] | undefined, model: string): boolean {
-  if (!providers?.length || !model) {
-    return false
-  }
-
-  return providers.some(provider => (provider.models ?? []).includes(model))
-}
-
-/** First real (non-MoA) catalog row that still has models. */
-export function firstSelectableCatalogModel(
-  providers: ModelOptionProvider[] | undefined
-): { model: string; provider: string } | null {
-  if (!providers?.length) {
-    return null
-  }
-
-  for (const provider of providers) {
-    if (provider.slug === MOA_PROVIDER_SLUG) {
-      continue
-    }
-
-    const model = provider.models?.[0]
-
-    if (model) {
-      return { model, provider: provider.slug }
-    }
-  }
-
-  return null
-}
-
-/**
- * After Refresh Models replaces the catalog: keep the current pick when it is
- * still listed; otherwise switch to the first available model in the new
- * catalog. Returns null when the catalog is empty/unloaded so we never wipe
- * a selection on a failed or still-hydrating refresh.
- */
-export function reconcileSelectionAfterCatalogRefresh(
-  currentModel: string,
-  providers: ModelOptionProvider[] | undefined
-): { model: string; provider: string } | null {
-  const next = firstSelectableCatalogModel(providers)
-
-  if (!next) {
-    return null
-  }
-
-  if (selectionInCatalog(providers, currentModel)) {
-    return null
-  }
-
-  return next
+  return !row || !(row.models ?? []).includes(model) || (row.unavailable_models ?? []).includes(model)
 }
 
 interface ModelOptionsRequest {
+  connectionId?: null | string
   /** When false, include ambient/unconfigured providers (onboarding/setup
    *  surfaces). Chat pickers default to true so only explicitly configured
    *  providers are listed (#56974). */
@@ -102,17 +28,23 @@ interface ModelOptionsRequest {
    *  `gateway.request` — a tile's model menu must not query the ambient
    *  chrome socket (#93892). */
   request?: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
-  /** Profile for the REST recovery path. Must match the catalog owner so a
+  /** Profile for both catalog paths. Must match the catalog owner so a
    *  secondary tile does not fall back to the launch profile's models. */
   profile?: null | string
   refresh?: boolean
   sessionId?: null | string
 }
 
-export function modelOptionsQueryKey(profile: null | string | undefined, sessionId?: null | string) {
+export function modelOptionsQueryKey(
+  profile: null | string | undefined,
+  sessionId?: null | string,
+  connectionId = getApiRequestConnection()
+) {
   const profileKey = (profile ?? '').trim() || 'default'
 
-  return ['model-options', profileKey, sessionId || 'global'] as const
+  const sourceKey = connectionId && connectionId !== 'local' ? `${connectionId}::${profileKey}` : profileKey
+
+  return ['model-options', sourceKey, sessionId || 'global'] as const
 }
 
 function hasSelectableModels(options: ModelOptionsResponse | null | undefined): boolean {
@@ -122,15 +54,14 @@ function hasSelectableModels(options: ModelOptionsResponse | null | undefined): 
 function restModelOptions(
   explicitOnly: boolean,
   refresh: boolean,
-  profile?: null | string
+  profile: ProfileScope
 ): Promise<ModelOptionsResponse> {
   const opts = { explicitOnly, ...(refresh ? { refresh: true } : {}) }
-  const profileKey = (profile ?? '').trim()
-
-  return profileKey ? getGlobalModelOptions(opts, profileKey) : getGlobalModelOptions(opts)
+  return getGlobalModelOptions(opts, profile)
 }
 
 export async function requestModelOptions({
+  connectionId = getApiRequestConnection(),
   explicitOnly = true,
   gateway,
   profile,
@@ -138,10 +69,13 @@ export async function requestModelOptions({
   request,
   sessionId
 }: ModelOptionsRequest): Promise<ModelOptionsResponse> {
+  // Capture the owner before either async leg; foreground source changes must
+  // not redirect a late REST recovery into another profile or connection.
+  const scope = { connectionId: connectionId || 'local', profile: profile ?? getApiRequestProfile() ?? 'default' }
   const dispatch = request ?? (gateway ? gateway.request.bind(gateway) : null)
 
   if (dispatch) {
-    const params: Record<string, unknown> = {}
+    const params: Record<string, unknown> = { profile: scope.profile }
 
     if (sessionId) {
       params.session_id = sessionId
@@ -173,7 +107,7 @@ export async function requestModelOptions({
     // catalog is already populated. Recover through the same profile-scoped
     // endpoint Settings uses, but keep the live session selection authoritative.
     try {
-      const restOptions = await restModelOptions(explicitOnly, refresh, profile)
+      const restOptions = await restModelOptions(explicitOnly, refresh, scope)
 
       if (hasSelectableModels(restOptions)) {
         return {
@@ -194,5 +128,5 @@ export async function requestModelOptions({
     throw gatewayError
   }
 
-  return restModelOptions(explicitOnly, refresh, profile)
+  return restModelOptions(explicitOnly, refresh, scope)
 }

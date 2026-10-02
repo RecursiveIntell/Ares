@@ -2955,6 +2955,8 @@ export const zh: Translations = {
   },
 
   modelPicker: {
+    selectionUnavailable: '所选提供商或模型在此配置文件中不可用。请在此配置或选择其他模型。当前选择已保留。',
+    sessionSelection: '此会话保留自己的模型选择。配置文件默认值的更改适用于新会话。',
     title: '切换模型',
     current: '当前：',
     unknown: '(未知)',

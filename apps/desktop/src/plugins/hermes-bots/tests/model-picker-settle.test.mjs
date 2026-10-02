@@ -154,7 +154,7 @@ test('#95279: the picker catalog read is cached, not force-refreshed on every mo
   // refresh here is what made every remount re-enter the loading state and
   // wipe the user's in-progress pick (#95279).
   assert.deepEqual(JSON.parse(JSON.stringify(runtime.routed)), [
-    [remoteBot.route, 'model.options', { include_unconfigured: true, explicit_only: false }]
+    [remoteBot.route, 'model.options', { profile: 'backend-default', include_unconfigured: true, explicit_only: false }]
   ])
 })
 
@@ -166,10 +166,23 @@ test('#95279: picker query stays disabled for orphaned rows and keyed active for
   const orphanQuery = runtime.query()
   assert.equal(orphanQuery.enabled, false)
 
-  // A local (non source-scoped) bot reads the ambient gateway under the
-  // stable 'active' key.
+  // A legacy local bot still keys the catalog by its target profile.
   runtime.context.__useModelOptions({ name: 'default' })
   const localQuery = runtime.query()
   assert.equal(localQuery.enabled, true)
-  assert.deepEqual(localQuery.queryKey[2], 'active')
+  assert.deepEqual(localQuery.queryKey[2], 'local')
+  assert.deepEqual(localQuery.queryKey[3], 'default')
+})
+
+test('catalog keys distinguish legacy local targets and remote backend mappings', () => {
+  const runtime = loadPickerHarness()
+  runtime.context.__useModelOptions({ name: 'local-a' })
+  const a = runtime.query().queryKey
+  runtime.context.__useModelOptions({ name: 'local-b' })
+  const b = runtime.query().queryKey
+  assert.notDeepEqual(JSON.parse(JSON.stringify(a)), JSON.parse(JSON.stringify(b)))
+  runtime.context.__useModelOptions(remoteBot)
+  const before = runtime.query().queryKey
+  runtime.context.__useModelOptions({ ...remoteBot, route: { ...remoteBot.route, targetProfile: 'another-target' } })
+  assert.notDeepEqual(JSON.parse(JSON.stringify(before)), JSON.parse(JSON.stringify(runtime.query().queryKey)))
 })

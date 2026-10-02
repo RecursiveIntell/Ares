@@ -24,7 +24,7 @@ import vm from 'node:vm'
 
 const source = readFileSync(new URL('../plugin.js', import.meta.url), 'utf8')
 
-function loadHarness({ request }) {
+function loadHarness({ request, catalog }) {
   const values = new Map()
   const atom = initial => {
     const slot = {
@@ -44,6 +44,12 @@ function loadHarness({ request }) {
     Checkbox: 'Checkbox',
     GlyphSpinner: 'GlyphSpinner',
     Input: 'Input',
+    Button: 'Button',
+    Select: 'Select',
+    SelectTrigger: 'SelectTrigger',
+    SelectValue: 'SelectValue',
+    SelectContent: 'SelectContent',
+    SelectItem: 'SelectItem',
     ScrollArea: 'ScrollArea',
     Textarea: 'Textarea',
     document: { createElement: () => ({}), getElementById: () => null, head: { appendChild: () => undefined } },
@@ -76,7 +82,7 @@ function loadHarness({ request }) {
 
       return 'notification-1'
     },
-    useQuery: () => ({ data: undefined, isLoading: false, error: null }),
+    useQuery: () => ({ data: catalog, isLoading: false, error: null }),
     useState: initial => [initial, () => undefined],
     window: { setTimeout, clearTimeout }
   }
@@ -86,10 +92,11 @@ function loadHarness({ request }) {
     .replace(/^import .* from 'react'\r?\n/m, '')
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
-    .concat('\nglobalThis.__applyAdvancedConfig = applyAdvancedConfig;')
+    .concat('\nglobalThis.__applyAdvancedConfig = applyAdvancedConfig; globalThis.__failureMessage = advancedFailureMessage; globalThis.__picker = ModelPicker;')
   vm.runInNewContext(code, context, { filename: 'plugin.js' })
 
-  return { applyAdvancedConfig: context.__applyAdvancedConfig, confirms, invalidated, routed }
+  return { applyAdvancedConfig: context.__applyAdvancedConfig, failureMessage: context.__failureMessage,
+    picker: context.__picker, confirms, invalidated, routed }
 }
 
 const bot = { name: 'zeta' }
@@ -185,4 +192,46 @@ test('unguarded saves keep the existing single-shot behavior', async () => {
   assert.equal(confirms.length, 0)
   assert.equal(res?.ok, true)
   assert.equal(res?.applied?.model, true)
+})
+
+test('configuration failure preserves staged selection and explains only bounded codes', async () => {
+  const state = { ...dirtyModelState, provider: 'ollama-launch', model: 'model-a' }
+  const { applyAdvancedConfig, failureMessage } = loadHarness({ request: async () => ({
+    ok: false, applied: { model: false, soul: true },
+    model_error: { code: 'provider_configuration_unavailable', message: 'https://fixture-user:fixture-password@host.invalid/?token=fixture-secret' }
+  }) })
+  const res = await applyAdvancedConfig(bot, state)
+  assert.equal(res.ok, false)
+  assert.equal(res.applied.soul, true)
+  assert.equal(state.provider, 'ollama-launch')
+  assert.equal(state.model, 'model-a')
+  assert.match(failureMessage(res), /provider is missing, disabled, or incomplete in this profile/)
+  assert.ok(!failureMessage(res).includes('fixture-'))
+  assert.equal(failureMessage({ applied: { model: false } }), 'Some sections failed: model')
+})
+
+function nodes(tree) {
+  if (!tree || typeof tree !== 'object') return []
+  if (Array.isArray(tree)) return tree.flatMap(nodes)
+  return [tree, ...nodes(tree.props?.children)]
+}
+
+test('cached custom alias displays its matching provider row without rewriting selection', () => {
+  const { picker } = loadHarness({ request: async () => ({}), catalog: {
+    providers: [{ slug: 'ollama-launch', name: 'Ollama Launch', aliases: ['custom:ollama-launch'], models: ['model-a'] }]
+  } })
+  const changes = []
+  const tree = picker({ value: { provider: 'custom:ollama-launch', model: 'model-a' }, onChange: patch => changes.push(patch) })
+  const selects = nodes(tree).filter(node => node.type === 'Select')
+  assert.equal(selects[0].props.value, 'ollama-launch')
+  assert.equal(selects[1].props.value, 'model-a')
+  assert.equal(changes.length, 0)
+})
+
+test('missing named provider gets a visible catalog notice and preserved input', () => {
+  const { picker } = loadHarness({ request: async () => ({}), catalog: { providers: [] } })
+  const tree = picker({ value: { provider: 'ollama-launch', model: 'model-a' }, onChange: () => assert.fail('selection changed') })
+  const notice = nodes(tree).find(node => node.props?.role === 'status')
+  assert.match(notice.props.children, /absent from this profile's catalog/)
+  assert.ok(nodes(tree).some(node => node.type === 'Input' && node.props.value === 'ollama-launch'))
 })

@@ -2433,6 +2433,8 @@ export const ja = defineLocale({
   },
 
   modelPicker: {
+    selectionUnavailable: '選択したプロバイダーまたはモデルはこのプロファイルで利用できません。ここで設定するか別のモデルを選択してください。選択は保持されます。',
+    sessionSelection: 'このセッションは独自のモデル選択を保持します。プロファイルの既定値の変更は新しいセッションに適用されます。',
     title: 'モデルを切り替え',
     current: '現在:',
     unknown: '(不明)',

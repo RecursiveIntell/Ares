@@ -89,6 +89,7 @@ export interface ModelMenuController {
 }
 
 interface ModelCatalogMenuProps {
+  connectionId?: null | string
   controller: ModelMenuController
   /** Rows appended under the catalog (Refresh Models, Edit Models, …). */
   footer?: ReactNode
@@ -122,6 +123,7 @@ const EMPTY_CATALOG_RETRY_DELAYS_MS = [250, 1_000, 3_000] as const
  * can never drift apart.
  */
 export function ModelCatalogMenu({
+  connectionId,
   controller,
   footer,
   gateway,
@@ -143,11 +145,11 @@ export function ModelCatalogMenu({
   const visibleModels = useStore($visibleModels)
 
   const modelOptions = useQuery({
-    queryKey: modelOptionsQueryKey(profile, sessionId),
+    queryKey: modelOptionsQueryKey(profile, sessionId, connectionId),
     // Gateway-first even with no session: a connected (possibly remote)
     // gateway owns the model catalog, including virtual providers the local
     // REST fallback can't know about (#53817).
-    queryFn: (): Promise<ModelOptionsResponse> => requestModelOptions({ gateway, profile, request, sessionId })
+    queryFn: (): Promise<ModelOptionsResponse> => requestModelOptions({ connectionId, gateway, profile, request, sessionId })
   })
 
   const {

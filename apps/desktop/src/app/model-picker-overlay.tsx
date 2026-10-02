@@ -12,6 +12,7 @@ import {
   $modelPickerOpen,
   setModelPickerOpen
 } from '@/store/session'
+import { knownOwnerForSession, requestForOwnedSession } from '@/store/session-states'
 import { $focusedRuntimeId, $focusedSessionState } from '@/store/session-states'
 
 interface ModelPickerOverlayProps {
@@ -46,15 +47,21 @@ export function ModelPickerOverlay({ gateway, onSelect, profile }: ModelPickerOv
     return null
   }
 
+  const owner = knownOwnerForSession(sessionId)
+  const ownerProfile = typeof owner === 'string' ? owner : (owner?.targetProfile || owner?.profile)
+  const ownerConnection = owner && typeof owner === 'object' ? owner.connectionId : owner ? 'local' : undefined
+
   return (
     <ModelPickerDialog
+      connectionId={ownerConnection}
       currentModel={currentModel}
       currentProvider={currentProvider}
       gw={gateway}
       onOpenChange={setModelPickerOpen}
       onSelect={selection => onSelect({ ...selection, sessionId })}
       open={open}
-      profile={profile}
+      profile={ownerProfile || profile}
+      request={gateway && sessionId ? (method, params) => requestForOwnedSession(sessionId, gateway.request.bind(gateway), method, params) : undefined}
       sessionId={sessionId}
     />
   )

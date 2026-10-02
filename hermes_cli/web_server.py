@@ -1801,7 +1801,15 @@ def _audio_extension_for_mime(mime_type: str) -> str:
     return _AUDIO_MIME_EXTENSIONS.get(normalized, ".webm")
 
 
-def _normalize_main_model_assignment(provider: str, model: str) -> tuple[str, str]:
+def _model_assignment_provider_category(provider: str) -> str:
+    from hermes_cli.models import normalize_provider
+    from hermes_cli.providers import normalize_provider as registry_normalize
+
+    generic = registry_normalize(provider)
+    return generic if generic in {"custom", "local"} else normalize_provider(provider)
+
+
+def _normalize_main_model_assignment(provider: str, model: str, base_url: str = "") -> tuple[str, str]:
     """Normalize a main-slot (provider, model) pair before persisting.
 
     The Models page has two assignment paths and only one of them was safe:
@@ -1843,7 +1851,7 @@ def _normalize_main_model_assignment(provider: str, model: str) -> tuple[str, st
 
     prov_in = (provider or "").strip()
     model_in = (model or "").strip()
-    canonical = normalize_provider(prov_in)
+    canonical = _model_assignment_provider_category(prov_in)
 
     # User-declared providers are real routing targets, not analytics vendor
     # labels. Resolve them before the unknown-vendor fallback. ``providers:``
@@ -1861,6 +1869,19 @@ def _normalize_main_model_assignment(provider: str, model: str) -> tuple[str, st
         prov_in,
         get_compatible_custom_providers(cfg) if isinstance(cfg, dict) else [],
     )
+    current = cfg.get("model") if isinstance(cfg, dict) else None
+    current = current if isinstance(current, dict) else {}
+    if canonical == "auto" or (
+        canonical in {"custom", "local"} and (
+            base_url or (
+                current.get("base_url")
+                and _model_assignment_provider_category(str(current.get("provider") or "")) == canonical
+                and user_provider is None
+                and (prov_in.strip().lower() == "custom" or custom_provider is None)
+            )
+        )
+    ):
+        return prov_in, model_in
     if user_provider is not None:
         return user_provider.id, model_in
     if custom_provider is not None:
@@ -1913,6 +1934,61 @@ def _normalize_main_model_assignment(provider: str, model: str) -> tuple[str, st
     return prov_in, model_in
 
 
+def _validate_model_assignment_provider(cfg: dict, provider: str, base_url: str = "") -> None:
+    """Validate selection against this target's definitions, without resolving auth.
+
+    A provider name is a reference, not a definition. In particular, never
+    borrow the launch profile's endpoint when saving another profile's model.
+    """
+    from hermes_cli.config import get_compatible_custom_providers, is_provider_enabled
+    from hermes_cli.models import _KNOWN_PROVIDER_NAMES, normalize_provider
+    from hermes_cli.providers import custom_provider_aliases, resolve_custom_provider
+
+    requested = provider.strip().lower()
+    canonical = _model_assignment_provider_category(provider)
+    current = cfg.get("model")
+    current = current if isinstance(current, dict) else {}
+    generic_endpoint = base_url or (
+        _model_assignment_provider_category(str(current.get("provider") or "")) == canonical and current.get("base_url")
+    )
+    providers_cfg = cfg.get("providers")
+    providers_cfg = providers_cfg if isinstance(providers_cfg, dict) else {}
+    # Check raw entries as well as the compatibility view: disabled entries
+    # are omitted from that view but must not fall through to a built-in alias.
+    for key, entry in providers_cfg.items():
+        matches_builtin = not requested.startswith("custom:") and canonical == _model_assignment_provider_category(str(key))
+        if matches_builtin or requested in custom_provider_aliases(str(entry.get("name") or key) if isinstance(entry, dict) else str(key), str(key)):
+            if not isinstance(entry, dict) or not is_provider_enabled(entry):
+                raise HTTPException(status_code=400, detail=f"Provider '{provider}' is disabled or invalid in this profile")
+            endpoint = entry.get("base_url") or entry.get("url") or entry.get("api")
+            builtin = _model_assignment_provider_category(str(key))
+            if matches_builtin and builtin in {"custom", "local"} and generic_endpoint:
+                return
+            if (endpoint and resolve_custom_provider(provider, get_compatible_custom_providers(cfg)) is not None) or (matches_builtin and builtin in _KNOWN_PROVIDER_NAMES and builtin not in {"custom", "local"}):
+                return
+            raise HTTPException(status_code=400, detail=f"Provider '{provider}' needs an endpoint in this profile")
+
+    legacy = cfg.get("custom_providers")
+    for entry in legacy if isinstance(legacy, list) else []:
+        if isinstance(entry, dict) and requested in custom_provider_aliases(str(entry.get("name") or ""), str(entry.get("provider_key") or "")):
+            if not is_provider_enabled(entry):
+                raise HTTPException(status_code=400, detail=f"Provider '{provider}' is disabled in this profile")
+
+    if canonical == "auto":
+        return
+    if requested != "custom" and resolve_custom_provider(provider, get_compatible_custom_providers(cfg)) is not None:
+        return
+    if canonical in {"custom", "local"}:
+        if generic_endpoint:
+            return
+        raise HTTPException(status_code=400, detail=f"Provider '{provider}' needs an explicit endpoint in this profile")
+    if resolve_custom_provider(provider, get_compatible_custom_providers(cfg)) is not None:
+        return
+    if canonical in _KNOWN_PROVIDER_NAMES:
+        return
+    raise HTTPException(status_code=400, detail=f"Provider '{provider}' is not configured in this profile; configure it here before selecting it")
+
+
 def _apply_main_model_assignment(
     model_cfg: "Any", provider: str, model: str, base_url: str = "", api_key: str = ""
 ) -> dict:
@@ -1941,15 +2017,21 @@ def _apply_main_model_assignment(
     Returns the same dict (coerced to a fresh dict if the input wasn't one) so
     callers can assign it straight back onto the model config.
     """
+    from hermes_cli.models import normalize_provider
+
     if not isinstance(model_cfg, dict):
         model_cfg = {}
     prev_provider = str(model_cfg.get("provider") or "").strip().lower()
     new_provider = provider.strip().lower()
+    previous_url = str(model_cfg.get("base_url") or "").strip()
+    endpoint_changed = bool(base_url.strip() and previous_url and base_url.strip() != previous_url)
+    same_generic_endpoint = bool(previous_url) and not endpoint_changed and _model_assignment_provider_category(prev_provider) in {"custom", "local"} and _model_assignment_provider_category(prev_provider) == _model_assignment_provider_category(new_provider)
+    provider_changed = (new_provider != prev_provider and not same_generic_endpoint) or endpoint_changed
     model_cfg["provider"] = provider
     model_cfg["default"] = model
     if base_url.strip():
         model_cfg["base_url"] = base_url.strip()
-    elif model_cfg.get("base_url") and new_provider != prev_provider:
+    elif model_cfg.get("base_url") and provider_changed:
         # Switching providers: the old URL belonged to the old provider, drop
         # it so the new provider's default endpoint is used. Same-provider
         # re-assignment keeps the user's configured base_url intact.
@@ -1961,14 +2043,14 @@ def _apply_main_model_assignment(
     if api_key.strip():
         model_cfg["api_key"] = api_key.strip()
         model_cfg.pop("api", None)
-    elif (model_cfg.get("api_key") or model_cfg.get("api")) and new_provider != prev_provider:
+    elif (model_cfg.get("api_key") or model_cfg.get("api")) and provider_changed:
         # A stale endpoint secret can live under the legacy ``api`` alias with
         # no ``api_key`` (the resolver still reads ``model.api`` as a key), so
         # the switch-clears-the-key path must trigger on either field — else the
         # old endpoint's secret survives in config.yaml and contaminates a later
         # custom resolution. clear_model_endpoint_credentials scrubs both.
         clear_model_endpoint_credentials(model_cfg, clear_api_mode=False)
-    if new_provider != prev_provider:
+    if provider_changed:
         clear_model_endpoint_credentials(model_cfg, clear_api_key=False)
     model_cfg.pop("context_length", None)
     return model_cfg
@@ -7760,11 +7842,14 @@ def _apply_model_assignment_sync(
     if scope == "main":
         if not provider or not model:
             raise HTTPException(status_code=400, detail="provider and model required for main")
-        provider, model = _normalize_main_model_assignment(provider, model)
+        _validate_model_assignment_provider(cfg, provider, base_url)
+        # An explicit generic endpoint must not bind to an unrelated saved custom row.
+        provider, model = _normalize_main_model_assignment(provider, model, base_url=base_url)
         providers_cfg = cfg.get("providers")
         provider_entry = providers_cfg.get(provider) if isinstance(providers_cfg, dict) else None
-        if not base_url and isinstance(provider_entry, dict) and provider_entry.get("base_url"):
-            base_url = str(provider_entry.get("base_url") or "").strip()
+        previous = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+        if not base_url and isinstance(provider_entry, dict) and (previous.get("provider") != provider or not previous.get("base_url")):
+            base_url = str(provider_entry.get("base_url") or provider_entry.get("url") or provider_entry.get("api") or "").strip()
         model_cfg = _apply_main_model_assignment(
             cfg.get("model", {}), provider, model, base_url, api_key
         )
@@ -15116,9 +15201,14 @@ def _write_profile_model(profile_dir: Path, provider: str, model: str) -> None:
 
     token = set_hermes_home_override(str(profile_dir))
     try:
-        provider, model = _normalize_main_model_assignment(provider, model)
         cfg = load_config()
-        cfg["model"] = _apply_main_model_assignment(cfg.get("model", {}), provider, model)
+        _validate_model_assignment_provider(cfg, provider)
+        provider, model = _normalize_main_model_assignment(provider, model)
+        providers_cfg = cfg.get("providers")
+        entry = providers_cfg.get(provider) if isinstance(providers_cfg, dict) else None
+        previous = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+        endpoint = str(entry.get("base_url") or entry.get("url") or entry.get("api") or "") if isinstance(entry, dict) and (previous.get("provider") != provider or not previous.get("base_url")) else ""
+        cfg["model"] = _apply_main_model_assignment(cfg.get("model", {}), provider, model, base_url=endpoint)
         save_config(cfg)
     finally:
         reset_hermes_home_override(token)
