@@ -475,6 +475,7 @@ describe('useComposerSubmit with a clarify parked on the session', () => {
 
     await waitFor(() =>
       expect(gatewayRequest).toHaveBeenCalledWith('clarify.respond', {
+        session_id: 'runtime-session',
         request_id: 'req-runtime-session',
         answer: ''
       })
@@ -494,7 +495,11 @@ describe('useComposerSubmit with a clarify parked on the session', () => {
     })
 
     await waitFor(() => expect(onSteer).toHaveBeenCalledWith('change course'))
-    expect(gatewayRequest).toHaveBeenCalledWith('clarify.respond', { request_id: 'req-runtime-session', answer: '' })
+    expect(gatewayRequest).toHaveBeenCalledWith('clarify.respond', {
+      session_id: 'runtime-session',
+      request_id: 'req-runtime-session',
+      answer: ''
+    })
   })
 
   it('leaves the question alone for an empty Enter (Stop, not an answer)', () => {

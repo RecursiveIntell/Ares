@@ -446,7 +446,7 @@ test('uncertain submit transport failure keeps an admission marker and never ret
 
 test('durable storage and an actual mirror roundtrip retain delivery proof and suppress a copied ID', async () => {
   const h = await harness({ alpha: [s => ({ turn_outcomes: wire(s.ref) })] }, { members: [ALPHA],
-    onPoll: (s, gc) => assert.deepEqual(h.storageWrites.get('group-chats').Room.stranded.alpha.delivery.accepted_turn, s.ref) })
+    onPoll: s => assert.deepEqual(h.storageWrites.get('group-chats').Room.stranded.alpha.delivery.accepted_turn, s.ref) })
   await h.gc.runGroupChatRounds('Room', [ALPHA], 'thread-1')
   const durable = clone(h.storageWrites.get('group-chats'))
   const receipt = durable.Room.log.find(entry => entry.from.kind === 'member').delivery
