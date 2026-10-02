@@ -175,6 +175,9 @@ def test_once_turn_runs_effective_model_then_restores_original_after_refresh(env
     original = server._snapshot_agent_model_runtime(env.old)
     original["model"] = "after-once"
     env.session["one_turn_model_restore"] = original
+    env.session["_one_turn_model_runtime"] = {
+        "session": env.session, "agent": env.old, "sid": SID, "active": False,
+    }
     receipt = server._accept_tui_context_input(env.session, "once input", event_id="once")
     server._run_prompt_submit("once-request", SID, env.session, "once input",
                               context_input_event_id=receipt.event_id)
