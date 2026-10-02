@@ -1167,6 +1167,178 @@ export const markComposerSelectionManual = (): void => {
   setCurrentModelSource('manual')
 }
 
+export interface ComposerModelOwner {
+  connectionId: string | null
+  profile: string
+  targetProfile?: string
+}
+
+export interface ComposerModelSelection {
+  readonly owner: Readonly<ComposerModelOwner>
+  readonly model: string
+  readonly provider: string
+  readonly source: 'default' | 'manual'
+  readonly selectionGeneration: number
+  readonly ownerEpoch: number
+}
+
+export interface ComposerModelSelectionTicket {
+  readonly owner: Readonly<ComposerModelOwner>
+  readonly ownerKey: string
+  readonly ownerEpoch: number
+  readonly selectionGeneration: number
+  readonly requestGeneration: number
+}
+
+// Global atoms are presentation only: a saved or ambient pair has no proven
+// route. Only explicit producer receipts enter this bounded window-local map.
+const composerModelSelections = new Map<string, ComposerModelSelection>()
+const composerModelRequests = new Map<string, number>()
+let composerModelOwnerKey: string | null = null
+let composerModelOwnerEpoch = 0
+let composerModelRequestGeneration = 0
+
+function composerModelOwner(owner: ComposerModelOwner): Readonly<ComposerModelOwner> {
+  const connectionId = owner.connectionId === null ? null : owner.connectionId.trim()
+
+  if (connectionId === '') {
+    throw new Error('A composer model selection requires an explicit connection owner')
+  }
+
+  const profile = owner.profile.trim() || 'default'
+
+  return Object.freeze({ connectionId, profile, targetProfile: owner.targetProfile?.trim() || profile })
+}
+
+function composerModelOwnerKeyFor(owner: ComposerModelOwner): string {
+  const normalized = composerModelOwner(owner)
+
+  return JSON.stringify([normalized.connectionId, normalized.profile, normalized.targetProfile])
+}
+
+function boundComposerModelMap<T>(values: Map<string, T>): void {
+  while (values.size > 256) {
+    const oldest = values.keys().next().value
+
+    if (oldest !== undefined) {
+      values.delete(oldest)
+    }
+  }
+}
+
+/** Foreground draft transitions invalidate pending defaults, including A→B→A.
+ *  Known route-qualified manual pins survive. Live tile writes do not call this. */
+export function setComposerModelSelectionOwner(owner: ComposerModelOwner): void {
+  const key = composerModelOwnerKeyFor(owner)
+
+  if (key !== composerModelOwnerKey) {
+    composerModelOwnerKey = key
+    composerModelOwnerEpoch += 1
+  }
+}
+
+/** Capture before an async read/save; manual repaint captures AFTER its existing
+ *  markComposerSelectionManual. This never changes the foreground draft owner. */
+export function captureComposerModelSelection(owner: ComposerModelOwner): ComposerModelSelectionTicket {
+  const normalized = composerModelOwner(owner)
+  const ownerKey = composerModelOwnerKeyFor(normalized)
+  const requestGeneration = ++composerModelRequestGeneration
+  composerModelRequests.set(ownerKey, requestGeneration)
+  boundComposerModelMap(composerModelRequests)
+
+  return Object.freeze({
+    owner: normalized,
+    ownerKey,
+    ownerEpoch: composerModelOwnerEpoch,
+    selectionGeneration: composerSelectionGeneration,
+    requestGeneration
+  })
+}
+
+function ownsComposerModelSelection(ticket: ComposerModelSelectionTicket): boolean {
+  return (
+    ticket.ownerKey === composerModelOwnerKeyFor(ticket.owner) &&
+    ticket.ownerEpoch === composerModelOwnerEpoch &&
+    ticket.selectionGeneration === composerSelectionGeneration &&
+    composerModelRequests.get(ticket.ownerKey) === ticket.requestGeneration
+  )
+}
+
+export function getComposerModelSelection(owner: ComposerModelOwner): ComposerModelSelection | null {
+  const value = composerModelSelections.get(composerModelOwnerKeyFor(owner))
+
+  return value && (value.source === 'manual' || value.ownerEpoch === composerModelOwnerEpoch) ? value : null
+}
+
+/** Record the complete explicit pair, without painting atoms or creating a user
+ *  intent. A default cannot replace this owner's deliberate manual selection. */
+export function recordComposerModelSelection(
+  ticket: ComposerModelSelectionTicket,
+  selection: Pick<ComposerModelSelection, 'model' | 'provider' | 'source'>
+): ComposerModelSelection | null {
+  const model = selection.model.trim()
+  const provider = selection.provider.trim()
+  const previous = composerModelSelections.get(ticket.ownerKey)
+
+  if (
+    !model ||
+    !provider ||
+    !ownsComposerModelSelection(ticket) ||
+    (selection.source === 'default' && (ticket.ownerKey !== composerModelOwnerKey || previous?.source === 'manual'))
+  ) {
+    return null
+  }
+
+  const value = Object.freeze({
+    owner: ticket.owner,
+    model,
+    provider,
+    source: selection.source,
+    selectionGeneration: ticket.selectionGeneration,
+    ownerEpoch: ticket.ownerEpoch
+  })
+
+  composerModelSelections.set(ticket.ownerKey, value)
+  boundComposerModelMap(composerModelSelections)
+
+  return value
+}
+
+/** Conditional rollback of the exact published selection. Call only after the
+ *  existing intent/foreground guards; never derive a baseline from global atoms. */
+export function restoreComposerModelSelection(
+  ticket: ComposerModelSelectionTicket,
+  previous: ComposerModelSelection | null,
+  expected: ComposerModelSelection
+): boolean {
+  if (
+    !ownsComposerModelSelection(ticket) ||
+    composerModelSelections.get(ticket.ownerKey) !== expected ||
+    (previous && composerModelOwnerKeyFor(previous.owner) !== ticket.ownerKey)
+  ) {
+    return false
+  }
+
+  if (previous) {
+    composerModelSelections.set(
+      ticket.ownerKey,
+      Object.freeze({ ...previous, selectionGeneration: ticket.selectionGeneration, ownerEpoch: ticket.ownerEpoch })
+    )
+  } else {
+    composerModelSelections.delete(ticket.ownerKey)
+  }
+
+  return true
+}
+
+/** @internal Reset window-local receipts for isolated behavioral tests. */
+export function _resetComposerModelSelectionsForTests(): void {
+  composerModelSelections.clear()
+  composerModelRequests.clear()
+  composerModelOwnerKey = null
+  composerModelOwnerEpoch += 1
+}
+
 export const setCurrentReasoningEffort = (next: Updater<string>) => {
   updateAtom($currentReasoningEffort, next)
   persistString(COMPOSER_EFFORT_KEY, $currentReasoningEffort.get() || null)

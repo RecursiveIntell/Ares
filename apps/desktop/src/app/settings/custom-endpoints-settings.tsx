@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react'
 
+import { beginMainModelSave, ownsMainModelSave } from '@/app/session/hooks/composer-model-selection-owner'
+import type { OnMainModelChanged } from '@/app/session/hooks/composer-model-selection-owner'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
@@ -21,7 +23,7 @@ import { EmptyState, Pill, SectionHeading, SettingsContent, SettingsSkeleton } f
 
 interface CustomEndpointsSettingsProps {
   onConfigSaved?: () => void
-  onMainModelChanged?: (provider: string, model: string) => void
+  onMainModelChanged?: OnMainModelChanged
 }
 
 interface EndpointForm {
@@ -125,9 +127,16 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
   }, [])
 
   async function handleSave() {
+    const origin = beginMainModelSave()
+
     try {
       setSaving(true)
       const response = await saveCustomEndpoint(toPayload(form, discoveredModels))
+
+      if (!ownsMainModelSave(origin)) {
+        return
+      }
+
       setEndpoints(response.endpoints)
       const saved = response.endpoints.find(endpoint => endpoint.id === response.id)
 
@@ -137,7 +146,7 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
       }
 
       if (saved && saved.is_current) {
-        onMainModelChanged?.(saved.id, saved.model)
+        onMainModelChanged?.({ ...origin, provider: saved.id, model: saved.model })
       }
 
       triggerHaptic('success')
@@ -181,12 +190,24 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
   }
 
   async function handleActivate(endpoint: CustomEndpoint) {
+    const origin = beginMainModelSave()
+
     try {
       setActivating(endpoint.id)
       const response = await activateCustomEndpoint(endpoint.id)
+
+      if (!ownsMainModelSave(origin)) {
+        return
+      }
+
       await refresh()
+
+      if (!ownsMainModelSave(origin)) {
+        return
+      }
+
       onConfigSaved?.()
-      onMainModelChanged?.(response.provider, response.model)
+      onMainModelChanged?.({ ...origin, provider: response.provider, model: response.model })
       triggerHaptic('success')
     } catch (err) {
       notifyError(err, 'Activation failed')

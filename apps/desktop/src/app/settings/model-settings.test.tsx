@@ -3,6 +3,12 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { MemoryRouter } from 'react-router'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { getApiRequestConnection, setApiRequestConnection, setApiRequestProfile } from '@/api/client'
+import { $activeGatewayProfile, $newChatProfile, $newChatRoute } from '@/store/profile'
+import { _resetComposerModelSelectionsForTests } from '@/store/session'
+
+import { deferred } from '../../test/deferred'
+
 // Radix Select calls scrollIntoView on its items when the content opens; jsdom
 // doesn't implement it (nor hasPointerCapture / releasePointerCapture), so stub
 // them to let the dropdown open in tests.
@@ -56,6 +62,12 @@ vi.mock('../hooks/use-on-profile-switch', () => ({
 }))
 
 beforeEach(() => {
+  _resetComposerModelSelectionsForTests()
+  $newChatRoute.set(null)
+  $newChatProfile.set(null)
+  $activeGatewayProfile.set('default')
+  setApiRequestConnection(null)
+  setApiRequestProfile('default')
   getGlobalModelInfo.mockResolvedValue({ provider: 'nous', model: 'hermes-4' })
   getGlobalModelOptions.mockResolvedValue({
     providers: [
@@ -86,7 +98,7 @@ afterEach(() => {
   profileSwitchHandler = null
 })
 
-async function renderModelSettings(scopeProfile?: string) {
+async function renderModelSettings(scopeProfile?: string, onMainModelChanged = vi.fn()) {
   const { ModelSettings } = await import('./model-settings')
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
 
@@ -95,13 +107,51 @@ async function renderModelSettings(scopeProfile?: string) {
     // needs a router context in tests (the app provides HashRouter at root).
     <MemoryRouter>
       <QueryClientProvider client={client}>
-        <ModelSettings scopeProfile={scopeProfile} />
+        <ModelSettings onMainModelChanged={onMainModelChanged} scopeProfile={scopeProfile} />
       </QueryClientProvider>
     </MemoryRouter>
   )
 }
 
 describe('ModelSettings profile scope', () => {
+  it('carries the original source/profile/target through an asynchronous save callback', async () => {
+    const owner = { connectionId: 'source-a', profile: 'specialist', targetProfile: 'backend-a' }
+    $newChatRoute.set(owner)
+    $newChatProfile.set(owner.profile)
+    $activeGatewayProfile.set(owner.profile)
+    setApiRequestConnection(owner.connectionId)
+    setApiRequestProfile(owner.profile)
+    const pending = deferred<unknown>()
+    setModelAssignment.mockReturnValueOnce(pending.promise)
+    const changed = vi.fn()
+    await renderModelSettings(undefined, changed)
+    fireEvent.click(await screen.findByRole('button', { name: 'Apply' }))
+    await waitFor(() => expect(setModelAssignment).toHaveBeenCalledOnce())
+    const originalSource = getApiRequestConnection()
+    setApiRequestConnection('source-b')
+    pending.resolve({ ok: true, provider: 'nous', model: 'hermes-4', gateway_tools: [] })
+    await waitFor(() => expect(changed).toHaveBeenCalledOnce())
+    expect(changed).toHaveBeenCalledWith(
+      expect.objectContaining({
+        owner,
+        model: 'hermes-4',
+        provider: 'nous',
+        startedAtGeneration: expect.any(Number),
+        saveIntent: expect.objectContaining({ target: JSON.stringify(['source-a', 'specialist', 'backend-a']) })
+      })
+    )
+    expect(originalSource).toBe('source-a')
+  })
+
+  it('publishes no callback or receipt when the main-model save fails', async () => {
+    setModelAssignment.mockRejectedValueOnce(new Error('fixture-save-failed'))
+    const changed = vi.fn()
+    await renderModelSettings(undefined, changed)
+    fireEvent.click(await screen.findByRole('button', { name: 'Apply' }))
+    await screen.findByText('fixture-save-failed')
+    expect(changed).not.toHaveBeenCalled()
+  })
+
   // #90549: the API helpers treat `null` as "deliberately target the
   // primary/default profile". A page following the active profile must pass
   // `undefined`, or every read repaints the primary's model and the user's
