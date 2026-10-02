@@ -270,6 +270,50 @@ failed archival, or failed verification is blocked/failed evidence—not
 approval. The controller must still review uncertainty, dissent, relevance,
 and next gates.
 
+### Offline specialist proposal artifacts
+
+The `hermes specialists` command captures source-scoped coverage and produces
+inert proposal artifacts from files you name. Check the command help through
+the generated `hermes` console entry point or the supported module entry point:
+
+```bash
+hermes specialists --help
+python -m hermes_cli.main specialists --help
+```
+
+Provide the coverage scope manifest, a `SpecialistNeedV1` JSON artifact, the
+coverage snapshot, and an assessment JSON explicitly. The scope manifest names
+the approved root and relative source files; the schemas for need, coverage,
+and proposal artifacts are in `ares_runtime/schemas/`.
+
+```bash
+hermes specialists capture-coverage \
+  --scope ./coverage-scope.json --out ./coverage-snapshot.json
+hermes specialists detect \
+  --need ./need.json --coverage ./coverage-snapshot.json \
+  --assessment ./assessment.json \
+  --out /chosen/private/specialist-proposals
+hermes specialists replay --bundle /chosen/private/specialist-proposals
+```
+
+Choose the `detect --out` directory yourself, outside profile homes. The
+command requests mode `0700` for a new directory, subject to the process
+umask, or refuses an existing directory with group/world permissions; it does
+not discover profile homes or guarantee that your chosen path is outside
+them. Read `manifest.json` to find the proposal artifact path for
+`hermes specialists show --proposal`.
+Capture and detection use only the named inputs. Replay validates the stored
+bundle and deterministically checks its proposal without modifying the bundle.
+Coverage capture enumerates the roster directory named in the caller-provided
+scope manifest and reads the relative source files declared there; it does not
+discover profile homes or resolve runtime permissions. The artifact flow does
+not contact providers, construct or dispatch specialists, admit standing
+workers, or activate a specialist.
+Use the generated `hermes` console script or `python -m hermes_cli.main`;
+direct `python hermes_cli/main.py` invocation is outside the tested scope.
+The current validation is Linux-only and does not certify Windows/macOS or
+crash/power-loss behavior.
+
 ### Explicit specialist dispatch
 
 The committed Ares runtime also exposes `ares specialist`, which submits an
