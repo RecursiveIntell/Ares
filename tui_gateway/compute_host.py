@@ -766,6 +766,7 @@ class ComputeHost:
                     cols=int(frame.get("cols") or 80),
                     cwd=str(frame.get("cwd") or "") or None,
                     session_db=session_db,
+                    profile_home=profile_home or None,
                     source=frame.get("source"),
                 )
             finally:
@@ -777,6 +778,7 @@ class ComputeHost:
             server._sessions[sid] = {
                 "agent": agent,
                 "session_key": key,
+                "profile_home": profile_home or None,
                 "history": list(history),
                 "history_lock": threading.Lock(),
                 "history_version": int(frame.get("history_version") or 0),

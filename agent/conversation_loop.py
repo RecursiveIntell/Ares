@@ -3403,6 +3403,10 @@ def run_conversation(
                     _dispatched_session = agent.session_id
 
                     def _record_physical(call, kwargs):
+                        # Capture before the call: fallback/cleanup can restore
+                        # the live agent before the accepted response is read.
+                        dispatched_base_url = getattr(agent, "base_url", None)
+                        dispatched_api_mode = getattr(agent, "api_mode", None)
                         value = call(kwargs)
                         if (
                             _route_turn_token is not None
@@ -3417,6 +3421,8 @@ def run_conversation(
                                 attempt_id=f"{api_request_id}:{retry_count}",
                                 provider=_dispatched_provider,
                                 model=_dispatched_model,
+                                base_url=dispatched_base_url,
+                                api_mode=dispatched_api_mode,
                                 served_model=(getattr(value, "model", None)
                                               if isinstance(getattr(value, "model", None), str)
                                               else None),

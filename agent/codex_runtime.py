@@ -691,6 +691,18 @@ def run_codex_app_server_turn(
     Called from run_conversation() when agent.api_mode == "codex_app_server".
     Returns the same dict shape as the chat_completions path.
     """
+    from ares_runtime.continuity.runtime import ContextDispatchError, context_dispatch_required
+
+    subscription_only_trial = context_dispatch_required(agent)
+    if subscription_only_trial:
+        # The child owns its HTTP body, physical attempts, token spending and
+        # tool effects. Local RPC framing/auth checks cannot qualify those
+        # boundaries. Keep the existing continuity authority fail-closed.
+        existing = getattr(agent, "_codex_session", None)
+        if existing is not None:
+            existing.close()
+            agent._codex_session = None
+        raise ContextDispatchError("PROVIDER_CONTEXT_RESET_UNQUALIFIED")
     # Defense in depth for compression.checkpoint_required: agent init
     # already refuses this combination, but api_mode is a plain attribute a
     # future code path could mutate on a live agent. Fail closed before the
@@ -709,6 +721,14 @@ def run_codex_app_server_turn(
         CodexAppServerSession,
         _ServerRequestRouting,
     )
+
+    existing = getattr(agent, "_codex_session", None)
+    if existing is not None and not existing.matches_route(
+        model=getattr(agent, "model", None), provider=getattr(agent, "provider", None),
+        subscription_only_trial=subscription_only_trial,
+    ):
+        existing.close()
+        agent._codex_session = None
 
     # Lazy session: one CodexAppServerSession per AIAgent instance.
     # Spawned on first turn, reused across turns, closed at AIAgent
@@ -756,6 +776,9 @@ def run_codex_app_server_turn(
         # Supersedes the narrower item/started-only bridge from #38835.
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
+            model=getattr(agent, "model", None),
+            provider=getattr(agent, "provider", None),
+            subscription_only_trial=subscription_only_trial,
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,
@@ -810,6 +833,12 @@ def run_codex_app_server_turn(
     # This runtime bypasses the normal conversation-loop finalizer. Mirror its
     # interrupt handoff/cleanup so a hard stop cannot poison the next turn and a
     # message-bearing compatibility interrupt can still be replayed by callers.
+    completed = bool(getattr(turn, "completed", False)) and not turn.interrupted and turn.error is None
+    final_response = turn.final_text if completed else ""
+    partial_response = (
+        getattr(turn, "partial_text", "") or turn.final_text
+    ) if not completed else ""
+    error = turn.error if completed or turn.error else "Codex turn did not report a matching completed terminal"
     _user_interrupted = bool(
         turn.interrupted and getattr(agent, "_interrupt_requested", False)
     )
@@ -908,7 +937,7 @@ def run_codex_app_server_turn(
 
     # External memory provider sync (mirrors line ~15439). Skipped on
     # interrupt/error to avoid feeding partial transcripts to memory.
-    if not turn.interrupted and turn.error is None:
+    if completed:
         try:
             agent._sync_external_memory_for_turn(
                 original_user_message=original_user_message,
@@ -923,8 +952,8 @@ def run_codex_app_server_turn(
     # path (line ~15449). Only fires when a trigger actually tripped AND
     # we have a real final response.
     if (
-        turn.final_text
-        and not turn.interrupted
+        final_response
+        and completed
         and (should_review_memory or should_review_skills)
     ):
         try:
@@ -937,18 +966,19 @@ def run_codex_app_server_turn(
             logger.debug("background review spawn raised", exc_info=True)
 
     return {
-        "final_response": turn.final_text,
+        "final_response": final_response,
+        "partial_response": partial_response,
         "messages": messages,
         "api_calls": api_calls,
-        "completed": not turn.interrupted and turn.error is None,
-        "partial": turn.interrupted or turn.error is not None,
+        "completed": completed,
+        "partial": not completed,
         "interrupted": _user_interrupted,
         **(
             {"interrupt_message": _interrupt_message}
             if _interrupt_message
             else {}
         ),
-        "error": turn.error,
+        "error": error,
         # The codex app-server runtime IS an early-return path that bypasses
         # conversation_loop, but we flush the projected assistant/tool messages
         # ourselves above (see the _flush_messages_to_session_db call after
