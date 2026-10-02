@@ -80,6 +80,29 @@ class TestOllamaCloudCredentials:
         assert result["api_key"] == "ollama-key"
         assert result["base_url"] == "https://ollama.com/v1"
 
+    def test_explicit_cloud_selection_does_not_borrow_openai_key(self, monkeypatch):
+        """A missing Cloud key must fail closed even when OpenAI is configured."""
+        from hermes_cli.runtime_provider import AuthError, resolve_runtime_provider
+
+        monkeypatch.delenv("OLLAMA_API_KEY", raising=False)
+        monkeypatch.setenv("OPENAI_API_KEY", "unrelated-openai-key")
+
+        with pytest.raises(AuthError, match="ollama-cloud"):
+            resolve_runtime_provider(requested="ollama-cloud")
+
+    def test_cloud_runtime_resolution_does_not_log_api_key(self, monkeypatch, caplog):
+        """Resolving the explicit route must not expose its key in logs."""
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        key = "ollama-cloud-test-secret-never-log"
+        monkeypatch.setenv("OLLAMA_API_KEY", key)
+
+        with caplog.at_level("DEBUG"):
+            result = resolve_runtime_provider(requested="ollama-cloud")
+
+        assert result["api_key"] == key
+        assert key not in caplog.text
+
 
 # ── Model Catalog (dynamic — no static list) ──
 
@@ -107,6 +130,114 @@ class TestOllamaCloudModelCatalog:
 
         assert len(result) > 0
         assert "qwen3.5:397b" in result
+
+    def test_catalog_uses_the_active_profile_secret_scope(self, tmp_path, monkeypatch):
+        """Catalog discovery must not borrow the process default profile's key."""
+        from agent import secret_scope
+        from hermes_cli import models
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("OLLAMA_API_KEY", "ambient-root-key")
+        monkeypatch.setenv("OLLAMA_BASE_URL", "https://ambient-root.example/v1")
+        multiplex_was_active = secret_scope.is_multiplex_active()
+        secret_scope.set_multiplex_active(True)
+        token = secret_scope.set_secret_scope({
+            "OLLAMA_API_KEY": "active-profile-key",
+            "OLLAMA_BASE_URL": "https://active-profile.example/v1",
+        })
+        captured = {}
+        monkeypatch.setattr(models, "_load_ollama_cloud_cache", lambda **_: None)
+        monkeypatch.setattr(models, "_save_ollama_cloud_cache", lambda _: None)
+        monkeypatch.setattr(
+            models,
+            "fetch_api_models",
+            lambda api_key, base_url, **_: (
+                captured.update(api_key=api_key, base_url=base_url)
+                or ["account-model-id"]
+            ),
+        )
+        monkeypatch.setattr("agent.models_dev.list_agentic_models", lambda _: [])
+        try:
+            result = models.fetch_ollama_cloud_models(force_refresh=True)
+        finally:
+            secret_scope.reset_secret_scope(token)
+            secret_scope.set_multiplex_active(multiplex_was_active)
+
+        assert captured == {
+            "api_key": "active-profile-key",
+            "base_url": "https://active-profile.example/v1",
+        }
+        assert result == ["account-model-id"]
+
+    def test_catalog_skips_live_lookup_when_multiplex_scope_is_missing(
+        self, tmp_path, monkeypatch
+    ):
+        """An unscoped picker must not probe Ollama with another profile's key."""
+        from agent import secret_scope
+        from hermes_cli import models
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("OLLAMA_API_KEY", "ambient-root-key")
+        monkeypatch.setenv("OLLAMA_BASE_URL", "https://ambient-root.example/v1")
+        multiplex_was_active = secret_scope.is_multiplex_active()
+        secret_scope.set_multiplex_active(True)
+        token = secret_scope.set_secret_scope(None)
+        calls = []
+        monkeypatch.setattr(models, "_load_ollama_cloud_cache", lambda **_: None)
+        monkeypatch.setattr(models, "_save_ollama_cloud_cache", lambda _: None)
+        monkeypatch.setattr(
+            models,
+            "fetch_api_models",
+            lambda *args, **kwargs: (
+                calls.append((args, kwargs)) or ["account-model-id"]
+            ),
+        )
+        monkeypatch.setattr("agent.models_dev.list_agentic_models", lambda _: [])
+        try:
+            result = models.fetch_ollama_cloud_models(force_refresh=True)
+        finally:
+            secret_scope.reset_secret_scope(token)
+            secret_scope.set_multiplex_active(multiplex_was_active)
+
+        assert calls == []
+        assert result == []
+
+    def test_catalog_ignores_ambient_base_url_when_profile_url_is_missing(
+        self, tmp_path, monkeypatch
+    ):
+        """An unscoped custom URL must not redirect a profile's Cloud key."""
+        from agent import secret_scope
+        from hermes_cli import models
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("OLLAMA_API_KEY", "ambient-root-key")
+        monkeypatch.setenv("OLLAMA_BASE_URL", "https://ambient-root.example/v1")
+        multiplex_was_active = secret_scope.is_multiplex_active()
+        secret_scope.set_multiplex_active(True)
+        token = secret_scope.set_secret_scope({"OLLAMA_API_KEY": "active-profile-key"})
+        captured = {}
+        monkeypatch.setattr(models, "_load_ollama_cloud_cache", lambda **_: None)
+        monkeypatch.setattr(models, "_save_ollama_cloud_cache", lambda _: None)
+        monkeypatch.setattr(
+            models,
+            "fetch_api_models",
+            lambda api_key, base_url, **_: (
+                captured.update(api_key=api_key, base_url=base_url)
+                or ["account-model-id"]
+            ),
+        )
+        monkeypatch.setattr("agent.models_dev.list_agentic_models", lambda _: [])
+        try:
+            result = models.fetch_ollama_cloud_models(force_refresh=True)
+        finally:
+            secret_scope.reset_secret_scope(token)
+            secret_scope.set_multiplex_active(multiplex_was_active)
+
+        assert captured == {
+            "api_key": "active-profile-key",
+            "base_url": "https://ollama.com/v1",
+        }
+        assert result == ["account-model-id"]
 
 
 # ── Model Picker (list_authenticated_providers) ──
@@ -207,6 +338,10 @@ class TestOllamaCloudModelNormalization:
 
     def test_passthrough_no_tag(self):
         assert normalize_model_for_provider("glm-5", "ollama-cloud") == "glm-5"
+
+    def test_preserves_account_returned_tagged_id(self):
+        model_id = "provider-model-name:account-tag"
+        assert normalize_model_for_provider(model_id, "ollama-cloud") == model_id
 
 
 # ── URL-to-Provider Mapping ──
