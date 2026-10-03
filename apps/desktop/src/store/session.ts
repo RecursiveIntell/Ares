@@ -1270,8 +1270,9 @@ export function getComposerModelSelection(owner: ComposerModelOwner): ComposerMo
   return value && (value.source === 'manual' || value.ownerEpoch === composerModelOwnerEpoch) ? value : null
 }
 
-/** Record the complete explicit pair, without painting atoms or creating a user
- *  intent. A default cannot replace this owner's deliberate manual selection. */
+/** Record an explicit model (provider is optional for scalar/legacy defaults),
+ *  without painting atoms or creating a user intent. A default cannot replace
+ *  this owner's deliberate manual selection. */
 export function recordComposerModelSelection(
   ticket: ComposerModelSelectionTicket,
   selection: Pick<ComposerModelSelection, 'model' | 'provider' | 'source'>
@@ -1282,7 +1283,6 @@ export function recordComposerModelSelection(
 
   if (
     !model ||
-    !provider ||
     !ownsComposerModelSelection(ticket) ||
     (selection.source === 'default' && (ticket.ownerKey !== composerModelOwnerKey || previous?.source === 'manual'))
   ) {

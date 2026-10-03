@@ -13,6 +13,7 @@ import {
   deleteSession,
   getAllSessionMessages,
   getApiRequestConnection,
+  getGlobalModelInfo,
   getLatestSessionMessages,
   getSession,
   type ProfileScope,
@@ -102,6 +103,7 @@ vi.mock('@/hermes', async importOriginal => ({
   ...(await importOriginal<Record<string, unknown>>()),
   deleteSession: vi.fn(),
   getSession: vi.fn(),
+  getGlobalModelInfo: vi.fn(async () => ({ model: '', provider: '' })),
   getAllSessionMessages: vi.fn(),
   getLatestSessionMessages: vi.fn(),
   listAllProfileSessions: vi.fn(),
@@ -4198,6 +4200,7 @@ describe('owner-qualified first-send admission', () => {
     expect(requestGatewayForAgent).not.toHaveBeenCalled()
     expect(ambient).not.toHaveBeenCalled()
     expect(getComposerModelSelection(b)).toBeNull()
+    expect(getGlobalModelInfo).toHaveBeenLastCalledWith({ connectionId: 'source-b', profile: 'backend-b' })
     recordTestDraftModel('model-b', 'provider-b')
     await act(async () => {
       await new Promise(resolve => setTimeout(resolve, 0))

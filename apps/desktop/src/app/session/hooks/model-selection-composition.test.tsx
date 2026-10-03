@@ -239,7 +239,11 @@ beforeEach(() => {
     .mockResolvedValue({ session_id: 'composition-created', stored_session_id: null } as never)
   vi.mocked(getGlobalModelInfo)
     .mockReset()
-    .mockImplementation(async () => (getApiRequestConnection() === b.connectionId ? wireB : wireA))
+    .mockImplementation(async scope =>
+      (scope && typeof scope === 'object' ? scope.connectionId : getApiRequestConnection()) === b.connectionId
+        ? wireB
+        : wireA
+    )
   vi.mocked(getGlobalModelOptions)
     .mockReset()
     .mockResolvedValue({
@@ -285,7 +289,7 @@ describe('actual producer/store/admission composition', () => {
     expect(value.request).toHaveBeenCalledWith('session.create', expect.objectContaining(defaultA))
   })
 
-  it('refuses immediate A→B Send, ignores delayed A, then admits the actual B default', async () => {
+  it('refuses an unreadable B admission, ignores delayed A, then admits the actual B default', async () => {
     const value = await setup()
     const oldA = deferred<typeof defaultA>()
     vi.mocked(getGlobalModelInfo).mockReturnValueOnce(oldA.promise)
@@ -297,6 +301,7 @@ describe('actual producer/store/admission composition', () => {
     await act(async () => {
       await value.handle.controls.refreshCurrentModel(true)
     })
+    vi.mocked(getGlobalModelInfo).mockResolvedValueOnce({ model: '', provider: '' })
     expect(await send(value)).toBeNull()
     expect(requestGatewayForAgent).not.toHaveBeenCalled()
     expect(ensureGatewayAgent).not.toHaveBeenCalled()
@@ -541,4 +546,132 @@ describe('actual producer/store/admission composition', () => {
     expect(await send(value)).toBe('composition-created')
     expectCreate(b, defaultB)
   })
+})
+
+it('admits a scalar configured model without a provider override', async () => {
+  wireA = { model: 'legacy-model', provider: '' }
+  const value = await setup()
+  await act(async () => {
+    await value.handle.controls.refreshCurrentModel(true)
+  })
+  expect(getComposerModelSelection(a)).toMatchObject({ model: 'legacy-model', provider: '' })
+  expect(await send(value)).toBe('composition-created')
+  const call = vi.mocked(requestGatewayForAgent).mock.calls.find(call => call[2] === 'session.create')!
+  expect(call[3]).toMatchObject({ profile: 'backend-a', model: 'legacy-model' })
+  expect(call[3]).not.toHaveProperty('provider')
+})
+
+it.each(['empty', 'rejected'])('recovers on Send after an initial %s model-info failure', async failure => {
+  const value = await setup()
+
+  if (failure === 'empty') {
+    vi.mocked(getGlobalModelInfo).mockResolvedValueOnce({ model: '', provider: '' })
+  } else {
+    vi.mocked(getGlobalModelInfo).mockRejectedValueOnce(new Error('temporary offline failure'))
+  }
+
+  await act(async () => {
+    await value.handle.controls.refreshCurrentModel(true)
+  })
+  expect(getComposerModelSelection(a)).toBeNull()
+  expect(await send(value)).toBe('composition-created')
+  expect(getGlobalModelInfo).toHaveBeenLastCalledWith({ connectionId: 'source-a', profile: 'backend-a' })
+  expectCreate(a, defaultA)
+})
+
+it('reads a never-foreground Bot tile owner while preserving the foreground receipt and display', async () => {
+  const value = await setup()
+  await seed(value)
+  const receipt = getComposerModelSelection(a)
+  vi.mocked(getGlobalModelInfo).mockResolvedValueOnce(defaultB)
+  vi.mocked(requestGatewayForAgent).mockResolvedValueOnce({
+    session_id: 'tile-b',
+    stored_session_id: 'stored-tile-b'
+  } as never)
+  await act(async () => {
+    await value.handle.actions.openNewSessionTile('center', {
+      route: b,
+      cwd: null,
+      workspaceScope: { workspaceMode: 'bots' }
+    })
+  })
+  expect(getGlobalModelInfo).toHaveBeenLastCalledWith({ connectionId: 'source-b', profile: 'backend-b' })
+  expectCreate(b, defaultB)
+  expect(getComposerModelSelection(a)).toBe(receipt)
+  expect($currentModel.get()).toBe(defaultA.model)
+  expect(getComposerModelSelection(b)).toBeNull()
+})
+
+it('bounds missing-receipt recovery to one read per Send and retries on the next Send', async () => {
+  const value = await setup()
+  vi.mocked(getGlobalModelInfo).mockResolvedValueOnce({ model: '', provider: '' })
+  expect(await send(value)).toBeNull()
+  expect(getGlobalModelInfo).toHaveBeenCalledOnce()
+  expect(requestGatewayForAgent).not.toHaveBeenCalled()
+  await act(async () => {
+    await new Promise(resolve => setTimeout(resolve, 0))
+  })
+  expect(await send(value)).toBe('composition-created')
+  expect(getGlobalModelInfo).toHaveBeenCalledTimes(2)
+})
+
+it('rejects a late recovery reply after a deliberate owner pin, then uses that pin on the next Send', async () => {
+  const value = await setup()
+  const late = deferred<typeof defaultA>()
+  vi.mocked(getGlobalModelInfo).mockReturnValueOnce(late.promise)
+  let first!: Promise<null | string>
+  act(() => {
+    first = value.handle.actions.createBackendSessionForSend()
+  })
+  await waitFor(() => expect(getGlobalModelInfo).toHaveBeenCalledOnce())
+  await act(async () => {
+    await value.handle.controls.selectModel({ model: 'manual-a', provider: 'provider-a' })
+  })
+  late.resolve(defaultA)
+  await act(async () => {
+    expect(await first).toBeNull()
+  })
+  expect(requestGatewayForAgent).not.toHaveBeenCalled()
+  await act(async () => {
+    await new Promise(resolve => setTimeout(resolve, 0))
+  })
+  expect(await send(value)).toBe('composition-created')
+  expectCreate(a, { model: 'manual-a', provider: 'provider-a' })
+  expect(getGlobalModelInfo).toHaveBeenCalledOnce()
+})
+
+it('recovers an unstamped B draft from B’s target while the ambient source is still A', async () => {
+  const value = await setup()
+  await seed(value)
+  act(() => route(b, false))
+  expect(await send(value)).toBe('composition-created')
+  expect(getGlobalModelInfo).toHaveBeenLastCalledWith({ connectionId: 'source-b', profile: 'backend-b' })
+  expectCreate(b, defaultB)
+})
+
+it('freezes a background tile’s captured owner despite a late reply and a foreground pin change', async () => {
+  const value = await setup()
+  await seed(value)
+  const late = deferred<typeof defaultB>()
+  vi.mocked(getGlobalModelInfo).mockReturnValueOnce(late.promise)
+  vi.mocked(requestGatewayForAgent).mockResolvedValueOnce({
+    session_id: 'tile-b',
+    stored_session_id: 'late-tile-b'
+  } as never)
+  let tile!: Promise<void>
+  act(() => {
+    tile = value.handle.actions.openNewSessionTile('center', { route: b, cwd: null })
+  })
+  await waitFor(() => expect(getGlobalModelInfo).toHaveBeenCalledTimes(2))
+  await act(async () => {
+    await value.handle.controls.selectModel({ model: 'manual-a', provider: 'provider-a' })
+  })
+  const foregroundPin = getComposerModelSelection(a)
+  late.resolve(defaultB)
+  await act(async () => {
+    await tile
+  })
+  expectCreate(b, defaultB)
+  expect(getComposerModelSelection(a)).toBe(foregroundPin)
+  expect($currentModel.get()).toBe('manual-a')
 })
