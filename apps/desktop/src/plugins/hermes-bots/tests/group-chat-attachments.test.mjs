@@ -47,7 +47,7 @@ function load(turnScript) {
           titleToStored.set(`${params.profile}::${params.title}`, stored)
           return { session_id: runtime, stored_session_id: stored, message_count: 0, messages: [] }
         }
-        if (method === 'session.resume') {
+        if (method === 'session.resume' || method === 'session.turn.poll') {
           const session = resolveSession(params.profile, params.session_id)
           if (!session) {
             // Shaped like the real gateway's JsonRpcGatewayError (`.code`,
@@ -64,7 +64,10 @@ function load(turnScript) {
             message_count: session.messages.length,
             messages: [...session.messages],
             inflight: false,
-            running: false
+            running: false,
+            turn_outcomes: { version: 1, scope: 'process_local', availability: 'available',
+              turns: session.acceptedTurn ? [{ accepted_turn: session.acceptedTurn, state: 'complete',
+                finalized: [{ text: session.reply, status: 'complete' }] }] : [] }
           }
         }
         if (method === 'image.attach_bytes' || method === 'pdf.attach' || method === 'file.attach') {
@@ -91,7 +94,10 @@ function load(turnScript) {
           calls.push({ profile: session.profile, prompt: params.text, runtime: session.runtime })
           const reply = turnScript(session.profile, params.text, calls.length, session)
           session.messages.push({ role: 'assistant', content: reply })
-          return {}
+          session.reply = reply
+          session.acceptedTurn = { request_id: `attachment-turn-${calls.length}`, session_id: session.runtime,
+            route: 'compute_host', host_boot_id: 'attachment-test-boot' }
+          return { accepted_turn: session.acceptedTurn }
         }
         return {}
       },
