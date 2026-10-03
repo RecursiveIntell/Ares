@@ -89,6 +89,8 @@ async function harness(roster = members(3), options = {}) {
     return projection
   }
   const gc = await importGroupTurnPlugin({ atom,
+    react: options.react, sdk: options.sdk, document: options.document,
+    setInterval: () => 1, clearInterval: () => {},
     Date: class extends Date { static now() { return now } },
     setTimeout: (fn, delay = 0) => { const id = ++sequence; timers.set(id, { fn, at: now + delay }); return id },
     clearTimeout: id => timers.delete(id),
@@ -105,7 +107,7 @@ async function harness(roster = members(3), options = {}) {
       notify: () => undefined, notifyError: () => undefined }
   })
   gc.stopGroupChatServerSync()
-  gc.bindGroupTurnTestStorage({ set: (key, value) => storage.set(key, clone(value)) })
+  gc.bindGroupTurnTestStorage({ get: key => clone(storage.get(key) ?? null), set: (key, value) => storage.set(key, clone(value)) })
   const input = { id: 'user-1', at: now, from: { kind: 'user', name: 'You' }, text: '@all evaluate FIRST_INPUT', thread: 't1' }
   gc.$groupChats.set({ Room: { roomId: 'room1', epoch: 1, running: true, log: [input],
     watermarks: {}, sessions: {}, stranded: {}, holds: {}, members: roster } })
