@@ -2,6 +2,7 @@ import { useStore } from '@nanostores/react'
 import { useQuery } from '@tanstack/react-query'
 import { useMemo, useState } from 'react'
 
+import { getApiRequestConnection } from '@/api/client'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
@@ -25,6 +26,7 @@ import {
   toggleModelVisibility
 } from '@/store/model-visibility'
 import { $collapsedProviders, toggleCollapsedProvider } from '@/store/provider-collapse'
+import { knownOwnerForSession, requestForOwnedSession } from '@/store/session-states'
 import type { ModelOptionProvider, ModelOptionsResponse } from '@/types/hermes'
 
 interface ModelVisibilityDialogProps {
@@ -49,10 +51,16 @@ export function ModelVisibilityDialog({
   const [search, setSearch] = useState('')
   const stored = useStore($visibleModels)
   const collapsedProviders = useStore($collapsedProviders)
+  const owner = knownOwnerForSession(sessionId)
+  const catalogProfile = (typeof owner === 'string' ? owner : owner?.targetProfile || owner?.profile) || profile
+  const connectionId = owner && typeof owner === 'object' ? owner.connectionId : owner ? 'local' : getApiRequestConnection()
 
   const modelOptions = useQuery({
-    queryKey: modelOptionsQueryKey(profile, sessionId),
-    queryFn: (): Promise<ModelOptionsResponse> => requestModelOptions({ gateway: gw, sessionId }),
+    queryKey: modelOptionsQueryKey(catalogProfile, sessionId, connectionId),
+    queryFn: (): Promise<ModelOptionsResponse> => requestModelOptions({
+      connectionId, gateway: gw, profile: catalogProfile, sessionId,
+      request: gw && sessionId ? (method, params) => requestForOwnedSession(sessionId, gw.request.bind(gw), method, params) : undefined
+    }),
     enabled: open
   })
 

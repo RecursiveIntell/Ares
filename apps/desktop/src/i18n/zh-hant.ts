@@ -2344,6 +2344,8 @@ export const zhHant = defineLocale({
   },
 
   modelPicker: {
+    selectionUnavailable: '所選供應商或模型在此設定檔中不可用。請在此設定或選擇其他模型。目前選擇已保留。',
+    sessionSelection: '此工作階段保留自己的模型選擇。設定檔預設值的變更適用於新工作階段。',
     title: '切換模型',
     current: '目前：',
     unknown: '（未知）',

@@ -2,11 +2,12 @@ import { QueryClient } from '@tanstack/react-query'
 import { act, cleanup } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { setApiRequestConnection } from '@/api/client'
 import { isTargetSessionBusy } from '@/app/session/hooks/use-prompt-actions/utils'
 import type { ClientSessionState } from '@/app/types'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { modelOptionsQueryKey } from '@/lib/model-options'
-import { setCurrentModel, setCurrentProvider } from '@/store/session'
+import { _resetSessionOwnerHintsForTests, setCurrentModel, setCurrentProvider, setSessionOwnerHint } from '@/store/session'
 
 import { type MessageStreamHarness, renderMessageStream } from './test-harness'
 import { PRE_TURN_LIVE_SETTLE_GRACE_MS } from './utils'
@@ -55,6 +56,8 @@ afterEach(() => {
   setCurrentProvider('')
   vi.useRealTimers()
   vi.restoreAllMocks()
+  setApiRequestConnection(null)
+  _resetSessionOwnerHintsForTests()
 })
 
 describe('session.info config refetch gating', () => {
@@ -92,6 +95,55 @@ describe('session.info config refetch gating', () => {
 })
 
 describe('session.info model-options invalidation gating', () => {
+  it('does not mix a stale owner hint with an incompatible connection-only event stamp', () => {
+    setApiRequestConnection('connection-a')
+    setSessionOwnerHint('session-background', {
+      connectionId: 'connection-a', profile: 'a-profile', targetProfile: 'a-target'
+    })
+    mountStream()
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
+    act(() => stream.handleEvent({
+      connectionId: 'connection-b', session_id: 'session-background',
+      type: 'session.info', payload: { model: 'b-new', provider: 'b-provider' }
+    }))
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['model-options'] })
+    expect(invalidate).not.toHaveBeenCalledWith({
+      queryKey: modelOptionsQueryKey('a-target', 'session-background', 'connection-b')
+    })
+  })
+
+  it('invalidates the background event owner catalog and backend target while another connection is foregrounded', () => {
+    setApiRequestConnection('connection-a')
+    setSessionOwnerHint('session-background', {
+      connectionId: 'connection-b', profile: 'tile-profile', targetProfile: 'backend-target'
+    })
+    mountStream()
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
+    act(() => stream.handleEvent({
+      connectionId: 'connection-b', profile: 'tile-profile', session_id: 'session-background',
+      type: 'session.info', payload: { model: 'b-new', provider: 'b-provider' }
+    }))
+    expect(invalidate).toHaveBeenCalledWith({
+      queryKey: modelOptionsQueryKey('backend-target', 'session-background', 'connection-b')
+    })
+    expect(invalidate).not.toHaveBeenCalledWith({
+      queryKey: modelOptionsQueryKey(ACTIVE_PROFILE, 'session-background', 'connection-a')
+    })
+  })
+
+  it('uses a stamped background event connection when no session owner hint is known', () => {
+    setApiRequestConnection('connection-a')
+    mountStream()
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
+    act(() => stream.handleEvent({
+      connectionId: 'connection-b', profile: 'background-profile', session_id: 'session-background',
+      type: 'session.info', payload: { model: 'b-new', provider: 'b-provider' }
+    }))
+    expect(invalidate).toHaveBeenCalledWith({
+      queryKey: modelOptionsQueryKey('background-profile', 'session-background', 'connection-b')
+    })
+  })
+
   it('skips invalidation when model/provider merely restate the known values', () => {
     mountStream()
     const invalidate = vi.spyOn(queryClient, 'invalidateQueries')

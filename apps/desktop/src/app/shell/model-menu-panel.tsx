@@ -8,7 +8,7 @@ import { Codicon } from '@/components/ui/codicon'
 import { DropdownMenuItem, dropdownMenuRow } from '@/components/ui/dropdown-menu'
 import type { HermesGateway } from '@/hermes'
 import { useI18n } from '@/i18n'
-import { modelOptionsQueryKey, reconcileSelectionAfterCatalogRefresh, requestModelOptions } from '@/lib/model-options'
+import { modelOptionsQueryKey, requestModelOptions, selectionUnavailable } from '@/lib/model-options'
 import { currentPickerSelection } from '@/lib/model-status-label'
 import { DEFAULT_REASONING_EFFORT } from '@/lib/reasoning-effort'
 import { cn } from '@/lib/utils'
@@ -65,6 +65,9 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
   // shows/switches its own model — not the primary-only globals.
   const view = useSessionView()
   const activeSessionId = useStore(view.$runtimeId)
+  const owner = knownOwnerForSession(activeSessionId)
+  const connectionId = owner && typeof owner === 'object' ? owner.connectionId : owner ? 'local' : activeGatewayConnectionId()
+  const catalogProfile = (typeof owner === 'string' ? owner : (owner?.targetProfile || owner?.profile)) || profile
 
   const unconfirmedOptions = useStore(
     useMemo(
@@ -91,9 +94,9 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
   // back to the catalog's reported current, and a non-reactive read would
   // never repaint that fallback once the catalog resolved.
   const modelOptions = useQuery({
-    queryKey: modelOptionsQueryKey(profile, activeSessionId),
+    queryKey: modelOptionsQueryKey(catalogProfile, activeSessionId, connectionId),
     queryFn: (): Promise<ModelOptionsResponse> =>
-      requestModelOptions({ gateway, profile, request: requestGateway, sessionId: activeSessionId })
+      requestModelOptions({ connectionId, gateway, profile: catalogProfile, request: requestGateway, sessionId: activeSessionId })
   })
 
   const { model: optionsModel, provider: optionsProvider } = currentPickerSelection(
@@ -113,11 +116,12 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
     setRefreshing(true)
 
     try {
-      const queryKey = modelOptionsQueryKey(profile, activeSessionId)
+      const queryKey = modelOptionsQueryKey(catalogProfile, activeSessionId, connectionId)
 
       const next = await requestModelOptions({
+        connectionId,
         gateway,
-        profile,
+        profile: catalogProfile,
         refresh: true,
         request: requestGateway,
         sessionId: activeSessionId
@@ -125,14 +129,8 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
 
       queryClient.setQueryData<ModelOptionsResponse>(queryKey, next)
 
-      // Group / credential swaps can return a catalog that no longer contains
-      // the session's current model. The store + currentPickerSelection would
-      // otherwise keep painting the stale id (it is not in the new list).
-      const switchTo = reconcileSelectionAfterCatalogRefresh(optionsModel, next.providers)
-
-      if (switchTo) {
-        await onSelectModel({ ...switchTo, sessionId: activeSessionId || null })
-      }
+      // Refresh changes discovery only. Preserve the session/manual selection;
+      // a missing binding is explained below until the user chooses another.
     } catch {
       // Network/backend hiccup — fall back to a plain invalidate so the next
       // open re-fetches (still cached, but no worse than before).
@@ -150,7 +148,7 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
       runtimeId,
       state?.storedSessionId ?? null,
       owner && typeof owner === 'object' ? owner.connectionId : activeGatewayConnectionId(),
-      typeof owner === 'string' ? owner : (owner?.profile ?? $activeGatewayProfile.get())
+      typeof owner === 'string' ? owner : ((owner?.targetProfile || owner?.profile) ?? $activeGatewayProfile.get())
     ])
   }
 
@@ -296,9 +294,20 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
 
   return (
     <ModelCatalogMenu
+      connectionId={connectionId}
       controller={controller}
       footer={
         <>
+          {modelOptions.data && selectionUnavailable(modelOptions.data.providers, optionsProvider, optionsModel) && (
+            <div className="px-2 py-1 text-xs text-(--ui-text-secondary)" role="status">
+              {t.modelPicker.selectionUnavailable}
+            </div>
+          )}
+          {activeSessionId && (
+            <div className="px-2 py-1 text-xs text-(--ui-text-secondary)" role="status">
+              {t.modelPicker.sessionSelection}
+            </div>
+          )}
           {unconfirmedOptions && (
             <div className="px-2 py-1 text-xs text-(--ui-text-secondary)" role="status">
               {t.shell.modelOptions.unconfirmed}
@@ -319,7 +328,7 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
       }
       gateway={gateway}
       includeMoa
-      profile={profile}
+      profile={catalogProfile}
       request={requestGateway}
       sessionId={activeSessionId}
     />

@@ -1,14 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { setApiRequestConnection, setApiRequestProfile } from '@/api/client'
 import { getGlobalModelOptions } from '@/hermes'
 
 import {
-  firstSelectableCatalogModel,
-  manualPickRemoved,
   modelOptionsQueryKey,
-  reconcileSelectionAfterCatalogRefresh,
   requestModelOptions,
-  selectionInCatalog
+  selectionUnavailable
 } from './model-options'
 
 const globalOptions = { model: 'hermes-4', provider: 'nous', providers: [] }
@@ -20,6 +18,8 @@ vi.mock('@/hermes', () => ({
 describe('requestModelOptions', () => {
   afterEach(() => {
     vi.clearAllMocks()
+    setApiRequestConnection(null)
+    setApiRequestProfile(null)
   })
 
   it('uses the connected gateway even before a session exists', async () => {
@@ -35,7 +35,7 @@ describe('requestModelOptions', () => {
 
     await expect(requestModelOptions({ gateway: gateway as never, sessionId: null })).resolves.toBe(gatewayPayload)
 
-    expect(gateway.request).toHaveBeenCalledWith('model.options', { explicit_only: true })
+    expect(gateway.request).toHaveBeenCalledWith('model.options', { explicit_only: true, profile: 'default' })
     expect(getGlobalModelOptions).not.toHaveBeenCalled()
   })
 
@@ -60,7 +60,7 @@ describe('requestModelOptions', () => {
       provider: 'hermes-local'
     })
 
-    expect(getGlobalModelOptions).toHaveBeenCalledWith({ explicitOnly: true })
+    expect(getGlobalModelOptions).toHaveBeenCalledWith({ explicitOnly: true }, { connectionId: 'local', profile: 'default' })
   })
 
   it('recovers through profile-scoped REST when the gateway catalog request fails', async () => {
@@ -79,7 +79,7 @@ describe('requestModelOptions', () => {
     await expect(requestModelOptions({ gateway: gateway as never, sessionId: 'session-1' })).resolves.toEqual(
       restPayload
     )
-    expect(getGlobalModelOptions).toHaveBeenCalledWith({ explicitOnly: true })
+    expect(getGlobalModelOptions).toHaveBeenCalledWith({ explicitOnly: true }, { connectionId: 'local', profile: 'default' })
   })
 
   it('preserves the gateway error when its REST recovery path also fails', async () => {
@@ -112,17 +112,18 @@ describe('requestModelOptions', () => {
     await requestModelOptions({ gateway: gateway as never, refresh: true, sessionId: 'session-1' })
 
     expect(gateway.request).toHaveBeenCalledWith('model.options', {
+      profile: 'default',
       explicit_only: true,
       refresh: true,
       session_id: 'session-1'
     })
-    expect(getGlobalModelOptions).toHaveBeenCalledWith({ explicitOnly: true, refresh: true })
+    expect(getGlobalModelOptions).toHaveBeenCalledWith({ explicitOnly: true, refresh: true }, { connectionId: 'local', profile: 'default' })
   })
 
   it('falls back to REST when no gateway is connected', async () => {
     await requestModelOptions({ refresh: true })
 
-    expect(getGlobalModelOptions).toHaveBeenCalledWith({ explicitOnly: true, refresh: true })
+    expect(getGlobalModelOptions).toHaveBeenCalledWith({ explicitOnly: true, refresh: true }, { connectionId: 'local', profile: 'default' })
   })
 
   it('prefers an owner-routed request over the ambient gateway socket', async () => {
@@ -151,7 +152,7 @@ describe('requestModelOptions', () => {
       routedPayload
     )
 
-    expect(request).toHaveBeenCalledWith('model.options', { explicit_only: true, session_id: 'tile-1' })
+    expect(request).toHaveBeenCalledWith('model.options', { explicit_only: true, profile: 'default', session_id: 'tile-1' })
     expect(gateway.request).not.toHaveBeenCalled()
   })
 
@@ -167,7 +168,27 @@ describe('requestModelOptions', () => {
     vi.mocked(getGlobalModelOptions).mockResolvedValueOnce(restPayload)
 
     await expect(requestModelOptions({ profile: 'berry', request, sessionId: 'tile-1' })).resolves.toEqual(restPayload)
-    expect(getGlobalModelOptions).toHaveBeenCalledWith({ explicitOnly: true }, 'berry')
+    expect(getGlobalModelOptions).toHaveBeenCalledWith({ explicitOnly: true }, { connectionId: 'local', profile: 'berry' })
+  })
+
+  it('freezes source and target before a late gateway failure', async () => {
+    vi.mocked(getGlobalModelOptions).mockResolvedValueOnce({ providers: [{ slug: 'target-a', name: 'Target A', models: ['model-a'] }] })
+    setApiRequestConnection('source-a')
+    setApiRequestProfile('target-a')
+    let reject!: (err: Error) => void
+    const request = vi.fn(() => new Promise<never>((_, fail) => { reject = fail }))
+    const pending = requestModelOptions({ request, sessionId: 'session-a' })
+    setApiRequestConnection('source-b')
+    setApiRequestProfile('target-b')
+    reject(new Error('late gateway failure'))
+    await pending
+    expect(getGlobalModelOptions).toHaveBeenCalledWith({ explicitOnly: true }, { connectionId: 'source-a', profile: 'target-a' })
+  })
+
+  it('keeps an explicit local owner on local during ambient remote activity', async () => {
+    setApiRequestConnection('remote-source')
+    await requestModelOptions({ connectionId: 'local', profile: 'local-specialist' })
+    expect(getGlobalModelOptions).toHaveBeenCalledWith({ explicitOnly: true }, { connectionId: 'local', profile: 'local-specialist' })
   })
 })
 
@@ -181,75 +202,27 @@ describe('modelOptionsQueryKey', () => {
   it('keeps session catalogs inside the owning profile namespace', () => {
     expect(modelOptionsQueryKey(' compass ', 'session-1')).toEqual(['model-options', 'compass', 'session-1'])
   })
-})
 
-describe('manualPickRemoved', () => {
-  const providers = [
-    { name: 'OpenRouter', slug: 'openrouter', models: ['owl-alpha', 'gpt-5.5'] },
-    { name: 'Nous', slug: 'nous', models: [] } // present but unconfigured / re-auth
-  ]
-
-  it('flags a pick whose model was dropped from a populated provider', () => {
-    expect(manualPickRemoved(providers, 'openrouter', 'nemotron-removed')).toBe(true)
-  })
-
-  it('keeps a pick that is still in the catalog', () => {
-    expect(manualPickRemoved(providers, 'openrouter', 'gpt-5.5')).toBe(false)
-  })
-
-  it('matches the provider by name as well as slug', () => {
-    expect(manualPickRemoved(providers, 'OpenRouter', 'gpt-5.5')).toBe(false)
-    expect(manualPickRemoved(providers, 'OpenRouter', 'gone')).toBe(true)
-  })
-
-  it('never clobbers when the provider is absent (ambiguous / deauth)', () => {
-    expect(manualPickRemoved(providers, 'anthropic', 'claude-sonnet-4.6')).toBe(false)
-  })
-
-  it('never clobbers when the provider has an empty model list (re-auth)', () => {
-    expect(manualPickRemoved(providers, 'nous', 'hermes-4')).toBe(false)
-  })
-
-  it('never clobbers on a not-yet-loaded or empty catalog', () => {
-    expect(manualPickRemoved(undefined, 'openrouter', 'gpt-5.5')).toBe(false)
-    expect(manualPickRemoved([], 'openrouter', 'gpt-5.5')).toBe(false)
-  })
-
-  it('never clobbers when there is no pick', () => {
-    expect(manualPickRemoved(providers, '', '')).toBe(false)
+  it('isolates identically named profiles and sessions on different sources', () => {
+    expect(modelOptionsQueryKey('target', 'session', 'remote-a')).not.toEqual(modelOptionsQueryKey('target', 'session', 'remote-b'))
+    expect(modelOptionsQueryKey('target', 'session', 'local')).toEqual(['model-options', 'target', 'session'])
   })
 })
 
-describe('reconcileSelectionAfterCatalogRefresh', () => {
-  const zhipu = { name: '智谱2', slug: 'zhipu', models: ['glm-4.5-air', 'glm-5-turbo'] }
+describe('selectionUnavailable', () => {
+  const row = { slug: 'ollama-launch', name: 'Ollama', aliases: ['custom:ollama-launch'], models: ['model-a'] }
 
-  const bytea = {
-    name: '字节A',
-    slug: 'byteplus',
-    models: ['deepseek-v4-flash', 'doubao-seed-2.0-pro']
-  }
-
-  const moa = { name: 'Mixture of Agents', slug: 'moa', models: ['default'] }
-
-  it('switches to the first new-group model when the current pick is gone', () => {
-    expect(selectionInCatalog([bytea], 'glm-4.5-air')).toBe(false)
-    expect(firstSelectableCatalogModel([moa, bytea])).toEqual({
-      model: 'deepseek-v4-flash',
-      provider: 'byteplus'
-    })
-    expect(reconcileSelectionAfterCatalogRefresh('glm-4.5-air', [moa, bytea])).toEqual({
-      model: 'deepseek-v4-flash',
-      provider: 'byteplus'
-    })
+  it('compares provider and model together and accepts canonical aliases', () => {
+    expect(selectionUnavailable([row], 'ollama-launch', 'model-a')).toBe(false)
+    expect(selectionUnavailable([row], 'custom:ollama-launch', 'model-a')).toBe(false)
+    expect(selectionUnavailable([row], 'another-host', 'model-a')).toBe(true)
   })
 
-  it('keeps the current pick when it is still in the refreshed catalog', () => {
-    expect(reconcileSelectionAfterCatalogRefresh('glm-4.5-air', [zhipu, moa])).toBeNull()
-  })
-
-  it('does not wipe the pick when the refreshed catalog has no selectable models', () => {
-    expect(reconcileSelectionAfterCatalogRefresh('glm-4.5-air', [moa])).toBeNull()
-    expect(reconcileSelectionAfterCatalogRefresh('glm-4.5-air', [])).toBeNull()
-    expect(reconcileSelectionAfterCatalogRefresh('glm-4.5-air', undefined)).toBeNull()
+  it('explains missing, disabled, and removed selections without choosing replacements', () => {
+    expect(selectionUnavailable([], 'ollama-launch', 'model-a')).toBe(true)
+    expect(selectionUnavailable([{ ...row, models: [] }], 'ollama-launch', 'model-a')).toBe(true)
+    expect(selectionUnavailable([row], 'ollama-launch', 'model-b')).toBe(true)
+    expect(selectionUnavailable([{ ...row, unavailable_models: ['model-a'] }], 'ollama-launch', 'model-a')).toBe(true)
+    expect(selectionUnavailable(undefined, 'ollama-launch', 'model-a')).toBe(false)
   })
 })

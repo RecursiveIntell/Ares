@@ -2791,6 +2791,8 @@ export const en: Translations = {
   },
 
   modelPicker: {
+    selectionUnavailable: 'The selected provider or model is unavailable in this profile. Configure it here or choose another model. Your selection is preserved.',
+    sessionSelection: 'This session keeps its own model selection. Profile-default changes apply to new sessions.',
     title: 'Switch model',
     current: 'current:',
     unknown: '(unknown)',

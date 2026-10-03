@@ -6,6 +6,7 @@ import type * as React from 'react'
 import { memo, Suspense, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useLocation } from 'react-router'
 
+import { getApiRequestConnection } from '@/api/client'
 import type { SubmitTextOptions } from '@/app/session/hooks/use-prompt-actions/utils'
 import { Thread } from '@/components/assistant-ui/thread'
 import { TranscriptWindowProvider } from '@/components/assistant-ui/thread/transcript-window'
@@ -47,7 +48,7 @@ import {
   sessionPinId,
   shouldMigrateComposerScope
 } from '@/store/session'
-import { $focusedStoredSessionId, sessionTileDelegate } from '@/store/session-states'
+import { $focusedStoredSessionId, knownOwnerForSession, requestForOwnedSession, sessionTileDelegate } from '@/store/session-states'
 import { $transcriptTailBySessionId, transcriptTailState } from '@/store/transcript-tail'
 import { isAuxiliaryWindow, isWatchWindow } from '@/store/windows'
 import type { ModelOptionsResponse } from '@/types/hermes'
@@ -524,9 +525,15 @@ const ChatViewContent = memo(function ChatViewContent({
   const showChatBar = !loadingSession && !resumeExhausted && !isWatchWindow()
   const threadKey = selectedSessionId || activeSessionId || (isRoutedSessionView ? location.pathname : 'new')
 
+  const catalogOwner = knownOwnerForSession(activeSessionId)
+  const catalogProfile = (typeof catalogOwner === 'string' ? catalogOwner : catalogOwner?.targetProfile || catalogOwner?.profile) || activeGatewayProfile
+  const catalogConnection = catalogOwner && typeof catalogOwner === 'object' ? catalogOwner.connectionId : catalogOwner ? 'local' : getApiRequestConnection()
   const modelOptionsQuery = useQuery<ModelOptionsResponse>({
-    queryKey: modelOptionsQueryKey(activeGatewayProfile, activeSessionId),
-    queryFn: () => requestModelOptions({ gateway: gateway || undefined, sessionId: activeSessionId }),
+    queryKey: modelOptionsQueryKey(catalogProfile, activeSessionId, catalogConnection),
+    queryFn: () => requestModelOptions({
+      connectionId: catalogConnection, gateway: gateway || undefined, profile: catalogProfile, sessionId: activeSessionId,
+      request: gateway && activeSessionId ? (method, params) => requestForOwnedSession(activeSessionId, gateway.request.bind(gateway), method, params) : undefined
+    }),
     enabled: gatewayOpen
   })
 

@@ -870,6 +870,7 @@ def _(rid, params: dict) -> dict:
         model = str(params.get("model") or "").strip()
         provider = str(params.get("provider") or "").strip()
         confirm_message = None
+        model_error = None
         if model and provider:
             # #95293 remainder: this is the Bots editor's model-switch path,
             # and it used to write guarded (data-policy / expensive) models
@@ -895,8 +896,20 @@ def _(rid, params: dict) -> dict:
 
                     _write_profile_model(profile_dir, provider, model)
                     applied["model"] = True
-                except Exception:
+                except Exception as exc:
                     applied["model"] = False
+                    from fastapi import HTTPException
+
+                    # Never expose arbitrary exception/config text to the editor.
+                    invalid_provider = isinstance(exc, HTTPException) and exc.status_code == 400
+                    model_error = {
+                        "code": "provider_configuration_unavailable" if invalid_provider else "model_save_failed",
+                        "message": (
+                            "The selected provider is missing, disabled, or incomplete in this profile. "
+                            "Configure it here or choose another provider. Your previous model is preserved."
+                            if invalid_provider else "The model could not be saved. Your previous model is preserved."
+                        ),
+                    }
 
         needs_cfg = (
             isinstance(params.get("disabled_skills"), list)
@@ -993,6 +1006,8 @@ def _(rid, params: dict) -> dict:
                 reset_hermes_home_override(token)
 
         result = {"ok": all(applied.values()) if applied else True, "applied": applied}
+        if model_error is not None:
+            result["model_error"] = model_error
         if confirm_message is not None:
             # Model write pending user confirmation — same shape config.set
             # returns, so clients reuse one confirm handler for both surfaces.
