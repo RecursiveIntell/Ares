@@ -6931,14 +6931,17 @@ def _apply_model_switch(
         _append_model_switch_marker(
             session, model=result.new_model, provider=result.target_provider
         )
-        if one_turn:
-            session["one_turn_model_restore"] = restore_snapshot
-            session["_one_turn_model_runtime"] = {
-                "session": session, "agent": agent, "sid": sid, "active": False,
-            }
-        else:
-            session.pop("one_turn_model_restore", None)
-            session.pop("_one_turn_model_runtime", None)
+        # The turn consumer uses this lock: snapshot and ownership must become
+        # visible (or retire) together, never as a partially published lease.
+        with session["history_lock"]:
+            if one_turn:
+                session["one_turn_model_restore"] = restore_snapshot
+                session["_one_turn_model_runtime"] = {
+                    "session": session, "agent": agent, "sid": sid, "active": False,
+                }
+            else:
+                session.pop("one_turn_model_restore", None)
+                session.pop("_one_turn_model_runtime", None)
 
     # Record the switch as a PER-SESSION override so a later rebuild of THIS
     # session (e.g. /new via _reset_session_agent, or resume) re-derives the
