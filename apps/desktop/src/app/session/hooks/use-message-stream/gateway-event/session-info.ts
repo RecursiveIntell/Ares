@@ -1,3 +1,4 @@
+import { getApiRequestConnection } from '@/api/client'
 import { normalizePersonalityValue } from '@/lib/chat-runtime'
 import { modelOptionsQueryKey } from '@/lib/model-options'
 import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
@@ -24,6 +25,7 @@ import {
   setWorkspaceCwdOwner,
   setYoloActive
 } from '@/store/session'
+import { knownOwnerForSession } from '@/store/session-states'
 import { reportInstallMethodWarning } from '@/store/updates'
 
 import { finalizeInterruptedMessages } from '../../use-prompt-actions/rewind'
@@ -426,8 +428,23 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
     }
 
     if (modelValueChanged || providerValueChanged) {
+      const knownOwner = knownOwnerForSession(sessionId)
+      const owner = typeof knownOwner === 'string' ? { connectionId: 'local', profile: knownOwner } : knownOwner
+      const eventConnection = event.connectionId?.trim() || undefined
+      const eventProfile = event.profile?.trim() || undefined
+
+      const matchesOwner = owner && (!eventConnection || eventConnection === owner.connectionId) &&
+        (!eventProfile || eventProfile === owner.profile || eventProfile === owner.targetProfile)
+
+      const completeEventOwner = eventConnection && eventProfile
+      const legacyUnstamped = !eventConnection && !eventProfile && !owner
+      const catalogProfile = matchesOwner ? owner.targetProfile || owner.profile : eventProfile || activeGatewayProfile
+      const catalogConnection = matchesOwner ? owner.connectionId : eventConnection || getApiRequestConnection()
+      // An incomplete stamp that conflicts with a known owner cannot name
+      // one exact cache. Invalidate the catalog family without mixing owners.
+      const exactOwner = matchesOwner || completeEventOwner || legacyUnstamped
       void queryClient.invalidateQueries({
-        queryKey: explicitSid && sessionId ? modelOptionsQueryKey(activeGatewayProfile, sessionId) : ['model-options']
+        queryKey: explicitSid && sessionId && exactOwner ? modelOptionsQueryKey(catalogProfile, sessionId, catalogConnection) : ['model-options']
       })
     }
 

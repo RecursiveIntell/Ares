@@ -135,6 +135,7 @@ class ProfileSecretScope(Mapping[str, str]):
     generation: str
     source_status: str
     digest: str
+    allow_environment_fallback: bool = True
 
     def __getitem__(self, key: str) -> str:
         return self.data[key]
@@ -204,7 +205,10 @@ def _immutable_scope(
     profile_home: Path | None,
     source_status: str,
     external_generation: int = 0,
+    allow_environment_fallback: bool = True,
 ) -> ProfileSecretScope:
+    if not allow_environment_fallback:
+        source_status += ";ambient:excluded"
     copied = {str(key): str(value) for key, value in values.items()}
     generation, digest = _scope_generation(
         profile_home,
@@ -219,6 +223,7 @@ def _immutable_scope(
         generation=generation,
         source_status=source_status,
         digest=digest,
+        allow_environment_fallback=allow_environment_fallback,
     )
 
 
@@ -352,7 +357,7 @@ def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
         val = scope.get(name)
         if val is not None:
             return val
-        if _MULTIPLEX_ACTIVE:
+        if _MULTIPLEX_ACTIVE or not scope.allow_environment_fallback:
             return default
         # Multiplex off: the scope is an overlay over the process environment,
         # not an isolation boundary — there is no other profile to leak from.
@@ -604,6 +609,7 @@ def build_profile_secret_scope(
     hermes_home: Path,
     *,
     fail_closed_external: bool = False,
+    allow_environment_fallback: bool = True,
 ) -> ProfileSecretScope:
     """Build a profile's secret mapping from its ``.env`` and optional ``.op.env``.
 
@@ -664,6 +670,7 @@ def build_profile_secret_scope(
             f"external:{external_snapshot.status}"
         ),
         external_generation=int(external_snapshot.generation),
+        allow_environment_fallback=allow_environment_fallback,
     )
 
 
