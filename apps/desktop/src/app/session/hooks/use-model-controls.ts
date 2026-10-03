@@ -1,7 +1,7 @@
-import { getApiRequestConnection } from '@/api/client'
 import { type QueryClient } from '@tanstack/react-query'
 import { useCallback, useRef } from 'react'
 
+import { getApiRequestConnection } from '@/api/client'
 import type { ModelSelection } from '@/app/shell/model-menu-panel'
 import { getGlobalModelInfo } from '@/hermes'
 import { useI18n } from '@/i18n'

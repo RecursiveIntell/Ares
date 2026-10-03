@@ -1,8 +1,8 @@
 import { useStore } from '@nanostores/react'
-import { getApiRequestConnection } from '@/api/client'
 import { useQuery } from '@tanstack/react-query'
 import { useMemo, useState } from 'react'
 
+import { getApiRequestConnection } from '@/api/client'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
-import { fixtureAdmission, fixtureProjection } from './group-turn-wire-fixture.mjs'
+import { assertFixturePoll, fixtureAdmission, fixtureProjection } from './group-turn-wire-fixture.mjs'
 import vm from 'node:vm'
 
 // #91868/#94569: a REAL stop path for group-chat rounds. Before
@@ -16,9 +16,9 @@ import vm from 'node:vm'
 const pluginSource = readFileSync(new URL('../plugin.js', import.meta.url), 'utf8')
 
 /** Harness mirroring group-turn-lease.test.mjs: run plugin.js in a vm with a
- *  scripted gateway. `busyPolls` makes session.resume report the member as
+ *  scripted gateway. `busyPolls` makes session.turn.poll report the member as
  *  inflight for the first N polls, so a stop can land mid-turn. */
-function load({ reply = 'long answer', busyPolls = 0, onResumePoll = null } = {}) {
+function load({ reply = 'long answer', busyPolls = 0, onTurnPoll = null } = {}) {
   const values = new Map()
   const atom = initial => {
     const slot = { get: () => values.get(slot), set: value => values.set(slot, value) }
@@ -31,7 +31,7 @@ function load({ reply = 'long answer', busyPolls = 0, onResumePoll = null } = {}
   const titleToStored = new Map()
   let sessionSequence = 0
   const rpcLog = []
-  let resumePolls = 0
+  let turnPolls = 0
 
   const resolveSession = (profile, target) =>
     (stored => (stored ? sessions.get(stored) : null))(
@@ -67,19 +67,20 @@ function load({ reply = 'long answer', busyPolls = 0, onResumePoll = null } = {}
         runtimeToStored.set(session.runtime, session.stored)
       }
       const runtime = session.runtime
+      if (method === 'session.turn.poll') assertFixturePoll(session, params)
 
       // Post-submit polls: stay "busy" for the first `busyPolls` polls so a
-      // stop can land mid-turn, then settle. `onResumePoll` lets a test fire
+      // stop can land mid-turn, then settle. `onTurnPoll` lets a test fire
       // the stop from inside the poll cadence.
       const submitted = session.messages.length > 0
       let busy = false
 
       if (submitted) {
-        resumePolls += 1
-        busy = resumePolls <= busyPolls
+        turnPolls += 1
+        busy = turnPolls <= busyPolls
 
-        if (typeof onResumePoll === 'function') {
-          onResumePoll(resumePolls)
+        if (typeof onTurnPoll === 'function') {
+          onTurnPoll(turnPolls)
         }
       }
 
@@ -255,7 +256,7 @@ test('poll loop abandons an in-flight turn once a stop bumps the epoch and holds
   let gcRef = null
   const gc = load({
     busyPolls: 50,
-    onResumePoll: polls => {
+    onTurnPoll: polls => {
       // Fire the stop from inside the poll cadence, after the second
       // busy poll — exactly the mid-turn click the Stop button produces.
       if (polls === 2) {
@@ -268,8 +269,8 @@ test('poll loop abandons an in-flight turn once a stop bumps the epoch and holds
   const reply = await gc.runGroupChatMemberTurn('Room', { name: 'helper', title: '' }, 'long task', 't1', [])
 
   assert.equal(reply, null, 'abandoned turn yields no reply')
-  const postStopPolls = gc.calls('session.resume').length
-  assert.ok(postStopPolls <= 6, `poll loop exited promptly after the stop, not at the deadline (${postStopPolls} resumes)`)
+  const postStopPolls = gc.calls('session.turn.poll').length
+  assert.ok(postStopPolls <= 6, `poll loop exited promptly after the stop, not at the deadline (${postStopPolls} polls)`)
   assert.equal(gc.$groupChats.get().Room.running, false)
 })
 
@@ -278,7 +279,7 @@ test('an ordinary newer-send epoch bump WITHOUT a hold does not abandon the poll
   const gc = load({
     reply: 'finished anyway',
     busyPolls: 3,
-    onResumePoll: polls => {
+    onTurnPoll: polls => {
       if (polls === 1) {
         // A newer user send bumps the epoch but holds nobody. The in-flight
         // poll must keep going so the finished reply can still be delivered

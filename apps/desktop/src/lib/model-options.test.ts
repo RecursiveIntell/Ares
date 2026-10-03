@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { getGlobalModelOptions } from '@/hermes'
 import { setApiRequestConnection, setApiRequestProfile } from '@/api/client'
+import { getGlobalModelOptions } from '@/hermes'
 
 import {
   modelOptionsQueryKey,

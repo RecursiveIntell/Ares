@@ -37,6 +37,7 @@ vi.mock('@/i18n', () => ({
     t: {
       common: { confirm: 'Confirm' },
       desktop: { modelSwitchFailed: 'Failed' },
+      modelPicker: { sessionSelection: 'This chat' },
       shell: {
         modelMenu: { refreshModels: 'Refresh' },
         modelOptions: { updateFailed: 'Failed', fastFailed: 'Failed', unconfirmed: 'Model options unconfirmed' }
@@ -345,7 +346,8 @@ it('unavailable readback leaves the desired effort visibly unconfirmed', async (
   await act(async () => fireEvent.click(screen.getByText('Set high')))
   expect(request.mock.calls.filter(([method]) => method === 'config.set')).toHaveLength(1)
   expect($sessionStates.get().r1).toMatchObject({ reasoningEffort: 'high', unconfirmedRuntimeOptions: ['effort'] })
-  expect(screen.getByRole('status').textContent).toContain('unconfirmed')
+  const unconfirmedStatus = screen.getAllByRole('status').find(status => status.textContent?.includes('unconfirmed'))
+  expect(unconfirmedStatus).toBeDefined()
 })
 
 it('a late preset recovery cannot recreate an unsaved runtime after close', async () => {

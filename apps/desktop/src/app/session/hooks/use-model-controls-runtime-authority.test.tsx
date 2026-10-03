@@ -229,8 +229,7 @@ describe('useModelControls runtime authority', () => {
     expect($currentProvider.get()).toBe('provider-c')
   })
 
-  it.each(['openrouter', 'anthropic', 'openai-codex', 'moa', 'ollama-cloud', 'ollama-launch', 'custom:target', 'auto'])
-  ('preserves A→B→A intent when older selector replies arrive last (%s)', async provider => {
+  it.each(['openrouter', 'anthropic', 'openai-codex', 'moa', 'ollama-cloud', 'ollama-launch', 'custom:target', 'auto'])('preserves A→B→A intent when older selector replies arrive last (%s)', async provider => {
     const replies: Array<(value: unknown) => void> = []
     const requestGateway = vi.fn((_method: string, _params?: Record<string, unknown>) => new Promise<never>(resolve => {
       replies.push(value => resolve(value as never))

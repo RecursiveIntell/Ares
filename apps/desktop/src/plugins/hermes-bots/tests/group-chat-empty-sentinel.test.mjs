@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
+import { assertFixturePoll, fixtureAdmission, fixtureProjection } from './group-turn-wire-fixture.mjs'
 import vm from 'node:vm'
 
 const pluginSource = readFileSync(new URL('../plugin.js', import.meta.url), 'utf8')
@@ -122,7 +123,7 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
           titleToStored.set(`${params.profile}::${params.title}`, stored)
           return { session_id: runtime, stored_session_id: stored, message_count: 0, messages: [] }
         }
-        if (method === 'session.resume') {
+        if (method === 'session.resume' || method === 'session.turn.poll') {
           const session = resolveSession(params.profile, params.session_id)
           if (!session) {
             const err = new Error(`session not found: ${params.session_id}`)
@@ -138,11 +139,15 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
           const pendingClarify = clarify && seen <= clarify.until ? clarify.payload : null
           const approval = approvalUntilResumeCall && approvalUntilResumeCall[profile]
           const pendingApproval = approval && seen <= approval.until ? approval.payload : null
+          if (method === 'session.turn.poll') assertFixturePoll(session, params)
           return {
             session_id: session.runtime,
             session_key: session.stored,
             message_count: session.messages.length,
             messages: [...session.messages],
+            turn_outcomes: fixtureProjection(session, {
+              state: pendingClarify || pendingApproval ? 'waiting' : busy ? 'running' : 'complete'
+            }),
             inflight: busy,
             running: busy,
             ...(pendingClarify ? { pending_clarify: pendingClarify } : {}),
@@ -164,7 +169,8 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
           })
           const reply = turnScript(session.profile, params.text, calls.length, session)
           session.messages.push({ role: 'assistant', content: reply })
-          return {}
+          session.finalized = [{ text: reply, status: 'complete' }]
+          return { accepted_turn: fixtureAdmission(session, `owned-${session.runtime}-${calls.length}`) }
         }
         if (method === 'clarify.respond') {
           clarifyResponds.push({ ...params })

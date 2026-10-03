@@ -1934,7 +1934,9 @@ def _normalize_main_model_assignment(provider: str, model: str, base_url: str = 
     return prov_in, model_in
 
 
-def _validate_model_assignment_provider(cfg: dict, provider: str, base_url: str = "") -> None:
+def _validate_model_assignment_provider(
+    cfg: dict, provider: str, base_url: str = "", *, allow_vendor_fallback: bool = False
+) -> None:
     """Validate selection against this target's definitions, without resolving auth.
 
     A provider name is a reference, not a definition. In particular, never
@@ -1968,9 +1970,11 @@ def _validate_model_assignment_provider(cfg: dict, provider: str, base_url: str 
                 return
             raise HTTPException(status_code=400, detail=f"Provider '{provider}' needs an endpoint in this profile")
 
+    declared_legacy = False
     legacy = cfg.get("custom_providers")
     for entry in legacy if isinstance(legacy, list) else []:
         if isinstance(entry, dict) and requested in custom_provider_aliases(str(entry.get("name") or ""), str(entry.get("provider_key") or "")):
+            declared_legacy = True
             if not is_provider_enabled(entry):
                 raise HTTPException(status_code=400, detail=f"Provider '{provider}' is disabled in this profile")
 
@@ -1985,6 +1989,11 @@ def _validate_model_assignment_provider(cfg: dict, provider: str, base_url: str 
     if resolve_custom_provider(provider, get_compatible_custom_providers(cfg)) is not None:
         return
     if canonical in _KNOWN_PROVIDER_NAMES:
+        return
+    # Analytics vendor labels may use the existing aggregator normalization.
+    # Raw declarations still reject above; an unresolved named custom target
+    # or endpointless legacy alias is never permission to retarget the save.
+    if allow_vendor_fallback and not declared_legacy and not requested.startswith("custom:"):
         return
     raise HTTPException(status_code=400, detail=f"Provider '{provider}' is not configured in this profile; configure it here before selecting it")
 
@@ -7842,9 +7851,13 @@ def _apply_model_assignment_sync(
     if scope == "main":
         if not provider or not model:
             raise HTTPException(status_code=400, detail="provider and model required for main")
-        _validate_model_assignment_provider(cfg, provider, base_url)
+        _validate_model_assignment_provider(
+            cfg, provider, base_url,
+            allow_vendor_fallback="/" in model and provider.strip().lower() == model.split("/", 1)[0].strip().lower(),
+        )
         # An explicit generic endpoint must not bind to an unrelated saved custom row.
         provider, model = _normalize_main_model_assignment(provider, model, base_url=base_url)
+        _validate_model_assignment_provider(cfg, provider, base_url)
         providers_cfg = cfg.get("providers")
         provider_entry = providers_cfg.get(provider) if isinstance(providers_cfg, dict) else None
         previous = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
@@ -15202,8 +15215,12 @@ def _write_profile_model(profile_dir: Path, provider: str, model: str) -> None:
     token = set_hermes_home_override(str(profile_dir))
     try:
         cfg = load_config()
-        _validate_model_assignment_provider(cfg, provider)
+        _validate_model_assignment_provider(
+            cfg, provider,
+            allow_vendor_fallback="/" in model and provider.strip().lower() == model.split("/", 1)[0].strip().lower(),
+        )
         provider, model = _normalize_main_model_assignment(provider, model)
+        _validate_model_assignment_provider(cfg, provider)
         providers_cfg = cfg.get("providers")
         entry = providers_cfg.get(provider) if isinstance(providers_cfg, dict) else None
         previous = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}

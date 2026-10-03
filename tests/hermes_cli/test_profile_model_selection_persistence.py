@@ -41,6 +41,57 @@ def read_cfg(home):
     return yaml.safe_load((home / "config.yaml").read_text())
 
 
+def assign_model(home, surface, provider, model):
+    if surface == "profile":
+        ws._write_profile_model(home, provider, model)
+    else:
+        token = set_hermes_home_override(str(home))
+        try:
+            ws._apply_model_assignment_sync("main", provider, model, "", "")
+        finally:
+            reset_hermes_home_override(token)
+
+
+@pytest.mark.parametrize("surface", ["main", "profile"])
+@pytest.mark.parametrize("current,expected", [
+    ("openrouter", "openrouter"), ("kilocode", "kilocode"), ("anthropic", "openrouter"),
+])
+def test_analytics_vendor_normalizes_on_target_before_effective_validation(homes, surface, current, expected):
+    source, target = homes
+    source_before = (source / "config.yaml").read_bytes()
+    write_cfg(target, {"model": {"provider": current, "default": "original"}})
+    assign_model(target, surface, "moonshotai", "moonshotai/kimi-k2.6")
+    assert read_cfg(target)["model"]["provider"] == expected
+    assert read_cfg(target)["model"]["default"] == "moonshotai/kimi-k2.6"
+    assert (source / "config.yaml").read_bytes() == source_before
+
+
+@pytest.mark.parametrize("surface", ["main", "profile"])
+@pytest.mark.parametrize("provider,model,definition", [
+    ("Acme", "acme/model", {"providers": {"target-key": {
+        "name": "Acme", "base_url": "http://target.invalid/v1", "enabled": False}}}),
+    ("acme", "acme/model", {"providers": {"acme": None}}),
+    ("Acme", "acme/model", {"custom_providers": [{"name": "Acme"}]}),
+    ("Acme", "acme/model", {"custom_providers": [{
+        "name": "Acme", "base_url": "http://target.invalid/v1", "enabled": False}]}),
+    ("custom:missing", "vendor/model", {}),
+    ("ollama-launch", "ollama/model", {}),
+    ("missing", "vendor/model", {}),
+    ("missing", "unprefixed-model", {}),
+    ("moonshotai", "moonshotai/kimi-k2.6", {"providers": {"openrouter": {"enabled": False}}}),
+])
+def test_vendor_fallback_cannot_hide_invalid_raw_or_effective_target(homes, surface, provider, model, definition):
+    source, target = homes
+    source_before = (source / "config.yaml").read_bytes()
+    path = write_cfg(target, {"model": {"provider": "openrouter", "default": "original"}, **definition})
+    before = path.read_bytes()
+    with pytest.raises(HTTPException) as err:
+        assign_model(target, surface, provider, model)
+    assert err.value.status_code == 400
+    assert path.read_bytes() == before
+    assert (source / "config.yaml").read_bytes() == source_before
+
+
 @pytest.mark.parametrize("provider,definition", [
     ("openrouter", {}), ("anthropic", {}), ("openai-codex", {}),
     ("claude", {"providers": {"anthropic": {"enabled": True}}}),
