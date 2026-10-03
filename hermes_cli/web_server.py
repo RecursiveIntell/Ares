@@ -1958,7 +1958,9 @@ def _validate_model_assignment_provider(
     # Check raw entries as well as the compatibility view: disabled entries
     # are omitted from that view but must not fall through to a built-in alias.
     for key, entry in providers_cfg.items():
-        matches_builtin = not requested.startswith("custom:") and canonical == _model_assignment_provider_category(str(key))
+        # Canonical declarations own their native aliases. An alias-named
+        # independent endpoint owns only its declared key/name identities.
+        matches_builtin = not requested.startswith("custom:") and canonical == str(key).strip().lower()
         if matches_builtin or requested in custom_provider_aliases(str(entry.get("name") or key) if isinstance(entry, dict) else str(key), str(key)):
             if not isinstance(entry, dict) or not is_provider_enabled(entry):
                 raise HTTPException(status_code=400, detail=f"Provider '{provider}' is disabled or invalid in this profile")
