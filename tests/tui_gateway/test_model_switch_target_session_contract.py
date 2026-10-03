@@ -1,5 +1,6 @@
 """Real selectors and session commit/metadata boundaries with inert clients."""
 import copy
+import threading
 
 import pytest
 
@@ -12,7 +13,7 @@ from tui_gateway import server
 @pytest.fixture
 def gateway(routes, agent, monkeypatch):
     value, _ = agent
-    session = {'agent': value, 'history': [],
+    session = {'agent': value, 'history': [], 'history_lock': threading.Lock(),
                'model_override': {'model': 'model-a', 'provider': 'endpoint-a'},
                'model_verified_for': ('endpoint-a', 'model-a')}
     events = []
