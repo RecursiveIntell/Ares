@@ -25,7 +25,8 @@ const handle = async (method, params) => {
     return packet.submit_ack.result
   }
   if (method === 'session.resume' || method === 'session.turn.poll') return submitted ? packet.resume_result : {
-    session_id: 's', session_key: 's', running: false, inflight: null, messages: []
+    session_id: 's', session_key: 's', running: false, inflight: null, messages: [],
+    turn_outcomes: { version: 1, scope: 'process_local', availability: 'available', turns: [] }
   }
   if (method === 'session.interrupt') return {}
   throw new Error(`Unexpected bridge RPC: ${method}`)
