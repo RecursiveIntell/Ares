@@ -2426,7 +2426,13 @@ def _prefetch_provider_models_parallel(provider_slugs: list[str]) -> None:
         max_workers=min(_PARALLEL_PREFETCH_WORKERS, len(stale_slugs)),
         thread_name_prefix="model-cache-prefetch",
     ) as executor:
-        list(executor.map(_fetch_one, stale_slugs))
+        # Each task needs its own copy: one Context cannot be entered by
+        # concurrent workers. Carry both target home and credential scope.
+        from contextvars import copy_context
+        context = copy_context()
+        futures = [executor.submit(context.copy().run, _fetch_one, slug) for slug in stale_slugs]
+        for future in futures:
+            future.result()
 
 
 def _collect_authed_provider_slugs(
@@ -2560,13 +2566,17 @@ def _collect_authed_provider_slugs(
             seen.add(pid.lower())
             seen.add(hermes_slug.lower())
 
-    # --- Section 2b: Canonical providers cross-check ---
+        # --- Section 2b: Canonical providers cross-check ---
     for _cp in CANONICAL_PROVIDERS:
         if _cp.slug.lower() in seen:
             continue
         if _cp.slug.lower() in _excluded_set:
             continue
         _cp_config = PROVIDER_REGISTRY.get(_cp.slug)
+        if _cp_config and getattr(_cp_config, "auth_type", "") == "aws_sdk":
+            # A saved auth record or pool does not make the SDK's ambient
+            # credential chain safe for a target-profile catalog prefetch.
+            continue
         _cp_has_creds = False
         if _cp_config and _cp_config.api_key_env_vars:
             _cp_has_creds = any(_scoped_key_env(ev) for ev in _cp_config.api_key_env_vars)
@@ -2584,8 +2594,6 @@ def _collect_authed_provider_slugs(
                     _cp_has_creds = True
             except Exception:
                 pass
-        if not _cp_has_creds and _cp_config and getattr(_cp_config, "auth_type", "") == "aws_sdk":
-            continue  # skip AWS SDK in prefetch
         if _cp_has_creds:
             slugs.append(_cp.slug)
             seen.add(_cp.slug.lower())
@@ -2657,8 +2665,17 @@ def list_authenticated_providers(
         clear_provider_models_cache, get_curated_nous_model_ids,
     )
 
+    def _catalog_provider_model_ids(slug):
+        from agent.secret_scope import current_secret_scope
+        scope = current_secret_scope()
+        if slug == "bedrock" and scope is not None and not scope.allow_environment_fallback:
+            # The SDK discovers through its process-global credential chain.
+            # A cross-profile catalog can use curated IDs without that probe.
+            return list(_PROVIDER_MODELS.get(slug, []))
+        return cached_provider_model_ids(slug)
+
     # Explicit refresh: drop every provider's cached model-id list so the
-    # cached_provider_model_ids() calls below all re-fetch live. Without this
+    # _catalog_provider_model_ids() calls below all re-fetch live. Without this
     # a stale 1h cache can fall back to the curated static list when its live
     # fetch later fails, silently dropping live-only models (e.g. OpenCode
     # Zen's free tier) the user had seen before.
@@ -2706,7 +2723,7 @@ def list_authenticated_providers(
             return
         url = ""
         if getattr(pcfg, "base_url_env_var", ""):
-            url = os.environ.get(pcfg.base_url_env_var, "") or ""
+            url = _scoped_key_env(pcfg.base_url_env_var) or ""
         if not url:
             url = getattr(pcfg, "inference_base_url", "") or ""
         normed = _norm_url(url)
@@ -2721,15 +2738,15 @@ def list_authenticated_providers(
         botocore may otherwise probe EC2 IMDS (169.254.169.254) on local
         machines before returning no credentials.
         """
-        if os.environ.get("AWS_BEARER_TOKEN_BEDROCK", "").strip():
+        if _scoped_key_env("AWS_BEARER_TOKEN_BEDROCK").strip():
             return True
         if (
-            os.environ.get("AWS_ACCESS_KEY_ID", "").strip()
-            and os.environ.get("AWS_SECRET_ACCESS_KEY", "").strip()
+            _scoped_key_env("AWS_ACCESS_KEY_ID").strip()
+            and _scoped_key_env("AWS_SECRET_ACCESS_KEY").strip()
         ):
             return True
         return any(
-            os.environ.get(name, "").strip()
+            _scoped_key_env(name).strip()
             for name in (
                 "AWS_PROFILE",
                 "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
@@ -2744,6 +2761,11 @@ def list_authenticated_providers(
         current_norm = str(current_provider or "").strip().lower()
         if _has_fast_aws_sdk_signal():
             return True
+        from agent.secret_scope import current_secret_scope
+        scope = current_secret_scope()
+        if scope is not None and not scope.allow_environment_fallback:
+            # boto3's ambient chain is process-owned, not this target profile.
+            return False
         if slug_norm != current_norm:
             return False
         try:
@@ -2774,19 +2796,19 @@ def list_authenticated_providers(
     # On auth rejection or unreachable server, fall back to the caller-supplied
     # current model so the picker still shows something when offline / mis-keyed.
     if "lmstudio" not in curated and (
-        os.environ.get("LM_API_KEY") or os.environ.get("LM_BASE_URL") or current_provider.strip().lower() == "lmstudio"
+        _scoped_key_env("LM_API_KEY") or _scoped_key_env("LM_BASE_URL") or current_provider.strip().lower() == "lmstudio"
     ):
         from hermes_cli.models import fetch_lmstudio_models
         from hermes_cli.auth import AuthError
         is_current_lmstudio = current_provider.strip().lower() == "lmstudio"
         lm_base = (
-            os.environ.get("LM_BASE_URL")
+            _scoped_key_env("LM_BASE_URL")
             or (current_base_url if is_current_lmstudio and current_base_url else None)
             or "http://127.0.0.1:1234/v1"
         )
         try:
             live = fetch_lmstudio_models(
-                api_key=os.environ.get("LM_API_KEY", ""),
+                api_key=_scoped_key_env("LM_API_KEY"),
                 base_url=lm_base,
                 timeout=1.5, # Smaller timeout for picker
             )
@@ -2798,7 +2820,7 @@ def list_authenticated_providers(
 
     # --- Parallel cache prefetch ---------------------------------------------
     # The serial loops below (sections 1, 2, 2b) each call
-    # cached_provider_model_ids(slug) which blocks on a live /v1/models HTTP
+    # _catalog_provider_model_ids(slug) which blocks on a live /v1/models HTTP
     # round-trip when the disk cache is stale or missing.  With many authed
     # providers those serial round-trips stack to 15-30s on a cold/expired
     # cache.  Pre-scanning which providers have credentials (without fetching
@@ -2891,7 +2913,7 @@ def list_authenticated_providers(
                 continue
 
         # Check if any env var is set
-        has_creds = any(os.environ.get(ev) for ev in env_vars)
+        has_creds = any(_scoped_key_env(ev) for ev in env_vars)
         if not has_creds:
             try:
                 from hermes_cli.auth import _load_auth_store
@@ -2908,11 +2930,11 @@ def list_authenticated_providers(
         if not has_creds:
             continue
 
-        # Unified pathway: route through cached_provider_model_ids() so the
+        # Unified pathway: route through _catalog_provider_model_ids() so the
         # /model picker sees the SAME list `hermes model` would build, with
         # disk caching to keep the picker open snappy. Falls back to the
         # curated static list when the live fetcher returns nothing.
-        model_ids = cached_provider_model_ids(hermes_id)
+        model_ids = _catalog_provider_model_ids(hermes_id)
         if not model_ids:
             model_ids = curated.get(hermes_id, [])
             if hermes_id in _MODELS_DEV_PREFERRED:
@@ -2990,13 +3012,13 @@ def list_authenticated_providers(
             except Exception as exc:
                 logger.debug("Vertex credential check failed: %s", exc)
         elif overlay.extra_env_vars:
-            has_creds = any(os.environ.get(ev) for ev in overlay.extra_env_vars)
+            has_creds = any(_scoped_key_env(ev) for ev in overlay.extra_env_vars)
         # Also check api_key_env_vars from PROVIDER_REGISTRY for api_key auth_type
         if not has_creds and overlay.auth_type == "api_key":
             for _key in (pid, hermes_slug):
                 pcfg = _auth_registry.get(_key)
                 if pcfg and pcfg.api_key_env_vars:
-                    if any(os.environ.get(ev) for ev in pcfg.api_key_env_vars):
+                    if any(_scoped_key_env(ev) for ev in pcfg.api_key_env_vars):
                         has_creds = True
                         break
         # Check auth store and credential pool for non-env-var credentials.
@@ -3064,15 +3086,15 @@ def list_authenticated_providers(
             # matches what the user's authenticated Codex/Copilot backend
             # actually serves — including ChatGPT-Pro-only Codex slugs
             # (e.g. gpt-5.3-codex-spark) that aren't in the static curated
-            # catalog. ``cached_provider_model_ids()`` falls back to the
+            # catalog. ``_catalog_provider_model_ids()`` falls back to the
             # curated list when the live endpoint is unreachable, so this
             # is safe for unauthenticated and offline cases too.
-            model_ids = cached_provider_model_ids(hermes_slug)
+            model_ids = _catalog_provider_model_ids(hermes_slug)
         # For aws_sdk providers (bedrock), use live discovery so the list
         # reflects the active region (eu.*, ap.*) not the static us.* list.
         elif overlay.auth_type == "aws_sdk":
             try:
-                _ids = cached_provider_model_ids(hermes_slug)
+                _ids = _catalog_provider_model_ids(hermes_slug)
                 model_ids = _ids if _ids else (curated.get(hermes_slug, []) or curated.get(pid, []))
             except Exception:
                 model_ids = curated.get(hermes_slug, []) or curated.get(pid, [])
@@ -3117,7 +3139,7 @@ def list_authenticated_providers(
             # Unified pathway — see Section 1 rationale. Fall back to the
             # curated dict (with models.dev merge for preferred providers)
             # when the live fetcher comes up empty.
-            model_ids = cached_provider_model_ids(hermes_slug)
+            model_ids = _catalog_provider_model_ids(hermes_slug)
             if not model_ids:
                 model_ids = curated.get(hermes_slug, []) or curated.get(pid, [])
                 if hermes_slug in _MODELS_DEV_PREFERRED:
@@ -3160,7 +3182,7 @@ def list_authenticated_providers(
         _cp_config = _auth_registry.get(_cp.slug)
         _cp_has_creds = False
         if _cp_config and _cp_config.api_key_env_vars:
-            _cp_has_creds = any(os.environ.get(ev) for ev in _cp_config.api_key_env_vars)
+            _cp_has_creds = any(_scoped_key_env(ev) for ev in _cp_config.api_key_env_vars)
         # Also check auth store and credential pool
         if not _cp_has_creds:
             try:
@@ -3191,13 +3213,13 @@ def list_authenticated_providers(
         # region (eu.*, us.*, ap.*) instead of the hardcoded us.* static list.
         if _cp_config and getattr(_cp_config, "auth_type", "") == "aws_sdk":
             try:
-                _ids = cached_provider_model_ids(_cp.slug)
+                _ids = _catalog_provider_model_ids(_cp.slug)
                 _cp_model_ids = _ids if _ids else curated.get(_cp.slug, [])
             except Exception:
                 _cp_model_ids = curated.get(_cp.slug, [])
         else:
             # Unified pathway — same as sections 1 and 2.
-            _cp_model_ids = cached_provider_model_ids(_cp.slug)
+            _cp_model_ids = _catalog_provider_model_ids(_cp.slug)
             if not _cp_model_ids:
                 _cp_model_ids = curated.get(_cp.slug, [])
         _cp_total = len(_cp_model_ids)
