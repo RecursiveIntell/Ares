@@ -7777,6 +7777,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if text is None:
             self._flush_stream()
             self._reset_stream_state()
+            getattr(self, "_turn_streamed_segments", []).append("")
             return
         if not text:
             return
@@ -7950,6 +7951,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             fill = w - 2 - HermesCLI._status_bar_display_width(label)
             _cprint(f"\n{_ACCENT}╭─{label}{'─' * max(fill - 1, 0)}╮{_RST}")
 
+        # Keep delivery evidence across tool boundaries; opening a box alone
+        # does not prove that the result's eventual partial draft was shown.
+        segments = getattr(self, "_turn_streamed_segments", None)
+        if segments is not None:
+            if not segments:
+                segments.append("")
+            segments[-1] += text
         self._stream_buf += text
 
         # Emit complete lines, keep partial remainder in buffer
@@ -14484,6 +14492,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         stacked line to scrollback on tool.completed so users can see the
         full history of tool calls (not just the current one in the spinner).
         """
+        # Native tool events do not send the default runtime's delta(None).
+        # Close the preceding text segment at this real semantic boundary.
+        segments = getattr(self, "_turn_streamed_segments", None)
+        if event_type == "tool.started" and segments and segments[-1]:
+            self._stream_delta(None)
         # MoA reference-model outputs: render each reference's answer as a
         # labelled thinking-style block BEFORE the aggregator acts, so the user
         # sees the mixture-of-agents process instead of a silent pause. These
@@ -16568,6 +16581,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
             # Reset streaming display state for this turn
             self._reset_stream_state()
+            self._turn_streamed_segments = [""]
             # Separate from _reset_stream_state because this must persist
             # across intermediate turn boundaries (tool-calling loops) — only
             # reset at the start of each user turn.
@@ -16590,6 +16604,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # chunks as they arrive, everything else synthesizes per sentence.
             use_streaming_tts = False
             _streaming_box_opened = False
+            _tts_displayed_text = ""
+            _tts_displayed_sentences = []
             _thinking_started = False
             text_queue = None
             tts_thread = None
@@ -16623,7 +16639,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 if not self.streaming_enabled:
                     def display_callback(sentence: str):
                         """Called by TTS consumer when a sentence is ready to display + speak."""
-                        nonlocal _streaming_box_opened
+                        nonlocal _streaming_box_opened, _tts_displayed_text
                         if not _streaming_box_opened:
                             _streaming_box_opened = True
                             w = self._scrollback_box_width(getattr(self.console, "width", 80))
@@ -16633,6 +16649,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             fill = w - 2 - HermesCLI._status_bar_display_width(label)
                             _cprint(f"\n{_ACCENT}╭─{label}{'─' * max(fill - 1, 0)}╮{_RST}")
                         _cprint(f"{_STREAM_PAD}{sentence.rstrip()}")
+                        _tts_displayed_text += sentence
+                        _tts_displayed_sentences.append(sentence)
                     _tts_display_cb = display_callback
 
                 tts_thread = threading.Thread(
@@ -16975,6 +16993,26 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if _partial_draft:
                 _partial_notice = f"[Partial response — {result.get('error') or 'processing incomplete'}]"
                 response = f"{_partial_draft}\n\n{_partial_notice}"
+            _partial_remaining = _partial_draft
+            if _partial_draft:
+                # TTS can display queued commentary after a tool callback.
+                # Correlate only at its actual sentence-display boundaries,
+                # after joining the consumer, rather than resetting its
+                # delivery evidence from the producer thread.
+                _tts_tails = [
+                    "".join(_tts_displayed_sentences[index:])
+                    for index in range(len(_tts_displayed_sentences))
+                ]
+                for displayed in self._turn_streamed_segments + [_tts_displayed_text] + _tts_tails:
+                    if not displayed:
+                        continue
+                    if displayed.endswith(_partial_draft):
+                        _partial_remaining = ""
+                        break
+                    if _partial_draft.startswith(displayed):
+                        suffix = _partial_draft[len(displayed):]
+                        if len(suffix) < len(_partial_remaining):
+                            _partial_remaining = suffix
 
             # Session titling now runs at TURN START (agent/turn_context.py)
             # from the user's message alone, so it is already done — or in
@@ -17078,14 +17116,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
                 is_error_response = result and (result.get("failed") or result.get("partial"))
                 already_streamed = self._stream_started and self._stream_box_opened and not is_error_response
-                if _partial_draft and (
-                    self._stream_started and self._stream_box_opened
-                    or use_streaming_tts and _streaming_box_opened
-                ):
-                    # The draft is already visible; label its outcome once.
+                if _partial_draft and _partial_remaining != _partial_draft:
+                    # Display only the draft suffix proven missing from the
+                    # actual text, then label the incomplete outcome once.
                     if use_streaming_tts and _streaming_box_opened and not self._stream_box_opened:
                         w = self._scrollback_box_width()
                         _cprint(f"\n{_ACCENT}╰{'─' * (w - 2)}╯{_RST}")
+                    if _partial_remaining:
+                        _cprint(_partial_remaining)
                     _cprint(f"\n{_DIM}{_partial_notice}{_RST}")
                 elif use_streaming_tts and _streaming_box_opened and not is_error_response:
                     # Text was already printed sentence-by-sentence; just close the box

@@ -485,7 +485,8 @@ def test_concurrent_request_notify_response_frames_remain_whole(tmp_path):
 
 
 @pytest.mark.parametrize("before_ack", [False, True])
-def test_supported_empty_ack_compaction_preserves_thread_over_real_wire(tmp_path, before_ack):
+@pytest.mark.parametrize("compaction_event", ["item_pair", "legacy_notification"])
+def test_supported_empty_ack_compaction_preserves_thread_over_real_wire(tmp_path, before_ack, compaction_event):
     """The inert child speaks protocol lifecycle, including delayed prior events."""
     dummy = tmp_path / "compact-protocol-child"
     dummy.write_text(
@@ -509,9 +510,11 @@ def test_supported_empty_ack_compaction_preserves_thread_over_real_wire(tmp_path
         "        note('turn/completed', 'prior')\n"
         "        emit({'method': 'turn/started', 'params': {'threadId': 'foreign', 'turn': {'id': 'foreign-turn'}}})\n"
         "        note('turn/completed', 'compact')\n"
-        "        note('turn/started', 'compact')\n"
-        "        note('item/started', 'compact', {'type': 'contextCompaction', 'id': 'compact-item'})\n"
-        "        note('item/completed', 'compact', {'type': 'contextCompaction', 'id': 'compact-item'})\n"
+        "        note('turn/started', 'compact')\n" +
+        ("        note('item/started', 'compact', {'type': 'contextCompaction', 'id': 'compact-item'})\n"
+         "        note('item/completed', 'compact', {'type': 'contextCompaction', 'id': 'compact-item'})\n"
+         if compaction_event == "item_pair" else
+         "        emit({'method': 'thread/compacted', 'params': {'threadId': 'canonical', 'turnId': 'compact'}})\n") +
         "        note('turn/completed', 'compact')\n"
         f"        if {before_ack!r}: emit({{'id': msg['id'], 'result': {{}}}})\n"
         "    elif method == 'turn/start':\n"
@@ -530,5 +533,90 @@ def test_supported_empty_ack_compaction_preserves_thread_over_real_wire(tmp_path
         assert session._thread_id == "canonical" and not session._closed and client.is_alive()
         next_turn = session.run_turn("continue", turn_timeout=1, notification_poll_timeout=0.001)
         assert next_turn.completed and next_turn.thread_id == "canonical"
+    finally:
+        session.close()
+
+
+@pytest.mark.parametrize("invalid_event", [
+    {"method": "thread/compacted", "params": {"threadId": "foreign", "turnId": "compact"}},
+    {"method": "thread/compacted", "params": {"threadId": "canonical", "turnId": "prior"}},
+    {"method": "thread/compacted", "params": {}},
+    {"method": "thread/compacted", "params": {"threadId": "canonical"}},
+    {"method": "thread/compacted", "params": {"turnId": "compact"}},
+    {"method": "thread/compacted", "params": {"thread_id": "canonical", "turn_id": "compact"}},
+    {"method": "thread/compacted", "params": {
+        "threadId": "canonical", "turnId": "compact", "turn": {"id": "prior"}}},
+    {"method": "thread/compacted", "params": {
+        "threadId": "canonical", "turnId": "compact", "thread_id": "foreign"}},
+    {"method": "thread/tokenUsage/updated", "params": {"threadId": "canonical", "turnId": "compact"}},
+    None,
+], ids=["foreign", "prior", "unscoped", "missing-turn", "missing-thread", "unsupported-aliases",
+        "conflicting-turn", "conflicting-thread", "noncompaction", "terminal-only"])
+def test_legacy_compaction_requires_canonical_bound_completion_over_wire(tmp_path, invalid_event):
+    """Negative peer frames cannot certify compaction or preserve an uncertain child."""
+    dummy = tmp_path / "legacy-negative-child"
+    dummy.write_text(
+        f"#!{sys.executable}\n"
+        "import json, sys\n"
+        f"event = {invalid_event!r}\n"
+        "def emit(frame): print(json.dumps(frame), flush=True)\n"
+        "for line in sys.stdin:\n"
+        "    msg = json.loads(line)\n"
+        "    if 'id' not in msg or 'method' not in msg: continue\n"
+        "    if msg['method'] == 'thread/read':\n"
+        "        emit({'id': msg['id'], 'result': {'thread': {'id': 'canonical', 'status': {'type': 'idle'}, 'turns': [{'id': 'prior', 'status': 'completed'}]}}})\n"
+        "    elif msg['method'] == 'thread/compact/start':\n"
+        "        emit({'id': msg['id'], 'result': {}})\n"
+        "        emit({'method': 'turn/started', 'params': {'threadId': 'canonical', 'turn': {'id': 'compact', 'status': 'inProgress'}}})\n"
+        "        if event is not None: emit(event)\n"
+        "        emit({'method': 'turn/completed', 'params': {'threadId': 'canonical', 'turn': {'id': 'compact', 'status': 'completed', 'error': None}}})\n"
+        "    else: emit({'id': msg['id'], 'result': {}})\n",
+        encoding="utf-8",
+    )
+    dummy.chmod(0o700)
+    client = cas.CodexAppServerClient(codex_bin=str(dummy))
+    session = CodexAppServerSession()
+    session._client, session._thread_id = client, "canonical"
+    try:
+        result = session.compact_thread(turn_timeout=1, notification_poll_timeout=0.001)
+        assert not result.completed and result.final_text == "" and result.error
+        assert result.should_retire and session._closed and client._closed
+        assert result.thread_id == "canonical" and result.turn_id == "compact"
+    finally:
+        session.close()
+
+
+@pytest.mark.parametrize("timing", ["before-start", "prequeued"])
+def test_legacy_compaction_preboundary_notification_cannot_certify_over_wire(tmp_path, timing):
+    dummy = tmp_path / "legacy-boundary-child"
+    dummy.write_text(
+        f"#!{sys.executable}\n"
+        "import json, sys\n"
+        f"timing = {timing!r}\n"
+        "def emit(frame): print(json.dumps(frame), flush=True)\n"
+        "def start(): emit({'method': 'turn/started', 'params': {'threadId': 'canonical', 'turn': {'id': 'compact', 'status': 'inProgress'}}})\n"
+        "def compacted(): emit({'method': 'thread/compacted', 'params': {'threadId': 'canonical', 'turnId': 'compact'}})\n"
+        "for line in sys.stdin:\n"
+        "    msg = json.loads(line)\n"
+        "    if 'id' not in msg or 'method' not in msg: continue\n"
+        "    if msg['method'] == 'thread/read':\n"
+        "        if timing == 'prequeued': start(); compacted()\n"
+        "        emit({'id': msg['id'], 'result': {'thread': {'id': 'canonical', 'status': {'type': 'idle'}, 'turns': []}}})\n"
+        "    elif msg['method'] == 'thread/compact/start':\n"
+        "        emit({'id': msg['id'], 'result': {}})\n"
+        "        if timing == 'before-start': compacted()\n"
+        "        start()\n"
+        "        emit({'method': 'turn/completed', 'params': {'threadId': 'canonical', 'turn': {'id': 'compact', 'status': 'completed', 'error': None}}})\n"
+        "    else: emit({'id': msg['id'], 'result': {}})\n",
+        encoding="utf-8",
+    )
+    dummy.chmod(0o700)
+    client = cas.CodexAppServerClient(codex_bin=str(dummy))
+    session = CodexAppServerSession()
+    session._client, session._thread_id = client, "canonical"
+    try:
+        result = session.compact_thread(turn_timeout=0.1, notification_poll_timeout=0.001)
+        assert not result.completed and result.should_retire and result.error
+        assert session._closed and client._closed and result.final_text == ""
     finally:
         session.close()

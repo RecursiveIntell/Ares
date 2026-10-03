@@ -21,6 +21,18 @@ from hermes_state import SessionDB
 
 DRAFT = "A native draft that must remain accessible."
 ERROR = "native terminal incomplete"
+COMMENTARY = "Earlier unrelated commentary."
+BRIDGE_EVENTS = [
+    {"method": "item/agentMessage/delta", "params": {"delta": COMMENTARY}},
+    {"method": "item/started", "params": {"item": {
+        "type": "commandExecution", "id": "bridge-tool", "command": "inert command",
+    }}},
+    {"method": "item/completed", "params": {"item": {
+        "type": "commandExecution", "id": "bridge-tool", "command": "inert command",
+        "exitCode": 0, "aggregatedOutput": "inert result",
+    }}},
+    {"method": "item/agentMessage/delta", "params": {"delta": DRAFT[:20]}},
+]
 
 
 @pytest_asyncio.fixture
@@ -54,16 +66,18 @@ def native(monkeypatch, tmp_path):
         error=ERROR, thread_id="native-thread", turn_id="native-turn",
         projected_messages=[{"role": "assistant", "content": DRAFT}],
     )
-    memory, review, results = [], [], []
+    memory, review, results, inputs, events = [], [], [], [], []
 
     class NativeSession:
         def __init__(self, **kwargs):
-            pass
+            self.on_event = kwargs.get("on_event")
 
         def matches_route(self, **kwargs):
             return True
 
         def run_turn(self, **kwargs):
+            for event in events:
+                self.on_event(event)
             return turn
 
         def close(self):
@@ -88,7 +102,14 @@ def native(monkeypatch, tmp_path):
             self.max_iterations = 500
             self._active_children = []
             self.stream_delta_callback = kwargs.get("stream_delta_callback")
+            self.tool_progress_callback = kwargs.get("tool_progress_callback")
+            self.tool_start_callback = kwargs.get("tool_start_callback")
+            self.tool_complete_callback = kwargs.get("tool_complete_callback")
+            self._stream_callback = None
             self.emit_deltas = False
+            self.stream_deltas = None
+            self.history_prefix = None
+            self.rotated_session_id = None
 
         def clear_interrupt(self):
             self._interrupt_requested = False
@@ -99,22 +120,34 @@ def native(monkeypatch, tmp_path):
         def _spawn_background_review(self, **kwargs):
             review.append(kwargs)
 
+        def _fire_stream_delta(self, delta):
+            if self.stream_delta_callback:
+                self.stream_delta_callback(delta)
+            if delta is not None and self._stream_callback:
+                self._stream_callback(delta)
+
         def run_conversation(self, user_message=None, conversation_history=None, **kwargs):
+            inputs.append({"session_id": self.session_id, "history": list(conversation_history or [])})
             self._interrupt_requested = turn.interrupted
             self._interrupt_message = None
-            if self.emit_deltas and self.stream_delta_callback:
-                self.stream_delta_callback(DRAFT)
-            messages = list(conversation_history or [])
+            self._stream_callback = kwargs.get("stream_callback")
+            if self.stream_delta_callback or self._stream_callback:
+                for delta in (self.stream_deltas if self.stream_deltas is not None else [DRAFT] if self.emit_deltas else []):
+                    self._fire_stream_delta(delta)
+            messages = list(self.history_prefix if self.history_prefix is not None else conversation_history or [])
             messages.append({"role": "user", "content": user_message})
             result = codex_runtime.run_codex_app_server_turn(
                 self, user_message=user_message, original_user_message=user_message,
                 messages=messages, effective_task_id=self.session_id,
                 should_review_memory=True,
             )
+            if self.rotated_session_id:
+                self.session_id = self.rotated_session_id
+                self._last_compaction_in_place = True
             results.append(result)
             return result
 
-    return SimpleNamespace(Agent=NativeAgent, turn=turn, results=results, memory=memory, review=review)
+    return SimpleNamespace(Agent=NativeAgent, turn=turn, results=results, inputs=inputs, events=events, memory=memory, review=review)
 
 
 def _assert_incomplete(native):
@@ -164,6 +197,119 @@ def test_cli_chat_renders_labeled_native_draft(native, interrupted, streaming):
     else:
         assert any(DRAFT in str(getattr(panel, "renderable", "")) for panel in panels)
     assert cli._last_turn_interrupted is interrupted
+    _assert_incomplete(native)
+
+
+@pytest.mark.parametrize("deltas", [
+    ["Earlier unrelated commentary."],
+    [DRAFT[:20]],
+    [DRAFT],
+    ["Earlier unrelated commentary.", None, DRAFT[:20]],
+    [DRAFT, None],
+    "native_bridge",
+    ["Earlier unrelated commentary ends in A"],
+])
+def test_cli_partial_draft_reconciles_actual_visible_text_across_tool_boundary(native, deltas):
+    from tests.cli.test_cli_interrupt_ack_race import _make_cli
+    import cli as cli_module
+
+    cli = _make_cli()
+    cli.final_response_markdown = "raw"
+    cli.agent = native.Agent(session_id=cli.session_id, tool_progress_callback=cli._on_tool_progress)
+    cli.agent.stream_deltas = [] if deltas == "native_bridge" else deltas
+    if deltas == "native_bridge":
+        native.events.extend(BRIDGE_EVENTS)
+    cli.agent.stream_delta_callback = cli._stream_delta
+    panels, printed = [], []
+    with patch.object(cli, "_ensure_runtime_credentials", return_value=True), \
+         patch.object(cli, "_resolve_turn_agent_config", return_value={
+             "signature": cli._active_agent_route_signature,
+             "model": None, "runtime": None, "request_overrides": None,
+         }), \
+         patch.object(cli, "_init_agent", return_value=True), \
+         patch.object(cli_module, "ChatConsole") as console, \
+         patch.object(cli_module, "_cprint", side_effect=printed.append):
+        console.return_value.print.side_effect = panels.append
+        response = cli.chat("continue")
+
+    displayed = "\n".join(str(text) for text in printed) + "\n" + "\n".join(
+        getattr(panel.renderable, "plain", str(panel.renderable))
+        for panel in panels if hasattr(panel, "renderable")
+    )
+    assert displayed.count(DRAFT[:20]) == 1
+    assert displayed.count(DRAFT[20:]) == 1
+    assert displayed.count("Partial response") == 1
+    assert DRAFT in response and ERROR in response
+    _assert_incomplete(native)
+
+
+@pytest.mark.parametrize("deltas", [
+    "native_bridge", "native_bridge_delayed", [DRAFT], [COMMENTARY], ["Earlier commentary ends in A"],
+])
+def test_cli_tts_display_reconciles_actual_sentence_callbacks(native, monkeypatch, deltas):
+    from tests.cli.test_cli_interrupt_ack_race import _make_cli
+    import cli as cli_module
+    import threading
+    from tools import tts_tool
+
+    cli = _make_cli()
+    cli.final_response_markdown = "raw"
+    cli.streaming_enabled = False
+    cli._voice_tts = True
+    bridge = isinstance(deltas, str)
+    tool_finished = threading.Event()
+
+    def tool_progress(event_type, *args, **kwargs):
+        cli._on_tool_progress(event_type, *args, **kwargs)
+        if event_type == "tool.completed":
+            tool_finished.set()
+
+    cli.agent = native.Agent(session_id=cli.session_id, tool_progress_callback=tool_progress)
+    cli.agent.stream_deltas = [] if bridge else deltas
+    if bridge:
+        native.events.extend(BRIDGE_EVENTS)
+    sentences, printed, panels, gate_results = [], [], [], []
+
+    def consume(text_queue, stop_event, done_event, display_callback=None):
+        try:
+            if deltas == "native_bridge_delayed":
+                # Commentary is produced before tool.started, but no display
+                # callback runs until the actual bridged tool has completed.
+                gate_results.append(tool_finished.wait(timeout=2))
+            while True:
+                sentence = text_queue.get(timeout=2)
+                if sentence is None:
+                    return
+                sentences.append(sentence)
+                display_callback(sentence)
+        finally:
+            done_event.set()
+
+    monkeypatch.setattr(tts_tool, "_import_sounddevice", lambda: None)
+    monkeypatch.setattr(tts_tool, "check_tts_requirements", lambda: True)
+    monkeypatch.setattr(tts_tool, "stream_tts_to_speaker", consume)
+    with patch.object(cli, "_ensure_runtime_credentials", return_value=True), \
+         patch.object(cli, "_resolve_turn_agent_config", return_value={
+             "signature": cli._active_agent_route_signature,
+             "model": None, "runtime": None, "request_overrides": None,
+         }), \
+         patch.object(cli, "_init_agent", return_value=True), \
+         patch.object(cli_module, "ChatConsole") as console, \
+         patch.object(cli_module, "_cprint", side_effect=printed.append):
+        console.return_value.print.side_effect = panels.append
+        response = cli.chat("continue")
+    assert sentences == ([COMMENTARY, DRAFT[:20]] if bridge else deltas)
+    if deltas == "native_bridge_delayed":
+        assert gate_results == [True]
+    displayed = "\n".join(str(text) for text in printed) + "\n" + "\n".join(
+        getattr(panel.renderable, "plain", str(panel.renderable))
+        for panel in panels if hasattr(panel, "renderable")
+    )
+    # The real sentence callback strips trailing whitespace before display.
+    assert displayed.count(DRAFT[:20].rstrip()) == 1
+    assert displayed.count(DRAFT[20:]) == 1
+    assert displayed.count("Partial response") == 1
+    assert DRAFT in response and ERROR in response
     _assert_incomplete(native)
 
 
@@ -277,6 +423,137 @@ def _events(stream):
             name = next((line[7:] for line in lines if line.startswith("event: ")), None)
             events.append((name, json.loads(data)))
     return events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["chat", "responses"])
+@pytest.mark.parametrize("deltas", [
+    ["Earlier unrelated commentary."], [DRAFT[:20]], [DRAFT],
+    ["Earlier unrelated commentary.", None, DRAFT[:20]],
+    "native_bridge",
+    ["Earlier unrelated commentary ends in A"],
+])
+async def test_api_stream_reconciles_distinct_or_partly_delivered_native_draft(
+    native, monkeypatch, inert_api_executor, endpoint, deltas,
+):
+    adapter = api_server.APIServerAdapter(PlatformConfig(enabled=True))
+
+    def create_agent(**kwargs):
+        agent = native.Agent(**kwargs)
+        agent.stream_deltas = [] if deltas == "native_bridge" else deltas
+        return agent
+
+    if deltas == "native_bridge":
+        native.events.extend(BRIDGE_EVENTS)
+    monkeypatch.setattr(adapter, "_create_agent", create_agent)
+    monkeypatch.setattr(api_server, "_publish_turn_process_ownership", lambda *args: None)
+    monkeypatch.setattr(api_server, "_clear_turn_process_ownership", lambda *args: None)
+    monkeypatch.setattr(api_server.web, "StreamResponse", CaptureStream)
+    body = {"stream": True, "model": "hermes-agent"}
+    if endpoint == "chat":
+        body["messages"] = [{"role": "user", "content": "continue"}]
+        handler = adapter._handle_chat_completions
+    else:
+        body["input"] = "continue"
+        handler = adapter._handle_responses
+    request = SimpleNamespace(headers={}, json=AsyncMock(return_value=body), query={})
+    response = await asyncio.wait_for(handler(request), timeout=5)
+    events = _events(response)
+    if deltas == "native_bridge":
+        if endpoint == "chat":
+            progress = [event for name, event in events if name == "hermes.tool.progress"]
+            assert [event["status"] for event in progress] == ["running", "completed"]
+        else:
+            assert any(event.get("item", {}).get("type") == "function_call_output" for _, event in events)
+    if endpoint == "chat":
+        text = "".join(event["choices"][0]["delta"].get("content", "")
+                       for _, event in events if "choices" in event)
+        assert events[-1][1]["choices"][0]["finish_reason"] == "error"
+        outcome = events[-1][1]["hermes"]
+    else:
+        text = "".join(event["delta"] for name, event in events if name == "response.output_text.delta")
+        terminal = events[-1][1]["response"]
+        assert terminal["status"] == "incomplete"
+        assert terminal["output"][-1]["content"][0]["text"] == DRAFT
+        assert terminal["output"][-1]["status"] == "incomplete"
+        outcome = terminal["hermes"]
+    assert text.count(DRAFT[:20]) == 1
+    assert text.count(DRAFT[20:]) == 1
+    assert outcome["completed"] is False and outcome["error"] == ERROR
+    _assert_incomplete(native)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True, "disconnect_after_result"])
+@pytest.mark.parametrize("compressed", [False, True])
+async def test_incomplete_responses_snapshot_preserves_native_tool_context_and_rotated_session(
+    native, monkeypatch, inert_api_executor, streaming, compressed,
+):
+    adapter = api_server.APIServerAdapter(PlatformConfig(enabled=True))
+    prior = [{"role": "user", "content": "old question"}, {"role": "assistant", "content": "old answer"}]
+    summary = [{"role": "user", "content": "[Earlier context summary]"}]
+    native.turn.projected_messages = [
+        {"role": "assistant", "content": None, "tool_calls": [{
+            "id": "native-tool", "type": "function", "function": {"name": "terminal", "arguments": "{}"},
+        }]},
+        {"role": "tool", "tool_call_id": "native-tool", "content": "real projected tool output"},
+        {"role": "assistant", "content": DRAFT},
+    ]
+    adapter._response_store.put("resp_prior", {
+        "response": {"id": "resp_prior", "status": "completed"},
+        "conversation_history": prior, "session_id": "native-parent",
+    })
+    agents = []
+
+    def create_agent(**kwargs):
+        agent = native.Agent(**kwargs)
+        if compressed and not agents:
+            # Simulate a compressed continuation at the inert native session
+            # boundary; real _run_agent annotates rotation/compression itself.
+            agent.history_prefix = summary
+            agent.rotated_session_id = "native-child"
+        agents.append(agent)
+        return agent
+
+    monkeypatch.setattr(adapter, "_create_agent", create_agent)
+    monkeypatch.setattr(api_server, "_publish_turn_process_ownership", lambda *args: None)
+    monkeypatch.setattr(api_server, "_clear_turn_process_ownership", lambda *args: None)
+    class DisconnectAfterResult(CaptureStream):
+        async def write(self, data):
+            if b"event: response.output_text.done\n" in data:
+                raise ConnectionResetError("inert transport disconnected after native result")
+            await super().write(data)
+
+    monkeypatch.setattr(api_server.web, "StreamResponse", DisconnectAfterResult if streaming == "disconnect_after_result" else CaptureStream)
+    monkeypatch.setattr(api_server, "_reap_disconnected_agent_processes", lambda *args: None)
+    request = SimpleNamespace(headers={}, query={}, json=AsyncMock(return_value={
+        "input": "continue", "stream": bool(streaming), "previous_response_id": "resp_prior",
+    }))
+    response = await asyncio.wait_for(adapter._handle_responses(request), timeout=5)
+    if streaming == "disconnect_after_result":
+        created = _events(response)[0][1]["response"]
+        terminal = adapter._response_store.get(created["id"])["response"]
+        assert terminal["hermes"]["completed"] is False
+        assert terminal["hermes"]["error"] == ERROR
+    else:
+        terminal = _events(response)[-1][1]["response"] if streaming else json.loads(response.text)
+    assert terminal["status"] == "incomplete"
+    stored = adapter._response_store.get(terminal["id"])
+    expected = native.results[0]["messages"]
+    assert stored["conversation_history"] == expected
+    assert any(message.get("role") == "tool" for message in expected)
+    assert stored["session_id"] == ("native-child" if compressed else "native-parent")
+    if compressed:
+        assert native.results[0]["_compressed"] is True
+        assert expected[0] == summary[0]
+        assert not any(message in expected for message in prior)
+    followup = SimpleNamespace(headers={}, query={}, json=AsyncMock(return_value={
+        "input": "follow up", "previous_response_id": terminal["id"],
+    }))
+    await asyncio.wait_for(adapter._handle_responses(followup), timeout=5)
+    assert native.inputs[1]["history"] == expected
+    assert native.inputs[1]["session_id"] == stored["session_id"]
+    _assert_incomplete(native)
 
 
 @pytest.mark.asyncio

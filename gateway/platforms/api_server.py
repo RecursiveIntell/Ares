@@ -5205,17 +5205,14 @@ class APIServerAdapter(BasePlatformAdapter):
             _stream_q = ThreadSafeAsyncQueue()
 
             def _on_delta(delta):
-                # Filter out None — the agent fires stream_delta_callback(None)
-                # to signal the CLI display to close its response box before
-                # tool execution, but the SSE writer uses None as end-of-stream
-                # sentinel.  Forwarding it would prematurely close the HTTP
-                # response, causing Open WebUI (and similar frontends) to miss
-                # the final answer after tool calls.  The SSE loop detects
-                # completion via agent_task.done() instead.
+                # None closes the CLI box before tools; preserve that text
+                # boundary without forwarding the SSE end-of-stream sentinel.
                 # Called from the worker thread running run_conversation —
                 # put_threadsafe (not put_nowait) is required here.
                 if delta is not None:
                     _stream_q.put_threadsafe(delta)
+                else:
+                    _stream_q.put_threadsafe(("__text_boundary__", None))
 
             # Track which tool_call_ids we've emitted a "running" lifecycle
             # event for, so a "completed" event without a matching "running"
@@ -5236,6 +5233,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 events (``_thinking``, …) stay off the wire — matching
                 the prior ``_on_tool_progress`` filter exactly.
                 """
+                # Native tools do not send delta(None). Preserve the actual
+                # text boundary even when the tool card itself is filtered.
+                _stream_q.put_threadsafe(("__text_boundary__", None))
                 if not tool_call_id or function_name.startswith("_"):
                     return
                 _started_tool_call_ids.add(tool_call_id)
@@ -5454,7 +5454,7 @@ class APIServerAdapter(BasePlatformAdapter):
             }
             await response.write(_sse_frame(role_chunk))
             last_activity = time.monotonic()
-            content_emitted = False
+            delivered_segments = [""]
 
             # Helper — route a queue item to the correct SSE event.
             async def _emit(item):
@@ -5467,11 +5467,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation history.  See #6972 for the original event,
                 #16588 for the ``toolCallId``/``status`` lifecycle fields.
                 """
-                nonlocal content_emitted
-                if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
+                if isinstance(item, tuple) and len(item) == 2 and item[0] == "__text_boundary__":
+                    delivered_segments.append("")
+                elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
                     await response.write(_sse_frame(item[1], event="hermes.tool.progress"))
                 else:
-                    content_emitted = content_emitted or bool(item)
+                    delivered_segments[-1] += item or ""
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
                         "created": created, "model": model,
@@ -5534,10 +5535,21 @@ class APIServerAdapter(BasePlatformAdapter):
             is_failed = bool(result.get("failed")) if isinstance(result, dict) else False
             completed = bool(result.get("completed", True)) if isinstance(result, dict) else True
             err_msg = result.get("error") if isinstance(result, dict) else None
-            if isinstance(result, dict) and not content_emitted:
-                draft = result.get("partial_response")
-                if draft:
-                    await _emit(_resolve_media_to_data_urls(draft))
+            if isinstance(result, dict) and result.get("partial_response"):
+                draft = _resolve_media_to_data_urls(result["partial_response"])
+                remaining = draft
+                for delivered in delivered_segments:
+                    if not delivered:
+                        continue
+                    if delivered.endswith(draft):
+                        remaining = ""
+                        break
+                    if draft.startswith(delivered):
+                        suffix = draft[len(delivered):]
+                        if len(suffix) < len(remaining):
+                            remaining = suffix
+                if remaining:
+                    await _emit(remaining)
             if agent_error is not None:
                 is_failed = True
                 err_msg = err_msg or str(agent_error)
@@ -5679,6 +5691,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # State accumulated during the stream
         final_text_parts: List[str] = []
+        delivered_segments = [""]
         # Track open function_call items by name so we can emit a matching
         # ``done`` event when the tool completes.  Order preserved.
         pending_tool_calls: List[Dict[str, Any]] = []
@@ -5753,28 +5766,46 @@ class APIServerAdapter(BasePlatformAdapter):
             """
             if not store or terminal_snapshot_persisted:
                 return
-            incomplete_text = "".join(final_text_parts) or final_response_text
+            incomplete_text = (
+                (result.get("partial_response") if isinstance(result, dict) else None)
+                or "".join(final_text_parts) or final_response_text
+            )
             incomplete_items: List[Dict[str, Any]] = list(emitted_items)
             if incomplete_text:
                 incomplete_items.append({
                     "type": "message",
+                    "status": "incomplete",
                     "role": "assistant",
                     "content": [{"type": "output_text", "text": incomplete_text}],
                 })
             incomplete_env = _envelope("incomplete")
             incomplete_env["output"] = incomplete_items
+            if isinstance(result, dict):
+                incomplete_env["hermes"] = {
+                    "completed": bool(result.get("completed", True)),
+                    "partial": bool(result.get("partial")),
+                    "interrupted": bool(result.get("interrupted")),
+                    "error": _redact_api_error_text(result["error"]) if result.get("error") else None,
+                }
             incomplete_env["usage"] = {
                 "input_tokens": usage.get("input_tokens", 0),
                 "output_tokens": usage.get("output_tokens", 0),
                 "total_tokens": usage.get("total_tokens", 0),
             }
-            incomplete_history = list(conversation_history)
-            incomplete_history.append({"role": "user", "content": user_message})
-            if incomplete_text:
-                incomplete_history.append({"role": "assistant", "content": incomplete_text})
+            if isinstance(result, dict):
+                incomplete_history = self._build_response_conversation_history(
+                    conversation_history, user_message, result, incomplete_text,
+                )
+            else:
+                incomplete_history = list(conversation_history)
+                incomplete_history.append({"role": "user", "content": user_message})
+                if incomplete_text:
+                    incomplete_history.append({"role": "assistant", "content": incomplete_text})
+            _result_sid = result.get("session_id") if isinstance(result, dict) else None
             _persist_response_snapshot(
                 incomplete_env,
                 conversation_history_snapshot=incomplete_history,
+                session_id_snapshot=_result_sid if isinstance(_result_sid, str) and _result_sid else None,
             )
 
         try:
@@ -5813,6 +5844,7 @@ class APIServerAdapter(BasePlatformAdapter):
             async def _emit_text_delta(delta_text: str) -> None:
                 await _open_message_item()
                 final_text_parts.append(delta_text)
+                delivered_segments[-1] += delta_text
                 await _write_event("response.output_text.delta", {
                     "type": "response.output_text.delta",
                     "item_id": message_item_id,
@@ -5945,9 +5977,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     if _batch_buf:
                         await _flush_batch()
                     if tag == "__tool_started__":
+                        # Native tool lifecycle is also a semantic text
+                        # boundary; its bridge need not send delta(None).
+                        delivered_segments.append("")
                         await _emit_tool_started(payload)
                     elif tag == "__tool_completed__":
                         await _emit_tool_completed(payload)
+                    elif tag == "__text_boundary__":
+                        delivered_segments.append("")
                 elif isinstance(it, str):
                     # Batch text deltas — append to buffer, flush on timer
                     _batch_buf.append(it)
@@ -6022,12 +6059,25 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 result, agent_usage = await agent_task
                 usage = agent_usage or usage
-                # If the agent produced a final_response but no text
-                # deltas were streamed (e.g. some providers only emit
-                # the full response at the end), emit a single fallback
-                # delta so Responses clients still receive a live text part.
+                # Reconcile native drafts against delivered text; earlier
+                # commentary is not proof that the draft itself was shown.
+                # Completed providers retain their no-deltas fallback.
                 agent_final = (result.get("final_response") or result.get("partial_response") or "") if isinstance(result, dict) else ""
-                if agent_final and not final_text_parts:
+                if agent_final and result.get("partial_response"):
+                    remaining = agent_final
+                    for delivered in delivered_segments:
+                        if not delivered:
+                            continue
+                        if delivered.endswith(agent_final):
+                            remaining = ""
+                            break
+                        if agent_final.startswith(delivered):
+                            suffix = agent_final[len(delivered):]
+                            if len(suffix) < len(remaining):
+                                remaining = suffix
+                    if remaining:
+                        await _emit_text_delta(remaining)
+                elif agent_final and not final_text_parts:
                     await _emit_text_delta(agent_final)
                 if agent_final and not final_response_text:
                     final_response_text = agent_final
@@ -6038,7 +6088,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_error = _redact_api_error_text(e)
 
             # Close the message item if it was opened
-            final_response_text = "".join(final_text_parts) or final_response_text
+            # A native draft is the canonical terminal text even when earlier
+            # commentary was streamed into this message item.
+            final_response_text = (
+                (result.get("partial_response") if isinstance(result, dict) else None)
+                or "".join(final_text_parts) or final_response_text
+            )
             incomplete_result = bool(isinstance(result, dict) and (
                 result.get("partial") or result.get("failed")
                 or result.get("completed") is False or result.get("interrupted")
@@ -6125,16 +6180,15 @@ class APIServerAdapter(BasePlatformAdapter):
                     "output_tokens": usage.get("output_tokens", 0),
                     "total_tokens": usage.get("total_tokens", 0),
                 }
-                _failed_history = list(conversation_history)
-                _failed_history.append({"role": "user", "content": user_message})
-                if final_response_text or agent_error:
-                    _failed_history.append({
-                        "role": "assistant",
-                        "content": final_response_text or _redact_api_error_text(agent_error),
-                    })
+                _failed_history = self._build_response_conversation_history(
+                    conversation_history, user_message, result,
+                    final_response_text or (_redact_api_error_text(agent_error) if agent_error else ""),
+                )
+                _result_sid = result.get("session_id") if isinstance(result, dict) else None
                 _persist_response_snapshot(
                     failed_env,
                     conversation_history_snapshot=_failed_history,
+                    session_id_snapshot=_result_sid if isinstance(_result_sid, str) and _result_sid else None,
                 )
                 terminal_snapshot_persisted = True
                 await _write_event(f"response.{terminal_status}", {
@@ -6374,13 +6428,13 @@ class APIServerAdapter(BasePlatformAdapter):
             _stream_q = ThreadSafeAsyncQueue()
 
             def _on_delta(delta):
-                # None from the agent is a CLI box-close signal, not EOS.
-                # Forwarding would kill the SSE stream prematurely; the
-                # SSE writer detects completion via agent_task.done().
+                # None is a CLI text boundary, not the SSE EOS sentinel.
                 # Called from the worker thread running run_conversation —
                 # put_threadsafe (not put_nowait) is required here.
                 if delta is not None:
                     _stream_q.put_threadsafe(delta)
+                else:
+                    _stream_q.put_threadsafe(("__text_boundary__", None))
 
             def _on_tool_progress(event_type, name, preview, args, **kwargs):
                 """Queue non-start tool progress events if needed in future.

@@ -41,7 +41,7 @@ describe('owner-qualified composer selections', () => {
 
   it('refuses incomplete defaults and an unspecified connection', () => {
     setComposerModelSelectionOwner(a)
-    expect(recordComposerModelSelection(captureComposerModelSelection(a), { ...pair, provider: '' })).toBeNull()
+    expect(recordComposerModelSelection(captureComposerModelSelection(a), { ...pair, model: '' })).toBeNull()
     expect(() => captureComposerModelSelection({ ...a, connectionId: '' })).toThrow('explicit connection owner')
     expect(getComposerModelSelection(a)).toBeNull()
   })
@@ -162,4 +162,14 @@ describe('owner-qualified composer selections', () => {
     expect(ownsRuntimeOptionIntent(origin.ownerKey, 'profile-default-save', newer)).toBe(true)
     expect(getComposerModelSelection(a)).toBe(known)
   })
+})
+
+it('accepts a configured scalar model with backend-resolved optional provider', () => {
+  setComposerModelSelectionOwner(a)
+  expect(recordComposerModelSelection(captureComposerModelSelection(a), { ...pair, provider: '' })).toMatchObject({
+    model: pair.model,
+    provider: '',
+    source: 'default'
+  })
+  expect(recordComposerModelSelection(captureComposerModelSelection(a), { ...pair, model: ' ' })).toBeNull()
 })

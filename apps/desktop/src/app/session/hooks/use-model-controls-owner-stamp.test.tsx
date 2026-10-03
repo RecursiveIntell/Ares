@@ -333,3 +333,18 @@ describe('real core owner receipts produced by controls', () => {
     expect(restored?.model).toBe('model-a')
   })
 })
+
+it('keeps B’s healthy default read when a background A save completes', async () => {
+  activate(a)
+  const origin = beginMainModelSave()
+  const c = controls()
+  activate(b)
+  const pending = deferred<{ model: string; provider: string }>()
+  vi.mocked(getGlobalModelInfo).mockReturnValueOnce(pending.promise)
+  const waiting = c.current.refreshCurrentModel(true)
+  c.current.applySavedMainModel({ ...origin, model: 'saved-a', provider: 'ollama-launch' })
+  pending.resolve({ model: 'healthy-b', provider: 'custom:b' })
+  await waiting
+  expect(getComposerModelSelection(b)).toMatchObject({ model: 'healthy-b', provider: 'custom:b' })
+  expect($currentModel.get()).toBe('healthy-b')
+})

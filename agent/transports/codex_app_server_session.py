@@ -964,8 +964,9 @@ class CodexAppServerSession:
 
         The supported ACK is empty. Under the session's single-writer lock,
         read prior history and drain pre-request lifecycle, then bind a fresh
-        same-thread turn/started. Only its completed contextCompaction item
-        and successful terminal certify completion, including events queued
+        same-thread turn/started. Its completed contextCompaction item or
+        canonical deprecated thread/compacted notification, followed by a
+        successful terminal, certifies completion, including events queued
         while the request is waiting for its ACK.
         """
         result = TurnResult()
@@ -1155,6 +1156,18 @@ class CodexAppServerSession:
 
             params = note.get("params") or {}
             item = params.get("item") or {}
+            if method == "thread/compacted":
+                # ContextCompactedNotification (including rust-v0.130.0)
+                # requires these canonical string IDs. The earlier strict
+                # scope check rejects conflicting aliases and nested IDs.
+                if (
+                    not isinstance(params.get("threadId"), str)
+                    or not isinstance(params.get("turnId"), str)
+                    or params["threadId"] != result.thread_id
+                    or params["turnId"] != result.turn_id
+                ):
+                    continue
+                compaction_completed = True
             if isinstance(item, dict) and item.get("type") == "contextCompaction":
                 item_id = item.get("id")
                 if method == "item/started" and isinstance(item_id, str) and item_id:
@@ -1167,7 +1180,7 @@ class CodexAppServerSession:
                     continue
                 if result.completed and not compaction_completed:
                     result.completed = False
-                    result.error = "compaction terminal lacked a completed contextCompaction item"
+                    result.error = "compaction terminal lacked completed contextCompaction or thread/compacted evidence"
                     result.should_retire = True
 
             if self._on_event is not None:

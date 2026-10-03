@@ -119,8 +119,12 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
         return
       }
 
-      profileRefreshEpochRef.current += 1
       const { owner, provider, model } = change
+
+      if (composerOwnerKey(captureDraftComposerOwner()) === composerOwnerKey(owner)) {
+        profileRefreshEpochRef.current += 1
+      }
+
       const current = getComposerModelSelection(owner)
 
       // The latest confirmed save supersedes a weaker default read, but a
