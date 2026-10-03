@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
-import { fixtureAdmission, fixtureProjection } from './group-turn-wire-fixture.mjs'
+import { assertFixturePoll, fixtureAdmission, fixtureProjection } from './group-turn-wire-fixture.mjs'
 import vm from 'node:vm'
 
 const pluginSource = readFileSync(new URL('../plugin.js', import.meta.url), 'utf8')
@@ -154,6 +154,7 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
           // Same window shape for pending command approvals (#90694 class).
           const approval = approvalUntilResumeCall && approvalUntilResumeCall[profile]
           const pendingApproval = approval && seen <= approval.until ? approval.payload : null
+          if (method === 'session.turn.poll') assertFixturePoll(session, params)
           return {
             session_id: session.runtime,
             session_key: session.stored,

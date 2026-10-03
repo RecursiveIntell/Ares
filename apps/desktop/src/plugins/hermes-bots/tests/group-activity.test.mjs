@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
-import { fixtureAdmission, fixtureProjection } from './group-turn-wire-fixture.mjs'
+import { assertFixturePoll, fixtureAdmission, fixtureProjection } from './group-turn-wire-fixture.mjs'
 import vm from 'node:vm'
 
 // Collapsible group Activity view: a runtime-only, bounded feed of truthful
@@ -65,6 +65,7 @@ function load(turnScript = () => '(pass)') {
             err.code = 4007
             throw err
           }
+          if (method === 'session.turn.poll') assertFixturePoll(session, params)
           return {
             session_id: session.runtime,
             session_key: session.stored,

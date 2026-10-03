@@ -1,11 +1,13 @@
 import { type GatewayEvent, registryBackendScopeKey } from '@hermes/shared'
 import { useStore } from '@nanostores/react'
+import { QueryClient } from '@tanstack/react-query'
 import { act, cleanup, render, waitFor } from '@testing-library/react'
 import { useEffect, useMemo, useRef } from 'react'
 import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from 'vitest'
 
+import { getApiRequestConnection, getApiRequestProfile } from '@/api/client'
 import { createSessionRpcDispatcher } from '@/app/contrib/session-rpc-dispatcher'
-import { getSession } from '@/hermes'
+import { getSession, setApiRequestConnection, setApiRequestProfile } from '@/hermes'
 import {
   activeGateway,
   activeGatewayConnectionId,
@@ -28,6 +30,7 @@ import {
   $connection,
   $selectedStoredSessionId,
   $sessions,
+  _resetComposerModelSelectionsForTests,
   _resetSessionOwnerHintsForTests,
   getSessionOwnerHint,
   mergeSessionPage,
@@ -45,6 +48,7 @@ import type { SessionInfo } from '@/types/hermes'
 
 import type { ClientSessionState } from '../../types'
 
+import { useModelControls } from './use-model-controls'
 import { usePromptActions } from './use-prompt-actions'
 import { clearSingleFlightSessionResumeState } from './use-prompt-actions/single-flight-resume'
 import type { SubmitTextOptions } from './use-prompt-actions/utils'
@@ -120,6 +124,8 @@ function answer(socket: MockGateway, method: string, params: Record<string, unkn
   const isOmar = socket.connectUrl?.includes(`:${ownerPort}`) ?? false
 
   if (method === 'session.create') {
+    expect(params.model).toBe('fixture-default-omar')
+    expect(params.provider).toBe('openrouter')
     if (!isOmar) {
       throw new Error(`session.create landed on the wrong socket: ${socket.connectUrl}`)
     }
@@ -199,8 +205,13 @@ vi.mock('@/hermes', async importOriginal => ({
   getSession: vi.fn(async () => {
     throw new Error('REST cross-profile probe must not be needed: the owner is known')
   }),
-  setApiRequestConnection: vi.fn(),
-  setApiRequestProfile: vi.fn()
+  getGlobalModelInfo: vi.fn(async (profile: string) => {
+    expect(profile).toBe('omar')
+    expect(getApiRequestProfile()).toBe('omar')
+    expect(getApiRequestConnection()).toBe(ownerPort === V1_PORT ? null : SOURCE_ID)
+
+    return { model: 'fixture-default-omar', provider: 'openrouter' }
+  })
 }))
 
 function installDesktop(): void {
@@ -277,6 +288,7 @@ function Harness({
   const selectedStoredSessionId = useStore($selectedStoredSessionId)
   const busyRef = useRef(false)
   const creatingSessionRef = useRef(false)
+  const queryClient = useMemo(() => new QueryClient(), [])
 
   const cache = useSessionStateCache({
     activeSessionId,
@@ -322,6 +334,8 @@ function Harness({
     updateSessionState: cache.updateSessionState
   })
 
+  const { refreshCurrentModel } = useModelControls({ queryClient, requestGateway })
+
   const promptActions = usePromptActions({
     activeSessionId,
     activeSessionIdRef: cache.activeSessionIdRef,
@@ -346,7 +360,8 @@ function Harness({
   const { submitText } = promptActions
 
   useEffect(() => {
-    onReady({
+    let mounted = true
+    const handle: HarnessHandle = {
       busyRef,
       bindings: () => ({
         runtimeForStored: cache.runtimeIdByStoredSessionIdRef.current.get(mintedStoredId) ?? null,
@@ -354,12 +369,25 @@ function Harness({
       }),
       submitText: (...args) => act(async () => submitText(...args)) as Promise<boolean>,
       updateSessionState: cache.updateSessionState as HarnessHandle['updateSessionState']
+    }
+
+    // Production wiring hydrates the fresh draft before Send becomes ready.
+    // Drive the real producer; the routing fixture never manufactures a stamp.
+    void refreshCurrentModel(true).then(() => {
+      if (mounted) {
+        onReady(handle)
+      }
     })
+
+    return () => {
+      mounted = false
+    }
   }, [
     cache.runtimeIdByStoredSessionIdRef,
     cache.sessionStateByRuntimeIdRef,
     cache.updateSessionState,
     onReady,
+    refreshCurrentModel,
     submitText
   ])
 
@@ -395,6 +423,9 @@ describe('profile rail: a fresh Omar chat keeps its exact registry owner across 
     $newChatProfile.set(null)
     $newChatRoute.set(null)
     $newChatConnectionId.set(null)
+    setApiRequestConnection(null)
+    setApiRequestProfile('default')
+    _resetComposerModelSelectionsForTests()
     _resetSessionOwnerHintsForTests({ storage: true })
   })
 
@@ -409,6 +440,9 @@ describe('profile rail: a fresh Omar chat keeps its exact registry owner across 
     $newChatRoute.set(null)
     $newChatConnectionId.set(null)
     $activeGatewayProfile.set('default')
+    setApiRequestConnection(null)
+    setApiRequestProfile('default')
+    _resetComposerModelSelectionsForTests()
     vi.clearAllMocks()
     delete (window as unknown as { hermesDesktop?: unknown }).hermesDesktop
   })

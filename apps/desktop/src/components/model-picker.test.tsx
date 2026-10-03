@@ -4,6 +4,7 @@ import { afterEach, beforeAll, expect, it, vi } from 'vitest'
 
 import { getGlobalModelOptions } from '@/hermes'
 import { modelOptionsQueryKey } from '@/lib/model-options'
+
 import { ModelPickerDialog } from './model-picker'
 import { ModelVisibilityDialog } from './model-visibility-dialog'
 
@@ -21,8 +22,8 @@ it('sends the modal target profile and explains a missing session selection with
   const select = vi.fn()
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   const view = render(<QueryClientProvider client={client}>
-    <ModelPickerDialog open onOpenChange={vi.fn()} onSelect={select} profile="specialist" connectionId="owner"
-      sessionId="session" currentProvider="ollama-launch" currentModel="model-a" />
+    <ModelPickerDialog connectionId="owner" currentModel="model-a" currentProvider="ollama-launch" onOpenChange={vi.fn()} onSelect={select}
+      open profile="specialist" sessionId="session" />
   </QueryClientProvider>)
   await view.findByText(/selected provider or model is unavailable in this profile/i)
   await view.findByText(/session keeps its own model selection/i)
@@ -37,8 +38,8 @@ it('keeps a late catalog reply in its original source and profile cache', async 
     .mockResolvedValueOnce(payload('model-b'))
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   const picker = (connectionId: string, profile: string) => <QueryClientProvider client={client}>
-    <ModelPickerDialog open onOpenChange={vi.fn()} onSelect={vi.fn()} profile={profile} connectionId={connectionId}
-      currentProvider="target" currentModel="model-b" />
+    <ModelPickerDialog connectionId={connectionId} currentModel="model-b" currentProvider="target" onOpenChange={vi.fn()} onSelect={vi.fn()}
+      open profile={profile} />
   </QueryClientProvider>
   const view = render(picker('source-a', 'target-a'))
   await vi.waitFor(() => expect(getGlobalModelOptions).toHaveBeenCalledTimes(1))
@@ -54,12 +55,12 @@ it('visibility and picker subscribers share the same target catalog instead of a
   const request = vi.fn(async (_method: string, params?: Record<string, unknown>) => payload(params?.profile === 'target' ? 'target-model' : 'source-model'))
   const gateway = { request } as never
   const view = render(<QueryClientProvider client={client}>
-    <ModelVisibilityDialog gw={gateway} open profile="target" onOpenChange={vi.fn()} onOpenProviders={vi.fn()} />
+    <ModelVisibilityDialog gw={gateway} onOpenChange={vi.fn()} onOpenProviders={vi.fn()} open profile="target" />
   </QueryClientProvider>)
   await vi.waitFor(() => expect(client.getQueryData(modelOptionsQueryKey('target'))).toEqual(payload('target-model')))
   view.rerender(<QueryClientProvider client={client}>
-    <ModelPickerDialog gw={gateway} open profile="target" onOpenChange={vi.fn()} onSelect={vi.fn()}
-      currentProvider="target" currentModel="target-model" />
+    <ModelPickerDialog currentModel="target-model" currentProvider="target" gw={gateway} onOpenChange={vi.fn()} onSelect={vi.fn()}
+      open profile="target" />
   </QueryClientProvider>)
   await vi.waitFor(() => expect(request).toHaveBeenCalledWith('model.options', { profile: 'target', explicit_only: true }))
   expect(client.getQueryData(modelOptionsQueryKey('target'))).toEqual(payload('target-model'))

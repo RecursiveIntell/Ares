@@ -8,7 +8,7 @@ import { Codicon } from '@/components/ui/codicon'
 import { DropdownMenuItem, dropdownMenuRow } from '@/components/ui/dropdown-menu'
 import type { HermesGateway } from '@/hermes'
 import { useI18n } from '@/i18n'
-import { modelOptionsQueryKey, selectionUnavailable, requestModelOptions } from '@/lib/model-options'
+import { modelOptionsQueryKey, requestModelOptions, selectionUnavailable } from '@/lib/model-options'
 import { currentPickerSelection } from '@/lib/model-status-label'
 import { DEFAULT_REASONING_EFFORT } from '@/lib/reasoning-effort'
 import { cn } from '@/lib/utils'
@@ -294,6 +294,7 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
 
   return (
     <ModelCatalogMenu
+      connectionId={connectionId}
       controller={controller}
       footer={
         <>
@@ -327,7 +328,6 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
       }
       gateway={gateway}
       includeMoa
-      connectionId={connectionId}
       profile={catalogProfile}
       request={requestGateway}
       sessionId={activeSessionId}
