@@ -6693,6 +6693,37 @@ def _snapshot_agent_model_runtime(agent) -> dict:
     }
 
 
+def _owns_one_turn_model_runtime(session, agent, runtime=None) -> bool:
+    """An in-memory once lease belongs to one session generation and agent."""
+    if runtime is None:
+        runtime = (session or {}).get("_one_turn_model_runtime")
+    return bool(
+        isinstance(runtime, dict)
+        and runtime.get("session") is session
+        and runtime.get("agent") is agent
+        and session.get("agent") is agent
+        and session.get("_one_turn_model_runtime") is runtime
+        and _sessions.get(runtime.get("sid")) is session
+    )
+
+
+def _consume_one_turn_model_runtime(session, agent):
+    with session["history_lock"]:
+        snapshot = session.get("one_turn_model_restore")
+        if not snapshot:
+            return None, None
+        runtime = session.get("_one_turn_model_runtime")
+        if not _owns_one_turn_model_runtime(session, agent, runtime):
+            session.pop("one_turn_model_restore", None)
+            session.pop("_one_turn_model_runtime", None)
+            raise RuntimeError("One-turn model selection changed owner before execution")
+        # Publish active ownership before removing the queued snapshot. Metadata
+        # stays truthful across consumption and through the finally restore.
+        runtime["active"] = True
+        session.pop("one_turn_model_restore", None)
+        return snapshot, runtime
+
+
 def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
     """Restore an agent model runtime captured before a one-turn override."""
     if not snapshot or agent is None:
@@ -6900,10 +6931,17 @@ def _apply_model_switch(
         _append_model_switch_marker(
             session, model=result.new_model, provider=result.target_provider
         )
-        if one_turn:
-            session["one_turn_model_restore"] = restore_snapshot
-        else:
-            session.pop("one_turn_model_restore", None)
+        # The turn consumer uses this lock: snapshot and ownership must become
+        # visible (or retire) together, never as a partially published lease.
+        with session["history_lock"]:
+            if one_turn:
+                session["one_turn_model_restore"] = restore_snapshot
+                session["_one_turn_model_runtime"] = {
+                    "session": session, "agent": agent, "sid": sid, "active": False,
+                }
+            else:
+                session.pop("one_turn_model_restore", None)
+                session.pop("_one_turn_model_runtime", None)
 
     # Record the switch as a PER-SESSION override so a later rebuild of THIS
     # session (e.g. /new via _reset_session_agent, or resume) re-derives the
@@ -7081,6 +7119,8 @@ def _sync_bot_capabilities(sid: str, session: dict) -> None:
     native_captured = False
     native_session = None
     native_client = None
+    once_runtime = session.get("_one_turn_model_runtime")
+    owns_once_runtime = _owns_one_turn_model_runtime(session, agent, once_runtime)
 
     def runtime_matches(candidate):
         return (all((getattr(candidate, name, None) or "") == (value or "")
@@ -7099,6 +7139,8 @@ def _sync_bot_capabilities(sid: str, session: dict) -> None:
                 or getattr(agent, "session_id", None) != agent_sid
                 or getattr(agent, "_session_db", None) is not db
                 or getattr(agent, "_owns_session_db", False) != owns_db
+                or session.get("_one_turn_model_runtime") is not once_runtime
+                or (owns_once_runtime and not _owns_one_turn_model_runtime(session, agent, once_runtime))
                 or not runtime_matches(agent)):
             raise RuntimeError("BOT_CAPABILITY_OWNER_CHANGED")
         if native_captured and (
@@ -7160,6 +7202,11 @@ def _sync_bot_capabilities(sid: str, session: dict) -> None:
                 agent._owns_session_db = False
                 agent._end_session_on_close = False
                 session["agent"] = new_agent
+                if owns_once_runtime:
+                    # This validated rebuild executes the same admitted turn.
+                    # Keep its opaque owner object so the driver's captured
+                    # restore can follow only this canonical replacement.
+                    once_runtime["agent"] = new_agent
                 session["bot_caps_seen"] = current
                 if native_session is not None:
                     agent._codex_session = None
@@ -8128,18 +8175,31 @@ def _session_info(agent, session: dict | None = None) -> dict:
         else None
     )
 
-    effective_model = pending_model or mirror.get("model", getattr(agent, "model", ""))
-    effective_provider = pending_provider or mirror.get("provider", getattr(agent, "provider", ""))
+    once_runtime = (session or {}).get("_one_turn_model_runtime")
+    owns_once = bool(
+        not (session or {}).get("_compute_host_active")
+        and _owns_one_turn_model_runtime(session, agent, once_runtime)
+        and (once_runtime.get("active") or once_runtime.get("restore_failed")
+             or session.get("one_turn_model_restore"))
+    )
+    effective_model = pending_model or (
+        getattr(agent, "model", "") if owns_once else mirror.get("model", getattr(agent, "model", ""))
+    )
+    effective_provider = pending_provider or (
+        getattr(agent, "provider", "") if owns_once else mirror.get("provider", getattr(agent, "provider", ""))
+    )
     if not effective_model:
         effective_model = _resolve_model()
     if not effective_provider:
         model_cfg = _load_cfg().get("model") or {}
         effective_provider = str(model_cfg.get("provider") or "") if isinstance(model_cfg, dict) else ""
-    if session is not None and not session.get("_compute_host_active"):
+    # A one-turn runtime is live now; its saved pin applies after restoration.
+    if session is not None and not session.get("_compute_host_active") and not owns_once:
         override = session.get("model_override")
         if isinstance(override, dict) and override.get("model"):
-            effective_model = override["model"]
-            effective_provider = override.get("provider") or effective_provider
+            # A queued next-turn pick outranks the previous session pin.
+            effective_model = pending_model or override["model"]
+            effective_provider = pending_provider or override.get("provider") or effective_provider
     identity = (str(effective_provider or ""), str(effective_model or ""))
     model_ready = bool(
         session is not None
@@ -13570,7 +13630,9 @@ def _run_prompt_submit(
         result = None  # turn outcome; read after the finally for leftover /steer
         tts_queue = None  # streaming-TTS feed for this turn (voice mode)
         thinking_started = False  # ambient thinking sound armed for this turn
-        one_turn_restore = session.pop("one_turn_model_restore", None)
+        one_turn_restore = None
+        one_turn_runtime = None
+        history = []  # setup errors must still reach one-turn cleanup
         # True once a failed turn's snapshot was retained for resume replay —
         # tells the finally below to skip the normal inflight clear.
         turn_error_retained = False
@@ -13587,6 +13649,7 @@ def _run_prompt_submit(
         if isinstance(marker_text, str) and marker_text.strip():
             record_turn_start(marker_home, marker_key, marker_text, attempts=marker_attempt)
         try:
+            one_turn_restore, one_turn_runtime = _consume_one_turn_model_runtime(session, agent)
             from tools.approval import (
                 reset_current_session_key,
                 set_current_session_key,
@@ -13621,8 +13684,10 @@ def _run_prompt_submit(
                 # so this turn runs on the model the user chose. Runs before the
                 # config sync so an explicit pick wins over a config.yaml change.
                 _apply_pending_model_switch(sid, session)
-                _sync_agent_model_with_config(sid, session)
-                _sync_agent_compression_with_config(sid, session)
+                one_turn_restore, one_turn_runtime = _consume_one_turn_model_runtime(session, agent)
+                if not one_turn_restore:
+                    _sync_agent_model_with_config(sid, session)
+                    _sync_agent_compression_with_config(sid, session)
             # Bot Chat capability sync — adopt Settings→Capabilities edits
             # (skills/toolsets/MCP/SOUL) into the eternal bot session before
             # the turn runs. No-op for every other session shape.
@@ -14387,14 +14452,20 @@ def _run_prompt_submit(
                     pass
             if tts_queue is not None:
                 tts_queue.put(None)  # end-of-text sentinel — flush + finish speaking
-            if one_turn_restore:
+            if one_turn_restore and _owns_one_turn_model_runtime(session, agent, one_turn_runtime):
                 try:
                     _restore_agent_model_runtime(agent, one_turn_restore)
                     _restart_slash_worker(sid, session)
                     _persist_live_session_runtime(session)
                     _persist_live_session_system_prompt(session)
                 except Exception:
+                    one_turn_runtime["restore_failed"] = True
+                    _emit("error", sid, {"message": "Could not restore the saved model after this one-turn selection."})
                     logger.debug("TUI one-turn model restore failed", exc_info=True)
+            if one_turn_runtime is not None and session.get("_one_turn_model_runtime") is one_turn_runtime:
+                one_turn_runtime["active"] = False
+                if not one_turn_runtime.get("restore_failed"):
+                    session.pop("_one_turn_model_runtime", None)
             try:
                 if approval_token is not None:
                     reset_current_session_key(approval_token)

@@ -1861,8 +1861,25 @@ def resolve_runtime_provider(
         _parse_api_mode(model_cfg.get("api_mode")) == "codex_app_server"
     )
     native_requested = native_runtime_opt_in or native_mode_opt_in
-    if native_requested:
-        native_trial = _configured_context_rebase_enabled(_full_cfg)
+    # An explicit saved custom endpoint selects its own transport. Profile
+    # native defaults belong to the OpenAI route, not this named target. Keep
+    # auto/ambiguous requests and OpenAI native credential restrictions intact.
+    explicit_named_api_route = bool(
+        native_requested
+        and explicit_base_url
+        and requested_provider not in {"", "auto", "openai", "openai-codex"}
+        and _get_named_custom_provider(requested_provider) is not None
+    )
+    native_trial = native_requested and _configured_context_rebase_enabled(_full_cfg)
+    # A caller can select a different API provider without mutating the saved
+    # OpenAI native default. Required continuity trials still reject that route.
+    explicit_alternate_provider = bool(
+        native_requested
+        and not native_trial
+        and configured_provider in {"openai", "openai-codex"}
+        and requested_provider not in {"", "auto", "openai", "openai-codex"}
+    )
+    if native_requested and not (explicit_named_api_route or explicit_alternate_provider):
         if effective_provider not in {"openai", "openai-codex"}:
             ambiguous_provider = effective_provider in {"", "auto"}
             explicit_api_route = bool(

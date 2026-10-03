@@ -1892,10 +1892,17 @@ def switch_model(
                 base_url = runtime.get("base_url", "") or _user_pdef.base_url
                 api_mode = runtime.get("api_mode", "")
                 validation_headers = runtime.get("extra_headers") or validation_headers
-            except Exception:
-                api_key = _ukey
-                base_url = _user_pdef.base_url
-                api_mode = ""
+            except Exception as e:
+                return ModelSwitchResult(
+                    success=False,
+                    target_provider=target_provider,
+                    provider_label=provider_label,
+                    is_global=is_global,
+                    error_message=(
+                        f"Could not resolve credentials for provider "
+                        f"'{provider_label}': {e}"
+                    ),
+                )
         elif target_provider == "custom" and current_base_url:
             api_key = current_api_key
             base_url = current_base_url
@@ -1970,8 +1977,17 @@ def switch_model(
                 base_url = runtime.get("base_url", "")
                 api_mode = runtime.get("api_mode", "")
                 validation_headers = runtime.get("extra_headers") or validation_headers
-            except Exception:
-                pass
+            except Exception as e:
+                return ModelSwitchResult(
+                    success=False,
+                    target_provider=target_provider,
+                    provider_label=provider_label,
+                    is_global=is_global,
+                    error_message=(
+                        f"Could not resolve credentials for provider "
+                        f"'{provider_label}': {e}"
+                    ),
+                )
 
     # --- Direct alias override: use exact base_url from the alias if set ---
     if resolved_alias:
