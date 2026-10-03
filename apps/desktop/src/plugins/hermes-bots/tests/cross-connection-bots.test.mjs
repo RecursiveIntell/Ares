@@ -235,6 +235,8 @@ test('group chat admission and polling keep the member source after the active c
         if (method === 'session.resume' && !session) {
           throw Object.assign(new Error('session not found'), { code: 4007 })
         }
+        if (method === 'session.resume') return { session_id: session.runtime, session_key: session.stored,
+          turn_outcomes: fixtureProjection(session) }
         if (method === 'session.create') {
           assert.equal(params.profile, 'backend-worker')
           session = { runtime: 'runtime-worker', stored: 'stored-worker', finalized: [] }

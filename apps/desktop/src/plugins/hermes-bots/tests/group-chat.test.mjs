@@ -1951,18 +1951,18 @@ test('disband clears the room mirrored questions', async () => {
   assert.equal(remaining[0].group, 'Other')
 })
 
-test('a legacy backend without v1 never replays a submitted turn or publishes its guessed history', async () => {
+test('a legacy backend without v1 never submits or publishes guessed history', async () => {
   const gc = load(() => 'tempting old answer', { outcomesAvailable: false })
   gc.sendToGroupChat('Legacy', [{ name: 'research' }], 'answer')
   for (let i = 0; i < 200 && gc.$groupChats.get().Legacy?.running; i++) {
     await new Promise(resolve => setImmediate(resolve))
   }
   assert.equal(roomLog(gc, 'Legacy').filter(entry => entry.from.kind === 'member').length, 0)
-  assert.ok(gc.$groupChats.get().Legacy.stranded.research)
+  assert.equal(gc.$groupChats.get().Legacy.stranded.research, undefined)
   await gc.harvestStrandedGroupReply('Legacy', { name: 'research' })
   await gc.runGroupChatRounds('Legacy', [{ name: 'research' }], roomLog(gc, 'Legacy')[0].thread)
-  assert.equal(gc.calls.length, 1)
-  assert.ok(gc.$groupChats.get().Legacy.stranded.research)
+  assert.equal(gc.calls.length, 0)
+  assert.equal(gc.$groupChats.get().Legacy.stranded.research, undefined)
 })
 
 // ── group approvals: same hidden-session class as clarify (#90694) ─────────
