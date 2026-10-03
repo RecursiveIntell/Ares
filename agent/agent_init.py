@@ -773,8 +773,20 @@ def init_agent(
                 )
                 or ""
             ).strip().lower()
+            _saved_native_provider = str(
+                _native_model_cfg.get("provider")
+                or (_raw_configured_default.get("provider")
+                    if isinstance(_raw_configured_default, dict) else "")
+                or ""
+            ).strip().lower()
+            _explicit_alternate_api_route = bool(
+                not _native_trial
+                and _saved_native_provider in {"openai", "openai-codex"}
+                and agent.provider not in {"", "auto", "openai", "openai-codex"}
+                and api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse"}
+            )
             if _configured_provider not in {"openai", "openai-codex"}:
-                if _native_trial or _configured_native_api_mode:
+                if _native_trial or (_configured_native_api_mode and not _explicit_alternate_api_route):
                     raise ValueError(
                         "codex_app_server requires provider 'openai' or 'openai-codex'"
                     )

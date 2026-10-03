@@ -6,6 +6,7 @@ provider/base_url/api_key empty in AIAgent, causing HTTP 404.
 """
 
 import os
+import threading
 from unittest.mock import MagicMock, patch
 
 
@@ -109,7 +110,8 @@ def test_apply_model_switch_does_not_leak_process_env():
         "HERMES_INFERENCE_PROVIDER",
     )
 
-    sess_b = {"agent": _FakeAgent(), "session_key": "k-B", "model_override": None}
+    sess_b = {"agent": _FakeAgent(), "session_key": "k-B", "model_override": None,
+              "history_lock": threading.Lock()}
     sess_a = {"agent": _FakeAgent(), "session_key": "k-A", "model_override": None}
 
     with (

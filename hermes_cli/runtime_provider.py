@@ -1870,8 +1870,16 @@ def resolve_runtime_provider(
         and requested_provider not in {"", "auto", "openai", "openai-codex"}
         and _get_named_custom_provider(requested_provider) is not None
     )
-    if native_requested and not explicit_named_api_route:
-        native_trial = _configured_context_rebase_enabled(_full_cfg)
+    native_trial = native_requested and _configured_context_rebase_enabled(_full_cfg)
+    # A caller can select a different API provider without mutating the saved
+    # OpenAI native default. Required continuity trials still reject that route.
+    explicit_alternate_provider = bool(
+        native_requested
+        and not native_trial
+        and configured_provider in {"openai", "openai-codex"}
+        and requested_provider not in {"", "auto", "openai", "openai-codex"}
+    )
+    if native_requested and not (explicit_named_api_route or explicit_alternate_provider):
         if effective_provider not in {"openai", "openai-codex"}:
             ambiguous_provider = effective_provider in {"", "auto"}
             explicit_api_route = bool(
