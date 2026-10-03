@@ -389,3 +389,42 @@ def test_canonical_refresh_refuses_changed_once_owner_during_constructor(bot_ref
     assert session['agent'] is not owner.built[0]
     assert state['agent'] is owner.original
     assert not owner.built[0]._owns_session_db
+
+
+@pytest.mark.parametrize('one_turn', [True, False])
+def test_once_publication_and_clear_hold_consumer_lock(live_turn, one_turn):
+    original, _ = live_turn
+    transitions = []
+
+    class CheckedSession(dict):
+        def _check_transition(self, key):
+            if key in {'one_turn_model_restore', '_one_turn_model_runtime'}:
+                acquired = self['history_lock'].acquire(blocking=False)
+                if acquired:
+                    self['history_lock'].release()
+                assert not acquired, 'consumer can observe an incomplete ownership transition'
+                transitions.append(key)
+
+        def __setitem__(self, key, value):
+            self._check_transition(key)
+            return super().__setitem__(key, value)
+
+        def pop(self, key, *default):
+            self._check_transition(key)
+            return super().pop(key, *default)
+
+    session = CheckedSession(original)
+    server._sessions['selected'] = session
+    suffix = '--once' if one_turn else '--session'
+    result = server._apply_model_switch('selected', session,
+                                      'chosen-model --provider endpoint-b ' + suffix,
+                                      confirm_expensive_model=True, persist_override=False)
+    assert result['scope'] == ('once' if one_turn else 'session')
+    assert transitions == ['one_turn_model_restore', '_one_turn_model_runtime']
+    if one_turn:
+        snapshot, runtime = server._consume_one_turn_model_runtime(session, session['agent'])
+        assert snapshot['model'] == 'model-a'
+        assert runtime['active'] and server._owns_one_turn_model_runtime(session, session['agent'], runtime)
+    else:
+        assert 'one_turn_model_restore' not in session
+        assert '_one_turn_model_runtime' not in session
