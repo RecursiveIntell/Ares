@@ -403,6 +403,16 @@ class ContextEngine(ABC):
         NOT called per-turn — only when the session truly ends.
         """
 
+    def shutdown(self) -> None:
+        """Release only handles owned by this engine instance.
+
+        The logical session may continue in another engine instance with the
+        same session ID. Do not end it, delete durable context, or close shared
+        host resources here. Resource-bearing engines should override this
+        independently of on_session_end; resource-free engines need no work.
+        Tolerate handles already released by on_session_end at a real boundary.
+        """
+
     def on_session_reset(self) -> None:
         """Called on /new or /reset. Reset per-session state.
 

@@ -83,7 +83,6 @@ def native_env(env, monkeypatch, request):
     monkeypatch.setattr('tools.bot_mode_probe.capability_fingerprint', lambda home: 'next-caps')
     with monkeypatch.context() as guard:
         guard.setattr(REAL_AGENT, 'close', forbidden)
-        guard.setattr(REAL_AGENT, 'shutdown_memory_provider', forbidden)
         guard.setattr(env.target, 'close', forbidden)
         guard.setattr(env.target, 'end_session', forbidden)
         guard.setattr(env.launch, 'close', forbidden)

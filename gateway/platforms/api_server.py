@@ -4683,7 +4683,7 @@ class APIServerAdapter(BasePlatformAdapter):
             **agent_overrides,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
-        final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
+        final_response = _resolve_media_to_data_urls((result.get("final_response") or result.get("partial_response") or "") if isinstance(result, dict) else "")
         headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
         if gateway_session_key:
             headers["X-Hermes-Session-Key"] = gateway_session_key
@@ -4709,6 +4709,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "object": "hermes.session.chat.completion",
                 "session_id": effective_session_id or session_id,
                 "message": {"role": "assistant", "content": final_response},
+                "completed": bool(result.get("completed", True)),
+                "partial": bool(result.get("partial")),
+                "interrupted": bool(result.get("interrupted")),
+                "error": _redact_api_error_text(result["error"]) if result.get("error") else None,
                 "usage": usage,
                 "runtime": runtime,
             },
@@ -4855,7 +4859,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     confirmed_runtime_lock=lock_active,
                     **agent_overrides,
                 )
-                final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
+                final_response = _resolve_media_to_data_urls((result.get("final_response") or result.get("partial_response") or "") if isinstance(result, dict) else "")
+                outcome = {
+                    "completed": bool(result.get("completed", True)),
+                    "partial": bool(result.get("partial")),
+                    "interrupted": bool(result.get("interrupted")),
+                    "error": _redact_api_error_text(result["error"]) if result.get("error") else None,
+                }
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
                 turn_messages = self._turn_transcript_messages(history, user_message, result) if isinstance(result, dict) else []
                 effective_runtime = {}
@@ -4879,9 +4889,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "session_id": effective_session_id,
                     "message_id": message_id,
                     "content": final_response,
-                    "completed": True,
-                    "partial": False,
-                    "interrupted": False,
+                    **outcome,
                     "runtime": effective_runtime,
                 }))
                 # A steer accepted after the final assistant response is drained
@@ -4892,20 +4900,26 @@ class APIServerAdapter(BasePlatformAdapter):
                 completed_payload = {
                     "session_id": effective_session_id,
                     "message_id": message_id,
-                    "completed": True,
+                    **outcome,
                     "messages": turn_messages,
                     "usage": usage,
                     "runtime": effective_runtime,
                 }
                 if pending_steer:
                     completed_payload["pending_steer"] = pending_steer
-                await queue.put(_event_payload("run.completed", completed_payload))
+                terminal_status = (
+                    "completed" if outcome["completed"]
+                    else "cancelled" if outcome["interrupted"] else "failed"
+                )
+                terminal_event = f"run.{terminal_status}"
+                await queue.put(_event_payload(terminal_event, completed_payload))
                 self._set_run_status(
                     run_id,
-                    "completed",
+                    terminal_status,
                     session_id=effective_session_id,
                     usage=usage,
-                    last_event="run.completed",
+                    last_event=terminal_event,
+                    **outcome,
                     **({"pending_steer": pending_steer} if pending_steer else {}),
                 )
             except asyncio.CancelledError:
@@ -5191,17 +5205,14 @@ class APIServerAdapter(BasePlatformAdapter):
             _stream_q = ThreadSafeAsyncQueue()
 
             def _on_delta(delta):
-                # Filter out None — the agent fires stream_delta_callback(None)
-                # to signal the CLI display to close its response box before
-                # tool execution, but the SSE writer uses None as end-of-stream
-                # sentinel.  Forwarding it would prematurely close the HTTP
-                # response, causing Open WebUI (and similar frontends) to miss
-                # the final answer after tool calls.  The SSE loop detects
-                # completion via agent_task.done() instead.
+                # None closes the CLI box before tools; preserve that text
+                # boundary without forwarding the SSE end-of-stream sentinel.
                 # Called from the worker thread running run_conversation —
                 # put_threadsafe (not put_nowait) is required here.
                 if delta is not None:
                     _stream_q.put_threadsafe(delta)
+                else:
+                    _stream_q.put_threadsafe(("__text_boundary__", None))
 
             # Track which tool_call_ids we've emitted a "running" lifecycle
             # event for, so a "completed" event without a matching "running"
@@ -5222,6 +5233,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 events (``_thinking``, …) stay off the wire — matching
                 the prior ``_on_tool_progress`` filter exactly.
                 """
+                # Native tools do not send delta(None). Preserve the actual
+                # text boundary even when the tool card itself is filtered.
+                _stream_q.put_threadsafe(("__text_boundary__", None))
                 if not tool_call_id or function_name.startswith("_"):
                     return
                 _started_tool_call_ids.add(tool_call_id)
@@ -5319,7 +5333,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=500,
                 )
 
-        final_response = _resolve_media_to_data_urls(result.get("final_response") or "")
+        final_response = _resolve_media_to_data_urls(result.get("final_response") or result.get("partial_response") or "")
         is_partial = bool(result.get("partial"))
         is_failed = bool(result.get("failed"))
         completed = bool(result.get("completed", True))
@@ -5331,7 +5345,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # codes. See issue #22496.
         if is_partial and err_msg and "truncat" in err_msg.lower():
             finish_reason = "length"
-        elif is_failed or (not completed and err_msg):
+        elif is_failed or is_partial or not completed or result.get("interrupted"):
             finish_reason = "error"
         else:
             finish_reason = "stop"
@@ -5388,6 +5402,7 @@ class APIServerAdapter(BasePlatformAdapter):
             response_data["hermes"] = {
                 "completed": completed,
                 "partial": is_partial,
+                "interrupted": bool(result.get("interrupted")),
                 "failed": is_failed,
                 "error": err_msg,
                 "error_code": "output_truncated" if finish_reason == "length" else "agent_error",
@@ -5439,6 +5454,7 @@ class APIServerAdapter(BasePlatformAdapter):
             }
             await response.write(_sse_frame(role_chunk))
             last_activity = time.monotonic()
+            delivered_segments = [""]
 
             # Helper — route a queue item to the correct SSE event.
             async def _emit(item):
@@ -5451,9 +5467,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation history.  See #6972 for the original event,
                 #16588 for the ``toolCallId``/``status`` lifecycle fields.
                 """
-                if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
+                if isinstance(item, tuple) and len(item) == 2 and item[0] == "__text_boundary__":
+                    delivered_segments.append("")
+                elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
                     await response.write(_sse_frame(item[1], event="hermes.tool.progress"))
                 else:
+                    delivered_segments[-1] += item or ""
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
                         "created": created, "model": model,
@@ -5516,6 +5535,21 @@ class APIServerAdapter(BasePlatformAdapter):
             is_failed = bool(result.get("failed")) if isinstance(result, dict) else False
             completed = bool(result.get("completed", True)) if isinstance(result, dict) else True
             err_msg = result.get("error") if isinstance(result, dict) else None
+            if isinstance(result, dict) and result.get("partial_response"):
+                draft = _resolve_media_to_data_urls(result["partial_response"])
+                remaining = draft
+                for delivered in delivered_segments:
+                    if not delivered:
+                        continue
+                    if delivered.endswith(draft):
+                        remaining = ""
+                        break
+                    if draft.startswith(delivered):
+                        suffix = draft[len(delivered):]
+                        if len(suffix) < len(remaining):
+                            remaining = suffix
+                if remaining:
+                    await _emit(remaining)
             if agent_error is not None:
                 is_failed = True
                 err_msg = err_msg or str(agent_error)
@@ -5524,7 +5558,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # for truncation, "error" for failure, "stop" for normal completion.
             if is_partial and err_msg and "truncat" in err_msg.lower():
                 finish_reason = "length"
-            elif agent_error is not None or is_failed or (not completed and err_msg):
+            elif agent_error is not None or is_failed or is_partial or not completed or (isinstance(result, dict) and result.get("interrupted")):
                 finish_reason = "error"
             else:
                 finish_reason = "stop"
@@ -5550,6 +5584,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 finish_chunk["hermes"] = {
                     "completed": completed,
                     "partial": is_partial,
+                    "interrupted": bool(result.get("interrupted")) if isinstance(result, dict) else False,
                     "failed": is_failed,
                     "error": err_msg,
                     "error_code": "output_truncated" if finish_reason == "length" else "agent_error",
@@ -5656,6 +5691,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # State accumulated during the stream
         final_text_parts: List[str] = []
+        delivered_segments = [""]
         # Track open function_call items by name so we can emit a matching
         # ``done`` event when the tool completes.  Order preserved.
         pending_tool_calls: List[Dict[str, Any]] = []
@@ -5695,6 +5731,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return env
 
         final_response_text = ""
+        result = None
         agent_error: Optional[str] = None
         usage: Dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
         terminal_snapshot_persisted = False
@@ -5729,28 +5766,46 @@ class APIServerAdapter(BasePlatformAdapter):
             """
             if not store or terminal_snapshot_persisted:
                 return
-            incomplete_text = "".join(final_text_parts) or final_response_text
+            incomplete_text = (
+                (result.get("partial_response") if isinstance(result, dict) else None)
+                or "".join(final_text_parts) or final_response_text
+            )
             incomplete_items: List[Dict[str, Any]] = list(emitted_items)
             if incomplete_text:
                 incomplete_items.append({
                     "type": "message",
+                    "status": "incomplete",
                     "role": "assistant",
                     "content": [{"type": "output_text", "text": incomplete_text}],
                 })
             incomplete_env = _envelope("incomplete")
             incomplete_env["output"] = incomplete_items
+            if isinstance(result, dict):
+                incomplete_env["hermes"] = {
+                    "completed": bool(result.get("completed", True)),
+                    "partial": bool(result.get("partial")),
+                    "interrupted": bool(result.get("interrupted")),
+                    "error": _redact_api_error_text(result["error"]) if result.get("error") else None,
+                }
             incomplete_env["usage"] = {
                 "input_tokens": usage.get("input_tokens", 0),
                 "output_tokens": usage.get("output_tokens", 0),
                 "total_tokens": usage.get("total_tokens", 0),
             }
-            incomplete_history = list(conversation_history)
-            incomplete_history.append({"role": "user", "content": user_message})
-            if incomplete_text:
-                incomplete_history.append({"role": "assistant", "content": incomplete_text})
+            if isinstance(result, dict):
+                incomplete_history = self._build_response_conversation_history(
+                    conversation_history, user_message, result, incomplete_text,
+                )
+            else:
+                incomplete_history = list(conversation_history)
+                incomplete_history.append({"role": "user", "content": user_message})
+                if incomplete_text:
+                    incomplete_history.append({"role": "assistant", "content": incomplete_text})
+            _result_sid = result.get("session_id") if isinstance(result, dict) else None
             _persist_response_snapshot(
                 incomplete_env,
                 conversation_history_snapshot=incomplete_history,
+                session_id_snapshot=_result_sid if isinstance(_result_sid, str) and _result_sid else None,
             )
 
         try:
@@ -5789,6 +5844,7 @@ class APIServerAdapter(BasePlatformAdapter):
             async def _emit_text_delta(delta_text: str) -> None:
                 await _open_message_item()
                 final_text_parts.append(delta_text)
+                delivered_segments[-1] += delta_text
                 await _write_event("response.output_text.delta", {
                     "type": "response.output_text.delta",
                     "item_id": message_item_id,
@@ -5921,9 +5977,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     if _batch_buf:
                         await _flush_batch()
                     if tag == "__tool_started__":
+                        # Native tool lifecycle is also a semantic text
+                        # boundary; its bridge need not send delta(None).
+                        delivered_segments.append("")
                         await _emit_tool_started(payload)
                     elif tag == "__tool_completed__":
                         await _emit_tool_completed(payload)
+                    elif tag == "__text_boundary__":
+                        delivered_segments.append("")
                 elif isinstance(it, str):
                     # Batch text deltas — append to buffer, flush on timer
                     _batch_buf.append(it)
@@ -5998,23 +6059,46 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 result, agent_usage = await agent_task
                 usage = agent_usage or usage
-                # If the agent produced a final_response but no text
-                # deltas were streamed (e.g. some providers only emit
-                # the full response at the end), emit a single fallback
-                # delta so Responses clients still receive a live text part.
-                agent_final = result.get("final_response", "") if isinstance(result, dict) else ""
-                if agent_final and not final_text_parts:
+                # Reconcile native drafts against delivered text; earlier
+                # commentary is not proof that the draft itself was shown.
+                # Completed providers retain their no-deltas fallback.
+                agent_final = (result.get("final_response") or result.get("partial_response") or "") if isinstance(result, dict) else ""
+                if agent_final and result.get("partial_response"):
+                    remaining = agent_final
+                    for delivered in delivered_segments:
+                        if not delivered:
+                            continue
+                        if delivered.endswith(agent_final):
+                            remaining = ""
+                            break
+                        if agent_final.startswith(delivered):
+                            suffix = agent_final[len(delivered):]
+                            if len(suffix) < len(remaining):
+                                remaining = suffix
+                    if remaining:
+                        await _emit_text_delta(remaining)
+                elif agent_final and not final_text_parts:
                     await _emit_text_delta(agent_final)
                 if agent_final and not final_response_text:
                     final_response_text = agent_final
-                if isinstance(result, dict) and result.get("error") and not final_response_text:
+                if isinstance(result, dict) and result.get("error"):
                     agent_error = _redact_api_error_text(result["error"])
             except Exception as e:  # noqa: BLE001
                 logger.error("Error running agent for streaming responses: %s", e, exc_info=True)
                 agent_error = _redact_api_error_text(e)
 
             # Close the message item if it was opened
-            final_response_text = "".join(final_text_parts) or final_response_text
+            # A native draft is the canonical terminal text even when earlier
+            # commentary was streamed into this message item.
+            final_response_text = (
+                (result.get("partial_response") if isinstance(result, dict) else None)
+                or "".join(final_text_parts) or final_response_text
+            )
+            incomplete_result = bool(isinstance(result, dict) and (
+                result.get("partial") or result.get("failed")
+                or result.get("completed") is False or result.get("interrupted")
+            ))
+            message_status = "incomplete" if incomplete_result or agent_error else "completed"
             if message_opened:
                 await _write_event("response.output_text.done", {
                     "type": "response.output_text.done",
@@ -6027,7 +6111,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 msg_done_item = {
                     "id": message_item_id,
                     "type": "message",
-                    "status": "completed",
+                    "status": message_status,
                     "role": "assistant",
                     "content": [
                         {"type": "output_text", "text": final_response_text}
@@ -6071,35 +6155,44 @@ class APIServerAdapter(BasePlatformAdapter):
 
             final_items.append({
                 "type": "message",
+                "status": message_status,
                 "role": "assistant",
                 "content": [
                     {"type": "output_text", "text": final_response_text or (_redact_api_error_text(agent_error) if agent_error else "")}
                 ],
             })
 
-            if agent_error:
-                failed_env = _envelope("failed")
+            if agent_error or incomplete_result:
+                terminal_status = "incomplete" if isinstance(result, dict) and result.get("partial") and not result.get("failed") else "failed"
+                failed_env = _envelope(terminal_status)
                 failed_env["output"] = final_items
-                failed_env["error"] = {"message": _redact_api_error_text(agent_error), "type": "server_error"}
+                if agent_error:
+                    failed_env["error"] = {"message": _redact_api_error_text(agent_error), "type": "server_error"}
+                if isinstance(result, dict):
+                    failed_env["hermes"] = {
+                        "completed": bool(result.get("completed", True)),
+                        "partial": bool(result.get("partial")),
+                        "interrupted": bool(result.get("interrupted")),
+                        "error": agent_error,
+                    }
                 failed_env["usage"] = {
                     "input_tokens": usage.get("input_tokens", 0),
                     "output_tokens": usage.get("output_tokens", 0),
                     "total_tokens": usage.get("total_tokens", 0),
                 }
-                _failed_history = list(conversation_history)
-                _failed_history.append({"role": "user", "content": user_message})
-                if final_response_text or agent_error:
-                    _failed_history.append({
-                        "role": "assistant",
-                        "content": final_response_text or _redact_api_error_text(agent_error),
-                    })
+                _failed_history = self._build_response_conversation_history(
+                    conversation_history, user_message, result,
+                    final_response_text or (_redact_api_error_text(agent_error) if agent_error else ""),
+                )
+                _result_sid = result.get("session_id") if isinstance(result, dict) else None
                 _persist_response_snapshot(
                     failed_env,
                     conversation_history_snapshot=_failed_history,
+                    session_id_snapshot=_result_sid if isinstance(_result_sid, str) and _result_sid else None,
                 )
                 terminal_snapshot_persisted = True
-                await _write_event("response.failed", {
-                    "type": "response.failed",
+                await _write_event(f"response.{terminal_status}", {
+                    "type": f"response.{terminal_status}",
                     "response": failed_env,
                 })
             else:
@@ -6335,13 +6428,13 @@ class APIServerAdapter(BasePlatformAdapter):
             _stream_q = ThreadSafeAsyncQueue()
 
             def _on_delta(delta):
-                # None from the agent is a CLI box-close signal, not EOS.
-                # Forwarding would kill the SSE stream prematurely; the
-                # SSE writer detects completion via agent_task.done().
+                # None is a CLI text boundary, not the SSE EOS sentinel.
                 # Called from the worker thread running run_conversation —
                 # put_threadsafe (not put_nowait) is required here.
                 if delta is not None:
                     _stream_q.put_threadsafe(delta)
+                else:
+                    _stream_q.put_threadsafe(("__text_boundary__", None))
 
             def _on_tool_progress(event_type, name, preview, args, **kwargs):
                 """Queue non-start tool progress events if needed in future.
@@ -6453,7 +6546,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=500,
                 )
 
-        final_response = _resolve_media_to_data_urls(result.get("final_response", ""))
+        final_response = _resolve_media_to_data_urls(result.get("final_response") or result.get("partial_response") or "")
         if not final_response:
             final_response = _redact_api_error_text(result.get("error", "(No response generated)"))
 
@@ -6502,6 +6595,17 @@ class APIServerAdapter(BasePlatformAdapter):
                 "total_tokens": usage.get("total_tokens", 0),
             },
         }
+
+        if result.get("partial") or result.get("failed") or result.get("completed") is False or result.get("interrupted"):
+            response_data["status"] = "failed" if result.get("failed") else "incomplete"
+            response_data["hermes"] = {
+                "completed": bool(result.get("completed", True)),
+                "partial": bool(result.get("partial")),
+                "interrupted": bool(result.get("interrupted")),
+                "error": _redact_api_error_text(result["error"]) if result.get("error") else None,
+            }
+            if result.get("error"):
+                response_data["error"] = {"message": _redact_api_error_text(result["error"]), "type": "server_error"}
 
         # Store the complete response object for future chaining / GET retrieval
         if store:
@@ -7108,12 +7212,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 })
 
         # Final assistant message
-        final = result.get("final_response", "")
+        final = result.get("final_response") or result.get("partial_response") or ""
         if not final:
             final = _redact_api_error_text(result.get("error", "(No response generated)"))
 
         items.append({
             "type": "message",
+            "status": "incomplete" if (result.get("partial") or result.get("failed") or result.get("completed") is False or result.get("interrupted")) else "completed",
             "role": "assistant",
             "content": [
                 {
@@ -7861,19 +7966,31 @@ class APIServerAdapter(BasePlatformAdapter):
                 # Check for structured failure (non-retryable client errors like
                 # 401/400 return failed=True instead of raising, so the except
                 # block below never fires — issue #15561).
-                elif isinstance(result, dict) and result.get("failed"):
+                elif isinstance(result, dict) and (
+                    result.get("failed") or result.get("partial")
+                    or result.get("completed") is False or result.get("interrupted")
+                ):
                     error_msg = _redact_api_error_text(result.get("error") or "agent run failed")
+                    status = "cancelled" if result.get("interrupted") else "failed"
+                    outcome = {
+                        "output": result.get("final_response") or result.get("partial_response") or "",
+                        "completed": False,
+                        "partial": bool(result.get("partial")),
+                        "interrupted": bool(result.get("interrupted")),
+                    }
                     _put_event_if_active({
-                        "event": "run.failed",
+                        "event": f"run.{status}",
                         "run_id": run_id,
                         "timestamp": time.time(),
                         "error": error_msg,
+                        **outcome,
                     })
                     self._set_run_status(
                         run_id,
-                        "failed",
+                        status,
                         error=error_msg,
-                        last_event="run.failed",
+                        last_event=f"run.{status}",
+                        **outcome,
                     )
                 else:
                     final_response = result.get("final_response", "") if isinstance(result, dict) else ""

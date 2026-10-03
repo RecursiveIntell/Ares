@@ -551,6 +551,7 @@ class AIAgent:
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
         requested_provider: str = None,
+        _resource_preserve_agent=None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         if tool_delay is not None:
@@ -561,87 +562,97 @@ class AIAgent:
                 stacklevel=2,
             )
         from agent.agent_init import init_agent
-        init_agent(
-            self,
-            base_url=base_url,
-            api_key=api_key,
-            provider=provider,
-            requested_provider=requested_provider,
-            api_mode=api_mode,
-            acp_command=acp_command,
-            acp_args=acp_args,
-            command=command,
-            args=args,
-            model=model,
-            max_iterations=max_iterations,
-            enabled_toolsets=enabled_toolsets,
-            disabled_toolsets=disabled_toolsets,
-            save_trajectories=save_trajectories,
-            verbose_logging=verbose_logging,
-            quiet_mode=quiet_mode,
-            tool_progress_mode=tool_progress_mode,
-            ephemeral_system_prompt=ephemeral_system_prompt,
-            log_prefix_chars=log_prefix_chars,
-            log_prefix=log_prefix,
-            providers_allowed=providers_allowed,
-            providers_ignored=providers_ignored,
-            providers_order=providers_order,
-            provider_sort=provider_sort,
-            provider_require_parameters=provider_require_parameters,
-            provider_data_collection=provider_data_collection,
-            openrouter_min_coding_score=openrouter_min_coding_score,
-            session_id=session_id,
-            tool_progress_callback=tool_progress_callback,
-            tool_start_callback=tool_start_callback,
-            tool_complete_callback=tool_complete_callback,
-            thinking_callback=thinking_callback,
-            reasoning_callback=reasoning_callback,
-            clarify_callback=clarify_callback,
-            read_terminal_callback=read_terminal_callback,
-            read_preview_callback=read_preview_callback,
-            drive_preview_callback=drive_preview_callback,
-            read_window_below_callback=read_window_below_callback,
-            setup_mcp_callback=setup_mcp_callback,
-            tour_callback=tour_callback,
-            step_callback=step_callback,
-            stream_delta_callback=stream_delta_callback,
-            interim_assistant_callback=interim_assistant_callback,
-            tool_gen_callback=tool_gen_callback,
-            status_callback=status_callback,
-            notice_callback=notice_callback,
-            notice_clear_callback=notice_clear_callback,
-            event_callback=event_callback,
-            reaction_callback=reaction_callback,
-            max_tokens=max_tokens,
-            reasoning_config=reasoning_config,
-            service_tier=service_tier,
-            request_overrides=request_overrides,
-            prefill_messages=prefill_messages,
-            platform=platform,
-            user_id=user_id,
-            user_id_alt=user_id_alt,
-            user_name=user_name,
-            chat_id=chat_id,
-            chat_name=chat_name,
-            chat_type=chat_type,
-            thread_id=thread_id,
-            gateway_session_key=gateway_session_key,
-            skip_context_files=skip_context_files,
-            load_soul_identity=load_soul_identity,
-            skip_memory=skip_memory,
-            skip_background_review=skip_background_review,
-            session_db=session_db,
-            parent_session_id=parent_session_id,
-            iteration_budget=iteration_budget,
-            run_budget_seconds=run_budget_seconds,
-            fallback_model=fallback_model,
-            credential_pool=credential_pool,
-            checkpoints_enabled=checkpoints_enabled,
-            checkpoint_max_snapshots=checkpoint_max_snapshots,
-            checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
-            checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
-            pass_session_id=pass_session_id,
-        )
+        try:
+            init_agent(
+                self,
+                base_url=base_url,
+                api_key=api_key,
+                provider=provider,
+                requested_provider=requested_provider,
+                api_mode=api_mode,
+                acp_command=acp_command,
+                acp_args=acp_args,
+                command=command,
+                args=args,
+                model=model,
+                max_iterations=max_iterations,
+                enabled_toolsets=enabled_toolsets,
+                disabled_toolsets=disabled_toolsets,
+                save_trajectories=save_trajectories,
+                verbose_logging=verbose_logging,
+                quiet_mode=quiet_mode,
+                tool_progress_mode=tool_progress_mode,
+                ephemeral_system_prompt=ephemeral_system_prompt,
+                log_prefix_chars=log_prefix_chars,
+                log_prefix=log_prefix,
+                providers_allowed=providers_allowed,
+                providers_ignored=providers_ignored,
+                providers_order=providers_order,
+                provider_sort=provider_sort,
+                provider_require_parameters=provider_require_parameters,
+                provider_data_collection=provider_data_collection,
+                openrouter_min_coding_score=openrouter_min_coding_score,
+                session_id=session_id,
+                tool_progress_callback=tool_progress_callback,
+                tool_start_callback=tool_start_callback,
+                tool_complete_callback=tool_complete_callback,
+                thinking_callback=thinking_callback,
+                reasoning_callback=reasoning_callback,
+                clarify_callback=clarify_callback,
+                read_terminal_callback=read_terminal_callback,
+                read_preview_callback=read_preview_callback,
+                drive_preview_callback=drive_preview_callback,
+                read_window_below_callback=read_window_below_callback,
+                setup_mcp_callback=setup_mcp_callback,
+                tour_callback=tour_callback,
+                step_callback=step_callback,
+                stream_delta_callback=stream_delta_callback,
+                interim_assistant_callback=interim_assistant_callback,
+                tool_gen_callback=tool_gen_callback,
+                status_callback=status_callback,
+                notice_callback=notice_callback,
+                notice_clear_callback=notice_clear_callback,
+                event_callback=event_callback,
+                reaction_callback=reaction_callback,
+                max_tokens=max_tokens,
+                reasoning_config=reasoning_config,
+                service_tier=service_tier,
+                request_overrides=request_overrides,
+                prefill_messages=prefill_messages,
+                platform=platform,
+                user_id=user_id,
+                user_id_alt=user_id_alt,
+                user_name=user_name,
+                chat_id=chat_id,
+                chat_name=chat_name,
+                chat_type=chat_type,
+                thread_id=thread_id,
+                gateway_session_key=gateway_session_key,
+                skip_context_files=skip_context_files,
+                load_soul_identity=load_soul_identity,
+                skip_memory=skip_memory,
+                skip_background_review=skip_background_review,
+                session_db=session_db,
+                parent_session_id=parent_session_id,
+                iteration_budget=iteration_budget,
+                run_budget_seconds=run_budget_seconds,
+                fallback_model=fallback_model,
+                credential_pool=credential_pool,
+                checkpoints_enabled=checkpoints_enabled,
+                checkpoint_max_snapshots=checkpoint_max_snapshots,
+                checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
+                checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
+                pass_session_id=pass_session_id,
+            )
+        except Exception:
+            # The constructor may fail after creating local clients/providers.
+            # No caller receives this object, so retire them here without
+            # ending its shared session or masking the construction failure.
+            try:
+                self.retire_local_resources(preserve_agent=_resource_preserve_agent)
+            except Exception:
+                logger.debug("Partial agent initialization cleanup failed", exc_info=True)
+            raise
 
     def _get_session_db_for_recall(self):
         """Return a SessionDB for recall, lazily creating it if an entrypoint forgot.
@@ -4486,26 +4497,40 @@ class AIAgent:
             },
         )
 
-    def shutdown_memory_provider(self, messages: list = None) -> None:
-        """Shut down the memory provider and context engine at session end.
+    def shutdown_memory_provider(
+        self, messages: list = None, *, end_session: bool = True, preserve_agent=None,
+    ) -> None:
+        """Shut down this instance's memory provider.
 
         Idempotent: gateway cleanup and AIAgent.close() may share this
-        ownership boundary.
+        ownership boundary. Local replacement passes end_session=False:
+        provider/engine shutdown releases instance resources, but logical
+        session-end hooks must wait for a real session boundary.
+        preserve_agent identifies the live owner of any borrowed instances.
         """
         if getattr(self, "_memory_provider_shutdown", False):
             return
         self._memory_provider_shutdown = True
-        if self._memory_manager:
+        memory_manager = getattr(self, "_memory_manager", None)
+        preserved_manager = getattr(preserve_agent, "_memory_manager", None)
+        if memory_manager and memory_manager is not preserved_manager:
+            if end_session:
+                try:
+                    memory_manager.on_session_end(messages or [])
+                except Exception as e:
+                    logger.warning("Memory provider on_session_end failed during shutdown: %s", e, exc_info=True)
             try:
-                self._memory_manager.on_session_end(messages or [])
-            except Exception as e:
-                logger.warning("Memory provider on_session_end failed during shutdown: %s", e, exc_info=True)
-            try:
-                self._memory_manager.shutdown_all()
+                if preserved_manager is None:
+                    memory_manager.shutdown_all()
+                else:
+                    memory_manager.shutdown_all(
+                        preserve_providers=preserved_manager.providers,
+                    )
             except Exception:
                 pass
+
         # Notify context engine of session end (flush DAG, close DBs, etc.)
-        if hasattr(self, "context_compressor") and self.context_compressor:
+        if end_session and hasattr(self, "context_compressor") and self.context_compressor:
             try:
                 self.context_compressor.on_session_end(
                     self.session_id or "",
@@ -4513,6 +4538,14 @@ class AIAgent:
                 )
             except Exception:
                 pass
+
+        engine = getattr(self, "context_compressor", None)
+        engine_shutdown = getattr(engine, "shutdown", None)
+        if engine is not getattr(preserve_agent, "context_compressor", None) and callable(engine_shutdown):
+            try:
+                engine_shutdown()
+            except Exception:
+                logger.debug("Context engine local shutdown failed", exc_info=True)
 
     def commit_memory_session(self, messages: list = None) -> None:
         """Trigger end-of-session extraction without tearing providers down.
@@ -4668,6 +4701,30 @@ class AIAgent:
             self._close_cached_request_anthropic_client(reason="cache_evict")
         except Exception:
             pass
+
+    def retire_local_resources(self, *, preserve_agent=None) -> None:
+        """Retire this instance while its logical session continues elsewhere.
+
+        Capability refresh constructs separate providers for the same session
+        ID. Drain their work without logical session-end hooks, ending the
+        SQLite row, closing its shared DB, or destroying task-scoped tools.
+        Context engines release only instance handles through shutdown(),
+        reserving on_session_end for real session boundaries. Native transport
+        retirement has a separate ownership boundary in the caller.
+        Borrowed provider/engine instances belonging to preserve_agent survive.
+        """
+        if getattr(self, "_local_resources_retired", False):
+            return
+        self._local_resources_retired = True
+        try:
+            self.release_clients()
+        finally:
+            session_messages = getattr(self, "_session_messages", None)
+            self.shutdown_memory_provider(
+                session_messages if isinstance(session_messages, list) else None,
+                end_session=False,
+                preserve_agent=preserve_agent,
+            )
 
     def close(self) -> None:
         """Release all resources held by this agent instance.

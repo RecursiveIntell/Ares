@@ -137,6 +137,7 @@ def _notification_belongs_to_turn(
     *,
     thread_id: Optional[str],
     turn_id: Optional[str],
+    require_explicit_scope: bool = False,
 ) -> bool:
     """Return whether a multiplexed notification belongs to this turn.
 
@@ -150,6 +151,19 @@ def _notification_belongs_to_turn(
         return False
 
     observed_thread_id, observed_turn_id = _notification_scope_ids(note)
+    if require_explicit_scope:
+        if observed_thread_id is None or observed_turn_id is None:
+            return False
+        params = note.get("params") or {}
+        for name, scope in (("params", params), ("turn", params.get("turn")), ("item", params.get("item"))):
+            if not isinstance(scope, dict):
+                continue
+            if any(scope.get(key) is not None and str(scope[key]) != str(thread_id)
+                   for key in ("threadId", "thread_id")):
+                return False
+            keys = ("id", "turnId", "turn_id") if name == "turn" else ("turnId", "turn_id")
+            if any(scope.get(key) is not None and str(scope[key]) != str(turn_id) for key in keys):
+                return False
 
     if (
         thread_id is not None
@@ -315,6 +329,8 @@ class CodexAppServerSession:
         self._interrupt_event = threading.Event()
         self._active_turn_id: Optional[str] = None
         self._active_turn_lock = threading.Lock()
+        # One caller owns a lifecycle boundary, including request/ACK latency.
+        self._operation_lock = threading.Lock()
         # Exclusions for prior turns belong to this session, alongside its
         # canonical thread identity; they confer no native qualification.
         self._known_turn_ids: set[str] = set()
@@ -450,6 +466,36 @@ class CodexAppServerSession:
             and self._subscription_only_trial == subscription_only_trial
         )
 
+    def update_model(
+        self, model: Optional[str], provider: Optional[str], *,
+        subscription_only_trial: bool = False,
+    ) -> bool:
+        """Select the next turn's model without replacing authoritative history.
+
+        turn/start.model is a sticky protocol override; sending the selected
+        model every turn also restores the primary model after a --once turn.
+        Provider and qualification-mode changes require an explicit reset.
+        """
+        if not self._operation_lock.acquire(blocking=False):
+            return False
+        try:
+            if not self.matches_route(
+                self._model, provider, subscription_only_trial=subscription_only_trial,
+            ):
+                return False
+            selected = str(model or "").strip()
+            for prefix in ("openai/", "openai-codex/"):
+                if selected.startswith(prefix):
+                    selected = selected[len(prefix):]
+                    break
+            # An omitted override cannot restore an unknown thread default.
+            if not selected:
+                return False
+            self._model = selected
+            return True
+        finally:
+            self._operation_lock.release()
+
     def close(self) -> None:
         if self._closed:
             return
@@ -554,6 +600,25 @@ class CodexAppServerSession:
         notification_poll_timeout: float = 0.25,
         post_tool_quiet_timeout: float = 90.0,
     ) -> TurnResult:
+        if not self._operation_lock.acquire(blocking=False):
+            return TurnResult(thread_id=self._thread_id, error="codex session already has an active operation")
+        try:
+            return self._run_turn(
+                user_input, turn_timeout=turn_timeout,
+                notification_poll_timeout=notification_poll_timeout,
+                post_tool_quiet_timeout=post_tool_quiet_timeout,
+            )
+        finally:
+            self._operation_lock.release()
+
+    def _run_turn(
+        self,
+        user_input: Any,
+        *,
+        turn_timeout: float = 600.0,
+        notification_poll_timeout: float = 0.25,
+        post_tool_quiet_timeout: float = 90.0,
+    ) -> TurnResult:
         """Send a user message and block until turn/completed, while
         forwarding server-initiated approval requests and projecting items
         into Hermes' messages shape.
@@ -597,15 +662,14 @@ class CodexAppServerSession:
 
         # Send turn/start with the user input. Text-only for now (codex
         # supports rich content but Hermes' text path is the common case).
+        turn_params: dict[str, Any] = {
+            "threadId": self._thread_id,
+            "input": [{"type": "text", "text": user_input_text}],
+        }
+        if self._model:
+            turn_params["model"] = self._model
         try:
-            ts = self._client.request(
-                "turn/start",
-                {
-                    "threadId": self._thread_id,
-                    "input": [{"type": "text", "text": user_input_text}],
-                },
-                timeout=10,
-            )
+            ts = self._client.request("turn/start", turn_params, timeout=10)
         except CodexAppServerError as exc:
             # Classify auth/refresh failures so the user gets a clear
             # `codex login` pointer instead of a raw RPC error string.
@@ -880,12 +944,30 @@ class CodexAppServerSession:
         turn_timeout: float = 600.0,
         notification_poll_timeout: float = 0.25,
     ) -> TurnResult:
+        if not self._operation_lock.acquire(blocking=False):
+            return TurnResult(thread_id=self._thread_id, error="codex session already has an active operation")
+        try:
+            return self._compact_thread(
+                turn_timeout=turn_timeout,
+                notification_poll_timeout=notification_poll_timeout,
+            )
+        finally:
+            self._operation_lock.release()
+
+    def _compact_thread(
+        self,
+        *,
+        turn_timeout: float = 600.0,
+        notification_poll_timeout: float = 0.25,
+    ) -> TurnResult:
         """Trigger Codex-native history compaction for the current thread.
 
-        Success requires an acknowledgement binding the requested operation
-        to a turn ID, followed by explicitly scoped started/completed events.
-        The current native protocol returns no ID, so it cannot establish
-        that binding and is conservatively retired with a correlation error.
+        The supported ACK is empty. Under the session's single-writer lock,
+        read prior history and drain pre-request lifecycle, then bind a fresh
+        same-thread turn/started. Its completed contextCompaction item or
+        canonical deprecated thread/compacted notification, followed by a
+        successful terminal, certifies completion, including events queued
+        while the request is waiting for its ACK.
         """
         result = TurnResult()
         try:
@@ -906,8 +988,44 @@ class CodexAppServerSession:
             return result
         projector = CodexEventProjector()
 
+        # thread/read is a supported non-mutating history boundary. The
+        # FIFO client reader has queued notifications preceding its response;
+        # persisted turn IDs also exclude delayed lifecycle for prior turns.
+        # Unsupported/malformed boundaries refuse before launching compaction
+        # and preserve the canonical thread for ordinary conversation.
+        try:
+            snapshot = self._client.request(
+                "thread/read", {"threadId": self._thread_id, "includeTurns": True}, timeout=10,
+            )
+        except CodexAppServerError as exc:
+            result.error = self._format_error_with_stderr("cannot establish compaction history boundary", exc)
+            self._interrupt_event.clear()
+            return result
+        except (RuntimeError, TimeoutError, OSError) as exc:
+            result.error = self._format_error_with_stderr("compaction history boundary transport failed", exc)
+            result.should_retire = True
+            self.close()
+            return result
+        if self._interrupt_event.is_set():
+            result.interrupted = True
+            self._interrupt_event.clear()
+            return result
+        thread = snapshot.get("thread") if isinstance(snapshot, dict) else None
+        turns = thread.get("turns") if isinstance(thread, dict) else None
+        status = thread.get("status") if isinstance(thread, dict) else None
+        if (
+            not isinstance(thread, dict) or thread.get("id") != self._thread_id
+            or not isinstance(status, dict) or status.get("type") != "idle"
+            or not isinstance(turns, list)
+            or any(not isinstance(turn, dict) or not isinstance(turn.get("id"), str)
+                   or not turn["id"] or turn.get("status") == "inProgress" for turn in turns)
+        ):
+            result.error = "cannot establish compaction history boundary: expected an idle thread with prior turn IDs"
+            return result
+        self._known_turn_ids.update(turn["id"] for turn in turns)
+
         # Reject lifecycle already queued before the new request. Bound the
-        # drain so an endlessly streaming peer cannot prevent retirement.
+        # drain so an endlessly streaming peer cannot prevent refusal.
         for _ in range(1024):
             note = self._client.take_notification(timeout=0)
             if note is None:
@@ -917,10 +1035,12 @@ class CodexAppServerSession:
                 self._known_turn_ids.add(str(turn_id))
         else:
             result.error = "cannot correlate compaction: notification backlog exceeds boundary limit"
-            result.should_retire = True
-            self.close()
             return result
 
+        if self._interrupt_event.is_set():
+            result.interrupted = True
+            self._interrupt_event.clear()
+            return result
         try:
             acknowledgment = self._client.request(
                 "thread/compact/start",
@@ -956,16 +1076,14 @@ class CodexAppServerSession:
             self.close()
             return result
 
-        acknowledged_turn = acknowledgment.get("turn") if isinstance(acknowledgment, dict) else None
-        acknowledged_id = acknowledged_turn.get("id") if isinstance(acknowledged_turn, dict) else None
-        if not isinstance(acknowledged_id, str) or not acknowledged_id or acknowledged_id in self._known_turn_ids:
-            result.error = "cannot correlate compaction: acknowledgement has no fresh bound turn id"
+        if not isinstance(acknowledgment, dict):
+            result.error = "invalid thread/compact/start acknowledgement"
             result.should_retire = True
             self.close()
             return result
-        result.turn_id = acknowledged_id
-        self._known_turn_ids.add(acknowledged_id)
         turn_started = False
+        compaction_item_id: Optional[str] = None
+        compaction_completed = False
         deadline = time.monotonic() + turn_timeout
         turn_complete = False
 
@@ -1012,33 +1130,58 @@ class CodexAppServerSession:
 
             method = note.get("method", "")
             observed_thread_id, observed_turn_id = _notification_scope_ids(note)
+            # Validate all explicit aliases before binding a new turn; a
+            # conflicting nested identity is not a legitimate start boundary.
+            if not _notification_belongs_to_turn(
+                note, thread_id=self._thread_id,
+                turn_id=result.turn_id if turn_started else observed_turn_id,
+                require_explicit_scope=True,
+            ):
+                continue
             if not turn_started:
                 if (
                     method != "turn/started"
                     or observed_thread_id is None or observed_turn_id is None
                     or str(observed_thread_id) != str(self._thread_id)
-                    or str(observed_turn_id) != acknowledged_id
+                    or not isinstance(observed_turn_id, str) or not observed_turn_id
+                    or observed_turn_id in self._known_turn_ids
                 ):
                     continue
+                result.turn_id = observed_turn_id
+                self._known_turn_ids.add(observed_turn_id)
                 turn_started = True
-
-            if not _notification_belongs_to_turn(
-                note,
-                thread_id=self._thread_id,
-                turn_id=result.turn_id,
-            ):
-                logger.debug(
-                    "ignoring foreign codex notification: method=%s", method
-                )
-                continue
 
             with self._active_turn_lock:
                 self._active_turn_id = result.turn_id
 
+            params = note.get("params") or {}
+            item = params.get("item") or {}
+            if method == "thread/compacted":
+                # ContextCompactedNotification (including rust-v0.130.0)
+                # requires these canonical string IDs. The earlier strict
+                # scope check rejects conflicting aliases and nested IDs.
+                if (
+                    not isinstance(params.get("threadId"), str)
+                    or not isinstance(params.get("turnId"), str)
+                    or params["threadId"] != result.thread_id
+                    or params["turnId"] != result.turn_id
+                ):
+                    continue
+                compaction_completed = True
+            if isinstance(item, dict) and item.get("type") == "contextCompaction":
+                item_id = item.get("id")
+                if method == "item/started" and isinstance(item_id, str) and item_id:
+                    compaction_item_id = item_id
+                elif method == "item/completed" and item_id == compaction_item_id and item_id:
+                    compaction_completed = True
             if method == "turn/completed":
                 turn_complete = self._accept_terminal(note, result)
                 if not turn_complete:
                     continue
+                if result.completed and not compaction_completed:
+                    result.completed = False
+                    result.error = "compaction terminal lacked completed contextCompaction or thread/compacted evidence"
+                    result.should_retire = True
 
             if self._on_event is not None:
                 try:

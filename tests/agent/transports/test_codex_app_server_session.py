@@ -53,6 +53,9 @@ class FakeClient:
         if method == "thread/start":
             return {"thread": {"id": "thread-fake-001"},
                     "activePermissionProfile": {"id": "workspace-write"}}
+        if method == "thread/read":
+            return {"thread": {"id": "thread-fake-001", "status": {"type": "idle"},
+                               "turns": getattr(self, "_history", [])}}
         if method == "turn/start":
             return {"turn": {"id": "turn-fake-001"}}
         if method == "turn/interrupt":
@@ -126,21 +129,30 @@ def make_session(client: FakeClient, **kwargs) -> CodexAppServerSession:
     )
 
 
-def emit_compaction_on_request(client, *, turn_id="compact-turn-1", bind_turn=True):
-    """Model new events from a fake request, optionally with an explicit ID.
-
-    The current native compact protocol has no such ID; bound success tests
-    exercise the adapter contract, not native protocol qualification.
-    """
+def emit_compaction_on_request(client, *, turn_id="compact-turn-1", complete_item=True):
+    """Emit scoped lifecycle before returning the protocol's empty ACK."""
     notes = list(client._notifications)
     client._notifications.clear()
+    if complete_item:
+        # Supply the documented single contextCompaction item pair. Existing
+        # transcript/terminal fixtures still control start and terminal order.
+        index = next((i + 1 for i, note in enumerate(notes)
+                      if note["method"] == "turn/started"
+                      and note["params"].get("threadId") == "thread-fake-001"
+                      and note["params"].get("turn", {}).get("id") == turn_id), len(notes))
+        item = {"type": "contextCompaction", "id": "fixture-compaction"}
+        notes[index:index] = [
+            {"method": method, "params": {"threadId": "thread-fake-001", "turnId": turn_id,
+                                          "item": dict(item)}}
+            for method in ("item/started", "item/completed")
+        ]
     original_request = client.request
 
     def request(method, params=None, timeout=30):
         response = original_request(method, params, timeout)
         if method == "thread/compact/start":
             client._notifications.extend(notes)
-            return {"turn": {"id": turn_id}} if bind_turn else {}
+            return {}
         return response
 
     client.request = request
@@ -516,9 +528,11 @@ class TestCompactThread:
         assert result.error is None
         assert result.turn_id == "compact-turn-1"
         assert result.final_text == "parent compacted"
-        assert result.projected_messages == [
-            {"role": "assistant", "content": "parent compacted"}
-        ]
+        parent_message = {"role": "assistant", "content": "parent compacted"}
+        assert result.projected_messages.count(parent_message) == 1
+        assert result.projected_messages[-1] == parent_message
+        assert not any("child" in message.get("content", "") for message in result.projected_messages)
+        assert result.compacted
 
 
 
@@ -1216,7 +1230,7 @@ class TestNativeMalformedStartup:
 
 class TestNativeCompactionTerminalProof:
     @pytest.mark.parametrize("preexisting", [False, True])
-    def test_no_id_ack_cannot_certify_even_typed_compact_lifecycle(self, preexisting):
+    def test_empty_ack_preserves_thread_only_for_fresh_lifecycle(self, preexisting):
         client = FakeClient()
         client.queue_notification("turn/started", threadId="t", turn={"id": "old"})
         client.queue_notification("item/completed", threadId="t", turnId="old",
@@ -1226,11 +1240,17 @@ class TestNativeCompactionTerminalProof:
         client.queue_notification("turn/completed", threadId="t",
             turn={"id": "old", "status": "completed"})
         if not preexisting:
-            emit_compaction_on_request(client, bind_turn=False)
-        result = make_session(client).compact_thread(turn_timeout=0.01)
-        assert not result.completed and result.final_text == ""
-        assert result.should_retire and client._closed
-        assert "correlat" in result.error
+            emit_compaction_on_request(client, turn_id="old")
+        session = make_session(client)
+        result = session.compact_thread(turn_timeout=0.01)
+        assert result.completed is (not preexisting)
+        assert result.should_retire is preexisting
+        assert client._closed is preexisting
+        if not preexisting:
+            assert session._thread_id == "thread-fake-001"
+            assert result.turn_id == "old" and result.final_text == "old summary"
+        else:
+            assert result.final_text == "" and "timed out" in result.error
 
     def test_compaction_ack_cannot_reuse_known_previous_turn(self):
         client = FakeClient()
@@ -1255,7 +1275,7 @@ class TestNativeCompactionTerminalProof:
 
         def request(method, params=None, timeout=30):
             response = original_request(method, params, timeout)
-            return {"turn": {"id": "prior"}} if method == "thread/compact/start" else response
+            return {} if method == "thread/compact/start" else response
 
         client.request = request
         result = make_session(client).compact_thread(turn_timeout=0.01)
@@ -1303,6 +1323,8 @@ class TestNativeCompactionRetirement:
         def request(method, params):
             if method == "thread/start":
                 return {"thread": {"id": "thread-fake-001"}}
+            if method == "thread/read":
+                return {"thread": {"id": "thread-fake-001", "status": {"type": "idle"}, "turns": []}}
             if method == "thread/compact/start":
                 raise error
             return {}
@@ -1380,3 +1402,113 @@ class TestNativeCompactionRetirement:
         assert not any(method == "thread/compact/start" for method, _ in client.requests)
         assert session._active_turn_id is None
         assert not session._interrupt_event.is_set()
+
+
+class TestNativeCompactionBoundary:
+    def test_late_prior_lifecycle_is_excluded_by_history_read(self):
+        client = FakeClient()
+        client._history = [{"id": "delayed-prior", "status": "completed"}]
+        for turn_id in ("delayed-prior", "fresh"):
+            client.queue_notification("turn/started", threadId="t", turn={"id": turn_id})
+            client.queue_notification("item/started", threadId="t", turnId=turn_id,
+                                      item={"type": "contextCompaction", "id": turn_id + "-item"})
+            client.queue_notification("item/completed", threadId="t", turnId=turn_id,
+                                      item={"type": "contextCompaction", "id": turn_id + "-item"})
+            client.queue_notification("turn/completed", threadId="t",
+                                      turn={"id": turn_id, "status": "completed"})
+        emit_compaction_on_request(client, turn_id="fresh", complete_item=False)
+        session = make_session(client)
+        result = session.compact_thread(turn_timeout=0.1)
+        assert result.completed and result.compacted and result.turn_id == "fresh"
+        assert not session._closed and session._thread_id == "thread-fake-001"
+        assert client.requests[1] == ("thread/read", {"threadId": "thread-fake-001", "includeTurns": True})
+
+    @pytest.mark.parametrize("boundary", [
+        {}, {"thread": {"id": "foreign", "status": {"type": "idle"}, "turns": []}},
+        {"thread": {"id": "thread-fake-001", "status": {"type": "active"}, "turns": []}},
+        {"thread": {"id": "thread-fake-001", "status": {"type": "idle"},
+                    "turns": [{"id": "inflight", "status": "inProgress"}]}},
+    ])
+    def test_unavailable_boundary_refuses_before_compact_without_closing(self, boundary):
+        client = FakeClient()
+        original = client.request
+        client.request = lambda method, params=None, timeout=30: (
+            boundary if method == "thread/read" else original(method, params, timeout))
+        session = make_session(client)
+        result = session.compact_thread(turn_timeout=0.01)
+        assert result.error and not result.should_retire and not session._closed
+        assert session._thread_id == "thread-fake-001"
+        assert not any(method == "thread/compact/start" for method, _ in client.requests)
+
+    def test_regular_turn_cannot_certify_compaction_without_item_pair(self):
+        client = FakeClient()
+        client.queue_notification("turn/started", threadId="t", turn={"id": "regular"})
+        client.queue_notification("turn/completed", threadId="t",
+                                  turn={"id": "regular", "status": "completed"})
+        emit_compaction_on_request(client, turn_id="regular", complete_item=False)
+        result = make_session(client).compact_thread(turn_timeout=0.01)
+        assert not result.completed and result.should_retire
+        assert "contextCompaction" in result.error
+
+    @pytest.mark.parametrize("outer", ["run_turn", "compact_thread"])
+    def test_concurrent_operation_is_refused_during_request_ack(self, outer):
+        client = FakeClient()
+        session = make_session(client)
+        refused = []
+        client.queue_notification("turn/started", threadId="t", turn={"id": "compact-turn-1"})
+        client.queue_notification("turn/completed", threadId="t",
+                                  turn={"id": "compact-turn-1", "status": "completed"})
+        if outer == "compact_thread":
+            emit_compaction_on_request(client)
+        else:
+            client._notifications.clear()
+            client.queue_notification("turn/completed", threadId="t",
+                                      turn={"id": "turn-fake-001", "status": "completed"})
+        original = client.request
+        launch = "turn/start" if outer == "run_turn" else "thread/compact/start"
+        def request(method, params=None, timeout=30):
+            if method == launch:
+                refused.append(
+                    session.compact_thread(turn_timeout=0.02, notification_poll_timeout=0.001)
+                    if outer == "run_turn" else
+                    session.run_turn("overlap", turn_timeout=0.02, notification_poll_timeout=0.001)
+                )
+            return original(method, params, timeout)
+        client.request = request
+        result = session.run_turn("outer", turn_timeout=0.1) if outer == "run_turn" else session.compact_thread(turn_timeout=0.1)
+        assert result.completed and not session._closed
+        assert len(refused) == 1 and refused[0].error and not refused[0].should_retire
+        assert sum(method == launch for method, _ in client.requests) == 1
+
+
+@pytest.mark.parametrize("conflict", [
+    {"threadId": "thread-fake-001", "turnId": "fresh", "turn": {"id": "prior"}},
+    {"threadId": "thread-fake-001", "turn": {"id": "fresh", "threadId": "foreign"}},
+])
+def test_compaction_rejects_conflicting_start_scope(conflict):
+    client = FakeClient()
+    client._notifications.append({"method": "turn/started", "params": conflict})
+    client.queue_notification("item/started", threadId="t", turnId="fresh",
+                              item={"type": "contextCompaction", "id": "compact-item"})
+    client.queue_notification("item/completed", threadId="t", turnId="fresh",
+                              item={"type": "contextCompaction", "id": "compact-item"})
+    client.queue_notification("turn/completed", threadId="t", turn={"id": "fresh", "status": "completed"})
+    emit_compaction_on_request(client, turn_id="fresh", complete_item=False)
+    result = make_session(client).compact_thread(turn_timeout=0.01)
+    assert not result.completed and result.should_retire and result.turn_id is None
+
+
+def test_compaction_interrupt_at_history_boundary_preserves_idle_thread():
+    client = FakeClient()
+    session = make_session(client)
+    original = client.request
+    def request(method, params=None, timeout=30):
+        response = original(method, params, timeout)
+        if method == "thread/read":
+            session.request_interrupt()
+        return response
+    client.request = request
+    result = session.compact_thread(turn_timeout=0.01)
+    assert result.interrupted and not result.should_retire and not session._closed
+    assert not session._interrupt_event.is_set()
+    assert not any(method == "thread/compact/start" for method, _ in client.requests)
