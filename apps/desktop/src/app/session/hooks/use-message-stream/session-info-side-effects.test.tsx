@@ -7,7 +7,12 @@ import { isTargetSessionBusy } from '@/app/session/hooks/use-prompt-actions/util
 import type { ClientSessionState } from '@/app/types'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { modelOptionsQueryKey } from '@/lib/model-options'
-import { _resetSessionOwnerHintsForTests, setCurrentModel, setCurrentProvider, setSessionOwnerHint } from '@/store/session'
+import {
+  _resetSessionOwnerHintsForTests,
+  setCurrentModel,
+  setCurrentProvider,
+  setSessionOwnerHint
+} from '@/store/session'
 
 import { type MessageStreamHarness, renderMessageStream } from './test-harness'
 import { PRE_TURN_LIVE_SETTLE_GRACE_MS } from './utils'
@@ -98,14 +103,20 @@ describe('session.info model-options invalidation gating', () => {
   it('does not mix a stale owner hint with an incompatible connection-only event stamp', () => {
     setApiRequestConnection('connection-a')
     setSessionOwnerHint('session-background', {
-      connectionId: 'connection-a', profile: 'a-profile', targetProfile: 'a-target'
+      connectionId: 'connection-a',
+      profile: 'a-profile',
+      targetProfile: 'a-target'
     })
     mountStream()
     const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
-    act(() => stream.handleEvent({
-      connectionId: 'connection-b', session_id: 'session-background',
-      type: 'session.info', payload: { model: 'b-new', provider: 'b-provider' }
-    }))
+    act(() =>
+      stream.handleEvent({
+        connectionId: 'connection-b',
+        session_id: 'session-background',
+        type: 'session.info',
+        payload: { model: 'b-new', provider: 'b-provider' }
+      })
+    )
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ['model-options'] })
     expect(invalidate).not.toHaveBeenCalledWith({
       queryKey: modelOptionsQueryKey('a-target', 'session-background', 'connection-b')
@@ -115,14 +126,21 @@ describe('session.info model-options invalidation gating', () => {
   it('invalidates the background event owner catalog and backend target while another connection is foregrounded', () => {
     setApiRequestConnection('connection-a')
     setSessionOwnerHint('session-background', {
-      connectionId: 'connection-b', profile: 'tile-profile', targetProfile: 'backend-target'
+      connectionId: 'connection-b',
+      profile: 'tile-profile',
+      targetProfile: 'backend-target'
     })
     mountStream()
     const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
-    act(() => stream.handleEvent({
-      connectionId: 'connection-b', profile: 'tile-profile', session_id: 'session-background',
-      type: 'session.info', payload: { model: 'b-new', provider: 'b-provider' }
-    }))
+    act(() =>
+      stream.handleEvent({
+        connectionId: 'connection-b',
+        profile: 'tile-profile',
+        session_id: 'session-background',
+        type: 'session.info',
+        payload: { model: 'b-new', provider: 'b-provider' }
+      })
+    )
     expect(invalidate).toHaveBeenCalledWith({
       queryKey: modelOptionsQueryKey('backend-target', 'session-background', 'connection-b')
     })
@@ -135,10 +153,15 @@ describe('session.info model-options invalidation gating', () => {
     setApiRequestConnection('connection-a')
     mountStream()
     const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
-    act(() => stream.handleEvent({
-      connectionId: 'connection-b', profile: 'background-profile', session_id: 'session-background',
-      type: 'session.info', payload: { model: 'b-new', provider: 'b-provider' }
-    }))
+    act(() =>
+      stream.handleEvent({
+        connectionId: 'connection-b',
+        profile: 'background-profile',
+        session_id: 'session-background',
+        type: 'session.info',
+        payload: { model: 'b-new', provider: 'b-provider' }
+      })
+    )
     expect(invalidate).toHaveBeenCalledWith({
       queryKey: modelOptionsQueryKey('background-profile', 'session-background', 'connection-b')
     })
@@ -161,20 +184,17 @@ describe('session.info model-options invalidation gating', () => {
 
   it('preserves a pending model pick when a delayed heartbeat repeats the previous model', () => {
     mountStream()
-    sessionStates!.set(
-      ACTIVE_SID,
-      {
-        ...createClientSessionState('stored-active'),
+    sessionStates!.set(ACTIVE_SID, {
+      ...createClientSessionState('stored-active'),
+      model: 'model-b',
+      provider: 'provider-b',
+      pendingModelSelection: {
         model: 'model-b',
         provider: 'provider-b',
-        pendingModelSelection: {
-          model: 'model-b',
-          provider: 'provider-b',
-          previousModel: 'model-a',
-          previousProvider: 'provider-a'
-        }
-      } as ClientSessionState
-    )
+        previousModel: 'model-a',
+        previousProvider: 'provider-a'
+      }
+    } as ClientSessionState)
 
     // This event was queued before the local config.set selection. It must not
     // repaint the picker back to A merely because it arrives later.

@@ -57,6 +57,7 @@ function restModelOptions(
   profile: ProfileScope
 ): Promise<ModelOptionsResponse> {
   const opts = { explicitOnly, ...(refresh ? { refresh: true } : {}) }
+
   return getGlobalModelOptions(opts, profile)
 }
 

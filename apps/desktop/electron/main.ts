@@ -46,7 +46,12 @@ import {
 } from './backend-claim'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
-import { assertDelegatedLocalDialCurrent, BackendDialClaims, type RegistryBackendDial, resolveRegistryDialOptions } from './backend-dial-claim'
+import {
+  assertDelegatedLocalDialCurrent,
+  BackendDialClaims,
+  type RegistryBackendDial,
+  resolveRegistryDialOptions
+} from './backend-dial-claim'
 import { buildDesktopBackendEnv, hermesManagedNodePathEntries, normalizeHermesHomeRoot } from './backend-env'
 import {
   isReauthRequiredError,
@@ -1405,6 +1410,7 @@ let softRehomeInProgress = false
 // byte-for-byte the single-backend behavior.
 const backendPool = new Map() // profile -> { process, port, token, connectionPromise, lastActiveAt }
 const profileDeletionGate = new ProfileDeletionGate()
+
 // Keep the pool light: cap concurrent profile backends (LRU eviction) and reap
 // idle ones. A user idles at exactly the primary backend; pool backends only
 // exist while a non-primary profile is actively being chatted through.
@@ -1417,6 +1423,7 @@ const POOL_MAX_BACKENDS = normalizeProfileBackendPoolMax(
   process.env.HERMES_DESKTOP_POOL_MAX,
   readProfileBackendPoolSettings(app.getPath('userData')).maxBackends
 )
+
 const POOL_IDLE_MS = Math.max(60_000, Number(process.env.HERMES_DESKTOP_POOL_IDLE_MS) || 10 * 60_000)
 
 // A backend touched within this window has a live renderer socket (the keepalive
@@ -11081,13 +11088,20 @@ function claimBackend(profile) {
 
 function claimRegistryBackend(connectionId, profile) {
   return backendDialClaims.runRegistry(
-    readDesktopConnectionsRegistry(), connectionId, profile,
+    readDesktopConnectionsRegistry(),
+    connectionId,
+    profile,
     resolveRegistryDialOptions(profile, primaryProfileKey(), globalRemoteActive(), profileHasRemoteOverride),
     route => ensureRegistryBackend(route.connectionId, profile, '', route)
   )
 }
 
-async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrelation = '', resolvedDial?: RegistryBackendDial) {
+async function ensureRegistryBackend(
+  connectionId,
+  profile,
+  managedUpdateCorrelation = '',
+  resolvedDial?: RegistryBackendDial
+) {
   const registry = resolvedDial?.registry || readDesktopConnectionsRegistry()
   const id = resolvedDial?.connectionId || String(connectionId || '').trim() || registry.primary
   const source = resolvedDial?.source || registry.connections.find(c => c.id === id)
@@ -11189,17 +11203,24 @@ async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrela
     specialistDispatchQuiesce.assertCanStart(profileKey)
     profileDeletionGate.assertCanStart(profileKey)
 
-    const localRoute = resolvedDial?.localRoute || resolveRegistryLocalRoute(profileKey, {
-      globalRemote: globalRemoteActive(),
-      profileRemoteOverride: Boolean(profileHasRemoteOverride(profileKey))
-    })
+    const localRoute =
+      resolvedDial?.localRoute ||
+      resolveRegistryLocalRoute(profileKey, {
+        globalRemote: globalRemoteActive(),
+        profileRemoteOverride: Boolean(profileHasRemoteOverride(profileKey))
+      })
 
     if (localRoute.delegate) {
       if (resolvedDial) {
-        assertDelegatedLocalDialCurrent(resolvedDial, resolveRegistryDialOptions(
-          resolvedDial.delegatedProfile ?? profileKey,
-          primaryProfileKey(), globalRemoteActive(), profileHasRemoteOverride
-        ))
+        assertDelegatedLocalDialCurrent(
+          resolvedDial,
+          resolveRegistryDialOptions(
+            resolvedDial.delegatedProfile ?? profileKey,
+            primaryProfileKey(),
+            globalRemoteActive(),
+            profileHasRemoteOverride
+          )
+        )
       }
 
       return ensureBackend(resolvedDial?.delegatedProfile ?? profile)
@@ -12249,7 +12270,9 @@ const specialistDispatchAdmission = createSpecialistDispatchAdmission({
 
     const timeout = setTimeout(() => {
       timedOut = true
-      rememberLog(`[specialist] runner ${request.runId} exceeded the bounded deadline; stopping its owned process group`)
+      rememberLog(
+        `[specialist] runner ${request.runId} exceeded the bounded deadline; stopping its owned process group`
+      )
       void poolStopper.stop(specialistDispatchAdmission.poolKey(request.runId))
     }, SPECIALIST_RUNNER_TIMEOUT_MS)
 
@@ -15127,9 +15150,7 @@ async function enumerateRegistryAgentSources(registry = readDesktopConnectionsRe
           // own reconnect dial for the same connection; coalescing avoids
           // bootstrapping a second SSH tunnel / remote dashboard.
           const descriptor: any = await withEnumerationDeadline(
-            Promise.resolve(
-              claimRegistryBackend(connection.id, null)
-            )
+            Promise.resolve(claimRegistryBackend(connection.id, null))
           )
 
           const body: any = await getJsonForBackend(descriptor, '/api/profiles', { timeoutMs: 8_000 })
@@ -16994,6 +17015,7 @@ ipcMain.handle('hermes:production-permit:sign', (event, envelope) => {
   if (!event.sender || event.sender.isDestroyed()) {
     throw new Error('production permit renderer unavailable')
   }
+
   return productionPermitController.requestSignedWitness(envelope)
 })
 ipcMain.handle('hermes:production-permit:public-key', () => productionPermitController.publicKeyForEnrollment())
@@ -17527,7 +17549,9 @@ app.whenReady().then(() => {
   installRemoteHeaderRules()
   registerDeepLinkProtocol()
   void startSpecialistDispatchTransport().catch(error => {
-    rememberLog(`[specialist] explicit dispatch transport unavailable: ${error instanceof Error ? error.message : String(error)}`)
+    rememberLog(
+      `[specialist] explicit dispatch transport unavailable: ${error instanceof Error ? error.message : String(error)}`
+    )
   })
 
   ensureWslWindowsFonts()

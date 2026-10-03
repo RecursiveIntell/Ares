@@ -252,25 +252,28 @@ export function useComposerSubmit({
     setSteeringPending(true)
     triggerHaptic('submit')
 
-    void Promise.resolve(onSteer(text)).then(accepted => {
-      if (!accepted && activeQueueSessionKey) {
-        enqueueQueuedPrompt(activeQueueSessionKey, { text, attachments: [] })
-      }
+    void Promise.resolve(onSteer(text))
+      .then(accepted => {
+        if (!accepted && activeQueueSessionKey) {
+          enqueueQueuedPrompt(activeQueueSessionKey, { text, attachments: [] })
+        }
 
-      // Keep the text in the composer until its delivery path has an explicit
-      // result. On a transport-unknown rejection the unchanged draft remains
-      // available for an informed retry instead of auto-queueing.
-      if (draftRef.current.trim() === text) {
-        clearDraft()
-      }
-    }).catch(() => {
-      // The caller surfaces the typed unknown-delivery error. Do not discard
-      // the text or convert uncertainty into an automatic queue retry.
-    }).finally(() => {
-      steeringPendingRef.current = false
-      setSteeringPending(false)
-      focusInput()
-    })
+        // Keep the text in the composer until its delivery path has an explicit
+        // result. On a transport-unknown rejection the unchanged draft remains
+        // available for an informed retry instead of auto-queueing.
+        if (draftRef.current.trim() === text) {
+          clearDraft()
+        }
+      })
+      .catch(() => {
+        // The caller surfaces the typed unknown-delivery error. Do not discard
+        // the text or convert uncertainty into an automatic queue retry.
+      })
+      .finally(() => {
+        steeringPendingRef.current = false
+        setSteeringPending(false)
+        focusInput()
+      })
   }
 
   const queueDraft = () => {

@@ -3,11 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { setApiRequestConnection, setApiRequestProfile } from '@/api/client'
 import { getGlobalModelOptions } from '@/hermes'
 
-import {
-  modelOptionsQueryKey,
-  requestModelOptions,
-  selectionUnavailable
-} from './model-options'
+import { modelOptionsQueryKey, requestModelOptions, selectionUnavailable } from './model-options'
 
 const globalOptions = { model: 'hermes-4', provider: 'nous', providers: [] }
 
@@ -60,7 +56,10 @@ describe('requestModelOptions', () => {
       provider: 'hermes-local'
     })
 
-    expect(getGlobalModelOptions).toHaveBeenCalledWith({ explicitOnly: true }, { connectionId: 'local', profile: 'default' })
+    expect(getGlobalModelOptions).toHaveBeenCalledWith(
+      { explicitOnly: true },
+      { connectionId: 'local', profile: 'default' }
+    )
   })
 
   it('recovers through profile-scoped REST when the gateway catalog request fails', async () => {
@@ -79,7 +78,10 @@ describe('requestModelOptions', () => {
     await expect(requestModelOptions({ gateway: gateway as never, sessionId: 'session-1' })).resolves.toEqual(
       restPayload
     )
-    expect(getGlobalModelOptions).toHaveBeenCalledWith({ explicitOnly: true }, { connectionId: 'local', profile: 'default' })
+    expect(getGlobalModelOptions).toHaveBeenCalledWith(
+      { explicitOnly: true },
+      { connectionId: 'local', profile: 'default' }
+    )
   })
 
   it('preserves the gateway error when its REST recovery path also fails', async () => {
@@ -117,13 +119,19 @@ describe('requestModelOptions', () => {
       refresh: true,
       session_id: 'session-1'
     })
-    expect(getGlobalModelOptions).toHaveBeenCalledWith({ explicitOnly: true, refresh: true }, { connectionId: 'local', profile: 'default' })
+    expect(getGlobalModelOptions).toHaveBeenCalledWith(
+      { explicitOnly: true, refresh: true },
+      { connectionId: 'local', profile: 'default' }
+    )
   })
 
   it('falls back to REST when no gateway is connected', async () => {
     await requestModelOptions({ refresh: true })
 
-    expect(getGlobalModelOptions).toHaveBeenCalledWith({ explicitOnly: true, refresh: true }, { connectionId: 'local', profile: 'default' })
+    expect(getGlobalModelOptions).toHaveBeenCalledWith(
+      { explicitOnly: true, refresh: true },
+      { connectionId: 'local', profile: 'default' }
+    )
   })
 
   it('prefers an owner-routed request over the ambient gateway socket', async () => {
@@ -152,7 +160,11 @@ describe('requestModelOptions', () => {
       routedPayload
     )
 
-    expect(request).toHaveBeenCalledWith('model.options', { explicit_only: true, profile: 'default', session_id: 'tile-1' })
+    expect(request).toHaveBeenCalledWith('model.options', {
+      explicit_only: true,
+      profile: 'default',
+      session_id: 'tile-1'
+    })
     expect(gateway.request).not.toHaveBeenCalled()
   })
 
@@ -168,27 +180,43 @@ describe('requestModelOptions', () => {
     vi.mocked(getGlobalModelOptions).mockResolvedValueOnce(restPayload)
 
     await expect(requestModelOptions({ profile: 'berry', request, sessionId: 'tile-1' })).resolves.toEqual(restPayload)
-    expect(getGlobalModelOptions).toHaveBeenCalledWith({ explicitOnly: true }, { connectionId: 'local', profile: 'berry' })
+    expect(getGlobalModelOptions).toHaveBeenCalledWith(
+      { explicitOnly: true },
+      { connectionId: 'local', profile: 'berry' }
+    )
   })
 
   it('freezes source and target before a late gateway failure', async () => {
-    vi.mocked(getGlobalModelOptions).mockResolvedValueOnce({ providers: [{ slug: 'target-a', name: 'Target A', models: ['model-a'] }] })
+    vi.mocked(getGlobalModelOptions).mockResolvedValueOnce({
+      providers: [{ slug: 'target-a', name: 'Target A', models: ['model-a'] }]
+    })
     setApiRequestConnection('source-a')
     setApiRequestProfile('target-a')
     let reject!: (err: Error) => void
-    const request = vi.fn(() => new Promise<never>((_, fail) => { reject = fail }))
+    const request = vi.fn(
+      () =>
+        new Promise<never>((_, fail) => {
+          reject = fail
+        })
+    )
     const pending = requestModelOptions({ request, sessionId: 'session-a' })
     setApiRequestConnection('source-b')
     setApiRequestProfile('target-b')
     reject(new Error('late gateway failure'))
     await pending
-    expect(getGlobalModelOptions).toHaveBeenCalledWith({ explicitOnly: true }, { connectionId: 'source-a', profile: 'target-a' })
+    expect(getGlobalModelOptions).toHaveBeenCalledWith(
+      { explicitOnly: true },
+      { connectionId: 'source-a', profile: 'target-a' }
+    )
   })
 
   it('keeps an explicit local owner on local during ambient remote activity', async () => {
     setApiRequestConnection('remote-source')
     await requestModelOptions({ connectionId: 'local', profile: 'local-specialist' })
-    expect(getGlobalModelOptions).toHaveBeenCalledWith({ explicitOnly: true }, { connectionId: 'local', profile: 'local-specialist' })
+    expect(getGlobalModelOptions).toHaveBeenCalledWith(
+      { explicitOnly: true },
+      { connectionId: 'local', profile: 'local-specialist' }
+    )
   })
 })
 
@@ -204,7 +232,9 @@ describe('modelOptionsQueryKey', () => {
   })
 
   it('isolates identically named profiles and sessions on different sources', () => {
-    expect(modelOptionsQueryKey('target', 'session', 'remote-a')).not.toEqual(modelOptionsQueryKey('target', 'session', 'remote-b'))
+    expect(modelOptionsQueryKey('target', 'session', 'remote-a')).not.toEqual(
+      modelOptionsQueryKey('target', 'session', 'remote-b')
+    )
     expect(modelOptionsQueryKey('target', 'session', 'local')).toEqual(['model-options', 'target', 'session'])
   })
 })

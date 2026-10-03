@@ -297,15 +297,21 @@ describe('main.ts wiring for #93910', () => {
     const body = functionSource('redialPoolBackendAfterResume')
 
     expect(body).toContain('parseBackendScopeKey(')
-    expect(body).toMatch(/return\s+connectionId\s*\?\s*claimRegistryBackend\(connectionId,\s*profile\)\s*:\s*claimBackend\(profile\)/)
+    expect(body).toMatch(
+      /return\s+connectionId\s*\?\s*claimRegistryBackend\(connectionId,\s*profile\)\s*:\s*claimBackend\(profile\)/
+    )
 
     const registryClaim = functionSource('claimRegistryBackend')
     expect(registryClaim).toContain('backendDialClaims.runRegistry(')
     expect(registryClaim).toContain('readDesktopConnectionsRegistry(), connectionId, profile')
-    expect(registryClaim).toContain('resolveRegistryDialOptions(profile, primaryProfileKey(), globalRemoteActive(), profileHasRemoteOverride)')
+    expect(registryClaim).toContain(
+      'resolveRegistryDialOptions(profile, primaryProfileKey(), globalRemoteActive(), profileHasRemoteOverride)'
+    )
     expect(registryClaim).toContain("route => ensureRegistryBackend(route.connectionId, profile, '', route)")
 
     const primaryClaim = functionSource('claimBackend')
-    expect(primaryClaim).toContain('backendDialClaims.run(backendScopeKey(null, profileKey), () => ensureBackend(profile))')
+    expect(primaryClaim).toContain(
+      'backendDialClaims.run(backendScopeKey(null, profileKey), () => ensureBackend(profile))'
+    )
   })
 })

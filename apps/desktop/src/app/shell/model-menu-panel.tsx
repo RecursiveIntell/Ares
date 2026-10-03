@@ -66,8 +66,9 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
   const view = useSessionView()
   const activeSessionId = useStore(view.$runtimeId)
   const owner = knownOwnerForSession(activeSessionId)
-  const connectionId = owner && typeof owner === 'object' ? owner.connectionId : owner ? 'local' : activeGatewayConnectionId()
-  const catalogProfile = (typeof owner === 'string' ? owner : (owner?.targetProfile || owner?.profile)) || profile
+  const connectionId =
+    owner && typeof owner === 'object' ? owner.connectionId : owner ? 'local' : activeGatewayConnectionId()
+  const catalogProfile = (typeof owner === 'string' ? owner : owner?.targetProfile || owner?.profile) || profile
 
   const unconfirmedOptions = useStore(
     useMemo(
@@ -96,7 +97,13 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
   const modelOptions = useQuery({
     queryKey: modelOptionsQueryKey(catalogProfile, activeSessionId, connectionId),
     queryFn: (): Promise<ModelOptionsResponse> =>
-      requestModelOptions({ connectionId, gateway, profile: catalogProfile, request: requestGateway, sessionId: activeSessionId })
+      requestModelOptions({
+        connectionId,
+        gateway,
+        profile: catalogProfile,
+        request: requestGateway,
+        sessionId: activeSessionId
+      })
   })
 
   const { model: optionsModel, provider: optionsProvider } = currentPickerSelection(

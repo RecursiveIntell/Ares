@@ -48,7 +48,7 @@ export function ModelPickerOverlay({ gateway, onSelect, profile }: ModelPickerOv
   }
 
   const owner = knownOwnerForSession(sessionId)
-  const ownerProfile = typeof owner === 'string' ? owner : (owner?.targetProfile || owner?.profile)
+  const ownerProfile = typeof owner === 'string' ? owner : owner?.targetProfile || owner?.profile
   const ownerConnection = owner && typeof owner === 'object' ? owner.connectionId : owner ? 'local' : undefined
 
   return (
@@ -61,7 +61,11 @@ export function ModelPickerOverlay({ gateway, onSelect, profile }: ModelPickerOv
       onSelect={selection => onSelect({ ...selection, sessionId })}
       open={open}
       profile={ownerProfile || profile}
-      request={gateway && sessionId ? (method, params) => requestForOwnedSession(sessionId, gateway.request.bind(gateway), method, params) : undefined}
+      request={
+        gateway && sessionId
+          ? (method, params) => requestForOwnedSession(sessionId, gateway.request.bind(gateway), method, params)
+          : undefined
+      }
       sessionId={sessionId}
     />
   )
