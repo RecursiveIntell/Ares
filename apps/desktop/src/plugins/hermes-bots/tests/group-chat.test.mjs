@@ -1901,6 +1901,7 @@ test('older backends without pending_clarify never mirror a question', () => {
 
 test('answerGroupClarify routes clarify.respond and clears the mirror', async () => {
   const gc = load(() => '(pass)')
+  gc.updateGroupChat('Core', room => room)
   const member = { name: 'research', title: '' }
 
   gc.syncGroupClarify('Core', member, { session_id: 'runtime-research', pending_clarify: CLARIFY_PAYLOAD })
@@ -1914,6 +1915,7 @@ test('answerGroupClarify routes clarify.respond and clears the mirror', async ()
 
 test('answerGroupClarify sends one respond per batch question, in order', async () => {
   const gc = load(() => '(pass)')
+  gc.updateGroupChat('Core', room => room)
   const member = { name: 'research', title: '' }
   const batch = {
     request_id: 'req-batch-1',
@@ -2023,6 +2025,7 @@ test('an approval without a server choice set falls back to once/deny', () => {
 
 test('answerGroupClarify routes approvals through approval.respond with session + choice', async () => {
   const gc = load(() => '(pass)')
+  gc.updateGroupChat('Core', room => room)
   const member = { name: 'research', title: '' }
 
   gc.syncGroupClarify('Core', member, { session_id: 'rt-research-1', pending_approval: APPROVAL_PAYLOAD })
