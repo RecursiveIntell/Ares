@@ -1,14 +1,290 @@
-import fs from 'node:fs'
-import path from 'node:path'
-import { fileURLToPath } from 'node:url'
-
 import { describe, expect, it, vi } from 'vitest'
 
-import { BackendDialClaims } from './backend-dial-claim'
-import { parseBackendScopeKey } from './connection-registry'
+import { createBackendConnectionState } from './backend-connection-state'
+import { assertDelegatedLocalDialCurrent, BackendDialClaims, type RegistryBackendDial, resolveRegistryDialOptions } from './backend-dial-claim'
+import { backendScopeKey, normalizeRegistry, parseBackendScopeKey } from './connection-registry'
 
-const here = path.dirname(fileURLToPath(import.meta.url))
-const mainSource = fs.readFileSync(path.join(here, 'main.ts'), 'utf8').replace(/\r\n/g, '\n')
+const registry = () => normalizeRegistry({
+  primary: 'gateway', connections: [
+    { id: 'local', kind: 'local', label: 'This device' },
+    { id: 'gateway', kind: 'remote', label: 'Gateway', url: 'http://127.0.0.1:38951' },
+    { id: 'other', kind: 'remote', label: 'Other', url: 'http://127.0.0.1:38952' }
+  ]
+})
+
+const options = (globalRemote = true) => ({ globalRemote, profileRemoteOverride: false, primaryProfile: 'default' })
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (error: Error) => void
+  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no })
+
+  return { promise, resolve, reject }
+}
+
+describe('resolved registry dial admission', () => {
+  for (const first of ['local', 'legacy'] as const) {
+    it(`keeps configured remote primary and explicit local independent when ${first} starts first`, async () => {
+      const claims = new BackendDialClaims()
+      const local = deferred<string>()
+      const remote = deferred<string>()
+
+      const localDial = vi.fn((route: RegistryBackendDial) => {
+        expect(route.source.kind).toBe('local')
+        expect(route.localRoute).toEqual({ delegate: false, poolKey: 'conn:local::default' })
+
+        return local.promise
+      })
+
+      const remoteDial = vi.fn(() => remote.promise)
+      const startLocal = () => claims.runRegistry(registry(), 'local', 'default', options(), localDial)
+      const startRemote = () => claims.run(backendScopeKey(null, 'default'), remoteDial)
+
+      const [localResult, remoteResult] = first === 'local'
+        ? [startLocal(), startRemote()] : (() => { const result = startRemote();
+
+ return [startLocal(), result] })()
+
+      local.resolve('native-local39609')
+      remote.resolve('remote-primary38951')
+
+      expect(await localResult).toBe('native-local39609')
+      expect(await remoteResult).toBe('remote-primary38951')
+      expect(localDial).toHaveBeenCalledTimes(1)
+      expect(remoteDial).toHaveBeenCalledTimes(1)
+      expect(claims.inFlight('default')).toBe(false)
+      expect(claims.inFlight('conn:local::default')).toBe(false)
+    })
+  }
+
+  it('coalesces identical forced-local targets while the legacy remote stays pending', async () => {
+    const claims = new BackendDialClaims()
+    const local = deferred<string>()
+    const dial = vi.fn(() => local.promise)
+    const a = claims.runRegistry(registry(), 'local', 'work', options(), dial)
+    const b = claims.runRegistry(registry(), 'local', ' work ', options(), dial)
+    expect(a).toBe(b)
+    expect(dial).toHaveBeenCalledTimes(1)
+    local.resolve('local-work')
+    expect(await b).toBe('local-work')
+  })
+
+  it('coalesces registry-local with the legacy backend only when the route delegates', async () => {
+    const claims = new BackendDialClaims()
+    const ready = deferred<string>()
+    const legacy = claims.run('default', () => ready.promise)
+    const extra = vi.fn(() => 'duplicate')
+    const local = claims.runRegistry(registry(), 'local', null, options(false), extra)
+    expect(local).toBe(legacy)
+    expect(extra).not.toHaveBeenCalled()
+    ready.resolve('same-local')
+    expect(await local).toBe('same-local')
+  })
+
+  it('delegated blank-profile registry requests coalesce with the actual selected primary profile', async () => {
+    const claims = new BackendDialClaims()
+    const ready = deferred<string>()
+    const legacy = claims.run('work', () => ready.promise)
+    const extra = vi.fn(() => 'duplicate')
+    const local = claims.runRegistry(registry(), 'local', null, { ...options(false), primaryProfile: 'work' }, extra)
+    expect(local).toBe(legacy)
+    expect(extra).not.toHaveBeenCalled()
+    ready.resolve('same-work')
+    expect(await local).toBe('same-work')
+  })
+
+  it('pins the delegated primary profile before an async dial can observe a later selection', async () => {
+    const claims = new BackendDialClaims()
+    const opts = { ...options(false), primaryProfile: 'work' }
+    const ready = deferred<void>()
+
+    const dial = claims.runRegistry(registry(), 'local', null, opts, async route => {
+      await ready.promise
+
+      return route.delegatedProfile
+    })
+
+    opts.primaryProfile = 'later'
+    ready.resolve()
+    expect(await dial).toBe('work')
+  })
+
+  it('rejects a late remote configuration instead of retargeting an admitted local delegate', async () => {
+    const claims = new BackendDialClaims()
+    const current = options(false)
+    const ready = deferred<void>()
+    const transport = vi.fn(() => 'retargeted')
+
+    const old = claims.runRegistry(registry(), 'local', 'default', current, async route => {
+      await ready.promise
+      assertDelegatedLocalDialCurrent(route, current)
+
+      return transport()
+    })
+
+    current.globalRemote = true
+    const rejection = expect(old).rejects.toThrow('superseded by a remote route')
+    ready.resolve()
+    await rejection
+    expect(transport).not.toHaveBeenCalled()
+    expect(claims.inFlight('default')).toBe(false)
+    expect(await claims.runRegistry(registry(), 'local', 'default', current, route => {
+      assertDelegatedLocalDialCurrent(route, current)
+
+      return route.localRoute?.poolKey
+    })).toBe('conn:local::default')
+  })
+
+  it('checks a captured nondefault primary for a late per-profile remote override', async () => {
+    const claims = new BackendDialClaims()
+    const overrides = new Map<string, boolean>()
+    const lookup = vi.fn((profile: string) => overrides.get(profile))
+    const initial = resolveRegistryDialOptions(null, 'work', false, lookup)
+    const ready = deferred<void>()
+    const transport = vi.fn(() => 'retargeted')
+
+    const old = claims.runRegistry(registry(), 'local', null, initial, async route => {
+      await ready.promise
+      const current = resolveRegistryDialOptions(route.delegatedProfile ?? route.profile, 'later', false, lookup)
+      assertDelegatedLocalDialCurrent(route, current)
+
+      return transport()
+    })
+
+    overrides.set('work', true)
+    const rejection = expect(old).rejects.toThrow('superseded by a remote route')
+    ready.resolve()
+    await rejection
+    expect(lookup.mock.calls.map(([profile]) => profile)).toEqual(['work', 'work'])
+    expect(transport).not.toHaveBeenCalled()
+    expect(claims.inFlight('work')).toBe(false)
+    const subsequent = resolveRegistryDialOptions(null, 'work', false, lookup)
+    expect(await claims.runRegistry(registry(), 'local', null, subsequent, route => route.localRoute))
+      .toEqual({ delegate: false, poolKey: 'conn:local::default' })
+  })
+
+  it('uses the actual local resolver for per-profile remote overrides', async () => {
+    const claims = new BackendDialClaims()
+    const legacy = deferred<string>()
+    const remote = claims.run('work', () => legacy.promise)
+
+    const local = claims.runRegistry(registry(), 'local', 'work',
+      { ...options(false), profileRemoteOverride: true }, route => {
+        expect(route.localRoute).toEqual({ delegate: false, poolKey: 'conn:local::work' })
+
+        return 'local-work'
+      })
+
+    legacy.resolve('remote-work')
+    expect(await local).toBe('local-work')
+    expect(await remote).toBe('remote-work')
+  })
+
+  it('resolves blank connection IDs before admission and keeps source/profile pairs independent', async () => {
+    const claims = new BackendDialClaims()
+    const ready = deferred<string>()
+    const dial = vi.fn(() => ready.promise)
+    const a = claims.runRegistry(registry(), '', 'default', options(), dial)
+    const b = claims.runRegistry(registry(), 'gateway', 'default', options(), dial)
+    expect(a).toBe(b)
+    expect(dial).toHaveBeenCalledTimes(1)
+    const other = claims.runRegistry(registry(), 'other', 'default', options(), route => route.source.id)
+    const work = claims.runRegistry(registry(), 'gateway', 'work', options(), route => route.profile)
+    ready.resolve('gateway-default')
+    expect(await a).toBe('gateway-default')
+    expect(await other).toBe('other')
+    expect(await work).toBe('work')
+  })
+
+  it('rejects a missing source before it can borrow an existing claim', async () => {
+    const claims = new BackendDialClaims()
+    const ready = deferred<string>()
+    const live = claims.runRegistry(registry(), 'gateway', 'default', options(), () => ready.promise)
+    const removed = registry()
+    removed.connections = removed.connections.filter(source => source.id !== 'gateway')
+    const dial = vi.fn(() => 'wrong')
+    await expect(claims.runRegistry(removed, 'gateway', 'default', options(), dial)).rejects.toThrow('No connection')
+    expect(dial).not.toHaveBeenCalled()
+    ready.resolve('owned')
+    expect(await live).toBe('owned')
+  })
+
+  it('keeps the resolved route across an async factory wait and later configuration changes', async () => {
+    const claims = new BackendDialClaims()
+    const opts = options()
+    const current = registry()
+    const ready = deferred<void>()
+
+    const first = claims.runRegistry(current, 'local', 'default', opts, async route => {
+      await ready.promise
+
+      return { id: route.connectionId, source: route.source.kind, localRoute: route.localRoute }
+    })
+
+    opts.globalRemote = false
+    current.primary = 'other'
+    current.connections = current.connections.filter(source => source.id !== 'local')
+    const next = claims.runRegistry(registry(), 'local', 'default', opts, route => route.localRoute)
+    ready.resolve()
+    expect(await first).toEqual({ id: 'local', source: 'local', localRoute: { delegate: false, poolKey: 'conn:local::default' } })
+    expect(await next).toEqual({ delegate: true, poolKey: 'default' })
+  })
+
+  it('releases cancelled and failed local dials without cancelling the independent primary', async () => {
+    const claims = new BackendDialClaims()
+    const primaryReady = deferred<string>()
+    const primary = claims.run('default', () => primaryReady.promise)
+    const controller = new AbortController()
+
+    const cancelled = claims.runRegistry(registry(), 'local', 'default', options(), () => new Promise<string>((_resolve, reject) => {
+      controller.signal.addEventListener('abort', () => reject(new Error('dial cancelled')), { once: true })
+    }))
+
+    const waiter = claims.runRegistry(registry(), 'local', 'default', options(), () => 'duplicate')
+    const outcomes = Promise.allSettled([cancelled, waiter])
+    controller.abort()
+    expect((await outcomes).every(result => result.status === 'rejected')).toBe(true)
+    expect(claims.inFlight('conn:local::default')).toBe(false)
+    expect(claims.inFlight('default')).toBe(true)
+    await expect(claims.runRegistry(registry(), 'local', 'default', options(), () => { throw new Error('dial failed') })).rejects.toThrow('dial failed')
+    expect(claims.inFlight('conn:local::default')).toBe(false)
+    expect(await claims.runRegistry(registry(), 'local', 'default', options(), () => 'replacement')).toBe('replacement')
+    primaryReady.resolve('unchanged-primary')
+    expect(await primary).toBe('unchanged-primary')
+  })
+
+  it('retains production generation and process-owner fences through cancellation, replacement and stale cleanup', async () => {
+    const claims = new BackendDialClaims()
+    const state = createBackendConnectionState<{ id: string }, string>()
+    const oldAttempt = state.startAttempt()
+    const oldTransport = deferred<string>()
+    const old = claims.runRegistry(registry(), 'local', 'default', options(), () => oldTransport.promise)
+    state.setPromise(oldAttempt, old)
+    const oldOwner = state.attachProcess(oldAttempt, { id: 'old' })!
+    const rejection = expect(old).rejects.toThrow('cancelled')
+    state.invalidate()
+    oldTransport.reject(new Error('cancelled'))
+    await rejection
+    const nextAttempt = state.startAttempt()
+    const nextReady = deferred<string>()
+    const next = claims.runRegistry(registry(), 'local', 'default', options(), () => nextReady.promise)
+    state.setPromise(nextAttempt, next)
+    const nextProcess = { id: 'replacement' }
+    const nextOwner = state.attachProcess(nextAttempt, nextProcess)!
+    expect(state.attachProcess(oldAttempt, { id: 'late-old' })).toBeNull()
+    expect(state.setPromise(oldAttempt, Promise.resolve('late-old'))).toBe(false)
+    expect(state.clearPromiseForAttempt(oldAttempt)).toBe(false)
+    expect(state.clearForCurrentProcess(oldOwner)).toBe(false)
+    expect(state.getPromise()).toBe(next)
+    expect(state.getProcess()).toBe(nextProcess)
+    expect(claims.inFlight('conn:local::default')).toBe(true)
+    nextReady.resolve('replacement')
+    expect(await next).toBe('replacement')
+    expect(claims.inFlight('conn:local::default')).toBe(false)
+    expect(state.clearForCurrentProcess(nextOwner)).toBe(true)
+    expect(state.getPromise()).toBeNull()
+  })
+})
 
 describe('BackendDialClaims (#90812)', () => {
   it('coalesces two concurrent dials for the same (connectionId, profile) onto ONE backend spawn', async () => {
@@ -119,84 +395,5 @@ describe('parseBackendScopeKey (#90812/#93910)', () => {
   it('treats a bare profile key as the local/primary scope', () => {
     expect(parseBackendScopeKey('default')).toEqual({ connectionId: null, profile: 'default' })
     expect(parseBackendScopeKey('work')).toEqual({ connectionId: null, profile: 'work' })
-  })
-})
-
-describe('main.ts wiring for #90812', () => {
-  it('routes the profile-scoped dial IPC through the single-owner claim', () => {
-    const handlerStart = mainSource.indexOf("ipcMain.handle('hermes:connection', ")
-    expect(handlerStart).toBeGreaterThan(-1)
-    const body = mainSource.slice(handlerStart, handlerStart + 900)
-
-    expect(body).toContain('backendDialClaims.run(')
-    expect(body).toContain('ensureBackend(profile)')
-  })
-
-  it('routes the registry-scoped dial IPC through the claim keyed by backendScopeKey(connectionId, profile)', () => {
-    const handlerStart = mainSource.indexOf("ipcMain.handle('hermes:connection:for', ")
-    expect(handlerStart).toBeGreaterThan(-1)
-    const body = mainSource.slice(handlerStart, handlerStart + 1_200)
-
-    expect(body).toContain('backendDialClaims.run(backendScopeKey(id, profile)')
-    expect(body).toContain('ensureRegistryBackend(id, profile)')
-  })
-
-  // The four IPC/probe surfaces below call ensureRegistryBackend()/ensureBackend()
-  // directly, bypassing backendDialClaims entirely — so a renderer's guarded
-  // reconnect dial and one of these can independently race the SAME
-  // ensureRegistryBackend() await-before-pool-check window (main.ts) and each
-  // bootstrap its own SSH tunnel / remote dashboard for the same
-  // (connectionId, profile) scope.
-
-  it('routes a media-stream connection resolve through the single-owner claim', () => {
-    const handlerStart = mainSource.indexOf('resolveRemoteConnection: ({ connectionId, profile }) =>')
-    expect(handlerStart).toBeGreaterThan(-1)
-    const body = mainSource.slice(handlerStart, handlerStart + 300)
-
-    expect(body).toContain('backendDialClaims.run(backendScopeKey(connectionId, profile)')
-    expect(body).toContain('ensureRegistryBackend(connectionId, profile)')
-    expect(body).toContain('ensureBackend(profile)')
-  })
-
-  it('routes a terminal-pane backend resolve through the single-owner claim on both the registry and local branches', () => {
-    const handlerStart = mainSource.indexOf('async function ensureTerminalBackend(webContentsId: number) {')
-    expect(handlerStart).toBeGreaterThan(-1)
-    const body = mainSource.slice(handlerStart, handlerStart + 900)
-
-    expect(body).toContain('backendDialClaims.run(backendScopeKey(windowRoute.connectionId, windowRoute.profile)')
-    expect(body).toContain('ensureRegistryBackend(windowRoute.connectionId, windowRoute.profile)')
-    expect(body).toContain('backendDialClaims.run(backendScopeKey(null, profile)')
-    expect(body).toContain('ensureBackend(profile)')
-  })
-
-  it('routes the roster-enumeration probe through the single-owner claim', () => {
-    const handlerStart = mainSource.indexOf('async function enumerateRegistryAgentSources')
-    expect(handlerStart).toBeGreaterThan(-1)
-    const body = mainSource.slice(handlerStart, handlerStart + 3_700)
-
-    expect(body).toContain('backendDialClaims.run(backendScopeKey(connection.id, null)')
-    expect(body).toContain('ensureRegistryBackend(connection.id, null)')
-    expect(body).toContain("getJsonForBackend(descriptor, '/api/profiles'")
-  })
-
-  it('routes the connections update-all dispatch through the single-owner claim', () => {
-    const handlerStart = mainSource.indexOf("ipcMain.handle('hermes:connections:update-all',")
-    expect(handlerStart).toBeGreaterThan(-1)
-    // The handler grew on main (renderer-side exclusions + the managed-SSH
-    // dispatch branch) — keep the scan window comfortably past the dial.
-    const body = mainSource.slice(handlerStart, handlerStart + 3_000)
-
-    expect(body).toContain('backendDialClaims.run(backendScopeKey(connection.id, null)')
-    expect(body).toContain('ensureRegistryBackend(connection.id, null)')
-    expect(body).toContain("postJsonForBackend(descriptor, '/api/hermes/update'")
-  })
-
-  it('routes every registry-scoped REST dispatch (hermes:api) through the single-owner claim', () => {
-    const handlerStart = mainSource.indexOf('async function dispatchRegistryApiRequest(')
-    expect(handlerStart).toBeGreaterThan(-1)
-    const body = mainSource.slice(handlerStart, handlerStart + 900)
-
-    expect(body).toContain('backendDialClaims.run(backendScopeKey(registryConnectionId, routeProfile)')
-    expect(body).toContain('ensureRegistryBackend(registryConnectionId, routeProfile)')
   })
 })

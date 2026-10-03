@@ -284,12 +284,28 @@ describe('main.ts wiring for #93910', () => {
   })
 
   it('re-dials a retired pool key through the single-owner dial claim', () => {
-    const fnStart = mainSource.indexOf('function redialPoolBackendAfterResume(')
-    expect(fnStart).toBeGreaterThan(-1)
-    const body = mainSource.slice(fnStart, fnStart + 1_200)
+    const functionSource = (name: string) => {
+      const fnStart = mainSource.indexOf(`function ${name}(`)
+      expect(fnStart).toBeGreaterThan(-1)
+
+      const fnEnd = mainSource.indexOf('\n}', fnStart)
+      expect(fnEnd).toBeGreaterThan(fnStart)
+
+      return mainSource.slice(fnStart, fnEnd + 2)
+    }
+
+    const body = functionSource('redialPoolBackendAfterResume')
 
     expect(body).toContain('parseBackendScopeKey(')
-    expect(body).toContain('backendDialClaims.run(')
-    expect(body).toContain('ensureRegistryBackend(')
+    expect(body).toMatch(/return\s+connectionId\s*\?\s*claimRegistryBackend\(connectionId,\s*profile\)\s*:\s*claimBackend\(profile\)/)
+
+    const registryClaim = functionSource('claimRegistryBackend')
+    expect(registryClaim).toContain('backendDialClaims.runRegistry(')
+    expect(registryClaim).toContain('readDesktopConnectionsRegistry(), connectionId, profile')
+    expect(registryClaim).toContain('resolveRegistryDialOptions(profile, primaryProfileKey(), globalRemoteActive(), profileHasRemoteOverride)')
+    expect(registryClaim).toContain("route => ensureRegistryBackend(route.connectionId, profile, '', route)")
+
+    const primaryClaim = functionSource('claimBackend')
+    expect(primaryClaim).toContain('backendDialClaims.run(backendScopeKey(null, profileKey), () => ensureBackend(profile))')
   })
 })

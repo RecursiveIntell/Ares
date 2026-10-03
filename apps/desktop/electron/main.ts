@@ -46,7 +46,7 @@ import {
 } from './backend-claim'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
-import { BackendDialClaims } from './backend-dial-claim'
+import { assertDelegatedLocalDialCurrent, BackendDialClaims, type RegistryBackendDial, resolveRegistryDialOptions } from './backend-dial-claim'
 import { buildDesktopBackendEnv, hermesManagedNodePathEntries, normalizeHermesHomeRoot } from './backend-env'
 import {
   isReauthRequiredError,
@@ -1377,9 +1377,7 @@ function registerMediaProtocol() {
     // reconnect dial for the same (connectionId, profile) scope; coalescing
     // here avoids bootstrapping a second SSH tunnel / remote dashboard.
     resolveRemoteConnection: ({ connectionId, profile }) =>
-      backendDialClaims.run(backendScopeKey(connectionId, profile), () =>
-        connectionId ? ensureRegistryBackend(connectionId, profile) : ensureBackend(profile)
-      )
+      connectionId ? claimRegistryBackend(connectionId, profile) : claimBackend(profile)
   })
 
   protocol.handle(MEDIA_PROTOCOL, handler)
@@ -9971,14 +9969,12 @@ async function ensureTerminalBackend(webContentsId: number) {
   // reconnect dial for the same (connectionId, profile) scope; coalescing
   // here avoids bootstrapping a second SSH tunnel / remote dashboard.
   if (windowRoute?.registryScoped && windowRoute.connectionId) {
-    return backendDialClaims.run(backendScopeKey(windowRoute.connectionId, windowRoute.profile), () =>
-      ensureRegistryBackend(windowRoute.connectionId, windowRoute.profile)
-    )
+    return claimRegistryBackend(windowRoute.connectionId, windowRoute.profile)
   }
 
   const profile = windowRoute?.profile ?? primaryProfileKey()
 
-  return backendDialClaims.run(backendScopeKey(null, profile), () => ensureBackend(profile))
+  return claimBackend(profile)
 }
 
 // Loopback reach for the browser pane. Scoped to the SSH connection that
@@ -11077,10 +11073,24 @@ async function ensureBackend(profile) {
 // a genuinely-local child when the v1 mode says remote; non-local connections
 // pool under the composite key from backendScopeKey() and reuse the same pool
 // entry lifecycle (LRU, idle reaper, touch) as per-profile local backends.
-async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrelation = '') {
-  const registry = readDesktopConnectionsRegistry()
-  const id = String(connectionId || '').trim() || registry.primary
-  const source = registry.connections.find(c => c.id === id)
+function claimBackend(profile) {
+  const profileKey = profile && String(profile).trim() ? String(profile).trim() : primaryProfileKey()
+
+  return backendDialClaims.run(backendScopeKey(null, profileKey), () => ensureBackend(profile))
+}
+
+function claimRegistryBackend(connectionId, profile) {
+  return backendDialClaims.runRegistry(
+    readDesktopConnectionsRegistry(), connectionId, profile,
+    resolveRegistryDialOptions(profile, primaryProfileKey(), globalRemoteActive(), profileHasRemoteOverride),
+    route => ensureRegistryBackend(route.connectionId, profile, '', route)
+  )
+}
+
+async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrelation = '', resolvedDial?: RegistryBackendDial) {
+  const registry = resolvedDial?.registry || readDesktopConnectionsRegistry()
+  const id = resolvedDial?.connectionId || String(connectionId || '').trim() || registry.primary
+  const source = resolvedDial?.source || registry.connections.find(c => c.id === id)
 
   if (!source) {
     throw new Error(`No connection with id "${id}".`)
@@ -11179,13 +11189,20 @@ async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrela
     specialistDispatchQuiesce.assertCanStart(profileKey)
     profileDeletionGate.assertCanStart(profileKey)
 
-    const localRoute = resolveRegistryLocalRoute(profileKey, {
+    const localRoute = resolvedDial?.localRoute || resolveRegistryLocalRoute(profileKey, {
       globalRemote: globalRemoteActive(),
       profileRemoteOverride: Boolean(profileHasRemoteOverride(profileKey))
     })
 
     if (localRoute.delegate) {
-      return ensureBackend(profile)
+      if (resolvedDial) {
+        assertDelegatedLocalDialCurrent(resolvedDial, resolveRegistryDialOptions(
+          resolvedDial.delegatedProfile ?? profileKey,
+          primaryProfileKey(), globalRemoteActive(), profileHasRemoteOverride
+        ))
+      }
+
+      return ensureBackend(resolvedDial?.delegatedProfile ?? profile)
     }
 
     const stoppingLocal = poolStopper.inFlight(localRoute.poolKey)
@@ -14297,12 +14314,8 @@ function createWindow() {
 }
 
 ipcMain.handle('hermes:connection', async (_event, profile) => {
-  // Coalesce concurrent renderer dials for one profile scope (#90812): the
-  // renderer-side reconnect lock is per-window, so two windows waking at once
-  // both land here. The claim key mirrors ensureBackend()'s own profile
-  // normalization so every spelling of the primary coalesces onto one dial.
-  const profileKey = profile && String(profile).trim() ? String(profile).trim() : primaryProfileKey()
-  const connection = await backendDialClaims.run(backendScopeKey(null, profileKey), () => ensureBackend(profile))
+  // Match ensureBackend's profile normalization before claim admission.
+  const connection = await claimBackend(profile)
   const connectionId = resolvedConnectionId(readDesktopConnectionsRegistry(), connection)
 
   return connectionId ? { ...connection, connectionId } : connection
@@ -14316,10 +14329,9 @@ ipcMain.handle('hermes:connection:for', async (_event, payload) => {
   const { connectionId, profile } = payload && typeof payload === 'object' ? (payload as any) : ({} as any)
   const registry = readDesktopConnectionsRegistry()
   const id = String(connectionId || '').trim() || registry.primary
-  // Same single-owner claim as 'hermes:connection', keyed by the composite
-  // (connectionId, profile) scope (#90812): concurrent registry dials for one
-  // scope share the first spawn instead of bootstrapping duplicate remotes.
-  const connection = await backendDialClaims.run(backendScopeKey(id, profile), () => ensureRegistryBackend(id, profile))
+  // Resolve the actual backend before claiming: explicit local can differ
+  // from the legacy remote primary even when their scope labels alias.
+  const connection = await claimRegistryBackend(id, profile)
 
   return { ...connection, connectionId: id, registryScoped: true }
 })
@@ -14418,9 +14430,7 @@ function revalidatePool() {
 function redialPoolBackendAfterResume(poolKey: string) {
   const { connectionId, profile } = parseBackendScopeKey(poolKey)
 
-  return backendDialClaims.run(poolKey, () =>
-    connectionId ? ensureRegistryBackend(connectionId, profile) : ensureBackend(profile)
-  )
+  return connectionId ? claimRegistryBackend(connectionId, profile) : claimBackend(profile)
 }
 
 // Identity for coalescing post-resume sweeps in the shared revalidation
@@ -15118,9 +15128,7 @@ async function enumerateRegistryAgentSources(registry = readDesktopConnectionsRe
           // bootstrapping a second SSH tunnel / remote dashboard.
           const descriptor: any = await withEnumerationDeadline(
             Promise.resolve(
-              backendDialClaims.run(backendScopeKey(connection.id, null), () =>
-                ensureRegistryBackend(connection.id, null)
-              )
+              claimRegistryBackend(connection.id, null)
             )
           )
 
@@ -15338,9 +15346,7 @@ ipcMain.handle('hermes:connections:update-all', async (_event, payload) => {
 
           // Claim-guarded (#90812): coalesce with a concurrent renderer dial
           // for the same connection instead of bootstrapping a second backend.
-          const descriptor: any = await backendDialClaims.run(backendScopeKey(connection.id, null), () =>
-            ensureRegistryBackend(connection.id, null)
-          )
+          const descriptor: any = await claimRegistryBackend(connection.id, null)
 
           const body: any = await postJsonForBackend(descriptor, '/api/hermes/update', {}, { timeoutMs: 15_000 })
 
@@ -15984,9 +15990,7 @@ async function dispatchRegistryApiRequest(
   // here, so it can race a renderer's own WS reconnect dial for the same
   // (connectionId, profile) scope; coalescing avoids bootstrapping a second
   // SSH tunnel / remote dashboard.
-  const connection: any = await backendDialClaims.run(backendScopeKey(registryConnectionId, routeProfile), () =>
-    ensureRegistryBackend(registryConnectionId, routeProfile)
-  )
+  const connection: any = await claimRegistryBackend(registryConnectionId, routeProfile)
 
   const requestPath = pathForRegistryBackendRequest(request.path, requestProfile, connection)
 
