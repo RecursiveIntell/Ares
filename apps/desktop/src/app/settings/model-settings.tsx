@@ -1,5 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
+import {
+  beginMainModelSave,
+  isMainModelSaveOriginCurrent,
+  ownsMainModelSave
+} from '@/app/session/hooks/composer-model-selection-owner'
+import type { OnMainModelChanged } from '@/app/session/hooks/composer-model-selection-owner'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
@@ -180,7 +186,7 @@ function StaleAuxWarning({ applying, onReset, slots, taskLabel }: StaleAuxWarnin
 
 interface ModelSettingsProps {
   /** Notified after the main model is applied, so live UI stores can sync. */
-  onMainModelChanged?: (provider: string, model: string) => void
+  onMainModelChanged?: OnMainModelChanged
   /** Shared settings "Applies to" scope: a concrete profile to edit instead of
    *  the app's active one, or undefined to follow the active profile (default).
    *  Request-shaped on purpose — the API helpers treat `null` as "deliberately
@@ -630,6 +636,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
     }
 
     const epoch = profileEpoch.current
+    const origin = beginMainModelSave(scopeProfile)
     setApplying(true)
     setError('')
 
@@ -640,10 +647,11 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
           provider: selectedProvider,
           ...(selectedProviderRow?.api_url ? { base_url: selectedProviderRow.api_url } : {})
         },
-        scopeProfile
+        scopeProfile,
+        { ownsOrigin: () => isMainModelSaveOriginCurrent(origin, scopeProfile) }
       )
 
-      if (profileEpoch.current !== epoch) {
+      if (profileEpoch.current !== epoch || !ownsMainModelSave(origin)) {
         return
       }
 
@@ -652,11 +660,9 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
       setMainModel({ provider, model })
       setSwitchStaleAux(result.stale_aux ?? [])
 
-      // Live UI stores mirror the ACTIVE profile's model; a scoped apply
-      // changed a different profile and must not repaint them.
-      if (scopeProfile == null) {
-        onMainModelChanged?.(provider, model)
-      }
+      // The callback carries origin scope; controls decide whether this
+      // owner may paint the foreground draft or only its own default cache.
+      onMainModelChanged?.({ ...origin, provider, model })
 
       await refresh()
     } catch (err) {

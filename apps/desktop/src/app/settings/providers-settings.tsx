@@ -3,6 +3,7 @@ import type { ReactNode } from 'react'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 
 import { runInTerminal } from '@/app/right-sidebar/store'
+import type { OnMainModelChanged } from '@/app/session/hooks/composer-model-selection-owner'
 import {
   FEATURED_ID,
   FeaturedProviderRow,
@@ -533,7 +534,7 @@ interface ProviderKeyGroup {
 interface ProvidersSettingsProps {
   onClose: () => void
   onConfigSaved?: () => void
-  onMainModelChanged?: (provider: string, model: string) => void
+  onMainModelChanged?: OnMainModelChanged
   onViewChange: (view: ProviderView) => void
   view: ProviderView
 }

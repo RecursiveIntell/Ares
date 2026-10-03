@@ -1,5 +1,7 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
+import { beginMainModelSave, ownsMainModelSave } from '@/app/session/hooks/composer-model-selection-owner'
+import type { OnMainModelChanged } from '@/app/session/hooks/composer-model-selection-owner'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
@@ -21,7 +23,7 @@ import { EmptyState, Pill, SectionHeading, SettingsContent, SettingsSkeleton } f
 
 interface CustomEndpointsSettingsProps {
   onConfigSaved?: () => void
-  onMainModelChanged?: (provider: string, model: string) => void
+  onMainModelChanged?: OnMainModelChanged
 }
 
 interface EndpointForm {
@@ -84,6 +86,9 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
   const [endpoints, setEndpoints] = useState<CustomEndpoint[]>([])
   const [form, setForm] = useState<EndpointForm>(EMPTY_FORM)
   const [discoveredModels, setDiscoveredModels] = useState<string[]>([])
+  // Fence writes synchronously as well as disabling buttons: a second click
+  // must not supersede a successful activation before React paints the lock.
+  const modelWritePendingRef = useRef(false)
 
   async function refresh() {
     const data = await getCustomEndpoints()
@@ -125,9 +130,21 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
   }, [])
 
   async function handleSave() {
+    if (modelWritePendingRef.current) {
+      return
+    }
+
+    modelWritePendingRef.current = true
+    const origin = beginMainModelSave()
+
     try {
       setSaving(true)
       const response = await saveCustomEndpoint(toPayload(form, discoveredModels))
+
+      if (!ownsMainModelSave(origin)) {
+        return
+      }
+
       setEndpoints(response.endpoints)
       const saved = response.endpoints.find(endpoint => endpoint.id === response.id)
 
@@ -137,7 +154,7 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
       }
 
       if (saved && saved.is_current) {
-        onMainModelChanged?.(saved.id, saved.model)
+        onMainModelChanged?.({ ...origin, provider: saved.id, model: saved.model })
       }
 
       triggerHaptic('success')
@@ -146,6 +163,7 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
     } catch (err) {
       notifyError(err, 'Save failed')
     } finally {
+      modelWritePendingRef.current = false
       setSaving(false)
     }
   }
@@ -181,25 +199,55 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
   }
 
   async function handleActivate(endpoint: CustomEndpoint) {
+    if (modelWritePendingRef.current) {
+      return
+    }
+
+    modelWritePendingRef.current = true
+    const origin = beginMainModelSave()
+
     try {
       setActivating(endpoint.id)
       const response = await activateCustomEndpoint(endpoint.id)
-      await refresh()
+
+      if (!ownsMainModelSave(origin)) {
+        return
+      }
+
+      // The write is confirmed. A subsequent list-read failure must not hide
+      // the committed default from the composer or report activation failure.
       onConfigSaved?.()
-      onMainModelChanged?.(response.provider, response.model)
+      onMainModelChanged?.({ ...origin, provider: response.provider, model: response.model })
       triggerHaptic('success')
+
+      try {
+        await refresh()
+      } catch (err) {
+        notifyError(err, 'Could not refresh custom endpoints')
+      }
     } catch (err) {
       notifyError(err, 'Activation failed')
     } finally {
+      modelWritePendingRef.current = false
       setActivating(null)
     }
   }
 
   async function handleDelete(endpoint: CustomEndpoint) {
+    if (modelWritePendingRef.current) {
+      return
+    }
+
     // This panel is not internationalized at all — keep the literal it had.
     if (!(await confirm({ destructive: true, title: `Delete ${endpoint.name}?` }))) {
       return
     }
+
+    if (modelWritePendingRef.current) {
+      return
+    }
+
+    modelWritePendingRef.current = true
 
     try {
       setDeleting(endpoint.id)
@@ -216,6 +264,7 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
     } catch (err) {
       notifyError(err, 'Delete failed')
     } finally {
+      modelWritePendingRef.current = false
       setDeleting(null)
     }
   }
@@ -264,7 +313,7 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
                   </button>
                   <div className="flex items-center gap-2 sm:justify-end">
                     <Button
-                      disabled={endpoint.is_current || activating === endpoint.id}
+                      disabled={endpoint.is_current || activating !== null || saving || deleting !== null}
                       onClick={() => void handleActivate(endpoint)}
                       size="sm"
                       variant="outline"
@@ -275,7 +324,7 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
                     {endpoint.source !== 'direct-config' && (
                       <Button
                         className="hover:text-destructive"
-                        disabled={deleting === endpoint.id}
+                        disabled={deleting !== null || saving || activating !== null}
                         onClick={() => void handleDelete(endpoint)}
                         size="icon-sm"
                         title="Delete endpoint"
@@ -381,7 +430,10 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
                 {testing ? <Loader2 className="animate-spin" /> : <Zap />}
                 Test
               </Button>
-              <Button disabled={saving || !canSave} onClick={() => void handleSave()}>
+              <Button
+                disabled={saving || activating !== null || deleting !== null || !canSave}
+                onClick={() => void handleSave()}
+              >
                 {saving ? <Loader2 className="animate-spin" /> : <Save />}
                 Save
               </Button>

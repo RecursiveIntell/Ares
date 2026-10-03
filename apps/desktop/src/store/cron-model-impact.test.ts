@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { getApiRequestConnection, setApiRequestConnection } from '@/api/client'
 import { $cronReviewRequest } from '@/store/cron'
 import { $notifications, clearNotifications, dismissNotification } from '@/store/notifications'
 import type { ModelAssignmentResponse } from '@/types/hermes'
@@ -59,6 +60,91 @@ beforeEach(() => {
 })
 
 describe('setMainModelAssignment', () => {
+  it('does not write B when A waits for confirmation and the source changes', async () => {
+    setApiRequestConnection('source-a')
+    const origin = getApiRequestConnection()
+    const writes: Array<string | null> = []
+    setModelAssignment.mockImplementation(async () => {
+      writes.push(getApiRequestConnection())
+
+      return {
+        ok: false,
+        confirm_required: true,
+        confirm_message: 'Confirm route A.',
+        scope: 'main',
+        model: 'guarded',
+        provider: 'openrouter'
+      }
+    })
+
+    const pending = setMainModelAssignment({ model: 'guarded', provider: 'openrouter' }, undefined, {
+      ownsOrigin: () => getApiRequestConnection() === origin
+    })
+
+    const rejection = expect(pending).rejects.toThrow('Hermes did not save that model change.')
+    const prompt = await waitForConfirmToast()
+    setApiRequestConnection('source-b')
+    prompt.action?.onClick()
+    await rejection
+    expect(writes).toEqual(['source-a'])
+    expect(setModelAssignment).toHaveBeenCalledTimes(1)
+    setApiRequestConnection(null)
+  })
+
+  it('checks an unchanged origin before both guarded assignment calls', async () => {
+    const ownsOrigin = vi.fn(() => true)
+    setModelAssignment.mockResolvedValueOnce({
+      ok: false,
+      confirm_required: true,
+      confirm_message: 'Confirm.',
+      scope: 'main',
+      model: 'guarded',
+      provider: 'openrouter'
+    })
+    setModelAssignment.mockResolvedValueOnce(response(undefined))
+    const pending = setMainModelAssignment({ model: 'guarded', provider: 'openrouter' }, undefined, { ownsOrigin })
+    const prompt = await waitForConfirmToast()
+    prompt.action?.onClick()
+    await pending
+    expect(setModelAssignment).toHaveBeenCalledTimes(2)
+    expect(ownsOrigin).toHaveBeenCalledTimes(2)
+    expect(setModelAssignment).toHaveBeenLastCalledWith(expect.objectContaining({ confirm_expensive_model: true }))
+  })
+
+  it('refuses a changed origin before the first actual assignment', async () => {
+    await expect(
+      setMainModelAssignment({ model: 'guarded', provider: 'openrouter' }, undefined, { ownsOrigin: () => false })
+    ).rejects.toThrow('Hermes did not save that model change.')
+    expect(setModelAssignment).not.toHaveBeenCalled()
+  })
+
+  it('guarded cancellation still performs no confirmation retry', async () => {
+    setModelAssignment.mockResolvedValueOnce({
+      ok: false,
+      confirm_required: true,
+      confirm_message: 'Confirm.',
+      scope: 'main',
+      model: 'guarded',
+      provider: 'openrouter'
+    })
+
+    const pending = setMainModelAssignment({ model: 'guarded', provider: 'openrouter' }, undefined, {
+      ownsOrigin: () => true
+    })
+
+    const rejection = expect(pending).rejects.toThrow('Model change cancelled')
+    const prompt = await waitForConfirmToast()
+    dismissNotification(prompt.id)
+    await rejection
+    expect(setModelAssignment).toHaveBeenCalledTimes(1)
+  })
+
+  it('unguarded and unchanged-origin no-warning saves still make one assignment', async () => {
+    setModelAssignment.mockResolvedValue(response(undefined))
+    await setMainModelAssignment({ model: 'plain', provider: 'openrouter' }, undefined, { ownsOrigin: () => true })
+    expect(setModelAssignment).toHaveBeenCalledTimes(1)
+  })
+
   it('shows one consumer warning and routes via a read-only review action', async () => {
     setModelAssignment.mockResolvedValue(response(positive()))
     const requestCount = $cronReviewRequest.get()

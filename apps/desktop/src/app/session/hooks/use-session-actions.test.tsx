@@ -12,6 +12,8 @@ import { noteActiveTreeGroup, revealTreePane } from '@/components/pane-shell/tre
 import {
   deleteSession,
   getAllSessionMessages,
+  getApiRequestConnection,
+  getGlobalModelInfo,
   getLatestSessionMessages,
   getSession,
   type ProfileScope,
@@ -24,7 +26,16 @@ import { $clarifyRequests, clearClarifyRequest, setClarifyRequest, updateClarify
 import { clearSessionDraft, stashSessionDraft, takeSessionDraft } from '@/store/composer'
 import { requestGatewayForAgent, requestGatewayForProfile } from '@/store/gateway'
 import { $pinnedSessionIds } from '@/store/layout'
-import { $activeGatewayProfile, $newChatProfile, $newChatRoute, $profiles, ensureGatewayProfile } from '@/store/profile'
+import { $notifications, clearNotifications } from '@/store/notifications'
+import {
+  $activeGatewayProfile,
+  $newChatProfile,
+  $newChatRoute,
+  $profiles,
+  ensureGatewayAgent,
+  ensureGatewayProfile,
+  resolveNewChatOwnerRoute
+} from '@/store/profile'
 import {
   $projectScope,
   $projectTree,
@@ -48,13 +59,19 @@ import {
   $selectedStoredSessionId,
   $sessions,
   $turnStartedAt,
+  _resetComposerModelSelectionsForTests,
+  captureComposerModelSelection,
+  getComposerModelSelection,
   getSessionOwnerHint,
   knownSessionOwner,
+  markComposerSelectionManual,
+  recordComposerModelSelection,
   sessionMatchesStoredId,
   setActiveSessionId,
   setActiveSessionStoredIdRotation,
   setAwaitingResponse,
   setBusy,
+  setComposerModelSelectionOwner,
   setConnection,
   setCronSessions,
   setCurrentCwd,
@@ -86,6 +103,7 @@ vi.mock('@/hermes', async importOriginal => ({
   ...(await importOriginal<Record<string, unknown>>()),
   deleteSession: vi.fn(),
   getSession: vi.fn(),
+  getGlobalModelInfo: vi.fn(async () => ({ model: '', provider: '' })),
   getAllSessionMessages: vi.fn(),
   getLatestSessionMessages: vi.fn(),
   listAllProfileSessions: vi.fn(),
@@ -113,6 +131,27 @@ vi.mock('@/components/pane-shell/tree/store', async importOriginal => ({
 }))
 
 const RUNTIME_SESSION_ID = 'rt-new-001'
+
+beforeEach(() => _resetComposerModelSelectionsForTests())
+
+function recordTestDraftModel(
+  model = 'test-model',
+  provider = 'test-provider',
+  source: 'default' | 'manual' = 'default'
+) {
+  const owner = resolveNewChatOwnerRoute() || {
+    connectionId: getApiRequestConnection(),
+    profile: $newChatProfile.get() || $activeGatewayProfile.get() || 'default'
+  }
+
+  setComposerModelSelectionOwner(owner)
+
+  if (source === 'manual') {
+    markComposerSelectionManual()
+  }
+
+  return recordComposerModelSelection(captureComposerModelSelection(owner), { model, provider, source })
+}
 
 type HarnessHandle = Pick<
   ReturnType<typeof useSessionActions>,
@@ -157,12 +196,13 @@ function Harness({
   selectedStoredSessionId?: null | string
 }) {
   const ref = <T,>(value: T): MutableRefObject<T> => ({ current: value })
+  const creatingSessionRef = useRef(false)
 
   const actions = useSessionActions({
     activeSessionId,
     activeSessionIdRef: ref(activeSessionId),
     busyRef: ref(false),
-    creatingSessionRef: ref(false),
+    creatingSessionRef,
     ensureSessionState: () => ({}) as ClientSessionState,
     getRouteToken: () => 'token',
     getRoutedStoredSessionId: () => null,
@@ -505,6 +545,8 @@ async function createWith(
     })
   }
 
+  recordTestDraftModel()
+
   await act(async () => {
     await handle!.createBackendSessionForSend()
   })
@@ -634,6 +676,7 @@ describe('createBackendSessionForSend profile routing', () => {
     $newChatProfile.set(route.profile)
     $newChatRoute.set({ ...route })
     $activeGatewayProfile.set('other-connection-profile')
+    recordTestDraftModel()
 
     let handle: HarnessHandle | null = null
     render(<Harness onReady={value => (handle = value)} requestGateway={ambientRequest} />)
@@ -658,6 +701,7 @@ describe('createBackendSessionForSend profile routing', () => {
 
     setCurrentModel('anthropic/claude-sonnet-4.6')
     setCurrentProvider('anthropic')
+    recordTestDraftModel('anthropic/claude-sonnet-4.6', 'anthropic', 'manual')
     setCurrentReasoningEffort('high')
     setCurrentFastMode(false)
 
@@ -3694,6 +3738,7 @@ describe('openNewSessionTile workspace target', () => {
     await waitFor(() => expect(handle).not.toBeNull())
 
     await act(async () => {
+      recordTestDraftModel()
       await handle!.openNewSessionTile('center', { cwd: null, listed: false })
     })
 
@@ -4014,6 +4059,8 @@ describe('routed fresh chat keeps its exact owner across turns', () => {
     $newChatProfile.set(route.profile)
     $newChatRoute.set({ ...route })
 
+    recordTestDraftModel()
+
     let handle: HarnessHandle | null = null
     render(<Harness onReady={value => (handle = value)} requestGateway={ambientRequest} />)
     await waitFor(() => expect(handle).not.toBeNull())
@@ -4089,5 +4136,174 @@ describe('routed fresh chat keeps its exact owner across turns', () => {
     expect(vi.mocked(requestGatewayForAgent).mock.calls.filter(call => call[2] === 'session.close')).toEqual([])
     expect(ambientRequest).not.toHaveBeenCalledWith('session.close', expect.anything())
     expect(getSessionOwnerHint(STORED)).toEqual(route)
+  })
+})
+
+// The producer boundary supplies explicit owner receipts; the real hook/store
+// below must never assign an ambient A pair to a pending draft B.
+describe('owner-qualified first-send admission', () => {
+  const a = { connectionId: 'source-a', profile: 'worker', targetProfile: 'backend-a' }
+  const b = { connectionId: 'source-b', profile: 'worker', targetProfile: 'backend-b' }
+
+  beforeEach(() => {
+    cleanup()
+    clearNotifications()
+    vi.clearAllMocks()
+    vi.mocked(ensureGatewayAgent).mockReset().mockResolvedValue(undefined)
+    vi.mocked(ensureGatewayProfile).mockReset().mockResolvedValue(undefined)
+    vi.mocked(requestGatewayForAgent)
+      .mockReset()
+      .mockResolvedValue({
+        session_id: RUNTIME_SESSION_ID,
+        stored_session_id: null
+      } as never)
+    setActiveSessionId(null)
+    setSelectedStoredSessionId(null)
+    $newChatProfile.set(a.profile)
+    $newChatRoute.set(a)
+    $activeGatewayProfile.set(a.profile)
+    setCurrentCwd('')
+    setNewChatWorkspaceTarget(undefined)
+    $projectScope.set(ALL_PROJECTS)
+  })
+
+  afterEach(() => {
+    cleanup()
+    clearNotifications()
+    $newChatRoute.set(null)
+    $newChatProfile.set(null)
+    $activeGatewayProfile.set('default')
+  })
+
+  async function ready() {
+    let handle: HarnessHandle | null = null
+    const ambient = vi.fn(async () => ({}) as never)
+    render(<Harness onReady={value => (handle = value)} requestGateway={ambient} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    return { handle: handle!, ambient }
+  }
+
+  it('refuses immediate A→B→Send visibly until an explicit B default arrives', async () => {
+    recordTestDraftModel('model-a', 'provider-a', 'manual')
+    setCurrentModel('model-a')
+    setCurrentProvider('provider-a')
+    $newChatRoute.set(b)
+    const { handle, ambient } = await ready()
+    let result: null | string = 'unresolved'
+    await act(async () => {
+      result = await handle.createBackendSessionForSend('offline input')
+    })
+    expect(result).toBeNull()
+    expect($notifications.get().some(n => n.message.includes('Loading model configuration'))).toBe(true)
+    expect(ensureGatewayAgent).not.toHaveBeenCalled()
+    expect(requestGatewayForAgent).not.toHaveBeenCalled()
+    expect(ambient).not.toHaveBeenCalled()
+    expect(getComposerModelSelection(b)).toBeNull()
+    expect(getGlobalModelInfo).toHaveBeenLastCalledWith({ connectionId: 'source-b', profile: 'backend-b' })
+    recordTestDraftModel('model-b', 'provider-b')
+    await act(async () => {
+      await new Promise(resolve => setTimeout(resolve, 0))
+    })
+    await act(async () => {
+      result = await handle.createBackendSessionForSend('offline retry')
+    })
+    expect(result).toBe(RUNTIME_SESSION_ID)
+    expect(requestGatewayForAgent).toHaveBeenCalledWith(
+      'source-b',
+      'worker',
+      'session.create',
+      expect.objectContaining({ profile: 'backend-b', model: 'model-b', provider: 'provider-b' })
+    )
+  })
+
+  it('freezes the qualified B pair before readiness despite later atom and manual changes', async () => {
+    $newChatRoute.set(b)
+    recordTestDraftModel('model-b', 'provider-b')
+    const pending = deferred<void>()
+    vi.mocked(ensureGatewayAgent).mockReturnValueOnce(pending.promise)
+    const { handle } = await ready()
+    let first!: Promise<null | string>
+    act(() => {
+      first = handle.createBackendSessionForSend()
+    })
+    await waitFor(() => expect(ensureGatewayAgent).toHaveBeenCalledOnce())
+    setCurrentModel('ambient-model-a')
+    setCurrentProvider('ambient-provider-a')
+    recordTestDraftModel('newer-model-b', 'provider-b', 'manual')
+    pending.resolve()
+    await act(async () => {
+      await first
+    })
+    expect(requestGatewayForAgent).toHaveBeenCalledOnce()
+    expect(requestGatewayForAgent).toHaveBeenCalledWith(
+      'source-b',
+      'worker',
+      'session.create',
+      expect.objectContaining({ model: 'model-b', provider: 'provider-b' })
+    )
+  })
+
+  it('suppresses duplicate Send while the first qualified create awaits readiness', async () => {
+    $newChatRoute.set(b)
+    recordTestDraftModel('model-b', 'provider-b')
+    const pending = deferred<void>()
+    vi.mocked(ensureGatewayAgent).mockReturnValueOnce(pending.promise)
+    const { handle } = await ready()
+    let first!: Promise<null | string>
+    act(() => {
+      first = handle.createBackendSessionForSend()
+    })
+    await waitFor(() => expect(ensureGatewayAgent).toHaveBeenCalledOnce())
+    await act(async () => {
+      expect(await handle.createBackendSessionForSend()).toBeNull()
+    })
+    expect(ensureGatewayAgent).toHaveBeenCalledOnce()
+    pending.resolve()
+    await act(async () => {
+      expect(await first).toBe(RUNTIME_SESSION_ID)
+    })
+    expect(requestGatewayForAgent).toHaveBeenCalledOnce()
+  })
+
+  it('uses the preserved A manual pin after A→B→A even if global atoms still show B', async () => {
+    recordTestDraftModel('manual-a', 'provider-a', 'manual')
+    $newChatRoute.set(b)
+    recordTestDraftModel('manual-b', 'provider-b', 'manual')
+    setCurrentModel('manual-b')
+    setCurrentProvider('provider-b')
+    $newChatRoute.set(a)
+    const { handle } = await ready()
+    await act(async () => {
+      await handle.createBackendSessionForSend()
+    })
+    expect(requestGatewayForAgent).toHaveBeenCalledWith(
+      'source-a',
+      'worker',
+      'session.create',
+      expect.objectContaining({ profile: 'backend-a', model: 'manual-a', provider: 'provider-a' })
+    )
+  })
+
+  it('refuses an initially unstamped pair instead of assigning it to the current route', async () => {
+    setCurrentModel('unowned-model')
+    setCurrentProvider('unowned-provider')
+    const { handle } = await ready()
+    await act(async () => {
+      expect(await handle.createBackendSessionForSend()).toBeNull()
+    })
+    expect(requestGatewayForAgent).not.toHaveBeenCalled()
+    expect($notifications.get().some(n => n.message.includes('Loading model configuration'))).toBe(true)
+  })
+
+  it('applies the same loading gate to a fresh split tile with an unknown target owner', async () => {
+    recordTestDraftModel('model-a', 'provider-a', 'manual')
+    const { handle, ambient } = await ready()
+    await act(async () => {
+      await handle.openNewSessionTile('center', { route: b, cwd: null })
+    })
+    expect(requestGatewayForAgent).not.toHaveBeenCalled()
+    expect(ambient).not.toHaveBeenCalled()
+    expect($notifications.get().some(n => n.message.includes('Loading model configuration'))).toBe(true)
   })
 })

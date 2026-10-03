@@ -10,10 +10,12 @@ import {
   deleteSession,
   fetchStoredTranscriptAcrossBackends,
   getAllSessionMessages,
+  getApiRequestConnection,
+  getGlobalModelInfo,
   getLatestSessionMessages,
   setSessionArchived
 } from '@/hermes'
-import { useI18n } from '@/i18n'
+import { translateNow, useI18n } from '@/i18n'
 import {
   type ChatMessage,
   preserveLocalAssistantErrors,
@@ -64,13 +66,12 @@ import {
   $connection,
   $currentCwd,
   $currentFastMode,
-  $currentModel,
-  $currentProvider,
   $currentReasoningEffort,
   $messages,
   $newChatWorkspaceTarget,
   $sessions,
   $yoloActive,
+  getComposerModelSelection,
   getSessionOwnerHint,
   type NewChatWorkspaceTarget,
   resolveComposerSessionKey,
@@ -236,6 +237,8 @@ function reconcileAuthoritativeMessages(
 // A no-op for single-profile/local-pooled users (a backend resolves its own launch
 // profile to None). The sticky UI model/effort/fast ride as per-session overrides,
 // never the profile default (that lives in Settings → Model).
+class ComposerModelSelectionLoadingError extends Error {}
+
 async function desktopSessionCreateParams(
   cwd: string,
   capturedRoute = resolveNewChatOwnerRoute()
@@ -244,14 +247,46 @@ async function desktopSessionCreateParams(
   // profile handshake below can yield long enough for background config/model
   // refreshes to finish; reading atoms afterward would silently create the
   // session with a different selection than the one the user submitted.
-  const selection = {
-    effort: $currentReasoningEffort.get().trim(),
-    fast: $currentFastMode.get(),
-    model: $currentModel.get().trim(),
-    provider: $currentProvider.get().trim()
+  const profile = capturedRoute?.profile || $newChatProfile.get() || normalizeProfileKey($activeGatewayProfile.get())
+  const owner = capturedRoute || { connectionId: getApiRequestConnection(), profile }
+  const effort = $currentReasoningEffort.get().trim()
+  const fast = $currentFastMode.get()
+  let modelSelection: { model: string; provider: string } | null = getComposerModelSelection(owner)
+
+  if (!modelSelection) {
+    // One authoritative read per admission attempt recovers a failed initial
+    // seed and supports owners that have never occupied the foreground draft.
+    // Keep this result local; a background tile must not claim the foreground
+    // receipt slot or borrow the ambient connection's default.
+    try {
+      const info = await getGlobalModelInfo({
+        connectionId: owner.connectionId,
+        profile: capturedRoute?.targetProfile || profile
+      })
+
+      if (
+        typeof info?.model !== 'string' ||
+        !info.model.trim() ||
+        typeof info.provider !== 'string' ||
+        getComposerModelSelection(owner)?.source === 'manual'
+      ) {
+        throw new Error('Model selection changed or configuration is unavailable')
+      }
+
+      modelSelection = { model: info.model.trim(), provider: info.provider.trim() }
+    } catch {
+      // A new Send retries; a deliberate pin made during the read governs that
+      // next admission rather than silently repointing this in-flight one.
+      throw new ComposerModelSelectionLoadingError(translateNow('settings.model.loading'))
+    }
   }
 
-  const profile = capturedRoute?.profile || $newChatProfile.get() || normalizeProfileKey($activeGatewayProfile.get())
+  const selection = {
+    effort,
+    fast,
+    model: modelSelection.model,
+    provider: modelSelection.provider
+  }
 
   if (capturedRoute) {
     await ensureGatewayAgent(capturedRoute.connectionId, profile)
@@ -473,6 +508,10 @@ export function useSessionActions({
 
   const createBackendSessionForSend = useCallback(
     async (preview: string | null = null): Promise<string | null> => {
+      if (creatingSessionRef.current) {
+        return null
+      }
+
       const startingStoredSessionId = selectedStoredSessionIdRef.current
       const startingRouteToken = getRouteToken()
 
@@ -625,6 +664,14 @@ export function useSessionActions({
         }
 
         return created.session_id
+      } catch (error) {
+        if (error instanceof ComposerModelSelectionLoadingError) {
+          notifyError(error, copy.createSessionFailed)
+
+          return null
+        }
+
+        throw error
       } finally {
         window.setTimeout(() => {
           creatingSessionRef.current = false
@@ -634,6 +681,7 @@ export function useSessionActions({
     [
       activeSessionIdRef,
       creatingSessionRef,
+      copy.createSessionFailed,
       ensureSessionState,
       getRouteToken,
       navigate,
