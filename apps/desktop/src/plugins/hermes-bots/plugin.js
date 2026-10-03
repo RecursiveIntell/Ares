@@ -1061,6 +1061,9 @@ function durableGroupChatRooms(all = $groupChats.get()) {
       log: room.log,
       watermarks: room.watermarks || {},
       sessions: room.sessions || {},
+      sessionOwners: room.sessionOwners || {},
+      holds: room.holds || {},
+      recoveryOrigin: room.recoveryOrigin || null,
       stranded: room.stranded || {},
       members: Array.isArray(room.members) ? room.members : [],
       // Immutable room identity: without this, a room merged in via the
@@ -7104,6 +7107,7 @@ function updateGroupChat(group, mutate, { sync = true } = {}) {
         watermarks: room.watermarks,
         sessions: room.sessions || {},
         sessionOwners: room.sessionOwners || {},
+        recoveryOrigin: room.recoveryOrigin || null,
         // Timed-out turns awaiting a late reply — keyed by member, valued
         // with the pre-turn message baseline. Survives reloads so finished
         // work is still harvested after a window restart.
@@ -7490,7 +7494,7 @@ async function ensureGroupChatSession(group, member, requestMember = member) {
           })
         }
 
-        return { runtime: res.session_id, stored }
+        return { runtime: res.session_id, stored, state: res }
       }
     } catch (error) {
       if (error?.code !== 4007) {
@@ -7517,7 +7521,44 @@ async function ensureGroupChatSession(group, member, requestMember = member) {
     })
   }
 
-  return { runtime: created?.session_id || null, stored }
+  return { runtime: created?.session_id || null, stored, resumeTarget: stored || title }
+}
+
+/** Older runtimes can accept work without identifying its outcome. Detect the
+ * versioned projection before any attachment or prompt write; display history
+ * cannot establish turn ownership after compaction. Do not cache across boots. */
+async function requireGroupTurnProtocol(member, prepared) {
+  const state = prepared.state || await requestForBot(member, 'session.resume', {
+    session_id: prepared.resumeTarget, profile: member.name, omit_messages: true
+  })
+  const projection = state?.turn_outcomes
+  if (typeof state?.session_id !== 'string' || !state.session_id ||
+      (prepared.stored && state.session_key && state.session_key !== prepared.stored)) {
+    throw new Error('The member session changed before admission. Try sending again.')
+  }
+  const unsupported = () => new Error('Update this member’s backend to support group turn outcomes, then send again. No member prompt was sent.')
+  if (projection === undefined) {
+    // Current lazy-session resume omits the projection. Probe the exact RPC
+    // without inventing an admission: its validation error establishes only
+    // method availability. It grants no ownership or completion authority.
+    try {
+      await requestForBot(member, 'session.turn.poll', {
+        session_id: state.session_id, profile: member.name
+      })
+    } catch (error) {
+      if (error?.code === 4006 && error?.message === 'session_id and full accepted_turn identity required') {
+        return state.session_id
+      }
+      if (error?.code === -32601) throw unsupported()
+      throw error
+    }
+    throw unsupported()
+  }
+  if (projection?.version !== 1 || projection.scope !== 'process_local' ||
+      !['available', 'unavailable'].includes(projection.availability) || !Array.isArray(projection.turns)) {
+    throw unsupported()
+  }
+  return state.session_id
 }
 
 const GROUP_TURN_TIMEOUT_MS = 180000
@@ -7604,6 +7645,7 @@ async function submitGroupTurnPrompt(member, runtime, stored, text) {
       throw error
     }
 
+    await requireGroupTurnProtocol(member, { runtime: fresh, stored, state: res })
     const ack = await requestForBot(member, 'prompt.submit', { session_id: fresh, text })
 
     return { runtime: fresh, acceptedTurn: groupAcceptedTurn(ack?.accepted_turn, fresh) }
@@ -8000,13 +8042,20 @@ async function runGroupChatMemberTurnLeased(group, captured, prompt, thread, ima
   }, { sync: false })
   let submitAttempted = false
   try {
-    const { runtime, stored } = await ensureGroupChatSession(group, member, requestMember)
+    const prepared = await ensureGroupChatSession(group, member, requestMember)
+    let { runtime } = prepared
+    const { stored } = prepared
     const beforeSubmit = () => {
       const room = $groupChats.get()[group] || {}
       return room.stranded?.[memberKey] === marker && !room.tombstone &&
         !((room.epoch || 0) !== dispatchEpoch && room.holds?.[memberKey])
     }
     if (!runtime || !beforeSubmit()) {
+      consumeGroupTurnMarker(group, memberKey, marker)
+      return discarded()
+    }
+    runtime = await requireGroupTurnProtocol(requestMember, prepared)
+    if (!beforeSubmit()) {
       consumeGroupTurnMarker(group, memberKey, marker)
       return discarded()
     }
@@ -12868,7 +12917,7 @@ function GroupChatSettingsDialog({ group, members, open, onClose, onRenamed }) {
  *  search), name the group, create. Assignment appends to each local bot's
  *  group membership list, so the room appears in the roster and syncs
  *  cross-machine via ui_meta without replacing its other groups. */
-function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
+function CreateGroupChatDialog({ open, roster, onClose, onCreated, recoverySource = null }) {
   const allMeta = useValue($botMeta)
   const [query, setQuery] = useState('')
   const [checked, setChecked] = useState({})
@@ -12879,8 +12928,8 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
   useEffect(() => {
     if (open) {
       setQuery('')
-      setChecked({})
-      setName('')
+      setChecked(recoverySource ? Object.fromEntries(recoverySource.members.map(member => [botRosterKey(member), true])) : {})
+      setName(recoverySource ? `${recoverySource.group} (new)` : '')
       setImage(null)
     }
   }, [open])
@@ -12903,44 +12952,13 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
       return
     }
 
-    // Creating a group is always a FRESH room. Without this, re-creating a
-    // group under an existing name (easy — the default name is just the
-    // member names) silently reopens the old room with its full log, which
-    // reads as "not a fresh group" (db's Aug 2026 report). Uniquify against
-    // both live rooms and any bot's current grouping, then mint a fresh
-    // roomId: member sessions are titled by that roomId, so a
-    // disbanded-and-recreated group with the SAME display name still gets
-    // new sessions instead of resuming the old room's by title.
-    const taken = new Set(liveGroupChatNames())
-
-    for (const meta of Object.values($botMeta.get() || {})) {
-      for (const existing of botGroups(meta)) {
-        taken.add(existing)
-      }
+    let groupName
+    try {
+      groupName = createFreshGroupChat(base, selected, { image, recoverySource })
+    } catch (error) {
+      host.notifyError(error, 'Could not create the new group')
+      return
     }
-
-    const groupName = uniqueGroupChatName(base, taken)
-    const roomId = mintGroupRoomId()
-
-    for (const bot of selected) {
-      void saveBotMeta(bot, groupMembershipPatch(botRosterMeta(bot, allMeta), groupName, true))
-    }
-
-    // Persist every machine identity, including today's active source. That
-    // member becomes remote after a source switch and cannot rely on the new
-    // gateway's name-keyed bot metadata to remain seated in this room.
-    const roomMembers = durableGroupChatMembers(selected)
-
-    updateGroupChat(groupName, room => {
-      room.members = roomMembers
-      room.roomId = roomId
-
-      if (image) {
-        room.image = image
-      }
-
-      return room
-    })
 
     host.notify({ kind: 'info', message: `“${groupName}” created with ${selected.length} bots` })
     onClose()
@@ -12961,7 +12979,9 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
           children: [
             jsx(DialogTitle, { children: 'New Group Chat' }),
             jsx(DialogDescription, {
-              children: `Pick 2–${GROUP_CHAT_MAX_MEMBERS} bots. Local memberships sync through each Bot profile; cross-machine members stay scoped to this room.`
+              children: recoverySource
+                ? 'Create a separate group with new sessions and its own stop controls. The original group, stop holds and unknown outcomes stay intact. Selected text is an unsent draft: review it before Send. Attachments are omitted; reattach any files you want to send.'
+                : `Pick 2–${GROUP_CHAT_MAX_MEMBERS} bots. Local memberships sync through each Bot profile; cross-machine members stay scoped to this room.`
             })
           ]
         }),
@@ -13569,6 +13589,85 @@ function migrateGroupComposerDraft(oldKey, newKey) {
   groupComposerDrafts.delete(oldKey)
 }
 
+/** This is presentation of retained custody, not evidence that old work ended.
+ * Derive it from durable receipts so reported:true and a cold activity feed
+ * cannot hide the reason a new message has not been admitted. */
+function groupBlockedMembers(room, members) {
+  return members.filter(member => {
+    const key = groupMemberKey(member)
+    return Object.prototype.hasOwnProperty.call(room?.stranded || {}, key) &&
+      !collectingGroupTurnMarkers.has(room.stranded[key])
+  })
+}
+
+/** Shared by ordinary New Group and the explicit blocked-room handoff. It
+ * creates UI context only. No session or turn is created until a later Send.
+ * A repeated handoff reopens its room without restaging a consumed/edited draft. */
+function createFreshGroupChat(base, selected, { image = null, recoverySource = null } = {}) {
+  if (selected.length < 2 || selected.length > GROUP_CHAT_MAX_MEMBERS) throw new Error('Select at least two bots for the new group.')
+  let source = null, entry = null, origin = null
+  if (recoverySource) {
+    source = $groupChats.get()[recoverySource.group]
+    if (!source || source.tombstone || source.roomId !== recoverySource.roomId ||
+        (!source.roomId && source !== recoverySource.room)) {
+      throw new Error('The original group changed. Open the new-group action again.')
+    }
+    if (recoverySource.entry) {
+      entry = source.log.find(item => item.id === recoverySource.entry.id && item.from?.kind === 'user')
+      if (!entry || entry.text !== recoverySource.entry.text || groupThreadOf(entry) !== recoverySource.entry.thread) {
+        throw new Error('The selected message changed. Select it again.')
+      }
+    }
+    origin = { roomId: source.roomId || null, group: recoverySource.group,
+      userEntryId: entry?.id || null, members: selected.map(groupMemberKey).sort() }
+    const prior = Object.entries($groupChats.get()).find(([, room]) => !room.tombstone &&
+      room.recoveryOrigin && JSON.stringify(room.recoveryOrigin) === JSON.stringify(origin))
+    if (prior) return prior[0]
+  }
+  const taken = new Set(liveGroupChatNames())
+  for (const meta of Object.values($botMeta.get() || {})) {
+    for (const existing of botGroups(meta)) taken.add(existing)
+  }
+  base = String(base || 'New group').trim().slice(0, 64)
+  const groupName = uniqueGroupChatName(base, taken)
+  const roomId = mintGroupRoomId()
+  const roomMembers = durableGroupChatMembers(selected)
+  updateGroupChat(groupName, room => {
+    Object.assign(room, { image: null, log: [], sessions: {}, sessionOwners: {},
+      watermarks: {}, stranded: {}, holds: {}, recoveryOrigin: origin, epoch: 0, running: false })
+    room.roomId = roomId
+    room.members = roomMembers
+    if (image) {
+      room.image = image
+    }
+    return room
+  })
+  if (entry) {
+    updateGroupComposerDraft(groupComposerDraftKey(groupName, $groupChats.get()[groupName]), draft => ({
+      ...draft, main: entry.text || '', pendingAttachments: {}, replies: {}, activeReplyThread: null
+    }))
+  }
+  for (const bot of selected) {
+    void saveBotMeta(bot, groupMembershipPatch(botRosterMeta(bot, $botMeta.get()), groupName, true))
+      .catch(error => host.notifyError(error, 'Group membership could not be synced'))
+  }
+  return groupName
+}
+
+function GroupBlockedNotice({ room, members, onCreate }) {
+  const blocked = groupBlockedMembers(room, members)
+  if (!blocked.length) return null
+  return jsxs('div', {
+    className: 'grid gap-1 border-b border-(--ui-stroke-secondary) px-2.5 py-2 text-xs text-(--ui-text-tertiary)',
+    role: 'status',
+    children: [
+      ...blocked.map(member => jsx('div', { children: `${groupSpeakerLabel(member.name)}${member.remoteSource ? ` (${member.connectionLabel || member.connectionId})` : ''}: earlier outcome unknown; new messages are blocked.` }, groupMemberKey(member))),
+      jsx('span', { children: 'You can create a separate group with new sessions. This group and its earlier work remain unchanged. Nothing is sent automatically.' }),
+      jsx(Button, { variant: 'secondary', size: 'sm', onClick: () => onCreate(null), children: 'Create a new group' })
+    ]
+  })
+}
+
 function GroupChatWorkspace({ group, members, onBack, visible = true }) {
   const rooms = useValue($groupChats)
   const allMeta = useValue($botMeta)
@@ -13617,6 +13716,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
     }))
   const [confirmDisband, setConfirmDisband] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [recoverySource, setRecoverySource] = useState(null)
   // Click-to-disambiguate: which log entry is showing its speaker's full
   // @handle (the roster's name-device form when names collide across
   // connections). Naturally every speaker just shows its display name.
@@ -13806,6 +13906,10 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
       ...b,
       title: (b.remoteSource ? '' : allMeta[b.name]?.title) || b.title || ''
     }))
+
+  const openNewGroup = entry => setRecoverySource({ group, roomId: room.roomId, room,
+    members: memberDescriptors(),
+    entry: entry ? { id: entry.id, text: entry.text, thread: groupThreadOf(entry) } : null })
 
   // Activity disclosure: quiet, collapsed by default. The collapsed row shows
   // the latest event; expanding lists the current run's events newest-first.
@@ -14311,6 +14415,9 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
         : null,
       header,
       activityPanel,
+      jsx(GroupBlockedNotice, { room, members, onCreate: openNewGroup }),
+      jsx(CreateGroupChatDialog, { open: Boolean(recoverySource), roster: members,
+        recoverySource, onClose: () => setRecoverySource(null), onCreated: name => openGroupChat(name) }),
       jsx(ScrollArea, {
         className: 'min-h-0 flex-1',
         children: jsxs('div', {
@@ -16088,6 +16195,7 @@ export default {
                   watermarks: room.watermarks && typeof room.watermarks === 'object' ? room.watermarks : {},
                   sessions: room.sessions && typeof room.sessions === 'object' ? room.sessions : {},
                   sessionOwners: room.sessionOwners && typeof room.sessionOwners === 'object' ? room.sessionOwners : {},
+                  recoveryOrigin: room.recoveryOrigin && typeof room.recoveryOrigin === 'object' ? room.recoveryOrigin : null,
                   stranded: room.stranded && typeof room.stranded === 'object' ? room.stranded : {},
                   // #93129: rehydrate sticky stop holds with the same shape
                   // guard as the other maps — a held bot stays held across
