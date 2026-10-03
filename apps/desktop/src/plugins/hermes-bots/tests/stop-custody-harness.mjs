@@ -34,6 +34,7 @@ async function harness(roster = members(3), options = {}) {
       if (failure) throw failure
       session.ref = { request_id: `accepted-${session.runtime}-${session.submits}`, session_id: session.runtime,
         route: 'compute_host', host_boot_id: `boot-${session.key}` }
+      options.onSubmit?.(session)
       session.prompt = params.text
       session.state = session.submits === 1 || options.chatty ? 'running' : 'complete'
       session.text = options.chatty ? `work ${session.submits} @all` : '(pass)'
@@ -66,6 +67,11 @@ async function harness(roster = members(3), options = {}) {
       return acknowledgement
     }
     if (method !== 'session.resume' && method !== 'session.turn.poll') throw new Error(`unexpected RPC ${method}`)
+    if (method === 'session.resume') {
+      await options.beforeResume?.(session, sessions)
+      if (!session.ref) await options.beforeAdmissionResume?.(session, sessions)
+    }
+    if (method === 'session.turn.poll' && !params.accepted_turn && options.capabilityPoll) return options.capabilityPoll(session)
     if (method === 'session.turn.poll') {
       assert.equal(params.accepted_turn?.session_id, params.session_id, 'poll carries captured runtime and accepted identity')
     }
@@ -76,6 +82,7 @@ async function harness(roster = members(3), options = {}) {
         turns: session.ref && !options.unavailable ? [{ accepted_turn: { ...session.ref }, state: session.state,
           finalized: ['complete', 'error', 'interrupted'].includes(session.state) ? [{ text: session.text, status: session.state,
             ...(session.state === 'error' ? { error: 'member failed' } : {}) }] : [] }] : [] } }
+    if (options.resumeProjection) return options.resumeProjection(session, method, projection)
     if (options.staleWaitingGate?.active && session.profile === 'bot1' && session.state === 'waiting') {
       await options.staleWaitingGate.promise
     }
