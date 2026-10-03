@@ -16968,6 +16968,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
             # Get the final response
             response = result.get("final_response", "") if result else ""
+            # Native incomplete turns keep their draft separate from final_response.
+            # Project it for display without changing the completion contract.
+            _partial_draft = result.get("partial_response", "") if result and not response else ""
+            _partial_notice = ""
+            if _partial_draft:
+                _partial_notice = f"[Partial response — {result.get('error') or 'processing incomplete'}]"
+                response = f"{_partial_draft}\n\n{_partial_notice}"
 
             # Session titling now runs at TURN START (agent/turn_context.py)
             # from the user's message alone, so it is already done — or in
@@ -17071,7 +17078,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
                 is_error_response = result and (result.get("failed") or result.get("partial"))
                 already_streamed = self._stream_started and self._stream_box_opened and not is_error_response
-                if use_streaming_tts and _streaming_box_opened and not is_error_response:
+                if _partial_draft and (
+                    self._stream_started and self._stream_box_opened
+                    or use_streaming_tts and _streaming_box_opened
+                ):
+                    # The draft is already visible; label its outcome once.
+                    if use_streaming_tts and _streaming_box_opened and not self._stream_box_opened:
+                        w = self._scrollback_box_width()
+                        _cprint(f"\n{_ACCENT}╰{'─' * (w - 2)}╯{_RST}")
+                    _cprint(f"\n{_DIM}{_partial_notice}{_RST}")
+                elif use_streaming_tts and _streaming_box_opened and not is_error_response:
                     # Text was already printed sentence-by-sentence; just close the box
                     w = self._scrollback_box_width()
                     _cprint(f"\n{_ACCENT}╰{'─' * (w - 2)}╯{_RST}")
@@ -21700,6 +21716,9 @@ def main(
                         ):
                             cli.session_id = cli.agent.session_id
                         response = result.get("final_response", "") if isinstance(result, dict) else str(result)
+                        if isinstance(result, dict) and not response and result.get("partial_response"):
+                            print(result["partial_response"])
+                            print(f"Partial response: {result.get('error') or 'processing incomplete'}", file=sys.stderr)
                         # Surface backend errors that produced no visible output
                         # (e.g. invalid model slug → provider 4xx). Mirrors the
                         # interactive CLI path. Write to stderr so piped stdout
@@ -21707,6 +21726,7 @@ def main(
                         if (
                             not response
                             and isinstance(result, dict)
+                            and not result.get("partial_response")
                             and result.get("error")
                             and (result.get("failed") or result.get("partial"))
                         ):
@@ -21743,7 +21763,10 @@ def main(
                         # permanently block the card. Non-kanban runs keep the
                         # plain 0/1 contract automation wrappers expect.
                         _exit_code = 0
-                        if isinstance(result, dict) and result.get("failed"):
+                        if isinstance(result, dict) and (
+                            result.get("failed") or result.get("partial")
+                            or result.get("completed") is False or result.get("interrupted")
+                        ):
                             _exit_code = 1
                             if os.environ.get("HERMES_KANBAN_TASK") and result.get(
                                 "failure_reason"

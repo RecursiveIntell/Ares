@@ -188,7 +188,14 @@ def test_default_control_send_bound_retires_session_and_handshake(tmp_path, oper
         return original_send(obj, **kwargs)
 
     client._send = send
-    client.request = lambda *args, **kwargs: {"turn": {"id": "new-turn"}}
+    def request(method, *args, **kwargs):
+        if method == "thread/read":
+            return {"thread": {"id": "dummy-thread", "status": {"type": "idle"}, "turns": []}}
+        if method == "thread/compact/start":
+            return {}
+        return {"turn": {"id": "new-turn"}}
+
+    client.request = request
     client._server_requests.put({"id": 42, "method": "item/permissions/requestApproval",
         "params": {"threadId": "dummy-thread", "turnId": "new-turn"}})
     session = CodexAppServerSession()
@@ -231,9 +238,11 @@ def test_default_control_send_bound_retires_session_and_handshake(tmp_path, oper
         session.close()
 
 
-def test_no_id_compaction_ack_retires_dummy_before_server_reply(dummy_codex):
+def test_empty_compaction_ack_without_lifecycle_times_out_and_retires(dummy_codex):
     client = cas.CodexAppServerClient(codex_bin=dummy_codex)
-    client.request = lambda *args, **kwargs: {}
+    client.request = lambda method, *args, **kwargs: (
+        {"thread": {"id": "dummy-thread", "status": {"type": "idle"}, "turns": []}}
+        if method == "thread/read" else {})
     client._server_requests.put({"id": 42, "method": "item/permissions/requestApproval"})
     session = CodexAppServerSession()
     session._client = client
@@ -241,13 +250,13 @@ def test_no_id_compaction_ack_retires_dummy_before_server_reply(dummy_codex):
     try:
         result = session.compact_thread(turn_timeout=0.01)
         assert not result.completed and result.final_text == ""
-        assert result.should_retire and "correlat" in result.error
+        assert result.should_retire and "timed out" in result.error
         assert client._closed and session._closed
         client._proc.wait(timeout=2)
         assert not client.is_alive()
         assert session._active_turn_id is None
         assert not session._interrupt_event.is_set()
-        assert client._server_requests.qsize() == 1
+        assert client._server_requests.qsize() == 0
     finally:
         client.close(timeout=0)
         session.close()
@@ -473,3 +482,53 @@ def test_concurrent_request_notify_response_frames_remain_whole(tmp_path):
     assert len({frame["id"] for frame in frames if frame.get("method") == "ping"}) == 5
     assert sorted((frame.get("params") or frame.get("result"))["tag"] for frame in frames[:-1]) == list(range(8))
     assert all((frame.get("params") or frame.get("result"))["text"] == payload for frame in frames[:-1])
+
+
+@pytest.mark.parametrize("before_ack", [False, True])
+def test_supported_empty_ack_compaction_preserves_thread_over_real_wire(tmp_path, before_ack):
+    """The inert child speaks protocol lifecycle, including delayed prior events."""
+    dummy = tmp_path / "compact-protocol-child"
+    dummy.write_text(
+        f"#!{sys.executable}\n"
+        "import json, sys\n"
+        "def emit(value): print(json.dumps(value), flush=True)\n"
+        "def note(method, turn, item=None):\n"
+        "    params = {'threadId': 'canonical', 'turnId': turn}\n"
+        "    if method.startswith('turn/'): params['turn'] = {'id': turn, 'status': 'completed' if method == 'turn/completed' else 'inProgress'}\n"
+        "    if item: params['item'] = item\n"
+        "    emit({'method': method, 'params': params})\n"
+        "for line in sys.stdin:\n"
+        "    msg = json.loads(line)\n"
+        "    if 'id' not in msg or 'method' not in msg: continue\n"
+        "    method = msg['method']\n"
+        "    if method == 'thread/read':\n"
+        "        emit({'id': msg['id'], 'result': {'thread': {'id': 'canonical', 'status': {'type': 'idle'}, 'turns': [{'id': 'prior', 'status': 'completed'}]}}})\n"
+        "    elif method == 'thread/compact/start':\n"
+        f"        if not {before_ack!r}: emit({{'id': msg['id'], 'result': {{}}}})\n"
+        "        note('turn/started', 'prior')\n"
+        "        note('turn/completed', 'prior')\n"
+        "        emit({'method': 'turn/started', 'params': {'threadId': 'foreign', 'turn': {'id': 'foreign-turn'}}})\n"
+        "        note('turn/completed', 'compact')\n"
+        "        note('turn/started', 'compact')\n"
+        "        note('item/started', 'compact', {'type': 'contextCompaction', 'id': 'compact-item'})\n"
+        "        note('item/completed', 'compact', {'type': 'contextCompaction', 'id': 'compact-item'})\n"
+        "        note('turn/completed', 'compact')\n"
+        f"        if {before_ack!r}: emit({{'id': msg['id'], 'result': {{}}}})\n"
+        "    elif method == 'turn/start':\n"
+        "        emit({'id': msg['id'], 'result': {'turn': {'id': 'next'}}})\n"
+        "        note('turn/completed', 'next')\n"
+        "    else: emit({'id': msg['id'], 'result': {}})\n",
+        encoding="utf-8",
+    )
+    dummy.chmod(0o700)
+    client = cas.CodexAppServerClient(codex_bin=str(dummy))
+    session = CodexAppServerSession()
+    session._client, session._thread_id = client, "canonical"
+    try:
+        compact = session.compact_thread(turn_timeout=1, notification_poll_timeout=0.001)
+        assert compact.completed and compact.compacted and compact.turn_id == "compact"
+        assert session._thread_id == "canonical" and not session._closed and client.is_alive()
+        next_turn = session.run_turn("continue", turn_timeout=1, notification_poll_timeout=0.001)
+        assert next_turn.completed and next_turn.thread_id == "canonical"
+    finally:
+        session.close()

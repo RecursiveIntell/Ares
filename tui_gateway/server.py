@@ -7175,6 +7175,7 @@ def _sync_bot_capabilities(sid: str, session: dict) -> None:
                 _preserve_default_reasoning=reasoning is None,
                 service_tier_override=tier,
                 platform_override=_session_source(session),
+                _resource_preserve_agent=agent,
             )
         finally:
             _clear_session_context(tokens)
@@ -7232,15 +7233,15 @@ def _sync_bot_capabilities(sid: str, session: dict) -> None:
     finally:
         retired = agent if published else new_agent
         if retired is not None and (published or retired is not agent):
-            # Soft retirement preserves same-session tools and the SQLite row.
-            # close() would end that row and destroy task-ID-scoped resources.
+            # Retire only this instance's clients and provider/engine handles.
+            # close() would end the row and destroy task-ID-scoped resources.
             if not published:
                 retired._owns_session_db = False
                 retired._end_session_on_close = False
             try:
-                retired.release_clients()
+                retired.retire_local_resources(preserve_agent=new_agent if published else agent)
             except Exception:
-                logger.debug("Bot capability client retirement failed", exc_info=True)
+                logger.debug("Bot capability local retirement failed", exc_info=True)
 
 
 def _sync_agent_model_with_config(sid: str, session: dict) -> None:
@@ -9517,6 +9518,7 @@ def _make_agent(
     service_tier_override: str | None = None,
     platform_override: str | None = None,
     _preserve_default_reasoning: bool = False,
+    _resource_preserve_agent=None,
 ):
     # AC-4 test seam: dead unless explicitly armed by the isolated certify
     # harness. Both inline and compute-host paths construct through _make_agent,
@@ -9687,6 +9689,7 @@ def _make_agent(
         platform=_resolve_agent_platform(platform_override),
         session_id=session_id or key,
         session_db=session_db if session_db is not None else _get_db(),
+        _resource_preserve_agent=_resource_preserve_agent,
         ephemeral_system_prompt=system_prompt or None,
         checkpoints_enabled=is_truthy_value(os.environ.get("HERMES_TUI_CHECKPOINTS")),
         pass_session_id=is_truthy_value(os.environ.get("HERMES_TUI_PASS_SESSION_ID")),
@@ -14089,8 +14092,10 @@ def _run_prompt_submit(
                 status = (
                     "interrupted"
                     if result.get("interrupted")
-                    else "error" if result.get("error") else "complete"
+                    else "error" if result.get("error") or result.get("partial") else "complete"
                 )
+                if not raw and result.get("partial"):
+                    raw = result.get("partial_response") or ""
                 # When the backend produced no visible response AND reported a
                 # real error (e.g. invalid model slug → provider 4xx), surface
                 # that error as the visible text instead of shipping an empty
@@ -14120,6 +14125,13 @@ def _run_prompt_submit(
                 status = "complete"
 
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
+            if isinstance(result, dict) and result.get("partial"):
+                payload["partial"] = True
+                payload["completed"] = False
+                if result.get("error"):
+                    payload["error"] = str(result["error"])
+                if result.get("interrupted"):
+                    payload["interrupted"] = True
             if last_reasoning:
                 payload["reasoning"] = last_reasoning
             if status_note:
@@ -14157,13 +14169,20 @@ def _run_prompt_submit(
                     _error_surface = None
             with session["history_lock"]:
                 if status == "error":
+                    # Native result-only turns may have no streamed deltas.
+                    # Keep the draft in the resume snapshot without appending
+                    # it again after a turn that already streamed it.
+                    if result.get("partial") and result.get("partial_response"):
+                        inflight = session.get("inflight_turn")
+                        if isinstance(inflight, dict):
+                            inflight["assistant"] = result["partial_response"]
                     # Returned-error result (provider 4xx, budget, etc.): retain
                     # the failed turn for resume replay instead of clearing it.
                     # If this terminal frame is lost to a disconnect, resume's
                     # inflight payload is the only carrier of the failure.
                     _fail_inflight_turn(
                         session,
-                        result.get("error") if isinstance(result, dict) else raw,
+                        (result.get("error") or "Turn incomplete") if isinstance(result, dict) else raw,
                         error_surface=_error_surface,
                     )
                     turn_error_retained = True

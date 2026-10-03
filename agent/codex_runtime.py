@@ -727,8 +727,18 @@ def run_codex_app_server_turn(
         model=getattr(agent, "model", None), provider=getattr(agent, "provider", None),
         subscription_only_trial=subscription_only_trial,
     ):
-        existing.close()
-        agent._codex_session = None
+        if not existing.update_model(
+            model=getattr(agent, "model", None), provider=getattr(agent, "provider", None),
+            subscription_only_trial=subscription_only_trial,
+        ):
+            error = (
+                "Codex native route change cannot preserve this thread. "
+                "Reset the conversation explicitly before changing provider or runtime mode."
+            )
+            return {
+                "final_response": error, "messages": messages, "api_calls": 0,
+                "completed": False, "partial": True, "error": error,
+            }
 
     # Lazy session: one CodexAppServerSession per AIAgent instance.
     # Spawned on first turn, reused across turns, closed at AIAgent

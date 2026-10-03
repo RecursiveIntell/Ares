@@ -4030,6 +4030,14 @@ def _normalize_empty_agent_response(
     if response:
         return response
 
+    partial_response = agent_result.get("partial_response")
+    if partial_response:
+        notice = f"⚠️ Partial response: {agent_result.get('error') or 'processing incomplete'}"
+        # Streaming already delivered the draft. Send only its outcome label.
+        if agent_result.get("partial_response_previewed"):
+            return notice
+        return f"{partial_response}\n\n{notice}"
+
     if agent_result.get("failed"):
         # None-safe: the gateway result dict is built with
         # ``'error': holder.get('error')`` and can carry an EXPLICIT None,
@@ -4135,6 +4143,8 @@ def _is_gateway_hidden_reasoning_incomplete_turn(agent_result: dict) -> bool:
     if agent_result.get("failed") or agent_result.get("interrupted"):
         return False
     if not agent_result.get("partial"):
+        return False
+    if agent_result.get("partial_response"):
         return False
     error_text = str(agent_result.get("error", "") or "").strip()
     if "remained incomplete after" not in error_text.lower():
@@ -6725,14 +6735,18 @@ class TurnRunner:
         )
 
         if not final_response:
-            final_response = _normalize_empty_agent_response(
-                result, final_response or "", history_len=len(agent_history),
-            )
-            final_response = _sanitize_gateway_final_response(ctx.source.platform, final_response)
-            if not final_response:
-                final_response = f"⚠️ {result['error']}" if result.get("error") else ""
+            # Preserve the producer's empty final for native incomplete turns.
+            # Delivery normalization below renders the separately labeled draft.
+            if not result.get("partial_response"):
+                final_response = _normalize_empty_agent_response(
+                    result, final_response or "", history_len=len(agent_history),
+                )
+                final_response = _sanitize_gateway_final_response(ctx.source.platform, final_response)
+                if not final_response:
+                    final_response = f"⚠️ {result['error']}" if result.get("error") else ""
             return {
                 "final_response": final_response,
+                "partial_response": result.get("partial_response", ""),
                 "messages": result.get("messages", []),
                 "api_calls": result.get("api_calls", 0),
                 "failed": result.get("failed", False),
@@ -6809,6 +6823,7 @@ class TurnRunner:
 
         return {
             "final_response": final_response,
+            "partial_response": result.get("partial_response", ""),
             "last_reasoning": result.get("last_reasoning"),
             "messages": ctx.result_holder[0].get("messages", []) if ctx.result_holder[0] else [],
             "api_calls": ctx.result_holder[0].get("api_calls", 0) if ctx.result_holder[0] else 0,
@@ -30294,7 +30309,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # _run_agent_task; sending the raw copy bypasses those steps.
                     _delivery_result = response if isinstance(response, dict) else (result or {})
                     _previewed = bool(_delivery_result.get("response_previewed"))
-                    first_response = _delivery_result.get("final_response", "")
+                    _partial_draft = _delivery_result.get("partial_response", "")
+                    if _partial_draft and _stream_confirmed_final_delivery(_sc, _partial_draft):
+                        _delivery_result["partial_response_previewed"] = True
+                    first_response = _normalize_empty_agent_response(
+                        _delivery_result, _delivery_result.get("final_response", ""),
+                    )
                     _already_streamed = _stream_confirmed_final_delivery(
                         _sc,
                         first_response,
@@ -30561,6 +30581,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # final answer.  Suppressing delivery here leaves the user staring
         # at silence.  (#10xxx — "agent stops after web search")
         _sc = stream_consumer_holder[0]
+        if isinstance(response, dict) and response.get("partial_response"):
+            # A successful stream seal preserved the accumulator. Keep the
+            # subsequent result-only delivery to a notice, without repeating it.
+            if _stream_confirmed_final_delivery(_sc, response["partial_response"]):
+                response["partial_response_previewed"] = True
         if isinstance(response, dict) and not response.get("failed"):
             _final = response.get("final_response") or ""
             _is_empty_sentinel = not _final or _final == "(empty)"

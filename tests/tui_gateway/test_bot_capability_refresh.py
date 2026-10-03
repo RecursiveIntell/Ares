@@ -32,6 +32,9 @@ class FakeAgent:
         self.client_closes.append(self.client)
         self.client = None
 
+    def retire_local_resources(self, *, preserve_agent=None):
+        self.release_clients()
+
     def clear_interrupt(self):
         pass
 
