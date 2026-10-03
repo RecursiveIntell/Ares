@@ -1952,6 +1952,8 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
     without the user's explicit choice.  See PR #4210 for the same
     pattern applied to the setup wizard gate.
     """
+    from agent.secret_scope import get_secret
+
     normalized = (provider_id or "").strip().lower()
 
     # 1. Check auth.json active_provider
@@ -2021,7 +2023,7 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
         for env_var in pconfig.api_key_env_vars:
             if env_var in _IMPLICIT_ENV_VARS:
                 continue
-            if has_usable_secret(os.getenv(env_var, "")):
+            if has_usable_secret(get_secret(env_var, "")):
                 return True
 
     # AWS SDK providers (Bedrock) have auth_type="aws_sdk" and empty
@@ -2033,11 +2035,11 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
     # Only check explicit env credentials here (NOT boto3's full chain):
     # ambient sources like EC2 IMDS / SSO profiles must not auto-surface.
     if pconfig and pconfig.auth_type == "aws_sdk":
-        if has_usable_secret(os.getenv("AWS_BEARER_TOKEN_BEDROCK", "")):
+        if has_usable_secret(get_secret("AWS_BEARER_TOKEN_BEDROCK", "")):
             return True
         if (
-            has_usable_secret(os.getenv("AWS_ACCESS_KEY_ID", ""))
-            and has_usable_secret(os.getenv("AWS_SECRET_ACCESS_KEY", ""))
+            has_usable_secret(get_secret("AWS_ACCESS_KEY_ID", ""))
+            and has_usable_secret(get_secret("AWS_SECRET_ACCESS_KEY", ""))
         ):
             return True
 
@@ -2057,7 +2059,7 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
                 # the user deletes the env var (#55790) — only count it when
                 # the referenced var still resolves to a usable secret NOW.
                 env_var = entry.get("source", "").split(":", 1)[1].strip()
-                if env_var and has_usable_secret(os.getenv(env_var, "")):
+                if env_var and has_usable_secret(get_secret(env_var, "")):
                     return True
                 continue
             if (

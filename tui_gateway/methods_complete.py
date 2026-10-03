@@ -469,6 +469,7 @@ def _(rid, params: dict) -> dict:
 @method("model.options")
 def _(rid, params: dict) -> dict:
     token = None
+    secret_token = None
     try:
         from hermes_cli.inventory import build_model_options_payload
         from hermes_cli.profiles import get_profile_dir, normalize_profile_name, validate_profile_name
@@ -496,11 +497,19 @@ def _(rid, params: dict) -> dict:
         session_home = Path(session.get("profile_home") or _hermes_home).resolve() if session else None
         if requested_home is not None and session_home is not None and requested_home != session_home:
             return _err(rid, 4033, "Model catalog profile does not match the session owner")
-        home = session_home or requested_home
+        from hermes_constants import get_hermes_home
+        home = session_home or requested_home or Path(get_hermes_home()).resolve()
         if home is not None:
             if not home.is_dir():
                 return _err(rid, 4033, "Model catalog session owner does not exist")
             token = set_hermes_home_override(str(home))
+            from agent.secret_scope import build_profile_secret_scope, set_secret_scope
+            secret_token = set_secret_scope(build_profile_secret_scope(
+                home,
+                # Cross-profile catalogs must not borrow launch credentials.
+                # The launch catalog retains normal environment injection.
+                allow_environment_fallback=home == Path(_hermes_home).resolve(),
+            ))
         agent = session.get("agent") if session else None
         # Layer agent-session state on top of disk config — once an agent
         # is spawned, IT owns the live provider/model/base_url. Empty
@@ -517,6 +526,9 @@ def _(rid, params: dict) -> dict:
     except Exception as e:
         return _err(rid, 5033, str(e))
     finally:
+        if secret_token is not None:
+            from agent.secret_scope import reset_secret_scope
+            reset_secret_scope(secret_token)
         if token is not None:
             reset_hermes_home_override(token)
 
