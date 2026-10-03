@@ -1,5 +1,6 @@
 """Only the matching host request may settle a parent session."""
 import threading
+from types import SimpleNamespace
 
 from tests.tui_gateway.terminal_settlement_helpers import wait_for_terminal_projection
 
@@ -84,7 +85,13 @@ def test_late_terminal_resolves_uncertain_send_without_replay(tmp_path, monkeypa
     session = state(monkeypatch)
     session.pop("_compute_host_active_request_id")
     host = HostSupervisor(registry_path=tmp_path / "host.json", autostart=False)
-    monkeypatch.setattr(host, "start", lambda: None)
+    # This test starts after the host hello has established readiness. Keep
+    # the real admission path so a write exception retains its boot owner.
+    proc = SimpleNamespace(poll=lambda: None)
+    monkeypatch.setattr(host, "_proc", proc)
+    monkeypatch.setattr(host, "_ready_proc", proc)
+    monkeypatch.setattr(host, "_hello", {"boot_id": "fixture-boot"})
+    assert host.is_ready()
     sent = []
     def fail_send(frame, **_kwargs):
         sent.append(frame)
@@ -99,6 +106,7 @@ def test_late_terminal_resolves_uncertain_send_without_replay(tmp_path, monkeypa
     monkeypatch.setattr(server, "_drain_queued_prompt", lambda *a: drained.append(a))
     result = server._submit_prompt_to_compute_host("rpc", "s", session, "A")
     assert result["error"]["data"]["delivery"] == "uncertain"
+    assert host._pending_turns[sent[0]["request_id"]][2] == "fixture-boot"
     terminal = {"type": "turn.end", "sid": "s", "request_id": sent[0]["request_id"]}
     host._complete_turn(terminal)
     wait_for_terminal_projection(host)

@@ -20,7 +20,7 @@ import {
   setSessionArchived
 } from '@/hermes'
 import { createClientSessionState } from '@/lib/chat-runtime'
-import { $clarifyRequests, clearClarifyRequest, setClarifyRequest } from '@/store/clarify'
+import { $clarifyRequests, clearClarifyRequest, setClarifyRequest, updateClarifyInteraction } from '@/store/clarify'
 import { clearSessionDraft, stashSessionDraft, takeSessionDraft } from '@/store/composer'
 import { requestGatewayForAgent, requestGatewayForProfile } from '@/store/gateway'
 import { $pinnedSessionIds } from '@/store/layout'
@@ -2490,6 +2490,114 @@ describe('resumeSession warm-cache mapping integrity', () => {
     expect(resumedState?.streamId).toBe(clarifyMessages[0].id)
     expect($clarifyRequests.get()['rt-A']).toMatchObject({ requestId: 'req-warm' })
   })
+
+  it.each(['session.activate', 'session.resume'])(
+    'retains lost-ACK evidence without an input badge after authoritative absence on %s',
+    async method => {
+      const state = clientState('stored-A')
+      state.busy = true
+      state.needsInput = true
+      state.streamId = 'cached-assistant'
+      state.messages = [
+        { id: 'cached-user', role: 'user', parts: [{ type: 'text', text: 'help me choose' }] },
+        {
+          id: 'cached-assistant',
+          role: 'assistant',
+          pending: true,
+          parts: [
+            {
+              type: 'tool-call',
+              toolCallId: 'call-provider',
+              toolName: 'clarify',
+              args: { choices: ['safe', 'fast'], question: 'Which path?' },
+              argsText: ''
+            }
+          ]
+        }
+      ]
+      const states: MutableRefObject<Map<string, ClientSessionState>> = { current: new Map([['rt-A', state]]) }
+
+      const runtimes: MutableRefObject<Map<string, string>> = {
+        current: method === 'session.activate' ? new Map([['stored-A', 'rt-A']]) : new Map()
+      }
+
+      setSessions([storedSession({ id: 'stored-A', message_count: 2 })])
+      setClarifyRequest({
+        choices: ['safe', 'fast'],
+        multiSelect: false,
+        question: 'Which path?',
+        requestId: 'req-lost-ack',
+        sessionId: 'rt-A'
+      })
+      const scope = $clarifyRequests.get()['rt-A']
+      updateClarifyInteraction(scope, {
+        selectedChoices: ['safe'],
+        deliveryUncertain: true,
+        sendError: 'Confirmation lost',
+        attempt: 1
+      })
+      vi.mocked(getLatestSessionMessages).mockResolvedValue({
+        messages: [
+          { content: 'help me choose', role: 'user', timestamp: 1 },
+          {
+            content: '',
+            role: 'assistant',
+            timestamp: 2,
+            tool_calls: [
+              {
+                function: { arguments: '{"question":"Which path?","choices":["safe","fast"]}', name: 'clarify' },
+                id: 'call-provider'
+              }
+            ]
+          }
+        ],
+        session_id: 'stored-A'
+      } as never)
+
+      const requestGateway = vi.fn(async (rpc: string) =>
+        rpc === method
+          ? ({
+              info: {},
+              message_count: 2,
+              messages: [],
+              messages_omitted: true,
+              resumed: 'stored-A',
+              running: false,
+              session_id: 'rt-A',
+              session_key: 'stored-A'
+            } as never)
+          : ({} as never)
+      )
+
+      let resume: ((id: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+      render(
+        <ResumeHarness
+          onReady={ready => (resume = ready)}
+          requestGateway={requestGateway}
+          runtimeIdByStoredSessionIdRef={runtimes}
+          sessionStateByRuntimeIdRef={states}
+        />
+      )
+      await waitFor(() => expect(resume).not.toBeNull())
+      await resume!('stored-A', true)
+      expect(requestGateway.mock.calls.map(([rpc]) => rpc)).toContain(method)
+      expect(requestGateway.mock.calls.map(([rpc]) => rpc)).not.toContain('clarify.respond')
+      expect(states.current.get('rt-A')?.needsInput).toBe(false)
+      expect($clarifyRequests.get()['rt-A']).toMatchObject({
+        generation: scope.generation,
+        deliveryOnly: true,
+        interaction: { selectedChoices: ['safe'], deliveryUncertain: true, sendError: 'Confirmation lost' }
+      })
+
+      const part = states.current
+        .get('rt-A')
+        ?.messages.flatMap(message => message.parts)
+        .find(part => part.type === 'tool-call' && part.toolName === 'clarify')
+
+      expect(part).toBeTruthy()
+      expect(part).not.toHaveProperty('result')
+    }
+  )
 
   it.each([
     ['with a stale request-store entry', true],

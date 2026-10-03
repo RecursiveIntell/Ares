@@ -3255,6 +3255,7 @@ export const en: Translations = {
         'Request expired. Your response may have reached the agent; check the conversation before sending it again.',
       responseUncertain:
         'Your response may have reached the agent, but confirmation was lost. Check the conversation before sending it again.',
+      responseAccepted: 'Answer received',
       responseRejected: 'Response was not accepted; your answer remains selected.',
       loadingQuestion: 'Loading question…',
       other: 'Other (type your answer)',

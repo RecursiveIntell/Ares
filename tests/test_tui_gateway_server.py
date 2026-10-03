@@ -13718,6 +13718,7 @@ def test_respond_unpacks_sid_tuple_correctly():
     """After the (sid, Event) tuple change, _respond must still work."""
     ev = threading.Event()
     server._pending["rid-x"] = ("sid_x", ev)
+    server._pending_prompt_payloads["rid-x"] = ("clarify.request", {})
     try:
         resp = server.handle_request(
             {
@@ -13731,6 +13732,7 @@ def test_respond_unpacks_sid_tuple_correctly():
         assert server._answers.get("rid-x") == "the answer"
     finally:
         server._pending.pop("rid-x", None)
+        server._pending_prompt_payloads.pop("rid-x", None)
         server._answers.pop("rid-x", None)
 
 

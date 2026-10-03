@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
+import { assertFixturePoll, fixtureAdmission, fixtureProjection } from './group-turn-wire-fixture.mjs'
 import vm from 'node:vm'
 
 // Collapsible group Activity view: a runtime-only, bounded feed of truthful
@@ -52,7 +53,7 @@ function load(turnScript = () => '(pass)') {
           titleToStored.set(`${params.profile}::${params.title}`, stored)
           return { session_id: runtime, stored_session_id: stored, message_count: 0, messages: [] }
         }
-        if (method === 'session.resume') {
+        if (method === 'session.resume' || method === 'session.turn.poll') {
           const session = resolveSession(params.profile, params.session_id)
           if (!session) {
             // Shaped like the real gateway's JsonRpcGatewayError (`.code`,
@@ -63,11 +64,13 @@ function load(turnScript = () => '(pass)') {
             err.code = 4007
             throw err
           }
+          if (method === 'session.turn.poll') assertFixturePoll(session, params)
           return {
             session_id: session.runtime,
             session_key: session.stored,
             message_count: session.messages.length,
             messages: [...session.messages],
+            turn_outcomes: fixtureProjection(session),
             inflight: false,
             running: false
           }
@@ -87,7 +90,9 @@ function load(turnScript = () => '(pass)') {
           })
           const reply = await turnScript(session.profile, params.text, calls.length, session)
           session.messages.push({ role: 'assistant', content: reply })
-          return {}
+          session.finalized = [{ text: reply, status: 'complete' }]
+          const accepted_turn = fixtureAdmission(session, `owned-${session.runtime}-${calls.length}`)
+          return { accepted_turn }
         }
         return {}
       },
@@ -216,7 +221,7 @@ test('a newer send interrupts the previous run and records cancelled in the CURR
   for (let i = 0; i < 50 && gc.calls.length < 1; i++) {
     await new Promise(resolve => setImmediate(resolve))
   }
-  gc.sendToGroupChat('Busy', member, 'second ask, supersede')
+  gc.sendToGroupChat('Busy', member, 'second ask, supersede', gc.$groupChats.get().Busy.log[0].thread)
   for (let i = 0; i < 50 && gc.calls.length < 2; i++) {
     await new Promise(resolve => setImmediate(resolve))
   }

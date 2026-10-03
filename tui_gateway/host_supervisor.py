@@ -41,6 +41,8 @@ MUTATOR_ROUTE_TABLE: dict[str, str] = {
     "session.interrupt": "turn-path",
     "session.steer": "run-concurrent",
     "session.redirect": "run-concurrent",
+    "clarify.snapshot": "run-concurrent",
+    "clarify.respond": "run-concurrent",
     "reload.mcp": "run-concurrent",
     "session.save": "run-concurrent",
     "session.run_checkpoint.claim": "run-concurrent",
@@ -61,6 +63,7 @@ MUTATOR_ROUTE_TABLE: dict[str, str] = {
 _REGISTRY_NAME = "dashboard-compute-host.json"
 _RESPAWN_WINDOW_SECS = 300.0
 _SHUTDOWN_TIMEOUT_SECS = 10.0
+_STARTUP_TIMEOUT_SECS = 10.0
 
 
 def append_log_record(path: str | Path, record: str) -> None:
@@ -204,6 +207,7 @@ class HostSupervisor:
         self._startup_result = None
         self._poisoned_proc = None
         self._proc: subprocess.Popen[str] | None = None
+        self._ready_proc: subprocess.Popen[str] | None = None
         self._stdout_thread: threading.Thread | None = None
         self._stderr_thread: threading.Thread | None = None
         self._wait_thread: threading.Thread | None = None
@@ -236,17 +240,25 @@ class HostSupervisor:
         proc = self._proc
         return proc is not None and proc.poll() is None and not self._stopped_respawning
 
+    def is_ready(self) -> bool:
+        """Liveness alone cannot authorize traffic to an unvalidated child."""
+        proc = self._proc
+        return not self._closing and proc is not None and self._ready_proc is proc and self.is_running()
+
     def start(self) -> None:
         with self._lock:
+            if self._closing:
+                raise RuntimeError("compute host supervisor is closing")
             if self.is_running():
                 return
-            self._closing = False
             self.reconcile_startup_orphan()
             self._spawn_locked(reason="startup")
 
     def shutdown(self) -> None:
+        # Signal waiters before acquiring the lifecycle lock, which startup
+        # holds while validating hello. Shutdown must cancel pending admission.
+        self._closing = True
         with self._lock:
-            self._closing = True
             proc = self._proc
         if proc is None:
             return
@@ -311,6 +323,9 @@ class HostSupervisor:
                 raise ValueError("duplicate compute-host request ID")
             boot = self.boot_id
             self._pending_turns[request_id] = (sid, on_complete, boot)
+            # Private caller-owned admission receipt, assigned by this owner
+            # before any byte is offered. It is not supplied by a host payload.
+            frame["_admitted_host_boot_id"] = boot
         finally:
             self._registry_lock.release()
         # Only a proven zero-byte refusal retires this registration. Partial
@@ -325,11 +340,21 @@ class HostSupervisor:
 
     def _ensure_started_by(self, deadline: float) -> None:
         """Share one startup attempt; a timeout never sends a delayed frame."""
+        if self._closing:
+            raise HostSendNotSent("compute-host startup cancelled by shutdown; not sent")
         if time.monotonic() >= deadline:
             raise HostSendNotSent("compute-host startup deadline exceeded; not sent")
-        if self.is_running():
+        if self.is_ready():
             return
-        with self._startup_guard:
+        if not self._startup_guard.acquire(timeout=max(0, deadline - time.monotonic())):
+            raise HostSendNotSent("compute-host startup deadline exceeded; not sent")
+        try:
+            if self._closing:
+                raise HostSendNotSent("compute-host startup cancelled by shutdown; not sent")
+            if time.monotonic() >= deadline:
+                raise HostSendNotSent("compute-host startup deadline exceeded; not sent")
+            if self.is_ready():
+                return
             attempt = self._startup_result
             if attempt is None or attempt[0].is_set():
                 done = threading.Event()
@@ -348,10 +373,29 @@ class HostSupervisor:
                 except Exception as exc:
                     errors.append(exc)
                     done.set()
-        if not attempt[0].wait(max(0, deadline - time.monotonic())):
-            raise HostSendNotSent("compute-host startup deadline exceeded; not sent")
+        finally:
+            self._startup_guard.release()
+        while not attempt[0].is_set():
+            if self._closing:
+                raise HostSendNotSent("compute-host startup cancelled by shutdown; not sent")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise HostSendNotSent("compute-host startup deadline exceeded; not sent")
+            attempt[0].wait(min(remaining, 0.05))
+        if self._closing:
+            raise HostSendNotSent("compute-host startup cancelled by shutdown; not sent")
         if attempt[1]:
             raise HostSendNotSent(f"compute-host startup failed; not sent: {attempt[1][0]}") from attempt[1][0]
+        if not self.is_ready():
+            raise HostSendNotSent("compute-host startup did not establish readiness; not sent")
+
+    def wait_ready(self, *, timeout: float = _STARTUP_TIMEOUT_SECS) -> None:
+        """Wait for startup without offering or scheduling any request frame.
+
+        Resume calls this outside its ownership lock before spending the short
+        owner-query budget. Mutation controls keep their single total deadline.
+        """
+        self._ensure_started_by(time.monotonic() + timeout)
 
     def _send_owner_control_bounded(self, frame: dict[str, Any], *, deadline: float,
                                     expected_boot_id: str | None = None) -> None:
@@ -404,6 +448,7 @@ class HostSupervisor:
         if not key:
             return None
         deadline = time.monotonic() + timeout
+        self._ensure_started_by(deadline)
         expected_boot_id = self.boot_id or None
         request_id = f"session-lookup-{uuid.uuid4().hex}"
         q: queue.Queue[dict] = queue.Queue(maxsize=1)
@@ -427,7 +472,7 @@ class HostSupervisor:
         if (type(observed_boot_id) is not str or not observed_boot_id
                 or (expected_boot_id is not None and observed_boot_id != expected_boot_id)
                 or observed_boot_id != self.boot_id):
-            raise HostBootMismatch("compute-host owner lookup belongs to another or unknown boot")
+            raise HostSendUncertain("compute-host owner lookup belongs to another or unknown boot; unconfirmed")
         matches = frame.get("sessions")
         if not isinstance(matches, list):
             raise RuntimeError("compute-host session lookup returned an invalid response")
@@ -566,6 +611,7 @@ class HostSupervisor:
         with self._registry_lock:
             self._hello_event.clear()
             self._hello = {}
+            self._ready_proc = None
             self._proc = proc
         self._stdout_thread = _Thread(target=self._drain_stdout, args=(proc,), name="compute-host-stdout", daemon=True)
         self._stderr_thread = _Thread(target=self._drain_stderr, args=(proc,), name="compute-host-stderr", daemon=True)
@@ -573,11 +619,26 @@ class HostSupervisor:
         self._stdout_thread.start()
         self._stderr_thread.start()
         self._wait_thread.start()
-        if not self._hello_event.wait(timeout=10.0):
+        try:
+            if not self._hello_event.wait(timeout=_STARTUP_TIMEOUT_SECS):
+                raise RuntimeError(f"compute host did not send hello; stderr={self._stderr_tail[-5:]}")
+            self._validate_hello()
+            self._persist_registry()
+            with self._registry_lock:
+                if self._closing or self._proc is not proc or proc.poll() is not None:
+                    raise RuntimeError("compute host exited before readiness")
+                self._ready_proc = proc
+        except Exception:
+            # Retire this exact rejected child before releasing the lifecycle
+            # lock. Later callers must never bypass its failed startup result.
+            with self._registry_lock:
+                if self._proc is proc:
+                    self._proc = None
+                    self._ready_proc = None
+                    self._hello = {}
             self._terminate_process(proc)
-            raise RuntimeError(f"compute host did not send hello; stderr={self._stderr_tail[-5:]}")
-        self._validate_hello()
-        self._persist_registry()
+            self._remove_registry()
+            raise
         logger.info("compute host started pid=%s reason=%s", proc.pid, reason)
 
     def _validate_hello(self) -> None:
@@ -793,6 +854,8 @@ class HostSupervisor:
             callback = observer if observer is not None else (pending[1] if pending is not None else None)
             if callback is None:
                 return
+            if boot_id:
+                frame = {**frame, "_host_boot_id": boot_id}
             self._terminal_queues.setdefault(sid, deque()).append((dict(frame), callback))
             launch = sid not in self._terminal_workers
             if launch:
@@ -832,6 +895,8 @@ class HostSupervisor:
                 return
             with self._registry_lock:
                 self._proc = None
+                self._ready_proc = None
+                self._hello = {}
         self._remove_registry()
         self._fail_pending_turns(reason="crash", message=f"compute host exited with code {code}")
         if self.on_crash is not None:

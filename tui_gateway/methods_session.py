@@ -399,6 +399,93 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, {"verification": {"status": "unknown", "evidence": None}})
 
 
+@method("session.turn.poll")
+def _(rid, params: dict) -> dict:
+    """Observe one accepted live turn without resuming or claiming a session.
+
+    Runtime IDs and stored transcript keys are different namespaces. This
+    endpoint never opens a DB, follows compression lineage, builds an agent,
+    touches activity, rebinds a viewer, or cancels orphan retirement.
+    """
+    sid = params.get("session_id")
+    ref = params.get("accepted_turn")
+    if (not isinstance(sid, str) or not sid or not isinstance(ref, dict)
+            or set(ref) != {"request_id", "session_id", "route", "host_boot_id"}
+            or not isinstance(ref.get("request_id"), str) or not ref["request_id"]
+            or ref.get("session_id") != sid
+            or not isinstance(ref.get("route"), str) or ref["route"] not in {"inline", "compute_host"}
+            or (ref["route"] == "inline" and ref.get("host_boot_id") is not None)
+            or (ref["route"] == "compute_host" and
+                (not isinstance(ref.get("host_boot_id"), str) or not ref["host_boot_id"]))):
+        return _err(rid, 4006, "session_id and full accepted_turn identity required")
+    try:
+        from hermes_cli.profiles import get_profile_dir, normalize_profile_name, validate_profile_name
+
+        profile = params.get("profile")
+        if profile is not None and (not isinstance(profile, str) or not profile.strip()):
+            raise ValueError("invalid profile")
+        if profile is not None:
+            profile = normalize_profile_name(profile)
+            validate_profile_name(profile)
+        home = (get_profile_dir(profile) if profile is not None else Path(_hermes_home)).resolve()
+        if not home.is_dir():
+            raise ValueError("unknown profile")
+    except Exception:
+        return _err(rid, 4030, "turn poll profile is unavailable")
+    with _sessions_lock:
+        session = _sessions.get(sid)
+        if session is None or session.get("_closing") or session.get("_finalized"):
+            return _err(rid, 4001, "accepted turn runtime is unavailable")
+        if Path(session.get("profile_home") or _hermes_home).resolve() != home:
+            return _err(rid, 4030, "turn poll session profile mismatch")
+        transport = session.get("transport")
+    with session["history_lock"]:
+        window = session.get("_turn_outcomes")
+        projection = _turn_outcomes_snapshot(sid, session)
+        matches = [turn for turn in projection["turns"] if turn["accepted_turn"] == ref]
+        latest = bool(projection["turns"] and projection["turns"][-1]["accepted_turn"] == ref)
+        waiting = len(matches) == 1 and latest and matches[0]["state"] in {"running", "waiting"}
+        key = str(session.get("session_key") or "")
+        expected_host = (getattr(window, "supervisor", None), ref["host_boot_id"])
+    # Pending prompts remain owned by their existing registries. In particular,
+    # a historical terminal must not expose a newer admission's approval card.
+    approval = _pending_approval_request_payload(key) if waiting else None
+    try:
+        clarify = _pending_clarify_request_payload(sid, expected_session=session,
+            expected_host=expected_host) if waiting else None
+    except RuntimeError:
+        return _err(rid, 4001, "accepted turn owner changed during observation")
+    with session["history_lock"]:
+        if (_sessions.get(sid) is not session or session.get("_closing") or session.get("_finalized")
+                or session.get("transport") is not transport
+                or Path(session.get("profile_home") or _hermes_home).resolve() != home
+                or session.get("_turn_outcomes") is not window):
+            return _err(rid, 4001, "accepted turn owner changed during observation")
+        projection = _turn_outcomes_snapshot(sid, session)
+        matches = [turn for turn in projection["turns"] if turn["accepted_turn"] == ref]
+        if len(matches) != 1:
+            return _ok(rid, {"session_id": sid, "running": False,
+                             "turn_outcomes": _unavailable_turn_outcomes()})
+        latest = projection["turns"][-1]["accepted_turn"] == ref
+        turn = matches[0]
+        running = turn["state"] in {"running", "waiting"}
+        payload = {"session_id": sid, "running": running,
+                   "turn_outcomes": {**projection, "turns": matches}}
+        if latest and (inflight := _inflight_snapshot(session)):
+            payload["inflight"] = inflight
+        if running and latest and waiting:
+            if session.get("session_key") != key:
+                return _err(rid, 5032, "turn prompt owner changed during observation")
+            if approval:
+                payload["pending_approval"] = approval
+            if clarify:
+                payload["pending_clarify"] = clarify
+                turn["state"] = "waiting"
+            elif session.get("_host_clarify_snapshot_unavailable"):
+                payload["pending_clarify_unavailable"] = True
+        return _ok(rid, payload)
+
+
 @method("session.resume")
 def _(rid, params: dict) -> dict:
     target = params.get("session_id", "")

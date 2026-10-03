@@ -8,7 +8,7 @@ from unittest.mock import Mock
 
 import pytest
 from tui_gateway import server
-from tui_gateway.host_supervisor import HostSupervisor, HostBootMismatch, HostSendNotSent
+from tui_gateway.host_supervisor import HostSupervisor, HostBootMismatch, HostSendNotSent, HostSendUncertain
 from tests.tui_gateway.terminal_settlement_helpers import wait_for_terminal_projection
 
 
@@ -81,6 +81,7 @@ def test_observer_registration_rejects_a_changed_boot(tmp_path):
 
 def test_lookup_rejects_an_ack_from_a_retired_boot(tmp_path, monkeypatch):
     host = HostSupervisor(registry_path=tmp_path/'host.json', autostart=False)
+    monkeypatch.setattr(host, 'is_ready', lambda: True)
     host._hello = {'boot_id': 'current'}
 
     def answer(frame, *, expected_boot_id, deadline):
@@ -92,13 +93,14 @@ def test_lookup_rejects_an_ack_from_a_retired_boot(tmp_path, monkeypatch):
         })
 
     monkeypatch.setattr(host, '_send_owner_control_bounded', answer)
-    with pytest.raises(HostBootMismatch):
+    with pytest.raises(HostSendUncertain):
         host.lookup_session_key('stored')
     assert not host._session_observers
 
 
 def test_lookup_carries_the_observed_boot_to_adoption(tmp_path, monkeypatch):
     host = HostSupervisor(registry_path=tmp_path/'host.json', autostart=False)
+    monkeypatch.setattr(host, 'is_ready', lambda: True)
     host._hello = {'boot_id': 'current'}
 
     def answer(frame, *, expected_boot_id, deadline):
@@ -119,6 +121,7 @@ def test_admission_boot_change_is_refused_before_pipe_bytes(tmp_path, monkeypatc
     read_fd, write_fd = os.pipe()
     stream = os.fdopen(write_fd, 'w')
     host._proc = types.SimpleNamespace(pid=0, stdin=stream, poll=lambda: None)
+    host._ready_proc = host._proc
     host._hello = {'boot_id':'before'}
     send = host._send_frame
     def changed(frame, **kwargs):

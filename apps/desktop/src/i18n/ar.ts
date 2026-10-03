@@ -2567,6 +2567,7 @@ export const ar = defineLocale({
       notReady: 'غير جاهز',
       gatewayDisconnected: 'البوابة غير متصلة',
       sendFailed: 'فشل الإرسال',
+      responseAccepted: 'تم استلام الإجابة',
       loadingQuestion: 'جار تحميل السؤال...',
       other: 'غير ذلك',
       placeholder: 'اكتب إجابتك...',

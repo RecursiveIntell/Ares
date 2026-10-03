@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
+import { fixtureAdmission, fixtureProjection } from './group-turn-wire-fixture.mjs'
 import vm from 'node:vm'
 
 // #93602: sub-profile bot silent in a group room. A member turn is a
@@ -68,7 +69,7 @@ function load({ failFirstSubmitWith = null, failEverySubmitWith = null, reply = 
       titleToStored.set(`${params.profile}::${params.title}`, stored)
       return { session_id: runtime, stored_session_id: stored, message_count: 0, messages: [] }
     }
-    if (method === 'session.resume') {
+    if (method === 'session.resume' || method === 'session.turn.poll') {
       const session = resolveSession(params.profile, params.session_id)
       if (!session) {
         const err = new Error(`session not found: ${params.session_id}`)
@@ -77,15 +78,18 @@ function load({ failFirstSubmitWith = null, failEverySubmitWith = null, reply = 
       }
       // Every resume mints a FRESH runtime id — the stored id is the durable
       // identity, mirroring the gateway's resume contract.
-      sessionSequence += 1
-      const runtime = `rt-${sessionSequence}`
-      session.runtime = runtime
-      runtimeToStored.set(runtime, session.stored)
+      if (!session.accepted_turn) {
+        sessionSequence += 1
+        session.runtime = `rt-${sessionSequence}`
+        runtimeToStored.set(session.runtime, session.stored)
+      }
+      const runtime = session.runtime
       return {
         session_id: runtime,
         session_key: session.stored,
         message_count: session.messages.length,
         messages: params.omit_messages ? [] : [...session.messages],
+        turn_outcomes: fixtureProjection(session),
         inflight: false,
         running: false
       }
@@ -121,7 +125,10 @@ function load({ failFirstSubmitWith = null, failEverySubmitWith = null, reply = 
       } else {
         session.messages.push({ role: 'assistant', content: reply })
       }
-      return {}
+      session.finalized = replyMessages
+        ? replyMessages.filter(message => message.role === 'assistant').map(message => ({ text: message.content, status: 'complete' }))
+        : [{ text: reply, status: 'complete' }]
+      return { accepted_turn: fixtureAdmission(session, `owned-${session.runtime}-${submits}`) }
     }
     return {}
   }

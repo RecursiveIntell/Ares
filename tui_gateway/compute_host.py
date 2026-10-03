@@ -380,6 +380,20 @@ class ComputeHost:
             if session is not None:
                 with session["history_lock"]:
                     if session.get("_host_turn_request_id") == request_id:
+                        window = session.get("_turn_outcomes")
+                        if isinstance(window, server.TurnOutcomeWindow) and window.owns(session, sid):
+                            try:
+                                window.finish(request_id, interrupted=bool(frame.get("interrupted")),
+                                              error=frame.get("type") == "turn.error")
+                                outcome = window.find(request_id)
+                                if outcome is not None:
+                                    import copy
+                                    frame = {**frame, "turn_outcome": copy.deepcopy(outcome)}
+                            except Exception:
+                                # Losing an advisory projection cannot retain
+                                # execution ownership or suppress its terminal.
+                                if (outcome := window.find(request_id)) is not None:
+                                    window.invalidate(outcome, "projection_failed")
                         session.pop("_host_turn_request_id", None)
             if self._active_request_ids.get(sid) == request_id:
                 self._active_request_ids.pop(sid, None)
@@ -587,6 +601,7 @@ class ComputeHost:
                 else:
                     session["running"] = True
                     session["_host_turn_request_id"] = request_id
+                    server._begin_turn_outcome(session, sid, request_id, "compute_host", self._boot_id)
                     session["_turn_cancel_requested"] = False
                     session["last_active"] = time.time()
                     server._start_inflight_turn(session, frame.get("text") if "text" in frame else frame.get("prompt"))
@@ -842,6 +857,38 @@ class ComputeHost:
                     return
             if route == "idle-gated" and session.get("running"):
                 self.emit({"type": "control.error", "sid": sid, "request_id": request_id, "message": "session busy"})
+                return
+            if route_name in {"clarify.snapshot", "clarify.respond"}:
+                from tui_gateway.transport import bind_transport, reset_transport
+                params = frame.get("params")
+                if not isinstance(params, dict) or params.get("session_id") != sid:
+                    self.emit({"type": "control.error", "sid": sid, "request_id": request_id,
+                               "message": "clarification session mismatch"})
+                    return
+                with server._sessions_lock:
+                    generation = session.setdefault("_clarify_host_generation", uuid.uuid4().hex)
+                    expected = frame.get("clarify_generation")
+                    if server._sessions.get(sid) is not session or expected is not None and expected != generation:
+                        self.emit({"type": "control.error", "sid": sid, "request_id": request_id,
+                                   "message": "clarification generation changed"})
+                        return
+                    if route_name == "clarify.snapshot":
+                        response = server._ok(request_id, {"generation": generation,
+                            "pending_clarify": server._pending_clarify_request_payload(sid)})
+                    else:
+                        if expected is None:
+                            self.emit({"type": "control.error", "sid": sid, "request_id": request_id,
+                                       "message": "clarification generation required"})
+                            return
+                        transport_token = bind_transport(self._transport)
+                        generation_token = server._host_clarify_expected_generation.set(generation)
+                        try:
+                            response = server._respond(request_id, params, "answer", allow_expired=True, idempotent=True)
+                        finally:
+                            server._host_clarify_expected_generation.reset(generation_token)
+                            reset_transport(transport_token)
+                self.emit({"type": "control.ack", "sid": sid, "request_id": request_id,
+                           "route_name": route_name, "response": response})
                 return
             if route_name in {"session.run_checkpoint.claim", "session.run_checkpoint.refresh", "session.run_checkpoint.release", "session.run_checkpoint.basis"}:
                 from tui_gateway.transport import bind_transport, reset_transport
