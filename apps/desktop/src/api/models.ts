@@ -10,9 +10,10 @@ import type {
 
 import { capabilityScoped, hermesApi, type ProfileScope, profileScoped, STARTUP_REQUEST_TIMEOUT_MS } from './client'
 
-export function getGlobalModelInfo(profile?: null | string): Promise<ModelInfoResponse> {
-  return hermesApi<ModelInfoResponse>({
-    ...profileScoped(profile),
+export function getGlobalModelInfo(profile?: ProfileScope): Promise<ModelInfoResponse> {
+  return window.hermesDesktop.api<ModelInfoResponse>({
+    ...capabilityScoped(profile),
+    ...(profile && typeof profile === 'object' ? { connectionId: profile.connectionId || 'local' } : {}),
     path: '/api/model/info',
     timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
   })

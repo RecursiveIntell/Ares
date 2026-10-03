@@ -11,6 +11,7 @@ import {
   fetchStoredTranscriptAcrossBackends,
   getAllSessionMessages,
   getApiRequestConnection,
+  getGlobalModelInfo,
   getLatestSessionMessages,
   setSessionArchived
 } from '@/hermes'
@@ -79,7 +80,6 @@ import {
   setActiveSessionStoredIdRotation,
   setAwaitingResponse,
   setBusy,
-  setComposerModelSelectionOwner,
   setCurrentBranch,
   setCurrentCwd,
   setCurrentCwdTransient,
@@ -249,16 +249,41 @@ async function desktopSessionCreateParams(
   // session with a different selection than the one the user submitted.
   const profile = capturedRoute?.profile || $newChatProfile.get() || normalizeProfileKey($activeGatewayProfile.get())
   const owner = capturedRoute || { connectionId: getApiRequestConnection(), profile }
-  setComposerModelSelectionOwner(owner)
-  const modelSelection = getComposerModelSelection(owner)
+  const effort = $currentReasoningEffort.get().trim()
+  const fast = $currentFastMode.get()
+  let modelSelection: { model: string; provider: string } | null = getComposerModelSelection(owner)
 
   if (!modelSelection) {
-    throw new ComposerModelSelectionLoadingError(translateNow('settings.model.loading'))
+    // One authoritative read per admission attempt recovers a failed initial
+    // seed and supports owners that have never occupied the foreground draft.
+    // Keep this result local; a background tile must not claim the foreground
+    // receipt slot or borrow the ambient connection's default.
+    try {
+      const info = await getGlobalModelInfo({
+        connectionId: owner.connectionId,
+        profile: capturedRoute?.targetProfile || profile
+      })
+
+      if (
+        typeof info?.model !== 'string' ||
+        !info.model.trim() ||
+        typeof info.provider !== 'string' ||
+        getComposerModelSelection(owner)?.source === 'manual'
+      ) {
+        throw new Error('Model selection changed or configuration is unavailable')
+      }
+
+      modelSelection = { model: info.model.trim(), provider: info.provider.trim() }
+    } catch {
+      // A new Send retries; a deliberate pin made during the read governs that
+      // next admission rather than silently repointing this in-flight one.
+      throw new ComposerModelSelectionLoadingError(translateNow('settings.model.loading'))
+    }
   }
 
   const selection = {
-    effort: $currentReasoningEffort.get().trim(),
-    fast: $currentFastMode.get(),
+    effort,
+    fast,
     model: modelSelection.model,
     provider: modelSelection.provider
   }
