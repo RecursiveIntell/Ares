@@ -139,3 +139,34 @@ def test_explicit_cli_missing_target_has_no_generic_fallback(routes):
                             agent=None, _normalize_model_for_provider=lambda _: False, _fallback_model=[])
     assert not CLIAgentSetupMixin._ensure_runtime_credentials(shell)
     assert (shell.provider, shell.base_url, shell.api_key) == ('endpoint-a', 'http://a.invalid/v1', 'synthetic-key-a')
+
+
+@pytest.mark.parametrize('native_setting', ['api_mode', 'openai_runtime', 'context_rebase'])
+def test_explicit_named_route_overrides_profile_native_defaults(routes, native_setting):
+    routes.config['model']['provider'] = 'openai'
+    routes.config['model']['api_mode' if native_setting == 'api_mode' else 'openai_runtime'] = 'codex_app_server'
+    if native_setting == 'context_rebase':
+        routes.config['compression'] = {'context_rebase_enabled': True}
+    routes.write()
+    before = (routes.home / 'config.yaml').read_bytes()
+    result = routes.switch(is_global=False)
+    assert result.success, result.error_message
+    assert (result.target_provider, result.base_url, result.api_key, result.api_mode) == (
+        'endpoint-b', 'http://b.invalid/v1', 'synthetic-key-b', 'chat_completions')
+    assert (routes.home / 'config.yaml').read_bytes() == before
+
+
+def test_named_route_resolution_failure_still_fails_closed(routes, monkeypatch):
+    from hermes_cli import runtime_provider
+    from hermes_cli.auth import AuthError
+
+    routes.config['model']['api_mode'] = 'codex_app_server'
+    routes.write()
+
+    def fail(**kwargs):
+        raise AuthError('synthetic target credential failure')
+
+    monkeypatch.setattr(runtime_provider, '_resolve_named_custom_runtime', fail)
+    result = routes.switch(is_global=False)
+    assert not result.success
+    assert 'synthetic target credential failure' in result.error_message
