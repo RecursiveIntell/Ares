@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict'
-import test from 'node:test'
 import { importGroupTurnPlugin } from './group-turn-test-loader.mjs'
 
 const deferred = () => { let resolve, reject; const promise = new Promise((a, b) => { resolve = a; reject = b }); return { promise, resolve, reject } }

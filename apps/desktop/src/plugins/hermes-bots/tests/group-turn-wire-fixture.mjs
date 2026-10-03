@@ -11,3 +11,10 @@ export function fixtureProjection(session, { state = 'complete', finalized = ses
     turns: session.accepted_turn ? [{ accepted_turn: session.accepted_turn, state,
       finalized, ...(reason ? { reason } : {}) }] : [] }
 }
+
+export function assertFixturePoll(session, params) {
+  assert.equal(params.session_id, session.runtime, 'turn polling stays in the accepted runtime namespace')
+  assert.deepEqual({ ...params.accepted_turn }, { ...session.accepted_turn },
+    'turn polling observes the exact backend admission')
+}
+import assert from 'node:assert/strict'
