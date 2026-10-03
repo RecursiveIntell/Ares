@@ -296,29 +296,9 @@ model:
 
 在 [novita.ai/settings/key-management](https://novita.ai/settings/key-management) 获取 API key。基础 URL 可通过 `NOVITA_BASE_URL` 覆盖。
 
-### Ollama Cloud — 托管 Ollama 模型，OAuth + API Key
+### Ollama Cloud
 
-[Ollama Cloud](https://ollama.com/cloud) 托管与本地 Ollama 相同的开源模型目录，无需 GPU。在 `hermes model` 中选择 **Ollama Cloud**，粘贴来自 [ollama.com/settings/keys](https://ollama.com/settings/keys) 的 API key，Hermes 会自动发现可用模型。
-
-```bash
-hermes model
-# → 选择"Ollama Cloud"
-# → 粘贴你的 OLLAMA_API_KEY
-# → 从已发现的模型中选择（gpt-oss:120b、glm-4.6:cloud、qwen3-coder:480b-cloud 等）
-```
-
-或直接编辑 `config.yaml`：
-```yaml
-model:
-  provider: "ollama-cloud"
-  default: "gpt-oss:120b"
-```
-
-模型目录从 `ollama.com/v1/models` 动态获取，缓存一小时。`model:tag` 格式（如 `qwen3-coder:480b-cloud`）在规范化过程中保留——不要使用连字符。
-
-:::tip Ollama Cloud 与本地 Ollama
-两者使用相同的 OpenAI 兼容 API。Cloud 是一等提供商（`--provider ollama-cloud`，`OLLAMA_API_KEY`）；本地 Ollama 通过自定义端点流程访问（基础 URL `http://localhost:11434/v1`，无需 key）。对于无法在本地运行的大模型使用 Cloud；对于隐私保护或离线工作使用本地。
-:::
+Ollama Cloud 可作为显式的 `ollama-cloud` 提供商使用，并通过 Ollama API key 认证。请参阅 [Ollama Cloud 设置指南](ollama-cloud.md)，了解安全保存 key、选择模型 ID，以及它与本地 Ollama 的区别。
 
 ### AWS Bedrock
 

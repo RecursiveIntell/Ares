@@ -362,29 +362,9 @@ model:
 
 Get your API key at [novita.ai/settings/key-management](https://novita.ai/settings/key-management). The base URL can be overridden with `NOVITA_BASE_URL`.
 
-### Ollama Cloud — Managed Ollama Models, OAuth + API Key
+### Ollama Cloud
 
-[Ollama Cloud](https://ollama.com/cloud) hosts the same open-weight catalog as local Ollama but without the GPU requirement. Pick it in `hermes model` as **Ollama Cloud**, paste your API key from [ollama.com/settings/keys](https://ollama.com/settings/keys), and Hermes auto-discovers the available models.
-
-```bash
-hermes model
-# → pick "Ollama Cloud"
-# → paste your OLLAMA_API_KEY
-# → select from discovered models (gpt-oss:120b, glm-4.6:cloud, qwen3-coder:480b-cloud, etc.)
-```
-
-Or `config.yaml` directly:
-```yaml
-model:
-  provider: "ollama-cloud"
-  default: "gpt-oss:120b"
-```
-
-The model catalog is fetched dynamically from `ollama.com/v1/models` and cached for one hour. `model:tag` notation (e.g. `qwen3-coder:480b-cloud`) is preserved through normalization — don't use dashes.
-
-:::tip Ollama Cloud vs local Ollama
-Both speak the same OpenAI-compatible API. Cloud is a first-class provider (`--provider ollama-cloud`, `OLLAMA_API_KEY`); local Ollama is reached via the Custom Endpoint flow (base URL `http://localhost:11434/v1`, no key). Use cloud for large models you can't run locally; use local for privacy or offline work.
-:::
+Ollama Cloud is available as the explicit `ollama-cloud` provider and uses an Ollama API key. See the [Ollama Cloud setup guide](ollama-cloud.md) for secure key setup, model ID selection, and how this route differs from local Ollama.
 
 ### AWS Bedrock
 

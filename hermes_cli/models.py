@@ -6296,6 +6296,23 @@ def _strip_ollama_cloud_suffix(model_id: str) -> str:
     return model_id
 
 
+def _scoped_ollama_env_value(name: str) -> str:
+    """Read an Ollama setting through the active profile secret scope.
+
+    In multiplex mode, an absent scope or value must not fall through to the
+    process environment: that environment may belong to another profile.
+    ``get_secret`` supplies the canonical fail-closed behavior; treating its
+    unscoped signal as an unavailable catalog credential keeps discovery
+    offline instead of probing Ollama with an ambient key.
+    """
+    try:
+        from agent.secret_scope import get_secret
+
+        return str(get_secret(name, "") or "").strip()
+    except Exception:
+        return ""
+
+
 def _ollama_cloud_cache_path() -> Path:
     """Return the path for the Ollama Cloud model cache."""
     from hermes_constants import get_hermes_home
@@ -6364,9 +6381,11 @@ def fetch_ollama_cloud_models(
 
     # 2. Live API probe
     if not api_key:
-        api_key = os.getenv("OLLAMA_API_KEY", "")
+        api_key = _scoped_ollama_env_value("OLLAMA_API_KEY")
     if not base_url:
-        base_url = os.getenv("OLLAMA_BASE_URL", "") or "https://ollama.com/v1"
+        base_url = (
+            _scoped_ollama_env_value("OLLAMA_BASE_URL") or "https://ollama.com/v1"
+        )
 
     live_models: list[str] = []
     if api_key:
