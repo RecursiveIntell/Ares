@@ -130,6 +130,7 @@ function load({ failFirstSubmitWith = null, failEverySubmitWith = null, reply = 
         : [{ text: reply, status: 'complete' }]
       return { accepted_turn: fixtureAdmission(session, `owned-${session.runtime}-${submits}`) }
     }
+    if (method === 'session.interrupt') return { status: 'interrupted' }
     return {}
   }
 
@@ -183,7 +184,7 @@ function load({ failFirstSubmitWith = null, failEverySubmitWith = null, reply = 
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__lease = { runGroupChatMemberTurn, submitGroupTurnPrompt, isSessionGoneError, $groupChats };\n'
+      '\nglobalThis.__lease = { runGroupChatMemberTurn, submitGroupTurnPrompt, isSessionGoneError, $groupChats, stopGroupThread };\n'
     )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   context.plugin.register({
@@ -266,12 +267,14 @@ test('the per-turn lease is released after the turn — refcount returns to zero
   assert.equal(gc.stats().disposals, 1)
 })
 
-test('the per-turn lease is released even when the turn fails', async () => {
+test('uncertain submit failure retains the per-turn lease until captured Stop', async () => {
   const fatal = new Error('backend exploded')
   const gc = load({ failEverySubmitWith: fatal })
 
   await assert.rejects(() => gc.runGroupChatMemberTurn('Room', ROUTED_MEMBER, 'hi', 't1', []))
 
+  assert.equal(gc.stats().refcount, 1, 'unknown acceptance is not vacant capacity')
+  await gc.stopGroupThread('Room', 't1', [ROUTED_MEMBER])
   assert.equal(gc.stats().refcount, 0)
 })
 

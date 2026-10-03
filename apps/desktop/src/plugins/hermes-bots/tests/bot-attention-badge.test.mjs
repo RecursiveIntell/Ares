@@ -136,9 +136,9 @@ test('hooks: relay delivery and group member turns note/clear attention', () => 
   // reply clears it. Typed gateway reasons take precedence over text parsing.
   assert.match(
     pluginSource,
-    /noteBotAttention\(groupMemberKey\(member\), reason \|\| error\?\.message \|\| error\)/
+    /noteBotAttention\(job.memberKey, reason \|\| error\?\.message \|\| error\)/
   )
-  assert.match(pluginSource, /clearBotAttention\(groupMemberKey\(member\)\)/)
+  assert.match(pluginSource, /clearBotAttention\(job.memberKey\)/)
 })
 
 test('render: roster row shows an amber warning glyph with a per-class hint', () => {

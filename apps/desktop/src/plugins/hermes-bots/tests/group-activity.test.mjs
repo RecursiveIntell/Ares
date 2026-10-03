@@ -33,7 +33,8 @@ function load(turnScript = () => '(pass)') {
   }
   const context = {
     atom,
-    setTimeout: fn => {
+    setTimeout: (fn, delay) => {
+      if (delay === 1200000) return 0 // virtual settlement deadline, not an immediate expiry
       fn()
       return 0
     },
@@ -222,13 +223,14 @@ test('a newer send interrupts the previous run and records cancelled in the CURR
     await new Promise(resolve => setImmediate(resolve))
   }
   gc.sendToGroupChat('Busy', member, 'second ask, supersede', gc.$groupChats.get().Busy.log[0].thread)
+  assert.equal(gc.calls.length, 1, 'old accepted owner holds the member until settlement')
+  gates[1].resolve('late from the old run')
   for (let i = 0; i < 50 && gc.calls.length < 2; i++) {
     await new Promise(resolve => setImmediate(resolve))
   }
 
   gates[2].resolve('from the new run')
   await drain(gc, 'Busy')
-  gates[1].resolve('late from the old run')
   await new Promise(resolve => setImmediate(resolve))
   await new Promise(resolve => setImmediate(resolve))
 

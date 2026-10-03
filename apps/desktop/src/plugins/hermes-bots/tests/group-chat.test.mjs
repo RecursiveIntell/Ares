@@ -1687,7 +1687,7 @@ test('source contract: long visible turns extend the deadline up to a hard cap',
 
 test('source contract: the working line names the member on turn', () => {
   assert.match(pluginSource, /is thinking…/)
-  assert.match(pluginSource, /r\.turn = member\.name/)
+  assert.match(pluginSource, /room\.turn = turns\.find/)
   assert.match(pluginSource, /r\.turn = null/)
 })
 

@@ -48,7 +48,10 @@ registerHooks({
           harvestStrandedGroupReply, stopGroupChatServerSync, currentGroupActivity, groupActivityLabel,
           $groupChats, $groupClarify, $botAttention, appendGroupChatEntry, syncGroupClarify, answerGroupClarify,
           groupChatSyncSnapshot, groupChatSyncEntryKey, stopGroupThread,
-          mergeRemoteGroupChatSnapshotIntoRooms, durableGroupChatRooms, sendToGroupChat };\n
+          mergeRemoteGroupChatSnapshotIntoRooms, durableGroupChatRooms, sendToGroupChat,
+          groupRoomCoordinators, groupRuntimeSessionOwners, groupMemberKey, updateGroupChat,
+          groupBlockedMembers, GroupBlockedNotice, CreateGroupChatDialog, createFreshGroupChat,
+          groupComposerDraftKey, groupComposerDraftSnapshot, updateGroupComposerDraft };\n
           export const groupRecoveryTestAPI = {\n            createFreshGroupChat: typeof createFreshGroupChat === 'function' ? createFreshGroupChat : undefined,\n            GroupBlockedNotice: typeof GroupBlockedNotice === 'function' ? GroupBlockedNotice : undefined,\n            groupBlockedMembers: typeof groupBlockedMembers === 'function' ? groupBlockedMembers : undefined,\n            updateGroupComposerDraft, GroupChatWorkspace, CreateGroupChatDialog, groupComposerDraftSnapshot, groupComposerDraftKey };\n          export function bindGroupTurnTestStorage(storage) { pluginCtx = { storage }; }\n`
       }
     }
