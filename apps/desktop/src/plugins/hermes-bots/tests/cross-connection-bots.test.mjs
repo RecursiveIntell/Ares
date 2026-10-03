@@ -2,6 +2,8 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
 import vm from 'node:vm'
+import { importGroupTurnPlugin } from './group-turn-test-loader.mjs'
+import { assertFixturePoll, fixtureAdmission, fixtureProjection } from './group-turn-wire-fixture.mjs'
 
 // Cross-connection Bot Mode: the New Agent "Create on" picker targets another
 // registered connection's backend, and group chats seat members from other
@@ -210,11 +212,63 @@ test('source contract: New Agent has a Create on picker that routes creation to 
   assert.match(pluginSource, /connections\.length > 1/)
 })
 
-test('source contract: group chat turns route through requestForBot on the member source', () => {
-  assert.match(pluginSource, /await requestForBot\(member, 'prompt\.submit'/)
-  assert.match(pluginSource, /await requestForBot\(member, 'session\.create'/)
-  // Room records persist remote member descriptors.
-  assert.match(pluginSource, /members: Array\.isArray\(room\.members\) \? room\.members : \[\]/)
+test('group chat admission and polling keep the member source after the active connection changes', async () => {
+  const member = {
+    name: 'worker', sourceScoped: true,
+    route: { connectionId: 'remote-a', mode: 'remote', profile: 'worker', targetProfile: 'backend-worker' }
+  }
+  const calls = []
+  let connectionId = 'local'
+  let session
+  const atom = initial => {
+    let value = initial
+    return { get: () => value, set: next => { value = next } }
+  }
+  const gc = await importGroupTurnPlugin({
+    atom, Date,
+    setTimeout: (fn, delay) => { if (delay === 2000) fn(); return 0 },
+    clearTimeout: () => undefined,
+    host: {
+      request: async () => { throw new Error('member turns cannot use the active gateway') },
+      requestProfile: async (route, method, params) => {
+        calls.push({ route: { ...route }, method, params })
+        if (method === 'session.resume' && !session) {
+          throw Object.assign(new Error('session not found'), { code: 4007 })
+        }
+        if (method === 'session.create') {
+          assert.equal(params.profile, 'backend-worker')
+          session = { runtime: 'runtime-worker', stored: 'stored-worker', finalized: [] }
+          return { session_id: session.runtime, stored_session_id: session.stored }
+        }
+        if (method === 'prompt.submit') {
+          assert.equal(params.session_id, session.runtime)
+          connectionId = 'remote-b'
+          session.finalized = [{ text: 'member answer', status: 'complete' }]
+          return { accepted_turn: fixtureAdmission(session, 'owned-worker') }
+        }
+        if (method === 'session.turn.poll') {
+          assertFixturePoll(session, params)
+          assert.equal(params.profile, 'backend-worker')
+          return { session_id: session.runtime, running: false, turn_outcomes: fixtureProjection(session) }
+        }
+        throw new Error(`unexpected RPC: ${method}`)
+      },
+      retainProfile: async () => () => undefined,
+      state: { profile: atom('default'), gateway: atom(null), connectionId: { get: () => connectionId } },
+      notify: () => undefined, notifyError: () => undefined
+    }
+  })
+  gc.$groupChats.set({ Room: { log: [], members: [member], sessions: {}, sessionOwners: {},
+    stranded: {}, watermarks: {}, holds: {}, epoch: 1 } })
+
+  assert.equal(await gc.runGroupChatMemberTurn('Room', member, 'question', 'thread-1'), 'member answer')
+  assert.equal(connectionId, 'remote-b')
+  assert.equal(calls.filter(call => call.method === 'prompt.submit').length, 1)
+  assert.equal(calls.filter(call => call.method === 'session.turn.poll').length, 1)
+  assert.ok(calls.length >= 3)
+  assert.ok(calls.every(call => call.route.connectionId === 'remote-a' &&
+    call.route.profile === 'worker' && call.route.targetProfile === 'backend-worker'))
+  assert.deepEqual(gc.durableGroupChatRooms().Room.members, [member])
 })
 
 test('regression: host.connections() result is normalized for BOTH SDK shapes before the picker gate', () => {
