@@ -16,7 +16,7 @@ const history = (length, text = 'old copied answer') => Array.from({ length }, (
 
 async function harness(scripts = {}, { baseline = 0, onPoll, onSubmit, ack, connectionId = '',
   outcomeRoute = 'compute_host', members = [ALPHA, BETA], submitError, queuedDrives = false, runtimeId,
-  clarifyResult = { status: 'ok' } } = {}) {
+  clarifyResult = { status: 'ok' }, capability = { version: 1, scope: 'process_local', availability: 'unavailable', turns: [] }, preflightError, lazyModern = false, probeError, onProbe } = {}) {
   let now = 100000
   let activeConnection = connectionId
   let gc
@@ -59,11 +59,21 @@ async function harness(scripts = {}, { baseline = 0, onPoll, onSubmit, ack, conn
     if (method === 'clarify.respond') return clarifyResult
     if (method.endsWith('.attach') || method.endsWith('.attach_bytes')) return {}
     if (method !== 'session.resume' && method !== 'session.turn.poll') throw new Error(`unexpected RPC: ${method}`)
+    if (method === 'session.turn.poll' && !params.accepted_turn) {
+      onProbe?.(session, gc)
+      if (probeError) throw probeError
+      throw Object.assign(new Error(lazyModern ? 'session_id and full accepted_turn identity required' : 'Method not found'),
+        { code: lazyModern ? 4006 : -32601 })
+    }
     if (method === 'session.turn.poll') {
       assert.equal(params.session_id, session.runtime, 'poll accepts runtime namespace only')
       assert.deepEqual(params.accepted_turn, session.ref)
     }
-    let snapshot = {}
+    if (method === 'session.resume' && preflightError && !session.ref) {
+      const error = typeof preflightError === 'function' ? preflightError() : preflightError
+      if (error) throw error
+    }
+    let snapshot = method === 'session.resume' && capability ? { turn_outcomes: capability } : {}
     if (method === 'session.turn.poll') {
       session.polls++
       session.totalPolls++
@@ -767,3 +777,88 @@ for (const state of ['unavailable', 'waiting']) {
     })
   }
 }
+
+for (const [label, capability] of [
+  ['older backend', null],
+  ['future protocol', { version: 2, scope: 'process_local', availability: 'available', turns: [] }],
+  ['wrong projection scope', { version: 1, scope: 'durable', availability: 'available', turns: [] }]
+]) {
+  test(`${label} rejects before attachments and admission without stranding the member`, async t => {
+    const h = await harness({}, { capability, members: [ALPHA],
+      ack: label === 'older backend' ? () => ({}) : undefined })
+    const error = await h.gc.runGroupChatMemberTurn('Room', ALPHA, 'prompt', 'thread-1',
+      [{ kind: 'pdf', data: 'synthetic', name: 'test.pdf' },
+        { kind: 'file', data: 'synthetic', name: 'test.txt' },
+        { kind: 'image', data: 'synthetic', name: 'test.png' }]).then(() => null, error => error)
+    t.diagnostic(JSON.stringify({ backend: label, submits: h.rpc('prompt.submit').length,
+      uploads: h.calls.filter(c => /attach/.test(c.method)).length, stranded: Boolean(room(h).stranded.alpha) }))
+    assert.match(error?.message || '', /update.*backend|backend.*update/i)
+    assert.equal(h.rpc('prompt.submit').length, 0)
+    assert.equal(h.calls.filter(c => /attach/.test(c.method)).length, 0)
+    assert.equal(room(h).stranded.alpha, undefined)
+    await assert.rejects(run(h), /update.*backend|backend.*update/i)
+    assert.equal(h.rpc('prompt.submit').length, 0)
+    assert.equal(room(h).stranded.alpha, undefined)
+  })
+}
+
+test('pre-admission observation failure is retriable and never interpreted as unsupported admission', async () => {
+  let offline = true
+  const h = await harness({}, { members: [ALPHA], preflightError: () => offline ? new Error('network offline') : null })
+  await assert.rejects(h.gc.runGroupChatMemberTurn('Room', ALPHA, 'prompt', 'thread-1',
+    [{ kind: 'pdf', data: 'synthetic', name: 'test.pdf' },
+      { kind: 'file', data: 'synthetic', name: 'test.txt' },
+      { kind: 'image', data: 'synthetic', name: 'test.png' }]), /network offline/)
+  assert.equal(h.calls.filter(c => /attach/.test(c.method)).length, 0)
+  assert.equal(h.rpc('prompt.submit').length, 0)
+  assert.equal(room(h).stranded.alpha, undefined)
+  offline = false
+  assert.equal(await run(h), '(pass)')
+  assert.equal(h.rpc('prompt.submit').length, 1)
+  assert.equal(room(h).stranded.alpha, undefined)
+})
+
+test('modern unavailable projection before first admission still permits exact owned output', async () => {
+  const h = await harness({ alpha: [s => ({ turn_outcomes: wire(s.ref, 'complete', [final('owned')]) })] },
+    { members: [ALPHA] })
+  assert.equal(await run(h), 'owned')
+  assert.equal(h.rpc('prompt.submit').length, 1)
+  assert.ok(h.rpc('session.resume').some(c => c.params.session_id === 'stored-alpha' && c.params.omit_messages))
+})
+
+test('current lazy resume without projection probes method availability, then collects only its real admission', async () => {
+  const h = await harness({ alpha: [s => ({ turn_outcomes: wire(s.ref, 'complete', [final('lazy owned reply')]) })] },
+    { capability: null, lazyModern: true, members: [ALPHA] })
+  assert.equal(await run(h), 'lazy owned reply')
+  const probe = h.rpc('session.turn.poll').find(c => !c.params.accepted_turn)
+  assert.deepEqual(probe.params, { session_id: 'runtime-alpha', profile: 'alpha' })
+  assert.ok(probe.at <= h.rpc('prompt.submit')[0].at)
+  assert.equal(h.rpc('prompt.submit').length, 1)
+  assert.equal(h.rpc('session.turn.poll').filter(c => c.params.accepted_turn).length, 1)
+  assert.equal(room(h).stranded.alpha, undefined)
+})
+
+for (const [label, probeError] of [
+  ['transient poll probe failure', new Error('probe network offline')],
+  ['unrecognized invalid-params error', Object.assign(new Error('other invalid parameters'), { code: 4006 })]
+]) {
+  test(`${label} rejects before admission without treating an arbitrary error as protocol proof`, async () => {
+    const h = await harness({}, { capability: null, lazyModern: true, probeError, members: [ALPHA] })
+    await assert.rejects(run(h), error => error === probeError)
+    assert.equal(h.rpc('prompt.submit').length, 0)
+    assert.equal(room(h).stranded.alpha, undefined)
+  })
+}
+
+test('lazy availability probe keeps the captured source/profile when active connection changes during its await', async () => {
+  const h = await harness({ alpha: [s => ({ turn_outcomes: wire(s.ref, 'complete', [final('source-owned')]) })] },
+    { capability: null, lazyModern: true, members: [ALPHA], connectionId: 'local-A',
+      onProbe: () => h.switchConnection('remote-B') })
+  assert.equal(await run(h), 'source-owned')
+  assert.equal(h.rpc('prompt.submit').length, 1)
+  assert.ok(h.calls.every(c => c.route?.connectionId === 'local-A' && c.route.profile === 'alpha' && c.route.targetProfile === 'alpha'))
+  const polls = h.rpc('session.turn.poll')
+  assert.equal(polls.filter(c => !c.params.accepted_turn).length, 1)
+  assert.equal(polls.filter(c => c.params.accepted_turn).length, 1)
+  assert.equal(room(h).stranded.alpha, undefined)
+})
