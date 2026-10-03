@@ -46,7 +46,9 @@ async function harness({ hydrate = false, members = MEMBERS } = {}) {
       const session = [...sessions.values()].find(s => s.route?.connectionId === route?.connectionId &&
         [s.runtime, s.stored, s.title].includes(params.session_id))
       if (!session) throw Object.assign(new Error('not found'), { code: 4007 })
-      return { session_id: session.runtime, session_key: session.stored }
+      // Match the current backend's live-unpersisted resume shape.
+      return { session_id: session.runtime, stored_session_id: session.stored, messages: [],
+        info: { title: session.title }, running: false }
     }
     if (method === 'prompt.submit') {
       const session = sessions.get(params.session_id); assert.ok(session)
@@ -56,6 +58,7 @@ async function harness({ hydrate = false, members = MEMBERS } = {}) {
     if (method === 'session.turn.poll') {
       const session = sessions.get(params.session_id)
       if (!session) throw Object.assign(new Error('accepted turn runtime is unavailable'), { code: 4001 })
+      if (!params.accepted_turn) throw Object.assign(new Error('session_id and full accepted_turn identity required'), { code: 4006 })
       assert.deepEqual(params.accepted_turn, session.accepted)
       return { session_id: session.runtime, turn_outcomes: { version: 1, scope: 'process_local', availability: 'available',
         turns: [{ accepted_turn: session.accepted, state: 'complete', finalized: [{ status: 'complete', text: '(pass)' }] }] } }
@@ -63,19 +66,20 @@ async function harness({ hydrate = false, members = MEMBERS } = {}) {
     if (method === 'profiles.configure') return { applied: { ui_meta: true } }
     return {}
   }
-  const gc = await importGroupTurnPlugin({ atom,
+  const imported = await importGroupTurnPlugin({ atom,
     Date: class extends Date { static now() { return now } },
     setTimeout: (fn, delay) => { if (delay === 2000) { now += delay; fn() } return 1 }, clearTimeout: () => {},
     setInterval: () => 1, clearInterval: () => {},
     document: { getElementById: () => true, addEventListener: () => {}, removeEventListener: () => {} },
-    useEffect: () => {}, useState: initial => { const index = stateCursor++; if (!(index in states)) states[index] = typeof initial === 'function' ? initial() : initial;
+    useEffect: () => {}, useRef: current => ({ current }), useState: initial => { const index = stateCursor++; if (!(index in states)) states[index] = typeof initial === 'function' ? initial() : initial;
       return [states[index], value => { states[index] = typeof value === 'function' ? value(states[index]) : value }] },
-    sdk: { useValue: value => value.get(), cn: (...values) => values.filter(Boolean).join(' '), profileColor: () => '#000000' },
+    sdk: { useValue: value => value.get(), cn: (...values) => values.filter(Boolean).join(' '), profileColor: () => '#000000', relativeTime: () => '' },
     host: { request: (method, params) => request(null, method, params), requestProfile: request,
       retainProfile: async () => () => {},
       state: { profile: atom('default'), gateway: atom(null), connectionId: atom('local') },
       notify: () => {}, notifyError: () => {} }
   })
+  const gc = { ...imported, ...imported.groupRecoveryTestAPI }
   storage.set('group-chats', { Original: originalRoom() })
   const storagePort = { get: key => clone(storage.get(key) ?? null), set: (key, value) => storage.set(key, clone(value)) }
   if (hydrate) {
@@ -95,6 +99,8 @@ async function harness({ hydrate = false, members = MEMBERS } = {}) {
   return { gc, calls, storage, sessions, source, members,
     create: (withText = true) => gc.createFreshGroupChat('Original', members, { recoverySource: source(withText) }),
     execution: () => calls.filter(call => /^(prompt\.|session\.(create|resume|interrupt)|(?:file|image|pdf)\.attach)/.test(call.method)),
+    renderWorkspace: () => { states.length = 0; stateCursor = 0; return gc.GroupChatWorkspace({ group: 'Original', members, onBack: () => {} }) },
+    rerenderWorkspace: () => { stateCursor = 0; return gc.GroupChatWorkspace({ group: 'Original', members, onBack: () => {} }) },
     renderDialog: props => { stateCursor = 0; return gc.CreateGroupChatDialog(props) },
     setDialogStates: values => { states.splice(0, states.length, ...values) },
     dispose: () => disposers.forEach(fn => fn()) }
@@ -216,4 +222,24 @@ test('both persistence paths preserve original holds, exact session owners and l
   for (const rooms of [h.gc.durableGroupChatRooms(), h.storage.get('group-chats')]) {
     for (const field of ['holds', 'sessionOwners', 'stranded', 'sessions', 'watermarks']) assert.deepEqual(rooms.Original[field], before[field])
   }
+})
+
+test('real workspace blocked notice opens recovery dialog without dispatch or changing old custody', async () => {
+  const h = await harness(), before = clone(h.gc.$groupChats.get().Original)
+  const tree = h.renderWorkspace()
+  const notice = nodes(tree).find(n => n.type === h.gc.GroupBlockedNotice)
+  assert.ok(notice, 'workspace renders its recovery affordance')
+  const renderedNotice = notice.type(notice.props)
+  const action = nodes(renderedNotice).find(n => n.props?.children === 'Create a new group')
+  assert.ok(action)
+  action.props.onClick()
+  const updated = h.rerenderWorkspace()
+  const dialog = nodes(updated).find(n => n.type === h.gc.CreateGroupChatDialog && n.props.open)
+  assert.ok(dialog, 'explicit action opens the canonical dialog')
+  assert.equal(dialog.props.recoverySource.entry, null, 'no backlog message is selected for replay')
+  assert.deepEqual(h.gc.$groupChats.get().Original, before)
+  assert.equal(h.execution().length, 0)
+  dialog.props.onClose()
+  assert.ok(nodes(h.rerenderWorkspace()).some(n => n.type === h.gc.CreateGroupChatDialog && !n.props.open))
+  assert.equal(h.execution().length, 0)
 })

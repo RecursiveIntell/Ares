@@ -159,7 +159,9 @@ _CLARIFY_RECEIPT_TTL_SECONDS = 60 * 60
 _CLARIFY_RECEIPT_LIMIT = 1024
 # Session lifecycle tokens hold no session history or answer plaintext.
 _clarify_request_owners: dict[str, tuple[str, object | None]] = {}
-_clarify_response_receipts: dict[str, tuple[float, tuple[str, object | None], dict[str, str]]] = {}
+_clarify_response_receipts: dict[str, tuple[float, tuple[str, object | None], dict[str, str], tuple[str, str] | None]] = {}
+_activation_host_owner = contextvars.ContextVar("activation_host_owner", default=None)
+_activation_attachment_check = contextvars.ContextVar("activation_attachment_check", default=None)
 _host_clarify_expected_generation = contextvars.ContextVar("host_clarify_expected_generation", default=None)
 _db = None
 _db_error: str | None = None
@@ -258,6 +260,7 @@ _LONG_HANDLERS = frozenset(
         # An accepted-turn observation may make the existing bounded child
         # clarification snapshot read; keep approval/Stop dispatch responsive.
         "session.turn.poll",
+        "session.activate",
         # Bounded source/file observations and SQLite admission must not stall
         # the reader's interrupt/approval path. No automatic claim or retry.
         "session.run_checkpoint.claim",
@@ -3309,7 +3312,21 @@ def handle_request(req: dict) -> dict | None:
         return _err(rid, -32601, f"unknown method: {method}")
     token = _current_rpc_method.set(method)
     try:
-        return fn(rid, params)
+        response = fn(rid, params)
+        if method == "session.resume" and isinstance(response, dict):
+            result = response.get("result")
+            if isinstance(result, dict) and result.get("resumed"):
+                with _sessions_lock:
+                    session = _sessions.get(result.get("session_id"))
+                    transport = current_transport()
+                    if (session is not None and transport is not None
+                            and session.get("transport") is transport
+                            and result["resumed"] == session.get("session_key")):
+                        # Only a successful explicit resume grants a replacement
+                        # runtime permission to read a prior receipt. Polls and
+                        # activation never create this receipt proof.
+                        session.setdefault("_clarify_receipt_resumes", {})[transport] = _clarify_session_identity(session)
+        return response
     finally:
         _current_rpc_method.reset(token)
 
@@ -3411,6 +3428,79 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
             except Exception:
                 release_setting()
                 return _err(_rid, 4009, "option worker unavailable; request not applied")
+            return None
+        if method == "session.activate":
+            sid = str(_params.get("session_id") or "")
+            reservation = object()
+            deadline = time.monotonic() + 25.0
+            with _sessions_lock:
+                record = _sessions.get(sid)
+                if record is None or record.get("_closing") or record.get("_finalized"):
+                    return _err(_rid, 4001, "session not found")
+                if record.get("_activation_pending") is not None:
+                    return _err(_rid, 4009, "session activation already pending")
+                record["_activation_pending"] = reservation
+                owner_transport = record.get("transport")
+                identity = _clarify_session_identity(record)
+                host = _compute_host_supervisor
+                host_owner = (host, host.boot_id if host is not None else None)
+            ctx = contextvars.copy_context()
+
+            def release_activation():
+                with _sessions_lock:
+                    if record.get("_activation_pending") is reservation:
+                        record.pop("_activation_pending", None)
+
+            def activation_current(expected_transport):
+                return (_sessions.get(sid) is record
+                        and not record.get("_closing") and not record.get("_finalized")
+                        and record.get("transport") is expected_transport
+                        and _clarify_session_identity(record) == identity
+                        and _compute_host_supervisor is host
+                        and (host.boot_id if host is not None else None) == host_owner[1])
+
+            def run_activation():
+                owner_token = _current_runtime_session_record.set(record)
+                host_token = _activation_host_owner.set(host_owner)
+                check_token = _activation_attachment_check.set(lambda: activation_current(owner_transport))
+                try:
+                    with _sessions_lock:
+                        current = activation_current(owner_transport)
+                    if not current:
+                        resp = _err(_rid, 4001, "session activation owner changed")
+                    elif time.monotonic() >= deadline:
+                        resp = _err(_rid, 4009, "session activation expired before execution")
+                    else:
+                        resp = handle_request(req)
+                        with _sessions_lock:
+                            if not activation_current(t):
+                                resp = _err(_rid, 4001, "session activation owner changed during snapshot")
+                except Exception as exc:
+                    resp = _err(_rid, -32000, f"handler error: {exc}")
+                finally:
+                    _activation_attachment_check.reset(check_token)
+                    _activation_host_owner.reset(host_token)
+                    _current_runtime_session_record.reset(owner_token)
+                    release_activation()
+                if resp is not None:
+                    t.write(resp)
+
+            try:
+                future = _pool.submit(lambda: ctx.run(run_activation))
+                # Cancel only queued work. A begun child read remains bounded
+                # by its existing two-second control deadline.
+                timer = threading.Timer(25.0, future.cancel)
+                timer.daemon = True
+                def activation_done(done):
+                    timer.cancel()
+                    release_activation()
+                    if done.cancelled():
+                        t.write(_err(_rid, 4009, "session activation cancelled before execution"))
+                future.add_done_callback(activation_done)
+                timer.start()
+            except Exception:
+                release_activation()
+                return _err(_rid, 4009, "activation worker unavailable")
             return None
         clarify_sid = _params.get("session_id")
         clarify_record = _sessions.get(clarify_sid) if method == "clarify.respond" and isinstance(clarify_sid, str) else None
@@ -5045,7 +5135,7 @@ def _prune_clarify_response_receipts() -> None:
     now = time.monotonic()
     expired = [
         rid
-        for rid, (completed_at, _owner, _answers) in _clarify_response_receipts.items()
+        for rid, (completed_at, _owner, _answers, _identity) in _clarify_response_receipts.items()
         if now - completed_at >= _CLARIFY_RECEIPT_TTL_SECONDS
     ]
     for rid in expired:
@@ -5058,18 +5148,49 @@ def _prune_clarify_response_receipts() -> None:
         _clarify_response_receipts.pop(oldest, None)
 
 
-def _remember_clarify_response(rid: str, answers: dict[str, str], owner: tuple[str, object | None]) -> None:
+def _remember_clarify_response(rid: str, answers: dict[str, str], owner: tuple[str, object | None],
+                               identity: tuple[str, str] | None = None) -> None:
     """Keep a bounded idempotency receipt, never the answer text itself."""
     _prune_clarify_response_receipts()
-    _clarify_response_receipts[rid] = (time.monotonic(), owner, answers)
+    _clarify_response_receipts[rid] = (time.monotonic(), owner, answers, identity)
     _prune_clarify_response_receipts()
 
 
-def _get_clarify_response_receipt(rid: str) -> tuple[tuple[str, object | None], dict[str, str]] | None:
+def _get_clarify_response_receipt(rid: str) -> tuple[tuple[str, object | None], dict[str, str], tuple[str, str] | None] | None:
     """Read a completed-response receipt while `_prompt_lock` is held."""
     _prune_clarify_response_receipts()
     receipt = _clarify_response_receipts.get(rid)
-    return (receipt[1], receipt[2]) if receipt else None
+    return (receipt[1], receipt[2], receipt[3]) if receipt else None
+
+
+def _clarify_session_identity(session: dict) -> tuple[str, str] | None:
+    """Canonical profile/store identity; never grants execution authority."""
+    key = session.get("session_key")
+    if not isinstance(key, str) or not key:
+        return None
+    return (str(Path(session.get("profile_home") or _hermes_home).resolve()), key)
+
+
+def _clarify_receipt_owner_matches(owner, identity, params) -> bool:
+    """Confirm retained fingerprints after explicit resume, never redeliver."""
+    if _clarify_owner_matches(owner, params):
+        return True
+    sid = params.get("session_id")
+    transport = current_transport()
+    if identity is None or not isinstance(sid, str) or transport is None:
+        return False
+    with _sessions_lock:
+        # A stale original id is a lookup hint. An existing unrelated record
+        # under that id must not be silently adopted or rebound.
+        candidates = ([_sessions[sid]] if sid in _sessions else
+                      list(_sessions.values()) if sid == owner[0] else [])
+        return any(
+            not session.get("_closing") and not session.get("_finalized")
+            and _clarify_session_identity(session) == identity
+            and session.get("_clarify_receipt_resumes", {}).get(transport) == identity
+            and (session.get("transport") is transport or transport in session.get("viewers", {}))
+            for session in candidates
+        )
 
 
 def _clarify_owner_matches(owner: tuple[str, object | None], params: dict) -> bool:
@@ -5103,11 +5224,13 @@ def _block(
     global _prompt_request_sequence
 
     owner = (sid, None)
+    receipt_identity = None
     if event == 'clarify.request':
         with _sessions_lock:
             session = _sessions.get(sid)
             if session is not None:
                 owner = (sid, session.setdefault('_clarify_generation', object()))
+                receipt_identity = _clarify_session_identity(session)
     ev = threading.Event()
     with _prompt_lock:
         _prompt_request_sequence += 1
@@ -5148,7 +5271,7 @@ def _block(
                 batch_answers = dict(batch_state["answers"])
             if event == "clarify.request":
                 if answer_present:
-                    _remember_clarify_response(rid, {"": _clarify_answer_fingerprint("", answer)}, owner)
+                    _remember_clarify_response(rid, {"": _clarify_answer_fingerprint("", answer)}, owner, receipt_identity)
                 elif (
                     batch_state is not None
                     and batch_answers is not None
@@ -5161,6 +5284,7 @@ def _block(
                             for qid in batch_state["qids"]
                         },
                         owner,
+                        receipt_identity,
                     )
 
     if batch_qids is not None:
@@ -11617,7 +11741,10 @@ def _live_session_payload(
     transport: Transport | None = None,
     omit_messages: bool = False,
 ) -> dict:
-    with session["history_lock"]:
+    with _sessions_lock, session["history_lock"]:
+        attachment_check = _activation_attachment_check.get()
+        if attachment_check is not None and not attachment_check():
+            raise RuntimeError("session activation owner changed before attachment")
         if cols is not None:
             session["cols"] = cols
         if transport is not None:
@@ -11685,7 +11812,10 @@ def _live_session_payload(
         payload["queued"] = queued
     if approval := _pending_approval_request_payload(str(session.get("session_key") or "")):
         payload["pending_approval"] = approval
-    if clarify := _pending_clarify_request_payload(sid):
+    activation_host = _activation_host_owner.get()
+    clarify = (_pending_clarify_request_payload(sid, expected_session=session, expected_host=activation_host)
+               if activation_host is not None else _pending_clarify_request_payload(sid))
+    if clarify:
         payload["pending_clarify"] = clarify
         if turn_outcomes["turns"] and running:
             turn = turn_outcomes["turns"][-1]
@@ -14824,8 +14954,8 @@ def _respond(rid, params, key, *, allow_expired=False, idempotent=False):
             if allow_expired and r:
                 receipt = _get_clarify_response_receipt(r) if idempotent else None
                 if receipt is not None:
-                    owner, receipt = receipt
-                    if not _clarify_owner_matches(owner, params):
+                    owner, receipt, identity = receipt
+                    if not _clarify_receipt_owner_matches(owner, identity, params):
                         return _err(rid, 4030, 'clarify response session owner mismatch')
                     if question_id and question_id not in receipt:
                         return _err(rid, 4002, f"unknown question_id {question_id!r}")

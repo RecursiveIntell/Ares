@@ -7519,7 +7519,7 @@ async function ensureGroupChatSession(group, member, requestMember = member, occ
           })
         }
 
-        return { runtime: res.session_id, stored }
+        return { runtime: res.session_id, stored, state: res }
       }
     } catch (error) {
       if (error?.code !== 4007) {
@@ -7547,7 +7547,44 @@ async function ensureGroupChatSession(group, member, requestMember = member, occ
     })
   }
 
-  return { runtime: created?.session_id || null, stored }
+  return { runtime: created?.session_id || null, stored, resumeTarget: stored || title }
+}
+
+/** Older runtimes can accept work without identifying its outcome. Detect the
+ * versioned projection before any attachment or prompt write; display history
+ * cannot establish turn ownership after compaction. Do not cache across boots. */
+async function requireGroupTurnProtocol(member, prepared) {
+  const state = prepared.state || await requestForBot(member, 'session.resume', {
+    session_id: prepared.resumeTarget, profile: member.name, omit_messages: true
+  })
+  const projection = state?.turn_outcomes
+  if (typeof state?.session_id !== 'string' || !state.session_id ||
+      (prepared.stored && state.session_key && state.session_key !== prepared.stored)) {
+    throw new Error('The member session changed before admission. Try sending again.')
+  }
+  const unsupported = () => new Error('Update this member’s backend to support group turn outcomes, then send again. No member prompt was sent.')
+  if (projection === undefined) {
+    // Current lazy-session resume omits the projection. Probe the exact RPC
+    // without inventing an admission: its validation error establishes only
+    // method availability. It grants no ownership or completion authority.
+    try {
+      await requestForBot(member, 'session.turn.poll', {
+        session_id: state.session_id, profile: member.name
+      })
+    } catch (error) {
+      if (error?.code === 4006 && error?.message === 'session_id and full accepted_turn identity required') {
+        return state.session_id
+      }
+      if (error?.code === -32601) throw unsupported()
+      throw error
+    }
+    throw unsupported()
+  }
+  if (projection?.version !== 1 || projection.scope !== 'process_local' ||
+      !['available', 'unavailable'].includes(projection.availability) || !Array.isArray(projection.turns)) {
+    throw unsupported()
+  }
+  return state.session_id
 }
 
 const GROUP_TURN_TIMEOUT_MS = 180000
@@ -7614,7 +7651,7 @@ async function retainGroupTurnRoute(member) {
  *  STORED id — the durable identity — to mint a fresh runtime id, and submit
  *  exactly once more. Returns the runtime id the submit actually landed on so
  *  the poll loop keeps a live fallback target. */
-async function submitGroupTurnPrompt(member, runtime, stored, text, occurrence) {
+async function submitGroupTurnPrompt(member, runtime, stored, text, occurrence, canSubmit) {
   try {
     const ack = await requestForBot(member, 'prompt.submit', { session_id: runtime, text })
 
@@ -7635,16 +7672,23 @@ async function submitGroupTurnPrompt(member, runtime, stored, text, occurrence) 
       throw error
     }
     if (occurrence) {
+      const sessionLock = groupSourceSessionKey(occurrence.captured, fresh)
+      const prior = groupRuntimeSessionOwners.get(sessionLock)
+      if (prior && prior !== occurrence) throw error
       if (occurrence.sessionLock && groupRuntimeSessionOwners.get(occurrence.sessionLock) === occurrence) {
         groupRuntimeSessionOwners.delete(occurrence.sessionLock)
       }
       occurrence.runtime = fresh
-      occurrence.sessionLock = groupSourceSessionKey(occurrence.captured, fresh)
-      if (groupRuntimeSessionOwners.has(occurrence.sessionLock)) throw error
-      groupRuntimeSessionOwners.set(occurrence.sessionLock, occurrence)
+      occurrence.sessionLock = sessionLock
+      groupRuntimeSessionOwners.set(sessionLock, occurrence)
       if (occurrence.cancelled) { await interruptGroupOccurrence(occurrence); throw error }
     }
 
+    await requireGroupTurnProtocol(member, { runtime: fresh, stored, state: res })
+    if ((occurrence && !groupOccurrenceCanSubmit(occurrence)) || (canSubmit && !canSubmit())) {
+      if (occurrence?.cancelled) await interruptGroupOccurrence(occurrence)
+      throw error
+    }
     const ack = await requestForBot(member, 'prompt.submit', { session_id: fresh, text })
 
     return { runtime: fresh, acceptedTurn: groupAcceptedTurn(ack?.accepted_turn, fresh) }
@@ -8391,7 +8435,9 @@ async function runGroupChatMemberTurnLeased(group, captured, prompt, thread, ima
   }, { sync: false })
   let submitAttempted = false
   try {
-    const { runtime, stored } = await ensureGroupChatSession(group, member, requestMember, occurrence)
+    const prepared = await ensureGroupChatSession(group, member, requestMember, occurrence)
+    let { runtime } = prepared
+    const { stored } = prepared
     if (occurrence) {
       occurrence.runtime = runtime
       occurrence.sessionLock = groupSourceSessionKey(captured, runtime)
@@ -8409,6 +8455,26 @@ async function runGroupChatMemberTurnLeased(group, captured, prompt, thread, ima
         !((room.epoch || 0) !== dispatchEpoch && room.holds?.[memberKey])
     }
     if (!runtime || !beforeSubmit()) {
+      consumeGroupTurnMarker(group, memberKey, marker)
+      return discarded()
+    }
+    runtime = await requireGroupTurnProtocol(requestMember, prepared)
+    if (occurrence && runtime !== occurrence.runtime) {
+      const sessionLock = groupSourceSessionKey(captured, runtime)
+      const prior = groupRuntimeSessionOwners.get(sessionLock)
+      if (prior && prior !== occurrence) {
+        consumeGroupTurnMarker(group, memberKey, marker)
+        throw groupTurnOutcomeError({ state: 'unavailable', reason: 'Member runtime is owned by another occurrence' })
+      }
+      if (occurrence.sessionLock && groupRuntimeSessionOwners.get(occurrence.sessionLock) === occurrence) {
+        groupRuntimeSessionOwners.delete(occurrence.sessionLock)
+      }
+      occurrence.runtime = runtime
+      occurrence.sessionLock = sessionLock
+      groupRuntimeSessionOwners.set(sessionLock, occurrence)
+      if (occurrence.cancelled) await interruptGroupOccurrence(occurrence)
+    }
+    if (!beforeSubmit()) {
       consumeGroupTurnMarker(group, memberKey, marker)
       return discarded()
     }
@@ -8443,7 +8509,7 @@ async function runGroupChatMemberTurnLeased(group, captured, prompt, thread, ima
     if (occurrence) { occurrence.submitAttempted = true; occurrence.submissionPending = true }
     let submitted
     try {
-      submitted = await submitGroupTurnPrompt(requestMember, runtime, stored, turnText, occurrence)
+      submitted = await submitGroupTurnPrompt(requestMember, runtime, stored, turnText, occurrence, beforeSubmit)
       if (occurrence) occurrence.runtime = submitted.runtime
     } finally {
       if (occurrence) {
