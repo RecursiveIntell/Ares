@@ -550,6 +550,20 @@ def build_turn_context(
     set_current_write_origin(getattr(agent, "_memory_write_origin", "assistant_tool"))
 
     # Restore the primary runtime if the previous turn activated fallback.
+    from ares_runtime.continuity.runtime import ContextDispatchError, context_dispatch_required
+
+    _aux_context_required = context_dispatch_required(agent)
+    _primary_runtime = getattr(agent, "_primary_runtime", None)
+    _native_primary = (
+        isinstance(_primary_runtime, dict)
+        and _primary_runtime.get("api_mode") == "codex_app_server"
+    )
+    if _aux_context_required and (
+        getattr(agent, "api_mode", None) == "codex_app_server" or _native_primary
+    ):
+        # Stop before restore, title generation, auxiliary resolution or the
+        # native child can dispatch from an unqualified trial context.
+        raise ContextDispatchError("PROVIDER_CONTEXT_RESET_UNQUALIFIED")
     agent._restore_primary_runtime()
 
     # Tell auxiliary_client what the live main provider/model are for this turn
@@ -577,8 +591,13 @@ def build_turn_context(
             auth_mode=getattr(agent, "auth_mode", "") or "",
             session_id=getattr(agent, "session_id", "") or "",
             cache_scope=_cache_scope,
+            context_dispatch_required=_aux_context_required,
         )
+    except ContextDispatchError:
+        raise
     except Exception:
+        if _aux_context_required:
+            raise ContextDispatchError("CONTEXT_DISPATCH_OWNER_UNAVAILABLE") from None
         pass
 
     # Between-turns MCP refresh: an MCP server that finished connecting since

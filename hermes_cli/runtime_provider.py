@@ -466,6 +466,36 @@ def _maybe_apply_codex_app_server_runtime(
     return api_mode
 
 
+def _native_codex_app_server_requested(model_cfg: Dict[str, Any]) -> bool:
+    """Whether config explicitly selects the native Codex app-server route."""
+    runtime = str(model_cfg.get("openai_runtime") or "").strip().lower()
+    return runtime == "codex_app_server" or _parse_api_mode(
+        model_cfg.get("api_mode")
+    ) == "codex_app_server"
+
+
+def _configured_context_rebase_enabled(config: Dict[str, Any]) -> bool:
+    """Read the existing continuity opt-in without creating new authority."""
+    compression = config.get("compression") if isinstance(config, dict) else None
+    if not isinstance(compression, dict):
+        return False
+    from utils import is_truthy_value
+
+    return is_truthy_value(compression.get("context_rebase_enabled"), default=False)
+
+
+def _native_codex_runtime(provider: str, requested_provider: str) -> Dict[str, Any]:
+    return {
+        "provider": provider,
+        "api_mode": "codex_app_server",
+        "base_url": "",
+        "api_key": "",
+        "source": "codex-app-server-native",
+        "credential_pool": None,
+        "requested_provider": requested_provider,
+    }
+
+
 def _resolve_runtime_from_pool_entry(
     *,
     provider: str,
@@ -595,11 +625,8 @@ def _resolve_runtime_from_pool_entry(
 
         base_url = normalize_opencode_base_url(provider, api_mode, base_url)
 
-    # Optional opt-in: route OpenAI/Codex turns through `codex app-server`.
-    # Inert when `model.openai_runtime` is unset or "auto".
-    api_mode = _maybe_apply_codex_app_server_runtime(
-        provider=provider, api_mode=api_mode, model_cfg=model_cfg
-    )
+    # Native selection belongs to the pre-credential route in
+    # resolve_runtime_provider; a selected API pool must remain an API route.
 
     if provider == "lmstudio":
         base_url = auth_mod._normalize_lmstudio_runtime_base_url(base_url)
@@ -1809,6 +1836,66 @@ def resolve_runtime_provider(
                 f"provider {requested_provider!r} is disabled in config "
                 f"(providers.{requested_provider}.enabled: false)"
             )
+
+    # The native Codex runtime owns authentication and endpoint selection.
+    # Resolve it before provider/auth/pool code can inspect or refresh a
+    # credential.  Continuity-enabled sessions still select the route here;
+    # init_agent rejects that currently unqualified combination before a
+    # generic SDK or native child is constructed.
+    raw_model_cfg = _full_cfg.get("model") if isinstance(_full_cfg, dict) else None
+    model_cfg = dict(raw_model_cfg) if isinstance(raw_model_cfg, dict) else {}
+    raw_default = model_cfg.get("default")
+    if isinstance(raw_default, dict) and not model_cfg.get("provider"):
+        model_cfg["provider"] = raw_default.get("provider")
+    configured_provider = str(model_cfg.get("provider") or "").strip().lower()
+    effective_provider = (
+        requested_provider
+        if requested_provider not in {"", "auto"}
+        else configured_provider
+    )
+    native_runtime_opt_in = (
+        str(model_cfg.get("openai_runtime") or "").strip().lower()
+        == "codex_app_server"
+    )
+    native_mode_opt_in = (
+        _parse_api_mode(model_cfg.get("api_mode")) == "codex_app_server"
+    )
+    native_requested = native_runtime_opt_in or native_mode_opt_in
+    if native_requested:
+        native_trial = _configured_context_rebase_enabled(_full_cfg)
+        if effective_provider not in {"openai", "openai-codex"}:
+            ambiguous_provider = effective_provider in {"", "auto"}
+            explicit_api_route = bool(
+                explicit_api_key or explicit_base_url or model_cfg.get("base_url")
+            )
+            if native_trial or native_mode_opt_in or (
+                ambiguous_provider and not explicit_api_route
+            ):
+                raise ValueError(
+                    "model.api_mode/openai_runtime codex_app_server requires "
+                    "provider 'openai' or 'openai-codex'; select model.provider "
+                    "explicitly for the native route"
+                )
+        elif native_trial and (
+            explicit_api_key
+            or explicit_base_url
+            or model_cfg.get("base_url")
+        ):
+            raise ValueError(
+                "codex_app_server with compression.context_rebase_enabled "
+                "does not accept explicit API credentials or base_url"
+            )
+        else:
+            # An auto request names no provider at the earlier enabled guard.
+            # Apply the same rule to the native provider selected from config.
+            if isinstance(_provs_cfg, dict) and not is_provider_enabled(
+                _provs_cfg.get(effective_provider)
+            ):
+                raise ValueError(
+                    f"provider {effective_provider!r} is disabled in config "
+                    f"(providers.{effective_provider}.enabled: false)"
+                )
+            return _native_codex_runtime(effective_provider, requested_provider)
 
     if requested_provider == "moa":
         return {

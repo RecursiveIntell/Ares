@@ -1046,6 +1046,9 @@ def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") ->
             unregister_gateway_notify(key)
     except Exception:
         pass
+    # A failed capability-refresh retirement remains owned by this record.
+    # Retry that one native handle at the existing teardown boundary only.
+    _finish_bot_native_retirement(session)
     try:
         agent = session.get("agent")
         if agent is not None and hasattr(agent, "close"):
@@ -6940,6 +6943,92 @@ def _apply_model_switch(
     }
 
 
+def _bot_native_sessions_share(left, right) -> bool:
+    if left is None or right is None:
+        return False
+    client = getattr(left, "_client", None)
+    return left is right or (client is not None and client is getattr(right, "_client", None))
+
+
+@contextlib.contextmanager
+def _bot_native_idle_guard(native):
+    # Native turn locks never acquire the gateway registry lock. Do not wait
+    # for an active-turn mutation while holding the registry lock.
+    lock = getattr(native, "_active_turn_lock", None)
+    if lock is not None and not lock.acquire(blocking=False):
+        raise RuntimeError("BOT_CAPABILITY_NATIVE_BUSY")
+    try:
+        if getattr(native, "_active_turn_id", None) is not None:
+            raise RuntimeError("BOT_CAPABILITY_NATIVE_BUSY")
+        yield
+    finally:
+        if lock is not None:
+            lock.release()
+
+
+def _finish_bot_native_retirement(session: dict) -> bool:
+    """Retire one captured, exclusive native owner outside locks.
+
+    Session/client close are best effort. Keep one explicit unresolved owner
+    until the captured transport proves child exit; normal teardown may retry
+    its existing close method, without promising eventual process cleanup.
+    """
+    with _sessions_lock:
+        pending = session.get("_bot_native_retirement")
+        if pending is None:
+            return True
+        if pending["status"] == "closing":
+            return False
+        native, client = pending["native"], pending["client"]
+        try:
+            if getattr(pending["agent"], "_codex_session", None) is not None:
+                raise RuntimeError("BOT_CAPABILITY_NATIVE_OWNER_CHANGED")
+            current_client = getattr(native, "_client", None)
+            # Real session.close clears _client even if client.close failed.
+            # Only that documented detach state permits captured-client retry.
+            detached = current_client is None and getattr(native, "_closed", False)
+            if current_client is not client and not detached:
+                raise RuntimeError("BOT_CAPABILITY_NATIVE_OWNER_CHANGED")
+            for record in [session, *_sessions.values()]:
+                other = getattr(record.get("agent"), "_codex_session", None)
+                if other is native or (client is not None and
+                                       getattr(other, "_client", None) is client):
+                    raise RuntimeError("BOT_CAPABILITY_NATIVE_SHARED")
+            with _bot_native_idle_guard(native):
+                pending["status"] = "closing"
+        except Exception:
+            pending["status"] = "failed"
+            logger.warning("Bot capability native retirement ownership refused", exc_info=True)
+            return False
+    try:
+        if detached and client is not None:
+            client.close()
+        else:
+            native.close()
+    except Exception:
+        with _sessions_lock:
+            if session.get("_bot_native_retirement") is pending:
+                pending["status"] = "failed"
+        logger.warning("Bot capability native retirement failed", exc_info=True)
+        return False
+    if client is not None:
+        try:
+            # A returned close or _closed flag alone does not prove child exit.
+            exited = client.is_alive() is False
+        except Exception:
+            exited = False
+        if not exited:
+            with _sessions_lock:
+                if session.get("_bot_native_retirement") is pending:
+                    pending["status"] = "unresolved"
+            logger.warning("Bot capability native retirement unresolved: child exit unverified")
+            return False
+    with _sessions_lock:
+        if session.get("_bot_native_retirement") is pending:
+            session.pop("_bot_native_retirement")
+    return True
+
+
 def _sync_bot_capabilities(sid: str, session: dict) -> None:
     """Rebuild a Bot Chat session's agent when its capability surface changed.
 
@@ -6970,36 +7059,141 @@ def _sync_bot_capabilities(sid: str, session: dict) -> None:
         if current == "unavailable":
             return
         seen = session.get("bot_caps_seen")
-        session["bot_caps_seen"] = current
         if seen is None or seen == current:
+            session["bot_caps_seen"] = current
             return
     except Exception:
         return
 
-    # Capability surface changed — rebuild the agent in place. Same
-    # session_id/key, so the DB-backed history and (epoch-refreshed) system
-    # prompt carry over; only tool definitions and prompt bytes change.
+    # The input receipt was accepted before this prologue. Its store and live
+    # runtime must survive refresh, including resumed and /model --once state.
+    key = session.get("session_key")
+    agent_sid = getattr(agent, "session_id", None)
+    db = getattr(agent, "_session_db", None)
+    home = session.get("profile_home")
+    owns_db = getattr(agent, "_owns_session_db", False)
+    runtime = {name: getattr(agent, name, None) for name in
+               ("model", "provider", "api_key", "base_url", "api_mode")}
+    reasoning = copy.deepcopy(getattr(agent, "reasoning_config", None))
+    tier = getattr(agent, "service_tier", None) or ""
+    acp_command = getattr(agent, "acp_command", None)
+    acp_args = list(getattr(agent, "acp_args", None) or [])
+    native_captured = False
+    native_session = None
+    native_client = None
+
+    def runtime_matches(candidate):
+        return (all((getattr(candidate, name, None) or "") == (value or "")
+                    for name, value in runtime.items())
+                and getattr(candidate, "reasoning_config", None) == reasoning
+                and (getattr(candidate, "service_tier", None) or "") == tier
+                and getattr(candidate, "acp_command", None) == acp_command
+                and (getattr(candidate, "acp_args", None) or []) == acp_args)
+
+    def require_owner():
+        if (_sessions.get(sid) is not session or session.get("_closing")
+                or session.get("_turn_cancel_requested")
+                or session.get("agent") is not agent
+                or session.get("session_key") != key
+                or session.get("profile_home") != home
+                or getattr(agent, "session_id", None) != agent_sid
+                or getattr(agent, "_session_db", None) is not db
+                or getattr(agent, "_owns_session_db", False) != owns_db
+                or not runtime_matches(agent)):
+            raise RuntimeError("BOT_CAPABILITY_OWNER_CHANGED")
+        if native_captured and (
+                getattr(agent, "_codex_session", None) is not native_session
+                or getattr(native_session, "_client", None) is not native_client):
+            raise RuntimeError("BOT_CAPABILITY_NATIVE_OWNER_CHANGED")
+        if (not key or not agent_sid or db is None or (owns_db and db is _db)
+                or Path(db.db_path).resolve() != (_session_home(session) / "state.db").resolve()):
+            raise RuntimeError("BOT_CAPABILITY_STORE_MISMATCH")
+
+    with _sessions_lock:
+        require_owner()
+        if session.get("_bot_native_retirement") is not None:
+            raise RuntimeError("BOT_CAPABILITY_NATIVE_RETIREMENT_PENDING")
+        native_session = getattr(agent, "_codex_session", None)
+        native_client = getattr(native_session, "_client", None)
+        native_captured = True
+        with _bot_native_idle_guard(native_session):
+            if any(record.get("agent") is not agent and
+                   _bot_native_sessions_share(native_session, getattr(record.get("agent"), "_codex_session", None))
+                   for record in _sessions.values()):
+                raise RuntimeError("BOT_CAPABILITY_NATIVE_SHARED")
+    new_agent = None
+    published = False
     try:
-        tokens = _set_session_context(sid, cwd=_session_cwd(session))
+        tokens = _set_session_context(key, cwd=_session_cwd(session), ui_session_id=sid)
         try:
             new_agent = _make_agent(
-                sid,
-                session["session_key"],
-                session_id=session["session_key"],
+                sid, key, session_id=agent_sid, session_db=db,
+                model_override=runtime,
+                reasoning_config_override=reasoning,
+                _preserve_default_reasoning=reasoning is None,
+                service_tier_override=tier,
                 platform_override=_session_source(session),
             )
         finally:
             _clear_session_context(tokens)
+        # Normal constructor resolution still owns credentials/fallback policy.
+        # A refresh may not silently change this admitted turn's runtime.
+        if (new_agent is agent or getattr(new_agent, "_session_db", None) is not db
+                or getattr(new_agent, "session_id", None) != agent_sid
+                or not runtime_matches(new_agent)):
+            raise RuntimeError("BOT_CAPABILITY_REPLACEMENT_MISMATCH")
         new_agent._session_title_hint = "Bot Chat"
-        session["agent"] = new_agent
-        session["config_model_seen"] = _config_model_target()
+        with _sessions_lock:
+            require_owner()
+            with _bot_native_idle_guard(native_session):
+                candidates = [new_agent, *(record.get("agent") for record in _sessions.values()
+                                           if record.get("agent") is not agent)]
+                if any(_bot_native_sessions_share(native_session, getattr(candidate, "_codex_session", None))
+                       for candidate in candidates):
+                    raise RuntimeError("BOT_CAPABILITY_NATIVE_SHARED")
+                if owns_db and not _transfer_db_to_agent(new_agent, db):
+                    raise RuntimeError("BOT_CAPABILITY_DB_TRANSFER_FAILED")
+                require_owner()
+                # Never grant ownership of the shared launch handle. Dedicated
+                # ownership moves only after all stale-generation checks pass.
+                new_agent._owns_session_db = bool(owns_db)
+                agent._owns_session_db = False
+                agent._end_session_on_close = False
+                session["agent"] = new_agent
+                session["bot_caps_seen"] = current
+                if native_session is not None:
+                    agent._codex_session = None
+                    session["_bot_native_retirement"] = {
+                        "agent": agent, "native": native_session,
+                        "client": native_client, "status": "pending",
+                    }
+                published = True
+        _finish_bot_native_retirement(session)
         _emit(
-            "notice",
-            sid,
+            "notice", sid,
             {"message": "Capabilities updated — this bot's tools and prompt were refreshed."},
         )
     except Exception as e:
+        # A construction failure leaves a valid predecessor usable and retries
+        # next turn. A stale/wrong owner aborts before any conversation runs.
+        if not published:
+            with _sessions_lock:
+                require_owner()
+            if str(e) == "BOT_CAPABILITY_NATIVE_BUSY":
+                raise
         logger.warning("Bot capability sync failed for %s: %s", sid, e)
+    finally:
+        retired = agent if published else new_agent
+        if retired is not None and (published or retired is not agent):
+            # Soft retirement preserves same-session tools and the SQLite row.
+            # close() would end that row and destroy task-ID-scoped resources.
+            if not published:
+                retired._owns_session_db = False
+                retired._end_session_on_close = False
+            try:
+                retired.release_clients()
+            except Exception:
+                logger.debug("Bot capability client retirement failed", exc_info=True)
 
 
 def _sync_agent_model_with_config(sid: str, session: dict) -> None:
@@ -7832,6 +8026,36 @@ def _project_info_for_cwd(cwd: str) -> dict | None:
         return None
 
 
+def _custom_readiness_route(agent, identity: tuple, session: dict | None = None) -> tuple[str, str] | None:
+    """Bind a displayed named alias to its exact configured dispatch transport.
+
+    This is configuration lookup only, not runtime/credential selection. Keep
+    resolver precedence and disabled/built-in-name rules in the existing owner;
+    never infer an alias from a matching model or a generic ``custom`` label.
+    """
+    if (getattr(agent, "provider", None) != "custom" or identity[0] == "custom"
+            or identity[1] != getattr(agent, "model", None)):
+        return None
+    home_token = set_hermes_home_override(str(_session_home(session))) if session is not None else None
+    try:
+        from hermes_cli.runtime_provider import _get_named_custom_provider, _detect_api_mode_for_url
+
+        configured = _get_named_custom_provider(str(identity[0] or ""))
+        if not configured:
+            return None
+        endpoint = str(configured.get("base_url") or "").strip().rstrip("/")
+        mode = configured.get("api_mode") or _detect_api_mode_for_url(endpoint) or "chat_completions"
+        if (not endpoint or endpoint != str(getattr(agent, "base_url", None) or "").strip().rstrip("/")
+                or mode != getattr(agent, "api_mode", None)):
+            return None
+        return endpoint, mode
+    except Exception:
+        return None
+    finally:
+        if home_token is not None:
+            reset_hermes_home_override(home_token)
+
+
 def _session_info(agent, session: dict | None = None) -> dict:
     if session is None:
         for candidate in _sessions.values():
@@ -7926,6 +8150,9 @@ def _session_info(agent, session: dict | None = None) -> dict:
             else session.get("model_verified_for") == identity
         )
     )
+
+    if model_ready and not session.get("_compute_host_active") and session.get("_verified_custom_route") is not None:
+        model_ready = session["_verified_custom_route"] == _custom_readiness_route(agent, identity, session)
 
     info: dict = {
         "session_id": next((sid for sid, record in _sessions.items() if record is session), ""),
@@ -9229,6 +9456,7 @@ def _make_agent(
     reasoning_config_override: dict | None = None,
     service_tier_override: str | None = None,
     platform_override: str | None = None,
+    _preserve_default_reasoning: bool = False,
 ):
     # AC-4 test seam: dead unless explicitly armed by the isolated certify
     # harness. Both inline and compute-host paths construct through _make_agent,
@@ -9375,9 +9603,11 @@ def _make_agent(
         # change on the classic CLI side.
         verbose_logging=False,
         reasoning_config=(
-            reasoning_config_override
-            if reasoning_config_override is not None
-            else _load_reasoning_config(str(model or ""))
+            None if _preserve_default_reasoning else (
+                reasoning_config_override
+                if reasoning_config_override is not None
+                else _load_reasoning_config(str(model or ""))
+            )
         ),
         service_tier=(
             service_tier_override
@@ -13628,6 +13858,7 @@ def _run_prompt_submit(
             _requested_route = (
                 _requested_route_info.get("provider"), _requested_route_info.get("model")
             )
+            _requested_custom_route = _custom_readiness_route(agent, _requested_route, session)
             session["_readiness_turn_token"] = _route_turn_token
             agent._route_turn_token = _route_turn_token
             _usage_stop, _usage_thread = _start_usage_ticker(sid, agent)
@@ -13893,8 +14124,16 @@ def _run_prompt_submit(
                         and isinstance(_route.turn_id, str) and bool(_route.turn_id)
                         and isinstance(_route.attempt_id, str)
                         and _route.attempt_id.startswith(f"{_route.turn_id}:api:")
-                        and (_route.provider, _route.model) == _requested_route
-                        and (_route.provider, _route.model) == (
+                        and (
+                            (_route.provider, _route.model) == _requested_route
+                            or (
+                                _requested_custom_route is not None
+                                and (_route.provider, _route.model) == ("custom", _requested_route[1])
+                                and (str(_route.base_url or "").strip().rstrip("/"), _route.api_mode) == _requested_custom_route
+                                and _custom_readiness_route(agent, _requested_route, session) == _requested_custom_route
+                            )
+                        )
+                        and _requested_route == (
                             _session_info(agent, session)["provider"],
                             _session_info(agent, session)["model"],
                         )
@@ -13907,6 +14146,7 @@ def _run_prompt_submit(
                         and _sessions.get(sid) in (None, session)
                     ):
                         session["model_verified_for"] = _requested_route
+                        session["_verified_custom_route"] = _requested_custom_route
                     else:
                         session.pop("model_verified_for", None)
                 elif status == "error":

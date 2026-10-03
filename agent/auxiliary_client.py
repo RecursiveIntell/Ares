@@ -3623,6 +3623,7 @@ def set_runtime_main(
     auth_mode: str = "",
     session_id: str = "",
     cache_scope: str = "",
+    context_dispatch_required: bool = False,
 ) -> contextvars.Token:
     """Record the current context's live main runtime for auxiliary routing.
 
@@ -3651,7 +3652,20 @@ def set_runtime_main(
         "auth_mode": (auth_mode or "").strip().lower(),
         "session_id": (session_id or "").strip(),
         "cache_scope": (cache_scope or "").strip(),
+        "context_dispatch_required": bool(context_dispatch_required),
     }
+    inherited = _RUNTIME_MAIN_CONTEXT.get()
+    if (
+        isinstance(inherited, dict)
+        and inherited.get("api_mode") == "codex_app_server"
+        and inherited.get("context_dispatch_required") is True
+    ):
+        runtime = {field: "" for field in _MAIN_RUNTIME_FIELDS}
+        runtime.update(
+            requested_provider="",
+            context_dispatch_required=True,
+        )
+        runtime.update(inherited)
     # Publish authoritative context before updating locked compatibility
     # mirrors; concurrent sessions never read those mirrors at runtime.
     token = _RUNTIME_MAIN_CONTEXT.set(runtime)
@@ -3686,6 +3700,13 @@ def reset_runtime_main(token: contextvars.Token) -> None:
 def scoped_runtime_main(main_runtime: Optional[Dict[str, Any]]):
     """Temporarily bind an explicit runtime without touching legacy mirrors."""
     runtime = _normalize_main_runtime(main_runtime)
+    inherited = _RUNTIME_MAIN_CONTEXT.get()
+    if (
+        isinstance(inherited, dict)
+        and inherited.get("api_mode") == "codex_app_server"
+        and inherited.get("context_dispatch_required") is True
+    ):
+        runtime = dict(inherited)
     token = _RUNTIME_MAIN_CONTEXT.set(runtime or None)
     try:
         yield runtime
@@ -4124,7 +4145,9 @@ _AUTO_PROVIDER_LABELS = {
 }
 
 _MAIN_RUNTIME_FIELDS = ("provider", "model", "base_url", "api_key", "api_mode", "auth_mode")
-_MAIN_RUNTIME_CONTEXT_FIELDS = _MAIN_RUNTIME_FIELDS + ("requested_provider",)
+_MAIN_RUNTIME_CONTEXT_FIELDS = _MAIN_RUNTIME_FIELDS + (
+    "requested_provider", "context_dispatch_required",
+)
 
 
 def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -4153,6 +4176,9 @@ def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str,
         if field == "api_key" and callable(value) and not isinstance(value, str):
             normalized[field] = value
             continue
+        if field == "context_dispatch_required" and isinstance(value, bool):
+            normalized[field] = value
+            continue
         if isinstance(value, str) and value.strip():
             normalized[field] = value.strip()
     for identity_field in ("provider", "requested_provider"):
@@ -4160,6 +4186,30 @@ def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str,
         if isinstance(identity, str):
             normalized[identity_field] = identity.lower()
     return normalized
+
+
+def _ensure_auxiliary_context_qualified(
+    main_runtime: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Reject auxiliary provider dispatch for a required native trial context.
+
+    The continuity runtime owns the requirement; this context-local flag only
+    carries that decision across auxiliary APIs. An explicit runtime override
+    can add a requirement, but cannot clear one already bound to the turn.
+    """
+    ambient = _RUNTIME_MAIN_CONTEXT.get()
+    candidates = (ambient, main_runtime)
+    for runtime in candidates:
+        if not isinstance(runtime, dict):
+            continue
+        api_mode = str(runtime.get("api_mode") or "").strip().lower()
+        if (
+            api_mode == "codex_app_server"
+            and runtime.get("context_dispatch_required") is True
+        ):
+            from ares_runtime.continuity.runtime import ContextDispatchError
+
+            raise ContextDispatchError("CODEX_NATIVE_AUXILIARY_UNQUALIFIED")
 
 
 def _get_provider_chain() -> List[tuple]:
@@ -6061,6 +6111,7 @@ def _resolve_auto_route(
     """
     global auxiliary_is_nous, _stale_base_url_warned
     auxiliary_is_nous = False  # Reset — _try_nous() will set True if it wins
+    _ensure_auxiliary_context_qualified(main_runtime)
     runtime = _normalize_main_runtime(main_runtime)
     runtime_provider = runtime.get("provider", "")
     runtime_model = str(runtime.get("model") or "")
@@ -6419,6 +6470,7 @@ def resolve_provider_client(
     Returns:
         (client, resolved_model) or (None, None) if auth is unavailable.
     """
+    _ensure_auxiliary_context_qualified(main_runtime)
     _validate_proxy_env_urls()
     # Preserve the original provider name before alias normalization so a
     # user-declared ``custom_providers`` entry whose name coincidentally
@@ -7439,6 +7491,7 @@ def resolve_vision_provider_client(
     backends, so users can intentionally force experimental providers. Auto mode
     stays conservative and only tries vision backends known to work today.
     """
+    _ensure_auxiliary_context_qualified(main_runtime)
     runtime = _normalize_main_runtime(main_runtime)
     requested, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         "vision", provider, model, base_url, api_key
@@ -8081,6 +8134,7 @@ def _get_cached_client(
     preventing the fd-exhaustion that previously occurred in long-running
     gateways where recycled worker threads created unbounded entries (#10200).
     """
+    _ensure_auxiliary_context_qualified(main_runtime)
     # Resolve the current event loop for async clients so we can validate
     # cached entries.  Loop identity is NOT in the cache key — instead we
     # check at hit time whether the cached loop is still current and open.
@@ -9456,6 +9510,7 @@ def call_llm(
     route_info: Optional[Dict[str, str]] = None,
 ) -> Any:
     """Run an auxiliary LLM request, applying the configured task limit."""
+    _ensure_auxiliary_context_qualified(main_runtime)
     semaphore = _acquire_sync_aux_semaphore(task)
     if semaphore is not None:
         semaphore.acquire()
@@ -9564,6 +9619,7 @@ def _call_llm_impl(
     Raises:
         RuntimeError: If no provider is configured.
     """
+    _ensure_auxiliary_context_qualified(main_runtime)
     # Capture one immutable runtime snapshot for keying, resolution, retries,
     # and fallbacks. Reading ambient state independently in each phase lets a
     # concurrent /model switch produce a key for one runtime and a client for
@@ -10345,6 +10401,7 @@ async def async_call_llm(
     route_info: Optional[Dict[str, str]] = None,
 ) -> Any:
     """Run an asynchronous auxiliary LLM request under the configured limit."""
+    _ensure_auxiliary_context_qualified(main_runtime)
     semaphore = _acquire_async_aux_semaphore(task)
     if semaphore is not None:
         await semaphore.acquire()
@@ -10391,6 +10448,7 @@ async def _async_call_llm_impl(
 
     Same as call_llm() but async. See call_llm() for full documentation.
     """
+    _ensure_auxiliary_context_qualified(main_runtime)
     # Keep every async phase on the same runtime identity, even if another
     # session switches models while this task is awaiting network I/O.
     main_runtime = _normalize_main_runtime(main_runtime)

@@ -126,6 +126,26 @@ def make_session(client: FakeClient, **kwargs) -> CodexAppServerSession:
     )
 
 
+def emit_compaction_on_request(client, *, turn_id="compact-turn-1", bind_turn=True):
+    """Model new events from a fake request, optionally with an explicit ID.
+
+    The current native compact protocol has no such ID; bound success tests
+    exercise the adapter contract, not native protocol qualification.
+    """
+    notes = list(client._notifications)
+    client._notifications.clear()
+    original_request = client.request
+
+    def request(method, params=None, timeout=30):
+        response = original_request(method, params, timeout)
+        if method == "thread/compact/start":
+            client._notifications.extend(notes)
+            return {"turn": {"id": turn_id}} if bind_turn else {}
+        return response
+
+    client.request = request
+
+
 # ---- choice mapping ----
 
 class TestApprovalChoiceMapping:
@@ -427,6 +447,7 @@ class TestCompactThread:
             turn={"id": "compact-turn-1", "status": "completed", "error": None},
         )
 
+        emit_compaction_on_request(client)
         r = make_session(client).compact_thread(turn_timeout=2.0)
 
         assert ("thread/compact/start", {"threadId": "thread-fake-001"}) in client.requests
@@ -489,6 +510,7 @@ class TestCompactThread:
             },
         )
 
+        emit_compaction_on_request(client)
         result = make_session(client).compact_thread(turn_timeout=2.0)
 
         assert result.error is None
@@ -704,10 +726,8 @@ class TestSessionRetirement:
 
 
 
-    def test_final_agent_message_without_turn_completed_is_recovered(self):
-        """A completed assistant item is still a usable terminal response when
-        codex omits turn/completed and then goes quiet.
-        """
+    def test_final_agent_message_without_turn_completed_remains_partial(self):
+        """Assistant text remains recoverable without proving turn success."""
         client = FakeClient()
         client.queue_notification(
             "item/completed",
@@ -721,15 +741,18 @@ class TestSessionRetirement:
             turn_timeout=0.05,
             notification_poll_timeout=0.01,
         )
-        assert r.final_text == "done"
-        assert r.interrupted is False
-        assert r.error is None
-        assert r.should_retire is False
+        assert r.final_text == ""
+        assert r.partial_text == "done"
+        assert r.completed is False
+        assert r.interrupted is True
+        assert r.error
+        assert r.should_retire is True
+        assert client._closed
         assert any(
             msg["role"] == "assistant" and msg.get("content") == "done"
             for msg in r.projected_messages
         )
-        assert not any(method == "turn/interrupt" for method, _ in client.requests)
+        assert any(method == "turn/interrupt" for method, _ in client.requests)
 
 
     def test_post_tool_watchdog_uses_monotonic_clock(self):
@@ -896,3 +919,464 @@ class TestClassifyOAuthFailure:
         assert _classify_oauth_failure("") is None
         assert _classify_oauth_failure("", None) is None  # type: ignore[arg-type]
 
+
+
+class TestNativeTerminalProof:
+    @pytest.mark.parametrize("terminal", [
+        None,
+        {"threadId": "thread-fake-001", "turn": {"id": "turn-fake-001"}},
+        {"threadId": "thread-fake-001", "turn": {"id": "turn-fake-001", "status": "failed"}},
+        {"threadId": "thread-fake-001", "turn": {"id": "turn-fake-001", "status": "interrupted"}},
+        {"turn": {"status": "completed"}},
+        {"threadId": "thread-fake-001", "turn": {"id": "stale-turn", "status": "completed"}},
+    ])
+    def test_partial_text_requires_matching_completed_terminal(self, terminal):
+        client = FakeClient()
+        client.queue_notification("item/completed", threadId="t", turnId="tu1",
+                                  item={"type": "agentMessage", "id": "m", "text": "partial"})
+        if terminal is not None:
+            client.queue_notification("turn/completed", **terminal)
+        result = make_session(client).run_turn("hi", turn_timeout=0.02)
+        assert result.final_text == ""
+        assert result.partial_text == "partial"
+        assert result.completed is False
+        assert result.error
+
+    def test_matching_terminal_with_completed_status_proves_success(self):
+        client = FakeClient()
+        client.queue_notification("item/completed", threadId="t", turnId="tu1",
+                                  item={"type": "agentMessage", "id": "m", "text": "done"})
+        client.queue_notification("turn/completed", threadId="t",
+                                  turn={"id": "tu1", "status": "completed"})
+        result = make_session(client).run_turn("hi", turn_timeout=0.02)
+        assert result.completed is True
+        assert result.terminal_status == "completed"
+        assert result.final_text == "done"
+
+    def test_terminal_drained_for_approval_roundtrip_proves_success(self):
+        client = FakeClient()
+        client.queue_server_request("item/commandExecution/requestApproval")
+        client.queue_notification("turn/completed", threadId="t",
+                                  turn={"id": "tu1", "status": "completed"})
+        result = make_session(client).run_turn("hi", turn_timeout=0.02)
+        assert result.interrupted is False
+        assert result.completed is True
+
+
+class TestNativeSubscriptionBinding:
+    @staticmethod
+    def trial_client(account=None, model="gpt-test", provider="openai"):
+        client = FakeClient()
+        def request(method, params):
+            if method == "account/read":
+                return {"account": account, "requiresOpenaiAuth": True}
+            if method == "thread/start":
+                return {"thread": {"id": "thread-fake-001"}, "model": model,
+                        "modelProvider": provider}
+            if method == "turn/start":
+                return {"turn": {"id": "turn-fake-001"}}
+            return {}
+        client._request_handler = request
+        return client
+
+    def test_trial_binds_model_and_checks_chatgpt_without_refresh(self):
+        client = self.trial_client({"type": "chatgpt", "planType": "plus"})
+        options = {}
+        def factory(**kwargs):
+            options.update(kwargs)
+            return client
+        session = CodexAppServerSession(cwd="/tmp", model="openai-codex/gpt-test",
+                    provider="openai-codex", subscription_only_trial=True,
+                    client_factory=factory)
+        session.ensure_started()
+        assert options["subscription_only_trial"] is True
+        assert client.requests == [
+            ("account/read", {"refreshToken": False}),
+            ("thread/start", {"cwd": "/tmp", "model": "gpt-test", "modelProvider": "openai"}),
+        ]
+
+    @pytest.mark.parametrize("account", [None, {"type": "apiKey"}, {"type": "custom"}])
+    def test_trial_rejects_non_chatgpt_account_before_turn_start(self, account):
+        client = self.trial_client(account)
+        result = make_session(client, model="gpt-test", provider="openai",
+                              subscription_only_trial=True).run_turn("hi", turn_timeout=0.01)
+        assert result.error
+        assert result.should_retire
+        assert not any(m in {"thread/start", "turn/start"} for m, _ in client.requests)
+        assert client._closed
+
+    @pytest.mark.parametrize("returned_model,returned_provider", [
+        ("other-model", "openai"), ("gpt-test", "custom"), (None, "openai"),
+        ("gpt-test", None),
+    ])
+    def test_trial_rejects_unverified_thread_binding(self, returned_model, returned_provider):
+        client = self.trial_client({"type": "chatgpt"}, returned_model, returned_provider)
+        result = make_session(client, model="gpt-test", provider="openai",
+                              subscription_only_trial=True).run_turn("hi", turn_timeout=0.01)
+        assert result.error
+        assert not any(m == "turn/start" for m, _ in client.requests)
+        assert client._closed
+
+    def test_trial_rejects_custom_provider_before_client_creation(self):
+        calls = []
+        session = CodexAppServerSession(model="gpt-test", provider="custom",
+                    subscription_only_trial=True, client_factory=lambda **kw: calls.append(kw) or FakeClient())
+        result = session.run_turn("hi")
+        assert result.error
+        assert calls == []
+
+    def test_nontrial_keeps_account_read_opt_in(self):
+        client = self.trial_client(model="gpt-test")
+        make_session(client, model="gpt-test", provider="openai-codex").ensure_started()
+        assert not any(m == "account/read" for m, _ in client.requests)
+        assert client.requests[0][1]["modelProvider"] == "openai"
+
+
+class TestNativeInterruptRetirement:
+    @pytest.mark.parametrize("operation", ["turn", "compact"])
+    def test_server_reply_wire_failure_retires_active_session(self, operation):
+        client = FakeClient()
+        session = make_session(client)
+        client.queue_server_request("unknown/server/request")
+
+        def respond_error(*args, **kwargs):
+            session.request_interrupt()
+            raise RuntimeError("stdin closed unexpectedly: Broken pipe")
+
+        client.respond_error = respond_error
+        if operation == "turn":
+            result = session.run_turn("hi", turn_timeout=1)
+        else:
+            emit_compaction_on_request(client)
+            result = session.compact_thread(turn_timeout=1)
+        assert result.error and result.should_retire
+        assert session._closed and client._closed
+        assert session._active_turn_id is None
+        assert not session._interrupt_event.is_set()
+
+    @pytest.mark.parametrize("interrupt_error", [TimeoutError("no ack"),
+        session_mod.CodexAppServerError(code=-32603, message="interrupt failed"),
+        RuntimeError("codex app-server stdin closed unexpectedly: Broken pipe")])
+    def test_unacknowledged_interrupt_closes_child_before_return(self, interrupt_error):
+        client = FakeClient()
+        session = make_session(client)
+        def request(method, params):
+            if method == "thread/start":
+                return {"thread": {"id": "thread-fake-001"}}
+            if method == "turn/start":
+                session.request_interrupt()
+                return {"turn": {"id": "turn-fake-001"}}
+            if method == "turn/interrupt":
+                raise interrupt_error
+            return {}
+        client._request_handler = request
+        result = session.run_turn("hi")
+        assert result.interrupted
+        assert result.should_retire
+        assert client._closed
+        assert result.error
+        assert session._closed
+        assert session._active_turn_id is None
+        assert not session._interrupt_event.is_set()
+
+    @pytest.mark.parametrize("failure_method", ["initialize", "thread/start", "turn/start"])
+    @pytest.mark.parametrize("error", [RuntimeError("stdin closed unexpectedly"), OSError("wire failed")])
+    def test_turn_wire_failure_returns_retired_result(self, failure_method, error):
+        client = FakeClient()
+        session = make_session(client)
+        original_request = client.request
+
+        def request(method, params=None, timeout=30):
+            if method == failure_method:
+                session.request_interrupt()
+                raise error
+            return original_request(method, params, timeout)
+
+        client.request = request
+        if failure_method == "initialize":
+            client.initialize = lambda **kwargs: request("initialize")
+        result = session.run_turn("hi")
+        assert result.error
+        assert result.should_retire
+        assert client._closed and session._closed
+        assert session._active_turn_id is None
+        assert not session._interrupt_event.is_set()
+
+    def test_deadline_closes_child_even_after_interrupt_ack(self):
+        client = FakeClient()
+        result = make_session(client).run_turn("hi", turn_timeout=0.01)
+        assert result.should_retire
+        assert client._closed
+        assert any(m == "turn/interrupt" for m, _ in client.requests)
+
+    def test_text_abort_interrupts_and_closes_child(self):
+        client = FakeClient()
+        client.queue_notification("item/completed", threadId="t", turnId="tu1",
+            item={"type": "agentMessage", "id": "m", "text": "partial <turn_aborted>"})
+        result = make_session(client).run_turn("hi", turn_timeout=0.02)
+        assert result.final_text == ""
+        assert result.partial_text == "partial <turn_aborted>"
+        assert result.should_retire
+        assert client._closed
+        assert any(m == "turn/interrupt" for m, _ in client.requests)
+
+    def test_missing_turn_id_never_proceeds_to_notifications(self):
+        client = FakeClient()
+        def request(method, params):
+            if method == "thread/start":
+                return {"thread": {"id": "thread-fake-001"}}
+            return {}
+        client._request_handler = request
+        result = make_session(client).run_turn("hi", turn_timeout=0.01)
+        assert result.should_retire
+        assert client._closed
+        assert "turn id" in result.error
+
+
+class TestNativeTrialApprovalDenial:
+    @pytest.mark.parametrize("method", ["item/commandExecution/requestApproval",
+        "item/fileChange/requestApproval", "item/permissions/requestApproval",
+        "mcpServer/elicitation/request", "item/tool/call"])
+    def test_trial_denies_requests_before_approval_callback(self, method):
+        client = TestNativeSubscriptionBinding.trial_client({"type": "chatgpt"})
+        calls = []
+        session = make_session(client, model="gpt-test", provider="openai",
+            subscription_only_trial=True, approval_callback=lambda *a, **kw: calls.append(a) or "once",
+            request_routing=_ServerRequestRouting(auto_approve_exec=True, auto_approve_apply_patch=True))
+        session.ensure_started()
+        session._handle_server_request({"id": "request-1", "method": method,
+            "params": {"serverName": "hermes-tools", "command": "touch forbidden"}})
+        assert calls == []
+        if method.endswith("requestApproval"):
+            assert client.responses == [("request-1", {"decision": "decline"})]
+        elif method == "mcpServer/elicitation/request":
+            assert client.responses[0][1]["action"] == "decline"
+        else:
+            assert client.error_responses
+
+
+class TestNativeSessionRouteIdentity:
+    def test_route_identity_normalizes_model_and_provider(self):
+        session = make_session(FakeClient(), model="openai-codex/gpt-test", provider="openai-codex")
+        assert session.matches_route("gpt-test", "openai")
+        assert not session.matches_route("gpt-other", "openai")
+        assert not session.matches_route("gpt-test", "custom")
+        assert not session.matches_route("gpt-test", "openai", subscription_only_trial=True)
+
+    def test_nontrial_rejects_unsupported_provider_before_creation(self):
+        calls = []
+        session = CodexAppServerSession(model="gpt-test", provider="custom",
+            client_factory=lambda **kw: calls.append(kw) or FakeClient())
+        result = session.run_turn("hi")
+        assert result.error
+        assert calls == []
+
+
+class TestNativeConflictingTerminal:
+    @pytest.mark.parametrize("terminal", [
+        {"threadId": "thread-fake-001", "turnId": "turn-fake-001",
+         "turn": {"id": "stale-turn", "status": "completed"}},
+        {"threadId": "thread-fake-001", "turn": {"id": "turn-fake-001",
+         "threadId": "other-thread", "status": "completed"}},
+        {"threadId": "thread-fake-001", "turn": {"id": "turn-fake-001",
+         "status": "completed", "error": {"message": "failed anyway"}}},
+    ])
+    def test_conflicting_terminal_cannot_prove_success(self, terminal):
+        client = FakeClient()
+        client.queue_notification("item/completed", threadId="t", turnId="tu1",
+            item={"type": "agentMessage", "id": "m", "text": "partial"})
+        client.queue_notification("turn/completed", **terminal)
+        result = make_session(client).run_turn("hi", turn_timeout=0.01)
+        assert result.completed is False
+        assert result.final_text == ""
+        assert result.error
+
+
+class TestNativeMalformedStartup:
+    def test_missing_binary_is_structured_startup_failure(self):
+        def factory(**kwargs):
+            raise FileNotFoundError("missing fake binary")
+        result = CodexAppServerSession(client_factory=factory).run_turn("hi")
+        assert result.error
+        assert result.should_retire
+        assert result.completed is False
+
+    def test_malformed_turn_response_closes_child(self):
+        client = FakeClient()
+        def request(method, params):
+            if method == "thread/start":
+                return {"thread": {"id": "thread-fake-001"}}
+            return {"turn": ["invalid"]}
+        client._request_handler = request
+        result = make_session(client).run_turn("hi", turn_timeout=0.01)
+        assert result.error
+        assert result.should_retire
+        assert client._closed
+
+
+class TestNativeCompactionTerminalProof:
+    @pytest.mark.parametrize("preexisting", [False, True])
+    def test_no_id_ack_cannot_certify_even_typed_compact_lifecycle(self, preexisting):
+        client = FakeClient()
+        client.queue_notification("turn/started", threadId="t", turn={"id": "old"})
+        client.queue_notification("item/completed", threadId="t", turnId="old",
+            item={"type": "contextCompaction", "id": "compacted"})
+        client.queue_notification("item/completed", threadId="t", turnId="old",
+            item={"type": "agentMessage", "id": "m", "text": "old summary"})
+        client.queue_notification("turn/completed", threadId="t",
+            turn={"id": "old", "status": "completed"})
+        if not preexisting:
+            emit_compaction_on_request(client, bind_turn=False)
+        result = make_session(client).compact_thread(turn_timeout=0.01)
+        assert not result.completed and result.final_text == ""
+        assert result.should_retire and client._closed
+        assert "correlat" in result.error
+
+    def test_compaction_ack_cannot_reuse_known_previous_turn(self):
+        client = FakeClient()
+        session = make_session(client)
+        client.queue_notification("turn/completed", threadId="t",
+            turn={"id": "turn-fake-001", "status": "completed"})
+        assert session.run_turn("hi", turn_timeout=0.01).completed
+        client.queue_notification("turn/started", threadId="t", turn={"id": "turn-fake-001"})
+        client.queue_notification("turn/completed", threadId="t",
+            turn={"id": "turn-fake-001", "status": "completed"})
+        emit_compaction_on_request(client, turn_id="turn-fake-001")
+        result = session.compact_thread(turn_timeout=0.01)
+        assert not result.completed and result.should_retire
+        assert client._closed and result.final_text == ""
+
+    def test_compaction_ack_cannot_accept_prequeued_matching_lifecycle(self):
+        client = FakeClient()
+        client.queue_notification("turn/started", threadId="t", turn={"id": "prior"})
+        client.queue_notification("turn/completed", threadId="t",
+            turn={"id": "prior", "status": "completed"})
+        original_request = client.request
+
+        def request(method, params=None, timeout=30):
+            response = original_request(method, params, timeout)
+            return {"turn": {"id": "prior"}} if method == "thread/compact/start" else response
+
+        client.request = request
+        result = make_session(client).compact_thread(turn_timeout=0.01)
+        assert not result.completed and result.should_retire and client._closed
+
+    def test_compaction_requires_explicit_same_thread_start_before_terminal(self):
+        client = FakeClient()
+        client.queue_notification("turn/started", turn={"id": "compact-1"})
+        client.queue_notification("turn/completed", threadId="t",
+            turn={"id": "compact-1", "status": "completed"})
+        emit_compaction_on_request(client, turn_id="compact-1")
+        result = make_session(client).compact_thread(turn_timeout=0.01)
+        assert not result.completed and result.should_retire and client._closed
+
+    def test_compaction_ignores_terminal_before_bound_start(self):
+        client = FakeClient()
+        client.queue_notification("turn/completed", threadId="t",
+            turn={"id": "compact-1", "status": "completed"})
+        client.queue_notification("turn/started", threadId="t", turn={"id": "compact-1"})
+        emit_compaction_on_request(client, turn_id="compact-1")
+        result = make_session(client).compact_thread(turn_timeout=0.01)
+        assert not result.completed and result.should_retire and client._closed
+
+    @pytest.mark.parametrize("terminal_status", [None, "failed", "interrupted", "completed"])
+    def test_compaction_exposes_text_only_for_completed_terminal(self, terminal_status):
+        client = FakeClient()
+        client.queue_notification("turn/started", threadId="t", turn={"id": "compact-1"})
+        client.queue_notification("item/completed", threadId="t", turnId="compact-1",
+            item={"type": "agentMessage", "id": "m", "text": "compact summary"})
+        client.queue_notification("turn/completed", threadId="t",
+            turn={"id": "compact-1", "status": terminal_status})
+        emit_compaction_on_request(client, turn_id="compact-1")
+        result = make_session(client).compact_thread(turn_timeout=0.01)
+        assert result.completed is (terminal_status == "completed")
+        assert result.final_text == ("compact summary" if result.completed else "")
+        assert result.partial_text == "compact summary"
+        assert result.error is None if result.completed else result.error
+
+
+class TestNativeCompactionRetirement:
+    @pytest.mark.parametrize("error", [TimeoutError("no compact ack"),
+        session_mod.CodexAppServerError(code=-32603, message="invalid_grant")])
+    def test_compaction_start_uncertainty_closes_child(self, error):
+        client = FakeClient()
+        def request(method, params):
+            if method == "thread/start":
+                return {"thread": {"id": "thread-fake-001"}}
+            if method == "thread/compact/start":
+                raise error
+            return {}
+        client._request_handler = request
+        result = make_session(client).compact_thread(turn_timeout=0.01)
+        assert result.error
+        assert result.should_retire
+        assert client._closed
+
+    @pytest.mark.parametrize("failure_method", ["initialize", "thread/start", "thread/compact/start"])
+    def test_compact_wire_failure_returns_retired_result(self, failure_method):
+        client = FakeClient()
+        session = make_session(client)
+        original_request = client.request
+
+        def request(method, params=None, timeout=30):
+            if method == failure_method:
+                session.request_interrupt()
+                raise RuntimeError("stdin closed unexpectedly: Broken pipe")
+            return original_request(method, params, timeout)
+
+        client.request = request
+        if failure_method == "initialize":
+            client.initialize = lambda **kwargs: request("initialize")
+        result = session.compact_thread(turn_timeout=0.01)
+        assert result.error and result.should_retire
+        assert client._closed and session._closed
+        assert session._active_turn_id is None
+        assert not session._interrupt_event.is_set()
+
+    @pytest.mark.parametrize("interrupt_error", [None, RuntimeError("Broken pipe"), TimeoutError("no ack")])
+    def test_compact_cancel_clears_active_turn(self, interrupt_error):
+        client = FakeClient()
+        session = make_session(client)
+        client.queue_notification("turn/started", threadId="t", turn={"id": "compact-1"})
+        emit_compaction_on_request(client, turn_id="compact-1")
+        original_take = client.take_notification
+        observed_active = []
+
+        def take(timeout=0):
+            if timeout > 0 and not client._notifications:
+                observed_active.append(session._active_turn_id)
+                session.request_interrupt()
+            return original_take(timeout)
+
+        client.take_notification = take
+        original_request = client.request
+
+        def request(method, params=None, timeout=30):
+            if method == "turn/interrupt" and interrupt_error is not None:
+                raise interrupt_error
+            return original_request(method, params, timeout)
+
+        client.request = request
+        result = session.compact_thread(turn_timeout=1)
+        assert observed_active == ["compact-1"]
+        assert result.interrupted and result.error
+        assert result.should_retire is (interrupt_error is not None)
+        assert client._closed is (interrupt_error is not None)
+        assert session._active_turn_id is None
+        assert not session._interrupt_event.is_set()
+
+    def test_compact_cancel_during_startup_does_not_launch_work(self):
+        client = FakeClient()
+        session = make_session(client)
+        original_initialize = client.initialize
+
+        def initialize(**kwargs):
+            session.request_interrupt()
+            return original_initialize(**kwargs)
+
+        client.initialize = initialize
+        result = session.compact_thread(turn_timeout=0.01)
+        assert result.interrupted
+        assert not any(method == "thread/compact/start" for method, _ in client.requests)
+        assert session._active_turn_id is None
+        assert not session._interrupt_event.is_set()

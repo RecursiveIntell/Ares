@@ -533,6 +533,27 @@ def _refuse_checkpoint_required_on_codex_app_server(
         )
 
 
+def _configured_context_rebase_enabled(config: Optional[Dict[str, Any]] = None) -> bool:
+    """Return the existing continuity config gate without creating state."""
+    try:
+        if config is None:
+            from hermes_cli.config import load_config_readonly
+
+            config = load_config_readonly()
+        from utils import is_truthy_value
+
+        compression = config.get("compression") if isinstance(config, dict) else None
+        if not isinstance(compression, dict):
+            return False
+        return is_truthy_value(
+            compression.get("context_rebase_enabled"), default=False
+        )
+    except Exception:
+        raise RuntimeError(
+            "codex_app_server cannot verify compression.context_rebase_enabled"
+        ) from None
+
+
 def init_agent(
     agent,
     base_url: str = None,
@@ -712,6 +733,63 @@ def init_agent(
         if isinstance(requested_provider, str) and requested_provider.strip()
         else agent.provider
     )
+
+    # Direct AIAgent construction must honor the same configured native route
+    # as runtime_provider before it reaches generic credentials or SDK setup.
+    # Explicit alternate modes remain caller-authoritative outside continuity
+    # trials; during a required native trial they cannot widen the route.
+    if api_mode != "codex_app_server":
+        try:
+            from hermes_cli.config import load_config_readonly
+            from hermes_cli.runtime_provider import _native_codex_app_server_requested
+
+            _native_config = load_config_readonly()
+        except Exception:
+            raise RuntimeError(
+                "cannot verify model.api_mode/openai_runtime Codex app-server selection"
+            ) from None
+        _native_model_cfg = (
+            _native_config.get("model")
+            if isinstance(_native_config, dict)
+            else None
+        )
+        _native_model_cfg = (
+            _native_model_cfg if isinstance(_native_model_cfg, dict) else {}
+        )
+        if _native_codex_app_server_requested(_native_model_cfg):
+            _native_trial = _configured_context_rebase_enabled(_native_config)
+            _configured_native_api_mode = (
+                str(_native_model_cfg.get("api_mode") or "").strip().lower()
+                == "codex_app_server"
+            )
+            _raw_configured_default = _native_model_cfg.get("default")
+            _configured_provider = str(
+                agent.provider
+                or _native_model_cfg.get("provider")
+                or (
+                    _raw_configured_default.get("provider")
+                    if isinstance(_raw_configured_default, dict)
+                    else ""
+                )
+                or ""
+            ).strip().lower()
+            if _configured_provider not in {"openai", "openai-codex"}:
+                if _native_trial or _configured_native_api_mode:
+                    raise ValueError(
+                        "codex_app_server requires provider 'openai' or 'openai-codex'"
+                    )
+            else:
+                if _native_trial and api_mode is not None:
+                    raise ValueError(
+                        "explicit api_mode cannot override configured codex_app_server "
+                        "with compression.context_rebase_enabled"
+                    )
+                if api_mode is None:
+                    api_mode = "codex_app_server"
+                    if not agent.provider:
+                        agent.provider = _configured_provider
+                        if not agent.requested_provider:
+                            agent.requested_provider = _configured_provider
     agent._credential_pool = credential_pool
     agent.acp_command = acp_command or command
     agent.acp_args = list(acp_args or args or [])
@@ -774,6 +852,21 @@ def init_agent(
         else:
             agent.api_mode = "chat_completions"
 
+    if agent.api_mode == "codex_app_server":
+        if agent.provider not in {"openai", "openai-codex"}:
+            raise ValueError(
+                "codex_app_server requires provider 'openai' or 'openai-codex'"
+            )
+        if _configured_context_rebase_enabled():
+            if base_url or api_key:
+                raise ValueError(
+                    "codex_app_server with compression.context_rebase_enabled "
+                    "does not accept explicit API credentials or base_url"
+                )
+            raise ValueError(
+                "codex_app_server is not qualified for compression.context_rebase_enabled"
+            )
+
     # Credential-pool validation runs AFTER provider auto-detection so
     # a pool scoped to e.g. "anthropic" is not rejected when the agent
     # was constructed with provider=None and an anthropic.com URL.
@@ -794,10 +887,11 @@ def init_agent(
 
     # Eagerly warm the transport cache so import errors surface at init,
     # not mid-conversation.  Also validates the api_mode is registered.
-    try:
-        agent._get_transport()
-    except Exception:
-        pass  # Non-fatal — transport may not exist for all modes yet
+    if agent.api_mode != "codex_app_server":
+        try:
+            agent._get_transport()
+        except Exception:
+            pass  # Non-fatal — transport may not exist for all modes yet
 
     try:
         from hermes_cli.model_normalize import (
@@ -1283,6 +1377,14 @@ def init_agent(
         if not agent.quiet_mode:
             _gr_label = " + Guardrails" if agent._bedrock_guardrail_config else ""
             print(f"🤖 AI Agent initialized with model: {agent.model} (AWS Bedrock, {agent._bedrock_region}{_gr_label})")
+    elif agent.api_mode == "codex_app_server":
+        # Native Codex app-server owns transport and authentication. Keep the
+        # generic OpenAI SDK router completely out of this init path.
+        agent.client = None
+        agent.api_key = ""
+        agent._client_kwargs = {}
+        if not agent.quiet_mode:
+            print(f"🤖 AI Agent initialized with model: {agent.model} (Codex app-server)")
     else:
         client_kwargs = {}
         if api_key and base_url:
