@@ -7693,8 +7693,21 @@ async function retainGroupTurnRoute(member) {
  *  exactly once more. Returns the runtime id the submit actually landed on so
  *  the poll loop keeps a live fallback target. */
 async function submitGroupTurnPrompt(member, runtime, stored, text, occurrence, canSubmit) {
+  const submit = async target => {
+    if (occurrence) occurrence.admissionRefused = false
+    try {
+      return await requestForBot(member, 'prompt.submit', { session_id: target, text })
+    } catch (error) {
+      // The gateway rejects a missing runtime before prompt admission. A
+      // cancelled remint/probe after that refusal owns no accepted turn.
+      if (occurrence && (error?.code === 4001 || error?.code === 4090 || error?.code === 'POOL_CAPACITY_EXCEEDED')) {
+        occurrence.admissionRefused = true
+      }
+      throw error
+    }
+  }
   try {
-    const ack = await requestForBot(member, 'prompt.submit', { session_id: runtime, text })
+    const ack = await submit(runtime)
 
     return { runtime, acceptedTurn: groupAcceptedTurn(ack?.accepted_turn, runtime) }
   } catch (error) {
@@ -7730,7 +7743,7 @@ async function submitGroupTurnPrompt(member, runtime, stored, text, occurrence, 
       if (occurrence?.cancelled) await interruptGroupOccurrence(occurrence)
       throw error
     }
-    const ack = await requestForBot(member, 'prompt.submit', { session_id: fresh, text })
+    const ack = await submit(fresh)
 
     return { runtime: fresh, acceptedTurn: groupAcceptedTurn(ack?.accepted_turn, fresh) }
   }
@@ -8343,7 +8356,7 @@ function interruptStoppedGroupMarker(group, memberKey, marker, target) {
 }
 
 function groupOccurrenceStopConfirmed(occurrence) {
-  if (occurrence.submissionPending || occurrence.answerPromise || groupOccurrenceHasPendingInterrupt(occurrence)) return false
+  if (occurrence.preparationPending || occurrence.submissionPending || occurrence.answerPromise || groupOccurrenceHasPendingInterrupt(occurrence)) return false
   if (occurrence.terminalObserved) return true
   if (!occurrence.submitAttempted) return Boolean(occurrence.collectorDone)
   return false // A matching interrupt ACK still needs exact terminal evidence.
@@ -8354,7 +8367,7 @@ function groupOccurrenceHasPendingInterrupt(occurrence) {
 }
 
 function groupOccurrenceInterruptApplied(occurrence) {
-  return !occurrence.submissionPending && !occurrence.answerPromise &&
+  return !occurrence.preparationPending && !occurrence.submissionPending && !occurrence.answerPromise &&
     occurrence.interrupts.get(`${occurrence.runtime}::${occurrence.admissionVersion || 0}`)?.confirmed === true
 }
 
@@ -8509,6 +8522,7 @@ function retainUnresolvedGroupOccurrence(occurrence) {
 }
 
 async function executeGroupOccurrence(occurrence) {
+  occurrence.preparationPending = true
   try {
     const release = await retainGroupTurnRoute(occurrence.captured.requestMember)
     let released = false
@@ -8520,6 +8534,7 @@ async function executeGroupOccurrence(occurrence) {
     return await runGroupChatMemberTurnLeased(occurrence.group, occurrence.captured,
       occurrence.prompt, occurrence.thread, occurrence.images, occurrence.deliveryResult, occurrence)
   } finally {
+    occurrence.preparationPending = false
     // Stop owns any interrupt through its acknowledgement, including a runtime
     // that became available during acquisition. Successors cannot start yet.
     if (occurrence.answerPromise) await occurrence.answerPromise.catch(() => undefined)
@@ -8647,7 +8662,10 @@ async function runGroupChatMemberTurnLeased(group, captured, prompt, thread, ima
       consumeGroupTurnMarker(group, memberKey, marker)
       return discarded()
     }
-    if (occurrence) { occurrence.phase = 'running'; paintGroupOccurrences(occurrence.coordinator) }
+    if (occurrence) {
+      occurrence.preparationPending = false
+      occurrence.phase = 'running'; paintGroupOccurrences(occurrence.coordinator)
+    }
     recordGroupActivity(group, { kind: 'working', member: member.name, thread })
     const fileRefs = []
     for (const img of Array.isArray(images) ? images : []) {
@@ -8812,8 +8830,8 @@ async function runGroupChatMemberTurnLeased(group, captured, prompt, thread, ima
     return null
   } catch (error) {
     group = occurrence?.group || group
-    if (!submitAttempted || error?.code === 4090 || error?.code === 'POOL_CAPACITY_EXCEEDED') {
-      if (error?.code === 4090 || error?.code === 'POOL_CAPACITY_EXCEEDED') {
+    if (!submitAttempted || occurrence?.admissionRefused || error?.code === 4090 || error?.code === 'POOL_CAPACITY_EXCEEDED') {
+      if (occurrence?.admissionRefused || error?.code === 4090 || error?.code === 'POOL_CAPACITY_EXCEEDED') {
         if (occurrence) occurrence.submitAttempted = false
         error.data = { ...error.data, outcomeState: 'admission-refused', reason: error.message }
       }

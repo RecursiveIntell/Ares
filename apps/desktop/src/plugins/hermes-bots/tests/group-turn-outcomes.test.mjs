@@ -436,10 +436,18 @@ test('explicit stop exits the collector and never collects its late complete out
   let stopped = false
   const h = await harness({ alpha: [async (s, gc) => {
     if (!stopped) { stopped = true; await gc.stopGroupThread('Room', 'thread-1', [ALPHA, BETA]) }
-    return { turn_outcomes: wire(s.ref, 'running', [final('late candidate')]) }
-  }] })
+    return { turn_outcomes: wire(s.ref, s.terminalAfterStop ? 'complete' : 'running', [final('late candidate')]) }
+  }] }, { connectionId: 'pc' })
   assert.equal(await run(h), null)
+  const marker = room(h).stranded.alpha
+  assert.equal(marker.stop_requested, true)
+  assert.deepEqual(marker.delivery.accepted_turn, h.sessions.get('alpha').ref)
+  assert.equal(h.releases(), 0, 'running custody outlives the interrupt ACK')
+  h.sessions.get('alpha').terminalAfterStop = true
+  await h.gc.harvestStrandedGroupReply('Room', ALPHA)
+  await new Promise(resolve => setImmediate(resolve))
   assert.equal(room(h).stranded.alpha, undefined)
+  assert.equal(h.releases(), 1, 'the exact terminal read releases custody after control settles')
   assert.equal(posts(h).length, 0)
   assert.equal(h.rpc('prompt.submit').length, 1)
 })
@@ -716,12 +724,22 @@ test('rejected read-only poll is visible immediately and next member advances on
 })
 
 test('stopped turn discards an in-flight poll rejection without stale failure publication', async () => {
-  const h = await harness({ alpha: [async (_s, gc) => {
-    await gc.stopGroupThread('Room', 'thread-1', [ALPHA])
+  let stopped = false
+  const h = await harness({ alpha: [async (s, gc) => {
+    if (!stopped) { stopped = true; await gc.stopGroupThread('Room', 'thread-1', [ALPHA]) }
+    if (s.terminalAfterStop) return { turn_outcomes: wire(s.ref, 'complete', [final('late rejected candidate')]) }
     throw new Error('late lost observer')
-  }] }, { members: [ALPHA] })
+  }] }, { members: [ALPHA], connectionId: 'pc' })
   assert.equal(await run(h), null)
+  assert.equal(room(h).stranded.alpha.stop_requested, true)
+  assert.deepEqual(room(h).stranded.alpha.delivery.accepted_turn, h.sessions.get('alpha').ref)
+  assert.equal(h.rpc('prompt.submit').length, 1)
+  assert.equal(h.releases(), 0, 'a rejected observation is not terminal evidence')
+  h.sessions.get('alpha').terminalAfterStop = true
+  await h.gc.harvestStrandedGroupReply('Room', ALPHA)
+  await new Promise(resolve => setImmediate(resolve))
   assert.equal(room(h).stranded.alpha, undefined)
+  assert.equal(h.releases(), 1)
   assert.equal(posts(h).length, 0)
   assert.equal(h.gc.currentGroupActivity('Room').filter(e => e.kind === 'unavailable').length, 0)
 })

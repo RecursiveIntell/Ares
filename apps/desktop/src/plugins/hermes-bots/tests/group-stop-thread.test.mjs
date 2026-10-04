@@ -224,21 +224,25 @@ test('stopGroupThread with nobody on turn stops the room without any interrupt R
   assert.equal(gc.$groupChats.get().Room.epoch, 4)
 })
 
-test('stopGroupThread records a stopped activity event visible in the CURRENT run', async () => {
+test('stopGroupThread records an honest legacy stop-unconfirmed event in the CURRENT run', async () => {
   const gc = load()
   seedRoom(gc)
 
   await gc.stopGroupThread('Room', 't1', MEMBERS)
 
   const events = gc.currentGroupActivity('Room')
-  const stopped = events.find(event => event.kind === 'stopped')
+  const stopped = events.find(event => event.kind === 'stop-unconfirmed')
   assert.ok(stopped, 'stopped event is tagged with the POST-bump epoch, so it survives the epoch filter')
   assert.equal(stopped.member, 'You')
   assert.equal(stopped.thread, 't1')
   // The label comes from the shared GROUP_ACTIVITY_LABELS map (the plugin's
   // label pattern) — and stays plain English, no hardcoded localized text.
-  assert.ok(gc.GROUP_ACTIVITY_LABELS.stopped)
-  assert.ok(gc.GROUP_ACTIVITY_GLYPHS.stopped)
+  assert.ok(gc.GROUP_ACTIVITY_LABELS['stop-unconfirmed'])
+  assert.ok(gc.GROUP_ACTIVITY_GLYPHS['stop-unconfirmed'])
+  const idle = load()
+  seedRoom(idle, { turn: null })
+  assert.equal((await idle.stopGroupThread('Room', 't1', MEMBERS)).status, 'stopped')
+  assert.ok(idle.currentGroupActivity('Room').some(event => event.kind === 'stopped' && event.epoch === 4))
 })
 
 test('stopGroupThread falls back to the durable room roster when called without members', async () => {
