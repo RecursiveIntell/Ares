@@ -513,6 +513,14 @@ describe('actual producer/store/admission composition', () => {
   })
 
   it('refuses the actual Settings confirmation retry after A changes to B with the same logical profile', async () => {
+    vi.mocked(getGlobalModelOptions).mockImplementation(async (_opts, scope) => {
+      const connectionId = scope && typeof scope === 'object' ? scope.connectionId : getApiRequestConnection()
+      const pair = connectionId === b.connectionId ? defaultB : defaultA
+
+      return {
+        providers: [{ slug: pair.provider, name: 'Offline owner', authenticated: true, models: [pair.model] }]
+      }
+    })
     const value = await setup(1)
     await seed(value)
     const assignmentSources: (string | null)[] = []

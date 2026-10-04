@@ -66,6 +66,14 @@ describe('model-status-label', () => {
       expect(currentPickerSelection({ model: 'opus', provider: '' }, options)).toEqual(options)
     })
 
+    it('keeps an authoritative scalar receipt without inventing its provider from a stale catalog', () => {
+      expect(currentPickerSelection({ model: 'scalar', provider: '', authoritative: true }, options)).toEqual({ model: 'scalar', provider: '' })
+    })
+
+    it('still hydrates an empty pair even when a caller marks it authoritative', () => {
+      expect(currentPickerSelection({ model: '', provider: '', authoritative: true }, options)).toEqual(options)
+    })
+
     it('falls back to the store while options are still loading', () => {
       expect(currentPickerSelection(store, undefined)).toEqual(store)
     })

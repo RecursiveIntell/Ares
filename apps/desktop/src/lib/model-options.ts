@@ -42,7 +42,7 @@ export function modelOptionsQueryKey(
 ) {
   const profileKey = (profile ?? '').trim() || 'default'
 
-  const sourceKey = connectionId && connectionId !== 'local' ? `${connectionId}::${profileKey}` : profileKey
+  const sourceKey = connectionId ? `${connectionId}::${profileKey}` : profileKey
 
   return ['model-options', sourceKey, sessionId || 'global'] as const
 }
@@ -57,6 +57,7 @@ function restModelOptions(
   profile: ProfileScope
 ): Promise<ModelOptionsResponse> {
   const opts = { explicitOnly, ...(refresh ? { refresh: true } : {}) }
+
   return getGlobalModelOptions(opts, profile)
 }
 
@@ -71,7 +72,7 @@ export async function requestModelOptions({
 }: ModelOptionsRequest): Promise<ModelOptionsResponse> {
   // Capture the owner before either async leg; foreground source changes must
   // not redirect a late REST recovery into another profile or connection.
-  const scope = { connectionId: connectionId || 'local', profile: profile ?? getApiRequestProfile() ?? 'default' }
+  const scope = { connectionId, profile: profile ?? getApiRequestProfile() ?? 'default' }
   const dispatch = request ?? (gateway ? gateway.request.bind(gateway) : null)
 
   if (dispatch) {
