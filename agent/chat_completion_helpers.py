@@ -2472,7 +2472,9 @@ def _fallback_reason_text(reason: "FailoverReason | None") -> str:
     return str(value or reason or "provider failure").replace("_", " ")
 
 
-def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
+def try_activate_fallback(
+    agent, reason: "FailoverReason | None" = None, *, _continuing_chain: bool = False
+) -> bool:
     """Switch to the next fallback model/provider in the chain.
 
     Called when the current model is failing after retries.  Swaps the
@@ -2484,7 +2486,10 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
-    if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
+    # Restoring the primary after an inadmissible candidate must not turn the
+    # internal chain walk into another originating provider failure. Separate
+    # public calls still arm backoff even when the chain is already exhausted.
+    if not _continuing_chain and reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
         # source of the 429 so the cooldown should not be reset/extended.
@@ -2532,11 +2537,11 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         agent._unavailable_fallback_keys = unavailable
     if fb_key in unavailable:
         logger.debug("Fallback skip: %s previously marked unavailable", fb_key)
-        return agent._try_activate_fallback(reason)
+        return try_activate_fallback(agent, reason, _continuing_chain=True)
     fb_provider = (fb.get("provider") or "").strip().lower()
     fb_model = (fb.get("model") or "").strip()
     if not fb_provider or not fb_model:
-        return agent._try_activate_fallback(reason)  # skip invalid, try next
+        return try_activate_fallback(agent, reason, _continuing_chain=True)  # skip invalid, try next
 
     local_skip_reason = _fallback_entry_unavailable_without_network(agent, fb)
     if local_skip_reason:
@@ -2547,7 +2552,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             fb_model,
             local_skip_reason,
         )
-        return agent._try_activate_fallback(reason)
+        return try_activate_fallback(agent, reason, _continuing_chain=True)
 
     # Skip entries that resolve to the same backend that just failed —
     # falling back to it loops the failure. Identity semantics (which axes
@@ -2572,11 +2577,15 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             "as the current one (%s)",
             fb_provider, fb_model, current_ident.base_url or current_ident.provider,
         )
-        return agent._try_activate_fallback(reason)
+        return try_activate_fallback(agent, reason, _continuing_chain=True)
 
     # Use centralized router for client construction.
     # raw_codex=True because the main agent needs direct responses.stream()
     # access for Codex providers.
+    from agent.agent_runtime_helpers import _snapshot_context_handoff
+
+    restore_handoff = _snapshot_context_handoff(agent)
+    handoff_accepted = False
     try:
         from agent.auxiliary_client import resolve_provider_client
         # Pass base_url and api_key from fallback config so custom
@@ -2629,7 +2638,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 "Fallback to %s failed: provider not configured",
                 fb_provider)
             unavailable.add(fb_key)
-            return agent._try_activate_fallback(reason)  # try next in chain
+            return try_activate_fallback(agent, reason, _continuing_chain=True)  # try next in chain
         try:
             from hermes_cli.model_normalize import normalize_model_for_provider
 
@@ -2844,10 +2853,12 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 api_key=getattr(agent, "api_key", ""),  # callable preserved → call_llm
                 provider=agent.provider,
                 api_mode=agent.api_mode,
+                max_tokens=getattr(agent, "max_tokens", None),
                 threshold_percent=_effective_compression_threshold_percent(
                     agent.model, agent.provider
                 ),
             )
+        handoff_accepted = True
 
         # Re-resolve reasoning_config for the new fallback model (Closes #21256).
         # Shared chokepoint: per-model override > global reasoning_effort
@@ -2906,10 +2917,12 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         _reset_stale_streak(agent)
         return True
     except Exception as e:
+        if not handoff_accepted:
+            restore_handoff()
         if fb_provider == "nous":
             unavailable.add(fb_key)
         logger.error("Failed to activate fallback %s: %s", fb_model, e)
-        return agent._try_activate_fallback(reason)  # try next in chain
+        return try_activate_fallback(agent, reason, _continuing_chain=True)  # try next in chain
 
 
 

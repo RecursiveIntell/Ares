@@ -1508,6 +1508,64 @@ def drop_thinking_only_and_merge_users(
 
 
 
+def _snapshot_context_handoff(agent):
+    """Return a rollback for host state until the context engine accepts a route.
+
+    Keep engine admission and durable state with their existing owners. This
+    captures only reversible host fields; fallback index/cooldown progress must
+    survive refusal so rejected candidates are not retried indefinitely.
+    """
+    missing = object()
+    snapshot = {
+        name: getattr(agent, name, missing)
+        for name in (
+            "model", "provider", "requested_provider", "base_url", "api_mode",
+            "api_key", "client", "_anthropic_client", "_anthropic_api_key",
+            "_anthropic_base_url", "_is_anthropic_oauth", "_client_kwargs",
+            "_credential_pool", "_credential_pool_entry_id",
+            "_config_context_length", "_custom_providers", "_reasoning_echo_flag",
+            "_use_prompt_caching", "_use_native_cache_layout", "_transport_cache",
+            "_fallback_activated",
+        )
+    }
+    # Preserve cache/kwargs identity as well as contents: clearing a live dict
+    # must not poison the rollback target or a reference held by its caller.
+    dict_contents = {
+        name: dict(value) for name, value in snapshot.items()
+        if name in {"_client_kwargs", "_transport_cache"} and isinstance(value, dict)
+    }
+
+    def restore():
+        rejected_clients = (
+            getattr(agent, "client", None),
+            getattr(agent, "_anthropic_client", None),
+        )
+        for name, value in snapshot.items():
+            if value is missing:
+                if hasattr(agent, name):
+                    delattr(agent, name)
+            else:
+                if name in dict_contents:
+                    value.clear()
+                    value.update(dict_contents[name])
+                setattr(agent, name, value)
+        # Retire only newly attached clients, never the restored shared ones.
+        # Socket shutdown defers FD release to GC instead of hard-closing a
+        # shared client from a thread whose earlier request may still unwind.
+        preserved = (snapshot["client"], snapshot["_anthropic_client"])
+        retired = set()
+        for client in rejected_clients:
+            if client is None or any(client is old for old in preserved) or id(client) in retired:
+                continue
+            retired.add(id(client))
+            try:
+                agent._retire_shared_openai_client(client, reason="context_handoff_refused")
+            except Exception:
+                logger.debug("Rejected context handoff client retirement failed", exc_info=True)
+
+    return restore
+
+
 def restore_primary_runtime(agent) -> bool:
     """Restore the primary runtime at the start of a new turn.
 
@@ -1622,6 +1680,8 @@ def restore_primary_runtime(agent) -> bool:
     provider_fallback_active = bool(
         getattr(agent, "_provider_fallback_active", False)
     )
+    restore_handoff = _snapshot_context_handoff(agent)
+    handoff_accepted = False
     try:
         # ── Core runtime state ──
         agent.model = rt["model"]
@@ -1679,14 +1739,19 @@ def restore_primary_runtime(agent) -> bool:
 
         # ── Restore context engine state ──
         cc = agent.context_compressor
-        cc.update_model(
+        from agent.auxiliary_client import _update_compressor_model
+
+        _update_compressor_model(
+            cc,
             model=rt["compressor_model"],
             context_length=rt["compressor_context_length"],
             base_url=rt["compressor_base_url"],
             api_key=rt["compressor_api_key"],
             provider=rt["compressor_provider"],
             api_mode=rt.get("compressor_api_mode", ""),
+            max_tokens=getattr(agent, "max_tokens", None),
         )
+        handoff_accepted = True
 
         # ── Rebind and re-select the primary credential pool ──
         # A cross-provider fallback attaches the fallback provider's pool. The
@@ -1824,6 +1889,8 @@ def restore_primary_runtime(agent) -> bool:
                 pass
         return True
     except Exception as e:
+        if not handoff_accepted:
+            restore_handoff()
         logger.warning("Failed to restore primary runtime: %s", e)
         return False
 
@@ -2768,56 +2835,10 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     old_model = agent.model
     old_provider = agent.provider
 
-    # ── Snapshot all fields the swap+rebuild can mutate ──
-    # If the rebuild raises (bad API key, network error, build_anthropic_client
-    # failure, etc.) we restore these atomically so the agent isn't left with a
-    # new model/provider name paired with the OLD client — that mismatch causes
-    # HTTP 400s like "claude-sonnet-4-6 is not supported on openai-codex" on the
-    # next turn.  Callers in cli.py / gateway/run.py / tui_gateway/server.py
-    # catch the re-raised exception and show the user a warning; without this
-    # rollback the warning is misleading because the swap partially succeeded.
-    # Use a sentinel so we can distinguish "attribute was unset" from
-    # "attribute was None" and skip the restore for genuinely-missing
-    # attributes (tests construct bare agents via __new__ without all fields).
-    _MISSING = object()
-    _snapshot = {
-        name: getattr(agent, name, _MISSING)
-        for name in (
-            "model",
-            "provider",
-            "requested_provider",
-            "base_url",
-            "api_mode",
-            "api_key",
-            "client",
-            "_anthropic_client",
-            "_anthropic_api_key",
-            "_anthropic_base_url",
-            "_is_anthropic_oauth",
-            "_config_context_length",
-            "_reasoning_echo_flag",
-        )
-    }
-    # _client_kwargs is a dict — snapshot a shallow copy so mutating the
-    # live dict doesn't poison the rollback target.
-    _snapshot["_client_kwargs"] = dict(getattr(agent, "_client_kwargs", {}) or {})
-    # Snapshot the credential pool reference so a failed client rebuild can
-    # restore the original pool (issue #52727: pool reload is part of this
-    # switch and must be reversible on rollback).
-    _snapshot["_credential_pool"] = getattr(agent, "_credential_pool", _MISSING)
-    _snapshot["_credential_pool_entry_id"] = getattr(
-        agent, "_credential_pool_entry_id", _MISSING
-    )
-
-    def _restore_snapshot() -> None:
-        for _name, _value in _snapshot.items():
-            if _value is _MISSING:
-                # Attribute did not exist before the swap — don't fabricate it.
-                continue
-            try:
-                setattr(agent, _name, _value)
-            except Exception:  # noqa: BLE001
-                pass
+    # Callers retain this agent after a failed /model swap and rely on its
+    # previous route surviving. Include cache/pool state and preserve that
+    # contract until the context engine has accepted the destination budget.
+    restore_handoff = _snapshot_context_handoff(agent)
 
     try:
         # Clear the per-config context_length override so the new model's
@@ -2990,102 +3011,108 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         # caller's exception handler can surface a meaningful warning.  The
         # exception is re-raised; cli.py / gateway/run.py / tui_gateway catch
         # it and print "Agent swap failed; change applied to next session".
-        _restore_snapshot()
+        restore_handoff()
         raise
 
-    # ── LM Studio: preload before probing context length ──
-    _sm_custom_providers = None
     try:
-        from hermes_cli.config import (
-            get_compatible_custom_providers,
-            get_custom_provider_context_length,
-            load_config,
+        # ── LM Studio: preload before probing context length ──
+        _sm_custom_providers = None
+        try:
+            from hermes_cli.config import (
+                get_compatible_custom_providers,
+                get_custom_provider_context_length,
+                load_config,
+            )
+
+            _sm_cfg = load_config()
+            _sm_custom_providers = get_compatible_custom_providers(_sm_cfg)
+            _destination_context_intent = get_custom_provider_context_length(
+                model=agent.model,
+                base_url=agent.base_url,
+                custom_providers=_sm_custom_providers,
+            )
+        except Exception:
+            _destination_context_intent = None
+        agent._config_context_length = _destination_context_intent
+        _runtime_context_length = agent._ensure_lmstudio_runtime_loaded(
+            _destination_context_intent
+        )
+        if agent._lmstudio_load_was_unverified(_runtime_context_length):
+            logger.warning(
+                "LM Studio model activation was rejected or completed without a "
+                "verifiable active context length during model switch; continuing "
+                "with configured context"
+            )
+        _effective_context_length = agent._effective_lmstudio_context_length(
+            _destination_context_intent,
+            _runtime_context_length,
         )
 
-        _sm_cfg = load_config()
-        _sm_custom_providers = get_compatible_custom_providers(_sm_cfg)
-        _destination_context_intent = get_custom_provider_context_length(
-            model=agent.model,
-            base_url=agent.base_url,
-            custom_providers=_sm_custom_providers,
+        # ── Re-evaluate prompt caching ──
+        # Refresh the custom-provider snapshot from the config just loaded above
+        # so the per-model ``prompt_caching`` capability lookup sees the same
+        # live list the context-length resolution used — without this, a flag
+        # added to config.yaml after session start is invisible to a /model
+        # switch (the policy would read the stale init-time snapshot).
+        if _sm_custom_providers is not None:
+            agent._custom_providers = _sm_custom_providers
+        agent._use_prompt_caching, agent._use_native_cache_layout = (
+            agent._anthropic_prompt_cache_policy(
+                provider=new_provider,
+                base_url=agent.base_url,
+                api_mode=api_mode,
+                model=new_model,
+            )
         )
+
+        # ── Update context compressor ──
+        if hasattr(agent, "context_compressor") and agent.context_compressor:
+            from agent.model_metadata import get_model_context_length
+            if _sm_custom_providers is None:
+                try:
+                    from hermes_cli.config import get_compatible_custom_providers, load_config
+                    _sm_custom_providers = get_compatible_custom_providers(load_config())
+                except Exception:
+                    _sm_custom_providers = None
+            # ``agent.api_key`` may be a callable (Azure Foundry Entra ID
+            # token provider). ``get_model_context_length`` expects a
+            # string for its live-probe paths; for Foundry the context
+            # length normally resolves via config or static catalogs and
+            # never hits a probe, but coerce to empty string defensively.
+            _ctx_api_key = agent.api_key if isinstance(agent.api_key, str) else ""
+            new_context_length = get_model_context_length(
+                agent.model,
+                base_url=agent.base_url,
+                api_key=_ctx_api_key,
+                provider=agent.provider,
+                config_context_length=_effective_context_length,
+                custom_providers=_sm_custom_providers,
+            )
+            # Forward the per-model resolved threshold (Codex gpt-5.x autoraise
+            # included) to engines that accept threshold_percent; the built-in
+            # compressor re-resolves internally and is skipped by the guard.
+            from agent.auxiliary_client import (
+                _effective_compression_threshold_percent,
+                _update_compressor_model,
+            )
+
+            _update_compressor_model(
+                agent.context_compressor,
+                model=agent.model,
+                context_length=new_context_length,
+                base_url=agent.base_url,
+                api_key=agent.api_key,  # context_compressor forwards to call_llm; callable preserved
+                provider=agent.provider,
+                api_mode=agent.api_mode,
+                max_tokens=getattr(agent, "max_tokens", None),
+                threshold_percent=_effective_compression_threshold_percent(
+                    agent.model, agent.provider
+                ),
+            )
+
     except Exception:
-        _destination_context_intent = None
-    agent._config_context_length = _destination_context_intent
-    _runtime_context_length = agent._ensure_lmstudio_runtime_loaded(
-        _destination_context_intent
-    )
-    if agent._lmstudio_load_was_unverified(_runtime_context_length):
-        logger.warning(
-            "LM Studio model activation was rejected or completed without a "
-            "verifiable active context length during model switch; continuing "
-            "with configured context"
-        )
-    _effective_context_length = agent._effective_lmstudio_context_length(
-        _destination_context_intent,
-        _runtime_context_length,
-    )
-
-    # ── Re-evaluate prompt caching ──
-    # Refresh the custom-provider snapshot from the config just loaded above
-    # so the per-model ``prompt_caching`` capability lookup sees the same
-    # live list the context-length resolution used — without this, a flag
-    # added to config.yaml after session start is invisible to a /model
-    # switch (the policy would read the stale init-time snapshot).
-    if _sm_custom_providers is not None:
-        agent._custom_providers = _sm_custom_providers
-    agent._use_prompt_caching, agent._use_native_cache_layout = (
-        agent._anthropic_prompt_cache_policy(
-            provider=new_provider,
-            base_url=agent.base_url,
-            api_mode=api_mode,
-            model=new_model,
-        )
-    )
-
-    # ── Update context compressor ──
-    if hasattr(agent, "context_compressor") and agent.context_compressor:
-        from agent.model_metadata import get_model_context_length
-        if _sm_custom_providers is None:
-            try:
-                from hermes_cli.config import get_compatible_custom_providers, load_config
-                _sm_custom_providers = get_compatible_custom_providers(load_config())
-            except Exception:
-                _sm_custom_providers = None
-        # ``agent.api_key`` may be a callable (Azure Foundry Entra ID
-        # token provider). ``get_model_context_length`` expects a
-        # string for its live-probe paths; for Foundry the context
-        # length normally resolves via config or static catalogs and
-        # never hits a probe, but coerce to empty string defensively.
-        _ctx_api_key = agent.api_key if isinstance(agent.api_key, str) else ""
-        new_context_length = get_model_context_length(
-            agent.model,
-            base_url=agent.base_url,
-            api_key=_ctx_api_key,
-            provider=agent.provider,
-            config_context_length=_effective_context_length,
-            custom_providers=_sm_custom_providers,
-        )
-        # Forward the per-model resolved threshold (Codex gpt-5.x autoraise
-        # included) to engines that accept threshold_percent; the built-in
-        # compressor re-resolves internally and is skipped by the guard.
-        from agent.auxiliary_client import (
-            _effective_compression_threshold_percent,
-            _update_compressor_model,
-        )
-
-        _update_compressor_model(
-            agent.context_compressor,
-            model=agent.model,
-            context_length=new_context_length,
-            base_url=agent.base_url,
-            api_key=agent.api_key,  # context_compressor forwards to call_llm; callable preserved
-            provider=agent.provider,
-            api_mode=agent.api_mode,
-            threshold_percent=_effective_compression_threshold_percent(
-                agent.model, agent.provider
-            ),
-        )
+        restore_handoff()
+        raise
 
     # ── Re-resolve reasoning_config from per-model override ──
     # The new model may have a different reasoning_effort override. Re-read
