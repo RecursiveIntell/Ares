@@ -39,6 +39,11 @@ def _normalized_time(value: Any, field: str) -> str:
     return instant.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _time_instant(value: str) -> datetime:
+    """Compare normalized bounds as instants, preserving their wire spelling."""
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
 def normalize_scope(raw: Any) -> dict[str, Any]:
     """Canonicalize a scope record; reject unknown fields and bad types."""
     if not isinstance(raw, Mapping):
@@ -64,7 +69,12 @@ def normalize_scope(raw: Any) -> dict[str, Any]:
             if not value:
                 raise ContractError("INVALID_TIME_SCOPE")
             normalized_time = {bound: _normalized_time(value[bound], "time." + bound) for bound in ("not_before", "not_after") if bound in value}
-            if "not_before" in normalized_time and "not_after" in normalized_time and normalized_time["not_before"] > normalized_time["not_after"]:
+            if (
+                "not_before" in normalized_time
+                and "not_after" in normalized_time
+                and _time_instant(normalized_time["not_before"])
+                > _time_instant(normalized_time["not_after"])
+            ):
                 raise ContractError("INVALID_TIME_SCOPE")
             normalized[field] = normalized_time
         else:
@@ -108,9 +118,15 @@ def is_subset_scope(subset: Mapping[str, Any], superset: Mapping[str, Any]) -> b
                 return False
         elif field == "time":
             sa, sb = a[field], b[field]
-            if "not_before" in sb and ("not_before" not in sa or sa["not_before"] < sb["not_before"]):
+            if "not_before" in sb and (
+                "not_before" not in sa
+                or _time_instant(sa["not_before"]) < _time_instant(sb["not_before"])
+            ):
                 return False
-            if "not_after" in sb and ("not_after" not in sa or sa["not_after"] > sb["not_after"]):
+            if "not_after" in sb and (
+                "not_after" not in sa
+                or _time_instant(sa["not_after"]) > _time_instant(sb["not_after"])
+            ):
                 return False
         else:
             if a[field] != b[field]:
