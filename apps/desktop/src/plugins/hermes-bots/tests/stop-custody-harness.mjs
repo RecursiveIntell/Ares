@@ -17,6 +17,8 @@ async function harness(roster = members(3), options = {}) {
   const sourceKey = (route, profile) => `${route?.connectionId || connection}::${route?.targetProfile || profile}`
   const handle = async (route, method, params) => {
     calls.push({ route: route && { ...route }, method, params: { ...params }, at: now })
+    const supplied = await options.rpcResponse?.(route, method, params)
+    if (supplied !== undefined) return supplied
     const key = sourceKey(route, params.profile)
     if (method === 'session.create') {
       if (options.createGate) await options.createGate.promise
@@ -53,8 +55,10 @@ async function harness(roster = members(3), options = {}) {
     if (method === 'clarify.respond' || method === 'approval.respond') {
       if (options.answerError?.()) throw new Error('response transport failed')
       if (options.answerGate) await options.answerGate.promise
-      const acknowledgement = method === 'clarify.respond' ? (options.clarifyResult ?? { status: 'ok' }) : {}
+      const acknowledgement = method === 'clarify.respond'
+        ? (options.clarifyResult ?? { status: 'ok' }) : (options.approvalResult ?? { resolved: 1 })
       if (method === 'clarify.respond' && acknowledgement?.status !== 'ok') return acknowledgement
+      if (method === 'approval.respond' && !(Number.isSafeInteger(acknowledgement?.resolved) && acknowledgement.resolved > 0)) return acknowledgement
       if (method === 'clarify.respond' && session.pending?.questions?.length) {
         session.questionAnswers ||= new Set()
         session.questionAnswers.add(params.question_id)
@@ -104,7 +108,7 @@ async function harness(roster = members(3), options = {}) {
         return () => { lease.releases++; activeLeases-- }
       },
       state: { profile: atom('default'), gateway: atom(null), connectionId: { get: () => connection, listen: () => () => undefined } },
-      notify: () => undefined, notifyError: () => undefined }
+      notify: notice => options.onNotify?.(notice), notifyError: () => undefined }
   })
   gc.stopGroupChatServerSync()
   gc.bindGroupTurnTestStorage({ get: key => clone(storage.get(key) ?? null), set: (key, value) => storage.set(key, clone(value)) })

@@ -529,6 +529,7 @@ const GROUP_ACTIVITY_LABELS = {
   capped: 'turn stopped at the round/message cap',
   delivered: 'delivered a late reply',
   held: 'is held (stopped by you) — @mention it or say resume to release',
+  stopping: 'held the room — interruption was applied; waiting for turn retirement',
   'stop-unconfirmed': 'held the room — interruption is unconfirmed; Stop can retry',
   stopped: 'stopped the room — remaining turns are held until resumed'
 }
@@ -549,6 +550,7 @@ const GROUP_ACTIVITY_GLYPHS = {
   capped: 'debug-step-over',
   delivered: 'mail-read',
   held: 'debug-pause',
+  stopping: 'debug-stop',
   'stop-unconfirmed': 'error',
   stopped: 'debug-stop'
 }
@@ -1285,6 +1287,7 @@ async function pullGroupChatServerState(connectionId = groupChatSyncConnectionId
     preserveRooms: pending?.changedRooms || [],
     deletedRooms: pending?.deletedRooms || []
   })
+  rehomeGroupRuntimeOwners(merged)
   $groupChats.set(merged)
   await persistGroupChatRooms(merged)
   return true
@@ -1376,6 +1379,7 @@ async function flushGroupChatServerSync(connectionId) {
           preserveRooms: pending?.changedRooms || [],
           deletedRooms: pending?.deletedRooms || []
         })
+        rehomeGroupRuntimeOwners(mergedRooms)
         $groupChats.set(mergedRooms)
         await persistGroupChatRooms(mergedRooms)
       }
@@ -1412,6 +1416,7 @@ async function flushGroupChatServerSync(connectionId) {
         preserveRooms: pending?.changedRooms || [],
         deletedRooms: pending?.deletedRooms || []
       })
+      rehomeGroupRuntimeOwners(mergedRooms)
       $groupChats.set(mergedRooms)
       await persistGroupChatRooms(mergedRooms)
     }
@@ -7285,9 +7290,9 @@ function setGroupChatImage(group, image) {
   })
 }
 
-/** Rename a group chat. The group's NAME is its identity everywhere — the
- *  room-map key, each local member's ui_meta membership list, and derived
- *  state — so a rename re-keys all of them. Member gateway sessions are kept
+/** Rename a group chat. The group's name keys its presentation — the
+ *  room map, each local member's ui_meta membership list, and derived
+ *  state — so a rename re-keys them while retaining its room lifetime. Member gateway sessions are kept
  *  as-is: stored sids keep resuming, so no history is lost. The room's
  *  immutable roomId (the member-session title) is preserved across the
  *  rename, so even a member whose sid is later lost falls back to the same
@@ -7333,6 +7338,7 @@ async function renameGroupChat(oldName, newName, members) {
     all[next] = room
   }
 
+  rehomeGroupRuntimeOwners(all)
   $groupChats.set(all)
 
   const needs = { ...$groupNeedsYou.get() }
@@ -7343,13 +7349,13 @@ async function renameGroupChat(oldName, newName, members) {
     $groupNeedsYou.set(needs)
   }
 
-  // Mirrored clarify cards key by group name; drop the old room's — the
-  // next poll re-mirrors any still-blocking question under the new name.
-  clearGroupClarify(oldName)
+  // Runtime owners/cards follow the same immutable lifetime above. A display
+  // rename neither replaces the accepted occurrence nor erases its question.
 
   // Local memberships: swap the name inside each member's canonical groups
   // list (syncs cross-machine via ui_meta). Remote members' seating lives in
   // the room record we just moved.
+  const metadataPersistence = []
   for (const member of members || []) {
     if (!member?.name) {
       continue
@@ -7358,11 +7364,20 @@ async function renameGroupChat(oldName, newName, members) {
     const meta = botRosterMeta(member, $botMeta.get()) || {}
     const groups = [...new Set(botGroups(meta).map(g => (g === oldName ? next : g)))]
 
-    await saveBotMeta(member, { groups, group: groups[0] || null })
+    // saveBotMeta applies its local atom before yielding. Start every member's
+    // transition now so a later rename cannot leave old-name writes in this loop.
+    metadataPersistence.push(saveBotMeta(member, { groups, group: groups[0] || null }))
   }
 
   // Persist the re-keyed map (updateGroupChat writes the whole durable map).
-  updateGroupChat(next, r => r, { sync: false })
+  const renamedRoom = updateGroupChat(next, r => {
+    // Idle legacy/metadata-only rooms need the same existing lifetime token
+    // as a runtime coordinator before this operation first yields.
+    if (!r.roomId && !r.coordinationId) r.coordinationId = groupChatEntryId()
+    return r
+  }, { sync: false })
+  const lifetime = { group: next, roomId: renamedRoom.roomId || null,
+    roomToken: renamedRoom.coordinationId || null }
   // A rename is one revisioned state transition: the new identity is updated
   // and the old identity is tombstoned together, so cold hydration cannot
   // merge the pre-rename room back into the roster.
@@ -7381,13 +7396,18 @@ async function renameGroupChat(oldName, newName, members) {
     openGroupChat(next)
   }
 
+  // Room, membership, persistence and navigation intent are all committed
+  // before waiting for metadata acknowledgement. No captured name is written
+  // by this continuation after an overlapping local/remote rename or disband.
+  await Promise.all(metadataPersistence)
+
   // Same convergence as disband: drop the pre-rename roster snapshot so the
   // old name can't linger anywhere the fence doesn't cover.
   if (typeof queryClient !== 'undefined' && queryClient?.invalidateQueries) {
     queryClient.invalidateQueries({ queryKey: ROSTER_KEY })
   }
 
-  return next
+  return groupNameForLifetime(lifetime)
 }
 
 function groupChatEntryId() {
@@ -7532,7 +7552,7 @@ async function ensureGroupChatSession(group, member, requestMember = member, occ
         const stored = res.session_key || known
 
         if (stored) {
-          updateGroupChat(group, current => {
+          updateGroupChat(occurrence?.group || group, current => {
             if (occurrence && !groupOccurrenceCurrent(occurrence)) return current
             current.sessions = { ...(current.sessions || {}), [key]: stored }
             current.sessionOwners = { ...(current.sessionOwners || {}), [key]: groupSessionOwner(requestMember) }
@@ -7560,7 +7580,7 @@ async function ensureGroupChatSession(group, member, requestMember = member, occ
   const stored = created?.stored_session_id || null
 
   if (stored) {
-    updateGroupChat(group, r => {
+    updateGroupChat(occurrence?.group || group, r => {
       if (occurrence && !groupOccurrenceCurrent(occurrence)) return r
       r.sessions = { ...(r.sessions || {}), [key]: stored }
       r.sessionOwners = { ...(r.sessionOwners || {}), [key]: groupSessionOwner(requestMember) }
@@ -7845,7 +7865,7 @@ async function waitForGroupTurnCollector(group, memberKey, collector, occurrence
   const epoch = $groupChats.get()[group]?.epoch || 0
   let timer, unbind
   const cancelled = () => {
-    const room = $groupChats.get()[group]
+    const room = $groupChats.get()[occurrence?.group || group]
     return !room || room.tombstone || Boolean(room.holds?.[memberKey]) ||
       (occurrence?.userIds ? !groupOccurrenceCanSubmit(occurrence) : (room.epoch || 0) !== epoch)
   }
@@ -7874,6 +7894,10 @@ function groupTurnMarkerBlocksDispatch(room, memberKey, coordinator) {
 function consumeGroupTurnMarker(group, memberKey, marker, published = false) {
   if ($groupChats.get()[group]?.stranded?.[memberKey] !== marker) return false
   const owned = [...(groupRoomCoordinators.get(group)?.occurrences || [])].find(o => o.id === marker?.occurrence_id)
+  // session.interrupt targets the runtime's current turn when applied. Even
+  // exact predecessor terminal proof cannot let a successor reuse that runtime
+  // while an older hot generation or a cold marker's control is still pending.
+  if (groupOccurrenceHasPendingInterrupt(owned) || interruptingGroupTurnMarkers.has(marker)) return false
   const coldDrive = owned ? null : restoreGroupDrive(group, marker)
   let consumed = false
   updateGroupChat(group, room => {
@@ -7901,7 +7925,8 @@ function consumeGroupTurnMarker(group, memberKey, marker, published = false) {
 }
 
 function groupTurnMarkerIntentIsCurrent(room, marker) {
-  if (!room || room.tombstone || room.holds?.[marker.delivery.member_key]) return false
+  if (!room || room.tombstone || marker.stop_requested || marker.hold_requested ||
+      room.holds?.[marker.delivery.member_key]) return false
   const newerUser = groupTurnHasNewerUser(room, marker.thread, marker.user_ids, marker.anchor_id, marker.input_version)
   return shouldCommitMemberTurn(marker.epoch ?? 0, room.epoch || 0, newerUser,
     marker.input_version !== undefined || Array.isArray(marker.user_ids))
@@ -8004,7 +8029,7 @@ function syncGroupClarify(group, member, state, requestMember = member) {
   return true
 }
 
-/** Drop every mirrored clarify belonging to `group` (disband/rename). */
+/** Drop every mirrored clarify belonging to `group` (disband/Stop). */
 function clearGroupClarify(group) {
   const all = $groupClarify.get()
   const next = {}
@@ -8098,11 +8123,15 @@ async function respondGroupClarify(entry, member, answers, occurrence, fence) {
     requireCurrentGroupQuestion(entry)
     attempted = true
     if (entry.kind === 'approval') {
-      await requestForBot(member, 'approval.respond', {
+      const result = await requestForBot(member, 'approval.respond', {
         session_id: entry.sessionId || undefined,
         request_id: entry.requestId,
         choice: typeof answers === 'string' && answers ? answers : 'deny'
       })
+      if (!Number.isSafeInteger(result?.resolved) || result.resolved <= 0) {
+        throw new Error(result?.resolved === 0 ? 'The approval is no longer pending.'
+          : 'The approval acknowledgement is unconfirmed.')
+      }
     } else if (entry.questions && entry.questions.length) {
       for (const question of entry.questions) {
         const qid = question?.qid ?? question?.id
@@ -8164,6 +8193,49 @@ const groupRoomCoordinators = new Map()
 const groupRuntimeSessionOwners = new Map()
 const GROUP_CHAT_PARALLEL_CEILING = 4
 
+function groupNameForLifetime(owner, rooms = $groupChats.get()) {
+  const matches = room => room && !room.tombstone &&
+    (room.roomId || null) === owner.roomId && (room.coordinationId || null) === owner.roomToken
+  if (matches(rooms[owner.group])) return owner.group
+  // Legacy owners also need their minted coordination token. Never follow a
+  // display-name reuse or an unidentifiable room into a replacement lifetime.
+  if (!owner.roomId && !owner.roomToken) return null
+  const names = Object.keys(rooms).filter(name => matches(rooms[name]))
+  return names.length === 1 ? names[0] : null
+}
+
+function rehomeGroupRuntimeOwners(rooms) {
+  for (const [oldName, coordinator] of [...groupRoomCoordinators]) {
+    const next = groupNameForLifetime(coordinator, rooms)
+    if (!next || next === oldName) continue
+    if (groupRoomCoordinators.get(oldName) === coordinator) groupRoomCoordinators.delete(oldName)
+    coordinator.group = next
+    groupRoomCoordinators.set(next, coordinator)
+    for (const occurrence of coordinator.occurrences) occurrence.group = next
+    for (const drive of coordinator.capturedDrives.values()) drive.group = next
+  }
+  const cards = {}, needs = { ...$groupNeedsYou.get() }, activity = { ...$groupActivity.get() }
+  let cardsChanged = false, needsChanged = false, activityChanged = false
+  for (const entry of Object.values($groupClarify.get())) {
+    const next = groupNameForLifetime({ group: entry.group, roomId: entry.roomId, roomToken: entry.roomToken }, rooms)
+    if (next && next !== entry.group) {
+      entry.group = next // preserve pending response/card identity
+      cardsChanged = true
+    }
+    cards[`${entry.group}::${entry.memberKey}`] = entry
+  }
+  for (const [oldName, room] of Object.entries($groupChats.get())) {
+    const next = groupNameForLifetime({ group: oldName, roomId: room.roomId || null,
+      roomToken: room.coordinationId || null }, rooms)
+    if (!next || next === oldName) continue
+    if (oldName in needs) { needs[next] = needs[oldName]; delete needs[oldName]; needsChanged = true }
+    if (oldName in activity) { activity[next] = activity[oldName]; delete activity[oldName]; activityChanged = true }
+  }
+  if (cardsChanged) $groupClarify.set(cards)
+  if (needsChanged) $groupNeedsYou.set(needs)
+  if (activityChanged) $groupActivity.set(activity)
+}
+
 function groupRoomCoordinator(group) {
   let room = $groupChats.get()[group] || {}
   if (!room.roomId && !room.coordinationId) {
@@ -8197,7 +8269,7 @@ function registerGroupOccurrence(group, member, thread, deliveryResult = {}, pre
     ready: new Promise(resolve => { ready = resolve }) }
   occurrence.settle = settle
   occurrence.markReady = ready
-  occurrence.memberLock = groupSourceSessionKey(captured, `room:${room.roomId || group}`)
+  occurrence.memberLock = groupSourceSessionKey(captured, `room:${room.roomId || room.coordinationId || group}`)
   occurrence.inputEndId = room.log?.length ? groupChatSyncEntryKey(room.log.at(-1)) : null
   occurrence.inputVersion = room.threadInputVersions?.[occurrence.thread] || 0
   occurrence.userIds = (room.log || []).filter(e => groupIsUserInstruction(e) && groupThreadOf(e) === occurrence.thread).map(groupChatSyncEntryKey)
@@ -8207,11 +8279,16 @@ function registerGroupOccurrence(group, member, thread, deliveryResult = {}, pre
   return occurrence
 }
 
-function groupOccurrenceCurrent(occurrence) {
+function groupOccurrenceRoomIsCurrent(occurrence) {
   const room = $groupChats.get()[occurrence.group]
-  return !occurrence.cancelled && room && !room.tombstone &&
+  return room && !room.tombstone &&
     (room.roomId || null) === occurrence.roomId &&
-    (room.coordinationId || null) === occurrence.roomToken && !room.holds?.[occurrence.memberKey]
+    (room.coordinationId || null) === occurrence.roomToken
+}
+
+function groupOccurrenceCurrent(occurrence) {
+  return !occurrence.cancelled && groupOccurrenceRoomIsCurrent(occurrence) &&
+    !$groupChats.get()[occurrence.group].holds?.[occurrence.memberKey]
 }
 
 function groupOccurrenceCanSubmit(occurrence) {
@@ -8228,7 +8305,7 @@ function paintGroupOccurrences(coordinator) {
       (current.coordinationId || null) !== coordinator.roomToken) return
   const turns = [...coordinator.occurrences].filter(o => !o.released).map(o => ({
     id: o.id, memberKey: o.memberKey, member: o.captured.member.name,
-    phase: o.cancelled ? (groupOccurrenceStopConfirmed(o) ? 'stopping' : 'stop-unconfirmed') : o.phase, thread: o.thread }))
+    phase: o.cancelled ? (groupOccurrenceInterruptApplied(o) ? 'stopping' : 'stop-unconfirmed') : o.phase, thread: o.thread }))
   updateGroupChat(coordinator.group, room => {
     room.turns = turns
     room.turn = turns.find(o => o.phase === 'running' || o.phase === 'starting')?.member || null
@@ -8237,16 +8314,26 @@ function paintGroupOccurrences(coordinator) {
 }
 
 function groupInterruptConfirmed(reply) {
+  // This confirms application of cancellation, not execution retirement.
   return reply?.status === 'interrupted'
 }
 
 function interruptStoppedGroupMarker(group, memberKey, marker, target) {
   const prior = interruptingGroupTurnMarkers.get(marker)
   if (prior) return prior
+  const room = $groupChats.get()[group]
+  const lifetime = { group, roomId: room?.roomId || null, roomToken: room?.coordinationId || null }
   const pending = Promise.resolve().then(() => requestForBot(target, 'session.interrupt', {
     session_id: marker.delivery.accepted_turn.session_id })).then(reply => {
       const confirmed = groupInterruptConfirmed(reply)
-      if (confirmed) consumeGroupTurnMarker(group, memberKey, marker)
+      const currentGroup = groupNameForLifetime(lifetime)
+      if (confirmed && currentGroup) updateGroupChat(currentGroup, room => {
+        if (room.stranded?.[memberKey] === marker) {
+          marker.interrupt_applied = true
+          room.stranded = { ...room.stranded }
+        }
+        return room
+      }, { sync: false })
       return confirmed
     }, () => false).finally(() => {
       if (interruptingGroupTurnMarkers.get(marker) === pending) interruptingGroupTurnMarkers.delete(marker)
@@ -8256,10 +8343,19 @@ function interruptStoppedGroupMarker(group, memberKey, marker, target) {
 }
 
 function groupOccurrenceStopConfirmed(occurrence) {
-  if (occurrence.submissionPending || occurrence.answerPromise) return false
+  if (occurrence.submissionPending || occurrence.answerPromise || groupOccurrenceHasPendingInterrupt(occurrence)) return false
   if (occurrence.terminalObserved) return true
   if (!occurrence.submitAttempted) return Boolean(occurrence.collectorDone)
-  return occurrence.interrupts.get(`${occurrence.runtime}::${occurrence.admissionVersion || 0}`)?.confirmed === true
+  return false // A matching interrupt ACK still needs exact terminal evidence.
+}
+
+function groupOccurrenceHasPendingInterrupt(occurrence) {
+  return [...(occurrence?.interrupts?.values() || [])].some(attempt => attempt.pending)
+}
+
+function groupOccurrenceInterruptApplied(occurrence) {
+  return !occurrence.submissionPending && !occurrence.answerPromise &&
+    occurrence.interrupts.get(`${occurrence.runtime}::${occurrence.admissionVersion || 0}`)?.confirmed === true
 }
 
 function markGroupOccurrenceStop(occurrence) {
@@ -8300,7 +8396,7 @@ async function interruptGroupOccurrence(occurrence, runtime = occurrence.runtime
 
 function finishGroupOccurrence(occurrence) {
   const c = occurrence.coordinator
-  if (occurrence.released) return
+  if (occurrence.released || groupOccurrenceHasPendingInterrupt(occurrence)) return
   occurrence.released = true
   occurrence.releaseLease?.()
   if (c.members.get(occurrence.memberLock) === occurrence) c.members.delete(occurrence.memberLock)
@@ -8399,7 +8495,12 @@ function retainUnresolvedGroupOccurrence(occurrence) {
       return false
     }
     markGroupOccurrenceStop(occurrence)
-  } else if (!groupOccurrenceCurrent(occurrence) || marker?.occurrence_id !== occurrence.id) return false
+    if (groupOccurrenceRoomIsCurrent(occurrence) && groupTurnDeliveryKey(marker?.delivery)) {
+      // Late admission/collector settlement may supply the first exact receipt
+      // after Stop. Reconcile it without making control completion wait on a read.
+      void harvestStrandedGroupReply(occurrence.group, occurrence.captured.member).catch(() => undefined)
+    }
+  } else if (!groupOccurrenceRoomIsCurrent(occurrence) || marker?.occurrence_id !== occurrence.id) return false
   // A timeout/unavailable projection is not capacity evidence. Waiting has
   // already surrendered only its worker; running/unknown keeps that worker.
   occurrence.markReady()
@@ -8462,6 +8563,7 @@ async function runGroupChatMemberTurnLeased(group, captured, prompt, thread, ima
     return null
   }
   while (true) {
+    group = occurrence?.group || group
     const current = $groupChats.get()[group] || {}
     const prior = current.stranded?.[memberKey]
     const priorCollector = prior && collectingGroupTurnMarkers.get(prior)
@@ -8480,6 +8582,7 @@ async function runGroupChatMemberTurnLeased(group, captured, prompt, thread, ima
     // Another waiter may have reserved the member. Recheck synchronously
     // before any session preparation, attachments, or prompt admission.
   }
+  group = occurrence?.group || group
   const roomAtDispatch = $groupChats.get()[group] || {}
   const dispatchEpoch = roomAtDispatch.epoch || 0
   let marker = { delivery: { accepted_turn: null, member_key: memberKey, owner },
@@ -8499,6 +8602,7 @@ async function runGroupChatMemberTurnLeased(group, captured, prompt, thread, ima
   let submitAttempted = false
   try {
     const prepared = await ensureGroupChatSession(group, member, requestMember, occurrence)
+    group = occurrence?.group || group
     let { runtime } = prepared
     const { stored } = prepared
     if (occurrence) {
@@ -8513,6 +8617,7 @@ async function runGroupChatMemberTurnLeased(group, captured, prompt, thread, ima
       if (occurrence.cancelled) await interruptGroupOccurrence(occurrence)
     }
     const beforeSubmit = () => {
+      group = occurrence?.group || group
       const room = $groupChats.get()[group] || {}
       return (!occurrence || groupOccurrenceCanSubmit(occurrence)) && room.stranded?.[memberKey] === marker && !room.tombstone &&
         !((room.epoch || 0) !== dispatchEpoch && room.holds?.[memberKey])
@@ -8522,6 +8627,7 @@ async function runGroupChatMemberTurnLeased(group, captured, prompt, thread, ima
       return discarded()
     }
     runtime = await requireGroupTurnProtocol(requestMember, prepared)
+    group = occurrence?.group || group
     if (occurrence && runtime !== occurrence.runtime) {
       const sessionLock = groupSourceSessionKey(captured, runtime)
       const prior = groupRuntimeSessionOwners.get(sessionLock)
@@ -8583,6 +8689,7 @@ async function runGroupChatMemberTurnLeased(group, captured, prompt, thread, ima
         if (occurrence.cancelled) { markGroupOccurrenceStop(occurrence); await interruptGroupOccurrence(occurrence) }
       }
     }
+    group = occurrence?.group || group
     const previous = marker
     marker = { ...marker, runtime: submitted.runtime,
       delivery: { ...marker.delivery, accepted_turn: submitted.acceptedTurn } }
@@ -8605,15 +8712,11 @@ async function runGroupChatMemberTurnLeased(group, captured, prompt, thread, ima
     let progress = 'working'
     while (Date.now() < deadline) {
       await new Promise(resolve => setTimeout(resolve, GROUP_TURN_POLL_MS))
+      group = occurrence?.group || group
       const roomDuringPoll = $groupChats.get()[group] || {}
       if (roomDuringPoll.stranded?.[memberKey] !== marker) return discarded()
-      if (occurrence && !groupOccurrenceCurrent(occurrence)) {
+      if (occurrence && (occurrence.cancelled || !groupOccurrenceRoomIsCurrent(occurrence))) {
         if (occurrence.cancelled) markGroupOccurrenceStop(occurrence)
-        else consumeGroupTurnMarker(group, memberKey, marker)
-        return discarded()
-      }
-      if ((roomDuringPoll.epoch || 0) !== dispatchEpoch && roomDuringPoll.holds?.[memberKey]) {
-        consumeGroupTurnMarker(group, memberKey, marker)
         return discarded()
       }
       let state
@@ -8624,28 +8727,21 @@ async function runGroupChatMemberTurnLeased(group, captured, prompt, thread, ima
           session_id: submitted.acceptedTurn.session_id, profile: member.name,
           accepted_turn: submitted.acceptedTurn })
       } catch (error) {
+        group = occurrence?.group || group
         const roomAfterError = $groupChats.get()[group] || {}
         if (roomAfterError.stranded?.[memberKey] !== marker) return discarded()
         if (occurrence?.cancelled) { markGroupOccurrenceStop(occurrence); return discarded() }
-        if ((roomAfterError.epoch || 0) !== dispatchEpoch && roomAfterError.holds?.[memberKey]) {
-          consumeGroupTurnMarker(group, memberKey, marker)
-          return discarded()
-        }
         if (!groupTurnMarkerIntentIsCurrent(roomAfterError, marker)) return discarded()
         // Observation failure grants no replay or resume authority. Surface it
         // now and retain the accepted receipt for an explicit later harvest.
         throw groupTurnOutcomeError({ state: 'unavailable',
           reason: `Could not observe member turn: ${error?.message || 'gateway poll failed'}` })
       }
+      group = occurrence?.group || group
       const roomAfterResume = $groupChats.get()[group] || {}
       if (roomAfterResume.stranded?.[memberKey] !== marker) return discarded()
-      if (occurrence && !groupOccurrenceCurrent(occurrence)) {
+      if (occurrence && (occurrence.cancelled || !groupOccurrenceRoomIsCurrent(occurrence))) {
         if (occurrence.cancelled) markGroupOccurrenceStop(occurrence)
-        else consumeGroupTurnMarker(group, memberKey, marker)
-        return discarded()
-      }
-      if ((roomAfterResume.epoch || 0) !== dispatchEpoch && roomAfterResume.holds?.[memberKey]) {
-        consumeGroupTurnMarker(group, memberKey, marker)
         return discarded()
       }
       const outcome = readGroupTurnOutcome(state, marker.delivery)
@@ -8689,7 +8785,9 @@ async function runGroupChatMemberTurnLeased(group, captured, prompt, thread, ima
         }
         paintGroupOccurrences(occurrence.coordinator)
       } else if (occurrence) {
-        if (occurrence.phase === 'waiting') await reserveGroupResumeWorker(occurrence)
+        if (occurrence.phase === 'waiting' && !['complete', 'error', 'interrupted'].includes(outcome.state)) {
+          await reserveGroupResumeWorker(occurrence)
+        }
         if (occurrence.resumeFence === resumeFenceAtPoll && responseAcknowledgedAtPoll) occurrence.resumeFence = null
         paintGroupOccurrences(occurrence.coordinator)
       }
@@ -8713,6 +8811,7 @@ async function runGroupChatMemberTurnLeased(group, captured, prompt, thread, ima
     // Observation expiry cannot invalidate a retained unavailable child card.
     return null
   } catch (error) {
+    group = occurrence?.group || group
     if (!submitAttempted || error?.code === 4090 || error?.code === 'POOL_CAPACITY_EXCEEDED') {
       if (error?.code === 4090 || error?.code === 'POOL_CAPACITY_EXCEEDED') {
         if (occurrence) occurrence.submitAttempted = false
@@ -8742,9 +8841,11 @@ async function runGroupChatMemberTurnLeased(group, captured, prompt, thread, ima
 async function harvestStrandedGroupReply(group, member) {
   const memberKey = groupMemberKey(member)
   const room = $groupChats.get()[group] || {}
+  const lifetime = { group, roomId: room.roomId || null, roomToken: room.coordinationId || null }
   const marker = room.stranded?.[memberKey]
-  if (marker === undefined || collectingGroupTurnMarkers.has(marker) ||
-      (room.holds?.[memberKey] && !marker?.stop_requested)) return
+  const reconciliationOnly = marker?.stop_requested || marker?.hold_requested
+  if (marker === undefined || (collectingGroupTurnMarkers.has(marker) && !reconciliationOnly) ||
+      (room.holds?.[memberKey] && !reconciliationOnly)) return
   if (marker?.room_token && marker.room_token !== room.coordinationId) {
     reportUnavailableGroupTurn(group, member, marker, 'Legacy room lifetime is unavailable after reload or replacement')
     return
@@ -8772,23 +8873,25 @@ async function harvestStrandedGroupReply(group, member) {
       session_id: marker.delivery.accepted_turn.session_id, profile: captured.member.name,
       accepted_turn: marker.delivery.accepted_turn })
   } catch (error) {
+    group = groupNameForLifetime(lifetime) || group
     const current = $groupChats.get()[group]
     if (current?.stranded?.[memberKey] !== marker || !groupTurnMarkerIntentIsCurrent(current, marker)) return
     reportUnavailableGroupTurn(group, member, marker,
       `Could not observe member turn: ${error?.message || 'gateway poll failed'}`)
     return
   }
+  group = groupNameForLifetime(lifetime) || group
   if ($groupChats.get()[group]?.stranded?.[memberKey] !== marker || ownedOccurrence?.answerPromise) return
   const outcome = readGroupTurnOutcome(state, marker.delivery)
   const freshResumeRead = !ownedOccurrence?.resumeFence ||
     (ownedOccurrence.resumeFence === resumeFenceAtRead && responseAcknowledgedAtRead)
-  if (marker.stop_requested || ownedOccurrence?.cancelled) {
-    // A stopped receipt is reconciliation only, including after reload. No
+  if (reconciliationOnly || ownedOccurrence?.cancelled) {
+    // A stopped/held receipt is reconciliation only, including after reload. No
     // reply, attention, input consumption, clarify card or prompt replay.
     if (['complete', 'error', 'interrupted'].includes(outcome.state) &&
         !ownedOccurrence?.submissionPending && freshResumeRead) {
       if (ownedOccurrence) ownedOccurrence.terminalObserved = true
-      consumeGroupTurnMarker(group, memberKey, marker)
+      if (consumeGroupTurnMarker(group, memberKey, marker) && ownedOccurrence) settleGroupPublication(ownedOccurrence)
     } else if (ownedOccurrence && outcome.state === 'waiting' &&
         !ownedOccurrence.submissionPending && freshResumeRead) {
       ownedOccurrence.resumeFence = null
@@ -9107,6 +9210,7 @@ function groupTurnHasNewerUser(room, thread, userIds, anchorId, inputVersion) {
  * settle, so an old cleanup can never interrupt a replacement occurrence. */
 async function stopGroupThread(group, thread, members = null) {
   const room = $groupChats.get()[group] || {}
+  const lifetime = { group, roomId: room.roomId || null, roomToken: room.coordinationId || null }
   const coordinator = groupRoomCoordinators.get(group)
   const occurrences = coordinator && coordinator.roomId === (room.roomId || null) && coordinator.roomToken === (room.coordinationId || null)
     ? [...coordinator.occurrences] : []
@@ -9141,7 +9245,7 @@ async function stopGroupThread(group, thread, members = null) {
   }
   if (coordinator) pumpGroupOccurrences(coordinator)
   const interrupts = occurrences.map(occurrence => interruptGroupOccurrence(occurrence, occurrence.runtime, true))
-  let coldUnconfirmed = 0
+  let legacyUnconfirmed = 0
   // A cold reload has no runtime registry: accepted durable receipts still
   // identify exact runtime and source, never a display-name roster guess.
   for (const [memberKey, marker] of Object.entries(room.stranded || {})) {
@@ -9155,11 +9259,10 @@ async function stopGroupThread(group, thread, members = null) {
       if (r.stranded?.[memberKey] === marker) { marker.stop_requested = true; r.stranded = { ...r.stranded } }
       return r
     }, { sync: false })
-    if (!groupTurnDeliveryKey(marker?.delivery)) { coldUnconfirmed++; continue }
+    if (!groupTurnDeliveryKey(marker?.delivery)) continue
     const owner = marker.delivery.owner
     const target = Object.freeze({ ...owner, ...(owner.route ? { route: Object.freeze({ ...owner.route }) } : {}) })
-    interrupts.push(interruptStoppedGroupMarker(group, memberKey, marker, target)
-      .then(confirmed => { if (!confirmed) coldUnconfirmed++ }))
+    interrupts.push(interruptStoppedGroupMarker(group, memberKey, marker, target))
   }
   // Legacy transient room.turn has no acceptance proof. Retain its old Stop
   // behavior only when the name is unambiguous and no occurrences exist.
@@ -9169,29 +9272,66 @@ async function stopGroupThread(group, thread, members = null) {
       const member = candidates[0]
       const sid = room.sessions?.[groupMemberKey(member)]
       if (sid) interrupts.push(Promise.resolve().then(() => requestForBot(member, 'session.interrupt', { session_id: sid }))
-        .then(reply => { if (!groupInterruptConfirmed(reply)) coldUnconfirmed++ }, () => { coldUnconfirmed++ }))
+        .then(() => { legacyUnconfirmed++ }, () => { legacyUnconfirmed++ }))
     }
   }
   for (const interrupt of interrupts) await interrupt
+  const missingLifetime = () => {
+    const pending = Math.max(1, occurrences.filter(o => !o.released && !groupOccurrenceStopConfirmed(o)).length)
+    return { status: 'unconfirmed', unconfirmed: pending, pending }
+  }
+  group = groupNameForLifetime(lifetime)
+  if (!group) return missingLifetime()
+  // The ACK only applied cancellation. The existing exact-turn collector owns
+  // retirement; do not infer a vacant worker from a successful control write.
+  for (const [memberKey, marker] of Object.entries($groupChats.get()[group]?.stranded || {})) {
+    if (!marker?.stop_requested || !groupTurnDeliveryKey(marker.delivery)) continue
+    if ($groupChats.get()[group]?.stranded?.[memberKey] !== marker) continue
+    const occurrence = occurrences.find(o => o.id === marker.occurrence_id)
+    const owner = marker.delivery.owner
+    const target = occurrence?.captured.member || Object.freeze({ ...owner,
+      ...(owner.route ? { route: Object.freeze({ ...owner.route }) } : {}) })
+    // A slow/unavailable poll is observation, not part of the interrupt ACK.
+    // Its exact terminal may retire custody later through the same collector.
+    void harvestStrandedGroupReply(group, target).catch(() => undefined)
+  }
   for (const occurrence of occurrences) {
-    const marker = $groupChats.get()[group]?.stranded?.[occurrence.memberKey]
     if (occurrence.collectorDone) {
       if (occurrence.answerPromise) await occurrence.answerPromise.catch(() => undefined)
       await interruptGroupOccurrence(occurrence)
+      group = groupNameForLifetime(lifetime)
+      if (!group) return missingLifetime()
+      const settledMarker = $groupChats.get()[group]?.stranded?.[occurrence.memberKey]
+      if (settledMarker?.occurrence_id === occurrence.id && groupTurnDeliveryKey(settledMarker.delivery)) {
+        // A late human response advanced the generation after the first read
+        // was fenced. Observe only after its producer and final interrupt settle.
+        void harvestStrandedGroupReply(group, occurrence.captured.member).catch(() => undefined)
+      }
       if (groupOccurrenceStopConfirmed(occurrence)) {
+        const marker = $groupChats.get()[group]?.stranded?.[occurrence.memberKey]
         if (marker?.occurrence_id === occurrence.id) consumeGroupTurnMarker(group, occurrence.memberKey, marker)
         finishGroupOccurrence(occurrence)
       }
     }
   }
-  const unconfirmed = coldUnconfirmed + occurrences.filter(o => !o.released && !groupOccurrenceStopConfirmed(o)).length
+  const pendingMarkers = Object.values($groupChats.get()[group]?.stranded || {}).filter(marker => marker?.stop_requested)
+  const unconfirmed = legacyUnconfirmed + pendingMarkers.filter(marker => {
+    const occurrence = occurrences.find(o => o.id === marker.occurrence_id)
+    return occurrence ? !groupOccurrenceInterruptApplied(occurrence) : !marker.interrupt_applied
+  }).length + occurrences.filter(o => !o.released && !groupOccurrenceStopConfirmed(o) &&
+    !pendingMarkers.some(marker => marker.occurrence_id === o.id) && !groupOccurrenceInterruptApplied(o)).length
+  const pending = pendingMarkers.length + occurrences.filter(o => !o.released && !groupOccurrenceStopConfirmed(o) &&
+    !pendingMarkers.some(marker => marker.occurrence_id === o.id)).length
   if (coordinator) paintGroupOccurrences(coordinator)
-  const result = { status: unconfirmed ? 'unconfirmed' : 'stopped', unconfirmed }
+  const result = { status: unconfirmed ? 'unconfirmed' : pending ? 'stopping' : 'stopped', unconfirmed, pending }
   const current = $groupChats.get()[group]
   if (current && (current.roomId || null) === (room.roomId || null) &&
       (current.coordinationId || null) === (room.coordinationId || null)) {
-    recordGroupActivity(group, { kind: unconfirmed ? 'stop-unconfirmed' : 'stopped',
+    recordGroupActivity(group, { kind: unconfirmed ? 'stop-unconfirmed' : pending ? 'stopping' : 'stopped',
       member: 'You', thread: thread || null, epoch: stoppedRoom.epoch })
+  }
+  if (pending && typeof window !== 'undefined') {
+    void harvestStrandedUntilSettled(group, occurrences.map(o => o.captured.member).concat(roster), thread)
   }
   return result
 }
@@ -9280,6 +9420,10 @@ function captureGroupDrive(group, members, thread) {
 /** A frozen round, never a raw Promise.all over roster members. The room
  * coordinator is the sole start owner; each completion publishes immediately. */
 function runGroupChatRounds(group, members, thread, capturedDrive) {
+  if (capturedDrive) {
+    group = groupNameForLifetime({ ...capturedDrive, group })
+    if (!group) return Promise.resolve() // deletion/replacement cannot revive a captured drive
+  }
   const drive = capturedDrive || captureGroupDrive(group, members, thread)
   const coordinator = groupRoomCoordinator(group)
   const key = groupDriveKey(drive)
@@ -9295,6 +9439,7 @@ function runGroupChatRounds(group, members, thread, capturedDrive) {
   const running = Promise.resolve().then(() => driveFrozenGroupRounds(group, members, drive, coordinator))
   coordinator.drives.set(key, running)
   void running.finally(() => {
+    group = coordinator.group
     if (coordinator.drives.get(key) === running) coordinator.drives.delete(key)
     drive.running = false
     if (!Object.values($groupChats.get()[group]?.stranded || {}).some(m => m?.drive_key === key)) {
@@ -9340,6 +9485,7 @@ async function driveFrozenGroupRounds(group, members, drive, coordinator) {
   const { thread } = drive
   members = drive.members.map(captured => captured.member)
   const sameRoom = () => {
+    group = coordinator.group
     const room = $groupChats.get()[group]
     return room && !room.tombstone && (room.roomId || null) === drive.roomId &&
       (room.coordinationId || null) === drive.roomToken
@@ -9421,6 +9567,7 @@ async function driveFrozenGroupRounds(group, members, drive, coordinator) {
       job.phase = 'queued'
       const complete = runGroupChatMemberTurn(group, job.captured.member, job.prompt, thread,
         job.images, job.deliveryResult, job).then(reply => {
+        if (!sameRoom()) return
         const room = $groupChats.get()[group]
         if (job.cancelled) return // Stop owns the confirmation/unconfirmed activity.
         if (!sameRoom() || job.deliveryResult.discarded ||
@@ -9441,6 +9588,7 @@ async function driveFrozenGroupRounds(group, members, drive, coordinator) {
           if (job.wasWaiting) scheduleGroupDriveContinuation(group, drive)
         }
       }, error => {
+        if (!sameRoom()) return
         const room = $groupChats.get()[group]
         if (!sameRoom() || job.cancelled || !shouldCommitMemberTurn(job.epoch, room.epoch || 0,
           groupTurnHasNewerUser(room, thread, job.userIds, job.inputEndId, job.inputVersion), true)) return
@@ -9539,10 +9687,15 @@ async function driveFrozenGroupRounds(group, members, drive, coordinator) {
 async function harvestStrandedUntilSettled(group, members, thread) {
   const HARVEST_INTERVAL_MS = 5000
   const HARVEST_MAX_TRIES = 60
+  const initial = $groupChats.get()[group]
+  if (!initial) return
+  const lifetime = { group, roomId: initial.roomId || null, roomToken: initial.coordinationId || null }
 
   for (let attempt = 0; attempt < HARVEST_MAX_TRIES; attempt++) {
     await new Promise(resolve => window.setTimeout(resolve, HARVEST_INTERVAL_MS))
 
+    group = groupNameForLifetime(lifetime)
+    if (!group) return
     const room = $groupChats.get()[group]
 
     if (!room || room.running) {
@@ -9610,29 +9763,35 @@ function sendToGroupChat(group, members, text, thread, images) {
       { at: sent?.at, byMessageId: sent?.id, thread: target },
       members.map(member => groupMemberKey(member))
     )
+    for (const [memberKey, marker] of Object.entries(room.stranded || {})) {
+      if (room.holds?.[memberKey] && marker && typeof marker === 'object') {
+        // A future-turn hold suppresses this result; it is not death evidence.
+        // Keep the live collector/CAS identity and persist reconciliation intent.
+        marker.hold_requested = true
+        room.stranded = { ...room.stranded }
+      }
+    }
     return room
   })
 
   recordGroupActivity(group, { kind: 'queued', member: 'You', thread: target })
   const capturedDrive = captureGroupDrive(group, members, target)
+  const clearFailedDrive = () => {
+    const currentGroup = groupNameForLifetime({ ...capturedDrive, group })
+    if (!currentGroup) return
+    updateGroupChat(currentGroup, room => {
+      if ((room.epoch || 0) === capturedDrive.epoch) room.running = false
+      return room
+    })
+  }
 
   if (!wasRunning) {
-    void runGroupChatRounds(group, members, target, capturedDrive).catch(() => {
-      updateGroupChat(group, r => {
-        if ((r.roomId || null) === capturedDrive.roomId && (r.epoch || 0) === capturedDrive.epoch) r.running = false
-        return r
-      })
-    })
+    void runGroupChatRounds(group, members, target, capturedDrive).catch(clearFailedDrive)
   } else {
     // A loop is live; it bails at its next boundary. Chain the fresh loop
     // after a short settle so exactly one drive owns the room.
     setTimeout(() => {
-      void runGroupChatRounds(group, members, target, capturedDrive).catch(() => {
-        updateGroupChat(group, r => {
-          if ((r.roomId || null) === capturedDrive.roomId && (r.epoch || 0) === capturedDrive.epoch) r.running = false
-          return r
-        })
-      })
+      void runGroupChatRounds(group, members, target, capturedDrive).catch(clearFailedDrive)
     }, 250)
   }
 
@@ -13498,7 +13657,11 @@ function GroupImageControls({ image, onImage, seedName, seedMembers }) {
  *  the room record. Both apply on Save so a cancelled dialog changes nothing. */
 function GroupChatSettingsDialog({ group, members, open, onClose, onRenamed }) {
   const rooms = useValue($groupChats)
-  const current = (rooms[group] || {}).image || null
+  const displayedRoom = rooms[group]
+  const displayedLifetime = { group, roomId: displayedRoom?.roomId || null,
+    roomToken: displayedRoom?.coordinationId || null }
+  const metadataOnlyGroup = !displayedRoom && knownGroups($botMeta.get()).includes(group)
+  const current = (displayedRoom || {}).image || null
   const [name, setName] = useState(group)
   const [image, setImage] = useState(current)
 
@@ -13511,11 +13674,31 @@ function GroupChatSettingsDialog({ group, members, open, onClose, onRenamed }) {
   }, [open, group])
 
   const save = async () => {
-    const finalName = await renameGroupChat(group, name, members)
-
-    if (finalName === null) {
-      return // collision — dialog stays open for a different name
+    let savingGroup = group
+    if (displayedRoom) {
+      savingGroup = groupNameForLifetime(displayedLifetime)
+      // A button rendered for a deleted/replaced room cannot adopt today's
+      // same-name record. Unidentified legacy rooms require the same object
+      // until their existing canonical lifetime token is minted below.
+      if (!savingGroup || (!displayedLifetime.roomId && !displayedLifetime.roomToken &&
+          $groupChats.get()[group] !== displayedRoom)) return
+    } else if (!metadataOnlyGroup || $groupChats.get()[group] || !knownGroups($botMeta.get()).includes(group)) {
+      return
     }
+    const original = $groupChats.get()[savingGroup]
+    if (original?.tombstone) return
+    const savingRoom = original?.roomId || original?.coordinationId ? original : updateGroupChat(savingGroup, room => {
+      room.coordinationId = groupChatEntryId()
+      return room
+    }, { sync: false })
+    const lifetime = { group: savingGroup, roomId: savingRoom.roomId || null, roomToken: savingRoom.coordinationId || null }
+    const renamed = await renameGroupChat(savingGroup, name, members)
+
+    if (renamed === null) {
+      return // collision or removed lifetime — the dialog cannot update another room
+    }
+    const finalName = groupNameForLifetime(lifetime)
+    if (finalName === null) return
 
     if (image !== current) {
       setGroupChatImage(finalName, image)
@@ -14009,7 +14192,6 @@ function GroupMentionInput({ members, onChange, onSubmitDraft, value, ...inputPr
  *    (once/session/always/deny) as buttons — no free text; approvals are a
  *    closed choice. Answer sends via the member's own source. */
 function GroupClarifyCard({ entry, members }) {
-  const { group } = entry
   const isApproval = entry.kind === 'approval'
   const member = members.find(m => groupMemberKey(m) === entry.memberKey) || members.find(m => m.name === entry.member)
   const [drafts, setDrafts] = useState({})
@@ -14062,7 +14244,10 @@ function GroupClarifyCard({ entry, members }) {
         : questions
             .map(q => (questions.length > 1 ? `${q.question}: ${answerFor(q)}` : answerFor(q)))
             .join('\n')
-      appendGroupChatEntry(group, { kind: 'user', name: 'You' }, summary, entry.thread || 'legacy',
+      const currentRoom = $groupChats.get()[entry.group]
+      if (!currentRoom || currentRoom.tombstone || (currentRoom.roomId || null) !== entry.roomId ||
+          (currentRoom.coordinationId || null) !== entry.roomToken) return
+      appendGroupChatEntry(entry.group, { kind: 'user', name: 'You' }, summary, entry.thread || 'legacy',
         undefined, undefined, entry.receipt?.delivery)
     } catch (err) {
       host.notify({ kind: 'error', message: `Could not send the answer to @${botHandle(entry.member, member)}: ${err?.message || err}` })
@@ -14587,7 +14772,9 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
     const result = await stopGroupThread(group, latestActivity?.thread || null, memberDescriptors())
     host.notify(result.status === 'stopped'
       ? { kind: 'success', message: `Stopped ${group} — remaining turns are held until you resume` }
-      : { kind: 'info', message: `Held ${group} — ${result.unconfirmed} interruption(s) are unconfirmed. Stop can retry.` })
+      : result.status === 'stopping'
+        ? { kind: 'info', message: `Stopping ${group} — waiting for the remaining turns to finish.` }
+        : { kind: 'info', message: `Held ${group} — ${result.unconfirmed} interruption(s) are unconfirmed. Stop can retry.` })
   }
 
   const activityPanel = jsxs('div', {
@@ -16733,7 +16920,7 @@ const groupTurnRuntime = {
   groupMemberKey, updateGroupChat, groupBlockedMembers, GroupBlockedNotice,
   CreateGroupChatDialog, createFreshGroupChat, groupComposerDraftKey,
   groupComposerDraftSnapshot, updateGroupComposerDraft, GroupChatWorkspace, GroupClarifyCard,
-  groupRoomCanStop,
+  groupRoomCanStop, renameGroupChat, pullGroupChatServerState, GroupChatSettingsDialog, $groupChatWorkspace,
   bindGroupTurnPorts(ports) {
     ({ Date, setTimeout, clearTimeout, setInterval, clearInterval, document } = createGroupTurnPorts(ports))
   },
@@ -17339,5 +17526,3 @@ export default {
     })
   }
 }
-
-
