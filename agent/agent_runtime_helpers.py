@@ -1741,16 +1741,20 @@ def restore_primary_runtime(agent) -> bool:
         cc = agent.context_compressor
         from agent.auxiliary_client import _update_compressor_model
 
-        _update_compressor_model(
-            cc,
-            model=rt["compressor_model"],
-            context_length=rt["compressor_context_length"],
-            base_url=rt["compressor_base_url"],
-            api_key=rt["compressor_api_key"],
-            provider=rt["compressor_provider"],
-            api_mode=rt.get("compressor_api_mode", ""),
-            max_tokens=getattr(agent, "max_tokens", None),
-        )
+        if cc is not None:
+            # A host with no engine has no engine state to restore. Every
+            # actual engine still requires its saved destination and must
+            # accept it before the host handoff can commit.
+            _update_compressor_model(
+                cc,
+                model=rt["compressor_model"],
+                context_length=rt["compressor_context_length"],
+                base_url=rt["compressor_base_url"],
+                api_key=rt["compressor_api_key"],
+                provider=rt["compressor_provider"],
+                api_mode=rt.get("compressor_api_mode", ""),
+                max_tokens=getattr(agent, "max_tokens", None),
+            )
         handoff_accepted = True
 
         # ── Rebind and re-select the primary credential pool ──
@@ -2923,7 +2927,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             # moa://local placeholder → HTTP 404 → fallback to a reference
             # model. Pin chat_completions here so the primary call always goes
             # through MoAClient.chat.completions, matching agent_init.py.
-            agent.api_mode = "chat_completions"
+            api_mode = agent.api_mode = "chat_completions"
             agent.api_key = api_key or "moa-virtual-provider"
             agent.base_url = "moa://local"
             agent._client_kwargs = {}

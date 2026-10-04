@@ -242,3 +242,33 @@ def test_refused_primary_restore_preserves_fallback_then_allows_retry(governor):
         assert agent._provider_fallback_active is False
         assert governor.context_length == original_window
         assert governor.max_tokens == 4096
+
+
+@pytest.mark.parametrize("missing_field", ["compressor_model", "compressor_context_length"])
+@pytest.mark.parametrize("falsey_engine", [False, True])
+def test_active_engine_requires_restore_snapshot_fields(
+    governor, monkeypatch, missing_field, falsey_engine
+):
+    with _host_init(governor) as create:
+        agent = create(max_tokens=4096)
+        agent._fallback_chain = [{"provider": "openai", "model": "valid-fallback"}]
+        with (
+            patch("agent.auxiliary_client.resolve_provider_client", return_value=(_fallback_client(), None)),
+            patch("agent.model_metadata.get_model_context_length", return_value=32_000),
+            patch("agent.credential_pool.load_pool", return_value=None),
+        ):
+            assert agent._try_activate_fallback() is True
+        if falsey_engine:
+            monkeypatch.setattr(type(governor), "__bool__", lambda self: False, raising=False)
+        saved_value = agent._primary_runtime.pop(missing_field)
+        before_host = _state(agent, _HOST_FIELDS)
+        before_engine = _state(governor, _ENGINE_FIELDS)
+        previous_client = agent.client
+        assert agent._restore_primary_runtime() is False
+        assert _state(agent, _HOST_FIELDS) == before_host
+        assert _state(governor, _ENGINE_FIELDS) == before_engine
+        assert agent.client is previous_client
+        agent._primary_runtime[missing_field] = saved_value
+        assert agent._restore_primary_runtime() is True
+        assert agent.model == governor.model == "test-model"
+        assert agent._fallback_activated is False
