@@ -36,6 +36,47 @@ class AresLocalRuntimeError(RuntimeError):
     """Raised when the explicit local-runtime contract is not satisfied."""
 
 
+def _prepare_gateway_stop_marker() -> None:
+    """Publish stop intent through the gateway owner in its process home."""
+    from gateway import status
+
+    pid_path = status._get_pid_path()
+    try:
+        identity = status.get_running_pid_identity_strict(pid_path)
+    except (OSError, RuntimeError) as exc:
+        raise AresLocalRuntimeError(
+            f"Ares gateway stop identity is ambiguous: {exc}"
+        ) from exc
+    if identity is None:
+        return
+    home = pid_path.parent
+    records = (
+        status._read_pid_record(pid_path),
+        status._read_gateway_lock_record(status._get_gateway_lock_path(pid_path)),
+    )
+    for record in records:
+        recorded_home = record.get("hermes_home")
+        if (
+            not isinstance(recorded_home, str)
+            or not recorded_home.strip()
+            or not status._same_hermes_home(recorded_home, home)
+            or not status._record_matches_live_gateway_pid(
+                record, identity[0], expected_home=home
+            )
+        ):
+            raise AresLocalRuntimeError("Ares gateway stop identity has an ambiguous home")
+    try:
+        current = status.get_running_pid_identity_strict(pid_path)
+    except (OSError, RuntimeError) as exc:
+        raise AresLocalRuntimeError(
+            f"Ares gateway stop identity changed: {exc}"
+        ) from exc
+    if current != identity:
+        raise AresLocalRuntimeError("Ares gateway stop identity changed before marker publication")
+    if not status.write_planned_stop_marker(identity[0]):
+        raise AresLocalRuntimeError("Ares gateway planned-stop marker could not be written")
+
+
 def _desktop_launch_arguments(
     executable: Path,
     *,
@@ -1455,12 +1496,49 @@ print(json.dumps({'enabled': enabled, 'probed': sorted(probed), 'missing': missi
     def chat(self, arguments: Sequence[str]) -> None:
         self._exec_hermes(arguments)
 
+    def _prepare_gateway_stop(self) -> None:
+        # Gateway identity/marker paths deliberately ignore task-local home
+        # overrides. Scope their canonical owner in a child without changing
+        # the caller's process environment or active profile context.
+        _, source = self.active_release()
+        python = self._python_for(source)
+        environment = self._agent_environment()
+        environment["HERMES_HOME"] = str(self.paths.agent_home.expanduser().resolve())
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        try:
+            completed = subprocess.run(
+                [
+                    str(python),
+                    "-c",
+                    "from ares_runtime.local_runtime import _prepare_gateway_stop_marker; "
+                    "_prepare_gateway_stop_marker()",
+                ],
+                cwd=source,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise AresLocalRuntimeError(
+                f"Ares gateway stop preparation failed: {exc}"
+            ) from exc
+        if completed.returncode:
+            detail = (completed.stderr or completed.stdout).strip()
+            raise AresLocalRuntimeError(
+                "Ares gateway stop preparation failed"
+                + (f": {detail}" if detail else "")
+            )
+
     def gateway(self, action: str) -> None:
         if action == "foreground":
             self._exec_hermes(["gateway"])
         if action == "start":
             self._systemctl("enable", "--now", "ares-gateway.service")
         elif action == "stop":
+            self._prepare_gateway_stop()
             self._systemctl("disable", "--now", "ares-gateway.service")
         elif action == "restart":
             self._systemctl("restart", "ares-gateway.service")
