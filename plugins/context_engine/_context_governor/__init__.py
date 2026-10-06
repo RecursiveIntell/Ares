@@ -622,6 +622,14 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         protect_first_n: int | None = None,
         protect_last_n: int | None = None,
     ) -> None:
+        resolved_context_length = int(context_length or 0)
+        output_reserve = int(max_tokens) if max_tokens and int(max_tokens) > 0 else None
+        effective_window = resolved_context_length - (output_reserve or 0)
+        if resolved_context_length > 0 and effective_window <= 0:
+            raise ValueError(
+                "context-governor response reservation leaves no input budget "
+                f"(context_length={resolved_context_length}, max_tokens={output_reserve})"
+            )
         # Persist the active agent route.  The optional summary-specific fields
         # override these only when explicitly configured.
         self.model = str(model or "")
@@ -635,16 +643,11 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             self.protect_first_n = int(protect_first_n)
         if protect_last_n is not None:
             self.protect_last_n = int(protect_last_n)
-        self.context_length = int(context_length or 0)
-        self.max_tokens = (
-            int(max_tokens) if max_tokens and int(max_tokens) > 0 else None
-        )
+        self.context_length = resolved_context_length
+        self.max_tokens = output_reserve
         # Account for output reservation in effective input budget
-        effective_window = self.context_length - (self.max_tokens or 0)
-        if effective_window <= 0:
-            effective_window = self.context_length
         self.threshold_tokens = (
-            int(effective_window * self.threshold_percent) if effective_window else 0
+            int(effective_window * self.threshold_percent) if effective_window > 0 else 0
         )
 
     def update_from_response(self, usage: Dict[str, Any]) -> None:
@@ -3823,17 +3826,30 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             return None
 
     def _target_tokens(self, current_tokens: int | None) -> int:
+        target = None
         explicit = self._policy.get("token_budget")
         try:
             if explicit is not None and int(explicit) > 0:
-                return max(512, int(explicit))
+                target = max(512, int(explicit))
         except (TypeError, ValueError):
             pass
-        if self.context_length:
-            return max(512, int(self.context_length * 0.20))
-        if current_tokens:
-            return max(512, int(current_tokens * 0.20))
-        return 8000
+        if target is None:
+            if self.context_length:
+                target = max(512, int(self.context_length * 0.20))
+            elif current_tokens:
+                target = max(512, int(current_tokens * 0.20))
+            else:
+                target = 8000
+        if self.context_length > 0:
+            input_window = self.context_length - (self.max_tokens or 0)
+            if input_window <= 0:
+                raise ValueError("context-governor response reservation leaves no input budget")
+            # Configured policy remains the requested target. The active route
+            # is a hard ceiling, including when its input window is below the
+            # adapter's usual 512-token target floor. Rust still owns admission
+            # and may refuse a target that cannot preserve protected content.
+            target = min(target, input_window)
+        return target
 
     def _run_json(
         self,
