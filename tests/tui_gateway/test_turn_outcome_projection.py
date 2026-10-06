@@ -26,7 +26,7 @@ def projection_env(monkeypatch):
     monkeypatch.setattr(server, "_load_dashboard_process_isolation_config", lambda: {})
     monkeypatch.setattr(server, "_pending_clarify_request_payload", lambda sid: None)
     frames = []
-    monkeypatch.setattr(server, "write_json", frames.append)
+    monkeypatch.setattr(server, "_stdio_transport", types.SimpleNamespace(write=frames.append))
     yield frames
     # These sessions use fake host pipes; production teardown would wait for
     # control ACKs that this in-process fixture intentionally cannot produce.

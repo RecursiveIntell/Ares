@@ -223,11 +223,13 @@ class TestEnvFileParsing:
         (tmp_path / ".env").write_text("XIAOMI_API_KEY=placeholder\n")
         from hermes_cli import env_loader
 
-        home_key = str(tmp_path.resolve())
-        monkeypatch.setitem(
-            env_loader._SECRET_SOURCE_VALUES_BY_HOME,
-            home_key,
-            {"XIAOMI_API_KEY": "sk-from-bitwarden"},
+        # Seed the authoritative current generation. A legacy value-only
+        # projection cannot replace a retained/stale typed snapshot when
+        # pytest reuses the temp home after removing a passing fixture.
+        env_loader._record_external_secret_snapshot(
+            tmp_path,
+            data={"XIAOMI_API_KEY": "sk-from-bitwarden"},
+            status="ready",
         )
 
         assert ss.build_profile_secret_scope(tmp_path) == {

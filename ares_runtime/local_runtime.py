@@ -36,6 +36,47 @@ class AresLocalRuntimeError(RuntimeError):
     """Raised when the explicit local-runtime contract is not satisfied."""
 
 
+def _prepare_gateway_stop_marker() -> None:
+    """Publish stop intent through the gateway owner in its process home."""
+    from gateway import status
+
+    pid_path = status._get_pid_path()
+    try:
+        identity = status.get_running_pid_identity_strict(pid_path)
+    except (OSError, RuntimeError) as exc:
+        raise AresLocalRuntimeError(
+            f"Ares gateway stop identity is ambiguous: {exc}"
+        ) from exc
+    if identity is None:
+        return
+    home = pid_path.parent
+    records = (
+        status._read_pid_record(pid_path),
+        status._read_gateway_lock_record(status._get_gateway_lock_path(pid_path)),
+    )
+    for record in records:
+        recorded_home = record.get("hermes_home")
+        if (
+            not isinstance(recorded_home, str)
+            or not recorded_home.strip()
+            or not status._same_hermes_home(recorded_home, home)
+            or not status._record_matches_live_gateway_pid(
+                record, identity[0], expected_home=home
+            )
+        ):
+            raise AresLocalRuntimeError("Ares gateway stop identity has an ambiguous home")
+    try:
+        current = status.get_running_pid_identity_strict(pid_path)
+    except (OSError, RuntimeError) as exc:
+        raise AresLocalRuntimeError(
+            f"Ares gateway stop identity changed: {exc}"
+        ) from exc
+    if current != identity:
+        raise AresLocalRuntimeError("Ares gateway stop identity changed before marker publication")
+    if not status.write_planned_stop_marker(identity[0]):
+        raise AresLocalRuntimeError("Ares gateway planned-stop marker could not be written")
+
+
 def _desktop_launch_arguments(
     executable: Path,
     *,
@@ -939,6 +980,9 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
                 self._require_complete_release(
                     self._release_source(candidate_revision), desktop=desktop
                 )
+                # The verified release is reused; the fresh staging checkout
+                # remains owned by this invocation and must not accumulate.
+                shutil.rmtree(staging)
                 return candidate_revision
             self._build_runtime(source, desktop=desktop)
             self._atomic_json(
@@ -1162,8 +1206,38 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
                 raise
         return revision, seeded
 
+    def _require_base_update_recipe(self) -> None:
+        """Refuse recipes the ordinary updater cannot reproduce."""
+
+        current = self._release_from_link(self.paths.current_link, "current")
+        if current is None:
+            return
+        record = current[1] / ".venv" / "share" / "ares-full-install.json"
+        try:
+            # The website recipe includes SDK overrides even without native
+            # enhancements. Its record is unsupported by this base builder;
+            # malformed records and dangling links must not mean "base".
+            record.lstat()
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise AresLocalRuntimeError(
+                "Cannot inspect installed recipe metadata; ares update cannot "
+                "establish a supported base recipe. Current and previous "
+                "releases are preserved. Reconcile the installation recipe "
+                "before retrying."
+            ) from exc
+        raise AresLocalRuntimeError(
+            "ares update cannot preserve the recorded installer recipe. "
+            "Current and previous releases are preserved. Rerun the official "
+            "full-distribution installer for a new Ares source revision. "
+            "Dependency-only changes at the same revision require recipe-aware "
+            "update support; keep the complete release selected."
+        )
+
     def update(self, *, desktop: bool) -> tuple[str, bool]:
         with self.locked():
+            self._require_base_update_recipe()
             config = self._read_config()
             remote = str(config["remote"])
             branch = str(config["branch"])
@@ -1224,6 +1298,15 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
             try:
                 self._atomic_link(self.paths.current_link, previous[1])
                 self._atomic_link(self.paths.previous_link, current[1])
+                if self.paths.unit_path.exists():
+                    self._systemctl("restart", "ares-gateway.service")
+                    time.sleep(1)
+                    if not self._systemctl(
+                        "is-active", "--quiet", "ares-gateway.service", required=False
+                    ):
+                        raise AresLocalRuntimeError(
+                            "Ares gateway did not remain active after rollback"
+                        )
             except Exception:
                 try:
                     self._restore_release_pair(current, previous)
@@ -1231,19 +1314,16 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
                     raise AresLocalRuntimeError(
                         "Ares rollback failed and the prior release pointers could not be restored"
                     ) from restore_exc
+                if self.paths.unit_path.exists():
+                    try:
+                        self._systemctl(
+                            "restart", "ares-gateway.service", required=False
+                        )
+                    except Exception:
+                        # Recovery is best effort; preserve the rollback error
+                        # after restoring the authoritative pointer pair.
+                        pass
                 raise
-            if self.paths.unit_path.exists():
-                self._systemctl("restart", "ares-gateway.service")
-                time.sleep(1)
-                if not self._systemctl(
-                    "is-active", "--quiet", "ares-gateway.service", required=False
-                ):
-                    self._atomic_link(self.paths.current_link, current[1])
-                    self._atomic_link(self.paths.previous_link, previous[1])
-                    self._systemctl("restart", "ares-gateway.service", required=False)
-                    raise AresLocalRuntimeError(
-                        "Ares gateway did not remain active after rollback"
-                    )
             return previous[0]
 
     @staticmethod
@@ -1455,12 +1535,49 @@ print(json.dumps({'enabled': enabled, 'probed': sorted(probed), 'missing': missi
     def chat(self, arguments: Sequence[str]) -> None:
         self._exec_hermes(arguments)
 
+    def _prepare_gateway_stop(self) -> None:
+        # Gateway identity/marker paths deliberately ignore task-local home
+        # overrides. Scope their canonical owner in a child without changing
+        # the caller's process environment or active profile context.
+        _, source = self.active_release()
+        python = self._python_for(source)
+        environment = self._agent_environment()
+        environment["HERMES_HOME"] = str(self.paths.agent_home.expanduser().resolve())
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        try:
+            completed = subprocess.run(
+                [
+                    str(python),
+                    "-c",
+                    "from ares_runtime.local_runtime import _prepare_gateway_stop_marker; "
+                    "_prepare_gateway_stop_marker()",
+                ],
+                cwd=source,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise AresLocalRuntimeError(
+                f"Ares gateway stop preparation failed: {exc}"
+            ) from exc
+        if completed.returncode:
+            detail = (completed.stderr or completed.stdout).strip()
+            raise AresLocalRuntimeError(
+                "Ares gateway stop preparation failed"
+                + (f": {detail}" if detail else "")
+            )
+
     def gateway(self, action: str) -> None:
         if action == "foreground":
             self._exec_hermes(["gateway"])
         if action == "start":
             self._systemctl("enable", "--now", "ares-gateway.service")
         elif action == "stop":
+            self._prepare_gateway_stop()
             self._systemctl("disable", "--now", "ares-gateway.service")
         elif action == "restart":
             self._systemctl("restart", "ares-gateway.service")

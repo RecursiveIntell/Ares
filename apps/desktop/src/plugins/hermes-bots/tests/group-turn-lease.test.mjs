@@ -267,15 +267,21 @@ test('the per-turn lease is released after the turn — refcount returns to zero
   assert.equal(gc.stats().disposals, 1)
 })
 
-test('uncertain submit failure retains the per-turn lease until captured Stop', async () => {
+test('uncertain submit failure retains the per-turn lease after a captured Stop ACK', async () => {
   const fatal = new Error('backend exploded')
   const gc = load({ failEverySubmitWith: fatal })
 
   await assert.rejects(() => gc.runGroupChatMemberTurn('Room', ROUTED_MEMBER, 'hi', 't1', []))
 
   assert.equal(gc.stats().refcount, 1, 'unknown acceptance is not vacant capacity')
-  await gc.stopGroupThread('Room', 't1', [ROUTED_MEMBER])
-  assert.equal(gc.stats().refcount, 0)
+  const first = await gc.stopGroupThread('Room', 't1', [ROUTED_MEMBER])
+  assert.equal(first.status, 'stopping')
+  assert.equal(first.pending, 1)
+  assert.equal(gc.stats().refcount, 1, 'ACK cannot prove retirement without admission identity')
+  const second = await gc.stopGroupThread('Room', 't1', [ROUTED_MEMBER])
+  assert.equal(second.status, 'stopping')
+  assert.equal(gc.stats().refcount, 1)
+  assert.equal(gc.stats().submits, 1, 'unknown acceptance never replays user text')
 })
 
 test('hosts without retainProfile still run the turn (feature detection)', async () => {

@@ -891,7 +891,9 @@ class ChatCompletionsTransport(ProviderTransport):
         _fr = getattr(choice, "finish_reason", None)
         if isinstance(_fr, int):
             _fr = str(_fr)
-        finish_reason = _fr or "stop"
+        from agent.transports.ri_llm import RiCompletionResponse
+        # Only the internal native result attests that finish metadata is absent.
+        finish_reason = _fr if isinstance(response, RiCompletionResponse) else (_fr or "stop")
 
         tool_calls = None
         message_tool_calls = getattr(msg, "tool_calls", None)

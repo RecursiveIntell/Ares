@@ -12,7 +12,7 @@ import { modelOptionsQueryKey, requestModelOptions, selectionUnavailable } from 
 import { currentPickerSelection } from '@/lib/model-status-label'
 import { DEFAULT_REASONING_EFFORT } from '@/lib/reasoning-effort'
 import { cn } from '@/lib/utils'
-import { activeGatewayConnectionId } from '@/store/gateway'
+import { activeGatewayConnectionId, requestGatewayForAgent } from '@/store/gateway'
 import { $modelPresets, applyModelPreset, modelPresetKey, setModelPreset } from '@/store/model-presets'
 import { $visibleModels } from '@/store/model-visibility'
 import { notifyError } from '@/store/notifications'
@@ -23,6 +23,7 @@ import {
   $defaultReasoningEffort,
   $selectedStoredSessionId,
   beginRuntimeOptionIntent,
+  getComposerModelSelection,
   markComposerSelectionManual,
   ownsRuntimeOptionIntent,
   setCurrentFastMode,
@@ -30,6 +31,8 @@ import {
 } from '@/store/session'
 import { $sessionStates, knownOwnerForSession, sessionTileDelegate } from '@/store/session-states'
 import type { ModelOptionsResponse } from '@/types/hermes'
+
+import { useDraftComposerOwner } from '../hooks/use-composer-model-owner'
 
 import { ModelCatalogMenu, type ModelMenuController } from './model-catalog-menu'
 
@@ -66,8 +69,13 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
   const view = useSessionView()
   const activeSessionId = useStore(view.$runtimeId)
   const owner = knownOwnerForSession(activeSessionId)
-  const connectionId = owner && typeof owner === 'object' ? owner.connectionId : owner ? 'local' : activeGatewayConnectionId()
-  const catalogProfile = (typeof owner === 'string' ? owner : (owner?.targetProfile || owner?.profile)) || profile
+  const draftOwner = useDraftComposerOwner()
+  const connectionId = owner && typeof owner === 'object' ? owner.connectionId : owner ? null : !activeSessionId ? draftOwner.connectionId : activeGatewayConnectionId()
+  const catalogProfile = (typeof owner === 'string' ? owner : (owner?.targetProfile || owner?.profile)) || (!activeSessionId ? draftOwner.targetProfile || draftOwner.profile : profile)
+
+  const catalogRequest = !activeSessionId
+    ? <T,>(method: string, params?: Record<string, unknown>) => requestGatewayForAgent<T>(draftOwner.connectionId, draftOwner.profile, method, params)
+    : requestGateway
 
   const unconfirmedOptions = useStore(
     useMemo(
@@ -82,6 +90,7 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
   const currentFastMode = useStore(view.$fast)
   const currentModel = useStore(view.$model)
   const currentProvider = useStore(view.$provider)
+  const draftSelection = !activeSessionId ? getComposerModelSelection(draftOwner) : null
   const currentReasoningEffort = useStore(view.$reasoningEffort)
   const modelPresets = useStore($modelPresets)
   const defaultEffort = useStore($defaultReasoningEffort) || DEFAULT_REASONING_EFFORT
@@ -96,11 +105,13 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
   const modelOptions = useQuery({
     queryKey: modelOptionsQueryKey(catalogProfile, activeSessionId, connectionId),
     queryFn: (): Promise<ModelOptionsResponse> =>
-      requestModelOptions({ connectionId, gateway, profile: catalogProfile, request: requestGateway, sessionId: activeSessionId })
+      requestModelOptions({ connectionId, gateway, profile: catalogProfile, request: catalogRequest, sessionId: activeSessionId })
   })
 
   const { model: optionsModel, provider: optionsProvider } = currentPickerSelection(
-    { model: currentModel, provider: currentProvider },
+    activeSessionId
+      ? { model: currentModel, provider: currentProvider }
+      : { model: draftSelection?.model || '', provider: draftSelection?.provider || '', authoritative: Boolean(draftSelection) },
     modelOptions.data
   )
 
@@ -123,7 +134,7 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
         gateway,
         profile: catalogProfile,
         refresh: true,
-        request: requestGateway,
+        request: catalogRequest,
         sessionId: activeSessionId
       })
 
@@ -329,7 +340,7 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
       gateway={gateway}
       includeMoa
       profile={catalogProfile}
-      request={requestGateway}
+      request={catalogRequest}
       sessionId={activeSessionId}
     />
   )

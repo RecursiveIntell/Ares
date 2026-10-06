@@ -1589,9 +1589,12 @@ class FeishuAdapter(BasePlatformAdapter):
         # Default group policy (for groups not in group_rules)
         default_group_policy = str(extra.get("default_group_policy", "")).strip().lower()
 
-        # Env-only so adapter and gateway auth bypass share one source; yaml
-        # feishu.allow_bots is bridged to this env var at config load.
-        allow_bots = os.getenv("FEISHU_ALLOW_BOTS", "none").strip().lower()
+        # Target env takes precedence over target PlatformConfig.extra. The
+        # YAML hook seeds extra without mutating the process environment.
+        allow_bots = str(
+            _get_scoped_secret("FEISHU_ALLOW_BOTS", "")
+            or extra.get("allow_bots", "none")
+        ).strip().lower()
         if allow_bots not in {"none", "mentions", "all"}:
             logger.warning(
                 "[Feishu] Unknown allow_bots=%r, falling back to 'none'. Valid: none, mentions, all.",
@@ -1600,25 +1603,25 @@ class FeishuAdapter(BasePlatformAdapter):
             allow_bots = "none"
 
         return FeishuAdapterSettings(
-            app_id=str(extra.get("app_id") or os.getenv("FEISHU_APP_ID", "")).strip(),
+            app_id=str(extra.get("app_id") or _get_scoped_secret("FEISHU_APP_ID", "")).strip(),
             app_secret=str(extra.get("app_secret") or _get_scoped_secret("FEISHU_APP_SECRET", "")).strip(),
-            domain_name=str(extra.get("domain") or os.getenv("FEISHU_DOMAIN", "feishu")).strip().lower(),
+            domain_name=str(extra.get("domain") or _get_scoped_secret("FEISHU_DOMAIN", "feishu")).strip().lower(),
             connection_mode=str(
-                extra.get("connection_mode") or os.getenv("FEISHU_CONNECTION_MODE", "websocket")
+                extra.get("connection_mode") or _get_scoped_secret("FEISHU_CONNECTION_MODE", "websocket")
             ).strip().lower(),
             encrypt_key=str(extra.get("encrypt_key") or _get_scoped_secret("FEISHU_ENCRYPT_KEY", "")).strip(),
             verification_token=str(
                 extra.get("verification_token") or _get_scoped_secret("FEISHU_VERIFICATION_TOKEN", "")
             ).strip(),
-            group_policy=os.getenv("FEISHU_GROUP_POLICY", "allowlist").strip().lower(),
+            group_policy=_get_scoped_secret("FEISHU_GROUP_POLICY", "allowlist").strip().lower(),
             allowed_group_users=frozenset(
                 item.strip()
-                for item in os.getenv("FEISHU_ALLOWED_USERS", "").split(",")
+                for item in _get_scoped_secret("FEISHU_ALLOWED_USERS", "").split(",")
                 if item.strip()
             ),
-            bot_open_id=os.getenv("FEISHU_BOT_OPEN_ID", "").strip(),
-            bot_user_id=os.getenv("FEISHU_BOT_USER_ID", "").strip(),
-            bot_name=os.getenv("FEISHU_BOT_NAME", "").strip(),
+            bot_open_id=_get_scoped_secret("FEISHU_BOT_OPEN_ID", "").strip(),
+            bot_user_id=_get_scoped_secret("FEISHU_BOT_USER_ID", "").strip(),
+            bot_name=_get_scoped_secret("FEISHU_BOT_NAME", "").strip(),
             dedup_cache_size=max(
                 32,
                 env_int("HERMES_FEISHU_DEDUP_CACHE_SIZE", _DEFAULT_DEDUP_CACHE_SIZE),
@@ -1641,13 +1644,13 @@ class FeishuAdapter(BasePlatformAdapter):
                 "HERMES_FEISHU_MEDIA_BATCH_DELAY_SECONDS", _DEFAULT_MEDIA_BATCH_DELAY_SECONDS
             ),
             webhook_host=str(
-                extra.get("webhook_host") or os.getenv("FEISHU_WEBHOOK_HOST", _DEFAULT_WEBHOOK_HOST)
+                extra.get("webhook_host") or _get_scoped_secret("FEISHU_WEBHOOK_HOST", _DEFAULT_WEBHOOK_HOST)
             ).strip(),
             webhook_port=int(
-                extra.get("webhook_port") or os.getenv("FEISHU_WEBHOOK_PORT", str(_DEFAULT_WEBHOOK_PORT))
+                extra.get("webhook_port") or _get_scoped_secret("FEISHU_WEBHOOK_PORT", str(_DEFAULT_WEBHOOK_PORT))
             ),
             webhook_path=(
-                str(extra.get("webhook_path") or os.getenv("FEISHU_WEBHOOK_PATH", _DEFAULT_WEBHOOK_PATH)).strip()
+                str(extra.get("webhook_path") or _get_scoped_secret("FEISHU_WEBHOOK_PATH", _DEFAULT_WEBHOOK_PATH)).strip()
                 or _DEFAULT_WEBHOOK_PATH
             ),
             ws_reconnect_nonce=_coerce_required_int(extra.get("ws_reconnect_nonce"), default=30, min_value=0),
@@ -1659,7 +1662,7 @@ class FeishuAdapter(BasePlatformAdapter):
             group_rules=group_rules,
             allow_bots=allow_bots,
             require_mention=_to_boolean(
-                extra.get("require_mention", os.getenv("FEISHU_REQUIRE_MENTION", "true"))
+                extra.get("require_mention", _get_scoped_secret("FEISHU_REQUIRE_MENTION", "true"))
             ),
         )
 
@@ -4373,9 +4376,9 @@ class FeishuAdapter(BasePlatformAdapter):
                 return "bot_not_mentioned"
 
         if not is_group:
-            if os.getenv("FEISHU_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
+            if _get_scoped_secret("FEISHU_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
                 return None
-            if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
+            if _get_scoped_secret("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
                 return None
             # Empty FEISHU_ALLOWED_USERS is the pairing-mode default from setup:
             # forward DMs to gateway intake so the pairing handshake can run.
@@ -5851,14 +5854,9 @@ def interactive_setup() -> None:
 
 
 def _apply_yaml_config(yaml_cfg: dict, feishu_cfg: dict) -> dict | None:
-    """Translate config.yaml feishu: keys into FEISHU_* env vars.
-
-    Implements the apply_yaml_config_fn contract (#24849). Mirrors the legacy
-    feishu_cfg block from gateway/config.py::load_gateway_config() (allow_bots).
-    Env vars take precedence over YAML. Returns None — flows through env.
-    """
-    if "allow_bots" in feishu_cfg and not os.getenv("FEISHU_ALLOW_BOTS"):
-        os.environ["FEISHU_ALLOW_BOTS"] = str(feishu_cfg["allow_bots"]).lower()
+    """Seed target PlatformConfig.extra; scoped env retains precedence."""
+    if "allow_bots" in feishu_cfg:
+        return {"allow_bots": str(feishu_cfg["allow_bots"]).lower()}
     return None
 
 

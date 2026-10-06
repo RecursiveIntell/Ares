@@ -4,8 +4,9 @@ import { MemoryRouter } from 'react-router'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { getApiRequestConnection, setApiRequestConnection, setApiRequestProfile } from '@/api/client'
+import { getHermesConfigRecord as readConfigOverBridge, saveHermesConfig as saveConfigOverBridge } from '@/api/config'
 import { $activeGatewayProfile, $newChatProfile, $newChatRoute } from '@/store/profile'
-import { _resetComposerModelSelectionsForTests } from '@/store/session'
+import { $connection, _resetComposerModelSelectionsForTests } from '@/store/session'
 
 import { deferred } from '../../test/deferred'
 
@@ -39,13 +40,13 @@ vi.mock('@/hermes', () => ({
   getAuxiliaryModels: (profile?: null | string) => getAuxiliaryModels(profile),
   getApiRequestProfile: () => 'default',
   getMoaModels: (profile?: null | string) => getMoaModels(profile),
-  profileScopeKey: (scope?: null | string) => (scope ?? '').trim() || 'default',
+  profileScopeKey: (scope?: null | string | { connectionId?: string | null; profile?: string | null }) => typeof scope === 'object' && scope ? `${scope.connectionId || 'local'}::${scope.profile || 'default'}` : (scope ?? '').trim() || 'default',
   setModelAssignment: (body: unknown) => setModelAssignment(body),
   getRecommendedDefaultModel: (slug: string) => getRecommendedDefaultModel(slug),
   saveMoaModels: (body: unknown) => saveMoaModels(body),
   setEnvVar: (key: string, value: string) => setEnvVar(key, value),
-  getHermesConfigRecord: () => getHermesConfigRecord(),
-  saveHermesConfig: (config: unknown) => saveHermesConfig(config),
+  getHermesConfigRecord: (profile?: null | string) => getHermesConfigRecord(profile),
+  saveHermesConfig: (config: unknown, profile?: null | string) => saveHermesConfig(config, profile),
   setApiRequestProfile: () => {}
 }))
 
@@ -63,6 +64,7 @@ vi.mock('../hooks/use-on-profile-switch', () => ({
 
 beforeEach(() => {
   _resetComposerModelSelectionsForTests()
+  $connection.set(null)
   $newChatRoute.set(null)
   $newChatProfile.set(null)
   $activeGatewayProfile.set('default')
@@ -114,6 +116,77 @@ async function renderModelSettings(scopeProfile?: string, onMainModelChanged = v
 }
 
 describe('ModelSettings profile scope', () => {
+  it('reloads the form for same-named source owners A → B → A before saving', async () => {
+    const rehome = (connectionId: string) => {
+      setApiRequestConnection(connectionId)
+      $connection.set({ connectionId } as never)
+      $newChatRoute.set({ connectionId, profile: 'default' })
+    }
+
+    rehome('source-a')
+    getGlobalModelInfo.mockImplementation(async () => ({
+      provider: getApiRequestConnection() === 'source-b' ? 'custom:b' : 'nous',
+      model: getApiRequestConnection() === 'source-b' ? 'model-b' : 'hermes-4'
+    }))
+    getGlobalModelOptions.mockImplementation(async () => ({
+      providers: getApiRequestConnection() === 'source-b'
+        ? [{ name: 'Source B', slug: 'custom:b', models: ['model-b'], authenticated: true, api_url: 'https://b.invalid/v1' }]
+        : [{ name: 'Nous', slug: 'nous', models: ['hermes-4'], authenticated: true }]
+    }))
+    await renderModelSettings()
+    await screen.findByRole('button', { name: 'Apply' })
+    await act(async () => rehome('source-b'))
+    await waitFor(() => expect(screen.getAllByRole('combobox')[0].textContent).toContain('Source B'))
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+    await waitFor(() => expect(setModelAssignment).toHaveBeenCalledWith(expect.objectContaining({
+      provider: 'custom:b', model: 'model-b', base_url: 'https://b.invalid/v1'
+    })))
+    await act(async () => rehome('source-a'))
+    await waitFor(() => expect(screen.getAllByRole('combobox')[0].textContent).toContain('Nous'))
+  })
+
+  it.each(['source-b', 'local'])('keeps config GET/PUT routing and record authority together on %s', async destination => {
+    const previousBridge = window.hermesDesktop
+
+    const api = vi.fn(async (request: { connectionId?: string; method?: string; body?: unknown }) =>
+      request.method === 'PUT' ? { ok: true } : {
+        fixture_source: request.connectionId,
+        agent: { reasoning_effort: 'medium', service_tier: 'normal' },
+        memory: { enabled: false }, governor: { semantic_memory_enabled: true }
+      })
+
+    window.hermesDesktop = { api } as never
+    getHermesConfigRecord.mockImplementation(readConfigOverBridge)
+    saveHermesConfig.mockImplementation(saveConfigOverBridge)
+
+    const rehome = (connectionId: string) => {
+      setApiRequestConnection(connectionId)
+      $connection.set({ connectionId } as never)
+      $newChatRoute.set({ connectionId, profile: 'default' })
+    }
+
+    try {
+      rehome('source-a')
+      await renderModelSettings()
+      await screen.findByRole('switch')
+      await act(async () => rehome(destination))
+      await waitFor(() => expect(api).toHaveBeenCalledWith(expect.objectContaining({ connectionId: destination, path: '/api/config' })))
+      fireEvent.click(await screen.findByRole('switch'))
+      await waitFor(() => expect(api).toHaveBeenCalledWith(expect.objectContaining({
+        connectionId: destination, method: 'PUT', body: { config: expect.objectContaining({
+          fixture_source: destination, memory: { enabled: false }, governor: { semantic_memory_enabled: true }
+        })
+        }
+      })))
+      expect(getHermesConfigRecord).toHaveBeenCalledWith(undefined)
+      expect(saveHermesConfig).toHaveBeenCalledWith(expect.objectContaining({ fixture_source: destination }), undefined)
+    } finally {
+      window.hermesDesktop = previousBridge
+      getHermesConfigRecord.mockReset()
+      saveHermesConfig.mockReset()
+    }
+  })
+
   it('carries the original source/profile/target through an asynchronous save callback', async () => {
     const owner = { connectionId: 'source-a', profile: 'specialist', targetProfile: 'backend-a' }
     $newChatRoute.set(owner)
@@ -128,7 +201,10 @@ describe('ModelSettings profile scope', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Apply' }))
     await waitFor(() => expect(setModelAssignment).toHaveBeenCalledOnce())
     const originalSource = getApiRequestConnection()
-    setApiRequestConnection('source-b')
+    await act(async () => {
+      setApiRequestConnection('source-b')
+      $connection.set({ connectionId: 'source-b' } as never)
+    })
     pending.resolve({ ok: true, provider: 'nous', model: 'hermes-4', gateway_tools: [] })
     await waitFor(() => expect(changed).toHaveBeenCalledOnce())
     expect(changed).toHaveBeenCalledWith(
@@ -345,7 +421,8 @@ describe('ModelSettings', () => {
 
     await waitFor(() =>
       expect(saveHermesConfig).toHaveBeenCalledWith(
-        expect.objectContaining({ agent: expect.objectContaining({ service_tier: 'fast' }) })
+        expect.objectContaining({ agent: expect.objectContaining({ service_tier: 'fast' }) }),
+        undefined
       )
     )
   })

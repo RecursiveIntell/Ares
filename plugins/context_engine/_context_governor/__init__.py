@@ -205,6 +205,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         self.last_real_prompt_tokens = 0
         self.last_compression_rough_tokens = 0
         self.awaiting_real_usage_after_compression = False
+        self._pending_request_rough_tokens = 0
 
         # Anti-thrashing state
         self._ineffective_compression_count = 0
@@ -351,6 +352,8 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         clone._ineffective_compression_count = self._ineffective_compression_count
         clone._last_compression_savings_pct = self._last_compression_savings_pct
         clone._set_defer_baseline(self.last_rough_tokens_when_real_prompt_fit)
+        # A clone has not sent the original owner's pending request.
+        clone._pending_request_rough_tokens = 0
         clone._previous_summary = self._previous_summary
         clone._summary_mode = self._summary_mode
         clone._summary_model = self._summary_model
@@ -622,6 +625,19 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         protect_first_n: int | None = None,
         protect_last_n: int | None = None,
     ) -> None:
+        resolved_context_length = int(context_length or 0)
+        output_reserve = int(max_tokens) if max_tokens and int(max_tokens) > 0 else None
+        effective_window = resolved_context_length - (output_reserve or 0)
+        if resolved_context_length > 0 and effective_window <= 0:
+            raise ValueError(
+                "context-governor response reservation leaves no input budget "
+                f"(context_length={resolved_context_length}, max_tokens={output_reserve})"
+            )
+        pressure_fields = (
+            "model", "base_url", "api_key", "provider", "api_mode",
+            "context_length", "max_tokens", "threshold_tokens",
+        )
+        previous_pressure_route = tuple(getattr(self, key, None) for key in pressure_fields)
         # Persist the active agent route.  The optional summary-specific fields
         # override these only when explicitly configured.
         self.model = str(model or "")
@@ -635,17 +651,31 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             self.protect_first_n = int(protect_first_n)
         if protect_last_n is not None:
             self.protect_last_n = int(protect_last_n)
-        self.context_length = int(context_length or 0)
-        self.max_tokens = (
-            int(max_tokens) if max_tokens and int(max_tokens) > 0 else None
-        )
+        self.context_length = resolved_context_length
+        self.max_tokens = output_reserve
         # Account for output reservation in effective input budget
-        effective_window = self.context_length - (self.max_tokens or 0)
-        if effective_window <= 0:
-            effective_window = self.context_length
         self.threshold_tokens = (
-            int(effective_window * self.threshold_percent) if effective_window else 0
+            int(effective_window * self.threshold_percent) if effective_window > 0 else 0
         )
+        if previous_pressure_route != tuple(getattr(self, key, None) for key in pressure_fields):
+            # Token evidence from another route/budget cannot qualify this
+            # request. Keep telemetry, but invalidate pressure projections.
+            self._set_defer_baseline(0)
+            self._pending_request_rough_tokens = 0
+            self.last_compression_rough_tokens = 0
+            self.awaiting_real_usage_after_compression = False
+
+    def note_request_rough_estimate(self, rough_tokens: int) -> None:
+        """Record host request pressure for its next matching usage update.
+
+        This is an advisory rough estimate, not final wire/native accounting.
+        A rebuilt request replaces the pending estimate; only its positive
+        provider usage can establish a new fitting pair.
+        """
+        try:
+            self._pending_request_rough_tokens = max(0, int(rough_tokens))
+        except (TypeError, ValueError, OverflowError):
+            self._pending_request_rough_tokens = 0
 
     def update_from_response(self, usage: Dict[str, Any]) -> None:
         self.last_prompt_tokens = int(
@@ -658,19 +688,19 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             usage.get("total_tokens")
             or (self.last_prompt_tokens + self.last_completion_tokens)
         )
+        request_rough = self._pending_request_rough_tokens
+        self._pending_request_rough_tokens = 0
         # Mirror the built-in contract: last_real_prompt_tokens tracks the
         # most recent non-zero provider-reported prompt count, separate from
         # last_prompt_tokens (which can be -1 after a deferred preflight).
         if self.last_prompt_tokens > 0:
             self.last_real_prompt_tokens = self.last_prompt_tokens
-            if self.last_prompt_tokens < self.threshold_tokens:
-                if (
-                    self.awaiting_real_usage_after_compression
-                    and self.last_compression_rough_tokens > 0
-                ):
-                    self._set_defer_baseline(self.last_compression_rough_tokens)
-            else:
-                self._set_defer_baseline(0)
+            # Update the pair atomically. An unmatched positive reading must
+            # not be projected against an unrelated older rough anchor;
+            # compaction diagnostics alone are not a request measurement.
+            self._set_defer_baseline(
+                request_rough if self.last_prompt_tokens < self.threshold_tokens else 0
+            )
         self.awaiting_real_usage_after_compression = False
 
     def should_compress(self, prompt_tokens: int = None) -> bool:
@@ -727,8 +757,9 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
 
         Mirrors the built-in ContextCompressor contract. The rough preflight
         estimator includes tool/schema overhead and can overestimate immediately
-        after compaction; provider-reported real usage is a better signal only
-        for a bounded growth window. Once rough growth exceeds tolerance,
+        after compaction; a matching rough/real pair can project cumulative
+        growth below the trigger. The projection is advisory, not a qualified
+        tokenizer bound. Once projected growth reaches the trigger,
         preflight must compress again instead of letting the session creep toward
         the hard context limit.
         """
@@ -741,9 +772,9 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         # At emergency pressure, fall through so should_compress() forces a
         # safety retry before the provider sees the oversized request.
         emergency_threshold = self._emergency_pressure_threshold()
-        if self.awaiting_real_usage_after_compression and (
-            emergency_threshold <= 0 or rough_tokens < emergency_threshold
-        ):
+        if emergency_threshold > 0 and rough_tokens >= emergency_threshold:
+            return False
+        if self.awaiting_real_usage_after_compression:
             return True
         # Futility deferral is a normal-band optimization, not a safety gate.
         # At emergency pressure the caller must reach should_compress(), whose
@@ -751,26 +782,19 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         # the request. Keeping this unconditional used to make the governor
         # look completely dead after two low-yield passes: both automatic
         # preflight paths returned here before should_compress() was evaluated.
-        if self._ineffective_compression_count >= 2 and (
-            emergency_threshold <= 0 or rough_tokens < emergency_threshold
-        ):
+        if self._ineffective_compression_count >= 2:
             return True
         if self.last_real_prompt_tokens <= 0:
             return False
         if self.last_real_prompt_tokens >= self.threshold_tokens:
             return False
-        baseline = (
-            self.last_rough_tokens_when_real_prompt_fit
-            or self.last_compression_rough_tokens
-        )
+        baseline = self.last_rough_tokens_when_real_prompt_fit
         if baseline <= 0:
             return False
         growth = max(0, rough_tokens - baseline)
-        tolerated = max(4096, int(self.threshold_tokens * 0.05))
-        if growth > tolerated:
-            return False
-        self._set_defer_baseline(max(baseline, rough_tokens))
-        return True
+        # Only a matching positive usage update refreshes the pair. Repeated
+        # pressure checks or usage-less growth cannot ratchet this anchor.
+        return self.last_real_prompt_tokens + growth < self.threshold_tokens
 
     def has_content_to_compress(self, messages: List[Dict[str, Any]]) -> bool:
         non_system = [
@@ -904,6 +928,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         self.last_real_prompt_tokens = 0
         self.last_compression_rough_tokens = 0
         self.awaiting_real_usage_after_compression = False
+        self._pending_request_rough_tokens = 0
         self._ineffective_compression_count = 0
         self._last_compression_savings_pct = 100.0
         self._set_defer_baseline(0)
@@ -3823,17 +3848,30 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             return None
 
     def _target_tokens(self, current_tokens: int | None) -> int:
+        target = None
         explicit = self._policy.get("token_budget")
         try:
             if explicit is not None and int(explicit) > 0:
-                return max(512, int(explicit))
+                target = max(512, int(explicit))
         except (TypeError, ValueError):
             pass
-        if self.context_length:
-            return max(512, int(self.context_length * 0.20))
-        if current_tokens:
-            return max(512, int(current_tokens * 0.20))
-        return 8000
+        if target is None:
+            if self.context_length:
+                target = max(512, int(self.context_length * 0.20))
+            elif current_tokens:
+                target = max(512, int(current_tokens * 0.20))
+            else:
+                target = 8000
+        if self.context_length > 0:
+            input_window = self.context_length - (self.max_tokens or 0)
+            if input_window <= 0:
+                raise ValueError("context-governor response reservation leaves no input budget")
+            # Configured policy remains the requested target. The active route
+            # is a hard ceiling, including when its input window is below the
+            # adapter's usual 512-token target floor. Rust still owns admission
+            # and may refuse a target that cannot preserve protected content.
+            target = min(target, input_window)
+        return target
 
     def _run_json(
         self,

@@ -23,6 +23,8 @@ CLASSIFIER_KEYS = (
     "mcp_catalog",
     "ci_review",
     "ci_review_files",
+    "context_continuity",
+    "current_owner_integration",
 )
 
 
@@ -31,6 +33,12 @@ def classifier(**overrides: str) -> dict[str, str]:
     result["ci_review_files"] = ""
     result.update(overrides)
     return result
+
+
+NATIVE_CALLS = (
+    ("context-continuity", "context_continuity", ("native_external_owner_result", "focused_tests_result")),
+    ("current-owner-integration", "current_owner_integration", ("profile_runtime_consumer_result",)),
+)
 
 
 def jobs_for(classifier_values: dict[str, str], *, event: str = "pull_request") -> dict[str, dict[str, object]]:
@@ -71,6 +79,12 @@ def jobs_for(classifier_values: dict[str, str], *, event: str = "pull_request") 
     # explicit applicability exception, not a blanket skipped-is-green rule.
     result["e2e-desktop"] = {"result": "skipped"}
     result["osv-scanner"] = {"result": "success"}
+    for job, lane, outputs in NATIVE_CALLS:
+        applies = event != "pull_request" or classifier_values[lane] == "true"
+        result[job] = {
+            "result": "success" if applies else "skipped",
+            "outputs": {key: "success" for key in outputs} if applies else {},
+        }
     return result
 
 
@@ -179,3 +193,135 @@ def test_missing_or_malformed_critical_findings_fails_closed(outputs):
     result = run(values, jobs=jobs)
     assert result["status"] == "FAIL"
     assert any("critical_findings" in failure for failure in result["failures"])
+
+
+@pytest.mark.parametrize("lanes", [
+    {"context_continuity": "true"},
+    {"current_owner_integration": "true"},
+    {"context_continuity": "true", "current_owner_integration": "true"},
+])
+def test_applicable_native_call_and_each_inner_owner_success_pass(lanes):
+    values = classifier(**lanes)
+    result = run(values)
+    assert result["status"] == "PASS"
+    for job, lane, _ in NATIVE_CALLS:
+        assert (job in result["required_jobs"]) == (values[lane] == "true")
+
+
+def test_applicable_native_calls_missing_from_existing_graph_fail_closed():
+    values = classifier(context_continuity="true", current_owner_integration="true")
+    jobs = jobs_for(values)
+    for job, _, _ in NATIVE_CALLS:
+        jobs.pop(job)
+    result = run(values, jobs=jobs)
+    assert result["status"] == "FAIL"
+    assert all(any(job in failure for failure in result["failures"]) for job, _, _ in NATIVE_CALLS)
+
+
+@pytest.mark.parametrize("job,lane,outputs", NATIVE_CALLS)
+@pytest.mark.parametrize("bad_result", ["failure", "cancelled", "skipped", "neutral", "", None, True])
+def test_applicable_native_caller_non_success_fails_closed(job, lane, outputs, bad_result):
+    values = classifier(**{lane: "true"})
+    jobs = jobs_for(values)
+    jobs[job]["result"] = bad_result
+    result = run(values, jobs=jobs)
+    assert result["status"] == "FAIL"
+    assert any(job in failure for failure in result["failures"])
+
+
+@pytest.mark.parametrize("job,lane,outputs", NATIVE_CALLS)
+@pytest.mark.parametrize("shape", ["missing", "null", "no-result", "wrong-result-key"])
+def test_applicable_native_caller_missing_or_malformed_fails_closed(job, lane, outputs, shape):
+    values = classifier(**{lane: "true"})
+    jobs = jobs_for(values)
+    if shape == "missing":
+        jobs.pop(job)
+    elif shape == "null":
+        jobs[job] = None
+    elif shape == "no-result":
+        jobs[job] = {}
+    else:
+        jobs[job] = {"conclusion": "success"}
+    assert run(values, jobs=jobs)["status"] == "FAIL"
+
+
+@pytest.mark.parametrize("job,lane,key", [
+    (job, lane, key) for job, lane, outputs in NATIVE_CALLS for key in outputs
+])
+@pytest.mark.parametrize("bad_result", ["failure", "cancelled", "skipped", "neutral", "", None, True, {}, []])
+def test_successful_call_cannot_hide_non_success_inner_owner(job, lane, key, bad_result):
+    values = classifier(**{lane: "true"})
+    jobs = jobs_for(values)
+    jobs[job]["outputs"][key] = bad_result
+    result = run(values, jobs=jobs)
+    assert result["status"] == "FAIL"
+    assert any(key in failure for failure in result["failures"])
+
+
+@pytest.mark.parametrize("job,lane,key", [
+    (job, lane, key) for job, lane, outputs in NATIVE_CALLS for key in outputs
+])
+def test_successful_call_cannot_hide_missing_inner_owner_result(job, lane, key):
+    values = classifier(**{lane: "true"})
+    jobs = jobs_for(values)
+    del jobs[job]["outputs"][key]
+    assert run(values, jobs=jobs)["status"] == "FAIL"
+
+
+@pytest.mark.parametrize("job,lane,outputs", NATIVE_CALLS)
+@pytest.mark.parametrize("shape", [None, "", [], {}])
+def test_applicable_call_requires_native_output_object_and_bindings(job, lane, outputs, shape):
+    values = classifier(**{lane: "true"})
+    jobs = jobs_for(values)
+    jobs[job]["outputs"] = shape
+    assert run(values, jobs=jobs)["status"] == "FAIL"
+
+
+@pytest.mark.parametrize("job,lane,outputs", NATIVE_CALLS)
+def test_non_applicable_native_call_must_be_present_and_skipped(job, lane, outputs):
+    values = classifier()
+    jobs = jobs_for(values)
+    assert jobs[job]["result"] == "skipped"
+    jobs[job].pop("outputs")
+    assert run(values, jobs=jobs)["status"] == "PASS"
+    jobs.pop(job)
+    assert run(values, jobs=jobs)["status"] == "FAIL"
+
+
+@pytest.mark.parametrize("job,lane,outputs", NATIVE_CALLS)
+@pytest.mark.parametrize("bad_result", ["success", "failure", "cancelled"])
+def test_non_applicable_native_call_rejects_unexpected_result(job, lane, outputs, bad_result):
+    values = classifier()
+    jobs = jobs_for(values)
+    jobs[job]["result"] = bad_result
+    assert run(values, jobs=jobs)["status"] == "FAIL"
+
+
+@pytest.mark.parametrize("event", ["push", "workflow_dispatch"])
+@pytest.mark.parametrize("job,lane,outputs", NATIVE_CALLS)
+def test_postmerge_and_dispatch_require_native_owners_even_with_false_flags(event, job, lane, outputs):
+    values = classifier()
+    jobs = jobs_for(values, event=event)
+    assert run(values, event=event, jobs=jobs)["status"] == "PASS"
+    jobs[job] = {"result": "skipped"}
+    assert run(values, event=event, jobs=jobs)["status"] == "FAIL"
+
+
+@pytest.mark.parametrize("lane", ["context_continuity", "current_owner_integration"])
+@pytest.mark.parametrize("bad_value", ["missing", "", "unknown", None, True])
+def test_native_classifier_missing_or_malformed_cannot_authorize_skip(lane, bad_value):
+    values = classifier()
+    jobs = jobs_for(values)
+    if bad_value == "missing":
+        del values[lane]
+    else:
+        values[lane] = bad_value
+    assert run(values, jobs=jobs)["status"] == "FAIL"
+
+
+@pytest.mark.parametrize("result", ["failure", "cancelled", "skipped"])
+def test_failed_detect_cannot_authorize_native_optional_results(result):
+    values = classifier()
+    jobs = jobs_for(values)
+    jobs["detect"]["result"] = result
+    assert run(values, jobs=jobs)["status"] == "FAIL"

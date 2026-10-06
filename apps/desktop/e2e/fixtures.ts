@@ -668,9 +668,13 @@ export async function waitForAppReady(fixture: MockBackendFixture | NoProviderFi
         return w ? w.isVisible() : false
       }).catch(() => false)
 
-      if (visible) {break}
+      if (visible) {
+        return
+      }
       await page.waitForTimeout(500)
     }
+
+    throw new Error(`Electron window did not become visible within ${timeoutMs}ms`)
   }
 }
 

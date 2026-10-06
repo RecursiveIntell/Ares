@@ -4348,9 +4348,84 @@ def delegate_task(
                 )
             return json.dumps(payload, ensure_ascii=False)
 
-        # Pool at capacity / schedule failure — children are still attached
-        # (we detach above only on the parent list, but the async unit was
-        # never accepted, so re-attaching isn't needed: we just run inline).
+        known_unstarted = (
+            dispatch.get("status") == "rejected"
+            and dispatch.get("execution_started") is False
+        )
+        if not known_unstarted:
+            # Submit may already have accepted the runner. Its registry keeps
+            # custody; closing, draining steering or running inline could race it.
+            return json.dumps({
+                "status": "dispatch_uncertain",
+                "error_code": "scheduling_uncertain",
+                "execution_started": None,
+                "mode": "background",
+                "delegation_id": dispatch.get("delegation_id") or live_deleg_id,
+                "count": len(_goals),
+                "goals": _goals,
+                "subagent_ids": [getattr(c, "_subagent_id", None) for c in _child_agents],
+                "error": dispatch.get("error") or "Background dispatch outcome is uncertain.",
+                "note": "Do not retry or run these children synchronously while dispatch is uncertain.",
+            }, ensure_ascii=False)
+
+        if dispatch.get("error_code") != "pool_capacity":
+            # Admission positively refused execution. Close only this call's
+            # constructed children, preserving steering accepted before refusal.
+            rejected_results = []
+            for index, task, child in children:
+                entry = {
+                    "task_index": index,
+                    "status": "rejected",
+                    "error_code": dispatch.get("error_code") or "durable_storage_unavailable",
+                    "execution_started": False,
+                    "error": dispatch.get("error") or "Background dispatch refused before execution.",
+                    "summary": None,
+                    "api_calls": 0,
+                    "duration_seconds": 0,
+                }
+                sid = getattr(child, "_subagent_id", None)
+                if sid:
+                    try:
+                        missed_steer = _close_subagent_steering(sid, child)
+                        if missed_steer:
+                            entry["missed_steer"] = missed_steer
+                    except Exception:
+                        logger.warning("Failed to close unstarted child steering: %s", sid, exc_info=True)
+                    _unregister_subagent(sid, agent=child)
+                try:
+                    if hasattr(child, "close"):
+                        child.close()
+                except Exception as exc:
+                    entry["cleanup_error"] = str(exc)
+                    logger.warning("Failed to close unstarted child: %s", sid, exc_info=True)
+                writer = live_writers[index] if 0 <= index < len(live_writers) else None
+                if writer is not None:
+                    try:
+                        writer.finalize(entry)
+                    except Exception:
+                        logger.debug("Live transcript refusal finalize failed", exc_info=True)
+                if index < len(live_paths):
+                    entry["live_transcript"] = live_paths[index]
+                rejected_results.append(entry)
+            try:
+                update_manifest_statuses(live_deleg_id, rejected_results)
+            except Exception:
+                logger.debug("Live transcript refusal manifest update failed", exc_info=True)
+            rejection_payload = {
+                "status": "rejected",
+                "error_code": dispatch.get("error_code") or "durable_storage_unavailable",
+                "execution_started": False,
+                "mode": "background",
+                "error": dispatch.get("error") or "Background dispatch refused before execution.",
+                "results": rejected_results,
+                "total_duration_seconds": round(time.monotonic() - overall_start, 2),
+            }
+            for field in ("delegation_id", "durable_reservation_released"):
+                if field in dispatch:
+                    rejection_payload[field] = dispatch[field]
+            return json.dumps(rejection_payload, ensure_ascii=False)
+
+        # Only a typed pool refusal proves inline fallback is permitted.
         logger.info(
             "delegate_task: async pool at capacity (%s); running the whole "
             "batch synchronously instead.",

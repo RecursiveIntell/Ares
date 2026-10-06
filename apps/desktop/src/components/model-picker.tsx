@@ -28,6 +28,8 @@ interface ModelPickerDialogProps {
   sessionId?: string | null
   currentModel: string
   currentProvider: string
+  /** An owner-qualified receipt can contain a scalar model without a provider. */
+  selectionIsAuthoritative?: boolean
   onSelect: (selection: { provider: string; model: string }) => void
   profile?: string
   /**
@@ -48,6 +50,7 @@ export function ModelPickerDialog({
   sessionId,
   currentModel,
   currentProvider,
+  selectionIsAuthoritative = false,
   onSelect,
   profile = 'default',
   contentClassName
@@ -70,7 +73,7 @@ export function ModelPickerDialog({
   const providers = modelOptions.data?.providers ?? []
 
   const { model: optionsModel, provider: optionsProvider } = currentPickerSelection(
-    { model: currentModel, provider: currentProvider },
+    { model: currentModel, provider: currentProvider, authoritative: selectionIsAuthoritative },
     modelOptions.data
   )
 

@@ -30,6 +30,8 @@ CLASSIFIER_KEYS = (
     "mcp_catalog",
     "ci_review",
     "ci_review_files",
+    "context_continuity",
+    "current_owner_integration",
 )
 CLASSIFIER_BOOLEAN_KEYS = frozenset(CLASSIFIER_KEYS) - {"ci_review_files"}
 
@@ -45,6 +47,8 @@ KNOWN_JOBS = frozenset(
         "js-tests",
         "installer-tests",
         "rust-tests",
+        "context-continuity",
+        "current-owner-integration",
         "e2e-desktop",
         "docs-site",
         "history-check",
@@ -63,6 +67,11 @@ KNOWN_JOBS = frozenset(
 # It is an explicit, reviewable exception, not a general skipped-is-green rule.
 DISABLED_JOBS = frozenset({"e2e-desktop"})
 VALID_RESULTS = frozenset({"success", "failure", "cancelled", "skipped"})
+# Reusable-call success cannot substitute for each mandatory inner owner job.
+QUALIFICATION_RESULTS = {
+    "context-continuity": ("native_external_owner_result", "focused_tests_result"),
+    "current-owner-integration": ("profile_runtime_consumer_result",),
+}
 
 
 def _failure(message: str) -> dict[str, Any]:
@@ -114,6 +123,19 @@ def _output_bool(needs: Mapping[str, Any], job: str, key: str) -> bool:
     return value == "true"
 
 
+def _qualification_failures(needs: Mapping[str, Any], job: str) -> list[str]:
+    outputs = needs[job].get("outputs")
+    if not isinstance(outputs, Mapping):
+        return [f"qualification job {job} outputs must be an object"]
+    failures = []
+    for key in QUALIFICATION_RESULTS[job]:
+        if key not in outputs:
+            failures.append(f"qualification job {job} output missing: {key}")
+        elif outputs[key] != "success":
+            failures.append(f"qualification job {job} output {key} must succeed, got {outputs[key]!r}")
+    return failures
+
+
 def _applicable(event_name: str, flags: Mapping[str, bool], needs: Mapping[str, Any], job: str) -> bool:
     if job in DISABLED_JOBS or job in {"detect", "infographic-check", "osv-scanner"}:
         return True
@@ -125,6 +147,10 @@ def _applicable(event_name: str, flags: Mapping[str, bool], needs: Mapping[str, 
         return flags["installer"]
     if job == "rust-tests":
         return flags["rust"]
+    if job == "context-continuity":
+        return event_name != "pull_request" or flags["context_continuity"]
+    if job == "current-owner-integration":
+        return event_name != "pull_request" or flags["current_owner_integration"]
     if job == "docs-site":
         return flags["site"]
     if job == "history-check":
@@ -215,6 +241,8 @@ def evaluate(
             required_jobs.append(job)
             if result != "success":
                 failures.append(f"required job {job} must succeed, got {result}")
+            elif job in QUALIFICATION_RESULTS:
+                failures.extend(_qualification_failures(needs_map, job))
         elif result != "skipped":
             failures.append(f"non-applicable job {job} must be explicitly skipped, got {result}")
 

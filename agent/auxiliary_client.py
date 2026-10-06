@@ -836,15 +836,17 @@ def _update_compressor_model(
     api_key: Any = "",
     provider: str = "",
     api_mode: str = "",
+    max_tokens: Optional[int] = None,
     threshold_percent: Optional[float] = None,
 ) -> None:
-    """Call ``update_model``, forwarding ``threshold_percent`` when supported.
+    """Forward route budget fields accepted by the engine's ``update_model``.
 
     The built-in ContextCompressor re-resolves its threshold internally and
     does not accept the kwarg; external engines (e.g. ri-context-governor)
     accept it so the resolved host threshold (including the Codex gpt-5.x
-    autoraise) reaches their trigger. A signature guard keeps every engine
-    on its own contract.
+    autoraise) reaches their trigger. The response reserve is also forwarded
+    when explicitly supported, including None to clear an old reservation.
+    A signature guard keeps every engine on its own contract.
     """
     _kwargs = {
         "model": model,
@@ -854,13 +856,15 @@ def _update_compressor_model(
         "provider": provider,
         "api_mode": api_mode,
     }
-    if threshold_percent is not None:
-        try:
-            import inspect
+    try:
+        import inspect
 
-            _params = inspect.signature(compressor.update_model).parameters
-        except (TypeError, ValueError):
-            _params = {}
+        _params = inspect.signature(compressor.update_model).parameters
+    except (TypeError, ValueError):
+        _params = {}
+    if "max_tokens" in _params:
+        _kwargs["max_tokens"] = max_tokens
+    if threshold_percent is not None:
         if "threshold_percent" in _params:
             _kwargs["threshold_percent"] = threshold_percent
     compressor.update_model(**_kwargs)

@@ -191,6 +191,11 @@ for (const expired of [false, true]) {
       assert.equal(h.rpc('prompt.submit').length, 5, 'sixth stays queued while four may be running')
       assert.equal(h.leases.find(l => l.route.profile === 'bot1').releases, 0)
       await h.gc.stopGroupThread('Room', 't1', h.roster); await h.advance(); await pending; await flush()
+      if (options.unavailable) {
+        assert.ok(h.leases.some(l => l.releases === 0), 'an interrupt ACK does not retire an unavailable accepted turn')
+        options.unavailable = false
+        for (const member of h.roster) await h.gc.harvestStrandedGroupReply('Room', member)
+      }
       assert.ok(h.leases.every(l => l.releases === 1))
     })
   }

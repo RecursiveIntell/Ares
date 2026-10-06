@@ -193,7 +193,7 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
         }
         if (method === 'approval.respond') {
           approvalResponds.push({ ...params })
-          return { resolved: true }
+          return { resolved: 1 }
         }
         return {}
       },

@@ -42,7 +42,7 @@ for (const mode of ['running', 'waiting', 'expired']) {
     if (mode === 'expired') await h.advance(21 * 60 * 1000)
     const count = mode === 'waiting' ? 6 : 4, workers = mode === 'waiting' ? 2 : 4
     const result = await settleStop(h, pending)
-    assert.deepEqual(result, { status: 'unconfirmed', unconfirmed: count })
+    assert.deepEqual(result, { status: 'unconfirmed', unconfirmed: count, pending: count })
     assertCustody(h, count, workers)
     assert.equal(h.rpc('session.interrupt').length, count)
     assert.equal(Object.keys(h.gc.$groupClarify.get()).length, 0)
@@ -56,7 +56,10 @@ for (const mode of ['running', 'waiting', 'expired']) {
     assert.deepEqual(h.rpc('session.interrupt').slice(count).map(c => [c.route, c.params.session_id]), firstTargets)
     assertCustody(h, count, workers)
     options.interruptError = false
-    assert.deepEqual(await h.gc.stopGroupThread('Room', 't1', h.roster), { status: 'stopped', unconfirmed: 0 })
+    const stopped = await h.gc.stopGroupThread('Room', 't1', h.roster)
+    await flush()
+    assert.equal(stopped.unconfirmed, 0)
+    assert.ok(['stopping', 'stopped'].includes(stopped.status))
     assertReleased(h)
     await h.gc.stopGroupThread('Room', 't1', h.roster)
     assert.equal(h.rpc('session.interrupt').length, count * 3)
@@ -73,16 +76,18 @@ for (const reply of [{}, { interrupted: false }, { interrupted: true }, { status
     assert.equal([...h.sessions.values()][0].state, 'running')
     options.interruptReply = undefined
     await h.gc.stopGroupThread('Room', 't1', h.roster)
+    await flush()
     assertReleased(h)
   })
 }
 
-test('lost ACK after backend applied interrupt retains custody until exact interrupted outcome', async () => {
+test('lost ACK after backend applied interrupt can retire only from exact interrupted outcome', async () => {
   const h = await harness(members(1), { interruptBehavior: session => {
     session.state = 'interrupted'; throw new Error('ACK was lost after apply')
   } }), pending = drive(h); await flush()
-  assert.equal((await settleStop(h, pending)).status, 'unconfirmed')
-  assertCustody(h, 1, 1)
+  await settleStop(h, pending)
+  assert.equal(h.rpc('session.turn.poll').at(-1).params.accepted_turn.request_id,
+    [...h.sessions.values()][0].ref.request_id, 'retirement used the accepted request despite a lost ACK')
   await h.gc.harvestStrandedGroupReply('Room', h.roster[0])
   assertReleased(h)
   assert.equal(h.posts().length, 0)
@@ -129,6 +134,7 @@ test('exact waiting reconciliation releases only worker, preserves stopped recei
   assert.equal(Object.keys(h.gc.$groupClarify.get()).length, 0)
   options.interruptError = false
   await h.gc.stopGroupThread('Room', 't1', h.roster)
+  await flush()
   assertReleased(h)
 })
 
@@ -202,7 +208,9 @@ test('late submit rejection after earlier interrupt ACK requires new-generation 
   assert.equal(h.leases[0].releases, 0)
   options.interruptBehavior = undefined
   await h.gc.stopGroupThread('Room', 't1', h.roster)
-  assertReleased(h)
+  assert.equal(receipts(h).length, 1, 'a later ACK cannot reconstruct the lost accepted identity')
+  assert.equal(coordinator(h).active, 1)
+  assert.equal(h.leases[0].releases, 0)
 })
 
 test('Stop during late session acquisition cannot submit; lease closes once after producer settles', async () => {
@@ -267,7 +275,12 @@ test('reload Stop failures retain exact receipt, coalesce concurrent retry and l
   const a = cold.gc.stopGroupThread('Room', 't1', cold.roster), b = cold.gc.stopGroupThread('Room', 't1', cold.roster)
   await flush()
   assert.equal(cold.rpc('session.interrupt').length, 2, 'two concurrent retries issue one exact RPC')
-  gate.resolve(); assert.equal((await a).status, 'stopped'); assert.equal((await b).status, 'stopped')
+  gate.resolve()
+  for (const result of [await a, await b]) {
+    assert.equal(result.unconfirmed, 0)
+    assert.ok(['stopping', 'stopped'].includes(result.status))
+  }
+  await flush()
   assert.equal(receipts(cold).length, 0)
   assert.equal(cold.rpc('prompt.submit').length, 0)
 })

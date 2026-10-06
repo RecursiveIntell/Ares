@@ -180,19 +180,19 @@ class TestSyncFallbacks:
                 res = _try_dispatch_background_run(_job('job-bg-06'))
         assert res is None
 
-    def test_pool_at_capacity_runs_inline(self):
-        """A rejected dispatch must not strand the already-taken claim."""
-        with _bound_session_key():
-            with patch("tools.cronjob_tools.claim_job_for_fire", side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}), \
-                 patch("tools.async_delegation.dispatch_async_delegation",
-                       return_value={"status": "rejected", "error": "capacity"}), \
-                 patch("cron.scheduler.run_one_job", return_value=True) as m_run, \
-                 patch("tools.cronjob_tools.get_job",
-                       return_value={"last_status": "ok", "last_error": None}):
-                res = _try_dispatch_background_run(_job('job-bg-07'))
+    def test_pool_at_capacity_runs_inline(self, sd03b_cron_state):
+        """Typed pool refusal keeps exactly one inline run with its claim owner."""
+        state = sd03b_cron_state
+        state.dispatch.return_value = {
+            "status": "rejected", "error": "capacity",
+            "error_code": "pool_capacity", "execution_started": False,
+        }
+        res = _try_dispatch_background_run(state.job)
         assert res["dispatched"] is False
         assert res["success"] is True
-        m_run.assert_called_once()   # ran inline on this thread
+        state.run.assert_called_once_with(state.claimed_job, extra_prompt=None)
+        state.release.assert_not_called()
+        state.mark.assert_not_called()
 
 
 class TestInFlightDedupe:
@@ -306,3 +306,381 @@ class TestCronjobRunToolIntegration:
         assert out["job"]["execution_success"] is True
         m_claim.assert_called_once_with("job-bg-13", return_job=True)
         m_run.assert_called_once()
+
+
+# SD03B fixtures replace every execution/claim/routing/config dependency with
+# in-memory recording objects. No runner, provider, DB or service is started.
+import sys
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+
+
+@pytest.fixture
+def sd03b_cron_state(monkeypatch):
+    import tools.cronjob_tools as caller
+    import tools.async_delegation as async_owner
+    import tools.delegate_tool as delegate_owner
+    import tools.approval as approval
+    import cron.jobs as job_owner
+
+    scheduler = ModuleType("cron.scheduler")
+    scheduler.get_running_job_ids = Mock(return_value=set())
+    scheduler.run_one_job = Mock(side_effect=AssertionError("real cron runner forbidden"))
+    scheduler.try_register_running_job = Mock(return_value=True)
+    scheduler.release_running_job = Mock()
+    monkeypatch.setitem(sys.modules, "cron.scheduler", scheduler)
+    executions = ModuleType("cron.executions")
+    executions.recover_interrupted_executions = Mock(return_value=0)
+    monkeypatch.setitem(sys.modules, "cron.executions", executions)
+    session_context = ModuleType("gateway.session_context")
+    session_context.async_delivery_supported = Mock(return_value=True)
+    session_context.get_session_env = Mock(return_value="")
+    monkeypatch.setitem(sys.modules, "gateway.session_context", session_context)
+    monkeypatch.setattr(approval, "get_current_session_key", lambda **_kw: "sd03b-session")
+    monkeypatch.setattr(async_owner, "_current_origin_session_id", lambda: "sd03b-parent")
+    monkeypatch.setattr(delegate_owner, "_get_max_async_children", lambda: 1)
+
+    job = _job("sd03b-job")
+    claimed_job = {**job, "fire_claim": {"by": "sd03b-fire-owner", "at": "2026-10-04T00:00:00Z"}}
+    receipt = object()  # An ephemeral exact object; never serialize or persist it.
+    old_claim = Mock(return_value=claimed_job)
+    receipt_claim = Mock(return_value=(claimed_job, receipt))
+    release = Mock(return_value={"status": "released"})
+    # Both surfaces are present so baseline and candidate enter the same
+    # inert path, while candidate is required to release the exact receipt.
+    for owner in (caller, job_owner):
+        monkeypatch.setattr(owner, "claim_job_for_fire", old_claim)
+        monkeypatch.setattr(owner, "claim_job_for_fire_with_unstarted_receipt", receipt_claim, raising=False)
+        monkeypatch.setattr(owner, "release_unstarted_fire_claim", release, raising=False)
+    dispatch = Mock()
+    monkeypatch.setattr(async_owner, "dispatch_async_delegation", dispatch)
+    run = Mock(return_value={"claimed": True, "success": True, "error": None})
+    mark = Mock()
+    monkeypatch.setattr(caller, "_run_claimed_job", run)
+    monkeypatch.setattr(caller, "mark_job_run", mark)
+    monkeypatch.setattr(caller, "get_job", Mock(return_value=claimed_job))
+    monkeypatch.setattr(caller, "_latest_job_output_excerpt", Mock(return_value=None))
+    monkeypatch.setattr(caller, "_notify_provider_jobs_changed_safe", Mock())
+    return SimpleNamespace(
+        caller=caller, job=job, claimed_job=claimed_job, receipt=receipt,
+        old_claim=old_claim, receipt_claim=receipt_claim, release=release,
+        dispatch=dispatch, run=run, mark=mark, scheduler=scheduler,
+        reclaim=executions.recover_interrupted_executions,
+    )
+
+
+def _sd03b_assert_exact_receipt_released(state):
+    state.release.assert_called_once()
+    args, kwargs = state.release.call_args
+    assert any(value is state.receipt for value in (*args, *kwargs.values()))
+
+
+@pytest.mark.parametrize("reservation_released", [False, True])
+@pytest.mark.parametrize("error_code", ["durable_backlog_full", "durable_storage_unavailable"])
+def test_background_storage_refusal_releases_unstarted_claim_without_inline(
+    sd03b_cron_state, error_code, reservation_released
+):
+    state = sd03b_cron_state
+    state.dispatch.return_value = {
+        "status": "rejected", "error_code": error_code,
+        "execution_started": False, "error": "inert storage refusal",
+        "delegation_id": "sd03b-refused-reservation",
+        "durable_reservation_released": reservation_released,
+    }
+    result = state.caller._try_dispatch_background_run(state.job)
+    state.run.assert_not_called()
+    state.scheduler.run_one_job.assert_not_called()
+    state.mark.assert_not_called()
+    _sd03b_assert_exact_receipt_released(state)
+    assert result["status"] == "rejected"
+    assert result["error_code"] == error_code
+    assert result["execution_started"] is False
+    assert result["delegation_id"] == "sd03b-refused-reservation"
+    assert result["durable_reservation_released"] is reservation_released
+    assert result["dispatched"] is False
+    assert result["success"] is False
+    assert result["claim_release_status"] == "released"
+    assert result["claim_release_confirmed"] is True
+
+
+@pytest.mark.parametrize("release_status", ["conflict", "missing", "write_uncertain"])
+def test_background_storage_refusal_reports_unconfirmed_claim_release(
+    sd03b_cron_state, release_status
+):
+    state = sd03b_cron_state
+    state.dispatch.return_value = {
+        "status": "rejected", "error_code": "durable_storage_unavailable",
+        "execution_started": False, "error": "inert storage refusal",
+    }
+    state.release.return_value = {"status": release_status}
+    result = state.caller._try_dispatch_background_run(state.job)
+    state.run.assert_not_called()
+    state.scheduler.run_one_job.assert_not_called()
+    state.mark.assert_not_called()
+    _sd03b_assert_exact_receipt_released(state)
+    assert result["status"] == "rejected"
+    assert result["error_code"] == "durable_storage_unavailable"
+    assert result["execution_started"] is False
+    assert result["success"] is False
+    assert result["claim_release_status"] == release_status
+    assert result["claim_release_confirmed"] is False
+
+
+def test_background_dispatch_uncertain_keeps_claim_without_inline(sd03b_cron_state):
+    state = sd03b_cron_state
+    state.dispatch.return_value = {
+        "status": "dispatch_uncertain", "error_code": "scheduling_uncertain",
+        "execution_started": None, "delegation_id": "sd03b-uncertain",
+        "error": "inert uncertain submit",
+    }
+    result = state.caller._try_dispatch_background_run(state.job)
+    state.run.assert_not_called()
+    state.scheduler.run_one_job.assert_not_called()
+    state.release.assert_not_called()
+    state.mark.assert_not_called()
+    assert result["status"] == "dispatch_uncertain"
+    assert result["error_code"] == "scheduling_uncertain"
+    assert result["execution_started"] is None
+    assert result["delegation_id"] == "sd03b-uncertain"
+
+
+def test_background_pool_capacity_runs_owner_bearing_claim_once(sd03b_cron_state):
+    state = sd03b_cron_state
+    state.dispatch.return_value = {
+        "status": "rejected", "error_code": "pool_capacity",
+        "execution_started": False, "error": "inert pool capacity",
+    }
+    result = state.caller._try_dispatch_background_run(state.job, extra_prompt="inert context")
+    state.run.assert_called_once_with(state.claimed_job, extra_prompt="inert context")
+    state.release.assert_not_called()
+    state.mark.assert_not_called()
+    state.scheduler.run_one_job.assert_not_called()
+    assert result["dispatched"] is False
+    assert result["success"] is True
+
+
+# SD03B public response fixtures: the real wrapper is exercised with every
+# execution, claim, store, scanner and notification dependency made inert.
+@pytest.fixture
+def sd03b_public_state(monkeypatch):
+    import tools.cronjob_tools as caller
+
+    job = {"id": "sd03b-public-job", "name": "inert public job"}
+    refreshed_job = {"id": "sd03b-public-job", "name": "inert refreshed job"}
+    resolve = Mock(return_value=job)
+    read = Mock(return_value=refreshed_job)
+    # This small fixed view is independent of the production formatter/schema.
+    format_job = Mock(side_effect=lambda _job: {"id": "formatted-job", "view": "inert"})
+    scanner = Mock(return_value=None)
+    background = Mock()
+    sync = Mock(return_value={"claimed": True, "success": True, "error": None})
+    notify = Mock()
+    for name, value in (
+        ("resolve_job_ref", resolve), ("get_job", read),
+        ("_format_job", format_job), ("_scan_cron_prompt", scanner),
+        ("_try_dispatch_background_run", background),
+        ("_execute_job_now", sync), ("_notify_provider_jobs_changed_safe", notify),
+    ):
+        monkeypatch.setattr(caller, name, value)
+    guards = {}
+    for name in (
+        "claim_job_for_fire", "claim_job_for_fire_with_unstarted_receipt",
+        "release_unstarted_fire_claim", "mark_job_run", "pause_job",
+        "resume_job", "remove_job", "update_job", "list_jobs",
+        "parse_schedule", "_run_claimed_job", "_latest_job_output_excerpt",
+        "_origin_from_env", "_gateway_liveness_notice",
+        "_validate_cron_script_path", "_validate_cron_base_url",
+        "_validate_bot_chat_deliver", "_resolve_cron_context_deliver",
+    ):
+        guard = Mock(side_effect=AssertionError("public wrapper crossed inert guard: " + name))
+        monkeypatch.setattr(caller, name, guard, raising=False)
+        guards[name] = guard
+    return SimpleNamespace(
+        caller=caller, job=job, refreshed_job=refreshed_job,
+        resolve=resolve, read=read, format_job=format_job, scanner=scanner,
+        background=background, sync=sync, notify=notify, guards=guards,
+    )
+
+
+def _sd03b_public_call(state, action="run"):
+    return json.loads(state.caller.cronjob(
+        action=action, job_id="inert requested name",
+        session_id="sd03b-public-session", prompt="inert per-run context",
+    ))
+
+
+def _sd03b_public_assert_inert_route(state, *, read_after_run, notifications):
+    state.resolve.assert_called_once_with("inert requested name")
+    state.scanner.assert_called_once_with("inert per-run context")
+    state.background.assert_called_once_with(
+        state.job, session_id="sd03b-public-session", extra_prompt="inert per-run context",
+    )
+    if read_after_run:
+        state.read.assert_called_once_with("sd03b-public-job")
+        state.format_job.assert_called_once_with(state.refreshed_job)
+    else:
+        state.read.assert_not_called()
+        state.format_job.assert_called_once_with(state.job)
+    assert state.notify.call_count == notifications
+    if notifications:
+        state.notify.assert_called_once_with()
+    for guard in state.guards.values():
+        guard.assert_not_called()
+
+
+@pytest.mark.parametrize("error_code", ["durable_backlog_full", "durable_storage_unavailable"])
+@pytest.mark.parametrize("reservation_released", [False, True])
+@pytest.mark.parametrize("release_status,release_confirmed", [
+    ("released", True), ("write_uncertain", False),
+])
+def test_public_storage_refusal_preserves_dispatch_evidence(
+    sd03b_public_state, error_code, reservation_released, release_status, release_confirmed
+):
+    state = sd03b_public_state
+    state.background.return_value = {
+        "claimed": True, "dispatched": False, "success": False,
+        "status": "rejected", "error_code": error_code,
+        "execution_started": False, "error": "inert storage refusal",
+        "delegation_id": "sd03b-public-refused-reservation",
+        "durable_reservation_released": reservation_released,
+        "claim_release_status": release_status,
+        "claim_release_confirmed": release_confirmed,
+    }
+    result = _sd03b_public_call(state)
+    assert result == {
+        "success": False,
+        "job": {"id": "formatted-job", "view": "inert", "executed": False},
+        "status": "rejected", "error_code": error_code,
+        "execution_started": False, "error": "inert storage refusal",
+        "delegation_id": "sd03b-public-refused-reservation",
+        "durable_reservation_released": reservation_released,
+        "claim_release_status": release_status,
+        "claim_release_confirmed": release_confirmed,
+    }
+    state.sync.assert_not_called()
+    _sd03b_public_assert_inert_route(state, read_after_run=False, notifications=0)
+
+
+def test_public_storage_refusal_does_not_invent_optional_fields(sd03b_public_state):
+    state = sd03b_public_state
+    state.background.return_value = {
+        "claimed": True, "dispatched": False, "success": False,
+        "status": "rejected", "error_code": "executor_unavailable",
+        "execution_started": False, "error": "inert unavailable executor",
+    }
+    result = _sd03b_public_call(state)
+    assert result == {
+        "success": False,
+        "job": {"id": "formatted-job", "view": "inert", "executed": False},
+        "status": "rejected", "error_code": "executor_unavailable",
+        "execution_started": False, "error": "inert unavailable executor",
+    }
+    for key in (
+        "delegation_id", "durable_reservation_released",
+        "claim_release_status", "claim_release_confirmed",
+    ):
+        assert key not in result
+    state.sync.assert_not_called()
+    _sd03b_public_assert_inert_route(state, read_after_run=False, notifications=0)
+
+
+@pytest.mark.parametrize("action", ["run", "run_now", "trigger"])
+def test_public_dispatch_uncertain_preserves_handle_and_no_replay_note(sd03b_public_state, action):
+    state = sd03b_public_state
+    state.background.return_value = {
+        "claimed": True, "dispatched": False, "success": False,
+        "status": "dispatch_uncertain", "error_code": "scheduling_uncertain",
+        "execution_started": None, "error": "inert uncertain submit",
+        "delegation_id": "sd03b-public-uncertain",
+        "durable_reservation_released": False,
+    }
+    result = _sd03b_public_call(state, action)
+    assert result == {
+        "success": False,
+        "job": {"id": "formatted-job", "view": "inert", "executed": None},
+        "status": "dispatch_uncertain", "error_code": "scheduling_uncertain",
+        "execution_started": None, "error": "inert uncertain submit",
+        "delegation_id": "sd03b-public-uncertain",
+        "durable_reservation_released": False,
+        "note": (
+            "Work may already be running. Keep the delegation handle; do not retry "
+            "or run inline while submission remains uncertain."
+        ),
+    }
+    state.sync.assert_not_called()
+    _sd03b_public_assert_inert_route(state, read_after_run=False, notifications=0)
+
+
+def test_public_confirmed_dispatch_keeps_existing_payload(sd03b_public_state):
+    state = sd03b_public_state
+    state.background.return_value = {
+        "claimed": True, "dispatched": True, "delegation_id": "sd03b-public-confirmed",
+    }
+    result = _sd03b_public_call(state)
+    assert result == {
+        "success": True,
+        "job": {
+            "id": "formatted-job", "view": "inert", "executed": True,
+            "execution_mode": "background", "delegation_id": "sd03b-public-confirmed",
+        },
+        "note": (
+            "The job is running in the background. You and the user can keep working; "
+            "its outcome re-enters the conversation as a new message when it finishes. "
+            "Do not wait or poll — just continue."
+        ),
+    }
+    state.sync.assert_not_called()
+    _sd03b_public_assert_inert_route(state, read_after_run=True, notifications=1)
+
+
+def test_public_typed_pool_fallback_keeps_existing_terminal_payload(sd03b_public_state):
+    state = sd03b_public_state
+    # The core helper has already executed the permitted pool-capacity fallback.
+    state.background.return_value = {
+        "claimed": True, "dispatched": False, "success": True, "error": None,
+    }
+    result = _sd03b_public_call(state)
+    assert result == {
+        "success": True,
+        "job": {
+            "id": "formatted-job", "view": "inert", "executed": True,
+            "execution_success": True,
+        },
+    }
+    state.sync.assert_not_called()
+    _sd03b_public_assert_inert_route(state, read_after_run=True, notifications=1)
+
+
+def test_public_background_unsupported_executes_inert_sync_once(sd03b_public_state):
+    state = sd03b_public_state
+    state.background.return_value = None
+    result = _sd03b_public_call(state)
+    assert result == {
+        "success": True,
+        "job": {
+            "id": "formatted-job", "view": "inert", "executed": True,
+            "execution_success": True,
+        },
+    }
+    state.sync.assert_called_once_with(state.job, extra_prompt="inert per-run context")
+    _sd03b_public_assert_inert_route(state, read_after_run=True, notifications=1)
+
+
+def test_public_claim_lost_keeps_existing_skipped_payload(sd03b_public_state):
+    state = sd03b_public_state
+    state.background.return_value = {
+        "claimed": False, "dispatched": False, "success": False,
+        "error": "inert claim lost",
+    }
+    result = _sd03b_public_call(state)
+    assert result == {
+        "success": True,
+        "job": {
+            "id": "formatted-job", "view": "inert", "executed": False,
+            "execution_success": False, "execution_skipped": "inert claim lost",
+        },
+    }
+    state.sync.assert_not_called()
+    _sd03b_public_assert_inert_route(state, read_after_run=True, notifications=0)

@@ -1,10 +1,10 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { setApiRequestConnection, setApiRequestProfile } from '@/api/client'
+import { getApiRequestConnection, setApiRequestConnection, setApiRequestProfile } from '@/api/client'
 import { confirm } from '@/store/confirm'
 import { $activeGatewayProfile, $newChatProfile, $newChatRoute } from '@/store/profile'
-import { _resetComposerModelSelectionsForTests } from '@/store/session'
+import { $connection, _resetComposerModelSelectionsForTests } from '@/store/session'
 import type { CustomEndpoint, CustomEndpointsResponse } from '@/types/hermes'
 
 import { deferred } from '../../test/deferred'
@@ -57,6 +57,7 @@ beforeEach(() => {
   deleteCustomEndpoint.mockReset()
   vi.mocked(confirm).mockReset().mockResolvedValue(true)
   _resetComposerModelSelectionsForTests()
+  $connection.set(null)
   $newChatRoute.set(owner)
   $newChatProfile.set(owner.profile)
   $activeGatewayProfile.set(owner.profile)
@@ -82,6 +83,92 @@ async function renderSettings(changed = vi.fn()) {
 }
 
 describe('custom endpoint save ownership', () => {
+  it('clears source A form authority and key draft when the same profile rehomes to B and back', async () => {
+    const second = { ...endpoint, name: 'Source B endpoint', model: 'model-b', models: ['model-b'], base_url: 'https://b.invalid/v1' }
+
+    const rehome = (connectionId: string) => {
+      setApiRequestConnection(connectionId)
+      $connection.set({ connectionId } as never)
+      $newChatRoute.set({ connectionId, profile: owner.profile, targetProfile: connectionId === 'source-a' ? 'backend-a' : 'backend-b' })
+    }
+
+    getCustomEndpoints.mockImplementation(async () => ({ endpoints: [getApiRequestConnection() === 'source-b' ? second : endpoint] }))
+    saveCustomEndpoint.mockResolvedValue({ id: second.id, endpoints: [second] })
+    await renderSettings()
+    fireEvent.change(screen.getByPlaceholderText('Leave blank to keep current key'), { target: { value: 'fake-source-a-key' } })
+    await act(async () => rehome('source-b'))
+    await screen.findByDisplayValue(second.base_url)
+    expect((screen.getByPlaceholderText('Leave blank to keep current key') as HTMLInputElement).value).toBe('')
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(saveCustomEndpoint).toHaveBeenCalledWith(expect.objectContaining({
+      base_url: second.base_url, model: second.model, api_key: undefined
+    })))
+    await act(async () => rehome('source-a'))
+    await screen.findByDisplayValue(endpoint.base_url)
+  })
+
+  it('rejects a delayed Delete confirmation from an unmounted owner even after A → B → A', async () => {
+    const confirmation = deferred<boolean>()
+    vi.mocked(confirm).mockReturnValueOnce(confirmation.promise)
+    deleteCustomEndpoint.mockResolvedValue({ endpoints: [] })
+    await renderSettings()
+    fireEvent.click(screen.getByRole('button', { name: 'Delete endpoint' }))
+    await waitFor(() => expect(confirm).toHaveBeenCalledOnce())
+
+    const rehome = (connectionId: string) => {
+      setApiRequestConnection(connectionId)
+      $connection.set({ connectionId } as never)
+      $newChatRoute.set({ connectionId, profile: owner.profile, targetProfile: connectionId === 'source-a' ? 'backend-a' : 'backend-b' })
+    }
+
+    await act(async () => rehome('source-b'))
+    await screen.findByRole('button', { name: 'Save' })
+    await act(async () => rehome('source-a'))
+    await screen.findByRole('button', { name: 'Save' })
+    await act(async () => confirmation.resolve(true))
+    expect(deleteCustomEndpoint).not.toHaveBeenCalled()
+  })
+
+  it('rejects a stale Delete confirmation when React batches the source A → B → A round trip', async () => {
+    const confirmation = deferred<boolean>()
+    vi.mocked(confirm).mockReturnValueOnce(confirmation.promise)
+    deleteCustomEndpoint.mockResolvedValue({ endpoints: [] })
+    saveCustomEndpoint.mockResolvedValue(savedResponse())
+    await renderSettings()
+    fireEvent.click(screen.getByRole('button', { name: 'Delete endpoint' }))
+    await waitFor(() => expect(confirm).toHaveBeenCalledOnce())
+    await act(async () => {
+      setApiRequestConnection('source-b')
+      $connection.set({ connectionId: 'source-b' } as never)
+      setApiRequestConnection(owner.connectionId)
+      $connection.set({ connectionId: owner.connectionId } as never)
+      confirmation.resolve(true)
+    })
+    expect(deleteCustomEndpoint).not.toHaveBeenCalled()
+    expect(notifyError).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringMatching(/target changed/i) }), 'Delete failed')
+    await waitFor(() => expect(getCustomEndpoints).toHaveBeenCalledTimes(2))
+    await screen.findByDisplayValue(endpoint.base_url)
+    fireEvent.click(await screen.findByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(saveCustomEndpoint).toHaveBeenCalledOnce())
+  })
+
+  it('discards a late source A inventory after the settings owner has rehomed to B', async () => {
+    const pending = deferred<CustomEndpointsResponse>()
+    const second = { ...endpoint, name: 'Source B endpoint', base_url: 'https://b.invalid/v1' }
+    getCustomEndpoints.mockReturnValueOnce(pending.promise).mockResolvedValue({ endpoints: [second] })
+    const { CustomEndpointsSettings } = await import('./custom-endpoints-settings')
+    render(<CustomEndpointsSettings />)
+    await waitFor(() => expect(getCustomEndpoints).toHaveBeenCalledOnce())
+    await act(async () => {
+      setApiRequestConnection('source-b')
+      $connection.set({ connectionId: 'source-b' } as never)
+      $newChatRoute.set({ connectionId: 'source-b', profile: owner.profile })
+    })
+    await act(async () => pending.resolve({ endpoints: [endpoint], current: savedResponse().current }))
+    await screen.findByDisplayValue(second.base_url)
+    expect(screen.queryByDisplayValue(endpoint.base_url)).toBeNull()
+  })
+
   it('carries the original owner through a delayed save callback', async () => {
     const pending = deferred<CustomEndpointsResponse>()
     saveCustomEndpoint.mockReturnValueOnce(pending.promise)

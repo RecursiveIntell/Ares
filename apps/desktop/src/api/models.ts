@@ -50,7 +50,10 @@ export function getGlobalModelOptions(
 
   return window.hermesDesktop.api<ModelOptionsResponse>({
     ...capabilityScoped(profile),
-    ...(profile && typeof profile === 'object' ? { connectionId: profile.connectionId || 'local' } : {}),
+    // Explicit null preserves the captured legacy route, which may be remote.
+    ...(profile && typeof profile === 'object' && profile.connectionId !== null
+      ? { connectionId: profile.connectionId || 'local' }
+      : {}),
     path: params.size > 0 ? `/api/model/options?${params.toString()}` : '/api/model/options',
     timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
   })

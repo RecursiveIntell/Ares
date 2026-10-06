@@ -39,6 +39,11 @@ def _normalized_time(value: Any, field: str) -> str:
     return instant.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _time_instant(value: str) -> datetime:
+    """Compare normalized bounds as instants, preserving their wire spelling."""
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
 def normalize_scope(raw: Any) -> dict[str, Any]:
     """Canonicalize a scope record; reject unknown fields and bad types."""
     if not isinstance(raw, Mapping):
@@ -64,7 +69,12 @@ def normalize_scope(raw: Any) -> dict[str, Any]:
             if not value:
                 raise ContractError("INVALID_TIME_SCOPE")
             normalized_time = {bound: _normalized_time(value[bound], "time." + bound) for bound in ("not_before", "not_after") if bound in value}
-            if "not_before" in normalized_time and "not_after" in normalized_time and normalized_time["not_before"] > normalized_time["not_after"]:
+            if (
+                "not_before" in normalized_time
+                and "not_after" in normalized_time
+                and _time_instant(normalized_time["not_before"])
+                > _time_instant(normalized_time["not_after"])
+            ):
                 raise ContractError("INVALID_TIME_SCOPE")
             normalized[field] = normalized_time
         else:
@@ -108,9 +118,15 @@ def is_subset_scope(subset: Mapping[str, Any], superset: Mapping[str, Any]) -> b
                 return False
         elif field == "time":
             sa, sb = a[field], b[field]
-            if "not_before" in sb and ("not_before" not in sa or sa["not_before"] < sb["not_before"]):
+            if "not_before" in sb and (
+                "not_before" not in sa
+                or _time_instant(sa["not_before"]) < _time_instant(sb["not_before"])
+            ):
                 return False
-            if "not_after" in sb and ("not_after" not in sa or sa["not_after"] > sb["not_after"]):
+            if "not_after" in sb and (
+                "not_after" not in sa
+                or _time_instant(sa["not_after"]) > _time_instant(sb["not_after"])
+            ):
                 return False
         else:
             if a[field] != b[field]:
@@ -168,8 +184,9 @@ class AuthorityScopeV1:
         child_uses = inherited.get("use_count", 1)
         if "use_count" in self._scope and self._charged_count + self._delegated_count + child_uses > self._scope["use_count"]:
             raise ContractError("USE_COUNT_EXHAUSTED")
+        child = AuthorityScopeV1(scope=inherited, generation=child_generation, holder=child_holder)
         self._delegated_count += child_uses
-        return AuthorityScopeV1(scope=inherited, generation=child_generation, holder=child_holder)
+        return child
 
     def reserve(self, *, consumption_ref: str, args_digest: str, target_ref: str | None = None) -> dict[str, Any]:
         """Open a reservation against finite remaining use."""
@@ -185,24 +202,35 @@ class AuthorityScopeV1:
             target_ref = _require_str(target_ref, "INVALID_TARGET_REF")
             if "target" in self._scope and target_ref != self._scope["target"]:
                 raise ContractError("TARGET_OUTSIDE_SCOPE")
-        self._settlements[consumption_ref] = {
+        record = {
             "consumption_ref": consumption_ref,
             "state": "reserved",
             "args_digest": args_digest,
             "target_ref": target_ref,
         }
-        self._open_count += 1
-        self._charged_count += 1
-        return self._receipt(consumption_ref)
+        open_count = self._open_count + 1
+        charged_count = self._charged_count + 1
+        receipt = self._build_receipt(record, open_count=open_count, charged_count=charged_count)
+        self._settlements[consumption_ref] = record
+        self._open_count = open_count
+        self._charged_count = charged_count
+        return receipt
 
     def commit(self, consumption_ref: str, *, effect_receipt_digest: str) -> dict[str, Any]:
+        effect_receipt_digest = _require_str(effect_receipt_digest, "INVALID_EFFECT_RECEIPT_DIGEST")
+        if not effect_receipt_digest.strip():
+            raise ContractError("INVALID_EFFECT_RECEIPT_DIGEST")
         return self._settle(consumption_ref, "committed", effect_receipt_digest=effect_receipt_digest)
 
     def release(self, consumption_ref: str, *, reason: str = "operator_release") -> dict[str, Any]:
+        reason = _require_str(reason, "INVALID_REASON")
+        if not reason.strip():
+            raise ContractError("INVALID_REASON")
         return self._settle(consumption_ref, "released", reason=reason)
 
     def mark_indeterminate(self, consumption_ref: str, *, reason: str) -> dict[str, Any]:
-        if not _require_str(reason, "INVALID_REASON"):
+        reason = _require_str(reason, "INVALID_REASON")
+        if not reason.strip():
             raise ContractError("INVALID_REASON")
         return self._settle(consumption_ref, "indeterminate", reason=reason)
 
@@ -213,24 +241,34 @@ class AuthorityScopeV1:
             raise ContractError("UNKNOWN_CONSUMPTION_REF")
         if record["state"] != "reserved":
             raise ContractError("ALREADY_SETTLED")
-        record["state"] = state
-        record.update(extra)
-        self._open_count -= 1
-        if state == "released":
-            self._charged_count -= 1
-        return self._receipt(consumption_ref)
+        candidate = dict(record)
+        candidate["state"] = state
+        candidate.update(extra)
+        open_count = self._open_count - 1
+        charged_count = self._charged_count - int(state == "released")
+        receipt = self._build_receipt(candidate, open_count=open_count, charged_count=charged_count)
+        self._settlements[consumption_ref] = candidate
+        self._open_count = open_count
+        self._charged_count = charged_count
+        return receipt
 
     def _receipt(self, consumption_ref: str) -> dict[str, Any]:
-        record = self._settlements[consumption_ref]
+        return self._build_receipt(
+            self._settlements[consumption_ref],
+            open_count=self._open_count,
+            charged_count=self._charged_count,
+        )
+
+    def _build_receipt(self, record: Mapping[str, Any], *, open_count: int, charged_count: int) -> dict[str, Any]:
         receipt = {
             "schema": SCHEMA_VERSION,
             "scope_fingerprint": self.fingerprint(),
             "generation": self._generation,
             "holder": self._holder,
             "record": dict(record),
-            "open_reservations": self._open_count,
-            "charged_total": self._charged_count,
-            "consumed_total": self._charged_count,
+            "open_reservations": open_count,
+            "charged_total": charged_count,
+            "consumed_total": charged_count,
             "delegated_total": self._delegated_count,
         }
         receipt["receipt_digest"] = digest(receipt)

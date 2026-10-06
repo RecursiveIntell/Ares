@@ -104,10 +104,11 @@ def test_cancel_before_turn_does_not_consume_queued_once(live_turn, monkeypatch,
 
 
 @pytest.mark.parametrize('replacement_kind', ['agent', 'session'])
-def test_retired_once_owner_does_not_restore_replacement(live_turn, monkeypatch, replacement_kind):
+def test_lost_once_owner_retains_unproven_A_without_restoring_replacement(live_turn, monkeypatch, replacement_kind):
     session, _ = live_turn
     value = session['agent']
     once(session)
+    lease = session['_one_turn_model_runtime']
     replacement = _make_agent_openrouter()
     replacement.quiet_mode = True
     replacement._create_openai_client = lambda kwargs, **kw: SimpleNamespace(kwargs=kwargs.copy())
@@ -136,7 +137,10 @@ def test_retired_once_owner_does_not_restore_replacement(live_turn, monkeypatch,
     server._run_prompt_submit('once-request', 'selected', session, 'offline input')
     assert (replacement.model, replacement.provider) == ('replacement-model', 'replacement-provider')
     assert_route(replacement, 'http://replacement.invalid/v1', 'synthetic-replacement-key')
-    assert not session.get('_one_turn_model_runtime')
+    assert session['_one_turn_model_runtime'] is lease
+    assert lease['restore_snapshot']['model'] == 'model-a'
+    if replacement_kind == 'agent':
+        assert lease['restore_failed'] and not lease['active']
     assert not restore_side_effects
 
 
@@ -206,6 +210,7 @@ def test_restore_failure_is_visible_and_keeps_actual_runtime_metadata(live_turn,
 def test_stale_queued_once_owner_fails_before_dispatch(live_turn, monkeypatch):
     session, events = live_turn
     once(session)
+    lease = session['_one_turn_model_runtime']
     replacement = _make_agent_openrouter()
     replacement.quiet_mode = True
     session['agent'] = replacement
@@ -213,8 +218,8 @@ def test_stale_queued_once_owner_fails_before_dispatch(live_turn, monkeypatch):
     monkeypatch.setattr(replacement, 'run_conversation', lambda *a, **kw: dispatched.append(True))
     server._run_prompt_submit('stale-once-request', 'selected', session, 'offline input')
     assert not dispatched
-    assert not session.get('_one_turn_model_runtime')
-    assert not session.get('one_turn_model_restore')
+    assert session['_one_turn_model_runtime'] is lease and lease['restore_failed']
+    assert session['one_turn_model_restore'] is lease['restore_snapshot']
     assert any(name == 'message.complete' and payload.get('status') == 'error' for name, _, payload in events)
 
 

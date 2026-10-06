@@ -109,7 +109,7 @@ def test_masking_shell_control_is_not_verification_evidence(
     assert evidence is None
 
 
-@pytest.mark.parametrize("command", ["prepare && pytest", "pytest && report"])
+@pytest.mark.parametrize("command", ["pytest && report", "pytest && cd elsewhere && cd back"])
 def test_successful_and_chain_preserves_passing_evidence(
     tmp_path, monkeypatch, command
 ):
@@ -127,9 +127,9 @@ def test_successful_and_chain_preserves_passing_evidence(
     assert evidence.status == "passed"
 
 
-@pytest.mark.parametrize("exit_code, expected", [(0, "passed"), (1, "failed")])
-def test_final_verifier_after_sequence_owns_shell_exit_status(
-    tmp_path, monkeypatch, exit_code, expected
+@pytest.mark.parametrize("exit_code", [0, 1])
+def test_final_verifier_after_sequence_has_unbound_workspace(
+    tmp_path, monkeypatch, exit_code
 ):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     _python_project(tmp_path)
@@ -141,8 +141,114 @@ def test_final_verifier_after_sequence_owns_shell_exit_status(
         exit_code=exit_code,
     )
 
+    assert evidence is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["cd elsewhere && pytest", "cd elsewhere && pytest && cd back", "prepare && pytest", "prepare\npytest"],
+)
+def test_preceding_shell_command_cannot_establish_original_workspace_freshness(
+    tmp_path, monkeypatch, command
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _python_project(tmp_path)
+    assert classify_verification_command(command, cwd=tmp_path, session_id="s1", exit_code=0) is None
+
+
+@pytest.mark.parametrize("prefix", ["cd elsewhere && ", "prepare; ", "prepare && "])
+def test_ad_hoc_verifier_after_shell_command_has_unbound_workspace(tmp_path, monkeypatch, prefix):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+    script = Path(tempfile.gettempdir()) / f"hermes-verify-cwd-{tmp_path.name}.py"
+    assert classify_verification_command(
+        f"{prefix}python {script}", cwd=tmp_path, session_id="s1", exit_code=0
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "pytest -k smoke", "pytest -ksmoke", "pytest -k=smoke",
+        "pytest -m smoke", "pytest -msmoke", "pytest -m=smoke", "pytest -qk smoke",
+        "pytest --deselect=smoke", "pytest --lf", "pytest --unknown-selection=smoke",
+        "HERMES_TEST_SLICE=1/8 pytest", "env HERMES_TEST_PATHS=unit pytest",
+        "PYTEST_ADDOPTS='-k smoke' pytest",
+        "TEST_FILTER=smoke pytest", "pytest time", "pytest root=unit",
+        "pytest tests/unit.py::test_case[value=smoke]",
+        "pytest -- -",
+    ],
+)
+def test_selection_and_ambiguous_arguments_are_targeted(tmp_path, monkeypatch, command):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _python_project(tmp_path)
+    evidence = classify_verification_command(command, cwd=tmp_path, session_id="s1", exit_code=0)
     assert evidence is not None
-    assert evidence.status == expected
+    assert evidence.scope == "targeted"
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    ["--slice=1/8", "--slice 1/8", "--files=unit", "--paths=unit"],
+)
+def test_runner_selection_arguments_are_targeted(tmp_path, monkeypatch, arguments):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _node_project(tmp_path)
+    evidence = classify_verification_command(
+        f"scripts/run_tests.sh {arguments}", cwd=tmp_path, session_id="s1", exit_code=0
+    )
+    assert evidence is not None
+    assert evidence.scope == "targeted"
+
+
+def test_go_run_selector_is_not_pytest_reporting_option(tmp_path, monkeypatch):
+    from agent import coding_context
+
+    monkeypatch.setattr(coding_context, "project_facts_for", lambda cwd: {
+        "root": str(tmp_path), "verifyCommands": ["go test"],
+    })
+    evidence = classify_verification_command(
+        "go test -run=Smoke", cwd=tmp_path, session_id="s1", exit_code=0
+    )
+    assert evidence is not None
+    assert evidence.scope == "targeted"
+
+
+def test_make_test_selection_assignment_is_not_a_shell_prefix(tmp_path, monkeypatch):
+    from agent import coding_context
+
+    monkeypatch.setattr(coding_context, "project_facts_for", lambda cwd: {
+        "root": str(tmp_path), "verifyCommands": ["make test"],
+    })
+    evidence = classify_verification_command(
+        "make test TEST=smoke", cwd=tmp_path, session_id="s1", exit_code=0
+    )
+    assert evidence is not None
+    assert evidence.scope == "targeted"
+
+
+@pytest.mark.parametrize("arguments", ["-q", "-vv", "-n 2", "--tb=short", "--junitxml=reports/results.xml"])
+def test_reporting_and_worker_options_preserve_unrestricted_selection(tmp_path, monkeypatch, arguments):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _python_project(tmp_path)
+    evidence = classify_verification_command(f"pytest {arguments}", cwd=tmp_path, session_id="s1", exit_code=0)
+    assert evidence is not None
+    assert evidence.scope == "full"
+
+
+def test_other_workspace_verifier_cannot_clear_initial_workspace_stale_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    project_a, project_b = tmp_path / "a", tmp_path / "b"
+    for project in (project_a, project_b):
+        project.mkdir()
+        _python_project(project)
+    record_terminal_result(command="pytest", cwd=project_a, session_id="conversation", exit_code=0)
+    mark_workspace_edited(session_id="conversation", cwd=project_a, paths=[str(project_a / "changed.py")])
+    assert record_terminal_result(
+        command=f"cd {project_b} && pytest && cd {project_a}",
+        cwd=project_a, session_id="conversation", exit_code=0,
+    ) is None
+    assert verification_status(session_id="conversation", cwd=project_a)["status"] == "stale"
 
 
 def test_quoted_shell_operator_remains_a_verifier_argument(tmp_path, monkeypatch):

@@ -32,6 +32,176 @@ def _runtime(tmp_path: Path) -> AresLocalRuntime:
     )
 
 
+@pytest.mark.parametrize("failure", ["restart", "health", "recovery_restart"])
+def test_rollback_service_failure_restores_the_exact_pointer_pair(
+    tmp_path: Path, monkeypatch, failure: str
+) -> None:
+    runtime = _runtime(tmp_path)
+    previous_source = _release(runtime, "a" * 40)
+    current_source = _release(runtime, "b" * 40)
+    runtime._activate("a" * 40)
+    runtime._activate("b" * 40)
+    runtime.paths.unit_path.parent.mkdir(parents=True)
+    runtime.paths.unit_path.write_text("inert service fixture", encoding="utf-8")
+    calls: list[tuple[tuple[str, ...], bool]] = []
+
+    def systemctl(*args: str, required: bool = True) -> bool:
+        calls.append((args, required))
+        if args[0] == "restart":
+            if required and failure != "health":
+                raise AresLocalRuntimeError("injected rollback restart failure")
+            if not required and failure == "recovery_restart":
+                raise OSError("injected recovery restart failure")
+        return not (failure == "health" and args[0] == "is-active")
+
+    monkeypatch.setattr(runtime, "_systemctl", systemctl)
+    monkeypatch.setattr("ares_runtime.local_runtime.time.sleep", lambda _seconds: None)
+    error = (
+        "did not remain active" if failure == "health" else "rollback restart failure"
+    )
+    with pytest.raises(AresLocalRuntimeError, match=error):
+        runtime.rollback()
+
+    assert runtime.active_release() == ("b" * 40, current_source.resolve())
+    assert runtime.previous_release() == ("a" * 40, previous_source.resolve())
+    assert calls[-1] == (("restart", "ares-gateway.service"), False)
+
+
+@pytest.mark.parametrize("gateway", [False, True])
+def test_rollback_success_selects_previous_with_and_without_gateway(
+    tmp_path: Path, monkeypatch, gateway: bool
+) -> None:
+    runtime = _runtime(tmp_path)
+    previous_source = _release(runtime, "a" * 40)
+    current_source = _release(runtime, "b" * 40)
+    runtime._activate("a" * 40)
+    runtime._activate("b" * 40)
+    if gateway:
+        runtime.paths.unit_path.parent.mkdir(parents=True)
+        runtime.paths.unit_path.write_text("inert service fixture", encoding="utf-8")
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        runtime, "_systemctl", lambda *args, **_kw: calls.append(args) or True
+    )
+    monkeypatch.setattr("ares_runtime.local_runtime.time.sleep", lambda _seconds: None)
+
+    assert runtime.rollback() == "a" * 40
+    assert runtime.active_release() == ("a" * 40, previous_source.resolve())
+    assert runtime.previous_release() == ("b" * 40, current_source.resolve())
+    assert bool(calls) is gateway
+
+
+def test_rollback_compensation_failure_is_reported_without_recovery_claim(
+    tmp_path: Path, monkeypatch
+) -> None:
+    runtime = _runtime(tmp_path)
+    _release(runtime, "a" * 40)
+    _release(runtime, "b" * 40)
+    runtime._activate("a" * 40)
+    runtime._activate("b" * 40)
+    runtime.paths.unit_path.parent.mkdir(parents=True)
+    runtime.paths.unit_path.write_text("inert service fixture", encoding="utf-8")
+    monkeypatch.setattr(
+        runtime,
+        "_systemctl",
+        lambda *_args, **_kw: (_ for _ in ()).throw(
+            AresLocalRuntimeError("injected rollback restart failure")
+        ),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_restore_release_pair",
+        lambda *_args: (_ for _ in ()).throw(OSError("injected restore failure")),
+    )
+
+    with pytest.raises(
+        AresLocalRuntimeError, match="prior release pointers could not be restored"
+    ) as error:
+        runtime.rollback()
+    assert isinstance(error.value.__cause__, OSError)
+    assert str(error.value.__cause__) == "injected restore failure"
+
+
+@pytest.mark.parametrize("cleanup_failure", [False, True])
+def test_upstream_candidate_reuse_removes_owned_staging(
+    tmp_path: Path, monkeypatch, cleanup_failure: bool
+) -> None:
+    runtime = _runtime(tmp_path)
+    runtime._ensure_layout()
+    upstream, downstream = "c" * 40, "d" * 40
+    installed = _release(runtime, upstream)
+    python = runtime._python_for(installed)
+    python.parent.mkdir(parents=True)
+    python.write_text("inert interpreter fixture", encoding="utf-8")
+    runtime._atomic_json(
+        runtime._release_dir(upstream) / "release.json",
+        {"upstream_revision": upstream, "downstream_revision": downstream},
+    )
+    prior_source = _release(runtime, "a" * 40)
+    runtime._activate("a" * 40)
+    runtime._activate(upstream)
+    marker = installed / "immutable-marker"
+    marker.write_bytes(b"existing immutable release")
+
+    def run(args, **_kwargs):
+        if list(args[:2]) == ["git", "clone"]:
+            staging_source = Path(args[-1])
+            staging_source.mkdir(parents=True)
+            (staging_source / "clone-fixture").write_bytes(
+                b"owned tiny staging fixture"
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(runtime, "_run", run)
+    monkeypatch.setattr(
+        runtime,
+        "_git_output",
+        lambda _source, *args: (
+            upstream if args == ("rev-parse", "FETCH_HEAD") else "0" * 40
+        ),
+    )
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kw: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_build_runtime",
+        lambda *_args, **_kw: (_ for _ in ()).throw(
+            AssertionError("existing release must never rebuild")
+        ),
+    )
+    if cleanup_failure:
+        monkeypatch.setattr(
+            "ares_runtime.local_runtime.shutil.rmtree",
+            lambda path: (_ for _ in ()).throw(OSError("injected cleanup failure")),
+        )
+
+    def reuse():
+        return runtime._materialize_upstream_candidate(
+            downstream_remote="inert-downstream",
+            downstream_revision=downstream,
+            upstream_remote="inert-upstream",
+            upstream_branch="main",
+            upstream_revision=upstream,
+            desktop=False,
+        )
+
+    if cleanup_failure:
+        with pytest.raises(
+            AresLocalRuntimeError, match="upstream candidate cleanup failed"
+        ):
+            reuse()
+    else:
+        assert reuse() == upstream
+        assert reuse() == upstream
+        assert not list(runtime.paths.staging_dir.iterdir())
+    assert marker.read_bytes() == b"existing immutable release"
+    assert runtime.active_release() == (upstream, installed.resolve())
+    assert runtime.previous_release() == ("a" * 40, prior_source.resolve())
+
+
 def _release(runtime: AresLocalRuntime, revision: str) -> Path:
     source = runtime.paths.releases_dir / revision / "source"
     source.mkdir(parents=True)
@@ -59,6 +229,225 @@ def _repository(path: Path) -> Path:
     _git(path, "config", "user.name", "Ares Runtime Tests")
     _git(path, "config", "user.email", "ares-runtime-tests@example.invalid")
     return path
+
+
+@pytest.fixture
+def gateway_stop_case(tmp_path: Path, monkeypatch):
+    from gateway import status
+
+    runtime = _runtime(tmp_path)
+    source = _release(runtime, "a" * 40)
+    python = source / ".venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.touch()
+    runtime._activate("a" * 40)
+    home = runtime.paths.agent_home
+    home.mkdir()
+    pid, start = 987654, 1200
+    record = {
+        "pid": pid,
+        "start_time": start,
+        "kind": "hermes-gateway",
+        "argv": ["python", "-m", "hermes_cli.main", "gateway", "run"],
+        "hermes_home": str(home),
+    }
+    for name in ("gateway.pid", "gateway.lock"):
+        (home / name).write_text(json.dumps(record))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(status, "_is_gateway_runtime_lock_active_strict", lambda _path: True)
+    monkeypatch.setattr(status, "_pid_exists", lambda candidate: candidate == pid)
+    monkeypatch.setattr(status, "_get_process_start_time", lambda _pid: start)
+    monkeypatch.setattr(status, "_read_process_cmdline", lambda _pid: " ".join(record["argv"]))
+    return SimpleNamespace(runtime=runtime, source=source, home=home,
+                           status=status, pid=pid, start=start, record=record)
+
+
+def _gateway_stop_child(case, monkeypatch, events):
+    import ares_runtime.local_runtime as local_runtime
+
+    def run(command, **kwargs):
+        assert command[:2] == [str(case.source / ".venv/bin/python"), "-c"]
+        assert kwargs["cwd"] == case.source
+        assert kwargs["env"]["HERMES_HOME"] == str(case.home.resolve())
+        assert kwargs["timeout"] == 10
+        events.append("prepare")
+        # Emulate the child's process environment without launching a process.
+        with monkeypatch.context() as child:
+            child.setenv("HERMES_HOME", kwargs["env"]["HERMES_HOME"])
+            try:
+                exec(command[-1], {})
+            except AresLocalRuntimeError as exc:
+                return SimpleNamespace(returncode=1, stdout="", stderr=str(exc))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(local_runtime.subprocess, "run", run)
+    monkeypatch.setattr(case.runtime, "_systemctl",
+                        lambda *args, **kwargs: events.append(args) or True)
+
+
+def test_gateway_stop_publishes_verified_marker_before_service_stop(gateway_stop_case, monkeypatch):
+    case = gateway_stop_case
+    events = []
+    _gateway_stop_child(case, monkeypatch, events)
+    case.runtime.gateway("stop")
+
+    assert events == ["prepare", ("disable", "--now", "ares-gateway.service")]
+    marker = json.loads((case.home / ".gateway-planned-stop.json").read_text())
+    assert (marker["target_pid"], marker["target_start_time"]) == (case.pid, case.start)
+    with monkeypatch.context() as consumer:
+        consumer.setattr(case.status.os, "getpid", lambda: case.pid)
+        assert case.status.consume_planned_stop_marker_for_self() is True
+
+
+def test_gateway_stop_keeps_isolated_unit_routing(gateway_stop_case, monkeypatch):
+    from dataclasses import replace
+    import ares_runtime.local_runtime as local_runtime
+
+    case = gateway_stop_case
+    case.runtime = AresLocalRuntime(replace(case.runtime.paths, unit_path=case.home / "offline-stop.service"))
+    events = []
+    _gateway_stop_child(case, monkeypatch, events)
+    child_run = local_runtime.subprocess.run
+    monkeypatch.setattr(case.runtime, "_systemctl", AresLocalRuntime._systemctl.__get__(case.runtime))
+    monkeypatch.setattr(local_runtime.shutil, "which", lambda _name: "/usr/bin/systemctl")
+
+    def run(command, **kwargs):
+        if command[0] != "systemctl":
+            return child_run(command, **kwargs)
+        assert (case.home / ".gateway-planned-stop.json").is_file()
+        events.append(command)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(local_runtime.subprocess, "run", run)
+    case.runtime.gateway("stop")
+    assert events == ["prepare", ["systemctl", "--user", "disable", "--now", "offline-stop.service"]]
+
+
+@pytest.mark.parametrize("boundary", ["stale_start", "dead_pid", "wrong_pid", "wrong_role"])
+def test_gateway_stop_rejects_stale_or_disagreeing_identity(gateway_stop_case, monkeypatch, boundary):
+    case = gateway_stop_case
+    if boundary == "stale_start":
+        monkeypatch.setattr(case.status, "_get_process_start_time", lambda _pid: case.start + 1)
+    elif boundary == "dead_pid":
+        monkeypatch.setattr(case.status, "_pid_exists", lambda _pid: False)
+    elif boundary == "wrong_pid":
+        record = dict(case.record, pid=case.pid + 1)
+        (case.home / "gateway.lock").write_text(json.dumps(record))
+    else:
+        monkeypatch.setattr(case.status, "_read_process_cmdline", lambda _pid: "python -m hermes_cli.main serve")
+    events = []
+    _gateway_stop_child(case, monkeypatch, events)
+    with pytest.raises(AresLocalRuntimeError, match="identity"):
+        case.runtime.gateway("stop")
+    assert events == ["prepare"]
+    assert not (case.home / ".gateway-planned-stop.json").exists()
+
+
+@pytest.mark.parametrize("record_name", ["gateway.pid", "gateway.lock", "live_profile"])
+def test_gateway_stop_rejects_foreign_home(gateway_stop_case, monkeypatch, tmp_path, record_name):
+    case = gateway_stop_case
+    if record_name == "live_profile":
+        monkeypatch.setattr(case.status, "_read_process_cmdline", lambda _pid: "python -m hermes_cli.main --profile other gateway run")
+    else:
+        record = dict(case.record, hermes_home=str(tmp_path / "foreign-home"))
+        (case.home / record_name).write_text(json.dumps(record))
+    events = []
+    _gateway_stop_child(case, monkeypatch, events)
+    with pytest.raises(AresLocalRuntimeError, match="home"):
+        case.runtime.gateway("stop")
+    assert events == ["prepare"]
+    assert not (case.home / ".gateway-planned-stop.json").exists()
+
+
+def test_gateway_stop_rejects_identity_change_before_publication(gateway_stop_case, monkeypatch):
+    case = gateway_stop_case
+    identities = iter(((case.pid, case.start), (case.pid, case.start + 1)))
+    monkeypatch.setattr(case.status, "get_running_pid_identity_strict", lambda _path: next(identities))
+    events = []
+    _gateway_stop_child(case, monkeypatch, events)
+    with pytest.raises(AresLocalRuntimeError, match="identity"):
+        case.runtime.gateway("stop")
+    assert events == ["prepare"]
+    assert not (case.home / ".gateway-planned-stop.json").exists()
+
+
+def test_gateway_stop_aborts_when_marker_publication_fails(gateway_stop_case, monkeypatch):
+    case = gateway_stop_case
+    monkeypatch.setattr(case.status, "write_planned_stop_marker", lambda _pid: False)
+    events = []
+    _gateway_stop_child(case, monkeypatch, events)
+    with pytest.raises(AresLocalRuntimeError, match="marker"):
+        case.runtime.gateway("stop")
+    assert events == ["prepare"]
+
+
+def test_gateway_stop_without_a_runtime_owner_does_not_create_marker(gateway_stop_case, monkeypatch):
+    case = gateway_stop_case
+    (case.home / "gateway.pid").unlink()
+    (case.home / "gateway.lock").unlink()
+    events = []
+    _gateway_stop_child(case, monkeypatch, events)
+    case.runtime.gateway("stop")
+    assert events == ["prepare", ("disable", "--now", "ares-gateway.service")]
+    assert not (case.home / ".gateway-planned-stop.json").exists()
+
+
+def test_gateway_stop_preserves_caller_environment_and_profile_context(gateway_stop_case, monkeypatch, tmp_path):
+    from hermes_constants import get_hermes_home, reset_hermes_home_override, set_hermes_home_override
+
+    case = gateway_stop_case
+    ambient_home = tmp_path / "ambient-home"
+    monkeypatch.setenv("HERMES_HOME", str(ambient_home))
+    monkeypatch.setenv("PYTHONPATH", "ambient-python-path")
+    profile = tmp_path / "context-profile"
+    token = set_hermes_home_override(profile)
+    before = dict(os.environ)
+    try:
+        events = []
+        _gateway_stop_child(case, monkeypatch, events)
+        case.runtime.gateway("stop")
+        assert dict(os.environ) == before
+        assert get_hermes_home() == profile
+        assert (case.home / ".gateway-planned-stop.json").is_file()
+        assert not (ambient_home / ".gateway-planned-stop.json").exists()
+        assert not (profile / ".gateway-planned-stop.json").exists()
+    finally:
+        reset_hermes_home_override(token)
+
+
+@pytest.mark.parametrize("failure", [OSError("synthetic launch failure"), subprocess.TimeoutExpired("synthetic", 10)])
+def test_gateway_stop_preparation_failure_never_calls_service(gateway_stop_case, monkeypatch, failure):
+    case = gateway_stop_case
+    before = dict(os.environ)
+    monkeypatch.setattr("ares_runtime.local_runtime.subprocess.run",
+                        lambda *args, **kwargs: (_ for _ in ()).throw(failure))
+    calls = []
+    monkeypatch.setattr(case.runtime, "_systemctl", lambda *args, **kwargs: calls.append(args))
+    with pytest.raises(AresLocalRuntimeError, match="stop"):
+        case.runtime.gateway("stop")
+    assert calls == []
+    assert dict(os.environ) == before
+
+
+@pytest.mark.parametrize("mismatch", ["stale", "pid", "start", "home"])
+def test_gateway_stop_marker_owner_rejects_stale_or_wrong_consumer(gateway_stop_case, monkeypatch, tmp_path, mismatch):
+    import ares_runtime.local_runtime as local_runtime
+
+    case = gateway_stop_case
+    local_runtime._prepare_gateway_stop_marker()
+    path = case.home / ".gateway-planned-stop.json"
+    marker = json.loads(path.read_text())
+    if mismatch == "stale":
+        marker["written_at"] = "2000-01-01T00:00:00+00:00"
+    elif mismatch == "pid":
+        marker["target_pid"] += 1
+    elif mismatch == "start":
+        marker["target_start_time"] += 1
+    else:
+        marker["target_hermes_home"] = str(tmp_path / "foreign-consumer")
+    path.write_text(json.dumps(marker))
+    monkeypatch.setattr(case.status.os, "getpid", lambda: case.pid)
+    assert case.status.consume_planned_stop_marker_for_self() is False
 
 
 def test_current_link_is_the_only_active_runtime_pointer(tmp_path: Path) -> None:
@@ -259,6 +648,152 @@ def test_update_activates_only_the_verified_upstream_candidate(
         upstream, "rev-parse", "HEAD"
     )
     assert runtime.update(desktop=False) == (candidate_revision, False)
+
+
+@pytest.fixture
+def recipe_update_case(tmp_path: Path):
+    runtime = _runtime(tmp_path)
+    first = _release(runtime, "a" * 40)
+    current = _release(runtime, "b" * 40)
+    candidate = _release(runtime, "c" * 40)
+    runtime._activate("a" * 40)
+    runtime._activate("b" * 40)
+    runtime._write_config(
+        remote="fixture-downstream", branch="main",
+        upstream_remote="fixture-upstream", upstream_branch="main",
+    )
+    home = runtime.paths.agent_home
+    home.mkdir()
+    profile = home / "profiles" / "fixture"
+    profile.mkdir(parents=True)
+    for name, data in {
+        "config.yaml": "context: {engine: ri-context-governor}\n",
+        "auth.json": '{"fixture":"inert-not-a-credential"}\n',
+        ".env": "FIXTURE_ONLY=unchanged\n",
+    }.items():
+        (profile / name).write_text(data)
+    receipt = home / "install-receipts" / "latest.json"
+    receipt.parent.mkdir()
+    receipt.write_text('{"fixture":"retained"}\n')
+
+    def snapshot():
+        return (
+            runtime.paths.current_link.readlink(),
+            runtime.paths.previous_link.readlink(),
+            runtime.paths.config_path.read_bytes(),
+            {p.name: p.read_bytes() for p in profile.iterdir()},
+            receipt.read_bytes(),
+        )
+
+    return SimpleNamespace(runtime=runtime, current=current, candidate=candidate,
+                           record=current / ".venv/share/ares-full-install.json",
+                           snapshot=snapshot)
+
+
+def _forbid_recipe_update_effects(case, monkeypatch):
+    calls = []
+    for name in ("_read_config", "_remote_revision", "_materialize_upstream_candidate",
+                 "_activate", "_write_config", "_install_gateway_unit", "_systemctl"):
+        def forbidden(*args, _name=name, **kwargs):
+            calls.append(_name)
+            raise AssertionError(f"Recipe admission must precede {_name}")
+        monkeypatch.setattr(case.runtime, name, forbidden)
+    return calls
+
+
+@pytest.mark.parametrize("kind", ["full", "sdk_only", "malformed", "unknown", "directory", "dangling_link"])
+def test_recipe_admission_refuses_before_update_effects(recipe_update_case, monkeypatch, kind):
+    case = recipe_update_case
+    case.record.parent.mkdir(parents=True)
+    if kind == "directory":
+        case.record.mkdir()
+    elif kind == "dangling_link":
+        case.record.symlink_to("missing-recipe")
+    else:
+        records = {
+            "full": json.dumps({"inputs": {"recipe_version": "3", "enhancements": True,
+                                          "desktop": True, "sdk_dependencies": ["mcp==2.2.0"]}}),
+            "sdk_only": json.dumps({"inputs": {"recipe_version": "3", "enhancements": False,
+                                              "desktop": False, "sdk_dependencies": ["mcp==2.2.0"]}}),
+            "malformed": "{incomplete",
+            "unknown": json.dumps({"future_recipe": "unrecognized"}),
+        }
+        case.record.write_text(records[kind])
+    before = case.snapshot()
+    calls = _forbid_recipe_update_effects(case, monkeypatch)
+    with pytest.raises(AresLocalRuntimeError, match="recorded installer recipe") as error:
+        case.runtime.update(desktop=False)
+    assert "full-distribution installer" in str(error.value)
+    assert "same revision" in str(error.value)
+    assert calls == []
+    assert case.snapshot() == before
+    assert not case.runtime.paths.staging_dir.exists()
+
+
+def test_recipe_admission_uninspectable_metadata_fails_closed(recipe_update_case, monkeypatch):
+    case = recipe_update_case
+    original = Path.lstat
+    def lstat(path, *args, **kwargs):
+        if path == case.record:
+            raise PermissionError("fixture metadata inspection denied")
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(Path, "lstat", lstat)
+    before = case.snapshot()
+    calls = _forbid_recipe_update_effects(case, monkeypatch)
+    with pytest.raises(AresLocalRuntimeError, match="recipe metadata"):
+        case.runtime.update(desktop=False)
+    assert calls == []
+    assert case.snapshot() == before
+
+
+def test_recipe_admission_installed_cli_reports_preservation(recipe_update_case, monkeypatch, capsys):
+    import ares_runtime.local_runtime as local_runtime
+    case = recipe_update_case
+    case.record.parent.mkdir(parents=True)
+    case.record.write_text(json.dumps({"inputs": {"enhancements": True}}))
+    before = case.snapshot()
+    calls = _forbid_recipe_update_effects(case, monkeypatch)
+    monkeypatch.setattr(local_runtime, "AresLocalRuntime", lambda: case.runtime)
+    with pytest.raises(SystemExit) as error:
+        local_runtime.main(["update", "--no-desktop"])
+    assert error.value.code == 1
+    assert "recorded installer recipe" in capsys.readouterr().err
+    assert calls == []
+    assert case.snapshot() == before
+
+
+@pytest.mark.parametrize("current_tuple", [False, True])
+def test_recipe_admission_preserves_base_update_and_noop(recipe_update_case, monkeypatch, current_tuple):
+    case = recipe_update_case
+    runtime = case.runtime
+    remote_calls = []
+    def resolve(remote, branch):
+        remote_calls.append((remote, branch))
+        return "d" * 40 if remote == "fixture-downstream" else "e" * 40
+    monkeypatch.setattr(runtime, "_remote_revision", resolve)
+    effects = []
+    monkeypatch.setattr(runtime, "_materialize_upstream_candidate",
+                        lambda **kwargs: effects.append(kwargs) or "c" * 40)
+    monkeypatch.setattr(runtime, "_systemctl", lambda *args, **kwargs: pytest.fail("No service in base fixture"))
+    if current_tuple:
+        runtime._atomic_json(case.current.parent / "release.json", {
+            "downstream_revision": "d" * 40, "upstream_revision": "e" * 40,
+            "upstream_remote": "fixture-upstream", "upstream_branch": "main",
+        })
+    before = case.snapshot()
+    result = runtime.update(desktop=False)
+    assert remote_calls == [("fixture-downstream", "main"), ("fixture-upstream", "main")]
+    if current_tuple:
+        assert result == ("b" * 40, False)
+        assert effects == []
+        assert case.snapshot() == before
+    else:
+        assert result == ("c" * 40, True)
+        assert len(effects) == 1
+        assert effects[0]["desktop"] is False
+        assert runtime.active_release() == ("c" * 40, case.candidate.resolve())
+        assert runtime.previous_release() == ("b" * 40, case.current.resolve())
+        assert case.snapshot()[2:] == before[2:]
 
 
 def test_upstream_candidate_conflict_never_publishes_a_release(

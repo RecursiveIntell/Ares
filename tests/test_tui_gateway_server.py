@@ -3659,9 +3659,9 @@ def test_slow_resume_hydration_degrades_instead_of_killing_agent_init(monkeypatc
         with caplog.at_level("WARNING", logger="tui_gateway.server"):
             outcome = server._await_resume_history(session, sid, "hydration-degrade-key")
         assert outcome == "degraded"
-        assert session["resume_hydrating"] is False
+        assert session["resume_hydrating"] is True
         assert session["history"] == []
-        assert event.is_set()
+        assert not event.is_set()
         statuses = [payload["status"] for name, payload in events
                     if name == "session.resume_progress"]
         assert statuses == ["slow", "degraded_timeout"]

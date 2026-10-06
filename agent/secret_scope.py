@@ -662,6 +662,15 @@ def build_profile_secret_scope(
             continue
         secrets[key] = value
 
+    # An explicitly admitted root underlay belongs to this profile's grant
+    # history. Keep that provenance if inheritance is later revoked while an
+    # old value remains in the launch environment. Never classify unrelated
+    # shell exports or unadmitted root namespaces as profile authority.
+    if inherited:
+        history_key = str(home.resolve())
+        with _PROFILE_OWNED_NAME_HISTORY_LOCK:
+            _PROFILE_OWNED_NAME_HISTORY.setdefault(history_key, set()).update(inherited)
+
     return _immutable_scope(
         secrets,
         profile_home=home,
@@ -773,8 +782,9 @@ def get_profile_owned_secret_names(
 ) -> frozenset[str]:
     """Return exact secret names owned by one profile, without reading values.
 
-    The profile's dotenv files and the external-source provenance snapshot are
-    the ownership sources. Ordinary shell exports are intentionally excluded:
+    The profile's dotenv files, external-source provenance snapshot and
+    explicitly admitted root underlay are the ownership sources.
+    Ordinary shell exports are intentionally excluded:
     they are user/process state, not profile-owned credentials.
     """
     home = Path(hermes_home)
@@ -796,6 +806,12 @@ def get_profile_owned_secret_names(
             )
     observed_names = set(op_snapshot.data)
     observed_names.update(env_snapshot.data)
+    observed_names.update(
+        _root_profile_fallback_secrets(
+            home,
+            fail_closed_external=fail_closed_external,
+        )
+    )
     observed_names.update(
         _profile_external_secret_values(
             home,

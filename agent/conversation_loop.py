@@ -2493,6 +2493,10 @@ def run_conversation(
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
 
+        if agent.provider == "moa":
+            from agent.transports.ri_llm import _should_use_ri_pipeline, RiTransportUnsupported
+            if _should_use_ri_pipeline(agent):
+                raise RiTransportUnsupported("native binding supports only ollama-launch")
         if moa_config:
             try:
                 from agent.message_content import flatten_message_text as _flatten_mt
@@ -2668,6 +2672,9 @@ def run_conversation(
         # request later without running the advisors a second time.
         _moa_prepared_request = None
         if agent.provider == "moa":
+            from agent.transports.ri_llm import _should_use_ri_pipeline, RiTransportUnsupported
+            if _should_use_ri_pipeline(agent):
+                raise RiTransportUnsupported("native binding supports only ollama-launch")
             _moa_completions = getattr(getattr(agent.client, "chat", None), "completions", None)
             if pending_moa_prepared_request is not None:
                 _rebase_moa_request = getattr(_moa_completions, "rebase_prepared_request", None)
@@ -6476,14 +6483,14 @@ def run_conversation(
                     # exists; otherwise "trying fallback..." is a lie and the
                     # session looks like it's recovering when it's about to
                     # abort silently (#35314, #17446).
-                    if agent._has_pending_fallback():
+                    if not (classified.error_context or {}).get("native_transport_refusal") and agent._has_pending_fallback():
                         if classified.reason == FailoverReason.content_policy_blocked:
                             agent._buffer_status("⚠️ Provider safety filter blocked this request — trying fallback...")
                         elif classified.reason == FailoverReason.ssl_cert_verification:
                             agent._buffer_status("⚠️ TLS certificate verification failed — trying fallback...")
                         else:
                             agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
-                    if agent._try_activate_fallback():
+                    if not (classified.error_context or {}).get("native_transport_refusal") and agent._try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0

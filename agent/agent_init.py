@@ -2106,6 +2106,8 @@ def init_agent(
     _agent_section = _agent_cfg.get("agent", {})
     if not isinstance(_agent_section, dict):
         _agent_section = {}
+    from agent.transports.ri_llm import configure_ri_pipeline
+    configure_ri_pipeline(agent, _agent_cfg)
     agent._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
 
     # Execution-discipline guidance gate: "auto" (default — matches
@@ -2821,7 +2823,16 @@ def init_agent(
     except Exception:
         pass
 
-    if _engine_name != "compressor":
+    if _engine_name == "ri-context-governor":
+        # Ares explicitly selects a certified, receipt-preserving engine.
+        # Readiness failure must not select Hermes' LLM compressor instead.
+        from plugins.context_engine import (
+            ContextEngineActivationError,
+            load_context_engine_strict,
+        )
+
+        _selected_engine = load_context_engine_strict(_engine_name)
+    elif _engine_name != "compressor":
         # Try loading from plugins/context_engine/<name>/
         try:
             from plugins.context_engine import load_context_engine
@@ -2905,6 +2916,7 @@ def init_agent(
             api_key=getattr(agent, "api_key", ""),
             provider=agent.provider,
             api_mode=agent.api_mode,
+            max_tokens=agent.max_tokens,
             threshold_percent=compression_threshold,
         )
         if not agent.quiet_mode:
@@ -2937,8 +2949,12 @@ def init_agent(
     if callable(_bind_session_state):
         try:
             _bind_session_state(session_db=session_db, session_id=agent.session_id)
-        except Exception:
-            pass
+        except Exception as _ce_bind_err:
+            if _engine_name == "ri-context-governor":
+                raise ContextEngineActivationError(
+                    f"configured context engine '{_engine_name}' failed its "
+                    f"session binding: {_ce_bind_err}"
+                ) from _ce_bind_err
     agent.compression_enabled = compression_enabled
     agent.compression_in_place = compression_in_place
     agent.context_rebase_enabled = compression_context_rebase
@@ -3045,6 +3061,7 @@ def init_agent(
             agent.enabled_toolsets is None
             or "context_engine" in agent.enabled_toolsets
         )
+        and "context_engine" not in (agent.disabled_toolsets or [])
     ):
         _existing_tool_names = {
             t.get("function", {}).get("name")
@@ -3075,6 +3092,11 @@ def init_agent(
 
     # Notify context engine of session start
     if hasattr(agent, "context_compressor") and agent.context_compressor:
+        _session_start_context = (
+            {"session_db": session_db}
+            if _engine_name == "ri-context-governor"
+            else {}
+        )
         try:
             agent.context_compressor.on_session_start(
                 agent.session_id,
@@ -3083,8 +3105,14 @@ def init_agent(
                 model=agent.model,
                 context_length=getattr(agent.context_compressor, "context_length", 0),
                 conversation_id=getattr(agent, "_gateway_session_key", None),
+                **_session_start_context,
             )
         except Exception as _ce_err:
+            if _engine_name == "ri-context-governor":
+                raise ContextEngineActivationError(
+                    f"configured context engine '{_engine_name}' failed its "
+                    f"session start: {_ce_err}"
+                ) from _ce_err
             _ra().logger.debug("Context engine on_session_start: %s", _ce_err)
 
     agent._subdirectory_hints = SubdirectoryHintTracker(
