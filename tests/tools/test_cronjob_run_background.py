@@ -14,6 +14,7 @@ Sync fallbacks preserved:
 """
 import json
 import threading
+from contextlib import contextmanager
 from unittest.mock import patch
 
 from tools.cronjob_tools import (
@@ -55,6 +56,62 @@ def _bound_session_key(key="agent:main:telegram:dm:123"):
     return _cm()
 
 
+def _claimed_with_receipt(job_id):
+    return {**_job(job_id), "fire_claim": {"by": "bg-owner"}}, object()
+
+
+@contextmanager
+def _background_runtime():
+    """Real admission, worker and queue with an inert ledger and joined futures."""
+    import sqlite3
+    import time
+
+    from tools import async_delegation as owner
+
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    owner._initialize_schema(conn)
+    transaction_lock = threading.RLock()
+
+    @contextmanager
+    def transaction():
+        with transaction_lock, conn:
+            yield conn
+
+    executor = owner._DaemonThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="cron-test-delegate"
+    )
+    original_submit = executor.submit
+    futures = []
+
+    def submit(*args, **kwargs):
+        future = original_submit(*args, **kwargs)
+        futures.append(future)
+        return future
+
+    with patch.object(owner, "_transaction", transaction), \
+         patch.object(owner, "_connect", side_effect=AssertionError("live ledger forbidden")), \
+         patch.object(owner, "_records", {}), \
+         patch.object(owner, "_get_executor", return_value=executor), \
+         patch.object(executor, "submit", side_effect=submit), \
+         patch("cron.executions.recover_interrupted_executions", return_value=0), \
+         patch("tools.cronjob_tools._latest_job_output_excerpt", return_value=None), \
+         patch("tools.cronjob_tools._notify_provider_jobs_changed_safe"), \
+         patch("tools.delegate_tool._get_max_async_children", return_value=1):
+        joined = False
+        try:
+            yield
+        finally:
+            deadline = time.monotonic() + 5.0
+            try:
+                for future in futures:
+                    future.result(timeout=max(0.0, deadline - time.monotonic()))
+                joined = True
+            finally:
+                executor.shutdown(wait=False)
+                if joined:
+                    conn.close()
+
+
 class TestBackgroundDispatch:
     def test_dispatches_and_returns_handle_immediately(self):
         """With a routable session, run claims sync then dispatches async."""
@@ -67,23 +124,23 @@ class TestBackgroundDispatch:
             return True
 
         with _bound_session_key():
-            with patch("tools.cronjob_tools.claim_job_for_fire", side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}) as m_claim, \
+            with patch("cron.jobs.claim_job_for_fire_with_unstarted_receipt", side_effect=_claimed_with_receipt) as m_claim, \
                  patch("cron.scheduler.run_one_job", side_effect=slow_run_one_job), \
                  patch("tools.cronjob_tools.get_job",
-                       return_value={"last_status": "ok", "last_error": None}):
-                res = _try_dispatch_background_run(_job('job-bg-01'))
-
-        try:
-            # Returned BEFORE the job finished — that's the whole point.
-            assert res is not None
-            assert res["claimed"] is True
-            assert res["dispatched"] is True
-            assert res["delegation_id"]
-            m_claim.assert_called_once_with("job-bg-01", return_job=True)
-            # The job actually starts on the daemon executor.
-            assert run_started.wait(timeout=5.0), "job never started in background"
-        finally:
-            run_release.set()
+                       return_value={"last_status": "ok", "last_error": None}), \
+                 _background_runtime():
+                try:
+                    res = _try_dispatch_background_run(_job('job-bg-01'))
+                    # Returned while the actual worker is still gated.
+                    assert res is not None
+                    assert res["claimed"] is True
+                    assert res["dispatched"] is True
+                    assert res["delegation_id"]
+                    m_claim.assert_called_once_with("job-bg-01")
+                    assert run_started.wait(timeout=5.0), "job never started in background"
+                    assert not run_release.is_set()
+                finally:
+                    run_release.set()
 
     def test_completion_event_reaches_shared_queue(self):
         """The finished run pushes a type='async_delegation' event carrying
@@ -95,11 +152,12 @@ class TestBackgroundDispatch:
         # The runner executes on a daemon thread — the patches must stay
         # active until the completion event lands, so poll INSIDE the blocks.
         with _bound_session_key("agent:main:telegram:dm:777"):
-            with patch("tools.cronjob_tools.claim_job_for_fire", side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}), \
+            with patch("cron.jobs.claim_job_for_fire_with_unstarted_receipt", side_effect=_claimed_with_receipt), \
                  patch("cron.scheduler.run_one_job", return_value=True), \
                  patch("tools.cronjob_tools.get_job",
                        return_value={"last_status": "ok", "last_error": None,
-                                     "next_run_at": "2026-08-07T09:00:00"}):
+                                     "next_run_at": "2026-08-07T09:00:00"}), \
+                 _background_runtime():
                 res = _try_dispatch_background_run(_job('job-bg-02'))
                 assert res["dispatched"] is True
 
@@ -128,11 +186,12 @@ class TestBackgroundDispatch:
         from tools.process_registry import process_registry
 
         with _bound_session_key("agent:main:telegram:dm:778"):
-            with patch("tools.cronjob_tools.claim_job_for_fire", side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}), \
+            with patch("cron.jobs.claim_job_for_fire_with_unstarted_receipt", side_effect=_claimed_with_receipt), \
                  patch("cron.scheduler.run_one_job", return_value=True), \
                  patch("tools.cronjob_tools.get_job",
                        return_value={"last_status": "error",
-                                     "last_error": "provider exploded"}):
+                                     "last_error": "provider exploded"}), \
+                 _background_runtime():
                 res = _try_dispatch_background_run(_job('job-bg-03'))
                 assert res["dispatched"] is True
 
@@ -156,13 +215,14 @@ class TestBackgroundDispatch:
         """Paused/already-firing jobs report in the tool response, not as a
         delayed completion event."""
         with _bound_session_key():
-            with patch("tools.cronjob_tools.claim_job_for_fire", return_value=False), \
+            with patch("cron.jobs.claim_job_for_fire_with_unstarted_receipt", return_value=None) as m_claim, \
                  patch("tools.cronjob_tools.get_job",
                        return_value={**_JOB, "enabled": False}), \
                  patch("tools.async_delegation.dispatch_async_delegation") as m_disp:
                 res = _try_dispatch_background_run(_job('job-bg-04'))
         assert res["claimed"] is False
         assert "paused/disabled" in res["error"]
+        m_claim.assert_called_once_with("job-bg-04")
         m_disp.assert_not_called()
 
 
@@ -245,7 +305,7 @@ class TestInFlightDedupe:
         assert sched.try_register_running_job("job-bg-10")
         try:
             with _bound_session_key():
-                with patch("tools.cronjob_tools.claim_job_for_fire") as m_claim, \
+                with patch("cron.jobs.claim_job_for_fire_with_unstarted_receipt") as m_claim, \
                      patch("tools.async_delegation.dispatch_async_delegation") as m_disp:
                     res = _try_dispatch_background_run(_job('job-bg-10'))
             assert res["claimed"] is False
@@ -278,11 +338,12 @@ class TestCronjobRunToolIntegration:
         """cronjob(action='run') surfaces the handle + do-not-wait note."""
         with _bound_session_key():
             with patch("tools.cronjob_tools.resolve_job_ref", return_value=_job('job-bg-12')), \
-                 patch("tools.cronjob_tools.claim_job_for_fire", side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}), \
+                 patch("cron.jobs.claim_job_for_fire_with_unstarted_receipt", side_effect=_claimed_with_receipt), \
                  patch("cron.scheduler.run_one_job", return_value=True), \
                  patch("tools.cronjob_tools.get_job",
                        return_value={"id": "job-bg-12", "name": "bg run",
-                                     "last_status": "ok", "last_error": None}):
+                                     "last_status": "ok", "last_error": None}), \
+                 _background_runtime():
                 out = json.loads(cronjob(action="run", job_id="job-bg-12"))
 
         assert out["success"] is True

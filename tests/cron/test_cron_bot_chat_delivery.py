@@ -144,7 +144,45 @@ def test_deliver_runs_canonical_bot_chat_lane():
     assert not any("the output" in str(a) for a in argv)
 
 
-def test_deliver_named_profile_uses_p_flag_and_clears_home():
+@pytest.fixture
+def named_delivery_profiles(tmp_path, monkeypatch):
+    from hermes_cli.env_loader import _record_external_secret_snapshot
+
+    root = tmp_path / "root"
+    source = root / "profiles" / "source"
+    target = root / "profiles" / "research"
+    source.mkdir(parents=True)
+    target.mkdir()
+    (root / ".env").write_text("ROOT_ONLY_TOKEN=synthetic-root\n")
+    (source / ".env").write_text(
+        "OPENAI_API_KEY=synthetic-source\n"
+        "GROQ_API_KEY=synthetic-source-only\n"
+        "SOURCE_CUSTOM=synthetic-custom\n"
+    )
+    (target / ".env").write_text("OPENAI_API_KEY=synthetic-target\n")
+    for home in (source, target):
+        (home / "config.yaml").write_text(
+            "security:\n  inherit_root_credentials: "
+            + ("true" if home == source else "false") + "\n"
+        )
+    _record_external_secret_snapshot(
+        source, data={"SOURCE_EXTERNAL_TOKEN": "synthetic-source-external"}, status="ready"
+    )
+    _record_external_secret_snapshot(
+        target, data={"ANTHROPIC_API_KEY": "synthetic-target-only"}, status="ready"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(source))
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-source")
+    monkeypatch.setenv("GROQ_API_KEY", "synthetic-source-only")
+    monkeypatch.setenv("SOURCE_CUSTOM", "synthetic-custom")
+    monkeypatch.setenv("SOURCE_EXTERNAL_TOKEN", "synthetic-source-external")
+    monkeypatch.setenv("ROOT_ONLY_TOKEN", "synthetic-root")
+    monkeypatch.setenv("SHELL_CONTROL", "synthetic-unowned")
+    return source, target
+
+
+def test_deliver_named_profile_uses_p_flag_and_target_authority(named_delivery_profiles):
+    _, target = named_delivery_profiles
     calls = {}
 
     def fake_run(argv, **kwargs):
@@ -153,15 +191,42 @@ def test_deliver_named_profile_uses_p_flag_and_clears_home():
         return _completed()
 
     with mock.patch.object(sched.subprocess, "run", side_effect=fake_run), \
-         mock.patch.object(sched.shutil, "which", return_value="/usr/bin/hermes"), \
-         mock.patch.dict(sched.os.environ, {"HERMES_HOME": "/tmp/other-profile"}):
+         mock.patch.object(sched.shutil, "which", return_value="/usr/bin/hermes"):
         err = _deliver_to_bot_chat({"id": "j1", "name": "n"}, "out", "research")
 
     assert err is None
     argv = calls["argv"]
     assert argv[1:3] == ["-p", "research"]
-    # -p owns resolution; the scheduler's own HERMES_HOME must not leak in.
-    assert "HERMES_HOME" not in calls["kwargs"]["env"]
+    env = calls["kwargs"]["env"]
+    assert env["HERMES_HOME"] == str(target)
+    assert env["OPENAI_API_KEY"] == "synthetic-target"
+    assert env["ANTHROPIC_API_KEY"] == "synthetic-target-only"
+    for name in ("GROQ_API_KEY", "SOURCE_CUSTOM", "SOURCE_EXTERNAL_TOKEN", "ROOT_ONLY_TOKEN"):
+        assert name not in env
+    assert env["SHELL_CONTROL"] == "synthetic-unowned"
+
+
+def test_deliver_named_profile_missing_authority_starts_no_child(tmp_path, monkeypatch):
+    source = tmp_path / "root" / "profiles" / "source"
+    source.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(source))
+    with mock.patch.object(sched.subprocess, "run") as child, \
+         mock.patch.object(sched.shutil, "which", return_value="/usr/bin/hermes"):
+        err = _deliver_to_bot_chat({"id": "j1"}, "out", "research")
+    assert err == "bot-chat delivery failed: profile authority unavailable"
+    child.assert_not_called()
+
+
+def test_deliver_named_profile_failed_snapshot_starts_no_child(named_delivery_profiles):
+    from hermes_cli.env_loader import _record_external_secret_snapshot
+
+    _, target = named_delivery_profiles
+    _record_external_secret_snapshot(target, data={}, status="failed", error_kind="synthetic")
+    with mock.patch.object(sched.subprocess, "run") as child, \
+         mock.patch.object(sched.shutil, "which", return_value="/usr/bin/hermes"):
+        err = _deliver_to_bot_chat({"id": "j1"}, "out", "research")
+    assert err == "bot-chat delivery failed: profile authority unavailable"
+    child.assert_not_called()
 
 
 def test_deliver_failure_returns_error_string():

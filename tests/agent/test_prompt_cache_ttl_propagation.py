@@ -13,6 +13,192 @@ pre-API preflight re-runs against the fallback's context window).
 
 import ast
 import inspect
+import copy
+from contextlib import ExitStack
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import pytest
+from tests.run_agent.test_run_agent import agent as canonical_minimal_agent
+
+
+@pytest.fixture
+def minimal_agent(request):
+    # Canonical constructor, with its metadata warm-up made inert as well.
+    with patch("agent.agent_init.fetch_model_metadata", return_value={}):
+        return request.getfixturevalue("canonical_minimal_agent")
+
+
+class TestFailoverConversationBehavior:
+    """Full-loop witnesses with canonical real-agent construction and inert LLMs."""
+
+    @staticmethod
+    def response(text):
+        return SimpleNamespace(id="inert", model="inert", usage=None,
+            choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(
+                content=text, tool_calls=None, reasoning=None, reasoning_content=None))])
+
+    @staticmethod
+    def prepare(item):
+        item._cached_system_prompt = "Model: primary\nProvider: openrouter\nAnswer the current question."
+        item.model = "g2-primary"
+        item.provider = "openrouter"
+        item._use_prompt_caching = False
+        item.save_trajectories = False
+        item.context_rebase_enabled = False
+        item.platform = "cron"
+        item._api_max_retries = 3
+        item.max_iterations = 4
+        item.tools = []
+        item._valid_tool_names = set()
+        item._cached_system_prompt_static = None
+        item.compression_checkpoint_required = False
+
+    @staticmethod
+    def external_boundaries(stack, item):
+        # Keep request building, preflight, dispatch and fallback real. Only
+        # unrelated persistence/display and external client creation are inert.
+        for name in ("_persist_session", "_save_trajectory", "_cleanup_task_resources",
+                     "_try_refresh_env_client_credentials", "_should_start_quiet_spinner"):
+            stack.enter_context(patch.object(item, name, return_value=False))
+        stack.enter_context(patch.object(item, "_create_request_openai_client", side_effect=lambda **_:item.client))
+        stack.enter_context(patch.object(item, "_create_openai_client", side_effect=lambda *_, **__:item.client))
+        stack.enter_context(patch("agent.auxiliary_client.get_model_context_length", return_value=64000))
+        stack.enter_context(patch("agent.model_metadata.fetch_model_metadata", return_value={}))
+
+    def test_smaller_window_fallback_rebuilds_and_compacts_before_dispatch(self, minimal_agent):
+        from agent import conversation_loop as loop
+        from agent.model_metadata import estimate_request_tokens_rough
+        item = minimal_agent
+        self.prepare(item)
+        item.compression_enabled = True
+        item.compression_in_place = False
+        compressor = item.context_compressor
+        compressor.protect_first_n = 1
+        compressor.protect_last_n = 2
+        compressor.update_model(model=item.model, context_length=256000,
+            base_url=item.base_url, api_key=item.api_key, provider=item.provider,
+            api_mode=item.api_mode, max_tokens=1024)
+        history = [{"role":"user" if i % 2 == 0 else "assistant",
+                    "content":f"historical row {i}: " + "long evidence " * 1800}
+                   for i in range(20)]
+        before = copy.deepcopy(history)
+        events, requests = [], []
+        primary, fallback = MagicMock(), MagicMock()
+        fallback.base_url = "https://fallback.invalid/v1"
+        primary.chat.completions.create.side_effect = lambda **kw: (
+            events.append(("dispatch", "primary")), requests.append(copy.deepcopy(kw)),
+            (_ for _ in ()).throw(ValueError("ordinary SDK validation failure")))[-1]
+        def complete(**kw):
+            events.append(("dispatch", "fallback"))
+            requests.append(copy.deepcopy(kw))
+            return self.response("fallback completed")
+        fallback.chat.completions.create.side_effect = complete
+        item.client = primary
+        item._fallback_chain = [dict(provider="openai", model="g2-fallback", api_key="inert-test-key",
+                                    base_url=str(fallback.base_url), api_mode="chat_completions")]
+        item._fallback_index = 0
+        def summary(**kw):
+            events.append(("summary", item.model))
+            return self.response("Task Snapshot: historical evidence reviewed.\nPending Asks: answer the current question.")
+        real_estimate = loop.estimate_messages_tokens_rough
+        def measure(*args, **kwargs):
+            result = real_estimate(*args, **kwargs)
+            events.append(("preflight", item.model, compressor.context_length, result))
+            return result
+        real_build = item._build_api_kwargs
+        def build(*args, **kwargs):
+            events.append(("build", item.model))
+            return real_build(*args, **kwargs)
+        with ExitStack() as stack:
+            self.external_boundaries(stack, item)
+            stack.enter_context(patch("agent.auxiliary_client.resolve_provider_client", return_value=(fallback,"g2-fallback")))
+            stack.enter_context(patch("agent.model_metadata.get_model_context_length", return_value=64000))
+            stack.enter_context(patch("agent.context_compressor.call_llm", side_effect=summary))
+            stack.enter_context(patch("agent.auxiliary_client.call_llm", side_effect=summary))
+            stack.enter_context(patch.object(loop, "estimate_messages_tokens_rough", side_effect=measure))
+            stack.enter_context(patch.object(item, "_build_api_kwargs", side_effect=build))
+            activation = stack.enter_context(patch.object(item, "_try_activate_fallback", wraps=item._try_activate_fallback))
+            result = item.run_conversation("Answer this current question.", conversation_history=history)
+        assert result["final_response"] == "fallback completed", (result, events)
+        assert activation.call_count == 1
+        assert len(requests) == 2
+        assert compressor.context_length == 64000
+        first = events.index(("dispatch", "primary"))
+        last = events.index(("dispatch", "fallback"))
+        pressure = [i for i,event in enumerate(events) if event[0] == "preflight" and event[1] == "g2-fallback"]
+        summaries = [i for i,event in enumerate(events) if event[0] == "summary"]
+        builds = [i for i,event in enumerate(events) if event == ("build", "g2-fallback")]
+        assert pressure and summaries and builds, events
+        assert first < pressure[0] < summaries[0] < builds[-1] < last, events
+        assert any(events[i][3] >= compressor.threshold_tokens for i in pressure), events
+        assert estimate_request_tokens_rough(requests[1]["messages"], tools=requests[1].get("tools")) < compressor.threshold_tokens
+        assert requests[0]["messages"] != requests[1]["messages"]
+        assert history == before, "request rebuilding mutated the caller's history"
+
+    def test_typed_native_refusal_has_no_provider_or_fallback_attempt(self, minimal_agent):
+        from agent.transports import ri_llm
+        from agent import chat_completion_helpers as helpers
+        item = minimal_agent
+        self.prepare(item)
+        item.compression_enabled = False
+        item.provider = "ollama-launch"
+        item.api_key = "no-key-required"
+        item.base_url = "http://inert.invalid/v1"
+        item._client_kwargs = {"api_key":item.api_key, "base_url":item.base_url}
+        item._fallback_chain = [dict(provider="openai", model="unused", api_key="inert-test-key")]
+        ri_llm.configure_ri_pipeline(item, {"agent":{"llm_pipeline":{"enabled":True}}})
+        with ExitStack() as stack:
+            self.external_boundaries(stack, item)
+            unused_client = MagicMock()
+            unused_client.base_url = "https://unused.invalid/v1"
+            stack.enter_context(patch("agent.auxiliary_client.resolve_provider_client", return_value=(unused_client,"unused")))
+            stack.enter_context(patch("agent.model_metadata.get_model_context_length", return_value=64000))
+            native_pipeline, native_config = MagicMock(), MagicMock()
+            stack.enter_context(patch.multiple(ri_llm, create=True,
+                _NATIVE_AVAILABLE=True, _NativePipeline=native_pipeline, LlmConfig=native_config))
+            selected = stack.enter_context(patch.object(helpers, "ri_pipeline_chat_completion", wraps=helpers.ri_pipeline_chat_completion))
+            activation = stack.enter_context(patch.object(item, "_try_activate_fallback", wraps=item._try_activate_fallback))
+            result = item.run_conversation("Question requiring unsupported chat history.",
+                conversation_history=[{"role":"user","content":"prior"},{"role":"assistant","content":"answer"}])
+            assert "RI_PIPELINE_REQUEST_UNSUPPORTED" in result.get("error", ""), result
+            assert result.get("failed") is True
+            assert selected.call_count == 1
+            activation.assert_not_called()
+            item.client.chat.completions.create.assert_not_called()
+            native_pipeline.assert_not_called()
+            native_config.assert_not_called()
+            unused_client.chat.completions.create.assert_not_called()
+
+    def test_exhausted_real_preflight_prevents_dispatch(self, minimal_agent):
+        from agent.context_compressor import ContextCompressor
+        from ares_runtime.continuity.runtime import ContextDispatchError
+        item = minimal_agent
+        self.prepare(item)
+        item.compression_enabled = True
+        # Real compressor policy with a history too short to summarize. Its
+        # real no-progress result must stop admission before provider dispatch.
+        compressor = item.context_compressor
+        assert isinstance(compressor, ContextCompressor)
+        compressor.update_model(model=item.model, context_length=64000,
+            base_url=item.base_url, api_key=item.api_key, provider=item.provider,
+            api_mode=item.api_mode, max_tokens=1024)
+        history = [{"role":"user","content":"historical evidence " * 17000},
+                   {"role":"assistant","content":"historical response " * 17000}]
+        item.client.chat.completions.create.return_value = self.response("unexpected admission")
+        with ExitStack() as stack:
+            self.external_boundaries(stack, item)
+            compression = stack.enter_context(patch.object(item, "_compress_context", wraps=item._compress_context))
+            summary = stack.enter_context(patch("agent.context_compressor.call_llm", side_effect=AssertionError("short history must not call summarizer")))
+            build = stack.enter_context(patch.object(item, "_build_api_kwargs", wraps=item._build_api_kwargs))
+            dispatch = stack.enter_context(patch.object(item, "_interruptible_api_call", wraps=item._interruptible_api_call))
+            with pytest.raises(ContextDispatchError, match="CONTEXT_PREFLIGHT_EXHAUSTED"):
+                item.run_conversation("Answer the current question.", conversation_history=history)
+            assert compression.call_count >= 1
+            summary.assert_not_called()
+            build.assert_not_called()
+            dispatch.assert_not_called()
+            item.client.chat.completions.create.assert_not_called()
 
 
 def _collect_cache_controls(obj):

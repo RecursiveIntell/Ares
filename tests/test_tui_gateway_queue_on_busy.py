@@ -604,13 +604,13 @@ def test_busy_image_prompts_keep_b_and_c_attachments_in_submission_order(monkeyp
             "drain-b",
             "sid",
             "B",
-            {"image_paths": ["/tmp/b.png"], "queued_prompt_generation": 0},
+            {"image_paths": ["/tmp/b.png"], "queued_prompt_generation": 0, "turn_transport": None},
         ),
         (
             "drain-c",
             "sid",
             "C",
-            {"image_paths": ["/tmp/c.png"], "queued_prompt_generation": 0},
+            {"image_paths": ["/tmp/c.png"], "queued_prompt_generation": 0, "turn_transport": None},
         ),
     ]
 
@@ -741,15 +741,21 @@ def test_drain_does_not_clear_stop_after_its_final_generation_check(monkeypatch)
     class _Agent:
         clear_calls = 0
 
+        interrupt_calls = 0
+
         def clear_interrupt(self):
             self.clear_calls += 1
 
+        def interrupt(self):
+            self.interrupt_calls += 1
+
     agent = _Agent()
     session = _session(agent=agent, queued_prompt={"text": "B", "transport": None})
+    monkeypatch.setitem(server._sessions, "sid", session)
     original_run = server._run_prompt_submit
 
     def stop_before_run(*args, **kwargs):
-        session["_queued_prompt_generation"] = 1
+        assert server._interrupt_session_turn("sid", session) is False
         return original_run(*args, **kwargs)
 
     monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: False)
@@ -757,7 +763,11 @@ def test_drain_does_not_clear_stop_after_its_final_generation_check(monkeypatch)
 
     assert server._drain_queued_prompt("r1", "sid", session) is True
     assert agent.clear_calls == 0
+    assert agent.interrupt_calls == 1
     assert session["running"] is False
+    assert session["_turn_cancel_requested"] is True
+    assert session["_queued_prompt_generation"] == session["_last_stop_queue_generation"] == 1
+    assert session["queued_prompt"] is None
 
 
 def test_drain_continues_with_later_queued_prompt_after_dispatch_failure(monkeypatch):
@@ -775,6 +785,7 @@ def test_drain_continues_with_later_queued_prompt_after_dispatch_failure(monkeyp
         queued_prompts=[{"text": "next", "image_paths": ["/tmp/next.png"], "transport": None}],
     )
 
+    monkeypatch.setitem(server._sessions, "sid", session)
     assert server._drain_queued_prompt("r1", "sid", session) is True
     assert calls == ["broken", "next"]
     assert session["queued_prompt"] is None

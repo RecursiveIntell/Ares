@@ -14034,7 +14034,9 @@ def _run_prompt_submit(
         admission = inflight.get("started_at") if isinstance(inflight, dict) else None
         admission_generation = int(session.get("_queued_prompt_generation", 0))
         admission_owner_transport = session.get("transport")
-        admission_transport = turn_transport or current_transport() or admission_owner_transport
+        # A caller can inherit another session's RPC context. The accepted
+        # envelope and captured session owner take precedence over that fallback.
+        admission_transport = turn_transport or admission_owner_transport or current_transport()
         admission_window = session.get("_turn_outcomes")
         admission_nonce = (admission_window.turns[-1]["accepted_turn"]["request_id"]
             if isinstance(admission_window, TurnOutcomeWindow)

@@ -2,12 +2,199 @@
 import concurrent.futures
 import math
 import os
+import subprocess
 import sys
+import textwrap
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+from pathlib import Path
 
 from agent.transports import ri_llm as owner
+
+
+class OptionalNativeImportContract(unittest.TestCase):
+    def _fresh_dispatch(self, state):
+        script = textwrap.dedent('''
+            import importlib.abc
+            import importlib.util
+            import json
+            from pathlib import Path
+            import sys
+            from types import SimpleNamespace
+            import unittest
+
+            state, root, contract_path = sys.argv[1:]
+            sys.path.insert(0, root)
+            attempted, native_calls, sdk_calls = [], [], []
+            class ControlledConfig:
+                def __init__(self, **values): self.values = values
+            class ControlledPipeline:
+                def __init__(self, url, model, *, config):
+                    native_calls.append((url, model, config.values))
+                def call(self, prompt, *, system=None, config=None):
+                    return "controlled native answer"
+            class OptionalLoader(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+                def find_spec(self, fullname, path=None, target=None):
+                    if fullname == "llm_pipeline" or fullname.startswith("llm_pipeline."):
+                        attempted.append(fullname)
+                        if state == "absent":
+                            raise ModuleNotFoundError("controlled package absence", name=fullname)
+                        return importlib.util.spec_from_loader(fullname, self,
+                            is_package=(fullname == "llm_pipeline"))
+                    return None
+                def create_module(self, spec): return None
+                def exec_module(self, module):
+                    if module.__name__ == "llm_pipeline._native":
+                        if state == "import_error":
+                            raise ImportError("controlled extension loader failure")
+                        module.LlmConfig, module.Pipeline = ControlledConfig, ControlledPipeline
+            def no_network(event, args):
+                if event in {"socket.connect", "socket.sendto", "socket.getaddrinfo", "os.system"}:
+                    raise AssertionError("external effect denied: " + event)
+            sys.addaudithook(no_network)
+            sys.meta_path.insert(0, OptionalLoader())
+            from agent.transports import ri_llm as fresh
+            from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
+            assert attempted, "native import boundary was not exercised"
+            assert fresh._NATIVE_AVAILABLE is (state == "present")
+            assert hasattr(fresh, "_NativePipeline") is (state == "present")
+            assert hasattr(fresh, "LlmConfig") is (state == "present")
+            def sdk_create(**payload):
+                sdk_calls.append(payload)
+                return SimpleNamespace(id="inert-sdk")
+            client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=sdk_create)))
+            item = SimpleNamespace(provider="ollama-launch", api_mode="chat_completions",
+                base_url="http://inert.invalid/v1", model="inert", api_key="no-key-required",
+                _ri_pipeline_enabled=True, _ri_pipeline_explicit=False, _ri_pipeline_providers=[])
+            payload = dict(model="inert", messages=[{"role":"user", "content":"hi"}], temperature=0, max_tokens=7)
+            def dispatch(data):
+                return _dispatch_nonstreaming_api_request(item, data, make_client=lambda *_:client)
+            if state == "present":
+                assert fresh._should_use_ri_pipeline(item, payload) is True
+                assert dispatch(dict(payload)).choices[0].message.content == "controlled native answer"
+                assert len(native_calls) == 1 and sdk_calls == []
+                unsupported = dict(payload, tools=[{"type":"function", "function":{"name":"inert"}}])
+                assert fresh._should_use_ri_pipeline(item, unsupported) is False
+                assert dispatch(dict(unsupported)).id == "inert-sdk"
+                assert len(native_calls) == 1 and len(sdk_calls) == 1
+                item._ri_pipeline_explicit = True
+                try: dispatch(dict(unsupported))
+                except ValueError as error: assert "RI_PIPELINE_REQUEST_UNSUPPORTED" in str(error)
+                else: raise AssertionError("explicit unsupported request did not refuse")
+                assert len(native_calls) == 1 and len(sdk_calls) == 1
+                # Exercise the original 27 methods after a real successful
+                # controlled import, then verify fixture restoration.
+                spec = importlib.util.spec_from_file_location("fresh_contract", contract_path)
+                contract = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(contract)
+                suite = unittest.defaultTestLoader.loadTestsFromTestCase(contract.TransportContract)
+                result = unittest.TextTestRunner(verbosity=0).run(suite)
+                assert result.wasSuccessful() and result.testsRun == 27
+                assert fresh._NativePipeline is ControlledPipeline
+                assert fresh.LlmConfig is ControlledConfig and fresh._NATIVE_AVAILABLE is True
+            else:
+                for explicit in (False, True):
+                    item._ri_pipeline_explicit = explicit
+                    assert fresh._should_use_ri_pipeline(item, payload) is False
+                    assert dispatch(dict(payload)).id == "inert-sdk"
+                assert native_calls == [] and len(sdk_calls) == 2
+                assert not hasattr(fresh, "_NativePipeline") and not hasattr(fresh, "LlmConfig")
+            print(json.dumps(dict(state=state, import_attempts=attempted,
+                native_dispatches=len(native_calls), sdk_dispatches=len(sdk_calls))))
+        ''')
+        result = subprocess.run(
+            [sys.executable, "-I", "-B", "-c", script, state,
+             str(Path(owner.__file__).resolve().parents[2]), __file__],
+            env={"PATH": os.defpath, "PYTHONDONTWRITEBYTECODE": "1",
+                 "HERMES_HOME": os.environ.get("HERMES_HOME", "")},
+            capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_fresh_absent_import_dispatches_sdk_with_zero_native_calls(self):
+        self._fresh_dispatch("absent")
+
+    def test_fresh_present_exports_qualify_actual_dispatch_and_existing_contract(self):
+        self._fresh_dispatch("present")
+
+    def test_fresh_extension_import_error_dispatches_sdk_with_zero_native_calls(self):
+        self._fresh_dispatch("import_error")
+
+    def test_setup_failure_after_native_patch_restores_environment_and_symbols(self):
+        environment = dict(os.environ)
+        missing = object()
+        fields = ("_NATIVE_AVAILABLE", "_NativePipeline", "LlmConfig")
+        originals = {name:getattr(owner, name, missing) for name in fields}
+        case = TransportContract("test_default_unknown_provider_retains_sdk_route")
+        real_enter = case.enterContext
+        entries = []
+        def enter_then_fail(context):
+            value = real_enter(context)
+            entries.append(context)
+            if len(entries) == 2:
+                self.assertIs(owner._NativePipeline, NativePipeline)
+                self.assertIs(owner.LlmConfig, NativeConfig)
+                self.assertTrue(owner._NATIVE_AVAILABLE)
+                raise RuntimeError("fault after native patch entry")
+            return value
+        case.enterContext = enter_then_fail
+        result = unittest.TestResult()
+        case.run(result)
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(len(result.errors), 1)
+        self.assertIn("fault after native patch entry", result.errors[0][1])
+        self.assertEqual(dict(os.environ), environment)
+        for name, previous in originals.items():
+            if previous is missing:
+                self.assertFalse(hasattr(owner, name), name)
+            else:
+                self.assertIs(getattr(owner, name), previous)
+
+    def test_cold_import_without_optional_native_retains_sdk(self):
+        script = textwrap.dedent('''
+            import importlib.util
+            import sys
+            from types import SimpleNamespace
+
+            attempted = []
+            class DeniedOptionalImport:
+                def find_spec(self, fullname, path=None, target=None):
+                    if fullname == "llm_pipeline" or fullname.startswith("llm_pipeline."):
+                        attempted.append(fullname)
+                        raise ModuleNotFoundError("controlled optional-native absence", name=fullname)
+                    return None
+
+            sys.meta_path.insert(0, DeniedOptionalImport())
+            spec = importlib.util.spec_from_file_location("cold_ri_llm", sys.argv[1])
+            fresh = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(fresh)
+            assert attempted, "optional import was not exercised"
+            assert fresh._NATIVE_AVAILABLE is False
+            assert not hasattr(fresh, "_NativePipeline")
+            assert not hasattr(fresh, "LlmConfig")
+            for explicit in (False, True):
+                item = SimpleNamespace(provider="ollama-launch", _ri_pipeline_enabled=True,
+                                       _ri_pipeline_explicit=explicit, _ri_pipeline_providers=[])
+                assert fresh._should_use_ri_pipeline(item, {}) is False
+            pipeline = fresh.RiPipeline("http://inert.invalid", "inert")
+            assert pipeline.available is False
+            assert fresh.RiLlmConfig()._to_native() is None
+            try:
+                pipeline.call("inert")
+            except RuntimeError as error:
+                assert "not installed" in str(error)
+            else:
+                raise AssertionError("unavailable native pipeline accepted a call")
+            assert not hasattr(fresh, "_NativePipeline")
+            assert not hasattr(fresh, "LlmConfig")
+        ''')
+        result = subprocess.run(
+            [sys.executable, "-I", "-B", "-c", script, owner.__file__],
+            env={"PATH": os.defpath, "PYTHONDONTWRITEBYTECODE": "1"},
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 class NativeConfig:
@@ -47,16 +234,12 @@ def request(**overrides):
 
 class TransportContract(unittest.TestCase):
     def setUp(self):
-        self.environment = patch.dict(os.environ, {}, clear=True)
-        self.environment.start()
-        self.native = patch.multiple(owner, _NATIVE_AVAILABLE=True,
-                                     _NativePipeline=NativePipeline, LlmConfig=NativeConfig)
-        self.native.start()
+        self.enterContext(patch.dict(os.environ, {}, clear=True))
+        self.enterContext(patch.multiple(
+            owner, create=True, _NATIVE_AVAILABLE=True,
+            _NativePipeline=NativePipeline, LlmConfig=NativeConfig,
+        ))
         NativePipeline.calls = []
-
-    def tearDown(self):
-        self.native.stop()
-        self.environment.stop()
 
     def qualify(self, item, config):
         owner.configure_ri_pipeline(item, config)
