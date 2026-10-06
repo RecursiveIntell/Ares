@@ -61,6 +61,225 @@ def _repository(path: Path) -> Path:
     return path
 
 
+@pytest.fixture
+def gateway_stop_case(tmp_path: Path, monkeypatch):
+    from gateway import status
+
+    runtime = _runtime(tmp_path)
+    source = _release(runtime, "a" * 40)
+    python = source / ".venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.touch()
+    runtime._activate("a" * 40)
+    home = runtime.paths.agent_home
+    home.mkdir()
+    pid, start = 987654, 1200
+    record = {
+        "pid": pid,
+        "start_time": start,
+        "kind": "hermes-gateway",
+        "argv": ["python", "-m", "hermes_cli.main", "gateway", "run"],
+        "hermes_home": str(home),
+    }
+    for name in ("gateway.pid", "gateway.lock"):
+        (home / name).write_text(json.dumps(record))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(status, "_is_gateway_runtime_lock_active_strict", lambda _path: True)
+    monkeypatch.setattr(status, "_pid_exists", lambda candidate: candidate == pid)
+    monkeypatch.setattr(status, "_get_process_start_time", lambda _pid: start)
+    monkeypatch.setattr(status, "_read_process_cmdline", lambda _pid: " ".join(record["argv"]))
+    return SimpleNamespace(runtime=runtime, source=source, home=home,
+                           status=status, pid=pid, start=start, record=record)
+
+
+def _gateway_stop_child(case, monkeypatch, events):
+    import ares_runtime.local_runtime as local_runtime
+
+    def run(command, **kwargs):
+        assert command[:2] == [str(case.source / ".venv/bin/python"), "-c"]
+        assert kwargs["cwd"] == case.source
+        assert kwargs["env"]["HERMES_HOME"] == str(case.home.resolve())
+        assert kwargs["timeout"] == 10
+        events.append("prepare")
+        # Emulate the child's process environment without launching a process.
+        with monkeypatch.context() as child:
+            child.setenv("HERMES_HOME", kwargs["env"]["HERMES_HOME"])
+            try:
+                exec(command[-1], {})
+            except AresLocalRuntimeError as exc:
+                return SimpleNamespace(returncode=1, stdout="", stderr=str(exc))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(local_runtime.subprocess, "run", run)
+    monkeypatch.setattr(case.runtime, "_systemctl",
+                        lambda *args, **kwargs: events.append(args) or True)
+
+
+def test_gateway_stop_publishes_verified_marker_before_service_stop(gateway_stop_case, monkeypatch):
+    case = gateway_stop_case
+    events = []
+    _gateway_stop_child(case, monkeypatch, events)
+    case.runtime.gateway("stop")
+
+    assert events == ["prepare", ("disable", "--now", "ares-gateway.service")]
+    marker = json.loads((case.home / ".gateway-planned-stop.json").read_text())
+    assert (marker["target_pid"], marker["target_start_time"]) == (case.pid, case.start)
+    with monkeypatch.context() as consumer:
+        consumer.setattr(case.status.os, "getpid", lambda: case.pid)
+        assert case.status.consume_planned_stop_marker_for_self() is True
+
+
+def test_gateway_stop_keeps_isolated_unit_routing(gateway_stop_case, monkeypatch):
+    from dataclasses import replace
+    import ares_runtime.local_runtime as local_runtime
+
+    case = gateway_stop_case
+    case.runtime = AresLocalRuntime(replace(case.runtime.paths, unit_path=case.home / "offline-stop.service"))
+    events = []
+    _gateway_stop_child(case, monkeypatch, events)
+    child_run = local_runtime.subprocess.run
+    monkeypatch.setattr(case.runtime, "_systemctl", AresLocalRuntime._systemctl.__get__(case.runtime))
+    monkeypatch.setattr(local_runtime.shutil, "which", lambda _name: "/usr/bin/systemctl")
+
+    def run(command, **kwargs):
+        if command[0] != "systemctl":
+            return child_run(command, **kwargs)
+        assert (case.home / ".gateway-planned-stop.json").is_file()
+        events.append(command)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(local_runtime.subprocess, "run", run)
+    case.runtime.gateway("stop")
+    assert events == ["prepare", ["systemctl", "--user", "disable", "--now", "offline-stop.service"]]
+
+
+@pytest.mark.parametrize("boundary", ["stale_start", "dead_pid", "wrong_pid", "wrong_role"])
+def test_gateway_stop_rejects_stale_or_disagreeing_identity(gateway_stop_case, monkeypatch, boundary):
+    case = gateway_stop_case
+    if boundary == "stale_start":
+        monkeypatch.setattr(case.status, "_get_process_start_time", lambda _pid: case.start + 1)
+    elif boundary == "dead_pid":
+        monkeypatch.setattr(case.status, "_pid_exists", lambda _pid: False)
+    elif boundary == "wrong_pid":
+        record = dict(case.record, pid=case.pid + 1)
+        (case.home / "gateway.lock").write_text(json.dumps(record))
+    else:
+        monkeypatch.setattr(case.status, "_read_process_cmdline", lambda _pid: "python -m hermes_cli.main serve")
+    events = []
+    _gateway_stop_child(case, monkeypatch, events)
+    with pytest.raises(AresLocalRuntimeError, match="identity"):
+        case.runtime.gateway("stop")
+    assert events == ["prepare"]
+    assert not (case.home / ".gateway-planned-stop.json").exists()
+
+
+@pytest.mark.parametrize("record_name", ["gateway.pid", "gateway.lock", "live_profile"])
+def test_gateway_stop_rejects_foreign_home(gateway_stop_case, monkeypatch, tmp_path, record_name):
+    case = gateway_stop_case
+    if record_name == "live_profile":
+        monkeypatch.setattr(case.status, "_read_process_cmdline", lambda _pid: "python -m hermes_cli.main --profile other gateway run")
+    else:
+        record = dict(case.record, hermes_home=str(tmp_path / "foreign-home"))
+        (case.home / record_name).write_text(json.dumps(record))
+    events = []
+    _gateway_stop_child(case, monkeypatch, events)
+    with pytest.raises(AresLocalRuntimeError, match="home"):
+        case.runtime.gateway("stop")
+    assert events == ["prepare"]
+    assert not (case.home / ".gateway-planned-stop.json").exists()
+
+
+def test_gateway_stop_rejects_identity_change_before_publication(gateway_stop_case, monkeypatch):
+    case = gateway_stop_case
+    identities = iter(((case.pid, case.start), (case.pid, case.start + 1)))
+    monkeypatch.setattr(case.status, "get_running_pid_identity_strict", lambda _path: next(identities))
+    events = []
+    _gateway_stop_child(case, monkeypatch, events)
+    with pytest.raises(AresLocalRuntimeError, match="identity"):
+        case.runtime.gateway("stop")
+    assert events == ["prepare"]
+    assert not (case.home / ".gateway-planned-stop.json").exists()
+
+
+def test_gateway_stop_aborts_when_marker_publication_fails(gateway_stop_case, monkeypatch):
+    case = gateway_stop_case
+    monkeypatch.setattr(case.status, "write_planned_stop_marker", lambda _pid: False)
+    events = []
+    _gateway_stop_child(case, monkeypatch, events)
+    with pytest.raises(AresLocalRuntimeError, match="marker"):
+        case.runtime.gateway("stop")
+    assert events == ["prepare"]
+
+
+def test_gateway_stop_without_a_runtime_owner_does_not_create_marker(gateway_stop_case, monkeypatch):
+    case = gateway_stop_case
+    (case.home / "gateway.pid").unlink()
+    (case.home / "gateway.lock").unlink()
+    events = []
+    _gateway_stop_child(case, monkeypatch, events)
+    case.runtime.gateway("stop")
+    assert events == ["prepare", ("disable", "--now", "ares-gateway.service")]
+    assert not (case.home / ".gateway-planned-stop.json").exists()
+
+
+def test_gateway_stop_preserves_caller_environment_and_profile_context(gateway_stop_case, monkeypatch, tmp_path):
+    from hermes_constants import get_hermes_home, reset_hermes_home_override, set_hermes_home_override
+
+    case = gateway_stop_case
+    ambient_home = tmp_path / "ambient-home"
+    monkeypatch.setenv("HERMES_HOME", str(ambient_home))
+    monkeypatch.setenv("PYTHONPATH", "ambient-python-path")
+    profile = tmp_path / "context-profile"
+    token = set_hermes_home_override(profile)
+    before = dict(os.environ)
+    try:
+        events = []
+        _gateway_stop_child(case, monkeypatch, events)
+        case.runtime.gateway("stop")
+        assert dict(os.environ) == before
+        assert get_hermes_home() == profile
+        assert (case.home / ".gateway-planned-stop.json").is_file()
+        assert not (ambient_home / ".gateway-planned-stop.json").exists()
+        assert not (profile / ".gateway-planned-stop.json").exists()
+    finally:
+        reset_hermes_home_override(token)
+
+
+@pytest.mark.parametrize("failure", [OSError("synthetic launch failure"), subprocess.TimeoutExpired("synthetic", 10)])
+def test_gateway_stop_preparation_failure_never_calls_service(gateway_stop_case, monkeypatch, failure):
+    case = gateway_stop_case
+    before = dict(os.environ)
+    monkeypatch.setattr("ares_runtime.local_runtime.subprocess.run",
+                        lambda *args, **kwargs: (_ for _ in ()).throw(failure))
+    calls = []
+    monkeypatch.setattr(case.runtime, "_systemctl", lambda *args, **kwargs: calls.append(args))
+    with pytest.raises(AresLocalRuntimeError, match="stop"):
+        case.runtime.gateway("stop")
+    assert calls == []
+    assert dict(os.environ) == before
+
+
+@pytest.mark.parametrize("mismatch", ["stale", "pid", "start", "home"])
+def test_gateway_stop_marker_owner_rejects_stale_or_wrong_consumer(gateway_stop_case, monkeypatch, tmp_path, mismatch):
+    import ares_runtime.local_runtime as local_runtime
+
+    case = gateway_stop_case
+    local_runtime._prepare_gateway_stop_marker()
+    path = case.home / ".gateway-planned-stop.json"
+    marker = json.loads(path.read_text())
+    if mismatch == "stale":
+        marker["written_at"] = "2000-01-01T00:00:00+00:00"
+    elif mismatch == "pid":
+        marker["target_pid"] += 1
+    elif mismatch == "start":
+        marker["target_start_time"] += 1
+    else:
+        marker["target_hermes_home"] = str(tmp_path / "foreign-consumer")
+    path.write_text(json.dumps(marker))
+    monkeypatch.setattr(case.status.os, "getpid", lambda: case.pid)
+    assert case.status.consume_planned_stop_marker_for_self() is False
+
+
 def test_current_link_is_the_only_active_runtime_pointer(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path)
     first = "a" * 40
