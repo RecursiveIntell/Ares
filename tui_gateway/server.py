@@ -6202,7 +6202,9 @@ def _is_pivot_marker(entry: Any) -> bool:
     return isinstance(entry, dict) and entry.get("display_kind") == "personality_switch"
 
 
-def _append_model_switch_marker(session: dict | None, *, model: str, provider: str) -> None:
+def _append_model_switch_marker(
+    session: dict | None, *, model: str, provider: str, history_lock_held: bool = False,
+) -> None:
     """Record a real system-history pivot after a live model switch.
 
     Only the most recent marker is kept: each new switch first strips any
@@ -6238,7 +6240,7 @@ def _append_model_switch_marker(session: dict | None, *, model: str, provider: s
         session["history_version"] = int(session.get("history_version", 0)) + 1
 
     lock = session.get("history_lock")
-    if lock is not None:
+    if lock is not None and not history_lock_held:
         with lock:
             _replace_markers()
     else:
@@ -6757,6 +6759,8 @@ def _apply_model_switch(
     pin_session_override: bool = True,
     parsed_flags: Any | None = None,
     persist_override: bool | None = None,
+    defer_if_running: bool = False,
+    supersede_pending: bool | None = None,
 ) -> dict:
     from hermes_cli.model_switch import (
         parse_model_switch_args,
@@ -6797,6 +6801,13 @@ def _apply_model_switch(
         raise ValueError("model value required")
 
     agent = session.get("agent")
+    owner_transport = session.get("transport")
+    # Existing restore/adoption/MoA callers explicitly suppress persistence;
+    # the picker marks manual intent, and the pending consumer opts out.
+    # A direct user /model choice otherwise keeps the pinning default.
+    if supersede_pending is None:
+        supersede_pending = pin_session_override and persist_override is None
+    superseded_pending = session.get("pending_model_switch") if supersede_pending else None
     if one_turn and not agent:
         raise ValueError("/model --once requires a live session")
     if agent:
@@ -6855,8 +6866,6 @@ def _apply_model_switch(
     if not result.success:
         raise ValueError(result.error_message or "model switch failed")
 
-    restore_snapshot = _snapshot_agent_model_runtime(agent) if (one_turn and agent) else None
-
     if agent:
         try:
             from hermes_cli.context_switch_guard import merge_preflight_compression_warning
@@ -6903,37 +6912,68 @@ def _apply_model_switch(
                 "confirm_message": confirm_msg,
             }
 
-    if agent:
-        try:
-            agent.switch_model(
-                new_model=result.new_model,
-                new_provider=result.target_provider,
-                api_key=result.api_key,
-                base_url=result.base_url,
-                api_mode=result.api_mode,
+    model_commit_lock = session.get("history_lock")
+    pending_publication = None
+    with model_commit_lock if model_commit_lock is not None else contextlib.nullcontext():
+        if defer_if_running:
+            if (_sessions.get(sid) is not session or session.get("agent") is not agent
+                    or session.get("transport") is not owner_transport):
+                raise ValueError("session owner changed; model request not applied")
+            if session.get("running"):
+                session["pending_model_switch"] = {
+                    "raw": raw_input,
+                    "confirm_expensive_model": confirm_expensive_model,
+                    "display_model": result.new_model,
+                    "display_provider": result.target_provider,
+                    "after_inflight_turn": session.get("inflight_turn"),
+                }
+                return {
+                    "value": result.new_model, "warning": result.warning_message or "",
+                    "confirm_required": False, "confirm_message": "", "deferred": True,
+                    "scope": "once" if one_turn else ("global" if persist_global else "session"),
+                }
+        restore_snapshot = None
+        if one_turn and agent:
+            queued_restore = session.get("one_turn_model_restore")
+            queued_runtime = session.get("_one_turn_model_runtime")
+            if (queued_restore and _owns_one_turn_model_runtime(session, agent, queued_runtime)
+                    and not queued_runtime.get("active")):
+                # Replacing an unused once choice changes its one eligible
+                # turn, not the original durable/runtime restoration target.
+                restore_snapshot = queued_restore
+            else:
+                restore_snapshot = _snapshot_agent_model_runtime(agent)
+
+        if agent:
+            try:
+                agent.switch_model(
+                    new_model=result.new_model,
+                    new_provider=result.target_provider,
+                    api_key=result.api_key,
+                    base_url=result.base_url,
+                    api_mode=result.api_mode,
+                )
+            except Exception as exc:
+                # The in-place swap rolled the agent back to the old working
+                # model/client and re-raised.  Abort the commit: do NOT restart the
+                # slash worker, persist runtime, append the switch marker, set a
+                # session model_override, or persist to config — all of which would
+                # otherwise leave the session pinned to a broken model and kill the
+                # conversation on the next turn (#50163).  A failed switch is a
+                # no-op; surface a clean error to the client.
+                logger.warning("In-place model switch failed for TUI agent: %s", exc)
+                raise ValueError(
+                    f"Model switch to {result.new_model} failed ({exc}); "
+                    f"staying on {getattr(agent, 'model', current_model)}."
+                ) from exc
+            _persist_live_session_runtime(session)
+            _persist_live_session_system_prompt(session)
+            _append_model_switch_marker(
+                session, model=result.new_model, provider=result.target_provider,
+                history_lock_held=model_commit_lock is not None,
             )
-        except Exception as exc:
-            # The in-place swap rolled the agent back to the old working
-            # model/client and re-raised.  Abort the commit: do NOT restart the
-            # slash worker, persist runtime, append the switch marker, set a
-            # session model_override, or persist to config — all of which would
-            # otherwise leave the session pinned to a broken model and kill the
-            # conversation on the next turn (#50163).  A failed switch is a
-            # no-op; surface a clean error to the client.
-            logger.warning("In-place model switch failed for TUI agent: %s", exc)
-            raise ValueError(
-                f"Model switch to {result.new_model} failed ({exc}); "
-                f"staying on {getattr(agent, 'model', current_model)}."
-            ) from exc
-        _restart_slash_worker(sid, session)
-        _persist_live_session_runtime(session)
-        _persist_live_session_system_prompt(session)
-        _append_model_switch_marker(
-            session, model=result.new_model, provider=result.target_provider
-        )
-        # The turn consumer uses this lock: snapshot and ownership must become
-        # visible (or retire) together, never as a partially published lease.
-        with session["history_lock"]:
+            # The turn consumer uses this lock: snapshot and ownership must become
+            # visible (or retire) together, never as a partially published lease.
             if one_turn:
                 session["one_turn_model_restore"] = restore_snapshot
                 session["_one_turn_model_runtime"] = {
@@ -6943,36 +6983,82 @@ def _apply_model_switch(
                 session.pop("one_turn_model_restore", None)
                 session.pop("_one_turn_model_runtime", None)
 
-    # Record the switch as a PER-SESSION override so a later rebuild of THIS
-    # session (e.g. /new via _reset_session_agent, or resume) re-derives the
-    # user's chosen model/provider instead of falling back to global config.
-    #
-    # We deliberately do NOT write process-global env vars (HERMES_MODEL /
-    # HERMES_INFERENCE_MODEL / HERMES_TUI_PROVIDER / HERMES_INFERENCE_PROVIDER)
-    # here. The desktop backend hosts every same-profile session in ONE process,
-    # so mutating os.environ on a /model switch leaked the new model/provider
-    # into every OTHER live session's next agent rebuild — switching the model
-    # in one session silently changed it in the others (the cross-session
-    # contamination bug). agent.switch_model() above already mutated the right
-    # agent in place; the override dict makes that choice survive a rebuild
-    # without touching shared process state.
-    if pin_session_override and isinstance(session, dict) and not one_turn:
-        session["model_override"] = {
-            "model": result.new_model,
-            "provider": result.target_provider,
-            "base_url": result.base_url,
-            "api_key": result.api_key,
-            "api_mode": result.api_mode,
-        }
-    if isinstance(session, dict):
-        session.pop("model_verified_for", None)
-        mirror = session.get("_metadata_mirror")
-        if isinstance(mirror, dict):
-            mirror["model_ready"] = False
-    if agent:
-        _emit("session.info", sid, _session_info(agent, session))
-    if persist_global:
-        _persist_model_switch(result)
+        # Record the switch as a PER-SESSION override so a later rebuild of THIS
+        # session (e.g. /new via _reset_session_agent, or resume) re-derives the
+        # user's chosen model/provider instead of falling back to global config.
+        #
+        # We deliberately do NOT write process-global env vars (HERMES_MODEL /
+        # HERMES_INFERENCE_MODEL / HERMES_TUI_PROVIDER / HERMES_INFERENCE_PROVIDER)
+        # here. The desktop backend hosts every same-profile session in ONE process,
+        # so mutating os.environ on a /model switch leaked the new model/provider
+        # into every OTHER live session's next agent rebuild — switching the model
+        # in one session silently changed it in the others (the cross-session
+        # contamination bug). agent.switch_model() above already mutated the right
+        # agent in place; the override dict makes that choice survive a rebuild
+        # without touching shared process state.
+        if pin_session_override and isinstance(session, dict) and not one_turn:
+            session["model_override"] = {
+                "model": result.new_model,
+                "provider": result.target_provider,
+                "base_url": result.base_url,
+                "api_key": result.api_key,
+                "api_mode": result.api_mode,
+            }
+        if superseded_pending is not None and session.get("pending_model_switch") is superseded_pending:
+            # Keep the old intent in its canonical queue until a manual
+            # choice finishes publication. Overlapping choices share claims
+            # on this same old intent; a newer queued pick is a new dict.
+            pending_publication = superseded_pending.get("_model_switch_publications")
+            if pending_publication is None:
+                pending_publication = {
+                    "owners": [],
+                    "projection": {key: superseded_pending[key] for key in
+                                   ("display_model", "display_provider") if key in superseded_pending},
+                }
+                superseded_pending["_model_switch_publications"] = pending_publication
+            pending_publication["owners"].append(result)
+            # Project the working pin/owned once runtime, including its
+            # natural restore, rather than the temporarily held old B.
+            superseded_pending.pop("display_model", None)
+            superseded_pending.pop("display_provider", None)
+        if isinstance(session, dict):
+            session.pop("model_verified_for", None)
+            mirror = session.get("_metadata_mirror")
+            if isinstance(mirror, dict):
+                mirror["model_ready"] = False
+    # Worker replacement can acquire the registry lock; keep it outside
+    # history_lock to preserve the existing registry -> history lock order.
+    try:
+        if agent:
+            _restart_slash_worker(sid, session)
+            _emit("session.info", sid, _session_info(agent, session))
+        if persist_global:
+            _persist_model_switch(result)
+    except Exception:
+        # A raised publication/persistence suffix means config.set cannot
+        # acknowledge C. Retain B's already acknowledged intent, without
+        # undoing the working client or resurrecting B over a newer choice.
+        if pending_publication is not None:
+            with model_commit_lock if model_commit_lock is not None else contextlib.nullcontext():
+                if (_sessions.get(sid) is session
+                        and session.get("pending_model_switch") is superseded_pending
+                        and superseded_pending.get("_model_switch_publications") is pending_publication):
+                    pending_publication["owners"][:] = [
+                        owner for owner in pending_publication["owners"] if owner is not result
+                    ]
+                    if not pending_publication["owners"]:
+                        superseded_pending.pop("_model_switch_publications", None)
+                        superseded_pending.update(pending_publication["projection"])
+                        if session.get("running"):
+                            superseded_pending["after_inflight_turn"] = session.get("inflight_turn")
+        raise
+    if pending_publication is not None:
+        with model_commit_lock if model_commit_lock is not None else contextlib.nullcontext():
+            if (_sessions.get(sid) is session
+                    and session.get("pending_model_switch") is superseded_pending):
+                # Any acknowledged manual choice supersedes this captured
+                # old intent, even if another choice's suffix is in flight.
+                session.pop("pending_model_switch", None)
     return {
         "value": result.new_model,
         "warning": result.warning_message or "",
@@ -7632,7 +7718,23 @@ def _apply_pending_model_switch(sid: str, session: dict) -> None:
     the current model and never blocks the turn, matching
     ``_sync_agent_model_with_config``.
     """
-    pending = session.pop("pending_model_switch", None)
+    with session["history_lock"]:
+        pending = session.get("pending_model_switch")
+        if pending and pending.get("_model_switch_publications") is not None:
+            return
+        # A pick that finished resolving AFTER Send's admission belongs to a
+        # later turn, even if this turn has not reached its setup yet. An
+        # accepted correction shallow-copies the replay dict, preserving its
+        # existing immutable started_at object from the same admission.
+        deferred_after = pending.get("after_inflight_turn") if pending else None
+        current_inflight = session.get("inflight_turn")
+        if (deferred_after is not None and (
+                deferred_after is current_inflight
+                or (isinstance(deferred_after, dict) and isinstance(current_inflight, dict)
+                    and deferred_after.get("started_at") is not None
+                    and deferred_after["started_at"] is current_inflight.get("started_at")))):
+            return
+        pending = session.pop("pending_model_switch", None)
     if not pending or session.get("agent") is None:
         return
     try:
@@ -7641,6 +7743,7 @@ def _apply_pending_model_switch(sid: str, session: dict) -> None:
             session,
             pending["raw"],
             confirm_expensive_model=bool(pending.get("confirm_expensive_model")),
+            supersede_pending=False,
         )
         # A queued pick is a deliberate user action; honour the expensive-model
         # confirm by NOT applying it silently — surface the warning and drop the
@@ -15114,6 +15217,8 @@ def _(rid, params: dict) -> dict:
                 # The user gets to pick, keep typing, and send the next turn on
                 # the new model without waiting for the swap or interrupting.
                 if session.get("running"):
+                    pending_agent = session.get("agent")
+                    pending_transport = session.get("transport")
                     parsed = parse_model_switch_args(value)
                     try:
                         pending_model = parsed.model_input
@@ -15161,16 +15266,19 @@ def _(rid, params: dict) -> dict:
                                     "deferred": False,
                                 },
                             )
-                    session["pending_model_switch"] = {
-                        "raw": value,
-                        "confirm_expensive_model": confirmed,
-                        # The resolved model/provider the next turn will run on.
-                        # _session_info reports these while the switch is pending
-                        # so the end-of-turn settle keeps showing the user's pick
-                        # instead of blipping back to the still-live old model.
-                        "display_model": pending_model,
-                        "display_provider": pending_provider,
-                    }
+                    with session["history_lock"]:
+                        if (_sessions.get(params["session_id"]) is not session
+                                or session.get("agent") is not pending_agent
+                                or session.get("transport") is not pending_transport):
+                            return _err(rid, 4001, "session owner changed; request not applied")
+                        session["pending_model_switch"] = {
+                            "raw": value,
+                            "confirm_expensive_model": confirmed,
+                            # Projection names the next eligible turn's choice.
+                            "display_model": pending_model,
+                            "display_provider": pending_provider,
+                            "after_inflight_turn": session.get("inflight_turn"),
+                        }
                     return _ok(
                         rid,
                         {
@@ -15201,6 +15309,8 @@ def _(rid, params: dict) -> dict:
                         params.get("confirm_expensive_model", False)
                     ),
                     parsed_flags=parsed_flags,
+                    defer_if_running=True,
+                    supersede_pending=True,
                 )
             else:
                 result = _apply_model_switch(
@@ -15220,6 +15330,7 @@ def _(rid, params: dict) -> dict:
                     "confirm_required": result.get("confirm_required", False),
                     "confirm_message": result.get("confirm_message", ""),
                     "scope": result.get("scope", "session"),
+                    **({"deferred": result["deferred"]} if "deferred" in result else {}),
                 },
             )
         except Exception as e:
