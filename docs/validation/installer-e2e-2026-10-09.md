@@ -84,17 +84,41 @@ This reproduced defect explains the four proxy-associated failure signatures.
 Because their original raw npm errors were discarded, it does not prove every
 failure in those four jobs has been eliminated. A fresh matrix remains required.
 
-## Exit 217: unresolved, not inferred from arithmetic
+## Exit 217: version-specific reproduction; historical cause unproven
 
 An npm errno of -39 can map to shell status 217. The updater v2026.5.28 log
 independently shows ENOTEMPTY, but it is a different invocation and does not
 establish the cause of the v2026.6.19 installer failure.
 
-An offline test created a stale npm retirement directory and changed a local
-package version. Available npm 11.9.0 repaired it successfully; `npm ci` also
-passed. This falsifies the proposed blanket stale-directory explanation in
-that environment. No destructive module cleanup or install algorithm change
-is justified by that test.
+The first offline test created a stale npm retirement directory and changed a
+local package version. Available npm 11.9.0 repaired it successfully; `npm ci`
+also passed. That result does not establish how the historical npm behaves.
+The preserved jobs report managed Node 22.23.3, whose official distribution
+source bundles npm 10.9.9; the jobs did not print the effective npm version.
+
+A follow-up retrieved the exact vendored npm 10.9.9 source from Node 22.23.3
+and verified all 1,312 runtime JS/JSON files against their Git blob hashes.
+Real offline npm 10.9.9 failed a correctly derived, nonempty retirement-directory
+collision with status 217, `ENOTEMPTY`, `syscall rename`, and errno -39. An empty
+directory control succeeded; file and symlink destinations instead failed with
+`ENOTDIR` and status 236. Fixture-only `npm ci` controls passed after lock
+regeneration. The interpreter was still Node 24.19.0, so this supplies npm source
+parity rather than complete historical toolchain parity.
+
+Passing the actual ENOTEMPTY output through the exact main v1 helper reproduced
+empty error-code/cause arrays and no reported truncation; the candidate's v2
+helper identified ENOTEMPTY. This establishes a concrete npm-version-specific
+failure mechanism consistent with the historical diagnostic shape. It does not
+prove the original installed trees contained that collision: neither the newly
+verified October 7 v2026.6.19 artifact nor October 8 preserved it or the raw npm
+error. A fresh candidate matrix remains the decisive next gate. No automatic
+module deletion, blanket `npm ci` conversion, or npm-version change is included.
+
+Only v2026.6.19 logged autostash and successful restoration. Its installer writes
+an untracked `.install_method` inside the checkout and that release does not
+ignore it; main does. A disposable git fixture confirms the marker alone makes
+the historical tree dirty. Stash presence therefore does not establish manifest
+contamination or the cause of exit 217; exact stashed paths were not retained.
 
 Diagnostic v2 now recognizes ENOTEMPTY and additional issuer errors, describes
 the bounded output shape, and reconstructs collected records strictly. Unknown
@@ -126,9 +150,12 @@ final six-file selection passed 68 tests with no failures or retries. It include
 tests, and nearby Node discovery/global-prefix regressions. TLS tests first
 ran on the original projection: two failed and the untrusted-CA negative
 control passed; all three passed after the correction. Shell syntax, scoped
-Ruff checks, and `git diff --check` also passed.
+Ruff checks, and `git diff --check` also passed. The same 68-test selection was
+then repeated successfully with the verified npm 10.9.9 runtime; this is a
+second runtime check of the same tests, not 68 additional unique tests.
 
-Local runtime: Linux, Python 3.12.14, Node 24.19.0, npm 11.9.0. These are not
+Local runtime: Linux, Python 3.12.14, Node 24.19.0, npm 11.9.0; follow-up npm
+source-parity checks used npm 10.9.9 on the same Node 24 interpreter. These are not
 the complete GitHub runner toolchain. The controlled npm fixture tests the
 actual TLS and dependency-probe boundaries, not the repository's entire
 dependency installation, package lifecycle, supply-chain age policy, or desktop
@@ -136,6 +163,9 @@ build.
 
 The full local bubblewrap replay is blocked: a namespace capability probe
 exited 1 with `Failed to create NETLINK_ROUTE socket: Operation not permitted`.
+Fresh follow-up probes also fail the required UID mapping with
+`/proc/self/uid_map: Operation not permitted`; an unmapped user/network namespace
+probe succeeds, which does not provide the mapped topology the harness needs.
 No permission setting or namespace isolation was bypassed. The full Ares test
 suite, macOS/Windows installers, packaging, providers, and live services are
 outside this bounded correction.
