@@ -394,7 +394,12 @@ def _run_profile_worker(profile_id: str, request: ExplicitDispatchRequest, recei
         inherit_credentials=True, profile_boundary=boundary,
     )
     environment.update({"HERMES_HOME": str(profile_home), "ARES_MANAGED_RUNTIME": "1", "HERMES_SESSION_SOURCE": "cli"})
-    command = [sys.executable, "-m", "hermes_cli.main", "--in", str(request.workspace), "-z", request.brief]
+    # The workspace remains the tool cwd, but cannot own the CLI entrypoint.
+    # Bind this source runtime first while retaining explicit user tool paths.
+    runtime = str(Path(__file__).resolve().parents[1])
+    tool_paths = [path for path in environment.get("PYTHONPATH", "").split(os.pathsep) if path]
+    environment["PYTHONPATH"] = os.pathsep.join([runtime, *tool_paths])
+    command = [sys.executable, "-P", "-m", "hermes_cli.main", "--in", str(request.workspace), "-z", request.brief]
     process = subprocess.Popen(command, cwd=request.workspace, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     stdout_raw, stderr_raw = process.communicate()
     profile_dir = receipt_dir / "profiles"

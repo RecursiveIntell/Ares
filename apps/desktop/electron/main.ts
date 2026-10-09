@@ -349,7 +349,7 @@ import {
   SESSION_WINDOW_MIN_WIDTH
 } from './session-windows'
 import { ensureLoginShellPath } from './shell-path'
-import { createSpecialistDispatchAdmission } from './specialist-dispatch-admission'
+import { createSpecialistDispatchAdmission, startSpecialistRunner, stopSpecialistRunner } from './specialist-dispatch-admission'
 import { createSpecialistDispatchQuiesce, SpecialistQuiesceError } from './specialist-dispatch-quiesce'
 import { startSpecialistDispatchServer } from './specialist-dispatch-server'
 import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstrap-coordinator'
@@ -12215,58 +12215,65 @@ let specialistDispatchServer: Awaited<ReturnType<typeof startSpecialistDispatchS
 const specialistDispatchAdmission = createSpecialistDispatchAdmission({
   maxCapacity: POOL_MAX_BACKENDS,
   pool: backendPool,
-  spawnRunner: async request => {
+  stopRunner: child => stopSpecialistRunner(child, {
+    stopChild: owned => stopBackendChild(owned),
+    waitForExit: owned => waitForBackendExit(owned)
+  }),
+  spawnRunner: (request, maySpawn) => startSpecialistRunner(request, maySpawn, {
     // Reuse Desktop's established runtime resolver, but do not accept a caller
     // command. The only child command is this package-local runner.
-    const backend = await ensureRuntime(resolveHermesBackend([]))
+    resolveRuntime: () => ensureRuntime(resolveHermesBackend([])),
+    spawn: (backend, request) => {
+      if (!backend.command) {
+        throw new Error('specialist runner runtime is unavailable')
+      }
 
-    if (!backend.command) {
-      throw new Error('specialist runner runtime is unavailable')
-    }
+      const cwd = backend.root || resolveHermesCwd()
 
-    const cwd = backend.root || resolveHermesCwd()
+      const child = spawn(
+        backend.command,
+        ['-m', 'ares_runtime.specialist_dispatch', 'runner'],
+        hiddenWindowsChildOptions({
+          cwd,
+          detached: true,
+          env: {
+            ...process.env,
+            ...backend.env,
+            // The runner begins in the default Ares home, then explicitly
+            // selects the one profile home per worker. A backend resolver must
+            // never override that isolation boundary through its own env map.
+            HERMES_HOME,
+            TERMINAL_CWD: cwd
+          },
+          stdio: ['pipe', 'ignore', 'ignore']
+        })
+      )
 
-    const child = spawn(
-      backend.command,
-      ['-m', 'ares_runtime.specialist_dispatch', 'runner'],
-      hiddenWindowsChildOptions({
-        cwd,
-        detached: true,
-        env: {
-          ...process.env,
-          ...backend.env,
-          // The runner begins in the default Ares home, then explicitly
-          // selects the one profile home per worker. A backend resolver must
-          // never override that isolation boundary through its own env map.
-          HERMES_HOME,
-          TERMINAL_CWD: cwd
-        },
-        stdio: ['pipe', 'ignore', 'ignore']
+      let timedOut = false
+
+      const timeout = setTimeout(() => {
+        timedOut = true
+        rememberLog(`[specialist] runner ${request.runId} exceeded the bounded deadline; stopping its owned process group`)
+        void specialistDispatchAdmission.cancel(request.runId, 'runner_failed').catch(error => {
+          rememberLog(`[specialist] runner ${request.runId} deadline cleanup failed: ${error.message}`)
+        })
+      }, SPECIALIST_RUNNER_TIMEOUT_MS)
+
+      timeout.unref?.()
+      child.once('error', error => {
+        clearTimeout(timeout)
+        rememberLog(`[specialist] runner ${request.runId} failed to start: ${error.message}`)
+        specialistDispatchAdmission.release(request.runId, 'runner_failed')
       })
-    )
+      child.once('exit', code => {
+        clearTimeout(timeout)
+        specialistDispatchAdmission.release(request.runId, code === 0 && !timedOut ? 'released' : 'runner_failed')
+      })
+      child.stdin?.end(request.runnerInput || '')
 
-    let timedOut = false
-
-    const timeout = setTimeout(() => {
-      timedOut = true
-      rememberLog(`[specialist] runner ${request.runId} exceeded the bounded deadline; stopping its owned process group`)
-      void poolStopper.stop(specialistDispatchAdmission.poolKey(request.runId))
-    }, SPECIALIST_RUNNER_TIMEOUT_MS)
-
-    timeout.unref?.()
-    child.once('error', error => {
-      clearTimeout(timeout)
-      rememberLog(`[specialist] runner ${request.runId} failed to start: ${error.message}`)
-      specialistDispatchAdmission.release(request.runId, 'runner_failed')
-    })
-    child.once('exit', code => {
-      clearTimeout(timeout)
-      specialistDispatchAdmission.release(request.runId, code === 0 && !timedOut ? 'released' : 'runner_failed')
-    })
-    child.stdin?.end(request.runnerInput || '')
-
-    return child
-  }
+      return child
+    }
+  })
 })
 
 async function startSpecialistDispatchTransport() {
@@ -12281,8 +12288,7 @@ async function startSpecialistDispatchTransport() {
         throw new Error('specialist run is not active')
       }
 
-      await poolStopper.stop(specialistDispatchAdmission.poolKey(runId))
-      specialistDispatchAdmission.release(runId, 'released')
+      await specialistDispatchAdmission.cancel(runId)
     },
     quiesce: {
       acquire: async profileIds => {

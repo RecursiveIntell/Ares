@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -28,6 +29,7 @@ from typing import Iterator, Mapping, Sequence
 
 _REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
 _CONFIG_SCHEMA = 2
+LOCAL_LIFECYCLE_CONTRACT = 1
 _DEFAULT_UPSTREAM_REMOTE = "https://github.com/NousResearch/hermes-agent.git"
 _DEFAULT_UPSTREAM_BRANCH = "main"
 
@@ -147,6 +149,10 @@ class AresLocalPaths:
     def previous_link(self) -> Path:
         return self.data_root / "previous"
 
+    @property
+    def transition_path(self) -> Path:
+        return self.data_root / "release-transition.json"
+
 
 def _default_paths() -> AresLocalPaths:
     home = Path.home()
@@ -185,16 +191,25 @@ class AresLocalRuntime:
 
     def __init__(self, paths: AresLocalPaths | None = None) -> None:
         self.paths = paths or _default_paths()
+        self._control_mutex = threading.RLock()
+        self._lock_depth = 0
 
     @contextmanager
     def locked(self) -> Iterator[None]:
-        self.paths.state_root.mkdir(parents=True, exist_ok=True)
-        with self.paths.lock_path.open("a+", encoding="utf-8") as lock_file:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            try:
+        with self._control_mutex:
+            if self._lock_depth:
                 yield
-            finally:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                return
+            self.paths.state_root.mkdir(parents=True, exist_ok=True)
+            with self.paths.lock_path.open("a+", encoding="utf-8") as lock_file:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                self._lock_depth = 1
+                try:
+                    self._recover_release_transition()
+                    yield
+                finally:
+                    self._lock_depth = 0
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
     def _ensure_layout(self) -> None:
         self.paths.state_root.mkdir(parents=True, exist_ok=True)
@@ -277,15 +292,17 @@ class AresLocalRuntime:
         return revision, source
 
     def active_release(self) -> tuple[str, Path]:
-        value = self._release_from_link(self.paths.current_link, "current")
-        if value is None:
-            raise AresLocalRuntimeError(
-                "Ares is not set up; run `ares setup --source <checkout>`"
-            )
-        return value
+        with self.locked():
+            value = self._release_from_link(self.paths.current_link, "current")
+            if value is None:
+                raise AresLocalRuntimeError(
+                    "Ares is not set up; run `ares setup --source <checkout>`"
+                )
+            return value
 
     def previous_release(self) -> tuple[str, Path] | None:
-        return self._release_from_link(self.paths.previous_link, "previous")
+        with self.locked():
+            return self._release_from_link(self.paths.previous_link, "previous")
 
     @staticmethod
     def _atomic_json(path: Path, value: dict[str, object]) -> None:
@@ -391,23 +408,109 @@ class AresLocalRuntime:
         )
 
     def _activate(self, revision: str) -> None:
-        target = self._release_source(revision).resolve()
-        current = self._release_from_link(self.paths.current_link, "current")
-        if current is not None and current[1] == target:
-            return
-        previous = self._release_from_link(self.paths.previous_link, "previous")
+        with self.locked():
+            target = self._release_source(revision).resolve()
+            self._require_complete_release(target, desktop=False)
+            current = self._release_from_link(self.paths.current_link, "current")
+            if current is not None and current[1] == target:
+                return
+            previous = self._release_from_link(self.paths.previous_link, "previous")
+            self._transition_release_pair((revision, target), current or previous)
+
+    @staticmethod
+    def _sync_directory(directory: Path) -> None:
+        fd = os.open(directory, os.O_DIRECTORY)
         try:
-            if current is not None:
-                self._atomic_link(self.paths.previous_link, current[1])
-            self._atomic_link(self.paths.current_link, target)
-        except Exception:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def _write_release_pair(
+        self, current: tuple[str, Path] | None, previous: tuple[str, Path] | None
+    ) -> None:
+        for path, value in (
+            (self.paths.current_link, current), (self.paths.previous_link, previous)
+        ):
+            if value is None:
+                path.unlink(missing_ok=True)
+                self._sync_directory(self.paths.data_root)
+            else:
+                revision, source = value
+                expected = self._release_source(revision).resolve()
+                if source.resolve() != expected:
+                    raise AresLocalRuntimeError("release transition source identity mismatch")
+                self._atomic_link(path, expected)
+
+    def _retire_release_transition(self) -> None:
+        self.paths.transition_path.unlink()
+        self._sync_directory(self.paths.data_root)
+
+    def _recover_release_transition(self) -> None:
+        """Restore an unfinished pair before any controller entry or launch.
+
+        This record is temporary recovery intent, never active-runtime truth.
+        The current link remains the only launch authority.
+        """
+        path = self.paths.transition_path
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            return
+        try:
+            if path.is_symlink() or not path.is_file() or metadata.st_size > 4096:
+                raise ValueError("invalid recovery record file")
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if (
+                not isinstance(value, dict)
+                or set(value) != {"schema", "current", "previous"}
+                or value["schema"] != "AresLocalReleaseTransitionV1"
+            ):
+                raise ValueError("invalid recovery record schema")
+            pair: list[tuple[str, Path] | None] = []
+            for name in ("current", "previous"):
+                revision = value[name]
+                if revision is None:
+                    pair.append(None)
+                elif isinstance(revision, str) and _REVISION_RE.fullmatch(revision):
+                    pair.append((revision, self._release_source(revision).resolve()))
+                else:
+                    raise ValueError("invalid recovery revision")
+            self._write_release_pair(pair[0], pair[1])
+            self._retire_release_transition()
+        except Exception as exc:
+            raise AresLocalRuntimeError(
+                "Ares release transition recovery is unresolved; preserve the recovery record and release bytes"
+            ) from exc
+
+    def _transition_release_pair(
+        self, current: tuple[str, Path] | None, previous: tuple[str, Path] | None
+    ) -> None:
+        with self.locked():
+            old_current = self._release_from_link(self.paths.current_link, "current")
+            old_previous = self._release_from_link(self.paths.previous_link, "previous")
+            self._atomic_json(
+                self.paths.transition_path,
+                {
+                    "schema": "AresLocalReleaseTransitionV1",
+                    "current": old_current[0] if old_current else None,
+                    "previous": old_previous[0] if old_previous else None,
+                },
+            )
             try:
-                self._restore_release_pair(current, previous)
-            except Exception as restore_exc:
-                raise AresLocalRuntimeError(
-                    "Ares activation failed and the prior release pointers could not be restored"
-                ) from restore_exc
-            raise
+                self._write_release_pair(current, previous)
+                self._retire_release_transition()
+            except BaseException as transition_exc:
+                if not self.paths.transition_path.exists():
+                    raise AresLocalRuntimeError(
+                        "Ares release pointers were published but recovery record retirement is uncertain; inspect selection before retrying"
+                    ) from transition_exc
+                try:
+                    self._recover_release_transition()
+                except BaseException as recovery_exc:
+                    raise AresLocalRuntimeError(
+                        "Ares release transition failed and recovery is unresolved; preserve release bytes"
+                    ) from recovery_exc
+                raise
 
     def _restore_release_pair(
         self,
@@ -416,14 +519,7 @@ class AresLocalRuntime:
     ) -> None:
         """Restore the exact pre-transition current/previous pointer pair."""
 
-        if current is None:
-            self.paths.current_link.unlink(missing_ok=True)
-        else:
-            self._atomic_link(self.paths.current_link, current[1])
-        if previous is None:
-            self.paths.previous_link.unlink(missing_ok=True)
-        else:
-            self._atomic_link(self.paths.previous_link, previous[1])
+        self._transition_release_pair(current, previous)
 
     def _build_environment(self, source: Path) -> dict[str, str]:
         """Return a clean build environment scoped to this Ares installation."""
@@ -595,11 +691,52 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
             missing.append("stable Python")
         if desktop and self._desktop_binary(source) is None:
             missing.append("Desktop executable")
+        try:
+            record = json.loads((source.parent / "release.json").read_text(encoding="utf-8"))
+            expected = {
+                "schema": "AresLocalRuntimeBindingV1",
+                "source": str(source.resolve()),
+                "controller_contract": LOCAL_LIFECYCLE_CONTRACT,
+            }
+            if (
+                not isinstance(record, dict)
+                or record.get("revision") != source.parent.name
+                or record.get("runtime_binding") != expected
+            ):
+                missing.append("verified final editable binding")
+        except (OSError, ValueError, TypeError):
+            missing.append("verified final editable binding")
         if missing:
             raise AresLocalRuntimeError(
                 f"installed Ares release is incomplete ({', '.join(missing)}); "
                 "refusing to rebuild an immutable release"
             )
+
+    def _require_unselected_release(self, revision: str, *, operation: str) -> None:
+        """Protect both canonical selections while the controller lock is held."""
+        selected = (
+            ("active", self._release_from_link(self.paths.current_link, "current")),
+            ("previous", self._release_from_link(self.paths.previous_link, "previous")),
+        )
+        for label, value in selected:
+            if value is not None and value[0] == revision:
+                raise AresLocalRuntimeError(
+                    f"cannot {operation} the {label} Ares release; preserve selected release bytes"
+                )
+
+    def _record_final_runtime_binding(self, source: Path) -> None:
+        """Complete the existing release metadata only after final-path verification."""
+        with self.locked():
+            self._require_unselected_release(source.parent.name, operation="rewrite binding metadata of")
+            record = self._release_metadata(source.parent.name)
+            if record.get("revision") != source.parent.name:
+                raise AresLocalRuntimeError("final runtime binding has mismatched release identity")
+            record["runtime_binding"] = {
+                "schema": "AresLocalRuntimeBindingV1",
+                "source": str(source.resolve()),
+                "controller_contract": LOCAL_LIFECYCLE_CONTRACT,
+            }
+            self._atomic_json(source.parent / "release.json", record)
 
     def _sync_python_runtime(self, source: Path) -> None:
         """Install and verify the editable Python runtime at ``source``."""
@@ -632,6 +769,7 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
                 (
                     "from pathlib import Path; "
                     "import ares_runtime.local_runtime, hermes_cli.main; "
+                    f"assert ares_runtime.local_runtime.LOCAL_LIFECYCLE_CONTRACT == {LOCAL_LIFECYCLE_CONTRACT}; "
                     f"root=Path({str(source)!r}).resolve(); "
                     "loaded=[Path(ares_runtime.local_runtime.__file__).resolve(), "
                     "Path(hermes_cli.main.__file__).resolve()]; "
@@ -645,26 +783,23 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
     def _refresh_moved_editable_install(self, source: Path) -> None:
         """Finalize one newly moved, inactive release's editable path binding."""
 
-        resolved = source.resolve()
-        try:
-            relative = resolved.relative_to(self.paths.releases_dir.resolve())
-            if len(relative.parts) != 2 or relative.parts[1] != "source":
-                raise ValueError("invalid release source layout")
-            revision = self._require_revision(relative.parts[0])
-        except (AresLocalRuntimeError, OSError, ValueError) as exc:
-            raise AresLocalRuntimeError(
-                "editable install refresh requires an exact releases/<revision>/source path"
-            ) from exc
-        if resolved != (self._release_dir(revision) / "source").resolve():
-            raise AresLocalRuntimeError(
-                "editable install refresh requires an exact releases/<revision>/source path"
-            )
-        current = self._release_from_link(self.paths.current_link, "current")
-        if current is not None and current[1].resolve() == resolved:
-            raise AresLocalRuntimeError(
-                "cannot refresh the editable install of an active Ares release"
-            )
-        self._sync_python_runtime(resolved)
+        with self.locked():
+            resolved = source.resolve()
+            try:
+                relative = resolved.relative_to(self.paths.releases_dir.resolve())
+                if len(relative.parts) != 2 or relative.parts[1] != "source":
+                    raise ValueError("invalid release source layout")
+                revision = self._require_revision(relative.parts[0])
+            except (AresLocalRuntimeError, OSError, ValueError) as exc:
+                raise AresLocalRuntimeError(
+                    "editable install refresh requires an exact releases/<revision>/source path"
+                ) from exc
+            if resolved != (self._release_dir(revision) / "source").resolve():
+                raise AresLocalRuntimeError(
+                    "editable install refresh requires an exact releases/<revision>/source path"
+                )
+            self._require_unselected_release(revision, operation="refresh the editable install of")
+            self._sync_python_runtime(resolved)
 
     def _build_runtime(self, source: Path, *, desktop: bool) -> None:
         if self._installed_release_source(source):
@@ -718,7 +853,7 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
         return candidate if candidate.is_file() else None
 
     def _quarantine_incomplete_release(self, revision: str, final_dir: Path) -> Path:
-        """Move one non-active incomplete release aside before a staged rebuild.
+        """Move one unselected incomplete release aside before a staged rebuild.
 
         Release directories are immutable once published. An interrupted build
         can nevertheless leave a revision-shaped directory without the required
@@ -728,18 +863,20 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
         the replacement cannot be built.
         """
 
-        current = self._release_from_link(self.paths.current_link, "current")
-        if current is not None and current[0] == revision:
-            raise AresLocalRuntimeError(
-                "installed active Ares release is incomplete; rollback before recovery"
-            )
-        quarantine_root = self.paths.data_root / "quarantine" / "incomplete-releases"
-        quarantine_root.mkdir(parents=True, exist_ok=True)
-        quarantine = quarantine_root / f"{revision}.{uuid.uuid4().hex}"
-        os.replace(final_dir, quarantine)
-        return quarantine
+        with self.locked():
+            self._require_unselected_release(revision, operation="restage")
+            quarantine_root = self.paths.data_root / "quarantine" / "incomplete-releases"
+            quarantine_root.mkdir(parents=True, exist_ok=True)
+            quarantine = quarantine_root / f"{revision}.{uuid.uuid4().hex}"
+            os.replace(final_dir, quarantine)
+            return quarantine
 
     def _materialize(self, source_spec: str, revision: str, *, desktop: bool) -> None:
+        with self.locked():
+            self._materialize_locked(source_spec, revision, desktop=desktop)
+
+    def _materialize_locked(self, source_spec: str, revision: str, *, desktop: bool) -> None:
+        """Keep selection protection stable through the direct restaging path."""
         self._ensure_layout()
         final_dir = self._release_dir(revision)
         quarantined: Path | None = None
@@ -773,7 +910,8 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
             # be followed by one bounded finalization at the final, inactive path.
             # Desktop artifacts already moved with the source and are not rebuilt.
             self._refresh_moved_editable_install(final_dir / "source")
-        except Exception:
+            self._record_final_runtime_binding(final_dir / "source")
+        except BaseException:
             cleanup_failure: OSError | None = None
             if staging.exists():
                 try:
@@ -813,7 +951,7 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
         return AresLocalRuntime._require_revision(fields[0])
 
     def _release_metadata(self, revision: str) -> dict[str, object]:
-        """Read the small release descriptor used only for update short-circuiting."""
+        """Read the canonical release descriptor for source and binding identity."""
 
         path = self._release_dir(revision) / "release.json"
         try:
@@ -1000,8 +1138,9 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
             os.replace(staging, final_dir)
             moved_to_final = True
             self._refresh_moved_editable_install(final_dir / "source")
+            self._record_final_runtime_binding(final_dir / "source")
             return candidate_revision
-        except Exception:
+        except BaseException:
             cleanup_failure: OSError | None = None
             if staging.exists():
                 try:
@@ -1127,13 +1266,60 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
                 raise AresLocalRuntimeError(
                     "Ares gateway did not remain active after startup"
                 )
-        except Exception:
+        except BaseException:
             self._systemctl("disable", "--now", "ares-gateway.service", required=False)
             if legacy_active:
                 self._systemctl(
                     "enable", "--now", "hermes-gateway.service", required=False
                 )
             raise
+
+    def _gateway_state(self) -> tuple[bool, str]:
+        """Read known service intent before changing code; unknown is not stopped."""
+        completed = self._run(
+            [
+                "systemctl", "--user", "show", self.paths.unit_path.name,
+                "--property=LoadState,ActiveState,UnitFileState",
+            ],
+            capture=True, env=self._systemd_environment(),
+        )
+        fields: dict[str, str] = {}
+        for line in completed.stdout.splitlines():
+            key, separator, value = line.partition("=")
+            if not separator or key in fields:
+                raise AresLocalRuntimeError("Ares gateway state is ambiguous")
+            fields[key] = value
+        if (
+            set(fields) != {"LoadState", "ActiveState", "UnitFileState"}
+            or fields["LoadState"] != "loaded"
+            or fields["ActiveState"] not in {"active", "inactive", "failed"}
+            or fields["UnitFileState"] not in {
+                "enabled", "enabled-runtime", "disabled", "static", "indirect",
+                "generated", "transient", "linked", "linked-runtime",
+                "masked", "masked-runtime",
+            }
+        ):
+            raise AresLocalRuntimeError(
+                "Ares gateway state is unresolved; release selection is preserved"
+            )
+        return fields["ActiveState"] == "active", fields["UnitFileState"]
+
+    def _recover_running_gateway(self) -> None:
+        """Distinguish restored code from an unconfirmed service recovery."""
+        try:
+            if not self._systemctl(
+                "restart", "ares-gateway.service", required=False
+            ):
+                raise AresLocalRuntimeError("prior gateway restart was not accepted")
+            time.sleep(1)
+            if not self._systemctl(
+                "is-active", "--quiet", "ares-gateway.service", required=False
+            ):
+                raise AresLocalRuntimeError("prior gateway did not remain active")
+        except Exception as exc:
+            raise AresLocalRuntimeError(
+                "Ares release pointers were restored but gateway recovery is unresolved"
+            ) from exc
 
     def setup(
         self,
@@ -1189,7 +1375,7 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
                 if gateway:
                     self._install_gateway_unit()
                     self._handoff_gateway(legacy_active=legacy_active)
-            except Exception:
+            except BaseException:
                 self._restore_release_pair(old_active, old_previous)
                 if old_active is not None:
                     # The launcher resolves through `current`; regenerate it
@@ -1254,9 +1440,13 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
                     and metadata.get("upstream_remote") == upstream_remote
                     and metadata.get("upstream_branch") == upstream_branch
                 ):
+                    self._require_complete_release(current[1], desktop=desktop)
                     return current[0], False
             old_active = current
             old_previous = self._release_from_link(self.paths.previous_link, "previous")
+            gateway_running = (
+                self._gateway_state()[0] if self.paths.unit_path.exists() else False
+            )
             revision = self._materialize_upstream_candidate(
                 downstream_remote=remote,
                 downstream_revision=downstream_revision,
@@ -1270,20 +1460,19 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
                 try:
                     self._install_gateway_unit()
                     self._systemctl("daemon-reload")
-                    self._systemctl("restart", "ares-gateway.service")
-                    time.sleep(1)
-                    if not self._systemctl(
-                        "is-active", "--quiet", "ares-gateway.service", required=False
-                    ):
-                        raise AresLocalRuntimeError(
-                            "Ares gateway did not remain active after update"
-                        )
-                except Exception:
+                    if gateway_running:
+                        self._systemctl("restart", "ares-gateway.service")
+                        time.sleep(1)
+                        if not self._systemctl(
+                            "is-active", "--quiet", "ares-gateway.service", required=False
+                        ):
+                            raise AresLocalRuntimeError(
+                                "Ares gateway did not remain active after update"
+                            )
+                except BaseException:
                     self._restore_release_pair(old_active, old_previous)
-                    if old_active is not None:
-                        self._systemctl(
-                            "restart", "ares-gateway.service", required=False
-                        )
+                    if old_active is not None and gateway_running:
+                        self._recover_running_gateway()
                     raise
             return revision, True
 
@@ -1295,10 +1484,13 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
                 raise AresLocalRuntimeError(
                     "no previous Ares runtime is available for rollback"
                 )
+            self._require_complete_release(previous[1], desktop=False)
+            gateway_running = (
+                self._gateway_state()[0] if self.paths.unit_path.exists() else False
+            )
             try:
-                self._atomic_link(self.paths.current_link, previous[1])
-                self._atomic_link(self.paths.previous_link, current[1])
-                if self.paths.unit_path.exists():
+                self._transition_release_pair(previous, current)
+                if gateway_running:
                     self._systemctl("restart", "ares-gateway.service")
                     time.sleep(1)
                     if not self._systemctl(
@@ -1307,22 +1499,15 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
                         raise AresLocalRuntimeError(
                             "Ares gateway did not remain active after rollback"
                         )
-            except Exception:
+            except BaseException:
                 try:
                     self._restore_release_pair(current, previous)
                 except Exception as restore_exc:
                     raise AresLocalRuntimeError(
                         "Ares rollback failed and the prior release pointers could not be restored"
                     ) from restore_exc
-                if self.paths.unit_path.exists():
-                    try:
-                        self._systemctl(
-                            "restart", "ares-gateway.service", required=False
-                        )
-                    except Exception:
-                        # Recovery is best effort; preserve the rollback error
-                        # after restoring the authoritative pointer pair.
-                        pass
+                if gateway_running:
+                    self._recover_running_gateway()
                 raise
             return previous[0]
 
@@ -1501,19 +1686,20 @@ print(json.dumps({'enabled': enabled, 'probed': sorted(probed), 'missing': missi
         return checks
 
     def status(self) -> list[str]:
-        current = self._release_from_link(self.paths.current_link, "current")
-        previous = self.previous_release()
-        try:
-            config = self._read_config()
-        except AresLocalRuntimeError as exc:
-            return [f"Ares status: {exc}"]
-        return [
-            f"active: {current[0] if current else 'none'}",
-            f"previous: {previous[0] if previous else 'none'}",
-            f"remote: {config['remote']}",
-            f"branch: {config['branch']}",
-            f"gateway: {'active' if self._systemctl('is-active', '--quiet', 'ares-gateway.service', required=False) else 'inactive'}",
-        ]
+        with self.locked():
+            current = self._release_from_link(self.paths.current_link, "current")
+            previous = self.previous_release()
+            try:
+                config = self._read_config()
+            except AresLocalRuntimeError as exc:
+                return [f"Ares status: {exc}"]
+            return [
+                f"active: {current[0] if current else 'none'}",
+                f"previous: {previous[0] if previous else 'none'}",
+                f"remote: {config['remote']}",
+                f"branch: {config['branch']}",
+                f"gateway: {'active' if self._systemctl('is-active', '--quiet', 'ares-gateway.service', required=False) else 'inactive'}",
+            ]
 
     def _exec_hermes(self, arguments: Sequence[str]) -> None:
         _, source = self.active_release()
@@ -1574,22 +1760,23 @@ print(json.dumps({'enabled': enabled, 'probed': sorted(probed), 'missing': missi
     def gateway(self, action: str) -> None:
         if action == "foreground":
             self._exec_hermes(["gateway"])
-        if action == "start":
-            self._systemctl("enable", "--now", "ares-gateway.service")
-        elif action == "stop":
-            self._prepare_gateway_stop()
-            self._systemctl("disable", "--now", "ares-gateway.service")
-        elif action == "restart":
-            self._systemctl("restart", "ares-gateway.service")
-        elif action == "status":
-            active = self._systemctl(
-                "is-active", "--quiet", "ares-gateway.service", required=False
-            )
-            print("Ares gateway is " + ("active" if active else "inactive"))
-            if not active:
-                raise AresLocalRuntimeError("Ares gateway is inactive")
-        else:
-            raise AresLocalRuntimeError(f"unsupported gateway action: {action}")
+        with self.locked():
+            if action == "start":
+                self._systemctl("enable", "--now", "ares-gateway.service")
+            elif action == "stop":
+                self._prepare_gateway_stop()
+                self._systemctl("disable", "--now", "ares-gateway.service")
+            elif action == "restart":
+                self._systemctl("restart", "ares-gateway.service")
+            elif action == "status":
+                active = self._systemctl(
+                    "is-active", "--quiet", "ares-gateway.service", required=False
+                )
+                print("Ares gateway is " + ("active" if active else "inactive"))
+                if not active:
+                    raise AresLocalRuntimeError("Ares gateway is inactive")
+            else:
+                raise AresLocalRuntimeError(f"unsupported gateway action: {action}")
 
     def auth(self, args, passthrough: Sequence[str]) -> None:
         """Delegate to hermes auth with Ares home environment."""

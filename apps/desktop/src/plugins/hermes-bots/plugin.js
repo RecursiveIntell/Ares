@@ -9036,21 +9036,23 @@ function isDuplicateGroupAppend(lastEntry, from, text, thread, now = Date.now())
 
 // --- member-hold helpers (#93129) — pure, vm-sliced by tests ---
 
-/** #93129: classify a USER room message's effect on member holds. Only user
- *  sends ever reach this (bot replies are appended by the round loop, never
- *  through sendToGroupChat), so a bot saying "stopped working on it" can
- *  never set a hold. Conservative on purpose: any standalone stop/halt/pause
- *  word next to a mention holds those members — "don't stop @x" therefore
- *  also holds, which errs toward the bot staying quiet until re-addressed
- *  (a wrongly-held bot is one mention away from release; a wrongly-running
- *  one keeps doing work it was told to stop). A non-stop direct mention
- *  releases the mentioned members — the user addressing a bot directly
- *  overrides its hold. */
+/** #93129: only a whole, affirmative USER command changes stop controls.
+ *  A stop word in negated, quoted, descriptive or conditional prose is not
+ *  an immediate stop instruction. Existing direct non-command mentions
+ *  still release the addressed members; the explicit Stop button is separate. */
 function classifyGroupHoldDirective(text, mentionedKeys, everyone) {
-  const value = String(text || '')
+  const value = String(text || '').trim()
   const mentioned = [...(mentionedKeys || [])]
-  const stop = /\b(stop|halt|pause)\b/i.test(value)
-  const resume = /\b(resume|continue|go|proceed)\b/i.test(value)
+  // Commands: "stop @member, please", "@member please pause for now", "@all resume".
+  // Match the entire message, not a keyword detached from its scope or timing.
+  const target = String.raw`@[a-z0-9][a-z0-9._-]*`
+  const targets = `${target}(?:(?:\\s*(?:,|&)\\s*|\\s+and\\s+|\\s+)${target})*`
+  const isCommand = verbs => new RegExp(
+    `^(?:please\\s+)?(?:${targets}(?:\\s*[:,]\\s*|\\s+)(?:please\\s+)?(?:${verbs})|(?:${verbs})\\s+${targets})(?:\\s+(?:now|for\\s+now|immediately))?(?:\\s+please|\\s*,\\s*please)?[.!]*$`,
+    'i'
+  ).test(value)
+  const stop = isCommand('stop|halt|pause')
+  const resume = isCommand('resume|continue|go|proceed')
 
   if (stop) {
     // "@all stop" holds every member — symmetric with "@all resume".

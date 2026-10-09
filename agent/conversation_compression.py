@@ -1566,7 +1566,10 @@ def _direct_messages_for_pre_compress_memory(messages: Any) -> list[dict[str, An
     # Deferred import: context_compressor imports turn_context, which imports
     # this module — a module-level import here would close that cycle
     # (upstream introduced the turn_context edge with the api_content work).
-    from agent.context_compressor import COMPRESSED_SUMMARY_METADATA_KEY
+    from agent.context_compressor import (
+        ContextCompressor, drop_stale_api_content, is_compaction_summary_message,
+        user_originated_turn_view,
+    )
 
     direct_messages: list[dict[str, Any]] = []
     for message in messages or []:
@@ -1575,8 +1578,15 @@ def _direct_messages_for_pre_compress_memory(messages: Any) -> list[dict[str, An
         role = message.get("role")
         if role not in {"user", "assistant"}:
             continue
-        if message.get(COMPRESSED_SUMMARY_METADATA_KEY):
-            continue
+        if role == "user":
+            message = user_originated_turn_view(message)
+            if message is None:
+                continue
+        elif is_compaction_summary_message(message):
+            message = ContextCompressor._strip_context_summary_handoff_message(message)
+            if message is None:
+                continue
+            drop_stale_api_content(message)
         if role == "assistant" and message.get("tool_calls"):
             content = message.get("content")
             has_prose = bool(

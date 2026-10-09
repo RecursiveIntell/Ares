@@ -2586,6 +2586,28 @@ def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
 
 
 _turn_outcome_execution = contextvars.ContextVar("gateway_turn_outcome_execution", default=None)
+_lifecycle_projection_owner = contextvars.ContextVar("gateway_lifecycle_projection_owner", default=None)
+_terminal_publication_owner = contextvars.ContextVar("gateway_terminal_publication_owner", default=None)
+
+
+def _lifecycle_projection_lock(session):
+    with session["history_lock"]:
+        return session.setdefault("_lifecycle_projection_lock", threading.RLock())
+
+
+def _capture_lifecycle_projection_owner(session, sid):
+    """Capture metadata custody under the producer's existing history lock."""
+    if not isinstance(session, dict):
+        return None
+    agent = session.get("agent")
+    window = session.get("_turn_outcomes")
+    nonce = (window.turns[-1]["accepted_turn"]["request_id"]
+        if isinstance(window, TurnOutcomeWindow) and window.owns(session, sid) and window.turns else None)
+    return (session, sid, agent, int(session.get("_queued_prompt_generation", 0)), window, nonce,
+            session.get("model_override"), session.get("_one_turn_model_runtime"),
+            getattr(agent, "_primary_runtime", None), session.get("inflight_turn"),
+            session.get("_run_thread"), int(session.get("history_version", 0)),
+            bool(session.get("_closing")), bool(session.get("_finalized")))
 
 
 def _begin_turn_outcome(session, sid, request_id, route, boot_id=None, supervisor=None):
@@ -2610,6 +2632,37 @@ def _turn_outcomes_snapshot(sid, session):
 
 
 def _emit(event: str, sid: str, payload: dict | None = None):
+    # Serialize lifecycle projections for one record without retaining the
+    # history lock across transport I/O. A successor start therefore follows
+    # a prior idle write, or makes that idle snapshot stale before publication.
+    if event in {"message.start", "message.complete", "session.info"}:
+        execution = _turn_outcome_execution.get()
+        record = execution[0] if execution is not None and execution[1] == sid else _sessions.get(sid)
+        if record is not None:
+            projection_lock = _lifecycle_projection_lock(record)
+            with projection_lock:
+                with record["history_lock"]:
+                    if event != "message.complete" and _sessions.get(sid) is not record:
+                        return
+                    if event == "session.info":
+                        if isinstance(payload, dict) and payload.get("running") is False and record.get("running"):
+                            return
+                        owner = _lifecycle_projection_owner.get()
+                        if owner is not None and owner[1] == sid:
+                            current_owner = _capture_lifecycle_projection_owner(record, sid)
+                            if (any(current_owner[i] != owner[i] for i in (3, 5, 11, 12, 13))
+                                    or any(current_owner[i] is not owner[i] for i in (0, 2, 4, 6, 7, 8, 9, 10))):
+                                return
+                        if execution is not None and execution[1] == sid:
+                            window = record.get("_turn_outcomes")
+                            if (execution[2] is not None and isinstance(window, TurnOutcomeWindow) and window.owns(record, sid)
+                                    and window.turns and window.turns[-1]["accepted_turn"]["request_id"] != execution[2]):
+                                return
+                return _emit_unserialized(event, sid, payload)
+    return _emit_unserialized(event, sid, payload)
+
+
+def _emit_unserialized(event: str, sid: str, payload: dict | None = None):
     session = _sessions.get(sid) if event == "message.complete" else None
     execution = _turn_outcome_execution.get()
     owned_event = execution is not None and execution[1] == sid and event in {
@@ -2633,7 +2686,7 @@ def _emit(event: str, sid: str, payload: dict | None = None):
             and not captured.get("_closing") and not captured.get("_finalized")
             and not captured.get("_turn_cancel_requested")
         )
-        if current is captured or detached_failure:
+        if current is captured or detached_failure or event == "message.complete":
             session = captured
         elif event == "message.complete":
             # Keep legacy terminal visibility after owner loss, without a
@@ -2647,8 +2700,7 @@ def _emit(event: str, sid: str, payload: dict | None = None):
         with session["history_lock"]:
             window = session.get("_turn_outcomes")
             current = _sessions.get(sid)
-            if ((current is session or (current is None and owned_event and failed_history))
-                    and not session.get("_closing")
+            if (not session.get("_closing")
                     and not session.get("_finalized")
                     and isinstance(window, TurnOutcomeWindow) and window.owns(session, sid)):
                 try:
@@ -2660,6 +2712,29 @@ def _emit(event: str, sid: str, payload: dict | None = None):
                     logger.debug("finalized reply projection unavailable", exc_info=True)
                 if ref is not None:
                     payload = {**(payload or {}), "request_id": ref["request_id"], "accepted_turn": ref}
+    if owned_event and event == "message.complete":
+        # Retain this exact outcome above even when it cannot safely address
+        # the currently visible stream. Never project through a replacement.
+        with captured["history_lock"]:
+            if _sessions.get(sid) is not captured and not detached_failure:
+                return
+            window = captured.get("_turn_outcomes")
+            publication = _terminal_publication_owner.get()
+            fenced = publication is not None and publication[0] is execution
+            if fenced:
+                # This producer acquired the publication barrier before it
+                # released admission. A new same-record turn can be admitted,
+                # but its start remains behind this completion. Stop/rebuild
+                # cannot donate permission to the old failure.
+                if (captured.get("agent") is not publication[1] or window is not publication[2]
+                        or int(captured.get("_queued_prompt_generation", 0)) != publication[3]
+                        or captured.get("_turn_cancel_requested") or captured.get("_closing")
+                        or captured.get("_finalized")):
+                    return
+            elif (execution[2] is not None and isinstance(window, TurnOutcomeWindow)
+                    and window.owns(captured, sid) and window.turns
+                    and window.turns[-1]["accepted_turn"]["request_id"] != execution[2]):
+                return
     if event == "message.complete" and session is not None and session.get("_host_turn_request_id") and _inside_compute_host_child():
         # The bubble is complete; only the host's matching turn terminal can
         # retire the accepted request (including any chained goal work).
@@ -2818,7 +2893,8 @@ def _compute_host_turn_frame(
         "service_tier_override": session.get("create_service_tier_override"),
         "source": _session_source(session),
         "attached_images": attached_images,
-        "queued_prompt_generation": queued_prompt_generation,
+        # The serving queue cut is checked atomically at parent admission.
+        # A child owns an independent queue generation after restart/reanchor.
     }
 
 
@@ -2992,6 +3068,12 @@ def _submit_prompt_to_compute_host(
 
     host_request_id = frame["request_id"]
     with session["history_lock"]:
+        if queued_prompt_generation is not None and (
+                _sessions.get(sid) is not session
+                or int(session.get("_queued_prompt_generation", 0)) != queued_prompt_generation
+                or session.get("_closing") or session.get("_turn_cancel_requested")):
+            return _err(rid, 4009, "queued prompt claim invalidated before host admission",
+                        {"delivery": "stale_claim"})
         if (session.get("_compute_host_active_request_id") or session.get("_stop_pending")
                 or session.get("_stop_uncertain")):
             return _err(rid, 4009, "compute-host request or Stop settlement still owns session",
@@ -7201,9 +7283,11 @@ def _apply_model_switch(
                 if explicit_model_intent and not owns_publication():
                     raise ValueError("session owner changed; model request not published")
                 info = _session_info(agent, session)
+                projection_owner = _capture_lifecycle_projection_owner(session, sid)
             # Transport callbacks may acquire history_lock; deliver outside it.
             # The captured execution/transport cannot route through a successor.
             token = _turn_outcome_execution.set((session, sid, None))
+            projection_token = _lifecycle_projection_owner.set(projection_owner)
             transport_token = bind_transport(owner_transport)
             try:
                 with model_commit_lock if model_commit_lock is not None else contextlib.nullcontext():
@@ -7212,6 +7296,7 @@ def _apply_model_switch(
                 _emit("session.info", sid, info)
             finally:
                 reset_transport(transport_token)
+                _lifecycle_projection_owner.reset(projection_token)
                 _turn_outcome_execution.reset(token)
         if persist_global:
             with model_commit_lock if model_commit_lock is not None else contextlib.nullcontext():
@@ -8142,7 +8227,8 @@ def _sync_session_key_after_compress(
     *,
     clear_pending_title: bool = True,
     restart_slash_worker: bool = True,
-) -> None:
+    expected_agent=None,
+) -> tuple[int, int] | None:
     """Re-anchor session_key when AIAgent._compress_context rotates session_id.
 
     AIAgent._compress_context ends the current SessionDB session and creates
@@ -8161,10 +8247,29 @@ def _sync_session_key_after_compress(
             if the caller manages the worker lifecycle separately.
     """
     agent = session.get("agent")
+    if session.get("_closing") or session.get("_finalized"):
+        return None
+    if expected_agent is not None and agent is not expected_agent:
+        return None
     new_session_id = getattr(agent, "session_id", None) or ""
     old_key = session.get("session_key", "") or ""
     if not new_session_id or new_session_id == old_key:
         return
+
+    reanchor = None
+
+    def publish_reanchor():
+        nonlocal reanchor
+        with session["history_lock"]:
+            if (session.get("agent") is not agent
+                    or session.get("_closing") or session.get("_finalized")
+                    or (expected_agent is not None and _sessions.get(sid) is not session)):
+                return False
+            generation = int(session.get("_queued_prompt_generation", 0))
+            session["session_key"] = new_session_id
+            session["_queued_prompt_generation"] = generation + 1
+            reanchor = (generation, generation + 1)
+            return True
 
     lease_reanchored = _transfer_active_session_slot(
         sid,
@@ -8192,7 +8297,8 @@ def _sync_session_key_after_compress(
             unregister_gateway_notify(old_key)
         except Exception:
             pass
-        session["session_key"] = new_session_id
+        if not publish_reanchor():
+            return None
         try:
             yolo_was_on = is_session_yolo_enabled(old_key)
         except Exception:
@@ -8214,7 +8320,8 @@ def _sync_session_key_after_compress(
         # Even if the approval module fails to import, still anchor the
         # session_key on the new continuation id so downstream lookups
         # don't keep targeting the ended row.
-        session["session_key"] = new_session_id
+        if reanchor is None and not publish_reanchor():
+            return None
 
     # #84417 (belt): invalidate any in-flight ``_drain_queued_prompt`` claim
     # that captured generation under the pre-rotation session_key. A raced
@@ -8222,9 +8329,8 @@ def _sync_session_key_after_compress(
     # claimed envelope is restored to the queue (see ``_drain_queued_prompt``)
     # so legitimate follow-ups still survive. Complements self-duplicate
     # scrubbing on redirect.
-    session["_queued_prompt_generation"] = int(
-        session.get("_queued_prompt_generation", 0)
-    ) + 1
+    # publish_reanchor invalidated raced queue claims atomically with the key.
+    # Its receipt lets only that same accepted execution retain cleanup custody.
 
     if clear_pending_title:
         session["pending_title"] = None
@@ -8233,6 +8339,7 @@ def _sync_session_key_after_compress(
             _restart_slash_worker(sid, session)
         except Exception:
             pass
+    return reanchor
 
 
 def _get_usage(agent) -> dict:
@@ -9665,7 +9772,25 @@ def _preview_restart_callbacks(parent: str, task_id: str) -> dict:
 
 
 def _reset_session_agent(sid: str, session: dict) -> dict:
-    tokens = _set_session_context(session["session_key"])
+    with _sessions_lock, session["history_lock"]:
+        if (_sessions.get(sid) is not session or session.get("running")
+                or session.get("_closing") or session.get("_finalized")
+                or session.get("_compute_host_active_request_id")
+                or session.get("_stop_pending") or session.get("_stop_uncertain")):
+            raise RuntimeError("session owner is busy or unavailable; reset not started")
+        owner = session.get("agent")
+        key = session["session_key"]
+        generation = int(session.get("_queued_prompt_generation", 0))
+        inflight = session.get("inflight_turn")
+        window = session.get("_turn_outcomes")
+        nonce = (window.turns[-1]["accepted_turn"]["request_id"]
+            if isinstance(window, TurnOutcomeWindow) and window.owns(session, sid) and window.turns else None)
+        override_keys = ("model_override", "create_reasoning_override", "create_service_tier_override",
+                         "one_turn_model_restore", "_one_turn_model_runtime")
+        overrides = {name: session.get(name) for name in override_keys}
+    tokens = _set_session_context(key)
+    new_agent = None
+    published = False
     try:
         # /new is a full conversation boundary: session-scoped runtime
         # overrides (/model, /reasoning, /fast) do NOT carry forward — the
@@ -9674,33 +9799,63 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
         # a rebuild can't resurrect them. (Global process state is still never
         # touched — see the cross-session-contamination note in
         # _apply_model_switch.)
-        session.pop("model_override", None)
-        session.pop("create_reasoning_override", None)
-        session.pop("create_service_tier_override", None)
-        session.pop("one_turn_model_restore", None)
         new_agent = _make_agent(
             sid,
-            session["session_key"],
-            session_id=session["session_key"],
+            key,
+            session_id=key,
             platform_override=_session_source(session),
+            _resource_preserve_agent=owner,
         )
+        config_model_seen = _config_model_target()
+        show_reasoning = _load_show_reasoning()
+        tool_progress_mode = _load_tool_progress_mode()
+        with _sessions_lock, session["history_lock"]:
+            current_window = session.get("_turn_outcomes")
+            current_nonce = (current_window.turns[-1]["accepted_turn"]["request_id"]
+                if isinstance(current_window, TurnOutcomeWindow)
+                and current_window.owns(session, sid) and current_window.turns else None)
+            if (_sessions.get(sid) is not session or session.get("agent") is not owner
+                    or session.get("session_key") != key
+                    or int(session.get("_queued_prompt_generation", 0)) != generation
+                    or session.get("inflight_turn") is not inflight
+                    or current_window is not window or current_nonce != nonce
+                    or any(session.get(name) is not value for name, value in overrides.items())
+                    or session.get("_closing") or session.get("_finalized")
+                    or session.get("running") or session.get("_compute_host_active_request_id")
+                    or session.get("_stop_pending") or session.get("_stop_uncertain")):
+                raise RuntimeError("session owner changed during reset; replacement not published")
+            # Construction failure leaves both predecessor and once snapshot intact.
+            # A successful fresh-runtime boundary retires only this captured lease.
+            for name in override_keys:
+                session.pop(name, None)
+            session.pop("model_verified_for", None)
+            session.pop("_verified_custom_route", None)
+            session["agent"] = new_agent
+            session["config_model_seen"] = config_model_seen
+            session["attached_images"] = []
+            session["queued_prompt"] = None
+            session.pop("queued_prompts", None)
+            session["_queued_prompt_generation"] = generation + 1
+            session["edit_snapshots"] = {}
+            session["image_counter"] = 0
+            session["running"] = False
+            session["show_reasoning"] = show_reasoning
+            session["tool_progress_mode"] = tool_progress_mode
+            session["tool_started_at"] = {}
+            session["history"] = []
+            session["history_version"] = int(session.get("history_version", 0)) + 1
+            published = True
+    except Exception:
+        if new_agent is not None and new_agent is not owner and not published:
+            retire = getattr(new_agent, "retire_local_resources", None)
+            if callable(retire):
+                try:
+                    retire(preserve_agent=owner)
+                except Exception:
+                    logger.warning("unpublished reset runtime retirement failed", exc_info=True)
+        raise
     finally:
         _clear_session_context(tokens)
-    session["agent"] = new_agent
-    session["config_model_seen"] = _config_model_target()
-    session["attached_images"] = []
-    session["queued_prompt"] = None
-    session.pop("queued_prompts", None)
-    session["_queued_prompt_generation"] = int(session.get("_queued_prompt_generation", 0)) + 1
-    session["edit_snapshots"] = {}
-    session["image_counter"] = 0
-    session["running"] = False
-    session["show_reasoning"] = _load_show_reasoning()
-    session["tool_progress_mode"] = _load_tool_progress_mode()
-    session["tool_started_at"] = {}
-    with session["history_lock"]:
-        session["history"] = []
-        session["history_version"] = int(session.get("history_version", 0)) + 1
     info = _session_info(new_agent, session)
     _emit("session.info", sid, info)
     _restart_slash_worker(sid, session)
@@ -11283,6 +11438,70 @@ def _handle_busy_submit(
 
 
 def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
+    """Drain an owned envelope with bounded fresh claims after reanchor."""
+    recovery = None
+    for _ in range(4):
+        result = _drain_queued_prompt_claim(rid, sid, session, recovery=recovery)
+        if not isinstance(result, tuple):
+            return bool(result) or recovery is not None
+        recovery = result
+    # Repeated invalidation is a visible pre-provider failure, not an idle
+    # queue stranded without an onward owner or permission to replay forever.
+    with session["history_lock"]:
+        if not _owns_queue_recovery(sid, session, recovery):
+            return True
+        queued = session["queued_prompt"]
+        rest = session.get("queued_prompts") or []
+        session["queued_prompt"] = rest.pop(0) if rest else None
+        if not rest:
+            session.pop("queued_prompts", None)
+        session["running"] = True
+        _start_inflight_turn(session, queued["text"])
+        started_at = session["inflight_turn"]["started_at"]
+        generation = int(session.get("_queued_prompt_generation", 0))
+        ref = _begin_turn_outcome(session, sid, f"inline-turn-{uuid.uuid4().hex}", "inline")
+        transport = queued.get("transport") or session.get("transport")
+    token = _turn_outcome_execution.set((session, sid, ref["request_id"]))
+    try:
+        settled = _emit_terminal_turn_error(sid, session,
+            "Queued input could not start because the session changed repeatedly. Send it again when the session is stable.",
+            error_surface={"layer": "runtime", "code": "queue_recovery_failed", "retryable": True},
+            expected_started_at=started_at, expected_queue_generation=generation,
+            settle_running=True, terminal_transport=transport,
+            context_input_event_id=queued.get("context_input_event_id"))
+    finally:
+        _turn_outcome_execution.reset(token)
+    if settled:
+        with session["history_lock"]:
+            window = session.get("_turn_outcomes")
+            drain_next = (bool(session.get("queued_prompt")) and not session.get("running")
+                and _sessions.get(sid) is session and isinstance(window, TurnOutcomeWindow)
+                and window.owns(session, sid) and window.turns
+                and window.turns[-1]["accepted_turn"]["request_id"] == ref["request_id"]
+                and int(session.get("_queued_prompt_generation", 0)) == generation
+                and not session.get("_turn_cancel_requested"))
+        if drain_next:
+            _drain_queued_prompt(rid, sid, session)
+    return True
+
+
+def _owns_queue_recovery(sid, session, recovery):
+    """Caller holds history_lock; recovery never creates a new input receipt."""
+    if recovery is None:
+        return False
+    owner, agent, inflight, window, nonce, queued, generation = recovery
+    current_window = session.get("_turn_outcomes")
+    current_nonce = (current_window.turns[-1]["accepted_turn"]["request_id"]
+        if isinstance(current_window, TurnOutcomeWindow) and current_window.owns(session, sid) and current_window.turns else None)
+    return (owner is session and _sessions.get(sid) is session and session.get("agent") is agent
+        and session.get("inflight_turn") is inflight and current_window is window and current_nonce == nonce
+        and session.get("queued_prompt") is queued and int(session.get("_queued_prompt_generation", 0)) == generation
+        and not session.get("running") and not session.get("_closing") and not session.get("_finalized")
+        and not session.get("_turn_cancel_requested") and not session.get("_compute_host_active_request_id")
+        and not session.get("_stop_pending") and not session.get("_stop_uncertain"))
+
+
+def _drain_queued_prompt_claim(rid, sid: str, session: dict, *, recovery=None):
     """Fire a queued next-turn prompt if one is waiting and the session is idle.
 
     Returns True if a queued prompt was dispatched (the caller should then skip
@@ -11290,6 +11509,8 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     claim-under-lock pattern used by the goal-continuation re-fire.
     """
     with session["history_lock"]:
+        if recovery is not None and not _owns_queue_recovery(sid, session, recovery):
+            return False
         if (session.get("_closing") or session.get("_compute_host_active_request_id")
                 or session.get("_stop_pending") or session.get("_stop_uncertain")):
             return False
@@ -11310,6 +11531,30 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         session["running"] = True
         if queued.get("transport") is not None:
             session["transport"] = queued["transport"]
+
+    def restore_reanchored_claim():
+        # Caller holds history_lock. Restore only this exact non-Stop owner;
+        # a replacement/accepted successor cannot donate its queue or state.
+        current_window = session.get("_turn_outcomes")
+        current_nonce = (current_window.turns[-1]["accepted_turn"]["request_id"]
+            if isinstance(current_window, TurnOutcomeWindow) and current_window.owns(session, sid) and current_window.turns else None)
+        generation = int(session.get("_queued_prompt_generation", 0))
+        if (_sessions.get(sid) is not session or session.get("agent") is not claim_agent
+                or session.get("inflight_turn") is not claim_inflight
+                or current_window is not claim_window or current_nonce != claim_nonce
+                or generation == queue_generation or int(session.get("_last_stop_queue_generation", 0)) > queue_generation
+                or session.get("_closing") or session.get("_finalized") or session.get("_turn_cancel_requested")
+                or session.get("_compute_host_active_request_id") or session.get("_stop_pending") or session.get("_stop_uncertain")):
+            return True
+        rest = ([session["queued_prompt"]] if session.get("queued_prompt") else [])
+        rest.extend(session.get("queued_prompts") or [])
+        session["queued_prompt"] = queued
+        if rest:
+            session["queued_prompts"] = rest
+        else:
+            session.pop("queued_prompts", None)
+        session["running"] = False
+        return (session, claim_agent, claim_inflight, claim_window, claim_nonce, queued, generation)
     use_compute_host = _session_uses_compute_host(session)
     with session["history_lock"]:
         if int(session.get("_queued_prompt_generation", 0)) != queue_generation:
@@ -11334,18 +11579,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             # legitimate follow-up is not silently dropped. Order: claimed
             # head first, then whatever advanced into the slot while we held
             # the claim (#84417 belt accuracy).
-            rest: list = []
-            advanced = session.get("queued_prompt")
-            if advanced:
-                rest.append(advanced)
-            rest.extend(session.get("queued_prompts") or [])
-            session["queued_prompt"] = queued
-            if rest:
-                session["queued_prompts"] = rest
-            else:
-                session.pop("queued_prompts", None)
-            session["running"] = False
-            return True
+            return restore_reanchored_claim()
         restore_error = _one_turn_model_restore_error(sid, session)
         if restore_error is not None:
             # This accepted envelope owns a distinct pre-provider outcome,
@@ -11387,11 +11621,38 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         elif use_compute_host:
             resp = _submit_prompt_to_compute_host(rid, sid, session, queued["text"], **kwargs)
             if resp.get("error"):
-                message = str(((resp.get("error") or {}).get("message")) or "queued prompt failed")
+                error = resp.get("error") or {}
+                message = str(error.get("message") or "queued prompt failed")
+                delivery = (error.get("data") or {}).get("delivery")
+                failed_request = (error.get("data") or {}).get("host_request_id")
+                settled = False
+                reanchored = None
                 with session["history_lock"]:
-                    session["running"] = False
-                    _clear_inflight_turn(session)
-                _emit("error", sid, {"message": message})
+                    window = session.get("_turn_outcomes")
+                    latest = (window.turns[-1]["accepted_turn"]["request_id"]
+                        if isinstance(window, TurnOutcomeWindow) and window.owns(session, sid) and window.turns else None)
+                    if (delivery == "stale_claim" and _sessions.get(sid) is session
+                            and session.get("agent") is claim_agent and window is claim_window
+                            and latest == claim_nonce and not session.get("_closing")
+                            and not session.get("_compute_host_active_request_id")
+                            and not session.get("_stop_pending") and not session.get("_stop_uncertain")):
+                        stopped = int(session.get("_last_stop_queue_generation", 0)) > queue_generation
+                        if not stopped and not session.get("_turn_cancel_requested"):
+                            reanchored = restore_reanchored_claim()
+                        elif stopped and session.get("_turn_cancel_requested"):
+                            session["running"] = False
+                    if (delivery == "not_sent" and failed_request == latest
+                            and _sessions.get(sid) is session and session.get("agent") is claim_agent
+                            and int(session.get("_queued_prompt_generation", 0)) == queue_generation
+                            and not session.get("_compute_host_active_request_id")
+                            and not session.get("_stop_pending") and not session.get("_stop_uncertain")):
+                        session["running"] = False
+                        _clear_inflight_turn(session)
+                        settled = True
+                if isinstance(reanchored, tuple):
+                    return reanchored
+                if settled:
+                    _emit("error", sid, {"message": message})
                 dispatch_failed = True
         else:
             dispatch_failed = _run_prompt_submit(rid, sid, session, queued["text"],
@@ -11403,7 +11664,12 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             file=sys.stderr,
         )
         with session["history_lock"]:
-            session["running"] = False
+            if (_sessions.get(sid) is session and session.get("agent") is claim_agent
+                    and int(session.get("_queued_prompt_generation", 0)) == queue_generation
+                    and session.get("_turn_outcomes") is claim_window
+                    and not session.get("_compute_host_active_request_id")
+                    and not session.get("_stop_pending") and not session.get("_stop_uncertain")):
+                session["running"] = False
         dispatch_failed = True
     if dispatch_failed:
         with session["history_lock"]:
@@ -11467,6 +11733,27 @@ def _emit_terminal_turn_error(
     settle_running: bool = False, terminal_transport=None,
     context_input_event_id: str | None = None,
 ) -> bool:
+    # Acquire publication before the helper can make the record idle. A
+    # successor may acquire history_lock/admit while rendering or writing is
+    # paused, but its message.start cannot overtake this terminal. Transport
+    # callbacks never run under history_lock.
+    with _lifecycle_projection_lock(session):
+        token = _terminal_publication_owner.set(None)
+        try:
+            return _emit_terminal_turn_error_owned(sid, session, error, error_surface,
+                expected_started_at=expected_started_at, expected_queue_generation=expected_queue_generation,
+                settle_running=settle_running, terminal_transport=terminal_transport,
+                context_input_event_id=context_input_event_id)
+        finally:
+            _terminal_publication_owner.reset(token)
+
+
+def _emit_terminal_turn_error_owned(
+    sid: str, session: dict, error: Any, error_surface: Optional[dict] = None,
+    *, expected_started_at: Any = None, expected_queue_generation: int | None = None,
+    settle_running: bool = False, terminal_transport=None,
+    context_input_event_id: str | None = None,
+) -> bool:
     """Close a failed turn with a terminal ``message.complete`` frame.
 
     Emits the same ``status: "error"`` frame shape the returned-error path in
@@ -11501,6 +11788,13 @@ def _emit_terminal_turn_error(
         except Exception:
             error_surface = None
     with session["history_lock"]:
+        if (not settle_running and execution is not None and execution[0] is session and execution[1] == sid
+                and execution[2] is not None):
+            window = session.get("_turn_outcomes")
+            if (_sessions.get(sid) not in (None, session) or not isinstance(window, TurnOutcomeWindow)
+                    or not window.owns(session, sid) or not window.turns
+                    or window.turns[-1]["accepted_turn"]["request_id"] != execution[2]):
+                return False
         if settle_running:
             current = _sessions.get(sid)
             ready = session.get("resume_history_ready")
@@ -11537,6 +11831,7 @@ def _emit_terminal_turn_error(
             # Only the code that records that marker may retire it.
             session["running"] = False
             session["last_active"] = time.time()
+            _terminal_publication_owner.set((execution, agent, window, expected_queue_generation))
     text = partial or f"Error: {message}"
     payload = {
         "text": text,
@@ -11547,7 +11842,7 @@ def _emit_terminal_turn_error(
     }
     if error_surface:
         payload["error_surface"] = error_surface
-    if settle_running and (error_surface or {}).get("code") == "one_turn_model_restore_failed":
+    if settle_running and (error_surface or {}).get("code") in {"one_turn_model_restore_failed", "queue_recovery_failed"}:
         payload.update(execution_started=False, durable_input_accepted=context_input_event_id is not None)
         if context_input_event_id is not None:
             payload["input_event_id"] = context_input_event_id
@@ -11566,14 +11861,19 @@ def _emit_terminal_turn_error(
         return True
     transport_token = bind_transport(terminal_transport or _stdio_transport)
     try:
-        _emit("message.complete", sid, payload)
+        try:
+            _emit("message.complete", sid, payload)
+        finally:
+            # append/stamp precedes transport I/O. An uncertain write must
+            # still close this outcome for replay/resume, without replaying it
+            # or settling the successor. The transport exception propagates.
+            with session["history_lock"]:
+                window = session.get("_turn_outcomes")
+                if (execution[2] is not None and isinstance(window, TurnOutcomeWindow)
+                        and window.owns(session, sid)):
+                    window.finish(execution[2], error=True)
         with session["history_lock"]:
             window = session.get("_turn_outcomes")
-            if (execution[2] is not None and isinstance(window, TurnOutcomeWindow)
-                    and window.owns(session, sid)):
-                # A successor may already be newest. Finish only this nonce;
-                # the canonical emitter above appended its captured payload.
-                window.finish(execution[2], error=True)
             turn = session.get("inflight_turn")
             if (_sessions.get(sid) is session and not session.get("_closing")
                     and not session.get("_finalized") and isinstance(turn, dict)
@@ -11583,17 +11883,16 @@ def _emit_terminal_turn_error(
                          and window.owns(session, sid) and window.turns
                          and window.turns[-1]["accepted_turn"]["request_id"] == execution[2]))):
                 # No detached metadata, and no old idle snapshot after Send B.
-                if (error_surface or {}).get("code") == "one_turn_model_restore_failed":
-                    settled_info = _session_info(agent, session)
-                else:
-                    # Other settlement callers retain their existing owner
-                    # contract; this correction is scoped to once refusal.
-                    _emit("session.info", sid, _session_info(agent, session))
-                    settled_info = None
+                settled_info = _session_info(agent, session)
+                projection_owner = _capture_lifecycle_projection_owner(session, sid)
             else:
                 settled_info = None
         if settled_info is not None:
-            _emit("session.info", sid, settled_info)
+            projection_token = _lifecycle_projection_owner.set(projection_owner)
+            try:
+                _emit("session.info", sid, settled_info)
+            finally:
+                _lifecycle_projection_owner.reset(projection_token)
     finally:
         reset_transport(transport_token)
     return True
@@ -11610,6 +11909,13 @@ def _restore_agent_history_after_turn_error(session: dict, agent) -> bool:
     if not isinstance(agent_messages, list):
         return False
     with session["history_lock"]:
+        execution = _turn_outcome_execution.get()
+        if execution is not None and execution[0] is session and execution[2] is not None:
+            window = session.get("_turn_outcomes")
+            if (_sessions.get(execution[1]) not in (None, session) or session.get("agent") is not agent
+                    or not isinstance(window, TurnOutcomeWindow) or not window.owns(session, execution[1])
+                    or not window.turns or window.turns[-1]["accepted_turn"]["request_id"] != execution[2]):
+                return False
         session["history"] = list(agent_messages)
         session["history_version"] = int(session.get("history_version", 0)) + 1
     return True
@@ -14033,6 +14339,7 @@ def _run_prompt_submit(
         inflight = session.get("inflight_turn")
         admission = inflight.get("started_at") if isinstance(inflight, dict) else None
         admission_generation = int(session.get("_queued_prompt_generation", 0))
+        settlement_generation = admission_generation
         admission_owner_transport = session.get("transport")
         # A caller can inherit another session's RPC context. The accepted
         # envelope and captured session owner take precedence over that fallback.
@@ -14052,9 +14359,10 @@ def _run_prompt_submit(
                     and session.get("agent_error") == session.get("resume_history_error")
                     and not session.get("_compute_host_active")):
                 return False
-        if int(session.get("_queued_prompt_generation", 0)) != admission_generation:
+        if (int(session.get("_queued_prompt_generation", 0)) != settlement_generation
+                or int(session.get("_last_stop_queue_generation", 0)) > admission_generation):
             return False
-        if queued_prompt_generation is not None and int(session.get("_queued_prompt_generation", 0)) != queued_prompt_generation:
+        if queued_prompt_generation is not None and admission_generation != queued_prompt_generation:
             return False
         current_inflight = session.get("inflight_turn")
         if admission is not None and (
@@ -14081,7 +14389,8 @@ def _run_prompt_submit(
         generation = int(session.get("_queued_prompt_generation", 0))
         return bool(_sessions.get(sid) is session
             and session.get("_turn_cancel_requested")
-            and generation == session.get("_last_stop_queue_generation")
+            and generation in {session.get("_last_stop_queue_generation"), settlement_generation}
+            and int(session.get("_last_stop_queue_generation", 0)) > admission_generation
             and generation > admission_generation
             and ((isinstance(current_inflight, dict)
                   and current_inflight.get("started_at") is admission)
@@ -14194,6 +14503,7 @@ def _run_prompt_submit(
     _emit("message.start", sid)
 
     def run_with_outcome():
+        nonlocal settlement_generation
         # The conversation runs on a fresh thread, so ContextVars from the RPC
         # dispatcher do not follow automatically. Rebind the exact transport
         # stored on this session generation before any tool can commission a
@@ -14668,9 +14978,29 @@ def _run_prompt_submit(
                 # applied to the continuation. Restart slash worker so subsequent
                 # worker-backed commands (/title etc.) target the live session.
                 # Fix for #20001.
-                _sync_session_key_after_compress(
+                reanchor = _sync_session_key_after_compress(
                     sid, session, clear_pending_title=False, restart_slash_worker=True,
+                    expected_agent=agent,
                 )
+                if reanchor is not None:
+                    with session["history_lock"]:
+                        current_inflight = session.get("inflight_turn")
+                        current_window = session.get("_turn_outcomes")
+                        current_nonce = (current_window.turns[-1]["accepted_turn"]["request_id"]
+                            if isinstance(current_window, TurnOutcomeWindow)
+                            and current_window.owns(session, sid) and current_window.turns else None)
+                        before, after = reanchor
+                        stopped_generation = int(session.get("_last_stop_queue_generation", 0))
+                        if (_sessions.get(sid) is session and session.get("agent") is agent
+                                and after == before + 1
+                                and int(session.get("_queued_prompt_generation", 0)) == after
+                                and isinstance(current_inflight, dict)
+                                and current_inflight.get("started_at") is admission
+                                and current_window is admission_window and current_nonce == admission_nonce
+                                and (before == settlement_generation or (
+                                    session.get("_turn_cancel_requested")
+                                    and before == stopped_generation > admission_generation))):
+                            settlement_generation = after
 
                 raw = result.get("final_response", "")
                 status = (
@@ -15165,7 +15495,7 @@ def _run_prompt_submit(
             # frame paths retire the marker as they emit).
             with session["history_lock"]:
                 if (_sessions.get(sid) not in (None, session) or session.get("agent") is not agent
-                        or (int(session.get("_queued_prompt_generation", 0)) != admission_generation
+                        or (int(session.get("_queued_prompt_generation", 0)) != settlement_generation
                             and not owns_stopped_admission())
                         or (session.get("inflight_turn") is not None and not turn_error_retained)
                         or session.get("running")):
@@ -15177,17 +15507,20 @@ def _run_prompt_submit(
                 except Exception:
                     logger.debug("failed to reconcile settled session cwd", exc_info=True)
                 settled_info = _session_info(agent, session)
+                projection_owner = _capture_lifecycle_projection_owner(session, sid)
             settled_execution_token = _turn_outcome_execution.set((session, sid,
                 execution[2] if execution is not None else None))
+            projection_token = _lifecycle_projection_owner.set(projection_owner)
             settled_transport_token = bind_transport(admission_transport)
             try:
                 _emit("session.info", sid, settled_info)
             finally:
                 reset_transport(settled_transport_token)
+                _lifecycle_projection_owner.reset(projection_token)
                 _turn_outcome_execution.reset(settled_execution_token)
             with session["history_lock"]:
                 if (_sessions.get(sid) not in (None, session) or session.get("agent") is not agent
-                        or int(session.get("_queued_prompt_generation", 0)) != admission_generation
+                        or int(session.get("_queued_prompt_generation", 0)) != settlement_generation
                         or session.get("running")
                         or (session.get("inflight_turn") is not None and not turn_error_retained)):
                     return

@@ -966,11 +966,19 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
             is_stale_connection_error,
             normalize_converse_response,
         )
-        region = api_kwargs.pop("__bedrock_region__", "us-east-1")
-        api_kwargs.pop("__bedrock_converse__", None)
+        from ares_runtime.continuity.runtime import (
+            context_dispatch_physical_call, validate_context_dispatch_source,
+        )
+        validate_context_dispatch_source(agent, api_kwargs)
+        final_kwargs = dict(api_kwargs)
+        region = final_kwargs.pop("__bedrock_region__", "us-east-1")
+        final_kwargs.pop("__bedrock_converse__", None)
         client = _get_bedrock_runtime_client(region)
         try:
-            raw_response = client.converse(**api_kwargs)
+            raw_response = context_dispatch_physical_call(
+                agent, final_kwargs, lambda final: client.converse(**final),
+                source_payload=api_kwargs, transport_kind="bedrock_nonstream",
+            )
         except Exception as _bedrock_exc:
             # Evict the cached client on stale-connection failures
             # so the outer retry loop builds a fresh client/pool.
@@ -3387,6 +3395,22 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted before streaming API call")
 
+    from ares_runtime.continuity.runtime import (
+        context_dispatch_physical_call, validate_context_dispatch_source,
+    )
+
+    def _nonstreaming_callback(kwargs):
+        if agent.api_mode in {"codex_responses", "bedrock_converse"}:
+            # Their canonical factories admit the final SDK request. Calling
+            # the interrupt worker under an outer admission lock would both
+            # seal too early and create a cross-thread lock wait.
+            validate_context_dispatch_source(agent, kwargs)
+            return agent._interruptible_api_call(kwargs)
+        return context_dispatch_physical_call(
+            agent, kwargs, lambda final: agent._interruptible_api_call(final),
+            source_payload=api_kwargs, transport_kind="stream_nonstream",
+        )
+
     def _stream_final_text(response) -> str:
         try:
             choices = getattr(response, "choices", None)
@@ -3432,8 +3456,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         if agent.api_mode == "chat_completions" and _should_use_ri_pipeline(agent, api_kwargs):
             _nonstreaming_args = dict(api_kwargs)
             _nonstreaming_args["stream"] = False
-            return agent._interruptible_api_call(_nonstreaming_args)
-        return agent._interruptible_api_call(api_kwargs)
+            return _nonstreaming_callback(_nonstreaming_args)
+        return _nonstreaming_callback(api_kwargs)
 
     if agent.api_mode == "codex_responses":
         # Codex streams internally via _run_codex_stream. The main dispatch
@@ -3443,7 +3467,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         agent._codex_on_first_delta = on_first_delta
         _emit_stream_start()
         try:
-            response = agent._interruptible_api_call(api_kwargs)
+            response = _nonstreaming_callback(api_kwargs)
             _emit_stream_end(final_text=_stream_final_text(response), finished=True, error=None)
             return response
         except Exception as exc:
@@ -3462,7 +3486,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     ):
         _streaming_disabled_kwargs = dict(api_kwargs)
         _streaming_disabled_kwargs["stream"] = False
-        return agent._interruptible_api_call(_streaming_disabled_kwargs)
+        return _nonstreaming_callback(_streaming_disabled_kwargs)
 
     # Bedrock Converse uses boto3's converse_stream() with real-time delta
     # callbacks — same UX as Anthropic and chat_completions streaming.
@@ -3515,12 +3539,16 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 writer_token = {"value": None}
 
                 def _open_bedrock_stream(next_api_kwargs: dict[str, Any]):
+                    validate_context_dispatch_source(agent, next_api_kwargs)
                     final_kwargs = dict(next_api_kwargs)
                     region = final_kwargs.pop("__bedrock_region__", "us-east-1")
                     final_kwargs.pop("__bedrock_converse__", None)
                     client = _get_bedrock_runtime_client(region)
                     try:
-                        raw_response = client.converse_stream(**final_kwargs)
+                        raw_response = context_dispatch_physical_call(
+                            agent, final_kwargs, lambda final: client.converse_stream(**final),
+                            source_payload=next_api_kwargs, transport_kind="bedrock_stream",
+                        )
                     except Exception as _bedrock_exc:
                         # InvokeModel-only policies cannot open a stream. Keep
                         # the fallback inside the same managed Relay attempt so
@@ -3539,7 +3567,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                                 type(_bedrock_exc).__name__,
                             )
                             return normalize_converse_response(
-                                client.converse(**final_kwargs)
+                                context_dispatch_physical_call(
+                                    agent, final_kwargs, lambda final: client.converse(**final),
+                                    source_payload=next_api_kwargs, transport_kind="bedrock_stream",
+                                )
                             )
                         if is_stale_connection_error(_bedrock_exc):
                             invalidate_runtime_client(region)
@@ -4017,6 +4048,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         attempt_stream_response = {"value": None}
 
         def _open_stream(next_api_kwargs: dict[str, Any]):
+            validate_context_dispatch_source(agent, next_api_kwargs)
             stream_kwargs = {
                 **next_api_kwargs,
                 "stream": True,
@@ -4039,7 +4071,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             attempt_request_client["value"] = request_client
             last_chunk_time["t"] = time.time()
             agent._touch_activity("waiting for provider response (streaming)")
-            return request_client.chat.completions.create(**stream_kwargs)
+            return context_dispatch_physical_call(
+                agent, stream_kwargs, lambda final: request_client.chat.completions.create(**final),
+                source_payload=next_api_kwargs, transport_kind="chat_stream",
+            )
 
         def _stream_created(raw_stream: Any) -> None:
             response = getattr(raw_stream, "response", None)
@@ -4616,12 +4651,17 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         accumulator = relay_llm.AnthropicStreamAccumulator()
 
         def _open_anthropic_stream(next_api_kwargs: dict[str, Any]):
-            final_kwargs = dict(next_api_kwargs)
+            validate_context_dispatch_source(agent, next_api_kwargs)
+            from copy import deepcopy
+            final_kwargs = deepcopy(next_api_kwargs)
             sanitize_anthropic_kwargs(
                 final_kwargs,
                 log_prefix=getattr(agent, "log_prefix", ""),
             )
-            manager = request_client.messages.stream(**final_kwargs)
+            manager = context_dispatch_physical_call(
+                agent, final_kwargs, lambda final: request_client.messages.stream(**final),
+                source_payload=next_api_kwargs, transport_kind="anthropic_stream",
+            )
             _stream_context["manager"] = manager
             return manager.__enter__()
 

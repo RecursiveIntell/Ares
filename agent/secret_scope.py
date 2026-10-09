@@ -662,16 +662,7 @@ def build_profile_secret_scope(
             continue
         secrets[key] = value
 
-    # An explicitly admitted root underlay belongs to this profile's grant
-    # history. Keep that provenance if inheritance is later revoked while an
-    # old value remains in the launch environment. Never classify unrelated
-    # shell exports or unadmitted root namespaces as profile authority.
-    if inherited:
-        history_key = str(home.resolve())
-        with _PROFILE_OWNED_NAME_HISTORY_LOCK:
-            _PROFILE_OWNED_NAME_HISTORY.setdefault(history_key, set()).update(inherited)
-
-    return _immutable_scope(
+    scope = _immutable_scope(
         secrets,
         profile_home=home,
         source_status=(
@@ -681,6 +672,19 @@ def build_profile_secret_scope(
         external_generation=int(external_snapshot.generation),
         allow_environment_fallback=allow_environment_fallback,
     )
+
+    # A successful capture is an ownership observation, even if its dotenv or
+    # external declarations disappear before the first ownership enumeration.
+    # Include only captured profile authority, preserving admitted root grants
+    # and excluding unrelated shell state and direct process-global settings.
+    # Publish after immutable construction succeeds so a failed capture cannot
+    # partially add grants to the monotonic history.
+    observed_names = {name for name in scope.owned_names if not _is_global_env(name)}
+    if observed_names:
+        history_key = str(scope.profile_home)
+        with _PROFILE_OWNED_NAME_HISTORY_LOCK:
+            _PROFILE_OWNED_NAME_HISTORY.setdefault(history_key, set()).update(observed_names)
+    return scope
 
 
 @dataclass(frozen=True)

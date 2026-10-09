@@ -212,3 +212,39 @@ def test_public_admission_preserves_overflow_digest_and_no_snapshot_modes(bound_
         admit_final_context_dispatch(bound_agent, snapshot, body, attempt_id="overflow")
     assert admit_final_context_dispatch(bound_agent, None, {"previous_response_id": "opaque"},
                                        attempt_id="ordinary") is None
+
+
+def test_bedrock_native_default_reserve_is_admitted_with_unset_host_limit(bound_agent):
+    from agent.chat_completion_helpers import build_api_kwargs
+    from agent.transports.bedrock import BedrockTransport
+    bound_agent.api_mode = "bedrock_converse"
+    bound_agent.max_tokens = None
+    bound_agent._get_transport = lambda: BedrockTransport()
+    body = build_api_kwargs(bound_agent, [{"role": "user", "content": "hi"}], [])
+    assert body["inferenceConfig"]["maxTokens"] == 4096
+    snapshot = bound_agent._session_db.read_context_rebase_snapshot("s")
+    admission = admit_final_context_dispatch(bound_agent, snapshot, body, attempt_id="native-default")
+    assert admission["payload_digest"] == context_dispatch_payload_digest(body)
+
+
+@pytest.mark.parametrize("inference", [None, {}, {"maxTokens": None}, {"maxTokens": True},
+    {"maxTokens": "4096"}, {"maxTokens": 0}, {"maxTokens": -1}, []])
+def test_bedrock_invalid_native_reserve_cannot_borrow_host_or_top_level_limit(bound_agent, inference):
+    bound_agent.api_mode = "bedrock_converse"
+    body = payload("bedrock_converse")
+    body["inferenceConfig"] = inference
+    body["max_tokens"] = 1000
+    snapshot = bound_agent._session_db.read_context_rebase_snapshot("s")
+    with pytest.raises(ContextDispatchError, match="CONTEXT_DISPATCH_OUTPUT_BUDGET_UNQUALIFIED"):
+        admit_final_context_dispatch(bound_agent, snapshot, body, attempt_id="invalid-native")
+
+
+def test_bedrock_native_reserve_controls_overflow_despite_smaller_alias(bound_agent):
+    bound_agent.api_mode = "bedrock_converse"
+    bound_agent.context_compressor.context_length = 20_000
+    body = payload("bedrock_converse")
+    body["inferenceConfig"]["maxTokens"] = 15_000
+    body["max_tokens"] = 1000
+    snapshot = bound_agent._session_db.read_context_rebase_snapshot("s")
+    with pytest.raises(ContextDispatchError, match="CONTEXT_DISPATCH_FINAL_PAYLOAD_TOO_LARGE"):
+        admit_final_context_dispatch(bound_agent, snapshot, body, attempt_id="native-overflow")

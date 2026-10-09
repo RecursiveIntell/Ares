@@ -61,9 +61,61 @@ class _FailingLegacyProvider(_BaseStubProvider):
         raise RuntimeError("legacy best-effort failure")
 
 
+@pytest.fixture(autouse=True)
+def unavailable_remote_model_metadata(monkeypatch):
+    # Constructor refusal tests do not qualify external model discovery.
+    monkeypatch.setattr("agent.model_metadata._query_ollama_api_show", lambda *args, **kwargs: None)
+
+
 def test_provider_base_class_defaults_to_implicit_historical_api_version_one():
     assert MemoryProvider.pre_compress_checkpoint_api_version == 1
     assert PRE_COMPRESS_CHECKPOINT_API_VERSION == 2
+
+
+@pytest.mark.parametrize("role", ["user", "assistant"])
+@pytest.mark.parametrize("marked", [False, True])
+@pytest.mark.parametrize("layout", ["pure", "before", "after"])
+def test_checkpoint_uses_canonical_summary_and_live_evidence_projection(role, marked, layout):
+    from copy import deepcopy
+    from agent.context_compressor import (
+        SUMMARY_PREFIX, _SUMMARY_END_MARKER, _MERGED_PRIOR_CONTEXT_HEADER, _MERGED_SUMMARY_DELIMITER,
+    )
+    summary = SUMMARY_PREFIX + "\nDerivative decision\n" + _SUMMARY_END_MARKER
+    authored = "Set the deadline to Friday."
+    if layout == "before":
+        content = _MERGED_PRIOR_CONTEXT_HEADER + "\n" + authored + "\n" + _MERGED_SUMMARY_DELIMITER + "\n" + summary
+    elif layout == "after":
+        content = summary + "\n" + authored
+    else:
+        content = summary
+    message = {"role": role, "content": content, "api_content": "stale derivative wire data"}
+    if marked:
+        message[COMPRESSED_SUMMARY_METADATA_KEY] = True
+    original = deepcopy(message)
+    evidence = _direct_messages_for_pre_compress_memory([message])
+    manager = MemoryManager()
+    provider = _CheckpointProvider()
+    manager.add_provider(provider)
+    manager.on_pre_compress([message], evidence_messages=evidence, require_checkpoint=True)
+    expected = [] if layout == "pure" else [{"role": role, "content": authored}]
+    assert provider.pre_compress_calls == [expected]
+    assert message == original
+
+
+def test_marker_free_store_history_never_promotes_derivative_summary(tmp_path):
+    from agent.context_compressor import SUMMARY_PREFIX
+    from hermes_state import SessionDB
+    db = SessionDB(tmp_path / "checkpoint-history.db")
+    try:
+        db.create_session("s", source="cli")
+        db.append_message("s", "user", "Authored evidence")
+        db.append_message("s", "assistant", SUMMARY_PREFIX + "\nDerived evidence", _compressed_summary=True)
+        plain = db.get_messages_as_conversation("s")
+        assert all(COMPRESSED_SUMMARY_METADATA_KEY not in message for message in plain)
+        evidence = _direct_messages_for_pre_compress_memory(plain)
+        assert [(m["role"], m["content"]) for m in evidence] == [("user", "Authored evidence")]
+    finally:
+        db.close()
 
 
 def test_v1_providers_receive_raw_messages_and_v2_receive_evidence():

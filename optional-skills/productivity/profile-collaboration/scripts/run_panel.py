@@ -39,7 +39,15 @@ PROFILES = (
 
 DEFAULT_PROFILE_TIMEOUT_SECONDS = 180.0
 DEFAULT_PANEL_TIMEOUT_SECONDS = 600.0
-PANEL_CHILD_ENVIRONMENT_POLICY = "runtime_safe_path_workspace_bound_v2"
+PANEL_CHILD_ENVIRONMENT_POLICY = "profile_boundary_runtime_safe_path_v3"
+# The archive child has one fixed filesystem operation and needs no model/tool
+# credentials, including custom target grants unknown to provider registries.
+ARCHIVE_PROCESS_ENV_KEYS = frozenset({
+    "HOME", "HERMES_REAL_HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
+    "APPDATA", "LOCALAPPDATA", "SYSTEMROOT", "WINDIR", "TEMP", "TMP",
+    "TMPDIR", "PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "PYTHONUTF8",
+    "PYTHONDONTWRITEBYTECODE",
+})
 DAEMON_POOL_BLOCK_MARKERS = (
     b"every inspection tool failed",
     b"all execution and file-inspection tools failed",
@@ -251,6 +259,22 @@ def terminate_process_groups(processes: list[subprocess.Popen[bytes]]) -> None:
             pass
 
 
+def profile_subprocess_environment(
+    *, profile_home: Path, inherit_credentials: bool,
+) -> dict[str, str]:
+    """Use the runtime's canonical source/target credential boundary."""
+    from agent.secret_scope import build_profile_env_boundary
+    from hermes_constants import get_process_hermes_home
+    from tools.environments.local import hermes_subprocess_env
+
+    boundary = build_profile_env_boundary(
+        source_home=get_process_hermes_home(), target_home=profile_home,
+    )
+    return hermes_subprocess_env(
+        inherit_credentials=inherit_credentials, profile_boundary=boundary,
+    )
+
+
 def archive_automation_session(
     *, runtime: Path, profile_home: Path, session_id: str
 ) -> dict[str, str]:
@@ -272,16 +296,22 @@ def archive_automation_session(
         "finally:\n"
         "    db.close()\n"
     )
-    environment = os.environ.copy()
-    environment.update(
-        {
-            "HERMES_HOME": str(profile_home),
-            "PANEL_SESSION_ID": session_id,
-            "PYTHONPATH": str(runtime),
-        }
-    )
-    environment.pop("HERMES_SESSION_SOURCE", None)
     try:
+        environment = profile_subprocess_environment(
+            profile_home=profile_home, inherit_credentials=False,
+        )
+        environment = {
+            name: value for name, value in environment.items()
+            if name.upper() in ARCHIVE_PROCESS_ENV_KEYS
+        }
+        environment.update(
+            {
+                "HERMES_HOME": str(profile_home),
+                "PANEL_SESSION_ID": session_id,
+                "PYTHONPATH": str(runtime),
+            }
+        )
+        environment.pop("HERMES_SESSION_SOURCE", None)
         completed = subprocess.run(
             [str(runtime / ".venv" / "bin" / "python"), "-P", "-c", program],
             env=environment,
@@ -332,7 +362,9 @@ def run_one(
         "-z",
         brief,
     ]
-    environment = os.environ.copy()
+    environment = profile_subprocess_environment(
+        profile_home=profile_home, inherit_credentials=True,
+    )
     # A controller launched from Hermes TUI inherits this renderer-routing
     # hint. A panel child must remain a real `-z` oneshot so it reaches the
     # archival hook instead of entering TUI session creation and polluting the
@@ -577,6 +609,10 @@ def main() -> int:
         atomic_write_manifest(receipt_dir / "panel.json", manifest)
         print(receipt_dir)
         return 0
+
+    # Standalone skill scripts live outside the installed runtime. Import its
+    # canonical policy owners before creating worker threads; never from cwd.
+    sys.path.insert(0, str(runtime))
 
     panel_path = receipt_dir / "panel.json"
     atomic_write_manifest(panel_path, manifest)

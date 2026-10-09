@@ -44,27 +44,37 @@ def test_rollback_service_failure_restores_the_exact_pointer_pair(
     runtime.paths.unit_path.parent.mkdir(parents=True)
     runtime.paths.unit_path.write_text("inert service fixture", encoding="utf-8")
     calls: list[tuple[tuple[str, ...], bool]] = []
+    restart_count = 0
 
     def systemctl(*args: str, required: bool = True) -> bool:
+        nonlocal restart_count
         calls.append((args, required))
         if args[0] == "restart":
+            restart_count += 1
             if required and failure != "health":
                 raise AresLocalRuntimeError("injected rollback restart failure")
             if not required and failure == "recovery_restart":
                 raise OSError("injected recovery restart failure")
-        return not (failure == "health" and args[0] == "is-active")
+        return not (
+            failure == "health" and args[0] == "is-active" and restart_count < 2
+        )
 
     monkeypatch.setattr(runtime, "_systemctl", systemctl)
+    monkeypatch.setattr(runtime, "_gateway_state", lambda: (True, "enabled"))
     monkeypatch.setattr("ares_runtime.local_runtime.time.sleep", lambda _seconds: None)
-    error = (
-        "did not remain active" if failure == "health" else "rollback restart failure"
-    )
+    error = {
+        "health": "did not remain active",
+        "restart": "rollback restart failure",
+        "recovery_restart": "gateway recovery is unresolved",
+    }[failure]
     with pytest.raises(AresLocalRuntimeError, match=error):
         runtime.rollback()
 
     assert runtime.active_release() == ("b" * 40, current_source.resolve())
     assert runtime.previous_release() == ("a" * 40, previous_source.resolve())
-    assert calls[-1] == (("restart", "ares-gateway.service"), False)
+    assert [call for call in calls if call[0][0] == "restart"][-1] == (
+        ("restart", "ares-gateway.service"), False
+    )
 
 
 @pytest.mark.parametrize("gateway", [False, True])
@@ -79,6 +89,7 @@ def test_rollback_success_selects_previous_with_and_without_gateway(
     if gateway:
         runtime.paths.unit_path.parent.mkdir(parents=True)
         runtime.paths.unit_path.write_text("inert service fixture", encoding="utf-8")
+        monkeypatch.setattr(runtime, "_gateway_state", lambda: (True, "enabled"))
     calls: list[tuple[str, ...]] = []
     monkeypatch.setattr(
         runtime, "_systemctl", lambda *args, **_kw: calls.append(args) or True
@@ -101,6 +112,7 @@ def test_rollback_compensation_failure_is_reported_without_recovery_claim(
     runtime._activate("b" * 40)
     runtime.paths.unit_path.parent.mkdir(parents=True)
     runtime.paths.unit_path.write_text("inert service fixture", encoding="utf-8")
+    monkeypatch.setattr(runtime, "_gateway_state", lambda: (True, "enabled"))
     monkeypatch.setattr(
         runtime,
         "_systemctl",
@@ -131,11 +143,15 @@ def test_upstream_candidate_reuse_removes_owned_staging(
     upstream, downstream = "c" * 40, "d" * 40
     installed = _release(runtime, upstream)
     python = runtime._python_for(installed)
-    python.parent.mkdir(parents=True)
+    python.parent.mkdir(parents=True, exist_ok=True)
     python.write_text("inert interpreter fixture", encoding="utf-8")
     runtime._atomic_json(
         runtime._release_dir(upstream) / "release.json",
-        {"upstream_revision": upstream, "downstream_revision": downstream},
+        {
+            **runtime._release_metadata(upstream),
+            "upstream_revision": upstream,
+            "downstream_revision": downstream,
+        },
     )
     prior_source = _release(runtime, "a" * 40)
     runtime._activate("a" * 40)
@@ -202,9 +218,20 @@ def test_upstream_candidate_reuse_removes_owned_staging(
     assert runtime.previous_release() == ("a" * 40, prior_source.resolve())
 
 
-def _release(runtime: AresLocalRuntime, revision: str) -> Path:
+def _release(runtime: AresLocalRuntime, revision: str, *, complete: bool = True) -> Path:
     source = runtime.paths.releases_dir / revision / "source"
     source.mkdir(parents=True)
+    record: dict[str, object] = {"revision": revision}
+    if complete:
+        python = runtime._python_for(source)
+        python.parent.mkdir(parents=True)
+        python.write_text("inert interpreter fixture", encoding="utf-8")
+        record["runtime_binding"] = {
+            "schema": "AresLocalRuntimeBindingV1",
+            "source": str(source.resolve()),
+            "controller_contract": 1,
+        }
+    runtime._atomic_json(source.parent / "release.json", record)
     return source
 
 
@@ -238,7 +265,7 @@ def gateway_stop_case(tmp_path: Path, monkeypatch):
     runtime = _runtime(tmp_path)
     source = _release(runtime, "a" * 40)
     python = source / ".venv" / "bin" / "python"
-    python.parent.mkdir(parents=True)
+    python.parent.mkdir(parents=True, exist_ok=True)
     python.touch()
     runtime._activate("a" * 40)
     home = runtime.paths.agent_home
@@ -576,6 +603,7 @@ def test_upstream_candidate_applies_downstream_delta_in_staging(
     tmp_path: Path, monkeypatch
 ) -> None:
     upstream = _repository(tmp_path / "upstream")
+    (upstream / ".gitignore").write_text(".venv/\n", encoding="utf-8")
     (upstream / "hermes.txt").write_text("base\n", encoding="utf-8")
     _commit(upstream, "base")
 
@@ -590,7 +618,11 @@ def test_upstream_candidate_applies_downstream_delta_in_staging(
     upstream_revision = _commit(upstream, "upstream change")
 
     runtime = _runtime(tmp_path)
-    monkeypatch.setattr(runtime, "_build_runtime", lambda source, *, desktop: None)
+    def build_inert_python(source, *, desktop):
+        python = runtime._python_for(source)
+        python.parent.mkdir(parents=True)
+        python.write_text("inert interpreter fixture", encoding="utf-8")
+    monkeypatch.setattr(runtime, "_build_runtime", build_inert_python)
     monkeypatch.setattr(runtime, "_refresh_moved_editable_install", lambda source: None)
 
     candidate_revision = runtime._materialize_upstream_candidate(
@@ -637,7 +669,11 @@ def test_update_activates_only_the_verified_upstream_candidate(
         upstream_remote=str(upstream),
         upstream_branch="main",
     )
-    monkeypatch.setattr(runtime, "_build_runtime", lambda source, *, desktop: None)
+    def build_inert_python(source, *, desktop):
+        python = runtime._python_for(source)
+        python.parent.mkdir(parents=True)
+        python.write_text("inert interpreter fixture", encoding="utf-8")
+    monkeypatch.setattr(runtime, "_build_runtime", build_inert_python)
     monkeypatch.setattr(runtime, "_refresh_moved_editable_install", lambda source: None)
 
     candidate_revision, changed = runtime.update(desktop=False)
@@ -777,6 +813,7 @@ def test_recipe_admission_preserves_base_update_and_noop(recipe_update_case, mon
     monkeypatch.setattr(runtime, "_systemctl", lambda *args, **kwargs: pytest.fail("No service in base fixture"))
     if current_tuple:
         runtime._atomic_json(case.current.parent / "release.json", {
+            **runtime._release_metadata("b" * 40),
             "downstream_revision": "d" * 40, "upstream_revision": "e" * 40,
             "upstream_remote": "fixture-upstream", "upstream_branch": "main",
         })
@@ -1098,8 +1135,9 @@ def test_setup_handoff_failure_restores_pointer_and_launcher(
     assert ("restart", "ares-gateway.service") in calls
 
 
+@pytest.mark.parametrize("recovery_healthy", [True, False])
 def test_update_failure_restores_complete_pointer_pair(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, recovery_healthy: bool
 ) -> None:
     runtime = _runtime(tmp_path)
     prior_revision = "0" * 40
@@ -1112,6 +1150,7 @@ def test_update_failure_restores_complete_pointer_pair(
     runtime._activate(old_revision)
     runtime.paths.unit_path.parent.mkdir(parents=True)
     runtime.paths.unit_path.write_text("unit", encoding="utf-8")
+    monkeypatch.setattr(runtime, "_gateway_state", lambda: (True, "enabled"))
 
     monkeypatch.setattr(
         runtime,
@@ -1135,20 +1174,32 @@ def test_update_failure_restores_complete_pointer_pair(
         lambda **_kwargs: new_revision,
     )
     monkeypatch.setattr(runtime, "_install_gateway_unit", lambda: None)
-    monkeypatch.setattr(
-        runtime,
-        "_systemctl",
-        lambda *args, **_kwargs: (
-            False if args[:2] == ("is-active", "--quiet") else True
-        ),
-    )
+    health_revisions: list[str] = []
+
+    def systemctl(*args: str, **_kwargs) -> bool:
+        if args[:2] == ("is-active", "--quiet"):
+            revision = runtime.active_release()[0]
+            health_revisions.append(revision)
+            return revision == old_revision and recovery_healthy
+        return True
+
+    monkeypatch.setattr(runtime, "_systemctl", systemctl)
     monkeypatch.setattr("ares_runtime.local_runtime.time.sleep", lambda _seconds: None)
 
-    with pytest.raises(AresLocalRuntimeError, match="did not remain active"):
+    error = (
+        "Ares gateway did not remain active after update"
+        if recovery_healthy
+        else "Ares release pointers were restored but gateway recovery is unresolved"
+    )
+    with pytest.raises(AresLocalRuntimeError, match=f"^{error}$") as raised:
         runtime.update(desktop=False)
 
+    assert health_revisions == [new_revision, old_revision]
     assert runtime.active_release() == (old_revision, old_source.resolve())
     assert runtime.previous_release() == (prior_revision, prior_source.resolve())
+    if not recovery_healthy:
+        assert isinstance(raised.value.__cause__, AresLocalRuntimeError)
+        assert str(raised.value.__cause__) == "prior gateway did not remain active"
 
 
 def test_setup_pre_handoff_failure_restores_complete_pointer_pair(
@@ -1413,7 +1464,7 @@ def test_doctor_reports_live_runtime_process_drift(tmp_path: Path, monkeypatch) 
     revision = "a" * 40
     source = _release(runtime, revision)
     python = runtime._python_for(source)
-    python.parent.mkdir(parents=True)
+    python.parent.mkdir(parents=True, exist_ok=True)
     python.write_text("python", encoding="utf-8")
     python.chmod(0o755)
     runtime._activate(revision)
@@ -1464,8 +1515,9 @@ def test_runtime_builder_refuses_an_installed_release_source(
     runtime = _runtime(tmp_path)
     source = _release(runtime, "a" * 40)
     monkeypatch.setattr(
-        "hermes_cli.managed_uv.ensure_uv",
-        lambda: (_ for _ in ()).throw(AssertionError("managed build was entered")),
+        runtime,
+        "_sync_python_runtime",
+        lambda _source: (_ for _ in ()).throw(AssertionError("managed build was entered")),
     )
 
     with pytest.raises(AresLocalRuntimeError, match="installed release"):
@@ -1512,7 +1564,7 @@ def test_materialize_reuses_a_complete_existing_release_without_rebuilding(
     revision = "a" * 40
     source = _release(runtime, revision)
     python = runtime._python_for(source)
-    python.parent.mkdir(parents=True)
+    python.parent.mkdir(parents=True, exist_ok=True)
     python.write_text("python", encoding="utf-8")
     python.chmod(0o755)
     monkeypatch.setattr(
@@ -1528,18 +1580,17 @@ def test_materialize_reuses_a_complete_existing_release_without_rebuilding(
     assert runtime._release_source(revision) == source
 
 
-def test_materialize_quarantines_an_incomplete_nonactive_release_then_rebuilds(
+def test_materialize_quarantines_an_incomplete_unselected_release_then_rebuilds(
     tmp_path: Path, monkeypatch
 ) -> None:
     runtime = _runtime(tmp_path)
     source_repository = _repository(tmp_path / "source")
     (source_repository / "canonical.txt").write_text("canonical\n", encoding="utf-8")
     revision = _commit(source_repository, "canonical source")
-    incomplete_source = _release(runtime, revision)
+    incomplete_source = _release(runtime, revision, complete=False)
     (incomplete_source / "preserved.txt").write_text(
         "old incomplete release\n", encoding="utf-8"
     )
-    runtime._atomic_link(runtime.paths.previous_link, incomplete_source.resolve())
 
     build_sources: list[Path] = []
     refresh_sources: list[Path] = []
@@ -1577,7 +1628,7 @@ def test_materialize_quarantines_an_incomplete_nonactive_release_then_rebuilds(
     assert (quarantines[0] / "source" / "preserved.txt").read_text(
         encoding="utf-8"
     ) == "old incomplete release\n"
-    assert runtime.previous_release() == (revision, rebuilt.resolve())
+    assert runtime.previous_release() is None
 
 
 def test_materialize_restores_incomplete_release_when_recovery_build_fails(
@@ -1587,11 +1638,10 @@ def test_materialize_restores_incomplete_release_when_recovery_build_fails(
     source_repository = _repository(tmp_path / "source")
     (source_repository / "canonical.txt").write_text("canonical\n", encoding="utf-8")
     revision = _commit(source_repository, "canonical source")
-    incomplete_source = _release(runtime, revision)
+    incomplete_source = _release(runtime, revision, complete=False)
     (incomplete_source / "preserved.txt").write_text(
         "old incomplete release\n", encoding="utf-8"
     )
-    runtime._atomic_link(runtime.paths.previous_link, incomplete_source.resolve())
     monkeypatch.setattr(
         runtime,
         "_build_runtime",
@@ -1607,7 +1657,7 @@ def test_materialize_restores_incomplete_release_when_recovery_build_fails(
     assert (restored / "preserved.txt").read_text(
         encoding="utf-8"
     ) == "old incomplete release\n"
-    assert runtime.previous_release() == (revision, restored.resolve())
+    assert runtime.previous_release() is None
     assert not list(
         (runtime.paths.data_root / "quarantine" / "incomplete-releases").glob(
             f"{revision}.*"
@@ -1622,11 +1672,10 @@ def test_materialize_restores_incomplete_release_when_editable_refresh_fails(
     source_repository = _repository(tmp_path / "source-refresh-failure")
     (source_repository / "canonical.txt").write_text("canonical\n", encoding="utf-8")
     revision = _commit(source_repository, "canonical source")
-    incomplete_source = _release(runtime, revision)
+    incomplete_source = _release(runtime, revision, complete=False)
     (incomplete_source / "preserved.txt").write_text(
         "old incomplete release\n", encoding="utf-8"
     )
-    runtime._atomic_link(runtime.paths.previous_link, incomplete_source.resolve())
 
     def mark_ready(source: Path, *, desktop: bool) -> None:
         assert desktop is False
@@ -1649,7 +1698,7 @@ def test_materialize_restores_incomplete_release_when_editable_refresh_fails(
     assert (restored / "preserved.txt").read_text(
         encoding="utf-8"
     ) == "old incomplete release\n"
-    assert runtime.previous_release() == (revision, restored.resolve())
+    assert runtime.previous_release() is None
     assert not list(
         (runtime.paths.data_root / "quarantine" / "incomplete-releases").glob(
             f"{revision}.*"
@@ -1666,6 +1715,7 @@ def test_materialize_refuses_to_quarantine_an_incomplete_active_release(
     revision = _commit(source_repository, "canonical source")
     incomplete_source = _release(runtime, revision)
     runtime._activate(revision)
+    runtime._python_for(incomplete_source).unlink()
     monkeypatch.setattr(
         runtime,
         "_build_runtime",
@@ -1692,11 +1742,10 @@ def test_materialize_restores_incomplete_release_when_staging_cleanup_fails(
     source_repository = _repository(tmp_path / "source")
     (source_repository / "canonical.txt").write_text("canonical\n", encoding="utf-8")
     revision = _commit(source_repository, "canonical source")
-    incomplete_source = _release(runtime, revision)
+    incomplete_source = _release(runtime, revision, complete=False)
     (incomplete_source / "preserved.txt").write_text(
         "old incomplete release\n", encoding="utf-8"
     )
-    runtime._atomic_link(runtime.paths.previous_link, incomplete_source.resolve())
     monkeypatch.setattr(
         runtime,
         "_build_runtime",
@@ -1716,7 +1765,7 @@ def test_materialize_restores_incomplete_release_when_staging_cleanup_fails(
     assert (restored / "preserved.txt").read_text(
         encoding="utf-8"
     ) == "old incomplete release\n"
-    assert runtime.previous_release() == (revision, restored.resolve())
+    assert runtime.previous_release() is None
 
 
 def test_upstream_candidate_refresh_failure_removes_published_candidate(
