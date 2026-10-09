@@ -966,11 +966,19 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
             is_stale_connection_error,
             normalize_converse_response,
         )
-        region = api_kwargs.pop("__bedrock_region__", "us-east-1")
-        api_kwargs.pop("__bedrock_converse__", None)
+        from ares_runtime.continuity.runtime import (
+            context_dispatch_physical_call, validate_context_dispatch_source,
+        )
+        validate_context_dispatch_source(agent, api_kwargs)
+        final_kwargs = dict(api_kwargs)
+        region = final_kwargs.pop("__bedrock_region__", "us-east-1")
+        final_kwargs.pop("__bedrock_converse__", None)
         client = _get_bedrock_runtime_client(region)
         try:
-            raw_response = client.converse(**api_kwargs)
+            raw_response = context_dispatch_physical_call(
+                agent, final_kwargs, lambda final: client.converse(**final),
+                source_payload=api_kwargs, transport_kind="bedrock_nonstream",
+            )
         except Exception as _bedrock_exc:
             # Evict the cached client on stale-connection failures
             # so the outer retry loop builds a fresh client/pool.
@@ -979,6 +987,9 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
             raise
         return normalize_converse_response(raw_response)
     if agent.provider == "moa":
+        # Explicit native selection must refuse before MoA facade effects.
+        if agent.api_mode == "chat_completions" and _should_use_ri_pipeline(agent, api_kwargs):
+            return ri_pipeline_chat_completion(agent, api_kwargs)
         # MoA is a virtual chat-completions provider backed by the
         # in-process MoAClient facade. Do not rebuild a request-local
         # OpenAI client from the virtual runtime metadata.
@@ -999,7 +1010,7 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     if (
         agent.api_mode == "chat_completions"
         and api_kwargs.get("stream") is not True
-        and _should_use_ri_pipeline(agent)
+        and _should_use_ri_pipeline(agent, api_kwargs)
     ):
         logger.debug(
             "Using llm-pipeline transport for non-streaming chat completion call "
@@ -2472,7 +2483,9 @@ def _fallback_reason_text(reason: "FailoverReason | None") -> str:
     return str(value or reason or "provider failure").replace("_", " ")
 
 
-def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
+def try_activate_fallback(
+    agent, reason: "FailoverReason | None" = None, *, _continuing_chain: bool = False
+) -> bool:
     """Switch to the next fallback model/provider in the chain.
 
     Called when the current model is failing after retries.  Swaps the
@@ -2484,7 +2497,10 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
-    if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
+    # Restoring the primary after an inadmissible candidate must not turn the
+    # internal chain walk into another originating provider failure. Separate
+    # public calls still arm backoff even when the chain is already exhausted.
+    if not _continuing_chain and reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
         # source of the 429 so the cooldown should not be reset/extended.
@@ -2532,11 +2548,11 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         agent._unavailable_fallback_keys = unavailable
     if fb_key in unavailable:
         logger.debug("Fallback skip: %s previously marked unavailable", fb_key)
-        return agent._try_activate_fallback(reason)
+        return try_activate_fallback(agent, reason, _continuing_chain=True)
     fb_provider = (fb.get("provider") or "").strip().lower()
     fb_model = (fb.get("model") or "").strip()
     if not fb_provider or not fb_model:
-        return agent._try_activate_fallback(reason)  # skip invalid, try next
+        return try_activate_fallback(agent, reason, _continuing_chain=True)  # skip invalid, try next
 
     local_skip_reason = _fallback_entry_unavailable_without_network(agent, fb)
     if local_skip_reason:
@@ -2547,7 +2563,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             fb_model,
             local_skip_reason,
         )
-        return agent._try_activate_fallback(reason)
+        return try_activate_fallback(agent, reason, _continuing_chain=True)
 
     # Skip entries that resolve to the same backend that just failed —
     # falling back to it loops the failure. Identity semantics (which axes
@@ -2572,11 +2588,15 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             "as the current one (%s)",
             fb_provider, fb_model, current_ident.base_url or current_ident.provider,
         )
-        return agent._try_activate_fallback(reason)
+        return try_activate_fallback(agent, reason, _continuing_chain=True)
 
     # Use centralized router for client construction.
     # raw_codex=True because the main agent needs direct responses.stream()
     # access for Codex providers.
+    from agent.agent_runtime_helpers import _snapshot_context_handoff
+
+    restore_handoff = _snapshot_context_handoff(agent)
+    handoff_accepted = False
     try:
         from agent.auxiliary_client import resolve_provider_client
         # Pass base_url and api_key from fallback config so custom
@@ -2629,7 +2649,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 "Fallback to %s failed: provider not configured",
                 fb_provider)
             unavailable.add(fb_key)
-            return agent._try_activate_fallback(reason)  # try next in chain
+            return try_activate_fallback(agent, reason, _continuing_chain=True)  # try next in chain
         try:
             from hermes_cli.model_normalize import normalize_model_for_provider
 
@@ -2844,10 +2864,12 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 api_key=getattr(agent, "api_key", ""),  # callable preserved → call_llm
                 provider=agent.provider,
                 api_mode=agent.api_mode,
+                max_tokens=getattr(agent, "max_tokens", None),
                 threshold_percent=_effective_compression_threshold_percent(
                     agent.model, agent.provider
                 ),
             )
+        handoff_accepted = True
 
         # Re-resolve reasoning_config for the new fallback model (Closes #21256).
         # Shared chokepoint: per-model override > global reasoning_effort
@@ -2906,10 +2928,12 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         _reset_stale_streak(agent)
         return True
     except Exception as e:
+        if not handoff_accepted:
+            restore_handoff()
         if fb_provider == "nous":
             unavailable.add(fb_key)
         logger.error("Failed to activate fallback %s: %s", fb_model, e)
-        return agent._try_activate_fallback(reason)  # try next in chain
+        return try_activate_fallback(agent, reason, _continuing_chain=True)  # try next in chain
 
 
 
@@ -3371,6 +3395,22 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted before streaming API call")
 
+    from ares_runtime.continuity.runtime import (
+        context_dispatch_physical_call, validate_context_dispatch_source,
+    )
+
+    def _nonstreaming_callback(kwargs):
+        if agent.api_mode in {"codex_responses", "bedrock_converse"}:
+            # Their canonical factories admit the final SDK request. Calling
+            # the interrupt worker under an outer admission lock would both
+            # seal too early and create a cross-thread lock wait.
+            validate_context_dispatch_source(agent, kwargs)
+            return agent._interruptible_api_call(kwargs)
+        return context_dispatch_physical_call(
+            agent, kwargs, lambda final: agent._interruptible_api_call(final),
+            source_payload=api_kwargs, transport_kind="stream_nonstream",
+        )
+
     def _stream_final_text(response) -> str:
         try:
             choices = getattr(response, "choices", None)
@@ -3413,11 +3453,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     # branch below — routing through the _interruptible_api_call method keeps the
     # outer loop's per-request retry/refresh seam intact.
     if should_use_direct_api_call(agent):
-        if agent.api_mode == "chat_completions" and _should_use_ri_pipeline(agent):
+        if agent.api_mode == "chat_completions" and _should_use_ri_pipeline(agent, api_kwargs):
             _nonstreaming_args = dict(api_kwargs)
             _nonstreaming_args["stream"] = False
-            return agent._interruptible_api_call(_nonstreaming_args)
-        return agent._interruptible_api_call(api_kwargs)
+            return _nonstreaming_callback(_nonstreaming_args)
+        return _nonstreaming_callback(api_kwargs)
 
     if agent.api_mode == "codex_responses":
         # Codex streams internally via _run_codex_stream. The main dispatch
@@ -3427,7 +3467,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         agent._codex_on_first_delta = on_first_delta
         _emit_stream_start()
         try:
-            response = agent._interruptible_api_call(api_kwargs)
+            response = _nonstreaming_callback(api_kwargs)
             _emit_stream_end(final_text=_stream_final_text(response), finished=True, error=None)
             return response
         except Exception as exc:
@@ -3442,11 +3482,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     # any provider-side stream behavior.
     if (
         agent.api_mode == "chat_completions"
-        and _should_use_ri_pipeline(agent)
+        and _should_use_ri_pipeline(agent, api_kwargs)
     ):
         _streaming_disabled_kwargs = dict(api_kwargs)
         _streaming_disabled_kwargs["stream"] = False
-        return agent._interruptible_api_call(_streaming_disabled_kwargs)
+        return _nonstreaming_callback(_streaming_disabled_kwargs)
 
     # Bedrock Converse uses boto3's converse_stream() with real-time delta
     # callbacks — same UX as Anthropic and chat_completions streaming.
@@ -3499,12 +3539,16 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 writer_token = {"value": None}
 
                 def _open_bedrock_stream(next_api_kwargs: dict[str, Any]):
+                    validate_context_dispatch_source(agent, next_api_kwargs)
                     final_kwargs = dict(next_api_kwargs)
                     region = final_kwargs.pop("__bedrock_region__", "us-east-1")
                     final_kwargs.pop("__bedrock_converse__", None)
                     client = _get_bedrock_runtime_client(region)
                     try:
-                        raw_response = client.converse_stream(**final_kwargs)
+                        raw_response = context_dispatch_physical_call(
+                            agent, final_kwargs, lambda final: client.converse_stream(**final),
+                            source_payload=next_api_kwargs, transport_kind="bedrock_stream",
+                        )
                     except Exception as _bedrock_exc:
                         # InvokeModel-only policies cannot open a stream. Keep
                         # the fallback inside the same managed Relay attempt so
@@ -3523,7 +3567,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                                 type(_bedrock_exc).__name__,
                             )
                             return normalize_converse_response(
-                                client.converse(**final_kwargs)
+                                context_dispatch_physical_call(
+                                    agent, final_kwargs, lambda final: client.converse(**final),
+                                    source_payload=next_api_kwargs, transport_kind="bedrock_stream",
+                                )
                             )
                         if is_stale_connection_error(_bedrock_exc):
                             invalidate_runtime_client(region)
@@ -4001,6 +4048,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         attempt_stream_response = {"value": None}
 
         def _open_stream(next_api_kwargs: dict[str, Any]):
+            validate_context_dispatch_source(agent, next_api_kwargs)
             stream_kwargs = {
                 **next_api_kwargs,
                 "stream": True,
@@ -4023,7 +4071,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             attempt_request_client["value"] = request_client
             last_chunk_time["t"] = time.time()
             agent._touch_activity("waiting for provider response (streaming)")
-            return request_client.chat.completions.create(**stream_kwargs)
+            return context_dispatch_physical_call(
+                agent, stream_kwargs, lambda final: request_client.chat.completions.create(**final),
+                source_payload=next_api_kwargs, transport_kind="chat_stream",
+            )
 
         def _stream_created(raw_stream: Any) -> None:
             response = getattr(raw_stream, "response", None)
@@ -4600,12 +4651,17 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         accumulator = relay_llm.AnthropicStreamAccumulator()
 
         def _open_anthropic_stream(next_api_kwargs: dict[str, Any]):
-            final_kwargs = dict(next_api_kwargs)
+            validate_context_dispatch_source(agent, next_api_kwargs)
+            from copy import deepcopy
+            final_kwargs = deepcopy(next_api_kwargs)
             sanitize_anthropic_kwargs(
                 final_kwargs,
                 log_prefix=getattr(agent, "log_prefix", ""),
             )
-            manager = request_client.messages.stream(**final_kwargs)
+            manager = context_dispatch_physical_call(
+                agent, final_kwargs, lambda final: request_client.messages.stream(**final),
+                source_payload=next_api_kwargs, transport_kind="anthropic_stream",
+            )
             _stream_context["manager"] = manager
             return manager.__enter__()
 

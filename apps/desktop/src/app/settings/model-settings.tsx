@@ -1,11 +1,13 @@
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import {
   beginMainModelSave,
+  composerOwnerKey,
   isMainModelSaveOriginCurrent,
   ownsMainModelSave
 } from '@/app/session/hooks/composer-model-selection-owner'
-import type { OnMainModelChanged } from '@/app/session/hooks/composer-model-selection-owner'
+import type { ComposerSelectionOwner, OnMainModelChanged } from '@/app/session/hooks/composer-model-selection-owner'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
@@ -15,6 +17,7 @@ import {
   getAuxiliaryModels,
   getGlobalModelInfo,
   getGlobalModelOptions,
+  getHermesConfigRecord,
   getMoaModels,
   getRecommendedDefaultModel,
   saveHermesConfig,
@@ -24,6 +27,7 @@ import {
 } from '@/hermes'
 import type {
   AuxiliaryModelsResponse,
+  HermesConfigRecord,
   MoaConfigResponse,
   MoaModelSlot,
   ModelOptionProvider,
@@ -37,7 +41,8 @@ import { setMainModelAssignment } from '@/store/cron-model-impact'
 import { notifyError } from '@/store/notifications'
 import { startManualLocalEndpoint, startManualOnboarding, startManualProviderOAuth } from '@/store/onboarding'
 
-import { hermesConfigCacheWriter, invalidateHermesConfig, useHermesConfigRecord } from '../hooks/use-config-record'
+import { requireCurrentModelOwner, useModelFormKey, useModelOwnerIsCurrent, useModelRequestOwner } from '../hooks/use-composer-model-owner'
+import { HERMES_CONFIG_KEY } from '../hooks/use-config-record'
 import { useOnProfileSwitch } from '../hooks/use-on-profile-switch'
 
 import { CONTROL_TEXT } from './constants'
@@ -195,6 +200,22 @@ interface ModelSettingsProps {
 }
 
 export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSettingsProps) {
+  const owner = useModelRequestOwner(scopeProfile)
+  const formKey = useModelFormKey(owner, scopeProfile)
+
+  return <ModelSettingsForm key={formKey} onMainModelChanged={onMainModelChanged} owner={owner} scopeProfile={scopeProfile} />
+}
+
+function ModelSettingsForm({ onMainModelChanged, owner, scopeProfile }: ModelSettingsProps & { owner: ComposerSelectionOwner }) {
+  const isOwnerCurrent = useModelOwnerIsCurrent(owner, scopeProfile)
+  const ownerKey = composerOwnerKey(owner)
+  const queryClient = useQueryClient()
+
+  const configKey = useMemo(
+    () => [...HERMES_CONFIG_KEY, ownerKey] as const,
+    [ownerKey]
+  )
+
   const { t } = useI18n()
   const m = t.settings.model
   const [loading, setLoading] = useState(true)
@@ -207,10 +228,26 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
   const [moa, setMoa] = useState<MoaConfigResponse | null>(null)
   const [selectedMoaPreset, setSelectedMoaPreset] = useState('')
   const [newMoaPresetName, setNewMoaPresetName] = useState('')
+
   // agent.* defaults round-trip through the shared config cache (read → write
   // back the whole record), so a save here shows in the MCP/model surfaces.
-  const { data: config } = useHermesConfigRecord(scopeProfile)
-  const setConfig = useMemo(() => hermesConfigCacheWriter(scopeProfile), [scopeProfile])
+  const { data: config } = useQuery({
+    queryKey: configKey,
+    queryFn: () => {
+      requireCurrentModelOwner(isOwnerCurrent)
+
+      // Keep GET and PUT on the same legacy routing seam. In particular an
+      // ambient explicit 'local' tag must bypass legacy remote overrides.
+      return getHermesConfigRecord(scopeProfile)
+    },
+    staleTime: 0
+  })
+
+  const setConfig = useCallback(
+    (value: HermesConfigRecord) => queryClient.setQueryData(configKey, value),
+    [configKey, queryClient]
+  )
+
   const [applying, setApplying] = useState(false)
   const [editingAuxTask, setEditingAuxTask] = useState<null | string>(null)
   const [auxDraft, setAuxDraft] = useState<{ model: string; provider: string }>({ model: '', provider: '' })
@@ -232,11 +269,15 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
 
   // Every profile-scoped async here captures this and bails before writing back,
   // so a request in flight when the user switches profiles can't paint profile
-  // A's models/providers into profile B (or fire onMainModelChanged for A).
+  // A's models/providers into profile B. Confirmed saves still report origin.
   const profileEpoch = useRef(0)
 
   const refresh = useCallback(
     async ({ replaceSelection = false }: { replaceSelection?: boolean } = {}) => {
+      if (!isOwnerCurrent()) {
+        return
+      }
+
       const epoch = profileEpoch.current
       setLoading(true)
       setError('')
@@ -249,7 +290,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
           getMoaModels(scopeProfile).catch(() => null)
         ])
 
-        if (profileEpoch.current !== epoch) {
+        if (profileEpoch.current !== epoch || !isOwnerCurrent()) {
           return
         }
 
@@ -273,18 +314,18 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
 
         // The config record loads via its own shared query; a model switch can
         // change it server-side (aux slots), so nudge that cache to refetch.
-        void invalidateHermesConfig(scopeProfile)
+        void queryClient.invalidateQueries({ queryKey: configKey })
       } catch (err) {
-        if (profileEpoch.current === epoch) {
+        if (profileEpoch.current === epoch && isOwnerCurrent()) {
           setError(err instanceof Error ? err.message : String(err))
         }
       } finally {
-        if (profileEpoch.current === epoch) {
+        if (profileEpoch.current === epoch && isOwnerCurrent()) {
           setLoading(false)
         }
       }
     },
-    [scopeProfile]
+    [configKey, isOwnerCurrent, queryClient, scopeProfile]
   )
 
   useEffect(() => {
@@ -406,20 +447,24 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
       }
 
       moaSaveTimer.current = window.setTimeout(() => {
+        if (!isOwnerCurrent()) {
+          return
+        }
+
         void saveMoaModels(next, scopeProfile)
           .then(saved => {
-            if (moaSaveGeneration.current === generation) {
+            if (moaSaveGeneration.current === generation && isOwnerCurrent()) {
               setMoa(saved)
             }
           })
           .catch(err => {
-            if (moaSaveGeneration.current === generation) {
+            if (moaSaveGeneration.current === generation && isOwnerCurrent()) {
               setError(err instanceof Error ? err.message : String(err))
             }
           })
       }, 600)
     },
-    [scopeProfile]
+    [isOwnerCurrent, scopeProfile]
   )
 
   const updateMoaPreset = useCallback(
@@ -475,9 +520,10 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
       setError('')
 
       try {
+        requireCurrentModelOwner(isOwnerCurrent)
         const saved = await saveMoaModels(next, scopeProfile)
 
-        if (profileEpoch.current !== epoch) {
+        if (profileEpoch.current !== epoch || !isOwnerCurrent()) {
           return
         }
 
@@ -488,7 +534,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
         setApplying(false)
       }
     },
-    [scopeProfile]
+    [isOwnerCurrent, scopeProfile]
   )
 
   const auxiliaryTaskLabel = useCallback((key: string) => m.tasks[key]?.label ?? key, [m.tasks])
@@ -544,16 +590,18 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
 
       const prev = config
       const next = setNested(config, key, value)
-      setConfig(next)
 
       try {
+        requireCurrentModelOwner(isOwnerCurrent)
+        setConfig(next)
         await saveHermesConfig(next, scopeProfile)
+        void queryClient.invalidateQueries({ queryKey: HERMES_CONFIG_KEY })
       } catch (err) {
         setConfig(prev)
         notifyError(err, m.defaultsFailed)
       }
     },
-    [config, m.defaultsFailed, scopeProfile, setConfig]
+    [config, isOwnerCurrent, m.defaultsFailed, queryClient, scopeProfile, setConfig]
   )
 
   // Paste an API key for the selected `api_key` provider, persist it, then
@@ -572,7 +620,13 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
     setError('')
 
     try {
+      requireCurrentModelOwner(isOwnerCurrent)
       await setEnvVar(keyEnv, apiKeyDraft.trim(), scopeProfile)
+
+      if (!isOwnerCurrent()) {
+        return
+      }
+
       setApiKeyDraft('')
 
       // Pick a sensible default for the freshly-activated provider (mirrors
@@ -587,9 +641,13 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
         nextModel = ''
       }
 
+      if (!isOwnerCurrent()) {
+        return
+      }
+
       const options = await getGlobalModelOptions(undefined, scopeProfile)
 
-      if (profileEpoch.current !== epoch) {
+      if (profileEpoch.current !== epoch || !isOwnerCurrent()) {
         return
       }
 
@@ -602,7 +660,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
     } finally {
       setActivating(false)
     }
-  }, [apiKeyDraft, scopeProfile, selectedProviderRow])
+  }, [apiKeyDraft, isOwnerCurrent, scopeProfile, selectedProviderRow])
 
   // OAuth / external providers can't be activated with a pasted key — hand off
   // to the shared onboarding flow scoped to this provider's real sign-in. The
@@ -613,7 +671,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
     const rowSlug = selectedProviderRow?.slug.trim() ?? ''
     const slug = rowSlug || selectedProvider.trim()
 
-    if (!slug) {
+    if (!slug || !isOwnerCurrent()) {
       return
     }
 
@@ -628,19 +686,20 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
       // provider picker instead of deep-linking an unknown or stale slug.
       startManualOnboarding()
     }
-  }, [selectedProvider, selectedProviderRow])
+  }, [isOwnerCurrent, selectedProvider, selectedProviderRow])
 
   const applyMainModel = useCallback(async () => {
     if (!selectedProvider || !selectedModel) {
       return
     }
 
-    const epoch = profileEpoch.current
-    const origin = beginMainModelSave(scopeProfile)
     setApplying(true)
     setError('')
 
     try {
+      requireCurrentModelOwner(isOwnerCurrent)
+      const origin = beginMainModelSave(scopeProfile)
+
       const result = await setMainModelAssignment(
         {
           model: selectedModel,
@@ -648,29 +707,32 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
           ...(selectedProviderRow?.api_url ? { base_url: selectedProviderRow.api_url } : {})
         },
         scopeProfile,
-        { ownsOrigin: () => isMainModelSaveOriginCurrent(origin, scopeProfile) }
+        { ownsOrigin: () => isOwnerCurrent() && isMainModelSaveOriginCurrent(origin, scopeProfile) }
       )
 
-      if (profileEpoch.current !== epoch || !ownsMainModelSave(origin)) {
+      if (!ownsMainModelSave(origin)) {
         return
       }
 
       const provider = result.provider || selectedProvider
       const model = result.model || selectedModel
-      setMainModel({ provider, model })
-      setSwitchStaleAux(result.stale_aux ?? [])
-
       // The callback carries origin scope; controls decide whether this
       // owner may paint the foreground draft or only its own default cache.
       onMainModelChanged?.({ ...origin, provider, model })
 
+      if (!isOwnerCurrent()) {
+        return
+      }
+
+      setMainModel({ provider, model })
+      setSwitchStaleAux(result.stale_aux ?? [])
       await refresh()
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     } finally {
       setApplying(false)
     }
-  }, [onMainModelChanged, refresh, scopeProfile, selectedModel, selectedProvider, selectedProviderRow])
+  }, [isOwnerCurrent, onMainModelChanged, refresh, scopeProfile, selectedModel, selectedProvider, selectedProviderRow])
 
   // Sibling of the applyMainModel endpoint passthrough (#65254): auxiliary
   // assignments targeting a user-defined provider must carry that provider's
@@ -696,6 +758,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
       setError('')
 
       try {
+        requireCurrentModelOwner(isOwnerCurrent)
         await setModelAssignment(
           {
             model: mainModel.model,
@@ -713,7 +776,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
         setApplying(false)
       }
     },
-    [endpointForProvider, mainModel, refresh, scopeProfile]
+    [endpointForProvider, isOwnerCurrent, mainModel, refresh, scopeProfile]
   )
 
   const applyAuxiliaryDraft = useCallback(
@@ -726,6 +789,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
       setError('')
 
       try {
+        requireCurrentModelOwner(isOwnerCurrent)
         await setModelAssignment(
           {
             model: auxDraft.model,
@@ -736,6 +800,11 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
           },
           scopeProfile
         )
+
+        if (!isOwnerCurrent()) {
+          return
+        }
+
         setEditingAuxTask(null)
         await refresh()
       } catch (err) {
@@ -744,7 +813,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
         setApplying(false)
       }
     },
-    [auxDraft, endpointForProvider, refresh, scopeProfile]
+    [auxDraft, endpointForProvider, isOwnerCurrent, refresh, scopeProfile]
   )
 
   const beginAuxiliaryEdit = useCallback(
@@ -770,6 +839,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
     setError('')
 
     try {
+      requireCurrentModelOwner(isOwnerCurrent)
       await setModelAssignment(
         {
           model: mainModel.model,
@@ -779,6 +849,11 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
         },
         scopeProfile
       )
+
+      if (!isOwnerCurrent()) {
+        return
+      }
+
       setSwitchStaleAux([])
       await refresh()
     } catch (err) {
@@ -786,7 +861,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
     } finally {
       setApplying(false)
     }
-  }, [mainModel, refresh, scopeProfile])
+  }, [isOwnerCurrent, mainModel, refresh, scopeProfile])
 
   if (loading && !mainModel) {
     return <ModelSettingsSkeleton />

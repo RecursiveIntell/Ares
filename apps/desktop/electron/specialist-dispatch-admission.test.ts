@@ -19,7 +19,7 @@ const request = (overrides: Record<string, unknown> = {}) => ({
 test('Electron reserves all four requested slots before spawning and rejects the fifth without eviction', async () => {
   const pool = new Map<string, Entry>()
   const spawnRunner = vi.fn(async () => ({ pid: 17 }))
-  const admission = createSpecialistDispatchAdmission({ maxCapacity: 4, pool, spawnRunner })
+  const admission = createSpecialistDispatchAdmission({ maxCapacity: 4, pool, spawnRunner, stopRunner: vi.fn(async () => {}) })
 
   const accepted = await admission.admit(request())
   const rejected = await admission.admit(request({
@@ -37,7 +37,7 @@ test('Electron reserves all four requested slots before spawning and rejects the
 test('identical request coalesces, mismatched reuse is rejected, and exact release frees capacity', async () => {
   const pool = new Map<string, Entry>()
   const spawnRunner = vi.fn(async () => ({ pid: 18 }))
-  const admission = createSpecialistDispatchAdmission({ maxCapacity: 4, pool, spawnRunner })
+  const admission = createSpecialistDispatchAdmission({ maxCapacity: 4, pool, spawnRunner, stopRunner: vi.fn(async () => {}) })
 
   const first = await admission.admit(request({ profileIds: ['explorer'] }))
   const duplicate = await admission.admit(request({ profileIds: ['explorer'] }))
@@ -55,7 +55,7 @@ test('identical request coalesces, mismatched reuse is rejected, and exact relea
 
 test('invalid request is rejected before a runner can spawn', async () => {
   const spawnRunner = vi.fn(async () => ({ pid: 19 }))
-  const admission = createSpecialistDispatchAdmission({ maxCapacity: 4, pool: new Map(), spawnRunner })
+  const admission = createSpecialistDispatchAdmission({ maxCapacity: 4, pool: new Map(), spawnRunner, stopRunner: vi.fn(async () => {}) })
 
   const result = await admission.admit(request({ profileIds: [] }))
 
@@ -67,7 +67,7 @@ test('a capacity rejection is terminal admission evidence, not an active runner'
   const pool = new Map<string, Entry>([
     ['occupied', { capacityUnits: 4, countsTowardPoolCap: true, process: { pid: 20 } }]
   ])
-  const admission = createSpecialistDispatchAdmission({ maxCapacity: 4, pool, spawnRunner: vi.fn() })
+  const admission = createSpecialistDispatchAdmission({ maxCapacity: 4, pool, spawnRunner: vi.fn(), stopRunner: vi.fn(async () => {}) })
 
   const rejected = await admission.admit(request({ profileIds: ['explorer'], runId: 'specialist-run-00000004' }))
 

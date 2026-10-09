@@ -3659,9 +3659,9 @@ def test_slow_resume_hydration_degrades_instead_of_killing_agent_init(monkeypatc
         with caplog.at_level("WARNING", logger="tui_gateway.server"):
             outcome = server._await_resume_history(session, sid, "hydration-degrade-key")
         assert outcome == "degraded"
-        assert session["resume_hydrating"] is False
+        assert session["resume_hydrating"] is True
         assert session["history"] == []
-        assert event.is_set()
+        assert not event.is_set()
         statuses = [payload["status"] for name, payload in events
                     if name == "session.resume_progress"]
         assert statuses == ["slow", "degraded_timeout"]
@@ -13884,7 +13884,8 @@ def test_mirror_slash_side_effects_allowed_when_idle(monkeypatch):
 
     applied = {"model": False}
 
-    def _fake_apply_model(sid, session, arg):
+    def _fake_apply_model(sid, session, arg, *, explicit_model_intent=False):
+        assert explicit_model_intent is True
         applied["model"] = True
         return {"value": arg, "warning": ""}
 
@@ -15997,6 +15998,8 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
     started = threading.Event()
     release = threading.Event()
     done = threading.Event()
+    allow_settle = threading.Event()
+    turn_thread = None
 
     class _Agent:
         model = "model-live"
@@ -16025,6 +16028,7 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
     def _emit(event, sid, payload=None):
         if event == "message.complete":
             done.set()
+            assert allow_settle.wait(2), "test did not release terminal publication"
 
     monkeypatch.setattr(server, "_emit", _emit)
 
@@ -16038,6 +16042,7 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
         )
         assert submit["result"]["status"] == "streaming"
         assert started.wait(2), "fake model did not stream before activation"
+        turn_thread = server._sessions["sid-live"]["_run_thread"]
 
         resp = server.handle_request(
             {
@@ -16060,6 +16065,21 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
 
         release.set()
         assert done.wait(2), "fake model turn did not complete"
+        # Bubble completion retains this admission until guarded lifecycle and
+        # once-model cleanup finish; it does not admit a successor by itself.
+        terminal = server.handle_request({
+            "id": "activate-terminal", "method": "session.activate",
+            "params": {"session_id": "sid-live"},
+        })
+        assert terminal["result"]["inflight"] == {
+            "assistant": "partial answer", "streaming": False,
+            "user": "write a long answer",
+        }
+        assert terminal["result"]["turn_started_at"] == turn_started_at
+        assert server._sessions["sid-live"]["running"] is True
+        allow_settle.set()
+        turn_thread.join(timeout=2)
+        assert not turn_thread.is_alive(), "fake model turn did not settle"
         completed = server.handle_request(
             {
                 "id": "activate-done",
@@ -16075,7 +16095,9 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
         ]
     finally:
         release.set()
-        done.wait(2)
+        allow_settle.set()
+        if turn_thread is not None:
+            turn_thread.join(timeout=2)
         server._sessions.pop("sid-live", None)
 
 
@@ -18668,6 +18690,7 @@ def test_reset_session_agent_clears_session_overrides(monkeypatch):
     monkeypatch.setattr(server, "_emit", lambda *_args: None)
     monkeypatch.setattr(server, "_restart_slash_worker", lambda *_args: None)
 
+    monkeypatch.setitem(server._sessions, "sid", session)
     server._reset_session_agent("sid", session)
 
     # No session overrides forwarded — fresh agent builds from config.
@@ -21511,7 +21534,7 @@ def test_workspace_move_rehomes_running_session(monkeypatch, tmp_path):
         lambda cwd: str(new_cwd),
     )
 
-    live = {"session_key": target, "running": True, "cwd": str(tmp_path / "old-project")}
+    live = _session(session_key=target, running=True, cwd=str(tmp_path / "old-project"))
     server._sessions["live-sid"] = live
     monkeypatch.setattr(server, "_register_session_cwd", lambda _session: None)
 

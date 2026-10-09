@@ -11,6 +11,8 @@ freezing any particular tool list.
 import threading
 import types
 
+import pytest
+
 from tools import mcp_tool
 
 
@@ -224,3 +226,45 @@ def test_wait_returns_instantly_when_no_discovery_thread(monkeypatch):
     t0 = time.time()
     mcp_startup.wait_for_mcp_discovery()
     assert time.time() - t0 < 0.2  # never blocks on the bound when nothing's pending
+
+
+@pytest.mark.parametrize("enabled", [None, ["context_engine"], [], ["coding"]])
+@pytest.mark.parametrize("disabled", [None, [], ["context_engine"], ["unrelated"]])
+def test_refresh_applies_context_engine_disabled_policy(monkeypatch, enabled, disabled):
+    """Actual refresh publishes only permitted late schemas and routing names."""
+    calls = []
+    schema = {"name": "policy_context_recover", "description": "Inert context witness", "parameters": {}}
+    agent = _agent(["policy_keep", "policy_context_recover"], enabled=enabled, disabled=disabled)
+    engine = types.SimpleNamespace(get_tool_schemas=lambda: calls.append("schemas") or [schema, schema])
+    agent.context_compressor = engine
+    agent._context_engine_tool_names = {"policy_context_recover"}
+
+    import model_tools
+    monkeypatch.setattr(model_tools, "get_tool_definitions", lambda **kw: [_tool("policy_keep"), _tool("mcp_policy_late")])
+    added = mcp_tool.refresh_agent_mcp_tools(agent)
+    allowed = (enabled is None or "context_engine" in enabled) and "context_engine" not in (disabled or [])
+    names = {tool["function"]["name"] for tool in agent.tools}
+    expected = {"policy_keep", "mcp_policy_late"} | ({"policy_context_recover"} if allowed else set())
+    assert names == agent.valid_tool_names == expected
+    assert added == {"mcp_policy_late"}
+    assert agent._context_engine_tool_names == ({"policy_context_recover"} if allowed else set())
+    assert calls == (["schemas"] if allowed else [])
+    assert agent.context_compressor is engine
+    assert sum(tool["function"]["name"] == "policy_context_recover" for tool in agent.tools) == int(allowed)
+
+
+def test_reinjection_does_not_claim_existing_registry_context_name():
+    """Enabled context tools retain dedup and existing registry dispatch ownership."""
+    agent = _agent([], enabled=["context_engine"], disabled=[])
+    agent.context_compressor = types.SimpleNamespace(get_tool_schemas=lambda: [
+        {"name": "registry_owned_context", "description": "", "parameters": {}},
+        {"name": "engine_owned_context", "description": "", "parameters": {}},
+    ])
+    staged = [_tool("registry_owned_context")]
+    names = {"registry_owned_context"}
+    assert mcp_tool._reinject_post_build_tools(agent, staged, names) == {"engine_owned_context"}
+    assert names == {"registry_owned_context", "engine_owned_context"}
+    assert len(staged) == 2
+    # The reinjector stages locals without touching the currently published pair.
+    assert agent.tools == []
+    assert agent.valid_tool_names == set()

@@ -2493,6 +2493,10 @@ def run_conversation(
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
 
+        if agent.provider == "moa":
+            from agent.transports.ri_llm import _should_use_ri_pipeline, RiTransportUnsupported
+            if _should_use_ri_pipeline(agent):
+                raise RiTransportUnsupported("native binding supports only ollama-launch")
         if moa_config:
             try:
                 from agent.message_content import flatten_message_text as _flatten_mt
@@ -2668,6 +2672,9 @@ def run_conversation(
         # request later without running the advisors a second time.
         _moa_prepared_request = None
         if agent.provider == "moa":
+            from agent.transports.ri_llm import _should_use_ri_pipeline, RiTransportUnsupported
+            if _should_use_ri_pipeline(agent):
+                raise RiTransportUnsupported("native binding supports only ollama-launch")
             _moa_completions = getattr(getattr(agent.client, "chat", None), "completions", None)
             if pending_moa_prepared_request is not None:
                 _rebase_moa_request = getattr(_moa_completions, "rebase_prepared_request", None)
@@ -3387,27 +3394,38 @@ def run_conversation(
                             is_github_responses=agent._is_copilot_url(),
                             sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
-                    from ares_runtime.continuity.runtime import admit_final_context_dispatch, context_provider_response_scope
+                    from ares_runtime.continuity.runtime import ContextDispatchPhysicalScope
 
-                    _admission = admit_final_context_dispatch(
-                        agent, _context_dispatch_snapshot, next_api_kwargs,
+                    _physical = ContextDispatchPhysicalScope(
+                        agent, _context_dispatch_snapshot,
                         attempt_id=f"{api_request_id}:{retry_count}",
                         materialization_digest=_context_materialization_digest,
                         route_identity=_context_route_identity,
                     )
-                    _context_provider_attempted = True
                     # Record at the physical callback, not the middleware or
                     # Relay return: either layer can substitute a response.
-                    _dispatched_model = next_api_kwargs.get("model")
+                    _dispatched_model = next_api_kwargs.get("model", next_api_kwargs.get("modelId"))
                     _dispatched_provider = agent.provider
                     _dispatched_session = agent.session_id
 
                     def _record_physical(call, kwargs):
+                        nonlocal _context_provider_attempted
                         # Capture before the call: fallback/cleanup can restore
                         # the live agent before the accepted response is read.
                         dispatched_base_url = getattr(agent, "base_url", None)
                         dispatched_api_mode = getattr(agent, "api_mode", None)
-                        value = call(kwargs)
+                        try:
+                            # These transports contain a later canonical SDK
+                            # factory (and Codex's own Relay interception).
+                            # Never spend admission or hold its lock across
+                            # the interrupt worker before that final boundary.
+                            _defer_physical = agent.api_mode in {"codex_responses", "bedrock_converse"}
+                            if _defer_physical:
+                                _physical.validate_source(kwargs)
+                            value = (call(kwargs) if _use_streaming or _defer_physical
+                                     else _physical.call(kwargs, lambda final: call(final)))
+                        finally:
+                            _context_provider_attempted = _context_provider_attempted or _physical.attempted
                         if (
                             _route_turn_token is not None
                             and isinstance(_dispatched_model, str) and _dispatched_model
@@ -3418,7 +3436,8 @@ def run_conversation(
                                 turn_token=_route_turn_token,
                                 turn_id=turn_id,
                                 session_id=_dispatched_session,
-                                attempt_id=f"{api_request_id}:{retry_count}",
+                                attempt_id=(_physical.admission["attempt_id"] if _physical.admission is not None
+                                            else f"{api_request_id}:{retry_count}"),
                                 provider=_dispatched_provider,
                                 model=_dispatched_model,
                                 base_url=dispatched_base_url,
@@ -3429,21 +3448,21 @@ def run_conversation(
                             )))
                         return value
 
-                    if _use_streaming:
-                        from ares_runtime.continuity.runtime import ContextDispatchStreamBuffer, settle_final_context_dispatch
+                    with _physical:
+                        if _use_streaming:
+                            from ares_runtime.continuity.runtime import ContextDispatchStreamBuffer
 
-                        with ContextDispatchStreamBuffer(agent, _admission) as _delivery, context_provider_response_scope(agent, _admission):
-                            _response = _record_physical(
-                                lambda kw: agent._interruptible_streaming_api_call(
-                                    kw, on_first_delta=_stop_spinner), next_api_kwargs
-                            )
+                            with ContextDispatchStreamBuffer(agent, _physical) as _delivery:
+                                _response = _record_physical(
+                                    lambda kw: agent._interruptible_streaming_api_call(
+                                        kw, on_first_delta=_stop_spinner), next_api_kwargs
+                                )
 
-                        settle_final_context_dispatch(agent, _admission)
-                        _delivery.deliver()
-                        return _response
-                    from agent import relay_llm
+                            _physical.settle()
+                            _delivery.deliver()
+                            return _response
+                        from agent import relay_llm
 
-                    with context_provider_response_scope(agent, _admission):
                         _response = relay_llm.execute(
                             next_api_kwargs,
                             lambda kw: _record_physical(agent._interruptible_api_call, kw),
@@ -3464,10 +3483,8 @@ def run_conversation(
                             },
                             defer_logical_completion=True,
                         )
-                    from ares_runtime.continuity.runtime import settle_final_context_dispatch
-
-                    settle_final_context_dispatch(agent, _admission)
-                    return _response
+                        _physical.settle()
+                        return _response
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 
@@ -6476,21 +6493,22 @@ def run_conversation(
                     # exists; otherwise "trying fallback..." is a lie and the
                     # session looks like it's recovering when it's about to
                     # abort silently (#35314, #17446).
-                    if agent._has_pending_fallback():
+                    if not (classified.error_context or {}).get("native_transport_refusal") and agent._has_pending_fallback():
                         if classified.reason == FailoverReason.content_policy_blocked:
                             agent._buffer_status("⚠️ Provider safety filter blocked this request — trying fallback...")
                         elif classified.reason == FailoverReason.ssl_cert_verification:
                             agent._buffer_status("⚠️ TLS certificate verification failed — trying fallback...")
                         else:
                             agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
-                    if agent._try_activate_fallback():
-                        active_system_prompt = _sync_failover_system_message(
-                            agent, api_messages, active_system_prompt)
-                        retry_count = 0
-                        compression_attempts = 0
-                        _retry.primary_recovery_attempted = False
-                        _retry.restart_with_rebuilt_messages = True
-                        break
+                    if not (classified.error_context or {}).get("native_transport_refusal"):
+                        if agent._try_activate_fallback():
+                            active_system_prompt = _sync_failover_system_message(
+                                agent, api_messages, active_system_prompt)
+                            retry_count = 0
+                            compression_attempts = 0
+                            _retry.primary_recovery_attempted = False
+                            _retry.restart_with_rebuilt_messages = True
+                            break
                     if api_kwargs is not None:
                         agent._dump_api_request_debug(
                             api_kwargs, reason="non_retryable_client_error", error=api_error,

@@ -1129,7 +1129,9 @@ def test_sync_session_key_after_compress_reanchors_active_session_lease(
         "active_session_lease": lease,
         "agent": types.SimpleNamespace(session_id="session-new"),
         "session_key": "session-old",
+        "history_lock": threading.Lock(),
     }
+    monkeypatch.setitem(server._sessions, "ui-1", session)
     fake_approval = types.SimpleNamespace(
         disable_session_yolo=lambda *_args, **_kwargs: None,
         enable_session_yolo=lambda *_args, **_kwargs: None,

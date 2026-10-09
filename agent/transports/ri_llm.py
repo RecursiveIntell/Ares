@@ -107,25 +107,122 @@ class RiPipeline:
         return f"RiPipeline(url={self.url}, model={self.model}, {status})"
 
 
-# ── Phase 2: RiChatCompletionsTransport (universal) ───────────────
+# ── Phase 2: RiChatCompletionsTransport ─────────────────────────
 #
-# Plugs into the chat_completion_helpers dispatch. Active by default when
-# the native extension is available and not runtime-disabled. Provider-
-# agnostic — works for any OpenAI-compatible provider.
-# OpenAI-compatible provider. Set HERMES_RI_PIPELINE_PROVIDERS to
-# a comma-separated whitelist to restrict (e.g. 'ollama-launch,deepseek').
-# Falls through to the stock httpx/openai path on any error.
+# Plugs into chat_completion_helpers for request shapes that the native
+# Ollama binding can preserve. Default-incompatible requests retain their SDK
+# route. Explicit native selection refuses unsupported requests before effects.
 
-import json as _json
+import math as _math
 import os as _os
 from types import SimpleNamespace as _SimpleNamespace
+from urllib.parse import urlsplit as _urlsplit
 
 
-def _should_use_ri_pipeline(agent) -> bool:
+class RiTransportUnsupported(ValueError):
+    """The selected native binding cannot preserve this request's contract."""
+
+    def __init__(self, reason: str):
+        self.code = "RI_PIPELINE_REQUEST_UNSUPPORTED"
+        self.reason = reason
+        super().__init__(f"{self.code}: {reason}")
+
+
+class RiCompletionResponse(_SimpleNamespace):
+    """Internal raw-text binding result with no reported finish or usage."""
+
+
+def configure_ri_pipeline(agent, config: dict) -> None:
+    """Hydrate transport selection from the slash command's canonical owner."""
+    from hermes_cli.llm_pipeline_switch import get_current_state
+
+    enabled, providers = get_current_state(config)
+    agent._ri_pipeline_enabled = enabled
+    agent._ri_pipeline_providers = providers
+    section = config.get("agent", {}) if isinstance(config, dict) else {}
+    selection = section.get("llm_pipeline", {}) if isinstance(section, dict) else {}
+    agent._ri_pipeline_explicit = bool(providers) or (
+        isinstance(selection, dict) and selection.get("enabled") is True
+    )
+
+
+def _native_text_request(agent, api_kwargs: dict):
+    """Qualify the prompt-only, unauthenticated Ollama binding before effects.
+
+    The pinned Python API accepts one prompt, one system string and LlmConfig.
+    It has no chat history, tools, media, headers, auth or reported-usage API.
+    """
+    if str(getattr(agent, "provider", "")).strip().lower() != "ollama-launch":
+        raise RiTransportUnsupported("native binding supports only ollama-launch")
+    base_url = getattr(agent, "base_url", None)
+    if not isinstance(base_url, str):
+        raise RiTransportUnsupported("missing endpoint")
+    try:
+        endpoint = _urlsplit(base_url)
+        endpoint.port  # Validate the port without making a connection.
+        valid_endpoint = (
+            endpoint.scheme in {"http", "https"} and endpoint.hostname
+            and endpoint.username is None and endpoint.password is None
+            and not endpoint.query and not endpoint.fragment
+            and endpoint.path.rstrip("/") in {"", "/v1", "/api"}
+        )
+    except ValueError:
+        valid_endpoint = False
+    if not valid_endpoint:
+        raise RiTransportUnsupported("endpoint cannot be preserved by native binding")
+    # Never invoke a credential supplier during selection/qualification.
+    api_key = getattr(agent, "api_key", None)
+    if api_key not in (None, "", "no-key-required", "ollama"):
+        raise RiTransportUnsupported("authenticated route requires a per-call native auth API")
+    client_options = getattr(agent, "_client_kwargs", {})
+    if type(client_options) is not dict or set(client_options) - {"api_key", "base_url"}:
+        raise RiTransportUnsupported("canonical client options unavailable in native binding")
+    if "base_url" in client_options and client_options["base_url"] != base_url:
+        raise RiTransportUnsupported("canonical endpoint differs from native endpoint")
+    if "api_key" in client_options and client_options["api_key"] != api_key:
+        raise RiTransportUnsupported("canonical credential differs from native credential")
+    if type(api_kwargs) is not dict:
+        raise RiTransportUnsupported("invalid request")
+    allowed = {"model", "messages", "temperature", "max_tokens", "stream"}
+    if set(api_kwargs) - allowed:
+        raise RiTransportUnsupported("request fields unavailable in native binding")
+    messages = api_kwargs.get("messages")
+    if not isinstance(messages, list) or len(messages) not in {1, 2}:
+        raise RiTransportUnsupported("chat history unavailable in native binding")
+    roles = [item.get("role") if isinstance(item, dict) else None for item in messages]
+    if roles not in (["user"], ["system", "user"]):
+        raise RiTransportUnsupported("message roles unavailable in native binding")
+    if any(set(item) != {"role", "content"} or not isinstance(item["content"], str) for item in messages):
+        raise RiTransportUnsupported("message metadata or media unavailable in native binding")
+    system = messages[0]["content"] if len(messages) == 2 else None
+    if system == "":
+        raise RiTransportUnsupported("empty system role unavailable in native binding")
+    if "{input}" in messages[-1]["content"]:
+        raise RiTransportUnsupported("native prompt template would alter literal input placeholder")
+    model = api_kwargs.get("model", getattr(agent, "model", None))
+    if not isinstance(model, str) or not model.strip():
+        raise RiTransportUnsupported("invalid model")
+    if "temperature" not in api_kwargs or "max_tokens" not in api_kwargs:
+        raise RiTransportUnsupported("omitted generation defaults unavailable in native binding")
+    temperature = api_kwargs["temperature"]
+    if (isinstance(temperature, bool) or not isinstance(temperature, (int, float))
+            or not _math.isfinite(temperature)):
+        raise RiTransportUnsupported("invalid temperature")
+    max_tokens = api_kwargs["max_tokens"]
+    if type(max_tokens) is not int or not 0 < max_tokens <= 2**32 - 1:
+        raise RiTransportUnsupported("invalid max_tokens")
+    if type(api_kwargs.get("stream", False)) is not bool:
+        raise RiTransportUnsupported("invalid stream setting")
+    return base_url, model, messages[-1]["content"], system, RiLlmConfig(
+        temperature=temperature, max_tokens=max_tokens,
+    )
+
+
+def _should_use_ri_pipeline(agent, api_kwargs: dict | None = None) -> bool:
     """Return True when the RiPipeline fast path should be used.
 
-    Active by default when the native extension is available.
-    Provider-agnostic — works for any OpenAI-compatible provider.
+    Default availability is restricted to representable Ollama requests.
+    An explicit native selection must pass the typed dispatch qualification.
     Set HERMES_RI_PIPELINE=0 to disable, or HERMES_RI_PIPELINE_PROVIDERS
     to a comma-separated whitelist (e.g. 'ollama-launch,deepseek').
     If no env whitelist is set, agent._ri_pipeline_enabled and
@@ -139,17 +236,33 @@ def _should_use_ri_pipeline(agent) -> bool:
     if not bool(getattr(agent, "_ri_pipeline_enabled", True)):
         return False
 
+    explicit = bool(getattr(agent, "_ri_pipeline_explicit", False))
+    explicit = explicit or _os.environ.get("HERMES_RI_PIPELINE") == "1"
+    provider = str(getattr(agent, "provider", "")).strip().lower()
     whitelist = _os.environ.get("HERMES_RI_PIPELINE_PROVIDERS")
     if whitelist:
         allowed = _normalize_ri_pipeline_provider_list(whitelist)
-        return str(getattr(agent, "provider", "")).strip().lower() in allowed
-
-    config_whitelist = _normalize_ri_pipeline_provider_list(
-        getattr(agent, "_ri_pipeline_providers", [])
-    )
-    if config_whitelist:
-        return str(getattr(agent, "provider", "")).strip().lower() in config_whitelist
-
+        if provider not in allowed:
+            return False
+        explicit = True
+    else:
+        config_whitelist = _normalize_ri_pipeline_provider_list(
+            getattr(agent, "_ri_pipeline_providers", [])
+        )
+        if config_whitelist:
+            if provider not in config_whitelist:
+                return False
+            explicit = True
+    # Default availability never selects an incompatible wire protocol.
+    if not explicit and provider != "ollama-launch":
+        return False
+    if api_kwargs is not None:
+        try:
+            _native_text_request(agent, api_kwargs)
+        except RiTransportUnsupported:
+            # Explicit selection reaches the typed refusal in dispatch. Ordinary
+            # unsupported requests retain their existing same-provider SDK path.
+            return explicit
     return True
 
 
@@ -178,119 +291,28 @@ def ri_pipeline_chat_completion(agent, api_kwargs: dict):
     and returns an OpenAI-compatible response namespace so the rest of
     the agent loop is unchanged.
     """
-    model = api_kwargs.get("model", agent.model)
-    messages = api_kwargs.get("messages", [])
-    base_url = getattr(agent, "base_url", "http://localhost:11434/v1")
-
-    # Inject API key into environment for the Rust pipeline.
-    # The Rust OpenAiBackend reads OPENAI_API_KEY from the environment.
-    _prev_key = _os.environ.get("OPENAI_API_KEY")
-    agent_api_key = getattr(agent, "api_key", None)
-    if callable(agent_api_key):
-        try:
-            agent_api_key = agent_api_key()
-        except Exception:
-            agent_api_key = None
-    if agent_api_key and isinstance(agent_api_key, str) and agent_api_key.strip():
-        _os.environ["OPENAI_API_KEY"] = agent_api_key
-    try:
-        return _ri_chat_completion_impl(
-            agent, api_kwargs, model, messages, base_url
-        )
-    finally:
-        if _prev_key is not None:
-            _os.environ["OPENAI_API_KEY"] = _prev_key
-        elif "OPENAI_API_KEY" in _os.environ:
-            del _os.environ["OPENAI_API_KEY"]
+    base_url, model, prompt, system, config = _native_text_request(agent, api_kwargs)
+    return _ri_chat_completion_impl(model, prompt, system, base_url, config)
 
 
-def _ri_chat_completion_impl(agent, api_kwargs, model, messages, base_url):
-    # Build a text prompt from the messages list (basic: system + user + assistant)
-    system_prompt = ""
-    prompt_parts = []
-    for msg in messages:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-        if isinstance(content, list):
-            # Multimodal content: extract text parts only
-            text_parts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
-            content = " ".join(text_parts)
-        if not isinstance(content, str):
-            content = str(content)
-        if role == "system":
-            system_prompt = content
-        elif role == "user":
-            prompt_parts.append(f"User: {content}")
-        elif role == "assistant":
-            prompt_parts.append(f"Assistant: {content}")
-        elif role == "tool":
-            prompt_parts.append(f"Tool output: {content}")
-
-    full_prompt = "\n".join(prompt_parts)
-
-    # Try to extract tool schemas for structured output
-    tools = api_kwargs.get("tools") or api_kwargs.get("functions")
-    use_json_mode = bool(tools and not api_kwargs.get("stream"))
-
-    pipe = RiPipeline(base_url, model)
+def _ri_chat_completion_impl(model, prompt, system, base_url, config):
+    pipe = RiPipeline(base_url, model, config=config)
     if not pipe.available:
         raise RuntimeError("RiPipeline native extension not available")
 
-    if use_json_mode:
-        # Tool-calling: use call_structured with a JSON schema for tool_choice
-        tool_names = [t.get("function", {}).get("name", "tool") for t in tools]
-        json_schema = _json.dumps({
-            "type": "object",
-            "properties": {
-                "tool": {"type": "string", "enum": tool_names},
-                "arguments": {"type": "object"},
-            },
-            "required": ["tool", "arguments"],
-        })
-        raw = pipe.call_structured(full_prompt, json_schema, system=system_prompt or None)
-    else:
-        raw = pipe.call(full_prompt, system=system_prompt or None)
-
-    # Parse tool calls if present (basic JSON extraction)
-    tool_calls = None
-    content = raw
-    if use_json_mode and raw.strip():
-        try:
-            parsed = _json.loads(raw)
-            tool_name = parsed.get("tool", "")
-            tool_args = parsed.get("arguments", {})
-            if tool_name:
-                import uuid as _uuid
-                tool_calls = [{
-                    "id": f"call_{_uuid.uuid4().hex[:8]}",
-                    "type": "function",
-                    "function": {
-                        "name": tool_name,
-                        "arguments": _json.dumps(tool_args),
-                    },
-                }]
-                content = None  # Tool call — no text content
-        except _json.JSONDecodeError:
-            pass
-
-    # Approximate token counts (rough character-based estimate)
-    prompt_chars = len(full_prompt) + len(system_prompt)
-    completion_chars = len(raw)
+    raw = pipe.call(prompt, system=system)
 
     # Build response namespace matching OpenAI shape
     message = _SimpleNamespace(
         role="assistant",
-        content=content,
-        tool_calls=[_SimpleNamespace(**tc) for tc in tool_calls] if tool_calls else None,
+        content=raw,
+        tool_calls=None,
     )
     choice = _SimpleNamespace(
         index=0,
         message=message,
-        finish_reason="tool_calls" if tool_calls else "stop",
+        finish_reason=None,
     )
-    usage = _SimpleNamespace(
-        prompt_tokens=max(1, prompt_chars // 4),
-        completion_tokens=max(1, completion_chars // 4),
-        total_tokens=max(2, (prompt_chars + completion_chars) // 4),
-    )
-    return _SimpleNamespace(choices=[choice], usage=usage, model=model)
+    # The binding returns raw text only. Estimates cannot attest provider usage,
+    # billing, compaction effectiveness or a known-fitting request baseline.
+    return RiCompletionResponse(choices=[choice], usage=None, model=model)

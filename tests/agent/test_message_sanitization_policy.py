@@ -455,7 +455,7 @@ class TestPerProviderReasoningEcho:
         agent._reasoning_echo_flag = False
 
         from agent.agent_runtime_helpers import restore_primary_runtime
-        restore_primary_runtime(agent)
+        assert restore_primary_runtime(agent) is True
 
         # Flag should be restored from snapshot
         assert agent._reasoning_echo_flag is True

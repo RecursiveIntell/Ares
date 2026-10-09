@@ -221,3 +221,157 @@ class TestSpoolPrimitives:
         assert remaining == 0
         assert seen == ["c0", "c1", "c2"]
         assert _spool_files(spool_home) == []
+
+
+# SD05: expected kwargs below are independently specified contract fixtures,
+# never computed by the production transcript mapper.
+_SD05_SUPPORTED_FIELD_CASES = [
+    pytest.param(
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_name": "fixture_tool",
+            "tool_calls": [{"id": "call-fixture-1", "type": "function", "function": {"name": "fixture_tool", "arguments": "{\"x\":1}"}}],
+            "tool_call_id": "assistant-call-id",
+            "reasoning": "assistant reasoning",
+            "reasoning_content": "reasoning content",
+            "reasoning_details": [{"type": "text", "text": "detail"}],
+            "codex_reasoning_items": [{"type": "reasoning", "id": "r1"}],
+            "codex_message_items": [{"type": "message", "id": "m1"}],
+            "platform_message_id": "platform-assistant",
+            "message_id": "ignored-fallback",
+            "observed": 1,
+            "timestamp": 0,
+            "api_content": "",
+            "display_kind": "internal_notification",
+            "display_metadata": {"source": "fixture", "ordinal": 1},
+        },
+        {
+            "session_id": "sd05-session",
+            "role": "assistant",
+            "content": None,
+            "tool_name": "fixture_tool",
+            "tool_calls": [{"id": "call-fixture-1", "type": "function", "function": {"name": "fixture_tool", "arguments": "{\"x\":1}"}}],
+            "tool_call_id": "assistant-call-id",
+            "reasoning": "assistant reasoning",
+            "reasoning_content": "reasoning content",
+            "reasoning_details": [{"type": "text", "text": "detail"}],
+            "codex_reasoning_items": [{"type": "reasoning", "id": "r1"}],
+            "codex_message_items": [{"type": "message", "id": "m1"}],
+            "platform_message_id": "platform-assistant",
+            "observed": True,
+            "timestamp": 0,
+            "api_content": "",
+            "display_kind": "internal_notification",
+            "display_metadata": {"source": "fixture", "ordinal": 1},
+        },
+        id="assistant",
+    ),
+    pytest.param(
+        {
+            "role": "tool",
+            "content": "tool output",
+            "tool_name": "fixture_tool",
+            "tool_call_id": "call-fixture-1",
+            "reasoning": "must not persist",
+            "reasoning_content": "must not persist",
+            "reasoning_details": [{"text": "must not persist"}],
+            "codex_reasoning_items": [{"id": "must-not-persist"}],
+            "codex_message_items": [{"id": "must-not-persist"}],
+            "platform_message_id": "",
+            "message_id": "platform-tool-fallback",
+            "observed": [],
+            "timestamp": 50.0,
+            "api_content": {"not": "a string"},
+            "display_kind": "tool_result",
+            "display_metadata": {"source": "fixture", "ordinal": 2},
+        },
+        {
+            "session_id": "sd05-session",
+            "role": "tool",
+            "content": "tool output",
+            "tool_name": "fixture_tool",
+            "tool_calls": None,
+            "tool_call_id": "call-fixture-1",
+            "reasoning": None,
+            "reasoning_content": None,
+            "reasoning_details": None,
+            "codex_reasoning_items": None,
+            "codex_message_items": None,
+            "platform_message_id": "platform-tool-fallback",
+            "observed": False,
+            "timestamp": 50.0,
+            "api_content": None,
+            "display_kind": "tool_result",
+            "display_metadata": {"source": "fixture", "ordinal": 2},
+        },
+        id="tool",
+    ),
+    pytest.param(
+        {
+            "role": "user",
+            "content": "user message",
+            "reasoning": "must not persist",
+            "reasoning_content": "must not persist",
+            "reasoning_details": [{"text": "must not persist"}],
+            "codex_reasoning_items": [{"id": "must-not-persist"}],
+            "codex_message_items": [{"id": "must-not-persist"}],
+            "message_id": "platform-user-fallback",
+            "observed": False,
+            "timestamp": None,
+            "api_content": "user message\n\nfixture context",
+            "display_kind": "user_input",
+            "display_metadata": {"source": "fixture", "ordinal": 3},
+        },
+        {
+            "session_id": "sd05-session",
+            "role": "user",
+            "content": "user message",
+            "tool_name": None,
+            "tool_calls": None,
+            "tool_call_id": None,
+            "reasoning": None,
+            "reasoning_content": None,
+            "reasoning_details": None,
+            "codex_reasoning_items": None,
+            "codex_message_items": None,
+            "platform_message_id": "platform-user-fallback",
+            "observed": False,
+            "timestamp": None,
+            "api_content": "user message\n\nfixture context",
+            "display_kind": "user_input",
+            "display_metadata": {"source": "fixture", "ordinal": 3},
+        },
+        id="user",
+    ),
+]
+
+
+class _Sd05RecordingDb:
+    """A supplied recording object; no SessionDB constructor or live storage."""
+
+    def __init__(self):
+        self.rows = []
+
+    def append_message(self, **kwargs):
+        self.rows.append(kwargs)
+
+
+@pytest.mark.parametrize("message, expected", _SD05_SUPPORTED_FIELD_CASES)
+def test_append_transcript_message_preserves_full_message_fields(message, expected):
+    """The extracted mapper must leave live forwarding unchanged."""
+    before = json.dumps(message, sort_keys=True)
+    db = _Sd05RecordingDb()
+    store = _make_store(db)
+    store._append_transcript_message("sd05-session", message)
+    assert db.rows == [expected]
+    assert json.dumps(message, sort_keys=True) == before
+
+
+@pytest.mark.parametrize("content", [None, "", [], {}], ids=["none", "empty-string", "empty-list", "empty-dict"])
+def test_append_transcript_message_keeps_live_falsy_content_and_zero_timestamp(content):
+    message = {"role": "assistant", "content": content, "timestamp": 0}
+    db = _Sd05RecordingDb()
+    _make_store(db)._append_transcript_message("sd05-session", message)
+    assert db.rows[0]["content"] == content
+    assert db.rows[0]["timestamp"] == 0

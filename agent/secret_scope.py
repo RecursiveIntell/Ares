@@ -662,7 +662,7 @@ def build_profile_secret_scope(
             continue
         secrets[key] = value
 
-    return _immutable_scope(
+    scope = _immutable_scope(
         secrets,
         profile_home=home,
         source_status=(
@@ -672,6 +672,19 @@ def build_profile_secret_scope(
         external_generation=int(external_snapshot.generation),
         allow_environment_fallback=allow_environment_fallback,
     )
+
+    # A successful capture is an ownership observation, even if its dotenv or
+    # external declarations disappear before the first ownership enumeration.
+    # Include only captured profile authority, preserving admitted root grants
+    # and excluding unrelated shell state and direct process-global settings.
+    # Publish after immutable construction succeeds so a failed capture cannot
+    # partially add grants to the monotonic history.
+    observed_names = {name for name in scope.owned_names if not _is_global_env(name)}
+    if observed_names:
+        history_key = str(scope.profile_home)
+        with _PROFILE_OWNED_NAME_HISTORY_LOCK:
+            _PROFILE_OWNED_NAME_HISTORY.setdefault(history_key, set()).update(observed_names)
+    return scope
 
 
 @dataclass(frozen=True)
@@ -773,8 +786,9 @@ def get_profile_owned_secret_names(
 ) -> frozenset[str]:
     """Return exact secret names owned by one profile, without reading values.
 
-    The profile's dotenv files and the external-source provenance snapshot are
-    the ownership sources. Ordinary shell exports are intentionally excluded:
+    The profile's dotenv files, external-source provenance snapshot and
+    explicitly admitted root underlay are the ownership sources.
+    Ordinary shell exports are intentionally excluded:
     they are user/process state, not profile-owned credentials.
     """
     home = Path(hermes_home)
@@ -796,6 +810,12 @@ def get_profile_owned_secret_names(
             )
     observed_names = set(op_snapshot.data)
     observed_names.update(env_snapshot.data)
+    observed_names.update(
+        _root_profile_fallback_secrets(
+            home,
+            fail_closed_external=fail_closed_external,
+        )
+    )
     observed_names.update(
         _profile_external_secret_values(
             home,

@@ -58,6 +58,8 @@ jobs:
       mcp_catalog: ${{ steps.classify.outputs.mcp_catalog }}
       ci_review: ${{ steps.classify.outputs.ci_review }}
       ci_review_files: ${{ steps.classify.outputs.ci_review_files }}
+      context_continuity: ${{ steps.classify.outputs.context_continuity }}
+      current_owner_integration: ${{ steps.classify.outputs.current_owner_integration }}
       event_name: ${{ github.event_name }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -117,6 +119,24 @@ jobs:
     # changes used to run the TypeScript matrix and nothing that compiles them.
     if: needs.detect.outputs.rust == 'true'
     uses: ./.github/workflows/rust-tests.yml
+
+  # Preserve the existing native owners and exact pairing. PR-controlled
+  # qualification receives only read access, without inherited secrets.
+  context-continuity:
+    name: Context continuity qualification
+    needs: detect
+    if: needs.detect.outputs.context_continuity == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/context-continuity-qualification.yml
+
+  current-owner-integration:
+    name: Current owner integration
+    needs: detect
+    if: needs.detect.outputs.current_owner_integration == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/current-owner-integration.yml
 
   e2e-desktop:
     name: Desktop E2E
@@ -234,6 +254,8 @@ jobs:
       - js-tests
       - installer-tests
       - rust-tests
+      - context-continuity
+      - current-owner-integration
       - e2e-desktop
       - docs-site
       - history-check
@@ -290,9 +312,13 @@ jobs:
 
       - name: Lint GitHub Actions workflows
         # The disabled Desktop lane is an explicit CI-01 applicability exception.
-        # Lint the planner workflow enforced by this aggregate. Other workflows
-        # own their existing shellcheck debt and are outside this bounded gate.
-        run: ./actionlint -ignore 'constant expression "false" in condition' .github/workflows/ci.yaml
+        # Lint the planner and native qualifications enforced by this aggregate.
+        # Other workflows retain their existing independent lint ownership.
+        run: >-
+          ./actionlint -ignore 'constant expression "false" in condition'
+          .github/workflows/ci.yaml
+          .github/workflows/context-continuity-qualification.yml
+          .github/workflows/current-owner-integration.yml
 
       - name: Evaluate job results
         id: evaluate

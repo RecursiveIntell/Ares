@@ -112,8 +112,8 @@ INSTALL_RECIPES: Dict[str, Dict[str, Any]] = {
 }
 
 
-_install_locks: Dict[str, threading.Lock] = {}
-_install_results: Dict[str, Optional[str]] = {}
+_install_locks: Dict[tuple[str, str], threading.Lock] = {}
+_install_results: Dict[tuple[str, str], Optional[str]] = {}
 _install_lock_meta = threading.Lock()
 _WINDOWS_WRAPPER_SUFFIXES = (".cmd", ".exe", ".bat")
 
@@ -161,12 +161,12 @@ def _existing_binary(name: str) -> Optional[str]:
     return None
 
 
-def _get_lock(pkg: str) -> threading.Lock:
+def _get_lock(key: tuple[str, str]) -> threading.Lock:
     with _install_lock_meta:
-        lock = _install_locks.get(pkg)
+        lock = _install_locks.get(key)
         if lock is None:
             lock = threading.Lock()
-            _install_locks[pkg] = lock
+            _install_locks[key] = lock
         return lock
 
 
@@ -177,7 +177,7 @@ def try_install(pkg: str, strategy: str = "auto") -> Optional[str]:
     ``manual``/``off`` mode, this function only probes for an
     existing binary and returns ``None`` if not found.
 
-    The install is cached per-package — a second call returns the
+    The install is cached per-profile/package — a second call returns the
     same path (or ``None``) without reinstalling.  Concurrent calls
     are serialized.
     """
@@ -188,16 +188,19 @@ def try_install(pkg: str, strategy: str = "auto") -> Optional[str]:
         bin_name = recipe.get("bin", pkg)
         return _existing_binary(bin_name)
 
-    if pkg in _install_results:
-        return _install_results[pkg]
+    from hermes_constants import get_hermes_home, hermes_home_key
 
-    lock = _get_lock(pkg)
+    key = (hermes_home_key(get_hermes_home()), pkg)
+    if key in _install_results:
+        return _install_results[key]
+
+    lock = _get_lock(key)
     with lock:
         # Double-check after acquiring lock.
-        if pkg in _install_results:
-            return _install_results[pkg]
+        if key in _install_results:
+            return _install_results[key]
         result = _do_install(pkg)
-        _install_results[pkg] = result
+        _install_results[key] = result
         return result
 
 

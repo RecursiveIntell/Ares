@@ -4,11 +4,14 @@ One shared admission gate for every surface that can start an in-place
 ``hermes update`` mutation (CLI apply, CLI --check, dashboard update
 endpoint). The decision layers:
 
-1. **Baked provenance marker** (``/etc/hermes/image-provenance.json``,
+1. **Ares release ownership**: the managed launcher environment or the
+   canonical ``releases/<revision>/source`` namespace refuses mutation.
+   Unresolvable source identity also refuses.
+2. **Baked provenance marker** (``/etc/hermes/image-provenance.json``,
    written by the image build — see :mod:`hermes_cli.image_provenance`):
    authoritative ground truth that this filesystem came from an immutable
    image. Fail-closed: a present-but-malformed marker still refuses.
-2. **Filesystem heuristics** (``detect_install_method()``): the pre-existing
+3. **Filesystem heuristics** (``detect_install_method()``): the pre-existing
    docker/nix/apt detection, kept as the fallback for images built before
    the marker existed and for package-managed installs that have no image
    marker at all.
@@ -21,6 +24,8 @@ use <command>" instead of a silent non-update), and exits 2 on CLI surfaces.
 from __future__ import annotations
 
 import logging
+import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -32,7 +37,7 @@ logger = logging.getLogger(__name__)
 class UpdateRefusal:
     """Why an in-place update is refused, and what to run instead."""
 
-    code: str              # image-marker | image-marker-invalid | docker | nix | apt
+    code: str              # Ares/source identity, image provenance, or package manager
     message: str           # full user-facing text (multi-line ok)
     update_command: str    # the one-line remediation command
 
@@ -41,9 +46,38 @@ def evaluate_update_admission(project_root: Path) -> Optional[UpdateRefusal]:
     """Return an :class:`UpdateRefusal` when in-place update must not run.
 
     ``None`` means the install is eligible for in-place update (git checkout
-    or unknown-but-mutable). Never raises; on any internal error it falls
-    back to the heuristic layer only.
+    or unknown-but-mutable). Source identity must resolve before admission;
+    provenance lookup errors retain the existing heuristic fallback.
     """
+    # Local Ares releases are immutable even when the inherited CLI is invoked
+    # directly without the launcher environment. The canonical release namespace
+    # remains managed when its metadata is missing/malformed, never mutable.
+    try:
+        root = project_root.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return UpdateRefusal(
+            code="runtime-identity-unresolved",
+            message="✗ Runtime source identity is unresolved; in-place update is disabled.",
+            update_command="Inspect the installed runtime source identity before retrying.",
+        )
+    if (
+        os.environ.get("ARES_MANAGED_RUNTIME") == "1"
+        or (
+            root.name == "source"
+            and re.fullmatch(r"[0-9a-f]{40}", root.parent.name) is not None
+            and root.parent.parent.name == "releases"
+        )
+    ):
+        return UpdateRefusal(
+            code="ares-managed-runtime",
+            message=(
+                "✗ This Ares release is managed and immutable. "
+                "In-place Hermes update is disabled. Update through the Ares "
+                "runtime controller: ares update"
+            ),
+            update_command="ares update",
+        )
+
     # Layer 1: baked provenance marker — authoritative when present.
     try:
         from hermes_cli.image_provenance import read_image_provenance

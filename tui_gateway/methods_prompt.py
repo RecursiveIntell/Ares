@@ -370,14 +370,49 @@ def _(rid, params: dict) -> dict:
     if (t := current_transport()) is not None:
         session["transport"] = t
     input_receipt = None
+    pending_input_admission = None
+    with session["history_lock"]:
+        input_agent = session.get("agent")
+        input_transport = session.get("transport")
+    def input_owner_error():
+        # Caller holds history_lock; slow pending resolution grants no new owner.
+        current_window = session.get("_turn_outcomes")
+        current_nonce = (current_window.turns[-1]["accepted_turn"]["request_id"]
+            if isinstance(current_window, TurnOutcomeWindow) and current_window.owns(session, sid) and current_window.turns else None)
+        if (_sessions.get(sid) is not session or session.get("agent") is not input_agent
+                or session.get("transport") is not input_transport
+                or (pending_input_admission is not None and (
+                    int(session.get("_queued_prompt_generation", 0)) != pending_input_admission[0]
+                    or (session.get("inflight_turn") or {}).get("started_at") is not pending_input_admission[1]
+                    or current_window is not pending_input_admission[2]
+                    or current_nonce != pending_input_admission[3]))):
+            return _err(rid, 5001, "session owner changed; input not started",
+                {"execution_started": False, "durable_input_accepted": input_receipt is not None,
+                 "error_surface": {"layer": "runtime", "code": "session_owner_changed", "retryable": True},
+                 **({"input_event_id": input_receipt.event_id} if input_receipt is not None else {})})
+        return None
     stop_input_deadline = time.monotonic() + 5.0
     while True:
         if input_receipt is None:
             stop_error = _wait_for_stop_input_admission(rid, session, deadline=stop_input_deadline)
             if stop_error is not None:
                 return stop_error
+            with session["history_lock"]:
+                failed_once = _one_turn_model_restore_error(sid, session) is not None
+                if failed_once:
+                    window = session.get("_turn_outcomes")
+                    pending_input_admission = (int(session.get("_queued_prompt_generation", 0)),
+                        (session.get("inflight_turn") or {}).get("started_at"), window,
+                        window.turns[-1]["accepted_turn"]["request_id"]
+                        if isinstance(window, TurnOutcomeWindow) and window.owns(session, sid) and window.turns else None)
+            if failed_once:
+                # Only an already acknowledged, eligible explicit pick may
+                # settle failed custody. Resolve outside the admission lock.
+                _apply_pending_model_switch(sid, session, before_admission=True)
         busy_transport = None
         with session["history_lock"]:
+            if (owner_error := input_owner_error()) is not None:
+                return owner_error
             if input_receipt is None and (session.get("_stop_pending") or session.get("_stop_uncertain")):
                 # Stop may have begun between the wait and lock acquisition.
                 # Retry outside the lock, before any durable input write.
@@ -385,6 +420,12 @@ def _(rid, params: dict) -> dict:
                     return _err(rid, 5032, "Stop settlement timed out; durable input not accepted",
                                 {"durable_input_accepted": False})
                 continue
+            if (restore_error := _one_turn_model_restore_error(sid, session)) is not None:
+                return _err(rid, 5001,
+                    "The saved model was not restored; choose a model explicitly before sending.",
+                    {"error_surface": restore_error, "execution_started": False,
+                     "durable_input_accepted": input_receipt is not None,
+                     **({"input_event_id": input_receipt.event_id} if input_receipt is not None else {})})
             # Refusals must precede durable acceptance, including busy ACKs.
             # A watch child's run belongs to its parent, so running alone
             # cannot establish that this session is available for input.
@@ -433,6 +474,14 @@ def _(rid, params: dict) -> dict:
         else None
     )
     with session["history_lock"]:
+        if (owner_error := input_owner_error()) is not None:
+            return owner_error
+        if (restore_error := _one_turn_model_restore_error(sid, session)) is not None:
+            return _err(rid, 5001,
+                "The saved model was not restored; choose a model explicitly before sending.",
+                {"error_surface": restore_error, "execution_started": False,
+                 "durable_input_accepted": input_receipt is not None,
+                 **({"input_event_id": input_receipt.event_id} if input_receipt is not None else {})})
         # A watch session's run lives in the PARENT turn, so its own running
         # flag is False — without this, typing mid-run builds a second agent
         # racing the in-flight child on the same stored session (interleaved
@@ -969,7 +1018,11 @@ def _(rid, params: dict) -> dict:
                     window.finish(outcome_execution[2], interrupted=bool(owns_current and session.get("_turn_cancel_requested")))
             _turn_outcome_execution.reset(token)
 
-    def run_owned_after_agent_ready() -> None:
+    def run_owned_after_agent_ready(
+        admitted_started_at=(session.get("inflight_turn") or {}).get("started_at"),
+        admitted_generation=int(session.get("_queued_prompt_generation", 0)),
+        admitted_transport=session.get("transport"),
+    ) -> None:
         # Patient wait (#63078): the user's message is already the accepted
         # in-flight turn, so a slow deferred build must not eat it. The wait
         # delivers the prompt when the still-running build completes, honors a
@@ -980,41 +1033,62 @@ def _(rid, params: dict) -> dict:
             # Terminal frame + retained snapshot (not a bare "error" event +
             # cleared inflight): if the client is disconnected right now, the
             # retained snapshot is the only way resume can show this failure.
-            _emit_terminal_turn_error(
+            settled = _emit_terminal_turn_error(
                 sid,
                 session,
                 (err.get("error") or {}).get("message", "agent initialization failed"),
                 # Agent construction never reached the provider: this is a
                 # local-runtime failure (env/config/venv), not an API error.
                 error_surface={"layer": "runtime", "code": "agent_init_failed", "retryable": True},
+                expected_started_at=admitted_started_at,
+                expected_queue_generation=admitted_generation,
+                settle_running=True,
+                terminal_transport=admitted_transport,
             )
-            with session["history_lock"]:
-                session["running"] = False
-                session["last_active"] = time.time()
-            _emit("session.info", sid, _session_info(session.get("agent"), session))
-            return
+            if settled:
+                return
         with session["history_lock"]:
+            window = session.get("_turn_outcomes")
+            inflight = session.get("inflight_turn")
+            cancelled = bool(session.get("_turn_cancel_requested"))
+            generation = int(session.get("_queued_prompt_generation", 0))
+            if (_sessions.get(sid) is not session or session.get("_closing")
+                    or session.get("_finalized") or admitted_started_at is None
+                    or not isinstance(inflight, dict) or inflight.get("started_at") is not admitted_started_at
+                    or not isinstance(window, TurnOutcomeWindow) or not window.owns(session, sid)
+                    or not window.turns
+                    or window.turns[-1]["accepted_turn"]["request_id"] != outcome_execution[2]
+                    or (generation != admitted_generation and not (
+                        cancelled and generation == session.get("_last_stop_queue_generation")))):
+                return
             if session.get("_turn_cancel_requested") or not session.get("running"):
                 session["running"] = False
                 _clear_inflight_turn(session)
+                window.finish(outcome_execution[2], interrupted=cancelled)
                 # Surface the cancellation to the client. Without this emit the
                 # turn vanishes silently — the Desktop sees `prompt.submit`
                 # return `{"status": "streaming"}` but never receives a
                 # `message.start` or `error` event, so the composer shows no
                 # feedback (issue #63078 server-side half). Match the
                 # `_wait_agent` error branch above: emit, then bail.
-                _emit(
-                    "error",
-                    sid,
-                    {
-                        "message": "Turn cancelled before the agent was ready"
-                        if session.get("_turn_cancel_requested")
-                        else "Session no longer running before the agent was ready"
-                    },
-                )
+                transport_token = bind_transport(admitted_transport)
+                try:
+                    _emit(
+                        "error",
+                        sid,
+                        {
+                            "message": "Turn cancelled before the agent was ready"
+                            if cancelled
+                            else "Session no longer running before the agent was ready"
+                        },
+                    )
+                finally:
+                    reset_transport(transport_token)
+                return
+            if err:
                 return
         _run_prompt_submit(rid, sid, session, text, display_kind=display_kind,
-            **({"context_input_event_id": input_receipt.event_id} if input_receipt is not None else {}))
+            turn_transport=admitted_transport, **({"context_input_event_id": input_receipt.event_id} if input_receipt is not None else {}))
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
     run_thread._turn_outcome_execution = outcome_execution

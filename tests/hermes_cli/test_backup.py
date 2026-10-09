@@ -309,6 +309,70 @@ class TestValidateBackupZip:
 # ---------------------------------------------------------------------------
 
 class TestImport:
+
+    def _import_effect_spies(self, monkeypatch, hermes_home):
+        import builtins
+        import sys
+        from types import ModuleType
+        from hermes_cli import backup as backup_mod
+        calls = {key: [] for key in ("wrappers", "service_checks", "service_starts", "provider_paths", "provider_imports")}
+        profiles = ModuleType("hermes_cli.profiles")
+        profiles.create_wrapper_script = lambda name: calls["wrappers"].append(name) or hermes_home / "unused-wrapper"
+        profiles.check_alias_collision = lambda name: None
+        profiles._is_wrapper_dir_in_path = lambda: True
+        profiles._get_wrapper_dir = lambda: hermes_home / "unused-wrappers"
+        monkeypatch.setitem(sys.modules, "hermes_cli.profiles", profiles)
+        gateway = ModuleType("hermes_cli.gateway")
+        gateway._is_service_running = lambda: calls["service_checks"].append(True) or False
+        gateway.ensure_gateway_service = lambda **kwargs: calls["service_starts"].append(kwargs) or True
+        monkeypatch.setitem(sys.modules, "hermes_cli.gateway", gateway)
+        monkeypatch.setattr(backup_mod, "_collect_memory_provider_external_paths", lambda: calls["provider_paths"].append(True) or [])
+        original_import = builtins.__import__
+        def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "plugins.memory" or name.startswith("plugins.memory."):
+                calls["provider_imports"].append(name)
+                raise AssertionError("provider import during restore")
+            return original_import(name, globals, locals, fromlist, level)
+        monkeypatch.setattr(builtins, "__import__", guarded_import)
+        return calls
+
+    @pytest.mark.parametrize("case", ["partial", "profile", "all-failed"])
+    def test_import_enospc_reports_incomplete_and_exits_before_activation(self, tmp_path, monkeypatch, capsys, case):
+        from hermes_cli.backup import run_import
+        home = tmp_path / "inert-home"
+        home.mkdir()
+        failed = "profiles/coder/config.yaml" if case == "profile" else "config.yaml"
+        target = home / failed
+        target.parent.mkdir(parents=True, exist_ok=True)
+        old = b"model: original\n"
+        target.write_bytes(old)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        members = {"config.yaml": "model: restored\n"}
+        if case == "partial":
+            members["notes.txt"] = "inert note\n"
+        elif case == "profile":
+            members[failed] = "model: restored-profile\n"
+        zipped = tmp_path / "backup.zip"
+        self._make_backup_zip(zipped, members)
+        calls = self._import_effect_spies(monkeypatch, home)
+        _break_member(monkeypatch, failed)
+        code = None
+        try:
+            run_import(Namespace(zipfile=str(zipped), force=True))
+        except SystemExit as exc:
+            code = exc.code
+        output = capsys.readouterr().out
+        print({"pre": old, "post": target.read_bytes(), "exit": code, "calls": calls, "output": output})
+        assert target.read_bytes() == old
+        assert list(target.parent.glob(".config.yaml.*")) == []
+        assert code == 1
+        assert all(not values for values in calls.values())
+        restored = 0 if case == "all-failed" else 1
+        assert f"Import incomplete: {restored} files restored, 1 failed" in output
+        assert "Import complete:" not in output
+        assert "Done. Your Hermes configuration has been restored." not in output
+
     def _make_backup_zip(self, zip_path: Path, files: dict[str, str | bytes]) -> None:
         """Create a test zip with given files."""
         with zipfile.ZipFile(zip_path, "w") as zf:
@@ -769,17 +833,19 @@ class TestImportAtomicWrites:
         """A dying member must not destroy the file it was replacing."""
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
-        original = "model: original\napi_key: keep-me\n"
+        original = "model: original\nnote: keep-me\n"
         (hermes_home / "config.yaml").write_text(original)
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
         zip_path = tmp_path / "backup.zip"
-        self._zip(zip_path, {"config.yaml": "model: replacement\n", "state.db": ""})
+        self._zip(zip_path, {"config.yaml": "model: replacement\n"})
         _break_member(monkeypatch, "config.yaml")
 
         from hermes_cli.backup import run_import
-        run_import(Namespace(zipfile=str(zip_path), force=True))
+        with pytest.raises(SystemExit) as caught:
+            run_import(Namespace(zipfile=str(zip_path), force=True))
+        assert caught.value.code == 1
 
         # Pre-fix this file is 0 bytes: the truncate landed, the write did not.
         assert (hermes_home / "config.yaml").read_text() == original
@@ -808,7 +874,9 @@ class TestImportAtomicWrites:
         _break_member(monkeypatch, "_external/.honcho/config.json")
 
         from hermes_cli.backup import run_import
-        run_import(Namespace(zipfile=str(zip_path), force=True))
+        with pytest.raises(SystemExit) as caught:
+            run_import(Namespace(zipfile=str(zip_path), force=True))
+        assert caught.value.code == 1
 
         assert (honcho / "config.json").read_text() == original
         assert list(honcho.glob(".config.json.*")) == []

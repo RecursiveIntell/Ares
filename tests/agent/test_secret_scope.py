@@ -223,11 +223,13 @@ class TestEnvFileParsing:
         (tmp_path / ".env").write_text("XIAOMI_API_KEY=placeholder\n")
         from hermes_cli import env_loader
 
-        home_key = str(tmp_path.resolve())
-        monkeypatch.setitem(
-            env_loader._SECRET_SOURCE_VALUES_BY_HOME,
-            home_key,
-            {"XIAOMI_API_KEY": "sk-from-bitwarden"},
+        # Seed the authoritative current generation. A legacy value-only
+        # projection cannot replace a retained/stale typed snapshot when
+        # pytest reuses the temp home after removing a passing fixture.
+        env_loader._record_external_secret_snapshot(
+            tmp_path,
+            data={"XIAOMI_API_KEY": "sk-from-bitwarden"},
+            status="ready",
         )
 
         assert ss.build_profile_secret_scope(tmp_path) == {
@@ -362,6 +364,231 @@ class TestInheritRootCredentials:
         # Malformed YAML must not crash scope building; inheritance is off.
         (profile / "config.yaml").write_text("\tbroken: [unclosed\n")
         assert ss.build_profile_secret_scope(profile) == {}
+
+
+class TestProfileOwnershipHistory:
+    """A successful scope capture remains provenance after declaration removal."""
+
+    @pytest.fixture(autouse=True)
+    def isolated_profiles(self, tmp_path, monkeypatch):
+        import hermes_constants
+        from hermes_cli import env_loader
+
+        self.env_loader = env_loader
+        self.root = tmp_path / "root"
+        self.source = self.root / "profiles" / "source"
+        self.target = self.root / "profiles" / "target"
+        self.sibling = self.root / "profiles" / "sibling"
+        for home in (self.source, self.target, self.sibling):
+            home.mkdir(parents=True)
+            (home / "config.yaml").write_text("{}\n")
+            self.seed(home)
+        monkeypatch.setattr(hermes_constants, "get_default_hermes_root", lambda: self.root)
+        monkeypatch.setattr(ss, "_PROFILE_OWNED_NAME_HISTORY", {})
+
+        def refuse_hydration(*args, **kwargs):
+            raise AssertionError("focused ownership test attempted external hydration")
+
+        monkeypatch.setattr(env_loader, "hydrate_profile_secret_sources", refuse_hydration)
+        token = ss.set_secret_scope(None)
+        yield
+        ss.reset_secret_scope(token)
+
+    def seed(self, home, data=None, status="ready"):
+        return self.env_loader._record_external_secret_snapshot(
+            home, data={} if data is None else data, status=status,
+        )
+
+    def declare(self, home, filename=".env", text="SOURCE_CUSTOM_TOKEN=synthetic-source\n"):
+        path = home / filename
+        path.write_text(text)
+        self.seed(home)
+        return path
+
+    def boundary(self, source=None, target=None):
+        return ss.build_profile_env_boundary(
+            source_home=source or self.source, target_home=target or self.target,
+        )
+
+    @pytest.mark.parametrize("filename", [".env", ".op.env"])
+    def test_cold_capture_then_real_deletion_retains_ownership(self, filename):
+        path = self.declare(self.source, filename)
+        captured = ss.build_profile_secret_scope(self.source, fail_closed_external=True)
+        assert captured["SOURCE_CUSTOM_TOKEN"] == "synthetic-source"
+        path.unlink()
+        self.seed(self.source)
+
+        boundary = self.boundary()
+        result = boundary.sanitize({
+            "SOURCE_CUSTOM_TOKEN": "synthetic-source",
+            "APPTAINERENV_SOURCE_CUSTOM_TOKEN": "synthetic-source",
+            "AMBIENT_SETTING": "user-owned",
+        })
+        assert "SOURCE_CUSTOM_TOKEN" in boundary.source_owned_names
+        assert result == {"AMBIENT_SETTING": "user-owned"}
+
+    def test_removed_source_name_uses_explicit_target_replacement(self):
+        path = self.declare(self.source)
+        self.declare(self.target, text="SOURCE_CUSTOM_TOKEN=synthetic-target\n")
+        ss.build_profile_secret_scope(self.source, fail_closed_external=True)
+        path.unlink()
+        self.seed(self.source)
+        result = self.boundary().sanitize({
+            "SOURCE_CUSTOM_TOKEN": "synthetic-source",
+            "SINGULARITYENV_SOURCE_CUSTOM_TOKEN": "synthetic-source",
+            "AMBIENT_SETTING": "user-owned",
+        })
+        assert result == {"SOURCE_CUSTOM_TOKEN": "synthetic-target", "AMBIENT_SETTING": "user-owned"}
+
+    def test_removed_external_generation_retains_exact_owned_name(self):
+        observed = self.seed(self.source, {"EXTERNAL_CUSTOM_TOKEN": "synthetic-source"})
+        captured = ss.build_profile_secret_scope(self.source, fail_closed_external=True)
+        assert captured["EXTERNAL_CUSTOM_TOKEN"] == "synthetic-source"
+        removed = self.seed(self.source)
+        assert removed.generation > observed.generation
+        result = self.boundary().sanitize({"EXTERNAL_CUSTOM_TOKEN": "synthetic-source", "AMBIENT_SETTING": "user-owned"})
+        assert result == {"AMBIENT_SETTING": "user-owned"}
+
+    def test_dotenv_and_external_precedence_survives_capture(self):
+        self.declare(self.source, ".op.env", "SOURCE_CUSTOM_TOKEN=bootstrap\nBOOTSTRAP_ONLY_TOKEN=bootstrap-only\n")
+        self.declare(self.source, ".env", "SOURCE_CUSTOM_TOKEN=dotenv\nDOTENV_ONLY_TOKEN=dotenv-only\n")
+        self.seed(self.source, {"SOURCE_CUSTOM_TOKEN": "external", "EXTERNAL_ONLY_TOKEN": "external-only"})
+        captured = ss.build_profile_secret_scope(self.source, fail_closed_external=True)
+        assert dict(captured) == {
+            "SOURCE_CUSTOM_TOKEN": "external", "BOOTSTRAP_ONLY_TOKEN": "bootstrap-only",
+            "DOTENV_ONLY_TOKEN": "dotenv-only", "EXTERNAL_ONLY_TOKEN": "external-only",
+        }
+        (self.source / ".env").unlink()
+        (self.source / ".op.env").unlink()
+        self.seed(self.source)
+        assert self.boundary().sanitize(dict(captured)) == {}
+
+    def test_warm_enumeration_retains_removed_name(self):
+        path = self.declare(self.source)
+        assert "SOURCE_CUSTOM_TOKEN" in ss.get_profile_owned_secret_names(self.source, fail_closed_external=True)
+        ss.build_profile_secret_scope(self.source, fail_closed_external=True)
+        path.unlink()
+        self.seed(self.source)
+        assert self.boundary().sanitize({"SOURCE_CUSTOM_TOKEN": "synthetic-source"}) == {}
+
+    def test_current_declaration_remains_owned(self):
+        self.declare(self.source)
+        assert self.boundary().sanitize({"SOURCE_CUSTOM_TOKEN": "synthetic-source"}) == {}
+
+    def test_never_observed_credential_shaped_ambient_name_is_preserved(self):
+        ss.build_profile_secret_scope(self.source, fail_closed_external=True)
+        ambient = {"UNOBSERVED_CUSTOM_TOKEN": "user-owned", "AMBIENT_SETTING": "user-owned"}
+        assert self.boundary().sanitize(ambient) == ambient
+
+    def test_sibling_observation_does_not_widen_source_ownership(self):
+        path = self.declare(self.sibling)
+        ss.build_profile_secret_scope(self.sibling, fail_closed_external=True)
+        path.unlink()
+        self.seed(self.sibling)
+        ambient = {"SOURCE_CUSTOM_TOKEN": "user-owned"}
+        assert self.boundary().sanitize(ambient) == ambient
+        assert self.boundary(source=self.sibling).sanitize(ambient) == {}
+
+    def test_direct_globals_and_forwarded_carriers_keep_distinct_authority(self):
+        path = self.declare(self.source, text="PATH=/source\nHOME=/source-home\nAPPTAINERENV_PATH=/source-container\nSINGULARITYENV_SOURCE_CUSTOM_TOKEN=synthetic-source\n")
+        ss.build_profile_secret_scope(self.source, fail_closed_external=True)
+        path.unlink()
+        self.seed(self.source)
+        result = self.boundary().sanitize({
+            "PATH": "/baseline", "HOME": "/baseline-home", "APPTAINERENV_PATH": "/source-container",
+            "SOURCE_CUSTOM_TOKEN": "synthetic-source", "SINGULARITYENV_SOURCE_CUSTOM_TOKEN": "synthetic-source",
+        })
+        assert result == {"PATH": "/baseline", "HOME": "/baseline-home"}
+
+    def test_same_home_boundary_preserves_its_existing_contract(self):
+        path = self.declare(self.source)
+        ss.build_profile_secret_scope(self.source, fail_closed_external=True)
+        path.unlink()
+        self.seed(self.source)
+        env = {"SOURCE_CUSTOM_TOKEN": "synthetic-source"}
+        assert self.boundary(target=self.source).sanitize(env) == env
+
+    def test_opted_in_root_observation_survives_revoked_inheritance(self):
+        (self.root / ".env").write_text("ROOT_ONLY_TOKEN=synthetic-root\n")
+        (self.source / "config.yaml").write_text('{"security":{"inherit_root_credentials":true}}\n')
+        self.seed(self.source)
+        assert ss.build_profile_secret_scope(self.source, fail_closed_external=True)["ROOT_ONLY_TOKEN"] == "synthetic-root"
+        (self.source / "config.yaml").write_text("{}\n")
+        self.seed(self.source)
+        assert self.boundary().sanitize({"ROOT_ONLY_TOKEN": "synthetic-root"}) == {}
+
+    def test_unadmitted_root_and_sibling_names_remain_ambient(self):
+        (self.root / ".env").write_text("ROOT_ONLY_TOKEN=synthetic-root\n")
+        self.declare(self.sibling, text="SIBLING_ONLY_TOKEN=synthetic-sibling\n")
+        assert ss.build_profile_secret_scope(self.source, fail_closed_external=True) == {}
+        ambient = {"ROOT_ONLY_TOKEN": "user-owned", "SIBLING_ONLY_TOKEN": "user-owned"}
+        assert self.boundary().sanitize(ambient) == ambient
+
+    def test_failed_dotenv_capture_adds_no_name_and_preserves_previous_history(self):
+        path = self.declare(self.source, text="PREVIOUS_TOKEN=previous\n")
+        assert "PREVIOUS_TOKEN" in ss.get_profile_owned_secret_names(self.source, fail_closed_external=True)
+        path.write_bytes(b"NEW_TOKEN=\xff\n")
+        self.seed(self.source)
+        with pytest.raises(RuntimeError, match="dotenv snapshot unavailable"):
+            ss.build_profile_secret_scope(self.source, fail_closed_external=True)
+        path.unlink()
+        self.seed(self.source)
+        assert ss.get_profile_owned_secret_names(self.source, fail_closed_external=True) == frozenset({"PREVIOUS_TOKEN"})
+
+    @pytest.mark.parametrize("status", ["failed", "degraded"])
+    def test_unavailable_external_capture_does_not_publish_names(self, status):
+        self.seed(self.source, {"FAILED_EXTERNAL_TOKEN": "synthetic-source"}, status=status)
+        with pytest.raises(RuntimeError, match="external secret snapshot"):
+            ss.build_profile_secret_scope(self.source, fail_closed_external=True)
+        self.seed(self.source)
+        assert ss.get_profile_owned_secret_names(self.source, fail_closed_external=True) == frozenset()
+
+    def test_failed_immutable_scope_does_not_publish_root_grant(self, monkeypatch):
+        path = self.declare(self.source, text="PREVIOUS_TOKEN=previous\n")
+        assert "PREVIOUS_TOKEN" in ss.get_profile_owned_secret_names(self.source, fail_closed_external=True)
+        path.unlink()
+        (self.root / ".env").write_text("ROOT_ONLY_TOKEN=synthetic-root\n")
+        (self.source / "config.yaml").write_text('{"security":{"inherit_root_credentials":true}}\n')
+        self.seed(self.source)
+
+        def refuse_generation(*args, **kwargs):
+            raise RuntimeError("synthetic immutable construction refusal")
+
+        with monkeypatch.context() as failed:
+            failed.setattr(ss, "_scope_generation", refuse_generation)
+            with pytest.raises(RuntimeError, match="immutable construction refusal"):
+                ss.build_profile_secret_scope(self.source, fail_closed_external=True)
+        (self.source / "config.yaml").write_text("{}\n")
+        self.seed(self.source)
+        assert ss.get_profile_owned_secret_names(self.source, fail_closed_external=True) == frozenset({"PREVIOUS_TOKEN"})
+
+    def test_stale_active_target_scope_is_refused(self):
+        self.declare(self.target, text="TARGET_TOKEN=first\n")
+        captured = ss.build_profile_secret_scope(self.target, fail_closed_external=True)
+        token = ss.set_secret_scope(captured)
+        try:
+            self.declare(self.target, text="TARGET_TOKEN=second\n")
+            with pytest.raises(RuntimeError, match="stale"):
+                self.boundary()
+        finally:
+            ss.reset_secret_scope(token)
+
+    def test_mismatched_active_target_scope_is_refused(self):
+        token = ss.set_secret_scope(ss.build_profile_secret_scope(self.source, fail_closed_external=True))
+        try:
+            with pytest.raises(RuntimeError, match="does not match"):
+                self.boundary()
+        finally:
+            ss.reset_secret_scope(token)
+
+    def test_existing_case_insensitive_carrier_policy_is_preserved(self, monkeypatch):
+        monkeypatch.setattr(ss, "_ENV_KEYS_CASE_INSENSITIVE", True)
+        path = self.declare(self.source, text="Source_Custom_Token=synthetic-source\n")
+        ss.build_profile_secret_scope(self.source, fail_closed_external=True)
+        path.unlink()
+        self.seed(self.source)
+        result = self.boundary().sanitize({"SOURCE_CUSTOM_TOKEN": "synthetic-source", "apptainerenv_source_custom_token": "synthetic-source", "PATH": "/baseline"})
+        assert result == {"PATH": "/baseline"}
 
 
 class TestApiServerListenerGlobals:

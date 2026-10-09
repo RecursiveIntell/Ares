@@ -1638,7 +1638,10 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     from agent import relay_llm
 
     active_client = client or agent._ensure_primary_openai_client(reason="codex_stream_direct")
-    from ares_runtime.continuity.runtime import context_dispatch_required
+    from ares_runtime.continuity.runtime import (
+        context_dispatch_required, context_dispatch_physical_call,
+        validate_context_dispatch_source,
+    )
 
     max_stream_retries = 0 if context_dispatch_required(agent) else 1
     # Accumulate streamed text so callers / compat shims can read it.
@@ -1667,13 +1670,17 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         writer_token = {"value": None}
 
         def _open_codex_stream(next_api_kwargs: dict[str, Any]):
+            validate_context_dispatch_source(agent, next_api_kwargs)
             stream_kwargs = _sanitize_consumer_codex_request(
                 agent,
                 next_api_kwargs,
             )
             stream_kwargs["stream"] = True
             stream_kwargs = _bypass_sdk_request_transform(stream_kwargs)
-            return active_client.responses.create(**stream_kwargs)
+            return context_dispatch_physical_call(
+                agent, stream_kwargs, lambda final: active_client.responses.create(**final),
+                source_payload=next_api_kwargs, transport_kind="codex_stream",
+            )
 
         def _codex_stream_created(_raw_stream: Any) -> None:
             # Claim the delta sink for THIS physical attempt. A newer attempt

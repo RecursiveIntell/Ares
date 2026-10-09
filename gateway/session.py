@@ -97,6 +97,36 @@ from .whatsapp_identity import (
 from utils import atomic_replace
 from agent.turn_context import extract_api_content_sidecar
 
+
+def _append_transcript_message_to_db(db, session_id: str, message: Dict[str, Any]) -> None:
+    """Persist the supported transcript fields through the existing DB owner."""
+    db.append_message(
+        session_id=session_id,
+        role=message.get("role", "unknown"),
+        content=message.get("content"),
+        tool_name=message.get("tool_name"),
+        tool_calls=message.get("tool_calls"),
+        tool_call_id=message.get("tool_call_id"),
+        reasoning=message.get("reasoning") if message.get("role") == "assistant" else None,
+        reasoning_content=message.get("reasoning_content") if message.get("role") == "assistant" else None,
+        reasoning_details=message.get("reasoning_details") if message.get("role") == "assistant" else None,
+        codex_reasoning_items=message.get("codex_reasoning_items") if message.get("role") == "assistant" else None,
+        codex_message_items=message.get("codex_message_items") if message.get("role") == "assistant" else None,
+        platform_message_id=(message.get("platform_message_id") or message.get("message_id")),
+        observed=bool(message.get("observed")),
+        timestamp=message.get("timestamp"),
+        # api_content sidecar: the exact bytes sent to the API for
+        # this message (prompt-cache-stable replay). Must survive
+        # any gateway-side persistence path or the next turn's
+        # replay diverges at this row.
+        api_content=extract_api_content_sidecar(message),
+        # Presentation typing (e.g. "internal_notification" for
+        # self-injected async-delegation/background notification turns,
+        # #82888). DB-only; stripped from provider-bound payloads.
+        display_kind=message.get("display_kind"),
+        display_metadata=message.get("display_metadata"),
+    )
+
 # Session keys/ids flow into filesystem paths downstream (e.g.
 # ``sessions_dir / f"{session_id}.json"`` in hermes_state, request-dump
 # filenames in agent_runtime_helpers). Any value that could escape the
@@ -3897,32 +3927,7 @@ class SessionStore:
 
     def _append_transcript_message(self, session_id: str, message: Dict[str, Any]) -> None:
         """Write one transcript row. Caller handles retry queuing."""
-        self._db.append_message(
-            session_id=session_id,
-            role=message.get("role", "unknown"),
-            content=message.get("content"),
-            tool_name=message.get("tool_name"),
-            tool_calls=message.get("tool_calls"),
-            tool_call_id=message.get("tool_call_id"),
-            reasoning=message.get("reasoning") if message.get("role") == "assistant" else None,
-            reasoning_content=message.get("reasoning_content") if message.get("role") == "assistant" else None,
-            reasoning_details=message.get("reasoning_details") if message.get("role") == "assistant" else None,
-            codex_reasoning_items=message.get("codex_reasoning_items") if message.get("role") == "assistant" else None,
-            codex_message_items=message.get("codex_message_items") if message.get("role") == "assistant" else None,
-            platform_message_id=(message.get("platform_message_id") or message.get("message_id")),
-            observed=bool(message.get("observed")),
-            timestamp=message.get("timestamp"),
-            # api_content sidecar: the exact bytes sent to the API for
-            # this message (prompt-cache-stable replay). Must survive
-            # any gateway-side persistence path or the next turn's
-            # replay diverges at this row.
-            api_content=extract_api_content_sidecar(message),
-            # Presentation typing (e.g. "internal_notification" for
-            # self-injected async-delegation/background notification turns,
-            # #82888). DB-only; stripped from provider-bound payloads.
-            display_kind=message.get("display_kind"),
-            display_metadata=message.get("display_metadata"),
-        )
+        _append_transcript_message_to_db(self._db, session_id, message)
 
     # Maximum in-memory pending messages per session before dropping the
     # oldest. Prevents unbounded growth when the DB is persistently broken.

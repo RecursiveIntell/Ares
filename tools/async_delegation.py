@@ -233,27 +233,38 @@ def _capture_routing_origin() -> Dict[str, Any]:
     return origin
 
 
-def _persist_dispatch(record: Dict[str, Any]) -> None:
+class _DurableAdmissionFull(RuntimeError):
+    """The existing pending-receipt admission policy has no free slot."""
+
+
+def _persist_dispatch(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Reserve one pending slot and return an ephemeral release fence."""
     now = time.time()
+    owner_pid = __import__("os").getpid()
     try:
         from gateway.status import get_process_start_time
-        owner_started_at = get_process_start_time(__import__("os").getpid())
+        owner_started_at = get_process_start_time(owner_pid)
     except Exception:
         owner_started_at = None
     task_payload = {
         key: record.get(key)
         for key in (
             "goal", "goals", "context", "toolsets", "role", "model", "is_batch",
-            # Routing origin (scope_id/user_id/user_name): persisted so a
-            # restart-recovered completion can reconstruct a full
-            # SessionSource — see _capture_routing_origin.
             "scope_id", "user_id", "user_name",
         )
         if key in record
     }
     with _DB_LOCK, _transaction() as conn:
+        # Serialize the count and insert across processes using the existing
+        # ledger. Every pending row occupies a slot, including active/claimed.
+        conn.execute("BEGIN IMMEDIATE")
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM async_delegations WHERE delivery_state='pending'"
+        ).fetchone()[0]
+        if pending >= _MAX_DURABLE_PENDING:
+            raise _DurableAdmissionFull("Pending delegation receipt capacity reached")
         conn.execute(
-            """INSERT OR REPLACE INTO async_delegations
+            """INSERT INTO async_delegations
                (delegation_id, origin_session, origin_ui_session_id,
                 parent_session_id, state, dispatched_at, updated_at,
                 delivery_state, delivery_attempts, owner_pid,
@@ -261,54 +272,76 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
                VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?)""",
             (record["delegation_id"], record.get("session_key", ""),
              record.get("origin_ui_session_id", ""), record.get("parent_session_id"),
-             record["dispatched_at"], now, __import__("os").getpid(),
+             record["dispatched_at"], now, owner_pid,
              owner_started_at, json.dumps(task_payload),
              record.get("origin_session_id", "")),
         )
-    _prune_durable_records()
+    reservation = {
+        "delegation_id": record["delegation_id"], "owner_pid": owner_pid,
+        "owner_started_at": owner_started_at,
+        "dispatched_at": record["dispatched_at"], "updated_at": now,
+    }
+    # The admission is committed. Maintenance failure cannot turn it into a
+    # refusal or cause a caller to replay work that has already been admitted.
+    try:
+        _prune_durable_records()
+    except Exception:
+        logger.exception("Delegation admitted; disposed-history maintenance failed")
+    return reservation
 
 
-def _delete_durable_delegation(delegation_id: str) -> None:
+
+def _delete_durable_delegation(
+    delegation_id: str, *, reservation: Dict[str, Any]
+) -> bool:
+    """Release only this process's exact reservation before submission."""
+    if reservation.get("delegation_id") != delegation_id:
+        return False
     with _DB_LOCK, _transaction() as conn:
-        conn.execute("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
+        deleted = conn.execute(
+            """DELETE FROM async_delegations
+               WHERE delegation_id=? AND owner_pid=? AND owner_started_at IS ?
+                 AND dispatched_at=? AND updated_at=?
+                 AND state='running' AND delivery_state='pending'
+                 AND delivery_attempts=0 AND delivery_claim IS NULL
+                 AND delivery_claimed_at IS NULL AND completed_at IS NULL
+                 AND event_json IS NULL AND result_json IS NULL""",
+            (delegation_id, reservation["owner_pid"],
+             reservation["owner_started_at"], reservation["dispatched_at"],
+             reservation["updated_at"]),
+        ).rowcount == 1
+    return deleted
+
 
 
 def _prune_durable_records() -> None:
-    """Bound terminal history, preferring delivered records for deletion."""
+    """Bound disposed history without deleting pending or claimed receipts."""
     now = time.time()
     cutoff = now - _DURABLE_RETENTION_SECONDS
+    eligible = (
+        "state NOT IN ('running','finalizing') "
+        "AND delivery_state IN ('delivered','dropped') "
+        "AND delivery_claim IS NULL"
+    )
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
-            "DELETE FROM async_delegations WHERE delivery_state='delivered' AND updated_at < ?",
+            f"""DELETE FROM async_delegations WHERE {eligible}
+                AND delivery_state='delivered' AND updated_at < ?""",
             (cutoff,),
         )
         terminal_count = conn.execute(
-            "SELECT COUNT(*) FROM async_delegations WHERE state NOT IN ('running','finalizing')"
+            f"SELECT COUNT(*) FROM async_delegations WHERE {eligible}"
         ).fetchone()[0]
         excess = max(0, terminal_count - _MAX_RETAINED_COMPLETED)
         if excess:
             conn.execute(
-                """DELETE FROM async_delegations WHERE delegation_id IN (
+                f"""DELETE FROM async_delegations WHERE delegation_id IN (
                      SELECT delegation_id FROM async_delegations
-                     WHERE state NOT IN ('running','finalizing')
+                     WHERE {eligible}
                      ORDER BY CASE delivery_state WHEN 'delivered' THEN 0 ELSE 1 END,
                               updated_at ASC LIMIT ?
                    )""",
                 (excess,),
-            )
-        pending_count = conn.execute(
-            """SELECT COUNT(*) FROM async_delegations
-               WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'"""
-        ).fetchone()[0]
-        overflow = max(0, pending_count - _MAX_DURABLE_PENDING)
-        if overflow:
-            conn.execute(
-                """DELETE FROM async_delegations WHERE delegation_id IN (
-                     SELECT delegation_id FROM async_delegations
-                     WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'
-                     ORDER BY updated_at ASC LIMIT ?
-                   )""",
-                (overflow,),
             )
 
 
@@ -836,6 +869,12 @@ def dispatch_async_delegation(
     # active_count() separately would let two concurrent dispatches (e.g.
     # from different gateway sessions) both pass the check and exceed the cap.
     with _records_lock:
+        if delegation_id in _records:
+            return {
+                "status": "rejected", "error_code": "duplicate_delegation_id",
+                "execution_started": False,
+                "error": "Delegation identity already exists; preserved its receipt",
+            }
         running = sum(
             1 for r in _records.values()
             if r.get("status") in ("running", "stalling")
@@ -843,6 +882,8 @@ def dispatch_async_delegation(
         if running >= max_async_children:
             return {
                 "status": "rejected",
+                "error_code": "pool_capacity",
+                "execution_started": False,
                 "error": (
                     f"Async delegation capacity reached ({max_async_children} "
                     f"running). Wait for one to finish (its result will re-enter "
@@ -853,8 +894,42 @@ def dispatch_async_delegation(
             }
         _records[delegation_id] = record
 
-    _persist_dispatch(record)
-    executor = _get_executor(max_async_children)
+    try:
+        reservation = _persist_dispatch(record)
+    except Exception as exc:
+        with _records_lock:
+            if _records.get(delegation_id) is record:
+                del _records[delegation_id]
+        return {
+            "status": "rejected",
+            "error_code": ("durable_backlog_full" if isinstance(exc, _DurableAdmissionFull)
+                           else "durable_storage_unavailable"),
+            "execution_started": False,
+            "delegation_id": delegation_id,
+            "error": f"Async delegation was not submitted: {exc}",
+        }
+    try:
+        executor = _get_executor(max_async_children)
+    except Exception as exc:
+        # No submit call occurred. Release only the unchanged owned row;
+        # failed or conflicting cleanup retains custody rather than guessing.
+        released = False
+        try:
+            released = _delete_durable_delegation(
+                delegation_id, reservation=reservation
+            )
+        except Exception:
+            logger.exception("Could not confirm unstarted delegation release %s", delegation_id)
+        if released:
+            with _records_lock:
+                if _records.get(delegation_id) is record:
+                    del _records[delegation_id]
+        return {
+            "status": "rejected", "error_code": "executor_unavailable",
+            "execution_started": False, "delegation_id": delegation_id,
+            "durable_reservation_released": released,
+            "error": f"Async executor unavailable before submission: {exc}",
+        }
 
     def _worker() -> None:
         result: Dict[str, Any] = {}
@@ -879,13 +954,14 @@ def dispatch_async_delegation(
         # Propagate the dispatching profile so the detached child resolves
         # get_hermes_home() under the right profile.
         executor.submit(propagate_context_to_thread(_worker))
-    except Exception as exc:  # pragma: no cover — pool submit failure is rare
-        with _records_lock:
-            _records.pop(delegation_id, None)
-        _delete_durable_delegation(delegation_id)
+    except Exception as exc:
+        # submit() may enqueue before raising. Keep both ledgers and the
+        # handle; callers must never replay an ambiguous scheduling outcome.
+        logger.exception("Async submission outcome uncertain for %s", delegation_id)
         return {
-            "status": "rejected",
-            "error": f"Failed to schedule async delegation: {exc}",
+            "status": "dispatch_uncertain", "error_code": "scheduling_uncertain",
+            "execution_started": None, "delegation_id": delegation_id,
+            "error": f"Async submission outcome is unknown: {exc}",
         }
     if progress_fn is not None:
         _ensure_stale_monitor()
@@ -895,6 +971,7 @@ def dispatch_async_delegation(
         delegation_id, session_key or "<cli>", (goal or "")[:80],
     )
     return {"status": "dispatched", "delegation_id": delegation_id}
+
 
 
 def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
@@ -1080,6 +1157,12 @@ def dispatch_async_delegation_batch(
         "_interrupted_at": None,
     }
     with _records_lock:
+        if delegation_id in _records:
+            return {
+                "status": "rejected", "error_code": "duplicate_delegation_id",
+                "execution_started": False,
+                "error": "Delegation identity already exists; preserved its receipt",
+            }
         running = sum(
             1 for r in _records.values()
             if r.get("status") in ("running", "stalling")
@@ -1087,6 +1170,8 @@ def dispatch_async_delegation_batch(
         if running >= max_async_children:
             return {
                 "status": "rejected",
+                "error_code": "pool_capacity",
+                "execution_started": False,
                 "error": (
                     f"Async delegation capacity reached ({max_async_children} "
                     f"running). Wait for one to finish (its result will re-enter "
@@ -1096,8 +1181,42 @@ def dispatch_async_delegation_batch(
             }
         _records[delegation_id] = record
 
-    _persist_dispatch(record)
-    executor = _get_executor(max_async_children)
+    try:
+        reservation = _persist_dispatch(record)
+    except Exception as exc:
+        with _records_lock:
+            if _records.get(delegation_id) is record:
+                del _records[delegation_id]
+        return {
+            "status": "rejected",
+            "error_code": ("durable_backlog_full" if isinstance(exc, _DurableAdmissionFull)
+                           else "durable_storage_unavailable"),
+            "execution_started": False,
+            "delegation_id": delegation_id,
+            "error": f"Async delegation was not submitted: {exc}",
+        }
+    try:
+        executor = _get_executor(max_async_children)
+    except Exception as exc:
+        # No submit call occurred. Release only the unchanged owned row;
+        # failed or conflicting cleanup retains custody rather than guessing.
+        released = False
+        try:
+            released = _delete_durable_delegation(
+                delegation_id, reservation=reservation
+            )
+        except Exception:
+            logger.exception("Could not confirm unstarted delegation release %s", delegation_id)
+        if released:
+            with _records_lock:
+                if _records.get(delegation_id) is record:
+                    del _records[delegation_id]
+        return {
+            "status": "rejected", "error_code": "executor_unavailable",
+            "execution_started": False, "delegation_id": delegation_id,
+            "durable_reservation_released": released,
+            "error": f"Async executor unavailable before submission: {exc}",
+        }
 
     def _worker() -> None:
         combined: Dict[str, Any] = {}
@@ -1127,13 +1246,14 @@ def dispatch_async_delegation_batch(
     try:
         # Propagate the dispatching profile to the detached batch children.
         executor.submit(propagate_context_to_thread(_worker))
-    except Exception as exc:  # pragma: no cover
-        with _records_lock:
-            _records.pop(delegation_id, None)
-        _delete_durable_delegation(delegation_id)
+    except Exception as exc:
+        # submit() may enqueue before raising. Keep both ledgers and the
+        # handle; callers must never replay an ambiguous scheduling outcome.
+        logger.exception("Async submission outcome uncertain for %s", delegation_id)
         return {
-            "status": "rejected",
-            "error": f"Failed to schedule async delegation batch: {exc}",
+            "status": "dispatch_uncertain", "error_code": "scheduling_uncertain",
+            "execution_started": None, "delegation_id": delegation_id,
+            "error": f"Async submission outcome is unknown: {exc}",
         }
     if progress_fn is not None:
         _ensure_stale_monitor()
@@ -1143,6 +1263,7 @@ def dispatch_async_delegation_batch(
         delegation_id, n, session_key or "<cli>",
     )
     return {"status": "dispatched", "delegation_id": delegation_id}
+
 
 
 def _finalize_batch(

@@ -375,6 +375,7 @@ def test_real_queued_prompt_preempts_goal_compression_retry(
     )
     session = _turn_session(agent, session_key)
     session_holder["session"] = session
+    monkeypatch.setitem(server._sessions, "sid", session)
 
     server._run_prompt_submit("rid", "sid", session, "initial work")
 

@@ -82,13 +82,23 @@ def test_late_parent_stop_does_not_clear_successor_state(monkeypatch):
 
 
 def test_cancelled_successor_cannot_clear_interrupt_or_start(monkeypatch):
-    session = {"running": True, "_turn_cancel_requested": True,
-               "history_lock": threading.Lock(),
-               "agent": types.SimpleNamespace(clear_interrupt=lambda: pytest.fail("cancel latch cleared"))}
+    interrupted = []
+    session = {"running": True, "history_lock": threading.Lock(),
+               "agent": types.SimpleNamespace(
+                   interrupt=lambda: interrupted.append(True),
+                   clear_interrupt=lambda: pytest.fail("cancel latch cleared"))}
+    monkeypatch.setitem(server._sessions, "s", session)
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: False)
     monkeypatch.setattr(server, "_start_inflight_turn", lambda *a: pytest.fail("cancelled turn admitted"))
+    assert server._interrupt_session_turn("s", session) is False
+    stopped_generation = session["_queued_prompt_generation"]
     assert server._run_prompt_submit("A", "s", session, "follow-up",
                                     display_kind="internal_notification") is False
+    assert interrupted == [True]
     assert session["running"] is False
+    assert session["inflight_turn"] is None
+    assert session["_turn_cancel_requested"] is True
+    assert session["_queued_prompt_generation"] == session["_last_stop_queue_generation"] == stopped_generation
 
 
 def test_real_host_rejects_stale_stop_then_interrupts_matching_request(tmp_path, monkeypatch):

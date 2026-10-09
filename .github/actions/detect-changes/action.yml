@@ -51,6 +51,12 @@ outputs:
   rust:
     description: Run `cargo test` for the Tauri bootstrap installer.
     value: ${{ steps.classify.outputs.rust }}
+  context_continuity:
+    description: Run exact paired native owner and Governor qualification.
+    value: ${{ steps.classify.outputs.context_continuity }}
+  current_owner_integration:
+    description: Run canonical owner to Ares consumer qualification.
+    value: ${{ steps.classify.outputs.current_owner_integration }}
   mcp_catalog:
     description: Require MCP catalog security review label.
     value: ${{ steps.classify.outputs.mcp_catalog }}
@@ -105,7 +111,7 @@ runs:
             if CHANGED="$(gh api \
               --paginate \
               "repos/${REPO}/compare/${BASE_SHA}...${HEAD_SHA}" \
-              --jq '.files[]?.filename')"; then
+              --jq '.files[]? | .filename, (.previous_filename // empty)')"; then
               break
             fi
             if [ "$i" = 3 ]; then
@@ -116,6 +122,15 @@ runs:
             echo "::warning::compare API failed (attempt $i); retrying in 10s"
             sleep 10
           done
+        fi
+
+        # A capped compare cannot prove either native qualification irrelevant.
+        # Renames emit both paths, so this threshold may also conservatively
+        # run all lanes before the 300-file API limit is reached.
+        if [ "$EVENT_NAME" = "pull_request" ] && [ -n "$CHANGED" ] && \
+            [ "$(printf '%s\n' "$CHANGED" | wc -l)" -ge 300 ]; then
+          echo "::warning::compare may be capped — failing open (all lanes run)"
+          CHANGED=""
         fi
 
         echo "Changed files:"

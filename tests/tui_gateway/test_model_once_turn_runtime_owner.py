@@ -104,10 +104,11 @@ def test_cancel_before_turn_does_not_consume_queued_once(live_turn, monkeypatch,
 
 
 @pytest.mark.parametrize('replacement_kind', ['agent', 'session'])
-def test_retired_once_owner_does_not_restore_replacement(live_turn, monkeypatch, replacement_kind):
+def test_lost_once_owner_retains_unproven_A_without_restoring_replacement(live_turn, monkeypatch, replacement_kind):
     session, _ = live_turn
     value = session['agent']
     once(session)
+    lease = session['_one_turn_model_runtime']
     replacement = _make_agent_openrouter()
     replacement.quiet_mode = True
     replacement._create_openai_client = lambda kwargs, **kw: SimpleNamespace(kwargs=kwargs.copy())
@@ -136,7 +137,10 @@ def test_retired_once_owner_does_not_restore_replacement(live_turn, monkeypatch,
     server._run_prompt_submit('once-request', 'selected', session, 'offline input')
     assert (replacement.model, replacement.provider) == ('replacement-model', 'replacement-provider')
     assert_route(replacement, 'http://replacement.invalid/v1', 'synthetic-replacement-key')
-    assert not session.get('_one_turn_model_runtime')
+    assert session['_one_turn_model_runtime'] is lease
+    assert lease['restore_snapshot']['model'] == 'model-a'
+    if replacement_kind == 'agent':
+        assert lease['restore_failed'] and not lease['active']
     assert not restore_side_effects
 
 
@@ -206,6 +210,7 @@ def test_restore_failure_is_visible_and_keeps_actual_runtime_metadata(live_turn,
 def test_stale_queued_once_owner_fails_before_dispatch(live_turn, monkeypatch):
     session, events = live_turn
     once(session)
+    lease = session['_one_turn_model_runtime']
     replacement = _make_agent_openrouter()
     replacement.quiet_mode = True
     session['agent'] = replacement
@@ -213,8 +218,8 @@ def test_stale_queued_once_owner_fails_before_dispatch(live_turn, monkeypatch):
     monkeypatch.setattr(replacement, 'run_conversation', lambda *a, **kw: dispatched.append(True))
     server._run_prompt_submit('stale-once-request', 'selected', session, 'offline input')
     assert not dispatched
-    assert not session.get('_one_turn_model_runtime')
-    assert not session.get('one_turn_model_restore')
+    assert session['_one_turn_model_runtime'] is lease and lease['restore_failed']
+    assert session['one_turn_model_restore'] is lease['restore_snapshot']
     assert any(name == 'message.complete' and payload.get('status') == 'error' for name, _, payload in events)
 
 
@@ -428,3 +433,176 @@ def test_once_publication_and_clear_hold_consumer_lock(live_turn, one_turn):
     else:
         assert 'one_turn_model_restore' not in session
         assert '_one_turn_model_runtime' not in session
+
+
+# Compression and tools.configure must preserve the exact accepted model owner.
+REAL_COMPRESS_SYNC = server._sync_session_key_after_compress
+
+
+@pytest.mark.parametrize('once_pick', [False, True])
+def test_actual_compression_reanchor_settles_accepted_owner(live_turn, monkeypatch, once_pick):
+    session, events = live_turn
+    value = session['agent']
+    if once_pick:
+        once(session)
+    with session['history_lock']:
+        server._start_inflight_turn(session, 'rotate this admitted turn')
+        ref = server._begin_turn_outcome(session, 'selected', 'rotation-owner', 'inline')
+    token = server._turn_outcome_execution.set((session, 'selected', ref['request_id']))
+    monkeypatch.setattr(server, '_sync_session_key_after_compress', REAL_COMPRESS_SYNC)
+    monkeypatch.setattr(server, '_transfer_active_session_slot', lambda *a, **kw: True)
+    monkeypatch.setattr('tools.approval.register_gateway_notify', lambda *a: None)
+    monkeypatch.setattr('tools.approval.unregister_gateway_notify', lambda *a: None)
+    monkeypatch.setattr('tools.approval.is_session_yolo_enabled', lambda *a: False)
+
+    def rotate(*a, **kw):
+        value.session_id = 'actual-continuation'
+        return {'final_response': 'rotated', 'completed': False, 'api_calls': 0}
+    monkeypatch.setattr(value, 'run_conversation', rotate)
+    try:
+        assert server._run_prompt_submit('rotation-rpc', 'selected', session, 'rotate this admitted turn')
+    finally:
+        server._turn_outcome_execution.reset(token)
+    assert session['session_key'] == 'actual-continuation'
+    assert session['_queued_prompt_generation'] == 1
+    assert session['running'] is False
+    assert session.get('inflight_turn') is None
+    if once_pick:
+        assert (value.model, value.provider) == ('model-a', 'endpoint-a')
+        assert not session.get('_one_turn_model_runtime')
+    assert any(name == 'session.info' and payload.get('running') is False
+               for name, _, payload in events)
+
+
+def test_compression_then_stop_preserves_only_cancelled_owner_cleanup(live_turn, monkeypatch):
+    session, _ = live_turn
+    value = session['agent']
+    once(session)
+    with session['history_lock']:
+        server._start_inflight_turn(session, 'stopped rotation')
+        ref = server._begin_turn_outcome(session, 'selected', 'stopped-owner', 'inline')
+    token = server._turn_outcome_execution.set((session, 'selected', ref['request_id']))
+    monkeypatch.setattr(server, '_sync_session_key_after_compress', REAL_COMPRESS_SYNC)
+    def stop_during_sync(*a, **kw):
+        session['_turn_cancel_requested'] = True
+        session['_queued_prompt_generation'] = 1
+        session['_last_stop_queue_generation'] = 1
+        return True
+    monkeypatch.setattr(server, '_transfer_active_session_slot', stop_during_sync)
+    monkeypatch.setattr('tools.approval.register_gateway_notify', lambda *a: None)
+    monkeypatch.setattr('tools.approval.unregister_gateway_notify', lambda *a: None)
+    monkeypatch.setattr('tools.approval.is_session_yolo_enabled', lambda *a: False)
+    def rotate(*a, **kw):
+        value.session_id = 'stopped-continuation'
+        return {'final_response': '', 'interrupted': True, 'completed': False, 'api_calls': 0}
+    monkeypatch.setattr(value, 'run_conversation', rotate)
+    try:
+        server._run_prompt_submit('stop-rpc', 'selected', session, 'stopped rotation')
+    finally:
+        server._turn_outcome_execution.reset(token)
+    assert session['running'] is False
+    assert (value.model, value.provider) == ('model-a', 'endpoint-a')
+    assert not session.get('_one_turn_model_runtime')
+
+
+def _configure_tools(monkeypatch):
+    from hermes_cli import tools_config
+    monkeypatch.setattr('hermes_cli.config.save_config', lambda cfg: None)
+    monkeypatch.setattr(tools_config, '_get_plugin_toolset_keys', lambda: set())
+    monkeypatch.setattr(tools_config, '_get_platform_tools', lambda *a, **kw: set())
+    name = tools_config.CONFIGURABLE_TOOLSETS[0][0]
+    return server._methods['tools.configure']('configure-rpc', {
+        'session_id': 'selected', 'action': 'disable', 'names': [name]})
+
+
+def test_registered_tools_configure_retires_idle_once_custody(live_turn, monkeypatch):
+    session, _ = live_turn
+    session['running'] = False
+    predecessor = session['agent']
+    once(session)
+    replacement = SimpleNamespace(session_id=session['session_key'], model='fresh-config', provider='fresh-provider')
+    monkeypatch.setattr(server, '_make_agent', lambda *a, **kw: replacement)
+    result = _configure_tools(monkeypatch)
+    assert not result.get('error'), result
+    assert result['result']['reset'] is True
+    assert session['agent'] is replacement and session['agent'] is not predecessor
+    assert 'one_turn_model_restore' not in session
+    assert '_one_turn_model_runtime' not in session
+    assert server._one_turn_model_restore_error('selected', session) is None
+
+
+def test_registered_tools_configure_constructor_failure_keeps_exact_once_snapshot(live_turn, monkeypatch):
+    session, _ = live_turn
+    session['running'] = False
+    once(session)
+    predecessor = session['agent']
+    snapshot = session['one_turn_model_restore']
+    lease = session['_one_turn_model_runtime']
+    pin = session['model_override']
+    def fail(*a, **kw):
+        raise RuntimeError('inert reset constructor failure')
+    monkeypatch.setattr(server, '_make_agent', fail)
+    result = _configure_tools(monkeypatch)
+    assert result['error']['code'] == 5035
+    assert session['agent'] is predecessor
+    assert session['one_turn_model_restore'] is snapshot
+    assert session['_one_turn_model_runtime'] is lease
+    assert session['model_override'] is pin
+    consumed, owned = server._consume_one_turn_model_runtime(session, predecessor)
+    assert consumed is snapshot and owned is lease
+    assert server._consume_one_turn_model_runtime(session, predecessor) == (None, None)
+    server._restore_agent_model_runtime(predecessor, consumed)
+    assert (predecessor.model, predecessor.provider) == ('model-a', 'endpoint-a')
+
+
+def test_reset_construction_cannot_clear_successor_once_owner(live_turn, monkeypatch):
+    session, _ = live_turn
+    session['running'] = False
+    once(session)
+    successor = SimpleNamespace()
+    successor_lease = {'session': session, 'sid': 'selected', 'agent': successor, 'active': False}
+    successor_snapshot = {'model': 'successor-pin'}
+    def replace_owner(*a, **kw):
+        session['agent'] = successor
+        session['_one_turn_model_runtime'] = successor_lease
+        session['one_turn_model_restore'] = successor_snapshot
+        return SimpleNamespace()
+    monkeypatch.setattr(server, '_make_agent', replace_owner)
+    with pytest.raises(RuntimeError, match='owner changed'):
+        server._reset_session_agent('selected', session)
+    assert session['agent'] is successor
+    assert session['_one_turn_model_runtime'] is successor_lease
+    assert session['one_turn_model_restore'] is successor_snapshot
+
+
+@pytest.mark.parametrize('flag', ['_closing', '_finalized'])
+def test_reset_cannot_construct_through_closed_owner(live_turn, monkeypatch, flag):
+    session, _ = live_turn
+    session['running'] = False
+    once(session)
+    session[flag] = True
+    predecessor = session['agent']
+    snapshot, lease = session['one_turn_model_restore'], session['_one_turn_model_runtime']
+    built = []
+    def construct(*a, **kw):
+        built.append(True)
+        return SimpleNamespace(session_id=session['session_key'], model='fresh', provider='fresh')
+    monkeypatch.setattr(server, '_make_agent', construct)
+    with pytest.raises(RuntimeError, match='owner is busy or unavailable'):
+        server._reset_session_agent('selected', session)
+    assert not built and session['agent'] is predecessor
+    assert session['one_turn_model_restore'] is snapshot and session['_one_turn_model_runtime'] is lease
+
+
+@pytest.mark.parametrize('flag', ['_closing', '_finalized'])
+def test_actual_reanchor_cannot_publish_through_closed_owner(live_turn, monkeypatch, flag):
+    session, _ = live_turn
+    key = session['session_key']
+    session['agent'].session_id = 'detached-continuation'
+    session[flag] = True
+    transferred = []
+    monkeypatch.setattr(server, '_transfer_active_session_slot', lambda *a, **kw: transferred.append(True) or True)
+    REAL_COMPRESS_SYNC('selected', session, restart_slash_worker=False)
+    assert not transferred
+    assert session['session_key'] == key and int(session.get('_queued_prompt_generation', 0)) == 0
+

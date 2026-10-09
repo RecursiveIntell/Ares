@@ -29,6 +29,8 @@ Lanes:
   lives under ``apps/``, so without this lane a Rust change matched ``frontend``
   and only the TypeScript matrix ran.
 * ``mcp_catalog`` — bundled MCP catalog / installer review.
+* ``context_continuity`` — exact paired native owner and Governor qualification.
+* ``current_owner_integration`` — canonical owner to Ares consumer qualification.
 
 Docker is not a lane — it builds on push-to-main and release only,
 never per-PR.
@@ -56,6 +58,7 @@ must never skip one a change could break:
 from __future__ import annotations
 
 import json
+from fnmatch import fnmatchcase
 import os
 import sys
 
@@ -115,6 +118,134 @@ _INSTALLER_FILES = {"scripts/install.ps1", "scripts/install.cmd"}
 # and the crate's unit tests had never executed in CI at all.
 _RUST_PATHS = ("apps/bootstrap-installer/src-tauri/",)
 _RUST_FILENAMES = {"Cargo.toml", "Cargo.lock"}
+
+# Native qualification applicability belongs to this classifier. These positive
+# patterns preserve the former standalone PR trigger coverage. fnmatchcase may
+# conservatively include deeper paths; it must never narrow a required lane.
+_CONTEXT_CONTINUITY_PATHS = (
+    '.github/workflows/context-continuity-qualification.yml',
+    'ares_runtime/continuity/**',
+    'tests/ares_runtime/test_continuity*',
+    'tests/ares_runtime/test_context_rebase_state.py',
+    'tests/ares_runtime/test_context_controller_credentials.py',
+    'tests/ares_runtime/test_context_authority_binding.py',
+    'tests/ares_runtime/test_context_native*.py',
+    'hermes_state_context_authority.py',
+    'hermes_cli/context_authority.py',
+    'tests/ares_runtime/test_managed_calls.py',
+    'tests/hermes_cli/test_goals.py',
+    'tests/hermes_cli/test_goal_lifecycle_contract.py',
+    'tests/test_model_tools.py',
+    'tests/tools/test_code_execution.py',
+    'tests/run_agent/test_message_sequence_repair.py',
+    'tests/run_agent/test_tool_executor_contextvar_propagation.py',
+    'tests/hermes_cli/test_heartbeat.py',
+    'tests/hermes_cli/test_loops.py',
+    'tests/test_run_checkpoint_import_boundaries.py',
+    'tests/test_run_checkpoint*.py',
+    'tests/test_run_task_custody.py',
+    'tests/test_run_custody_cold_recovery.py',
+    'tests/test_run_custody_ready_recovery.py',
+    'tests/test_run_custody_obligations.py',
+    'tests/gateway/test_context_input.py',
+    'tests/gateway/test_context_input_recovery.py',
+    'tests/ares_runtime/test_context_input_lifetime.py',
+    'tests/cli/test_quick_commands.py',
+    'tests/test_estop.py',
+    'tests/ares_runtime/test_permit_readback.py',
+    'tests/test_ares_collaboration.py',
+    'ares_runtime/collaboration.py',
+    'tests/gateway/test_pre_gateway_dispatch.py',
+    'tests/gateway/test_restart_resume_pending.py',
+    'tests/gateway/test_multiplex_session_db_profile_scope.py',
+    'tests/gateway/test_multiplex_adapter_registry.py',
+    'tests/gateway/test_adapter_startup_secret_scope.py',
+    'tests/gateway/test_startup_connect_parallel.py',
+    'tests/gateway/test_run_progress_topics.py',
+    'tests/gateway/test_42039_duplicate_user_message.py',
+    'tests/gateway/test_internal_event_never_interrupts_busy_session.py',
+    'tests/gateway/test_multiplex_busy_input_mode.py',
+    'tests/gateway/test_platform_base.py',
+    'tests/gateway/test_base_topic_sessions.py',
+    'tests/gateway/test_profile_routing.py',
+    'tests/gateway/test_busy_session_auth_bypass.py',
+    'tests/gateway/test_busy_session_ack.py',
+    'gateway/context_input.py',
+    'gateway/context_input_recovery.py',
+    'gateway/turn_context.py',
+    'gateway/platforms/base.py',
+    'gateway/run.py',
+    'tests/state/test_message_copy_mapping.py',
+    'tests/state/test_message_row_publication.py',
+    'tests/test_compression_watermark_commit.py',
+    'tests/state/test_todo_compaction.py',
+    'tests/run_agent/test_in_place_compaction.py',
+    'tests/agent/test_micro_compaction.py',
+    'tests/hermes_state/test_append_messages_batch.py',
+    'tests/tui_gateway/test_run_checkpoint_claim_rpc.py',
+    'tests/tui_gateway/test_goal_command.py',
+    'tests/test_turn_run_custody.py',
+    'tests/tui_gateway/test_inline_rpc_gil_starvation.py',
+    'tests/tui_gateway/test_kanban_notify_poller.py',
+    'tests/test_tui_gateway_server.py',
+    'tests/cli/test_cli_goal_interrupt.py',
+    'tests/cli/test_cli_async_delegation_delivery.py',
+    'tests/gateway/test_goal_resume_restart.py',
+    'tests/agent/test_synthetic_turn_display_kind.py',
+    'tests/agent/test_turn_context.py',
+    'tests/run_agent/test_run_agent.py',
+    'tests/run_agent/test_1630_context_overflow_loop.py',
+    'tests/run_agent/test_compression_lock_defer.py',
+    'agent/agent_init.py',
+    'agent/agent_runtime_helpers.py',
+    'agent/tool_executor.py',
+    'model_tools.py',
+    'agent/conversation_loop.py',
+    'agent/chat_completion_helpers.py',
+    'agent/codex_runtime.py',
+    'agent/run_checkpoint_custody.py',
+    'agent/turn_context.py',
+    'agent/context_input.py',
+    'cli.py',
+    'hermes_cli/goals.py',
+    'hermes_cli/heartbeat.py',
+    'hermes_cli/loops.py',
+    'hermes_state.py',
+    'hermes_state_common.py',
+    'hermes_state_continuity.py',
+    'hermes_state_inbox.py',
+    'hermes_state_input_turns.py',
+    'agent/turn_finalizer.py',
+    'hermes_state_runs.py',
+    'plugins/context_engine/_context_governor/**',
+    'scripts/run_checkpoint_context.py',
+    'scripts/run_checkpoint_claim.py',
+    'scripts/run_checkpoint_resume.py',
+    'tui_gateway/run_checkpoint_rpc.py',
+    'scripts/run_tests.sh',
+    'tests/run_agent/test_streaming.py',
+    'tests/run_agent/test_run_agent_codex_responses.py',
+    'tests/run_agent/test_codex_sdk_transform_bypass.py',
+    'tests/plugins/test_context_governor*.py',
+    'tui_gateway/server.py',
+    'tui_gateway/methods_prompt.py',
+    'tui_gateway/compute_host.py',
+    'docs/context-continuity/**',
+)
+_CURRENT_OWNER_INTEGRATION_PATHS = (
+    '.github/workflows/current-owner-integration.yml',
+    'ares_runtime/collaboration.py',
+    'ares_runtime/governed_context.py',
+    'ares_runtime/__init__.py',
+    'tests/owner_integration/**',
+    'tests/test_ares_collaboration.py',
+    'tests/ares_runtime/test_governed_context_materialization.py',
+    'tests/ares_runtime/test_memory_witness_v2.py',
+    'tests/ares_runtime/test_policy_basis_v2.py',
+    'tests/ares_runtime/fixtures/profile_runtime_v2_owner.json',
+)
+_QUALIFICATION_INFRA_PATHS = ("scripts/ci/", "tests/ci/")
+_QUALIFICATION_INFRA_FILES = {"scripts/run_tests.sh", "scripts/run_tests_parallel.py"}
 
 def _is_docs(p: str) -> bool:
     if p.startswith(("skills/", "optional-skills/")):
@@ -183,6 +314,10 @@ def ci_review_files(files: list[str]) -> list[str]:
     return sorted({f.strip() for f in files if f.strip() and _is_ci_review(f.strip())})
 
 
+def _qualification_path(p: str, patterns: tuple[str, ...]) -> bool:
+    return any(fnmatchcase(p, pattern) for pattern in patterns)
+
+
 def classify(files: list[str]) -> dict[str, bool]:
     """Map changed paths to ``{lane: should_run}``."""
     files = [f.strip() for f in files if f.strip()]
@@ -208,6 +343,10 @@ def classify(files: list[str]) -> dict[str, bool]:
         "rust": any(_is_rust(f) for f in files),
         "mcp_catalog": any(_is_mcp_catalog(f) for f in files),
         "ci_review": any(_is_ci_review(f) for f in files),
+        "context_continuity": any(_qualification_path(f, _CONTEXT_CONTINUITY_PATHS) for f in files),
+        "current_owner_integration": any(
+            _qualification_path(f, _CURRENT_OWNER_INTEGRATION_PATHS) for f in files
+        ),
         "nix": python_prod or frontend or any(_is_nix(f) for f in files)
     }
     if not files or any(f.startswith(".github/") for f in files):
@@ -225,8 +364,13 @@ def classify(files: list[str]) -> dict[str, bool]:
         ret["rust"] = True
         ret["nix"] = True
         ret["ci_review"] = True
+        ret["context_continuity"] = True
+        ret["current_owner_integration"] = True
 
         # explicitly skip mcp catalog here. it's not needed unless those files are modified.
+    if any(f.startswith(_QUALIFICATION_INFRA_PATHS) or f in _QUALIFICATION_INFRA_FILES for f in files):
+        ret["context_continuity"] = True
+        ret["current_owner_integration"] = True
     return ret
 
 

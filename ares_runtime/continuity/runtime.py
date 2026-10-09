@@ -121,7 +121,8 @@ def context_dispatch_payload_digest(payload):
 
 
 def admit_final_context_dispatch(agent, snapshot, payload, *, attempt_id,
-                                 materialization_digest=None, route_identity=None):
+                                 materialization_digest=None, route_identity=None,
+                                 validate_only=False):
     """Count and seal the final text request at the real dispatch boundary."""
     if snapshot is None:
         return None
@@ -147,9 +148,13 @@ def admit_final_context_dispatch(agent, snapshot, payload, *, attempt_id,
         raise ContextDispatchError("PROVIDER_CONTEXT_RESET_UNQUALIFIED")
     route = ":".join(str(getattr(agent, name, "unknown") or "unknown").replace(" ", "_")
                      for name in ("provider", "api_mode", "model"))
-    output = payload.get("max_output_tokens", payload.get("max_completion_tokens", payload.get("max_tokens")))
-    if output is None:
-        output = getattr(agent, "max_tokens", None)
+    if mode == "bedrock_converse":
+        inference = payload.get("inferenceConfig")
+        output = inference.get("maxTokens") if type(inference) is dict else None
+    else:
+        output = payload.get("max_output_tokens", payload.get("max_completion_tokens", payload.get("max_tokens")))
+        if output is None:
+            output = getattr(agent, "max_tokens", None)
     if type(output) is not int or output <= 0:
         raise ContextDispatchError("CONTEXT_DISPATCH_OUTPUT_BUDGET_UNQUALIFIED")
     context_limit = getattr(getattr(agent, "context_compressor", None), "context_length", None)
@@ -169,6 +174,8 @@ def admit_final_context_dispatch(agent, snapshot, payload, *, attempt_id,
         try:
             from agent.context_input import validate_turn_input_authority
             validate_turn_input_authority(agent)
+            if validate_only:
+                return None
             return agent._session_db.admit_context_dispatch(
                 agent.session_id,
                 turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
@@ -177,6 +184,170 @@ def admit_final_context_dispatch(agent, snapshot, payload, *, attempt_id,
             )
         except Exception as exc:
             raise ContextDispatchError(getattr(exc, "code", "CONTEXT_DISPATCH_OWNER_UNAVAILABLE")) from None
+
+
+_physical_dispatch = ContextVar("context_continuity_physical_dispatch", default=None)
+
+
+def _codex_sdk_request_body(payload):
+    """Use the SDK's own extra_body merge before canonical count/seal.
+
+    The transform bypass moves input/tools into extra_body; their original
+    JSON Schema positions must be restored for qualification. Source proof is
+    checked separately, before any trusted transport derivation.
+    """
+    try:
+        from openai._base_client import _merge_mappings
+        body = {key: value for key, value in payload.items()
+                if key not in {"extra_body", "timeout", "extra_headers", "headers"}}
+        extra = payload.get("extra_body")
+        if extra is not None:
+            if type(extra) is not dict:
+                raise ContextDispatchError("CONTEXT_DISPATCH_WIRE_OVERRIDE_UNQUALIFIED")
+            body = _merge_mappings(body, extra)
+        return body
+    except ContextDispatchError:
+        raise
+    except Exception:
+        raise ContextDispatchError("CONTEXT_DISPATCH_SDK_BODY_UNQUALIFIED") from None
+
+
+class ContextDispatchPhysicalScope:
+    """Carry source proof to physical callbacks; SessionDB owns every receipt.
+
+    Source validation precedes trusted transport conversion. The final payload
+    then gets its own count and receipt. A later physical retry discards the
+    previous response and never reuses its spent admission.
+    """
+
+    def __init__(self, agent, snapshot, *, attempt_id, materialization_digest, route_identity):
+        from threading import RLock
+        self.agent, self.snapshot = agent, snapshot
+        self.attempt_id = attempt_id
+        self.materialization_digest, self.route_identity = materialization_digest, route_identity
+        self.admission = None
+        self.attempted = False
+        self._physical_count = 0
+        self._settlement_started = False
+        self._stream_buffer = None
+        self._lock = RLock()
+
+    def __enter__(self):
+        if _physical_dispatch.get() is not None:
+            raise ContextDispatchError("CONTEXT_DISPATCH_OWNER_MISMATCH")
+        self._token = _physical_dispatch.set(self)
+        return self
+
+    def __exit__(self, exc_type, *_):
+        try:
+            if exc_type is not None and not self._settlement_started:
+                self.discard()
+        finally:
+            _physical_dispatch.reset(self._token)
+
+    def validate_source(self, payload):
+        admit_final_context_dispatch(
+            self.agent, self.snapshot, payload, attempt_id=self.attempt_id,
+            materialization_digest=self.materialization_digest,
+            route_identity=self.route_identity, validate_only=True,
+        )
+
+    def discard(self):
+        if self.admission is not None:
+            admission = self.admission
+            # Leave custody visible if the owner cannot prove discard.
+            try:
+                self.agent._session_db.record_context_dispatch_discard(
+                    admission["attempt_id"],
+                    turn_lease_holder=getattr(self.agent, "_active_session_turn_lease_holder", None),
+                )
+            except Exception as exc:
+                raise ContextDispatchError(getattr(exc, "code", "CONTEXT_DISPATCH_SETTLEMENT_UNKNOWN")) from None
+            self.admission = None
+            if self._stream_buffer is not None:
+                self._stream_buffer.discard()
+
+    def call(self, payload, callback, *, source_payload=None, transport_kind=None):
+        with self._lock:
+            if self._settlement_started:
+                raise ContextDispatchError("CONTEXT_DISPATCH_SETTLEMENT_UNKNOWN")
+            if self.snapshot is None:
+                self.attempted = True
+                return callback(payload)
+            from copy import deepcopy
+            source = deepcopy(payload if source_payload is None else source_payload)
+            # Validate and derive from the same isolated source bytes.
+            self.validate_source(source)
+            if transport_kind == "chat_stream" and self.agent.api_mode == "chat_completions":
+                source["stream"] = True
+                from agent.gemini_native_adapter import is_native_gemini_base_url
+                if not is_native_gemini_base_url(self.agent.base_url):
+                    source["stream_options"] = {"include_usage": True}
+            elif transport_kind == "anthropic_stream" and self.agent.api_mode == "anthropic_messages":
+                from agent.anthropic_adapter import sanitize_anthropic_kwargs
+                sanitize_anthropic_kwargs(source, log_prefix=getattr(self.agent, "log_prefix", ""))
+            elif transport_kind in {"bedrock_stream", "bedrock_nonstream"} and self.agent.api_mode == "bedrock_converse":
+                source.pop("__bedrock_region__", None)
+                source.pop("__bedrock_converse__", None)
+            elif transport_kind == "codex_stream" and self.agent.api_mode == "codex_responses":
+                from agent.codex_runtime import (
+                    _sanitize_consumer_codex_request, _bypass_sdk_request_transform,
+                )
+                source = _sanitize_consumer_codex_request(self.agent, source)
+                source["stream"] = True
+                source = _bypass_sdk_request_transform(source)
+            elif transport_kind == "stream_nonstream":
+                if payload.get("stream") is False:
+                    source["stream"] = False
+            elif transport_kind is not None:
+                raise ContextDispatchError("CONTEXT_DISPATCH_TRANSPORT_UNQUALIFIED")
+            # Pin the body actually passed to the SDK, not a mutable Relay alias.
+            final_payload = deepcopy(payload)
+            if transport_kind == "codex_stream":
+                counted_payload = _codex_sdk_request_body(final_payload)
+                source = _codex_sdk_request_body(source)
+            else:
+                counted_payload = final_payload
+            self.discard()
+            physical_number = self._physical_count + 1
+            physical_id = self.attempt_id if physical_number == 1 else f"{self.attempt_id}:physical:{physical_number}"
+            self.admission = admit_final_context_dispatch(
+                self.agent, self.snapshot, counted_payload, attempt_id=physical_id,
+                materialization_digest=context_dispatch_payload_digest(source),
+                route_identity=self.route_identity,
+            )
+            self._physical_count = physical_number
+            self.attempted = True
+            try:
+                return callback(final_payload)
+            except BaseException:
+                self.discard()
+                raise
+
+    def settle(self):
+        if self.snapshot is not None and self.admission is None:
+            raise ContextDispatchError("CONTEXT_DISPATCH_RESPONSE_NOT_ADMITTED")
+        self._settlement_started = True
+        settle_final_context_dispatch(self.agent, self.admission)
+
+
+def validate_context_dispatch_source(agent, payload):
+    """Check Relay output before the canonical factory transforms it."""
+    scope = _physical_dispatch.get()
+    if scope is None:
+        return
+    if scope.agent is not agent:
+        raise ContextDispatchError("CONTEXT_DISPATCH_OWNER_MISMATCH")
+    scope.validate_source(payload)
+
+
+def context_dispatch_physical_call(agent, payload, callback, *, source_payload=None, transport_kind=None):
+    scope = _physical_dispatch.get()
+    if scope is None:
+        return callback(payload)
+    if scope.agent is not agent:
+        raise ContextDispatchError("CONTEXT_DISPATCH_OWNER_MISMATCH")
+    return scope.call(payload, callback, source_payload=source_payload, transport_kind=transport_kind)
 
 
 @contextmanager
@@ -299,13 +470,22 @@ class ContextDispatchStreamBuffer:
     """
 
     def __init__(self, agent, admission):
-        self.agent, self.admission = agent, admission
+        self.agent, self._admission_source = agent, admission
+        self.required = (admission.snapshot is not None if isinstance(admission, ContextDispatchPhysicalScope)
+                         else admission is not None)
         self.events, self.originals = [], {}
         self.bytes, self.overflow = 0, False
 
+    @property
+    def admission(self):
+        source = self._admission_source
+        return source.admission if isinstance(source, ContextDispatchPhysicalScope) else source
+
     def __enter__(self):
-        if self.admission is None:
+        if not self.required:
             return self
+        if isinstance(self._admission_source, ContextDispatchPhysicalScope):
+            self._admission_source._stream_buffer = self
         self.previous_buffered = getattr(self.agent, "_context_stream_delivery_buffered", False)
         self.agent._context_stream_delivery_buffered = True
         for name in ("_fire_stream_delta", "_fire_reasoning_delta", "_fire_tool_gen_started",
@@ -329,7 +509,7 @@ class ContextDispatchStreamBuffer:
         return self
 
     def __exit__(self, *_):
-        if self.admission is not None:
+        if self.required:
             self.agent._context_stream_delivery_buffered = self.previous_buffered
         for name, (instance_owned, callback) in self.originals.items():
             if instance_owned:
@@ -355,6 +535,10 @@ class ContextDispatchStreamBuffer:
             except Exception:
                 logging.getLogger(__name__).debug("Buffered stream observer failed", exc_info=True)
         self.events.clear()
+
+    def discard(self):
+        self.events.clear()
+        self.bytes, self.overflow = 0, False
 
 
 class AutomaticRebaseStatus(str, Enum):

@@ -311,6 +311,17 @@ def _equivalent_needles(needle: list[str]) -> list[list[str]]:
     return candidates
 
 
+def _verification_cwd_is_attributable(
+    segments: list[_ShellSegment], match_index: int
+) -> bool:
+    """Only the first segment is bound to the caller's pre-command cwd.
+
+    An earlier arbitrary shell command may change cwd. A final cwd or a
+    successful shell status cannot establish where a later verifier ran.
+    """
+    return bool(segments) and match_index == 0
+
+
 def _find_canonical_match(
     command: str,
     canonical_commands: list[str],
@@ -328,6 +339,7 @@ def _find_canonical_match(
             for candidate in _equivalent_needles(needle):
                 if (
                     candidate_tokens[:len(candidate)] == candidate
+                    and _verification_cwd_is_attributable(segments, index)
                     and _exit_status_is_attributable(segments, index, exit_code)
                 ):
                     return canonical, candidate_tokens[len(candidate):]
@@ -361,8 +373,54 @@ def _looks_like_target(arg: str) -> bool:
     )
 
 
-def _scope_for_args(args: list[str]) -> str:
-    return "targeted" if any(_looks_like_target(arg) for arg in args) else "full"
+_NEUTRAL_VERIFICATION_OPTIONS = {
+    "-q": False, "-v": False, "-s": False, "--quiet": False,
+    "--verbose": False,
+    "--no-header": False, "--no-summary": False, "--disable-warnings": False,
+    "-n": True, "--numprocesses": True, "-j": True, "--jobs": True,
+    "--file-timeout": True, "--file-retries": True, "--color": True,
+    "--tb": True, "--show-capture": True, "--junitxml": True,
+    "-r": True,
+}
+
+
+def _scope_for_args(
+    args: list[str], *, canonical: str = "", prefix_args: list[str] | None = None
+) -> str:
+    """Label selection intent conservatively; never prove executed coverage."""
+    for prefix in prefix_args or []:
+        name, separator, _ = prefix.partition("=")
+        if separator and name not in {
+            "CI", "HERMES_TEST_WORKERS", "HERMES_TEST_FILE_TIMEOUT", "HERMES_TEST_FILE_RETRIES"
+        }:
+            return "targeted"
+    # Option meanings belong to their runner, not to a shared spelling.
+    # In particular Go's -run is not pytest's attached reporting option -r.
+    known_options = canonical in {"pytest", "scripts/run_tests.sh"}
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if not arg or arg == "--":
+            index += 1
+            continue
+        if _looks_like_target(arg):
+            return "targeted"
+        option, separator, _ = arg.partition("=")
+        if known_options and option in _NEUTRAL_VERIFICATION_OPTIONS:
+            if _NEUTRAL_VERIFICATION_OPTIONS[option] and not separator:
+                if index + 1 >= len(args) or args[index + 1].startswith("-"):
+                    return "targeted"
+                index += 1
+        elif known_options and len(arg) > 1 and arg.startswith("-") and set(arg[1:]) <= {"q", "v", "s"}:
+            pass
+        elif known_options and any(arg.startswith(short) and len(arg) > 2 for short in ("-n", "-j", "-r")):
+            pass
+        else:
+            # Explicit selectors and unknown arguments cannot establish an
+            # unrestricted suite. This includes attached -k/-m and --slice.
+            return "targeted"
+        index += 1
+    return "full"
 
 
 def _is_under_temp_dir(token: str) -> bool:
@@ -431,8 +489,10 @@ def _find_ad_hoc_match(
         segments = _split_shell_segments(command, posix=posix)
         for index, segment in enumerate(segments):
             trailing_args = _ad_hoc_script_args(segment.tokens, root)
-            if trailing_args is not None and _exit_status_is_attributable(
-                segments, index, exit_code
+            if (
+                trailing_args is not None
+                and _verification_cwd_is_attributable(segments, index)
+                and _exit_status_is_attributable(segments, index, exit_code)
             ):
                 return trailing_args
     return None
@@ -546,11 +606,17 @@ def classify_verification_command(
         return None
 
     canonical, trailing_args = match
+    # Keep explicit selection assignments that matching strips from the
+    # first segment. They are command-bound inputs, unlike inherited env.
+    first_tokens = _split_shell_segments(command)[0].tokens
+    prefix_length = len(first_tokens) - len(_strip_command_prefix(first_tokens))
     return VerificationEvidence(
         command=command,
         canonical_command=canonical,
         kind="ad_hoc" if is_ad_hoc else _kind_for_command(canonical),
-        scope="targeted" if is_ad_hoc else _scope_for_args(trailing_args),
+        scope="targeted" if is_ad_hoc else _scope_for_args(
+            trailing_args, canonical=canonical, prefix_args=first_tokens[:prefix_length]
+        ),
         status="passed" if int(exit_code) == 0 else "failed",
         exit_code=int(exit_code),
         cwd=str(Path(cwd or ".").resolve()),

@@ -185,6 +185,7 @@ for (const failsFirst of [false, true]) {
       assert.ok(receipts(cold)[0].stop_requested)
       options.interruptError = false
       await cold.gc.stopGroupThread('Room', 't1', cold.roster)
+      await flush() // control completion precedes exact terminal observation
       assert.deepEqual(cold.rpc('session.interrupt').map(call => call.params.session_id), [accepted.session_id, accepted.session_id])
       assert.equal(receipts(cold).length, 0)
     }
@@ -265,6 +266,52 @@ boundedTest('actual UI exposes cold Stop, retains it after failed interrupt and 
   assert.ok(retried.room().holds['local::bot1'])
   assert.equal(retried.stopButton(), undefined)
   await hot.gc.stopGroupThread('Room', 't1', hot.roster)
+})
+
+for (const cold of [false, true]) {
+  boundedTest(`actual Stop button projects pending retirement honestly after applied ACK; cold=${cold}`, async () => {
+    const notices = [], options = { interruptReply: { status: 'interrupted' }, onNotify: value => notices.push(value) }
+    const hot = await uiHarness(members(1), cold ? {} : options), pending = drive(hot)
+    await flush()
+    const h = cold ? await reload(hot, options) : hot
+    const accepted = clone(receipts(h)[0].delivery.accepted_turn), button = h.stopButton()
+    assert.ok(button)
+    button.props.onClick(); await flush()
+    assert.equal(notices.length, 1)
+    assert.equal(notices[0].kind, 'info')
+    assert.match(notices[0].message, /^Stopping Room/)
+    assert.match(notices[0].message, /waiting for the remaining turns to finish/)
+    assert.doesNotMatch(notices[0].message, /unconfirmed|Stop can retry/)
+    assert.deepEqual(receipts(h)[0].delivery.accepted_turn, accepted)
+    assert.equal(h.rpc('session.interrupt').length, 1)
+    assert.equal(h.rpc('prompt.submit').length, cold ? 0 : 1)
+    if (!cold) {
+      assert.equal(h.activeLeases(), 1)
+      assert.equal(h.gc.groupRoomCoordinators.get('Room').active, 1)
+    }
+    const session = [...h.sessions.values()][0]
+    session.state = 'interrupted'; session.pending = null
+    await h.gc.harvestStrandedGroupReply('Room', h.roster[0]); await h.advance()
+    assert.equal(receipts(h).length, 0)
+    if (cold) await hot.gc.stopGroupThread('Room', 't1', hot.roster)
+    await hot.advance(); await pending
+  })
+}
+
+boundedTest('actual Stop button keeps failed interruption wording and retry custody', async () => {
+  const notices = [], h = await uiHarness(members(1), { interruptError: true, onNotify: value => notices.push(value) })
+  const pending = drive(h); await flush()
+  const accepted = clone(receipts(h)[0].delivery.accepted_turn)
+  h.stopButton().props.onClick(); await flush(); await h.advance(); await pending
+  assert.equal(notices.length, 1)
+  assert.equal(notices[0].kind, 'info')
+  assert.match(notices[0].message, /1 interruption\(s\) are unconfirmed.*Stop can retry/)
+  assert.deepEqual(receipts(h)[0].delivery.accepted_turn, accepted)
+  assert.equal(h.activeLeases(), 1)
+  assert.ok(h.stopButton())
+  h.finish('bot1', '', 'interrupted')
+  await h.gc.harvestStrandedGroupReply('Room', h.roster[0])
+  assert.equal(h.activeLeases(), 0)
 })
 
 boundedTest('legacy unknown receipt does not manufacture an interrupt target or Stop affordance', async () => {
@@ -379,6 +426,7 @@ boundedTest(`unresolved waiting reservations retain capacity; ${invalidation} ca
   const secondAdmitted = new Set()
   const h = await uiHarness(members(6), { resumeProjection: (session, method, projection) => {
     if (method !== 'session.turn.poll' || !session.ref) return projection
+    if (session.state === 'interrupted') return projection // preserve exact terminal after fake Stop
     if (session.submits === 2) secondAdmitted.add(session.profile)
     session.state = session.submits === 1 ? 'complete' : 'waiting'
     session.text = `FIRST_${session.profile} @all`

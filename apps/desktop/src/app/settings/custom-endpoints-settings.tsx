@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 
 import { beginMainModelSave, ownsMainModelSave } from '@/app/session/hooks/composer-model-selection-owner'
-import type { OnMainModelChanged } from '@/app/session/hooks/composer-model-selection-owner'
+import type { ComposerSelectionOwner, OnMainModelChanged } from '@/app/session/hooks/composer-model-selection-owner'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
@@ -18,6 +18,8 @@ import { cn } from '@/lib/utils'
 import { confirm } from '@/store/confirm'
 import { notify, notifyError } from '@/store/notifications'
 import type { CustomEndpoint, CustomEndpointUpdate } from '@/types/hermes'
+
+import { requireCurrentModelOwner, useModelFormKey, useModelOwnerIsCurrent, useModelRequestOwner } from '../hooks/use-composer-model-owner'
 
 import { EmptyState, Pill, SectionHeading, SettingsContent, SettingsSkeleton } from './primitives'
 
@@ -78,6 +80,14 @@ function toPayload(form: EndpointForm, models?: string[]): CustomEndpointUpdate 
 }
 
 export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: CustomEndpointsSettingsProps) {
+  const owner = useModelRequestOwner()
+  const formKey = useModelFormKey(owner)
+
+  return <CustomEndpointsForm key={formKey} onConfigSaved={onConfigSaved} onMainModelChanged={onMainModelChanged} owner={owner} />
+}
+
+function CustomEndpointsForm({ onConfigSaved, onMainModelChanged, owner }: CustomEndpointsSettingsProps & { owner: ComposerSelectionOwner }) {
+  const isOwnerCurrent = useModelOwnerIsCurrent(owner)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [testing, setTesting] = useState(false)
@@ -91,8 +101,15 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
   const modelWritePendingRef = useRef(false)
 
   async function refresh() {
+    if (!isOwnerCurrent()) {
+      return
+    }
+
     const data = await getCustomEndpoints()
-    setEndpoints(data.endpoints)
+
+    if (isOwnerCurrent()) {
+      setEndpoints(data.endpoints)
+    }
   }
 
   useEffect(() => {
@@ -102,7 +119,7 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
       try {
         const data = await getCustomEndpoints()
 
-        if (cancelled) {
+        if (cancelled || !isOwnerCurrent()) {
           return
         }
 
@@ -114,9 +131,11 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
           setDiscoveredModels(current.models)
         }
       } catch (err) {
-        notifyError(err, 'Could not load custom endpoints')
+        if (!cancelled && isOwnerCurrent()) {
+          notifyError(err, 'Could not load custom endpoints')
+        }
       } finally {
-        if (!cancelled) {
+        if (!cancelled && isOwnerCurrent()) {
           setLoading(false)
         }
       }
@@ -127,7 +146,7 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
     return () => {
       cancelled = true
     }
-  }, [])
+  }, [isOwnerCurrent])
 
   async function handleSave() {
     if (modelWritePendingRef.current) {
@@ -135,9 +154,10 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
     }
 
     modelWritePendingRef.current = true
-    const origin = beginMainModelSave()
 
     try {
+      requireCurrentModelOwner(isOwnerCurrent)
+      const origin = beginMainModelSave()
       setSaving(true)
       const response = await saveCustomEndpoint(toPayload(form, discoveredModels))
 
@@ -145,20 +165,26 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
         return
       }
 
-      setEndpoints(response.endpoints)
       const saved = response.endpoints.find(endpoint => endpoint.id === response.id)
+
+      if (saved && saved.is_current) {
+        onMainModelChanged?.({ ...origin, provider: saved.id, model: saved.model })
+      }
+
+      onConfigSaved?.()
+
+      if (!isOwnerCurrent()) {
+        return
+      }
+
+      setEndpoints(response.endpoints)
 
       if (saved) {
         setForm(formFromEndpoint(saved))
         setDiscoveredModels(saved.models)
       }
 
-      if (saved && saved.is_current) {
-        onMainModelChanged?.({ ...origin, provider: saved.id, model: saved.model })
-      }
-
       triggerHaptic('success')
-      onConfigSaved?.()
       notify({ kind: 'success', message: 'Custom endpoint saved.' })
     } catch (err) {
       notifyError(err, 'Save failed')
@@ -170,8 +196,14 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
 
   async function handleValidate() {
     try {
+      requireCurrentModelOwner(isOwnerCurrent)
       setTesting(true)
       const response = await validateCustomEndpoint(toPayload(form))
+
+      if (!isOwnerCurrent()) {
+        return
+      }
+
       setDiscoveredModels(response.models)
 
       if (response.ok) {
@@ -204,9 +236,10 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
     }
 
     modelWritePendingRef.current = true
-    const origin = beginMainModelSave()
 
     try {
+      requireCurrentModelOwner(isOwnerCurrent)
+      const origin = beginMainModelSave()
       setActivating(endpoint.id)
       const response = await activateCustomEndpoint(endpoint.id)
 
@@ -218,6 +251,11 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
       // the committed default from the composer or report activation failure.
       onConfigSaved?.()
       onMainModelChanged?.({ ...origin, provider: response.provider, model: response.model })
+
+      if (!isOwnerCurrent()) {
+        return
+      }
+
       triggerHaptic('success')
 
       try {
@@ -250,8 +288,15 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
     modelWritePendingRef.current = true
 
     try {
+      requireCurrentModelOwner(isOwnerCurrent)
       setDeleting(endpoint.id)
       const response = await deleteCustomEndpoint(endpoint.id)
+      onConfigSaved?.()
+
+      if (!isOwnerCurrent()) {
+        return
+      }
+
       setEndpoints(response.endpoints)
 
       if (form.id === endpoint.id) {
@@ -259,7 +304,6 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
         setDiscoveredModels([])
       }
 
-      onConfigSaved?.()
       triggerHaptic('success')
     } catch (err) {
       notifyError(err, 'Delete failed')

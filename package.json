@@ -71,7 +71,7 @@
     "esbuild@0.28.1": true,
     "esbuild@0.28.2": true,
     "node-pty@1.1.0": true,
-    "electron@41.10.3": true,
+    "electron@41.10.6": true,
     "fsevents@2.3.2": true,
     "fsevents@2.3.3": true
   }

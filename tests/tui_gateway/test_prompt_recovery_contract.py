@@ -74,11 +74,20 @@ def test_patient_first_prompt_wait_outlives_old_30_second_cliff(monkeypatch):
         _agent_build_thread=_BuildThread(),
     )
     events = []
-    times = iter((0.0, 31.0))
-    monkeypatch.setattr(server.time, "monotonic", lambda: next(times))
+    elapsed = [0.0]
+    original_wait = ready.wait
+
+    def advance_slice(timeout=None):
+        elapsed[0] += 31.0
+        return original_wait(timeout=timeout)
+
+    monkeypatch.setattr(ready, "wait", advance_slice)
+    monkeypatch.setattr(server.time, "monotonic", lambda: elapsed[0])
     monkeypatch.setattr(server, "_emit", lambda event, sid, payload=None: events.append((event, payload)))
 
     assert server._wait_agent_for_prompt(session, "rid", "sid") is None
+    assert ready.calls == 2
+    assert elapsed[0] > 30.0
     assert [event for event, _ in events] == [
         "notification.show",
         "notification.clear",
