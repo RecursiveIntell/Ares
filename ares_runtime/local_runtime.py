@@ -846,6 +846,17 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
                 return
             self._record_final_runtime_binding(source, legacy_rollback_binding=binding)
 
+    def _ensure_legacy_rollback_binding(self, source: Path, binding: dict[str, str]) -> None:
+        """Read-only reuse may inspect previous; writers remain unselected-only."""
+        with self.locked():
+            current = self.active_release()
+            if current[0] != binding.get("revision") or str(current[1]) != binding.get("source"):
+                raise AresLocalRuntimeError("selected legacy source changed before binding reuse")
+            if self._release_metadata(source.parent.name).get("legacy_rollback_binding") == binding:
+                self._require_transition_backout((source.parent.name, source), current)
+                return
+            self._record_legacy_rollback_binding(source, binding)
+
     def _record_final_runtime_binding(
         self, source: Path, *, legacy_rollback_binding: dict[str, str] | None = None
     ) -> None:
@@ -1035,7 +1046,7 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
                 quarantined = self._quarantine_incomplete_release(revision, final_dir)
             else:
                 if legacy_rollback_binding is not None:
-                    self._record_legacy_rollback_binding(source, legacy_rollback_binding)
+                    self._ensure_legacy_rollback_binding(source, legacy_rollback_binding)
                 return
         staging = self.paths.staging_dir / f"{revision}.{uuid.uuid4().hex}"
         source = staging / "source"
@@ -1539,7 +1550,7 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
                     or old_active is None
                     or self._probe_legacy_release(old_active[1], desktop=desktop) != legacy_binding):
                     raise AresLocalRuntimeError("legacy selection or identity changed during candidate build")
-                self._record_legacy_rollback_binding(self._release_source(revision), legacy_binding)
+                self._ensure_legacy_rollback_binding(self._release_source(revision), legacy_binding)
             seeded = self._seed_agent_home(seed_from)
             self._provision_context_governor_key(self._release_source(revision))
             if (self._release_from_link(self.paths.current_link, "current") != old_active

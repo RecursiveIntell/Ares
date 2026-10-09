@@ -409,3 +409,31 @@ def test_digest_rejects_fifo_without_waiting_for_a_writer(runtime):
     os.mkfifo(fifo)
     with pytest.raises(LegacyTransitionError, match="regular file"):
         file_digest(fifo)
+
+
+def test_qualified_previous_transition_candidate_reuses_without_metadata_write(runtime, monkeypatch):
+    old, new = _bound_pair(runtime)
+    assert runtime.rollback() == old.parent.name
+    binding = runtime._probe_legacy_release(old, desktop=False)
+    descriptor = new.parent / "release.json"
+    before = (descriptor.read_bytes(), descriptor.stat().st_ino)
+    pair = _pair(runtime)
+    for name in ("_atomic_json", "_build_runtime", "_refresh_moved_editable_install"):
+        def forbidden(*_args, _name=name, **_kwargs):
+            raise AssertionError("readonly reuse reached " + _name)
+        monkeypatch.setattr(runtime, name, forbidden)
+    runtime._materialize("unused", new.parent.name, desktop=False, legacy_rollback_binding=binding)
+    assert (descriptor.read_bytes(), descriptor.stat().st_ino) == before
+    assert _pair(runtime) == pair
+
+
+def test_explicit_setup_reselects_qualified_previous_without_rewriting_it(runtime, monkeypatch):
+    old, new = _bound_pair(runtime)
+    assert runtime.rollback() == old.parent.name
+    descriptor = new.parent / "release.json"
+    before = (descriptor.read_bytes(), descriptor.stat().st_ino)
+    _setup_seams(runtime, monkeypatch)
+    runtime.setup(new, desktop=False, gateway=False, seed_from=runtime.paths.agent_home,
+                  transition_from_legacy=old.parent.name)
+    assert runtime.active_release()[0] == new.parent.name
+    assert (descriptor.read_bytes(), descriptor.stat().st_ino) == before
