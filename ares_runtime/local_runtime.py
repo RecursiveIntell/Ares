@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -30,6 +31,7 @@ from typing import Iterator, Mapping, Sequence
 _REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
 _CONFIG_SCHEMA = 2
 LOCAL_LIFECYCLE_CONTRACT = 1
+LEGACY_TRANSITION_CONTRACT = 1
 _DEFAULT_UPSTREAM_REMOTE = "https://github.com/NousResearch/hermes-agent.git"
 _DEFAULT_UPSTREAM_BRANCH = "main"
 
@@ -415,6 +417,11 @@ class AresLocalRuntime:
             if current is not None and current[1] == target:
                 return
             previous = self._release_from_link(self.paths.previous_link, "previous")
+            if current is not None:
+                self._require_transition_backout((revision, target), current)
+            if (self._release_from_link(self.paths.current_link, "current") != current
+                or self._release_from_link(self.paths.previous_link, "previous") != previous):
+                raise AresLocalRuntimeError("release selections changed before activation")
             self._transition_release_pair((revision, target), current or previous)
 
     @staticmethod
@@ -724,13 +731,144 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
                     f"cannot {operation} the {label} Ares release; preserve selected release bytes"
                 )
 
-    def _record_final_runtime_binding(self, source: Path) -> None:
+    def _probe_legacy_release(self, source: Path, *, desktop: bool) -> dict[str, str]:
+        """Observe legacy identity without repairing or promoting its contract."""
+        from .legacy_transition import (
+            LEGACY_BINDING_SCHEMA, LegacyTransitionError, file_digest,
+            probe_owned_imports, read_identity_record,
+        )
+
+        try:
+            resolved = source.resolve(strict=True)
+            revision = self._require_revision(source.parent.name)
+            if resolved != (self.paths.releases_dir.resolve() / revision / "source"):
+                raise LegacyTransitionError("legacy release escapes its final namespace")
+            descriptor = resolved.parent / "release.json"
+            record, raw = read_identity_record(descriptor)
+            if (
+                set(record) != {"revision", "source", "installed_at"}
+                or record["revision"] != revision
+                or not isinstance(record["source"], str) or not record["source"]
+                or type(record["installed_at"]) is not int or record["installed_at"] < 0
+            ):
+                raise LegacyTransitionError("unsupported legacy release descriptor")
+            python = self._python_for(resolved)
+            if not python.is_file() or not os.access(python, os.X_OK):
+                raise LegacyTransitionError("legacy interpreter is unavailable")
+            if desktop and self._desktop_binary(resolved) is None:
+                raise LegacyTransitionError("legacy Desktop executable is unavailable")
+            if self._git_output(resolved, "rev-parse", "HEAD") != revision:
+                raise LegacyTransitionError("legacy Git revision mismatch")
+            if self._git_output(resolved, "status", "--porcelain", "--untracked-files=normal"):
+                raise LegacyTransitionError("legacy source is dirty")
+            tree = self._require_revision(self._git_output(resolved, "rev-parse", "HEAD^{tree}"))
+            python_digest = file_digest(python, follow_symlinks=True)
+            config_digest = file_digest(resolved / ".venv" / "pyvenv.cfg", limit=32768)
+            imports = probe_owned_imports(
+                resolved, python, cwd=self.paths.state_root,
+                home=self.paths.agent_home, legacy=True,
+            )
+            if (read_identity_record(descriptor)[1] != raw
+                or file_digest(python, follow_symlinks=True) != python_digest
+                or file_digest(resolved / ".venv" / "pyvenv.cfg", limit=32768) != config_digest
+                or self._git_output(resolved, "rev-parse", "HEAD^{tree}") != tree
+                or self._git_output(resolved, "rev-parse", "HEAD") != revision
+                or self._git_output(resolved, "status", "--porcelain", "--untracked-files=normal")):
+                raise LegacyTransitionError("legacy release identity changed during probe")
+            return {
+                "schema": LEGACY_BINDING_SCHEMA, "revision": revision,
+                "source": str(resolved), "git_tree": tree,
+                "descriptor_sha256": hashlib.sha256(raw).hexdigest(),
+                "python_sha256": python_digest, "venv_config_sha256": config_digest,
+                "controller_contract": "legacy-v0", **imports,
+            }
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise AresLocalRuntimeError("legacy release identity is not verified") from exc
+
+    def _require_supported_current(self, current: tuple[str, Path] | None) -> None:
+        if current is not None:
+            try:
+                self._require_complete_release(current[1], desktop=False)
+            except AresLocalRuntimeError as exc:
+                raise AresLocalRuntimeError(
+                    "selected release requires an explicit verified setup "
+                    "--transition-from-legacy <exact-current-revision>; "
+                    "preserve release bytes and use the new source-bound controller"
+                ) from exc
+
+    def _require_transition_backout(
+        self, candidate: tuple[str, Path], previous: tuple[str, Path]
+    ) -> None:
+        """Strict new target or separately witnessed legacy target, never fallback."""
+        from .legacy_transition import LegacyTransitionError, read_identity_record, require_legacy_binding
+
+        try:
+            previous_record, _raw = read_identity_record(previous[1].parent / "release.json")
+            if "runtime_binding" in previous_record:
+                self._require_complete_release(previous[1], desktop=False)
+                return
+            self._require_complete_release(candidate[1], desktop=False)
+            self._require_candidate_transition_owner(candidate[1])
+            record, _raw = read_identity_record(candidate[1].parent / "release.json")
+            binding = require_legacy_binding(record.get("legacy_rollback_binding"))
+            if binding["revision"] != previous[0] or binding["source"] != str(previous[1].resolve()):
+                raise LegacyTransitionError("legacy rollback target mismatch")
+            if self._probe_legacy_release(previous[1], desktop=False) != binding:
+                raise LegacyTransitionError("legacy rollback identity changed")
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise AresLocalRuntimeError("release backout identity is not verified") from exc
+
+    def _require_candidate_transition_owner(self, source: Path) -> None:
+        from .legacy_transition import LegacyTransitionError, probe_owned_imports
+
+        revision = self._require_revision(source.parent.name)
+        if (source.resolve(strict=True) != self.paths.releases_dir.resolve() / revision / "source"
+            or self._git_output(source, "rev-parse", "HEAD") != revision
+            or self._git_output(source, "status", "--porcelain", "--untracked-files=normal")):
+            raise LegacyTransitionError("candidate transition source identity mismatch")
+        probe_owned_imports(
+            source.resolve(), self._python_for(source),
+            cwd=self.paths.state_root, home=self.paths.agent_home, legacy=False,
+        )
+
+    def _record_legacy_rollback_binding(self, source: Path, binding: dict[str, str]) -> None:
+        """Attach transition correlation only to a qualified unselected release."""
+        with self.locked():
+            self._require_unselected_release(source.parent.name, operation="record legacy rollback binding of")
+            self._require_complete_release(source, desktop=False)
+            existing = self._release_metadata(source.parent.name).get("legacy_rollback_binding")
+            if existing is not None:
+                if existing != binding:
+                    raise AresLocalRuntimeError("legacy rollback binding collision")
+                self._require_transition_backout(
+                    (source.parent.name, source), self.active_release()
+                )
+                return
+            self._record_final_runtime_binding(source, legacy_rollback_binding=binding)
+
+    def _record_final_runtime_binding(
+        self, source: Path, *, legacy_rollback_binding: dict[str, str] | None = None
+    ) -> None:
         """Complete the existing release metadata only after final-path verification."""
         with self.locked():
             self._require_unselected_release(source.parent.name, operation="rewrite binding metadata of")
             record = self._release_metadata(source.parent.name)
             if record.get("revision") != source.parent.name:
                 raise AresLocalRuntimeError("final runtime binding has mismatched release identity")
+            if legacy_rollback_binding is not None:
+                from .legacy_transition import LegacyTransitionError, require_legacy_binding
+
+                try:
+                    binding = require_legacy_binding(legacy_rollback_binding)
+                    current = self.active_release()
+                    if current[0] != binding["revision"] or current[1] != Path(binding["source"]):
+                        raise LegacyTransitionError("selected legacy source changed")
+                    if self._probe_legacy_release(current[1], desktop=False) != binding:
+                        raise LegacyTransitionError("selected legacy bytes changed")
+                    self._require_candidate_transition_owner(source)
+                    record["legacy_rollback_binding"] = binding
+                except (OSError, ValueError, RuntimeError) as exc:
+                    raise AresLocalRuntimeError("candidate legacy transition binding is not verified") from exc
             record["runtime_binding"] = {
                 "schema": "AresLocalRuntimeBindingV1",
                 "source": str(source.resolve()),
@@ -770,6 +908,7 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
                     "from pathlib import Path; "
                     "import ares_runtime.local_runtime, hermes_cli.main; "
                     f"assert ares_runtime.local_runtime.LOCAL_LIFECYCLE_CONTRACT == {LOCAL_LIFECYCLE_CONTRACT}; "
+                    f"assert ares_runtime.local_runtime.LEGACY_TRANSITION_CONTRACT == {LEGACY_TRANSITION_CONTRACT}; "
                     f"root=Path({str(source)!r}).resolve(); "
                     "loaded=[Path(ares_runtime.local_runtime.__file__).resolve(), "
                     "Path(hermes_cli.main.__file__).resolve()]; "
@@ -871,11 +1010,19 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
             os.replace(final_dir, quarantine)
             return quarantine
 
-    def _materialize(self, source_spec: str, revision: str, *, desktop: bool) -> None:
+    def _materialize(
+        self, source_spec: str, revision: str, *, desktop: bool,
+        legacy_rollback_binding: dict[str, str] | None = None,
+    ) -> None:
         with self.locked():
-            self._materialize_locked(source_spec, revision, desktop=desktop)
+            self._materialize_locked(
+                source_spec, revision, desktop=desktop, legacy_rollback_binding=legacy_rollback_binding
+            )
 
-    def _materialize_locked(self, source_spec: str, revision: str, *, desktop: bool) -> None:
+    def _materialize_locked(
+        self, source_spec: str, revision: str, *, desktop: bool,
+        legacy_rollback_binding: dict[str, str] | None = None,
+    ) -> None:
         """Keep selection protection stable through the direct restaging path."""
         self._ensure_layout()
         final_dir = self._release_dir(revision)
@@ -887,6 +1034,8 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
             except AresLocalRuntimeError:
                 quarantined = self._quarantine_incomplete_release(revision, final_dir)
             else:
+                if legacy_rollback_binding is not None:
+                    self._record_legacy_rollback_binding(source, legacy_rollback_binding)
                 return
         staging = self.paths.staging_dir / f"{revision}.{uuid.uuid4().hex}"
         source = staging / "source"
@@ -910,7 +1059,12 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
             # be followed by one bounded finalization at the final, inactive path.
             # Desktop artifacts already moved with the source and are not rebuilt.
             self._refresh_moved_editable_install(final_dir / "source")
-            self._record_final_runtime_binding(final_dir / "source")
+            if legacy_rollback_binding is None:
+                self._record_final_runtime_binding(final_dir / "source")
+            else:
+                self._record_final_runtime_binding(
+                    final_dir / "source", legacy_rollback_binding=legacy_rollback_binding
+                )
         except BaseException:
             cleanup_failure: OSError | None = None
             if staging.exists():
@@ -1330,7 +1484,13 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
         seed_from: Path,
         upstream_remote: str = _DEFAULT_UPSTREAM_REMOTE,
         upstream_branch: str = _DEFAULT_UPSTREAM_BRANCH,
+        transition_from_legacy: str | None = None,
     ) -> tuple[str, bool]:
+        if transition_from_legacy is not None and (
+            not isinstance(transition_from_legacy, str)
+            or _REVISION_RE.fullmatch(transition_from_legacy) is None
+        ):
+            raise AresLocalRuntimeError("transition-from-legacy requires an exact 40-character revision")
         source = source.expanduser().resolve()
         if not source.is_dir():
             raise AresLocalRuntimeError(
@@ -1352,6 +1512,13 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
         with self.locked():
             old_active = self._release_from_link(self.paths.current_link, "current")
             old_previous = self._release_from_link(self.paths.previous_link, "previous")
+            legacy_binding: dict[str, str] | None = None
+            if transition_from_legacy is None:
+                self._require_supported_current(old_active)
+            else:
+                if old_active is None or old_active[0] != transition_from_legacy:
+                    raise AresLocalRuntimeError("selected legacy revision does not match transition-from-legacy")
+                legacy_binding = self._probe_legacy_release(old_active[1], desktop=desktop)
             legacy_active = False
             default_unit_path = (
                 Path.home() / ".config" / "systemd" / "user" / "ares-gateway.service"
@@ -1360,9 +1527,24 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
                 legacy_active = self._systemctl(
                     "is-active", "--quiet", "hermes-gateway.service", required=False
                 )
-            self._materialize(str(source), revision, desktop=desktop)
+            if legacy_binding is None:
+                self._materialize(str(source), revision, desktop=desktop)
+            else:
+                self._materialize(
+                    str(source), revision, desktop=desktop,
+                    legacy_rollback_binding=legacy_binding,
+                )
+                if (self._release_from_link(self.paths.current_link, "current") != old_active
+                    or self._release_from_link(self.paths.previous_link, "previous") != old_previous
+                    or old_active is None
+                    or self._probe_legacy_release(old_active[1], desktop=desktop) != legacy_binding):
+                    raise AresLocalRuntimeError("legacy selection or identity changed during candidate build")
+                self._record_legacy_rollback_binding(self._release_source(revision), legacy_binding)
             seeded = self._seed_agent_home(seed_from)
             self._provision_context_governor_key(self._release_source(revision))
+            if (self._release_from_link(self.paths.current_link, "current") != old_active
+                or self._release_from_link(self.paths.previous_link, "previous") != old_previous):
+                raise AresLocalRuntimeError("release selections changed before setup activation")
             self._activate(revision)
             try:
                 self._write_config(
@@ -1423,6 +1605,7 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
 
     def update(self, *, desktop: bool) -> tuple[str, bool]:
         with self.locked():
+            self._require_supported_current(self._release_from_link(self.paths.current_link, "current"))
             self._require_base_update_recipe()
             config = self._read_config()
             remote = str(config["remote"])
@@ -1484,7 +1667,10 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
                 raise AresLocalRuntimeError(
                     "no previous Ares runtime is available for rollback"
                 )
-            self._require_complete_release(previous[1], desktop=False)
+            self._require_transition_backout(current, previous)
+            if (self._release_from_link(self.paths.current_link, "current") != current
+                or self._release_from_link(self.paths.previous_link, "previous") != previous):
+                raise AresLocalRuntimeError("release selections changed before rollback")
             gateway_running = (
                 self._gateway_state()[0] if self.paths.unit_path.exists() else False
             )
@@ -1896,6 +2082,11 @@ def _parser() -> argparse.ArgumentParser:
         help="Ares checkout to install (default: current directory)",
     )
     setup.add_argument(
+        "--transition-from-legacy",
+        metavar="EXACT_CURRENT_SHA",
+        help="Explicitly verify a legacy current release for backout using the new source-bound controller",
+    )
+    setup.add_argument(
         "--seed-from",
         type=Path,
         default=Path.home() / ".hermes",
@@ -2031,6 +2222,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 seed_from=args.seed_from,
                 upstream_remote=args.upstream_remote,
                 upstream_branch=args.upstream_branch,
+                transition_from_legacy=args.transition_from_legacy,
             )
             print(f"Ares stable runtime selected: {revision}")
             if seeded:
