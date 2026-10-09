@@ -327,6 +327,20 @@ class TestBuildSkillsSystemPrompt:
         assert "permission" in routing_prompt
         assert "blocked maintenance" in routing_prompt
 
+    def test_foreground_skill_maintenance_not_blanket_blocked(self, routing_prompt):
+        assert "foreground maintenance" in routing_prompt.lower()
+        assert "editable user-owned skills" in routing_prompt
+        assert "does not require separate permission" in routing_prompt
+        assert "background-curation" in routing_prompt
+        assert "do not modify protected or user-owned skills" not in routing_prompt
+
+    def test_novel_reusable_workflow_can_be_saved_with_confirmation(self, routing_prompt):
+        assert "if none exists" in routing_prompt
+        assert "new skill" in routing_prompt
+        assert "user confirmation before creation" in routing_prompt
+        assert "routine task" in routing_prompt
+        assert "only when it materially improves an existing editable workflow" not in routing_prompt
+
     def test_deduplicates_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         cat_dir = tmp_path / "skills" / "tools"
