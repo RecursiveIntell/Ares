@@ -683,57 +683,84 @@ def test_drain_releases_running_on_dispatch_failure(monkeypatch):
         raise RuntimeError("dispatch failed")
     monkeypatch.setattr(server, "_run_prompt_submit", _boom)
     session = _session(queued_prompt={"text": "go", "transport": None})
+    monkeypatch.setitem(server._sessions, "sid", session)
 
     assert server._drain_queued_prompt("r1", "sid", session) is True
     # Failure must not leave the session wedged as running.
     assert session["running"] is False
 
 
-def test_drain_does_not_dispatch_a_prompt_cancelled_after_claim(monkeypatch):
-    """Generation cancel aborts dispatch but must restore the claimed head.
+def test_drain_reclaims_queue_head_in_order_after_non_stop_reanchor(monkeypatch):
+    """Compression invalidates the old claim, then freshly admits its envelope.
 
-    Compress re-anchor / Stop bump generation between claim and check. Dropping
-    the envelope would silently lose a legitimate follow-up (#84417 belt).
+    The head must reach an onward owner once, before the later queued input.
+    Explicit Stop cancellation has separate coverage below.
     """
     session = _session(
         queued_prompt={"text": "B", "transport": "ws-1"},
         queued_prompts=[{"text": "C", "transport": "ws-1"}],
     )
+    monkeypatch.setitem(server._sessions, "sid", session)
+    claims, dispatched = [], []
+
+    def reanchor(_session):
+        assert _session is session
+        claims.append(session.get("_queued_prompt_generation", 0))
+        session["_queued_prompt_generation"] = 1
+        return False
+
     monkeypatch.setattr(
         server,
         "_session_uses_compute_host",
-        lambda _session: session.__setitem__("_queued_prompt_generation", 1) or False,
+        reanchor,
     )
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not dispatch")),
+        lambda *args, **kwargs: dispatched.append((args, kwargs)),
     )
 
     assert server._drain_queued_prompt("r1", "sid", session) is True
-    assert session["running"] is False
-    # Claimed B restored first; C that advanced into the slot is behind it.
-    assert session.get("queued_prompt") == {"text": "B", "transport": "ws-1"}
-    assert session.get("queued_prompts") == [{"text": "C", "transport": "ws-1"}]
+    assert claims == [0, 1]
+    assert dispatched == [(('r1', 'sid', session, 'B'), {
+        "turn_transport": "ws-1", "queued_prompt_generation": 1,
+    })]
+    assert session["running"] is True
+    assert session["transport"] == "ws-1"
+    assert session.get("queued_prompt") == {"text": "C", "transport": "ws-1"}
+    assert not session.get("queued_prompts")
 
 
-def test_drain_restores_claimed_prompt_when_generation_bumps_mid_claim(monkeypatch):
-    """Single-item queue: generation cancel must not empty the queue."""
+def test_drain_reclaims_single_prompt_after_non_stop_reanchor(monkeypatch):
+    """A sole queued input reaches a fresh owner instead of stranding idle."""
     session = _session(queued_prompt={"text": "follow-up Q", "transport": None})
+    monkeypatch.setitem(server._sessions, "sid", session)
+    claims, dispatched = [], []
+
+    def reanchor(_session):
+        assert _session is session
+        claims.append(session.get("_queued_prompt_generation", 0))
+        session["_queued_prompt_generation"] = 1
+        return False
+
     monkeypatch.setattr(
         server,
         "_session_uses_compute_host",
-        lambda _session: session.__setitem__("_queued_prompt_generation", 1) or False,
+        reanchor,
     )
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not dispatch")),
+        lambda *args, **kwargs: dispatched.append((args, kwargs)),
     )
 
     assert server._drain_queued_prompt("r1", "sid", session) is True
-    assert session["running"] is False
-    assert session.get("queued_prompt") == {"text": "follow-up Q", "transport": None}
+    assert claims == [0, 1]
+    assert dispatched == [(('r1', 'sid', session, 'follow-up Q'), {
+        "turn_transport": None, "queued_prompt_generation": 1,
+    })]
+    assert session["running"] is True
+    assert session.get("queued_prompt") is None
     assert not session.get("queued_prompts")
 
 

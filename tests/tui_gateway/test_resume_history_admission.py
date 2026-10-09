@@ -526,7 +526,7 @@ def test_inline_error_settlement_does_not_clear_later_send(resume, monkeypatch):
 
 
 @pytest.mark.parametrize("original_sink", ["transport", "stdio"])
-def test_replaced_legacy_terminal_uses_original_sink_without_borrowing_correlation(resume, monkeypatch, original_sink):
+def test_replaced_terminal_is_retained_without_publishing_to_either_sink(resume, monkeypatch, original_sink):
     ref = server._begin_turn_outcome(resume.session, "runtime", "old-admission", "inline")
     original = resume.transport
     if original_sink == "stdio":
@@ -543,9 +543,10 @@ def test_replaced_legacy_terminal_uses_original_sink_without_borrowing_correlati
     finally:
         server.reset_transport(transport_token)
         server._turn_outcome_execution.reset(execution_token)
-    terminal = next(frame["params"]["payload"] for frame in original.frames
-        if frame.get("params", {}).get("type") == "message.complete")
-    assert terminal["text"] == "old terminal" and "accepted_turn" not in terminal
+    assert original.frames == []
+    old_turn = resume.session["_turn_outcomes"].find(ref["request_id"])
+    assert old_turn["accepted_turn"] == ref
+    assert old_turn["finalized"] == [{"text": "old terminal", "status": "error"}]
     assert replacement_transport.frames == []
     assert replacement["_turn_outcomes"].turns[-1]["accepted_turn"] == successor_ref
     assert replacement["_turn_outcomes"].turns[-1]["finalized"] == []
@@ -587,9 +588,10 @@ def test_replacement_during_terminal_projection_cannot_capture_old_stdio_reply(r
         thread.join(5)
         assert not thread.is_alive()
         assert transport.frames == []
-        terminal = next(frame["params"]["payload"] for frame in resume.transport.frames
-            if frame.get("params", {}).get("type") == "message.complete")
-        assert terminal["text"] == "old terminal" and "accepted_turn" not in terminal
+        assert resume.transport.frames == []
+        old_turn = resume.session["_turn_outcomes"].find(ref["request_id"])
+        assert old_turn["accepted_turn"] == ref
+        assert old_turn["finalized"] == [{"text": "old terminal", "status": "error"}]
         assert replacement["_turn_outcomes"].turns[-1]["accepted_turn"] == successor_ref
         assert replacement["_turn_outcomes"].turns[-1]["finalized"] == []
         assert replacement["running"] and replacement["inflight_turn"] == {"user": "successor"}

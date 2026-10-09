@@ -207,10 +207,12 @@ def test_identical_text_belongs_to_distinct_accepted_turns(monkeypatch, projecti
 def test_late_old_execution_cannot_relabel_as_new_request(monkeypatch, projection_env):
     session = _session(running=True)
     server._sessions["s"] = session
-    server._begin_turn_outcome(session, "s", "old", "inline")
+    old_ref = server._begin_turn_outcome(session, "s", "old", "inline")
     token = server._turn_outcome_execution.set((session, "s", "old"))
     try:
         server._emit("message.complete", "s", {"text": "old answer", "status": "complete"})
+        assert projection_env[-1]["params"]["payload"]["accepted_turn"] == old_ref
+        published = list(projection_env)
         session["_turn_outcomes"].finish("old")
         server._begin_turn_outcome(session, "s", "new", "inline")
         session["_compute_host_active_request_id"] = "new"
@@ -220,7 +222,10 @@ def test_late_old_execution_cannot_relabel_as_new_request(monkeypatch, projectio
         server._turn_outcome_execution.reset(token)
     assert snapshot(session)["turns"][-1]["finalized"] == []
     assert snapshot(session)["turns"][-1]["state"] == "running"
-    assert "accepted_turn" not in projection_env[-1]["params"]["payload"]
+    assert projection_env == published
+    assert session["_turn_outcomes"].find("old")["finalized"] == [
+        {"text": "old answer", "status": "complete"},
+    ]
 
 
 def test_transcript_cache_overwrite_restart_and_cross_owner_are_unavailable(monkeypatch, projection_env):
@@ -244,6 +249,7 @@ def test_transcript_cache_overwrite_restart_and_cross_owner_are_unavailable(monk
 def test_session_replacement_rejects_terminal_and_old_emitter(tmp_path, monkeypatch, projection_env):
     session = _session(running=True)
     host, _, ref = host_owner(tmp_path, monkeypatch, session)
+    published = list(projection_env)
     replacement = _session(session_key="new-root")
     server._sessions["s"] = replacement
     host._complete_turn(terminal(ref))
@@ -254,7 +260,10 @@ def test_session_replacement_rejects_terminal_and_old_emitter(tmp_path, monkeypa
     finally:
         server._turn_outcome_execution.reset(token)
     assert snapshot(replacement)["turns"] == [] and session["running"] is True
-    assert "accepted_turn" not in projection_env[-1]["params"]["payload"]
+    assert projection_env == published
+    assert session["_turn_outcomes"].find(ref["request_id"])["finalized"] == [
+        {"text": "old execution", "status": "complete"},
+    ]
 
 
 def test_host_replacement_and_crash_revoke_projection(tmp_path, monkeypatch, projection_env):
@@ -552,12 +561,17 @@ def test_replacement_while_emitter_waits_for_lock_cannot_attach_ref(monkeypatch,
     worker.start()
     try:
         assert entered.wait(2)
-        server._sessions["s"] = _session()
+        replacement = _session()
+        server._sessions["s"] = replacement
     finally:
         release.set()
         worker.join(2)
     assert not worker.is_alive()
-    assert "accepted_turn" not in projection_env[-1]["params"]["payload"]
+    assert projection_env == []
+    assert "_turn_outcomes" not in replacement
+    assert session["_turn_outcomes"].find("A")["finalized"] == [
+        {"text": "late", "status": "complete"},
+    ]
 
 
 def test_next_admission_retains_previous_terminal_for_collector(tmp_path, monkeypatch, projection_env):

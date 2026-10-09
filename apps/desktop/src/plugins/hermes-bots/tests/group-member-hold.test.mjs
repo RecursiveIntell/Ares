@@ -110,6 +110,82 @@ test('polite terminal all-member stop and resume use real mention parsing and ow
   }
 })
 
+test('explicit all-member resume can carry the next instruction', () => {
+  const { classifyGroupHoldDirective, applyGroupHoldDirective } = loadHelpers()
+  for (const text of ['@all resume NEW_INPUT', '@everyone resume REPLACEMENT_INPUT',
+    '@all, please resume newer work', 'please resume @all successor',
+    '@all resume now work; do not stop until done']) {
+    const mentions = parseLocalMentions(text)
+    assert.equal(mentions.everyone, true, text)
+    const action = classifyGroupHoldDirective(text, mentions.mentioned, mentions.everyone)
+    assert.equal(action.holdAll, false, text)
+    assert.equal(action.releaseAll, true, text)
+    const prior = { impl: { at: 1 }, docs: { at: 2 } }
+    const next = applyGroupHoldDirective(prior, mentions, text, {}, ['impl', 'docs'])
+    assert.deepEqual(JSON.parse(JSON.stringify(next)), {}, text)
+    assert.deepEqual(Object.keys(prior), ['impl', 'docs'], 'prior holds are not mutated')
+  }
+})
+
+test('conditional, negated and descriptive all-member resume requests retain holds', () => {
+  const { classifyGroupHoldDirective, applyGroupHoldDirective } = loadHelpers()
+  for (const text of ['@all resume if approved', '@all resume please when ready',
+    '@all resume now, please until the owner returns', '@all resume after approval',
+    '@all resume not yet', '@all resume never', '@all do not resume work',
+    '@all explain how to resume work', '"@all resume replacement"']) {
+    const mentions = parseLocalMentions(text)
+    const action = classifyGroupHoldDirective(text, mentions.mentioned, mentions.everyone)
+    assert.equal(action.holdAll, false, text)
+    assert.equal(action.releaseAll, false, text)
+    const prior = { impl: { at: 1 }, docs: { at: 2 } }
+    assert.equal(applyGroupHoldDirective(prior, mentions, text, {}, ['impl', 'docs']), prior, text)
+  }
+})
+
+test('deferred resume prefixes retain all holds through actual mention parsing', () => {
+  const { classifyGroupHoldDirective, applyGroupHoldDirective } = loadHelpers()
+  for (const text of ['@all resume only if approved', '@all resume once approved',
+    '@all resume later', '@everyone resume please only when approved',
+    '@all resume now only if approved']) {
+    const mentions = parseLocalMentions(text)
+    const action = classifyGroupHoldDirective(text, mentions.mentioned, mentions.everyone, parseLocalMentions)
+    assert.equal(action.releaseAll, false, text)
+    const prior = { impl: { at: 1 }, docs: { at: 2 } }
+    assert.equal(applyGroupHoldDirective(prior, mentions, text, {}, ['impl', 'docs'], parseLocalMentions), prior, text)
+  }
+})
+
+test('explicit immediate resume keeps negative successor instructions in their scope', () => {
+  const { classifyGroupHoldDirective, applyGroupHoldDirective } = loadHelpers()
+  for (const text of ['@all resume now do not stop until done',
+    '@everyone resume immediately please do not stop until done']) {
+    const mentions = parseLocalMentions(text)
+    const action = classifyGroupHoldDirective(text, mentions.mentioned, mentions.everyone, parseLocalMentions)
+    assert.equal(action.releaseAll, true, text)
+    const prior = { impl: { at: 1 }, docs: { at: 2 } }
+    const next = applyGroupHoldDirective(prior, mentions, text, {}, ['impl', 'docs'], parseLocalMentions)
+    assert.deepEqual(JSON.parse(JSON.stringify(next)), {}, text)
+    assert.deepEqual(Object.keys(prior), ['impl', 'docs'], 'prior holds are not mutated')
+  }
+})
+
+test('resume control targets never borrow successor-instruction mentions', () => {
+  const { classifyGroupHoldDirective, applyGroupHoldDirective } = loadHelpers()
+  for (const text of ['@impl resume ask @all for status',
+    '@impl resume ask @everyone for status', 'resume @impl ask @all for status',
+    '@impl resume now ask @docs for status']) {
+    const mentions = parseLocalMentions(text)
+    const action = classifyGroupHoldDirective(text, mentions.mentioned, mentions.everyone, parseLocalMentions)
+    assert.equal(action.releaseAll, false, text)
+    assert.deepEqual([...action.release], ['impl'], text)
+    const prior = { impl: { at: 1 }, docs: { at: 2 } }
+    const next = applyGroupHoldDirective(prior, mentions, text, {}, ['impl', 'docs'], parseLocalMentions)
+    assert.equal(next.docs, prior.docs, text)
+    assert.equal(next.impl, undefined, text)
+    assert.deepEqual(Object.keys(prior), ['impl', 'docs'], 'prior holds are not mutated')
+  }
+})
+
 test('quoted display-name targets are unsupported by the unchanged production mention grammar', () => {
   const { classifyGroupHoldDirective, applyGroupHoldDirective } = loadHelpers()
   for (const text of ['stop @"Implementation specialist"', '@"Implementation specialist" stop']) {

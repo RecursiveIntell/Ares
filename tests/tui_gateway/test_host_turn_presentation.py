@@ -8,7 +8,7 @@ from tui_gateway.compute_host import ComputeHost
 
 
 def test_host_owned_bubble_marks_pending_without_mutating_payload(monkeypatch):
-    session = {"_host_turn_request_id": "A"}
+    session = {"history_lock": threading.Lock(), "_host_turn_request_id": "A"}
     monkeypatch.setattr(server, "_sessions", {"s": session})
     monkeypatch.setattr(server, "_inside_compute_host_child", lambda: True)
     sent = []

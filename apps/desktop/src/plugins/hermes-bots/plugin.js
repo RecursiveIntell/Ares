@@ -9036,11 +9036,11 @@ function isDuplicateGroupAppend(lastEntry, from, text, thread, now = Date.now())
 
 // --- member-hold helpers (#93129) — pure, vm-sliced by tests ---
 
-/** #93129: only a whole, affirmative USER command changes stop controls.
+/** #93129: only a whole, affirmative USER command creates stop controls.
  *  A stop word in negated, quoted, descriptive or conditional prose is not
  *  an immediate stop instruction. Existing direct non-command mentions
  *  still release the addressed members; the explicit Stop button is separate. */
-function classifyGroupHoldDirective(text, mentionedKeys, everyone) {
+function classifyGroupHoldDirective(text, mentionedKeys, everyone, parseTargets) {
   const value = String(text || '').trim()
   const mentioned = [...(mentionedKeys || [])]
   // Commands: "stop @member, please", "@member please pause for now", "@all resume".
@@ -9052,7 +9052,19 @@ function classifyGroupHoldDirective(text, mentionedKeys, everyone) {
     'i'
   ).test(value)
   const stop = isCommand('stop|halt|pause')
-  const resume = isCommand('resume|continue|go|proceed')
+  const wholeResume = isCommand('resume|continue|go|proceed')
+  // A leading resume may carry a successor instruction. Its target prefix
+  // owns the control; mentions in the instruction cannot expand that scope.
+  const resumeInstruction = new RegExp(
+    '^(?:please\\s+)?(?:(' + targets + ')(?:\\s*[:,]\\s*|\\s+)(?:please\\s+)?resume|resume\\s+(' + targets + '))\\s+(.+)$',
+    'i'
+  ).exec(value)
+  const instruction = resumeInstruction?.[3] || ''
+  const deferredResume = /^(?:(?:please|now|immediately|for\s+now)[\s,]+)*(?:(?:only\s+)?(?:if|when|unless|until|after|before|once)|later)\b/i.test(instruction)
+  // Without an immediate marker, a negative prefix qualifies resume itself.
+  // After "now"/"immediately", it belongs to the successor instruction.
+  const negatedResume = /^(?:please[\s,]+)*(?:not|never|do\s+not|don['’]t)\b/i.test(instruction)
+  const resume = wholeResume || Boolean(resumeInstruction && !deferredResume && !negatedResume)
 
   if (stop) {
     // "@all stop" holds every member — symmetric with "@all resume".
@@ -9060,7 +9072,12 @@ function classifyGroupHoldDirective(text, mentionedKeys, everyone) {
   }
 
   if (resume) {
-    return { hold: [], holdAll: false, release: mentioned, releaseAll: Boolean(everyone) }
+    const targetText = resumeInstruction?.[1] || resumeInstruction?.[2] || ''
+    const scoped = !wholeResume && targetText ? parseTargets?.(targetText) : null
+    const release = !wholeResume && targetText ? [...(scoped?.mentioned || [])] : mentioned
+    const controlAll = /(?:^|[\s,&])@(?:all|everyone)(?=$|[\s,&])/i.test(targetText)
+    const releaseAll = wholeResume ? Boolean(everyone) : Boolean(scoped?.everyone ?? (everyone && controlAll))
+    return { hold: [], holdAll: false, release, releaseAll }
   }
 
   return { hold: [], holdAll: false, release: mentioned, releaseAll: false }
@@ -9071,9 +9088,9 @@ function classifyGroupHoldDirective(text, mentionedKeys, everyone) {
  *  mints a NEW thread, so a thread-scoped hold would never block the next
  *  send's turns and the stop would not stick. Returns the same object when
  *  nothing changed. */
-function applyGroupHoldDirective(holds, mentions, text, stamp, allMemberKeys = []) {
+function applyGroupHoldDirective(holds, mentions, text, stamp, allMemberKeys = [], parseTargets) {
   const prior = holds && typeof holds === 'object' ? holds : {}
-  const action = classifyGroupHoldDirective(text, mentions?.mentioned || [], Boolean(mentions?.everyone))
+  const action = classifyGroupHoldDirective(text, mentions?.mentioned || [], Boolean(mentions?.everyone), parseTargets)
 
   if (action.releaseAll) {
     return Object.keys(prior).length ? {} : prior
@@ -9781,7 +9798,8 @@ function sendToGroupChat(group, members, text, thread, images) {
       parseGroupChatMentions(trimmed, members),
       trimmed,
       { at: sent?.at, byMessageId: sent?.id, thread: target },
-      members.map(member => groupMemberKey(member))
+      members.map(member => groupMemberKey(member)),
+      targetText => parseGroupChatMentions(targetText, members)
     )
     for (const [memberKey, marker] of Object.entries(room.stranded || {})) {
       if (room.holds?.[memberKey] && marker && typeof marker === 'object') {
