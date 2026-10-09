@@ -2079,11 +2079,6 @@ def _build_skills_system_prompt_inner(
     if not skills_by_category:
         result = ""
     else:
-        # "basic tools like web_search or terminal" — don't name web_search
-        # when the session has no web tools (dangling reference otherwise).
-        _basic_tools = "web_search or terminal"
-        if available_tools is not None and "web_search" not in available_tools:
-            _basic_tools = "terminal"
         index_lines = []
         for category in sorted(skills_by_category.keys()):
             # Deduplicate and sort skills within each category
@@ -2107,32 +2102,30 @@ def _build_skills_system_prompt_inner(
                     index_lines.append(f"    - {name}")
 
         result = (
-            "## Skills (mandatory)\n"
-            "Before replying, scan the skills below. If a skill matches or is even partially relevant "
-            "to your task, you MUST load it with skill_view(name) and follow its instructions. "
-            "Err on the side of loading — it is always better to have context you don't need "
-            "than to miss critical steps, pitfalls, or established workflows. "
-            "Skills contain specialized knowledge — API endpoints, tool-specific commands, "
-            "and proven workflows that outperform general-purpose approaches. Load the skill "
-            f"even if you think you could handle the task with basic tools like {_basic_tools}. "
-            "Skills also encode the user's preferred approach, conventions, and quality standards "
-            "for tasks like code review, planning, and testing — load them even for tasks you "
-            "already know how to do, because the skill defines how it should be done here.\n"
+            "## Skills (task-fit routing)\n"
+            "Identify the requested deliverable before selecting a workflow. Load directly applicable "
+            "or explicitly required skills with skill_view(name), and follow their prerequisites. "
+            "Add another skill only when it satisfies a concrete unmet requirement or can materially "
+            "change the decision; shared keywords or neighboring domains are not enough. "
+            "Reuse already loaded current guidance rather than rereading or stacking duplicate procedures. "
+            "For simple tasks, use the shortest safe path to a verified result without planning or "
+            "delegation ceremony. Required safety, authority, and verification checks are not optional "
+            "and must not be removed to reduce tool calls.\n"
             "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
             "or troubleshoot Hermes Agent itself — its CLI, config, models, providers, tools, "
             "skills, voice, gateway, plugins, or any feature — load the `hermes-agent` skill "
             "first. It has the actual commands (e.g. `hermes config set …`, `hermes tools`, "
             "`hermes setup`) so you don't have to guess or invent workarounds.\n"
-            "If a skill has issues, fix it with skill_manage(action='patch').\n"
-            "After difficult/iterative tasks, offer to save as a skill. "
-            "If a skill you loaded was missing steps, had wrong commands, or needed "
-            "pitfalls you discovered, update it before finishing.\n"
+            "Correct discovered skill errors only within the skill's ownership and permission boundary; "
+            "do not modify protected or user-owned skills without explicit permission. Report blocked maintenance "
+            "rather than creating a shadow copy. Save a reusable lesson only when it materially improves an "
+            "existing editable workflow; do not add a skill merely to close a routine task.\n"
             "\n"
             "<available_skills>\n"
             + "\n".join(index_lines) + "\n"
             "</available_skills>\n"
             "\n"
-            "Only proceed without loading a skill if genuinely none are relevant to the task."
+            "If no skill is directly applicable or explicitly required, proceed without loading one."
             + hidden_note
         )
 

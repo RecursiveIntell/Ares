@@ -298,6 +298,35 @@ class TestBuildSkillsSystemPrompt:
 
 
 
+    @pytest.fixture
+    def routing_prompt(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill = tmp_path / "skills" / "tools" / "fixture-inspection"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(
+            "---\nname: fixture-inspection\ndescription: Inspect a named fixture.\n---\n"
+        )
+        return build_skills_system_prompt(skills_dir_override=tmp_path / "skills")
+
+    def test_skill_loading_requires_concrete_task_fit(self, routing_prompt):
+        assert "directly applicable" in routing_prompt
+        assert "concrete unmet requirement" in routing_prompt
+        assert "partially relevant" not in routing_prompt
+        assert "always better to have context you don't need" not in routing_prompt
+        assert "fixture-inspection" in routing_prompt
+
+    def test_skill_loading_preserves_required_checks(self, routing_prompt):
+        assert "Required safety, authority, and verification checks" in routing_prompt
+        assert "not optional" in routing_prompt
+        assert "`hermes-agent` skill" in routing_prompt
+        assert "first" in routing_prompt
+
+    def test_skill_maintenance_respects_ownership(self, routing_prompt):
+        assert "ownership" in routing_prompt
+        assert "user-owned" in routing_prompt
+        assert "permission" in routing_prompt
+        assert "blocked maintenance" in routing_prompt
+
     def test_deduplicates_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         cat_dir = tmp_path / "skills" / "tools"
@@ -457,15 +486,21 @@ class TestBuildContextFilesPrompt:
         (sub / "AGENTS.md").write_text("Only file.")
         assert _load_agents_md(sub) == "## AGENTS.md\n\nOnly file."
 
-    def test_agents_md_no_git_root_stays_cwd_only(self, tmp_path):
-        # Without a git root, parents are never consulted (no picking up an
-        # AGENTS.md planted in /tmp or $HOME).
+    def test_agents_md_no_git_root_stays_cwd_only(self, monkeypatch, tmp_path):
+        # Exercise the no-repository branch explicitly: the host temporary
+        # directory can itself live inside a Git repository (e.g. /tmp/.git).
+        # Root discovery is a separate dependency; do not weaken the loader's
+        # negative witness or delete an ambient repository to force this case.
+        # Import the module object currently in sys.modules: an earlier import
+        # resilience test reloads it, so a dotted monkeypatch target can resolve
+        # the stale package attribute instead of the function's actual globals.
+        module = importlib.import_module("agent.prompt_builder")
+        monkeypatch.setattr(module, "_find_git_root", lambda _: None)
         (tmp_path / "AGENTS.md").write_text("Planted in parent.")
         sub = tmp_path / "sub"
         sub.mkdir()
-        from agent.prompt_builder import _load_agents_md
 
-        assert _load_agents_md(sub) == ""
+        assert module._load_agents_md(sub) == ""
 
     # --- AGENTS.override.md personal override (port of pi#7681) ---
 
