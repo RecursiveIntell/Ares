@@ -128,6 +128,31 @@ def test_protocol_probe_exercises_the_certified_two_phase_wire_contract():
     assert calls[-1][1] == {}
 
 
+@pytest.mark.parametrize("adjacent_role", ["assistant", "user"])
+def test_candidate_reserve_projection_already_matches_final_host_shape(adjacent_role):
+    with patch("hermes_cli.config.load_config", return_value={}):
+        engine = ContextGovernorEngine(binary="/tmp/context-governor")
+    latest = "Which fixture job failed? Preserve exact job identities."
+    source = [{"role": "user", "content": latest}]
+    response = {
+        "receipt": {"schema": "ContextCompactionReceiptV2", "receipt_id": "ctxr_fixture"},
+        "compacted_messages": [
+            {"role": adjacent_role, "content": "CI job proc_fixture_ci was unrun."},
+            {"role": adjacent_role, "content": "Reviewer proc_fixture_review returned; no merge authority."},
+            {"role": "user", "content": latest},
+        ],
+    }
+    original_projection = [engine._message_from_governor(m) for m in response["compacted_messages"]]
+    original_projection = engine._ensure_latest_user_last(source, original_projection)
+    original_projection = engine._sanitize_tool_pairs(original_projection)
+    _, _, projected = engine._project_compaction_candidate(response, source)
+    final = engine._repair_for_host_alternation(copy.deepcopy(original_projection))
+    final = engine._ensure_latest_user_last(source, final)
+    final = engine._preserve_multimodal_tail(source, final)
+    assert projected == final
+    assert projected[-1]["content"] == latest
+
+
 def test_governor_compressed_summary_marker_survives_host_roundtrip():
     with patch("hermes_cli.config.load_config", return_value={}):
         engine = ContextGovernorEngine(binary="/tmp/context-governor")

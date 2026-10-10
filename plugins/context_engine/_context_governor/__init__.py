@@ -1416,15 +1416,21 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         compacted = self._sanitize_tool_pairs(compacted)
         compacted = self._ensure_latest_user_last(source_messages, compacted)
         compacted = self._preserve_multimodal_tail(source_messages, compacted)
-        from agent.conversation_compression import (
-            _ensure_compressed_has_user_turn,
-        )
-
-        # Reserve only for host material the certified candidate actually lacks.
-        # This projection is also applied idempotently immediately before
-        # finalize-v2, so the measured token delta matches the persisted shape.
-        _ensure_compressed_has_user_turn(source_messages, compacted)
+        # Measure the exact final host shape, including role repair and the
+        # latest-user restoration that can add text after a user-run merge.
+        compacted = self._final_host_projection(source_messages, compacted)
         return pending_receipt, pending_receipt_id, compacted
+
+    def _final_host_projection(
+        self, source_messages: List[Dict[str, Any]], compacted: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """One host-owned pre-finalization recipe; never rewrite signed receipts."""
+        from agent.conversation_compression import _ensure_compressed_has_user_turn
+
+        _ensure_compressed_has_user_turn(source_messages, compacted)
+        compacted = self._repair_for_host_alternation(compacted)
+        compacted = self._ensure_latest_user_last(source_messages, compacted)
+        return self._preserve_multimodal_tail(source_messages, compacted)
 
     def _compact_v2_candidate(
         self, request: dict[str, Any]
@@ -1671,6 +1677,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             # Deterministic compaction owns the fast path. An LLM may replace
             # the extractive summary only at a receipt-proven fixed point or
             # after the deterministic pass has reached diminishing returns.
+            measured_host_projection = copy.deepcopy(compacted)
             checkpoint, checkpoint_reason = self._llm_checkpoint_decision(
                 response,
                 target_tokens=target_tokens,
@@ -1758,20 +1765,12 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             # rejects the shifted projection and the turn cannot continue.
             # Apply the exact host helper before alternation repair/finalize so
             # both the receipt and SessionDB bind the same human-intent anchor.
-            from agent.conversation_compression import (
-                _ensure_compressed_has_user_turn,
-            )
-
-            _ensure_compressed_has_user_turn(source_messages, compacted)
-            # The host repairs role-alternation in memory immediately after
-            # compress() returns. Apply the same repair BEFORE finalize so
-            # the receipt describes the exact transcript the host persists;
-            # otherwise the next compaction's input no longer exactly
-            # prefixes the stored parent and recursive lineage rejects it —
-            # which made deterministic compaction one-shot per session.
-            compacted = self._repair_for_host_alternation(compacted)
-            compacted = self._ensure_latest_user_last(source_messages, compacted)
-            compacted = self._preserve_multimodal_tail(source_messages, compacted)
+            # The deterministic candidate already has the measured final host
+            # shape. Re-running repair after latest-user restoration can merge
+            # that user again and append another copy. Only a changed LLM
+            # projection needs this recipe again; Rust still checks its budget.
+            if compacted != measured_host_projection:
+                compacted = self._final_host_projection(source_messages, compacted)
             response = self._finalize_response(response, compacted)
             finalized_messages = response.get("compacted_messages")
             if not isinstance(finalized_messages, list):
