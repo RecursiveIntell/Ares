@@ -34,6 +34,13 @@ CORRELATION_KEYS = ("session_id", "run_id", "trace_id", "span_id", "parent_span_
 REDACT_KEYS = ("content", "prompt", "completion", "messages", "body", "text",
                "secret", "token_raw", "api_key", "password", "authorization")
 
+# RP-02 F06: timing is a fixed-shape contract field on the collector side
+# (stack-observation `Timing` struct). Only these keys may cross the wire;
+# unknown keys are dropped and counted rather than forwarded opaquely.
+TIMING_KEYS = ("started_at", "completed_at", "duration_ms", "model", "provider",
+               "prompt_tokens", "completion_tokens", "total_tokens",
+               "estimated_cost", "currency", "error_category")
+
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
@@ -53,6 +60,8 @@ class AresObservationClient:
         self._seq_lock = threading.Lock()
         self._sock = None
         self._sock_lock = threading.Lock()
+        self._drain_lock = threading.Lock()   # single-flight drain (RP-02 F05)
+        self._stats_lock = threading.Lock()   # all counter mutation (RP-02 F02/F05)
         self._cap = local_queue_cap
         self._pending: list[bytes] = []
         self._pending_lock = threading.Lock()
@@ -64,6 +73,7 @@ class AresObservationClient:
         self.rejected = 0   # schema/limit violations
         self.dropped = 0    # queue overflow / socket unavailable after retry
         self.connection_failures = 0
+        self.timing_keys_filtered = 0   # non-contract timing keys dropped (RP-02 F06)
 
     # ---- contract validation (S1-07.02/04, schema v1) ----
     @staticmethod
@@ -89,6 +99,11 @@ class AresObservationClient:
             for k, v in correlation.items():
                 if k in CORRELATION_KEYS and v is not None:
                     corr[k] = str(v)[:128]
+        timing_filtered = {k: v for k, v in (timing or {}).items() if k in TIMING_KEYS}
+        n_filtered = len(timing or {}) - len(timing_filtered)
+        if n_filtered:
+            with self._stats_lock:
+                self.timing_keys_filtered += n_filtered
         env = {
             "schema_version": SCHEMA_VERSION,
             "event_id": str(uuid.uuid4()),
@@ -102,7 +117,7 @@ class AresObservationClient:
             "producer_sequence": self._next_seq(),
             "kind": kind,
             "status": status,
-            "timing": dict(timing) if timing else {},
+            "timing": timing_filtered,
             "privacy": self._privacy_metadata(payload),
             "payload": self._redact(payload or {}),
         }
@@ -144,19 +159,28 @@ class AresObservationClient:
         return len(payload).to_bytes(FRAME_HEADER_BYTES, "big") + payload
 
     def _drain(self) -> int:
+        """Single-flight drain: at most one thread peeks/sends/pops at a time,
+        so a concurrent emit can never double-send pending[0] (RP-02 F05)."""
         sent = 0
-        while self._pending:
-            frame = self._pending[0]
-            try:
-                sock = self._connect()
-                sock.sendall(frame)
-            except (OSError, ValueError):
-                self.connection_failures += 1
-                break
-            self.sent += 1
-            sent += 1
-            with self._pending_lock:
-                self._pending.pop(0)
+        with self._drain_lock:
+            while True:
+                with self._pending_lock:
+                    if not self._pending:
+                        break
+                    frame = self._pending[0]
+                try:
+                    sock = self._connect()
+                    sock.sendall(frame)
+                except (OSError, ValueError):
+                    with self._stats_lock:
+                        self.connection_failures += 1
+                    break
+                with self._stats_lock:
+                    self.sent += 1
+                sent += 1
+                with self._pending_lock:
+                    if self._pending:
+                        self._pending.pop(0)
         return sent
 
     # ---- public API ----
@@ -168,33 +192,44 @@ class AresObservationClient:
         Returns one of: 'accepted' (handed to a live socket), 'queued'
         (bounded local queue; will drain later), 'dropped' (rejected locally).
         Never raises on transport failure; raises ValueError on contract violations.
+        Thread-safe: counters and the outbound queue are lock-guarded (RP-02 F02/F05).
         """
         if self.closed:
             raise ValueError("client-closed")
-        self.attempted += 1
+        with self._stats_lock:
+            self.attempted += 1
         try:
             env = self._build_envelope(kind, status, payload or {}, correlation,
                                        timing, provenance)
             frame = self._frame(env)
         except ValueError:
-            self.rejected += 1
+            with self._stats_lock:
+                self.rejected += 1
             raise
         with self._pending_lock:
             if len(self._pending) >= self._cap:
                 # Contract-invalid AND queue-dropped events each count exactly once:
                 # attempted == accepted + rejected + dropped (identity must hold).
-                self.dropped += 1
+                with self._stats_lock:
+                    self.dropped += 1
                 return "dropped"
-            self.accepted += 1
+            with self._stats_lock:
+                self.accepted += 1
             self._pending.append(frame)
         self._drain()
         return "queued" if self._pending else "accepted"
 
     def stats(self) -> dict:
-        return {"attempted": self.attempted, "accepted": self.accepted,
-                "sent": self.sent, "rejected": self.rejected,
-                "dropped": self.dropped, "queued": len(self._pending),
-                "connection_failures": self.connection_failures}
+        with self._stats_lock:
+            attempted, accepted, sent = self.attempted, self.accepted, self.sent
+            rejected, dropped = self.rejected, self.dropped
+            connection_failures = self.connection_failures
+            timing_filtered = self.timing_keys_filtered
+        return {"attempted": attempted, "accepted": accepted,
+                "sent": sent, "rejected": rejected,
+                "dropped": dropped, "queued": len(self._pending),
+                "connection_failures": connection_failures,
+                "timing_keys_filtered": timing_filtered}
 
     def close(self):
         """Drain what is drainable, then surface the final accounting identity.
