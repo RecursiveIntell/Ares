@@ -117,5 +117,35 @@ def test_skills_breakdown_attributes_demoted_category_shared_line(isolated_home)
         assert entry["index_line_skill_count"] == 2
 
 
+def test_context_tier_reports_agents_md_from_cwd(isolated_home, tmp_path, monkeypatch):
+    """The context tier must attribute AGENTS.md when a cwd is supplied.
+
+    Regression: ``compute_prompt_breakdown`` built a cli-platform inspection
+    agent at a dry cwd, so the context tier always read 0 B even for a surface
+    whose real sessions carry an AGENTS.md. The diagnostic could not measure
+    the largest context block it exists to explain.
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+    agents_md = "# rules\n" + "line\n" * 200
+    (project / "AGENTS.md").write_text(agents_md, encoding="utf-8")
+    monkeypatch.delenv("TERMINAL_CWD", raising=False)
+
+    def _context_bytes(data):
+        return next(b for label, _c, b in data["sections"]
+                    if label.startswith("context"))
+
+    # Without a supplied cwd the context tier is empty (the pre-fix behavior).
+    assert _context_bytes(compute_prompt_breakdown("cli")) == 0
+
+    # With cwd pointed at a dir containing AGENTS.md, its bytes are attributed
+    # and are at least the size of the file we wrote.
+    data = compute_prompt_breakdown("cli", cwd=project)
+    ctx_bytes = _context_bytes(data)
+    assert ctx_bytes >= len(agents_md.encode("utf-8")), (
+        "context tier did not attribute the AGENTS.md bytes"
+    )
+
+
 
 
