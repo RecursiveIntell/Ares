@@ -72,7 +72,7 @@ Ares does **not** claim that every installed service is reachable or exercised, 
 ### Prerequisites
 
 - Git
-- [uv](https://docs.astral.sh/uv/) — the bootstrap installs uv automatically when it is missing (skip with `--no-venv` and an active Python environment)
+- [uv](https://docs.astral.sh/uv/) — the installer installs uv automatically when it is missing (skip with `--no-venv` and an active Python environment)
 - Python **3.11–3.14** is admitted by the current project metadata (`>=3.11,<3.15`). The inherited POSIX installer provisions 3.11 by default; the committed Desktop resolver explicitly probes 3.11–3.14. Resolver support is a source-level admission decision, not proof that every native extension or installation path works on each Python minor and operating system.
 - A model provider configured through the normal Hermes setup flow
 
@@ -144,7 +144,7 @@ ares desktop              # Launch the selected Desktop build, if installed
 ares gateway status       # Inspect the Ares gateway service
 ```
 
-The bootstrap installs Desktop and the gateway by default; on a CLI-only or
+The installer installs Desktop and the gateway by default; on a CLI-only or
 headless host, keep the two opt-outs. A manual CLI-only setup can add them
 later by repeating setup without the opt-outs:
 
@@ -384,9 +384,9 @@ Choose the engine through the existing configuration workflow, then validate the
 
 ### Recursive Agent plugin
 
-The Recursive Agent integration is a standalone plugin, not a bundled core tool. The bootstrap installs the plugin payload by default and auto-provisions a `RecursiveIntell/recursive-agent` checkout under `<hermes-home>/recursive-agent-src`; skip it with `--no-recursive-agent`.
+The Recursive Agent integration is a standalone plugin, not a bundled core tool. The installer installs the plugin payload by default and auto-provisions a `RecursiveIntell/recursive-agent` checkout under `<hermes-home>/recursive-agent-src`; skip it with `--no-recursive-agent`.
 
-To install from an existing checkout instead, point the bootstrap at it:
+To install from an existing checkout instead, point the installer at it:
 
 ```bash
 bash install.sh --with-recursive-agent-source /path/to/recursive-agent
