@@ -31,6 +31,17 @@ from pathlib import Path
 
 import yaml
 
+try:  # Canonical config chokepoint: fail-closed guard + shared atomic writer
+    # (symlink, owner, mode, fsync, formatting guarantees).
+    from hermes_cli.config import atomic_config_write as _shared_config_write
+except Exception:  # pragma: no cover - standalone fallback outside the source tree
+    _shared_config_write = None
+
+try:  # Shared writer alone, when the full config module is unavailable.
+    from utils import atomic_yaml_write as _shared_atomic_yaml_write
+except Exception:  # pragma: no cover - standalone fallback outside the source tree
+    _shared_atomic_yaml_write = None
+
 
 class AresIntegrationsError(RuntimeError):
     """Typed failure for integration registration."""
@@ -116,20 +127,36 @@ def _load_config(path: Path) -> dict:
 
 
 def _atomic_write_yaml(path: Path, config: dict) -> None:
-    """Write YAML through a same-directory temporary file, atomically."""
+    """Write the config through the canonical Hermes config chokepoint.
 
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ``hermes_cli.config.atomic_config_write`` runs the fail-closed readable-
+    config guard and then the shared atomic writer, which preserves symlinked
+    ``config.yaml`` files (swap in-place on the real file), ownership, mode,
+    and fsync durability. Fallbacks for standalone use outside the source tree
+    keep a symlinked config a symlink by writing through its resolved target.
+    """
+
+    if _shared_config_write is not None:
+        _shared_config_write(path, config, sort_keys=True, create_mode=0o600)
+        return
+
+    if _shared_atomic_yaml_write is not None:
+        _shared_atomic_yaml_write(path, config, sort_keys=True, create_mode=0o600)
+        return
+
+    target = path.resolve() if path.is_symlink() else path
+    target.parent.mkdir(parents=True, exist_ok=True)
     mode = None
-    if path.exists():
-        mode = os.stat(path).st_mode & 0o777
-    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    if target.exists():
+        mode = os.stat(target).st_mode & 0o777
+    tmp = target.with_name(f"{target.name}.tmp.{os.getpid()}")
     try:
         tmp.write_text(
             yaml.safe_dump(config, default_flow_style=False, sort_keys=True),
             encoding="utf-8",
         )
         os.chmod(tmp, mode if mode is not None else 0o600)
-        os.replace(tmp, path)
+        os.replace(tmp, target)
     finally:
         if tmp.exists():
             try:
@@ -173,18 +200,30 @@ def apply_plan(home: Path, plan: dict) -> list[str]:
                 report.append(f"kept existing (differs from plan): {name}")
 
     if plan.get("disable_builtin_memory"):
-        agent = config.setdefault("agent", {})
-        if not isinstance(agent, dict):
-            raise AresIntegrationsError("config 'agent' section is not a mapping")
-        disabled = agent.setdefault("disabled_toolsets", [])
-        if not isinstance(disabled, list):
-            raise AresIntegrationsError("config 'agent.disabled_toolsets' is not a list")
-        if "memory" not in disabled:
-            disabled.append("memory")
-            changed = True
-            report.append("disabled built-in memory toolset")
+        # Keep the working built-in memory tools when the replacement entry is
+        # missing or explicitly disabled: a preserved operator customization
+        # must not leave the home with both memory systems switched off.
+        server_entry = (config.get("mcp_servers") or {}).get("semantic_memory")
+        replacement_enabled = (
+            isinstance(server_entry, dict) and server_entry.get("enabled") is not False
+        )
+        if not replacement_enabled:
+            report.append(
+                "built-in memory toolset kept enabled (semantic-memory entry is missing or disabled)"
+            )
         else:
-            report.append("built-in memory toolset already disabled")
+            agent = config.setdefault("agent", {})
+            if not isinstance(agent, dict):
+                raise AresIntegrationsError("config 'agent' section is not a mapping")
+            disabled = agent.setdefault("disabled_toolsets", [])
+            if not isinstance(disabled, list):
+                raise AresIntegrationsError("config 'agent.disabled_toolsets' is not a list")
+            if "memory" not in disabled:
+                disabled.append("memory")
+                changed = True
+                report.append("disabled built-in memory toolset")
+            else:
+                report.append("built-in memory toolset already disabled")
 
     if changed:
         _atomic_write_yaml(config_path, config)

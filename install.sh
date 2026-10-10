@@ -34,7 +34,9 @@ SKILLS_PACK_ASSET="hermes-skills-20260803.tar.gz"
 HOOKS_PACK_ASSET="hermes-hooks-20260803.tar.gz"
 
 _OS=""
+_ARCH=""
 _ARES_TMP_DIR=""
+_AG_UNIT_NAME=""
 
 log() { printf '[ares] %s\n' "$*"; }
 warn() { printf '[ares] warning: %s\n' "$*" >&2; }
@@ -144,7 +146,13 @@ detect_os() {
         Darwin) _OS="macos" ;;
         *)      _OS="unsupported" ;;
     esac
-    log "detected platform: $_OS"
+    _ARCH="$(uname -m)"
+    log "detected platform: $_OS / $_ARCH"
+}
+
+prebuilt_linux_x64_available() {
+    [[ "$_OS" == "linux" ]] || return 1
+    [[ "$_ARCH" == "x86_64" || "$_ARCH" == "amd64" ]]
 }
 
 resolve_layout() {
@@ -222,10 +230,17 @@ agent_python() {
 }
 
 fetch_asset() {
-    # fetch_asset URL DEST — best-effort download; returns nonzero on failure.
+    # fetch_asset URL DEST — best-effort download to a temporary sibling, so a
+    # failed or partial transfer can never corrupt an existing executable.
     local url="$1" dest="$2"
+    local tmp="$dest.tmp.$$"
     mkdir -p "$(dirname "$dest")"
-    curl -fsSL --retry 2 --max-time 600 -o "$dest" "$url"
+    if curl -fsSL --retry 2 --max-time 600 -o "$tmp" "$url"; then
+        mv -f "$tmp" "$dest"
+    else
+        rm -f "$tmp"
+        return 1
+    fi
 }
 
 # ── MCP servers ──────────────────────────────────────────────────────────────
@@ -246,8 +261,8 @@ install_mcp_servers() {
     if [[ "$INSTALL_SEMANTIC_MEMORY" == true ]]; then
         log "installing semantic-memory MCP server (knowledge base + memory search)"
         local sm_dest="$ARES_BIN_DIR/semantic-memory-mcp"
-        if [[ "$_OS" != "linux" ]]; then
-            warn "semantic-memory: prebuilt binary is Linux-only; build from source (cargo install semantic-memory-mcp)"
+        if ! prebuilt_linux_x64_available; then
+            warn "semantic-memory: prebuilt binary is Linux x86_64-only; build from source (cargo install semantic-memory-mcp)"
         elif fetch_asset "https://github.com/RecursiveIntell/semantic-memory-mcp/releases/latest/download/semantic-memory-mcp-linux-x64" "$sm_dest"; then
             chmod +x "$sm_dest"
             log "  semantic-memory-mcp -> $sm_dest"
@@ -281,7 +296,7 @@ install_mcp_servers() {
                 warn "agent-graph cargo provisioning failed (log: $_ARES_TMP_DIR/cargo-install.log)"
             fi
         fi
-        if [[ -z "$ag_proxy" && "$_OS" == "linux" ]]; then
+        if [[ -z "$ag_proxy" ]] && prebuilt_linux_x64_available; then
             local ag_proxy_asset="$ARES_BIN_DIR/agent-graph-mcp"
             if fetch_asset "https://github.com/RecursiveIntell/agent-graph-mcp/releases/latest/download/agent-graph-mcp-linux-x64" "$ag_proxy_asset"; then
                 chmod +x "$ag_proxy_asset"
@@ -290,7 +305,7 @@ install_mcp_servers() {
             fi
         fi
         if [[ -n "$ag_proxy" ]]; then
-            plan_entries+=("\"agent_graph\": {\"command\": \"$ag_proxy\", \"args\": [\"--socket\", \"$HOME/.local/share/agent-graph/run/mcp.sock\"]}")
+            plan_entries+=("\"agent_graph\": {\"command\": \"$ag_proxy\", \"args\": [\"--socket\", \"$HERMES_HOME/agent-graph/run/mcp.sock\"]}")
         else
             warn "agent-graph not installed; provision it manually: cargo install --locked agent-graph-mcp"
         fi
@@ -302,8 +317,8 @@ install_mcp_servers() {
     if [[ "$INSTALL_CLAIM_LEDGER" == true ]]; then
         log "installing claim-ledger MCP server (evidence/claim verification)"
         local cl_dest="$ARES_BIN_DIR/claim-ledger-mcp"
-        if [[ "$_OS" != "linux" ]]; then
-            warn "claim-ledger: prebuilt binary is Linux-only; see the RecursiveIntell/Ares release assets"
+        if ! prebuilt_linux_x64_available; then
+            warn "claim-ledger: prebuilt binary is Linux x86_64-only; see the RecursiveIntell/Ares release assets"
         elif fetch_asset "$RELEASE_BASE/claim-ledger-mcp" "$cl_dest"; then
             chmod +x "$cl_dest"
             log "  claim-ledger-mcp -> $cl_dest"
@@ -317,8 +332,8 @@ install_mcp_servers() {
         log "installing cea-graph MCP server (causal edit attribution)"
         local cea_dir="$HOME/.local/lib/cea-graph-mcp"
         local cea_tarball="$_ARES_TMP_DIR/cea-graph.tar.gz"
-        if [[ "$_OS" != "linux" ]]; then
-            warn "cea-graph: prebuilt package is Linux-only; build from source"
+        if ! prebuilt_linux_x64_available; then
+            warn "cea-graph: prebuilt package is Linux x86_64-only; build from source"
         elif fetch_asset "$RELEASE_BASE/cea-graph-mcp-linux-x64.tar.gz" "$cea_tarball"; then
             mkdir -p "$cea_dir"
             if tar -xzf "$cea_tarball" -C "$cea_dir"; then
@@ -337,8 +352,8 @@ install_mcp_servers() {
         log "installing pilot-bridge MCP server (forge-pilot OODA loops)"
         local pb_dir="$HOME/.local/lib/pilot-bridge-mcp"
         local pb_tarball="$_ARES_TMP_DIR/pilot-bridge.tar.gz"
-        if [[ "$_OS" != "linux" ]]; then
-            warn "pilot-bridge: prebuilt package is Linux-only; build from source"
+        if ! prebuilt_linux_x64_available; then
+            warn "pilot-bridge: prebuilt package is Linux x86_64-only; build from source"
         elif fetch_asset "$RELEASE_BASE/pilot-bridge-mcp-linux-x64.tar.gz" "$pb_tarball"; then
             mkdir -p "$pb_dir"
             if tar -xzf "$pb_tarball" -C "$pb_dir"; then
@@ -377,7 +392,9 @@ install_mcp_servers() {
 
 install_agent_graph_unit() {
     local daemon="$1"
-    local data_dir="$HOME/.local/share/agent-graph"
+    # Scope graph state and service identity to the selected Ares home, so
+    # independent homes cannot read or mutate each other's graph daemon/store.
+    local data_dir="$HERMES_HOME/agent-graph"
     local socket="$data_dir/run/mcp.sock"
 
     if [[ -z "$daemon" ]]; then
@@ -388,6 +405,15 @@ install_agent_graph_unit() {
     mkdir -p "$data_dir/run"
     local unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
     mkdir -p "$unit_dir"
+    local default_home
+    default_home="$(python3 -c 'import os, sys; print(os.path.abspath(os.path.expanduser(sys.argv[1])))' "$HOME/.ares")"
+    local unit_name="agent-graph-mcpd.service"
+    if [[ "$HERMES_HOME" != "$default_home" ]]; then
+        local home_key
+        home_key="$(python3 -c 'import hashlib, sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:10])' "$HERMES_HOME")"
+        unit_name="agent-graph-mcpd-$home_key.service"
+    fi
+    local unit_path="$unit_dir/$unit_name"
     local env_file="$HERMES_HOME/agent-graph.env"
     if [[ ! -f "$env_file" ]]; then
         printf '%s\n' \
@@ -396,10 +422,14 @@ install_agent_graph_unit() {
         chmod 600 "$env_file"
     fi
 
-    cat > "$unit_dir/agent-graph-mcpd.service" << UNITEOF
+    _AG_UNIT_NAME="$unit_name"
+    if [[ -f "$unit_path" ]]; then
+        log "keeping the existing $unit_name (edit it for your provider/model settings)"
+    else
+        cat > "$unit_path" << UNITEOF
 # Written by the Ares installer (install.sh). Adjust the provider base URL
 # and model below to match your environment, then:
-#   systemctl --user daemon-reload && systemctl --user restart agent-graph-mcpd
+#   systemctl --user daemon-reload && systemctl --user restart $unit_name
 [Unit]
 Description=Agent Graph MCP daemon
 After=network-online.target
@@ -420,14 +450,15 @@ EnvironmentFile=-$env_file
 [Install]
 WantedBy=default.target
 UNITEOF
+    fi
 
     if systemctl --user daemon-reload 2>/dev/null \
-        && systemctl --user enable agent-graph-mcpd.service 2>/dev/null; then
+        && systemctl --user enable "$unit_name" 2>/dev/null; then
         log "agent-graph daemon unit enabled (starts on next login)"
     else
-        warn "could not enable agent-graph-mcpd.service (no systemd user bus?)"
+        warn "could not enable $unit_name (no systemd user bus?)"
     fi
-    log "set an API key in $env_file, then: systemctl --user start agent-graph-mcpd"
+    log "set an API key in $env_file, then: systemctl --user start $unit_name"
 }
 
 # ── Skills and hooks packs ───────────────────────────────────────────────────
@@ -454,7 +485,7 @@ install_packs() {
         mkdir -p "$HERMES_HOME/agent-hooks"
         if curl -fsSL --retry 2 --max-time 600 "$RELEASE_BASE/$HOOKS_PACK_ASSET" \
             | tar -xz -C "$HERMES_HOME/agent-hooks"; then
-            log "  hooks pack installed (hooks auto-discover; review before use)"
+            log "  hooks pack extracted to $HERMES_HOME/agent-hooks (hook registration and allowlisting remain explicit operator steps; review the pack's INTEGRATIONS.md before use)"
         else
             warn "hooks pack download or extraction failed (the agent still works without it)"
         fi
@@ -510,6 +541,18 @@ install_recursive_agent_plugin() {
     fi
 }
 
+refresh_gateway() {
+    # The gateway discovers MCP servers and plugins at process startup; one
+    # that was started during `ares setup` would otherwise miss every
+    # integration provisioned afterwards. Restart it when it is running.
+    [[ "$INSTALL_GATEWAY" == true ]] || return 0
+    if systemctl --user is-active --quiet ares-gateway.service 2>/dev/null; then
+        log "restarting ares-gateway.service so it discovers the newly installed MCP servers and plugin"
+        systemctl --user restart ares-gateway.service 2>/dev/null \
+            || warn "could not restart ares-gateway.service; restart it manually"
+    fi
+}
+
 print_summary() {
     echo
     log "Ares installed"
@@ -519,8 +562,8 @@ print_summary() {
     echo "  ares chat | ares tui | ares desktop   # start the agent (fresh session for new tools)"
     echo "  ares doctor                           # verify the selected runtime"
     echo "  ares auth                             # configure model provider credentials"
-    if [[ "$INSTALL_AGENT_GRAPH" == true && -f "$HERMES_HOME/agent-graph.env" ]]; then
-        echo "  edit $HERMES_HOME/agent-graph.env and 'systemctl --user start agent-graph-mcpd' for multi-agent graphs"
+    if [[ -n "$_AG_UNIT_NAME" ]]; then
+        echo "  edit $HERMES_HOME/agent-graph.env and 'systemctl --user start $_AG_UNIT_NAME' for multi-agent graphs"
     fi
 }
 
@@ -535,6 +578,7 @@ main() {
     install_mcp_servers
     install_packs
     install_recursive_agent_plugin
+    refresh_gateway
     print_summary
 }
 

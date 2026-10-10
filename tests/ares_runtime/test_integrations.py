@@ -151,6 +151,53 @@ def test_invalid_existing_config_fails_without_writing(tmp_path: Path) -> None:
     assert config_path.read_bytes() == before
 
 
+def test_keeps_builtin_memory_when_semantic_entry_disabled(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "mcp_servers": {
+                    "semantic_memory": {
+                        "command": "/custom/semantic-memory-mcp",
+                        "enabled": False,
+                        "args": ["--memory-dir", "/custom/store"],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = apply_plan(home, load_plan(_plan_file(tmp_path, _sample_plan())))
+
+    config = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
+    # A preserved, disabled replacement must not turn off the working built-in
+    # memory tools.
+    assert "memory" not in (config.get("agent", {}).get("disabled_toolsets") or [])
+    assert config["mcp_servers"]["semantic_memory"]["enabled"] is False
+    assert any("kept enabled" in line for line in report)
+
+
+def test_symlinked_config_is_preserved(tmp_path: Path) -> None:
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    real = shared / "config.yaml"
+    real.write_text(
+        yaml.safe_dump({"provider": {"model": "shared-choice"}}), encoding="utf-8"
+    )
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.yaml").symlink_to(real)
+
+    apply_plan(home, load_plan(_plan_file(tmp_path, _sample_plan())))
+
+    assert (home / "config.yaml").is_symlink()
+    updated = yaml.safe_load(real.read_text(encoding="utf-8"))
+    assert updated["provider"] == {"model": "shared-choice"}
+    assert updated["mcp_servers"]["semantic_memory"]["enabled"] is True
+
+
 def test_cli_register_mcp_round_trip(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     home = tmp_path / "home"
     plan = _plan_file(tmp_path, _sample_plan())
