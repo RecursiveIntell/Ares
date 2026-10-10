@@ -2,7 +2,7 @@
   <img src="docs/ares-workbench.svg" width="100%" alt="Ares architecture: an isolated Hermes-compatible runtime feeds explicit plugins, MCP services, and an evidence boundary with optional governed integrations.">
 </p>
 
-<!-- README source review: 2026-09-30; installer-defaults revision 2026-10-10; installed/runtime proof remains separately scoped -->
+<!-- README source review: 2026-09-30; installer-consolidation revision 2026-10-10; installed/runtime proof remains separately scoped -->
 
 # Ares
 
@@ -30,7 +30,7 @@ Ares keeps Hermes’s normal conversation, model routing, tools, plugins, skills
 | Runtime lifecycle | Hermes can be installed and updated through its normal flows | Ares materializes releases, switches them atomically, keeps current/previous pointers, and supports `doctor`, `status`, and rollback. |
 | Release custody | Hermes update behavior remains available inside the selected runtime | Ares-owned candidate custody binds release artifacts, identities, inventories, lifecycle events, authorization, and rollback state. See [`docs/ares-candidate-custody.md`](docs/ares-candidate-custody.md). |
 | Governed execution | Hermes approvals and toolsets remain the normal agent boundary | The Recursive Agent plugin payload is installed by default; when its operator-managed daemon is running, the plugin submits one bounded operation through local authenticated IPC and returns daemon-derived verification facts. |
-| RecursiveIntell integrations | Normal Hermes providers, MCP, plugins, and skills remain available | The installer installs and registers the default service set (Semantic Memory, Agent Graph, Claim Ledger, CEA Graph, Pilot Bridge) and adds the skills and hooks packs; each default-on piece can be skipped with an installer opt-out. Optional transports and native extensions stay capability-gated: `llm-pipeline`, `context-governor`, `agent-graph`, `poly-kv`. Source presence is not activation. |
+| RecursiveIntell integrations | Normal Hermes providers, MCP, plugins, and skills remain available | The installer builds the Rust tools and native wheels from source, bundles them into each sealed release, and registers the default MCP set (Semantic Memory, Agent Graph, ClaimLedger, Context Governor); CEA and Pilot Bridge install as CLIs. `--minimal` skips the enhancement set. Source presence is not activation. |
 | Documentation | Hermes-compatible reference material remains useful | Ares documents which surfaces are fork-owned, inherited, optional, verified, or still unverified. |
 
 ### The core distinction
@@ -63,7 +63,7 @@ This is the compact Ares-versus-Hermes map. “Inherited” means the surface co
 | Candidate custody | Ares-owned and separately persisted | No claim that upstream Hermes provides this Ares custody layer | [`docs/ares-candidate-custody.md`](docs/ares-candidate-custody.md) |
 | Recursive Agent execution | Payload installed by default; execution gated | Separate plugin and daemon; the daemon remains operator-managed | [`docs/ares-recursive-agent.md`](docs/ares-recursive-agent.md) |
 | Rust-backed RecursiveIntell transports | Gated and environment-dependent | Not part of the normal Hermes compatibility guarantee | [Transport boundaries](#recursiveintell-integrations) |
-| Semantic Memory, Agent Graph, Claim Ledger, CEA Graph, Pilot Bridge | Installed and registered by default; still separate services | Separate services/projects with installer opt-outs | [Integration boundaries](#integration-boundaries) |
+| Semantic Memory, Agent Graph, Claim Ledger, CEA Graph, Pilot Bridge | Installed by default; still separate services | Separate services/projects; `--minimal` opts out of the enhancement set | [Integration boundaries](#integration-boundaries) |
 
 Ares does **not** claim that every installed service is reachable or exercised, that every native extension is active, or that every provider/platform combination has been tested on every host.
 
@@ -72,7 +72,7 @@ Ares does **not** claim that every installed service is reachable or exercised, 
 ### Prerequisites
 
 - Git
-- [uv](https://docs.astral.sh/uv/) — the bootstrap installs uv automatically when it is missing (skip with `--no-venv` and an active Python environment)
+- [uv](https://docs.astral.sh/uv/) — the installer installs uv automatically when it is missing (skip with `--no-venv` and an active Python environment)
 - Python **3.11–3.14** is admitted by the current project metadata (`>=3.11,<3.15`). The inherited POSIX installer provisions 3.11 by default; the committed Desktop resolver explicitly probes 3.11–3.14. Resolver support is a source-level admission decision, not proof that every native extension or installation path works on each Python minor and operating system.
 - A model provider configured through the normal Hermes setup flow
 
@@ -80,10 +80,13 @@ Ares does **not** claim that every installed service is reachable or exercised, 
 
 ### Install from the Ares fork
 
-The bootstrap installs the full default set — stable runtime and `ares`
-launcher, Desktop, the gateway service, the Recursive Agent plugin payload,
-five MCP servers, and the skills and hooks packs. Review the source and the
-installer contract (`bash install.sh --help`) before executing it, then run:
+The installer provisions the full Ares distribution — managed Python and Rust
+toolchains, the stable runtime and `ares` launcher, Desktop and voice, Context
+Governor, the semantic-memory / Agent Graph / ClaimLedger / Context Governor
+MCP servers, CEA and Pilot Bridge CLIs, the memory kit, the Recursive Agent
+plugin payload, and the local provider wizard. Review the source and the
+installer contract (`bash install.sh --help` or `--plan`) before executing it,
+then run:
 
 ```bash
 git clone https://github.com/RecursiveIntell/Ares.git Ares
@@ -91,15 +94,16 @@ cd Ares
 bash install.sh
 ```
 
-Every default-on piece has an opt-out flag; the per-piece flags are
-`--no-desktop`, `--no-gateway`, `--no-mcp`, `--no-semantic-memory`,
-`--no-agent-graph`, `--no-claim-ledger`, `--no-cea-graph`,
-`--no-pilot-bridge`, `--no-skills`, `--no-hooks`, and `--no-recursive-agent`.
-For example:
+System package installation may request sudo; native builds and Desktop
+downloads can take tens of minutes on a fresh machine; the provider wizard
+needs an interactive terminal. Every default-on group has an opt-out:
+`--no-desktop`, `--no-gateway`, `--minimal` (skip the enhancement builds and
+memory kit), `--no-recursive-agent`, `--skip-setup` (defer provider sign-in),
+and `--no-path` (leave shell startup files untouched):
 
 ```bash
-bash install.sh --no-desktop --no-gateway          # CLI-only: no Desktop build or gateway service
-bash install.sh --no-mcp --no-skills --no-hooks    # runtime + Desktop/gateway/plugin only
+bash install.sh --no-desktop --no-gateway --skip-setup   # unattended CLI install
+bash install.sh --minimal --no-recursive-agent           # fresh minimal home
 ```
 
 For a minimal, fully manual path that skips the default service set:
@@ -129,7 +133,7 @@ ares status
 ares doctor
 ```
 
-The expected first-success signal is a selected Ares revision followed by `PASS` checks from `ares doctor`. Doctor checks selected-runtime imports and SQLite, the configured strict governor, managed-process coherence, and enabled MCP readiness. Its MCP probe can start configured subprocess servers or contact configured endpoints, so review those server commands and destinations before running it. Provider credentials are still your responsibility; setup does not create credentials or silently authorize external services. The manual command above intentionally omits Desktop and the gateway so the CLI path can be validated without a desktop build or systemd user service; `bash install.sh` installs both by default.
+The expected first-success signal is a selected Ares revision followed by `PASS` checks from `ares doctor`. Doctor checks selected-runtime imports and SQLite, the configured strict governor, managed-process coherence, and enabled MCP readiness. Its MCP probe can start configured subprocess servers or contact configured endpoints, so review those server commands and destinations before running it. Provider credentials are still your responsibility; setup does not create credentials or silently authorize external services. The manual command above intentionally omits Desktop and the gateway so the CLI path can be validated without a desktop build or systemd user service; `bash install.sh` installs both by default and finishes by running `ares doctor` itself, refusing to claim completion when a required health check fails and writing an install record to `~/.ares/install-receipts/latest.json`.
 
 ### Choose the Ares runtime surface
 
@@ -140,7 +144,7 @@ ares desktop              # Launch the selected Desktop build, if installed
 ares gateway status       # Inspect the Ares gateway service
 ```
 
-The bootstrap installs Desktop and the gateway by default; on a CLI-only or
+The installer installs Desktop and the gateway by default; on a CLI-only or
 headless host, keep the two opt-outs. A manual CLI-only setup can add them
 later by repeating setup without the opt-outs:
 
@@ -207,7 +211,7 @@ ares doctor
 ares rollback
 ```
 
-`ares update` stages a configured Hermes upstream revision, applies the Ares downstream state, builds the candidate, and switches only after the candidate succeeds. If the build or activation path fails, the active release is intended to remain selected. `ares rollback` returns to the previous stable release when one exists.
+`ares update` stages a configured Hermes upstream revision, applies the Ares downstream state, builds the candidate, and switches only after the candidate succeeds. If the build or activation path fails, the active release is intended to remain selected. `ares rollback` returns to the previous stable release when one exists. Rolling back across a release boundary that predates a full installation (for example, a base release that this installer has upgraded) leaves the enhanced configuration pointing at tooling the older release does not bundle; the install receipt records this (`rollback_previous_has_bundled_tools`), and rolling forward again or rerunning the installer recovers.
 
 Ordinary `ares setup` and `ares update` refuse an unqualified selected release.
 For a verified legacy release without `runtime_binding`, follow the
@@ -354,7 +358,7 @@ The repository includes optional transport modules for `llm-pipeline`, `context-
 4. exercise a real request in the target environment;
 5. retain the returned evidence before making a capability claim.
 
-The presence of source modules, a config key, or a registered MCP server does not establish any of those steps. The bootstrap installs the five MCP service binaries and registers them in the Ares home by default (opt out per service); installation and registration are not reachability, and a registered server still needs a live backend and a fresh session before a tool can be exposed.
+The presence of source modules, a config key, or a registered MCP server does not establish any of those steps. The installer builds the Rust tools and native wheels from source, bundles them into each sealed release before activation, and registers the default MCP set through the Hermes config API; installation and registration are not reachability, and a registered server still needs a live backend and a fresh session before a tool can be exposed.
 
 The current transport adapters are optional and capability-gated. Some become
 active by default when their native extension is present, and each exposes an
@@ -380,9 +384,9 @@ Choose the engine through the existing configuration workflow, then validate the
 
 ### Recursive Agent plugin
 
-The Recursive Agent integration is a standalone plugin, not a bundled core tool. The bootstrap installs the plugin payload by default and auto-provisions a `RecursiveIntell/recursive-agent` checkout under `<hermes-home>/recursive-agent-src`; skip it with `--no-recursive-agent`.
+The Recursive Agent integration is a standalone plugin, not a bundled core tool. The installer installs the plugin payload by default and auto-provisions a `RecursiveIntell/recursive-agent` checkout under `<hermes-home>/recursive-agent-src`; skip it with `--no-recursive-agent`.
 
-To install from an existing checkout instead, point the bootstrap at it:
+To install from an existing checkout instead, point the installer at it:
 
 ```bash
 bash install.sh --with-recursive-agent-source /path/to/recursive-agent
@@ -400,33 +404,27 @@ Keep these boundaries explicit:
 
 - provider secrets belong in the supported local secret mechanism, never in this repository or shell history;
 - MCP server mappings and argument lists are typed YAML, not ad-hoc strings;
-- plugins and hooks run with agent-process authority; the installer installs the default payloads, and each can be skipped (`--no-hooks`, `--no-recursive-agent`, ...) or removed — review them before exercising their authority;
+- plugins and hooks run with agent-process authority; the installer installs the default payloads, and each can be skipped (`--no-recursive-agent`, `--minimal`, ...) or removed — review them before exercising their authority;
 - restart or start a fresh session after changing plugin, toolset, MCP, or credential configuration because tool schemas are session-scoped;
 - prove a capability at the correct layer: selected, registered, exposed, then exercised.
 
-The bootstrap installer accepts:
+The installer accepts (`bash install.sh --help` is authoritative):
 
 | Installer option | Effect |
 |---|---|
-| `--branch NAME` | Clone or update a specific branch. |
-| `--dir PATH` | Select the source checkout directory. |
-| `--hermes-home PATH` | Select the Ares data directory. |
-| `--ares-bin-dir PATH` | Select where the `ares` launcher is written. |
-| `--no-venv` | Use the active Python environment instead of a managed virtual environment. |
-| `--no-desktop` | Skip the Desktop build for a CLI-only or disposable installation. |
-| `--no-gateway` | Do not install, enable, or start the user-level Ares gateway service. |
-| `--no-mcp` | Skip all five MCP servers. |
-| `--no-semantic-memory` | Skip the semantic-memory MCP server (and the built-in-memory replacement pairing). |
-| `--no-agent-graph` | Skip the agent-graph MCP server and daemon provisioning. |
-| `--no-claim-ledger` | Skip the claim-ledger MCP server. |
-| `--no-cea-graph` | Skip the cea-graph MCP server. |
-| `--no-pilot-bridge` | Skip the pilot-bridge MCP server. |
-| `--no-skills` | Skip the skills pack. |
-| `--no-hooks` | Skip the agent hooks pack. |
+| `--home PATH` | Select the Ares data home (default `~/.ares`). |
+| `--bin-dir PATH` | Select where the `ares` launcher is written (default `~/.local/bin`). |
+| `--branch NAME` | Install from a specific Ares source branch. |
+| `--no-desktop` | CLI installation without Desktop/voice downloads. |
+| `--no-gateway` | Do not install or start the background gateway. |
+| `--minimal` | Skip the RecursiveIntell enhancement builds and memory kit; requires a fresh/minimal home. |
+| `--skip-setup` | Leave provider sign-in for later (unattended install); the gateway is still installed and started when a Linux user systemd session is available. |
+| `--no-path` | Do not update shell startup files. |
 | `--no-recursive-agent` | Skip the Recursive Agent plugin payload. |
 | `--with-recursive-agent-source PATH` | Install the plugin payload from an existing RecursiveIntell/recursive-agent checkout instead of the auto-provisioned one. The daemon remains operator-managed. |
+| `--plan` | Print the resolved install plan without changing anything. |
 
-Run `bash install.sh --help` for the authoritative installer contract. Structured configuration edits (MCP server registration and the built-in-memory pairing) are performed by `ares_runtime.integrations` as a typed YAML merge: existing operator-customized entries are preserved and reported, not overwritten. The bootstrap refuses to update a dirty existing checkout and refuses to overwrite a non-Ares launcher.
+Run `bash install.sh --help` for the authoritative installer contract; the canonical file is this repository's `install.sh`, mirrored byte-identically to `recursiveintell-web/public/ares/install.sh`. The installer refuses to overwrite unowned checkouts or launchers, seals each release before activation, and stops without claiming completion when a required component or health check fails.
 
 ### Inherited installer and runtime remediation behavior
 
@@ -444,18 +442,20 @@ The current project admission range is `>=3.11,<3.15` (Python 3.11 through
 native extension, Desktop build, or optional service works on every minor and
 every operating system.
 
-**Installer proof boundary:** the managed bootstrap invokes
-`.venv/bin/python -m ares_runtime.local_runtime`; it does not depend on an
-undeclared `ares` console script. A hermetic subprocess regression exercises
-managed and active-environment setup, option/environment forwarding, and
-fail-closed dependency-install errors. Git, dependency installation and the
-setup implementation are fixture boundaries in that test, so it is not a full
-installation or installed-runtime acceptance test. Shell syntax and help are
-checked separately. Service downloads and registration are best-effort by
-design — a failed download is reported and skipped, never a silent success —
-and the registration merge is covered by focused behavior tests against
-temporary homes. The manual module-based [Quick start](#quick-start) remains
-available.
+**Installer proof boundary:** the managed installer drives
+`ares_runtime.local_runtime` directly (it never depends on an undeclared
+`ares` console script), builds and seals an inactive release before
+activation, verifies the result with `ares doctor` and an install receipt,
+and stops without claiming completion when a required component or health
+check fails. The hermetic contract battery
+(`tests/test_ares_installer_contract.py`, run by the canonical test entry
+point) checks syntax, the help contract, `--plan` defaults/opt-outs with a
+no-writes guarantee, argument validation, and the pre-provisioning guard; the
+`recursiveintell-web` installer regression suite (`npm run test:installer`)
+exercises the identical mirrored bytes. This documentation does not
+establish that every source/native build, Desktop download, or provider flow
+succeeds on every host. The manual module-based
+[Quick start](#quick-start) remains available.
 
 ## Security and trust boundaries
 
@@ -521,10 +521,9 @@ experimental/runtime-gated controls; they are not a security certification.
 
 | Path | Role |
 |---|---|
-| `install.sh` | Ares installer: runtime-module setup, stable launcher, Desktop, gateway, five MCP servers, skills/hooks packs, and the Recursive Agent plugin payload — each default-on piece with an opt-out flag. |
+| `install.sh` | Canonical Ares full installer: managed toolchains, stable runtime, Desktop/gateway, Rust tools and native wheels, memory kit, Recursive Agent plugin payload, and provider wizard, with opt-outs and `--plan`. Mirrored byte-identically to `recursiveintell-web/public/ares/install.sh`. |
 | `scripts/install.sh`, `scripts/install.ps1` | Inherited Hermes installers and dependency/bootstrap surfaces; they are not the Ares stable-runtime launcher. |
 | `ares_runtime/` | Stable runtime selection, materialization, activation, rollback, gateway handoff, and launcher implementation. |
-| `ares_runtime/integrations.py` | Typed YAML registration of the default MCP service set into the Ares home configuration. |
 | `agent/transports/ri_*.py` | Optional RecursiveIntell transport integrations. |
 | `docs/ares-candidate-custody.md` | Candidate custody, lifecycle, audit, authorization, and garbage-collection contract. |
 | `docs/ares-recursive-agent.md` | Recursive Agent boundary and operator guide. |
@@ -546,10 +545,10 @@ Useful bounded checks from this checkout:
 ```bash
 bash -n install.sh
 bash install.sh --help
+bash install.sh --plan
 bash -n scripts/install.sh
 bash scripts/install.sh --help
 scripts/run_tests.sh tests/test_ares_distribution.py -q
-scripts/run_tests.sh tests/ares_runtime/test_integrations.py -q
 scripts/run_tests.sh tests/test_ares_collaboration.py -q
 ```
 
@@ -585,9 +584,9 @@ Where a page names upstream URLs or support channels, treat those as Hermes refe
 
 ## Status and claim boundary
 
-**README source review: 2026-09-30, committed `main` snapshot `56d296c70d9fe7f1cf1e978c730b3122a57de44e` (bootstrap invocation repair); installer-defaults revision pending publication.** The installer, options-table, and registration descriptions were reconciled against the current `install.sh`, `ares_runtime.integrations`, and the distribution contract tests; asset URLs were resolved against the published releases. Root installer syntax/help, the typed-registration behavior tests, and an isolated sandbox run of the service-installation phase were exercised in the working tree.
+**README source review: 2026-09-30, committed `main` snapshot `56d296c70d9fe7f1cf1e978c730b3122a57de44e`; installer-consolidation revision 2026-10-10.** The installer sections were reconciled against the consolidated canonical `install.sh` and the distribution contract tests; the mirrored website bytes are exercised by the `recursiveintell-web` installer regression suite (18/18 in the working tree). Shell syntax, `--help`, and `--plan` output were checked; source/native builds were not.
 
-That working-tree verification did not run a full installation, select an installed release, contact configured MCP servers, or execute live compaction. Service downloads are best-effort and platform-gated. Do not treat documentation publication or unmerged branch descriptions as passing runtime evidence.
+That working-tree verification did not run a full installation, select an installed release, contact configured MCP servers, or execute live compaction. Source/native builds, Desktop downloads, and provider flows remain host-dependent. Do not treat documentation publication or unmerged branch descriptions as passing runtime evidence.
 
 This revision does **not** establish cross-platform support, public packaging of the Recursive Agent daemon, reachability of any installed service, production readiness, security certification, performance superiority, or universal provider/platform support. Treat those as separate verification projects.
 

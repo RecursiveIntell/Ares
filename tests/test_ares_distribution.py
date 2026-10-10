@@ -35,55 +35,38 @@ def test_website_front_door_carries_ares_identity() -> None:
     assert "Hermes-compatible" in index
 
 
-def test_ares_installer_defaults_to_the_full_set_with_opt_outs() -> None:
+def test_ares_installer_is_the_canonical_full_installer_with_opt_outs() -> None:
     installer = (REPO_ROOT / "install.sh").read_text(encoding="utf-8")
 
-    assert "Ares Installer" in installer
+    assert "Ares full installer" in installer
 
-    # Every default-on piece exposes an opt-out flag.
+    # Every default-on piece group exposes an opt-out flag.
     for flag in (
         "--no-desktop",
         "--no-gateway",
-        "--no-mcp",
-        "--no-semantic-memory",
-        "--no-agent-graph",
-        "--no-claim-ledger",
-        "--no-cea-graph",
-        "--no-pilot-bridge",
-        "--no-skills",
-        "--no-hooks",
+        "--minimal",
+        "--skip-setup",
+        "--no-path",
+        "--plan",
         "--no-recursive-agent",
+        "--with-recursive-agent-source PATH",
     ):
         assert flag in installer, flag
+    assert "RECURSIVE_AGENT=false" in installer
 
-    for name in (
-        "INSTALL_DESKTOP",
-        "INSTALL_GATEWAY",
-        "INSTALL_SEMANTIC_MEMORY",
-        "INSTALL_AGENT_GRAPH",
-        "INSTALL_CLAIM_LEDGER",
-        "INSTALL_CEA_GRAPH",
-        "INSTALL_PILOT_BRIDGE",
-        "INSTALL_SKILLS",
-        "INSTALL_HOOKS",
-        "INSTALL_RECURSIVE_AGENT",
-    ):
-        assert f"{name}=true" in installer, name
-        assert f"{name}=false" in installer, name
+    # Fail-closed and ownership guardrails remain part of the contract.
+    assert "No complete-install claim was made." in installer
+    assert "Refusing to overwrite local changes" in installer
+    assert "Cannot switch a full Ares home to --minimal" in installer
+    assert "refusing a partial native installation" in installer
 
-    assert "setup_args+=(--no-gateway)" in installer
+    # The website copy is a byte-identical mirror of this canonical file.
+    assert "byte-identical mirror" in installer
 
-    # The Recursive Agent daemon boundary is preserved.
-    assert "--with-recursive-agent-source PATH" in installer
-    assert (
-        "Recursive Agent daemon is not installed or started by this option" in installer
-    )
-
-    # Structured configuration stays out of the shell installer; typed edits
-    # are owned by ares_runtime.integrations.
-    assert "config set" not in installer
+    # Structured configuration edits happen through the Hermes config API in
+    # the embedded programs, never through shell-level string coercion.
+    assert "hermes config set" not in installer
     assert "yaml.safe_dump" not in installer
-    assert "ares_runtime.integrations" in installer
 
 
 def test_ares_docs_are_deployed_by_the_downstream_workflow() -> None:

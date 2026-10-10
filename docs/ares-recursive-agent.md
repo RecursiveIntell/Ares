@@ -17,20 +17,20 @@ The plugin makes one bounded native request. It does not expose a general remote
 
 ## Preconditions
 
-The bootstrap installs the plugin **payload** by default. Before **exercising**
+The installer installs the plugin **payload** by default. Before **exercising**
 the integration, independently establish all of these conditions:
 
-1. You have a local checkout of `RecursiveIntell/recursive-agent` (the bootstrap auto-provisions one under `<hermes-home>/recursive-agent-src` unless `--no-recursive-agent` skipped it or an explicit source was passed).
+1. You have a local checkout of `RecursiveIntell/recursive-agent` (the installer auto-provisions one under `<hermes-home>/recursive-agent-src` unless `--no-recursive-agent` skipped it or an explicit source was passed).
 2. Its own build, policy, and daemon lifecycle gates have passed.
 3. The daemon is running on its private local Unix-domain socket.
 4. You have reviewed the plugin source and accept agent-process plugin authority.
 5. You are using the intended Ares/Hermes home and have no existing plugin directory at `plugins/recursive-agent-native` unless you deliberately removed it.
 
-The Ares bootstrap installs the plugin payload but does not satisfy conditions 2 or 3.
+The Ares installer installs the plugin payload but does not satisfy conditions 2 or 3.
 
 ## Install the plugin
 
-The bootstrap installs the plugin payload by default; skip it with
+The installer installs the plugin payload by default; skip it with
 `--no-recursive-agent`. To install from an existing checkout explicitly:
 
 ```bash
