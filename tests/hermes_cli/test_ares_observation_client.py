@@ -183,6 +183,59 @@ def test_scenario_frame_encoding():
     _run_checked(t_frame_encoding)
 
 
+
+
+# --- RP-02 F06: timing whitelist (unknown contract keys dropped + counted) ---
+def t_timing_whitelist():
+    c = AresObservationClient.__new__(AresObservationClient)
+    import threading as _t
+    c.producer_id, c.source_crate, c.adapter_id = "pt", "sc", "ad"
+    c._seq, c._seq_lock = 0, _t.Lock()
+    c._stats_lock = _t.Lock(); c.timing_keys_filtered = 0
+    env = c._build_envelope("tool", "started", {},
+                            None,
+                            {"duration_ms": 5, "prompt_body": "SHOULD-NOT-CROSS",
+                             "not_a_contract_key": 1},
+                            "canonical")
+    check("timing keeps contract keys", env["timing"] == {"duration_ms": 5},
+          str(env["timing"]))
+    check("timing drops unknown keys", "SHOULD-NOT-CROSS" not in json.dumps(env))
+    check("timing filter counted", c.timing_keys_filtered == 2,
+          str(c.timing_keys_filtered))
+
+
+# --- RP-02 F02/F05: concurrency identity under N threads (dead socket) ---
+def t_concurrent_identity():
+    import threading as _t
+    c = AresObservationClient("/tmp/definitely-no-collector.sock",
+                              producer_id="conc", local_queue_cap=4)
+    errors = []
+    def worker():
+        try:
+            for i in range(40):
+                c.emit("health", "health", {"i": i})
+        except Exception as ex:  # noqa: BLE001
+            errors.append(repr(ex))
+    threads = [_t.Thread(target=worker) for _ in range(6)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    st = c.stats()
+    check("no worker exceptions", not errors, str(errors[:2]))
+    check("concurrent accounting identity exact",
+          st["attempted"] == st["accepted"] + st["rejected"] + st["dropped"],
+          json.dumps(st))
+    check("concurrent attempts counted", st["attempted"] == 240, json.dumps(st))
+    c.close()
+
+
+def test_scenario_timing_whitelist():
+    _run_checked(t_timing_whitelist)
+
+
+def test_scenario_concurrent_identity():
+    _run_checked(t_concurrent_identity)
+
+
 if __name__ == "__main__":
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
