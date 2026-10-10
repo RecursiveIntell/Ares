@@ -447,7 +447,10 @@ every operating system.
 `ares` console script), builds and seals an inactive release before
 activation, verifies the result with `ares doctor` and an install receipt,
 and stops without claiming completion when a required component or health
-check fails. Shell syntax, help, and plan output are checked here; the
+check fails. The hermetic contract battery
+(`tests/test_ares_installer_contract.py`, run by the canonical test entry
+point) checks syntax, the help contract, `--plan` defaults/opt-outs with a
+no-writes guarantee, argument validation, and the pre-provisioning guard; the
 `recursiveintell-web` installer regression suite (`npm run test:installer`)
 exercises the identical mirrored bytes. This documentation does not
 establish that every source/native build, Desktop download, or provider flow
