@@ -133,7 +133,7 @@ The launcher is defined in [`ares_runtime/local_runtime.py`](ares_runtime/local_
 
 | Command | Purpose | Important options |
 |---|---|---|
-| `ares setup` | Build and select a stable runtime from a Git checkout | `--source PATH`, `--seed-from PATH`, `--no-desktop`, `--no-gateway`, `--upstream-remote URL`, `--upstream-branch NAME` |
+| `ares setup` | Build and select a stable runtime from a Git checkout | `--source PATH`, `--seed-from PATH`, `--no-desktop`, `--no-gateway`, `--upstream-remote URL`, `--upstream-branch NAME`, `--transition-from-legacy EXACT_CURRENT_SHA` |
 | `ares update` | Build and atomically select the configured remote candidate | `--no-desktop` |
 | `ares rollback` | Return to the previous stable runtime | None |
 | `ares doctor` | Check runtime pointers, imports, configuration, native integrations, and gateway state | None |
@@ -187,6 +187,14 @@ ares rollback
 ```
 
 `ares update` stages a configured Hermes upstream revision, applies the Ares downstream state, builds the candidate, and switches only after the candidate succeeds. If the build or activation path fails, the active release is intended to remain selected. `ares rollback` returns to the previous stable release when one exists.
+
+Ordinary `ares setup` and `ares update` refuse an unqualified selected release.
+For a verified legacy release without `runtime_binding`, follow the
+[source-bound transition runbook](docs/operations/legacy-controller-transition.md):
+use the new controller's `setup --transition-from-legacy EXACT_CURRENT_SHA`
+with the full 40-character selected revision. The installed old `ares` launcher
+cannot emit the new binding contract. Preserve existing release bytes; this
+option does not repair a contract-1 release with missing or invalid bindings.
 
 The source-backed custody details are deliberately kept out of this quick-start block. Read [`docs/ares-candidate-custody.md`](docs/ares-candidate-custody.md) before treating candidate certification, audit state, or rollback state as an authority decision: certification and candidate-bundled activation input are explicitly non-authorizing until the CandidateStore-owned activation transition occurs.
 
