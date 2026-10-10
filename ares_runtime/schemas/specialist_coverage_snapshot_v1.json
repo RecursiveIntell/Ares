@@ -1,0 +1,926 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://recursiveintell.local/schemas/ares-specialist/specialistcoveragesnapshotv1.json",
+  "title": "SpecialistCoverageSnapshotV1",
+  "description": "A source-scoped snapshot that preserves inventories and per-profile facts separately; it does not define a universal active roster.",
+  "type": "object",
+  "additionalProperties": false,
+  "x-canonical-owner": "Ares specialist routing artifact contracts; inert versioned data",
+  "x-maxContractBytes": 262144,
+  "x-maxJsonDepth": 16,
+  "x-maxArrayItems": 128,
+  "x-maxSourceBytes": 67108864,
+  "x-canonicalEncoding": "ares_runtime.collaboration.canonical_json: sorted keys, compact separators, ASCII escaping, allow_nan=false, terminal LF; this is not an RFC 8785/JCS claim",
+  "x-envelopeDigestRule": "sha256 over all envelope fields except only its own digest field",
+  "x-inputDigestRule": "byte_digest binds exact source bytes separately from the envelope digest",
+  "required": [
+    "schema_version",
+    "snapshot_id",
+    "source_revision",
+    "cutoff",
+    "declared_scope",
+    "sources",
+    "roster_manifest",
+    "roster_identity_digest",
+    "snapshot_digest"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0.0"
+    },
+    "snapshot_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 65536,
+      "x-maxUtf8Bytes": 65536
+    },
+    "source_revision": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 65536,
+      "x-maxUtf8Bytes": 65536
+    },
+    "cutoff": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 65536,
+      "x-maxUtf8Bytes": 65536
+    },
+    "declared_scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scope_ref",
+        "description",
+        "source_refs",
+        "completeness",
+        "gaps",
+        "source_profile_applicability"
+      ],
+      "properties": {
+        "scope_ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9._:/@#-]+(?![\\s\\S])",
+          "x-maxUtf8Bytes": 256
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 65536,
+          "x-maxUtf8Bytes": 65536
+        },
+        "source_refs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "pattern": "^[A-Za-z0-9._:/@#-]+(?![\\s\\S])",
+            "x-maxUtf8Bytes": 256
+          },
+          "minItems": 1,
+          "maxItems": 128,
+          "uniqueItems": true
+        },
+        "completeness": {
+          "type": "string",
+          "enum": [
+            "complete_within_declared_sources",
+            "incomplete",
+            "stale_or_concurrent_drift",
+            "unknown"
+          ]
+        },
+        "gaps": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 65536,
+            "x-maxUtf8Bytes": 65536
+          },
+          "minItems": 0,
+          "maxItems": 128,
+          "uniqueItems": true
+        },
+        "source_profile_applicability": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "profile_id",
+              "source_ref",
+              "applicability",
+              "file_ref",
+              "basis",
+              "basis_refs"
+            ],
+            "properties": {
+              "profile_id": {
+                "type": "string",
+                "pattern": "^[a-z0-9][a-z0-9_-]{0,63}(?![\\s\\S])",
+                "maxLength": 64,
+                "x-maxUtf8Bytes": 64
+              },
+              "source_ref": {
+                "$ref": "#/$defs/ref"
+              },
+              "applicability": {
+                "type": "string",
+                "enum": [
+                  "required",
+                  "not_applicable",
+                  "unresolved"
+                ]
+              },
+              "file_ref": {
+                "oneOf": [
+                  {
+                    "$ref": "#/$defs/ref"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "basis": {
+                "$ref": "#/$defs/text"
+              },
+              "basis_refs": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/ref"
+                },
+                "minItems": 1,
+                "maxItems": 128,
+                "uniqueItems": true
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "applicability": {
+                      "const": "required"
+                    }
+                  },
+                  "required": [
+                    "applicability"
+                  ]
+                },
+                "then": {
+                  "properties": {
+                    "file_ref": {
+                      "$ref": "#/$defs/ref"
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "applicability": {
+                      "enum": [
+                        "not_applicable",
+                        "unresolved"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "applicability"
+                  ]
+                },
+                "then": {
+                  "properties": {
+                    "file_ref": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          "minItems": 0,
+          "maxItems": 128,
+          "uniqueItems": true
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "completeness": {
+                "const": "complete_within_declared_sources"
+              }
+            },
+            "required": [
+              "completeness"
+            ]
+          },
+          "then": {
+            "properties": {
+              "gaps": {
+                "maxItems": 0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "completeness": {
+                "not": {
+                  "const": "complete_within_declared_sources"
+                }
+              }
+            },
+            "required": [
+              "completeness"
+            ]
+          },
+          "then": {
+            "properties": {
+              "gaps": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "sources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "source_ref",
+          "source_kind",
+          "revision",
+          "cutoff",
+          "status",
+          "byte_digest",
+          "byte_length",
+          "profile_ids"
+        ],
+        "properties": {
+          "source_ref": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "pattern": "^[A-Za-z0-9._:/@#-]+(?![\\s\\S])",
+            "x-maxUtf8Bytes": 256
+          },
+          "source_kind": {
+            "type": "string",
+            "enum": [
+              "descriptor_manifest",
+              "panel_roster",
+              "role_registry",
+              "profile_registry",
+              "binding_index",
+              "other"
+            ]
+          },
+          "revision": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 65536,
+            "x-maxUtf8Bytes": 65536
+          },
+          "cutoff": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 65536,
+            "x-maxUtf8Bytes": 65536
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "missing",
+              "unreadable",
+              "malformed",
+              "valid_empty",
+              "valid_populated"
+            ]
+          },
+          "byte_digest": {
+            "oneOf": [
+              {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}(?![\\s\\S])"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "byte_length": {
+            "oneOf": [
+              {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 67108864
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "profile_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,63}(?![\\s\\S])"
+            },
+            "minItems": 0,
+            "maxItems": 128,
+            "uniqueItems": true
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "enum": [
+                    "missing",
+                    "unreadable"
+                  ]
+                }
+              },
+              "required": [
+                "status"
+              ]
+            },
+            "then": {
+              "properties": {
+                "byte_digest": {
+                  "type": "null"
+                },
+                "byte_length": {
+                  "type": "null"
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "enum": [
+                    "malformed",
+                    "valid_empty",
+                    "valid_populated"
+                  ]
+                }
+              },
+              "required": [
+                "status"
+              ]
+            },
+            "then": {
+              "properties": {
+                "byte_digest": {
+                  "type": "string",
+                  "pattern": "^sha256:[0-9a-f]{64}(?![\\s\\S])"
+                },
+                "byte_length": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 67108864
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "const": "valid_populated"
+                }
+              },
+              "required": [
+                "status"
+              ]
+            },
+            "then": {
+              "properties": {
+                "byte_length": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 67108864
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "enum": [
+                    "missing",
+                    "unreadable",
+                    "malformed",
+                    "valid_empty"
+                  ]
+                }
+              },
+              "required": [
+                "status"
+              ]
+            },
+            "then": {
+              "properties": {
+                "profile_ids": {
+                  "maxItems": 0
+                }
+              }
+            }
+          }
+        ]
+      },
+      "minItems": 1,
+      "maxItems": 128
+    },
+    "roster_manifest": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "profile_id",
+          "source_files",
+          "roles",
+          "exclusions"
+        ],
+        "properties": {
+          "profile_id": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9_-]{0,63}(?![\\s\\S])"
+          },
+          "source_files": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "source_ref",
+                "status",
+                "byte_digest",
+                "byte_length",
+                "file_ref"
+              ],
+              "properties": {
+                "source_ref": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256,
+                  "pattern": "^[A-Za-z0-9._:/@#-]+(?![\\s\\S])",
+                  "x-maxUtf8Bytes": 256
+                },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "missing",
+                    "unreadable",
+                    "malformed",
+                    "valid_empty",
+                    "valid_populated"
+                  ]
+                },
+                "byte_digest": {
+                  "oneOf": [
+                    {
+                      "type": "string",
+                      "pattern": "^sha256:[0-9a-f]{64}(?![\\s\\S])"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "byte_length": {
+                  "oneOf": [
+                    {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 67108864
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "file_ref": {
+                  "$ref": "#/$defs/ref"
+                }
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "properties": {
+                      "status": {
+                        "enum": [
+                          "missing",
+                          "unreadable"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "status"
+                    ]
+                  },
+                  "then": {
+                    "properties": {
+                      "byte_digest": {
+                        "type": "null"
+                      },
+                      "byte_length": {
+                        "type": "null"
+                      }
+                    }
+                  }
+                },
+                {
+                  "if": {
+                    "properties": {
+                      "status": {
+                        "enum": [
+                          "malformed",
+                          "valid_empty",
+                          "valid_populated"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "status"
+                    ]
+                  },
+                  "then": {
+                    "properties": {
+                      "byte_digest": {
+                        "type": "string",
+                        "pattern": "^sha256:[0-9a-f]{64}(?![\\s\\S])"
+                      },
+                      "byte_length": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 67108864
+                      }
+                    }
+                  }
+                },
+                {
+                  "if": {
+                    "properties": {
+                      "status": {
+                        "const": "valid_populated"
+                      }
+                    },
+                    "required": [
+                      "status"
+                    ]
+                  },
+                  "then": {
+                    "properties": {
+                      "byte_length": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 67108864
+                      }
+                    }
+                  }
+                }
+              ]
+            },
+            "minItems": 0,
+            "maxItems": 128
+          },
+          "roles": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "semantic_role_id",
+                "descriptor_status",
+                "descriptor_ref",
+                "binding_status",
+                "binding_ref",
+                "index_status",
+                "enabled_state",
+                "availability",
+                "semantic_coverage"
+              ],
+              "properties": {
+                "semantic_role_id": {
+                  "type": "string",
+                  "maxLength": 65536,
+                  "pattern": "^role\\.[A-Za-z0-9._-]+(?![\\s\\S])",
+                  "x-maxUtf8Bytes": 65536
+                },
+                "descriptor_status": {
+                  "type": "string",
+                  "enum": [
+                    "missing",
+                    "unreadable",
+                    "malformed",
+                    "valid",
+                    "unknown"
+                  ]
+                },
+                "descriptor_ref": {
+                  "oneOf": [
+                    {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256,
+                      "pattern": "^[A-Za-z0-9._:/@#-]+(?![\\s\\S])",
+                      "x-maxUtf8Bytes": 256
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "binding_status": {
+                  "type": "string",
+                  "enum": [
+                    "unbound",
+                    "bound",
+                    "mismatch",
+                    "unknown"
+                  ]
+                },
+                "binding_ref": {
+                  "oneOf": [
+                    {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256,
+                      "pattern": "^[A-Za-z0-9._:/@#-]+(?![\\s\\S])",
+                      "x-maxUtf8Bytes": 256
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "index_status": {
+                  "type": "string",
+                  "enum": [
+                    "indexed",
+                    "unindexed",
+                    "unknown"
+                  ]
+                },
+                "enabled_state": {
+                  "type": "string",
+                  "enum": [
+                    "enabled",
+                    "disabled",
+                    "unknown"
+                  ]
+                },
+                "availability": {
+                  "type": "string",
+                  "enum": [
+                    "available",
+                    "disabled_by_owner",
+                    "temporarily_unavailable",
+                    "unknown"
+                  ]
+                },
+                "semantic_coverage": {
+                  "type": "string",
+                  "enum": [
+                    "covered",
+                    "not_covered",
+                    "unknown"
+                  ]
+                }
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "properties": {
+                      "descriptor_status": {
+                        "const": "valid"
+                      }
+                    },
+                    "required": [
+                      "descriptor_status"
+                    ]
+                  },
+                  "then": {
+                    "properties": {
+                      "descriptor_ref": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 256,
+                        "pattern": "^[A-Za-z0-9._:/@#-]+(?![\\s\\S])",
+                        "x-maxUtf8Bytes": 256
+                      }
+                    }
+                  }
+                },
+                {
+                  "if": {
+                    "properties": {
+                      "descriptor_status": {
+                        "enum": [
+                          "missing",
+                          "unreadable",
+                          "malformed",
+                          "unknown"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "descriptor_status"
+                    ]
+                  },
+                  "then": {
+                    "properties": {
+                      "descriptor_ref": {
+                        "type": "null"
+                      }
+                    }
+                  }
+                },
+                {
+                  "if": {
+                    "properties": {
+                      "binding_status": {
+                        "enum": [
+                          "bound",
+                          "mismatch"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "binding_status"
+                    ]
+                  },
+                  "then": {
+                    "properties": {
+                      "binding_ref": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 256,
+                        "pattern": "^[A-Za-z0-9._:/@#-]+(?![\\s\\S])",
+                        "x-maxUtf8Bytes": 256
+                      }
+                    }
+                  }
+                },
+                {
+                  "if": {
+                    "properties": {
+                      "binding_status": {
+                        "enum": [
+                          "unbound",
+                          "unknown"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "binding_status"
+                    ]
+                  },
+                  "then": {
+                    "properties": {
+                      "binding_ref": {
+                        "type": "null"
+                      }
+                    }
+                  }
+                }
+              ]
+            },
+            "minItems": 0,
+            "maxItems": 128
+          },
+          "exclusions": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 65536,
+              "x-maxUtf8Bytes": 65536
+            },
+            "minItems": 0,
+            "maxItems": 128,
+            "uniqueItems": true
+          }
+        }
+      },
+      "minItems": 0,
+      "maxItems": 128
+    },
+    "roster_identity_digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}(?![\\s\\S])"
+    },
+    "snapshot_digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}(?![\\s\\S])"
+    }
+  },
+  "$defs": {
+    "ref": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[A-Za-z0-9._:/@#-]+(?![\\s\\S])",
+      "x-maxUtf8Bytes": 256
+    },
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 65536,
+      "x-maxUtf8Bytes": 65536
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}(?![\\s\\S])"
+    }
+  },
+  "x-cross-field-invariants": [
+    "declared_scope.source_refs equals source source_ref values",
+    "roster_manifest profile IDs equal the union of identities actually observed in valid_populated sources.profile_ids",
+    "source_profile_applicability contains exactly one row for every roster profile_id and declared source_ref pair",
+    "source_profile_applicability has at most 128 rows; larger profile/source products are not representable",
+    "required source_profile_applicability rows match roster_manifest.source_files exactly by profile_id, source_ref, and file_ref",
+    "not_applicable and unresolved applicability rows have null file_ref and no source_files row",
+    "every applicability basis_refs cites declared sources and includes a readable source that observed the profile identity",
+    "complete_within_declared_sources requires no gaps, no unresolved applicability, every top-level source valid_empty or valid_populated, and every required source file valid_empty or valid_populated",
+    "non-complete snapshots cannot assert semantic_coverage=not_covered",
+    "roster_identity_digest hashes the sorted observed profile IDs"
+  ],
+  "x-runtime-invariants": [
+    "all arrays are sorted and unique by their contract keys",
+    "source profile_ids record identities observed in that individual inventory and are not applicability requirements for other sources",
+    "source_profile_applicability is a digest-bound complete profile/source matrix with explicit required, not_applicable, or unresolved state",
+    "the complete profile/source matrix must fit the 128-item array bound",
+    "each required matrix pair has one exact file_ref and one status-bearing source_files row even when that status is missing, unreadable, or malformed",
+    "non-applicability is never inferred from an absent source_files row",
+    "applicability basis_refs are declared source refs and include a readable source that observed the profile",
+    "valid_empty records owner-parsed semantic emptiness and may retain nonzero byte_length",
+    "byte_digest and byte_length preserve exact source bytes; the contract does not infer semantic status from byte length",
+    "non-complete snapshots require explicit gaps and cannot assert semantic_coverage=not_covered",
+    "source and role missingness fields agree with their independent status axes",
+    "JSON Schema and runtime both reject semantic_coverage=not_covered when completeness is non-complete"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "declared_scope": {
+            "properties": {
+              "completeness": {
+                "enum": [
+                  "incomplete",
+                  "stale_or_concurrent_drift",
+                  "unknown"
+                ]
+              }
+            },
+            "required": [
+              "completeness"
+            ]
+          }
+        },
+        "required": [
+          "declared_scope"
+        ]
+      },
+      "then": {
+        "properties": {
+          "roster_manifest": {
+            "items": {
+              "properties": {
+                "roles": {
+                  "items": {
+                    "properties": {
+                      "semantic_coverage": {
+                        "not": {
+                          "const": "not_covered"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}
