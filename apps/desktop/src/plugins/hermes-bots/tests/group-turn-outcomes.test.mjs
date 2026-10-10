@@ -89,6 +89,9 @@ async function harness(scripts = {}, { baseline = 0, onPoll, onSubmit, ack, conn
     atom, Date: class extends Date { static now() { return now } },
     setTimeout: (fn, delay = 0) => {
       if (delay === 1200000) { const id = ++timerSequence; collectorTimers.set(id, fn); return id }
+      // Independent reconciliation must not time-travel five seconds on each
+      // ordinary fake timer call. These fixtures drive explicit harvests.
+      if (delay === 5000) return ++timerSequence
       if (delay === 250 && queuedDrives) { const id = ++timerSequence; driveTimers.set(id, fn); return id }
       if (delay === 2000) now += delay
       fn(); return 0
@@ -709,12 +712,12 @@ test('actual backend wire fixture drives the frontend after 194 → 15 compactio
     preHistory: 194, resumeCount: 15, messagesOmitted: true, frontendProviderCalls: 0 }))
 })
 
-test('rejected read-only poll is visible immediately and next member advances once without resume or replay', async () => {
+test('rejected read-only poll retries are bounded and next member advances once without resume or replay', async () => {
   const h = await harness({ alpha: [() => { throw Object.assign(new Error('observation transport failed'), { code: 5032 }) }] })
   await h.gc.runGroupChatRounds('Room', [ALPHA, BETA], 'thread-1')
   assert.equal(h.sessions.get('alpha').submits, 1)
   assert.equal(h.sessions.get('beta').submits, 1)
-  assert.equal(h.sessions.get('alpha').totalPolls, 1)
+  assert.equal(h.sessions.get('alpha').totalPolls, 3)
   assert.ok(h.gc.currentGroupActivity('Room').some(entry => entry.kind === 'unavailable' && /observation transport failed/.test(entry.reason)))
   assert.ok(room(h).stranded.alpha)
   const initialResumes = h.rpc('session.resume').length

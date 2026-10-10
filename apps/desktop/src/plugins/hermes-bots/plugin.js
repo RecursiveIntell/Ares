@@ -508,7 +508,7 @@ function groupActivityLabel(event) {
   }
 
   const who = event?.member === 'You' ? 'You' : groupSpeakerLabel(event?.member || 'A bot')
-  const reason = ['failed', 'interrupted', 'unavailable', 'waiting'].includes(kind) && typeof event?.reason === 'string' ? event.reason.trim() : ''
+  const reason = ['failed', 'interrupted', 'unavailable', 'waiting', 'observing'].includes(kind) && typeof event?.reason === 'string' ? event.reason.trim() : ''
 
   return `${who} ${base}${reason ? `: ${reason}` : ''}`
 }
@@ -516,6 +516,7 @@ function groupActivityLabel(event) {
 const GROUP_ACTIVITY_LABELS = {
   queued: 'sent a message',
   working: 'is working…',
+  observing: 'is checking earlier turn status',
   waiting: 'is waiting',
   replied: 'replied',
   passed: 'passed',
@@ -537,6 +538,7 @@ const GROUP_ACTIVITY_LABELS = {
 const GROUP_ACTIVITY_GLYPHS = {
   queued: 'comment',
   working: 'sync',
+  observing: 'sync',
   waiting: 'debug-pause',
   replied: 'check',
   passed: 'circle-outline',
@@ -7630,6 +7632,9 @@ async function requireGroupTurnProtocol(member, prepared) {
 
 const GROUP_TURN_TIMEOUT_MS = 180000
 const GROUP_TURN_POLL_MS = 2000
+const GROUP_TURN_POLL_RETRY_LIMIT = 3
+const GROUP_TURN_RECONCILE_INTERVAL_MS = 5000
+const GROUP_TURN_RECONCILE_MAX_TRIES = 60
 
 // --- group-turn session-lease helpers (#93602) ------------------------------
 // A member turn is a session-scoped RPC SEQUENCE (resume → attach → submit →
@@ -8411,6 +8416,8 @@ function finishGroupOccurrence(occurrence) {
   const c = occurrence.coordinator
   if (occurrence.released || groupOccurrenceHasPendingInterrupt(occurrence)) return
   occurrence.released = true
+  clearTimeout(occurrence.reconcileTimer)
+  occurrence.reconcileTimer = null
   occurrence.releaseLease?.()
   if (c.members.get(occurrence.memberLock) === occurrence) c.members.delete(occurrence.memberLock)
   if (occurrence.sessionLock && groupRuntimeSessionOwners.get(occurrence.sessionLock) === occurrence) {
@@ -8516,9 +8523,49 @@ function retainUnresolvedGroupOccurrence(occurrence) {
   } else if (!groupOccurrenceRoomIsCurrent(occurrence) || marker?.occurrence_id !== occurrence.id) return false
   // A timeout/unavailable projection is not capacity evidence. Waiting has
   // already surrendered only its worker; running/unknown keeps that worker.
+  if (!occurrence.cancelled && occurrence.phase !== 'waiting') occurrence.phase = 'reconciling'
   occurrence.markReady()
   paintGroupOccurrences(occurrence.coordinator)
+  scheduleGroupOccurrenceReconciliation(occurrence)
   return true
+}
+
+/** Exact observation does not need a dispatch slot or a settled room drive.
+ * Keep this bounded and owned by the retained occurrence, not by new input.
+ * Terminal evidence releases its existing locks; unavailable never does. */
+function scheduleGroupOccurrenceReconciliation(occurrence) {
+  if (groupObservationStopped || occurrence.released || occurrence.reconcileTimer || occurrence.reconcileReading ||
+      (occurrence.reconcileTries || 0) >= GROUP_TURN_RECONCILE_MAX_TRIES ||
+      !groupOccurrenceRoomIsCurrent(occurrence)) return
+  const marker = $groupChats.get()[occurrence.group]?.stranded?.[occurrence.memberKey]
+  if (marker?.occurrence_id !== occurrence.id || !groupTurnDeliveryKey(marker.delivery)) return
+  occurrence.reconcileTimer = setTimeout(async () => {
+    occurrence.reconcileTimer = null
+    if (occurrence.released || !groupOccurrenceRoomIsCurrent(occurrence)) return
+    occurrence.reconcileTries = (occurrence.reconcileTries || 0) + 1
+    occurrence.reconcileReading = true
+    try {
+      await harvestStrandedGroupReply(occurrence.group, occurrence.captured.member)
+    } catch {
+      // The next bounded exact read can recover; no prompt or control replay.
+    } finally {
+      occurrence.reconcileReading = false
+      scheduleGroupOccurrenceReconciliation(occurrence)
+    }
+  }, GROUP_TURN_RECONCILE_INTERVAL_MS)
+}
+
+/** Plugin disposal stops only the automatic reads. Markers, leases and worker
+ * reservations remain: stopping an observer is not terminal evidence. */
+let groupObservationStopped = false
+function stopGroupTurnObservation() {
+  groupObservationStopped = true
+  for (const coordinator of groupRoomCoordinators.values()) {
+    for (const occurrence of coordinator.occurrences) {
+      clearTimeout(occurrence.reconcileTimer)
+      occurrence.reconcileTimer = null
+    }
+  }
 }
 
 async function executeGroupOccurrence(occurrence) {
@@ -8683,7 +8730,17 @@ async function runGroupChatMemberTurnLeased(group, captured, prompt, thread, ima
             content_base64: img.data, filename: img.name || 'attachment.png' })
         }
       } catch {
-        /* text-only fallback for this member */
+        // Required evidence failed before admission: do not submit text-only.
+        // Surface only bounded display metadata, never bytes or RPC errors.
+        const kind = img.kind === 'pdf' ? 'pdf' : img.kind === 'file' ? 'file' : 'image'
+        const fallback = kind === 'pdf' ? 'attachment.pdf' : kind === 'file' ? 'attachment' : 'attachment.png'
+        const filename = (typeof img.name === 'string' ? img.name.split(/[\\/]/).at(-1) : '')
+          .replace(/[^a-zA-Z0-9._ -]/g, '_').slice(0, 120).trim() || fallback
+        const error = groupTurnOutcomeError({ state: 'attachment-failed',
+          reason: `Could not attach ${kind} "${filename}" for member ${member.name}; prompt was not submitted` })
+        error.code = 'GROUP_ATTACHMENT_FAILED'
+        error.data = { ...error.data, member: member.name, attachmentKind: kind, filename }
+        throw error
       }
     }
     const turnText = fileRefs.length
@@ -8728,6 +8785,7 @@ async function runGroupChatMemberTurnLeased(group, captured, prompt, thread, ima
     const started = Date.now()
     let deadline = started + GROUP_TURN_TIMEOUT_MS
     let progress = 'working'
+    let failedPolls = 0
     while (Date.now() < deadline) {
       await new Promise(resolve => setTimeout(resolve, GROUP_TURN_POLL_MS))
       group = occurrence?.group || group
@@ -8749,12 +8807,21 @@ async function runGroupChatMemberTurnLeased(group, captured, prompt, thread, ima
         const roomAfterError = $groupChats.get()[group] || {}
         if (roomAfterError.stranded?.[memberKey] !== marker) return discarded()
         if (occurrence?.cancelled) { markGroupOccurrenceStop(occurrence); return discarded() }
+        // Supersession changes publication intent, not observation ownership.
+        // Retry exact reads only; an absent runtime/capability is not transient.
+        failedPolls++
+        if (marker.hold_requested || roomAfterError.holds?.[memberKey]) return discarded()
+        if (failedPolls < GROUP_TURN_POLL_RETRY_LIMIT &&
+            ![4001, 4006, 4030, -32601].includes(error?.code)) {
+          recordGroupActivity(group, { kind: 'observing', member: member.name, thread,
+            reason: 'Retrying earlier turn status; no instruction is resubmitted' })
+          continue
+        }
         if (!groupTurnMarkerIntentIsCurrent(roomAfterError, marker)) return discarded()
-        // Observation failure grants no replay or resume authority. Surface it
-        // now and retain the accepted receipt for an explicit later harvest.
         throw groupTurnOutcomeError({ state: 'unavailable',
           reason: `Could not observe member turn: ${error?.message || 'gateway poll failed'}` })
       }
+      failedPolls = 0
       group = occurrence?.group || group
       const roomAfterResume = $groupChats.get()[group] || {}
       if (roomAfterResume.stranded?.[memberKey] !== marker) return discarded()
@@ -8765,9 +8832,21 @@ async function runGroupChatMemberTurnLeased(group, captured, prompt, thread, ima
       const outcome = readGroupTurnOutcome(state, marker.delivery)
       if (!groupTurnMarkerIntentIsCurrent(roomAfterResume, marker)) {
         if (['complete', 'error', 'interrupted'].includes(outcome.state)) {
+          if (occurrence) occurrence.terminalObserved = true
           consumeGroupTurnMarker(group, memberKey, marker)
+          return discarded()
         }
-        return discarded()
+        if (marker.hold_requested || roomAfterResume.holds?.[memberKey]) return discarded()
+        // Do not publish superseded output, but keep watching until its locks
+        // can be released. A newer drive is waiting on this exact predecessor.
+        if (outcome.state === 'unavailable') throw groupTurnOutcomeError(outcome)
+        if (occurrence && occurrence.phase !== 'waiting') {
+          occurrence.phase = 'reconciling'
+          paintGroupOccurrences(occurrence.coordinator)
+        }
+        deadline = Math.min(started + GROUP_TURN_HARD_CAP_MS,
+          Math.max(deadline, Date.now() + GROUP_TURN_TIMEOUT_MS))
+        continue
       }
       const pendingQuestion = state?.pending_clarify?.request_id || state?.pending_approval?.request_id
       const freshResumeRead = !occurrence?.resumeFence ||
@@ -14487,6 +14566,25 @@ function groupBlockedMembers(room, members) {
   })
 }
 
+/** Explicit exact observation: no session adoption, prompt or control replay.
+ * Concurrent clicks coalesce, but a later click starts a new bounded read. */
+function checkGroupTurnStatus(group, members) {
+  const room = $groupChats.get()[group]
+  if (!room || room.tombstone) return Promise.resolve()
+  const coordinator = groupRoomCoordinator(group)
+  coordinator.statusCheck ||= { current: null }
+  const captured = members.map(member => captureGroupTurnMember(member).member)
+  const pending = singleFlight(coordinator.statusCheck, async () => {
+    for (const member of captured) {
+      if (!groupNameForLifetime(coordinator)) return
+      await harvestStrandedGroupReply(coordinator.group, member)
+    }
+  })
+  return pending.finally(() => {
+    if (coordinator.statusCheck.current === pending) coordinator.statusCheck.current = null
+  })
+}
+
 /** Shared by ordinary New Group and the explicit blocked-room handoff. It
  * creates UI context only. No session or turn is created until a later Send.
  * A repeated handoff reopens its room without restaging a consumed/edited draft. */
@@ -14541,14 +14639,21 @@ function createFreshGroupChat(base, selected, { image = null, recoverySource = n
   return groupName
 }
 
-function GroupBlockedNotice({ room, members, onCreate }) {
+function GroupBlockedNotice({ room, members, onCreate, onCheck }) {
   const blocked = groupBlockedMembers(room, members)
   if (!blocked.length) return null
   return jsxs('div', {
     className: 'grid gap-1 border-b border-(--ui-stroke-secondary) px-2.5 py-2 text-xs text-(--ui-text-tertiary)',
     role: 'status',
     children: [
-      ...blocked.map(member => jsx('div', { children: `${groupSpeakerLabel(member.name)}${member.remoteSource ? ` (${member.connectionLabel || member.connectionId})` : ''}: earlier outcome unknown; new messages are blocked.` }, groupMemberKey(member))),
+      ...blocked.map(member => {
+        const marker = room.stranded[groupMemberKey(member)]
+        const reason = marker?.reason || (!groupTurnDeliveryKey(marker?.delivery)
+          ? 'Earlier turn has no accepted identity; it cannot be replayed safely.'
+          : 'Earlier turn status has not been reconciled yet.')
+        return jsx('div', { children: `${groupSpeakerLabel(member.name)}${member.remoteSource ? ` (${member.connectionLabel || member.connectionId})` : ''}: reconciliation pending; new messages are blocked. ${reason}` }, groupMemberKey(member))
+      }),
+      onCheck ? jsx(Button, { variant: 'secondary', size: 'sm', onClick: onCheck, children: 'Check earlier turn status' }) : null,
       jsx('span', { children: 'You can create a separate group with new sessions. This group and its earlier work remain unchanged. Nothing is sent automatically.' }),
       jsx(Button, { variant: 'secondary', size: 'sm', onClick: () => onCreate(null), children: 'Create a new group' })
     ]
@@ -15309,7 +15414,8 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
         : null,
       header,
       activityPanel,
-      jsx(GroupBlockedNotice, { room, members, onCreate: openNewGroup }),
+      jsx(GroupBlockedNotice, { room, members, onCreate: openNewGroup,
+        onCheck: () => void checkGroupTurnStatus(group, members).catch(error => host.notifyError(error, 'Earlier turn status could not be checked')) }),
       jsx(CreateGroupChatDialog, { open: Boolean(recoverySource), roster: members,
         recoverySource, onClose: () => setRecoverySource(null), onCreated: name => openGroupChat(name) }),
       jsx(ScrollArea, {
@@ -15337,6 +15443,8 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
                       ? 'Interruption is unconfirmed. Stop can retry.'
                     : room.turns?.some(turn => turn.phase === 'stopping')
                       ? 'Finishing stopped turns…'
+                    : room.turns?.some(turn => turn.phase === 'reconciling')
+                      ? 'Checking earlier turn outcomes; retained work is not proof of active computation.'
                     : roomClarifies.length
                       ? 'Waiting for your answer…'
                       : room.turn
@@ -16955,7 +17063,8 @@ const groupTurnRuntime = {
   appendGroupChatEntry, syncGroupClarify, answerGroupClarify, groupChatSyncSnapshot,
   groupChatSyncEntryKey, stopGroupThread, mergeRemoteGroupChatSnapshotIntoRooms,
   durableGroupChatRooms, sendToGroupChat, groupRoomCoordinators, groupRuntimeSessionOwners,
-  groupMemberKey, updateGroupChat, groupBlockedMembers, GroupBlockedNotice,
+  groupMemberKey, updateGroupChat, groupBlockedMembers, GroupBlockedNotice, checkGroupTurnStatus,
+  stopGroupTurnObservation,
   CreateGroupChatDialog, createFreshGroupChat, groupComposerDraftKey,
   groupComposerDraftSnapshot, updateGroupComposerDraft, GroupChatWorkspace, GroupClarifyCard,
   groupRoomCanStop, renameGroupChat, pullGroupChatServerState, GroupChatSettingsDialog, $groupChatWorkspace,
@@ -16976,6 +17085,7 @@ export default {
   register(ctx) {
     pluginCtx = ctx
     groupChatSyncDisposed = false
+    groupObservationStopped = false
     startFaceClock()
     // The cross-connection relay rides every gateway socket this Desktop
     // holds: roster sync + envelope drain/deliver/reply loops.
@@ -16985,6 +17095,7 @@ export default {
     if (typeof ctx.onDispose === 'function') {
       ctx.onDispose(stopFaceClock)
       ctx.onDispose(stopBotRelay)
+      ctx.onDispose(stopGroupTurnObservation)
     }
 
     // @-mention autocomplete: typing "@rese…" in ANY composer offers the
