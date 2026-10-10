@@ -2422,11 +2422,35 @@ class ProcessRegistry:
                 session.termination_source = source
             self._move_to_finished(session)
             self._write_checkpoint()
+            # Containment fidelity (S1-04.03): a PID tree-walk SIGTERMs/SIGKILLs
+            # the tracked tree, but a descendant that escaped via setsid +
+            # double-fork (reparented away from the session) is NOT reachable by
+            # lineage.  Only the systemd cgroup scope (_stop_systemd_unit) is
+            # guaranteed to reap those.  Report the distinction explicitly so a
+            # caller cannot read "status: killed" (tracked-tree exit) as
+            # "quiesced" (no survivors anywhere).
+            containment = {
+                "fidelity": "cgroup" if session.systemd_unit else "tree",
+                "quiescence": "verified" if session.systemd_unit else "tree_only",
+                "note": (
+                    "cgroup scope stopped; double-forked/reparented descendants reaped"
+                    if session.systemd_unit
+                    else "no systemd scope for this session: only the tracked PID tree "
+                         "was signalled; a descendant reparented via setsid+double-fork "
+                         "is not guaranteed contained"
+                ),
+            }
+            if not session.systemd_unit:
+                logger.warning(
+                    "kill_process(%s): no systemd scope — containment is tree-only; "
+                    "a reparented descendant may survive", session_id,
+                )
             return {
                 "status": "killed",
                 "session_id": session.id,
                 "completion_reason": session.completion_reason,
                 "termination_source": session.termination_source,
+                "containment": containment,
                 "output": output,
             }
         except Exception as e:
