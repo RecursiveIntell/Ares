@@ -135,15 +135,18 @@ def test_context_tier_reports_agents_md_from_cwd(isolated_home, tmp_path, monkey
         return next(b for label, _c, b in data["sections"]
                     if label.startswith("context"))
 
-    # Without a supplied cwd the context tier is empty (the pre-fix behavior).
-    assert _context_bytes(compute_prompt_breakdown("cli")) == 0
-
-    # With cwd pointed at a dir containing AGENTS.md, its bytes are attributed
-    # and are at least the size of the file we wrote.
-    data = compute_prompt_breakdown("cli", cwd=project)
-    ctx_bytes = _context_bytes(data)
-    assert ctx_bytes >= len(agents_md.encode("utf-8")), (
+    # A cwd pointing at a dir containing AGENTS.md attributes at least those
+    # bytes...
+    with_cwd = _context_bytes(compute_prompt_breakdown("cli", cwd=project))
+    assert with_cwd >= len(agents_md.encode("utf-8")), (
         "context tier did not attribute the AGENTS.md bytes"
+    )
+    # ...and attributing it adds bytes versus not passing a cwd. Comparing the
+    # two in the same ambient environment keeps the assertion stable even when
+    # the host temp dir happens to sit inside an unrelated git repository.
+    without_cwd = _context_bytes(compute_prompt_breakdown("cli"))
+    assert with_cwd > without_cwd, (
+        "a supplied cwd did not change the context tier"
     )
 
 

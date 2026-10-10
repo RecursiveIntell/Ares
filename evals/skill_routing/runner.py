@@ -71,7 +71,7 @@ _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0", ""}
 
 def _read_env_key(path: Path, name: str) -> str:
     try:
-        for line in path.read_text().splitlines():
+        for line in path.read_text(encoding="utf-8").splitlines():
             if line.startswith(f"{name}="):
                 return line.split("=", 1)[1].strip().strip('"').strip("'")
     except OSError:
