@@ -255,9 +255,13 @@ def compute_prompt_breakdown(platform: str = "cli", cwd: Any = None) -> Dict[str
 
     # Scope the context tier to the requested directory for the duration of the
     # build. resolve_context_cwd() reads TERMINAL_CWD; restoring it afterwards
-    # keeps the process environment untouched.
+    # keeps the process environment untouched. Validate first: a nonexistent
+    # path would silently fall back to the process cwd and attribute unrelated
+    # context files to the requested project.
     _prev_cwd = _os.environ.get("TERMINAL_CWD")
     if cwd is not None:
+        if not Path(str(cwd)).expanduser().is_dir():
+            raise ValueError(f"--cwd is not an existing directory: {cwd!r}")
         _os.environ["TERMINAL_CWD"] = str(cwd)
     try:
         parts = build_system_prompt_parts(agent)

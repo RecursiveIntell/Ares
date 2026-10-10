@@ -55,12 +55,16 @@ def measure(platform: str = "cli") -> dict:
     skills = data.get("skills_breakdown") or []
 
     # Per-category byte shares: the categories whose descriptions cost the
-    # most are the candidates a future demotion decision would weigh.
+    # most are the candidates a future demotion decision would weigh. The
+    # breakdown names are flat (frontmatter names), so the category is derived
+    # from each skill's path (<root>/<category>/<skill>/SKILL.md), not by
+    # splitting the name.
     by_cat: dict[str, int] = {}
     for sk in skills:
-        # skill names in the index are flat; attribute each line's bytes to the
-        # owning top-level category when the name maps to a known prefix.
-        cat = sk["name"].split("/", 1)[0]
+        path = sk.get("path")
+        cat = "(unknown)"
+        if path:
+            cat = Path(str(path)).parent.parent.name or "(unknown)"
         by_cat[cat] = by_cat.get(cat, 0) + sk.get("index_line_bytes", 0)
 
     return {

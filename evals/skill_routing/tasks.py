@@ -39,26 +39,39 @@ class RoutingTask:
     notes: str = ""
 
 
-def _loaded_set(loaded: list[str]) -> set[str]:
-    return {n for n in loaded if n in known_names()}
+def _calls(loaded: list[str]) -> list[str]:
+    """Every skill_view call the agent made, valid name or not.
+
+    A call with an unknown name is still a load attempt: it must count, or an
+    abstain task would score a perfect 1.0 despite the agent reaching for a
+    skill, and a relevant task would score as a single clean load despite
+    spurious extra calls.
+    """
+    return [n for n in loaded if isinstance(n, str)]
+
+
+def _known(calls: list[str]) -> set[str]:
+    return {n for n in calls if n in known_names()}
 
 
 def _relevant(name: str) -> Callable[[list[str], str], float]:
     def _grade(loaded: list[str], _final: str) -> float:
-        got = _loaded_set(loaded)
+        calls = _calls(loaded)
+        got = _known(calls)
+        unknown = [n for n in calls if n not in known_names()]
         if name not in got:
             return 0.0
-        return 1.0 if len(got) == 1 else 0.5
+        # 1.0 only when the agent loaded exactly the applicable skill and made
+        # no other call (including a hallucinated-named one).
+        return 1.0 if (got == {name} and not unknown) else 0.5
     return _grade
 
 
 def _abstain() -> Callable[[list[str], str], float]:
     def _grade(loaded: list[str], _final: str) -> float:
-        got = _loaded_set(loaded)
-        if not got:
-            return 1.0
-        # Any load on a no-applicable-skill task is the over-loading failure.
-        return 0.0
+        # Any skill_view call at all — including an unknown name — is the
+        # over-loading failure on a no-applicable-skill task.
+        return 1.0 if not _calls(loaded) else 0.0
     return _grade
 
 
@@ -153,19 +166,19 @@ SYSTEM_PREAMBLE = (
 
 def _self_test() -> int:
     """Both polarities: oracles must accept correct behavior and reject failures."""
-    # relevant: correct single load passes; over-load halves; miss zeroes.
+    # relevant: correct single load passes; over-load (extra or hallucinated)
+    # halves; miss zeroes.
     g = _relevant("deploy-runbook")
     assert g(["deploy-runbook"], "") == 1.0
     assert g(["deploy-runbook", "csv-parser"], "") == 0.5
+    assert g(["deploy-runbook", "not-a-real-skill"], "") == 0.5
     assert g(["csv-parser"], "") == 0.0
     assert g([], "") == 0.0
-    # abstain: no load passes; any load fails.
+    # abstain: no call passes; ANY call — real or hallucinated name — fails.
     a = _abstain()
     assert a([], "") == 1.0
     assert a(["hue-scenes"], "") == 0.0
-    # Unknown names never count as a real load, so a hallucinated tool call
-    # cannot masquerade as a correct load.
-    assert a(["not-a-real-skill"], "") == 1.0
+    assert a(["not-a-real-skill"], "") == 0.0
     # Every task id is unique and every oracle is callable.
     assert len(TASKS_BY_ID) == len(TASKS)
     for t in TASKS:

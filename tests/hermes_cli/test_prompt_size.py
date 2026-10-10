@@ -147,5 +147,17 @@ def test_context_tier_reports_agents_md_from_cwd(isolated_home, tmp_path, monkey
     )
 
 
+def test_context_tier_rejects_invalid_cwd(isolated_home, tmp_path):
+    """A nonexistent --cwd must error, not silently measure the process cwd."""
+    missing = tmp_path / "does-not-exist"
+    with pytest.raises(ValueError):
+        compute_prompt_breakdown("cli", cwd=missing)
+    # A file (not a directory) is equally invalid.
+    a_file = tmp_path / "afile.txt"
+    a_file.write_text("x")
+    with pytest.raises(ValueError):
+        compute_prompt_breakdown("cli", cwd=a_file)
+
+
 
 

@@ -7,9 +7,6 @@ arms is the ``<available_skills>`` block produced by
 model, temperature, task prompts, the skill catalog, the ``skill_view`` tool
 behavior — is held constant.
 
-The block under test is the routing prose + index: exactly what a real
-session puts on the wire.
-
 Usage:
   python3 evals/skill_routing/runner.py \
       --base e3e8a39d9427 --cand be3df4e52121 \
@@ -38,6 +35,7 @@ import sys
 import tempfile
 import time
 import traceback
+import urllib.parse
 from pathlib import Path
 
 EVAL_DIR = Path(__file__).resolve().parent
@@ -46,7 +44,7 @@ sys.path.insert(0, str(EVAL_DIR))
 sys.path.insert(0, str(REPO_ROOT))
 
 from fixtures import build_catalog, skill_body  # noqa: E402
-from tasks import SYSTEM_PREAMBLE, TASKS, TASKS_BY_ID  # noqa: E402
+from tasks import SYSTEM_PREAMBLE, TASKS_BY_ID  # noqa: E402
 
 # The bridge tool the model uses to load a skill. Its schema is byte-identical
 # across arms; only the system-prompt skills block varies.
@@ -68,17 +66,70 @@ SKILL_VIEW_TOOL = {
     },
 }
 
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0", ""}
 
-def _load_api_key() -> str:
-    key = os.environ.get("OPENROUTER_API_KEY", "").strip()
-    if key:
-        return key
-    env_path = Path.home() / ".ares" / ".env"
-    if env_path.exists():
-        for line in env_path.read_text().splitlines():
-            if line.startswith("OPENROUTER_API_KEY="):
+
+def _read_env_key(path: Path, name: str) -> str:
+    try:
+        for line in path.read_text().splitlines():
+            if line.startswith(f"{name}="):
                 return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
     return ""
+
+
+def _load_api_key(env_name: str) -> str:
+    """Resolve *env_name* from the process env, then the profile-aware Hermes
+    home (ARES_HOME/HERMES_HOME, then ~/.ares and ~/.hermes)."""
+    val = os.environ.get(env_name, "").strip()
+    if val:
+        return val
+    for home in (os.environ.get("ARES_HOME"), os.environ.get("HERMES_HOME")):
+        if home:
+            v = _read_env_key(Path(home) / ".env", env_name)
+            if v:
+                return v
+    for path in (Path.home() / ".ares" / ".env", Path.home() / ".hermes" / ".env"):
+        v = _read_env_key(path, env_name)
+        if v:
+            return v
+    return ""
+
+
+def _is_local_endpoint(url: str) -> bool:
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    return host in _LOCAL_HOSTS or host.startswith("127.")
+
+
+def resolve_bearer(base_url: str, explicit_key: str, key_env: str) -> str:
+    """Never send a real cloud credential to an arbitrary endpoint.
+
+    A keyless local URL gets a dummy token. OpenRouter uses OPENROUTER_API_KEY.
+    Any other host requires an endpoint-specific key via --api-key-env, so
+    pointing --base-url at a third-party service cannot leak the OpenRouter key.
+    """
+    if explicit_key:
+        return explicit_key
+    if _is_local_endpoint(base_url):
+        return "local"
+    if "openrouter.ai" in base_url:
+        key = _load_api_key("OPENROUTER_API_KEY")
+        if not key:
+            raise SystemExit(
+                "OPENROUTER_API_KEY not set (env or ~/.ares/.env) for the "
+                "OpenRouter endpoint."
+            )
+        return key
+    if key_env:
+        key = _load_api_key(key_env)
+        if not key:
+            raise SystemExit(f"{key_env} not set (for endpoint {base_url!r}).")
+        return key
+    raise SystemExit(
+        f"Refusing to send a shared credential to {base_url!r}. Pass "
+        "--api-key-env <VAR> naming an endpoint-specific key, or --api-key."
+    )
 
 
 def extract_arm(ref: str, workdir: Path, name: str) -> Path:
@@ -171,14 +222,37 @@ def run_one(client, model, arm_name, skills_block, task_id, prompt, oracle,
     }
 
 
+def _repair_jsonl_tail(path: Path) -> None:
+    """Drop a truncated final line so appends don't concatenate onto it.
+
+    An interrupted write can leave a partial JSON line without a trailing
+    newline; appending the next record onto it would corrupt both. Truncate to
+    the last complete line before opening for append.
+    """
+    if not path.exists():
+        return
+    data = path.read_bytes()
+    if not data or data.endswith(b"\n"):
+        return
+    idx = data.rfind(b"\n")
+    path.write_bytes(data[: idx + 1] if idx >= 0 else b"")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", required=True, help="git ref for the baseline arm")
     ap.add_argument("--cand", required=True, help="git ref for the candidate arm")
     ap.add_argument("--model", required=True)
     ap.add_argument("--base-url", default="https://openrouter.ai/api/v1")
+    ap.add_argument("--api-key", default="", help="explicit bearer token")
+    ap.add_argument(
+        "--api-key-env",
+        default="",
+        help="env var holding an endpoint-specific key for a non-local, "
+             "non-OpenRouter --base-url",
+    )
     ap.add_argument("--reps", type=int, default=3)
-    ap.add_argument("--tasks", nargs="*", default=None)
+    ap.add_argument("--tasks", nargs="+", default=None, metavar="TASK")
     ap.add_argument("--label", default="ab")
     ap.add_argument(
         "--demote-extra-arm",
@@ -191,10 +265,20 @@ def main():
     )
     args = ap.parse_args()
 
+    # Validate the task limiter so a typo cannot silently run nothing (or an
+    # empty --tasks cannot silently run the whole experiment).
+    if args.tasks is not None:
+        unknown = [t for t in args.tasks if t not in TASKS_BY_ID]
+        if unknown:
+            ap.error(
+                f"unknown task id(s): {', '.join(unknown)}. "
+                f"valid: {', '.join(sorted(TASKS_BY_ID))}"
+            )
+
     from openai import OpenAI
 
-    api_key = _load_api_key() or "ollama"
-    client = OpenAI(base_url=args.base_url, api_key=api_key)
+    bearer = resolve_bearer(args.base_url, args.api_key, args.api_key_env)
+    client = OpenAI(base_url=args.base_url, api_key=bearer)
 
     with tempfile.TemporaryDirectory(prefix="skill_routing_") as td:
         tdir = Path(td)
@@ -224,15 +308,30 @@ def main():
         outdir = EVAL_DIR / "results" / args.label
         outdir.mkdir(parents=True, exist_ok=True)
         outpath = outdir / (re.sub(r"[^\w.-]", "_", args.model) + ".jsonl")
+
+        # Resume: only skip cells already recorded for THIS experiment identity
+        # (same refs + model). Mixing refs would silently report an old run as
+        # a new one, so refuse rather than merge.
         done = set()
         if outpath.exists():
+            _repair_jsonl_tail(outpath)
             for line in outpath.read_text().splitlines():
+                if not line.strip():
+                    continue
                 try:
                     r = json.loads(line)
-                    done.add((r["task"], r["arm"], r["rep"]))
                 except Exception:
-                    pass
+                    continue
+                if (r.get("base_ref"), r.get("cand_ref"), r.get("model")) != (
+                    args.base, args.cand, args.model
+                ):
+                    raise SystemExit(
+                        f"{outpath} contains rows from a different experiment "
+                        "(different --base/--cand/--model). Use a new --label."
+                    )
+                done.add((r["task"], r["arm"], r["rep"]))
 
+        failures: list[str] = []
         with open(outpath, "a", encoding="utf-8") as f:
             for task_id, task in TASKS_BY_ID.items():
                 if args.tasks and task_id not in args.tasks:
@@ -241,13 +340,14 @@ def main():
                     for arm_name in arm_names:
                         if (task_id, arm_name, rep) in done:
                             continue
-                        for attempt in range(3):
+                        attempts = 3
+                        for attempt in range(attempts):
                             try:
                                 r = run_one(client, args.model, arm_name,
                                             blocks[arm_name], task_id,
                                             task.prompt, task.oracle)
                                 if (not r["final"].strip() and r["n_loads"] == 0
-                                        and attempt < 2):
+                                        and attempt < attempts - 1):
                                     print(f"NOISE-RETRY {task_id} {arm_name} rep{rep}")
                                     continue
                                 r["rep"] = rep
@@ -263,7 +363,18 @@ def main():
                             except Exception as e:  # noqa: BLE001
                                 print(f"RETRY {task_id} {arm_name} rep{rep}: {e}")
                                 traceback.print_exc()
-                                time.sleep(3 * (attempt + 1))
+                                if attempt == attempts - 1:
+                                    failures.append(f"{task_id}/{arm_name}/rep{rep}")
+                                else:
+                                    time.sleep(3 * (attempt + 1))
+
+        # A cell that exhausted its retries leaves the JSONL incomplete; report
+        # a nonzero status rather than printing "done" over biased results.
+        if failures:
+            raise SystemExit(
+                f"INCOMPLETE: {len(failures)} cell(s) failed all attempts: "
+                f"{', '.join(failures)}. Results in {outpath} are partial."
+            )
         print("done ->", outpath)
 
 
