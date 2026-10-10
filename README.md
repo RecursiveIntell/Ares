@@ -330,7 +330,7 @@ explicit disable or restriction gate:
 
 | Adapter | What it provides | Gate / limitation |
 |---|---|---|
-| `ri_llm` | Rust-backed `llm-pipeline` calls for OpenAI-compatible providers, including structured output | Native extension required; active by default when available; `HERMES_RI_PIPELINE=0` disables it; provider allowlists may be set with `HERMES_RI_PIPELINE_PROVIDERS` or config; failures fall back to the stock path |
+| `ri_llm` | Rust-backed `llm-pipeline` path for representable, unauthenticated `ollama-launch` text requests | Native extension required; default selection is limited to qualifying Ollama requests; `HERMES_RI_PIPELINE=0` disables it; unsupported ordinary requests keep their same-provider SDK route; explicit native selection raises `RI_PIPELINE_REQUEST_UNSUPPORTED` for unsupported requests |
 | `ri_context_compressor` | Legacy PyO3-backed context compressor with an LLM summarizer fallback and receipt preservation | Native extension required for this legacy lane; it is distinct from the configured CLI-backed engine below; the CEA graph lane is advisory, read-only, and fails open |
 | `ri_agent_graph` | Rust-backed in-process state plus read-only direct SQLite queries for runs, graphs, state, and receipts | Native extension required for the accelerator; active by default when available; writes remain MCP-mediated; `HERMES_RI_AGENT_GRAPH=0` disables the read accelerator; `HERMES_RI_AGENT_GRAPH_DB` selects the DB |
 | `ri_poly_kv` | Shape validation, synthetic-pool receipts, local cosine/top-k scoring, and compressed-domain integration points | Native extension required; `HERMES_RI_POLY_KV=0` disables; the adapter returns `None` on errors so callers can use the MCP path; the scorer is alpha |
