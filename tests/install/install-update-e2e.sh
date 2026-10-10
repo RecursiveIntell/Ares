@@ -254,6 +254,18 @@ require_hermes_works() {
   ok "hermes runs $when"
 }
 
+# A Python version probe cannot prove the Node refresh succeeded. Historical
+# updaters can warn about a failed npm install and still return zero, leaving
+# the target checkout with missing TUI/web dependencies. Check only after the
+# current target lands: the old release's dependency contract may differ.
+require_node_deps_work() {
+  if ! in_sandbox "bash $INSTALL_DIR/scripts/sandbox/check-node-deps.sh $INSTALL_DIR"; then
+    collect_sandbox_logs node-health
+    fail 'required Node dependencies are missing or invalid after updating'
+  fi
+  ok 'required Node dependencies are healthy after updating'
+}
+
 # ── install the earlier Hermes ─────────────────────────────────────────────
 step "installing upstream $INSTALL_REF (real curl | install.sh: uv, Python, Node, venv)"
 install_in_sandbox "install of upstream $INSTALL_REF" "$INSTALL_REF" install
@@ -278,9 +290,17 @@ case "$ROUTE" in
     else
       update_cmd="hermes update </dev/null"
     fi
-    if ! in_sandbox "cd $INSTALL_DIR && $update_cmd"; then
-      collect_sandbox_logs update
-      fail "hermes update failed ($update_cmd)"
+    # Preserve the updater transcript too: a zero exit can still describe a
+    # partial dependency refresh that the final health gate rejects. pipefail
+    # retains the updater status instead of accepting tee's successful write.
+    update_status=0
+    in_sandbox "cd $INSTALL_DIR && $update_cmd" 2>&1 | tee "$LOG_DIR/update.log" \
+      || update_status=$?
+    # Every later sandbox invocation starts a fresh proxy log. Preserve the
+    # update's network evidence before HEAD/version/health probes replace it.
+    collect_sandbox_logs update
+    if [ "$update_status" -ne 0 ]; then
+      fail "hermes update failed ($update_cmd, exit $update_status)"
     fi
     require_landed_on_target 'hermes update'
     require_hermes_works 'after hermes update'
@@ -294,6 +314,8 @@ case "$ROUTE" in
     require_hermes_works 'after installer re-run'
     ;;
 esac
+
+require_node_deps_work
 
 printf '\n\033[1;32m✓ install/update E2E passed (route: %s, from: %s)\033[0m\n' \
   "$ROUTE" "$INSTALL_REF"
