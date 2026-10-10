@@ -2416,3 +2416,54 @@ class TestGetByPrefix:
         result = registry.poll("4dae56ca")
         assert result["session_id"] == "proc_4dae56ca81f6"
         assert result["status"] == "running"
+
+
+class TestKillContainmentFidelity:
+    """S1-04.03: kill_process must distinguish tracked-tree exit from quiescence.
+
+    A PID tree-walk signal reaches the tracked tree, but a descendant reparented
+    via setsid + double-fork is not reachable by lineage.  Only the systemd
+    cgroup scope is guaranteed to reap those, so the result must report the
+    distinction and never let "status: killed" be read as "quiesced".
+    """
+
+    def test_kill_reports_containment_verdict(self, registry):
+        session = registry.spawn_local("sleep 30", cwd="/tmp")
+        time.sleep(0.5)
+        result = registry.kill_process(session.id)
+        assert result["status"] == "killed"
+        assert "containment" in result, "kill_process must report containment fidelity"
+        c = result["containment"]
+        assert c["fidelity"] in ("tree", "cgroup")
+        assert c["quiescence"] in ("tree_only", "verified")
+        # A session with no owned systemd scope must NOT claim verified quiescence.
+        if not getattr(session, "systemd_unit", None):
+            assert c["fidelity"] == "tree"
+            assert c["quiescence"] == "tree_only"
+
+    def test_verdict_scope_stop_failure_is_downgraded(self):
+        # P1: a nonempty unit whose stop did NOT succeed must never be "verified".
+        s = _make_session(sid="proc_cv1")
+        s.systemd_unit = "ares-worker-x.service"
+        v = ProcessRegistry._containment_verdict(s, scope_stopped=False)
+        assert v["fidelity"] == "tree"
+        assert v["quiescence"] == "tree_only"
+
+    def test_verdict_scope_stop_success_is_verified(self):
+        s = _make_session(sid="proc_cv2")
+        s.systemd_unit = "ares-worker-x.service"
+        v = ProcessRegistry._containment_verdict(s, scope_stopped=True)
+        assert v["fidelity"] == "cgroup"
+        assert v["quiescence"] == "verified"
+
+    def test_verdict_unscoped_is_tree_only(self):
+        s = _make_session(sid="proc_cv3")
+        v = ProcessRegistry._containment_verdict(s)
+        assert v["fidelity"] == "tree"
+        assert v["quiescence"] == "tree_only"
+
+    def test_verdict_sandbox_is_pid_only(self):
+        s = _make_session(sid="proc_cv4")
+        v = ProcessRegistry._containment_verdict(s, pid_only=True)
+        assert v["fidelity"] == "pid_only"
+        assert v["quiescence"] == "unverified"
