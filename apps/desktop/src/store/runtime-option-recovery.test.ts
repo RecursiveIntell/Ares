@@ -42,12 +42,15 @@ function context(response: unknown, dimension: 'effort' | 'fast' = 'effort') {
   }
 }
 
-it.each([undefined, null, '', '   ', 0, false])('does not accept readback with unproven host boot %#', async host_boot_id => {
-  const ctx = context({ owner: 'compute_host', session_id: 'r', host_boot_id, value: 'high' })
-  await reconcileRuntimeOptionFailure(Object.assign(new Error('unknown'), { code: 5019 }), ctx)
-  expect(ctx.applyObserved).not.toHaveBeenCalled()
-  expect($sessionStates.get().r.unconfirmedRuntimeOptions).toEqual(['effort'])
-})
+it.each([undefined, null, '', '   ', 0, false])(
+  'does not accept readback with unproven host boot %#',
+  async host_boot_id => {
+    const ctx = context({ owner: 'compute_host', session_id: 'r', host_boot_id, value: 'high' })
+    await reconcileRuntimeOptionFailure(Object.assign(new Error('unknown'), { code: 5019 }), ctx)
+    expect(ctx.applyObserved).not.toHaveBeenCalled()
+    expect($sessionStates.get().r.unconfirmedRuntimeOptions).toEqual(['effort'])
+  }
+)
 
 it.each([
   ['effort', 'none', 'none'],

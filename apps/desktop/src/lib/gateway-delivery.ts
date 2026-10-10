@@ -21,7 +21,10 @@ export const NON_REPLAYABLE_GATEWAY_METHODS = new Set([
 export class GatewayDeliveryUnknownError extends Error {
   readonly cause: unknown
 
-  constructor(readonly method: string, cause: unknown) {
+  constructor(
+    readonly method: string,
+    cause: unknown
+  ) {
     super(`${method} delivery status is unknown; the gateway may have accepted it, so the request was not retried.`)
     this.name = 'GatewayDeliveryUnknownError'
     this.cause = cause

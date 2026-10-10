@@ -1,23 +1,33 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import { createBackendConnectionState } from './backend-connection-state'
-import { assertDelegatedLocalDialCurrent, BackendDialClaims, type RegistryBackendDial, resolveRegistryDialOptions } from './backend-dial-claim'
+import {
+  assertDelegatedLocalDialCurrent,
+  BackendDialClaims,
+  type RegistryBackendDial,
+  resolveRegistryDialOptions
+} from './backend-dial-claim'
 import { backendScopeKey, normalizeRegistry, parseBackendScopeKey } from './connection-registry'
 
-const registry = () => normalizeRegistry({
-  primary: 'gateway', connections: [
-    { id: 'local', kind: 'local', label: 'This device' },
-    { id: 'gateway', kind: 'remote', label: 'Gateway', url: 'http://127.0.0.1:38951' },
-    { id: 'other', kind: 'remote', label: 'Other', url: 'http://127.0.0.1:38952' }
-  ]
-})
+const registry = () =>
+  normalizeRegistry({
+    primary: 'gateway',
+    connections: [
+      { id: 'local', kind: 'local', label: 'This device' },
+      { id: 'gateway', kind: 'remote', label: 'Gateway', url: 'http://127.0.0.1:38951' },
+      { id: 'other', kind: 'remote', label: 'Other', url: 'http://127.0.0.1:38952' }
+    ]
+  })
 
 const options = (globalRemote = true) => ({ globalRemote, profileRemoteOverride: false, primaryProfile: 'default' })
 
 function deferred<T>() {
   let resolve!: (value: T) => void
   let reject!: (error: Error) => void
-  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no })
+  const promise = new Promise<T>((yes, no) => {
+    resolve = yes
+    reject = no
+  })
 
   return { promise, resolve, reject }
 }
@@ -40,10 +50,14 @@ describe('resolved registry dial admission', () => {
       const startLocal = () => claims.runRegistry(registry(), 'local', 'default', options(), localDial)
       const startRemote = () => claims.run(backendScopeKey(null, 'default'), remoteDial)
 
-      const [localResult, remoteResult] = first === 'local'
-        ? [startLocal(), startRemote()] : (() => { const result = startRemote();
+      const [localResult, remoteResult] =
+        first === 'local'
+          ? [startLocal(), startRemote()]
+          : (() => {
+              const result = startRemote()
 
- return [startLocal(), result] })()
+              return [startLocal(), result]
+            })()
 
       local.resolve('native-local39609')
       remote.resolve('remote-primary38951')
@@ -128,11 +142,13 @@ describe('resolved registry dial admission', () => {
     await rejection
     expect(transport).not.toHaveBeenCalled()
     expect(claims.inFlight('default')).toBe(false)
-    expect(await claims.runRegistry(registry(), 'local', 'default', current, route => {
-      assertDelegatedLocalDialCurrent(route, current)
+    expect(
+      await claims.runRegistry(registry(), 'local', 'default', current, route => {
+        assertDelegatedLocalDialCurrent(route, current)
 
-      return route.localRoute?.poolKey
-    })).toBe('conn:local::default')
+        return route.localRoute?.poolKey
+      })
+    ).toBe('conn:local::default')
   })
 
   it('checks a captured nondefault primary for a late per-profile remote override', async () => {
@@ -159,8 +175,10 @@ describe('resolved registry dial admission', () => {
     expect(transport).not.toHaveBeenCalled()
     expect(claims.inFlight('work')).toBe(false)
     const subsequent = resolveRegistryDialOptions(null, 'work', false, lookup)
-    expect(await claims.runRegistry(registry(), 'local', null, subsequent, route => route.localRoute))
-      .toEqual({ delegate: false, poolKey: 'conn:local::default' })
+    expect(await claims.runRegistry(registry(), 'local', null, subsequent, route => route.localRoute)).toEqual({
+      delegate: false,
+      poolKey: 'conn:local::default'
+    })
   })
 
   it('uses the actual local resolver for per-profile remote overrides', async () => {
@@ -168,12 +186,17 @@ describe('resolved registry dial admission', () => {
     const legacy = deferred<string>()
     const remote = claims.run('work', () => legacy.promise)
 
-    const local = claims.runRegistry(registry(), 'local', 'work',
-      { ...options(false), profileRemoteOverride: true }, route => {
+    const local = claims.runRegistry(
+      registry(),
+      'local',
+      'work',
+      { ...options(false), profileRemoteOverride: true },
+      route => {
         expect(route.localRoute).toEqual({ delegate: false, poolKey: 'conn:local::work' })
 
         return 'local-work'
-      })
+      }
+    )
 
     legacy.resolve('remote-work')
     expect(await local).toBe('local-work')
@@ -226,7 +249,11 @@ describe('resolved registry dial admission', () => {
     current.connections = current.connections.filter(source => source.id !== 'local')
     const next = claims.runRegistry(registry(), 'local', 'default', opts, route => route.localRoute)
     ready.resolve()
-    expect(await first).toEqual({ id: 'local', source: 'local', localRoute: { delegate: false, poolKey: 'conn:local::default' } })
+    expect(await first).toEqual({
+      id: 'local',
+      source: 'local',
+      localRoute: { delegate: false, poolKey: 'conn:local::default' }
+    })
     expect(await next).toEqual({ delegate: true, poolKey: 'default' })
   })
 
@@ -236,9 +263,16 @@ describe('resolved registry dial admission', () => {
     const primary = claims.run('default', () => primaryReady.promise)
     const controller = new AbortController()
 
-    const cancelled = claims.runRegistry(registry(), 'local', 'default', options(), () => new Promise<string>((_resolve, reject) => {
-      controller.signal.addEventListener('abort', () => reject(new Error('dial cancelled')), { once: true })
-    }))
+    const cancelled = claims.runRegistry(
+      registry(),
+      'local',
+      'default',
+      options(),
+      () =>
+        new Promise<string>((_resolve, reject) => {
+          controller.signal.addEventListener('abort', () => reject(new Error('dial cancelled')), { once: true })
+        })
+    )
 
     const waiter = claims.runRegistry(registry(), 'local', 'default', options(), () => 'duplicate')
     const outcomes = Promise.allSettled([cancelled, waiter])
@@ -246,7 +280,11 @@ describe('resolved registry dial admission', () => {
     expect((await outcomes).every(result => result.status === 'rejected')).toBe(true)
     expect(claims.inFlight('conn:local::default')).toBe(false)
     expect(claims.inFlight('default')).toBe(true)
-    await expect(claims.runRegistry(registry(), 'local', 'default', options(), () => { throw new Error('dial failed') })).rejects.toThrow('dial failed')
+    await expect(
+      claims.runRegistry(registry(), 'local', 'default', options(), () => {
+        throw new Error('dial failed')
+      })
+    ).rejects.toThrow('dial failed')
     expect(claims.inFlight('conn:local::default')).toBe(false)
     expect(await claims.runRegistry(registry(), 'local', 'default', options(), () => 'replacement')).toBe('replacement')
     primaryReady.resolve('unchanged-primary')

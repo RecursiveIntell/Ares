@@ -19,7 +19,12 @@ import { confirm } from '@/store/confirm'
 import { notify, notifyError } from '@/store/notifications'
 import type { CustomEndpoint, CustomEndpointUpdate } from '@/types/hermes'
 
-import { requireCurrentModelOwner, useModelFormKey, useModelOwnerIsCurrent, useModelRequestOwner } from '../hooks/use-composer-model-owner'
+import {
+  requireCurrentModelOwner,
+  useModelFormKey,
+  useModelOwnerIsCurrent,
+  useModelRequestOwner
+} from '../hooks/use-composer-model-owner'
 
 import { EmptyState, Pill, SectionHeading, SettingsContent, SettingsSkeleton } from './primitives'
 
@@ -83,10 +88,21 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
   const owner = useModelRequestOwner()
   const formKey = useModelFormKey(owner)
 
-  return <CustomEndpointsForm key={formKey} onConfigSaved={onConfigSaved} onMainModelChanged={onMainModelChanged} owner={owner} />
+  return (
+    <CustomEndpointsForm
+      key={formKey}
+      onConfigSaved={onConfigSaved}
+      onMainModelChanged={onMainModelChanged}
+      owner={owner}
+    />
+  )
 }
 
-function CustomEndpointsForm({ onConfigSaved, onMainModelChanged, owner }: CustomEndpointsSettingsProps & { owner: ComposerSelectionOwner }) {
+function CustomEndpointsForm({
+  onConfigSaved,
+  onMainModelChanged,
+  owner
+}: CustomEndpointsSettingsProps & { owner: ComposerSelectionOwner }) {
   const isOwnerCurrent = useModelOwnerIsCurrent(owner)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)

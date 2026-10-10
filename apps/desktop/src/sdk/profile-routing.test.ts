@@ -1101,7 +1101,9 @@ describe('profile-aware plugin session opens', () => {
     expect(diagnostic).toBeDefined()
     expect(diagnostic).toHaveLength(1)
     expect(JSON.parse(String(diagnostic?.[0]).slice('[bot-wake] timeout '.length))).toMatchObject({
-      phase: 'activation', storedSessionId: 'wedged-chat', profile: 'medicina',
+      phase: 'activation',
+      storedSessionId: 'wedged-chat',
+      profile: 'medicina',
       hydrationWaitMs: 0
     })
 

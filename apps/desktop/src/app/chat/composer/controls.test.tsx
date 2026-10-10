@@ -171,7 +171,13 @@ describe('ComposerControls shortcut tooltips', () => {
   })
 
   it('keeps the draft and prevents duplicate sends while Stop is pending', () => {
-    renderControls({ busy: true, busyAction: 'steer', hasComposerPayload: true, interruptPending: true, onStop: vi.fn() })
+    renderControls({
+      busy: true,
+      busyAction: 'steer',
+      hasComposerPayload: true,
+      interruptPending: true,
+      onStop: vi.fn()
+    })
 
     const stop = screen.getByRole('button', { name: 'Stop' })
     const send = screen.getByRole('button', { name: 'Send' })

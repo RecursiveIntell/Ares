@@ -54,12 +54,12 @@ export function ModelPickerOverlay({ gateway, onSelect, profile }: ModelPickerOv
 
   const owner = knownOwnerForSession(sessionId)
   const draftSelection = !sessionId ? getComposerModelSelection(draftOwner) : null
-  const ownerProfile = typeof owner === 'string' ? owner : (owner?.targetProfile || owner?.profile)
+  const ownerProfile = typeof owner === 'string' ? owner : owner?.targetProfile || owner?.profile
   const ownerConnection = owner && typeof owner === 'object' ? owner.connectionId : owner ? null : undefined
 
   return (
     <ModelPickerDialog
-      connectionId={owner ? ownerConnection : (!sessionId ? draftOwner.connectionId : undefined)}
+      connectionId={owner ? ownerConnection : !sessionId ? draftOwner.connectionId : undefined}
       currentModel={sessionId ? currentModel : draftSelection?.model || ''}
       currentProvider={sessionId ? currentProvider : draftSelection?.provider || ''}
       gw={gateway}
@@ -67,9 +67,13 @@ export function ModelPickerOverlay({ gateway, onSelect, profile }: ModelPickerOv
       onSelect={selection => onSelect({ ...selection, sessionId })}
       open={open}
       profile={ownerProfile || (!sessionId ? draftOwner.targetProfile || draftOwner.profile : profile)}
-      request={!sessionId
-        ? (method, params) => requestGatewayForAgent(draftOwner.connectionId, draftOwner.profile, method, params)
-        : gateway ? (method, params) => requestForOwnedSession(sessionId, gateway.request.bind(gateway), method, params) : undefined}
+      request={
+        !sessionId
+          ? (method, params) => requestGatewayForAgent(draftOwner.connectionId, draftOwner.profile, method, params)
+          : gateway
+            ? (method, params) => requestForOwnedSession(sessionId, gateway.request.bind(gateway), method, params)
+            : undefined
+      }
       selectionIsAuthoritative={Boolean(draftSelection)}
       sessionId={sessionId}
     />

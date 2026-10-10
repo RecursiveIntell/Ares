@@ -149,14 +149,11 @@ export function ModelCatalogMenu({
     // Gateway-first even with no session: a connected (possibly remote)
     // gateway owns the model catalog, including virtual providers the local
     // REST fallback can't know about (#53817).
-    queryFn: (): Promise<ModelOptionsResponse> => requestModelOptions({ connectionId, gateway, profile, request, sessionId })
+    queryFn: (): Promise<ModelOptionsResponse> =>
+      requestModelOptions({ connectionId, gateway, profile, request, sessionId })
   })
 
-  const {
-    data: modelOptionsData,
-    isFetching: modelOptionsFetching,
-    refetch: refetchModelOptions
-  } = modelOptions
+  const { data: modelOptionsData, isFetching: modelOptionsFetching, refetch: refetchModelOptions } = modelOptions
 
   const [emptyCatalogRetryAttempt, setEmptyCatalogRetryAttempt] = useState(0)
 

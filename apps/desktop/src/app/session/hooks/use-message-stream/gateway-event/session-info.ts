@@ -253,11 +253,7 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
           const { model: _incomingModel, provider: _incomingProvider, ...nonModelStatePatch } = statePatch
           const effectiveStatePatch = repeatsPreviousModel ? nonModelStatePatch : statePatch
 
-          const pendingModelSelection = repeatsPreviousModel
-            ? pending
-            : hasIncomingModelMetadata
-              ? null
-              : pending
+          const pendingModelSelection = repeatsPreviousModel ? pending : hasIncomingModelMetadata ? null : pending
 
           return {
             ...state,
@@ -433,7 +429,9 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
       const eventConnection = event.connectionId?.trim() || undefined
       const eventProfile = event.profile?.trim() || undefined
 
-      const matchesOwner = owner && (!eventConnection || eventConnection === owner.connectionId) &&
+      const matchesOwner =
+        owner &&
+        (!eventConnection || eventConnection === owner.connectionId) &&
         (!eventProfile || eventProfile === owner.profile || eventProfile === owner.targetProfile)
 
       const completeEventOwner = eventConnection && eventProfile
@@ -444,7 +442,10 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
       // one exact cache. Invalidate the catalog family without mixing owners.
       const exactOwner = matchesOwner || completeEventOwner || legacyUnstamped
       void queryClient.invalidateQueries({
-        queryKey: explicitSid && sessionId && exactOwner ? modelOptionsQueryKey(catalogProfile, sessionId, catalogConnection) : ['model-options']
+        queryKey:
+          explicitSid && sessionId && exactOwner
+            ? modelOptionsQueryKey(catalogProfile, sessionId, catalogConnection)
+            : ['model-options']
       })
     }
 

@@ -278,7 +278,7 @@ describe('useGatewayRequest', () => {
     expect(gateway.connect).toHaveBeenLastCalledWith(expect.stringContaining('ticket=fresh-2'))
   })
 
-  it.each(['session.interrupt', 'session.redirect', 'session.steer', 'prompt.submit']) (
+  it.each(['session.interrupt', 'session.redirect', 'session.steer', 'prompt.submit'])(
     'does not replay non-idempotent %s after transport failure',
     async method => {
       const { gateway } = await activateRemoteGateway()

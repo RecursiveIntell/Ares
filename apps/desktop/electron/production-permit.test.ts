@@ -26,9 +26,11 @@ class FakeSafeStorage implements SafeStoragePort {
 
   decryptString(value: Buffer): string {
     const text = value.toString('utf8')
+
     if (!text.startsWith('encrypted:')) {
       throw new Error('not encrypted')
     }
+
     return text.slice('encrypted:'.length)
   }
 }
@@ -70,11 +72,13 @@ describe('production permit Electron signer', () => {
     const controller = createProductionPermitController(root, new FakeSafeStorage())
     const witness = controller.requestSignedWitness(envelope(root))
     const publicMaterial = controller.publicKeyForEnrollment()
+
     const publicKey = crypto.createPublicKey({
       key: Buffer.from(publicMaterial.public_key, 'base64'),
       format: 'der',
       type: 'spki'
     })
+
     const { signature, ...payload } = witness
 
     expect(signature).toHaveLength(64)
@@ -82,12 +86,7 @@ describe('production permit Electron signer', () => {
     expect(publicMaterial.verifier_enrollment.schema).toBe('recursive-agent.desktop-production-public-key/v1')
     expect(Buffer.from(publicMaterial.verifier_enrollment.public_key, 'base64')).toHaveLength(32)
     expect(
-      crypto.verify(
-        null,
-        Buffer.from(canonicalizeProductionPermit(payload)),
-        publicKey,
-        Buffer.from(signature)
-      )
+      crypto.verify(null, Buffer.from(canonicalizeProductionPermit(payload)), publicKey, Buffer.from(signature))
     ).toBe(true)
 
     const keyFile = path.join(root, 'production-permit-signing-key.enc')

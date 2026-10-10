@@ -70,11 +70,21 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
   const activeSessionId = useStore(view.$runtimeId)
   const owner = knownOwnerForSession(activeSessionId)
   const draftOwner = useDraftComposerOwner()
-  const connectionId = owner && typeof owner === 'object' ? owner.connectionId : owner ? null : !activeSessionId ? draftOwner.connectionId : activeGatewayConnectionId()
-  const catalogProfile = (typeof owner === 'string' ? owner : (owner?.targetProfile || owner?.profile)) || (!activeSessionId ? draftOwner.targetProfile || draftOwner.profile : profile)
+  const connectionId =
+    owner && typeof owner === 'object'
+      ? owner.connectionId
+      : owner
+        ? null
+        : !activeSessionId
+          ? draftOwner.connectionId
+          : activeGatewayConnectionId()
+  const catalogProfile =
+    (typeof owner === 'string' ? owner : owner?.targetProfile || owner?.profile) ||
+    (!activeSessionId ? draftOwner.targetProfile || draftOwner.profile : profile)
 
   const catalogRequest = !activeSessionId
-    ? <T,>(method: string, params?: Record<string, unknown>) => requestGatewayForAgent<T>(draftOwner.connectionId, draftOwner.profile, method, params)
+    ? <T,>(method: string, params?: Record<string, unknown>) =>
+        requestGatewayForAgent<T>(draftOwner.connectionId, draftOwner.profile, method, params)
     : requestGateway
 
   const unconfirmedOptions = useStore(
@@ -105,13 +115,23 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
   const modelOptions = useQuery({
     queryKey: modelOptionsQueryKey(catalogProfile, activeSessionId, connectionId),
     queryFn: (): Promise<ModelOptionsResponse> =>
-      requestModelOptions({ connectionId, gateway, profile: catalogProfile, request: catalogRequest, sessionId: activeSessionId })
+      requestModelOptions({
+        connectionId,
+        gateway,
+        profile: catalogProfile,
+        request: catalogRequest,
+        sessionId: activeSessionId
+      })
   })
 
   const { model: optionsModel, provider: optionsProvider } = currentPickerSelection(
     activeSessionId
       ? { model: currentModel, provider: currentProvider }
-      : { model: draftSelection?.model || '', provider: draftSelection?.provider || '', authoritative: Boolean(draftSelection) },
+      : {
+          model: draftSelection?.model || '',
+          provider: draftSelection?.provider || '',
+          authoritative: Boolean(draftSelection)
+        },
     modelOptions.data
   )
 

@@ -84,25 +84,45 @@ async function renderSettings(changed = vi.fn()) {
 
 describe('custom endpoint save ownership', () => {
   it('clears source A form authority and key draft when the same profile rehomes to B and back', async () => {
-    const second = { ...endpoint, name: 'Source B endpoint', model: 'model-b', models: ['model-b'], base_url: 'https://b.invalid/v1' }
+    const second = {
+      ...endpoint,
+      name: 'Source B endpoint',
+      model: 'model-b',
+      models: ['model-b'],
+      base_url: 'https://b.invalid/v1'
+    }
 
     const rehome = (connectionId: string) => {
       setApiRequestConnection(connectionId)
       $connection.set({ connectionId } as never)
-      $newChatRoute.set({ connectionId, profile: owner.profile, targetProfile: connectionId === 'source-a' ? 'backend-a' : 'backend-b' })
+      $newChatRoute.set({
+        connectionId,
+        profile: owner.profile,
+        targetProfile: connectionId === 'source-a' ? 'backend-a' : 'backend-b'
+      })
     }
 
-    getCustomEndpoints.mockImplementation(async () => ({ endpoints: [getApiRequestConnection() === 'source-b' ? second : endpoint] }))
+    getCustomEndpoints.mockImplementation(async () => ({
+      endpoints: [getApiRequestConnection() === 'source-b' ? second : endpoint]
+    }))
     saveCustomEndpoint.mockResolvedValue({ id: second.id, endpoints: [second] })
     await renderSettings()
-    fireEvent.change(screen.getByPlaceholderText('Leave blank to keep current key'), { target: { value: 'fake-source-a-key' } })
+    fireEvent.change(screen.getByPlaceholderText('Leave blank to keep current key'), {
+      target: { value: 'fake-source-a-key' }
+    })
     await act(async () => rehome('source-b'))
     await screen.findByDisplayValue(second.base_url)
     expect((screen.getByPlaceholderText('Leave blank to keep current key') as HTMLInputElement).value).toBe('')
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
-    await waitFor(() => expect(saveCustomEndpoint).toHaveBeenCalledWith(expect.objectContaining({
-      base_url: second.base_url, model: second.model, api_key: undefined
-    })))
+    await waitFor(() =>
+      expect(saveCustomEndpoint).toHaveBeenCalledWith(
+        expect.objectContaining({
+          base_url: second.base_url,
+          model: second.model,
+          api_key: undefined
+        })
+      )
+    )
     await act(async () => rehome('source-a'))
     await screen.findByDisplayValue(endpoint.base_url)
   })
@@ -118,7 +138,11 @@ describe('custom endpoint save ownership', () => {
     const rehome = (connectionId: string) => {
       setApiRequestConnection(connectionId)
       $connection.set({ connectionId } as never)
-      $newChatRoute.set({ connectionId, profile: owner.profile, targetProfile: connectionId === 'source-a' ? 'backend-a' : 'backend-b' })
+      $newChatRoute.set({
+        connectionId,
+        profile: owner.profile,
+        targetProfile: connectionId === 'source-a' ? 'backend-a' : 'backend-b'
+      })
     }
 
     await act(async () => rehome('source-b'))
@@ -145,7 +169,10 @@ describe('custom endpoint save ownership', () => {
       confirmation.resolve(true)
     })
     expect(deleteCustomEndpoint).not.toHaveBeenCalled()
-    expect(notifyError).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringMatching(/target changed/i) }), 'Delete failed')
+    expect(notifyError).toHaveBeenCalledWith(
+      expect.objectContaining({ message: expect.stringMatching(/target changed/i) }),
+      'Delete failed'
+    )
     await waitFor(() => expect(getCustomEndpoints).toHaveBeenCalledTimes(2))
     await screen.findByDisplayValue(endpoint.base_url)
     fireEvent.click(await screen.findByRole('button', { name: 'Save' }))

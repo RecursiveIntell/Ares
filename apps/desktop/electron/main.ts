@@ -46,7 +46,12 @@ import {
 } from './backend-claim'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
-import { assertDelegatedLocalDialCurrent, BackendDialClaims, type RegistryBackendDial, resolveRegistryDialOptions } from './backend-dial-claim'
+import {
+  assertDelegatedLocalDialCurrent,
+  BackendDialClaims,
+  type RegistryBackendDial,
+  resolveRegistryDialOptions
+} from './backend-dial-claim'
 import { buildDesktopBackendEnv, hermesManagedNodePathEntries, normalizeHermesHomeRoot } from './backend-env'
 import {
   isReauthRequiredError,
@@ -349,7 +354,11 @@ import {
   SESSION_WINDOW_MIN_WIDTH
 } from './session-windows'
 import { ensureLoginShellPath } from './shell-path'
-import { createSpecialistDispatchAdmission, startSpecialistRunner, stopSpecialistRunner } from './specialist-dispatch-admission'
+import {
+  createSpecialistDispatchAdmission,
+  startSpecialistRunner,
+  stopSpecialistRunner
+} from './specialist-dispatch-admission'
 import { createSpecialistDispatchQuiesce, SpecialistQuiesceError } from './specialist-dispatch-quiesce'
 import { startSpecialistDispatchServer } from './specialist-dispatch-server'
 import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstrap-coordinator'
@@ -1405,6 +1414,7 @@ let softRehomeInProgress = false
 // byte-for-byte the single-backend behavior.
 const backendPool = new Map() // profile -> { process, port, token, connectionPromise, lastActiveAt }
 const profileDeletionGate = new ProfileDeletionGate()
+
 // Keep the pool light: cap concurrent profile backends (LRU eviction) and reap
 // idle ones. A user idles at exactly the primary backend; pool backends only
 // exist while a non-primary profile is actively being chatted through.
@@ -1417,6 +1427,7 @@ const POOL_MAX_BACKENDS = normalizeProfileBackendPoolMax(
   process.env.HERMES_DESKTOP_POOL_MAX,
   readProfileBackendPoolSettings(app.getPath('userData')).maxBackends
 )
+
 const POOL_IDLE_MS = Math.max(60_000, Number(process.env.HERMES_DESKTOP_POOL_IDLE_MS) || 10 * 60_000)
 
 // A backend touched within this window has a live renderer socket (the keepalive
@@ -11081,13 +11092,20 @@ function claimBackend(profile) {
 
 function claimRegistryBackend(connectionId, profile) {
   return backendDialClaims.runRegistry(
-    readDesktopConnectionsRegistry(), connectionId, profile,
+    readDesktopConnectionsRegistry(),
+    connectionId,
+    profile,
     resolveRegistryDialOptions(profile, primaryProfileKey(), globalRemoteActive(), profileHasRemoteOverride),
     route => ensureRegistryBackend(route.connectionId, profile, '', route)
   )
 }
 
-async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrelation = '', resolvedDial?: RegistryBackendDial) {
+async function ensureRegistryBackend(
+  connectionId,
+  profile,
+  managedUpdateCorrelation = '',
+  resolvedDial?: RegistryBackendDial
+) {
   const registry = resolvedDial?.registry || readDesktopConnectionsRegistry()
   const id = resolvedDial?.connectionId || String(connectionId || '').trim() || registry.primary
   const source = resolvedDial?.source || registry.connections.find(c => c.id === id)
@@ -11189,17 +11207,24 @@ async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrela
     specialistDispatchQuiesce.assertCanStart(profileKey)
     profileDeletionGate.assertCanStart(profileKey)
 
-    const localRoute = resolvedDial?.localRoute || resolveRegistryLocalRoute(profileKey, {
-      globalRemote: globalRemoteActive(),
-      profileRemoteOverride: Boolean(profileHasRemoteOverride(profileKey))
-    })
+    const localRoute =
+      resolvedDial?.localRoute ||
+      resolveRegistryLocalRoute(profileKey, {
+        globalRemote: globalRemoteActive(),
+        profileRemoteOverride: Boolean(profileHasRemoteOverride(profileKey))
+      })
 
     if (localRoute.delegate) {
       if (resolvedDial) {
-        assertDelegatedLocalDialCurrent(resolvedDial, resolveRegistryDialOptions(
-          resolvedDial.delegatedProfile ?? profileKey,
-          primaryProfileKey(), globalRemoteActive(), profileHasRemoteOverride
-        ))
+        assertDelegatedLocalDialCurrent(
+          resolvedDial,
+          resolveRegistryDialOptions(
+            resolvedDial.delegatedProfile ?? profileKey,
+            primaryProfileKey(),
+            globalRemoteActive(),
+            profileHasRemoteOverride
+          )
+        )
       }
 
       return ensureBackend(resolvedDial?.delegatedProfile ?? profile)
@@ -12215,65 +12240,69 @@ let specialistDispatchServer: Awaited<ReturnType<typeof startSpecialistDispatchS
 const specialistDispatchAdmission = createSpecialistDispatchAdmission({
   maxCapacity: POOL_MAX_BACKENDS,
   pool: backendPool,
-  stopRunner: child => stopSpecialistRunner(child, {
-    stopChild: owned => stopBackendChild(owned),
-    waitForExit: owned => waitForBackendExit(owned)
-  }),
-  spawnRunner: (request, maySpawn) => startSpecialistRunner(request, maySpawn, {
-    // Reuse Desktop's established runtime resolver, but do not accept a caller
-    // command. The only child command is this package-local runner.
-    resolveRuntime: () => ensureRuntime(resolveHermesBackend([])),
-    spawn: (backend, request) => {
-      if (!backend.command) {
-        throw new Error('specialist runner runtime is unavailable')
+  stopRunner: child =>
+    stopSpecialistRunner(child, {
+      stopChild: owned => stopBackendChild(owned),
+      waitForExit: owned => waitForBackendExit(owned)
+    }),
+  spawnRunner: (request, maySpawn) =>
+    startSpecialistRunner(request, maySpawn, {
+      // Reuse Desktop's established runtime resolver, but do not accept a caller
+      // command. The only child command is this package-local runner.
+      resolveRuntime: () => ensureRuntime(resolveHermesBackend([])),
+      spawn: (backend, request) => {
+        if (!backend.command) {
+          throw new Error('specialist runner runtime is unavailable')
+        }
+
+        const cwd = backend.root || resolveHermesCwd()
+
+        const child = spawn(
+          backend.command,
+          ['-m', 'ares_runtime.specialist_dispatch', 'runner'],
+          hiddenWindowsChildOptions({
+            cwd,
+            detached: true,
+            env: {
+              ...process.env,
+              ...backend.env,
+              // The runner begins in the default Ares home, then explicitly
+              // selects the one profile home per worker. A backend resolver must
+              // never override that isolation boundary through its own env map.
+              HERMES_HOME,
+              TERMINAL_CWD: cwd
+            },
+            stdio: ['pipe', 'ignore', 'ignore']
+          })
+        )
+
+        let timedOut = false
+
+        const timeout = setTimeout(() => {
+          timedOut = true
+          rememberLog(
+            `[specialist] runner ${request.runId} exceeded the bounded deadline; stopping its owned process group`
+          )
+          void specialistDispatchAdmission.cancel(request.runId, 'runner_failed').catch(error => {
+            rememberLog(`[specialist] runner ${request.runId} deadline cleanup failed: ${error.message}`)
+          })
+        }, SPECIALIST_RUNNER_TIMEOUT_MS)
+
+        timeout.unref?.()
+        child.once('error', error => {
+          clearTimeout(timeout)
+          rememberLog(`[specialist] runner ${request.runId} failed to start: ${error.message}`)
+          specialistDispatchAdmission.release(request.runId, 'runner_failed')
+        })
+        child.once('exit', code => {
+          clearTimeout(timeout)
+          specialistDispatchAdmission.release(request.runId, code === 0 && !timedOut ? 'released' : 'runner_failed')
+        })
+        child.stdin?.end(request.runnerInput || '')
+
+        return child
       }
-
-      const cwd = backend.root || resolveHermesCwd()
-
-      const child = spawn(
-        backend.command,
-        ['-m', 'ares_runtime.specialist_dispatch', 'runner'],
-        hiddenWindowsChildOptions({
-          cwd,
-          detached: true,
-          env: {
-            ...process.env,
-            ...backend.env,
-            // The runner begins in the default Ares home, then explicitly
-            // selects the one profile home per worker. A backend resolver must
-            // never override that isolation boundary through its own env map.
-            HERMES_HOME,
-            TERMINAL_CWD: cwd
-          },
-          stdio: ['pipe', 'ignore', 'ignore']
-        })
-      )
-
-      let timedOut = false
-
-      const timeout = setTimeout(() => {
-        timedOut = true
-        rememberLog(`[specialist] runner ${request.runId} exceeded the bounded deadline; stopping its owned process group`)
-        void specialistDispatchAdmission.cancel(request.runId, 'runner_failed').catch(error => {
-          rememberLog(`[specialist] runner ${request.runId} deadline cleanup failed: ${error.message}`)
-        })
-      }, SPECIALIST_RUNNER_TIMEOUT_MS)
-
-      timeout.unref?.()
-      child.once('error', error => {
-        clearTimeout(timeout)
-        rememberLog(`[specialist] runner ${request.runId} failed to start: ${error.message}`)
-        specialistDispatchAdmission.release(request.runId, 'runner_failed')
-      })
-      child.once('exit', code => {
-        clearTimeout(timeout)
-        specialistDispatchAdmission.release(request.runId, code === 0 && !timedOut ? 'released' : 'runner_failed')
-      })
-      child.stdin?.end(request.runnerInput || '')
-
-      return child
-    }
-  })
+    })
 })
 
 async function startSpecialistDispatchTransport() {
@@ -15133,9 +15162,7 @@ async function enumerateRegistryAgentSources(registry = readDesktopConnectionsRe
           // own reconnect dial for the same connection; coalescing avoids
           // bootstrapping a second SSH tunnel / remote dashboard.
           const descriptor: any = await withEnumerationDeadline(
-            Promise.resolve(
-              claimRegistryBackend(connection.id, null)
-            )
+            Promise.resolve(claimRegistryBackend(connection.id, null))
           )
 
           const body: any = await getJsonForBackend(descriptor, '/api/profiles', { timeoutMs: 8_000 })
@@ -17000,6 +17027,7 @@ ipcMain.handle('hermes:production-permit:sign', (event, envelope) => {
   if (!event.sender || event.sender.isDestroyed()) {
     throw new Error('production permit renderer unavailable')
   }
+
   return productionPermitController.requestSignedWitness(envelope)
 })
 ipcMain.handle('hermes:production-permit:public-key', () => productionPermitController.publicKeyForEnrollment())
@@ -17533,7 +17561,9 @@ app.whenReady().then(() => {
   installRemoteHeaderRules()
   registerDeepLinkProtocol()
   void startSpecialistDispatchTransport().catch(error => {
-    rememberLog(`[specialist] explicit dispatch transport unavailable: ${error instanceof Error ? error.message : String(error)}`)
+    rememberLog(
+      `[specialist] explicit dispatch transport unavailable: ${error instanceof Error ? error.message : String(error)}`
+    )
   })
 
   ensureWslWindowsFonts()

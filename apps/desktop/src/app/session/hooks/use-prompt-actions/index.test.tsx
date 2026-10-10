@@ -2313,7 +2313,9 @@ describe('usePromptActions submit / queue drain semantics', () => {
     )
 
     const sending = handle!.submitTextRaw('raced with a live turn')
-    await vi.waitFor(() => expect(requestGateway).toHaveBeenCalledWith('prompt.submit', expect.anything(), expect.anything()))
+    await vi.waitFor(() =>
+      expect(requestGateway).toHaveBeenCalledWith('prompt.submit', expect.anything(), expect.anything())
+    )
     // The gateway reports the original turn live while the second submit is pending.
     handle!.replaceState({ ...states.at(-1), busy: true, awaitingResponse: true, turnLive: true, streamId: 'original' })
     rejectSubmit(new Error('4009: session busy'))
