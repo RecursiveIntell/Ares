@@ -8555,8 +8555,10 @@ function scheduleGroupOccurrenceReconciliation(occurrence) {
   }, GROUP_TURN_RECONCILE_INTERVAL_MS)
 }
 
-/** Plugin disposal stops only the automatic reads. Markers, leases and worker
- * reservations remain: stopping an observer is not terminal evidence. */
+/** Plugin disposal stops scheduling further automatic reads. Markers, leases
+ * and worker reservations remain: stopping an observer is not terminal
+ * evidence. A read already in flight may still settle on exact terminal
+ * evidence, which is the same retirement path an explicit check uses. */
 let groupObservationStopped = false
 function stopGroupTurnObservation() {
   groupObservationStopped = true
@@ -8832,8 +8834,9 @@ async function runGroupChatMemberTurnLeased(group, captured, prompt, thread, ima
       const outcome = readGroupTurnOutcome(state, marker.delivery)
       if (!groupTurnMarkerIntentIsCurrent(roomAfterResume, marker)) {
         if (['complete', 'error', 'interrupted'].includes(outcome.state)) {
-          if (occurrence) occurrence.terminalObserved = true
-          consumeGroupTurnMarker(group, memberKey, marker)
+          // Evidence counts only once custody is actually retired; a refused
+          // consume (pending interrupt) keeps the marker and its locks.
+          if (consumeGroupTurnMarker(group, memberKey, marker) && occurrence) occurrence.terminalObserved = true
           return discarded()
         }
         if (marker.stop_requested || marker.hold_requested || roomAfterResume.holds?.[memberKey]) return discarded()
