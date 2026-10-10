@@ -195,6 +195,9 @@ use the new controller's `setup --transition-from-legacy EXACT_CURRENT_SHA`
 with the full 40-character selected revision. The installed old `ares` launcher
 cannot emit the new binding contract. Preserve existing release bytes; this
 option does not repair a contract-1 release with missing or invalid bindings.
+For a CLI-only legacy release, also pass `--no-desktop` during this transition;
+the legacy probe otherwise requires a Desktop executable in that release.
+Build Desktop only in a later qualified release.
 
 The source-backed custody details are deliberately kept out of this quick-start block. Read [`docs/ares-candidate-custody.md`](docs/ares-candidate-custody.md) before treating candidate certification, audit state, or rollback state as an authority decision: certification and candidate-bundled activation input are explicitly non-authorizing until the CandidateStore-owned activation transition occurs.
 
