@@ -118,7 +118,7 @@ test('actual cold hydrate shows both accepted and legacy unknown markers despite
   assert.deepEqual(h.gc.groupBlockedMembers(room, MEMBERS).map(m => m.connectionId), ['local', 'remote-A'])
   assert.equal(h.gc.currentGroupActivity('Original').length, 0)
   const tree = h.gc.GroupBlockedNotice({ room, members: MEMBERS, onCreate: () => {} })
-  assert.equal(nodes(tree).filter(n => typeof n.props?.children === 'string' && n.props.children.includes('earlier outcome unknown')).length, 2)
+  assert.equal(nodes(tree).filter(n => typeof n.props?.children === 'string' && n.props.children.includes('reconciliation pending')).length, 2)
   assert.equal(h.execution().length, 0)
   h.dispose()
 })

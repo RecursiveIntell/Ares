@@ -596,7 +596,7 @@ test('running hard-cap expiration keeps admission custody and does not start que
   assert.equal(h.rpc('prompt.submit').length, 4)
   assert.equal(h.gc.groupRoomCoordinators.get('Room').active, 4)
   assert.ok(h.leases.every(l => l.releases === 0))
-  assert.equal(active(h).filter(o => o.collectorDone && o.phase === 'running').length, 4)
+  assert.equal(active(h).filter(o => o.collectorDone && o.phase === 'reconciling' && o.ownsWorker).length, 4)
   await h.gc.stopGroupThread('Room', 't1', h.roster); await pending; await flush()
   assert.ok(h.leases.every(l => l.releases === 1))
 })
