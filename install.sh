@@ -409,10 +409,24 @@ if final.exists():
     if result.returncode:
         raise SystemExit('Existing immutable release failed its enhancement probe; refusing to repair it in place.')
     manifest = previous
+# The release that will become `previous` after activation: if it was not
+# produced by this installer it carries none of the bundled tooling, so a
+# `ares rollback` to it would leave the enhanced configuration without its
+# tools. Record that in the receipt instead of presenting a silent breakage.
+previous_has_bundled_tools = True
+try:
+    current = runtime._release_from_link(runtime.paths.current_link, 'current')
+    if current is not None:
+        previous_has_bundled_tools = (current[1]/'.venv'/'share'/'ares-full-install.json').exists()
+        if not previous_has_bundled_tools:
+            print('[Ares] Note: the preserved previous release was not produced by this installer and lacks the bundled native tools; after this install, `ares rollback` to it leaves the enhanced configuration without its tooling. Roll forward again or rerun this installer to recover.')
+except Exception:
+    # Minimal runtimes or fixtures without pointer introspection: advisory only.
+    pass
 # Build and seal an INACTIVE release before changing an existing configuration.
 with runtime.locked():
     runtime._materialize(str(source), revision, desktop=desktop)
-receipt = {'schema':'ares-full-install/v1', 'created_at':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()), **manifest['inputs'], 'provider_setup':'pending', 'phase':'built_pending_activation', 'native_wheels':manifest['native_wheels']}
+receipt = {'schema':'ares-full-install/v1', 'created_at':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()), **manifest['inputs'], 'provider_setup':'pending', 'phase':'built_pending_activation', 'native_wheels':manifest['native_wheels'], 'rollback_previous_has_bundled_tools': previous_has_bundled_tools}
 directory = home/'install-receipts'
 directory.mkdir(exist_ok=True, mode=0o700)
 (directory/'latest.json').write_text(json.dumps(receipt, indent=2)+'\n')
@@ -422,9 +436,9 @@ STEP=configuration
 export ARES_INSTALL_BACKUP="$ARES_HOME/installer-backups/config-$(date +%s)-$$"
 CONFIG_PENDING=true
 "$BOOTSTRAP_PYTHON" - <<'PY'
-import json, os, shutil
+import hashlib, json, os, shutil
 from pathlib import Path
-from hermes_cli.config import load_config, save_config, save_env_value
+from hermes_cli.config import load_config, save_config
 
 home = Path(os.environ['ARES_HOME'])
 source = Path(os.environ['ARES_INSTALL_SOURCE'])
@@ -441,6 +455,41 @@ if os.environ['ARES_INSTALL_EXTRAS'] == 'true':
                 continue
             result[str(relative)] = ('link', str(path.readlink())) if path.is_symlink() else ('dir',) if path.is_dir() else ('file', path.read_bytes())
         return result
+    def skill_snapshot(root):
+        result = {}
+        for path in sorted(root.rglob('*')):
+            relative = path.relative_to(root)
+            if '__pycache__' in relative.parts or path.suffix == '.pyc':
+                continue
+            result[str(relative)] = ['dir'] if path.is_dir() else ['file', hashlib.sha256(path.read_bytes()).hexdigest()]
+        return result
+    def save_env_path(name, value):
+        """Persist a behavioral path in .env without the credential sanitizer.
+
+        ``hermes_cli.config.save_env_value`` strips every non-ASCII character
+        (it is written for API keys), which would corrupt the persisted paths
+        on a home whose directory name contains non-ASCII text. These are
+        filesystem paths, not credentials, so upsert them directly with the
+        same quoting semantics the shared writer uses.
+        """
+        quoted = value
+        if value == "" or any(ch in value for ch in "#\"'") or value != value.strip() or any(c.isspace() for c in value):
+            quoted = '"' + value.replace('\\', '\\\\').replace('"', '\\"') + '"'
+        env_path = home/'.env'
+        existing_lines = env_path.read_text(encoding='utf-8-sig').splitlines() if env_path.exists() else []
+        line = f'{name}={quoted}'
+        out, replaced = [], False
+        for raw in existing_lines:
+            probe = raw.strip()
+            if probe.startswith(f'{name}=') or probe.startswith(f'export {name}='):
+                out.append(line)
+                replaced = True
+            else:
+                out.append(raw)
+        if not replaced:
+            out.append(line)
+        env_path.write_text('\n'.join(out).rstrip('\n') + '\n', encoding='utf-8')
+        env_path.chmod(0o600)
     if plugin.is_symlink():
         if plugin.readlink() != plugin_target:
             raise SystemExit('Existing semantic-memory-mcp plugin link is customized; preserved. Reconcile it before rerunning.')
@@ -472,21 +521,79 @@ if os.environ['ARES_INSTALL_EXTRAS'] == 'true':
         'context_governor': {'command': str(home/'runtime'/'current'/'.venv'/'bin'/'python'), 'args': [str(kits/'hermes'/'scripts'/'context-governor-mcp.py')]},
     }
     existing = config.setdefault('mcp_servers', {})
+
+    def legacy_installer_shape(name, candidate):
+        # Exact shapes written by the superseded bootstrap installer, which a
+        # home installed before this one legitimately carries; migrate those
+        # while still rejecting genuinely customized entries.
+        if not isinstance(candidate, dict) or set(candidate) != {'command', 'enabled', 'args'} or candidate.get('enabled') is not True:
+            return False
+        stem = os.path.basename(str(candidate.get('command', '')))
+        if name == 'semantic_memory':
+            return stem == 'semantic-memory-mcp' and candidate.get('args') == ['--memory-dir', str(home/'semantic-memory.db')]
+        if name == 'claim_ledger':
+            return stem == 'claim-ledger-mcp' and candidate.get('args') == ['--ledger-dir', str(home/'claim-ledger')]
+        if name == 'agent_graph':
+            return stem == 'agent-graph-mcp' and candidate.get('args') in (
+                ['--socket', str(home/'agent-graph'/'run'/'mcp.sock')],
+                ['--socket', str(Path.home()/'.local'/'share'/'agent-graph'/'run'/'mcp.sock')],
+            )
+        return False
+
     for name, entry in servers.items():
         if name in existing and existing[name] != entry:
+            if legacy_installer_shape(name, existing[name]):
+                print(f'[Ares] Migrated configuration from the superseded installer: {name}')
+                existing[name] = entry
+                continue
             raise SystemExit(f'Existing MCP configuration {name!r} differs. Backup retained; reconcile it before rerunning.')
         existing[name] = entry
+    # The semantic-memory replacement is installer-enabled, so retire the
+    # overlapping built-in memory toolset: never keep both memory surfaces
+    # enabled at once (they pay for both schemas on every model request).
+    agent = config.setdefault('agent', {})
+    disabled = agent.setdefault('disabled_toolsets', [])
+    if 'memory' not in disabled:
+        print('[Ares] Disabled the built-in memory toolset for the semantic-memory replacement.')
+        disabled.append('memory')
     save_config(config)
-    save_env_value('CONTEXT_GOVERNOR_BIN', str(bins/'context-governor'))
-    save_env_value('CEA_GRAPH_BIN', str(bins/'cea-graph'))
-    save_env_value('SEMANTIC_MEMORY_KIT_ROOT', str(kits))
-    save_env_value('CONTEXT_GOVERNOR_STORE', str(home/'context-governor'/'receipts'))
-    save_env_value('HERMES_RI_AGENT_GRAPH_DB', str(home/'agent-graph'/'agent-graph.db'))
+    save_env_path('CONTEXT_GOVERNOR_BIN', str(bins/'context-governor'))
+    save_env_path('CEA_GRAPH_BIN', str(bins/'cea-graph'))
+    save_env_path('SEMANTIC_MEMORY_KIT_ROOT', str(kits))
+    save_env_path('CONTEXT_GOVERNOR_STORE', str(home/'context-governor'/'receipts'))
+    save_env_path('HERMES_RI_AGENT_GRAPH_DB', str(home/'agent-graph'/'agent-graph.db'))
+    skills_manifest_path = home/'skills'/'.ares-install-manifest.json'
+    skills_manifest = json.loads(skills_manifest_path.read_text()) if skills_manifest_path.exists() else {}
+    refreshed_skills = []
+    preserved_skills = []
     for root, prefix in [(source/'optional-skills', 'ares'), (kits_source/'hermes'/'skills', 'memory-kit')]:
         for skill in root.rglob('SKILL.md'):
-            dest = home/'skills'/prefix/skill.parent.relative_to(root)
+            key = str(Path(prefix)/skill.parent.relative_to(root))
+            dest = home/'skills'/key
             if not dest.exists():
                 shutil.copytree(skill.parent, dest)
+                skills_manifest[key] = skill_snapshot(skill.parent)
+                continue
+            current = skill_snapshot(dest)
+            if current == skill_snapshot(skill.parent):
+                continue
+            if skills_manifest.get(key) == current:
+                # Unmodified since this installer wrote it: refresh to the new
+                # source revision so updates deliver skill fixes.
+                shutil.rmtree(dest)
+                shutil.copytree(skill.parent, dest)
+                skills_manifest[key] = skill_snapshot(skill.parent)
+                refreshed_skills.append(key)
+            else:
+                # Operator-modified (or pre-manifest) copy: preserved, and
+                # reported so the divergence is visible.
+                preserved_skills.append(key)
+    if refreshed_skills:
+        print('[Ares] Refreshed installer-owned skills: ' + ', '.join(sorted(refreshed_skills)))
+    if preserved_skills:
+        print('[Ares] Preserved locally-modified skills: ' + ', '.join(sorted(preserved_skills)))
+    skills_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    skills_manifest_path.write_text(json.dumps(skills_manifest, indent=2, sort_keys=True))
     if not plugin.is_symlink():
         plugin.parent.mkdir(parents=True, exist_ok=True)
         if plugin.exists():
@@ -590,13 +697,21 @@ fi
 
 STEP=gateway
 export ARES_INSTALL_GATEWAY_STARTED=false
-if [[ "$GATEWAY" == true && "$SETUP" == true && "$OS" == Linux ]] && command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
+if [[ "$GATEWAY" == true && "$OS" == Linux ]] && command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
   args=(setup --source "$ARES_SOURCE" --seed-from "$ARES_HOME/no-import")
   [[ "$DESKTOP" == true ]] || args+=(--no-desktop)
-  "$RUNTIME_PYTHON" -m ares_runtime.local_runtime "${args[@]}"
-  export ARES_INSTALL_GATEWAY_STARTED=true
+  if [[ "$SETUP" == true ]]; then
+    "$RUNTIME_PYTHON" -m ares_runtime.local_runtime "${args[@]}"
+    export ARES_INSTALL_GATEWAY_STARTED=true
+  elif "$RUNTIME_PYTHON" -m ares_runtime.local_runtime "${args[@]}"; then
+    # Unattended (--skip-setup) installs still install and start the gateway;
+    # provider sign-in stays deferred, so a deferred start is not fatal.
+    export ARES_INSTALL_GATEWAY_STARTED=true
+  else
+    log "Gateway install/start did not complete during the unattended (--skip-setup) install; continuing. Configure a provider, then rerun this installer or run 'ares setup'."
+  fi
 else
-  log "Gateway not started (disabled, sign-in deferred, or no Linux user-systemd session). Use ares gateway foreground when needed."
+  log "Gateway not installed or started (disabled or no Linux user-systemd session). Use ares gateway foreground, or rerun this installer when systemd is available."
 fi
 
 STEP=verification

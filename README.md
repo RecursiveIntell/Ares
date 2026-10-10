@@ -211,7 +211,7 @@ ares doctor
 ares rollback
 ```
 
-`ares update` stages a configured Hermes upstream revision, applies the Ares downstream state, builds the candidate, and switches only after the candidate succeeds. If the build or activation path fails, the active release is intended to remain selected. `ares rollback` returns to the previous stable release when one exists.
+`ares update` stages a configured Hermes upstream revision, applies the Ares downstream state, builds the candidate, and switches only after the candidate succeeds. If the build or activation path fails, the active release is intended to remain selected. `ares rollback` returns to the previous stable release when one exists. Rolling back across a release boundary that predates a full installation (for example, a base release that this installer has upgraded) leaves the enhanced configuration pointing at tooling the older release does not bundle; the install receipt records this (`rollback_previous_has_bundled_tools`), and rolling forward again or rerunning the installer recovers.
 
 Ordinary `ares setup` and `ares update` refuse an unqualified selected release.
 For a verified legacy release without `runtime_binding`, follow the
@@ -418,7 +418,7 @@ The installer accepts (`bash install.sh --help` is authoritative):
 | `--no-desktop` | CLI installation without Desktop/voice downloads. |
 | `--no-gateway` | Do not install or start the background gateway. |
 | `--minimal` | Skip the RecursiveIntell enhancement builds and memory kit; requires a fresh/minimal home. |
-| `--skip-setup` | Leave provider sign-in for later (unattended install). |
+| `--skip-setup` | Leave provider sign-in for later (unattended install); the gateway is still installed and started when a Linux user systemd session is available. |
 | `--no-path` | Do not update shell startup files. |
 | `--no-recursive-agent` | Skip the Recursive Agent plugin payload. |
 | `--with-recursive-agent-source PATH` | Install the plugin payload from an existing RecursiveIntell/recursive-agent checkout instead of the auto-provisioned one. The daemon remains operator-managed. |
