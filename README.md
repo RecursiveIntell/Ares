@@ -532,6 +532,18 @@ experimental/runtime-gated controls; they are not a security certification.
 | `tests/test_ares_distribution.py` | Fork identity and installer-scope contract tests. |
 | `tests/ares_runtime/`, `tests/test_ares_collaboration.py` | Runtime, custody-boundary, effect, permit, witness, and replay contract tests. |
 
+### Inherited POSIX installer policy
+
+The non-Termux dependency stage in `scripts/install.sh` preserves the reviewed
+project UV policy during locked synchronization through
+[`scripts/install_uv_policy.py`](scripts/install_uv_policy.py). It admits uv
+0.9.28 through 0.12.x, rejects unsupported policy or inherited UV overrides,
+and stops on a failed locked sync without an unlocked pip fallback. The
+Termux branch, PowerShell installer, and Ares bootstrap/runtime controller are
+separate paths. See the [scoped validation and compatibility
+boundary](docs/validation/installer-uv-policy-2026-10-01.md); these source and
+disposable-test observations do not prove a live installation.
+
 ## Development and validation
 
 Ares is a large Python, TypeScript, and desktop codebase. Start with [`AGENTS.md`](AGENTS.md) and [`CONTRIBUTING.md`](CONTRIBUTING.md). For repository tests, sync the development extra in addition to the runtime extras:
