@@ -35,19 +35,55 @@ def test_website_front_door_carries_ares_identity() -> None:
     assert "Hermes-compatible" in index
 
 
-def test_ares_installer_is_explicit_about_compatibility_and_plugin_scope() -> None:
+def test_ares_installer_defaults_to_the_full_set_with_opt_outs() -> None:
     installer = (REPO_ROOT / "install.sh").read_text(encoding="utf-8")
 
     assert "Ares Installer" in installer
+
+    # Every default-on piece exposes an opt-out flag.
+    for flag in (
+        "--no-desktop",
+        "--no-gateway",
+        "--no-mcp",
+        "--no-semantic-memory",
+        "--no-agent-graph",
+        "--no-claim-ledger",
+        "--no-cea-graph",
+        "--no-pilot-bridge",
+        "--no-skills",
+        "--no-hooks",
+        "--no-recursive-agent",
+    ):
+        assert flag in installer, flag
+
+    for name in (
+        "INSTALL_DESKTOP",
+        "INSTALL_GATEWAY",
+        "INSTALL_SEMANTIC_MEMORY",
+        "INSTALL_AGENT_GRAPH",
+        "INSTALL_CLAIM_LEDGER",
+        "INSTALL_CEA_GRAPH",
+        "INSTALL_PILOT_BRIDGE",
+        "INSTALL_SKILLS",
+        "INSTALL_HOOKS",
+        "INSTALL_RECURSIVE_AGENT",
+    ):
+        assert f"{name}=true" in installer, name
+        assert f"{name}=false" in installer, name
+
+    assert "setup_args+=(--no-gateway)" in installer
+
+    # The Recursive Agent daemon boundary is preserved.
     assert "--with-recursive-agent-source PATH" in installer
     assert (
         "Recursive Agent daemon is not installed or started by this option" in installer
     )
-    assert "--no-gateway" in installer
-    assert "INSTALL_GATEWAY=false" in installer
-    assert "setup_args+=(--no-gateway)" in installer
+
+    # Structured configuration stays out of the shell installer; typed edits
+    # are owned by ares_runtime.integrations.
     assert "config set" not in installer
     assert "yaml.safe_dump" not in installer
+    assert "ares_runtime.integrations" in installer
 
 
 def test_ares_docs_are_deployed_by_the_downstream_workflow() -> None:

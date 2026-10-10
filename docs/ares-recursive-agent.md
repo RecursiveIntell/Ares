@@ -2,7 +2,7 @@
 
 ## Scope
 
-This guide documents the boundary between the **Ares** downstream distribution of Hermes Agent and the separately maintained **Recursive Agent** service. It is an operator guide, not a claim that the service is bundled, automatically configured, or safe to expose on a network.
+This guide documents the boundary between the **Ares** downstream distribution of Hermes Agent and the separately maintained **Recursive Agent** service. It is an operator guide, not a claim that the daemon is bundled, configured, or safe to expose on a network.
 
 ## Ownership
 
@@ -17,17 +17,21 @@ The plugin makes one bounded native request. It does not expose a general remote
 
 ## Preconditions
 
-Before installing the plugin, independently establish all of these conditions:
+The bootstrap installs the plugin **payload** by default. Before **exercising**
+the integration, independently establish all of these conditions:
 
-1. You have a local checkout of `RecursiveIntell/recursive-agent`.
+1. You have a local checkout of `RecursiveIntell/recursive-agent` (the bootstrap auto-provisions one under `<hermes-home>/recursive-agent-src` unless `--no-recursive-agent` skipped it or an explicit source was passed).
 2. Its own build, policy, and daemon lifecycle gates have passed.
 3. The daemon is running on its private local Unix-domain socket.
 4. You have reviewed the plugin source and accept agent-process plugin authority.
 5. You are using the intended Ares/Hermes home and have no existing plugin directory at `plugins/recursive-agent-native` unless you deliberately removed it.
 
-The Ares bootstrap can install the plugin payload but does not satisfy conditions 2 or 3.
+The Ares bootstrap installs the plugin payload but does not satisfy conditions 2 or 3.
 
 ## Install the plugin
+
+The bootstrap installs the plugin payload by default; skip it with
+`--no-recursive-agent`. To install from an existing checkout explicitly:
 
 ```bash
 cd /path/to/ares
@@ -44,7 +48,7 @@ plugin.yaml
 pyproject.toml
 ```
 
-It writes a manifest alongside the plugin for deterministic removal. The plugin is discovered at next Ares/Hermes process start; an already-open conversation may have an older tool schema.
+It writes a manifest alongside the plugin for deterministic removal. The plugin is discovered at next Ares/Hermes process start; an already-open conversation may have an older tool schema. The auto-provisioned checkout lives at `<hermes-home>/recursive-agent-src`; its own installer remains the rollback authority.
 
 ## What a successful invocation means
 
