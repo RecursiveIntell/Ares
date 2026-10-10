@@ -2440,3 +2440,30 @@ class TestKillContainmentFidelity:
         if not getattr(session, "systemd_unit", None):
             assert c["fidelity"] == "tree"
             assert c["quiescence"] == "tree_only"
+
+    def test_verdict_scope_stop_failure_is_downgraded(self):
+        # P1: a nonempty unit whose stop did NOT succeed must never be "verified".
+        s = _make_session(sid="proc_cv1")
+        s.systemd_unit = "ares-worker-x.service"
+        v = ProcessRegistry._containment_verdict(s, scope_stopped=False)
+        assert v["fidelity"] == "tree"
+        assert v["quiescence"] == "tree_only"
+
+    def test_verdict_scope_stop_success_is_verified(self):
+        s = _make_session(sid="proc_cv2")
+        s.systemd_unit = "ares-worker-x.service"
+        v = ProcessRegistry._containment_verdict(s, scope_stopped=True)
+        assert v["fidelity"] == "cgroup"
+        assert v["quiescence"] == "verified"
+
+    def test_verdict_unscoped_is_tree_only(self):
+        s = _make_session(sid="proc_cv3")
+        v = ProcessRegistry._containment_verdict(s)
+        assert v["fidelity"] == "tree"
+        assert v["quiescence"] == "tree_only"
+
+    def test_verdict_sandbox_is_pid_only(self):
+        s = _make_session(sid="proc_cv4")
+        v = ProcessRegistry._containment_verdict(s, pid_only=True)
+        assert v["fidelity"] == "pid_only"
+        assert v["quiescence"] == "unverified"
