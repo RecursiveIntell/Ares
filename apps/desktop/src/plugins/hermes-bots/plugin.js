@@ -8810,7 +8810,7 @@ async function runGroupChatMemberTurnLeased(group, captured, prompt, thread, ima
         // Supersession changes publication intent, not observation ownership.
         // Retry exact reads only; an absent runtime/capability is not transient.
         failedPolls++
-        if (marker.hold_requested || roomAfterError.holds?.[memberKey]) return discarded()
+        if (marker.stop_requested || marker.hold_requested || roomAfterError.holds?.[memberKey]) return discarded()
         if (failedPolls < GROUP_TURN_POLL_RETRY_LIMIT &&
             ![4001, 4006, 4030, -32601].includes(error?.code)) {
           recordGroupActivity(group, { kind: 'observing', member: member.name, thread,
@@ -8836,7 +8836,7 @@ async function runGroupChatMemberTurnLeased(group, captured, prompt, thread, ima
           consumeGroupTurnMarker(group, memberKey, marker)
           return discarded()
         }
-        if (marker.hold_requested || roomAfterResume.holds?.[memberKey]) return discarded()
+        if (marker.stop_requested || marker.hold_requested || roomAfterResume.holds?.[memberKey]) return discarded()
         // Do not publish superseded output, but keep watching until its locks
         // can be released. A newer drive is waiting on this exact predecessor.
         if (outcome.state === 'unavailable') throw groupTurnOutcomeError(outcome)
