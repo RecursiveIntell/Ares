@@ -29,6 +29,14 @@ def build_prompt_size_parser(subparsers, *, cmd_prompt_size: Callable) -> None:
         help="Platform to simulate (cli, telegram, discord, ...). Default: cli",
     )
     prompt_size_parser.add_argument(
+        "--cwd",
+        default=None,
+        help=(
+            "Project directory to attribute the context tier to (AGENTS.md etc.). "
+            "Default: none (context tier reads 0 B)"
+        ),
+    )
+    prompt_size_parser.add_argument(
         "--json",
         action="store_true",
         help="Emit the breakdown as JSON",

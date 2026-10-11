@@ -129,7 +129,7 @@ def test_protocol_probe_exercises_the_certified_two_phase_wire_contract():
 
 
 @pytest.mark.parametrize("adjacent_role", ["assistant", "user"])
-def test_candidate_reserve_projection_already_matches_final_host_shape(adjacent_role):
+def test_reserve_projection_does_not_mutate_unmerged_candidate(adjacent_role):
     with patch("hermes_cli.config.load_config", return_value={}):
         engine = ContextGovernorEngine(binary="/tmp/context-governor")
     latest = "Which fixture job failed? Preserve exact job identities."
@@ -146,11 +146,62 @@ def test_candidate_reserve_projection_already_matches_final_host_shape(adjacent_
     original_projection = engine._ensure_latest_user_last(source, original_projection)
     original_projection = engine._sanitize_tool_pairs(original_projection)
     _, _, projected = engine._project_compaction_candidate(response, source)
-    final = engine._repair_for_host_alternation(copy.deepcopy(original_projection))
-    final = engine._ensure_latest_user_last(source, final)
-    final = engine._preserve_multimodal_tail(source, final)
-    assert projected == final
+    before = copy.deepcopy(projected)
+    final = engine._final_host_projection(source, copy.deepcopy(projected))
+    assert projected == before
+    assert len(projected) == len(original_projection)
+    assert all(left["role"] != right["role"] for left, right in zip(final, final[1:]))
+    assert final[-1]["content"] == latest
+    assert engine._final_host_projection(source, copy.deepcopy(final)) == final
+    user_text = "\n".join(str(message.get("content", "")) for message in final if message.get("role") == "user")
+    assert user_text.count(latest) == 1
     assert projected[-1]["content"] == latest
+
+
+def test_final_projection_separates_protected_summary_user_from_history():
+    from agent.context_compressor import LEGACY_SUMMARY_PREFIX
+
+    with patch("hermes_cli.config.load_config", return_value={}):
+        engine = ContextGovernorEngine(binary="/tmp/context-governor")
+    source = [{"role": "user", "content": "latest request"}]
+    summary = {"role": "user", "content": LEGACY_SUMMARY_PREFIX + " background",
+               "name": "context_governor", "tool_name": "context_governor",
+               "_compressed_summary": True}
+    result = engine._final_host_projection(source, [
+        copy.deepcopy(summary), {"role": "user", "content": "retained history"},
+        copy.deepcopy(source[0]),
+    ])
+    assert result[0] == summary
+    assert result[-1]["content"] == "latest request"
+    assert any(message.get("content") == "retained history" for message in result)
+    assert all(left["role"] != right["role"] for left, right in zip(result, result[1:]))
+    assert engine._final_host_projection(source, copy.deepcopy(result)) == result
+
+
+def test_boundary_note_survives_session_db_governor_projection_roundtrip():
+    with patch("hermes_cli.config.load_config", return_value={}):
+        engine = ContextGovernorEngine(binary="/tmp/context-governor")
+    source = [{"role": "user", "content": "latest request"}]
+    projected = engine._final_host_projection(source, [
+        {"role": "user", "content": "retained user history"},
+        copy.deepcopy(source[0]),
+    ])
+    db = SessionDB()
+    try:
+        db.create_session("boundary-roundtrip", "cli")
+        db.append_messages_batch("boundary-roundtrip", source)
+        expected = [engine._message_to_governor(message, i) for i, message in enumerate(projected)]
+        db.archive_and_compact("boundary-roundtrip", projected)
+        restored = db.get_messages_as_conversation("boundary-roundtrip", include_summary_markers=True)
+        actual = [engine._message_to_governor(message, i) for i, message in enumerate(restored)]
+        assert actual == expected
+        assert restored[1]["tool_name"] == "context_governor"
+        assert restored[1]["content"].startswith("[Non-authorizing context boundary:")
+        assert restored[1].get("_compressed_summary") is not True
+        assert restored[-1]["content"] == "latest request"
+        assert all(left["role"] != right["role"] for left, right in zip(restored, restored[1:]))
+    finally:
+        db.close()
 
 
 def test_governor_compressed_summary_marker_survives_host_roundtrip():
@@ -1041,6 +1092,53 @@ def test_deterministic_saturation_above_target_invokes_one_llm_checkpoint():
     assert "=== PRIOR CONTEXT SUMMARY ===\ncheckpoint" in compacted[0]["content"]
     assert f"receipt_id={_receipt_id(1)}" in compacted[0]["content"]
     assert "ctxs_" + "f" * 64 in compacted[0]["content"]
+
+
+def test_llm_checkpoint_preserves_summary_after_retained_assistant_prefix():
+    engine, llm = _checkpoint_engine(
+        target_tokens=128_000, llm_output=_valid_llm_summary("changed checkpoint"),
+        checkpoint_strategy="after_n:1",
+        compacted_prefix=[{"role": "assistant", "content": "retained prefix witness"}],
+    )
+    result = engine.compress(
+        [{"role": "assistant", "content": "old"}, {"role": "user", "content": "final"}],
+        current_tokens=200_000,
+    )
+    text = "\n".join(str(message.get("content", "")) for message in result)
+    assert llm.call_count == 1
+    assert "changed checkpoint" in text
+    assert "retained prefix witness" in text
+
+
+@pytest.mark.parametrize("retained_role", ["assistant", "user"])
+def test_llm_checkpoint_keeps_tail_without_replaying_user_projection(retained_role):
+    engine, llm = _checkpoint_engine(
+        target_tokens=128_000, llm_output=_valid_llm_summary("changed checkpoint"),
+        checkpoint_strategy="after_n:1",
+    )
+    original_run = engine._run_json
+
+    def run_json(args, payload):
+        response = original_run(args, payload)
+        if args and args[0] == "compact-v2":
+            response["compacted_messages"].insert(
+                -1, {"role": retained_role, "content": "retained tail witness"}
+            )
+        return response
+
+    engine._run_json = run_json
+    result = engine.compress(
+        [{"role": "assistant", "content": "old"}, {"role": "user", "content": "final"}],
+        current_tokens=200_000,
+    )
+    text = "\n".join(str(message.get("content", "")) for message in result)
+    assert llm.call_count == 1
+    assert "changed checkpoint" in text
+    assert "retained tail witness" in text
+    user_text = "\n".join(str(message.get("content", "")) for message in result if message.get("role") == "user")
+    assert user_text.count("final") == 1
+    assert result[-1]["content"] == "final"
+    assert all(left["role"] != right["role"] for left, right in zip(result, result[1:]))
 
 
 def test_only_exact_transient_summary_identity_can_be_overwritten():
