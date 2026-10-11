@@ -72,7 +72,7 @@ Ares does **not** claim that every installed service is reachable or exercised, 
 ### Prerequisites
 
 - Git
-- [uv](https://docs.astral.sh/uv/) — the installer installs uv automatically when it is missing (skip with `--no-venv` and an active Python environment)
+- [uv](https://docs.astral.sh/uv/) — the installer provisions its own copy under `<ARES_HOME>/bin` and manages Python 3.13.
 - Python **3.11–3.14** is admitted by the current project metadata (`>=3.11,<3.15`). The inherited POSIX installer provisions 3.11 by default; the committed Desktop resolver explicitly probes 3.11–3.14. Resolver support is a source-level admission decision, not proof that every native extension or installation path works on each Python minor and operating system.
 - A model provider configured through the normal Hermes setup flow
 
