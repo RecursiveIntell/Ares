@@ -1416,15 +1416,43 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         compacted = self._sanitize_tool_pairs(compacted)
         compacted = self._ensure_latest_user_last(source_messages, compacted)
         compacted = self._preserve_multimodal_tail(source_messages, compacted)
-        from agent.conversation_compression import (
-            _ensure_compressed_has_user_turn,
-        )
-
-        # Reserve only for host material the certified candidate actually lacks.
-        # This projection is also applied idempotently immediately before
-        # finalize-v2, so the measured token delta matches the persisted shape.
-        _ensure_compressed_has_user_turn(source_messages, compacted)
+        # Keep the exact summary carrier separate until checkpoint enhancement.
+        # Reserve measurement projects a copy; it must not merge protected
+        # neighbors into a row whose content the checkpoint will replace.
         return pending_receipt, pending_receipt_id, compacted
+
+    def _final_host_projection(
+        self, source_messages: List[Dict[str, Any]], compacted: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """One host-owned pre-finalization recipe; never rewrite signed receipts."""
+        from agent.conversation_compression import _ensure_compressed_has_user_turn
+
+        _ensure_compressed_has_user_turn(source_messages, compacted)
+        compacted = self._ensure_latest_user_last(source_messages, compacted)
+        has_latest_user = any(
+            isinstance(message, dict) and message.get("role") == "user"
+            for message in source_messages
+        )
+        latest_user = compacted.pop() if has_latest_user else None
+        compacted = self._repair_for_host_alternation(compacted)
+        if latest_user is not None:
+            compacted.append(latest_user)
+        separated = []
+        for message in compacted:
+            if separated and separated[-1].get("role") == "user" and message.get("role") == "user":
+                # The host also preserves receipt-backed user summary carriers.
+                # Separate those protected pairs without rewriting their bytes
+                # or roles. This host-authored note grants no effect authority.
+                separated.append({
+                    "role": "assistant",
+                    "content": "[Non-authorizing context boundary: a preserved user message follows.]",
+                    # Use the existing durable producer-name column, not
+                    # generic metadata that SessionDB does not roundtrip.
+                    "name": "context_governor",
+                    "tool_name": "context_governor",
+                })
+            separated.append(message)
+        return self._preserve_multimodal_tail(source_messages, separated)
 
     def _compact_v2_candidate(
         self, request: dict[str, Any]
@@ -1634,7 +1662,10 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                     if isinstance(message, dict)
                 ]
                 raw_tokens = self._estimate_messages_tokens(raw_compacted)
-                host_tokens = self._estimate_messages_tokens(compacted)
+                host_projection = self._final_host_projection(
+                    source_messages, copy.deepcopy(compacted)
+                )
+                host_tokens = self._estimate_messages_tokens(host_projection)
                 required_reserve = max(
                     post_finalize_reserve_tokens,
                     max(0, host_tokens - raw_tokens),
@@ -1691,7 +1722,9 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                     # re-finalize the unchanged deterministic projection.
                     try:
                         candidate_response = self._finalize_response(
-                            response, candidate
+                            response, self._final_host_projection(
+                                source_messages, copy.deepcopy(candidate)
+                            )
                         )
                     except Exception as exc:
                         warning = (
@@ -1758,20 +1791,9 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             # rejects the shifted projection and the turn cannot continue.
             # Apply the exact host helper before alternation repair/finalize so
             # both the receipt and SessionDB bind the same human-intent anchor.
-            from agent.conversation_compression import (
-                _ensure_compressed_has_user_turn,
-            )
-
-            _ensure_compressed_has_user_turn(source_messages, compacted)
-            # The host repairs role-alternation in memory immediately after
-            # compress() returns. Apply the same repair BEFORE finalize so
-            # the receipt describes the exact transcript the host persists;
-            # otherwise the next compaction's input no longer exactly
-            # prefixes the stored parent and recursive lineage rejects it —
-            # which made deterministic compaction one-shot per session.
-            compacted = self._repair_for_host_alternation(compacted)
-            compacted = self._ensure_latest_user_last(source_messages, compacted)
-            compacted = self._preserve_multimodal_tail(source_messages, compacted)
+            # Project the selected unmerged candidate once. Earlier reserve and
+            # checkpoint budget checks used copies, never this mutable carrier.
+            compacted = self._final_host_projection(source_messages, compacted)
             response = self._finalize_response(response, compacted)
             finalized_messages = response.get("compacted_messages")
             if not isinstance(finalized_messages, list):
