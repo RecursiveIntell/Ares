@@ -232,7 +232,7 @@ def _compute_toolsets_breakdown(tools: List[Any]) -> List[Dict[str, Any]]:
     return out
 
 
-def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
+def compute_prompt_breakdown(platform: str = "cli", cwd: Any = None) -> Dict[str, Any]:
     """Return a dict of prompt-size measurements for a fresh session.
 
     Keys: ``system_prompt`` (chars/bytes), ``skills_index``, ``memory``,
@@ -241,13 +241,37 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
     (per-skill index-line + on-disk SKILL.md bytes, largest-first), and
     ``toolsets_breakdown`` (per-toolset tool count + schema json bytes,
     largest-first). The last two answer "what should I disable to cut tokens?".
+
+    ``cwd`` (optional) points the context tier at a real project directory so
+    an AGENTS.md on that surface is attributed. Without it the context tier is
+    empty, which under-represents any surface (e.g. a desktop session) whose
+    sessions carry project context files.
     """
+    import os as _os
+
     from agent.system_prompt import build_system_prompt, build_system_prompt_parts
 
     agent = _build_inspection_agent(platform)
 
-    parts = build_system_prompt_parts(agent)
-    full = build_system_prompt(agent)
+    # Scope the context tier to the requested directory for the duration of the
+    # build. resolve_context_cwd() reads TERMINAL_CWD; restoring it afterwards
+    # keeps the process environment untouched. Validate first: a nonexistent
+    # path would silently fall back to the process cwd and attribute unrelated
+    # context files to the requested project.
+    _prev_cwd = _os.environ.get("TERMINAL_CWD")
+    if cwd is not None:
+        if not Path(str(cwd)).expanduser().is_dir():
+            raise ValueError(f"--cwd is not an existing directory: {cwd!r}")
+        _os.environ["TERMINAL_CWD"] = str(cwd)
+    try:
+        parts = build_system_prompt_parts(agent)
+        full = build_system_prompt(agent)
+    finally:
+        if cwd is not None:
+            if _prev_cwd is None:
+                _os.environ.pop("TERMINAL_CWD", None)
+            else:
+                _os.environ["TERMINAL_CWD"] = _prev_cwd
 
     stable = parts.get("stable", "")
     context = parts.get("context", "")
@@ -365,9 +389,10 @@ def render_breakdown(data: Dict[str, Any]) -> str:
 def cmd_prompt_size(args: Any) -> None:
     """Entry point for ``hermes prompt-size``."""
     platform = getattr(args, "platform", "cli") or "cli"
+    cwd = getattr(args, "cwd", None)
     as_json = getattr(args, "json", False)
     try:
-        data = compute_prompt_breakdown(platform)
+        data = compute_prompt_breakdown(platform, cwd=cwd)
     except Exception as e:
         print(f"Could not compute prompt-size breakdown: {e}")
         return

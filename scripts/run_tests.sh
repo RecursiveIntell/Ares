@@ -31,6 +31,20 @@
 # bare flags. Positional path arguments override the default discovery
 # root (tests/).
 
+# ── Help guard ──────────────────────────────────────────────────────────────
+# This wrapper forwards every unrecognized argument to pytest, so `--help`
+# would otherwise fall through to the runner as a bare flag and launch the
+# FULL suite (thousands of files). Print the usage above and exit instead.
+# Bare `-h`/`--help` only: a path or a runner flag alongside them still runs.
+case "${1:-}" in
+  -h|--help|--usage)
+    if [ "$#" -eq 1 ]; then
+      sed -n '2,32p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+      exit 0
+    fi
+    ;;
+esac
+
 set -euo pipefail
 
 # ── Locate repo root ────────────────────────────────────────────────────────
