@@ -30,7 +30,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: RecursiveIntell/Libraries
-          ref: 9849d12adc8a5ef852d56e36abec4ffbb5122c62
+          ref: 12c55d5cd08e0b986a56d344cbe261d01bf2957f
           path: Libraries
           persist-credentials: false
       - name: Generate inputs with the exact current canonical Rust owner
