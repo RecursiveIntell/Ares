@@ -151,14 +151,11 @@ export function ModelCatalogMenu({
     // Gateway-first even with no session: a connected (possibly remote)
     // gateway owns the model catalog, including virtual providers the local
     // REST fallback can't know about (#53817).
-    queryFn: (): Promise<ModelOptionsResponse> => requestModelOptions({ connectionId, gateway, profile, request, sessionId })
+    queryFn: (): Promise<ModelOptionsResponse> =>
+      requestModelOptions({ connectionId, gateway, profile, request, sessionId })
   })
 
-  const {
-    data: modelOptionsData,
-    isFetching: modelOptionsFetching,
-    refetch: refetchModelOptions
-  } = modelOptions
+  const { data: modelOptionsData, isFetching: modelOptionsFetching, refetch: refetchModelOptions } = modelOptions
 
   const [emptyCatalogRetryAttempt, setEmptyCatalogRetryAttempt] = useState(0)
 
@@ -516,13 +513,20 @@ export function ModelCatalogMenu({
                           fastControl={fastControl}
                           isActive={isCurrent}
                           model={family.id}
-                          onApplyPreset={controller.preserveOptionsOnSelect && isCurrent &&
+                          onApplyPreset={
+                            controller.preserveOptionsOnSelect &&
+                            isCurrent &&
                             (preset.effort !== undefined || preset.fast !== undefined)
-                            ? () => controller.applyPreset({
-                                effort: (caps?.reasoning ?? true) ? preset.effort : undefined,
-                                fast: (caps?.fast ?? false) ? preset.fast : undefined
-                              }, { model: family.id, provider: group.provider.slug })
-                            : undefined}
+                              ? () =>
+                                  controller.applyPreset(
+                                    {
+                                      effort: (caps?.reasoning ?? true) ? preset.effort : undefined,
+                                      fast: (caps?.fast ?? false) ? preset.fast : undefined
+                                    },
+                                    { model: family.id, provider: group.provider.slug }
+                                  )
+                              : undefined
+                          }
                           onSelectModel={nextModel => controller.select(nextModel, group.provider.slug)}
                           onSetOptions={patch =>
                             controller.setOptions(patch, {

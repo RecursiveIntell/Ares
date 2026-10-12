@@ -214,9 +214,11 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
         setCurrentPersonality(normalizePersonalityValue(payload.personality))
       }
 
-      if (typeof payload?.reasoning_effort === 'string' &&
-          (knownState?.pendingRuntimeOptions?.effort === undefined ||
-           payload.reasoning_effort === knownState.pendingRuntimeOptions.effort)) {
+      if (
+        typeof payload?.reasoning_effort === 'string' &&
+        (knownState?.pendingRuntimeOptions?.effort === undefined ||
+          payload.reasoning_effort === knownState.pendingRuntimeOptions.effort)
+      ) {
         setCurrentReasoningEffort(payload.reasoning_effort, false)
       }
 
@@ -224,9 +226,11 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
         setCurrentServiceTier(payload.service_tier)
       }
 
-      if (typeof payload?.fast === 'boolean' &&
-          (knownState?.pendingRuntimeOptions?.fast === undefined ||
-           payload.fast === knownState.pendingRuntimeOptions.fast)) {
+      if (
+        typeof payload?.fast === 'boolean' &&
+        (knownState?.pendingRuntimeOptions?.fast === undefined ||
+          payload.fast === knownState.pendingRuntimeOptions.fast)
+      ) {
         setCurrentFastMode(payload.fast, false)
       }
 
@@ -267,15 +271,13 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
             delete effectiveStatePatch.serviceTier
           }
 
-          const optionsApplied = options && payload?.pending_runtime_options === null &&
+          const optionsApplied =
+            options &&
+            payload?.pending_runtime_options === null &&
             (options.effort === undefined || statePatch.reasoningEffort === options.effort) &&
             (options.fast === undefined || statePatch.fast === options.fast)
 
-          const pendingModelSelection = repeatsPreviousModel
-            ? pending
-            : hasIncomingModelMetadata
-              ? null
-              : pending
+          const pendingModelSelection = repeatsPreviousModel ? pending : hasIncomingModelMetadata ? null : pending
 
           return {
             ...state,
@@ -452,7 +454,9 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
       const eventConnection = event.connectionId?.trim() || undefined
       const eventProfile = event.profile?.trim() || undefined
 
-      const matchesOwner = owner && (!eventConnection || eventConnection === owner.connectionId) &&
+      const matchesOwner =
+        owner &&
+        (!eventConnection || eventConnection === owner.connectionId) &&
         (!eventProfile || eventProfile === owner.profile || eventProfile === owner.targetProfile)
 
       const completeEventOwner = eventConnection && eventProfile
@@ -463,7 +467,10 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
       // one exact cache. Invalidate the catalog family without mixing owners.
       const exactOwner = matchesOwner || completeEventOwner || legacyUnstamped
       void queryClient.invalidateQueries({
-        queryKey: explicitSid && sessionId && exactOwner ? modelOptionsQueryKey(catalogProfile, sessionId, catalogConnection) : ['model-options']
+        queryKey:
+          explicitSid && sessionId && exactOwner
+            ? modelOptionsQueryKey(catalogProfile, sessionId, catalogConnection)
+            : ['model-options']
       })
     }
 

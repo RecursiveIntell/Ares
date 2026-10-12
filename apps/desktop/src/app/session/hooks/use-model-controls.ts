@@ -157,87 +157,84 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
   // only fills an EMPTY selection so a user's pick (plain UI state in
   // $currentModel) survives the lifecycle refreshes that fire on boot / fresh
   // draft / session events. A live session owns the footer, so skip entirely.
-  const refreshCurrentModel = useCallback(
-    async (force = false) => {
-      // A forced profile swap opens a new intent epoch; an older in-flight
-      // response for a previous profile must stand down when it resolves.
+  const refreshCurrentModel = useCallback(async (force = false) => {
+    // A forced profile swap opens a new intent epoch; an older in-flight
+    // response for a previous profile must stand down when it resolves.
+    if (force) {
+      profileRefreshEpochRef.current += 1
+    }
+
+    const profileRefreshEpoch = profileRefreshEpochRef.current
+
+    try {
+      if ($activeSessionId.get()) {
+        return
+      }
+
+      const draftOwner = captureDraftComposerOwner()
+      setComposerModelSelectionOwner(draftOwner)
+      const ownedSelection = getComposerModelSelection(draftOwner)
+
+      if (ownedSelection?.source === 'manual') {
+        setCurrentModel(ownedSelection.model)
+        setCurrentProvider(ownedSelection.provider)
+        setCurrentModelSource('manual')
+
+        return
+      }
+
+      // A route swap can leave the old mirror visible until activation
+      // completes. Seed only the new owner's known pair, never relabel it.
       if (force) {
-        profileRefreshEpochRef.current += 1
+        setCurrentModel(ownedSelection?.model ?? '')
+        setCurrentProvider(ownedSelection?.provider ?? '')
+        setCurrentModelSource(ownedSelection?.source ?? '')
       }
 
-      const profileRefreshEpoch = profileRefreshEpochRef.current
+      const requestOwner = captureModelRequestOwner()
 
-      try {
-        if ($activeSessionId.get()) {
-          return
-        }
-
-        const draftOwner = captureDraftComposerOwner()
-        setComposerModelSelectionOwner(draftOwner)
-        const ownedSelection = getComposerModelSelection(draftOwner)
-
-        if (ownedSelection?.source === 'manual') {
-          setCurrentModel(ownedSelection.model)
-          setCurrentProvider(ownedSelection.provider)
-          setCurrentModelSource('manual')
-
-          return
-        }
-
-        // A route swap can leave the old mirror visible until activation
-        // completes. Seed only the new owner's known pair, never relabel it.
-        if (force) {
-          setCurrentModel(ownedSelection?.model ?? '')
-          setCurrentProvider(ownedSelection?.provider ?? '')
-          setCurrentModelSource(ownedSelection?.source ?? '')
-        }
-
-        const requestOwner = captureModelRequestOwner()
-
-        if (composerOwnerKey(requestOwner) !== composerOwnerKey(draftOwner)) {
-          return
-        }
-
-        const requestTicket = captureComposerModelSelection(requestOwner)
-        const selectionGeneration = getComposerSelectionGeneration()
-        const connectionId = getApiRequestConnection()
-        const profile = $activeGatewayProfile.get()
-        // The helper builds REST scope synchronously, before this first await.
-        const result = await getGlobalModelInfo(requestOwner.targetProfile || requestOwner.profile)
-
-        if (
-          profileRefreshEpochRef.current !== profileRefreshEpoch ||
-          $activeGatewayProfile.get() !== profile ||
-          getApiRequestConnection() !== connectionId ||
-          $activeSessionId.get() ||
-          getComposerSelectionGeneration() !== selectionGeneration ||
-          composerOwnerKey(captureDraftComposerOwner()) !== composerOwnerKey(requestOwner) ||
-          getComposerModelSelection(requestOwner)?.source === 'manual'
-        ) {
-          return
-        }
-
-        if (typeof result.model !== 'string' || typeof result.provider !== 'string') {
-          return
-        }
-
-        const stamp = recordComposerModelSelection(requestTicket, {
-          model: result.model,
-          provider: result.provider,
-          source: 'default'
-        })
-
-        if (stamp) {
-          setCurrentModel(stamp.model)
-          setCurrentProvider(stamp.provider)
-          setCurrentModelSource(stamp.source)
-        }
-      } catch {
-        // The delayed session.info event still updates this once the agent is ready.
+      if (composerOwnerKey(requestOwner) !== composerOwnerKey(draftOwner)) {
+        return
       }
-    },
-    []
-  )
+
+      const requestTicket = captureComposerModelSelection(requestOwner)
+      const selectionGeneration = getComposerSelectionGeneration()
+      const connectionId = getApiRequestConnection()
+      const profile = $activeGatewayProfile.get()
+      // The helper builds REST scope synchronously, before this first await.
+      const result = await getGlobalModelInfo(requestOwner.targetProfile || requestOwner.profile)
+
+      if (
+        profileRefreshEpochRef.current !== profileRefreshEpoch ||
+        $activeGatewayProfile.get() !== profile ||
+        getApiRequestConnection() !== connectionId ||
+        $activeSessionId.get() ||
+        getComposerSelectionGeneration() !== selectionGeneration ||
+        composerOwnerKey(captureDraftComposerOwner()) !== composerOwnerKey(requestOwner) ||
+        getComposerModelSelection(requestOwner)?.source === 'manual'
+      ) {
+        return
+      }
+
+      if (typeof result.model !== 'string' || typeof result.provider !== 'string') {
+        return
+      }
+
+      const stamp = recordComposerModelSelection(requestTicket, {
+        model: result.model,
+        provider: result.provider,
+        source: 'default'
+      })
+
+      if (stamp) {
+        setCurrentModel(stamp.model)
+        setCurrentProvider(stamp.provider)
+        setCurrentModelSource(stamp.source)
+      }
+    } catch {
+      // The delayed session.info event still updates this once the agent is ready.
+    }
+  }, [])
 
   // Returns whether the switch was applied so callers can await it before
   // applying follow-up changes. `true` means applied (or deferred/busy-queued

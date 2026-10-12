@@ -86,7 +86,9 @@ export async function applyModelPreset(
   { effort, fast }: ModelPreset,
   ctx: { failMessage: string; primary?: boolean; request: RequestGateway; sessionId: null | string }
 ): Promise<void> {
-  if (effort === undefined && fast === undefined) {return}
+  if (effort === undefined && fast === undefined) {
+    return
+  }
 
   if (!ctx.sessionId) {
     if (effort !== undefined) {
@@ -155,25 +157,33 @@ export async function applyModelPreset(
 
   const desired = { ...(effort !== undefined ? { effort } : {}), ...(fast !== undefined ? { fast } : {}) }
   sessionTileDelegate()?.updateSession(runtimeId, current => ({
-    ...current, pendingRuntimeOptions: { ...current.pendingRuntimeOptions, ...desired }
+    ...current,
+    pendingRuntimeOptions: { ...current.pendingRuntimeOptions, ...desired }
   }))
 
-  const clearPending = () => sessionTileDelegate()?.updateSession(runtimeId, current => {
-    const pending = { ...current.pendingRuntimeOptions }
+  const clearPending = () =>
+    sessionTileDelegate()?.updateSession(runtimeId, current => {
+      const pending = { ...current.pendingRuntimeOptions }
 
-    if (effort !== undefined && owns('effort')) {delete pending.effort}
+      if (effort !== undefined && owns('effort')) {
+        delete pending.effort
+      }
 
-    if (fast !== undefined && owns('fast')) {delete pending.fast}
+      if (fast !== undefined && owns('fast')) {
+        delete pending.fast
+      }
 
-    return { ...current, pendingRuntimeOptions: Object.keys(pending).length ? pending : null }
-  })
+      return { ...current, pendingRuntimeOptions: Object.keys(pending).length ? pending : null }
+    })
 
   try {
     let result: { deferred?: boolean } | undefined
 
     try {
       result = await ctx.request<{ deferred?: boolean }>('config.set', {
-        key: 'runtime_options', session_id: runtimeId, value: desired
+        key: 'runtime_options',
+        session_id: runtimeId,
+        value: desired
       })
     } catch (err) {
       if (!isLegacyRuntimeOptionsBackend(err)) {
@@ -191,25 +201,39 @@ export async function applyModelPreset(
       }
     }
 
-    if (effort !== undefined && owns('effort')) {clearRuntimeOptionUncertainty(runtimeId, 'effort')}
+    if (effort !== undefined && owns('effort')) {
+      clearRuntimeOptionUncertainty(runtimeId, 'effort')
+    }
 
-    if (fast !== undefined && owns('fast')) {clearRuntimeOptionUncertainty(runtimeId, 'fast')}
+    if (fast !== undefined && owns('fast')) {
+      clearRuntimeOptionUncertainty(runtimeId, 'fast')
+    }
 
-    if (!result?.deferred) {clearPending()}
+    if (!result?.deferred) {
+      clearPending()
+    }
   } catch (err) {
     let uncertain = false
 
     for (const dimension of ['effort', 'fast'] as const) {
-      if (!(dimension in desired) || !owns(dimension)) {continue}
+      if (!(dimension in desired) || !owns(dimension)) {
+        continue
+      }
 
       const reconciled = await reconcileRuntimeOptionFailure(err, {
-        sessionId: runtimeId, dimension, request: ctx.request, owns: () => owns(dimension),
-        applyObserved: value => paint(dimension === 'effort' ? { reasoningEffort: value as string } : { fast: value as boolean })
+        sessionId: runtimeId,
+        dimension,
+        request: ctx.request,
+        owns: () => owns(dimension),
+        applyObserved: value =>
+          paint(dimension === 'effort' ? { reasoningEffort: value as string } : { fast: value as boolean })
       })
 
       uncertain ||= reconciled
 
-      if (!reconciled && owns(dimension)) {paint(dimension === 'effort' ? { reasoningEffort: previousEffort } : { fast: previousFast })}
+      if (!reconciled && owns(dimension)) {
+        paint(dimension === 'effort' ? { reasoningEffort: previousEffort } : { fast: previousFast })
+      }
     }
 
     if (!uncertain) {

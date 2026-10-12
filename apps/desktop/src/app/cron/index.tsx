@@ -1071,6 +1071,7 @@ function CronEditorDialog({
   // model here, so skip the fetch entirely for them.
   const catalogConnection = getApiRequestConnection()
   const catalogProfile = getApiRequestProfile()
+
   const modelOptions = useQuery({
     queryKey: modelOptionsQueryKey(catalogProfile, null, catalogConnection),
     queryFn: () => requestModelOptions({ connectionId: catalogConnection, profile: catalogProfile }),

@@ -15,11 +15,7 @@ import { cn } from '@/lib/utils'
 import { activeGatewayConnectionId, requestGatewayForAgent } from '@/store/gateway'
 import { $modelPresets, applyModelPreset, modelPresetKey, setModelPreset } from '@/store/model-presets'
 import { $visibleModels } from '@/store/model-visibility'
-import {
-  $defaultReasoningEffort,
-  getComposerModelSelection,
-  markComposerSelectionManual
-} from '@/store/session'
+import { $defaultReasoningEffort, getComposerModelSelection, markComposerSelectionManual } from '@/store/session'
 import { $sessionStates, knownOwnerForSession } from '@/store/session-states'
 import type { ModelOptionsResponse } from '@/types/hermes'
 
@@ -61,11 +57,21 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
   const activeSessionId = useStore(view.$runtimeId)
   const owner = knownOwnerForSession(activeSessionId)
   const draftOwner = useDraftComposerOwner()
-  const connectionId = owner && typeof owner === 'object' ? owner.connectionId : owner ? null : !activeSessionId ? draftOwner.connectionId : activeGatewayConnectionId()
-  const catalogProfile = (typeof owner === 'string' ? owner : (owner?.targetProfile || owner?.profile)) || (!activeSessionId ? draftOwner.targetProfile || draftOwner.profile : profile)
+  const connectionId =
+    owner && typeof owner === 'object'
+      ? owner.connectionId
+      : owner
+        ? null
+        : !activeSessionId
+          ? draftOwner.connectionId
+          : activeGatewayConnectionId()
+  const catalogProfile =
+    (typeof owner === 'string' ? owner : owner?.targetProfile || owner?.profile) ||
+    (!activeSessionId ? draftOwner.targetProfile || draftOwner.profile : profile)
 
   const catalogRequest = !activeSessionId
-    ? <T,>(method: string, params?: Record<string, unknown>) => requestGatewayForAgent<T>(draftOwner.connectionId, draftOwner.profile, method, params)
+    ? <T,>(method: string, params?: Record<string, unknown>) =>
+        requestGatewayForAgent<T>(draftOwner.connectionId, draftOwner.profile, method, params)
     : requestGateway
 
   const unconfirmedOptions = useStore(
@@ -80,8 +86,13 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
 
   const currentFastMode = useStore(view.$fast)
 
-  const pendingOptions = useStore(useMemo(() => computed($sessionStates, states =>
-    Boolean(activeSessionId && states[activeSessionId]?.pendingRuntimeOptions)), [activeSessionId]))
+  const pendingOptions = useStore(
+    useMemo(
+      () =>
+        computed($sessionStates, states => Boolean(activeSessionId && states[activeSessionId]?.pendingRuntimeOptions)),
+      [activeSessionId]
+    )
+  )
 
   const currentModel = useStore(view.$model)
   const currentProvider = useStore(view.$provider)
@@ -100,13 +111,23 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
   const modelOptions = useQuery({
     queryKey: modelOptionsQueryKey(catalogProfile, activeSessionId, connectionId),
     queryFn: (): Promise<ModelOptionsResponse> =>
-      requestModelOptions({ connectionId, gateway, profile: catalogProfile, request: catalogRequest, sessionId: activeSessionId })
+      requestModelOptions({
+        connectionId,
+        gateway,
+        profile: catalogProfile,
+        request: catalogRequest,
+        sessionId: activeSessionId
+      })
   })
 
   const { model: optionsModel, provider: optionsProvider } = currentPickerSelection(
     activeSessionId
       ? { model: currentModel, provider: currentProvider }
-      : { model: draftSelection?.model || '', provider: draftSelection?.provider || '', authoritative: Boolean(draftSelection) },
+      : {
+          model: draftSelection?.model || '',
+          provider: draftSelection?.provider || '',
+          authoritative: Boolean(draftSelection)
+        },
     modelOptions.data
   )
 
@@ -146,17 +167,16 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
     }
   }
 
-  const patchRuntimeOption = async (
-    dimension: 'effort' | 'fast',
-    next: string | boolean,
-    message: string
-  ) => {
+  const patchRuntimeOption = async (dimension: 'effort' | 'fast', next: string | boolean, message: string) => {
     if (touchesPrimary) {
       markComposerSelectionManual()
     }
 
     await applyModelPreset(dimension === 'effort' ? { effort: next as string } : { fast: next as boolean }, {
-      failMessage: message, primary: touchesPrimary, request: requestGateway, sessionId: activeSessionId
+      failMessage: message,
+      primary: touchesPrimary,
+      request: requestGateway,
+      sessionId: activeSessionId
     })
   }
 

@@ -166,7 +166,13 @@ describe('useSessionTileActions sleep/wake session recovery', () => {
 
   it('reports a typed Stop disposition for a rejected tile Stop', async () => {
     clearNotifications()
-    let state: Record<string, unknown> = { attachedImages: [], busy: true, cwd: null, messages: [], storedSessionId: STORED_SESSION_ID }
+    let state: Record<string, unknown> = {
+      attachedImages: [],
+      busy: true,
+      cwd: null,
+      messages: [],
+      storedSessionId: STORED_SESSION_ID
+    }
 
     setSessionTileDelegate({
       archiveSession: vi.fn(async () => undefined),
@@ -194,7 +200,9 @@ describe('useSessionTileActions sleep/wake session recovery', () => {
 
     // The sibling path must not fall back to the bare banner the composer stopped using.
     expect($notifications.get().some(item => item.message === 'Stop was not sent — nothing was cancelled.')).toBe(true)
-    expect($notifications.get().some(item => item.message === 'Stop failed' || item.title === 'Stop failed')).toBe(false)
+    expect($notifications.get().some(item => item.message === 'Stop failed' || item.title === 'Stop failed')).toBe(
+      false
+    )
   })
 
   it('finalizes the tile partial only after interrupt acknowledgement and keeps it busy until settle', async () => {

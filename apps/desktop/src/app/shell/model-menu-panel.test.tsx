@@ -84,27 +84,40 @@ function renderPanel(onSelectModel = vi.fn()) {
   return { onSelectModel, content }
 }
 
-it.each(['legacy-local', 'remote-target'])('loads the known session owner catalog while ambient source differs (%s)', async kind => {
-  setApiRequestConnection('ambient-remote')
+it.each(['legacy-local', 'remote-target'])(
+  'loads the known session owner catalog while ambient source differs (%s)',
+  async kind => {
+    setApiRequestConnection('ambient-remote')
 
-  if (kind === 'legacy-local') {
-    $sessions.set([{ id: 'runtime-1', profile: 'local-specialist' }] as never)
-  } else {
-    setSessionOwnerHint('runtime-1', { connectionId: 'owner-remote', profile: 'logical', targetProfile: 'backend-target', mode: 'remote' })
-  }
+    if (kind === 'legacy-local') {
+      $sessions.set([{ id: 'runtime-1', profile: 'local-specialist' }] as never)
+    } else {
+      setSessionOwnerHint('runtime-1', {
+        connectionId: 'owner-remote',
+        profile: 'logical',
+        targetProfile: 'backend-target',
+        mode: 'remote'
+      })
+    }
 
-  try {
-    renderPanel()
-    await vi.waitFor(() => expect(getGlobalModelOptions).toHaveBeenCalledWith({ explicitOnly: true }, {
-      connectionId: kind === 'legacy-local' ? null : 'owner-remote',
-      profile: kind === 'legacy-local' ? 'local-specialist' : 'backend-target'
-    }))
-  } finally {
-    setApiRequestConnection(null)
-    $sessions.set([])
-    _resetSessionOwnerHintsForTests()
+    try {
+      renderPanel()
+      await vi.waitFor(() =>
+        expect(getGlobalModelOptions).toHaveBeenCalledWith(
+          { explicitOnly: true },
+          {
+            connectionId: kind === 'legacy-local' ? null : 'owner-remote',
+            profile: kind === 'legacy-local' ? 'local-specialist' : 'backend-target'
+          }
+        )
+      )
+    } finally {
+      setApiRequestConnection(null)
+      $sessions.set([])
+      _resetSessionOwnerHintsForTests()
+    }
   }
-})
+)
 
 describe('ModelMenuPanel MoA presets', () => {
   it('selecting a MoA preset switches PERSISTENTLY via onSelectModel (not the one-shot dispatch)', async () => {
