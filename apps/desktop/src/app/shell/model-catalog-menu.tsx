@@ -72,6 +72,8 @@ export interface ModelChoice {
  * Returning `{}` is fine — the row then shows Hermes' defaults.
  */
 export interface ModelMenuController {
+  /** Live chats preserve explicit options; preset application is deliberate. */
+  preserveOptionsOnSelect?: boolean
   /** Restore a model's remembered settings after it is selected. Separate from
    *  `setOptions` because it is one atomic "apply this model's preset" write,
    *  not a user editing one control — surfaces that write through to a session
@@ -244,9 +246,14 @@ export function ModelCatalogMenu({
     // id, so honor the remembered preset by selecting that sibling. Param-fast
     // is applied through setOptions below instead.
     const variantFast = !(caps?.fast ?? false) && !!family.fastId
-    const targetId = variantFast && preset.fast === true ? family.fastId! : family.id
+    const fast = controller.preserveOptionsOnSelect ? current.fast : preset.fast
+    const targetId = variantFast && fast === true ? family.fastId! : family.id
 
     if ((await controller.select(targetId, provider.slug)) === false) {
+      return
+    }
+
+    if (controller.preserveOptionsOnSelect) {
       return
     }
 
@@ -509,6 +516,13 @@ export function ModelCatalogMenu({
                           fastControl={fastControl}
                           isActive={isCurrent}
                           model={family.id}
+                          onApplyPreset={controller.preserveOptionsOnSelect && isCurrent &&
+                            (preset.effort !== undefined || preset.fast !== undefined)
+                            ? () => controller.applyPreset({
+                                effort: (caps?.reasoning ?? true) ? preset.effort : undefined,
+                                fast: (caps?.fast ?? false) ? preset.fast : undefined
+                              }, { model: family.id, provider: group.provider.slug })
+                            : undefined}
                           onSelectModel={nextModel => controller.select(nextModel, group.provider.slug)}
                           onSetOptions={patch =>
                             controller.setOptions(patch, {

@@ -54,6 +54,11 @@ def _valid_context_stop_v2(value) -> bool:
         and type(value["stopped_at"]) in (int, float) and math.isfinite(value["stopped_at"]))
 
 
+def context_stop_store_scope(db_path):
+    """Opaque path scope shared by the Stop writer and its requesting parent."""
+    return "sha256:" + hashlib.sha256(os.fsencode(os.path.realpath(db_path))).hexdigest()
+
+
 def _identity(value: str, code: str) -> str:
     if type(value) is not str or _ID_RE.fullmatch(value) is None:
         raise ContextContinuationError(code)
@@ -1210,21 +1215,73 @@ class SessionContextContinuityMixin(SessionContextAuthorityMixin):
 
     def record_context_stop(self, session_id):
         """Linearize an explicit user stop with the existing dispatch owner."""
+        return self._execute_write(lambda conn: self._record_context_stop_on_conn(conn, session_id))
+
+    def _record_context_stop_on_conn(self, conn, session_id):
+        root = str(self._session_turn_lease_key_on_conn(conn, session_id))
+        key = "context-control:" + root
+        row = conn.execute("SELECT value FROM state_meta WHERE key=?", (key,)).fetchone()
+        previous = {} if row is None else _strict_json(row[0])
+        watermark = conn.execute("SELECT COALESCE(MAX(id),0) FROM messages").fetchone()[0]
+        input_raw = self._context_input_control_on_conn(conn, session_id)
+        sequence = 0 if input_raw is None else _strict_json(input_raw)["accepted_sequence"]
+        value = {"schema": "SessionDBContextControlV2", "revision": previous.get("revision", 0) + 1,
+                 "stopped": True, "stopped_at": time.time(), "input_watermark": watermark,
+                 "input_sequence": sequence}
+        conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                     (key, _canonical(value)))
+        self._cancel_undispatched_input_turn_on_conn(conn, session_id, value)
+        return value
+
+    def _context_stop_operation_scope(self, conn, session_id, operation_id):
+        _identity(operation_id, "CONTEXT_STOP_OPERATION_INVALID")
+        row = conn.execute("SELECT profile_name FROM sessions WHERE id=?", (session_id,)).fetchone()
+        if row is None:
+            raise ContextContinuationError("CONTEXT_STOP_SESSION_MISSING")
+        return {"schema": "SessionDBStopOperationV1", "operation_id": operation_id,
+                "intent": "stop_cut",
+                "conversation_root": str(self._session_turn_lease_key_on_conn(conn, session_id)),
+                "profile_name": row[0] or "default",
+                "store_scope": context_stop_store_scope(self.db_path)}
+
+    def _read_context_stop_operation_on_conn(self, conn, scope):
+        row = conn.execute("SELECT value FROM state_meta WHERE key=?",
+                           ("context-stop-operation:" + scope["operation_id"],)).fetchone()
+        if row is None:
+            return None
+        receipt = _strict_json(row[0])
+        if (type(receipt) is not dict or set(receipt) != set(scope) | {"control"}
+                or any(receipt.get(key) != value for key, value in scope.items())
+                or not _valid_context_stop_v2(receipt.get("control"))):
+            raise ContextContinuationError("CONTEXT_STOP_OPERATION_COLLISION")
+        return receipt
+
+    def read_context_stop_operation(self, session_id, *, operation_id):
+        """Historical effect evidence only; does not certify current control."""
+        with self._read_ctx() as conn:
+            conn.execute("SAVEPOINT context_stop_operation_read")
+            try:
+                scope = self._context_stop_operation_scope(conn, session_id, operation_id)
+                return self._read_context_stop_operation_on_conn(conn, scope)
+            finally:
+                conn.execute("ROLLBACK TO context_stop_operation_read")
+                conn.execute("RELEASE context_stop_operation_read")
+
+    def record_context_stop_operation(self, session_id, *, operation_id):
+        """Publish one cut and immutable receipt in the SAME writer transaction.
+
+        BEGIN IMMEDIATE serializes competing operations and same-ID retries.
+        A replay returns the original effect without cancelling later inputs.
+        """
         def write(conn):
-            root = str(self._session_turn_lease_key_on_conn(conn, session_id))
-            key = "context-control:" + root
-            row = conn.execute("SELECT value FROM state_meta WHERE key=?", (key,)).fetchone()
-            previous = {} if row is None else _strict_json(row[0])
-            watermark = conn.execute("SELECT COALESCE(MAX(id),0) FROM messages").fetchone()[0]
-            input_raw = self._context_input_control_on_conn(conn, session_id)
-            sequence = 0 if input_raw is None else _strict_json(input_raw)["accepted_sequence"]
-            value = {"schema": "SessionDBContextControlV2", "revision": previous.get("revision", 0) + 1,
-                     "stopped": True, "stopped_at": time.time(), "input_watermark": watermark,
-                     "input_sequence": sequence}
-            conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                         (key, _canonical(value)))
-            self._cancel_undispatched_input_turn_on_conn(conn, session_id, value)
-            return value
+            scope = self._context_stop_operation_scope(conn, session_id, operation_id)
+            receipt = self._read_context_stop_operation_on_conn(conn, scope)
+            if receipt is not None:
+                return {"disposition": "already_committed", "receipt": receipt}
+            receipt = {**scope, "control": self._record_context_stop_on_conn(conn, session_id)}
+            conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?)",
+                         ("context-stop-operation:" + operation_id, _canonical(receipt)))
+            return {"disposition": "applied", "receipt": receipt}
         return self._execute_write(write)
 
     def admit_context_dispatch(self, session_id, *, turn_lease_holder, attempt_id,

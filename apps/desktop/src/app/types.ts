@@ -201,6 +201,8 @@ export interface ClientSessionState {
   fast: boolean
   /** Renderer-only uncertainty after a lost option acknowledgement/readback. */
   unconfirmedRuntimeOptions?: ('effort' | 'fast')[]
+  /** Explicit desired settings waiting for acknowledgement or next-turn application. */
+  pendingRuntimeOptions?: null | { effort?: string; fast?: boolean }
   yolo: boolean
   personality: string
   busy: boolean

@@ -65,13 +65,12 @@ import {
   $activeSessionStoredIdRotation,
   $connection,
   $currentCwd,
-  $currentFastMode,
-  $currentReasoningEffort,
   $messages,
   $newChatWorkspaceTarget,
   $sessions,
   $yoloActive,
   getComposerModelSelection,
+  getComposerRuntimeOptions,
   getSessionOwnerHint,
   type NewChatWorkspaceTarget,
   resolveComposerSessionKey,
@@ -249,8 +248,7 @@ async function desktopSessionCreateParams(
   // session with a different selection than the one the user submitted.
   const profile = capturedRoute?.profile || $newChatProfile.get() || normalizeProfileKey($activeGatewayProfile.get())
   const owner = capturedRoute || { connectionId: getApiRequestConnection(), profile }
-  const effort = $currentReasoningEffort.get().trim()
-  const fast = $currentFastMode.get()
+  const { effort, fast } = getComposerRuntimeOptions()
   let modelSelection: { model: string; provider: string } | null = getComposerModelSelection(owner)
 
   if (!modelSelection) {

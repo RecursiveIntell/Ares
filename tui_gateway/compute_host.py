@@ -465,11 +465,14 @@ class ComputeHost:
                 session = server._sessions.get(sid)
                 ack = {"type": "interrupt.ack", "sid": sid,
                        "request_id": frame.get("request_id"), "applied": False,
+                       **({"operation_id": frame["operation_id"]} if frame.get("operation_id") is not None else {}),
                        **({"target_request_id": target} if target is not None else {})}
                 if target is not None and (type(target) is not str or not target):
                     ack["message"] = "invalid target request id"
                 elif target is not None and self._active_request_ids.get(sid) != target:
                     ack["message"] = "turn owner changed or unknown"
+                    ack["failure_code"] = "turn_owner_changed"
+                    ack["effect_disposition"] = "not_applied"
                 elif session is not None or target is not None:
                     # Accepted requests can still be constructing their session.
                     # Retain the exact cancellation through that window; the
@@ -482,19 +485,36 @@ class ComputeHost:
                         # for A cannot cancel B on the same reused agent.
                         agent = session.get("agent")
                         previous_receipt = getattr(agent, "_context_stop_receipt", None)
-                        server._interrupt_session_turn(sid, session, request_id=frame.get("request_id"))
+                        server._interrupt_session_turn(sid, session, request_id=frame.get("request_id"),
+                            **({"operation_id": frame["operation_id"]} if frame.get("operation_id") is not None else {}))
                         receipt = getattr(agent, "_context_stop_receipt", None)
                         if isinstance(receipt, dict) and receipt is not previous_receipt:
                             ack["stop_receipt"] = {"session_key": receipt.get("session_key"),
                                                    "control": receipt.get("control")}
+                            if (frame.get("operation_id") is not None
+                                    and isinstance(receipt.get("operation"), dict)
+                                    and receipt["operation"].get("operation_id") == frame["operation_id"]):
+                                ack["stop_receipt"]["operation"] = receipt["operation"]
                         if getattr(agent, "_context_stop_unacknowledged", False) is True:
                             ack["durable_stop_unconfirmed"] = True
                     ack.update(applied=True, applied_ns=now_ns())
                     if pending:
                         ack["pending"] = True
             self.emit(ack)
-        except Exception as exc:
-            self.emit({"type": "interrupt.ack", "sid": sid, "request_id": frame.get("request_id"), "applied": False, "message": str(exc)})
+        except Exception:
+            # Application may have cancelled the socket before a later step
+            # failed. Preserve correlation, but never label that as non-effect
+            # or put arbitrary exception/prompt/credential text on the wire.
+            self.emit({
+                "type": "interrupt.ack", "sid": sid,
+                "request_id": frame.get("request_id"),
+                **({"operation_id": frame["operation_id"]} if frame.get("operation_id") is not None else {}),
+                **({"target_request_id": frame["target_request_id"]}
+                   if frame.get("target_request_id") is not None else {}),
+                "applied": False, "message": "Stop application could not be confirmed",
+                "failure_code": "interrupt_application_failed",
+                "effect_disposition": "indeterminate",
+            })
 
     def _run_spike_turn(self, session: HostSession, frame: dict[str, Any]) -> None:
         request_id = frame.get("request_id") or uuid.uuid4().hex
@@ -849,7 +869,7 @@ class ComputeHost:
                 return
             if session is None:
                 snapshot = frame.get("session_snapshot")
-                if route_name in {"config.set.model", "config.set.reasoning"} and isinstance(snapshot, dict) and snapshot.get("sid") == sid:
+                if route_name in {"config.set.model", "config.set.reasoning", "config.set.fast", "config.set.runtime_options"} and isinstance(snapshot, dict) and snapshot.get("sid") == sid:
                     # A new draft has no host session until its first turn.
                     # Rebuild from the serving gateway's committed snapshot;
                     # this also repairs a host restart before another turn.
@@ -858,7 +878,8 @@ class ComputeHost:
                     self.emit({"type": "control.error", "sid": sid, "request_id": request_id, "message": "session not found"})
                     return
             if route == "idle-gated" and session.get("running"):
-                self.emit({"type": "control.error", "sid": sid, "request_id": request_id, "message": "session busy"})
+                self.emit({"type": "control.error", "sid": sid, "request_id": request_id,
+                           "route_name": route_name, "delivery": "not_applied", "message": "session busy"})
                 return
             if route_name in {"clarify.snapshot", "clarify.respond"}:
                 from tui_gateway.transport import bind_transport, reset_transport
@@ -942,7 +963,7 @@ class ComputeHost:
                     }
                 )
                 return
-            if route_name in {"config.set.fast", "config.set.reasoning"}:
+            if route_name in {"config.set.fast", "config.set.reasoning", "config.set.runtime_options"}:
                 option = route_name.removeprefix("config.set.")
                 params = frame.get("params")
                 if not isinstance(params, dict):

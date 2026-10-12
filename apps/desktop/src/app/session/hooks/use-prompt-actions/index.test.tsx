@@ -3611,7 +3611,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
     expect(handle!.activeSessionIdRef.current).toBe(RUNTIME_SESSION_ID)
   })
 
-  it('resumes the stored session and retries once when session.interrupt reports "session not found"', async () => {
+  it('never retargets Stop through resume when the original runtime is missing', async () => {
     const calls: { method: string; params?: Record<string, unknown> }[] = []
     let interruptAttempts = 0
 
@@ -3648,14 +3648,89 @@ describe('usePromptActions sleep/wake session recovery', () => {
 
     await handle!.cancelRun()
 
-    expect(calls.map(c => c.method)).toEqual(['session.interrupt', 'session.resume', 'session.interrupt'])
+    expect(calls.map(c => c.method)).toEqual(['session.interrupt'])
     expect(calls[0]?.params).toEqual({ session_id: RUNTIME_SESSION_ID })
-    expect(calls[1]?.params).toEqual({
-      session_id: STORED_SESSION_ID,
-      source: 'desktop',
-      omit_messages: true
+    expect(handle!.activeSessionIdRef.current).toBe(RUNTIME_SESSION_ID)
+  })
+
+  it('offers explicit conversation recovery when the original Stop owner is missing', async () => {
+    publishSessionState(RUNTIME_SESSION_ID, {
+      ...createClientSessionState(STORED_SESSION_ID), busy: true, turnStartedAt: 123
     })
-    expect(calls[2]?.params).toEqual({ session_id: RECOVERED_SESSION_ID })
+    const resumeStoredSession = vi.fn(async () => undefined)
+    const requestGateway = vi.fn(async () => { throw new Error('session not found') })
+    let handle: HarnessHandle | null = null
+    await actRender(<Harness onReady={h => (handle = h)} refreshSessions={async () => undefined}
+      requestGateway={requestGateway} resumeStoredSession={resumeStoredSession}
+      seedBusy seedTurnStartedAt={123} storedSessionId={STORED_SESSION_ID} />)
+    await handle!.cancelRun()
+    const recovery = $notifications.get().find(item => item.action)
+    expect(recovery?.action).toBeDefined()
+    expect(resumeStoredSession).not.toHaveBeenCalled()
+    await act(async () => { recovery!.action!.onClick() })
+    expect(resumeStoredSession).toHaveBeenCalledWith(STORED_SESSION_ID)
+    expect(requestGateway).toHaveBeenCalledTimes(1)
+    dropSessionState(RUNTIME_SESSION_ID)
+  })
+
+  it.each([
+    ['not_sent', 'error', 'Stop was not sent — nothing was cancelled.'],
+    ['not_applied', 'info', 'That turn is no longer active — nothing was cancelled.'],
+    ['indeterminate', 'error', 'Stop could not be confirmed — the turn may still be running.']
+  ] as const)(
+    'reports a typed Stop disposition (%s) instead of a bare "Stop failed"',
+    async (effect_disposition, kind, message) => {
+      clearNotifications()
+      publishSessionState(RUNTIME_SESSION_ID, {
+        ...createClientSessionState(STORED_SESSION_ID), busy: true, turnStartedAt: 123
+      })
+
+      const requestGateway = vi.fn(async () => {
+        throw new JsonRpcGatewayError('Stop could not be confirmed; reconcile the original turn before continuing', {
+          code: 5019,
+          data: {
+            effect_disposition,
+            failure_code: 'stop_ack_unconfirmed',
+            owner_reconciliation_required: effect_disposition === 'indeterminate'
+          }
+        })
+      })
+
+      let handle: HarnessHandle | null = null
+      await actRender(<Harness onReady={h => (handle = h)} refreshSessions={async () => undefined}
+        requestGateway={requestGateway} seedBusy seedTurnStartedAt={123} storedSessionId={STORED_SESSION_ID} />)
+      await waitFor(() => expect(handle).not.toBeNull())
+
+      await handle!.cancelRun()
+
+      const notice = $notifications.get().find(item => item.message === message)
+      expect(notice?.kind).toBe(kind)
+      // The typed disposition must not ALSO raise the generic failure banner.
+      expect($notifications.get().some(item => item.message === 'Stop failed' || item.title === 'Stop failed')).toBe(false)
+      dropSessionState(RUNTIME_SESSION_ID)
+    }
+  )
+
+  it('keeps the generic Stop failure for an untyped error payload', async () => {
+    clearNotifications()
+    publishSessionState(RUNTIME_SESSION_ID, {
+      ...createClientSessionState(STORED_SESSION_ID), busy: true, turnStartedAt: 123
+    })
+
+    const requestGateway = vi.fn(async () => {
+      throw new JsonRpcGatewayError('Stop could not be confirmed', { code: 5019, data: { failure_code: 'stop_ack_unconfirmed' } })
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(<Harness onReady={h => (handle = h)} refreshSessions={async () => undefined}
+      requestGateway={requestGateway} seedBusy seedTurnStartedAt={123} storedSessionId={STORED_SESSION_ID} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await handle!.cancelRun()
+
+    // notifyError() carries the fallback as the notification TITLE.
+    expect($notifications.get().some(item => item.message === 'Stop failed' || item.title === 'Stop failed')).toBe(true)
+    dropSessionState(RUNTIME_SESSION_ID)
   })
 
   it.each(['session.interrupt', 'session.redirect'])(
@@ -3882,12 +3957,11 @@ describe('usePromptActions sleep/wake session recovery', () => {
       resolveInterrupt()
       await finish
 
-      // Acceptance finalizes partial output but busy is cleared only by the
-      // authoritative terminal event.
+      // ACK acceptance must preserve partial output while execution is live.
       expect(lastState).toMatchObject({
         busy: true,
         interrupted: true,
-        messages: [expect.objectContaining({ pending: false })]
+        messages: [expect.objectContaining({ pending: true })]
       })
     })
   })
@@ -3959,7 +4033,8 @@ describe('usePromptActions sleep/wake session recovery', () => {
     dropSessionState(RUNTIME_SESSION_ID)
   })
 
-  it('does not treat missing pre-start turn markers as a wildcard for a late Stop ACK', async () => {
+  it.each([false, true])('does not treat missing pre-start markers as a wildcard for late Stop failure=%s', async failure => {
+    const notificationsBefore = $notifications.get()
     publishSessionState(RUNTIME_SESSION_ID, {
       ...createClientSessionState(STORED_SESSION_ID),
       busy: true
@@ -3973,6 +4048,10 @@ describe('usePromptActions sleep/wake session recovery', () => {
         await new Promise<void>(resolve => {
           resolveInterrupt = resolve
         })
+
+        if (failure) {
+          throw new Error('Stop confirmation timed out')
+        }
       }
 
       return {} as never
@@ -4009,6 +4088,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
       interruptPending: false,
       streamId: 'new-turn'
     })
+    expect($notifications.get()).toEqual(notificationsBefore)
     dropSessionState(RUNTIME_SESSION_ID)
   })
 

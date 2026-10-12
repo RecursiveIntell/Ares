@@ -84,6 +84,7 @@ import {
   readFileDataUrlForAttach,
   readImageForRemoteAttach,
   shouldInterruptBeforeRewind,
+  stopFailureNotice,
   type SubmitTextOptions,
   withSessionNotFoundResume
 } from './utils'
@@ -762,30 +763,12 @@ export function usePromptActions({
     // turn look idle or discard the user's partial output/prompts.
     updateSessionState(sessionId, state => ({ ...state, interruptPending: true }))
 
-    let interruptedSessionId = sessionId
+    const interruptedSessionId = sessionId
 
     try {
-      const recovered = await withSessionNotFoundResume(
-        sessionId,
-        storedSessionId,
-        liveId => requestForTargetSession('session.interrupt', { session_id: liveId }),
-        {
-          requestGateway: requestForTargetSession,
-          driftReason: () =>
-            selectedStoredSessionIdRef.current !== storedSessionId || activeSessionIdRef.current !== sessionId
-              ? 'the selected session changed while Stop was reconnecting'
-              : null,
-          onRecovered: recoveredId => {
-            interruptedSessionId = recoveredId
-            updateSessionState(sessionId, state => ({ ...state, interruptPending: false }))
-            updateSessionState(recoveredId, state => ({ ...state, interruptPending: true }))
-            activeSessionIdRef.current = recoveredId
-            setActiveSessionId(recoveredId)
-          }
-        }
-      )
-
-      interruptedSessionId = recovered.sessionId
+      // A missing runtime is not permission to cancel a resumed successor.
+      // Only an explicit later click may ask the original owner to reconcile.
+      await requestForTargetSession('session.interrupt', { session_id: sessionId })
 
       let acceptedForCurrentTurn = false
 
@@ -809,7 +792,6 @@ export function usePromptActions({
           ...(acceptedForCurrentTurn
             ? {
                 interrupted: true,
-                messages: finalizeInterruptedMessages(state.messages, state.streamId),
                 needsInput: false,
                 pendingBranchGroup: null
               }
@@ -847,14 +829,47 @@ export function usePromptActions({
       // Stop failure if the authoritative stream already settled this session.
       const current = $sessionStates.get()[sessionId]
 
-      if (current?.busy || current?.reconnecting || !current) {
-        notifyError(err, copy.stopFailed)
+      if (activeSessionIdRef.current === sessionId && selectedStoredSessionIdRef.current === storedSessionId &&
+          (current?.busy || current?.reconnecting || !current) &&
+          Boolean(turnAtStop?.streamId || turnAtStop?.turnStartedAt != null) &&
+          (!turnAtStop?.streamId || current?.streamId === turnAtStop.streamId) &&
+          (turnAtStop?.turnStartedAt == null || current?.turnStartedAt === turnAtStop.turnStartedAt)) {
+        const missingOwner = err instanceof JsonRpcGatewayError
+          ? err.code === 4007
+          : err instanceof Error && /session not found/i.test(err.message)
+
+        // The backend types how the Stop actually resolved
+        // (`effect_disposition` on the 5019 payload). Report that instead of a
+        // bare "Stop failed": "nothing was cancelled" and "the turn is still
+        // running" call for completely different reactions from the user.
+        const notice = stopFailureNotice(err, copy)
+
+        if (notice) {
+          notify(notice)
+        } else if (missingOwner && storedSessionId) {
+          notify({
+            kind: 'error',
+            message: copy.stopFailed,
+            action: {
+              label: t.shell.gatewayMenu.reconnectGateway,
+              onClick: () => {
+                if (activeSessionIdRef.current === sessionId && selectedStoredSessionIdRef.current === storedSessionId) {
+                  void resumeStoredSession(storedSessionId)
+                }
+              }
+            }
+          })
+        } else {
+          notifyError(err, copy.stopFailed)
+        }
       }
     }
   }, [
     activeSessionIdRef,
     busyRef,
-    copy.stopFailed,
+    copy,
+    t.shell.gatewayMenu.reconnectGateway,
+    resumeStoredSession,
     requestForStoredSession,
     selectedStoredSessionIdRef,
     updateSessionState

@@ -56,7 +56,13 @@ def test_false_idle_parent_still_targets_known_owner(monkeypatch):
     monkeypatch.setattr(server, "_emit", lambda *a: None)
     monkeypatch.setattr(server, "_session_info", lambda *a: {})
     assert server._interrupt_session_turn("s", session, request_id="stop")
-    assert calls == [("s", {"request_id": "stop", "target_request_id": "A", "wait": True})]
+    assert len(calls) == 1 and calls[0][0] == 's'
+    correlation = calls[0][1]
+    assert correlation['request_id'] == 'stop' and correlation['target_request_id'] == 'A'
+    assert correlation['wait'] is True
+    import uuid
+    assert uuid.UUID(correlation['operation_id']).version == 4
+    assert correlation['operation_id'] not in {'stop', 'A'}
 
 
 def test_late_parent_stop_does_not_clear_successor_state(monkeypatch):

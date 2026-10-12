@@ -61,6 +61,16 @@ afterEach(() => {
 })
 
 describe('session.info config refetch gating', () => {
+  it('does not overwrite pending explicit options with older runtime observations', () => {
+    mountStream()
+    sessionStates!.set(ACTIVE_SID, {
+      ...createClientSessionState('stored-active'), reasoningEffort: 'high', fast: false,
+      pendingRuntimeOptions: { effort: 'high', fast: false }
+    } as ClientSessionState)
+    sessionInfo(ACTIVE_SID, { reasoning_effort: 'low', fast: true })
+    expect(sessionStates!.get(ACTIVE_SID)).toMatchObject({ reasoningEffort: 'high', fast: false })
+  })
+
   it('coalesces active-session bursts into one trailing config fetch', async () => {
     // Mount under real timers (waitFor), then freeze time for the debounce.
     mountStream()

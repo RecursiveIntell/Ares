@@ -141,6 +141,106 @@ class TestUnguardedPickStillDefers:
         assert pending["display_provider"] == "anthropic"
 
 
+class TestSupersedingPickPreservesADeferredOptionsIntent:
+    """A pick must merge like the options direction, not clobber the intent.
+
+    ``config.set runtime_options`` merges INTO an existing pending intent. If the
+    pick direction instead replaced the dict wholesale, a busy model pick landing
+    after a deferred effort/Fast edit would silently drop it: the next turn runs
+    the old values while the client still shows the newer choice as pending.
+    """
+
+    def test_a_busy_pick_keeps_an_already_stashed_options_intent(self, running_session):
+        running_session["pending_model_switch"] = {"runtime_options": {"effort": "high", "fast": True}}
+
+        result = _config_set_model(UNGUARDED_MODEL)["result"]
+        assert result["deferred"] is True
+
+        pending = running_session["pending_model_switch"]
+        assert pending["runtime_options"] == {"effort": "high", "fast": True}, (
+            "a superseding pick replaced the whole intent and silently dropped the "
+            "user's deferred effort/Fast"
+        )
+        assert pending["raw"] == UNGUARDED_MODEL
+
+    def test_a_busy_pick_does_not_carry_the_publication_marker(self, running_session):
+        running_session["pending_model_switch"] = {
+            "runtime_options": {"effort": "high"},
+            "_model_switch_publications": {"already": "published"},
+        }
+
+        _config_set_model(UNGUARDED_MODEL)
+
+        pending = running_session["pending_model_switch"]
+        assert "_model_switch_publications" not in pending, (
+            "carrying the publication marker makes _apply_pending_model_switch "
+            "return early, so the new pick would never apply"
+        )
+        assert pending["runtime_options"] == {"effort": "high"}
+
+
+class TestCompletingPickKeepsTheSupersededOptionsIntent:
+    """The mirror of the merge, exercised end-to-end on the idle path.
+
+    Sequence: busy turn -> pick B (deferred, carrying an effort edit) -> the turn
+    settles -> the user picks D while idle. D applies and B's model choice is
+    correctly superseded -- but B's independently expressed effort/Fast intent
+    was riding in the same dict and must not die silently with it.
+    """
+
+    def test_an_idle_pick_keeps_the_superseded_options_intent(self, monkeypatch):
+        # Provider resolution happens on the idle path. A dummy key satisfies the
+        # credential lookup, and the agent's in-place swap is a no-op here -- the
+        # switch-metadata path makes no network call.
+        monkeypatch.setenv("GMI_API_KEY", "test-key-not-used")
+
+        agent = types.SimpleNamespace()
+        agent.switch_model = lambda **_kwargs: None
+
+        sessions = server._sessions
+        sessions["idle-sid"] = _session(running=False, agent=agent)
+        session = sessions["idle-sid"]
+        session["pending_model_switch"] = {"runtime_options": {"effort": "high", "fast": True}}
+        try:
+            resp = server.handle_request({
+                "id": "1", "method": "config.set",
+                "params": {"session_id": "idle-sid", "key": "model", "value": UNGUARDED_MODEL},
+            })
+            assert not resp.get("error"), resp
+            pending = session.get("pending_model_switch")
+            assert pending is not None and pending.get("runtime_options") == {"effort": "high", "fast": True}, (
+                "a completing pick discarded the superseded intent's effort/Fast: "
+                f"pending={pending!r}"
+            )
+        finally:
+            sessions.pop("idle-sid", None)
+
+
+class TestSupersededIntentSurvivor:
+    """The pure decision behind the idle-path fix, pinned without credentials."""
+
+    def test_a_superseded_options_intent_survives_the_published_pick(self):
+        assert server._superseded_intent_after_publication(
+            {"runtime_options": {"effort": "high", "fast": True}}
+        ) == {"runtime_options": {"effort": "high", "fast": True}}
+
+    def test_a_model_only_intent_is_dropped_entirely(self):
+        assert server._superseded_intent_after_publication({"raw": "m --session"}) is None
+        assert server._superseded_intent_after_publication(None) is None
+
+    def test_the_publication_marker_never_survives(self):
+        survivor = server._superseded_intent_after_publication({
+            "_model_switch_publications": {"owners": ["x"]},
+            "runtime_options": {"effort": "high"},
+        })
+
+        assert survivor == {"runtime_options": {"effort": "high"}}
+        assert "_model_switch_publications" not in survivor
+
+    def test_an_empty_options_intent_is_dropped(self):
+        assert server._superseded_intent_after_publication({"runtime_options": {}}) is None
+
+
 class TestGuardFailureIsNotFatal:
     def test_a_raising_guard_falls_back_to_deferring(self, running_session, monkeypatch):
         """A broken guard must never cost the user their model pick.

@@ -3333,6 +3333,7 @@ class AIAgent:
         *,
         hard_cancel: bool = False,
         tool_reason: Optional[str] = None,
+        operation_id: Optional[str] = None,
     ) -> None:
         """
         Request the agent to interrupt its current tool-calling loop.
@@ -3500,12 +3501,17 @@ class AIAgent:
                     if db is None or not getattr(self, "session_id", None):
                         raise RuntimeError("CONTEXT_DISPATCH_OWNER_UNAVAILABLE")
                     stop_session_id = self.session_id
-                    control = db.record_context_stop(stop_session_id)
-                    self._context_stop_receipt = {"session_key": stop_session_id, "control": control}
+                    if operation_id is None:
+                        control = db.record_context_stop(stop_session_id)
+                        self._context_stop_receipt = {"session_key": stop_session_id, "control": control}
+                    else:
+                        result = db.record_context_stop_operation(stop_session_id, operation_id=operation_id)
+                        self._context_stop_receipt = {"session_key": stop_session_id,
+                            "control": result["receipt"]["control"], "operation": result["receipt"]}
                     self._context_stop_unacknowledged = False
             except Exception:
                 self._context_stop_unacknowledged = True
-                logger.error("Context stop cancelled locally; durable acknowledgement failed", exc_info=True)
+                logger.error("Context stop cancelled locally; durable acknowledgement failed")
         if not self.quiet_mode:
             print("\n⚡ Interrupt requested" + (f": '{message[:40]}...'" if message and len(message) > 40 else f": '{message}'" if message else ""))
 
@@ -3514,6 +3520,7 @@ class AIAgent:
         message: Optional[str] = None,
         *,
         tool_reason: Optional[str] = None,
+        operation_id: Optional[str] = None,
     ) -> None:
         """Request an explicit stop while preserving ``interrupt()`` ABI.
 
@@ -3528,6 +3535,7 @@ class AIAgent:
             message,
             hard_cancel=True,
             tool_reason=tool_reason,
+            operation_id=operation_id,
         )
 
     def clear_interrupt(self, *, preserve_redirect: bool = False) -> bool:

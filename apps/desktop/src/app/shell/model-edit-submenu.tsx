@@ -59,6 +59,8 @@ export function resolveFastControl(
 }
 
 interface ModelEditSubmenuProps {
+  /** Deliberately apply saved settings to the already-selected model. */
+  onApplyPreset?: () => void
   /** Whether this model can turn thinking off. False on reasoning-mandatory
    *  routes, whose upstream rejects a disable — the toggle is hidden rather
    *  than offered as a control that silently does nothing. */
@@ -107,6 +109,7 @@ function ModelEditSubmenuBody({
   effort,
   fastControl,
   isActive,
+  onApplyPreset,
   onSelectModel,
   onSetOptions,
   reasoning
@@ -145,6 +148,11 @@ function ModelEditSubmenuBody({
   ) : (
     <>
       <DropdownMenuLabel className={dropdownMenuSectionLabel}>{copy.options}</DropdownMenuLabel>
+      {onApplyPreset ? (
+        <DropdownMenuItem className={dropdownMenuRow} onSelect={() => onApplyPreset()}>
+          {t.common.apply} {copy.options}
+        </DropdownMenuItem>
+      ) : null}
       {showThinkingToggle ? (
         <DropdownMenuItem className={dropdownMenuRow} onSelect={event => event.preventDefault()}>
           {copy.thinking}

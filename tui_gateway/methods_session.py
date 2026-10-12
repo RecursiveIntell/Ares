@@ -3455,10 +3455,34 @@ def _(rid, params: dict) -> dict:
         return err
     if _session_uses_compute_host(session):
         sid = str(params.get("session_id") or "")
+        with session.get("history_lock", threading.Lock()):
+            control = session.get("_stop_pending") or session.get("_stop_uncertain") or {}
+            correlation = {"session_id": sid, "request_id": control.get("request_id") or f"interrupt-{rid}",
+                           "target_request_id": control.get("target_request_id") or session.get("_compute_host_active_request_id"),
+                           "host_boot_id": control.get("host_boot_id")}
         try:
             _interrupt_session_turn(sid, session, request_id=f"interrupt-{rid}")
         except Exception as exc:
-            return _err(rid, 5019, f"compute-host interrupt failed: {exc}")
+            from tui_gateway.host_supervisor import HostSendNotSent, HostStopNotApplied, HostSendUncertain, HostProjectionFault
+            with session.get("history_lock", threading.Lock()):
+                control = session.get("_stop_pending") or session.get("_stop_uncertain") or {}
+                unresolved = bool(control)
+                correlation["host_boot_id"] = control.get("host_boot_id", correlation["host_boot_id"])
+                if control.get("operation_id"):
+                    correlation["operation_id"] = control["operation_id"]
+                failure_code = ("stop_not_sent" if isinstance(exc, HostSendNotSent) else
+                                "stop_refused_before_effect" if isinstance(exc, HostStopNotApplied) else
+                                "stop_projection_failed" if isinstance(exc, HostProjectionFault) else
+                                "stop_canonical_write_indeterminate" if control.get("canonical_stop_started") else
+                                "stop_missing_durable_receipt" if control.get("missing_stop_receipt") else
+                                "stop_durable_receipt_unconfirmed" if control.get("durable_stop_unconfirmed") and control.get("ack") else
+                                "stop_ack_unconfirmed" if isinstance(exc, HostSendUncertain) else
+                                "stop_application_indeterminate")
+            return _err(rid, 5019, "Stop could not be confirmed; reconcile the original turn before continuing",
+                        {**correlation, "failure_code": failure_code,
+                         "effect_disposition": ("not_sent" if isinstance(exc, HostSendNotSent) else
+                                                "not_applied" if isinstance(exc, HostStopNotApplied) else "indeterminate"),
+                         "owner_reconciliation_required": unresolved})
         return _ok(rid, {"status": "interrupted", "turn_isolation": True})
     session, err = _sess(params, rid)
     if err:

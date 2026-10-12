@@ -1582,7 +1582,7 @@ function publishRuntimeToComposer(state: SessionRuntimeStatePatch): void {
   }
 
   if (state.reasoningEffort !== undefined) {
-    setCurrentReasoningEffort(state.reasoningEffort)
+    setCurrentReasoningEffort(state.reasoningEffort, false)
   }
 
   if (state.serviceTier !== undefined) {
@@ -1590,7 +1590,7 @@ function publishRuntimeToComposer(state: SessionRuntimeStatePatch): void {
   }
 
   if (state.fast !== undefined) {
-    setCurrentFastMode(state.fast)
+    setCurrentFastMode(state.fast, false)
   }
 
   if (state.yolo !== undefined) {
@@ -1678,9 +1678,9 @@ export function applyStoredSessionPreviewRuntimeInfo(
 ) {
   setCurrentModel(stored?.model || '')
   setCurrentProvider('')
-  setCurrentReasoningEffort('')
+  setCurrentReasoningEffort('', false)
   setCurrentServiceTier('')
-  setCurrentFastMode(false)
+  setCurrentFastMode(false, false)
   setYoloActive(false)
   setCurrentPersonality('')
 

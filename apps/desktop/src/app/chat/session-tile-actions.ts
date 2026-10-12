@@ -11,6 +11,7 @@
 import type { AppendMessage, ThreadMessage } from '@assistant-ui/react'
 import { useCallback, useMemo, useRef } from 'react'
 
+import { stopFailureNotice } from '@/app/session/hooks/use-prompt-actions/utils'
 import type { ClientSessionState } from '@/app/types'
 import { useI18n } from '@/i18n'
 import { textPart } from '@/lib/chat-messages'
@@ -20,7 +21,7 @@ import { triggerHaptic } from '@/lib/haptics'
 import { clearClarifyRequest } from '@/store/clarify'
 import type { ComposerAttachment } from '@/store/composer'
 import { resetSessionBackground } from '@/store/composer-status'
-import { notifyError } from '@/store/notifications'
+import { notify, notifyError } from '@/store/notifications'
 import { clearPreviewArtifacts } from '@/store/preview-status'
 import { clearAllPrompts } from '@/store/prompts'
 import {
@@ -436,10 +437,24 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
       const current = $sessionStates.get()[interruptedSessionId]
 
       if (current?.busy || current?.reconnecting || !current) {
-        notifyError(err, copy.stopFailed)
+        // Same typed dispositions as the composer's Stop: a rejected tile Stop
+        // must say whether anything was actually cancelled.
+        const notice = stopFailureNotice(err, copy)
+
+        if (notice) {
+          notify(notice)
+        } else {
+          notifyError(err, copy.stopFailed)
+        }
       }
     }
-  }, [bindRecoveredRuntime, copy.stopFailed, readState, requestSessionGateway, update])
+  }, [
+    bindRecoveredRuntime,
+    copy,
+    readState,
+    requestSessionGateway,
+    update
+  ])
 
   const steerPrompt = useCallback(
     async (rawText: string): Promise<boolean> => {
