@@ -3214,21 +3214,14 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
 
             llm_summary = self._bind_receipt_carrier(llm_summary, response)
             candidate = list(compacted)
-            metadata = candidate[summary_idx].get("metadata")
-            if not isinstance(metadata, dict):
-                metadata = {}
-            receipt_id = receipt.get("receipt_id")
-            generation = receipt.get("generation")
+            # The bound text and durable summary marker already carry the
+            # checkpoint identity. SessionDB has no generic metadata column;
+            # adding one here would sign a projection that cold replay loses.
+            # Keep checkpoint accounting in the pending admission, not in a
+            # transient host metadata envelope.
             candidate[summary_idx] = {
                 **candidate[summary_idx],
                 "content": llm_summary,
-                "metadata": {
-                    **metadata,
-                    "compressed_summary": True,
-                    "llm_checkpoint": True,
-                    "receipt_id": receipt_id,
-                    "receipt_generation": generation,
-                },
             }
             # The caller finalizes this candidate with Rust and accepts it only
             # if the governor's own token counter meets the target.
