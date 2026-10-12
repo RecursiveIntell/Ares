@@ -267,6 +267,21 @@ def _(rid, params: dict) -> dict:
                 "display_name": getattr(p, "display_name", "") or "",
                 "skill_count": getattr(p, "skill_count", 0) or 0,
             }
+            # Profile Models reads saved intent, not a live agent's clamped
+            # effort. Resolve this row's owner without opening a backend.
+            from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+            token = set_hermes_home_override(str(p.path))
+            try:
+                from hermes_cli.config import read_user_config_raw
+
+                cfg = read_user_config_raw() or {}
+                agent_cfg = cfg.get("agent") or {}
+                row["reasoning_effort"] = agent_cfg.get("reasoning_effort")
+            except Exception:
+                row["reasoning_effort"] = None
+            finally:
+                reset_hermes_home_override(token)
             if include_sessions:
                 db = _open_profile_session_db(p.path)
                 try:
@@ -752,7 +767,7 @@ def _(rid, params: dict) -> dict:
 
     Params: ``name`` (required) plus any of:
     ``description`` (str), ``soul`` (str, full SOUL.md replacement),
-    ``model`` + ``provider`` (both required together),
+    ``model`` + ``provider`` (both required together), ``reasoning_effort``,
     ``disabled_skills`` (list[str], replace semantics),
     ``enabled_toolsets`` (list[str], replace semantics; empty list clears
     the pin so every toolset is enabled again), and
@@ -775,7 +790,35 @@ def _(rid, params: dict) -> dict:
         if not profile_dir.is_dir():
             return _err(rid, 4064, f"profile '{name}' not found")
 
+        effort = None
+        if "reasoning_effort" in params:
+            from hermes_constants import parse_reasoning_effort
+
+            parsed = parse_reasoning_effort(params["reasoning_effort"])
+            if parsed is None:
+                return _err(rid, 4002, "Invalid reasoning effort")
+            effort = parsed.get("effort", "none")
+
         applied = {}
+
+        if effort is not None:
+            token = set_hermes_home_override(str(profile_dir))
+            try:
+                from hermes_cli.config import read_user_config_raw, save_config
+
+                # Merge a single owned leaf under the canonical writer lock;
+                # never overwrite another section from a stale full snapshot.
+                save_config(
+                    {"agent": {"reasoning_effort": effort}},
+                    merge_existing=True,
+                    preserve_keys={("agent", "reasoning_effort")},
+                )
+                cfg = read_user_config_raw() or {}
+                applied["reasoning_effort"] = (cfg.get("agent") or {}).get("reasoning_effort") == effort
+            except Exception:
+                applied["reasoning_effort"] = False
+            finally:
+                reset_hermes_home_override(token)
 
         if isinstance(params.get("ui_meta"), dict):
             # Client-agnostic UI metadata (avatar/pet/etc.), merged key-wise
