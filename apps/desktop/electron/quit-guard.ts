@@ -6,6 +6,26 @@
 
 const MAX_LISTED = 4
 
+export interface QuitConfirmationState {
+  skipConfirm: boolean
+  confirmed: boolean
+  promptOpen: boolean
+  quittingForHandoff: boolean
+}
+
+/** Separate explicit quit authority from a still-unanswered confirmation. */
+export function quitConfirmationDisposition(state: QuitConfirmationState): 'proceed' | 'hold' | 'check-work' {
+  if (state.skipConfirm || state.confirmed || state.quittingForHandoff) {
+    return 'proceed'
+  }
+
+  if (state.promptOpen) {
+    return 'hold'
+  }
+
+  return 'check-work'
+}
+
 export interface ActiveWork {
   /** Titles of sessions running a turn. Untitled sessions contribute a count only. */
   titles: string[]

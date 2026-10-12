@@ -313,7 +313,7 @@ import {
   tagRegistrySessionResponse
 } from './profile-session-routing'
 import { createQuickEntryShortcut, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
-import { type ActiveWork, mergeActiveWork, normalizeActiveWork, quitPromptFor } from './quit-guard'
+import { type ActiveWork, mergeActiveWork, normalizeActiveWork, quitConfirmationDisposition, quitPromptFor } from './quit-guard'
 import * as remoteLifecycle from './remote-lifecycle'
 import {
   attachPowerResumeRemoteRevalidation,
@@ -17615,8 +17615,20 @@ function configureSpellChecker() {
 // and the confirmation is on screen; "Quit Anyway" re-enters before-quit with
 // the latch set and falls straight through to the teardown below.
 function heldQuitForActiveWork(event: Electron.Event): boolean {
-  if (SKIP_QUIT_CONFIRM || quitConfirmedWithActiveWork || quitPromptOpen) {
+  const disposition = quitConfirmationDisposition({
+    skipConfirm: SKIP_QUIT_CONFIRM,
+    confirmed: quitConfirmedWithActiveWork,
+    promptOpen: quitPromptOpen,
+    quittingForHandoff: isQuittingForHandoff,
+  })
+
+  if (disposition === 'proceed') {
     return false
+  }
+
+  if (disposition === 'hold') {
+    event.preventDefault()
+    return true
   }
 
   const prompt = quitPromptFor(mergeActiveWork(activeWorkByWebContents.values()), isQuittingForHandoff)
