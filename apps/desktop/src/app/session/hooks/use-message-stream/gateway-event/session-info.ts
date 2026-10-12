@@ -138,7 +138,7 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
     // session, OR when it's a global broadcast and we have no session.
     const apply = (explicitSid ? isActiveEvent : !activeSessionIdRef.current) || rebound
     const statePatch = sessionInfoStatePatch(payload)
-    const hasStatePatch = hasSessionInfoStatePatch(statePatch)
+    const hasStatePatch = hasSessionInfoStatePatch(statePatch) || Boolean(payload?.pending_runtime_options)
     const modelChanged = typeof payload?.model === 'string'
     const providerChanged = typeof payload?.provider === 'string'
     const runningChanged = typeof payload?.running === 'boolean'
@@ -155,6 +155,20 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
     // session.info frames, but those frames cannot prove the durable turn has
     // settled: only a fresh runtime binding or durable hydrate may do that.
     const retiredRuntime = Boolean(knownState?.reconnecting)
+    // A fresh renderer has no optimistic intent to preserve. Hydrate the
+    // session-owned deferred intent from the backend, but never let an older
+    // heartbeat replace a newer local edit or revive a retired runtime.
+    const reportedOptions = retiredRuntime ? null : payload?.pending_runtime_options
+
+    const incomingOptions =
+      reportedOptions && typeof reportedOptions === 'object'
+        ? {
+            ...(typeof reportedOptions.effort === 'string' ? { effort: reportedOptions.effort } : {}),
+            ...(typeof reportedOptions.fast === 'boolean' ? { fast: reportedOptions.fast } : {})
+          }
+        : null
+
+    const pendingOptions = knownState?.pendingRuntimeOptions ?? incomingOptions
     const modelValueChanged = modelChanged && payload!.model !== (knownState?.model ?? $currentModel.get())
 
     const providerValueChanged =
@@ -214,9 +228,10 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
         setCurrentPersonality(normalizePersonalityValue(payload.personality))
       }
 
-      if (typeof payload?.reasoning_effort === 'string' &&
-          (knownState?.pendingRuntimeOptions?.effort === undefined ||
-           payload.reasoning_effort === knownState.pendingRuntimeOptions.effort)) {
+      if (
+        typeof payload?.reasoning_effort === 'string' &&
+        (pendingOptions?.effort === undefined || payload.reasoning_effort === pendingOptions.effort)
+      ) {
         setCurrentReasoningEffort(payload.reasoning_effort, false)
       }
 
@@ -224,14 +239,25 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
         setCurrentServiceTier(payload.service_tier)
       }
 
-      if (typeof payload?.fast === 'boolean' &&
-          (knownState?.pendingRuntimeOptions?.fast === undefined ||
-           payload.fast === knownState.pendingRuntimeOptions.fast)) {
+      if (
+        typeof payload?.fast === 'boolean' &&
+        (pendingOptions?.fast === undefined || payload.fast === pendingOptions.fast)
+      ) {
         setCurrentFastMode(payload.fast, false)
       }
 
       if (typeof payload?.yolo === 'boolean') {
         setYoloActive(payload.yolo)
+      }
+
+      if (sessionId && !knownState?.pendingRuntimeOptions && incomingOptions) {
+        if (incomingOptions.effort !== undefined) {
+          setCurrentReasoningEffort(incomingOptions.effort, false)
+        }
+
+        if (incomingOptions.fast !== undefined) {
+          setCurrentFastMode(incomingOptions.fast, false)
+        }
       }
     }
 
@@ -256,7 +282,17 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
 
           const { model: _incomingModel, provider: _incomingProvider, ...nonModelStatePatch } = statePatch
           const effectiveStatePatch = { ...(repeatsPreviousModel ? nonModelStatePatch : statePatch) }
-          const options = state.pendingRuntimeOptions
+          const options = state.pendingRuntimeOptions ?? incomingOptions
+
+          if (!state.pendingRuntimeOptions && incomingOptions) {
+            if (incomingOptions.effort !== undefined) {
+              effectiveStatePatch.reasoningEffort = incomingOptions.effort
+            }
+
+            if (incomingOptions.fast !== undefined) {
+              effectiveStatePatch.fast = incomingOptions.fast
+            }
+          }
 
           if (options?.effort !== undefined && effectiveStatePatch.reasoningEffort !== options.effort) {
             delete effectiveStatePatch.reasoningEffort
@@ -267,20 +303,18 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
             delete effectiveStatePatch.serviceTier
           }
 
-          const optionsApplied = options && payload?.pending_runtime_options === null &&
+          const optionsApplied =
+            options &&
+            payload?.pending_runtime_options === null &&
             (options.effort === undefined || statePatch.reasoningEffort === options.effort) &&
             (options.fast === undefined || statePatch.fast === options.fast)
 
-          const pendingModelSelection = repeatsPreviousModel
-            ? pending
-            : hasIncomingModelMetadata
-              ? null
-              : pending
+          const pendingModelSelection = repeatsPreviousModel ? pending : hasIncomingModelMetadata ? null : pending
 
           return {
             ...state,
             ...effectiveStatePatch,
-            pendingRuntimeOptions: optionsApplied ? null : state.pendingRuntimeOptions,
+            pendingRuntimeOptions: optionsApplied ? null : incomingOptions ? options : state.pendingRuntimeOptions,
             branch: effectiveStatePatch.branch ?? state.branch,
             cwd: effectiveStatePatch.cwd ?? state.cwd,
             pendingModelSelection
@@ -452,7 +486,9 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
       const eventConnection = event.connectionId?.trim() || undefined
       const eventProfile = event.profile?.trim() || undefined
 
-      const matchesOwner = owner && (!eventConnection || eventConnection === owner.connectionId) &&
+      const matchesOwner =
+        owner &&
+        (!eventConnection || eventConnection === owner.connectionId) &&
         (!eventProfile || eventProfile === owner.profile || eventProfile === owner.targetProfile)
 
       const completeEventOwner = eventConnection && eventProfile
@@ -463,7 +499,10 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
       // one exact cache. Invalidate the catalog family without mixing owners.
       const exactOwner = matchesOwner || completeEventOwner || legacyUnstamped
       void queryClient.invalidateQueries({
-        queryKey: explicitSid && sessionId && exactOwner ? modelOptionsQueryKey(catalogProfile, sessionId, catalogConnection) : ['model-options']
+        queryKey:
+          explicitSid && sessionId && exactOwner
+            ? modelOptionsQueryKey(catalogProfile, sessionId, catalogConnection)
+            : ['model-options']
       })
     }
 

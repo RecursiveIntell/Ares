@@ -8377,20 +8377,39 @@ def _apply_pending_model_switch(sid: str, session: dict, *, before_admission: bo
             if isinstance(window, TurnOutcomeWindow) and window.owns(session, sid) and window.turns else None)
     if not pending or session.get("agent") is None:
         return
+    def pending_still_owned():
+        # Called only while holding this session's history lock.
+        current_inflight = session.get("inflight_turn")
+        current_window = session.get("_turn_outcomes")
+        current_nonce = (current_window.turns[-1]["accepted_turn"]["request_id"]
+            if isinstance(current_window, TurnOutcomeWindow)
+            and current_window.owns(session, sid) and current_window.turns else None)
+        return not (_sessions.get(sid) is not session or session.get("agent") is not pending_agent
+                or session.get("transport") is not pending_transport
+                or int(session.get("_queued_prompt_generation", 0)) != pending_generation
+                or (before_admission and (
+                    (current_inflight.get("started_at") if isinstance(current_inflight, dict) else None) is not pending_admission[3]
+                    or current_window is not pending_admission[4]
+                    or current_nonce != pending_admission[5])))
+
+    def retain_pending_options():
+        if not pending.get("runtime_options"):
+            return
+        with session["history_lock"]:
+            if not pending_still_owned():
+                return
+            # Preserve a newer model/option intent; only fill its missing
+            # dimensions from the accepted option survivor, never replay the
+            # failed model choice or transfer intent to a replacement owner.
+            newer = session.get("pending_model_switch") or {}
+            session["pending_model_switch"] = {
+                **newer,
+                "runtime_options": {**pending["runtime_options"], **newer.get("runtime_options", {})},
+            }
+
     def emit_pending_error(message):
         with session["history_lock"]:
-            current_inflight = session.get("inflight_turn")
-            current_window = session.get("_turn_outcomes")
-            current_nonce = (current_window.turns[-1]["accepted_turn"]["request_id"]
-                if isinstance(current_window, TurnOutcomeWindow)
-                and current_window.owns(session, sid) and current_window.turns else None)
-            if (_sessions.get(sid) is not session or session.get("agent") is not pending_agent
-                    or session.get("transport") is not pending_transport
-                    or int(session.get("_queued_prompt_generation", 0)) != pending_generation
-                    or (before_admission and (
-                        (current_inflight.get("started_at") if isinstance(current_inflight, dict) else None) is not pending_admission[3]
-                        or current_window is not pending_admission[4]
-                        or current_nonce != pending_admission[5]))):
+            if not pending_still_owned():
                 return
         token = _turn_outcome_execution.set((session, sid, None))
         transport_token = bind_transport(pending_transport)
@@ -8419,9 +8438,11 @@ def _apply_pending_model_switch(sid: str, session: dict, *, before_admission: bo
         # confirm by NOT applying it silently — surface the warning and drop the
         # switch rather than spend on a pricey model the user never confirmed.
         if result.get("confirm_required"):
+            retain_pending_options()
             emit_pending_error(result.get("confirm_message") or result.get("warning") or "")
         return result
     except Exception as e:
+        retain_pending_options()
         emit_pending_error(f"Could not switch model: {e}")
 
 
