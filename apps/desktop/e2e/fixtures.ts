@@ -365,6 +365,8 @@ export interface MockBackendOptions {
   extraConfig?: string
   /** Override the mock model's context window for compression scenarios. */
   modelContextLength?: number
+  /** Exercise the real quit guard instead of the default teardown bypass. */
+  skipQuitConfirm?: boolean
 }
 
 /**
@@ -394,7 +396,9 @@ export async function setupMockBackend(options: MockBackendOptions = {}): Promis
   writeEnvFile(sandbox.hermesHome)
 
   // 3. Build env + launch
-  const env = buildAppEnv(sandbox)
+  const env = buildAppEnv(sandbox, {
+    HERMES_DESKTOP_SKIP_QUIT_CONFIRM: options.skipQuitConfirm === false ? '0' : '1',
+  })
   const { app, page } = await launchDesktop(env)
 
   return {
