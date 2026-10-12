@@ -46,14 +46,21 @@ def test_invalid_effort_is_rejected_without_mutating_any_profile(profiles, value
     assert [(p / 'config.yaml').read_bytes() for p in (source, target)] == before
 
 
-def test_profile_roster_reads_effort_from_each_target_without_live_backend(profiles, monkeypatch):
+@pytest.mark.parametrize('value,expected', [
+    ('high', 'high'), (' HIGH ', 'high'), (False, 'none'), ('disabled', 'none'),
+    ('xhigh', 'xhigh'), ('invalid', None), (None, None),
+])
+def test_profile_roster_reads_effort_from_each_target_without_live_backend(profiles, monkeypatch, value, expected):
     source, target = profiles
+    cfg = yaml.safe_load((target / 'config.yaml').read_text())
+    cfg['agent']['reasoning_effort'] = value
+    (target / 'config.yaml').write_text(yaml.safe_dump(cfg))
     monkeypatch.setattr('hermes_cli.profiles.list_profiles', lambda: [SimpleNamespace(
         name='fixture', path=target, is_default=False, model='gpt-6-luna', provider='openai-codex',
     )])
     before = [(p / 'config.yaml').read_bytes() for p in (source, target)]
     response = server._methods['profiles.list']('list', {'include_sessions': False})
-    assert response['result']['profiles'][0]['reasoning_effort'] == 'high'
+    assert response['result']['profiles'][0]['reasoning_effort'] == expected
     assert [(p / 'config.yaml').read_bytes() for p in (source, target)] == before
 
 

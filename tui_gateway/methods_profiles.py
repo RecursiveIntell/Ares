@@ -274,10 +274,12 @@ def _(rid, params: dict) -> dict:
             token = set_hermes_home_override(str(p.path))
             try:
                 from hermes_cli.config import read_user_config_raw
+                from hermes_constants import parse_reasoning_effort
 
                 cfg = read_user_config_raw() or {}
                 agent_cfg = cfg.get("agent") or {}
-                row["reasoning_effort"] = agent_cfg.get("reasoning_effort")
+                parsed = parse_reasoning_effort(agent_cfg.get("reasoning_effort"))
+                row["reasoning_effort"] = parsed.get("effort", "none") if parsed is not None else None
             except Exception:
                 row["reasoning_effort"] = None
             finally:
