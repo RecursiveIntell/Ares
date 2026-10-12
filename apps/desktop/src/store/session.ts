@@ -1339,10 +1339,19 @@ export function _resetComposerModelSelectionsForTests(): void {
   composerModelOwnerEpoch += 1
 }
 
-export const setCurrentReasoningEffort = (next: Updater<string>) => {
+export const setCurrentReasoningEffort = (next: Updater<string>, persist = true) => {
   updateAtom($currentReasoningEffort, next)
-  persistString(COMPOSER_EFFORT_KEY, $currentReasoningEffort.get() || null)
+
+  if (persist) {
+    persistString(COMPOSER_EFFORT_KEY, $currentReasoningEffort.get() || null)
+  }
 }
+
+/** Explicit draft preferences, not the last runtime observed in a session. */
+export const getComposerRuntimeOptions = () => ({
+  effort: storedString(COMPOSER_EFFORT_KEY) ?? '',
+  fast: storedBoolean(COMPOSER_FAST_KEY, false)
+})
 
 // The profile's `agent.reasoning_effort`, mirrored from config so surfaces that
 // need to render or apply "the default" resolve the user's configured level
@@ -1354,9 +1363,12 @@ export const setDefaultReasoningEffort = (next: string) => updateAtom($defaultRe
 
 export const setCurrentServiceTier = (next: Updater<string>) => updateAtom($currentServiceTier, next)
 
-export const setCurrentFastMode = (next: Updater<boolean>) => {
+export const setCurrentFastMode = (next: Updater<boolean>, persist = true) => {
   updateAtom($currentFastMode, next)
-  persistBoolean(COMPOSER_FAST_KEY, $currentFastMode.get())
+
+  if (persist) {
+    persistBoolean(COMPOSER_FAST_KEY, $currentFastMode.get())
+  }
 }
 
 export const setYoloActive = (next: Updater<boolean>) => updateAtom($yoloActive, next)

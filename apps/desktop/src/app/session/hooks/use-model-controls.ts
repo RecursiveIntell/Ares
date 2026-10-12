@@ -695,6 +695,12 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
 
         finishSwitch(result)
 
+        // A superseded ACK still means THIS write was acknowledged, so the
+        // boolean keeps its documented "abort only on a failed switch" meaning.
+        // Not re-applying a stale preset is the CALLER's job: preserving
+        // surfaces set `preserveOptionsOnSelect` and never apply one after a
+        // select, and ModelMenuPanel's applyPreset ignores a row that is no
+        // longer the current selection.
         return true
       } catch (err) {
         if (err instanceof ModelSwitchRecoveryAborted || !owns('model')) {

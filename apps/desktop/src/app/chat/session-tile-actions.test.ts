@@ -1,6 +1,9 @@
+import { JsonRpcGatewayError } from '@hermes/shared'
 import { renderHook } from '@testing-library/react'
 import { act } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+import { $notifications, clearNotifications } from '@/store/notifications'
 
 import { MAIN_COMPOSER_SCOPE } from './composer/scope'
 
@@ -159,6 +162,39 @@ describe('useSessionTileActions sleep/wake session recovery', () => {
 
     expect(state).toMatchObject({ busy: true, interrupted: false, messages: originalMessages })
     expect(requestGatewayMock).toHaveBeenCalledWith('session.interrupt', { session_id: RUNTIME_SESSION_ID })
+  })
+
+  it('reports a typed Stop disposition for a rejected tile Stop', async () => {
+    clearNotifications()
+    let state: Record<string, unknown> = { attachedImages: [], busy: true, cwd: null, messages: [], storedSessionId: STORED_SESSION_ID }
+
+    setSessionTileDelegate({
+      archiveSession: vi.fn(async () => undefined),
+      branchSession: vi.fn(async () => undefined),
+      deleteSession: vi.fn(async () => undefined),
+      executeSlash: vi.fn(async () => undefined),
+      interruptSession: vi.fn(async () => undefined),
+      resumeTile: vi.fn(async () => RUNTIME_SESSION_ID),
+      submitToSession: vi.fn(async () => undefined),
+      updateSession: vi.fn((_runtimeId, updater) => {
+        state = updater(state as never) as unknown as Record<string, unknown>
+
+        return state as never
+      })
+    })
+    requestGatewayMock.mockRejectedValueOnce(
+      new JsonRpcGatewayError('Stop could not be confirmed', {
+        code: 5019,
+        data: { effect_disposition: 'not_sent', failure_code: 'stop_not_sent' }
+      })
+    )
+
+    const { result } = renderTileActions()
+    await act(async () => result.current.cancelRun())
+
+    // The sibling path must not fall back to the bare banner the composer stopped using.
+    expect($notifications.get().some(item => item.message === 'Stop was not sent — nothing was cancelled.')).toBe(true)
+    expect($notifications.get().some(item => item.message === 'Stop failed' || item.title === 'Stop failed')).toBe(false)
   })
 
   it('finalizes the tile partial only after interrupt acknowledgement and keeps it busy until settle', async () => {

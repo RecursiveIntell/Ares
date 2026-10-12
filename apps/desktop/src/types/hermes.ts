@@ -690,6 +690,7 @@ export interface SessionResumeResponse {
 }
 
 export interface SessionRuntimeInfo {
+  pending_runtime_options?: null | { effort?: string; fast?: boolean }
   approval_mode?: 'manual' | 'off' | 'smart'
   branch?: string
   config_warning?: string

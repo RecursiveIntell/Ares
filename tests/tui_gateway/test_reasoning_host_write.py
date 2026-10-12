@@ -128,7 +128,7 @@ def test_reasoning_not_sent_is_distinguishable_from_started_write(serving, monke
 @pytest.mark.parametrize("busy", [False, True])
 def test_host_handler_applies_only_to_idle_owner(monkeypatch, busy):
     agent = SimpleNamespace(model="fixture", provider="fixture", reasoning_config={"enabled": True, "effort": "low"})
-    record = {"session_key": "stored", "agent": agent, "running": busy}
+    record = {"session_key": "stored", "agent": agent, "running": busy, "history_lock": threading.Lock()}
     monkeypatch.setattr(server, "_sessions", {"live": record})
     monkeypatch.setenv("HERMES_COMPUTE_HOST_CHILD", "1")
     monkeypatch.setattr(server, "_load_cfg", lambda: {})
@@ -145,8 +145,9 @@ def test_host_handler_applies_only_to_idle_owner(monkeypatch, busy):
         host.close()
     result = json.loads(output.getvalue().splitlines()[0])
     if busy:
-        assert result["type"] == "control.error"
-        assert result["message"] == "session busy"
+        assert result["type"] == "control.ack"
+        assert result["result"]["deferred"] is True
+        assert record["pending_model_switch"]["runtime_options"] == {"effort": "xhigh"}
         assert agent.reasoning_config["effort"] == "low"
         persist.assert_not_called()
     else:

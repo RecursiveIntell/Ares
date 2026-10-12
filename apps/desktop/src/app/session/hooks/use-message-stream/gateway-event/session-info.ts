@@ -214,16 +214,20 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
         setCurrentPersonality(normalizePersonalityValue(payload.personality))
       }
 
-      if (typeof payload?.reasoning_effort === 'string') {
-        setCurrentReasoningEffort(payload.reasoning_effort)
+      if (typeof payload?.reasoning_effort === 'string' &&
+          (knownState?.pendingRuntimeOptions?.effort === undefined ||
+           payload.reasoning_effort === knownState.pendingRuntimeOptions.effort)) {
+        setCurrentReasoningEffort(payload.reasoning_effort, false)
       }
 
       if (typeof payload?.service_tier === 'string') {
         setCurrentServiceTier(payload.service_tier)
       }
 
-      if (typeof payload?.fast === 'boolean') {
-        setCurrentFastMode(payload.fast)
+      if (typeof payload?.fast === 'boolean' &&
+          (knownState?.pendingRuntimeOptions?.fast === undefined ||
+           payload.fast === knownState.pendingRuntimeOptions.fast)) {
+        setCurrentFastMode(payload.fast, false)
       }
 
       if (typeof payload?.yolo === 'boolean') {
@@ -251,7 +255,21 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
             (statePatch.provider === undefined || statePatch.provider === pending?.previousProvider)
 
           const { model: _incomingModel, provider: _incomingProvider, ...nonModelStatePatch } = statePatch
-          const effectiveStatePatch = repeatsPreviousModel ? nonModelStatePatch : statePatch
+          const effectiveStatePatch = { ...(repeatsPreviousModel ? nonModelStatePatch : statePatch) }
+          const options = state.pendingRuntimeOptions
+
+          if (options?.effort !== undefined && effectiveStatePatch.reasoningEffort !== options.effort) {
+            delete effectiveStatePatch.reasoningEffort
+          }
+
+          if (options?.fast !== undefined && effectiveStatePatch.fast !== options.fast) {
+            delete effectiveStatePatch.fast
+            delete effectiveStatePatch.serviceTier
+          }
+
+          const optionsApplied = options && payload?.pending_runtime_options === null &&
+            (options.effort === undefined || statePatch.reasoningEffort === options.effort) &&
+            (options.fast === undefined || statePatch.fast === options.fast)
 
           const pendingModelSelection = repeatsPreviousModel
             ? pending
@@ -262,6 +280,7 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
           return {
             ...state,
             ...effectiveStatePatch,
+            pendingRuntimeOptions: optionsApplied ? null : state.pendingRuntimeOptions,
             branch: effectiveStatePatch.branch ?? state.branch,
             cwd: effectiveStatePatch.cwd ?? state.cwd,
             pendingModelSelection

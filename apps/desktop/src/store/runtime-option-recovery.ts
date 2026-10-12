@@ -38,6 +38,13 @@ export function clearRuntimeOptionUncertainty(sessionId: string, dimension: Runt
 /** Recognized transport/host uncertainty is not proof of rejection. */
 export function isUncertainRuntimeOptionError(error: unknown): boolean {
   if (error && typeof error === 'object' && 'code' in error && error.code === 5019) {
+    const data = 'data' in error ? error.data : null
+
+    if (data && typeof data === 'object' && 'delivery' in data &&
+        (data.delivery === 'not_sent' || data.delivery === 'not_applied')) {
+      return false
+    }
+
     return true
   }
 

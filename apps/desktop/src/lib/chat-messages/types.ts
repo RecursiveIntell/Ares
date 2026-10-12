@@ -74,6 +74,7 @@ export type GatewayEventPayload = {
   model?: string
   provider?: string
   reasoning_effort?: string
+  pending_runtime_options?: null | { effort?: string; fast?: boolean }
   service_tier?: string
   fast?: boolean
   approval_mode?: string

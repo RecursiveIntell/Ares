@@ -1252,9 +1252,9 @@ def _wait_for_stop_input_admission(rid, session: dict, *, deadline: float) -> di
             return _err(rid, 5032, "Stop settlement timed out; durable input not accepted", refused)
 
 
-def _verify_host_stop_receipt(session: dict, receipt: dict) -> dict:
+def _verify_host_stop_receipt(session: dict, receipt: dict, *, operation_id=None) -> dict:
     """Verify host-reported control against the session's canonical DB owner."""
-    if (type(receipt) is not dict or set(receipt) != {"session_key", "control"}
+    if (type(receipt) is not dict or set(receipt) not in ({"session_key", "control"}, {"session_key", "control", "operation"})
             or type(receipt.get("session_key")) is not str or not receipt["session_key"]
             or type(receipt.get("control")) is not dict
             or receipt["control"].get("schema") != "SessionDBContextControlV2"):
@@ -1265,6 +1265,15 @@ def _verify_host_stop_receipt(session: dict, receipt: dict) -> dict:
     with _session_db(session) as db:
         if db is None:
             raise RuntimeError("durable Stop storage owner unavailable")
+        if session.get("stop_store_scope"):
+            from hermes_state_continuity import context_stop_store_scope
+            if context_stop_store_scope(db.db_path) != session["stop_store_scope"]:
+                raise RuntimeError("durable Stop storage scope changed")
+        if operation_id is not None:
+            operation = db.read_context_stop_operation(key, operation_id=operation_id)
+            if (operation is None or receipt.get("operation") != operation
+                    or operation["control"] != receipt["control"]):
+                raise RuntimeError("durable Stop operation mismatch")
         expected = db.read_context_stop(key)
         reported = db.read_context_stop(receipt["session_key"])
         if expected is None or reported != expected or expected["control"] != receipt["control"]:
@@ -1314,21 +1323,147 @@ def _rollback_unsent_stop_cut(session: dict, token: dict) -> bool:
     return True
 
 
+def _reconcile_late_stop_ack(sid, session, token, supervisor, ack):
+    """Observe the original control only; never resend cancellation."""
+    def owns():
+        return (_sessions.get(sid) is session
+                and (session.get("_stop_pending") is token or session.get("_stop_uncertain") is token)
+                and session.get("session_key") == token["session_key"]
+                and session.get("profile_home") == token["profile_home"]
+                and session.get("_compute_host_active_request_id") in {None, token["target_request_id"]}
+                and supervisor.boot_id == token["host_boot_id"]
+                and _get_compute_host_supervisor() is supervisor
+                and not token.get("local_state_unconfirmed"))
+    with session["history_lock"]:
+        if not owns():
+            return
+    if (ack.get("type") != "interrupt.ack" or ack.get("sid") != sid
+            or ack.get("request_id") != token["request_id"]
+            or ack.get("target_request_id") != token["target_request_id"]
+            or ack.get("_host_boot_id") != token["host_boot_id"]
+            or ack.get("applied") is not True or ack.get("durable_stop_unconfirmed") is True):
+        return
+    scope = {"session_key": token["session_key"], "profile_home": token["profile_home"],
+             "stop_store_scope": token.get("store_scope")}
+    try:
+        durable = _verify_host_stop_receipt(scope, ack["stop_receipt"],
+            operation_id=token.get("operation_id")) if "stop_receipt" in ack else None
+        if durable is None and _native_stop_requires_receipt(scope):
+            return
+    except Exception:
+        return
+    with session["history_lock"]:
+        if not owns():
+            return
+        token["ack"] = dict(ack)
+        if durable is not None:
+            token["durable_stop"] = durable
+        token.pop("durable_stop_unconfirmed", None)
+        token["late_ack_verified"] = True
+        if session.get("_stop_uncertain") is token:
+            session.pop("_stop_uncertain")
+        if session.get("_stop_pending") is not token:
+            token["input_release"].set()
+    _emit("session.info", sid, _session_info(session.get("agent"), session))
+    _drain_queued_prompt(token["request_id"], sid, session)
+
+
 def _interrupt_owned_compute_host_turn(sid: str, session: dict, request_id: str | None) -> bool:
     """Settle a known host Stop without deleting inputs arriving after its cut."""
-    from tui_gateway.host_supervisor import HostSendNotSent, HostSendUncertain
+    from tui_gateway.host_supervisor import HostSendNotSent, HostSendUncertain, HostStopNotApplied
 
+    supervisor = _get_compute_host_supervisor()
     with session["history_lock"]:
+        previous = session.get("_stop_uncertain")
+        if (isinstance(previous, dict) and previous.get("operation_id") and previous.get("store_scope")
+                and previous.get("host_supervisor") is supervisor):
+            terminal = previous.get("terminal") or {}
+            if not terminal:
+                recover_projections = getattr(supervisor, "recover_projections", None)
+                if callable(recover_projections):
+                    recover_projections(sid)
+                read_observation = getattr(supervisor, "read_owner_observation", None)
+                if callable(read_observation):
+                    terminal = read_observation(sid, request_id=previous["target_request_id"],
+                                                boot_id=previous["host_boot_id"]) or {}
+            if (_sessions.get(sid) is session
+                    and session.get("_compute_host_active_request_id") in {None, previous["target_request_id"]}
+                    and previous.get("host_boot_id")
+                    and not previous.get("local_state_unconfirmed")
+                    and session.get("session_key") == previous["session_key"]
+                    and session.get("profile_home") == previous["profile_home"]
+                    and previous.get("host_boot_id") == getattr(supervisor, "boot_id", None)
+                    and terminal.get("request_id") == previous["target_request_id"]
+                    and terminal.get("sid") == sid
+                    and terminal.get("_host_boot_id") == previous.get("host_boot_id")
+                    and terminal.get("type") in {"turn.end", "turn.error"}):
+                # Recover ONLY the original operation. SQLite serializes this
+                # against a delayed child writer; neither can take a second cut.
+                scope = {"session_key": previous["session_key"], "profile_home": previous["profile_home"],
+                         "stop_store_scope": previous["store_scope"]}
+                with _session_db(scope) as db:
+                    if db is None:
+                        raise HostSendUncertain("canonical Stop owner unavailable")
+                    from hermes_state_continuity import context_stop_store_scope
+                    if context_stop_store_scope(db.db_path) != previous["store_scope"]:
+                        raise HostSendUncertain("canonical Stop storage scope changed")
+                    previous["canonical_stop_started"] = True
+                    result = db.record_context_stop_operation(previous["session_key"],
+                        operation_id=previous["operation_id"])
+                    operation = result["receipt"]
+                durable_stop = _verify_host_stop_receipt(scope,
+                    {"session_key": previous["session_key"], "control": operation["control"],
+                     "operation": operation}, operation_id=previous["operation_id"])
+                if (_sessions.get(sid) is not session or session.get("_stop_uncertain") is not previous
+                        or session.get("session_key") != previous["session_key"]
+                        or session.get("profile_home") != previous["profile_home"]
+                        or _get_compute_host_supervisor() is not supervisor
+                        or supervisor.boot_id != previous["host_boot_id"]
+                        or session.get("_compute_host_active_request_id") not in {None, previous["target_request_id"]}):
+                    raise HostSendUncertain("Stop ownership changed during recovery")
+                previous["durable_stop"] = durable_stop
+                previous.pop("missing_stop_receipt", None)
+                previous.pop("durable_stop_unconfirmed", None)
+                previous["terminal"] = terminal
+                session.pop("_stop_uncertain")
+                session.pop("_compute_host_active_request_id", None)
+                session.pop("_compute_host_settling_request_id", None)
+                session["running"] = False
+                previous["input_release"].set()
+                release_observation = getattr(supervisor, "release_owner_observation", None)
+                if callable(release_observation):
+                    release_observation(sid, request_id=previous["target_request_id"],
+                                        boot_id=previous["host_boot_id"], evidence=terminal)
+                    # The ACK callback may also have failed presentation. The
+                    # same canonical proof and exact retirement now discharge
+                    # its retained slot, without replaying either callback.
+                    read_observation = getattr(supervisor, "read_owner_observation", None)
+                    control = read_observation(sid, request_id=previous["request_id"],
+                                               boot_id=previous["host_boot_id"]) if callable(read_observation) else None
+                    if (control and control.get("type") == "interrupt.ack"
+                            and control.get("target_request_id") == previous["target_request_id"]
+                            and control.get("operation_id") == previous["operation_id"]):
+                        release_observation(sid, request_id=previous["request_id"],
+                                            boot_id=previous["host_boot_id"], evidence=control)
+                return True
         if session.get("_stop_pending") or session.get("_stop_uncertain"):
             raise RuntimeError("Stop is pending or requires owner reconciliation")
         target = session.get("_compute_host_active_request_id")
         if not target:
             return False
         generation = int(session.get("_queued_prompt_generation", 0)) + 1
+        from hermes_state_continuity import context_stop_store_scope
+        # Resolve scope without opening storage ahead of physical cancellation.
+        db_path = (Path(session["profile_home"]) / "state.db" if session.get("profile_home")
+                   else getattr(_db, "db_path", None) or _session_home(session) / "state.db")
         token = {"request_id": request_id or uuid.uuid4().hex,
+                 "operation_id": uuid.uuid4().hex,
+                 "store_scope": context_stop_store_scope(db_path),
+                 "host_supervisor": supervisor,
                  "target_request_id": target, "queue_generation": generation,
                  "session_key": session.get("session_key"),
                  "profile_home": session.get("profile_home"),
+                 "host_boot_id": session.get("_compute_host_active_boot_id") or getattr(supervisor, "boot_id", None),
                  "input_release": threading.Event(),
                  "previous_queue_generation": session.get("_queued_prompt_generation"),
                  "previous_stop_generation": session.get("_last_stop_queue_generation"),
@@ -1344,11 +1479,23 @@ def _interrupt_owned_compute_host_turn(sid: str, session: dict, request_id: str 
         session.pop("queued_prompts", None)
         session["_queued_prompt_generation"] = generation
         session["_last_stop_queue_generation"] = generation
-    stop_scope = {"session_key": token["session_key"], "profile_home": token["profile_home"]}
+    stop_scope = {"session_key": token["session_key"], "profile_home": token["profile_home"],
+                  "stop_store_scope": token["store_scope"]}
     try:
-        ack = _get_compute_host_supervisor().interrupt(
+        observer = ({"expected_boot_id": token["host_boot_id"],
+                     "on_late_ack": lambda ack: _reconcile_late_stop_ack(sid, session, token, supervisor, ack)}
+                    if token["host_boot_id"] else {})
+        ack = supervisor.interrupt(
             sid, request_id=token["request_id"], target_request_id=target, wait=True,
+            operation_id=token["operation_id"],
+            **observer,
         )
+        if (isinstance(ack, dict) and ack.get("type") == "interrupt.ack"
+                and ack.get("sid") == sid and ack.get("request_id") == token["request_id"]
+                and ack.get("target_request_id") == target and ack.get("applied") is False
+                and ack.get("failure_code") == "turn_owner_changed"
+                and ack.get("effect_disposition") == "not_applied"):
+            raise HostStopNotApplied("original turn owner refused Stop")
         if (not isinstance(ack, dict) or ack.get("type") != "interrupt.ack"
                 or ack.get("sid") != sid or ack.get("request_id") != token["request_id"]
                 or ack.get("target_request_id") != target or ack.get("applied") is not True):
@@ -1359,8 +1506,10 @@ def _interrupt_owned_compute_host_turn(sid: str, session: dict, request_id: str 
             raise HostSendUncertain("durable Stop persistence not confirmed")
         try:
             if "stop_receipt" in ack:
-                token["durable_stop"] = _verify_host_stop_receipt(stop_scope, ack["stop_receipt"])
+                token["durable_stop"] = _verify_host_stop_receipt(stop_scope, ack["stop_receipt"],
+                    operation_id=token["operation_id"])
             elif _native_stop_requires_receipt(stop_scope):
+                token["missing_stop_receipt"] = True
                 raise HostSendUncertain("durable Stop receipt is missing")
         except Exception:
             token["durable_stop_unconfirmed"] = True
@@ -1370,8 +1519,8 @@ def _interrupt_owned_compute_host_turn(sid: str, session: dict, request_id: str 
         if same_owner:
             _clear_interrupt_waiters(sid, session)
     except Exception as exc:
-        unsent = isinstance(exc, HostSendNotSent) and not token.get("ack")
-        if not unsent and not token.get("durable_stop"):
+        unsent = isinstance(exc, (HostSendNotSent, HostStopNotApplied)) and not token.get("ack")
+        if not unsent and not token.get("durable_stop") and not token.get("late_ack_verified"):
             try:
                 if _native_stop_requires_receipt(stop_scope):
                     token["durable_stop_unconfirmed"] = True
@@ -1384,7 +1533,8 @@ def _interrupt_owned_compute_host_turn(sid: str, session: dict, request_id: str 
                 rollback_failed = True
             if session.get("_stop_pending") is token:
                 session.pop("_stop_pending", None)
-            if rollback_failed or (not unsent and (not token.get("terminal") or token.get("durable_stop_unconfirmed"))):
+            if rollback_failed or (not unsent and not token.get("late_ack_verified")
+                                  and (not token.get("terminal") or token.get("durable_stop_unconfirmed"))):
                 session["_stop_uncertain"] = token
             if token.get("terminal") and not session.get("_compute_host_active_request_id"):
                 session["running"] = False
@@ -1418,7 +1568,7 @@ def _interrupt_owned_compute_host_turn(sid: str, session: dict, request_id: str 
 
 
 def _interrupt_session_turn(
-    sid: str, session: dict, *, request_id: str | None = None
+    sid: str, session: dict, *, request_id: str | None = None, operation_id: str | None = None
 ) -> bool:
     """Apply the shared ``session.interrupt`` contract to one claimed session.
 
@@ -1433,7 +1583,12 @@ def _interrupt_session_turn(
     target_request_id = None
 
     if use_compute_host:
+        previous_stop = session.get("_stop_uncertain")
         if _interrupt_owned_compute_host_turn(sid, session, request_id):
+            if (previous_stop and session.get("_stop_uncertain") is not previous_stop
+                    and previous_stop.get("durable_stop") and previous_stop.get("terminal")):
+                _emit("session.info", sid, _session_info(session.get("agent"), session))
+                _drain_queued_prompt(request_id, sid, session)
             return True
         with session["history_lock"]:
             target_request_id = session.get("_compute_host_active_request_id")
@@ -1464,7 +1619,8 @@ def _interrupt_session_turn(
         if should_interrupt:
             from agent.interrupt_compat import request_hard_interrupt
 
-            request_hard_interrupt(session.get("agent"))
+            request_hard_interrupt(session.get("agent"),
+                **({"operation_id": operation_id} if operation_id is not None else {}))
         if not run_thread_alive:
             with session["history_lock"]:
                 if session.get("running"):
@@ -2545,6 +2701,48 @@ def _default_session_cwd() -> str:
     return _launch_configured_cwd() or os.getenv("TERMINAL_CWD") or os.getcwd()
 
 
+def _capture_compute_host_rpc(obj: dict):
+    """Capture custody while the supervisor still holds the source registry."""
+    params = obj.get("params")
+    sid = params.get("session_id") if isinstance(params, dict) else None
+    # Do not invert sessions-lock -> supervisor-registry ordering. Captured
+    # references are checked again at admission and never re-resolved on write.
+    session = _sessions.get(sid) if sid else None
+    transport = (session or {}).get("transport") or current_transport() or _stdio_transport
+    return sid, session, transport
+
+
+def _prepare_compute_host_rpc(obj: dict, *, source=None):
+    """Freeze pipe output's client custody before the supervisor defers it."""
+    from tui_gateway.event_replay import _stamp_event
+    sid, session, transport = source if source is not None else _capture_compute_host_rpc(obj)
+
+    def admit():
+        if sid and (_sessions.get(sid) is not session
+                    or ((session or {}).get("transport") or transport) is not transport):
+            from tui_gateway.host_supervisor import HostProjectionFault
+            raise HostProjectionFault("compute-host session replaced during capture")
+        # Stamp only after source checks, but before bounded queue admission
+        # so a capacity refusal remains available for reconnect replay.
+        _stamp_event(obj)
+
+    def deliver(frame):
+        return transport.write(frame)
+
+    def refuse():
+        from tui_gateway.ws import WSTransport
+        if isinstance(transport, WSTransport):
+            def disconnect():
+                transport.close()
+                transport._loop.create_task(transport._ws.close(code=1013))
+            transport._loop.call_soon_threadsafe(disconnect)
+        else:
+            transport.close()
+    deliver.refuse = refuse
+    deliver.admit = admit
+    return deliver
+
+
 def write_json(obj: dict) -> bool:
     """Emit one JSON frame. Routes via the most-specific transport available.
 
@@ -2850,6 +3048,8 @@ def _get_compute_host_supervisor(cfg: dict | None = None):
             _compute_host_supervisor = HostSupervisor(
                 autostart=False,
                 rpc_sink=write_json,
+                rpc_prepare=_prepare_compute_host_rpc,
+                rpc_capture=_capture_compute_host_rpc,
                 on_crash=_on_compute_host_crash,
                 heartbeat_secs=int(isolation_cfg.get("compute_host_heartbeat_secs") or 15),
                 respawn_max=int(isolation_cfg.get("compute_host_respawn_max") or 3),
@@ -3103,6 +3303,8 @@ def _submit_prompt_to_compute_host(
     with session["history_lock"]:
         window = session.get("_turn_outcomes")
         admitted_boot = frame.get("_admitted_host_boot_id")
+        if session.get("_compute_host_active_request_id") == host_request_id:
+            session["_compute_host_active_boot_id"] = admitted_boot
         if isinstance(window, TurnOutcomeWindow) and window.owns(session, sid):
             window.bind_boot(host_request_id, admitted_boot)
         # ACK correlation belongs to this admission, even if a fast terminal
@@ -6244,7 +6446,7 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
     return config
 
 
-def _persist_live_session_runtime(session: dict | None) -> None:
+def _persist_live_session_runtime(session: dict | None, *, strict: bool = False) -> None:
     """Persist active session runtime so future resumes restore the same footer."""
     if not session:
         return
@@ -6255,6 +6457,8 @@ def _persist_live_session_runtime(session: dict | None) -> None:
 
     db = getattr(agent, "_session_db", None) or _get_db()
     if db is None:
+        if strict:
+            raise RuntimeError("runtime option persistence owner unavailable")
         return
 
     try:
@@ -6277,9 +6481,19 @@ def _persist_live_session_runtime(session: dict | None) -> None:
         model = str(getattr(agent, "model", "") or "").strip()
         if hasattr(db, "update_session_meta"):
             db.update_session_meta(session_key, json.dumps(model_config), model or None)
+            if strict:
+                saved = db.get_session(session_key) or {}
+                raw_saved = saved.get("model_config")
+                actual = json.loads(raw_saved) if isinstance(raw_saved, str) else raw_saved
+                if actual != model_config:
+                    raise RuntimeError("runtime option persistence readback mismatch")
         elif model and hasattr(db, "update_session_model"):
+            if strict:
+                raise RuntimeError("runtime option persistence is unsupported")
             db.update_session_model(session_key, model)
     except Exception:
+        if strict:
+            raise
         logger.debug("failed to persist live session runtime", exc_info=True)
 
 
@@ -6942,6 +7156,54 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
         restore_reasoning()
 
 
+def _deferred_model_switch_intent(
+    session: dict, *, raw: str, confirm_expensive_model: bool, display_model: str, display_provider: str
+) -> dict:
+    """Build the ``pending_model_switch`` dict for a pick that defers on a busy turn.
+
+    A superseding model pick must NOT discard an already-stashed options intent.
+    ``_apply_session_runtime_options`` merges options INTO an existing intent, so
+    the reverse direction has to be symmetric: otherwise a pick landing after a
+    deferred effort/Fast edit silently drops it, and the next turn runs with the
+    old values while the client still shows the newer choice as pending.
+
+    Only ``runtime_options`` is carried. The ``_model_switch_publications`` marker
+    must deliberately NOT survive into a new intent — ``_apply_pending_model_switch``
+    returns early while it is set, so carrying it would mean the new pick never
+    applies.
+    """
+    previous = session.get("pending_model_switch") or {}
+    carried = {"runtime_options": previous["runtime_options"]} if previous.get("runtime_options") else {}
+
+    return {
+        **carried,
+        "raw": raw,
+        "confirm_expensive_model": confirm_expensive_model,
+        # Projection names the next eligible turn's choice.
+        "display_model": display_model,
+        "display_provider": display_provider,
+        "after_inflight_turn": session.get("inflight_turn"),
+    }
+
+
+def _superseded_intent_after_publication(superseded_pending: dict | None) -> dict | None:
+    """What a superseded intent leaves behind once a newer pick has been published.
+
+    A published manual pick correctly discards the older intent's MODEL choice.
+    An independently expressed effort/Fast intent rode along in the same dict and
+    must survive — otherwise a mid-turn option edit is silently lost while the
+    client still shows it pending. Returns the intent to re-stash, or None to drop
+    the pending switch entirely.
+
+    Only ``runtime_options`` survives: the ``_model_switch_publications`` marker
+    would make ``_apply_pending_model_switch`` return early, so carrying it would
+    mean the re-stashed options never apply.
+    """
+    carried = (superseded_pending or {}).get("runtime_options")
+
+    return {"runtime_options": carried} if carried else None
+
+
 def _apply_model_switch(
     sid: str,
     session: dict,
@@ -7131,13 +7393,13 @@ def _apply_model_switch(
             raise ValueError("session admission changed; model request not applied")
         if defer_if_running:
             if session.get("running"):
-                session["pending_model_switch"] = {
-                    "raw": raw_input,
-                    "confirm_expensive_model": confirm_expensive_model,
-                    "display_model": result.new_model,
-                    "display_provider": result.target_provider,
-                    "after_inflight_turn": session.get("inflight_turn"),
-                }
+                session["pending_model_switch"] = _deferred_model_switch_intent(
+                    session,
+                    raw=raw_input,
+                    confirm_expensive_model=confirm_expensive_model,
+                    display_model=result.new_model,
+                    display_provider=result.target_provider,
+                )
                 return {
                     "value": result.new_model, "warning": result.warning_message or "",
                     "confirm_required": False, "confirm_message": "", "deferred": True,
@@ -7344,7 +7606,13 @@ def _apply_model_switch(
                     and session.get("pending_model_switch") is superseded_pending):
                 # Any acknowledged manual choice supersedes this captured
                 # old intent, even if another choice's suffix is in flight.
-                session.pop("pending_model_switch", None)
+                # The superseded MODEL choice dies with it, but an independently
+                # expressed effort/Fast intent must not (see the helper).
+                survivor = _superseded_intent_after_publication(superseded_pending)
+                if survivor is None:
+                    session.pop("pending_model_switch", None)
+                else:
+                    session["pending_model_switch"] = survivor
     return {
         "value": result.new_model,
         "warning": result.warning_message or "",
@@ -7993,6 +8261,80 @@ def _sync_agent_compression_with_config(sid: str, session: dict) -> None:
         )
 
 
+def _apply_session_runtime_options(sid: str, session: dict, values: dict, *,
+                                   at_turn_boundary=False, lock_held=False) -> dict:
+    """Validate together; reuse the existing next-turn model intent owner.
+
+    ``history_lock`` is a plain (non-reentrant) Lock. A caller that already
+    holds it must pass ``lock_held=True`` rather than re-acquiring it.
+    """
+    from hermes_constants import parse_reasoning_effort
+    from hermes_cli.models import resolve_fast_mode_overrides
+
+    if type(values) is not dict or not values or set(values) - {"effort", "fast"}:
+        raise ValueError("runtime options must contain effort and/or fast")
+    values = dict(values)
+    reasoning = None
+    if "effort" in values:
+        if type(values["effort"]) is not str:
+            raise ValueError("invalid reasoning effort")
+        reasoning = parse_reasoning_effort(values["effort"])
+        if reasoning is None:
+            raise ValueError("invalid reasoning effort")
+    if "fast" in values and type(values["fast"]) is not bool:
+        raise ValueError("fast must be a boolean")
+    with (contextlib.nullcontext() if lock_held else session["history_lock"]):
+        if _sessions.get(sid) is not session or session.get("_closing"):
+            raise ValueError("session owner changed; request not applied")
+        agent = session.get("agent")
+        pending = session.get("pending_model_switch") or {}
+        model = pending.get("display_model") or getattr(agent, "model", None) or (session.get("model_override") or {}).get("model")
+        overrides = resolve_fast_mode_overrides(model) if values.get("fast") and model else None
+        if values.get("fast") and overrides is None:
+            raise ValueError("fast mode is not available for this model")
+        if not at_turn_boundary and (session.get("running") or pending):
+            session["pending_model_switch"] = {
+                **pending,
+                "runtime_options": {**pending.get("runtime_options", {}), **values},
+                "after_inflight_turn": pending.get("after_inflight_turn", session.get("inflight_turn")),
+            }
+            return {"key": "runtime_options", "value": values, "deferred": True}
+        missing = object()
+        old_pins = {key: session.get(key, missing) for key in
+                    ("create_reasoning_override", "create_service_tier_override")}
+        old_agent = ({key: getattr(agent, key, missing) for key in
+                      ("reasoning_config", "service_tier", "request_overrides")} if agent else {})
+        try:
+            if "effort" in values:
+                session["create_reasoning_override"] = reasoning
+                if agent is not None:
+                    agent.reasoning_config = reasoning
+            if "fast" in values:
+                session["create_service_tier_override"] = "priority" if values["fast"] else ""
+                if agent is not None:
+                    agent.service_tier = "priority" if values["fast"] else None
+                    request_overrides = dict(getattr(agent, "request_overrides", {}) or {})
+                    request_overrides.pop("service_tier", None)
+                    request_overrides.pop("speed", None)
+                    if values["fast"]:
+                        request_overrides.update(overrides)
+                    agent.request_overrides = request_overrides
+            _persist_live_session_runtime(session, strict=True)
+        except Exception:
+            for key, value in old_pins.items():
+                if value is missing:
+                    session.pop(key, None)
+                else:
+                    session[key] = value
+            for key, value in old_agent.items():
+                if value is missing:
+                    delattr(agent, key)
+                else:
+                    setattr(agent, key, value)
+            raise
+        return {"key": "runtime_options", "value": values, "deferred": False}
+
+
 def _apply_pending_model_switch(sid: str, session: dict, *, before_admission: bool = False) -> dict | None:
     """Apply a model switch queued while a turn was running.
 
@@ -8058,16 +8400,21 @@ def _apply_pending_model_switch(sid: str, session: dict, *, before_admission: bo
             reset_transport(transport_token)
             _turn_outcome_execution.reset(token)
     try:
-        result = _apply_model_switch(
-            sid,
-            session,
-            pending["raw"],
+        result = (_apply_model_switch(
+            sid, session, pending["raw"],
             confirm_expensive_model=bool(pending.get("confirm_expensive_model")),
-            supersede_pending=False,
-            explicit_model_intent=True,
+            supersede_pending=False, explicit_model_intent=True,
             defer_if_running=before_admission,
             expected_admission=pending_admission if before_admission else None,
-        )
+        ) if pending.get("raw") else {})
+        if pending.get("runtime_options") and not result.get("confirm_required"):
+            with session["history_lock"]:
+                if (_sessions.get(sid) is not session or session.get("agent") is not pending_agent
+                        or session.get("transport") is not pending_transport
+                        or int(session.get("_queued_prompt_generation", 0)) != pending_generation):
+                    raise ValueError("session owner changed; options not applied")
+                _apply_session_runtime_options(sid, session, pending["runtime_options"],
+                                               at_turn_boundary=True, lock_held=True)
         # A queued pick is a deliberate user action; honour the expensive-model
         # confirm by NOT applying it silently — surface the warning and drop the
         # switch rather than spend on a pricey model the user never confirmed.
@@ -8664,6 +9011,8 @@ def _session_info(agent, session: dict | None = None) -> dict:
         "reasoning_effort": reasoning_effort,
         "service_tier": service_tier,
         "fast": service_tier == "priority",
+        "pending_runtime_options": (mirror.get("pending_runtime_options") if host_owned
+                                    else pending_switch.get("runtime_options")),
         "yolo": yolo,
         "approval_mode": approval_mode,
         "tools": dict(mirror.get("tools") or {}) if isinstance(mirror.get("tools"), dict) else {},
@@ -11529,6 +11878,11 @@ def _drain_queued_prompt_claim(rid, sid: str, session: dict, *, recovery=None):
         if not queued_prompts:
             session.pop("queued_prompts", None)
         session["running"] = True
+        # The Stop cut removed pre-cut envelopes. This idle, owner-checked
+        # claim admits a remaining post-cut input, not the cancelled turn.
+        # A newer Stop still invalidates the captured queue generation before
+        # dispatch; its cancellation latch must never be cleared later.
+        session["_turn_cancel_requested"] = False
         if queued.get("transport") is not None:
             session["transport"] = queued["transport"]
 
@@ -16036,6 +16390,45 @@ def _(rid, params: dict) -> dict:
     if requested_session_id not in (None, "") and session is None:
         return _err(rid, 4001, "session not found")
 
+    if key == "runtime_options":
+        if session is None:
+            return _err(rid, 4001, "runtime options require an exact session")
+        sid = str(requested_session_id)
+        if _session_uses_compute_host(session):
+            from tui_gateway.host_supervisor import HostSendNotSent
+            try:
+                supervisor = _get_compute_host_supervisor()
+                boot = supervisor.boot_id
+                ack = _send_compute_host_control(sid, route_name="config.set.runtime_options",
+                    payload={"params": {"value": value}, "session_snapshot": _compute_host_turn_frame(rid, sid, session, "")},
+                    wait=True, timeout=30.0)
+            except HostSendNotSent:
+                return _err(rid, 5019, "option update not sent", {"delivery": "not_sent"})
+            except Exception:
+                return _err(rid, 5019, "option update unconfirmed", {"delivery": "uncertain"})
+            if (_sessions.get(sid) is not session or not isinstance(ack, dict)
+                    or not boot or supervisor.boot_id != boot or ack.get("_host_boot_id") != boot
+                    or ack.get("sid") != sid or ack.get("route_name") != "config.set.runtime_options"):
+                return _err(rid, 5019, "option update owner unconfirmed", {"delivery": "uncertain"})
+            if ack.get("type") == "control.error":
+                disposition = "not_applied" if ack.get("delivery") == "not_applied" else "uncertain"
+                return _err(rid, 5019, "option update rejected" if disposition == "not_applied" else "option update unconfirmed",
+                            {"delivery": disposition})
+            result = ack.get("result")
+            if (ack.get("type") != "control.ack" or not isinstance(result, dict)
+                    or result.get("key") != key or result.get("value") != value):
+                return _err(rid, 5019, "option update readback unconfirmed", {"delivery": "uncertain"})
+            _apply_compute_host_metadata_mirror(session, ack)
+        else:
+            try:
+                result = _apply_session_runtime_options(sid, session, value)
+            except ValueError as exc:
+                return _err(rid, 4002, str(exc), {"delivery": "not_applied"})
+            except Exception:
+                return _err(rid, 5019, "option persistence unconfirmed", {"delivery": "uncertain"})
+        _emit("session.info", sid, _session_info(session.get("agent"), session))
+        return _ok(rid, result)
+
     if key == "model":
         try:
             if not value:
@@ -16150,14 +16543,13 @@ def _(rid, params: dict) -> dict:
                                 or session.get("agent") is not pending_agent
                                 or session.get("transport") is not pending_transport):
                             return _err(rid, 4001, "session owner changed; request not applied")
-                        session["pending_model_switch"] = {
-                            "raw": value,
-                            "confirm_expensive_model": confirmed,
-                            # Projection names the next eligible turn's choice.
-                            "display_model": pending_model,
-                            "display_provider": pending_provider,
-                            "after_inflight_turn": session.get("inflight_turn"),
-                        }
+                        session["pending_model_switch"] = _deferred_model_switch_intent(
+                            session,
+                            raw=value,
+                            confirm_expensive_model=confirmed,
+                            display_model=pending_model,
+                            display_provider=pending_provider,
+                        )
                     return _ok(
                         rid,
                         {
@@ -16330,6 +16722,12 @@ def _(rid, params: dict) -> dict:
                     "fast mode is not available for this model",
                 )
 
+        # Only the compute-host executor defers: its idle gate used to refuse
+        # this write. The in-process gateway keeps its established immediate
+        # application (covered by the once-turn/pin composition tests).
+        if session is not None and session.get("running") and _inside_compute_host_child():
+            result = _apply_session_runtime_options(str(params["session_id"]), session, {"fast": nv == "fast"})
+            return _ok(rid, {"key": key, "value": nv, "deferred": result["deferred"]})
         if session is not None:
             # Session-scoped, like `reasoning` below (global persistence is
             # `--global` / Settings → Model territory). Writing config.yaml
@@ -16699,6 +17097,10 @@ def _(rid, params: dict) -> dict:
                 _apply_compute_host_metadata_mirror(session, ack)
                 _emit("session.info", sid, _session_info(session.get("agent"), session))
                 return _ok(rid, result)
+            if (session is not None and not global_scope and session.get("running")
+                    and _inside_compute_host_child()):
+                result = _apply_session_runtime_options(str(requested_session_id), session, {"effort": arg})
+                return _ok(rid, {"key": key, "value": arg, "deferred": result["deferred"]})
             if global_scope or session is None:
                 _write_config_key("agent.reasoning_effort", arg)
                 if session is not None:

@@ -167,8 +167,9 @@ def test_compute_host_workers_inherit_tui_pool_env_or_8(monkeypatch):
 def test_mutator_route_table_matches_prd_inventory():
     assert MUTATOR_ROUTE_TABLE == {
         "config.set.model": "run-concurrent",
-        "config.set.fast": "idle-gated",
-        "config.set.reasoning": "idle-gated",
+        "config.set.fast": "run-concurrent",
+        "config.set.reasoning": "run-concurrent",
+        "config.set.runtime_options": "run-concurrent",
         "session.redirect": "run-concurrent",
         "session.steer": "run-concurrent",
         "clarify.snapshot": "run-concurrent",
@@ -887,17 +888,26 @@ def test_existing_compute_host_agent_applies_fast_off_and_on_at_owner(monkeypatc
         host.close()
 
 
-def test_busy_compute_host_fast_control_rejects_without_mutation(monkeypatch):
+def test_busy_compute_host_fast_control_defers_without_mutating_live_request(monkeypatch):
     sid = "host-fast-busy"
-    agent = types.SimpleNamespace(service_tier="priority", request_overrides={"service_tier": "priority"})
-    server._sessions[sid] = {"agent": agent, "running": True}
+    agent = types.SimpleNamespace(model="fixture", provider="fixture", service_tier="priority",
+                                  request_overrides={"service_tier": "priority"})
+    session = {"agent": agent, "running": True, "history_lock": threading.Lock()}
+    server._sessions[sid] = session
+    # run_host() exports this for the real host child; a bare ComputeHost does not.
+    monkeypatch.setenv("HERMES_COMPUTE_HOST_CHILD", "1")
     output = io.StringIO()
     host = ComputeHost(stdout=output, heartbeat_secs=0)
     try:
         host._handle_control({"sid": sid, "request_id": "busy", "route_name": "config.set.fast",
                               "params": {"value": "normal"}})
-        assert _json_lines(output)[-1]["type"] == "control.error"
+        frame = _json_lines(output)[-1]
+        assert frame["type"] == "control.ack"
+        assert frame["result"]["deferred"] is True
+        # The in-flight request is immutable; the edit waits for the next admission.
         assert agent.service_tier == "priority"
+        assert agent.request_overrides == {"service_tier": "priority"}
+        assert session["pending_model_switch"]["runtime_options"] == {"fast": False}
     finally:
         server._sessions.pop(sid, None)
         host.close()

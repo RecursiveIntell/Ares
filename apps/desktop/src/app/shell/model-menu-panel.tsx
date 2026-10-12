@@ -15,21 +15,12 @@ import { cn } from '@/lib/utils'
 import { activeGatewayConnectionId, requestGatewayForAgent } from '@/store/gateway'
 import { $modelPresets, applyModelPreset, modelPresetKey, setModelPreset } from '@/store/model-presets'
 import { $visibleModels } from '@/store/model-visibility'
-import { notifyError } from '@/store/notifications'
-import { $activeGatewayProfile } from '@/store/profile'
-import { clearRuntimeOptionUncertainty, reconcileRuntimeOptionFailure } from '@/store/runtime-option-recovery'
 import {
-  $activeSessionId,
   $defaultReasoningEffort,
-  $selectedStoredSessionId,
-  beginRuntimeOptionIntent,
   getComposerModelSelection,
-  markComposerSelectionManual,
-  ownsRuntimeOptionIntent,
-  setCurrentFastMode,
-  setCurrentReasoningEffort
+  markComposerSelectionManual
 } from '@/store/session'
-import { $sessionStates, knownOwnerForSession, sessionTileDelegate } from '@/store/session-states'
+import { $sessionStates, knownOwnerForSession } from '@/store/session-states'
 import type { ModelOptionsResponse } from '@/types/hermes'
 
 import { useDraftComposerOwner } from '../hooks/use-composer-model-owner'
@@ -88,6 +79,10 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
   )
 
   const currentFastMode = useStore(view.$fast)
+
+  const pendingOptions = useStore(useMemo(() => computed($sessionStates, states =>
+    Boolean(activeSessionId && states[activeSessionId]?.pendingRuntimeOptions)), [activeSessionId]))
+
   const currentModel = useStore(view.$model)
   const currentProvider = useStore(view.$provider)
   const draftSelection = !activeSessionId ? getComposerModelSelection(draftOwner) : null
@@ -151,110 +146,29 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
     }
   }
 
-  const optionTarget = (runtimeId: string) => {
-    const state = $sessionStates.get()[runtimeId]
-    const owner = knownOwnerForSession(runtimeId)
-
-    return JSON.stringify([
-      runtimeId,
-      state?.storedSessionId ?? null,
-      owner && typeof owner === 'object' ? owner.connectionId : activeGatewayConnectionId(),
-      typeof owner === 'string' ? owner : ((owner?.targetProfile || owner?.profile) ?? $activeGatewayProfile.get())
-    ])
-  }
-
   const patchRuntimeOption = async (
     dimension: 'effort' | 'fast',
     next: string | boolean,
-    previous: string | boolean,
     message: string
   ) => {
-    if (!activeSessionId) {
-      if (dimension === 'effort') {
-        setCurrentReasoningEffort(next as string)
-      } else {
-        setCurrentFastMode(next as boolean)
-      }
-
-      markComposerSelectionManual()
-
-      return
-    }
-
-    const runtimeId = activeSessionId
-    const storedSessionId = $sessionStates.get()[runtimeId]?.storedSessionId
-    const target = optionTarget(runtimeId)
-    const token = beginRuntimeOptionIntent(target, [dimension])[dimension]
-
-    const owns = () =>
-      Boolean($sessionStates.get()[runtimeId]) &&
-      optionTarget(runtimeId) === target &&
-      $sessionStates.get()[runtimeId]?.storedSessionId === storedSessionId &&
-      ownsRuntimeOptionIntent(target, dimension, token)
-
-    const update = (value: string | boolean) => {
-      if (dimension === 'effort') {
-        sessionTileDelegate()?.updateSession(runtimeId, state => ({ ...state, reasoningEffort: value as string }))
-      } else {
-        sessionTileDelegate()?.updateSession(runtimeId, state => ({ ...state, fast: value as boolean }))
-      }
-
-      // Explicit primary choices still seed future drafts. An old callback
-      // may update its own runtime, but never another foreground draft.
-      if (
-        touchesPrimary &&
-        $activeSessionId.get() === runtimeId &&
-        $selectedStoredSessionId.get() === storedSessionId
-      ) {
-        if (dimension === 'effort') {
-          setCurrentReasoningEffort(value as string)
-        } else {
-          setCurrentFastMode(value as boolean)
-        }
-      }
-    }
-
     if (touchesPrimary) {
       markComposerSelectionManual()
     }
 
-    update(next)
-
-    try {
-      await requestGateway('config.set', {
-        key: dimension === 'effort' ? 'reasoning' : 'fast',
-        session_id: runtimeId,
-        value: dimension === 'fast' ? ((next as boolean) ? 'fast' : 'normal') : next
-      })
-
-      if (owns()) {
-        clearRuntimeOptionUncertainty(runtimeId, dimension)
-      }
-    } catch (err) {
-      if (
-        await reconcileRuntimeOptionFailure(err, {
-          sessionId: runtimeId,
-          dimension,
-          request: requestGateway,
-          owns,
-          applyObserved: update
-        })
-      ) {
-        return
-      }
-
-      if (owns()) {
-        update(previous)
-      }
-
-      notifyError(err, message)
-    }
+    await applyModelPreset(dimension === 'effort' ? { effort: next as string } : { fast: next as boolean }, {
+      failMessage: message, primary: touchesPrimary, request: requestGateway, sessionId: activeSessionId
+    })
   }
 
   const controller: ModelMenuController = {
+    preserveOptionsOnSelect: true,
     // Selecting a model row restores that model's remembered preset onto the
     // session (effort/fast). applyModelPreset owns the batched gateway write.
     applyPreset: (preset, row) => {
+      if (view.$model.get() !== row.model || view.$provider.get() !== row.provider) {
+        return
+      }
+
       setModelPreset(row.provider, row.model, preset)
 
       void applyModelPreset(preset, {
@@ -294,11 +208,11 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
       }
 
       if (patch.effort !== undefined) {
-        void patchRuntimeOption('effort', patch.effort, currentReasoningEffort, t.shell.modelOptions.updateFailed)
+        void patchRuntimeOption('effort', patch.effort, t.shell.modelOptions.updateFailed)
       }
 
       if (patch.fast !== undefined) {
-        void patchRuntimeOption('fast', patch.fast, currentFastMode, t.shell.modelOptions.fastFailed)
+        void patchRuntimeOption('fast', patch.fast, t.shell.modelOptions.fastFailed)
       }
     }
   }
@@ -322,6 +236,11 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
           {unconfirmedOptions && (
             <div className="px-2 py-1 text-xs text-(--ui-text-secondary)" role="status">
               {t.shell.modelOptions.unconfirmed}
+            </div>
+          )}
+          {pendingOptions && (
+            <div className="px-2 py-1 text-xs text-(--ui-text-secondary)" role="status">
+              {t.install.stageStates.pending} · {t.shell.modelOptions.options}
             </div>
           )}
           <DropdownMenuItem

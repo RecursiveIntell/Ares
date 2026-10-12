@@ -119,6 +119,13 @@ it('leaves confirmed rejection on the existing rollback path without reading', a
   expect(ctx.request).not.toHaveBeenCalled()
 })
 
+it.each(['not_sent', 'not_applied'])('does not reconcile a typed %s refusal as unknown', async delivery => {
+  const ctx = context({})
+  expect(await reconcileRuntimeOptionFailure({ code: 5019, data: { delivery } }, ctx)).toBe(false)
+  expect(ctx.request).not.toHaveBeenCalled()
+  expect($sessionStates.get().r.unconfirmedRuntimeOptions).toBeUndefined()
+})
+
 it('clears only the acknowledged dimension', () => {
   publishSessionState('r', { ...$sessionStates.get().r, unconfirmedRuntimeOptions: ['effort', 'fast'] })
   clearRuntimeOptionUncertainty('r', 'effort')
