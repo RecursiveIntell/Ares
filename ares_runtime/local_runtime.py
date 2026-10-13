@@ -27,6 +27,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Mapping, Sequence
 
+from .governor_install import (
+    GovernorInstallError, GovernorSource, NATIVE_LIFECYCLE_CONTRACT,
+    build_governor, bundled_binary, external_backout, recipe_for_source, require_pair,
+)
+
 
 _REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
 _CONFIG_SCHEMA = 2
@@ -655,11 +660,12 @@ class AresLocalRuntime:
 import shutil
 from hermes_constants import get_hermes_home
 from hermes_cli.config import load_config_readonly
+from plugins.context_engine._context_governor import ContextGovernorEngine
 from plugins.context_engine._context_governor.key_state import ContextGovernorKeyError, ContextGovernorKeyState
 
 config = load_config_readonly() or {}
 if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
-    binary = shutil.which('context-governor')
+    binary = ContextGovernorEngine().binary
     if not binary:
         raise RuntimeError('context-governor binary is unavailable')
     state = ContextGovernorKeyState(get_hermes_home(), binary)
@@ -700,10 +706,11 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
             missing.append("Desktop executable")
         try:
             record = json.loads((source.parent / "release.json").read_text(encoding="utf-8"))
+            native = recipe_for_source(source)
             expected = {
                 "schema": "AresLocalRuntimeBindingV1",
                 "source": str(source.resolve()),
-                "controller_contract": LOCAL_LIFECYCLE_CONTRACT,
+                "controller_contract": NATIVE_LIFECYCLE_CONTRACT if native is not None else LOCAL_LIFECYCLE_CONTRACT,
             }
             if (
                 not isinstance(record, dict)
@@ -806,6 +813,7 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
             previous_record, _raw = read_identity_record(previous[1].parent / "release.json")
             if "runtime_binding" in previous_record:
                 self._require_complete_release(previous[1], desktop=False)
+                require_pair(candidate, previous)
                 return
             self._require_complete_release(candidate[1], desktop=False)
             self._require_candidate_transition_owner(candidate[1])
@@ -880,10 +888,13 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
                     record["legacy_rollback_binding"] = binding
                 except (OSError, ValueError, RuntimeError) as exc:
                     raise AresLocalRuntimeError("candidate legacy transition binding is not verified") from exc
+            native = recipe_for_source(source)
+            if native is not None:
+                self._probe_governor_binding(source)
             record["runtime_binding"] = {
                 "schema": "AresLocalRuntimeBindingV1",
                 "source": str(source.resolve()),
-                "controller_contract": LOCAL_LIFECYCLE_CONTRACT,
+                "controller_contract": NATIVE_LIFECYCLE_CONTRACT if native is not None else LOCAL_LIFECYCLE_CONTRACT,
             }
             self._atomic_json(source.parent / "release.json", record)
 
@@ -951,13 +962,64 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
             self._require_unselected_release(revision, operation="refresh the editable install of")
             self._sync_python_runtime(resolved)
 
-    def _build_runtime(self, source: Path, *, desktop: bool) -> None:
+    def _probe_governor_binding(self, source: Path) -> None:
+        """Require the final producer to resolve this release's native file."""
+        expected = bundled_binary(source, probe=True)
+        if expected is None:
+            raise AresLocalRuntimeError("native producer probe requires a declared bundle")
+        program = (
+            "from pathlib import Path; "
+            "import ares_runtime.governor_install as native; "
+            "import plugins.context_engine._context_governor as adapter; "
+            "from ares_runtime.governor_install import NATIVE_LIFECYCLE_CONTRACT; "
+            "from plugins.context_engine._context_governor import ContextGovernorEngine; "
+            "from plugins.context_engine._context_governor.key_state import ContextGovernorKeyState; "
+            "from hermes_constants import get_hermes_home; "
+            f"root=Path({str(source.resolve())!r}); "
+            "assert all(Path(m.__file__).resolve().is_relative_to(root) for m in (native,adapter)); "
+            f"assert NATIVE_LIFECYCLE_CONTRACT == {NATIVE_LIFECYCLE_CONTRACT}; "
+            "engine=ContextGovernorEngine(); "
+            f"assert Path(engine.binary) == Path({str(expected)!r}); "
+            "binding=ContextGovernorKeyState(get_hermes_home(),engine.binary).initialize_first_install(); "
+            "binding.close(); engine.probe_activation()"
+        )
+        with tempfile.TemporaryDirectory(prefix="governor-admission-", dir=self.paths.state_root) as fixture:
+            environment = self._agent_environment()
+            environment["HERMES_HOME"] = fixture
+            environment["ARES_HOME"] = fixture
+            self._run([self._python_for(source), "-c", program], cwd=source, env=environment)
+
+    def _native_inputs(self, current: tuple[str, Path] | None, requested: Path | None):
+        """The current descriptor owns the pinned component; no second selector."""
+        current_recipe = recipe_for_source(current[1]) if current else None
+        spec = GovernorSource.capture(requested) if requested is not None else (
+            GovernorSource.from_record(current_recipe) if current_recipe is not None else None
+        )
+        backout = None
+        if spec is not None and current is not None and current_recipe is None:
+            probe = self._run(
+                [self._python_for(current[1]), "-c", "import json; from plugins.context_engine._context_governor import ContextGovernorEngine; print(json.dumps({'binary':ContextGovernorEngine().binary}))"],
+                cwd=current[1], env=self._agent_environment(), capture=True,
+            ).stdout.strip()
+            probe = json.loads(probe)["binary"]
+            if not isinstance(probe, str) or not probe:
+                raise AresLocalRuntimeError("external governor producer returned no executable identity")
+            resolved = shutil.which(probe) if not Path(probe).is_file() else probe
+            if not resolved:
+                raise AresLocalRuntimeError("external governor backout executable is unavailable")
+            backout = external_backout(current, Path(resolved))
+        return spec, backout
+
+    def _build_runtime(self, source: Path, *, desktop: bool,
+                       governor: GovernorSource | None = None,
+                       native_backout: dict | None = None) -> dict | None:
         if self._installed_release_source(source):
             raise AresLocalRuntimeError(
                 "cannot mutate an installed release; build a new staged Ares release instead"
             )
 
         self._sync_python_runtime(source)
+        native = build_governor(governor, source, external_backout=native_backout) if governor is not None else None
         if desktop:
             npm = self._managed_npm()
             if npm is None:
@@ -977,6 +1039,7 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
                 raise AresLocalRuntimeError(
                     "Ares Desktop build completed without an executable"
                 )
+        return native
 
     @staticmethod
     def _desktop_binary(source: Path) -> Path | None:
@@ -1024,15 +1087,18 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
     def _materialize(
         self, source_spec: str, revision: str, *, desktop: bool,
         legacy_rollback_binding: dict[str, str] | None = None,
+        governor: GovernorSource | None = None, native_backout: dict | None = None,
     ) -> None:
         with self.locked():
-            self._materialize_locked(
-                source_spec, revision, desktop=desktop, legacy_rollback_binding=legacy_rollback_binding
-            )
+            options = {"desktop": desktop, "legacy_rollback_binding": legacy_rollback_binding}
+            if governor is not None:
+                options.update(governor=governor, native_backout=native_backout)
+            self._materialize_locked(source_spec, revision, **options)
 
     def _materialize_locked(
         self, source_spec: str, revision: str, *, desktop: bool,
         legacy_rollback_binding: dict[str, str] | None = None,
+        governor: GovernorSource | None = None, native_backout: dict | None = None,
     ) -> None:
         """Keep selection protection stable through the direct restaging path."""
         self._ensure_layout()
@@ -1045,6 +1111,10 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
             except AresLocalRuntimeError:
                 quarantined = self._quarantine_incomplete_release(revision, final_dir)
             else:
+                existing_native = recipe_for_source(source)
+                expected_native = governor.identity if governor is not None else None
+                if (existing_native["source"] if existing_native is not None else None) != expected_native:
+                    raise AresLocalRuntimeError("immutable release native recipe mismatch; preserve release bytes")
                 if legacy_rollback_binding is not None:
                     self._ensure_legacy_rollback_binding(source, legacy_rollback_binding)
                 return
@@ -1054,13 +1124,17 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
         try:
             self._run(["git", "clone", "--no-local", source_spec, source])
             self._run(["git", "-C", source, "checkout", "--detach", revision])
-            self._build_runtime(source, desktop=desktop)
+            build_options = {"desktop": desktop}
+            if governor is not None:
+                build_options.update(governor=governor, native_backout=native_backout)
+            native = self._build_runtime(source, **build_options)
             self._atomic_json(
                 staging / "release.json",
                 {
                     "revision": revision,
                     "source": source_spec,
                     "installed_at": int(time.time()),
+                    **({"governor": native} if native is not None else {}),
                 },
             )
             os.replace(staging, final_dir)
@@ -1134,6 +1208,7 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
         upstream_branch: str,
         upstream_revision: str,
         desktop: bool,
+        governor: GovernorSource | None = None, native_backout: dict | None = None,
     ) -> str:
         """Build one isolated Ares candidate from upstream plus the downstream delta.
 
@@ -1283,11 +1358,18 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
                 self._require_complete_release(
                     self._release_source(candidate_revision), desktop=desktop
                 )
+                existing_native = recipe_for_source(self._release_source(candidate_revision))
+                expected_native = governor.identity if governor is not None else None
+                if (existing_native["source"] if existing_native is not None else None) != expected_native:
+                    raise AresLocalRuntimeError("immutable candidate native recipe mismatch")
                 # The verified release is reused; the fresh staging checkout
                 # remains owned by this invocation and must not accumulate.
                 shutil.rmtree(staging)
                 return candidate_revision
-            self._build_runtime(source, desktop=desktop)
+            build_options = {"desktop": desktop}
+            if governor is not None:
+                build_options.update(governor=governor, native_backout=native_backout)
+            native = self._build_runtime(source, **build_options)
             self._atomic_json(
                 staging / "release.json",
                 {
@@ -1298,6 +1380,7 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
                     "upstream_branch": upstream_branch,
                     "upstream_revision": upstream_revision,
                     "installed_at": int(time.time()),
+                    **({"governor": native} if native is not None else {}),
                 },
             )
             os.replace(staging, final_dir)
@@ -1496,6 +1579,7 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
         upstream_remote: str = _DEFAULT_UPSTREAM_REMOTE,
         upstream_branch: str = _DEFAULT_UPSTREAM_BRANCH,
         transition_from_legacy: str | None = None,
+        governor_source: Path | None = None,
     ) -> tuple[str, bool]:
         if transition_from_legacy is not None and (
             not isinstance(transition_from_legacy, str)
@@ -1539,8 +1623,14 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
                     "is-active", "--quiet", "hermes-gateway.service", required=False
                 )
             if legacy_binding is None:
-                self._materialize(str(source), revision, desktop=desktop)
+                governor, backout = self._native_inputs(old_active, governor_source)
+                native_options = {"governor": governor, "native_backout": backout} if governor is not None else {}
+                self._materialize(str(source), revision, desktop=desktop, **native_options)
+                if governor is not None and old_active and old_active[0] == revision and old_previous:
+                    self._require_transition_backout(old_active, old_previous)
             else:
+                if governor_source is not None:
+                    raise AresLocalRuntimeError("native admission requires a supported base release; complete legacy transition first")
                 self._materialize(
                     str(source), revision, desktop=desktop,
                     legacy_rollback_binding=legacy_binding,
@@ -1641,6 +1731,8 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
             gateway_running = (
                 self._gateway_state()[0] if self.paths.unit_path.exists() else False
             )
+            governor, backout = self._native_inputs(current, None)
+            native_options = {"governor": governor, "native_backout": backout} if governor is not None else {}
             revision = self._materialize_upstream_candidate(
                 downstream_remote=remote,
                 downstream_revision=downstream_revision,
@@ -1648,6 +1740,7 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
                 upstream_branch=upstream_branch,
                 upstream_revision=upstream_revision,
                 desktop=desktop,
+                **native_options,
             )
             self._activate(revision)
             if self.paths.unit_path.exists():
@@ -2093,6 +2186,10 @@ def _parser() -> argparse.ArgumentParser:
         help="Ares checkout to install (default: current directory)",
     )
     setup.add_argument(
+        "--governor-source", type=Path,
+        help="Opt in to a pinned clean Git context-governor build bundled with this staged release",
+    )
+    setup.add_argument(
         "--transition-from-legacy",
         metavar="EXACT_CURRENT_SHA",
         help="Explicitly verify a legacy current release for backout using the new source-bound controller",
@@ -2234,6 +2331,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 upstream_remote=args.upstream_remote,
                 upstream_branch=args.upstream_branch,
                 transition_from_legacy=args.transition_from_legacy,
+                **({"governor_source": args.governor_source} if args.governor_source is not None else {}),
             )
             print(f"Ares stable runtime selected: {revision}")
             if seeded:
@@ -2270,7 +2368,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             runtime.auth(args, passthrough)
         else:
             runtime.tui(())
-    except AresLocalRuntimeError as exc:
+    except (AresLocalRuntimeError, GovernorInstallError) as exc:
         print(f"ares: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
 
