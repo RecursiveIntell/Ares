@@ -6,6 +6,7 @@ import { $currentCwd } from '@/store/session'
 import { setTerminalTakeover } from '../store'
 
 import { seedAgentTerminalCommand } from './agent-terminal-stream'
+import { requestTerminalFocus } from './focus'
 
 /** One in-app terminal tab. `id` is the renderer-side handle (distinct from the
  *  PTY session id the main process mints); each instance owns its own shell. */
@@ -159,10 +160,12 @@ const newId = () =>
 
 /** Append a fresh terminal and focus it. Captures the current cwd once (its only
  *  tie to session/project state); pass an explicit cwd to override. Returns the id. */
-export function createTerminal(cwd: string = $currentCwd.get()): string {
+export function createTerminal(cwd: string = $currentCwd.get(), focus = true): string {
   const id = newId()
   $terminals.set([...$terminals.get(), { id, title: 'Terminal', auto: true, cwd, kind: 'user' }])
   $activeTerminalId.set(id)
+
+  if (focus) { requestTerminalFocus(id) }
 
   return id
 }
@@ -207,6 +210,7 @@ export function openAgentTerminal(procId: string, title: string): void {
 
   $activeTerminalId.set(id)
   setTerminalTakeover(true)
+  requestTerminalFocus(id)
 }
 
 /** Guarantee at least one tab exists when the pane opens.
@@ -214,13 +218,14 @@ export function openAgentTerminal(procId: string, title: string): void {
  *  second, unrelated user shell just because the pane became visible. */
 export function ensureTerminal(): void {
   if ($terminals.get().length === 0) {
-    createTerminal()
+    createTerminal(undefined, false)
   }
 }
 
 export function selectTerminal(id: string): void {
   if ($terminals.get().some(term => term.id === id)) {
     $activeTerminalId.set(id)
+    requestTerminalFocus(id)
   }
 }
 

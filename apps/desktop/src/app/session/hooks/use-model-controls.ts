@@ -8,6 +8,7 @@ import { useI18n } from '@/i18n'
 import { isBusySessionModelSwitch } from '@/lib/gateway-rpc'
 import { surfaceModelSwitchConfirm } from '@/lib/guarded-model-switch'
 import { modelOptionsQueryKey } from '@/lib/model-options'
+import { reconcileSelectorInfo } from '@/lib/selector-observation'
 import { activeGatewayConnectionId } from '@/store/gateway'
 import { notifyError } from '@/store/notifications'
 import { $activeGatewayProfile } from '@/store/profile'
@@ -32,7 +33,7 @@ import {
 } from '@/store/session'
 import { isSessionGoneError } from '@/store/session-gone'
 import { $sessionStates, knownOwnerForSession, sessionTileDelegate } from '@/store/session-states'
-import type { ModelOptionsResponse } from '@/types/hermes'
+import type { ModelOptionsResponse, SessionRuntimeInfo } from '@/types/hermes'
 
 import {
   captureDraftComposerOwner,
@@ -59,6 +60,7 @@ interface ModelControlsOptions {
 }
 
 interface ModelSwitchResponse {
+  selector_info?: SessionRuntimeInfo
   confirm_message?: string
   confirm_required?: boolean
   deferred?: boolean
@@ -646,6 +648,12 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
         // the switch publishes session.info when it lands, and that is what
         // re-syncs every surface.
         if (!result?.deferred) {
+          if (liveSessionId && result?.selector_info) {
+            sessionTileDelegate()?.updateSession(liveSessionId, state => ({ ...state,
+              ...reconcileSelectorInfo(state, result.selector_info!, { settleModel: true })
+            }))
+          }
+
           void queryClient.invalidateQueries({
             queryKey: modelOptionsQueryKey(liveGatewayProfile, liveSessionId, liveConnectionId)
           })

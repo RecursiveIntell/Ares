@@ -1,6 +1,7 @@
 import type * as React from 'react'
 
 import type { ChatMessage } from '@/lib/chat-messages'
+import type { SelectorObservation } from '@/lib/selector-observation'
 import type { SessionMessage, UsageStats } from '@/types/hermes'
 
 export interface ContextSuggestion {
@@ -196,6 +197,7 @@ export interface ClientSessionState {
   /** Local model intent awaiting a matching or normalized backend metadata
    * update. A heartbeat repeating `previous*` is stale, not a rejection. */
   pendingModelSelection?: null | PendingModelSelection
+  selectorObservation?: SelectorObservation
   reasoningEffort: string
   serviceTier: string
   fast: boolean
