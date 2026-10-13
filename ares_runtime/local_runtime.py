@@ -814,6 +814,13 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
             if "runtime_binding" in previous_record:
                 self._require_complete_release(previous[1], desktop=False)
                 require_pair(candidate, previous)
+                candidate_recipe, previous_recipe = recipe_for_source(candidate[1]), recipe_for_source(previous[1])
+                if (candidate_recipe is None) != (previous_recipe is None):
+                    native = candidate_recipe if candidate_recipe is not None else previous_recipe
+                    base = previous if candidate_recipe is not None else candidate
+                    witness = native["external_backout"]
+                    if witness["binary"] is None and self._base_governor_probe(base[1])["required"]:
+                        raise GovernorInstallError("optional-native predecessor policy is now strict")
                 return
             self._require_complete_release(candidate[1], desktop=False)
             self._require_candidate_transition_owner(candidate[1])
@@ -989,6 +996,47 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
             environment["ARES_HOME"] = fixture
             self._run([self._python_for(source), "-c", program], cwd=source, env=environment)
 
+    def _base_governor_probe(self, source: Path) -> dict:
+        """Read the predecessor's actual policy, without fallback on read errors."""
+        program = """
+import json
+from hermes_cli.config import get_config_path, load_config_readonly
+from plugins.context_engine._context_governor import ContextGovernorEngine
+from utils import fast_safe_load
+
+path = get_config_path()
+try:
+    before = path.read_bytes()
+except FileNotFoundError:
+    if path.is_symlink():
+        raise RuntimeError('predecessor config has dangling custody')
+    before = None
+if before is not None:
+    raw = fast_safe_load(before)
+    if raw is not None and not isinstance(raw, dict):
+        raise RuntimeError('predecessor config must be a mapping')
+config = load_config_readonly()
+if (before is None and (path.exists() or path.is_symlink())) or (before is not None and path.read_bytes() != before):
+    raise RuntimeError('predecessor config changed during policy probe')
+context = config.get('context', {})
+if context is None:
+    context = {}
+if not isinstance(context, dict):
+    raise RuntimeError('predecessor context policy must be a mapping')
+engine = context.get('engine', 'compressor')
+if not isinstance(engine, str) or not engine:
+    raise RuntimeError('predecessor engine selector is invalid')
+print(json.dumps({'binary': ContextGovernorEngine().binary,
+                  'required': engine == 'ri-context-governor'}))
+"""
+        probe = json.loads(self._run([self._python_for(source), "-c", program],
+                                    cwd=source, env=self._agent_environment(), capture=True).stdout.strip())
+        if (not isinstance(probe, dict) or set(probe) != {"binary", "required"}
+            or type(probe["required"]) is not bool
+            or not isinstance(probe["binary"], str) or not probe["binary"]):
+            raise AresLocalRuntimeError("external governor policy probe returned no exact identity")
+        return probe
+
     def _native_inputs(self, current: tuple[str, Path] | None, requested: Path | None):
         """The current descriptor owns the pinned component; no second selector."""
         current_recipe = recipe_for_source(current[1]) if current else None
@@ -997,17 +1045,11 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
         )
         backout = None
         if spec is not None and current is not None and current_recipe is None:
-            probe = self._run(
-                [self._python_for(current[1]), "-c", "import json; from plugins.context_engine._context_governor import ContextGovernorEngine; print(json.dumps({'binary':ContextGovernorEngine().binary}))"],
-                cwd=current[1], env=self._agent_environment(), capture=True,
-            ).stdout.strip()
-            probe = json.loads(probe)["binary"]
-            if not isinstance(probe, str) or not probe:
-                raise AresLocalRuntimeError("external governor producer returned no executable identity")
-            resolved = shutil.which(probe) if not Path(probe).is_file() else probe
-            if not resolved:
+            probe = self._base_governor_probe(current[1])
+            resolved = shutil.which(probe["binary"]) if not Path(probe["binary"]).is_file() else probe["binary"]
+            if not resolved and probe["required"]:
                 raise AresLocalRuntimeError("external governor backout executable is unavailable")
-            backout = external_backout(current, Path(resolved))
+            backout = external_backout(current, Path(resolved) if resolved else None)
         return spec, backout
 
     def _build_runtime(self, source: Path, *, desktop: bool,

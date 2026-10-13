@@ -15,7 +15,7 @@ from test_governor_recipe import capabilities, git, repository
 pytestmark = pytest.mark.linux_only
 
 
-def tools(tmp_path, monkeypatch):
+def tools(tmp_path, monkeypatch, *, configured_target=None):
     root = tmp_path / "tools"
     root.mkdir()
     cargo = root / "cargo"
@@ -26,12 +26,14 @@ def tools(tmp_path, monkeypatch):
         "if sys.argv[1:] == ['--version']:\n print('cargo synthetic fixture')\n"
         "else:\n"
         " assert sys.argv[1:4] == ['build','--release','--locked']\n"
-        " target=Path(sys.argv[sys.argv.index('--target-dir')+1])/'release'\n"
+        " target_root=Path(sys.argv[sys.argv.index('--target-dir')+1])\n"
+        f" selected=sys.argv[sys.argv.index('--target')+1] if '--target' in sys.argv else {configured_target!r}\n"
+        " target=(target_root/selected if selected else target_root)/'release'\n"
         " target.mkdir(parents=True)\n"
         f" (target/'context-governor').write_text({binary_text!r})\n"
     )
     rustc = root / "rustc"
-    rustc.write_text(f"#!{sys.executable}\nprint('rustc synthetic fixture')\n")
+    rustc.write_text(f"#!{sys.executable}\nprint('rustc synthetic fixture\\nhost: x86_64-unknown-linux-gnu')\n")
     cargo.chmod(0o755)
     rustc.chmod(0o755)
     original = native.shutil.which
@@ -65,7 +67,7 @@ def test_locked_native_build_uses_git_archive_and_only_staged_output(tmp_path, m
     assert recipe["sha256"] == hashlib.sha256(produced.read_bytes()).hexdigest()
     assert recipe["lock_sha256"] == hashlib.sha256(b"version=4\n").hexdigest()
     assert recipe["capabilities"] == capabilities()
-    assert recipe["build"]["flags"] == ["build", "--release", "--locked"]
+    assert recipe["build"]["flags"] == ["build", "--release", "--locked", "--target", "x86_64-unknown-linux-gnu"]
     assert old.read_bytes() == b"unchanged external executable"
     assert not (source.parent / "governor-build").exists()
     assert not (source.parent / "release.json").exists()
@@ -111,3 +113,13 @@ def test_native_build_refuses_output_directory_substitution(tmp_path, monkeypatc
     with pytest.raises(native.GovernorInstallError, match="directory substitution"):
         native.build_governor(spec, source, external_backout=None)
     assert not (outside / "context-governor").exists()
+
+
+def test_native_build_explicitly_pins_compiler_host_over_cargo_target(tmp_path, monkeypatch):
+    root, _ = repository(tmp_path)
+    spec = native.GovernorSource.capture(root)
+    tools(tmp_path, monkeypatch, configured_target="ambient-cross-target")
+    recipe = native.build_governor(spec, stage(tmp_path), external_backout=None)
+    flags = recipe["build"]["flags"]
+    assert flags[flags.index("--target") + 1] == "x86_64-unknown-linux-gnu"
+    assert recipe["build"]["rustc"].endswith("host: x86_64-unknown-linux-gnu")

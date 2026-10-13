@@ -12,7 +12,7 @@ ares setup --source /path/to/clean/ares --governor-source /path/to/libraries/con
 
 An older installed controller will reject the new argument. For the initial transition, invoke the reviewed new source's controller using its verified interpreter/import context; do not replace launchers or release pointers manually.
 
-The native recipe captures the exact commit, crate subtree, remote, Cargo lock digest, toolchain version, flags, target and resulting executable digest. The build derives its inputs from Git, requires the commit to be reachable from the declared remote's default head, uses locked default-feature Cargo compilation in staging, and copies only the produced executable into that inactive release. The existing `release.json` owns the component binding; there is no second active-native selector.
+The native recipe captures the exact commit, crate subtree, remote, Cargo lock digest, toolchain version, flags, target and resulting executable digest. Relative local remotes are bound to their capture root; URL userinfo is rejected for every scheme (use credential-free URLs or SCP-style SSH routing). The build derives its inputs from Git, requires the commit to be reachable from the declared remote's default head, and pins locked default-feature Cargo compilation to the recorded compiler host target, regardless of ambient Cargo target settings. Only the produced executable enters the inactive release. The existing `release.json` owns the component binding; there is no second active-native selector.
 
 Before final binding, the controller probes the actual final-path Python producer and native compact/finalize/prepare/discard contract with newly generated fixture-only authority. Live keys are not copied into that fixture. The normal key owner retains existing live authority; a first install initializes missing canonical authority through its existing path, not by key rotation or fixture-key adoption.
 
@@ -27,6 +27,8 @@ An existing immutable Ares revision cannot acquire a different native recipe in 
 ## Backout and recovery
 
 The existing `current`/`previous` pair and transition journal remain the only selection owner. A transition from an external-native base release records that exact predecessor's executable and descriptor digests in the candidate's backout witness. The external executable remains intact. Activation/backout refuse predecessor drift; native-to-native backout validates both bundles.
+
+A base that does not require or have an external governor receives an explicit paired-null artifact witness, still bound to its exact source and descriptor. Admission, backout and reselection re-probe its policy using that predecessor's interpreter and owner-scoped home. Probe/read errors, a half-null witness, or a now-strict governor policy refuse the transition; a strict predecessor with a missing executable is never qualified as optional absence.
 
 ```bash
 ares rollback

@@ -49,6 +49,18 @@ def _path(value: object) -> str:
     return value
 
 
+def _relative_local_remote(value: str) -> bool:
+    return ("://" not in value and not Path(value).is_absolute()
+            and re.fullmatch(r"(?:[^/@:]+@)?[^/:]+:.+", value) is None)
+
+
+def _host_target(rustc: str) -> str:
+    hosts = re.findall(r"^host: ([A-Za-z0-9_][A-Za-z0-9_.-]*)$", rustc, re.MULTILINE)
+    if len(hosts) != 1:
+        raise GovernorInstallError("native compiler host target is unavailable")
+    return hosts[0]
+
+
 def source_identity(value: object) -> dict:
     if not isinstance(value, dict) or set(value) != _SOURCE_FIELDS:
         raise GovernorInstallError("invalid native source identity")
@@ -57,8 +69,10 @@ def source_identity(value: object) -> dict:
     if not _HEX40.fullmatch(str(value["crate_tree"])):
         raise GovernorInstallError("invalid native source tree")
     remote = _path(value["remote"])
-    if re.search(r"https?://[^/]*@", remote):
+    if re.search(r"[A-Za-z][A-Za-z0-9+.-]*://[^/]*@", remote):
         raise GovernorInstallError("credential-bearing native remote is not accepted")
+    if _relative_local_remote(remote):
+        raise GovernorInstallError("native local remote is not bound to its capture root")
     path = _path(value["crate_path"])
     if PurePosixPath(path).is_absolute() or ".." in PurePosixPath(path).parts:
         raise GovernorInstallError("native crate path escapes the source")
@@ -79,7 +93,9 @@ class GovernorSource:
             raise GovernorInstallError("native source has uncommitted or untracked changes")
         relative = crate.relative_to(root).as_posix()
         revision = _git(root, "rev-parse", "HEAD")
-        remote = _git(root, "remote", "get-url", "origin")
+        remote = _path(_git(root, "remote", "get-url", "origin"))
+        if _relative_local_remote(remote):
+            remote = str((root / remote).resolve(strict=True))
         tree_ref = revision + ("^{tree}" if relative == "." else ":" + relative)
         tree = _git(root, "rev-parse", tree_ref)
         entries = _git(root, "ls-tree", "-r", tree_ref).splitlines()
@@ -174,10 +190,10 @@ def recipe_for_source(source: Path) -> dict | None:
         build = recipe["build"]
         if not isinstance(build, dict) or set(build) != {"cargo", "rustc", "flags", "features"}:
             raise GovernorInstallError("native build recipe is invalid")
-        if build["flags"] != ["build", "--release", "--locked"] or build["features"] != []:
-            raise GovernorInstallError("native build recipe is unsupported")
         if not all(isinstance(build[k], str) and build[k].strip() for k in ("cargo", "rustc")):
             raise GovernorInstallError("native toolchain binding is unavailable")
+        if build["flags"] != ["build", "--release", "--locked", "--target", _host_target(build["rustc"])] or build["features"] != []:
+            raise GovernorInstallError("native build recipe is unsupported")
         binary = _executable(source)
         if file_digest(binary) != recipe["sha256"]:
             raise GovernorInstallError("native artifact digest mismatch")
@@ -186,11 +202,14 @@ def recipe_for_source(source: Path) -> dict | None:
             fields = {"revision", "source", "descriptor_sha256", "binary", "sha256"}
             if not isinstance(backout, dict) or set(backout) != fields:
                 raise GovernorInstallError("external native backout identity is invalid")
-            if not _HEX40.fullmatch(str(backout["revision"])) or not all(
-                _HEX64.fullmatch(str(backout[k])) for k in ("descriptor_sha256", "sha256")
-            ):
+            if not _HEX40.fullmatch(str(backout["revision"])) or not _HEX64.fullmatch(str(backout["descriptor_sha256"])):
                 raise GovernorInstallError("external native backout digest is invalid")
-            if not all(isinstance(backout[k], str) and Path(backout[k]).is_absolute() for k in ("source", "binary")):
+            absent = backout["binary"] is None and backout["sha256"] is None
+            if not absent and (not isinstance(backout["binary"], str)
+                               or not Path(backout["binary"]).is_absolute()
+                               or not _HEX64.fullmatch(str(backout["sha256"]))):
+                raise GovernorInstallError("external native backout artifact is invalid")
+            if not isinstance(backout["source"], str) or not Path(backout["source"]).is_absolute():
                 raise GovernorInstallError("external native backout path is invalid")
         return recipe
     except LegacyTransitionError as exc:
@@ -246,6 +265,8 @@ def _build_governor(spec: GovernorSource, source: Path, *, external_backout: dic
         "rustc": subprocess.check_output([rustc, "-Vv"], text=True, env=environment).strip(),
         "flags": ["build", "--release", "--locked"], "features": [],
     }
+    host_target = _host_target(toolchain["rustc"])
+    toolchain["flags"].extend(["--target", host_target])
     target = work / "target"
     subprocess.run([cargo, *toolchain["flags"], "--manifest-path", str(crate / "Cargo.toml"), "--target-dir", str(target)], cwd=crate, env=environment, check=True)
     binary = source / BINARY_PATH
@@ -255,7 +276,7 @@ def _build_governor(spec: GovernorSource, source: Path, *, external_backout: dic
             raise GovernorInstallError("native output directory substitution")
     if binary.exists() or binary.is_symlink():
         raise GovernorInstallError("staged native executable already exists")
-    shutil.copyfile(target / "release/context-governor", binary)
+    shutil.copyfile(target / host_target / "release/context-governor", binary)
     binary.chmod(0o755)
     artifact_digest = file_digest(binary)
     observed = require_capabilities(bounded_probe([str(binary), "capabilities"], cwd=source, home=source.parent))
@@ -276,14 +297,15 @@ def build_governor(spec: GovernorSource, source: Path, *, external_backout: dict
         raise GovernorInstallError("native source/build/probe failed; no admission") from exc
 
 
-def external_backout(previous: tuple[str, Path], binary: Path) -> dict:
+def external_backout(previous: tuple[str, Path], binary: Path | None) -> dict:
     record, raw = read_identity_record(previous[1].parent / "release.json")
     if record.get("revision") != previous[0]:
         raise GovernorInstallError("external predecessor revision mismatch")
-    resolved = binary.resolve(strict=True)
+    resolved = binary.resolve(strict=True) if binary is not None else None
     return {"revision": previous[0], "source": str(previous[1].resolve()),
             "descriptor_sha256": hashlib.sha256(raw).hexdigest(),
-            "binary": str(resolved), "sha256": file_digest(resolved)}
+            "binary": str(resolved) if resolved is not None else None,
+            "sha256": file_digest(resolved) if resolved is not None else None}
 
 
 def require_pair(first: tuple[str, Path], second: tuple[str, Path]) -> None:
@@ -300,6 +322,8 @@ def require_pair(first: tuple[str, Path], second: tuple[str, Path]) -> None:
     _, raw = read_identity_record(base[1].parent / "release.json")
     if hashlib.sha256(raw).hexdigest() != witness["descriptor_sha256"]:
         raise GovernorInstallError("external predecessor descriptor changed")
+    if witness["binary"] is None:
+        return  # The lifecycle owner separately re-probes optional-native policy.
     binary = Path(witness["binary"])
     if binary.resolve(strict=True) != binary or file_digest(binary) != witness["sha256"]:
         raise GovernorInstallError("external predecessor executable changed")

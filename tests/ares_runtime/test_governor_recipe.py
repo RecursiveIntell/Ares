@@ -7,13 +7,14 @@ from pathlib import Path
 import platform
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
 from ares_runtime.governor_install import (
     BINARY_PATH, GovernorInstallError, GovernorSource, NATIVE_LIFECYCLE_CONTRACT,
     RECIPE_SCHEMA, SOURCE_SCHEMA, build_governor, bundled_binary,
-    external_backout, recipe_for_source, require_pair,
+    external_backout, recipe_for_source, require_pair, source_identity,
 )
 from ares_runtime.local_runtime import AresLocalPaths, AresLocalRuntime, AresLocalRuntimeError
 
@@ -48,12 +49,13 @@ def native_release(runtime, revision="a" * 40, *, backout=None):
     binary.chmod(0o755)
     recipe = {
         "schema": RECIPE_SCHEMA,
-        "source": {"schema": SOURCE_SCHEMA, "remote": "fixture-native", "revision": "b" * 40,
+        "source": {"schema": SOURCE_SCHEMA, "remote": str(runtime.paths.state_root / "fixture-native.git"), "revision": "b" * 40,
                    "crate_path": "context-governor", "crate_tree": "c" * 40},
         "binary": BINARY_PATH, "sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
         "lock_sha256": "d" * 64, "platform": platform.system(), "architecture": platform.machine(),
         "capabilities": capabilities(),
-        "build": {"cargo": "fixture cargo", "rustc": "fixture rustc", "flags": ["build", "--release", "--locked"], "features": []},
+        "build": {"cargo": "fixture cargo", "rustc": "fixture rustc\nhost: x86_64-unknown-linux-gnu",
+                  "flags": ["build", "--release", "--locked", "--target", "x86_64-unknown-linux-gnu"], "features": []},
         "external_backout": backout,
     }
     record = {"revision": revision, "governor": recipe,
@@ -217,3 +219,114 @@ def test_source_capture_refuses_untracked_inputs_and_source_links(tmp_path):
     git(root, "commit", "-m", "link negative")
     with pytest.raises(GovernorInstallError, match="symlinks"):
         GovernorSource.capture(root)
+
+
+@pytest.mark.parametrize("scheme", ["https", "http", "ftp", "ftps", "ssh", "file"])
+def test_source_identity_refuses_userinfo_in_any_url(scheme):
+    with pytest.raises(GovernorInstallError, match="credential"):
+        source_identity({"schema": SOURCE_SCHEMA,
+                         "remote": f"{scheme}://fixture-user:fixture-password@example.invalid/repo",
+                         "revision": "b" * 40, "crate_path": ".", "crate_tree": "c" * 40})
+
+
+def test_relative_local_remote_is_bound_to_capture_root(tmp_path, monkeypatch):
+    root, _ = repository(tmp_path)
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "clone", "--bare", str(root), str(remote)], check=True)
+    git(root, "remote", "set-url", "origin", "../remote.git")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    spec = GovernorSource.capture(root)
+    assert spec.identity["remote"] == str(remote.resolve())
+    assert GovernorSource.from_record({"source": spec.identity}).identity == spec.identity
+
+
+def test_optional_native_free_base_has_explicit_absence_witness(tmp_path, monkeypatch):
+    runtime = owner(tmp_path)
+    base = base_release(runtime)
+    root, _ = repository(tmp_path)
+    missing = tmp_path / "missing/context-governor"
+    monkeypatch.setattr(runtime, "_run", lambda *a, **kw: SimpleNamespace(
+        stdout=json.dumps({"binary": str(missing), "required": False})))
+    spec, witness = runtime._native_inputs((base.parent.name, base), root)
+    assert spec is not None
+    assert witness["binary"] is None and witness["sha256"] is None
+    source, _, _, _ = native_release(runtime, backout=witness)
+    runtime._activate(base.parent.name)
+    runtime._activate(source.parent.name)
+    assert runtime.rollback() == base.parent.name
+    before = (runtime.active_release(), runtime.previous_release())
+    monkeypatch.setattr(runtime, "_run", lambda *a, **kw: SimpleNamespace(
+        stdout=json.dumps({"binary": str(missing), "required": True})))
+    with pytest.raises(AresLocalRuntimeError, match="backout identity"):
+        runtime.rollback()
+    assert before == (runtime.active_release(), runtime.previous_release())
+
+
+def test_strict_native_base_without_executable_still_refuses(tmp_path, monkeypatch):
+    runtime = owner(tmp_path)
+    base = base_release(runtime)
+    root, _ = repository(tmp_path)
+    monkeypatch.setattr(runtime, "_run", lambda *a, **kw: SimpleNamespace(
+        stdout=json.dumps({"binary": str(tmp_path / "missing-governor"), "required": True})))
+    with pytest.raises(AresLocalRuntimeError, match="unavailable"):
+        runtime._native_inputs((base.parent.name, base), root)
+    assert not runtime.paths.current_link.exists()
+
+
+@pytest.mark.parametrize("field", ["binary", "sha256"])
+def test_half_null_absence_witness_refuses_before_selection(tmp_path, field):
+    runtime = owner(tmp_path)
+    base = base_release(runtime)
+    witness = external_backout((base.parent.name, base), None)
+    witness[field] = str(tmp_path / "not-admitted") if field == "binary" else "a" * 64
+    source, _, _, _ = native_release(runtime, backout=witness)
+    with pytest.raises(AresLocalRuntimeError):
+        runtime._activate(source.parent.name)
+    assert not runtime.paths.current_link.exists()
+
+
+def test_absence_witness_probe_error_preserves_selected_pair(tmp_path, monkeypatch):
+    runtime = owner(tmp_path)
+    base = base_release(runtime)
+    source, _, _, _ = native_release(runtime, backout=external_backout((base.parent.name, base), None))
+    runtime._activate(base.parent.name)
+    before = (runtime.active_release(), runtime.previous_release())
+    def failed_probe(*args, **kwargs):
+        raise AresLocalRuntimeError("controlled read failure")
+    monkeypatch.setattr(runtime, "_run", failed_probe)
+    with pytest.raises(AresLocalRuntimeError, match="backout identity"):
+        runtime._activate(source.parent.name)
+    assert before == (runtime.active_release(), runtime.previous_release())
+
+
+def test_absence_witness_descriptor_drift_preserves_selected_pair(tmp_path):
+    runtime = owner(tmp_path)
+    base = base_release(runtime)
+    source, _, _, _ = native_release(runtime, backout=external_backout((base.parent.name, base), None))
+    runtime._activate(base.parent.name)
+    before = (runtime.active_release(), runtime.previous_release())
+    descriptor = base.parent / "release.json"
+    changed = json.loads(descriptor.read_text())
+    changed["unreviewed"] = True
+    descriptor.write_text(json.dumps(changed))
+    with pytest.raises(AresLocalRuntimeError, match="backout identity"):
+        runtime._activate(source.parent.name)
+    assert before == (runtime.active_release(), runtime.previous_release())
+
+
+def test_recorded_relative_remote_is_not_reinterpreted_on_update():
+    with pytest.raises(GovernorInstallError, match="capture root"):
+        source_identity({"schema": SOURCE_SCHEMA, "remote": "../unbound.git",
+                         "revision": "b" * 40, "crate_path": ".", "crate_tree": "c" * 40})
+
+
+def test_native_build_target_must_match_recorded_compiler_host(tmp_path):
+    runtime = owner(tmp_path)
+    source, _, record, descriptor = native_release(runtime)
+    record["governor"]["build"]["flags"][-1] = "ambient-target"
+    descriptor.write_text(json.dumps(record))
+    with pytest.raises(AresLocalRuntimeError):
+        runtime._activate(source.parent.name)
+    assert not runtime.paths.current_link.exists()
