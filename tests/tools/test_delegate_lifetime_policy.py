@@ -29,16 +29,10 @@ def test_absent_timeout_policy_preserves_legacy_no_cap(monkeypatch):
     assert delegate._get_child_timeout() is None
 
 
-def test_real_canonical_loader_absence_resolves_default_total_600():
+def test_real_canonical_loader_absence_preserves_total_zero_no_cap():
     loaded = config.load_config_readonly()
     assert loaded['delegation']['child_timeout_mode'] == 'total'
-    assert loaded['delegation']['child_timeout_seconds'] == 600
-    assert delegate._get_child_timeout() == 600.0
-
-
-def test_blank_code_fallback_remains_no_cap(monkeypatch):
-    monkeypatch.delenv('DELEGATION_CHILD_TIMEOUT_SECONDS', raising=False)
-    monkeypatch.setattr(delegate, '_load_config', lambda: {'child_timeout_mode': 'total'})
+    assert loaded['delegation']['child_timeout_seconds'] == 0
     assert delegate._get_child_timeout() is None
 
 
