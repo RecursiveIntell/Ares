@@ -17,19 +17,20 @@ import { modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
 import { displayModelName, modelDisplayParts } from '@/lib/model-status-label'
 import { normalize } from '@/lib/text'
 import {
-  $visibleModels,
   collapseModelFamilies,
   effectiveVisibleKeys,
   modelVisibilityKey,
   setProviderVisibility,
   setVisibleModels,
-  toggleModelVisibility
+  toggleModelVisibility,
+  visibleModelsStore
 } from '@/store/model-visibility'
 import { $collapsedProviders, toggleCollapsedProvider } from '@/store/provider-collapse'
 import { knownOwnerForSession, requestForOwnedSession } from '@/store/session-states'
 import type { ModelOptionProvider, ModelOptionsResponse } from '@/types/hermes'
 
 interface ModelVisibilityDialogProps {
+  connectionId?: null | string
   gw?: HermesGateway
   onOpenChange: (open: boolean) => void
   onOpenProviders: () => void
@@ -39,6 +40,7 @@ interface ModelVisibilityDialogProps {
 }
 
 export function ModelVisibilityDialog({
+  connectionId: targetConnectionId,
   gw,
   onOpenChange,
   onOpenProviders,
@@ -49,11 +51,13 @@ export function ModelVisibilityDialog({
   const { t } = useI18n()
   const copy = t.modelVisibility
   const [search, setSearch] = useState('')
-  const stored = useStore($visibleModels)
   const collapsedProviders = useStore($collapsedProviders)
   const owner = knownOwnerForSession(sessionId)
   const catalogProfile = (typeof owner === 'string' ? owner : owner?.targetProfile || owner?.profile) || profile
-  const connectionId = owner && typeof owner === 'object' ? owner.connectionId : owner ? 'local' : getApiRequestConnection()
+  const connectionId = targetConnectionId !== undefined ? targetConnectionId : owner && typeof owner === 'object' ? owner.connectionId : owner ? null : getApiRequestConnection()
+  const visibilityScope = { connectionId, profile: catalogProfile }
+  const visibilityStore = visibleModelsStore(visibilityScope)
+  const stored = useStore(visibilityStore)
 
   const modelOptions = useQuery({
     queryKey: modelOptionsQueryKey(catalogProfile, sessionId, connectionId),
@@ -72,11 +76,11 @@ export function ModelVisibilityDialog({
   const visible = effectiveVisibleKeys(stored, providers)
 
   const toggle = (provider: ModelOptionProvider, model: string) => {
-    setVisibleModels(toggleModelVisibility($visibleModels.get(), providers, provider.slug, model))
+    setVisibleModels(toggleModelVisibility(visibilityStore.get(), providers, provider.slug, model), visibilityScope)
   }
 
   const setProviderVisible = (provider: ModelOptionProvider, next: boolean) => {
-    setVisibleModels(setProviderVisibility($visibleModels.get(), providers, provider.slug, next))
+    setVisibleModels(setProviderVisibility(visibilityStore.get(), providers, provider.slug, next), visibilityScope)
   }
 
   const q = normalize(search)

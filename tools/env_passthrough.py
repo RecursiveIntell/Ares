@@ -24,9 +24,10 @@ from __future__ import annotations
 import logging
 import os
 from contextvars import ContextVar
-from pathlib import Path
-from typing import Iterable
-from hermes_cli.config import cfg_get
+from typing import TYPE_CHECKING, Callable, Iterable
+
+if TYPE_CHECKING:
+    from hermes_cli.config import LaunchConfigPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -127,54 +128,50 @@ def register_env_passthrough(var_names: Iterable[str]) -> None:
         logger.debug("env passthrough: registered %s", name)
 
 
+def _compile_protected(config_policy: LaunchConfigPolicy) -> Callable[[str], bool]:
+    """Reuse local's name classifiers without resolving config for every name."""
+    try:
+        from tools.environments.local import (
+            _build_provider_env_blocklist,
+            _is_blocked_provider_env,
+            _is_hermes_internal_secret,
+        )
+        blocked = frozenset(name.upper() for name in _build_provider_env_blocklist())
+    except ImportError:
+        return lambda name: True
+
+    def protected(name: str) -> bool:
+        return (
+            _is_hermes_internal_secret(name, bws_token_env=config_policy.bws_token_env)
+            or _is_blocked_provider_env(name, blocked_names=blocked)
+        )
+
+    return protected
+
+
 def _load_config_passthrough(
     profile_home: str | os.PathLike[str] | None = None,
+    *,
+    config_policy: LaunchConfigPolicy | None = None,
+    is_protected: Callable[[str], bool] | None = None,
 ) -> frozenset[str]:
     """Load the active profile's ``terminal.env_passthrough`` exactly now.
 
-    ``read_raw_config`` already maintains a path-and-file-identity cache. A
-    second process-global cache here loses the profile identity and lets the
-    first routed profile authorize later siblings, so this layer deliberately
-    reloads through the canonical profile-aware config owner on every call.
+    Launch callers supply the typed config projection and compiled predicate.
+    Standalone callers resolve them fresh through the canonical owners.
     """
     global _config_passthrough
-    result: set[str] = set()
-    try:
-        from hermes_cli.config import read_raw_config, read_user_config_raw
+    if config_policy is None:
+        from hermes_cli.config import read_launch_config_policy
 
-        cfg = (
-            read_user_config_raw(Path(profile_home) / "config.yaml")
-            if profile_home is not None
-            else read_raw_config()
-        )
-        passthrough = cfg_get(cfg, "terminal", "env_passthrough")
-        if isinstance(passthrough, list):
-            for item in passthrough:
-                if not isinstance(item, str) or not item.strip():
-                    continue
-                name = item.strip()
-                # Mirror the skill-path filter in register_env_passthrough:
-                # Hermes-managed provider credentials must not be passed
-                # through to execute_code / terminal children, regardless of
-                # whether the request came from a skill or from config.yaml.
-                # See GHSA-rhgp-j443-p4rf.
-                if _is_hermes_provider_credential(name):
-                    logger.warning(
-                        "env passthrough: refusing to register Hermes "
-                        "provider credential %r from config.yaml (blocked "
-                        "by _HERMES_PROVIDER_ENV_BLOCKLIST). Operator "
-                        "configuration must not override the execute_code "
-                        "sandbox's credential scrubbing; see "
-                        "GHSA-rhgp-j443-p4rf.",
-                        name,
-                    )
-                    continue
-                result.add(name)
-    except Exception as e:
-        logger.debug("Could not read tools.env_passthrough from config: %s", e)
-
-    _config_passthrough = frozenset(result)
-    return _config_passthrough
+        config_policy = read_launch_config_policy(profile_home)
+    if is_protected is None:
+        is_protected = _compile_protected(config_policy)
+    result = frozenset(
+        name for name in config_policy.passthrough_names if not is_protected(name)
+    )
+    _config_passthrough = result
+    return result
 
 
 def is_env_passthrough(
@@ -187,17 +184,28 @@ def is_env_passthrough(
     Returns ``True`` if the variable was registered by a skill or listed in
     the user's ``tools.env_passthrough`` config.
     """
-    if var_name in _get_allowed():
-        return True
-    return var_name in _load_config_passthrough(profile_home)
+    return var_name in get_all_passthrough(profile_home=profile_home)
 
 
 def get_all_passthrough(
     *,
     profile_home: str | os.PathLike[str] | None = None,
+    config_policy: LaunchConfigPolicy | None = None,
+    is_protected: Callable[[str], bool] | None = None,
 ) -> frozenset[str]:
     """Return the union of skill-registered and config-based passthrough vars."""
-    return frozenset(_get_allowed()) | _load_config_passthrough(profile_home)
+    if config_policy is None:
+        from hermes_cli.config import read_launch_config_policy
+
+        config_policy = read_launch_config_policy(profile_home)
+    if is_protected is None:
+        is_protected = _compile_protected(config_policy)
+    configured = _load_config_passthrough(
+        profile_home, config_policy=config_policy, is_protected=is_protected,
+    )
+    allowed = frozenset(_get_allowed())
+    allowed = frozenset(name for name in allowed if not is_protected(name))
+    return allowed | configured
 
 
 def resolve_passthrough_value(

@@ -14,7 +14,6 @@ import { DEFAULT_REASONING_EFFORT } from '@/lib/reasoning-effort'
 import { cn } from '@/lib/utils'
 import { activeGatewayConnectionId, requestGatewayForAgent } from '@/store/gateway'
 import { $modelPresets, applyModelPreset, modelPresetKey, setModelPreset } from '@/store/model-presets'
-import { $visibleModels } from '@/store/model-visibility'
 import {
   $defaultReasoningEffort,
   getComposerModelSelection,
@@ -89,7 +88,6 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
   const currentReasoningEffort = useStore(view.$reasoningEffort)
   const modelPresets = useStore($modelPresets)
   const defaultEffort = useStore($defaultReasoningEffort) || DEFAULT_REASONING_EFFORT
-  const visibleModels = useStore($visibleModels)
   const touchesPrimary = view.kind === 'primary'
 
   // Subscribe to the SAME query the menu runs (identical key ⇒ React Query

@@ -161,6 +161,6 @@ describe('the catalog owns model curation', () => {
 
     fireEvent.click(screen.getByText('Edit Models…'))
 
-    expect($modelVisibilityOpen.get()).toBe(true)
+    expect($modelVisibilityOpen.get()).toEqual({ connectionId: null, profile: 'default', sessionId: null })
   })
 })

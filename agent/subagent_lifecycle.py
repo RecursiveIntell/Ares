@@ -18,7 +18,7 @@ import secrets
 import threading
 import time
 from contextlib import contextmanager
-from concurrent.futures import Future, TimeoutError
+from concurrent.futures import Future, wait
 from typing import Any, Callable, Mapping, Optional
 
 from agent.interrupt_compat import request_hard_interrupt
@@ -92,6 +92,8 @@ class SubagentStatus:
     state: SubagentState
     updated_at: float
     diagnostic: Optional[str] = None
+    cleanup_state: str = 'complete'
+    capacity_occupied: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -266,7 +268,9 @@ class SubagentLifecycleService:
                 handle, SubagentState.UNKNOWN, time.time(), "UNKNOWN_HANDLE"
             )
         with _REGISTRY.lock:
-            return SubagentStatus(record.handle, record.state, record.updated_at)
+            cleanup = getattr(record.agent, '_delegate_cleanup_state', 'complete') if record.agent is not None else 'complete'
+            return SubagentStatus(record.handle, record.state, record.updated_at,
+                cleanup_state=cleanup, capacity_occupied=cleanup != 'complete' or record.result is None)
 
     def wait(
         self, handle: SubagentHandle, *, timeout_seconds: Optional[float] = None
@@ -279,9 +283,10 @@ class SubagentLifecycleService:
         future = record.future
         if future is not None:
             try:
-                future.result(timeout=timeout_seconds)
-            except TimeoutError:
-                return SubagentTerminalState(record.handle, record.state, False, True)
+                completed, _ = wait({future}, timeout=timeout_seconds)
+                if future not in completed:
+                    return SubagentTerminalState(record.handle, record.state, False, True)
+                future.result()
             except Exception:
                 pass
         with _REGISTRY.lock:
@@ -294,7 +299,9 @@ class SubagentLifecycleService:
         if record is None:
             return SubagentCancelResult(False, unknown_handle=True)
         with _REGISTRY.lock:
-            if record.result is not None:
+            if record.result is not None and (
+                record.agent is None or getattr(record.agent, '_delegate_cleanup_state', 'complete') == 'complete'
+            ):
                 return SubagentCancelResult(
                     False, already_terminal=True, state=record.state
                 )
@@ -396,6 +403,7 @@ class SubagentLifecycleService:
             subagent_id
             for subagent_id, record in _REGISTRY.records.items()
             if record.result is not None
+            and (record.agent is None or getattr(record.agent, '_delegate_cleanup_state', 'complete') == 'complete')
             and record.completed_at is not None
             and record.completed_at < cutoff
         ]
@@ -448,7 +456,8 @@ class SubagentLifecycleService:
                 if isinstance(raw, dict)
                 else {},
                 tool_execution_summary={
-                    "duration_seconds": raw.get("duration_seconds", 0)
+                    "duration_seconds": raw.get("duration_seconds", 0),
+                    "cleanup": raw.get('cleanup', {}),
                 }
                 if isinstance(raw, dict)
                 else {},
@@ -472,7 +481,8 @@ class SubagentLifecycleService:
             ).hexdigest(),
         )
         with _REGISTRY.lock:
-            record.agent = None
+            if getattr(record.agent, '_delegate_cleanup_state', 'complete') == 'complete':
+                record.agent = None
             record.result = result
             record.state = result.terminal_state
             record.completed_at = result.completed_at

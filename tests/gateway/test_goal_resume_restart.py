@@ -1,7 +1,7 @@
 """#75362 — /goal resume must restart work, not just flip persisted state.
 
-After a goal auto-pauses on turn-budget exhaustion, each surface's
-``resume`` handler must schedule exactly one canonical
+Bare resume preserves exhausted budgets and schedules no turn. For an
+eligible goal, each surface uses the canonical
 ``GoalManager.next_continuation_prompt()`` turn through that surface's
 existing input path:
 
@@ -87,27 +87,17 @@ def _make_cli(session_id: str):
 
 
 class TestCliResumeRestartsWork:
-    def test_resume_after_budget_exhaustion_queues_continuation(self, hermes_home):
+    def test_bare_resume_keeps_exhausted_budget_paused(self, hermes_home):
         sid = f"sid-cli-resume-{uuid.uuid4().hex}"
         cli = _make_cli(sid)
         _exhaust_budget(sid)
 
         cli._handle_goal_command("goal resume")
 
-        assert not cli._pending_input.empty(), (
-            "/goal resume must queue the continuation prompt on _pending_input "
-            "— otherwise the goal sits idle until the user types something"
-        )
-        queued = cli._pending_input.get_nowait()
-        assert queued.text.startswith("[Continuing toward your standing goal]")
-        assert queued.display_kind == "internal_notification"
-        assert queued.display_metadata == {
-            "synthetic_source": "goal_continuation",
-        }
-
+        assert cli._pending_input.empty(), "bare resume cannot mint extra budget"
         state = goals.GoalManager(sid).state
-        assert state.status == "active"
-        assert state.turns_used == 1, "resume preserves the cumulative goal budget"
+        assert state.status == "paused"
+        assert state.turns_used == 1
 
     def test_resume_without_goal_queues_nothing(self, hermes_home):
         sid = f"sid-cli-noresume-{uuid.uuid4().hex}"
@@ -155,6 +145,11 @@ def _make_runner() -> tuple[GatewayRunner, _FakeAdapter]:
     adapter = _FakeAdapter()
     runner.adapters = {Platform.DISCORD: adapter}
     runner._queued_events = {}
+    # Real manager/SQLite behind the actual command adapter. Runtime session
+    # lookup/executor lifetime is a separate gateway integration gate.
+    async def manager_for_event(event):
+        return goals.GoalManager(_GW_SID), runner.session_store.entry
+    runner._get_goal_manager_for_event = manager_for_event
     return runner, adapter
 
 
@@ -174,7 +169,7 @@ def _resume_event() -> MessageEvent:
 
 class TestGatewayResumeRestartsWork:
     @pytest.mark.asyncio
-    async def test_resume_after_budget_exhaustion_enqueues_continuation(
+    async def test_bare_resume_keeps_exhausted_budget_paused(
         self, hermes_home
     ):
         runner, adapter = _make_runner()
@@ -183,19 +178,10 @@ class TestGatewayResumeRestartsWork:
         response = await GatewayRunner._handle_goal_command(runner, _resume_event())
 
         assert "resume" in response.lower() or "Goal" in response
-        pending = adapter._pending_messages.get(_GW_KEY)
-        assert pending is not None, (
-            "/goal resume must enqueue the continuation on the adapter FIFO "
-            "— otherwise the goal sits idle until the next real user message"
-        )
-        assert pending.text.startswith("[Continuing toward your standing goal]")
-        # The pause/clear stale-work guard must recognize the queued turn as
-        # a synthetic goal continuation so it can be cleaned up on /goal pause.
-        assert GatewayRunner._is_goal_continuation_event(pending)
-
+        assert adapter._pending_messages == {}, "bare resume cannot mint extra budget"
         state = goals.GoalManager(_GW_SID).state
-        assert state.status == "active"
-        assert state.turns_used == 1, "resume preserves the cumulative goal budget"
+        assert state.status == "paused"
+        assert state.turns_used == 1
 
     @pytest.mark.asyncio
     async def test_resume_without_goal_enqueues_nothing(self, hermes_home):
@@ -203,5 +189,20 @@ class TestGatewayResumeRestartsWork:
 
         response = await GatewayRunner._handle_goal_command(runner, _resume_event())
 
-        assert "No goal to resume" in response
+        assert "No goal" in response
         assert adapter._pending_messages == {}
+
+
+@pytest.mark.asyncio
+async def test_eligible_gateway_resume_enqueues_exact_checkpoint(hermes_home):
+    runner,adapter=_make_runner()
+    goals._get_session_db().create_session(_GW_SID, source='discord')
+    manager=goals.GoalManager(_GW_SID); manager.set('approved work'); manager.pause()
+    await GatewayRunner._handle_goal_command(runner, _resume_event())
+    pending=adapter._pending_messages[_GW_KEY]
+    current=goals.GoalManager(_GW_SID).state
+    assert pending.metadata['goal_continuation'] == {
+        'goal_id':current.goal_id, 'checkpoint_revision':current.checkpoint_revision,
+        'continuation_token':current.continuation_token}
+    assert pending.internal is True
+    assert current.turns_used == 0

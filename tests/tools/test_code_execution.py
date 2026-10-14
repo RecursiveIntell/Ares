@@ -158,12 +158,14 @@ class TestExecuteCodeRemoteTempDir(unittest.TestCase):
                 self.commands.append((command, cwd, timeout))
                 if "command -v python3" in command:
                     return {"output": "OK\n"}
-                if "python3 script.py" in command:
+                if "python3 -u script.py" in command:
                     return {"output": "hello\n", "returncode": 0}
                 return {"output": ""}
 
         env = FakeEnv()
         fake_thread = MagicMock()
+        fake_thread.name = "test-sandbox-rpc"
+        fake_thread.is_alive.return_value = False
 
         with patch("tools.code_execution_tool._load_config", return_value={"timeout": 30, "max_tool_calls": 5}), \
              patch("tools.code_execution_tool._get_or_create_env", return_value=(env, "ssh")), \
@@ -176,7 +178,7 @@ class TestExecuteCodeRemoteTempDir(unittest.TestCase):
         self.assertFalse(result["stdout_truncated"])
         self.assertEqual(result["stdout_bytes_total"], len("hello\n".encode("utf-8")))
         mkdir_cmd = env.commands[1][0]
-        run_cmd = next(cmd for cmd, _, _ in env.commands if "python3 script.py" in cmd)
+        run_cmd = next(cmd for cmd, _, _ in env.commands if "python3 -u script.py" in cmd)
         cleanup_cmd = env.commands[-1][0]
         self.assertIn("mkdir -p /data/data/com.termux/files/usr/tmp/hermes_exec_", mkdir_cmd)
         self.assertIn("HERMES_RPC_DIR=/data/data/com.termux/files/usr/tmp/hermes_exec_", run_cmd)
@@ -196,12 +198,14 @@ class TestExecuteCodeRemoteTempDir(unittest.TestCase):
                 self.commands.append((command, cwd, timeout))
                 if "command -v python3" in command:
                     return {"output": "OK\n"}
-                if "python3 script.py" in command:
+                if "python3 -u script.py" in command:
                     return {"output": "hello\n", "returncode": 0}
                 return {"output": ""}
 
         env = FakeEnv()
         fake_thread = MagicMock()
+        fake_thread.name = "test-sandbox-rpc"
+        fake_thread.is_alive.return_value = False
 
         malicious_tz = "US/Eastern; echo PWNED"
 
@@ -216,7 +220,7 @@ class TestExecuteCodeRemoteTempDir(unittest.TestCase):
             result = json.loads(_execute_remote("print('hello')", "task-1", ["terminal"]))
 
         self.assertEqual(result["status"], "success")
-        run_cmd = next(cmd for cmd, _, _ in env.commands if "python3 script.py" in cmd)
+        run_cmd = next(cmd for cmd, _, _ in env.commands if "python3 -u script.py" in cmd)
         # The TZ value must be shell-quoted — it should NOT contain unescaped semicolons
         self.assertNotIn("TZ=US/Eastern; echo PWNED", run_cmd,
                          "TZ value with shell metacharacters must not appear unquoted")
@@ -769,11 +773,13 @@ class TestHeadTailTruncation(unittest.TestCase):
                 self.commands.append((command, cwd, timeout))
                 if "command -v python3" in command:
                     return {"output": "OK\n"}
-                if "python3 script.py" in command:
+                if "python3 -u script.py" in command:
                     return {"output": "HEAD\n" + ("x" * 80_000) + "\nTAIL\n", "returncode": 0}
                 return {"output": ""}
 
         fake_thread = MagicMock()
+        fake_thread.name = "test-sandbox-rpc"
+        fake_thread.is_alive.return_value = False
 
         with patch("tools.code_execution_tool._load_config", return_value={"timeout": 30, "max_tool_calls": 5}), \
              patch("tools.code_execution_tool._get_or_create_env", return_value=(FakeEnv(), "ssh")), \

@@ -32,6 +32,7 @@ import logging
 import socket
 import threading
 import time
+import uuid
 from typing import Any
 
 from tui_gateway import server
@@ -106,6 +107,9 @@ class WSTransport:
         #: never populate this: it is the only identity authority for
         #: browser-controller registration.
         self.auth_identity = auth_identity
+        # Server-observed socket occurrence, not a client connection label or
+        # authorization token. A reconnect always creates a distinct epoch.
+        self._input_epoch = str(uuid.uuid4())
         self._closed = False
         self._last_inbound_at = time.monotonic()
         # Token-coalescing buffer (CF-2). Streamed token frames land here and a
@@ -120,6 +124,10 @@ class WSTransport:
         # writes need an async boundary because several batches can be queued on
         # the owning loop while it recovers from a stall.
         self._send_lock = asyncio.Lock()
+
+    @property
+    def input_epoch(self) -> str:
+        return self._input_epoch
 
     @property
     def closed(self) -> bool:

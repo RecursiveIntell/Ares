@@ -162,6 +162,7 @@ _clarify_request_owners: dict[str, tuple[str, object | None]] = {}
 _clarify_response_receipts: dict[str, tuple[float, tuple[str, object | None], dict[str, str], tuple[str, str] | None]] = {}
 _activation_host_owner = contextvars.ContextVar("activation_host_owner", default=None)
 _activation_attachment_check = contextvars.ContextVar("activation_attachment_check", default=None)
+_pdf_attachment_check = contextvars.ContextVar("pdf_attachment_check", default=None)
 _host_clarify_expected_generation = contextvars.ContextVar("host_clarify_expected_generation", default=None)
 _db = None
 _db_error: str | None = None
@@ -809,7 +810,114 @@ def _is_gateway_owned_source(source: str) -> bool:
         return False
 
 
+# Detached records retain their exact resources while canonical owners settle.
+_retiring_sessions: dict[int, dict] = {}
+
+
+def _session_cleanup_unsettled(session: dict) -> bool:
+    agent = session.get("agent")
+    thread = session.get("_run_thread")
+    if session.get("running"):
+        return True
+    if thread is not None and thread is not threading.current_thread():
+        # A replaced/missing liveness witness is uncertainty, not settlement.
+        try:
+            probe = getattr(thread, "is_alive", None)
+            if not callable(probe) or probe() is not False:
+                return True
+        except Exception:
+            return True
+    if (session.get("_compute_host_active_request_id") or session.get("_host_delivery_uncertain")
+            or session.get("_stop_pending") or session.get("_stop_uncertain")):
+        return True
+    if agent is None:
+        return False
+    owned = getattr(type(agent), "_has_owned_tool_work", None) or vars(agent).get("_has_owned_tool_work")
+    if callable(owned) and agent._has_owned_tool_work():
+        return True
+    from tools.delegate_tool import _owned_subagent_supervisors
+    retained, _ = _owned_subagent_supervisors(vars(agent).get("session_id"))
+    if retained:
+        return True
+    from agent.run_checkpoint_custody import TurnRunCustody
+    return bool(vars(agent).get("_active_session_turn_lease_holder")
+        and not isinstance(vars(agent).get("_run_checkpoint_custody"), TurnRunCustody))
+
+
+def _defer_session_close(session: dict, end_reason: str, *, teardown: bool = False) -> None:
+    """Stop the admitted owner; observe settlement without blocking the caller."""
+    with session.get("history_lock") or _sessions_lock:
+        session["_run_checkpoint_finalize_deferred"] = end_reason
+        if teardown:
+            session["_run_checkpoint_teardown_deferred"] = end_reason
+        if session.get("_close_settlement_thread") is not None:
+            return
+        _retiring_sessions[id(session)] = session
+        def settle():
+            wake = threading.Event()
+            try:
+                while _session_cleanup_unsettled(session):
+                    wake.wait(0.1)
+                with session.get("history_lock") or _sessions_lock:
+                    close_reason = session.get("_run_checkpoint_teardown_deferred")
+                    final_reason = session.get("_run_checkpoint_finalize_deferred", end_reason)
+                if close_reason:
+                    _teardown_session(session, end_reason=close_reason)
+                else:
+                    _finalize_session(session, end_reason=final_reason)
+                if not session.get("_close_cleanup_error"):
+                    _retiring_sessions.pop(id(session), None)
+            except Exception as exc:
+                session["_close_cleanup_error"] = str(exc)
+                logger.exception("Session close settlement requires reconciliation")
+        # Settlement must stay off the close caller, like the usage ticker.
+        thread = _RealThread(target=settle,
+            name=f"session-close-{session.get('_sid') or session.get('session_key')}", daemon=True)
+        session["_close_settlement_thread"] = thread
+    try:
+        sid = session.get("_sid") or next((key for key, value in _sessions.items() if value is session), None)
+        if sid:
+            _interrupt_session_turn(sid, session)
+        else:
+            from agent.interrupt_compat import request_hard_interrupt
+            request_hard_interrupt(session.get("agent"))
+    except Exception as exc:
+        session["_close_stop_error"] = str(exc)
+        logger.exception("Session close Stop requires reconciliation")
+    agent = session.get("agent")
+    if agent is not None and callable(getattr(type(agent), "close", None)):
+        from tools.delegate_tool import _owned_subagent_supervisors
+        retained, _ = _owned_subagent_supervisors(vars(agent).get("session_id"))
+        if retained:
+            try:
+                agent.close()
+            except Exception as exc:
+                session["_close_cleanup_error"] = str(exc)
+                logger.exception("Owned child close requires reconciliation")
+    try:
+        thread.start()
+    except Exception as exc:
+        with session.get("history_lock") or _sessions_lock:
+            # Retain the exact resource owner. Only a provably unstarted
+            # supervisor may lose its latch for a later explicit close attempt.
+            session["_close_supervision_error"] = str(exc)
+            if (session.get("_close_settlement_thread") is thread
+                    and thread.ident is None and not thread.is_alive()):
+                session.pop("_close_settlement_thread", None)
+        logger.exception("Session settlement supervisor did not start; owner retained")
+    else:
+        with session.get("history_lock") or _sessions_lock:
+            session.pop("_close_supervision_error", None)
+
+
 def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> None:
+    if not session:
+        return
+    with session.setdefault("_close_lock", threading.RLock()):
+        _finalize_session_owned(session, end_reason)
+
+
+def _finalize_session_owned(session: dict, end_reason: str) -> None:
     """Best-effort finalize hook + memory commit for a session.
 
     Fires ``on_session_end`` plugin hook and attempts to persist any
@@ -818,40 +926,13 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     force-quit (double Ctrl‑C, terminal‑close, SIGHUP) while the agent
     is mid‑turn.
     """
-    if not session or session.get("_finalized"):
+    if not session or session.get("_finalized") or session.get("_close_cleanup_error"):
         return
-    from agent.run_checkpoint_custody import TurnRunCustody
-    agent = session.get("agent")
-    custody = getattr(agent, "_run_checkpoint_custody", None)
     with session.get("history_lock") or _sessions_lock:
-        holder = getattr(agent, "_active_session_turn_lease_holder", None)
-        run_thread = session.get("_run_thread")
-        defer_custody = (isinstance(custody, TurnRunCustody) and holder and
-            (session.get("running") or (run_thread is not None and run_thread.is_alive())))
-        if defer_custody:
-            session["_run_checkpoint_finalize_deferred"] = end_reason
-    if defer_custody:
-        # Never release custody, close relay scopes or finalize native session
-        # state underneath a live owning turn. Its finally is the release owner.
-        with _sessions_lock:
-            sid = session.get("_sid") or next((key for key, value in _sessions.items() if value is session), None)
-        if sid:
-            _interrupt_session_turn(sid, session)
-        else:
-            from agent.interrupt_compat import request_hard_interrupt
-            request_hard_interrupt(agent)
+        unsettled = _session_cleanup_unsettled(session)
+    if unsettled:
+        _defer_session_close(session, end_reason)
         return
-    session.pop("_run_checkpoint_finalize_deferred", None)
-    session["_finalized"] = True
-    history_ready = session.get("resume_history_ready")
-    if history_ready is not None and not history_ready.is_set():
-        session["resume_history_error"] = "session resume cancelled"
-        history_ready.set()
-    _release_active_session_slot(session)
-    stop_event = session.get("_notif_stop")
-    if stop_event is not None:
-        stop_event.set()
-
     agent = session.get("agent")
     from agent.run_checkpoint_custody import TurnRunCustody
     custody = getattr(agent, "_run_checkpoint_custody", None)
@@ -860,6 +941,18 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
         if errors:
             session["_run_checkpoint_cleanup_errors"] = errors
             logger.error("Run checkpoint finalization requires reconciliation: %s", errors)
+            session["_close_cleanup_error"] = "checkpoint retirement unconfirmed"
+            _retiring_sessions[id(session)] = session
+            return
+    session.pop("_run_checkpoint_finalize_deferred", None)
+    # A prior supervisor-start failure is no longer unresolved once the
+    # canonical finalizer has independently witnessed settlement above.
+    session.pop("_close_supervision_error", None)
+    history_ready = session.get("resume_history_ready")
+    if history_ready is not None and not history_ready.is_set():
+        session["resume_history_error"] = "session resume cancelled"
+        history_ready.set()
+    agent = session.get("agent")
     lock = session.get("history_lock")
     if lock is not None:
         with lock:
@@ -883,8 +976,16 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
         if snapshot:
             try:
                 agent._persist_session(snapshot)
-            except Exception:
-                pass
+            except Exception as exc:
+                session["_close_cleanup_error"] = str(exc)
+                _retiring_sessions[id(session)] = session
+                logger.exception("Session tail persistence requires reconciliation")
+                return
+    session["_finalized"] = True
+    _release_active_session_slot(session)
+    stop_event = session.get("_notif_stop")
+    if stop_event is not None:
+        stop_event.set()
 
     # ── Plugin hook: on_session_end ────────────────────────────────────
     # Signals every plugin that the session is closing, with
@@ -1022,6 +1123,13 @@ def _announce_session_reclaimed(session: dict, end_reason: str) -> None:
 
 
 def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") -> None:
+    if not session:
+        return
+    with session.setdefault("_close_lock", threading.RLock()):
+        _teardown_session_owned(session, end_reason=end_reason)
+
+
+def _teardown_session_owned(session: dict, *, end_reason: str) -> None:
     """Fully tear down a session: finalize, unregister, close agent + worker.
 
     Shared by ``session.close`` and the orphaned-WS-session reaper. The
@@ -1031,11 +1139,16 @@ def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") ->
     ``_finalize_session`` and the ``poll()`` guard in ``_SlashWorker.close``
     make repeat calls harmless.
     """
-    if not session:
+    if not session or session.get("_teardown_complete"):
+        return
+    with session.get("history_lock") or _sessions_lock:
+        unsettled = _session_cleanup_unsettled(session)
+    if unsettled:
+        _defer_session_close(session, end_reason, teardown=True)
         return
     _finalize_session(session, end_reason=end_reason)
     with session.get("history_lock") or _sessions_lock:
-        if session.get("_run_checkpoint_finalize_deferred"):
+        if not session.get("_finalized") or session.get("_run_checkpoint_finalize_deferred"):
             session["_run_checkpoint_teardown_deferred"] = end_reason
             return
     _announce_session_reclaimed(session, end_reason)
@@ -1053,8 +1166,16 @@ def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") ->
         agent = session.get("agent")
         if agent is not None and hasattr(agent, "close"):
             agent.close()
-    except Exception:
-        pass
+            if getattr(agent, "_close_cleanup_state", None) == "incomplete":
+                session["_close_cleanup_error"] = "agent retained unresolved owned resources"
+                _retiring_sessions[id(session)] = session
+                return
+    except Exception as exc:
+        session["_close_cleanup_error"] = str(exc)
+        _retiring_sessions[id(session)] = session
+        logger.exception("Session resource close requires reconciliation")
+        return
+    session["_teardown_complete"] = True
     # NOTE: the slash-worker is closed inside _finalize_session (the single
     # _finalized-guarded chokepoint that main folded it into), exactly once.
     # We deliberately do NOT re-close it here — _teardown_session's job beyond
@@ -1102,6 +1223,8 @@ def _teardown_popped_session(
     """Finish a close after the caller has atomically detached the session."""
     if session is None:
         return False
+    if _session_cleanup_unsettled(session):
+        _defer_session_close(session, end_reason, teardown=True)
     run_thread = session.get("_run_thread")
     if (
         end_reason != "tui_shutdown"
@@ -1396,7 +1519,8 @@ def _interrupt_owned_compute_host_turn(sid: str, session: dict, request_id: str 
                     and terminal.get("request_id") == previous["target_request_id"]
                     and terminal.get("sid") == sid
                     and terminal.get("_host_boot_id") == previous.get("host_boot_id")
-                    and terminal.get("type") in {"turn.end", "turn.error"}):
+                    and terminal.get("type") in {"turn.end", "turn.error"}
+                    and terminal.get("outcome") != "unknown"):
                 # Recover ONLY the original operation. SQLite serializes this
                 # against a delayed child writer; neither can take a second cut.
                 scope = {"session_key": previous["session_key"], "profile_home": previous["profile_home"],
@@ -1592,7 +1716,7 @@ def _interrupt_session_turn(
             return True
         with session["history_lock"]:
             target_request_id = session.get("_compute_host_active_request_id")
-        if should_interrupt or target_request_id:
+        if target_request_id or (should_interrupt and not session.get("_goal_generation")):
             _get_compute_host_supervisor().interrupt(
                 sid, request_id=request_id,
                 **({"target_request_id": target_request_id} if target_request_id else {}),
@@ -2844,6 +2968,14 @@ def _turn_outcomes_snapshot(sid, session):
 
 
 def _emit(event: str, sid: str, payload: dict | None = None):
+    if event == "status.update" and payload and payload.get("kind") == "goal":
+        try:
+            from hermes_cli.goals import GoalManager
+            owner = _sessions.get(sid)
+            if owner:
+                payload = {**payload, "goal": GoalManager(str(owner.get("session_key") or "")).projection()}
+        except Exception:
+            pass
     # Serialize lifecycle projections for one record without retaining the
     # history lock across transport I/O. A successor start therefore follows
     # a prior idle write, or makes that idle snapshot stale before publication.
@@ -3096,6 +3228,7 @@ def _compute_host_turn_frame(
     queued_prompt_generation: int | None = None,
     display_kind: str | None = None,
     context_input_event_id: str | None = None,
+    display_metadata: dict | None = None,
 ) -> dict:
     with session["history_lock"]:
         history = list(session.get("history", []))
@@ -3112,6 +3245,7 @@ def _compute_host_turn_frame(
         "session_key": session.get("session_key") or sid,
         "text": text,
         **({"display_kind": display_kind} if display_kind else {}),
+        **({"display_metadata": display_metadata} if display_metadata else {}),
         **({"context_input_event_id": context_input_event_id} if context_input_event_id is not None else {}),
         "history": history,
         "history_version": history_version,
@@ -3187,8 +3321,22 @@ def _apply_compute_host_metadata_mirror(session: dict, frame: dict | None) -> bo
 def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -> None:
     is_error = frame.get("type") == "turn.error"
     with _sessions_lock:
-        if _sessions.get(sid) is not session:
+        if _sessions.get(sid) is not session and _retiring_sessions.get(id(session)) is not session:
             return
+    if session.get("_closing") and _retiring_sessions.get(id(session)) is session:
+        with session["history_lock"]:
+            owner = session.get("_compute_host_active_request_id")
+            window = session.get("_turn_outcomes")
+            turn = window.find(owner) if isinstance(window, TurnOutcomeWindow) else None
+            boot = (turn or {}).get("accepted_turn", {}).get("host_boot_id")
+            if (owner and frame.get("request_id") == owner and frame.get("sid") == sid
+                    and frame.get("type") in {"turn.end", "turn.error"}
+                    and frame.get("outcome") != "unknown" and boot
+                    and frame.get("_host_boot_id") == boot):
+                session["running"] = False
+                session.pop("_compute_host_active_request_id", None)
+                session.pop("_host_delivery_uncertain", None)
+        return
     with session["history_lock"]:
         if session.get("_closing"):
             # The close/re-adoption owner detached this record while the
@@ -3266,7 +3414,19 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
         session.pop("_compute_host_active_request_id", None)
         session.pop("_compute_host_settling_request_id", None)
         session.pop("_compute_host_terminal", None)
-        session.pop("_host_delivery_uncertain", None)
+        if frame.get("outcome") == "unknown":
+            session["_host_delivery_uncertain"] = True
+        else:
+            session.pop("_host_delivery_uncertain", None)
+        binding = session.get("_goal_generation")
+        if binding and frame.get("execution_started") is False and _goal_generation_current(session, binding):
+            from hermes_cli.goals import GoalManager
+            manager = GoalManager(str(session.get("session_key") or ""))
+            manager.checkpoint_recovery("HOST_ADMISSION_NOT_STARTED",
+                metadata={"continuation": binding, "receipt_request_id": owner})
+        session.pop("_goal_generation", None)
+        session.pop("_goal_generation_transport", None)
+        session.pop("_goal_generation_dispatched", None)
     if session.get("_closing"):
         return
     _drain_queued_prompt(rid, sid, session)
@@ -3281,6 +3441,7 @@ def _submit_prompt_to_compute_host(
     queued_prompt_generation: int | None = None,
     display_kind: str | None = None,
     context_input_event_id: str | None = None,
+    display_metadata: dict | None = None,
 ) -> dict:
     from tui_gateway.host_supervisor import HostSendNotSent
 
@@ -3296,6 +3457,7 @@ def _submit_prompt_to_compute_host(
         image_paths=image_paths,
         queued_prompt_generation=queued_prompt_generation,
         display_kind=display_kind,
+        display_metadata=display_metadata,
         context_input_event_id=context_input_event_id,
     )
     supervisor = _get_compute_host_supervisor(cfg)
@@ -3319,8 +3481,14 @@ def _submit_prompt_to_compute_host(
                 or session.get("_closing") or session.get("_turn_cancel_requested")):
             return _err(rid, 4009, "queued prompt claim invalidated before host admission",
                         {"delivery": "stale_claim"})
+        binding = (display_metadata or {}).get("goal_continuation")
+        if binding and (not _goal_generation_current(session, binding)
+                or session.get("_goal_generation") != binding
+                or "_goal_generation_transport" not in session
+                or session["_goal_generation_transport"] is not session.get("transport")):
+            return _err(rid, 4009, "goal generation revoked before host admission", {"delivery": "stale_claim"})
         if (session.get("_compute_host_active_request_id") or session.get("_stop_pending")
-                or session.get("_stop_uncertain")):
+                or session.get("_stop_uncertain") or session.get("_host_delivery_uncertain")):
             return _err(rid, 4009, "compute-host request or Stop settlement still owns session",
                         {"delivery": "owner_busy"})
         session["_compute_host_active_request_id"] = host_request_id
@@ -3746,6 +3914,69 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
             return normalized
 
         _rid, method, _params = normalized
+        if method == "pdf.attach":
+            # Capture the exact owner before queuing costly conversion. Stop
+            # invalidates this generation but does not falsely settle the worker.
+            sid = str(_params.get("session_id") or "")
+            reservation = object()
+            deadline = time.monotonic() + 25.0
+            with _sessions_lock:
+                record = _sessions.get(sid)
+                if record is None or record.get("_closing") or record.get("_finalized"):
+                    return _err(_rid, 4001, "session not found")
+                with record.get("history_lock") or contextlib.nullcontext():
+                    if record.get("_pdf_attachment_pending") is not None:
+                        return _err(_rid, 4009, "PDF attachment already pending")
+                    owner_transport = record.get("transport")
+                    if owner_transport is not t:
+                        return _err(_rid, 4001, "PDF attachment transport is not the session owner")
+                    identity = (record.get("session_key"), record.get("profile_home"),
+                                record.get("_queued_prompt_generation", 0))
+                    record["_pdf_attachment_pending"] = reservation
+            ctx = contextvars.copy_context()
+
+            def pdf_current():
+                # Callers serialize publication with the existing session locks.
+                return (_sessions.get(sid) is record
+                        and not record.get("_closing") and not record.get("_finalized")
+                        and record.get("transport") is owner_transport
+                        and (record.get("session_key"), record.get("profile_home"),
+                             record.get("_queued_prompt_generation", 0)) == identity
+                        and record.get("_pdf_attachment_pending") is reservation)
+
+            def release_pdf():
+                with _sessions_lock:
+                    if record.get("_pdf_attachment_pending") is reservation:
+                        record.pop("_pdf_attachment_pending", None)
+
+            def run_pdf():
+                owner_token = _current_runtime_session_record.set(record)
+                check_token = _pdf_attachment_check.set(pdf_current)
+                try:
+                    with _sessions_lock:
+                        with record.get("history_lock") or contextlib.nullcontext():
+                            current = pdf_current()
+                    if not current:
+                        resp = _err(_rid, 4001, "PDF attachment owner changed; conversion not started")
+                    elif time.monotonic() >= deadline:
+                        resp = _err(_rid, 4009, "PDF attachment expired before conversion")
+                    else:
+                        resp = handle_request(req)
+                except Exception as exc:
+                    resp = _err(_rid, -32000, f"PDF attachment handler error: {exc}")
+                finally:
+                    _pdf_attachment_check.reset(check_token)
+                    _current_runtime_session_record.reset(owner_token)
+                    release_pdf()
+                if resp is not None:
+                    t.write(resp)
+
+            try:
+                _pool.submit(lambda: ctx.run(run_pdf))
+            except Exception:
+                release_pdf()
+                return _err(_rid, 4009, "PDF attachment worker unavailable; conversion not started")
+            return None
         if (method == "config.set" and _params.get("key") in {"model", "reasoning", "fast", "runtime_options"}
                 and _params.get("session_id") and _params.get("scope") != "global"):
             # These handlers may wait for the host or durable storage. Never
@@ -11464,14 +11695,64 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
     return {"attempt": attempt, "interrupted_at": marker["started_at"]}
 
 
-def _accept_tui_context_input(session, text, *, event_id=None, display_kind=None):
+def _observe_desktop_input_origin(session, db, key):
+    """Observe a live server-owned binding; callers hold history_lock.
+
+    Epochs identify occurrences, not permissions. No RPC field or Python object
+    address is persisted as identity. The session binding is process-local and
+    cannot restore authorization after a restart.
+    """
+    from hermes_state_continuity import ContextContinuationError
+    from hermes_state_input_media import desktop_input_origin
+    from tui_gateway.ws import WSTransport
+
+    transport = current_transport()
+    runtime_ids = [sid for sid, live in list(_sessions.items()) if live is session]
+    if (len(runtime_ids) != 1 or not isinstance(transport, WSTransport)
+            or transport.closed or session.get("transport") is not transport):
+        raise ContextContinuationError("CONTEXT_INPUT_ORIGIN_OWNER_UNAVAILABLE")
+    if session.get("profile_home") and Path(db.db_path).resolve() != (
+            Path(session["profile_home"]) / "state.db").resolve():
+        raise ContextContinuationError("CONTEXT_INPUT_STORE_MISMATCH")
+    owner = session.get("agent")
+    binding = session.get("_desktop_input_owner_binding")
+    if (binding is None or binding[0] is not session or binding[1] is not owner
+            or binding[2] != key):
+        binding = (session, owner, key, str(uuid.uuid4()))
+        session["_desktop_input_owner_binding"] = binding
+    with db._read_ctx() as conn:
+        root, profile = db._context_input_scope_on_conn(conn, key)
+        control = db._context_input_stop_cut_on_conn(conn, root, require_sequence_cut=True)
+    return desktop_input_origin({"schema": "SessionDBDesktopInputOriginV1", "connection_id": None,
+        "runtime_session_id": runtime_ids[0], "stored_session_id": key, "profile_name": profile,
+        "owner_epoch": binding[3], "transport_epoch": transport.input_epoch,
+        "stop_revision": 0 if control is None else control["revision"]})
+
+
+def _desktop_input_recovery_origin(session, db, key, receipt):
+    """Original occurrence plus current binding, never an origin rewrite."""
+    from hermes_state_continuity import ContextContinuationError
+    original = db.read_context_input_origin(key, receipt)
+    if original is None:
+        raise ContextContinuationError("CONTEXT_INPUT_ORIGIN_MISSING")
+    if original["schema"] != "SessionDBDesktopInputOriginV1":
+        raise ContextContinuationError("CONTEXT_INPUT_ORIGIN_INVALID")
+    current = _observe_desktop_input_origin(session, db, key)
+    if original["profile_name"] != current["profile_name"]:
+        raise ContextContinuationError("CONTEXT_INPUT_SCOPE_MISMATCH")
+    return original
+
+
+def _accept_tui_context_input(session, text, *, event_id=None, display_kind=None, manual_recovery=False):
     """Commit authentic input before the RPC acknowledges a queued submission."""
     if display_kind:
         return None
-    agent = session.get("agent")
+    agent = None if _session_uses_compute_host(session) else session.get("agent")
     if agent is not None:
         owner = getattr(agent, "_session_db", None)
         selected = getattr(agent, "context_rebase_enabled", False) is True
+        if manual_recovery and not selected:
+            raise RuntimeError("CONTEXT_INPUT_MANUAL_RECOVERY_UNSUPPORTED")
         if not selected:
             check = getattr(type(owner), "context_dispatch_required_for_session", None)
             if not callable(check) or not check(owner, getattr(agent, "session_id", None) or session.get("session_key")):
@@ -11504,8 +11785,26 @@ def _accept_tui_context_input(session, text, *, event_id=None, display_kind=None
             raise ContextContinuationError("CONTEXT_INPUT_TEXT_ROUTE_REQUIRED")
         _ensure_session_db_row(session)
         source = str(getattr(agent, "platform", None) or _session_source(session))
+        if manual_recovery:
+            receipt = db.read_context_input(key, source=source, event_id=event_id)
+            work = db.read_context_input_work(key)
+            phase = work["phase"]
+            if (receipt is None or receipt not in work["receipts"] or receipt.content != text
+                    or phase and phase.get("dispatch_attempts")
+                    or session.get("running") or session.get("_turn_cancel_requested")
+                    or session.get("_stop_pending") or session.get("_stop_uncertain")
+                    or session.get("_host_delivery_uncertain") or session.get("_compute_host_active_request_id")):
+                raise ContextContinuationError("CONTEXT_INPUT_MANUAL_RECOVERY_UNSAFE")
+            if source == "desktop":
+                _desktop_input_recovery_origin(session, db, key, receipt)
+            # Manual readback returns the exact historical receipt. Calling
+            # acceptance with current origin would collide after reconnect or
+            # backfill evidence that never belonged to this occurrence.
+            return receipt
+        origin = _observe_desktop_input_origin(session, db, key) if source == "desktop" else None
         return db.accept_context_input(key, source=source,
-            event_id=event_id if event_id is not None else str(uuid.uuid4()), content=text)
+            event_id=event_id if event_id is not None else str(uuid.uuid4()), content=text,
+            **({"desktop_origin": origin} if origin is not None else {}))
     finally:
         if owns_db and db is not None:
             db.close()
@@ -14529,6 +14828,97 @@ _GOAL_COMPRESSION_RECOVERY_ATTEMPTS = "_goal_compression_recovery_attempts"
 _GOAL_COMPRESSION_RECOVERY_LIMIT = 1
 
 
+def _dispatch_goal_continuation(rid, sid, session, *, expected=None) -> bool:
+    """Reserve, take the runtime slot, CAS-consume, then render for dispatch."""
+    host_owned = _session_uses_compute_host(session)
+    from hermes_cli.goals import GoalManager
+    mgr = GoalManager(str(session.get("session_key") or ""))
+    if not mgr.claim_continuation(f"desktop:{sid}:{uuid.uuid4()}"):
+        return False
+    state = mgr.state
+    binding = {"goal_id": state.goal_id, "checkpoint_revision": state.checkpoint_revision,
+               "continuation_token": state.continuation_token}
+    admitted = False
+    dispatched = False
+    try:
+        if expected is not None and expected != binding:
+            return False
+        with session["history_lock"]:
+            if (_sessions.get(sid) is not session or session.get("running")
+                    or session.get("_turn_cancel_requested") or session.get("_closing")
+                    or session.get("_stop_pending") or session.get("_stop_uncertain")
+                    or session.get("_compute_host_active_request_id")):
+                return False
+            generation = int(session.get("_queued_prompt_generation", 0))
+            transport = session.get("transport")
+            if not mgr.start_continuation(expected_goal_id=binding["goal_id"],
+                    expected_checkpoint_revision=binding["checkpoint_revision"],
+                    expected_continuation_token=binding["continuation_token"]):
+                return False
+            session["running"] = True
+            session["_goal_generation"] = binding
+            session["_goal_generation_transport"] = transport
+            admitted = True
+        # No queued string carries authority. Rendering uses the consumed state.
+        prompt = mgr.next_continuation_prompt()
+        if not prompt:
+            return False
+        with session["history_lock"]:
+            if (_sessions.get(sid) is not session or session.get("_closing")
+                    or session.get("transport") is not transport
+                    or int(session.get("_queued_prompt_generation", 0)) != generation
+                    or session.get("_turn_cancel_requested") or not _goal_generation_current(session, binding)):
+                return False
+        if host_owned:
+            # CAS consumption now owns the generation. Release the scheduler
+            # lock before sending so an immediately completed native turn can
+            # reserve its own newer checkpoint within this accepted host chain.
+            mgr.release_continuation(queued=False)
+            result = _submit_prompt_to_compute_host(rid, sid, session, prompt,
+                queued_prompt_generation=generation, display_kind="internal_notification",
+                display_metadata={"synthetic_source": "goal_continuation", "goal_continuation": binding})
+            # A partially offered frame retains the consumed admission. It can
+            # only be reconciled by its exact boot/request receipt, never replay.
+            dispatched = "error" not in result or (result["error"].get("data") or {}).get("delivery") == "uncertain"
+            return dispatched
+        dispatched = _run_prompt_submit(rid, sid, session, prompt, display_kind="internal_notification",
+            display_metadata={"synthetic_source": "goal_continuation", "goal_continuation": binding}) is not False
+        return dispatched
+    finally:
+        mgr.release_continuation(queued=False)
+        if admitted and not dispatched:
+            with session["history_lock"]:
+                if _sessions.get(sid) is session and session.get("_goal_generation") == binding:
+                    session["running"] = False
+                    session.pop("_goal_generation", None)
+                    session.pop("_goal_generation_transport", None)
+                    session.pop("_goal_generation_dispatched", None)
+
+
+def _goal_generation_current(session, binding) -> bool:
+    from hermes_cli.goals import GoalManager
+    mgr = GoalManager(str(session.get("session_key") or ""))
+    state = mgr.state
+    return bool(state and mgr._auto_eligible(state, admitted=True) and not state.continuation_pending
+        and state.goal_id == binding.get("goal_id")
+        and state.checkpoint_revision == binding.get("checkpoint_revision")
+        and state.continuation_token == binding.get("continuation_token"))
+
+
+def _cancel_goal_generation(session) -> None:
+    """Cancel only a generation admitted by this goal adapter."""
+    with session["history_lock"]:
+        if not session.get("_goal_generation"):
+            return
+        session["_turn_cancel_requested"] = True
+        agent = session.get("agent")
+    sid = session.get("_sid") or next((key for key, value in _sessions.items() if value is session), None)
+    if sid and _session_uses_compute_host(session):
+        _interrupt_session_turn(sid, session)
+    elif agent is not None and callable(getattr(agent, "interrupt", None)):
+        agent.interrupt()
+
+
 def _is_successful_goal_turn(result: Any, status: str, raw: Any) -> bool:
     """Return whether a turn produced a real response the goal judge can use."""
     return bool(
@@ -14546,6 +14936,7 @@ def _plan_goal_compression_recovery(
     *,
     status: str,
     raw: Any,
+    binding_out: dict | None = None,
 ) -> tuple[str | None, str | None]:
     """Plan a bounded active-goal retry after compression exhaustion.
 
@@ -14586,6 +14977,7 @@ def _plan_goal_compression_recovery(
         return None, None
 
     metadata = {
+        "continuation": session.get("_goal_generation") or {},
         "failure_fingerprint": "CONTEXT_COMPRESSION_EXHAUSTED",
         "session_id": sid_key,
         "goal_created_at": float(getattr(goal_mgr.state, "created_at", 0.0) or 0.0),
@@ -14598,6 +14990,10 @@ def _plan_goal_compression_recovery(
     if recovery.get("should_continue"):
         continuation_prompt = recovery.get("continuation_prompt")
         if continuation_prompt:
+            if binding_out is not None:
+                state = goal_mgr.state
+                binding_out.update(goal_id=state.goal_id, checkpoint_revision=state.checkpoint_revision,
+                                   continuation_token=state.continuation_token)
             return (
                 continuation_prompt,
                 "Context compression was exhausted. Retrying the active goal once from its durable recovery checkpoint.",
@@ -15165,6 +15561,50 @@ def _run_prompt_submit(
                 if "persist_user_event_id" not in _run_params:
                     raise RuntimeError("CONTEXT_INPUT_READER_UNSUPPORTED")
                 run_kwargs["persist_user_event_id"] = context_input_event_id
+                input_db = getattr(agent, "_session_db", None)
+                source = str(getattr(agent, "platform", None) or _session_source(session))
+                receipt = input_db.read_context_input(agent.session_id,
+                    source=source, event_id=context_input_event_id) if source == "desktop" else None
+                if source == "desktop":
+                    if receipt is None:
+                        raise RuntimeError("CONTEXT_INPUT_RECEIPT_MISSING")
+                    origin = input_db.read_context_input_origin(agent.session_id, receipt)
+                    if origin is None or origin["schema"] != "SessionDBDesktopInputOriginV1":
+                        raise RuntimeError("CONTEXT_INPUT_ORIGIN_MISSING")
+                    if not {"persist_user_input_receipt", "persist_user_input_authorizer"} <= set(_run_params):
+                        raise RuntimeError("CONTEXT_INPUT_READER_UNSUPPORTED")
+                    if source != "desktop" or receipt.content != text:
+                        raise RuntimeError("CONTEXT_INPUT_RECEIPT_MISMATCH")
+                    def authorize_input(stored_key, receipts):
+                        # Recheck the existing live execution owner, never
+                        # promote the stored epoch into a permission token.
+                        with session["history_lock"]:
+                            if (_sessions.get(sid) is not session or session.get("agent") is not agent
+                                    or not owns_admission() or not session.get("running")
+                                    or session.get("_closing") or session.get("_finalized")
+                                    or session.get("_turn_cancel_requested")
+                                    or session.get("_stop_pending") or session.get("_stop_uncertain")
+                                    or session.get("transport") is not admission_owner_transport):
+                                return False
+                            if _inside_compute_host_child():
+                                from tui_gateway.compute_host import _HostTransport
+                                if (not isinstance(admission_transport, _HostTransport) or execution is None
+                                        or execution[2] != session.get("_host_turn_request_id")):
+                                    return False
+                            else:
+                                from tui_gateway.ws import WSTransport
+                                if (not isinstance(admission_transport, WSTransport) or admission_transport.closed
+                                        or admission_transport is not admission_owner_transport):
+                                    return False
+                            for accepted in receipts:
+                                origin = input_db.read_context_input_origin(stored_key, accepted)
+                                if (accepted.source != "desktop" or origin is None
+                                        or origin["schema"] != "SessionDBDesktopInputOriginV1"
+                                        or origin["profile_name"] != accepted.profile_name):
+                                    return False
+                            return True
+                    run_kwargs["persist_user_input_receipt"] = receipt
+                    run_kwargs["persist_user_input_authorizer"] = authorize_input
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
@@ -15190,6 +15630,12 @@ def _run_prompt_submit(
             agent._route_turn_token = _route_turn_token
             _usage_stop, _usage_thread = _start_usage_ticker(sid, agent)
             try:
+                binding = (display_metadata or {}).get("goal_continuation")
+                if binding:
+                    with session["history_lock"]:
+                        if not owns_admission() or session.get("_turn_cancel_requested") or not _goal_generation_current(session, binding):
+                            return False
+                        session["_goal_generation_dispatched"] = binding
                 result = agent.run_conversation(run_message, **run_kwargs)
             finally:
                 if getattr(agent, "_route_turn_token", None) is _route_turn_token:
@@ -15549,12 +15995,16 @@ def _run_prompt_submit(
             compression_exhausted = bool(
                 isinstance(result, dict) and result.get("compression_exhausted")
             )
+            goal_origin = (display_metadata or {}).get("synthetic_source")
+            unrelated_notification = display_kind in {"internal_notification", "async_delegation_complete"} and goal_origin != "goal_continuation"
+            recovery_binding = {}
             try:
-                recovery_prompt, recovery_notice = _plan_goal_compression_recovery(
+                recovery_prompt, recovery_notice = (None, None) if unrelated_notification else _plan_goal_compression_recovery(
                     session,
                     result,
                     status=status,
                     raw=raw,
+                    binding_out=recovery_binding,
                 )
                 if recovery_notice:
                     _emit(
@@ -15563,7 +16013,7 @@ def _run_prompt_submit(
                         {"kind": "goal", "text": recovery_notice},
                     )
                 if recovery_prompt:
-                    goal_followup = recovery_prompt
+                    goal_followup = recovery_binding or None
             except Exception as _goal_recovery_exc:
                 print(
                     f"[tui_gateway] goal compression recovery failed: "
@@ -15573,7 +16023,7 @@ def _run_prompt_submit(
 
             # Compression failures are never judge input: the error text is
             # not work toward the goal, and evaluating it would spend a turn.
-            if not compression_exhausted and _is_successful_goal_turn(
+            if not unrelated_notification and not compression_exhausted and _is_successful_goal_turn(
                 result, status, raw
             ):
                 try:
@@ -15598,7 +16048,8 @@ def _run_prompt_submit(
                                 _bg_procs = None
                             decision = goal_mgr.evaluate_after_turn(
                                 raw,
-                                user_initiated=True,
+                                user_initiated=display_kind != "internal_notification",
+                                turn_metadata={"continuation": (display_metadata or {}).get("goal_continuation") or {}},
                                 background_processes=_bg_procs,
                             )
                             verdict_msg = decision.get("message") or ""
@@ -15611,7 +16062,9 @@ def _run_prompt_submit(
                             if decision.get("should_continue"):
                                 cont_prompt = decision.get("continuation_prompt") or ""
                                 if cont_prompt:
-                                    goal_followup = cont_prompt
+                                    state = goal_mgr.state
+                                    goal_followup = {"goal_id": state.goal_id, "checkpoint_revision": state.checkpoint_revision,
+                                                     "continuation_token": state.continuation_token}
                 except Exception as _goal_exc:
                     print(
                         f"[tui_gateway] goal continuation hook failed: "
@@ -15912,6 +16365,13 @@ def _run_prompt_submit(
         if isinstance(_leftover_steer, str) and _leftover_steer.strip():
             with session["history_lock"]:
                 _enqueue_prompt(session, _leftover_steer, session.get("transport"))
+        with session["history_lock"]:
+            binding = (display_metadata or {}).get("goal_continuation")
+            if binding and session.get("_goal_generation") == binding:
+                session.pop("_goal_generation", None)
+                session.pop("_goal_generation_transport", None)
+                session.pop("_goal_generation_dispatched", None)
+
         if _drain_queued_prompt(rid, sid, session):
             return
 
@@ -15922,27 +16382,10 @@ def _run_prompt_submit(
         # prompt.submit sets running=True under the history_lock and
         # we check that guard before re-firing.
         if goal_followup:
-            with session["history_lock"]:
-                if session.get("running"):
-                    # User already sent something — their turn wins,
-                    # the judge will re-run on the next turn anyway.
-                    return
-                session["running"] = True
             try:
-                _emit("message.start", sid)
-                _run_prompt_submit(
-                    rid, sid, session, goal_followup,
-                    display_kind="internal_notification",
-                    display_metadata={"synthetic_source": "goal_continuation"},
-                )
-            except Exception as _cont_exc:
-                print(
-                    f"[tui_gateway] goal continuation dispatch failed: "
-                    f"{type(_cont_exc).__name__}: {_cont_exc}",
-                    file=sys.stderr,
-                )
-                with session["history_lock"]:
-                    session["running"] = False
+                _dispatch_goal_continuation(rid, sid, session, expected=goal_followup)
+            except Exception as exc:
+                logger.warning("Goal continuation dispatch unconfirmed: %s", exc)
 
         # Drain completion notifications that arrived during this turn.
         # The background poller handles between-turn delivery; this is
@@ -16129,7 +16572,35 @@ def _session_images_dir(session: dict) -> Path:
     return base / "images"
 
 
-def _queue_attached_image(session: dict, img_bytes: bytes, ext: str, *, prefix: str) -> Path:
+def _new_staged_attachment_path(root: Path, filename: str) -> Path:
+    """Reserve an occurrence namespace, not a canonical input identity.
+
+    Native clipboard fallbacks can unlink/recreate their leaf, so isolation
+    belongs to the private directory as well as exclusive byte-file creation.
+    These mutable stages are not native input receipts or durability ACKs.
+    """
+    import tempfile
+
+    root.mkdir(parents=True, exist_ok=True)
+    directory = Path(tempfile.mkdtemp(prefix="stage-", dir=root))
+    return directory / filename
+
+
+def _discard_staged_attachment(path: Path) -> None:
+    """Discard only a newly allocated operation leaf and its empty directory."""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        logger.debug("Unable to discard failed attachment leaf", exc_info=True)
+    try:
+        path.parent.rmdir()
+    except OSError:
+        # Never recursively delete a directory containing other/unknown data.
+        logger.debug("Failed attachment staging directory retained", exc_info=True)
+
+
+def _queue_attached_image(session: dict, img_bytes: bytes, ext: str, *, prefix: str,
+                          queue: bool = True) -> Path:
     """Write image bytes into the gateway's images dir and queue them.
 
     Mirrors what ``image.attach`` does for a local path: appends to
@@ -16138,15 +16609,20 @@ def _queue_attached_image(session: dict, img_bytes: bytes, ext: str, *, prefix: 
     """
     session["image_counter"] = session.get("image_counter", 0) + 1
     img_dir = _session_images_dir(session)
-    img_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    img_path = img_dir / f"{prefix}_{ts}_{session['image_counter']}{ext}"
+    img_path = None
     try:
-        img_path.write_bytes(img_bytes)
-    except Exception:
+        img_path = _new_staged_attachment_path(img_dir, f"{prefix}_{ts}_{session['image_counter']}{ext}")
+        with img_path.open("xb") as output:
+            output.write(img_bytes)
+    except BaseException:
+        if img_path is not None:
+            _discard_staged_attachment(img_path)
         session["image_counter"] = max(0, session["image_counter"] - 1)
         raise
-    session.setdefault("attached_images", []).append(str(img_path))
+    if queue:
+        with session.get("history_lock") or contextlib.nullcontext():
+            session.setdefault("attached_images", []).append(str(img_path))
     return img_path
 
 
@@ -16210,20 +16686,6 @@ def _sanitize_attachment_name(name: str) -> str:
     candidate = _re.sub(r"[\x00-\x1f]+", "_", candidate)
     candidate = candidate.strip().strip(".")
     return candidate or "attachment"
-
-
-def _unique_attachment_path(root: Path, filename: str) -> Path:
-    candidate = root / filename
-    if not candidate.exists():
-        return candidate
-    stem = Path(filename).stem or "attachment"
-    suffix = Path(filename).suffix
-    counter = 2
-    while True:
-        next_candidate = root / f"{stem}-{counter}{suffix}"
-        if not next_candidate.exists():
-            return next_candidate
-        counter += 1
 
 
 def _resolve_gateway_attachment_path(raw: str) -> Path | None:
@@ -16302,8 +16764,13 @@ def _stage_session_file_attachment(
         filename = _sanitize_attachment_name(name or Path(str(raw_path or "")).name)
 
     upload_dir = _desktop_attachment_dir(session)
-    target = _unique_attachment_path(upload_dir, _sanitize_attachment_name(filename))
-    target.write_bytes(payload)
+    target = _new_staged_attachment_path(upload_dir, _sanitize_attachment_name(filename))
+    try:
+        with target.open("xb") as output:
+            output.write(payload)
+    except BaseException:
+        _discard_staged_attachment(target)
+        raise
     return target.resolve(), True
 
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextvars
 import json
+import errno
 
 from tui_gateway.checkpoint_json import load_checkpoint_frame
 import logging
@@ -90,7 +91,8 @@ def append_log_record(path: str | Path, record: str) -> None:
     data = text.encode("utf-8", errors="replace")
     fd = os.open(str(p), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
-        os.write(fd, data)
+        if os.write(fd, data) != len(data):
+            raise OSError(errno.EIO, 'compute-host receipt write was incomplete')
     finally:
         os.close(fd)
 
@@ -326,6 +328,8 @@ class HostSupervisor:
         except Exception:
             self._terminate_process(proc)
         finally:
+            self._fail_pending_turns(reason='shutdown_unknown',
+                message='Compute host shut down; unfinished effects require reconciliation')
             self._remove_registry()
 
     def reconcile_startup_orphan(self) -> str:
@@ -1215,7 +1219,14 @@ class HostSupervisor:
                 "_host_boot_id": boot,
                 "reason": reason,
                 "message": message,
+                "outcome": "unknown",
             }
+            try:
+                append_log_record(self.registry_path.with_name('dashboard-compute-host-outcomes.jsonl'),
+                    json.dumps({'boot_id': boot, 'sid': sid, 'request_id': request_id,
+                        'classification': 'HOST_PROCESS_LOST', 'reason': reason, 'outcome': 'unknown'}))
+            except OSError:
+                logger.exception('Compute host uncertainty receipt could not be persisted')
             try:
                 self.rpc_sink(
                     {

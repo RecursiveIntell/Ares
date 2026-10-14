@@ -29,6 +29,7 @@ import { $previewStatusBySession, dismissPreviewArtifact } from '@/store/preview
 import { $threadScrolledUp } from '@/store/thread-scroll'
 import { openSessionInNewWindow } from '@/store/windows'
 
+import { GoalControls } from './goal-controls'
 import { PreviewStatusRow } from './preview-row'
 import { StatusItemRow } from './status-row'
 
@@ -53,6 +54,13 @@ const GROUP_ICON: Record<StatusGroup['type'], string> = {
 const groupLabel = (group: StatusGroup, s: Translations['statusStack']) => {
   if (group.type === 'goal') {
     const status = group.items[0]?.goalStatus
+
+    if (status === 'blocked') {
+      return s.goalBlocked
+    }
+    if (status === 'awaiting_input') {
+      return s.goalAwaitingInput
+    }
 
     return status === 'paused'
       ? s.goalPaused
@@ -162,7 +170,9 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
       node: (
         <StatusSection
           accessory={
-            group.type === 'subagent' ? (
+            group.type === 'goal' && sessionId ? (
+              <GoalControls sessionId={sessionId} />
+            ) : group.type === 'subagent' ? (
               <Tip label={<TipKeybindLabel actionId="nav.agents" text={t.statusStack.agents} />}>
                 <Button
                   className="text-muted-foreground/75 hover:text-foreground/90"

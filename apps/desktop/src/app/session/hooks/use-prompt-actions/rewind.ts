@@ -28,8 +28,7 @@ import {
   visibleUserIndexAtOrdinal,
   visibleUserMessageIndices,
   visibleUserOrdinal,
-  withSessionBusyRetry,
-  withSessionNotFoundResume
+  withSessionBusyRetry
 } from './utils'
 
 type RequestGateway = <T = unknown>(method: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<T>
@@ -277,7 +276,8 @@ export async function runRewindSubmit(
 ): Promise<SurvivorUserRowIds | undefined> {
   // Recovery may rebind the live id mid-flight; interrupt/submit must both
   // follow it rather than pinning the dead one.
-  let liveSessionId = sessionId
+  const liveSessionId = sessionId
+  const inputEventId = crypto.randomUUID()
 
   // A truncation without a durable address is the #87059 shape: the gateway
   // fails it closed (4004) for any persisted session, so sending it can only
@@ -337,6 +337,7 @@ export async function runRewindSubmit(
       'prompt.submit',
       {
         session_id: targetId,
+        input_event_id: inputEventId,
         text,
         ...truncateSubmitParams(resolvedOrdinal, resolvedMessageId, resolvedRowId),
         // A first-turn rewind resolves to an empty transcript, which the
@@ -355,24 +356,7 @@ export async function runRewindSubmit(
       PROMPT_SUBMIT_REQUEST_TIMEOUT_MS
     )
 
-  const submit = async () => {
-    const { result, sessionId: usedId } = await withSessionNotFoundResume(
-      liveSessionId,
-      recovery?.storedSessionId,
-      submitFor,
-      {
-        requestGateway,
-        onRecovered: recoveredId => {
-          liveSessionId = recoveredId
-          recovery?.onSessionRecovered?.(recoveredId)
-        }
-      }
-    )
-
-    liveSessionId = usedId
-
-    return survivorRowIdsFrom(result)
-  }
+  const submit = async () => survivorRowIdsFrom(await submitFor(liveSessionId))
 
   if (interruptFirst) {
     await interrupt()

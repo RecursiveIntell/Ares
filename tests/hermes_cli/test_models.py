@@ -1344,7 +1344,9 @@ class TestLocalOllamaModelDiscovery:
                 return_value={"ollama": {"fp": "same", "at": 0, "models": ["stale:model"]}},
             ), patch.object(models, "_save_provider_models_cache"), patch.object(
                 models, "_credential_fingerprint", return_value="same"
-            ), patch.object(models, "provider_model_ids", return_value=[]), patch.object(
+            ), patch.object(models, "provider_model_ids", return_value=models.CatalogModelIds(
+                [], source="live", freshness="fresh", authoritative=True,
+                updated_at=models.time.time())), patch.object(
                 models, "_get_ollama_base_url", return_value=base_url
             ), patch.object(models, "_get_ollama_request_headers", return_value={}):
                 assert models.cached_provider_model_ids("ollama") == []

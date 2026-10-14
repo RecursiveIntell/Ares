@@ -26,7 +26,7 @@ const TODO_GLYPHS: Record<Exclude<TodoStatus, 'in_progress' | 'pending'>, { icon
 // (green = done, red = failed) so the slot is always filled and rows align.
 function leadingGlyph(item: ComposerStatusItem, s: Translations['statusStack']): ReactNode {
   if (item.type === 'goal') {
-    if (item.goalStatus === 'paused') {
+    if (['paused', 'blocked', 'awaiting_input', 'waiting'].includes(item.goalStatus ?? '')) {
       return <Codicon className="text-muted-foreground/60" name="debug-pause" size="0.8rem" />
     }
 

@@ -215,50 +215,12 @@ def build_models_payload(
             rows, ctx, current_only=True
         )
 
-    # --- Deduplicate: remove models from aggregators that overlap with
-    # user-defined providers.  When a local proxy (e.g. litellm-proxy)
-    # serves a model whose name also appears in an aggregator's curated
-    # catalog, the picker would show the model under both providers.
-    # Selecting it from the aggregator row sets model.provider to the
-    # aggregator (e.g. openrouter) instead of the user's proxy — silently
-    # breaking the call.  Filtering at the payload level keeps the
-    # aggregator rows honest: they only show models the user can't get
-    # from a more-specific provider.  (#45954)
-    try:
-        from hermes_cli.providers import is_routing_aggregator as _is_routing_aggregator
-    except Exception:
-        _is_routing_aggregator = None  # type: ignore[assignment]
-
-    if _is_routing_aggregator is not None:
-        user_models: set[str] = set()
-        for row in rows:
-            if row.get("is_user_defined"):
-                user_models.update(m.lower() for m in (row.get("models") or []))
-        if user_models:
-            for row in rows:
-                # A user's own configured provider is never an "aggregator
-                # duplicate" of itself: user_models is built from these very
-                # rows, and is_routing_aggregator() reports True for every
-                # custom:* slug.  Without this guard the dedup strips a
-                # user-defined custom provider's entire model list (all of it
-                # lives in user_models), emptying its picker row.
-                if row.get("is_user_defined"):
-                    continue
-                slug = row.get("slug", "")
-                # Only strip overlaps from TRUE routing aggregators (OpenRouter,
-                # custom:* proxies). Flat-namespace resellers (opencode-go /
-                # opencode-zen) serve every listed model as a first-party model,
-                # so their rows must keep models that a user's proxy happens to
-                # share a name with — otherwise a subscription provider's own
-                # catalog (minimax-m3, glm-5, deepseek-v4-flash, ...) is silently
-                # gutted in the picker. (#47077)
-                if not _is_routing_aggregator(slug):
-                    continue
-                original = row.get("models") or []
-                filtered = [m for m in original if m.lower() not in user_models]
-                if len(filtered) < len(original):
-                    row["models"] = filtered
-                    row["total_models"] = len(filtered)
+    # Model IDs are opaque and route-specific. An identically named model on
+    # a user's proxy does not replace the aggregator's independent route.
+    for row in rows:
+        status = getattr(row.get("models"), "catalog_status", None)
+        if status is not None:
+            row["catalog_status"] = dict(status)
 
     if include_unconfigured:
         rows = list(rows) + [r for r in _append_unconfigured_rows(rows, ctx) if str(r.get("slug", "")).lower() != "moa"]
@@ -293,8 +255,7 @@ def build_model_options_payload(
     This wraps ``build_models_payload`` with the stable picker shape and the
     safe custom-provider probe policy used for normal GUI/TUI opens:
 
-    - normal open: probe only the current custom provider so offline saved
-      endpoints do not block the picker
+    - normal open: use configured/cached custom catalogs without live probes
     - explicit refresh: probe every custom provider while busting the model
       cache so live catalogs repopulate fully
     """
@@ -310,7 +271,7 @@ def build_model_options_payload(
         featured=True,
         refresh=refresh,
         probe_custom_providers=refresh,
-        probe_current_custom_provider=not refresh,
+        probe_current_custom_provider=False,
     )
 
 
@@ -512,8 +473,8 @@ def _apply_featured(rows: list[dict]) -> None:
     vendor segment of a ``vendor/model`` id), ranked by models.dev
     ``release_date`` among that row's OWN models — never against the current
     date, so the choice is stable as models age. Same-date ties (and labs whose
-    models lack a date) fall back to the row's curated order, which is already
-    flagship-first, so a lab keeps its headliners rather than an arbitrary slice.
+    models lack a date) use opaque ID order, so refreshing/reordering the
+    catalog cannot change shortlist membership.
 
     Derived live from the models.dev catalog already loaded on this path (same
     source as pricing/capabilities) — there is no hand-maintained allowlist to
@@ -534,11 +495,8 @@ def _apply_featured(rows: list[dict]) -> None:
         by_lab: dict[str, list[tuple[int, str, str]]] = {}
         for pos, model in enumerate(models):
             lab = model.split("/", 1)[0] if "/" in model else ""
-            if not lab:
-                # No vendor prefix → single-namespace provider, not an
-                # aggregator. Bail on the whole row (see below).
-                by_lab = {}
-                break
+            # Bare IDs are an unknown namespace, not evidence that prefixed
+            # entries have lost their vendor. Never invent a vendor/alias.
             date = ""
             if get_model_info is not None:
                 info = get_model_info(slug, model) or get_model_info("openrouter", model)
@@ -552,10 +510,10 @@ def _apply_featured(rows: list[dict]) -> None:
 
         featured: list[str] = []
         for entries in by_lab.values():
-            # Newest release_date first; earlier list position breaks ties and
-            # is the sole key when a lab has no dated models (all ""). Keep the
-            # newest _FEATURED_PER_LAB of each lab.
-            ranked = sorted(entries, key=lambda e: (e[1], -e[0]), reverse=True)
+            # Release date descending; opaque IDs break ties independently
+            # of catalog reorder. Bare IDs retain an unknown-namespace group.
+            ranked = sorted(entries, key=lambda e: e[2])
+            ranked.sort(key=lambda e: e[1], reverse=True)
             featured.extend(model for _pos, _date, model in ranked[:_FEATURED_PER_LAB])
         # Preserve the row's model order for stable rendering.
         order = {m: i for i, m in enumerate(models)}

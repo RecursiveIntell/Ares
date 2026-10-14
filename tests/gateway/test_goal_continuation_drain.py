@@ -18,6 +18,7 @@ silently stalling goal loops on messaging gateways.
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -139,6 +140,28 @@ async def test_fifo_enqueued_continuation_is_drained_without_new_user_message():
             break
         await asyncio.sleep(0.05)
     assert key not in adapter._active_sessions
+    # Active-session release precedes the adapter task's final cleanup. Drain
+    # its actual owner before pytest tears down the loop; bulk loop cancellation
+    # can race the typing-task shield in that finally.
+    tasks = list(adapter._background_tasks)
+    if tasks:
+        done, pending = await asyncio.wait(tasks, timeout=5)
+        assert not pending, [(str(task), task.get_stack()) for task in pending]
+    await adapter.cancel_background_tasks()
+    print('Settled adapter task census:',
+          [(str(task), [(f.f_code.co_filename, f.f_lineno) for f in task.get_stack()])
+           for task in asyncio.all_tasks()])
+    # The typing refresh is owned by the adapter but is separate from its
+    # message task set. Settle that exact coroutine before loop shutdown.
+    owned = [task for task in asyncio.all_tasks()
+             if task is not asyncio.current_task()
+             and getattr(task.get_coro(), 'cr_frame', None) is not None
+             and task.get_coro().cr_frame.f_locals.get('self') is adapter]
+    for task in owned:
+        task.cancel()
+    if owned:
+        _, pending = await asyncio.wait(owned, timeout=5)
+        assert not pending, [(str(task), task.get_stack()) for task in pending]
 
 
 @pytest.mark.asyncio
@@ -267,7 +290,7 @@ async def test_generation_scoped_continuation_consumes_only_its_checkpoint(herme
 
 
 @pytest.mark.asyncio
-async def test_turn_start_rejects_checkpoint_corrupted_after_enqueue(hermes_home):
+async def test_turn_start_rejects_checkpoint_corrupted_after_enqueue(hermes_home, monkeypatch):
     """Matching FIFO identity cannot bypass the canonical checkpoint check."""
     from gateway.run import GatewayRunner
     from hermes_cli import goals
@@ -302,7 +325,55 @@ async def test_turn_start_rejects_checkpoint_corrupted_after_enqueue(hermes_home
         metadata={"goal_continuation": identity},
     )
     runner = object.__new__(GatewayRunner)
+    writes = []
+    original_cas = db.compare_and_set_meta
+    def record_cas(key, expected, replacement):
+        result = original_cas(key, expected, replacement)
+        writes.append((key, expected, replacement, result))
+        return result
+    monkeypatch.setattr(db, "compare_and_set_meta", record_cas)
     assert await runner._consume_goal_continuation_at_turn_start(
         event, SimpleNamespace(session_id=session_id)
     ) is False
-    assert db.get_meta(goals._meta_key(session_id)) == before
+    after_raw = db.get_meta(goals._meta_key(session_id))
+    before_state, after_state = json.loads(before), json.loads(after_raw)
+    # Canonical load owns this one conditional conservative migration; a
+    # rejected adapter consume may not charge, repair identity, or mint work.
+    assert writes == [(goals._meta_key(session_id), before, after_raw, True)]
+    assert after_state["status"] == "paused"
+    assert after_state["outcome"] == goals.EXECUTION_FAILED
+    assert after_state["continuation_pending"] is False
+    assert after_state["migration"]["load_parked"] == "unknown or contradictory checkpoint"
+    allowed_migration_fields = {"status", "outcome", "continuation_pending", "migration"}
+    assert {k: v for k, v in after_state.items() if k not in allowed_migration_fields} == {
+        k: v for k, v in before_state.items() if k not in allowed_migration_fields
+    }
+    assert after_state["checkpoint"]["goal_id"] == "foreign-goal"
+    assert await runner._consume_goal_continuation_at_turn_start(
+        event, SimpleNamespace(session_id=session_id)
+    ) is False
+    assert db.get_meta(goals._meta_key(session_id)) == after_raw
+    assert len(writes) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('cut', ['pause', 'clear'])
+async def test_goal_revoked_after_consume_before_render_is_not_dispatched(hermes_home, monkeypatch, cut):
+    from gateway.run import GatewayRunner
+    from hermes_cli import goals
+    sid = 'goal-postconsume-' + cut
+    goals._get_session_db().create_session(sid, source='slack')
+    mgr = goals.GoalManager(sid)
+    mgr.set('authorized step')
+    mgr.checkpoint_recovery('RETRYABLE_FAILURE')
+    binding = {'goal_id': mgr.state.goal_id, 'checkpoint_revision': mgr.state.checkpoint_revision,
+               'continuation_token': mgr.state.continuation_token}
+    original = goals.GoalManager.next_continuation_prompt
+    def render(self):
+        getattr(goals.GoalManager(sid), cut)()
+        return original(self)
+    monkeypatch.setattr(goals.GoalManager, 'next_continuation_prompt', render)
+    event = MessageEvent(text='cached prose', source=_slack_thread_source(), internal=True,
+                         metadata={'goal_continuation': binding})
+    assert not await GatewayRunner._consume_goal_continuation_at_turn_start(
+        object.__new__(GatewayRunner), event, SimpleNamespace(session_id=sid))

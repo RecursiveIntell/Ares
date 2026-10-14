@@ -649,6 +649,167 @@ def _call(tool_name, args):
 _TERMINAL_BLOCKED_PARAMS = {"background", "pty", "notify", "notify_on_complete", "watch_patterns"}
 
 
+# Settlement is a separate budget from the script and per-RPC budgets. It
+# bounds our wait, not a promise that arbitrary synchronous Python has stopped.
+_RPC_SETTLEMENT_SECONDS = 0.5
+
+
+class _SandboxExecution:
+    """Accounting held by the existing RPC thread until it actually exits.
+
+    No executor, global client teardown, DB writes or completion callbacks.
+    A result receives detached snapshots; late returns cannot rewrite it.
+    Callers seeing cleanup-incomplete must keep their session resources alive
+    until the named thread settles (its sandbox_execution owner is inspectable).
+    """
+
+    def __init__(self, stop_event, call_log, counter, timeout):
+        self.stop_event = stop_event
+        self.call_log = call_log
+        self.counter = counter
+        self.timeout = timeout
+        self.deadline = time.monotonic() + timeout
+        self.lock = threading.Lock()
+        self.conn = None
+        self.worker_tid = None
+        self.settled = threading.Event()
+        self.deadline_expired = threading.Event()
+
+    def attach_worker(self):
+        with self.lock:
+            self.worker_tid = threading.get_ident()
+            threading.current_thread().sandbox_execution = self
+
+    def attach_connection(self, conn):
+        with self.lock:
+            if self.stop_event.is_set():
+                conn.close()
+                return False
+            self.conn = conn
+            return True
+
+    def begin_call(self, tool, args):
+        with self.lock:
+            if self.stop_event.is_set():
+                return None
+            if time.monotonic() >= self.deadline:
+                self.deadline_expired.set()
+                return None
+            entry = {
+                "sequence": self.counter[0] + 1,
+                "tool": tool,
+                "phase": "running",
+                "rpc_timeout_seconds": 300,
+                "outer_remaining_seconds": round(max(0, self.deadline - time.monotonic()), 3),
+            }
+            if tool == "terminal" and isinstance(args, dict):
+                requested = args.get("timeout")
+                if isinstance(requested, (int, float)) and not isinstance(requested, bool):
+                    entry["requested_tool_timeout_seconds"] = requested
+                # The terminal owner resolves/clamps its own effective budget.
+                entry["tool_timeout_source"] = "terminal owner"
+            if tool in {"write_file", "patch"}:
+                entry["artifact_operation"] = tool
+                entry["artifact_outcome"] = "unknown"
+            self.counter[0] += 1
+            self.call_log.append(entry)
+            return entry
+
+    def finish_call(self, entry, result, duration=0):
+        with self.lock:
+            entry["phase"] = "returned"
+            entry["duration_seconds"] = round(duration, 3)
+            try:
+                payload = json.loads(result)
+            except (ValueError, TypeError):
+                payload = None
+            if isinstance(payload, dict):
+                code = payload.get("exit_code", payload.get("returncode"))
+                if code == 124 or payload.get("status") == "timeout":
+                    entry["tool_phase"] = "timeout"
+                elif code == 130 or payload.get("status") == "interrupted":
+                    entry["tool_phase"] = "interrupted"
+                elif payload.get("status") in {"success", "ok", "error", "failed"}:
+                    entry["tool_phase"] = payload["status"]
+            failed = isinstance(payload, dict) and (
+                bool(payload.get("error")) or payload.get("status") in {"error", "failed"}
+                or (isinstance(payload.get("exit_code"), int) and payload["exit_code"] != 0)
+            )
+            entry["outcome"] = "error" if failed else "returned"
+            if "artifact_operation" in entry and isinstance(payload, dict):
+                # Keep owner-reported artifact evidence without file contents.
+                for key in ("bytes_written", "verified"):
+                    value = payload.get(key)
+                    if isinstance(value, (int, bool)):
+                        entry["artifact_" + key] = value
+                if failed:
+                    entry["artifact_outcome"] = "error"
+                elif payload.get("status") in {"success", "ok"} or "bytes_written" in payload:
+                    entry["artifact_outcome"] = "reported_success"
+
+    def stop(self):
+        # Same lock as admission and worker exit: no new admission after Stop,
+        # and no interrupt can accidentally hit a recycled/foreign thread id.
+        from tools.interrupt import set_interrupt
+        with self.lock:
+            self.stop_event.set()
+            if self.worker_tid is not None:
+                set_interrupt(True, self.worker_tid, reason="sandbox execution ended")
+            if self.conn is not None:
+                try:
+                    self.conn.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                self.conn.close()
+                self.conn = None
+
+    def finish_worker(self):
+        from tools.interrupt import set_interrupt
+        with self.lock:
+            if self.conn is not None:
+                self.conn.close()
+                self.conn = None
+            if self.worker_tid is not None:
+                set_interrupt(False, self.worker_tid)
+                self.worker_tid = None
+            self.settled.set()
+
+    def snapshot(self):
+        with self.lock:
+            calls = [dict(entry) for entry in self.call_log]
+            completed = sum(entry["phase"] == "returned" for entry in calls)
+            return {"admitted": len(calls), "completed": completed,
+                    "active": len(calls) - completed, "calls": calls}
+
+    def result_metadata(self, phase, thread, **owned_cleanup):
+        if phase == "success" and self.deadline_expired.is_set():
+            phase = "timeout"
+        alive = thread is not None and thread.is_alive()
+        complete = not alive and all(owned_cleanup.values())
+        return {
+            "execution": {"phase": phase, "outer_timeout_seconds": self.timeout,
+                          "rpc_timeout_seconds": 300, "rpc_dispatch": "serial"},
+            "rpc": self.snapshot(),
+            "cleanup": {"status": "complete" if complete else "incomplete",
+                        "scope": "owned RPC and sandbox resources",
+                        "supervision_required": alive,
+                        "rpc_thread_alive": alive,
+                        "rpc_thread_name": thread.name if thread is not None else None,
+                        "settlement_wait_seconds": _RPC_SETTLEMENT_SECONDS,
+                        **owned_cleanup},
+        }
+
+
+def _start_sandbox_process(python, script, cwd, env):
+    """Launch the owned script with explicit unbuffered stdout and stderr."""
+    return subprocess.Popen(
+        [python, "-u", script], cwd=cwd, env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL, start_new_session=True,
+        creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+    )
+
+
 def _rpc_server_loop(
     server_sock: socket.socket,
     task_id: str,
@@ -658,15 +819,19 @@ def _rpc_server_loop(
     allowed_tools: frozenset,
     stop_event: threading.Event,
     rpc_token: str,
+    execution=None,
 ):
     """
     Accept one client connection and dispatch tool-call requests until
     the client disconnects or the call limit is reached.
     """
-    from model_tools import handle_function_call
-
+    execution = execution or _SandboxExecution(
+        stop_event, tool_call_log, tool_call_counter, DEFAULT_TIMEOUT,
+    )
+    execution.attach_worker()
     conn = None
     try:
+        from model_tools import handle_function_call
         server_sock.settimeout(0.05)
         while not stop_event.is_set():
             try:
@@ -676,20 +841,38 @@ def _rpc_server_loop(
                 continue
         if conn is None:
             return
-        conn.settimeout(300)
+        if not execution.attach_connection(conn):
+            return
+        # Short recv polls honor Stop on an already-connected idle client.
+        # The child's serial round-trip deadline remains 300s.
+        conn.settimeout(0.05)
+
+        def send_response(response):
+            # The short idle recv poll must not shorten the response-write
+            # budget. Stop still interrupts this owned socket via shutdown.
+            conn.settimeout(300)
+            try:
+                conn.sendall((response + "\n").encode())
+            finally:
+                conn.settimeout(0.05)
+
+        idle_deadline = time.monotonic() + 300
 
         buf = b""
-        while True:
+        while not stop_event.is_set():
             try:
                 chunk = conn.recv(65536)
             except socket.timeout:
-                break
+                if time.monotonic() >= idle_deadline:
+                    break
+                continue
             if not chunk:
                 break
             buf += chunk
+            idle_deadline = time.monotonic() + 300
 
             # Process all complete newline-delimited messages in the buffer
-            while b"\n" in buf:
+            while b"\n" in buf and not stop_event.is_set():
                 line, buf = buf.split(b"\n", 1)
                 line = line.strip()
                 if not line:
@@ -700,7 +883,11 @@ def _rpc_server_loop(
                     request = json.loads(line.decode())
                 except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                     resp = tool_error(f"Invalid RPC request: {exc}")
-                    conn.sendall((resp + "\n").encode())
+                    send_response(resp)
+                    continue
+
+                if not isinstance(request, dict):
+                    send_response(tool_error("Invalid RPC request shape"))
                     continue
 
                 if not rpc_token or not secrets.compare_digest(
@@ -710,7 +897,7 @@ def _rpc_server_loop(
                     str(request.get("token") or "").encode(), rpc_token.encode()
                 ):
                     resp = tool_error("Unauthorized RPC request")
-                    conn.sendall((resp + "\n").encode())
+                    send_response(resp)
                     continue
 
                 tool_name = request.get("tool", "")
@@ -723,7 +910,7 @@ def _rpc_server_loop(
                         f"Tool '{tool_name}' is not available in execute_code. "
                         f"Available: {available}"
                     )
-                    conn.sendall((resp + "\n").encode())
+                    send_response(resp)
                     continue
 
                 # Enforce tool call limit
@@ -732,13 +919,17 @@ def _rpc_server_loop(
                         f"Tool call limit reached ({max_tool_calls}). "
                         "No more tool calls allowed in this execution."
                     )
-                    conn.sendall((resp + "\n").encode())
+                    send_response(resp)
                     continue
 
                 # Strip forbidden terminal parameters
                 if tool_name == "terminal" and isinstance(tool_args, dict):
                     for param in _TERMINAL_BLOCKED_PARAMS:
                         tool_args.pop(param, None)
+
+                entry = execution.begin_call(tool_name, tool_args)
+                if entry is None:
+                    return
 
                 # Dispatch through the standard tool handler.
                 # Suppress stdout/stderr from internal tool handlers so
@@ -749,32 +940,20 @@ def _rpc_server_loop(
                             tool_name, tool_args, task_id=task_id
                         )
                 except Exception as exc:
-                    logger.error("Tool call failed in sandbox: %s", exc, exc_info=True)
+                    logger.warning("Sandbox RPC dispatch failed (%s)", type(exc).__name__)
                     result = tool_error(str(exc))
 
-                tool_call_counter[0] += 1
-                call_duration = time.monotonic() - call_start
-
-                # Log for observability
-                args_preview = str(tool_args)[:80]
-                tool_call_log.append({
-                    "tool": tool_name,
-                    "args_preview": args_preview,
-                    "duration": round(call_duration, 2),
-                })
-
-                conn.sendall((result + "\n").encode())
+                execution.finish_call(entry, result, time.monotonic() - call_start)
+                if stop_event.is_set():
+                    return
+                send_response(result)
 
     except socket.timeout:
         logger.debug("RPC listener socket timeout")
     except OSError as e:
-        logger.debug("RPC listener socket error: %s", e, exc_info=True)
+        logger.debug("Sandbox RPC socket closed (%s)", type(e).__name__)
     finally:
-        if conn:
-            try:
-                conn.close()
-            except OSError as e:
-                logger.debug("RPC conn close error: %s", e)
+        execution.finish_worker()
 
 
 # ---------------------------------------------------------------------------
@@ -930,6 +1109,7 @@ def _rpc_poll_loop(
     allowed_tools: frozenset,
     stop_event: threading.Event,
     rpc_token: str,
+    execution=None,
 ):
     """Poll the remote filesystem for tool call requests and dispatch them.
 
@@ -937,129 +1117,140 @@ def _rpc_poll_loop(
     independent process, so these calls run safely concurrent with the
     script-execution thread.
     """
-    from model_tools import handle_function_call
+    execution = execution or _SandboxExecution(
+        stop_event, tool_call_log, tool_call_counter, DEFAULT_TIMEOUT,
+    )
+    execution.attach_worker()
+    try:
+        from model_tools import handle_function_call
 
-    poll_interval = 0.1  # 100 ms
+        poll_interval = 0.1  # 100 ms
 
-    quoted_rpc_dir = shlex.quote(rpc_dir)
-    while not stop_event.is_set():
-        try:
-            # List pending request files (skip .tmp partials)
-            ls_result = env.execute(
-                f"ls -1 {quoted_rpc_dir}/req_* 2>/dev/null || true",
-                cwd="/",
-                timeout=10,
-            )
-            output = ls_result.get("output", "").strip()
-            if not output:
-                stop_event.wait(poll_interval)
-                continue
-
-            req_files = sorted([
-                f.strip() for f in output.split("\n")
-                if f.strip()
-                and not f.strip().endswith(".tmp")
-                and "/req_" in f.strip()
-            ])
-
-            for req_file in req_files:
-                if stop_event.is_set():
-                    break
-
-                call_start = time.monotonic()
-
-                quoted_req_file = shlex.quote(req_file)
-                # Read request
-                read_result = env.execute(
-                    f"cat {quoted_req_file}",
+        quoted_rpc_dir = shlex.quote(rpc_dir)
+        while not stop_event.is_set():
+            try:
+                # List pending request files (skip .tmp partials)
+                ls_result = env.execute(
+                    f"ls -1 {quoted_rpc_dir}/req_* 2>/dev/null || true",
                     cwd="/",
                     timeout=10,
                 )
-                try:
-                    request = json.loads(read_result.get("output", ""))
-                except (json.JSONDecodeError, ValueError):
-                    logger.debug("Malformed RPC request in %s", req_file)
-                    # Remove bad request to avoid infinite retry
-                    env.execute(f"rm -f {quoted_req_file}", cwd="/", timeout=5)
+                output = ls_result.get("output", "").strip()
+                if not output:
+                    stop_event.wait(poll_interval)
                     continue
 
-                if not rpc_token or not secrets.compare_digest(
-                    # Compare as bytes: compare_digest raises TypeError on a
-                    # str with non-ASCII characters, and the token comes from
-                    # sandbox-script-supplied JSON.
-                    str(request.get("token") or "").encode(), rpc_token.encode()
-                ):
-                    logger.debug("Unauthorized RPC request in %s", req_file)
-                    env.execute(f"rm -f {quoted_req_file}", cwd="/", timeout=5)
-                    continue
+                req_files = sorted([
+                    f.strip() for f in output.split("\n")
+                    if f.strip()
+                    and not f.strip().endswith(".tmp")
+                    and "/req_" in f.strip()
+                ])
 
-                tool_name = request.get("tool", "")
-                tool_args = request.get("args", {})
-                seq = request.get("seq", 0)
-                seq_str = f"{seq:06d}"
-                res_file = f"{rpc_dir}/res_{seq_str}"
-                quoted_res_file = shlex.quote(res_file)
+                for req_file in req_files:
+                    if stop_event.is_set():
+                        break
 
-                # Enforce allow-list
-                if tool_name not in allowed_tools:
-                    available = ", ".join(sorted(allowed_tools))
-                    tool_result = tool_error(
-                        f"Tool '{tool_name}' is not available in execute_code. "
-                        f"Available: {available}"
+                    call_start = time.monotonic()
+
+                    quoted_req_file = shlex.quote(req_file)
+                    # Read request
+                    read_result = env.execute(
+                        f"cat {quoted_req_file}",
+                        cwd="/",
+                        timeout=10,
                     )
-                # Enforce tool call limit
-                elif tool_call_counter[0] >= max_tool_calls:
-                    tool_result = tool_error(
-                        f"Tool call limit reached ({max_tool_calls}). "
-                        "No more tool calls allowed in this execution."
-                    )
-                else:
-                    # Strip forbidden terminal parameters
-                    if tool_name == "terminal" and isinstance(tool_args, dict):
-                        for param in _TERMINAL_BLOCKED_PARAMS:
-                            tool_args.pop(param, None)
-
-                    # Dispatch through the standard tool handler
                     try:
-                        with thread_scoped_silence():
-                            tool_result = handle_function_call(
-                                tool_name, tool_args, task_id=task_id
-                            )
-                    except Exception as exc:
-                        logger.error("Tool call failed in remote sandbox: %s",
-                                     exc, exc_info=True)
-                        tool_result = tool_error(str(exc))
+                        request = json.loads(read_result.get("output", ""))
+                    except (json.JSONDecodeError, ValueError):
+                        logger.debug("Malformed file RPC request")
+                        # Remove bad request to avoid infinite retry
+                        env.execute(f"rm -f {quoted_req_file}", cwd="/", timeout=5)
+                        continue
 
-                    tool_call_counter[0] += 1
-                    call_duration = time.monotonic() - call_start
-                    tool_call_log.append({
-                        "tool": tool_name,
-                        "args_preview": str(tool_args)[:80],
-                        "duration": round(call_duration, 2),
-                    })
+                    if not rpc_token or not secrets.compare_digest(
+                        # Compare as bytes: compare_digest raises TypeError on a
+                        # str with non-ASCII characters, and the token comes from
+                        # sandbox-script-supplied JSON.
+                        str(request.get("token") or "").encode(), rpc_token.encode()
+                    ):
+                        logger.debug("Unauthorized file RPC request")
+                        env.execute(f"rm -f {quoted_req_file}", cwd="/", timeout=5)
+                        continue
 
-                # Write response atomically (tmp + rename).
-                # Use echo piping (not stdin_data) because Modal doesn't
-                # reliably deliver stdin to chained commands.
-                encoded_result = base64.b64encode(
-                    tool_result.encode("utf-8")
-                ).decode("ascii")
-                env.execute(
-                    f"echo '{encoded_result}' | base64 -d > {quoted_res_file}.tmp"
-                    f" && mv {quoted_res_file}.tmp {quoted_res_file}",
-                    cwd="/",
-                    timeout=60,
-                )
+                    if stop_event.is_set():
+                        break
+                    tool_name = request.get("tool", "")
+                    tool_args = request.get("args", {})
+                    seq = request.get("seq", 0)
+                    seq_str = f"{seq:06d}"
+                    res_file = f"{rpc_dir}/res_{seq_str}"
+                    quoted_res_file = shlex.quote(res_file)
 
-                # Remove the request file
-                env.execute(f"rm -f {quoted_req_file}", cwd="/", timeout=5)
+                    # Enforce allow-list
+                    if tool_name not in allowed_tools:
+                        available = ", ".join(sorted(allowed_tools))
+                        tool_result = tool_error(
+                            f"Tool '{tool_name}' is not available in execute_code. "
+                            f"Available: {available}"
+                        )
+                    # Enforce tool call limit
+                    elif tool_call_counter[0] >= max_tool_calls:
+                        tool_result = tool_error(
+                            f"Tool call limit reached ({max_tool_calls}). "
+                            "No more tool calls allowed in this execution."
+                        )
+                    else:
+                        # Strip forbidden terminal parameters
+                        if tool_name == "terminal" and isinstance(tool_args, dict):
+                            for param in _TERMINAL_BLOCKED_PARAMS:
+                                tool_args.pop(param, None)
 
-        except Exception as e:
+                        entry = execution.begin_call(tool_name, tool_args)
+                        if entry is None:
+                            return
+                        # Dispatch through the standard tool handler
+                        try:
+                            with thread_scoped_silence():
+                                tool_result = handle_function_call(
+                                    tool_name, tool_args, task_id=task_id
+                                )
+                        except Exception as exc:
+                            logger.warning("Remote sandbox RPC dispatch failed (%s)",
+                                           type(exc).__name__)
+                            tool_result = tool_error(str(exc))
+
+                        execution.finish_call(entry, tool_result, time.monotonic() - call_start)
+
+                    # Never publish late results / perform more backend I/O after Stop.
+                    if stop_event.is_set():
+                        return
+
+                    # Write response atomically (tmp + rename).
+                    # Use echo piping (not stdin_data) because Modal doesn't
+                    # reliably deliver stdin to chained commands.
+                    encoded_result = base64.b64encode(
+                        tool_result.encode("utf-8")
+                    ).decode("ascii")
+                    env.execute(
+                        f"echo '{encoded_result}' | base64 -d > {quoted_res_file}.tmp"
+                        f" && mv {quoted_res_file}.tmp {quoted_res_file}",
+                        cwd="/",
+                        timeout=60,
+                    )
+
+                    # Remove the request file
+                    if not stop_event.is_set():
+                        env.execute(f"rm -f {quoted_req_file}", cwd="/", timeout=5)
+
+            except Exception as e:
+                if not stop_event.is_set():
+                    logger.debug("File RPC poll failed (%s)", type(e).__name__)
+
             if not stop_event.is_set():
-                logger.debug("RPC poll error: %s", e, exc_info=True)
-
-        if not stop_event.is_set():
-            stop_event.wait(poll_interval)
+                stop_event.wait(poll_interval)
+    finally:
+        execution.finish_worker()
 
 
 def _format_interrupted_output(stdout_text: str) -> str:
@@ -1110,6 +1301,9 @@ def _execute_remote(
     exec_start = time.monotonic()
     stop_event = threading.Event()
     rpc_thread = None
+    execution = _SandboxExecution(stop_event, tool_call_log, tool_call_counter, timeout)
+    staging_removed = False
+    execution_error = None
 
     try:
         # Verify Python is available on the remote
@@ -1151,10 +1345,12 @@ def _execute_remote(
             args=(
                 env, f"{sandbox_dir}/rpc", effective_task_id,
                 tool_call_log, tool_call_counter, max_tool_calls,
-                sandbox_tools, stop_event, rpc_token,
+                sandbox_tools, stop_event, rpc_token, execution,
             ),
+            name=f"sandbox-file-rpc-{uuid.uuid4().hex}",
             daemon=True,
         )
+        rpc_thread.sandbox_execution = execution
         rpc_thread.start()
 
         # Build environment variable prefix for the script
@@ -1168,10 +1364,10 @@ def _execute_remote(
             env_prefix += f" TZ={shlex.quote(tz)}"
 
         # Execute the script on the remote backend
-        logger.info("Executing code on %s backend (task %s)...",
-                     env_type, effective_task_id[:8])
+        logger.info("Sandbox remote execution started (%s backend)", env_type)
+        execution.deadline = time.monotonic() + timeout
         script_result = env.execute(
-            f"cd {quoted_sandbox_dir} && {env_prefix} python3 script.py",
+            f"cd {quoted_sandbox_dir} && {env_prefix} python3 -u script.py",
             timeout=timeout,
         )
 
@@ -1184,34 +1380,31 @@ def _execute_remote(
             status = "timeout"
         elif exit_code == 130:
             status = "interrupted"
+        elif execution.deadline_expired.is_set():
+            status = "timeout"
 
     except Exception as exc:
-        duration = round(time.monotonic() - exec_start, 2)
-        logger.error(
-            "execute_code remote failed after %ss with %d tool calls: %s: %s",
-            duration, tool_call_counter[0], type(exc).__name__, exc,
-            exc_info=True,
-        )
-        return json.dumps({
-            "status": "error",
-            "error": str(exc),
-            "tool_calls_made": tool_call_counter[0],
-            "duration_seconds": duration,
-        }, ensure_ascii=False)
+        from agent.redact import redact_sensitive_text
+        execution_error = redact_sensitive_text(str(exc), code_file=True)
+        logger.warning("Remote sandbox execution failed (%s)", type(exc).__name__)
+        stdout_text, exit_code, status = "", -1, "error"
 
     finally:
         # Stop the polling thread
-        stop_event.set()
+        execution.stop()
         if rpc_thread is not None:
-            rpc_thread.join(timeout=5)
+            rpc_thread.join(timeout=_RPC_SETTLEMENT_SECONDS)
 
-        # Clean up remote sandbox dir
-        try:
-            env.execute(
-                f"rm -rf {quoted_sandbox_dir}", cwd="/", timeout=15,
-            )
-        except Exception:
-            logger.debug("Failed to clean up remote sandbox %s", sandbox_dir)
+        # A still-running file RPC owns this directory. Never delete it under
+        # that worker or close the shared terminal environment/client.
+        if rpc_thread is None or not rpc_thread.is_alive():
+            try:
+                cleanup_result = env.execute(
+                    f"rm -rf {quoted_sandbox_dir}", cwd="/", timeout=15,
+                )
+                staging_removed = cleanup_result.get("returncode", 0) == 0
+            except Exception:
+                logger.debug("Remote sandbox staging cleanup failed")
 
     duration = round(time.monotonic() - exec_start, 2)
 
@@ -1238,9 +1431,17 @@ def _execute_remote(
         "duration_seconds": duration,
     }
     result.update(stdout_metadata)
+    result.update(execution.result_metadata(status, rpc_thread, staging_removed=staging_removed))
+    # Remote process-tree settlement belongs to the terminal backend. A
+    # return code alone does not prove descendants or provider work settled.
+    result["cleanup"]["process_settlement"] = "backend_owned"
+    if not staging_removed:
+        result["cleanup"]["retained_staging_directory"] = sandbox_dir
+    if result["cleanup"]["status"] == "incomplete" and status == "success":
+        result["status"] = result["execution"]["phase"] = "cleanup-incomplete"
 
     if status == "timeout":
-        timeout_msg = f"Script timed out after {timeout}s and was killed."
+        timeout_msg = f"Script timed out after {timeout}s; execution stopped."
         result["error"] = timeout_msg
         # Include timeout message in output so the LLM always surfaces it
         # to the user (see local path comment — same reasoning, #10807).
@@ -1256,7 +1457,8 @@ def _execute_remote(
         result["output"] = _format_interrupted_output(stdout_text)
     elif exit_code != 0:
         result["status"] = "error"
-        result["error"] = f"Script exited with code {exit_code}"
+        result["error"] = execution_error or f"Script exited with code {exit_code}"
+        result["execution"]["phase"] = "error"
 
     return json.dumps(result, ensure_ascii=False)
 
@@ -1353,7 +1555,7 @@ def execute_code(
     if env_type != "local":
         return _execute_remote(code, task_id, enabled_tools)
 
-    # --- Local execution path (UDS) --- below this line is unchanged ---
+    # --- Local execution path (UDS / Windows loopback TCP) ---
 
     # Import per-thread interrupt check (cooperative cancellation)
     from tools.interrupt import is_interrupted as _is_interrupted
@@ -1397,6 +1599,10 @@ def execute_code(
     exec_start = time.monotonic()
     server_sock = None
     stop_event = threading.Event()
+    execution = _SandboxExecution(stop_event, tool_call_log, tool_call_counter, timeout)
+    rpc_thread = proc = stdout_reader = stderr_reader = None
+    stdout_head_chunks, stdout_tail_chunks, stderr_chunks = [], [], []
+    stdout_total_bytes = [0]
 
     try:
         # Write the auto-generated hermes_tools module.
@@ -1445,10 +1651,12 @@ def execute_code(
             target=propagate_context_to_thread(_rpc_server_loop),
             args=(
                 server_sock, task_id, tool_call_log,
-                tool_call_counter, max_tool_calls, sandbox_tools, stop_event, rpc_token,
+                tool_call_counter, max_tool_calls, sandbox_tools, stop_event, rpc_token, execution,
             ),
+            name=f"sandbox-rpc-{uuid.uuid4().hex}",
             daemon=True,
         )
+        rpc_thread.sandbox_execution = execution
         rpc_thread.start()
 
         # --- Spawn child process ---
@@ -1533,27 +1741,17 @@ def execute_code(
             # fails" reports are diagnosable without log spam.
             _external_env_logged.add(_child_python)
             logger.info(
-                "execute_code: child interpreter %s is outside the Hermes "
-                "environment; hermes root omitted from PYTHONPATH",
-                _child_python,
+                "execute_code: external child environment; hermes root omitted from PYTHONPATH",
             )
         if _existing_pp:
             _pp_parts.append(_existing_pp)
         child_env["PYTHONPATH"] = os.pathsep.join(_pp_parts)
 
-        proc = subprocess.Popen(
-            [_child_python, _script_path],
-            cwd=_child_cwd,
-            env=child_env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
-        )
+        proc = _start_sandbox_process(_child_python, _script_path, _child_cwd, child_env)
+        execution.process = proc
 
         # --- Poll loop: watch for exit, timeout, and interrupt ---
-        deadline = time.monotonic() + timeout
+        deadline = execution.deadline = time.monotonic() + timeout
         stderr_chunks: list = []
 
         # Background readers to avoid pipe buffer deadlocks.
@@ -1568,7 +1766,7 @@ def execute_code(
             total = 0
             try:
                 while True:
-                    data = pipe.read(4096)
+                    data = pipe.read1(4096)
                     if not data:
                         break
                     if total < max_bytes:
@@ -1588,7 +1786,7 @@ def execute_code(
             tail_collected = 0
             try:
                 while True:
-                    data = pipe.read(4096)
+                    data = pipe.read1(4096)
                     if not data:
                         break
                     total_ref[0] += len(data)
@@ -1606,11 +1804,17 @@ def execute_code(
                     # Evict old tail data to stay within tail_bytes budget
                     while tail_collected > tail_bytes and tail_buf:
                         oldest = tail_buf.popleft()
-                        tail_collected -= len(oldest)
+                        excess = tail_collected - tail_bytes
+                        if len(oldest) > excess:
+                            tail_buf.appendleft(oldest[excess:])
+                            tail_collected -= excess
+                        else:
+                            tail_collected -= len(oldest)
+                    tail_chunks[:] = list(tail_buf)
             except (ValueError, OSError):
                 pass
             # Transfer final tail to output list
-            tail_chunks.extend(tail_buf)
+            tail_chunks[:] = list(tail_buf)
 
         stdout_head_chunks: list = []
         stdout_tail_chunks: list = []
@@ -1624,6 +1828,9 @@ def execute_code(
         stderr_reader = threading.Thread(
             target=_drain, args=(proc.stderr, stderr_chunks, MAX_STDERR_BYTES), daemon=True
         )
+        stdout_reader.sandbox_execution = execution
+        stderr_reader.sandbox_execution = execution
+        execution.output_readers = (stdout_reader, stderr_reader)
         stdout_reader.start()
         stderr_reader.start()
 
@@ -1639,11 +1846,13 @@ def execute_code(
         poll_interval = 0.005
         while proc.poll() is None:
             if _is_interrupted():
-                _kill_process_group(proc)
+                execution.stop()
+                _kill_process_group(proc, escalate=True)
                 status = "interrupted"
                 break
             now = time.monotonic()
             if now > deadline:
+                execution.stop()
                 _kill_process_group(proc, escalate=True)
                 status = "timeout"
                 break
@@ -1660,9 +1869,24 @@ def execute_code(
                 pass
             poll_interval = min(0.2, poll_interval * 1.5)
 
-        # Wait for readers to finish draining
-        stdout_reader.join(timeout=3)
-        stderr_reader.join(timeout=3)
+        # RPC admission can notice the deadline before the process poll does.
+        # A resulting disconnect must not turn an outer timeout into success/error.
+        if status == "success" and execution.deadline_expired.is_set():
+            status = "timeout"
+        # Exit/killing the script is not proof the parent's tool has stopped.
+        execution.stop()
+        server_sock.close()
+        server_sock = None
+        rpc_thread.join(timeout=_RPC_SETTLEMENT_SECONDS)
+        try:
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+
+        # One shared drain budget, not one full budget per pipe.
+        drain_deadline = time.monotonic() + 1
+        stdout_reader.join(timeout=max(0, drain_deadline - time.monotonic()))
+        stderr_reader.join(timeout=max(0, drain_deadline - time.monotonic()))
 
         stderr_text = b"".join(stderr_chunks).decode("utf-8", errors="replace")
 
@@ -1674,12 +1898,6 @@ def execute_code(
 
         exit_code = proc.returncode if proc.returncode is not None else -1
         duration = round(time.monotonic() - exec_start, 2)
-
-        # Wait for RPC thread to finish
-        stop_event.set()
-        server_sock.close()  # break accept() so thread exits promptly
-        server_sock = None  # prevent double close in finally
-        rpc_thread.join(timeout=3)
 
         # Strip ANSI escape sequences so the model never sees terminal
         # formatting — prevents it from copying escapes into file writes.
@@ -1706,9 +1924,18 @@ def execute_code(
             "duration_seconds": duration,
         }
         result.update(stdout_metadata)
+        result.update(execution.result_metadata(
+            status if status != "success" or exit_code == 0 else "error", rpc_thread,
+            process_reaped=proc.poll() is not None,
+            output_drained=not stdout_reader.is_alive() and not stderr_reader.is_alive(),
+        ))
+        if result["cleanup"]["status"] == "incomplete":
+            result["cleanup"]["retained_staging_directory"] = tmpdir
+        if result["cleanup"]["status"] == "incomplete" and result["status"] == "success":
+            result["status"] = result["execution"]["phase"] = "cleanup-incomplete"
 
         if status == "timeout":
-            timeout_msg = f"Script timed out after {timeout}s and was killed."
+            timeout_msg = f"Script timed out after {timeout}s; execution stopped."
             result["error"] = timeout_msg
             # Include timeout message in output so the LLM always surfaces it
             # to the user.  When output is empty, models often treat the result
@@ -1740,31 +1967,77 @@ def execute_code(
         return json.dumps(result, ensure_ascii=False)
 
     except Exception as exc:
-        duration = round(time.monotonic() - exec_start, 2)
-        logger.error(
-            "execute_code failed after %ss with %d tool calls: %s: %s",
-            duration,
-            tool_call_counter[0],
-            type(exc).__name__,
-            exc,
-            exc_info=True,
+        execution.stop()
+        if server_sock is not None:
+            server_sock.close()
+            server_sock = None
+        if proc is not None and proc.poll() is None:
+            _kill_process_group(proc, escalate=True)
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+        if rpc_thread is not None:
+            rpc_thread.join(timeout=_RPC_SETTLEMENT_SECONDS)
+        drain_deadline = time.monotonic() + 1
+        for reader in (stdout_reader, stderr_reader):
+            if reader is not None:
+                reader.join(timeout=max(0, drain_deadline - time.monotonic()))
+        from agent.redact import redact_sensitive_text
+        stdout_text, stdout_metadata = _assemble_stdout_result(
+            b"".join(stdout_head_chunks), b"".join(stdout_tail_chunks),
+            total_bytes=stdout_total_bytes[0],
         )
-        return json.dumps({
-            "status": "error",
-            "error": str(exc),
-            "tool_calls_made": tool_call_counter[0],
-            "duration_seconds": duration,
-        }, ensure_ascii=False)
+        from tools.ansi_strip import strip_ansi
+        stdout_text = redact_sensitive_text(strip_ansi(stdout_text), code_file=True)
+        logger.warning("Sandbox execution failed (%s)", type(exc).__name__)
+        result = {
+            "status": "error", "error": redact_sensitive_text(str(exc), code_file=True),
+            "output": stdout_text, "tool_calls_made": tool_call_counter[0],
+            "duration_seconds": round(time.monotonic() - exec_start, 2),
+            **stdout_metadata,
+            **execution.result_metadata(
+                "error", rpc_thread,
+                process_reaped=proc is None or proc.poll() is not None,
+                output_drained=all(reader is None or not reader.is_alive()
+                                   for reader in (stdout_reader, stderr_reader)),
+            ),
+        }
+        if result["cleanup"]["status"] == "incomplete":
+            result["cleanup"]["retained_staging_directory"] = tmpdir
+        return json.dumps(result, ensure_ascii=False)
 
     finally:
+        execution.stop()
+        if proc is not None:
+            if proc.poll() is None:
+                _kill_process_group(proc, escalate=True)
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+        if rpc_thread is not None and not execution.settled.is_set():
+            # Do not stack another settlement wait on the normal result path.
+            if server_sock is not None:
+                rpc_thread.join(timeout=_RPC_SETTLEMENT_SECONDS)
+        # Close only drained pipe handles; blocked readers retain their owner.
+        for reader, pipe in ((stdout_reader, getattr(proc, "stdout", None)),
+                             (stderr_reader, getattr(proc, "stderr", None))):
+            if pipe is not None and (reader is None or not reader.is_alive()):
+                pipe.close()
         # Cleanup temp dir and socket
         if server_sock is not None:
             try:
                 server_sock.close()
             except OSError as e:
                 logger.debug("Server socket close error: %s", e)
-        import shutil
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        # Retain staging while a parent tool / output reader may still use it.
+        # No deferred env/DB callbacks are scheduled on late settlement.
+        if (rpc_thread is None or not rpc_thread.is_alive()) and all(
+            reader is None or not reader.is_alive() for reader in (stdout_reader, stderr_reader)
+        ) and (proc is None or proc.poll() is not None):
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
         try:
             # Only UDS has a filesystem socket to unlink; TCP sockets are
             # freed by server_sock.close() above.

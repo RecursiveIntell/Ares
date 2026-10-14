@@ -26,6 +26,10 @@ def accept_turn_input(agent, *, user_message, persist_user_message, timestamp,
             source=accepted_receipt.source, event_id=accepted_receipt.event_id)
         if current != accepted_receipt or persist_user_message != current.content:
             raise ContextContinuationError("CONTEXT_INPUT_RECEIPT_MISMATCH")
+        # Custody acceptance does not qualify a media dispatch route. Apply
+        # the same text-only contract as fresh input before any projection.
+        if type(current.content) is not str:
+            raise ContextContinuationError("CONTEXT_INPUT_TEXT_ROUTE_REQUIRED")
         return current
     if display_kind or getattr(agent, "_persist_disabled", False):
         return None
@@ -59,6 +63,10 @@ def project_turn_inputs(agent, receipt, *, holder, conversation_history):
     work = agent._session_db.read_context_input_work(agent.session_id)
     by_sequence = {r.sequence: r for r in (*work["receipts"], *agent._session_db.read_pending_context_inputs(agent.session_id))}
     receipts = tuple(by_sequence[n] for n in sorted(by_sequence) if n <= receipt.sequence)
+    # A text receipt must not smuggle earlier unqualified media through the
+    # FIFO range. Refuse before creating a phase or projecting any occurrence.
+    if any(type(r.content) is not str for r in receipts):
+        raise ContextContinuationError("CONTEXT_INPUT_TEXT_ROUTE_REQUIRED")
     authorize = getattr(agent, "_context_input_authorizer", None)
     if any(agent._session_db.read_context_input_origin(agent.session_id, r) is not None for r in receipts):
         if not callable(authorize) or authorize(agent.session_id, receipts) is not True:

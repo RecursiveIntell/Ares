@@ -1020,7 +1020,13 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         )
         return ri_pipeline_chat_completion(agent, api_kwargs)
     request_client = make_client("chat_completion_request")
-    return request_client.chat.completions.create(**api_kwargs)
+    from agent.operation_progress import model_request_scope, observe_sdk_request_started
+    with model_request_scope('chat-sdk:' + uuid.uuid4().hex, streaming=False) as progress:
+        observe_sdk_request_started()
+        response = request_client.chat.completions.create(**api_kwargs)
+        if progress is not None:
+            progress.complete_response(response)
+        return response
 
 
 def should_use_direct_api_call(agent) -> bool:
@@ -3978,6 +3984,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 pass
 
     def _call_chat_completions(stream_attempt_id: int):
+        from agent.operation_progress import model_request_scope
+        with model_request_scope('chat-stream-sdk:' + uuid.uuid4().hex, streaming=True) as progress:
+            response = _call_chat_completions_impl(stream_attempt_id)
+            if progress is not None:
+                progress.complete_response(response)
+            return response
+
+    def _call_chat_completions_impl(stream_attempt_id: int):
         """Stream a chat completions response."""
         import httpx as _httpx
         # Per-provider / per-model request_timeout_seconds (from config.yaml)
@@ -4071,8 +4085,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             attempt_request_client["value"] = request_client
             last_chunk_time["t"] = time.time()
             agent._touch_activity("waiting for provider response (streaming)")
+            def _create_sdk_stream(final):
+                from agent.operation_progress import observe_sdk_request_started
+                observe_sdk_request_started()
+                return request_client.chat.completions.create(**final)
             return context_dispatch_physical_call(
-                agent, stream_kwargs, lambda final: request_client.chat.completions.create(**final),
+                agent, stream_kwargs, _create_sdk_stream,
                 source_payload=next_api_kwargs, transport_kind="chat_stream",
             )
 
@@ -4091,6 +4109,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # the fact that a tool call was in flight so retry policy does not
             # misclassify the attempt as a partial text response. The chunk
             # itself is still rejected below and never reaches callbacks.
+            delta = None
             try:
                 choices = getattr(_chunk, "choices", None)
                 delta = getattr(choices[0], "delta", None) if choices else None
@@ -4109,6 +4128,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     api_kwargs.get("model", "unknown"),
                 )
                 return False
+            # Observe only provider deltas that passed the active-attempt and
+            # single-writer fences. Heartbeat/role-only frames earn no credit.
+            from agent.operation_progress import observe_chat_completion_delta
+            observe_chat_completion_delta(delta)
             # Record provider activity before Relay processes the chunk. This
             # prevents the stale watchdog from cancelling a live stream while
             # an interceptor or codec is still handling an already-received

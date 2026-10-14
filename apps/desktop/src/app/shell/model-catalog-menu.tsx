@@ -2,6 +2,7 @@ import { useStore } from '@nanostores/react'
 import { useQuery } from '@tanstack/react-query'
 import { createContext, type ReactNode, useContext, useEffect, useMemo, useRef, useState } from 'react'
 
+import { getApiRequestConnection } from '@/api/client'
 import { Codicon } from '@/components/ui/codicon'
 import { DisclosureCaret } from '@/components/ui/disclosure-caret'
 import {
@@ -20,19 +21,19 @@ import { usePointerQuiet } from '@/components/ui/keyboard-first'
 import { Skeleton } from '@/components/ui/skeleton'
 import type { HermesGateway } from '@/hermes'
 import { useI18n } from '@/i18n'
-import { modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
+import { catalogIsDegraded, modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
 import { displayModelName, modelDisplayParts } from '@/lib/model-status-label'
 import { DEFAULT_REASONING_EFFORT, reasoningEffortLabel } from '@/lib/reasoning-effort'
 import { normalize } from '@/lib/text'
 import { cn } from '@/lib/utils'
 import {
-  $visibleModels,
   collapseModelFamilies,
   DEFAULT_VISIBLE_PER_PROVIDER,
   effectiveVisibleKeys,
   type ModelFamily,
   modelVisibilityKey,
-  setModelVisibilityOpen
+  setModelVisibilityOpen,
+  visibleModelsStore
 } from '@/store/model-visibility'
 import { $collapsedProviders, toggleCollapsedProvider } from '@/store/provider-collapse'
 import { $defaultReasoningEffort } from '@/store/session'
@@ -125,7 +126,7 @@ const EMPTY_CATALOG_RETRY_DELAYS_MS = [250, 1_000, 3_000] as const
  * can never drift apart.
  */
 export function ModelCatalogMenu({
-  connectionId,
+  connectionId = getApiRequestConnection(),
   controller,
   footer,
   gateway,
@@ -138,13 +139,11 @@ export function ModelCatalogMenu({
   const copy = t.shell.modelMenu
   const closeMenu = useContext(ModelMenuCloseContext)
   const [search, setSearch] = useState('')
+  const [showAll, setShowAll] = useState(false)
   const collapsedProviders = useStoreCollapsed()
   const defaultEffort = useDefaultEffort()
-  // Which models the user curated in Edit Models. Read HERE rather than taken
-  // as a prop: it's one global preference, so every surface that shows a
-  // catalog must show the same shortlist. A per-caller opt-in is how the board
-  // and the composer would end up disagreeing about what "my models" means.
-  const visibleModels = useStore($visibleModels)
+  // Every picker for this connection/profile shares its curated preference.
+  const visibleModels = useStore(visibleModelsStore({ connectionId, profile }))
 
   const modelOptions = useQuery({
     queryKey: modelOptionsQueryKey(profile, sessionId, connectionId),
@@ -186,7 +185,8 @@ export function ModelCatalogMenu({
 
   useEffect(() => {
     setEmptyCatalogRetryAttempt(0)
-  }, [profile, sessionId])
+    setShowAll(false)
+  }, [connectionId, profile, sessionId])
 
   // `model.options` can briefly report a successful-but-empty catalog while a
   // gateway/provider is still hydrating. A success result does not trigger
@@ -224,8 +224,8 @@ export function ModelCatalogMenu({
   )
 
   const groups = useMemo(
-    () => groupModels(pickerProviders, search, { model: current.model, provider: current.provider }, shownKeys),
-    [pickerProviders, search, current.model, current.provider, shownKeys]
+    () => groupModels(pickerProviders, search, { model: current.model, provider: current.provider }, shownKeys, showAll),
+    [pickerProviders, search, current.model, current.provider, shownKeys, showAll]
   )
 
   const q = normalize(search)
@@ -284,7 +284,7 @@ export function ModelCatalogMenu({
   const kbRows = useMemo<KbRow[]>(
     () => [
       ...groups.flatMap(group =>
-        collapsedProviders.includes(group.provider.slug) && !search
+        collapsedProviders.includes(group.provider.slug) && !search && !showAll
           ? []
           : group.families.map((family): KbRow => ({
               family,
@@ -295,7 +295,7 @@ export function ModelCatalogMenu({
       ),
       ...shownMoaPresets.map((preset): KbRow => ({ key: `moa:${preset}`, kind: 'moa', preset }))
     ],
-    [groups, collapsedProviders, search, shownMoaPresets]
+    [groups, collapsedProviders, search, shownMoaPresets, showAll]
   )
 
   const [kbOverride, setKbOverride] = useState<null | number>(null)
@@ -313,7 +313,7 @@ export function ModelCatalogMenu({
     ? kbRows.length > 0
       ? 0
       : -1
-    : kbRows.findIndex(row => rowIsCurrent(row) || (row.kind === 'family' && row.family.fastId === current.model))
+    : kbRows.findIndex(row => rowIsCurrent(row))
 
   const kbIndex = kbOverride !== null && kbOverride < kbRows.length ? kbOverride : autoIndex
   const kbActiveKey = kbIndex >= 0 ? kbRows[kbIndex].key : null
@@ -341,7 +341,7 @@ export function ModelCatalogMenu({
       return
     }
 
-    if (!rowIsCurrent(row) && row.family.fastId !== current.model) {
+    if (!rowIsCurrent(row)) {
       void selectFamily(row.family, row.provider)
     }
 
@@ -369,6 +369,11 @@ export function ModelCatalogMenu({
 
   return (
     <>
+      {pickerProviders.some(catalogIsDegraded) && (
+        <div className="px-2 py-1 text-xs text-(--ui-text-secondary)" role="status">
+          {t.modelDiscovery.catalogStale}
+        </div>
+      )}
       <DropdownMenuSearch
         aria-label={copy.search}
         onKeyDown={event => {
@@ -422,7 +427,7 @@ export function ModelCatalogMenu({
 
             // Collapsed when the user stored it (and not while searching, which
             // spans every model regardless of collapse state).
-            const collapsed = collapsedProviders.includes(slug) && !search
+            const collapsed = collapsedProviders.includes(slug) && !search && !showAll
 
             return (
               <DropdownMenuGroup className="py-0.5" key={slug}>
@@ -577,9 +582,17 @@ export function ModelCatalogMenu({
           trailing block it has always rendered. */}
       <DropdownMenuSeparator className="mx-0" />
       {footer}
+      {!showAll && (
+        <DropdownMenuItem onSelect={event => {
+          event.preventDefault()
+          setShowAll(true)
+        }}>
+          {t.modelDiscovery.showAllModels}
+        </DropdownMenuItem>
+      )}
       <DropdownMenuItem
         className={cn(dropdownMenuRow, 'text-(--ui-text-tertiary)')}
-        onSelect={() => setModelVisibilityOpen(true)}
+        onSelect={() => setModelVisibilityOpen(true, { connectionId, profile, sessionId })}
       >
         <Codicon name="settings-gear" size="0.75rem" />
         {copy.editModels}
@@ -598,7 +611,8 @@ function groupModels(
   providers: ModelOptionProvider[],
   search: string,
   current: { model: string; provider: string },
-  visible: Set<string> | null
+  visible: Set<string> | null,
+  showAll = false
 ): ProviderGroup[] {
   const q = normalize(search)
   const groups: ProviderGroup[] = []
@@ -620,6 +634,8 @@ function groupModels(
     if (q) {
       // Search spans every family, regardless of visibility.
       shown = new Set(allFamilies.filter(matches).map(family => family.id))
+    } else if (showAll) {
+      shown = new Set(allFamilies.map(family => family.id))
     } else if (visible) {
       // User has customized which models show — honor their selection exactly.
       shown = new Set(

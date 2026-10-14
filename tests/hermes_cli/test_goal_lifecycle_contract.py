@@ -53,7 +53,7 @@ def test_model_done_waits_for_authority_and_does_not_complete(monkeypatch, tmp_p
 
     decision = mgr.evaluate_after_turn("I am done")
     assert decision["verdict"] == "waiting_for_authority"
-    assert mgr.state.status == "active"
+    assert mgr.state.status == "paused"
     assert mgr.state.outcome == goals.WAITING_FOR_AUTHORITY
     assert mgr.state.completion_evidence is None
 
@@ -69,7 +69,7 @@ def test_model_done_with_contract_still_waits_for_verified_receipt(monkeypatch, 
 
     decision = mgr.evaluate_after_turn("I am done")
     assert decision["verdict"] == "waiting_for_authority"
-    assert mgr.state.status == "active"
+    assert mgr.state.status == "paused"
     assert mgr.state.outcome == goals.WAITING_FOR_AUTHORITY
     assert mgr.state.completion_evidence is None
 

@@ -2897,18 +2897,19 @@ class CLICommandsMixin:
                         queue_internal = getattr(
                             self, "_queue_internal_input", None
                         )
-                        if callable(queue_internal):
-                            queue_internal(prompt, source="goal_continuation")
-                        else:
-                            self._pending_input.put(prompt)
-                        queued = True
+                        if callable(queue_internal) and mgr.claim_continuation(f"cli-resume:{id(self)}"):
+                            try:
+                                queue_internal(prompt, source="goal_continuation")
+                                queued = True
+                            finally:
+                                mgr.release_continuation(queued=queued)
                     except Exception:
                         pass
                 if queued:
                     _cprint(f"  {_DIM}Continuing now — taking the next step.{_RST}")
                 else:
                     _cprint(
-                        f"  {_DIM}Send any message to kick off the next step.{_RST}"
+                        f"  {_DIM}{mgr.status_line()}{_RST}"
                     )
             return
 

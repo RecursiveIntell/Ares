@@ -648,3 +648,20 @@ describe('optimistic rewind/reload turn-clock seeding (#86795)', () => {
     expect(next.turnStartedAt).toBeGreaterThanOrEqual(before)
   })
 })
+
+describe('manual rewind recovery', () => {
+  it('never re-homes and replays an edit after a missing-owner reply', async () => {
+    const methods: string[] = []
+    const request = async <T>(method: string): Promise<T> => {
+      methods.push(method)
+      if (method === 'prompt.submit') {
+        throw new Error('session not found')
+      }
+      return { session_id: 'replacement' } as T
+    }
+    await expect(
+      runRewindSubmit(request, 'original', 'edited', undefined, undefined, false, { storedSessionId: 'stored' })
+    ).rejects.toThrow('session not found')
+    expect(methods).toEqual(['prompt.submit'])
+  })
+})

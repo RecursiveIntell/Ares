@@ -19,7 +19,7 @@ import { setSessionYolo } from '@/lib/yolo-session'
 import { openCommandPalettePage } from '@/store/command-palette'
 import { setComposerDraft } from '@/store/composer'
 import { enqueueQueuedPrompt } from '@/store/composer-queue'
-import { applyGoalStatusText } from '@/store/goals'
+import { applyGoalProjection, applyGoalStatusText } from '@/store/goals'
 import { dismissNotification, notify, notifyError } from '@/store/notifications'
 import { setPetScale } from '@/store/pet-gallery'
 import { $petGenInput, openPetGenerate } from '@/store/pet-generate'
@@ -268,8 +268,12 @@ export function useSlashCommand(deps: SlashCommandDeps) {
         let slashExecError: unknown = null
 
         const handleDispatch = async (
-          dispatch: NonNullable<ReturnType<typeof parseCommandDispatch>>
+          dispatch: NonNullable<ReturnType<typeof parseCommandDispatch>>,
+          raw?: unknown
         ): Promise<void> => {
+          const sidecar = raw as
+            { goal?: unknown; goal_continuation?: SubmitTextOptions['goalContinuation'] } | undefined
+          const typedGoal = name === 'goal' && applyGoalProjection(sessionId, sidecar?.goal)
           if (dispatch.type === 'exec' || dispatch.type === 'plugin') {
             // `/goal clear|pause|resume|status` can come back as a TYPED exec
             // dispatch (command.dispatch routing) instead of the plain-output
@@ -278,7 +282,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             // while the stale "Goal paused" card kept showing until the chat
             // was reopened (#80348). Mirror the output into the store exactly
             // like the plain-output path does.
-            if (name === 'goal' && dispatch.output) {
+            if (name === 'goal' && !typedGoal && dispatch.output) {
               applyGoalStatusText(sessionId, dispatch.output)
             }
 
@@ -305,11 +309,12 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             // `status.update kind:"goal"` after that turn's post-turn judge
             // runs. Seed the goal store from the notice so the indicator shows
             // the active goal right away instead of after the first turn.
-            if (name === 'goal') {
+            if (name === 'goal' && !typedGoal) {
               applyGoalStatusText(sessionId, dispatch.notice.trim())
             }
           }
 
+          const goalBinding = sidecar?.goal_continuation
           const message = ('message' in dispatch ? dispatch.message : '')?.trim() ?? ''
 
           // /undo returns a prefill directive: drop the backed-up message into
@@ -341,6 +346,9 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           // view's — see isTargetSessionBusy. `busyRef` mirrors whatever chat
           // is on screen, while this command runs against the session
           // resolveTargetSessionId picked, routinely a different one.
+          if (goalBinding && isTargetSessionBusy($sessionStates.get(), sessionId, busyRef.current)) {
+            return
+          }
           if (isTargetSessionBusy($sessionStates.get(), sessionId, busyRef.current)) {
             // The backend already executed the command — for `/goal <text>`
             // the goal is set and `message` is its kickoff prompt. Dropping
@@ -372,7 +380,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           // its kickoff as a user message into whatever conversation was on
           // screen. Every other target the dispatcher serves (tile, background
           // queue drain, a session created by this very call) had the same leak.
-          await submitPromptText(message, { sessionId, storedSessionId, displayText })
+          await submitPromptText(message, { sessionId, storedSessionId, displayText, goalContinuation: goalBinding })
         }
 
         try {
@@ -384,7 +392,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           const dispatch = parseCommandDispatch(result)
 
           if (dispatch) {
-            await handleDispatch(dispatch)
+            await handleDispatch(dispatch, result)
 
             return
           }
@@ -411,9 +419,8 @@ export function useSlashCommand(deps: SlashCommandDeps) {
         }
 
         try {
-          const dispatch = parseCommandDispatch(
-            await requestGateway<unknown>('command.dispatch', { session_id: sessionId, name, arg })
-          )
+          const result = await requestGateway<unknown>('command.dispatch', { session_id: sessionId, name, arg })
+          const dispatch = parseCommandDispatch(result)
 
           if (!dispatch) {
             renderSlashOutput('error: invalid response: command.dispatch')
@@ -421,7 +428,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             return
           }
 
-          await handleDispatch(dispatch)
+          await handleDispatch(dispatch, result)
         } catch (err) {
           // "not a quick/plugin/skill command" just means the fallback had
           // nothing to add — the slash.exec failure (worker timeout, crash) is

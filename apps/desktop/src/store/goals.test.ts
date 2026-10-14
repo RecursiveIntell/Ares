@@ -1,7 +1,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { $gateway } from './gateway'
-import { $goalsBySession, applyGoalStatusText, clearSessionGoal, refreshSessionGoal } from './goals'
+import {
+  $goalsBySession,
+  applyGoalProjection,
+  applyGoalStatusText,
+  clearSessionGoal,
+  refreshSessionGoal
+} from './goals'
 import { resetSessionGone } from './session-gone'
 
 describe('goal store', () => {
@@ -125,5 +131,34 @@ describe('goal store', () => {
     applyGoalStatusText('s2', '⏸ Goal (paused, 20/20 turns): other work', { hydrate: true })
 
     expect($goalsBySession.get().s2).toMatchObject({ status: 'paused', title: 'other work' })
+  })
+})
+
+describe('typed goal projection', () => {
+  it('keeps a blocked reason, action, budget and lower-revision guard', () => {
+    applyGoalProjection('typed', {
+      goal_id: 'g',
+      checkpoint_revision: 3,
+      status: 'blocked',
+      title: 'ship',
+      reason: 'owner approval',
+      next_action: 'provide owner receipt',
+      turns_used: 2,
+      max_turns: 8
+    })
+    applyGoalProjection('typed', { goal_id: 'g', checkpoint_revision: 2, status: 'active', title: 'stale' })
+    expect($goalsBySession.get().typed).toMatchObject({
+      status: 'blocked',
+      title: 'ship',
+      detail: 'owner approval',
+      nextAction: 'provide owner receipt',
+      turnsUsed: 2,
+      maxTurns: 8
+    })
+  })
+  it('equal revision active replies cannot overwrite a pause', () => {
+    applyGoalProjection('typed', { goal_id: 'g', checkpoint_revision: 3, status: 'paused', title: 'ship' })
+    applyGoalProjection('typed', { goal_id: 'g', checkpoint_revision: 3, status: 'active', title: 'ship' })
+    expect($goalsBySession.get().typed.status).toBe('paused')
   })
 })

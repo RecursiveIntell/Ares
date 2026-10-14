@@ -11,6 +11,8 @@ Run with:  python -m pytest tests/test_delegate.py -v
 
 import json
 import os
+import tempfile
+from pathlib import Path
 import threading
 import time
 import types
@@ -1469,12 +1471,16 @@ class TestConcurrencyDefaults(unittest.TestCase):
             }
         }
 
-        with patch.dict("sys.modules", {"cli": stale_cli}):
-            with patch(
-                "hermes_cli.config.load_config_readonly", return_value=active_config
-            ):
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        with tempfile.TemporaryDirectory() as home, patch.dict("sys.modules", {"cli": stale_cli}):
+            (Path(home) / "config.yaml").write_text(json.dumps(active_config))
+            token = set_hermes_home_override(home)
+            try:
                 self.assertEqual(_load_config()["max_concurrent_children"], 50)
                 self.assertEqual(_get_max_concurrent_children(), 50)
+            finally:
+                reset_hermes_home_override(token)
 
 
     @patch("tools.delegate_tool._load_config",

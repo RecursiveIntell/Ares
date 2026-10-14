@@ -808,14 +808,16 @@ def _(rid, params: dict) -> dict:
 
         lower = arg.strip().lower()
         if not arg.strip() or lower == "status":
-            return _ok(rid, {"type": "exec", "output": mgr.status_line()})
+            return _ok(rid, {"type": "exec", "output": mgr.status_line(), "goal": mgr.projection()})
         if lower == "pause":
             had = mgr.has_goal()
             state = mgr.pause(reason="user-paused")
+            if state is not None:
+                _cancel_goal_generation(session)
             if had and state is None:
                 return _err(rid, 5032, "Goal pause persistence unconfirmed; refresh before retrying")
             out = "No goal set." if state is None else f"⏸ Goal paused: {state.goal}"
-            return _ok(rid, {"type": "exec", "output": out})
+            return _ok(rid, {"type": "exec", "output": out, "goal": mgr.projection()})
         if lower == "resume":
             state = mgr.resume()
             if state is None:
@@ -830,7 +832,7 @@ def _(rid, params: dict) -> dict:
             prompt = mgr.next_continuation_prompt()
             notice = f"▶ Goal resumed: {state.goal}\nContinuing now — taking the next step."
             if not prompt:
-                return _ok(rid, {"type": "exec", "output": f"▶ Goal resumed: {state.goal}"})
+                return _ok(rid, {"type": "exec", "output": mgr.status_line(), "goal": mgr.projection()})
             return _ok(
                 rid,
                 {
@@ -838,11 +840,16 @@ def _(rid, params: dict) -> dict:
                     "notice": notice,
                     "message": prompt,
                     "display": "/goal resume",
+                    "goal": mgr.projection(),
+                    "goal_continuation": {"goal_id": state.goal_id, "checkpoint_revision": state.checkpoint_revision,
+                                          "continuation_token": state.continuation_token},
                 },
             )
         if lower in {"clear", "stop", "done"}:
             had = mgr.has_goal()
             cleared = mgr.clear()
+            if cleared:
+                _cancel_goal_generation(session)
             if had and not cleared:
                 return _err(rid, 5032, "Goal clear persistence unconfirmed; refresh before retrying")
             return _ok(
@@ -850,6 +857,7 @@ def _(rid, params: dict) -> dict:
                 {
                     "type": "exec",
                     "output": "✓ Goal cleared." if had else "No active goal.",
+                    "goal": None,
                 },
             )
 

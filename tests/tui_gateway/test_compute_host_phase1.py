@@ -525,6 +525,87 @@ def _register_turn(host: ComputeHost, fn, sid: str = "s1") -> None:
     host._track_turn_future(host._executor.submit(fn), sid)
 
 
+def test_broken_output_is_typed_and_never_acknowledged(monkeypatch):
+    read_fd, write_fd = os.pipe()
+    os.close(read_fd)
+    stream = os.fdopen(write_fd, 'w')
+    host = ComputeHost(stdout=stream, heartbeat_secs=0)
+    stops = []
+    agent = types.SimpleNamespace(interrupt=lambda **kw: stops.append('stop'))
+    monkeypatch.setattr(server, '_sessions', {'live': {'agent': agent, 'running': True, 'transport': host._transport}})
+    try:
+        assert host._transport.write({'jsonrpc': '2.0', 'method': 'event',
+            'params': {'session_id': 'live'}}) is False
+        assert host._output_failure['classification'] == 'HOST_OUTPUT_LOST'
+        assert host._output_failure['outcome'] == 'unknown'
+        assert host._closed.is_set()
+        assert stops == ['stop']
+        assert host.emit({'type': 'control.ack', 'request_id': 'unwritten'}) is False
+        assert stops == ['stop']
+    finally:
+        host.shutdown(wait=0)
+        # TextIO retains the unwritten buffer; closing the test's stream can
+        # retry that same broken pipe. The host must never acknowledge it.
+        try:
+            stream.close()
+        except BrokenPipeError:
+            pass
+
+
+def test_shutdown_signals_live_owner_before_drain(monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+    stops = []
+    host = ComputeHost(stdout=io.StringIO(), heartbeat_secs=0)
+    class Agent:
+        def interrupt(self, **kwargs):
+            stops.append('stop')
+            release.set()
+    monkeypatch.setattr(server, '_sessions', {'live': {'agent': Agent(), 'running': True}})
+    finalized = []
+    monkeypatch.setattr(server, '_finalize_session', lambda *a, **kw: finalized.append('finalize'))
+    def work():
+        entered.set()
+        release.wait(4)
+    _register_turn(host, work, 'live')
+    assert entered.wait(2)
+    try:
+        host.shutdown(wait=1)
+        assert stops == ['stop']
+        assert finalized == ['finalize']
+    finally:
+        release.set()
+
+
+def test_R09_atexit_seam_retains_live_non_custody_session(monkeypatch):
+    # Execute the real server atexit owner. This is controller-owned source;
+    # keep the RED witness if that seam cannot be repaired in this lane.
+    release = threading.Event()
+    started = threading.Event()
+    thread = threading.Thread(target=lambda: (started.set(), release.wait(4)), daemon=True)
+    thread.start()
+    assert started.wait(2)
+    session = {'running': True, '_run_thread': thread, 'session_key': 'r09',
+        'history': [], 'history_lock': threading.RLock(), 'agent': types.SimpleNamespace()}
+    monkeypatch.setattr(server, '_sessions', {'r09': session})
+    monkeypatch.setattr(server, '_flush_sessions_before_exit', lambda: None)
+    monkeypatch.setattr(server, '_release_gateway_wake_owner', lambda: None)
+    closed = []
+    # The close seam invokes the real one-shot finalizer; capture only teardown
+    # side effects unrelated to the live-work decision.
+    def close(sid, end_reason):
+        server._finalize_session(session, end_reason=end_reason)
+        if session.get('_finalized'):
+            closed.append(sid)
+    monkeypatch.setattr(server, '_close_session_by_id', close)
+    try:
+        server._shutdown_sessions()
+        assert not closed, 'atexit finalized a still-running non-custody turn'
+    finally:
+        release.set()
+        thread.join(2)
+
+
 def test_shutdown_drains_in_flight_turn_before_finalizing_sessions(monkeypatch):
     events: list[str] = []
     _record_finalize(monkeypatch, events)

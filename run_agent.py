@@ -3395,6 +3395,9 @@ class AIAgent:
             if hard_cancel
             else ("user sent a new message" if message else "user interrupt")
         )
+        stop_event = vars(self).get('_delegate_stop_event')
+        if stop_event is not None:
+            stop_event.set()
 
         _redirect_lock = getattr(self, "_pending_redirect_lock", None)
         if _redirect_lock is not None:
@@ -4734,6 +4737,51 @@ class AIAgent:
                 preserve_agent=preserve_agent,
             )
 
+    def _has_owned_tool_work(self) -> bool:
+        """Exact retained sandbox witnesses, never a process-wide tool guess."""
+        tracker = vars(self).get('_tool_worker_threads')
+        lock = vars(self).get('_tool_worker_threads_lock')
+        if tracker is not None and lock is not None:
+            with lock:
+                if tracker:
+                    return True
+        return vars(self).get('_owned_turn_retirement_state') == 'incomplete' or any(
+            worker.is_alive() for worker in vars(self).get('_owned_tool_work', ())) or bool(
+            vars(self).get('_owned_tool_work_unknown', False)
+        )
+
+    def _wait_owned_tool_settlement(self) -> None:
+        """Observe retained owners off the caller path; no unbounded join."""
+        wake = threading.Event()
+        while self._has_owned_tool_work():
+            wake.wait(0.1)
+        event = vars(self).get('_owned_turn_retired')
+        if event is not None:
+            while not event.wait(0.1):
+                pass
+
+    def _defer_owned_tool_retirement(self, retire) -> bool:
+        if not self._has_owned_tool_work():
+            return False
+        retired = threading.Event()
+        self._owned_turn_retired = retired
+        import contextvars
+        context = contextvars.copy_context()
+        def supervise():
+            wake = threading.Event()
+            while self._has_owned_tool_work():
+                wake.wait(0.1)
+            try:
+                if context.run(retire) is not False:
+                    retired.set()
+            except Exception:
+                self._owned_turn_retirement_state = 'incomplete'
+                logger.exception('Owned turn retirement requires reconciliation')
+        self._owned_tool_supervisor = threading.Thread(target=supervise,
+            name=f'owned-tool-settlement-{self.session_id}', daemon=True)
+        self._owned_tool_supervisor.start()
+        return True
+
     def close(self) -> None:
         """Release all resources held by this agent instance.
 
@@ -4748,6 +4796,31 @@ class AIAgent:
         Safe to call multiple times (idempotent).  Each cleanup step is
         independently guarded so a failure in one does not prevent the rest.
         """
+        # Closing resources is retirement, not cancellation. A live delegated
+        # worker, owned RPC or final turn lease keeps its exact DB/client owner.
+        future = vars(self).get('_delegate_worker_future')
+        from concurrent.futures import wait as wait_futures
+        live_worker = future is not None and future not in wait_futures({future}, timeout=0)[0]
+        children_lock = vars(self).get('_active_children_lock')
+        if children_lock is not None:
+            with children_lock:
+                children = list(self._active_children)
+        else:
+            children = list(vars(self).get('_active_children', ()))
+        live_children = [child for child in children
+            if vars(child).get('_delegate_cleanup_state') != 'complete']
+        from tools.delegate_tool import _owned_subagent_supervisors
+        detached_owned, detached_children = _owned_subagent_supervisors(vars(self).get('session_id'))
+        if live_worker or self._has_owned_tool_work() or live_children or detached_owned or vars(self).get('_active_session_turn_lease_holder'):
+            self._close_cleanup_state = 'incomplete'
+            try:
+                request_hard_interrupt(self)
+                for child in detached_children:
+                    request_hard_interrupt(child)
+            except Exception:
+                logger.debug('Close interrupt failed; retaining live owner', exc_info=True)
+            return
+        self._close_cleanup_state = 'complete'
         # AIAgent.close() is the hard owner boundary. Gateway cleanup may
         # call shutdown_memory_provider() first; its idempotence prevents
         # duplicate extraction while direct callers cannot skip provider close.
@@ -4796,7 +4869,6 @@ class AIAgent:
         try:
             with self._active_children_lock:
                 children = list(self._active_children)
-                self._active_children.clear()
             for child in children:
                 try:
                     child.close()
@@ -8558,7 +8630,7 @@ class AIAgent:
                      skip_tool_execution_middleware: bool = False) -> str:
         """Forwarder — see ``agent.agent_runtime_helpers.invoke_tool``."""
         from agent.agent_runtime_helpers import invoke_tool
-        return invoke_tool(
+        result = invoke_tool(
             self,
             function_name,
             function_args,
@@ -8570,6 +8642,28 @@ class AIAgent:
             tool_request_middleware_trace,
             skip_tool_execution_middleware,
         )
+        if function_name == 'execute_code':
+            try:
+                payload = json.loads(result) if isinstance(result, str) else result
+                cleanup = payload.get('cleanup', {}) if isinstance(payload, dict) else {}
+                if cleanup.get('status') == 'incomplete':
+                    name = cleanup.get('rpc_thread_name')
+                    witnesses = [worker for worker in threading.enumerate()
+                        if worker.name == name and hasattr(worker, 'sandbox_execution')]
+                    if len(witnesses) == 1:
+                        rpc = witnesses[0]
+                        owned = vars(self).setdefault('_owned_tool_work', [])
+                        for worker in (rpc, *getattr(rpc.sandbox_execution, 'output_readers', ())):
+                            if worker not in owned:
+                                owned.append(worker)
+                    else:
+                        self._owned_tool_work_unknown = True
+                    # The RPC may have exited after the snapshot while an
+                    # output reader remains live. Missing or ambiguous identity
+                    # cannot prove settlement of every owned resource.
+            except (TypeError, ValueError, AttributeError):
+                self._owned_tool_work_unknown = True
+        return result
 
     @staticmethod
     def _wrap_verbose(label: str, text: str, indent: str = "     ") -> str:
@@ -9102,7 +9196,11 @@ class AIAgent:
                     # The lease remains held through relay/task finalization, but
                     # those post-loop steps must not receive a late refresh
                     # interrupt that poisons the next turn on a cached agent.
-                    _stop_durable_turn_lease_refresher()
+                    # A terminal tool result may leave an owned RPC authorized
+                    # to write. Its lease must keep renewing until settlement;
+                    # retaining only the row lets the TTL expire underneath it.
+                    if not self._has_owned_tool_work():
+                        _stop_durable_turn_lease_refresher()
                     # Interrupt clear is deferred to after thread join in the
                     # outer finally: a refresher firing between stop and join
                     # would otherwise set an interrupt that survives the clear.
@@ -9138,78 +9236,88 @@ class AIAgent:
                 finish_task_run(**task_context, error=exc)
             raise
         finally:
-            if durable_turn_lease is not None:
-                self._context_input_receipt = None
-                self._context_input_authorizer = None
-                self._context_input_existing_message = None
-            try:
-                if relay_turn is not None:
-                    relay_runtime.SESSION_COORDINATOR.end_turn(
-                        relay_turn,
-                        outcome=relay_outcome,
-                    )
-            finally:
+            def retire_owned_turn():
+                if durable_turn_lease is not None:
+                    self._context_input_receipt = None
+                    self._context_input_authorizer = None
+                    self._context_input_existing_message = None
                 try:
-                    if relay_lease is not None:
-                        relay_runtime.SESSION_COORDINATOR.release_conversation(
-                            relay_lease
+                    if relay_turn is not None:
+                        relay_runtime.SESSION_COORDINATOR.end_turn(
+                            relay_turn,
+                            outcome=relay_outcome,
                         )
                 finally:
-                    _stop_durable_turn_lease_refresher()
-                    if (
-                        durable_turn_lease_thread is not None
-                        and durable_turn_lease_thread.is_alive()
-                    ):
-                        durable_turn_lease_thread.join(timeout=1.0)
-                    # Clear any interrupt the refresher may have fired between
-                    # the inner stop and this join. Must run AFTER join so a
-                    # late interrupt does not survive into the next turn.
-                    _clear_durable_turn_lease_interrupt()
-                    if durable_turn_lease is not None:
-                        if input_receipt is not None:
-                            try:
-                                _turn_db.release_context_input_turn(self.session_id,
-                                    turn_lease_holder=durable_turn_lease)
-                            except Exception:
-                                logger.error("Input execution release requires native reconciliation", exc_info=True)
-                        self._context_input_phase = None
-                        if turn_run_custody is not None:
-                            try:
-                                cleanup_errors = turn_run_custody.finish_turn(durable_turn_lease)
-                                if cleanup_errors:
-                                    self._run_checkpoint_cleanup_errors = cleanup_errors
-                                    logger.error("Run checkpoint cleanup requires reconciliation: %s", cleanup_errors)
-                                    self._emit_warning("Run checkpoint cleanup is unresolved; reconcile native custody before continuing that run.")
-                            except Exception:
-                                logger.error("Run checkpoint cleanup outcome unknown; reconciliation required")
-                        try:
-                            _turn_db.release_session_turn_lease(
-                                session_id, durable_turn_lease
-                            )
-                        except Exception:
-                            logger.error(
-                                "Failed to release session turn lease: %s",
-                                session_id,
-                                exc_info=True,
-                            )
-                        if (
-                            getattr(self, "_active_session_turn_lease_holder", None)
-                            == durable_turn_lease
-                        ):
-                            self._active_session_turn_lease_holder = None
-                            self._active_session_turn_lease_ttl_seconds = None
-                    # Always clear mid-turn labels when the turn exits — including
-                    # interrupted early returns that skip finalize_turn. Keep ts.
                     try:
-                        self._reset_activity_labels_after_turn()
-                    except Exception:
-                        pass
-                    if getattr(self, "_relay_pending_turn_id", None) == relay_turn_id:
-                        self._relay_pending_turn_id = None
-                    if acct_token is not None:
-                        reset_accounting_context(acct_token)
-                    if token is not None:
-                        reset_conversation_context(token)
+                        if relay_lease is not None:
+                            relay_runtime.SESSION_COORDINATOR.release_conversation(
+                                relay_lease
+                            )
+                    finally:
+                        _stop_durable_turn_lease_refresher()
+                        if (
+                            durable_turn_lease_thread is not None
+                            and durable_turn_lease_thread.is_alive()
+                        ):
+                            durable_turn_lease_thread.join(timeout=1.0)
+                        # Clear any interrupt the refresher may have fired between
+                        # the inner stop and this join. Must run AFTER join so a
+                        # late interrupt does not survive into the next turn.
+                        _clear_durable_turn_lease_interrupt()
+                        if durable_turn_lease is not None:
+                            if input_receipt is not None:
+                                try:
+                                    _turn_db.release_context_input_turn(self.session_id,
+                                        turn_lease_holder=durable_turn_lease)
+                                except Exception:
+                                    logger.error("Input execution release requires native reconciliation", exc_info=True)
+                            self._context_input_phase = None
+                            if turn_run_custody is not None:
+                                try:
+                                    cleanup_errors = turn_run_custody.finish_turn(durable_turn_lease)
+                                    if cleanup_errors:
+                                        self._run_checkpoint_cleanup_errors = cleanup_errors
+                                        logger.error("Run checkpoint cleanup requires reconciliation: %s", cleanup_errors)
+                                        self._emit_warning("Run checkpoint cleanup is unresolved; reconcile native custody before continuing that run.")
+                                except Exception:
+                                    logger.error("Run checkpoint cleanup outcome unknown; reconciliation required")
+                            try:
+                                _turn_db.release_session_turn_lease(
+                                    session_id, durable_turn_lease
+                                )
+                            except Exception:
+                                self._owned_turn_retirement_state = 'incomplete'
+                                logger.error(
+                                    "Failed to release session turn lease: %s",
+                                    session_id,
+                                    exc_info=True,
+                                )
+                                # Unknown release is not closure. Keep the
+                                # holder/DB and do not signal settled retirement.
+                                return False
+                            if (
+                                getattr(self, "_active_session_turn_lease_holder", None)
+                                == durable_turn_lease
+                            ):
+                                self._active_session_turn_lease_holder = None
+                                self._active_session_turn_lease_ttl_seconds = None
+                        # Always clear mid-turn labels when the turn exits — including
+                        # interrupted early returns that skip finalize_turn. Keep ts.
+                        try:
+                            self._reset_activity_labels_after_turn()
+                        except Exception:
+                            pass
+                        if getattr(self, "_relay_pending_turn_id", None) == relay_turn_id:
+                            self._relay_pending_turn_id = None
+
+            if not self._defer_owned_tool_retirement(retire_owned_turn):
+                retire_owned_turn()
+            # Context tokens belong to the conversation thread. Resource
+            # retirement may be handed off, token resets may not.
+            if acct_token is not None:
+                reset_accounting_context(acct_token)
+            if token is not None:
+                reset_conversation_context(token)
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """

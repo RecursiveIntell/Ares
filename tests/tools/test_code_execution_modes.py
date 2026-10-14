@@ -534,11 +534,12 @@ class TestPythonPathComposition(unittest.TestCase):
         def _fake_popen(cmd, **kwargs):
             env = kwargs.get("env") or {}
             captured["PYTHONPATH"] = env.get("PYTHONPATH", "")
-            # cmd is [python, <staging_dir>/script.py]
-            captured["staging_dir"] = os.path.dirname(cmd[1])
+            # The script remains the final argument; unbuffered launch adds
+            # an interpreter flag without changing staging ownership.
+            captured["staging_dir"] = os.path.dirname(cmd[-1])
             mock_proc = unittest.mock.MagicMock()
-            mock_proc.stdout.read.return_value = b""
-            mock_proc.stderr.read.return_value = b""
+            mock_proc.stdout.read1.return_value = b""
+            mock_proc.stderr.read1.return_value = b""
             mock_proc.wait.return_value = 0
             mock_proc.returncode = 0
             mock_proc.poll.return_value = 0

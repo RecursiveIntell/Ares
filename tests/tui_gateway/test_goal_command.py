@@ -200,16 +200,10 @@ def _exhaust_budget(session_key: str, goal_text: str = "finish the benchmark"):
     return mgr
 
 
-def test_goal_resume_after_budget_exhaustion_dispatches_continuation(
+def test_goal_resume_after_budget_exhaustion_does_not_reset_budget(
     server, session
 ):
-    """#75362: /goal resume must restart work, not just flip state.
-
-    The pre-fix handler returned a display-only `exec` payload, so the
-    resumed goal sat idle until the user sent another message. Resume
-    must return a sendable dispatch carrying the canonical continuation
-    prompt, with a concise `/goal resume` transcript projection.
-    """
+    """Reopening scheduling does not replenish cumulative goal budget."""
     from hermes_cli.goals import GoalManager
 
     sid, session_key, _ = session
@@ -218,14 +212,9 @@ def test_goal_resume_after_budget_exhaustion_dispatches_continuation(
 
     r = _call(server, "command.dispatch", name="goal", arg="resume", session_id=sid)
     result = r["result"]
-    assert result["type"] == "send"
-    assert result["message"].startswith("[Continuing toward your standing goal]")
-    assert result["display"] == "/goal resume"
-    assert "Goal resumed" in result["notice"]
-
-    state = GoalManager(session_key).state
-    assert state.status == "active"
-    assert state.turns_used == 1, "resume must preserve the cumulative turn budget"
+    assert result["type"] == "exec"
+    assert GoalManager(session_key).state.turns_used == 1
+    assert GoalManager(session_key).claim_continuation("budget-exhausted") is False
 
 
 def test_goal_resume_without_goal_stays_exec(server, session):
@@ -289,6 +278,7 @@ def test_active_goal_retries_once_without_judging_failed_turn(
         clear_interrupt=lambda: None,
     )
     session = _turn_session(agent, session_key)
+    monkeypatch.setitem(server._sessions, "sid", session)
 
     server._run_prompt_submit("rid", "sid", session, "initial work")
 
@@ -325,6 +315,7 @@ def test_second_consecutive_exhaustion_pauses_goal_instead_of_looping(
         clear_interrupt=lambda: None,
     )
     session = _turn_session(agent, session_key)
+    monkeypatch.setitem(server._sessions, "sid", session)
 
     server._run_prompt_submit("rid", "sid", session, "initial work")
 
