@@ -1,3 +1,5 @@
+import type { SelectorVersion } from '@/lib/selector-observation'
+
 export interface ConfigFieldSchema {
   category?: string
   description?: string
@@ -690,6 +692,8 @@ export interface SessionResumeResponse {
 }
 
 export interface SessionRuntimeInfo {
+  selector_version?: SelectorVersion
+  session_id?: string
   pending_runtime_options?: null | { effort?: string; fast?: boolean }
   approval_mode?: 'manual' | 'off' | 'smart'
   branch?: string

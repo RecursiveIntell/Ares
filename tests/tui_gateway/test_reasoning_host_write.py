@@ -179,7 +179,8 @@ def test_cold_reasoning_uses_existing_snapshot_reconstruction(monkeypatch):
     monkeypatch.setattr(server, "_emit", Mock())
     monkeypatch.setattr(server, "_persist_live_session_runtime", Mock())
     agent = SimpleNamespace(model="fixture", provider="fixture", reasoning_config=None)
-    record = {"session_key": "stored", "agent": agent, "running": False}
+    # Real reconstructed sessions own a plain canonical history lock.
+    record = {"session_key": "stored", "agent": agent, "running": False, "history_lock": threading.Lock()}
     output = io.StringIO()
     host = ComputeHost(stdout=output, heartbeat_secs=0)
     snapshot = {"sid": "live", "session_key": "stored"}

@@ -19,7 +19,7 @@ _REAL_THREAD = threading.Thread
 @pytest.fixture
 def projection_env(monkeypatch):
     monkeypatch.setattr(server, "_sessions", {})
-    monkeypatch.setattr(server, "_session_info", lambda *a: {})
+    monkeypatch.setattr(server, "_session_info", lambda *a, lock_held=False: {})
     monkeypatch.setattr(server, "_fallback_session_info", lambda *a: {})
     monkeypatch.setattr(server, "_get_db", lambda: None)
     monkeypatch.setattr(server, "_drain_queued_prompt", lambda *a: False)

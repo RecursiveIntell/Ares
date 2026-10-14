@@ -330,7 +330,7 @@ class ComputeHost:
                                 "session_id": sid,
                                 "running": bool(request_id or session.get("running")),
                                 "request_id": request_id,
-                                "session_info": server._session_info(agent, session),
+                                "session_info": server._session_info(agent, session, lock_held=True),
                             }
                         )
             except Exception as exc:
@@ -826,6 +826,12 @@ class ComputeHost:
             session["attached_images"] = list(frame.get("attached_images") or [])
         if frame.get("model_override") is not None:
             session["model_override"] = frame.get("model_override")
+        if frame.get("reasoning_config_override") is not None:
+            session["create_reasoning_override"] = frame["reasoning_config_override"]
+        if frame.get("service_tier_override") is not None:
+            session["create_service_tier_override"] = frame["service_tier_override"]
+        if frame.get("pending_runtime_options"):
+            session["pending_model_switch"] = {"runtime_options": dict(frame["pending_runtime_options"])}
         return session
 
     def _handle_reload_mcp(self, frame: dict[str, Any]) -> None:

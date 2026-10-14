@@ -170,7 +170,7 @@ def test_terminal_cannot_project_into_a_replaced_parent_record(monkeypatch):
     emitted,drained = Mock(),Mock()
     monkeypatch.setattr(server,'_emit',emitted)
     monkeypatch.setattr(server,'_drain_queued_prompt',drained)
-    monkeypatch.setattr(server,'_session_info',lambda *a:{})
+    monkeypatch.setattr(server,'_session_info',lambda *a, lock_held=False:{})
     server._on_compute_host_turn_done('rpc','sid',old,{'type':'turn.end','sid':'sid','request_id':'A'})
     emitted.assert_not_called();drained.assert_not_called()
     assert old['running'] is True and replacement['_compute_host_active_request_id']=='B'

@@ -22,7 +22,7 @@ def test_wrong_or_duplicate_terminal_cannot_settle_parent(monkeypatch):
     effects = []
     monkeypatch.setattr(server, "_clear_inflight_turn", lambda s: effects.append("clear"))
     monkeypatch.setattr(server, "_emit", lambda *a: effects.append("emit"))
-    monkeypatch.setattr(server, "_session_info", lambda *a: {})
+    monkeypatch.setattr(server, "_session_info", lambda *a, lock_held=False: {})
     monkeypatch.setattr(server, "_drain_queued_prompt", lambda *a: effects.append("drain"))
     for sid, rid in (("s", "B"), ("other", "A")):
         server._on_compute_host_turn_done("rpc", "s", session,
@@ -98,7 +98,7 @@ def test_late_terminal_resolves_uncertain_send_without_replay(tmp_path, monkeypa
         raise OSError("uncertain write")
     monkeypatch.setattr(host, "_send_frame", fail_send)
     monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda *a: host)
-    monkeypatch.setattr(server, "_session_info", lambda *a: {})
+    monkeypatch.setattr(server, "_session_info", lambda *a, lock_held=False: {})
     monkeypatch.setattr(server, "_clear_inflight_turn", lambda *a: None)
     emitted = []
     drained = []
@@ -124,7 +124,7 @@ def test_projection_failure_retains_owner_and_does_not_repeat_emit(monkeypatch):
     session = state(monkeypatch)
     calls = []
     monkeypatch.setattr(server, "_clear_inflight_turn", lambda *a: None)
-    monkeypatch.setattr(server, "_session_info", lambda *a: {})
+    monkeypatch.setattr(server, "_session_info", lambda *a, lock_held=False: {})
     def fail_emit(*args):
         calls.append(args)
         raise OSError("projection outcome unknown")
@@ -154,7 +154,7 @@ def test_dequeued_terminal_after_abort_claim_publishes_and_drains_nothing(monkey
     effects = []
     monkeypatch.setattr(server, "_clear_inflight_turn", lambda *a: effects.append("clear"))
     monkeypatch.setattr(server, "_emit", lambda *a: effects.append("emit"))
-    monkeypatch.setattr(server, "_session_info", lambda *a: {})
+    monkeypatch.setattr(server, "_session_info", lambda *a, lock_held=False: {})
     monkeypatch.setattr(server, "_drain_queued_prompt", lambda *a: effects.append("drain"))
     terminal = {"type": "turn.end", "sid": "s", "request_id": "A"}
     failures = []
@@ -193,7 +193,7 @@ def test_abort_after_terminal_claim_before_emit_publishes_and_drains_nothing(mon
 
     monkeypatch.setattr(server, "_clear_inflight_turn", paused_clear)
     monkeypatch.setattr(server, "_emit", lambda *a: effects.append("emit"))
-    monkeypatch.setattr(server, "_session_info", lambda *a: {})
+    monkeypatch.setattr(server, "_session_info", lambda *a, lock_held=False: {})
     monkeypatch.setattr(server, "_drain_queued_prompt", lambda *a: effects.append("drain"))
     failures = []
 

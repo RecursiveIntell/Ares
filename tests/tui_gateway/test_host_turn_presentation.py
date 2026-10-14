@@ -27,7 +27,8 @@ def test_session_info_stays_busy_during_host_handoff(tmp_path, monkeypatch):
     monkeypatch.setattr(banner, "get_update_result", lambda **kw: None)
     monkeypatch.setattr(server, "_load_cfg", lambda: {})
     monkeypatch.setattr(server, "_get_db", lambda: None)
-    session = {"running": False, "_host_turn_request_id": "A", "cwd": str(tmp_path)}
+    session = {"running": False, "_host_turn_request_id": "A", "cwd": str(tmp_path),
+               "history_lock": threading.Lock()}
     agent = types.SimpleNamespace(model="test-model", provider="test-provider")
     assert server._session_info(agent, session)["running"] is True
     session.pop("_host_turn_request_id")

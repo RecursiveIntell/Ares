@@ -198,7 +198,7 @@ def test_group_member_session_create_uses_its_profile_policy(construction, monke
     monkeypatch.setattr(server, "_start_notification_poller", lambda *a: None)
     monkeypatch.setattr(server, "_notify_session_boundary", lambda *a: None)
     monkeypatch.setattr(server, "_schedule_mcp_late_refresh", lambda *a: None)
-    monkeypatch.setattr(server, "_session_info", lambda agent, session:
+    monkeypatch.setattr(server, "_session_info", lambda agent, session, *, lock_held=False:
                         {"tools": sorted(agent.valid_tool_names), "source": session["source"]})
     monkeypatch.setattr(server, "_emit", lambda event, sid, data: events.append((event, data)))
     monkeypatch.setattr(tools.approval, "register_gateway_notify", lambda *a: None)

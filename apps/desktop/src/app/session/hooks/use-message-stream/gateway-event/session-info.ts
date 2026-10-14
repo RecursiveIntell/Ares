@@ -1,6 +1,8 @@
 import { getApiRequestConnection } from '@/api/client'
 import { normalizePersonalityValue } from '@/lib/chat-runtime'
+import { createClientSessionState } from '@/lib/chat-runtime'
 import { modelOptionsQueryKey } from '@/lib/model-options'
+import { reconcileSelectorInfo } from '@/lib/selector-observation'
 import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
 import { requestDesktopOnboardingForCredentialWarning } from '@/store/onboarding'
 import { followActiveSessionCwd } from '@/store/projects'
@@ -154,6 +156,7 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
     // A reconnect retires the old runtime id. It may still have buffered
     // session.info frames, but those frames cannot prove the durable turn has
     // settled: only a fresh runtime binding or durable hydrate may do that.
+    const selectorPatch = reconcileSelectorInfo(knownState ?? createClientSessionState(), payload ?? {})
     const retiredRuntime = Boolean(knownState?.reconnecting)
     const modelValueChanged = modelChanged && payload!.model !== (knownState?.model ?? $currentModel.get())
 
@@ -214,21 +217,13 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
         setCurrentPersonality(normalizePersonalityValue(payload.personality))
       }
 
-      if (typeof payload?.reasoning_effort === 'string' &&
-          (knownState?.pendingRuntimeOptions?.effort === undefined ||
-           payload.reasoning_effort === knownState.pendingRuntimeOptions.effort)) {
-        setCurrentReasoningEffort(payload.reasoning_effort, false)
+      if (selectorPatch.reasoningEffort !== undefined) {
+        setCurrentReasoningEffort(selectorPatch.reasoningEffort, false)
       }
 
-      if (typeof payload?.service_tier === 'string') {
-        setCurrentServiceTier(payload.service_tier)
-      }
+      if (selectorPatch.serviceTier !== undefined) { setCurrentServiceTier(selectorPatch.serviceTier) }
 
-      if (typeof payload?.fast === 'boolean' &&
-          (knownState?.pendingRuntimeOptions?.fast === undefined ||
-           payload.fast === knownState.pendingRuntimeOptions.fast)) {
-        setCurrentFastMode(payload.fast, false)
-      }
+      if (selectorPatch.fast !== undefined) { setCurrentFastMode(selectorPatch.fast, false) }
 
       if (typeof payload?.yolo === 'boolean') {
         setYoloActive(payload.yolo)
@@ -239,51 +234,14 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
       updateSessionState(
         sessionId,
         state => {
-          const pending = state.pendingModelSelection
-          const hasIncomingModelMetadata = statePatch.model !== undefined || statePatch.provider !== undefined
-
-          // A model click updates the owning runtime slice immediately. A
-          // session.info heartbeat that was queued before that click can arrive
-          // later with the exact previous pair; it is stale relative to the
-          // local intent, not evidence that the click failed. A matching pick
-          // or genuinely different backend-normalized pair remains authoritative
-          // and settles the pending selection.
-          const repeatsPreviousModel =
-            Boolean(pending) &&
-            hasIncomingModelMetadata &&
-            (statePatch.model === undefined || statePatch.model === pending?.previousModel) &&
-            (statePatch.provider === undefined || statePatch.provider === pending?.previousProvider)
-
-          const { model: _incomingModel, provider: _incomingProvider, ...nonModelStatePatch } = statePatch
-          const effectiveStatePatch = { ...(repeatsPreviousModel ? nonModelStatePatch : statePatch) }
-          const options = state.pendingRuntimeOptions
-
-          if (options?.effort !== undefined && effectiveStatePatch.reasoningEffort !== options.effort) {
-            delete effectiveStatePatch.reasoningEffort
-          }
-
-          if (options?.fast !== undefined && effectiveStatePatch.fast !== options.fast) {
-            delete effectiveStatePatch.fast
-            delete effectiveStatePatch.serviceTier
-          }
-
-          const optionsApplied = options && payload?.pending_runtime_options === null &&
-            (options.effort === undefined || statePatch.reasoningEffort === options.effort) &&
-            (options.fast === undefined || statePatch.fast === options.fast)
-
-          const pendingModelSelection = repeatsPreviousModel
-            ? pending
-            : hasIncomingModelMetadata
-              ? null
-              : pending
+          const { model: _model, provider: _provider, reasoningEffort: _effort, fast: _fast, serviceTier: _tier, ...other } = statePatch
 
           return {
             ...state,
-            ...effectiveStatePatch,
-            pendingRuntimeOptions: optionsApplied ? null : state.pendingRuntimeOptions,
-            branch: effectiveStatePatch.branch ?? state.branch,
-            cwd: effectiveStatePatch.cwd ?? state.cwd,
-            pendingModelSelection
+            ...other,
+            ...reconcileSelectorInfo(state, payload ?? {}),
+            branch: other.branch ?? state.branch,
+            cwd: other.cwd ?? state.cwd
           }
         },
         payload?.stored_session_id || undefined

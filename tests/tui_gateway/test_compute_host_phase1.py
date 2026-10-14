@@ -963,10 +963,14 @@ def test_compute_host_lookup_returns_session_owner_metadata(monkeypatch):
     output = io.StringIO()
     host = ComputeHost(stdout=output, heartbeat_secs=0)
     monkeypatch.setattr(server, "_sessions", {owner_sid: session})
+    def owner_info(_agent, _session, *, lock_held=False):
+        assert lock_held is True
+        assert _session["history_lock"].locked()
+        return {"model": "owner-model", "provider": "owner-provider"}
     monkeypatch.setattr(
         server,
         "_session_info",
-        lambda _agent, _session: {"model": "owner-model", "provider": "owner-provider"},
+        owner_info,
     )
     try:
         host._handle_session_lookup(

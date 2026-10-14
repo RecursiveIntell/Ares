@@ -54,7 +54,7 @@ def test_false_idle_parent_still_targets_known_owner(monkeypatch):
     monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda: host)
     monkeypatch.setattr(server, "_clear_pending", lambda *a: None)
     monkeypatch.setattr(server, "_emit", lambda *a: None)
-    monkeypatch.setattr(server, "_session_info", lambda *a: {})
+    monkeypatch.setattr(server, "_session_info", lambda *a, lock_held=False: {})
     assert server._interrupt_session_turn("s", session, request_id="stop")
     assert len(calls) == 1 and calls[0][0] == 's'
     correlation = calls[0][1]
@@ -81,7 +81,7 @@ def test_late_parent_stop_does_not_clear_successor_state(monkeypatch):
                         lambda: types.SimpleNamespace(interrupt=handoff))
     monkeypatch.setattr(server, "_clear_pending", lambda *a: pytest.fail("new owner pending UI cleared"))
     monkeypatch.setattr(server, "_emit", lambda *a: None)
-    monkeypatch.setattr(server, "_session_info", lambda *a: {})
+    monkeypatch.setattr(server, "_session_info", lambda *a, lock_held=False: {})
     assert server._interrupt_session_turn("s", session, request_id="stop")
     assert session["queued_prompt"] is queued
     assert not session.get("_turn_cancel_requested")

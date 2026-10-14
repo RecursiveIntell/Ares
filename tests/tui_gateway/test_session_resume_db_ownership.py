@@ -284,7 +284,7 @@ def test_resume_keeps_profile_db_open_after_ownership_transfer(profile_dbs, monk
     monkeypatch.setattr(server, "_set_session_context", lambda _target: [])
     monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
     monkeypatch.setattr(server, "_stored_session_runtime_overrides", lambda _found: {})
-    monkeypatch.setattr(server, "_session_info", lambda agent, *a: {"model": "test"})
+    monkeypatch.setattr(server, "_session_info", lambda agent, *a, lock_held=False: {"model": "test"})
 
     resp = _resume(session_id="s1", profile="work", eager_build=True)
 
@@ -377,7 +377,7 @@ def test_resume_eager_never_transfers_shared_launch_db(profile_dbs, monkeypatch)
     monkeypatch.setattr(
         server, "_stored_session_runtime_overrides", lambda _found: {}
     )
-    monkeypatch.setattr(server, "_session_info", lambda agent, *a: {"model": "test"})
+    monkeypatch.setattr(server, "_session_info", lambda agent, *a, lock_held=False: {"model": "test"})
 
     resp = _resume(session_id="s1", eager_build=True)
 

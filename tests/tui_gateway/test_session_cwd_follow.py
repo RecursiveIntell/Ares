@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import threading
 
 import pytest
 
@@ -48,7 +49,8 @@ def session(repo_with_worktree):
     repo, _ = repo_with_worktree
     key = "sess-follow"
     terminal_tool.clear_session_cwd(key)
-    yield {"session_key": key, "cwd": str(repo), "source": "desktop"}
+    yield {"session_key": key, "cwd": str(repo), "source": "desktop",
+           "history_lock": threading.Lock()}
     terminal_tool.clear_session_cwd(key)
 
 

@@ -710,7 +710,7 @@ def test_terminal_publish_failure_cannot_clear_replacement_owner(monkeypatch):
     monkeypatch.setattr(server, "_persist_branch_seed", lambda *a: None)
     monkeypatch.setattr(server, "_start_inflight_turn", lambda *a: None)
     monkeypatch.setattr(server, "_run_prompt_submit", lambda *a, **kw: None)
-    monkeypatch.setattr(server, "_session_info", lambda *a: {})
+    monkeypatch.setattr(server, "_session_info", lambda *a, lock_held=False: {})
     cleared = []
     monkeypatch.setattr(server, "_clear_inflight_turn", cleared.append)
 

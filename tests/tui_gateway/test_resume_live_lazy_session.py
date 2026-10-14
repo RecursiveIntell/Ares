@@ -16,6 +16,8 @@ Contract:
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 
 import tui_gateway.server as srv
@@ -35,6 +37,7 @@ def live_lazy_session(home):
     sid = "live-lazy-1"
     record = {
         "history": [],
+        "history_lock": threading.Lock(),
         "last_active": 0.0,
         "pending_title": "Bot Chat",
         "pending_hidden": True,

@@ -1,6 +1,8 @@
 import { atom } from 'nanostores'
 
+import { reconcileSelectorInfo } from '@/lib/selector-observation'
 import { persistString, storedString } from '@/lib/storage'
+import type { SessionRuntimeInfo } from '@/types/hermes'
 
 import { activeGatewayConnectionId } from './gateway'
 import { notifyError } from './notifications'
@@ -169,10 +171,10 @@ export async function applyModelPreset(
   })
 
   try {
-    let result: { deferred?: boolean } | undefined
+    let result: { deferred?: boolean; selector_info?: SessionRuntimeInfo } | undefined
 
     try {
-      result = await ctx.request<{ deferred?: boolean }>('config.set', {
+      result = await ctx.request<{ deferred?: boolean; selector_info?: SessionRuntimeInfo }>('config.set', {
         key: 'runtime_options', session_id: runtimeId, value: desired
       })
     } catch (err) {
@@ -195,7 +197,17 @@ export async function applyModelPreset(
 
     if (fast !== undefined && owns('fast')) {clearRuntimeOptionUncertainty(runtimeId, 'fast')}
 
-    if (!result?.deferred) {clearPending()}
+    if (!result?.deferred) {
+      if (result?.selector_info && ((effort !== undefined && owns('effort')) || (fast !== undefined && owns('fast')))) {
+        sessionTileDelegate()?.updateSession(runtimeId, current => ({ ...current,
+          ...reconcileSelectorInfo(current, result!.selector_info!, {
+            settleOptions: (['effort', 'fast'] as const).filter(dimension => dimension in desired && owns(dimension))
+          })
+        }))
+      }
+
+      clearPending()
+    }
   } catch (err) {
     let uncertain = false
 

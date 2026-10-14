@@ -24,6 +24,8 @@ import nodePath from 'node:path'
 export const MOCK_REPLY = 'Hello from the mock inference server! The full boot chain is working.'
 
 export interface MockServerOptions {
+  /** Explicit synthetic discovery catalog for selector E2E fixtures. */
+  models?: readonly string[]
   /** Pause the matching stream after its first token for session-switch E2E coverage. */
   holdFirstStreamForPrompt?: string
 /** Pause the first completion whose request JSON contains this text. */
@@ -425,14 +427,14 @@ export function startMockServer(options: MockServerOptions = {}): Promise<MockSe
         res.end(
           JSON.stringify({
             object: 'list',
-            data: [
+            data: (options.models ?? ['mock-model']).map(id => (
               {
-                id: 'mock-model',
+                id,
                 object: 'model',
                 created: 0,
                 owned_by: 'mock',
-              },
-            ],
+              }
+            )),
           }),
         )
         return
