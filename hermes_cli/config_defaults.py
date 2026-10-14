@@ -2066,11 +2066,11 @@ DEFAULT_CONFIG = {
         "max_summary_chars": 24000,
 
         "child_timeout_mode": "total",  # explicit compatibility mode; no implicit inactivity migration
-        "child_timeout_seconds": 0,  # optional wall-clock cap per child agent. 0 (default)
-                                     # = no timeout: children fail only from real errors
-                                     # (API, tools, iteration budget), never a delegation
-                                     # stopwatch. Set a positive number of seconds
-                                     # (floor 30s) to enforce a hard cap.
+        "child_timeout_seconds": 600,  # wall-clock cap per child agent in total mode.
+                                       # 600 (default, explicit). A blank/absent key in code
+                                       # resolves to no cap (DEFAULT_CHILD_TIMEOUT=None).
+                                       # Set 0/negative to disable, or a positive number
+                                       # (floor 30s) for a different hard cap.
         "reasoning_effort": "",  # subagent effort: "ultra", "max", "xhigh", "high",
                                  # "medium", "low", "minimal", "none" (empty = inherit)
         "max_concurrent_children": 10,  # unified concurrency cap: max parallel children per batch

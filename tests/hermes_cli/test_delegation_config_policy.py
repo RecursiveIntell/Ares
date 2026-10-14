@@ -28,11 +28,11 @@ def neutral_home(tmp_path, monkeypatch):
     reset_hermes_home_override(token)
 
 
-def test_absent_never_observed_policy_preserves_legacy_default(neutral_home):
+def test_absent_never_observed_policy_resolves_default_600(neutral_home):
     policy = config.read_delegation_config_policy()
     assert policy.status is config.ConfigPolicyStatus.ABSENT
     policy.validate()
-    assert delegate._get_child_timeout() is None
+    assert delegate._get_child_timeout() == 600.0
 
 
 @pytest.mark.parametrize('warm', [False, True])
