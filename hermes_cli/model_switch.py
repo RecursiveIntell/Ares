@@ -350,7 +350,7 @@ def _fetch_picker_live_models(
         api_mode=api_mode,
         force_refresh=force_refresh,
     )
-    return generic_models
+    return generic_models if generic_models else None
 
 
 # ---------------------------------------------------------------------------
@@ -3471,7 +3471,11 @@ def list_authenticated_providers(
                     )
                     if isinstance(live_models, _NativePickerModelList):
                         native_catalog_empty = not live_models
-                    if live_models is not None:
+                    if live_models is not None and (
+                        live_models
+                        or not has_explicit_models
+                        or isinstance(live_models, _NativePickerModelList)
+                    ):
                         models_list = live_models
                 except Exception:
                     pass
@@ -3855,7 +3859,11 @@ def list_authenticated_providers(
                         api_mode=grp.get("api_mode"),
                         force_refresh=refresh,
                     )
-                    if live_models is not None:
+                    if live_models is not None and (
+                        live_models
+                        or not bool(grp.get("has_explicit_models"))
+                        or isinstance(live_models, _NativePickerModelList)
+                    ):
                         if isinstance(live_models, _NativePickerModelList):
                             native_catalog_empty = not live_models
                         grp["models"] = live_models
