@@ -56,7 +56,7 @@ def owned(monkeypatch):
     monkeypatch.setattr(server, '_compute_host_supervisor', supervisor)
     monkeypatch.setattr(server, '_get_compute_host_supervisor', lambda: supervisor)
     monkeypatch.setattr(server, '_emit', Mock())
-    monkeypatch.setattr(server, '_session_info', lambda a, r: dict(r['_metadata_mirror']))
+    monkeypatch.setattr(server, '_session_info', lambda a, r, *, lock_held=False: dict(r['_metadata_mirror']))
     return record
 
 

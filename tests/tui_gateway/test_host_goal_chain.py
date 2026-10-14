@@ -26,7 +26,7 @@ def test_real_host_turn_waits_for_a_chained_successor_before_terminal(monkeypatc
     monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: None)
     monkeypatch.setattr(server, "_persist_branch_seed", lambda _session: None)
     monkeypatch.setattr(server, "_start_inflight_turn", lambda *_args: None)
-    monkeypatch.setattr(server, "_session_info", lambda _agent, state: {"running": state["running"]})
+    monkeypatch.setattr(server, "_session_info", lambda _agent, state, *, lock_held=False: {"running": state["running"]})
 
     joined_predecessor = threading.Event()
     allow_successor = threading.Event()
@@ -90,7 +90,7 @@ def test_terminal_uses_final_chain_state_and_original_receipt(monkeypatch):
     monkeypatch.setattr(server, "_ensure_session_db_row", lambda _: None)
     monkeypatch.setattr(server, "_persist_branch_seed", lambda _: None)
     monkeypatch.setattr(server, "_start_inflight_turn", lambda *a: None)
-    monkeypatch.setattr(server, "_session_info", lambda *a: {"running": False})
+    monkeypatch.setattr(server, "_session_info", lambda *a, lock_held=False: {"running": False})
     joins = []
     submitted = []
 

@@ -267,7 +267,17 @@ const TEXT_NAVIGATION_KEYS = new Set(['up', 'down', 'left', 'right', 'home', 'en
 // as Ctrl+Arrow/PageUp must stay with the input even if a user rebinds them to
 // a global navigation action, and bare/Shift-only combos (typed letters) are
 // gated by the allowlist so they never hijack normal typing.
-export function actionAllowedInInput(actionId: string, combo: string): boolean {
+export function actionAllowedInInput(actionId: string, combo: string, target: EventTarget | null = null): boolean {
+  // Xterm is an editable input too, but these exact terminal-cycle gestures
+  // belong to its tab rail. Never grant the exception to a prompt, another
+  // action, or a text-editing chord rebound onto a terminal action.
+  if (target instanceof Element && target.closest('[data-terminal]')) {
+    const terminalCombo = actionId === 'view.prevTerminal' ? 'ctrl+shift+up'
+      : actionId === 'view.nextTerminal' ? 'ctrl+shift+down' : null
+
+    if (terminalCombo && combo === canonicalizeCombo(terminalCombo)) { return true }
+  }
+
   const base = combo.split('+').pop()
 
   // A bare modifier (no key) is not a real chord — `comboFromEvent` never

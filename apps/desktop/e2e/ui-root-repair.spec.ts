@@ -116,3 +116,33 @@ test('explicit terminal shortcut focuses terminal, then prompt retains focus dur
   await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
   await expect(composer).toBeFocused()
 })
+
+test('native terminal cycling and focused-tab close transfer keyboard ownership', async () => {
+  const page: Page = fixture.page
+  const focusedId = () => page.evaluate(() => document.activeElement?.closest('[data-terminal]')?.getAttribute('data-terminal') ?? '')
+  // The prior scenario created one terminal. This explicit command creates a
+  // second in the private display; no shell commands or operator settings change.
+  await page.keyboard.press('Control+Shift+Backquote')
+  await expect(page.locator('[data-terminal]')).toHaveCount(2)
+  await expect.poll(focusedId).not.toBe('')
+  const newest = await focusedId()
+  const visibleId = () => page.evaluate(() => [...document.querySelectorAll<HTMLElement>('[data-terminal]')]
+    .find(element => getComputedStyle(element).visibility === 'visible')?.dataset.terminal ?? '')
+  const composer = page.locator('[data-slot="composer-rich-input"]')
+  await composer.click()
+  await page.keyboard.press('Control+Shift+ArrowUp')
+  await expect(composer).toBeFocused()
+  await expect.poll(visibleId).toBe(newest)
+  // Explicit native tab selection returns keyboard ownership to xterm.
+  await page.getByRole('tablist', { name: 'Terminals' }).getByRole('tab').last().click()
+  await expect.poll(focusedId).toBe(newest)
+  await page.keyboard.press('Control+Shift+ArrowUp')
+  await expect.poll(focusedId).not.toBe(newest)
+  await expect.poll(focusedId).not.toBe('')
+  const previous = await focusedId()
+  await page.keyboard.press('Control+Shift+ArrowDown')
+  await expect.poll(focusedId).toBe(newest)
+  await page.keyboard.press('Control+Shift+W')
+  await expect(page.locator('[data-terminal]')).toHaveCount(1)
+  await expect.poll(focusedId).toBe(previous)
+})

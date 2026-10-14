@@ -406,7 +406,7 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
         return
       }
 
-      if (isEditableTarget(event.target) && !actionAllowedInInput(actionId, combo)) {
+      if (isEditableTarget(event.target) && !actionAllowedInInput(actionId, combo, event.target)) {
         return
       }
 

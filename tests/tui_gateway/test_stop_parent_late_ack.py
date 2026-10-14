@@ -16,7 +16,7 @@ def setup(monkeypatch, host):
     monkeypatch.setattr(server, "_session_uses_compute_host", lambda *a: True)
     monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda *a: host)
     monkeypatch.setattr(server, "_clear_pending", lambda *a: None)
-    monkeypatch.setattr(server, "_session_info", lambda *a: {})
+    monkeypatch.setattr(server, "_session_info", lambda *a, lock_held=False: {})
     monkeypatch.setattr(server, "_emit", lambda *a: None)
 
 

@@ -904,7 +904,7 @@ def test_session_resume_returns_hydrated_messages(server, monkeypatch):
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
     monkeypatch.setattr(server, "_make_agent", lambda sid, key, session_id=None, session_db=None, **_kwargs: object())
     monkeypatch.setattr(server, "_init_session", lambda sid, key, agent, history, cols=80, **_kwargs: None)
-    monkeypatch.setattr(server, "_session_info", lambda _agent, _session=None: {"model": "test/model"})
+    monkeypatch.setattr(server, "_session_info", lambda _agent, _session=None, *, lock_held=False: {"model": "test/model"})
 
     resp = server.handle_request(
         {
@@ -1037,7 +1037,7 @@ def test_session_resume_active_turn_payload_matches_desktop_fixture(server, monk
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
     # _session_info takes (agent, session) at the resume payload boundary;
     # accept the session arg the same way the other protocol tests do.
-    monkeypatch.setattr(server, "_session_info", lambda _agent, _session=None: fixture["info"])
+    monkeypatch.setattr(server, "_session_info", lambda _agent, _session=None, *, lock_held=False: fixture["info"])
 
     # JSON round-trip the real RPC envelope: the desktop fixture must stay
     # faithful to what the gateway actually serializes, not a copied shape.

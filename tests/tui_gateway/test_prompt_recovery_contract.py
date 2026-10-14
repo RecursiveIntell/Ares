@@ -143,7 +143,7 @@ def turn_env(monkeypatch, tmp_path):
     monkeypatch.setattr(
         server,
         "_session_info",
-        lambda agent, session=None: {
+        lambda agent, session=None, *, lock_held=False: {
             "model": getattr(agent, "model", "fake-model"),
             "provider": getattr(agent, "provider", "fake-provider"),
         },
