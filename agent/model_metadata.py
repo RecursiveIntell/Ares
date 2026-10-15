@@ -3721,6 +3721,38 @@ def _wire_message_shadow(msg: Dict[str, Any]) -> Dict[str, Any]:
     return shadow
 
 
+# Codex Responses replays each retained turn's encrypted reasoning items
+# (``codex_reasoning_items`` / ``codex_message_items``). They are billed,
+# but their base64 ``encrypted_content`` is far denser in characters than
+# the tokens it costs: charging it at the text rate (~4 chars/token)
+# overstated a real 832K-token request as ~1.54M and hard-blocked a
+# conversation that still fit its window. A fit against 268
+# provider-reported prompt sizes (57K-832K tokens, gpt-6.1-sol and
+# gpt-6-luna) gave a weight of 0.232 of the text-rate estimate. Keep a
+# slightly conservative 1/4 so the estimate errs toward compacting early.
+_CODEX_REPLAY_SIDECAR_KEYS = ("codex_reasoning_items", "codex_message_items")
+_CODEX_REPLAY_SIDECAR_WEIGHT_DIVISOR = 4
+
+
+def _split_codex_replay_sidecars(
+    shadow: Dict[str, Any],
+) -> Tuple[Dict[str, Any], List[Any]]:
+    """Separate replayed Codex sidecars so they can be charged at their rate."""
+    sidecars = [shadow[key] for key in _CODEX_REPLAY_SIDECAR_KEYS if shadow.get(key)]
+    if not sidecars:
+        return shadow, []
+    rest = {k: v for k, v in shadow.items() if k not in _CODEX_REPLAY_SIDECAR_KEYS}
+    return rest, sidecars
+
+
+def _codex_sidecar_tokens(sidecars: List[Any]) -> int:
+    if not sidecars:
+        return 0
+    text_rate = sum(estimate_tokens_rough(str(value)) for value in sidecars)
+    # Ceiling division: a nonempty sidecar is never free.
+    return -(-text_rate // _CODEX_REPLAY_SIDECAR_WEIGHT_DIVISOR)
+
+
 def _estimate_message_chars(msg: Dict[str, Any]) -> int:
     """Char count for token estimation, excluding base64 image data.
 
@@ -3736,7 +3768,8 @@ def _estimate_message_tokens_without_images(msg: Dict[str, Any]) -> int:
     """Token estimate for a message shadow with image payloads stripped."""
     if not isinstance(msg, dict):
         return estimate_tokens_rough(str(msg))
-    return estimate_tokens_rough(str(_wire_message_shadow(msg)))
+    rest, sidecars = _split_codex_replay_sidecars(_wire_message_shadow(msg))
+    return estimate_tokens_rough(str(rest)) + _codex_sidecar_tokens(sidecars)
 
 
 def estimate_request_tokens_rough(
