@@ -110,13 +110,21 @@ def test_snapshot_failure_marks_broken_via_outer_timeout(tmp_path, monkeypatch):
         install_strategy="manual",
     )
     try:
-        # Force the inner snapshot coroutine to raise.
-        async def boom(_path):
-            raise RuntimeError("outer-timeout simulated")
+        # Inject at the actual outer submission boundary, independently of
+        # whether an LSP executable happens to be installed on this host.
+        attempts = []
 
-        with patch.object(svc, "_snapshot_async", boom):
+        def outer_timeout(coro, *, timeout):
+            attempts.append(timeout)
+            coro.close()
+            raise TimeoutError("outer-timeout simulated")
+
+        with patch.object(svc._loop, "run", side_effect=outer_timeout):
             assert svc.enabled_for(str(src)) is True
-            svc.snapshot_baseline(str(src))
+            result = svc.snapshot_baseline(str(src))
+        assert len(attempts) == 1
+        assert result.quality == "unavailable"
+        assert result.reason == "submission_failed"
 
         # After the failure, the file's pair is in the broken-set and
         # ``enabled_for`` skips it.

@@ -831,7 +831,6 @@ def _rpc_server_loop(
     execution.attach_worker()
     conn = None
     try:
-        from model_tools import handle_function_call
         server_sock.settimeout(0.05)
         while not stop_event.is_set():
             try:
@@ -936,6 +935,10 @@ def _rpc_server_loop(
                 # their status prints don't leak into the CLI spinner.
                 try:
                     with thread_scoped_silence():
+                        # A script with no RPCs must not start expensive
+                        # dispatcher/plugin initialization in an idle listener.
+                        # Initialization belongs to this admitted tool call.
+                        from model_tools import handle_function_call
                         result = handle_function_call(
                             tool_name, tool_args, task_id=task_id
                         )

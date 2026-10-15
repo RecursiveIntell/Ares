@@ -14,6 +14,7 @@ def _manager(monkeypatch, tmp_path, session_id="fake-e2e"):
     home.mkdir(exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", str(home))
     goals._DB_CACHE.clear()
+    goals._get_session_db().create_session(session_id, source="cli")
     return goals.GoalManager(session_id, default_max_turns=4)
 
 
@@ -84,7 +85,20 @@ def test_fake_provider_budget_restart_enqueue_loss_race_and_completion(monkeypat
     )
     waiting = recovered.evaluate_after_turn(provider.turn(), user_initiated=False)
     assert waiting["verdict"] == "waiting_for_authority"
-    assert recovered.state.status == "active"
+    assert recovered.state.status == "paused"
+    parked = goals.GoalManager("fake-e2e")
+    assert parked.state.outcome == goals.WAITING_FOR_AUTHORITY
+    assert not parked.state.completion_evidence
+    assert not parked.state.continuation_pending
+    assert parked.claim_continuation("model-prose-is-not-authority") is False
+    assert parked.start_continuation() is False
+    assert parked.evaluate_after_turn(
+        "background work finished", turn_metadata={"origin": "notification"},
+    )["should_continue"] is False
+    assert parked.resume() is not None
+    assert not goals.GoalManager("fake-e2e").auto_eligible()
+    assert goals.GoalManager("fake-e2e").state.outcome == goals.WAITING_FOR_AUTHORITY
+    recovered = goals.GoalManager("fake-e2e")
     assert recovered.confirm_completion("receipt=fake-provider-verified", source="test") is True
     assert recovered.state.outcome == goals.GOAL_COMPLETED
     assert recovered.start_continuation() is False

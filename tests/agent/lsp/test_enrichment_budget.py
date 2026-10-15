@@ -176,6 +176,37 @@ def executable(path, script):
     path.chmod(0o755)
 
 
+def test_missing_resolution_side_effect_does_not_reenable_failure(repo, monkeypatch):
+    """Creating the owned bin directory is not evidence of a repaired server."""
+    from hermes_constants import get_hermes_home
+
+    calls = []
+
+    def unavailable(root, ctx):
+        calls.append(root)
+        # Real manual resolution also creates this directory before reporting
+        # a missing executable. Cache the identity AFTER that observation.
+        (get_hermes_home() / "lsp" / "bin").mkdir(parents=True, exist_ok=True)
+        return None
+
+    replacement = ServerDef(server_id="pyright", extensions=(".py",),
+                            resolve_root=lambda fp, ws: ws, build_spawn=unavailable)
+    monkeypatch.setattr("agent.lsp.servers.SERVERS", [replacement])
+    source = repo / "x.py"
+    source.write_text("x = 1\n")
+    svc = service()
+    try:
+        assert svc.enabled_for(str(source))
+        result = svc.snapshot_baseline(str(source))
+        assert result.quality == "unavailable"
+        assert result.reason == "server_unavailable"
+        assert not svc.enabled_for(str(source))
+        assert svc.snapshot_baseline(str(source)).quality == "unavailable"
+        assert calls == [str(repo)], "unchanged missing server must not be resolved again"
+    finally:
+        svc.shutdown()
+
+
 def test_missing_executable_recovers_without_restart(repo, monkeypatch, record_property):
     binary = repo / "mock-server"
     calls = install_server(monkeypatch, command=[str(binary)])
