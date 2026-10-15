@@ -1487,8 +1487,12 @@ def _run_review_in_thread(
                 _ac_lock = getattr(agent, "_active_children_lock", None)
                 if _ac_lock is not None:
                     with _ac_lock:
+                        if vars(agent).get("_close_cleanup_state") in {"incomplete", "complete"}:
+                            raise RuntimeError("BACKGROUND_REVIEW_PARENT_CLOSING")
                         agent._active_children.append(review_agent)
                 else:
+                    if vars(agent).get("_close_cleanup_state") in {"incomplete", "complete"}:
+                        raise RuntimeError("BACKGROUND_REVIEW_PARENT_CLOSING")
                     agent._active_children.append(review_agent)
 
             from model_tools import get_tool_definitions

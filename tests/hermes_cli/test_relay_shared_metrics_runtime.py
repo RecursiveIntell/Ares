@@ -1560,6 +1560,10 @@ def test_subagent_agent_boundary_closes_its_own_scope(
         _session_db=None,
         _conversation_root_id=lambda: "parent",
     )
+    # This double has no owned I/O. Implement the new retirement protocol
+    # explicitly rather than letting production infer settlement from absence.
+    child_agent._has_owned_tool_work = lambda: False
+    child_agent._defer_owned_tool_retirement = lambda retire: False
 
     if terminal == "return":
         monkeypatch.setattr(

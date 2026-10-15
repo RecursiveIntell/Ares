@@ -78,7 +78,7 @@ def test_actual_rpc_inventory_uses_only_target_credentials_and_restores_scope(tm
     monkeypatch.setattr(models, "fetch_ollama_cloud_models", lambda: [])
     monkeypatch.setattr(switch, "_credential_pool_is_usable", lambda *a, **k: False)
     fetched = []
-    def inert_models(slug):
+    def inert_models(slug, **kwargs):
         fetched.append((slug, Path(get_hermes_home()), secrets.get_secret("ANTHROPIC_API_KEY")))
         return ["fixture-model"]
     monkeypatch.setattr(models, "cached_provider_model_ids", inert_models)

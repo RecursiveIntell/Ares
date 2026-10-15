@@ -4804,11 +4804,16 @@ class AIAgent:
         children_lock = vars(self).get('_active_children_lock')
         if children_lock is not None:
             with children_lock:
+                # The same lock protects delegate reservations and background
+                # review registration. Close fences admission before observing
+                # child ownership, not after the final empty-list check.
+                self._close_cleanup_state = 'incomplete'
                 children = list(self._active_children)
         else:
+            self._close_cleanup_state = 'incomplete'
             children = list(vars(self).get('_active_children', ()))
         live_children = [child for child in children
-            if vars(child).get('_delegate_cleanup_state') != 'complete']
+            if getattr(child, '__dict__', {}).get('_delegate_cleanup_state') != 'complete']
         from tools.delegate_tool import _owned_subagent_supervisors
         detached_owned, detached_children = _owned_subagent_supervisors(vars(self).get('session_id'))
         if live_worker or self._has_owned_tool_work() or live_children or detached_owned or vars(self).get('_active_session_turn_lease_holder'):
@@ -4819,6 +4824,33 @@ class AIAgent:
                     request_hard_interrupt(child)
             except Exception:
                 logger.debug('Close interrupt failed; retaining live owner', exc_info=True)
+            return
+        # Retire children before releasing any parent-owned resources. A
+        # returned close is not a settlement witness; keep unresolved handles.
+        settled_children = []
+        child_close_failed = False
+        for child in children:
+            try:
+                child.close()
+            except Exception:
+                child_close_failed = True
+                logger.debug('Child close failed; retaining owner', exc_info=True)
+                continue
+            if getattr(child, '__dict__', {}).get('_close_cleanup_state') == 'complete':
+                settled_children.append(child)
+            else:
+                child_close_failed = True
+        if children_lock is not None:
+            with children_lock:
+                self._active_children[:] = [
+                    child for child in self._active_children
+                    if not any(child is settled for settled in settled_children)
+                ]
+                children_remain = bool(self._active_children)
+        else:
+            children_remain = bool(children)
+        if child_close_failed or children_remain:
+            self._close_cleanup_state = 'incomplete'
             return
         self._close_cleanup_state = 'complete'
         # AIAgent.close() is the hard owner boundary. Gateway cleanup may
@@ -4865,17 +4897,7 @@ class AIAgent:
         except Exception:
             pass
 
-        # 5. Close active child agents
-        try:
-            with self._active_children_lock:
-                children = list(self._active_children)
-            for child in children:
-                try:
-                    child.close()
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        # 5. Child ownership was reconciled before parent retirement above.
 
         # 6. Close the OpenAI/httpx client
         try:
@@ -9237,6 +9259,7 @@ class AIAgent:
             raise
         finally:
             def retire_owned_turn():
+                release_failed = False
                 if durable_turn_lease is not None:
                     self._context_input_receipt = None
                     self._context_input_authorizer = None
@@ -9294,21 +9317,23 @@ class AIAgent:
                                 )
                                 # Unknown release is not closure. Keep the
                                 # holder/DB and do not signal settled retirement.
-                                return False
-                            if (
+                                release_failed = True
+                            if (not release_failed and
                                 getattr(self, "_active_session_turn_lease_holder", None)
                                 == durable_turn_lease
                             ):
                                 self._active_session_turn_lease_holder = None
                                 self._active_session_turn_lease_ttl_seconds = None
-                        # Always clear mid-turn labels when the turn exits — including
-                        # interrupted early returns that skip finalize_turn. Keep ts.
-                        try:
-                            self._reset_activity_labels_after_turn()
-                        except Exception:
-                            pass
-                        if getattr(self, "_relay_pending_turn_id", None) == relay_turn_id:
-                            self._relay_pending_turn_id = None
+                        if not release_failed:
+                            # Always clear mid-turn labels when the turn exits — including
+                            # interrupted early returns that skip finalize_turn. Keep ts.
+                            try:
+                                self._reset_activity_labels_after_turn()
+                            except Exception:
+                                pass
+                            if getattr(self, "_relay_pending_turn_id", None) == relay_turn_id:
+                                self._relay_pending_turn_id = None
+                return not release_failed
 
             if not self._defer_owned_tool_retirement(retire_owned_turn):
                 retire_owned_turn()

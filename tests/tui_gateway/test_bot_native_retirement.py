@@ -267,7 +267,7 @@ def test_close_failure_has_bounded_owner_and_normal_teardown_cleanup(native_env,
     # Exercise the existing teardown owner with its unrelated destructive
     # operations inert; only real pending-native cleanup is under test.
     owner.monkeypatch.setattr(owner.native, 'close', real_close)
-    owner.monkeypatch.setattr(server, '_finalize_session', lambda *a, **k: None)
+    owner.monkeypatch.setattr(server, '_finalize_session', lambda session, **k: session.__setitem__('_finalized', True))
     owner.monkeypatch.setattr(server, '_announce_session_reclaimed', lambda *a: None)
     normal_closes = []
     owner.monkeypatch.setattr(successor, 'close', lambda: normal_closes.append('normal-boundary'))
@@ -369,7 +369,7 @@ def test_unresolved_exit_after_normal_teardown_retains_explicit_handle(native_en
     owner.monkeypatch.setattr(owner.client, 'close', lambda: calls.append('attempt'))
     server._sync_bot_capabilities(SID, owner.env.session)
     pending = owner.env.session['_bot_native_retirement']
-    owner.monkeypatch.setattr(server, '_finalize_session', lambda *a, **k: None)
+    owner.monkeypatch.setattr(server, '_finalize_session', lambda session, **k: session.__setitem__('_finalized', True))
     owner.monkeypatch.setattr(server, '_announce_session_reclaimed', lambda *a: None)
     owner.monkeypatch.setattr(owner.env.session['agent'], 'close', lambda: None)
     server._teardown_session(owner.env.session)

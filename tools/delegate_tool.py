@@ -3731,19 +3731,22 @@ def _build_child_preserving_parent_tools(**kwargs):
     admitted = time.monotonic()
     deadline = None if timeout is None else admitted + timeout
     parent = kwargs.get('parent_agent')
-    if parent is not None and vars(parent).get('_close_cleanup_state') in {'incomplete', 'complete'}:
-        raise ValueError('DELEGATION_PARENT_CLOSING: child admission refused')
+    parent_admission_lock = (getattr(parent, '_active_children_lock', None)
+        or _PARENT_FINALIZATION_FALLBACK_LOCK)
     parent_sid = str(getattr(parent, 'session_id', '') or '')
     reservation = 'sa-init-' + uuid.uuid4().hex
     ceiling = _get_max_concurrent_children()
-    with _active_subagents_lock:
-        occupied = sum(r.get('owner_agent_session_id') == parent_sid
-            for r in _active_subagents.values())
-        if occupied >= ceiling:
-            raise ValueError('DELEGATION_CAPACITY_OCCUPIED: running or cleanup-incomplete children at ceiling')
-        _active_subagents[reservation] = {'subagent_id': reservation, 'goal': kwargs.get('goal'),
-            'owner_agent_session_id': parent_sid, 'agent': None, 'status': 'initializing',
-            'capacity_occupied': True, 'started_at': time.time(), 'accepting_steer': False}
+    with parent_admission_lock:
+        if parent is not None and vars(parent).get('_close_cleanup_state') in {'incomplete', 'complete'}:
+            raise ValueError('DELEGATION_PARENT_CLOSING: child admission refused')
+        with _active_subagents_lock:
+            occupied = sum(r.get('owner_agent_session_id') == parent_sid
+                for r in _active_subagents.values())
+            if occupied >= ceiling:
+                raise ValueError('DELEGATION_CAPACITY_OCCUPIED: running or cleanup-incomplete children at ceiling')
+            _active_subagents[reservation] = {'subagent_id': reservation, 'goal': kwargs.get('goal'),
+                'owner_agent_session_id': parent_sid, 'agent': None, 'status': 'initializing',
+                'capacity_occupied': True, 'started_at': time.time(), 'accepting_steer': False}
 
     def build():
         with _CHILD_CONSTRUCTION_LOCK:
@@ -3792,11 +3795,19 @@ def _build_child_preserving_parent_tools(**kwargs):
             with _active_subagents_lock:
                 _active_subagents.pop(reservation, None)
             raise
-        with _active_subagents_lock:
-            record = _active_subagents.pop(reservation)
-            record.update(subagent_id=child._subagent_id, agent=child, status='admitted')
-            record.pop('future', None)
-            _active_subagents[child._subagent_id] = record
+        with parent_admission_lock:
+            closing = parent is not None and vars(parent).get('_close_cleanup_state') in {'incomplete', 'complete'}
+            if not closing:
+                with _active_subagents_lock:
+                    record = _active_subagents.pop(reservation)
+                    record.update(subagent_id=child._subagent_id, agent=child, status='admitted')
+                    record.pop('future', None)
+                    _active_subagents[child._subagent_id] = record
+        if closing:
+            # The initialization reservation still charges this exact parent
+            # until the positively unstarted child's resources settle.
+            _retire_unstarted_child(child, parent, reservation_id=reservation)
+            raise ValueError('DELEGATION_PARENT_CLOSING: child admission revoked during initialization')
         return child
     finally:
         executor.shutdown(wait=False, cancel_futures=True)

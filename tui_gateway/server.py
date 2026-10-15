@@ -832,16 +832,29 @@ def _session_cleanup_unsettled(session: dict) -> bool:
         return True
     if agent is None:
         return False
-    owned = getattr(type(agent), "_has_owned_tool_work", None) or vars(agent).get("_has_owned_tool_work")
-    if callable(owned) and agent._has_owned_tool_work():
+    # Inspect declared state, not a dynamic __getattr__ which may manufacture
+    # an apparent capability. Lightweight non-resource records can lack a dict.
+    fields = getattr(agent, "__dict__", {})
+    owned = getattr(type(agent), "_has_owned_tool_work", None) or fields.get("_has_owned_tool_work")
+    if owned is not None:
+        try:
+            if not callable(owned) or agent._has_owned_tool_work() is not False:
+                return True
+        except Exception:
+            return True
+    elif any(fields.get(key) for key in (
+        "_owned_tool_work", "_owned_tool_work_unknown", "_tool_worker_threads",
+        "_delegate_worker_future", "_owned_turn_retirement_state",
+    )):
+        # Retained work without its observation protocol is uncertainty.
         return True
     from tools.delegate_tool import _owned_subagent_supervisors
-    retained, _ = _owned_subagent_supervisors(vars(agent).get("session_id"))
+    retained, _ = _owned_subagent_supervisors(fields.get("session_id"))
     if retained:
         return True
     from agent.run_checkpoint_custody import TurnRunCustody
-    return bool(vars(agent).get("_active_session_turn_lease_holder")
-        and not isinstance(vars(agent).get("_run_checkpoint_custody"), TurnRunCustody))
+    return bool(fields.get("_active_session_turn_lease_holder")
+        and not isinstance(fields.get("_run_checkpoint_custody"), TurnRunCustody))
 
 
 def _defer_session_close(session: dict, end_reason: str, *, teardown: bool = False) -> None:

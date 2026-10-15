@@ -221,6 +221,40 @@ def test_background_review_shuts_down_memory_provider_before_close(monkeypatch):
     ]
 
 
+def test_closing_parent_refuses_background_review_before_request(monkeypatch):
+    from agent import background_review
+    from types import SimpleNamespace
+    import threading
+
+    events = []
+
+    class RefusedReview(FakeReviewAgent):
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            events.append("constructed")
+
+        def run_conversation(self, **kw):
+            pytest.fail("closing parent admitted background request")
+
+        def close(self):
+            events.append("closed")
+
+    gateway_threads = SimpleNamespace(**vars(threading))
+    gateway_threads.Thread = ImmediateThread
+    monkeypatch.setattr(background_review, "threading", gateway_threads)
+    monkeypatch.setattr(run_agent_module, "threading", gateway_threads)
+    monkeypatch.setattr(run_agent_module, "AIAgent", RefusedReview)
+    agent = _bare_agent()
+    agent._close_cleanup_state = "incomplete"
+    agent._emit_auxiliary_failure = lambda *a: events.append("refused")
+    AIAgent._spawn_background_review(
+        agent, messages_snapshot=[{"role": "user", "content": "fixture"}], review_memory=True,
+    )
+    assert events == ["constructed", "refused", "closed"]
+    assert agent._active_children == []
+    assert agent._background_review_agent is None
+
+
 def test_background_review_fork_opts_out_of_session_finalization(monkeypatch):
     """The review fork shares the parent's live session_id, so it must set
     ``_end_session_on_close = False``. Otherwise close() (now finalizing owned

@@ -133,7 +133,12 @@ def turn_env(monkeypatch, tmp_path):
     from hermes_cli import goals
 
     goals._DB_CACHE.clear()
-    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
+    # Only the gateway's turn-launch seam is synchronous in this fixture.
+    # Mutating the stdlib module makes unrelated queue/telemetry workers run
+    # inline too, deadlocking teardown on their blocking receive loops.
+    gateway_threads = types.SimpleNamespace(**vars(threading))
+    gateway_threads.Thread = _InlineThread
+    monkeypatch.setattr(server, "threading", gateway_threads)
     monkeypatch.setattr(server, "_wire_callbacks", lambda sid: None)
     monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda sid, session: None)
     monkeypatch.setattr(server, "_session_cwd", lambda session: str(tmp_path))
