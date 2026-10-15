@@ -4785,6 +4785,16 @@ def _is_model_incompatible_error(exc: Exception) -> bool:
     ))
 
 
+class AuxiliaryIncompleteTerminalError(RuntimeError):
+    """A compression summary response lacked a completed final terminal.
+
+    The provider answered, but with ``length``/``content_filter``/incomplete/
+    failed/refused/tool-call output. That route cannot produce a usable
+    summary for this request, so it is fallback-worthy like any other
+    invalid auxiliary response.
+    """
+
+
 def _is_invalid_aux_response_error(exc: Exception) -> bool:
     """Detect provider responses that authenticated but cannot serve aux shape.
 
@@ -4794,6 +4804,8 @@ def _is_invalid_aux_response_error(exc: Exception) -> bool:
     need ``choices[0].message`` and should be able to continue through the
     same fallback path as explicit model-incompatibility errors.
     """
+    if isinstance(exc, AuxiliaryIncompleteTerminalError):
+        return True
     if not isinstance(exc, RuntimeError):
         return False
     msg = str(exc).lower()
@@ -9076,7 +9088,7 @@ def _validate_llm_response(
     if task == "compression" and not _auxiliary_response_has_completed_terminal(
         response
     ):
-        raise RuntimeError(
+        raise AuxiliaryIncompleteTerminalError(
             "Auxiliary compression response did not prove a completed final "
             "terminal; refusing to use partial summary text"
         )
@@ -9183,6 +9195,9 @@ def _recover_aux_response_message(
         incomplete_details = _obj_get(response, "incomplete_details")
         if incomplete_details is not None:
             recovered.incomplete_details = incomplete_details
+        error = _obj_get(response, "error")
+        if error is not None:
+            recovered.error = error
         return recovered
 
 

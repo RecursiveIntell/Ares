@@ -54,6 +54,31 @@ def test_compression_task_rejects_unfinished_or_nonfinal_terminal(response):
         _validate_llm_response(response, "compression")
 
 
+def test_rejected_summary_terminal_is_fallback_worthy():
+    from agent.auxiliary_client import _is_invalid_aux_response_error
+
+    with pytest.raises(RuntimeError) as excinfo:
+        _validate_llm_response(_chat_response("length"), "compression")
+    assert _is_invalid_aux_response_error(excinfo.value)
+
+
+def test_immutable_completed_response_with_error_is_rejected():
+    class _Frozen:
+        __slots__ = ("output_text", "status", "error")
+
+        def __init__(self):
+            self.output_text = "partial text alongside an error"
+            self.status = "completed"
+            self.error = {"code": "server_error"}
+
+    recovered = _recover_aux_response_message(
+        _Frozen(), require_completed_terminal=True
+    )
+    assert recovered.error == {"code": "server_error"}
+    with pytest.raises(RuntimeError, match="completed|terminal"):
+        _validate_llm_response(recovered, "compression")
+
+
 def test_noncompression_call_retains_legacy_partial_length_response():
     response = _chat_response("length")
     assert _validate_llm_response(response, "web_extract") is response
