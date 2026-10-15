@@ -1874,9 +1874,9 @@ class TestAuxiliaryFallbackLayering:
     def test_explicit_provider_no_client_uses_configured_chain_before_error(self, monkeypatch):
         """Missing primary credentials should still honor auxiliary fallback_chain."""
         chain_client = MagicMock()
-        chain_client.chat.completions.create.return_value = MagicMock(choices=[
-            MagicMock(message=MagicMock(content="from configured chain"))
-        ])
+        chain_client.chat.completions.create.return_value = _DummyResponse(
+            "from configured chain"
+        )
 
         with patch("agent.auxiliary_client._get_cached_client",
                    return_value=(None, None)), \
@@ -2516,8 +2516,15 @@ class _AuxAuth401(Exception):
 
 
 class _DummyResponse:
+    """A completed provider response: final text with a ``stop`` terminal."""
+
     def __init__(self, text="ok"):
-        self.choices = [MagicMock(message=MagicMock(content=text))]
+        self.choices = [
+            SimpleNamespace(
+                message=SimpleNamespace(content=text, tool_calls=None, refusal=None),
+                finish_reason="stop",
+            )
+        ]
 
 
 class _FailingThenSuccessCompletions:
@@ -3963,8 +3970,7 @@ class TestAuxUnhealthyCache:
         primary_client.chat.completions.create.side_effect = err
 
         nous_client = MagicMock()
-        nous_resp = MagicMock()
-        nous_resp.choices = [MagicMock(message=MagicMock(content="ok"))]
+        nous_resp = _DummyResponse("ok")
         nous_client.chat.completions.create.return_value = nous_resp
 
         with patch("agent.auxiliary_client._get_cached_client",
