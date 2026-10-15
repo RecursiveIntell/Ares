@@ -50,7 +50,11 @@ def test_fallback_candidate_call_uses_entry_timeout():
         def create(self, **kwargs):
             seen.update(kwargs)
             return SimpleNamespace(
-                choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content="ok"), finish_reason="stop"
+                    )
+                ]
             )
 
     fb_client = SimpleNamespace(
