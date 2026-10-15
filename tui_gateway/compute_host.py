@@ -813,7 +813,14 @@ class ComputeHost:
             history_db = session_db if session_db is not None else server._get_db()
             if history_db.get_session(key) is not None:
                 persisted_history = history_db.get_messages_as_conversation(
-                    key, repair_alternation=True, include_row_ids=True
+                    key,
+                    repair_alternation=True,
+                    include_row_ids=True,
+                    # Model-facing cold replay must retain the owner's durable
+                    # summary discriminator so the Governor projection matches
+                    # the authenticated receipt parent. This remains opt-in;
+                    # display/export paths use their separate projections.
+                    include_summary_markers=True,
                 )
                 if persisted_history:
                     history = server.sanitize_replay_history(persisted_history)

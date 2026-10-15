@@ -1112,8 +1112,11 @@ def _consume_codex_event_stream(
       if no message item was emitted directly.
     * ``output_text``: assembled text from ``response.output_text.delta`` deltas.
     * ``usage``: copied from the terminal event's ``response.usage`` (when present).
-    * ``status``: ``completed`` / ``incomplete`` / ``failed`` (or ``completed`` if
-      the stream ended without a terminal frame but produced content).
+    * ``status``: ``completed`` / ``incomplete`` / ``failed`` (or the
+      compatibility value ``completed`` if the stream ended without a terminal
+      frame but produced content).
+    * ``terminal_observed``: ``True`` only when an actual ``response.completed``
+      event was observed; EOF must not become summary-completion evidence.
     * ``id``: ``response.id`` when present.
     * ``incomplete_details``: passed through for ``response.incomplete`` frames.
     * ``error``: passed through for ``response.failed`` frames.
@@ -1163,7 +1166,7 @@ def _consume_codex_event_stream(
     # parts by this index and gives each part no separator of its own, so a
     # change of index is where the blank line belongs.
     active_summary_index: Any = None
-    terminal_status: str = "completed"
+    terminal_status: str | None = None
     terminal_usage: Any = None
     terminal_response_id: str = None
     terminal_incomplete_details: Any = None
@@ -1486,7 +1489,8 @@ def _consume_codex_event_stream(
         output=output,
         output_text=assembled_text,
         usage=terminal_usage,
-        status=terminal_status,
+        status=terminal_status or "completed",
+        terminal_observed=saw_response_completed,
         id=terminal_response_id,
         model=model,
         incomplete_details=terminal_incomplete_details,

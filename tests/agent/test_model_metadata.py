@@ -10,6 +10,7 @@ Coverage levels:
   Persistent cache       — save/load, corruption, update, provider isolation
 """
 
+import copy
 import time
 
 import pytest
@@ -165,51 +166,79 @@ class TestEstimateMessagesTokensRough:
 
 
 class TestEstimateRequestTokensRough:
-    def test_caches_tools_estimate(self):
+    def test_schema_parameters_are_recomputed_each_estimate(self):
         messages = [{"role": "user", "content": "hello"}]
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "terminal",
-                    "description": "Run a command",
-                    "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
-                },
-            }
-        ]
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "terminal",
+                "description": "Run a command",
+                "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+            },
+        }]
 
-        # json.dumps is used for params sizing; ensure the tools estimate is cached
-        # so repeated calls don't keep re-serializing the same schema list.
+        # Mutable tool schemas have no owner-enforced version, so every estimate
+        # must re-read their parameter shape rather than risk a stale admission.
         with patch("agent.model_metadata.json.dumps", wraps=__import__("json").dumps) as dumps:
             estimate_request_tokens_rough(messages, system_prompt="x" * 8, tools=tools)
             estimate_request_tokens_rough(messages, system_prompt="x" * 8, tools=tools)
-            assert dumps.call_count == 1
+            assert dumps.call_count == 2
 
-    def test_tools_cache_is_bounded(self):
-        # A long-lived process builds many transient tool lists; the cache must
-        # not grow without bound. Feed more distinct lists than the cap and
-        # confirm the cache never exceeds it.
-        import agent.model_metadata as mm
+    def test_same_size_schema_change_recomputes_parameter_estimate(self):
+        import agent.model_metadata as metadata
 
-        mm._TOOLS_TOKENS_CACHE.clear()
-        cap = mm._TOOLS_TOKENS_CACHE_MAX
-        # Keep references so ids are not recycled mid-loop, forcing distinct keys.
-        held = []
-        for i in range(cap + 50):
-            tools = [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": f"tool_{i}",
-                        "description": "d",
-                        "parameters": {"type": "object"},
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "middle",
+                "description": "tiny",
+                "parameters": {"type": "object", "properties": {"arg": {"type": "string"}}},
+            },
+        }]
+        with patch("agent.model_metadata.json.dumps", wraps=__import__("json").dumps) as dumps:
+            before = metadata._estimate_tools_tokens_rough(tools)
+            tools[0]["function"]["description"] = "long"
+            after = metadata._estimate_tools_tokens_rough(tools)
+        assert after == before  # equal-size content gives an equal rough estimate
+        assert dumps.call_count == 2  # same-identity content still gets re-read
+
+    def test_same_identity_schema_growth_nested_change_and_shrink_recompute(self):
+        import agent.model_metadata as metadata
+
+        def tool(name):
+            return {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": "tiny",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"value": {"type": "string"}},
                     },
-                }
-            ]
-            held.append(tools)
-            mm._estimate_tools_tokens_rough(tools)
-            assert len(mm._TOOLS_TOKENS_CACHE) <= cap
-        assert len(mm._TOOLS_TOKENS_CACHE) == cap
+                },
+            }
+
+        tools = [tool("first"), tool("middle"), tool("last")]
+        before = metadata._estimate_tools_tokens_rough(tools)
+        tools[1]["function"]["description"] = "schema growth " * 1000
+        grown = metadata._estimate_tools_tokens_rough(tools)
+        fresh_grown = metadata._estimate_tools_tokens_rough(copy.deepcopy(tools))
+        assert grown == fresh_grown
+        assert grown > before
+        assert [item["function"]["name"] for item in tools] == ["first", "middle", "last"]
+
+        tools[1]["function"]["parameters"]["properties"]["value"]["description"] = (
+            "nested schema growth " * 500
+        )
+        nested = metadata._estimate_tools_tokens_rough(tools)
+        assert nested == metadata._estimate_tools_tokens_rough(copy.deepcopy(tools))
+        assert nested > grown
+
+        tools[1]["function"]["description"] = "tiny"
+        tools[1]["function"]["parameters"]["properties"]["value"].pop("description")
+        shrunk = metadata._estimate_tools_tokens_rough(tools)
+        assert shrunk == metadata._estimate_tools_tokens_rough(copy.deepcopy(tools))
+        assert shrunk == before
 
 
 # =========================================================================

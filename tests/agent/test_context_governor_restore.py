@@ -1582,7 +1582,7 @@ def test_secondary_summary_uses_auxiliary_compression_route_by_default():
             "model": "glm-5.2:cloud",
         })
         return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="summary"))]
+            choices=[SimpleNamespace(message=SimpleNamespace(content="summary"), finish_reason="stop")]
         )
 
     engine.last_compaction_metrics = {}
@@ -1620,7 +1620,7 @@ def test_secondary_summary_rejects_fallback_route_mismatch():
             "model": "gpt-5.4",
         })
         return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="summary"))]
+            choices=[SimpleNamespace(message=SimpleNamespace(content="summary"), finish_reason="stop")]
         )
 
     engine.last_compaction_metrics = {}
@@ -1654,7 +1654,7 @@ def test_summary_retry_pins_first_actual_route_across_config_mutation():
         model = kwargs.get("model") or route_config["model"]
         kwargs["route_info"].update({"provider": provider, "model": model})
         return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="summary"))]
+            choices=[SimpleNamespace(message=SimpleNamespace(content="summary"), finish_reason="stop")]
         )
 
     with (
