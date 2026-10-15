@@ -22,7 +22,10 @@ def captured(monkeypatch):
     )
     # Teardown's real work (finalize, agent close, notifier unregister) is out
     # of scope — this is about what reaches the client.
-    monkeypatch.setattr(server, "_finalize_session", lambda *a, **k: None)
+    monkeypatch.setattr(
+        server, "_finalize_session",
+        lambda session, **k: session.__setitem__("_finalized", True),
+    )
     return events
 
 

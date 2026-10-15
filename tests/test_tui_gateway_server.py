@@ -18026,6 +18026,7 @@ def test_close_session_by_id_is_idempotent_and_full(monkeypatch):
         # slash-worker; mirror that here so the test exercises the actual
         # teardown contract (worker close lives in finalize, not the caller).
         calls["finalize"] += 1
+        s["_finalized"] = True
         w = s.get("slash_worker")
         if w:
             w.close()

@@ -276,6 +276,17 @@ async def test_empty_agent_result_releases_inflight_loop_tick(loop_env):
 
 @pytest.mark.asyncio
 async def test_goal_hook_failure_does_not_block_loop_completion(loop_env, caplog):
+    """A /goal-bound internal continuation whose judge hook raises must still
+    let loop bookkeeping (_post_turn_loop_completion) run to completion.
+
+    2026-10-14: _run_post_turn_hooks narrowed internal/wakeup events to only
+    invoke the goal-continuation hook when the event itself carries a
+    ``goal_continuation`` metadata binding (gateway/run.py ~22456-22459),
+    so a bare internal wakeup with no binding no longer reaches the judge
+    at all -- that's the correct new contract (it stops spurious goal
+    evaluation on non-goal-bound internal ticks). This test exercises the
+    goal-bound case, which is what the test's own name/intent requires.
+    """
     runner = _make_runner()
     await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
 
@@ -283,7 +294,45 @@ async def test_goal_hook_failure_does_not_block_loop_completion(loop_env, caplog
     mgr.state.next_due_at = time.time() - 1
     assert mgr.fire_tick() is not None
 
+    continuation_event = _make_event("wakeup")
+    continuation_event.metadata = {
+        "goal_continuation": {
+            "goal_id": "goal-loop-test",
+            "checkpoint_revision": 1,
+            "continuation_token": "token-loop-test",
+        },
+    }
+
     runner._post_turn_goal_continuation = AsyncMock(side_effect=RuntimeError("judge failed"))
+    with caplog.at_level(logging.DEBUG, logger="gateway.run"):
+        await GatewayRunner._run_post_turn_hooks(
+            runner,
+            agent_result={"final_response": "still working"},
+            source=continuation_event.source,
+            is_internal=True,
+            event=continuation_event,
+        )
+
+    runner._post_turn_goal_continuation.assert_awaited_once()
+    reloaded = loops.load_loop("sid-gateway-loop")
+    assert reloaded.awaiting_response is False
+    assert "goal continuation hook failed: judge failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_goal_hook_skipped_for_unbound_internal_event(loop_env, caplog):
+    """Negative witness for the 2026-10-14 narrowing: a bare internal/wakeup
+    event with no goal_continuation metadata must never reach the judge
+    hook at all (not just tolerate its failure) -- loop completion must
+    still run."""
+    runner = _make_runner()
+    await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
+
+    mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    mgr.state.next_due_at = time.time() - 1
+    assert mgr.fire_tick() is not None
+
+    runner._post_turn_goal_continuation = AsyncMock(side_effect=RuntimeError("must not be called"))
     with caplog.at_level(logging.DEBUG, logger="gateway.run"):
         await GatewayRunner._run_post_turn_hooks(
             runner,
@@ -292,9 +341,10 @@ async def test_goal_hook_failure_does_not_block_loop_completion(loop_env, caplog
             is_internal=True,
         )
 
+    runner._post_turn_goal_continuation.assert_not_awaited()
     reloaded = loops.load_loop("sid-gateway-loop")
     assert reloaded.awaiting_response is False
-    assert "goal continuation hook failed: judge failed" in caplog.text
+    assert "goal continuation hook failed" not in caplog.text
 
 
 @pytest.mark.asyncio
