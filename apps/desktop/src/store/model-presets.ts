@@ -164,15 +164,21 @@ export async function applyModelPreset(
     ...current, pendingRuntimeOptions: { ...current.pendingRuntimeOptions, ...desired }
   }))
 
-  const clearPending = () => sessionTileDelegate()?.updateSession(runtimeId, current => {
-    const pending = { ...current.pendingRuntimeOptions }
+  const clearPending = () => {
+    // A settled write cannot recreate a closed runtime or touch a successor's
+    // intent. Check ownership before asking the delegate to update any slice.
+    if ((effort === undefined || !owns('effort')) && (fast === undefined || !owns('fast'))) {return}
 
-    if (effort !== undefined && owns('effort') && !legacyDeferred.has('effort')) {delete pending.effort}
+    sessionTileDelegate()?.updateSession(runtimeId, current => {
+      const pending = { ...current.pendingRuntimeOptions }
 
-    if (fast !== undefined && owns('fast') && !legacyDeferred.has('fast')) {delete pending.fast}
+      if (effort !== undefined && owns('effort') && !legacyDeferred.has('effort')) {delete pending.effort}
 
-    return { ...current, pendingRuntimeOptions: Object.keys(pending).length ? pending : null }
-  })
+      if (fast !== undefined && owns('fast') && !legacyDeferred.has('fast')) {delete pending.fast}
+
+      return { ...current, pendingRuntimeOptions: Object.keys(pending).length ? pending : null }
+    })
+  }
 
   try {
     let result: { deferred?: boolean; selector_info?: SessionRuntimeInfo } | undefined
