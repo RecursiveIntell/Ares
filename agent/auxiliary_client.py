@@ -5060,7 +5060,7 @@ def _retry_same_provider_sync(
     # ``x-initiator: user``) across the rebuilt-client retry — dropping them
     # here would let a recovery retry silently lose capability gating (#60293).
     if extra_headers:
-        retry_kwargs["extra_headers"] = dict(extra_headers)
+        retry_kwargs["extra_headers"] = {**(retry_kwargs.get("extra_headers") or {}), **extra_headers}
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
     return _validate_llm_response(
@@ -5134,7 +5134,7 @@ async def _retry_same_provider_async(
     # Preserve per-request attribution headers across the rebuilt-client
     # retry — see the sync variant above (#60293).
     if extra_headers:
-        retry_kwargs["extra_headers"] = dict(extra_headers)
+        retry_kwargs["extra_headers"] = {**(retry_kwargs.get("extra_headers") or {}), **extra_headers}
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
     return _validate_llm_response(
@@ -9874,7 +9874,7 @@ def _call_llm_impl(
         reasoning_config=reasoning_config,
         base_url=_base_info or resolved_base_url, task=task)
     if extra_headers:
-        kwargs["extra_headers"] = dict(extra_headers)
+        kwargs["extra_headers"] = {**(kwargs.get("extra_headers") or {}), **extra_headers}
 
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
     _client_base = str(getattr(client, "base_url", "") or "")

@@ -2977,6 +2977,12 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
 
     def _managed_summary_call(request, callback, *, retry_count: int):
         from agent import relay_llm
+        from agent.opencode_affinity import merge_opencode_session_headers
+
+        request = merge_opencode_session_headers(
+            request, getattr(agent, "provider", None),
+            getattr(agent, "base_url", None), getattr(agent, "session_id", None),
+        )
 
         return relay_llm.execute_current(
             request,

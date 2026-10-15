@@ -10,6 +10,7 @@ callers outside a conversation.
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any, Optional
 
 OPENCODE_SESSION_HEADER = "x-opencode-session"
@@ -42,7 +43,12 @@ def opencode_session_headers(
     from agent.transports.codex import _cache_scope_from_session_id
 
     key = _cache_scope_from_session_id(get_conversation_context() or session_id)
-    return {OPENCODE_SESSION_HEADER: key} if key else {}
+    if not key:
+        return {}
+    # Session APIs may admit Unicode IDs. Keep canonical identity unchanged,
+    # but encode its wire projection as a bounded ASCII affinity token.
+    token = "oc1_" + hashlib.sha256(key.encode("utf-8")).hexdigest()
+    return {OPENCODE_SESSION_HEADER: token}
 
 
 def merge_opencode_session_headers(

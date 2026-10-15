@@ -1,6 +1,7 @@
 """Behavioral boundaries and SDK forwarding for OpenCode session affinity."""
 
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 from threading import Barrier
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -20,6 +21,10 @@ from agent.portal_tags import reset_conversation_context, set_conversation_conte
 URL = "https://opencode.ai/zen/go/v1"
 MESSAGES = [{"role": "user", "content": "hi"}]
 HEADER = "x-opencode-session"
+
+
+def expected(scope):
+    return "oc1_" + hashlib.sha256(scope.encode("utf-8")).hexdigest()
 
 
 @pytest.mark.parametrize("provider,url,expected", [
@@ -42,8 +47,8 @@ def test_distinct_sessions_root_precedence_and_no_global_fallback():
     assert opencode_session_headers("opencode-go", URL, None) == {}
     token = set_conversation_context("lineage-root")
     try:
-        assert opencode_session_headers("opencode-go", URL, "segment-1")[HEADER] == "lineage-root"
-        assert opencode_session_headers("opencode-go", URL, "segment-2")[HEADER] == "lineage-root"
+        assert opencode_session_headers("opencode-go", URL, "segment-1")[HEADER] == expected("lineage-root")
+        assert opencode_session_headers("opencode-go", URL, "segment-2")[HEADER] == expected("lineage-root")
     finally:
         reset_conversation_context(token)
 
@@ -51,7 +56,7 @@ def test_distinct_sessions_root_precedence_and_no_global_fallback():
 def test_existing_cron_scope_normalization_is_reused():
     first = opencode_session_headers("opencode-go", URL, "cron_job-a_20261014_010203")
     second = opencode_session_headers("opencode-go", URL, "cron_job-a_20261015_040506")
-    assert first == second == {HEADER: "cron_job-a"}
+    assert first == second == {HEADER: expected("cron_job-a")}
 
 
 def test_merge_preserves_explicit_header_and_other_fields():
@@ -77,7 +82,7 @@ def test_concurrent_contexts_do_not_borrow_other_conversation_identity():
     with ThreadPoolExecutor(max_workers=2) as pool:
         first = pool.submit(worker, "conversation-a")
         second = pool.submit(worker, "conversation-b")
-        assert [first.result(), second.result()] == ["conversation-a", "conversation-b"]
+        assert [first.result(), second.result()] == [expected("conversation-a"), expected("conversation-b")]
 
 
 def test_auxiliary_worker_uses_explicit_rotation_stable_scope():
@@ -87,7 +92,7 @@ def test_auxiliary_worker_uses_explicit_rotation_stable_scope():
     )
     try:
         kwargs = aux._build_call_kwargs("opencode-go", "glm-5", MESSAGES, base_url=URL)
-        assert kwargs["extra_headers"][HEADER] == "lineage-root"
+        assert kwargs["extra_headers"][HEADER] == expected("lineage-root")
     finally:
         aux.reset_runtime_main(token)
 
@@ -105,7 +110,7 @@ def test_chat_sdk_serializes_affinity_as_a_header_not_a_body_field():
     with OpenAI(api_key="test-key", base_url=URL, http_client=httpx.Client(transport=httpx.MockTransport(handler))) as client:
         kwargs = merge_opencode_session_headers({"model": "glm-5", "messages": MESSAGES}, "opencode-go", URL, "sdk-session")
         assert client.chat.completions.create(**kwargs).choices[0].message.content == "ok"
-    assert captured[0].headers[HEADER] == "sdk-session"
+    assert captured[0].headers[HEADER] == expected("sdk-session")
     assert HEADER.encode() not in captured[0].content
 
 
@@ -116,7 +121,7 @@ def test_codex_auxiliary_adapter_forwards_session_header_to_sdk():
     client = aux.CodexAuxiliaryClient(sdk, "gpt-5.6-luna")
     kwargs = merge_opencode_session_headers({"model": "gpt-5.6-luna", "messages": MESSAGES}, "opencode-go", URL, "responses-session")
     assert client.chat.completions.create(**kwargs).choices[0].message.content == "ok"
-    assert create.call_args.kwargs["extra_headers"][HEADER] == "responses-session"
+    assert create.call_args.kwargs["extra_headers"][HEADER] == expected("responses-session")
 
 
 def test_anthropic_auxiliary_adapter_forwards_session_header_to_sdk(monkeypatch):
@@ -127,4 +132,4 @@ def test_anthropic_auxiliary_adapter_forwards_session_header_to_sdk(monkeypatch)
     client = aux.AnthropicAuxiliaryClient(sdk, "minimax-m2.7", "test-key", URL)
     kwargs = merge_opencode_session_headers({"model": "minimax-m2.7", "messages": MESSAGES, "max_tokens": 16}, "opencode-go", URL, "messages-session")
     assert client.chat.completions.create(**kwargs).choices[0].message.content == "ok"
-    assert create.call_args.args[1]["extra_headers"][HEADER] == "messages-session"
+    assert create.call_args.args[1]["extra_headers"][HEADER] == expected("messages-session")

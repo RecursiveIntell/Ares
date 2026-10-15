@@ -57,7 +57,7 @@ You need at least one way to connect to an LLM. Use `hermes model` to switch pro
 | **LM Studio** | `hermes model` → "LM Studio" (provider: `lmstudio`, optional `LM_API_KEY`) |
 | **Custom Endpoint** | `hermes model` → choose "Custom endpoint" (saved in `config.yaml`) |
 
-Session-bound OpenCode Zen, Go, and Free calls through the main and auxiliary request builders attach `x-opencode-session` on Chat Completions, Responses, and Anthropic Messages transports. The value follows the ambient conversation root or explicit session scope; auxiliary calls inherit the runtime main scope. OpenCode documents this as a backend-affinity hint. Programmatic callers must provide a session ID or conversation context: calls outside a conversation are not assigned a shared global ID.
+Session-bound OpenCode Zen, Go, and Free calls through the main and auxiliary request builders attach `x-opencode-session` on Chat Completions, Responses, and Anthropic Messages transports, including iteration-limit summaries and auxiliary client-recovery retries. The value is a stable, bounded ASCII token derived from the ambient conversation root or explicit session scope; auxiliary calls inherit the runtime main scope. OpenCode documents this as a backend-affinity hint. Programmatic callers must provide a session ID or conversation context: calls outside a conversation are not assigned a shared global ID.
 
 For the official API-key path, see the dedicated [Google Gemini guide](/guides/google-gemini).
 
