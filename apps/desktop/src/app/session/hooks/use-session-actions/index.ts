@@ -301,7 +301,7 @@ async function desktopSessionCreateParams(
       ? { model: selection.model, ...(selection.provider ? { provider: selection.provider } : {}) }
       : {}),
     ...(selection.effort ? { reasoning_effort: selection.effort } : {}),
-    fast: selection.fast
+    ...(selection.fast !== undefined ? { fast: selection.fast } : {})
   }
 }
 

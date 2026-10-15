@@ -157,3 +157,23 @@ def test_persist_failure_restores_all_live_option_fields(state, monkeypatch):
     assert state['agent'].reasoning_config['effort'] == 'low'
     assert state['agent'].service_tier is None
     assert state['agent'].request_overrides == {}
+
+
+def test_compute_host_preserves_definitive_fast_rejection_delivery(state, monkeypatch):
+    state['agent'].model = 'claude-sonnet-5-5'
+    monkeypatch.setattr('hermes_cli.models.resolve_fast_mode_overrides', lambda model: None)
+    output = io.StringIO()
+    host = ComputeHost(stdout=output, heartbeat_secs=0)
+    try:
+        host._handle_control({'sid': 'live', 'request_id': 'unsupported-fast',
+                              'route_name': 'config.set.runtime_options',
+                              'params': {'value': {'fast': True}}})
+        ack = json.loads(output.getvalue().splitlines()[0])
+        assert ack['type'] == 'control.error'
+        assert ack['code'] == 4002
+        assert ack['delivery'] == 'not_applied'
+        assert state['agent'].service_tier is None
+        assert state['agent'].request_overrides == {}
+        assert not state.get('pending_model_switch')
+    finally:
+        host.close()

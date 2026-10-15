@@ -9,6 +9,7 @@ import { createClientSessionState } from '@/lib/chat-runtime'
 import { modelOptionsQueryKey } from '@/lib/model-options'
 import { _resetSessionOwnerHintsForTests, setCurrentModel, setCurrentProvider, setSessionOwnerHint } from '@/store/session'
 
+import publications from './fixtures/selector-publications.json'
 import { type MessageStreamHarness, renderMessageStream } from './test-harness'
 import { PRE_TURN_LIVE_SETTLE_GRACE_MS } from './utils'
 
@@ -101,6 +102,59 @@ describe('session.info config refetch gating', () => {
     })
 
     expect(refreshHermesConfig).not.toHaveBeenCalled()
+  })
+})
+
+describe('diagnostic negative witnesses: observation ordering', () => {
+  it('must retain the selection when replaying the actual backend publication witness', async () => {
+    mountStream()
+    sessionStates!.set(ACTIVE_SID, {
+      ...createClientSessionState('stored-active'), model: 'B', provider: 'synthetic', reasoningEffort: 'high',
+      pendingModelSelection: { model: 'B', provider: 'synthetic', previousModel: 'A', previousProvider: 'synthetic' },
+      pendingRuntimeOptions: { effort: 'high' }
+    } as ClientSessionState)
+
+    for (const observation of publications) {
+      // Retain the original captured values/order; add the new owner-issued
+      // protocol stamp (capture order, not arrival order) for the repaired lane.
+      sessionInfo(ACTIVE_SID, { model: observation.model, provider: 'synthetic', reasoning_effort: observation.effort, pending_runtime_options: null,
+        selector_version: { epoch: 'fixture-owner', revision: observation.model === 'B' ? 2 : 1 } })
+    }
+
+    const observed = { model: sessionStates!.get(ACTIVE_SID)?.model, effort: sessionStates!.get(ACTIVE_SID)?.reasoningEffort }
+    console.log('WITNESS backend → real renderer event replay:', observed)
+    expect(observed).toEqual({ model: 'B', effort: 'high' })
+  })
+  it('older A observation must not overwrite C while C supersedes pending B', () => {
+    mountStream()
+    sessionStates!.set(ACTIVE_SID, {
+      ...createClientSessionState('stored-active'), model: 'C', provider: 'p',
+      pendingModelSelection: { model: 'C', provider: 'p', previousModel: 'B', previousProvider: 'p', rollbackModel: 'A', rollbackProvider: 'p' }
+    } as ClientSessionState)
+    sessionInfo(ACTIVE_SID, { model: 'A', provider: 'p' })
+    console.log('WITNESS model A→B→C delayed A', sessionStates!.get(ACTIVE_SID)?.model)
+    expect(sessionStates!.get(ACTIVE_SID)?.model).toBe('C')
+  })
+  it('matching B observation must not permit a subsequently delivered older A to undo B', () => {
+    mountStream()
+    sessionStates!.set(ACTIVE_SID, {
+      ...createClientSessionState('stored-active'), model: 'B', provider: 'p',
+      pendingModelSelection: { model: 'B', provider: 'p', previousModel: 'A', previousProvider: 'p' }
+    } as ClientSessionState)
+    sessionInfo(ACTIVE_SID, { model: 'B', provider: 'p', selector_version: { epoch: 'fixture-owner', revision: 2 } })
+    sessionInfo(ACTIVE_SID, { model: 'A', provider: 'p', selector_version: { epoch: 'fixture-owner', revision: 1 } })
+    console.log('WITNESS model B confirmed then delayed A', sessionStates!.get(ACTIVE_SID)?.model)
+    expect(sessionStates!.get(ACTIVE_SID)?.model).toBe('B')
+  })
+  it('confirmed high effort must survive a subsequently delivered older low observation', () => {
+    mountStream()
+    sessionStates!.set(ACTIVE_SID, {
+      ...createClientSessionState('stored-active'), reasoningEffort: 'high', pendingRuntimeOptions: { effort: 'high' }
+    } as ClientSessionState)
+    sessionInfo(ACTIVE_SID, { reasoning_effort: 'high', pending_runtime_options: null, selector_version: { epoch: 'fixture-owner', revision: 2 } })
+    sessionInfo(ACTIVE_SID, { reasoning_effort: 'low', pending_runtime_options: null, selector_version: { epoch: 'fixture-owner', revision: 1 } })
+    console.log('WITNESS effort high confirmed then delayed low', sessionStates!.get(ACTIVE_SID)?.reasoningEffort)
+    expect(sessionStates!.get(ACTIVE_SID)?.reasoningEffort).toBe('high')
   })
 })
 

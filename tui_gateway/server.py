@@ -2724,6 +2724,20 @@ def _prepare_compute_host_rpc(obj: dict, *, source=None):
             raise HostProjectionFault("compute-host session replaced during capture")
         # Stamp only after source checks, but before bounded queue admission
         # so a capacity refusal remains available for reconnect replay.
+        params = obj.get("params") or {}
+        payload = params.get("payload")
+        if session is not None and params.get("type") == "session.info" and isinstance(payload, dict):
+            from tui_gateway.selector_projection import SELECTOR_KEYS, stamp_selector_snapshot
+            admitted = _apply_compute_host_metadata_mirror(session, {
+                "session_info": payload, "_host_boot_id": params.get("host_boot_id")
+            })
+            if admitted:
+                session["_compute_host_active"] = True
+                params["payload"] = {**payload, "selector_version": stamp_selector_snapshot(session, payload)}
+            else:
+                # Keep lifecycle/non-selector signal; stale selector metadata
+                # cannot re-enter via a separately queued host event delivery.
+                params["payload"] = {k: v for k, v in payload.items() if k not in (*SELECTOR_KEYS, "selector_version")}
         _stamp_event(obj)
 
     def deliver(frame):
@@ -2838,11 +2852,27 @@ def _emit(event: str, sid: str, payload: dict | None = None):
         record = execution[0] if execution is not None and execution[1] == sid else _sessions.get(sid)
         if record is not None:
             projection_lock = _lifecycle_projection_lock(record)
+            selector_host_owned = _session_uses_compute_host(record) if event == "session.info" else False
             with projection_lock:
                 with record["history_lock"]:
                     if event != "message.complete" and _sessions.get(sid) is not record:
                         return
                     if event == "session.info":
+                        from tui_gateway.selector_projection import selector_snapshot_is_current, stamp_selector_snapshot
+                        from tui_gateway.selector_snapshot import runtime_selector_values
+                        if isinstance(payload, dict) and payload.get("selector_version") is not None:
+                            agent = record.get("agent")
+                            once = record.get("_one_turn_model_runtime")
+                            owns_once = bool(not record.get("_compute_host_active")
+                                and _owns_one_turn_model_runtime(record, agent, once)
+                                and (once.get("active") or once.get("restore_failed") or record.get("one_turn_model_restore")))
+                            current_selectors, _ = runtime_selector_values(agent, record,
+                                host_owned=selector_host_owned, owns_once=owns_once,
+                                default_model=str(payload.get("model") or ""),
+                                default_provider=str(payload.get("provider") or ""))
+                            stamp_selector_snapshot(record, current_selectors)
+                        if isinstance(payload, dict) and not selector_snapshot_is_current(record, payload):
+                            return
                         if isinstance(payload, dict) and payload.get("running") is False and record.get("running"):
                             return
                         owner = _lifecycle_projection_owner.get()
@@ -3091,6 +3121,7 @@ def _compute_host_turn_frame(
         "model_override": session.get("model_override"),
         "reasoning_config_override": session.get("create_reasoning_override"),
         "service_tier_override": session.get("create_service_tier_override"),
+        "pending_runtime_options": dict((session.get("pending_model_switch") or {}).get("runtime_options") or {}),
         "source": _session_source(session),
         "attached_images": attached_images,
         # The serving queue cut is checked atomically at parent admission.
@@ -3103,40 +3134,54 @@ def _metadata_mirror(session: dict | None) -> dict:
     return mirror if isinstance(mirror, dict) else {}
 
 
-def _apply_compute_host_metadata_mirror(session: dict, frame: dict | None) -> None:
-    """Mirror host-owned session metadata in the serving process.
-
-    The compute host is the only writer of live agent/history state while turn
-    isolation is active. The serving process keeps read metadata from the last
-    host frame so UI reads do not construct a second in-process agent.
-    """
+def _apply_compute_host_metadata_mirror(session: dict, frame: dict | None) -> bool:
+    """Admit host selector order before updating any reconstruction metadata."""
     if not isinstance(frame, dict):
-        return
-    with session.get("history_lock", threading.Lock()):
-        # An acknowledged host switch must survive a later host restart.
+        return False
+    from tui_gateway.selector_projection import admit_host_selector_snapshot, selector_lock
+    info = frame.get("session_info")
+    supervisor = _compute_host_supervisor
+    current_boot = supervisor.boot_id if supervisor is not None else None
+    with session.get("history_lock", threading.Lock()), selector_lock(session):
+        if isinstance(info, dict) and not admit_host_selector_snapshot(
+                session, info, frame.get("_host_boot_id"), current_boot):
+            return False
         if "model_override" in frame:
             session["model_override"] = frame["model_override"]
         if frame.get("session_key"):
-            session["session_key"] = str(frame.get("session_key"))
+            session["session_key"] = str(frame["session_key"])
         if frame.get("history_version") is not None:
             try:
-                session["history_version"] = max(
-                    int(session.get("history_version", 0)),
-                    int(frame.get("history_version") or 0),
-                )
-            except Exception:
+                session["history_version"] = max(int(session.get("history_version", 0)), int(frame["history_version"] or 0))
+            except (TypeError, ValueError):
                 pass
         if frame.get("message_count") is not None:
             try:
-                session["_metadata_message_count"] = int(frame.get("message_count") or 0)
-            except Exception:
+                session["_metadata_message_count"] = int(frame["message_count"] or 0)
+            except (TypeError, ValueError):
                 pass
-    info = frame.get("session_info")
-    if isinstance(info, dict):
-        mirror = dict(_metadata_mirror(session))
-        mirror.update(info)
-        session["_metadata_mirror"] = mirror
-        session["_metadata_mirror_updated_at"] = time.time()
+        if isinstance(info, dict):
+            mirror = dict(_metadata_mirror(session))
+            mirror.update(info)
+            session["_metadata_mirror"] = mirror
+            session["_metadata_mirror_updated_at"] = time.time()
+            pending = session.get("pending_model_switch") or {}
+            desired = pending.get("runtime_options")
+            if isinstance(desired, dict) and info.get("pending_runtime_options") is None:
+                from hermes_constants import parse_reasoning_effort
+                applied = (("effort" not in desired or parse_reasoning_effort(info.get("reasoning_effort", "")) == parse_reasoning_effort(desired["effort"]))
+                           and ("fast" not in desired or info.get("fast") is desired["fast"]))
+                if applied:
+                    if "effort" in desired:
+                        session["create_reasoning_override"] = parse_reasoning_effort(desired["effort"])
+                    if "fast" in desired:
+                        session["create_service_tier_override"] = "priority" if desired["fast"] else ""
+                    remainder = {k: v for k, v in pending.items() if k != "runtime_options"}
+                    if remainder:
+                        session["pending_model_switch"] = remainder
+                    else:
+                        session.pop("pending_model_switch", None)
+        return True
 
 
 def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -> None:
@@ -3701,7 +3746,7 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
             return normalized
 
         _rid, method, _params = normalized
-        if (method == "config.set" and _params.get("key") in {"model", "reasoning", "fast"}
+        if (method == "config.set" and _params.get("key") in {"model", "reasoning", "fast", "runtime_options"}
                 and _params.get("session_id") and _params.get("scope") != "global"):
             # These handlers may wait for the host or durable storage. Never
             # hold the connection reader while they run. Reserve one mutation
@@ -6762,6 +6807,37 @@ def _load_service_tier() -> str | None:
     return None
 
 
+def _resolve_effective_fast_runtime(model: str, requested_tier: str | None) -> tuple[str | None, dict]:
+    """Resolve Fast intent to an effective tier and provider request fields.
+
+    The caller retains ``requested_tier`` in the session pin. Unsupported
+    models therefore run normally without destroying the preference for a
+    later supported model.
+    """
+    raw = str(requested_tier or "").strip().lower()
+    if raw not in {"priority", "fast", "on"}:
+        return None, {}
+    from hermes_cli.models import resolve_fast_mode_overrides
+
+    overrides = resolve_fast_mode_overrides(model)
+    if overrides is None:
+        return None, {}
+    if not isinstance(overrides, dict):
+        raise ValueError("invalid Fast capability result")
+    return "priority", dict(overrides)
+
+
+def _set_agent_fast_runtime(agent, effective_tier: str | None, fast_overrides: dict) -> str | None:
+    """Commit a pre-resolved Fast result without another capability lookup."""
+    request_overrides = dict(getattr(agent, "request_overrides", {}) or {})
+    request_overrides.pop("service_tier", None)
+    request_overrides.pop("speed", None)
+    request_overrides.update(fast_overrides)
+    agent.service_tier = effective_tier
+    agent.request_overrides = request_overrides
+    return effective_tier
+
+
 def _load_provider_routing() -> dict:
     """OpenRouter provider-routing prefs from config.yaml (``provider_routing``).
 
@@ -7068,6 +7144,8 @@ def _snapshot_agent_model_runtime(agent) -> dict:
         "api_mode": getattr(agent, "api_mode", ""),
         "primary_runtime": primary,
         "reasoning_config": reasoning,
+        "service_tier": getattr(agent, "service_tier", None),
+        "request_overrides": copy.deepcopy(getattr(agent, "request_overrides", {}) or {}),
     }
 
 
@@ -7133,6 +7211,12 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
             primary = getattr(agent, "_primary_runtime", None)
             if isinstance(primary, dict):
                 primary["reasoning_config"] = copy.deepcopy(agent.reasoning_config)
+        # Fast fields are model-specific and may have been disabled for the
+        # temporary model. Restore them only after the saved route succeeds.
+        if "service_tier" in snapshot:
+            agent.service_tier = snapshot["service_tier"]
+        if "request_overrides" in snapshot:
+            agent.request_overrides = copy.deepcopy(snapshot["request_overrides"])
 
     primary = snapshot.get("primary_runtime")
     if primary and hasattr(agent, "_restore_primary_runtime"):
@@ -7430,6 +7514,18 @@ def _apply_model_switch(
                 restore_snapshot = _snapshot_agent_model_runtime(agent)
 
         if agent:
+            # Capability lookup can fail independently of model support. Refuse
+            # before the in-place model mutation rather than silently changing
+            # Fast, or leaving a partially applied switch after lookup failure.
+            requested_tier = session.get("create_service_tier_override")
+            if requested_tier is None:
+                requested_tier = getattr(agent, "service_tier", None)
+                if requested_tier is None:
+                    requested_tier = _load_service_tier()
+            try:
+                fast_tier, fast_overrides = _resolve_effective_fast_runtime(result.new_model, requested_tier)
+            except Exception as exc:
+                raise ValueError("Fast capability resolution failed; model request not applied") from exc
             try:
                 agent.switch_model(
                     new_model=result.new_model,
@@ -7451,6 +7547,21 @@ def _apply_model_switch(
                     f"Model switch to {result.new_model} failed ({exc}); "
                     f"staying on {getattr(agent, 'model', current_model)}."
                 ) from exc
+            # The agent switch resolves profile defaults for the new model.
+            # An explicit session choice outranks that fallback and survives
+            # both the immediate switch and later agent reconstruction.
+            reasoning_intent = session.get("create_reasoning_override")
+            # --once keeps its existing temporary per-model default and exact
+            # restore contract; persistent session switches retain session intent.
+            if not one_turn and isinstance(reasoning_intent, dict):
+                agent.reasoning_config = copy.deepcopy(reasoning_intent)
+                primary_runtime = getattr(agent, "_primary_runtime", None)
+                if isinstance(primary_runtime, dict):
+                    primary_runtime["reasoning_config"] = copy.deepcopy(reasoning_intent)
+
+            # Keep Fast intent in the session pin, but clear effective Fast
+            # and its wire fields when the target model does not support it.
+            _set_agent_fast_runtime(agent, fast_tier, fast_overrides)
             _persist_live_session_runtime(session)
             _persist_live_session_system_prompt(session)
             _append_model_switch_marker(
@@ -7544,7 +7655,7 @@ def _apply_model_switch(
             with model_commit_lock if model_commit_lock is not None else contextlib.nullcontext():
                 if explicit_model_intent and not owns_publication():
                     raise ValueError("session owner changed; model request not published")
-                info = _session_info(agent, session)
+                info = _session_info(agent, session, lock_held=model_commit_lock is not None)
                 projection_owner = _capture_lifecycle_projection_owner(session, sid)
             # Transport callbacks may acquire history_lock; deliver outside it.
             # The captured execution/transport cannot route through a successor.
@@ -8913,12 +9024,30 @@ def _custom_readiness_route(agent, identity: tuple, session: dict | None = None)
             reset_hermes_home_override(home_token)
 
 
-def _session_info(agent, session: dict | None = None) -> dict:
+def _session_info(agent, session: dict | None = None, *, lock_held: bool = False) -> dict:
     if session is None:
         for candidate in _sessions.values():
             if candidate.get("agent") is agent:
                 session = candidate
                 break
+    from tui_gateway.selector_snapshot import runtime_selector_values
+    from tui_gateway.selector_projection import stamp_selector_snapshot
+    cfg = _load_cfg()
+    model_cfg = cfg.get("model") or {}
+    default_model = _resolve_model()
+    host_owned = session is not None and _session_uses_compute_host(session)
+    # Snapshot and stamp share the canonical mutation lock. Known locked callers
+    # explicitly pass lock_held; never infer ownership from Lock.locked().
+    with (contextlib.nullcontext() if lock_held or session is None else session["history_lock"]):
+        once = (session or {}).get("_one_turn_model_runtime")
+        owns_once = bool(not (session or {}).get("_compute_host_active")
+            and _owns_one_turn_model_runtime(session, agent, once)
+            and (once.get("active") or once.get("restore_failed") or session.get("one_turn_model_restore")))
+        selectors, captured_pending_model = runtime_selector_values(agent, session,
+            host_owned=host_owned, owns_once=owns_once,
+            default_model=default_model,
+            default_provider=str(model_cfg.get("provider") or "") if isinstance(model_cfg, dict) else "")
+        selector_version = stamp_selector_snapshot(session, selectors) if session is not None else None
     mirror = _metadata_mirror(session)
     cwd = _display_session_cwd(session)
     session_key = str(
@@ -8927,28 +9056,8 @@ def _session_info(agent, session: dict | None = None) -> dict:
     cfg_personality = ((_load_cfg().get("display") or {}).get("personality") or "")
     personality = (session or {}).get("personality", cfg_personality)
     host_owned = session is not None and _session_uses_compute_host(session)
-    reasoning_config = None if host_owned else getattr(agent, "reasoning_config", None)
-    reasoning_effort = ""
-    if host_owned:
-        # Only owner-confirmed metadata may describe the executing agent.
-        # Empty/missing readback is unknown, not permission to revive a stale
-        # serving-process effort after a reconnect or host restart.
-        reasoning_effort = str(mirror.get("reasoning_effort") or "")
-    elif isinstance(reasoning_config, dict):
-        if reasoning_config.get("enabled") is False:
-            # Disabled must be distinguishable from unset ("" = provider
-            # default). Reporting "" here made the desktop adopt the empty
-            # value after the first turn, wiping its sticky "thinking off"
-            # pick and re-creating every later chat at the default effort.
-            reasoning_effort = "none"
-        else:
-            reasoning_effort = str(reasoning_config.get("effort", "") or "")
-    if session is not None and _session_uses_compute_host(session) and "service_tier" in mirror:
-        # The compute host owns the live agent. An explicit normal/off value
-        # must win over a stale serving-process agent and profile default.
-        service_tier = mirror["service_tier"] or ""
-    else:
-        service_tier = getattr(agent, "service_tier", None) or mirror.get("service_tier") or ""
+    reasoning_effort = selectors["reasoning_effort"]
+    service_tier = selectors["service_tier"]
     # Effective approval-bypass state — the same three sources that
     # check_all_command_guards() ORs together: persistent config
     # (approvals.mode=off), the process-scoped --yolo env, and the
@@ -8967,14 +9076,7 @@ def _session_info(agent, session: dict | None = None) -> dict:
         yolo = bool(_YOLO_MODE_FROZEN) or session_yolo or approval_mode == "off"
     except Exception:
         yolo = False
-    # A model switch queued mid-turn (pending_model_switch) applies at the next
-    # turn start, so agent.model still reads the OLD model until then. Report the
-    # pending pick instead — it's the model the next turn will run, and it stops
-    # the end-of-turn settle from blipping the UI back to the old model before
-    # the switch lands. Cleared once _apply_pending_model_switch consumes it.
-    pending_switch = (session or {}).get("pending_model_switch") or {}
-    pending_model = str(pending_switch.get("display_model") or "").strip()
-    pending_provider = str(pending_switch.get("display_provider") or "").strip()
+    pending_model = captured_pending_model
     # Epoch seconds the current turn started, or None when idle. Lets the
     # desktop preserve the turn-elapsed timer across session switches (cold
     # resume path) instead of resetting it to 0:00.
@@ -8985,31 +9087,8 @@ def _session_info(agent, session: dict | None = None) -> dict:
         else None
     )
 
-    once_runtime = (session or {}).get("_one_turn_model_runtime")
-    owns_once = bool(
-        not (session or {}).get("_compute_host_active")
-        and _owns_one_turn_model_runtime(session, agent, once_runtime)
-        and (once_runtime.get("active") or once_runtime.get("restore_failed")
-             or session.get("one_turn_model_restore"))
-    )
-    effective_model = pending_model or (
-        getattr(agent, "model", "") if owns_once else mirror.get("model", getattr(agent, "model", ""))
-    )
-    effective_provider = pending_provider or (
-        getattr(agent, "provider", "") if owns_once else mirror.get("provider", getattr(agent, "provider", ""))
-    )
-    if not effective_model:
-        effective_model = _resolve_model()
-    if not effective_provider:
-        model_cfg = _load_cfg().get("model") or {}
-        effective_provider = str(model_cfg.get("provider") or "") if isinstance(model_cfg, dict) else ""
-    # A one-turn runtime is live now; its saved pin applies after restoration.
-    if session is not None and not session.get("_compute_host_active") and not owns_once:
-        override = session.get("model_override")
-        if isinstance(override, dict) and override.get("model"):
-            # A queued next-turn pick outranks the previous session pin.
-            effective_model = pending_model or override["model"]
-            effective_provider = pending_provider or override.get("provider") or effective_provider
+    effective_model = selectors["model"]
+    effective_provider = selectors["provider"]
     identity = (str(effective_provider or ""), str(effective_model or ""))
     model_ready = bool(
         session is not None
@@ -9025,15 +9104,10 @@ def _session_info(agent, session: dict | None = None) -> dict:
         model_ready = session["_verified_custom_route"] == _custom_readiness_route(agent, identity, session)
 
     info: dict = {
+        **({"selector_version": selector_version} if selector_version else {}),
         "session_id": next((sid for sid, record in _sessions.items() if record is session), ""),
-        "model": effective_model,
-        "provider": effective_provider,
+        **selectors,
         "model_ready": model_ready,
-        "reasoning_effort": reasoning_effort,
-        "service_tier": service_tier,
-        "fast": service_tier == "priority",
-        "pending_runtime_options": (mirror.get("pending_runtime_options") if host_owned
-                                    else pending_switch.get("runtime_options")),
         "yolo": yolo,
         "approval_mode": approval_mode,
         "tools": dict(mirror.get("tools") or {}) if isinstance(mirror.get("tools"), dict) else {},
@@ -9114,6 +9188,12 @@ def _session_info(agent, session: dict | None = None) -> dict:
         if warn:
             info["credential_warning"] = warn
     return info
+
+
+def _selector_info_for_ack(session: dict) -> dict:
+    from tui_gateway.selector_projection import SELECTOR_KEYS
+    info = _session_info(session.get("agent"), session)
+    return {key: info[key] for key in (*SELECTOR_KEYS, "selector_version") if key in info}
 
 
 def _tool_ctx(name: str, args: dict) -> str:
@@ -10530,6 +10610,8 @@ def _make_agent(
         and not isinstance(provider_cap, bool) and provider_cap > 0
         else None
     )
+    requested_tier = service_tier_override if service_tier_override is not None else _load_service_tier()
+    effective_tier, fast_request_overrides = _resolve_effective_fast_runtime(str(model or ""), requested_tier)
     return AIAgent(
         model=model,
         max_tokens=max_tokens,
@@ -10554,11 +10636,8 @@ def _make_agent(
                 else _load_reasoning_config(str(model or ""))
             )
         ),
-        service_tier=(
-            service_tier_override
-            if service_tier_override is not None
-            else _load_service_tier()
-        ),
+        service_tier=effective_tier,
+        request_overrides=fast_request_overrides,
         enabled_toolsets=_load_enabled_toolsets(_resolve_agent_platform(platform_override)),
         disabled_toolsets=disabled_toolsets,
         # OpenRouter provider-routing prefs (config.yaml `provider_routing`).
@@ -12258,7 +12337,7 @@ def _emit_terminal_turn_error_owned(
                          and window.owns(session, sid) and window.turns
                          and window.turns[-1]["accepted_turn"]["request_id"] == execution[2]))):
                 # No detached metadata, and no old idle snapshot after Send B.
-                settled_info = _session_info(agent, session)
+                settled_info = _session_info(agent, session, lock_held=True)
                 projection_owner = _capture_lifecycle_projection_owner(session, sid)
             else:
                 settled_info = None
@@ -15512,8 +15591,8 @@ def _run_prompt_submit(
                             )
                         )
                         and _requested_route == (
-                            _session_info(agent, session)["provider"],
-                            _session_info(agent, session)["model"],
+                            _session_info(agent, session, lock_held=True)["provider"],
+                            _session_info(agent, session, lock_held=True)["model"],
                         )
                         and _route.served_model == _route.model
                         # Current-owner gate: if a session record currently
@@ -15881,7 +15960,7 @@ def _run_prompt_submit(
                     _reconcile_session_cwd_from_terminal(session)
                 except Exception:
                     logger.debug("failed to reconcile settled session cwd", exc_info=True)
-                settled_info = _session_info(agent, session)
+                settled_info = _session_info(agent, session, lock_held=True)
                 projection_owner = _capture_lifecycle_projection_owner(session, sid)
             settled_execution_token = _turn_outcome_execution.set((session, sid,
                 execution[2] if execution is not None else None))
@@ -16436,10 +16515,29 @@ def _(rid, params: dict) -> dict:
                 return _err(rid, 5019, "option update rejected" if disposition == "not_applied" else "option update unconfirmed",
                             {"delivery": disposition})
             result = ack.get("result")
+            info = ack.get("session_info")
             if (ack.get("type") != "control.ack" or not isinstance(result, dict)
-                    or result.get("key") != key or result.get("value") != value):
+                    or result.get("key") != key or result.get("value") != value or not isinstance(info, dict)):
                 return _err(rid, 5019, "option update readback unconfirmed", {"delivery": "uncertain"})
-            _apply_compute_host_metadata_mirror(session, ack)
+            from hermes_constants import parse_reasoning_effort
+            if result.get("deferred"):
+                observed = info.get("pending_runtime_options")
+                if not isinstance(observed, dict) or any(observed.get(k) != v for k, v in value.items()):
+                    return _err(rid, 5019, "pending option owner readback unconfirmed", {"delivery": "uncertain"})
+            elif (("effort" in value and parse_reasoning_effort(info.get("reasoning_effort", "")) != parse_reasoning_effort(value["effort"]))
+                  or ("fast" in value and (type(info.get("fast")) is not bool or info["fast"] != value["fast"]))):
+                return _err(rid, 5019, "applied option owner readback unconfirmed", {"delivery": "uncertain"})
+            if not _apply_compute_host_metadata_mirror(session, ack):
+                return _err(rid, 5019, "option acknowledgement superseded", {"delivery": "uncertain"})
+            with session["history_lock"]:
+                if not result.get("deferred"):
+                    if "effort" in value:
+                        session["create_reasoning_override"] = parse_reasoning_effort(value["effort"])
+                    if "fast" in value:
+                        session["create_service_tier_override"] = "priority" if value["fast"] else ""
+                else:
+                    pending = session.get("pending_model_switch") or {}
+                    session["pending_model_switch"] = {**pending, "runtime_options": {**pending.get("runtime_options", {}), **value}}
         else:
             try:
                 result = _apply_session_runtime_options(sid, session, value)
@@ -16447,8 +16545,10 @@ def _(rid, params: dict) -> dict:
                 return _err(rid, 4002, str(exc), {"delivery": "not_applied"})
             except Exception:
                 return _err(rid, 5019, "option persistence unconfirmed", {"delivery": "uncertain"})
-        _emit("session.info", sid, _session_info(session.get("agent"), session))
-        return _ok(rid, result)
+        info = _session_info(session.get("agent"), session)
+        _emit("session.info", sid, info)
+        from tui_gateway.selector_projection import SELECTOR_KEYS
+        return _ok(rid, {**result, "selector_info": {k: info[k] for k in (*SELECTOR_KEYS, "selector_version") if k in info}})
 
     if key == "model":
         try:
@@ -16483,12 +16583,15 @@ def _(rid, params: dict) -> dict:
                     return _err(rid, 5001, "compute-host model switch returned an invalid response")
                 session["_compute_host_active"] = True
                 _apply_compute_host_metadata_mirror(session, ack)
-                _emit("session.info", sid, _session_info(session.get("agent"), session))
+                info = _session_info(session.get("agent"), session)
+                _emit("session.info", sid, info)
+                from tui_gateway.selector_projection import SELECTOR_KEYS
                 return _ok(
                     rid,
                     {
                         "key": key,
                         "value": result.get("value", ""),
+                        "selector_info": {k: info[k] for k in (*SELECTOR_KEYS, "selector_version") if k in info},
                         "warning": result.get("warning", ""),
                         "confirm_required": result.get("confirm_required", False),
                         "confirm_message": result.get("confirm_message", ""),
@@ -16619,6 +16722,7 @@ def _(rid, params: dict) -> dict:
                 {
                     "key": key,
                     "value": result["value"],
+                    **({"selector_info": _selector_info_for_ack(session)} if session is not None and not result.get("confirm_required") else {}),
                     "warning": result["warning"],
                     "confirm_required": result.get("confirm_required", False),
                     "confirm_message": result.get("confirm_message", ""),
@@ -16656,9 +16760,13 @@ def _(rid, params: dict) -> dict:
                 return _err(rid, 5019, "fast update returned an unconfirmed owner",
                             {"delivery": "uncertain"})
             if ack.get("type") in {"control.error", "error"}:
-                # A host error after an offered write carries no proof that
-                # the mutation was not applied, regardless of its error code.
+                # Preserve a host's definitive validation refusal. Only a
+                # missing/unknown delivery remains uncertain.
                 code = ack.get("code")
+                delivery = ack.get("delivery")
+                if delivery in {"not_sent", "not_applied"}:
+                    return _err(rid, 5019, str(ack.get("message") or "fast update rejected"),
+                                {"delivery": delivery, **({"host_code": code} if type(code) is int else {})})
                 return _err(rid, 5019, str(ack.get("message") or "fast update unconfirmed"),
                             {"delivery": "uncertain", **({"host_code": code} if type(code) is int else {})})
             result, info = ack.get("result"), ack.get("session_info")
@@ -17090,11 +17198,14 @@ def _(rid, params: dict) -> dict:
                     return _err(rid, 5019, "reasoning update returned an unconfirmed owner",
                                 {"delivery": "uncertain"})
                 if ack.get("type") in {"control.error", "error"}:
-                    # The control was offered; a host-reported error code is
-                    # not evidence that it did not apply before the reply.
+                    # Preserve a host's definitive validation refusal. Only a
+                    # missing/unknown delivery remains uncertain.
                     code = ack.get("code")
-                    return _err(rid, 5019,
-                                str(ack.get("message") or "reasoning update unconfirmed"),
+                    delivery = ack.get("delivery")
+                    if delivery in {"not_sent", "not_applied"}:
+                        return _err(rid, 5019, str(ack.get("message") or "reasoning update rejected"),
+                                    {"delivery": delivery, **({"host_code": code} if type(code) is int else {})})
+                    return _err(rid, 5019, str(ack.get("message") or "reasoning update unconfirmed"),
                                 {"delivery": "uncertain", **({"host_code": code} if type(code) is int else {})})
                 result, info = ack.get("result"), ack.get("session_info")
                 try:
@@ -18522,10 +18633,25 @@ def _model_picker_context(agent, session: dict | None = None):
 
     ctx = load_picker_context()
     selected = {}
-    if session is not None and _session_uses_compute_host(session) and not session.get("_compute_host_active"):
-        override = session.get("model_override")
-        if isinstance(override, dict):
-            selected = override
+    if session is not None and _session_uses_compute_host(session):
+        with session["history_lock"]:
+            override = session.get("model_override")
+            if isinstance(override, dict):
+                selected = dict(override)
+            if session.get("_compute_host_active"):
+                # The serving agent is only a prewarmed shadow. Use the
+                # admitted host projection, including a temporary --once pick.
+                mirror = _metadata_mirror(session)
+                host_model = mirror.get("model")
+                host_provider = mirror.get("provider")
+                if host_model and host_provider:
+                    same_route = (selected.get("model") == host_model
+                                  and selected.get("provider") == host_provider)
+                    selected.update(model=host_model, provider=host_provider)
+                    if not same_route:
+                        # Do not attach a durable/parent route URL to a
+                        # different host selection whose URL was not reported.
+                        selected["base_url"] = ""
     provider = selected.get("provider") or (getattr(agent, "provider", "") if agent else "")
     model = selected.get("model") or (getattr(agent, "model", "") if agent else "")
     base_url = selected.get("base_url") if selected else (getattr(agent, "base_url", "") if agent else "")
@@ -19000,10 +19126,8 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
             return "\n".join(_lines)
         elif name == "fast" and agent:
             mode = arg.lower()
-            if mode in {"fast", "on"}:
-                agent.service_tier = "priority"
-            elif mode in {"normal", "off"}:
-                agent.service_tier = None
+            if mode in {"fast", "on", "normal", "off"}:
+                _apply_session_runtime_options(sid, session, {"fast": mode in {"fast", "on"}})
             _emit("session.info", sid, _session_info(agent, session))
         elif name == "reload-mcp" and agent and hasattr(agent, "reload_mcp_tools"):
             agent.reload_mcp_tools()

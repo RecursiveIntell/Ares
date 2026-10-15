@@ -72,10 +72,13 @@ def bridge(tmp_path, monkeypatch, request):
     parent, child_pipe = multiprocessing.get_context("spawn").Pipe()
     process = multiprocessing.get_context("spawn").Process(target=child, args=(child_pipe, request.param))
     received = []
+    clarify_delivered = threading.Event()
 
     class Transport:
         def write(self, frame):
             received.append(frame)
+            if (frame.get("params") or {}).get("type") == "clarify.request":
+                clarify_delivered.set()
             return True
 
     transport = Transport()
@@ -110,7 +113,11 @@ def bridge(tmp_path, monkeypatch, request):
     host._hello = {"boot_id": parent.recv()["boot_id"]}
     assert parent.poll(5)
     host._handle_host_frame(parent.recv())
-    rid = received[-1]["params"]["payload"]["request_id"]
+    # HostSupervisor queues projection off the reader; enqueue is not delivery.
+    assert clarify_delivered.wait(5), "host projection did not deliver the clarify request"
+    request_frame = next(frame for frame in received
+                         if (frame.get("params") or {}).get("type") == "clarify.request")
+    rid = request_frame["params"]["payload"]["request_id"]
 
     def inspect():
         parent.send("inspect")

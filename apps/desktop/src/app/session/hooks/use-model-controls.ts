@@ -8,6 +8,7 @@ import { useI18n } from '@/i18n'
 import { isBusySessionModelSwitch } from '@/lib/gateway-rpc'
 import { surfaceModelSwitchConfirm } from '@/lib/guarded-model-switch'
 import { modelOptionsQueryKey } from '@/lib/model-options'
+import { reconcileSelectorInfo } from '@/lib/selector-observation'
 import { activeGatewayConnectionId } from '@/store/gateway'
 import { notifyError } from '@/store/notifications'
 import { $activeGatewayProfile } from '@/store/profile'
@@ -32,7 +33,7 @@ import {
 } from '@/store/session'
 import { isSessionGoneError } from '@/store/session-gone'
 import { $sessionStates, knownOwnerForSession, sessionTileDelegate } from '@/store/session-states'
-import type { ModelOptionsResponse } from '@/types/hermes'
+import type { ModelOptionsResponse, SessionRuntimeInfo } from '@/types/hermes'
 
 import {
   captureDraftComposerOwner,
@@ -59,6 +60,8 @@ interface ModelControlsOptions {
 }
 
 interface ModelSwitchResponse {
+  value?: string
+  selector_info?: SessionRuntimeInfo
   confirm_message?: string
   confirm_required?: boolean
   deferred?: boolean
@@ -646,6 +649,31 @@ export function useModelControls({ queryClient, recoverRuntime, requestGateway }
         // the switch publishes session.info when it lands, and that is what
         // re-syncs every surface.
         if (!result?.deferred) {
+          if (liveSessionId && owns('model')) {
+            const ackModel = result?.selector_info?.model ?? result?.value
+            const ackProvider = result?.selector_info?.provider
+            const exactIntentAcknowledged = ackModel === selection.model &&
+              (ackProvider === undefined || ackProvider === selection.provider)
+
+            sessionTileDelegate()?.updateSession(liveSessionId, state => {
+              const reconciled = result?.selector_info
+                ? reconcileSelectorInfo(state, result.selector_info, { settleModel: true })
+                : {}
+              const pending = state.pendingModelSelection
+              const settlesOwnedPick = exactIntentAcknowledged && pending?.model === selection.model &&
+                pending.provider === selection.provider
+
+              return {
+                ...state,
+                ...reconciled,
+                // The snapshot remains epoch-gated. This RPC is separately
+                // correlated to the still-current owner/token and can settle
+                // only its exact pending pick, never a newer selection.
+                ...(settlesOwnedPick ? { pendingModelSelection: null } : {})
+              }
+            })
+          }
+
           void queryClient.invalidateQueries({
             queryKey: modelOptionsQueryKey(liveGatewayProfile, liveSessionId, liveConnectionId)
           })

@@ -49,6 +49,7 @@ from plugins.context_engine._context_governor.protocol import (
 )
 
 logger = logging.getLogger(__name__)
+_NATIVE_SOURCE_OWNER = Path(__file__).resolve().parents[3]
 
 # These certified lifecycle/query operations return JSON arrays. Keep the
 # exception exact; every other certified command remains object-shaped and
@@ -145,9 +146,20 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         store_dir: str | None = None,
         timeout_sec: int = 30,
     ):
-        self.binary = (
-            binary or os.environ.get("CONTEXT_GOVERNOR_BIN") or self._default_binary()
-        )
+        from ares_runtime.governor_install import GovernorInstallError, bundled_binary
+
+        self._managed_native_source = None
+        try:
+            managed_binary = bundled_binary(_NATIVE_SOURCE_OWNER)
+        except GovernorInstallError as exc:
+            raise ContextGovernorActivationError(str(exc)) from exc
+        if managed_binary is not None:
+            if binary is not None and Path(binary).resolve() != managed_binary:
+                raise ContextGovernorActivationError("explicit binary differs from the managed native bundle")
+            self._managed_native_source = _NATIVE_SOURCE_OWNER
+            self.binary = str(managed_binary)
+        else:
+            self.binary = binary or os.environ.get("CONTEXT_GOVERNOR_BIN") or self._default_binary()
         self.store_dir = Path(
             store_dir
             or os.environ.get("CONTEXT_GOVERNOR_STORE")
@@ -384,6 +396,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         a replacement for stock compression. It deliberately refuses a V2
         runtime without a configured readable HMAC key.
         """
+        self._verify_managed_native()
         if self._unsafe_configured_hmac_path:
             raise ContextGovernorActivationError(
                 "ConfigurationPathOutsideCanonicalState: receipt_hmac_key_path is not accepted"
@@ -3214,21 +3227,14 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
 
             llm_summary = self._bind_receipt_carrier(llm_summary, response)
             candidate = list(compacted)
-            metadata = candidate[summary_idx].get("metadata")
-            if not isinstance(metadata, dict):
-                metadata = {}
-            receipt_id = receipt.get("receipt_id")
-            generation = receipt.get("generation")
+            # The bound text and durable summary marker already carry the
+            # checkpoint identity. SessionDB has no generic metadata column;
+            # adding one here would sign a projection that cold replay loses.
+            # Keep checkpoint accounting in the pending admission, not in a
+            # transient host metadata envelope.
             candidate[summary_idx] = {
                 **candidate[summary_idx],
                 "content": llm_summary,
-                "metadata": {
-                    **metadata,
-                    "compressed_summary": True,
-                    "llm_checkpoint": True,
-                    "receipt_id": receipt_id,
-                    "receipt_generation": generation,
-                },
             }
             # The caller finalizes this candidate with Rust and accepts it only
             # if the governor's own token counter meets the target.
@@ -3895,6 +3901,18 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             target = min(target, input_window)
         return target
 
+    def _verify_managed_native(self) -> None:
+        source = getattr(self, "_managed_native_source", None)
+        if source is None:
+            return
+        from ares_runtime.governor_install import GovernorInstallError, bundled_binary
+
+        try:
+            if bundled_binary(source) != Path(self.binary):
+                raise GovernorInstallError("managed native owner disappeared or changed")
+        except GovernorInstallError as exc:
+            raise ContextGovernorActivationError(str(exc)) from exc
+
     def _run_json(
         self,
         args: list[str],
@@ -3902,6 +3920,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         *,
         pass_fds: tuple[int, ...] = (),
     ) -> Any:
+        self._verify_managed_native()
         expect_failure_envelope = FAILURE_FLAG in args
         command = [str(self.binary), *args]
         popen_kwargs: dict[str, Any] = {

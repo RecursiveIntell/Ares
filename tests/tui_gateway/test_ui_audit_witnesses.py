@@ -79,7 +79,7 @@ def test_reasoning_change_must_reach_compute_host_owner(monkeypatch):
 
 def test_session_info_reports_owner_reasoning_not_stale_parent(monkeypatch):
     parent = SimpleNamespace(model='fixture', provider='fixture', reasoning_config={'enabled':True,'effort':'low'})
-    record = {'session_key':'stored-audit','agent':parent,'_compute_host_active':True,'_metadata_mirror':{'model':'fixture','provider':'fixture','reasoning_effort':'high'},'running':False}
+    record = {'session_key':'stored-audit','agent':parent,'_compute_host_active':True,'_metadata_mirror':{'model':'fixture','provider':'fixture','reasoning_effort':'high'},'running':False,'history_lock':threading.Lock()}
     monkeypatch.setattr(server, '_session_uses_compute_host', lambda s: True)
     info = server._session_info(parent, record)
     print({'owner':'high','parent':'low','reported':info['reasoning_effort']})

@@ -330,7 +330,7 @@ class ComputeHost:
                                 "session_id": sid,
                                 "running": bool(request_id or session.get("running")),
                                 "request_id": request_id,
-                                "session_info": server._session_info(agent, session),
+                                "session_info": server._session_info(agent, session, lock_held=True),
                             }
                         )
             except Exception as exc:
@@ -826,6 +826,12 @@ class ComputeHost:
             session["attached_images"] = list(frame.get("attached_images") or [])
         if frame.get("model_override") is not None:
             session["model_override"] = frame.get("model_override")
+        if frame.get("reasoning_config_override") is not None:
+            session["create_reasoning_override"] = frame["reasoning_config_override"]
+        if frame.get("service_tier_override") is not None:
+            session["create_service_tier_override"] = frame["service_tier_override"]
+        if frame.get("pending_runtime_options"):
+            session["pending_model_switch"] = {"runtime_options": dict(frame["pending_runtime_options"])}
         return session
 
     def _handle_reload_mcp(self, frame: dict[str, Any]) -> None:
@@ -973,9 +979,13 @@ class ComputeHost:
                     {"key": option, "value": params.get("value", ""), "session_id": sid},
                 )
                 if "error" in response:
+                    error = response.get("error") or {}
+                    error_data = error.get("data") if isinstance(error, dict) else None
+                    delivery = error_data.get("delivery") if isinstance(error_data, dict) else None
                     self.emit({"type": "control.error", "sid": sid, "request_id": request_id,
-                               "code": response["error"].get("code"),
-                               "message": str(response["error"].get("message") or "option switch failed")})
+                               "code": error.get("code"),
+                               "message": str(error.get("message") or "option switch failed"),
+                               **({"delivery": delivery} if delivery in {"not_sent", "not_applied"} else {})})
                     return
                 self.emit({"type": "control.ack", "sid": sid, "request_id": request_id,
                            "route_name": route_name, "result": response.get("result") or {},

@@ -87,6 +87,87 @@ def selected_session(value, monkeypatch):
     return session
 
 
+def test_custom_provider_switch_preserves_reasoning_on_request_wire(world, monkeypatch):
+    world.routes.config["providers"]["endpoint-b"]["models"] = {"gpt-5.3-codex": {}}
+    world.routes.write()
+    value = world.build()
+    session = selected_session(value, monkeypatch)
+    session["create_reasoning_override"] = {"enabled": True, "effort": "low"}
+    session["create_service_tier_override"] = "priority"
+
+    server._apply_model_switch(
+        "selected", session, "gpt-5.3-codex --provider endpoint-b --session",
+        confirm_expensive_model=True, persist_override=False,
+    )
+    request = outgoing(value)
+    assert value.provider == "endpoint-b"
+    assert value.base_url == "http://b.invalid/v1"
+    assert request["model"] == "gpt-5.3-codex"
+    assert request["reasoning_effort"] == "low"
+    assert "service_tier" not in request
+    assert "speed" not in request
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_custom_wire_profile_requires_a_configured_provider(world, monkeypatch, configured):
+    value = world.build()
+    value.model = "gpt-5.3-codex"
+    value.provider = "endpoint-b" if configured else "unconfigured-provider"
+    value.reasoning_config = {"enabled": True, "effort": "low"}
+    request = outgoing(value)
+    if configured:
+        assert request["reasoning_effort"] == "low"
+    else:
+        assert "reasoning_effort" not in request
+    assert value.provider == ("endpoint-b" if configured else "unconfigured-provider")
+
+
+def test_registered_wire_profile_precedes_named_custom_detection(world, monkeypatch):
+    from unittest.mock import Mock
+    from providers import get_provider_profile
+
+    value = world.build()
+    value.model = "gpt-5.3-codex"
+    value.provider = "endpoint-b"
+    value.reasoning_config = {"enabled": True, "effort": "low"}
+    profile = get_provider_profile("custom")
+    monkeypatch.setattr("providers.get_provider_profile", lambda _: profile)
+    named = Mock(side_effect=AssertionError("registered profile must not trigger custom detection"))
+    monkeypatch.setattr("hermes_cli.runtime_provider.has_named_custom_provider", named)
+    assert outgoing(value)["reasoning_effort"] == "low"
+    named.assert_not_called()
+
+
+@pytest.mark.parametrize("active,temporary", [(False, False), (True, False), (True, True)])
+def test_model_picker_uses_host_selection_instead_of_prewarmed_parent(world, monkeypatch, active, temporary):
+    value = world.build()
+    session = selected_session(value, monkeypatch)
+    session["model_override"] = {
+        "model": "chosen-model", "provider": "endpoint-b", "base_url": "http://b.invalid/v1",
+    }
+    session["_compute_host_active"] = active
+    session["_metadata_mirror"] = {
+        "model": "temporary-model" if temporary else "chosen-model", "provider": "endpoint-b",
+    }
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _: True)
+
+    context = server._model_picker_context(value, session)
+    assert context.current_model == ("temporary-model" if temporary else "chosen-model")
+    assert context.current_provider == "endpoint-b"
+    assert context.current_base_url == ("" if temporary else "http://b.invalid/v1")
+    # Readback must not mutate the serving process's stale prewarmed agent.
+    assert value.model == "model-a"
+
+
+def test_model_picker_ignores_host_mirror_for_inprocess_owner(world, monkeypatch):
+    value = world.build()
+    session = selected_session(value, monkeypatch)
+    session["_metadata_mirror"] = {"model": "stale-model", "provider": "endpoint-b"}
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _: False)
+    context = server._model_picker_context(value, session)
+    assert context.current_model == "model-a"
+
+
 @pytest.mark.parametrize("actual", [None, {"enabled": False}, {"enabled": True, "effort": "medium"}])
 def test_once_restores_actual_reasoning_and_primary(world, monkeypatch, actual):
     value = world.build()
@@ -121,6 +202,95 @@ def test_snapshot_copies_actual_manual_reasoning(world):
     value.reasoning_config["effort"] = "high"
     assert snapshot["reasoning_config"] == {"enabled": True, "effort": "medium"}
     assert snapshot["primary_runtime"]["reasoning_config"] == {"enabled": True, "effort": "medium"}
+
+
+def test_fast_capability_failure_is_not_treated_as_unsupported(world, monkeypatch):
+    def broken_resolver(_model):
+        raise RuntimeError("fixture capability resolver failed")
+
+    monkeypatch.setattr("hermes_cli.models.resolve_fast_mode_overrides", broken_resolver)
+    with pytest.raises(RuntimeError, match="fixture capability resolver failed"):
+        server._resolve_effective_fast_runtime("chosen-model", "priority")
+
+
+@pytest.mark.parametrize("invalid_result", [False, "priority", []])
+def test_invalid_fast_capability_result_is_not_treated_as_unsupported(monkeypatch, invalid_result):
+    monkeypatch.setattr("hermes_cli.models.resolve_fast_mode_overrides", lambda _: invalid_result)
+    with pytest.raises(ValueError, match="invalid Fast capability result"):
+        server._resolve_effective_fast_runtime("chosen-model", "priority")
+
+
+def test_fast_capability_failure_refuses_switch_before_mutation(world, monkeypatch):
+    value = world.build()
+    value.service_tier = "priority"
+    value.request_overrides = {"service_tier": "priority"}
+    session = selected_session(value, monkeypatch)
+    session["create_service_tier_override"] = "priority"
+    before = server._snapshot_agent_model_runtime(value)
+    pin = copy.deepcopy(session["model_override"])
+    attempted = []
+
+    def broken_resolver(model):
+        attempted.append(model)
+        raise RuntimeError("fixture capability resolver failed")
+
+    monkeypatch.setattr("hermes_cli.models.resolve_fast_mode_overrides", broken_resolver)
+    with pytest.raises(ValueError, match="Fast capability resolution failed.*not applied"):
+        server._apply_model_switch(
+            "selected", session, "chosen-model --provider endpoint-b --session",
+            confirm_expensive_model=True, persist_override=False,
+        )
+    assert attempted == ["chosen-model"]
+    assert server._snapshot_agent_model_runtime(value) == before
+    assert session["model_override"] == pin
+    assert not session["history"]
+
+
+def test_model_switch_preserves_session_reasoning_intent_and_gates_fast(world, monkeypatch):
+    value = world.build()
+    value.reasoning_config = {"enabled": True, "effort": "low"}
+    value.service_tier = "priority"
+    value.request_overrides = {"service_tier": "priority"}
+    session = selected_session(value, monkeypatch)
+    session["create_reasoning_override"] = {"enabled": True, "effort": "low"}
+    session["create_service_tier_override"] = "priority"
+    # A stale projection must not outrank the live agent for an in-process session.
+    session["_metadata_mirror"] = {"service_tier": "priority", "fast": True}
+
+    server._apply_model_switch(
+        "selected", session, "chosen-model --provider endpoint-b --session",
+        confirm_expensive_model=True, persist_override=False,
+    )
+
+    assert value.reasoning_config == {"enabled": True, "effort": "low"}
+    assert value._primary_runtime["reasoning_config"] == {"enabled": True, "effort": "low"}
+    assert value.service_tier is None
+    assert "service_tier" not in value.request_overrides
+    assert "speed" not in value.request_overrides
+    # User intent remains available if a later switch returns to a Fast-capable model.
+    assert session["create_service_tier_override"] == "priority"
+    info = server._session_info(value, session)
+    assert info["service_tier"] == ""
+    assert info["fast"] is False
+
+
+def test_once_restores_fast_fields_after_an_unsupported_temporary_model(world, monkeypatch):
+    value = world.build()
+    value.service_tier = "priority"
+    original_overrides = {"service_tier": "priority", "extra_body": {"fixture": True}}
+    value.request_overrides = copy.deepcopy(original_overrides)
+    session = selected_session(value, monkeypatch)
+    session["create_service_tier_override"] = "priority"
+
+    server._apply_model_switch(
+        "selected", session, "chosen-model --provider endpoint-b --once",
+        confirm_expensive_model=True, persist_override=False,
+    )
+    assert value.service_tier is None
+    assert "service_tier" not in value.request_overrides
+    server._restore_agent_model_runtime(value, session.pop("one_turn_model_restore"))
+    assert value.service_tier == "priority"
+    assert value.request_overrides == original_overrides
 
 
 @pytest.mark.parametrize("setting,expected", [

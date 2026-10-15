@@ -2050,6 +2050,14 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
     try:
         from providers import get_provider_profile
         _profile = get_provider_profile(agent.provider)
+        if _profile is None:
+            from hermes_cli.runtime_provider import has_named_custom_provider
+
+            # Named custom routes retain their configured identity on a model
+            # switch. Their wire behavior must match fresh construction, which
+            # uses the registered custom profile, not the unknown-provider path.
+            if has_named_custom_provider(agent.provider):
+                _profile = get_provider_profile("custom")
     except Exception:
         _profile = None
 

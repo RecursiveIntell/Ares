@@ -7,6 +7,7 @@ provider/base_url/api_key empty in AIAgent, causing HTTP 404.
 
 import os
 import threading
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 
@@ -59,6 +60,38 @@ def test_make_agent_passes_resolved_provider():
         assert call_kwargs.kwargs["base_url"] == "https://api.anthropic.com"
         assert call_kwargs.kwargs["api_key"] == "sk-test-key"
         assert call_kwargs.kwargs["api_mode"] == "anthropic_messages"
+
+
+def test_make_agent_applies_fast_only_when_the_selected_model_supports_it():
+    """A pinned Fast preference is intent; effective tier and wire fields are model-gated."""
+    from tui_gateway.server import _make_agent
+
+    runtime = {
+        "provider": "anthropic", "base_url": "https://api.anthropic.com", "api_key": "test",
+        "api_mode": "anthropic_messages", "command": None, "args": None,
+        "credential_pool": None, "max_output_tokens": None,
+    }
+
+    for model, expected_tier, expected_overrides in (
+        ("claude-sonnet-5-5", None, {}),
+        ("claude-opus-4-6", "priority", {"speed": "fast"}),
+    ):
+        with (
+            patch("tui_gateway.server._load_cfg", return_value={"model": {"default": model, "provider": "anthropic"}}),
+            patch("tui_gateway.server._resolve_runtime_with_fallback",
+                  return_value=SimpleNamespace(runtime=runtime, used_fallback=False, selected_model=None)),
+            patch("tui_gateway.server._load_reasoning_config", return_value=None),
+            patch("tui_gateway.server._load_service_tier", return_value="priority"),
+            patch("tui_gateway.server._load_tool_progress_mode", return_value="compact"),
+            patch("tui_gateway.server._load_enabled_toolsets", return_value=[]),
+            patch("tui_gateway.server._get_db", return_value=MagicMock()),
+            patch("run_agent.AIAgent") as mock_agent,
+        ):
+            _make_agent("sid", "key", model_override={"model": model, "provider": "anthropic"},
+                        service_tier_override="priority")
+            kwargs = mock_agent.call_args.kwargs
+            assert kwargs["service_tier"] == expected_tier
+            assert kwargs["request_overrides"] == expected_overrides
 
 
 def test_probe_config_health_flags_null_sections():

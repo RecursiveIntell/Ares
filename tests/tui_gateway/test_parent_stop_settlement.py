@@ -21,7 +21,7 @@ def setup(monkeypatch, host):
     monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda *a: host)
     monkeypatch.setattr(server, "_clear_pending", lambda *a: None)
     monkeypatch.setattr(server, "_clear_inflight_turn", lambda *a: None)
-    monkeypatch.setattr(server, "_session_info", lambda *a: {})
+    monkeypatch.setattr(server, "_session_info", lambda *a, lock_held=False: {})
     monkeypatch.setattr(server, "_emit", lambda *a: None)
 
 
@@ -145,7 +145,7 @@ def test_unsent_stop_after_terminal_publishes_idle_state(monkeypatch):
             {"type": "turn.end", "sid": "s", "request_id": "A"})
         raise HostSendNotSent("nothing offered")
     setup(monkeypatch, types.SimpleNamespace(interrupt=interrupt))
-    monkeypatch.setattr(server, "_session_info", lambda agent, s: {
+    monkeypatch.setattr(server, "_session_info", lambda agent, s, *, lock_held=False: {
         "running": bool(s.get("running") or s.get("_stop_pending") or s.get("_stop_uncertain"))})
     monkeypatch.setattr(server, "_emit", lambda event, sid, payload: emitted.append(payload))
     with pytest.raises(HostSendNotSent):

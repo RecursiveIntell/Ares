@@ -30,7 +30,7 @@ def test_new_input_waits_outside_session_lock_until_native_cut_verified(tmp_path
     monkeypatch.setattr(server, "_ensure_session_db_row", lambda *a: None)
     monkeypatch.setattr(server, "_clear_pending", lambda *a: None)
     monkeypatch.setattr(server, "_emit", lambda *a: None)
-    monkeypatch.setattr(server, "_session_info", lambda *a: {})
+    monkeypatch.setattr(server, "_session_info", lambda *a, lock_held=False: {})
     waiting = threading.Event()
     release = threading.Event()
     input_started = threading.Event()

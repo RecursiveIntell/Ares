@@ -15,7 +15,7 @@ def test_busy_rejection_must_not_settle_another_live_turn_or_disable_stop(monkey
     monkeypatch.setattr(server,'_session_uses_compute_host',lambda s: True)
     monkeypatch.setattr(server,'_get_compute_host_supervisor',lambda:supervisor)
     monkeypatch.setattr(server,'_emit',emit)
-    monkeypatch.setattr(server,'_session_info',lambda *a:{'running':record['running']})
+    monkeypatch.setattr(server,'_session_info',lambda *a, lock_held=False:{'running':record['running']})
     monkeypatch.setattr(server,'_drain_queued_prompt',Mock())
     monkeypatch.setattr(server,'_clear_pending',Mock())
     # Host refused another submission because the actual-live request still runs.

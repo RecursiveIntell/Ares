@@ -117,7 +117,7 @@ def test_unidentified_observer_is_refused(tmp_path, request_id):
 def test_lookup_reports_request_owner_during_running_flag_handoff(monkeypatch):
     state = {"session_key": "stored", "history_lock": threading.Lock(), "running": False}
     monkeypatch.setattr(server, "_sessions", {"s": state})
-    monkeypatch.setattr(server, "_session_info", lambda *a: {})
+    monkeypatch.setattr(server, "_session_info", lambda *a, lock_held=False: {})
     output = io.StringIO()
     host = ComputeHost(stdout=output, heartbeat_secs=0)
     try:

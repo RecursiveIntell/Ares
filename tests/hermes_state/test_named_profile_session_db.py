@@ -187,7 +187,7 @@ def test_init_session_skips_launch_db_when_profile_store_unopenable(homes, monke
     monkeypatch.setattr(server, "_start_notification_poller", lambda _sid, _s: threading.Event())
     monkeypatch.setattr(server, "_notify_session_boundary", lambda *a, **kw: None)
     monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
-    monkeypatch.setattr(server, "_session_info", lambda _agent, _s=None: {})
+    monkeypatch.setattr(server, "_session_info", lambda _agent, _s=None, *, lock_held=False: {})
     monkeypatch.setattr(server, "_schedule_mcp_late_refresh", lambda _sid, _agent: None)
     monkeypatch.setattr(server, "_register_session_cwd", lambda _s: None)
     monkeypatch.setattr(server, "_load_show_reasoning", lambda: False)

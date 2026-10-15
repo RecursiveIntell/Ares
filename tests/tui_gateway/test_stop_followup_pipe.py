@@ -35,7 +35,7 @@ def test_real_pipe_stop_then_post_cut_followup_runs_once(tmp_path, monkeypatch):
     monkeypatch.setattr(server, '_session_db', lambda scope: contextlib.nullcontext(db))
     monkeypatch.setattr(server, '_clear_pending', lambda *a: None)
     monkeypatch.setattr(server, '_clear_inflight_turn', lambda s: s.pop('inflight_turn', None))
-    monkeypatch.setattr(server, '_session_info', lambda agent, s: {'running': bool(s.get('running') or s.get('_stop_pending') or s.get('_stop_uncertain'))})
+    monkeypatch.setattr(server, '_session_info', lambda agent, s, *, lock_held=False: {'running': bool(s.get('running') or s.get('_stop_pending') or s.get('_stop_uncertain'))})
     events = []
     monkeypatch.setattr(server, '_emit', lambda event, sid, payload: events.append((event, payload)))
     started = threading.Event()

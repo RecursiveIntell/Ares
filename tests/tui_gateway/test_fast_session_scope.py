@@ -19,6 +19,7 @@ Contract under test:
 
 from __future__ import annotations
 
+import threading
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -51,7 +52,7 @@ class TestConfigSetFastSessionScope:
 
     def test_session_scoped_fast_skips_global_write(self) -> None:
         agent = _agent()
-        session = {"session_key": "k1", "agent": agent}
+        session = {"session_key": "k1", "agent": agent, "history_lock": threading.Lock()}
         with patch.dict(server._sessions, {"s1": session}, clear=False), \
                 patch.object(server, "_write_config_key") as write_key, \
                 patch.object(server, "_persist_live_session_runtime"), \
@@ -113,11 +114,21 @@ class TestConfigGetFastSessionScope:
         session = {
             "session_key": "k6",
             "agent": None,
+            "model_override": {"model": "gpt-6", "provider": "openai"},
             "create_service_tier_override": "priority",
         }
         with patch.dict(server._sessions, {"s6": session}, clear=False):
             resp = _get({"key": "fast", "session_id": "s6"})
         assert resp["result"]["value"] == "fast"
+
+    def test_prebuild_pin_does_not_claim_fast_for_unsupported_model(self) -> None:
+        session = {"session_key": "k7", "agent": None,
+                   "model_override": {"model": "claude-sonnet-5-5", "provider": "anthropic"},
+                   "create_service_tier_override": "priority"}
+        with patch.dict(server._sessions, {"s7": session}, clear=False):
+            resp = _get({"key": "fast", "session_id": "s7"})
+        assert resp["result"]["value"] == "normal"
+        assert session["create_service_tier_override"] == "priority"
 
 
     def test_falls_back_to_global(self) -> None:

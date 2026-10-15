@@ -111,3 +111,11 @@ def test_anthropic_pool_api_key_overrides_conflicting_active_endpoint(monkeypatc
         )
     ]
     assert all(not url.startswith(active_endpoint) for url, _headers in requests)
+
+
+def test_anthropic_picker_uses_curated_fallback_when_catalog_is_unavailable(monkeypatch):
+    """Discovery failure retains the curated catalog and its ordering."""
+    expected = list(models._PROVIDER_MODELS["anthropic"])
+    monkeypatch.setattr(models, "_fetch_anthropic_models", lambda **_kwargs: None)
+
+    assert models.provider_model_ids("anthropic") == expected

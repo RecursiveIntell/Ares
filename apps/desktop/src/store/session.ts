@@ -1347,10 +1347,12 @@ export const setCurrentReasoningEffort = (next: Updater<string>, persist = true)
   }
 }
 
-/** Explicit draft preferences, not the last runtime observed in a session. */
+/** Explicit draft preferences, not the last runtime observed in a session.
+ * Missing Fast preference means inherit the profile; false is an explicit
+ * normal-tier choice. Retain legacy stored choices without inventing provenance. */
 export const getComposerRuntimeOptions = () => ({
   effort: storedString(COMPOSER_EFFORT_KEY) ?? '',
-  fast: storedBoolean(COMPOSER_FAST_KEY, false)
+  fast: storedString(COMPOSER_FAST_KEY) === null ? undefined : storedBoolean(COMPOSER_FAST_KEY, false)
 })
 
 // The profile's `agent.reasoning_effort`, mirrored from config so surfaces that

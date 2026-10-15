@@ -2,8 +2,10 @@ import { textWithoutReferenceLines } from '@/components/assistant-ui/reference-k
 import { getSession } from '@/hermes'
 import { assistantTextPart, type ChatMessage, chatMessageText, textPart } from '@/lib/chat-messages'
 import { normalizePersonalityValue } from '@/lib/chat-runtime'
+import { createClientSessionState } from '@/lib/chat-runtime'
 import { embeddedImageUrls, textWithoutEmbeddedImages } from '@/lib/embedded-images'
 import { parseErrorSurface } from '@/lib/error-surface'
+import { reconcileSelectorInfo } from '@/lib/selector-observation'
 import { isMessagingSource, normalizeSessionSource } from '@/lib/session-source'
 import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
 import { requestDesktopOnboardingForCredentialWarning } from '@/store/onboarding'
@@ -33,6 +35,7 @@ import {
   setYoloActive
 } from '@/store/session'
 import type { SessionProfileRoute } from '@/store/session-request-router'
+import { $sessionStates } from '@/store/session-states'
 
 // Re-exported for the many session-actions/tile call sites that already import
 // it from here; the canonical definition lives in @/store/session.
@@ -1529,7 +1532,7 @@ export async function resolveSessionOwner(storedSessionId: null | string): Promi
 type SessionRuntimeStatePatch = Partial<
   Pick<
     ClientSessionState,
-    'branch' | 'cwd' | 'fast' | 'model' | 'personality' | 'provider' | 'reasoningEffort' | 'serviceTier' | 'yolo'
+    'branch' | 'cwd' | 'fast' | 'model' | 'personality' | 'provider' | 'reasoningEffort' | 'serviceTier' | 'yolo' | 'selectorObservation' | 'pendingModelSelection' | 'pendingRuntimeOptions'
   >
 >
 
@@ -1660,6 +1663,15 @@ export function applyRuntimeInfo(
   if (typeof info.yolo === 'boolean') {
     sessionState.yolo = info.yolo
   }
+
+  const known = info.session_id ? $sessionStates.get()[info.session_id] : undefined
+  const selectorPatch = reconcileSelectorInfo(known ?? createClientSessionState(), info)
+  delete sessionState.model
+  delete sessionState.provider
+  delete sessionState.reasoningEffort
+  delete sessionState.serviceTier
+  delete sessionState.fast
+  Object.assign(sessionState, selectorPatch)
 
   if (foreground) {
     publishRuntimeToComposer(sessionState)
