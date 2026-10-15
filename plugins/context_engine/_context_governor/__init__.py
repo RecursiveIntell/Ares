@@ -3713,6 +3713,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             # ``model_router`` imports never existed in the live package, which
             # made ``summary_mode: llm`` silently fall back to extractive mode.
             from agent.auxiliary_client import (
+                _auxiliary_response_has_completed_terminal,
                 _resolve_task_provider_model,
                 call_llm,
             )
@@ -3812,6 +3813,11 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         if metrics is not None and pinned_route is not None:
             metrics["summarizer_retry_provider"] = actual_route.provider
             metrics["summarizer_retry_model"] = actual_route.model
+        if not _auxiliary_response_has_completed_terminal(response):
+            raise RuntimeError(
+                "compression summary response lacked explicit completed-terminal "
+                "evidence; refusing partial or refused summary text"
+            )
         content = response.choices[0].message.content
         if not isinstance(content, str):
             content = str(content) if content else ""
