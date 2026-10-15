@@ -96,7 +96,7 @@ def test_concurrent_same_session_images_are_both_queued_once(staging):
 
 
 def test_clipboard_sessions_do_not_overwrite_previous_staged_image(staging, monkeypatch):
-    _, sessions = staging
+    home, sessions = staging
     def save(path):
         path.write_bytes(image_bytes('red' if not sessions['a']['attached_images'] else 'blue'))
         return True
@@ -109,6 +109,7 @@ def test_clipboard_sessions_do_not_overwrite_previous_staged_image(staging, monk
     assert second_response['result']['attached']
     second = Path(second_response['result']['path'])
     assert first != second
+    assert first.parent == second.parent == home/'images'
     assert first.read_bytes() == original == image_bytes('red')
     assert second.read_bytes() == image_bytes('blue')
 
@@ -332,7 +333,15 @@ def test_pdf_response_construction_failure_does_not_publish_pages(staging, monke
 
 
 @pytest.mark.linux_only
-def test_new_staging_occurrence_directory_is_private(staging):
+def test_new_staging_occurrence_directory_is_private(staging, monkeypatch):
     _, _ = staging
-    path = upload('a', image_bytes('red'))
-    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+    allocate = server._new_staged_attachment_path
+    observed_modes = []
+    def observe_stage(*args, **kwargs):
+        path = allocate(*args, **kwargs)
+        observed_modes.append(stat.S_IMODE(path.parent.stat().st_mode))
+        return path
+    monkeypatch.setattr(server, '_new_staged_attachment_path', observe_stage)
+    published = upload('a', image_bytes('red'))
+    assert observed_modes == [0o700]
+    assert stat.S_IMODE(published.stat().st_mode) == 0o600
