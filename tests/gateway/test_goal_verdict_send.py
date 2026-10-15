@@ -172,5 +172,12 @@ async def test_goal_verdict_budget_exhausted_sends_pause(hermes_home):
     assert "turns used" in content.lower()
     # No continuation enqueued when budget is exhausted
     assert not adapter._pending_messages
+    persisted = GoalManager(session_entry.session_id)
+    assert persisted.state.status == "paused"
+    assert persisted.state.outcome == "TURN_BUDGET_EXHAUSTED"
+    assert persisted.state.turns_used == 2
+    assert not persisted.state.continuation_pending
+    assert persisted.validate_checkpoint()[0]
+    assert not persisted.claim_continuation("budget-exhausted")
 
 

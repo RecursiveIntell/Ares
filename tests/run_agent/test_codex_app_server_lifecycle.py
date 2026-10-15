@@ -28,7 +28,8 @@ def _bare_agent(session_id: str) -> AIAgent:
     agent.session_id = session_id
     agent.client = None
     agent._active_children_lock = threading.Lock()
-    agent._active_children = set()
+    # agent.agent_init initializes the ordered child registry as a list.
+    agent._active_children = []
     agent._end_session_on_close = False
     agent._session_messages = ["retained"]
     return agent

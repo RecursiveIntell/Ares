@@ -112,17 +112,27 @@ def _record_external_secret_snapshot(
     home = home.resolve()
     home_key = str(home)
     with _SECRET_SOURCE_CACHE_LOCK:
+        copied = {str(key): str(value) for key, value in data.items()}
+        source_identity = _external_secret_source_identity(home)
+        previous = _SECRET_SOURCE_SNAPSHOTS_BY_HOME.get(home_key)
+        # Absence is reparsed on every startup/cron load so newly configured
+        # sources remain discoverable. An identical successful empty read is
+        # not a new authority epoch. Real fetch/error observations and explicit
+        # cache reset still advance the monotonic counter below.
+        if (status in {"absent", "empty"} and not copied
+                and previous is not None and previous.status == status
+                and not previous.data and previous.error_kind == error_kind
+                and previous.source_identity == source_identity):
+            return previous
         generation = _SECRET_SOURCE_GENERATION_BY_HOME.get(home_key, 0) + 1
         _SECRET_SOURCE_GENERATION_BY_HOME[home_key] = generation
         snapshot = ExternalSecretSnapshot(
             profile_home=home,
-            data=MappingProxyType(
-                {str(key): str(value) for key, value in data.items()}
-            ),
+            data=MappingProxyType(copied),
             status=status,
             generation=generation,
             error_kind=error_kind,
-            source_identity=_external_secret_source_identity(home),
+            source_identity=source_identity,
         )
         _SECRET_SOURCE_SNAPSHOTS_BY_HOME[home_key] = snapshot
         _SECRET_SOURCE_VALUES_BY_HOME[home_key] = dict(snapshot.data)

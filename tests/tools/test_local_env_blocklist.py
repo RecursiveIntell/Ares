@@ -1436,7 +1436,13 @@ class TestSanePathIncludesHomebrew:
         """
         from tools.environments import local as local_mod
         from tools.environments.local import _make_run_env
-        windows_env = {"Path": r"C:\Windows\System32;C:\Program Files\Git\bin"}
+        windows_env = {
+            "Path": r"C:\Windows\System32;C:\Program Files\Git\bin",
+            # Preserve the test-owned profile authority when replacing the
+            # environment with a case-sensitive dict. Native Windows cannot
+            # resolve Path.home() without HOME/USERPROFILE/HOMEPATH either.
+            "HERMES_HOME": os.environ["HERMES_HOME"],
+        }
         monkeypatch.setattr(local_mod, "_git_bash_bin_dirs", lambda: [])
         # Isolate the Bitwarden token policy: this test is about PATH key
         # casing, not secrets.  The real resolver reads the operator's config

@@ -2136,8 +2136,10 @@ class GoalManager:
         return True, "checkpoint is current"
 
     @staticmethod
-    def _auto_eligible(state: Optional[GoalState], *, admitted: bool = False) -> bool:
-        if state is None or state.status != "active" or state.turns_used >= state.max_turns:
+    def _auto_eligible(state: Optional[GoalState], *, admitted: bool = False,
+                       require_budget: bool = True) -> bool:
+        if (state is None or state.status != "active"
+                or (require_budget and state.turns_used >= state.max_turns)):
             return False
         if not GoalManager._validate_checkpoint(state)[0]:
             return False
@@ -2854,7 +2856,10 @@ class GoalManager:
             (binding.get("goal_id") == state.goal_id and binding.get("checkpoint_revision") == state.checkpoint_revision
              and binding.get("continuation_token") == state.continuation_token)))
         notification = (turn_metadata or {}).get("origin") == "notification"
-        if stale or notification or (binding and not admitted) or not self._auto_eligible(state, admitted=admitted):
+        # Evaluation may persist a budget stop, but cannot admit another turn.
+        # All dispatch callers retain the default require_budget=True.
+        if (stale or notification or (binding and not admitted)
+                or not self._auto_eligible(state, admitted=admitted, require_budget=False)):
             return {
                 "status": state.status if state else None,
                 "should_continue": False,
@@ -2883,6 +2888,23 @@ class GoalManager:
                 "verdict": "waiting",
                 "reason": reason,
                 "message": f"⏳ Goal parked — waiting on {tgt}: {reason}",
+            }
+
+        # A stored active-at-limit state still needs a durable pause and a
+        # visible verdict. Do not count another turn, call gates/the judge, or
+        # silently return "inactive" just because dispatch is disallowed.
+        if state.turns_used >= state.max_turns:
+            state.status = "paused"
+            reason = f"turn budget exhausted ({state.turns_used}/{state.max_turns})"
+            state.paused_reason = reason
+            if not self._checkpoint(TURN_BUDGET_EXHAUSTED, reason,
+                    "explicit /goal resume after inspecting cumulative budget", continuation=False):
+                return self._persistence_failure("turn budget stop could not be saved")
+            return {
+                "status": "paused", "should_continue": False, "continuation_prompt": None,
+                "verdict": "stopped", "reason": reason,
+                "message": f"⏸ Goal paused — {state.turns_used}/{state.max_turns} turns used. "
+                           "Inspect the checkpoint before explicitly resuming.",
             }
 
         # Count the turn that just finished.

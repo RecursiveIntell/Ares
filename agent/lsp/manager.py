@@ -721,6 +721,11 @@ class LSPService:
                 # or install attempt failed).  Surface this once via
                 # the structured logger so the user can act on it.
                 eventlog.log_server_unavailable(srv.server_id, srv.server_id)
+                # Resolution may create the profile-owned staging directory
+                # even when no executable is available. Cache this failed
+                # observation, not its pre-resolution filesystem identity.
+                self._refresh_identity(srv, per_server_root, ws_root)
+                self._invalidated.discard(key)
                 self._broken.add(key)
                 spawn_future.set_result(None)
                 return None
