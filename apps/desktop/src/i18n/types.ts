@@ -2117,6 +2117,11 @@ export interface Translations {
     goalActive: string
     goalDone: string
     goalPaused: string
+    goalPauseAction: string
+    goalResumeAction: string
+    goalClearAction: string
+    goalBlocked: string
+    goalAwaitingInput: string
     goalWaiting: string
     subagents: (count: number) => string
     todos: (done: number, total: number) => string
@@ -2915,6 +2920,12 @@ export interface Translations {
     audioReadFailed: string
     sessionUnavailable: string
     createSessionFailed: string
+    inputRecoveryRefused: string
+    inputRecoveryRequired: string
+    inputRecoveryReview: string
+    inputRecoveryNotStarted: string
+    inputRecoveryUnknown: string
+    inputRecoveryRetry: string
     promptFailed: string
     providerCredentialRequired: string
     emptySlashCommand: string

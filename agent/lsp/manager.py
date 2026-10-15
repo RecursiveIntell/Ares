@@ -14,9 +14,9 @@ Design choices:
   the first request for a key spawns the client; subsequent requests
   re-use it.
 
-- A **broken-set** records ``(server_id, workspace_root)`` pairs that
-  failed to spawn or initialize.  These are never retried for the
-  life of the service.  Mirrors OpenCode's design.
+- A **broken-set** records failed ``(server_id, workspace_root)`` pairs.
+  The same executable/root/config identity is not retried; a changed
+  identity invalidates the failure so a repaired server can recover.
 
 - A **delta baseline** map keeps "diagnostics-as-of-the-last-snapshot"
   per file.  ``snapshot_baseline()`` is called BEFORE a write; the
@@ -35,10 +35,14 @@ in-process syntax check.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import math
 import os
+import shutil
 import threading
 import time
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from agent.lsp import eventlog
@@ -60,6 +64,25 @@ logger = logging.getLogger("agent.lsp.manager")
 
 DEFAULT_IDLE_TIMEOUT = 600  # seconds; servers idle for >10min get reaped
 MIN_IDLE_TIMEOUT = 30  # floor for config values; must exceed any per-op wait budget
+ENRICHMENT_INIT_BUDGET = 3.0
+ENRICHMENT_MAX_WAIT = 10.0
+ENRICHMENT_JOIN_MARGIN = 0.5
+
+
+@dataclass
+class EnrichmentResult:
+    """Optional diagnostic projection, never a syntax/validation verdict.
+
+    ``complete`` means fresh server data, including a genuinely empty
+    result. ``degraded`` means no fresh verdict from an acquired server;
+    ``unavailable`` means no server could be acquired. Consumers must
+    preserve the quality even when diagnostics is empty.
+    """
+
+    diagnostics: List[Dict[str, Any]] = field(default_factory=list)
+    quality: str = "unavailable"
+    reason: str = "not_enabled"
+    phases: Dict[str, float] = field(default_factory=dict)
 
 
 class _BackgroundLoop:
@@ -169,7 +192,13 @@ class LSPService:
         self._profile_generation = boundary.target_generation
         self._enabled = enabled
         self._wait_mode = wait_mode if wait_mode in {"document", "full"} else "document"
-        self._wait_timeout = wait_timeout
+        try:
+            wait_timeout = float(wait_timeout)
+        except (ValueError, TypeError):
+            wait_timeout = DIAGNOSTICS_DOCUMENT_WAIT
+        if not math.isfinite(wait_timeout) or wait_timeout <= 0:
+            wait_timeout = DIAGNOSTICS_DOCUMENT_WAIT
+        self._wait_timeout = min(wait_timeout, ENRICHMENT_MAX_WAIT)
         self._install_strategy = install_strategy
         self._binary_overrides = binary_overrides or {}
         self._env_overrides = env_overrides or {}
@@ -186,6 +215,9 @@ class LSPService:
         self._broken: set = set()
         self._spawning: Dict[Tuple[str, str], asyncio.Future] = {}
         self._last_used: Dict[Tuple[str, str], float] = {}
+        self._identities: Dict[Tuple[str, str], tuple] = {}
+        self._commands: Dict[Tuple[str, str], List[str]] = {}
+        self._invalidated: set = set()
         self._state_lock = threading.Lock()
         self._idle_reaper_task: Optional[asyncio.Task] = None
 
@@ -194,6 +226,7 @@ class LSPService:
         # out anything in the baseline so the agent only sees errors
         # introduced by the current edit.
         self._delta_baseline: Dict[str, List[Dict[str, Any]]] = {}
+        self._baseline_owner: Dict[str, tuple] = {}
 
         if self._enabled and self._idle_timeout > 0:
             self._loop.run(self._start_idle_reaper(), timeout=2.0)
@@ -218,7 +251,7 @@ class LSPService:
 
         enabled = bool(lsp_cfg.get("enabled", True))
         wait_mode = lsp_cfg.get("wait_mode", "document")
-        wait_timeout = float(lsp_cfg.get("wait_timeout", DIAGNOSTICS_DOCUMENT_WAIT))
+        wait_timeout = lsp_cfg.get("wait_timeout", DIAGNOSTICS_DOCUMENT_WAIT)
         install_strategy = lsp_cfg.get("install_strategy", "auto")
         try:
             idle_timeout = float(lsp_cfg.get("idle_timeout", DEFAULT_IDLE_TIMEOUT))
@@ -278,12 +311,12 @@ class LSPService:
         Gates on workspace detection (file or cwd inside a git worktree),
         on whether any registered server matches the extension, and
         on whether the (server_id, workspace_root) pair is in the
-        broken-set from a previous spawn failure.
+        broken-set from a previous spawn failure with the same identity.
 
         Files in already-broken pairs return False so the file_operations
         layer skips the LSP path entirely — no spawn attempts, no
-        timeout cost — until the service is restarted (``hermes lsp
-        restart``) or the process exits.
+        timeout cost — until the executable, root, or configuration changes
+        or the service is restarted (``hermes lsp restart``).
         """
         if not self._enabled:
             return False
@@ -293,19 +326,19 @@ class LSPService:
         ws_root, gated_in = resolve_workspace_for_file(file_path)
         if not (ws_root and gated_in):
             return False
-        # Broken-set short-circuit.  Use the per-server root if we can
-        # compute one cheaply; otherwise fall back to the workspace
-        # root as the broken key (which is what _get_or_spawn would
-        # have used anyway when it failed).
+        # Match the spawn path's exact project root and exclude gate.
         try:
-            per_server_root = srv.resolve_root(file_path, ws_root) or ws_root
+            per_server_root = srv.resolve_root(file_path, ws_root)
         except Exception:  # noqa: BLE001
-            per_server_root = ws_root
+            return False
+        if per_server_root is None:
+            return False
+        self._refresh_identity(srv, per_server_root, ws_root)
         if (srv.server_id, per_server_root) in self._broken:
             return False
         return True
 
-    def snapshot_baseline(self, file_path: str) -> None:
+    def snapshot_baseline(self, file_path: str) -> EnrichmentResult:
         """Snapshot current diagnostics for ``file_path`` as the delta baseline.
 
         Called BEFORE a write so the next ``get_diagnostics_sync()``
@@ -316,18 +349,11 @@ class LSPService:
         (server_id, workspace_root) pair as broken so subsequent edits
         skip it instantly instead of re-paying the timeout cost.
         """
-        if not self.enabled_for(file_path):
-            return
-        try:
-            # Outer join budget must exceed the inner wait budget or a
-            # slow-but-alive server gets falsely marked broken.
-            t = max(8.0, self._wait_timeout + 3.0)
-            diags = self._loop.run(self._snapshot_async(file_path), timeout=t)
-            self._delta_baseline[os.path.abspath(file_path)] = diags or []
-        except Exception as e:  # noqa: BLE001
-            logger.debug("baseline snapshot failed for %s: %s", file_path, e)
-            self._mark_broken_for_file(file_path, e)
-            self._delta_baseline[os.path.abspath(file_path)] = []
+        result = self._collect_sync(file_path, baseline=True)
+        path = os.path.abspath(file_path)
+        self._delta_baseline[path] = list(result.diagnostics)
+        self._baseline_owner[path] = self._owner_for_file(file_path)
+        return result
 
     def get_diagnostics_sync(
         self,
@@ -361,68 +387,155 @@ class LSPService:
         can be detected, when no server matches, or when the server
         can't be spawned.  Never raises.
         """
-        if not self.enabled_for(file_path):
-            return []
+        # Compatibility for existing diagnostic-list consumers. New edit
+        # enrichment consumers must retain the accompanying quality.
+        return self.get_enrichment_sync(
+            file_path, delta=delta, timeout=timeout, line_shift=line_shift,
+        ).diagnostics
 
-        # Resolve server_id eagerly so we can emit structured logs even
-        # when the request errors out below.
-        srv = find_server_for_file(file_path)
-        server_id = srv.server_id if srv else "?"
+    def get_enrichment_sync(
+        self, file_path: str, *, delta: bool = True,
+        timeout: Optional[float] = None,
+        line_shift: Optional[Callable[[int], Optional[int]]] = None,
+    ) -> EnrichmentResult:
+        """Return bounded diagnostics and explicit projection quality.
 
-        try:
-            t = timeout if timeout is not None else self._wait_timeout + 2.0
-            diags = self._loop.run(self._open_and_wait_async(file_path), timeout=t)
-        except asyncio.TimeoutError as e:
-            eventlog.log_timeout(server_id, file_path)
-            logger.debug("LSP diagnostics timeout for %s: %s", file_path, e)
-            self._mark_broken_for_file(file_path, e)
-            return []
-        except Exception as e:  # noqa: BLE001
-            eventlog.log_server_error(server_id, file_path, e)
-            logger.debug("LSP diagnostics fetch failed for %s: %s", file_path, e)
-            self._mark_broken_for_file(file_path, e)
-            return []
-
-        if diags is None:
-            # The server is alive but never produced diagnostics for the
-            # post-edit content within the wait budget (common for
-            # tsserver on large projects).  Report "no data" rather than
-            # whatever stale state is in the stores — surfacing the
-            # previous edit's errors as if they were current is the
-            # ghost-diagnostics bug.  The server is NOT marked broken:
-            # slow is not dead, and the next edit may well succeed.
-            eventlog.log_timeout(server_id, file_path, kind="fresh diagnostics")
-            return []
-
-        abs_path = os.path.abspath(file_path)
+        Declared consumer: file-edit enrichment, where an empty diagnostic
+        list must not turn optional server failure into validation success.
+        This API cannot waive the caller's mandatory syntax checks.
+        """
+        result = self._collect_sync(file_path, timeout=timeout)
+        path = os.path.abspath(file_path)
+        owner = self._owner_for_file(file_path)
+        if result.quality != "complete":
+            self._delta_baseline.pop(path, None)
+            self._baseline_owner.pop(path, None)
+            return result
+        fresh = list(result.diagnostics)
         if delta:
-            baseline = self._delta_baseline.get(abs_path) or []
+            baseline = []
+            if self._baseline_owner.get(path) == owner:
+                baseline = self._delta_baseline.get(path) or []
             if baseline:
                 if line_shift is not None:
-                    # Remap baseline diagnostics into post-edit
-                    # coordinates so shifted-but-otherwise-identical
-                    # entries hash equal under _diag_key.  Entries
-                    # that mapped into a deleted region drop out
-                    # silently — they no longer apply.
                     from agent.lsp.range_shift import shift_baseline
                     baseline = shift_baseline(baseline, line_shift)
                 seen = {_diag_key(d) for d in baseline}
-                diags = [d for d in diags if _diag_key(d) not in seen]
-            # Roll baseline forward — next call returns deltas relative
-            # to the just-emitted state, mirroring claude-code's
-            # diagnosticTracking.
-            try:
-                fresh = self._loop.run(self._current_diags_async(file_path), timeout=2.0) or []
-            except Exception:  # noqa: BLE001
-                fresh = []
-            if fresh:
-                self._delta_baseline[abs_path] = fresh
+                result.diagnostics = [d for d in fresh if _diag_key(d) not in seen]
+            # Use this exact fresh snapshot, even when clean. No second
+            # wait or lookup by a different (git rather than project) root.
+            self._delta_baseline[path] = fresh
+            self._baseline_owner[path] = owner
+        return result
 
-        if diags:
-            eventlog.log_diagnostics(server_id, file_path, len(diags))
-        else:
-            eventlog.log_clean(server_id, file_path)
-        return diags
+    def _collect_sync(self, file_path: str, *, baseline=False, timeout=None) -> EnrichmentResult:
+        phase = "baseline" if baseline else "post_edit"
+        spans = {"initialize": 0.0, phase: 0.0}
+        try:
+            if not self.enabled_for(file_path):
+                return EnrichmentResult(reason="not_enabled_or_cached_failure", phases=spans)
+            budget = ENRICHMENT_INIT_BUDGET + self._wait_timeout
+            if timeout is not None:
+                limit = float(timeout)
+                if math.isfinite(limit) and limit > 0:
+                    budget = min(budget, limit)
+            result = self._loop.run(
+                self._enrich_async(file_path, baseline=baseline, budget=budget, spans=spans),
+                timeout=budget + ENRICHMENT_JOIN_MARGIN,
+            )
+            return result
+        except Exception as exc:  # optional enrichment never breaks writes
+            logger.debug("LSP enrichment failed for %s: %s", file_path, exc)
+            self._mark_broken_for_file(file_path, exc)
+            return EnrichmentResult(reason="submission_failed", phases=dict(spans))
+
+    async def _enrich_async(self, file_path: str, *, baseline, budget, spans) -> EnrichmentResult:
+        deadline = time.monotonic() + budget
+        phase = "baseline" if baseline else "post_edit"
+        started = time.monotonic()
+        try:
+            client = await asyncio.wait_for(
+                self._get_or_spawn(file_path), timeout=min(ENRICHMENT_INIT_BUDGET, budget),
+            )
+        except Exception as exc:
+            logger.debug("LSP initialize enrichment failed: %s", exc)
+            return EnrichmentResult(reason="initialize_failed", phases=spans)
+        finally:
+            spans["initialize"] = time.monotonic() - started
+        if client is None:
+            return EnrichmentResult(reason="server_unavailable", phases=spans)
+        started = time.monotonic()
+        try:
+            remaining = max(0.0, min(self._wait_timeout, deadline - started))
+            work = self._snapshot_async(file_path) if baseline else self._open_and_wait_async(file_path)
+            diags = await asyncio.wait_for(work, timeout=remaining)
+            if diags is None:
+                return EnrichmentResult(quality="degraded", reason="fresh_diagnostics_timeout", phases=spans)
+            srv = find_server_for_file(file_path)
+            if diags:
+                eventlog.log_diagnostics(srv.server_id, file_path, len(diags))
+            else:
+                eventlog.log_clean(srv.server_id, file_path)
+            return EnrichmentResult(diagnostics=diags, quality="complete", reason="fresh", phases=spans)
+        except asyncio.TimeoutError:
+            return EnrichmentResult(quality="degraded", reason="fresh_diagnostics_timeout", phases=spans)
+        except Exception as exc:
+            logger.debug("LSP document enrichment failed: %s", exc)
+            # A raised server/transport failure is different from a slow
+            # diagnostics publication: suppress repeat work for this identity.
+            self._broken.add((client.server_id, client.workspace_root))
+            return EnrichmentResult(quality="degraded", reason="server_error", phases=spans)
+        finally:
+            spans[phase] = time.monotonic() - started
+
+    def _owner_for_file(self, file_path: str):
+        srv = find_server_for_file(file_path)
+        ws, gated = resolve_workspace_for_file(file_path)
+        if not (srv and ws and gated):
+            return None
+        try:
+            root = srv.resolve_root(file_path, ws)
+        except Exception:
+            return None
+        key = (srv.server_id, root)
+        with self._state_lock:
+            client = self._clients.get(key)
+            return key, self._identities.get(key), client
+
+    @staticmethod
+    def _path_identity(path, *, directory=False):
+        try:
+            stat = os.stat(path)
+            return (stat.st_dev, stat.st_ino) if directory else (
+                stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_mode,
+            )
+        except OSError:
+            return None
+
+    def _refresh_identity(self, srv, root, workspace):
+        key = (srv.server_id, root)
+        command = self._commands.get(key) or self._binary_overrides.get(srv.server_id) or []
+        executable = (shutil.which(command[0]) or command[0]) if command else ""
+        identity = (
+            self._path_identity(root, directory=True),
+            self._path_identity(os.path.join(workspace, ".git"), directory=True),
+            executable, self._path_identity(executable),
+            tuple((arg, self._path_identity(arg)) for arg in command[1:] if os.path.isabs(arg)),
+            tuple((path, self._path_identity(path)) for path in [
+                *os.get_exec_path(), str(self._profile_home / "lsp" / "bin"),
+            ]),
+            json.dumps([self._binary_overrides, self._env_overrides, self._init_overrides,
+                        self._install_strategy], sort_keys=True),
+            tuple((arg, self._path_identity(shutil.which(arg) or arg))
+                  for arg in self._binary_overrides.get(srv.server_id, []) if arg),
+        )
+        with self._state_lock:
+            previous = self._identities.get(key)
+            if previous is not None and previous != identity:
+                self._broken.discard(key)
+                self._invalidated.add(key)
+            self._identities[key] = identity
+        return identity
 
     def _mark_broken_for_file(self, file_path: str, exc: BaseException) -> None:
         """Mark the (server_id, workspace_root) pair as broken so subsequent
@@ -489,22 +602,20 @@ class LSPService:
     # async internals
     # ------------------------------------------------------------------
 
-    async def _snapshot_async(self, file_path: str) -> List[Dict[str, Any]]:
+    async def _snapshot_async(self, file_path: str) -> Optional[List[Dict[str, Any]]]:
         client = await self._get_or_spawn(file_path)
         if client is None:
-            return []
-        try:
-            version = await client.open_file(file_path, language_id=language_id_for(file_path))
-            fresh = await client.wait_for_diagnostics(file_path, version, mode=self._wait_mode)
-        except Exception as e:  # noqa: BLE001
-            logger.debug("snapshot open/wait failed: %s", e)
-            return []
+            return None
+        version = await client.open_file(file_path, language_id=language_id_for(file_path))
+        fresh = await client.wait_for_diagnostics(
+            file_path, version, mode=self._wait_mode, timeout=self._wait_timeout,
+        )
         self._touch(client)
         if not fresh:
             # No fresh data for the pre-edit content — an empty baseline
             # is safe: worst case the delta filter removes less, never
             # more.  Never seed the baseline from stale stores.
-            return []
+            return None
         return list(client.diagnostics_for(file_path, fresh_only=True))
 
     async def _open_and_wait_async(self, file_path: str) -> Optional[List[Dict[str, Any]]]:
@@ -519,29 +630,14 @@ class LSPService:
         client = await self._get_or_spawn(file_path)
         if client is None:
             return None
-        try:
-            version = await client.open_file(file_path, language_id=language_id_for(file_path))
-            await client.save_file(file_path)
-            fresh = await client.wait_for_diagnostics(
-                file_path, version, mode=self._wait_mode, timeout=self._wait_timeout
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.debug("open/wait failed for %s: %s", file_path, e)
-            return None
+        version = await client.open_file(file_path, language_id=language_id_for(file_path))
+        await client.save_file(file_path)
+        fresh = await client.wait_for_diagnostics(
+            file_path, version, mode=self._wait_mode, timeout=self._wait_timeout
+        )
         self._touch(client)
         if not fresh:
             return None
-        return list(client.diagnostics_for(file_path, fresh_only=True))
-
-    async def _current_diags_async(self, file_path: str) -> List[Dict[str, Any]]:
-        ws, gated = resolve_workspace_for_file(file_path)
-        srv = find_server_for_file(file_path)
-        if not (ws and gated and srv):
-            return []
-        with self._state_lock:
-            client = self._clients.get((srv.server_id, ws))
-        if client is None:
-            return []
         return list(client.diagnostics_for(file_path, fresh_only=True))
 
     async def _get_or_spawn(self, file_path: str) -> Optional[LSPClient]:
@@ -574,8 +670,15 @@ class LSPService:
             return None  # exclude marker hit, server gated off
 
         key = (srv.server_id, per_server_root)
+        self._refresh_identity(srv, per_server_root, ws_root)
         if key in self._broken:
             return None
+        with self._state_lock:
+            invalidated = key in self._invalidated
+            self._invalidated.discard(key)
+            old = self._clients.pop(key, None) if invalidated else None
+        if old is not None:
+            await old.shutdown()
         with self._state_lock:
             client = self._clients.get(key)
             if client is not None and client.is_running:
@@ -585,7 +688,7 @@ class LSPService:
             spawning = self._spawning.get(key)
         if spawning is not None:
             try:
-                return await spawning
+                return await asyncio.shield(spawning)
             except Exception:  # noqa: BLE001
                 return None
 
@@ -602,11 +705,16 @@ class LSPService:
                 env_overrides=self._env_overrides,
                 init_overrides=self._init_overrides,
             )
-            home_token = set_hermes_home_override(self._profile_home)
-            try:
-                spec = srv.build_spawn(per_server_root, ctx)
-            finally:
-                reset_hermes_home_override(home_token)
+            def build_spawn():
+                home_token = set_hermes_home_override(self._profile_home)
+                try:
+                    return srv.build_spawn(per_server_root, ctx)
+                finally:
+                    reset_hermes_home_override(home_token)
+
+            # Install/resolution is synchronous; it must not block the
+            # background loop and defeat the caller's finite join budget.
+            spec = await asyncio.to_thread(build_spawn)
             if spec is None:
                 # ``build_spawn`` returns None when the binary can't be
                 # located (auto-install disabled, manual-only server,
@@ -616,6 +724,10 @@ class LSPService:
                 self._broken.add(key)
                 spawn_future.set_result(None)
                 return None
+            self._commands[key] = list(spec.command)
+            # Record the resolved executable, including installer recovery.
+            self._refresh_identity(srv, per_server_root, ws_root)
+            self._invalidated.discard(key)
             client = LSPClient(
                 server_id=srv.server_id,
                 workspace_root=spec.workspace_root,
@@ -628,10 +740,12 @@ class LSPService:
             )
             try:
                 await client.start()
-            except Exception as e:  # noqa: BLE001
+            except (Exception, asyncio.CancelledError) as e:
                 eventlog.log_spawn_failed(srv.server_id, per_server_root, e)
                 self._broken.add(key)
                 spawn_future.set_result(None)
+                if isinstance(e, asyncio.CancelledError):
+                    raise
                 return None
             with self._state_lock:
                 self._clients[key] = client
@@ -639,7 +753,12 @@ class LSPService:
             eventlog.log_active(srv.server_id, per_server_root)
             spawn_future.set_result(client)
             return client
+        except (Exception, asyncio.CancelledError):
+            self._broken.add(key)
+            raise
         finally:
+            if not spawn_future.done():
+                spawn_future.set_result(None)
             with self._state_lock:
                 self._spawning.pop(key, None)
 
@@ -704,6 +823,9 @@ class LSPService:
             clients = list(self._clients.values())
             self._clients.clear()
             self._broken.clear()
+            self._identities.clear()
+            self._commands.clear()
+            self._invalidated.clear()
             self._last_used.clear()
         await asyncio.gather(
             *(c.shutdown() for c in clients),
@@ -769,4 +891,4 @@ def _diag_key(d: Dict[str, Any]) -> str:
     )
 
 
-__all__ = ["LSPService"]
+__all__ = ["LSPService", "EnrichmentResult"]

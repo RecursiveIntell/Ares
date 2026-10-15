@@ -322,21 +322,19 @@ describe('useSessionTileActions sleep/wake session recovery', () => {
     expect($sessionTiles.get()[0]?.runtimeId).toBe(RECOVERED_SESSION_ID)
   })
 
-  it('rebinds prompt.submit recovery to the tile without changing the foreground session', async () => {
+  // The shared submit hook no longer re-homes and replays a user prompt after a
+  // missing-owner reply (index.test.tsx: 'does not re-home or replay when
+  // prompt.submit reports "session not found"'). The tile path goes through the
+  // same hook, so it must not rebind itself or replay either; recovery is the
+  // explicit, receipt-backed manual path.
+  it('does not re-home, rebind or replay a tile prompt after "session not found"', async () => {
     const calls: { method: string; params?: Record<string, unknown> }[] = []
-    let submitAttempts = 0
 
     requestGatewayMock.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
       calls.push({ method, params })
 
       if (method === 'prompt.submit') {
-        submitAttempts += 1
-
-        if (submitAttempts === 1) {
-          throw new Error('session not found')
-        }
-
-        return {}
+        throw new Error('session not found')
       }
 
       if (method === 'session.resume') {
@@ -349,14 +347,12 @@ describe('useSessionTileActions sleep/wake session recovery', () => {
     const { result } = renderTileActions()
 
     await act(async () => {
-      await expect(result.current.submitText('continue the bot chat')).resolves.toBe(true)
+      await expect(result.current.submitText('continue the bot chat')).resolves.toBe(false)
     })
 
-    expect(calls.map(c => c.method)).toEqual(['prompt.submit', 'session.resume', 'prompt.submit'])
+    expect(calls.map(c => c.method)).toEqual(['prompt.submit'])
     expect(calls[0]?.params).toMatchObject({ session_id: RUNTIME_SESSION_ID })
-    expect(calls[1]?.params).toMatchObject({ session_id: STORED_SESSION_ID, source: 'desktop', omit_messages: true })
-    expect(calls[2]?.params).toMatchObject({ session_id: RECOVERED_SESSION_ID })
-    expect($sessionTiles.get()[0]?.runtimeId).toBe(RECOVERED_SESSION_ID)
+    expect($sessionTiles.get()[0]?.runtimeId).toBe(RUNTIME_SESSION_ID)
     expect($activeSessionId.get()).toBe('foreground-runtime')
   })
 })

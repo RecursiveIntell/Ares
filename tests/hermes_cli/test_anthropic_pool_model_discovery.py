@@ -119,3 +119,15 @@ def test_anthropic_picker_uses_curated_fallback_when_catalog_is_unavailable(monk
     monkeypatch.setattr(models, "_fetch_anthropic_models", lambda **_kwargs: None)
 
     assert models.provider_model_ids("anthropic") == expected
+
+
+def test_anthropic_picker_keeps_current_models_when_oauth_catalog_is_unavailable(monkeypatch):
+    """The curated Anthropic fallback must include current API model IDs."""
+    expected = {
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "claude-haiku-5-5",
+    }
+    monkeypatch.setattr(models, "_fetch_anthropic_models", lambda **_kwargs: None)
+
+    assert expected <= set(models.provider_model_ids("anthropic"))

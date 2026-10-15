@@ -21,6 +21,7 @@ import enum
 import contextvars
 import json
 import logging
+import math
 import re
 
 logger = logging.getLogger(__name__)
@@ -28,14 +29,20 @@ import os
 import threading
 import time
 import weakref
-from concurrent.futures import (
-    TimeoutError as FuturesTimeoutError,
-)
+from concurrent.futures import wait as wait_futures
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
+from hermes_cli.delegation_policy import (
+    DelegationConfigError,
+    DelegationLifetimePolicy,
+    DelegationTimeoutConfigError,
+    parse_child_timeout,
+    validate_child_timeout_mode,
+)
 
 from toolsets import TOOLSETS
 from agent.interrupt_compat import request_hard_interrupt
+from agent.progress_witness import InactivityVerdict, ProgressWitness
 
 # Sentinel value used by the runtime provider system for providers that are
 # not natively known (named custom providers, third-party aggregators, etc.).
@@ -273,16 +280,28 @@ def interrupt_subagent(subagent_id: str) -> bool:
     """
     with _active_subagents_lock:
         record = _active_subagents.get(subagent_id)
+        if record is not None and record.get('stop_requested'):
+            return True
+        if record is not None:
+            record['stop_requested'] = True
+            record['accepting_steer'] = False
+            record.setdefault('first_stop_at', time.time())
     if not record:
         return False
     agent = record.get("agent")
     if agent is None:
         return False
+    stop_event = vars(agent).get('_delegate_stop_event')
+    if stop_event is not None:
+        stop_event.set()
     try:
         if not request_hard_interrupt(agent, f"Interrupted via TUI ({subagent_id})"):
             return False
     except Exception as exc:
         logger.debug("interrupt_subagent(%s) failed: %s", subagent_id, exc)
+        with _active_subagents_lock:
+            if _active_subagents.get(subagent_id) is record:
+                record.pop('stop_requested', None)
         return False
     return True
 
@@ -371,10 +390,19 @@ def list_active_subagents() -> List[Dict[str, Any]]:
                     "owner_transport",
                     "owner_session_record",
                     "accepting_steer",
+                    "future",
                 }
-            }
+            } | {'cleanup_age_seconds': max(0.0, time.time() - r['first_stop_at']) if r.get('first_stop_at') else 0.0}
             for r in _active_subagents.values()
         ]
+
+
+def _owned_subagent_supervisors(parent_session_id):
+    """Teardown sees detached owners without changing foreground interrupts."""
+    with _active_subagents_lock:
+        records = [r for r in _active_subagents.values()
+            if parent_session_id and r.get('owner_agent_session_id') == parent_session_id]
+        return bool(records), [r['agent'] for r in records if r.get('agent') is not None]
 
 
 def _is_descendant_of(child_agent: Any, parent_agent: Any, max_hops: int = 8) -> bool:
@@ -928,6 +956,33 @@ def _get_max_async_children() -> int:
     return _get_max_concurrent_children()
 
 
+class DelegationProgressUnavailableError(RuntimeError):
+    """Observation-only heartbeats cannot qualify an inactivity execution mode."""
+
+
+def _parse_child_timeout(value) -> Optional[float]:
+    return parse_child_timeout(value)
+
+
+def _get_child_lifetime_policy() -> DelegationLifetimePolicy:
+    cfg = _load_config()
+    mode = validate_child_timeout_mode(cfg.get('child_timeout_mode', 'total'))
+    value = cfg.get('child_timeout_seconds')
+    if value is None:
+        value = os.getenv('DELEGATION_CHILD_TIMEOUT_SECONDS')
+        timeout = DEFAULT_CHILD_TIMEOUT if value is None else _parse_child_timeout(value)
+    else:
+        timeout = _parse_child_timeout(value)
+    return DelegationLifetimePolicy(mode, timeout)
+
+
+def _require_child_lifetime_policy(policy: DelegationLifetimePolicy) -> Optional[float]:
+    if policy.mode == 'inactivity':
+        raise DelegationProgressUnavailableError(
+            'DELEGATION_PROGRESS_UNAVAILABLE: qualified operation progress and independent bounds are required')
+    return policy.timeout_seconds
+
+
 def _get_child_timeout() -> Optional[float]:
     """Read delegation.child_timeout_seconds from config.
 
@@ -946,28 +1001,7 @@ def _get_child_timeout() -> Optional[float]:
     Set ``delegation.child_timeout_seconds`` to a positive number to opt back
     in to a hard cap (floor 30 s); ``0`` or a negative value means disabled.
     """
-    cfg = _load_config()
-    val = cfg.get("child_timeout_seconds")
-    if val is not None:
-        try:
-            parsed = float(val)
-        except (TypeError, ValueError):
-            logger.warning(
-                "delegation.child_timeout_seconds=%r is not a valid number; "
-                "using default (no timeout)",
-                val,
-            )
-        else:
-            return None if parsed <= 0 else max(30.0, parsed)
-    env_val = os.getenv("DELEGATION_CHILD_TIMEOUT_SECONDS")
-    if env_val:
-        try:
-            parsed = float(env_val)
-        except (TypeError, ValueError):
-            pass
-        else:
-            return None if parsed <= 0 else max(30.0, parsed)
-    return DEFAULT_CHILD_TIMEOUT
+    return _require_child_lifetime_policy(_get_child_lifetime_policy())
 
 
 def _get_max_spawn_depth() -> int:
@@ -1461,6 +1495,9 @@ def _build_child_progress_callback(
 
         if event_type == "subagent.complete":
             _relay("subagent.complete", preview=preview, **kwargs)
+            return
+        if event_type == 'subagent.settling':
+            _relay('subagent.progress', preview=preview, **kwargs)
             return
 
         if event_type == "subagent.text":
@@ -2451,6 +2488,113 @@ def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
         )
 
 
+class ChildWaitOutcome(str, enum.Enum):
+    COMPLETED = 'completed'
+    EXPIRED = 'expired'
+    STOPPED = 'stopped'
+
+
+class _ChildDeadlineExpired(TimeoutError, ValueError):
+    pass
+
+
+class _ChildInactivityExpired(_ChildDeadlineExpired):
+    def __init__(self, verdict: InactivityVerdict):
+        self.verdict = InactivityVerdict(verdict.state, dict(verdict.detail))
+        super().__init__('DELEGATION_INACTIVITY_EXPIRED: ' + verdict.state)
+
+
+class _ChildStopRequested(InterruptedError):
+    pass
+
+
+def _wait_child_attempt(future, deadline, stop_event=None, *, progress_witness=None) -> ChildWaitOutcome | InactivityVerdict:
+    """Completed-set/total/Stop classification precedes optional progress verdicts.
+
+    A supplied witness is observation only. Unknown or closed observation does
+    not turn live work into completion; the caller must retain its existing
+    interruption and settlement owner. Legacy waits without a witness keep
+    their original blocking/deadline behavior.
+    """
+    while True:
+        remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+        needs_poll = stop_event is not None or progress_witness is not None
+        wait_seconds = remaining if not needs_poll else (0.05 if remaining is None else min(0.05, remaining))
+        completed, _ = wait_futures({future}, timeout=wait_seconds)
+        if future in completed:
+            return ChildWaitOutcome.COMPLETED
+        if deadline is not None and time.monotonic() >= deadline:
+            return ChildWaitOutcome.EXPIRED
+        if stop_event is not None and stop_event.is_set():
+            return ChildWaitOutcome.STOPPED
+        if progress_witness is not None:
+            if type(progress_witness) is not ProgressWitness:
+                return InactivityVerdict('unavailable', {'reason': 'invalid_progress_owner'})
+            try:
+                verdict = progress_witness.evaluate()
+            except Exception as exc:
+                return InactivityVerdict('unavailable', {
+                    'reason': 'progress_observation_failed', 'error_class': type(exc).__name__})
+            if (type(verdict) is not InactivityVerdict or type(verdict.state) is not str
+                    or type(verdict.detail) is not dict or verdict.state not in {
+                        'ok', 'stalled', 'request_limit', 'tool_limit', 'ceiling', 'closed'}):
+                return InactivityVerdict('unavailable', {'reason': 'invalid_progress_verdict'})
+            if verdict.state == 'closed':
+                return InactivityVerdict('unavailable', {'reason': 'closed_progress_owner'})
+            if verdict.state != 'ok':
+                limit = verdict.detail.get('limit')
+                if (type(limit) not in (int, float) or limit <= 0
+                        or limit > threading.TIMEOUT_MAX or not math.isfinite(limit)):
+                    return InactivityVerdict('unavailable', {'reason': 'invalid_progress_limit'})
+                return verdict
+
+
+def _repair_child_output(child, result, task_id, stream_callback, phase):
+    """The one repair is part of the same worker and admitted deadline."""
+    schema = getattr(child, '_delegate_output_schema', None)
+    valid, errors, retries = None, [], 0
+    if isinstance(schema, dict):
+        from tools.delegation_output_schema import build_retry_message, validate_output
+        text = result.get('final_response') or ''
+        valid, errors = validate_output(text, schema)
+        if (not valid and text.strip() and not result.get('interrupted', False)
+                and getattr(child, '_interrupt_requested', False) is not True
+                and not vars(child).get('_delegate_stop_event', threading.Event()).is_set()):
+            phase['value'] = 'schema_repair'
+            deadline = phase['deadline']
+            phase['trace'].append({'phase': 'schema_repair',
+                'remaining_seconds': None if deadline is None else max(0.0, deadline - time.monotonic())})
+            if deadline is not None and time.monotonic() >= deadline:
+                raise _ChildDeadlineExpired('admitted budget exhausted before schema repair')
+            retries = 1
+            try:
+                repaired = child.run_conversation(user_message=build_retry_message(errors),
+                    task_id=task_id, stream_callback=stream_callback)
+            except Exception as exc:
+                # Preserve legacy invalid-output fallback, but retain the
+                # repair's child-origin failure as an explicit attempt outcome.
+                phase['trace'][-1].update(outcome='child_error', error_class=type(exc).__name__)
+                repaired = None
+            if isinstance(repaired, dict):
+                text = repaired.get('final_response') or ''
+                if text.strip():
+                    result['final_response'] = text
+                try:
+                    result['api_calls'] = int(result.get('api_calls', 0) or 0) + int(repaired.get('api_calls', 0) or 0)
+                except (TypeError, ValueError):
+                    pass
+                if isinstance(repaired.get('messages'), list) and isinstance(result.get('messages'), list):
+                    result['messages'] = result['messages'] + repaired['messages']
+                valid, errors = validate_output(text, schema)
+    result['_delegate_schema_metadata'] = (valid, errors, retries)
+    return result
+
+
+# This is a settlement observation window, not an assertion that arbitrary
+# synchronous I/O can be cancelled. Beyond it the existing owner is retained.
+_CHILD_SETTLEMENT_SECONDS = 0.5
+
+
 def _run_single_child(
     task_index: int,
     goal: str,
@@ -2466,7 +2610,31 @@ def _run_single_child(
     Run a pre-built child agent. Called from within a thread.
     Returns a structured result dict.
     """
-    child_start = time.monotonic()
+    child_start = getattr(child, '_delegate_admitted_at', None)
+    if not isinstance(child_start, (int, float)):
+        child_start = time.monotonic()
+    _child_future = None
+    _timeout_executor = None
+    _cleanup = {'status': 'complete', 'supervision_required': False}
+    _progress_witness = None
+    _attempt_phase = {'value': 'initialization', 'deadline': None, 'trace': []}
+    child._delegate_stop_event = vars(child).get('_delegate_stop_event', threading.Event())
+    if getattr(child, '_interrupt_requested', False) is True:
+        child._delegate_stop_event.set()
+    child._delegate_settled_event = threading.Event()
+    _pending_terminal = None
+    _terminal_entry = None
+
+    def _publish_completion(**kwargs):
+        nonlocal _pending_terminal
+        if not child_progress_cb:
+            return
+        _pending_terminal = dict(kwargs)
+        if _cleanup['status'] == 'incomplete':
+            child_progress_cb('subagent.settling', preview='Child result available; cleanup remains incomplete',
+                status='running', task_result_status=kwargs.get('status'), cleanup=dict(_cleanup))
+        # Terminal projection follows owned retirement, including release/close
+        # failures. A task result alone cannot free renderer capacity.
 
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, "tool_progress_callback", None)
@@ -2481,15 +2649,6 @@ def _run_single_child(
 
     child_pool = getattr(child, "_credential_pool", None)
     leased_cred_id = None
-    if child_pool is not None:
-        leased_cred_id = child_pool.acquire_lease()
-        if leased_cred_id is not None:
-            try:
-                leased_entry = child_pool.current()
-                if leased_entry is not None and hasattr(child, "_swap_credential"):
-                    child._swap_credential(leased_entry)
-            except Exception as exc:
-                logger.debug("Failed to bind child to leased credential: %s", exc)
 
     # Heartbeat: periodically propagate child activity to the parent so the
     # gateway inactivity timeout doesn't fire while the subagent is working.
@@ -2635,6 +2794,8 @@ def _run_single_child(
                 ),
                 "started_at": time.time(),
                 "status": "running",
+                "capacity_occupied": True,
+                "execution_generation": str(getattr(child, '_delegate_execution_generation', _subagent_id)),
                 "tool_count": 0,
                 "agent": child,
                 # Durable conversation lineage for the model-facing control
@@ -2657,6 +2818,10 @@ def _run_single_child(
     def _attach_worktree(entry_dict: Dict[str, Any]) -> None:
         """Inspect + prune the child worktree, reporting into the entry."""
         if _worktree_info is None:
+            return
+        if _cleanup['status'] == 'incomplete':
+            entry_dict['worktree'] = {'path': _worktree_info.get('path'), 'pruned': False,
+                'inspection_failed': True, 'note': 'Retained for unsettled child work'}
             return
         try:
             from tools import subagent_worktree
@@ -2695,8 +2860,27 @@ def _run_single_child(
                     ),
                 }
 
-    try:
-        _heartbeat_thread.start()
+    import uuid as _uuid
+
+    child_task_id = _subagent_id or f"subagent-{task_index}-{_uuid.uuid4().hex[:8]}"
+    parent_task_id = getattr(parent_agent, "_current_task_id", None)
+    wall_start = time.time()
+    parent_reads_snapshot = []
+
+    def _initialize_child():
+        # Credential and filesystem setup are owned work too. Keep them in
+        # the same supervised future as both conversation attempts so a
+        # blocked setup cannot defeat the admission deadline or retire early.
+        nonlocal leased_cred_id, _worktree_info, goal, wall_start, parent_reads_snapshot
+        if child_pool is not None:
+            leased_cred_id = child_pool.acquire_lease()
+            if leased_cred_id is not None:
+                try:
+                    leased_entry = child_pool.current()
+                    if leased_entry is not None and hasattr(child, "_swap_credential"):
+                        child._swap_credential(leased_entry)
+                except Exception as exc:
+                    logger.debug("Failed to bind child to leased credential: %s", exc)
         if child_progress_cb:
             try:
                 child_progress_cb("subagent.start", preview=goal)
@@ -2707,10 +2891,6 @@ def _run_single_child(
         # task_id so file_state writes, active-subagents registry, and TUI
         # events all share one key.  Falls back to a fresh uuid only if the
         # pre-built id is somehow missing.
-        import uuid as _uuid
-
-        child_task_id = _subagent_id or f"subagent-{task_index}-{_uuid.uuid4().hex[:8]}"
-        parent_task_id = getattr(parent_agent, "_current_task_id", None)
         # Seed the child's session-cwd record from the parent's (cwd rearch):
         # children share the parent's container, and today they inherit the
         # parent's live env.cwd implicitly. Seeding at spawn preserves that
@@ -2779,13 +2959,36 @@ def _run_single_child(
             list(file_state.known_reads(parent_task_id)) if parent_task_id else []
         )
 
+    try:
+        _heartbeat_thread.start()
         # Run child with an optional hard timeout (off by default —
         # result(timeout=None) blocks until the child finishes). Stuck-child
         # protection comes from the heartbeat staleness monitor instead.
-        child_timeout = _get_child_timeout()
-        # Daemon worker (tools.daemon_pool): a timed-out child is abandoned
-        # below; a stdlib non-daemon worker would then block interpreter
-        # exit at atexit-join time if the child never unwinds.
+        child_timeout = vars(child)['_delegate_timeout'] if '_delegate_timeout' in vars(child) else _get_child_timeout()
+        _deadline = getattr(child, '_delegate_deadline', None)
+        if not isinstance(_deadline, (int, float)):
+            _deadline = None if child_timeout is None else child_start + child_timeout
+        _attempt_phase['deadline'] = _deadline
+        _progress_witness = None
+        _admitted_policy = vars(child).get('_delegate_lifetime_policy')
+        if _admitted_policy is not None:
+            if type(_admitted_policy) is not DelegationLifetimePolicy:
+                raise DelegationConfigError('DELEGATION_ADMITTED_POLICY_INVALID')
+            validate_child_timeout_mode(_admitted_policy.mode)
+            if _admitted_policy.mode == 'inactivity':
+                _candidate_progress = vars(child).get('_delegate_progress_witness')
+                _progress_generation = vars(child).get('_delegate_progress_generation')
+                if (type(_candidate_progress) is not ProgressWitness
+                        or type(_progress_generation) is not str or not _progress_generation
+                        or _candidate_progress.snapshot().generation != _progress_generation
+                        or _candidate_progress.snapshot().closed):
+                    raise DelegationProgressUnavailableError(
+                        'DELEGATION_PROGRESS_UNAVAILABLE: admitted generation-bound witness required')
+                _progress_witness = _candidate_progress
+        _attempt_phase['trace'].append({'phase': 'initialization',
+            'remaining_seconds': None if _deadline is None else max(0.0, _deadline - time.monotonic())})
+        # A daemon worker permits bounded caller settlement. Its retained
+        # supervisor still owns resources if the worker cannot unwind.
         from tools.daemon_pool import DaemonThreadPoolExecutor
         _timeout_executor = DaemonThreadPoolExecutor(
             max_workers=1,
@@ -2816,19 +3019,45 @@ def _run_single_child(
             from agent.delegation_context import delegated_child_context
 
             with delegated_child_context(str(getattr(child, "session_id", "") or "")):
-                return child.run_conversation(
+                if child._delegate_stop_event.is_set():
+                    raise _ChildStopRequested('explicit stop before first child turn')
+                if _deadline is not None and time.monotonic() >= _deadline:
+                    raise _ChildDeadlineExpired('admitted budget exhausted during initialization')
+                _initialize_child()
+                if child._delegate_stop_event.is_set():
+                    raise _ChildStopRequested('explicit stop during child initialization')
+                if _deadline is not None and time.monotonic() >= _deadline:
+                    raise _ChildDeadlineExpired('admitted budget exhausted during initialization')
+                _attempt_phase['value'] = 'initial_conversation'
+                _attempt_phase['trace'].append({'phase': 'initial_conversation',
+                    'remaining_seconds': None if _deadline is None else max(0.0, _deadline - time.monotonic())})
+                initial = child.run_conversation(
                     user_message=goal,
                     task_id=child_task_id,
                     stream_callback=_relay_child_text,
                 )
+                return _repair_child_output(child, initial, child_task_id, _relay_child_text, _attempt_phase)
 
         _child_context = contextvars.copy_context()
         _child_future = _timeout_executor.submit(
             _child_context.run,
             _run_with_thread_capture,
         )
+        child._delegate_worker_future = _child_future
+        _wait_outcome = (_wait_child_attempt(_child_future, _deadline, child._delegate_stop_event)
+            if _progress_witness is None else _wait_child_attempt(
+                _child_future, _deadline, child._delegate_stop_event, progress_witness=_progress_witness))
         try:
-            result = _child_future.result(timeout=child_timeout)
+            if type(_wait_outcome) is InactivityVerdict:
+                if _wait_outcome.state == 'unavailable':
+                    raise DelegationProgressUnavailableError(
+                        'DELEGATION_PROGRESS_UNAVAILABLE: ' + str(_wait_outcome.detail.get('reason')))
+                raise _ChildInactivityExpired(_wait_outcome)
+            if _wait_outcome is ChildWaitOutcome.EXPIRED:
+                raise _ChildDeadlineExpired('admitted child deadline expired')
+            if _wait_outcome is ChildWaitOutcome.STOPPED:
+                raise _ChildStopRequested('explicit child stop requested')
+            result = _child_future.result()
         except Exception as _timeout_exc:
             # No consumer boundary remains once this owner stops waiting for
             # the child. Close acceptance before any completion callback and
@@ -2836,6 +3065,10 @@ def _run_single_child(
             _late_pending_steer = (
                 _close_subagent_steering(_subagent_id, child) if _subagent_id else None
             )
+            # Freeze the admitted progress generation before interruption;
+            # late callbacks cannot keep it alive while owned work settles.
+            if _progress_witness is not None:
+                _progress_witness.close()
             # Signal the child to stop so its thread can exit cleanly.
             try:
                 interrupted = child is not None and request_hard_interrupt(child)
@@ -2844,7 +3077,21 @@ def _run_single_child(
             except Exception:
                 pass
 
-            is_timeout = isinstance(_timeout_exc, (FuturesTimeoutError, TimeoutError))
+            is_timeout = isinstance(_timeout_exc, _ChildDeadlineExpired)
+            is_stopped = isinstance(_timeout_exc, _ChildStopRequested)
+            is_inactivity = isinstance(_timeout_exc, _ChildInactivityExpired)
+            progress_unknown = type(_wait_outcome) is InactivityVerdict and _wait_outcome.state == 'unavailable'
+            effective_timeout = _timeout_exc.verdict.detail['limit'] if is_inactivity else child_timeout
+            completed, _ = wait_futures({_child_future}, timeout=_CHILD_SETTLEMENT_SECONDS)
+            _owned_live = getattr(child, '_has_owned_tool_work', None)
+            if _child_future not in completed or (callable(_owned_live) and _owned_live() is True):
+                _cleanup.update(status='incomplete', supervision_required=True)
+                child._delegate_cleanup_state = 'incomplete'
+                with _active_subagents_lock:
+                    record = _active_subagents.get(_subagent_id)
+                    if record is not None and record.get('agent') is child:
+                        record.update(status='cleanup-incomplete', cleanup_state='incomplete',
+                            capacity_occupied=True, first_stop_at=time.time(), stop_requested=True)
             duration = round(time.monotonic() - child_start, 2)
             logger.warning(
                 "Subagent %d %s after %.1fs",
@@ -2869,7 +3116,7 @@ def _run_single_child(
                     task_index=task_index,
                     # is_timeout implies a cap was configured (result(timeout=None)
                     # never raises FuturesTimeoutError); guard for the type checker.
-                    timeout_seconds=float(child_timeout or 0.0),
+                    timeout_seconds=float(effective_timeout or 0.0),
                     duration_seconds=float(duration),
                     worker_thread=_worker_thread_holder.get("t"),
                     goal=goal,
@@ -2883,21 +3130,23 @@ def _run_single_child(
 
             if child_progress_cb:
                 try:
-                    child_progress_cb(
-                        "subagent.complete",
+                    _publish_completion(
                         preview=(
                             f"Timed out after {duration}s"
                             if is_timeout
                             else str(_timeout_exc)
                         ),
-                        status="timeout" if is_timeout else "error",
+                        status="timeout" if is_timeout else "interrupted" if is_stopped else "error",
                         duration_seconds=duration,
                         summary="",
+                        cleanup=dict(_cleanup),
                     )
                 except Exception:
                     pass
 
-            if is_timeout:
+            if is_inactivity:
+                _err = str(_timeout_exc)
+            elif is_timeout:
                 if child_api_calls == 0:
                     _err = (
                         f"Subagent timed out after {child_timeout}s without "
@@ -2921,13 +3170,13 @@ def _run_single_child(
 
             _error_entry = {
                 "task_index": task_index,
-                "status": "timeout" if is_timeout else "error",
+                "status": "timeout" if is_timeout else "interrupted" if is_stopped else "error",
                 "summary": None,
                 "error": _err,
-                "exit_reason": "timeout" if is_timeout else "error",
+                "exit_reason": "timeout" if is_timeout else "interrupted" if is_stopped else "error",
                 "api_calls": child_api_calls,
                 "duration_seconds": duration,
-                "timeout_seconds": child_timeout if is_timeout else None,
+                "timeout_seconds": effective_timeout if is_timeout else None,
                 "timed_out_after_seconds": duration if is_timeout else None,
                 "timeout_phase": (
                     "before_first_llm_call" if is_timeout and child_api_calls == 0
@@ -2936,6 +3185,15 @@ def _run_single_child(
                 ),
                 "_child_role": getattr(child, "_delegate_role", None),
                 "diagnostic_path": diagnostic_path,
+                "attempt_outcome": ('expired' if is_timeout else 'stopped' if is_stopped
+                    else 'progress_unavailable' if progress_unknown else _wait_outcome.value),
+                "attempt_phase": _attempt_phase['value'],
+                "error_origin": ('parent_inactivity' if is_inactivity else 'progress_owner' if progress_unknown
+                    else 'parent_deadline' if is_timeout else 'parent_stop' if is_stopped else 'child'),
+                **({'progress_cutoff': {'state': _timeout_exc.verdict.state,
+                    'limit_seconds': effective_timeout}} if is_inactivity else {}),
+                "cleanup": dict(_cleanup),
+                "attempt_trace": [dict(item) for item in _attempt_phase['trace']],
             }
             if _late_pending_steer:
                 _error_entry["missed_steer"] = _late_pending_steer
@@ -2944,72 +3202,26 @@ def _run_single_child(
                     f"{_late_pending_steer}]"
                 )
             _attach_worktree(_error_entry)
+            _terminal_entry = _error_entry
             return _error_entry
         finally:
             # Shut down executor without waiting — if the child thread
             # is stuck on blocking I/O, wait=True would hang forever.
             _timeout_executor.shutdown(wait=False)
 
-        # T1-24: structured-output contract validation + ONE bounded retry.
-        # Runs only when a schema was attached at dispatch; schema-less
-        # delegations take none of these branches and their result entry
-        # stays byte-identical (wire-shape pinning).
-        # Pattern from: github/copilot-cli ctx.agent(prompt, {schema}) —
-        # PATTERN ONLY, no code copied.
-        _output_schema = getattr(child, "_delegate_output_schema", None)
-        _schema_valid: Optional[bool] = None
-        _schema_errors: List[str] = []
-        _schema_retries = 0
-        if isinstance(_output_schema, dict):
-            from tools.delegation_output_schema import (
-                build_retry_message,
-                validate_output,
-            )
-
-            _first_text = result.get("final_response") or ""
-            _schema_valid, _schema_errors = validate_output(
-                _first_text, _output_schema
-            )
-            if (
-                not _schema_valid
-                and _first_text.strip()
-                and not result.get("interrupted", False)
-            ):
-                # Exactly one retry turn, carrying the validation errors
-                # verbatim (no schema re-paste — the child already holds
-                # the contract in its context).
-                _schema_retries = 1
-                _retry_result = None
-                try:
-                    _retry_result = child.run_conversation(
-                        user_message=build_retry_message(_schema_errors),
-                        task_id=child_task_id,
-                        stream_callback=_relay_child_text,
-                    )
-                except Exception as _retry_exc:
-                    logger.warning(
-                        "Subagent %d schema-retry turn failed: %s",
-                        task_index,
-                        _retry_exc,
-                    )
-                if isinstance(_retry_result, dict):
-                    _retry_text = _retry_result.get("final_response") or ""
-                    if _retry_text.strip():
-                        result["final_response"] = _retry_text
-                    try:
-                        result["api_calls"] = int(
-                            result.get("api_calls", 0) or 0
-                        ) + int(_retry_result.get("api_calls", 0) or 0)
-                    except (TypeError, ValueError):
-                        pass
-                    _retry_messages = _retry_result.get("messages")
-                    if isinstance(_retry_messages, list) and isinstance(
-                        result.get("messages"), list
-                    ):
-                        result["messages"] = result["messages"] + _retry_messages
-                    _schema_valid, _schema_errors = validate_output(
-                        _retry_text, _output_schema
-                    )
+        _output_schema = getattr(child, '_delegate_output_schema', None)
+        _schema_valid, _schema_errors, _schema_retries = result.pop(
+            '_delegate_schema_metadata', (None, [], 0)
+        )
+        _has_owned_work = getattr(child, '_has_owned_tool_work', None)
+        if callable(_has_owned_work) and _has_owned_work() is True:
+            _cleanup.update(status='incomplete', supervision_required=True)
+            child._delegate_cleanup_state = 'incomplete'
+            with _active_subagents_lock:
+                record = _active_subagents.get(_subagent_id)
+                if record is not None and record.get('agent') is child:
+                    record.update(status='cleanup-incomplete', cleanup_state='incomplete',
+                        capacity_occupied=True, first_stop_at=time.time())
 
         # Linearization boundary for registry steering. From this point on the
         # child cannot consume another steer. Closing under the registry lock
@@ -3269,7 +3481,11 @@ def _run_single_child(
             "files_read": _files_read,
             "files_written": _files_written,
             "output_tail": _output_tail,
+            "cleanup": dict(_cleanup),
         }
+        entry.update(cleanup=dict(_cleanup), attempt_outcome='completed',
+            attempt_phase=_attempt_phase['value'],
+            attempt_trace=[dict(item) for item in _attempt_phase['trace']])
         if _cost_usd is not None:
             try:
                 complete_kwargs["cost_usd"] = float(_cost_usd)
@@ -3278,11 +3494,12 @@ def _run_single_child(
 
         if child_progress_cb:
             try:
-                child_progress_cb("subagent.complete", **complete_kwargs)
+                _publish_completion(**complete_kwargs)
             except Exception as e:
                 logger.debug("Progress callback completion failed: %s", e)
 
         _attach_worktree(entry)
+        _terminal_entry = entry
         return entry
 
     except Exception as exc:
@@ -3293,8 +3510,7 @@ def _run_single_child(
         logging.exception(f"[subagent-{task_index}] failed")
         if child_progress_cb:
             try:
-                child_progress_cb(
-                    "subagent.complete",
+                _publish_completion(
                     preview=str(exc),
                     status="failed",
                     duration_seconds=duration,
@@ -3319,9 +3535,12 @@ def _run_single_child(
             )
         # _attach_worktree defaults to a no-op when isolation never engaged.
         _attach_worktree(_error_entry)
+        _terminal_entry = _error_entry
         return _error_entry
 
     finally:
+        if _progress_witness is not None:
+            _progress_witness.close()
         # Stop the heartbeat thread so it doesn't keep touching parent activity
         # after the child has finished (or failed).  Guard the join: .start()
         # now lives inside the try block, so if it raised (OS thread
@@ -3331,64 +3550,133 @@ def _run_single_child(
         if _heartbeat_thread.ident is not None:
             _heartbeat_thread.join(timeout=5)
 
-        # Drop the TUI-facing registry entry.  Safe to call even if the
-        # child was never registered (e.g. ID missing on test doubles).
-        if _subagent_id:
-            _unregister_subagent(_subagent_id, agent=child)
+        def _retire_owned_child():
+            def retain_unknown(phase, exc=None):
+                _cleanup.update(status='incomplete', supervision_required=True,
+                    retirement_phase=phase, outcome='unknown')
+                if exc is not None:
+                    _cleanup['error_class'] = type(exc).__name__
+                child._delegate_cleanup_state = 'incomplete'
+                # Keep the exact owner closure (including parent/credential)
+                # for reconciliation; never unregister-and-forget a failure.
+                child._delegate_retirement_owner = _retire_owned_child
+                with _active_subagents_lock:
+                    record = _active_subagents.get(_subagent_id)
+                    if record is not None and record.get('agent') is child:
+                        record.update(status='cleanup-incomplete', cleanup_state='incomplete',
+                            capacity_occupied=True, cleanup=dict(_cleanup))
+                        record.setdefault('first_stop_at', time.time())
+                if _terminal_entry is not None:
+                    _terminal_entry['cleanup'] = dict(_cleanup)
+                if child_progress_cb:
+                    try:
+                        child_progress_cb('subagent.settling', preview='Owned retirement requires reconciliation',
+                            status='running', cleanup=dict(_cleanup))
+                    except Exception:
+                        logger.debug('Retirement uncertainty projection failed', exc_info=True)
 
-        if child_pool is not None and leased_cred_id is not None:
+            with _active_subagents_lock:
+                current = _active_subagents.get(_subagent_id)
+                publish_terminal = _subagent_id is None or (current is not None and current.get('agent') is child)
+
+            if child_pool is not None and leased_cred_id is not None:
+                try:
+                    if not vars(child).get('_delegate_credential_released', False):
+                        child_pool.release_lease(leased_cred_id)
+                        child._delegate_credential_released = True
+                except Exception as exc:
+                    logger.debug("Failed to release credential lease: %s", exc)
+                    retain_unknown('credential_release', exc)
+                    return
+
             try:
-                child_pool.release_lease(leased_cred_id)
+                if hasattr(child, "close"):
+                    child.close()
+                if vars(child).get('_close_cleanup_state') == 'incomplete':
+                    retain_unknown('owned_close')
+                    return
             except Exception as exc:
-                logger.debug("Failed to release credential lease: %s", exc)
+                logger.debug("Failed to close child agent after delegation")
+                retain_unknown('owned_close', exc)
+                return
 
-        # Restore the parent's tool names so the process-global is correct
-        # for any subsequent execute_code calls or other consumers.
-        import model_tools
+            if _subagent_id:
+                _unregister_subagent(_subagent_id, agent=child)
 
-        saved_tool_names = getattr(child, "_delegate_saved_tool_names", None)
-        if isinstance(saved_tool_names, list):
-            model_tools._last_resolved_tool_names = list(saved_tool_names)
+            # Restore the parent's tool names so the process-global is correct
+            # for any subsequent execute_code calls or other consumers.
+            import model_tools
 
-        # Remove child from active tracking
+            saved_tool_names = getattr(child, "_delegate_saved_tool_names", None)
+            if isinstance(saved_tool_names, list):
+                model_tools._last_resolved_tool_names = list(saved_tool_names)
 
-        # Unregister child from interrupt propagation
-        if hasattr(parent_agent, "_active_children"):
-            try:
-                lock = getattr(parent_agent, "_active_children_lock", None)
-                if lock:
-                    with lock:
+            # Remove child from active tracking
+
+            # Unregister child from interrupt propagation
+            if hasattr(parent_agent, "_active_children"):
+                try:
+                    lock = getattr(parent_agent, "_active_children_lock", None)
+                    if lock:
+                        with lock:
+                            parent_agent._active_children.remove(child)
+                    else:
                         parent_agent._active_children.remove(child)
-                else:
-                    parent_agent._active_children.remove(child)
-            except (ValueError, UnboundLocalError) as e:
-                logger.debug("Could not remove child from active_children: %s", e)
+                except (ValueError, UnboundLocalError) as e:
+                    logger.debug("Could not remove child from active_children: %s", e)
 
-        # Close tool resources (terminal sandboxes, browser daemons,
-        # background processes, httpx clients) so subagent subprocesses
-        # don't outlive the delegation.
-        try:
-            if hasattr(child, "close"):
-                child.close()
-        except Exception:
-            logger.debug("Failed to close child agent after delegation")
+            # The AIAgent turn boundary normally closes the child scope itself. This
+            # fallback covers failures before that boundary starts, but must not pop
+            # a scope while a timed-out child worker is still unwinding.
+            try:
+                from agent import relay_runtime
 
-        # The AIAgent turn boundary normally closes the child scope itself. This
-        # fallback covers failures before that boundary starts, but must not pop
-        # a scope while a timed-out child worker is still unwinding.
-        try:
-            from agent import relay_runtime
+                runtime = relay_runtime.get_runtime(create=False)
+                child_session_id = str(getattr(child, "session_id", "") or "")
+                child_turn_is_active = relay_runtime.SESSION_COORDINATOR.has_active_turn(
+                    profile_key=relay_runtime.current_profile_key(),
+                    session_id=child_session_id,
+                )
+                if runtime is not None and child_session_id and not child_turn_is_active:
+                    runtime.unregister_subagent({"child_session_id": child_session_id})
+            except Exception:
+                logger.debug("Failed to close child Relay session after delegation")
 
-            runtime = relay_runtime.get_runtime(create=False)
-            child_session_id = str(getattr(child, "session_id", "") or "")
-            child_turn_is_active = relay_runtime.SESSION_COORDINATOR.has_active_turn(
-                profile_key=relay_runtime.current_profile_key(),
-                session_id=child_session_id,
-            )
-            if runtime is not None and child_session_id and not child_turn_is_active:
-                runtime.unregister_subagent({"child_session_id": child_session_id})
-        except Exception:
-            logger.debug("Failed to close child Relay session after delegation")
+            child._delegate_cleanup_state = 'complete'
+            child._delegate_retirement_owner = None
+            if _pending_terminal is not None and publish_terminal and child_progress_cb:
+                try:
+                    child_progress_cb('subagent.complete', **{
+                        **_pending_terminal, 'cleanup': {'status': 'complete', 'supervision_required': False}})
+                except Exception:
+                    logger.debug('Settled child terminal projection could not be delivered', exc_info=True)
+            child._delegate_settled_event.set()
+            if parent_agent is not None and vars(parent_agent).get('_close_cleanup_state') == 'incomplete':
+                parent_agent.close()
+
+        def _await_settlement_and_retire(_future=None):
+            # Owned RPC work may outlive the conversation's terminal result.
+            settle = getattr(child, '_wait_owned_tool_settlement', None)
+            if callable(settle):
+                settle()
+            _retire_owned_child()
+
+        completed = set() if _child_future is None else wait_futures({_child_future}, timeout=0)[0]
+        owned_live = getattr(child, '_has_owned_tool_work', None)
+        pending_tools = callable(owned_live) and owned_live() is True
+        if (_child_future is not None and _child_future not in completed) or pending_tools:
+            child._delegate_cleanup_state = 'incomplete'
+            # Strong closure references retain parent, child, DB and credential.
+            # This supervisor, unlike a terminal UI projection, owns retirement.
+            def _start_settlement(_future=None):
+                threading.Thread(target=_await_settlement_and_retire,
+                    name=f'child-settlement-{_subagent_id}', daemon=True).start()
+            if _child_future is not None and _child_future not in completed:
+                _child_future.add_done_callback(_start_settlement)
+            else:
+                _start_settlement()
+        else:
+            _retire_owned_child()
 
 
 _PARENT_FINALIZATION_LOCK_GUARD = threading.Lock()
@@ -3396,18 +3684,122 @@ _PARENT_FINALIZATION_FALLBACK_LOCK = threading.RLock()
 _CHILD_CONSTRUCTION_LOCK = threading.RLock()
 
 
-def _build_child_preserving_parent_tools(**kwargs):
-    """Build a child without leaking its resolved toolset into the parent."""
-    import model_tools
+def _retire_unstarted_child(child, parent, *, reservation_id=None):
+    """Retire a positively unstarted reservation, never an uncertain runner."""
+    if vars(child).get('_delegate_worker_future') is not None:
+        return False
+    sid = reservation_id or getattr(child, '_subagent_id', None)
+    with _active_subagents_lock:
+        record = _active_subagents.get(sid)
+        if record is not None and record.get('agent') in (None, child):
+            record['agent'] = child
+    error_class = None
+    try:
+        child.close()
+    except Exception as exc:
+        error_class = type(exc).__name__
+    if error_class is not None or vars(child).get('_close_cleanup_state') == 'incomplete':
+        child._delegate_cleanup_state = 'incomplete'
+        with _active_subagents_lock:
+            record = _active_subagents.get(sid)
+            if record is not None and record.get('agent') is child:
+                record.update(status='cleanup-incomplete', cleanup_state='incomplete',
+                    capacity_occupied=True, cleanup={'status': 'incomplete',
+                        'outcome': 'unknown', 'retirement_phase': 'unstarted_close',
+                        'error_class': error_class})
+                record.setdefault('first_stop_at', time.time())
+        return False
+    child._delegate_cleanup_state = 'complete'
+    if sid:
+        _unregister_subagent(sid, agent=child)
+    lock = getattr(parent, '_active_children_lock', None)
+    if lock is not None:
+        with lock:
+            if child in parent._active_children:
+                parent._active_children.remove(child)
+    return True
 
-    with _CHILD_CONSTRUCTION_LOCK:
-        parent_tool_names = list(model_tools._last_resolved_tool_names)
+
+def _build_child_preserving_parent_tools(**kwargs):
+    """Reserve before owned initialization; preserve the parent's toolset."""
+    policy = _get_child_lifetime_policy()
+    timeout = _require_child_lifetime_policy(policy)
+    import model_tools
+    from tools.daemon_pool import DaemonThreadPoolExecutor
+    import uuid
+
+    admitted = time.monotonic()
+    deadline = None if timeout is None else admitted + timeout
+    parent = kwargs.get('parent_agent')
+    if parent is not None and vars(parent).get('_close_cleanup_state') in {'incomplete', 'complete'}:
+        raise ValueError('DELEGATION_PARENT_CLOSING: child admission refused')
+    parent_sid = str(getattr(parent, 'session_id', '') or '')
+    reservation = 'sa-init-' + uuid.uuid4().hex
+    ceiling = _get_max_concurrent_children()
+    with _active_subagents_lock:
+        occupied = sum(r.get('owner_agent_session_id') == parent_sid
+            for r in _active_subagents.values())
+        if occupied >= ceiling:
+            raise ValueError('DELEGATION_CAPACITY_OCCUPIED: running or cleanup-incomplete children at ceiling')
+        _active_subagents[reservation] = {'subagent_id': reservation, 'goal': kwargs.get('goal'),
+            'owner_agent_session_id': parent_sid, 'agent': None, 'status': 'initializing',
+            'capacity_occupied': True, 'started_at': time.time(), 'accepting_steer': False}
+
+    def build():
+        with _CHILD_CONSTRUCTION_LOCK:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise _ChildDeadlineExpired('DELEGATION_DEADLINE_EXPIRED: initialization admission')
+            parent_tool_names = list(model_tools._last_resolved_tool_names)
+            try:
+                child = _build_child_agent(**kwargs)
+            finally:
+                model_tools._last_resolved_tool_names = parent_tool_names
+        child._delegate_saved_tool_names = parent_tool_names
+        child._delegate_admitted_at = admitted
+        child._delegate_deadline = deadline
+        child._delegate_timeout = timeout
+        child._delegate_lifetime_policy = policy
+        return child
+
+    executor = DaemonThreadPoolExecutor(max_workers=1, thread_name_prefix='child-initialization')
+    try:
+        future = executor.submit(build)
+        with _active_subagents_lock:
+            _active_subagents[reservation]['future'] = future
+        outcome = _wait_child_attempt(future, deadline)
+        if outcome is ChildWaitOutcome.EXPIRED:
+            with _active_subagents_lock:
+                _active_subagents[reservation].update(status='cleanup-incomplete',
+                    cleanup_state='incomplete', first_stop_at=time.time())
+            def retire_initialization(done):
+                try:
+                    child = done.result()
+                except BaseException:
+                    child = None
+                if child is not None:
+                    request_hard_interrupt(child)
+                    if not _retire_unstarted_child(child, parent, reservation_id=reservation):
+                        return
+                with _active_subagents_lock:
+                    _active_subagents.pop(reservation, None)
+                if parent is not None and vars(parent).get('_close_cleanup_state') == 'incomplete':
+                    parent.close()
+            future.add_done_callback(retire_initialization)
+            raise _ChildDeadlineExpired('DELEGATION_DEADLINE_EXPIRED: initialization unsettled')
         try:
-            child = _build_child_agent(**kwargs)
-        finally:
-            model_tools._last_resolved_tool_names = parent_tool_names
-    child._delegate_saved_tool_names = parent_tool_names
-    return child
+            child = future.result()
+        except BaseException:
+            with _active_subagents_lock:
+                _active_subagents.pop(reservation, None)
+            raise
+        with _active_subagents_lock:
+            record = _active_subagents.pop(reservation)
+            record.update(subagent_id=child._subagent_id, agent=child, status='admitted')
+            record.pop('future', None)
+            _active_subagents[child._subagent_id] = record
+        return child
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _parent_finalization_lock(parent_agent) -> threading.RLock:
@@ -3904,6 +4296,11 @@ def delegate_task(
         except ValueError as exc:
             # Explicit-pin preflight failures (e.g. pinned delegation.command
             # missing from PATH) refuse the spawn loudly (#80450).
+            for _, _, previous in children:
+                _retire_unstarted_child(previous, parent_agent)
+            if isinstance(exc, DelegationTimeoutConfigError):
+                return json.dumps({'status': 'rejected', 'error_code': 'delegation_invalid_timeout',
+                    'execution_started': False, 'error': str(exc)})
             return tool_error(str(exc))
         # Attach the validated schema for the completion-side validation
         # hook in _run_single_child. Absent (None) on schema-less tasks.
@@ -4676,16 +5073,14 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
 def _load_config() -> dict:
     """Load delegation config from the active Hermes config.
 
-    Prefer the shared persistent loader because it follows the active
-    HERMES_HOME/profile. ``cli.CLI_CONFIG`` is a legacy fallback for entry
-    points that cannot import the shared loader; importing it first can return
-    an old default ``delegation`` block and hide user-set keys such as
-    ``max_concurrent_children``.
+    The shared persistent loader follows the active HERMES_HOME/profile.
+    Its failure is not permission to borrow an old CLI configuration, which
+    can remove a timeout or change admission limits. Legacy CLI configuration
+    is authoritative only for an explicit ignore-user-config invocation.
 
-    Uses ``load_config_readonly()``: every consumer of this dict is read-only
-    (``.get()`` lookups), and this runs on each ``get_definitions()`` schema
-    rebuild via ``_get_max_concurrent_children``, so skipping the defensive
-    deepcopy matters. Do NOT mutate the returned dict.
+    Uses the canonical strict policy snapshot, not the lenient display/LKG
+    cache. Only the bounded delegation section is projected; no global
+    policy cache or stale configuration can qualify a new child admission.
 
     ``HERMES_IGNORE_USER_CONFIG=1`` (``hermes chat --ignore-user-config``) is
     only honored by the legacy ``cli`` loader, not the shared one, so when the
@@ -4695,21 +5090,30 @@ def _load_config() -> dict:
     prefer_legacy = os.environ.get("HERMES_IGNORE_USER_CONFIG") == "1"
     if not prefer_legacy:
         try:
-            from hermes_cli.config import load_config_readonly
+            from hermes_cli.config import DelegationConfigPolicy, read_delegation_config_policy
 
-            full = load_config_readonly()
-            cfg = full.get("delegation") or {}
-            if isinstance(cfg, dict):
-                return cfg
-        except Exception:
-            pass
-    try:
-        from cli import CLI_CONFIG
+            policy = read_delegation_config_policy()
+            if type(policy) is not DelegationConfigPolicy:
+                raise DelegationConfigError('DELEGATION_CONFIG_INVALID: expected canonical policy snapshot')
+            policy.validate()
+            return policy.values
+        except DelegationConfigError:
+            raise
+        except Exception as exc:
+            raise DelegationConfigError('DELEGATION_CONFIG_UNAVAILABLE: canonical reader failed') from exc
+    else:
+        try:
+            from cli import CLI_CONFIG
 
-        cfg = CLI_CONFIG.get("delegation") or {}
-        return cfg if isinstance(cfg, dict) else {}
-    except Exception:
-        return {}
+            full = CLI_CONFIG
+        except Exception as exc:
+            raise DelegationConfigError('DELEGATION_CONFIG_UNAVAILABLE: explicit CLI owner failed') from exc
+    if not isinstance(full, dict):
+        raise DelegationConfigError('DELEGATION_CONFIG_INVALID: expected a mapping')
+    cfg = full.get("delegation", {})
+    if not isinstance(cfg, dict):
+        raise DelegationConfigError('DELEGATION_CONFIG_INVALID: delegation must be a mapping')
+    return cfg
 
 
 # ---------------------------------------------------------------------------

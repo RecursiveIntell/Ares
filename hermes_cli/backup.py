@@ -943,6 +943,43 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
                     file_count,
                 )
 
+        # Native-input media bytes are published (fsynced) BEFORE the receipt
+        # that references them commits. The scan above ran before the database
+        # snapshot, so an input accepted in between puts a receipt into the
+        # snapshot whose blob is not in ``files_to_add``. Re-sweep each backed-up
+        # database's byte namespace AFTER the snapshot: every receipt visible in
+        # the snapshot has its bytes on disk by then. Files that appear after
+        # this sweep are unreferenced by the snapshot (harmless orphans).
+        archived = {str(rel) for _, rel in files_to_add}
+        late_roots = {
+            abs_path.parent / "attachments" / "native-input"
+            for abs_path, _ in files_to_add
+            if abs_path.suffix == ".db"
+        }
+        late_count = 0
+        for late_root in sorted(late_roots):
+            if late_root.is_symlink() or not late_root.is_dir():
+                continue
+            for dirpath, _dirnames, filenames in os.walk(late_root, followlinks=False):
+                for fname in filenames:
+                    fpath = Path(dirpath) / fname
+                    try:
+                        rel = fpath.relative_to(hermes_root)
+                    except ValueError:
+                        continue
+                    if str(rel) in archived or _should_skip_backup_file(fpath, rel, out_path):
+                        continue
+                    try:
+                        zf.write(fpath, arcname=str(rel))
+                        total_bytes += fpath.stat().st_size
+                        archived.add(str(rel))
+                        late_count += 1
+                    except (PermissionError, OSError, ValueError) as exc:
+                        errors.append(f"  {rel}: {exc}")
+        if late_count:
+            logger.info("backup phase=archive status=late-attachments files=%d", late_count)
+            print(f"  Late attachments added after database snapshot: {late_count}")
+
         # External memory-provider state, stored under the ``_external/`` arc
         # prefix. These never include ``.db`` files in practice (config/env
         # blobs), so a straight zf.write is fine.

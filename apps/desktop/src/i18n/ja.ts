@@ -3,6 +3,10 @@ import { defineFieldCopy } from '@/app/settings/field-copy'
 import { defineLocale } from './define-locale'
 
 export const ja = defineLocale({
+  modelDiscovery: {
+    catalogStale: '保存されたカタログを表示しています。更新して利用可否を確認してください。',
+    showAllModels: 'すべてのモデルを表示'
+  },
   common: {
     apply: '適用',
     back: '戻る',
@@ -2141,6 +2145,11 @@ export const ja = defineLocale({
     goalActive: '目標進行中',
     goalDone: '目標達成',
     goalPaused: '目標一時停止中',
+    goalPauseAction: '一時停止',
+    goalResumeAction: 'スケジュールを再開',
+    goalClearAction: '解除',
+    goalBlocked: '目標がブロックされています',
+    goalAwaitingInput: '目標への入力待ち',
     goalWaiting: '目標待機中',
     subagents: count => `サブエージェント ${count} 件`,
     todos: (done, total) => `タスク ${done}/${total}`,
@@ -3019,6 +3028,12 @@ export const ja = defineLocale({
     audioReadFailed: '録音した音声を読み取れませんでした',
     sessionUnavailable: 'セッションが利用できません',
     createSessionFailed: '新しいセッションを作成できませんでした',
+    inputRecoveryRefused: '入力は受領されておらず、実行も開始されていません。手動復旧用に下書きを保持します。',
+    inputRecoveryRequired: '入力の手動確認が必要です。下書きは保持されます。',
+    inputRecoveryReview: '受領情報を確認',
+    inputRecoveryNotStarted: '入力は受領済みですが、実行は開始されていません。',
+    inputRecoveryUnknown: '実行が開始された可能性、または配信状態が不明です。再送前に確認してください。',
+    inputRecoveryRetry: '受領済み入力を再開',
     promptFailed: 'プロンプトに失敗しました',
     providerCredentialRequired: '最初のメッセージを送信する前にプロバイダー認証情報を追加してください。',
     emptySlashCommand: '空のスラッシュコマンド',

@@ -189,34 +189,32 @@ class TestJudgeParseFailureAutoPause:
         assert transport_failed is True
 
 
-    def test_auto_pause_after_three_consecutive_parse_failures(self, hermes_home):
-        """N=3 consecutive parse failures → auto-pause with config pointer."""
+    def test_invalid_judge_contract_retries_auxiliary_once_without_minting_turns(self, hermes_home):
+        """Contract recovery is auxiliary work, never extra main goal turns."""
         from hermes_cli import goals
-        from hermes_cli.goals import GoalManager, DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES
+        from hermes_cli.goals import GoalManager
 
-        assert DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES == 3
         mgr = GoalManager(session_id="parse-fail-sid-1", default_max_turns=20)
         mgr.set("do a thing")
 
         with patch.object(
             goals, "judge_goal", return_value=("continue", "judge returned empty response", True, None, False)
-        ):
-            d1 = mgr.evaluate_after_turn("step 1")
-            assert d1["should_continue"] is True
+        ) as judge:
+            decision = mgr.evaluate_after_turn("step 1")
+            assert judge.call_count == 2
+            assert decision["should_continue"] is False
+            assert decision["status"] == "paused"
+            assert decision["verdict"] == "judge_failed"
             assert mgr.state.consecutive_parse_failures == 1
-
-            d2 = mgr.evaluate_after_turn("step 2")
-            assert d2["should_continue"] is True
-            assert mgr.state.consecutive_parse_failures == 2
-
-            d3 = mgr.evaluate_after_turn("step 3")
-            assert d3["should_continue"] is False
-            assert d3["status"] == "paused"
-            assert mgr.state.consecutive_parse_failures == 3
-            # Message points at the config surface so the user can fix it.
-            assert "auxiliary" in d3["message"]
-            assert "goal_judge" in d3["message"]
-            assert "config.yaml" in d3["message"]
+            assert mgr.state.turns_used == 1
+            assert mgr.state.continuation_pending is False
+            assert mgr.state.outcome == goals.PROVIDER_FAILED
+            assert "auxiliary judge" in mgr.state.next_action
+            assert "judge returned empty response" in decision["message"]
+            # Unrelated wakes cannot convert this pause into more recovery turns.
+            assert mgr.evaluate_after_turn("unrelated completion")["should_continue"] is False
+            assert judge.call_count == 2
+            assert mgr.state.turns_used == 1
 
 
 

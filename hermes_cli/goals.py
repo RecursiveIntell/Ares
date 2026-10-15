@@ -176,12 +176,13 @@ JUDGE_SYSTEM_PROMPT = (
     "You are a strict judge evaluating whether an autonomous agent has "
     "achieved a user's stated goal. You receive the goal text, the agent's "
     "most recent response, and — when present — a list of background "
-    "processes the agent has running. Decide one of three verdicts.\n\n"
+    "processes the agent has running. Decide one of four verdicts.\n\n"
     "DONE — the goal is fully satisfied:\n"
     "- The response explicitly confirms the goal was completed, OR\n"
-    "- The response clearly shows the final deliverable was produced, OR\n"
-    "- The response explains the goal is unachievable / blocked / needs "
-    "user input (treat this as DONE with reason describing the block).\n\n"
+    "- The response clearly shows the final deliverable was produced.\n\n"
+    "BLOCKED — no authorized actionable step remains; user input, owner approval, "
+    "or an unresolved dependency is required. This is a conservative proposal, "
+    "never completion or permission. Independent approved work may continue.\n\n"
     "WAIT — the goal is NOT done, but the next step is to wait for async "
     "work to finish rather than act again. Choose this ONLY when the agent's "
     "progress is genuinely gated on something running on its own:\n"
@@ -204,6 +205,7 @@ JUDGE_SYSTEM_PROMPT = (
     "Reply ONLY with a single JSON object on one line. Shapes:\n"
     '{"verdict": "done", "reason": "<one sentence>"}\n'
     '{"verdict": "continue", "reason": "<one sentence>"}\n'
+    '{"verdict": "blocked", "reason": "<one sentence>"}\n'
     '{"verdict": "wait", "wait_on_session": "<id>", "reason": "<one sentence>"}\n'
     '{"verdict": "wait", "wait_on_pid": <int>, "reason": "<one sentence>"}\n'
     '{"verdict": "wait", "wait_for_seconds": <int>, "reason": "<one sentence>"}\n'
@@ -226,7 +228,7 @@ JUDGE_USER_PROMPT_TEMPLATE = (
     "Agent's most recent response:\n{response}\n\n"
     "{background_block}"
     "Current time: {current_time}\n\n"
-    "Is the goal satisfied — done, continue, or wait?"
+    "Is the goal satisfied — done, continue, blocked, or wait?"
 )
 
 # Used when the user has added /subgoal criteria. The judge must
@@ -244,8 +246,8 @@ JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE = (
     "met' or 'implying it was done' — require specific evidence (a "
     "file contents excerpt, an output line, a command result). If "
     "ANY criterion lacks specific evidence in the response, the goal "
-    "is NOT done — return CONTINUE (or WAIT if blocked on a listed "
-    "background process).\n\n"
+    "is NOT done — return CONTINUE when an authorized actionable step remains, "
+    "BLOCKED when none remains, or WAIT on a listed actual background process.\n\n"
     "Is the goal AND every additional criterion satisfied?"
 )
 
@@ -271,11 +273,11 @@ JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE = (
     "verification and it's still running), return WAIT on that process "
     "instead of re-poking — re-poking now would be pure busy-work.\n"
     "- If the response explains the work is blocked, unachievable, or needs user "
-    "input, it is NOT done. Return CONTINUE unless a valid WAIT directive names "
+    "input, it is NOT done. Return BLOCKED unless a valid WAIT directive names "
     "an actual running process/session or bounded delay. The controller persists "
     "the resulting paused/blocked state; never promote a technical block to DONE.\n"
     "- Otherwise the goal is NOT done — CONTINUE.\n\n"
-    "Is the goal satisfied per its completion contract — done, continue, or wait?"
+    "Is the goal satisfied per its completion contract — done, continue, blocked, or wait?"
 )
 
 
@@ -679,7 +681,7 @@ class GoalState:
                     ) if field_name not in data
                 ),
             }
-        return cls(
+        state = cls(
             goal=data.get("goal", ""),
             goal_id=str(data.get("goal_id") or ""),
             status=data.get("status", "active"),
@@ -727,6 +729,29 @@ class GoalState:
         )
 
     # --- contract helpers -------------------------------------------------
+
+        cp = state.checkpoint or {}
+        explicit_barrier = (data.get("outcome") in {GOAL_BLOCKED, WAITING_FOR_AUTHORITY}
+            or data.get("last_verdict") in {"blocked", "GOAL_BLOCKED", "waiting_for_authority"}
+            or data.get("last_verdict") == "done" and not state.completion_evidence)
+        unknown = "outcome" in data and data["outcome"] not in _ALLOWED_OUTCOMES
+        contradictory = (state.status == "active" and state.outcome == GOAL_COMPLETED
+            or data.get("checkpoint") is not None and not isinstance(data.get("checkpoint"), dict)
+            or bool(cp and (cp.get("goal_id") != state.goal_id
+            or cp.get("checkpoint_revision") != state.checkpoint_revision
+            or (state.continuation_pending and cp.get("outcome") != state.outcome))))
+        if state.status == "active" and (unknown or contradictory or
+                (explicit_barrier and not cp.get("authorized_actionable_steps"))):
+            state.status = "paused"  # Old readers also remain conservative.
+            state.continuation_pending = False
+            if unknown or contradictory:
+                state.outcome = EXECUTION_FAILED
+            elif data.get("last_verdict") in {"blocked", "GOAL_BLOCKED"}:
+                state.outcome = GOAL_BLOCKED
+            elif data.get("last_verdict") == "done" and not state.completion_evidence:
+                state.outcome = WAITING_FOR_AUTHORITY
+            state.migration["load_parked"] = "unknown or contradictory checkpoint" if unknown or contradictory else "unresolved explicit barrier"
+        return state
 
     def has_contract(self) -> bool:
         return self.contract is not None and not self.contract.is_empty()
@@ -1031,7 +1056,11 @@ def load_goal(session_id: str) -> Optional[GoalState]:
     if not raw:
         return None
     try:
-        return GoalState.from_json(raw)
+        state = GoalState.from_json(raw)
+        if state.migration.get("load_parked") and json.loads(raw).get("status") == "active":
+            if not db.compare_and_set_meta(_meta_key(session_id), raw, state.to_json()):
+                return None
+        return state
     except Exception as exc:
         logger.warning("GoalManager: could not parse stored goal for %s: %s", session_id, exc)
         return None
@@ -1303,7 +1332,7 @@ def _goal_judge_timeout() -> float:
 
 
 def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, Any]]]:
-    """Parse the judge's reply. Fail-open on unusable output.
+    """Parse the judge's reply. Unusable output is a contract failure.
 
     Returns ``(verdict, reason, parse_failed, wait_directive)`` where:
       - ``verdict`` is ``"done"``, ``"continue"``, or ``"wait"``.
@@ -1356,15 +1385,21 @@ def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, 
     if isinstance(verdict_raw, str):
         verdict = verdict_raw.strip().lower()
     else:
+        if "done" not in data or not isinstance(data["done"], (bool, str)):
+            return "continue", "judge verdict is missing or malformed", True, None
         done_val = data.get("done")
+        if isinstance(done_val, str) and done_val.strip().lower() not in {"true", "false", "yes", "no", "1", "0", "done"}:
+            return "continue", "legacy judge verdict is malformed", True, None
         if isinstance(done_val, str):
             done = done_val.strip().lower() in {"true", "yes", "1", "done"}
         else:
             done = bool(done_val)
         verdict = "done" if done else "continue"
 
-    if verdict not in {"done", "continue", "wait"}:
-        verdict = "continue"
+    if verdict == "goal_blocked":
+        verdict = "blocked"
+    if verdict not in {"done", "continue", "wait", "blocked"}:
+        return "continue", f"unknown judge verdict: {verdict}", True, None
 
     if verdict != "wait":
         return verdict, reason, False, None
@@ -1396,7 +1431,7 @@ def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, 
     if seconds is not None:
         return "wait", reason, False, {"seconds": seconds}
     # Wait with no usable target — can't park on nothing; treat as continue.
-    return "continue", f"{reason} (wait verdict had no target — continuing)", False, None
+    return "continue", f"{reason} (wait verdict had no target)", True, None
 
 
 def _render_background_block(background_processes: Optional[List[Dict[str, Any]]]) -> str:
@@ -1712,6 +1747,8 @@ def _apply_goal_checkpoint(state: GoalState, outcome: str, reason: str,
         "remaining_goal_turns": max(0, state.max_turns - state.turns_used),
         "blockers": list(metadata.get("blockers") or []),
         "required_authority": metadata.get("required_authority"),
+        "blocker_kind": metadata.get("blocker_kind"),
+        "authorized_actionable_steps": list(metadata.get("authorized_actionable_steps") or []),
         "outcome": state.outcome,
         "updated_at": time.time(),
     }
@@ -1729,12 +1766,29 @@ def goal_resume_state(before: str, *, reset_budget: bool, operator_action_id: st
     state.waiting_since = 0.0
     if reset_budget:
         state.turns_used = 0
+    if state.migration.get("continuation_admission"):
+        state.status = "paused"
+        state.continuation_pending = False
+        state.next_action = "reconcile the admitted generation before requesting any new execution"
+        return state
     state.recovery_episode_attempts = 0
     state.last_recovery_reason = None
-    _apply_goal_checkpoint(state, CONTINUATION_REQUIRED, "USER_RESUMED",
-                           "run the next admissible turn", continuation=True)
-    state.continuation_token = str(uuid.uuid5(uuid.UUID(state.goal_id),
-        f"operator-resume:{state.checkpoint_revision}:{operator_action_id}"))
+    previous = dict(state.checkpoint or {})
+    barrier = state.outcome in {GOAL_BLOCKED, WAITING_FOR_AUTHORITY} or bool(previous.get("blocker_kind") or previous.get("blockers"))
+    outcome = state.outcome if barrier else CONTINUATION_REQUIRED
+    _apply_goal_checkpoint(state, outcome, "USER_RESUMED",
+                           state.next_action if barrier else "run the next admissible turn",
+                           continuation=not barrier or bool(previous.get("authorized_actionable_steps")),
+                           metadata=previous)
+    state.migration.pop("load_parked", None)
+    if barrier and not previous.get("authorized_actionable_steps"):
+        state.status = "paused"
+        state.outcome = WAITING_FOR_AUTHORITY if previous.get("blocker_kind") == "unverified_completion" else GOAL_BLOCKED
+        state.checkpoint["outcome"] = state.outcome
+        state.continuation_pending = False
+    if state.turns_used >= state.max_turns:
+        state.status = "paused"
+        state.continuation_pending = False
     return state
 
 
@@ -1759,6 +1813,7 @@ class GoalManager:
         self.session_id = session_id
         self.default_max_turns = int(default_max_turns or DEFAULT_MAX_TURNS)
         self._state: Optional[GoalState] = load_goal(session_id)
+        self._admitted_revision = None
         self._continuation_lock_handle = None
         self._continuation_claim_owner: Optional[str] = None
 
@@ -1776,6 +1831,20 @@ class GoalManager:
 
     def has_contract(self) -> bool:
         return self._state is not None and self._state.has_contract()
+
+    def projection(self) -> Optional[Dict[str, Any]]:
+        state = self._state
+        if state is None or state.status == "cleared":
+            return None
+        cp = state.checkpoint or {}
+        status = ("awaiting_input" if state.outcome == WAITING_FOR_AUTHORITY else
+            "blocked" if state.outcome == GOAL_BLOCKED else
+            "waiting" if self.is_waiting() else state.status)
+        return {"goal_id": state.goal_id, "checkpoint_revision": state.checkpoint_revision,
+            "status": status, "title": state.goal, "reason": state.paused_reason or state.last_reason or state.last_stop_reason,
+            "next_action": state.next_action, "blocker_kind": cp.get("blocker_kind"),
+            "blockers": cp.get("blockers", []), "turns_used": state.turns_used,
+            "max_turns": state.max_turns, "auto_eligible": self.auto_eligible()}
 
     def status_line(self) -> str:
         s = self._state
@@ -1858,7 +1927,7 @@ class GoalManager:
                         "legacy schema omitted completion authority; explicit "
                         "verified evidence is required"
                     ),
-                    "blockers": list(migration.get("missing_fields") or []),
+                    "blockers": [],
                 },
             )
         else:
@@ -1965,6 +2034,8 @@ class GoalManager:
         except Exception:
             logger.error("Goal resume owner is unavailable", exc_info=True)
             return None
+        if self._state.migration.get("load_parked") == "unknown or contradictory checkpoint":
+            return None
         valid, reason = self.validate_checkpoint()
         if not valid:
             self._state.status = "paused"
@@ -2064,6 +2135,24 @@ class GoalManager:
                 return False, "continuation token does not match checkpoint stop reason"
         return True, "checkpoint is current"
 
+    @staticmethod
+    def _auto_eligible(state: Optional[GoalState], *, admitted: bool = False) -> bool:
+        if state is None or state.status != "active" or state.turns_used >= state.max_turns:
+            return False
+        if not GoalManager._validate_checkpoint(state)[0]:
+            return False
+        cp = state.checkpoint or {}
+        if state.migration.get("continuation_admission") and not admitted:
+            return False
+        if state.migration.get("load_parked"):
+            return False
+        if state.outcome in {GOAL_BLOCKED, WAITING_FOR_AUTHORITY} or cp.get("blocker_kind") or cp.get("blockers"):
+            return bool(cp.get("authorized_actionable_steps"))
+        return True
+
+    def auto_eligible(self) -> bool:
+        return self._auto_eligible(self._state, admitted=self._state is not None and self._admitted_revision == self._state.checkpoint_revision) and not self.is_waiting()
+
     def claim_continuation(self, owner: str, *, lease_seconds: float = 120.0) -> bool:
         """Atomically claim one pending continuation across local processes."""
         db = _get_session_db()
@@ -2076,9 +2165,11 @@ class GoalManager:
             state = GoalState.from_json(expected_raw)
         except Exception:
             return False
-        if not state.continuation_pending or state.status != "active":
+        if not state.continuation_pending or not self._auto_eligible(state):
             return False
         self._state = state
+        if self.is_waiting():
+            return False
         valid, _reason = self.validate_checkpoint()
         if not valid:
             return False
@@ -2188,7 +2279,7 @@ class GoalManager:
             state = GoalState.from_json(expected_raw) if expected_raw else None
         except Exception:
             return False
-        if state is None or state.status != "active" or not state.continuation_pending:
+        if not self._auto_eligible(state) or not state.continuation_pending:
             return False
         if expected_goal_id is not None and state.goal_id != expected_goal_id:
             return False
@@ -2202,6 +2293,9 @@ class GoalManager:
             and state.continuation_token != expected_continuation_token
         ):
             return False
+        self._state = state
+        if self.is_waiting():
+            return False
         valid, _reason = self._validate_checkpoint(state)
         if not valid:
             return False
@@ -2210,6 +2304,7 @@ class GoalManager:
         state.continuation_claimed_by = None
         state.continuation_claimed_at = 0.0
         state.outcome = GOAL_ACTIVE
+        state.migration["continuation_admission"] = "admitted_not_started_or_unknown"
         state.last_stop_reason = "CONTINUATION_STARTED"
         state.next_action = "evaluate the current continuation turn"
         state.migration.pop("continuation_enqueued_at", None)
@@ -2226,6 +2321,8 @@ class GoalManager:
             logger.warning("GoalManager: continuation consume failed: %s", exc)
             saved = False
         self._state = state if saved else load_goal(self.session_id)
+        if saved:
+            self._admitted_revision = state.checkpoint_revision
         return saved
 
     def confirm_completion(self, evidence: str, *, source: str = "user") -> bool:
@@ -2414,7 +2511,8 @@ class GoalManager:
                     "verdict": "gate_failed", "reason": state.paused_reason,
                     "message": f"⏸ Goal paused — quality gate still failing: $ {gate.command} (exit {exit_code}).",
                 }
-            if not save_goal(self.session_id, state):
+            if not self._checkpoint(CONTINUATION_REQUIRED, f"quality gate failed: {gate.command}",
+                    "repair the failed quality gate", continuation=True):
                 return self._persistence_failure("quality-gate failure could not be saved")
             prompt = (
                 "[Continuing toward your standing goal — a quality gate failed]\\n"
@@ -2555,6 +2653,10 @@ class GoalManager:
         if state is None:
             return False
         before = state.to_json()
+        if metadata is None and state.checkpoint:
+            previous = state.checkpoint
+            metadata = {key: previous.get(key) for key in (
+                "blocker_kind", "blockers", "required_authority", "authorized_actionable_steps")}
         _apply_goal_checkpoint(state, outcome, reason, next_action,
                                continuation=continuation, metadata=metadata)
         if not save_goal(self.session_id, state):
@@ -2591,7 +2693,10 @@ class GoalManager:
         durable checkpoint/lease/consumer lifecycle.
         """
         state = self._state
-        if state is None or state.status != "active":
+        binding = (metadata or {}).get("continuation") or {}
+        if state and binding.get("goal_id") == state.goal_id and binding.get("checkpoint_revision") == state.checkpoint_revision and binding.get("continuation_token") == state.continuation_token:
+            self._admitted_revision = state.checkpoint_revision
+        if not self.auto_eligible():
             return {
                 "status": state.status if state else None,
                 "should_continue": False,
@@ -2622,6 +2727,7 @@ class GoalManager:
                     "Repair the blocker, then /goal resume."
                 ),
             }
+        state.migration.pop("continuation_admission", None)
         state.recovery_attempts += 1
         state.recovery_episode_attempts += 1
         state.last_recovery_reason = fingerprint
@@ -2657,6 +2763,19 @@ class GoalManager:
             if not self._checkpoint(CANCELLED, reason, "explicit /goal resume or /goal clear", continuation=False, metadata=metadata):
                 return self._persistence_failure("cancel transition could not be saved")
             return {"status": "paused", "should_continue": False, "continuation_prompt": None, "verdict": "cancelled", "reason": reason, "message": f"⏸ Goal paused — {reason}. Use /goal resume to continue."}
+        if outcome == GOAL_BLOCKED:
+            metadata = dict(metadata or {})
+            metadata.setdefault("blocker_kind", "missing_input")
+            metadata.setdefault("blockers", [{"kind": metadata["blocker_kind"], "reason": reason}])
+            independent = bool(metadata.get("authorized_actionable_steps")) and state.turns_used < state.max_turns
+            state.status = "active" if independent else "paused"
+            state.paused_reason = None if independent else reason
+            if not self._checkpoint(GOAL_BLOCKED, reason, "resolve each blocker explicitly; resume does not supply approval or input",
+                    continuation=independent, metadata=metadata):
+                return self._persistence_failure("blocked transition could not be saved")
+            return {"status": state.status, "should_continue": independent,
+                "continuation_prompt": self.next_continuation_prompt() if independent else None,
+                "verdict": "blocked", "reason": reason, "message": f"⏸ Goal blocked — {reason}."}
         exhausted = state.turns_used >= state.max_turns
         if exhausted or (outcome in {PROVIDER_FAILED, EXECUTION_FAILED} and state.execution_failures >= 2):
             state.status = "paused"
@@ -2723,8 +2842,19 @@ class GoalManager:
           - ``reason``: str
           - ``message``: user-visible one-liner to print/send
         """
-        state = self._state
-        if state is None or state.status != "active":
+        previous = self._state
+        state = load_goal(self.session_id)
+        if previous is not None and state is not None and previous.to_json() == state.to_json():
+            state = previous
+        self._state = state
+        stale = previous is not None and (state is None or previous.goal_id != state.goal_id
+            or previous.checkpoint_revision != state.checkpoint_revision)
+        binding = (turn_metadata or {}).get("continuation") or {}
+        admitted = bool(state and ((self._admitted_revision == state.checkpoint_revision) or
+            (binding.get("goal_id") == state.goal_id and binding.get("checkpoint_revision") == state.checkpoint_revision
+             and binding.get("continuation_token") == state.continuation_token)))
+        notification = (turn_metadata or {}).get("origin") == "notification"
+        if stale or notification or (binding and not admitted) or not self._auto_eligible(state, admitted=admitted):
             return {
                 "status": state.status if state else None,
                 "should_continue": False,
@@ -2756,9 +2886,15 @@ class GoalManager:
             }
 
         # Count the turn that just finished.
+        state.migration.pop("continuation_admission", None)
+        self._admitted_revision = None
         state.turns_used += 1
         state.last_turn_at = time.time()
         state.continuation_pending = False
+
+        if turn_outcome:
+            detail = (turn_metadata or {}).get("reason", "")
+            return self._execution_stop(turn_outcome, detail or turn_outcome, metadata=turn_metadata)
 
         gate_decision = self._check_gates()
         if gate_decision is not None:
@@ -2801,6 +2937,26 @@ class GoalManager:
             background_processes=background_processes,
             contract=state.contract if state.has_contract() else None,
         )
+        parse_failed = parse_failed or verdict not in {"done", "continue", "wait", "blocked"}
+        if parse_failed or transport_failed:
+            # One auxiliary retry, within this evaluation. Never dispatch a
+            # new main-model goal turn to recover the judge contract.
+            verdict, reason, parse_failed, wait_directive, transport_failed = judge_goal(
+                state.goal, last_response, subgoals=state.subgoals or None,
+                background_processes=background_processes,
+                contract=state.contract if state.has_contract() else None)
+            parse_failed = parse_failed or verdict not in {"done", "continue", "wait", "blocked"}
+            if parse_failed or transport_failed:
+                state.status = "paused"
+                state.paused_reason = reason
+                state.consecutive_parse_failures += int(parse_failed)
+                state.consecutive_transport_failures += int(transport_failed)
+                if not self._checkpoint(PROVIDER_FAILED, reason, "repair the auxiliary judge contract, then explicitly resume", continuation=False):
+                    return self._persistence_failure("judge contract failure could not be saved")
+                return {"status": "paused", "should_continue": False, "continuation_prompt": None,
+                    "verdict": "judge_failed", "reason": reason, "message": f"⏸ Goal paused — judge contract failed: {reason}."}
+        if verdict == "blocked":
+            return self._execution_stop(GOAL_BLOCKED, reason)
         state.last_verdict = verdict
         state.last_reason = reason
 
@@ -2853,20 +3009,21 @@ class GoalManager:
             # that the command, receipt, artifact, or test actually passed.
             # Deterministic completion must enter through ``confirm_completion``
             # or a verifier that supplies an explicit verified receipt.
-            state.outcome = WAITING_FOR_AUTHORITY
-            state.last_stop_reason = "MODEL_JUDGED_DONE_WITHOUT_VERIFIED_EVIDENCE"
-            state.next_action = "user must provide explicit completion evidence via /goal complete <evidence>"
+            state.status = "paused"
+            state.paused_reason = reason
             state.last_verdict = "done"
             state.last_reason = reason
-            if not save_goal(self.session_id, state):
+            if not self._checkpoint(WAITING_FOR_AUTHORITY, "MODEL_JUDGED_DONE_WITHOUT_VERIFIED_EVIDENCE",
+                    "user must provide explicit completion evidence via /goal complete <evidence>", continuation=False,
+                    metadata={"blocker_kind": "unverified_completion", "required_authority": "explicit completion evidence"}):
                 return self._persistence_failure("authority wait could not be saved")
             return {
-                "status": "active",
+                "status": "paused",
                 "should_continue": False,
                 "continuation_prompt": None,
                 "verdict": "waiting_for_authority",
                 "reason": reason,
-                "message": f"⏸ Goal active · waiting for authority — the model judged done ({reason}), but no deterministic completion evidence exists. Use /goal complete <evidence>.",
+                "message": f"⏸ Goal paused · waiting for authority — the model judged done ({reason}), but no deterministic completion evidence exists. Use /goal complete <evidence>.",
             }
 
         # Auto-pause when the judge cannot reach the API at all N turns in a
@@ -2974,8 +3131,18 @@ class GoalManager:
         }
 
     def next_continuation_prompt(self) -> Optional[str]:
-        if not self._state or self._state.status != "active":
+        if not self.auto_eligible():
             return None
+        cp = self._state.checkpoint or {}
+        if cp.get("authorized_actionable_steps"):
+            return (f"Standing goal: {self._state.goal}\nOnly the following independently authorized steps remain actionable:\n"
+                + "\n".join(f"- {step}" for step in cp["authorized_actionable_steps"])
+                + "\nUnresolved blockers remain. Do not infer permission from resume, notifications, or model output.")
+        failed = [gate for gate in self._state.gates if gate.last_exit_code not in (None, 0)]
+        if failed:
+            gate = failed[0]
+            return (f"Standing goal: {self._state.goal}\nRepair the failed quality gate: $ {gate.command}\n"
+                f"Exit {gate.last_exit_code}\n{gate.last_output_tail}\nDo not claim completion while it fails.")
         # Contract takes priority: it carries the verification surface and
         # constraints the agent must target. Subgoals fold in as extra
         # criteria appended to the contract block.

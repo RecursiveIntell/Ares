@@ -5,10 +5,16 @@ import { keyedTimeouts } from '@/lib/keyed-timeouts'
 import { $gateway } from './gateway'
 import { isSessionGone, isSessionGoneError, markSessionGone } from './session-gone'
 
-export type GoalStatus = 'active' | 'done' | 'paused' | 'waiting'
+export type GoalStatus = 'active' | 'done' | 'paused' | 'waiting' | 'blocked' | 'awaiting_input'
 
 export interface SessionGoal {
   detail?: string
+  goalId?: string
+  revision?: number
+  nextAction?: string
+  turnsUsed?: number
+  maxTurns?: number
+  autoEligible?: boolean
   status: GoalStatus
   title: string
   updatedAt: number
@@ -161,6 +167,53 @@ export function applyGoalStatusText(sid: string, text: string, opts?: { hydrate?
   }
 }
 
+/** Typed backend projection is authoritative; prose is an old-runtime fallback. */
+export function applyGoalProjection(sid: string, value: unknown): boolean {
+  if (value === null) {
+    clearSessionGoal(sid)
+
+    return true
+  }
+  if (typeof value !== 'object' || !value) {
+    return false
+  }
+  const goal = value as Record<string, unknown>
+  if (
+    typeof goal.goal_id !== 'string' ||
+    typeof goal.title !== 'string' ||
+    !['active', 'done', 'paused', 'waiting', 'blocked', 'awaiting_input'].includes(String(goal.status))
+  ) {
+    return false
+  }
+  const revision = typeof goal.checkpoint_revision === 'number' ? goal.checkpoint_revision : 0
+  const previous = $goalsBySession.get()[sid]
+  if (previous?.goalId === goal.goal_id && (previous.revision ?? 0) > revision) {
+    return true
+  }
+  if (
+    previous?.goalId === goal.goal_id &&
+    (previous.revision ?? 0) === revision &&
+    ['paused', 'blocked', 'awaiting_input', 'done'].includes(previous.status) &&
+    goal.status === 'active'
+  ) {
+    return true
+  }
+  setSessionGoal(sid, {
+    autoEligible: goal.auto_eligible === true,
+    goalId: goal.goal_id,
+    revision,
+    title: goal.title,
+    status: goal.status as GoalStatus,
+    detail: typeof goal.reason === 'string' ? goal.reason : undefined,
+    nextAction: typeof goal.next_action === 'string' ? goal.next_action : undefined,
+    turnsUsed: typeof goal.turns_used === 'number' ? goal.turns_used : undefined,
+    maxTurns: typeof goal.max_turns === 'number' ? goal.max_turns : undefined,
+    updatedAt: Date.now()
+  })
+
+  return true
+}
+
 export async function refreshSessionGoal(sid: string): Promise<void> {
   const gateway = $gateway.get()
 
@@ -168,15 +221,43 @@ export async function refreshSessionGoal(sid: string): Promise<void> {
     return
   }
 
+  const previous = $goalsBySession.get()[sid]
   try {
-    const result = await gateway.request<{ output?: string }>('slash.exec', { command: 'goal status', session_id: sid })
+    const result = await gateway.request<{ output?: string; goal?: unknown }>('slash.exec', {
+      command: 'goal status',
+      session_id: sid
+    })
 
-    applyGoalStatusText(sid, result?.output ?? '', { hydrate: true })
+    if ($goalsBySession.get()[sid] !== previous) {
+      return
+    }
+    if ((result?.goal as { status?: string } | undefined)?.status === 'done') {
+      clearSessionGoal(sid)
+      return
+    }
+    if (!applyGoalProjection(sid, result?.goal)) {
+      applyGoalStatusText(sid, result?.output ?? '', { hydrate: true })
+    }
   } catch (error) {
     if (isSessionGoneError(error)) {
       markSessionGone(sid)
     }
 
     // Best-effort: older gateways or detached sessions simply won't hydrate it.
+  }
+}
+
+export async function controlSessionGoal(sid: string, action: 'pause' | 'resume' | 'clear'): Promise<void> {
+  const gateway = $gateway.get()
+  if (!gateway) {
+    return
+  }
+  const result = await gateway.request<{ goal?: unknown; type?: string; goal_continuation?: unknown }>(
+    'command.dispatch',
+    { session_id: sid, name: 'goal', arg: action }
+  )
+  applyGoalProjection(sid, result.goal)
+  if (result.type === 'send' && result.goal_continuation) {
+    await gateway.request('prompt.submit', { session_id: sid, goal_continuation: result.goal_continuation })
   }
 }

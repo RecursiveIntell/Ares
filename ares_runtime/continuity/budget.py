@@ -128,6 +128,47 @@ class PressureDecision:
     execution_authorized: bool = field(default=False, init=False)
 
 
+# Provider-shaped media is recognised structurally, not by one ``type`` key:
+# Bedrock Converse uses keyed blocks (``{"image": {"source": ...}}``) and Gemini
+# uses ``inlineData``/``fileData`` parts, neither of which carries ``type``.
+# Detection only decides *refusal*; no media is counted or qualified here.
+_GEMINI_MEDIA_KEYS = ("inlineData", "inline_data", "fileData", "file_data")
+_CONVERSE_MEDIA_KEYS = ("image", "document", "video")
+_MEDIA_TYPE_KINDS = frozenset({"input_video", "video_url", "audio_url"})
+# Tool/model-authored data is the only place a media-looking dict is not media.
+# It is recognised by *position inside a typed content block*, never by key name
+# alone: a root-level or free-floating ``input``/``json`` dict is not exempt.
+_DATA_BLOCK_KINDS = {"tool_use": "input", "function_call": "arguments", "server_tool_use": "input"}
+
+
+def _data_child_key(block: dict) -> str | None:
+    """Key under which this typed block carries tool-authored data, if any."""
+    kind = block.get("type")
+    if isinstance(kind, str) and kind in _DATA_BLOCK_KINDS:
+        return _DATA_BLOCK_KINDS[kind]
+    return None
+
+
+def _converse_data_position(path: tuple, key) -> bool:
+    """Bedrock Converse ``toolUse.input`` and ``toolResult.content[].json``."""
+    return (key == "input" and path[-1:] == ("toolUse",)) or (key == "json" and "toolResult" in path)
+
+
+def _is_provider_media_block(value: dict) -> bool:
+    kind = value.get("type")
+    if isinstance(kind, str):
+        if kind in _MEDIA_TYPE_KINDS:
+            return True
+        # Anthropic ``document``/``video`` blocks are provider-interpreted
+        # inputs (base64, URL, file or citation-bearing text), never plain text.
+        if kind in ("document", "video") and type(value.get("source")) is dict:
+            return True
+    if any(type(value.get(key)) is dict for key in _GEMINI_MEDIA_KEYS):
+        return True
+    return any(type(value.get(key)) is dict and type(value[key].get("source")) is dict
+               for key in _CONVERSE_MEDIA_KEYS)
+
+
 def final_request_upper_bound(*, route_ref: str, payload: dict[str, Any]) -> InputCount:
     """Count the final text request after middleware and transport conversion.
 
@@ -172,7 +213,7 @@ def final_request_upper_bound(*, route_ref: str, payload: dict[str, Any]) -> Inp
                     and type(inputs) is dict and type(inputs.get("json")) is dict):
                 schema_roots.add(("toolConfig", "tools", index, "toolSpec", "inputSchema", "json"))
 
-    def check(value, depth=0, path=(), schema=False):
+    def check(value, depth=0, path=(), schema=False, data=False):
         if depth > 64:
             raise BudgetError("INVALID_FINAL_PAYLOAD")
         schema = schema or path in schema_roots
@@ -185,11 +226,21 @@ def final_request_upper_bound(*, route_ref: str, payload: dict[str, Any]) -> Inp
                 "compaction", "computer_screenshot",
             }) or any(key in value for key in ("encrypted_content", "previous_response_id", "conversation"))):
                 raise BudgetError("FINAL_PAYLOAD_OPAQUE_ACCOUNTING_UNQUALIFIED")
+            if not schema and not data and _is_provider_media_block(value):
+                raise BudgetError("FINAL_PAYLOAD_OPAQUE_ACCOUNTING_UNQUALIFIED")
+            data_key = _data_child_key(value)
             for key, item in value.items():
-                check(item, depth + 1, path + (key,), schema)
+                # A dict named ``image`` inside a tool call's own arguments is
+                # data, not a content block. Exemption is positional (a typed
+                # tool block's data field, or Converse toolUse.input /
+                # toolResult json), and only the structural media test honours
+                # it: every earlier check keeps its exact behaviour everywhere.
+                check(item, depth + 1, path + (key,), schema,
+                      data or (key == data_key and type(item) is dict)
+                      or _converse_data_position(path, key))
         elif isinstance(value, list):
             for index, item in enumerate(value):
-                check(item, depth + 1, path + (index,), schema)
+                check(item, depth + 1, path + (index,), schema, data)
 
     check(body)
     try:

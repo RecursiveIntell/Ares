@@ -195,9 +195,8 @@ class TestCacheOnly:
         assert out is None
         live.assert_not_called()
 
-    def test_empty_live_result_is_not_persisted(self):
-        """An empty list from a transient error must never pin an empty
-        cache entry over real data on the next open."""
+    def test_successful_empty_live_result_is_persisted(self):
+        """None is failure; a successful empty response is delisting."""
         import hermes_cli.models as mod
 
         with patch.object(mod, "_load_provider_models_cache", return_value={}), \
@@ -206,7 +205,7 @@ class TestCacheOnly:
              patch.object(mod, "fetch_api_models", return_value=[]):
             out = mod.cached_fetch_api_models("sk-key", "https://gw.example.com/v1")
         assert out == []
-        save.assert_not_called()
+        assert save.call_args.args[0]["custom:https://gw.example.com/v1"]["authoritative"] is True
 
     def test_blank_base_url_skips_cache_entirely(self):
         """No base_url means nothing to key the cache on — call straight
@@ -267,7 +266,9 @@ class TestCachedFetchApiModelsDiskRoundTrip:
             mod, "fetch_api_models", lambda *a, **k: ["custom-endpoint-model"]
         )
         monkeypatch.setattr(
-            mod, "provider_model_ids", lambda *a, **k: ["openrouter-curated-model"]
+            mod, "provider_model_ids", lambda *a, **k: mod.CatalogModelIds(
+                ["openrouter-curated-model"], source="live", freshness="fresh",
+                authoritative=True, updated_at=mod.time.time())
         )
 
         mod.cached_fetch_api_models("sk-key", "https://openrouter.ai/v1")

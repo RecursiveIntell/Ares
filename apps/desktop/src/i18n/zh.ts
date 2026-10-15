@@ -3,6 +3,10 @@ import { defineFieldCopy } from '@/app/settings/field-copy'
 import type { Translations } from './types'
 
 export const zh: Translations = {
+  modelDiscovery: {
+    catalogStale: '正在显示保存的目录。请刷新以检查可用性。',
+    showAllModels: '显示所有模型'
+  },
   common: {
     apply: '应用',
     back: '返回',
@@ -2684,6 +2688,11 @@ export const zh: Translations = {
     goalActive: '目标进行中',
     goalDone: '目标已完成',
     goalPaused: '目标已暂停',
+    goalPauseAction: '暂停',
+    goalResumeAction: '恢复调度',
+    goalClearAction: '清除',
+    goalBlocked: '目标受阻',
+    goalAwaitingInput: '目标等待输入',
     goalWaiting: '目标等待中',
     subagents: count => `${count} 个子代理`,
     todos: (done, total) => `任务 ${done}/${total}`,
@@ -3540,6 +3549,12 @@ export const zh: Translations = {
     audioReadFailed: '无法读取录制的音频',
     sessionUnavailable: '会话不可用',
     createSessionFailed: '无法创建新会话',
+    inputRecoveryRefused: '输入未接收且未开始执行，草稿已保留用于手动恢复。',
+    inputRecoveryRequired: '输入需要手动核对，草稿已保留。',
+    inputRecoveryReview: '核对回执',
+    inputRecoveryNotStarted: '输入已接收，执行尚未开始。',
+    inputRecoveryUnknown: '执行可能已开始或投递状态未知。再次发送前请核对。',
+    inputRecoveryRetry: '恢复已接收输入',
     promptFailed: '提示词发送失败',
     providerCredentialRequired: '发送第一条消息前请先添加提供方凭据。',
     emptySlashCommand: '空 slash 命令',

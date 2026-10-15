@@ -2,7 +2,22 @@ import { FIELD_DESCRIPTIONS, FIELD_LABELS } from '@/app/settings/constants'
 
 import type { Translations } from './types'
 
+// Additive model-lane copy contract colocated with its English owner. Keeps
+// the bounded change within the approved model UI and locale files.
+declare module './types' {
+  interface Translations {
+    modelDiscovery: {
+      catalogStale: string
+      showAllModels: string
+    }
+  }
+}
+
 export const en: Translations = {
+  modelDiscovery: {
+    catalogStale: 'Showing a saved catalog. Refresh to check availability.',
+    showAllModels: 'Show all models'
+  },
   common: {
     apply: 'Apply',
     back: 'Back',
@@ -2504,6 +2519,11 @@ export const en: Translations = {
     goalActive: 'Goal active',
     goalDone: 'Goal done',
     goalPaused: 'Goal paused',
+    goalPauseAction: 'Pause',
+    goalResumeAction: 'Resume scheduling',
+    goalClearAction: 'Clear',
+    goalBlocked: 'Goal blocked',
+    goalAwaitingInput: 'Goal awaiting input',
     goalWaiting: 'Goal waiting',
     subagents: count => `${count} Subagent${count === 1 ? '' : 's'}`,
     todos: (done, total) => `Tasks ${done}/${total}`,
@@ -3398,6 +3418,12 @@ export const en: Translations = {
     audioReadFailed: 'Could not read recorded audio',
     sessionUnavailable: 'Session unavailable',
     createSessionFailed: 'Could not create a new session',
+    inputRecoveryRefused: 'Input was not accepted or started. Draft retained for manual recovery.',
+    inputRecoveryRequired: 'Input needs manual reconciliation; draft retained.',
+    inputRecoveryReview: 'Review receipt',
+    inputRecoveryNotStarted: 'Receipt accepted; execution has not started.',
+    inputRecoveryUnknown: 'Execution may have started or delivery is unknown. Review before sending again.',
+    inputRecoveryRetry: 'Resume accepted input',
     promptFailed: 'Prompt failed',
     providerCredentialRequired: 'Add a provider credential before sending your first message.',
     emptySlashCommand: 'empty slash command',

@@ -8,6 +8,7 @@ See: https://github.com/NousResearch/hermes-agent/issues/1002
 See: https://github.com/NousResearch/hermes-agent/issues/1264
 """
 
+import io
 import os
 import subprocess
 import sys
@@ -789,10 +790,12 @@ class TestPythonpathSelectiveStrip:
 
         def _fake_popen(cmd, **kwargs):
             captured["env"] = kwargs.get("env", {})
-            captured["staging"] = os.path.dirname(cmd[1])
+            captured["staging"] = os.path.dirname(cmd[-1])
             proc = MagicMock()
-            proc.stdout.read.return_value = b""
-            proc.stderr.read.return_value = b""
+            # Real binary EOF streams exercise both read() and read1(). The
+            # unbuffered child argv includes -u before the script path.
+            proc.stdout = io.BytesIO()
+            proc.stderr = io.BytesIO()
             proc.wait.return_value = 0
             proc.returncode = 0
             proc.poll.return_value = 0

@@ -47,18 +47,26 @@
     "lodash": "4.18.1",
     "yauzl": "^3.3.1",
     "protobufjs": "^8.7.1",
-    "brace-expansion": "5.0.9",
+    "brace-expansion": "5.0.12",
     "minimatch@3.1.5": {
-      "brace-expansion": "1.1.18"
+      "brace-expansion": "1.1.21"
     },
     "mermaid": "11.16.1",
-    "dompurify": "3.4.13",
+    "dompurify": "3.4.17",
+    "katex": "0.18.2",
+    "@tailwindcss/typography": {
+      "postcss-selector-parser": "7.1.6"
+    },
     "ip-address": "10.3.1",
     "nanoid@^3": "3.3.18",
     "nanoid@^6": "6.0.0",
     "js-yaml@^4": "4.3.2",
     "undici@^6": "6.28.1",
     "undici@^7": "7.29.1",
+    "source-map-js": "1.2.2",
+    "shell-quote": "1.11.0",
+    "fast-uri": "3.1.8",
+    "joi@^18": "18.2.9",
     "postcss": "8.5.23",
     "tar": "7.5.22"
   },

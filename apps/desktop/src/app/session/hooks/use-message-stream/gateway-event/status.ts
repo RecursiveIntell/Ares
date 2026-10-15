@@ -6,7 +6,7 @@ import { type AgentNoticePayload, clearAgentNotice, nativeNoticeInput, showAgent
 import { clearClarifyRequest } from '@/store/clarify'
 import { setSessionCompacting } from '@/store/compaction'
 import { refreshBackgroundProcesses } from '@/store/composer-status'
-import { applyGoalStatusText } from '@/store/goals'
+import { applyGoalProjection, applyGoalStatusText } from '@/store/goals'
 import { dispatchNativeNotification } from '@/store/native-notifications'
 import { isDiskFullErrorMessage, notify, notifyError } from '@/store/notifications'
 import { requestDesktopOnboarding } from '@/store/onboarding'
@@ -35,7 +35,9 @@ export function handleStatusEvent(ctx: GatewayEventContext): boolean {
       // completions / watch matches here — re-sync the status stack.
       void refreshBackgroundProcesses(sessionId)
     } else if (sessionId && payload?.kind === 'goal') {
-      applyGoalStatusText(sessionId, coerceGatewayText(payload?.text))
+      if (!applyGoalProjection(sessionId, (payload as unknown as { goal?: unknown })?.goal)) {
+        applyGoalStatusText(sessionId, coerceGatewayText(payload?.text))
+      }
     }
 
     return true

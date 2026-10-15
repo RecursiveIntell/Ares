@@ -485,7 +485,7 @@ describe('usePromptActions slash session targeting', () => {
     expect(calls.map(c => c.method)).toEqual(['session.resume', 'slash.exec'])
     expect(calls[0]?.params).toMatchObject({ session_id: STORED_SESSION_ID })
     // The command lands on the recovered runtime that owns the goal.
-    expect(calls[1]?.params).toEqual({ command: 'goal status', session_id: RECOVERED_SESSION_ID })
+    expect(calls[1]?.params).toMatchObject({ command: 'goal status', session_id: RECOVERED_SESSION_ID })
   })
 
   it('does not fork the chat when the routed session cannot be rebound', async () => {
@@ -1212,11 +1212,11 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
     await handle!.submitText('/goal write the implementation plan')
 
     expect(calls.map(c => c.method)).toEqual(['slash.exec', 'prompt.submit'])
-    expect(calls[0]?.params).toEqual({
+    expect(calls[0]?.params).toMatchObject({
       command: 'goal write the implementation plan',
       session_id: RUNTIME_SESSION_ID
     })
-    expect(calls[1]?.params).toEqual({
+    expect(calls[1]?.params).toMatchObject({
       session_id: RUNTIME_SESSION_ID,
       text: 'write the implementation plan'
     })
@@ -1661,7 +1661,7 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
     // The newline lives in the arg — the command still reaches the gateway
     // whole, exactly as the CLI and Telegram handle it.
     expect(calls.map(c => c.method)).toEqual(['slash.exec', 'prompt.submit'])
-    expect(calls[0]?.params).toEqual({
+    expect(calls[0]?.params).toMatchObject({
       command: 'goal Write a Python script\nthat prints Hello World',
       session_id: RUNTIME_SESSION_ID
     })
@@ -1819,7 +1819,7 @@ describe('usePromptActions submit / queue drain semantics', () => {
       'hermes01',
       'default',
       'prompt.submit',
-      { session_id: 'runtime-remote', text: 'continue remotely' },
+      expect.objectContaining({ session_id: 'runtime-remote', text: 'continue remotely' }),
       1_800_000
     )
     expect(ambientRequest).not.toHaveBeenCalled()
@@ -1848,10 +1848,10 @@ describe('usePromptActions submit / queue drain semantics', () => {
     expect(seeds.every(s => s.interrupted === false)).toBe(true)
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
-      {
+      expect.objectContaining({
         session_id: RUNTIME_SESSION_ID,
         text: 'hello after a stop'
-      },
+      }),
       1_800_000
     )
   })
@@ -1924,21 +1924,21 @@ describe('usePromptActions submit / queue drain semantics', () => {
     // The latch is one-shot: the flag rides this submit, the next is clean.
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
-      {
+      expect.objectContaining({
         session_id: RUNTIME_SESSION_ID,
         text: 'stop! rude interruption',
         interrupted: true
-      },
+      }),
       1_800_000
     )
 
     await handle!.submitText('follow-up without a barge')
     expect(requestGateway).toHaveBeenLastCalledWith(
       'prompt.submit',
-      {
+      expect.objectContaining({
         session_id: RUNTIME_SESSION_ID,
         text: 'follow-up without a barge'
-      },
+      }),
       1_800_000
     )
   })
@@ -1964,11 +1964,11 @@ describe('usePromptActions submit / queue drain semantics', () => {
     expect(accepted).toBe(true)
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
-      {
+      expect.objectContaining({
         queued: true,
         session_id: RUNTIME_SESSION_ID,
         text: 'queued message'
-      },
+      }),
       1_800_000
     )
   })
@@ -2001,11 +2001,11 @@ describe('usePromptActions submit / queue drain semantics', () => {
     expect(accepted).toBe(true)
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
-      {
+      expect.objectContaining({
         queued: true,
         session_id: 'rt-session-a',
         text: 'queued for background session'
-      },
+      }),
       1_800_000
     )
     expect(requestGateway).not.toHaveBeenCalledWith('session.resume', expect.anything())
@@ -2056,11 +2056,11 @@ describe('usePromptActions submit / queue drain semantics', () => {
     })
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
-      {
+      expect.objectContaining({
         queued: true,
         session_id: 'rt-session-b',
         text: 'queued for B mid-switch'
-      },
+      }),
       1_800_000
     )
     // The invariant: the stale foreground runtime never receives the prompt.
@@ -2100,11 +2100,11 @@ describe('usePromptActions submit / queue drain semantics', () => {
     expect(accepted).toBe(true)
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
-      {
+      expect.objectContaining({
         queued: true,
         session_id: 'rt-session-b-live',
         text: 'queued for B, B already re-bound'
-      },
+      }),
       1_800_000
     )
     expect(requestGateway).not.toHaveBeenCalledWith('session.resume', expect.anything())
@@ -2143,10 +2143,10 @@ describe('usePromptActions submit / queue drain semantics', () => {
     expect(accepted).toBe(true)
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
-      {
+      expect.objectContaining({
         session_id: 'rt-tab',
         text: 'kickoff for the tab'
-      },
+      }),
       1_800_000
     )
   })
@@ -2194,11 +2194,11 @@ describe('usePromptActions submit / queue drain semantics', () => {
     // The prompt must land in the resumed session, NOT the foreground.
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
-      {
+      expect.objectContaining({
         queued: true,
         session_id: 'rt-session-a-rebound',
         text: 'queued for background session'
-      },
+      }),
       1_800_000
     )
     // The invariant: the foreground runtime never receives the prompt.
@@ -2245,11 +2245,11 @@ describe('usePromptActions submit / queue drain semantics', () => {
     expect(second).toBe(true)
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
-      {
+      expect.objectContaining({
         queued: true,
         session_id: RUNTIME_SESSION_ID,
         text: 'please send me'
-      },
+      }),
       1_800_000
     )
   })
@@ -2313,7 +2313,9 @@ describe('usePromptActions submit / queue drain semantics', () => {
     )
 
     const sending = handle!.submitTextRaw('raced with a live turn')
-    await vi.waitFor(() => expect(requestGateway).toHaveBeenCalledWith('prompt.submit', expect.anything(), expect.anything()))
+    await vi.waitFor(() =>
+      expect(requestGateway).toHaveBeenCalledWith('prompt.submit', expect.anything(), expect.anything())
+    )
     // The gateway reports the original turn live while the second submit is pending.
     handle!.replaceState({ ...states.at(-1), busy: true, awaitingResponse: true, turnLive: true, streamId: 'original' })
     rejectSubmit(new Error('4009: session busy'))
@@ -2585,9 +2587,9 @@ describe('usePromptActions redirectPrompt', () => {
 
     expect(await handle!.redirectPrompt('reconnect nudge')).toBe(true)
     expect(calls.map(c => c.method)).toEqual(['session.redirect', 'session.resume', 'session.redirect'])
-    expect(calls[0]?.params).toEqual({ session_id: RUNTIME_SESSION_ID, text: 'reconnect nudge' })
-    expect(calls[1]?.params).toEqual({ session_id: STORED_SESSION_ID, source: 'desktop', omit_messages: true })
-    expect(calls[2]?.params).toEqual({ session_id: RECOVERED_SESSION_ID, text: 'reconnect nudge' })
+    expect(calls[0]?.params).toMatchObject({ session_id: RUNTIME_SESSION_ID, text: 'reconnect nudge' })
+    expect(calls[1]?.params).toMatchObject({ session_id: STORED_SESSION_ID, source: 'desktop', omit_messages: true })
+    expect(calls[2]?.params).toMatchObject({ session_id: RECOVERED_SESSION_ID, text: 'reconnect nudge' })
     expect(handle!.activeSessionIdRef.current).toBe(RECOVERED_SESSION_ID)
   })
 })
@@ -2631,13 +2633,13 @@ describe('usePromptActions restoreToMessage', () => {
     // drops that turn and everything after, then runs the same text again.
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
-      {
+      expect.objectContaining({
         session_id: RUNTIME_SESSION_ID,
         text: 'first prompt',
         confirm_truncate: true,
         truncate_before_message_id: 'u1',
         confirm_empty_truncate: true
-      },
+      }),
       1_800_000
     )
     expect((lastState.messages as { id: string }[]).map(m => m.id)).toEqual(['u1'])
@@ -2700,13 +2702,13 @@ describe('usePromptActions restoreToMessage', () => {
     expect(submitAttempts).toBe(2)
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
-      {
+      expect.objectContaining({
         session_id: RUNTIME_SESSION_ID,
         text: 'first prompt',
         confirm_truncate: true,
         truncate_before_message_id: 'u1',
         confirm_empty_truncate: true
-      },
+      }),
       1_800_000
     )
   })
@@ -2747,13 +2749,13 @@ describe('usePromptActions restoreToMessage', () => {
 
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
-      {
+      expect.objectContaining({
         session_id: RUNTIME_SESSION_ID,
         text: 'first prompt',
         confirm_truncate: true,
         truncate_before_message_id: 'u1',
         confirm_empty_truncate: true
-      },
+      }),
       1_800_000
     )
     expect((lastState.messages as { id: string }[]).map(m => m.id)).toEqual(['u1'])
@@ -2822,7 +2824,7 @@ describe('usePromptActions file attachment sync', () => {
       name: 'report.txt',
       data_url: 'data:text/plain;base64,aGVsbG8='
     })
-    expect(calls[1]?.params).toEqual({
+    expect(calls[1]?.params).toMatchObject({
       session_id: RUNTIME_SESSION_ID,
       text: '@file:.hermes/desktop-attachments/report.txt\n\nconvert this to epub'
     })
@@ -2876,7 +2878,7 @@ describe('usePromptActions file attachment sync', () => {
         session_id: RUNTIME_SESSION_ID
       }
     })
-    expect(calls[1]).toEqual({
+    expect(calls[1]).toMatchObject({
       method: 'prompt.submit',
       params: { session_id: RUNTIME_SESSION_ID, text: '@file:.hermes/desktop-attachments/report.txt\n\nsummarize' }
     })
@@ -3254,7 +3256,7 @@ describe('usePromptActions file attachment sync', () => {
     expect(readFileDataUrl).not.toHaveBeenCalled()
     // Native Windows local mode shares the same path namespace.
     expect(calls[0]?.params).not.toHaveProperty('data_url')
-    expect(calls[1]).toEqual({
+    expect(calls[1]).toMatchObject({
       method: 'prompt.submit',
       params: { session_id: RUNTIME_SESSION_ID, text: '@file:data/report.txt\n\nsummarize' }
     })
@@ -3334,7 +3336,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
     vi.restoreAllMocks()
   })
 
-  it('resumes the stored session and retries once when prompt.submit reports "session not found"', async () => {
+  it('does not re-home or replay when prompt.submit reports "session not found"', async () => {
     // After sleep/wake the gateway's in-memory session table is cleared, so the
     // first prompt.submit with the stale runtime id fails. The hook resumes the
     // durable stored id (which survives gateway restarts), gets a fresh live id,
@@ -3374,14 +3376,11 @@ describe('usePromptActions sleep/wake session recovery', () => {
 
     const ok = await handle!.submitText('message after wake')
 
-    expect(ok).toBe(true)
-    // First submit (stale id) → session.resume (stored id) → retry submit (fresh id).
-    expect(calls.map(c => c.method)).toEqual(['prompt.submit', 'session.resume', 'prompt.submit'])
-    expect(calls[1]?.params).toEqual({ session_id: STORED_SESSION_ID, source: 'desktop', omit_messages: true })
-    expect(calls[2]?.params).toEqual({ session_id: RECOVERED_SESSION_ID, text: 'message after wake' })
+    expect(ok).toBe(false)
+    expect(calls.map(c => c.method)).toEqual(['prompt.submit'])
   })
 
-  it('resumes the stored session and retries once when reloadFromMessage (regenerate) reports "session not found"', async () => {
+  it('does not re-home or replay when reloadFromMessage (regenerate) reports "session not found"', async () => {
     // reloadFromMessage builds its own prompt.submit call inline instead of
     // going through the shared send() path submitText/redirectPrompt use, so
     // it needs the same sleep/wake recovery independently — otherwise
@@ -3432,12 +3431,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
 
     await handle!.reloadFromMessage('u1')
 
-    // First submit (stale id) → session.resume (stored id) → retry submit (fresh id).
-    expect(calls.map(c => c.method)).toEqual(['prompt.submit', 'session.resume', 'prompt.submit'])
-    expect(calls[1]?.params).toEqual({ session_id: STORED_SESSION_ID, source: 'desktop', omit_messages: true })
-    expect(calls[2]?.params).toEqual(
-      expect.objectContaining({ session_id: RECOVERED_SESSION_ID, text: 'original prompt' })
-    )
+    expect(calls.map(c => c.method)).toEqual(['prompt.submit'])
   })
 
   // #67603 (second symptom): a recovery resume must re-register on the session's
@@ -3479,14 +3473,8 @@ describe('usePromptActions sleep/wake session recovery', () => {
       />
     )
 
-    expect(await handle!.submitText('message after wake')).toBe(true)
-    expect(calls[1]?.params).toEqual({
-      session_id: STORED_SESSION_ID,
-      source: 'desktop',
-      omit_messages: true,
-      profile: 'work'
-    })
-
+    expect(await handle!.submitText('message after wake')).toBe(false)
+    expect(calls.map(c => c.method)).toEqual(['prompt.submit'])
     setSessions(() => [])
   })
 
@@ -3531,14 +3519,8 @@ describe('usePromptActions sleep/wake session recovery', () => {
       />
     )
 
-    expect(await handle!.submitText('message after wake')).toBe(true)
-    expect(calls[1]?.params).toEqual({
-      session_id: STORED_SESSION_ID,
-      source: 'desktop',
-      omit_messages: true,
-      profile: 'work'
-    })
-
+    expect(await handle!.submitText('message after wake')).toBe(false)
+    expect(calls.map(c => c.method)).toEqual(['prompt.submit'])
     vi.mocked(getSession).mockReset()
     setSessions(() => [])
   })
@@ -3591,23 +3573,14 @@ describe('usePromptActions sleep/wake session recovery', () => {
       storedSessionId: STORED_SESSION_ID
     })
 
-    expect(ok).toBe(true)
-    expect(calls.map(c => c.method)).toEqual(['prompt.submit', 'session.resume', 'prompt.submit'])
-    expect(calls[0]?.params).toEqual({
+    expect(ok).toBe(false)
+    expect(calls.map(c => c.method)).toEqual(['prompt.submit'])
+    expect(calls[0]?.params).toMatchObject({
       queued: true,
       session_id: 'rt-background-stale',
       text: 'queued background message after wake'
     })
-    expect(calls[1]?.params).toEqual({
-      session_id: STORED_SESSION_ID,
-      source: 'desktop',
-      omit_messages: true
-    })
-    expect(calls[2]?.params).toEqual({
-      queued: true,
-      session_id: RECOVERED_SESSION_ID,
-      text: 'queued background message after wake'
-    })
+    expect(calls.map(c => c.method)).toEqual(['prompt.submit'])
     expect(handle!.activeSessionIdRef.current).toBe(RUNTIME_SESSION_ID)
   })
 
@@ -4298,7 +4271,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
     expect(ok).toBe(true)
     expect(createBackendSessionForSend).not.toHaveBeenCalled()
     expect(calls.map(c => c.method)).toEqual(['session.resume', 'prompt.submit'])
-    expect(calls[0]?.params).toEqual({
+    expect(calls[0]?.params).toMatchObject({
       session_id: STORED_SESSION_ID,
       source: 'desktop',
       omit_messages: true
@@ -4379,7 +4352,10 @@ describe('usePromptActions sleep/wake session recovery', () => {
     expect(createBackendSessionForSend).not.toHaveBeenCalled()
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
-      { session_id: RECOVERED_SESSION_ID, text: 'follow-up while the profile route is rebinding' },
+      expect.objectContaining({
+        session_id: RECOVERED_SESSION_ID,
+        text: 'follow-up while the profile route is rebinding'
+      }),
       1_800_000
     )
   })
@@ -4417,7 +4393,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
     expect(resumeStoredSession).toHaveBeenCalledWith(STORED_SESSION_ID)
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
-      { session_id: RECOVERED_SESSION_ID, text: 'stay in the routed profile session' },
+      expect.objectContaining({ session_id: RECOVERED_SESSION_ID, text: 'stay in the routed profile session' }),
       1_800_000
     )
   })
@@ -4449,7 +4425,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
     expect(resumeStoredSession).not.toHaveBeenCalled()
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
-      { session_id: RECOVERED_SESSION_ID, text: 'normal follow-up' },
+      expect.objectContaining({ session_id: RECOVERED_SESSION_ID, text: 'normal follow-up' }),
       1_800_000
     )
   })
@@ -4506,7 +4482,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
     expect(await handle!.submitText('retry after recovery')).toBe(true)
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
-      { session_id: RECOVERED_SESSION_ID, text: 'retry after recovery' },
+      expect.objectContaining({ session_id: RECOVERED_SESSION_ID, text: 'retry after recovery' }),
       1_800_000
     )
   })
@@ -4757,16 +4733,12 @@ describe('usePromptActions submit session-context isolation (#54527)', () => {
     )
     await waitFor(() => expect(handle).not.toBeNull())
 
-    const submitting = handle!.submitText('message that must not land in session B')
-    await waitFor(() => expect(calls.some(c => c.method === 'session.resume')).toBe(true))
-    releaseResume()
-
-    expect(await submitting).toBe(false)
+    const accepted = await handle!.submitText('message that must not land in session B')
+    expect(accepted).toBe(false)
     expect(submitAttempts).toBe(1)
-    expect(calls.filter(c => c.method === 'prompt.submit')).toHaveLength(1)
-    expect(calls.find(c => c.method === 'session.resume')?.params).toMatchObject({
-      session_id: STORED_SESSION_A
-    })
+    expect(calls.map(c => c.method)).toEqual(['prompt.submit'])
+    expect(selectedStoredSessionIdRef.current).toBe(STORED_SESSION_A)
+    releaseResume()
   })
 
   it('submits the first prompt of a new chat — the create pipeline re-homing selection/route is not user drift', async () => {
@@ -4933,7 +4905,7 @@ describe('usePromptActions new-chat first-send delivery (#63078)', () => {
     expect(calls).toEqual([
       {
         method: 'prompt.submit',
-        params: { session_id: NEW_RUNTIME_ID, text: 'first message of a new chat' }
+        params: { session_id: NEW_RUNTIME_ID, text: 'first message of a new chat', input_event_id: expect.any(String) }
       }
     ])
   })
@@ -4989,10 +4961,10 @@ describe('usePromptActions new-chat first-send delivery (#63078)', () => {
     expect(await handle!.submitText('hello')).toBe(true)
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
-      {
+      expect.objectContaining({
         session_id: NEW_RUNTIME_ID,
         text: 'hello'
-      },
+      }),
       1_800_000
     )
   })
@@ -5286,7 +5258,11 @@ describe('usePromptActions busy-gateway churn tolerance (#64327)', () => {
       },
       {
         method: 'prompt.submit',
-        params: { session_id: RESUMED_RUNTIME_ID, text: 'deliver despite lagging local publication' }
+        params: {
+          session_id: RESUMED_RUNTIME_ID,
+          text: 'deliver despite lagging local publication',
+          input_event_id: expect.any(String)
+        }
       }
     ])
   })
@@ -5365,7 +5341,12 @@ describe('usePromptActions busy-gateway churn tolerance (#64327)', () => {
       },
       {
         method: 'prompt.submit',
-        params: { session_id: QUEUED_RUNTIME_ID, text: 'queued prompt for C', queued: true }
+        params: {
+          session_id: QUEUED_RUNTIME_ID,
+          text: 'queued prompt for C',
+          queued: true,
+          input_event_id: expect.any(String)
+        }
       }
     ])
     // No prompt or state write ever touches B, and no foreground

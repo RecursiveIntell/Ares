@@ -425,17 +425,16 @@ def test_bws_token_env_remap_non_suffix_stripped(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("token_name", ["MY_BWS_TOKEN", "VAULT_BOOTSTRAP_AUTH"])
-def test_bws_bootstrap_policy_failure_refuses_child(monkeypatch, token_name):
+def test_bws_bootstrap_policy_failure_refuses_child(tmp_path, monkeypatch, token_name):
     import hermes_cli.config as config_mod
 
-    def _raise():
-        raise RuntimeError("config unavailable")
-
-    monkeypatch.setattr(config_mod, "read_raw_config", _raise)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text("secrets: [unterminated\n")
     monkeypatch.setenv(token_name, "fake-bootstrap")
 
-    with pytest.raises(RuntimeError, match="Bitwarden token policy unavailable"):
+    with pytest.raises(config_mod.ConfigPolicyError) as error:
         build_subprocess_env()
+    assert error.value.status is config_mod.ConfigPolicyStatus.MALFORMED
 
 
 def test_plugin_strip_registry_failure_refuses_child(monkeypatch):

@@ -12,6 +12,7 @@ import atexit
 import datetime as _datetime
 import json
 import logging
+import math
 import os
 import queue
 import socket
@@ -128,7 +129,7 @@ def _correlation(kwargs: Mapping[str, Any]) -> dict[str, str | None]:
         "node_id": _bounded(kwargs.get("node_id")),
         "attempt_id": _bounded(kwargs.get("attempt_id")),
         "trial_id": _bounded(kwargs.get("trial_id")),
-        "request_id": _bounded(kwargs.get("api_request_id") or kwargs.get("tool_call_id")),
+        "request_id": _bounded(kwargs.get("api_request_id") or kwargs.get("tool_call_id") or kwargs.get("request_id")),
     }
 
 
@@ -163,22 +164,34 @@ def build_envelope(hook_name: str, kwargs: Mapping[str, Any], *, sequence: int) 
     for source, target in (
         ("model", "model"),
         ("provider", "provider"),
-        ("finish_reason", "error_category"),
+        ("error_category", "error_category"),
     ):
         value = _bounded(kwargs.get(source))
         if value is not None:
             timing[target] = value
-    for source, target in (
-        ("approx_input_tokens", "prompt_tokens"),
-        ("assistant_content_chars", "completion_tokens"),
-        ("api_call_count", "total_tokens"),
-    ):
-        value = kwargs.get(source)
-        if isinstance(value, int) and value >= 0:
-            timing[target] = value
-    duration = kwargs.get("api_duration") or kwargs.get("duration_ms")
-    if isinstance(duration, (int, float)) and duration >= 0:
-        timing["duration_ms"] = int(duration)
+    finish_reason = _bounded(kwargs.get("finish_reason"))
+    if finish_reason is not None:
+        payload["finish_reason"] = finish_reason
+    # Preserve different measurements under their actual names. Estimates,
+    # character counts and request counts are never provider token usage.
+    for name in ("approx_input_tokens", "assistant_content_chars", "api_call_count"):
+        value = kwargs.get(name)
+        if type(value) is int and value >= 0:
+            payload[name] = value
+    usage = kwargs.get("usage")
+    if isinstance(usage, Mapping):
+        for name in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            value = usage.get(name)
+            if type(value) is int and value >= 0:
+                timing[name] = value
+    # API hooks report seconds; tool hooks can report milliseconds. A real
+    # zero must not fall through to a different field or scope.
+    seconds = kwargs.get("api_duration")
+    duration = seconds if seconds is not None else kwargs.get("duration_ms")
+    if type(duration) in (int, float) and duration >= 0 and math.isfinite(duration):
+        milliseconds = duration * 1000 if seconds is not None else duration
+        if math.isfinite(milliseconds):
+            timing["duration_ms"] = round(milliseconds)
 
     return {
         "schema_version": 1,
@@ -287,8 +300,9 @@ class _Producer:
 
 _PRODUCER: _Producer | None = None
 _PRODUCER_LOCK = threading.Lock()
-_OPEN_EVENTS: dict[tuple[str, str, str], dict[str, Any]] = {}
-_SESSION_COUNTS: dict[str, dict[str, int]] = {}
+_EVENTS_LOCK = threading.RLock()
+_OPEN_EVENTS: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+_SESSION_COUNTS: dict[tuple[str, str], dict[str, int]] = {}
 
 
 def _producer() -> _Producer | None:
@@ -321,55 +335,58 @@ def observe_lifecycle(hook_name: str, **kwargs: Any) -> None:
     if producer is None:
         return
     session_id = _bounded(kwargs.get("session_id")) or ""
+    run_id = _bounded(kwargs.get("run_id") or kwargs.get("task_id")) or ""
     request_id = _bounded(kwargs.get("api_request_id") or kwargs.get("tool_call_id")) or ""
-    if hook_name in {"pre_api_request", "pre_tool_call"} and request_id:
-        kind, _ = _kind_status(hook_name, kwargs)
-        counts = _SESSION_COUNTS.setdefault(
-            session_id,
-            {"started_llm": 0, "terminal_llm": 0, "started_tool": 0, "terminal_tool": 0},
-        )
-        counts[f"started_{'llm' if kind == 'llm_call' else 'tool'}"] += 1
-        _OPEN_EVENTS[(session_id, request_id, kind)] = {
-            "session_id": session_id,
-            "request_id": request_id,
-            "gap_kind": kind,
-            "missing_terminal_hook": (
-                "post_api_request" if kind == "llm_call" else "post_tool_call"
-            ),
-        }
-    elif hook_name in {"post_api_request", "api_request_error", "post_tool_call"} and request_id:
-        kind, _ = _kind_status(hook_name, kwargs)
-        counts = _SESSION_COUNTS.setdefault(
-            session_id,
-            {"started_llm": 0, "terminal_llm": 0, "started_tool": 0, "terminal_tool": 0},
-        )
-        counts[f"terminal_{'llm' if kind == 'llm_call' else 'tool'}"] += 1
-        _OPEN_EVENTS.pop((session_id, request_id, kind), None)
-    if hook_name == "on_session_end":
-        kwargs = dict(kwargs)
-        kwargs["coverage"] = _SESSION_COUNTS.pop(
-            session_id,
-            {"started_llm": 0, "terminal_llm": 0, "started_tool": 0, "terminal_tool": 0},
-        )
-        pending_items = [
-            (key, pending)
-            for key, pending in _OPEN_EVENTS.items()
-            if key[0] == session_id
-        ]
-        if not pending_items:
-            # Some legacy/transport paths finalize without forwarding the
-            # session identity on every hook. Do not lose a known open event;
-            # close it as an explicitly unmatched terminal observation.
-            pending_items = list(_OPEN_EVENTS.items())
-        for key, pending in pending_items:
-            producer.emit(
-                build_envelope(
-                    "terminal_observation_gap",
-                    pending,
-                    sequence=producer.next_sequence(),
-                )
+    owner = (session_id, run_id)
+    pending_items = []
+    with _EVENTS_LOCK:
+        if hook_name in {"pre_api_request", "pre_tool_call"} and request_id:
+            kind, _ = _kind_status(hook_name, kwargs)
+            counts = _SESSION_COUNTS.setdefault(
+                owner,
+                {"started_llm": 0, "terminal_llm": 0, "started_tool": 0, "terminal_tool": 0},
             )
-            _OPEN_EVENTS.pop(key, None)
+            counts[f"started_{'llm' if kind == 'llm_call' else 'tool'}"] += 1
+            _OPEN_EVENTS[(*owner, request_id, kind)] = {
+                "session_id": session_id,
+                "run_id": run_id,
+                "request_id": request_id,
+                "gap_kind": kind,
+                "missing_terminal_hook": (
+                    "post_api_request" if kind == "llm_call" else "post_tool_call"
+                ),
+            }
+        elif hook_name in {"post_api_request", "api_request_error", "post_tool_call"} and request_id:
+            kind, _ = _kind_status(hook_name, kwargs)
+            counts = _SESSION_COUNTS.setdefault(
+                owner,
+                {"started_llm": 0, "terminal_llm": 0, "started_tool": 0, "terminal_tool": 0},
+            )
+            counts[f"terminal_{'llm' if kind == 'llm_call' else 'tool'}"] += 1
+            _OPEN_EVENTS.pop((*owner, request_id, kind), None)
+        if hook_name == "on_session_end":
+            kwargs = dict(kwargs)
+            kwargs["coverage"] = _SESSION_COUNTS.pop(
+                owner,
+                {"started_llm": 0, "terminal_llm": 0, "started_tool": 0, "terminal_tool": 0},
+            )
+            # Missing ownership never grants authority to close a sibling's
+            # span. Modern finalizers carry task_id; legacy unscoped hooks
+            # can only settle events that were unscoped to begin with.
+            pending_items = [
+                (key, pending)
+                for key, pending in _OPEN_EVENTS.items()
+                if key[:2] == owner
+            ]
+            for key, _pending in pending_items:
+                _OPEN_EVENTS.pop(key, None)
+    for _key, pending in pending_items:
+        producer.emit(
+            build_envelope(
+                "terminal_observation_gap", pending,
+                sequence=producer.next_sequence(),
+            )
+        )
     producer.emit(
         build_envelope(
             hook_name,
@@ -393,7 +410,11 @@ def shutdown() -> None:
     global _PRODUCER
     with _PRODUCER_LOCK:
         if _PRODUCER is not None:
-            for key, pending in list(_OPEN_EVENTS.items()):
+            with _EVENTS_LOCK:
+                pending_items = list(_OPEN_EVENTS.values())
+                _OPEN_EVENTS.clear()
+                _SESSION_COUNTS.clear()
+            for pending in pending_items:
                 _PRODUCER.emit(
                     build_envelope(
                         "terminal_observation_gap",
@@ -401,7 +422,6 @@ def shutdown() -> None:
                         sequence=_PRODUCER.next_sequence(),
                     )
                 )
-                _OPEN_EVENTS.pop(key, None)
             _PRODUCER.flush()
             _PRODUCER.close()
             _PRODUCER = None

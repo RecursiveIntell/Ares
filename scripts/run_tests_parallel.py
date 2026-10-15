@@ -42,15 +42,18 @@ Exit code: 0 if every file's pytest exited 0; 1 otherwise.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, Future
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -309,6 +312,7 @@ def _run_one_file(
     repo_root: Path,
     file_timeout: float,
     retries: int = 0,
+    evidence_dir: Path | None = None,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Run ``python -m pytest <file> <pytest_args>`` in a fresh subprocess.
 
@@ -342,16 +346,20 @@ def _run_one_file(
     orphan onto PID 1. This outer timeout exists only to
     bound a pathologically slow or hung file as a whole.
     """
-    file, rc, output, summary, subproc_wall = _run_one_file_once(
-        file, pytest_args, repo_root, file_timeout
-    )
+    def run_attempt(attempt: int):
+        if evidence_dir is None:
+            return _run_one_file_once(file, pytest_args, repo_root, file_timeout)
+        return _run_one_file_once(
+            file, pytest_args, repo_root, file_timeout,
+            evidence_dir=evidence_dir, attempt=attempt,
+        )
+
+    file, rc, output, summary, subproc_wall = run_attempt(1)
     attempt = 0
     while rc != 0 and attempt < retries:
         attempt += 1
         first_output = output
-        file, rc, output, summary, subproc_wall2 = _run_one_file_once(
-            file, pytest_args, repo_root, file_timeout
-        )
+        file, rc, output, summary, subproc_wall2 = run_attempt(attempt + 1)
         subproc_wall += subproc_wall2
         if rc == 0:
             output = (
@@ -378,9 +386,19 @@ def _run_one_file_once(
     pytest_args: List[str],
     repo_root: Path,
     file_timeout: float,
+    *,
+    evidence_dir: Path | None = None,
+    attempt: int = 1,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
     cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
+    attempt_dir = None
+    test_digest = None
+    if evidence_dir is not None:
+        attempt_dir = evidence_dir / _evidence_file_key(file) / f"attempt-{attempt:03d}"
+        attempt_dir.mkdir(parents=True, exist_ok=False)
+        test_digest = hashlib.sha256(file.read_bytes()).hexdigest()
+        cmd.append(f"--junitxml={attempt_dir / 'junit.xml'}")
 
     # Give this subprocess its own pytest temp root.
     #
@@ -432,15 +450,19 @@ def _run_one_file_once(
         except (ProcessLookupError, PermissionError):
             pgid = None
 
+    timed_out = False
     try:
         output, _ = proc.communicate(timeout=file_timeout)
+        captured_output = output
         rc = proc.returncode
     except subprocess.TimeoutExpired:
+        timed_out = True
         _kill_tree(proc, pgid=pgid)
         try:
             output, _ = proc.communicate(timeout=10)
         except subprocess.TimeoutExpired:
             output = "(file timeout exceeded; output unavailable)"
+        captured_output = output
         rc = 124  # de facto convention for "killed by timeout".
         output = (
             f"({file_timeout:.0f}s exceeded; "
@@ -463,6 +485,7 @@ def _run_one_file_once(
         # runner over one suite.
         shutil.rmtree(temproot, ignore_errors=True)
 
+    pytest_return_code = proc.returncode
     if rc == 5:
         # No tests collected in THIS file — legitimate per-file: a
         # platform-gated or fully-marker-filtered file (e.g. a win32-only
@@ -473,7 +496,80 @@ def _run_one_file_once(
         rc = 0
     summary = _parse_pytest_summary(output)
     subproc_wall = time.monotonic() - subproc_start
+    if attempt_dir is not None:
+        stdout = attempt_dir / "stdout.log"
+        with stdout.open("x", encoding="utf-8") as stream:
+            stream.write(captured_output)
+        junit = attempt_dir / "junit.xml"
+        junit_error = None
+        try:
+            ET.parse(junit)
+        except (OSError, ET.ParseError) as exc:
+            junit_error = type(exc).__name__
+        after_digest = hashlib.sha256(file.read_bytes()).hexdigest() if file.is_file() else None
+        _write_evidence_json(attempt_dir / "receipt.json", {
+            "schema": "hermes.test-attempt-evidence/v1",
+            "file": _format_file(file, repo_root), "attempt": attempt,
+            "command": cmd, "cwd": str(repo_root),
+            "pytest_return_code": pytest_return_code, "runner_return_code": rc,
+            "timed_out": timed_out, "wall_seconds": subproc_wall,
+            "parsed_summary": summary,
+            "test_sha256_before": test_digest, "test_sha256_after": after_digest,
+            "stdout": _evidence_artifact(stdout, evidence_dir),
+            "stdout_encoding": "combined stdout/stderr decoded as UTF-8 with replacement",
+            "junit": _evidence_artifact(junit, evidence_dir) if junit.is_file() else None,
+            "junit_error": junit_error,
+            "attempt_completed": not timed_out and pytest_return_code in {0, 1, 5}
+                and junit_error is None and test_digest == after_digest,
+            "effect_authorization": False,
+            "scope": "Raw attempt evidence, not case qualification or whole-source provenance",
+        })
     return file, rc, output, summary, subproc_wall
+
+
+def _evidence_file_key(file: Path) -> str:
+    return hashlib.sha256(str(file.resolve()).encode("utf-8")).hexdigest()
+
+
+def _evidence_artifact(path: Path, root: Path) -> dict:
+    return {"path": path.relative_to(root).as_posix(),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+
+def _write_evidence_json(path: Path, value: dict) -> None:
+    # Publish complete JSON without replacing an earlier observation. A failed
+    # write/link retains its staging artifact, never a truncated final manifest.
+    content = json.dumps(value, indent=2, sort_keys=True) + "\n"
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False,
+                                     dir=path.parent, prefix=path.name + ".pending-") as stream:
+        staged = Path(stream.name)
+        stream.write(content)
+    os.link(staged, path)
+    staged.unlink()
+
+
+def _finish_evidence(root: Path, files: List[Path], return_code: int) -> bool:
+    references = []
+    for file in files:
+        attempts = sorted((root / _evidence_file_key(file)).glob("attempt-*"))
+        if not attempts:
+            return False
+        for attempt in attempts:
+            receipt = attempt / "receipt.json"
+            if not receipt.is_file():
+                return False
+            record = json.loads(receipt.read_text(encoding="utf-8"))
+            if record["attempt_completed"] is not True:
+                return False
+            references.append(_evidence_artifact(receipt, root))
+    _write_evidence_json(root / "summary.json", {
+        "schema": "hermes.test-run-evidence/v1",
+        "runner_return_code": return_code, "attempt_receipts": references,
+        "requested_files": [str(file) for file in files],
+        "scope": "Completed attempts only; neither file PASS nor this summary qualifies a case",
+        "effect_authorization": False,
+    })
+    return True
 
 
 def _parse_pytest_summary(output: str) -> dict[str, int]:
@@ -860,6 +956,11 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--evidence-dir",
+        type=Path,
+        help="Fresh directory for exclusive per-attempt stdout/JUnit/exit evidence (not qualification)",
+    )
+    parser.add_argument(
         "paths_positional",
         nargs="*",
         metavar="PATH",
@@ -887,7 +988,7 @@ def main() -> int:
     # (``-k=expr``, ``--tb=long``) are self-contained and need no lookahead.
     OUR_FLAGS = {
         "-j", "--jobs", "--paths", "--include-integration",
-        "--file-timeout", "--file-retries", "--slice", "--generate-slices", "--files",
+        "--file-timeout", "--file-retries", "--slice", "--generate-slices", "--files", "--evidence-dir",
     }
     # pytest short flags that consume the NEXT token as their value.
     PYTEST_VALUE_FLAGS = {"-k", "-m", "-p", "-o", "-c", "-r", "-W"}
@@ -990,9 +1091,10 @@ def main() -> int:
     repo_root = Path(__file__).resolve().parent.parent
 
     # --files: explicit file list from the CI generate job — skip discovery.
-    if args.files:
+    if args.files is not None:
         files = [repo_root / f for f in _split_pathspec(args.files)]
         roots = []
+        requested = files
     else:
         # Resolve discovery roots: positional path args override --paths if any
         # were supplied, otherwise --paths (which itself defaults to 'tests').
@@ -1006,6 +1108,24 @@ def main() -> int:
             global _SKIP_PARTS  # noqa: PLW0603 — config knob
             _SKIP_PARTS = set()
 
+        requested = roots
+
+    # A partial requested suite is not success. Check the entire admission
+    # set before discovery, slice generation, counting or worker creation.
+    invalid = False
+    for path in requested:
+        if not path.exists():
+            print(f"error: TEST_REQUESTED_PATH_MISSING: {path}", file=sys.stderr)
+            invalid = True
+        elif args.files is not None and not path.is_file():
+            print(f"error: TEST_REQUESTED_FILE_INVALID: {path}", file=sys.stderr)
+            invalid = True
+        elif not path.is_file() and not path.is_dir():
+            print(f"error: TEST_REQUESTED_PATH_INVALID: {path}", file=sys.stderr)
+            invalid = True
+    if invalid:
+        return 2
+    if args.files is None:
         files = _discover_files(roots)
 
     if not files:
@@ -1043,6 +1163,29 @@ def main() -> int:
         # Recount after slicing.
         test_counts = {f: test_counts[f] for f in files if f in test_counts}
         approx_total_tests = sum(test_counts.values())
+
+    if args.evidence_dir is not None:
+        # Validate conflicts before claiming the destination or admitting any worker.
+        options = pytest_passthrough + shlex.split(os.environ.get("PYTEST_ADDOPTS", ""))
+        if any(option.split("=", 1)[0] in {"--junitxml", "--junit-xml"} for option in options):
+            print("error: TEST_EVIDENCE_JUNIT_CONFLICT", file=sys.stderr)
+            return 2
+        if len({_evidence_file_key(file) for file in files}) != len(files):
+            print("error: TEST_EVIDENCE_DUPLICATE_FILE", file=sys.stderr)
+            return 2
+        args.evidence_dir = args.evidence_dir.absolute()
+        try:
+            args.evidence_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
+        except OSError as exc:
+            print(f"error: TEST_EVIDENCE_DIRECTORY_NOT_FRESH: {exc}", file=sys.stderr)
+            return 2
+        _write_evidence_json(args.evidence_dir / "started.json", {
+            "schema": "hermes.test-run-evidence-start/v1",
+            "argv": sys.argv[1:], "cwd": str(repo_root),
+            "requested_files": [str(file) for file in files],
+            "python_executable": sys.executable, "python_version": sys.version,
+            "effect_authorization": False,
+        })
 
     if roots:
         roots_str = [str(r.relative_to(repo_root)) if r.is_relative_to(repo_root) else str(r) for r in roots]
@@ -1129,9 +1272,11 @@ def main() -> int:
         futures: List[Future] = []
         for file in files:
             t0 = time.monotonic()
+            evidence_kwargs = {"evidence_dir": args.evidence_dir} if args.evidence_dir is not None else {}
             fut = pool.submit(
                 _run_one_file, file, pytest_passthrough, repo_root,
                 args.file_timeout, args.file_retries,
+                **evidence_kwargs,
             )
             fut.add_done_callback(lambda f, file=file, t0=t0: _on_done(file, t0, f))
             futures.append(fut)
@@ -1142,6 +1287,11 @@ def main() -> int:
             fut.result() if fut.exception() is None else None
 
     elapsed = time.monotonic() - started
+    evidence_incomplete = False
+    if args.evidence_dir is not None:
+        evidence_incomplete = not _finish_evidence(args.evidence_dir, files, 1 if failures or tests_collected == 0 else 0)
+        if evidence_incomplete:
+            print("=== ✗ INCOMPLETE EVIDENCE — retained attempts; no summary manifest. ===")
     print()
     pct = min(100, (tests_done / approx_total_tests * 100)) if approx_total_tests else 0
     skipped_note = f", {tests_skipped} skipped" if tests_skipped else ""
@@ -1255,7 +1405,7 @@ def main() -> int:
                 print(f"  {_format_file(file, repo_root)}")
         return 1
 
-    if no_tests_ran_at_all:
+    if no_tests_ran_at_all or evidence_incomplete:
         return 1
 
     return 0

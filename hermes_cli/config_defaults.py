@@ -2065,6 +2065,7 @@ DEFAULT_CONFIG = {
         # budget still applies.
         "max_summary_chars": 24000,
 
+        "child_timeout_mode": "total",  # explicit compatibility mode; no implicit inactivity migration
         "child_timeout_seconds": 0,  # optional wall-clock cap per child agent. 0 (default)
                                      # = no timeout: children fail only from real errors
                                      # (API, tools, iteration budget), never a delegation

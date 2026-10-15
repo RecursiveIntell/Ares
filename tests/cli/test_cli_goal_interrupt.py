@@ -185,8 +185,10 @@ class TestHealthyTurnStillRuns:
         queued = cli._pending_input.get_nowait()
         assert "Continuing toward your standing goal" in queued.text
         assert queued.display_kind == "internal_notification"
-        assert queued.display_metadata == {
-            "synthetic_source": "goal_continuation",
+        assert queued.display_metadata["synthetic_source"] == "goal_continuation"
+        assert queued.display_metadata["goal_continuation"] == {
+            "goal_id": mgr.state.goal_id, "checkpoint_revision": mgr.state.checkpoint_revision,
+            "continuation_token": mgr.state.continuation_token,
         }
         assert mgr.state.status == "active"
 
@@ -205,7 +207,7 @@ class TestHealthyTurnStillRuns:
             cli._maybe_continue_goal_after_turn()
 
         assert cli._pending_input.empty()
-        assert mgr.state.status == "active"
+        assert mgr.state.status == "paused"
         assert mgr.state.outcome == "WAITING_FOR_AUTHORITY"
 
 

@@ -154,8 +154,21 @@ const todoToItem = (t: TodoItem): ComposerStatusItem => ({
   type: 'todo'
 })
 
-const goalToItem = (goal: { detail?: string; status: GoalStatus; title: string }): ComposerStatusItem => ({
-  currentTool: goal.detail,
+const goalToItem = (goal: {
+  detail?: string
+  nextAction?: string
+  turnsUsed?: number
+  maxTurns?: number
+  status: GoalStatus
+  title: string
+}): ComposerStatusItem => ({
+  currentTool: [
+    goal.detail,
+    goal.nextAction,
+    goal.turnsUsed !== undefined ? `${goal.turnsUsed}/${goal.maxTurns}` : undefined
+  ]
+    .filter(Boolean)
+    .join(' · '),
   goalStatus: goal.status,
   id: 'goal:standing',
   state: goal.status === 'active' || goal.status === 'waiting' ? 'running' : 'done',
