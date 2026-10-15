@@ -1155,6 +1155,8 @@ def _(rid, params: dict) -> dict:
         # Save-first remains intact; a native fallback may replace the leaf
         # inside this occurrence's private directory without affecting peers.
         saved = save_clipboard_image(img_path)
+        if saved:
+            img_path = _publish_staged_attachment(img_path, img_dir)
     except Exception as exc:
         if img_path is not None:
             _discard_staged_attachment(img_path)

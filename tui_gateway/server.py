@@ -16612,6 +16612,39 @@ def _discard_staged_attachment(path: Path) -> None:
         logger.debug("Failed attachment staging directory retained", exc_info=True)
 
 
+def _publish_staged_attachment(stage: Path, root: Path) -> Path:
+    """Expose complete staging bytes at a flat, atomic, no-clobber path.
+
+    This is not a native input ACK. Profile-root symlinks are resolved once;
+    the private occurrence must belong to that root and be a regular file.
+    Unsupported hard links fail rather than degrading to partial direct writes.
+    """
+    import stat
+    import uuid
+
+    root = root.resolve(strict=True)
+    if (stage.parent.is_symlink() or stage.parent.parent.resolve(strict=True) != root
+            or not stage.parent.name.startswith("stage-")
+            or not stat.S_ISREG(stage.lstat().st_mode)):
+        raise ValueError("attachment stage does not belong to the selected profile root")
+    stage = stage.parent.resolve(strict=True) / stage.name
+    stage.chmod(0o600)
+    suffix = "".join(Path(stage.name).suffixes)
+    stem = stage.name[:-len(suffix)] if suffix else stage.name
+    for attempt in range(16):
+        name = stage.name if attempt == 0 else f"{stem}-{uuid.uuid4().hex}{suffix}"
+        target = root / name
+        try:
+            os.link(stage, target, follow_symlinks=False)
+        except FileExistsError:
+            continue
+        # Publication is committed. Failure to remove private staging residue
+        # cannot undo the root artifact or turn this into an RPC failure.
+        _discard_staged_attachment(stage)
+        return target
+    raise FileExistsError("attachment publication collision budget exhausted")
+
+
 def _queue_attached_image(session: dict, img_bytes: bytes, ext: str, *, prefix: str,
                           queue: bool = True) -> Path:
     """Write image bytes into the gateway's images dir and queue them.
@@ -16628,6 +16661,10 @@ def _queue_attached_image(session: dict, img_bytes: bytes, ext: str, *, prefix: 
         img_path = _new_staged_attachment_path(img_dir, f"{prefix}_{ts}_{session['image_counter']}{ext}")
         with img_path.open("xb") as output:
             output.write(img_bytes)
+        # PDF batches own their own admission/rollback; their queue=False
+        # occurrences remain private until the batch owner publishes them.
+        if queue:
+            img_path = _publish_staged_attachment(img_path, img_dir)
     except BaseException:
         if img_path is not None:
             _discard_staged_attachment(img_path)
@@ -16781,10 +16818,11 @@ def _stage_session_file_attachment(
     try:
         with target.open("xb") as output:
             output.write(payload)
+        published = _publish_staged_attachment(target, upload_dir)
     except BaseException:
         _discard_staged_attachment(target)
         raise
-    return target.resolve(), True
+    return published, True
 
 
 # ── Methods: respond ─────────────────────────────────────────────────
