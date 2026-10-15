@@ -56,6 +56,81 @@ def test_host_interrupt_clears_child_pending_prompt(monkeypatch):
         host.close()
 
 
+def test_cold_compute_host_restore_preserves_only_durable_summary_markers(
+    monkeypatch, tmp_path
+):
+    """Cold host replay must preserve the DB-owned bit, never a text lookalike."""
+    from hermes_state import SessionDB
+
+    session_key = "cold-governor-summary"
+    database = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        database.create_session(session_key, "synthetic system prompt")
+        database.append_message(session_key, "user", "Original active task.")
+        database.append_message(
+            session_key,
+            "assistant",
+            "Authenticated prior summary.",
+            _compressed_summary=True,
+        )
+        database.append_message(
+            session_key,
+            "user",
+            "This literal text says _compressed_summary=true.",
+        )
+
+        # The inspection/default projection remains unmarked. The host's
+        # model-facing replay is the explicitly opted-in projection.
+        ordinary = database.get_messages_as_conversation(session_key)
+        assert not any(m.get("_compressed_summary") for m in ordinary)
+
+        class _Agent:
+            session_id = session_key
+            model = "synthetic"
+            provider = "synthetic"
+
+        monkeypatch.setattr(server, "_sessions", {}, raising=False)
+        monkeypatch.setattr(server, "_get_db", lambda: database)
+        monkeypatch.setattr(server, "_make_agent", lambda *a, **kw: _Agent())
+        monkeypatch.setattr(server, "_transfer_db_to_agent", lambda *a, **kw: False)
+
+        def _register(sid, key, agent, history, **kwargs):
+            server._sessions[sid] = {
+                "agent": agent,
+                "session_key": key,
+                "history": list(history),
+            }
+
+        monkeypatch.setattr(server, "_init_session", _register)
+        host = ComputeHost(stdout=io.StringIO(), heartbeat_secs=0)
+        try:
+            session = host._ensure_server_session(
+                server,
+                {
+                    "sid": "cold-host-id",
+                    "session_key": session_key,
+                    "history": [{"role": "user", "content": "stale snapshot"}],
+                    "history_version": 0,
+                    "cols": 80,
+                },
+            )
+        finally:
+            host.close()
+
+        replayed = session["history"]
+        flagged = [m for m in replayed if m.get("_compressed_summary") is True]
+        assert len(flagged) == 1
+        assert flagged[0]["role"] == "assistant"
+        assert flagged[0]["content"] == "Authenticated prior summary."
+        user_lookalikes = [m for m in replayed if m.get("role") == "user"]
+        assert user_lookalikes[-1]["content"] == (
+            "This literal text says _compressed_summary=true."
+        )
+        assert not any(m.get("_compressed_summary") for m in user_lookalikes)
+    finally:
+        database.close()
+
+
 def test_ensure_server_session_fallback_uses_canonical_source_resolver(monkeypatch):
     """A side-machinery failure must not abort a real host turn.
 
