@@ -1467,136 +1467,6 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             separated.append(message)
         return self._preserve_multimodal_tail(source_messages, separated)
 
-    def _compact_with_durable_replay_recovery(
-        self,
-        request: dict[str, Any],
-        messages: List[Dict[str, Any]],
-        source_messages: List[Dict[str, Any]],
-        metrics: Dict[str, Any],
-    ) -> tuple[dict[str, Any], dict[str, int] | None, List[Dict[str, Any]]]:
-        """Run compact-v2; on a live lineage mismatch retry once from durable rows.
-
-        The in-memory transcript can diverge from the SessionDB rows it was
-        persisted as (observed 2026-10-14: the live engine was refused with
-        ``lineage_integrity_mismatch`` for ~2h while the same session's
-        durable rows compacted cleanly). The durable rows are the session's
-        source of truth, so they are a legitimate input: Rust still verifies
-        the parent prefix exactly and the receipt chain as usual. Nothing
-        is relaxed. The retry runs at most once per compaction, and only
-        when every persisted live row is accounted for in SessionDB.
-        """
-        try:
-            response, continuation = self._compact_v2_candidate(request)
-            return response, continuation, source_messages
-        except ContextGovernorCommandError as exc:
-            if (
-                exc.code != "lineage_integrity_mismatch"
-                or metrics.get("durable_replay_recovery") is not None
-            ):
-                raise
-            recovered = self._durable_replay_source(messages)
-            if recovered is None:
-                metrics["durable_replay_recovery"] = "unavailable"
-                raise
-            recovered_source = self._without_host_todo_snapshots(recovered)
-            live_projection = request["messages"]
-            durable_projection = self._rehydrate_legacy_parent_prefix([
-                self._message_to_governor(m, i)
-                for i, m in enumerate(recovered_source)
-                if isinstance(m, dict)
-            ])
-            divergence = self._first_projection_divergence(
-                live_projection, durable_projection
-            )
-            if divergence is None:
-                # The live projection already equals the durable one, so a
-                # retry would be refused identically.
-                metrics["durable_replay_recovery"] = "identical"
-                raise
-            metrics["durable_replay_recovery"] = "attempted"
-            metrics["durable_replay_divergence"] = divergence
-            logger.warning(
-                "context-governor: live transcript diverged from SessionDB "
-                "(session=%s first_index=%s role=%s fields=%s live=%d durable=%d); "
-                "retrying compaction once from the durable rows",
-                self._governor_session_id(),
-                divergence["index"],
-                divergence["role"],
-                ",".join(divergence["fields"]),
-                len(live_projection),
-                len(durable_projection),
-            )
-            request["messages"] = durable_projection
-            response, continuation = self._compact_v2_candidate(request)
-            metrics["durable_replay_recovery"] = "recovered"
-            return response, continuation, recovered_source
-
-    def _durable_replay_source(
-        self, messages: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]] | None:
-        """Durable SessionDB rows plus the live tail not yet persisted.
-
-        Returns ``None`` unless the mapping is unambiguous: every live row
-        carrying ``_row_id`` exists in SessionDB, SessionDB holds no row
-        newer than the live transcript knows about, and unpersisted live
-        messages appear only as a trailing run.
-        """
-        session_db = getattr(self, "_session_db", None)
-        session_id = str(getattr(self, "session_id", "") or "")
-        getter = getattr(type(session_db), "get_messages_as_conversation", None)
-        if session_db is None or not session_id or not callable(getter):
-            return None
-        live = [m for m in messages if isinstance(m, dict)]
-        tail_start = len(live)
-        while tail_start > 0 and live[tail_start - 1].get("_row_id") is None:
-            tail_start -= 1
-        persisted, tail = live[:tail_start], live[tail_start:]
-        if not persisted or any(
-            m.get("_row_id") is None and m.get("role") != "system" for m in persisted
-        ):
-            return None
-        try:
-            durable = getter(
-                session_db,
-                session_id,
-                repair_alternation=False,
-                include_row_ids=True,
-                include_summary_markers=True,
-            )
-        except Exception:
-            return None
-        if not isinstance(durable, list) or not durable:
-            return None
-        durable_ids = {
-            m.get("_row_id") for m in durable if isinstance(m, dict)
-        }
-        live_ids = {m["_row_id"] for m in persisted if m.get("_row_id") is not None}
-        if not live_ids or not live_ids <= durable_ids:
-            return None
-        if max(i for i in durable_ids if isinstance(i, int)) > max(live_ids):
-            return None
-        head = [m for m in persisted if m.get("role") == "system" and m.get("_row_id") is None]
-        return copy.deepcopy(head + list(durable) + tail)
-
-    @staticmethod
-    def _first_projection_divergence(
-        live: List[Dict[str, Any]], durable: List[Dict[str, Any]]
-    ) -> Dict[str, Any] | None:
-        """Content-free location of the first live/durable difference."""
-        for index, (a, b) in enumerate(zip(live, durable)):
-            if a != b:
-                return {
-                    "index": index,
-                    "role": a.get("role") if isinstance(a, dict) else None,
-                    "fields": sorted(
-                        k for k in set(a) | set(b) if a.get(k) != b.get(k)
-                    ) if isinstance(a, dict) and isinstance(b, dict) else ["type"],
-                }
-        if len(live) != len(durable):
-            index = min(len(live), len(durable))
-            return {"index": index, "role": None, "fields": ["length"]}
-        return None
-
     def _compact_v2_candidate(
         self, request: dict[str, Any]
     ) -> tuple[dict[str, Any], dict[str, int] | None]:
@@ -1795,11 +1665,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         try:
             lineage_continuation = None
             for projection_attempt in range(2):
-                response, lineage_continuation, source_messages = (
-                    self._compact_with_durable_replay_recovery(
-                        request, messages, source_messages, metrics
-                    )
-                )
+                response, lineage_continuation = self._compact_v2_candidate(request)
                 pending_receipt, pending_receipt_id, compacted = (
                     self._project_compaction_candidate(response, source_messages)
                 )
@@ -2034,6 +1900,11 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
 
             return compacted or messages
         except Exception as exc:
+            if (
+                isinstance(exc, ContextGovernorCommandError)
+                and exc.code == "lineage_integrity_mismatch"
+            ):
+                metrics["durable_replay_recovery"] = "disabled_fail_closed"
             if self._pending_admission is not None:
                 try:
                     self.discard_pending_compression(reason="adapter_exception")
