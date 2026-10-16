@@ -12,15 +12,12 @@ authority.
 """
 from __future__ import annotations
 
-import ast
 import types
-from pathlib import Path
 
 import pytest
 
 from hermes_state import SessionDB
 
-REPO = Path(__file__).resolve().parents[2]
 SUMMARY = "Authenticated prior summary."
 LOOKALIKE = "This literal text says _compressed_summary=true."
 
@@ -142,73 +139,77 @@ def test_context_input_publication_reload_keeps_summary_marker(db):
     _assert_marker_contract(messages)
 
 
-# Restore owners whose result becomes the model-facing working conversation.
-# Display, export, rewind-comparison and trace readers are deliberately absent:
-# they keep the verbatim inspection projection.
-_MODEL_FACING_RESTORES = {
-    ("acp_adapter/session.py", "_restore"),
-    ("agent/context_input.py", "project_turn_inputs"),
-    ("agent/context_input.py", "complete_turn_inputs"),
-    ("gateway/session.py", "load_transcript"),
-    ("hermes_cli/cli_agent_setup_mixin.py", "_init_agent"),
-    ("run_agent.py", "run_conversation"),
-    ("tui_gateway/compute_host.py", "_ensure_server_session"),
-}
+class _RestoreObserved(BaseException):
+    """Stop before unrelated agent/provider construction, after the real DB read."""
 
 
-def _restore_calls(path: Path):
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    calls = []
-    stack = []
+def test_cli_init_resume_keeps_summary_marker(monkeypatch, db):
+    import cli
+    from hermes_cli import mcp_startup
+    from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
 
-    class _Visitor(ast.NodeVisitor):
-        def _fn(self, node):
-            stack.append(node.name)
-            self.generic_visit(node)
-            stack.pop()
+    _seed(db, "cli-session", source="cli")
+    noop = lambda *_a, **_k: None
+    monkeypatch.setattr(cli, "_prepare_deferred_agent_startup", noop)
+    monkeypatch.setattr(mcp_startup, "ensure_mcp_discovery_before_agent_build", noop)
 
-        visit_FunctionDef = visit_AsyncFunctionDef = _fn
+    def after_restore(*_a, **_k):
+        raise _RestoreObserved
 
-        def visit_Call(self, node):
-            func = node.func
-            if isinstance(func, ast.Attribute) and func.attr == "get_messages_as_conversation":
-                kwargs = {
-                    k.arg: (k.value.value if isinstance(k.value, ast.Constant) else None)
-                    for k in node.keywords
-                    if k.arg
-                }
-                calls.append((tuple(stack), node.lineno, kwargs))
-            self.generic_visit(node)
-
-    _Visitor().visit(tree)
-    return calls
+    cli_state = types.SimpleNamespace(
+        agent=None, _session_db=db, session_id="cli-session", _resumed=True,
+        conversation_history=[], tool_progress_mode="off", finalize_preloaded_skills=noop,
+        _install_tool_callbacks=noop, _ensure_tirith_security=noop,
+        _ensure_runtime_credentials=lambda: True,
+        _resume_history_limit_error=lambda **_k: None,
+        _restore_session_cwd=after_restore,
+    )
+    with pytest.raises(_RestoreObserved):
+        CLIAgentSetupMixin._init_agent(cli_state)
+    _assert_marker_contract(cli_state.conversation_history)
 
 
-def _source_files():
-    for path in sorted(REPO.rglob("*.py")):
-        rel = path.relative_to(REPO).as_posix()
-        if rel.startswith(("tests/", "website/", ".venv/", "node_modules/")) or "/node_modules/" in rel:
-            continue
-        if rel == "hermes_state.py":
-            continue
-        yield rel, path
+@pytest.mark.parametrize("existing_projection", [False, True])
+def test_context_input_projection_reloads_keep_summary_marker(monkeypatch, db, existing_projection):
+    from agent.context_input import project_turn_inputs
+
+    _seed(db, "project-session")
+    tail_id = db.get_messages_as_conversation("project-session", include_row_ids=True)[-1]["_row_id"]
+    receipt = types.SimpleNamespace(sequence=1)
+    # Native input admission is not under test here; its result selects the
+    # two reload branches. The transcript projection itself is real SessionDB.
+    monkeypatch.setattr(db, "read_context_input_work", lambda _s: {"receipts": [receipt]})
+    monkeypatch.setattr(db, "read_pending_context_inputs", lambda _s: ())
+    monkeypatch.setattr(db, "read_context_input_origin", lambda *_a: None)
+    monkeypatch.setattr(db, "begin_context_input_turn", lambda *_a, **_k: {"phase_id": "p"})
+    monkeypatch.setattr(db, "project_context_inputs_before", lambda *_a, **_k: {
+        "projection": {"row_id": tail_id} if existing_projection else None,
+        "inserted": not existing_projection,
+    })
+    agent = types.SimpleNamespace(session_id="project-session", _session_db=db)
+    history = project_turn_inputs(agent, receipt, holder="holder", conversation_history=[])
+    _assert_marker_contract(history)
+    if existing_projection:
+        assert agent._context_input_existing_message["_row_id"] == tail_id
+        assert all(m.get("_row_id") != tail_id for m in history)
 
 
-def test_model_facing_restores_request_summary_markers():
-    """Live-replay reads (repair_alternation=True) and known owners must opt in.
+def test_tui_eager_omit_resume_keeps_summary_marker(monkeypatch, db):
+    from tui_gateway import server
 
-    A repaired read is by contract a LIVE REPLAY restore (see
-    ``get_messages_as_conversation``), so it is model-facing wherever it lives;
-    the explicit owner list covers unrepaired model-facing reloads.
-    """
-    missing = []
-    for rel, path in _source_files():
-        text = path.read_text(encoding="utf-8", errors="replace")
-        if "get_messages_as_conversation" not in text:
-            continue
-        for scope, lineno, kwargs in _restore_calls(path):
-            owner = any((rel, name) in _MODEL_FACING_RESTORES for name in scope)
-            live_replay = kwargs.get("repair_alternation") is True
-            if (owner or live_replay) and kwargs.get("include_summary_markers") is not True:
-                missing.append(f"{rel}:{lineno} {'.'.join(scope)}")
-    assert not missing, "model-facing restores omit summary markers:\n" + "\n".join(missing)
+    _seed(db, "eager-session")
+    captured = []
+    load = db.get_messages_as_conversation
+
+    def observe_restore(*args, **kwargs):
+        captured.extend(load(*args, **kwargs))
+        raise _RestoreObserved
+
+    monkeypatch.setattr(db, "get_messages_as_conversation", observe_restore)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    with pytest.raises(_RestoreObserved):
+        server.handle_request({"id": "eager", "method": "session.resume", "params": {
+            "session_id": "eager-session", "omit_messages": True, "eager_build": True,
+        }})
+    _assert_marker_contract(captured)
