@@ -8941,6 +8941,7 @@ class AIAgent:
                         self.session_id,
                         repair_alternation=True,
                         include_row_ids=True,
+                        include_summary_markers=True,
                     )
 
                 self._ensure_db_session()
@@ -8965,7 +8966,8 @@ class AIAgent:
                         self.session_id = tip
                         task_context["session_id"] = tip
                         conversation_history = _turn_db.get_messages_as_conversation(
-                            tip, repair_alternation=False, include_row_ids=True)
+                            tip, repair_alternation=False, include_row_ids=True,
+                            include_summary_markers=True)
                     from agent.context_input import project_turn_inputs
                     conversation_history = project_turn_inputs(self, input_receipt,
                         holder=_durable_holder, conversation_history=conversation_history)
