@@ -6808,34 +6808,18 @@ def _load_service_tier() -> str | None:
 
 
 def _resolve_effective_fast_runtime(model: str, requested_tier: str | None) -> tuple[str | None, dict]:
-    """Resolve Fast intent to an effective tier and provider request fields.
+    """Use the core runtime owner's model-specific Fast projection."""
+    from agent.agent_runtime_helpers import resolve_fast_mode_runtime
 
-    The caller retains ``requested_tier`` in the session pin. Unsupported
-    models therefore run normally without destroying the preference for a
-    later supported model.
-    """
-    raw = str(requested_tier or "").strip().lower()
-    if raw not in {"priority", "fast", "on"}:
-        return None, {}
-    from hermes_cli.models import resolve_fast_mode_overrides
-
-    overrides = resolve_fast_mode_overrides(model)
-    if overrides is None:
-        return None, {}
-    if not isinstance(overrides, dict):
-        raise ValueError("invalid Fast capability result")
-    return "priority", dict(overrides)
+    return resolve_fast_mode_runtime(model, requested_tier)
 
 
-def _set_agent_fast_runtime(agent, effective_tier: str | None, fast_overrides: dict) -> str | None:
-    """Commit a pre-resolved Fast result without another capability lookup."""
-    request_overrides = dict(getattr(agent, "request_overrides", {}) or {})
-    request_overrides.pop("service_tier", None)
-    request_overrides.pop("speed", None)
-    request_overrides.update(fast_overrides)
-    agent.service_tier = effective_tier
-    agent.request_overrides = request_overrides
-    return effective_tier
+def _set_agent_fast_runtime(agent, effective_tier: str | None, fast_overrides: dict, *, requested_tier):
+    """Commit the preflight projection and synchronize core requested intent."""
+    from agent.agent_runtime_helpers import apply_fast_mode_runtime
+
+    return apply_fast_mode_runtime(agent, requested_tier, remember=True,
+                                   resolved=(effective_tier, fast_overrides))
 
 
 def _load_provider_routing() -> dict:
@@ -7217,6 +7201,13 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
             agent.service_tier = snapshot["service_tier"]
         if "request_overrides" in snapshot:
             agent.request_overrides = copy.deepcopy(snapshot["request_overrides"])
+        primary = getattr(agent, "_primary_runtime", None)
+        saved_primary = snapshot.get("primary_runtime")
+        if isinstance(primary, dict):
+            if isinstance(saved_primary, dict) and "service_tier_intent" in saved_primary:
+                primary["service_tier_intent"] = saved_primary["service_tier_intent"]
+            else:
+                primary.pop("service_tier_intent", None)
 
     primary = snapshot.get("primary_runtime")
     if primary and hasattr(agent, "_restore_primary_runtime"):
@@ -7561,7 +7552,7 @@ def _apply_model_switch(
 
             # Keep Fast intent in the session pin, but clear effective Fast
             # and its wire fields when the target model does not support it.
-            _set_agent_fast_runtime(agent, fast_tier, fast_overrides)
+            _set_agent_fast_runtime(agent, fast_tier, fast_overrides, requested_tier=requested_tier)
             _persist_live_session_runtime(session)
             _persist_live_session_system_prompt(session)
             _append_model_switch_marker(
@@ -7865,6 +7856,9 @@ def _sync_bot_capabilities(sid: str, session: dict) -> None:
                ("model", "provider", "api_key", "base_url", "api_mode")}
     reasoning = copy.deepcopy(getattr(agent, "reasoning_config", None))
     tier = getattr(agent, "service_tier", None) or ""
+    from agent.agent_runtime_helpers import get_fast_mode_intent
+
+    fast_intent = get_fast_mode_intent(agent)
     acp_command = getattr(agent, "acp_command", None)
     acp_args = list(getattr(agent, "acp_args", None) or [])
     native_captured = False
@@ -7878,6 +7872,7 @@ def _sync_bot_capabilities(sid: str, session: dict) -> None:
                     for name, value in runtime.items())
                 and getattr(candidate, "reasoning_config", None) == reasoning
                 and (getattr(candidate, "service_tier", None) or "") == tier
+                and get_fast_mode_intent(candidate) == fast_intent
                 and getattr(candidate, "acp_command", None) == acp_command
                 and (getattr(candidate, "acp_args", None) or []) == acp_args)
 
@@ -7924,7 +7919,7 @@ def _sync_bot_capabilities(sid: str, session: dict) -> None:
                 model_override=runtime,
                 reasoning_config_override=reasoning,
                 _preserve_default_reasoning=reasoning is None,
-                service_tier_override=tier,
+                service_tier_override=fast_intent,
                 platform_override=_session_source(session),
                 _resource_preserve_agent=agent,
             )
@@ -8415,21 +8410,22 @@ def _apply_session_runtime_options(sid: str, session: dict, values: dict, *,
                     ("create_reasoning_override", "create_service_tier_override")}
         old_agent = ({key: getattr(agent, key, missing) for key in
                       ("reasoning_config", "service_tier", "request_overrides")} if agent else {})
+        primary = getattr(agent, "_primary_runtime", None) if agent else None
+        old_primary = ({key: primary.get(key, missing) for key in
+                        ("service_tier_intent", "reasoning_config")} if isinstance(primary, dict) else {})
         try:
             if "effort" in values:
                 session["create_reasoning_override"] = reasoning
                 if agent is not None:
                     agent.reasoning_config = reasoning
+                    if isinstance(primary, dict):
+                        primary["reasoning_config"] = copy.deepcopy(reasoning)
             if "fast" in values:
                 session["create_service_tier_override"] = "priority" if values["fast"] else ""
                 if agent is not None:
-                    agent.service_tier = "priority" if values["fast"] else None
-                    request_overrides = dict(getattr(agent, "request_overrides", {}) or {})
-                    request_overrides.pop("service_tier", None)
-                    request_overrides.pop("speed", None)
-                    if values["fast"]:
-                        request_overrides.update(overrides)
-                    agent.request_overrides = request_overrides
+                    _set_agent_fast_runtime(agent, "priority" if values["fast"] else None,
+                                            overrides if values["fast"] else {},
+                                            requested_tier=session["create_service_tier_override"])
             _persist_live_session_runtime(session, strict=True)
         except Exception:
             for key, value in old_pins.items():
@@ -8442,6 +8438,12 @@ def _apply_session_runtime_options(sid: str, session: dict, values: dict, *,
                     delattr(agent, key)
                 else:
                     setattr(agent, key, value)
+            if isinstance(primary, dict) and getattr(agent, "_primary_runtime", None) is primary:
+                for key, value in old_primary.items():
+                    if value is missing:
+                        primary.pop(key, None)
+                    else:
+                        primary[key] = value
             raise
         return {"key": "runtime_options", "value": values, "deferred": False}
 
@@ -8529,6 +8531,7 @@ def _apply_pending_model_switch(sid: str, session: dict, *, before_admission: bo
         finally:
             reset_transport(transport_token)
             _turn_outcome_execution.reset(token)
+    options_attempted = False
     try:
         result = (_apply_model_switch(
             sid, session, pending["raw"],
@@ -8543,6 +8546,7 @@ def _apply_pending_model_switch(sid: str, session: dict, *, before_admission: bo
                         or session.get("transport") is not pending_transport
                         or int(session.get("_queued_prompt_generation", 0)) != pending_generation):
                     raise ValueError("session owner changed; options not applied")
+                options_attempted = True
                 _apply_session_runtime_options(sid, session, pending["runtime_options"],
                                                at_turn_boundary=True, lock_held=True)
         # A queued pick is a deliberate user action; honour the expensive-model
@@ -8553,8 +8557,13 @@ def _apply_pending_model_switch(sid: str, session: dict, *, before_admission: bo
             emit_pending_error(result.get("confirm_message") or result.get("warning") or "")
         return result
     except Exception as e:
-        retain_pending_options()
-        emit_pending_error(f"Could not switch model: {e}")
+        # A model failure may leave independent options for one later attempt.
+        # An option's own rejection or uncertain write is not permission to
+        # requeue/replay it on every subsequent turn.
+        if not options_attempted:
+            retain_pending_options()
+        action = "apply model options" if options_attempted else "switch model"
+        emit_pending_error(f"Could not {action}: {e}")
 
 
 class CompressionLockHeld(Exception):
@@ -10612,7 +10621,7 @@ def _make_agent(
     )
     requested_tier = service_tier_override if service_tier_override is not None else _load_service_tier()
     effective_tier, fast_request_overrides = _resolve_effective_fast_runtime(str(model or ""), requested_tier)
-    return AIAgent(
+    agent = AIAgent(
         model=model,
         max_tokens=max_tokens,
         max_iterations=_cfg_max_turns(cfg, 500),
@@ -10661,6 +10670,12 @@ def _make_agent(
         fallback_model=_load_fallback_model(),
         **_agent_cbs(sid),
     )
+    from agent.agent_runtime_helpers import remember_fast_mode_intent
+
+    # The constructor owns effective state. Seed only requested intent here;
+    # never normalize away a constructor mismatch before an admission guard.
+    remember_fast_mode_intent(agent, requested_tier)
+    return agent
 
 
 def _init_session(
@@ -16872,13 +16887,9 @@ def _(rid, params: dict) -> dict:
         else:
             _write_config_key("agent.service_tier", nv)
         if agent is not None:
-            agent.service_tier = "priority" if nv == "fast" else None
-            current_overrides = dict(getattr(agent, "request_overrides", {}) or {})
-            current_overrides.pop("service_tier", None)
-            current_overrides.pop("speed", None)
-            if nv == "fast":
-                current_overrides.update(overrides)
-            agent.request_overrides = current_overrides
+            _set_agent_fast_runtime(agent, "priority" if nv == "fast" else None,
+                                    overrides if nv == "fast" else {},
+                                    requested_tier="priority" if nv == "fast" else "")
             _persist_live_session_runtime(session)
             _emit(
                 "session.info",
@@ -18645,8 +18656,13 @@ def _model_picker_context(agent, session: dict | None = None):
                 host_model = mirror.get("model")
                 host_provider = mirror.get("provider")
                 if host_model and host_provider:
-                    same_route = (selected.get("model") == host_model
-                                  and selected.get("provider") == host_provider)
+                    route_model = selected.get("model") if selected else ctx.current_model
+                    route_provider = selected.get("provider") if selected else ctx.current_provider
+                    same_route = route_model == host_model and route_provider == host_provider
+                    if same_route and not selected:
+                        # A session without an explicit override inherits this
+                        # profile route. Keep its URL only for that exact tuple.
+                        selected["base_url"] = ctx.current_base_url
                     selected.update(model=host_model, provider=host_provider)
                     if not same_route:
                         # Do not attach a durable/parent route URL to a

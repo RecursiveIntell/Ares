@@ -107,6 +107,37 @@ def test_failed_deferred_model_retains_only_owned_options(state, monkeypatch, re
     server._write_config_key.assert_not_called()
 
 
+def test_definitive_deferred_option_failure_is_not_requeued(state, monkeypatch):
+    state['running'] = False
+    state['pending_model_switch'] = {'raw': 'chosen --session', 'runtime_options': {'fast': True}}
+    monkeypatch.setattr(server, '_apply_model_switch', Mock(side_effect=RuntimeError('model failed')))
+    server._apply_pending_model_switch('live', state, before_admission=True)
+    assert state['pending_model_switch'] == {'runtime_options': {'fast': True}}
+    # The retained options now belong to their own application attempt on
+    # the old model, which does not support Fast. That refusal is terminal.
+    monkeypatch.setattr('hermes_cli.models.resolve_fast_mode_overrides', lambda model: None)
+    apply = Mock(wraps=server._apply_session_runtime_options)
+    monkeypatch.setattr(server, '_apply_session_runtime_options', apply)
+    server._apply_pending_model_switch('live', state, before_admission=True)
+    assert not state.get('pending_model_switch')
+    assert state['agent'].service_tier is None
+    assert state['agent'].request_overrides == {}
+    server._apply_pending_model_switch('live', state, before_admission=True)
+    assert apply.call_count == 1
+
+
+def test_uncertain_deferred_option_persistence_is_not_automatically_replayed(state, monkeypatch):
+    state['running'] = False
+    state['pending_model_switch'] = {'runtime_options': {'effort': 'high'}}
+    persist = Mock(side_effect=RuntimeError('persistence unconfirmed'))
+    monkeypatch.setattr(server, '_persist_live_session_runtime', persist)
+    server._apply_pending_model_switch('live', state, before_admission=True)
+    assert not state.get('pending_model_switch')
+    assert state['agent'].reasoning_config['effort'] == 'low'
+    server._apply_pending_model_switch('live', state, before_admission=True)
+    assert persist.call_count == 1
+
+
 def test_failed_deferred_model_preserves_newer_pending_dimensions(state, monkeypatch):
     state['running'] = False
     state['pending_model_switch'] = {'raw': 'old --session', 'runtime_options': {'effort': 'high', 'fast': True}}
@@ -155,6 +186,21 @@ def test_persist_failure_restores_all_live_option_fields(state, monkeypatch):
                                                      'value':{'effort':'high','fast':True}})
     assert result.get('error')
     assert state['agent'].reasoning_config['effort'] == 'low'
+    assert state['agent'].service_tier is None
+    assert state['agent'].request_overrides == {}
+
+
+def test_option_persistence_failure_restores_primary_intent_projection(state, monkeypatch):
+    state['running'] = False
+    old_reasoning = {'enabled': True, 'effort': 'low'}
+    state['agent']._primary_runtime = {'service_tier_intent': '', 'reasoning_config': old_reasoning}
+    monkeypatch.setattr(server, '_persist_live_session_runtime', Mock(side_effect=RuntimeError('unconfirmed')))
+    response = server._methods['config.set']('failed', {'session_id': 'live', 'key': 'runtime_options',
+                                                       'value': {'fast': True, 'effort': 'high'}})
+    assert 'error' in response
+    assert state['agent']._primary_runtime['service_tier_intent'] == ''
+    assert state['agent']._primary_runtime['reasoning_config'] is old_reasoning
+    assert 'create_service_tier_override' not in state
     assert state['agent'].service_tier is None
     assert state['agent'].request_overrides == {}
 

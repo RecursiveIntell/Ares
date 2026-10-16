@@ -50,7 +50,7 @@ def world(routes, monkeypatch):
     monkeypatch.setattr("run_agent.OpenAI", lambda **k: SimpleNamespace(kwargs=k))
     monkeypatch.setattr("hermes_cli.timeouts.get_provider_request_timeout", lambda *a, **k: None)
     monkeypatch.setattr(server, "_restart_slash_worker", lambda *a: None)
-    monkeypatch.setattr(server, "_persist_live_session_runtime", lambda *a: None)
+    monkeypatch.setattr(server, "_persist_live_session_runtime", lambda *a, **k: None)
     monkeypatch.setattr(server, "_persist_live_session_system_prompt", lambda *a: None)
     monkeypatch.setattr(server, "_probe_credentials", lambda *a: None)
     monkeypatch.setattr(server, "_git_branch_for_cwd", lambda *a: None)
@@ -60,8 +60,9 @@ def world(routes, monkeypatch):
     monkeypatch.setattr("tools.mcp_tool.get_mcp_status", lambda: [])
     agents = []
 
-    def build(override=None):
-        value = server._make_agent("selected", "inert-session", model_override=override)
+    def build(override=None, *, service_tier_override=None):
+        value = server._make_agent("selected", "inert-session", model_override=override,
+                                   service_tier_override=service_tier_override)
         value._create_openai_client = lambda kwargs, **k: SimpleNamespace(kwargs=kwargs.copy())
         agents.append(value)
         return value
@@ -85,6 +86,108 @@ def selected_session(value, monkeypatch):
     monkeypatch.setattr(server, "_sessions", {"selected": session})
     monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
     return session
+
+
+def fallback_world(world, monkeypatch, primary="gpt-6.1-sol", fallback="gpt-5.3-codex", intent="priority"):
+    from agent import chat_completion_helpers
+
+    value = world.build({"model": primary, "provider": "endpoint-a"}, service_tier_override=intent)
+    value.request_overrides["extra_body"] = {"fixture": True}
+    value._fallback_chain = [{"provider": "endpoint-b", "model": fallback,
+                              "api_mode": "chat_completions", "base_url": "http://b.invalid/v1"}]
+    value._fallback_index = 0
+    monkeypatch.setattr(chat_completion_helpers, "_fallback_entry_unavailable_without_network", lambda *a: None)
+    monkeypatch.setattr("agent.credential_pool.load_pool", lambda *a, **k: None)
+    monkeypatch.setattr("agent.auxiliary_client.resolve_provider_client", lambda *a, **k:
+        (SimpleNamespace(base_url="http://b.invalid/v1", api_key="inert-fallback", default_headers={}), fallback))
+    return value
+
+
+@pytest.mark.parametrize("primary,fallback,intent,expected", [
+    ("gpt-6.1-sol", "gpt-5.3-codex", "priority", {}),
+    ("gpt-5.3-codex", "gpt-6.1-sol", "priority", {"service_tier": "priority"}),
+    ("claude-opus-4-6", "gpt-6.1-sol", "priority", {"service_tier": "priority"}),
+    ("gpt-6.1-sol", "o3", "", {}),
+])
+def test_fast_fallback_and_primary_restore_use_preserved_intent(world, monkeypatch, primary, fallback, intent, expected):
+    value = fallback_world(world, monkeypatch, primary, fallback, intent)
+    original = outgoing(value)
+    assert value._try_activate_fallback()
+    request = outgoing(value)
+    assert request["model"] == fallback
+    for key in ("service_tier", "speed"):
+        assert request.get(key) == expected.get(key)
+        assert (key in request) == (key in expected)
+    assert value.request_overrides["extra_body"] == {"fixture": True}
+    assert value._restore_primary_runtime()
+    restored = outgoing(value)
+    assert restored["model"] == primary
+    for key in ("service_tier", "speed"):
+        assert restored.get(key) == original.get(key)
+        assert (key in restored) == (key in original)
+    assert value.request_overrides["extra_body"] == {"fixture": True}
+
+
+@pytest.mark.parametrize("refuse", [False, True])
+def test_newer_fast_off_during_fallback_resolution_wins(world, monkeypatch, refuse):
+    from agent.agent_runtime_helpers import apply_fast_mode_runtime
+    from agent import auxiliary_client
+
+    value = fallback_world(world, monkeypatch, fallback="o3")
+    resolver = auxiliary_client.resolve_provider_client
+
+    def resolve_after_newer_choice(*a, **k):
+        apply_fast_mode_runtime(value, "", remember=True)
+        return resolver(*a, **k)
+
+    monkeypatch.setattr(auxiliary_client, "resolve_provider_client", resolve_after_newer_choice)
+    if refuse:
+        def reject(*a, **k):
+            raise RuntimeError("fixture refusal after newer intent")
+        monkeypatch.setattr(auxiliary_client, "_update_compressor_model", reject)
+    assert value._try_activate_fallback() is not refuse
+    assert value._primary_runtime["service_tier_intent"] == ""
+    assert value.service_tier is None
+    assert "service_tier" not in value.request_overrides
+    assert "speed" not in value.request_overrides
+    assert value.request_overrides["extra_body"] == {"fixture": True}
+    assert value.model == ("gpt-6.1-sol" if refuse else "o3")
+
+
+@pytest.mark.parametrize("key,payload", [("runtime_options", {"fast": False}), ("fast", "normal")])
+def test_fast_off_on_fallback_remains_off_after_primary_restore(world, monkeypatch, key, payload):
+    value = fallback_world(world, monkeypatch)
+    session = selected_session(value, monkeypatch)
+    assert value._try_activate_fallback()
+    response = server._methods["config.set"]("off", {"session_id": "selected", "key": key, "value": payload})
+    assert "error" not in response
+    assert session["create_service_tier_override"] == ""
+    assert value._restore_primary_runtime()
+    request = outgoing(value)
+    assert "service_tier" not in request and "speed" not in request
+
+
+@pytest.mark.parametrize("restore", [False, True])
+def test_fast_fields_roll_back_with_refused_fallback_or_primary_handoff(world, monkeypatch, restore):
+    value = fallback_world(world, monkeypatch)
+    if restore:
+        assert value._try_activate_fallback()
+    old_model, old_tier, old_overrides = value.model, value.service_tier, value.request_overrides
+    before = copy.deepcopy(value.request_overrides)
+    calls = []
+
+    def refuse(*a, **k):
+        calls.append(True)
+        raise RuntimeError("fixture handoff refused")
+
+    monkeypatch.setattr("agent.auxiliary_client._update_compressor_model", refuse)
+    assert not (value._restore_primary_runtime() if restore else value._try_activate_fallback())
+    assert calls
+    assert value.model == old_model
+    assert value.service_tier == old_tier
+    assert value.request_overrides is old_overrides
+    assert value.request_overrides == before
+    assert value._fallback_index == 1
 
 
 def test_custom_provider_switch_preserves_reasoning_on_request_wire(world, monkeypatch):
@@ -157,6 +260,27 @@ def test_model_picker_uses_host_selection_instead_of_prewarmed_parent(world, mon
     assert context.current_base_url == ("" if temporary else "http://b.invalid/v1")
     # Readback must not mutate the serving process's stale prewarmed agent.
     assert value.model == "model-a"
+
+
+@pytest.mark.parametrize("same_route", [True, False])
+def test_inherited_bare_custom_host_retains_only_its_configured_url(world, monkeypatch, same_route):
+    value = world.build()
+    world.routes.config["model"] = {
+        "default": "inherited-model", "provider": "custom", "base_url": "http://inherited.invalid/v1",
+    }
+    world.routes.write()
+    session = selected_session(value, monkeypatch)
+    session.pop("model_override")
+    session["_compute_host_active"] = True
+    session["_metadata_mirror"] = {
+        "model": "inherited-model" if same_route else "different-model", "provider": "custom",
+    }
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _: True)
+    context = server._model_picker_context(value, session)
+    assert context.current_model == session["_metadata_mirror"]["model"]
+    assert context.current_provider == "custom"
+    assert context.current_base_url == ("http://inherited.invalid/v1" if same_route else "")
+    assert "model_override" not in session
 
 
 def test_model_picker_ignores_host_mirror_for_inprocess_owner(world, monkeypatch):

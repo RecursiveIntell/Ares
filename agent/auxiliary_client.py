@@ -1683,6 +1683,10 @@ class _CodexCompletionsAdapter:
         timeout = kwargs.get("timeout")
         if timeout is not None:
             resp_kwargs["timeout"] = timeout
+        # Per-request HTTP headers (OpenCode session affinity, Copilot
+        # x-initiator) map to real headers via the SDK kwarg — forward them.
+        if isinstance(kwargs.get("extra_headers"), dict) and kwargs["extra_headers"]:
+            resp_kwargs["extra_headers"] = dict(kwargs["extra_headers"])
 
         # Note: the Codex endpoint (chatgpt.com/backend-api/codex) does NOT
         # support max_output_tokens or temperature — omit to avoid 400 errors.
@@ -2050,15 +2054,39 @@ class _CodexCompletionsAdapter:
             content=content,
             tool_calls=tool_calls_raw or None,
         )
+        response_status = _obj_get(final, "status")
+        incomplete_details = _obj_get(final, "incomplete_details")
+        final_finish_reason = _obj_get(final, "finish_reason") or _obj_get(
+            final, "stop_reason"
+        )
+        terminal_observed = _obj_get(final, "terminal_observed")
+        if terminal_observed is None:
+            terminal_observed = response_status in {
+                "completed",
+                "incomplete",
+                "failed",
+            } or final_finish_reason is not None
+        if tool_calls_raw:
+            finish_reason = "tool_calls"
+        elif response_status == "completed":
+            finish_reason = final_finish_reason or "stop"
+        elif response_status == "incomplete":
+            finish_reason = final_finish_reason or "length"
+        else:
+            finish_reason = final_finish_reason
         choice = SimpleNamespace(
             index=0,
             message=message,
-            finish_reason="stop" if not tool_calls_raw else "tool_calls",
+            finish_reason=finish_reason,
+            terminal_observed=bool(terminal_observed),
         )
         return SimpleNamespace(
             choices=[choice],
             model=model,
             usage=usage,
+            status=response_status,
+            incomplete_details=incomplete_details,
+            error=_obj_get(final, "error"),
         )
 
 
@@ -2252,6 +2280,13 @@ class _AnthropicCompletionsAdapter:
             from agent.anthropic_adapter import _forbids_sampling_params
             if not _forbids_sampling_params(model):
                 anthropic_kwargs["temperature"] = temperature
+        # Per-request HTTP headers (OpenCode session affinity) — the Anthropic
+        # SDK accepts ``extra_headers`` on messages.create/stream too.
+        if isinstance(kwargs.get("extra_headers"), dict) and kwargs["extra_headers"]:
+            anthropic_kwargs["extra_headers"] = {
+                **(anthropic_kwargs.get("extra_headers") or {}),
+                **kwargs["extra_headers"],
+            }
 
         # Pass through caller-supplied extra_body so providers behind
         # Anthropic-compatible gateways receive their per-vendor request
@@ -4761,6 +4796,16 @@ def _is_model_incompatible_error(exc: Exception) -> bool:
     ))
 
 
+class AuxiliaryIncompleteTerminalError(RuntimeError):
+    """A compression summary response lacked a completed final terminal.
+
+    The provider answered, but with ``length``/``content_filter``/incomplete/
+    failed/refused/tool-call output. That route cannot produce a usable
+    summary for this request, so it is fallback-worthy like any other
+    invalid auxiliary response.
+    """
+
+
 def _is_invalid_aux_response_error(exc: Exception) -> bool:
     """Detect provider responses that authenticated but cannot serve aux shape.
 
@@ -4770,6 +4815,8 @@ def _is_invalid_aux_response_error(exc: Exception) -> bool:
     need ``choices[0].message`` and should be able to continue through the
     same fallback path as explicit model-incompatibility errors.
     """
+    if isinstance(exc, AuxiliaryIncompleteTerminalError):
+        return True
     if not isinstance(exc, RuntimeError):
         return False
     msg = str(exc).lower()
@@ -5013,7 +5060,7 @@ def _retry_same_provider_sync(
     # ``x-initiator: user``) across the rebuilt-client retry — dropping them
     # here would let a recovery retry silently lose capability gating (#60293).
     if extra_headers:
-        retry_kwargs["extra_headers"] = dict(extra_headers)
+        retry_kwargs["extra_headers"] = {**(retry_kwargs.get("extra_headers") or {}), **extra_headers}
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
     return _validate_llm_response(
@@ -5087,7 +5134,7 @@ async def _retry_same_provider_async(
     # Preserve per-request attribution headers across the rebuilt-client
     # retry — see the sync variant above (#60293).
     if extra_headers:
-        retry_kwargs["extra_headers"] = dict(extra_headers)
+        retry_kwargs["extra_headers"] = {**(retry_kwargs.get("extra_headers") or {}), **extra_headers}
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
     return _validate_llm_response(
@@ -8997,7 +9044,14 @@ def _build_call_kwargs(
         ):
             kwargs["_reasoning_config"] = dict(reasoning_config)
 
-    return kwargs
+    # Reuse the same rotation-stable scope as auxiliary Responses routing,
+    # falling back to the physical session when no cache scope is published.
+    from agent.opencode_affinity import merge_opencode_session_headers
+
+    return merge_opencode_session_headers(
+        kwargs, provider, base_url,
+        _runtime_main_value("cache_scope") or _runtime_main_value("session_id") or None,
+    )
 
 
 def _validate_llm_response(
@@ -9035,19 +9089,27 @@ def _validate_llm_response(
         if not choices or not hasattr(choices[0], "message"):
             raise AttributeError("missing choices[0].message")
     except (AttributeError, TypeError, IndexError) as exc:
-        recovered = _recover_aux_response_message(response)
+        recovered = _recover_aux_response_message(
+            response, require_completed_terminal=(task == "compression")
+        )
         if recovered is not None:
-            _record_relay_auxiliary_response_model(response)
-            _complete_relay_auxiliary_call()
-            return recovered
-        response_type = type(response).__name__
-        response_preview = str(response)[:120]
-        raise RuntimeError(
-            f"Auxiliary {task or 'call'}: LLM returned invalid response "
-            f"(type={response_type}): {response_preview!r}. "
-            f"Expected object with .choices[0].message — check provider "
-            f"adapter or custom endpoint compatibility."
-        ) from exc
+            response = recovered
+        else:
+            response_type = type(response).__name__
+            response_preview = str(response)[:120]
+            raise RuntimeError(
+                f"Auxiliary {task or 'call'}: LLM returned invalid response "
+                f"(type={response_type}): {response_preview!r}. "
+                f"Expected object with .choices[0].message — check provider "
+                f"adapter or custom endpoint compatibility."
+            ) from exc
+    if task == "compression" and not _auxiliary_response_has_completed_terminal(
+        response
+    ):
+        raise AuxiliaryIncompleteTerminalError(
+            "Auxiliary compression response did not prove a completed final "
+            "terminal; refusing to use partial summary text"
+        )
     _record_relay_auxiliary_response_model(response)
     _complete_relay_auxiliary_call()
     return response
@@ -9093,32 +9155,68 @@ def _fail_relay_auxiliary_call() -> None:
         )
 
 
-def _recover_aux_response_message(response: Any) -> Optional[Any]:
-    """Synthesize chat-completions shape from Responses-style text fields.
+def _recover_aux_response_message(
+    response: Any, *, require_completed_terminal: bool = False
+) -> Optional[Any]:
+    """Synthesize a chat-completions shape without erasing terminal evidence.
 
-    Auxiliary callers consume ``choices[0].message``.  Some compatible
-    endpoints return text outside ``choices`` (for example ``output_text`` or
-    ``output`` items).  Preserve that response before declaring it malformed.
+    Auxiliary callers consume ``choices[0].message``. Some compatible
+    endpoints return text outside ``choices``. For checkpoint callers, preserve
+    typed Responses status and an explicit indication of whether a terminal was
+    actually observed; a nonempty text field alone is not completion evidence.
     """
     text = _extract_aux_response_text(response)
     if not text:
         return None
 
+    status = _obj_get(response, "status")
+    raw_finish_reason = _obj_get(response, "finish_reason") or _obj_get(
+        response, "stop_reason"
+    )
+    if status == "completed":
+        finish_reason = raw_finish_reason or "stop"
+        terminal_observed = True
+    elif raw_finish_reason:
+        finish_reason = raw_finish_reason
+        terminal_observed = True
+    elif status is not None:
+        # Preserve incomplete/failed/unknown status; do not translate it to stop.
+        finish_reason = None
+        terminal_observed = True
+    elif require_completed_terminal:
+        finish_reason = None
+        terminal_observed = False
+    else:
+        # Non-checkpoint callers retain the historical shape, while a private
+        # witness prevents this compatibility sentinel becoming summary proof.
+        finish_reason = "stop"
+        terminal_observed = False
+
     choice = SimpleNamespace(
         message=SimpleNamespace(content=text),
-        finish_reason=getattr(response, "finish_reason", None) or "stop",
+        finish_reason=finish_reason,
+        terminal_observed=terminal_observed,
     )
     try:
         response.choices = [choice]
         return response
     except Exception:
-        return SimpleNamespace(
-            id=getattr(response, "id", ""),
-            model=getattr(response, "model", ""),
-            object=getattr(response, "object", "chat.completion"),
+        recovered = SimpleNamespace(
+            id=_obj_get(response, "id", ""),
+            model=_obj_get(response, "model", ""),
+            object=_obj_get(response, "object", "chat.completion"),
             choices=[choice],
-            usage=getattr(response, "usage", None),
+            usage=_obj_get(response, "usage"),
         )
+        if status is not None:
+            recovered.status = status
+        incomplete_details = _obj_get(response, "incomplete_details")
+        if incomplete_details is not None:
+            recovered.incomplete_details = incomplete_details
+        error = _obj_get(response, "error")
+        if error is not None:
+            recovered.error = error
+        return recovered
 
 
 def _extract_aux_response_text(response: Any) -> str:
@@ -9149,6 +9247,35 @@ def _obj_get(obj: Any, key: str, default: Any = None) -> Any:
     if value is default and isinstance(obj, dict):
         value = obj.get(key, default)
     return value
+
+
+def _auxiliary_response_has_completed_terminal(response: Any) -> bool:
+    """Prove an auxiliary text response is a completed, final text result.
+
+    This gate is used only for summary/checkpoint admission. Ordinary
+    conversation-loop partial-stream continuation keeps its existing contract.
+    """
+    status = _obj_get(response, "status")
+    if _obj_get(response, "error") is not None:
+        return False
+    if status is not None and status != "completed":
+        return False
+    if _obj_get(response, "incomplete_details") is not None:
+        return False
+    choices = _obj_get(response, "choices")
+    if not choices:
+        return False
+    choice = choices[0]
+    if _obj_get(choice, "terminal_observed", True) is False:
+        return False
+    if _obj_get(choice, "finish_reason") not in {"stop", "end_turn"}:
+        return False
+    message = _obj_get(choice, "message")
+    if message is None or _obj_get(message, "tool_calls"):
+        return False
+    if _obj_get(message, "refusal"):
+        return False
+    return True
 
 
 # ── Streamed aggregation for progress-hooked auxiliary calls ─────────────
@@ -9429,6 +9556,9 @@ class _ChatStreamAccumulator:
             index=0,
             message=message,
             finish_reason=self.finish_reason or "stop",
+            # Keep the historical chat-facing sentinel; compression summary
+            # admission separately requires that a terminal chunk was seen.
+            terminal_observed=self.finish_reason is not None,
         )
         return SimpleNamespace(
             id=self.resp_id,
@@ -9744,7 +9874,7 @@ def _call_llm_impl(
         reasoning_config=reasoning_config,
         base_url=_base_info or resolved_base_url, task=task)
     if extra_headers:
-        kwargs["extra_headers"] = dict(extra_headers)
+        kwargs["extra_headers"] = {**(kwargs.get("extra_headers") or {}), **extra_headers}
 
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
     _client_base = str(getattr(client, "base_url", "") or "")
