@@ -218,6 +218,38 @@ def test_codex_raw_responses_consumer_keeps_eof_distinct_from_completed_event():
     assert complete.terminal_observed is True
 
 
+def test_raw_eof_final_reaching_choice_recovery_is_not_summary_completion():
+    """The no-``choices`` recovery path must honor an explicit EOF witness.
+
+    ``_consume_codex_event_stream`` keeps ``status="completed"`` as a
+    compatibility value after EOF and records the real evidence in
+    ``terminal_observed=False``. A caller that hands that raw final to
+    ``_validate_llm_response`` reaches ``_recover_aux_response_message``; the
+    compatibility status alone must not become summary-completion proof.
+    """
+    from agent.codex_runtime import _consume_codex_event_stream
+
+    eof = _consume_codex_event_stream(
+        [SimpleNamespace(type="response.output_text.delta", delta="partial summary")],
+        model="fixture-model",
+    )
+    assert not hasattr(eof, "choices")
+    with pytest.raises(RuntimeError, match="completed|terminal"):
+        _validate_llm_response(eof, "compression")
+
+    complete = _consume_codex_event_stream(
+        [
+            SimpleNamespace(type="response.output_text.delta", delta="full summary"),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed", usage=None),
+            ),
+        ],
+        model="fixture-model",
+    )
+    assert _validate_llm_response(complete, "compression").choices[0].message.content == "full summary"
+
+
 def test_codex_raw_responses_consumer_preserves_incomplete_terminal_status():
     from agent.codex_runtime import _consume_codex_event_stream
 

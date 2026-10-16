@@ -227,6 +227,9 @@ def test_run_conversation_acquires_then_reloads_latest_tip(monkeypatch):
     assert db.events[2][2] == {
         "repair_alternation": True,
         "include_row_ids": True,
+        # Model-facing reload: keep the durable summary discriminator so the
+        # next Context Governor compaction matches its authenticated parent.
+        "include_summary_markers": True,
     }
     assert any(
         kind == "lifecycle"

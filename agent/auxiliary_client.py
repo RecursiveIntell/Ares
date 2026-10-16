@@ -9173,7 +9173,14 @@ def _recover_aux_response_message(
     raw_finish_reason = _obj_get(response, "finish_reason") or _obj_get(
         response, "stop_reason"
     )
-    if status == "completed":
+    if _obj_get(response, "terminal_observed") is False:
+        # A raw stream final reports ``status="completed"`` as a compatibility
+        # value after EOF; its explicit witness says no terminal was seen.
+        finish_reason = raw_finish_reason or (
+            None if require_completed_terminal else "stop"
+        )
+        terminal_observed = False
+    elif status == "completed":
         finish_reason = raw_finish_reason or "stop"
         terminal_observed = True
     elif raw_finish_reason:
