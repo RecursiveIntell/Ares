@@ -1532,7 +1532,18 @@ export async function resolveSessionOwner(storedSessionId: null | string): Promi
 type SessionRuntimeStatePatch = Partial<
   Pick<
     ClientSessionState,
-    'branch' | 'cwd' | 'fast' | 'model' | 'personality' | 'provider' | 'reasoningEffort' | 'serviceTier' | 'yolo' | 'selectorObservation' | 'pendingModelSelection' | 'pendingRuntimeOptions'
+    | 'branch'
+    | 'cwd'
+    | 'fast'
+    | 'model'
+    | 'personality'
+    | 'provider'
+    | 'reasoningEffort'
+    | 'serviceTier'
+    | 'yolo'
+    | 'selectorObservation'
+    | 'pendingModelSelection'
+    | 'pendingRuntimeOptions'
   >
 >
 

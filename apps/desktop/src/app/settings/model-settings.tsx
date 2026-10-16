@@ -41,7 +41,12 @@ import { setMainModelAssignment } from '@/store/cron-model-impact'
 import { notifyError } from '@/store/notifications'
 import { startManualLocalEndpoint, startManualOnboarding, startManualProviderOAuth } from '@/store/onboarding'
 
-import { requireCurrentModelOwner, useModelFormKey, useModelOwnerIsCurrent, useModelRequestOwner } from '../hooks/use-composer-model-owner'
+import {
+  requireCurrentModelOwner,
+  useModelFormKey,
+  useModelOwnerIsCurrent,
+  useModelRequestOwner
+} from '../hooks/use-composer-model-owner'
 import { HERMES_CONFIG_KEY } from '../hooks/use-config-record'
 import { useOnProfileSwitch } from '../hooks/use-on-profile-switch'
 
@@ -203,18 +208,26 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
   const owner = useModelRequestOwner(scopeProfile)
   const formKey = useModelFormKey(owner, scopeProfile)
 
-  return <ModelSettingsForm key={formKey} onMainModelChanged={onMainModelChanged} owner={owner} scopeProfile={scopeProfile} />
+  return (
+    <ModelSettingsForm
+      key={formKey}
+      onMainModelChanged={onMainModelChanged}
+      owner={owner}
+      scopeProfile={scopeProfile}
+    />
+  )
 }
 
-function ModelSettingsForm({ onMainModelChanged, owner, scopeProfile }: ModelSettingsProps & { owner: ComposerSelectionOwner }) {
+function ModelSettingsForm({
+  onMainModelChanged,
+  owner,
+  scopeProfile
+}: ModelSettingsProps & { owner: ComposerSelectionOwner }) {
   const isOwnerCurrent = useModelOwnerIsCurrent(owner, scopeProfile)
   const ownerKey = composerOwnerKey(owner)
   const queryClient = useQueryClient()
 
-  const configKey = useMemo(
-    () => [...HERMES_CONFIG_KEY, ownerKey] as const,
-    [ownerKey]
-  )
+  const configKey = useMemo(() => [...HERMES_CONFIG_KEY, ownerKey] as const, [ownerKey])
 
   const { t } = useI18n()
   const m = t.settings.model

@@ -29,6 +29,7 @@ export function readProfileBackendPoolSettings(
 ): ProfileBackendPoolSettings {
   try {
     const parsed: unknown = JSON.parse(readFile(profileBackendPoolSettingsPath(userDataDir), 'utf8'))
+
     const maxBackends =
       parsed && typeof parsed === 'object' && 'max_backends' in parsed
         ? (parsed as { max_backends?: unknown }).max_backends
@@ -56,11 +57,10 @@ export function writeProfileBackendPoolSettings(
   const temporary = `${target}.${process.pid}.tmp`
 
   mkdir(userDataDir)
-  writeFile(
-    temporary,
-    `${JSON.stringify({ version: 1, max_backends: settings.maxBackends }, null, 2)}\n`,
-    { encoding: 'utf8', mode: 0o600 }
-  )
+  writeFile(temporary, `${JSON.stringify({ version: 1, max_backends: settings.maxBackends }, null, 2)}\n`, {
+    encoding: 'utf8',
+    mode: 0o600
+  })
   rename(temporary, target)
 
   return settings

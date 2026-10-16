@@ -38,7 +38,9 @@ export class PoolCapacityError extends Error {
   readonly code = POOL_CAPACITY_EXCEEDED
 
   constructor(max: number) {
-    super(`Local profile backend budget reached (${max}); wait for an active profile backend to finish or close it before opening another.`)
+    super(
+      `Local profile backend budget reached (${max}); wait for an active profile backend to finish or close it before opening another.`
+    )
     this.name = 'PoolCapacityError'
   }
 }
@@ -76,11 +78,13 @@ export function canAdmitLocalBackend(
   }
 
   const maximum = Math.max(1, max)
+
   if (requestedCapacity > maximum) {
     return false
   }
 
   const used = [...entries].reduce((total, [, entry]) => total + capacityUnits(entry), 0)
+
   return used + requestedCapacity <= maximum
 }
 

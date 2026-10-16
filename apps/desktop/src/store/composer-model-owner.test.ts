@@ -94,19 +94,23 @@ describe('owner-qualified composer selections', () => {
     setComposerModelSelectionOwner(a)
     const previous = recordComposerModelSelection(captureComposerModelSelection(a), pair)!
     markComposerSelectionManual()
+
     const rejected = recordComposerModelSelection(captureComposerModelSelection(a), {
       ...pair,
       model: 'rejected',
       source: 'manual'
     })!
+
     expect(restoreComposerModelSelection(captureComposerModelSelection(a), previous, rejected)).toBe(true)
     expect(getComposerModelSelection(a)).toMatchObject(pair)
     markComposerSelectionManual()
+
     const newest = recordComposerModelSelection(captureComposerModelSelection(a), {
       ...pair,
       model: 'newest',
       source: 'manual'
     })!
+
     expect(restoreComposerModelSelection(captureComposerModelSelection(a), previous, rejected)).toBe(false)
     expect(getComposerModelSelection(a)).toBe(newest)
     expect(restoreComposerModelSelection(captureComposerModelSelection(b), previous, newest)).toBe(false)
@@ -130,10 +134,12 @@ describe('owner-qualified composer selections', () => {
     const weakRead = captureComposerModelSelection(a)
     recordComposerModelSelection(weakRead, { ...pair, model: 'older-default' })
     expect(ownsRuntimeOptionIntent(origin.ownerKey, 'profile-default-save', token)).toBe(true)
+
     const confirmed = recordComposerModelSelection(captureComposerModelSelection(origin.owner), {
       ...pair,
       model: 'saved-default'
     })
+
     expect(getComposerModelSelection(a)).toBe(confirmed)
     expect(confirmed?.model).toBe('saved-default')
     expect(recordComposerModelSelection(weakRead, pair)).toBeNull()
