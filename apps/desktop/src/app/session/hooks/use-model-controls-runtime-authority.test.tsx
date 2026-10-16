@@ -231,6 +231,32 @@ describe('useModelControls runtime authority', () => {
     expect($currentProvider.get()).toBe('provider-c')
   })
 
+  it('settles only its own confirmed model intent when an ACK snapshot has a foreign epoch', async () => {
+    const current = $sessionStates.get()[PRIMARY_RUNTIME_ID]
+    publishSessionState(PRIMARY_RUNTIME_ID, {
+      ...current,
+      selectorObservation: {
+        version: { epoch: 'owner-a', revision: 7 },
+        values: { model: 'model-a', provider: 'provider-a' }
+      }
+    })
+    const requestGateway = vi.fn(async () => ({
+      key: 'model', scope: 'session', value: 'model-b',
+      selector_info: {
+        model: 'model-b', provider: 'provider-b',
+        selector_version: { epoch: 'replacement-owner', revision: 1 }
+      }
+    }) as never)
+    const { result } = renderHook(() => useModelControls({ queryClient: new QueryClient(), requestGateway }))
+
+    await expect(result.current.selectModel({ model: 'model-b', provider: 'provider-b' })).resolves.toBe(true)
+
+    expect($sessionStates.get()[PRIMARY_RUNTIME_ID]).toMatchObject({
+      model: 'model-b', provider: 'provider-b', pendingModelSelection: null,
+      selectorObservation: { version: { epoch: 'owner-a', revision: 7 } }
+    })
+  })
+
   it.each(['openrouter', 'anthropic', 'openai-codex', 'moa', 'ollama-cloud', 'ollama-launch', 'custom:target', 'auto'])(
     'preserves A→B→A intent when older selector replies arrive last (%s)',
     async provider => {

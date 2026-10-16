@@ -4,6 +4,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vite
 
 import { setApiRequestConnection } from '@/api/client'
 import { DropdownMenu, DropdownMenuContent } from '@/components/ui/dropdown-menu'
+import { setModelPreset } from '@/store/model-presets'
 import { $collapsedProviders, toggleCollapsedProvider } from '@/store/provider-collapse'
 import { $activeSessionId, $currentModel, $currentProvider } from '@/store/session'
 import { $sessions, _resetSessionOwnerHintsForTests, setSessionOwnerHint } from '@/store/session'
@@ -68,14 +69,14 @@ afterEach(() => {
   vi.clearAllMocks()
 })
 
-function renderPanel(onSelectModel = vi.fn()) {
+function renderPanel(onSelectModel = vi.fn(), requestGateway = vi.fn()) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
 
   const content = render(
     <QueryClientProvider client={client}>
       <DropdownMenu open>
         <DropdownMenuContent>
-          <ModelMenuPanel onSelectModel={onSelectModel} requestGateway={vi.fn() as never} />
+          <ModelMenuPanel onSelectModel={onSelectModel} requestGateway={requestGateway as never} />
         </DropdownMenuContent>
       </DropdownMenu>
     </QueryClientProvider>
@@ -84,27 +85,40 @@ function renderPanel(onSelectModel = vi.fn()) {
   return { onSelectModel, content }
 }
 
-it.each(['legacy-local', 'remote-target'])('loads the known session owner catalog while ambient source differs (%s)', async kind => {
-  setApiRequestConnection('ambient-remote')
+it.each(['legacy-local', 'remote-target'])(
+  'loads the known session owner catalog while ambient source differs (%s)',
+  async kind => {
+    setApiRequestConnection('ambient-remote')
 
-  if (kind === 'legacy-local') {
-    $sessions.set([{ id: 'runtime-1', profile: 'local-specialist' }] as never)
-  } else {
-    setSessionOwnerHint('runtime-1', { connectionId: 'owner-remote', profile: 'logical', targetProfile: 'backend-target', mode: 'remote' })
-  }
+    if (kind === 'legacy-local') {
+      $sessions.set([{ id: 'runtime-1', profile: 'local-specialist' }] as never)
+    } else {
+      setSessionOwnerHint('runtime-1', {
+        connectionId: 'owner-remote',
+        profile: 'logical',
+        targetProfile: 'backend-target',
+        mode: 'remote'
+      })
+    }
 
-  try {
-    renderPanel()
-    await vi.waitFor(() => expect(getGlobalModelOptions).toHaveBeenCalledWith({ explicitOnly: true }, {
-      connectionId: kind === 'legacy-local' ? null : 'owner-remote',
-      profile: kind === 'legacy-local' ? 'local-specialist' : 'backend-target'
-    }))
-  } finally {
-    setApiRequestConnection(null)
-    $sessions.set([])
-    _resetSessionOwnerHintsForTests()
+    try {
+      renderPanel()
+      await vi.waitFor(() =>
+        expect(getGlobalModelOptions).toHaveBeenCalledWith(
+          { explicitOnly: true },
+          {
+            connectionId: kind === 'legacy-local' ? null : 'owner-remote',
+            profile: kind === 'legacy-local' ? 'local-specialist' : 'backend-target'
+          }
+        )
+      )
+    } finally {
+      setApiRequestConnection(null)
+      $sessions.set([])
+      _resetSessionOwnerHintsForTests()
+    }
   }
-})
+)
 
 describe('ModelMenuPanel MoA presets', () => {
   it('selecting a MoA preset switches PERSISTENTLY via onSelectModel (not the one-shot dispatch)', async () => {
@@ -161,6 +175,34 @@ describe('ModelMenuPanel MoA presets', () => {
 })
 
 describe('ModelMenuPanel current selection', () => {
+  it('applies saved options through the live alias of a custom provider', async () => {
+    $currentProvider.set('custom:foo')
+    $currentModel.set('fixture')
+    setModelPreset('foo', 'fixture', { effort: 'high' })
+    getGlobalModelOptions.mockResolvedValue({
+      providers: [
+        {
+          aliases: ['custom:foo'],
+          models: ['fixture'],
+          name: 'Foo',
+          slug: 'foo'
+        }
+      ]
+    })
+    const request = vi.fn().mockResolvedValue({})
+    renderPanel(vi.fn(), request)
+    const row = (await screen.findByText('Fixture')).closest('[role="menuitem"]')!
+    fireEvent.keyDown(row, { key: 'ArrowRight' })
+    fireEvent.click(await screen.findByRole('menuitem', { name: /apply options/i }))
+    await vi.waitFor(() =>
+      expect(request).toHaveBeenCalledWith('config.set', {
+        key: 'runtime_options',
+        session_id: 'runtime-1',
+        value: { effort: 'high' }
+      })
+    )
+  })
+
   it('keeps the checkmark on the live SessionView model when a stale options response disagrees', async () => {
     $currentProvider.set('google')
     $currentModel.set('gemini-3.1-pro')

@@ -208,6 +208,7 @@ class NonEditingProgressCaptureAdapter(ProgressCaptureAdapter):
 
 class FakeAgent:
     def __init__(self, **kwargs):
+        self.model = kwargs["model"]
         # Capture anything passed via kwargs (older code path) but don't
         # freeze it — production now assigns tool_progress_callback after
         # construction (see gateway/run.py around the agent-cache hit),
@@ -285,6 +286,7 @@ class FailingNativeTaskCardAdapter(NativeTaskCardAdapter):
 
 class DuplicateNativeToolsAgent:
     def __init__(self, **kwargs):
+        self.model = kwargs["model"]
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tool_start_callback = kwargs.get("tool_start_callback")
         self.tool_complete_callback = kwargs.get("tool_complete_callback")
@@ -316,6 +318,7 @@ class ThinkingAgent:
     """
 
     def __init__(self, **kwargs):
+        self.model = kwargs["model"]
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tools = []
 
@@ -336,6 +339,7 @@ class LongPreviewAgent:
     LONG_CMD = "cd /home/teknium/.hermes/hermes-agent/.worktrees/hermes-d8860339 && source .venv/bin/activate && python -m pytest tests/gateway/test_run_progress_topics.py -n0 -q"
 
     def __init__(self, **kwargs):
+        self.model = kwargs["model"]
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tools = []
 
@@ -353,6 +357,7 @@ class UrlPreviewAgent:
     URL = "https://hermes-agent.nousresearch.com/docs/gateway/discord/tool-progress"
 
     def __init__(self, **kwargs):
+        self.model = kwargs["model"]
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tools = []
 
@@ -373,6 +378,7 @@ class UrlPreviewAgent:
 
 class DelayedProgressAgent:
     def __init__(self, **kwargs):
+        self.model = kwargs["model"]
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tools = []
 
@@ -392,6 +398,7 @@ class RetryableEditProgressAgent:
     """Keep the turn alive long enough to retry the same progress bubble."""
 
     def __init__(self, **kwargs):
+        self.model = kwargs["model"]
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tools = []
 
@@ -417,6 +424,7 @@ class ManyProgressLinesAgent:
     """Emits enough tool-progress lines to exceed a single platform bubble."""
 
     def __init__(self, **kwargs):
+        self.model = kwargs["model"]
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tools = []
 
@@ -440,6 +448,7 @@ class ManyProgressLinesAgent:
 
 class DelayedInterimAgent:
     def __init__(self, **kwargs):
+        self.model = kwargs["model"]
         self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
         self.tools = []
 
@@ -797,6 +806,7 @@ def test_discord_truncated_tool_url_links_to_full_destination(monkeypatch, tmp_p
 
 class CommentaryAgent:
     def __init__(self, **kwargs):
+        self.model = kwargs["model"]
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
         self.stream_delta_callback = kwargs.get("stream_delta_callback")
@@ -817,6 +827,7 @@ class CommentaryAgent:
 
 class PreviewedResponseAgent:
     def __init__(self, **kwargs):
+        self.model = kwargs["model"]
         self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
         self.tools = []
 
@@ -833,6 +844,7 @@ class PreviewedResponseAgent:
 
 class PreviewedSplitAfterCommentaryAgent:
     def __init__(self, **kwargs):
+        self.model = kwargs["model"]
         self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
         self.session_id = kwargs.get("session_id")
         self.tools = []
@@ -851,6 +863,7 @@ class PreviewedSplitAfterCommentaryAgent:
 
 class StreamingRefineAgent:
     def __init__(self, **kwargs):
+        self.model = kwargs["model"]
         self.stream_delta_callback = kwargs.get("stream_delta_callback")
         self.tools = []
 
@@ -872,6 +885,7 @@ class QueuedCommentaryAgent:
     calls = 0
 
     def __init__(self, **kwargs):
+        self.model = kwargs["model"]
         self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
         self.tools = []
 
@@ -893,6 +907,7 @@ class QueuedMediaAgent:
     media_path = None
 
     def __init__(self, **kwargs):
+        self.model = kwargs["model"]
         self.stream_delta_callback = kwargs.get("stream_delta_callback")
         self.tools = []
 
@@ -919,6 +934,7 @@ class QueuedSilenceAgent:
     calls = 0
 
     def __init__(self, **kwargs):
+        self.model = kwargs["model"]
         self.tools = []
 
     def run_conversation(self, message, conversation_history=None, task_id=None):
@@ -936,6 +952,7 @@ class QueuedFailedEmptyAgent:
     calls = 0
 
     def __init__(self, **kwargs):
+        self.model = kwargs["model"]
         self.tools = []
 
     def run_conversation(self, message, conversation_history=None, task_id=None):
@@ -957,6 +974,7 @@ class QueuedFailedEmptyAgent:
 
 class BackgroundReviewAgent:
     def __init__(self, **kwargs):
+        self.model = kwargs["model"]
         self.background_review_callback = kwargs.get("background_review_callback")
         self.tools = []
 
@@ -975,6 +993,7 @@ class VerboseAgent:
     LONG_CODE = "x" * 300
 
     def __init__(self, **kwargs):
+        self.model = kwargs["model"]
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tools = []
 
@@ -1191,6 +1210,7 @@ class TransformedStreamAgent:
     """
 
     def __init__(self, **kwargs):
+        self.model = kwargs["model"]
         self.stream_delta_callback = kwargs.get("stream_delta_callback")
         self.tools = []
 
@@ -1683,6 +1703,7 @@ class TerminalCommandAgent:
     )
 
     def __init__(self, **kwargs):
+        self.model = kwargs["model"]
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tools = []
 
@@ -1846,6 +1867,7 @@ class MultiTerminalCommandAgent:
     different tool, then terminal again — to exercise header collapsing."""
 
     def __init__(self, **kwargs):
+        self.model = kwargs["model"]
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tools = []
 

@@ -257,7 +257,7 @@ class TestCommandCodeFetchModelsPickerContract:
         assert profile is not None
         assert "base_url" in inspect.signature(profile.fetch_models).parameters
 
-    def test_resolve_provider_full(self):
+    def test_resolve_provider_full(self, monkeypatch):
         """Both profiles must resolve through the model-switch path.
 
         Regression: ``resolve_provider_full`` only knew models.dev + overlay
@@ -265,16 +265,40 @@ class TestCommandCodeFetchModelsPickerContract:
         "Unknown provider" on /model switches even though the picker listed
         them.
         """
+        from agent import models_dev
         from hermes_cli.providers import resolve_provider_full
+
+        # Exercise the plugin-only fallback, not the changing live catalog.
+        monkeypatch.setattr(models_dev, "get_provider_info", lambda *_a, **_k: None)
 
         chat = resolve_provider_full("commandcode", {}, [])
         assert chat is not None and chat.id == "commandcode"
         assert chat.transport == "openai_chat"
         assert "COMMANDCODE_API_KEY" in chat.api_key_env_vars
+        assert chat.source == "plugin-profile"
 
         anth = resolve_provider_full("commandcode-anthropic", {}, [])
         assert anth is not None and anth.id == "commandcode-anthropic"
         assert anth.transport == "anthropic_messages"
+        assert anth.source == "plugin-profile"
+
+    def test_catalog_provider_precedes_plugin_profile(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from agent import models_dev
+        from hermes_cli.providers import resolve_provider_full
+
+        catalog = SimpleNamespace(
+            name="Catalog fixture", env=["CATALOG_FIXTURE_KEY"],
+            api="https://catalog.invalid/v1", doc="https://catalog.invalid/docs",
+        )
+        monkeypatch.setattr(models_dev, "get_provider_info", lambda *_a, **_k: catalog)
+
+        chat = resolve_provider_full("commandcode", {}, [])
+        assert chat is not None and chat.id == "commandcode"
+        assert chat.source == "models.dev"
+        assert chat.api_key_env_vars == ("CATALOG_FIXTURE_KEY",)
+        assert chat.base_url == catalog.api
 
 
 # ── base_url endpoint override ───────────────────────────────────────────────

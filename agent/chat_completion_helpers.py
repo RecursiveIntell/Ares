@@ -2066,6 +2066,14 @@ def _build_api_kwargs_for_mode(agent, api_messages: list, tools_for_api: list | 
     try:
         from providers import get_provider_profile
         _profile = get_provider_profile(agent.provider)
+        if _profile is None:
+            from hermes_cli.runtime_provider import has_named_custom_provider
+
+            # Named custom routes retain their configured identity on a model
+            # switch. Their wire behavior must match fresh construction, which
+            # uses the registered custom profile, not the unknown-provider path.
+            if has_named_custom_provider(agent.provider):
+                _profile = get_provider_profile("custom")
     except Exception:
         _profile = None
 
@@ -2609,8 +2617,11 @@ def try_activate_fallback(
     # Use centralized router for client construction.
     # raw_codex=True because the main agent needs direct responses.stream()
     # access for Codex providers.
-    from agent.agent_runtime_helpers import _snapshot_context_handoff
+    from agent.agent_runtime_helpers import (
+        _snapshot_context_handoff, apply_fast_mode_runtime, get_fast_mode_intent,
+    )
 
+    requested_fast_tier = get_fast_mode_intent(agent)
     restore_handoff = _snapshot_context_handoff(agent)
     handoff_accepted = False
     try:
@@ -2736,6 +2747,9 @@ def try_activate_fallback(
         agent.requested_provider = fb_provider
         agent.base_url = fb_base_url
         agent.api_mode = fb_api_mode
+        # Provider resolution may have yielded to a newer explicit Fast choice.
+        requested_fast_tier = get_fast_mode_intent(agent)
+        apply_fast_mode_runtime(agent, requested_fast_tier)
         # Per-provider reasoning_content echo opt-in (see _reasoning_echo_opt_in).
         # Read from the fallback entry so the flag travels with the active
         # provider; restore_primary_runtime will revert it from the snapshot.
@@ -2886,6 +2900,10 @@ def try_activate_fallback(
                 ),
             )
         handoff_accepted = True
+
+        primary = getattr(agent, "_primary_runtime", None)
+        if isinstance(primary, dict):
+            primary.setdefault("service_tier_intent", requested_fast_tier)
 
         # Re-resolve reasoning_config for the new fallback model (Closes #21256).
         # Shared chokepoint: per-model override > global reasoning_effort
