@@ -58,6 +58,7 @@ class ClarifyThenToolAgent:
     """Emits a clarify tool.started (with raw args) then a normal tool."""
 
     def __init__(self, **kwargs):
+        self.model = kwargs["model"]
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tools = []
 
