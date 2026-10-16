@@ -10,6 +10,7 @@ import {
   $currentFastMode,
   $currentReasoningEffort,
   $defaultReasoningEffort,
+  getComposerRuntimeOptions,
   markComposerSelectionManual,
   setCurrentCwd,
   setCurrentFastMode,
@@ -63,6 +64,21 @@ describe('useHermesConfig refreshHermesConfig', () => {
     expect($defaultReasoningEffort.get()).toBe('high')
     // The manual pick itself is still respected.
     expect($currentReasoningEffort.get()).toBe('low')
+  })
+
+  it('seeds composer defaults without persisting them as explicit draft choices', async () => {
+    localStorage.removeItem('hermes.desktop.composer.reasoning-effort')
+    localStorage.removeItem('hermes.desktop.composer.fast')
+    mockConfig({ agent: { reasoning_effort: 'xhigh', service_tier: 'fast' } })
+    const { result } = renderHook(() => useHermesConfig({ activeSessionIdRef: { current: null } }))
+
+    await act(async () => {
+      await result.current.refreshHermesConfig()
+    })
+
+    expect($currentReasoningEffort.get()).toBe('xhigh')
+    expect($currentFastMode.get()).toBe(true)
+    expect(getComposerRuntimeOptions()).toEqual({ effort: '', fast: undefined })
   })
 
   it('does not let terminal.cwd replace an inactive selected workspace', async () => {

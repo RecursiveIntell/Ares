@@ -3255,6 +3255,9 @@ def init_agent(
     # preferred model gets a fresh attempt each time.  Uses a single dict
     # so new state fields are easy to add without N individual attributes.
     _cc = agent.context_compressor
+    from agent.agent_runtime_helpers import apply_fast_mode_runtime, get_fast_mode_intent
+
+    requested_fast_tier = get_fast_mode_intent(agent)
     agent._primary_runtime = {
         "model": agent.model,
         "provider": agent.provider,
@@ -3266,6 +3269,7 @@ def init_agent(
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,
         "reasoning_echo_flag": getattr(agent, "_reasoning_echo_flag", False),
+        "service_tier_intent": requested_fast_tier,
         # Context engine state that _try_activate_fallback() overwrites.
         # Use getattr for model/base_url/api_key/provider since plugin
         # engines may not have these (they're ContextCompressor-specific).
@@ -3282,6 +3286,7 @@ def init_agent(
             "anthropic_base_url": agent._anthropic_base_url,
             "is_anthropic_oauth": agent._is_anthropic_oauth,
         })
+    apply_fast_mode_runtime(agent, requested_fast_tier)
 
 
 

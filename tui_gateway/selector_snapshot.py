@@ -23,7 +23,9 @@ def runtime_selector_values(agent, session, *, host_owned, owns_once,
     if host_owned and "service_tier" in mirror:
         tier = mirror["service_tier"] or ""
     else:
-        tier = getattr(agent, "service_tier", None) or mirror.get("service_tier") or ""
+        # A live in-process agent owns its effective tier. A mirror from a prior
+        # model/runtime must not resurrect a stale Fast value.
+        tier = (getattr(agent, "service_tier", None) or "") if agent is not None else mirror.get("service_tier", "") or ""
         if agent is None and record.get("create_service_tier_override") is not None:
             tier = record["create_service_tier_override"]
     model = pending_model or (getattr(agent, "model", "") if owns_once

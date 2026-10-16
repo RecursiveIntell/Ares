@@ -140,7 +140,7 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
     // session, OR when it's a global broadcast and we have no session.
     const apply = (explicitSid ? isActiveEvent : !activeSessionIdRef.current) || rebound
     const statePatch = sessionInfoStatePatch(payload)
-    const hasStatePatch = hasSessionInfoStatePatch(statePatch)
+    const hasStatePatch = hasSessionInfoStatePatch(statePatch) || Boolean(payload?.pending_runtime_options)
     const modelChanged = typeof payload?.model === 'string'
     const providerChanged = typeof payload?.provider === 'string'
     const runningChanged = typeof payload?.running === 'boolean'
@@ -158,6 +158,20 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
     // settled: only a fresh runtime binding or durable hydrate may do that.
     const selectorPatch = reconcileSelectorInfo(knownState ?? createClientSessionState(), payload ?? {})
     const retiredRuntime = Boolean(knownState?.reconnecting)
+    // A fresh renderer has no optimistic state to preserve. Hydrate the
+    // session-owned deferred intent only from an admitted, non-retired owner.
+    const reportedOptions = retiredRuntime ? null : payload?.pending_runtime_options
+    const rawIncomingOptions =
+      reportedOptions && typeof reportedOptions === 'object'
+        ? {
+            ...(typeof reportedOptions.effort === 'string' ? { effort: reportedOptions.effort } : {}),
+            ...(typeof reportedOptions.fast === 'boolean' ? { fast: reportedOptions.fast } : {})
+          }
+        : null
+    const incomingOptions = knownState?.selectorObservation && !selectorPatch.selectorObservation
+      ? null
+      : rawIncomingOptions
+    const pendingOptions = knownState?.pendingRuntimeOptions ?? incomingOptions
     const modelValueChanged = modelChanged && payload!.model !== (knownState?.model ?? $currentModel.get())
 
     const providerValueChanged =
@@ -217,16 +231,30 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
         setCurrentPersonality(normalizePersonalityValue(payload.personality))
       }
 
-      if (selectorPatch.reasoningEffort !== undefined) {
+      if (
+        selectorPatch.reasoningEffort !== undefined &&
+        (pendingOptions?.effort === undefined || selectorPatch.reasoningEffort === pendingOptions.effort)
+      ) {
         setCurrentReasoningEffort(selectorPatch.reasoningEffort, false)
       }
 
-      if (selectorPatch.serviceTier !== undefined) { setCurrentServiceTier(selectorPatch.serviceTier) }
+      if (
+        selectorPatch.serviceTier !== undefined &&
+        (pendingOptions?.fast === undefined || selectorPatch.fast === pendingOptions.fast)
+      ) { setCurrentServiceTier(selectorPatch.serviceTier) }
 
-      if (selectorPatch.fast !== undefined) { setCurrentFastMode(selectorPatch.fast, false) }
+      if (
+        selectorPatch.fast !== undefined &&
+        (pendingOptions?.fast === undefined || selectorPatch.fast === pendingOptions.fast)
+      ) { setCurrentFastMode(selectorPatch.fast, false) }
 
       if (typeof payload?.yolo === 'boolean') {
         setYoloActive(payload.yolo)
+      }
+
+      if (sessionId && !knownState?.pendingRuntimeOptions && incomingOptions) {
+        if (incomingOptions.effort !== undefined) { setCurrentReasoningEffort(incomingOptions.effort, false) }
+        if (incomingOptions.fast !== undefined) { setCurrentFastMode(incomingOptions.fast, false) }
       }
     }
 
@@ -235,11 +263,19 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
         sessionId,
         state => {
           const { model: _model, provider: _provider, reasoningEffort: _effort, fast: _fast, serviceTier: _tier, ...other } = statePatch
+          const pending = state.pendingRuntimeOptions ?? incomingOptions
+          const base = !state.pendingRuntimeOptions && incomingOptions
+            ? { ...state, pendingRuntimeOptions: incomingOptions }
+            : state
+          const selectors = reconcileSelectorInfo(base, payload ?? {})
 
           return {
             ...state,
             ...other,
-            ...reconcileSelectorInfo(state, payload ?? {}),
+            ...selectors,
+            ...(pending?.effort !== undefined ? { reasoningEffort: pending.effort } : {}),
+            ...(pending?.fast !== undefined ? { fast: pending.fast } : {}),
+            pendingRuntimeOptions: selectors.pendingRuntimeOptions !== undefined ? selectors.pendingRuntimeOptions : pending ?? null,
             branch: other.branch ?? state.branch,
             cwd: other.cwd ?? state.cwd
           }

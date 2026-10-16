@@ -116,8 +116,10 @@ export function useHermesConfig({ activeSessionIdRef }: HermesConfigOptions) {
             return
           }
 
-          setCurrentReasoningEffort(reasoning)
-          setCurrentFastMode(FAST_TIERS.has(tier.toLowerCase()))
+          // Profile defaults seed presentation only. Persisting these as draft
+          // values turned config fallback into explicit sticky intent.
+          setCurrentReasoningEffort(reasoning, false)
+          setCurrentFastMode(FAST_TIERS.has(tier.toLowerCase()), false)
         }
 
         if (!canPublish()) {
