@@ -126,7 +126,9 @@ export function useSubmission(opts: UseSubmissionOptions) {
           }
         })
         .catch((e: Error) => sys(`error: ${e.message}`))
-        .finally(() => patchUiState(state => ({ ...state, busy: false, status: idleModelStatus(state.info, state.sid) })))
+        .finally(() =>
+          patchUiState(state => ({ ...state, busy: false, status: idleModelStatus(state.info, state.sid) }))
+        )
     },
     [appendMessage, gw, sys]
   )

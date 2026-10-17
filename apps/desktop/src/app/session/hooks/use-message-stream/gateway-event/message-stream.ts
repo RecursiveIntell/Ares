@@ -357,7 +357,12 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
       // This bubble ended, not the host-owned goal chain. Keep the existing
       // per-runtime Stop control until a backend terminal session.info, even
       // when a cooperative interrupt is still pending.
-      updateSessionState(sessionId, state => ({ ...state, busy: true, turnLive: true, awaitingResponse: !state.interrupted }))
+      updateSessionState(sessionId, state => ({
+        ...state,
+        busy: true,
+        turnLive: true,
+        awaitingResponse: !state.interrupted
+      }))
     }
 
     // Structured billing wall forwarded by the gateway (out of credits /

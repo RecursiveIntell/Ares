@@ -6,9 +6,18 @@ import { setApiRequestConnection, setApiRequestProfile } from '@/api/client'
 import type * as Gateway from '@/store/gateway'
 import { $newChatConnectionId, $newChatProfile, $newChatRoute } from '@/store/profile'
 import {
-  $activeSessionId, $currentModel, $currentProvider, $gatewayState, $modelPickerOpen, $sessions,
-  _resetComposerModelSelectionsForTests, _resetSessionOwnerHintsForTests, captureComposerModelSelection,
-  recordComposerModelSelection, setComposerModelSelectionOwner, setSessionOwnerHint
+  $activeSessionId,
+  $currentModel,
+  $currentProvider,
+  $gatewayState,
+  $modelPickerOpen,
+  $sessions,
+  _resetComposerModelSelectionsForTests,
+  _resetSessionOwnerHintsForTests,
+  captureComposerModelSelection,
+  recordComposerModelSelection,
+  setComposerModelSelectionOwner,
+  setSessionOwnerHint
 } from '@/store/session'
 import { knownOwnerForSession } from '@/store/session-states'
 
@@ -16,17 +25,31 @@ import { ModelPickerOverlay } from './model-picker-overlay'
 
 const calls = vi.hoisted(() => ({ agent: vi.fn(), profile: vi.fn(), rest: vi.fn() }))
 vi.mock('@/store/gateway', async original => ({
-  ...await original<typeof Gateway>(),
+  ...(await original<typeof Gateway>()),
   requestGatewayForAgent: (...args: unknown[]) => calls.agent(...args),
   requestGatewayForProfile: (...args: unknown[]) => calls.profile(...args)
 }))
-vi.mock('@/hermes', () => ({ getGlobalModelOptions: (...args: unknown[]) => calls.rest(...args), setApiRequestProfile: vi.fn() }))
+vi.mock('@/hermes', () => ({
+  getGlobalModelOptions: (...args: unknown[]) => calls.rest(...args),
+  setApiRequestProfile: vi.fn()
+}))
 beforeAll(() => {
   Element.prototype.scrollIntoView = vi.fn()
-  vi.stubGlobal('ResizeObserver', class { observe() {} unobserve() {} disconnect() {} })
+  vi.stubGlobal(
+    'ResizeObserver',
+    class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+  )
 })
 const owner = { connectionId: 'source-b', profile: 'same-name', targetProfile: 'backend-b' }
-const options = { model: 'catalog-b', provider: 'custom:b', providers: [{ name: 'B', slug: 'custom:b', models: ['catalog-b', 'pinned-b'] }] }
+const options = {
+  model: 'catalog-b',
+  provider: 'custom:b',
+  providers: [{ name: 'B', slug: 'custom:b', models: ['catalog-b', 'pinned-b'] }]
+}
 
 beforeEach(() => {
   vi.clearAllMocks()
@@ -48,13 +71,28 @@ beforeEach(() => {
   $newChatConnectionId.set(owner.connectionId)
   setComposerModelSelectionOwner(owner)
 })
-afterEach(() => { cleanup(); setApiRequestConnection(null); setApiRequestProfile('default'); $newChatRoute.set(null); $newChatProfile.set(null); $newChatConnectionId.set(null); $modelPickerOpen.set(false); $gatewayState.set('idle'); $sessions.set([]); _resetSessionOwnerHintsForTests() })
+afterEach(() => {
+  cleanup()
+  setApiRequestConnection(null)
+  setApiRequestProfile('default')
+  $newChatRoute.set(null)
+  $newChatProfile.set(null)
+  $newChatConnectionId.set(null)
+  $modelPickerOpen.set(false)
+  $gatewayState.set('idle')
+  $sessions.set([])
+  _resetSessionOwnerHintsForTests()
+})
 
 function mount() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   const ambient = vi.fn(async () => options)
   const select = vi.fn()
-  const view = render(<QueryClientProvider client={client}><ModelPickerOverlay gateway={{ request: ambient } as never} onSelect={select} profile="default" /></QueryClientProvider>)
+  const view = render(
+    <QueryClientProvider client={client}>
+      <ModelPickerOverlay gateway={{ request: ambient } as never} onSelect={select} profile="default" />
+    </QueryClientProvider>
+  )
 
   return { client, view, ambient, select }
 }
@@ -62,12 +100,19 @@ function mount() {
 it('uses the captured fresh draft source and backend target in the actual overlay catalog', async () => {
   const { ambient } = mount()
   await screen.findByText('catalog-b')
-  expect(calls.agent).toHaveBeenCalledWith('source-b', 'same-name', 'model.options', { profile: 'backend-b', explicit_only: true })
+  expect(calls.agent).toHaveBeenCalledWith('source-b', 'same-name', 'model.options', {
+    profile: 'backend-b',
+    explicit_only: true
+  })
   expect(ambient).not.toHaveBeenCalled()
 })
 
 it('does not mark a stale catalog default current when a valid scalar receipt owns the draft', async () => {
-  recordComposerModelSelection(captureComposerModelSelection(owner), { model: 'scalar-b', provider: '', source: 'default' })
+  recordComposerModelSelection(captureComposerModelSelection(owner), {
+    model: 'scalar-b',
+    provider: '',
+    source: 'default'
+  })
   $currentModel.set('scalar-b')
   $currentProvider.set('')
   const { select } = mount()
@@ -78,11 +123,19 @@ it('does not mark a stale catalog default current when a valid scalar receipt ow
 
 it('preserves a deliberate draft pin through a late catalog reply', async () => {
   let resolve!: (value: typeof options) => void
-  calls.agent.mockReturnValueOnce(new Promise(r => { resolve = r }))
+  calls.agent.mockReturnValueOnce(
+    new Promise(r => {
+      resolve = r
+    })
+  )
   mount()
   await waitFor(() => expect(calls.agent).toHaveBeenCalledOnce())
   await act(async () => {
-    recordComposerModelSelection(captureComposerModelSelection(owner), { model: 'pinned-b', provider: 'custom:b', source: 'manual' })
+    recordComposerModelSelection(captureComposerModelSelection(owner), {
+      model: 'pinned-b',
+      provider: 'custom:b',
+      source: 'manual'
+    })
     $currentModel.set('pinned-b')
     $currentProvider.set('custom:b')
     resolve(options)
@@ -92,7 +145,10 @@ it('preserves a deliberate draft pin through a late catalog reply', async () => 
 })
 
 it.each([
-  ['legacy', 'rejected'], ['legacy', 'empty'], ['local', 'rejected'], ['local', 'empty']
+  ['legacy', 'rejected'],
+  ['legacy', 'empty'],
+  ['local', 'rejected'],
+  ['local', 'empty']
 ] as const)('preserves a live %s owner through %s RPC recovery in the overlay', async (source, rpcUnavailable) => {
   const runtimeId = 'owned-runtime'
   const connectionId = source === 'legacy' ? null : 'local'
@@ -102,7 +158,9 @@ it.each([
     setSessionOwnerHint(runtimeId, { connectionId, profile: 'default', mode: 'local' })
   }
 
-  expect(knownOwnerForSession(runtimeId)).toEqual(connectionId ? { connectionId, profile: 'default', mode: 'local' } : 'default')
+  expect(knownOwnerForSession(runtimeId)).toEqual(
+    connectionId ? { connectionId, profile: 'default', mode: 'local' } : 'default'
+  )
   $activeSessionId.set(runtimeId)
   $currentModel.set('')
   $currentProvider.set('')
@@ -116,17 +174,31 @@ it.each([
 
   const model = source === 'legacy' ? 'legacy-a' : 'local-b'
   const expected = { ...options, model, providers: [{ ...options.providers[0], models: [model] }] }
-  calls.rest.mockImplementation(async (_opts, scope) => scope.connectionId === connectionId ? expected : options)
+  calls.rest.mockImplementation(async (_opts, scope) => (scope.connectionId === connectionId ? expected : options))
   const { client, ambient } = mount()
-  await waitFor(() => expect(calls.rest).toHaveBeenCalledWith({ explicitOnly: true }, { connectionId, profile: 'default' }))
+  await waitFor(() =>
+    expect(calls.rest).toHaveBeenCalledWith({ explicitOnly: true }, { connectionId, profile: 'default' })
+  )
   await screen.findByText(model)
   expect(ambient).not.toHaveBeenCalled()
 
   if (source === 'legacy') {
-    expect(calls.profile).toHaveBeenCalledWith('default', 'model.options', { profile: 'default', session_id: runtimeId, explicit_only: true }, undefined, undefined)
+    expect(calls.profile).toHaveBeenCalledWith(
+      'default',
+      'model.options',
+      { profile: 'default', session_id: runtimeId, explicit_only: true },
+      undefined,
+      undefined
+    )
   } else {
-    expect(calls.agent).toHaveBeenCalledWith('local', 'default', 'model.options', { profile: 'default', session_id: runtimeId, explicit_only: true })
+    expect(calls.agent).toHaveBeenCalledWith('local', 'default', 'model.options', {
+      profile: 'default',
+      session_id: runtimeId,
+      explicit_only: true
+    })
   }
 
-  expect(client.getQueryData(['model-options', source === 'legacy' ? 'default' : 'local::default', runtimeId])).toEqual(expected)
+  expect(client.getQueryData(['model-options', source === 'legacy' ? 'default' : 'local::default', runtimeId])).toEqual(
+    expected
+  )
 })

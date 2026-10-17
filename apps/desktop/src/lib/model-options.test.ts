@@ -12,11 +12,7 @@ import type { ModelOptionsResponse } from '@/types/hermes'
 
 import { deferred } from '../test/deferred'
 
-import {
-  modelOptionsQueryKey,
-  requestModelOptions,
-  selectionUnavailable
-} from './model-options'
+import { modelOptionsQueryKey, requestModelOptions, selectionUnavailable } from './model-options'
 
 const globalOptions = { model: 'hermes-4', provider: 'nous', providers: [] }
 
@@ -29,17 +25,26 @@ vi.mock('@/hermes', () => ({
 // renderer's strict typecheck or changing Electron source/compiler settings.
 const { apiRequestRegistryConnectionId, resolveProfileApiRequest } = await vi.importActual<{
   apiRequestRegistryConnectionId: (request: HermesApiRequest) => null | string
-  resolveProfileApiRequest: (profile: unknown, path: string, opts: Record<string, unknown>) => { backendProfile: null | string }
+  resolveProfileApiRequest: (
+    profile: unknown,
+    path: string,
+    opts: Record<string, unknown>
+  ) => { backendProfile: null | string }
 }>('../../electron/connection-config')
 
 const { normalizeRegistry, resolvedConnectionId, resolveRegistryLocalRoute } = await vi.importActual<{
   normalizeRegistry: (input: unknown) => unknown
   resolvedConnectionId: (registry: unknown, descriptor: Record<string, unknown>) => null | string
-  resolveRegistryLocalRoute: (profile: unknown, opts: { globalRemote: boolean }) => { delegate: boolean; poolKey: string }
+  resolveRegistryLocalRoute: (
+    profile: unknown,
+    opts: { globalRemote: boolean }
+  ) => { delegate: boolean; poolKey: string }
 }>('../../electron/connection-registry')
 
 const { resolveDesktopRemoteRoute } = await vi.importActual<{
-  resolveDesktopRemoteRoute: (input: Record<string, unknown>) => null | { connectionId?: string; kind: string; source: string; url?: string }
+  resolveDesktopRemoteRoute: (
+    input: Record<string, unknown>
+  ) => null | { connectionId?: string; kind: string; source: string; url?: string }
 }>('../../electron/desktop-remote-route')
 
 describe('requestModelOptions', () => {
@@ -87,7 +92,10 @@ describe('requestModelOptions', () => {
       provider: 'hermes-local'
     })
 
-    expect(getGlobalModelOptions).toHaveBeenCalledWith({ explicitOnly: true }, { connectionId: null, profile: 'default' })
+    expect(getGlobalModelOptions).toHaveBeenCalledWith(
+      { explicitOnly: true },
+      { connectionId: null, profile: 'default' }
+    )
   })
 
   it('recovers through profile-scoped REST when the gateway catalog request fails', async () => {
@@ -106,7 +114,10 @@ describe('requestModelOptions', () => {
     await expect(requestModelOptions({ gateway: gateway as never, sessionId: 'session-1' })).resolves.toEqual(
       restPayload
     )
-    expect(getGlobalModelOptions).toHaveBeenCalledWith({ explicitOnly: true }, { connectionId: null, profile: 'default' })
+    expect(getGlobalModelOptions).toHaveBeenCalledWith(
+      { explicitOnly: true },
+      { connectionId: null, profile: 'default' }
+    )
   })
 
   it('preserves the gateway error when its REST recovery path also fails', async () => {
@@ -144,13 +155,19 @@ describe('requestModelOptions', () => {
       refresh: true,
       session_id: 'session-1'
     })
-    expect(getGlobalModelOptions).toHaveBeenCalledWith({ explicitOnly: true, refresh: true }, { connectionId: null, profile: 'default' })
+    expect(getGlobalModelOptions).toHaveBeenCalledWith(
+      { explicitOnly: true, refresh: true },
+      { connectionId: null, profile: 'default' }
+    )
   })
 
   it('falls back to REST when no gateway is connected', async () => {
     await requestModelOptions({ refresh: true })
 
-    expect(getGlobalModelOptions).toHaveBeenCalledWith({ explicitOnly: true, refresh: true }, { connectionId: null, profile: 'default' })
+    expect(getGlobalModelOptions).toHaveBeenCalledWith(
+      { explicitOnly: true, refresh: true },
+      { connectionId: null, profile: 'default' }
+    )
   })
 
   it('prefers an owner-routed request over the ambient gateway socket', async () => {
@@ -179,7 +196,11 @@ describe('requestModelOptions', () => {
       routedPayload
     )
 
-    expect(request).toHaveBeenCalledWith('model.options', { explicit_only: true, profile: 'default', session_id: 'tile-1' })
+    expect(request).toHaveBeenCalledWith('model.options', {
+      explicit_only: true,
+      profile: 'default',
+      session_id: 'tile-1'
+    })
     expect(gateway.request).not.toHaveBeenCalled()
   })
 
@@ -199,23 +220,36 @@ describe('requestModelOptions', () => {
   })
 
   it('freezes source and target before a late gateway failure', async () => {
-    vi.mocked(getGlobalModelOptions).mockResolvedValueOnce({ providers: [{ slug: 'target-a', name: 'Target A', models: ['model-a'] }] })
+    vi.mocked(getGlobalModelOptions).mockResolvedValueOnce({
+      providers: [{ slug: 'target-a', name: 'Target A', models: ['model-a'] }]
+    })
     setApiRequestConnection('source-a')
     setApiRequestProfile('target-a')
     let reject!: (err: Error) => void
-    const request = vi.fn(() => new Promise<never>((_, fail) => { reject = fail }))
+    const request = vi.fn(
+      () =>
+        new Promise<never>((_, fail) => {
+          reject = fail
+        })
+    )
     const pending = requestModelOptions({ request, sessionId: 'session-a' })
     setApiRequestConnection('source-b')
     setApiRequestProfile('target-b')
     reject(new Error('late gateway failure'))
     await pending
-    expect(getGlobalModelOptions).toHaveBeenCalledWith({ explicitOnly: true }, { connectionId: 'source-a', profile: 'target-a' })
+    expect(getGlobalModelOptions).toHaveBeenCalledWith(
+      { explicitOnly: true },
+      { connectionId: 'source-a', profile: 'target-a' }
+    )
   })
 
   it('keeps an explicit local owner on local during ambient remote activity', async () => {
     setApiRequestConnection('remote-source')
     await requestModelOptions({ connectionId: 'local', profile: 'local-specialist' })
-    expect(getGlobalModelOptions).toHaveBeenCalledWith({ explicitOnly: true }, { connectionId: 'local', profile: 'local-specialist' })
+    expect(getGlobalModelOptions).toHaveBeenCalledWith(
+      { explicitOnly: true },
+      { connectionId: 'local', profile: 'local-specialist' }
+    )
   })
 })
 
@@ -231,7 +265,9 @@ describe('modelOptionsQueryKey', () => {
   })
 
   it('isolates identically named profiles and sessions on different sources', () => {
-    expect(modelOptionsQueryKey('target', 'session', 'remote-a')).not.toEqual(modelOptionsQueryKey('target', 'session', 'remote-b'))
+    expect(modelOptionsQueryKey('target', 'session', 'remote-a')).not.toEqual(
+      modelOptionsQueryKey('target', 'session', 'remote-b')
+    )
     expect(modelOptionsQueryKey('target', 'session', 'local')).toEqual(['model-options', 'local::target', 'session'])
   })
 })
@@ -281,19 +317,29 @@ describe('legacy-null and explicit-local catalog authority', () => {
 
     if (connectionId === null) {
       const route = resolveProfileApiRequest(request.profile, request.path, {
-        primaryProfile: 'default', globalRemote: true
+        primaryProfile: 'default',
+        globalRemote: true
       })
 
       const remote = resolveDesktopRemoteRoute({
-        config: { mode: 'local' }, env, profile: route.backendProfile, registry
+        config: { mode: 'local' },
+        env,
+        profile: route.backendProfile,
+        registry
       })
 
       expect(route.backendProfile).toBeNull()
       expect(remote).toMatchObject({ kind: 'remote', source: 'env', url: env.url })
       expect(remote?.connectionId).toBeUndefined()
-      expect(resolvedConnectionId(registry, {
-        mode: 'remote', remoteKind: 'url', baseUrl: env.url, token: env.token, authMode: 'token'
-      })).toBeNull()
+      expect(
+        resolvedConnectionId(registry, {
+          mode: 'remote',
+          remoteKind: 'url',
+          baseUrl: env.url,
+          token: env.token,
+          authMode: 'token'
+        })
+      ).toBeNull()
       routed.push({ request, target: env.url })
 
       return catalog('model-legacy-a') as T
@@ -329,32 +375,45 @@ describe('legacy-null and explicit-local catalog authority', () => {
     expect(remote).toMatchObject({ kind: 'remote', source: 'env', url: env.url })
     expect(remote?.connectionId).toBeUndefined()
     expect(resolveRegistryLocalRoute('default', { globalRemote: Boolean(env.url) })).toEqual({
-      delegate: false, poolKey: 'conn:local::default'
+      delegate: false,
+      poolKey: 'conn:local::default'
     })
     expect(modelOptionsQueryKey('default', null, null)).not.toEqual(modelOptionsQueryKey('default', null, 'local'))
   })
 
-  it.each(['rejected', 'empty'])('recovers a %s legacy RPC through the real API and legacy bridge route', async failure => {
-    const request = vi.fn(async () => {
-      if (failure === 'rejected') {
-        throw new Error('inert legacy RPC failure')
-      }
+  it.each(['rejected', 'empty'])(
+    'recovers a %s legacy RPC through the real API and legacy bridge route',
+    async failure => {
+      const request = vi.fn(async () => {
+        if (failure === 'rejected') {
+          throw new Error('inert legacy RPC failure')
+        }
 
-      return { providers: [] }
-    })
+        return { providers: [] }
+      })
 
-    await expect(requestModelOptions({ connectionId: null, profile: 'default', request: request as never })).resolves.toEqual(catalog('model-legacy-a'))
-    expect(request).toHaveBeenCalledWith('model.options', { explicit_only: true, profile: 'default' })
-    expect(routed).toEqual([{ request: expect.objectContaining({ profile: 'default' }), target: env.url }])
-    expect(routed[0].request).not.toHaveProperty('connectionId')
-  })
+      await expect(
+        requestModelOptions({ connectionId: null, profile: 'default', request: request as never })
+      ).resolves.toEqual(catalog('model-legacy-a'))
+      expect(request).toHaveBeenCalledWith('model.options', { explicit_only: true, profile: 'default' })
+      expect(routed).toEqual([{ request: expect.objectContaining({ profile: 'default' }), target: env.url }])
+      expect(routed[0].request).not.toHaveProperty('connectionId')
+    }
+  )
 
   it('keeps forced-local B recovery registry-pinned while the legacy primary resolves to remote A', async () => {
-    const request = vi.fn(async () => { throw new Error('inert local RPC failure') })
-    await expect(requestModelOptions({ connectionId: 'local', profile: 'default', request })).resolves.toEqual(catalog('model-local-b'))
-    expect(routed).toEqual([{
-      request: expect.objectContaining({ connectionId: 'local', profile: 'default' }), target: 'conn:local::default'
-    }])
+    const request = vi.fn(async () => {
+      throw new Error('inert local RPC failure')
+    })
+    await expect(requestModelOptions({ connectionId: 'local', profile: 'default', request })).resolves.toEqual(
+      catalog('model-local-b')
+    )
+    expect(routed).toEqual([
+      {
+        request: expect.objectContaining({ connectionId: 'local', profile: 'default' }),
+        target: 'conn:local::default'
+      }
+    ])
   })
 
   it('retains captured legacy A when its RPC fails after the foreground moves to named source C', async () => {
@@ -371,17 +430,36 @@ describe('legacy-null and explicit-local catalog authority', () => {
 
   it('keeps a late legacy A catalog in its own cache without painting the foreground local B picker', async () => {
     Element.prototype.scrollIntoView = vi.fn()
-    vi.stubGlobal('ResizeObserver', class { observe() {} unobserve() {} disconnect() {} })
+    vi.stubGlobal(
+      'ResizeObserver',
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      }
+    )
     const pending = deferred<ModelOptionsResponse>()
     const requestA = vi.fn(() => pending.promise)
-    const requestB = vi.fn(async () => { throw new Error('inert local RPC failure') })
+    const requestB = vi.fn(async () => {
+      throw new Error('inert local RPC failure')
+    })
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
 
-    const picker = (connectionId: null | string) => createElement(QueryClientProvider, { client },
-      createElement(ModelPickerDialog, {
-        connectionId, profile: 'default', request: (connectionId === null ? requestA : requestB) as never,
-        open: true, onOpenChange: vi.fn(), onSelect: vi.fn(), currentModel: '', currentProvider: ''
-      }))
+    const picker = (connectionId: null | string) =>
+      createElement(
+        QueryClientProvider,
+        { client },
+        createElement(ModelPickerDialog, {
+          connectionId,
+          profile: 'default',
+          request: (connectionId === null ? requestA : requestB) as never,
+          open: true,
+          onOpenChange: vi.fn(),
+          onSelect: vi.fn(),
+          currentModel: '',
+          currentProvider: ''
+        })
+      )
 
     const view = render(picker(null))
 
@@ -393,8 +471,14 @@ describe('legacy-null and explicit-local catalog authority', () => {
       setApiRequestConnection('source-c')
       setApiRequestProfile('other-profile')
       pending.reject(new Error('inert late legacy RPC failure'))
-      await waitFor(() => expect(client.getQueryData(modelOptionsQueryKey('default', null, null))).toMatchObject({ model: 'model-legacy-a' }))
-      expect(client.getQueryData(modelOptionsQueryKey('default', null, 'local'))).toMatchObject({ model: 'model-local-b' })
+      await waitFor(() =>
+        expect(client.getQueryData(modelOptionsQueryKey('default', null, null))).toMatchObject({
+          model: 'model-legacy-a'
+        })
+      )
+      expect(client.getQueryData(modelOptionsQueryKey('default', null, 'local'))).toMatchObject({
+        model: 'model-local-b'
+      })
       expect(screen.queryByText('model-legacy-a')).toBeNull()
       expect(screen.getByText('model-local-b')).toBeTruthy()
     } finally {

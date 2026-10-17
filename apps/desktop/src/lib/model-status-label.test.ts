@@ -67,7 +67,10 @@ describe('model-status-label', () => {
     })
 
     it('keeps an authoritative scalar receipt without inventing its provider from a stale catalog', () => {
-      expect(currentPickerSelection({ model: 'scalar', provider: '', authoritative: true }, options)).toEqual({ model: 'scalar', provider: '' })
+      expect(currentPickerSelection({ model: 'scalar', provider: '', authoritative: true }, options)).toEqual({
+        model: 'scalar',
+        provider: ''
+      })
     })
 
     it('still hydrates an empty pair even when a caller marks it authoritative', () => {

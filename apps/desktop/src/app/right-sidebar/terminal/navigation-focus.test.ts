@@ -10,7 +10,9 @@ beforeEach(() => {
 })
 
 afterEach(() => {
-  for (const stop of cleanup.splice(0)) { stop() }
+  for (const stop of cleanup.splice(0)) {
+    stop()
+  }
   document.body.replaceChildren()
 })
 
@@ -31,23 +33,42 @@ async function terminals() {
   secondHost.append(secondInput)
   document.body.append(firstHost, secondHost)
   let secondReady = true
-  cleanup.push(focus.registerTerminalFocus(first, () => {
-    if (store.$activeTerminalId.get() !== first) { return false }
-    firstInput.focus()
+  cleanup.push(
+    focus.registerTerminalFocus(first, () => {
+      if (store.$activeTerminalId.get() !== first) {
+        return false
+      }
+      firstInput.focus()
 
-    return true
-  }))
-  cleanup.push(focus.registerTerminalFocus(second, () => {
-    if (store.$activeTerminalId.get() !== second || !secondReady) { return false }
-    secondInput.focus()
+      return true
+    })
+  )
+  cleanup.push(
+    focus.registerTerminalFocus(second, () => {
+      if (store.$activeTerminalId.get() !== second || !secondReady) {
+        return false
+      }
+      secondInput.focus()
 
-    return true
-  }))
+      return true
+    })
+  )
   store.selectTerminal(first)
   expect(document.activeElement).toBe(firstInput)
 
-  return { ...store, ...focus, $currentCwd, first, second, firstHost, firstInput, secondInput,
-    setSecondReady: (value: boolean) => { secondReady = value } }
+  return {
+    ...store,
+    ...focus,
+    $currentCwd,
+    first,
+    second,
+    firstHost,
+    firstInput,
+    secondInput,
+    setSecondReady: (value: boolean) => {
+      secondReady = value
+    }
+  }
 }
 
 describe('terminal navigation preserves keyboard ownership', () => {

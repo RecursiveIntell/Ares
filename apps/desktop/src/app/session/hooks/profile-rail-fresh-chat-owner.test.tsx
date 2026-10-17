@@ -126,6 +126,7 @@ function answer(socket: MockGateway, method: string, params: Record<string, unkn
   if (method === 'session.create') {
     expect(params.model).toBe('fixture-default-omar')
     expect(params.provider).toBe('openrouter')
+
     if (!isOmar) {
       throw new Error(`session.create landed on the wrong socket: ${socket.connectUrl}`)
     }
@@ -361,6 +362,7 @@ function Harness({
 
   useEffect(() => {
     let mounted = true
+
     const handle: HarnessHandle = {
       busyRef,
       bindings: () => ({
