@@ -105,6 +105,50 @@ async def test_compress_command_works_when_auto_compaction_disabled():
 
 
 @pytest.mark.asyncio
+async def test_manual_compress_lineage_failure_does_not_claim_recovery_or_retry():
+    history = _make_history()
+    runner = _make_runner(history)
+    agent_instance = MagicMock()
+    agent_instance.shutdown_memory_provider = MagicMock()
+    agent_instance.close = MagicMock()
+    agent_instance._cached_system_prompt = ""
+    agent_instance.tools = None
+    agent_instance.context_compressor.has_content_to_compress.return_value = True
+    agent_instance.context_compressor._last_compress_aborted = True
+    agent_instance.context_compressor._last_summary_fallback_used = False
+    agent_instance.context_compressor._last_summary_error = (
+        "context-governor compact-v2 failed [lineage_integrity_mismatch]"
+    )
+    agent_instance.context_compressor.last_outcome = {
+        "kind": "compaction_failed_closed",
+        "source_operation": "compact-v2",
+        "source_error_code": "lineage_integrity_mismatch",
+    }
+    agent_instance.context_compressor.automatic_rebase_block_reason.return_value = (
+        "CONTEXT_REBASE_LINEAGE_INTEGRITY_MISMATCH"
+    )
+    agent_instance.context_compressor._last_aux_model_failure_model = None
+    agent_instance.context_compressor._last_aux_model_failure_error = None
+    agent_instance.session_id = "sess-1"
+    agent_instance._compress_context.return_value = (list(history), "")
+    agent_instance._compression_skipped_due_to_lock = False
+
+    with (
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key"}),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch("run_agent.AIAgent", return_value=agent_instance),
+        patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100),
+    ):
+        result = await runner._handle_compress_command(_make_event())
+
+    assert "lineage integrity mismatch" in result.lower()
+    assert "no compacted transcript was committed" in result.lower()
+    assert "automatic durable-state rebase is blocked" in result.lower()
+    assert "conversation is unchanged" not in result.lower()
+    assert "run /compress to retry" not in result.lower()
+
+
+@pytest.mark.asyncio
 async def test_compress_command_surfaces_aux_model_failure_even_when_recovered():
     """When the user's configured ``auxiliary.compression.model`` errors out
     but compression recovers by retrying on the main model, /compress must
