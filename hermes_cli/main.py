@@ -12347,6 +12347,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "project", "proxy",
         "prompt-size",
         "resume",
+        "specialists",
         "send", "sessions", "setup",
         "skin", "skills", "slack", "status", "sync", "tools", "uninstall", "update",
         "webhook", "whatsapp", "whatsapp-cloud", "worktree", "chat", "secrets", "security",
@@ -13149,6 +13150,15 @@ def main():
 
     parser, subparsers, chat_parser = build_top_level_parser()
     chat_parser.set_defaults(func=cmd_chat)
+
+    # Specialist proposals are inert and are normally dispatched by the
+    # package's pre-startup route. Keep them registered for parser/help
+    # parity and for callers that construct this parser directly.
+    from hermes_cli.specialists import (
+        register_parser as register_specialists_parser,
+    )
+
+    register_specialists_parser(subparsers)
 
     # =========================================================================
     # model command  (parser built in hermes_cli/subcommands/model.py)
