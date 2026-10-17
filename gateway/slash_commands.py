@@ -4718,14 +4718,10 @@ class GatewaySlashCommandsMixin:
             lines.append(summary["token_line"])
             if summary["note"]:
                 lines.append(summary["note"])
-            if _summary_aborted:
-                lines.append(
-                    t(
-                        "gateway.compress.aborted",
-                        error=(_summary_err or "unknown error"),
-                    )
-                )
-            elif _aux_fail_model:
+            # summarize_manual_compression() already supplied the shared,
+            # redacted abort guidance above. Do not append the older localized
+            # template, which claimed availability and recommended a retry.
+            if not _summary_aborted and _aux_fail_model:
                 lines.append(
                     t(
                         "gateway.compress.aux_failed",

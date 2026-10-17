@@ -788,6 +788,22 @@ def attempt_turn_start_context_rebase(
             "CONTEXT_REBASE_DISABLED",
             str(getattr(agent, "session_id", "") or ""),
         )
+    compressor = getattr(agent, "context_compressor", None)
+    veto_check = getattr(compressor, "automatic_rebase_block_reason", None)
+    if callable(veto_check):
+        try:
+            veto_reason = veto_check()
+        except Exception:
+            veto_reason = "CONTEXT_REBASE_ADMISSION_CHECK_FAILED"
+        if veto_reason is not None:
+            if type(veto_reason) is not str or not veto_reason.strip():
+                veto_reason = "CONTEXT_REBASE_ADMISSION_CHECK_FAILED"
+            return AutomaticRebaseResult(
+                AutomaticRebaseStatus.BLOCKED,
+                veto_reason.strip(),
+                str(getattr(agent, "session_id", "") or ""),
+                before_tokens=before_tokens if type(before_tokens) is int else None,
+            )
     if type(before_tokens) is not int or before_tokens <= 0:
         raise AutomaticRebaseError("INVALID_PRE_REBASE_COUNT")
     if (

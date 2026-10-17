@@ -69,13 +69,17 @@ VISIBLE_COMPRESSION_MESSAGES = [
     "Compressed with fallback: 30 → 12 messages",
     "No changes from compression: 30 messages",
     (
-        "⚠ Compression aborted: auth failure. No messages were dropped — "
-        "conversation continues unchanged. Run /compress to retry, or /new "
-        "to start a fresh session."
+        "⚠ Compression aborted. No compacted transcript was committed. The "
+        "current working messages were retained, but context recovery is not "
+        "established; the next request remains subject to model-window admission. "
+        "Retrying /compress may repeat the failure and is not proof of recovery. "
+        "Reason: auth failure"
     ),
     (
-        "⚠ Compression returned an empty transcript. No session split was "
-        "performed; conversation continues unchanged."
+        "⚠ Compression returned an empty transcript. No compacted transcript "
+        "was committed. The current working messages remain, but this does not "
+        "establish that the next request fits or can "
+        "proceed."
     ),
     # Manual /compress lock-skip feedback (issue #57631): both the
     # confirmed-holder and unconfirmed-acquire wordings must reach the user.
@@ -92,8 +96,8 @@ VISIBLE_COMPRESSION_MESSAGES = [
     # Blocked-overflow warning (#62625/#62708): the context is over the
     # compression threshold but compression is blocked (summary-LLM cooldown
     # or the anti-thrash breaker). FAILURE-CLASS — must reach chat users so
-    # they can /new or /compress before the session dies at the hard token
-    # limit. Formatted from the SAME template the emit site uses, so a
+    # they can explicitly choose /new or resolve the issue before retrying.
+    # It is a failure-class notice and must reach chat users. Formatted from
     # rewording that drifts into the noise regex fails here.
     CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE.format(
         tokens=85_000, threshold=72_000, reason="cooldown:30"
