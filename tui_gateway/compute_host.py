@@ -162,6 +162,8 @@ class ComputeHost:
         # A completed worker can invoke its done callback during registration.
         self._turn_futures_lock = threading.RLock()
         self._active_request_ids: dict[str, str] = {}
+        # Admission binds a wire reservation to the exact session object.
+        self._admitted_request_sessions: dict[str, tuple[str, dict]] = {}
         self._pending_interrupts: dict[str, str] = {}
         self._transport = _HostTransport(self.emit)
         self._heartbeat_secs = (
@@ -366,7 +368,7 @@ class ComputeHost:
         with self._turn_futures_lock:
             self._turn_futures.pop(future, None)
 
-    def _emit_real_turn_terminal(self, frame: dict[str, Any]) -> None:
+    def _emit_real_turn_terminal(self, frame: dict[str, Any], *, admitted_session: dict | None = None) -> None:
         # The computation has reached its terminal point. Release only this
         # request's admission before publishing; output I/O must not hold the
         # admission lock. Future retirement is resource accounting and cannot
@@ -376,8 +378,10 @@ class ComputeHost:
         sid = str(frame.get("sid") or "")
         request_id = str(frame.get("request_id") or "")
         with self._turn_futures_lock:
-            session = server._sessions.get(sid)
-            if session is not None:
+            binding = self._admitted_request_sessions.get(sid)
+            session = admitted_session
+            owns_binding = binding is None or (binding[0] == request_id and binding[1] is session)
+            if session is not None and server._sessions.get(sid) is session:
                 with session["history_lock"]:
                     if session.get("_host_turn_request_id") == request_id:
                         window = session.get("_turn_outcomes")
@@ -395,9 +399,11 @@ class ComputeHost:
                                 if (outcome := window.find(request_id)) is not None:
                                     window.invalidate(outcome, "projection_failed")
                         session.pop("_host_turn_request_id", None)
-            if self._active_request_ids.get(sid) == request_id:
+            if owns_binding and self._active_request_ids.get(sid) == request_id:
                 self._active_request_ids.pop(sid, None)
-            if self._pending_interrupts.get(sid) == request_id:
+            if owns_binding and binding is not None and binding[0] == request_id:
+                self._admitted_request_sessions.pop(sid, None)
+            if owns_binding and self._pending_interrupts.get(sid) == request_id:
                 self._pending_interrupts.pop(sid, None)
         self.emit(frame)
 
@@ -471,6 +477,11 @@ class ComputeHost:
                     ack["message"] = "invalid target request id"
                 elif target is not None and self._active_request_ids.get(sid) != target:
                     ack["message"] = "turn owner changed or unknown"
+                    ack["failure_code"] = "turn_owner_changed"
+                    ack["effect_disposition"] = "not_applied"
+                elif ((binding := self._admitted_request_sessions.get(sid)) is not None
+                      and (binding[0] != self._active_request_ids.get(sid) or binding[1] is not session)):
+                    ack["message"] = "admitted session owner changed"
                     ack["failure_code"] = "turn_owner_changed"
                     ack["effect_disposition"] = "not_applied"
                 elif session is not None or target is not None:
@@ -575,9 +586,35 @@ class ComputeHost:
 
     # ── Real dashboard turn path ───────────────────────────────────────
 
+    def _join_run_thread_chain(self, server: Any, session: dict, sid: str, request_id: str) -> None:
+        """Settle this admission's workers without holding a lifecycle lock."""
+        run_thread = server._get_run_thread(session)
+        while run_thread is not None and hasattr(run_thread, "join"):
+            with session["history_lock"]:
+                if session.get("_host_turn_request_id") != request_id:
+                    raise RuntimeError("run-thread admission owner changed before settlement")
+            execution = getattr(run_thread, "_turn_outcome_execution", None)
+            # Queued inputs intentionally have no advisory outcome id, while
+            # remaining in this accepted host request's physical thread chain.
+            if execution is not None and (execution[0] is not session or execution[1] != sid
+                                          or execution[2] not in (None, request_id)):
+                # A pre-dispatch failure can restore the prior turn's handle.
+                # Only a real, already-started and now terminated native thread
+                # proves that this stale slot carries no outstanding execution.
+                if isinstance(run_thread, threading.Thread) and run_thread.ident is not None and not run_thread.is_alive():
+                    return
+                raise RuntimeError("run-thread execution owner changed before settlement")
+            run_thread.join()
+            successor = server._get_run_thread(session)
+            if successor is run_thread:
+                return
+            run_thread = successor
+
     def _run_real_turn(self, frame: dict[str, Any]) -> None:
         sid = str(frame.get("sid") or "")
         request_id = str(frame.get("request_id") or uuid.uuid4().hex)
+        admitted_session = None
+        terminal_attempted = False
         if not sid:
             self._emit_real_turn_terminal({"type": "turn.error", "sid": sid, "request_id": request_id, "message": "sid required"})
             return
@@ -587,6 +624,7 @@ class ComputeHost:
             with self._turn_futures_lock:
                 cancelled_before_construction = self._pending_interrupts.get(sid) == request_id
             if cancelled_before_construction:
+                terminal_attempted = True
                 self._emit_real_turn_terminal({"type": "turn.end", "sid": sid, "request_id": request_id,
                                                "interrupted": True, "ended_ns": now_ns()})
                 return
@@ -621,12 +659,15 @@ class ComputeHost:
                 else:
                     session["running"] = True
                     session["_host_turn_request_id"] = request_id
+                    admitted_session = session
+                    self._admitted_request_sessions[sid] = (request_id, session)
                     server._begin_turn_outcome(session, sid, request_id, "compute_host", self._boot_id)
                     session["_turn_cancel_requested"] = False
                     session["last_active"] = time.time()
                     server._start_inflight_turn(session, frame.get("text") if "text" in frame else frame.get("prompt"))
             if terminal is not None:
-                self._emit_real_turn_terminal(terminal)
+                terminal_attempted = True
+                self._emit_real_turn_terminal(terminal, admitted_session=admitted_session)
                 return
             self.emit({"type": "turn.started", "sid": sid, "request_id": request_id, "started_ns": now_ns()})
             try:
@@ -652,14 +693,7 @@ class ComputeHost:
             # Goal/notification follow-ups install their next run thread before
             # their predecessor exits. Keep the accepted request alive through
             # that chain instead of publishing a false terminal at the handoff.
-            run_thread = session.get("_run_thread")
-            while run_thread is not None and hasattr(run_thread, "join"):
-                run_thread.join()
-                with session["history_lock"]:
-                    successor = session.get("_run_thread")
-                if successor is run_thread:
-                    break
-                run_thread = successor
+            self._join_run_thread_chain(server, session, sid, request_id)
             with session["history_lock"]:
                 history_version = int(session.get("history_version", 0))
                 message_count = len(session.get("history") or [])
@@ -669,6 +703,7 @@ class ComputeHost:
             session_info = server._session_info(session.get("agent"), session)
             session_info["running"] = running
             self._bump_progress()
+            terminal_attempted = True
             self._emit_real_turn_terminal(
                 {
                     "type": "turn.end",
@@ -684,22 +719,31 @@ class ComputeHost:
                     # Child reply boundaries remain busy while this request
                     # owns the chain. Parent settlement publishes the final info.
                     "session_info_emitted": False,
-                }
+                }, admitted_session=admitted_session,
             )
         except Exception as exc:
-            try:
-                from tui_gateway import server
-
-                session = server._sessions.get(sid)
-                if session is not None:
-                    with self._turn_futures_lock, session.get("history_lock", threading.Lock()):
-                        owner = self._active_request_ids.get(sid)
-                        if owner is None or owner == request_id:
-                            session["running"] = False
-                            server._clear_inflight_turn(session)
-            except Exception:
-                pass
-            self._emit_real_turn_terminal({"type": "turn.error", "sid": sid, "request_id": request_id, "reason": "exception", "message": str(exc)})
+            if terminal_attempted:
+                # Execution is settled and ownership already released. Do not
+                # turn failed output into another terminal or touch a successor.
+                server.logger.exception("compute-host terminal output failed: sid=%s request=%s", sid, request_id)
+                return
+            if admitted_session is not None:
+                try:
+                    self._join_run_thread_chain(server, admitted_session, sid, request_id)
+                except Exception:
+                    # No settlement proof: retain admission and recovery evidence.
+                    # Stop remains available; never manufacture idle/terminal.
+                    server.logger.exception("compute-host worker settlement unconfirmed: sid=%s request=%s", sid, request_id)
+                    return
+                with self._turn_futures_lock, admitted_session["history_lock"]:
+                    binding = self._admitted_request_sessions.get(sid)
+                    if (binding is not None and binding[0] == request_id and binding[1] is admitted_session
+                            and admitted_session.get("_host_turn_request_id") == request_id):
+                        admitted_session["running"] = False
+                # Do not clear inflight: it is failed-turn recovery evidence.
+            terminal_attempted = True
+            self._emit_real_turn_terminal({"type": "turn.error", "sid": sid, "request_id": request_id,
+                "reason": "exception", "message": str(exc)}, admitted_session=admitted_session)
 
     def _ensure_server_session(self, server: Any, frame: dict[str, Any]) -> dict:
         sid = str(frame.get("sid") or "")

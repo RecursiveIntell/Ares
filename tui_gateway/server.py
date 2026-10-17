@@ -172,6 +172,33 @@ _cfg_lock = threading.Lock()
 # dedicated lock rather than the unrelated process-config cache lock.
 _profile_ui_meta_lock = threading.Lock()
 _sessions_lock = threading.RLock()  # reentrant: _close_session_by_id may run under callers that already hold it
+
+
+def _start_run_thread(session: dict, run_thread) -> None:
+    """Publish and start as one transition for all run-thread readers.
+
+    Publish first so an immediate successor cannot be overwritten. Roll back
+    a failed start, but never discard a worker whose bootstrap already ran.
+    """
+    missing = object()
+    with _sessions_lock:
+        previous = session.get("_run_thread", missing)
+        session["_run_thread"] = run_thread
+        try:
+            run_thread.start()
+        except BaseException:
+            if getattr(run_thread, "ident", None) is None and session.get("_run_thread") is run_thread:
+                if previous is missing:
+                    session.pop("_run_thread", None)
+                else:
+                    session["_run_thread"] = previous
+            raise
+
+
+def _get_run_thread(session: dict):
+    """Snapshot only after the producer's start transition has completed."""
+    with _sessions_lock:
+        return session.get("_run_thread")
 _prompt_lock = threading.Lock()
 _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
@@ -1102,7 +1129,7 @@ def _teardown_popped_session(
     """Finish a close after the caller has atomically detached the session."""
     if session is None:
         return False
-    run_thread = session.get("_run_thread")
+    run_thread = _get_run_thread(session)
     if (
         end_reason != "tui_shutdown"
         and run_thread is not None
@@ -1598,7 +1625,7 @@ def _interrupt_session_turn(
                 **({"target_request_id": target_request_id} if target_request_id else {}),
             )
     else:
-        run_thread = session.get("_run_thread")
+        run_thread = _get_run_thread(session)
         run_thread_alive = run_thread is not None and run_thread.is_alive()
 
     with session["history_lock"]:
@@ -16134,8 +16161,7 @@ def _run_prompt_submit(
             and (registered is None or registered is session)
         )
         if can_start:
-            session["_run_thread"] = run_thread
-            run_thread.start()
+            _start_run_thread(session, run_thread)
     if not can_start:
         with session["history_lock"]:
             session["running"] = False
