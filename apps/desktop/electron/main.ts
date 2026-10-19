@@ -33,6 +33,7 @@ import MainWebSocket from 'ws'
 
 import { classifyActiveRuntime } from './active-runtime-state'
 import { destroyKeepaliveAgents, downloadAgentFor, jsonAgentFor, withRetry } from './api-transport'
+import { AppDocumentUrl } from './app-document-url'
 import { appIconCandidates, resolveAppIcon } from './app-icon'
 import { stopBackendChild as stopBackendChildImpl, stopBackendTreesForUpdate } from './backend-child'
 import {
@@ -6899,7 +6900,32 @@ function installContextMenuBridge(window: BrowserWindow) {
 // acquire voice permission or native backend transport provenance.
 const privilegedAppContents = new Set<number>()
 const nativeBackendProofs = new Map<string, NativeBackendAdmission>()
-const appDocumentUrl = () => DEV_SERVER || pathToFileURL(resolveRendererIndex()).toString()
+// Admission (`trustedAppContents`, `approvedFrame`) runs on EVERY gateway
+// frame, every renderer ack, and every 250 ms transport watchdog tick — but
+// resolving this URL is not a string lookup: it walks the renderer bundle
+// through `missingRendererAssets` (torn-generation detection reads and
+// regex-scans every chunk — 142 files / 28.8 MB / ~186 ms measured on this
+// build). A per-call resolve therefore pinned the Electron main thread at
+// ~100% CPU (rchar 224 MB/s, 930 opens/s) and starved the gateway transport
+// itself: transcript hydrates blew the 30 s RPC timeout ("request timed out
+// after 30s: session.resume"), the readiness probe timed out ("Runtime not
+// ready"), and the transport's congestion watchdog kept closing the socket.
+// The URL is an identity and its path is stable for the process lifetime, so
+// resolve it once and keep it fresh with a microsecond stat of the chosen
+// index — a repair or update that rewrites the bundle still re-resolves.
+// Boot-time torn detection is untouched: every window creation still calls
+// `resolveRendererIndex()` and gets a fresh scan.
+const appDocumentUrlResolver = new AppDocumentUrl({
+  devServer: DEV_SERVER || undefined,
+  resolveIndex: resolveRendererIndex,
+  toUrl: indexPath => pathToFileURL(indexPath).toString(),
+  stat: indexPath => {
+    const stats = fs.statSync(indexPath)
+
+    return { mtimeMs: stats.mtimeMs, size: stats.size }
+  }
+})
+const appDocumentUrl = () => appDocumentUrlResolver.resolve()
 
 function trustedAppContents(contents) {
   return (
@@ -6936,8 +6962,12 @@ function MainProbeWebSocket(url, options: any = {}) {
 // Transport admission is IPC frame-based; WebRequest metadata is never authority.
 const nativeSocketTransport = new NativeSocketTransport({
   trusted: trustedAppContents,
-  approvedFrame: frame =>
-    isAppDocument(frame.url, appDocumentUrl()) && new URL(frame.url).pathname === new URL(appDocumentUrl()).pathname,
+  approvedFrame: frame => {
+    // One resolve per admission, not two — see appDocumentUrl above.
+    const appUrl = appDocumentUrl()
+
+    return isAppDocument(frame.url, appUrl) && new URL(frame.url).pathname === new URL(appUrl).pathname
+  },
   resolve: resolveNativeTransportBackend,
   dial: (url, headers, maxPayload) =>
     new MainWebSocket(url, {
