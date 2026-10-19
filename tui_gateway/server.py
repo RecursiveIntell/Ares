@@ -14538,7 +14538,11 @@ def _notification_poller_loop(
                     _claim_ids.append((_evt, _claim))
                     _claimed_deliverables.append((_evt, _text))
                 else:
-                    process_registry.completion_queue.put(_evt)
+                    # Claim lost: another durable consumer owns this row's
+                    # delivery. Requeueing would rival its owner and can
+                    # inject the subagent summary twice; drop it exactly as
+                    # the legacy single-event path did.
+                    pass
             if not _claim_ids:
                 if not _host_route:
                     with session["history_lock"]:
@@ -14737,9 +14741,10 @@ def _notification_poller_loop(
                     _claim_ids.append((_evt, _claim))
                     _claimed_deliverables.append((_evt, _text))
                 else:
-                    # Cannot prove sole ownership of this row's delivery —
-                    # leave it pending (the deferred pass below requeues it).
-                    _held.append(_evt)
+                    # Claim lost: another durable consumer owns delivery.
+                    # Drop it — never requeue a row whose claim we do not
+                    # hold, and keep it out of the deferred requeue pass.
+                    pass
             if _claim_ids:
                 try:
                     _ok, _missed = _dispatch_grouped_delegation_notifications(
@@ -16600,7 +16605,9 @@ def _run_prompt_submit(
                             _claim_ids.append((_evt, _claim))
                             _claimed.append((_evt, synth))
                         else:
-                            process_registry.completion_queue.put(_evt)
+                            # Claim lost: another durable consumer owns
+                            # delivery; drop it (never rival its owner).
+                            pass
                     if _claim_ids:
                         # This drain runs inside the accepted turn's own run
                         # thread (the host keeps that request id alive across
@@ -16615,6 +16622,12 @@ def _run_prompt_submit(
                         if not _ok:
                             with session["history_lock"]:
                                 session["running"] = False
+                    else:
+                        # Every claim was lost: release the speculative busy
+                        # slot this drain claimed, or a successful foreground
+                        # turn wedges as running with nothing dispatched.
+                        with session["history_lock"]:
+                            session["running"] = False
         except Exception as _drain_exc:
             print(
                 f"[tui_gateway] completion queue drain failed: "
