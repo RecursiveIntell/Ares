@@ -289,9 +289,7 @@ let activeHook: Hook | null = null
 let activeAfter: ((name: Name, args: any[], result: unknown) => Promise<void>) | null = null
 
 for (const name of NAMES) {
-  ;
-
-(fsp as any)[name] = async (...args: any[]) => {
+  ;(fsp as any)[name] = async (...args: any[]) => {
     if (!activeHook) {
       return REAL[name](...args)
     }

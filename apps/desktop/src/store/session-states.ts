@@ -424,7 +424,11 @@ function runtimeReferenced(runtimeId: string, storedSessionId: null | string): b
  *  `needsInput` states stay — the sidebar's attention dot reads them. */
 function evictable(runtimeId: string, state: ClientSessionState): boolean {
   return (
-    !state.busy && !state.reconnecting && !state.needsInput && !state.awaitingResponse && !runtimeReferenced(runtimeId, state.storedSessionId)
+    !state.busy &&
+    !state.reconnecting &&
+    !state.needsInput &&
+    !state.awaitingResponse &&
+    !runtimeReferenced(runtimeId, state.storedSessionId)
   )
 }
 

@@ -165,7 +165,9 @@ export function createTerminal(cwd: string = $currentCwd.get(), focus = true): s
   $terminals.set([...$terminals.get(), { id, title: 'Terminal', auto: true, cwd, kind: 'user' }])
   $activeTerminalId.set(id)
 
-  if (focus) { requestTerminalFocus(id) }
+  if (focus) {
+    requestTerminalFocus(id)
+  }
 
   return id
 }
@@ -258,7 +260,9 @@ $currentCwd.listen(cwd => {
   const active = list.find(term => term.id === $activeTerminalId.get())
 
   // A session update cannot hide the PTY the operator is currently typing in.
-  if (active && terminalOwnsKeyboardFocus(active.id)) { return }
+  if (active && terminalOwnsKeyboardFocus(active.id)) {
+    return
+  }
 
   if (active?.kind === 'user' && terminalCwd(active) === target) {
     return
@@ -301,9 +305,11 @@ export function closeTerminal(id: string, transferFocus = false): void {
 
   const next = list.filter(term => term.id !== id)
   const active = $activeTerminalId.get() === id
-  const nextId = active ? (next[index] ?? next[index - 1])?.id ?? null : null
+  const nextId = active ? ((next[index] ?? next[index - 1])?.id ?? null) : null
 
-  if (transferFocus && nextId) { requestTerminalFocusAfterClose(nextId, id) }
+  if (transferFocus && nextId) {
+    requestTerminalFocusAfterClose(nextId, id)
+  }
 
   $terminals.set(next)
 

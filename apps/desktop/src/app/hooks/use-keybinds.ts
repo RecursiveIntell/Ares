@@ -5,7 +5,13 @@ import { closeActiveTab } from '@/app/chat/close-tab'
 import { hudTargetSessionId } from '@/app/hud/handoff'
 import { setTerminalTakeover } from '@/app/right-sidebar/store'
 import { requestTerminalFocus } from '@/app/right-sidebar/terminal/focus'
-import { $activeTerminalId, closeActiveTerminal, createTerminal, cycleTerminal, ensureTerminal } from '@/app/right-sidebar/terminal/terminals'
+import {
+  $activeTerminalId,
+  closeActiveTerminal,
+  createTerminal,
+  cycleTerminal,
+  ensureTerminal
+} from '@/app/right-sidebar/terminal/terminals'
 import { appViewForPath, isOverlayView } from '@/app/routes'
 import {
   activateTreeTabSlot,
@@ -261,7 +267,9 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
         ensureTerminal()
         const id = $activeTerminalId.get()
 
-        if (id) { requestTerminalFocus(id) }
+        if (id) {
+          requestTerminalFocus(id)
+        }
       }
     },
     // Create first so the pane's open-effect ensure sees a non-empty set and

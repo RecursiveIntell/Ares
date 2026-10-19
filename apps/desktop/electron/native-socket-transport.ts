@@ -22,13 +22,15 @@ function closedObject(value: unknown, keys: string[]): asserts value is Record<s
     typeof value !== 'object' ||
     Array.isArray(value) ||
     Object.keys(value).some(key => !keys.includes(key))
-  )
-    {throw new Error('Invalid transport schema')}
+  ) {
+    throw new Error('Invalid transport schema')
+  }
 }
 
 function identifier(value: unknown): asserts value is string {
-  if (typeof value !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(value))
-    {throw new Error('Invalid transport identifier')}
+  if (typeof value !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(value)) {
+    throw new Error('Invalid transport identifier')
+  }
 }
 
 export function validateNativeOpen(raw: unknown): NativeSocketOpen {
@@ -37,36 +39,47 @@ export function validateNativeOpen(raw: unknown): NativeSocketOpen {
   closedObject(raw.route, ['kind', 'profile', 'connectionId'])
   const route = raw.route
 
-  if (route.kind === 'primary') {closedObject(route, ['kind'])}
-  else if (route.kind === 'profile') {
+  if (route.kind === 'primary') {
+    closedObject(route, ['kind'])
+  } else if (route.kind === 'profile') {
     closedObject(route, ['kind', 'profile'])
     identifier(route.profile)
   } else if (route.kind === 'registry') {
     identifier(route.connectionId)
     identifier(route.profile)
-  } else {throw new Error('Invalid transport route')}
+  } else {
+    throw new Error('Invalid transport route')
+  }
 
   closedObject(raw.channel, ['kind', 'pluginId', 'suffix'])
 
-  if (raw.channel.kind === 'gateway' || raw.channel.kind === 'tts') {closedObject(raw.channel, ['kind'])}
-  else if (raw.channel.kind === 'plugin') {
+  if (raw.channel.kind === 'gateway' || raw.channel.kind === 'tts') {
+    closedObject(raw.channel, ['kind'])
+  } else if (raw.channel.kind === 'plugin') {
     identifier(raw.channel.pluginId)
     // No URL, query credentials, encoded traversal, backslash, or namespace escape.
     const suffix = raw.channel.suffix
 
-    if (typeof suffix !== 'string' || suffix.length > 512)
-      {throw new Error('Invalid plugin suffix')}
+    if (typeof suffix !== 'string' || suffix.length > 512) {
+      throw new Error('Invalid plugin suffix')
+    }
+
     // Kanban's selected-board stream selects its board via `/events?board=<slug>`;
     // preserve exactly that one non-credential parameter and nothing else.
     const queryAt = suffix.indexOf('?')
     const suffixPath = queryAt === -1 ? suffix : suffix.slice(0, queryAt)
     const suffixQuery = queryAt === -1 ? '' : suffix.slice(queryAt)
 
-    if (!/^\/(?:[A-Za-z0-9_-]+\/?)*$/.test(suffixPath))
-      {throw new Error('Invalid plugin suffix')}
-    if (suffixQuery && !/^\?board=[A-Za-z0-9-_.~!*'()%]{1,256}$/.test(suffixQuery))
-      {throw new Error('Invalid plugin suffix')}
-  } else {throw new Error('Invalid transport channel')}
+    if (!/^\/(?:[A-Za-z0-9_-]+\/?)*$/.test(suffixPath)) {
+      throw new Error('Invalid plugin suffix')
+    }
+
+    if (suffixQuery && !/^\?board=[A-Za-z0-9-_.~!*'()%]{1,256}$/.test(suffixQuery)) {
+      throw new Error('Invalid plugin suffix')
+    }
+  } else {
+    throw new Error('Invalid transport channel')
+  }
 
   return raw as NativeSocketOpen
 }
@@ -137,8 +150,9 @@ export class NativeSocketTransport {
       owner.senderFrame.detached ||
       owner.senderFrame !== owner.sender.mainFrame ||
       !this.deps.approvedFrame(owner.senderFrame)
-    )
-      {throw new Error('Transport sender denied')}
+    ) {
+      throw new Error('Transport sender denied')
+    }
 
     this.watch(owner.sender)
 
@@ -148,7 +162,9 @@ export class NativeSocketTransport {
     this.watch(contents)
   }
   private watch(contents: any) {
-    if (this.watched.has(contents)) {return}
+    if (this.watched.has(contents)) {
+      return
+    }
     this.watched.add(contents)
     contents.on('did-start-navigation', (_event: unknown, _url: string, inPlace: boolean, main: boolean) => {
       if (main && !inPlace) {
@@ -169,8 +185,11 @@ export class NativeSocketTransport {
   invalidate(contents: any) {
     this.documents.set(contents, (this.documents.get(contents) ?? 0) + 1)
 
-    for (const entry of this.entries.values())
-      {if (entry.owner.sender === contents) {this.finish(entry, 1001, 'Document retired', false, false)}}
+    for (const entry of this.entries.values()) {
+      if (entry.owner.sender === contents) {
+        this.finish(entry, 1001, 'Document retired', false, false)
+      }
+    }
   }
   private documentCurrent(entry: Entry): boolean {
     try {
@@ -208,7 +227,9 @@ export class NativeSocketTransport {
     }
   }
   private emit(entry: Entry, event: Omit<NativeSocketEvent, 'correlation' | 'handle' | 'sequence'>) {
-    if (!this.documentCurrent(entry)) {return}
+    if (!this.documentCurrent(entry)) {
+      return
+    }
 
     try {
       this.deps.emit(entry.owner, {
@@ -222,11 +243,17 @@ export class NativeSocketTransport {
     }
   }
   private finish(entry: Entry, code = 1006, reason = 'Native transport failed', clean = false, publish = true) {
-    if (entry.dead) {return}
+    if (entry.dead) {
+      return
+    }
 
-    if (publish) {this.emit(entry, { type: 'close', code, reason, wasClean: clean })}
+    if (publish) {
+      this.emit(entry, { type: 'close', code, reason, wasClean: clean })
+    }
 
-    if (entry.dead) {return}
+    if (entry.dead) {
+      return
+    }
     entry.dead = true
     clearTimeout(entry.timer)
     clearInterval(entry.watchdog)
@@ -253,8 +280,9 @@ export class NativeSocketTransport {
       reserved.length >= MAX_PROCESS ||
       own.filter(row => row.pending).length >= MAX_PENDING_DOCUMENT ||
       reserved.filter(row => row.pending).length >= MAX_PENDING_PROCESS
-    )
-      {throw new Error('Native transport capacity exceeded')}
+    ) {
+      throw new Error('Native transport capacity exceeded')
+    }
 
     const entry: Entry = {
       owner: { sender: owner.sender, senderFrame: owner.senderFrame },
@@ -321,8 +349,9 @@ export class NativeSocketTransport {
             this.documentQueue(entry).bytes + size > GATEWAY_MESSAGE_BYTES ||
             this.documentQueue(entry).count >= 256 ||
             this.queueBytes + size > PROCESS_QUEUE_BYTES
-          )
-            {throw new Error('Native event queue overflow')}
+          ) {
+            throw new Error('Native event queue overflow')
+          }
 
           const data = binary ? Uint8Array.from(bytes).buffer : bytes.toString('utf8')
           entry.bytes += size
@@ -345,13 +374,19 @@ export class NativeSocketTransport {
         if (wire.bufferedAmount || entry.queued.size || entry.sends) {
           congestedSince ||= Date.now()
 
-          if (Date.now() - Math.max(congestedSince, entry.progress) > CONGESTION_MS) {this.failure(entry)}
-        } else {congestedSince = 0}
+          if (Date.now() - Math.max(congestedSince, entry.progress) > CONGESTION_MS) {
+            this.failure(entry)
+          }
+        } else {
+          congestedSince = 0
+        }
       }, 250)
     } catch (error: any) {
-      if (error?.code === 'PLUGIN_OAUTH_POLLING')
-        {this.finish(entry, 1008, 'Plugin OAuth stream unavailable; use polling')}
-      else {this.failure(entry, error?.needsOauthLogin === true)}
+      if (error?.code === 'PLUGIN_OAUTH_POLLING') {
+        this.finish(entry, 1008, 'Plugin OAuth stream unavailable; use polling')
+      } else {
+        this.failure(entry, error?.needsOauthLogin === true)
+      }
     } finally {
       this.resolving.delete(entry)
     }
@@ -365,8 +400,9 @@ export class NativeSocketTransport {
       entry.owner.sender !== owner.sender ||
       entry.owner.senderFrame !== owner.senderFrame ||
       entry.generation !== generation
-    )
-      {throw new Error('Native socket ownership denied')}
+    ) {
+      throw new Error('Native socket ownership denied')
+    }
 
     this.check(entry)
 
@@ -416,7 +452,9 @@ export class NativeSocketTransport {
         if (error || !this.current(entry)) {
           this.failure(entry)
           reject(new Error('Native send failed'))
-        } else {resolve()}
+        } else {
+          resolve()
+        }
       }
 
       try {
@@ -430,8 +468,9 @@ export class NativeSocketTransport {
     closedObject(raw, ['handle', 'sequence'])
     const entry = this.owned(owner, raw.handle)
 
-    if (!Number.isSafeInteger(raw.sequence) || !entry.queued.has(raw.sequence))
-      {throw new Error('Invalid transport acknowledgement')}
+    if (!Number.isSafeInteger(raw.sequence) || !entry.queued.has(raw.sequence)) {
+      throw new Error('Invalid transport acknowledgement')
+    }
 
     const size = entry.queued.get(raw.sequence)!
     entry.queued.delete(raw.sequence)
@@ -454,7 +493,9 @@ export class NativeSocketTransport {
             row.request.correlation === raw.correlation
         )
 
-    if (!entry) {return}
+    if (!entry) {
+      return
+    }
 
     if (
       entry.request.correlation !== raw.correlation ||
@@ -462,8 +503,9 @@ export class NativeSocketTransport {
         raw.code !== 1000 &&
         !(Number.isInteger(raw.code) && raw.code >= 3000 && raw.code <= 4999)) ||
       (raw.reason !== undefined && (typeof raw.reason !== 'string' || Buffer.byteLength(raw.reason) > 123))
-    )
-      {throw new Error('Invalid transport close')}
+    ) {
+      throw new Error('Invalid transport close')
+    }
 
     if (entry.pending) {
       this.finish(entry, 1000, 'Open cancelled', true)
@@ -471,7 +513,9 @@ export class NativeSocketTransport {
       return
     }
 
-    if (entry.closing) {return}
+    if (entry.closing) {
+      return
+    }
     entry.closing = true
     clearTimeout(entry.timer)
     entry.timer = setTimeout(() => this.finish(entry), CLOSE_MS)

@@ -38,13 +38,16 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
         !/^[A-Za-z0-9_-]{1,128}$/.test(correlation) ||
         nativeSocketListeners.has(correlation) ||
         nativeSocketListeners.size >= 24
-      )
-        {throw new Error('Native socket subscription denied')}
+      ) {
+        throw new Error('Native socket subscription denied')
+      }
 
       nativeSocketListeners.set(correlation, callback)
 
       return () => {
-        if (nativeSocketListeners.get(correlation) === callback) {nativeSocketListeners.delete(correlation)}
+        if (nativeSocketListeners.get(correlation) === callback) {
+          nativeSocketListeners.delete(correlation)
+        }
       }
     }
   },

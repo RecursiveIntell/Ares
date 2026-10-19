@@ -53,14 +53,22 @@ export function ModelVisibilityDialog({
   const collapsedProviders = useStore($collapsedProviders)
   const owner = knownOwnerForSession(sessionId)
   const catalogProfile = (typeof owner === 'string' ? owner : owner?.targetProfile || owner?.profile) || profile
-  const connectionId = owner && typeof owner === 'object' ? owner.connectionId : owner ? 'local' : getApiRequestConnection()
+  const connectionId =
+    owner && typeof owner === 'object' ? owner.connectionId : owner ? 'local' : getApiRequestConnection()
 
   const modelOptions = useQuery({
     queryKey: modelOptionsQueryKey(catalogProfile, sessionId, connectionId),
-    queryFn: (): Promise<ModelOptionsResponse> => requestModelOptions({
-      connectionId, gateway: gw, profile: catalogProfile, sessionId,
-      request: gw && sessionId ? (method, params) => requestForOwnedSession(sessionId, gw.request.bind(gw), method, params) : undefined
-    }),
+    queryFn: (): Promise<ModelOptionsResponse> =>
+      requestModelOptions({
+        connectionId,
+        gateway: gw,
+        profile: catalogProfile,
+        sessionId,
+        request:
+          gw && sessionId
+            ? (method, params) => requestForOwnedSession(sessionId, gw.request.bind(gw), method, params)
+            : undefined
+      }),
     enabled: open
   })
 

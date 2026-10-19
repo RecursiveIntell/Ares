@@ -72,6 +72,7 @@ it('keeps an accepted deferred legacy effort pending when Fast is rejected', asy
     if (params.key === 'reasoning') {
       return { deferred: true }
     }
+
     throw Object.assign(new Error('fast mode is not available for this model'), { code: 4002 })
   })
 
@@ -89,6 +90,7 @@ it('rolls back both dimensions when the first legacy write is rejected', async (
     if (params.key === 'runtime_options') {
       throw Object.assign(new Error('unknown config key: runtime_options'), { code: 4002 })
     }
+
     throw Object.assign(new Error('reasoning not supported'), { code: 4002 })
   })
 

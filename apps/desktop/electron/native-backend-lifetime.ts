@@ -13,9 +13,13 @@ const lifetimeBinding = Symbol('nativeBackendLifetime')
 export function bindNativeBackendLifetime(connection: any, candidate: NativeBackendLifetimeCandidate) {
   // A revalidation may reconnect through another canonical producer. Preserve
   // that producer's binding instead of attaching the retired outer cache.
-  if (connection[lifetimeBinding]) {return connection}
+  if (connection[lifetimeBinding]) {
+    return connection
+  }
 
-  if (!candidate.promise) {throw new Error('Backend lifetime has no owning promise')}
+  if (!candidate.promise) {
+    throw new Error('Backend lifetime has no owning promise')
+  }
 
   return { ...connection, [lifetimeBinding]: candidate }
 }
@@ -45,7 +49,9 @@ export async function claimNativeBackendLifetime(
 
   deps.currentDocument()
 
-  if (deps.source() !== source) {throw new Error('Backend source changed during claim')}
+  if (deps.source() !== source) {
+    throw new Error('Backend source changed during claim')
+  }
   const candidate: NativeBackendLifetimeCandidate | undefined = connection[lifetimeBinding]
 
   if (!candidate?.promise || candidate.current() !== candidate.promise) {

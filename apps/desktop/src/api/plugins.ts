@@ -103,7 +103,9 @@ export function pluginSocket(pluginId: string, path: string, onMessage: (data: u
     const native = window.hermesDesktop?.nativeSocket
 
     if (native) {
-      if (disposed) {return}
+      if (disposed) {
+        return
+      }
       socket = new NativeRendererSocket(native, nativeRoute(getApiRequestProfile(), getApiRequestConnection()), {
         kind: 'plugin',
         pluginId,

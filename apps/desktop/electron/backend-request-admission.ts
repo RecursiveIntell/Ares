@@ -29,11 +29,15 @@ export function registerOwnedBackendAdmission(
     throw new Error('Owned local backend origin is invalid')
   }
 
-  if (child.exitCode !== null || child.killed) {throw new Error('Owned backend exited before admission')}
+  if (child.exitCode !== null || child.killed) {
+    throw new Error('Owned backend exited before admission')
+  }
   const entry = { identity, alive: () => child.exitCode === null && !child.killed }
   admissions.set(target.origin, entry)
   child.once('exit', () => {
-    if (admissions.get(target.origin) === entry) {admissions.delete(target.origin)}
+    if (admissions.get(target.origin) === entry) {
+      admissions.delete(target.origin)
+    }
   })
 
   return entry
@@ -50,13 +54,16 @@ export function privilegedRequestHeaders(
   }
 ): { requestHeaders?: Record<string, string | string[]> } {
   try {
-    if (!contents || !dependencies.trusted(contents) || !details.frame || details.frame !== contents.mainFrame)
-      {return {}}
+    if (!contents || !dependencies.trusted(contents) || !details.frame || details.frame !== contents.mainFrame) {
+      return {}
+    }
 
     const target = new URL(details.url)
 
     // Renderer WebSockets (including workers) never inherit native privileges.
-    if (details.resourceType === 'webSocket') {return {}}
+    if (details.resourceType === 'webSocket') {
+      return {}
+    }
     const headers = dependencies.headers(details.url)
 
     return Object.keys(headers).length ? { requestHeaders: { ...details.requestHeaders, ...headers } } : {}

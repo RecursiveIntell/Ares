@@ -112,7 +112,11 @@ it('a primary effort click must update the live SessionView, not only its draft 
   const request = vi.fn(async () => ({ key: 'reasoning', value: 'high' }))
   panel(request)
   await act(async () => fireEvent.click(screen.getByText('Set high')))
-  expect(request).toHaveBeenCalledWith('config.set', { key: 'runtime_options', session_id: 'r1', value: { effort: 'high' } })
+  expect(request).toHaveBeenCalledWith('config.set', {
+    key: 'runtime_options',
+    session_id: 'r1',
+    value: { effort: 'high' }
+  })
   console.log({ draft: $currentReasoningEffort.get(), visible: PRIMARY_SESSION_VIEW.$reasoningEffort.get() })
   expect(PRIMARY_SESSION_VIEW.$reasoningEffort.get()).toBe('high')
   expect($currentReasoningEffort.get()).toBe('high')

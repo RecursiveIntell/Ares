@@ -137,9 +137,11 @@ describe('useAgentTerminal', () => {
 
   it('async agent-terminal activation must not steal an already-focused prompt', async () => {
     const frames: FrameRequestCallback[] = []
-    vi.stubGlobal('requestAnimationFrame', (fn: FrameRequestCallback) => { frames.push(fn);
+    vi.stubGlobal('requestAnimationFrame', (fn: FrameRequestCallback) => {
+      frames.push(fn)
 
- return frames.length })
+      return frames.length
+    })
     vi.stubGlobal('cancelAnimationFrame', vi.fn())
     const prompt = document.createElement('input')
     prompt.id = 'prompt-witness'
@@ -149,16 +151,24 @@ describe('useAgentTerminal', () => {
     xterm.focus.mockImplementation(() => terminalInput.focus())
     const { rerender, unmount } = render(<Harness />)
     await waitFor(() => expect(document.fonts.load).toHaveBeenCalled())
-    await act(async () => { resolveFontLoad([]); await Promise.resolve() })
+    await act(async () => {
+      resolveFontLoad([])
+      await Promise.resolve()
+    })
     await waitFor(() => expect(xterm.open).toHaveBeenCalledOnce())
     prompt.focus()
     expect(document.activeElement).toBe(prompt)
     rerender(<Harness active />)
-    act(() => { while (frames.length) { frames.shift()!(0) } })
+    act(() => {
+      while (frames.length) {
+        frames.shift()!(0)
+      }
+    })
     const observed = document.activeElement?.id
     console.log('WITNESS asynchronous terminal activation focus target:', observed)
     unmount()
-    prompt.remove(); terminalInput.remove()
+    prompt.remove()
+    terminalInput.remove()
     expect(observed).toBe('prompt-witness')
   })
 

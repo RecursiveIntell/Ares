@@ -59,7 +59,9 @@ const request = (correlation = 'request_1') => ({
 })
 
 async function flush() {
-  for (let i = 0; i < 8; i++) {await Promise.resolve()}
+  for (let i = 0; i < 8; i++) {
+    await Promise.resolve()
+  }
 }
 
 afterEach(() => vi.useRealTimers())
@@ -84,9 +86,9 @@ test.each(['/../events', '/%2e%2e/events', '//hostile.invalid', '/events?token=x
 test.each(['/events?board=default', '/events?board=my-board_2', '/events?board=a%20b'])(
   'preserve kanban board query on plugin suffix %s',
   suffix => {
-    expect(
-      validateNativeOpen({ ...request(), channel: { kind: 'plugin', pluginId: 'kanban', suffix } })
-    ).toMatchObject({ channel: { kind: 'plugin', pluginId: 'kanban', suffix } })
+    expect(validateNativeOpen({ ...request(), channel: { kind: 'plugin', pluginId: 'kanban', suffix } })).toMatchObject(
+      { channel: { kind: 'plugin', pluginId: 'kanban', suffix } }
+    )
   }
 )
 test.each(['/events?board=', '/events?board=a&x=1', '/events?token=x', '/events?board=a/../b', '/events?board=a?b'])(
@@ -204,7 +206,9 @@ test('ordered PCM/text events remain bounded until acknowledged; overflow is ter
   f.transport.ack(f.owner, { handle, sequence: 2 })
   f.transport.ack(f.owner, { handle, sequence: 3 })
 
-  for (let i = 0; i < 129; i++) {f.wire.emit('message', Buffer.from('x'), false)}
+  for (let i = 0; i < 129; i++) {
+    f.wire.emit('message', Buffer.from('x'), false)
+  }
   expect(f.events.at(-1).type).toBe('close')
   expect(f.wire.terminate).toHaveBeenCalledOnce()
 })

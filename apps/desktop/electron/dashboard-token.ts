@@ -19,7 +19,9 @@ function equalHex(actual: unknown, expected: string): boolean {
 async function boundedJson(response: Response): Promise<any> {
   const reader = response.body?.getReader()
 
-  if (!reader) {throw new Error('Missing native bootstrap proof')}
+  if (!reader) {
+    throw new Error('Missing native bootstrap proof')
+  }
   const chunks: Uint8Array[] = []
   let size = 0
 
@@ -27,7 +29,9 @@ async function boundedJson(response: Response): Promise<any> {
     while (true) {
       const row = await reader.read()
 
-      if (row.done) {break}
+      if (row.done) {
+        break
+      }
       size += row.value.length
 
       if (size > 4096) {
@@ -46,7 +50,9 @@ async function boundedJson(response: Response): Promise<any> {
 
 async function resolveServedDashboardToken(baseUrl, fallbackToken, options: any = {}) {
   // The SSH path owns its independent pinned-token/endpoint proof. No HTML scraping.
-  if (options.bootstrapKey === undefined && options.identity === undefined) {return fallbackToken}
+  if (options.bootstrapKey === undefined && options.identity === undefined) {
+    return fallbackToken
+  }
   const key = options.bootstrapKey
   const identity = options.identity
 
@@ -105,10 +111,14 @@ async function resolveServedDashboardToken(baseUrl, fallbackToken, options: any 
 }
 
 async function adoptServedDashboardToken(baseUrl, spawnToken, { childAlive, label = 'Hermes backend', ...options }) {
-  if (!childAlive()) {throw new Error(`${label} exited; refusing its session token.`)}
+  if (!childAlive()) {
+    throw new Error(`${label} exited; refusing its session token.`)
+  }
   const servedToken = await resolveServedDashboardToken(baseUrl, spawnToken, options)
 
-  if (!childAlive()) {throw new Error(`${label} exited during native bootstrap.`)}
+  if (!childAlive()) {
+    throw new Error(`${label} exited during native bootstrap.`)
+  }
 
   return servedToken
 }

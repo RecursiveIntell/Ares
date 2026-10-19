@@ -6900,6 +6900,7 @@ function installContextMenuBridge(window: BrowserWindow) {
 // acquire voice permission or native backend transport provenance.
 const privilegedAppContents = new Set<number>()
 const nativeBackendProofs = new Map<string, NativeBackendAdmission>()
+
 // Admission (`trustedAppContents`, `approvedFrame`) runs on EVERY gateway
 // frame, every renderer ack, and every 250 ms transport watchdog tick — but
 // resolving this URL is not a string lookup: it walks the renderer bundle
@@ -6925,6 +6926,7 @@ const appDocumentUrlResolver = new AppDocumentUrl({
     return { mtimeMs: stats.mtimeMs, size: stats.size }
   }
 })
+
 const appDocumentUrl = () => appDocumentUrlResolver.resolve()
 
 function trustedAppContents(contents) {
@@ -6943,7 +6945,11 @@ function MainProbeWebSocket(url, options: any = {}) {
   origin.protocol = origin.protocol === 'wss:' ? 'https:' : 'http:'
   const headers = { ...(options.headers || {}) }
 
-  for (const key of Object.keys(headers)) {if (key.toLowerCase() === 'origin') {delete headers[key]}}
+  for (const key of Object.keys(headers)) {
+    if (key.toLowerCase() === 'origin') {
+      delete headers[key]
+    }
+  }
 
   const socket = new MainWebSocket(url, {
     headers: { ...headers, Origin: origin.origin },
@@ -7022,10 +7028,14 @@ async function resolveNativeTransportBackend(route, currentDocument) {
   const base = new URL(connection.baseUrl)
   const localProof = connection.mode === 'local' ? nativeBackendProofs.get(base.origin) : null
 
-  if (connection.mode === 'local' && !localProof?.alive()) {throw new Error('Owned local backend admission unavailable')}
+  if (connection.mode === 'local' && !localProof?.alive()) {
+    throw new Error('Owned local backend admission unavailable')
+  }
   const sshOwner = [...sshConnections.entries()].find(([, state]) => state.localPort === Number(base.port))
 
-  if (connection.remoteKind === 'ssh' && !sshOwner) {throw new Error('SSH backend lifetime unavailable')}
+  if (connection.remoteKind === 'ssh' && !sshOwner) {
+    throw new Error('SSH backend lifetime unavailable')
+  }
 
   const alive = () =>
     lifetimeCurrent() &&
@@ -7056,7 +7066,9 @@ async function resolveNativeTransportBackend(route, currentDocument) {
         current: () => {
           current()
 
-          if (!alive()) {throw new Error('Backend retired during ticket mint')}
+          if (!alive()) {
+            throw new Error('Backend retired during ticket mint')
+          }
         }
       })
 
@@ -7068,9 +7080,13 @@ async function resolveNativeTransportBackend(route, currentDocument) {
       const proxy = await session.defaultSession.resolveProxy(proxyTarget.toString())
       current()
 
-      if (!alive()) {throw new Error('Backend retired during proxy resolution')}
+      if (!alive()) {
+        throw new Error('Backend retired during proxy resolution')
+      }
 
-      if (proxy.trim() !== 'DIRECT') {throw new Error('Configured forward proxy is unsupported by native transport')}
+      if (proxy.trim() !== 'DIRECT') {
+        throw new Error('Configured forward proxy is unsupported by native transport')
+      }
 
       return target
     }
@@ -12331,14 +12347,18 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
     rememberLog(`Hermes backend for profile "${profile}" failed to start: ${error.message}`)
     releaseBackendChild(child)
 
-    if (backendPool.get(poolKey) === entry) {backendPool.delete(poolKey)}
+    if (backendPool.get(poolKey) === entry) {
+      backendPool.delete(poolKey)
+    }
     rejectStart?.(error)
   })
   child.once('exit', (code, signal) => {
     rememberLog(`Hermes backend for profile "${profile}" exited (${signal || code})`)
     releaseBackendChild(child)
 
-    if (backendPool.get(poolKey) === entry) {backendPool.delete(poolKey)}
+    if (backendPool.get(poolKey) === entry) {
+      backendPool.delete(poolKey)
+    }
 
     if (!ready) {
       rejectStart?.(

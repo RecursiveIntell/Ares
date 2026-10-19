@@ -218,7 +218,9 @@ async function run() {
     ensureBackend: async (profile: string) => {
       effects.claims++
 
-      if (gate) {await gate}
+      if (gate) {
+        await gate
+      }
 
       return profile === 'pool'
         ? bindNativeBackendPromise(
@@ -249,8 +251,8 @@ async function run() {
           onBeforeSendHeaders: (listener: any) => {
             session.defaultSession.webRequest.onBeforeSendHeaders((details, callback) =>
               listener(details, (result: any) => {
-                if (details.resourceType === 'webSocket')
-                  {workerRequests.push({
+                if (details.resourceType === 'webSocket') {
+                  workerRequests.push({
                     urlPath: new URL(details.url).pathname,
                     origin: result.requestHeaders?.Origin,
                     frameUrl: details.frame?.url ?? null,
@@ -258,7 +260,8 @@ async function run() {
                     owningMainFrame: details.frame === webContents.fromId(details.webContentsId!)?.mainFrame,
                     webContentsId: details.webContentsId,
                     proxy: !!result.requestHeaders?.['x-synthetic-proxy']
-                  })}
+                  })
+                }
 
                 callback(result)
               })
@@ -330,7 +333,9 @@ async function run() {
       }
     })
 
-    if (trusted) {privilegedAppContents.add(win.webContents.id)}
+    if (trusted) {
+      privilegedAppContents.add(win.webContents.id)
+    }
     transport.register(win.webContents)
 
     return win
@@ -439,8 +444,9 @@ async function run() {
       'electron/native-backend-lifetime.ts',
       'electron/backend-dial-claim.ts',
       'electron/fixtures/p2-bootstrap-backend.py'
-    ])
-      {hashes[f] = hash(f)}
+    ]) {
+      hashes[f] = hash(f)
+    }
 
     return {
       normalSandbox: true,
@@ -471,7 +477,9 @@ async function run() {
 }
 
 async function stop() {
-  for (const timer of fixtureTimers) {clearTimeout(timer)}
+  for (const timer of fixtureTimers) {
+    clearTimeout(timer)
+  }
   await Promise.all(
     children.map(
       child =>

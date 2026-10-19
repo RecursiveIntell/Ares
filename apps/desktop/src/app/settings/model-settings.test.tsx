@@ -40,7 +40,10 @@ vi.mock('@/hermes', () => ({
   getAuxiliaryModels: (profile?: null | string) => getAuxiliaryModels(profile),
   getApiRequestProfile: () => 'default',
   getMoaModels: (profile?: null | string) => getMoaModels(profile),
-  profileScopeKey: (scope?: null | string | { connectionId?: string | null; profile?: string | null }) => typeof scope === 'object' && scope ? `${scope.connectionId || 'local'}::${scope.profile || 'default'}` : (scope ?? '').trim() || 'default',
+  profileScopeKey: (scope?: null | string | { connectionId?: string | null; profile?: string | null }) =>
+    typeof scope === 'object' && scope
+      ? `${scope.connectionId || 'local'}::${scope.profile || 'default'}`
+      : (scope ?? '').trim() || 'default',
   setModelAssignment: (body: unknown) => setModelAssignment(body),
   getRecommendedDefaultModel: (slug: string) => getRecommendedDefaultModel(slug),
   saveMoaModels: (body: unknown) => saveMoaModels(body),
@@ -129,63 +132,99 @@ describe('ModelSettings profile scope', () => {
       model: getApiRequestConnection() === 'source-b' ? 'model-b' : 'hermes-4'
     }))
     getGlobalModelOptions.mockImplementation(async () => ({
-      providers: getApiRequestConnection() === 'source-b'
-        ? [{ name: 'Source B', slug: 'custom:b', models: ['model-b'], authenticated: true, api_url: 'https://b.invalid/v1' }]
-        : [{ name: 'Nous', slug: 'nous', models: ['hermes-4'], authenticated: true }]
+      providers:
+        getApiRequestConnection() === 'source-b'
+          ? [
+              {
+                name: 'Source B',
+                slug: 'custom:b',
+                models: ['model-b'],
+                authenticated: true,
+                api_url: 'https://b.invalid/v1'
+              }
+            ]
+          : [{ name: 'Nous', slug: 'nous', models: ['hermes-4'], authenticated: true }]
     }))
     await renderModelSettings()
     await screen.findByRole('button', { name: 'Apply' })
     await act(async () => rehome('source-b'))
     await waitFor(() => expect(screen.getAllByRole('combobox')[0].textContent).toContain('Source B'))
     fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
-    await waitFor(() => expect(setModelAssignment).toHaveBeenCalledWith(expect.objectContaining({
-      provider: 'custom:b', model: 'model-b', base_url: 'https://b.invalid/v1'
-    })))
+    await waitFor(() =>
+      expect(setModelAssignment).toHaveBeenCalledWith(
+        expect.objectContaining({
+          provider: 'custom:b',
+          model: 'model-b',
+          base_url: 'https://b.invalid/v1'
+        })
+      )
+    )
     await act(async () => rehome('source-a'))
     await waitFor(() => expect(screen.getAllByRole('combobox')[0].textContent).toContain('Nous'))
   })
 
-  it.each(['source-b', 'local'])('keeps config GET/PUT routing and record authority together on %s', async destination => {
-    const previousBridge = window.hermesDesktop
+  it.each(['source-b', 'local'])(
+    'keeps config GET/PUT routing and record authority together on %s',
+    async destination => {
+      const previousBridge = window.hermesDesktop
 
-    const api = vi.fn(async (request: { connectionId?: string; method?: string; body?: unknown }) =>
-      request.method === 'PUT' ? { ok: true } : {
-        fixture_source: request.connectionId,
-        agent: { reasoning_effort: 'medium', service_tier: 'normal' },
-        memory: { enabled: false }, governor: { semantic_memory_enabled: true }
-      })
+      const api = vi.fn(async (request: { connectionId?: string; method?: string; body?: unknown }) =>
+        request.method === 'PUT'
+          ? { ok: true }
+          : {
+              fixture_source: request.connectionId,
+              agent: { reasoning_effort: 'medium', service_tier: 'normal' },
+              memory: { enabled: false },
+              governor: { semantic_memory_enabled: true }
+            }
+      )
 
-    window.hermesDesktop = { api } as never
-    getHermesConfigRecord.mockImplementation(readConfigOverBridge)
-    saveHermesConfig.mockImplementation(saveConfigOverBridge)
+      window.hermesDesktop = { api } as never
+      getHermesConfigRecord.mockImplementation(readConfigOverBridge)
+      saveHermesConfig.mockImplementation(saveConfigOverBridge)
 
-    const rehome = (connectionId: string) => {
-      setApiRequestConnection(connectionId)
-      $connection.set({ connectionId } as never)
-      $newChatRoute.set({ connectionId, profile: 'default' })
+      const rehome = (connectionId: string) => {
+        setApiRequestConnection(connectionId)
+        $connection.set({ connectionId } as never)
+        $newChatRoute.set({ connectionId, profile: 'default' })
+      }
+
+      try {
+        rehome('source-a')
+        await renderModelSettings()
+        await screen.findByRole('switch')
+        await act(async () => rehome(destination))
+        await waitFor(() =>
+          expect(api).toHaveBeenCalledWith(expect.objectContaining({ connectionId: destination, path: '/api/config' }))
+        )
+        fireEvent.click(await screen.findByRole('switch'))
+        await waitFor(() =>
+          expect(api).toHaveBeenCalledWith(
+            expect.objectContaining({
+              connectionId: destination,
+              method: 'PUT',
+              body: {
+                config: expect.objectContaining({
+                  fixture_source: destination,
+                  memory: { enabled: false },
+                  governor: { semantic_memory_enabled: true }
+                })
+              }
+            })
+          )
+        )
+        expect(getHermesConfigRecord).toHaveBeenCalledWith(undefined)
+        expect(saveHermesConfig).toHaveBeenCalledWith(
+          expect.objectContaining({ fixture_source: destination }),
+          undefined
+        )
+      } finally {
+        window.hermesDesktop = previousBridge
+        getHermesConfigRecord.mockReset()
+        saveHermesConfig.mockReset()
+      }
     }
-
-    try {
-      rehome('source-a')
-      await renderModelSettings()
-      await screen.findByRole('switch')
-      await act(async () => rehome(destination))
-      await waitFor(() => expect(api).toHaveBeenCalledWith(expect.objectContaining({ connectionId: destination, path: '/api/config' })))
-      fireEvent.click(await screen.findByRole('switch'))
-      await waitFor(() => expect(api).toHaveBeenCalledWith(expect.objectContaining({
-        connectionId: destination, method: 'PUT', body: { config: expect.objectContaining({
-          fixture_source: destination, memory: { enabled: false }, governor: { semantic_memory_enabled: true }
-        })
-        }
-      })))
-      expect(getHermesConfigRecord).toHaveBeenCalledWith(undefined)
-      expect(saveHermesConfig).toHaveBeenCalledWith(expect.objectContaining({ fixture_source: destination }), undefined)
-    } finally {
-      window.hermesDesktop = previousBridge
-      getHermesConfigRecord.mockReset()
-      saveHermesConfig.mockReset()
-    }
-  })
+  )
 
   it('carries the original source/profile/target through an asynchronous save callback', async () => {
     const owner = { connectionId: 'source-a', profile: 'specialist', targetProfile: 'backend-a' }

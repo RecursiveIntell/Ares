@@ -829,14 +829,18 @@ export function usePromptActions({
       // Stop failure if the authoritative stream already settled this session.
       const current = $sessionStates.get()[sessionId]
 
-      if (activeSessionIdRef.current === sessionId && selectedStoredSessionIdRef.current === storedSessionId &&
-          (current?.busy || current?.reconnecting || !current) &&
-          Boolean(turnAtStop?.streamId || turnAtStop?.turnStartedAt != null) &&
-          (!turnAtStop?.streamId || current?.streamId === turnAtStop.streamId) &&
-          (turnAtStop?.turnStartedAt == null || current?.turnStartedAt === turnAtStop.turnStartedAt)) {
-        const missingOwner = err instanceof JsonRpcGatewayError
-          ? err.code === 4007
-          : err instanceof Error && /session not found/i.test(err.message)
+      if (
+        activeSessionIdRef.current === sessionId &&
+        selectedStoredSessionIdRef.current === storedSessionId &&
+        (current?.busy || current?.reconnecting || !current) &&
+        Boolean(turnAtStop?.streamId || turnAtStop?.turnStartedAt != null) &&
+        (!turnAtStop?.streamId || current?.streamId === turnAtStop.streamId) &&
+        (turnAtStop?.turnStartedAt == null || current?.turnStartedAt === turnAtStop.turnStartedAt)
+      ) {
+        const missingOwner =
+          err instanceof JsonRpcGatewayError
+            ? err.code === 4007
+            : err instanceof Error && /session not found/i.test(err.message)
 
         // The backend types how the Stop actually resolved
         // (`effect_disposition` on the 5019 payload). Report that instead of a
@@ -853,7 +857,10 @@ export function usePromptActions({
             action: {
               label: t.shell.gatewayMenu.reconnectGateway,
               onClick: () => {
-                if (activeSessionIdRef.current === sessionId && selectedStoredSessionIdRef.current === storedSessionId) {
+                if (
+                  activeSessionIdRef.current === sessionId &&
+                  selectedStoredSessionIdRef.current === storedSessionId
+                ) {
                   void resumeStoredSession(storedSessionId)
                 }
               }
