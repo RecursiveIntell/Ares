@@ -14459,16 +14459,62 @@ def _notification_poller_loop(
             _emit("status.update", sid, {"kind": "process", "text": text})
             _emitted.add(_dedup_key)
 
+        # ── Coalesce same-session delegation completions ──
+        # A backlog (overnight disconnect, or a fan-out finishing together)
+        # used to become one prompt turn PER result — N stale "already
+        # incorporated, no action needed" bubbles in a row. Drain whatever
+        # else is already queued for THIS session and deliver it as one turn.
+        # Foreign-owned and non-delegation events are held aside and requeued
+        # below, exactly as a fresh loop iteration would have handled them.
+        _held_foreign: list = []
+        is_delegation = evt.get("type") == "async_delegation"
+        deliverables = [(evt, text)]
+        if is_delegation:
+            while True:
+                try:
+                    _nxt = process_registry.completion_queue.get_nowait()
+                except Exception:
+                    break
+                if _notification_event_belongs_elsewhere(sid, session, _nxt):
+                    _held_foreign.append(_nxt)
+                    continue
+                if _nxt.get("type") != "async_delegation":
+                    _held_foreign.append(_nxt)
+                    continue
+                if not _session_owns_notification_event(sid, session, _nxt):
+                    _held_foreign.append(_nxt)
+                    continue
+                _nxt_text = format_process_notification(_nxt)
+                if not _nxt_text:
+                    continue
+                _nxt_key = _notification_event_dedup_key(_nxt)
+                if _nxt_key not in _emitted:
+                    _emit(
+                        "status.update", sid,
+                        {"kind": "process", "text": _nxt_text},
+                    )
+                    _emitted.add(_nxt_key)
+                deliverables.append((_nxt, _nxt_text))
+            if len(deliverables) > 1:
+                logger.info(
+                    "Coalescing %d async-delegation completions for session "
+                    "%s into one turn",
+                    len(deliverables), sid,
+                )
+
         _requeued = False
         _host_route = _autonomous_host_route_available()
         with session["history_lock"]:
             if session.get("running"):
-                process_registry.completion_queue.put(evt)
+                for _evt, _text in deliverables:
+                    process_registry.completion_queue.put(_evt)
                 _requeued = True
             elif not _host_route:
                 session["running"] = True
+        for _held in _held_foreign:
+            process_registry.completion_queue.put(_held)
         if _requeued:
-            # Back off before re-polling: the re-queued event keeps the queue
+            # Back off before re-polling: the re-queued events keep the queue
             # non-empty, so without a sleep this loop spins at full speed
             # (100% CPU, GIL churn) for as long as the session stays busy.
             time.sleep(0.25)
@@ -14478,6 +14524,58 @@ def _notification_poller_loop(
         from tools.async_delegation import (
             claim_event_delivery, complete_event_delivery, release_event_delivery,
         )
+        if is_delegation:
+            # Claim every member of the batch BEFORE building the submission
+            # (the ledger never acks work that was not delivered). A claim
+            # lost mid-batch drops that row from the consolidated text and
+            # requeues it for its own later turn instead of injecting a
+            # subagent's summary twice.
+            _claim_ids: list = []
+            _claimed_deliverables: list = []
+            for _evt, _text in deliverables:
+                _claim = claim_event_delivery(_evt, "tui-poller")
+                if _claim is not None:
+                    _claim_ids.append((_evt, _claim))
+                    _claimed_deliverables.append((_evt, _text))
+                else:
+                    process_registry.completion_queue.put(_evt)
+            if not _claim_ids:
+                if not _host_route:
+                    with session["history_lock"]:
+                        session["running"] = False
+                continue
+            try:
+                _ok, _missed = _dispatch_grouped_delegation_notifications(
+                    sid, session, _claimed_deliverables, _claim_ids,
+                    _dispatch_fn=(_dispatch_autonomous_turn if _host_route
+                                  else _run_prompt_submit),
+                )
+            except Exception as exc:
+                for _evt, _c in _claim_ids:
+                    release_event_delivery(_evt, _c)
+                for _evt, _text in _claimed_deliverables:
+                    process_registry.completion_queue.put(_evt)
+                print(
+                    f"[tui_gateway] notification poller dispatch failed: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+                if not _host_route:
+                    with session["history_lock"]:
+                        session["running"] = False
+                else:
+                    time.sleep(0.5)
+                continue
+            for _evt in _missed:
+                process_registry.completion_queue.put(_evt)
+            if not _ok:
+                if not _host_route:
+                    with session["history_lock"]:
+                        session["running"] = False
+                else:
+                    time.sleep(0.25)
+            continue
+
         _claim = claim_event_delivery(evt, "tui-poller")
         if _claim is None:
             # Another durable consumer already owns delivery. We claimed the
@@ -14592,73 +14690,120 @@ def _notification_poller_loop(
             if not _host_route:
                 session["running"] = True
 
+        # Shutdown drain mirrors the live loop: same-session delegation
+        # completions ride out as ONE consolidated turn, other types as their
+        # own turns (unchanged legacy shape). Foreign-owned and non-delegation
+        # events are deferred to the requeue pass below.
+        _held: list = []
+        is_delegation = evt.get("type") == "async_delegation"
+        deliverables = [(evt, text)]
+        if is_delegation:
+            while True:
+                try:
+                    _nxt = process_registry.completion_queue.get_nowait()
+                except Exception:
+                    break
+                if _notification_event_belongs_elsewhere(sid, session, _nxt):
+                    _held.append(_nxt)
+                    continue
+                if _nxt.get("type") != "async_delegation":
+                    _held.append(_nxt)
+                    continue
+                if not _session_owns_notification_event(sid, session, _nxt):
+                    _held.append(_nxt)
+                    continue
+                _nxt_text = format_process_notification(_nxt)
+                if not _nxt_text:
+                    continue
+                _nxt_key = _notification_event_dedup_key(_nxt)
+                if _nxt_key not in _emitted:
+                    _emit(
+                        "status.update", sid,
+                        {"kind": "process", "text": _nxt_text},
+                    )
+                    _emitted.add(_nxt_key)
+                deliverables.append((_nxt, _nxt_text))
+
         rid = f"__notif__{int(time.time() * 1000)}"
         from tools.async_delegation import (
             claim_event_delivery, complete_event_delivery, release_event_delivery,
         )
-        _claim = claim_event_delivery(evt, "tui-poller")
-        if _claim is None:
-            # Another durable consumer already owns delivery. We claimed the
-            # local UI turn slot before consulting the durable arbiter, so
-            # release that speculative busy state instead of leaving the
-            # session permanently stuck as running.
-            if not _host_route:
-                with session["history_lock"]:
-                    session["running"] = False
-            continue
-        try:
-            if _host_route:
-                admitted = _dispatch_autonomous_turn(
-                    rid, sid, session, text,
-                    display_kind=("async_delegation_complete"
-                                  if evt.get("type") == "async_delegation"
-                                  else "internal_notification"),
-                    display_metadata=(_async_delegation_display_metadata(evt)
-                                      if evt.get("type") == "async_delegation"
-                                      else {"synthetic_source": "background_notification"}),
-                )
-                if not admitted:
-                    release_event_delivery(evt, _claim)
-                    process_registry.completion_queue.put(evt)
-                    break
-                _emit("message.start", sid)
-            else:
-                _emit("message.start", sid)
-                if evt.get("type") == "async_delegation":
-                    _run_prompt_submit(
-                        rid,
-                        sid,
-                        session,
-                        text,
-                        display_kind="async_delegation_complete",
-                        display_metadata=_async_delegation_display_metadata(evt),
-                    )
+        if is_delegation:
+            _claim_ids: list = []
+            _claimed_deliverables: list = []
+            for _evt, _text in deliverables:
+                _claim = claim_event_delivery(_evt, "tui-poller")
+                if _claim is not None:
+                    _claim_ids.append((_evt, _claim))
+                    _claimed_deliverables.append((_evt, _text))
                 else:
-                    _run_prompt_submit(
-                        rid,
-                        sid,
-                        session,
-                        text,
-                        display_kind="internal_notification",
-                        display_metadata={"synthetic_source": "background_notification"},
+                    # Cannot prove sole ownership of this row's delivery —
+                    # leave it pending (the deferred pass below requeues it).
+                    _held.append(_evt)
+            if _claim_ids:
+                try:
+                    _ok, _missed = _dispatch_grouped_delegation_notifications(
+                        sid, session, _claimed_deliverables, _claim_ids,
+                        _dispatch_fn=(_dispatch_autonomous_turn if _host_route
+                                      else _run_prompt_submit),
                     )
-            complete_event_delivery(evt, _claim)
-        except Exception as exc:
-            release_event_delivery(evt, _claim)
-            print(
-                f"[tui_gateway] notification poller dispatch failed: "
-                f"{type(exc).__name__}: {exc}",
-                file=sys.stderr,
-            )
-            if _host_route:
-                # Keep the event for the resume-time poller instead of
-                # dropping it, but stop draining: a persistent dispatch fault
-                # must not loop this finite shutdown drain.
-                process_registry.completion_queue.put(evt)
-                break
-            else:
+                except Exception:
+                    for _evt, _claim in _claim_ids:
+                        release_event_delivery(_evt, _claim)
+                    for _evt, _text in _claimed_deliverables:
+                        _held.append(_evt)
+                    _ok, _missed = False, []
+                for _evt in _missed:
+                    _held.append(_evt)
+                if not _ok and not _host_route:
+                    with session["history_lock"]:
+                        session["running"] = False
+            elif not _host_route:
                 with session["history_lock"]:
                     session["running"] = False
+        else:
+            _claim = claim_event_delivery(evt, "tui-poller")
+            if _claim is not None:
+                try:
+                    if _host_route:
+                        admitted = _dispatch_autonomous_turn(
+                            rid, sid, session, text,
+                            display_kind=("async_delegation_complete"
+                                          if evt.get("type") == "async_delegation"
+                                          else "internal_notification"),
+                            display_metadata=(_async_delegation_display_metadata(evt)
+                                              if evt.get("type") == "async_delegation"
+                                              else {"synthetic_source": "background_notification"}),
+                        )
+                        if not admitted:
+                            release_event_delivery(evt, _claim)
+                            _held.append(evt)
+                        else:
+                            _emit("message.start", sid)
+                            complete_event_delivery(evt, _claim)
+                    else:
+                        _emit("message.start", sid)
+                        _run_prompt_submit(
+                            rid, sid, session, text,
+                            display_kind="internal_notification",
+                            display_metadata={"synthetic_source": "background_notification"},
+                        )
+                        complete_event_delivery(evt, _claim)
+                except Exception as exc:
+                    release_event_delivery(evt, _claim)
+                    print(
+                        f"[tui_gateway] notification poller dispatch failed: "
+                        f"{type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                    )
+                    if not _host_route:
+                        with session["history_lock"]:
+                            session["running"] = False
+            elif not _host_route:
+                with session["history_lock"]:
+                    session["running"] = False
+        for _held_evt in _held:
+            deferred.append(_held_evt)
 
     # Hand any other sessions' events back to the shared queue.
     for evt in deferred:
@@ -14690,6 +14835,128 @@ def _async_delegation_display_metadata(evt: dict) -> dict:
     if isinstance(duration, (int, float)):
         metadata["duration_seconds"] = duration
     return metadata
+
+
+def _format_coalesced_tui_delegations(blocks: list) -> str:
+    """Join per-delegation formatted blocks into one consolidated turn.
+
+    The desktop poller historically injected every queued async-delegation
+    completion as its own prompt turn. After an overnight disconnect that meant
+    one turn per stale result — N "already incorporated into its earlier
+    closure, no action needed" bubbles in a row. The gateway path
+    (gateway/run.py ``_deliver_async_delegation_group``) already coalesces
+    same-route completions with exactly this header contract; the desktop
+    mirrors it. Per-event blocks are self-describing (each carries its own
+    Dispatched/age/Status lines), so this only numbers them and adds the
+    one-consolidated-response instruction.
+    """
+    header = (
+        f"[IMPORTANT: {len(blocks)} background subagent delegations "
+        "completed for this session. Treat these results as one completion "
+        "batch and send at most one consolidated user-facing response. If a "
+        "result does not change the current conclusion, absorb it silently.]"
+    )
+    parts = [header]
+    for i, block in enumerate(blocks):
+        parts.append(f"--- result {i + 1}/{len(blocks)} ---")
+        parts.append(block)
+    return "\n\n".join(parts)
+
+
+def _dispatch_grouped_delegation_notifications(
+    sid: str,
+    session: dict,
+    deliverables: list,
+    claim_ids: list,
+    *,
+    _dispatch_fn=None,
+) -> tuple:
+    """Deliver pre-claimed async-delegation completions as ONE agent turn.
+
+    ``deliverables`` are ``(evt, formatted_text)`` pairs in queue order;
+    ``claim_ids`` the parallel ``(evt, claim_id)`` pairs produced by
+    ``claim_event_delivery(evt, <owner>)`` for each — claimed by the caller
+    BEFORE the session-busy/requeue gate so a submission can never be built
+    from rows another consumer may claim in the meantime. ``_dispatch_fn``
+    performs the actual submission: ``_dispatch_autonomous_turn`` when the
+    compute-host route is available (admission registers a complete owner),
+    ``_run_prompt_submit`` for the chained post-turn drain. A dispatch that
+    reports refusal (``False``) or raises releases every claim and returns
+    ``(False, events)`` so the caller can requeue the raw events; the durable
+    rows stay ``pending`` for a later retry (the ledger never acks work that
+    was not delivered). A single deliverable rides the legacy per-event shape
+    exactly (same text, same display metadata) so small backlogs stay
+    behavior-identical.
+
+    Returns ``(True, [])`` after the turn was accepted for submission, or
+    ``(False, [events...])`` for everything the caller must requeue.
+    """
+    from tools.async_delegation import (
+        complete_event_delivery,
+        release_event_delivery,
+    )
+
+    if not deliverables:
+        return True, []
+
+    if _dispatch_fn is None:
+        _dispatch_fn = _run_prompt_submit
+
+    if len(deliverables) == 1:
+        evt, synth_text = deliverables[0]
+        claim_id = claim_ids[0][1]
+        try:
+            ok = _dispatch_fn(
+                f"__notif__{int(time.time() * 1000)}",
+                sid,
+                session,
+                synth_text,
+                display_kind="async_delegation_complete",
+                display_metadata=_async_delegation_display_metadata(evt),
+            )
+            if ok is False:
+                release_event_delivery(evt, claim_id)
+                return False, [evt]
+            complete_event_delivery(evt, claim_id)
+            return True, []
+        except Exception as exc:
+            release_event_delivery(evt, claim_id)
+            print(
+                f"[tui_gateway] notification poller dispatch failed: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return False, [evt]
+
+    consolidated = _format_coalesced_tui_delegations(
+        [text for _evt, text in deliverables]
+    )
+    rid = f"__notif__{int(time.time() * 1000)}"
+    metadata = _async_delegation_display_metadata(deliverables[0][0])
+    metadata["task_count"] = len(deliverables)
+    metadata["coalesced"] = True
+    try:
+        ok = _dispatch_fn(
+            rid, sid, session, consolidated,
+            display_kind="async_delegation_complete",
+            display_metadata=metadata,
+        )
+        if ok is False:
+            for evt, claim_id in claim_ids:
+                release_event_delivery(evt, claim_id)
+            return False, [evt for evt, _claim in claim_ids]
+        for evt, claim_id in claim_ids:
+            complete_event_delivery(evt, claim_id)
+        return True, []
+    except Exception as exc:
+        for evt, claim_id in claim_ids:
+            release_event_delivery(evt, claim_id)
+        print(
+            f"[tui_gateway] notification poller dispatch failed: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return False, [evt for evt, _claim in claim_ids]
 
 
 def _wire_agent_terminal_output() -> None:
@@ -16257,16 +16524,29 @@ def _run_prompt_submit(
                 owns_event=lambda e: _session_owns_notification_event(sid, session, e),
                 skip_poll_observed=False,
             )
-            for index, (_evt, synth) in enumerate(drained):
+            # Split the drained batch: same-session delegation completions
+            # coalesce into ONE turn (mirrors the poller; an overnight backlog
+            # used to become one prompt turn per stale result), ordinary
+            # completion events keep the legacy per-event shape. Order: the
+            # per-event types first in queue order, then the delegation batch.
+            from tools.async_delegation import (
+                claim_event_delivery, complete_event_delivery, release_event_delivery,
+            )
+            _deleg_pairs: list = []
+            _other_pairs: list = []
+            for _evt, synth in drained:
+                if _evt.get("type") == "async_delegation":
+                    _deleg_pairs.append((_evt, synth))
+                else:
+                    _other_pairs.append((_evt, synth))
+
+            for _idx, (_evt, synth) in enumerate(_other_pairs):
                 with session["history_lock"]:
                     if session.get("running"):
-                        for pending_evt, _pending_synth in drained[index:]:
+                        for pending_evt, _pending_synth in _other_pairs[_idx:]:
                             process_registry.completion_queue.put(pending_evt)
                         break
                     session["running"] = True
-                from tools.async_delegation import (
-                    claim_event_delivery, complete_event_delivery, release_event_delivery,
-                )
                 _claim = claim_event_delivery(_evt, "tui-post-turn")
                 if _claim is None:
                     # The local slot was claimed before the durable arbiter.
@@ -16302,6 +16582,39 @@ def _run_prompt_submit(
                     )
                     with session["history_lock"]:
                         session["running"] = False
+
+            if _deleg_pairs:
+                with session["history_lock"]:
+                    if session.get("running"):
+                        for pending_evt, _pending_synth in _deleg_pairs:
+                            process_registry.completion_queue.put(pending_evt)
+                        _deleg_pairs = []
+                    else:
+                        session["running"] = True
+                if _deleg_pairs:
+                    _claim_ids: list = []
+                    _claimed: list = []
+                    for _evt, synth in _deleg_pairs:
+                        _claim = claim_event_delivery(_evt, "tui-post-turn")
+                        if _claim is not None:
+                            _claim_ids.append((_evt, _claim))
+                            _claimed.append((_evt, synth))
+                        else:
+                            process_registry.completion_queue.put(_evt)
+                    if _claim_ids:
+                        # This drain runs inside the accepted turn's own run
+                        # thread (the host keeps that request id alive across
+                        # the chained successors), so dispatched batches stay
+                        # inline — host admission is already held by the chain.
+                        _ok, _missed = _dispatch_grouped_delegation_notifications(
+                            sid, session, _claimed, _claim_ids,
+                            _dispatch_fn=_run_prompt_submit,
+                        )
+                        for _evt in _missed:
+                            process_registry.completion_queue.put(_evt)
+                        if not _ok:
+                            with session["history_lock"]:
+                                session["running"] = False
         except Exception as _drain_exc:
             print(
                 f"[tui_gateway] completion queue drain failed: "
