@@ -72,7 +72,7 @@ def test_real_sdk_lease_paths(endpoint,monkeypatch,provider):
         with client(url) as sdk:
             sdk.responses.create(model='local',input='hello',max_output_tokens=7)
     else:
-        import boto3
+        boto3 = pytest.importorskip("boto3", reason="bedrock extra not installed")
         from botocore import UNSIGNED
         from botocore.config import Config
         sdk=bind_bedrock_client(boto3.client('bedrock-runtime',region_name='us-east-1',endpoint_url=url,

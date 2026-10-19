@@ -78,7 +78,7 @@ async def test_async_auxiliary_actual_sdk(endpoint, observed):
 
 
 def test_bedrock_converse_actual_botocore_retry(endpoint, observed):
-    import boto3
+    boto3 = pytest.importorskip("boto3", reason="bedrock extra not installed")
     from botocore import UNSIGNED
     from botocore.config import Config
     url, bodies, statuses = endpoint
@@ -98,7 +98,7 @@ def test_bedrock_converse_actual_botocore_retry(endpoint, observed):
 
 @pytest.mark.parametrize('kind', ['deny', 'settle'])
 def test_bedrock_typed_failure_zero_or_one_send(endpoint, monkeypatch, kind):
-    import boto3
+    boto3 = pytest.importorskip("boto3", reason="bedrock extra not installed")
     from botocore import UNSIGNED
     from botocore.config import Config
     url, bodies, _ = endpoint
@@ -124,7 +124,7 @@ def test_bedrock_typed_failure_zero_or_one_send(endpoint, monkeypatch, kind):
 
 
 def test_bedrock_policy_denial_cannot_trigger_iam_stream_fallback(endpoint,monkeypatch):
-    import boto3
+    boto3 = pytest.importorskip("boto3", reason="bedrock extra not installed")
     from botocore import UNSIGNED
     from botocore.config import Config
     from agent import bedrock_adapter

@@ -163,7 +163,7 @@ def test_other_sync_providers_share_total_deadline(dripping,monkeypatch,provider
             with GeminiNativeClient(api_key='local',base_url=url,http_client=httpx.Client(trust_env=False)) as sdk:
                 sdk.chat.completions.create(model='local',messages=[],max_tokens=7)
         else:
-            import boto3
+            boto3 = pytest.importorskip("boto3", reason="bedrock extra not installed")
             from botocore import UNSIGNED
             from botocore.config import Config
             from ares_runtime.physical_dispatch import bind_bedrock_client

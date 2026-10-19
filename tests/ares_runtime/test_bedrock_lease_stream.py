@@ -7,10 +7,11 @@ import time
 import zlib
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 
-import boto3
-from botocore import UNSIGNED
-from botocore.config import Config
 import pytest
+
+boto3 = pytest.importorskip("boto3", reason="bedrock extra not installed")
+from botocore import UNSIGNED  # noqa: E402
+from botocore.config import Config  # noqa: E402
 
 from ares_runtime.physical_dispatch import bind_bedrock_client
 from hermes_cli import middleware

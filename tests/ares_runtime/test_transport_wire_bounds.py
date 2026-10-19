@@ -31,9 +31,11 @@ def test_invalid_actual_output_field_cannot_be_repaired(endpoint,monkeypatch,bod
 
 @pytest.mark.parametrize('provider',['openai','anthropic','gemini','responses','bedrock'])
 def test_off_enforce_exact_sdk_body_and_hash(endpoint,monkeypatch,provider):
-    import openai,anthropic,boto3
-    from botocore import UNSIGNED
-    from botocore.config import Config
+    import openai,anthropic
+    if provider=='bedrock':
+        boto3 = pytest.importorskip("boto3", reason="bedrock extra not installed")
+        from botocore import UNSIGNED
+        from botocore.config import Config
     from ares_runtime.physical_dispatch import bind_inference_client,bind_bedrock_client
     from agent.gemini_native_adapter import GeminiNativeClient
     url,bodies,_=endpoint;observations=[];settles=[]
