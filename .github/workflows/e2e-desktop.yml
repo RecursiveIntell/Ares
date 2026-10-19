@@ -2,6 +2,10 @@ name: E2E Desktop
 
 on:
   workflow_call:
+  # Reachable on demand while the ci.yaml caller stays intentionally disabled
+  # (Aug 2 2026 team decision, tracking #76627): run the native security
+  # witnesses from the Actions UI / API without re-enabling the parked lane.
+  workflow_dispatch:
     outputs:
       review_status:
         description: Screenshot and visual-diff status for the CI review comment.
