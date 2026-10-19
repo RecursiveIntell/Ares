@@ -9074,12 +9074,13 @@ class AIAgent:
             )
             from agent.auxiliary_client import scoped_runtime_main
             from hermes_state_inbox import context_input_turn_lease_scope
+            from ares_runtime.managed_calls import model_call_owner_scope
 
             # The outer token restores the caller's Context even though turn setup
             # replaces the value with the live runtime after fallback restoration.
             # Keep the scope local instead of storing ContextVar tokens on the agent,
             # which may be observed from another thread.
-            with bind_subagent_parent(self), scoped_runtime_main({}), context_input_turn_lease_scope(
+            with model_call_owner_scope(self), bind_subagent_parent(self), scoped_runtime_main({}), context_input_turn_lease_scope(
                 getattr(self, "_session_db", None), durable_turn_lease,
             ):
                 try:

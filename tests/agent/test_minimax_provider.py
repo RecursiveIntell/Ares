@@ -1,6 +1,7 @@
 """Tests for MiniMax provider hardening — context lengths, thinking, catalog, beta headers, transport."""
 
 from unittest.mock import patch
+from tests.agent.sdk_factory_fixtures import constructor_httpx_backend
 
 
 class TestMinimaxContextLengths:
@@ -165,7 +166,7 @@ class TestMinimaxBetaHeaders:
     def _build_and_get_betas(self, api_key, base_url=None):
         """Build client, return the anthropic-beta header string."""
         from agent.anthropic_adapter import build_anthropic_client
-        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk, constructor_httpx_backend(mock_sdk):
             build_anthropic_client(api_key, base_url=base_url)
             kwargs = mock_sdk.Anthropic.call_args[1]
             headers = kwargs.get("default_headers", {})

@@ -815,10 +815,13 @@ def _probe_single_zai_endpoint(
     ``probe_models`` LIST and each model is tried in order until one
     succeeds (some plans only accept newer/older GLM slugs).
     """
+    from ares_runtime.physical_dispatch import unsupported_transport_scope
+    from hermes_cli.middleware import EgressDispatchDenied, EgressOutcomeUnrecorded
     ep_id, base_url, probe_models, label = endpoint
     for model in probe_models:
         try:
-            resp = httpx.post(
+            with unsupported_transport_scope('zai_setup_probe'):
+                resp = httpx.post(
                 f"{base_url}/chat/completions",
                 headers={
                     "Authorization": f"Bearer {api_key}",
@@ -841,6 +844,8 @@ def _probe_single_zai_endpoint(
                     "label": label,
                 }
             logger.debug("Z.AI endpoint probe: %s model=%s returned %s", ep_id, model, resp.status_code)
+        except (EgressDispatchDenied, EgressOutcomeUnrecorded):
+            raise
         except Exception as exc:
             logger.debug("Z.AI endpoint probe: %s model=%s failed: %s", ep_id, model, exc)
     return None
@@ -855,6 +860,7 @@ def detect_zai_endpoint(api_key: str, timeout: float = 8.0) -> Optional[Dict[str
     its endpoint's models in order and returns the first that succeeds.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
+    from hermes_cli.middleware import EgressDispatchDenied, EgressOutcomeUnrecorded
 
     # No `with` block: a context manager would join ALL probe threads on
     # exit, defeating the early return below. shutdown(wait=False) lets the
@@ -874,6 +880,8 @@ def detect_zai_endpoint(api_key: str, timeout: float = 8.0) -> Optional[Dict[str
                 result = future.result()
                 if result is not None:
                     results[ep_id] = result
+            except (EgressDispatchDenied, EgressOutcomeUnrecorded):
+                raise
             except Exception:
                 pass
             # Early exit in PRIORITY order: walk endpoints highest-priority

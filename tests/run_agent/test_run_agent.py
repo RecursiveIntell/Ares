@@ -20,6 +20,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from tests.agent.sdk_factory_fixtures import constructor_httpx_backend
 from agent.codex_responses_adapter import _normalize_codex_response
 
 import run_agent
@@ -677,6 +678,7 @@ class TestInit:
             patch("run_agent.get_tool_definitions", return_value=[]),
             patch("run_agent.check_toolset_requirements", return_value={}),
             patch("agent.anthropic_adapter._anthropic_sdk") as mock_anthropic,
+            constructor_httpx_backend(mock_anthropic),
         ):
             agent = AIAgent(
                 api_key="test-key-1234567890",
@@ -747,7 +749,8 @@ class TestInit:
         with (
             patch("run_agent.get_tool_definitions", return_value=[]),
             patch("run_agent.check_toolset_requirements", return_value={}),
-            patch("agent.anthropic_adapter._anthropic_sdk"),
+            patch("agent.anthropic_adapter._anthropic_sdk") as mock_anthropic,
+            constructor_httpx_backend(mock_anthropic),
         ):
             a = AIAgent(
                 api_key="test-key-1234567890",

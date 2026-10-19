@@ -49,6 +49,8 @@ from agent.transports.ri_llm import _should_use_ri_pipeline, ri_pipeline_chat_co
 from tools.terminal_tool import is_persistent_env
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 
+from hermes_cli.middleware import EgressDispatchDenied, EgressOutcomeUnrecorded
+
 logger = logging.getLogger(__name__)
 _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 _PROVIDER_STREAM_ERROR_FINISH_REASONS = {"error", "error_finish"}
@@ -3002,9 +3004,15 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             getattr(agent, "base_url", None), getattr(agent, "session_id", None),
         )
 
+        from hermes_cli.middleware import run_llm_dispatch
+        def governed_summary(final):
+            return run_llm_dispatch(final, callback, _dispatch_agent=agent,
+                purpose="background_summary", session_id=getattr(agent, "session_id", None),
+                provider=getattr(agent, "provider", None), api_mode=getattr(agent, "api_mode", None))
+
         return relay_llm.execute_current(
             request,
-            callback,
+            governed_summary,
             name=str(getattr(agent, "provider", "") or "provider"),
             model_name=str(getattr(agent, "model", "") or ""),
             metadata={
@@ -3321,6 +3329,8 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             else:
                 final_response = "I reached the iteration limit and couldn't generate a summary."
 
+    except (EgressDispatchDenied, EgressOutcomeUnrecorded):
+        raise
     except Exception as e:
         logger.warning("Failed to get summary response: %s", e)
         final_response = f"I reached the maximum iterations ({agent.max_iterations}) but couldn't summarize. Error: {str(e)}"

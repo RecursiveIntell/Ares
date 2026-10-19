@@ -126,8 +126,10 @@ def probe_gemini_tier(
         "generationConfig": {"maxOutputTokens": 1},
     }
 
+    from ares_runtime.physical_dispatch import bind_http_client
+    from hermes_cli.middleware import EgressDispatchDenied, EgressOutcomeUnrecorded
     try:
-        with httpx.Client(timeout=timeout) as client:
+        with bind_http_client(httpx.Client(timeout=timeout)) as client:
             resp = client.post(
                 url,
                 params={"key": key},
@@ -137,6 +139,8 @@ def probe_gemini_tier(
                     "X-Goog-Api-Client": f"hermes-agent/{_HERMES_VERSION}",
                 },
             )
+    except (EgressDispatchDenied, EgressOutcomeUnrecorded):
+        raise
     except Exception as exc:
         logger.debug("probe_gemini_tier: network error: %s", exc)
         return "unknown"
@@ -1127,9 +1131,10 @@ class GeminiNativeClient:
         self._default_headers = dict(default_headers or {})
         self.chat = _GeminiChatNamespace(self)
         self.is_closed = False
-        self._http = http_client or httpx.Client(
+        from ares_runtime.physical_dispatch import bind_http_client
+        self._http = bind_http_client(http_client or httpx.Client(
             timeout=timeout or httpx.Timeout(connect=15.0, read=600.0, write=30.0, pool=30.0)
-        )
+        ))
 
     def close(self) -> None:
         self.is_closed = True
@@ -1243,32 +1248,63 @@ class GeminiNativeClient:
 class AsyncGeminiNativeClient:
     """Async wrapper used by auxiliary_client for native Gemini calls."""
 
-    def __init__(self, sync_client: GeminiNativeClient):
+    def __init__(self, sync_client: GeminiNativeClient, *, http_client: Optional[httpx.AsyncClient] = None):
         self._sync = sync_client
         self.api_key = sync_client.api_key
         self.base_url = sync_client.base_url
         self.chat = _AsyncGeminiChatNamespace(self)
-        # Expose the underlying sync client as _real_client so the auxiliary
-        # cache's eviction-by-leaf-client helper (#23482) can find and drop
-        # this async entry when the sync GeminiNativeClient is poisoned.
-        # GeminiNativeClient is itself the leaf (no OpenAI client beneath
-        # it), so we point at the sync_client directly.
         self._real_client = sync_client
+        from ares_runtime.physical_dispatch import bind_http_client
+        from ares_runtime.http_client_config import async_client_from_sync
+        self._http = bind_http_client(http_client if http_client is not None else async_client_from_sync(sync_client._http))
 
     async def _create_chat_completion(self, **kwargs: Any) -> Any:
-        stream = bool(kwargs.get("stream"))
-        result = await asyncio.to_thread(self._sync.chat.completions.create, **kwargs)
-        if not stream:
-            return result
+        extra = kwargs.get('extra_body')
+        thinking_config = (extra.get('thinking_config') or extra.get('thinkingConfig')) if isinstance(extra, dict) else None
+        request = build_gemini_request(
+            messages=kwargs.get('messages') or [], tools=kwargs.get('tools'),
+            tool_choice=kwargs.get('tool_choice'), temperature=kwargs.get('temperature'),
+            max_tokens=kwargs.get('max_tokens'), top_p=kwargs.get('top_p'),
+            stop=kwargs.get('stop'), thinking_config=thinking_config,
+            model=kwargs.get('model', 'gemini-3.7-flash'),
+        )
+        model = bare_gemini_model_id(kwargs.get('model', 'gemini-3.7-flash'))
+        timeout = kwargs.get('timeout')
+        if kwargs.get('stream'):
+            return self._stream_completion(model=model, request=request, timeout=timeout)
+        url = f'{self.base_url}/models/{model}:generateContent'
+        response = await self._http.post(url, json=request, headers=self._sync._headers(), timeout=timeout)
+        if response.status_code != 200:
+            raise gemini_http_error(response)
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise GeminiAPIError(f'Invalid JSON from Gemini native API: {exc}',
+                code='gemini_invalid_json', status_code=response.status_code, response=response) from exc
+        return translate_gemini_response(payload, model=model)
 
-        async def _async_stream() -> Any:
-            while True:
-                done, chunk = await asyncio.to_thread(self._sync._advance_stream_iterator, result)
-                if done:
-                    break
-                yield chunk
-
-        return _async_stream()
+    async def _stream_completion(self, *, model, request, timeout=None):
+        url = f'{self.base_url}/models/{model}:streamGenerateContent?alt=sse'
+        headers = dict(self._sync._headers())
+        headers['Accept'] = 'text/event-stream'
+        async with self._http.stream('POST', url, json=request, headers=headers, timeout=timeout) as response:
+            if response.status_code != 200:
+                body_text = (await response.aread()).decode('utf-8', errors='replace')
+                raise gemini_http_error(response, body_text=body_text)
+            indices = {}
+            async for line in response.aiter_lines():
+                if not line.startswith('data: '):
+                    continue
+                data = line[6:]
+                if data == '[DONE]':
+                    return
+                try:
+                    event = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(event, dict):
+                    for chunk in translate_stream_event(event, model, indices):
+                        yield chunk
 
     async def close(self) -> None:
-        await asyncio.to_thread(self._sync.close)
+        await self._http.aclose()
