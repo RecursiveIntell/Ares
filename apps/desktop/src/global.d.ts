@@ -1,6 +1,8 @@
 import type { GatewayWsUrlResult } from '@hermes/shared'
 import type { TranslucencyState } from '@hermes/shared/translucency'
 
+import type { NativeSocketBridge } from '../electron/native-socket-contract'
+
 import type { WakeIndicatorState } from './lib/wake-indicator'
 import type {
   PetOverlayBounds,
@@ -15,6 +17,7 @@ export {}
 declare global {
   interface Window {
     hermesDesktop: {
+      nativeSocket?: NativeSocketBridge
       // Resolve a backend connection. Omit `profile` (or pass the primary) for
       // the window's backend; pass a named profile to lazily spawn/reuse that
       // profile's backend from the pool.
@@ -46,7 +49,7 @@ declare global {
       // Keepalive: mark a pool profile backend as recently used so the idle
       // reaper spares it while its chat is active.
       touchBackend: (profile?: string | null) => Promise<{ ok: boolean }>
-      getGatewayWsUrl: (profile?: null | string) => Promise<GatewayWsUrlResult>
+      getGatewayWsUrl?: (profile?: null | string) => Promise<GatewayWsUrlResult>
       // Open (or focus) a standalone OS window for a single chat session so
       // the user can work with multiple chats side by side. Returns ok:false
       // with an error code when the sessionId is empty/invalid. `watch` opens
@@ -457,6 +460,7 @@ declare global {
         desktop: boolean
         agentName?: string | null
         desktopName?: string | null
+        revision?: string
         warnings?: string[]
         insecure?: boolean
         error?: string
@@ -465,7 +469,8 @@ declare global {
         identifier?: string
         repo?: string
         force?: boolean
-      }) => Promise<{ ok: boolean; pluginName?: string; path?: string; error?: string }>
+        revision?: string
+      }) => Promise<{ ok: boolean; pluginName?: string; path?: string; error?: string; revision?: string }>
       onWindowStateChanged?: (callback: (payload: HermesWindowState) => void) => () => void
       onFocusSession?: (callback: (sessionId: string) => void) => () => void
       onNotificationAction?: (callback: (payload: { actionId: string; sessionId?: string }) => void) => () => void

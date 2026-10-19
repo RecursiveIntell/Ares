@@ -15494,6 +15494,7 @@ def _run_prompt_submit(
         session_tokens = []
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
         secret_token = None
+        admission_goal = None  # original goal snapshot; pause uses its guarded CAS
         goal_followup = None  # set by the post-turn goal hook below
         result = None  # turn outcome; read after the finally for leftover /steer
         tts_queue = None  # streaming-TTS feed for this turn (voice mode)
@@ -15798,6 +15799,15 @@ def _run_prompt_submit(
             agent._route_turn_token = _route_turn_token
             _usage_stop, _usage_thread = _start_usage_ticker(sid, agent)
             try:
+                # Capture under this turn's profile scope, using the canonical
+                # owner rather than the UI sid. Never reload after a refusal:
+                # pause's expected-raw CAS protects intervening operator edits.
+                from hermes_cli.goals import GoalManager
+                from ares_runtime.continuity.runtime import ContextDispatchError
+
+                goal_key = str(session.get("session_key") or "")
+                if goal_key:
+                    admission_goal = GoalManager(goal_key)
                 result = agent.run_conversation(run_message, **run_kwargs)
             finally:
                 if getattr(agent, "_route_turn_token", None) is _route_turn_token:
@@ -16323,6 +16333,30 @@ def _run_prompt_submit(
             # Keep the partial turn available to the next prompt; the durable
             # inflight record still carries the recoverable error state.
             _restore_agent_history_after_turn_error(session, agent)
+            refusal_notice = None
+            if admission_goal is not None and isinstance(e, ContextDispatchError):
+                # Refusal grants no retry/judge authority, including when the
+                # guarded durable pause loses a race or persistence fails.
+                goal_followup = None
+                with session["history_lock"]:
+                    refusal_owned = ((owns_admission() or owns_stopped_admission())
+                        and session.get("agent") is agent)
+                if refusal_owned and admission_goal.is_active():
+                    try:
+                        paused = admission_goal.pause("CONTEXT_ADMISSION_REFUSED")
+                    except Exception:
+                        paused = None
+                    if paused is not None:
+                        refusal_notice = (
+                            "Goal paused: context recovery is required. An operator may explicitly "
+                            "resume with /goal resume after repairing context."
+                        )
+                    else:
+                        refusal_notice = (
+                            "Could not verify a durable pause of the failed admission's goal "
+                            "(state changed or persistence failed). No automatic goal followup "
+                            "was scheduled; inspect goal state and repair context."
+                        )
             try:
                 # Close the turn with the same terminal error frame shape as
                 # the returned-error path (uniform client handling), retaining
@@ -16337,6 +16371,11 @@ def _run_prompt_submit(
                     flush=True,
                 )
                 _emit("error", sid, {"message": str(e)})
+            if refusal_notice:
+                try:
+                    _emit("status.update", sid, {"kind": "goal", "text": refusal_notice})
+                except Exception:
+                    logger.debug("context refusal goal notice delivery failed", exc_info=True)
         finally:
             # Drop both local snapshots of the pre-turn history before asking
             # glibc to return pages. session["history"] already points at the

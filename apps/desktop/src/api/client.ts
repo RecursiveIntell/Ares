@@ -1,6 +1,8 @@
-import { JsonRpcGatewayClient } from '@hermes/shared'
+import { type GatewayClientOptions, JsonRpcGatewayClient } from '@hermes/shared'
 
 import type { HermesApiRequest } from '@/global'
+
+import { desktopSocketFactory } from './native-socket'
 
 // Desktop startup fires a burst of read-only data calls (config, profiles,
 // model info/options, cron) the moment the backend passes readiness. On a
@@ -26,13 +28,16 @@ const DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS = 30_000
 export const PROMPT_SUBMIT_REQUEST_TIMEOUT_MS = 1_800_000
 
 export class HermesGateway extends JsonRpcGatewayClient {
-  constructor() {
+  constructor(options: Pick<GatewayClientOptions, 'socketFactory'> = {}) {
     super({
       closedErrorMessage: 'Hermes gateway connection closed',
       connectErrorMessage: 'Could not connect to Hermes gateway',
       createRequestId: nextId => nextId,
       notConnectedErrorMessage: 'Hermes gateway is not connected',
-      requestTimeoutMs: DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS
+      requestTimeoutMs: DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS,
+      socketFactory:
+        options.socketFactory ??
+        (typeof window !== 'undefined' && window.hermesDesktop?.nativeSocket ? desktopSocketFactory : undefined)
     })
   }
 }
