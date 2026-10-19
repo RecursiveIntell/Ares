@@ -97,7 +97,11 @@ describe('installCrashForensics — EPIPE suppression', () => {
       target: { on: (event, l) => captured.set(event, l as (value: unknown) => void) }
     })
     const storm = captured.get('uncaughtException')!
-    for (let i = 0; i < 100; i++) storm(epipe())
+
+    for (let i = 0; i < 100; i++) {
+      storm(epipe())
+    }
+
     expect(log).toHaveBeenCalledTimes(1)
     expect(log.mock.calls[0][0]).toMatch(/EPIPE on stdio suppressed x\d+/)
 

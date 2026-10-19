@@ -50,13 +50,17 @@ export function describeCrashReason(reason: unknown): string {
 export function installCrashForensics({ flush, log, target = process }: CrashForensicsOptions): void {
   let epipeSuppressed = 0
   let epipeLastLoggedAt = 0
+
   const record = (label: string) => (reason: unknown) => {
     const code = (reason as { code?: unknown } | null | undefined)?.code
+
     if (code === 'EPIPE') {
       epipeSuppressed += 1
       const now = Date.now()
+
       if (now - epipeLastLoggedAt > 60_000) {
         epipeLastLoggedAt = now
+
         try {
           log(`[main] EPIPE on stdio suppressed x${epipeSuppressed} (pipe reader gone; app continuing)`)
           flush()
@@ -64,8 +68,10 @@ export function installCrashForensics({ flush, log, target = process }: CrashFor
           // The log channel itself is the dead pipe. Nothing left to do.
         }
       }
+
       return
     }
+
     log(`[main] ${label}: ${describeCrashReason(reason)}`)
     flush()
   }
