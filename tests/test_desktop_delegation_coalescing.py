@@ -429,6 +429,101 @@ def test_host_route_refusal_releases_all_claims_and_requeues(monkeypatch):
                 ad._records.pop(f"deleg_hostbusy_{i}", None)
 
 
+def test_coalesced_display_metadata_aggregates_fanout_task_counts():
+    """A coalesced batch totals SUBAGENTS, not delegation events.
+
+    An event may itself carry a fan-out (``results``) with its own
+    ``task_count``; overwriting the total with the event count would tell the
+    user "2 agents finished" for a fan-out of three plus a singleton.
+    """
+    from tools import async_delegation as ad
+
+    events = _make_delegation_events("sid_agg", "deleg_agg", 2)
+    events[0]["results"] = [
+        {"status": "completed"}, {"status": "completed"}, {"status": "failed"},
+    ]
+    events[1]["results"] = [{"status": "completed"}]
+    captured = {}
+
+    def _submit(_rid, _sid, _sess, _text, **kwargs):
+        captured.update(kwargs.get("display_metadata") or {})
+        return True
+
+    deliverables = [(evt, f"formatted {i}") for i, evt in enumerate(events)]
+    claim_ids = []
+    try:
+        for evt in events:
+            claim = ad.claim_event_delivery(evt, "tui-poller")
+            assert claim is not None
+            claim_ids.append((evt, claim))
+        ok, missed = server._dispatch_grouped_delegation_notifications(
+            "sid_agg", _session(), deliverables, claim_ids, _dispatch_fn=_submit,
+        )
+        assert ok is True and missed == []
+        assert captured["task_count"] == 4, captured      # 3 subagents + 1
+        assert captured["completed_count"] == 3, captured  # 2 + 1
+        assert captured["failed_count"] == 1, captured
+        assert captured["coalesced"] is True
+    finally:
+        with ad._records_lock:
+            for i in range(2):
+                ad._records.pop(f"deleg_agg_{i}", None)
+
+
+def test_coalesced_turn_is_bounded_and_leaves_the_rest_queued(monkeypatch):
+    """A backlog larger than the cap must not become one unbounded mega-turn.
+
+    The consolidated prompt is capped by event count (and characters); the
+    remainder stays queued so the next turn delivers it instead of a single
+    oversized prompt whose receipts would already be acked.
+    """
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+    from tools import async_delegation as ad
+
+    sess = _session()
+    server._sessions["sid_bound"] = sess
+    monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_autonomous_host_route_available", lambda: False)
+
+    total = server._COALESCE_MAX_EVENTS + 3
+    events = _make_delegation_events("sid_bound", "deleg_bound", total)
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    for evt in events:
+        isolated_queue.put(evt)
+
+    turns = []
+
+    def _submit(_rid, _sid, _sess, text, **_kwargs):
+        turns.append(text)
+        return True
+
+    monkeypatch.setattr(server, "_run_prompt_submit", _submit)
+    stop = threading.Event()
+    stop.set()
+    try:
+        server._notification_poller_loop(stop, "sid_bound", sess)
+
+        assert len(turns) == 1, f"expected 1 bounded turn, got {len(turns)}"
+        assert turns[0].count("--- result ") == server._COALESCE_MAX_EVENTS
+        remainder = []
+        while not isolated_queue.empty():
+            remainder.append(isolated_queue.get_nowait())
+        assert len(remainder) == 3, [e["delegation_id"] for e in remainder]
+    finally:
+        server._sessions.pop("sid_bound", None)
+        with ad._records_lock:
+            for i in range(total):
+                ad._records.pop(f"deleg_bound_{i}", None)
+        while not isolated_queue.empty():
+            isolated_queue.get_nowait()
+
+
 def _session(agent=None, **extra):
     return {
         "agent": agent if agent is not None else types.SimpleNamespace(),

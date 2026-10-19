@@ -14298,6 +14298,14 @@ def _dispatch_autonomous_turn(
     ))
 
 
+# One consolidated delegation turn is bounded: a full durable backlog can
+# exceed the model context while every receipt would already be acked as soon
+# as the turn starts, so cap both the event count and the concatenated
+# characters; the remainder stays queued for the next turn.
+_COALESCE_MAX_EVENTS = 8
+_COALESCE_MAX_TEXT_CHARS = 48_000
+
+
 def _notification_poller_loop(
     stop_event: threading.Event, sid: str, session: dict
 ) -> None:
@@ -14469,6 +14477,7 @@ def _notification_poller_loop(
         _held_foreign: list = []
         is_delegation = evt.get("type") == "async_delegation"
         deliverables = [(evt, text)]
+        _deliv_chars = len(text)
         if is_delegation:
             while True:
                 try:
@@ -14487,6 +14496,14 @@ def _notification_poller_loop(
                 _nxt_text = format_process_notification(_nxt)
                 if not _nxt_text:
                     continue
+                if (len(deliverables) >= _COALESCE_MAX_EVENTS
+                        or _deliv_chars + len(_nxt_text) > _COALESCE_MAX_TEXT_CHARS):
+                    # Bound the consolidated prompt: a full pending backlog
+                    # can exceed the model context, and receipts are acked as
+                    # soon as the turn starts — leave the rest queued for the
+                    # next turn instead of a doomed mega-turn.
+                    process_registry.completion_queue.put(_nxt)
+                    break
                 _nxt_key = _notification_event_dedup_key(_nxt)
                 if _nxt_key not in _emitted:
                     _emit(
@@ -14495,6 +14512,7 @@ def _notification_poller_loop(
                     )
                     _emitted.add(_nxt_key)
                 deliverables.append((_nxt, _nxt_text))
+                _deliv_chars += len(_nxt_text)
             if len(deliverables) > 1:
                 logger.info(
                     "Coalescing %d async-delegation completions for session "
@@ -14701,6 +14719,7 @@ def _notification_poller_loop(
         _held: list = []
         is_delegation = evt.get("type") == "async_delegation"
         deliverables = [(evt, text)]
+        _deliv_chars = len(text)
         if is_delegation:
             while True:
                 try:
@@ -14719,6 +14738,14 @@ def _notification_poller_loop(
                 _nxt_text = format_process_notification(_nxt)
                 if not _nxt_text:
                     continue
+                if (len(deliverables) >= _COALESCE_MAX_EVENTS
+                        or _deliv_chars + len(_nxt_text) > _COALESCE_MAX_TEXT_CHARS):
+                    # Bound the consolidated prompt: a full pending backlog
+                    # can exceed the model context, and receipts are acked as
+                    # soon as the turn starts — leave the rest queued for the
+                    # next turn instead of a doomed mega-turn.
+                    process_registry.completion_queue.put(_nxt)
+                    break
                 _nxt_key = _notification_event_dedup_key(_nxt)
                 if _nxt_key not in _emitted:
                     _emit(
@@ -14727,6 +14754,7 @@ def _notification_poller_loop(
                     )
                     _emitted.add(_nxt_key)
                 deliverables.append((_nxt, _nxt_text))
+                _deliv_chars += len(_nxt_text)
 
         rid = f"__notif__{int(time.time() * 1000)}"
         from tools.async_delegation import (
@@ -14801,7 +14829,12 @@ def _notification_poller_loop(
                         f"{type(exc).__name__}: {exc}",
                         file=sys.stderr,
                     )
-                    if not _host_route:
+                    if _host_route:
+                        # Keep the event for the resume-time poller instead
+                        # of dropping it — mirrors the legacy shutdown
+                        # recovery path and the live-loop error handling.
+                        _held.append(evt)
+                    else:
                         with session["history_lock"]:
                             session["running"] = False
             elif not _host_route:
@@ -14938,7 +14971,18 @@ def _dispatch_grouped_delegation_notifications(
     )
     rid = f"__notif__{int(time.time() * 1000)}"
     metadata = _async_delegation_display_metadata(deliverables[0][0])
-    metadata["task_count"] = len(deliverables)
+    # Aggregate the batch's human-facing totals: a single event may itself
+    # carry a fan-out (``results``) with its own task_count, so counting
+    # EVENTS here under-reports subagents (e.g. "2 agents finished" for a
+    # fan-out of 3 plus a singleton).
+    _per_event_meta = [
+        _async_delegation_display_metadata(evt) for evt, _text in deliverables
+    ]
+    metadata["task_count"] = sum(m.get("task_count", 1) for m in _per_event_meta)
+    metadata["completed_count"] = sum(
+        m.get("completed_count", 0) for m in _per_event_meta
+    )
+    metadata["failed_count"] = sum(m.get("failed_count", 0) for m in _per_event_meta)
     metadata["coalesced"] = True
     try:
         ok = _dispatch_fn(
