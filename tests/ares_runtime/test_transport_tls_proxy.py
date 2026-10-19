@@ -112,7 +112,8 @@ def test_sdk_tls_proxy_auth_and_exact_body(tls_endpoint,connect_proxy,monkeypatc
 
 @pytest.mark.parametrize('proxy',[False,True])
 def test_bedrock_prepared_signature_tls_proxy_preserved(tls_endpoint,connect_proxy,monkeypatch,proxy):
-    import boto3
+    boto3 = pytest.importorskip("boto3", reason="bedrock extra not installed")
+    pytest.importorskip("botocore", reason="bedrock extra not installed")
     from botocore.config import Config
     url,cert,seen,_=tls_endpoint;proxy_url,proxy_seen=connect_proxy
     outcomes=govern(monkeypatch)

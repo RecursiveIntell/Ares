@@ -2939,10 +2939,11 @@ class GatewaySlashCommandsMixin:
                 return "Usage: /goal draft <objective in plain language>"
             try:
                 import asyncio
+                import functools
                 from hermes_cli.goals import draft_contract
 
                 draft_contract_obj = await asyncio.get_running_loop().run_in_executor(
-                    None, draft_contract, objective
+                    None, functools.partial(draft_contract, objective, session_id=getattr(mgr, "session_id", None))
                 )
             except Exception as exc:
                 logger.debug("goal draft failed: %s", exc)
