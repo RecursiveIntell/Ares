@@ -2775,7 +2775,22 @@ def _prepare_compute_host_rpc(obj: dict, *, source=None):
         if isinstance(transport, WSTransport):
             def disconnect():
                 transport.close()
-                transport._loop.create_task(transport._ws.close(code=1013))
+                # Hold the task reference so the "Task exception was never retrieved"
+                # watchdog never fires on it, and swallow the close race explicitly:
+                # if the client already closed (or is mid-teardown), Starlette raises
+                # RuntimeError("Cannot call \"send\" once a close message has been
+                # sent.") — the disconnect is already done, so that outcome is success
+                # for a best-effort 1013 try-close, not an error.
+                async def _try_close():
+                    try:
+                        await transport._ws.close(code=1013)
+                    except RuntimeError as exc:
+                        if "close message has been sent" not in str(exc):
+                            raise
+                task = transport._loop.create_task(_try_close())
+                transport._refused_ws_tasks = (
+                    getattr(transport, "_refused_ws_tasks", []) + [task]
+                )
             transport._loop.call_soon_threadsafe(disconnect)
         else:
             transport.close()

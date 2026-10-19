@@ -739,7 +739,12 @@ def repair_message_sequence(agent, messages: List[Dict], *, preserve_user_messag
                 and known_tool_ids[tc_id] not in matched_tool_groups
             }
             if not result_variants:
-                filtered.append(msg)
+                # Missing/empty tool_call_id: schema-invalid on the wire (strict upstream
+                # deserializers 400 with "missing field `tool_call_id`") and unpairable by
+                # the alias-group logic. Drop at repair time so DB-restored/resumed
+                # histories heal instead of replaying the poison every request.
+                repairs += 1
+                continue
             elif candidate_groups:
                 # Consume the whole alias group so a SECOND result replaying
                 # any sibling spelling falls into the drop branch below —
@@ -3834,6 +3839,37 @@ def repair_empty_non_final_messages(
     return messages
 
 
+def _drop_results_without_ids(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Drop tool results with a missing/empty tool_call_id (ported from upstream hermes-agent).
+
+    A tool result whose tool_call_id is missing or blank is schema-invalid on every Chat
+    Completions wire: strict upstream deserializers reject the whole request with HTTP 400
+    "Failed to deserialize the JSON body into the target type: missing field `tool_call_id`".
+    The pre-call sanitizer's orphan-drop and dedup passes both skip such results (their
+    variant sets are empty, so `if variants` guards never fire), which let a rejection
+    result paired against a synthetically-backfilled assistant call id persist for the
+    life of the session (observed 2026-10-19: glm-5.3-flash via an aggregator emitted an
+    empty-name tool call; the rejection result was persisted with tool_call_id='' while
+    the assistant call carried a backfilled deterministic id). Kept explicit — not folded
+    into the orphan/dedup walks — for its own log line and so the chokepoint guarantee
+    holds on its own for callers that skip repair_message_sequence.
+    """
+    kept = [
+        m for m in messages
+        if not (
+            isinstance(m, dict)
+            and m.get("role") == "tool"
+            and not (m.get("tool_call_id") or "").strip()
+        )
+    ]
+    if len(kept) != len(messages):
+        _ra().logger.debug(
+            "Pre-call sanitizer: dropped %d tool result(s) with missing/empty tool_call_id",
+            len(messages) - len(kept),
+        )
+    return kept
+
+
 def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Fix orphaned tool_call / tool_result pairs before every LLM call.
 
@@ -4115,6 +4151,12 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             "Pre-call sanitizer: removed %d duplicate tool_call_id reference(s)",
             removed_dupes,
         )
+    # Final chokepoint guarantee: a tool result with a missing/empty tool_call_id is
+    # schema-invalid on the wire (HTTP 400 "missing field `tool_call_id`" from strict
+    # upstream deserializers) and is invisible to the orphan/dedup passes above (their
+    # `if variants` guards skip empty-id rows). Drop it last, after pairing/dedup had
+    # their chance. Ported from upstream hermes-agent sanitize_api_messages.
+    messages = _drop_results_without_ids(messages)
     return messages
 
 
