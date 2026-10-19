@@ -41,6 +41,52 @@ _DEFAULT_UPSTREAM_REMOTE = "https://github.com/NousResearch/hermes-agent.git"
 _DEFAULT_UPSTREAM_BRANCH = "main"
 
 
+def read_dispatch_source_identity(source: Path | None = None) -> dict[str, str]:
+    """Read the admitted release/source tuple, never dirty checkout HEAD alone.
+
+    Explicit source is for disposable owner fixtures and controller consumers;
+    the running call producer uses this module's actual source root. This is a
+    source correlation witness, not lifecycle readiness or egress authority.
+    """
+    from .collaboration import ContractError
+    root = (source or Path(__file__).resolve().parent.parent).resolve()
+    descriptor = root.parent / "release.json"
+    try:
+        raw = descriptor.read_bytes()
+        if len(raw) > 1048576:
+            raise ValueError("oversized release descriptor")
+        def closed_pairs(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate descriptor key")
+                result[key] = value
+            return result
+        record = json.loads(raw, object_pairs_hook=closed_pairs)
+        revision = record["revision"]
+        if (not isinstance(revision, str) or len(revision) != 40
+                or any(c not in "0123456789abcdef" for c in revision)
+                or root.parent.name != revision
+                or record["runtime_binding"] != {
+                    "schema": "AresLocalRuntimeBindingV1", "source": str(root),
+                    "controller_contract": record["runtime_binding"]["controller_contract"],
+                }
+                or record["runtime_binding"]["controller_contract"] not in {
+                    LOCAL_LIFECYCLE_CONTRACT, NATIVE_LIFECYCLE_CONTRACT}):
+            raise ValueError("source binding mismatch")
+        def git(*args):
+            return subprocess.check_output(["git", "-C", str(root), *args],
+                                           stderr=subprocess.DEVNULL, timeout=10).decode().strip()
+        if git("rev-parse", "HEAD") != revision or git("status", "--porcelain", "--untracked-files=normal"):
+            raise ValueError("source revision changed")
+        if descriptor.read_bytes() != raw:
+            raise ValueError("source descriptor changed")
+        return {"source_revision": "ares-source:" + revision,
+                "source_digest": "sha256:" + hashlib.sha256(raw).hexdigest()}
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+        raise ContractError("SOURCE_REVISION_UNAVAILABLE") from error
+
+
 class AresLocalRuntimeError(RuntimeError):
     """Raised when the explicit local-runtime contract is not satisfied."""
 

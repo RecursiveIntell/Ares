@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
 import pytest
+from tests.agent.sdk_factory_fixtures import constructor_httpx_backend
 
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.anthropic_adapter import (
@@ -49,7 +50,7 @@ class TestBuildAnthropicClient:
 
 
     def test_api_key_uses_api_key(self):
-        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk, constructor_httpx_backend(mock_sdk):
             build_anthropic_client("sk-ant-api03-something")
             kwargs = mock_sdk.Anthropic.call_args[1]
             assert kwargs["api_key"] == "sk-ant-api03-something"
@@ -73,7 +74,7 @@ class TestBuildAnthropicClient:
         profile.default_headers. The Anthropic Messages route builds its
         client here and must merge the same set.
         """
-        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk, constructor_httpx_backend(mock_sdk):
             build_anthropic_client(
                 "sk-opencode-secret",
                 base_url="https://opencode.ai/zen/go/v1",
@@ -88,7 +89,7 @@ class TestBuildAnthropicClient:
             assert "anthropic-beta" in headers
 
     def test_minimax_anthropic_endpoint_uses_bearer_auth_for_regular_api_keys(self):
-        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk, constructor_httpx_backend(mock_sdk):
             build_anthropic_client(
                 "minimax-secret-123",
                 base_url="https://api.minimax.io/anthropic",
@@ -108,7 +109,7 @@ class TestBuildAnthropicClient:
         and the endpoint returns HTTP 401. Also verifies that Azure retains the
         1M-context beta even though it now matches `_requires_bearer_auth`.
         """
-        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk, constructor_httpx_backend(mock_sdk):
             build_anthropic_client(
                 "azure-foundry-secret-123",
                 base_url="https://my-resource.openai.azure.com/anthropic",
@@ -129,7 +130,7 @@ class TestBuildAnthropicClient:
         ``<org>.palantirfoundry.com/api/v2/llm/proxy/anthropic`` endpoint
         rejects x-api-key with 401 — the SDK must be built with auth_token.
         """
-        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk, constructor_httpx_backend(mock_sdk):
             build_anthropic_client(
                 "foundry-secret-123",
                 base_url="https://acme.palantirfoundry.com/api/v2/llm/proxy/anthropic",
@@ -143,7 +144,7 @@ class TestBuildAnthropicClient:
         """#26293: the SDK's default max_retries=2 ignores Retry-After and
         double-retries inside hermes's outer loop. We delegate retry entirely
         to the outer loop, so the client must be built with max_retries=0."""
-        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk, constructor_httpx_backend(mock_sdk):
             build_anthropic_client("sk-ant-api03-something")
             kwargs = mock_sdk.Anthropic.call_args[1]
             assert kwargs["max_retries"] == 0

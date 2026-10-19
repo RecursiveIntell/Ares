@@ -3458,7 +3458,7 @@ def run_conversation(
                                         kw, on_first_delta=_stop_spinner), next_api_kwargs
                                 )
 
-                            _physical.settle()
+                            _physical.settle(_response)
                             _delivery.deliver()
                             return _response
                         from agent import relay_llm
@@ -3483,7 +3483,7 @@ def run_conversation(
                             },
                             defer_logical_completion=True,
                         )
-                        _physical.settle()
+                        _physical.settle(_response)
                         return _response
 
                 from hermes_cli.middleware import run_llm_execution_middleware
@@ -4748,6 +4748,24 @@ def run_conversation(
                     return _context_rebase_stopped_result(AutomaticRebaseResult(
                         AutomaticRebaseStatus.BLOCKED, str(api_error), agent.session_id,
                     ))
+
+                from hermes_cli.middleware import EgressDispatchDenied, EgressOutcomeUnrecorded
+                if isinstance(api_error, (EgressDispatchDenied, EgressOutcomeUnrecorded)):
+                    # Governance is not a transport/auth error. In particular a
+                    # post-send lost ACK cannot authorize fallback or a resend.
+                    attempted = bool(_context_provider_attempted) or isinstance(api_error, EgressOutcomeUnrecorded)
+                    if not attempted:
+                        api_call_count = max(0, api_call_count - 1)
+                        agent._api_call_count = api_call_count
+                        agent.iteration_budget.refund()
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "messages": messages, "api_calls": api_call_count,
+                        "completed": False, "failed": True, "final_response": None,
+                        "error": str(api_error),
+                        "failure_reason": ("egress_outcome_unrecorded" if isinstance(api_error, EgressOutcomeUnrecorded) else "egress_denied"),
+                        "failure_retryable": False, "provider_attempted": attempted,
+                    }
 
                 # -----------------------------------------------------------
                 # UnicodeEncodeError recovery.  Two common causes:
