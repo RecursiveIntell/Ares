@@ -71,14 +71,14 @@ def project_turn_inputs(agent, receipt, *, holder, conversation_history):
         # Only a native phase with no admitted dispatch reaches this point.
         # Reuse the exact durable occurrence and its stored API sidecar.
         history = agent._session_db.get_messages_as_conversation(agent.session_id,
-            repair_alternation=False, include_row_ids=True)
+            repair_alternation=False, include_row_ids=True, include_summary_markers=True)
         if not history or history[-1].get("_row_id") != result["projection"]["row_id"]:
             raise ContextContinuationError("CONTEXT_INPUT_PROJECTED_TAIL_CHANGED")
         agent._context_input_existing_message = history[-1]
         return history[:-1]
     if result["inserted"]:
         return agent._session_db.get_messages_as_conversation(agent.session_id,
-            repair_alternation=False, include_row_ids=True)
+            repair_alternation=False, include_row_ids=True, include_summary_markers=True)
     return conversation_history
 
 
@@ -113,7 +113,7 @@ def complete_turn_inputs(agent, messages):
         # Publication committed but its caller never received row IDs. Reload
         # the exact native batch; a later close flush must not duplicate it.
         messages[:] = agent._session_db.get_messages_as_conversation(agent.session_id,
-            repair_alternation=False, include_row_ids=True)
+            repair_alternation=False, include_row_ids=True, include_summary_markers=True)
     return confirmed
 
 

@@ -261,6 +261,22 @@ class CodexAppServerClient:
         params: Optional[dict] = None,
         timeout: float = 30.0,
     ) -> dict:
+        # These calls are control-plane only. Unknown/new native operations
+        # must not silently inherit transport admission from JSON-RPC success.
+        control_plane = {'initialize', 'thread/start', 'thread/resume',
+                         'model/list', 'plugin/list', 'turn/interrupt'}
+        if method in control_plane:
+            return self._request_rpc(method, params, timeout)
+        from ares_runtime.physical_dispatch import unsupported_transport_scope
+        with unsupported_transport_scope('codex_app_server_native_rpc'):
+            return self._request_rpc(method, params, timeout)
+
+    def _request_rpc(
+        self,
+        method: str,
+        params: Optional[dict] = None,
+        timeout: float = 30.0,
+    ) -> dict:
         """Bound send and reply by one deadline; a timeout retires the client.
 
         Returns `result`, raises CodexAppServerError on a protocol `error`.

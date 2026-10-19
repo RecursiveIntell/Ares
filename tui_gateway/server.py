@@ -172,6 +172,33 @@ _cfg_lock = threading.Lock()
 # dedicated lock rather than the unrelated process-config cache lock.
 _profile_ui_meta_lock = threading.Lock()
 _sessions_lock = threading.RLock()  # reentrant: _close_session_by_id may run under callers that already hold it
+
+
+def _start_run_thread(session: dict, run_thread) -> None:
+    """Publish and start as one transition for all run-thread readers.
+
+    Publish first so an immediate successor cannot be overwritten. Roll back
+    a failed start, but never discard a worker whose bootstrap already ran.
+    """
+    missing = object()
+    with _sessions_lock:
+        previous = session.get("_run_thread", missing)
+        session["_run_thread"] = run_thread
+        try:
+            run_thread.start()
+        except BaseException:
+            if getattr(run_thread, "ident", None) is None and session.get("_run_thread") is run_thread:
+                if previous is missing:
+                    session.pop("_run_thread", None)
+                else:
+                    session["_run_thread"] = previous
+            raise
+
+
+def _get_run_thread(session: dict):
+    """Snapshot only after the producer's start transition has completed."""
+    with _sessions_lock:
+        return session.get("_run_thread")
 _prompt_lock = threading.Lock()
 _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
@@ -1102,7 +1129,7 @@ def _teardown_popped_session(
     """Finish a close after the caller has atomically detached the session."""
     if session is None:
         return False
-    run_thread = session.get("_run_thread")
+    run_thread = _get_run_thread(session)
     if (
         end_reason != "tui_shutdown"
         and run_thread is not None
@@ -1598,7 +1625,7 @@ def _interrupt_session_turn(
                 **({"target_request_id": target_request_id} if target_request_id else {}),
             )
     else:
-        run_thread = session.get("_run_thread")
+        run_thread = _get_run_thread(session)
         run_thread_alive = run_thread is not None and run_thread.is_alive()
 
     with session["history_lock"]:
@@ -2748,7 +2775,22 @@ def _prepare_compute_host_rpc(obj: dict, *, source=None):
         if isinstance(transport, WSTransport):
             def disconnect():
                 transport.close()
-                transport._loop.create_task(transport._ws.close(code=1013))
+                # Hold the task reference so the "Task exception was never retrieved"
+                # watchdog never fires on it, and swallow the close race explicitly:
+                # if the client already closed (or is mid-teardown), Starlette raises
+                # RuntimeError("Cannot call \"send\" once a close message has been
+                # sent.") — the disconnect is already done, so that outcome is success
+                # for a best-effort 1013 try-close, not an error.
+                async def _try_close():
+                    try:
+                        await transport._ws.close(code=1013)
+                    except RuntimeError as exc:
+                        if "close message has been sent" not in str(exc):
+                            raise
+                task = transport._loop.create_task(_try_close())
+                transport._refused_ws_tasks = (
+                    getattr(transport, "_refused_ws_tasks", []) + [task]
+                )
             transport._loop.call_soon_threadsafe(disconnect)
         else:
             transport.close()
@@ -6807,6 +6849,21 @@ def _load_service_tier() -> str | None:
     return None
 
 
+def _resolve_effective_fast_runtime(model: str, requested_tier: str | None) -> tuple[str | None, dict]:
+    """Use the core runtime owner's model-specific Fast projection."""
+    from agent.agent_runtime_helpers import resolve_fast_mode_runtime
+
+    return resolve_fast_mode_runtime(model, requested_tier)
+
+
+def _set_agent_fast_runtime(agent, effective_tier: str | None, fast_overrides: dict, *, requested_tier):
+    """Commit the preflight projection and synchronize core requested intent."""
+    from agent.agent_runtime_helpers import apply_fast_mode_runtime
+
+    return apply_fast_mode_runtime(agent, requested_tier, remember=True,
+                                   resolved=(effective_tier, fast_overrides))
+
+
 def _load_provider_routing() -> dict:
     """OpenRouter provider-routing prefs from config.yaml (``provider_routing``).
 
@@ -7113,6 +7170,8 @@ def _snapshot_agent_model_runtime(agent) -> dict:
         "api_mode": getattr(agent, "api_mode", ""),
         "primary_runtime": primary,
         "reasoning_config": reasoning,
+        "service_tier": getattr(agent, "service_tier", None),
+        "request_overrides": copy.deepcopy(getattr(agent, "request_overrides", {}) or {}),
     }
 
 
@@ -7178,6 +7237,19 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
             primary = getattr(agent, "_primary_runtime", None)
             if isinstance(primary, dict):
                 primary["reasoning_config"] = copy.deepcopy(agent.reasoning_config)
+        # Fast fields are model-specific and may have been disabled for the
+        # temporary model. Restore them only after the saved route succeeds.
+        if "service_tier" in snapshot:
+            agent.service_tier = snapshot["service_tier"]
+        if "request_overrides" in snapshot:
+            agent.request_overrides = copy.deepcopy(snapshot["request_overrides"])
+        primary = getattr(agent, "_primary_runtime", None)
+        saved_primary = snapshot.get("primary_runtime")
+        if isinstance(primary, dict):
+            if isinstance(saved_primary, dict) and "service_tier_intent" in saved_primary:
+                primary["service_tier_intent"] = saved_primary["service_tier_intent"]
+            else:
+                primary.pop("service_tier_intent", None)
 
     primary = snapshot.get("primary_runtime")
     if primary and hasattr(agent, "_restore_primary_runtime"):
@@ -7475,6 +7547,18 @@ def _apply_model_switch(
                 restore_snapshot = _snapshot_agent_model_runtime(agent)
 
         if agent:
+            # Capability lookup can fail independently of model support. Refuse
+            # before the in-place model mutation rather than silently changing
+            # Fast, or leaving a partially applied switch after lookup failure.
+            requested_tier = session.get("create_service_tier_override")
+            if requested_tier is None:
+                requested_tier = getattr(agent, "service_tier", None)
+                if requested_tier is None:
+                    requested_tier = _load_service_tier()
+            try:
+                fast_tier, fast_overrides = _resolve_effective_fast_runtime(result.new_model, requested_tier)
+            except Exception as exc:
+                raise ValueError("Fast capability resolution failed; model request not applied") from exc
             try:
                 agent.switch_model(
                     new_model=result.new_model,
@@ -7496,6 +7580,21 @@ def _apply_model_switch(
                     f"Model switch to {result.new_model} failed ({exc}); "
                     f"staying on {getattr(agent, 'model', current_model)}."
                 ) from exc
+            # The agent switch resolves profile defaults for the new model.
+            # An explicit session choice outranks that fallback and survives
+            # both the immediate switch and later agent reconstruction.
+            reasoning_intent = session.get("create_reasoning_override")
+            # --once keeps its existing temporary per-model default and exact
+            # restore contract; persistent session switches retain session intent.
+            if not one_turn and isinstance(reasoning_intent, dict):
+                agent.reasoning_config = copy.deepcopy(reasoning_intent)
+                primary_runtime = getattr(agent, "_primary_runtime", None)
+                if isinstance(primary_runtime, dict):
+                    primary_runtime["reasoning_config"] = copy.deepcopy(reasoning_intent)
+
+            # Keep Fast intent in the session pin, but clear effective Fast
+            # and its wire fields when the target model does not support it.
+            _set_agent_fast_runtime(agent, fast_tier, fast_overrides, requested_tier=requested_tier)
             _persist_live_session_runtime(session)
             _persist_live_session_system_prompt(session)
             _append_model_switch_marker(
@@ -7799,6 +7898,9 @@ def _sync_bot_capabilities(sid: str, session: dict) -> None:
                ("model", "provider", "api_key", "base_url", "api_mode")}
     reasoning = copy.deepcopy(getattr(agent, "reasoning_config", None))
     tier = getattr(agent, "service_tier", None) or ""
+    from agent.agent_runtime_helpers import get_fast_mode_intent
+
+    fast_intent = get_fast_mode_intent(agent)
     acp_command = getattr(agent, "acp_command", None)
     acp_args = list(getattr(agent, "acp_args", None) or [])
     native_captured = False
@@ -7812,6 +7914,7 @@ def _sync_bot_capabilities(sid: str, session: dict) -> None:
                     for name, value in runtime.items())
                 and getattr(candidate, "reasoning_config", None) == reasoning
                 and (getattr(candidate, "service_tier", None) or "") == tier
+                and get_fast_mode_intent(candidate) == fast_intent
                 and getattr(candidate, "acp_command", None) == acp_command
                 and (getattr(candidate, "acp_args", None) or []) == acp_args)
 
@@ -7858,7 +7961,7 @@ def _sync_bot_capabilities(sid: str, session: dict) -> None:
                 model_override=runtime,
                 reasoning_config_override=reasoning,
                 _preserve_default_reasoning=reasoning is None,
-                service_tier_override=tier,
+                service_tier_override=fast_intent,
                 platform_override=_session_source(session),
                 _resource_preserve_agent=agent,
             )
@@ -8349,21 +8452,22 @@ def _apply_session_runtime_options(sid: str, session: dict, values: dict, *,
                     ("create_reasoning_override", "create_service_tier_override")}
         old_agent = ({key: getattr(agent, key, missing) for key in
                       ("reasoning_config", "service_tier", "request_overrides")} if agent else {})
+        primary = getattr(agent, "_primary_runtime", None) if agent else None
+        old_primary = ({key: primary.get(key, missing) for key in
+                        ("service_tier_intent", "reasoning_config")} if isinstance(primary, dict) else {})
         try:
             if "effort" in values:
                 session["create_reasoning_override"] = reasoning
                 if agent is not None:
                     agent.reasoning_config = reasoning
+                    if isinstance(primary, dict):
+                        primary["reasoning_config"] = copy.deepcopy(reasoning)
             if "fast" in values:
                 session["create_service_tier_override"] = "priority" if values["fast"] else ""
                 if agent is not None:
-                    agent.service_tier = "priority" if values["fast"] else None
-                    request_overrides = dict(getattr(agent, "request_overrides", {}) or {})
-                    request_overrides.pop("service_tier", None)
-                    request_overrides.pop("speed", None)
-                    if values["fast"]:
-                        request_overrides.update(overrides)
-                    agent.request_overrides = request_overrides
+                    _set_agent_fast_runtime(agent, "priority" if values["fast"] else None,
+                                            overrides if values["fast"] else {},
+                                            requested_tier=session["create_service_tier_override"])
             _persist_live_session_runtime(session, strict=True)
         except Exception:
             for key, value in old_pins.items():
@@ -8376,6 +8480,12 @@ def _apply_session_runtime_options(sid: str, session: dict, values: dict, *,
                     delattr(agent, key)
                 else:
                     setattr(agent, key, value)
+            if isinstance(primary, dict) and getattr(agent, "_primary_runtime", None) is primary:
+                for key, value in old_primary.items():
+                    if value is missing:
+                        primary.pop(key, None)
+                    else:
+                        primary[key] = value
             raise
         return {"key": "runtime_options", "value": values, "deferred": False}
 
@@ -8422,20 +8532,39 @@ def _apply_pending_model_switch(sid: str, session: dict, *, before_admission: bo
             if isinstance(window, TurnOutcomeWindow) and window.owns(session, sid) and window.turns else None)
     if not pending or session.get("agent") is None:
         return
+    def pending_still_owned():
+        # Called only while holding this session's history lock.
+        current_inflight = session.get("inflight_turn")
+        current_window = session.get("_turn_outcomes")
+        current_nonce = (current_window.turns[-1]["accepted_turn"]["request_id"]
+            if isinstance(current_window, TurnOutcomeWindow)
+            and current_window.owns(session, sid) and current_window.turns else None)
+        return not (_sessions.get(sid) is not session or session.get("agent") is not pending_agent
+                or session.get("transport") is not pending_transport
+                or int(session.get("_queued_prompt_generation", 0)) != pending_generation
+                or (before_admission and (
+                    (current_inflight.get("started_at") if isinstance(current_inflight, dict) else None) is not pending_admission[3]
+                    or current_window is not pending_admission[4]
+                    or current_nonce != pending_admission[5])))
+
+    def retain_pending_options():
+        if not pending.get("runtime_options"):
+            return
+        with session["history_lock"]:
+            if not pending_still_owned():
+                return
+            # Preserve a newer model/option intent; only fill its missing
+            # dimensions from the accepted option survivor, never replay the
+            # failed model choice or transfer intent to a replacement owner.
+            newer = session.get("pending_model_switch") or {}
+            session["pending_model_switch"] = {
+                **newer,
+                "runtime_options": {**pending["runtime_options"], **newer.get("runtime_options", {})},
+            }
+
     def emit_pending_error(message):
         with session["history_lock"]:
-            current_inflight = session.get("inflight_turn")
-            current_window = session.get("_turn_outcomes")
-            current_nonce = (current_window.turns[-1]["accepted_turn"]["request_id"]
-                if isinstance(current_window, TurnOutcomeWindow)
-                and current_window.owns(session, sid) and current_window.turns else None)
-            if (_sessions.get(sid) is not session or session.get("agent") is not pending_agent
-                    or session.get("transport") is not pending_transport
-                    or int(session.get("_queued_prompt_generation", 0)) != pending_generation
-                    or (before_admission and (
-                        (current_inflight.get("started_at") if isinstance(current_inflight, dict) else None) is not pending_admission[3]
-                        or current_window is not pending_admission[4]
-                        or current_nonce != pending_admission[5]))):
+            if not pending_still_owned():
                 return
         token = _turn_outcome_execution.set((session, sid, None))
         transport_token = bind_transport(pending_transport)
@@ -8444,6 +8573,7 @@ def _apply_pending_model_switch(sid: str, session: dict, *, before_admission: bo
         finally:
             reset_transport(transport_token)
             _turn_outcome_execution.reset(token)
+    options_attempted = False
     try:
         result = (_apply_model_switch(
             sid, session, pending["raw"],
@@ -8458,16 +8588,24 @@ def _apply_pending_model_switch(sid: str, session: dict, *, before_admission: bo
                         or session.get("transport") is not pending_transport
                         or int(session.get("_queued_prompt_generation", 0)) != pending_generation):
                     raise ValueError("session owner changed; options not applied")
+                options_attempted = True
                 _apply_session_runtime_options(sid, session, pending["runtime_options"],
                                                at_turn_boundary=True, lock_held=True)
         # A queued pick is a deliberate user action; honour the expensive-model
         # confirm by NOT applying it silently — surface the warning and drop the
         # switch rather than spend on a pricey model the user never confirmed.
         if result.get("confirm_required"):
+            retain_pending_options()
             emit_pending_error(result.get("confirm_message") or result.get("warning") or "")
         return result
     except Exception as e:
-        emit_pending_error(f"Could not switch model: {e}")
+        # A model failure may leave independent options for one later attempt.
+        # An option's own rejection or uncertain write is not permission to
+        # requeue/replay it on every subsequent turn.
+        if not options_attempted:
+            retain_pending_options()
+        action = "apply model options" if options_attempted else "switch model"
+        emit_pending_error(f"Could not {action}: {e}")
 
 
 class CompressionLockHeld(Exception):
@@ -10523,7 +10661,9 @@ def _make_agent(
         and not isinstance(provider_cap, bool) and provider_cap > 0
         else None
     )
-    return AIAgent(
+    requested_tier = service_tier_override if service_tier_override is not None else _load_service_tier()
+    effective_tier, fast_request_overrides = _resolve_effective_fast_runtime(str(model or ""), requested_tier)
+    agent = AIAgent(
         model=model,
         max_tokens=max_tokens,
         max_iterations=_cfg_max_turns(cfg, 500),
@@ -10547,11 +10687,8 @@ def _make_agent(
                 else _load_reasoning_config(str(model or ""))
             )
         ),
-        service_tier=(
-            service_tier_override
-            if service_tier_override is not None
-            else _load_service_tier()
-        ),
+        service_tier=effective_tier,
+        request_overrides=fast_request_overrides,
         enabled_toolsets=_load_enabled_toolsets(_resolve_agent_platform(platform_override)),
         disabled_toolsets=disabled_toolsets,
         # OpenRouter provider-routing prefs (config.yaml `provider_routing`).
@@ -10575,6 +10712,12 @@ def _make_agent(
         fallback_model=_load_fallback_model(),
         **_agent_cbs(sid),
     )
+    from agent.agent_runtime_helpers import remember_fast_mode_intent
+
+    # The constructor owns effective state. Seed only requested intent here;
+    # never normalize away a constructor mismatch before an admission guard.
+    remember_fast_mode_intent(agent, requested_tier)
+    return agent
 
 
 def _init_session(
@@ -13852,15 +13995,18 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
     if goal_blocks_loop_tick(sid_key):
         return
 
+    _host_route = _autonomous_host_route_available()
     with session["history_lock"]:
         if session.get("running"):
             return  # busy — stays due, next poll retries
-        session["running"] = True
+        if not _host_route:
+            session["running"] = True
 
     wakeup = mgr.fire_tick()
     if not wakeup:
-        with session["history_lock"]:
-            session["running"] = False
+        if not _host_route:
+            with session["history_lock"]:
+                session["running"] = False
         return
 
     tick_no = mgr.state.ticks_fired if mgr.state else "?"
@@ -13874,8 +14020,11 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
         if wakeup.lstrip().startswith("/"):
             # Slash-command loop: route through the slash pipeline instead of
             # the model. No model reply to evaluate — complete immediately.
-            with session["history_lock"]:
-                session["running"] = False
+            # The busy slot (when this path claimed it) is released before the
+            # command runs; host-routed ticks never claimed it.
+            if not _host_route:
+                with session["history_lock"]:
+                    session["running"] = False
             try:
                 parts = wakeup.lstrip()[1:].split(None, 1)
                 resp = _methods["command.dispatch"](
@@ -13894,6 +14043,16 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
                     # The command resolves to a prompt (skill command etc.) —
                     # run it as a normal turn; the post-turn hook completes
                     # the tick.
+                    #
+                    # NOTE (2026-10-18): this command-bound follow-up is the
+                    # one autonomous path that still dispatches inline with a
+                    # pre-claimed busy slot. The tick's command side effects
+                    # are not replay-safe, so a refused host admission cannot
+                    # be deferred/abandoned here without risking duplicate
+                    # command effects. The reproduced class (notification
+                    # poller, kanban, model wakeups) routes through host
+                    # admission; converting this residual needs a replay-safe
+                    # tick-command contract.
                     with session["history_lock"]:
                         if session.get("running"):
                             mgr.abandon_tick()
@@ -13912,20 +14071,39 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
             if decision.get("message"):
                 _emit("status.update", sid, {"kind": "loop", "text": decision["message"]})
             return
-        _emit("message.start", sid)
-        _run_prompt_submit(
-            rid, sid, session, wakeup,
-            display_kind="internal_notification",
-            display_metadata={"synthetic_source": "loop"},
-        )
+        if _host_route:
+            admitted = _dispatch_autonomous_turn(
+                rid, sid, session, wakeup,
+                display_kind="internal_notification",
+                display_metadata={"synthetic_source": "loop"},
+            )
+            if not admitted:
+                # A busy owner holds the session: return the tick to the due
+                # state and retry on the next poll. The wakeup text is
+                # re-derived by fire_tick, so abandoning here cannot
+                # duplicate a side effect.
+                try:
+                    mgr.abandon_tick()
+                except Exception:
+                    pass
+                return
+            _emit("message.start", sid)
+        else:
+            _emit("message.start", sid)
+            _run_prompt_submit(
+                rid, sid, session, wakeup,
+                display_kind="internal_notification",
+                display_metadata={"synthetic_source": "loop"},
+            )
     except Exception as exc:
         print(
             f"[tui_gateway] loop wakeup dispatch failed: "
             f"{type(exc).__name__}: {exc}",
             file=sys.stderr,
         )
-        with session["history_lock"]:
-            session["running"] = False
+        if not _host_route:
+            with session["history_lock"]:
+                session["running"] = False
         try:
             mgr.abandon_tick()
         except Exception:
@@ -14087,6 +14265,62 @@ def _collect_kanban_notifications(session: dict) -> list:
     return texts
 
 
+# ── Autonomous-turn admission (compute-host child) ─────────────────────────
+#
+# Autonomous producers (the notification poller, kanban delivery, /loop
+# wakeups) historically ran their turns by setting ``running`` and calling
+# ``_run_prompt_submit`` directly. Inside the compute-host child that
+# bypassed the host's request-admission map, so the next resume could observe
+# ``running=True`` with no request identity and refuse with "compute-host
+# running owner omitted its request id". The child registers its host here at
+# startup; every autonomous dispatch then rides the same admission as a wire
+# turn.start, and owner lookup/resume always see a complete owner.
+_local_host_turn_admitter: Callable[[dict], bool] | None = None
+
+
+def register_local_host_turn_admitter(admitter: Callable[[dict], bool] | None) -> None:
+    """Register (or clear) the in-process host admission for autonomous turns."""
+    global _local_host_turn_admitter
+    _local_host_turn_admitter = admitter
+
+
+def _autonomous_host_route_available() -> bool:
+    return _inside_compute_host_child() and _local_host_turn_admitter is not None
+
+
+def _dispatch_autonomous_turn(
+    rid, sid: str, session: dict, text,
+    *, display_kind: str | None = None, display_metadata: dict | None = None,
+) -> bool:
+    """Dispatch an autonomous turn through the owning admission path.
+
+    Returns True when the work was admitted. In the compute-host child the
+    turn is admitted by the registered host (a complete owner: request id +
+    running); elsewhere the historical inline dispatch is preserved.
+    """
+    admitter = _local_host_turn_admitter if _inside_compute_host_child() else None
+    if admitter is not None:
+        return bool(admitter({
+            "sid": sid,
+            "request_id": f"auto-turn-{uuid.uuid4().hex}",
+            "text": text,
+            "display_kind": display_kind,
+            "display_metadata": display_metadata,
+        }))
+    return bool(_run_prompt_submit(
+        rid, sid, session, text,
+        display_kind=display_kind, display_metadata=display_metadata,
+    ))
+
+
+# One consolidated delegation turn is bounded: a full durable backlog can
+# exceed the model context while every receipt would already be acked as soon
+# as the turn starts, so cap both the event count and the concatenated
+# characters; the remainder stays queued for the next turn.
+_COALESCE_MAX_EVENTS = 8
+_COALESCE_MAX_TEXT_CHARS = 48_000
+
+
 def _notification_poller_loop(
     stop_event: threading.Event, sid: str, session: dict
 ) -> None:
@@ -14146,28 +14380,54 @@ def _notification_poller_loop(
             _pending = session.get("_kanban_pending") or []
             if _pending:
                 _batch: list = []
+                _kb_host_route = _autonomous_host_route_available()
                 with session["history_lock"]:
                     if not session.get("running"):
-                        session["running"] = True
+                        if not _kb_host_route:
+                            session["running"] = True
                         _batch = list(_pending)
                         session["_kanban_pending"] = []
                 if _batch:
                     rid = f"__notif__{int(time.time() * 1000)}"
+
+                    def _rebuffer_kanban_batch() -> None:
+                        # Busy/refused dispatch must not drop cursor-claimed
+                        # kanban events: keep the batch at the head of the
+                        # retry buffer for the next poll.
+                        with session["history_lock"]:
+                            session["_kanban_pending"] = (
+                                list(_batch) + (session.get("_kanban_pending") or [])
+                            )
+
                     try:
-                        _emit("message.start", sid)
-                        _run_prompt_submit(
-                            rid, sid, session, "\n".join(_batch),
-                            display_kind="internal_notification",
-                            display_metadata={"synthetic_source": "kanban_notification"},
-                        )
+                        if _kb_host_route:
+                            admitted = _dispatch_autonomous_turn(
+                                rid, sid, session, "\n".join(_batch),
+                                display_kind="internal_notification",
+                                display_metadata={"synthetic_source": "kanban_notification"},
+                            )
+                            if not admitted:
+                                _rebuffer_kanban_batch()
+                            else:
+                                _emit("message.start", sid)
+                        else:
+                            _emit("message.start", sid)
+                            _run_prompt_submit(
+                                rid, sid, session, "\n".join(_batch),
+                                display_kind="internal_notification",
+                                display_metadata={"synthetic_source": "kanban_notification"},
+                            )
                     except Exception as exc:
                         print(
                             f"[tui_gateway] kanban notification dispatch failed: "
                             f"{type(exc).__name__}: {exc}",
                             file=sys.stderr,
                         )
-                        with session["history_lock"]:
-                            session["running"] = False
+                        if _kb_host_route:
+                            _rebuffer_kanban_batch()
+                        else:
+                            with session["history_lock"]:
+                                session["running"] = False
         try:
             evt = process_registry.completion_queue.get(timeout=0.5)
         except Exception:
@@ -14222,15 +14482,72 @@ def _notification_poller_loop(
             _emit("status.update", sid, {"kind": "process", "text": text})
             _emitted.add(_dedup_key)
 
+        # ── Coalesce same-session delegation completions ──
+        # A backlog (overnight disconnect, or a fan-out finishing together)
+        # used to become one prompt turn PER result — N stale "already
+        # incorporated, no action needed" bubbles in a row. Drain whatever
+        # else is already queued for THIS session and deliver it as one turn.
+        # Foreign-owned and non-delegation events are held aside and requeued
+        # below, exactly as a fresh loop iteration would have handled them.
+        _held_foreign: list = []
+        is_delegation = evt.get("type") == "async_delegation"
+        deliverables = [(evt, text)]
+        _deliv_chars = len(text)
+        if is_delegation:
+            while True:
+                try:
+                    _nxt = process_registry.completion_queue.get_nowait()
+                except Exception:
+                    break
+                if _notification_event_belongs_elsewhere(sid, session, _nxt):
+                    _held_foreign.append(_nxt)
+                    continue
+                if _nxt.get("type") != "async_delegation":
+                    _held_foreign.append(_nxt)
+                    continue
+                if not _session_owns_notification_event(sid, session, _nxt):
+                    _held_foreign.append(_nxt)
+                    continue
+                _nxt_text = format_process_notification(_nxt)
+                if not _nxt_text:
+                    continue
+                if (len(deliverables) >= _COALESCE_MAX_EVENTS
+                        or _deliv_chars + len(_nxt_text) > _COALESCE_MAX_TEXT_CHARS):
+                    # Bound the consolidated prompt: a full pending backlog
+                    # can exceed the model context, and receipts are acked as
+                    # soon as the turn starts — leave the rest queued for the
+                    # next turn instead of a doomed mega-turn.
+                    process_registry.completion_queue.put(_nxt)
+                    break
+                _nxt_key = _notification_event_dedup_key(_nxt)
+                if _nxt_key not in _emitted:
+                    _emit(
+                        "status.update", sid,
+                        {"kind": "process", "text": _nxt_text},
+                    )
+                    _emitted.add(_nxt_key)
+                deliverables.append((_nxt, _nxt_text))
+                _deliv_chars += len(_nxt_text)
+            if len(deliverables) > 1:
+                logger.info(
+                    "Coalescing %d async-delegation completions for session "
+                    "%s into one turn",
+                    len(deliverables), sid,
+                )
+
         _requeued = False
+        _host_route = _autonomous_host_route_available()
         with session["history_lock"]:
             if session.get("running"):
-                process_registry.completion_queue.put(evt)
+                for _evt, _text in deliverables:
+                    process_registry.completion_queue.put(_evt)
                 _requeued = True
-            else:
+            elif not _host_route:
                 session["running"] = True
+        for _held in _held_foreign:
+            process_registry.completion_queue.put(_held)
         if _requeued:
-            # Back off before re-polling: the re-queued event keeps the queue
+            # Back off before re-polling: the re-queued events keep the queue
             # non-empty, so without a sleep this loop spins at full speed
             # (100% CPU, GIL churn) for as long as the session stays busy.
             time.sleep(0.25)
@@ -14240,32 +14557,110 @@ def _notification_poller_loop(
         from tools.async_delegation import (
             claim_event_delivery, complete_event_delivery, release_event_delivery,
         )
+        if is_delegation:
+            # Claim every member of the batch BEFORE building the submission
+            # (the ledger never acks work that was not delivered). A claim
+            # lost mid-batch drops that row from the consolidated text and
+            # requeues it for its own later turn instead of injecting a
+            # subagent's summary twice.
+            _claim_ids: list = []
+            _claimed_deliverables: list = []
+            for _evt, _text in deliverables:
+                _claim = claim_event_delivery(_evt, "tui-poller")
+                if _claim is not None:
+                    _claim_ids.append((_evt, _claim))
+                    _claimed_deliverables.append((_evt, _text))
+                else:
+                    # Claim lost: another durable consumer owns this row's
+                    # delivery. Requeueing would rival its owner and can
+                    # inject the subagent summary twice; drop it exactly as
+                    # the legacy single-event path did.
+                    pass
+            if not _claim_ids:
+                if not _host_route:
+                    with session["history_lock"]:
+                        session["running"] = False
+                continue
+            try:
+                _ok, _missed = _dispatch_grouped_delegation_notifications(
+                    sid, session, _claimed_deliverables, _claim_ids,
+                    _dispatch_fn=(_dispatch_autonomous_turn if _host_route
+                                  else _run_prompt_submit),
+                )
+            except Exception as exc:
+                for _evt, _c in _claim_ids:
+                    release_event_delivery(_evt, _c)
+                for _evt, _text in _claimed_deliverables:
+                    process_registry.completion_queue.put(_evt)
+                print(
+                    f"[tui_gateway] notification poller dispatch failed: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+                if not _host_route:
+                    with session["history_lock"]:
+                        session["running"] = False
+                else:
+                    time.sleep(0.5)
+                continue
+            for _evt in _missed:
+                process_registry.completion_queue.put(_evt)
+            if not _ok:
+                if not _host_route:
+                    with session["history_lock"]:
+                        session["running"] = False
+                else:
+                    time.sleep(0.25)
+            continue
+
         _claim = claim_event_delivery(evt, "tui-poller")
         if _claim is None:
             # Another durable consumer already owns delivery. We claimed the
             # local UI turn slot before consulting the durable arbiter, so
             # release that speculative busy state instead of leaving the
             # session permanently stuck as running.
-            with session["history_lock"]:
-                session["running"] = False
+            if not _host_route:
+                with session["history_lock"]:
+                    session["running"] = False
             continue
         try:
-            _emit("message.start", sid)
-            if evt.get("type") == "async_delegation":
-                _run_prompt_submit(
-                    rid,
-                    sid,
-                    session,
-                    text,
-                    display_kind="async_delegation_complete",
-                    display_metadata=_async_delegation_display_metadata(evt),
-                )
-            else:
-                _run_prompt_submit(
+            if _host_route:
+                # The child's registered host performs the same admission a
+                # wire turn.start would — a complete owner (running + request
+                # id) registers before the work starts. A refusal is a real
+                # busy owner: release the claim and retry the event later.
+                admitted = _dispatch_autonomous_turn(
                     rid, sid, session, text,
-                    display_kind="internal_notification",
-                    display_metadata={"synthetic_source": "background_notification"},
+                    display_kind=("async_delegation_complete"
+                                  if evt.get("type") == "async_delegation"
+                                  else "internal_notification"),
+                    display_metadata=(_async_delegation_display_metadata(evt)
+                                      if evt.get("type") == "async_delegation"
+                                      else {"synthetic_source": "background_notification"}),
                 )
+                if not admitted:
+                    release_event_delivery(evt, _claim)
+                    process_registry.completion_queue.put(evt)
+                    time.sleep(0.25)
+                    continue
+                _emit("message.start", sid)
+            else:
+                _emit("message.start", sid)
+                if evt.get("type") == "async_delegation":
+                    _run_prompt_submit(
+                        rid,
+                        sid,
+                        session,
+                        text,
+                        display_kind="async_delegation_complete",
+                        display_metadata=_async_delegation_display_metadata(evt),
+                    )
+                else:
+                    _run_prompt_submit(
+                        rid, sid, session, text,
+                        display_kind="internal_notification",
+                        display_metadata={"synthetic_source": "background_notification"},
+                    )
             complete_event_delivery(evt, _claim)
         except Exception as exc:
             release_event_delivery(evt, _claim)
@@ -14274,8 +14669,14 @@ def _notification_poller_loop(
                 f"{type(exc).__name__}: {exc}",
                 file=sys.stderr,
             )
-            with session["history_lock"]:
-                session["running"] = False
+            if _host_route:
+                process_registry.completion_queue.put(evt)
+                # Bounded retry backoff: a persistent dispatch fault must not
+                # spin the poller at full speed while it retries the event.
+                time.sleep(0.5)
+            else:
+                with session["history_lock"]:
+                    session["running"] = False
 
     # Drain any remaining events after stop signal (process all pending
     # before exiting so nothing is lost on shutdown). Events owned by other
@@ -14318,55 +14719,144 @@ def _notification_poller_loop(
             _emit("status.update", sid, {"kind": "process", "text": text})
             _emitted.add(_dedup_key)
 
+        _host_route = _autonomous_host_route_available()
         with session["history_lock"]:
             if session.get("running"):
                 process_registry.completion_queue.put(evt)
                 break
-            session["running"] = True
+            if not _host_route:
+                session["running"] = True
+
+        # Shutdown drain mirrors the live loop: same-session delegation
+        # completions ride out as ONE consolidated turn, other types as their
+        # own turns (unchanged legacy shape). Foreign-owned and non-delegation
+        # events are deferred to the requeue pass below.
+        _held: list = []
+        is_delegation = evt.get("type") == "async_delegation"
+        deliverables = [(evt, text)]
+        _deliv_chars = len(text)
+        if is_delegation:
+            while True:
+                try:
+                    _nxt = process_registry.completion_queue.get_nowait()
+                except Exception:
+                    break
+                if _notification_event_belongs_elsewhere(sid, session, _nxt):
+                    _held.append(_nxt)
+                    continue
+                if _nxt.get("type") != "async_delegation":
+                    _held.append(_nxt)
+                    continue
+                if not _session_owns_notification_event(sid, session, _nxt):
+                    _held.append(_nxt)
+                    continue
+                _nxt_text = format_process_notification(_nxt)
+                if not _nxt_text:
+                    continue
+                if (len(deliverables) >= _COALESCE_MAX_EVENTS
+                        or _deliv_chars + len(_nxt_text) > _COALESCE_MAX_TEXT_CHARS):
+                    # Bound the consolidated prompt: a full pending backlog
+                    # can exceed the model context, and receipts are acked as
+                    # soon as the turn starts — leave the rest queued for the
+                    # next turn instead of a doomed mega-turn.
+                    process_registry.completion_queue.put(_nxt)
+                    break
+                _nxt_key = _notification_event_dedup_key(_nxt)
+                if _nxt_key not in _emitted:
+                    _emit(
+                        "status.update", sid,
+                        {"kind": "process", "text": _nxt_text},
+                    )
+                    _emitted.add(_nxt_key)
+                deliverables.append((_nxt, _nxt_text))
+                _deliv_chars += len(_nxt_text)
 
         rid = f"__notif__{int(time.time() * 1000)}"
         from tools.async_delegation import (
             claim_event_delivery, complete_event_delivery, release_event_delivery,
         )
-        _claim = claim_event_delivery(evt, "tui-poller")
-        if _claim is None:
-            # Another durable consumer already owns delivery. We claimed the
-            # local UI turn slot before consulting the durable arbiter, so
-            # release that speculative busy state instead of leaving the
-            # session permanently stuck as running.
-            with session["history_lock"]:
-                session["running"] = False
-            continue
-        try:
-            _emit("message.start", sid)
-            if evt.get("type") == "async_delegation":
-                _run_prompt_submit(
-                    rid,
-                    sid,
-                    session,
-                    text,
-                    display_kind="async_delegation_complete",
-                    display_metadata=_async_delegation_display_metadata(evt),
-                )
-            else:
-                _run_prompt_submit(
-                    rid,
-                    sid,
-                    session,
-                    text,
-                    display_kind="internal_notification",
-                    display_metadata={"synthetic_source": "background_notification"},
-                )
-            complete_event_delivery(evt, _claim)
-        except Exception as exc:
-            release_event_delivery(evt, _claim)
-            print(
-                f"[tui_gateway] notification poller dispatch failed: "
-                f"{type(exc).__name__}: {exc}",
-                file=sys.stderr,
-            )
-            with session["history_lock"]:
-                session["running"] = False
+        if is_delegation:
+            _claim_ids: list = []
+            _claimed_deliverables: list = []
+            for _evt, _text in deliverables:
+                _claim = claim_event_delivery(_evt, "tui-poller")
+                if _claim is not None:
+                    _claim_ids.append((_evt, _claim))
+                    _claimed_deliverables.append((_evt, _text))
+                else:
+                    # Claim lost: another durable consumer owns delivery.
+                    # Drop it — never requeue a row whose claim we do not
+                    # hold, and keep it out of the deferred requeue pass.
+                    pass
+            if _claim_ids:
+                try:
+                    _ok, _missed = _dispatch_grouped_delegation_notifications(
+                        sid, session, _claimed_deliverables, _claim_ids,
+                        _dispatch_fn=(_dispatch_autonomous_turn if _host_route
+                                      else _run_prompt_submit),
+                    )
+                except Exception:
+                    for _evt, _claim in _claim_ids:
+                        release_event_delivery(_evt, _claim)
+                    for _evt, _text in _claimed_deliverables:
+                        _held.append(_evt)
+                    _ok, _missed = False, []
+                for _evt in _missed:
+                    _held.append(_evt)
+                if not _ok and not _host_route:
+                    with session["history_lock"]:
+                        session["running"] = False
+            elif not _host_route:
+                with session["history_lock"]:
+                    session["running"] = False
+        else:
+            _claim = claim_event_delivery(evt, "tui-poller")
+            if _claim is not None:
+                try:
+                    if _host_route:
+                        admitted = _dispatch_autonomous_turn(
+                            rid, sid, session, text,
+                            display_kind=("async_delegation_complete"
+                                          if evt.get("type") == "async_delegation"
+                                          else "internal_notification"),
+                            display_metadata=(_async_delegation_display_metadata(evt)
+                                              if evt.get("type") == "async_delegation"
+                                              else {"synthetic_source": "background_notification"}),
+                        )
+                        if not admitted:
+                            release_event_delivery(evt, _claim)
+                            _held.append(evt)
+                        else:
+                            _emit("message.start", sid)
+                            complete_event_delivery(evt, _claim)
+                    else:
+                        _emit("message.start", sid)
+                        _run_prompt_submit(
+                            rid, sid, session, text,
+                            display_kind="internal_notification",
+                            display_metadata={"synthetic_source": "background_notification"},
+                        )
+                        complete_event_delivery(evt, _claim)
+                except Exception as exc:
+                    release_event_delivery(evt, _claim)
+                    print(
+                        f"[tui_gateway] notification poller dispatch failed: "
+                        f"{type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                    )
+                    if _host_route:
+                        # Keep the event for the resume-time poller instead
+                        # of dropping it — mirrors the legacy shutdown
+                        # recovery path and the live-loop error handling.
+                        _held.append(evt)
+                    else:
+                        with session["history_lock"]:
+                            session["running"] = False
+            elif not _host_route:
+                with session["history_lock"]:
+                    session["running"] = False
+        for _held_evt in _held:
+            deferred.append(_held_evt)
 
     # Hand any other sessions' events back to the shared queue.
     for evt in deferred:
@@ -14398,6 +14888,139 @@ def _async_delegation_display_metadata(evt: dict) -> dict:
     if isinstance(duration, (int, float)):
         metadata["duration_seconds"] = duration
     return metadata
+
+
+def _format_coalesced_tui_delegations(blocks: list) -> str:
+    """Join per-delegation formatted blocks into one consolidated turn.
+
+    The desktop poller historically injected every queued async-delegation
+    completion as its own prompt turn. After an overnight disconnect that meant
+    one turn per stale result — N "already incorporated into its earlier
+    closure, no action needed" bubbles in a row. The gateway path
+    (gateway/run.py ``_deliver_async_delegation_group``) already coalesces
+    same-route completions with exactly this header contract; the desktop
+    mirrors it. Per-event blocks are self-describing (each carries its own
+    Dispatched/age/Status lines), so this only numbers them and adds the
+    one-consolidated-response instruction.
+    """
+    header = (
+        f"[IMPORTANT: {len(blocks)} background subagent delegations "
+        "completed for this session. Treat these results as one completion "
+        "batch and send at most one consolidated user-facing response. If a "
+        "result does not change the current conclusion, absorb it silently.]"
+    )
+    parts = [header]
+    for i, block in enumerate(blocks):
+        parts.append(f"--- result {i + 1}/{len(blocks)} ---")
+        parts.append(block)
+    return "\n\n".join(parts)
+
+
+def _dispatch_grouped_delegation_notifications(
+    sid: str,
+    session: dict,
+    deliverables: list,
+    claim_ids: list,
+    *,
+    _dispatch_fn=None,
+) -> tuple:
+    """Deliver pre-claimed async-delegation completions as ONE agent turn.
+
+    ``deliverables`` are ``(evt, formatted_text)`` pairs in queue order;
+    ``claim_ids`` the parallel ``(evt, claim_id)`` pairs produced by
+    ``claim_event_delivery(evt, <owner>)`` for each — claimed by the caller
+    BEFORE the session-busy/requeue gate so a submission can never be built
+    from rows another consumer may claim in the meantime. ``_dispatch_fn``
+    performs the actual submission: ``_dispatch_autonomous_turn`` when the
+    compute-host route is available (admission registers a complete owner),
+    ``_run_prompt_submit`` for the chained post-turn drain. A dispatch that
+    reports refusal (``False``) or raises releases every claim and returns
+    ``(False, events)`` so the caller can requeue the raw events; the durable
+    rows stay ``pending`` for a later retry (the ledger never acks work that
+    was not delivered). A single deliverable rides the legacy per-event shape
+    exactly (same text, same display metadata) so small backlogs stay
+    behavior-identical.
+
+    Returns ``(True, [])`` after the turn was accepted for submission, or
+    ``(False, [events...])`` for everything the caller must requeue.
+    """
+    from tools.async_delegation import (
+        complete_event_delivery,
+        release_event_delivery,
+    )
+
+    if not deliverables:
+        return True, []
+
+    if _dispatch_fn is None:
+        _dispatch_fn = _run_prompt_submit
+
+    if len(deliverables) == 1:
+        evt, synth_text = deliverables[0]
+        claim_id = claim_ids[0][1]
+        try:
+            ok = _dispatch_fn(
+                f"__notif__{int(time.time() * 1000)}",
+                sid,
+                session,
+                synth_text,
+                display_kind="async_delegation_complete",
+                display_metadata=_async_delegation_display_metadata(evt),
+            )
+            if ok is False:
+                release_event_delivery(evt, claim_id)
+                return False, [evt]
+            complete_event_delivery(evt, claim_id)
+            return True, []
+        except Exception as exc:
+            release_event_delivery(evt, claim_id)
+            print(
+                f"[tui_gateway] notification poller dispatch failed: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return False, [evt]
+
+    consolidated = _format_coalesced_tui_delegations(
+        [text for _evt, text in deliverables]
+    )
+    rid = f"__notif__{int(time.time() * 1000)}"
+    metadata = _async_delegation_display_metadata(deliverables[0][0])
+    # Aggregate the batch's human-facing totals: a single event may itself
+    # carry a fan-out (``results``) with its own task_count, so counting
+    # EVENTS here under-reports subagents (e.g. "2 agents finished" for a
+    # fan-out of 3 plus a singleton).
+    _per_event_meta = [
+        _async_delegation_display_metadata(evt) for evt, _text in deliverables
+    ]
+    metadata["task_count"] = sum(m.get("task_count", 1) for m in _per_event_meta)
+    metadata["completed_count"] = sum(
+        m.get("completed_count", 0) for m in _per_event_meta
+    )
+    metadata["failed_count"] = sum(m.get("failed_count", 0) for m in _per_event_meta)
+    metadata["coalesced"] = True
+    try:
+        ok = _dispatch_fn(
+            rid, sid, session, consolidated,
+            display_kind="async_delegation_complete",
+            display_metadata=metadata,
+        )
+        if ok is False:
+            for evt, claim_id in claim_ids:
+                release_event_delivery(evt, claim_id)
+            return False, [evt for evt, _claim in claim_ids]
+        for evt, claim_id in claim_ids:
+            complete_event_delivery(evt, claim_id)
+        return True, []
+    except Exception as exc:
+        for evt, claim_id in claim_ids:
+            release_event_delivery(evt, claim_id)
+        print(
+            f"[tui_gateway] notification poller dispatch failed: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return False, [evt for evt, _claim in claim_ids]
 
 
 def _wire_agent_terminal_output() -> None:
@@ -14886,6 +15509,7 @@ def _run_prompt_submit(
         session_tokens = []
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
         secret_token = None
+        admission_goal = None  # original goal snapshot; pause uses its guarded CAS
         goal_followup = None  # set by the post-turn goal hook below
         result = None  # turn outcome; read after the finally for leftover /steer
         tts_queue = None  # streaming-TTS feed for this turn (voice mode)
@@ -15190,6 +15814,15 @@ def _run_prompt_submit(
             agent._route_turn_token = _route_turn_token
             _usage_stop, _usage_thread = _start_usage_ticker(sid, agent)
             try:
+                # Capture under this turn's profile scope, using the canonical
+                # owner rather than the UI sid. Never reload after a refusal:
+                # pause's expected-raw CAS protects intervening operator edits.
+                from hermes_cli.goals import GoalManager
+                from ares_runtime.continuity.runtime import ContextDispatchError
+
+                goal_key = str(session.get("session_key") or "")
+                if goal_key:
+                    admission_goal = GoalManager(goal_key)
                 result = agent.run_conversation(run_message, **run_kwargs)
             finally:
                 if getattr(agent, "_route_turn_token", None) is _route_turn_token:
@@ -15715,6 +16348,30 @@ def _run_prompt_submit(
             # Keep the partial turn available to the next prompt; the durable
             # inflight record still carries the recoverable error state.
             _restore_agent_history_after_turn_error(session, agent)
+            refusal_notice = None
+            if admission_goal is not None and isinstance(e, ContextDispatchError):
+                # Refusal grants no retry/judge authority, including when the
+                # guarded durable pause loses a race or persistence fails.
+                goal_followup = None
+                with session["history_lock"]:
+                    refusal_owned = ((owns_admission() or owns_stopped_admission())
+                        and session.get("agent") is agent)
+                if refusal_owned and admission_goal.is_active():
+                    try:
+                        paused = admission_goal.pause("CONTEXT_ADMISSION_REFUSED")
+                    except Exception:
+                        paused = None
+                    if paused is not None:
+                        refusal_notice = (
+                            "Goal paused: context recovery is required. An operator may explicitly "
+                            "resume with /goal resume after repairing context."
+                        )
+                    else:
+                        refusal_notice = (
+                            "Could not verify a durable pause of the failed admission's goal "
+                            "(state changed or persistence failed). No automatic goal followup "
+                            "was scheduled; inspect goal state and repair context."
+                        )
             try:
                 # Close the turn with the same terminal error frame shape as
                 # the returned-error path (uniform client handling), retaining
@@ -15729,6 +16386,11 @@ def _run_prompt_submit(
                     flush=True,
                 )
                 _emit("error", sid, {"message": str(e)})
+            if refusal_notice:
+                try:
+                    _emit("status.update", sid, {"kind": "goal", "text": refusal_notice})
+                except Exception:
+                    logger.debug("context refusal goal notice delivery failed", exc_info=True)
         finally:
             # Drop both local snapshots of the pre-turn history before asking
             # glibc to return pages. session["history"] already points at the
@@ -15965,16 +16627,29 @@ def _run_prompt_submit(
                 owns_event=lambda e: _session_owns_notification_event(sid, session, e),
                 skip_poll_observed=False,
             )
-            for index, (_evt, synth) in enumerate(drained):
+            # Split the drained batch: same-session delegation completions
+            # coalesce into ONE turn (mirrors the poller; an overnight backlog
+            # used to become one prompt turn per stale result), ordinary
+            # completion events keep the legacy per-event shape. Order: the
+            # per-event types first in queue order, then the delegation batch.
+            from tools.async_delegation import (
+                claim_event_delivery, complete_event_delivery, release_event_delivery,
+            )
+            _deleg_pairs: list = []
+            _other_pairs: list = []
+            for _evt, synth in drained:
+                if _evt.get("type") == "async_delegation":
+                    _deleg_pairs.append((_evt, synth))
+                else:
+                    _other_pairs.append((_evt, synth))
+
+            for _idx, (_evt, synth) in enumerate(_other_pairs):
                 with session["history_lock"]:
                     if session.get("running"):
-                        for pending_evt, _pending_synth in drained[index:]:
+                        for pending_evt, _pending_synth in _other_pairs[_idx:]:
                             process_registry.completion_queue.put(pending_evt)
                         break
                     session["running"] = True
-                from tools.async_delegation import (
-                    claim_event_delivery, complete_event_delivery, release_event_delivery,
-                )
                 _claim = claim_event_delivery(_evt, "tui-post-turn")
                 if _claim is None:
                     # The local slot was claimed before the durable arbiter.
@@ -16010,6 +16685,47 @@ def _run_prompt_submit(
                     )
                     with session["history_lock"]:
                         session["running"] = False
+
+            if _deleg_pairs:
+                with session["history_lock"]:
+                    if session.get("running"):
+                        for pending_evt, _pending_synth in _deleg_pairs:
+                            process_registry.completion_queue.put(pending_evt)
+                        _deleg_pairs = []
+                    else:
+                        session["running"] = True
+                if _deleg_pairs:
+                    _claim_ids: list = []
+                    _claimed: list = []
+                    for _evt, synth in _deleg_pairs:
+                        _claim = claim_event_delivery(_evt, "tui-post-turn")
+                        if _claim is not None:
+                            _claim_ids.append((_evt, _claim))
+                            _claimed.append((_evt, synth))
+                        else:
+                            # Claim lost: another durable consumer owns
+                            # delivery; drop it (never rival its owner).
+                            pass
+                    if _claim_ids:
+                        # This drain runs inside the accepted turn's own run
+                        # thread (the host keeps that request id alive across
+                        # the chained successors), so dispatched batches stay
+                        # inline — host admission is already held by the chain.
+                        _ok, _missed = _dispatch_grouped_delegation_notifications(
+                            sid, session, _claimed, _claim_ids,
+                            _dispatch_fn=_run_prompt_submit,
+                        )
+                        for _evt in _missed:
+                            process_registry.completion_queue.put(_evt)
+                        if not _ok:
+                            with session["history_lock"]:
+                                session["running"] = False
+                    else:
+                        # Every claim was lost: release the speculative busy
+                        # slot this drain claimed, or a successful foreground
+                        # turn wedges as running with nothing dispatched.
+                        with session["history_lock"]:
+                            session["running"] = False
         except Exception as _drain_exc:
             print(
                 f"[tui_gateway] completion queue drain failed: "
@@ -16033,8 +16749,7 @@ def _run_prompt_submit(
             and (registered is None or registered is session)
         )
         if can_start:
-            session["_run_thread"] = run_thread
-            run_thread.start()
+            _start_run_thread(session, run_thread)
     if not can_start:
         with session["history_lock"]:
             session["running"] = False
@@ -16674,9 +17389,13 @@ def _(rid, params: dict) -> dict:
                 return _err(rid, 5019, "fast update returned an unconfirmed owner",
                             {"delivery": "uncertain"})
             if ack.get("type") in {"control.error", "error"}:
-                # A host error after an offered write carries no proof that
-                # the mutation was not applied, regardless of its error code.
+                # Preserve a host's definitive validation refusal. Only a
+                # missing/unknown delivery remains uncertain.
                 code = ack.get("code")
+                delivery = ack.get("delivery")
+                if delivery in {"not_sent", "not_applied"}:
+                    return _err(rid, 5019, str(ack.get("message") or "fast update rejected"),
+                                {"delivery": delivery, **({"host_code": code} if type(code) is int else {})})
                 return _err(rid, 5019, str(ack.get("message") or "fast update unconfirmed"),
                             {"delivery": "uncertain", **({"host_code": code} if type(code) is int else {})})
             result, info = ack.get("result"), ack.get("session_info")
@@ -16782,13 +17501,9 @@ def _(rid, params: dict) -> dict:
         else:
             _write_config_key("agent.service_tier", nv)
         if agent is not None:
-            agent.service_tier = "priority" if nv == "fast" else None
-            current_overrides = dict(getattr(agent, "request_overrides", {}) or {})
-            current_overrides.pop("service_tier", None)
-            current_overrides.pop("speed", None)
-            if nv == "fast":
-                current_overrides.update(overrides)
-            agent.request_overrides = current_overrides
+            _set_agent_fast_runtime(agent, "priority" if nv == "fast" else None,
+                                    overrides if nv == "fast" else {},
+                                    requested_tier="priority" if nv == "fast" else "")
             _persist_live_session_runtime(session)
             _emit(
                 "session.info",
@@ -17108,11 +17823,14 @@ def _(rid, params: dict) -> dict:
                     return _err(rid, 5019, "reasoning update returned an unconfirmed owner",
                                 {"delivery": "uncertain"})
                 if ack.get("type") in {"control.error", "error"}:
-                    # The control was offered; a host-reported error code is
-                    # not evidence that it did not apply before the reply.
+                    # Preserve a host's definitive validation refusal. Only a
+                    # missing/unknown delivery remains uncertain.
                     code = ack.get("code")
-                    return _err(rid, 5019,
-                                str(ack.get("message") or "reasoning update unconfirmed"),
+                    delivery = ack.get("delivery")
+                    if delivery in {"not_sent", "not_applied"}:
+                        return _err(rid, 5019, str(ack.get("message") or "reasoning update rejected"),
+                                    {"delivery": delivery, **({"host_code": code} if type(code) is int else {})})
+                    return _err(rid, 5019, str(ack.get("message") or "reasoning update unconfirmed"),
                                 {"delivery": "uncertain", **({"host_code": code} if type(code) is int else {})})
                 result, info = ack.get("result"), ack.get("session_info")
                 try:
@@ -18540,10 +19258,30 @@ def _model_picker_context(agent, session: dict | None = None):
 
     ctx = load_picker_context()
     selected = {}
-    if session is not None and _session_uses_compute_host(session) and not session.get("_compute_host_active"):
-        override = session.get("model_override")
-        if isinstance(override, dict):
-            selected = override
+    if session is not None and _session_uses_compute_host(session):
+        with session["history_lock"]:
+            override = session.get("model_override")
+            if isinstance(override, dict):
+                selected = dict(override)
+            if session.get("_compute_host_active"):
+                # The serving agent is only a prewarmed shadow. Use the
+                # admitted host projection, including a temporary --once pick.
+                mirror = _metadata_mirror(session)
+                host_model = mirror.get("model")
+                host_provider = mirror.get("provider")
+                if host_model and host_provider:
+                    route_model = selected.get("model") if selected else ctx.current_model
+                    route_provider = selected.get("provider") if selected else ctx.current_provider
+                    same_route = route_model == host_model and route_provider == host_provider
+                    if same_route and not selected:
+                        # A session without an explicit override inherits this
+                        # profile route. Keep its URL only for that exact tuple.
+                        selected["base_url"] = ctx.current_base_url
+                    selected.update(model=host_model, provider=host_provider)
+                    if not same_route:
+                        # Do not attach a durable/parent route URL to a
+                        # different host selection whose URL was not reported.
+                        selected["base_url"] = ""
     provider = selected.get("provider") or (getattr(agent, "provider", "") if agent else "")
     model = selected.get("model") or (getattr(agent, "model", "") if agent else "")
     base_url = selected.get("base_url") if selected else (getattr(agent, "base_url", "") if agent else "")
@@ -19018,10 +19756,8 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
             return "\n".join(_lines)
         elif name == "fast" and agent:
             mode = arg.lower()
-            if mode in {"fast", "on"}:
-                agent.service_tier = "priority"
-            elif mode in {"normal", "off"}:
-                agent.service_tier = None
+            if mode in {"fast", "on", "normal", "off"}:
+                _apply_session_runtime_options(sid, session, {"fast": mode in {"fast", "on"}})
             _emit("session.info", sid, _session_info(agent, session))
         elif name == "reload-mcp" and agent and hasattr(agent, "reload_mcp_tools"):
             agent.reload_mcp_tools()

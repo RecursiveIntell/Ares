@@ -1094,8 +1094,7 @@ def _(rid, params: dict) -> dict:
     run_thread._turn_outcome_execution = outcome_execution
     # Keep a handle so session.interrupt can tell a live turn from a stuck
     # `running` flag (a turn that died without clearing it) and recover the latter.
-    session["_run_thread"] = run_thread
-    run_thread.start()
+    _start_run_thread(session, run_thread)
     return _ok(
         rid,
         {

@@ -53,6 +53,7 @@ class CaptureQueuedNativeImageAgent:
     calls = []
 
     def __init__(self, **kwargs):
+        self.model = kwargs["model"]
         self.tools = []
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
 

@@ -5903,6 +5903,9 @@ class TurnRunner:
         agent.reasoning_config = reasoning_config
         agent.service_tier = self._runner._service_tier
         agent.request_overrides = turn_route.get("request_overrides") or {}
+        from agent.agent_runtime_helpers import apply_fast_mode_runtime
+
+        apply_fast_mode_runtime(agent, self._runner._service_tier, remember=True)
         # Must-deliver notes for THIS turn ride the current user message
         # (api_content sidecar), never the system prompt: staged by
         # _handle_message_with_agent (auto-reset note, first-contact

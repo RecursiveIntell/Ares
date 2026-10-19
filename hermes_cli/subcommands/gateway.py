@@ -336,7 +336,11 @@ def build_gateway_parser(
     proxy_start.add_argument(
         "--host",
         default=None,
-        help="Bind address (default: 127.0.0.1). Use 0.0.0.0 to expose on LAN.",
+        help="Bind address (default: 127.0.0.1). Nonloopback requires --client-token-file.",
+    )
+    proxy_start.add_argument(
+        "--client-token-file", default=None, metavar="PATH",
+        help="Read a distinct client bearer from a private file (never pass the secret in argv)",
     )
     proxy_start.add_argument(
         "--port",

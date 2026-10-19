@@ -26,7 +26,10 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Dict, List, Optional
 
-from agent.context_engine import ContextEngine
+from agent.context_engine import (
+    CONTEXT_REBASE_LINEAGE_INTEGRITY_MISMATCH,
+    ContextEngine,
+)
 from agent.message_sanitization import (
     coalesce_tool_call_id,
     tool_call_id_variants,
@@ -178,6 +181,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         # Receipts belong to the stable logical compression lineage instead;
         # otherwise the first rotated child silently starts a new governor DAG.
         self._lineage_session_id = ""
+        self._lineage_session_id_resolved = False
         self._session_db: Any = None
         # A finalized receipt is prepared durably inside compress(), but remains
         # invisible to parent selection/search/expand until the host confirms
@@ -197,6 +201,10 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         self.last_error: str | None = None
         self.last_warning: str | None = None
         self.last_outcome: dict[str, Any] | None = None
+        # Volatile owner evidence, keyed by logical lineage (or by the physical
+        # fallback until ancestry is positively resolved). A later mismatch on
+        # another lineage must not overwrite an earlier unresolved refusal.
+        self._lineage_integrity_vetoes: dict[str, bool] = {}
         self.last_summary_safety: dict[str, Any] | None = None
         self.last_compaction_metrics: dict[str, Any] | None = None
         self.fallback_event_count = 0
@@ -336,6 +344,9 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         clone = type(self)(str(self.binary), str(self.store_dir), self.timeout_sec)
         clone.session_id = self.session_id
         clone._lineage_session_id = self._lineage_session_id
+        clone._lineage_session_id_resolved = getattr(
+            self, "_lineage_session_id_resolved", False
+        )
         clone._session_db = self._session_db
         clone._pending_admission = copy.deepcopy(self._pending_admission)
         clone.last_prompt_tokens = self.last_prompt_tokens
@@ -348,6 +359,9 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         clone.last_error = self.last_error
         clone.last_warning = self.last_warning
         clone.last_outcome = copy.deepcopy(self.last_outcome)
+        clone._lineage_integrity_vetoes = copy.deepcopy(
+            getattr(self, "_lineage_integrity_vetoes", {})
+        )
         clone.last_summary_safety = copy.deepcopy(self.last_summary_safety)
         clone.last_compaction_metrics = copy.deepcopy(self.last_compaction_metrics)
         clone.fallback_event_count = self.fallback_event_count
@@ -818,17 +832,20 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
     def on_session_start(self, session_id: str, **kwargs) -> None:
         self.session_id = str(session_id or self.session_id or "default")
         session_db = kwargs.get("session_db")
+        boundary_reason = kwargs.get("boundary_reason")
         if session_db is not None:
             self.bind_session_state(session_db=session_db, session_id=self.session_id)
-        elif kwargs.get("boundary_reason") != "compression":
+        elif boundary_reason not in {"compression", "context_rebase"}:
+            # This lifecycle callback is an explicit new-session boundary.
             self._lineage_session_id = self.session_id
+            self._lineage_session_id_resolved = True
         elif not self._lineage_session_id:
-            # A boundary callback without a bound SessionDB is still one
-            # logical conversation. Preserve the old physical id as its stable
-            # governor key rather than rebasing the receipt DAG to the child.
+            # A continuation boundary without DB evidence cannot invent a new
+            # root; initialize only when this engine has no prior lineage.
             self._lineage_session_id = str(
                 kwargs.get("old_session_id") or self.session_id
             )
+            self._lineage_session_id_resolved = False
         # Cross-session context transfer: if receipts exist from prior sessions,
         # load the most recent one as initial _previous_summary for context continuity.
         # This is a lightweight bootstrap — the model can use context_search to
@@ -845,7 +862,11 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         """
         if self._session_db is not session_db or self.session_id != session_id:
             raise RuntimeError("GOVERNOR_REBASE_BINDING_MISMATCH")
-        expected_root = self._context_lineage_root(session_db, session_id)
+        expected_root, lineage_resolved = self._context_lineage_root_with_evidence(
+            session_db, session_id
+        )
+        if not lineage_resolved:
+            raise RuntimeError("GOVERNOR_REBASE_LINEAGE_UNRESOLVED")
         if self._lineage_session_id != expected_root:
             raise RuntimeError("GOVERNOR_REBASE_LINEAGE_MISMATCH")
         records = self._run_certified_json(["pending-v2", "--dir", str(self.store_dir)], {})
@@ -923,6 +944,10 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         self._set_defer_baseline(value)
 
     def on_session_reset(self) -> None:
+        current_lineage = self._governor_session_id()
+        vetoes = getattr(self, "_lineage_integrity_vetoes", None)
+        if isinstance(vetoes, dict):
+            vetoes.pop(current_lineage, None)
         super().on_session_reset()
         self.last_receipt_id = None
         self.last_error = None
@@ -947,6 +972,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         self._set_defer_baseline(0)
         self._previous_summary = None
         self._lineage_session_id = ""
+        self._lineage_session_id_resolved = False
         self._session_db = None
         # A reset is a real user boundary. Any in-process prepared receipt was
         # not accepted by the old host transcript and must not leak into the
@@ -957,85 +983,195 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         self,
         session_db: Any = None,
         session_id: str = "",
-    ) -> None:
-        """Bind SessionDB, restore the logical lineage, and reconcile pending.
+    ) -> bool:
+        """Bind SessionDB and restore lineage when ancestry is positively known.
 
-        Resume-time provider repair is not durable, so recovery reads the raw
-        active SessionDB projection. A pending receipt is activated only when
-        its authenticated compacted projection is an exact normalized prefix
-        of a durable in-place row set or compression-continuation tip.
+        Return whether the supplied owner resolved a complete logical lineage.
+        Missing DB ancestry is not a new-session transition and cannot clear an
+        existing integrity veto. A caller that owns an explicit session-start
+        boundary may clear only after this method returns ``True``.
         """
         if session_id:
             self.session_id = str(session_id)
         self._session_db = session_db
-        self._lineage_session_id = self._context_lineage_root(
+        lineage_root, lineage_resolved = self._context_lineage_root_with_evidence(
             session_db,
             self.session_id or "default",
         )
+        if not isinstance(getattr(self, "_lineage_integrity_vetoes", None), dict):
+            self._lineage_integrity_vetoes = {}
+        if lineage_resolved:
+            for fallback_root, unresolved in list(
+                self._lineage_integrity_vetoes.items()
+            ):
+                if unresolved is not True:
+                    continue
+                resolved_veto_root, veto_root_resolved = (
+                    self._context_lineage_root_with_evidence(
+                        session_db,
+                        fallback_root,
+                    )
+                )
+                if veto_root_resolved and resolved_veto_root == lineage_root:
+                    # Positive owner evidence refined this fallback into the
+                    # same logical root; carry the veto, not a recovery claim.
+                    self._lineage_integrity_vetoes.pop(fallback_root, None)
+                    self._lineage_integrity_vetoes[lineage_root] = False
+            self._lineage_session_id = lineage_root
+            self._lineage_session_id_resolved = True
+        elif not self._lineage_session_id:
+            self._lineage_session_id = lineage_root
+            self._lineage_session_id_resolved = False
         if session_db is not None:
             self._reconcile_pending_receipts(session_db, self.session_id)
+        return lineage_resolved
 
     @staticmethod
-    def _context_lineage_root(session_db: Any, session_id: str) -> str:
-        """Return the stable logical root across compression and context rebases.
-
-        Compression children historically share the Governor receipt DAG.  A
-        context rebase is the same logical conversation with a fresh provider
-        working set, so rebinding the Governor to the physical child must not
-        silently fork its authenticated lineage.  Explicit branch/delegate
-        children are not continuation edges and stop the walk.
-        """
+    def _context_lineage_root_with_evidence(
+        session_db: Any, session_id: str
+    ) -> tuple[str, bool]:
+        """Resolve a root only through complete, owner-backed ancestry evidence."""
         current = str(session_id or "default")
         getter = getattr(type(session_db), "get_session", None)
         if session_db is None or not callable(getter):
-            return current
+            return current, False
         seen: set[str] = set()
         for _ in range(1000):
             if not current or current in seen:
-                break
+                return current, False
             seen.add(current)
-            row = getter(session_db, current)
-            if not isinstance(row, dict):
-                break
-            parent_id = str(row.get("parent_session_id") or "")
-            if not parent_id:
-                break
-            parent = getter(session_db, parent_id)
-            if not isinstance(parent, dict):
-                break
-            reason = parent.get("end_reason")
-            config = row.get("model_config") or {}
-            if isinstance(config, str):
+            try:
+                row = getter(session_db, current)
+            except Exception:
+                return current, False
+            if not isinstance(row, dict) or "parent_session_id" not in row:
+                return current, False
+            raw_parent_id = row.get("parent_session_id")
+            if raw_parent_id is None:
+                return current, True
+            # SessionDB's nullable TEXT column yields either None or a string.
+            # Do not let falsey malformed values (False, 0, [], "") masquerade
+            # as an owner-confirmed logical root and replace a known veto key.
+            if not isinstance(raw_parent_id, str) or not raw_parent_id:
+                return current, False
+            parent_id = raw_parent_id
+            if row.get("source") == "tool":
+                return current, True
+            if "model_config" not in row:
+                return current, False
+            raw_config = row.get("model_config")
+            if raw_config is None:
+                # SessionDB stores a missing optional configuration as SQL
+                # NULL. Only that exact owner representation means an empty
+                # config; other falsey values are malformed, not defaults.
+                config = {}
+            elif isinstance(raw_config, str):
+                if not raw_config.strip():
+                    return current, False
                 try:
-                    config = json.loads(config)
+                    config = json.loads(raw_config)
                 except (TypeError, ValueError):
-                    break
-            if not isinstance(config, dict):
-                break
-            if reason == "compression":
-                if (
-                    config.get("_branched_from") == parent_id
-                    or config.get("_delegate_from") == parent_id
-                ):
-                    break
-            elif reason == "context_rebase":
-                if (
-                    config.get("_context_rebase_from") != parent_id
-                    or not config.get("_context_rebase_transition")
-                    or type(config.get("_context_epoch")) is not int
-                    or config.get("_context_epoch") < 1
-                ):
-                    break
+                    return current, False
             else:
-                break
-            current = parent_id
-        return current or str(session_id or "default")
+                config = raw_config
+            if not isinstance(config, dict):
+                return current, False
+            # Validate owner markers before comparing them. SessionDB's fork
+            # owner uses OR semantics: either marker naming the immediate
+            # parent establishes a fork; another valid marker may be inherited
+            # provenance on that row and does not contradict the owner result.
+            marker_values = []
+            for marker_key in ("_branched_from", "_delegate_from"):
+                marker_value = config.get(marker_key)
+                if marker_value is None:
+                    continue
+                if not isinstance(marker_value, str) or not marker_value:
+                    return current, False
+                marker_values.append(marker_value)
+            if parent_id in marker_values:
+                return current, True
+            reset_from = config.get("_reset_from")
+            if reset_from is not None and (
+                not isinstance(reset_from, str) or not reset_from
+            ):
+                return current, False
+            try:
+                parent = getter(session_db, parent_id)
+            except Exception:
+                return current, False
+            if not isinstance(parent, dict) or "end_reason" not in parent:
+                return current, False
+            reason = parent.get("end_reason")
+            from hermes_state_common import _RESET_END_REASONS
+
+            if reset_from == parent_id:
+                # SessionDB persists this owner marker before a parent may be
+                # reopened, so the marker—not mutable end_reason—is the durable
+                # reset-boundary evidence for this immediate edge.
+                return current, True
+            if reason in _RESET_END_REASONS:
+                child_key = row.get("session_key")
+                parent_key = parent.get("session_key")
+                if (
+                    isinstance(child_key, str)
+                    and child_key
+                    and child_key == parent_key
+                ):
+                    # Match SessionDB's legacy reset-child fallback exactly:
+                    # same non-empty route key plus a recognized reset end.
+                    return current, True
+            if reason == "compression":
+                current = parent_id
+                continue
+            if reason == "context_rebase":
+                transition_lookup = getattr(
+                    type(session_db), "context_rebase_transition_for_session", None
+                )
+                if not callable(transition_lookup):
+                    return current, False
+                try:
+                    transition = transition_lookup(session_db, current)
+                except Exception:
+                    return current, False
+                if (
+                    transition is None
+                    or getattr(transition, "child_session_id", None) != current
+                    or getattr(transition, "parent_session_id", None) != parent_id
+                ):
+                    return current, False
+                current = parent_id
+                continue
+            return current, False
+        return current, False
+
+    @staticmethod
+    def _context_lineage_root(session_db: Any, session_id: str) -> str:
+        """Return the best-known logical root, without asserting it was resolved."""
+        return ContextGovernorEngine._context_lineage_root_with_evidence(
+            session_db, session_id
+        )[0]
 
     # Back-compat for tests/extensions that still name the narrower helper.
     _compression_lineage_root = _context_lineage_root
 
     def _governor_session_id(self) -> str:
         return self._lineage_session_id or self.session_id or "hermes-session"
+
+    def automatic_rebase_block_reason(self) -> str | None:
+        """Veto rebase only for the active logical lineage's unresolved refusal.
+
+        The map is volatile and keyed by logical lineage. A different current
+        session does not repair an older lineage; a matching verified activation
+        or explicit reset removes only that lineage's entry. State does not
+        survive process restart.
+        """
+        vetoes = getattr(self, "_lineage_integrity_vetoes", None)
+        if (
+            isinstance(vetoes, dict)
+            and self._governor_session_id() in vetoes
+        ):
+            return CONTEXT_REBASE_LINEAGE_INTEGRITY_MISMATCH
+        return None
 
     def get_active_compression_failure_cooldown(
         self,
@@ -1467,136 +1603,6 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             separated.append(message)
         return self._preserve_multimodal_tail(source_messages, separated)
 
-    def _compact_with_durable_replay_recovery(
-        self,
-        request: dict[str, Any],
-        messages: List[Dict[str, Any]],
-        source_messages: List[Dict[str, Any]],
-        metrics: Dict[str, Any],
-    ) -> tuple[dict[str, Any], dict[str, int] | None, List[Dict[str, Any]]]:
-        """Run compact-v2; on a live lineage mismatch retry once from durable rows.
-
-        The in-memory transcript can diverge from the SessionDB rows it was
-        persisted as (observed 2026-10-14: the live engine was refused with
-        ``lineage_integrity_mismatch`` for ~2h while the same session's
-        durable rows compacted cleanly). The durable rows are the session's
-        source of truth, so they are a legitimate input: Rust still verifies
-        the parent prefix exactly and the receipt chain as usual. Nothing
-        is relaxed. The retry runs at most once per compaction, and only
-        when every persisted live row is accounted for in SessionDB.
-        """
-        try:
-            response, continuation = self._compact_v2_candidate(request)
-            return response, continuation, source_messages
-        except ContextGovernorCommandError as exc:
-            if (
-                exc.code != "lineage_integrity_mismatch"
-                or metrics.get("durable_replay_recovery") is not None
-            ):
-                raise
-            recovered = self._durable_replay_source(messages)
-            if recovered is None:
-                metrics["durable_replay_recovery"] = "unavailable"
-                raise
-            recovered_source = self._without_host_todo_snapshots(recovered)
-            live_projection = request["messages"]
-            durable_projection = self._rehydrate_legacy_parent_prefix([
-                self._message_to_governor(m, i)
-                for i, m in enumerate(recovered_source)
-                if isinstance(m, dict)
-            ])
-            divergence = self._first_projection_divergence(
-                live_projection, durable_projection
-            )
-            if divergence is None:
-                # The live projection already equals the durable one, so a
-                # retry would be refused identically.
-                metrics["durable_replay_recovery"] = "identical"
-                raise
-            metrics["durable_replay_recovery"] = "attempted"
-            metrics["durable_replay_divergence"] = divergence
-            logger.warning(
-                "context-governor: live transcript diverged from SessionDB "
-                "(session=%s first_index=%s role=%s fields=%s live=%d durable=%d); "
-                "retrying compaction once from the durable rows",
-                self._governor_session_id(),
-                divergence["index"],
-                divergence["role"],
-                ",".join(divergence["fields"]),
-                len(live_projection),
-                len(durable_projection),
-            )
-            request["messages"] = durable_projection
-            response, continuation = self._compact_v2_candidate(request)
-            metrics["durable_replay_recovery"] = "recovered"
-            return response, continuation, recovered_source
-
-    def _durable_replay_source(
-        self, messages: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]] | None:
-        """Durable SessionDB rows plus the live tail not yet persisted.
-
-        Returns ``None`` unless the mapping is unambiguous: every live row
-        carrying ``_row_id`` exists in SessionDB, SessionDB holds no row
-        newer than the live transcript knows about, and unpersisted live
-        messages appear only as a trailing run.
-        """
-        session_db = getattr(self, "_session_db", None)
-        session_id = str(getattr(self, "session_id", "") or "")
-        getter = getattr(type(session_db), "get_messages_as_conversation", None)
-        if session_db is None or not session_id or not callable(getter):
-            return None
-        live = [m for m in messages if isinstance(m, dict)]
-        tail_start = len(live)
-        while tail_start > 0 and live[tail_start - 1].get("_row_id") is None:
-            tail_start -= 1
-        persisted, tail = live[:tail_start], live[tail_start:]
-        if not persisted or any(
-            m.get("_row_id") is None and m.get("role") != "system" for m in persisted
-        ):
-            return None
-        try:
-            durable = getter(
-                session_db,
-                session_id,
-                repair_alternation=False,
-                include_row_ids=True,
-                include_summary_markers=True,
-            )
-        except Exception:
-            return None
-        if not isinstance(durable, list) or not durable:
-            return None
-        durable_ids = {
-            m.get("_row_id") for m in durable if isinstance(m, dict)
-        }
-        live_ids = {m["_row_id"] for m in persisted if m.get("_row_id") is not None}
-        if not live_ids or not live_ids <= durable_ids:
-            return None
-        if max(i for i in durable_ids if isinstance(i, int)) > max(live_ids):
-            return None
-        head = [m for m in persisted if m.get("role") == "system" and m.get("_row_id") is None]
-        return copy.deepcopy(head + list(durable) + tail)
-
-    @staticmethod
-    def _first_projection_divergence(
-        live: List[Dict[str, Any]], durable: List[Dict[str, Any]]
-    ) -> Dict[str, Any] | None:
-        """Content-free location of the first live/durable difference."""
-        for index, (a, b) in enumerate(zip(live, durable)):
-            if a != b:
-                return {
-                    "index": index,
-                    "role": a.get("role") if isinstance(a, dict) else None,
-                    "fields": sorted(
-                        k for k in set(a) | set(b) if a.get(k) != b.get(k)
-                    ) if isinstance(a, dict) and isinstance(b, dict) else ["type"],
-                }
-        if len(live) != len(durable):
-            index = min(len(live), len(durable))
-            return {"index": index, "role": None, "fields": ["length"]}
-        return None
-
     def _compact_v2_candidate(
         self, request: dict[str, Any]
     ) -> tuple[dict[str, Any], dict[str, int] | None]:
@@ -1795,11 +1801,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         try:
             lineage_continuation = None
             for projection_attempt in range(2):
-                response, lineage_continuation, source_messages = (
-                    self._compact_with_durable_replay_recovery(
-                        request, messages, source_messages, metrics
-                    )
-                )
+                response, lineage_continuation = self._compact_v2_candidate(request)
                 pending_receipt, pending_receipt_id, compacted = (
                     self._project_compaction_candidate(response, source_messages)
                 )
@@ -2034,6 +2036,20 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
 
             return compacted or messages
         except Exception as exc:
+            integrity_mismatch = (
+                isinstance(exc, ContextGovernorCommandError)
+                and exc.operation == "compact-v2"
+                and exc.code == "lineage_integrity_mismatch"
+            )
+            if integrity_mismatch:
+                vetoes = getattr(self, "_lineage_integrity_vetoes", None)
+                if not isinstance(vetoes, dict):
+                    vetoes = {}
+                    self._lineage_integrity_vetoes = vetoes
+                vetoes[self._governor_session_id()] = not getattr(
+                    self, "_lineage_session_id_resolved", False
+                )
+                metrics["durable_replay_recovery"] = "disabled_fail_closed"
             if self._pending_admission is not None:
                 try:
                     self.discard_pending_compression(reason="adapter_exception")
@@ -2071,11 +2087,14 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                     ),
                 }
             else:
-                self.last_outcome = {
+                outcome = {
                     "kind": "compaction_failed_closed",
                     "source_error_code": getattr(exc, "code", None),
                     "error": self._safe_summary_diagnostic(error_text),
                 }
+                if integrity_mismatch:
+                    outcome["source_operation"] = exc.operation
+                self.last_outcome = outcome
             failure_type = self._classify_subprocess_error(exc)
             if failure_type == "auth":
                 logger.error("context-governor auth failure: %s", exc)
@@ -4383,6 +4402,12 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         # before best-effort bookkeeping so a later Python exception cannot
         # make the host try to discard an already-active receipt.
         self._pending_admission = None
+        lineage_id = pending.get("lineage_session_id")
+        vetoes = getattr(self, "_lineage_integrity_vetoes", None)
+        if isinstance(vetoes, dict):
+            # Only a verified activation for the same logical lineage proves
+            # that its authenticated compacted projection now has a host commit.
+            vetoes.pop(lineage_id, None)
         try:
             generation = info.get("generation")
             if isinstance(generation, int) and not isinstance(generation, bool):

@@ -1,0 +1,3042 @@
+[
+  {
+    "file": "agent/account_usage.py",
+    "function": "redeem_codex_reset_credit",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: agent/account_usage.py::redeem_codex_reset_credit; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "agent/agent_runtime_helpers.py",
+    "function": "create_openai_client",
+    "pattern": "GeminiNativeClient",
+    "occurrences": 1,
+    "classification": "main_physical",
+    "evidence": "agent.process_bootstrap bound OpenAI/Gemini factories; test_physical_sdk_matrix.py"
+  },
+  {
+    "file": "agent/agent_runtime_helpers.py",
+    "function": "create_openai_client",
+    "pattern": "OpenAI",
+    "occurrences": 1,
+    "classification": "main_physical",
+    "evidence": "agent.process_bootstrap bound OpenAI/Gemini factories; test_physical_sdk_matrix.py"
+  },
+  {
+    "file": "agent/anthropic_adapter.py",
+    "function": "_build_anthropic_client_with_bearer_hook",
+    "pattern": "Anthropic",
+    "occurrences": 1,
+    "classification": "adapter_physical",
+    "evidence": "factory bind_inference_client; physical SDK and lease matrix tests"
+  },
+  {
+    "file": "agent/anthropic_adapter.py",
+    "function": "build_anthropic_client",
+    "pattern": "Anthropic",
+    "occurrences": 1,
+    "classification": "adapter_physical",
+    "evidence": "factory bind_inference_client; physical SDK and lease matrix tests"
+  },
+  {
+    "file": "agent/anthropic_adapter.py",
+    "function": "refresh_anthropic_oauth_pure",
+    "pattern": "urlopen",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: agent/anthropic_adapter.py::refresh_anthropic_oauth_pure; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "agent/anthropic_adapter.py",
+    "function": "run_hermes_oauth_login_pure",
+    "pattern": "urlopen",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: agent/anthropic_adapter.py::run_hermes_oauth_login_pure; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "agent/auxiliary_client.py",
+    "function": "_AsyncAnthropicCompletionsAdapter.create",
+    "pattern": "legacy_thread_bridge",
+    "occurrences": 1,
+    "classification": "unsupported_enforce",
+    "evidence": "test_threaded_transport_admission.py; unowned legacy worker denied before start/physical lease"
+  },
+  {
+    "file": "agent/auxiliary_client.py",
+    "function": "_AsyncBedrockCompletionsAdapter.create",
+    "pattern": "legacy_thread_bridge",
+    "occurrences": 1,
+    "classification": "unsupported_enforce",
+    "evidence": "test_threaded_transport_admission.py; unowned legacy worker denied before start/physical lease"
+  },
+  {
+    "file": "agent/auxiliary_client.py",
+    "function": "_AsyncCodexCompletionsAdapter.create",
+    "pattern": "legacy_thread_bridge",
+    "occurrences": 1,
+    "classification": "unsupported_enforce",
+    "evidence": "test_threaded_transport_admission.py; unowned legacy worker denied before start/physical lease"
+  },
+  {
+    "file": "agent/auxiliary_client.py",
+    "function": "_CodexCompletionsAdapter.create",
+    "pattern": "responses.create",
+    "occurrences": 1,
+    "classification": "auxiliary_physical",
+    "evidence": "bound Responses physical seam; missing actual output ceiling is UNSUPPORTED_OUTPUT_BOUND, no cap injection; Codex OAuth is not admitted"
+  },
+  {
+    "file": "agent/auxiliary_client.py",
+    "function": "_acreate_with_stream",
+    "pattern": "chat.completions.create",
+    "occurrences": 1,
+    "classification": "auxiliary_physical",
+    "evidence": "bound SDK factories plus _relay_* dispatch; test_auxiliary_dispatch_governor.py, test_physical_sdk_matrix.py; threaded facades separately unsupported"
+  },
+  {
+    "file": "agent/auxiliary_client.py",
+    "function": "_async_call_llm_impl._acreate",
+    "pattern": "chat.completions.create",
+    "occurrences": 1,
+    "classification": "auxiliary_physical",
+    "evidence": "bound SDK factories plus _relay_* dispatch; test_auxiliary_dispatch_governor.py, test_physical_sdk_matrix.py; threaded facades separately unsupported"
+  },
+  {
+    "file": "agent/auxiliary_client.py",
+    "function": "_create_openai_client",
+    "pattern": "OpenAI",
+    "occurrences": 1,
+    "classification": "auxiliary_physical",
+    "evidence": "bound SDK factories plus _relay_* dispatch; test_auxiliary_dispatch_governor.py, test_physical_sdk_matrix.py; threaded facades separately unsupported"
+  },
+  {
+    "file": "agent/auxiliary_client.py",
+    "function": "_create_with_progress",
+    "pattern": "chat.completions.create",
+    "occurrences": 3,
+    "classification": "auxiliary_physical",
+    "evidence": "bound SDK factories plus _relay_* dispatch; test_auxiliary_dispatch_governor.py, test_physical_sdk_matrix.py; threaded facades separately unsupported"
+  },
+  {
+    "file": "agent/auxiliary_client.py",
+    "function": "_relay_async_completion",
+    "pattern": "chat.completions.create",
+    "occurrences": 1,
+    "classification": "auxiliary_physical",
+    "evidence": "bound SDK factories plus _relay_* dispatch; test_auxiliary_dispatch_governor.py, test_physical_sdk_matrix.py; threaded facades separately unsupported"
+  },
+  {
+    "file": "agent/auxiliary_client.py",
+    "function": "_relay_sync_completion",
+    "pattern": "chat.completions.create",
+    "occurrences": 1,
+    "classification": "auxiliary_physical",
+    "evidence": "bound SDK factories plus _relay_* dispatch; test_auxiliary_dispatch_governor.py, test_physical_sdk_matrix.py; threaded facades separately unsupported"
+  },
+  {
+    "file": "agent/auxiliary_client.py",
+    "function": "_relay_sync_stream.callback",
+    "pattern": "chat.completions.create",
+    "occurrences": 1,
+    "classification": "auxiliary_physical",
+    "evidence": "bound SDK factories plus _relay_* dispatch; test_auxiliary_dispatch_governor.py, test_physical_sdk_matrix.py; threaded facades separately unsupported"
+  },
+  {
+    "file": "agent/auxiliary_client.py",
+    "function": "_resolve_api_key_provider",
+    "pattern": "GeminiNativeClient",
+    "occurrences": 2,
+    "classification": "auxiliary_physical",
+    "evidence": "bound SDK factories plus _relay_* dispatch; test_auxiliary_dispatch_governor.py, test_physical_sdk_matrix.py; threaded facades separately unsupported"
+  },
+  {
+    "file": "agent/auxiliary_client.py",
+    "function": "_run_protected_sync_provider_call",
+    "pattern": "unsupported_transport_scope",
+    "occurrences": 1,
+    "classification": "unsupported_enforce",
+    "evidence": "test_threaded_transport_admission.py; unowned legacy worker denied before start/physical lease"
+  },
+  {
+    "file": "agent/auxiliary_client.py",
+    "function": "_to_async_client",
+    "pattern": "AsyncGeminiNativeClient",
+    "occurrences": 1,
+    "classification": "auxiliary_physical",
+    "evidence": "bound SDK factories plus _relay_* dispatch; test_auxiliary_dispatch_governor.py, test_physical_sdk_matrix.py; threaded facades separately unsupported"
+  },
+  {
+    "file": "agent/auxiliary_client.py",
+    "function": "_to_async_client",
+    "pattern": "AsyncOpenAI",
+    "occurrences": 1,
+    "classification": "auxiliary_physical",
+    "evidence": "bound SDK factories plus _relay_* dispatch; test_auxiliary_dispatch_governor.py, test_physical_sdk_matrix.py; threaded facades separately unsupported"
+  },
+  {
+    "file": "agent/auxiliary_client.py",
+    "function": "resolve_provider_client",
+    "pattern": "GeminiNativeClient",
+    "occurrences": 1,
+    "classification": "auxiliary_physical",
+    "evidence": "bound SDK factories plus _relay_* dispatch; test_auxiliary_dispatch_governor.py, test_physical_sdk_matrix.py; threaded facades separately unsupported"
+  },
+  {
+    "file": "agent/auxiliary_client.py",
+    "function": "resolve_provider_client",
+    "pattern": "OpenAI",
+    "occurrences": 2,
+    "classification": "auxiliary_physical",
+    "evidence": "bound SDK factories plus _relay_* dispatch; test_auxiliary_dispatch_governor.py, test_physical_sdk_matrix.py; threaded facades separately unsupported"
+  },
+  {
+    "file": "agent/bedrock_adapter.py",
+    "function": "_get_bedrock_control_client",
+    "pattern": "boto3.client",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: agent/bedrock_adapter.py::_get_bedrock_control_client; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "agent/bedrock_adapter.py",
+    "function": "_get_bedrock_runtime_client",
+    "pattern": "boto3.client",
+    "occurrences": 1,
+    "classification": "adapter_physical",
+    "evidence": "prepared-body per-instance send; test_physical_sdk_matrix.py, test_bedrock_lease_stream.py, test_physical_probe_routes.py"
+  },
+  {
+    "file": "agent/bedrock_adapter.py",
+    "function": "call_converse",
+    "pattern": "converse",
+    "occurrences": 1,
+    "classification": "adapter_physical",
+    "evidence": "prepared-body per-instance send; test_physical_sdk_matrix.py, test_bedrock_lease_stream.py, test_physical_probe_routes.py"
+  },
+  {
+    "file": "agent/bedrock_adapter.py",
+    "function": "call_converse_stream",
+    "pattern": "converse",
+    "occurrences": 1,
+    "classification": "adapter_physical",
+    "evidence": "prepared-body per-instance send; test_physical_sdk_matrix.py, test_bedrock_lease_stream.py, test_physical_probe_routes.py"
+  },
+  {
+    "file": "agent/bedrock_adapter.py",
+    "function": "call_converse_stream",
+    "pattern": "converse_stream",
+    "occurrences": 1,
+    "classification": "adapter_physical",
+    "evidence": "prepared-body per-instance send; test_physical_sdk_matrix.py, test_bedrock_lease_stream.py, test_physical_probe_routes.py"
+  },
+  {
+    "file": "agent/bedrock_adapter.py",
+    "function": "probe_bedrock_context_length",
+    "pattern": "converse",
+    "occurrences": 1,
+    "classification": "adapter_physical",
+    "evidence": "prepared-body per-instance send; test_physical_sdk_matrix.py, test_bedrock_lease_stream.py, test_physical_probe_routes.py"
+  },
+  {
+    "file": "agent/chat_completion_helpers.py",
+    "function": "_dispatch_nonstreaming_api_request",
+    "pattern": "chat.completions.create",
+    "occurrences": 2,
+    "classification": "main_physical",
+    "evidence": "context_dispatch_physical_call and bound canonical SDK; test_physical_dispatch_governor.py; native Codex capless payloads remain unsupported"
+  },
+  {
+    "file": "agent/chat_completion_helpers.py",
+    "function": "_dispatch_nonstreaming_api_request",
+    "pattern": "converse",
+    "occurrences": 1,
+    "classification": "main_physical",
+    "evidence": "context_dispatch_physical_call and bound canonical SDK; test_physical_dispatch_governor.py; native Codex capless payloads remain unsupported"
+  },
+  {
+    "file": "agent/chat_completion_helpers.py",
+    "function": "handle_max_iterations",
+    "pattern": "chat.completions.create",
+    "occurrences": 2,
+    "classification": "main_physical",
+    "evidence": "context_dispatch_physical_call and bound canonical SDK; test_physical_dispatch_governor.py; native Codex capless payloads remain unsupported"
+  },
+  {
+    "file": "agent/chat_completion_helpers.py",
+    "function": "interruptible_streaming_api_call._bedrock_call",
+    "pattern": "stream",
+    "occurrences": 1,
+    "classification": "main_physical",
+    "evidence": "context_dispatch_physical_call and bound canonical SDK; test_physical_dispatch_governor.py; native Codex capless payloads remain unsupported"
+  },
+  {
+    "file": "agent/chat_completion_helpers.py",
+    "function": "interruptible_streaming_api_call._bedrock_call._open_bedrock_stream",
+    "pattern": "converse",
+    "occurrences": 1,
+    "classification": "main_physical",
+    "evidence": "context_dispatch_physical_call and bound canonical SDK; test_physical_dispatch_governor.py; native Codex capless payloads remain unsupported"
+  },
+  {
+    "file": "agent/chat_completion_helpers.py",
+    "function": "interruptible_streaming_api_call._bedrock_call._open_bedrock_stream",
+    "pattern": "converse_stream",
+    "occurrences": 1,
+    "classification": "main_physical",
+    "evidence": "context_dispatch_physical_call and bound canonical SDK; test_physical_dispatch_governor.py; native Codex capless payloads remain unsupported"
+  },
+  {
+    "file": "agent/chat_completion_helpers.py",
+    "function": "interruptible_streaming_api_call._call_anthropic",
+    "pattern": "stream",
+    "occurrences": 1,
+    "classification": "main_physical",
+    "evidence": "context_dispatch_physical_call and bound canonical SDK; test_physical_dispatch_governor.py; native Codex capless payloads remain unsupported"
+  },
+  {
+    "file": "agent/chat_completion_helpers.py",
+    "function": "interruptible_streaming_api_call._call_anthropic._open_anthropic_stream",
+    "pattern": "messages.stream",
+    "occurrences": 1,
+    "classification": "main_physical",
+    "evidence": "context_dispatch_physical_call and bound canonical SDK; test_physical_dispatch_governor.py; native Codex capless payloads remain unsupported"
+  },
+  {
+    "file": "agent/chat_completion_helpers.py",
+    "function": "interruptible_streaming_api_call._call_chat_completions",
+    "pattern": "stream",
+    "occurrences": 1,
+    "classification": "main_physical",
+    "evidence": "context_dispatch_physical_call and bound canonical SDK; test_physical_dispatch_governor.py; native Codex capless payloads remain unsupported"
+  },
+  {
+    "file": "agent/chat_completion_helpers.py",
+    "function": "interruptible_streaming_api_call._call_chat_completions._open_stream",
+    "pattern": "chat.completions.create",
+    "occurrences": 1,
+    "classification": "main_physical",
+    "evidence": "context_dispatch_physical_call and bound canonical SDK; test_physical_dispatch_governor.py; native Codex capless payloads remain unsupported"
+  },
+  {
+    "file": "agent/codex_runtime.py",
+    "function": "run_codex_stream",
+    "pattern": "stream",
+    "occurrences": 1,
+    "classification": "main_physical",
+    "evidence": "context_dispatch_physical_call and bound canonical SDK; test_physical_dispatch_governor.py; native Codex capless payloads remain unsupported"
+  },
+  {
+    "file": "agent/codex_runtime.py",
+    "function": "run_codex_stream._open_codex_stream",
+    "pattern": "responses.create",
+    "occurrences": 1,
+    "classification": "main_physical",
+    "evidence": "context_dispatch_physical_call and bound canonical SDK; test_physical_dispatch_governor.py; native Codex capless payloads remain unsupported"
+  },
+  {
+    "file": "agent/gemini_native_adapter.py",
+    "function": "AsyncGeminiNativeClient._create_chat_completion",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "adapter_physical",
+    "evidence": "sync/async bound httpx; test_transport_deadline.py, test_transport_wire_bounds.py, test_physical_probe_routes.py"
+  },
+  {
+    "file": "agent/gemini_native_adapter.py",
+    "function": "AsyncGeminiNativeClient._stream_completion",
+    "pattern": "stream",
+    "occurrences": 1,
+    "classification": "adapter_physical",
+    "evidence": "sync/async bound httpx; test_transport_deadline.py, test_transport_wire_bounds.py, test_physical_probe_routes.py"
+  },
+  {
+    "file": "agent/gemini_native_adapter.py",
+    "function": "GeminiNativeClient._create_chat_completion",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "adapter_physical",
+    "evidence": "sync/async bound httpx; test_transport_deadline.py, test_transport_wire_bounds.py, test_physical_probe_routes.py"
+  },
+  {
+    "file": "agent/gemini_native_adapter.py",
+    "function": "GeminiNativeClient._stream_completion._generator",
+    "pattern": "stream",
+    "occurrences": 1,
+    "classification": "adapter_physical",
+    "evidence": "sync/async bound httpx; test_transport_deadline.py, test_transport_wire_bounds.py, test_physical_probe_routes.py"
+  },
+  {
+    "file": "agent/gemini_native_adapter.py",
+    "function": "probe_gemini_tier",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "adapter_physical",
+    "evidence": "sync/async bound httpx; test_transport_deadline.py, test_transport_wire_bounds.py, test_physical_probe_routes.py"
+  },
+  {
+    "file": "agent/model_metadata.py",
+    "function": "_query_local_context_length_uncached",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: agent/model_metadata.py::_query_local_context_length_uncached; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "agent/model_metadata.py",
+    "function": "_query_ollama_api_show_uncached",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: agent/model_metadata.py::_query_ollama_api_show_uncached; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "agent/model_metadata.py",
+    "function": "query_ollama_num_ctx",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: agent/model_metadata.py::query_ollama_num_ctx; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "agent/model_metadata.py",
+    "function": "query_ollama_supports_vision",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: agent/model_metadata.py::query_ollama_supports_vision; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "agent/pet/store.py",
+    "function": "_download",
+    "pattern": "stream",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: agent/pet/store.py::_download; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "agent/proxy_sources/iron_proxy.py",
+    "function": "_http_download",
+    "pattern": "urlopen",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: agent/proxy_sources/iron_proxy.py::_http_download; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "agent/proxy_sources/iron_proxy.py",
+    "function": "reload_proxy",
+    "pattern": "urlopen",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: agent/proxy_sources/iron_proxy.py::reload_proxy; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "agent/relay_llm.py",
+    "function": "stream_current",
+    "pattern": "stream",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: agent/relay_llm.py::stream_current; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "agent/secret_sources/bitwarden.py",
+    "function": "_http_download",
+    "pattern": "urlopen",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: agent/secret_sources/bitwarden.py::_http_download; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "agent/transports/codex_app_server.py",
+    "function": "CodexAppServerClient.initialize",
+    "pattern": "request",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: agent/transports/codex_app_server.py::CodexAppServerClient.initialize; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "agent/transports/codex_app_server.py",
+    "function": "CodexAppServerClient.request",
+    "pattern": "unsupported_transport_scope",
+    "occurrences": 1,
+    "classification": "unsupported_enforce",
+    "evidence": "test_threaded_transport_admission.py; no provider-authorizing native RPC admission"
+  },
+  {
+    "file": "agent/transports/codex_app_server_session.py",
+    "function": "CodexAppServerSession._compact_thread",
+    "pattern": "request",
+    "occurrences": 2,
+    "classification": "unsupported_enforce",
+    "evidence": "CodexAppServerClient.request closed control-plane allowlist; test_threaded_transport_admission.py; no native physical-send conformance"
+  },
+  {
+    "file": "agent/transports/codex_app_server_session.py",
+    "function": "CodexAppServerSession._ensure_started",
+    "pattern": "request",
+    "occurrences": 2,
+    "classification": "not_inference",
+    "evidence": "source review: agent/transports/codex_app_server_session.py::CodexAppServerSession._ensure_started; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "agent/transports/codex_app_server_session.py",
+    "function": "CodexAppServerSession._issue_interrupt",
+    "pattern": "request",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: agent/transports/codex_app_server_session.py::CodexAppServerSession._issue_interrupt; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "agent/transports/codex_app_server_session.py",
+    "function": "CodexAppServerSession._run_turn",
+    "pattern": "request",
+    "occurrences": 1,
+    "classification": "unsupported_enforce",
+    "evidence": "CodexAppServerClient.request closed control-plane allowlist; test_threaded_transport_admission.py; no native physical-send conformance"
+  },
+  {
+    "file": "agent/transports/codex_app_server_session.py",
+    "function": "CodexAppServerSession.request_steer",
+    "pattern": "request",
+    "occurrences": 1,
+    "classification": "unsupported_enforce",
+    "evidence": "CodexAppServerClient.request closed control-plane allowlist; test_threaded_transport_admission.py; no native physical-send conformance"
+  },
+  {
+    "file": "agent/transports/ri_llm.py",
+    "function": "RiPipeline.call",
+    "pattern": "_native.call",
+    "occurrences": 1,
+    "classification": "unsupported_enforce",
+    "evidence": "unsupported_transport_scope before native Rust; test_unsupported_native_dispatch.py"
+  },
+  {
+    "file": "agent/transports/ri_llm.py",
+    "function": "RiPipeline.call",
+    "pattern": "unsupported_transport_scope",
+    "occurrences": 1,
+    "classification": "unsupported_enforce",
+    "evidence": "unsupported_transport_scope before native Rust; test_unsupported_native_dispatch.py"
+  },
+  {
+    "file": "agent/transports/ri_llm.py",
+    "function": "RiPipeline.call_structured",
+    "pattern": "_native.call_structured",
+    "occurrences": 1,
+    "classification": "unsupported_enforce",
+    "evidence": "unsupported_transport_scope before native Rust; test_unsupported_native_dispatch.py"
+  },
+  {
+    "file": "agent/transports/ri_llm.py",
+    "function": "RiPipeline.call_structured",
+    "pattern": "unsupported_transport_scope",
+    "occurrences": 1,
+    "classification": "unsupported_enforce",
+    "evidence": "unsupported_transport_scope before native Rust; test_unsupported_native_dispatch.py"
+  },
+  {
+    "file": "agent/verify/runner.py",
+    "function": "_poll_readiness",
+    "pattern": "urlopen",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: agent/verify/runner.py::_poll_readiness; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "agent/video_gen_provider.py",
+    "function": "OpenAICompatibleVideoGenProvider.generate",
+    "pattern": "OpenAI",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: agent/video_gen_provider.py::OpenAICompatibleVideoGenProvider.generate; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "ares_runtime/bedrock_lease.py",
+    "function": "_Raw.read",
+    "pattern": "stream",
+    "occurrences": 1,
+    "classification": "adapter_physical",
+    "evidence": "transport executor/stream owner (not an extra independent send); test_physical_http_transport.py, test_transport_stream_ownership.py, test_bedrock_lease_stream.py"
+  },
+  {
+    "file": "ares_runtime/physical_dispatch.py",
+    "function": "_BotocoreBody.stream",
+    "pattern": "stream",
+    "occurrences": 1,
+    "classification": "adapter_physical",
+    "evidence": "transport executor/stream owner (not an extra independent send); test_physical_http_transport.py, test_transport_stream_ownership.py, test_bedrock_lease_stream.py"
+  },
+  {
+    "file": "ares_runtime/physical_dispatch.py",
+    "function": "bind_bedrock_client.send_once",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "adapter_physical",
+    "evidence": "transport executor/stream owner (not an extra independent send); test_physical_http_transport.py, test_transport_stream_ownership.py, test_bedrock_lease_stream.py"
+  },
+  {
+    "file": "ares_runtime/physical_dispatch.py",
+    "function": "legacy_thread_bridge",
+    "pattern": "unsupported_transport_scope",
+    "occurrences": 1,
+    "classification": "unsupported_enforce",
+    "evidence": "transport executor/stream owner (not an extra independent send); test_physical_http_transport.py, test_transport_stream_ownership.py, test_bedrock_lease_stream.py"
+  },
+  {
+    "file": "cli.py",
+    "function": "_apply_bracketed_paste_timeout_patch._patched_vt100_feed",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: cli.py::_apply_bracketed_paste_timeout_patch._patched_vt100_feed; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/browser_control_broker.py",
+    "function": "BrowserControlBroker._emit_cancel_frames",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/browser_control_broker.py::BrowserControlBroker._emit_cancel_frames; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/browser_control_broker.py",
+    "function": "BrowserControlBroker.attach",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/browser_control_broker.py::BrowserControlBroker.attach; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/browser_control_broker.py",
+    "function": "BrowserControlBroker.dispatch",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/browser_control_broker.py::BrowserControlBroker.dispatch; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/delivery.py",
+    "function": "DeliveryRouter._deliver_to_platform",
+    "pattern": "send",
+    "occurrences": 2,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/delivery.py::DeliveryRouter._deliver_to_platform; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/delivery.py",
+    "function": "DeliveryTransport.send",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/delivery.py::DeliveryTransport.send; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/kanban_watchers.py",
+    "function": "GatewayKanbanWatchersMixin._kanban_notifier_watcher",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/kanban_watchers.py::GatewayKanbanWatchersMixin._kanban_notifier_watcher; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/base.py",
+    "function": "BasePlatformAdapter._notify_media_delivery_failure",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/base.py::BasePlatformAdapter._notify_media_delivery_failure; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/base.py",
+    "function": "BasePlatformAdapter._process_message_background",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/base.py::BasePlatformAdapter._process_message_background; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/base.py",
+    "function": "BasePlatformAdapter._send_with_retry",
+    "pattern": "send",
+    "occurrences": 4,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/base.py::BasePlatformAdapter._send_with_retry; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/base.py",
+    "function": "BasePlatformAdapter.send_clarify",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/base.py::BasePlatformAdapter.send_clarify; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/base.py",
+    "function": "BasePlatformAdapter.send_document",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/base.py::BasePlatformAdapter.send_document; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/base.py",
+    "function": "BasePlatformAdapter.send_image",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/base.py::BasePlatformAdapter.send_image; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/base.py",
+    "function": "BasePlatformAdapter.send_image_file",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/base.py::BasePlatformAdapter.send_image_file; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/base.py",
+    "function": "BasePlatformAdapter.send_private_notice",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/base.py::BasePlatformAdapter.send_private_notice; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/base.py",
+    "function": "BasePlatformAdapter.send_video",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/base.py::BasePlatformAdapter.send_video; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/base.py",
+    "function": "BasePlatformAdapter.send_voice",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/base.py::BasePlatformAdapter.send_voice; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/base.py",
+    "function": "cache_audio_from_url",
+    "pattern": "stream",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/base.py::cache_audio_from_url; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/base.py",
+    "function": "cache_image_from_url",
+    "pattern": "stream",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/base.py::cache_image_from_url; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/bluebubbles.py",
+    "function": "BlueBubblesAdapter._api_post",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/bluebubbles.py::BlueBubblesAdapter._api_post; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/bluebubbles.py",
+    "function": "BlueBubblesAdapter._send_attachment",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/bluebubbles.py::BlueBubblesAdapter._send_attachment; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/bluebubbles.py",
+    "function": "BlueBubblesAdapter._send_attachment",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/bluebubbles.py::BlueBubblesAdapter._send_attachment; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/bluebubbles.py",
+    "function": "BlueBubblesAdapter.mark_read",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/bluebubbles.py::BlueBubblesAdapter.mark_read; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/bluebubbles.py",
+    "function": "BlueBubblesAdapter.send_typing",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/bluebubbles.py::BlueBubblesAdapter.send_typing; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/qqbot/adapter.py",
+    "function": "QQAdapter._api_request",
+    "pattern": "request",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/qqbot/adapter.py::QQAdapter._api_request; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/qqbot/adapter.py",
+    "function": "QQAdapter._call_stt",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/qqbot/adapter.py::QQAdapter._call_stt; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/qqbot/adapter.py",
+    "function": "QQAdapter._ensure_token",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/qqbot/adapter.py::QQAdapter._ensure_token; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/qqbot/adapter.py",
+    "function": "QQAdapter.send_image",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/qqbot/adapter.py::QQAdapter.send_image; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/qqbot/onboard.py",
+    "function": "_create_bind_task",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/qqbot/onboard.py::_create_bind_task; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/qqbot/onboard.py",
+    "function": "_poll_bind_result",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/qqbot/onboard.py::_poll_bind_result; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/signal.py",
+    "function": "SignalAdapter._notify_batch_pacing",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/signal.py::SignalAdapter._notify_batch_pacing; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/signal.py",
+    "function": "SignalAdapter._rpc",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/signal.py::SignalAdapter._rpc; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/signal.py",
+    "function": "SignalAdapter._sse_listener",
+    "pattern": "stream",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/signal.py::SignalAdapter._sse_listener; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/webhook.py",
+    "function": "WebhookAdapter._deliver_cross_platform",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/webhook.py::WebhookAdapter._deliver_cross_platform; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/weixin.py",
+    "function": "_api_post._do",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/weixin.py::_api_post._do; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/weixin.py",
+    "function": "_upload_ciphertext._do_upload",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/weixin.py::_upload_ciphertext._do_upload; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/weixin.py",
+    "function": "send_weixin_direct",
+    "pattern": "send",
+    "occurrences": 2,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/weixin.py::send_weixin_direct; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/whatsapp_cloud.py",
+    "function": "WhatsAppCloudAdapter._dispatch_interactive_reply",
+    "pattern": "send",
+    "occurrences": 3,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/whatsapp_cloud.py::WhatsAppCloudAdapter._dispatch_interactive_reply; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/whatsapp_cloud.py",
+    "function": "WhatsAppCloudAdapter._post_interactive",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/whatsapp_cloud.py::WhatsAppCloudAdapter._post_interactive; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/whatsapp_cloud.py",
+    "function": "WhatsAppCloudAdapter._send_media",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/whatsapp_cloud.py::WhatsAppCloudAdapter._send_media; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/whatsapp_cloud.py",
+    "function": "WhatsAppCloudAdapter._upload_media",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/whatsapp_cloud.py::WhatsAppCloudAdapter._upload_media; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/whatsapp_cloud.py",
+    "function": "WhatsAppCloudAdapter.send",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/whatsapp_cloud.py::WhatsAppCloudAdapter.send; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/whatsapp_cloud.py",
+    "function": "WhatsAppCloudAdapter.send_clarify",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/whatsapp_cloud.py::WhatsAppCloudAdapter.send_clarify; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/whatsapp_cloud.py",
+    "function": "WhatsAppCloudAdapter.send_typing",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/whatsapp_cloud.py::WhatsAppCloudAdapter.send_typing; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/yuanbao.py",
+    "function": "ConnectionManager._authenticate",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/yuanbao.py::ConnectionManager._authenticate; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/yuanbao.py",
+    "function": "ConnectionManager._handle_frame",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/yuanbao.py::ConnectionManager._handle_frame; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/yuanbao.py",
+    "function": "ConnectionManager._heartbeat_loop",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/yuanbao.py::ConnectionManager._heartbeat_loop; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/yuanbao.py",
+    "function": "ConnectionManager.send_biz_request",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/yuanbao.py::ConnectionManager.send_biz_request; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/yuanbao.py",
+    "function": "HeartbeatManager.send_heartbeat_once",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/yuanbao.py::HeartbeatManager.send_heartbeat_once; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/yuanbao.py",
+    "function": "MessageSender.send_direct",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/yuanbao.py::MessageSender.send_direct; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/yuanbao.py",
+    "function": "OwnerCommandMiddleware.handle",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/yuanbao.py::OwnerCommandMiddleware.handle; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/yuanbao.py",
+    "function": "SignManager.fetch",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/yuanbao.py::SignManager.fetch; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/yuanbao.py",
+    "function": "YuanbaoAdapter.send_dm",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/yuanbao.py::YuanbaoAdapter.send_dm; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/yuanbao_media.py",
+    "function": "download_url",
+    "pattern": "stream",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/yuanbao_media.py::download_url; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/platforms/yuanbao_media.py",
+    "function": "get_cos_credentials",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/platforms/yuanbao_media.py::get_cos_credentials; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/relay/__init__.py",
+    "function": "_post_policy",
+    "pattern": "urlopen",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/relay/__init__.py::_post_policy; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/relay/__init__.py",
+    "function": "_post_provision",
+    "pattern": "urlopen",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/relay/__init__.py::_post_provision; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/relay/__init__.py",
+    "function": "_resolve_relay_identity_token",
+    "pattern": "urlopen",
+    "occurrences": 2,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/relay/__init__.py::_resolve_relay_identity_token; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/relay/adapter.py",
+    "function": "RelayAdapter._send_lifecycle_ack._ack",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/relay/adapter.py::RelayAdapter._send_lifecycle_ack._ack; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/relay/media.py",
+    "function": "RelayMediaClient.download._get",
+    "pattern": "urlopen",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/relay/media.py::RelayMediaClient.download._get; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/relay/media.py",
+    "function": "RelayMediaClient.upload._post",
+    "pattern": "urlopen",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/relay/media.py::RelayMediaClient.upload._post; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/relay/ws_transport.py",
+    "function": "WebSocketRelayTransport._send",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/relay/ws_transport.py::WebSocketRelayTransport._send; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/run.py",
+    "function": "GatewayRunner._check_session_stalls",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/run.py::GatewayRunner._check_session_stalls; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/run.py",
+    "function": "GatewayRunner._deliver_platform_notice",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/run.py::GatewayRunner._deliver_platform_notice; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/run.py",
+    "function": "GatewayRunner._deliver_queued_first_response",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/run.py::GatewayRunner._deliver_queued_first_response; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/run.py",
+    "function": "GatewayRunner._echo_pending_stt_transcripts_once",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/run.py::GatewayRunner._echo_pending_stt_transcripts_once; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/run.py",
+    "function": "GatewayRunner._ensure_telegram_system_topic",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/run.py::GatewayRunner._ensure_telegram_system_topic; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/run.py",
+    "function": "GatewayRunner._handle_message",
+    "pattern": "send",
+    "occurrences": 5,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/run.py::GatewayRunner._handle_message; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/run.py",
+    "function": "GatewayRunner._handle_message_with_agent",
+    "pattern": "send",
+    "occurrences": 5,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/run.py::GatewayRunner._handle_message_with_agent; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/run.py",
+    "function": "GatewayRunner._handle_voice_channel_input",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/run.py::GatewayRunner._handle_voice_channel_input; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/run.py",
+    "function": "GatewayRunner._notify_active_sessions_of_shutdown",
+    "pattern": "send",
+    "occurrences": 3,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/run.py::GatewayRunner._notify_active_sessions_of_shutdown; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/run.py",
+    "function": "GatewayRunner._notify_interrupted_cron_jobs",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/run.py::GatewayRunner._notify_interrupted_cron_jobs; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/run.py",
+    "function": "GatewayRunner._prepare_inbound_message_text",
+    "pattern": "send",
+    "occurrences": 2,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/run.py::GatewayRunner._prepare_inbound_message_text; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/run.py",
+    "function": "GatewayRunner._process_handoff",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/run.py::GatewayRunner._process_handoff; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/run.py",
+    "function": "GatewayRunner._redeliver_claimed_obligations",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/run.py::GatewayRunner._redeliver_claimed_obligations; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/run.py",
+    "function": "GatewayRunner._run_agent_inner",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/run.py::GatewayRunner._run_agent_inner; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/run.py",
+    "function": "GatewayRunner._run_agent_inner._notify_long_running",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/run.py::GatewayRunner._run_agent_inner._notify_long_running; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/run.py",
+    "function": "GatewayRunner._run_agent_via_proxy",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/run.py::GatewayRunner._run_agent_via_proxy; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/run.py",
+    "function": "GatewayRunner._run_background_task_inner",
+    "pattern": "send",
+    "occurrences": 5,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/run.py::GatewayRunner._run_background_task_inner; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/run.py",
+    "function": "GatewayRunner._run_process_watcher",
+    "pattern": "send",
+    "occurrences": 2,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/run.py::GatewayRunner._run_process_watcher; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/run.py",
+    "function": "GatewayRunner._send_goal_status_notice",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/run.py::GatewayRunner._send_goal_status_notice; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/run.py",
+    "function": "GatewayRunner._send_home_channel_startup_notifications",
+    "pattern": "send",
+    "occurrences": 2,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/run.py::GatewayRunner._send_home_channel_startup_notifications; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/run.py",
+    "function": "GatewayRunner._send_restart_notification",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/run.py::GatewayRunner._send_restart_notification; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/run.py",
+    "function": "GatewayRunner._send_session_db_warning_notifications",
+    "pattern": "send",
+    "occurrences": 2,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/run.py::GatewayRunner._send_session_db_warning_notifications; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/run.py",
+    "function": "GatewayRunner._send_update_notification",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/run.py::GatewayRunner._send_update_notification; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/run.py",
+    "function": "GatewayRunner._watch_update_progress",
+    "pattern": "send",
+    "occurrences": 4,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/run.py::GatewayRunner._watch_update_progress; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/run.py",
+    "function": "GatewayRunner._watch_update_progress._flush_buffer",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/run.py::GatewayRunner._watch_update_progress._flush_buffer; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/run.py",
+    "function": "TurnRunner._send_native_task_card_progress._send_or_edit_fallback",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/run.py::TurnRunner._send_native_task_card_progress._send_or_edit_fallback; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/run.py",
+    "function": "TurnRunner.run_sync._approval_notify_sync",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/run.py::TurnRunner.run_sync._approval_notify_sync; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/run.py",
+    "function": "TurnRunner.run_sync._deliver_bg_review_message",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/run.py::TurnRunner.run_sync._deliver_bg_review_message; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/run.py",
+    "function": "TurnRunner.run_sync._interim_assistant_cb",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/run.py::TurnRunner.run_sync._interim_assistant_cb; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/run.py",
+    "function": "TurnRunner.send_progress_messages",
+    "pattern": "send",
+    "occurrences": 3,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/run.py::TurnRunner.send_progress_messages; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/run.py",
+    "function": "TurnRunner.send_progress_messages._send_progress_text",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/run.py::TurnRunner.send_progress_messages._send_progress_text; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/run.py",
+    "function": "_send_or_update_status_coro",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/run.py::_send_or_update_status_coro; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/slash_commands.py",
+    "function": "GatewaySlashCommandsMixin._handle_approve_command",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/slash_commands.py::GatewaySlashCommandsMixin._handle_approve_command; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/slash_commands.py",
+    "function": "GatewaySlashCommandsMixin._handle_deny_command",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/slash_commands.py::GatewaySlashCommandsMixin._handle_deny_command; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/stream_consumer.py",
+    "function": "GatewayStreamConsumer._flush_segment_tail_on_edit_failure",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/stream_consumer.py::GatewayStreamConsumer._flush_segment_tail_on_edit_failure; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/stream_consumer.py",
+    "function": "GatewayStreamConsumer._handle_approval_boundary",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/stream_consumer.py::GatewayStreamConsumer._handle_approval_boundary; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/stream_consumer.py",
+    "function": "GatewayStreamConsumer._send_commentary",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/stream_consumer.py::GatewayStreamConsumer._send_commentary; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/stream_consumer.py",
+    "function": "GatewayStreamConsumer._send_empty_fallback_final",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/stream_consumer.py::GatewayStreamConsumer._send_empty_fallback_final; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/stream_consumer.py",
+    "function": "GatewayStreamConsumer._send_fallback_final",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/stream_consumer.py::GatewayStreamConsumer._send_fallback_final; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/stream_consumer.py",
+    "function": "GatewayStreamConsumer._send_new_chunk",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/stream_consumer.py::GatewayStreamConsumer._send_new_chunk; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/stream_consumer.py",
+    "function": "GatewayStreamConsumer._send_or_edit",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/stream_consumer.py::GatewayStreamConsumer._send_or_edit; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/stream_consumer.py",
+    "function": "GatewayStreamConsumer._try_fresh_final",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/stream_consumer.py::GatewayStreamConsumer._try_fresh_final; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/streaming_tts_consumer.py",
+    "function": "StreamingTTSConsumer._iter_stream_chunks",
+    "pattern": "stream",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/streaming_tts_consumer.py::StreamingTTSConsumer._iter_stream_chunks; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/systemd_notify.py",
+    "function": "notify",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/systemd_notify.py::notify; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "gateway/wake.py",
+    "function": "_self_post_chat_completion",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: gateway/wake.py::_self_post_chat_completion; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/auth.py",
+    "function": "_codex_device_code_login",
+    "pattern": "post",
+    "occurrences": 3,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/auth.py::_codex_device_code_login; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/auth.py",
+    "function": "_minimax_post_form",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/auth.py::_minimax_post_form; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/auth.py",
+    "function": "_poll_for_token",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/auth.py::_poll_for_token; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/auth.py",
+    "function": "_probe_single_zai_endpoint",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "unsupported_enforce",
+    "evidence": "unsupported_transport_scope before raw transport; test_raw_inference_admission.py"
+  },
+  {
+    "file": "hermes_cli/auth.py",
+    "function": "_probe_single_zai_endpoint",
+    "pattern": "unsupported_transport_scope",
+    "occurrences": 1,
+    "classification": "unsupported_enforce",
+    "evidence": "unsupported_transport_scope before raw transport; test_raw_inference_admission.py"
+  },
+  {
+    "file": "hermes_cli/auth.py",
+    "function": "_refresh_access_token",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/auth.py::_refresh_access_token; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/auth.py",
+    "function": "_refresh_qwen_cli_tokens",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/auth.py::_refresh_qwen_cli_tokens; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/auth.py",
+    "function": "_refresh_spotify_oauth_state",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/auth.py::_refresh_spotify_oauth_state; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/auth.py",
+    "function": "_request_device_code",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/auth.py::_request_device_code; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/auth.py",
+    "function": "_spotify_exchange_code_for_tokens",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/auth.py::_spotify_exchange_code_for_tokens; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/auth.py",
+    "function": "_xai_oauth_poll_device_token",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/auth.py::_xai_oauth_poll_device_token; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/auth.py",
+    "function": "_xai_oauth_request_device_code",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/auth.py::_xai_oauth_request_device_code; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/auth.py",
+    "function": "refresh_codex_oauth_pure",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/auth.py::refresh_codex_oauth_pure; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/auth.py",
+    "function": "refresh_xai_oauth_pure",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/auth.py::refresh_xai_oauth_pure; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/auth_commands.py",
+    "function": "_interactive_auth",
+    "pattern": "boto3.client",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/auth_commands.py::_interactive_auth; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/banner.py",
+    "function": "_github_compare_behind",
+    "pattern": "urlopen",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/banner.py::_github_compare_behind; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/browser_connect.py",
+    "function": "is_browser_debug_ready",
+    "pattern": "urlopen",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/browser_connect.py::is_browser_debug_ready; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/codex_runtime_plugin_migration.py",
+    "function": "_query_codex_plugins",
+    "pattern": "request",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/codex_runtime_plugin_migration.py::_query_codex_plugins; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/copilot_auth.py",
+    "function": "copilot_device_code_login",
+    "pattern": "urlopen",
+    "occurrences": 2,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/copilot_auth.py::copilot_device_code_login; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/copilot_auth.py",
+    "function": "exchange_copilot_token",
+    "pattern": "urlopen",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/copilot_auth.py::exchange_copilot_token; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/dashboard_auth/routes.py",
+    "function": "api_auth_ws_ticket",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/dashboard_auth/routes.py::api_auth_ws_ticket; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/dashboard_auth/routes.py",
+    "function": "auth_logout",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/dashboard_auth/routes.py::auth_logout; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/dashboard_auth/routes.py",
+    "function": "auth_native_refresh",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/dashboard_auth/routes.py::auth_native_refresh; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/dashboard_auth/routes.py",
+    "function": "auth_native_token",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/dashboard_auth/routes.py::auth_native_token; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/dashboard_auth/routes.py",
+    "function": "auth_password_login",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/dashboard_auth/routes.py::auth_password_login; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/dashboard_register.py",
+    "function": "_register_self_hosted_client",
+    "pattern": "urlopen",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/dashboard_register.py::_register_self_hosted_client; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/debug.py",
+    "function": "_upload_dpaste_com",
+    "pattern": "urlopen",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/debug.py::_upload_dpaste_com; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/debug.py",
+    "function": "_upload_paste_rs",
+    "pattern": "urlopen",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/debug.py::_upload_paste_rs; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/debug.py",
+    "function": "delete_paste",
+    "pattern": "urlopen",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/debug.py::delete_paste; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/diagnostics_upload.py",
+    "function": "put_bundle",
+    "pattern": "urlopen",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/diagnostics_upload.py::put_bundle; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/diagnostics_upload.py",
+    "function": "request_upload_url",
+    "pattern": "urlopen",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/diagnostics_upload.py::request_upload_url; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/dingtalk_auth.py",
+    "function": "_api_post",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/dingtalk_auth.py::_api_post; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/doctor.py",
+    "function": "run_doctor._probe_bedrock",
+    "pattern": "boto3.client",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/doctor.py::run_doctor._probe_bedrock; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/gateway_enroll.py",
+    "function": "_post_enroll",
+    "pattern": "urlopen",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/gateway_enroll.py::_post_enroll; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/memory_oauth.py",
+    "function": "start_memory_oauth",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/memory_oauth.py::start_memory_oauth; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/model_catalog.py",
+    "function": "_fetch_manifest",
+    "pattern": "urlopen",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/model_catalog.py::_fetch_manifest; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/models.py",
+    "function": "_fetch_ai_gateway_models",
+    "pattern": "urlopen",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/models.py::_fetch_ai_gateway_models; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/models.py",
+    "function": "fetch_ai_gateway_models",
+    "pattern": "urlopen",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/models.py::fetch_ai_gateway_models; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/models.py",
+    "function": "fetch_ai_gateway_pricing",
+    "pattern": "urlopen",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/models.py::fetch_ai_gateway_pricing; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/models.py",
+    "function": "ollama_model_supports_thinking",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/models.py::ollama_model_supports_thinking; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/models.py",
+    "function": "probe_opencode_free_execution",
+    "pattern": "unsupported_transport_scope",
+    "occurrences": 1,
+    "classification": "unsupported_enforce",
+    "evidence": "unsupported_transport_scope before raw transport; test_raw_inference_admission.py"
+  },
+  {
+    "file": "hermes_cli/models.py",
+    "function": "probe_opencode_free_execution",
+    "pattern": "urlopen",
+    "occurrences": 1,
+    "classification": "unsupported_enforce",
+    "evidence": "unsupported_transport_scope before raw transport; test_raw_inference_admission.py"
+  },
+  {
+    "file": "hermes_cli/nous_account.py",
+    "function": "_fetch_nous_account_info",
+    "pattern": "urlopen",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/nous_account.py::_fetch_nous_account_info; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/nous_billing.py",
+    "function": "_request",
+    "pattern": "urlopen",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/nous_billing.py::_request; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/proxy/server.py",
+    "function": "create_app.handle_proxy._send_upstream",
+    "pattern": "request",
+    "occurrences": 1,
+    "classification": "unsupported_enforce",
+    "evidence": "unsupported_transport_scope before raw transport; test_raw_inference_admission.py"
+  },
+  {
+    "file": "hermes_cli/proxy/server.py",
+    "function": "create_app.handle_proxy._send_upstream",
+    "pattern": "unsupported_transport_scope",
+    "occurrences": 1,
+    "classification": "unsupported_enforce",
+    "evidence": "unsupported_transport_scope before raw transport; test_raw_inference_admission.py"
+  },
+  {
+    "file": "hermes_cli/security_audit.py",
+    "function": "_http_get_json",
+    "pattern": "urlopen",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/security_audit.py::_http_get_json; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/security_audit.py",
+    "function": "_http_post_json",
+    "pattern": "urlopen",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/security_audit.py::_http_post_json; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/skills_hub.py",
+    "function": "_github_publish",
+    "pattern": "post",
+    "occurrences": 3,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/skills_hub.py::_github_publish; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/subcommands/peer.py",
+    "function": "_request",
+    "pattern": "urlopen",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/subcommands/peer.py::_request; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/telegram_managed_bot.py",
+    "function": "create_pairing",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/telegram_managed_bot.py::create_pairing; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/tools_config.py",
+    "function": "_cua_release_endpoint_reachable",
+    "pattern": "urlopen",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/tools_config.py::_cua_release_endpoint_reachable; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_routers/cron.py",
+    "function": "create_cron_job",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_routers/cron.py::create_cron_job; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_routers/cron.py",
+    "function": "cron_fire_webhook",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_routers/cron.py::cron_fire_webhook; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_routers/cron.py",
+    "function": "instantiate_blueprint",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_routers/cron.py::instantiate_blueprint; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_routers/cron.py",
+    "function": "pause_cron_job",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_routers/cron.py::pause_cron_job; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_routers/cron.py",
+    "function": "resume_cron_job",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_routers/cron.py::resume_cron_job; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_routers/cron.py",
+    "function": "trigger_cron_job",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_routers/cron.py::trigger_cron_job; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_routers/git.py",
+    "function": "git_branch_switch_route",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_routers/git.py::git_branch_switch_route; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_routers/git.py",
+    "function": "git_commit_route",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_routers/git.py::git_commit_route; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_routers/git.py",
+    "function": "git_create_pr_route",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_routers/git.py::git_create_pr_route; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_routers/git.py",
+    "function": "git_pr_list_route",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_routers/git.py::git_pr_list_route; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_routers/git.py",
+    "function": "git_push_route",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_routers/git.py::git_push_route; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_routers/git.py",
+    "function": "git_revert_route",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_routers/git.py::git_revert_route; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_routers/git.py",
+    "function": "git_stage_route",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_routers/git.py::git_stage_route; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_routers/git.py",
+    "function": "git_unstage_route",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_routers/git.py::git_unstage_route; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_routers/git.py",
+    "function": "git_worktree_add_route",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_routers/git.py::git_worktree_add_route; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_routers/git.py",
+    "function": "git_worktree_remove_route",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_routers/git.py::git_worktree_remove_route; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_routers/mcp.py",
+    "function": "add_mcp_server",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_routers/mcp.py::add_mcp_server; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_routers/mcp.py",
+    "function": "auth_mcp_server",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_routers/mcp.py::auth_mcp_server; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_routers/mcp.py",
+    "function": "install_mcp_catalog_entry",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_routers/mcp.py::install_mcp_catalog_entry; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_routers/mcp.py",
+    "function": "test_mcp_server",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_routers/mcp.py::test_mcp_server; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_routers/profiles.py",
+    "function": "create_profile_endpoint",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_routers/profiles.py::create_profile_endpoint; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_routers/profiles.py",
+    "function": "describe_profile_auto_endpoint",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_routers/profiles.py::describe_profile_auto_endpoint; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_routers/profiles.py",
+    "function": "export_profile_endpoint",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_routers/profiles.py::export_profile_endpoint; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_routers/profiles.py",
+    "function": "import_profile_endpoint",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_routers/profiles.py::import_profile_endpoint; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_routers/profiles.py",
+    "function": "open_profile_terminal_endpoint",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_routers/profiles.py::open_profile_terminal_endpoint; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_routers/profiles.py",
+    "function": "post_profiles_sessions_pull_requests",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_routers/profiles.py::post_profiles_sessions_pull_requests; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_routers/profiles.py",
+    "function": "set_active_profile_endpoint",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_routers/profiles.py::set_active_profile_endpoint; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_routers/sessions.py",
+    "function": "backfill_session_owner_profiles",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_routers/sessions.py::backfill_session_owner_profiles; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_routers/sessions.py",
+    "function": "bulk_delete_sessions_endpoint",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_routers/sessions.py::bulk_delete_sessions_endpoint; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_routers/sessions.py",
+    "function": "import_sessions_endpoint",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_routers/sessions.py::import_sessions_endpoint; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_routers/sessions.py",
+    "function": "prune_sessions_endpoint",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_routers/sessions.py::prune_sessions_endpoint; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_routers/skills.py",
+    "function": "create_skill",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_routers/skills.py::create_skill; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_routers/skills.py",
+    "function": "install_skill_hub",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_routers/skills.py::install_skill_hub; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_routers/skills.py",
+    "function": "uninstall_skill_hub",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_routers/skills.py::uninstall_skill_hub; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_routers/skills.py",
+    "function": "update_skills_hub",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_routers/skills.py::update_skills_hub; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_routers/tools.py",
+    "function": "grant_computer_use_permissions",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_routers/tools.py::grant_computer_use_permissions; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_routers/tools.py",
+    "function": "run_toolset_post_setup",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_routers/tools.py::run_toolset_post_setup; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "_codex_full_login_worker",
+    "pattern": "post",
+    "occurrences": 3,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::_codex_full_login_worker; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "_forward_cron_fire_to_gateway",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::_forward_cron_fire_to_gateway; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "_probe_gateway_health",
+    "pattern": "urlopen",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::_probe_gateway_health; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "_read_session_import_body",
+    "pattern": "stream",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::_read_session_import_body; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "_submit_anthropic_pkce",
+    "pattern": "urlopen",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::_submit_anthropic_pkce; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "_telegram_onboarding_request_sync",
+    "pattern": "request",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::_telegram_onboarding_request_sync; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "activate_custom_endpoint",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::activate_custom_endpoint; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "add_credential_pool_entry",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::add_credential_pool_entry; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "apply_telegram_onboarding",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::apply_telegram_onboarding; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "apply_whatsapp_onboarding",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::apply_whatsapp_onboarding; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "approve_pairing",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::approve_pairing; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "browser_bootstrap",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::browser_bootstrap; inbound FastAPI route handler for the browser launch-ticket redemption (@app.post decorator and request.stream() body read of the INBOUND request); no outbound provider call, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "browser_bootstrap",
+    "pattern": "stream",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::browser_bootstrap; inbound FastAPI route handler for the browser launch-ticket redemption (@app.post decorator and request.stream() body read of the INBOUND request); no outbound provider call, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "clear_pending_pairing",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::clear_pending_pairing; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "create_hook",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::create_hook; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "create_managed_directory",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::create_managed_directory; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "create_webhook",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::create_webhook; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "enable_webhooks",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::enable_webhooks; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "fs_write_text",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::fs_write_text; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "gateway_drain",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::gateway_drain; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "get_elevenlabs_voices._fetch",
+    "pattern": "urlopen",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::get_elevenlabs_voices._fetch; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "post_agent_plugin_disable",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::post_agent_plugin_disable; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "post_agent_plugin_enable",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::post_agent_plugin_enable; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "post_agent_plugin_install",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::post_agent_plugin_install; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "post_agent_plugin_update",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::post_agent_plugin_update; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "post_plugin_visibility",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::post_plugin_visibility; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "prune_checkpoints",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::prune_checkpoints; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "reset_memory",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::reset_memory; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "restart_gateway",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::restart_gateway; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "reveal_env_var",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::reveal_env_var; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "revoke_pairing",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::revoke_pairing; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "run_backup",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::run_backup; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "run_config_migrate",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::run_config_migrate; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "run_curator",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::run_curator; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "run_debug_share_endpoint",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::run_debug_share_endpoint; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "run_doctor",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::run_doctor; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "run_dump",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::run_dump; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "run_import",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::run_import; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "run_import_upload",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::run_import_upload; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "run_prompt_size",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::run_prompt_size; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "run_security_audit",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::run_security_audit; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "set_model_assignment",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::set_model_assignment; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "setup_memory_provider",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::setup_memory_provider; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "speak_stream_ws._produce",
+    "pattern": "stream",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::speak_stream_ws._produce; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "speak_text",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::speak_text; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "start_gateway",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::start_gateway; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "start_oauth_login",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::start_oauth_login; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "start_telegram_onboarding",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::start_telegram_onboarding; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "start_whatsapp_onboarding",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::start_whatsapp_onboarding; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "stop_gateway",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::stop_gateway; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "submit_oauth_code",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::submit_oauth_code; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "test_messaging_platform",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::test_messaging_platform; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "transcribe_audio_upload",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::transcribe_audio_upload; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "update_hermes",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::update_hermes; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "upload_chat_image",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::upload_chat_image; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "upload_managed_file",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::upload_managed_file; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "upload_managed_file_stream",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::upload_managed_file_stream; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "upsert_custom_endpoint",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::upsert_custom_endpoint; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "validate_custom_endpoint",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::validate_custom_endpoint; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/web_server.py",
+    "function": "validate_provider_credential",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/web_server.py::validate_provider_credential; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_cli/webhook.py",
+    "function": "_cmd_test",
+    "pattern": "urlopen",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_cli/webhook.py::_cmd_test; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "hermes_constants.py",
+    "function": "_heal_managed_node_windows",
+    "pattern": "urlopen",
+    "occurrences": 2,
+    "classification": "not_inference",
+    "evidence": "source review: hermes_constants.py::_heal_managed_node_windows; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "mini_swe_runner.py",
+    "function": "MiniSWERunner.__init__",
+    "pattern": "OpenAI",
+    "occurrences": 2,
+    "classification": "unsupported_enforce",
+    "evidence": "bound OpenAI factory; standalone requests have no SessionDB/input owner or explicit output ceiling; lease refuses, no fabricated lineage"
+  },
+  {
+    "file": "mini_swe_runner.py",
+    "function": "MiniSWERunner.run_task",
+    "pattern": "chat.completions.create",
+    "occurrences": 1,
+    "classification": "unsupported_enforce",
+    "evidence": "bound OpenAI factory; standalone requests have no SessionDB/input owner or explicit output ceiling; lease refuses, no fabricated lineage"
+  },
+  {
+    "file": "tools/browser_camofox.py",
+    "function": "_ensure_tab",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: tools/browser_camofox.py::_ensure_tab; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/browser_camofox.py",
+    "function": "_post",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: tools/browser_camofox.py::_post; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/browser_cdp_tool.py",
+    "function": "_cdp_call",
+    "pattern": "send",
+    "occurrences": 2,
+    "classification": "not_inference",
+    "evidence": "source review: tools/browser_cdp_tool.py::_cdp_call; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/browser_supervisor.py",
+    "function": "CDPSupervisor._cdp",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: tools/browser_supervisor.py::CDPSupervisor._cdp; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/discord_tool.py",
+    "function": "_discord_request",
+    "pattern": "urlopen",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: tools/discord_tool.py::_discord_request; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/environments/managed_modal.py",
+    "function": "ManagedModalEnvironment._request",
+    "pattern": "request",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: tools/environments/managed_modal.py::ManagedModalEnvironment._request; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/feishu_doc_tool.py",
+    "function": "_handle_feishu_doc_read",
+    "pattern": "request",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: tools/feishu_doc_tool.py::_handle_feishu_doc_read; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/feishu_drive_tool.py",
+    "function": "_do_request",
+    "pattern": "request",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: tools/feishu_drive_tool.py::_do_request; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/homeassistant_tool.py",
+    "function": "_async_call_service",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: tools/homeassistant_tool.py::_async_call_service; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/kanban_tools.py",
+    "function": "_download_url_with_cap",
+    "pattern": "stream",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: tools/kanban_tools.py::_download_url_with_cap; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/managed_tool_gateway.py",
+    "function": "build_managed_media_uploader.upload",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: tools/managed_tool_gateway.py::build_managed_media_uploader.upload; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/mcp_oauth_manager.py",
+    "function": "_make_hermes_provider_class.HermesMCPOAuthProvider._prefetch_oauth_metadata",
+    "pattern": "send",
+    "occurrences": 2,
+    "classification": "not_inference",
+    "evidence": "source review: tools/mcp_oauth_manager.py::_make_hermes_provider_class.HermesMCPOAuthProvider._prefetch_oauth_metadata; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/mcp_tool.py",
+    "function": "MCPServerTask._preflight_content_type",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: tools/mcp_tool.py::MCPServerTask._preflight_content_type; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/microsoft_graph_auth.py",
+    "function": "MicrosoftGraphTokenProvider._fetch_access_token",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: tools/microsoft_graph_auth.py::MicrosoftGraphTokenProvider._fetch_access_token; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/microsoft_graph_client.py",
+    "function": "MicrosoftGraphClient._request",
+    "pattern": "request",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: tools/microsoft_graph_client.py::MicrosoftGraphClient._request; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/microsoft_graph_client.py",
+    "function": "MicrosoftGraphClient.download_to_file",
+    "pattern": "stream",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: tools/microsoft_graph_client.py::MicrosoftGraphClient.download_to_file; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/osv_check.py",
+    "function": "_query_osv",
+    "pattern": "urlopen",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: tools/osv_check.py::_query_osv; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/send_message_tool.py",
+    "function": "_matrix_send_core",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: tools/send_message_tool.py::_matrix_send_core; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/send_message_tool.py",
+    "function": "_resolve_slack_user_target.post_api",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: tools/send_message_tool.py::_resolve_slack_user_target.post_api; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/send_message_tool.py",
+    "function": "_send_bluebubbles",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: tools/send_message_tool.py::_send_bluebubbles; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/send_message_tool.py",
+    "function": "_send_qqbot",
+    "pattern": "post",
+    "occurrences": 4,
+    "classification": "not_inference",
+    "evidence": "source review: tools/send_message_tool.py::_send_qqbot; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/send_message_tool.py",
+    "function": "_send_signal._post",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: tools/send_message_tool.py::_send_signal._post; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/send_message_tool.py",
+    "function": "_send_signal._send_inline_notice",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: tools/send_message_tool.py::_send_signal._send_inline_notice; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/send_message_tool.py",
+    "function": "_send_via_adapter",
+    "pattern": "send",
+    "occurrences": 2,
+    "classification": "not_inference",
+    "evidence": "source review: tools/send_message_tool.py::_send_via_adapter; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/skills_hub.py",
+    "function": "GitHubAuth._try_github_app",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: tools/skills_hub.py::GitHubAuth._try_github_app; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/skills_sync_client.py",
+    "function": "SyncClient.cas_ref",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: tools/skills_sync_client.py::SyncClient.cas_ref; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/skills_sync_client.py",
+    "function": "SyncClient.put_objects",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: tools/skills_sync_client.py::SyncClient.put_objects; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/tirith_security.py",
+    "function": "_download_file",
+    "pattern": "urlopen",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: tools/tirith_security.py::_download_file; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/transcription_tools.py",
+    "function": "_transcribe_elevenlabs",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: tools/transcription_tools.py::_transcribe_elevenlabs; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/transcription_tools.py",
+    "function": "_transcribe_groq",
+    "pattern": "OpenAI",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: tools/transcription_tools.py::_transcribe_groq; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/transcription_tools.py",
+    "function": "_transcribe_openai",
+    "pattern": "OpenAI",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: tools/transcription_tools.py::_transcribe_openai; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/transcription_tools.py",
+    "function": "_transcribe_xai._post_transcription",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: tools/transcription_tools.py::_transcribe_xai._post_transcription; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/tts_streaming.py",
+    "function": "GeminiStreamer.stream._sse_chunks",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: tools/tts_streaming.py::GeminiStreamer.stream._sse_chunks; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/tts_streaming.py",
+    "function": "OpenAIStreamer.stream",
+    "pattern": "OpenAI",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: tools/tts_streaming.py::OpenAIStreamer.stream; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/tts_streaming.py",
+    "function": "XAIStreamer._async_frames",
+    "pattern": "send",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: tools/tts_streaming.py::XAIStreamer._async_frames; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/tts_tool.py",
+    "function": "_generate_gemini_tts",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: tools/tts_tool.py::_generate_gemini_tts; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/tts_tool.py",
+    "function": "_generate_minimax_tts",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: tools/tts_tool.py::_generate_minimax_tts; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/tts_tool.py",
+    "function": "_generate_openai_tts",
+    "pattern": "OpenAI",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: tools/tts_tool.py::_generate_openai_tts; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/tts_tool.py",
+    "function": "_generate_xai_tts",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: tools/tts_tool.py::_generate_xai_tts; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/tts_tool.py",
+    "function": "stream_tts_to_speaker._enqueue_audio",
+    "pattern": "stream",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: tools/tts_tool.py::stream_tts_to_speaker._enqueue_audio; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/vision_tools.py",
+    "function": "_stream_download_to_file",
+    "pattern": "stream",
+    "occurrences": 1,
+    "classification": "not_inference",
+    "evidence": "source review: tools/vision_tools.py::_stream_download_to_file; messaging/control-plane/resource/media/inbound declaration, not physical normal_model_call provider egress"
+  },
+  {
+    "file": "tools/x_search_tool.py",
+    "function": "x_search_tool",
+    "pattern": "post",
+    "occurrences": 1,
+    "classification": "unsupported_enforce",
+    "evidence": "unsupported_transport_scope before raw transport; test_raw_inference_admission.py"
+  },
+  {
+    "file": "tools/x_search_tool.py",
+    "function": "x_search_tool",
+    "pattern": "unsupported_transport_scope",
+    "occurrences": 1,
+    "classification": "unsupported_enforce",
+    "evidence": "unsupported_transport_scope before raw transport; test_raw_inference_admission.py"
+  },
+  {
+    "file": "trajectory_compressor.py",
+    "function": "TrajectoryCompressor._generate_summary",
+    "pattern": "chat.completions.create",
+    "occurrences": 1,
+    "classification": "auxiliary_physical",
+    "evidence": "bound sync/async SDK plus background_summary scope; test_physical_summary_routes.py; missing persistent owner stays unqualified"
+  },
+  {
+    "file": "trajectory_compressor.py",
+    "function": "TrajectoryCompressor._generate_summary_async",
+    "pattern": "chat.completions.create",
+    "occurrences": 1,
+    "classification": "auxiliary_physical",
+    "evidence": "bound sync/async SDK plus background_summary scope; test_physical_summary_routes.py; missing persistent owner stays unqualified"
+  },
+  {
+    "file": "trajectory_compressor.py",
+    "function": "TrajectoryCompressor._get_async_client",
+    "pattern": "AsyncOpenAI",
+    "occurrences": 1,
+    "classification": "auxiliary_physical",
+    "evidence": "bound sync/async SDK plus background_summary scope; test_physical_summary_routes.py; missing persistent owner stays unqualified"
+  },
+  {
+    "file": "trajectory_compressor.py",
+    "function": "TrajectoryCompressor._init_summarizer",
+    "pattern": "OpenAI",
+    "occurrences": 1,
+    "classification": "auxiliary_physical",
+    "evidence": "bound sync/async SDK plus background_summary scope; test_physical_summary_routes.py; missing persistent owner stays unqualified"
+  }
+]

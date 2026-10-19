@@ -100,6 +100,7 @@ class StalePrefixAgent:
     """
 
     def __init__(self, **kwargs):
+        self.model = kwargs["model"]
         self.stream_delta_callback = kwargs.get("stream_delta_callback")
         self.tools = []
 
@@ -118,6 +119,7 @@ class CompleteStreamAgent:
     """Control: the streamed text exactly equals the final response."""
 
     def __init__(self, **kwargs):
+        self.model = kwargs["model"]
         self.stream_delta_callback = kwargs.get("stream_delta_callback")
         self.tools = []
 

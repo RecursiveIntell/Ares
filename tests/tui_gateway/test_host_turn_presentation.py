@@ -40,10 +40,11 @@ def test_only_matching_host_terminal_releases_presentation_owner(monkeypatch):
     monkeypatch.setattr(server, "_sessions", {"s": session})
     host = ComputeHost(stdout=io.StringIO(), heartbeat_secs=0)
     host._active_request_ids["s"] = "A"
+    host._admitted_request_sessions["s"] = ("A", session)
     try:
-        host._emit_real_turn_terminal({"type": "turn.end", "sid": "s", "request_id": "old"})
+        host._emit_real_turn_terminal({"type": "turn.end", "sid": "s", "request_id": "old"}, admitted_session=session)
         assert session["_host_turn_request_id"] == "A"
-        host._emit_real_turn_terminal({"type": "turn.end", "sid": "s", "request_id": "A"})
+        host._emit_real_turn_terminal({"type": "turn.end", "sid": "s", "request_id": "A"}, admitted_session=session)
         assert "_host_turn_request_id" not in session
     finally:
         host.close()

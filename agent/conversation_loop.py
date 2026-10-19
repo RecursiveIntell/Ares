@@ -3458,7 +3458,7 @@ def run_conversation(
                                         kw, on_first_delta=_stop_spinner), next_api_kwargs
                                 )
 
-                            _physical.settle()
+                            _physical.settle(_response)
                             _delivery.deliver()
                             return _response
                         from agent import relay_llm
@@ -3483,7 +3483,7 @@ def run_conversation(
                             },
                             defer_logical_completion=True,
                         )
-                        _physical.settle()
+                        _physical.settle(_response)
                         return _response
 
                 from hermes_cli.middleware import run_llm_execution_middleware
@@ -4749,6 +4749,24 @@ def run_conversation(
                         AutomaticRebaseStatus.BLOCKED, str(api_error), agent.session_id,
                     ))
 
+                from hermes_cli.middleware import EgressDispatchDenied, EgressOutcomeUnrecorded
+                if isinstance(api_error, (EgressDispatchDenied, EgressOutcomeUnrecorded)):
+                    # Governance is not a transport/auth error. In particular a
+                    # post-send lost ACK cannot authorize fallback or a resend.
+                    attempted = bool(_context_provider_attempted) or isinstance(api_error, EgressOutcomeUnrecorded)
+                    if not attempted:
+                        api_call_count = max(0, api_call_count - 1)
+                        agent._api_call_count = api_call_count
+                        agent.iteration_budget.refund()
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "messages": messages, "api_calls": api_call_count,
+                        "completed": False, "failed": True, "final_response": None,
+                        "error": str(api_error),
+                        "failure_reason": ("egress_outcome_unrecorded" if isinstance(api_error, EgressOutcomeUnrecorded) else "egress_denied"),
+                        "failure_retryable": False, "provider_attempted": attempted,
+                    }
+
                 # -----------------------------------------------------------
                 # UnicodeEncodeError recovery.  Two common causes:
                 #   1. Lone surrogates (U+D800..U+DFFF) from clipboard paste
@@ -5625,8 +5643,10 @@ def run_conversation(
                         force=True,
                     )
                     agent._vprint(
-                        f"{agent.log_prefix}   💡 Run /compress to compact manually, /new to start fresh, "
-                        f"switch to a larger-context model, or reduce attachments.",
+                        f"{agent.log_prefix}   💡 Resolve the compression issue before retrying; "
+                        "explicit /new starts a separate conversation and does not "
+                        "repair this history. Switch to a larger-context model or "
+                        "reduce attachments if appropriate.",
                         force=True,
                     )
                     logger.error(
@@ -5636,8 +5656,10 @@ def run_conversation(
                     agent._persist_session(messages, conversation_history)
                     _final_response = (
                         "Context overflow and auto-compaction is disabled "
-                        "(compression.enabled: false). Run /compress to compact manually, "
-                        "/new to start fresh, or switch to a larger-context model."
+                        "(compression.enabled: false). Resolve the compression issue "
+                        "before retrying; explicit /new starts a separate conversation "
+                        "and does not repair this history. You can also switch to a "
+                        "larger-context model or reduce attachments."
                     )
                     return {
                         "final_response": _final_response,
@@ -5967,7 +5989,12 @@ def run_conversation(
                         # Terminal — surface the buffered retry trace.
                         agent._flush_status_buffer()
                         agent._vprint(f"{agent.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached for payload-too-large error.", force=True)
-                        agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
+                        agent._vprint(
+                            f"{agent.log_prefix}   💡 Resolve the compression issue before retrying, "
+                            "or explicitly choose /new to start a separate conversation; "
+                            "that does not repair this history.",
+                            force=True,
+                        )
                         logger.error("%s413 compression failed after %d attempts.", agent.log_prefix, max_compression_attempts)
                         agent._persist_session(messages, conversation_history)
                         _final_response = f"Request payload too large: max compression attempts ({max_compression_attempts}) reached."
@@ -6053,7 +6080,12 @@ def run_conversation(
                         # sees what compression attempts were made.
                         agent._flush_status_buffer()
                         agent._vprint(f"{agent.log_prefix}❌ Payload too large and cannot compress further.", force=True)
-                        agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
+                        agent._vprint(
+                            f"{agent.log_prefix}   💡 Resolve the compression issue before retrying, "
+                            "or explicitly choose /new to start a separate conversation; "
+                            "that does not repair this history.",
+                            force=True,
+                        )
                         logger.error("%s413 payload too large. Cannot compress further.", agent.log_prefix)
                         agent._persist_session(messages, conversation_history)
                         _final_response = "Request payload too large (413). Cannot compress further."
@@ -6143,7 +6175,12 @@ def run_conversation(
                                 return _context_rebase_stopped_result(_rebase)
                             agent._flush_status_buffer()
                             agent._vprint(f"{agent.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached.", force=True)
-                            agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
+                            agent._vprint(
+                                f"{agent.log_prefix}   💡 Resolve the compression issue before retrying, "
+                                "or explicitly choose /new to start a separate conversation; "
+                                "that does not repair this history.",
+                                force=True,
+                            )
                             logger.error("%sContext compression failed after %d attempts.", agent.log_prefix, max_compression_attempts)
                             agent._persist_session(messages, conversation_history)
                             _final_response = f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached."
@@ -6311,7 +6348,12 @@ def run_conversation(
                             return _context_rebase_stopped_result(_rebase)
                         agent._flush_status_buffer()
                         agent._vprint(f"{agent.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached.", force=True)
-                        agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
+                        agent._vprint(
+                            f"{agent.log_prefix}   💡 Resolve the compression issue before retrying, "
+                            "or explicitly choose /new to start a separate conversation; "
+                            "that does not repair this history.",
+                            force=True,
+                        )
                         logger.error("%sContext compression failed after %d attempts.", agent.log_prefix, max_compression_attempts)
                         agent._persist_session(messages, conversation_history)
                         _final_response = f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached."
@@ -6374,7 +6416,12 @@ def run_conversation(
                         # Can't compress further and already at minimum tier
                         agent._flush_status_buffer()
                         agent._vprint(f"{agent.log_prefix}❌ Context length exceeded and cannot compress further.", force=True)
-                        agent._vprint(f"{agent.log_prefix}   💡 The conversation has accumulated too much content. Try /new to start fresh, or /compress to manually trigger compression.", force=True)
+                        agent._vprint(
+                            f"{agent.log_prefix}   💡 Resolve the compression issue before retrying; "
+                            "explicit /new starts a separate conversation and does not "
+                            "repair this history.",
+                            force=True,
+                        )
                         logger.error("%sContext length exceeded: %s tokens. Cannot compress further.", agent.log_prefix, f"{new_tokens:,}")
                         agent._persist_session(messages, conversation_history)
                         _final_response = f"Context length exceeded ({new_tokens:,} tokens). Cannot compress further."

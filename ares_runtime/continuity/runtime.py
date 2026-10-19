@@ -230,6 +230,8 @@ class ContextDispatchPhysicalScope:
         self._physical_count = 0
         self._settlement_started = False
         self._stream_buffer = None
+        self._dispatch_tickets = None
+        self._model_call_basis = None
         self._lock = RLock()
 
     def __enter__(self):
@@ -240,10 +242,41 @@ class ContextDispatchPhysicalScope:
 
     def __exit__(self, exc_type, *_):
         try:
-            if exc_type is not None and not self._settlement_started:
-                self.discard()
+            if not self._settlement_started:
+                self._settle_dispatch("abandoned")
+                if exc_type is not None:
+                    self.discard()
         finally:
             _physical_dispatch.reset(self._token)
+
+    def _settle_dispatch(self, outcome, response=None, error=None):
+        from hermes_cli.middleware import settle_llm_dispatch
+        tickets, self._dispatch_tickets = self._dispatch_tickets, None
+        if tickets is not None:
+            settle_llm_dispatch(tickets, outcome=outcome, response=response, error=error)
+
+    def _provider_callback(self, payload, callback):
+        from hermes_cli.middleware import begin_llm_dispatch
+        self._dispatch_tickets = begin_llm_dispatch(
+            payload, **_dispatch_governor_context(self.agent),
+            attempt_id=self.attempt_id, route_identity=self.route_identity,
+        )
+        self.attempted = True
+        try:
+            from ares_runtime.managed_calls import produce_dispatch_materialization
+            from ares_runtime.physical_dispatch import _restore_call, bind_deferred_result
+            # A new callback may be a changed request or fallback route. Only
+            # SDK-internal physical retries share this logical materialization.
+            self._model_call_basis = produce_dispatch_materialization(self.agent, payload, purpose="conversation")
+            with _restore_call(self._model_call_basis):
+                response = callback(payload)
+                return bind_deferred_result(response, self._model_call_basis)
+        except BaseException as error:
+            self._settle_dispatch(
+                "interrupted" if isinstance(error, (InterruptedError, KeyboardInterrupt)) else "provider_error",
+                error=error,
+            )
+            raise
 
     def validate_source(self, payload):
         admit_final_context_dispatch(
@@ -253,6 +286,7 @@ class ContextDispatchPhysicalScope:
         )
 
     def discard(self):
+        self._settle_dispatch("discarded")
         if self.admission is not None:
             admission = self.admission
             # Leave custody visible if the owner cannot prove discard.
@@ -272,8 +306,8 @@ class ContextDispatchPhysicalScope:
             if self._settlement_started:
                 raise ContextDispatchError("CONTEXT_DISPATCH_SETTLEMENT_UNKNOWN")
             if self.snapshot is None:
-                self.attempted = True
-                return callback(payload)
+                self.discard()
+                return self._provider_callback(payload, callback)
             from copy import deepcopy
             source = deepcopy(payload if source_payload is None else source_payload)
             # Validate and derive from the same isolated source bytes.
@@ -317,18 +351,22 @@ class ContextDispatchPhysicalScope:
                 route_identity=self.route_identity,
             )
             self._physical_count = physical_number
-            self.attempted = True
             try:
-                return callback(final_payload)
+                return self._provider_callback(final_payload, callback)
             except BaseException:
                 self.discard()
                 raise
 
-    def settle(self):
+    def settle(self, response=None):
         if self.snapshot is not None and self.admission is None:
             raise ContextDispatchError("CONTEXT_DISPATCH_RESPONSE_NOT_ADMITTED")
         self._settlement_started = True
-        settle_final_context_dispatch(self.agent, self.admission)
+        try:
+            settle_final_context_dispatch(self.agent, self.admission)
+        except BaseException:
+            self._settle_dispatch("discarded")
+            raise
+        self._settle_dispatch("ok", response=response)
 
 
 def validate_context_dispatch_source(agent, payload):
@@ -341,10 +379,17 @@ def validate_context_dispatch_source(agent, payload):
     scope.validate_source(payload)
 
 
+def _dispatch_governor_context(agent):
+    # Observed callback metadata, not a new lineage or source-authority owner.
+    return {key: getattr(agent, key, None) for key in ("session_id", "provider", "model", "api_mode")}
+
+
 def context_dispatch_physical_call(agent, payload, callback, *, source_payload=None, transport_kind=None):
     scope = _physical_dispatch.get()
     if scope is None:
-        return callback(payload)
+        from hermes_cli.middleware import run_llm_dispatch
+        streaming = bool(payload.get("stream")) or transport_kind in {"chat_stream", "anthropic_stream", "bedrock_stream", "codex_stream"}
+        return run_llm_dispatch(payload, callback, stream=streaming, _dispatch_agent=agent, **_dispatch_governor_context(agent))
     if scope.agent is not agent:
         raise ContextDispatchError("CONTEXT_DISPATCH_OWNER_MISMATCH")
     return scope.call(payload, callback, source_payload=source_payload, transport_kind=transport_kind)
@@ -788,6 +833,22 @@ def attempt_turn_start_context_rebase(
             "CONTEXT_REBASE_DISABLED",
             str(getattr(agent, "session_id", "") or ""),
         )
+    compressor = getattr(agent, "context_compressor", None)
+    veto_check = getattr(compressor, "automatic_rebase_block_reason", None)
+    if callable(veto_check):
+        try:
+            veto_reason = veto_check()
+        except Exception:
+            veto_reason = "CONTEXT_REBASE_ADMISSION_CHECK_FAILED"
+        if veto_reason is not None:
+            if type(veto_reason) is not str or not veto_reason.strip():
+                veto_reason = "CONTEXT_REBASE_ADMISSION_CHECK_FAILED"
+            return AutomaticRebaseResult(
+                AutomaticRebaseStatus.BLOCKED,
+                veto_reason.strip(),
+                str(getattr(agent, "session_id", "") or ""),
+                before_tokens=before_tokens if type(before_tokens) is int else None,
+            )
     if type(before_tokens) is not int or before_tokens <= 0:
         raise AutomaticRebaseError("INVALID_PRE_REBASE_COUNT")
     if (

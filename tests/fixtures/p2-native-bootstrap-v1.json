@@ -1,0 +1,12 @@
+{
+  "protocol": "hermes-native-v1",
+  "synthetic_key": "synthetic-owned-child-secret-32-bytes-minimum",
+  "endpoint": "http://127.0.0.1:9119/auth/desktop-bootstrap",
+  "identity": "synthetic-child",
+  "nonce": "abababababababababababababababababababababababababababababababab",
+  "issued_at": 1791650000,
+  "synthetic_session_token": "synthetic-spawn-token",
+  "session_digest": "54f84c816a7dbf31447cfd9020efacd24761afdd4a6ef1e9b8bd832412c5fcdc",
+  "request_mac": "3cd124714743a03b4a4efd3aacbc5a6791903a6250532d1f2530e0cf0e788224",
+  "response_mac": "d99e7e405a7d0d468ea9e40f55c7ae7ff06ea1586de59c183dc92fd19b1e131d"
+}

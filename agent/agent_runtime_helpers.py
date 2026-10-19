@@ -739,7 +739,12 @@ def repair_message_sequence(agent, messages: List[Dict], *, preserve_user_messag
                 and known_tool_ids[tc_id] not in matched_tool_groups
             }
             if not result_variants:
-                filtered.append(msg)
+                # Missing/empty tool_call_id: schema-invalid on the wire (strict upstream
+                # deserializers 400 with "missing field `tool_call_id`") and unpairable by
+                # the alias-group logic. Drop at repair time so DB-restored/resumed
+                # histories heal instead of replaying the poison every request.
+                repairs += 1
+                continue
             elif candidate_groups:
                 # Consume the whole alias group so a SECOND result replaying
                 # any sibling spelling falls into the drop branch below —
@@ -1508,6 +1513,66 @@ def drop_thinking_only_and_merge_users(
 
 
 
+def _fast_intent_value(tier) -> str:
+    return "priority" if str(tier or "").strip().lower() in {"priority", "fast", "on"} else ""
+
+
+def get_fast_mode_intent(agent) -> str:
+    """Read requested Fast from the existing primary-runtime owner.
+
+    The active tier/overrides are model-specific projections. Older/inert
+    agents without this snapshot key can seed it from their explicit runtime.
+    """
+    primary = getattr(agent, "_primary_runtime", None)
+    if isinstance(primary, dict) and "service_tier_intent" in primary:
+        return _fast_intent_value(primary["service_tier_intent"])
+    tier = getattr(agent, "service_tier", None)
+    overrides = getattr(agent, "request_overrides", None)
+    if tier is None and isinstance(overrides, dict) and (
+            overrides.get("service_tier") == "priority" or overrides.get("speed") == "fast"):
+        tier = "priority"
+    return _fast_intent_value(tier)
+
+
+def resolve_fast_mode_runtime(model: str, requested_tier) -> tuple[str | None, dict]:
+    """Derive effective Fast from intent using the canonical capability owner."""
+    if not _fast_intent_value(requested_tier):
+        return None, {}
+    from hermes_cli.models import resolve_fast_mode_overrides
+
+    overrides = resolve_fast_mode_overrides(model)
+    if overrides is None:
+        return None, {}
+    if not isinstance(overrides, dict):
+        raise ValueError("invalid Fast capability result")
+    return "priority", dict(overrides)
+
+
+def remember_fast_mode_intent(agent, requested_tier):
+    """Update only the primary snapshot's requested intent, not effective state."""
+    primary = getattr(agent, "_primary_runtime", None)
+    if isinstance(primary, dict):
+        primary["service_tier_intent"] = _fast_intent_value(requested_tier)
+
+
+def apply_fast_mode_runtime(agent, requested_tier, *, remember=False, resolved=None):
+    """Project Fast onto the active route; only explicit writers change intent.
+
+    ``resolved`` admits a caller's preflight result without another lookup
+    after an in-place route mutation. Unrelated request fields are preserved.
+    """
+    tier, fields = resolved if resolved is not None else resolve_fast_mode_runtime(agent.model, requested_tier)
+    overrides = dict(getattr(agent, "request_overrides", {}) or {})
+    overrides.pop("service_tier", None)
+    overrides.pop("speed", None)
+    overrides.update(fields)
+    if remember:
+        remember_fast_mode_intent(agent, requested_tier)
+    agent.service_tier = tier
+    agent.request_overrides = overrides
+    return tier
+
+
 def _snapshot_context_handoff(agent):
     """Return a rollback for host state until the context engine accepts a route.
 
@@ -1515,6 +1580,7 @@ def _snapshot_context_handoff(agent):
     captures only reversible host fields; fallback index/cooldown progress must
     survive refusal so rejected candidates are not retried indefinitely.
     """
+    captured_fast_intent = get_fast_mode_intent(agent)
     missing = object()
     snapshot = {
         name: getattr(agent, name, missing)
@@ -1525,14 +1591,14 @@ def _snapshot_context_handoff(agent):
             "_credential_pool", "_credential_pool_entry_id",
             "_config_context_length", "_custom_providers", "_reasoning_echo_flag",
             "_use_prompt_caching", "_use_native_cache_layout", "_transport_cache",
-            "_fallback_activated",
+            "_fallback_activated", "service_tier", "request_overrides",
         )
     }
     # Preserve cache/kwargs identity as well as contents: clearing a live dict
     # must not poison the rollback target or a reference held by its caller.
     dict_contents = {
         name: dict(value) for name, value in snapshot.items()
-        if name in {"_client_kwargs", "_transport_cache"} and isinstance(value, dict)
+        if name in {"_client_kwargs", "_transport_cache", "request_overrides"} and isinstance(value, dict)
     }
 
     def restore():
@@ -1549,6 +1615,15 @@ def _snapshot_context_handoff(agent):
                     value.clear()
                     value.update(dict_contents[name])
                 setattr(agent, name, value)
+        # A user may change Fast while slow provider/context setup is in
+        # flight. Roll back the route, not that newer authoritative intent.
+        fast_restore_error = None
+        try:
+            latest_fast_intent = get_fast_mode_intent(agent)
+            if latest_fast_intent != captured_fast_intent:
+                apply_fast_mode_runtime(agent, latest_fast_intent)
+        except Exception as exc:
+            fast_restore_error = exc
         # Retire only newly attached clients, never the restored shared ones.
         # Socket shutdown defers FD release to GC instead of hard-closing a
         # shared client from a thread whose earlier request may still unwind.
@@ -1562,6 +1637,8 @@ def _snapshot_context_handoff(agent):
                 agent._retire_shared_openai_client(client, reason="context_handoff_refused")
             except Exception:
                 logger.debug("Rejected context handoff client retirement failed", exc_info=True)
+        if fast_restore_error is not None:
+            raise fast_restore_error
 
     return restore
 
@@ -1691,6 +1768,7 @@ def restore_primary_runtime(agent) -> bool:
         agent.api_mode = rt["api_mode"]
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
+        apply_fast_mode_runtime(agent, get_fast_mode_intent(agent))
         agent.api_key = rt["api_key"]
         agent._reasoning_echo_flag = rt.get("reasoning_echo_flag", False)
         agent._client_kwargs = dict(rt["client_kwargs"])
@@ -2842,6 +2920,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     # Callers retain this agent after a failed /model swap and rely on its
     # previous route surviving. Include cache/pool state and preserve that
     # contract until the context engine has accepted the destination budget.
+    requested_fast_tier = get_fast_mode_intent(agent)
     restore_handoff = _snapshot_context_handoff(agent)
 
     try:
@@ -2885,6 +2964,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         # Invalidate transport cache — new api_mode may need a different transport
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
+        apply_fast_mode_runtime(agent, requested_fast_tier)
         if api_key:
             agent.api_key = api_key
 
@@ -3160,6 +3240,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,
         "reasoning_config": dict(agent.reasoning_config) if getattr(agent, "reasoning_config", None) else None,
+        "service_tier_intent": get_fast_mode_intent(agent),
         "reasoning_echo_flag": getattr(agent, "_reasoning_echo_flag", False),
         "compressor_model": getattr(_cc, "model", agent.model) if _cc else agent.model,
         "compressor_base_url": getattr(_cc, "base_url", agent.base_url) if _cc else agent.base_url,
@@ -3758,6 +3839,37 @@ def repair_empty_non_final_messages(
     return messages
 
 
+def _drop_results_without_ids(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Drop tool results with a missing/empty tool_call_id (ported from upstream hermes-agent).
+
+    A tool result whose tool_call_id is missing or blank is schema-invalid on every Chat
+    Completions wire: strict upstream deserializers reject the whole request with HTTP 400
+    "Failed to deserialize the JSON body into the target type: missing field `tool_call_id`".
+    The pre-call sanitizer's orphan-drop and dedup passes both skip such results (their
+    variant sets are empty, so `if variants` guards never fire), which let a rejection
+    result paired against a synthetically-backfilled assistant call id persist for the
+    life of the session (observed 2026-10-19: glm-5.3-flash via an aggregator emitted an
+    empty-name tool call; the rejection result was persisted with tool_call_id='' while
+    the assistant call carried a backfilled deterministic id). Kept explicit — not folded
+    into the orphan/dedup walks — for its own log line and so the chokepoint guarantee
+    holds on its own for callers that skip repair_message_sequence.
+    """
+    kept = [
+        m for m in messages
+        if not (
+            isinstance(m, dict)
+            and m.get("role") == "tool"
+            and not (m.get("tool_call_id") or "").strip()
+        )
+    ]
+    if len(kept) != len(messages):
+        _ra().logger.debug(
+            "Pre-call sanitizer: dropped %d tool result(s) with missing/empty tool_call_id",
+            len(messages) - len(kept),
+        )
+    return kept
+
+
 def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Fix orphaned tool_call / tool_result pairs before every LLM call.
 
@@ -4039,6 +4151,12 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             "Pre-call sanitizer: removed %d duplicate tool_call_id reference(s)",
             removed_dupes,
         )
+    # Final chokepoint guarantee: a tool result with a missing/empty tool_call_id is
+    # schema-invalid on the wire (HTTP 400 "missing field `tool_call_id`" from strict
+    # upstream deserializers) and is invisible to the orphan/dedup passes above (their
+    # `if variants` guards skip empty-id rows). Drop it last, after pairing/dedup had
+    # their chance. Ported from upstream hermes-agent sanitize_api_messages.
+    messages = _drop_results_without_ids(messages)
     return messages
 
 

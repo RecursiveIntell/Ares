@@ -139,7 +139,7 @@ def test_explicit_ares_selection_probes_before_session_binding(governor):
                 "_context_rebase_transition": "transition-fixture",
                 "_context_epoch": 1,
             },
-            "root",
+            "tip",  # Marker-shaped metadata is not an owner transition record.
         ),
         ("context_rebase", {}, "tip"),
     ],
@@ -159,6 +159,28 @@ def test_session_start_keeps_the_sessiondb_lineage(
         assert governor.session_id == "tip"
         assert governor._session_db is db
         assert governor._governor_session_id() == expected_root
+    finally:
+        db.close()
+
+
+def test_session_start_keeps_owner_published_context_rebase_lineage(governor, tmp_path):
+    from tests.ares_runtime.test_context_rebase_state import _publish
+
+    db = SessionDB(tmp_path / "owner-transition.db")
+    try:
+        db.create_session("root", "cli", profile_name="p1", model="test")
+        db.append_message("root", "user", "retain the original requirement")
+        assert db.try_acquire_session_turn_lease("root", "holder", ttl_seconds=300)
+        transition = _publish(
+            db, transition="transition-fixture", parent="root", child="tip"
+        )
+        assert db.context_rebase_transition_for_session("tip") == transition
+        with _host_init(governor) as create:
+            create(session_id="tip", session_db=db)
+        assert governor.session_id == "tip"
+        assert governor._session_db is db
+        assert governor._governor_session_id() == "root"
+        assert governor._lineage_session_id_resolved is True
     finally:
         db.close()
 

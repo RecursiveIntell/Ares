@@ -162,6 +162,40 @@ def test_activation_timeout_replays_exact_request_once_and_clears_pending():
     assert engine.last_compaction_metrics["activation_replayed_after_timeout"] is True
 
 
+@pytest.mark.parametrize(
+    "activation_lineage,expected_vetoes,blocked",
+    [
+        ("s1", {"s2": False}, False),
+        ("other-lineage", {"s1": False, "s2": False}, True),
+    ],
+)
+def test_verified_activation_clears_only_its_matching_lineage_veto(
+    activation_lineage, expected_vetoes, blocked
+):
+    engine = _activation_engine()
+    engine._lineage_session_id = "s1"
+    engine._lineage_integrity_vetoes = {"s1": False, "s2": False}
+    engine._pending_admission["lineage_session_id"] = activation_lineage
+    engine._run_certified_json = lambda _args, payload: {
+        "schema": "ReceiptActivationResultV2",
+        "receipt_id": payload["receipt_id"],
+        "activated": True,
+        "verified": True,
+        "already_activated": False,
+    }
+
+    assert engine.commit_pending_compression([{"role": "user", "content": "kept"}])
+
+    assert engine._lineage_integrity_vetoes == expected_vetoes
+    if blocked:
+        assert engine.automatic_rebase_block_reason() == (
+            "CONTEXT_REBASE_LINEAGE_INTEGRITY_MISMATCH"
+        )
+    else:
+        assert engine.automatic_rebase_block_reason() is None
+    assert engine._pending_admission is None
+
+
 def test_failed_activation_replay_retains_pending_for_reconciliation():
     engine = _activation_engine()
     calls = 0

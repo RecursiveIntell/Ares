@@ -1188,9 +1188,8 @@ def build_turn_context(
             # Context is already over the compression threshold, but compression
             # is blocked (summary LLM cooldown or anti-thrashing). Without a
             # signal the session keeps growing until the model silently stops
-            # answering — the conversation hits the hard provider token limit
-            # with no explanation. Surface a deduped warning so the user can
-            # take action (/new or /compress) instead of hitting a silent hang.
+            # answering. Surface a deduped warning that states the admission
+            # risk without recommending an immediate compression retry.
             agent._warn_context_overflow_blocked(
                 _compress_block_reason,
                 _preflight_tokens,
