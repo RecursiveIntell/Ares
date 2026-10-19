@@ -5539,9 +5539,11 @@ def probe_opencode_free_execution(model_id: str) -> tuple[bool, str]:
         headers=headers,
         method="POST",
     )
+    from ares_runtime.physical_dispatch import unsupported_transport_scope
     try:
-        with urlopen(request, timeout=10) as response:
-            body = json.load(response)
+        with unsupported_transport_scope('opencode_setup_urlopen_probe'):
+            with urlopen(request, timeout=10) as response:
+                body = json.load(response)
         if isinstance(body, dict) and body.get("choices"):
             return True, ""
         return False, "The OpenCode Free relay returned no completion."

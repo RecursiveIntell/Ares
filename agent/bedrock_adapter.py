@@ -117,9 +117,10 @@ def _get_bedrock_runtime_client(region: str):
     """
     if region not in _bedrock_runtime_client_cache:
         boto3 = _require_boto3()
-        _bedrock_runtime_client_cache[region] = boto3.client(
+        from ares_runtime.physical_dispatch import bind_bedrock_client
+        _bedrock_runtime_client_cache[region] = bind_bedrock_client(boto3.client(
             "bedrock-runtime", region_name=region,
-        )
+        ))
     return _bedrock_runtime_client_cache[region]
 
 
@@ -1715,6 +1716,7 @@ def probe_bedrock_context_length(model_id: str, region: str) -> Optional[int]:
         logger.debug("Bedrock context probe skipped for %s: %s", model_id, exc)
         return None
 
+    from hermes_cli.middleware import EgressDispatchDenied, EgressOutcomeUnrecorded
     last_error = ""
     for tier_tokens in _BEDROCK_PROBE_TIERS:
         pad_words = int(tier_tokens / _WORDS_PER_TOKEN)
@@ -1733,6 +1735,8 @@ def probe_bedrock_context_length(model_id: str, region: str) -> Optional[int]:
                 "window is at least that", model_id, f"{tier_tokens:,}",
             )
             return tier_tokens
+        except (EgressDispatchDenied, EgressOutcomeUnrecorded):
+            raise
         except Exception as exc:
             msg = str(exc)
             last_error = msg

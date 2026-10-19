@@ -164,6 +164,13 @@ for _test_var in HERMES_TEST_IMAGE HERMES_TEST_WORKERS HERMES_TEST_PATHS \
   fi
 done
 
+# Exact test-only native executable input. Preserve an explicit empty value so
+# its consumer can reject it; never silently replace it with a debug artifact.
+# No RA_* glob or credential variable is admitted.
+if [ "${RA_DAEMON_BIN+x}" = x ]; then
+  TEST_ENV+=("RA_DAEMON_BIN=$RA_DAEMON_BIN")
+fi
+
 # ── Run in hermetic env ──────────────────────────────────────────────────────
 # env -i: start with empty environment, opt-in only what we need.
 # No credential var can leak — you'd have to explicitly add it here.

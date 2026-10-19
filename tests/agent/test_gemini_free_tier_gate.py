@@ -20,10 +20,15 @@ def _mock_response(status: int, headers: dict | None = None, text: str = "") -> 
 
 
 def _run_probe(resp: MagicMock) -> str:
-    with patch("agent.gemini_native_adapter.httpx.Client") as MC:
-        inst = MagicMock()
-        inst.post.return_value = resp
-        MC.return_value.__enter__.return_value = inst
+    import httpx
+    original = httpx.Client
+    def respond(request):
+        return httpx.Response(resp.status_code,headers=dict(resp.headers),text=resp.text,request=request)
+    class ProbeClient(original):
+        def __init__(self,*args,**kwargs):
+            kwargs.update(transport=httpx.MockTransport(respond),trust_env=False)
+            super().__init__(*args,**kwargs)
+    with patch("agent.gemini_native_adapter.httpx.Client",ProbeClient):
         return probe_gemini_tier("fake-key")
 
 

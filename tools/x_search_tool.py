@@ -52,6 +52,7 @@ from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+from hermes_cli.middleware import EgressDispatchDenied, EgressOutcomeUnrecorded
 
 from tools.registry import registry, tool_error
 from tools.xai_http import hermes_xai_user_agent, resolve_xai_http_credentials
@@ -363,9 +364,11 @@ def x_search_tool(
         timeout_seconds = _get_x_search_timeout_seconds()
         max_retries = _get_x_search_retries()
         response: Optional[requests.Response] = None
+        from ares_runtime.physical_dispatch import unsupported_transport_scope
         for attempt in range(max_retries + 1):
             try:
-                response = requests.post(
+                with unsupported_transport_scope('x_search_requests'):
+                    response = requests.post(
                     f"{base_url}/responses",
                     headers={
                         "Authorization": f"Bearer {api_key}",
@@ -449,6 +452,8 @@ def x_search_tool(
             },
             ensure_ascii=False,
         )
+    except (EgressDispatchDenied, EgressOutcomeUnrecorded):
+        raise
     except requests.HTTPError as e:
         logger.error("x_search failed: %s", e, exc_info=True)
         return json.dumps(

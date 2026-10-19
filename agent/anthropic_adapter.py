@@ -820,7 +820,8 @@ def _build_anthropic_client_with_bearer_hook(
     if common_betas:
         kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
 
-    client = _anthropic_sdk.Anthropic(**kwargs)
+    from ares_runtime.physical_dispatch import bind_inference_client
+    client = bind_inference_client(_anthropic_sdk.Anthropic(**kwargs))
     # Same env-inference trap as build_anthropic_client: auth_token-only
     # construction would otherwise also send ANTHROPIC_API_KEY as X-Api-Key.
     client.api_key = None
@@ -971,7 +972,8 @@ def build_anthropic_client(
         headers.setdefault("User-Agent", f"HermesAgent/{_HERMES_VERSION}")
         kwargs["default_headers"] = headers
 
-    client = _anthropic_sdk.Anthropic(**kwargs)
+    from ares_runtime.physical_dispatch import bind_inference_client
+    client = bind_inference_client(_anthropic_sdk.Anthropic(**kwargs))
     # Bearer-only construction leaves ``api_key`` unset, so the SDK fills it
     # from ``ANTHROPIC_API_KEY`` (Hermes loads that into the process env from
     # ``~/.hermes/.env``). The result is dual auth —

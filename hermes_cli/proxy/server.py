@@ -221,21 +221,28 @@ def create_app(adapter: UpstreamAdapter, *, host: str = DEFAULT_HOST,
                 raise RuntimeError(f"proxy session init failed: {exc}") from exc
 
             try:
-                upstream_resp = await session.request(
-                    request.method,
-                    upstream_url,
-                    data=body if body else None,
-                    headers=fwd_headers,
-                    allow_redirects=False,
-                )
+                from ares_runtime.physical_dispatch import unsupported_transport_scope
+                with unsupported_transport_scope('standalone_aiohttp_provider_proxy'):
+                    upstream_resp = await session.request(
+                        request.method,
+                        upstream_url,
+                        data=body if body else None,
+                        headers=fwd_headers,
+                        allow_redirects=False,
+                    )
             except Exception:
                 await session.close()
                 raise
             return session, upstream_resp
 
         async def _open_upstream(active_cred: UpstreamCredential):
+            from hermes_cli.middleware import EgressDispatchDenied, EgressOutcomeUnrecorded
             try:
                 return await _send_upstream(active_cred)
+            except EgressDispatchDenied as exc:
+                return _json_error(403, str(exc), code=exc.code), None
+            except EgressOutcomeUnrecorded as exc:
+                return _json_error(422, str(exc), code=exc.code), None
             except RuntimeError as exc:
                 return _json_error(500, str(exc)), None
             except aiohttp.ClientError as exc:
