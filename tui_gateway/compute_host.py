@@ -412,6 +412,30 @@ class ComputeHost:
         if sid in self._sessions:
             self._handle_spike_turn_start(frame)
             return
+        admitted, request_id = self._admit_real_turn(frame)
+        if not admitted:
+            self.emit({"type": "turn.error", "sid": sid, "request_id": request_id,
+                       "message": "session busy", "reason": "admission_refused_busy"})
+
+    def admit_autonomous_turn(self, frame: dict[str, Any]) -> bool:
+        """Admit an autonomously-initiated turn through the same registry as a
+        wire turn.start.
+
+        Autonomous producers running inside this child (the notification
+        poller, kanban delivery, /loop wakeups) call this instead of mutating
+        ``running`` directly, so owner lookup and resume always observe a
+        complete owner (running + request identity) and adopt it rather than
+        refusing with "compute-host running owner omitted its request id".
+        Returns True when the turn was admitted; False when another owner
+        holds the session (the caller retries later).
+        """
+        if not str(frame.get("sid") or ""):
+            return False
+        return self._admit_real_turn(frame)[0]
+
+    def _admit_real_turn(self, frame: dict[str, Any]) -> tuple[bool, str]:
+        """Register and submit one real turn. Returns (admitted, request_id)."""
+        sid = str(frame.get("sid") or "")
         payload = dict(frame)
         request_id = str(payload.get("request_id") or uuid.uuid4().hex)
         payload["request_id"] = request_id
@@ -426,9 +450,8 @@ class ComputeHost:
                         self._pending_interrupts.pop(sid, None)
                     raise
                 self._track_turn_future(future, sid)
-                return
-        self.emit({"type": "turn.error", "sid": sid, "request_id": request_id,
-                   "message": "session busy", "reason": "admission_refused_busy"})
+                return True, request_id
+        return False, request_id
 
     def _handle_spike_turn_start(self, frame: dict[str, Any]) -> None:
         sid = str(frame.get("sid") or "")
@@ -687,6 +710,8 @@ class ComputeHost:
                 session,
                 text,
                 display_kind=frame.get("display_kind") or None,
+                display_metadata=(frame.get("display_metadata")
+                                  if isinstance(frame.get("display_metadata"), dict) else None),
                 **({"context_input_event_id": frame["context_input_event_id"]}
                    if frame.get("context_input_event_id") is not None else {}),
             )
@@ -1203,6 +1228,13 @@ def run_host(stdin: Any = None, stdout: Any = None) -> None:
     os.environ["HERMES_COMPUTE_HOST_CHILD"] = "1"
     stdin = stdin or sys.stdin
     host = ComputeHost(stdout=stdout or sys.stdout)
+    from tui_gateway import server as _server
+
+    # Autonomous producers in this child (the notification poller, kanban
+    # delivery, /loop wakeups) dispatch through this admission so owner
+    # lookup and resume always observe a complete owner (running + request
+    # identity) instead of refusing with "omitted its request id".
+    _server.register_local_host_turn_admitter(host.admit_autonomous_turn)
     shutting_down = threading.Event()
 
     def _signal_handler(_signum, _frame) -> None:
