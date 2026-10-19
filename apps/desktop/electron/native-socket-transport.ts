@@ -165,6 +165,7 @@ export class NativeSocketTransport {
     if (this.watched.has(contents)) {
       return
     }
+
     this.watched.add(contents)
     contents.on('did-start-navigation', (_event: unknown, _url: string, inPlace: boolean, main: boolean) => {
       if (main && !inPlace) {
@@ -254,6 +255,7 @@ export class NativeSocketTransport {
     if (entry.dead) {
       return
     }
+
     entry.dead = true
     clearTimeout(entry.timer)
     clearInterval(entry.watchdog)
@@ -516,6 +518,7 @@ export class NativeSocketTransport {
     if (entry.closing) {
       return
     }
+
     entry.closing = true
     clearTimeout(entry.timer)
     entry.timer = setTimeout(() => this.finish(entry), CLOSE_MS)

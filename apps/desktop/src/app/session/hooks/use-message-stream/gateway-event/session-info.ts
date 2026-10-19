@@ -281,6 +281,7 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
             serviceTier: _tier,
             ...other
           } = statePatch
+
           const pending = state.pendingRuntimeOptions ?? incomingOptions
 
           const base =

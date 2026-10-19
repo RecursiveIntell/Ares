@@ -94,6 +94,7 @@ function requestFocus(id: string, closingHost: Element | null): void {
     if (intent !== requested) {
       return
     }
+
     flushTerminalFocus(id)
 
     if (intent === requested && --remaining > 0) {

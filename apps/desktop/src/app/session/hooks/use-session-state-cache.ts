@@ -39,8 +39,10 @@ interface SessionStateCacheOptions {
 function syncRuntimeMetadataToView(cached: ClientSessionState, sessionId: string) {
   // A staged RAF/warm cache is not newer than the admitted runtime projection.
   const live = $sessionStates.get()[sessionId]
+
   const state =
     live && (live.selectorObservation || live.pendingModelSelection || live.pendingRuntimeOptions) ? live : cached
+
   setCurrentModel(state.model ?? '')
   setCurrentProvider(state.provider ?? '')
   setCurrentReasoningEffort(state.reasoningEffort ?? '', false)

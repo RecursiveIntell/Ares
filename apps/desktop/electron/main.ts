@@ -7031,6 +7031,7 @@ async function resolveNativeTransportBackend(route, currentDocument) {
   if (connection.mode === 'local' && !localProof?.alive()) {
     throw new Error('Owned local backend admission unavailable')
   }
+
   const sshOwner = [...sshConnections.entries()].find(([, state]) => state.localPort === Number(base.port))
 
   if (connection.remoteKind === 'ssh' && !sshOwner) {
@@ -12350,6 +12351,7 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
     if (backendPool.get(poolKey) === entry) {
       backendPool.delete(poolKey)
     }
+
     rejectStart?.(error)
   })
   child.once('exit', (code, signal) => {
