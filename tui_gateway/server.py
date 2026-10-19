@@ -13980,15 +13980,18 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
     if goal_blocks_loop_tick(sid_key):
         return
 
+    _host_route = _autonomous_host_route_available()
     with session["history_lock"]:
         if session.get("running"):
             return  # busy — stays due, next poll retries
-        session["running"] = True
+        if not _host_route:
+            session["running"] = True
 
     wakeup = mgr.fire_tick()
     if not wakeup:
-        with session["history_lock"]:
-            session["running"] = False
+        if not _host_route:
+            with session["history_lock"]:
+                session["running"] = False
         return
 
     tick_no = mgr.state.ticks_fired if mgr.state else "?"
@@ -14002,8 +14005,11 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
         if wakeup.lstrip().startswith("/"):
             # Slash-command loop: route through the slash pipeline instead of
             # the model. No model reply to evaluate — complete immediately.
-            with session["history_lock"]:
-                session["running"] = False
+            # The busy slot (when this path claimed it) is released before the
+            # command runs; host-routed ticks never claimed it.
+            if not _host_route:
+                with session["history_lock"]:
+                    session["running"] = False
             try:
                 parts = wakeup.lstrip()[1:].split(None, 1)
                 resp = _methods["command.dispatch"](
@@ -14022,6 +14028,16 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
                     # The command resolves to a prompt (skill command etc.) —
                     # run it as a normal turn; the post-turn hook completes
                     # the tick.
+                    #
+                    # NOTE (2026-10-18): this command-bound follow-up is the
+                    # one autonomous path that still dispatches inline with a
+                    # pre-claimed busy slot. The tick's command side effects
+                    # are not replay-safe, so a refused host admission cannot
+                    # be deferred/abandoned here without risking duplicate
+                    # command effects. The reproduced class (notification
+                    # poller, kanban, model wakeups) routes through host
+                    # admission; converting this residual needs a replay-safe
+                    # tick-command contract.
                     with session["history_lock"]:
                         if session.get("running"):
                             mgr.abandon_tick()
@@ -14040,20 +14056,39 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
             if decision.get("message"):
                 _emit("status.update", sid, {"kind": "loop", "text": decision["message"]})
             return
-        _emit("message.start", sid)
-        _run_prompt_submit(
-            rid, sid, session, wakeup,
-            display_kind="internal_notification",
-            display_metadata={"synthetic_source": "loop"},
-        )
+        if _host_route:
+            admitted = _dispatch_autonomous_turn(
+                rid, sid, session, wakeup,
+                display_kind="internal_notification",
+                display_metadata={"synthetic_source": "loop"},
+            )
+            if not admitted:
+                # A busy owner holds the session: return the tick to the due
+                # state and retry on the next poll. The wakeup text is
+                # re-derived by fire_tick, so abandoning here cannot
+                # duplicate a side effect.
+                try:
+                    mgr.abandon_tick()
+                except Exception:
+                    pass
+                return
+            _emit("message.start", sid)
+        else:
+            _emit("message.start", sid)
+            _run_prompt_submit(
+                rid, sid, session, wakeup,
+                display_kind="internal_notification",
+                display_metadata={"synthetic_source": "loop"},
+            )
     except Exception as exc:
         print(
             f"[tui_gateway] loop wakeup dispatch failed: "
             f"{type(exc).__name__}: {exc}",
             file=sys.stderr,
         )
-        with session["history_lock"]:
-            session["running"] = False
+        if not _host_route:
+            with session["history_lock"]:
+                session["running"] = False
         try:
             mgr.abandon_tick()
         except Exception:
@@ -14215,6 +14250,54 @@ def _collect_kanban_notifications(session: dict) -> list:
     return texts
 
 
+# ── Autonomous-turn admission (compute-host child) ─────────────────────────
+#
+# Autonomous producers (the notification poller, kanban delivery, /loop
+# wakeups) historically ran their turns by setting ``running`` and calling
+# ``_run_prompt_submit`` directly. Inside the compute-host child that
+# bypassed the host's request-admission map, so the next resume could observe
+# ``running=True`` with no request identity and refuse with "compute-host
+# running owner omitted its request id". The child registers its host here at
+# startup; every autonomous dispatch then rides the same admission as a wire
+# turn.start, and owner lookup/resume always see a complete owner.
+_local_host_turn_admitter: Callable[[dict], bool] | None = None
+
+
+def register_local_host_turn_admitter(admitter: Callable[[dict], bool] | None) -> None:
+    """Register (or clear) the in-process host admission for autonomous turns."""
+    global _local_host_turn_admitter
+    _local_host_turn_admitter = admitter
+
+
+def _autonomous_host_route_available() -> bool:
+    return _inside_compute_host_child() and _local_host_turn_admitter is not None
+
+
+def _dispatch_autonomous_turn(
+    rid, sid: str, session: dict, text,
+    *, display_kind: str | None = None, display_metadata: dict | None = None,
+) -> bool:
+    """Dispatch an autonomous turn through the owning admission path.
+
+    Returns True when the work was admitted. In the compute-host child the
+    turn is admitted by the registered host (a complete owner: request id +
+    running); elsewhere the historical inline dispatch is preserved.
+    """
+    admitter = _local_host_turn_admitter if _inside_compute_host_child() else None
+    if admitter is not None:
+        return bool(admitter({
+            "sid": sid,
+            "request_id": f"auto-turn-{uuid.uuid4().hex}",
+            "text": text,
+            "display_kind": display_kind,
+            "display_metadata": display_metadata,
+        }))
+    return bool(_run_prompt_submit(
+        rid, sid, session, text,
+        display_kind=display_kind, display_metadata=display_metadata,
+    ))
+
+
 def _notification_poller_loop(
     stop_event: threading.Event, sid: str, session: dict
 ) -> None:
@@ -14274,28 +14357,54 @@ def _notification_poller_loop(
             _pending = session.get("_kanban_pending") or []
             if _pending:
                 _batch: list = []
+                _kb_host_route = _autonomous_host_route_available()
                 with session["history_lock"]:
                     if not session.get("running"):
-                        session["running"] = True
+                        if not _kb_host_route:
+                            session["running"] = True
                         _batch = list(_pending)
                         session["_kanban_pending"] = []
                 if _batch:
                     rid = f"__notif__{int(time.time() * 1000)}"
+
+                    def _rebuffer_kanban_batch() -> None:
+                        # Busy/refused dispatch must not drop cursor-claimed
+                        # kanban events: keep the batch at the head of the
+                        # retry buffer for the next poll.
+                        with session["history_lock"]:
+                            session["_kanban_pending"] = (
+                                list(_batch) + (session.get("_kanban_pending") or [])
+                            )
+
                     try:
-                        _emit("message.start", sid)
-                        _run_prompt_submit(
-                            rid, sid, session, "\n".join(_batch),
-                            display_kind="internal_notification",
-                            display_metadata={"synthetic_source": "kanban_notification"},
-                        )
+                        if _kb_host_route:
+                            admitted = _dispatch_autonomous_turn(
+                                rid, sid, session, "\n".join(_batch),
+                                display_kind="internal_notification",
+                                display_metadata={"synthetic_source": "kanban_notification"},
+                            )
+                            if not admitted:
+                                _rebuffer_kanban_batch()
+                            else:
+                                _emit("message.start", sid)
+                        else:
+                            _emit("message.start", sid)
+                            _run_prompt_submit(
+                                rid, sid, session, "\n".join(_batch),
+                                display_kind="internal_notification",
+                                display_metadata={"synthetic_source": "kanban_notification"},
+                            )
                     except Exception as exc:
                         print(
                             f"[tui_gateway] kanban notification dispatch failed: "
                             f"{type(exc).__name__}: {exc}",
                             file=sys.stderr,
                         )
-                        with session["history_lock"]:
-                            session["running"] = False
+                        if _kb_host_route:
+                            _rebuffer_kanban_batch()
+                        else:
+                            with session["history_lock"]:
+                                session["running"] = False
         try:
             evt = process_registry.completion_queue.get(timeout=0.5)
         except Exception:
@@ -14351,11 +14460,12 @@ def _notification_poller_loop(
             _emitted.add(_dedup_key)
 
         _requeued = False
+        _host_route = _autonomous_host_route_available()
         with session["history_lock"]:
             if session.get("running"):
                 process_registry.completion_queue.put(evt)
                 _requeued = True
-            else:
+            elif not _host_route:
                 session["running"] = True
         if _requeued:
             # Back off before re-polling: the re-queued event keeps the queue
@@ -14374,26 +14484,48 @@ def _notification_poller_loop(
             # local UI turn slot before consulting the durable arbiter, so
             # release that speculative busy state instead of leaving the
             # session permanently stuck as running.
-            with session["history_lock"]:
-                session["running"] = False
+            if not _host_route:
+                with session["history_lock"]:
+                    session["running"] = False
             continue
         try:
-            _emit("message.start", sid)
-            if evt.get("type") == "async_delegation":
-                _run_prompt_submit(
-                    rid,
-                    sid,
-                    session,
-                    text,
-                    display_kind="async_delegation_complete",
-                    display_metadata=_async_delegation_display_metadata(evt),
-                )
-            else:
-                _run_prompt_submit(
+            if _host_route:
+                # The child's registered host performs the same admission a
+                # wire turn.start would — a complete owner (running + request
+                # id) registers before the work starts. A refusal is a real
+                # busy owner: release the claim and retry the event later.
+                admitted = _dispatch_autonomous_turn(
                     rid, sid, session, text,
-                    display_kind="internal_notification",
-                    display_metadata={"synthetic_source": "background_notification"},
+                    display_kind=("async_delegation_complete"
+                                  if evt.get("type") == "async_delegation"
+                                  else "internal_notification"),
+                    display_metadata=(_async_delegation_display_metadata(evt)
+                                      if evt.get("type") == "async_delegation"
+                                      else {"synthetic_source": "background_notification"}),
                 )
+                if not admitted:
+                    release_event_delivery(evt, _claim)
+                    process_registry.completion_queue.put(evt)
+                    time.sleep(0.25)
+                    continue
+                _emit("message.start", sid)
+            else:
+                _emit("message.start", sid)
+                if evt.get("type") == "async_delegation":
+                    _run_prompt_submit(
+                        rid,
+                        sid,
+                        session,
+                        text,
+                        display_kind="async_delegation_complete",
+                        display_metadata=_async_delegation_display_metadata(evt),
+                    )
+                else:
+                    _run_prompt_submit(
+                        rid, sid, session, text,
+                        display_kind="internal_notification",
+                        display_metadata={"synthetic_source": "background_notification"},
+                    )
             complete_event_delivery(evt, _claim)
         except Exception as exc:
             release_event_delivery(evt, _claim)
@@ -14402,8 +14534,14 @@ def _notification_poller_loop(
                 f"{type(exc).__name__}: {exc}",
                 file=sys.stderr,
             )
-            with session["history_lock"]:
-                session["running"] = False
+            if _host_route:
+                process_registry.completion_queue.put(evt)
+                # Bounded retry backoff: a persistent dispatch fault must not
+                # spin the poller at full speed while it retries the event.
+                time.sleep(0.5)
+            else:
+                with session["history_lock"]:
+                    session["running"] = False
 
     # Drain any remaining events after stop signal (process all pending
     # before exiting so nothing is lost on shutdown). Events owned by other
@@ -14446,11 +14584,13 @@ def _notification_poller_loop(
             _emit("status.update", sid, {"kind": "process", "text": text})
             _emitted.add(_dedup_key)
 
+        _host_route = _autonomous_host_route_available()
         with session["history_lock"]:
             if session.get("running"):
                 process_registry.completion_queue.put(evt)
                 break
-            session["running"] = True
+            if not _host_route:
+                session["running"] = True
 
         rid = f"__notif__{int(time.time() * 1000)}"
         from tools.async_delegation import (
@@ -14462,29 +14602,46 @@ def _notification_poller_loop(
             # local UI turn slot before consulting the durable arbiter, so
             # release that speculative busy state instead of leaving the
             # session permanently stuck as running.
-            with session["history_lock"]:
-                session["running"] = False
+            if not _host_route:
+                with session["history_lock"]:
+                    session["running"] = False
             continue
         try:
-            _emit("message.start", sid)
-            if evt.get("type") == "async_delegation":
-                _run_prompt_submit(
-                    rid,
-                    sid,
-                    session,
-                    text,
-                    display_kind="async_delegation_complete",
-                    display_metadata=_async_delegation_display_metadata(evt),
+            if _host_route:
+                admitted = _dispatch_autonomous_turn(
+                    rid, sid, session, text,
+                    display_kind=("async_delegation_complete"
+                                  if evt.get("type") == "async_delegation"
+                                  else "internal_notification"),
+                    display_metadata=(_async_delegation_display_metadata(evt)
+                                      if evt.get("type") == "async_delegation"
+                                      else {"synthetic_source": "background_notification"}),
                 )
+                if not admitted:
+                    release_event_delivery(evt, _claim)
+                    process_registry.completion_queue.put(evt)
+                    break
+                _emit("message.start", sid)
             else:
-                _run_prompt_submit(
-                    rid,
-                    sid,
-                    session,
-                    text,
-                    display_kind="internal_notification",
-                    display_metadata={"synthetic_source": "background_notification"},
-                )
+                _emit("message.start", sid)
+                if evt.get("type") == "async_delegation":
+                    _run_prompt_submit(
+                        rid,
+                        sid,
+                        session,
+                        text,
+                        display_kind="async_delegation_complete",
+                        display_metadata=_async_delegation_display_metadata(evt),
+                    )
+                else:
+                    _run_prompt_submit(
+                        rid,
+                        sid,
+                        session,
+                        text,
+                        display_kind="internal_notification",
+                        display_metadata={"synthetic_source": "background_notification"},
+                    )
             complete_event_delivery(evt, _claim)
         except Exception as exc:
             release_event_delivery(evt, _claim)
@@ -14493,8 +14650,15 @@ def _notification_poller_loop(
                 f"{type(exc).__name__}: {exc}",
                 file=sys.stderr,
             )
-            with session["history_lock"]:
-                session["running"] = False
+            if _host_route:
+                # Keep the event for the resume-time poller instead of
+                # dropping it, but stop draining: a persistent dispatch fault
+                # must not loop this finite shutdown drain.
+                process_registry.completion_queue.put(evt)
+                break
+            else:
+                with session["history_lock"]:
+                    session["running"] = False
 
     # Hand any other sessions' events back to the shared queue.
     for evt in deferred:
