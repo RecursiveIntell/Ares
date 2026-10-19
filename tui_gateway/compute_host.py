@@ -710,8 +710,8 @@ class ComputeHost:
                 session,
                 text,
                 display_kind=frame.get("display_kind") or None,
-                display_metadata=(frame.get("display_metadata")
-                                  if isinstance(frame.get("display_metadata"), dict) else None),
+                **({"display_metadata": frame["display_metadata"]}
+                   if isinstance(frame.get("display_metadata"), dict) else {}),
                 **({"context_input_event_id": frame["context_input_event_id"]}
                    if frame.get("context_input_event_id") is not None else {}),
             )
