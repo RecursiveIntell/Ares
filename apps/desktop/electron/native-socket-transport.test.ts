@@ -81,6 +81,22 @@ test.each(['/../events', '/%2e%2e/events', '//hostile.invalid', '/events?token=x
     ).toThrow()
   }
 )
+test.each(['/events?board=default', '/events?board=my-board_2', '/events?board=a%20b'])(
+  'preserve kanban board query on plugin suffix %s',
+  suffix => {
+    expect(
+      validateNativeOpen({ ...request(), channel: { kind: 'plugin', pluginId: 'kanban', suffix } })
+    ).toMatchObject({ channel: { kind: 'plugin', pluginId: 'kanban', suffix } })
+  }
+)
+test.each(['/events?board=', '/events?board=a&x=1', '/events?token=x', '/events?board=a/../b', '/events?board=a?b'])(
+  'reject non-board or malformed plugin query %s',
+  suffix => {
+    expect(() =>
+      validateNativeOpen({ ...request(), channel: { kind: 'plugin', pluginId: 'kanban', suffix } })
+    ).toThrow()
+  }
+)
 test('attachment upper bound covers raw 256 MiB base64 plus JSON without allocating it', () => {
   expect(GATEWAY_MESSAGE_BYTES).toBeGreaterThan(Math.ceil((256 * 1024 * 1024) / 3) * 4 + 4096)
 })

@@ -54,7 +54,18 @@ export function validateNativeOpen(raw: unknown): NativeSocketOpen {
     // No URL, query credentials, encoded traversal, backslash, or namespace escape.
     const suffix = raw.channel.suffix
 
-    if (typeof suffix !== 'string' || suffix.length > 512 || !/^\/(?:[A-Za-z0-9_-]+\/?)*$/.test(suffix))
+    if (typeof suffix !== 'string' || suffix.length > 512)
+      {throw new Error('Invalid plugin suffix')}
+    // Kanban's selected-board stream selects its board via `/events?board=<slug>`;
+    // preserve exactly that one non-credential parameter and nothing else.
+    const queryAt = suffix.indexOf('?')
+    const suffixPath = queryAt === -1 ? suffix : suffix.slice(0, queryAt)
+    const suffixQuery = queryAt === -1 ? '' : suffix.slice(queryAt)
+
+    if (!/^\/(?:[A-Za-z0-9_-]+\/?)*$/.test(suffixPath))
+      {throw new Error('Invalid plugin suffix')}
+    if (suffixQuery && !/^\?board=[A-Za-z0-9-_.~!*'()%]{1,256}$/.test(suffixQuery))
+      {throw new Error('Invalid plugin suffix')}
       {throw new Error('Invalid plugin suffix')}
   } else {throw new Error('Invalid transport channel')}
 
