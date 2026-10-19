@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 
 import httpx
+import pytest
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from hermes_cli import web_server as ws
@@ -15,7 +16,10 @@ from tests.hermes_cli.test_p2_browser_network import serve
 
 
 def test_redeemed_bootstrap_does_not_send_api_bearer_to_sibling_port(monkeypatch):
-    from playwright.sync_api import sync_playwright
+    # Browser-dependent gate: run where playwright is installed (Desktop E2E,
+    # controller build) rather than failing unit slices for its absence.
+    playwright = pytest.importorskip("playwright.sync_api")
+    sync_playwright = playwright.sync_playwright
     monkeypatch.delenv("HERMES_SERVE_HEADLESS", raising=False)
     assert (ws.WEB_DIST / "index.html").is_file(), "Build the current production web frontend before this gate"
     dashboard = FastAPI()
