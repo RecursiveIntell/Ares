@@ -2997,6 +2997,7 @@ def _(rid, params: dict) -> dict:
                 sid,
                 route_name="session.compress",
                 command=command,
+                payload={"session_snapshot": _compute_host_turn_frame(rid, sid, session, "")},
                 wait=True,
                 timeout=120.0,
             )

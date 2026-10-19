@@ -11,6 +11,13 @@ const translucencySupport = ipcRenderer.sendSync('hermes:translucency:support')
 const hudWindowing = ipcRenderer.sendSync('hermes:hud:windowing')
 const hudNativeDrag = hudWindowing?.nativeDrag === true
 
+// Filter by correlation before contextBridge copies a payload. A 384 MiB
+// attachment must never be replicated to every socket listener in the renderer.
+const nativeSocketListeners = new Map<string, (payload: any) => void>()
+ipcRenderer.on('hermes:transport:event', (_event, payload) => {
+  nativeSocketListeners.get(payload?.correlation)?.(payload)
+})
+
 contextBridge.exposeInMainWorld('hermesDesktop', {
   glassSupported: translucencySupport?.glass === true,
   translucencySupported: translucencySupport?.translucency === true,
@@ -20,10 +27,27 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   getProfileRoutes: profiles => ipcRenderer.invoke('hermes:plugin-profile-routes', profiles),
   revalidateConnection: () => ipcRenderer.invoke('hermes:connection:revalidate'),
   touchBackend: profile => ipcRenderer.invoke('hermes:backend:touch', profile),
-  getGatewayWsUrl: profile => ipcRenderer.invoke('hermes:gateway:ws-url', profile),
-  // Registry-scoped fresh WS URL: { connectionId, profile } → result shape of
-  // getGatewayWsUrl, minted against that connection's backend.
-  getGatewayWsUrlFor: payload => ipcRenderer.invoke('hermes:gateway:ws-url-for', payload),
+  nativeSocket: {
+    open: request => ipcRenderer.invoke('hermes:transport:open', request),
+    send: request => ipcRenderer.invoke('hermes:transport:send', request),
+    close: request => ipcRenderer.invoke('hermes:transport:close', request),
+    ack: request => ipcRenderer.invoke('hermes:transport:ack', request),
+    onEvent: (correlation, callback) => {
+      if (
+        typeof correlation !== 'string' ||
+        !/^[A-Za-z0-9_-]{1,128}$/.test(correlation) ||
+        nativeSocketListeners.has(correlation) ||
+        nativeSocketListeners.size >= 24
+      )
+        {throw new Error('Native socket subscription denied')}
+
+      nativeSocketListeners.set(correlation, callback)
+
+      return () => {
+        if (nativeSocketListeners.get(correlation) === callback) {nativeSocketListeners.delete(correlation)}
+      }
+    }
+  },
   // Union agent roster across every registered connection.
   getAgentRoster: () => ipcRenderer.invoke('hermes:agents:roster'),
   openSessionWindow: (sessionId, opts) => ipcRenderer.invoke('hermes:window:openSession', sessionId, opts),

@@ -64,7 +64,17 @@ export class JsonRpcGatewayError extends Error {
   }
 }
 
-export type WebSocketLike = WebSocket
+export interface WebSocketLike {
+  readonly readyState: number
+  send(data: string): void
+  close(code?: number, reason?: string): void
+  addEventListener<K extends keyof WebSocketEventMap>(
+    type: K,
+    listener: (event: WebSocketEventMap[K]) => void,
+    options?: boolean | AddEventListenerOptions
+  ): void
+  removeEventListener<K extends keyof WebSocketEventMap>(type: K, listener: (event: WebSocketEventMap[K]) => void): void
+}
 
 type PendingCall = {
   reject: (error: Error) => void
@@ -183,7 +193,13 @@ export class JsonRpcGatewayClient {
 
     this.setState('connecting')
 
-    const socket = this.options.socketFactory?.(wsUrl) ?? new WebSocket(wsUrl)
+    let socket: WebSocketLike
+    try {
+      socket = this.options.socketFactory?.(wsUrl) ?? new WebSocket(wsUrl)
+    } catch (error) {
+      this.setState('error')
+      throw error
+    }
     this.socket = socket
     this.stopHeartbeat()
 
@@ -239,7 +255,7 @@ export class JsonRpcGatewayClient {
         void this.fetchReplay()
       }
 
-      const onError = () => {
+      const onError = (event: Event) => {
         if (settled || this.socket !== socket) {
           return
         }
@@ -247,7 +263,7 @@ export class JsonRpcGatewayClient {
         settled = true
         cleanup()
         this.setState('error')
-        reject(new Error(this.options.connectErrorMessage))
+        reject((event as Event & { error?: Error }).error ?? new Error(this.options.connectErrorMessage))
       }
 
       socket.addEventListener('open', onOpen, { once: true })

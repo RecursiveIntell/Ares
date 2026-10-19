@@ -87,10 +87,19 @@ def _path_is_public(path: str) -> bool:
 
 
 def _client_ip(request: Request) -> str:
-    fwd = request.headers.get("x-forwarded-for", "")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    return request.client.host if request.client else ""
+    from hermes_cli.dashboard_auth.routes import _client_ip as resolved_peer
+    return resolved_peer(request)
+
+
+def _cookie_origin_denial(request: Request):
+    if request.method in {"GET", "HEAD", "OPTIONS"}:
+        return None
+    at, rt = read_session_cookies(request)
+    if at or rt:
+        from hermes_cli.dashboard_auth.origins import origin_allowed
+        if not origin_allowed(request.headers.get("origin", ""), request.scope):
+            return JSONResponse({"detail": "Cookie request origin denied"}, status_code=403)
+    return None
 
 
 def _ordered_session_providers(
@@ -340,8 +349,11 @@ async def gated_auth_middleware(
         return await call_next(request)
 
     path = request.url.path
-    if _path_is_public(path):
+    if path == "/auth/desktop-bootstrap":
         return await call_next(request)
+    if _path_is_public(path):
+        denial = _cookie_origin_denial(request)
+        return denial if denial is not None else await call_next(request)
 
     # RFC 8252 native-app bearer path (goal: no session cookies). The desktop
     # authenticates REST with ``Authorization: Bearer <access_token>`` — the
@@ -372,6 +384,9 @@ async def gated_auth_middleware(
         # re-login, rather than falling through to the cookie/login redirect.
         return _unauth_response(request, reason="invalid_or_expired_session")
 
+    denial = _cookie_origin_denial(request)
+    if denial is not None:
+        return denial
     at, _rt = read_session_cookies(request)
     provider_hint = read_session_provider(request)
     if not at and not _rt:

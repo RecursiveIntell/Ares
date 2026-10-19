@@ -27,7 +27,7 @@ export function createRemoteWsHeaderStore(limit = 100) {
   const headersByUrl = new Map<string, Record<string, string>>()
 
   const remember = (wsUrl: string, headers: Record<string, string> = {}) => {
-    if (!wsUrl || Object.keys(headers).length === 0) {
+    if (!wsUrl) {
       return
     }
 
@@ -58,7 +58,10 @@ export function createRemoteWsHeaderStore(limit = 100) {
     return headers
   }
 
-  return { headersFor, remember }
+  // This is the existing descriptor/header projection, not an enrollment API.
+  const hasExact = (requestUrl: string): boolean => headersByUrl.has(String(requestUrl))
+
+  return { headersFor, remember, hasExact }
 }
 
 export function applyRemoteRequestHeaders(

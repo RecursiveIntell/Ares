@@ -1,6 +1,7 @@
-import { type ConnectionState, type GatewayEvent, registryBackendScopeKey, resolveGatewayWsUrl } from '@hermes/shared'
+import { type ConnectionState, type GatewayEvent, registryBackendScopeKey } from '@hermes/shared'
 import { atom } from 'nanostores'
 
+import { nativeRoute, resolveDesktopGatewayDial } from '@/api/native-socket'
 import type { HermesConnection } from '@/global'
 import { HermesGateway, setApiRequestConnection } from '@/hermes'
 import { reconnectBackoffDelayMs } from '@/lib/reconnect-backoff'
@@ -512,7 +513,7 @@ async function openSecondary(entry: Secondary): Promise<void> {
           : desktop
 
     const wsUrl = await withTimeout(
-      resolveGatewayWsUrl(wsDeps, conn),
+      resolveDesktopGatewayDial(wsDeps, conn, nativeRoute(entry.profile, entry.connectionId)),
       RECONNECT_ATTEMPT_TIMEOUT_MS,
       `Timed out re-minting the gateway WebSocket URL for profile "${entry.profile}"`
     )

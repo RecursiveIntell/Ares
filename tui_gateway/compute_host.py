@@ -951,10 +951,11 @@ class ComputeHost:
                 return
             if session is None:
                 snapshot = frame.get("session_snapshot")
-                if route_name in {"config.set.model", "config.set.reasoning", "config.set.fast", "config.set.runtime_options"} and isinstance(snapshot, dict) and snapshot.get("sid") == sid:
+                if route_name in {"config.set.model", "config.set.reasoning", "config.set.fast", "config.set.runtime_options", "session.compress"} and isinstance(snapshot, dict) and snapshot.get("sid") == sid:
                     # A new draft has no host session until its first turn.
                     # Rebuild from the serving gateway's committed snapshot;
-                    # this also repairs a host restart before another turn.
+                    # this also repairs a host restart or manual compaction
+                    # of a resumed session before another provider turn.
                     session = self._ensure_server_session(server, snapshot)
                 else:
                     self.emit({"type": "control.error", "sid": sid, "request_id": request_id, "message": "session not found"})

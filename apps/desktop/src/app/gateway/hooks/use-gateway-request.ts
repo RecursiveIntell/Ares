@@ -1,7 +1,8 @@
-import { isGatewayReauthRequired, resolveGatewayWsUrl } from '@hermes/shared'
+import { isGatewayReauthRequired } from '@hermes/shared'
 import { useStore } from '@nanostores/react'
 import { useCallback, useEffect, useRef } from 'react'
 
+import { resolveDesktopGatewayDial } from '@/api/native-socket'
 import type { HermesGateway } from '@/hermes'
 import {
   gatewayDeliveryUnknownError,
@@ -100,7 +101,7 @@ export function useGatewayRequest() {
         // retryable. Stash only the former so requestGateway can show the
         // actionable "sign in again" message.
         const wsUrl = await withTimeout(
-          resolveGatewayWsUrl(desktop, conn),
+          resolveDesktopGatewayDial(desktop, conn),
           RECONNECT_ATTEMPT_TIMEOUT_MS,
           'Timed out re-minting the gateway WebSocket URL'
         )
