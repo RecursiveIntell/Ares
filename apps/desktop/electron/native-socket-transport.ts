@@ -66,7 +66,6 @@ export function validateNativeOpen(raw: unknown): NativeSocketOpen {
       {throw new Error('Invalid plugin suffix')}
     if (suffixQuery && !/^\?board=[A-Za-z0-9-_.~!*'()%]{1,256}$/.test(suffixQuery))
       {throw new Error('Invalid plugin suffix')}
-      {throw new Error('Invalid plugin suffix')}
   } else {throw new Error('Invalid transport channel')}
 
   return raw as NativeSocketOpen
