@@ -194,12 +194,14 @@ export class JsonRpcGatewayClient {
     this.setState('connecting')
 
     let socket: WebSocketLike
+
     try {
       socket = this.options.socketFactory?.(wsUrl) ?? new WebSocket(wsUrl)
     } catch (error) {
       this.setState('error')
       throw error
     }
+
     this.socket = socket
     this.stopHeartbeat()
 

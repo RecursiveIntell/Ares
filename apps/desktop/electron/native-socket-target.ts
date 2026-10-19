@@ -21,13 +21,18 @@ export async function prepareNativeSocketTarget(
   deps.current()
   const base = new URL(connection.baseUrl)
 
-  if (!['http:', 'https:'].includes(base.protocol) || base.username || base.password || base.search || base.hash)
-    {throw new Error('Invalid canonical backend')}
+  if (!['http:', 'https:'].includes(base.protocol) || base.username || base.password || base.search || base.hash) {
+    throw new Error('Invalid canonical backend')
+  }
 
   const headers = { ...(connection.headers ?? {}) }
 
   // Always override any case variant of Origin in canonical configured headers.
-  for (const key of Object.keys(headers)) {if (key.toLowerCase() === 'origin') {delete headers[key]}}
+  for (const key of Object.keys(headers)) {
+    if (key.toLowerCase() === 'origin') {
+      delete headers[key]
+    }
+  }
   headers.Origin = base.origin
 
   const target = new URL(
@@ -43,24 +48,30 @@ export async function prepareNativeSocketTarget(
 
   if (connection.authMode === 'oauth') {
     // Existing plugin API has no verified ticket path: polling remains its fallback.
-    if (channel.kind === 'plugin')
-      {throw Object.assign(new Error('Plugin OAuth stream unavailable; use polling'), { code: 'PLUGIN_OAUTH_POLLING' })}
+    if (channel.kind === 'plugin') {
+      throw Object.assign(new Error('Plugin OAuth stream unavailable; use polling'), { code: 'PLUGIN_OAUTH_POLLING' })
+    }
 
     const ticket = await deps.mint(connection.baseUrl, connection.headers ?? {})
     deps.current() // Fresh ticket may complete after source or document retirement.
     target.searchParams.set('ticket', ticket)
   } else {
-    if (!connection.token) {throw new Error('Canonical backend has no transport credential')}
+    if (!connection.token) {
+      throw new Error('Canonical backend has no transport credential')
+    }
     target.searchParams.set('token', connection.token)
   }
 
-  if (connection.sharedRemote || connection.sharedPrimary)
-    {target.searchParams.set('profile', connection.profile || 'default')}
+  if (connection.sharedRemote || connection.sharedPrimary) {
+    target.searchParams.set('profile', connection.profile || 'default')
+  }
 
   if (channel.kind === 'tts' && !target.searchParams.has('profile')) {
     const profile = connection.remoteProfile ?? connection.profile
 
-    if (profile) {target.searchParams.set('profile', profile)}
+    if (profile) {
+      target.searchParams.set('profile', profile)
+    }
   }
 
   deps.current()

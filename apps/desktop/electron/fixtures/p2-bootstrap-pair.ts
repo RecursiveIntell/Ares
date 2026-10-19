@@ -161,7 +161,9 @@ async function run() {
       )
     )
   } finally {
-    if (child.exitCode === null) {child.kill('SIGTERM')}
+    if (child.exitCode === null) {
+      child.kill('SIGTERM')
+    }
     let timer: ReturnType<typeof setTimeout> | undefined
     await Promise.race([
       stopped,
@@ -172,7 +174,9 @@ async function run() {
         }, 10000)
       })
     ]).finally(() => {
-      if (timer) {clearTimeout(timer)}
+      if (timer) {
+        clearTimeout(timer)
+      }
     })
   }
 

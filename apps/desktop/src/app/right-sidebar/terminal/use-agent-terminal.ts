@@ -135,7 +135,9 @@ export function useAgentTerminal({ active, id, procId }: { active: boolean; id: 
       mountedRef.current = true
 
       const unregisterFocus = registerTerminalFocus(id, () => {
-        if (!terminalHostVisible(host)) { return false }
+        if (!terminalHostVisible(host)) {
+          return false
+        }
         term.focus()
 
         return true
@@ -143,7 +145,10 @@ export function useAgentTerminal({ active, id, procId }: { active: boolean; id: 
 
       const previousUnregister = unregister
 
-      unregister = () => { previousUnregister(); unregisterFocus() }
+      unregister = () => {
+        previousUnregister()
+        unregisterFocus()
+      }
 
       try {
         const webgl = new WebglAddon()
@@ -164,7 +169,10 @@ export function useAgentTerminal({ active, id, procId }: { active: boolean; id: 
       const unregisterWriter = registerAgentTerminalWriter(procId, chunk => term.write(chunk))
       const unregisterMounted = unregister
 
-      unregister = () => { unregisterMounted(); unregisterWriter() }
+      unregister = () => {
+        unregisterMounted()
+        unregisterWriter()
+      }
       unregisterReader = registerTerminalReader(id, makeTerminalReader(term))
     }
 

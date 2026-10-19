@@ -112,10 +112,7 @@ export class AppDocumentUrl {
   }
 }
 
-function safeStat(
-  stat: (indexPath: string) => AppDocumentUrlStat,
-  indexPath: string
-): AppDocumentUrlStat | null {
+function safeStat(stat: (indexPath: string) => AppDocumentUrlStat, indexPath: string): AppDocumentUrlStat | null {
   try {
     return stat(indexPath) ?? null
   } catch {

@@ -57,6 +57,7 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
   const activeSessionId = useStore(view.$runtimeId)
   const owner = knownOwnerForSession(activeSessionId)
   const draftOwner = useDraftComposerOwner()
+
   const connectionId =
     owner && typeof owner === 'object'
       ? owner.connectionId
@@ -65,6 +66,7 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
         : !activeSessionId
           ? draftOwner.connectionId
           : activeGatewayConnectionId()
+
   const catalogProfile =
     (typeof owner === 'string' ? owner : owner?.targetProfile || owner?.profile) ||
     (!activeSessionId ? draftOwner.targetProfile || draftOwner.profile : profile)

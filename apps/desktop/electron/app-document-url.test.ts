@@ -7,6 +7,7 @@ const INDEX = '/app/dist/index.html'
 describe('AppDocumentUrl', () => {
   test('resolves the bundle exactly once across repeated calls', () => {
     let calls = 0
+
     const url = new AppDocumentUrl({
       resolveIndex: () => {
         calls += 1
@@ -27,6 +28,7 @@ describe('AppDocumentUrl', () => {
   test('stays cached while the index is untouched, even with a stat probe', () => {
     let calls = 0
     let stats = { mtimeMs: 1000, size: 5000 }
+
     const url = new AppDocumentUrl({
       resolveIndex: () => {
         calls += 1
@@ -48,6 +50,7 @@ describe('AppDocumentUrl', () => {
     let calls = 0
     let indexPath = INDEX
     let stats = { mtimeMs: 1000, size: 5000 }
+
     const url = new AppDocumentUrl({
       resolveIndex: () => {
         calls += 1
@@ -76,6 +79,7 @@ describe('AppDocumentUrl', () => {
 
   test('an unreadable stat keeps the cached identity instead of re-walking', () => {
     let calls = 0
+
     const url = new AppDocumentUrl({
       resolveIndex: () => {
         calls += 1
@@ -95,6 +99,7 @@ describe('AppDocumentUrl', () => {
 
   test('dev server short-circuits without touching the bundle', () => {
     let calls = 0
+
     const url = new AppDocumentUrl({
       devServer: 'http://127.0.0.1:5174/',
       resolveIndex: () => {
@@ -112,6 +117,7 @@ describe('AppDocumentUrl', () => {
 
   test('invalidate() re-resolves on demand', () => {
     let calls = 0
+
     const url = new AppDocumentUrl({
       resolveIndex: () => {
         calls += 1
@@ -131,10 +137,12 @@ describe('AppDocumentUrl', () => {
     // The security property is unaffected by caching: the cached URL is
     // compared to the frame's URL on every admission.
     const { isAppDocument } = await import('./guest-policy')
+
     const url = new AppDocumentUrl({
       resolveIndex: () => INDEX,
       toUrl: path => `file://${path}`
     })
+
     const appUrl = url.resolve()
 
     expect(isAppDocument('file:///app/dist/index.html#/20260101_000000_abc123', appUrl)).toBe(true)

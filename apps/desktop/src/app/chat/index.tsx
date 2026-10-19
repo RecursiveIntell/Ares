@@ -48,7 +48,12 @@ import {
   sessionPinId,
   shouldMigrateComposerScope
 } from '@/store/session'
-import { $focusedStoredSessionId, knownOwnerForSession, requestForOwnedSession, sessionTileDelegate } from '@/store/session-states'
+import {
+  $focusedStoredSessionId,
+  knownOwnerForSession,
+  requestForOwnedSession,
+  sessionTileDelegate
+} from '@/store/session-states'
 import { $transcriptTailBySessionId, transcriptTailState } from '@/store/transcript-tail'
 import { isAuxiliaryWindow, isWatchWindow } from '@/store/windows'
 import type { ModelOptionsResponse } from '@/types/hermes'
@@ -526,14 +531,29 @@ const ChatViewContent = memo(function ChatViewContent({
   const threadKey = selectedSessionId || activeSessionId || (isRoutedSessionView ? location.pathname : 'new')
 
   const catalogOwner = knownOwnerForSession(activeSessionId)
-  const catalogProfile = (typeof catalogOwner === 'string' ? catalogOwner : catalogOwner?.targetProfile || catalogOwner?.profile) || activeGatewayProfile
-  const catalogConnection = catalogOwner && typeof catalogOwner === 'object' ? catalogOwner.connectionId : catalogOwner ? 'local' : getApiRequestConnection()
+  const catalogProfile =
+    (typeof catalogOwner === 'string' ? catalogOwner : catalogOwner?.targetProfile || catalogOwner?.profile) ||
+    activeGatewayProfile
+  const catalogConnection =
+    catalogOwner && typeof catalogOwner === 'object'
+      ? catalogOwner.connectionId
+      : catalogOwner
+        ? 'local'
+        : getApiRequestConnection()
+
   const modelOptionsQuery = useQuery<ModelOptionsResponse>({
     queryKey: modelOptionsQueryKey(catalogProfile, activeSessionId, catalogConnection),
-    queryFn: () => requestModelOptions({
-      connectionId: catalogConnection, gateway: gateway || undefined, profile: catalogProfile, sessionId: activeSessionId,
-      request: gateway && activeSessionId ? (method, params) => requestForOwnedSession(activeSessionId, gateway.request.bind(gateway), method, params) : undefined
-    }),
+    queryFn: () =>
+      requestModelOptions({
+        connectionId: catalogConnection,
+        gateway: gateway || undefined,
+        profile: catalogProfile,
+        sessionId: activeSessionId,
+        request:
+          gateway && activeSessionId
+            ? (method, params) => requestForOwnedSession(activeSessionId, gateway.request.bind(gateway), method, params)
+            : undefined
+      }),
     enabled: gatewayOpen
   })
 

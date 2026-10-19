@@ -20,8 +20,9 @@ export function nativeRouteUrl(route: NativeSocketRoute): string {
 function parseRoute(url: string): NativeSocketRoute {
   const target = new URL(url)
 
-  if (target.origin !== 'ws://native-transport.invalid' || target.search || target.hash)
-    {throw new Error('Native transport requires a route selector')}
+  if (target.origin !== 'ws://native-transport.invalid' || target.search || target.hash) {
+    throw new Error('Native transport requires a route selector')
+  }
 
   return JSON.parse(decodeURIComponent(target.pathname.slice(1))) as NativeSocketRoute
 }
@@ -39,7 +40,9 @@ export async function resolveDesktopGatewayDial(
   conn: GatewayWsConnection,
   route: NativeSocketRoute = { kind: 'primary' }
 ): Promise<string> {
-  if (window.hermesDesktop?.nativeSocket) {return nativeRouteUrl(route)}
+  if (window.hermesDesktop?.nativeSocket) {
+    return nativeRouteUrl(route)
+  }
 
   return resolveGatewayWsUrl(deps, conn)
 }
@@ -98,7 +101,9 @@ export class NativeRendererSocket extends EventTarget {
     this.timer = setTimeout(() => this.fail(), 15_000)
     // Listener attachment always precedes the asynchronous bridge open.
     queueMicrotask(() => {
-      if (this.readyState !== 0) {return}
+      if (this.readyState !== 0) {
+        return
+      }
       void bridge
         .open({ correlation: this.correlation, route, channel })
         .then(result => {
@@ -110,13 +115,17 @@ export class NativeRendererSocket extends EventTarget {
 
           this.handle = result.handle
 
-          if (this.readyState >= 2) {void this.cancel().catch(() => {})}
+          if (this.readyState >= 2) {
+            void this.cancel().catch(() => {})
+          }
         })
         .catch(() => this.fail())
     })
   }
   private receive(event: NativeSocketEvent) {
-    if (event.correlation !== this.correlation || this.readyState === 3) {return}
+    if (event.correlation !== this.correlation || this.readyState === 3) {
+      return
+    }
 
     if ((this.handle && event.handle !== this.handle) || event.sequence !== this.sequence + 1) {
       this.fail()
@@ -140,7 +149,9 @@ export class NativeRendererSocket extends EventTarget {
       this.dispatchEvent(opened)
       this.onopen?.(opened)
     } else if (event.type === 'message') {
-      if (this.readyState !== 1) {return}
+      if (this.readyState !== 1) {
+        return
+      }
       const message = new MessageEvent('message', { data: event.data })
 
       try {
@@ -149,18 +160,24 @@ export class NativeRendererSocket extends EventTarget {
       } finally {
         void this.bridge.ack({ handle: event.handle, sequence: event.sequence }).catch(() => this.fail())
       }
-    } else if (event.type === 'error') {this.fail(event.needsOauthLogin)}
-    else {this.finish(event.code ?? 1006, event.reason ?? '', event.wasClean === true)}
+    } else if (event.type === 'error') {
+      this.fail(event.needsOauthLogin)
+    } else {
+      this.finish(event.code ?? 1006, event.reason ?? '', event.wasClean === true)
+    }
   }
   private cancel() {
     return this.bridge.close({ correlation: this.correlation, ...(this.handle ? { handle: this.handle } : {}) })
   }
   private fail(oauth = false) {
-    if (this.readyState === 3) {return}
+    if (this.readyState === 3) {
+      return
+    }
     const event = new Event('error')
 
-    if (oauth)
-      {Object.assign(event, { error: new GatewayReauthRequiredError('Gateway sign-in required'), needsOauthLogin: true })}
+    if (oauth) {
+      Object.assign(event, { error: new GatewayReauthRequiredError('Gateway sign-in required'), needsOauthLogin: true })
+    }
 
     this.dispatchEvent(event)
     this.onerror?.(event)
@@ -168,7 +185,9 @@ export class NativeRendererSocket extends EventTarget {
     this.finish(1006, 'Native transport failed', false)
   }
   private finish(code: number, reason: string, wasClean: boolean) {
-    if (this.readyState === 3) {return}
+    if (this.readyState === 3) {
+      return
+    }
     clearTimeout(this.timer)
     this.readyState = 3
     this.unsubscribe()
@@ -177,7 +196,9 @@ export class NativeRendererSocket extends EventTarget {
     this.onclose?.(event)
   }
   send(data: string) {
-    if (this.readyState !== 1 || !this.handle || typeof data !== 'string') {throw new Error('Native socket is not open')}
+    if (this.readyState !== 1 || !this.handle || typeof data !== 'string') {
+      throw new Error('Native socket is not open')
+    }
     // Bound in-flight IPC copies as well as main's queue. Exact byte accounting
     // is enforced in main; UTF-16 upper bound avoids another huge allocation.
     const bytes = data.length * 2
@@ -198,12 +219,17 @@ export class NativeRendererSocket extends EventTarget {
       })
   }
   close(code?: number, reason?: string) {
-    if (this.readyState >= 2) {return}
+    if (this.readyState >= 2) {
+      return
+    }
 
-    if (code !== undefined && code !== 1000 && !(Number.isInteger(code) && code >= 3000 && code <= 4999))
-      {throw new Error('Invalid close code')}
+    if (code !== undefined && code !== 1000 && !(Number.isInteger(code) && code >= 3000 && code <= 4999)) {
+      throw new Error('Invalid close code')
+    }
 
-    if (reason && new TextEncoder().encode(reason).byteLength > 123) {throw new Error('Invalid close reason')}
+    if (reason && new TextEncoder().encode(reason).byteLength > 123) {
+      throw new Error('Invalid close reason')
+    }
     this.readyState = 2
     clearTimeout(this.timer)
     this.timer = setTimeout(() => this.finish(1006, 'Close timed out', false), 2_500)
@@ -215,7 +241,9 @@ export class NativeRendererSocket extends EventTarget {
         ...(reason === undefined ? {} : { reason })
       })
       .then(() => {
-        if (!this.handle) {this.finish(1000, '', true)}
+        if (!this.handle) {
+          this.finish(1000, '', true)
+        }
       })
       .catch(() => this.fail())
   }
@@ -224,7 +252,9 @@ export class NativeRendererSocket extends EventTarget {
 export function desktopSocketFactory(url: string) {
   const bridge = window.hermesDesktop?.nativeSocket
 
-  if (!bridge) {throw new Error('Native transport unavailable')}
+  if (!bridge) {
+    throw new Error('Native transport unavailable')
+  }
 
   return new NativeRendererSocket(bridge, parseRoute(url))
 }

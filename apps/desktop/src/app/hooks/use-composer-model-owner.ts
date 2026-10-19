@@ -52,10 +52,13 @@ export function useModelFormKey(owner: ComposerSelectionOwner, scopeProfile?: st
       }
     }
 
-    const unlisten = [$connection, $activeGatewayProfile, $newChatConnectionId, $newChatProfile, $newChatRoute]
-      .map(store => store.listen(rehome))
+    const unlisten = [$connection, $activeGatewayProfile, $newChatConnectionId, $newChatProfile, $newChatRoute].map(
+      store => store.listen(rehome)
+    )
 
-    return () => { unlisten.forEach(stop => stop()) }
+    return () => {
+      unlisten.forEach(stop => stop())
+    }
   }, [scopeProfile])
 
   return JSON.stringify([composerOwnerKey(owner), revision])
@@ -76,8 +79,9 @@ export function useModelOwnerIsCurrent(owner: ComposerSelectionOwner, scopeProfi
 
     // Observe the transition itself, even when React batches A→B→A into one
     // paint. This lease cannot become valid again before a fresh form mount.
-    const unlisten = [$connection, $activeGatewayProfile, $newChatConnectionId, $newChatProfile, $newChatRoute]
-      .map(store => store.listen(invalidate))
+    const unlisten = [$connection, $activeGatewayProfile, $newChatConnectionId, $newChatProfile, $newChatRoute].map(
+      store => store.listen(invalidate)
+    )
 
     return () => {
       mounted.current = false

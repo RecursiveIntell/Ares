@@ -41,7 +41,9 @@ async function bounded<T>(promise: Promise<T>, label: string): Promise<T> {
       timer = setTimeout(() => reject(new Error('native admission step deadline: ' + label)), 10000)
     })
   ]).finally(() => {
-    if (timer) {clearTimeout(timer)}
+    if (timer) {
+      clearTimeout(timer)
+    }
   })
 }
 
@@ -196,13 +198,14 @@ async function run() {
           onBeforeSendHeaders: listener => {
             session.defaultSession.webRequest.onBeforeSendHeaders((details, callback) =>
               listener(details, result => {
-                if (details.resourceType === 'webSocket')
-                  {rows.push({
+                if (details.resourceType === 'webSocket') {
+                  rows.push({
                     phase,
                     mainFrame: details.frame === webContents.fromId(details.webContentsId!)?.mainFrame,
                     rewritten: result.requestHeaders?.Origin === new URL(details.url.replace(/^ws/, 'http')).origin,
                     rawSecretHeader: !!result.requestHeaders?.['X-Hermes-Native-Bootstrap']
-                  })}
+                  })
+                }
 
                 fs.writeFileSync('/evidence/native-admission-progress.json', JSON.stringify({ phase, rows }, null, 2))
                 callback(result)
@@ -328,7 +331,9 @@ async function run() {
 }
 
 async function stop() {
-  for (const timer of fixtureTimers) {clearTimeout(timer)}
+  for (const timer of fixtureTimers) {
+    clearTimeout(timer)
+  }
   await Promise.all(
     children.map(
       child =>

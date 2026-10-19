@@ -240,19 +240,29 @@ describe('useModelControls runtime authority', () => {
         values: { model: 'model-a', provider: 'provider-a' }
       }
     })
-    const requestGateway = vi.fn(async () => ({
-      key: 'model', scope: 'session', value: 'model-b',
-      selector_info: {
-        model: 'model-b', provider: 'provider-b',
-        selector_version: { epoch: 'replacement-owner', revision: 1 }
-      }
-    }) as never)
+
+    const requestGateway = vi.fn(
+      async () =>
+        ({
+          key: 'model',
+          scope: 'session',
+          value: 'model-b',
+          selector_info: {
+            model: 'model-b',
+            provider: 'provider-b',
+            selector_version: { epoch: 'replacement-owner', revision: 1 }
+          }
+        }) as never
+    )
+
     const { result } = renderHook(() => useModelControls({ queryClient: new QueryClient(), requestGateway }))
 
     await expect(result.current.selectModel({ model: 'model-b', provider: 'provider-b' })).resolves.toBe(true)
 
     expect($sessionStates.get()[PRIMARY_RUNTIME_ID]).toMatchObject({
-      model: 'model-b', provider: 'provider-b', pendingModelSelection: null,
+      model: 'model-b',
+      provider: 'provider-b',
+      pendingModelSelection: null,
       selectorObservation: { version: { epoch: 'owner-a', revision: 7 } }
     })
   })

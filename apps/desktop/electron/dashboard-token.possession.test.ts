@@ -27,7 +27,9 @@ test('an inert listener reflecting request identity cannot impersonate the child
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
   const address = server.address()
 
-  if (!address || typeof address === 'string') {throw new Error('inert listener did not bind')}
+  if (!address || typeof address === 'string') {
+    throw new Error('inert listener did not bind')
+  }
 
   try {
     await expect(
@@ -149,9 +151,13 @@ test.each(['protocol', 'nonce', 'identity', 'issued_at', 'session_digest', 'proo
             ])
           }
 
-          if (field === 'oversized') {return new Response('x'.repeat(5000))}
+          if (field === 'oversized') {
+            return new Response('x'.repeat(5000))
+          }
 
-          if (field === 'malformed') {return new Response('{')}
+          if (field === 'malformed') {
+            return new Response('{')
+          }
           result[field] = field === 'issued_at' ? issued - 1 : 'foreign'
 
           return new Response(JSON.stringify(result))

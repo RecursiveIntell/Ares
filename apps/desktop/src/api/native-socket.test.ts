@@ -37,7 +37,9 @@ function fixture() {
 }
 
 async function flush() {
-  for (let i = 0; i < 8; i++) {await Promise.resolve()}
+  for (let i = 0; i < 8; i++) {
+    await Promise.resolve()
+  }
 }
 
 afterEach(() => {

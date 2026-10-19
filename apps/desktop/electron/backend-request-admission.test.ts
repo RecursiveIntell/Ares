@@ -67,7 +67,9 @@ test.each(['guest', 'subframe', 'unknown-frame', 'dead', 'unadmitted', 'malforme
   kind => {
     const { deps, child } = fixture()
 
-    if (kind === 'dead') {child.exitCode = 0}
+    if (kind === 'dead') {
+      child.exitCode = 0
+    }
 
     const request = {
       url: kind === 'unadmitted' ? 'ws://127.0.0.1:9220/api/ws' : kind === 'malformed' ? 'invalid' : url,

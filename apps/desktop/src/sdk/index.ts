@@ -1048,17 +1048,20 @@ export const host = {
         // Electron captures only error-level console lines. Emit one bounded,
         // single-string diagnostic on the terminal failure path; ordinary
         // console.warn objects are intentionally not persisted to desktop.log.
-        console.error('[bot-wake] timeout ' + JSON.stringify({
-          attempts: wakePhase === 'hydration' ? maxAttempts : 1,
-          hydrationWaitMs: wakePhase === 'hydration' ? timedOutAt - profileActiveAt : 0,
-          phase: wakePhase,
-          profile: targetProfile.slice(0, 128),
-          profileActivationMs: (wakePhase === 'activation' ? timedOutAt : profileActiveAt) - wakeStartedAt,
-          runtimeBound: Boolean($activeSessionId.get()),
-          selectionSettled: $selectedStoredSessionId.get() === storedSessionId,
-          storedSessionId: storedSessionId.slice(0, 128),
-          transcriptPainted: $messages.get().length > 0
-        }))
+        console.error(
+          '[bot-wake] timeout ' +
+            JSON.stringify({
+              attempts: wakePhase === 'hydration' ? maxAttempts : 1,
+              hydrationWaitMs: wakePhase === 'hydration' ? timedOutAt - profileActiveAt : 0,
+              phase: wakePhase,
+              profile: targetProfile.slice(0, 128),
+              profileActivationMs: (wakePhase === 'activation' ? timedOutAt : profileActiveAt) - wakeStartedAt,
+              runtimeBound: Boolean($activeSessionId.get()),
+              selectionSettled: $selectedStoredSessionId.get() === storedSessionId,
+              storedSessionId: storedSessionId.slice(0, 128),
+              transcriptPainted: $messages.get().length > 0
+            })
+        )
         // Reuse the core stranded-session surface: it renders the explicit
         // error and Retry button, and the normal resume path clears the latch.
         setResumeExhaustedSessionId(storedSessionId)

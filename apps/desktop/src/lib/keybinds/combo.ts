@@ -272,10 +272,12 @@ export function actionAllowedInInput(actionId: string, combo: string, target: Ev
   // belong to its tab rail. Never grant the exception to a prompt, another
   // action, or a text-editing chord rebound onto a terminal action.
   if (target instanceof Element && target.closest('[data-terminal]')) {
-    const terminalCombo = actionId === 'view.prevTerminal' ? 'ctrl+shift+up'
-      : actionId === 'view.nextTerminal' ? 'ctrl+shift+down' : null
+    const terminalCombo =
+      actionId === 'view.prevTerminal' ? 'ctrl+shift+up' : actionId === 'view.nextTerminal' ? 'ctrl+shift+down' : null
 
-    if (terminalCombo && combo === canonicalizeCombo(terminalCombo)) { return true }
+    if (terminalCombo && combo === canonicalizeCombo(terminalCombo)) {
+      return true
+    }
   }
 
   const base = combo.split('+').pop()
