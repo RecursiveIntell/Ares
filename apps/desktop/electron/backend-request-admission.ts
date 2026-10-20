@@ -32,6 +32,7 @@ export function registerOwnedBackendAdmission(
   if (child.exitCode !== null || child.killed) {
     throw new Error('Owned backend exited before admission')
   }
+
   const entry = { identity, alive: () => child.exitCode === null && !child.killed }
   admissions.set(target.origin, entry)
   child.once('exit', () => {
@@ -64,6 +65,7 @@ export function privilegedRequestHeaders(
     if (details.resourceType === 'webSocket') {
       return {}
     }
+
     const headers = dependencies.headers(details.url)
 
     return Object.keys(headers).length ? { requestHeaders: { ...details.requestHeaders, ...headers } } : {}

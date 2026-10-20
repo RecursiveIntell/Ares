@@ -281,6 +281,7 @@ export function createProductionPermitControllerWithClock(
         format: 'der',
         type: 'pkcs8'
       })
+
       const signature = crypto.sign(
         null,
         Buffer.from(canonicalize(signingPayload(witnessWithoutSignature))),
