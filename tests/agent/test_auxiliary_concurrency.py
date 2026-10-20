@@ -123,10 +123,16 @@ class TestSyncCallEnforcesLimit:
         active = 0
         max_active = 0
         lock = threading.Lock()
+        callback_entries = []
+        callback_exits = []
+        results = {}
+        errors = {}
 
         def fake_create(**kwargs):
             nonlocal active, max_active
+            caller = threading.current_thread().name
             with lock:
+                callback_entries.append(caller)
                 active += 1
                 if active > max_active:
                     max_active = active
@@ -135,11 +141,25 @@ class TestSyncCallEnforcesLimit:
             finally:
                 with lock:
                     active -= 1
+                    callback_exits.append(caller)
             return MagicMock()
 
         client = MagicMock()
         client.base_url = "https://example.test/v1"
         client.chat.completions.create.side_effect = fake_create
+
+        def run_caller(index):
+            try:
+                response = call_llm(
+                    task="title_generation",
+                    messages=[{"role": "user", "content": "hi"}],
+                )
+            except BaseException as exc:
+                with lock:
+                    errors[index] = exc
+            else:
+                with lock:
+                    results[index] = response
 
         with (
             patch(
@@ -161,20 +181,39 @@ class TestSyncCallEnforcesLimit:
         ):
             threads = [
                 threading.Thread(
-                    target=lambda: call_llm(
-                        task="title_generation",
-                        messages=[{"role": "user", "content": "hi"}],
-                    )
+                    target=run_caller,
+                    args=(index,),
+                    name=f"aux-limit-caller-{index}",
                 )
-                for _ in range(n_callers)
+                for index in range(n_callers)
             ]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join(timeout=5)
+            try:
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=5)
+                unfinished_at_join_boundary = [
+                    thread.name for thread in threads if thread.is_alive()
+                ]
+            finally:
+                # Cleanup does not turn a late caller into acceptance: retain
+                # the original join-boundary observation for the assertion.
+                for thread in threads:
+                    if thread.ident is not None and thread.is_alive():
+                        thread.join(timeout=5)
 
-        assert max_active <= limit, f"observed {max_active} > limit {limit}"
-        assert client.chat.completions.create.call_count == n_callers
+            assert unfinished_at_join_boundary == []
+            assert errors == {}
+            assert set(results) == set(range(n_callers))
+            assert all(response is not None for response in results.values())
+            assert len(callback_entries) == n_callers
+            assert len(callback_exits) == n_callers
+            assert len(set(callback_entries)) == n_callers
+            assert active == 0
+            assert max_active <= limit, f"observed {max_active} > limit {limit}"
+            # In CI's Python 3.11, mock.call_count is an unlocked read/modify/
+            # write. Count actual SDK entries with the locked observations
+            # above rather than relying on that shared bookkeeping.
 
     def test_call_llm_unlimited_when_not_configured(self):
         client = MagicMock()

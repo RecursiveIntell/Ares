@@ -1,4 +1,5 @@
 """New input must be accepted after, not inside, a settling native Stop cut."""
+import asyncio
 import contextlib
 import threading
 import time
@@ -9,6 +10,8 @@ import pytest
 from hermes_state import SessionDB
 from tui_gateway import server
 from tui_gateway.host_supervisor import HostSendUncertain
+from tui_gateway.transport import bind_transport, reset_transport
+from tui_gateway.ws import WSTransport
 from tests.test_tui_gateway_server import _session
 
 
@@ -20,6 +23,9 @@ def test_new_input_waits_outside_session_lock_until_native_cut_verified(tmp_path
     session = _session(session_key="stored", source="desktop", running=True,
                        agent_ready=threading.Event(), _compute_host_active_request_id="A")
     session["agent"] = None
+    loop = asyncio.new_event_loop()
+    transport = WSTransport(types.SimpleNamespace(), loop)
+    session["transport"] = transport
     session["queued_prompt"] = {"text": "B", "context_input_event_id": "B", "transport": None}
     monkeypatch.setattr(server, "_sessions", {"s": session})
     monkeypatch.setattr(server, "_get_db", lambda: db)
@@ -63,6 +69,9 @@ def test_new_input_waits_outside_session_lock_until_native_cut_verified(tmp_path
         except Exception as exc:
             errors.append(exc)
     def send():
+        # Desktop origin is observed from the actual request-thread transport;
+        # a synthetic session or client-provided origin is not that authority.
+        token = bind_transport(transport)
         try:
             input_started.set()
             results["input"] = server.handle_request({"id": "C", "method": "prompt.submit",
@@ -70,6 +79,7 @@ def test_new_input_waits_outside_session_lock_until_native_cut_verified(tmp_path
         except Exception as exc:
             errors.append(exc)
         finally:
+            reset_transport(token)
             input_done.set()
     stopper = threading.Thread(target=stop)
     sender = threading.Thread(target=send)
@@ -93,6 +103,13 @@ def test_new_input_waits_outside_session_lock_until_native_cut_verified(tmp_path
         stopper.join(4)
         if sender.ident is not None:
             sender.join(4)
+        assert not stopper.is_alive() and not sender.is_alive()
+        # Retire the test-owned registration before closing its DB; gateway
+        # teardown must not try to reconcile Stop against a closed fake owner.
+        if server._sessions.get("s") is session:
+            server._sessions.pop("s")
+        transport.close()
+        loop.close()
         db.close()
     assert not stopper.is_alive() and not sender.is_alive()
     reopened = SessionDB(tmp_path / "state.db")
@@ -102,8 +119,11 @@ def test_new_input_waits_outside_session_lock_until_native_cut_verified(tmp_path
             assert errors == []
             assert results["stop"] is True
             assert results["cut"]["input_sequence"] == before.sequence
+            assert "result" in results["input"], results["input"]
             assert results["input"]["result"]["status"] == "queued"
             assert after is not None and after.sequence > results["cut"]["input_sequence"]
+            origin = reopened.read_context_input_origin("stored", after)
+            assert origin["transport_epoch"] == transport.input_epoch
         else:
             assert len(errors) == 1 and isinstance(errors[0], HostSendUncertain)
             assert results["input"]["error"]["data"]["durable_input_accepted"] is False

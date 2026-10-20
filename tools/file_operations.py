@@ -33,6 +33,7 @@ import sys
 import difflib
 import hashlib
 import json
+import math
 import unicodedata
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -205,6 +206,36 @@ def _is_write_denied(path: str) -> bool:
 # Result Data Classes
 # =============================================================================
 
+def _lsp_quality_receipt(result: Any = None, *, reason: str = "not_enabled") -> dict:
+    """Bound the optional service's receipt to safe, JSON-compatible metadata."""
+    quality = getattr(result, "quality", "unavailable")
+    if quality not in ("complete", "degraded", "unavailable"):
+        quality = "unavailable"
+        reason = "invalid_quality_receipt"
+    else:
+        candidate = getattr(result, "reason", reason)
+        if isinstance(candidate, str):
+            reason = " ".join(candidate.split())[:200]
+    phases = getattr(result, "phases", None)
+    safe_phases = {}
+    if isinstance(phases, dict):
+        for name in ("initialize", "baseline", "post_edit"):
+            span = phases.get(name)
+            if (isinstance(span, (int, float)) and not isinstance(span, bool)
+                    and span >= 0 and math.isfinite(span)):
+                safe_phases[name] = span
+    return {"quality": quality, "reason": reason, "phases": safe_phases}
+
+
+@dataclass
+class _LSPBaseline:
+    """Write-local provenance; service/owner tokens never enter tool output."""
+    receipt: Dict[str, Any]
+    service: Any = None
+    owner: Any = None
+    has_diagnostics: bool = False
+
+
 @dataclass
 class ReadResult:
     """Result from reading a file."""
@@ -239,12 +270,12 @@ class WriteResult:
     # Semantic diagnostics from the LSP layer, when applicable.  Kept in
     # its own field (not folded into ``lint``) so the model and any
     # downstream parsers can read syntax errors and semantic errors as
-    # separate signals.  ``None`` when LSP is disabled, when the file
-    # isn't in a git workspace, or when no diagnostics were introduced
-    # by this edit.
+    # separate signals. None when no reportable diagnostics were returned;
+    # lsp_enrichment retains quality even in that case.
     lsp_diagnostics: Optional[str] = None
     error: Optional[str] = None
     warning: Optional[str] = None
+    lsp_enrichment: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> dict:
         return {k: v for k, v in self.__dict__.items() if v is not None}
@@ -267,6 +298,8 @@ class PatchResult:
     # model explaining why no diff is included.
     no_change: bool = False
     note: Optional[str] = None
+    # Replace mode carries one receipt; V4A carries receipts keyed by path.
+    lsp_enrichment: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> dict:
         result: Dict[str, Any] = {"success": self.success}
@@ -286,6 +319,8 @@ class PatchResult:
             result["lint"] = self.lint
         if self.lsp_diagnostics:
             result["lsp_diagnostics"] = self.lsp_diagnostics
+        if self.lsp_enrichment is not None:
+            result["lsp_enrichment"] = self.lsp_enrichment
         if self.error:
             result["error"] = self.error
         return result
@@ -646,43 +681,8 @@ LINTERS = {
     '.rs': 'rustfmt --check {file} 2>&1',
 }
 
-# Extensions where the per-file shell linter is structurally weaker than
-# a real LSP server AND produces phantom errors on real-world projects:
-#
-# - ``.ts``: ``tsc --noEmit FILE.ts`` ignores ``tsconfig.json`` and
-#   defaults to no-lib / ES5, so every ES2015+ stdlib reference
-#   (``Promise``, ``Map``, ``Set``, ``ReadonlySet``, ``Iterable``,
-#   ``Math.imul``, ``Number.isFinite``, etc.) reports as missing.  This
-#   floods the agent's lint field with 20K+ tokens of false positives on
-#   every edit.  No supported tsc flag fixes the single-file invocation;
-#   the canonical replacement is ``tsserver`` via LSP, which respects
-#   tsconfig and gives true diagnostics.
-#
-#   ``.tsx`` is intentionally NOT in ``LINTERS`` (and therefore not
-#   here): it has no shell linter entry, so it falls through to the
-#   ``ext not in LINTERS`` skip case unchanged.  Pre-PR behavior:
-#   ``.tsx`` was implicitly ``skipped``.  Keeping it that way means
-#   ``.tsx`` edits with LSP disabled get no per-file syntax check
-#   (same as before this PR) instead of the broken ``tsc`` invocation
-#   that ``.ts`` used to get.  When LSP is enabled, ``.tsx`` is covered
-#   by the LSP tier via ``_maybe_lsp_diagnostics`` exactly as ``.ts``.
-#
-# - ``.go``: ``go vet FILE.go`` fails outside a module / GOPATH with
-#   "cannot find package" — already partially handled by
-#   ``_LINTER_UNUSABLE_PATTERNS`` but only when the package error is the
-#   ONLY output; mixed real+phantom output still leaks through.
-#   ``gopls`` is the canonical replacement.
-#
-# - ``.rs``: ``rustfmt --check FILE.rs`` is style, not type-checking, and
-#   rejects non-Cargo project files.  ``rust-analyzer`` is the canonical
-#   replacement.
-#
-# When the LSP service is configured AND ``enabled_for(path)`` for this
-# extension's file, ``_check_lint`` skips the shell linter for these
-# extensions — the ``lsp_diagnostics`` channel carries the real signal.
-# Everything else in ``LINTERS`` (Python ``py_compile``, ``node --check``)
-# is fast, file-local, and correct, so it runs unconditionally.
-_SHELL_LINTER_LSP_REDUNDANT = frozenset({'.ts', '.go', '.rs'})
+# Optional LSP availability is not a syntax verdict. Shell checks keep their
+# independent contract, including the project-tsconfig exception below.
 
 
 # Patterns that indicate the linter base command exists on PATH but
@@ -847,6 +847,180 @@ DEFAULT_SEARCH_LIMIT = 50
 # Echoed by the size probe when the path exists but is not a regular file.
 # `wc -c` prints only digits, so this can never collide with a real size.
 NOT_REGULAR_SENTINEL = "__hermes_not_regular__"
+
+
+# Executed by the existing local backend, never in the file-tool process.
+# Keep only a bounded prefix of each requested line, even when a line spans
+# the entire file. Nothing is emitted until EOF and the identity checks pass.
+_LOCAL_READ_SCRIPT = r'''
+import base64, codecs, json, os, stat, sys
+
+request = json.load(sys.stdin)
+p = request['path']
+
+def identity(s):
+    return (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+
+def changed():
+    return {'status': 'error', 'error': 'File changed while reading: ' + p + '. Retry the read.'}
+
+def read():
+    try:
+        before = os.stat(p)
+    except FileNotFoundError:
+        return {'status': 'missing'}
+    if not stat.S_ISREG(before.st_mode):
+        return {'status': 'not_regular'}
+    result = {'status': 'ok', 'file_size': before.st_size}
+    if request['image']:
+        return result if identity(os.stat(p)) == identity(before) else changed()
+
+    # Following symlinks is intentional. NONBLOCK prevents a regular-file ->
+    # FIFO replacement between stat and open from hanging before fstat.
+    fd = os.open(p, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or identity(opened) != identity(before):
+            return changed()
+        sample = b''
+        while len(sample) < 1000:
+            piece = os.read(fd, 1000 - len(sample))
+            if not piece:
+                break
+            sample += piece
+        result['sample'] = base64.b64encode(sample).decode('ascii')
+        binary = request['binary_extension'] or b'\x00' in sample
+        if not binary:
+            try:
+                sample.decode('utf-8')
+            except UnicodeDecodeError as exc:
+                binary = True
+                if exc.start >= len(sample) - 3:
+                    try:
+                        sample[:exc.start].decode('utf-8')
+                        binary = False
+                    except UnicodeDecodeError:
+                        pass
+        encoding = None
+        if binary and not request['binary_extension'] and before.st_size <= request['utf16_max']:
+            head = sample[:request['utf16_sample']]
+            if head[:2] == b'\xfe\xff':
+                encoding = 'utf-16-be'
+            elif head[:2] == b'\xff\xfe':
+                encoding = 'utf-16-le'
+            else:
+                odd = sum(head[i] == 0 for i in range(1, len(head), 2))
+                even = sum(head[i] == 0 for i in range(0, len(head), 2))
+                if even == 0 and odd >= 2:
+                    encoding = 'utf-16-le'
+                elif odd == 0 and even >= 2:
+                    encoding = 'utf-16-be'
+
+        if not binary or encoding:
+            offset, limit = request['offset'], request['limit']
+            end = offset + limit - 1
+            # UTF-16's legacy JSON transport cleans fence markers before
+            # character clamping. Retain the selected page under the fixed
+            # 10 MiB rescue ceiling to preserve that ordering exactly.
+            cap = request['utf16_max'] if encoding else 4 * request['max_line'] + 1
+            empty, newline, cr = ('', '\n', '\r') if encoding else (b'', b'\n', b'\r')
+            prefix, last = empty, empty
+            length, line, lfs, scanned = 0, 1, 0, 0
+            page = []
+            decoder = codecs.getincrementaldecoder(encoding)('replace') if encoding else None
+            first_text = True
+
+            def finish(has_lf):
+                nonlocal prefix, length, line, last
+                # UTF-16 rescue normalizes CRLF; ordinary reads preserve CR.
+                if encoding and has_lf and last == cr and length <= cap:
+                    prefix = prefix[:-1]
+                if offset <= line <= end:
+                    page.append(prefix)
+                prefix, length, last = empty, 0, empty
+                line += 1
+
+            def consume(chunk):
+                nonlocal prefix, length, last, lfs, first_text, line
+                if encoding and first_text and chunk:
+                    first_text = False
+                    if chunk.startswith('\ufeff'):
+                        chunk = chunk[1:]
+                if line > end:
+                    # EOF still determines the exact count, but page-sized
+                    # Python work ends with the page (important for logs).
+                    breaks = chunk.count(newline)
+                    lfs += breaks
+                    line += breaks
+                    return
+                if line < offset:
+                    needed = offset - line
+                    breaks = chunk.count(newline)
+                    if breaks < needed:
+                        line += breaks
+                        lfs += breaks
+                        tail = chunk.rsplit(newline, 1)[-1]
+                        length = len(tail) if breaks else length + len(tail)
+                        if tail or breaks:
+                            last = tail[-1:]
+                        return
+                    chunk = chunk.split(newline, needed)[-1]
+                    line = offset
+                    lfs += needed
+                    length, last = 0, empty
+                parts = chunk.split(newline)
+                for index, piece in enumerate(parts):
+                    if piece:
+                        if offset <= line <= end and len(prefix) < cap:
+                            prefix += piece[:cap - len(prefix)]
+                        length += len(piece)
+                        last = piece[-1:]
+                    if index < len(parts) - 1:
+                        lfs += 1
+                        finish(True)
+
+            chunk = sample
+            last_byte = b''
+            while chunk:
+                scanned += len(chunk)
+                last_byte = chunk[-1:]
+                consume(decoder.decode(chunk) if decoder else chunk)
+                chunk = os.read(fd, 64 * 1024)
+            if decoder:
+                consume(decoder.decode(b'', final=True))
+                finish(False)  # split('\n') includes the final empty line
+                result['encoding'] = encoding
+                result['content'] = '\n'.join(page)
+                result['total_lines'] = lfs + 1
+            else:
+                if length:
+                    finish(False)
+                output = b'\n'.join(page) + (b'\n' if page else b'')
+                result['content_base64'] = base64.b64encode(output).decode('ascii')
+                result['total_lines'] = lfs  # preserve wc -l, even without final LF
+                result['final_lf'] = last_byte == b'\n'
+            # Pseudo-regular files (for example /proc/version) legitimately
+            # report size zero while returning bytes. EOF supplies their exact
+            # line count; the descriptor/path checks below still detect ordinary
+            # empty-file replacement or growth, without disabling that feature.
+            if before.st_size != 0 and scanned != before.st_size:
+                return changed()
+        # One descriptor supplies sample, page and count. A rename/replacement
+        # is also an error, even if the descriptor still points at old data.
+        try:
+            stable = identity(os.fstat(fd)) == identity(before) == identity(os.stat(p))
+        except OSError:
+            stable = False
+        return result if stable else changed()
+    finally:
+        os.close(fd)
+
+try:
+    result = read()
+except OSError as exc:
+    result = {'status': 'error', 'error': 'Failed to read file: ' + str(exc)}
+print(json.dumps(result, ensure_ascii=True))
+'''
 
 
 def _coerce_int(value: Any, default: int) -> int:
@@ -1487,6 +1661,10 @@ class ShellFileOperations(FileOperations):
         except (ValueError, KeyError, TypeError):
             return None
 
+        return self._format_utf16_read(content, offset, limit, file_size, total_lines, encoding)
+
+    def _format_utf16_read(self, content: str, offset: int, limit: int,
+                           file_size: int, total_lines: int, encoding: str) -> ReadResult:
         end_line = offset + limit - 1
         truncated = total_lines > end_line
         hint_parts = [f"Transcoded from {encoding.upper()} to UTF-8 for display. "
@@ -1503,6 +1681,74 @@ class ShellFileOperations(FileOperations):
             truncated=truncated,
             hint=" ".join(hint_parts),
         )
+
+    def _read_local_file(self, path: str, offset: int, limit: int) -> Optional[ReadResult]:
+        """One bounded backend operation; None preserves missing-path retries.
+
+        Only used for the POSIX LocalEnvironment. The backend still owns its
+        launch policy, snapshot, cwd, interruption and process accounting.
+        Remote backends must never execute the host interpreter/path here.
+        """
+        from tools.tool_output_limits import get_max_line_length
+
+        request = {
+            "path": path, "offset": offset, "limit": limit,
+            "max_line": get_max_line_length(),
+            "image": self._is_image(path),
+            "binary_extension": os.path.splitext(path)[1].lower() in BINARY_EXTENSIONS,
+            "utf16_max": self._UTF16_MAX_BYTES,
+            "utf16_sample": self._UTF16_SAMPLE_BYTES,
+        }
+        transport = self._exec(
+            f"{self._escape_shell_arg(sys.executable)} -I -c {self._escape_shell_arg(_LOCAL_READ_SCRIPT)}",
+            stdin_data=json.dumps(request, ensure_ascii=True),
+            timeout=min(60, max(1, self.env.timeout or 60)),
+        )
+        if transport.exit_code != 0:
+            return ReadResult(error=f"Failed to read file: {transport.stdout}")
+        try:
+            data = json.loads(_strip_terminal_fence_leaks(transport.stdout))
+            status = data["status"]
+            if status == "missing":
+                return None
+            if status == "not_regular":
+                return self._not_regular_error(path)
+            if status == "error":
+                return ReadResult(error=data["error"])
+            if status != "ok":
+                raise ValueError("unknown read status")
+            file_size = int(data["file_size"])
+            if request["image"]:
+                return ReadResult(
+                    is_image=True, is_binary=True, file_size=file_size,
+                    hint=(
+                        "Image file detected. Automatically redirected to vision_analyze tool. "
+                        "Use vision_analyze with this file path to inspect the image contents."
+                    ),
+                )
+            sample = base64.b64decode(data["sample"], validate=True)
+            if "encoding" in data:
+                return self._format_utf16_read(
+                    data["content"], offset, limit, file_size,
+                    int(data["total_lines"]), data["encoding"],
+                )
+            if request["binary_extension"] or self._is_likely_binary_bytes(sample):
+                return ReadResult(
+                    is_binary=True, file_size=file_size,
+                    error=describe_binary_file(sample, file_size),
+                )
+            read_output = base64.b64decode(data["content_base64"], validate=True).decode("utf-8", "replace")
+            read_output = _strip_terminal_fence_leaks(read_output)
+            if offset == 1:
+                read_output, _ = _strip_bom(read_output)
+            total_lines = int(data["total_lines"])
+            if total_lines <= offset + limit - 1 and not data["final_lf"] and read_output.endswith("\n"):
+                read_output = read_output[:-1]
+            return self._format_text_read(read_output, offset, limit, file_size, total_lines)
+        except (ValueError, KeyError, TypeError):
+            # Incomplete/contaminated transport is not an exact count, and
+            # must not silently become a successful empty read or a retry.
+            return ReadResult(error="Failed to read file: invalid local read response")
 
     def read_file(self, path: str, offset: int = 1, limit: int = 2000) -> ReadResult:
         """
@@ -1521,8 +1767,16 @@ class ShellFileOperations(FileOperations):
         
         offset, limit = normalize_read_pagination(offset, limit)
         
-        # Check if file exists and get size (POSIX, works on Linux + macOS)
-        stat_result = self._exec(self._size_probe_cmd(path))
+        from tools.environments.local import LocalEnvironment
+
+        if os.name != "nt" and isinstance(self.env, LocalEnvironment):
+            local_result = self._read_local_file(path, offset, limit)
+            if local_result is not None:
+                return local_result
+            stat_result = ExecuteResult(exit_code=1)
+        else:
+            # Remote/Windows backends keep their own host shell behavior.
+            stat_result = self._exec(self._size_probe_cmd(path))
 
         if stat_result.exit_code != 0:
             # File not found. Before failing, try unicode-equivalent
@@ -1651,9 +1905,6 @@ class ShellFileOperations(FileOperations):
         
         # Check if truncated
         truncated = total_lines > end_line
-        hint = None
-        if truncated:
-            hint = f"Use offset={end_line + 1} to continue reading (showing {offset}-{end_line} of {total_lines} lines)"
 
         # ``cut`` (unlike sed -n p) always newline-terminates its output,
         # so a file whose final line has no trailing newline would grow a
@@ -1666,11 +1917,20 @@ class ShellFileOperations(FileOperations):
             if tail_result.exit_code == 0 and tail_output.strip() == "0":
                 read_output = read_output[:-1]
 
+        return self._format_text_read(read_output, offset, limit, file_size, total_lines)
+
+    def _format_text_read(self, read_output: str, offset: int, limit: int,
+                          file_size: int, total_lines: int) -> ReadResult:
+        end_line = offset + limit - 1
+        truncated = total_lines > end_line
+        hint = None
+        if truncated:
+            hint = f"Use offset={end_line + 1} to continue reading (showing {offset}-{end_line} of {total_lines} lines)"
         # Ambiguous-silence guards: an empty content string is
         # indistinguishable, from inside the model, from a broken tool —
         # it re-reads, widens the window, tries another path. Name the
         # dead end and its recovery instead.
-        if file_size == 0:
+        if file_size == 0 and not read_output:
             return ReadResult(
                 content="",
                 total_lines=0,
@@ -2122,7 +2382,7 @@ class ShellFileOperations(FileOperations):
         # by this specific edit.  Mirrors claude-code's
         # ``beforeFileEdited`` pattern but wired to the local LSP
         # rather than an external IDE.
-        self._snapshot_lsp_baseline(path)
+        lsp_baseline = self._snapshot_lsp_baseline(path)
 
         # Write atomically.  ``mkdir -p`` is folded into _atomic_write
         # (one fewer subprocess vs. a separate mkdir call).
@@ -2212,11 +2472,14 @@ class ShellFileOperations(FileOperations):
         # an LSP for a file that won't even parse).  Pass pre/post
         # content so the LSP layer can build a line-shift map and
         # remap baseline diagnostics into post-edit coordinates.
-        # Best-effort: ``""`` is returned for any failure path.
+        # Quality remains visible even when no diagnostic block is emitted.
         lsp_diagnostics: Optional[str] = None
+        lsp_enrichment = _lsp_quality_receipt(reason="syntax_failed")
+        lsp_enrichment["baseline"] = lsp_baseline.receipt
         if lint_result.success or lint_result.skipped:
             block = self._maybe_lsp_diagnostics(
-                path, pre_content=pre_content, post_content=content
+                path, pre_content=pre_content, post_content=content,
+                baseline=lsp_baseline, receipt=lsp_enrichment,
             )
             if block:
                 lsp_diagnostics = block
@@ -2227,6 +2490,7 @@ class ShellFileOperations(FileOperations):
             verified=content_verified,
             lint=lint_result.to_dict() if lint_result else None,
             lsp_diagnostics=lsp_diagnostics,
+            lsp_enrichment=lsp_enrichment,
         )
     
     # =========================================================================
@@ -2378,6 +2642,7 @@ class ShellFileOperations(FileOperations):
             # the patch as a whole.  Keep the field separate from the
             # syntax-check ``lint`` so the agent can read both signals.
             lsp_diagnostics=write_result.lsp_diagnostics,
+            lsp_enrichment=write_result.lsp_enrichment,
         )
     
     def patch_v4a(self, patch_content: str) -> PatchResult:
@@ -2471,19 +2736,6 @@ class ShellFileOperations(FileOperations):
                     "use the LSP tier or `tsc -p tsconfig.json` for real "
                     "diagnostics)."
                 ),
-            )
-
-        # If a real LSP server is active and claims this file, skip the
-        # shell linter for extensions whose per-file shell invocation is
-        # structurally weaker / floods phantom errors.  See
-        # ``_SHELL_LINTER_LSP_REDUNDANT`` above for the rationale per ext.
-        # The LSP tier runs separately via ``_maybe_lsp_diagnostics`` and
-        # carries the real diagnostics in ``lsp_diagnostics`` on the
-        # WriteResult / PatchResult.
-        if ext in _SHELL_LINTER_LSP_REDUNDANT and self._lsp_will_handle(path):
-            return LintResult(
-                skipped=True,
-                message=f"LSP server handles {ext} — shell linter skipped",
             )
 
         linter_cmd = LINTERS[ext]
@@ -2681,7 +2933,7 @@ class ShellFileOperations(FileOperations):
             return False
 
     def _lsp_will_handle(self, path: str) -> bool:
-        """Return True iff the LSP service is active AND will lint this file.
+        """Return potential LSP availability, never a fresh syntax verdict.
 
         Stronger than :meth:`_lsp_handles_extension` — that one only checks
         the static server registry.  This one additionally requires the
@@ -2690,8 +2942,7 @@ class ShellFileOperations(FileOperations):
         workspace detection, disabled-server set, and the broken-pair
         short-circuit).
 
-        Used by :meth:`_check_lint` to decide whether to skip the per-file
-        shell linter for extensions in ``_SHELL_LINTER_LSP_REDUNDANT``.
+        This optimistic probe cannot waive an independent syntax check.
 
         Best-effort: any failure path returns False so the shell linter
         runs as before — never suppress lint based on an LSP probe that
@@ -2714,28 +2965,31 @@ class ShellFileOperations(FileOperations):
         except Exception:  # noqa: BLE001
             return False
 
-    def _snapshot_lsp_baseline(self, path: str) -> None:
-        """Capture pre-edit LSP diagnostics so the post-write delta is correct.
+    @staticmethod
+    def _lsp_owner(svc: Any, path: str) -> Any:
+        # The service binds baselines to root, identity and client. Reuse its
+        # token to avoid asserting edit provenance across an ownership change.
+        try:
+            return svc._owner_for_file(path)
+        except Exception:  # noqa: BLE001
+            return None
 
-        Best-effort.  Silent on every failure path — LSP is an
-        enrichment layer and must never break a write.
-
-        Skipped entirely on non-local backends (Docker, Modal, SSH,
-        etc.) — the server can't see files inside the sandbox.
-        """
+    def _snapshot_lsp_baseline(self, path: str) -> _LSPBaseline:
+        """Retain baseline quality; optional failures never break a write."""
         if not self._lsp_local_only():
-            return
+            return _LSPBaseline(_lsp_quality_receipt(reason="non_local_backend"))
         try:
             from agent.lsp import get_service
             svc = get_service()
+            if svc is None:
+                return _LSPBaseline(_lsp_quality_receipt(reason="service_unavailable"))
+            result = svc.snapshot_baseline(path)
+            return _LSPBaseline(
+                _lsp_quality_receipt(result), svc, self._lsp_owner(svc, path),
+                has_diagnostics=bool(result.diagnostics),
+            )
         except Exception:  # noqa: BLE001
-            return
-        if svc is None:
-            return
-        try:
-            svc.snapshot_baseline(path)
-        except Exception:  # noqa: BLE001
-            pass
+            return _LSPBaseline(_lsp_quality_receipt(reason="baseline_failed"))
 
     def _maybe_lsp_diagnostics(
         self,
@@ -2743,43 +2997,45 @@ class ShellFileOperations(FileOperations):
         *,
         pre_content: Optional[str] = None,
         post_content: Optional[str] = None,
+        baseline: Optional[_LSPBaseline] = None,
+        receipt: Optional[Dict[str, Any]] = None,
     ) -> str:
-        """Best-effort LSP semantic diagnostics for ``path``.
+        """Format optional semantic findings and project quality separately.
 
-        Returns a formatted ``<diagnostics>`` block, or empty string
-        when LSP is unavailable / disabled / produced no errors.
-
-        When both ``pre_content`` and ``post_content`` are provided,
-        a line-shift map is built and passed to the LSPService so
-        baseline diagnostics are remapped into post-edit coordinates
-        before the set-difference.  Without this, edits that delete
-        or insert lines surface every pre-existing diagnostic below
-        the edit point as "introduced by this edit".
-
-        Wraps everything in a try/except so a misbehaving LSP server
-        can't break a write.  This intentionally swallows all errors
-        — the calling tier already returned a clean syntax result, so
-        ``""`` here just means "no extra info to add".
-
-        Skipped entirely on non-local backends (Docker, Modal, SSH,
-        etc.) — same reasoning as ``_snapshot_lsp_baseline``.
+        Keep the string return for existing callers. The write-local receipt
+        output also retains quality for empty/failed results. Only a complete,
+        same-owner baseline can support introduced-by-edit attribution; other
+        baselines request current diagnostics without delta filtering. A
+        nonempty baseline also needs pre/post text to remap old positions.
         """
+        if receipt is None:
+            receipt = {}
+        receipt.clear()
+        receipt.update(_lsp_quality_receipt(reason="service_unavailable"))
+        if baseline is not None:
+            receipt["baseline"] = baseline.receipt
+        receipt["diagnostic_scope"] = "current"
         if not self._lsp_local_only():
+            receipt["reason"] = "non_local_backend"
             return ""
         try:
             from agent.lsp import get_service
-        except Exception:  # noqa: BLE001
-            return ""
-        try:
             svc = get_service()
+            if svc is None:
+                return ""
+            if not svc.enabled_for(path):
+                receipt["reason"] = "not_enabled_for_file"
+                return ""
         except Exception:  # noqa: BLE001
-            return ""
-        if svc is None or not svc.enabled_for(path):
+            receipt["reason"] = "service_probe_failed"
             return ""
 
-        # Build a line-shift map when we have both pre and post — it
-        # remaps baseline diagnostics into post-edit coordinates so
-        # the strict (range-aware) delta key matches correctly.
+        owner = self._lsp_owner(svc, path)
+        delta = bool(baseline is not None and baseline.service is svc
+                     and baseline.receipt["quality"] == "complete"
+                     and baseline.owner is not None and baseline.owner == owner
+                     and (not baseline.has_diagnostics
+                          or (pre_content is not None and post_content is not None)))
         line_shift = None
         if pre_content is not None and post_content is not None and pre_content != post_content:
             try:
@@ -2787,10 +3043,18 @@ class ShellFileOperations(FileOperations):
                 line_shift = build_line_shift(pre_content, post_content)
             except Exception:  # noqa: BLE001
                 line_shift = None
+                # Without remapping, moved old findings cannot prove a delta.
+                delta = False
 
         try:
-            diagnostics = svc.get_diagnostics_sync(path, delta=True, line_shift=line_shift)
+            result = svc.get_enrichment_sync(path, delta=delta, line_shift=line_shift)
+            receipt.update(_lsp_quality_receipt(result))
+            introduced = (delta and receipt["quality"] == "complete"
+                          and self._lsp_owner(svc, path) == owner)
+            receipt["diagnostic_scope"] = "introduced" if introduced else "current"
+            diagnostics = result.diagnostics
         except Exception:  # noqa: BLE001
+            receipt.update(_lsp_quality_receipt(reason="enrichment_failed"))
             return ""
         if not diagnostics:
             return ""
@@ -2799,10 +3063,14 @@ class ShellFileOperations(FileOperations):
             block = report_for_file(path, diagnostics)
             if not block:
                 return ""
-            return truncate("LSP diagnostics introduced by this edit:\n" + block)
+            prefix = ("LSP diagnostics introduced by this edit:\n" if introduced else
+                      "Current LSP diagnostics (edit provenance unavailable):\n")
+            return truncate(prefix + block)
         except Exception:  # noqa: BLE001
+            receipt.update(_lsp_quality_receipt(reason="diagnostic_format_failed"))
+            receipt["diagnostic_scope"] = "current"
             return ""
-    
+
     # =========================================================================
     # SEARCH Implementation
     # =========================================================================

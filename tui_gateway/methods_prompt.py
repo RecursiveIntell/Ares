@@ -335,6 +335,13 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    if "goal_continuation" in params:
+        binding = params.get("goal_continuation")
+        if not isinstance(binding, dict):
+            return _err(rid, 4004, "invalid goal continuation binding")
+        if not _dispatch_goal_continuation(rid, sid, session, expected=binding):
+            return _err(rid, 4091, "goal continuation no longer eligible; refresh goal status")
+        return _ok(rid, {"accepted": True, "goal_continuation": binding})
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
         return _err(rid, 4090, limit_message)
     # Which desktop window this message was typed into. Rewritten on every
@@ -388,6 +395,15 @@ def _(rid, params: dict) -> dict:
                     or current_nonce != pending_input_admission[3]))):
             return _err(rid, 5001, "session owner changed; input not started",
                 {"execution_started": False, "durable_input_accepted": input_receipt is not None,
+                 "changed_owner": [name for name, changed in (
+                     ("session", _sessions.get(sid) is not session),
+                     ("agent", session.get("agent") is not input_agent),
+                     ("transport", session.get("transport") is not input_transport),
+                     ("admission", pending_input_admission is not None and (
+                         int(session.get("_queued_prompt_generation", 0)) != pending_input_admission[0]
+                         or (session.get("inflight_turn") or {}).get("started_at") is not pending_input_admission[1]
+                         or current_window is not pending_input_admission[2]
+                         or current_nonce != pending_input_admission[3]))) if changed],
                  "error_surface": {"layer": "runtime", "code": "session_owner_changed", "retryable": True},
                  **({"input_event_id": input_receipt.event_id} if input_receipt is not None else {})})
         return None
@@ -436,7 +452,8 @@ def _(rid, params: dict) -> dict:
             if not has_truncation and input_receipt is None:
                 try:
                     input_receipt = _accept_tui_context_input(session, text,
-                        event_id=params.get("input_event_id"), display_kind=display_kind)
+                        event_id=params.get("input_event_id"), display_kind=display_kind,
+                        manual_recovery=params.get("manual_input_recovery") is True)
                 except Exception as exc:
                     return _err(rid, 5071, str(exc))
             if session.get("running"):
@@ -901,7 +918,8 @@ def _(rid, params: dict) -> dict:
         if has_truncation:
             try:
                 input_receipt = _accept_tui_context_input(session, text,
-                    event_id=params.get("input_event_id"), display_kind=display_kind)
+                    event_id=params.get("input_event_id"), display_kind=display_kind,
+                        manual_recovery=params.get("manual_input_recovery") is True)
             except Exception as exc:
                 with session["history_lock"]:
                     session["running"] = False
@@ -943,7 +961,8 @@ def _(rid, params: dict) -> dict:
         _persist_branch_seed(session)
         if has_truncation:
             input_receipt = _accept_tui_context_input(session, text,
-                event_id=params.get("input_event_id"), display_kind=display_kind)
+                event_id=params.get("input_event_id"), display_kind=display_kind,
+                        manual_recovery=params.get("manual_input_recovery") is True)
     except Exception as exc:
         from hermes_state import is_disk_full_error
 
@@ -1128,14 +1147,22 @@ def _(rid, params: dict) -> dict:
 
     session["image_counter"] = session.get("image_counter", 0) + 1
     img_dir = _session_images_dir(session)
-    img_dir.mkdir(parents=True, exist_ok=True)
-    img_path = (
-        img_dir
-        / f"clip_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{session['image_counter']}.png"
-    )
-
-    # Save-first: mirrors CLI keybinding path; more robust than has_image() precheck
-    if not save_clipboard_image(img_path):
+    img_path = None
+    try:
+        img_path = _new_staged_attachment_path(img_dir,
+            f"clip_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{session['image_counter']}.png")
+        # Save-first remains intact; a native fallback may replace the leaf
+        # inside this occurrence's private directory without affecting peers.
+        saved = save_clipboard_image(img_path)
+        if saved:
+            img_path = _publish_staged_attachment(img_path, img_dir)
+    except Exception as exc:
+        if img_path is not None:
+            _discard_staged_attachment(img_path)
+        session["image_counter"] = max(0, session["image_counter"] - 1)
+        return _err(rid, 5027, f"clipboard capture failed: {exc}")
+    if not saved:
+        _discard_staged_attachment(img_path)
         session["image_counter"] = max(0, session["image_counter"] - 1)
         msg = (
             "Clipboard has image but extraction failed"
@@ -1144,7 +1171,8 @@ def _(rid, params: dict) -> dict:
         )
         return _ok(rid, {"attached": False, "message": msg})
 
-    session.setdefault("attached_images", []).append(str(img_path))
+    with session.get("history_lock") or contextlib.nullcontext():
+        session.setdefault("attached_images", []).append(str(img_path))
     return _ok(
         rid,
         {
@@ -1280,6 +1308,26 @@ def _(rid, params: dict) -> dict:
     if err:
         return err
 
+    sid = str(params.get("session_id") or "")
+    with _sessions_lock:
+        with session.get("history_lock") or contextlib.nullcontext():
+            owner_identity = (session.get("session_key"), session.get("profile_home"),
+                              session.get("transport"), session.get("_queued_prompt_generation", 0))
+            dispatch_check = _pdf_attachment_check.get()
+            staging_session = dict(session)
+
+    def pdf_owner_current():
+        return (_sessions.get(sid) is session
+                and not session.get("_closing") and not session.get("_finalized")
+                and (session.get("session_key"), session.get("profile_home"),
+                     session.get("transport"), session.get("_queued_prompt_generation", 0)) == owner_identity
+                and (dispatch_check is None or dispatch_check()))
+
+    with _sessions_lock:
+        with session.get("history_lock") or contextlib.nullcontext():
+            if not pdf_owner_current():
+                return _err(rid, 4001, "PDF attachment owner changed; conversion not started")
+
     if shutil.which("pdftoppm") is None:
         return _err(rid, 5028, "pdftoppm not installed (poppler-utils package required)")
 
@@ -1364,26 +1412,42 @@ def _(rid, params: dict) -> dict:
             return _err(rid, 5028, "pdftoppm produced no pages (corrupt PDF?)")
 
         attached_pages = []
-        for src in rendered:
-            page_num = src.stem.split("-", 1)[-1]
-            try:
-                page_int = int(page_num)
-            except ValueError:
-                page_int = first_page + len(attached_pages)
-            dst = _queue_attached_image(session, src.read_bytes(), ".png", prefix=f"pdf_p{page_num}")
-            attached_pages.append({"path": str(dst), "page": page_int, **_image_meta(dst)})
-
-        return _ok(
-            rid,
-            {
-                "attached": True,
-                "filename": display_name,
-                "pages_attached": len(attached_pages),
-                "pages": attached_pages,
-                "count": len(session["attached_images"]),
+        staged_paths = []
+        try:
+            for src in rendered:
+                page_num = src.stem.split("-", 1)[-1]
+                try:
+                    page_int = int(page_num)
+                except ValueError:
+                    page_int = first_page + len(attached_pages)
+                dst = _queue_attached_image(staging_session, src.read_bytes(), ".png",
+                    prefix=f"pdf_p{page_num}", queue=False)
+                staged_paths.append(dst)
+                attached_pages.append({"path": str(dst), "page": page_int, **_image_meta(dst)})
+            # Build the response before publishing any pages. An ordinary
+            # method/metadata error must not strand a partially queued PDF.
+            response = _ok(rid, {
+                "attached": True, "filename": display_name,
+                "pages_attached": len(attached_pages), "pages": attached_pages,
+                "count": 0,
                 "text": f"[User attached PDF: {display_name} ({len(attached_pages)} page(s))]",
-            },
-        )
+            })
+        except Exception as exc:
+            for dst in staged_paths:
+                _discard_staged_attachment(dst)
+            return _err(rid, 5028, f"PDF page staging failed: {exc}")
+        with _sessions_lock:
+            with session.get("history_lock") or contextlib.nullcontext():
+                if not pdf_owner_current():
+                    for dst in staged_paths:
+                        _discard_staged_attachment(dst)
+                    return _err(rid, 4001, "PDF attachment owner changed; pages not published")
+                images = session.setdefault("attached_images", [])
+                images.extend(str(dst) for dst in staged_paths)
+                session["image_counter"] = max(session.get("image_counter", 0),
+                                               staging_session.get("image_counter", 0))
+                response["result"]["count"] = len(images)
+        return response
 
 
 @method("file.attach")
@@ -1916,6 +1980,65 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, {"resolved": resolved})
     except Exception as e:
         return _err(rid, 5004, str(e))
+
+
+@method("prompt.input_status")
+def _(rid, params: dict) -> dict:
+    """Manual readback of the existing inbox receipt, never execution authority."""
+    session, error = _sess_nowait(params, rid)
+    if error:
+        return error
+    event_id, text = params.get("input_event_id"), params.get("text")
+    if not isinstance(event_id, str) or not event_id or not isinstance(text, str):
+        return _err(rid, 4004, "exact input identity and frozen text required")
+    with session["history_lock"]:
+        agent = None if _session_uses_compute_host(session) else session.get("agent")
+        source = str(getattr(agent, "platform", None) or _session_source(session))
+        key = getattr(agent, "session_id", None) or session.get("session_key")
+        try:
+            with _session_db(session) as db:
+                receipt = db.read_context_input(key, source=source, event_id=event_id)
+                if receipt is None:
+                    # Absence in this owner does not prove another owner refused.
+                    return _ok(rid, {"input_event_id": event_id, "durable_input_accepted": None,
+                        "execution_started": None, "can_manual_retry": False})
+                # V2 media custody can be read back without granting media
+                # execution. Compare only the stored text for this read-only
+                # query; the immutable payload digest remains authoritative
+                # and no content is rewritten or downgraded to a V1 receipt.
+                media_unqualified = receipt.schema == "SessionDBContextInputV2"
+                stored_text = (receipt.content.get("text")
+                    if media_unqualified and isinstance(receipt.content, dict)
+                    else receipt.content)
+                if stored_text != text:
+                    return _err(rid, 4092, "CONTEXT_INPUT_ID_CONFLICT")
+                work = db.read_context_input_work(key)
+                phase = work["phase"]
+                pending = receipt in work["receipts"]
+                started = bool(phase and phase.get("dispatch_attempts"))
+                safe = pending and not started and not session.get("running") and not (
+                    session.get("_stop_pending") or session.get("_stop_uncertain") or session.get("_turn_cancel_requested")
+                    or session.get("_host_delivery_uncertain") or session.get("_compute_host_active_request_id"))
+                origin_status = "not_applicable"
+                recovery_block_reason = None
+                if media_unqualified:
+                    safe = False
+                    recovery_block_reason = "CONTEXT_INPUT_TEXT_ROUTE_REQUIRED"
+                if source == "desktop":
+                    origin = db.read_context_input_origin(key, receipt)
+                    origin_status = "missing" if origin is None else "recorded"
+                    if safe:
+                        try:
+                            _desktop_input_recovery_origin(session, db, key, receipt)
+                        except Exception as exc:
+                            safe = False
+                            recovery_block_reason = str(exc)
+                return _ok(rid, {"input_event_id": event_id, "durable_input_accepted": True,
+                    "execution_started": True if started else False if safe else None,
+                    "can_manual_retry": bool(safe), "payload_digest": receipt.payload_digest,
+                    "origin_status": origin_status, "recovery_block_reason": recovery_block_reason})
+        except Exception as exc:
+            return _err(rid, 5032, f"Input receipt reconciliation unavailable: {exc}")
 
 
 def register(server) -> None:

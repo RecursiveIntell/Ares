@@ -2,6 +2,28 @@ import { getApiRequestConnection, getApiRequestProfile, type ProfileScope } from
 import { getGlobalModelOptions, type HermesGateway, type ModelOptionsResponse } from '@/hermes'
 import type { ModelOptionProvider } from '@/types/hermes'
 
+/** Optional backend provenance. Absence means an older backend, not staleness. */
+export interface ModelCatalogStatus {
+  authoritative?: boolean
+  degraded: boolean
+  freshness: 'fresh' | 'stale' | 'unknown'
+  source: string
+  updated_at?: number | null
+}
+
+export function modelCatalogStatus(provider: ModelOptionProvider): ModelCatalogStatus | null {
+  const status = (provider as ModelOptionProvider & { catalog_status?: ModelCatalogStatus }).catalog_status
+
+  return status && typeof status.source === 'string' &&
+    ['fresh', 'stale', 'unknown'].includes(status.freshness) && typeof status.degraded === 'boolean' ? status : null
+}
+
+export function catalogIsDegraded(provider: ModelOptionProvider): boolean {
+  const status = modelCatalogStatus(provider)
+
+  return status?.degraded === true || status?.freshness === 'stale'
+}
+
 /** Catalog absence is a visible configuration gap, never a new selection. */
 export function selectionUnavailable(
   providers: ModelOptionProvider[] | undefined,
@@ -12,7 +34,7 @@ export function selectionUnavailable(
     return false
   }
 
-  const row = providers.find(p => p.slug === provider || p.name === provider || p.aliases?.includes(provider))
+  const row = providers.find(p => p.slug === provider || p.aliases?.includes(provider))
 
   return !row || !(row.models ?? []).includes(model) || (row.unavailable_models ?? []).includes(model)
 }
@@ -99,7 +121,11 @@ export async function requestModelOptions({
       gatewayError = error
     }
 
-    if (gatewayOptions && hasSelectableModels(gatewayOptions)) {
+    if (gatewayOptions && (hasSelectableModels(gatewayOptions) || gatewayOptions.providers?.some(row => {
+      const status = modelCatalogStatus(row)
+
+      return status?.freshness === 'fresh' && !status.degraded && status.authoritative === true
+    }))) {
       return gatewayOptions
     }
 

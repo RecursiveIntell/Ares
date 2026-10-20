@@ -493,3 +493,14 @@ describe('legacy-null and explicit-local catalog authority', () => {
     }
   })
 })
+
+it('keeps explicit authoritative delisting instead of recovering a foreign REST catalog', async () => {
+  const payload = { provider: 'custom:a', model: 'removed', providers: [{
+    slug: 'custom:a', name: 'A', models: [],
+    catalog_status: { source: 'live', freshness: 'fresh', degraded: false, updated_at: 1, authoritative: true }
+  }] }
+  const request = vi.fn().mockResolvedValue(payload)
+  vi.mocked(getGlobalModelOptions).mockClear()
+  expect(await requestModelOptions({ request })).toBe(payload)
+  expect(getGlobalModelOptions).not.toHaveBeenCalled()
+})

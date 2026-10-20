@@ -11,6 +11,7 @@ import argparse
 import concurrent.futures
 import contextlib
 import json
+import errno
 
 from tui_gateway.checkpoint_json import load_checkpoint_frame
 import os
@@ -101,8 +102,7 @@ class _HostTransport:
                 sid = str(((obj.get("params") or {}).get("session_id")) or "")
         except Exception:
             sid = ""
-        self._emit({"type": "rpc", "sid": sid, "message": obj})
-        return True
+        return self._emit({"type": "rpc", "sid": sid, "message": obj}) is not False
 
     def close(self) -> None:
         return None
@@ -146,11 +146,16 @@ class ComputeHost:
         self._stdout = stdout or sys.stdout
         self._write_lock = threading.Lock()
         self._sessions: dict[str, HostSession] = {}
-        self._executor = concurrent.futures.ThreadPoolExecutor(
+        from tools.daemon_pool import DaemonThreadPoolExecutor
+        self._executor = DaemonThreadPoolExecutor(
             max_workers=max_workers or _default_workers(),
             thread_name_prefix="compute-host-turn",
         )
         self._closed = threading.Event()
+        self._output_failure = None
+        self._stop_signaled: set[int] = set()
+        self._stop_failures: list[dict[str, Any]] = []
+        self._stop_lock = threading.Lock()
         self._parent_pid = os.getppid()
         self._boot_id = uuid.uuid4().hex
         self._progress_counter = 0
@@ -175,15 +180,69 @@ class ComputeHost:
             threading.Thread(target=self._heartbeat_loop, name="compute-host-heartbeat", daemon=True).start()
             threading.Thread(target=self._parent_guard_loop, name="compute-host-ppid-guard", daemon=True).start()
 
-    def emit(self, frame: dict[str, Any]) -> None:
+    def _record_unsent(self, frame: dict[str, Any], outcome: str) -> None:
+        from hermes_constants import get_hermes_home
+        from tui_gateway.host_supervisor import append_log_record
+        receipt = {'boot_id': self._boot_id, 'host_pid': os.getpid(),
+            'frame_type': frame.get('type'), 'sid': frame.get('sid'),
+            'request_id': frame.get('request_id'), 'delivery': outcome,
+            'outcome': 'unknown', 'classification': 'HOST_OUTPUT_LOST'}
+        try:
+            append_log_record(get_hermes_home() / 'state' / 'dashboard-compute-host-outcomes.jsonl',
+                json.dumps(receipt, separators=(',', ':')))
+        except OSError:
+            # The in-memory classification remains unknown. A failed durable
+            # receipt must never become a written transport acknowledgement.
+            self._output_failure['receipt_persisted'] = False
+
+    def _signal_live_owners(self) -> None:
+        agents = [session.agent for session in self._sessions.values() if session.running]
+        from tui_gateway import server
+        with self._turn_futures_lock:
+            owned_sids = set(self._active_request_ids) | set(self._turn_futures.values())
+        for sid, session in list(server._sessions.items()):
+            if sid in owned_sids or session.get('transport') is self._transport:
+                if session.get('agent') is not None:
+                    agents.append(session['agent'])
+        for agent in agents:
+            with self._stop_lock:
+                if id(agent) in self._stop_signaled:
+                    continue
+                self._stop_signaled.add(id(agent))
+            try:
+                request_hard_interrupt(agent)
+            except Exception as exc:
+                self._stop_failures.append({'session_id': getattr(agent, 'session_id', None),
+                    'error_class': type(exc).__name__, 'outcome': 'unknown'})
+
+    def emit(self, frame: dict[str, Any]) -> bool:
         frame.setdefault("host_ns", now_ns())
         data = json.dumps(frame, separators=(",", ":"), ensure_ascii=False)
+        lost = False
         with self._write_lock:
-            print(data, file=self._stdout, flush=True)
+            if self._output_failure is not None:
+                self._record_unsent(frame, 'not_sent')
+                return False
+            try:
+                print(data, file=self._stdout, flush=True)
+            except (OSError, ValueError) as exc:
+                code = getattr(exc, 'errno', None)
+                if isinstance(exc, ValueError) and getattr(self._stdout, 'closed', False):
+                    code = errno.EBADF
+                if code not in {errno.EPIPE, errno.EBADF}:
+                    raise
+                self._output_failure = {'classification': 'HOST_OUTPUT_LOST',
+                    'outcome': 'unknown', 'errno': code, 'receipt_persisted': True}
+                self._record_unsent(frame, 'unknown')
+                lost = True
+        if lost:
+            self._closed.set()
+            self._signal_live_owners()
+            return False
+        return True
 
     def close(self) -> None:
-        self._closed.set()
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        self.shutdown(reason='close', wait=0)
 
     def shutdown(self, *, reason: str = "shutdown", wait: float = 10.0) -> None:
         """Drain in-flight turns, then finalize every session.
@@ -213,21 +272,11 @@ class ComputeHost:
         Leaving them unfinalized keeps them recoverable instead. Sessions with
         no live turn finalize here as they always have.
 
-        NOTE: ``server._shutdown_sessions`` is registered via ``atexit``
-        (``server.py``) and runs on ``SystemExit`` after ``shutdown()``
-        returns. It calls ``_finalize_session`` on any session still in
-        ``server._sessions`` — including ones skipped here whose turn is
-        still running, since ``_executor.shutdown(wait=False)`` only cancels
-        pending futures, not running ones. The orphan path (``os._exit(0)``)
-        bypasses atexit, so the skip is fully effective there. For the
-        SIGTERM and stdin_closed paths the atexit handler may re-finalize
-        skipped sessions; this is a pre-existing issue (the old finalize-
-        first order had the same atexit interaction) and does not make the
-        drain-before-finalize reordering worse. A follow-up could gate
-        ``_shutdown_sessions`` on ``not session.get("_finalized") and not
-        session.get("running")`` to close the gap.
+        The canonical server finalizer also retains unresolved owners across
+        the registered atexit path; it cannot spend the latch on live work.
         """
         self._closed.set()
+        self._signal_live_owners()
         budget = max(0.0, wait)
         deadline = time.monotonic() + budget - min(_FLUSH_RESERVE_SECS, budget / 2.0)
         while True:
@@ -244,6 +293,18 @@ class ComputeHost:
             time.sleep(min(0.05, remaining))
         with self._turn_futures_lock:
             live_sids = {sid for future, sid in self._turn_futures.items() if sid and not future.done()}
+        # Record uncertainty, never a successful terminal for still-live work.
+        if live_sids:
+            from hermes_constants import get_hermes_home
+            from tui_gateway.host_supervisor import append_log_record
+            for sid in live_sids:
+                try:
+                    append_log_record(get_hermes_home() / 'state' / 'dashboard-compute-host-outcomes.jsonl',
+                        json.dumps({'boot_id': self._boot_id, 'sid': sid,
+                            'request_id': self._active_request_ids.get(sid),
+                            'classification': 'HOST_SHUTDOWN_UNSETTLED', 'outcome': 'unknown'}))
+                except OSError:
+                    self._shutdown_receipt_failed = True
         self.flush_all_sessions(reason=reason, skip_sids=live_sids)
         self._executor.shutdown(wait=False, cancel_futures=True)
 
@@ -273,6 +334,8 @@ class ComputeHost:
 
     def handle_frame(self, frame: dict[str, Any]) -> None:
         kind = str(frame.get("type") or "")
+        if self._closed.is_set() and kind != 'shutdown':
+            return
         if kind == "session.seed":
             self._handle_seed(frame)
         elif kind == "session.lookup":
@@ -286,11 +349,9 @@ class ComputeHost:
         elif kind == "control":
             self._handle_control(frame)
         elif kind == "shutdown":
-            self.emit({"type": "shutdown.ack", "request_id": frame.get("request_id")})
-            # Explicit supervisor/test shutdown is a clean child-process close;
-            # SIGTERM and orphan paths are the durability flush paths.
-            self._closed.set()
-            self._executor.shutdown(wait=False, cancel_futures=True)
+            self.shutdown(reason='control_shutdown')
+            self.emit({"type": "shutdown.ack", "request_id": frame.get("request_id"),
+                'outcome': 'unknown' if self._turn_futures else 'settled'})
         else:
             self.emit(
                 {
@@ -415,7 +476,7 @@ class ComputeHost:
         admitted, request_id = self._admit_real_turn(frame)
         if not admitted:
             self.emit({"type": "turn.error", "sid": sid, "request_id": request_id,
-                       "message": "session busy", "reason": "admission_refused_busy"})
+                       "message": "session busy", "reason": "admission_refused_busy", "execution_started": False})
 
     def admit_autonomous_turn(self, frame: dict[str, Any]) -> bool:
         """Admit an autonomously-initiated turn through the same registry as a
@@ -649,9 +710,14 @@ class ComputeHost:
             if cancelled_before_construction:
                 terminal_attempted = True
                 self._emit_real_turn_terminal({"type": "turn.end", "sid": sid, "request_id": request_id,
-                                               "interrupted": True, "ended_ns": now_ns()})
+                                               "interrupted": True, "execution_started": False, "ended_ns": now_ns()})
                 return
             session = self._ensure_server_session(server, frame)
+            binding = (frame.get("display_metadata") or {}).get("goal_continuation")
+            if binding and not server._goal_generation_current(session, binding):
+                self._emit_real_turn_terminal({"type": "turn.end", "sid": sid, "request_id": request_id,
+                    "interrupted": True, "execution_started": False, "ended_ns": now_ns()})
+                return
             # The compute host is the canonical turn owner while isolation is
             # active. Admit durable session state before claiming running or
             # emitting turn.started; a false ready/streaming projection for an
@@ -668,19 +734,21 @@ class ComputeHost:
                     session["_turn_cancel_requested"] = True
                     session["running"] = False
                     terminal = {"type": "turn.end", "sid": sid, "request_id": request_id,
-                                "interrupted": True, "ended_ns": now_ns()}
+                                "interrupted": True, "execution_started": False, "ended_ns": now_ns()}
                 elif (
                     queued_prompt_generation is not None
                     and int(session.get("_queued_prompt_generation", 0))
                     != int(queued_prompt_generation)
                 ):
                     terminal = {"type": "turn.end", "sid": sid, "request_id": request_id,
-                                "interrupted": True, "ended_ns": now_ns()}
+                                "interrupted": True, "execution_started": False, "ended_ns": now_ns()}
                 elif session.get("running"):
                     terminal = {"type": "turn.error", "sid": sid, "request_id": request_id,
-                                "message": "session busy"}
+                                "message": "session busy", "execution_started": False}
                 else:
                     session["running"] = True
+                    if binding:
+                        session["_goal_generation"] = binding
                     session["_host_turn_request_id"] = request_id
                     admitted_session = session
                     self._admitted_request_sessions[sid] = (request_id, session)
@@ -1298,4 +1366,11 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":  # pragma: no cover
-    raise SystemExit(main())
+    # Run the canonical module's implementation. The server imports its
+    # concrete _HostTransport for authorization: constructing the host from
+    # this __main__ namespace would create a second, nonidentical class and
+    # reject legitimate host-owned turns. Keep the strict type/owner checks;
+    # normalize the executable entrypoint, not the authorization decision.
+    from tui_gateway.compute_host import main as _canonical_main
+
+    raise SystemExit(_canonical_main())

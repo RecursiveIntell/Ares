@@ -3,10 +3,14 @@
 The child uses the existing explicit synthetic-turn fixture, never a provider.
 """
 import contextlib
+from collections import deque
 import json
 import os
 from pathlib import Path
+import sys
 import threading
+import time
+import traceback
 
 from hermes_state import SessionDB
 from tui_gateway import server
@@ -24,7 +28,19 @@ def test_real_pipe_stop_then_post_cut_followup_runs_once(tmp_path, monkeypatch):
                'source': 'desktop', 'cwd': str(tmp_path), 'queued_prompt': None,
                '_compute_host_active': True}
     monkeypatch.setitem(server._sessions, 'fixture', session)
+    # Existing argv injection seam: retain child thread locations when this
+    # integration stalls, without changing the product host or timeout bounds.
+    launcher = tmp_path / 'trace_compute_host.py'
+    root = Path(__file__).resolve().parents[2]
+    launcher.write_text(
+        "import faulthandler, importlib.util, runpy\n"
+        f"assert importlib.util.find_spec('tui_gateway.compute_host').origin == {str(root / 'tui_gateway/compute_host.py')!r}\n"
+        "faulthandler.dump_traceback_later(8, repeat=True)\n"
+        "try:\n    runpy.run_module('tui_gateway.compute_host', run_name='__main__', alter_sys=True)\n"
+        "finally:\n    faulthandler.cancel_dump_traceback_later()\n"
+    )
     host = HostSupervisor(registry_path=home / 'host.json', autostart=False,
+        argv=[sys.executable, '-P', str(launcher)],
         rpc_sink=lambda frame: None, heartbeat_secs=0, respawn_max=0,
         env={'HOME': str(tmp_path), 'PATH': os.environ.get('PATH', ''),
              'PYTHONPATH': str(Path(__file__).resolve().parents[2]), 'HERMES_HOME': str(home),
@@ -42,11 +58,15 @@ def test_real_pipe_stop_then_post_cut_followup_runs_once(tmp_path, monkeypatch):
     finished = threading.Event()
     admissions = []
     terminals = []
+    observed = deque(maxlen=160)
     original_frame = host._handle_host_frame
     original_done = server._on_compute_host_turn_done
     original_interrupt = host.interrupt
 
     def capture(frame):
+        observed.append({'at': time.monotonic(), 'type': frame.get('type'),
+                         'request_id': frame.get('request_id'),
+                         'target_request_id': frame.get('target_request_id')})
         if frame.get('type') == 'turn.started':
             admissions.append(frame['request_id'])
             started.set()
@@ -69,6 +89,26 @@ def test_real_pipe_stop_then_post_cut_followup_runs_once(tmp_path, monkeypatch):
     monkeypatch.setattr(host, '_handle_host_frame', capture)
     monkeypatch.setattr(server, '_on_compute_host_turn_done', complete)
     monkeypatch.setattr(host, 'interrupt', stop_and_enqueue)
+
+    def diagnostic_snapshot():
+        # Location-only snapshots, without locals, prompt data, or locking a
+        # possibly stalled owner. These observations are not settlement proof.
+        frames = sys._current_frames()
+        stacks = {}
+        for thread in threading.enumerate():
+            if thread.name.startswith('compute-host-') and thread.ident in frames:
+                stacks[thread.name] = [
+                    {'file': item.filename, 'line': item.lineno, 'function': item.name}
+                    for item in traceback.extract_stack(frames[thread.ident])
+                ]
+        proc = host._proc
+        return {'observed_frames': list(observed), 'parent_stacks': stacks,
+                'child_exit_code': proc.poll() if proc is not None else None,
+                'child_stderr_tail': list(host._stderr_tail),
+                'pending_turn_ids': list(host._pending_turns),
+                'projection_workers': list(host._terminal_workers),
+                'failed_projection_keys': list(host._failed_projections)}
+
     try:
         result = server._submit_prompt_to_compute_host('first', 'fixture', session,
             json.dumps({'duration_s': 5, 'chunk': 100}))
@@ -81,6 +121,7 @@ def test_real_pipe_stop_then_post_cut_followup_runs_once(tmp_path, monkeypatch):
                 '_queued_prompt_generation', '_last_stop_queue_generation', 'queued_prompt',
                 '_compute_host_active_request_id', '_stop_pending', '_stop_uncertain')},
             'events': events,
+            'diagnostics': diagnostic_snapshot(),
         }
         assert len(admissions) == len(set(admissions)) == 2
         assert all(frame['type'] == 'turn.end' for frame in terminals)

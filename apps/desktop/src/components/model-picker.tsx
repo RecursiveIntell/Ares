@@ -2,7 +2,7 @@ import { useQuery } from '@tanstack/react-query'
 import { useState } from 'react'
 
 import { useI18n } from '@/i18n'
-import { modelOptionsQueryKey, requestModelOptions, selectionUnavailable } from '@/lib/model-options'
+import { catalogIsDegraded, modelOptionsQueryKey, requestModelOptions, selectionUnavailable } from '@/lib/model-options'
 import { modelSearchText } from '@/lib/model-search-text'
 import { currentPickerSelection } from '@/lib/model-status-label'
 import { normalize } from '@/lib/text'
@@ -105,6 +105,11 @@ export function ModelPickerDialog({
         bodyClassName="gap-0 overflow-hidden p-0"
         className={cn('max-h-[85vh] max-w-2xl', contentClassName)}
       >
+        {providers.some(catalogIsDegraded) && (
+          <div className="px-4 py-2 text-xs text-(--ui-text-secondary)" role="status">
+            {t.modelDiscovery.catalogStale}
+          </div>
+        )}
         <DialogHeader className="border-b border-border px-4 py-3">
           <DialogTitle>{copy.title}</DialogTitle>
           <DialogDescription className="font-mono text-xs leading-relaxed">

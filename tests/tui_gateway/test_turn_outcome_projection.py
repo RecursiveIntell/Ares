@@ -354,27 +354,71 @@ def inline_admission(monkeypatch, session):
     monkeypatch.setattr(server, "_wait_agent_for_prompt", lambda *a: None)
 
 
-def test_real_inline_chain_preserves_all_finalized_under_one_admission(monkeypatch, turn_env, projection_env):
+@pytest.mark.parametrize("pause_before_dispatch", [False, True])
+def test_real_inline_chain_preserves_all_finalized_under_one_admission(
+    monkeypatch, turn_env, projection_env, pause_before_dispatch,
+):
+    """Real pending-goal admission preserves the original inline reply chain.
+
+    A recovery prompt alone grants no authority: a paused checkpoint must not
+    dispatch. Both admitted replies still correlate to the original Send ACK.
+    """
+    from hermes_cli import goals
+
     session = _session()
     inline_admission(monkeypatch, session)
+    session_key = session["session_key"]
+    goals._get_session_db().create_session(session_key, source="desktop")
+    goals.GoalManager(session_key).set("work")
+    # This test exercises correlation and the real SQLite admission seam,
+    # not the auxiliary goal judge. Never discover an external provider.
+    monkeypatch.setattr(server, "_is_successful_goal_turn", lambda *a: False)
     calls = []
+    expected_prompt = []
+
     def provider(prompt, **kwargs):
         calls.append(prompt)
         if len(calls) == 2:
             assert snapshot(session)["turns"][0]["state"] == "running"
         text = "substantive" if len(calls) == 1 else "pass"
-        return {"final_response": text, "messages": [*(kwargs.get("conversation_history") or []),
-            {"role": "user", "content": prompt}, {"role": "assistant", "content": text}]}
-    session["agent"] = types.SimpleNamespace(session_id="inline-key", model="fake", provider="fake",
-        context_compressor=None, run_conversation=provider, clear_interrupt=lambda: None)
-    monkeypatch.setattr(server, "_plan_goal_compression_recovery", lambda *a, **kw: (
-        "continue" if len(calls) == 1 else None, None))
+        return {"final_response": text, "messages": [
+            *(kwargs.get("conversation_history") or []),
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": text},
+        ]}
+
+    session["agent"] = types.SimpleNamespace(
+        session_id="inline-key", model="fake", provider="fake",
+        context_compressor=None, run_conversation=provider, clear_interrupt=lambda: None,
+    )
+
+    def pending_recovery(session, result, *, status, raw, binding_out=None):
+        if len(calls) != 1:
+            return None, None
+        mgr = goals.GoalManager(session_key)
+        decision = mgr.evaluate_after_turn("", turn_outcome=goals.EXECUTION_FAILED)
+        assert decision["should_continue"] is True
+        state = mgr.state
+        binding_out.update(
+            goal_id=state.goal_id, checkpoint_revision=state.checkpoint_revision,
+            continuation_token=state.continuation_token,
+        )
+        expected_prompt.append(decision["continuation_prompt"])
+        if pause_before_dispatch:
+            mgr.pause()
+        return decision["continuation_prompt"], None
+
+    monkeypatch.setattr(server, "_plan_goal_compression_recovery", pending_recovery)
     ack = server._methods["prompt.submit"]("rpc", {"session_id": "s", "text": "prompt"})
-    turn = snapshot(session)["turns"][0]
+    turns = snapshot(session)["turns"]
+    assert len(turns) == 1
+    turn = turns[0]
     assert turn["accepted_turn"] == ack["result"]["accepted_turn"]
     assert turn["state"] == "complete"
-    assert [f["text"] for f in turn["finalized"]] == ["substantive", "pass"]
-    assert calls == ["prompt", "continue"]
+    assert [f["text"] for f in turn["finalized"]] == (
+        ["substantive"] if pause_before_dispatch else ["substantive", "pass"]
+    )
+    assert calls == (["prompt"] if pause_before_dispatch else ["prompt", expected_prompt[0]])
 
 
 @pytest.mark.parametrize("retirement", ["closing", "replacement", "cancel"])

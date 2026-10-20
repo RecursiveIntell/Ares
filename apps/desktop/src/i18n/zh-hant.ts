@@ -3,6 +3,10 @@ import { defineFieldCopy } from '@/app/settings/field-copy'
 import { defineLocale } from './define-locale'
 
 export const zhHant = defineLocale({
+  modelDiscovery: {
+    catalogStale: '正在顯示儲存的目錄。請重新整理以檢查可用性。',
+    showAllModels: '顯示所有模型'
+  },
   common: {
     apply: '套用',
     back: '返回',
@@ -2073,6 +2077,11 @@ export const zhHant = defineLocale({
     goalActive: '目標進行中',
     goalDone: '目標已完成',
     goalPaused: '目標已暫停',
+    goalPauseAction: '暫停',
+    goalResumeAction: '恢復排程',
+    goalClearAction: '清除',
+    goalBlocked: '目標受阻',
+    goalAwaitingInput: '目標等待輸入',
     goalWaiting: '目標等待中',
     subagents: count => `${count} 個子代理`,
     todos: (done, total) => `任務 ${done}/${total}`,
@@ -2892,6 +2901,12 @@ export const zhHant = defineLocale({
     audioReadFailed: '無法讀取錄製的音訊',
     sessionUnavailable: '工作階段不可用',
     createSessionFailed: '無法建立新工作階段',
+    inputRecoveryRefused: '輸入未接收且未開始執行，草稿已保留用於手動恢復。',
+    inputRecoveryRequired: '輸入需要手動核對，草稿已保留。',
+    inputRecoveryReview: '核對回執',
+    inputRecoveryNotStarted: '輸入已接收，執行尚未開始。',
+    inputRecoveryUnknown: '執行可能已開始或投遞狀態未知。再次傳送前請核對。',
+    inputRecoveryRetry: '恢復已接收輸入',
     promptFailed: '提示詞傳送失敗',
     providerCredentialRequired: '傳送第一則訊息前請先新增提供方憑證。',
     emptySlashCommand: '空的斜線指令',

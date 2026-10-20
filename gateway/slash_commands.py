@@ -2843,11 +2843,22 @@ class GatewaySlashCommandsMixin:
                         source=event.source,
                         message_id=None,
                         channel_prompt=None,
+                        internal=True,
+                        allow_gateway_control=False,
+                        metadata={"goal_continuation": {"goal_id": state.goal_id,
+                            "checkpoint_revision": state.checkpoint_revision,
+                            "continuation_token": state.continuation_token},
+                            "gateway_session_key": _quick_key, "gateway_session_id": session_entry.session_id,
+                            "gateway_session_strict": True},
                     )
-                    self._enqueue_fifo(_quick_key, cont_event, adapter)
+                    if mgr.claim_continuation(f"gateway-resume:{id(self)}:{session_entry.session_id}"):
+                        try:
+                            self._enqueue_fifo(_quick_key, cont_event, adapter)
+                        finally:
+                            mgr.release_continuation(queued=True)
             except Exception as exc:
                 logger.debug("goal resume: continuation enqueue failed: %s", exc)
-            return t("gateway.goal.resumed", goal=state.goal)
+            return t("gateway.goal.resumed", goal=state.goal) if prompt else mgr.status_line()
 
         if lower == "done":
             had = mgr.has_goal()

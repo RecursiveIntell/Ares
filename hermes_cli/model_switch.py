@@ -76,10 +76,9 @@ def _declared_model_ids(value: Any) -> list[str]:
         model_id = candidate.strip()
         if not model_id:
             return
-        lowered = model_id.lower()
-        if lowered in seen:
+        if model_id in seen:
             return
-        seen.add(lowered)
+        seen.add(model_id)
         ids.append(model_id)
 
     if isinstance(value, str):
@@ -291,6 +290,7 @@ def _fetch_picker_live_models(
     headers: dict[str, str] | None = None,
     timeout: float = 5.0,
     api_mode: str | None = None,
+    force_refresh: bool = False,
 ) -> list[str] | None:
     """Fetch picker models with native Ollama and cached generic discovery."""
     from hermes_cli.models import (
@@ -340,6 +340,7 @@ def _fetch_picker_live_models(
             timeout=timeout,
             headers=resolved_headers,
             api_mode=api_mode,
+            force_refresh=force_refresh,
         )
     generic_models = cached_fetch_api_models(
         api_key,
@@ -347,6 +348,7 @@ def _fetch_picker_live_models(
         timeout=timeout,
         headers=resolved_headers,
         api_mode=api_mode,
+        force_refresh=force_refresh,
     )
     return generic_models if generic_models else None
 
@@ -2412,13 +2414,9 @@ def _prefetch_provider_models_parallel(provider_slugs: list[str]) -> None:
 
     def _fetch_one(slug: str) -> None:
         try:
-            models = cached_provider_model_ids(slug, force_refresh=True)
-            # cached_provider_model_ids already persists the result, but in a
-            # non-locked read-modify-write.  Re-persist via the thread-safe
-            # path to guarantee no lost writes under concurrency.
-            if models:
-                from hermes_cli.models import update_provider_cache_entry
-                update_provider_cache_entry(slug, models)
+            # The cache owner validates provenance and writes under its lock.
+            # Re-persisting the returned fallback would reset its age/scope.
+            cached_provider_model_ids(slug, force_refresh=True)
         except Exception:
             pass  # best-effort; picker falls back to curated list
 
@@ -2636,9 +2634,8 @@ def list_authenticated_providers(
     account-sensitive flows. UI picker opens should leave it false so they do
     not block on fresh Portal/account checks every time.
 
-    ``refresh`` busts the per-provider model-id disk cache
-    (``provider_models_cache.json``) up front so every row re-fetches its
-    live catalog. Use for an explicit user-triggered "refresh models" action
+    ``refresh`` bypasses cache reads and replaces a provider's disk entry only
+    after validated, authoritative discovery. Use for a "refresh models" action
     (e.g. the desktop picker's refresh control); leave false for normal picker
     opens so they stay snappy on the 1h cache.
 
@@ -2662,8 +2659,10 @@ def list_authenticated_providers(
     from hermes_cli.models import (
         OPENROUTER_MODELS, _PROVIDER_MODELS,
         _MODELS_DEV_PREFERRED, _merge_with_models_dev, cached_provider_model_ids,
-        clear_provider_models_cache, get_curated_nous_model_ids,
+        get_curated_nous_model_ids, model_catalog_endpoint_identity,
     )
+
+    discovered_status: dict[str, dict] = {}
 
     def _catalog_provider_model_ids(slug):
         from agent.secret_scope import current_secret_scope
@@ -2672,23 +2671,22 @@ def list_authenticated_providers(
             # The SDK discovers through its process-global credential chain.
             # A cross-profile catalog can use curated IDs without that probe.
             return list(_PROVIDER_MODELS.get(slug, []))
-        return cached_provider_model_ids(slug)
+        ids = cached_provider_model_ids(slug, force_refresh=refresh)
+        status = getattr(ids, "catalog_status", None)
+        if status is not None:
+            discovered_status[slug] = dict(status)
+        return ids
 
-    # Explicit refresh: drop every provider's cached model-id list so the
-    # _catalog_provider_model_ids() calls below all re-fetch live. Without this
-    # a stale 1h cache can fall back to the curated static list when its live
-    # fetch later fails, silently dropping live-only models (e.g. OpenCode
-    # Zen's free tier) the user had seen before.
-    if refresh:
-        try:
-            clear_provider_models_cache()
-        except Exception:
-            pass
+    def _authoritative_catalog(slug):
+        return discovered_status.get(slug, {}).get("authoritative") is True
+
+    # Refresh replaces a validated catalog after success; deleting first
+    # loses last-known-good recovery during an outage.
 
     results: List[dict] = []
     seen_slugs: set = set()  # lowercase-normalized to catch case variants (#9545)
     _current_provider_norm = str(current_provider or "").strip().lower()
-    _current_base_url_norm = str(current_base_url or "").strip().rstrip("/").lower()
+    _current_base_url_norm = model_catalog_endpoint_identity(current_base_url)
 
     def _can_probe_custom_provider(*, row_is_current: bool) -> bool:
         return bool(probe_custom_providers or (probe_current_custom_provider and row_is_current))
@@ -2706,7 +2704,7 @@ def list_authenticated_providers(
     _builtin_endpoints: set = set()
 
     def _norm_url(url: str) -> str:
-        return str(url or "").strip().rstrip("/").lower()
+        return model_catalog_endpoint_identity(url)
 
     def _record_builtin_endpoint(slug: str) -> None:
         """Record the effective base URL for a built-in provider row.
@@ -2935,7 +2933,7 @@ def list_authenticated_providers(
         # disk caching to keep the picker open snappy. Falls back to the
         # curated static list when the live fetcher returns nothing.
         model_ids = _catalog_provider_model_ids(hermes_id)
-        if not model_ids:
+        if not model_ids and not _authoritative_catalog(hermes_id):
             model_ids = curated.get(hermes_id, [])
             if hermes_id in _MODELS_DEV_PREFERRED:
                 model_ids = _merge_with_models_dev(hermes_id, model_ids)
@@ -3095,7 +3093,7 @@ def list_authenticated_providers(
         elif overlay.auth_type == "aws_sdk":
             try:
                 _ids = _catalog_provider_model_ids(hermes_slug)
-                model_ids = _ids if _ids else (curated.get(hermes_slug, []) or curated.get(pid, []))
+                model_ids = _ids if _ids or _authoritative_catalog(hermes_slug) else (curated.get(hermes_slug, []) or curated.get(pid, []))
             except Exception:
                 model_ids = curated.get(hermes_slug, []) or curated.get(pid, [])
         elif hermes_slug == "nous":
@@ -3110,6 +3108,9 @@ def list_authenticated_providers(
             # catalog; then: curated-only, which dropped the 4 Portal
             # recommendations (e.g. stepfun/step-3.7-flash:free).
             model_ids = curated.get("nous", [])
+            status = getattr(model_ids, "catalog_status", None)
+            if status is not None:
+                discovered_status[hermes_slug] = dict(status)
             try:
                 from hermes_cli.models import (
                     get_pricing_for_provider as _nous_pricing,
@@ -3140,7 +3141,7 @@ def list_authenticated_providers(
             # curated dict (with models.dev merge for preferred providers)
             # when the live fetcher comes up empty.
             model_ids = _catalog_provider_model_ids(hermes_slug)
-            if not model_ids:
+            if not model_ids and not _authoritative_catalog(hermes_slug):
                 model_ids = curated.get(hermes_slug, []) or curated.get(pid, [])
                 if hermes_slug in _MODELS_DEV_PREFERRED:
                     model_ids = _merge_with_models_dev(hermes_slug, model_ids)
@@ -3214,13 +3215,13 @@ def list_authenticated_providers(
         if _cp_config and getattr(_cp_config, "auth_type", "") == "aws_sdk":
             try:
                 _ids = _catalog_provider_model_ids(_cp.slug)
-                _cp_model_ids = _ids if _ids else curated.get(_cp.slug, [])
+                _cp_model_ids = _ids if _ids or _authoritative_catalog(_cp.slug) else curated.get(_cp.slug, [])
             except Exception:
                 _cp_model_ids = curated.get(_cp.slug, [])
         else:
             # Unified pathway — same as sections 1 and 2.
             _cp_model_ids = _catalog_provider_model_ids(_cp.slug)
-            if not _cp_model_ids:
+            if not _cp_model_ids and not _authoritative_catalog(_cp.slug):
                 _cp_model_ids = curated.get(_cp.slug, [])
         _cp_total = len(_cp_model_ids)
         _cp_top = _cp_model_ids[:max_models] if max_models is not None else _cp_model_ids
@@ -3294,7 +3295,7 @@ def list_authenticated_providers(
                 if inline_api_key
                 else (f"env:{key_env}" if key_env else "")
             )
-            api_url_norm = str(api_url).strip().rstrip("/").lower()
+            api_url_norm = model_catalog_endpoint_identity(api_url)
             # Per-provider extra_headers participate in the group identity
             # (same invariant as section 4): two entries sharing
             # (api_url, credential, api_mode) but declaring different headers
@@ -3419,7 +3420,7 @@ def list_authenticated_providers(
             if isinstance(discover, str):
                 discover = discover.lower() not in {"false", "no", "0"}
             has_explicit_models = bool(grp.get("has_explicit_models"))
-            _ep_url_norm = str(api_url).strip().rstrip("/").lower()
+            _ep_url_norm = model_catalog_endpoint_identity(api_url)
             _ep_slug_norm = str(ep_name).strip().lower()
             _ep_aliases = {
                 str(alias).lower() for alias in grp.get("aliases", set())
@@ -3466,6 +3467,7 @@ def list_authenticated_providers(
                         headers=_extra_headers_from_config(ep_cfg) or None,
                         timeout=(1.5 if for_picker else 5.0),
                         api_mode=ep_cfg.get("api_mode"),
+                        force_refresh=refresh,
                     )
                     if isinstance(live_models, _NativePickerModelList):
                         native_catalog_empty = not live_models
@@ -3489,7 +3491,7 @@ def list_authenticated_providers(
                         headers=_extra_headers_from_config(ep_cfg) or None,
                         api_mode=ep_cfg.get("api_mode"),
                     )
-                    if cached_models:
+                    if cached_models is not None:
                         models_list = cached_models
                 except _MODEL_DISCOVERY_ERRORS:
                     pass
@@ -3511,7 +3513,7 @@ def list_authenticated_providers(
             # this group so section-4's _section3_emitted_pairs dedup can
             # match per-model custom_providers rows ("Palantir Claude 4.7 Opus")
             # even though we collapsed the group label to "Palantir Claude".
-            _url_norm_for_pair = str(api_url).strip().rstrip("/").lower()
+            _url_norm_for_pair = model_catalog_endpoint_identity(api_url)
             for _raw_name in grp.get("raw_names") or [display_name]:
                 _pair = (
                     str(_raw_name).strip().lower(),
@@ -3541,12 +3543,11 @@ def list_authenticated_providers(
         and "custom" not in seen_slugs
         and not any(
             isinstance(_cp, dict)
-            and str(
+            and model_catalog_endpoint_identity(
                 _cp.get("base_url", "")
                 or _cp.get("url", "")
                 or _cp.get("api", "")
-            ).strip().rstrip("/").lower()
-            == str(current_base_url).strip().rstrip("/").lower()
+            ) == model_catalog_endpoint_identity(current_base_url)
             for _cp in (custom_providers or [])
         )
     ):
@@ -3563,6 +3564,7 @@ def list_authenticated_providers(
                     "custom",
                     False,
                     timeout=(1.5 if for_picker else 5.0),
+                    force_refresh=refresh,
                 )
             else:
                 from hermes_cli.models import cached_fetch_api_models
@@ -3735,7 +3737,7 @@ def list_authenticated_providers(
             1
             for _grp in groups.values()
             if _current_base_url_norm
-            and str(_grp["api_url"]).strip().rstrip("/").lower() == _current_base_url_norm
+            and model_catalog_endpoint_identity(_grp["api_url"]) == _current_base_url_norm
         )
         for grp in groups.values():
             api_url = grp["api_url"]
@@ -3764,7 +3766,7 @@ def list_authenticated_providers(
             # ``custom_providers`` list.
             _pair_key = (
                 str(grp["name"]).strip().lower(),
-                str(grp["api_url"]).strip().rstrip("/").lower(),
+                model_catalog_endpoint_identity(grp["api_url"]),
             )
             if _pair_key[0] and _pair_key[1] and _pair_key in _section3_emitted_pairs:
                 continue
@@ -3855,6 +3857,7 @@ def list_authenticated_providers(
                         headers=grp.get("extra_headers") or None,
                         timeout=(1.5 if for_picker else 5.0),
                         api_mode=grp.get("api_mode"),
+                        force_refresh=refresh,
                     )
                     if live_models is not None and (
                         live_models
@@ -3885,7 +3888,7 @@ def list_authenticated_providers(
                         headers=grp.get("extra_headers") or None,
                         api_mode=grp.get("api_mode"),
                     )
-                    if cached_models:
+                    if cached_models is not None:
                         grp["models"] = cached_models
                         grp["total_models"] = len(cached_models)
                 except _MODEL_DISCOVERY_ERRORS:
@@ -3926,6 +3929,13 @@ def list_authenticated_providers(
     except Exception:
         pass
 
+    # Preserve provenance through configured merges and expose it to every
+    # inventory consumer. Missing provenance stays unknown for older fetchers.
+    for row in results:
+        status = getattr(row.get("models"), "catalog_status", None) or discovered_status.get(row["slug"])
+        if status is not None:
+            row["catalog_status"] = dict(status)
+
     # Surface a custom / uncurated model the user selected via the CLI.
     # Each row's model list is its curated/live catalog, so a model the user set
     # with `/model <provider>/<uncurated-name>` would otherwise be invisible in
@@ -3940,6 +3950,10 @@ def list_authenticated_providers(
                 continue
             _models = _row.get("models") or []
             if current_model not in _models:
+                status = _row.get("catalog_status") or {}
+                if status.get("authoritative") is True:
+                    _row["unavailable_models"] = [current_model]
+                    break
                 _row["models"] = [current_model, *_models]
                 _row["total_models"] = _row.get("total_models", len(_models)) + 1
             break

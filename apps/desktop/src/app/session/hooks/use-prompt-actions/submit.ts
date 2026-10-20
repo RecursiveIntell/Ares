@@ -27,7 +27,6 @@ import { isStoredTranscriptReadOnly } from '@/store/read-only-transcript'
 import {
   $sessions,
   resolveComposerSessionKey,
-  setActiveSessionId,
   setAwaitingResponse,
   setBusy,
   setMessages,
@@ -39,6 +38,7 @@ import type { ClientSessionState } from '../../../types'
 import { sessionContextDrift } from '../session-context-drift'
 import { resolveSessionProfile } from '../use-session-actions/utils'
 
+import { inputRecoveryEvidence, reconcileInput } from './input-recovery'
 import { finalizeInterruptedMessages } from './rewind'
 import { registerRecoveredRuntime, singleFlightSessionResume, takeRecoveredRuntime } from './single-flight-resume'
 import {
@@ -50,8 +50,7 @@ import {
   isTargetSessionBusy,
   releaseSubmitInFlight,
   SessionRecoveryAborted,
-  type SubmitTextOptions,
-  withSessionNotFoundResume
+  type SubmitTextOptions
 } from './utils'
 
 interface SubmitPromptDeps {
@@ -121,6 +120,16 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
   return useCallback(
     async (rawText: string, options?: SubmitTextOptions) => {
+      const inputEventId = options?.queueEntryId ?? crypto.randomUUID()
+      const recovery: {
+        input: {
+          sessionId: string
+          eventId: string
+          text: string
+          routeToken: string
+          params: Record<string, unknown>
+        } | null
+      } = { input: null }
       const visibleText = sanitizeComposerInput(rawText).trim()
       const usingComposerAttachments = !options?.attachments
 
@@ -758,6 +767,8 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         const submitParams = (targetId: string) => ({
           session_id: targetId,
           text,
+          input_event_id: inputEventId,
+          ...(options?.goalContinuation && { goal_continuation: options.goalContinuation }),
           ...(interrupted && { interrupted }),
           // Off-screen widget intent: the gateway types the persisted user
           // row display_kind=hidden so no client renders it as a bubble.
@@ -781,25 +792,14 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         let submitErr: unknown = null
 
         try {
-          const recoverStoredSessionId = targetStoredSessionId ?? selectedStoredSessionIdRef.current
-
-          await withSessionNotFoundResume(
+          recovery.input = {
             sessionId,
-            recoverStoredSessionId,
-            liveId => requestGateway('prompt.submit', submitParams(liveId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS),
-            {
-              requestGateway,
-              driftReason: sessionDriftReason,
-              onRecovered: recoveredId => {
-                if (onRuntimeRecovered) {
-                  onRuntimeRecovered(recoveredId)
-                } else if (targetIsCurrentView()) {
-                  activeSessionIdRef.current = recoveredId
-                  setActiveSessionId(recoveredId)
-                }
-              }
-            }
-          )
+            eventId: inputEventId,
+            text,
+            routeToken: getRouteToken(),
+            params: submitParams(sessionId)
+          }
+          await requestGateway('prompt.submit', recovery.input.params, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
         } catch (firstErr) {
           if (firstErr instanceof SessionRecoveryAborted) {
             console.warn('[submit-drift-abort]', firstErr.reason, { phase: 'post-resume-retry' })
@@ -828,6 +828,86 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
         return true
       } catch (err) {
+        const evidence = inputRecoveryEvidence(err)
+        const ownerChanged = (err as { code?: number } | null)?.code === 5001
+        if (recovery.input && (ownerChanged || isGatewayDeliveryUnknownError(err))) {
+          const original = recovery.input
+          releaseSubmitLock()
+          if (evidence.started === false) {
+            const settled = updateSessionState(
+              sessionId,
+              state =>
+                state.turnLive
+                  ? state
+                  : {
+                      ...state,
+                      busy: false,
+                      awaitingResponse: false,
+                      turnStartedAt: null
+                    },
+              targetStoredSessionId
+            )
+            if (targetIsCurrentView()) {
+              setMutableRef(busyRef, settled.busy)
+              scope.setBusy(settled.busy)
+              scope.setAwaitingResponse(settled.awaitingResponse)
+            }
+          }
+          if (options?.fromQueue && targetStoredSessionId) {
+            if (options.queueEntryId) {
+              markQueuedPromptDeliveryUnknown(targetStoredSessionId, options.queueEntryId)
+            } else {
+              parkQueuedPrompts(targetStoredSessionId)
+            }
+          }
+          if (targetIsCurrentView()) {
+            notify({
+              kind: 'error',
+              message:
+                evidence.accepted === false && evidence.started === false
+                  ? copy.inputRecoveryRefused
+                  : evidence.accepted === true && evidence.started === false
+                    ? copy.inputRecoveryNotStarted
+                    : copy.inputRecoveryUnknown,
+              detail: `${evidence.eventId ?? original.eventId} · ${evidence.changedOwner.join(', ')}`,
+              durationMs: 0,
+              action: {
+                label: copy.inputRecoveryReview,
+                onClick: () => {
+                  if (getRouteToken() !== original.routeToken || activeSessionIdRef.current !== original.sessionId) {
+                    return
+                  }
+                  void reconcileInput(requestGateway, original)
+                    .then(result => {
+                      notify({
+                        message: result.can_manual_retry ? copy.inputRecoveryNotStarted : copy.inputRecoveryUnknown,
+                        action: result.can_manual_retry
+                          ? {
+                              label: copy.inputRecoveryRetry,
+                              onClick: () => {
+                                if (
+                                  getRouteToken() !== original.routeToken ||
+                                  activeSessionIdRef.current !== original.sessionId
+                                ) {
+                                  return
+                                }
+                                void requestGateway(
+                                  'prompt.submit',
+                                  { ...original.params, manual_input_recovery: true },
+                                  PROMPT_SUBMIT_REQUEST_TIMEOUT_MS
+                                ).catch(error => notifyError(error, copy.promptFailed))
+                              }
+                            }
+                          : undefined
+                      })
+                    })
+                    .catch(error => notifyError(error, copy.promptFailed))
+                }
+              }
+            })
+          }
+          return false
+        }
         if (isGatewayDeliveryUnknownError(err)) {
           // The gateway may already be running this turn. Keep its optimistic
           // user row and busy state until an authoritative event/readback, and

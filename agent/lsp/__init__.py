@@ -16,9 +16,9 @@ Public API:
     from agent.lsp import get_service
 
     svc = get_service()
-    if svc and svc.enabled_for(path):
-        await svc.touch_file(path)
-        diags = svc.diagnostics_for(path)
+    if svc:
+        result = svc.get_enrichment_sync(path)
+        # Retain result.quality even if result.diagnostics is empty.
 
 The bulk of the wiring is internal — most callers only need the layer
 in :func:`tools.file_operations.FileOperations._check_lint_delta`,
@@ -35,7 +35,7 @@ import logging
 import threading
 from typing import Optional
 
-from agent.lsp.manager import LSPService
+from agent.lsp.manager import EnrichmentResult, LSPService
 
 logger = logging.getLogger("agent.lsp")
 
@@ -141,4 +141,4 @@ def _atexit_shutdown() -> None:
         logger.debug("atexit LSP shutdown failed: %s", e)
 
 
-__all__ = ["get_service", "shutdown_service", "LSPService"]
+__all__ = ["get_service", "shutdown_service", "LSPService", "EnrichmentResult"]

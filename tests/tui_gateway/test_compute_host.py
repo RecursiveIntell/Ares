@@ -11,6 +11,65 @@ import pytest
 from tui_gateway.compute_host import ComputeHost, HostSession
 
 
+@pytest.mark.parametrize('exit_path', ['stdin_closed', 'sigterm'])
+def test_live_work_process_exit_records_exact_boot_unknown(tmp_path, exit_path):
+    # Real Linux pipes/process exit, no provider, credentials or service. A
+    # barrier worker deliberately cannot settle within the shutdown window.
+    script = '''
+import io,json,signal,sys,threading
+wire=sys.stdout
+from tui_gateway.compute_host import ComputeHost
+from tui_gateway import server
+host=ComputeHost(stdout=wire,heartbeat_secs=0)
+started=threading.Event()
+blocked=threading.Event()
+def work():
+    started.set()
+    blocked.wait()
+future=host._executor.submit(work)
+host._track_turn_future(future,'live-child')
+host._active_request_ids['live-child']='request-owner'
+server._sessions={}
+started.wait(2)
+host.emit({'type':'hello','boot_id':host._boot_id})
+def stop(*args):
+    host.shutdown(reason='sigterm',wait=0.1)
+    raise SystemExit(0)
+signal.signal(signal.SIGTERM,stop)
+for line in sys.stdin:
+    pass
+host.shutdown(reason='stdin_closed',wait=0.1)
+'''
+    repo = Path(__file__).resolve().parents[2]
+    proc = subprocess.Popen([sys.executable, '-c', script], cwd=repo, stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        env={**os.environ, 'HERMES_HOME': str(tmp_path), 'PYTHONPATH': str(repo)})
+    out = _stdout_queue(proc)
+    try:
+        try:
+            hello = _read_json_line(out, timeout=10)
+        except AssertionError:
+            proc.kill()
+            proc.wait(timeout=2)
+            raise AssertionError(proc.stderr.read())
+        if exit_path == 'stdin_closed':
+            proc.stdin.close()
+        else:
+            proc.terminate()
+        proc.wait(timeout=4)
+        assert proc.returncode == 0
+        receipts = [json.loads(line) for line in
+            (tmp_path / 'state' / 'dashboard-compute-host-outcomes.jsonl').read_text().splitlines()]
+        assert any(r['boot_id'] == hello['boot_id'] and r['sid'] == 'live-child'
+            and r['request_id'] == 'request-owner' and r['outcome'] == 'unknown'
+            and r['classification'] == 'HOST_SHUTDOWN_UNSETTLED' for r in receipts)
+        assert all(r.get('outcome') != 'completed' for r in receipts)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=2)
+
+
 def _stdout_queue(proc: subprocess.Popen) -> queue.Queue[dict]:
     out: queue.Queue[dict] = queue.Queue()
     assert proc.stdout is not None

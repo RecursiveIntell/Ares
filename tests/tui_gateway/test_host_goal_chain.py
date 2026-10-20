@@ -97,8 +97,13 @@ def test_terminal_uses_final_chain_state_and_original_receipt(monkeypatch):
     class Successor:
         def __init__(self, index):
             self.index = index
+            self.joined = False
+
+        def is_alive(self):
+            return not self.joined
 
         def join(self):
+            self.joined = True
             joins.append(self.index)
             if self.index < 3:
                 session["_run_thread"] = Successor(self.index + 1)

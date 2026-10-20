@@ -192,6 +192,9 @@ class TestAgentCloseMethod:
 
             child_1 = MagicMock()
             child_2 = MagicMock()
+            for child in (child_1, child_2):
+                child._delegate_cleanup_state = "complete"
+                child._close_cleanup_state = "complete"
             agent._active_children = [child_1, child_2]
 
             agent.close()

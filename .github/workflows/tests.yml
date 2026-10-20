@@ -94,6 +94,12 @@ jobs:
         with:
           command: uv python install 3.11
 
+      - name: Install PDF conversion test dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y poppler-utils
+          command -v pdftoppm
+
       - name: Install dependencies
         # `uv sync --locked` installs the exact pinned set from uv.lock (and
         # fails if the lock is out of sync with pyproject.toml), giving a

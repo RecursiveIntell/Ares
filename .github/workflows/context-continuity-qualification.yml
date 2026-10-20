@@ -124,6 +124,11 @@ jobs:
           version: '0.9.28'
       - name: Install locked test dependencies
         run: uv sync --frozen --extra dev --extra anthropic --python 3.13
+      - name: Install PDF conversion test dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y poppler-utils
+          command -v pdftoppm
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: RecursiveIntell/Libraries

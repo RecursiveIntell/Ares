@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import type { ModelOptionProvider } from '@/types/hermes'
 
@@ -78,10 +78,10 @@ describe('model visibility', () => {
     expect(visible.has(modelVisibilityKey('nous', 'hermes-3-llama-3.1-8b'))).toBe(false)
   })
 
-  it('folds a date-pinned snapshot into its rolling alias when present', () => {
+  it('keeps a date-pinned route even when a rolling name exists', () => {
     const families = collapseModelFamilies(['claude-opus-4-5', 'claude-opus-4-5-20251101'])
 
-    expect(families.map(f => f.id)).toEqual(['claude-opus-4-5'])
+    expect(families.map(f => f.id)).toEqual(['claude-opus-4-5', 'claude-opus-4-5-20251101'])
   })
 
   it('keeps a date-pinned snapshot standing alone when it has no alias', () => {
@@ -326,4 +326,54 @@ describe('setProviderVisibility', () => {
     // The -fast sibling is represented by its base family, not its own key.
     expect(next.has(modelVisibilityKey('nous', 'model-fast'))).toBe(false)
   })
+})
+
+describe('scoped persistence and opaque IDs', () => {
+  it('does not hide dated opaque routes behind a rolling name', () => {
+    expect(collapseModelFamilies(['model', 'model-20261010']).map(f => f.id)).toEqual(['model', 'model-20261010'])
+  })
+
+  it('retains explicit choices and hides through catalog reorder', () => {
+    const models = ['anthropic/claude-fable-5.1', 'anthropic/claude-opus-5.5', 'Case/ID', 'case/id']
+    const stored = new Set([modelVisibilityKey('openrouter', models[0]), emptyProviderSentinelKey('tokenrouter')])
+    const rows = [provider('openrouter', models), provider('tokenrouter', models)]
+    expect(effectiveVisibleKeys(stored, rows)).toEqual(effectiveVisibleKeys(stored, rows.map(p => ({ ...p, models: [...p.models!].reverse() }))))
+    expect(effectiveVisibleKeys(stored, rows)).toEqual(new Set([modelVisibilityKey('openrouter', models[0])]))
+  })
+
+  it('ignores ambiguous global legacy choices and persists by connection/profile across reload', async () => {
+    const storage = new Map<string, string>([['hermes.desktop.visible-models', JSON.stringify(['openrouter::legacy'])]])
+    const memoryStorage = {
+      getItem: (key: string) => storage.get(key) ?? null,
+      setItem: (key: string, value: string) => storage.set(key, value),
+      removeItem: (key: string) => storage.delete(key)
+    }
+    vi.stubGlobal('localStorage', memoryStorage)
+    try {
+      vi.resetModules()
+      const mod = await import('./model-visibility')
+      const a = { connectionId: 'stable-remote', profile: 'alpha' }
+      const b = { connectionId: 'stable-remote', profile: 'beta' }
+      const c = { connectionId: 'other-remote', profile: 'alpha' }
+      expect(mod.visibleModelsStore(a).get()).toBeNull()
+      mod.setVisibleModels(new Set(['openrouter::anthropic/claude-fable-5.1', 'tokenrouter::']), a)
+      expect(mod.visibleModelsStore(b).get()).toBeNull()
+      expect(mod.visibleModelsStore(c).get()).toBeNull()
+      expect(mod.visibleModelsStore({ connectionId: null, profile: 'default' }).get()).toBeNull()
+      vi.resetModules()
+      const restarted = await import('./model-visibility')
+      expect(restarted.visibleModelsStore(a).get()).toEqual(new Set(['openrouter::anthropic/claude-fable-5.1', 'tokenrouter::']))
+      expect(restarted.visibleModelsStore(b).get()).toBeNull()
+      expect(storage.get('hermes.desktop.visible-models')).toBe(JSON.stringify(['openrouter::legacy']))
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+})
+
+it('keeps uppercase FAST IDs opaque instead of dropping them as variants', () => {
+  expect(collapseModelFamilies(['ID', 'ID-FAST', 'ID-fast'])).toEqual([
+    { id: 'ID', fastId: 'ID-fast' },
+    { id: 'ID-FAST', fastId: null }
+  ])
 })

@@ -36,11 +36,14 @@ def _route_spy(monkeypatch):
 
     monkeypatch.setattr(browser_tool, "routed_browser_handler", spy)
     monkeypatch.setattr(browser_cdp_tool, "routed_browser_handler", spy)
-    monkeypatch.setattr(
-        browser_tool,
-        "browser_navigate",
-        lambda url="", task_id=None, local_browser=False: "legacy-nav",
-    )
+    # Every registry action below invokes its own legacy fallback. Isolate all
+    # of them: stubbing navigation alone leaves snapshot/click/etc. free to
+    # start a real backend during this routing-only test.
+    for action in BROWSER_ACTIONS:
+        def legacy_fallback(*args, _action=action, **kwargs):
+            return "legacy-nav" if _action == "browser_navigate" else f"legacy-{_action}"
+
+        monkeypatch.setattr(browser_tool, action, legacy_fallback)
     monkeypatch.setattr(browser_cdp_tool, "browser_cdp", lambda *a, **k: "legacy-cdp")
     return calls
 

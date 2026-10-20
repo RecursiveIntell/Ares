@@ -268,6 +268,11 @@ export async function applyModelPreset(
         continue
       }
 
+      if (legacyAccepted.has(dimension)) {
+        clearRuntimeOptionUncertainty(runtimeId, dimension)
+        continue
+      }
+
       const reconciled = await reconcileRuntimeOptionFailure(err, {
         sessionId: runtimeId,
         dimension,

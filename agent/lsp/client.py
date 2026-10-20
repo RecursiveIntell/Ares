@@ -301,7 +301,7 @@ class LSPClient:
             if not self._connection_is_open():
                 raise LSPProtocolError("server connection closed during initialization")
             self._state = "running"
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             self._state = "error"
             await self._cleanup_process()
             raise
@@ -547,12 +547,14 @@ class LSPClient:
                     proc.terminate()
                     try:
                         await asyncio.wait_for(proc.wait(), timeout=SHUTDOWN_GRACE)
-                    except asyncio.TimeoutError:
+                    except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
                         try:
                             proc.kill()
                             await proc.wait()
                         except ProcessLookupError:
                             pass
+                        if isinstance(exc, asyncio.CancelledError):
+                            raise
                 except ProcessLookupError:
                     pass
 
@@ -951,18 +953,20 @@ class LSPClient:
             # Concurrent: document pull + push wait.
             pull_task = asyncio.create_task(self._pull_document_diagnostics(abs_path))
             push_task = asyncio.create_task(self._wait_for_fresh_push(abs_path, version, remaining))
-            done, pending = await asyncio.wait(
-                {pull_task, push_task},
-                timeout=remaining,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            for t in pending:
-                t.cancel()
-            for t in pending:
-                try:
-                    await t
-                except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                    pass
+            tasks = {pull_task, push_task}
+            try:
+                await asyncio.wait(
+                    tasks,
+                    timeout=remaining,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                # An outer enrichment deadline can cancel this wait.
+                # Child pulls/push waits must not survive into the next edit.
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
 
             # If we got a fresh push for our version, we're done.
             doc = self._docs.get(abs_path)

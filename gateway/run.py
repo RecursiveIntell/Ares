@@ -6550,8 +6550,17 @@ class TurnRunner:
             from gateway.context_input import turn_input_api_content, turn_input_kwargs
             _conversation_kwargs.update(turn_input_kwargs(ctx.context_input))
             _api_run_message = turn_input_api_content(ctx.context_input, _api_run_message)
+            binding = getattr(ctx, "goal_continuation", None)
+            if binding:
+                agent._goal_continuation_binding = binding
+                if (not ctx._run_still_current() or getattr(agent, "_interrupt_requested", False)
+                        or not self._runner._goal_runtime_turn_current(ctx.session_id, binding)):
+                    return {"final_response": "", "messages": [], "api_calls": 0,
+                            "interrupted": True, "completed": False}
             result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
         finally:
+            if getattr(agent, "_goal_continuation_binding", None) == getattr(ctx, "goal_continuation", None):
+                vars(agent).pop("_goal_continuation_binding", None)
             unregister_gateway_notify(_approval_session_key)
             # Cancel any pending clarify entries so blocked agent
             # threads don't hang past the end of the run (interrupt,
@@ -9264,6 +9273,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         queued by the judge.  Remove only synthetic goal continuations while
         preserving normal /queue and user follow-up events.
         """
+        running = (getattr(self, "_running_agents", None) or {}).get(session_key)
+        if running is not None and getattr(running, "__dict__", {}).get("_goal_continuation_binding"):
+            request_hard_interrupt(running, "goal continuation revoked")
         removed = 0
         pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
         if isinstance(pending_slot, dict):
@@ -9283,6 +9295,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     kept.append(queued_event)
             _q_state.conversation.queued_events = kept
         return removed
+
+    @staticmethod
+    def _goal_runtime_turn_current(session_id: str, binding: dict) -> bool:
+        from hermes_cli.goals import GoalManager
+        mgr = GoalManager(session_id)
+        state = mgr.state
+        return bool(state and mgr._auto_eligible(state, admitted=True)
+            and not state.continuation_pending and state.goal_id == binding.get("goal_id")
+            and state.checkpoint_revision == binding.get("checkpoint_revision")
+            and state.continuation_token == binding.get("continuation_token"))
 
     def _goal_still_active_for_session(self, session_id: str) -> bool:
         """Best-effort fresh DB check before running a queued continuation."""
@@ -20928,6 +20950,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _run_start_session_id = session_entry.session_id
             if not await self._consume_goal_continuation_at_turn_start(event, session_entry):
                 return None
+            if (getattr(event, "metadata", None) or {}).get("goal_continuation"):
+                message_text = event.text
+                persist_user_message = event.text
             _turn_started_monotonic = time.monotonic()
             agent_result = await self._run_agent(
                 message=message_text,
@@ -20943,6 +20968,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 context_input=event._context_input,
+                goal_continuation=(getattr(event, "metadata", None) or {}).get("goal_continuation"),
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=event.message_type,
             )
@@ -22256,6 +22282,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_entry: Any,
         source: Any,
         final_response: str,
+        continuation_binding: Optional[dict] = None,
     ) -> None:
         """Run the goal judge after a gateway turn and, if still active,
         enqueue a continuation prompt for the same session.
@@ -22307,7 +22334,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         decision = await self._run_in_executor_with_context(
             lambda: mgr.evaluate_after_turn(
                 final_response or "",
-                user_initiated=True,
+                turn_metadata={"continuation": continuation_binding or {}},
+                user_initiated=not bool(continuation_binding),
                 background_processes=_bg_procs,
             ),
         )
@@ -22403,6 +22431,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
         if not started:
             logger.info("Dropping stale goal continuation for session %s", session_entry.session_id)
+        else:
+            event.text = mgr.next_continuation_prompt() or ""
+            if not event.text or not self._goal_runtime_turn_current(session_entry.session_id, continuation):
+                return False
         return started
 
     async def _run_post_turn_hooks(
@@ -22427,12 +22459,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Empty interrupted/errored responses must not drive /goal, but an
         # in-flight /loop tick still needs to be released and rescheduled.
-        if final_text.strip():
+        goal_binding = (getattr(event, "metadata", None) or {}).get("goal_continuation")
+        if final_text.strip() and (not is_internal or isinstance(goal_binding, dict)):
             try:
                 await self._post_turn_goal_continuation(
                     session_entry=session_entry,
                     source=source,
                     final_response=final_text,
+                    continuation_binding=goal_binding,
                 )
             except Exception as exc:
                 logger.debug("goal continuation hook failed: %s", exc)
@@ -28746,6 +28780,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
         context_input: Any = None,
+        goal_continuation: Optional[dict] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -28765,6 +28800,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 context_input=context_input,
+                goal_continuation=goal_continuation,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
             )
@@ -28779,6 +28815,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 context_input=context_input,
+                goal_continuation=goal_continuation,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
             )
@@ -28939,6 +28976,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
         context_input: Any = None,
+        goal_continuation: Optional[dict] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -29253,6 +29291,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             context_input=context_input,
             persist_user_display_kind=persist_user_display_kind,
         )
+        turn_ctx.goal_continuation = goal_continuation
+
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to
         # TurnRunner.progress_callback (bound method, same signature).

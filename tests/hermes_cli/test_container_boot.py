@@ -109,7 +109,7 @@ def _named_actions(actions: list[ReconcileAction]) -> list[ReconcileAction]:
 # ---------------------------------------------------------------------------
 
 
-def test_running_profile_is_registered_and_autostarted(tmp_path: Path) -> None:
+def test_running_profile_is_registered_and_autostarted(tmp_path: Path, s6_layout_chown_spy) -> None:
     scandir = tmp_path / "run-service"; scandir.mkdir()
     _make_profile(tmp_path, "coder", state="running")
 
@@ -128,7 +128,7 @@ def test_running_profile_is_registered_and_autostarted(tmp_path: Path) -> None:
     assert not (svc / "down").exists()
 
 
-def test_registered_profile_has_finish_script(tmp_path: Path) -> None:
+def test_registered_profile_has_finish_script(tmp_path: Path, s6_layout_chown_spy) -> None:
     """The finish script must be written so s6 stops restarting on
     fatal config errors (exit 78 → exit 125).  See #51228."""
     scandir = tmp_path / "run-service"; scandir.mkdir()
@@ -158,7 +158,7 @@ def test_registered_profile_has_finish_script(tmp_path: Path) -> None:
 
 
 
-def test_register_service_overwrites_existing_slot(tmp_path: Path) -> None:
+def test_register_service_overwrites_existing_slot(tmp_path: Path, s6_layout_chown_spy) -> None:
     """A second reconciliation pass cleanly replaces an existing
     slot (the tmp+rename publication overwrites the previous one)."""
     scandir = tmp_path / "run-service"; scandir.mkdir()
@@ -205,6 +205,7 @@ def test_register_service_overwrites_existing_slot(tmp_path: Path) -> None:
 def test_profiles_default_subdir_is_skipped_with_warning(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
+    s6_layout_chown_spy,
 ) -> None:
     """A user-created profiles/default/ collides with the reserved
     root-profile slot — the named entry is skipped (with a warning)

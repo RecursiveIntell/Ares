@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="https://github.com/RecursiveIntell/Ares">Repository</a> ·
-  <a href="https://recursiveintell.github.io/hermes-agent/docs/">Documentation</a> ·
+  <a href="https://recursiveintell.com/ares/README.md">Documentation</a> ·
   <a href="https://github.com/NousResearch/hermes-agent">Upstream Hermes</a> ·
   <a href="SECURITY.md">Security</a>
 </p>

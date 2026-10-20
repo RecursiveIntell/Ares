@@ -47,7 +47,7 @@ def _agent_args(**overrides) -> Namespace:
 
 def test_prepare_agent_startup_backgrounds_blocking_mcp_for_chat(monkeypatch):
     stop = threading.Event()
-    calls = {"mcp": 0}
+    calls = {"mcp": 0, "plugins": 0, "outbound": 0}
 
     def _blocking_discover():
         calls["mcp"] += 1
@@ -56,7 +56,7 @@ def test_prepare_agent_startup_backgrounds_blocking_mcp_for_chat(monkeypatch):
     monkeypatch.setitem(
         sys.modules,
         "hermes_cli.plugins",
-        types.SimpleNamespace(discover_plugins=lambda: None),
+        types.SimpleNamespace(start_background_plugin_discovery=lambda: calls.__setitem__("plugins", calls["plugins"] + 1)),
     )
     monkeypatch.setitem(
         sys.modules,
@@ -70,6 +70,14 @@ def test_prepare_agent_startup_backgrounds_blocking_mcp_for_chat(monkeypatch):
         sys.modules,
         "agent.shell_hooks",
         types.SimpleNamespace(register_from_config=lambda *_a, **_k: None),
+    )
+    # This unit pins MCP backgrounding, not unrelated plugin/webhook startup
+    # import costs. Cover the entrypoints the actual caller invokes and assert
+    # below that both seams were reached; keep the latency budget unchanged.
+    monkeypatch.setitem(
+        sys.modules,
+        "agent.outbound_webhooks",
+        types.SimpleNamespace(register_from_config=lambda *_a, **_k: calls.__setitem__("outbound", calls["outbound"] + 1)),
     )
     # Stub mcp_oauth so the background thread doesn't pay the real (cold,
     # ~0.75s) ``tools.mcp_oauth`` import before calling discovery. This test
@@ -92,12 +100,15 @@ def test_prepare_agent_startup_backgrounds_blocking_mcp_for_chat(monkeypatch):
         main_mod._prepare_agent_startup(_agent_args())
         elapsed = time.monotonic() - start
         assert elapsed < 0.2
+        assert calls["plugins"] == 1, "startup plugin boundary was not isolated"
+        assert calls["outbound"] == 1, "startup outbound-hook boundary was not isolated"
         deadline = time.monotonic() + 3.0
         while calls["mcp"] == 0 and time.monotonic() < deadline:
             time.sleep(0.01)
         assert calls["mcp"] == 1
         assert mcp_startup._mcp_discovery_thread is not None
         assert mcp_startup._mcp_discovery_thread.is_alive()
+        assert mcp_startup._mcp_discovery_thread.ident != threading.get_ident()
     finally:
         stop.set()
 

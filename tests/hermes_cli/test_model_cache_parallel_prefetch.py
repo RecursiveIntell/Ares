@@ -15,6 +15,14 @@ from unittest.mock import patch, MagicMock
 import pytest
 
 
+def witnessed(ids, fp):
+    from hermes_cli.models import CatalogModelIds
+    result = CatalogModelIds(ids, source="live", freshness="fresh", authoritative=True,
+                             updated_at=time.time())
+    result.credential_scope = fp
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Thread-safe cache entry update (hermes_cli/models.py)
 # ---------------------------------------------------------------------------
@@ -30,7 +38,7 @@ class TestUpdateProviderCacheEntry:
         monkeypatch.setattr(mod, "_provider_models_cache_path", lambda: cache_path)
 
         with patch.object(mod, "_credential_fingerprint", return_value="fp1"):
-            mod.update_provider_cache_entry("openrouter", ["m1", "m2"])
+            mod.update_provider_cache_entry("openrouter", witnessed(["m1", "m2"], "fp1"))
 
         cache = mod._load_provider_models_cache()
         assert "openrouter" in cache
@@ -46,11 +54,11 @@ class TestUpdateProviderCacheEntry:
 
         # Seed with one entry
         with patch.object(mod, "_credential_fingerprint", return_value="fp_a"):
-            mod.update_provider_cache_entry("provider_a", ["a1"])
+            mod.update_provider_cache_entry("provider_a", witnessed(["a1"], "fp_a"))
 
         # Write a second entry
         with patch.object(mod, "_credential_fingerprint", return_value="fp_b"):
-            mod.update_provider_cache_entry("provider_b", ["b1"])
+            mod.update_provider_cache_entry("provider_b", witnessed(["b1"], "fp_b"))
 
         cache = mod._load_provider_models_cache()
         assert "provider_a" in cache
@@ -82,7 +90,7 @@ class TestUpdateProviderCacheEntry:
         with patch.object(mod, "_credential_fingerprint", side_effect=lambda p: f"fp_{p}"):
             with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
                 list(executor.map(
-                    lambda p: mod.update_provider_cache_entry(p, [f"model_{p}"]),
+                    lambda p: mod.update_provider_cache_entry(p, witnessed([f"model_{p}"], f"fp_{p}")),
                     providers,
                 ))
 

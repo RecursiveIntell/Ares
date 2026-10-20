@@ -3,7 +3,22 @@ import { atom } from 'nanostores'
 import { persistString, storedString } from '@/lib/storage'
 import type { ModelOptionProvider } from '@/types/hermes'
 
-const STORAGE_KEY = 'hermes.desktop.visible-models'
+// The old global key is intentionally retained on disk, but not imported into
+// an unknown profile. The connection registry, not a WebSocket ticket, owns ID.
+const STORAGE_KEY = 'hermes.desktop.visible-models.v2'
+
+export interface ModelVisibilityScope {
+  connectionId?: null | string
+  profile?: string
+}
+
+export interface ModelVisibilityTarget extends ModelVisibilityScope {
+  sessionId?: null | string
+}
+
+export function modelVisibilityStorageKey({ connectionId, profile = 'default' }: ModelVisibilityScope = {}): string {
+  return `${STORAGE_KEY}:${JSON.stringify([connectionId || 'local', profile.trim() || 'default'])}`
+}
 
 /** Models shown per provider in the status-bar dropdown before the user has
  *  customized the list. Backend `models` are already relevance-ordered. */
@@ -45,13 +60,8 @@ export function collapseModelFamilies(models: readonly string[]): ModelFamily[] 
       continue
     }
 
-    if (/-fast$/i.test(model) && present.has(model.replace(/-fast$/i, ''))) {
+    if (/-fast$/.test(model) && present.has(model.replace(/-fast$/, ''))) {
       // Represented by its base entry — the base attaches it as `fastId`.
-      continue
-    }
-
-    if (/-\d{8}$/.test(model) && present.has(model.replace(/-\d{8}$/, ''))) {
-      // A date-pinned snapshot superseded by its rolling alias — drop the dupe.
       continue
     }
 
@@ -68,8 +78,8 @@ export function collapseModelFamilies(models: readonly string[]): ModelFamily[] 
   return families
 }
 
-function loadVisible(): Set<string> | null {
-  const raw = storedString(STORAGE_KEY)
+function loadVisible(scope: ModelVisibilityScope): Set<string> | null {
+  const raw = storedString(modelVisibilityStorageKey(scope))
 
   if (!raw) {
     return null
@@ -84,19 +94,34 @@ function loadVisible(): Set<string> | null {
   }
 }
 
-/** Explicit set of visible `provider::model` keys, or null when the user
- *  hasn't customized — in which case the curated default applies. */
-export const $visibleModels = atom<Set<string> | null>(loadVisible())
+/** Presentation preference owned here, one atom per stable catalog scope. */
+const scopedStores = new Map<string, ReturnType<typeof atom<Set<string> | null>>>()
 
-export const $modelVisibilityOpen = atom(false)
+export function visibleModelsStore(scope: ModelVisibilityScope = {}) {
+  const key = modelVisibilityStorageKey(scope)
+  let store = scopedStores.get(key)
 
-export function setVisibleModels(keys: Set<string>): void {
-  $visibleModels.set(new Set(keys))
-  persistString(STORAGE_KEY, JSON.stringify([...keys]))
+  if (!store) {
+    store = atom<Set<string> | null>(loadVisible(scope))
+    scopedStores.set(key, store)
+  }
+
+  return store
 }
 
-export function setModelVisibilityOpen(open: boolean): void {
-  $modelVisibilityOpen.set(open)
+// Compatibility for existing local/default callers. Scoped consumers must use
+// visibleModelsStore so a foreground switch never changes another tile's list.
+export const $visibleModels = visibleModelsStore()
+
+export const $modelVisibilityOpen = atom<false | ModelVisibilityTarget>(false)
+
+export function setVisibleModels(keys: Set<string>, scope: ModelVisibilityScope = {}): void {
+  visibleModelsStore(scope).set(new Set(keys))
+  persistString(modelVisibilityStorageKey(scope), JSON.stringify([...keys]))
+}
+
+export function setModelVisibilityOpen(open: boolean, target: ModelVisibilityTarget = {}): void {
+  $modelVisibilityOpen.set(open ? target : false)
 }
 
 /** The default-visible key set: the curated top-N per provider. Used both as

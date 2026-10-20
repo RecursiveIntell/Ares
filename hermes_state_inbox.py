@@ -15,6 +15,7 @@ import time
 from agent.context_compressor import user_originated_turn_view
 from hermes_state_continuity import ContextContinuationError, _canonical, _identity, _strict_json
 from hermes_state_input_turns import SessionContextInputTurnsMixin
+from hermes_state_input_media import SessionContextMediaMixin, desktop_input_origin, validate_media_content
 
 
 def _hash(value):
@@ -88,7 +89,8 @@ class ContextInputReceipt:
     def from_raw(cls, raw):
         value = _strict_json(raw)
         if (set(value) != set(cls.__dataclass_fields__)
-                or value["schema"] != "SessionDBContextInputV1"
+                or type(value["schema"]) is not str
+                or value["schema"] not in {"SessionDBContextInputV1", "SessionDBContextInputV2"}
                 or type(value["sequence"]) is not int or value["sequence"] < 1
                 or type(value["timestamp"]) not in (int, float) or not math.isfinite(value["timestamp"])
                 or type(value["payload_digest"]) is not str or re.fullmatch(r"[0-9a-f]{64}", value["payload_digest"]) is None
@@ -100,6 +102,10 @@ class ContextInputReceipt:
             raise ContextContinuationError("CONTEXT_INPUT_RECORD_INVALID")
         for key in ("conversation_root", "profile_name", "source", "event_id"):
             _identity(value[key], "CONTEXT_INPUT_RECORD_INVALID")
+        if value["schema"] == "SessionDBContextInputV2":
+            if value["source"] != "desktop":
+                raise ContextContinuationError("CONTEXT_INPUT_RECORD_INVALID")
+            validate_media_content(value["content"], root=value["conversation_root"], profile=value["profile_name"])
         if value["payload_digest"] != _hash({"content": value["content"],
                 "timestamp": value["supplied_timestamp"], "display_metadata": value["display_metadata"]}):
             raise ContextContinuationError("CONTEXT_INPUT_RECORD_INVALID")
@@ -122,7 +128,7 @@ def context_input_turn_lease_scope(db, holder):
         _compaction_input_lease.reset(token)
 
 
-class SessionContextInboxMixin(SessionContextInputTurnsMixin):
+class SessionContextInboxMixin(SessionContextMediaMixin, SessionContextInputTurnsMixin):
     def _normalize_compacted_context_messages_on_conn(self, conn, source_session, messages):
         """Keep accepted input clean and preserve its exact API-only sidecar."""
         projected = []
@@ -223,39 +229,70 @@ class SessionContextInboxMixin(SessionContextInputTurnsMixin):
         return receipt
 
     def accept_context_input(self, session_id, *, source, event_id, content,
-                              timestamp=None, display_metadata=None, gateway_origin=None):
+                              timestamp=None, display_metadata=None, gateway_origin=None,
+                              desktop_origin=None):
         """Persist one authentic event before acknowledging its acceptance.
 
         The transport supplies a stable event identity. Same-ID changed payloads
         refuse; an identical delivery returns its original sequence/time.
-        Synthetic turns use their own existing owners and cannot enter here.
+        Synthetic turns use their own existing typed owners and cannot enter here.
         """
+        if desktop_origin is not None:
+            if gateway_origin is not None or source != "desktop" or type(content) is not str:
+                raise ContextContinuationError("CONTEXT_INPUT_ORIGIN_INVALID")
+            origin = desktop_input_origin(_strict_json(_canonical(desktop_origin)))
+            if origin["stored_session_id"] != session_id:
+                raise ContextContinuationError("CONTEXT_INPUT_ORIGIN_INVALID")
+        else:
+            origin = None if gateway_origin is None else _gateway_origin(_strict_json(_canonical(gateway_origin)))
+        return self._accept_context_input_owned(session_id, source=source, event_id=event_id,
+            content=content, timestamp=timestamp, display_metadata=display_metadata,
+            origin=origin, receipt_schema="SessionDBContextInputV1")
+
+    def _accept_context_input_owned(self, session_id, *, source, event_id, content,
+                                    timestamp, display_metadata, origin, receipt_schema,
+                                    content_factory=None):
+        """One atomic receipt/dedup/head owner for legacy and native media."""
+        if receipt_schema not in {"SessionDBContextInputV1", "SessionDBContextInputV2"}:
+            raise ContextContinuationError("CONTEXT_INPUT_RECORD_INVALID")
         _identity(source, "CONTEXT_INPUT_SOURCE_INVALID")
         _identity(event_id, "CONTEXT_INPUT_ID_INVALID")
         if timestamp is not None and (type(timestamp) not in (int, float) or not math.isfinite(timestamp)):
             raise ContextContinuationError("CONTEXT_INPUT_TIMESTAMP_INVALID")
         if display_metadata is not None and type(display_metadata) is not dict:
             raise ContextContinuationError("CONTEXT_INPUT_METADATA_INVALID")
-        message = {"role": "user", "content": content, "timestamp": timestamp,
-                   "display_metadata": display_metadata}
-        if user_originated_turn_view(message) is None:
-            raise ContextContinuationError("CONTEXT_INPUT_AUTHENTIC_REQUIRED")
-        payload = {"content": content, "timestamp": timestamp, "display_metadata": display_metadata}
-        raw_payload = _canonical(payload)
-        if len(raw_payload.encode()) > 900_000:
-            raise ContextContinuationError("CONTEXT_INPUT_TOO_LARGE")
-        # Freeze the caller's mutable input before entering native admission.
-        payload = _strict_json(raw_payload)
-        digest = _hash(payload)
-        origin = None if gateway_origin is None else _gateway_origin(_strict_json(_canonical(gateway_origin)))
-        if origin is not None and origin["route"]["platform"] != source:
+        if display_metadata is not None:
+            display_metadata = _strict_json(_canonical(display_metadata))
+        def freeze(value):
+            message = {"role": "user", "content": value, "timestamp": timestamp,
+                       "display_metadata": display_metadata}
+            if user_originated_turn_view(message) is None:
+                raise ContextContinuationError("CONTEXT_INPUT_AUTHENTIC_REQUIRED")
+            raw = _canonical({"content": value, "timestamp": timestamp, "display_metadata": display_metadata})
+            if len(raw.encode()) > 900_000:
+                raise ContextContinuationError("CONTEXT_INPUT_TOO_LARGE")
+            return _strict_json(raw)
+        # Preserve legacy pre-admission freezing. The media factory receives
+        # already-frozen bytes and publishes under this DB's write reservation.
+        payload = freeze(content)
+        desktop = origin is not None and origin["schema"] == "SessionDBDesktopInputOriginV1"
+        if origin is not None and not desktop and origin["route"]["platform"] != source:
             raise ContextContinuationError("CONTEXT_INPUT_ORIGIN_INVALID")
 
         def write(conn):
+            current_payload = payload
             root, profile = self._context_input_scope_on_conn(conn, session_id)
             tip = self._assert_context_input_target_on_conn(conn, session_id, allow_alias=True)
             if self._context_input_scope_on_conn(conn, tip) != (root, profile):
                 raise ContextContinuationError("CONTEXT_INPUT_SCOPE_MISMATCH")
+            if receipt_schema == "SessionDBContextInputV2":
+                validate_media_content(current_payload["content"], root=root, profile=profile)
+                if not desktop:
+                    raise ContextContinuationError("CONTEXT_INPUT_ORIGIN_INVALID")
+            if desktop and (source != "desktop" or desktop_input_origin(origin)["profile_name"] != profile
+                    or self._context_input_scope_on_conn(conn, origin["stored_session_id"]) != (root, profile)):
+                raise ContextContinuationError("CONTEXT_INPUT_ORIGIN_INVALID")
+            digest = _hash(current_payload)
             head = self._context_input_head_on_conn(conn, root, profile)
             dedup = _prefix(root) + ":dedup:" + _hash([source, event_id])
             existing = conn.execute("SELECT value FROM state_meta WHERE key=?", (dedup,)).fetchone()
@@ -273,18 +310,34 @@ class SessionContextInboxMixin(SessionContextInputTurnsMixin):
                     # Neither missing evidence nor a new transport can be
                     # backfilled onto an already accepted occurrence.
                     raise ContextContinuationError("CONTEXT_INPUT_ORIGIN_COLLISION")
+                if content_factory is not None and freeze(content_factory(root, profile)) != payload:
+                    raise ContextContinuationError("CONTEXT_INPUT_MATERIALIZATION_CHANGED")
                 return receipt
+            if desktop:
+                # Origin was observed before this write reservation. A Stop
+                # that wins first revokes that new admission, not its history.
+                # Exact duplicate readback above remains data reconciliation.
+                control = self._context_input_stop_cut_on_conn(conn, root, require_sequence_cut=True)
+                revision = 0 if control is None else control["revision"]
+                if origin["stop_revision"] != revision:
+                    raise ContextContinuationError("CONTEXT_INPUT_ORIGIN_STOP_CHANGED")
             if head["accepted_sequence"] - head["projected_sequence"] >= 128:
                 raise ContextContinuationError("CONTEXT_INPUT_PENDING_LIMIT")
+            # Identity conflicts and admission limits precede byte publication.
+            # Materialization stays under this same native write reservation.
+            if content_factory is not None:
+                current_payload = freeze(content_factory(root, profile))
+                if current_payload != payload:
+                    raise ContextContinuationError("CONTEXT_INPUT_MATERIALIZATION_CHANGED")
             sequence = head["accepted_sequence"] + 1
-            receipt = ContextInputReceipt("SessionDBContextInputV1", root, profile, sequence, source,
-                event_id, digest, payload["content"], time.time() if timestamp is None else timestamp,
-                timestamp, payload["display_metadata"])
+            receipt = ContextInputReceipt(receipt_schema, root, profile, sequence, source,
+                event_id, digest, current_payload["content"], time.time() if timestamp is None else timestamp,
+                timestamp, current_payload["display_metadata"])
             raw = _canonical(asdict(receipt))
             ContextInputReceipt.from_raw(raw)
             conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?)", (_event_key(root, sequence), raw))
             if origin is not None:
-                bound_origin = {"schema": "SessionDBContextInputOriginV1", "conversation_root": root,
+                bound_origin = {"schema": "SessionDBContextInputOriginV2" if desktop else "SessionDBContextInputOriginV1", "conversation_root": root,
                     "profile_name": profile, "sequence": sequence, "payload_digest": digest, "origin": origin}
                 conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?)",
                     (_event_key(root, sequence) + ":origin", _canonical(bound_origin)))
@@ -300,16 +353,25 @@ class SessionContextInboxMixin(SessionContextInputTurnsMixin):
         row = conn.execute("SELECT value FROM state_meta WHERE key=?",
             (_event_key(receipt.conversation_root, receipt.sequence) + ":origin",)).fetchone()
         if row is None:
+            if receipt.schema == "SessionDBContextInputV2":
+                raise ContextContinuationError("CONTEXT_INPUT_ORIGIN_MISSING")
             return None
         value = _strict_json(row[0])
         if (set(value) != {"schema", "conversation_root", "profile_name", "sequence", "payload_digest", "origin"}
-                or value["schema"] != "SessionDBContextInputOriginV1"
+                or type(value["schema"]) is not str
+                or value["schema"] not in {"SessionDBContextInputOriginV1", "SessionDBContextInputOriginV2"}
+                or receipt.schema == "SessionDBContextInputV2" and value["schema"] != "SessionDBContextInputOriginV2"
                 or value["conversation_root"] != receipt.conversation_root or value["profile_name"] != receipt.profile_name
                 or type(value["sequence"]) is not int or value["sequence"] != receipt.sequence
                 or value["payload_digest"] != receipt.payload_digest):
             raise ContextContinuationError("CONTEXT_INPUT_ORIGIN_INVALID")
-        origin = _gateway_origin(value["origin"])
-        if origin["route"]["platform"] != receipt.source:
+        desktop = value["schema"] == "SessionDBContextInputOriginV2"
+        origin = desktop_input_origin(value["origin"]) if desktop else _gateway_origin(value["origin"])
+        if desktop and (receipt.source != "desktop" or origin["profile_name"] != receipt.profile_name
+                or receipt.schema == "SessionDBContextInputV1" and type(receipt.content) is not str
+                or self._context_input_scope_on_conn(conn, origin["stored_session_id"]) != (receipt.conversation_root, receipt.profile_name)):
+            raise ContextContinuationError("CONTEXT_INPUT_ORIGIN_INVALID")
+        if not desktop and origin["route"]["platform"] != receipt.source:
             raise ContextContinuationError("CONTEXT_INPUT_ORIGIN_INVALID")
         return origin
 

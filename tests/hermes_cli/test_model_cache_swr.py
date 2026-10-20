@@ -16,6 +16,12 @@ from unittest.mock import patch
 import pytest
 
 
+def witnessed(ids):
+    from hermes_cli.models import CatalogModelIds
+    return CatalogModelIds(ids, source="live", freshness="fresh", authoritative=True,
+                           updated_at=time.time())
+
+
 @pytest.fixture(autouse=True)
 def _reset_swr_state():
     import hermes_cli.models as models_mod
@@ -66,7 +72,7 @@ class TestProviderModelsSWR:
              patch.object(mod, "_credential_fingerprint", return_value="fp"), \
              patch.object(mod, "_save_provider_models_cache"), \
              patch.object(mod, "_spawn_swr_refresh") as spawn, \
-             patch.object(mod, "provider_model_ids", return_value=["fresh"]) as live:
+             patch.object(mod, "provider_model_ids", return_value=witnessed(["fresh"])) as live:
             out = mod.cached_provider_model_ids("openrouter")
         assert out == ["fresh"]
         spawn.assert_not_called()
@@ -82,7 +88,7 @@ class TestProviderModelsSWR:
              patch.object(mod, "_credential_fingerprint", return_value="new"), \
              patch.object(mod, "_save_provider_models_cache"), \
              patch.object(mod, "_spawn_swr_refresh") as spawn, \
-             patch.object(mod, "provider_model_ids", return_value=["new-key-models"]):
+             patch.object(mod, "provider_model_ids", return_value=witnessed(["new-key-models"])):
             out = mod.cached_provider_model_ids("openrouter")
         assert out == ["new-key-models"]
         spawn.assert_not_called()
@@ -95,7 +101,7 @@ class TestProviderModelsSWR:
              patch.object(mod, "_credential_fingerprint", return_value="fp"), \
              patch.object(mod, "_save_provider_models_cache"), \
              patch.object(mod, "_spawn_swr_refresh") as spawn, \
-             patch.object(mod, "provider_model_ids", return_value=["live"]) as live:
+             patch.object(mod, "provider_model_ids", return_value=witnessed(["live"])) as live:
             out = mod.cached_provider_model_ids("openrouter", force_refresh=True)
         assert out == ["live"]
         spawn.assert_not_called()
@@ -138,7 +144,7 @@ class TestProviderModelsSWR:
                 captured["target"]()  # run synchronously
 
         with patch.object(mod.threading, "Thread", InlineThread), \
-             patch.object(mod, "provider_model_ids", return_value=["fresh1", "fresh2"]), \
+             patch.object(mod, "provider_model_ids", return_value=witnessed(["fresh1", "fresh2"])), \
              patch.object(mod, "_credential_fingerprint", return_value="fp"), \
              patch.object(mod, "_load_provider_models_cache", return_value={}), \
              patch.object(mod, "_save_provider_models_cache", side_effect=fake_save):
@@ -198,7 +204,7 @@ class TestCorruptCacheRowDegradation:
         with patch.object(mod, "_load_provider_models_cache", return_value=cache), \
              patch.object(mod, "_credential_fingerprint", return_value="fp"), \
              patch.object(mod, "_save_provider_models_cache"), \
-             patch.object(mod, "provider_model_ids", return_value=["live-model"]) as live:
+             patch.object(mod, "provider_model_ids", return_value=witnessed(["live-model"])) as live:
             out = mod.cached_provider_model_ids("openrouter")
         assert out == ["live-model"]
         live.assert_called_once()

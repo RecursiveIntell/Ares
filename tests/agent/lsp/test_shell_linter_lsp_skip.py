@@ -1,34 +1,7 @@
-"""Skip the per-file shell linter when LSP will handle the same file.
+"""Potential LSP availability cannot waive independent shell lint.
 
-The per-file ``npx tsc --noEmit FILE.ts`` shell linter cannot see
-``tsconfig.json`` (a documented ``tsc`` quirk: explicit file args bypass
-the project config), so it defaults to no-lib / ES5 and floods the
-agent's lint field with phantom "Cannot find 'Promise' / 'Map' / 'Set' /
-'ReadonlySet' / 'Iterable' / 'imul' / …" errors on every edit — up to
-25K tokens per patch.  The LSP tier (``tsserver`` via
-typescript-language-server) reads tsconfig correctly and surfaces real
-diagnostics in the ``lsp_diagnostics`` field of the WriteResult /
-PatchResult.
-
-These tests pin the contract:
-
-  - When LSP is active AND ``enabled_for(path)`` for a ``.ts`` / ``.go``
-    / ``.rs`` file, ``_check_lint`` returns ``skipped`` without invoking
-    the shell linter at all.
-  - When LSP is inactive or disabled-for-path, the shell linter runs
-    exactly as before (regression guard for the default config).
-  - The skip only applies to extensions in
-    ``_SHELL_LINTER_LSP_REDUNDANT`` — Python ``py_compile`` and
-    ``node --check`` keep running unconditionally because they're fast,
-    file-local, and correct.
-  - ``.tsx`` is intentionally NOT in either ``LINTERS`` or
-    ``_SHELL_LINTER_LSP_REDUNDANT``: it had no ``LINTERS`` entry
-    pre-PR (so it was already implicitly ``skipped`` via the
-    ``ext not in LINTERS`` branch) and adding one would have inherited
-    ``.ts``'s broken ``tsc --noEmit FILE`` invocation for LSP-disabled
-    users.  When LSP IS enabled, ``.tsx`` is still covered by
-    typescript-language-server via ``_maybe_lsp_diagnostics`` — the
-    diagnostics show up on ``lsp_diagnostics``, not ``lint``.
+The existing tsconfig project exception and unsupported TSX behavior remain
+separate from the optimistic service probe.
 """
 from __future__ import annotations
 
@@ -44,37 +17,19 @@ def _make_fops():
 
 
 @pytest.mark.parametrize("ext", [".ts", ".go", ".rs"])
-def test_shell_linter_skipped_when_lsp_will_handle(ext, tmp_path):
-    """When LSP is active and enabled_for(path), shell linter is skipped.
-
-    The shell linter's _exec must NOT be called — that's the whole
-    point.  We assert by patching ``_exec`` to raise, so any accidental
-    invocation surfaces as a test failure.
-    """
+def test_shell_linter_runs_when_lsp_will_handle(ext, tmp_path):
+    """A configured service has supplied no fresh syntax verdict."""
     fops = _make_fops()
     src = tmp_path / f"bad{ext}"
     src.write_text("intentionally invalid content\n")
-
-    def _exec_must_not_run(*args, **kwargs):  # pragma: no cover
-        raise AssertionError(
-            "shell linter was invoked despite LSP claiming the file"
-        )
-
+    failure = MagicMock(exit_code=1, stdout="syntax checker rejected content")
     with patch.object(fops, "_lsp_will_handle", return_value=True), \
-         patch.object(fops, "_exec", side_effect=_exec_must_not_run), \
+         patch.object(fops, "_exec", return_value=failure) as execute, \
          patch.object(fops, "_has_command", return_value=True):
         result = fops._check_lint(str(src))
-
-    assert result.skipped is True
-    assert "LSP" in (result.message or "")
-
-
-
-
-
-
-
-
+    assert execute.called
+    assert not result.skipped and not result.success
+    assert "rejected content" in result.output
 
 
 def test_lsp_will_handle_swallows_enabled_for_exception(tmp_path):

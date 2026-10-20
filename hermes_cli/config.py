@@ -30,7 +30,8 @@ import tempfile
 import threading
 import time
 import unicodedata
-from dataclasses import dataclass
+from enum import Enum
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple, Set
 
@@ -304,6 +305,10 @@ _RAW_CONFIG_CACHE: Dict[str, Tuple[int, int, Dict[str, Any]]] = {}
 # calls read_raw_config. Also covers mutation of the module-level cache
 # dicts above.
 _CONFIG_LOCK = threading.RLock()
+# Monotonic observations, not cached permissions. Removing an authority this
+# process has already used must not turn it into optional first-run absence.
+_POLICY_CONFIG_OBSERVED: set[str] = set()
+_POLICY_MANAGED_PATHS: Dict[str, Path] = {}
 # Env var names written to .env that aren't in OPTIONAL_ENV_VARS
 # (managed by setup/provider flows directly).
 _EXTRA_ENV_KEYS = frozenset({
@@ -1013,6 +1018,7 @@ def _ensure_hermes_home_managed(home: Path):
 # =============================================================================
 
 from hermes_cli.config_defaults import DEFAULT_CONFIG, OPTIONAL_ENV_VARS  # noqa: F401
+from hermes_cli.delegation_policy import DelegationTimeoutConfigError, validate_child_timeout_mode
 
 # =============================================================================
 # Config Migration System
@@ -2099,6 +2105,13 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
             return [ConfigIssue("error", "Could not load config.yaml", "Run 'hermes setup' to create a valid config")]
 
     issues: List[ConfigIssue] = []
+
+    delegation = config.get("delegation")
+    if isinstance(delegation, dict) and "child_timeout_mode" in delegation:
+        try:
+            validate_child_timeout_mode(delegation["child_timeout_mode"])
+        except DelegationTimeoutConfigError as exc:
+            issues.append(ConfigIssue("error", str(exc), "Set delegation.child_timeout_mode to total or inactivity"))
 
     # ── voice.submit_mode: direct | draft ────────────────────────────────
     voice_cfg = config.get("voice")
@@ -3280,6 +3293,215 @@ def resolve_ephemeral_system_prompt_from_config(cfg: Optional[Dict[str, Any]]) -
     from hermes_cli.personality import resolve_ephemeral_system_prompt
 
     return resolve_ephemeral_system_prompt(cfg)
+
+
+class ConfigPolicyStatus(str, Enum):
+    VALID = "valid"
+    ABSENT = "absent"
+    MALFORMED = "malformed"
+    NONMAPPING = "nonmapping"
+    UNAVAILABLE = "unavailable"
+    REMOVED = "removed"
+    CHANGED = "changed"
+
+
+class ConfigPolicyError(RuntimeError):
+    """Safe security-boundary error; never includes YAML or secret values."""
+
+    def __init__(self, status: ConfigPolicyStatus):
+        self.status = status
+        super().__init__(f"launch configuration policy {status.value}; refusing child environment")
+
+
+def _policy_file_signature(path: Path) -> tuple[int, ...] | None:
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        if path.is_symlink():
+            raise ConfigPolicyError(ConfigPolicyStatus.UNAVAILABLE) from None
+        return None
+    except OSError:
+        raise ConfigPolicyError(ConfigPolicyStatus.UNAVAILABLE) from None
+    return (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_ctime_ns, st.st_size)
+
+
+@dataclass(frozen=True)
+class LaunchConfigPolicy:
+    """Presence-sensitive name projection; no defaults merge or secret values.
+
+    An optional config.yaml never observed in this process may be absent.
+    Empty/nonmapping YAML, unreadable files and removal of a known authority
+    are errors. Signatures and observations belong to the config owner's lock;
+    this snapshot is local to one launch and is never an authorization cache.
+    """
+
+    config_path: Path
+    status: ConfigPolicyStatus
+    signatures: tuple[tuple[Path, tuple[int, ...] | None], ...]
+    managed_path: Path | None
+    bws_token_env: str
+    passthrough_names: frozenset[str]
+
+    def validate(self) -> None:
+        """Reject a file/managed identity change during environment construction."""
+        _validate_policy_signatures(self.signatures, self.managed_path)
+
+
+def _read_policy_mapping(path: Path) -> tuple[dict, tuple[int, ...] | None]:
+    """Strict raw file read under _CONFIG_LOCK; legacy readers remain lenient."""
+    signature = _policy_file_signature(path)
+    path_key = str(path)
+    if signature is None:
+        if path_key in _POLICY_CONFIG_OBSERVED or path_key in _RAW_CONFIG_CACHE or path_key in _LOAD_CONFIG_CACHE:
+            raise ConfigPolicyError(ConfigPolicyStatus.REMOVED)
+        return {}, None
+    # Even an invalid observed file cannot subsequently become optional absence.
+    _POLICY_CONFIG_OBSERVED.add(path_key)
+    try:
+        with open(path, encoding="utf-8") as stream:
+            data = fast_safe_load(stream)
+    except OSError:
+        raise ConfigPolicyError(ConfigPolicyStatus.UNAVAILABLE) from None
+    except Exception:
+        raise ConfigPolicyError(ConfigPolicyStatus.MALFORMED) from None
+    if not isinstance(data, dict):
+        raise ConfigPolicyError(ConfigPolicyStatus.NONMAPPING)
+    if _policy_file_signature(path) != signature:
+        raise ConfigPolicyError(ConfigPolicyStatus.CHANGED)
+    return data, signature
+
+
+def _validate_policy_signatures(signatures, managed_path) -> None:
+    from hermes_cli import managed_scope
+
+    with _CONFIG_LOCK:
+        managed_dir = managed_scope.get_managed_dir()
+        if managed_dir is None and os.environ.get("HERMES_MANAGED_DIR", "").strip():
+            raise ConfigPolicyError(ConfigPolicyStatus.UNAVAILABLE)
+        current_managed = (managed_dir / "config.yaml").absolute() if managed_dir else None
+        if current_managed != managed_path:
+            raise ConfigPolicyError(ConfigPolicyStatus.CHANGED)
+        for path, signature in signatures:
+            if _policy_file_signature(path) != signature:
+                raise ConfigPolicyError(ConfigPolicyStatus.CHANGED)
+
+
+def _read_config_policy_sources(profile_home=None):
+    """Canonical strict source tuple; callers hold _CONFIG_LOCK."""
+    from hermes_cli import managed_scope
+
+    try:
+        home = Path(profile_home) if profile_home is not None else get_config_path().parent
+        path = home.resolve() / "config.yaml"
+    except (OSError, RuntimeError):
+        raise ConfigPolicyError(ConfigPolicyStatus.UNAVAILABLE) from None
+    user, signature = _read_policy_mapping(path)
+    signatures = [(path, signature)]
+    managed_dir = managed_scope.get_managed_dir()
+    if managed_dir is None and os.environ.get("HERMES_MANAGED_DIR", "").strip():
+        raise ConfigPolicyError(ConfigPolicyStatus.UNAVAILABLE)
+    managed_path = (managed_dir / "config.yaml").absolute() if managed_dir else None
+    previous_managed = _POLICY_MANAGED_PATHS.get(str(path))
+    if previous_managed is not None and managed_path != previous_managed:
+        raise ConfigPolicyError(ConfigPolicyStatus.REMOVED)
+    managed = {}
+    if managed_path is not None:
+        managed, managed_signature = _read_policy_mapping(managed_path)
+        signatures.append((managed_path, managed_signature))
+        if managed_signature is not None:
+            _POLICY_MANAGED_PATHS[str(path)] = managed_path
+    return path, user, managed_path, managed, tuple(signatures)
+
+
+@dataclass(frozen=True)
+class DelegationConfigPolicy:
+    """One strict, launch-local delegation projection, never an authority cache."""
+
+    config_path: Path
+    status: ConfigPolicyStatus
+    signatures: tuple[tuple[Path, tuple[int, ...] | None], ...]
+    managed_path: Path | None
+    _values: Dict[str, Any] = field(repr=False)
+
+    @property
+    def values(self) -> Dict[str, Any]:
+        return copy.deepcopy(self._values)
+
+    def validate(self) -> None:
+        with _CONFIG_LOCK:
+            if get_config_path().parent.resolve() / "config.yaml" != self.config_path:
+                raise ConfigPolicyError(ConfigPolicyStatus.CHANGED)
+            _validate_policy_signatures(self.signatures, self.managed_path)
+
+
+def read_delegation_config_policy() -> DelegationConfigPolicy:
+    """Read effective delegation values without admitting defaults on failure.
+
+    Reuses the strict config owner's source/signature and managed precedence
+    rules. Legacy display/LKG readers remain unchanged. Optional absence is
+    preserved, but corrupt, nonmapping, unreadable or removed authority refuses.
+    """
+    with _CONFIG_LOCK:
+        path, user, managed_path, managed, signatures = _read_config_policy_sources()
+
+        def section(mapping):
+            value = mapping.get("delegation", {})
+            if not isinstance(value, dict):
+                raise ConfigPolicyError(ConfigPolicyStatus.NONMAPPING)
+            return value
+
+        try:
+            values = _deep_merge(copy.deepcopy(DEFAULT_CONFIG["delegation"]),
+                                 _expand_env_vars(section(user)))
+            values = _deep_merge(values, _expand_env_vars(section(managed)))
+        except ConfigPolicyError:
+            raise
+        except Exception:
+            raise ConfigPolicyError(ConfigPolicyStatus.MALFORMED) from None
+        policy = DelegationConfigPolicy(
+            config_path=path,
+            status=ConfigPolicyStatus.VALID if any(sig is not None for _, sig in signatures) else ConfigPolicyStatus.ABSENT,
+            signatures=signatures, managed_path=managed_path, _values=values)
+        policy.validate()
+        return policy
+
+
+def read_launch_config_policy(profile_home: str | os.PathLike | None = None) -> LaunchConfigPolicy:
+    """Read security name policy once, with strict managed leaf precedence.
+
+    Uses the canonical profile path, YAML parser, merge and managed directory
+    resolver. Unlike legacy mutable readers this never turns errors into {}.
+    The managed layer expands against process env, as its owner specifies;
+    the user layer retains raw, presence-sensitive terminal name semantics.
+    """
+    with _CONFIG_LOCK:
+        path, data, managed_path, managed, signatures = _read_config_policy_sources(profile_home)
+        data = _deep_merge(data, _expand_env_vars(managed))
+
+        def section(mapping, key):
+            value = mapping.get(key, {})
+            # Existing config loaders treat an empty section as absent.
+            if value is None:
+                return {}
+            if not isinstance(value, dict):
+                raise ConfigPolicyError(ConfigPolicyStatus.NONMAPPING)
+            return value
+
+        bitwarden = section(section(data, "secrets"), "bitwarden")
+        name = bitwarden.get("access_token_env", "BWS_ACCESS_TOKEN")
+        if not isinstance(name, str) or not name.strip():
+            raise ConfigPolicyError(ConfigPolicyStatus.MALFORMED)
+        passthrough = section(data, "terminal").get("env_passthrough", [])
+        if not isinstance(passthrough, list) or any(not isinstance(item, str) for item in passthrough):
+            raise ConfigPolicyError(ConfigPolicyStatus.MALFORMED)
+        return LaunchConfigPolicy(
+            config_path=path,
+            status=ConfigPolicyStatus.VALID if any(sig is not None for _, sig in signatures) else ConfigPolicyStatus.ABSENT,
+            signatures=tuple(signatures),
+            managed_path=managed_path,
+            bws_token_env=name.strip(),
+            passthrough_names=frozenset(item.strip() for item in passthrough if item.strip()),
+        )
 
 
 def read_raw_config() -> Dict[str, Any]:
@@ -5541,6 +5763,8 @@ def set_config_value(key: str, value: str, force: bool = False):
     if is_managed():
         managed_error("set configuration values")
         return
+    if key == "delegation.child_timeout_mode":
+        validate_child_timeout_mode(value)
     # Reject malformed dotted keys with empty segments (leading/trailing/
     # double dots). ``"agent."`` split to ["agent", ""] and _set_nested wrote
     # config["agent"][""] = ..., polluting a live schema section with a

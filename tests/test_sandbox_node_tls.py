@@ -21,9 +21,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 @pytest.fixture
 def npm_proxy(tmp_path):
-    required = ("bash", "openssl", "node", "npm")
+    required = ("bash", "openssl", "node", "npm", "cp")
     if any(shutil.which(binary) is None for binary in required):
-        pytest.skip("sandbox TLS fixture requires bash, openssl, Node and npm")
+        pytest.skip("sandbox TLS fixture requires bash, openssl, Node, npm and cp")
     real_ca = Path("/etc/ssl/certs/ca-certificates.crt")
     if not real_ca.is_file():
         pytest.skip("sandbox TLS fixture requires the host public CA bundle")
@@ -50,6 +50,21 @@ def npm_proxy(tmp_path):
     bwrap.write_text(f"#!{sys.executable}\nimport json,sys\n"
                      f"json.dump(sys.argv[1:],open({str(capture)!r},'w'))\n")
     bwrap.chmod(0o755)
+    # This fixture captures argv, not mount/copy behavior. Copying the host's
+    # entire /etc is irrelevant and can outrun the setup deadline in CI.
+    # Double only that exact boundary; all other cp invocations stay real.
+    real_cp = shutil.which("cp")
+    copier = binaries / "cp"
+    copier.write_text(
+        f"#!{sys.executable}\nimport os,sys\nfrom pathlib import Path\n"
+        f"expected=['-a','/etc/.',{str(sandbox / 'etc-merged')!r}]\n"
+        "if sys.argv[1:] == expected:\n"
+        "    Path(expected[-1]).mkdir(parents=True,exist_ok=True)\n"
+        "else:\n"
+        f"    os.execv({real_cp!r},[{real_cp!r},*sys.argv[1:]])\n",
+        encoding="utf-8",
+    )
+    copier.chmod(0o755)
     env = clean_env | {"PATH": str(binaries) + os.pathsep + clean_env["PATH"],
                       "DEV_SANDBOX_ROOT": str(sandbox), "DEV_SANDBOX_BASH": "/bin/bash",
                       "DEV_SANDBOX_INTERACTIVE": "false", "DEV_SANDBOX_USER": "test",
@@ -129,13 +144,19 @@ def npm_install(fixture, project, *, ca=None):
     project.mkdir()
     (project / "package.json").write_text(json.dumps({"name": "sandbox-tls-app",
         "version": "1.0.0", "dependencies": {"ares-ci-trust-proof": "1.0.0"}}))
+    selected_ca = str(ca or fixture["node_ca"])
+    for name in ("empty-user.npmrc", "empty-global.npmrc"):
+        (project / name).write_text("", encoding="utf-8")
     env = fixture["env"] | {"HOME": str(project),
-        "CURL_CA_BUNDLE": str(fixture["certs"] / "ca.pem"),
-        "SSL_CERT_FILE": str(fixture["certs"] / "ca.pem"),
-        "NODE_EXTRA_CA_CERTS": str(ca or fixture["node_ca"]),
+        "CURL_CA_BUNDLE": selected_ca,
+        "SSL_CERT_FILE": selected_ca,
+        "NODE_EXTRA_CA_CERTS": selected_ca,
+        "npm_config_userconfig": str(project / "empty-user.npmrc"),
+        "npm_config_globalconfig": str(project / "empty-global.npmrc"),
         "HTTPS_PROXY": fixture["proxy"], "HTTP_PROXY": fixture["proxy"], "NO_PROXY": "",
         "npm_config_update_notifier": "false"}
     return subprocess.run(["npm", "install", "--ignore-scripts", "--no-audit", "--no-fund",
+        "--strict-ssl=true",
         "--fetch-retries=0", "--fetch-timeout=5000", "--loglevel=error",
         "--registry=https://registry.npmjs.org", f"--https-proxy={fixture['proxy']}"],
         env=env, cwd=project, capture_output=True, text=True, timeout=20)

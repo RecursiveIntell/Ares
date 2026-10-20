@@ -24,12 +24,6 @@ from typing import Iterable, Optional, Tuple
 
 logger = logging.getLogger("agent.lsp.workspace")
 
-# Cache: cwd → (worktree_root, is_git) so repeated calls don't re-stat.
-# Cleared on shutdown.  Keyed by absolute resolved path so symlink
-# folds collapse to one entry.
-_workspace_cache: dict = {}
-
-
 def normalize_path(path: str) -> str:
     """Normalize a path for use as a stable map key.
 
@@ -59,11 +53,9 @@ def find_git_worktree(start: str) -> Optional[str]:
         # bail out rather than crash the lint hook.
         return None
 
-    # Cache check
-    cached = _workspace_cache.get(str(start_path))
-    if cached is not None:
-        root, _is_git = cached
-        return root
+    # Re-walk the bounded ancestor chain. A cached positive can survive
+    # removal of .git, and a cached negative can hide a newly created or
+    # nearer worktree. Directory identity alone cannot detect both cases.
 
     cur = start_path
     # Defensive cap: the deepest reasonable monorepo is well under 64
@@ -74,7 +66,6 @@ def find_git_worktree(start: str) -> Optional[str]:
         try:
             if git_marker.exists():
                 resolved = str(cur)
-                _workspace_cache[str(start_path)] = (resolved, True)
                 return resolved
         except OSError:
             # Permission error on a parent dir — bail out cleanly.
@@ -84,7 +75,6 @@ def find_git_worktree(start: str) -> Optional[str]:
             break
         cur = parent
 
-    _workspace_cache[str(start_path)] = (None, False)
     return None
 
 
@@ -205,12 +195,7 @@ def resolve_workspace_for_file(
 
 
 def clear_cache() -> None:
-    """Clear the workspace-resolution cache.
-
-    Called on service shutdown so a subsequent re-init doesn't pick
-    up stale results from a previous session.
-    """
-    _workspace_cache.clear()
+    """Compatibility hook; workspace markers are now resolved afresh."""
 
 
 __all__ = [

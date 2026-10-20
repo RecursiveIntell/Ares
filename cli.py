@@ -12531,6 +12531,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 _cprint(f"  No agent running; queued as next turn: {payload[:80]}{'...' if len(payload) > 80 else ''}")
         elif canonical == "goal":
             self._handle_goal_command(cmd_original)
+            if cmd_original.strip().split(None, 1)[-1].lower() in {"pause", "clear", "stop", "done"}:
+                self._cancel_goal_runtime_turn()
         elif canonical == "heartbeat":
             self._handle_heartbeat_command(cmd_original)
         elif canonical == "refine":
@@ -12784,6 +12786,41 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     # ────────────────────────────────────────────────────────────────
     # /goal — persistent cross-turn goals (Ralph-style loop)
     # ────────────────────────────────────────────────────────────────
+    def _goal_runtime_turn_current(self, binding) -> bool:
+        from hermes_cli.goals import GoalManager
+        if (getattr(self, "_goal_turn_cancelled", False)
+                or getattr(self, "_goal_turn_session_id", None) != self.session_id):
+            return False
+        mgr = GoalManager(self.session_id)
+        state = mgr.state
+        return bool(state and mgr._auto_eligible(state, admitted=True)
+            and not state.continuation_pending and state.goal_id == binding.get("goal_id")
+            and state.checkpoint_revision == binding.get("checkpoint_revision")
+            and state.continuation_token == binding.get("continuation_token"))
+
+    def _cancel_goal_runtime_turn(self) -> None:
+        self._goal_stop_generation = int(getattr(self, "_goal_stop_generation", 0)) + 1
+        if not getattr(self, "_goal_turn_binding", None):
+            return
+        self._goal_turn_cancelled = True
+        if self.agent is not None:
+            request_hard_interrupt(self.agent)
+
+    def _consume_goal_runtime_turn(self, binding):
+        mgr = self._get_goal_manager()
+        generation = int(getattr(self, "_goal_stop_generation", 0))
+        session_id = self.session_id
+        if not mgr.start_continuation(expected_goal_id=binding["goal_id"],
+                expected_checkpoint_revision=binding["checkpoint_revision"],
+                expected_continuation_token=binding["continuation_token"]):
+            return None
+        self._goal_turn_binding = binding
+        self._goal_turn_session_id = session_id
+        self._goal_turn_cancelled = generation != int(getattr(self, "_goal_stop_generation", 0))
+        self._goal_turn_dispatched = False
+        prompt = mgr.next_continuation_prompt()
+        return prompt if prompt and self._goal_runtime_turn_current(binding) else None
+
     def _get_goal_manager(self):
         """Return the GoalManager bound to the current session_id.
 
@@ -12829,7 +12866,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             _SyntheticInputMessage(
                 text,
                 display_kind=display_kind,
-                display_metadata={"synthetic_source": source},
+                display_metadata={"synthetic_source": source, **({"goal_continuation": {
+                    "goal_id": self._get_goal_manager().state.goal_id,
+                    "checkpoint_revision": self._get_goal_manager().state.checkpoint_revision,
+                    "continuation_token": self._get_goal_manager().state.continuation_token,
+                }} if source == "goal_continuation" else {})},
             )
         )
 
@@ -13142,6 +13183,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         The empty-response skip mirrors the gateway guard at
         ``_handle_message`` in ``gateway/run.py``.
         """
+        if getattr(self, "_goal_turn_binding", None) and not getattr(self, "_goal_turn_dispatched", False):
+            return
         mgr = self._get_goal_manager()
         if mgr is None or not mgr.is_active():
             return
@@ -13237,7 +13280,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             user_initiated=True,
             background_processes=_bg_procs,
             turn_outcome=turn_outcome,
-            turn_metadata={"reason": "empty assistant output"} if turn_outcome else None,
+            turn_metadata={"continuation": getattr(self, "_goal_turn_binding", None) or {}, "origin": getattr(self, "_goal_turn_origin", "goal"), **({"reason": "empty assistant output"} if turn_outcome else {})},
         )
         msg = decision.get("message") or ""
         if msg:
@@ -16407,6 +16450,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         Returns:
             The agent's response, or None on error
         """
+        goal_binding = (persist_user_display_metadata or {}).get("goal_continuation")
+        if goal_binding and not self._goal_runtime_turn_current(goal_binding):
+            return None
         # Single-query and direct chat callers do not go through run(), so
         # register secure secret capture here as well.
         set_secret_capture_callback(self._secret_capture_callback)
@@ -16436,6 +16482,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return None
         agent = self.agent
         if agent is None:
+            return None
+        if goal_binding and not self._goal_runtime_turn_current(goal_binding):
             return None
 
         # Route image attachments based on the active model's vision capability.
@@ -16752,6 +16800,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 )
                 self._pending_one_turn_model_restore = None
                 try:
+                    if goal_binding and (not self._goal_runtime_turn_current(goal_binding)
+                            or getattr(self.agent, "_interrupt_requested", False)):
+                        return None
+                    if goal_binding:
+                        self._goal_turn_dispatched = True
                     result = self.agent.run_conversation(
                         user_message=agent_message,
                         conversation_history=self.conversation_history[:-1],  # Exclude the message we just added
@@ -18939,6 +18992,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 
                 self._last_ctrl_c_time = now
                 print("\n⚡ Interrupting agent... (press Ctrl+C again to force exit)")
+                self._cancel_goal_runtime_turn()
                 request_hard_interrupt(self.agent)
             # If there's text or images, clear them (like bash).
             # If everything is already empty, exit.
@@ -19017,6 +19071,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
             if self._agent_running and self.agent:
                 print("\n⚡ Interrupting agent...")
+                self._cancel_goal_runtime_turn()
                 request_hard_interrupt(self.agent)
             elif event.app.current_buffer.text or self._attached_images:
                 event.app.current_buffer.reset()
@@ -20668,6 +20723,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     app.invalidate()  # Refresh status line
 
                     try:
+                        binding = (synthetic_metadata or {}).get("goal_continuation")
+                        if binding:
+                            user_input = self._consume_goal_runtime_turn(binding)
+                            if not user_input:
+                                continue
+                        self._goal_turn_binding = binding
+                        self._goal_turn_origin = "notification" if synthetic_kind and not binding else "goal"
                         self.chat(
                             user_input,
                             images=submit_images or None,

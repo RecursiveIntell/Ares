@@ -175,7 +175,10 @@ def test_context_input_projection_reloads_keep_summary_marker(monkeypatch, db, e
 
     _seed(db, "project-session")
     tail_id = db.get_messages_as_conversation("project-session", include_row_ids=True)[-1]["_row_id"]
-    receipt = types.SimpleNamespace(sequence=1)
+    # The merged tree fails closed on any receipt whose content is not a str
+    # (CONTEXT_INPUT_TEXT_ROUTE_REQUIRED), before phase creation or projection.
+    # The fixture provides that shape so the projection itself is what runs.
+    receipt = types.SimpleNamespace(sequence=1, content="Original active task.")
     # Native input admission is not under test here; its result selects the
     # two reload branches. The transcript projection itself is real SessionDB.
     monkeypatch.setattr(db, "read_context_input_work", lambda _s: {"receipts": [receipt]})

@@ -83,7 +83,12 @@ def _custom_provider_ssl_context(base_url: str):
 # Fallback OpenRouter snapshot used when the live catalog is unavailable.
 # (model_id, display description shown in menus)
 OPENROUTER_MODELS: list[tuple[str, str]] = [
-    # Anthropic
+    # Anthropic — bounded additions verified against the public catalog
+    # snapshot supplied for the 2026-10-10 reliability lane.
+    ("anthropic/claude-fable-5.1",             ""),
+    ("anthropic/claude-opus-5.5",              ""),
+    ("anthropic/claude-sonnet-5.5",            ""),
+    ("anthropic/claude-haiku-5.5",             ""),
     ("anthropic/claude-fable-5",               ""),
     ("anthropic/claude-opus-5",                ""),
     ("anthropic/claude-opus-5-fast",           "2x price, higher output speed"),
@@ -2026,8 +2031,12 @@ def fetch_openrouter_models(
     """Return the curated OpenRouter picker list, refreshed from the live catalog when possible."""
     global _openrouter_catalog_cache
 
-    if _openrouter_catalog_cache is not None and not force_refresh:
-        return list(_openrouter_catalog_cache)
+    fp = _credential_fingerprint("openrouter")
+    known_cache = (_openrouter_catalog_cache
+                   if getattr(_openrouter_catalog_cache, "credential_scope", None) == fp else None)
+    if known_cache is not None and not force_refresh:
+        return CatalogModelIds(known_cache, source="cache", freshness="unknown",
+                               updated_at=known_cache.catalog_status["updated_at"], authoritative=True)
 
     # Prefer the remotely-hosted catalog manifest; fall back to the in-repo
     # snapshot when the manifest is unreachable. Both are curated lists that
@@ -2041,6 +2050,13 @@ def fetch_openrouter_models(
     fallback = list(remote) if remote else list(OPENROUTER_MODELS)
     preferred_ids = [mid for mid, _ in fallback]
 
+    def unavailable():
+        if known_cache is not None and _credential_fingerprint("openrouter") == fp:
+            return CatalogModelIds(known_cache, source="cache", freshness="stale",
+                                   updated_at=known_cache.catalog_status["updated_at"],
+                                   degraded=True, authoritative=True)
+        return CatalogModelIds(fallback, source="curated", freshness="unknown", degraded=True)
+
     try:
         req = urllib.request.Request(
             _OPENROUTER_CATALOG_URL,
@@ -2049,19 +2065,15 @@ def fetch_openrouter_models(
         with _urlopen_model_catalog_request(req, timeout=timeout) as resp:
             payload = json.loads(resp.read().decode())
     except Exception:
-        return list(_openrouter_catalog_cache or fallback)
+        return unavailable()
 
-    live_items = payload.get("data", [])
-    if not isinstance(live_items, list):
-        return list(_openrouter_catalog_cache or fallback)
+    live_items = payload.get("data") if isinstance(payload, dict) else None
+    if not _valid_catalog_items(live_items):
+        return unavailable()
 
     live_by_id: dict[str, dict[str, Any]] = {}
     for item in live_items:
-        if not isinstance(item, dict):
-            continue
-        mid = str(item.get("id") or "").strip()
-        if not mid:
-            continue
+        mid = item["id"]
         live_by_id[mid] = item
 
     # Free warm-up for the reasoning-capability cache: this is the same payload
@@ -2092,19 +2104,24 @@ def fetch_openrouter_models(
             desc = "free" if _openrouter_model_is_free(live_item.get("pricing")) else ""
         curated.append((preferred_id, desc))
 
-    if not curated:
-        return list(_openrouter_catalog_cache or fallback)
-
-    first_id, first_desc = curated[0]
-    if not first_desc:
-        curated[0] = (first_id, "recommended")
-    _openrouter_catalog_cache = curated
-    return list(curated)
+    if curated:
+        first_id, first_desc = curated[0]
+        if not first_desc:
+            curated[0] = (first_id, "recommended")
+    if _credential_fingerprint("openrouter") != fp:
+        return unavailable()
+    result = CatalogModelIds(curated, source="live", freshness="fresh",
+                             updated_at=time.time(), authoritative=True)
+    _openrouter_catalog_cache = CatalogModelIds(curated, **result.catalog_status)
+    _openrouter_catalog_cache.credential_scope = fp
+    return result
 
 
 def model_ids(*, force_refresh: bool = False) -> list[str]:
     """Return just the OpenRouter model-id strings."""
-    return [mid for mid, _ in fetch_openrouter_models(force_refresh=force_refresh)]
+    catalog = fetch_openrouter_models(force_refresh=force_refresh)
+    return CatalogModelIds([mid for mid, _ in catalog],
+                           **getattr(catalog, "catalog_status", _unknown_catalog_status()))
 
 
 def get_curated_nous_model_ids() -> list[str]:
@@ -2121,8 +2138,9 @@ def get_curated_nous_model_ids() -> list[str]:
     except Exception:
         remote = None
     if remote:
-        return list(remote)
-    return list(_PROVIDER_MODELS.get("nous", []))
+        return CatalogModelIds(remote, source="curated", freshness="unknown")
+    return CatalogModelIds(_PROVIDER_MODELS.get("nous", []), source="curated",
+                           freshness="unknown", degraded=True)
 
 
 def _ai_gateway_model_is_free(pricing: Any) -> bool:
@@ -3062,7 +3080,8 @@ def probe_ollama_local_models(
     if cached is not None:
         cached_models, cached_at = cached
         if time.monotonic() - cached_at < _OLLAMA_LOCAL_MODELS_CACHE_TTL:
-            return list(cached_models)
+            return CatalogModelIds(cached_models, source="cache", freshness="fresh", authoritative=True,
+                                   updated_at=time.time() - (time.monotonic() - cached_at))
     failed_at = _OLLAMA_LOCAL_PROBE_FAILURE_CACHE.get(failure_key)
     if failed_at is not None:
         if time.monotonic() - failed_at < _OLLAMA_LOCAL_PROBE_FAILURE_TTL:
@@ -3135,7 +3154,7 @@ def probe_ollama_local_models(
         cache_key,
         (tuple(models), time.monotonic()),
     )
-    return models
+    return _live_catalog(models)
 
 
 def fetch_ollama_local_models(
@@ -3872,6 +3891,20 @@ def _openai_discovery_base_url(provider: str) -> str:
 
 
 def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) -> list[str]:
+    """List-compatible projection of discovery with explicit provenance.
+
+    Legacy adapters lacking a result contract remain unknown; a nonempty list
+    alone never witnesses a fresh catalog or authorizes cache replacement.
+    """
+    result = _discover_provider_model_ids(provider, force_refresh=force_refresh)
+    if not _valid_model_ids(result):
+        return CatalogModelIds([], source="discovery", freshness="unknown", degraded=True)
+    if isinstance(result, CatalogModelIds):
+        return result
+    return CatalogModelIds(result, **_unknown_catalog_status())
+
+
+def _discover_provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) -> list[str]:
     """Return the best known model catalog for a provider.
 
     Tries live API endpoints for providers that support them (Codex, Nous),
@@ -3896,11 +3929,8 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
                 native_models = fetch_ollama_local_models(base_url, headers=headers)
             else:
                 native_models = fetch_ollama_local_models(base_url)
-            native_key = _ollama_probe_cache_key(
-                _root_for_ollama_native_api(base_url), headers or None
-            )
-            if native_models or _OLLAMA_LOCAL_PROBE_REACHABLE.get(native_key) is True:
-                return native_models or []
+            if native_models is not None:
+                return native_models
         else:
             # Non-native Ollama-compatible endpoints (including Ollama Cloud)
             # retain the generic OpenAI-compatible catalog path.
@@ -3922,7 +3952,9 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
             fallback_base,
             headers=fallback_headers or None,
         )
-        return fallback_models or []
+        if _valid_model_ids(fallback_models):
+            return _live_catalog(fallback_models)
+        return CatalogModelIds([], source="discovery", freshness="unknown", degraded=True)
 
     normalized = normalize_provider(provider)
     if normalized == "openrouter":
@@ -3955,12 +3987,19 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
     if normalized == "nous":
         # Try live Nous Portal /models endpoint
         try:
-            from hermes_cli.auth import fetch_nous_models, resolve_nous_runtime_credentials
+            from hermes_cli.auth import resolve_nous_runtime_credentials
             creds = resolve_nous_runtime_credentials()
             if creds:
-                live = fetch_nous_models(api_key=creds.get("api_key", ""), inference_base_url=creds.get("base_url", ""))
-                if live:
-                    return live
+                # Parse at the discovery owner: the legacy auth helper flattens
+                # malformed payloads and successful empty catalogs into [].
+                live = fetch_api_models(creds.get("api_key", ""), creds.get("base_url", ""))
+                if _valid_model_ids(live):
+                    live = [mid for mid in live if "hermes" not in mid.lower()]
+                    def priority(mid):
+                        low = mid.lower()
+                        return (0 if "opus" in low else 1 if "pro" in low and "sonnet" not in low
+                                else 3 if "sonnet" in low else 2, mid)
+                    return _live_catalog(sorted(dict.fromkeys(live), key=priority))
         except Exception:
             pass
         # Live failed (or no creds). Fall back to the docs-hosted manifest
@@ -3968,7 +4007,7 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
         # added Portal models still surface without a Hermes release.
         manifest_ids = get_curated_nous_model_ids()
         if manifest_ids:
-            return manifest_ids
+            return CatalogModelIds(manifest_ids, source="curated", freshness="unknown", degraded=True)
     if normalized == "stepfun":
         try:
             from hermes_cli.auth import resolve_api_key_provider_credentials
@@ -3978,8 +4017,8 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
             base_url = str(creds.get("base_url") or "").strip()
             if api_key and base_url:
                 live = fetch_api_models(api_key, base_url)
-                if live:
-                    return live
+                if _valid_model_ids(live):
+                    return _live_catalog(live)
         except Exception:
             pass
     if normalized == "anthropic":
@@ -3995,9 +4034,11 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
             base_url=cfg_base_url or None,
             api_key=cfg_api_key or None,
         )
-        if live:
+        if _valid_model_ids(live):
             if cfg_base_url:
-                return live
+                return _live_catalog(live)
+            if not live:
+                return _live_catalog([])
             # The live /v1/models dump lags newly-routed curated aliases
             # (e.g. claude-fable-5, which is reachable on Anthropic before it
             # is enumerated by the models endpoint). Surface curated entries
@@ -4010,8 +4051,10 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
                 if m.lower() not in merged_lower:
                     merged.append(m)
                     merged_lower.add(m.lower())
-            return merged
-        return list(_PROVIDER_MODELS.get("anthropic", []))
+            # Curated aliases intentionally extend the official live dump.
+            return CatalogModelIds(merged, source="live+curated", freshness="unknown")
+        return CatalogModelIds(_PROVIDER_MODELS.get("anthropic", []), source="curated",
+                               freshness="unknown", degraded=True)
     if normalized == "ai-gateway":
         live = _fetch_ai_gateway_models()
         if live:
@@ -4026,7 +4069,9 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
         if live:
             return live
     if normalized in ("openai", "openai-api"):
-        api_key = _get_secret("OPENAI_API_KEY", "").strip()
+        model_cfg = _get_model_config_dict()
+        same_provider = normalize_provider(model_cfg.get("provider")) == normalized
+        api_key = (str(model_cfg.get("api_key") or "").strip() if same_provider else "") or _get_secret("OPENAI_API_KEY", "").strip()
         if api_key:
             base = _openai_discovery_base_url(normalized)
             # Custom OpenAI-compatible endpoints (proxies, gateways, self-hosted)
@@ -4042,21 +4087,17 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
 
             is_default_openai = is_official_openai_host(base)
             try:
-                live = fetch_api_models(api_key, base)
-                if live:
+                mode = model_cfg.get("api_mode") if same_provider else None
+                live = fetch_api_models(api_key, base, api_mode=mode)
+                if _valid_model_ids(live):
                     if is_default_openai:
-                        live_lower = {m.lower() for m in live}
+                        live_ids = set(live)
                         curated = list(_PROVIDER_MODELS.get(normalized, []))
                         # Keep curated order; only surface curated models the
                         # account actually has access to.
-                        filtered = [m for m in curated if m.lower() in live_lower]
-                        if filtered:
-                            return filtered
-                        # Account serves none of the curated models (rare —
-                        # e.g. org without GPT-5 access). Fall back to curated
-                        # so the picker still offers sane defaults.
-                        return curated or live
-                    return live
+                        filtered = [m for m in curated if m in live_ids]
+                        return _live_catalog(filtered)
+                    return _live_catalog(live)
             except Exception:
                 pass
     if normalized == "gmi":
@@ -4068,8 +4109,8 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
             base_url = str(creds.get("base_url") or "").strip()
             if api_key and base_url:
                 live = fetch_api_models(api_key, base_url)
-                if live:
-                    return live
+                if _valid_model_ids(live):
+                    return _live_catalog(live)
         except Exception:
             pass
     if normalized == "custom":
@@ -4085,8 +4126,8 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
             )
             api_mode = "anthropic_messages" if _base_url_looks_like_anthropic_messages(base_url) else None
             live = fetch_api_models(api_key, base_url, api_mode=api_mode)
-            if live:
-                return live
+            if _valid_model_ids(live):
+                return _live_catalog(live)
     # Bedrock uses live discovery keyed by the resolved AWS region so that
     # EU/AP users see eu.*/ap.* model IDs instead of the static us.* list.
     # Note: early return intentionally skips _MODELS_DEV_PREFERRED merge
@@ -4196,7 +4237,7 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
                     return live
             # Use profile's fallback_models if defined
             if _p.fallback_models:
-                return list(_p.fallback_models)
+                return CatalogModelIds(_p.fallback_models, source="curated", freshness="unknown", degraded=True)
     except Exception:
         pass
 
@@ -4204,9 +4245,9 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
     if normalized in _MODELS_DEV_PREFERRED:
         merged = _merge_with_models_dev(normalized, curated_static)
         if normalized in {"xai", "xai-oauth"}:
-            return _xai_finalize_catalog(merged)
-        return merged
-    return curated_static
+            merged = _xai_finalize_catalog(merged)
+        return CatalogModelIds(merged, source="curated+models.dev", freshness="unknown", degraded=True)
+    return CatalogModelIds(curated_static, source="curated", freshness="unknown", degraded=True)
 
 
 # ---------------------------------------------------------------------------
@@ -4225,8 +4266,8 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
 #     normally reads. Swap your OPENAI_API_KEY and the entry invalidates.
 #   - 1h TTL by default. `force_refresh=True` skips the cache entirely
 #     and overwrites it on success.
-#   - Only NON-EMPTY results are cached. An empty/None response from a
-#     transient network error never gets pinned.
+#   - Only validated authoritative live results replace a cache entry,
+#     including successful empty catalogs. Offline fallback never resets age.
 #   - Cache file is best-effort. Any read/write error degrades silently
 #     to a live fetch — the picker keeps working.
 
@@ -4290,34 +4331,21 @@ def _spawn_swr_refresh(cache_key: str, refresh_fn=None) -> None:
         _swr_refresh_inflight.add(cache_key)
 
     def _default_refresh():
+        fp = _credential_fingerprint(cache_key)
         live = provider_model_ids(cache_key, force_refresh=True)
-        if not live and cache_key == "ollama":
-            base_url = _get_ollama_base_url()
-            headers = _get_ollama_native_headers(base_url) or None
-            probe_key = _ollama_probe_cache_key(
-                _root_for_ollama_native_api(base_url), headers
-            )
-            if _OLLAMA_LOCAL_PROBE_REACHABLE.get(probe_key) is True:
-                return {
-                    "fp": _credential_fingerprint(cache_key),
-                    "at": time.time(),
-                    "models": [],
-                }
-        if not live:
+        if _credential_fingerprint(cache_key) != fp:
+            # A request begun under old credentials cannot validate new ones.
             return None
-        return {
-            "fp": _credential_fingerprint(cache_key),
-            "at": time.time(),
-            "models": list(live),
-        }
+        return _provider_cache_entry(live, fp)
 
     def _refresh() -> None:
         try:
             entry = (refresh_fn or _default_refresh)()
-            if entry:
-                cache = _load_provider_models_cache()
-                cache[cache_key] = entry
-                _save_provider_models_cache(cache)
+            if entry and _cache_entry_valid(entry, entry.get("fp"), allow_empty=entry.get("authoritative") is True):
+                with _cache_write_lock:
+                    cache = _load_provider_models_cache()
+                    cache[cache_key] = entry
+                    _save_provider_models_cache(cache)
         except Exception:
             logger.debug("SWR refresh failed for %s", cache_key, exc_info=True)
         finally:
@@ -4352,6 +4380,26 @@ def _credential_fingerprint(provider: str) -> str:
     import os as _os
 
     parts: list[str] = []
+
+    # Bind the existing cache to the active config/secret owner, never to a
+    # second endpoint store. Paths and wire modes are opaque and case-sensitive.
+    from hermes_constants import get_hermes_home
+    parts.append(f"home={get_hermes_home()}")
+    model_cfg = _get_model_config_dict()
+    if normalize_provider(model_cfg.get("provider")) == provider:
+        for key in ("base_url", "api_mode", "api_key", "extra_headers"):
+            parts.append(f"model.{key}={json.dumps(model_cfg.get(key), sort_keys=True)}")
+    provider_cfg = _get_provider_config_dict(provider)
+    parts.append("provider_config=" + json.dumps(provider_cfg, sort_keys=True, default=str))
+    key_env = provider_cfg.get("key_env") or provider_cfg.get("api_key_env")
+    if key_env:
+        parts.append(f"{key_env}={_get_secret(str(key_env), '')}")
+    if provider == "openrouter":
+        # OpenRouter is intentionally absent from PROVIDER_REGISTRY. Its
+        # runtime credential inputs still bind both disk and in-process cache.
+        for name in ("OPENROUTER_API_KEY", "OPENAI_API_KEY"):
+            parts.append(f"{name}={_get_secret(name, '')}")
+        parts.append(f"catalog_endpoint={_OPENROUTER_CATALOG_URL}")
 
     # Env vars from PROVIDER_REGISTRY for this slug
     try:
@@ -4476,16 +4524,17 @@ def update_provider_cache_entry(provider: str, models: list[str]) -> None:
     """
     try:
         normalized = normalize_provider(provider) or (provider or "")
-        if not normalized or not models:
+        if not normalized:
             return
         fp = _credential_fingerprint(normalized)
+        if getattr(models, "credential_scope", None) != fp:
+            return
+        entry = _provider_cache_entry(models, fp)
+        if entry is None:
+            return
         with _cache_write_lock:
             cache = _load_provider_models_cache()
-            cache[normalized] = {
-                "fp": fp,
-                "at": time.time(),
-                "models": list(models),
-            }
+            cache[normalized] = entry
             _save_provider_models_cache(cache)
     except Exception:
         pass
@@ -4499,8 +4548,9 @@ def cached_provider_model_ids(
 ) -> list[str]:
     """Disk-cached wrapper around :func:`provider_model_ids`.
 
-    Hits the cache when fresh; otherwise calls the live function and
-    persists a non-empty result. Always returns a list (never None).
+    Hits the cache when fresh; otherwise discovers and persists only validated,
+    authoritative success. A fallback cannot replace same-scope last-known-good.
+    Always returns a list (never None).
     """
     requested = str(provider or "").strip().lower()
     normalized = requested if requested == "ollama" else (normalize_provider(provider) or (provider or ""))
@@ -4514,62 +4564,45 @@ def cached_provider_model_ids(
     entry = cache.get(normalized)
     now = time.time()
 
-    allow_empty_ollama = normalized == "ollama"
-    if not force_refresh and _cache_entry_valid(entry, fp, allow_empty=allow_empty_ollama):
+    allow_empty = isinstance(entry, dict) and entry.get("authoritative") is True
+    if not force_refresh and _cache_entry_valid(entry, fp, allow_empty=allow_empty):
         age = now - entry["at"]
         if age < ttl_seconds:
-            return list(entry["models"])
-        # Empty native catalogs are authoritative only for the short native
-        # TTL. Re-probe after expiry so newly pulled models become visible;
-        # do not serve an empty row through the generic stale window.
-        if entry["models"] and age < _PROVIDER_MODELS_STALE_SERVE_MAX:
+            return _cached_model_ids(entry)
+        # Native empty catalogs have a short TTL; other authoritative empty
+        # results can use the normal stale window without resurrecting IDs.
+        if (entry["models"] or normalized != "ollama") and age < _PROVIDER_MODELS_STALE_SERVE_MAX:
             # Stale-while-revalidate: serve the expired entry immediately so
             # interactive picker opens never block on serial /v1/models
             # round-trips; refresh the cache off-thread for the next open.
             _spawn_swr_refresh(normalized)
-            return list(entry["models"])
+            return _cached_model_ids(entry, stale=True)
 
     # Cache miss / stale / forced refresh — call the live path.
-    live = provider_model_ids(normalized, force_refresh=force_refresh)
-    if live:
-        cache[normalized] = {
-            "fp": fp,
-            "at": now,
-            "models": list(live),
-        }
-        _save_provider_models_cache(cache)
-        return list(live)
-
-    if normalized == "ollama":
-        base_url = _get_ollama_base_url()
-        headers = _get_ollama_native_headers(base_url) or None
-        probe_key = _ollama_probe_cache_key(
-            _root_for_ollama_native_api(base_url), headers
-        )
-        if _OLLAMA_LOCAL_PROBE_REACHABLE.get(probe_key) is True:
-            # A reachable empty native catalog is authoritative for the short
-            # native TTL; do not resurrect a stale disk catalog.
-            cache[normalized] = {"fp": fp, "at": now, "models": []}
+    try:
+        live = provider_model_ids(normalized, force_refresh=force_refresh)
+    except Exception:
+        live = CatalogModelIds([], source="discovery", freshness="unknown", degraded=True)
+    if _credential_fingerprint(normalized) != fp:
+        return CatalogModelIds([], source="discovery", freshness="unknown", degraded=True)
+    replacement = _provider_cache_entry(live, fp)
+    if replacement is not None:
+        with _cache_write_lock:
+            cache = _load_provider_models_cache()
+            cache[normalized] = replacement
             _save_provider_models_cache(cache)
-            return []
+        result = CatalogModelIds(live, **live.catalog_status)
+        result.credential_scope = fp
+        return result
 
-        # A failed/non-native probe is not authoritative. Preserve a stale
-        # catalog rather than blanking the picker during a transient outage.
-        if (
-            isinstance(entry, dict)
-            and entry.get("fp") == fp
-            and isinstance(entry.get("models"), list)
-            and entry["models"]
-        ):
-            return list(entry["models"])
-        return []
-
-    # Live fetch returned nothing. If we have a stale entry with the
+    # Discovery did not witness authoritative success. If we have an entry with the
     # SAME fingerprint, prefer it over an empty result — stale data
     # beats no data when the network is flaky.
-    if _cache_entry_valid(entry, fp):
-        return list(entry["models"])
-    return list(live or [])
+    if _cache_entry_valid(entry, fp, allow_empty=allow_empty):
+        return _cached_model_ids(entry, stale=True, degraded=True)
+    if _valid_model_ids(live):
+        return CatalogModelIds(live, **getattr(live, "catalog_status", _unknown_catalog_status()))
+    return CatalogModelIds([], source="discovery", freshness="unknown", degraded=True)
 
 
 def clear_provider_models_cache(provider: Optional[str] = None) -> None:
@@ -4705,7 +4738,10 @@ def _fetch_anthropic_models(
                     raise
             else:
                 raise
-        models = [m["id"] for m in data.get("data", []) if m.get("id")]
+        items = data.get("data") if isinstance(data, dict) else None
+        if not _valid_catalog_items(items):
+            return None
+        models = [m["id"] for m in items]
         # Sort: latest/largest first (opus > sonnet > haiku, higher version first)
         return sorted(models, key=lambda m: (
             "opus" not in m,      # opus first
@@ -5851,8 +5887,11 @@ def probe_api_models(
         try:
             with _urlopen_model_catalog_request(req, **_open_kwargs) as resp:
                 data = json.loads(resp.read().decode())
+                items = data.get("data") if isinstance(data, dict) else None
+                if not _valid_catalog_items(items):
+                    raise ValueError("invalid model catalog")
                 return {
-                    "models": [m.get("id", "") for m in data.get("data", [])],
+                    "models": [item["id"] for item in items],
                     "probed_url": url,
                     "resolved_base_url": candidate_base.rstrip("/"),
                     "suggested_base_url": alternate_base if alternate_base != candidate_base else normalized,
@@ -6167,6 +6206,64 @@ def _custom_endpoint_fingerprint(
     return hashlib.blake2b(blob, digest_size=8).hexdigest()
 
 
+class CatalogModelIds(list[str]):
+    """List-compatible discovery result carrying witnessed cache provenance.
+
+    No second cache: metadata follows the existing cache owner's result and
+    survives picker truncation. Legacy callers still receive a JSON list.
+    """
+
+    def __init__(self, models, *, source, freshness, degraded=False, updated_at=None, authoritative=False):
+        super().__init__(models)
+        self.catalog_status = {"source": source, "freshness": freshness,
+                               "degraded": degraded, "updated_at": updated_at, "authoritative": authoritative}
+
+    def __getitem__(self, key):
+        value = super().__getitem__(key)
+        return CatalogModelIds(value, **self.catalog_status) if isinstance(key, slice) else value
+
+
+def _valid_model_ids(value):
+    return isinstance(value, list) and all(isinstance(mid, str) and mid.strip() for mid in value)
+
+
+def _valid_catalog_items(value):
+    return isinstance(value, list) and all(
+        isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"].strip()
+        for item in value
+    )
+
+
+def _unknown_catalog_status():
+    return dict(source="discovery", freshness="unknown", degraded=False,
+                authoritative=False, updated_at=None)
+
+
+def _live_catalog(ids):
+    return CatalogModelIds(ids, source="live", freshness="fresh",
+                           authoritative=True, updated_at=time.time())
+
+
+def _provider_cache_entry(ids, fp):
+    """Admission requires validated IDs and a witnessed authoritative success."""
+    status = getattr(ids, "catalog_status", {})
+    if (not _valid_model_ids(ids) or status.get("authoritative") is not True
+            or status.get("freshness") != "fresh" or status.get("degraded") is not False
+            or status.get("source") != "live"):
+        return None
+    entry = dict(fp=fp, at=status.get("updated_at"), models=list(ids),
+                 authoritative=True, catalog_status=dict(status))
+    return entry if _cache_entry_valid(entry, fp, allow_empty=True) else None
+
+
+def _cached_model_ids(entry, *, stale=False, degraded=False):
+    result = CatalogModelIds(entry["models"], source="cache",
+                             freshness="stale" if stale else "fresh" if entry.get("authoritative") is True else "unknown",
+                             degraded=degraded, updated_at=entry["at"])
+    result.catalog_status["authoritative"] = entry.get("authoritative") is True
+    return result
+
+
 def _cache_entry_valid(
     entry: Any,
     fp: str,
@@ -6185,9 +6282,20 @@ def _cache_entry_valid(
         and entry.get("fp") == fp
         and isinstance(entry.get("models"), list)
         and (allow_empty or bool(entry["models"]))
+        and all(isinstance(model, str) and model.strip() for model in entry["models"])
         and isinstance(entry.get("at"), (int, float))
+        and 0 <= entry["at"] < float("inf")
         and not isinstance(entry.get("at"), bool)
     )
+
+
+def model_catalog_endpoint_identity(base_url: Optional[str]) -> str:
+    """Normalize scheme/host while preserving case-sensitive path/query."""
+    from urllib.parse import urlsplit, urlunsplit
+
+    parsed = urlsplit(str(base_url or "").strip().rstrip("/"))
+    return urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(),
+                      parsed.path, parsed.query, parsed.fragment))
 
 
 def cached_fetch_api_models(
@@ -6220,7 +6328,7 @@ def cached_fetch_api_models(
     block on a stopped local endpoint) use this so a warm catalog still
     reaches the picker instead of collapsing to the config-declared subset.
     """
-    normalized_url = str(base_url or "").strip().rstrip("/").lower()
+    normalized_url = model_catalog_endpoint_identity(base_url)
     if not normalized_url:
         if cache_only:
             return None
@@ -6235,22 +6343,23 @@ def cached_fetch_api_models(
     cache = _load_provider_models_cache()
     entry = cache.get(cache_key)
     now = time.time()
+    allow_empty = isinstance(entry, dict) and entry.get("authoritative") is True
 
     if cache_only:
         # Same trust window as the stale-while-revalidate tier below, minus
         # the revalidation: an entry this side of the bound is good enough to
         # render, and anything older is treated as a miss so the caller falls
         # back to its configured list rather than showing a stale catalog.
-        if force_refresh or not _cache_entry_valid(entry, fp):
+        if force_refresh or not _cache_entry_valid(entry, fp, allow_empty=allow_empty):
             return None
         if now - entry["at"] >= _PROVIDER_MODELS_STALE_SERVE_MAX:
             return None
-        return list(entry["models"])
+        return _cached_model_ids(entry, stale=now - entry["at"] >= ttl_seconds)
 
-    if not force_refresh and _cache_entry_valid(entry, fp):
+    if not force_refresh and _cache_entry_valid(entry, fp, allow_empty=allow_empty):
         age = now - entry["at"]
         if age < ttl_seconds:
-            return list(entry["models"])
+            return _cached_model_ids(entry)
         if age < _PROVIDER_MODELS_STALE_SERVE_MAX:
             # Stale-while-revalidate: serve the expired entry immediately so
             # picker opens never block on a live /v1/models round-trip
@@ -6261,26 +6370,26 @@ def cached_fetch_api_models(
                     api_key, base_url,
                     timeout=timeout, api_mode=api_mode, headers=headers,
                 )
-                if not live:
+                if not _valid_model_ids(live):
                     return None
-                return {"fp": fp, "at": time.time(), "models": list(live)}
+                return {"fp": fp, "at": time.time(), "models": list(live), "authoritative": True}
 
             _spawn_swr_refresh(cache_key, _refresh_custom)
-            return list(entry["models"])
+            return _cached_model_ids(entry, stale=True)
 
     live = fetch_api_models(
         api_key, base_url, timeout=timeout, api_mode=api_mode, headers=headers
     )
-    if live:
-        cache[cache_key] = {"fp": fp, "at": now, "models": list(live)}
+    if _valid_model_ids(live):
+        cache[cache_key] = {"fp": fp, "at": now, "models": list(live), "authoritative": True}
         _save_provider_models_cache(cache)
-        return list(live)
+        return CatalogModelIds(live, source="live", freshness="fresh", updated_at=now, authoritative=True)
 
     # Live fetch returned nothing (offline endpoint, timeout, auth hiccup).
     # A stale same-fingerprint entry beats an empty result.
-    if _cache_entry_valid(entry, fp):
-        return list(entry["models"])
-    return live
+    if _cache_entry_valid(entry, fp, allow_empty=allow_empty):
+        return _cached_model_ids(entry, stale=True, degraded=True)
+    return None
 
 
 # ---------------------------------------------------------------------------

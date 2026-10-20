@@ -1,5 +1,7 @@
 """Revalidate canonical checkpoints when a queued goal turn actually starts."""
 
+import json
+
 import pytest
 
 from hermes_cli import goals
@@ -57,9 +59,16 @@ def test_consumer_revalidates_checkpoint_after_enqueue(pending, field, value):
     restarted = goals.GoalManager(manager.session_id)
     assert restarted.start_continuation(**identity) is False
     assert restarted.state is not None
-    assert db.get_meta(goals._meta_key(manager.session_id)) == before
-    assert restarted.state.continuation_pending is True
-    assert restarted.state.outcome == goals.CONTINUATION_REQUIRED
+    persisted = goals.GoalState.from_json(db.get_meta(goals._meta_key(manager.session_id)))
+    if field in {"goal_id", "checkpoint_revision", "outcome"}:
+        assert persisted.status == "paused"
+        assert persisted.continuation_pending is False
+        assert persisted.checkpoint == json.loads(before)["checkpoint"]
+    else:
+        assert db.get_meta(goals._meta_key(manager.session_id)) == before
+    if field not in {"goal_id", "checkpoint_revision", "outcome"}:
+        assert restarted.state.continuation_pending is True
+        assert restarted.state.outcome == goals.CONTINUATION_REQUIRED
 
 
 @pytest.mark.parametrize("damage", ["missing-checkpoint", "wrong-token-reason", "invalid-uuid"])

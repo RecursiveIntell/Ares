@@ -43,7 +43,7 @@ def input_response_publication_scope(db, holder, phase_id, attempt_id, content):
 
 
 class SessionContextInputTurnsMixin:
-    def _context_input_stop_cut_on_conn(self, conn, root):
+    def _context_input_stop_cut_on_conn(self, conn, root, *, require_sequence_cut=False):
         row = conn.execute("SELECT value FROM state_meta WHERE key=?",
             ("context-control:" + root,)).fetchone()
         if row is None:
@@ -52,6 +52,8 @@ class SessionContextInputTurnsMixin:
         if type(control) is dict and control.get("schema") == "SessionDBContextControlV1":
             # No receipt cut in V1; its existing transcript watermark still
             # gates dispatch. Never invent a sequence for a legacy record.
+            if require_sequence_cut:
+                raise ContextContinuationError("CONTEXT_INPUT_STOP_UNCONFIRMED")
             return None
         if not _valid_context_stop_v2(control):
             raise ContextContinuationError("CONTEXT_INPUT_STOP_UNCONFIRMED")

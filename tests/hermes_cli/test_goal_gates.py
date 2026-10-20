@@ -191,8 +191,8 @@ def test_passing_gates_fall_through_to_judge_once():
 
 def test_gate_retry_exhaustion_pauses_goal():
     mgr = _mgr_with_goal("gate-exhaust-sid")
-    mgr.add_gate("exit 1")
-    mgr.state.gates[0].max_retries = 2
+    mgr.add_gate("exit 1", max_retries=2)
+    assert load_goal(mgr.session_id).gates[0].max_retries == 2
     with patch("hermes_cli.goals.judge_goal") as mock_judge, \
          patch("hermes_cli.goals.workspace_fingerprint", return_value=""):
         d1 = mgr.evaluate_after_turn("attempt one")
@@ -205,6 +205,13 @@ def test_gate_retry_exhaustion_pauses_goal():
     assert d3["should_continue"] is False
     assert mgr.state.status == "paused"
     assert "gate" in (mgr.state.paused_reason or "")
+    persisted = GoalManager(mgr.session_id)
+    assert persisted.state.status == "paused"
+    assert persisted.state.outcome == "GOAL_PAUSED"
+    assert persisted.state.gates[0].attempts == 3
+    assert persisted.state.continuation_pending is False
+    assert persisted.validate_checkpoint()[0]
+    assert persisted.claim_continuation("after-retry-exhaustion") is False
 
 
 def test_unchanged_workspace_skips_rerun():

@@ -15508,7 +15508,31 @@ def test_model_options_does_not_overwrite_curated_models(monkeypatch):
     # list_authenticated_providers is the single source.
     assert listing.call_count == 1
     assert listing.call_args.kwargs["probe_custom_providers"] is False
-    assert listing.call_args.kwargs["probe_current_custom_provider"] is True
+    # Normal opens never probe live, including the current custom provider —
+    # offline saved endpoints must not block the picker on any network round
+    # trip (not just non-current ones). Only an explicit refresh probes.
+    assert listing.call_args.kwargs["probe_current_custom_provider"] is False
+
+
+def test_model_options_refresh_still_probes_custom_providers(monkeypatch):
+    """Normal opens never probe live (RG06 fix, 2026-10-14), but an explicit
+    refresh must still probe every custom provider including the current
+    one — otherwise an offline saved endpoint would silently stay stale
+    forever with no way for the user to force a live recheck."""
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {"providers": {}, "custom_providers": []},
+    )
+    with patch(
+        "hermes_cli.model_switch.list_authenticated_providers",
+        return_value=[],
+    ) as listing:
+        resp = server._methods["model.options"](98, {"session_id": "", "refresh": True})
+    assert "result" in resp, resp
+    assert listing.call_count == 1
+    assert listing.call_args.kwargs["probe_custom_providers"] is True
+    assert listing.call_args.kwargs["refresh"] is True
 
 
 def test_model_options_propagates_list_exception(monkeypatch):
@@ -18005,6 +18029,7 @@ def test_close_session_by_id_is_idempotent_and_full(monkeypatch):
         # slash-worker; mirror that here so the test exercises the actual
         # teardown contract (worker close lives in finalize, not the caller).
         calls["finalize"] += 1
+        s["_finalized"] = True
         w = s.get("slash_worker")
         if w:
             w.close()

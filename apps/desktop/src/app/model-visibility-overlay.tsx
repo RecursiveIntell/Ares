@@ -22,12 +22,13 @@ export function ModelVisibilityOverlay({ gateway, onOpenProviders, profile }: Mo
 
   return (
     <ModelVisibilityDialog
+      connectionId={open ? open.connectionId : undefined}
       gw={gateway}
       onOpenChange={setModelVisibilityOpen}
       onOpenProviders={onOpenProviders}
-      open={open}
-      profile={profile}
-      sessionId={activeSessionId}
+      open={Boolean(open)}
+      profile={open ? open.profile ?? profile : profile}
+      sessionId={open ? open.sessionId ?? null : activeSessionId}
     />
   )
 }

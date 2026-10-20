@@ -497,10 +497,8 @@ def test_user_defined_rows_carry_alias_set_for_gui_current_match():
     assert "aliases" not in by_slug["nous"]
 
 
-def test_aggregator_dedup_removes_overlapping_models():
-    """Models served by a user-defined provider are removed from
-    aggregator rows so the picker doesn't show them under the wrong
-    provider.  (#45954)"""
+def test_aggregator_keeps_independent_overlapping_routes():
+    """Model names shared with a proxy do not replace aggregator routes."""
     rows = [
         _user_provider_row("litellm-proxy", [
             "nvidia/nim/minimax-m3",
@@ -522,11 +520,11 @@ def test_aggregator_dedup_removes_overlapping_models():
     # User-defined provider keeps all its models
     assert proxy_row["models"] == ["nvidia/nim/minimax-m3", "nvidia/nim/kimi-k2.6"]
 
-    # Aggregator lost the overlapping model but kept the rest
-    assert "nvidia/nim/minimax-m3" not in or_row["models"]
+    # Each provider is an independent selectable route.
+    assert "nvidia/nim/minimax-m3" in or_row["models"]
     assert "minimax/minimax-m3" in or_row["models"]
     assert "anthropic/claude-sonnet-4.6" in or_row["models"]
-    assert or_row["total_models"] == 2
+    assert or_row["total_models"] == 3
 
 
 
@@ -566,8 +564,8 @@ def test_flat_namespace_reseller_keeps_first_party_models_overlapping_user_proxy
     ]
     assert go_row["total_models"] == 6
 
-    # A TRUE routing aggregator is still deduped against the user's models.
-    assert "minimax-m3" not in or_row["models"]
+    # Routing aggregators also keep independent routes.
+    assert "minimax-m3" in or_row["models"]
     assert "anthropic/claude-sonnet-4.6" in or_row["models"]
 
 
@@ -626,16 +624,15 @@ def test_build_models_payload_forwards_refresh_flag():
     assert captured["refresh"] is True
 
 
-def test_list_authenticated_providers_refresh_busts_cache():
-    """refresh=True clears the provider-model disk cache exactly once;
-    refresh=False leaves it untouched (so normal picker opens stay snappy)."""
+def test_list_authenticated_providers_refresh_preserves_cache():
+    """Refresh leaves validated catalogs in place until replacement succeeds."""
     from hermes_cli import model_switch
 
     with patch("hermes_cli.models.clear_provider_models_cache") as clear:
         model_switch.list_authenticated_providers(refresh=False)
         assert clear.call_count == 0
         model_switch.list_authenticated_providers(refresh=True)
-        assert clear.call_count == 1
+        assert clear.call_count == 0
 
 
 # ─── _apply_featured (one-flagship-per-lab shortlist) ──────────────────
