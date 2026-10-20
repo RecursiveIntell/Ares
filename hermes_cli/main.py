@@ -6913,24 +6913,9 @@ def _write_desktop_build_stamp(project_root: Path, *, source_mode: bool) -> None
 
 def _desktop_packaged_executable(desktop_dir: Path) -> Optional[Path]:
     """Return the current platform's unpacked Electron app executable."""
-    release_dir = desktop_dir / "release"
-    if sys.platform == "darwin":
-        candidates = list(release_dir.glob("mac*/Hermes.app/Contents/MacOS/Hermes"))
-    elif sys.platform == "win32":
-        candidates = [
-            release_dir / "win-unpacked" / "Hermes.exe",
-            release_dir / "win-ia32-unpacked" / "Hermes.exe",
-            release_dir / "win-arm64-unpacked" / "Hermes.exe",
-        ]
-    else:
-        candidates = [
-            release_dir / "linux-unpacked" / "hermes",
-            release_dir / "linux-unpacked" / "Hermes",
-            release_dir / "linux-arm64-unpacked" / "hermes",
-            release_dir / "linux-arm64-unpacked" / "Hermes",
-        ]
+    from hermes_cli.desktop_package import packaged_executables
 
-    existing = [p for p in candidates if p.exists()]
+    existing = packaged_executables(desktop_dir, sys.platform)
     if not existing:
         return None
     if sys.platform == "win32" and len(existing) > 1:
@@ -12260,6 +12245,7 @@ def cmd_dashboard(args):
         headless=_headless_backend,
         ssh_session_token=_ssh_session_token,
         ssh_owner_nonce=_ssh_owner_nonce,
+        print_launch_url=getattr(args, "print_launch_url", False),
     )
 
 
@@ -14585,6 +14571,8 @@ def main():
     # profile command  (parser built in hermes_cli/subcommands/profile.py)
     # =========================================================================
     build_profile_parser(subparsers, cmd_profile=cmd_profile)
+    from hermes_cli.context_authority import build_context_authority_parser
+    build_context_authority_parser(subparsers)
 
     # =========================================================================
     # completion command

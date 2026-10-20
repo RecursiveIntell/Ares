@@ -1,0 +1,12 @@
+{
+  ".github/workflows/context-continuity-qualification.yml": "cb201cbcec2009e7f2743551bc6fe3165cc1f2736c38c5ef777d420554d1cb65",
+  "agent/run_checkpoint_custody.py": "92ce34d6041aa4a6eaaec43641f6daa679bb7b76b234ec85aba340c547d757af",
+  "ares_runtime/continuity/runtime.py": "89db184cd279962327f69f8d774dab7eff88f6c40058bc4851bbf507020c1a3b",
+  "hermes_state_continuity.py": "03e2dcb4a4792ef7fd0a62cba4e6777cacf2007f4cee218ba8cc0489fde2c890",
+  "hermes_state_runs.py": "e5733f61661e0ca467893c4bfa0920e53fa0b7d88d59d285f170d28a6d884213",
+  "scripts/run_checkpoint_claim.py": "a7fe9a6d0f16e5929470be9223931ffb423160b90954cc6b5c3b8d1c4850921e",
+  "tests/ares_runtime/test_context_rebase_state.py": "83b4fbb87271619c8c94464bf26a0f8e0fd9b02b0e6069b94fa1425025f9ea03",
+  "tests/tui_gateway/test_goal_command.py": "a9aa74fc25de2e832f59fb0c307db7baf6d24bd87ad4203826760cba8a78b9b2",
+  "tests/tui_gateway/test_run_checkpoint_claim_rpc.py": "50aea3d2b496ca531e4dfc383663f44d608660afea8ad11eb2cdeb31fb65349f",
+  "tests/test_run_custody_cold_recovery.py": "f2ec44bdc13fe1e20b849b516c5f989088b25b22c4c30464e843060cae17511e"
+}

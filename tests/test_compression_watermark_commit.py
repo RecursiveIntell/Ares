@@ -11,6 +11,8 @@ lease was reclaimed cannot publish a stale compaction.
 from __future__ import annotations
 
 import json
+import copy
+import sys
 import sqlite3
 import threading
 import time
@@ -38,6 +40,13 @@ SUMMARY = [
     {"role": "user", "content": "[CONTEXT COMPACTION] summary of turns 0-5"},
     {"role": "assistant", "content": "Continuing from the summary."},
 ]
+
+
+@pytest.fixture(autouse=True)
+def fresh_summary(monkeypatch):
+    # Successful native writes publish row coordinates onto caller dictionaries.
+    # Each test owns another database, so it must start with fresh unbound rows.
+    monkeypatch.setattr(sys.modules[__name__], "SUMMARY", copy.deepcopy(SUMMARY))
 
 
 class TestWatermarkCommit:

@@ -28,6 +28,7 @@ def fake_session(monkeypatch):
 
     def fake_run_turn(self, user_input: str, **kwargs):
         return TurnResult(
+            completed=True, terminal_status="completed",
             final_text=f"echo: {user_input}",
             projected_messages=[
                 {"role": "assistant", "content": None,
@@ -89,6 +90,7 @@ class TestRunConversationCodexPath:
     def test_codex_app_server_token_usage_updates_session_accounting(self, monkeypatch):
         def fake_run_turn(self, user_input: str, **kwargs):
             return TurnResult(
+                completed=True, terminal_status="completed",
                 final_text="done",
                 projected_messages=[{"role": "assistant", "content": "done"}],
                 turn_id="turn-usage-1",
@@ -139,6 +141,7 @@ class TestRunConversationCodexPath:
     def test_native_codex_compaction_updates_bookkeeping(self, monkeypatch):
         def fake_run_turn(self, user_input: str, **kwargs):
             return TurnResult(
+                completed=True, terminal_status="completed",
                 final_text="done",
                 projected_messages=[{"role": "assistant", "content": "done"}],
                 turn_id="turn-compact-1",
@@ -271,6 +274,7 @@ class TestRunConversationCodexPath:
         # (matching the default skill threshold).
         def fake_run_turn(self, user_input: str, **kwargs):
             return TurnResult(
+                completed=True, terminal_status="completed",
                 final_text=f"echo: {user_input}",
                 projected_messages=[
                     {"role": "assistant", "content": f"echo: {user_input}"},
@@ -361,6 +365,7 @@ class TestRunConversationCodexPath:
 
         def fake_run_turn(self, user_input: str, **kwargs):
             return TurnResult(
+                completed=True, terminal_status="completed",
                 final_text="ok",
                 projected_messages=[{"role": "assistant", "content": "ok"}],
                 turn_id="turn-stub-1",
@@ -390,6 +395,7 @@ class TestRunConversationCodexPath:
 
         def fake_run_turn(self, user_input: str, **kwargs):
             return TurnResult(
+                completed=True, terminal_status="completed",
                 final_text="ok",
                 projected_messages=[{"role": "assistant", "content": "ok"}],
                 turn_id="turn-stub-1",
@@ -771,7 +777,7 @@ class TestCodexToolProgressBridge:
             if on_event:
                 on_event({"method": "item/started", "params": {"item": {
                     "type": "commandExecution", "command": "pytest", "cwd": "/repo"}}})
-            return TurnResult(final_text="done", projected_messages=[
+            return TurnResult(completed=True, terminal_status="completed", final_text="done", projected_messages=[
                 {"role": "assistant", "content": "done"}], turn_id="t1", thread_id="th1")
 
         monkeypatch.setattr(CodexAppServerSession, "__init__", fake_init)

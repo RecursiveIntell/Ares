@@ -1,0 +1,35 @@
+{
+  "schema": "ares.context-authority-source-audit/v1",
+  "stage": "audit@post",
+  "status": "degraded",
+  "finding_ids": [],
+  "closed_findings": [
+    "CA-1 legacy consumed obligation inventory",
+    "CA-2 native history/projection consistency",
+    "CA-3 durable approval-verifier rotation across live daemons"
+  ],
+  "source_commit": "5105d4e85d05ed9aacd12680d4209f98a196fef9",
+  "source_tree": "a25164902f862efb28a798e175212541d9f39e4e",
+  "audited_files": {
+    "crates/recursive-agent-policy/src/context_authority.rs": "57f91cb8354c3145b96a3929419057d7aa316dd42100a4ecfae18809812c6d86",
+    "crates/recursive-agent-policy/tests/context_authority.rs": "9fd292347abb5a5cbb0f83e2cd6ce8f06b27f78fc8e5be3b0d99567d002b244b",
+    "crates/recursive-agent-runner/src/runtime.rs": "861460db9393af5f7d5eced0b9cef76a26241d78b1bfa56b75a8b7b9a827fd3b",
+    "crates/recursive-agent-daemon/src/protocol.rs": "0543e983d62f5dfa225c74880ed3bb77d702405877df972622390b316f003a99",
+    "crates/recursive-agent-daemon/src/server.rs": "b28d7b2b11b6ad579d0326f02d3fbcb435615ab539812c62af3cd11390f1d05d",
+    "crates/recursive-agent-daemon/src/bin/ra-daemon.rs": "3a7319fa9556b54a4fd746258e8c75ba6ce818454eb60e3338556abdb60bd745",
+    "crates/recursive-agent-daemon/tests/ipc_runtime.rs": "fe30524304b60b101433bfad3085d346885559df5ff35ebab72ee3691500e391"
+  },
+  "native_checks": {
+    "fmt": "passed",
+    "clippy_all_targets": "passed",
+    "runtime": "passed hosted exact candidate: run36154571672/job108135872634",
+    "first_hosted_policy_scope_tests": "13 passed, zero failures",
+    "first_hosted_daemon_result": "one new test fixture failure: duplicate request ID, repaired"
+  },
+  "coverage_limits": [
+    "Source review only for new native authority behavior",
+    "No Ares integration or full V4 readiness claim",
+    "Worst-case frame-size and performance bounds not execution-certified"
+  ],
+  "post_audit_delta": "Added public enrolled grant/verifier fields to snapshot; corrected duplicate IPC test correlation IDs. No admission authority widened."
+}

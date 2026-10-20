@@ -1,0 +1,115 @@
+AF_UNIX unavailable: local exclusion tests/tools/test_code_execution.py and five named socket tests. Hosted selection retains all.
+▶ running per-file parallel test suite via run_tests_parallel.py
+  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)
+▶ pre-compiling bytecode cache
+▶ launching test runner
+Discovered 89 test files (~2179 tests) under ['tests/ares_runtime/test_continuity_live.py', 'tests/ares_runtime/test_continuity_dispatch.py', 'tests/ares_runtime/test_continuity_compiler.py', 'tests/ares_runtime/test_continuity_tool_control.py', 'tests/ares_runtime/test_continuity_native_governor.py', 'tests/ares_runtime/test_continuity_snapshot_races.py', 'tests/ares_runtime/test_continuity_progress.py', 'tests/ares_runtime/test_continuity_budget.py', 'tests/ares_runtime/test_continuity_checkpoint.py', 'tests/ares_runtime/test_continuity_recovery.py', 'tests/ares_runtime/test_continuity_rollback.py', 'tests/ares_runtime/test_continuity_runtime.py', 'tests/ares_runtime/test_continuity_input.py', 'tests/ares_runtime/test_continuity_transport_bounds.py', 'tests/ares_runtime/test_context_rebase_state.py', 'tests/ares_runtime/test_managed_calls.py', 'tests/hermes_cli/test_goals.py', 'tests/hermes_cli/test_goal_lifecycle_contract.py', 'tests/test_model_tools.py', 'tests/run_agent/test_message_sequence_repair.py', 'tests/run_agent/test_tool_executor_contextvar_propagation.py', 'tests/hermes_cli/test_heartbeat.py', 'tests/hermes_cli/test_loops.py', 'tests/test_run_checkpoint_import_boundaries.py', 'tests/test_run_checkpoint_owner.py', 'tests/test_run_checkpoint_refresh_storage.py', 'tests/test_run_checkpoint_claim_admission.py', 'tests/test_run_checkpoint_claim_client.py', 'tests/test_run_checkpoint_resume.py', 'tests/test_run_task_custody.py', 'tests/test_run_custody_cold_recovery.py', 'tests/test_run_custody_ready_recovery.py', 'tests/test_run_custody_obligations.py', 'tests/gateway/test_context_input.py', 'tests/gateway/test_context_input_recovery.py', 'tests/ares_runtime/test_context_input_lifetime.py', 'tests/cli/test_quick_commands.py', 'tests/test_estop.py', 'tests/ares_runtime/test_permit_readback.py', 'tests/test_ares_collaboration.py', 'tests/gateway/test_pre_gateway_dispatch.py', 'tests/gateway/test_restart_resume_pending.py', 'tests/gateway/test_multiplex_session_db_profile_scope.py', 'tests/gateway/test_multiplex_adapter_registry.py', 'tests/gateway/test_adapter_startup_secret_scope.py', 'tests/gateway/test_startup_connect_parallel.py', 'tests/gateway/test_run_progress_topics.py', 'tests/gateway/test_42039_duplicate_user_message.py', 'tests/gateway/test_internal_event_never_interrupts_busy_session.py', 'tests/gateway/test_multiplex_busy_input_mode.py', 'tests/gateway/test_platform_base.py', 'tests/gateway/test_base_topic_sessions.py', 'tests/gateway/test_profile_routing.py', 'tests/gateway/test_busy_session_auth_bypass.py', 'tests/gateway/test_busy_session_ack.py', 'tests/state/test_message_copy_mapping.py', 'tests/state/test_message_row_publication.py', 'tests/test_compression_watermark_commit.py', 'tests/state/test_todo_compaction.py', 'tests/run_agent/test_in_place_compaction.py', 'tests/agent/test_micro_compaction.py', 'tests/hermes_state/test_append_messages_batch.py', 'tests/tui_gateway/test_run_checkpoint_claim_rpc.py', 'tests/tui_gateway/test_goal_command.py', 'tests/tui_gateway/test_protocol.py', 'tests/tui_gateway/test_compute_host_phase1.py', 'tests/tui_gateway/test_session_profile_db.py', 'tests/tui_gateway/test_composite_carrier_rewind.py', 'tests/tui_gateway/test_prompt_recovery_contract.py', 'tests/test_turn_run_custody.py', 'tests/tui_gateway/test_inline_rpc_gil_starvation.py', 'tests/tui_gateway/test_kanban_notify_poller.py', 'tests/test_tui_gateway_server.py', 'tests/cli/test_cli_goal_interrupt.py', 'tests/cli/test_cli_async_delegation_delivery.py', 'tests/gateway/test_goal_resume_restart.py', 'tests/agent/test_synthetic_turn_display_kind.py', 'tests/agent/test_turn_context.py', 'tests/run_agent/test_run_agent.py', 'tests/run_agent/test_1630_context_overflow_loop.py', 'tests/run_agent/test_compression_lock_defer.py', 'tests/run_agent/test_streaming.py', 'tests/run_agent/test_run_agent_codex_responses.py', 'tests/run_agent/test_codex_sdk_transform_bypass.py', 'tests/plugins/test_context_governor_release_identity.py', 'tests/plugins/test_context_governor_runtime_closure.py', 'tests/plugins/test_context_governor_key_state_v2.py', 'tests/plugins/test_context_governor_protocol.py', 'tests/plugins/test_context_governor_fd_ownership.py']; running with -j 4
+[  1.7% |    36/~2179 | ✓36 | ✗ 0] ✓ tests/agent/test_micro_compaction.py (36✓, 2.2s)
+[  1.7% |    38/~2179 | ✓38 | ✗ 0] ✓ tests/agent/test_synthetic_turn_display_kind.py (2✓, 3.5s)
+[  2.5% |    54/~2179 | ✓78 | ✗ 0] ✓ tests/ares_runtime/test_continuity_budget.py (40✓, 0.8s)
+[  4.1% |    89/~2179 | ✓119 | ✗  0] ✓ tests/ares_runtime/test_context_rebase_state.py (41✓, 2.1s)
+[  4.8% |   104/~2179 | ✓143 | ✗  0] ✓ tests/agent/test_turn_context.py (24✓, 4.8s)
+[  5.5% |   119/~2179 | ✓170 | ✗  0] ✓ tests/ares_runtime/test_continuity_compiler.py (27✓, 0.6s)
+[  6.1% |   132/~2179 | ✓188 | ✗  0] ✓ tests/ares_runtime/test_context_input_lifetime.py (18✓, 5.1s)
+[  6.6% |   143/~2179 | ✓199 | ✗  0] ✓ tests/ares_runtime/test_continuity_live.py (11✓, 0.9s)
+[  7.2% |   156/~2179 | ✓214 | ✗  0] ✓ tests/ares_runtime/test_continuity_checkpoint.py (15✓, 1.8s)
+[  7.3% |   159/~2179 | ✓217 | ✗  0] ✓ tests/ares_runtime/test_continuity_native_governor.py (3✓, 1.1s)
+[  7.6% |   165/~2179 | ✓223 | ✗  0] ✓ tests/ares_runtime/test_continuity_recovery.py (6✓, 0.9s)
+[  8.3% |   181/~2179 | ✓240 | ✗  0] ✓ tests/ares_runtime/test_continuity_input.py (17✓, 4.7s)
+[  8.6% |   188/~2179 | ✓249 | ✗  0] ✓ tests/ares_runtime/test_continuity_progress.py (9✓, 4.0s)
+[  9.0% |   197/~2179 | ✓258 | ✗  0] ✓ tests/ares_runtime/test_continuity_runtime.py (9✓, 1.0s)
+[  9.4% |   204/~2179 | ✓271 | ✗  0] ✓ tests/ares_runtime/test_continuity_snapshot_races.py (13✓, 1.0s)
+[  9.5% |   207/~2179 | ✓276 | ✗  0] ✓ tests/ares_runtime/test_continuity_rollback.py (5✓, 4.1s)
+[  9.9% |   215/~2179 | ✓284 | ✗  0] ✓ tests/ares_runtime/test_continuity_transport_bounds.py (8✓, 1.3s)
+[ 10.1% |   219/~2179 | ✓288 | ✗  0] ✓ tests/ares_runtime/test_managed_calls.py (4✓, 0.4s)
+[ 10.2% |   222/~2179 | ✓291 | ✗  0] ✓ tests/cli/test_cli_async_delegation_delivery.py (3✓, 0.8s)
+[ 10.5% |   228/~2179 | ✓303 | ✗  0] ✓ tests/ares_runtime/test_permit_readback.py (12✓, 1.7s)
+[ 10.8% |   235/~2179 | ✓310 | ✗  0] ✓ tests/cli/test_cli_goal_interrupt.py (7✓, 0.9s)
+[ 10.9% |   237/~2179 | ✓312 | ✗  0] ✓ tests/gateway/test_42039_duplicate_user_message.py (2✓, 1.0s)
+[ 11.2% |   245/~2179 | ✓320 | ✗  0] ✓ tests/cli/test_quick_commands.py (8✓, 1.7s)
+[ 11.5% |   251/~2179 | ✓331 | ✗  0] ✓ tests/ares_runtime/test_continuity_tool_control.py (11✓, 5.2s)
+[ 11.7% |   256/~2179 | ✓406 | ✗  0] ✓ tests/gateway/test_adapter_startup_secret_scope.py (75✓, 0.9s)
+[ 11.9% |   259/~2179 | ✓409 | ✗  0] ✓ tests/gateway/test_base_topic_sessions.py (3✓, 0.8s)
+[ 12.0% |   262/~2179 | ✓412 | ✗  0] ✓ tests/gateway/test_busy_session_auth_bypass.py (3✓, 0.9s)
+[ 12.5% |   272/~2179 | ✓422 | ✗  0] ✓ tests/gateway/test_busy_session_ack.py (10✓, 1.3s)
+[ 12.7% |   276/~2179 | ✓426 | ✗  0] ✓ tests/gateway/test_goal_resume_restart.py (4✓, 1.1s)
+[ 12.7% |   277/~2179 | ✓427 | ✗  0] ✓ tests/gateway/test_internal_event_never_interrupts_busy_session.py (1✓, 1.0s)
+[ 13.4% |   292/~2179 | ✓448 | ✗  0] ✓ tests/gateway/test_context_input.py (21✓, 3.6s)
+[ 14.4% |   313/~2179 | ✓470 | ✗  0] ✓ tests/gateway/test_multiplex_adapter_registry.py (22✓, 2.0s)
+[ 14.8% |   322/~2179 | ✓489 | ✗  0] ✓ tests/gateway/test_context_input_recovery.py (19✓, 5.3s)
+[ 15.3% |   333/~2179 | ✓500 | ✗  0] ✓ tests/gateway/test_multiplex_session_db_profile_scope.py (11✓, 1.2s)
+[ 19.2% |   419/~2179 | ✓594 | ✗  0] ✓ tests/gateway/test_platform_base.py (94✓ 1s, 1.1s)
+[ 19.3% |   421/~2179 | ✓596 | ✗  0] ✓ tests/gateway/test_pre_gateway_dispatch.py (2✓, 1.1s)
+[ 19.8% |   431/~2179 | ✓611 | ✗  0] ✓ tests/gateway/test_multiplex_busy_input_mode.py (15✓, 3.8s)
+[ 20.2% |   441/~2179 | ✓621 | ✗  0] ✓ tests/gateway/test_profile_routing.py (10✓, 0.7s)
+[ 21.0% |   457/~2179 | ✓655 | ✗  0] ✓ tests/ares_runtime/test_continuity_dispatch.py (34✓, 21.2s)
+[ 22.1% |   481/~2179 | ✓679 | ✗  0] ✓ tests/hermes_cli/test_goal_lifecycle_contract.py (24✓, 1.3s)
+[ 23.8% |   518/~2179 | ✓716 | ✗  0] ✓ tests/hermes_cli/test_goals.py (37✓, 1.2s)
+[ 24.5% |   534/~2179 | ✓742 | ✗  0] ✓ tests/hermes_cli/test_heartbeat.py (26✓, 0.7s)
+[ 24.8% |   540/~2179 | ✓748 | ✗  0] ✓ tests/gateway/test_startup_connect_parallel.py (6✓, 5.7s)
+[ 25.2% |   549/~2179 | ✓757 | ✗  0] ✓ tests/hermes_state/test_append_messages_batch.py (9✓, 0.7s)
+[ 28.1% |   612/~2179 | ✓820 | ✗  0] ✓ tests/hermes_cli/test_loops.py (63✓, 1.5s)
+[ 29.7% |   648/~2179 | ✓856 | ✗  0] ✓ tests/gateway/test_restart_resume_pending.py (36✓, 7.3s)
+[ 29.9% |   651/~2179 | ✓859 | ✗  0] ✓ tests/plugins/test_context_governor_key_state_v2.py (3✓, 0.4s)
+[ 30.1% |   655/~2179 | ✓863 | ✗  0] ✓ tests/plugins/test_context_governor_fd_ownership.py (4✓, 0.6s)
+[ 30.3% |   660/~2179 | ✓876 | ✗  0] ✓ tests/plugins/test_context_governor_protocol.py (13✓, 0.5s)
+[ 30.6% |   666/~2179 | ✓886 | ✗  0] ✓ tests/plugins/test_context_governor_release_identity.py (10✓, 0.6s)
+[ 31.0% |   676/~2179 | ✓896 | ✗  0] ✓ tests/run_agent/test_1630_context_overflow_loop.py (10✓, 1.4s)
+[ 31.4% |   684/~2179 | ✓904 | ✗  0] ✓ tests/plugins/test_context_governor_runtime_closure.py (8✓, 2.2s)
+[ 31.8% |   694/~2179 | ✓914 | ✗  0] ✓ tests/run_agent/test_codex_sdk_transform_bypass.py (10✓, 2.6s)
+[ 32.2% |   701/~2179 | ✓921 | ✗  0] ✓ tests/run_agent/test_compression_lock_defer.py (7✓, 2.5s)
+[ 33.8% |   736/~2179 | ✓956 | ✗  0] ✓ tests/run_agent/test_message_sequence_repair.py (35✓, 1.8s)
+[ 35.0% |   763/~2179 | ✓983 | ✗  0] ✓ tests/gateway/test_run_progress_topics.py (27✓, 12.2s)
+[ 35.5% |   774/~2179 | ✓994 | ✗  0] ✓ tests/run_agent/test_in_place_compaction.py (11✓, 6.4s)
+[ 35.7% |   777/~2179 | ✓997 | ✗  0] ✓ tests/run_agent/test_tool_executor_contextvar_propagation.py (3✓, 1.5s)
+[ 36.2% |   789/~2179 | ✓1036 | ✗   0] ✓ tests/state/test_message_copy_mapping.py (39✓, 1.5s)
+[ 36.6% |   797/~2179 | ✓1059 | ✗   0] ✓ tests/state/test_message_row_publication.py (23✓, 1.0s)
+[ 38.2% |   832/~2179 | ✓1093 | ✗   0] ✓ tests/run_agent/test_streaming.py (34✓ 4s, 8.2s)
+[ 40.3% |   878/~2179 | ✓1145 | ✗   0] ✓ tests/test_ares_collaboration.py (52✓, 1.2s)
+[ 42.7% |   931/~2179 | ✓1203 | ✗   0] ✓ tests/run_agent/test_run_agent_codex_responses.py (58✓, 11.9s)
+[ 43.8% |   955/~2179 | ✓1227 | ✗   0] ✓ tests/test_estop.py (24✓, 1.4s)
+[ 45.2% |   985/~2179 | ✓1445 | ✗   0] ✓ tests/state/test_todo_compaction.py (218✓, 6.7s)
+[ 45.5% |   992/~2179 | ✓1469 | ✗   0] ✓ tests/test_run_checkpoint_claim_admission.py (24✓, 1.0s)
+[ 46.9% |  1021/~2179 | ✓1498 | ✗   0] ✓ tests/test_model_tools.py (29✓, 3.0s)
+[ 47.1% |  1027/~2179 | ✓1521 | ✗   0] ✓ tests/test_run_checkpoint_claim_client.py (23✓, 0.9s)
+[ 48.2% |  1051/~2179 | ✓1564 | ✗   0] ✓ tests/test_run_checkpoint_owner.py (43✓, 2.7s)
+[ 48.6% |  1060/~2179 | ✓1576 | ✗   0] ✓ tests/test_run_checkpoint_refresh_storage.py (12✓, 0.9s)
+[ 48.8% |  1064/~2179 | ✓1581 | ✗   0] ✓ tests/test_run_checkpoint_import_boundaries.py (5✓, 4.3s)
+[ 49.7% |  1082/~2179 | ✓1610 | ✗   0] ✓ tests/test_run_checkpoint_resume.py (29✓, 1.7s)
+[ 50.3% |  1097/~2179 | ✓1626 | ✗   0] ✓ tests/test_compression_watermark_commit.py (16✓, 16.0s)
+[ 51.2% |  1116/~2179 | ✓1663 | ✗   0] ✓ tests/test_run_custody_obligations.py (37✓, 7.4s)
+[ 51.7% |  1127/~2179 | ✓1684 | ✗   0] ✓ tests/test_run_task_custody.py (21✓, 1.2s)
+[ 52.6% |  1147/~2179 | ✓1720 | ✗   0] ✓ tests/test_run_custody_cold_recovery.py (36✓, 11.4s)
+[ 52.9% |  1153/~2179 | ✓1728 | ✗   0] ✓ tests/test_turn_run_custody.py (8✓, 0.7s)
+[ 53.5% |  1165/~2179 | ✓1744 | ✗   0] ✓ tests/test_run_custody_ready_recovery.py (16✓, 10.1s)
+[ 54.2% |  1180/~2179 | ✓1761 | ✗   0] ✓ tests/tui_gateway/test_composite_carrier_rewind.py (17✓, 3.4s)
+[ 55.2% |  1202/~2179 | ✓1783 | ✗   0] ✓ tests/tui_gateway/test_compute_host_phase1.py (22✓, 4.2s)
+[ 55.4% |  1207/~2179 | ✓1793 | ✗   0] ✓ tests/tui_gateway/test_inline_rpc_gil_starvation.py (10✓, 1.8s)
+[ 55.9% |  1219/~2179 | ✓1805 | ✗   0] ✓ tests/tui_gateway/test_goal_command.py (12✓, 6.9s)
+[ 56.3% |  1226/~2179 | ✓1812 | ✗   0] ✓ tests/tui_gateway/test_prompt_recovery_contract.py (7✓, 1.7s)
+[ 56.9% |  1240/~2179 | ✓1826 | ✗   0] ✓ tests/tui_gateway/test_kanban_notify_poller.py (14✓, 3.8s)
+[ 68.8% |  1499/~2179 | ✓2105 | ✗   0] ✓ tests/run_agent/test_run_agent.py (279✓, 47.5s)
+[ 69.6% |  1516/~2179 | ✓2170 | ✗   0] ✓ tests/tui_gateway/test_run_checkpoint_claim_rpc.py (65✓, 2.2s)
+[ 69.9% |  1524/~2179 | ✓2178 | ✗   0] ✓ tests/tui_gateway/test_session_profile_db.py (8✓, 2.0s)
+[ 72.2% |  1573/~2179 | ✓2244 | ✗   0] ✓ tests/tui_gateway/test_protocol.py (66✓, 8.0s)
+[100.0% |  2179/~2179 | ✓2865 | ✗   0] ✓ tests/test_tui_gateway_server.py (621✓, 25.4s)
+
+=== Summary: 89 files, 2865 tests passed, 0 failed, 5 skipped (100% complete) in 91.7s (4 workers) ===
+  Durations cached to test_durations.json (89 files)
+
+=== Per-file subprocess time distribution ===
+  Files:   89
+  Total subprocess CPU-wall: 348.5s  (runner wall: 91.7s, parallelism: 4x)
+  P50: 1.73s  P90: 8.19s  P95: 12.24s  P99: 47.53s  Max: 47.53s
+  <1s: 24 files (27%)  <2s: 51 files (57%)
+  Top 10 slowest:
+     47.53s  tests/run_agent/test_run_agent.py
+     25.43s  tests/test_tui_gateway_server.py
+     21.16s  tests/ares_runtime/test_continuity_dispatch.py
+     15.99s  tests/test_compression_watermark_commit.py
+     12.24s  tests/gateway/test_run_progress_topics.py
+     11.93s  tests/run_agent/test_run_agent_codex_responses.py
+     11.40s  tests/test_run_custody_cold_recovery.py
+     10.08s  tests/test_run_custody_ready_recovery.py
+      8.19s  tests/run_agent/test_streaming.py
+      8.00s  tests/tui_gateway/test_protocol.py

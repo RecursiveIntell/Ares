@@ -398,6 +398,26 @@ def collapse_const_unions(schema: Any) -> Any:
     return out
 
 
+def _normalize_type_array(value: list, out: dict) -> None:
+    """Project an array type using the existing generic sanitizer contract.
+
+    Keep permissive fallback and key-order semantics here unchanged. Provider
+    projections requiring stricter inputs must validate before calling this.
+    """
+    has_null = "null" in value
+    non_null = [t for t in value if isinstance(t, str) and t != "null"]
+    if len(non_null) == 1:
+        out["type"] = non_null[0]
+        if has_null:
+            out.setdefault("nullable", True)
+    elif len(non_null) >= 2:
+        out["anyOf"] = [{"type": t} for t in non_null]
+        if has_null:
+            out.setdefault("nullable", True)
+    else:
+        out["type"] = "null" if has_null else "object"
+
+
 def _sanitize_node(node: Any, path: str) -> Any:
     """Recursively sanitize a JSON-Schema fragment.
 
@@ -464,22 +484,7 @@ def _sanitize_node(node: Any, path: str) -> Any:
         #   * all-null / empty → ``type: "null"`` (or object fallback).
         # Ported from anomalyco/opencode#31877.
         if key == "type" and isinstance(value, list):
-            has_null = "null" in value
-            non_null = [t for t in value if isinstance(t, str) and t != "null"]
-            if len(non_null) == 1:
-                out["type"] = non_null[0]
-                if has_null:
-                    out.setdefault("nullable", True)
-                continue
-            if len(non_null) >= 2:
-                # Preserve all branches as a union instead of dropping them.
-                out["anyOf"] = [{"type": t} for t in non_null]
-                if has_null:
-                    out.setdefault("nullable", True)
-                continue
-            # No usable non-null type: all-null array → type: "null";
-            # otherwise an empty/garbage array → object fallback.
-            out["type"] = "null" if has_null else "object"
+            _normalize_type_array(value, out)
             continue
 
         if key in {"properties", "$defs", "definitions"} and isinstance(value, dict):

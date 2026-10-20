@@ -26,7 +26,10 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Dict, List, Optional
 
-from agent.context_engine import ContextEngine
+from agent.context_engine import (
+    CONTEXT_REBASE_LINEAGE_INTEGRITY_MISMATCH,
+    ContextEngine,
+)
 from agent.message_sanitization import (
     coalesce_tool_call_id,
     tool_call_id_variants,
@@ -49,6 +52,7 @@ from plugins.context_engine._context_governor.protocol import (
 )
 
 logger = logging.getLogger(__name__)
+_NATIVE_SOURCE_OWNER = Path(__file__).resolve().parents[3]
 
 # These certified lifecycle/query operations return JSON arrays. Keep the
 # exception exact; every other certified command remains object-shaped and
@@ -145,9 +149,20 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         store_dir: str | None = None,
         timeout_sec: int = 30,
     ):
-        self.binary = (
-            binary or os.environ.get("CONTEXT_GOVERNOR_BIN") or self._default_binary()
-        )
+        from ares_runtime.governor_install import GovernorInstallError, bundled_binary
+
+        self._managed_native_source = None
+        try:
+            managed_binary = bundled_binary(_NATIVE_SOURCE_OWNER)
+        except GovernorInstallError as exc:
+            raise ContextGovernorActivationError(str(exc)) from exc
+        if managed_binary is not None:
+            if binary is not None and Path(binary).resolve() != managed_binary:
+                raise ContextGovernorActivationError("explicit binary differs from the managed native bundle")
+            self._managed_native_source = _NATIVE_SOURCE_OWNER
+            self.binary = str(managed_binary)
+        else:
+            self.binary = binary or os.environ.get("CONTEXT_GOVERNOR_BIN") or self._default_binary()
         self.store_dir = Path(
             store_dir
             or os.environ.get("CONTEXT_GOVERNOR_STORE")
@@ -166,6 +181,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         # Receipts belong to the stable logical compression lineage instead;
         # otherwise the first rotated child silently starts a new governor DAG.
         self._lineage_session_id = ""
+        self._lineage_session_id_resolved = False
         self._session_db: Any = None
         # A finalized receipt is prepared durably inside compress(), but remains
         # invisible to parent selection/search/expand until the host confirms
@@ -185,6 +201,10 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         self.last_error: str | None = None
         self.last_warning: str | None = None
         self.last_outcome: dict[str, Any] | None = None
+        # Volatile owner evidence, keyed by logical lineage (or by the physical
+        # fallback until ancestry is positively resolved). A later mismatch on
+        # another lineage must not overwrite an earlier unresolved refusal.
+        self._lineage_integrity_vetoes: dict[str, bool] = {}
         self.last_summary_safety: dict[str, Any] | None = None
         self.last_compaction_metrics: dict[str, Any] | None = None
         self.fallback_event_count = 0
@@ -205,6 +225,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         self.last_real_prompt_tokens = 0
         self.last_compression_rough_tokens = 0
         self.awaiting_real_usage_after_compression = False
+        self._pending_request_rough_tokens = 0
 
         # Anti-thrashing state
         self._ineffective_compression_count = 0
@@ -323,6 +344,9 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         clone = type(self)(str(self.binary), str(self.store_dir), self.timeout_sec)
         clone.session_id = self.session_id
         clone._lineage_session_id = self._lineage_session_id
+        clone._lineage_session_id_resolved = getattr(
+            self, "_lineage_session_id_resolved", False
+        )
         clone._session_db = self._session_db
         clone._pending_admission = copy.deepcopy(self._pending_admission)
         clone.last_prompt_tokens = self.last_prompt_tokens
@@ -335,6 +359,9 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         clone.last_error = self.last_error
         clone.last_warning = self.last_warning
         clone.last_outcome = copy.deepcopy(self.last_outcome)
+        clone._lineage_integrity_vetoes = copy.deepcopy(
+            getattr(self, "_lineage_integrity_vetoes", {})
+        )
         clone.last_summary_safety = copy.deepcopy(self.last_summary_safety)
         clone.last_compaction_metrics = copy.deepcopy(self.last_compaction_metrics)
         clone.fallback_event_count = self.fallback_event_count
@@ -351,6 +378,8 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         clone._ineffective_compression_count = self._ineffective_compression_count
         clone._last_compression_savings_pct = self._last_compression_savings_pct
         clone._set_defer_baseline(self.last_rough_tokens_when_real_prompt_fit)
+        # A clone has not sent the original owner's pending request.
+        clone._pending_request_rough_tokens = 0
         clone._previous_summary = self._previous_summary
         clone._summary_mode = self._summary_mode
         clone._summary_model = self._summary_model
@@ -381,6 +410,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         a replacement for stock compression. It deliberately refuses a V2
         runtime without a configured readable HMAC key.
         """
+        self._verify_managed_native()
         if self._unsafe_configured_hmac_path:
             raise ContextGovernorActivationError(
                 "ConfigurationPathOutsideCanonicalState: receipt_hmac_key_path is not accepted"
@@ -622,6 +652,19 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         protect_first_n: int | None = None,
         protect_last_n: int | None = None,
     ) -> None:
+        resolved_context_length = int(context_length or 0)
+        output_reserve = int(max_tokens) if max_tokens and int(max_tokens) > 0 else None
+        effective_window = resolved_context_length - (output_reserve or 0)
+        if resolved_context_length > 0 and effective_window <= 0:
+            raise ValueError(
+                "context-governor response reservation leaves no input budget "
+                f"(context_length={resolved_context_length}, max_tokens={output_reserve})"
+            )
+        pressure_fields = (
+            "model", "base_url", "api_key", "provider", "api_mode",
+            "context_length", "max_tokens", "threshold_tokens",
+        )
+        previous_pressure_route = tuple(getattr(self, key, None) for key in pressure_fields)
         # Persist the active agent route.  The optional summary-specific fields
         # override these only when explicitly configured.
         self.model = str(model or "")
@@ -635,17 +678,31 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             self.protect_first_n = int(protect_first_n)
         if protect_last_n is not None:
             self.protect_last_n = int(protect_last_n)
-        self.context_length = int(context_length or 0)
-        self.max_tokens = (
-            int(max_tokens) if max_tokens and int(max_tokens) > 0 else None
-        )
+        self.context_length = resolved_context_length
+        self.max_tokens = output_reserve
         # Account for output reservation in effective input budget
-        effective_window = self.context_length - (self.max_tokens or 0)
-        if effective_window <= 0:
-            effective_window = self.context_length
         self.threshold_tokens = (
-            int(effective_window * self.threshold_percent) if effective_window else 0
+            int(effective_window * self.threshold_percent) if effective_window > 0 else 0
         )
+        if previous_pressure_route != tuple(getattr(self, key, None) for key in pressure_fields):
+            # Token evidence from another route/budget cannot qualify this
+            # request. Keep telemetry, but invalidate pressure projections.
+            self._set_defer_baseline(0)
+            self._pending_request_rough_tokens = 0
+            self.last_compression_rough_tokens = 0
+            self.awaiting_real_usage_after_compression = False
+
+    def note_request_rough_estimate(self, rough_tokens: int) -> None:
+        """Record host request pressure for its next matching usage update.
+
+        This is an advisory rough estimate, not final wire/native accounting.
+        A rebuilt request replaces the pending estimate; only its positive
+        provider usage can establish a new fitting pair.
+        """
+        try:
+            self._pending_request_rough_tokens = max(0, int(rough_tokens))
+        except (TypeError, ValueError, OverflowError):
+            self._pending_request_rough_tokens = 0
 
     def update_from_response(self, usage: Dict[str, Any]) -> None:
         self.last_prompt_tokens = int(
@@ -658,19 +715,19 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             usage.get("total_tokens")
             or (self.last_prompt_tokens + self.last_completion_tokens)
         )
+        request_rough = self._pending_request_rough_tokens
+        self._pending_request_rough_tokens = 0
         # Mirror the built-in contract: last_real_prompt_tokens tracks the
         # most recent non-zero provider-reported prompt count, separate from
         # last_prompt_tokens (which can be -1 after a deferred preflight).
         if self.last_prompt_tokens > 0:
             self.last_real_prompt_tokens = self.last_prompt_tokens
-            if self.last_prompt_tokens < self.threshold_tokens:
-                if (
-                    self.awaiting_real_usage_after_compression
-                    and self.last_compression_rough_tokens > 0
-                ):
-                    self._set_defer_baseline(self.last_compression_rough_tokens)
-            else:
-                self._set_defer_baseline(0)
+            # Update the pair atomically. An unmatched positive reading must
+            # not be projected against an unrelated older rough anchor;
+            # compaction diagnostics alone are not a request measurement.
+            self._set_defer_baseline(
+                request_rough if self.last_prompt_tokens < self.threshold_tokens else 0
+            )
         self.awaiting_real_usage_after_compression = False
 
     def should_compress(self, prompt_tokens: int = None) -> bool:
@@ -727,8 +784,9 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
 
         Mirrors the built-in ContextCompressor contract. The rough preflight
         estimator includes tool/schema overhead and can overestimate immediately
-        after compaction; provider-reported real usage is a better signal only
-        for a bounded growth window. Once rough growth exceeds tolerance,
+        after compaction; a matching rough/real pair can project cumulative
+        growth below the trigger. The projection is advisory, not a qualified
+        tokenizer bound. Once projected growth reaches the trigger,
         preflight must compress again instead of letting the session creep toward
         the hard context limit.
         """
@@ -741,9 +799,9 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         # At emergency pressure, fall through so should_compress() forces a
         # safety retry before the provider sees the oversized request.
         emergency_threshold = self._emergency_pressure_threshold()
-        if self.awaiting_real_usage_after_compression and (
-            emergency_threshold <= 0 or rough_tokens < emergency_threshold
-        ):
+        if emergency_threshold > 0 and rough_tokens >= emergency_threshold:
+            return False
+        if self.awaiting_real_usage_after_compression:
             return True
         # Futility deferral is a normal-band optimization, not a safety gate.
         # At emergency pressure the caller must reach should_compress(), whose
@@ -751,26 +809,19 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         # the request. Keeping this unconditional used to make the governor
         # look completely dead after two low-yield passes: both automatic
         # preflight paths returned here before should_compress() was evaluated.
-        if self._ineffective_compression_count >= 2 and (
-            emergency_threshold <= 0 or rough_tokens < emergency_threshold
-        ):
+        if self._ineffective_compression_count >= 2:
             return True
         if self.last_real_prompt_tokens <= 0:
             return False
         if self.last_real_prompt_tokens >= self.threshold_tokens:
             return False
-        baseline = (
-            self.last_rough_tokens_when_real_prompt_fit
-            or self.last_compression_rough_tokens
-        )
+        baseline = self.last_rough_tokens_when_real_prompt_fit
         if baseline <= 0:
             return False
         growth = max(0, rough_tokens - baseline)
-        tolerated = max(4096, int(self.threshold_tokens * 0.05))
-        if growth > tolerated:
-            return False
-        self._set_defer_baseline(max(baseline, rough_tokens))
-        return True
+        # Only a matching positive usage update refreshes the pair. Repeated
+        # pressure checks or usage-less growth cannot ratchet this anchor.
+        return self.last_real_prompt_tokens + growth < self.threshold_tokens
 
     def has_content_to_compress(self, messages: List[Dict[str, Any]]) -> bool:
         non_system = [
@@ -781,23 +832,51 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
     def on_session_start(self, session_id: str, **kwargs) -> None:
         self.session_id = str(session_id or self.session_id or "default")
         session_db = kwargs.get("session_db")
+        boundary_reason = kwargs.get("boundary_reason")
         if session_db is not None:
             self.bind_session_state(session_db=session_db, session_id=self.session_id)
-        elif kwargs.get("boundary_reason") != "compression":
+        elif boundary_reason not in {"compression", "context_rebase"}:
+            # This lifecycle callback is an explicit new-session boundary.
             self._lineage_session_id = self.session_id
+            self._lineage_session_id_resolved = True
         elif not self._lineage_session_id:
-            # A boundary callback without a bound SessionDB is still one
-            # logical conversation. Preserve the old physical id as its stable
-            # governor key rather than rebasing the receipt DAG to the child.
+            # A continuation boundary without DB evidence cannot invent a new
+            # root; initialize only when this engine has no prior lineage.
             self._lineage_session_id = str(
                 kwargs.get("old_session_id") or self.session_id
             )
+            self._lineage_session_id_resolved = False
         # Cross-session context transfer: if receipts exist from prior sessions,
         # load the most recent one as initial _previous_summary for context continuity.
         # This is a lightweight bootstrap — the model can use context_search to
         # find specific omitted content from prior sessions.
         if self._previous_summary is None:
             self._load_prior_session_context()
+
+    def validate_context_rebase_binding(self, *, session_db, session_id) -> None:
+        """Read the real receipt owner before acknowledging a rebase binding.
+
+        Ordinary lifecycle hooks remain best-effort for legacy callers. Context
+        continuation requires a positive readback and cannot turn a warning
+        from bind_session_state into an activation acknowledgment.
+        """
+        if self._session_db is not session_db or self.session_id != session_id:
+            raise RuntimeError("GOVERNOR_REBASE_BINDING_MISMATCH")
+        expected_root, lineage_resolved = self._context_lineage_root_with_evidence(
+            session_db, session_id
+        )
+        if not lineage_resolved:
+            raise RuntimeError("GOVERNOR_REBASE_LINEAGE_UNRESOLVED")
+        if self._lineage_session_id != expected_root:
+            raise RuntimeError("GOVERNOR_REBASE_LINEAGE_MISMATCH")
+        records = self._run_certified_json(["pending-v2", "--dir", str(self.store_dir)], {})
+        if not isinstance(records, list):
+            raise RuntimeError("GOVERNOR_PENDING_INVENTORY_INVALID")
+        for record in records:
+            if not isinstance(record, dict) or record.get("schema") != "PendingReceiptInfoV2":
+                raise RuntimeError("GOVERNOR_PENDING_INVENTORY_INVALID")
+            if record.get("session_id") == self._governor_session_id():
+                raise RuntimeError("GOVERNOR_PENDING_RECONCILIATION_REQUIRED")
 
     def _load_prior_session_context(self) -> None:
         """Load the most recent receipt from the store as prior context.
@@ -865,6 +944,10 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         self._set_defer_baseline(value)
 
     def on_session_reset(self) -> None:
+        current_lineage = self._governor_session_id()
+        vetoes = getattr(self, "_lineage_integrity_vetoes", None)
+        if isinstance(vetoes, dict):
+            vetoes.pop(current_lineage, None)
         super().on_session_reset()
         self.last_receipt_id = None
         self.last_error = None
@@ -883,11 +966,13 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         self.last_real_prompt_tokens = 0
         self.last_compression_rough_tokens = 0
         self.awaiting_real_usage_after_compression = False
+        self._pending_request_rough_tokens = 0
         self._ineffective_compression_count = 0
         self._last_compression_savings_pct = 100.0
         self._set_defer_baseline(0)
         self._previous_summary = None
         self._lineage_session_id = ""
+        self._lineage_session_id_resolved = False
         self._session_db = None
         # A reset is a real user boundary. Any in-process prepared receipt was
         # not accepted by the old host transcript and must not leak into the
@@ -898,53 +983,195 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         self,
         session_db: Any = None,
         session_id: str = "",
-    ) -> None:
-        """Bind SessionDB, restore the logical lineage, and reconcile pending.
+    ) -> bool:
+        """Bind SessionDB and restore lineage when ancestry is positively known.
 
-        Resume-time provider repair is not durable, so recovery reads the raw
-        active SessionDB projection. A pending receipt is activated only when
-        its authenticated compacted projection is an exact normalized prefix
-        of a durable in-place row set or compression-continuation tip.
+        Return whether the supplied owner resolved a complete logical lineage.
+        Missing DB ancestry is not a new-session transition and cannot clear an
+        existing integrity veto. A caller that owns an explicit session-start
+        boundary may clear only after this method returns ``True``.
         """
         if session_id:
             self.session_id = str(session_id)
         self._session_db = session_db
-        self._lineage_session_id = self._compression_lineage_root(
+        lineage_root, lineage_resolved = self._context_lineage_root_with_evidence(
             session_db,
             self.session_id or "default",
         )
+        if not isinstance(getattr(self, "_lineage_integrity_vetoes", None), dict):
+            self._lineage_integrity_vetoes = {}
+        if lineage_resolved:
+            for fallback_root, unresolved in list(
+                self._lineage_integrity_vetoes.items()
+            ):
+                if unresolved is not True:
+                    continue
+                resolved_veto_root, veto_root_resolved = (
+                    self._context_lineage_root_with_evidence(
+                        session_db,
+                        fallback_root,
+                    )
+                )
+                if veto_root_resolved and resolved_veto_root == lineage_root:
+                    # Positive owner evidence refined this fallback into the
+                    # same logical root; carry the veto, not a recovery claim.
+                    self._lineage_integrity_vetoes.pop(fallback_root, None)
+                    self._lineage_integrity_vetoes[lineage_root] = False
+            self._lineage_session_id = lineage_root
+            self._lineage_session_id_resolved = True
+        elif not self._lineage_session_id:
+            self._lineage_session_id = lineage_root
+            self._lineage_session_id_resolved = False
         if session_db is not None:
             self._reconcile_pending_receipts(session_db, self.session_id)
+        return lineage_resolved
 
     @staticmethod
-    def _compression_lineage_root(session_db: Any, session_id: str) -> str:
-        """Return the stable root following compression edges only."""
+    def _context_lineage_root_with_evidence(
+        session_db: Any, session_id: str
+    ) -> tuple[str, bool]:
+        """Resolve a root only through complete, owner-backed ancestry evidence."""
         current = str(session_id or "default")
         getter = getattr(type(session_db), "get_session", None)
         if session_db is None or not callable(getter):
-            return current
+            return current, False
         seen: set[str] = set()
-        for _ in range(100):
+        for _ in range(1000):
             if not current or current in seen:
-                break
+                return current, False
             seen.add(current)
-            row = getter(session_db, current)
-            if not isinstance(row, dict):
-                break
-            parent_id = str(row.get("parent_session_id") or "")
-            if not parent_id:
-                break
-            parent = getter(session_db, parent_id)
-            if (
-                not isinstance(parent, dict)
-                or parent.get("end_reason") != "compression"
+            try:
+                row = getter(session_db, current)
+            except Exception:
+                return current, False
+            if not isinstance(row, dict) or "parent_session_id" not in row:
+                return current, False
+            raw_parent_id = row.get("parent_session_id")
+            if raw_parent_id is None:
+                return current, True
+            # SessionDB's nullable TEXT column yields either None or a string.
+            # Do not let falsey malformed values (False, 0, [], "") masquerade
+            # as an owner-confirmed logical root and replace a known veto key.
+            if not isinstance(raw_parent_id, str) or not raw_parent_id:
+                return current, False
+            parent_id = raw_parent_id
+            if row.get("source") == "tool":
+                return current, True
+            if "model_config" not in row:
+                return current, False
+            raw_config = row.get("model_config")
+            if raw_config is None:
+                # SessionDB stores a missing optional configuration as SQL
+                # NULL. Only that exact owner representation means an empty
+                # config; other falsey values are malformed, not defaults.
+                config = {}
+            elif isinstance(raw_config, str):
+                if not raw_config.strip():
+                    return current, False
+                try:
+                    config = json.loads(raw_config)
+                except (TypeError, ValueError):
+                    return current, False
+            else:
+                config = raw_config
+            if not isinstance(config, dict):
+                return current, False
+            # Validate owner markers before comparing them. SessionDB's fork
+            # owner uses OR semantics: either marker naming the immediate
+            # parent establishes a fork; another valid marker may be inherited
+            # provenance on that row and does not contradict the owner result.
+            marker_values = []
+            for marker_key in ("_branched_from", "_delegate_from"):
+                marker_value = config.get(marker_key)
+                if marker_value is None:
+                    continue
+                if not isinstance(marker_value, str) or not marker_value:
+                    return current, False
+                marker_values.append(marker_value)
+            if parent_id in marker_values:
+                return current, True
+            reset_from = config.get("_reset_from")
+            if reset_from is not None and (
+                not isinstance(reset_from, str) or not reset_from
             ):
-                break
-            current = parent_id
-        return current or str(session_id or "default")
+                return current, False
+            try:
+                parent = getter(session_db, parent_id)
+            except Exception:
+                return current, False
+            if not isinstance(parent, dict) or "end_reason" not in parent:
+                return current, False
+            reason = parent.get("end_reason")
+            from hermes_state_common import _RESET_END_REASONS
+
+            if reset_from == parent_id:
+                # SessionDB persists this owner marker before a parent may be
+                # reopened, so the marker—not mutable end_reason—is the durable
+                # reset-boundary evidence for this immediate edge.
+                return current, True
+            if reason in _RESET_END_REASONS:
+                child_key = row.get("session_key")
+                parent_key = parent.get("session_key")
+                if (
+                    isinstance(child_key, str)
+                    and child_key
+                    and child_key == parent_key
+                ):
+                    # Match SessionDB's legacy reset-child fallback exactly:
+                    # same non-empty route key plus a recognized reset end.
+                    return current, True
+            if reason == "compression":
+                current = parent_id
+                continue
+            if reason == "context_rebase":
+                transition_lookup = getattr(
+                    type(session_db), "context_rebase_transition_for_session", None
+                )
+                if not callable(transition_lookup):
+                    return current, False
+                try:
+                    transition = transition_lookup(session_db, current)
+                except Exception:
+                    return current, False
+                if (
+                    transition is None
+                    or getattr(transition, "child_session_id", None) != current
+                    or getattr(transition, "parent_session_id", None) != parent_id
+                ):
+                    return current, False
+                current = parent_id
+                continue
+            return current, False
+        return current, False
+
+    @staticmethod
+    def _context_lineage_root(session_db: Any, session_id: str) -> str:
+        """Return the best-known logical root, without asserting it was resolved."""
+        return ContextGovernorEngine._context_lineage_root_with_evidence(
+            session_db, session_id
+        )[0]
+
+    # Back-compat for tests/extensions that still name the narrower helper.
+    _compression_lineage_root = _context_lineage_root
 
     def _governor_session_id(self) -> str:
         return self._lineage_session_id or self.session_id or "hermes-session"
+
+    def automatic_rebase_block_reason(self) -> str | None:
+        """Veto rebase only for the active logical lineage's unresolved refusal.
+
+        The map is volatile and keyed by logical lineage. A different current
+        session does not repair an older lineage; a matching verified activation
+        or explicit reset removes only that lineage's entry. State does not
+        survive process restart.
+        """
+        vetoes = getattr(self, "_lineage_integrity_vetoes", None)
+        if (
+            isinstance(vetoes, dict)
+            and self._governor_session_id() in vetoes
+        ):
+            return CONTEXT_REBASE_LINEAGE_INTEGRITY_MISMATCH
+        return None
 
     def get_active_compression_failure_cooldown(
         self,
@@ -1338,15 +1565,43 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         compacted = self._sanitize_tool_pairs(compacted)
         compacted = self._ensure_latest_user_last(source_messages, compacted)
         compacted = self._preserve_multimodal_tail(source_messages, compacted)
-        from agent.conversation_compression import (
-            _ensure_compressed_has_user_turn,
-        )
-
-        # Reserve only for host material the certified candidate actually lacks.
-        # This projection is also applied idempotently immediately before
-        # finalize-v2, so the measured token delta matches the persisted shape.
-        _ensure_compressed_has_user_turn(source_messages, compacted)
+        # Keep the exact summary carrier separate until checkpoint enhancement.
+        # Reserve measurement projects a copy; it must not merge protected
+        # neighbors into a row whose content the checkpoint will replace.
         return pending_receipt, pending_receipt_id, compacted
+
+    def _final_host_projection(
+        self, source_messages: List[Dict[str, Any]], compacted: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """One host-owned pre-finalization recipe; never rewrite signed receipts."""
+        from agent.conversation_compression import _ensure_compressed_has_user_turn
+
+        _ensure_compressed_has_user_turn(source_messages, compacted)
+        compacted = self._ensure_latest_user_last(source_messages, compacted)
+        has_latest_user = any(
+            isinstance(message, dict) and message.get("role") == "user"
+            for message in source_messages
+        )
+        latest_user = compacted.pop() if has_latest_user else None
+        compacted = self._repair_for_host_alternation(compacted)
+        if latest_user is not None:
+            compacted.append(latest_user)
+        separated = []
+        for message in compacted:
+            if separated and separated[-1].get("role") == "user" and message.get("role") == "user":
+                # The host also preserves receipt-backed user summary carriers.
+                # Separate those protected pairs without rewriting their bytes
+                # or roles. This host-authored note grants no effect authority.
+                separated.append({
+                    "role": "assistant",
+                    "content": "[Non-authorizing context boundary: a preserved user message follows.]",
+                    # Use the existing durable producer-name column, not
+                    # generic metadata that SessionDB does not roundtrip.
+                    "name": "context_governor",
+                    "tool_name": "context_governor",
+                })
+            separated.append(message)
+        return self._preserve_multimodal_tail(source_messages, separated)
 
     def _compact_v2_candidate(
         self, request: dict[str, Any]
@@ -1556,7 +1811,10 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                     if isinstance(message, dict)
                 ]
                 raw_tokens = self._estimate_messages_tokens(raw_compacted)
-                host_tokens = self._estimate_messages_tokens(compacted)
+                host_projection = self._final_host_projection(
+                    source_messages, copy.deepcopy(compacted)
+                )
+                host_tokens = self._estimate_messages_tokens(host_projection)
                 required_reserve = max(
                     post_finalize_reserve_tokens,
                     max(0, host_tokens - raw_tokens),
@@ -1613,7 +1871,9 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                     # re-finalize the unchanged deterministic projection.
                     try:
                         candidate_response = self._finalize_response(
-                            response, candidate
+                            response, self._final_host_projection(
+                                source_messages, copy.deepcopy(candidate)
+                            )
                         )
                     except Exception as exc:
                         warning = (
@@ -1680,20 +1940,9 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             # rejects the shifted projection and the turn cannot continue.
             # Apply the exact host helper before alternation repair/finalize so
             # both the receipt and SessionDB bind the same human-intent anchor.
-            from agent.conversation_compression import (
-                _ensure_compressed_has_user_turn,
-            )
-
-            _ensure_compressed_has_user_turn(source_messages, compacted)
-            # The host repairs role-alternation in memory immediately after
-            # compress() returns. Apply the same repair BEFORE finalize so
-            # the receipt describes the exact transcript the host persists;
-            # otherwise the next compaction's input no longer exactly
-            # prefixes the stored parent and recursive lineage rejects it —
-            # which made deterministic compaction one-shot per session.
-            compacted = self._repair_for_host_alternation(compacted)
-            compacted = self._ensure_latest_user_last(source_messages, compacted)
-            compacted = self._preserve_multimodal_tail(source_messages, compacted)
+            # Project the selected unmerged candidate once. Earlier reserve and
+            # checkpoint budget checks used copies, never this mutable carrier.
+            compacted = self._final_host_projection(source_messages, compacted)
             response = self._finalize_response(response, compacted)
             finalized_messages = response.get("compacted_messages")
             if not isinstance(finalized_messages, list):
@@ -1787,6 +2036,20 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
 
             return compacted or messages
         except Exception as exc:
+            integrity_mismatch = (
+                isinstance(exc, ContextGovernorCommandError)
+                and exc.operation == "compact-v2"
+                and exc.code == "lineage_integrity_mismatch"
+            )
+            if integrity_mismatch:
+                vetoes = getattr(self, "_lineage_integrity_vetoes", None)
+                if not isinstance(vetoes, dict):
+                    vetoes = {}
+                    self._lineage_integrity_vetoes = vetoes
+                vetoes[self._governor_session_id()] = not getattr(
+                    self, "_lineage_session_id_resolved", False
+                )
+                metrics["durable_replay_recovery"] = "disabled_fail_closed"
             if self._pending_admission is not None:
                 try:
                     self.discard_pending_compression(reason="adapter_exception")
@@ -1824,11 +2087,14 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                     ),
                 }
             else:
-                self.last_outcome = {
+                outcome = {
                     "kind": "compaction_failed_closed",
                     "source_error_code": getattr(exc, "code", None),
                     "error": self._safe_summary_diagnostic(error_text),
                 }
+                if integrity_mismatch:
+                    outcome["source_operation"] = exc.operation
+                self.last_outcome = outcome
             failure_type = self._classify_subprocess_error(exc)
             if failure_type == "auth":
                 logger.error("context-governor auth failure: %s", exc)
@@ -2081,6 +2347,18 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 ]
         return normalized
 
+    @staticmethod
+    def _empty_tip_shape_is_valid(tip: dict) -> bool:
+        """Check the empty Rust tip shape; omitted epoch alone defaults to zero."""
+        epoch = tip.get("lineage_epoch", 0)
+        return (
+            tip.get("compacted_messages") == []
+            and tip.get("receipt_id") is None
+            and tip.get("generation") is None
+            and type(epoch) is int
+            and epoch == 0
+        )
+
     def _rehydrate_legacy_parent_prefix(
         self,
         governor_messages: List[Dict[str, Any]],
@@ -2127,13 +2405,11 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             compacted = tip.get("compacted_messages") if isinstance(tip, dict) else None
             receipt_id = tip.get("receipt_id") if isinstance(tip, dict) else None
             generation = tip.get("generation") if isinstance(tip, dict) else None
-            lineage_epoch = tip.get("lineage_epoch") if isinstance(tip, dict) else None
-            valid_empty_tip = (
-                compacted == []
-                and receipt_id is None
-                and generation is None
-                and lineage_epoch == 0
-            )
+            # Rust's LineageTipProjectionV1 uses serde(default) and omits
+            # lineage_epoch when zero. Absence is epoch zero in that wire
+            # contract; explicit null/bool/string values remain invalid below.
+            lineage_epoch = tip.get("lineage_epoch", 0) if isinstance(tip, dict) else None
+            valid_empty_tip = isinstance(tip, dict) and self._empty_tip_shape_is_valid(tip)
             valid_active_tip = (
                 isinstance(compacted, list)
                 and bool(compacted)
@@ -3104,21 +3380,14 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
 
             llm_summary = self._bind_receipt_carrier(llm_summary, response)
             candidate = list(compacted)
-            metadata = candidate[summary_idx].get("metadata")
-            if not isinstance(metadata, dict):
-                metadata = {}
-            receipt_id = receipt.get("receipt_id")
-            generation = receipt.get("generation")
+            # The bound text and durable summary marker already carry the
+            # checkpoint identity. SessionDB has no generic metadata column;
+            # adding one here would sign a projection that cold replay loses.
+            # Keep checkpoint accounting in the pending admission, not in a
+            # transient host metadata envelope.
             candidate[summary_idx] = {
                 **candidate[summary_idx],
                 "content": llm_summary,
-                "metadata": {
-                    **metadata,
-                    "compressed_summary": True,
-                    "llm_checkpoint": True,
-                    "receipt_id": receipt_id,
-                    "receipt_generation": generation,
-                },
             }
             # The caller finalizes this candidate with Rust and accepts it only
             # if the governor's own token counter meets the target.
@@ -3597,6 +3866,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             # ``model_router`` imports never existed in the live package, which
             # made ``summary_mode: llm`` silently fall back to extractive mode.
             from agent.auxiliary_client import (
+                _auxiliary_response_has_completed_terminal,
                 _resolve_task_provider_model,
                 call_llm,
             )
@@ -3696,6 +3966,11 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         if metrics is not None and pinned_route is not None:
             metrics["summarizer_retry_provider"] = actual_route.provider
             metrics["summarizer_retry_model"] = actual_route.model
+        if not _auxiliary_response_has_completed_terminal(response):
+            raise RuntimeError(
+                "compression summary response lacked explicit completed-terminal "
+                "evidence; refusing partial or refused summary text"
+            )
         content = response.choices[0].message.content
         if not isinstance(content, str):
             content = str(content) if content else ""
@@ -3760,17 +4035,42 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             return None
 
     def _target_tokens(self, current_tokens: int | None) -> int:
+        target = None
         explicit = self._policy.get("token_budget")
         try:
             if explicit is not None and int(explicit) > 0:
-                return max(512, int(explicit))
+                target = max(512, int(explicit))
         except (TypeError, ValueError):
             pass
-        if self.context_length:
-            return max(512, int(self.context_length * 0.20))
-        if current_tokens:
-            return max(512, int(current_tokens * 0.20))
-        return 8000
+        if target is None:
+            if self.context_length:
+                target = max(512, int(self.context_length * 0.20))
+            elif current_tokens:
+                target = max(512, int(current_tokens * 0.20))
+            else:
+                target = 8000
+        if self.context_length > 0:
+            input_window = self.context_length - (self.max_tokens or 0)
+            if input_window <= 0:
+                raise ValueError("context-governor response reservation leaves no input budget")
+            # Configured policy remains the requested target. The active route
+            # is a hard ceiling, including when its input window is below the
+            # adapter's usual 512-token target floor. Rust still owns admission
+            # and may refuse a target that cannot preserve protected content.
+            target = min(target, input_window)
+        return target
+
+    def _verify_managed_native(self) -> None:
+        source = getattr(self, "_managed_native_source", None)
+        if source is None:
+            return
+        from ares_runtime.governor_install import GovernorInstallError, bundled_binary
+
+        try:
+            if bundled_binary(source) != Path(self.binary):
+                raise GovernorInstallError("managed native owner disappeared or changed")
+        except GovernorInstallError as exc:
+            raise ContextGovernorActivationError(str(exc)) from exc
 
     def _run_json(
         self,
@@ -3779,6 +4079,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         *,
         pass_fds: tuple[int, ...] = (),
     ) -> Any:
+        self._verify_managed_native()
         expect_failure_envelope = FAILURE_FLAG in args
         command = [str(self.binary), *args]
         popen_kwargs: dict[str, Any] = {
@@ -4101,6 +4402,12 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         # before best-effort bookkeeping so a later Python exception cannot
         # make the host try to discard an already-active receipt.
         self._pending_admission = None
+        lineage_id = pending.get("lineage_session_id")
+        vetoes = getattr(self, "_lineage_integrity_vetoes", None)
+        if isinstance(vetoes, dict):
+            # Only a verified activation for the same logical lineage proves
+            # that its authenticated compacted projection now has a host commit.
+            vetoes.pop(lineage_id, None)
         try:
             generation = info.get("generation")
             if isinstance(generation, int) and not isinstance(generation, bool):

@@ -357,14 +357,88 @@ def _(rid, params: dict) -> dict:
         )
     isolation_cfg = _load_dashboard_process_isolation_config()
     turn_isolation = _session_uses_compute_host(session, isolation_cfg)
+    if turn_isolation:
+        with session["history_lock"]:
+            if (session.get("_compute_host_active_request_id") or session.get("_stop_pending")
+                    or session.get("_stop_uncertain")):
+                # Goal handoff and uncertain delivery cannot admit a second
+                # execution just because the running projection reads idle.
+                session["running"] = True
     # Re-bind to the current client transport for this request. This keeps
     # streaming events on the active websocket even if an earlier disconnect
     # or fallback moved the session transport to stdio.
     if (t := current_transport()) is not None:
         session["transport"] = t
+    input_receipt = None
+    pending_input_admission = None
+    with session["history_lock"]:
+        input_agent = session.get("agent")
+        input_transport = session.get("transport")
+    def input_owner_error():
+        # Caller holds history_lock; slow pending resolution grants no new owner.
+        current_window = session.get("_turn_outcomes")
+        current_nonce = (current_window.turns[-1]["accepted_turn"]["request_id"]
+            if isinstance(current_window, TurnOutcomeWindow) and current_window.owns(session, sid) and current_window.turns else None)
+        if (_sessions.get(sid) is not session or session.get("agent") is not input_agent
+                or session.get("transport") is not input_transport
+                or (pending_input_admission is not None and (
+                    int(session.get("_queued_prompt_generation", 0)) != pending_input_admission[0]
+                    or (session.get("inflight_turn") or {}).get("started_at") is not pending_input_admission[1]
+                    or current_window is not pending_input_admission[2]
+                    or current_nonce != pending_input_admission[3]))):
+            return _err(rid, 5001, "session owner changed; input not started",
+                {"execution_started": False, "durable_input_accepted": input_receipt is not None,
+                 "error_surface": {"layer": "runtime", "code": "session_owner_changed", "retryable": True},
+                 **({"input_event_id": input_receipt.event_id} if input_receipt is not None else {})})
+        return None
+    stop_input_deadline = time.monotonic() + 5.0
     while True:
+        if input_receipt is None:
+            stop_error = _wait_for_stop_input_admission(rid, session, deadline=stop_input_deadline)
+            if stop_error is not None:
+                return stop_error
+            with session["history_lock"]:
+                failed_once = _one_turn_model_restore_error(sid, session) is not None
+                if failed_once:
+                    window = session.get("_turn_outcomes")
+                    pending_input_admission = (int(session.get("_queued_prompt_generation", 0)),
+                        (session.get("inflight_turn") or {}).get("started_at"), window,
+                        window.turns[-1]["accepted_turn"]["request_id"]
+                        if isinstance(window, TurnOutcomeWindow) and window.owns(session, sid) and window.turns else None)
+            if failed_once:
+                # Only an already acknowledged, eligible explicit pick may
+                # settle failed custody. Resolve outside the admission lock.
+                _apply_pending_model_switch(sid, session, before_admission=True)
         busy_transport = None
         with session["history_lock"]:
+            if (owner_error := input_owner_error()) is not None:
+                return owner_error
+            if input_receipt is None and (session.get("_stop_pending") or session.get("_stop_uncertain")):
+                # Stop may have begun between the wait and lock acquisition.
+                # Retry outside the lock, before any durable input write.
+                if time.monotonic() >= stop_input_deadline:
+                    return _err(rid, 5032, "Stop settlement timed out; durable input not accepted",
+                                {"durable_input_accepted": False})
+                continue
+            if (restore_error := _one_turn_model_restore_error(sid, session)) is not None:
+                return _err(rid, 5001,
+                    "The saved model was not restored; choose a model explicitly before sending.",
+                    {"error_surface": restore_error, "execution_started": False,
+                     "durable_input_accepted": input_receipt is not None,
+                     **({"input_event_id": input_receipt.event_id} if input_receipt is not None else {})})
+            # Refusals must precede durable acceptance, including busy ACKs.
+            # A watch child's run belongs to its parent, so running alone
+            # cannot establish that this session is available for input.
+            if input_receipt is None and session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
+                return _err(rid, 4009, "subagent still running — wait for it to finish")
+            if is_truthy_value(params.get("confirm_truncate")) and not has_truncation:
+                return _err(rid, 4004, "confirm_truncate requires truncate_before_user_ordinal, truncate_before_message_id, or truncate_before_row_id")
+            if not has_truncation and input_receipt is None:
+                try:
+                    input_receipt = _accept_tui_context_input(session, text,
+                        event_id=params.get("input_event_id"), display_kind=display_kind)
+                except Exception as exc:
+                    return _err(rid, 5071, str(exc))
             if session.get("running"):
                 # Don't reject a mid-turn prompt — queue it (and, by default,
                 # interrupt the live turn) so it runs as the next turn. The
@@ -376,6 +450,7 @@ def _(rid, params: dict) -> dict:
         busy_response = _handle_busy_submit(
             rid, sid, session, text, busy_transport,
             queued=bool(params.get("queued")),
+            **({"context_input_event_id": input_receipt.event_id} if input_receipt is not None else {}),
         )
         if busy_response is not None:
             return busy_response
@@ -399,12 +474,20 @@ def _(rid, params: dict) -> dict:
         else None
     )
     with session["history_lock"]:
+        if (owner_error := input_owner_error()) is not None:
+            return owner_error
+        if (restore_error := _one_turn_model_restore_error(sid, session)) is not None:
+            return _err(rid, 5001,
+                "The saved model was not restored; choose a model explicitly before sending.",
+                {"error_surface": restore_error, "execution_started": False,
+                 "durable_input_accepted": input_receipt is not None,
+                 **({"input_event_id": input_receipt.event_id} if input_receipt is not None else {})})
         # A watch session's run lives in the PARENT turn, so its own running
         # flag is False — without this, typing mid-run builds a second agent
         # racing the in-flight child on the same stored session (interleaved
         # transcript, stale fork). After the run completes, submitting is fine:
         # the upgrade resumes the child's transcript as a normal conversation.
-        if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
+        if has_truncation and session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
             return _err(rid, 4009, "subagent still running — wait for it to finish")
         truncate_message_id = params.get("truncate_before_message_id")
         truncate_row_id = params.get("truncate_before_row_id")
@@ -815,8 +898,18 @@ def _(rid, params: dict) -> dict:
         _start_inflight_turn(session, text)
 
     if turn_isolation:
+        if has_truncation:
+            try:
+                input_receipt = _accept_tui_context_input(session, text,
+                    event_id=params.get("input_event_id"), display_kind=display_kind)
+            except Exception as exc:
+                with session["history_lock"]:
+                    session["running"] = False
+                    _clear_inflight_turn(session)
+                return _err(rid, 5071, str(exc))
         isolated_response = _submit_prompt_to_compute_host(
-            rid, sid, session, text, display_kind=display_kind
+            rid, sid, session, text, display_kind=display_kind,
+            **({"context_input_event_id": input_receipt.event_id} if input_receipt is not None else {}),
         )
         if not isolated_response.get("error"):
             if survivor_user_row_ids is not None and requested_rebind_ids is None:
@@ -828,6 +921,11 @@ def _(rid, params: dict) -> dict:
                 ] = survivor_user_row_ids
             if survivor_row_id_map is not None:
                 isolated_response["result"]["survivor_row_id_map"] = survivor_row_id_map
+            return isolated_response
+        delivery = isolated_response["error"].get("data")
+        if isinstance(delivery, dict) and delivery.get("delivery") in {"owner_busy", "uncertain"}:
+            # This request either conflicts with a retained owner or may have
+            # reached the host. An inline retry would create another executor.
             return isolated_response
         logger.warning(
             "compute-host dispatch failed for session %s; falling back inline: %s",
@@ -843,6 +941,9 @@ def _(rid, params: dict) -> dict:
         # A branch becomes real here: copy its parent's transcript into the row so it
         # resumes with full context (the agent won't persist the seed itself).
         _persist_branch_seed(session)
+        if has_truncation:
+            input_receipt = _accept_tui_context_input(session, text,
+                event_id=params.get("input_event_id"), display_kind=display_kind)
     except Exception as exc:
         from hermes_state import is_disk_full_error
 
@@ -864,7 +965,64 @@ def _(rid, params: dict) -> dict:
         )
     _start_agent_build(sid, session)
 
+    # Bind a server nonce before ACK/worker launch; the caller's RPC id may
+    # repeat after reconnect and cannot prove which execution finalized text.
+    with session["history_lock"]:
+        accepted_turn = _begin_turn_outcome(session, sid, f"inline-turn-{uuid.uuid4().hex}", "inline")
+    outcome_execution = (session, sid, accepted_turn["request_id"])
+
     def run_after_agent_ready() -> None:
+        token = _turn_outcome_execution.set(outcome_execution)
+        try:
+            run_owned_after_agent_ready()
+            # This existing admission thread observes the same successor chain
+            # the host observes. Bubble completion alone does not settle it.
+            with _sessions_lock:
+                run_thread = session.get("_run_thread")
+            while run_thread is not None and hasattr(run_thread, "join"):
+                if run_thread is threading.current_thread():
+                    break
+                captured = getattr(run_thread, "_turn_outcome_execution", None)
+                if (captured is None or captured[0] is not session
+                        or captured[1:] != outcome_execution[1:]):
+                    break
+                # Observe only this admission's threads. Detach/cancellation
+                # bounds this advisory observer, even if provider shutdown lags.
+                while run_thread.is_alive():
+                    with session["history_lock"]:
+                        window = session.get("_turn_outcomes")
+                        current_execution = getattr(session.get("_run_thread"), "_turn_outcome_execution", None)
+                        owns_current = (current_execution is not None and current_execution[0] is session
+                            and current_execution[1:] == outcome_execution[1:] and isinstance(window, TurnOutcomeWindow)
+                            and window.turns and window.turns[-1]["accepted_turn"]["request_id"] == outcome_execution[2])
+                        if (_sessions.get(sid) is not session or session.get("_closing")
+                                or (owns_current and session.get("_turn_cancel_requested"))):
+                            if isinstance(window, TurnOutcomeWindow) and (turn := window.find(outcome_execution[2])) is not None:
+                                window.invalidate(turn, "owner_lost_or_cancel_unconfirmed")
+                            return
+                    run_thread.join(timeout=0.25)
+                with _sessions_lock:
+                    successor = session.get("_run_thread")
+                if successor is run_thread:
+                    break
+                run_thread = successor
+        finally:
+            with session["history_lock"]:
+                window = session.get("_turn_outcomes")
+                if (isinstance(window, TurnOutcomeWindow) and window.owns(session, sid)
+                        and _sessions.get(sid) is session and not session.get("_closing")):
+                    current_execution = getattr(session.get("_run_thread"), "_turn_outcome_execution", None)
+                    owns_current = (current_execution is not None and current_execution[0] is session
+                        and current_execution[1:] == outcome_execution[1:] and window.turns
+                        and window.turns[-1]["accepted_turn"]["request_id"] == outcome_execution[2])
+                    window.finish(outcome_execution[2], interrupted=bool(owns_current and session.get("_turn_cancel_requested")))
+            _turn_outcome_execution.reset(token)
+
+    def run_owned_after_agent_ready(
+        admitted_started_at=(session.get("inflight_turn") or {}).get("started_at"),
+        admitted_generation=int(session.get("_queued_prompt_generation", 0)),
+        admitted_transport=session.get("transport"),
+    ) -> None:
         # Patient wait (#63078): the user's message is already the accepted
         # in-flight turn, so a slow deferred build must not eat it. The wait
         # delivers the prompt when the still-running build completes, honors a
@@ -875,50 +1033,74 @@ def _(rid, params: dict) -> dict:
             # Terminal frame + retained snapshot (not a bare "error" event +
             # cleared inflight): if the client is disconnected right now, the
             # retained snapshot is the only way resume can show this failure.
-            _emit_terminal_turn_error(
+            settled = _emit_terminal_turn_error(
                 sid,
                 session,
                 (err.get("error") or {}).get("message", "agent initialization failed"),
                 # Agent construction never reached the provider: this is a
                 # local-runtime failure (env/config/venv), not an API error.
                 error_surface={"layer": "runtime", "code": "agent_init_failed", "retryable": True},
+                expected_started_at=admitted_started_at,
+                expected_queue_generation=admitted_generation,
+                settle_running=True,
+                terminal_transport=admitted_transport,
             )
-            with session["history_lock"]:
-                session["running"] = False
-                session["last_active"] = time.time()
-            _emit("session.info", sid, _session_info(session.get("agent"), session))
-            return
+            if settled:
+                return
         with session["history_lock"]:
+            window = session.get("_turn_outcomes")
+            inflight = session.get("inflight_turn")
+            cancelled = bool(session.get("_turn_cancel_requested"))
+            generation = int(session.get("_queued_prompt_generation", 0))
+            if (_sessions.get(sid) is not session or session.get("_closing")
+                    or session.get("_finalized") or admitted_started_at is None
+                    or not isinstance(inflight, dict) or inflight.get("started_at") is not admitted_started_at
+                    or not isinstance(window, TurnOutcomeWindow) or not window.owns(session, sid)
+                    or not window.turns
+                    or window.turns[-1]["accepted_turn"]["request_id"] != outcome_execution[2]
+                    or (generation != admitted_generation and not (
+                        cancelled and generation == session.get("_last_stop_queue_generation")))):
+                return
             if session.get("_turn_cancel_requested") or not session.get("running"):
                 session["running"] = False
                 _clear_inflight_turn(session)
+                window.finish(outcome_execution[2], interrupted=cancelled)
                 # Surface the cancellation to the client. Without this emit the
                 # turn vanishes silently — the Desktop sees `prompt.submit`
                 # return `{"status": "streaming"}` but never receives a
                 # `message.start` or `error` event, so the composer shows no
                 # feedback (issue #63078 server-side half). Match the
                 # `_wait_agent` error branch above: emit, then bail.
-                _emit(
-                    "error",
-                    sid,
-                    {
-                        "message": "Turn cancelled before the agent was ready"
-                        if session.get("_turn_cancel_requested")
-                        else "Session no longer running before the agent was ready"
-                    },
-                )
+                transport_token = bind_transport(admitted_transport)
+                try:
+                    _emit(
+                        "error",
+                        sid,
+                        {
+                            "message": "Turn cancelled before the agent was ready"
+                            if cancelled
+                            else "Session no longer running before the agent was ready"
+                        },
+                    )
+                finally:
+                    reset_transport(transport_token)
                 return
-        _run_prompt_submit(rid, sid, session, text, display_kind=display_kind)
+            if err:
+                return
+        _run_prompt_submit(rid, sid, session, text, display_kind=display_kind,
+            turn_transport=admitted_transport, **({"context_input_event_id": input_receipt.event_id} if input_receipt is not None else {}))
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
+    run_thread._turn_outcome_execution = outcome_execution
     # Keep a handle so session.interrupt can tell a live turn from a stuck
     # `running` flag (a turn that died without clearing it) and recover the latter.
-    session["_run_thread"] = run_thread
-    run_thread.start()
+    _start_run_thread(session, run_thread)
     return _ok(
         rid,
         {
             "status": "streaming",
+            "accepted_turn": accepted_turn,
+            **({"input_event_id": input_receipt.event_id} if input_receipt is not None else {}),
             **(
                 {"survivor_user_row_ids": survivor_user_row_ids}
                 if survivor_user_row_ids is not None
@@ -1518,7 +1700,9 @@ def _(rid, params: dict) -> dict:
     # from _pending) while the card is still visible — common when a WebSocket
     # reconnect during the wait drops tool.complete. A late answer must resolve
     # gracefully instead of hitting the raw 4009 "no pending answer request".
-    return _respond(rid, params, "answer", allow_expired=True)
+    if (response := _respond_host_clarify(rid, params)) is not None:
+        return response
+    return _respond(rid, params, "answer", allow_expired=True, idempotent=True)
 
 
 @method("terminal.read.respond")

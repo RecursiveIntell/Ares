@@ -25,7 +25,7 @@ Design choices:
   ``beforeFileEdited`` / ``getNewDiagnostics`` pattern, except wired
   to the local LSP layer instead of MCP IDE RPC.
 
-The service is **off by default** — call :meth:`is_active` to check
+The service is **enabled by default** — call :meth:`is_active` to check
 whether it's actually doing anything.  When LSP is disabled in
 config, when no git workspace can be detected, when all configured
 servers are missing binaries and auto-install is off, ``is_active``
@@ -156,7 +156,17 @@ class LSPService:
         init_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
         disabled_servers: Optional[List[str]] = None,
         idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
+        profile_boundary=None,
     ) -> None:
+        from agent.secret_scope import build_profile_env_boundary
+        from hermes_constants import get_hermes_home, get_process_hermes_home
+
+        boundary = profile_boundary or build_profile_env_boundary(
+            get_process_hermes_home(), get_hermes_home(),
+        )
+        self._profile_home = boundary.target_home
+        self._source_home = boundary.source_home
+        self._profile_generation = boundary.target_generation
         self._enabled = enabled
         self._wait_mode = wait_mode if wait_mode in {"document", "full"} else "document"
         self._wait_timeout = wait_timeout
@@ -189,7 +199,7 @@ class LSPService:
             self._loop.run(self._start_idle_reaper(), timeout=2.0)
 
     @classmethod
-    def create_from_config(cls) -> Optional["LSPService"]:
+    def create_from_config(cls, *, config=None, profile_boundary=None) -> Optional["LSPService"]:
         """Build a service from ``hermes_cli.config`` settings.
 
         Returns ``None`` if the config can't be loaded.  The service
@@ -197,7 +207,7 @@ class LSPService:
         """
         try:
             from hermes_cli.config import load_config_readonly
-            cfg = load_config_readonly()
+            cfg = load_config_readonly() if config is None else config
         except Exception as e:  # noqa: BLE001
             logger.debug("LSP config load failed: %s", e)
             return None
@@ -251,6 +261,7 @@ class LSPService:
             init_overrides=init_overrides,
             disabled_servers=disabled,
             idle_timeout=idle_timeout,
+            profile_boundary=profile_boundary,
         )
 
     # ------------------------------------------------------------------
@@ -471,6 +482,7 @@ class LSPService:
         except Exception as e:  # noqa: BLE001
             logger.debug("LSP shutdown error: %s", e)
         self._loop.stop()
+        self._enabled = False
         clear_cache()
 
     # ------------------------------------------------------------------
@@ -533,6 +545,17 @@ class LSPService:
         return list(client.diagnostics_for(file_path, fresh_only=True))
 
     async def _get_or_spawn(self, file_path: str) -> Optional[LSPClient]:
+        if not self._enabled:
+            return None
+        from agent.secret_scope import build_profile_env_boundary
+        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+
+        try:
+            boundary = build_profile_env_boundary(self._source_home, self._profile_home)
+        except Exception:
+            return None
+        if boundary.target_generation != self._profile_generation:
+            return None
         srv = find_server_for_file(file_path)
         if srv is None:
             return None
@@ -579,7 +602,11 @@ class LSPService:
                 env_overrides=self._env_overrides,
                 init_overrides=self._init_overrides,
             )
-            spec = srv.build_spawn(per_server_root, ctx)
+            home_token = set_hermes_home_override(self._profile_home)
+            try:
+                spec = srv.build_spawn(per_server_root, ctx)
+            finally:
+                reset_hermes_home_override(home_token)
             if spec is None:
                 # ``build_spawn`` returns None when the binary can't be
                 # located (auto-install disabled, manual-only server,
@@ -597,6 +624,7 @@ class LSPService:
                 cwd=spec.cwd,
                 initialization_options=spec.initialization_options,
                 seed_diagnostics_on_first_push=spec.seed_diagnostics_on_first_push or srv.seed_first_push,
+                profile_boundary=boundary,
             )
             try:
                 await client.start()

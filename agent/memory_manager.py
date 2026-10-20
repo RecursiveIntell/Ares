@@ -1293,7 +1293,7 @@ class MemoryManager:
                     provider.name, e,
                 )
 
-    def shutdown_all(self) -> None:
+    def shutdown_all(self, *, preserve_providers=()) -> None:
         """Shut down all providers (reverse order for clean teardown).
 
         Drains the background sync/prefetch executor first (bounded by
@@ -1301,9 +1301,14 @@ class MemoryManager:
         land before providers are torn down. The worker threads are
         daemon, so anything still wedged past the drain window dies with
         the interpreter rather than blocking exit.
+
+        A same-session replacement may borrow provider instances. Drain this
+        manager's executor, but leave those exact live-owner instances open.
         """
         self._drain_sync_executor()
         for provider in reversed(self._providers):
+            if any(provider is preserved for preserved in preserve_providers):
+                continue
             try:
                 provider.shutdown()
             except Exception as e:

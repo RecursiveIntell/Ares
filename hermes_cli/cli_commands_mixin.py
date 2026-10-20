@@ -2894,7 +2894,13 @@ class CLICommandsMixin:
                 queued = False
                 if prompt:
                     try:
-                        self._pending_input.put(prompt)
+                        queue_internal = getattr(
+                            self, "_queue_internal_input", None
+                        )
+                        if callable(queue_internal):
+                            queue_internal(prompt, source="goal_continuation")
+                        else:
+                            self._pending_input.put(prompt)
                         queued = True
                     except Exception:
                         pass
@@ -3052,7 +3058,7 @@ class CLICommandsMixin:
 
         _cprint(f"  {_DIM}Drafting completion contract…{_RST}")
         try:
-            contract = draft_contract(objective)
+            contract = draft_contract(objective, session_id=getattr(mgr, "session_id", None))
         except Exception as exc:
             import logging as _logging
             _logging.getLogger(__name__).debug("goal draft failed: %s", exc)

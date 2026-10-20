@@ -551,6 +551,7 @@ class AIAgent:
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
         requested_provider: str = None,
+        _resource_preserve_agent=None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         if tool_delay is not None:
@@ -561,87 +562,97 @@ class AIAgent:
                 stacklevel=2,
             )
         from agent.agent_init import init_agent
-        init_agent(
-            self,
-            base_url=base_url,
-            api_key=api_key,
-            provider=provider,
-            requested_provider=requested_provider,
-            api_mode=api_mode,
-            acp_command=acp_command,
-            acp_args=acp_args,
-            command=command,
-            args=args,
-            model=model,
-            max_iterations=max_iterations,
-            enabled_toolsets=enabled_toolsets,
-            disabled_toolsets=disabled_toolsets,
-            save_trajectories=save_trajectories,
-            verbose_logging=verbose_logging,
-            quiet_mode=quiet_mode,
-            tool_progress_mode=tool_progress_mode,
-            ephemeral_system_prompt=ephemeral_system_prompt,
-            log_prefix_chars=log_prefix_chars,
-            log_prefix=log_prefix,
-            providers_allowed=providers_allowed,
-            providers_ignored=providers_ignored,
-            providers_order=providers_order,
-            provider_sort=provider_sort,
-            provider_require_parameters=provider_require_parameters,
-            provider_data_collection=provider_data_collection,
-            openrouter_min_coding_score=openrouter_min_coding_score,
-            session_id=session_id,
-            tool_progress_callback=tool_progress_callback,
-            tool_start_callback=tool_start_callback,
-            tool_complete_callback=tool_complete_callback,
-            thinking_callback=thinking_callback,
-            reasoning_callback=reasoning_callback,
-            clarify_callback=clarify_callback,
-            read_terminal_callback=read_terminal_callback,
-            read_preview_callback=read_preview_callback,
-            drive_preview_callback=drive_preview_callback,
-            read_window_below_callback=read_window_below_callback,
-            setup_mcp_callback=setup_mcp_callback,
-            tour_callback=tour_callback,
-            step_callback=step_callback,
-            stream_delta_callback=stream_delta_callback,
-            interim_assistant_callback=interim_assistant_callback,
-            tool_gen_callback=tool_gen_callback,
-            status_callback=status_callback,
-            notice_callback=notice_callback,
-            notice_clear_callback=notice_clear_callback,
-            event_callback=event_callback,
-            reaction_callback=reaction_callback,
-            max_tokens=max_tokens,
-            reasoning_config=reasoning_config,
-            service_tier=service_tier,
-            request_overrides=request_overrides,
-            prefill_messages=prefill_messages,
-            platform=platform,
-            user_id=user_id,
-            user_id_alt=user_id_alt,
-            user_name=user_name,
-            chat_id=chat_id,
-            chat_name=chat_name,
-            chat_type=chat_type,
-            thread_id=thread_id,
-            gateway_session_key=gateway_session_key,
-            skip_context_files=skip_context_files,
-            load_soul_identity=load_soul_identity,
-            skip_memory=skip_memory,
-            skip_background_review=skip_background_review,
-            session_db=session_db,
-            parent_session_id=parent_session_id,
-            iteration_budget=iteration_budget,
-            run_budget_seconds=run_budget_seconds,
-            fallback_model=fallback_model,
-            credential_pool=credential_pool,
-            checkpoints_enabled=checkpoints_enabled,
-            checkpoint_max_snapshots=checkpoint_max_snapshots,
-            checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
-            checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
-            pass_session_id=pass_session_id,
-        )
+        try:
+            init_agent(
+                self,
+                base_url=base_url,
+                api_key=api_key,
+                provider=provider,
+                requested_provider=requested_provider,
+                api_mode=api_mode,
+                acp_command=acp_command,
+                acp_args=acp_args,
+                command=command,
+                args=args,
+                model=model,
+                max_iterations=max_iterations,
+                enabled_toolsets=enabled_toolsets,
+                disabled_toolsets=disabled_toolsets,
+                save_trajectories=save_trajectories,
+                verbose_logging=verbose_logging,
+                quiet_mode=quiet_mode,
+                tool_progress_mode=tool_progress_mode,
+                ephemeral_system_prompt=ephemeral_system_prompt,
+                log_prefix_chars=log_prefix_chars,
+                log_prefix=log_prefix,
+                providers_allowed=providers_allowed,
+                providers_ignored=providers_ignored,
+                providers_order=providers_order,
+                provider_sort=provider_sort,
+                provider_require_parameters=provider_require_parameters,
+                provider_data_collection=provider_data_collection,
+                openrouter_min_coding_score=openrouter_min_coding_score,
+                session_id=session_id,
+                tool_progress_callback=tool_progress_callback,
+                tool_start_callback=tool_start_callback,
+                tool_complete_callback=tool_complete_callback,
+                thinking_callback=thinking_callback,
+                reasoning_callback=reasoning_callback,
+                clarify_callback=clarify_callback,
+                read_terminal_callback=read_terminal_callback,
+                read_preview_callback=read_preview_callback,
+                drive_preview_callback=drive_preview_callback,
+                read_window_below_callback=read_window_below_callback,
+                setup_mcp_callback=setup_mcp_callback,
+                tour_callback=tour_callback,
+                step_callback=step_callback,
+                stream_delta_callback=stream_delta_callback,
+                interim_assistant_callback=interim_assistant_callback,
+                tool_gen_callback=tool_gen_callback,
+                status_callback=status_callback,
+                notice_callback=notice_callback,
+                notice_clear_callback=notice_clear_callback,
+                event_callback=event_callback,
+                reaction_callback=reaction_callback,
+                max_tokens=max_tokens,
+                reasoning_config=reasoning_config,
+                service_tier=service_tier,
+                request_overrides=request_overrides,
+                prefill_messages=prefill_messages,
+                platform=platform,
+                user_id=user_id,
+                user_id_alt=user_id_alt,
+                user_name=user_name,
+                chat_id=chat_id,
+                chat_name=chat_name,
+                chat_type=chat_type,
+                thread_id=thread_id,
+                gateway_session_key=gateway_session_key,
+                skip_context_files=skip_context_files,
+                load_soul_identity=load_soul_identity,
+                skip_memory=skip_memory,
+                skip_background_review=skip_background_review,
+                session_db=session_db,
+                parent_session_id=parent_session_id,
+                iteration_budget=iteration_budget,
+                run_budget_seconds=run_budget_seconds,
+                fallback_model=fallback_model,
+                credential_pool=credential_pool,
+                checkpoints_enabled=checkpoints_enabled,
+                checkpoint_max_snapshots=checkpoint_max_snapshots,
+                checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
+                checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
+                pass_session_id=pass_session_id,
+            )
+        except Exception:
+            # The constructor may fail after creating local clients/providers.
+            # No caller receives this object, so retire them here without
+            # ending its shared session or masking the construction failure.
+            try:
+                self.retire_local_resources(preserve_agent=_resource_preserve_agent)
+            except Exception:
+                logger.debug("Partial agent initialization cleanup failed", exc_info=True)
+            raise
 
     def _get_session_db_for_recall(self):
         """Return a SessionDB for recall, lazily creating it if an entrypoint forgot.
@@ -726,6 +737,7 @@ class AIAgent:
         previous_messages: Optional[list] = None,
         carry_over_context: bool = False,
         reset_engine: bool = True,
+        strict: bool = False,
         **extra_context,
     ) -> None:
         """Notify the active context engine about a host session transition.
@@ -745,12 +757,16 @@ class AIAgent:
             try:
                 engine.on_session_end(old_session_id, previous_messages)
             except Exception as exc:
+                if strict:
+                    raise
                 logger.debug("context engine on_session_end during transition: %s", exc)
 
         if reset_engine and hasattr(engine, "on_session_reset"):
             try:
                 engine.on_session_reset()
             except Exception as exc:
+                if strict:
+                    raise
                 logger.debug("context engine on_session_reset during transition: %s", exc)
 
         should_start = bool(
@@ -774,6 +790,8 @@ class AIAgent:
             try:
                 engine.on_session_start(target_session_id, **start_context)
             except Exception as exc:
+                if strict:
+                    raise
                 logger.debug("context engine on_session_start during transition: %s", exc)
 
         if (
@@ -785,6 +803,8 @@ class AIAgent:
             try:
                 engine.carry_over_new_session_context(old_session_id, target_session_id)
             except Exception as exc:
+                if strict:
+                    raise
                 logger.debug("context engine carry_over_new_session_context during transition: %s", exc)
 
     def reset_session_state(
@@ -2398,6 +2418,7 @@ class AIAgent:
                     "codex_message_items": msg.get("codex_message_items"),
                     "_compressed_summary": bool(msg.get(COMPRESSED_SUMMARY_METADATA_KEY)),
                     "timestamp": _row_timestamp,
+                    "_context_input": msg.get("_context_input"),
                     "api_content": _row_api_content,
                     # Standalone reference handoffs are always hidden, even
                     # when the summarized transcript contained a user turn —
@@ -2447,7 +2468,12 @@ class AIAgent:
                     )
                     or 300.0,
                 )
-                for _written in _batch_msgs:
+                for _written, _row in zip(_batch_msgs, _batch_rows):
+                    # SessionDB publishes these coordinates only after commit.
+                    # Preserve that projection across serialization copies;
+                    # it is not producer authentication or execution authority.
+                    if "_row_id" in _row:
+                        _written["_row_id"] = _row["_row_id"]
                     _written[_DB_PERSISTED_MARKER] = True
             # The intrinsic markers are now the sole source of truth. Reset the
             # one-shot seed so no id() outlives this flush to alias a message
@@ -3307,6 +3333,7 @@ class AIAgent:
         *,
         hard_cancel: bool = False,
         tool_reason: Optional[str] = None,
+        operation_id: Optional[str] = None,
     ) -> None:
         """
         Request the agent to interrupt its current tool-calling loop.
@@ -3460,6 +3487,31 @@ class AIAgent:
                     child.interrupt(message)
             except Exception as e:
                 logger.debug("Failed to propagate interrupt to child agent: %s", e)
+        # Cancel sockets, tools, children and the compression fence before a
+        # storage operation can block. A missing durable acknowledgement must
+        # never turn a local stop into permission to resume.
+        if hard_cancel:
+            self._context_stop_receipt = None
+            try:
+                from ares_runtime.continuity.runtime import context_dispatch_required
+
+                if context_dispatch_required(self):
+                    db = getattr(self, "_session_db", None)
+                    self._context_stop_unacknowledged = True
+                    if db is None or not getattr(self, "session_id", None):
+                        raise RuntimeError("CONTEXT_DISPATCH_OWNER_UNAVAILABLE")
+                    stop_session_id = self.session_id
+                    if operation_id is None:
+                        control = db.record_context_stop(stop_session_id)
+                        self._context_stop_receipt = {"session_key": stop_session_id, "control": control}
+                    else:
+                        result = db.record_context_stop_operation(stop_session_id, operation_id=operation_id)
+                        self._context_stop_receipt = {"session_key": stop_session_id,
+                            "control": result["receipt"]["control"], "operation": result["receipt"]}
+                    self._context_stop_unacknowledged = False
+            except Exception:
+                self._context_stop_unacknowledged = True
+                logger.error("Context stop cancelled locally; durable acknowledgement failed")
         if not self.quiet_mode:
             print("\n⚡ Interrupt requested" + (f": '{message[:40]}...'" if message and len(message) > 40 else f": '{message}'" if message else ""))
 
@@ -3468,6 +3520,7 @@ class AIAgent:
         message: Optional[str] = None,
         *,
         tool_reason: Optional[str] = None,
+        operation_id: Optional[str] = None,
     ) -> None:
         """Request an explicit stop while preserving ``interrupt()`` ABI.
 
@@ -3482,6 +3535,7 @@ class AIAgent:
             message,
             hard_cancel=True,
             tool_reason=tool_reason,
+            operation_id=operation_id,
         )
 
     def clear_interrupt(self, *, preserve_redirect: bool = False) -> bool:
@@ -4451,26 +4505,40 @@ class AIAgent:
             },
         )
 
-    def shutdown_memory_provider(self, messages: list = None) -> None:
-        """Shut down the memory provider and context engine at session end.
+    def shutdown_memory_provider(
+        self, messages: list = None, *, end_session: bool = True, preserve_agent=None,
+    ) -> None:
+        """Shut down this instance's memory provider.
 
         Idempotent: gateway cleanup and AIAgent.close() may share this
-        ownership boundary.
+        ownership boundary. Local replacement passes end_session=False:
+        provider/engine shutdown releases instance resources, but logical
+        session-end hooks must wait for a real session boundary.
+        preserve_agent identifies the live owner of any borrowed instances.
         """
         if getattr(self, "_memory_provider_shutdown", False):
             return
         self._memory_provider_shutdown = True
-        if self._memory_manager:
+        memory_manager = getattr(self, "_memory_manager", None)
+        preserved_manager = getattr(preserve_agent, "_memory_manager", None)
+        if memory_manager and memory_manager is not preserved_manager:
+            if end_session:
+                try:
+                    memory_manager.on_session_end(messages or [])
+                except Exception as e:
+                    logger.warning("Memory provider on_session_end failed during shutdown: %s", e, exc_info=True)
             try:
-                self._memory_manager.on_session_end(messages or [])
-            except Exception as e:
-                logger.warning("Memory provider on_session_end failed during shutdown: %s", e, exc_info=True)
-            try:
-                self._memory_manager.shutdown_all()
+                if preserved_manager is None:
+                    memory_manager.shutdown_all()
+                else:
+                    memory_manager.shutdown_all(
+                        preserve_providers=preserved_manager.providers,
+                    )
             except Exception:
                 pass
+
         # Notify context engine of session end (flush DAG, close DBs, etc.)
-        if hasattr(self, "context_compressor") and self.context_compressor:
+        if end_session and hasattr(self, "context_compressor") and self.context_compressor:
             try:
                 self.context_compressor.on_session_end(
                     self.session_id or "",
@@ -4478,6 +4546,14 @@ class AIAgent:
                 )
             except Exception:
                 pass
+
+        engine = getattr(self, "context_compressor", None)
+        engine_shutdown = getattr(engine, "shutdown", None)
+        if engine is not getattr(preserve_agent, "context_compressor", None) and callable(engine_shutdown):
+            try:
+                engine_shutdown()
+            except Exception:
+                logger.debug("Context engine local shutdown failed", exc_info=True)
 
     def commit_memory_session(self, messages: list = None) -> None:
         """Trigger end-of-session extraction without tearing providers down.
@@ -4633,6 +4709,30 @@ class AIAgent:
             self._close_cached_request_anthropic_client(reason="cache_evict")
         except Exception:
             pass
+
+    def retire_local_resources(self, *, preserve_agent=None) -> None:
+        """Retire this instance while its logical session continues elsewhere.
+
+        Capability refresh constructs separate providers for the same session
+        ID. Drain their work without logical session-end hooks, ending the
+        SQLite row, closing its shared DB, or destroying task-scoped tools.
+        Context engines release only instance handles through shutdown(),
+        reserving on_session_end for real session boundaries. Native transport
+        retirement has a separate ownership boundary in the caller.
+        Borrowed provider/engine instances belonging to preserve_agent survive.
+        """
+        if getattr(self, "_local_resources_retired", False):
+            return
+        self._local_resources_retired = True
+        try:
+            self.release_clients()
+        finally:
+            session_messages = getattr(self, "_session_messages", None)
+            self.shutdown_memory_provider(
+                session_messages if isinstance(session_messages, list) else None,
+                end_session=False,
+                preserve_agent=preserve_agent,
+            )
 
     def close(self) -> None:
         """Release all resources held by this agent instance.
@@ -4796,11 +4896,12 @@ class AIAgent:
 
     def _hydrate_todo_store(self, history: List[Dict[str, Any]]) -> None:
         """
-        Recover todo state from conversation history.
-        
-        The gateway creates a fresh AIAgent per message, so the in-memory
-        TodoStore is empty. We scan the history for the most recent todo
-        tool response and replay it to reconstruct the state.
+        Prefer the exact SessionDB owner's selection, including empty state.
+
+        Owner validation errors abort recovery, never fall through to history.
+        SessionDB's application provenance is not authentication against a
+        privileged writer. The legacy paired-history path below remains only
+        a structural compatibility reconstruction when no owner version exists.
 
         Hydration is restricted to tool results that are paired with an
         earlier assistant ``todo`` tool call. The gateway/API server accepts
@@ -4810,6 +4911,28 @@ class AIAgent:
         (GHSA-5g4g-6jrg-mw3g).
         """
         from tools.todo_tool import MAX_TODO_RESULT_CHARS
+
+        db = getattr(self, "_session_db", None)
+        if db is not None and not getattr(self, "_persist_disabled", False):
+            from hermes_state import TodoSnapshotError
+
+            selection = db.get_todo_recovery_state(self.session_id)
+            if selection.state == "selected":
+                self._todo_store.write(selection.snapshot["todos"], merge=False)
+                return
+            if selection.state == "cleared_by_rewind":
+                self._todo_store.write([], merge=False)
+                return
+            if selection.state == "missing_session":
+                if getattr(self, "_session_db_created", False):
+                    raise TodoSnapshotError("session")
+            elif selection.state != "never_committed":
+                raise TodoSnapshotError("selection")
+
+        # Legacy hydration is only for an empty local store. Canonical selection
+        # above runs every turn, including when an old local list is nonempty.
+        if self._todo_store.has_items():
+            return
 
         # Walk history backwards to find the most recent todo tool response
         last_todo_response = None
@@ -4847,7 +4970,6 @@ class AIAgent:
             self._todo_store.write(last_todo_response, merge=False)
             if not self.quiet_mode:
                 self._vprint(f"{self.log_prefix}📋 Restored {len(last_todo_response)} todo item(s) from history")
-        _set_interrupt(False)
 
     @classmethod
     def _tool_response_matches_todo_call(
@@ -8530,6 +8652,9 @@ class AIAgent:
         persist_user_display_kind: Optional[str] = None,
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        persist_user_event_id: Optional[str] = None,
+        persist_user_input_receipt: Optional[Any] = None,
+        persist_user_input_authorizer: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         # A review deliberately shares this agent's session_id for prompt-cache
@@ -8586,6 +8711,7 @@ class AIAgent:
         task_started = False
         task_finished = False
         relay_outcome = "failed"
+        input_receipt = None
 
         def _stop_durable_turn_lease_refresher() -> None:
             nonlocal durable_turn_lease_turn_active
@@ -8623,6 +8749,12 @@ class AIAgent:
             # process; this durable lease covers Desktop, CLI resume, gateway,
             # and background delivery processes sharing state.db (#84234).
             _turn_db = getattr(self, "_session_db", None)
+            if persist_user_input_receipt is not None and (
+                getattr(self, "_persist_disabled", False)
+                or not callable(getattr(type(_turn_db), "acquire_session_turn_lease", None))
+            ):
+                from hermes_state_continuity import ContextContinuationError
+                raise ContextContinuationError("CONTEXT_INPUT_OWNER_UNAVAILABLE")
             _durable_session_exists = False
             if _turn_db is not None and session_id:
                 try:
@@ -8640,16 +8772,14 @@ class AIAgent:
                         "will acquire rather than run without serialization",
                         exc_info=True,
                     )
-                    _durable_session_exists = True
+                    # The probe did not establish existence. Admission below
+                    # still takes the lease, then ensures the row before effects.
             if (
                 _turn_db is not None
                 and session_id
                 and not getattr(self, "_persist_disabled", False)
-                # A fresh session id is process-unique and has no durable
-                # transcript to race over. More importantly, subagent/new-turn
-                # callers may intentionally supply an in-memory seed before the
-                # row exists; reloading an absent row would erase that seed.
-                and _durable_session_exists
+                # Fresh turns need custody too: todo publication is fenced by
+                # this owner. Reload only after contention, preserving fresh seeds.
                 # Test doubles and third-party DB shims may accept arbitrary
                 # MagicMock attributes without implementing the protocol. Check
                 # the concrete type so only real implementations opt in.
@@ -8657,10 +8787,26 @@ class AIAgent:
                     getattr(type(_turn_db), "acquire_session_turn_lease", None)
                 )
             ):
-                # Resumed agents also defer their create check until the turn
-                # prologue. We just proved this row exists, so suppress the
-                # redundant create attempt after acquiring it.
-                self._session_db_created = True
+                # Only a positive probe suppresses lazy creation. An absent row
+                # must be established under custody before the loop can act.
+                if _durable_session_exists:
+                    self._session_db_created = True
+                from ares_runtime.continuity.runtime import context_dispatch_required
+                if context_dispatch_required(self) or persist_user_input_receipt is not None:
+                    from hermes_state_continuity import ContextContinuationError
+                    # Create only the canonical session identity before input
+                    # acceptance. Transcript projection still requires custody.
+                    self._ensure_db_session()
+                    if not self._session_db_created:
+                        raise ContextContinuationError("CONTEXT_INPUT_SESSION_MISSING")
+                    from agent.context_input import accept_turn_input
+                    input_receipt = accept_turn_input(self, user_message=user_message,
+                        persist_user_message=persist_user_message, timestamp=persist_user_timestamp,
+                        display_kind=persist_user_display_kind, display_metadata=persist_user_display_metadata,
+                        event_id=persist_user_event_id, accepted_receipt=persist_user_input_receipt)
+                    if input_receipt is not None:
+                        persist_user_timestamp = input_receipt.timestamp
+                        persist_user_display_metadata = input_receipt.display_metadata
                 _durable_holder = (
                     f"pid={os.getpid()}:turn={relay_turn_id}:platform="
                     f"{task_context['platform'] or 'unknown'}"
@@ -8700,6 +8846,8 @@ class AIAgent:
                             "Stopped waiting for another Hermes process on "
                             "this session. Your message was not processed."
                         )
+                        if input_receipt is not None:
+                            interrupt_msg = "Stopped waiting. Your message is durably queued and has not been processed."
                         interrupt_result = {
                             "final_response": interrupt_msg,
                             "messages": list(conversation_history or []),
@@ -8731,6 +8879,8 @@ class AIAgent:
                         "long. Your message was not processed - wait for the "
                         "other process to finish, then send it again."
                     )
+                    if input_receipt is not None:
+                        timeout_msg = "The conversation is still busy. Your message is durably queued and has not been processed."
                     logger.error(
                         "session turn lease wait timed out for %s",
                         session_id,
@@ -8757,6 +8907,10 @@ class AIAgent:
                 # the agent attr so a late flush after reclaim is fenced in
                 # the same SQLite write transaction as the transcript insert.
                 durable_turn_lease = _durable_holder
+                self._context_input_receipt = input_receipt
+                self._context_input_authorizer = persist_user_input_authorizer
+                self._context_input_phase = None
+                self._context_input_existing_message = None
                 from agent.run_checkpoint_custody import TurnRunCustody
                 turn_run_custody = getattr(self, "_run_checkpoint_custody", None)
                 if turn_run_custody is None:
@@ -8787,7 +8941,36 @@ class AIAgent:
                         self.session_id,
                         repair_alternation=True,
                         include_row_ids=True,
+                        include_summary_markers=True,
                     )
+
+                self._ensure_db_session()
+                if not self._session_db_created:
+                    # _ensure_db_session logs transient errors for retry on a
+                    # later turn; they must not admit this turn without storage.
+                    # The outer finally releases the already-acquired lease.
+                    return {
+                        "final_response": "Session storage could not be established. Your message was not processed.",
+                        "messages": list(conversation_history or []),
+                        "api_calls": 0,
+                        "completed": False,
+                        "failed": True,
+                        "error": f"session_persistence_admission_failed:{self.session_id}",
+                    }
+
+                if input_receipt is not None:
+                    # The addressed alias may have advanced without contention
+                    # in this process. Resolve it under the root lease.
+                    tip = _turn_db.get_context_continuation_tip(self.session_id)
+                    if tip != self.session_id:
+                        self.session_id = tip
+                        task_context["session_id"] = tip
+                        conversation_history = _turn_db.get_messages_as_conversation(
+                            tip, repair_alternation=False, include_row_ids=True,
+                            include_summary_markers=True)
+                    from agent.context_input import project_turn_inputs
+                    conversation_history = project_turn_inputs(self, input_receipt,
+                        holder=_durable_holder, conversation_history=conversation_history)
 
                 # Long model/tool/compression turns outlive a fixed TTL. Refresh
                 # in a daemon thread; holder-qualified UPDATE and DELETE fence a
@@ -8890,12 +9073,16 @@ class AIAgent:
                 getattr(self, "session_id", None),
             )
             from agent.auxiliary_client import scoped_runtime_main
+            from hermes_state_inbox import context_input_turn_lease_scope
+            from ares_runtime.managed_calls import model_call_owner_scope
 
             # The outer token restores the caller's Context even though turn setup
             # replaces the value with the live runtime after fallback restoration.
             # Keep the scope local instead of storing ContextVar tokens on the agent,
             # which may be observed from another thread.
-            with bind_subagent_parent(self), scoped_runtime_main({}):
+            with model_call_owner_scope(self), bind_subagent_parent(self), scoped_runtime_main({}), context_input_turn_lease_scope(
+                getattr(self, "_session_db", None), durable_turn_lease,
+            ):
                 try:
                     if durable_turn_lease_thread is not None:
                         with durable_turn_lease_activity_lock:
@@ -8954,6 +9141,10 @@ class AIAgent:
                 finish_task_run(**task_context, error=exc)
             raise
         finally:
+            if durable_turn_lease is not None:
+                self._context_input_receipt = None
+                self._context_input_authorizer = None
+                self._context_input_existing_message = None
             try:
                 if relay_turn is not None:
                     relay_runtime.SESSION_COORDINATOR.end_turn(
@@ -8978,6 +9169,13 @@ class AIAgent:
                     # late interrupt does not survive into the next turn.
                     _clear_durable_turn_lease_interrupt()
                     if durable_turn_lease is not None:
+                        if input_receipt is not None:
+                            try:
+                                _turn_db.release_context_input_turn(self.session_id,
+                                    turn_lease_holder=durable_turn_lease)
+                            except Exception:
+                                logger.error("Input execution release requires native reconciliation", exc_info=True)
+                        self._context_input_phase = None
                         if turn_run_custody is not None:
                             try:
                                 cleanup_errors = turn_run_custody.finish_turn(durable_turn_lease)

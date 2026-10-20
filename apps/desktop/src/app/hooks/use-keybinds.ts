@@ -4,7 +4,14 @@ import { useLocation, useNavigate } from 'react-router'
 import { closeActiveTab } from '@/app/chat/close-tab'
 import { hudTargetSessionId } from '@/app/hud/handoff'
 import { setTerminalTakeover } from '@/app/right-sidebar/store'
-import { closeActiveTerminal, createTerminal, cycleTerminal } from '@/app/right-sidebar/terminal/terminals'
+import { requestTerminalFocus } from '@/app/right-sidebar/terminal/focus'
+import {
+  $activeTerminalId,
+  closeActiveTerminal,
+  createTerminal,
+  cycleTerminal,
+  ensureTerminal
+} from '@/app/right-sidebar/terminal/terminals'
 import { appViewForPath, isOverlayView } from '@/app/routes'
 import {
   activateTreeTabSlot,
@@ -253,7 +260,18 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
     'view.showFiles': showFiles,
     'view.showBrowser': openBrowserTab,
     'view.toggleHud': () => toggleHud(hudTargetSessionId()),
-    'view.showTerminal': () => togglePaneVisible('terminal'),
+    'view.showTerminal': () => {
+      togglePaneVisible('terminal')
+
+      if (isPaneVisible('terminal')) {
+        ensureTerminal()
+        const id = $activeTerminalId.get()
+
+        if (id) {
+          requestTerminalFocus(id)
+        }
+      }
+    },
     // Create first so the pane's open-effect ensure sees a non-empty set and
     // doesn't also spawn one — net effect is exactly one fresh terminal.
     'view.newTerminal': () => {
@@ -396,7 +414,7 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
         return
       }
 
-      if (isEditableTarget(event.target) && !actionAllowedInInput(actionId, combo)) {
+      if (isEditableTarget(event.target) && !actionAllowedInInput(actionId, combo, event.target)) {
         return
       }
 

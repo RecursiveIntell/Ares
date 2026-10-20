@@ -2158,32 +2158,58 @@ def _mark_verification_stale(
     session_id: str | None = None,
 ) -> None:
     """Best-effort note that successful edits made prior verification stale."""
-    paths = [p for p in resolved_paths if p]
+    paths = list(dict.fromkeys(p for p in resolved_paths if p))
     if not paths:
         return
     try:
         from agent.coding_context import project_facts_for
         from agent.verification_evidence import mark_workspace_edited
 
-        cwd = None
-        for path in paths:
-            try:
-                candidate = str(Path(path).parent)
-            except Exception:
-                continue
-            if project_facts_for(candidate):
-                cwd = candidate
-                break
-        if cwd is None:
-            cwd = _authoritative_workspace_root(task_id)
-        if cwd is None:
-            try:
-                cwd = str(Path(paths[0]).parent)
-            except Exception:
-                cwd = None
-        mark_workspace_edited(session_id=session_id or task_id, cwd=cwd, paths=paths)
     except Exception:
         logger.debug("verification stale marker failed", exc_info=True)
+        return
+
+    grouped_paths: dict[str | None, list[str]] = {}
+    unresolved: list[str] = []
+    for path in paths:
+        try:
+            candidate = str(Path(path).parent)
+            facts = project_facts_for(candidate)
+        except Exception:
+            facts = None
+        if facts:
+            root = str(facts.get("root") or candidate)
+            grouped_paths.setdefault(root, []).append(path)
+        else:
+            unresolved.append(path)
+
+    if unresolved:
+        try:
+            cwd = _authoritative_workspace_root(task_id)
+        except Exception:
+            cwd = None
+        if cwd is None:
+            try:
+                cwd = str(Path(unresolved[0]).parent)
+            except Exception:
+                cwd = None
+        try:
+            facts = project_facts_for(cwd)
+            if facts:
+                cwd = str(facts.get("root") or cwd)
+        except Exception:
+            pass
+        if cwd is not None:
+            grouped_paths.setdefault(cwd, []).extend(unresolved)
+
+    for cwd, changed_paths in grouped_paths.items():
+        try:
+            mark_workspace_edited(
+                session_id=session_id or task_id, cwd=cwd, paths=changed_paths
+            )
+        except Exception:
+            # One failed best-effort marker must not skip another workspace.
+            logger.debug("verification stale marker failed", exc_info=True)
 
 
 def _check_binary_document_write(filepath: str, task_id: str = "default") -> str | None:

@@ -32,9 +32,8 @@ test.afterAll(async () => {
 })
 
 test.describe('dev-mode boot with mock backend', () => {
-  test('window opens with Hermes title', async () => {
-    const title = await fixture!.page.title()
-    expect(title).toContain('Hermes')
+  test('window opens with Ares title', async () => {
+    await expect(fixture!.page).toHaveTitle('Ares')
   })
 
   test('renderer mounts and shows DOM content', async () => {

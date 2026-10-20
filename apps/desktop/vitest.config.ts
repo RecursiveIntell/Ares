@@ -22,12 +22,22 @@ const electronNative: TestProjectConfiguration = {
     name: 'electron',
     environment: 'node',
     include: ['electron/**/*.test.ts', 'scripts/**.test.{ts,mjs}'],
-    exclude: ['scripts/run-short-session-hang-repro.test.mjs']
+    exclude: ['scripts/run-short-session-hang-repro.test.mjs', 'electron/**/*.native.test.ts']
+  }
+}
+
+// These real Linux callers require the repository Python environment, unlike
+// the portable Node-only platform suite. CI runs them after Python provisioning.
+const securityNative: TestProjectConfiguration = {
+  test: {
+    name: 'native-security',
+    environment: 'node',
+    include: ['electron/**/*.native.test.ts']
   }
 }
 
 export default defineConfig({
   test: {
-    projects: [reactUi, electronNative]
+    projects: [reactUi, electronNative, securityNative]
   }
 })

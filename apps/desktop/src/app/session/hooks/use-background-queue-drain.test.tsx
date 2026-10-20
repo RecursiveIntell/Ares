@@ -8,6 +8,7 @@ import {
   $queuedPromptsBySession,
   enqueueQueuedPrompt,
   getQueuedPrompts,
+  markQueuedPromptDeliveryUnknown,
   parkQueuedPrompts
 } from '@/store/composer-queue'
 import { $sessions, setSessions } from '@/store/session'
@@ -84,12 +85,15 @@ describe('useBackgroundQueueDrain', () => {
     render(<Harness runtimeMap={runtimeMap} submitText={submitText} />)
 
     await waitFor(() => {
-      expect(submitText).toHaveBeenCalledWith('continue in the background', {
-        attachments: [],
-        fromQueue: true,
-        sessionId: 'rt-session-a',
-        storedSessionId: 'stored-session-a'
-      })
+      expect(submitText).toHaveBeenCalledWith(
+        'continue in the background',
+        expect.objectContaining({
+          attachments: [],
+          fromQueue: true,
+          sessionId: 'rt-session-a',
+          storedSessionId: 'stored-session-a'
+        })
+      )
     })
 
     await waitFor(() => expect(getQueuedPrompts('stored-session-a')).toHaveLength(0))
@@ -179,6 +183,20 @@ describe('useBackgroundQueueDrain', () => {
     expect(getQueuedPrompts('stored-session-a')).toHaveLength(1)
   })
 
+  it('does not auto-replay an uncertain queued entry after its in-memory park is lost', async () => {
+    const runtimeMap = { current: new Map([['stored-session-a', 'rt-session-a']]) }
+    const submitText = vi.fn(async () => true)
+    const entry = enqueueQueuedPrompt('stored-session-a', { text: 'possibly accepted', attachments: [] })!
+    markQueuedPromptDeliveryUnknown('stored-session-a', entry.id)
+    $parkedQueueSessions.set({}) // process restart: only the persisted queue entry remains
+
+    render(<Harness runtimeMap={runtimeMap} submitText={submitText} />)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+
+    expect(submitText).not.toHaveBeenCalled()
+    expect(getQueuedPrompts('stored-session-a')[0]?.deliveryUnknown).toBe(true)
+  })
+
   it('passes a null runtime id so submitText can resume stale background sessions by stored id', async () => {
     const runtimeMap = { current: new Map<string, string>() }
     const submitText = vi.fn(async () => true)
@@ -188,12 +206,15 @@ describe('useBackgroundQueueDrain', () => {
     render(<Harness runtimeMap={runtimeMap} submitText={submitText} />)
 
     await waitFor(() => {
-      expect(submitText).toHaveBeenCalledWith('resume then send', {
-        attachments: [],
-        fromQueue: true,
-        sessionId: null,
-        storedSessionId: 'stored-session-a'
-      })
+      expect(submitText).toHaveBeenCalledWith(
+        'resume then send',
+        expect.objectContaining({
+          attachments: [],
+          fromQueue: true,
+          sessionId: null,
+          storedSessionId: 'stored-session-a'
+        })
+      )
     })
   })
 

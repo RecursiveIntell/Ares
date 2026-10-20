@@ -512,7 +512,9 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
       const recoveredRuntimeId = $activeSessionId.get()
 
-      return recoveredRuntimeId && recoveredRuntimeId !== staleRuntimeId && $selectedStoredSessionId.get() === storedSessionId
+      return recoveredRuntimeId &&
+        recoveredRuntimeId !== staleRuntimeId &&
+        $selectedStoredSessionId.get() === storedSessionId
         ? recoveredRuntimeId
         : null
     },
@@ -1205,8 +1207,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
               void refreshCurrentModel()
               void queryClient.invalidateQueries({ queryKey: ['model-options'] })
             }}
-            onMainModelChanged={(provider, model) => {
-              applySavedMainModel(provider, model)
+            onMainModelChanged={change => {
+              applySavedMainModel(change)
               void refreshCurrentModel()
               void queryClient.invalidateQueries({ queryKey: ['model-options'] })
             }}

@@ -29,9 +29,11 @@ import {
   shell,
   systemPreferences
 } from 'electron'
+import MainWebSocket from 'ws'
 
 import { classifyActiveRuntime } from './active-runtime-state'
 import { destroyKeepaliveAgents, downloadAgentFor, jsonAgentFor, withRetry } from './api-transport'
+import { AppDocumentUrl } from './app-document-url'
 import { appIconCandidates, resolveAppIcon } from './app-icon'
 import { stopBackendChild as stopBackendChildImpl, stopBackendTreesForUpdate } from './backend-child'
 import {
@@ -46,7 +48,12 @@ import {
 } from './backend-claim'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
-import { BackendDialClaims } from './backend-dial-claim'
+import {
+  assertDelegatedLocalDialCurrent,
+  BackendDialClaims,
+  type RegistryBackendDial,
+  resolveRegistryDialOptions
+} from './backend-dial-claim'
 import { buildDesktopBackendEnv, hermesManagedNodePathEntries, normalizeHermesHomeRoot } from './backend-env'
 import {
   isReauthRequiredError,
@@ -69,6 +76,11 @@ import {
 } from './backend-probes'
 import { waitForDashboardPortAnnouncement } from './backend-ready'
 import { isPidAliveWindows, waitForBackendRelease } from './backend-release-gate'
+import {
+  type NativeBackendAdmission,
+  privilegedRequestHeaders,
+  registerOwnedBackendAdmission
+} from './backend-request-admission'
 import {
   isHostKeyChangedBootFailure,
   isRetryableRemoteBootFailure,
@@ -104,7 +116,6 @@ import {
   cookiesHavePrivySession,
   cookiesHaveSession,
   gatewayTicketFailure,
-  gatewayWsUrlIpcResult,
   hostLabelFromBaseUrl,
   localProfileEntry,
   modeIsRemoteLike,
@@ -202,6 +213,7 @@ import {
 import { probeGatewayWebSocket } from './gateway-ws-probe'
 import { registerGitIpc } from './git-ipc'
 import { clearStaleGitLocks } from './gitlock'
+import { admitPreviewGuest, installSessionPermissions, isAppDocument } from './guest-policy'
 import { readAndConsumeHandoffResult } from './handoff-result'
 import {
   ATTACHMENT_UPLOAD_DEFAULT_MAX_BYTES,
@@ -260,6 +272,11 @@ import {
   resolveReadinessProbeAuth
 } from './native-auth-decisions'
 import {
+  bindNativeBackendLifetime,
+  bindNativeBackendPromise,
+  claimNativeBackendLifetime
+} from './native-backend-lifetime'
+import {
   nativeRefreshUrl,
   type NativeTokenSet,
   parseTokenResponse,
@@ -267,6 +284,8 @@ import {
   tokenNeedsRefresh
 } from './native-oauth'
 import { runNativeLogin } from './native-oauth-login'
+import { prepareNativeSocketTarget } from './native-socket-target'
+import { NativeSocketTransport } from './native-socket-transport'
 import { loadNativeTokenSet, type NativeTokenStoreIo, persistNativeTokenSet } from './native-token-store'
 import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
 import { LEGACY_OAUTH_PARTITION, resolveOauthPartition } from './oauth-partition'
@@ -313,7 +332,13 @@ import {
   tagRegistrySessionResponse
 } from './profile-session-routing'
 import { createQuickEntryShortcut, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
-import { type ActiveWork, mergeActiveWork, normalizeActiveWork, quitPromptFor } from './quit-guard'
+import {
+  type ActiveWork,
+  mergeActiveWork,
+  normalizeActiveWork,
+  quitConfirmationDisposition,
+  quitPromptFor
+} from './quit-guard'
 import * as remoteLifecycle from './remote-lifecycle'
 import {
   attachPowerResumeRemoteRevalidation,
@@ -324,11 +349,7 @@ import {
   revalidateRemoteConnection,
   revalidateSuspectPooledRemoteBackends
 } from './remote-liveness'
-import {
-  applyRemoteRequestHeaders,
-  createRegistryGatewayWsUrlHandler,
-  createRemoteWsHeaderStore
-} from './remote-ws-headers'
+import { createRemoteWsHeaderStore } from './remote-ws-headers'
 import { missingRendererAssets } from './renderer-bundle'
 import { loadRendererLoadErrorPage } from './renderer-load-error-page'
 import { attachRendererConsoleCapture, formatRendererBoundaryReport } from './renderer-log'
@@ -349,7 +370,11 @@ import {
   SESSION_WINDOW_MIN_WIDTH
 } from './session-windows'
 import { ensureLoginShellPath } from './shell-path'
-import { createSpecialistDispatchAdmission } from './specialist-dispatch-admission'
+import {
+  createSpecialistDispatchAdmission,
+  startSpecialistRunner,
+  stopSpecialistRunner
+} from './specialist-dispatch-admission'
 import { createSpecialistDispatchQuiesce, SpecialistQuiesceError } from './specialist-dispatch-quiesce'
 import { startSpecialistDispatchServer } from './specialist-dispatch-server'
 import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstrap-coordinator'
@@ -1377,9 +1402,7 @@ function registerMediaProtocol() {
     // reconnect dial for the same (connectionId, profile) scope; coalescing
     // here avoids bootstrapping a second SSH tunnel / remote dashboard.
     resolveRemoteConnection: ({ connectionId, profile }) =>
-      backendDialClaims.run(backendScopeKey(connectionId, profile), () =>
-        connectionId ? ensureRegistryBackend(connectionId, profile) : ensureBackend(profile)
-      )
+      connectionId ? claimRegistryBackend(connectionId, profile) : claimBackend(profile)
   })
 
   protocol.handle(MEDIA_PROTOCOL, handler)
@@ -1407,6 +1430,7 @@ let softRehomeInProgress = false
 // byte-for-byte the single-backend behavior.
 const backendPool = new Map() // profile -> { process, port, token, connectionPromise, lastActiveAt }
 const profileDeletionGate = new ProfileDeletionGate()
+
 // Keep the pool light: cap concurrent profile backends (LRU eviction) and reap
 // idle ones. A user idles at exactly the primary backend; pool backends only
 // exist while a non-primary profile is actively being chatted through.
@@ -1419,6 +1443,7 @@ const POOL_MAX_BACKENDS = normalizeProfileBackendPoolMax(
   process.env.HERMES_DESKTOP_POOL_MAX,
   readProfileBackendPoolSettings(app.getPath('userData')).maxBackends
 )
+
 const POOL_IDLE_MS = Math.max(60_000, Number(process.env.HERMES_DESKTOP_POOL_IDLE_MS) || 10 * 60_000)
 
 // A backend touched within this window has a live renderer socket (the keepalive
@@ -6871,39 +6896,233 @@ function installContextMenuBridge(window: BrowserWindow) {
   })
 }
 
-// Microphone and camera capture. The voice composer drives mic access and
-// renderer features (e.g. desktop plugins) can drive camera access, both
-// through getUserMedia, which Chromium gates behind these two session hooks.
-//
-// The naive `details.mediaTypes.includes('audio')` check works on macOS but
-// breaks on Windows: Chromium frequently fires the request with an empty or
-// undefined `mediaTypes`, so a strict check denies it and getUserMedia throws
-// NotAllowedError. We therefore allow the capture permissions and treat absent
-// metadata as allowed.
-//
-// Granting here is not the last gate: the OS still applies its own capture
-// permission (macOS TCC prompts on first use, per the NSMicrophone/NSCamera
-// usage strings), so the user keeps a real allow/deny and can revoke it in
-// System Settings afterwards.
-function isMediaCapturePermission(permission, details) {
-  if (permission === 'audioCapture' || permission === 'videoCapture') {
-    return true
+// Main registers privileged app documents; guest and unknown contents never
+// acquire voice permission or native backend transport provenance.
+const privilegedAppContents = new Set<number>()
+const nativeBackendProofs = new Map<string, NativeBackendAdmission>()
+
+// Admission (`trustedAppContents`, `approvedFrame`) runs on EVERY gateway
+// frame, every renderer ack, and every 250 ms transport watchdog tick — but
+// resolving this URL is not a string lookup: it walks the renderer bundle
+// through `missingRendererAssets` (torn-generation detection reads and
+// regex-scans every chunk — 142 files / 28.8 MB / ~186 ms measured on this
+// build). A per-call resolve therefore pinned the Electron main thread at
+// ~100% CPU (rchar 224 MB/s, 930 opens/s) and starved the gateway transport
+// itself: transcript hydrates blew the 30 s RPC timeout ("request timed out
+// after 30s: session.resume"), the readiness probe timed out ("Runtime not
+// ready"), and the transport's congestion watchdog kept closing the socket.
+// The URL is an identity and its path is stable for the process lifetime, so
+// resolve it once and keep it fresh with a microsecond stat of the chosen
+// index — a repair or update that rewrites the bundle still re-resolves.
+// Boot-time torn detection is untouched: every window creation still calls
+// `resolveRendererIndex()` and gets a fresh scan.
+const appDocumentUrlResolver = new AppDocumentUrl({
+  devServer: DEV_SERVER || undefined,
+  resolveIndex: resolveRendererIndex,
+  toUrl: indexPath => pathToFileURL(indexPath).toString(),
+  stat: indexPath => {
+    const stats = fs.statSync(indexPath)
+
+    return { mtimeMs: stats.mtimeMs, size: stats.size }
   }
+})
 
-  if (permission !== 'media') {
-    return false
-  }
+const appDocumentUrl = () => appDocumentUrlResolver.resolve()
 
-  const mediaTypes = details?.mediaTypes
-
-  // Windows: mediaTypes is often empty for a capture request. Don't deny on
-  // missing metadata.
-  if (!Array.isArray(mediaTypes) || mediaTypes.length === 0) {
-    return true
-  }
-
-  return mediaTypes.includes('audio') || mediaTypes.includes('video')
+function trustedAppContents(contents) {
+  return (
+    !!contents &&
+    !contents.isDestroyed() &&
+    privilegedAppContents.has(contents.id) &&
+    isAppDocument(contents.getURL(), appDocumentUrl())
+  )
 }
+
+// Readiness probes use the same main-owned header/TLS transport. They never
+// rely on renderer WebRequest rewriting and hard-close after their bounded probe.
+function MainProbeWebSocket(url, options: any = {}) {
+  const origin = new URL(url)
+  origin.protocol = origin.protocol === 'wss:' ? 'https:' : 'http:'
+  const headers = { ...(options.headers || {}) }
+
+  for (const key of Object.keys(headers)) {
+    if (key.toLowerCase() === 'origin') {
+      delete headers[key]
+    }
+  }
+
+  const socket = new MainWebSocket(url, {
+    headers: { ...headers, Origin: origin.origin },
+    maxPayload: 1024 * 1024,
+    handshakeTimeout: 10_000,
+    followRedirects: false,
+    rejectUnauthorized: true,
+    perMessageDeflate: false
+  })
+
+  socket.close = () => socket.terminate()
+
+  return socket
+}
+
+// Transport admission is IPC frame-based; WebRequest metadata is never authority.
+const nativeSocketTransport = new NativeSocketTransport({
+  trusted: trustedAppContents,
+  approvedFrame: frame => {
+    // One resolve per admission, not two — see appDocumentUrl above.
+    const appUrl = appDocumentUrl()
+
+    return isAppDocument(frame.url, appUrl) && new URL(frame.url).pathname === new URL(appUrl).pathname
+  },
+  resolve: resolveNativeTransportBackend,
+  dial: (url, headers, maxPayload) =>
+    new MainWebSocket(url, {
+      headers,
+      maxPayload,
+      handshakeTimeout: 15_000,
+      perMessageDeflate: false,
+      followRedirects: false,
+      rejectUnauthorized: true
+    }),
+  emit: (owner, event) => owner.senderFrame.send('hermes:transport:event', event)
+})
+
+// Bind the resolved endpoint to its actual owning cache generation, including
+// reused primary/registry routes. No header-cache or renderer URL lookup.
+async function resolveNativeTransportBackend(route, currentDocument) {
+  currentDocument()
+  const profile = route.kind === 'primary' ? null : route.profile
+
+  const configuration = () => {
+    const config = readDesktopConnectionConfig()
+    const relevantProfile = profile || primaryProfileKey()
+    const registry = route.kind === 'registry' ? readDesktopConnectionsRegistry() : null
+    const source = registry?.connections.find(source => source.id === route.connectionId)
+    const legacy = route.kind !== 'registry' || source?.kind === 'local' || source?.id === registry?.primary
+
+    // Cosmetic source labels and unrelated profile edits are not lifetime changes.
+    return JSON.stringify({
+      legacy: legacy
+        ? {
+            mode: config.mode,
+            remote: config.remote,
+            ssh: config.ssh,
+            cloud: config.cloud,
+            primaryProfile: primaryProfileKey(),
+            primaryOverride: config.profiles?.[primaryProfileKey()],
+            profileOverride: config.profiles?.[relevantProfile]
+          }
+        : null,
+      source: source ? { ...source, label: undefined } : null
+    })
+  }
+
+  const { connection, sourceCurrent, lifetimeCurrent } = await claimNativeBackendLifetime(route, {
+    primary: claimBackend,
+    registry: claimRegistryBackend,
+    currentDocument,
+    source: configuration
+  })
+
+  currentDocument()
+  const base = new URL(connection.baseUrl)
+  const localProof = connection.mode === 'local' ? nativeBackendProofs.get(base.origin) : null
+
+  if (connection.mode === 'local' && !localProof?.alive()) {
+    throw new Error('Owned local backend admission unavailable')
+  }
+  const sshOwner = [...sshConnections.entries()].find(([, state]) => state.localPort === Number(base.port))
+
+  if (connection.remoteKind === 'ssh' && !sshOwner) {
+    throw new Error('SSH backend lifetime unavailable')
+  }
+
+  const alive = () =>
+    lifetimeCurrent() &&
+    sourceCurrent() &&
+    (!localProof || (nativeBackendProofs.get(base.origin) === localProof && localProof.alive())) &&
+    (!sshOwner || sshConnections.get(sshOwner[0]) === sshOwner[1])
+
+  return {
+    oauth: connection.authMode === 'oauth',
+    scope: backendScopeKey(
+      route.kind === 'registry' ? route.connectionId : null,
+      connection.profile || primaryProfileKey()
+    ),
+    alive,
+    prepare: async (channel, current) => {
+      const target = await prepareNativeSocketTarget(connection, channel, {
+        mint: async (baseUrl, headers) => {
+          try {
+            return await mintGatewayWsTicket(baseUrl, headers)
+          } catch (error) {
+            throw gatewayTicketFailure(
+              error,
+              oauthTicketFailureAuthMessage(hasNativeSession(baseUrl)),
+              'Could not refresh gateway ticket'
+            )
+          }
+        },
+        current: () => {
+          current()
+
+          if (!alive()) {
+            throw new Error('Backend retired during ticket mint')
+          }
+        }
+      })
+
+      current()
+      // ws supports canonical access-proxy headers, but does not honor Electron
+      // PAC/forward-proxy settings. Fail closed rather than bypass that policy.
+      const proxyTarget = new URL(target.url)
+      proxyTarget.search = ''
+      const proxy = await session.defaultSession.resolveProxy(proxyTarget.toString())
+      current()
+
+      if (!alive()) {
+        throw new Error('Backend retired during proxy resolution')
+      }
+
+      if (proxy.trim() !== 'DIRECT') {
+        throw new Error('Configured forward proxy is unsupported by native transport')
+      }
+
+      return target
+    }
+  }
+}
+
+for (const operation of ['open', 'send', 'close', 'ack'] as const) {
+  ipcMain.handle(`hermes:transport:${operation}`, (event, request) => nativeSocketTransport[operation](event, request))
+}
+
+function guardSession(sess) {
+  installSessionPermissions(sess, trustedAppContents, appDocumentUrl)
+}
+
+app.on('session-created', guardSession)
+app.on('web-contents-created', (_event, contents) => {
+  guardSession(contents.session)
+  contents.on('will-attach-webview', (event, preferences, params) => {
+    if (!trustedAppContents(contents)) {
+      event.preventDefault()
+
+      return
+    }
+
+    admitPreviewGuest(event, preferences, params, () => {
+      const sess = session.fromPartition('persist:hermes-preview')
+      guardSession(sess)
+
+      return sess
+    })
+  })
+
+  if (contents.getType() === 'webview') {
+    contents.setWindowOpenHandler(() => ({ action: 'deny' }))
+  }
+})
 
 // Chromium-initiated downloads (renderer anchor/blob downloads, drag-outs)
 // land here. Without a handler the OS save dialog opens with the process cwd
@@ -6936,22 +7155,8 @@ function installDownloadHandling() {
 }
 
 function installMediaPermissions() {
-  // Async request handler: the prompt-style path (most platforms).
-  session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback, details) => {
-    callback(isMediaCapturePermission(permission, details))
-  })
-
-  // Synchronous check handler: Chromium consults this for getUserMedia on
-  // Windows in addition to (or instead of) the request handler. Without it,
-  // the check defaults to false and capture is denied before the request
-  // handler ever runs.
-  session.defaultSession.setPermissionCheckHandler((_webContents, permission) => {
-    return (
-      permission === 'media' ||
-      permission === ('audioCapture' as any) /* todo: is this needed? */ ||
-      permission === ('videoCapture' as any)
-    )
-  })
+  guardSession(session.defaultSession)
+  guardSession(session.fromPartition('persist:hermes-preview'))
 }
 
 // ---------------------------------------------------------------------------
@@ -7923,36 +8128,6 @@ async function mintGatewayWsTicket(baseUrl, headers = {}) {
   })
 }
 
-// Build a fresh WS URL for the *current* connection. Critical for reconnects:
-// OAuth WS tickets are single-use with a ~30s TTL, so the ticket baked into
-// the cached connection's wsUrl is stale on the second connect. The renderer
-// calls this immediately before every gateway.connect() so each WS upgrade
-// carries a freshly-minted ticket. For local/token connections this just
-// reuses the static token (no minting needed).
-async function freshGatewayWsUrl(profile) {
-  // Mint for the requested profile's backend, NOT always the primary. The
-  // renderer re-mints right before every gateway.connect(); when swapping to a
-  // pooled profile we must return THAT backend's ws URL, otherwise the connect
-  // silently lands back on the primary (default) backend and writes sessions to
-  // the wrong profile's DB. A null/empty profile resolves to the primary, so
-  // legacy callers and single-profile users are unchanged.
-  const connection = await ensureBackend(profile)
-
-  if (connection.authMode === 'oauth') {
-    const ticket = await mintGatewayWsTicket(connection.baseUrl, connection.headers)
-    const wsUrl = buildGatewayWsUrlWithTicket(connection.baseUrl, ticket)
-
-    rememberRemoteWsHeaders(wsUrl, connection.headers)
-
-    return wsUrl
-  }
-
-  // Local/token: the cached wsUrl already carries the (long-lived) token.
-  rememberRemoteWsHeaders(connection.wsUrl, connection.headers)
-
-  return connection.wsUrl
-}
-
 // --- Hermes Cloud discovery + silent per-agent sign-in (cloud-auto-discovery
 // Phase 3) ---------------------------------------------------------------
 //
@@ -8859,7 +9034,15 @@ function installRemoteHeaderRules() {
 
   remoteHeaderRulesInstalled = true
   session.defaultSession.webRequest.onBeforeSendHeaders((details, callback) => {
-    applyRemoteRequestHeaders(details, callback, headersForRemoteRequest)
+    const contents = details.webContentsId ? electronWebContents.fromId(details.webContentsId) : null
+    callback(
+      privilegedRequestHeaders(details, contents, {
+        admissions: nativeBackendProofs,
+        trusted: trustedAppContents,
+        remembered: url => remoteWsHeaderStore.hasExact(url),
+        headers: headersForRemoteRequest
+      })
+    )
   })
 }
 
@@ -9971,14 +10154,12 @@ async function ensureTerminalBackend(webContentsId: number) {
   // reconnect dial for the same (connectionId, profile) scope; coalescing
   // here avoids bootstrapping a second SSH tunnel / remote dashboard.
   if (windowRoute?.registryScoped && windowRoute.connectionId) {
-    return backendDialClaims.run(backendScopeKey(windowRoute.connectionId, windowRoute.profile), () =>
-      ensureRegistryBackend(windowRoute.connectionId, windowRoute.profile)
-    )
+    return claimRegistryBackend(windowRoute.connectionId, windowRoute.profile)
   }
 
   const profile = windowRoute?.profile ?? primaryProfileKey()
 
-  return backendDialClaims.run(backendScopeKey(null, profile), () => ensureBackend(profile))
+  return claimBackend(profile)
 }
 
 // Loopback reach for the browser pane. Scoped to the SSH connection that
@@ -10780,8 +10961,8 @@ async function testDesktopConnectionConfig(input: any = {}) {
   // Skip the WS leg only when the runtime genuinely lacks a WebSocket (so an
   // older Electron/Node never fails the test spuriously); Electron's main
   // process ships a global WebSocket on every supported version.
-  if (wsUrl && typeof globalThis.WebSocket === 'function') {
-    const probe = await probeGatewayWebSocket(wsUrl, { WebSocketImpl: globalThis.WebSocket, headers: testHeaders })
+  if (wsUrl) {
+    const probe = await probeGatewayWebSocket(wsUrl, { WebSocketImpl: MainProbeWebSocket, headers: testHeaders })
 
     if (!probe.ok) {
       throw new Error(
@@ -11023,7 +11204,11 @@ async function ensureBackend(profile) {
 
   if (existing) {
     existing.lastActiveAt = Date.now()
-    const connection = await existing.connectionPromise
+
+    const connection = await bindNativeBackendPromise(existing.connectionPromise, () =>
+      poolStopper.inFlight(key) ? null : backendPool.get(key)?.connectionPromise || null
+    )
+
     setWslBridgeProfileState(key, connection.mode !== 'remote')
 
     return connection
@@ -11064,7 +11249,10 @@ async function ensureBackend(profile) {
   backendPool.set(key, entry)
   startPoolIdleReaper()
 
-  const connection = await entry.connectionPromise
+  const connection = await bindNativeBackendPromise(entry.connectionPromise, () =>
+    poolStopper.inFlight(key) ? null : backendPool.get(key)?.connectionPromise || null
+  )
+
   setWslBridgeProfileState(key, connection.mode !== 'remote')
 
   return connection
@@ -11077,10 +11265,31 @@ async function ensureBackend(profile) {
 // a genuinely-local child when the v1 mode says remote; non-local connections
 // pool under the composite key from backendScopeKey() and reuse the same pool
 // entry lifecycle (LRU, idle reaper, touch) as per-profile local backends.
-async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrelation = '') {
-  const registry = readDesktopConnectionsRegistry()
-  const id = String(connectionId || '').trim() || registry.primary
-  const source = registry.connections.find(c => c.id === id)
+function claimBackend(profile) {
+  const profileKey = profile && String(profile).trim() ? String(profile).trim() : primaryProfileKey()
+
+  return backendDialClaims.run(backendScopeKey(null, profileKey), () => ensureBackend(profile))
+}
+
+function claimRegistryBackend(connectionId, profile) {
+  return backendDialClaims.runRegistry(
+    readDesktopConnectionsRegistry(),
+    connectionId,
+    profile,
+    resolveRegistryDialOptions(profile, primaryProfileKey(), globalRemoteActive(), profileHasRemoteOverride),
+    route => ensureRegistryBackend(route.connectionId, profile, '', route)
+  )
+}
+
+async function ensureRegistryBackend(
+  connectionId,
+  profile,
+  managedUpdateCorrelation = '',
+  resolvedDial?: RegistryBackendDial
+) {
+  const registry = resolvedDial?.registry || readDesktopConnectionsRegistry()
+  const id = resolvedDial?.connectionId || String(connectionId || '').trim() || registry.primary
+  const source = resolvedDial?.source || registry.connections.find(c => c.id === id)
 
   if (!source) {
     throw new Error(`No connection with id "${id}".`)
@@ -11179,13 +11388,27 @@ async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrela
     specialistDispatchQuiesce.assertCanStart(profileKey)
     profileDeletionGate.assertCanStart(profileKey)
 
-    const localRoute = resolveRegistryLocalRoute(profileKey, {
-      globalRemote: globalRemoteActive(),
-      profileRemoteOverride: Boolean(profileHasRemoteOverride(profileKey))
-    })
+    const localRoute =
+      resolvedDial?.localRoute ||
+      resolveRegistryLocalRoute(profileKey, {
+        globalRemote: globalRemoteActive(),
+        profileRemoteOverride: Boolean(profileHasRemoteOverride(profileKey))
+      })
 
     if (localRoute.delegate) {
-      return ensureBackend(profile)
+      if (resolvedDial) {
+        assertDelegatedLocalDialCurrent(
+          resolvedDial,
+          resolveRegistryDialOptions(
+            resolvedDial.delegatedProfile ?? profileKey,
+            primaryProfileKey(),
+            globalRemoteActive(),
+            profileHasRemoteOverride
+          )
+        )
+      }
+
+      return ensureBackend(resolvedDial?.delegatedProfile ?? profile)
     }
 
     const stoppingLocal = poolStopper.inFlight(localRoute.poolKey)
@@ -11199,7 +11422,9 @@ async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrela
     if (existingLocal) {
       existingLocal.lastActiveAt = Date.now()
 
-      return existingLocal.connectionPromise
+      return bindNativeBackendPromise(existingLocal.connectionPromise, () =>
+        poolStopper.inFlight(localRoute.poolKey) ? null : backendPool.get(localRoute.poolKey)?.connectionPromise || null
+      )
     }
 
     if (!canAdmitLocalBackend(backendPool.entries(), POOL_MAX_BACKENDS)) {
@@ -11239,7 +11464,9 @@ async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrela
     backendPool.set(localRoute.poolKey, localEntry)
     startPoolIdleReaper()
 
-    return localEntry.connectionPromise
+    return bindNativeBackendPromise(localEntry.connectionPromise, () =>
+      poolStopper.inFlight(localRoute.poolKey) ? null : backendPool.get(localRoute.poolKey)?.connectionPromise || null
+    )
   }
 
   const key = backendScopeKey(id, profile)
@@ -11253,7 +11480,7 @@ async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrela
     // Validate the exact cached descriptor at dispatch time; background
     // revalidation is renderer-driven and may never run while the Bots pane is
     // closed. Concurrent clicks share one retire/reconnect sequence.
-    return registryDispatchRevalidation.run(connectionPromise, () =>
+    const connection = await registryDispatchRevalidation.run(connectionPromise, () =>
       ensureHealthyPooledRemoteBackendForDispatch({
         connectionPromise,
         currentConnectionPromise: () => backendPool.get(key)?.connectionPromise || null,
@@ -11278,6 +11505,11 @@ async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrela
         }
       })
     )
+
+    return bindNativeBackendLifetime(connection, {
+      promise: connectionPromise,
+      current: () => (poolStopper.inFlight(key) ? null : backendPool.get(key)?.connectionPromise || null)
+    })
   }
 
   evictLruPoolBackends(POOL_MAX_BACKENDS - 1)
@@ -11309,7 +11541,9 @@ async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrela
   backendPool.set(key, entry)
   startPoolIdleReaper()
 
-  return entry.connectionPromise
+  return bindNativeBackendPromise(entry.connectionPromise, () =>
+    poolStopper.inFlight(key) ? null : backendPool.get(key)?.connectionPromise || null
+  )
 }
 
 // Dial a non-local registry connection for one profile. Never spawns a local
@@ -12008,6 +12242,7 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   }
 
   const token = crypto.randomBytes(32).toString('base64url')
+  const bootstrapKey = crypto.randomBytes(32).toString('base64url')
 
   // Same update mutual exclusion as the primary window's waitForLocalStart
   // (#73822): pool backends spawn from the same venv, so an ungated respawn
@@ -12071,6 +12306,8 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
         // can still point at the install dir even when spawn cwd is home.
         TERMINAL_CWD: hermesCwd,
         HERMES_DASHBOARD_SESSION_TOKEN: token,
+        HERMES_DESKTOP_BOOTSTRAP_KEY: bootstrapKey,
+        HERMES_DESKTOP_BOOTSTRAP_ID: backendNonce,
         // Marks this dashboard backend as desktop-spawned so it runs the cron
         // scheduler tick loop (the gateway isn't running under the app).
         HERMES_DESKTOP: '1',
@@ -12109,13 +12346,19 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   child.once('error', error => {
     rememberLog(`Hermes backend for profile "${profile}" failed to start: ${error.message}`)
     releaseBackendChild(child)
-    backendPool.delete(poolKey)
+
+    if (backendPool.get(poolKey) === entry) {
+      backendPool.delete(poolKey)
+    }
     rejectStart?.(error)
   })
   child.once('exit', (code, signal) => {
     rememberLog(`Hermes backend for profile "${profile}" exited (${signal || code})`)
     releaseBackendChild(child)
-    backendPool.delete(poolKey)
+
+    if (backendPool.get(poolKey) === entry) {
+      backendPool.delete(poolKey)
+    }
 
     if (!ready) {
       rejectStart?.(
@@ -12144,22 +12387,25 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
 
   const authToken = await adoptServedDashboardToken(baseUrl, token, {
     childAlive: () => child.exitCode === null && !child.killed,
+    bootstrapKey,
+    identity: backendNonce,
     label: `Hermes backend for profile "${profile}"`,
     rememberLog
   })
 
-  entry.token = authToken
-
   // Verify the WebSocket session token before declaring backend ready.
   // HTTP /api/status can pass while WS auth fails (separate transport, separate guards).
   const wsUrl = `ws://127.0.0.1:${port}/api/ws?token=${encodeURIComponent(authToken)}`
-  const wsProbe = await probeGatewayWebSocket(wsUrl, { WebSocketImpl: globalThis.WebSocket })
+  const wsProbe = await probeGatewayWebSocket(wsUrl, { WebSocketImpl: MainProbeWebSocket })
 
   if (!wsProbe.ok) {
     throw new Error(
       `Hermes backend for profile "${profile}" is HTTP-reachable but the WebSocket (/api/ws) rejected the session token: ${wsProbe.reason}`
     )
   }
+
+  registerOwnedBackendAdmission(nativeBackendProofs, baseUrl, child, backendNonce)
+  entry.token = authToken
 
   return {
     baseUrl,
@@ -12198,58 +12444,69 @@ let specialistDispatchServer: Awaited<ReturnType<typeof startSpecialistDispatchS
 const specialistDispatchAdmission = createSpecialistDispatchAdmission({
   maxCapacity: POOL_MAX_BACKENDS,
   pool: backendPool,
-  spawnRunner: async request => {
-    // Reuse Desktop's established runtime resolver, but do not accept a caller
-    // command. The only child command is this package-local runner.
-    const backend = await ensureRuntime(resolveHermesBackend([]))
+  stopRunner: child =>
+    stopSpecialistRunner(child, {
+      stopChild: owned => stopBackendChild(owned),
+      waitForExit: owned => waitForBackendExit(owned)
+    }),
+  spawnRunner: (request, maySpawn) =>
+    startSpecialistRunner(request, maySpawn, {
+      // Reuse Desktop's established runtime resolver, but do not accept a caller
+      // command. The only child command is this package-local runner.
+      resolveRuntime: () => ensureRuntime(resolveHermesBackend([])),
+      spawn: (backend, request) => {
+        if (!backend.command) {
+          throw new Error('specialist runner runtime is unavailable')
+        }
 
-    if (!backend.command) {
-      throw new Error('specialist runner runtime is unavailable')
-    }
+        const cwd = backend.root || resolveHermesCwd()
 
-    const cwd = backend.root || resolveHermesCwd()
+        const child = spawn(
+          backend.command,
+          ['-m', 'ares_runtime.specialist_dispatch', 'runner'],
+          hiddenWindowsChildOptions({
+            cwd,
+            detached: true,
+            env: {
+              ...process.env,
+              ...backend.env,
+              // The runner begins in the default Ares home, then explicitly
+              // selects the one profile home per worker. A backend resolver must
+              // never override that isolation boundary through its own env map.
+              HERMES_HOME,
+              TERMINAL_CWD: cwd
+            },
+            stdio: ['pipe', 'ignore', 'ignore']
+          })
+        )
 
-    const child = spawn(
-      backend.command,
-      ['-m', 'ares_runtime.specialist_dispatch', 'runner'],
-      hiddenWindowsChildOptions({
-        cwd,
-        detached: true,
-        env: {
-          ...process.env,
-          ...backend.env,
-          // The runner begins in the default Ares home, then explicitly
-          // selects the one profile home per worker. A backend resolver must
-          // never override that isolation boundary through its own env map.
-          HERMES_HOME,
-          TERMINAL_CWD: cwd
-        },
-        stdio: ['pipe', 'ignore', 'ignore']
-      })
-    )
+        let timedOut = false
 
-    let timedOut = false
+        const timeout = setTimeout(() => {
+          timedOut = true
+          rememberLog(
+            `[specialist] runner ${request.runId} exceeded the bounded deadline; stopping its owned process group`
+          )
+          void specialistDispatchAdmission.cancel(request.runId, 'runner_failed').catch(error => {
+            rememberLog(`[specialist] runner ${request.runId} deadline cleanup failed: ${error.message}`)
+          })
+        }, SPECIALIST_RUNNER_TIMEOUT_MS)
 
-    const timeout = setTimeout(() => {
-      timedOut = true
-      rememberLog(`[specialist] runner ${request.runId} exceeded the bounded deadline; stopping its owned process group`)
-      void poolStopper.stop(specialistDispatchAdmission.poolKey(request.runId))
-    }, SPECIALIST_RUNNER_TIMEOUT_MS)
+        timeout.unref?.()
+        child.once('error', error => {
+          clearTimeout(timeout)
+          rememberLog(`[specialist] runner ${request.runId} failed to start: ${error.message}`)
+          specialistDispatchAdmission.release(request.runId, 'runner_failed')
+        })
+        child.once('exit', code => {
+          clearTimeout(timeout)
+          specialistDispatchAdmission.release(request.runId, code === 0 && !timedOut ? 'released' : 'runner_failed')
+        })
+        child.stdin?.end(request.runnerInput || '')
 
-    timeout.unref?.()
-    child.once('error', error => {
-      clearTimeout(timeout)
-      rememberLog(`[specialist] runner ${request.runId} failed to start: ${error.message}`)
-      specialistDispatchAdmission.release(request.runId, 'runner_failed')
+        return child
+      }
     })
-    child.once('exit', code => {
-      clearTimeout(timeout)
-      specialistDispatchAdmission.release(request.runId, code === 0 && !timedOut ? 'released' : 'runner_failed')
-    })
-    child.stdin?.end(request.runnerInput || '')
-
-    return child
-  }
 })
 
 async function startSpecialistDispatchTransport() {
@@ -12264,8 +12521,7 @@ async function startSpecialistDispatchTransport() {
         throw new Error('specialist run is not active')
       }
 
-      await poolStopper.stop(specialistDispatchAdmission.poolKey(runId))
-      specialistDispatchAdmission.release(runId, 'released')
+      await specialistDispatchAdmission.cancel(runId)
     },
     quiesce: {
       acquire: async profileIds => {
@@ -12413,7 +12669,7 @@ async function startHermes() {
   const existingConnectionPromise = backendConnectionState.getPromise()
 
   if (existingConnectionPromise) {
-    return existingConnectionPromise
+    return bindNativeBackendPromise(existingConnectionPromise, () => backendConnectionState.getPromise())
   }
 
   const connectionAttempt = backendConnectionState.startAttempt()
@@ -12477,6 +12733,7 @@ async function startHermes() {
     }
 
     const token = crypto.randomBytes(32).toString('base64url')
+    const bootstrapKey = crypto.randomBytes(32).toString('base64url')
     // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
     const backendArgs = ['serve', '--host', '127.0.0.1', '--port', '0']
     // Pin the desktop's chosen profile via the global --profile flag. This is
@@ -12558,6 +12815,8 @@ async function startHermes() {
           ...backend.env,
           TERMINAL_CWD: hermesCwd,
           HERMES_DASHBOARD_SESSION_TOKEN: token,
+          HERMES_DESKTOP_BOOTSTRAP_KEY: bootstrapKey,
+          HERMES_DESKTOP_BOOTSTRAP_ID: backendNonce,
           // Marks this dashboard backend as desktop-spawned so it runs the cron
           // scheduler tick loop (the gateway isn't running under the app).
           HERMES_DESKTOP: '1',
@@ -12680,23 +12939,29 @@ async function startHermes() {
     const baseUrl = `http://127.0.0.1:${port}`
     await advanceBootProgress('backend.wait', 'Waiting for Hermes backend to become ready', 90)
     await Promise.race([waitForHermes(baseUrl, token), backendStartFailed])
-    backendReady = true
-    backendStartFailure = null
+
+    const bootstrapChild = hermesProcess
 
     const authToken = await adoptServedDashboardToken(baseUrl, token, {
-      childAlive: () => hermesProcess.exitCode === null && !hermesProcess.killed,
+      childAlive: () => bootstrapChild.exitCode === null && !bootstrapChild.killed,
+      bootstrapKey,
+      identity: backendNonce,
       rememberLog
     })
 
     // Verify the WebSocket session token before declaring backend ready.
     const wsUrl = `ws://127.0.0.1:${port}/api/ws?token=${encodeURIComponent(authToken)}`
-    const wsProbe = await probeGatewayWebSocket(wsUrl, { WebSocketImpl: globalThis.WebSocket })
+    const wsProbe = await probeGatewayWebSocket(wsUrl, { WebSocketImpl: MainProbeWebSocket })
 
     if (!wsProbe.ok) {
       throw new Error(
         `Local Hermes backend is HTTP-reachable but the WebSocket (/api/ws) rejected the session token: ${wsProbe.reason}`
       )
     }
+
+    registerOwnedBackendAdmission(nativeBackendProofs, baseUrl, bootstrapChild, backendNonce)
+    backendReady = true
+    backendStartFailure = null
 
     updateBootProgress({
       phase: 'backend.ready',
@@ -12803,7 +13068,7 @@ async function startHermes() {
 
   backendConnectionState.setPromise(connectionAttempt, connectionPromise)
 
-  return connectionPromise
+  return bindNativeBackendPromise(connectionPromise, () => backendConnectionState.getPromise())
 }
 
 // Shared navigation guards + window chrome wiring applied to every window
@@ -12818,6 +13083,10 @@ async function startHermes() {
 // Alt+wheel scale, so inheriting the global UI zoom would render the mascot
 // larger than its window and crop it. Chat windows keep zoom on.
 function wireCommonWindowHandlers(win, { zoom = true }: { zoom?: boolean } = {}) {
+  const privilegedContentsId = win.webContents.id
+  privilegedAppContents.add(privilegedContentsId)
+  nativeSocketTransport.register(win.webContents)
+  win.webContents.once('destroyed', () => privilegedAppContents.delete(privilegedContentsId))
   installPreviewShortcut(win)
   installDevToolsShortcut(win)
   installBrowserNavGestures(win)
@@ -12853,7 +13122,7 @@ function wireCommonWindowHandlers(win, { zoom = true }: { zoom?: boolean } = {})
     return { action: 'deny' }
   })
   win.webContents.on('will-navigate', (event, url) => {
-    if ((DEV_SERVER && url.startsWith(DEV_SERVER)) || (!DEV_SERVER && url.startsWith('file:'))) {
+    if (isAppDocument(url, appDocumentUrl())) {
       return
     }
 
@@ -14297,15 +14566,11 @@ function createWindow() {
 }
 
 ipcMain.handle('hermes:connection', async (_event, profile) => {
-  // Coalesce concurrent renderer dials for one profile scope (#90812): the
-  // renderer-side reconnect lock is per-window, so two windows waking at once
-  // both land here. The claim key mirrors ensureBackend()'s own profile
-  // normalization so every spelling of the primary coalesces onto one dial.
-  const profileKey = profile && String(profile).trim() ? String(profile).trim() : primaryProfileKey()
-  const connection = await backendDialClaims.run(backendScopeKey(null, profileKey), () => ensureBackend(profile))
+  // Match ensureBackend's profile normalization before claim admission.
+  const connection = await claimBackend(profile)
   const connectionId = resolvedConnectionId(readDesktopConnectionsRegistry(), connection)
 
-  return connectionId ? { ...connection, connectionId } : connection
+  return { ...connection, wsUrl: '', headers: undefined, ...(connectionId ? { connectionId } : {}) }
 })
 // Registry-scoped variant: resolve a backend for (connectionId, profile).
 // connectionId '' / 'local' / the registry primary all behave sensibly; the
@@ -14316,12 +14581,11 @@ ipcMain.handle('hermes:connection:for', async (_event, payload) => {
   const { connectionId, profile } = payload && typeof payload === 'object' ? (payload as any) : ({} as any)
   const registry = readDesktopConnectionsRegistry()
   const id = String(connectionId || '').trim() || registry.primary
-  // Same single-owner claim as 'hermes:connection', keyed by the composite
-  // (connectionId, profile) scope (#90812): concurrent registry dials for one
-  // scope share the first spawn instead of bootstrapping duplicate remotes.
-  const connection = await backendDialClaims.run(backendScopeKey(id, profile), () => ensureRegistryBackend(id, profile))
+  // Resolve the actual backend before claiming: explicit local can differ
+  // from the legacy remote primary even when their scope labels alias.
+  const connection = await claimRegistryBackend(id, profile)
 
-  return { ...connection, connectionId: id, registryScoped: true }
+  return { ...connection, wsUrl: '', headers: undefined, connectionId: id, registryScoped: true }
 })
 
 const windowConnectionRoutes = new WindowConnectionRouteRegistry()
@@ -14418,9 +14682,7 @@ function revalidatePool() {
 function redialPoolBackendAfterResume(poolKey: string) {
   const { connectionId, profile } = parseBackendScopeKey(poolKey)
 
-  return backendDialClaims.run(poolKey, () =>
-    connectionId ? ensureRegistryBackend(connectionId, profile) : ensureBackend(profile)
-  )
+  return connectionId ? claimRegistryBackend(connectionId, profile) : claimBackend(profile)
 }
 
 // Identity for coalescing post-resume sweeps in the shared revalidation
@@ -14461,8 +14723,8 @@ ipcMain.handle('hermes:backend:touch', async (_event, profile) => {
 
   return { ok: true }
 })
-ipcMain.handle('hermes:gateway:ws-url', async (_event, profile) => {
-  return gatewayWsUrlIpcResult(() => freshGatewayWsUrl(profile))
+ipcMain.handle('hermes:gateway:ws-url', async () => {
+  throw new Error('Use the frame-validated native transport')
 })
 ipcMain.handle('hermes:window:openSession', async (_event, sessionId, opts) => {
   if (typeof sessionId !== 'string' || !sessionId.trim()) {
@@ -14927,8 +15189,8 @@ ipcMain.handle('hermes:connections:test', async (_event, id) => {
     mintTicket: url => mintGatewayWsTicket(url, testHeaders)
   })
 
-  if (wsUrl && typeof globalThis.WebSocket === 'function') {
-    const probe = await probeGatewayWebSocket(wsUrl, { WebSocketImpl: globalThis.WebSocket, headers: testHeaders })
+  if (wsUrl) {
+    const probe = await probeGatewayWebSocket(wsUrl, { WebSocketImpl: MainProbeWebSocket, headers: testHeaders })
 
     if (!probe.ok) {
       throw new Error(
@@ -15117,11 +15379,7 @@ async function enumerateRegistryAgentSources(registry = readDesktopConnectionsRe
           // own reconnect dial for the same connection; coalescing avoids
           // bootstrapping a second SSH tunnel / remote dashboard.
           const descriptor: any = await withEnumerationDeadline(
-            Promise.resolve(
-              backendDialClaims.run(backendScopeKey(connection.id, null), () =>
-                ensureRegistryBackend(connection.id, null)
-              )
-            )
+            Promise.resolve(claimRegistryBackend(connection.id, null))
           )
 
           const body: any = await getJsonForBackend(descriptor, '/api/profiles', { timeoutMs: 8_000 })
@@ -15224,17 +15482,8 @@ ipcMain.handle('hermes:agents:roster', async () => {
   }
 })
 
-// Registry-scoped fresh WS URL: the (connectionId, profile) analogue of
-// hermes:gateway:ws-url. Same single-use-ticket discipline for OAuth sources.
-const registryGatewayWsUrlHandler = createRegistryGatewayWsUrlHandler({
-  ensureBackend: ensureRegistryBackend,
-  mintTicket: mintGatewayWsTicket,
-  buildTicketUrl: buildGatewayWsUrlWithTicket,
-  rememberHeaders: rememberRemoteWsHeaders
-})
-
-ipcMain.handle('hermes:gateway:ws-url-for', async (_event, payload) => {
-  return gatewayWsUrlIpcResult(() => registryGatewayWsUrlHandler(payload))
+ipcMain.handle('hermes:gateway:ws-url-for', async () => {
+  throw new Error('Use the frame-validated native transport')
 })
 
 // Transactional update for a Desktop-managed SSH install. Unlike the generic
@@ -15338,9 +15587,7 @@ ipcMain.handle('hermes:connections:update-all', async (_event, payload) => {
 
           // Claim-guarded (#90812): coalesce with a concurrent renderer dial
           // for the same connection instead of bootstrapping a second backend.
-          const descriptor: any = await backendDialClaims.run(backendScopeKey(connection.id, null), () =>
-            ensureRegistryBackend(connection.id, null)
-          )
+          const descriptor: any = await claimRegistryBackend(connection.id, null)
 
           const body: any = await postJsonForBackend(descriptor, '/api/hermes/update', {}, { timeoutMs: 15_000 })
 
@@ -15984,9 +16231,7 @@ async function dispatchRegistryApiRequest(
   // here, so it can race a renderer's own WS reconnect dial for the same
   // (connectionId, profile) scope; coalescing avoids bootstrapping a second
   // SSH tunnel / remote dashboard.
-  const connection: any = await backendDialClaims.run(backendScopeKey(registryConnectionId, routeProfile), () =>
-    ensureRegistryBackend(registryConnectionId, routeProfile)
-  )
+  const connection: any = await claimRegistryBackend(registryConnectionId, routeProfile)
 
   const requestPath = pathForRegistryBackendRequest(request.path, requestProfile, connection)
 
@@ -16990,6 +17235,7 @@ ipcMain.handle('hermes:production-permit:sign', (event, envelope) => {
   if (!event.sender || event.sender.isDestroyed()) {
     throw new Error('production permit renderer unavailable')
   }
+
   return productionPermitController.requestSignedWitness(envelope)
 })
 ipcMain.handle('hermes:production-permit:public-key', () => productionPermitController.publicKeyForEnrollment())
@@ -17523,7 +17769,9 @@ app.whenReady().then(() => {
   installRemoteHeaderRules()
   registerDeepLinkProtocol()
   void startSpecialistDispatchTransport().catch(error => {
-    rememberLog(`[specialist] explicit dispatch transport unavailable: ${error instanceof Error ? error.message : String(error)}`)
+    rememberLog(
+      `[specialist] explicit dispatch transport unavailable: ${error instanceof Error ? error.message : String(error)}`
+    )
   })
 
   ensureWslWindowsFonts()
@@ -17605,8 +17853,21 @@ function configureSpellChecker() {
 // and the confirmation is on screen; "Quit Anyway" re-enters before-quit with
 // the latch set and falls straight through to the teardown below.
 function heldQuitForActiveWork(event: Electron.Event): boolean {
-  if (SKIP_QUIT_CONFIRM || quitConfirmedWithActiveWork || quitPromptOpen) {
+  const disposition = quitConfirmationDisposition({
+    skipConfirm: SKIP_QUIT_CONFIRM,
+    confirmed: quitConfirmedWithActiveWork,
+    promptOpen: quitPromptOpen,
+    quittingForHandoff: isQuittingForHandoff
+  })
+
+  if (disposition === 'proceed') {
     return false
+  }
+
+  if (disposition === 'hold') {
+    event.preventDefault()
+
+    return true
   }
 
   const prompt = quitPromptFor(mergeActiveWork(activeWorkByWebContents.values()), isQuittingForHandoff)

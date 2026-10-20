@@ -763,6 +763,13 @@ def _(rid, params: dict) -> dict:
     if name == "steer":
         if not arg:
             return _err(rid, 4004, "usage: /steer <prompt>")
+        if session is not None and _session_uses_compute_host(session):
+            response = _send_host_live_input(rid, str(params.get("session_id") or ""), session, arg, "session.steer")
+            if response.get("error") and response["error"].get("code") != 4010:
+                return response  # uncertain delivery must never become a new send
+            if response.get("result", {}).get("status") == "queued":
+                return _ok(rid, {"type": "exec", "output": f"⏩ Steer queued — arrives after the next tool call: {arg[:80]}{'...' if len(arg) > 80 else ''}"})
+            return _ok(rid, {"type": "send", "message": arg})
         agent = session.get("agent") if session else None
         if agent and hasattr(agent, "steer"):
             try:
@@ -803,7 +810,10 @@ def _(rid, params: dict) -> dict:
         if not arg.strip() or lower == "status":
             return _ok(rid, {"type": "exec", "output": mgr.status_line()})
         if lower == "pause":
+            had = mgr.has_goal()
             state = mgr.pause(reason="user-paused")
+            if had and state is None:
+                return _err(rid, 5032, "Goal pause persistence unconfirmed; refresh before retrying")
             out = "No goal set." if state is None else f"⏸ Goal paused: {state.goal}"
             return _ok(rid, {"type": "exec", "output": out})
         if lower == "resume":
@@ -832,7 +842,9 @@ def _(rid, params: dict) -> dict:
             )
         if lower in {"clear", "stop", "done"}:
             had = mgr.has_goal()
-            mgr.clear()
+            cleared = mgr.clear()
+            if had and not cleared:
+                return _err(rid, 5032, "Goal clear persistence unconfirmed; refresh before retrying")
             return _ok(
                 rid,
                 {
@@ -846,6 +858,8 @@ def _(rid, params: dict) -> dict:
             state = mgr.set(arg)
         except ValueError as exc:
             return _err(rid, 4004, f"invalid goal: {exc}")
+        except RuntimeError as exc:
+            return _err(rid, 5032, f"Goal persistence unconfirmed: {exc}")
 
         notice = (
             f"⊙ Goal set ({state.max_turns}-turn budget): {state.goal}\n"

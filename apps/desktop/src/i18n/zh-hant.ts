@@ -2344,6 +2344,8 @@ export const zhHant = defineLocale({
   },
 
   modelPicker: {
+    selectionUnavailable: '所選供應商或模型在此設定檔中不可用。請在此設定或選擇其他模型。目前選擇已保留。',
+    sessionSelection: '此工作階段保留自己的模型選擇。設定檔預設值的變更適用於新工作階段。',
     title: '切換模型',
     current: '目前：',
     unknown: '（未知）',
@@ -2392,7 +2394,10 @@ export const zhHant = defineLocale({
       max: '最高',
       ultra: '超高',
       updateFailed: '模型選項更新失敗',
-      fastFailed: '快速模式更新失敗'
+      fastFailed: '快速模式更新失敗',
+      unconfirmed: '模型選項尚未確認',
+      unconfirmedObserved: '更新結果尚未確認。現顯示主機回報的目前設定；未重試寫入。',
+      unconfirmedUnavailable: '更新結果未知。所選值尚未確認；未重試寫入。'
     },
     gatewayMenu: {
       gateway: '閘道',
@@ -2774,6 +2779,10 @@ export const zhHant = defineLocale({
       notReady: '澄清請求尚未就緒',
       gatewayDisconnected: 'Hermes 閘道未連線',
       sendFailed: '無法傳送澄清回應',
+      responseAccepted: '已收到回覆',
+      responseExpired: '請求已逾期。回應可能已送達代理；重新傳送前請檢查對話。',
+      responseRejected: '回應未被接受，已保留所選答案。',
+      responseUncertain: '回應可能已送達代理，但確認已遺失。重新傳送前請檢查對話。',
       loadingQuestion: '正在載入問題…',
       other: '其他（輸入您的答案）',
       placeholder: '輸入您的答案…',

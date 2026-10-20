@@ -1,0 +1,13 @@
+{
+  "base": "dbbc704ab18771396de967faec5b6bad3189e956",
+  "files": {
+    ".github/workflows/context-continuity-qualification.yml": "35edfacdcc6a8614361de608d935101e48c71cd61fdcad68814ad6df3d41126e",
+    "agent/run_checkpoint_custody.py": "41a5ed918ebfaae365b601385eaa7e712d367f5e8f8016e494b04aa4701c43f1",
+    "ares_runtime/collaboration.py": "c69b3e1a26c11e48ab87f57278b5935a3ef15d01dcb7405f63e743c9b6313234",
+    "hermes_state_runs.py": "e8d7772038c5c3a53a20da05e47a3b2e97089f91ef25c5e90d715c81beba4550",
+    "tests/ares_runtime/test_permit_readback.py": "107ac5c07ea42239752c7538f35b855d06578a5a0bf99ff97c004a81a7d5d0b3",
+    "tests/test_ares_collaboration.py": "d28ea74315b846b6c0dd40dbf7e7f1c9183553a471c010d367a885dc79658051",
+    "tests/test_estop.py": "b9a3d98051f17697d37248a99acd2a63b166f3e2ecf1a3af73bd25c60e90d69b",
+    "tests/test_run_custody_cold_recovery.py": "caa1714f5a62989ad516ca253cbaf66af85dc1a81acb5f36f46f9f83ff88e6f0"
+  }
+}

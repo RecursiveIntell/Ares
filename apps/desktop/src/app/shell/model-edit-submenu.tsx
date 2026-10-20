@@ -59,6 +59,8 @@ export function resolveFastControl(
 }
 
 interface ModelEditSubmenuProps {
+  /** Deliberately apply saved settings to the already-selected model. */
+  onApplyPreset?: () => void
   /** Whether this model can turn thinking off. False on reasoning-mandatory
    *  routes, whose upstream rejects a disable — the toggle is hidden rather
    *  than offered as a control that silently does nothing. */
@@ -107,6 +109,7 @@ function ModelEditSubmenuBody({
   effort,
   fastControl,
   isActive,
+  onApplyPreset,
   onSelectModel,
   onSetOptions,
   reasoning
@@ -120,13 +123,13 @@ function ModelEditSubmenuBody({
 
   const setFast = (enabled: boolean) => {
     if (fastControl.kind === 'variant') {
-      // Fast is a separate model id. Report the choice so the controller can
-      // record it against the base model, and only swap models now if this is
-      // the active row — inactive edits stay preference-only.
-      onSetOptions({ fast: enabled })
-
+      // A catalog-backed -fast sibling is a MODEL change, not a speed
+      // parameter on the current model. Inactive edits remain preset-only;
+      // the active row must not also send config.set fast to the old model.
       if (isActive) {
         void onSelectModel(enabled ? fastControl.fastId : fastControl.baseId)
+      } else {
+        onSetOptions({ fast: enabled })
       }
 
       return
@@ -145,6 +148,11 @@ function ModelEditSubmenuBody({
   ) : (
     <>
       <DropdownMenuLabel className={dropdownMenuSectionLabel}>{copy.options}</DropdownMenuLabel>
+      {onApplyPreset ? (
+        <DropdownMenuItem className={dropdownMenuRow} onSelect={() => onApplyPreset()}>
+          {t.common.apply} {copy.options}
+        </DropdownMenuItem>
+      ) : null}
       {showThinkingToggle ? (
         <DropdownMenuItem className={dropdownMenuRow} onSelect={event => event.preventDefault()}>
           {copy.thinking}

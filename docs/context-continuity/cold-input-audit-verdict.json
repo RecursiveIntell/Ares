@@ -1,0 +1,133 @@
+{
+  "schema": "context-input-lifetime-audit-verdict/v1",
+  "verdict": "BOUNDED_PASS",
+  "audit_role": "independent read-only hostile post-implementation audit",
+  "base_commit": "120baddb3732bc8ea9b08417e28334227bc9ce67",
+  "source_manifest": "docs/context-continuity/cold-input-audit-sources.json",
+  "source_manifest_sha256": "b2ba582492aff169e3ecc22fb62d8d493f0e7502326fccf7cf645f5c594e84da",
+  "source_hash_readback": {
+    "matched": 21,
+    "mismatched": 0,
+    "files": {
+      ".github/workflows/context-continuity-qualification.yml": "29179e517ddacc3c34f7abf078ade1d1c92107dc387d5f514307dc980d2fab36",
+      "agent/context_input.py": "130733df5bca8c47d1d26cb8ec68ff758bf3da3862bebdab14dcd13fb6f2b530",
+      "agent/conversation_loop.py": "51574db03970daa5de72f8a98e271c73a2fbb94f6d3959ba27a90352207340dc",
+      "agent/turn_context.py": "9a5d186180fd0d74d97b4193d2b0a90af790d4913e8e909aa8b2be9bfd0f592b",
+      "agent/turn_finalizer.py": "58bfd36ba036cbe8fffaf9a6cda286b1b58047a0abf7c66c6091bd2328ef9394",
+      "ares_runtime/continuity/runtime.py": "f6b46387c0558421b02da145e59107b45e296e6475e7956df956fe361484be7c",
+      "gateway/context_input.py": "53e2f24b19bc2dcee5eebe2665677dabf521b26e91c7f1bac636811fc0abdbb0",
+      "gateway/context_input_recovery.py": "7fd5f3c59f87bf8cf65ad3b94fba3fc6820f5c41c49b3f04aad5d505946ccd6f",
+      "gateway/run.py": "40c07f7b5d7d23fd70b1fb8a21c612b8baf5b8fe330a6ec9eb8f582487ced454",
+      "hermes_state.py": "28fabeb5b3cf4d2d1d4f2b3a86e1214c33cfce55c971749d7ea6449a27e1b6cc",
+      "hermes_state_continuity.py": "c57da83dcd76b898fb86771a2eb0a1ddb784f2a2ebaa7d1bb7b1ace8911bd68b",
+      "hermes_state_inbox.py": "78b8f947190f76db90d2884ddfa5e491f49f693ca200c896b88344cc3620e37b",
+      "hermes_state_input_turns.py": "eeea874576ba3b40d3b32a87fa8c5fc8ac7231e4c099b24758fbe03ef4979023",
+      "pyproject.toml": "973fa2707705d1a9ace5df5926b8cc49dbc9fd8c563c5abffef1f7ad6b48e77e",
+      "run_agent.py": "8f527c0cb3186df0f32f8c2d07bdb7048c401a25d7254740e20a86fda4cfeff8",
+      "tests/ares_runtime/test_context_input_lifetime.py": "668e7ee52bee39ab505e61d138c47fbc0359f71248d567caa7dc8e09acec0210",
+      "tests/ares_runtime/test_continuity_dispatch.py": "a1f10134cc9b6ce15fef961ff7af3a5dc9c1c2fc813ef5f4a12213b0557c3603",
+      "tests/ares_runtime/test_continuity_input.py": "9673c9b2aa19694a20fa42b443f818c6b65b03e7bce3a8a4163798a337f54131",
+      "tests/cli/test_quick_commands.py": "3a053e20831731ae4b9f52204b0e747e4c5e4fbb9613ba43991c522422e4b6ca",
+      "tests/gateway/test_context_input.py": "e6f40945ea0a3afdf4fa7fdbaa745c08d6944bb43a3014206768d9e8971895ed",
+      "tests/gateway/test_context_input_recovery.py": "047ef93549cf11b3005f29259cd4afdc7789ef75c209422eec78ffb62e9fe12f"
+    }
+  },
+  "scope": "Selected locally authorized stateless-text gateway input: immutable transport provenance, existing-controller cold discovery, native bounded pre-dispatch recovery, native dispatch linkage, uncertainty quarantine, and atomic final assistant response persistence.",
+  "findings": [],
+  "closed_findings": [
+    {
+      "id": "AUD-L1",
+      "closure": "Final completion requires the last admitted attempt, received final response, a strictly post-admission active assistant tail, and exact content. Native response receipt and final batch commit atomically; lost acknowledgement is reconciled read-only.",
+      "evidence": [
+        "hermes_state_input_turns.py:_complete_context_input_turn_on_conn",
+        "test_pre_request_assistant_note_cannot_complete_response",
+        "test_response_and_final_row_publish_atomically_and_ack_loss_reads_back",
+        "test_final_response_cannot_complete_superseded_or_tool_work"
+      ]
+    },
+    {
+      "id": "AUD-L2",
+      "closure": "Answered input phases do not acquire separately owned synthetic dispatches.",
+      "evidence": [
+        "hermes_state_input_turns.py:_bind_input_turn_dispatch_on_conn",
+        "test_answered_phase_does_not_block_separately_owned_synthetic_dispatch"
+      ]
+    },
+    {
+      "id": "transport-producer-decoder",
+      "closure": "Primary transport uses valid transport:primary discriminator; native platform identifiers remain bounded opaque strings. Current primary auth scope is the stable gateway launch home.",
+      "evidence": [
+        "gateway/context_input.py",
+        "hermes_state_inbox.py",
+        "test_platform_ids_remain_opaque_in_native_provenance",
+        "test_actual_cold_adapter_turn_projects_once_and_records_response"
+      ]
+    }
+  ],
+  "verified_behaviors": [
+    {
+      "claim": "Projection is not execution or completion; admitted requests without durable final outcome cannot be cold-replayed.",
+      "tests": [
+        "test_projection_is_not_execution_or_completion",
+        "test_any_admitted_request_without_final_outcome_parks",
+        "test_final_response_receipt_reconciles_lost_ack_and_never_reexecutes"
+      ]
+    },
+    {
+      "claim": "Recovery uses the existing gateway scheduler and native inbox, with fixed construction/recovery bounds and proven-dead takeover.",
+      "tests": [
+        "test_startup_recovers_native_input_without_resume_marker_or_new_human",
+        "test_retry_budget_cannot_be_reset_by_new_input_or_lease",
+        "test_wake_construction_budget_survives_new_arrivals",
+        "test_live_controller_is_not_dead_when_lease_expires",
+        "test_actual_dead_process_projected_input_recovers_without_duplicate"
+      ]
+    },
+    {
+      "claim": "Immutable origin and current whole-range actor authorization fence selected gateway recovery; changed routing and reset cannot silently retarget work.",
+      "tests": [
+        "test_acceptance_origin_survives_reopen_and_cannot_be_backfilled",
+        "test_every_actor_in_shared_chat_batch_is_reauthorized",
+        "test_changed_recovery_authority_parks_without_losing_input",
+        "test_reset_after_wake_admission_does_not_route_old_input_to_new_root",
+        "test_actor_revocation_reaches_real_provider_boundary",
+        "test_unqualified_delegated_authorization_refuses_before_native_acceptance"
+      ]
+    },
+    {
+      "claim": "Provider exceptions may durably settle as response_discarded while preserving spent admission and cold replay refusal; final phase completion requires the last response_received.",
+      "source": [
+        "ares_runtime/continuity/runtime.py",
+        "hermes_state_input_turns.py"
+      ]
+    }
+  ],
+  "validation": {
+    "runner": "HERMES_TEST_WORKERS=2 HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh",
+    "files": [
+      "tests/ares_runtime/test_context_input_lifetime.py",
+      "tests/gateway/test_context_input_recovery.py",
+      "tests/gateway/test_context_input.py",
+      "tests/ares_runtime/test_continuity_input.py",
+      "tests/ares_runtime/test_continuity_dispatch.py",
+      "tests/ares_runtime/test_continuity_tool_control.py",
+      "tests/test_run_custody_ready_recovery.py"
+    ],
+    "passed": 136,
+    "failed": 0,
+    "file_count": 7,
+    "exit_code": 0,
+    "raw_log": "docs/context-continuity/cold-input-audit-test-run.log",
+    "raw_log_sha256": "075b9e4829cf5f536b499f87580425cab6dc09ef3f77f034bc43a2bb69c32a3b",
+    "root_gate": "Parent separately reports 2765 passed, 0 failed, 5 skipped across 86 files; this independent verdict is grounded in the separately executed seven-file gate and source review."
+  },
+  "limits": [
+    "This is not full V4 acceptance or readiness certification.",
+    "Recovery deadlines bound pre-dispatch recovery/construction. Live productive execution retains native request cap 128 and existing parent budgets; complete shared-budget qualification remains outstanding.",
+    "Answered certifies durable final assistant response persistence, not transport delivery or completion of all task/effect obligations.",
+    "Selected local stateless-text authorization only: delegated/upstream role-dependent authorization refuses before acceptance; legacy receipts lacking immutable origin are not backfilled or cold-qualified.",
+    "A request admitted without a durable final response remains parked; response_discarded does not establish zero billing or prove the request never reached its provider.",
+    "No live provider/platform calls or production restart qualification were performed; tests exercise native DB and real agent/controller seams with controlled provider/adapter fixtures."
+  ],
+  "next_gate": "Continue remaining V4 implementation and exact acceptance-oracle qualification; retain shared-budget and delivery/task-completion distinctions."
+}

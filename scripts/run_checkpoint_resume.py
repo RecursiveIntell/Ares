@@ -30,7 +30,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from hermes_state import SessionDB
-from hermes_state_runs import RunCheckpoint, RunCustodyError
+from hermes_state_runs import RunCheckpoint, RunCustodyV2, RunCustodyError
 
 MAX_FILE_BYTES = 8_000_000
 MAX_TOTAL_BYTES = 64_000_000
@@ -116,6 +116,9 @@ def check_lease(db, owner, request):
 
 
 def check_goal(db, owner):
+    if type(owner) is RunCustodyV2:
+        db.validate_run_task_binding(owner)
+        return
     key = dict(owner.checkpoint.members).get("historical-goal-key")
     if not key:
         raise ResumeRefusal("HISTORICAL_GOAL_BINDING_MISSING")

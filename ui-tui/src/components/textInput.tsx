@@ -1428,11 +1428,15 @@ export function TextInput({
       let v = vRef.current
       const mod = isActionMod(k)
       const wordMod = mod || k.meta
-      const actionHome = k.home || (!isMac && mod && inp === 'a') || isMacActionFallback(k, inp, 'a')
-      const actionEnd = k.end || (mod && inp === 'e') || isMacActionFallback(k, inp, 'e')
-      const actionDeleteToStart = (mod && inp === 'u') || isMacActionFallback(k, inp, 'u')
-      const actionKillToEnd = (mod && inp === 'k') || isMacActionFallback(k, inp, 'k')
-      const actionDeleteWord = (mod && inp === 'w') || isMacActionFallback(k, inp, 'w')
+      // Enhanced protocols keep a canonical lowercase command name while
+      // inserted Shift text is uppercase. Raw uppercase escape chords have
+      // no single-character name: retain their existing literal fallback.
+      const command = event.keypress.name?.length === 1 ? event.keypress.name : inp
+      const actionHome = k.home || (!isMac && mod && command === 'a') || isMacActionFallback(k, inp, 'a')
+      const actionEnd = k.end || (mod && command === 'e') || isMacActionFallback(k, inp, 'e')
+      const actionDeleteToStart = (mod && command === 'u') || isMacActionFallback(k, inp, 'u')
+      const actionKillToEnd = (mod && command === 'k') || isMacActionFallback(k, inp, 'k')
+      const actionDeleteWord = (mod && command === 'w') || isMacActionFallback(k, inp, 'w')
       const range = selRange()
       const delFwd = k.delete || fwdDel.current
 
@@ -1443,15 +1447,15 @@ export function TextInput({
         flushKeyBurst()
       }
 
-      if (mod && inp === 'z') {
+      if (mod && !k.shift && command === 'z') {
         return swap(undo, redo)
       }
 
-      if ((mod && inp === 'y') || (mod && k.shift && inp === 'z')) {
+      if ((mod && command === 'y') || (mod && k.shift && command.toLowerCase() === 'z')) {
         return swap(redo, undo)
       }
 
-      if (isMac && mod && inp === 'a') {
+      if (isMac && mod && command === 'a') {
         return selectAll()
       }
 
@@ -1487,13 +1491,13 @@ export function TextInput({
         moveCursor(c, k.shift)
 
         return
-      } else if (wordMod && inp === 'b') {
+      } else if (wordMod && command === 'b') {
         clearSel()
         c = wordLeft(v, c)
-      } else if (wordMod && inp === 'f') {
+      } else if (wordMod && command === 'f') {
         clearSel()
         c = wordRight(v, c)
-      } else if (wordMod && inp === 'd') {
+      } else if (wordMod && command === 'd') {
         // meta+d (readline kill-word). The web dashboard maps Ctrl+Delete to
         // ESC d, which hermes-ink decodes as meta+'d'; without this branch it
         // fell through to the printable path and typed a literal "d".

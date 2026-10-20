@@ -68,7 +68,7 @@ def _make_desktop_tree(tmp_path: Path) -> Path:
     root = tmp_path / "hermes-agent"
     desktop_dir = root / "apps" / "desktop"
     desktop_dir.mkdir(parents=True)
-    (desktop_dir / "package.json").write_text("{}", encoding="utf-8")
+    (desktop_dir / "package.json").write_text('{"productName": "Hermes"}', encoding="utf-8")
     return root
 
 

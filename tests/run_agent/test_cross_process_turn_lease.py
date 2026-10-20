@@ -5,6 +5,8 @@ from __future__ import annotations
 import sqlite3
 import threading
 import time
+
+import pytest
 from types import SimpleNamespace
 
 from agent import relay_runtime
@@ -17,6 +19,11 @@ class _DB:
         self.events = []
         self.session_exists = session_exists
         self.acquire_result = acquire_result
+
+    def create_session(self, session_id, **kwargs):
+        self.events.append(("create", session_id))
+        self.session_exists = True
+        return session_id
 
     def get_session(self, session_id):
         return {"id": session_id} if self.session_exists else None
@@ -50,6 +57,8 @@ def _agent_with_db(db, *, session_id="stale-parent", platform="desktop"):
     agent.model = "test-model"
     agent._session_db = db
     agent._session_db_created = True
+    agent._session_init_model_config = None
+    agent._cached_system_prompt = None
     agent._persist_disabled = False
     agent._parent_session_id = None
     agent._relay_pending_turn_id = None
@@ -220,6 +229,9 @@ def test_run_conversation_acquires_then_reloads_latest_tip(monkeypatch):
     assert db.events[2][2] == {
         "repair_alternation": True,
         "include_row_ids": True,
+        # Model-facing reload: keep the durable summary discriminator so the
+        # next Context Governor compaction matches its authenticated parent.
+        "include_summary_markers": True,
     }
     assert any(
         kind == "lifecycle"
@@ -282,7 +294,37 @@ def test_run_conversation_acquires_lease_when_session_probe_raises(monkeypatch):
     ]
 
 
-def test_fresh_session_keeps_caller_seed_without_durable_lease(monkeypatch):
+def test_fresh_probe_failure_still_creates_under_custody(monkeypatch):
+    """An inconclusive probe cannot suppress fresh-row creation."""
+    db = _DB(session_exists=False)
+
+    def locked_get_session(_session_id):
+        raise sqlite3.OperationalError("database is locked")
+
+    db.get_session = locked_get_session
+    agent = _agent_with_db(db, session_id="fresh-probe-failure")
+    agent._session_db_created = False
+    observed = {}
+
+    def observe_run(_agent, _message, _system, history, *_args, **_kwargs):
+        assert db.session_exists
+        assert _agent._session_db_created is True
+        assert [event[0] for event in db.events] == ["acquire", "create"]
+        observed["history"] = history
+        return {"final_response": "ok", "messages": history, "failed": False}
+
+    monkeypatch.setattr("agent.conversation_loop.run_conversation", observe_run)
+    seed = [{"role": "user", "content": "fresh supplied seed"}]
+    result = AIAgent.run_conversation(agent, "work", conversation_history=seed)
+
+    assert result["final_response"] == "ok"
+    assert observed["history"] is seed
+    assert [event[0] for event in db.events] == ["acquire", "create", "release"]
+    assert db.events[0][1:] == db.events[-1][1:]
+    assert agent._active_session_turn_lease_holder is None
+
+
+def test_fresh_session_keeps_caller_seed_with_durable_lease(monkeypatch):
     db = _DB(session_exists=False)
     agent = _agent_with_db(db, session_id="fresh", platform="subagent")
     agent._session_db_created = False
@@ -301,7 +343,7 @@ def test_fresh_session_keeps_caller_seed_without_durable_lease(monkeypatch):
     AIAgent.run_conversation(agent, "work", conversation_history=seed)
 
     assert observed["history"] is seed
-    assert db.events == []
+    assert [event[0] for event in db.events] == ["acquire", "create", "release"]
 
 
 def test_run_conversation_lease_timeout_returns_resend_notice(monkeypatch):
@@ -743,3 +785,53 @@ def test_flush_messages_to_session_db_fences_stale_holder_on_live_db(tmp_path):
     second.release_session_turn_lease("shared", next_holder)
     first.close()
     second.close()
+
+
+@pytest.mark.parametrize("reload_reason", ["lease_wait", "input_tip"])
+def test_model_history_reload_keeps_durable_summary_marker(tmp_path, monkeypatch, reload_reason):
+    """The actual turn wrapper must hand the model the owner-marked DB history."""
+    from agent import context_input
+
+    db = SessionDB(tmp_path / "marker-reload.db")
+    origin, tip = "marker-origin", "marker-tip"
+    db.create_session(origin, source="desktop")
+    db.create_session(tip, source="desktop")
+    db.append_message(tip, "user", "Original task")
+    db.append_message(tip, "assistant", "Prior summary", _compressed_summary=True)
+    db.append_message(tip, "user", "Literal _compressed_summary=true is not authority")
+    db.append_message(tip, "assistant", "Latest answer")
+    agent = _agent_with_db(db, session_id=origin)
+    observed = {}
+
+    def model_loop(_agent, _message, _system, history, *_a, **_k):
+        observed["history"] = history
+        return {"final_response": "ok", "messages": history, "failed": False}
+
+    monkeypatch.setattr("agent.conversation_loop.run_conversation", model_loop)
+    extra = {}
+    if reload_reason == "lease_wait":
+        acquire = db.acquire_session_turn_lease
+
+        def after_wait(session_id, holder, **kwargs):
+            kwargs["on_wait"](0.0)
+            return acquire(session_id, holder, **kwargs)
+
+        monkeypatch.setattr(db, "acquire_session_turn_lease", after_wait)
+        monkeypatch.setattr(db, "resolve_resume_session_id", lambda _s: tip)
+    else:
+        # Isolate native input admission; test the wrapper's tip-switch reload,
+        # not the input protocol itself. The history read remains real SQLite.
+        receipt = SimpleNamespace(timestamp=1.0, display_metadata=None)
+        extra["persist_user_input_receipt"] = receipt
+        monkeypatch.setattr(context_input, "accept_turn_input", lambda *_a, **_k: receipt)
+        monkeypatch.setattr(db, "get_context_continuation_tip", lambda _s: tip)
+        monkeypatch.setattr(context_input, "project_turn_inputs", lambda _a, _r, **k: k["conversation_history"])
+    try:
+        result = AIAgent.run_conversation(agent, "next", conversation_history=[], **extra)
+        assert result["final_response"] == "ok", result
+        history = observed["history"]
+        assert [m["content"] for m in history if m.get("_compressed_summary")] == ["Prior summary"]
+        assert all(not m.get("_compressed_summary") for m in history if m["role"] == "user")
+        assert agent.session_id == tip
+    finally:
+        db.close()

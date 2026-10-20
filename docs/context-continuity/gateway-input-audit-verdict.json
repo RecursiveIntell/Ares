@@ -1,0 +1,43 @@
+{
+  "stage": "independent-post-implementation-audit",
+  "status": "bounded_pass",
+  "finding_ids": [],
+  "reason": "No remaining blocker found in bounded gateway ingress and native provenance compatibility scope. Exact nonpositive integer coordinates preserve first-durable occurrence semantics; positive/malformed coordinates remain strict; per-test SUMMARY isolation removes cross-database coordinate contamination.",
+  "audited_snapshot": "gateway-input-audit-sources.json",
+  "validation": {
+    "runner": "HERMES_TEST_WORKERS=2 HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh",
+    "files": [
+      "tests/state/test_message_row_publication.py",
+      "tests/test_compression_watermark_commit.py",
+      "tests/test_run_custody_obligations.py",
+      "tests/gateway/test_context_input.py",
+      "tests/ares_runtime/test_continuity_input.py"
+    ],
+    "passed": 114,
+    "failed": 0,
+    "raw_log": "gateway-input-audit-test-run.log",
+    "hashes_unchanged_after_gate": true
+  },
+  "coverage_limits": [
+    "Autonomous cold native-inbox wake and turn completion remain next work",
+    "Active pending control replies are not qualified by this increment; existing owners retain handling",
+    "Selected stateless text BaseAdapter ingress only; attachments and non-BaseAdapter transports not certified",
+    "Proxy route refuses typed native receipt",
+    "Generated invocation IDs do not provide cross-delivery deduplication when stable transport IDs are absent",
+    "Bounded increment only; no full V4 readiness claim"
+  ],
+  "remaining_delta": [],
+  "next_gate": "Continue native inbox wake and turn completion construction",
+  "base_commit": "20728d31a2185a5f8f777168982cb76db922c32a",
+  "compatibility": {
+    "ci_run": "36138759070",
+    "baseline_reproduced_failures": 20,
+    "baseline_breakdown": {
+      "message_row_publication": 8,
+      "compression_watermark_commit": 12
+    },
+    "baseline_log": "coordinate-compat-before.log",
+    "corrected_source_status": "closed",
+    "semantics": "Only exact integers <=0 are provisional absent coordinates in both helper sites; rollback does not publish row IDs; strict malformed/positive validation retained."
+  }
+}

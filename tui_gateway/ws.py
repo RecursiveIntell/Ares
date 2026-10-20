@@ -26,6 +26,8 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import json
+
+from tui_gateway.checkpoint_json import load_checkpoint_frame
 import logging
 import socket
 import threading
@@ -430,15 +432,13 @@ async def handle_ws(
             messages += 1
 
             try:
-                req = json.loads(line)
-            except json.JSONDecodeError as exc:
+                req = load_checkpoint_frame(line)
+            except json.JSONDecodeError:
                 parse_errors += 1
                 _log.warning(
-                    "ws parse error peer=%s index=%d error=%s payload=%r",
+                    "ws parse error peer=%s index=%d",
                     peer,
                     messages,
-                    exc,
-                    line[:_WS_LOG_PAYLOAD_PREVIEW],
                 )
                 ok = await transport.write_async(
                     {

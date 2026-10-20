@@ -35,6 +35,7 @@ MEMORY_CONTEXT_MAX_CHARS = 6_000
 _MEMORY_CONTEXT_HEAD_CHARS = 4_000
 _MEMORY_CONTEXT_TAIL_CHARS = 1_500
 _MEMORY_CONTEXT_TRUNCATION_MARKER = "\n...[memory provider context truncated]...\n"
+CONTEXT_REBASE_LINEAGE_INTEGRITY_MISMATCH = "CONTEXT_REBASE_LINEAGE_INTEGRITY_MISMATCH"
 
 
 def sanitize_memory_context(memory_context: str) -> str:
@@ -163,6 +164,16 @@ class ContextEngine(ABC):
         warning fix (#62625) so plugin engines don't raise AttributeError.
         """
         return self.should_compress(prompt_tokens), None
+
+    def automatic_rebase_block_reason(self) -> str | None:
+        """Optionally veto host automatic durable-state rebase.
+
+        This is a veto-only contract: a non-empty reason can stop a rebase,
+        while ``None`` never authorizes one or replaces the runtime's existing
+        owner/effect/admission checks. Engines predating the hook inherit the
+        no-veto behavior.
+        """
+        return None
 
     @abstractmethod
     def compress(
@@ -401,6 +412,16 @@ class ContextEngine(ABC):
 
         Use this to flush state, close DB connections, etc.
         NOT called per-turn — only when the session truly ends.
+        """
+
+    def shutdown(self) -> None:
+        """Release only handles owned by this engine instance.
+
+        The logical session may continue in another engine instance with the
+        same session ID. Do not end it, delete durable context, or close shared
+        host resources here. Resource-bearing engines should override this
+        independently of on_session_end; resource-free engines need no work.
+        Tolerate handles already released by on_session_end at a real boundary.
         """
 
     def on_session_reset(self) -> None:

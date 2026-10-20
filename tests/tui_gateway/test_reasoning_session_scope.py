@@ -20,6 +20,7 @@ Covers the "desktop reverts thinking to medium after one turn" report:
 
 from __future__ import annotations
 
+import threading
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -62,7 +63,7 @@ class TestConfigSetReasoningSessionScope:
 
     def test_session_scoped_set_skips_global_write(self) -> None:
         agent = _agent(None)
-        session = {"session_key": "k1", "agent": agent}
+        session = {"session_key": "k1", "agent": agent, "history_lock": threading.Lock()}
         with patch.dict(server._sessions, {"s1": session}, clear=False), \
                 patch.object(server, "_write_config_key") as write_key, \
                 patch.object(server, "_persist_live_session_runtime"), \

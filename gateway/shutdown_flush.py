@@ -347,12 +347,13 @@ def recover_pending_to_db(
                         path,
                     )
                     continue
-                session_db.append_message(
-                    session_id=spooled_sid,
-                    role=message.get("role", "unknown"),
-                    content=message.get("content") or "",
-                    timestamp=message.get("timestamp") or payload.get("ts"),
-                )
+                from gateway.session import _append_transcript_message_to_db
+
+                recovered_message = dict(message)
+                # Preserve the established recovery coercion and timestamp fallback.
+                recovered_message["content"] = message.get("content") or ""
+                recovered_message["timestamp"] = message.get("timestamp") or payload.get("ts")
+                _append_transcript_message_to_db(session_db, spooled_sid, recovered_message)
                 recovered += 1
                 path.unlink(missing_ok=True)
                 continue

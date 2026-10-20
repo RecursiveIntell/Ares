@@ -54,6 +54,76 @@ export function isSessionNotFoundError(error: unknown): boolean {
   return /session not found/i.test(message)
 }
 
+/** How a failed `session.interrupt` actually resolved on the backend. */
+export type StopFailureDisposition = 'not_sent' | 'not_applied' | 'indeterminate' | 'unknown'
+
+/**
+ * Classify a failed Stop from the gateway's typed error payload.
+ *
+ * `session.interrupt` answers 5019 with `effect_disposition` on the compute-host
+ * path (`tui_gateway/methods_session.py`): `not_sent` = the request never
+ * reached the host, `not_applied` = the host refused before any effect, and
+ * `indeterminate` = the effect cannot be established (usually alongside
+ * `owner_reconciliation_required`). Rendering all three as one "Stop failed"
+ * tells the user nothing about whether their turn actually stopped.
+ *
+ * Unknown or older shapes stay `unknown` so callers keep the generic path.
+ * This reads a wire field only — it never treats a message as proof.
+ */
+export function classifyStopFailureDisposition(error: unknown): StopFailureDisposition {
+  const data = error && typeof error === 'object' && 'data' in error ? (error as { data?: unknown }).data : null
+
+  if (!data || typeof data !== 'object') {
+    return 'unknown'
+  }
+
+  const disposition = (data as { effect_disposition?: unknown }).effect_disposition
+
+  return disposition === 'not_sent' || disposition === 'not_applied' || disposition === 'indeterminate'
+    ? disposition
+    : 'unknown'
+}
+
+export interface StopFailureNotice {
+  kind: 'error' | 'info'
+  message: string
+}
+
+/**
+ * The notice a failed Stop should raise, or null to fall through to the generic
+ * failure path. ONE decision shared by the two Stop surfaces that report to the
+ * user — the composer Stop and the chat-tile Stop — so a sibling path cannot
+ * drift back to a bare "Stop failed".
+ *
+ * NOT covered (pre-existing, outside this repair): the rewind interrupt
+ * (`use-prompt-actions/rewind.ts`, silent best-effort) and the contrib tile
+ * delegate (`app/contrib/hooks/use-session-tile-delegate.ts`, which auto-resumes
+ * before interrupting). They are the app's other `session.interrupt` senders and
+ * still do not consume typed dispositions.
+ *
+ * Returns data rather than notifying, so this module stays free of the store.
+ */
+export function stopFailureNotice(
+  error: unknown,
+  copy: { stopNotSent: string; stopAlreadySettled: string; stopUnconfirmed: string }
+): StopFailureNotice | null {
+  const disposition = classifyStopFailureDisposition(error)
+
+  if (disposition === 'not_sent') {
+    return { kind: 'error', message: copy.stopNotSent }
+  }
+
+  if (disposition === 'not_applied') {
+    return { kind: 'info', message: copy.stopAlreadySettled }
+  }
+
+  if (disposition === 'indeterminate') {
+    return { kind: 'error', message: copy.stopUnconfirmed }
+  }
+
+  return null
+}
+
 /**
  * Thrown when a stale-session recovery resumed successfully but the caller's
  * drift check says the user has since moved on (profile swap, route rebind,
@@ -710,6 +780,8 @@ export interface SubmitTextOptions {
    *  still receives the text as a normal user turn. */
   displayKind?: 'hidden'
   fromQueue?: boolean
+  /** Exact queue entry whose uncertain delivery must survive a restart. */
+  queueEntryId?: string
   /** A one-shot /goal resume dispatch. The backend consumes its canonical
    * checkpoint only after agent readiness, at actual turn start. */
   goalContinuation?: boolean

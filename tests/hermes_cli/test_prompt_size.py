@@ -117,5 +117,50 @@ def test_skills_breakdown_attributes_demoted_category_shared_line(isolated_home)
         assert entry["index_line_skill_count"] == 2
 
 
+def test_context_tier_reports_agents_md_from_cwd(isolated_home, tmp_path, monkeypatch):
+    """The context tier must attribute AGENTS.md when a cwd is supplied.
+
+    Regression: ``compute_prompt_breakdown`` built a cli-platform inspection
+    agent at a dry cwd, so the context tier always read 0 B even for a surface
+    whose real sessions carry an AGENTS.md. The diagnostic could not measure
+    the largest context block it exists to explain.
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+    agents_md = "# rules\n" + "line\n" * 200
+    (project / "AGENTS.md").write_text(agents_md, encoding="utf-8")
+    monkeypatch.delenv("TERMINAL_CWD", raising=False)
+
+    def _context_bytes(data):
+        return next(b for label, _c, b in data["sections"]
+                    if label.startswith("context"))
+
+    # A cwd pointing at a dir containing AGENTS.md attributes at least those
+    # bytes...
+    with_cwd = _context_bytes(compute_prompt_breakdown("cli", cwd=project))
+    assert with_cwd >= len(agents_md.encode("utf-8")), (
+        "context tier did not attribute the AGENTS.md bytes"
+    )
+    # ...and attributing it adds bytes versus not passing a cwd. Comparing the
+    # two in the same ambient environment keeps the assertion stable even when
+    # the host temp dir happens to sit inside an unrelated git repository.
+    without_cwd = _context_bytes(compute_prompt_breakdown("cli"))
+    assert with_cwd > without_cwd, (
+        "a supplied cwd did not change the context tier"
+    )
+
+
+def test_context_tier_rejects_invalid_cwd(isolated_home, tmp_path):
+    """A nonexistent --cwd must error, not silently measure the process cwd."""
+    missing = tmp_path / "does-not-exist"
+    with pytest.raises(ValueError):
+        compute_prompt_breakdown("cli", cwd=missing)
+    # A file (not a directory) is equally invalid.
+    a_file = tmp_path / "afile.txt"
+    a_file.write_text("x")
+    with pytest.raises(ValueError):
+        compute_prompt_breakdown("cli", cwd=a_file)
+
+
 
 

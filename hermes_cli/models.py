@@ -18,6 +18,7 @@ import urllib.parse
 import urllib.request
 import urllib.error
 import time
+from contextvars import copy_context
 from difflib import get_close_matches
 from pathlib import Path
 from typing import Any, NamedTuple, Optional, TYPE_CHECKING
@@ -25,6 +26,7 @@ from typing import Any, NamedTuple, Optional, TYPE_CHECKING
 if TYPE_CHECKING:
     from typing import TypeGuard
 
+from agent.secret_scope import get_secret as _get_secret
 from hermes_cli import __version__ as _HERMES_VERSION
 from hermes_cli.urllib_security import open_credentialed_url, url_origin
 from utils import atomic_json_write, base_url_host_matches
@@ -451,6 +453,9 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     ],
     "anthropic": [
         "claude-fable-5",
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "claude-haiku-5-5",
         "claude-sonnet-5",
         "claude-opus-4-8",
         "claude-opus-4-7",
@@ -495,7 +500,6 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     # discovery floor — live entries lead in the picker and stale curated
     # names never pollute the top.
     "opencode-zen": [
-        "x-preview-f-free",  # "Ox Alpha" stealth model — free, 1M ctx, ZDR
         "kimi-k3",
         "kimi-k2.5",
         "kimi-k2.6",
@@ -570,7 +574,6 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     # "opencode/latest"; we send honest Hermes attribution and don't
     # impersonate other clients — verified 2026-08-21).
     "opencode-free": [
-        "x-preview-f-free",  # "Ox Alpha" stealth model — free, 1M ctx, ZDR
         "hy3-free",
         "laguna-s-2.1-free",
         "nemotron-3-ultra-free",
@@ -1733,8 +1736,9 @@ def _warm_reasoning_caps_async(refresh) -> None:
     """
     if os.environ.get("PYTEST_CURRENT_TEST"):
         return
+    context = copy_context()
     threading.Thread(
-        target=refresh, name="reasoning-caps-warm", daemon=True
+        target=lambda: context.run(refresh), name="reasoning-caps-warm", daemon=True
     ).start()
 
 
@@ -2514,7 +2518,7 @@ def fetch_ai_gateway_pricing(
 
 def _resolve_openrouter_api_key() -> str:
     """Best-effort OpenRouter API key for pricing fetch."""
-    return os.getenv("OPENROUTER_API_KEY", "").strip()
+    return _get_secret("OPENROUTER_API_KEY", "").strip()
 
 
 _DEFAULT_NOUS_INFERENCE_BASE = "https://inference-api.nousresearch.com"
@@ -2664,11 +2668,11 @@ def _fetch_novita_pricing(
     matching the pattern used by ``fetch_ai_gateway_pricing`` — without this,
     every menu render or pricing lookup re-hits the network.
     """
-    api_key = os.getenv("NOVITA_API_KEY", "").strip()
+    api_key = _get_secret("NOVITA_API_KEY", "").strip()
     if not api_key:
         return {}
 
-    base_url = os.getenv("NOVITA_BASE_URL", "").strip() or "https://api.novita.ai/openai/v1"
+    base_url = _get_secret("NOVITA_BASE_URL", "").strip() or "https://api.novita.ai/openai/v1"
     cache_key = base_url.rstrip("/")
     if not force_refresh:
         cached = _cached_catalog(cache_key)
@@ -2767,7 +2771,7 @@ def list_available_providers() -> list[dict[str, str]]:
                 custom_base_url = _get_custom_base_url() or ""
                 has_creds = bool(custom_base_url.strip())
             elif pid == "openrouter":
-                has_creds = has_usable_secret(os.getenv("OPENROUTER_API_KEY", ""))
+                has_creds = has_usable_secret(_get_secret("OPENROUTER_API_KEY", ""))
             else:
                 status = get_auth_status(pid)
                 has_creds = bool(status.get("logged_in") or status.get("configured"))
@@ -2913,7 +2917,7 @@ def _get_ollama_base_url() -> str:
         except (OSError, RuntimeError, TypeError, ValueError):
             pass
 
-    env_host = os.getenv("OLLAMA_HOST", "").strip()
+    env_host = _get_secret("OLLAMA_HOST", "").strip()
     if env_host:
         if env_host.startswith(":") and not env_host.startswith("::"):
             env_host = "127.0.0.1" + env_host
@@ -2960,7 +2964,7 @@ def _get_ollama_request_headers() -> dict[str, str]:
         key_env = str(
             entry.get("key_env") or entry.get("api_key_env") or ""
         ).strip()
-        api_key = os.getenv(key_env, "").strip() if key_env else ""
+        api_key = _get_secret(key_env, "").strip() if key_env else ""
     if api_key:
         if not any(key.lower() == "authorization" for key in result):
             result["Authorization"] = f"Bearer {api_key}"
@@ -3852,7 +3856,7 @@ def _openai_discovery_base_url(provider: str) -> str:
     config-set data-residency host (``us.api.openai.com``) was ignored and
     the catalog kept coming from ``api.openai.com``.
     """
-    env_raw = os.getenv("OPENAI_BASE_URL", "").strip().rstrip("/")
+    env_raw = _get_secret("OPENAI_BASE_URL", "").strip().rstrip("/")
     if env_raw:
         return env_raw
     try:
@@ -3906,7 +3910,7 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
         fallback_key = str(config.get("api_key") or "").strip()
         if not fallback_key:
             key_env = str(config.get("key_env") or "").strip()
-            fallback_key = os.getenv(key_env, "").strip() if key_env else ""
+            fallback_key = _get_secret(key_env, "").strip() if key_env else ""
         fallback_base = _normalize_openai_base_url(
             config.get("base_url") or base_url
         )
@@ -4022,7 +4026,7 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
         if live:
             return live
     if normalized in ("openai", "openai-api"):
-        api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        api_key = _get_secret("OPENAI_API_KEY", "").strip()
         if api_key:
             base = _openai_discovery_base_url(normalized)
             # Custom OpenAI-compatible endpoints (proxies, gateways, self-hosted)
@@ -4075,9 +4079,9 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
             # Try common API key env vars for custom endpoints
             api_key = (
                 str(model_cfg.get("api_key", "") or "").strip()
-                or os.getenv("CUSTOM_API_KEY", "")
-                or os.getenv("OPENAI_API_KEY", "")
-                or os.getenv("OPENROUTER_API_KEY", "")
+                or _get_secret("CUSTOM_API_KEY", "")
+                or _get_secret("OPENAI_API_KEY", "")
+                or _get_secret("OPENROUTER_API_KEY", "")
             )
             api_mode = "anthropic_messages" if _base_url_looks_like_anthropic_messages(base_url) else None
             live = fetch_api_models(api_key, base_url, api_mode=api_mode)
@@ -4096,11 +4100,46 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
         except Exception:
             pass
 
-    # OpenCode Free: curated keyless list only. models.dev's cost.input==0
-    # filter lags reality (deepseek-v4-flash-free stayed "free" there after
-    # its promo ended and the relay began 401ing keyless requests), so the
-    # curated list — synced against anonymous live probes — is authoritative.
+    # Free-model promotions end without a Hermes release. The relay's live
+    # catalog is the only useful picker source; stale curated entries can 401
+    # immediately even though they looked selectable (x-preview-f-free did).
+    #
+    # Picker discipline (same class as #72762 / cached_fetch_api_models):
+    # the picker must NOT block on a live network round-trip when it opens.
+    # Serve a same-fingerprint cached entry immediately (TTL, then a bounded
+    # stale-serve window) and revalidate off-thread; a cold cache falls back
+    # to the curated keyless list rather than blocking the open.
     if normalized == "opencode-free":
+        if force_refresh:
+            live = fetch_api_models(
+                None, "https://opencode.ai/zen/v1", headers=opencode_zen_free_headers()
+            )
+            catalog = [model for model in (live or []) if is_opencode_zen_free_model(model)]
+            if catalog:
+                cache = _load_provider_models_cache()
+                cache[_OPENCODE_FREE_CACHE_KEY] = {
+                    "fp": None,
+                    "at": time.time(),
+                    "models": list(catalog),
+                }
+                _save_provider_models_cache(cache)
+            return catalog
+        cache = _load_provider_models_cache().get(_OPENCODE_FREE_CACHE_KEY)
+        fp = None
+        if _cache_entry_valid(cache if isinstance(cache, dict) else None, fp):
+            age = time.time() - cache["at"]
+            if age < _OPENCODE_FREE_CACHE_TTL:
+                return list(cache["models"])
+            if age < _OPENCODE_FREE_STALE_SERVE_MAX:
+                _spawn_swr_refresh(
+                    _OPENCODE_FREE_CACHE_KEY,
+                    lambda: _refresh_opencode_free_catalog(),
+                )
+                return list(cache["models"])
+            if _cache_entry_valid(
+                cache if isinstance(cache, dict) else None, fp
+            ):
+                return list(cache["models"])
         return list(_PROVIDER_MODELS.get(normalized, []))
 
     # ── Profile-based generic live fetch (all simple api-key providers) ──
@@ -4209,6 +4248,27 @@ _PROVIDER_MODELS_STALE_SERVE_MAX = 7 * 24 * 3600  # 7d
 _swr_refresh_inflight: set = set()
 _swr_refresh_lock = threading.Lock()
 
+# OpenCode Free relay catalog cache (keyless; fingerprint-free — the relay
+# catalog is global, not per-credential). TTL then bounded stale-serve, both
+# revalidated off-thread via _spawn_swr_refresh; cold cache serves curated.
+_OPENCODE_FREE_CACHE_KEY = "custom:https://opencode.ai/zen/v1#opencode-free"
+_OPENCODE_FREE_CACHE_TTL = 900  # 15 minutes
+_OPENCODE_FREE_STALE_SERVE_MAX = _PROVIDER_MODELS_STALE_SERVE_MAX
+
+
+def _refresh_opencode_free_catalog():
+    """Background refresh for the opencode-free cache entry (or None)."""
+    try:
+        live = fetch_api_models(
+            None, "https://opencode.ai/zen/v1", headers=opencode_zen_free_headers()
+        )
+    except Exception:
+        return None
+    catalog = [model for model in (live or []) if is_opencode_zen_free_model(model)]
+    if not catalog:
+        return None
+    return {"fp": None, "at": time.time(), "models": list(catalog)}
+
 
 def _spawn_swr_refresh(cache_key: str, refresh_fn=None) -> None:
     """Kick a background refresh of *cache_key*'s model-id cache entry.
@@ -4264,8 +4324,9 @@ def _spawn_swr_refresh(cache_key: str, refresh_fn=None) -> None:
             with _swr_refresh_lock:
                 _swr_refresh_inflight.discard(cache_key)
 
+    context = copy_context()
     threading.Thread(
-        target=_refresh, daemon=True, name=f"model-cache-swr-{cache_key}"
+        target=lambda: context.run(_refresh), daemon=True, name=f"model-cache-swr-{cache_key}"
     ).start()
 
 
@@ -4298,10 +4359,10 @@ def _credential_fingerprint(provider: str) -> str:
         pcfg = PROVIDER_REGISTRY.get(provider)
         if pcfg is not None:
             for ev in getattr(pcfg, "api_key_env_vars", ()) or ():
-                parts.append(f"{ev}={_os.environ.get(ev, '')}")
+                parts.append(f"{ev}={_get_secret(ev, '')}")
             bev = getattr(pcfg, "base_url_env_var", "") or ""
             if bev:
-                parts.append(f"{bev}={_os.environ.get(bev, '')}")
+                parts.append(f"{bev}={_get_secret(bev, '')}")
     except Exception:
         pass
 
@@ -4317,7 +4378,7 @@ def _credential_fingerprint(provider: str) -> str:
             pass
 
     if provider == "ollama":
-        parts.append(f"OLLAMA_HOST={_os.environ.get('OLLAMA_HOST', '')}")
+        parts.append(f"OLLAMA_HOST={_get_secret('OLLAMA_HOST', '')}")
         provider_cfg = _get_provider_config_dict("ollama")
         parts.append(
             "providers.ollama.base_url="
@@ -4327,7 +4388,7 @@ def _credential_fingerprint(provider: str) -> str:
         key_env = provider_cfg.get("key_env") or provider_cfg.get("api_key_env") or ""
         parts.append(f"providers.ollama.key_env={key_env}")
         if key_env:
-            parts.append(f"{key_env}={_os.environ.get(str(key_env), '')}")
+            parts.append(f"{key_env}={_get_secret(str(key_env), '')}")
         model_cfg = _get_model_config_dict()
         parts.append(
             "model.provider="
@@ -5459,6 +5520,46 @@ def is_opencode_zen_free_model(model_id: Optional[str]) -> bool:
     return bare.endswith("-free") or bare in _OPENCODE_KEYLESS_EXTRA_SLUGS
 
 
+def probe_opencode_free_execution(model_id: str) -> tuple[bool, str]:
+    """Check that the anonymous relay will execute a listed free model."""
+    from urllib.error import HTTPError, URLError
+    from urllib.request import Request, urlopen
+
+    headers = {
+        **opencode_zen_free_headers(),
+        "Content-Type": "application/json",
+    }
+    request = Request(
+        "https://opencode.ai/zen/v1/chat/completions",
+        data=json.dumps({
+            "model": model_id,
+            "messages": [{"role": "user", "content": "OK"}],
+            "max_tokens": 1,
+        }).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    from ares_runtime.physical_dispatch import unsupported_transport_scope
+    try:
+        with unsupported_transport_scope('opencode_setup_urlopen_probe'):
+            with urlopen(request, timeout=10) as response:
+                body = json.load(response)
+        if isinstance(body, dict) and body.get("choices"):
+            return True, ""
+        return False, "The OpenCode Free relay returned no completion."
+    except HTTPError as exc:
+        message = ""
+        try:
+            body = json.loads(exc.read(4096))
+            error = body.get("error") if isinstance(body, dict) else None
+            message = str(error.get("message") or "") if isinstance(error, dict) else ""
+        except Exception:
+            pass
+        return False, f"OpenCode Free rejected execution (HTTP {exc.code}): {message or exc.reason}"
+    except (OSError, URLError, ValueError) as exc:
+        return False, f"Could not verify OpenCode Free execution: {exc}"
+
+
 def opencode_zen_free_headers() -> dict:
     """Client default_headers for anonymous OpenCode Zen free-tier requests.
 
@@ -5807,7 +5908,7 @@ _DEEPINFRA_CATALOG_NEG_TTL = 60.0  # seconds
 
 def _deepinfra_catalog_url() -> tuple[str, str]:
     """Return ``(cache_key, full_url)`` for the DeepInfra catalog endpoint."""
-    base = os.getenv("DEEPINFRA_BASE_URL", "").strip() or _DEEPINFRA_DEFAULT_BASE_URL
+    base = _get_secret("DEEPINFRA_BASE_URL", "").strip() or _DEEPINFRA_DEFAULT_BASE_URL
     cache_key = base.rstrip("/")
     return cache_key, f"{cache_key}/models?{_DEEPINFRA_MODELS_QUERY}"
 
@@ -5832,7 +5933,7 @@ def _fetch_deepinfra_catalog(
             return None
 
     headers: dict[str, str] = {"User-Agent": _HERMES_USER_AGENT}
-    api_key = os.getenv("DEEPINFRA_API_KEY", "").strip()
+    api_key = _get_secret("DEEPINFRA_API_KEY", "").strip()
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
@@ -5945,7 +6046,7 @@ def deepinfra_base_url(section: Optional[dict] = None) -> str:
     to re-code (with subtly divergent normalization).
     """
     candidate = section.get("base_url") if isinstance(section, dict) else None
-    value = candidate or os.getenv("DEEPINFRA_BASE_URL") or _DEEPINFRA_DEFAULT_BASE_URL
+    value = candidate or _get_secret("DEEPINFRA_BASE_URL") or _DEEPINFRA_DEFAULT_BASE_URL
     return str(value).strip().rstrip("/")
 
 
@@ -5992,10 +6093,10 @@ def _fetch_deepinfra_pricing(
 
 def _fetch_ai_gateway_models(timeout: float = 5.0) -> Optional[list[str]]:
     """Fetch available language models with tool-use from AI Gateway."""
-    api_key = os.getenv("AI_GATEWAY_API_KEY", "").strip()
+    api_key = _get_secret("AI_GATEWAY_API_KEY", "").strip()
     if not api_key:
         return None
-    base_url = os.getenv("AI_GATEWAY_BASE_URL", "").strip()
+    base_url = _get_secret("AI_GATEWAY_BASE_URL", "").strip()
     if not base_url:
         from hermes_constants import AI_GATEWAY_BASE_URL
         base_url = AI_GATEWAY_BASE_URL
@@ -6204,6 +6305,23 @@ def _strip_ollama_cloud_suffix(model_id: str) -> str:
     return model_id
 
 
+def _scoped_ollama_env_value(name: str) -> str:
+    """Read an Ollama setting through the active profile secret scope.
+
+    In multiplex mode, an absent scope or value must not fall through to the
+    process environment: that environment may belong to another profile.
+    ``get_secret`` supplies the canonical fail-closed behavior; treating its
+    unscoped signal as an unavailable catalog credential keeps discovery
+    offline instead of probing Ollama with an ambient key.
+    """
+    try:
+        from agent.secret_scope import get_secret
+
+        return str(get_secret(name, "") or "").strip()
+    except Exception:
+        return ""
+
+
 def _ollama_cloud_cache_path() -> Path:
     """Return the path for the Ollama Cloud model cache."""
     from hermes_constants import get_hermes_home
@@ -6272,9 +6390,11 @@ def fetch_ollama_cloud_models(
 
     # 2. Live API probe
     if not api_key:
-        api_key = os.getenv("OLLAMA_API_KEY", "")
+        api_key = _scoped_ollama_env_value("OLLAMA_API_KEY")
     if not base_url:
-        base_url = os.getenv("OLLAMA_BASE_URL", "") or "https://ollama.com/v1"
+        base_url = (
+            _scoped_ollama_env_value("OLLAMA_BASE_URL") or "https://ollama.com/v1"
+        )
 
     live_models: list[str] = []
     if api_key:
@@ -6353,6 +6473,28 @@ def validate_requested_model(
             "persist": False,
             "recognized": False,
             "message": "Model name cannot be empty.",
+        }
+
+    if normalized == "opencode-free":
+        # This provider is anonymous. Membership in a baked-in list is no
+        # evidence that the Zen relay still serves the model today.
+        live = provider_model_ids("opencode-free", force_refresh=True)
+        if requested_for_lookup in live:
+            executable, reason = probe_opencode_free_execution(requested_for_lookup)
+            return {
+                "accepted": executable,
+                "persist": executable,
+                "recognized": True,
+                "message": None if executable else reason,
+            }
+        return {
+            "accepted": False,
+            "persist": False,
+            "recognized": False,
+            "message": (
+                f"OpenCode Free does not currently list `{requested}`. "
+                "Refresh /model and choose a listed free model."
+            ),
         }
 
     if normalized == "moa":

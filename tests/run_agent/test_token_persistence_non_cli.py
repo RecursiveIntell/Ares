@@ -44,7 +44,10 @@ def _make_agent(session_db, *, platform: str):
 
 
 def test_run_conversation_persists_tokens_for_telegram_sessions():
+    from hermes_state import TodoRecoveryState
+
     session_db = MagicMock()
+    session_db.get_todo_recovery_state.return_value = TodoRecoveryState("never_committed", None)
     agent = _make_agent(session_db, platform="telegram")
 
     result = agent.run_conversation("hello")

@@ -52,7 +52,7 @@ export function QueuePanel({
     // behind a collapsed "N queued" pill is how they read as vanished.
     <StatusSection
       accessory={
-        parked ? (
+        parked && !entries.some(entry => entry.deliveryUnknown) ? (
           <Tip label={c.queueResumeTip}>
             <Button
               className="text-muted-foreground/75 hover:text-foreground/90"
@@ -76,7 +76,7 @@ export function QueuePanel({
         const attachmentsCount = entry.attachments.length
         // Steer only surfaces where it can actually deliver: a live turn to
         // redirect and an entry the redirect can carry (text-only, no slash).
-        const canSteer = busy && Boolean(onSteerNow) && isSteerableEntry(entry)
+        const canSteer = busy && Boolean(onSteerNow) && !entry.deliveryUnknown && isSteerableEntry(entry)
 
         return (
           <StatusRow
@@ -119,7 +119,7 @@ export function QueuePanel({
                   <Button
                     aria-label={busy ? c.queueSendNext : c.queueSend}
                     className="size-5 rounded-md"
-                    disabled={isEditing}
+                    disabled={isEditing || entry.deliveryUnknown}
                     onClick={() => onSendNow(entry.id)}
                     size="icon-xs"
                     type="button"
@@ -146,6 +146,12 @@ export function QueuePanel({
           >
             <div className="min-w-0 flex-1">
               <p className="truncate text-[0.73rem] leading-4 text-foreground/92">{entryPreview(entry, c)}</p>
+              {entry.deliveryUnknown && (
+                <p className="text-[0.64rem] text-muted-foreground" role="status">
+                  Delivery unknown — check the transcript before composing another message. This entry will not resend
+                  automatically.
+                </p>
+              )}
               {(attachmentsCount > 0 || isEditing) && (
                 <div className="mt-0.5 flex items-center gap-1.5 text-[0.64rem] text-muted-foreground/75">
                   {attachmentsCount > 0 && <span>{c.attachments(attachmentsCount)}</span>}

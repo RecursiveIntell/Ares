@@ -124,7 +124,7 @@ class TestAppendMessagesBatch:
         """A failure mid-batch leaves ZERO rows and untouched counters."""
         real_insert = SessionDB._insert_message_rows
 
-        def failing_insert(self_db, conn, session_id, messages):
+        def failing_insert(self_db, conn, session_id, messages, **kwargs):
             real_conn_execute = conn.execute
             calls = {"n": 0}
 
@@ -137,7 +137,7 @@ class TestAppendMessagesBatch:
 
             conn.execute = exec_counting
             try:
-                return real_insert(self_db, conn, session_id, messages)
+                return real_insert(self_db, conn, session_id, messages, **kwargs)
             finally:
                 conn.execute = real_conn_execute
 

@@ -1,0 +1,55 @@
+{
+  "schema": "ares.context-continuity-owner-recovery-evidence/v1",
+  "base_commit": "dbbc704ab18771396de967faec5b6bad3189e956",
+  "status": "bounded_source_pass_full_v4_incomplete",
+  "scope": [
+    "same-process recovery custody renewal checked by native owner under existing recovery reservation",
+    "one read-only native outcome lookup after uncertain ACK; no effect replay",
+    "native external outcome semantic idempotency, exact receipt lookup and locked trusted clock",
+    "emergency-stop fixture uses real MessageEvent"
+  ],
+  "validation": {
+    "canonical_local": {
+      "passed": 2865,
+      "failed": 0,
+      "skipped": 5,
+      "files": 89,
+      "seconds": 91.7,
+      "exit": 0,
+      "log": "owner-recovery-test-run.log"
+    },
+    "local_environment_exclusions": [
+      "tests/tools/test_code_execution.py",
+      "Five AF_UNIX collaboration tests; hosted selection retains every test"
+    ],
+    "independent_audit": {
+      "passed": 72,
+      "failed": 0,
+      "files": 4,
+      "log": "owner-recovery-audit-test-run.log"
+    },
+    "lint": "ruff and diff --check passed",
+    "native_source": "native-external-owner.json",
+    "native_compile": "exit 0",
+    "native_clippy": "exit 0",
+    "native_runtime": "required local guard failed missing systemd user bus; supported hosted paired-root CI queued after publication"
+  },
+  "prior_hosted_head": {
+    "sha": "dbbc704ab18771396de967faec5b6bad3189e956",
+    "focused_pr": 36145855079,
+    "focused_push": 36145849576,
+    "nix": 36145855123,
+    "docker": 36145855089,
+    "source_export": 36145855137,
+    "full_ci": 36145856716,
+    "full_ci_result": "one emergency-stop fake-event compatibility failure reproduced and fixed locally"
+  },
+  "rollback": "Revert candidate source changes; keep native readers and existing durable history. Native patch is a CI candidate, not a live installed daemon update. No profile or live state activation.",
+  "not_qualified": [
+    "native context generation retirement/current-policy/incarnation fencing",
+    "owner-qualified task completion and independently confirmed effects",
+    "remaining ingress/controls, workspace/retrieval policy, shared physical budgets, reader/backup compatibility",
+    "selected installed subscription route, canaries and actual endurance",
+    "108 continuity and 172 inherited acceptance oracles"
+  ]
+}

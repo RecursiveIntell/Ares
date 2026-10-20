@@ -35,18 +35,37 @@ def test_website_front_door_carries_ares_identity() -> None:
     assert "Hermes-compatible" in index
 
 
-def test_ares_installer_is_explicit_about_compatibility_and_plugin_scope() -> None:
+def test_ares_installer_is_the_canonical_full_installer_with_opt_outs() -> None:
     installer = (REPO_ROOT / "install.sh").read_text(encoding="utf-8")
 
-    assert "Ares Installer" in installer
-    assert "--with-recursive-agent-source PATH" in installer
-    assert (
-        "Recursive Agent daemon is not installed or started by this option" in installer
-    )
-    assert "--no-gateway" in installer
-    assert "INSTALL_GATEWAY=false" in installer
-    assert "setup_args+=(--no-gateway)" in installer
-    assert "config set" not in installer
+    assert "Ares full installer" in installer
+
+    # Every default-on piece group exposes an opt-out flag.
+    for flag in (
+        "--no-desktop",
+        "--no-gateway",
+        "--minimal",
+        "--skip-setup",
+        "--no-path",
+        "--plan",
+        "--no-recursive-agent",
+        "--with-recursive-agent-source PATH",
+    ):
+        assert flag in installer, flag
+    assert "RECURSIVE_AGENT=false" in installer
+
+    # Fail-closed and ownership guardrails remain part of the contract.
+    assert "No complete-install claim was made." in installer
+    assert "Refusing to overwrite local changes" in installer
+    assert "Cannot switch a full Ares home to --minimal" in installer
+    assert "refusing a partial native installation" in installer
+
+    # The website copy is a byte-identical mirror of this canonical file.
+    assert "byte-identical mirror" in installer
+
+    # Structured configuration edits happen through the Hermes config API in
+    # the embedded programs, never through shell-level string coercion.
+    assert "hermes config set" not in installer
     assert "yaml.safe_dump" not in installer
 
 

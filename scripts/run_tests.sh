@@ -31,6 +31,20 @@
 # bare flags. Positional path arguments override the default discovery
 # root (tests/).
 
+# ── Help guard ──────────────────────────────────────────────────────────────
+# This wrapper forwards every unrecognized argument to pytest, so `--help`
+# would otherwise fall through to the runner as a bare flag and launch the
+# FULL suite (thousands of files). Print the usage above and exit instead.
+# Bare `-h`/`--help` only: a path or a runner flag alongside them still runs.
+case "${1:-}" in
+  -h|--help|--usage)
+    if [ "$#" -eq 1 ]; then
+      sed -n '2,32p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+      exit 0
+    fi
+    ;;
+esac
+
 set -euo pipefail
 
 # ── Locate repo root ────────────────────────────────────────────────────────
@@ -143,11 +157,19 @@ done
 # credential can leak" property stays auditable at a glance.
 TEST_ENV=()
 for _test_var in HERMES_TEST_IMAGE HERMES_TEST_WORKERS HERMES_TEST_PATHS \
-  HERMES_TEST_FILE_TIMEOUT HERMES_TEST_FILE_RETRIES HERMES_TEST_SLICE; do
+  HERMES_TEST_FILE_TIMEOUT HERMES_TEST_FILE_RETRIES HERMES_TEST_SLICE \
+  HERMES_TEST_CONTEXT_GOVERNOR_BIN HERMES_TEST_CONTEXT_DAEMON_BIN; do
   if [ -n "${!_test_var:-}" ]; then
     TEST_ENV+=("$_test_var=${!_test_var}")
   fi
 done
+
+# Exact test-only native executable input. Preserve an explicit empty value so
+# its consumer can reject it; never silently replace it with a debug artifact.
+# No RA_* glob or credential variable is admitted.
+if [ "${RA_DAEMON_BIN+x}" = x ]; then
+  TEST_ENV+=("RA_DAEMON_BIN=$RA_DAEMON_BIN")
+fi
 
 # ── Run in hermetic env ──────────────────────────────────────────────────────
 # env -i: start with empty environment, opt-in only what we need.

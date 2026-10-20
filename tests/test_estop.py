@@ -176,21 +176,19 @@ def test_kanban_dispatch_blocked_when_engaged(hermes_home):
 # ── gateway turn-start integration ──────────────────────────────────────────
 
 
-class _FakeSource:
-    platform = None
-    chat_id = "c1"
-    user_id = "u1"
-    user_name = "user"
-    chat_type = "dm"
-    profile = None
+from gateway.platforms.base import MessageEvent
 
 
-class _FakeEvent:
-    internal = False
+class _FakeEvent(MessageEvent):
     text = "hello"
 
     def __init__(self):
-        self.source = _FakeSource()
+        from gateway.config import Platform
+        from gateway.session import SessionSource
+
+        super().__init__(text=type(self).text, source=SessionSource(
+            platform=Platform.TELEGRAM, chat_id="c1", user_id="u1", user_name="user",
+        ))
 
 
 @pytest.mark.asyncio

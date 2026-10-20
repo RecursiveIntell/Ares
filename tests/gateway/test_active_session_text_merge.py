@@ -83,8 +83,8 @@ def _make_initialized_adapter() -> BasePlatformAdapter:
 
 
 def _make_adapter() -> BasePlatformAdapter:
-    """Build a BasePlatformAdapter without running its heavy __init__."""
-    adapter = object.__new__(_DummyAdapter)
+    """Use the real adapter initialization before overriding queue settings."""
+    adapter = _make_initialized_adapter()
     adapter.config = PlatformConfig(enabled=True, token="***")
     adapter.platform = Platform.TELEGRAM
     adapter._message_handler = AsyncMock(return_value=None)

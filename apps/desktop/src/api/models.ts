@@ -10,9 +10,10 @@ import type {
 
 import { capabilityScoped, hermesApi, type ProfileScope, profileScoped, STARTUP_REQUEST_TIMEOUT_MS } from './client'
 
-export function getGlobalModelInfo(profile?: null | string): Promise<ModelInfoResponse> {
-  return hermesApi<ModelInfoResponse>({
-    ...profileScoped(profile),
+export function getGlobalModelInfo(profile?: ProfileScope): Promise<ModelInfoResponse> {
+  return window.hermesDesktop.api<ModelInfoResponse>({
+    ...capabilityScoped(profile),
+    ...(profile && typeof profile === 'object' ? { connectionId: profile.connectionId || 'local' } : {}),
     path: '/api/model/info',
     timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
   })
@@ -31,7 +32,7 @@ export function getGlobalModelOptions(
     includeUnconfigured?: boolean
     explicitOnly?: boolean
   },
-  profile?: null | string
+  profile?: ProfileScope
 ): Promise<ModelOptionsResponse> {
   const params = new URLSearchParams()
 
@@ -47,8 +48,12 @@ export function getGlobalModelOptions(
     params.set('explicit_only', '1')
   }
 
-  return hermesApi<ModelOptionsResponse>({
-    ...profileScoped(profile),
+  return window.hermesDesktop.api<ModelOptionsResponse>({
+    ...capabilityScoped(profile),
+    // Explicit null preserves the captured legacy route, which may be remote.
+    ...(profile && typeof profile === 'object' && profile.connectionId !== null
+      ? { connectionId: profile.connectionId || 'local' }
+      : {}),
     path: params.size > 0 ? `/api/model/options?${params.toString()}` : '/api/model/options',
     timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
   })

@@ -1,15 +1,14 @@
 import { expect, test, vi } from 'vitest'
 
-import {
-  createSpecialistDispatchQuiesce,
-  SpecialistProfileQuiescedError
-} from './specialist-dispatch-quiesce'
+import { createSpecialistDispatchQuiesce, SpecialistProfileQuiescedError } from './specialist-dispatch-quiesce'
 
 test('a lease marks exact profiles before owner teardown and release restores them', async () => {
   let quiesce!: ReturnType<typeof createSpecialistDispatchQuiesce>
+
   const stopProfile = vi.fn(async (profile: string) => {
     expect(quiesce.isQuiesced(profile)).toBe(true)
   })
+
   quiesce = createSpecialistDispatchQuiesce({ stopProfile })
 
   const lease = await quiesce.acquire(['explorer', 'public'])
@@ -35,6 +34,7 @@ test('conflicts and teardown failure leave no stale quiesce authority', async ()
       throw new Error('stop failed')
     }
   })
+
   const quiesce = createSpecialistDispatchQuiesce({ stopProfile })
 
   await expect(quiesce.acquire(['explorer', 'public'])).rejects.toMatchObject({ code: 'QUIESCE_STOP_FAILED' })
@@ -43,6 +43,9 @@ test('conflicts and teardown failure leave no stale quiesce authority', async ()
 
   const lease = await quiesce.acquire(['statistician'])
   await expect(quiesce.acquire(['explorer'])).rejects.toMatchObject({ code: 'QUIESCE_CONFLICT' })
-  expect(quiesce.release('specialist-quiesce-missing')).toEqual({ outcome: 'rejected', reasonCode: 'UNKNOWN_QUIESCE_LEASE' })
+  expect(quiesce.release('specialist-quiesce-missing')).toEqual({
+    outcome: 'rejected',
+    reasonCode: 'UNKNOWN_QUIESCE_LEASE'
+  })
   expect(quiesce.release(lease.leaseId)).toEqual({ outcome: 'released', profileIds: ['statistician'] })
 })

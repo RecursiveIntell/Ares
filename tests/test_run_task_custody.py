@@ -1,0 +1,536 @@
+"""Ordinary-task custody uses real native input, never a fabricated goal."""
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict, replace
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+import pytest
+
+from agent.run_checkpoint_custody import TurnRunCustody
+from ares_runtime.continuity.checkpoint import read_checkpoint_context
+from ares_runtime.continuity.compiler import ContinuationScope, Mode
+from hermes_state import SessionDB
+from hermes_state_runs import RunCheckpoint, RunCustody, RunCustodyV2, RunCustodyError, generation_key
+from scripts.run_checkpoint_claim import ClaimOutcomeUnknown, ClaimRefusal
+from scripts.run_checkpoint_resume import inspect_resume
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+@pytest.fixture
+def task(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("s", source="cli", profile_name="p")
+    row = db.append_message("s", "user", "Repair the queue; retain my changes.", timestamp=1.0)
+    assert db.try_acquire_session_turn_lease("s", "holder", ttl_seconds=120)
+    source = tmp_path / "queue.py"
+    source.write_text("pending = []\n")
+    inventory = json.dumps({str(source): sha(source.read_bytes())}).encode()
+    scope = ContinuationScope("profile:p", "session:s", "run:task", "branch:work",
+        "workspace:repo", "sha256:" + sha(inventory), 1, 1, Mode.NORMAL)
+    members = (("continuation-scope-v1", json.dumps(asdict(scope))), ("original-wip", "Retain my changes"))
+    files = {"members": {}}
+    for name, raw in {"plan": b"Inspect queue", "contract": b"Retain user changes", "source": inventory}.items():
+        path = tmp_path / name
+        path.write_bytes(raw)
+        files[name] = str(path)
+    for index, (name, raw) in enumerate(members):
+        path = tmp_path / f"member-{index}"
+        path.write_text(raw)
+        files["members"][name] = str(path)
+    cp = RunCheckpoint(sha(b"Inspect queue"), sha(b"Retain user changes"), sha(inventory),
+        "Inspect the queue", members, ("effect:unknown",), ("finding:race",), ("no merge",))
+    binding, control = db.read_run_task_basis(run_id="task", origin_session_id="s",
+        current_session_id="s", input_row_id=row)
+    kwargs = dict(lease_holder="holder", expected_generation=0, checkpoint=cp,
+        task_binding=binding, current_session_id="s", expected_control_digest=control)
+    request = tmp_path / "request.json"
+    request.write_text(json.dumps({"checkpoint": asdict(cp), "files": files,
+                                  "session_id": "s", "lease_holder": "holder"}))
+    yield db, kwargs, request, source
+    db.close()
+
+
+def claim(task, **overrides):
+    return task[0].claim_run_task_custody_checked("task", **{**task[1], **overrides})
+
+
+def client_args(task, generation=0):
+    _, kwargs, request, _ = task
+    return dict(run_id="task", expected_generation=generation, session_id="s",
+        request_path=str(request), expected_request_digest=sha(request.read_bytes()),
+        origin_session_id="s", task_binding=asdict(kwargs["task_binding"]),
+        expected_control_digest=kwargs["expected_control_digest"], ttl_seconds=120)
+
+
+def test_claim_refresh_reopen_and_release_preserve_strict_v2_without_goal(task):
+    db, kwargs, _, _ = task
+    first = claim(task)
+    assert type(first) is RunCustodyV2
+    assert db.list_meta_prefix("goal:") == []
+    history = [first]
+    for _ in range(3):
+        old = history[-1]
+        history.append(db.refresh_run_custody("task", owner_token=old.owner_token,
+            expected_generation=old.generation))
+    assert json.loads(db.get_meta(generation_key("task", 4)))["schema"] == "SessionDBRunCustodyRefreshV2"
+    with SessionDB(db_path=db.db_path, read_only=True) as reopened:
+        assert reopened.read_run_custody("task") == history[-1]
+        for value in history:
+            assert reopened.read_run_checkpoint("task", generation=value.generation) == value
+        assert reopened.validate_run_task_binding(first) == kwargs["task_binding"]
+    old = history[-1]
+    released = db.release_run_custody("task", owner_token=old.owner_token, expected_generation=old.generation)
+    assert released.checkpoint == first.checkpoint
+    replacement = claim(task, expected_generation=released.generation)
+    assert replacement.owner_token != first.owner_token
+    assert replacement.checkpoint == first.checkpoint
+
+
+@pytest.mark.parametrize("fault,code", [
+    ("root", "TASK_BINDING_MISMATCH"), ("profile", "TASK_BINDING_MISMATCH"),
+    ("digest", "TASK_BINDING_MISMATCH"), ("inactive", "TASK_INPUT_MISSING"),
+    ("edited", "TASK_BINDING_MISMATCH"), ("synthetic", "TASK_AUTHENTIC_INPUT_REQUIRED"),
+    ("summary", "TASK_AUTHENTIC_INPUT_REQUIRED"), ("new-input", "TASK_CONTROL_CHANGED"),
+    ("lease", "LEASE_MISMATCH"), ("wrong-session", "TASK_LINEAGE_MISMATCH"),
+])
+def test_invalid_native_task_binding_never_creates_generation(task, fault, code):
+    db, kwargs, _, _ = task
+    binding = kwargs["task_binding"]
+    if fault in {"root", "profile", "digest"}:
+        field = {"root": "conversation_root", "profile": "profile_name", "digest": "input_digest"}[fault]
+        kwargs["task_binding"] = replace(binding, **{field: "0" * 64 if fault == "digest" else "other"})
+    elif fault in {"inactive", "edited", "synthetic", "summary"}:
+        column, value = {"inactive": ("active", 0), "edited": ("content", "different task"),
+                         "synthetic": ("display_kind", "hidden"), "summary": ("_compressed_summary", 1)}[fault]
+        db._execute_write(lambda conn: conn.execute(f"UPDATE messages SET {column}=? WHERE id=?", (value, binding.input_row_id)))
+    elif fault == "new-input":
+        db.append_message("s", "user", "Actually stop before editing.", turn_lease_holder="holder")
+    elif fault == "lease":
+        db.release_session_turn_lease("s", "holder")
+    else:
+        db.create_session("other", source="cli", profile_name="p")
+        db.append_message("other", "user", "Unrelated task")
+        assert db.try_acquire_session_turn_lease("other", "holder")
+        kwargs["current_session_id"] = "other"
+    with pytest.raises(RunCustodyError, match=code):
+        claim(task)
+    assert db.read_run_custody("task") is None
+
+
+def test_control_rechecked_after_waiting_for_native_write_admission(task, monkeypatch):
+    db = task[0]
+    execute = db._execute_write
+    def changed(fn, *args, **kwargs):
+        # Independent connection commits before candidate obtains writer admission.
+        with SessionDB(db_path=db.db_path) as other:
+            other.append_message("s", "user", "Wait for review", turn_lease_holder="holder")
+        return execute(fn, *args, **kwargs)
+    monkeypatch.setattr(db, "_execute_write", changed)
+    with pytest.raises(RunCustodyError, match="TASK_CONTROL_CHANGED"):
+        claim(task)
+    assert db.read_run_custody("task") is None
+
+
+def test_v1_decoder_and_v2_binding_cannot_be_mixed(task):
+    db = task[0]
+    value = claim(task)
+    wire = json.loads(json.dumps(asdict(value)))
+    with pytest.raises(RunCustodyError, match="INTEGRITY_SCHEMA"):
+        RunCustody.from_dict(wire)
+    with pytest.raises(RunCustodyError, match="MIXED_TASK_BINDING"):
+        replace(value, checkpoint=replace(value.checkpoint,
+            members=value.checkpoint.members + (("historical-goal-key", "goal:fake"),)))
+    compact = db.refresh_run_custody("task", owner_token=value.owner_token, expected_generation=1)
+    record = json.loads(db.get_meta(generation_key("task", compact.generation)))
+    record["schema"] = "SessionDBRunCustodyRefreshV1"
+    raw = json.dumps(record)
+    db.set_meta(generation_key("task", compact.generation), raw)
+    db.set_meta("run-custody:task:head", json.dumps({"generation": compact.generation, "digest": sha(raw.encode())}))
+    with pytest.raises(RunCustodyError, match="INTEGRITY_REFRESH_SCHEMA"):
+        db.read_run_custody("task")
+
+
+def test_v2_claim_file_client_and_cold_inspection_share_native_checks(task):
+    db, _, request, _ = task
+    handle = TurnRunCustody(db)
+    handle.begin_turn("holder")
+    response = handle.claim("holder", **client_args(task))
+    value = db.read_run_custody("task")
+    assert response["generation"] == 1
+    assert value.owner_token not in json.dumps(response)
+    assert inspect_resume(db.db_path, "task", 1, request)["resume_authorized"] is False
+    files = json.loads(request.read_text())["files"]
+    before = db.list_meta_prefix("run-custody:")
+    with SessionDB(db_path=db.db_path, read_only=True) as reopened:
+        context = read_checkpoint_context(reopened, run_id="task", expected_generation=1, files=files)
+    assert "effect:unknown" in context.brief.evidence_text
+    assert context.summary()["resume_authorized"] is False
+    assert db.list_meta_prefix("run-custody:") == before
+    assert handle.finish_turn("holder") == []
+
+
+def test_lost_v2_claim_ack_retains_unknown_and_never_reclaims(task, monkeypatch):
+    db = task[0]
+    original = db.claim_run_task_custody_checked
+    calls = []
+    def lost(*args, **kwargs):
+        calls.append(1)
+        original(*args, **kwargs)
+        raise OSError("lost acknowledgment")
+    monkeypatch.setattr(db, "claim_run_task_custody_checked", lost)
+    handle = TurnRunCustody(db)
+    handle.begin_turn("holder")
+    with pytest.raises(ClaimOutcomeUnknown):
+        handle.claim("holder", **client_args(task))
+    with pytest.raises(ClaimOutcomeUnknown):
+        handle.claim("holder", **client_args(task))
+    assert handle.finish_turn("holder")[0]["status"] == "unknown"
+    assert calls == [1]
+    assert db.read_run_custody("task").generation == 1
+
+
+def test_real_dead_process_takeover_preserves_exact_checkpoint_and_fences_old_token(task):
+    db, _, request, _ = task
+    payload = client_args(task)
+    payload.pop("session_id")
+    code = '''
+import json, os, sys
+from pathlib import Path
+from hermes_state import SessionDB
+from scripts.run_checkpoint_claim import claim_from_files
+db = SessionDB(db_path=Path(sys.argv[1]))
+args = json.loads(sys.argv[2])
+claim_from_files(db, **args, controller_pid=os.getpid())
+print("claimed", flush=True)
+sys.stdin.readline()
+db.close()
+'''
+    child = subprocess.Popen([sys.executable, "-u", "-c", code, str(db.db_path), json.dumps(payload)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        first_line = pool.submit(child.stdout.readline).result(timeout=15).strip()
+        if first_line != "claimed":
+            _, stderr = child.communicate(timeout=15)
+            pytest.fail(f"Child claim failed: {stderr}")
+        old = db.read_run_custody("task")
+        with pytest.raises(RunCustodyError, match="OWNER_ACTIVE"):
+            claim(task, expected_generation=1)
+        out, err = child.communicate("exit\n", timeout=15)
+        assert child.returncode == 0, err
+        with pytest.raises(RunCustodyError, match="TAKEOVER_REQUIRES_EXACT_CHECKPOINT"):
+            claim(task, expected_generation=1, checkpoint=replace(old.checkpoint, unresolved_effects=()))
+        handle = TurnRunCustody(db)
+        handle.begin_turn("holder")
+        assert handle.claim("holder", **client_args(task, generation=1))["generation"] == 2
+        new = db.read_run_custody("task")
+        assert new.controller_pid == os.getpid()
+        assert new.owner_token != old.owner_token
+        assert new.checkpoint == old.checkpoint
+        assert new.task_binding == old.task_binding
+        with pytest.raises(RunCustodyError, match="FENCE_MISMATCH"):
+            db.release_run_custody("task", owner_token=old.owner_token, expected_generation=1)
+        assert inspect_resume(db.db_path, "task", 2, request)["effects_executed"] is False
+        assert handle.finish_turn("holder") == []
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=15)
+        pool.shutdown(wait=True, cancel_futures=True)
+
+
+def test_v2_session_transfer_retains_task_identity(task):
+    db, kwargs, _, _ = task
+    first = claim(task)
+    db.end_session("s", "compression")
+    db.create_session("child", source="cli", profile_name="p", parent_session_id="s")
+    moved = db.transfer_run_session("task", owner_token=first.owner_token,
+        expected_generation=1, expected_session_id="s", new_session_id="child")
+    assert moved.task_binding == kwargs["task_binding"]
+    assert db.validate_run_task_binding(moved) == first.task_binding
+    assert moved.checkpoint == first.checkpoint
+
+
+@pytest.mark.parametrize("fork", [False, True])
+def test_v2_transfer_refuses_cross_profile_or_fork_before_mutation(task, fork):
+    db = task[0]
+    first = claim(task)
+    db.end_session("s", "compression")
+    db.create_session("child", source="cli", profile_name="p" if fork else "other",
+        parent_session_id="s", model_config={"_branched_from": "s"} if fork else None)
+    with pytest.raises(RunCustodyError, match="TASK_LINEAGE_MISMATCH" if fork else "TASK_PROFILE_MISMATCH"):
+        db.transfer_run_session("task", owner_token=first.owner_token,
+            expected_generation=1, expected_session_id="s", new_session_id="child")
+    assert db.read_run_custody("task") == first
+    assert db.get_meta(generation_key("task", 2)) is None
+
+
+def test_cross_profile_ancestor_cannot_be_relabelled_as_current_task(task):
+    db, kwargs, _, _ = task
+    db.end_session("s", "compression")
+    db.create_session("child", source="cli", profile_name="other", parent_session_id="s")
+    db.append_message("child", "user", "Public task", turn_lease_holder="holder")
+    with pytest.raises(RunCustodyError, match="TASK_PROFILE_MISMATCH"):
+        db.read_run_task_basis(run_id="task", origin_session_id="child",
+            current_session_id="child", input_row_id=kwargs["task_binding"].input_row_id)
+
+
+def test_tool_child_cannot_inherit_parent_task_or_control(task):
+    db, kwargs, _, _ = task
+    db.end_session("s", "compression")
+    db.create_session("child", source="tool", profile_name="p", parent_session_id="s")
+    child_row = db.append_message("child", "user", "Separate child task")
+    assert db.try_acquire_session_turn_lease("child", "child-holder")
+    snapshot = db.read_context_rebase_snapshot("child")
+    assert snapshot.conversation_root == "child"
+    assert [item["row_id"] for item in snapshot.authentic_users] == [child_row]
+    with pytest.raises(RunCustodyError, match="TASK_LINEAGE_MISMATCH"):
+        db.read_run_task_basis(run_id="task", origin_session_id="s",
+            current_session_id="child", input_row_id=kwargs["task_binding"].input_row_id)
+
+
+@pytest.fixture
+def observation(task):
+    """Real file-checked private V2 claim with no unresolved effect."""
+    from dataclasses import replace
+    db, kwargs, request, source = task
+    kwargs["checkpoint"] = replace(kwargs["checkpoint"], unresolved_effects=())
+    document = json.loads(request.read_text())
+    document["checkpoint"] = asdict(kwargs["checkpoint"])
+    request.write_text(json.dumps(document))
+    owner = TurnRunCustody(db)
+    owner.begin_turn("holder")
+    owner.claim("holder", **client_args(task))
+    return db, owner, task
+
+
+def observe(f, **kwargs):
+    return f[1].observe_basis("holder", **{ "session_id": "s", "run_id": "task",
+        "expected_generation": 1, **kwargs})
+
+
+def test_observation_is_redacted_stable_and_read_only(observation, monkeypatch):
+    db, owner, _ = observation
+    before = list(db._conn.iterdump())
+    handle = owner._handles["task"].value
+    def forbidden(*a, **k):
+        pytest.fail("observation escaped its reader or mutated custody")
+    for name in ("get_meta", "_execute_write", "claim_run_task_custody_checked",
+                 "refresh_run_custody", "release_run_custody"):
+        monkeypatch.setattr(db, name, forbidden)
+    first = observe(observation)
+    assert observe(observation) == first
+    assert list(db._conn.iterdump()) == before
+    assert owner._handles["task"].value is handle
+    assert first["observation_only"] is True
+    assert first["authorizes_effects"] is False
+    assert first["custody_changed"] is False
+    raw = json.dumps(first)
+    for secret in (handle.owner_token, "holder", str(db.db_path), "Repair the queue", "Retain my changes"):
+        assert secret not in raw
+
+
+def test_observation_selects_each_of_sixteen_real_handles(observation):
+    db, owner, task = observation
+    for i in range(1, 16):
+        run_id = f"task-{i}"
+        binding, control = db.read_run_task_basis(run_id=run_id, origin_session_id="s",
+            current_session_id="s", input_row_id=task[1]["task_binding"].input_row_id)
+        args = client_args(task)
+        args.update(run_id=run_id, task_binding=asdict(binding), expected_control_digest=control)
+        owner.claim("holder", **args)
+    before = list(db._conn.iterdump())
+    for run_id in owner._handles:
+        result = observe(observation, run_id=run_id)
+        assert result["run_id"] == result["task_binding"]["run_id"] == run_id
+    assert len(owner._handles) == 16
+    assert list(db._conn.iterdump()) == before
+
+
+@pytest.mark.parametrize("fault", ["generation", "session", "token", "holder", "process", "expired",
+    "released", "unknown", "pending", "recovery", "cold", "lease", "ended", "profile", "root",
+    "edited", "synthetic", "inactive", "stop", "pending-input", "post-stop-input"])
+def test_observation_refuses_without_repair_or_mutation(observation, monkeypatch, fault):
+    db, owner, task = observation
+    handle = owner._handles["task"]
+    kwargs = {}
+    if fault == "generation": kwargs["expected_generation"] = 2
+    elif fault == "session": kwargs["session_id"] = "other"
+    elif fault == "token": handle.value = replace(handle.value, owner_token="0" * 64)
+    elif fault == "holder": handle.holder = "other"
+    elif fault == "process": monkeypatch.setattr("hermes_state_runs._controller", lambda pid: "other")
+    elif fault == "expired": monkeypatch.setattr("hermes_state_runs.time.monotonic_ns", lambda: handle.value.expires_monotonic_ns)
+    elif fault == "released": owner.release("holder", run_id="task", expected_generation=1)
+    elif fault in {"unknown", "pending"}: handle.status = fault
+    elif fault == "recovery": handle.recovery_pending = True
+    elif fault == "cold":
+        owner = TurnRunCustody(db)
+        owner.begin_turn("holder")
+        observation = db, owner, task
+    elif fault == "lease": db.release_session_turn_lease("s", "holder")
+    elif fault == "ended": db._execute_write(lambda c: c.execute("UPDATE sessions SET end_reason='done' WHERE id='s'"))
+    elif fault == "profile": db._execute_write(lambda c: c.execute("UPDATE sessions SET profile_name='other' WHERE id='s'"))
+    elif fault == "root":
+        db.create_session("other", source="cli", profile_name="p")
+        db.end_session("other", end_reason="compression")
+        db._execute_write(lambda c: c.execute("UPDATE sessions SET parent_session_id='other' WHERE id='s'"))
+    elif fault in {"edited", "synthetic", "inactive"}:
+        col, value = {"edited": ("content", "forged"), "synthetic": ("display_kind", "hidden"), "inactive": ("active", 0)}[fault]
+        db._execute_write(lambda c: c.execute(f"UPDATE messages SET {col}=? WHERE id=?", (value, task[1]["task_binding"].input_row_id)))
+    elif fault in {"stop", "post-stop-input"}: db.record_context_stop("s")
+    if fault in {"pending-input", "post-stop-input"}:
+        db.accept_context_input("s", source="cli", event_id="new", content="Continue")
+    before = list(db._conn.iterdump())
+    state = (handle.status, handle.error, handle.recovery_pending, handle.value)
+    with pytest.raises((ClaimRefusal, ClaimOutcomeUnknown)):
+        observe(observation, **kwargs)
+    assert list(db._conn.iterdump()) == before
+    assert state == (handle.status, handle.error, handle.recovery_pending, handle.value)
+
+
+def test_observation_released_other_run_obligation_still_blocks(observation):
+    db, owner, task = observation
+    binding, control = db.read_run_task_basis(run_id="other", origin_session_id="s",
+        current_session_id="s", input_row_id=task[1]["task_binding"].input_row_id)
+    value = db.claim_run_task_custody_checked("other", **{**task[1], "task_binding": binding,
+        "expected_control_digest": control, "checkpoint": replace(task[1]["checkpoint"], unresolved_effects=("unknown",))})
+    db.release_run_custody("other", owner_token=value.owner_token, expected_generation=value.generation)
+    with pytest.raises(ClaimRefusal, match="OBSERVATION_EFFECT_UNRESOLVED"):
+        observe(observation)
+
+
+@pytest.mark.parametrize("journal_policy", ["native", "delete"])
+def test_observation_snapshot_is_coherent_but_not_a_fence(request, monkeypatch, journal_policy, record_property):
+    import sqlite3
+    if journal_policy == "delete":
+        monkeypatch.setattr("hermes_state.resolve_journal_mode", lambda: "delete")
+    observation = request.getfixturevalue("observation")
+    db, _, _ = observation
+    mode = db._conn.execute("PRAGMA journal_mode").fetchone()[0]
+    print(f"SQLite {sqlite3.sqlite_version}; requested={journal_policy}; actual={mode}")
+    record_property("sqlite_version", sqlite3.sqlite_version)
+    record_property("journal_policy", journal_policy)
+    record_property("journal_mode", mode)
+    assert mode in {"wal", "delete"}
+    if journal_policy == "delete":
+        assert mode == "delete"
+    prior = observe(observation)
+    original = db._read_context_rebase_snapshot_on_conn
+    from threading import Event
+    prepared, allow_commit = Event(), Event()
+    pending = []
+    with SessionDB(db_path=db.db_path) as writer, ThreadPoolExecutor(max_workers=1) as pool:
+        real_write = writer._execute_write
+
+        def gated_write(fn, **kwargs):
+            def write(conn):
+                result = fn(conn)  # Real Stop writes, not a synthetic receipt.
+                assert conn.in_transaction
+                prepared.set()
+                assert allow_commit.wait(10), "reader did not release writer"
+                return result
+            return real_write(write, **kwargs)
+
+        def raced(conn, session_id):
+            assert conn.in_transaction, "observation must retain its read snapshot"
+            pending.append(pool.submit(writer.record_context_stop, session_id))
+            assert prepared.wait(10), "writer did not prepare Stop"
+            if mode == "wal":
+                # WAL allows commit before the reader's remaining snapshot reads.
+                allow_commit.set()
+                assert pending[0].result(timeout=10)["stopped"] is True
+            # Rollback journaling must commit only after this reader closes.
+            return original(conn, session_id)
+
+        monkeypatch.setattr(writer, "_execute_write", gated_write)
+        monkeypatch.setattr(db, "_read_context_rebase_snapshot_on_conn", raced)
+        try:
+            assert observe(observation) == prior
+        finally:
+            monkeypatch.setattr(db, "_read_context_rebase_snapshot_on_conn", original)
+            allow_commit.set()
+            for future in pending:
+                assert future.result(timeout=10)["stopped"] is True
+    assert db.read_context_stop("s")["control"]["stopped"] is True
+    with pytest.raises(ClaimRefusal, match="OBSERVATION_STOPPED"):
+        observe(observation)
+
+
+def test_observation_compacted_authentic_input_remains_valid(observation):
+    db, _, task = observation
+    before = observe(observation)
+    db.archive_and_compact("s", [
+        {"role": "user", "content": "[summary]", "_compressed_summary": True},
+        {"role": "user", "content": "Now check the regression", "timestamp": 2.0}])
+    after = observe(observation)
+    assert after["task_binding"] == before["task_binding"]
+
+
+def test_observation_refresh_changes_digest_without_observation_renewal(observation):
+    db, owner, _ = observation
+    first = observe(observation)
+    owner.refresh("holder", run_id="task", expected_generation=1, ttl_seconds=120)
+    second = observe(observation, expected_generation=2)
+    assert first["digest"] != second["digest"]
+    assert first["head_digest"] != second["head_digest"]
+
+
+def test_observation_dto_rejects_tampering_and_is_not_a_capability(observation):
+    from hermes_state_runs import OwnedRunObservation
+    value = observe(observation)
+    for field, replacement in [("generation", True), ("authorizes_effects", True), ("digest", "0"*64),
+            ("run_id", "other"), ("current_session_id", "x"*257), ("owner_token", "secret")]:
+        with pytest.raises(RunCustodyError):
+            OwnedRunObservation.from_dict({**value, field: replacement})
+    tampered = {**value, "task_binding": {**value["task_binding"], "run_id": "other"}}
+    tampered["digest"] = OwnedRunObservation.payload_digest({k:v for k,v in tampered.items() if k != "digest"})
+    with pytest.raises(RunCustodyError): OwnedRunObservation.from_dict(tampered)
+    with pytest.raises(RunCustodyError):
+        observation[0].observe_owned_run("task", owner_token=value["digest"], expected_generation=1,
+            expected_session_id="s", lease_holder="holder")
+
+
+def test_observation_read_error_does_not_poison_handle(observation, monkeypatch):
+    db, owner, _ = observation
+    value = owner._handles["task"].value
+    def failed(*a, **k): raise OSError("secret path")
+    monkeypatch.setattr(db, "observe_owned_run", failed)
+    with pytest.raises(ClaimOutcomeUnknown, match="^OBSERVATION_UNAVAILABLE$"):
+        observe(observation)
+    assert owner._handles["task"].status == "owned"
+    assert owner._handles["task"].value is value
+
+
+@pytest.mark.parametrize("clock", ["wall", "monotonic"])
+def test_observation_rechecks_expiry_before_return(observation, monkeypatch, clock):
+    db, owner, _ = observation
+    original = db._read_context_rebase_snapshot_on_conn
+    value = owner._handles["task"].value
+    def expires(conn, sid):
+        snapshot = original(conn, sid)
+        if clock == "monotonic":
+            monkeypatch.setattr("hermes_state_runs.time.monotonic_ns", lambda: value.expires_monotonic_ns)
+        else:
+            monkeypatch.setattr("hermes_state_runs.time.time", lambda: 10**12)
+        return snapshot
+    monkeypatch.setattr(db, "_read_context_rebase_snapshot_on_conn", expires)
+    with pytest.raises(ClaimRefusal, match="OWNER_EXPIRED|LEASE_MISMATCH"):
+        observe(observation)
+    assert owner._handles["task"].value is value
+
+
+def test_observation_new_authentic_input_changes_control_digest(observation):
+    db, _, _ = observation
+    before = observe(observation)
+    db.append_message("s", "user", "New instruction", turn_lease_holder="holder")
+    after = observe(observation)
+    assert after["action_control_digest"] != before["action_control_digest"]
+    assert after["digest"] != before["digest"]
+    assert after["task_binding"] == before["task_binding"]

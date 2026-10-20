@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { onComposerInsertRequest } from '@/app/chat/composer/focus'
 import { I18nProvider } from '@/i18n'
-import { clearClarifyRequest, setClarifyRequest } from '@/store/clarify'
+import { clearClarifyRequest, hasClarifyRequest, setClarifyRequest, skipClarifyRequest } from '@/store/clarify'
 import { $gateway } from '@/store/gateway'
 import { $profiles } from '@/store/profile'
 import { $activeSessionId, _resetSessionOwnerHintsForTests, setSessionOwnerHint } from '@/store/session'
@@ -18,7 +18,7 @@ import { ClarifyTool, readClarifyBatchResult, readClarifyResult } from './clarif
 // `$gateway` remains the genuine ambient atom every other test in this file
 // drives.
 const gatewayMocks = vi.hoisted(() => ({
-  requestGatewayForAgent: vi.fn(async () => ({ ok: true }))
+  requestGatewayForAgent: vi.fn(async () => ({ status: 'ok' }))
 }))
 
 vi.mock('@/store/gateway', async importActual => ({
@@ -94,7 +94,7 @@ function liveClarifyProps(choices = ['staging', 'production']): ToolCallMessageP
 }
 
 function renderLiveClarify({ multiSelect = false }: { multiSelect?: boolean } = {}) {
-  const request = vi.fn().mockResolvedValue({ ok: true })
+  const request = vi.fn().mockResolvedValue({ status: 'ok' })
 
   $activeSessionId.set('session-1')
   $gateway.set({ request } as never)
@@ -195,7 +195,8 @@ describe('ClarifyTool choice selection', () => {
     await waitFor(() => {
       expect(request).toHaveBeenCalledWith('clarify.respond', {
         answer: JSON.stringify(['production', 'staging']),
-        request_id: 'request-1'
+        request_id: 'request-1',
+        session_id: 'session-1'
       })
     })
   })
@@ -216,9 +217,131 @@ describe('ClarifyTool choice selection', () => {
     await waitFor(() => {
       expect(request).toHaveBeenCalledWith('clarify.respond', {
         answer: 'production',
-        request_id: 'request-1'
+        request_id: 'request-1',
+        session_id: 'session-1'
       })
     })
+  })
+  it('submits free-text clarification answers with the same request identity', async () => {
+    const request = vi.fn().mockResolvedValue({ status: 'ok' })
+    $activeSessionId.set('session-1')
+    $gateway.set({ request } as never)
+    setClarifyRequest({
+      choices: null,
+      multiSelect: false,
+      question: 'What should I call the environment?',
+      requestId: 'request-free-text',
+      sessionId: 'session-1'
+    })
+    const args = { question: 'What should I call the environment?' }
+    renderClarify(
+      <ClarifyTool
+        addResult={vi.fn()}
+        args={args}
+        argsText={JSON.stringify(args)}
+        isError={false}
+        respondToApproval={vi.fn()}
+        result={undefined}
+        resume={vi.fn()}
+        status={{ type: 'running' }}
+        toolCallId="clarify-free-text"
+        toolName="clarify"
+        type="tool-call"
+      />
+    )
+
+    fireEvent.change(screen.getByPlaceholderText(/Type your answer/), { target: { value: 'preview' } })
+    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
+
+    await waitFor(() => {
+      expect(request).toHaveBeenCalledWith('clarify.respond', {
+        answer: 'preview',
+        request_id: 'request-free-text',
+        session_id: 'session-1'
+      })
+    })
+  })
+  it('does not issue a second request while a confirmation is awaiting its acknowledgement', async () => {
+    const { request } = renderLiveClarify()
+    let acceptResponse!: (value: { status: string }) => void
+    request.mockImplementationOnce(
+      () =>
+        new Promise(resolve => {
+          acceptResponse = resolve
+        })
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: /staging/ }))
+    const confirm = screen.getByRole('button', { name: /Continue/ })
+    fireEvent.click(confirm)
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(1))
+    fireEvent.click(confirm)
+    expect(request).toHaveBeenCalledTimes(1)
+
+    await act(async () => acceptResponse({ status: 'ok' }))
+    expect(request).toHaveBeenCalledTimes(1)
+  })
+  it('shows an acknowledged answer as received and closes the single-response controls', async () => {
+    const { request } = renderLiveClarify()
+    request.mockResolvedValue({ status: 'ok' })
+
+    const staging = screen.getByRole('button', { name: /staging/ })
+    fireEvent.click(staging)
+    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
+
+    await waitFor(() => expect(screen.getByText('Answer received')).toBeTruthy())
+
+    await waitFor(() =>
+      expect((screen.getByRole('button', { name: /Continue/ }) as HTMLButtonElement).disabled).toBe(true)
+    )
+    const confirm = screen.getByRole('button', { name: /Continue/ }) as HTMLButtonElement
+    expect(staging.getAttribute('aria-pressed')).toBe('true')
+    expect(confirm.disabled).toBe(true)
+    fireEvent.click(confirm)
+    expect(request).toHaveBeenCalledTimes(1)
+  })
+  it('keeps the selected single answer when the server says the request expired', async () => {
+    const { request } = renderLiveClarify()
+    request.mockResolvedValue({ status: 'expired' })
+
+    fireEvent.click(screen.getByRole('button', { name: /staging/ }))
+    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
+
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(screen.getByRole('button', { name: /Continue/ })).toBeTruthy())
+    expect(screen.getByRole('button', { name: /staging/ }).getAttribute('aria-pressed')).toBe('true')
+    expect(hasClarifyRequest('session-1')).toBe(true)
+    expect(screen.getByRole('alert').textContent).toMatch(/Request expired/)
+    expect((screen.getByRole('button', { name: /Continue/ }) as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
+    expect(request).toHaveBeenCalledTimes(1)
+  })
+  it('does not call a lost-ack single answer undelivered when retry expires', async () => {
+    const { request } = renderLiveClarify()
+    request.mockRejectedValueOnce(new Error('socket lost')).mockResolvedValueOnce({ status: 'expired' })
+    fireEvent.click(screen.getByRole('button', { name: /staging/ }))
+    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/may have reached/i))
+    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/may have reached/i))
+    expect(screen.getByRole('button', { name: /staging/ }).getAttribute('aria-pressed')).toBe('true')
+  })
+  it('does not assert non-delivery after a remount loses transport history', async () => {
+    const { request } = renderLiveClarify()
+    request.mockRejectedValueOnce(new Error('socket lost')).mockResolvedValue({ status: 'expired' })
+    fireEvent.click(screen.getByRole('button', { name: /staging/ }))
+    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/may have reached/i))
+    cleanup() // Reconnect/transcript remount: local refs are gone, request store remains.
+    renderClarify(<ClarifyTool {...liveClarifyProps()} />)
+    expect(screen.getByRole('alert').textContent).toMatch(/may have reached/i)
+    expect(screen.getByRole('button', { name: /staging/ }).getAttribute('aria-pressed')).toBe('true')
+    expect(request).toHaveBeenCalledTimes(1)
+    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/check the conversation/i))
+    expect(screen.getByRole('alert').textContent).not.toMatch(/not delivered/i)
   })
 })
 
@@ -401,7 +524,8 @@ describe('ClarifyTool keyboard navigation', () => {
     await waitFor(() => {
       expect(request).toHaveBeenCalledWith('clarify.respond', {
         answer: 'production',
-        request_id: 'request-1'
+        request_id: 'request-1',
+        session_id: 'session-1'
       })
     })
   })
@@ -421,7 +545,8 @@ describe('ClarifyTool keyboard navigation', () => {
     await waitFor(() => {
       expect(request).toHaveBeenCalledWith('clarify.respond', {
         answer: JSON.stringify(['production']),
-        request_id: 'request-1'
+        request_id: 'request-1',
+        session_id: 'session-1'
       })
     })
   })
@@ -454,7 +579,7 @@ describe('ClarifyTool keyboard navigation', () => {
 
 describe('ClarifyTool recommended option', () => {
   it('dims the (Recommended) label and answers with the choice the backend sent', async () => {
-    const request = vi.fn().mockResolvedValue({ ok: true })
+    const request = vi.fn().mockResolvedValue({ status: 'ok' })
 
     $activeSessionId.set('session-1')
     $gateway.set({ request } as never)
@@ -480,7 +605,8 @@ describe('ClarifyTool recommended option', () => {
     await waitFor(() => {
       expect(request).toHaveBeenCalledWith('clarify.respond', {
         answer: 'staging (Recommended)',
-        request_id: 'request-1'
+        request_id: 'request-1',
+        session_id: 'session-1'
       })
     })
   })
@@ -501,7 +627,7 @@ describe('ClarifyTool pending marker', () => {
 
   it('does not mark a free-text (no-choice) pending card', () => {
     $activeSessionId.set('session-1')
-    $gateway.set({ request: vi.fn().mockResolvedValue({ ok: true }) } as never)
+    $gateway.set({ request: vi.fn().mockResolvedValue({ status: 'ok' }) } as never)
     setClarifyRequest({
       choices: null,
       multiSelect: false,
@@ -559,7 +685,7 @@ function liveBatchProps(): ToolCallMessagePartProps {
 }
 
 function renderLiveBatch(lockedAnswers?: Record<string, string>, multiSelect = false) {
-  const request = vi.fn().mockResolvedValue({ ok: true, remaining: [] })
+  const request = vi.fn().mockResolvedValue({ status: 'ok', remaining: [] })
 
   $activeSessionId.set('session-1')
   $gateway.set({ request } as never)
@@ -644,13 +770,197 @@ describe('ClarifyTool batch card', () => {
     expect(request).toHaveBeenNthCalledWith(1, 'clarify.respond', {
       answer: 'red',
       question_id: 'q0',
-      request_id: 'request-batch'
+      request_id: 'request-batch',
+      session_id: 'session-1'
     })
     expect(request).toHaveBeenNthCalledWith(2, 'clarify.respond', {
       answer: 'packet',
       question_id: 'q1',
-      request_id: 'request-batch'
+      request_id: 'request-batch',
+      session_id: 'session-1'
     })
+    expect(screen.getByText('2 of 2 answered')).toBeTruthy()
+    await waitFor(() => {
+      expect(screen.getByRole('status').textContent).toBe('Answer received')
+      expect((screen.getByRole('button', { name: /Confirm and continue/ }) as HTMLButtonElement).disabled).toBe(true)
+    })
+    expect(screen.queryByRole('status', { name: /loading question/i })).toBeNull()
+    messageRunning = false
+    act(() => clearClarifyRequest('request-batch', 'session-1'))
+    expect(screen.getByText('Color?')).toBeTruthy()
+    expect(screen.getByText('2 of 2 answered')).toBeTruthy()
+    expect(screen.queryByRole('status', { name: /loading question/i })).toBeNull()
+  })
+
+  it('retains the full batch and stops after a later rejected lock', async () => {
+    const request = renderLiveBatch()
+    request.mockResolvedValueOnce({ status: 'ok', remaining: ['q1'] }).mockResolvedValueOnce({ status: 'expired' })
+
+    fireEvent.click(screen.getByRole('button', { name: /red/ }))
+    fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'packet' } })
+    fireEvent.click(screen.getByRole('button', { name: /Confirm and continue/ }))
+
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/Request expired/))
+    expect(request).toHaveBeenCalledTimes(2)
+    expect(screen.getByText('2 of 2 answered')).toBeTruthy()
+    expect(screen.getByRole('button', { name: /red/ }).getAttribute('aria-pressed')).toBe('true')
+    expect(hasClarifyRequest('session-1')).toBe(true)
+    const confirm = screen.getByRole('button', { name: /Confirm and continue/ }) as HTMLButtonElement
+    expect(confirm.disabled).toBe(true)
+    fireEvent.click(confirm)
+    expect(request).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps the staged batch when the first lock is expired and sends no later lock', async () => {
+    const request = renderLiveBatch()
+    request.mockResolvedValue({ status: 'expired' })
+
+    fireEvent.click(screen.getByRole('button', { name: /red/ }))
+    fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'packet' } })
+    fireEvent.click(screen.getByRole('button', { name: /Confirm and continue/ }))
+
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(screen.getByRole('button', { name: /Confirm and continue/ })).toBeTruthy())
+    expect(screen.getByText('2 of 2 answered')).toBeTruthy()
+    expect(hasClarifyRequest('session-1')).toBe(true)
+    expect(request).toHaveBeenCalledTimes(1)
+    expect((screen.getByRole('button', { name: /Confirm and continue/ }) as HTMLButtonElement).disabled).toBe(true)
+    expect(screen.getByRole('alert').textContent).toMatch(/Request expired/)
+  })
+
+  it('keeps an uncertain batch editable and allows an explicit confirm retry', async () => {
+    const request = renderLiveBatch()
+    request.mockRejectedValueOnce(new Error('socket lost')).mockResolvedValue({ status: 'ok' })
+
+    fireEvent.click(screen.getByRole('button', { name: /red/ }))
+    fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'packet' } })
+    fireEvent.click(screen.getByRole('button', { name: /Confirm and continue/ }))
+
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/may have reached/i))
+    expect(request).toHaveBeenCalledTimes(1)
+    expect(screen.getByRole('button', { name: /red/ }).getAttribute('aria-pressed')).toBe('true')
+    expect((screen.getByRole('button', { name: /Confirm and continue/ }) as HTMLButtonElement).disabled).toBe(false)
+
+    fireEvent.click(screen.getByRole('button', { name: /Confirm and continue/ }))
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(3))
+    await waitFor(() => expect(screen.getByRole('status').textContent).toBe('Answer received'))
+  })
+
+  it('marks final-lock lost acknowledgement as uncertain when retry expires', async () => {
+    const request = renderLiveBatch()
+    request
+      .mockResolvedValueOnce({ status: 'ok', remaining: ['q1'] })
+      .mockRejectedValueOnce(new Error('socket lost'))
+      .mockResolvedValueOnce({ status: 'expired' })
+    fireEvent.click(screen.getByRole('button', { name: /red/ }))
+    fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'packet' } })
+    fireEvent.click(screen.getByRole('button', { name: /Confirm and continue/ }))
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/may have reached/i))
+    fireEvent.click(screen.getByRole('button', { name: /Confirm and continue/ }))
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(3))
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/may have reached/i))
+    expect((screen.getByRole('button', { name: /Confirm and continue/ }) as HTMLButtonElement).disabled).toBe(true)
+    expect(screen.getByText('2 of 2 answered')).toBeTruthy()
+  })
+
+  it('starts a distinct batch request with a fresh stage after the old request expires', async () => {
+    const request = renderLiveBatch()
+    request.mockResolvedValue({ status: 'expired' })
+    fireEvent.click(screen.getByRole('button', { name: /red/ }))
+    fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'packet' } })
+    fireEvent.click(screen.getByRole('button', { name: /Confirm and continue/ }))
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/Request expired/))
+
+    act(() =>
+      setClarifyRequest({
+        choices: null,
+        multiSelect: false,
+        question: '',
+        questions: [
+          { choices: ['red', 'blue'], multiSelect: false, qid: 'q0', question: 'Color?' },
+          { choices: null, multiSelect: false, qid: 'q1', question: 'Name?' }
+        ],
+        requestId: 'new-request',
+        sessionId: 'session-1'
+      })
+    )
+    expect(screen.getByText('0 of 2 answered')).toBeTruthy()
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect((screen.getByRole('button', { name: /Confirm and continue/ }) as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.click(screen.getByRole('button', { name: /blue/ }))
+    fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'new' } })
+    expect((screen.getByRole('button', { name: /Confirm and continue/ }) as HTMLButtonElement).disabled).toBe(false)
+  })
+
+  it('does not treat a late old acknowledgement as answering a newer request', async () => {
+    let acceptOld!: (result: { status: string }) => void
+    const request = renderLiveBatch()
+    request.mockImplementationOnce(
+      () =>
+        new Promise(resolve => {
+          acceptOld = resolve
+        })
+    )
+    fireEvent.click(screen.getByRole('button', { name: /red/ }))
+    fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'packet' } })
+    fireEvent.click(screen.getByRole('button', { name: /Confirm and continue/ }))
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(1))
+
+    act(() =>
+      setClarifyRequest({
+        choices: null,
+        multiSelect: false,
+        question: '',
+        questions: [
+          { choices: ['red', 'blue'], multiSelect: false, qid: 'q0', question: 'Color?' },
+          { choices: null, multiSelect: false, qid: 'q1', question: 'Name?' }
+        ],
+        requestId: 'new-request',
+        sessionId: 'session-1'
+      })
+    )
+    await act(async () => acceptOld({ status: 'ok' }))
+    messageRunning = false
+    act(() => clearClarifyRequest('new-request', 'session-1'))
+    expect(screen.queryByText('0 of 2 answered')).toBeNull()
+    expect(screen.queryByRole('button', { name: /Confirm and continue/ })).toBeNull()
+  })
+
+  it('does not let a late old acknowledgement erase a newer accepted latch', async () => {
+    let acceptOld!: (result: { status: string }) => void
+    const request = renderLiveBatch()
+    request.mockImplementationOnce(
+      () =>
+        new Promise(resolve => {
+          acceptOld = resolve
+        })
+    )
+    fireEvent.click(screen.getByRole('button', { name: /red/ }))
+    fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'old' } })
+    fireEvent.click(screen.getByRole('button', { name: /Confirm and continue/ }))
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(1))
+
+    act(() =>
+      setClarifyRequest({
+        choices: null,
+        multiSelect: false,
+        question: '',
+        questions: [
+          { choices: ['red', 'blue'], multiSelect: false, qid: 'q0', question: 'Color?' },
+          { choices: null, multiSelect: false, qid: 'q1', question: 'Name?' }
+        ],
+        requestId: 'new-request',
+        sessionId: 'session-1'
+      })
+    )
+    fireEvent.click(screen.getByRole('button', { name: /blue/ }))
+    fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'new' } })
+    fireEvent.click(screen.getByRole('button', { name: /Confirm and continue/ }))
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(3))
+    await act(async () => acceptOld({ status: 'ok' }))
+    messageRunning = false
+    act(() => clearClarifyRequest('new-request', 'session-1'))
+    expect(screen.getByText('2 of 2 answered')).toBeTruthy()
   })
 
   it('a staged answer stays editable before confirm', async () => {
@@ -668,7 +978,8 @@ describe('ClarifyTool batch card', () => {
     expect(request).toHaveBeenNthCalledWith(1, 'clarify.respond', {
       answer: 'blue',
       question_id: 'q0',
-      request_id: 'request-batch'
+      request_id: 'request-batch',
+      session_id: 'session-1'
     })
   })
 
@@ -690,14 +1001,52 @@ describe('ClarifyTool batch card', () => {
   it('Skip cancels the whole batch without a question_id', async () => {
     const request = renderLiveBatch()
 
+    fireEvent.click(screen.getByRole('button', { name: /red/ }))
+    fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'packet' } })
     fireEvent.click(screen.getByRole('button', { name: 'Skip' }))
 
     await waitFor(() => {
       expect(request).toHaveBeenCalledWith('clarify.respond', {
         answer: '',
-        request_id: 'request-batch'
+        request_id: 'request-batch',
+        session_id: 'session-1'
       })
     })
+    await waitFor(() => expect(screen.getByText('Skipped')).toBeTruthy())
+
+    expect(screen.getByRole('status').textContent).toBe('Skipped')
+    expect(screen.getByRole('button', { name: /red/ }).getAttribute('aria-pressed')).toBe('false')
+    expect((screen.getByPlaceholderText('Type your answer…') as HTMLTextAreaElement).disabled).toBe(true)
+    expect((screen.getByRole('button', { name: 'Skip' }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it('keeps staged input and the request after an uncertain batch skip; retry is explicit', async () => {
+    const request = renderLiveBatch()
+    request.mockRejectedValueOnce(new Error('socket lost')).mockResolvedValueOnce({ status: 'ok' })
+
+    fireEvent.click(screen.getByRole('button', { name: /red/ }))
+    fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'packet' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Skip' }))
+
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/may have reached/i))
+    expect(hasClarifyRequest('session-1')).toBe(true)
+    expect(screen.getByRole('button', { name: /red/ }).getAttribute('aria-pressed')).toBe('true')
+    expect((screen.getByPlaceholderText('Type your answer…') as HTMLTextAreaElement).value).toBe('packet')
+    expect(request).toHaveBeenCalledTimes(1)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Skip' }))
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(2))
+    expect(request).toHaveBeenNthCalledWith(1, 'clarify.respond', {
+      answer: '',
+      request_id: 'request-batch',
+      session_id: 'session-1'
+    })
+    expect(request).toHaveBeenNthCalledWith(2, 'clarify.respond', {
+      answer: '',
+      request_id: 'request-batch',
+      session_id: 'session-1'
+    })
+    await waitFor(() => expect(screen.getByText('Skipped')).toBeTruthy())
   })
 
   it('renders the settled batch with all questions and answers', () => {
@@ -741,7 +1090,7 @@ function armCrossProfileOwner() {
   $profiles.set([{ name: OWNER_PROFILE }, { name: 'profile-b' }] as never)
   setSessionOwnerHint('session-a', { connectionId: OWNER_CONNECTION_ID, profile: OWNER_PROFILE })
 
-  const ambient = vi.fn().mockResolvedValue({ ok: true })
+  const ambient = vi.fn().mockResolvedValue({ status: 'ok' })
 
   $activeSessionId.set('session-a')
   $gateway.set({ request: ambient } as never)
@@ -755,7 +1104,7 @@ function expectOwnerCall(nth: number, params: Record<string, unknown>) {
     OWNER_CONNECTION_ID,
     OWNER_PROFILE,
     'clarify.respond',
-    params
+    { ...params, session_id: 'session-a' }
   )
 }
 
@@ -784,8 +1133,39 @@ describe('ClarifyTool owner routing', () => {
     await waitFor(() => {
       expect(gatewayMocks.requestGatewayForAgent).toHaveBeenCalledTimes(1)
     })
-    expectOwnerCall(1, { answer: 'staging', request_id: 'request-1' })
+    expectOwnerCall(1, { answer: 'staging', request_id: 'request-1', session_id: 'session-1' })
     expect(ambient).not.toHaveBeenCalled()
+  })
+
+  it('keeps the answer and does not retry automatically when the owner connection fails', async () => {
+    const ambient = armCrossProfileOwner()
+    gatewayMocks.requestGatewayForAgent
+      .mockRejectedValueOnce(new Error('owner connection changed'))
+      .mockResolvedValueOnce({ status: 'ok' })
+
+    setClarifyRequest({
+      choices: ['staging', 'production'],
+      multiSelect: false,
+      question: 'Which deployment target?',
+      requestId: 'request-connection-change',
+      sessionId: 'session-a'
+    })
+    renderClarify(<ClarifyTool {...liveClarifyProps()} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /staging/ }))
+    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
+
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/may have reached/i))
+    expect(gatewayMocks.requestGatewayForAgent).toHaveBeenCalledTimes(1)
+    expect(screen.getByRole('button', { name: /staging/ }).getAttribute('aria-pressed')).toBe('true')
+    expect(hasClarifyRequest('session-a')).toBe(true)
+    expect(ambient).not.toHaveBeenCalled()
+
+    // Only another explicit Confirm issues a retry, with the same owner and payload.
+    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
+    await waitFor(() => expect(gatewayMocks.requestGatewayForAgent).toHaveBeenCalledTimes(2))
+    expectOwnerCall(1, { answer: 'staging', request_id: 'request-connection-change' })
+    expectOwnerCall(2, { answer: 'staging', request_id: 'request-connection-change' })
   })
 
   it('sends both sequential batch locks on the owner socket, in order', async () => {
@@ -812,8 +1192,8 @@ describe('ClarifyTool owner routing', () => {
       expect(gatewayMocks.requestGatewayForAgent).toHaveBeenCalledTimes(2)
     })
     // The LAST lock resolves the blocked tool, so order is load-bearing.
-    expectOwnerCall(1, { answer: 'red', question_id: 'q0', request_id: 'request-batch' })
-    expectOwnerCall(2, { answer: 'packet', question_id: 'q1', request_id: 'request-batch' })
+    expectOwnerCall(1, { answer: 'red', question_id: 'q0', request_id: 'request-batch', session_id: 'session-1' })
+    expectOwnerCall(2, { answer: 'packet', question_id: 'q1', request_id: 'request-batch', session_id: 'session-1' })
     expect(ambient).not.toHaveBeenCalled()
   })
 
@@ -838,7 +1218,140 @@ describe('ClarifyTool owner routing', () => {
     await waitFor(() => {
       expect(gatewayMocks.requestGatewayForAgent).toHaveBeenCalledTimes(1)
     })
-    expectOwnerCall(1, { answer: '', request_id: 'request-batch' })
+    expectOwnerCall(1, { answer: '', request_id: 'request-batch', session_id: 'session-1' })
     expect(ambient).not.toHaveBeenCalled()
+  })
+
+  it('composer skip routes to the clarify owner after the ambient profile switches', async () => {
+    const ambient = armCrossProfileOwner()
+    setClarifyRequest({
+      choices: ['staging', 'production'],
+      multiSelect: false,
+      question: 'Which deployment target?',
+      requestId: 'request-composer',
+      sessionId: 'session-a'
+    })
+
+    await expect(skipClarifyRequest('session-a')).resolves.toBe(true)
+    expectOwnerCall(1, { answer: '', request_id: 'request-composer' })
+    expect(ambient).not.toHaveBeenCalled()
+  })
+})
+
+describe('ClarifyTool remount delivery state', () => {
+  it('retains a free-text draft and warning through remount and request replay', async () => {
+    const { request } = renderLiveClarify()
+    request.mockRejectedValueOnce(new Error('lost ACK')).mockResolvedValue({ status: 'ok' })
+    fireEvent.change(screen.getByPlaceholderText('Other (type your answer)'), {
+      target: { value: 'my chosen environment' }
+    })
+    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/may have reached/i))
+    cleanup()
+    setClarifyRequest({
+      choices: ['staging', 'production'],
+      multiSelect: false,
+      question: 'Which deployment target?',
+      requestId: 'request-1',
+      sessionId: 'session-1'
+    })
+    renderClarify(<ClarifyTool {...liveClarifyProps()} />)
+    expect((screen.getByPlaceholderText('Other (type your answer)') as HTMLTextAreaElement).value).toBe(
+      'my chosen environment'
+    )
+    expect(screen.getByRole('alert').textContent).toMatch(/may have reached/i)
+    expect(request).toHaveBeenCalledTimes(1)
+    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
+    await waitFor(() => expect(screen.getByText('Answer received')).toBeTruthy())
+    expect(request).toHaveBeenCalledTimes(2)
+    cleanup()
+    renderClarify(<ClarifyTool {...liveClarifyProps()} />)
+    expect(screen.getByText('Answer received')).toBeTruthy()
+    expect((screen.getByRole('button', { name: /Continue/ }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it('retains an in-flight guard through remount and processes its acknowledgement', async () => {
+    const { request } = renderLiveClarify()
+    let acknowledge!: (result: { status: string }) => void
+    request.mockImplementationOnce(
+      () =>
+        new Promise(resolve => {
+          acknowledge = resolve
+        })
+    )
+    fireEvent.click(screen.getByRole('button', { name: /staging/ }))
+    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
+    cleanup()
+    renderClarify(<ClarifyTool {...liveClarifyProps()} />)
+    expect(screen.getByRole('button', { name: /staging/ }).getAttribute('aria-pressed')).toBe('true')
+    expect((screen.getByRole('button', { name: 'Skip' }) as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.click(screen.getByRole('button', { name: 'Skip' }))
+    expect(request).toHaveBeenCalledTimes(1)
+    await act(async () => acknowledge({ status: 'ok' }))
+    expect(screen.getByText('Answer received')).toBeTruthy()
+  })
+
+  it('retains both staged batch answers and uncertainty across transcript remount', async () => {
+    const request = renderLiveBatch()
+    request
+      .mockResolvedValueOnce({ status: 'ok', remaining: ['q1'] })
+      .mockRejectedValueOnce(new Error('final ACK lost'))
+      .mockResolvedValue({ status: 'ok' })
+    fireEvent.click(screen.getByRole('button', { name: /blue/ }))
+    fireEvent.change(screen.getByPlaceholderText('Type your answer…'), { target: { value: 'packet' } })
+    fireEvent.click(screen.getByRole('button', { name: /Confirm and continue/ }))
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/may have reached/i))
+    cleanup()
+    renderClarify(<ClarifyTool {...liveBatchProps()} />)
+    expect(screen.getByRole('button', { name: /blue/ }).getAttribute('aria-pressed')).toBe('true')
+    expect((screen.getByPlaceholderText('Type your answer…') as HTMLTextAreaElement).value).toBe('packet')
+    expect(screen.getByRole('alert').textContent).toMatch(/may have reached/i)
+    expect(request).toHaveBeenCalledTimes(2)
+    fireEvent.click(screen.getByRole('button', { name: /Confirm and continue/ }))
+    await waitFor(() => expect(screen.getByText('Answer received')).toBeTruthy())
+    expect(request).toHaveBeenCalledTimes(4)
+  })
+
+  it('keeps the selected answer and expired warning through remount', async () => {
+    const { request } = renderLiveClarify()
+    request.mockResolvedValue({ status: 'expired' })
+    fireEvent.click(screen.getByRole('button', { name: /production/ }))
+    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/Request expired/))
+    cleanup()
+    renderClarify(<ClarifyTool {...liveClarifyProps()} />)
+    expect(screen.getByRole('button', { name: /production/ }).getAttribute('aria-pressed')).toBe('true')
+    expect(screen.getByRole('alert').textContent).toMatch(/Request expired/)
+    expect((screen.getByRole('button', { name: /Continue/ }) as HTMLButtonElement).disabled).toBe(true)
+    expect(request).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('ClarifyTool real resume snapshot reconciliation', () => {
+  it('retains lost-ACK input and warning when the resumed gateway has no pending clarify', async () => {
+    const { restorePendingClarifyFromSnapshot } =
+      await import('@/app/session/hooks/use-session-actions/restore-pending-clarify')
+
+    const { request } = renderLiveClarify()
+    request.mockRejectedValueOnce(new Error('accepted but ACK lost')).mockResolvedValue({ status: 'ok' })
+    fireEvent.click(screen.getByRole('button', { name: /staging/ }))
+    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/may have reached/))
+    let state!: ReturnType<typeof restorePendingClarifyFromSnapshot>
+    act(() => {
+      state = restorePendingClarifyFromSnapshot({}, 'session-1', Date.now() / 1000, 'request-1')
+    })
+    expect(state.authoritativeAbsent).toBe(true)
+    expect(state.cleared).toBeNull()
+    expect(hasClarifyRequest('session-1')).toBe(false)
+    cleanup()
+    renderClarify(<ClarifyTool {...liveClarifyProps()} />)
+    expect(screen.getByRole('alert').textContent).toMatch(/may have reached/)
+    expect(screen.getByRole('button', { name: /staging/ }).getAttribute('aria-pressed')).toBe('true')
+    expect(screen.queryByText('Skipped')).toBeNull()
+    expect(request).toHaveBeenCalledTimes(1)
+    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
+    await waitFor(() => expect(screen.getByText('Answer received')).toBeTruthy())
+    expect(request).toHaveBeenCalledTimes(2)
   })
 })

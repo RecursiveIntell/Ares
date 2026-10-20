@@ -1,0 +1,29 @@
+▶ running per-file parallel test suite via run_tests_parallel.py
+  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)
+▶ pre-compiling bytecode cache
+▶ launching test runner
+Discovered 7 test files (~87 tests) under ['tests/ares_runtime/test_context_input_lifetime.py', 'tests/gateway/test_context_input_recovery.py', 'tests/gateway/test_context_input.py', 'tests/ares_runtime/test_continuity_input.py', 'tests/ares_runtime/test_continuity_dispatch.py', 'tests/ares_runtime/test_continuity_tool_control.py', 'tests/test_run_custody_ready_recovery.py']; running with -j 2
+[ 14.9% |    13/~87 | ✓18 | ✗ 0] ✓ tests/ares_runtime/test_context_input_lifetime.py (18✓, 4.5s)
+[ 33.3% |    29/~87 | ✓35 | ✗ 0] ✓ tests/ares_runtime/test_continuity_input.py (17✓, 5.1s)
+[ 40.2% |    35/~87 | ✓46 | ✗ 0] ✓ tests/ares_runtime/test_continuity_tool_control.py (11✓, 5.7s)
+[ 57.5% |    50/~87 | ✓67 | ✗ 0] ✓ tests/gateway/test_context_input.py (21✓, 3.8s)
+[ 75.9% |    66/~87 | ✓101 | ✗  0] ✓ tests/ares_runtime/test_continuity_dispatch.py (34✓, 22.7s)
+[ 86.2% |    75/~87 | ✓120 | ✗  0] ✓ tests/gateway/test_context_input_recovery.py (19✓, 5.2s)
+[100.0% |    87/~87 | ✓136 | ✗  0] ✓ tests/test_run_custody_ready_recovery.py (16✓, 11.7s)
+
+=== Summary: 7 files, 136 tests passed, 0 failed (100% complete) in 34.4s (2 workers) ===
+  Durations cached to test_durations.json (7 files)
+
+=== Per-file subprocess time distribution ===
+  Files:   7
+  Total subprocess CPU-wall: 58.7s  (runner wall: 34.4s, parallelism: 2x)
+  P50: 5.19s  P90: 22.70s  P95: 22.70s  P99: 22.70s  Max: 22.70s
+  <1s: 0 files (0%)  <2s: 0 files (0%)
+  Top 10 slowest:
+     22.70s  tests/ares_runtime/test_continuity_dispatch.py
+     11.73s  tests/test_run_custody_ready_recovery.py
+      5.68s  tests/ares_runtime/test_continuity_tool_control.py
+      5.19s  tests/gateway/test_context_input_recovery.py
+      5.11s  tests/ares_runtime/test_continuity_input.py
+      4.50s  tests/ares_runtime/test_context_input_lifetime.py
+      3.83s  tests/gateway/test_context_input.py

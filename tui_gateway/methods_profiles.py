@@ -267,6 +267,23 @@ def _(rid, params: dict) -> dict:
                 "display_name": getattr(p, "display_name", "") or "",
                 "skill_count": getattr(p, "skill_count", 0) or 0,
             }
+            # Profile Models reads saved intent, not a live agent's clamped
+            # effort. Resolve this row's owner without opening a backend.
+            from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+            token = set_hermes_home_override(str(p.path))
+            try:
+                from hermes_cli.config import read_user_config_raw
+                from hermes_constants import parse_reasoning_effort
+
+                cfg = read_user_config_raw() or {}
+                agent_cfg = cfg.get("agent") or {}
+                parsed = parse_reasoning_effort(agent_cfg.get("reasoning_effort"))
+                row["reasoning_effort"] = parsed.get("effort", "none") if parsed is not None else None
+            except Exception:
+                row["reasoning_effort"] = None
+            finally:
+                reset_hermes_home_override(token)
             if include_sessions:
                 db = _open_profile_session_db(p.path)
                 try:
@@ -752,7 +769,7 @@ def _(rid, params: dict) -> dict:
 
     Params: ``name`` (required) plus any of:
     ``description`` (str), ``soul`` (str, full SOUL.md replacement),
-    ``model`` + ``provider`` (both required together),
+    ``model`` + ``provider`` (both required together), ``reasoning_effort``,
     ``disabled_skills`` (list[str], replace semantics),
     ``enabled_toolsets`` (list[str], replace semantics; empty list clears
     the pin so every toolset is enabled again), and
@@ -775,7 +792,35 @@ def _(rid, params: dict) -> dict:
         if not profile_dir.is_dir():
             return _err(rid, 4064, f"profile '{name}' not found")
 
+        effort = None
+        if "reasoning_effort" in params:
+            from hermes_constants import parse_reasoning_effort
+
+            parsed = parse_reasoning_effort(params["reasoning_effort"])
+            if parsed is None:
+                return _err(rid, 4002, "Invalid reasoning effort")
+            effort = parsed.get("effort", "none")
+
         applied = {}
+
+        if effort is not None:
+            token = set_hermes_home_override(str(profile_dir))
+            try:
+                from hermes_cli.config import read_user_config_raw, save_config
+
+                # Merge a single owned leaf under the canonical writer lock;
+                # never overwrite another section from a stale full snapshot.
+                save_config(
+                    {"agent": {"reasoning_effort": effort}},
+                    merge_existing=True,
+                    preserve_keys={("agent", "reasoning_effort")},
+                )
+                cfg = read_user_config_raw() or {}
+                applied["reasoning_effort"] = (cfg.get("agent") or {}).get("reasoning_effort") == effort
+            except Exception:
+                applied["reasoning_effort"] = False
+            finally:
+                reset_hermes_home_override(token)
 
         if isinstance(params.get("ui_meta"), dict):
             # Client-agnostic UI metadata (avatar/pet/etc.), merged key-wise
@@ -790,31 +835,15 @@ def _(rid, params: dict) -> dict:
                 if len(_json.dumps(incoming)) > 65536:
                     applied["ui_meta"] = False
                 else:
-                    import yaml as _yaml
+                    from hermes_cli.profiles import update_profile_metadata
 
                     expected = params.get("ui_meta_expected_revisions")
                     if expected is not None and not isinstance(expected, dict):
                         raise ValueError("ui_meta_expected_revisions must be an object")
 
-                    meta_path = profile_dir / "profile.yaml"
-                    with _profile_ui_meta_lock:
-                        existing = {}
-                        if meta_path.is_file():
-                            try:
-                                with open(meta_path, "r", encoding="utf-8") as f:
-                                    loaded = _yaml.safe_load(f) or {}
-                                if isinstance(loaded, dict):
-                                    existing = loaded
-                            except Exception:
-                                existing = {}
-
+                    def update_ui_meta(existing):
                         raw_revisions = existing.get("_ui_meta_revisions")
-                        revisions = dict(raw_revisions) if isinstance(raw_revisions, dict) else {}
-                        revisions = {
-                            str(key): max(0, int(value))
-                            for key, value in revisions.items()
-                            if isinstance(value, int) and not isinstance(value, bool)
-                        }
+                        revisions = dict(raw_revisions or {})
                         conflicts = {}
                         if isinstance(expected, dict):
                             for key in incoming:
@@ -834,6 +863,7 @@ def _(rid, params: dict) -> dict:
                             applied["ui_meta_revisions"] = {
                                 key: revisions.get(key, 0) for key in incoming
                             }
+                            return False
                         else:
                             current = existing.get("ui_meta")
                             if not isinstance(current, dict):
@@ -852,15 +882,15 @@ def _(rid, params: dict) -> dict:
                             # stale client must not recreate a removed key by
                             # presenting the initial revision again.
                             existing["_ui_meta_revisions"] = revisions
-                            from utils import atomic_yaml_write
-
-                            atomic_yaml_write(meta_path, existing, sort_keys=False)
                             applied["ui_meta"] = True
                             applied["ui_meta_revisions"] = {
                                 key: revisions[key] for key in incoming
                             }
+
+                    update_profile_metadata(profile_dir, update_ui_meta)
             except Exception:
                 applied["ui_meta"] = False
+                applied.pop("ui_meta_revisions", None)
 
         if isinstance(params.get("soul"), str):
             try:
@@ -885,6 +915,7 @@ def _(rid, params: dict) -> dict:
         model = str(params.get("model") or "").strip()
         provider = str(params.get("provider") or "").strip()
         confirm_message = None
+        model_error = None
         if model and provider:
             # #95293 remainder: this is the Bots editor's model-switch path,
             # and it used to write guarded (data-policy / expensive) models
@@ -910,8 +941,20 @@ def _(rid, params: dict) -> dict:
 
                     _write_profile_model(profile_dir, provider, model)
                     applied["model"] = True
-                except Exception:
+                except Exception as exc:
                     applied["model"] = False
+                    from fastapi import HTTPException
+
+                    # Never expose arbitrary exception/config text to the editor.
+                    invalid_provider = isinstance(exc, HTTPException) and exc.status_code == 400
+                    model_error = {
+                        "code": "provider_configuration_unavailable" if invalid_provider else "model_save_failed",
+                        "message": (
+                            "The selected provider is missing, disabled, or incomplete in this profile. "
+                            "Configure it here or choose another provider. Your previous model is preserved."
+                            if invalid_provider else "The model could not be saved. Your previous model is preserved."
+                        ),
+                    }
 
         needs_cfg = (
             isinstance(params.get("disabled_skills"), list)
@@ -1008,6 +1051,8 @@ def _(rid, params: dict) -> dict:
                 reset_hermes_home_override(token)
 
         result = {"ok": all(applied.values()) if applied else True, "applied": applied}
+        if model_error is not None:
+            result["model_error"] = model_error
         if confirm_message is not None:
             # Model write pending user confirmation — same shape config.set
             # returns, so clients reuse one confirm handler for both surfaces.

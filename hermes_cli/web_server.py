@@ -109,8 +109,7 @@ try:
         FastAPI, File, Form, HTTPException, Query, Request, UploadFile,
         WebSocket, WebSocketDisconnect,
     )
-    from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+    from fastapi.responses import RedirectResponse, FileResponse, HTMLResponse, JSONResponse, Response
     from fastapi.staticfiles import StaticFiles
     from pydantic import BaseModel, SecretStr, field_validator
     from starlette.concurrency import run_in_threadpool
@@ -125,8 +124,7 @@ except ImportError:
             FastAPI, File, Form, HTTPException, Query, Request, UploadFile,
             WebSocket, WebSocketDisconnect,
         )
-        from fastapi.middleware.cors import CORSMiddleware
-        from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+        from fastapi.responses import RedirectResponse, FileResponse, HTMLResponse, JSONResponse, Response
         from fastapi.staticfiles import StaticFiles
         from pydantic import BaseModel, SecretStr, field_validator
         from starlette.concurrency import run_in_threadpool
@@ -626,16 +624,43 @@ _reveal_timestamps: List[float] = []
 _REVEAL_MAX_PER_WINDOW = 5
 _REVEAL_WINDOW_SECONDS = 30
 
-# CORS: restrict to localhost origins only.  The web UI is intended to run
-# locally; binding to 0.0.0.0 with allow_origins=["*"] would let any website
-# read/modify config and secrets.
+# Browser callers share one exact origin contract with WS and cookie auth.
+from hermes_cli.dashboard_auth.origins import ExactOriginCORS, origin_allowed
+from hermes_cli.dashboard_auth.browser_launch import BrowserLaunchTickets
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
-    allow_methods=["*"],
-    allow_headers=["*"],
+_BROWSER_LAUNCH_TICKETS = BrowserLaunchTickets()
+
+# Child-owned bootstrap proof is separate from the live session bearer and
+# authorizes only token discovery / native transport provenance. Never emit it
+# in HTML, connection descriptors, argv, readiness messages or logs.
+_DESKTOP_BOOTSTRAP_KEY = os.environ.get("HERMES_DESKTOP_BOOTSTRAP_KEY", "")
+_DESKTOP_BOOTSTRAP_ID = os.environ.get("HERMES_DESKTOP_BOOTSTRAP_ID", "")
+
+
+from hermes_cli.dashboard_auth.native_bootstrap import (
+    NativeReplayWindow, make_native_response, verify_native_request, native_listener_endpoint,
 )
+_NATIVE_BOOTSTRAP_NONCES = NativeReplayWindow()
+
+
+@app.get("/auth/desktop-bootstrap")
+async def desktop_bootstrap(request: Request):
+    if (request.headers.get("origin") is not None or request.url.query
+            or getattr(app.state, "auth_required", False)):
+        raise HTTPException(status_code=403, detail="Native bootstrap denied")
+    endpoint = native_listener_endpoint(request.scope, request.headers.get("host", ""))
+    if endpoint is None:
+        raise HTTPException(status_code=403, detail="Native listener binding denied")
+    admitted = verify_native_request(request.headers, endpoint, _DESKTOP_BOOTSTRAP_KEY,
+                                     _DESKTOP_BOOTSTRAP_ID, _NATIVE_BOOTSTRAP_NONCES)
+    if admitted is None:
+        raise HTTPException(status_code=403, detail="Native bootstrap denied")
+    nonce, issued = admitted
+    return JSONResponse(
+        make_native_response(_DESKTOP_BOOTSTRAP_KEY, endpoint, _DESKTOP_BOOTSTRAP_ID,
+                             nonce, issued, _SESSION_TOKEN),
+        headers={"Cache-Control": "no-store"},
+    )
 
 # ---------------------------------------------------------------------------
 # Endpoints that do NOT require the session token.  Everything else under
@@ -675,6 +700,30 @@ def _has_valid_session_token(request: Request) -> bool:
     auth = request.headers.get("authorization", "")
     expected = f"Bearer {_SESSION_TOKEN}"
     return hmac.compare_digest(auth.encode(), expected.encode())
+
+
+@app.post("/auth/browser-bootstrap")
+async def browser_bootstrap(request: Request):
+    """Redeem an exact-origin launch grant; never create ambient authority."""
+    headers = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
+    if (getattr(request.app.state, "auth_required", False)
+            or not origin_allowed(request.headers.get("origin", ""), request.scope)):
+        return JSONResponse({"detail": "Browser bootstrap denied"}, status_code=403, headers=headers)
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > 1024:
+            return JSONResponse({"detail": "Bootstrap body too large"}, status_code=413, headers=headers)
+    try:
+        payload = json.loads(body)
+    except (ValueError, UnicodeError):
+        return JSONResponse({"detail": "Invalid bootstrap request"}, status_code=400, headers=headers)
+    if payload == {} and _has_valid_session_token(request):
+        return Response(status_code=204, headers=headers)
+    if (not isinstance(payload, dict) or set(payload) != {"ticket"}
+            or not _BROWSER_LAUNCH_TICKETS.consume(payload.get("ticket"))):
+        return JSONResponse({"detail": "Browser bootstrap denied"}, status_code=403, headers=headers)
+    return JSONResponse({"protocol": "browser-launch-v1", "token": _SESSION_TOKEN}, headers=headers)
 
 
 # Routes that may also authenticate via a ``?token=`` query param, for download
@@ -999,6 +1048,8 @@ async def auth_middleware(request: Request, call_next):
     if getattr(request.app.state, "auth_required", False):
         return await call_next(request)
     path = request.url.path
+    if path == "/auth/desktop-bootstrap":
+        return await call_next(request)
     is_mcp_oauth_callback = path.startswith("/api/mcp/oauth/callback/")
     if path.startswith("/api/") and path not in _PUBLIC_API_PATHS and not is_mcp_oauth_callback:
         if not _has_valid_session_token(request) and not _has_valid_query_token(request, path):
@@ -1006,6 +1057,20 @@ async def auth_middleware(request: Request, call_next):
                 status_code=401,
                 content={"detail": "Unauthorized"},
             )
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def browser_origin_middleware(request: Request, call_next):
+    origin = request.headers.get("origin")
+    # Browser navigations/download anchors can omit Origin. Fetch Metadata
+    # still identifies sibling/foreign-site token URLs; OS/native links carry
+    # no such browser metadata and retain the explicit query-bearer path.
+    if (request.url.path in _QUERY_TOKEN_API_PATHS
+            and request.headers.get("sec-fetch-site") in {"same-site", "cross-site"}):
+        return JSONResponse({"detail": "Cross-origin download denied"}, status_code=403)
+    if origin is not None and not origin_allowed(origin, request.scope):
+        return JSONResponse({"detail": "Origin denied"}, status_code=403)
     return await call_next(request)
 
 
@@ -1021,6 +1086,10 @@ async def _token_auth_seam(request: Request, call_next):
     """
     from hermes_cli.dashboard_auth.token_auth import token_auth_middleware
     return await token_auth_middleware(request, call_next)
+
+
+# Outermost browser CORS owns OPTIONS before any authentication adapters.
+app.add_middleware(ExactOriginCORS)
 
 
 # ---------------------------------------------------------------------------
@@ -1801,7 +1870,15 @@ def _audio_extension_for_mime(mime_type: str) -> str:
     return _AUDIO_MIME_EXTENSIONS.get(normalized, ".webm")
 
 
-def _normalize_main_model_assignment(provider: str, model: str) -> tuple[str, str]:
+def _model_assignment_provider_category(provider: str) -> str:
+    from hermes_cli.models import normalize_provider
+    from hermes_cli.providers import normalize_provider as registry_normalize
+
+    generic = registry_normalize(provider)
+    return generic if generic in {"custom", "local"} else normalize_provider(provider)
+
+
+def _normalize_main_model_assignment(provider: str, model: str, base_url: str = "") -> tuple[str, str]:
     """Normalize a main-slot (provider, model) pair before persisting.
 
     The Models page has two assignment paths and only one of them was safe:
@@ -1843,7 +1920,7 @@ def _normalize_main_model_assignment(provider: str, model: str) -> tuple[str, st
 
     prov_in = (provider or "").strip()
     model_in = (model or "").strip()
-    canonical = normalize_provider(prov_in)
+    canonical = _model_assignment_provider_category(prov_in)
 
     # User-declared providers are real routing targets, not analytics vendor
     # labels. Resolve them before the unknown-vendor fallback. ``providers:``
@@ -1861,6 +1938,19 @@ def _normalize_main_model_assignment(provider: str, model: str) -> tuple[str, st
         prov_in,
         get_compatible_custom_providers(cfg) if isinstance(cfg, dict) else [],
     )
+    current = cfg.get("model") if isinstance(cfg, dict) else None
+    current = current if isinstance(current, dict) else {}
+    if canonical == "auto" or (
+        canonical in {"custom", "local"} and (
+            base_url or (
+                current.get("base_url")
+                and _model_assignment_provider_category(str(current.get("provider") or "")) == canonical
+                and user_provider is None
+                and (prov_in.strip().lower() == "custom" or custom_provider is None)
+            )
+        )
+    ):
+        return prov_in, model_in
     if user_provider is not None:
         return user_provider.id, model_in
     if custom_provider is not None:
@@ -1913,6 +2003,72 @@ def _normalize_main_model_assignment(provider: str, model: str) -> tuple[str, st
     return prov_in, model_in
 
 
+def _validate_model_assignment_provider(
+    cfg: dict, provider: str, base_url: str = "", *, allow_vendor_fallback: bool = False
+) -> None:
+    """Validate selection against this target's definitions, without resolving auth.
+
+    A provider name is a reference, not a definition. In particular, never
+    borrow the launch profile's endpoint when saving another profile's model.
+    """
+    from hermes_cli.config import get_compatible_custom_providers, is_provider_enabled
+    from hermes_cli.models import _KNOWN_PROVIDER_NAMES, normalize_provider
+    from hermes_cli.providers import custom_provider_aliases, resolve_custom_provider
+
+    requested = provider.strip().lower()
+    canonical = _model_assignment_provider_category(provider)
+    current = cfg.get("model")
+    current = current if isinstance(current, dict) else {}
+    generic_endpoint = base_url or (
+        _model_assignment_provider_category(str(current.get("provider") or "")) == canonical and current.get("base_url")
+    )
+    providers_cfg = cfg.get("providers")
+    providers_cfg = providers_cfg if isinstance(providers_cfg, dict) else {}
+    # Check raw entries as well as the compatibility view: disabled entries
+    # are omitted from that view but must not fall through to a built-in alias.
+    for key, entry in providers_cfg.items():
+        # Canonical declarations own their native aliases. An alias-named
+        # independent endpoint owns only its declared key/name identities.
+        matches_builtin = not requested.startswith("custom:") and canonical == str(key).strip().lower()
+        if matches_builtin or requested in custom_provider_aliases(str(entry.get("name") or key) if isinstance(entry, dict) else str(key), str(key)):
+            if not isinstance(entry, dict) or not is_provider_enabled(entry):
+                raise HTTPException(status_code=400, detail=f"Provider '{provider}' is disabled or invalid in this profile")
+            endpoint = entry.get("base_url") or entry.get("url") or entry.get("api")
+            builtin = _model_assignment_provider_category(str(key))
+            if matches_builtin and builtin in {"custom", "local"} and generic_endpoint:
+                return
+            if (endpoint and resolve_custom_provider(provider, get_compatible_custom_providers(cfg)) is not None) or (matches_builtin and builtin in _KNOWN_PROVIDER_NAMES and builtin not in {"custom", "local"}):
+                return
+            raise HTTPException(status_code=400, detail=f"Provider '{provider}' needs an endpoint in this profile")
+
+    declared_legacy = False
+    legacy = cfg.get("custom_providers")
+    for entry in legacy if isinstance(legacy, list) else []:
+        if isinstance(entry, dict) and requested in custom_provider_aliases(str(entry.get("name") or ""), str(entry.get("provider_key") or "")):
+            declared_legacy = True
+            if not is_provider_enabled(entry):
+                raise HTTPException(status_code=400, detail=f"Provider '{provider}' is disabled in this profile")
+
+    if canonical == "auto":
+        return
+    if requested != "custom" and resolve_custom_provider(provider, get_compatible_custom_providers(cfg)) is not None:
+        return
+    if canonical in {"custom", "local"}:
+        if generic_endpoint:
+            return
+        raise HTTPException(status_code=400, detail=f"Provider '{provider}' needs an explicit endpoint in this profile")
+    if resolve_custom_provider(provider, get_compatible_custom_providers(cfg)) is not None:
+        return
+    if canonical in _KNOWN_PROVIDER_NAMES:
+        return
+    # Analytics vendor labels may use the existing aggregator normalization.
+    # Raw declarations still reject above; an unresolved named custom target
+    # or endpointless legacy alias is never permission to retarget the save.
+    if allow_vendor_fallback and not declared_legacy and not requested.startswith("custom:"):
+        return
+    raise HTTPException(status_code=400, detail=f"Provider '{provider}' is not configured in this profile; configure it here before selecting it")
+
+
 def _apply_main_model_assignment(
     model_cfg: "Any", provider: str, model: str, base_url: str = "", api_key: str = ""
 ) -> dict:
@@ -1941,15 +2097,21 @@ def _apply_main_model_assignment(
     Returns the same dict (coerced to a fresh dict if the input wasn't one) so
     callers can assign it straight back onto the model config.
     """
+    from hermes_cli.models import normalize_provider
+
     if not isinstance(model_cfg, dict):
         model_cfg = {}
     prev_provider = str(model_cfg.get("provider") or "").strip().lower()
     new_provider = provider.strip().lower()
+    previous_url = str(model_cfg.get("base_url") or "").strip()
+    endpoint_changed = bool(base_url.strip() and previous_url and base_url.strip() != previous_url)
+    same_generic_endpoint = bool(previous_url) and not endpoint_changed and _model_assignment_provider_category(prev_provider) in {"custom", "local"} and _model_assignment_provider_category(prev_provider) == _model_assignment_provider_category(new_provider)
+    provider_changed = (new_provider != prev_provider and not same_generic_endpoint) or endpoint_changed
     model_cfg["provider"] = provider
     model_cfg["default"] = model
     if base_url.strip():
         model_cfg["base_url"] = base_url.strip()
-    elif model_cfg.get("base_url") and new_provider != prev_provider:
+    elif model_cfg.get("base_url") and provider_changed:
         # Switching providers: the old URL belonged to the old provider, drop
         # it so the new provider's default endpoint is used. Same-provider
         # re-assignment keeps the user's configured base_url intact.
@@ -1961,14 +2123,14 @@ def _apply_main_model_assignment(
     if api_key.strip():
         model_cfg["api_key"] = api_key.strip()
         model_cfg.pop("api", None)
-    elif (model_cfg.get("api_key") or model_cfg.get("api")) and new_provider != prev_provider:
+    elif (model_cfg.get("api_key") or model_cfg.get("api")) and provider_changed:
         # A stale endpoint secret can live under the legacy ``api`` alias with
         # no ``api_key`` (the resolver still reads ``model.api`` as a key), so
         # the switch-clears-the-key path must trigger on either field — else the
         # old endpoint's secret survives in config.yaml and contaminates a later
         # custom resolution. clear_model_endpoint_credentials scrubs both.
         clear_model_endpoint_credentials(model_cfg, clear_api_mode=False)
-    if new_provider != prev_provider:
+    if provider_changed:
         clear_model_endpoint_credentials(model_cfg, clear_api_key=False)
     model_cfg.pop("context_length", None)
     return model_cfg
@@ -2188,6 +2350,7 @@ _SENSITIVE_MANAGED_FILE_BASENAMES = frozenset({
 # so these trees are blocked wherever they appear under the browsable root,
 # without needing to resolve them relative to HERMES_HOME.
 _SENSITIVE_MANAGED_DIR_NAMES = frozenset({
+    "context-controller-keys",
     "mcp-tokens",
     "pairing",
 })
@@ -7759,11 +7922,18 @@ def _apply_model_assignment_sync(
     if scope == "main":
         if not provider or not model:
             raise HTTPException(status_code=400, detail="provider and model required for main")
-        provider, model = _normalize_main_model_assignment(provider, model)
+        _validate_model_assignment_provider(
+            cfg, provider, base_url,
+            allow_vendor_fallback="/" in model and provider.strip().lower() == model.split("/", 1)[0].strip().lower(),
+        )
+        # An explicit generic endpoint must not bind to an unrelated saved custom row.
+        provider, model = _normalize_main_model_assignment(provider, model, base_url=base_url)
+        _validate_model_assignment_provider(cfg, provider, base_url)
         providers_cfg = cfg.get("providers")
         provider_entry = providers_cfg.get(provider) if isinstance(providers_cfg, dict) else None
-        if not base_url and isinstance(provider_entry, dict) and provider_entry.get("base_url"):
-            base_url = str(provider_entry.get("base_url") or "").strip()
+        previous = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+        if not base_url and isinstance(provider_entry, dict) and (previous.get("provider") != provider or not previous.get("base_url")):
+            base_url = str(provider_entry.get("base_url") or provider_entry.get("url") or provider_entry.get("api") or "").strip()
         model_cfg = _apply_main_model_assignment(
             cfg.get("model", {}), provider, model, base_url, api_key
         )
@@ -15115,9 +15285,18 @@ def _write_profile_model(profile_dir: Path, provider: str, model: str) -> None:
 
     token = set_hermes_home_override(str(profile_dir))
     try:
-        provider, model = _normalize_main_model_assignment(provider, model)
         cfg = load_config()
-        cfg["model"] = _apply_main_model_assignment(cfg.get("model", {}), provider, model)
+        _validate_model_assignment_provider(
+            cfg, provider,
+            allow_vendor_fallback="/" in model and provider.strip().lower() == model.split("/", 1)[0].strip().lower(),
+        )
+        provider, model = _normalize_main_model_assignment(provider, model)
+        _validate_model_assignment_provider(cfg, provider)
+        providers_cfg = cfg.get("providers")
+        entry = providers_cfg.get(provider) if isinstance(providers_cfg, dict) else None
+        previous = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+        endpoint = str(entry.get("base_url") or entry.get("url") or entry.get("api") or "") if isinstance(entry, dict) and (previous.get("provider") != provider or not previous.get("base_url")) else ""
+        cfg["model"] = _apply_main_model_assignment(cfg.get("model", {}), provider, model, base_url=endpoint)
         save_config(cfg)
     finally:
         reset_hermes_home_override(token)
@@ -16377,15 +16556,12 @@ def _ws_host_origin_reason(ws: "WebSocket") -> Optional[str]:
     on rejection so the close path can log *why* the upgrade was refused.
     """
     bound_host = getattr(app.state, "bound_host", None)
-    if not bound_host:
-        return None
-
     trusted_public_hosts = getattr(
         app.state, "trusted_public_hosts", frozenset()
     )
 
     host_header = ws.headers.get("host", "")
-    if not _is_accepted_host(
+    if bound_host and not _is_accepted_host(
         host_header, bound_host, trusted_public_hosts
     ):
         return f"host_mismatch host={host_header or '?'} bound={bound_host}"
@@ -16394,20 +16570,8 @@ def _ws_host_origin_reason(ws: "WebSocket") -> Optional[str]:
     if not origin:
         return None
 
-    parsed = urllib.parse.urlparse(origin)
-    if parsed.scheme not in {"http", "https"}:
-        # Non-web origin (packaged Electron: file://, null, app://). The
-        # upstream credential check is the real auth boundary; trust it.
-        # See _ws_host_origin_is_allowed for the full rationale.
-        return None
-
-    if not parsed.netloc:
-        return f"origin_mismatch origin={origin} bound={bound_host}"
-
-    if not _is_accepted_host(
-        parsed.netloc, bound_host, trusted_public_hosts
-    ):
-        return f"origin_mismatch origin={origin} bound={bound_host}"
+    if not origin_allowed(origin, ws.scope):
+        return "origin_mismatch"
     return None
 
 
@@ -17913,32 +18077,6 @@ def mount_spa(application: FastAPI):
 
         @application.get("/{full_path:path}")
         async def no_frontend(full_path: str):
-            # Desktop token handshake (#94227): the Electron shell boots by
-            # fetching `/` and extracting ``window.__HERMES_SESSION_TOKEN__``
-            # for /api/ws auth (apps/desktop/electron/dashboard-token.ts).
-            # When headless serve 404'd every path, a renderer whose spawn
-            # token no longer matched the backend's live token (e.g. after
-            # `hermes update` replaced the backend) had no way to adopt the
-            # served token — the WS handshake failed and the window
-            # white-screened (#95575). Serve a minimal token-only page at the
-            # exact root, but ONLY when the dashboard auth gate is off: on a
-            # gated (non-loopback/remote) serve the token must never be
-            # readable without auth, so the 404 JSON stays.
-            gated = bool(getattr(application.state, "auth_required", False))
-            if full_path == "" and not gated:
-                token_js = json.dumps(_SESSION_TOKEN)
-                return HTMLResponse(
-                    "<!doctype html><html><head><script>"
-                    f"window.__HERMES_SESSION_TOKEN__={token_js};"
-                    "window.__HERMES_AUTH_REQUIRED__=false;"
-                    "</script></head><body>"
-                    "Headless backend (hermes serve): web UI disabled — use "
-                    "`hermes dashboard` for the browser UI."
-                    "</body></html>",
-                    headers={
-                        "Cache-Control": "no-store, no-cache, must-revalidate"
-                    },
-                )
             return JSONResponse({"error": _msg}, status_code=404)
         return
 
@@ -17956,8 +18094,8 @@ def mount_spa(application: FastAPI):
 
     _index_path = WEB_DIST / "index.html"
 
-    def _serve_index(prefix: str = ""):
-        """Return index.html with the session token + base-path injected.
+    def _serve_index(request: Request, prefix: str = ""):
+        """Return a bearer-free shell with auth mode and base-path metadata.
 
         ``prefix`` is the normalised ``X-Forwarded-Prefix`` (e.g. ``/hermes``)
         or empty string when served at root.
@@ -17968,6 +18106,10 @@ def mount_spa(application: FastAPI):
         ``__HERMES_AUTH_REQUIRED__`` flag lets the SPA pick the right
         auth scheme for /api/pty and /api/ws (ticket vs token).
         """
+        if "bootstrap" in request.query_params:
+            # Credentials belong in the fragment-to-POST flow, never request URLs.
+            return HTMLResponse("Use the authenticated fragment launch URL.", status_code=400,
+                                headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
         try:
             html = _index_path.read_text(encoding="utf-8")
         except OSError:
@@ -17981,24 +18123,15 @@ def mount_spa(application: FastAPI):
                 status_code=404,
             )
         chat_js = "true" if _DASHBOARD_EMBEDDED_CHAT_ENABLED else "false"
-        gated = bool(getattr(app.state, "auth_required", False))
+        gated = bool(getattr(application.state, "auth_required", False))
         gated_js = "true" if gated else "false"
-        if gated:
-            bootstrap_script = (
-                f"<script>"
-                f"window.__HERMES_DASHBOARD_EMBEDDED_CHAT__={chat_js};"
-                f'window.__HERMES_BASE_PATH__="{prefix}";'
-                f"window.__HERMES_AUTH_REQUIRED__={gated_js};"
-                f"</script>"
-            )
-        else:
-            bootstrap_script = (
-                f'<script>window.__HERMES_SESSION_TOKEN__="{_SESSION_TOKEN}";'
-                f"window.__HERMES_DASHBOARD_EMBEDDED_CHAT__={chat_js};"
-                f'window.__HERMES_BASE_PATH__="{prefix}";'
-                f"window.__HERMES_AUTH_REQUIRED__={gated_js};"
-                f"</script>"
-            )
+        bootstrap_script = (
+            f"<script>"
+            f"window.__HERMES_DASHBOARD_EMBEDDED_CHAT__={chat_js};"
+            f"window.__HERMES_BASE_PATH__={json.dumps(prefix).replace('<', chr(92) + 'u003c')};"
+            f"window.__HERMES_AUTH_REQUIRED__={gated_js};"
+            f"</script>"
+        )
         if prefix:
             # Rewrite absolute asset URLs baked into the Vite build so the
             # browser fetches them through the same proxy prefix.
@@ -18019,10 +18152,13 @@ def mount_spa(application: FastAPI):
         if theme_bootstrap:
             html = html.replace("</head>", f"{theme_bootstrap}</head>", 1)
         html = html.replace("</head>", f"{bootstrap_script}</head>", 1)
-        return HTMLResponse(
+        response = HTMLResponse(
             html,
-            headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+            headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Referrer-Policy": "no-referrer"},
         )
+        if not gated and "hermes_dashboard_bootstrap" in request.cookies:
+            response.delete_cookie("hermes_dashboard_bootstrap", path="/", httponly=True, samesite="strict")
+        return response
 
     # When served behind a path-prefix proxy, the built CSS contains
     # absolute ``url(/fonts/...)`` and ``url(/ds-assets/...)`` references.
@@ -18100,7 +18236,7 @@ def mount_spa(application: FastAPI):
             and file_path.is_file()
         ):
             return FileResponse(file_path)
-        return _serve_index(prefix)
+        return _serve_index(request, prefix)
 
 
 # ---------------------------------------------------------------------------
@@ -19318,7 +19454,8 @@ def _write_dashboard_ready_file(actual_port: int) -> None:
 
 
 def _maybe_open_browser(
-    host: str, actual_port: int, open_browser: bool, initial_profile: str
+    host: str, actual_port: int, open_browser: bool, initial_profile: str,
+    print_launch_url: bool = False,
 ) -> None:
     """Open the dashboard URL in the user's browser if appropriate.
 
@@ -19327,7 +19464,7 @@ def _maybe_open_browser(
     Maps ``0.0.0.0`` / ``::`` binds to ``127.0.0.1`` so the browser opens
     a reachable URL.
     """
-    if not open_browser:
+    if not open_browser and not print_launch_url:
         return
 
     import webbrowser
@@ -19337,7 +19474,7 @@ def _maybe_open_browser(
         or bool(os.environ.get("DISPLAY"))
         or bool(os.environ.get("WAYLAND_DISPLAY"))
     )
-    if not _has_display:
+    if not _has_display and not print_launch_url:
         _log.debug(
             "Skipping browser-open: no DISPLAY or WAYLAND_DISPLAY detected "
             "(headless Linux). Pass --no-open to suppress this detection."
@@ -19345,10 +19482,19 @@ def _maybe_open_browser(
         return
 
     _display_host = host if host not in ("0.0.0.0", "::") else "127.0.0.1"
+    if ":" in _display_host and not _display_host.startswith("["):
+        _display_host = f"[{_display_host}]"
     _open_url = f"http://{_display_host}:{actual_port}"
     if initial_profile:
         from urllib.parse import quote
         _open_url += f"/?profile={quote(initial_profile)}"
+
+    if not getattr(app.state, "auth_required", False):
+        _open_url += f"#bootstrap={urllib.parse.quote(_BROWSER_LAUNCH_TICKETS.issue())}"
+    if print_launch_url:
+        print(_open_url, flush=True)
+    if not open_browser or not _has_display:
+        return
 
     def _open():
         try:
@@ -19569,6 +19715,7 @@ def start_server(
     headless: bool = False,
     ssh_session_token: Optional[str] = None,
     ssh_owner_nonce: Optional[str] = None,
+    print_launch_url: bool = False,
 ):
     """Start the web UI server.
 
@@ -19797,6 +19944,14 @@ def start_server(
         except (TypeError, ValueError):
             return default
 
+    _proxy_trust = _dash_cfg.get("trusted_proxies", os.environ.get("FORWARDED_ALLOW_IPS", ""))
+    if _proxy_trust is None:
+        _proxy_trust = ""
+    if not isinstance(_proxy_trust, (str, list, tuple)):
+        raise ValueError("dashboard.trusted_proxies must be a list of trusted peers/networks")
+    _proxy_hosts = _proxy_trust.split(",") if isinstance(_proxy_trust, str) else _proxy_trust
+    if any(str(peer).strip() == "*" for peer in _proxy_hosts):
+        raise ValueError("dashboard.trusted_proxies must name explicit trusted peers/networks")
     config = uvicorn.Config(
         app, host=host, port=port, log_level="warning",
         # proxy_headers defaults to False so _ws_client_is_allowed sees
@@ -19807,6 +19962,7 @@ def start_server(
         # decide cookie Secure flags, so we flip proxy_headers on for that
         # mode.
         proxy_headers=bool(app.state.auth_required),
+        forwarded_allow_ips=_proxy_trust,
         # Half-open detection for public binds only (see above). Loopback
         # disables the protocol ping (None) so an event-loop stall can never
         # trigger a false disconnect; a genuinely dead local client is still
@@ -19953,7 +20109,7 @@ def start_server(
                 print(f"  Hermes backend listening on {host}:{actual_port}", flush=True)
             else:
                 print(f"  Hermes Web UI → http://{host}:{actual_port}")
-            _maybe_open_browser(host, actual_port, open_browser, initial_profile)
+            _maybe_open_browser(host, actual_port, open_browser, initial_profile, print_launch_url)
 
             # Collapse the peer-hangup teardown flood (#50005). When the Desktop
             # forcibly closes its WebSocket mid-write, asyncio logs a full

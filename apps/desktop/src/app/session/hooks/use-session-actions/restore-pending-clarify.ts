@@ -5,6 +5,7 @@ import {
   clearClarifyRequest,
   normalizeChoices,
   normalizeQuestions,
+  retainClarifyDelivery,
   setClarifyRequest
 } from '@/store/clarify'
 import type { SessionResumeResponse } from '@/types/hermes'
@@ -30,12 +31,16 @@ export interface PendingClarifyResumeState {
  * is in flight is left alone.
  */
 export function restorePendingClarifyFromSnapshot(
-  response: Pick<SessionResumeResponse, 'pending_clarify'>,
+  response: Pick<SessionResumeResponse, 'pending_clarify' | 'pending_clarify_unavailable'>,
   sessionId: string,
   resumeStartedAt: number,
   requestIdAtStart?: string
 ): PendingClarifyResumeState {
   const pending = response.pending_clarify
+
+  if (response.pending_clarify_unavailable && !pending) {
+    return { authoritativeAbsent: false, cleared: null, request: null }
+  }
 
   if (!pending || typeof pending.request_id !== 'string') {
     const current = $clarifyRequests.get()[sessionId]
@@ -45,6 +50,14 @@ export function restorePendingClarifyFromSnapshot(
     const legacyWithoutTime = Boolean(current && current.receivedAt === undefined && !requestIdAtStart)
 
     if (current && (existedAtStart || definitelyOlder || legacyWithoutTime)) {
+      // Keep only local delivery evidence, never claim the backend still waits.
+      // Map presence prevents callers from fabricating an empty tool answer;
+      // live prompt selectors ignore deliveryOnly, while the inline card can
+      // retain its chosen input/warning and explicitly reconcile its receipt.
+      if (retainClarifyDelivery(current)) {
+        return { authoritativeAbsent: true, cleared: null, request: null }
+      }
+
       clearClarifyRequest(current.requestId, sessionId)
 
       return { authoritativeAbsent: true, cleared: current, request: null }

@@ -200,7 +200,7 @@ class MiniSWERunner:
         # If explicit api_key/base_url are provided (e.g. from CLI args),
         # construct directly.  Otherwise use the router for OpenRouter.
         if api_key or base_url:
-            from openai import OpenAI
+            from agent.auxiliary_client import OpenAI
             client_kwargs = {
                 "base_url": base_url or "https://openrouter.ai/api/v1",
                 "api_key": api_key or os.getenv(
@@ -216,7 +216,7 @@ class MiniSWERunner:
                 # Fallback: try auto-detection
                 self.client, _ = resolve_provider_client("auto", model=model)
             if self.client is None:
-                from openai import OpenAI
+                from agent.auxiliary_client import OpenAI
                 self.client = OpenAI(
                     base_url="https://openrouter.ai/api/v1",
                     api_key=os.getenv("OPENROUTER_API_KEY", ""))

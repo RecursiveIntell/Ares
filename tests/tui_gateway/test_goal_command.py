@@ -88,6 +88,10 @@ def session(server):
         "cols": 120,
     }
     server._sessions[sid] = s
+    # Resume is a transaction on the canonical goal/episode/session owner.
+    # The transport fixture must include its durable session, as production does.
+    from hermes_cli.goals import _get_session_db
+    _get_session_db().create_session(session_key, source="tui")
     return sid, session_key, s
 
 
@@ -371,6 +375,7 @@ def test_real_queued_prompt_preempts_goal_compression_retry(
     )
     session = _turn_session(agent, session_key)
     session_holder["session"] = session
+    monkeypatch.setitem(server._sessions, "sid", session)
 
     server._run_prompt_submit("rid", "sid", session, "initial work")
 
@@ -440,6 +445,174 @@ def test_new_goal_does_not_inherit_previous_goal_recovery_attempt(server):
     assert "replacement goal" in replacement_prompt
     assert "Retrying the active goal once" in replacement_notice
     assert GoalManager(session_key).state.status == "active"
+
+
+def test_context_dispatch_refusal_pauses_admitted_goal(server, turn_env, monkeypatch):
+    from ares_runtime.continuity.runtime import ContextDispatchError
+    from hermes_cli.goals import GoalManager, save_goal
+
+    key = "admission-owner"
+    mgr = GoalManager(key)
+    mgr.set("finish the task", max_turns=7)
+    mgr.state.turns_used = 2
+    mgr.state.checkpoint = {"next_step": "finish the pending local work"}
+    mgr.state.checkpoint_revision += 1
+    mgr.state.continuation_pending = True
+    assert save_goal(key, mgr.state)
+    before = mgr.state.to_json()
+    calls = []
+    judge = MagicMock(side_effect=AssertionError("refusal must not be judged"))
+    monkeypatch.setattr(GoalManager, "evaluate_after_turn", judge)
+
+    def run(message, **kwargs):
+        calls.append(message)
+        raise ContextDispatchError("CONTEXT_PREFLIGHT_EXHAUSTED")
+
+    agent = types.SimpleNamespace(session_id=key, run_conversation=run,
+                                  clear_interrupt=lambda: None)
+    session = _turn_session(agent, key)
+    server._run_prompt_submit("rid", "unbound-ui-sid", session, "work")
+    state = GoalManager(key).state
+    assert state.status == "paused"
+    assert not state.continuation_pending
+    from hermes_cli.goals import GoalState
+    old = GoalState.from_json(before)
+    assert (state.goal, state.created_at, state.turns_used, state.max_turns, state.checkpoint) == (
+        old.goal, old.created_at, old.turns_used, old.max_turns, old.checkpoint)
+    assert calls == ["work"]
+    judge.assert_not_called()
+    completes = [p for event, _, p in turn_env if event == "message.complete"]
+    assert len(completes) == 1 and completes[0]["status"] == "error"
+    assert server._inflight_snapshot(session)["status"] == "error"
+    notices = [p["text"] for event, _, p in turn_env
+               if event == "status.update" and p.get("kind") == "goal"]
+    assert len(notices) == 1
+    assert "Goal paused" in notices[0] and "context recovery" in notices[0].lower()
+
+
+@pytest.mark.parametrize("case", ["ordinary", "none", "paused", "completed",
+                                  "replacement", "operator_pause", "operator_resume", "persistence"])
+def test_context_refusal_does_not_overwrite_other_goal_state(
+    server, turn_env, monkeypatch, case
+):
+    from ares_runtime.continuity.runtime import ContextDispatchError
+    from hermes_cli import goals
+
+    key = "refusal-negative"
+    mgr = goals.GoalManager(key)
+    if case != "none":
+        mgr.set("original task")
+        if case == "paused":
+            assert mgr.pause() is not None
+        elif case == "completed":
+            mgr.state.status = "completed"
+            assert goals.save_goal(key, mgr.state)
+    expected = [mgr.state.to_json() if mgr.state else None]
+    calls = []
+    judge = MagicMock(side_effect=AssertionError("unexpected judge"))
+    monkeypatch.setattr(goals.GoalManager, "evaluate_after_turn", judge)
+
+    def run(message, **kwargs):
+        calls.append(message)
+        current = goals.GoalManager(key)
+        if case == "replacement":
+            current.set("replacement task")
+        elif case == "operator_pause":
+            assert current.pause("operator pause") is not None
+        elif case == "operator_resume":
+            # An operator's intervening active state must also lose the CAS,
+            # even though its identity/status still match the captured goal.
+            current.state.last_stop_reason = "operator resumed"
+            assert goals.save_goal(key, current.state)
+        if case in {"replacement", "operator_pause", "operator_resume"}:
+            expected[0] = goals.GoalManager(key).state.to_json()
+        if case == "persistence":
+            monkeypatch.setattr(goals, "save_goal", lambda *a, **k: False)
+        error = RuntimeError if case == "ordinary" else ContextDispatchError
+        raise error("CONTEXT_PREFLIGHT_EXHAUSTED")
+
+    agent = types.SimpleNamespace(session_id=key, run_conversation=run,
+                                  clear_interrupt=lambda: None)
+    session = _turn_session(agent, key)
+    server._run_prompt_submit("rid", "sid", session, "work")
+    state = goals.GoalManager(key).state
+    assert (state.to_json() if state else None) == expected[0]
+    assert calls == ["work"]
+    judge.assert_not_called()
+    completes = [p for event, _, p in turn_env if event == "message.complete"]
+    assert len(completes) == 1 and completes[0]["status"] == "error"
+    notices = [p["text"] for event, _, p in turn_env
+               if event == "status.update" and p.get("kind") == "goal"]
+    if case in {"replacement", "operator_pause", "operator_resume", "persistence"}:
+        assert len(notices) == 1
+        assert "Could not verify" in notices[0]
+    else:
+        assert notices == []
+    assert not any("Goal paused" in notice for notice in notices)
+
+
+def test_context_refusal_uses_canonical_profile_owner(
+    server, turn_env, monkeypatch, tmp_path
+):
+    from ares_runtime.continuity.runtime import ContextDispatchError
+    from hermes_cli.goals import GoalManager
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+
+    key = "canonical-profile-owner"
+    GoalManager(key).set("default profile task")
+    GoalManager("ui-sid").set("UI namesake task")
+    profile = tmp_path / "other-profile"
+    profile.mkdir()
+    # conftest pins SessionDB's default path for isolation; seed the profile
+    # cache with its own real DB so the two scopes cannot share that fixture DB.
+    from hermes_cli import goals
+    from hermes_state import SessionDB
+    monkeypatch.setitem(goals._DB_CACHE, str(profile), SessionDB(profile / "state.db"))
+    token = set_hermes_home_override(str(profile))
+    try:
+        GoalManager(key).set("profile task")
+    finally:
+        reset_hermes_home_override(token)
+
+    def run(*args, **kwargs):
+        raise ContextDispatchError("CONTEXT_PREFLIGHT_EXHAUSTED")
+
+    agent = types.SimpleNamespace(session_id="different-agent-id", run_conversation=run,
+                                  clear_interrupt=lambda: None)
+    session = _turn_session(agent, key)
+    session["profile_home"] = str(profile)
+    server._run_prompt_submit("rid", "ui-sid", session, "work")
+    assert GoalManager(key).state.status == "active"
+    assert GoalManager("ui-sid").state.status == "active"
+    token = set_hermes_home_override(str(profile))
+    try:
+        state = GoalManager(key).state
+        assert state.status == "paused" and state.goal == "profile task"
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_context_refusal_preserves_real_queued_input(server, turn_env, monkeypatch):
+    from ares_runtime.continuity.runtime import ContextDispatchError
+    from hermes_cli.goals import GoalManager
+
+    key = "refusal-queued-input"
+    GoalManager(key).set("task")
+    calls = []
+    def run(message, **kwargs):
+        calls.append(message)
+        if len(calls) == 1:
+            server._enqueue_prompt(session, "real input", None)
+            raise ContextDispatchError("CONTEXT_PREFLIGHT_EXHAUSTED")
+        return {"final_response": "handled input"}
+
+    agent = types.SimpleNamespace(session_id=key, run_conversation=run,
+                                  clear_interrupt=lambda: None)
+    session = _turn_session(agent, key)
+    monkeypatch.setitem(server._sessions, "sid", session)
+    server._run_prompt_submit("rid", "sid", session, "work")
+    assert calls == ["work", "real input"]
+    assert GoalManager(key).state.status == "paused"
 
 
 # ── command.dispatch /moa ────────────────────────────────────────────

@@ -815,10 +815,13 @@ def _probe_single_zai_endpoint(
     ``probe_models`` LIST and each model is tried in order until one
     succeeds (some plans only accept newer/older GLM slugs).
     """
+    from ares_runtime.physical_dispatch import unsupported_transport_scope
+    from hermes_cli.middleware import EgressDispatchDenied, EgressOutcomeUnrecorded
     ep_id, base_url, probe_models, label = endpoint
     for model in probe_models:
         try:
-            resp = httpx.post(
+            with unsupported_transport_scope('zai_setup_probe'):
+                resp = httpx.post(
                 f"{base_url}/chat/completions",
                 headers={
                     "Authorization": f"Bearer {api_key}",
@@ -841,6 +844,8 @@ def _probe_single_zai_endpoint(
                     "label": label,
                 }
             logger.debug("Z.AI endpoint probe: %s model=%s returned %s", ep_id, model, resp.status_code)
+        except (EgressDispatchDenied, EgressOutcomeUnrecorded):
+            raise
         except Exception as exc:
             logger.debug("Z.AI endpoint probe: %s model=%s failed: %s", ep_id, model, exc)
     return None
@@ -855,6 +860,7 @@ def detect_zai_endpoint(api_key: str, timeout: float = 8.0) -> Optional[Dict[str
     its endpoint's models in order and returns the first that succeeds.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
+    from hermes_cli.middleware import EgressDispatchDenied, EgressOutcomeUnrecorded
 
     # No `with` block: a context manager would join ALL probe threads on
     # exit, defeating the early return below. shutdown(wait=False) lets the
@@ -874,6 +880,8 @@ def detect_zai_endpoint(api_key: str, timeout: float = 8.0) -> Optional[Dict[str
                 result = future.result()
                 if result is not None:
                     results[ep_id] = result
+            except (EgressDispatchDenied, EgressOutcomeUnrecorded):
+                raise
             except Exception:
                 pass
             # Early exit in PRIORITY order: walk endpoints highest-priority
@@ -1952,6 +1960,8 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
     without the user's explicit choice.  See PR #4210 for the same
     pattern applied to the setup wizard gate.
     """
+    from agent.secret_scope import get_secret
+
     normalized = (provider_id or "").strip().lower()
 
     # 1. Check auth.json active_provider
@@ -2021,7 +2031,7 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
         for env_var in pconfig.api_key_env_vars:
             if env_var in _IMPLICIT_ENV_VARS:
                 continue
-            if has_usable_secret(os.getenv(env_var, "")):
+            if has_usable_secret(get_secret(env_var, "")):
                 return True
 
     # AWS SDK providers (Bedrock) have auth_type="aws_sdk" and empty
@@ -2033,11 +2043,11 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
     # Only check explicit env credentials here (NOT boto3's full chain):
     # ambient sources like EC2 IMDS / SSO profiles must not auto-surface.
     if pconfig and pconfig.auth_type == "aws_sdk":
-        if has_usable_secret(os.getenv("AWS_BEARER_TOKEN_BEDROCK", "")):
+        if has_usable_secret(get_secret("AWS_BEARER_TOKEN_BEDROCK", "")):
             return True
         if (
-            has_usable_secret(os.getenv("AWS_ACCESS_KEY_ID", ""))
-            and has_usable_secret(os.getenv("AWS_SECRET_ACCESS_KEY", ""))
+            has_usable_secret(get_secret("AWS_ACCESS_KEY_ID", ""))
+            and has_usable_secret(get_secret("AWS_SECRET_ACCESS_KEY", ""))
         ):
             return True
 
@@ -2057,7 +2067,7 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
                 # the user deletes the env var (#55790) — only count it when
                 # the referenced var still resolves to a usable secret NOW.
                 env_var = entry.get("source", "").split(":", 1)[1].strip()
-                if env_var and has_usable_secret(os.getenv(env_var, "")):
+                if env_var and has_usable_secret(get_secret(env_var, "")):
                     return True
                 continue
             if (

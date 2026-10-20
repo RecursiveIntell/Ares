@@ -55,6 +55,10 @@ def _tool_call(call_id: str, arguments: str):
         pytest.param("[]", id="list"),
         pytest.param("", id="empty"),
         pytest.param('{"query": "cut off', id="truncated"),
+        pytest.param('{"query":"first","query":"second"}', id="duplicate-key"),
+        pytest.param(r'{"query":"first","\u0071uery":"second"}', id="escaped-shadow-key"),
+        pytest.param('{"nested":{"x":1,"x":2}}', id="nested-duplicate-key"),
+        pytest.param('{"items":[{"x":1,"x":2}]}', id="array-object-duplicate-key"),
     ],
 )
 def test_malformed_arguments_are_rejected_without_blocking_valid_sibling(

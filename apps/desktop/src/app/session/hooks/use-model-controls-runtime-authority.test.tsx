@@ -4,15 +4,23 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { PRIMARY_SESSION_VIEW } from '@/app/chat/session-view'
 import { createClientSessionState } from '@/lib/chat-runtime'
+import { _resetComposerModelSelectionsForTests } from '@/store/session'
 import {
   $activeSessionId,
   $currentModel,
   $currentProvider,
   $selectedStoredSessionId,
+  getCurrentModelSource,
   setCurrentModel,
+  setCurrentModelSource,
   setCurrentProvider
 } from '@/store/session'
-import { $sessionStates, publishSessionState, type SessionTileDelegate, setSessionTileDelegate } from '@/store/session-states'
+import {
+  $sessionStates,
+  publishSessionState,
+  type SessionTileDelegate,
+  setSessionTileDelegate
+} from '@/store/session-states'
 
 import { useModelControls } from './use-model-controls'
 
@@ -57,6 +65,7 @@ function installSessionStateDelegate() {
 
 describe('useModelControls runtime authority', () => {
   beforeEach(() => {
+    _resetComposerModelSelectionsForTests()
     $sessionStates.set({})
     $activeSessionId.set(PRIMARY_RUNTIME_ID)
     $selectedStoredSessionId.set(PRIMARY_STORED_ID)
@@ -110,4 +119,186 @@ describe('useModelControls runtime authority', () => {
     expect(PRIMARY_SESSION_VIEW.$provider.get()).toBe('provider-a')
     expect($sessionStates.get()[PRIMARY_RUNTIME_ID]).toMatchObject({ model: 'model-a', provider: 'provider-a' })
   })
+
+  it.each([
+    { label: 'older rejection first', order: [0, 1] },
+    { label: 'newer rejection first', order: [1, 0] }
+  ])('restores the last confirmed owner after two overlapping model picks both reject ($label)', async ({ order }) => {
+    setCurrentModelSource('default')
+
+    const rejectRequests: Array<(reason: Error) => void> = []
+
+    const requestGateway = vi.fn(
+      () =>
+        new Promise<never>((_resolve, reject) => {
+          rejectRequests.push(reject)
+        })
+    )
+
+    const { result } = renderHook(() => useModelControls({ queryClient: new QueryClient(), requestGateway }))
+
+    const first = result.current.selectModel({ model: 'model-b', provider: 'provider-b' })
+    const second = result.current.selectModel({ model: 'model-c', provider: 'provider-c' })
+    expect(rejectRequests).toHaveLength(2)
+    expect(PRIMARY_SESSION_VIEW.$model.get()).toBe('model-c')
+
+    const picks = [first, second]
+
+    for (const index of order) {
+      rejectRequests[index](new Error(`${index === 0 ? 'B' : 'C'} rejected`))
+      await expect(picks[index]).resolves.toBe(false)
+    }
+
+    expect(PRIMARY_SESSION_VIEW.$model.get()).toBe('model-a')
+    expect(PRIMARY_SESSION_VIEW.$provider.get()).toBe('provider-a')
+    expect($sessionStates.get()[PRIMARY_RUNTIME_ID]).toMatchObject({
+      model: 'model-a',
+      provider: 'provider-a',
+      pendingModelSelection: null
+    })
+    expect($currentModel.get()).toBe('model-a')
+    expect($currentProvider.get()).toBe('provider-a')
+    expect(getCurrentModelSource()).toBe('default')
+  })
+
+  it.each([
+    { label: 'before', ackFirst: true },
+    { label: 'after', ackFirst: false }
+  ])('retains an acknowledged earlier pick when it settles $label the later rejection', async ({ ackFirst }) => {
+    const requests: Array<{
+      reject: (reason: Error) => void
+      resolve: (value: unknown) => void
+    }> = []
+
+    const requestGateway = vi.fn(
+      () =>
+        new Promise<never>((resolve, reject) => {
+          requests.push({ reject, resolve: value => resolve(value as never) })
+        })
+    )
+
+    const { result } = renderHook(() => useModelControls({ queryClient: new QueryClient(), requestGateway }))
+
+    const first = result.current.selectModel({ model: 'model-b', provider: 'provider-b' })
+    const second = result.current.selectModel({ model: 'model-c', provider: 'provider-c' })
+
+    if (ackFirst) {
+      requests[0].resolve({ key: 'model', scope: 'session', value: 'model-b' })
+      await expect(first).resolves.toBe(true)
+      requests[1].reject(new Error('C rejected'))
+      await expect(second).resolves.toBe(false)
+    } else {
+      requests[1].reject(new Error('C rejected'))
+      await expect(second).resolves.toBe(false)
+      requests[0].resolve({ key: 'model', scope: 'session', value: 'model-b' })
+      await expect(first).resolves.toBe(true)
+    }
+
+    expect(PRIMARY_SESSION_VIEW.$model.get()).toBe('model-b')
+    expect(PRIMARY_SESSION_VIEW.$provider.get()).toBe('provider-b')
+    expect($sessionStates.get()[PRIMARY_RUNTIME_ID]).toMatchObject({
+      model: 'model-b',
+      provider: 'provider-b',
+      pendingModelSelection: null
+    })
+    expect($currentModel.get()).toBe('model-b')
+    expect($currentProvider.get()).toBe('provider-b')
+  })
+
+  it('does not let an older acknowledgement repaint a newer successful choice', async () => {
+    const requests: Array<(value: unknown) => void> = []
+
+    const requestGateway = vi.fn(
+      () =>
+        new Promise<never>(resolve => {
+          requests.push(value => resolve(value as never))
+        })
+    )
+
+    const { result } = renderHook(() => useModelControls({ queryClient: new QueryClient(), requestGateway }))
+
+    const first = result.current.selectModel({ model: 'model-b', provider: 'provider-b' })
+    const second = result.current.selectModel({ model: 'model-c', provider: 'provider-c' })
+
+    requests[1]({ key: 'model', scope: 'session', value: 'model-c' })
+    await expect(second).resolves.toBe(true)
+    requests[0]({ key: 'model', scope: 'session', value: 'model-b' })
+    await expect(first).resolves.toBe(true)
+
+    expect(PRIMARY_SESSION_VIEW.$model.get()).toBe('model-c')
+    expect(PRIMARY_SESSION_VIEW.$provider.get()).toBe('provider-c')
+    expect($currentModel.get()).toBe('model-c')
+    expect($currentProvider.get()).toBe('provider-c')
+  })
+
+  it('settles only its own confirmed model intent when an ACK snapshot has a foreign epoch', async () => {
+    const current = $sessionStates.get()[PRIMARY_RUNTIME_ID]
+    publishSessionState(PRIMARY_RUNTIME_ID, {
+      ...current,
+      selectorObservation: {
+        version: { epoch: 'owner-a', revision: 7 },
+        values: { model: 'model-a', provider: 'provider-a' }
+      }
+    })
+
+    const requestGateway = vi.fn(
+      async () =>
+        ({
+          key: 'model',
+          scope: 'session',
+          value: 'model-b',
+          selector_info: {
+            model: 'model-b',
+            provider: 'provider-b',
+            selector_version: { epoch: 'replacement-owner', revision: 1 }
+          }
+        }) as never
+    )
+
+    const { result } = renderHook(() => useModelControls({ queryClient: new QueryClient(), requestGateway }))
+
+    await expect(result.current.selectModel({ model: 'model-b', provider: 'provider-b' })).resolves.toBe(true)
+
+    expect($sessionStates.get()[PRIMARY_RUNTIME_ID]).toMatchObject({
+      model: 'model-b',
+      provider: 'provider-b',
+      pendingModelSelection: null,
+      selectorObservation: { version: { epoch: 'owner-a', revision: 7 } }
+    })
+  })
+
+  it.each(['openrouter', 'anthropic', 'openai-codex', 'moa', 'ollama-cloud', 'ollama-launch', 'custom:target', 'auto'])(
+    'preserves A→B→A intent when older selector replies arrive last (%s)',
+    async provider => {
+      const replies: Array<(value: unknown) => void> = []
+
+      const requestGateway = vi.fn(
+        (_method: string, _params?: Record<string, unknown>) =>
+          new Promise<never>(resolve => {
+            replies.push(value => resolve(value as never))
+          })
+      )
+
+      const { result } = renderHook(() => useModelControls({ queryClient: new QueryClient(), requestGateway }))
+
+      const choices = [
+        result.current.selectModel({ provider, model: 'model-a' }),
+        result.current.selectModel({ provider: 'openrouter', model: 'model-b' }),
+        result.current.selectModel({ provider, model: 'model-a' })
+      ]
+
+      for (const index of [2, 1, 0]) {
+        replies[index]({ key: 'model', scope: 'session', value: index === 1 ? 'model-b' : 'model-a' })
+        await expect(choices[index]).resolves.toBe(true)
+        expect(PRIMARY_SESSION_VIEW.$model.get()).toBe('model-a')
+        expect(PRIMARY_SESSION_VIEW.$provider.get()).toBe(provider)
+      }
+
+      expect(requestGateway.mock.calls.map(([, params]) => params)).toEqual([
+        expect.objectContaining({ value: `model-a --provider ${provider} --session`, session_id: PRIMARY_RUNTIME_ID }),
+        expect.objectContaining({ value: 'model-b --provider openrouter --session', session_id: PRIMARY_RUNTIME_ID }),
+        expect.objectContaining({ value: `model-a --provider ${provider} --session`, session_id: PRIMARY_RUNTIME_ID })
+      ])
+    }
+  )
 })

@@ -42,6 +42,7 @@ export function createClientSessionState(
     adoptedRunningTurn: false,
     pendingBranchGroup: null,
     interrupted: false,
+    interruptPending: false,
     interimBoundaryPending: false,
     needsInput: false,
     turnStartedAt: null,

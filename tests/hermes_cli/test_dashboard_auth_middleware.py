@@ -177,8 +177,11 @@ def test_gated_require_token_endpoint_accepts_cookie_session(gated_app):
     coupling to the validation message.
     """
     _complete_stub_login(gated_app)
+    # Cookie-authenticated browser calls must carry the request's exact origin
+    # (P2 possession hardening). TestClient's base URL is http://testserver.
     r = gated_app.post(
         "/api/dashboard/agent-plugins/install",
+        headers={"origin": "https://fly-app.fly.dev"},
         json={"identifier": "definitely not a valid identifier",
               "force": False, "enable": False},
     )
@@ -191,6 +194,13 @@ def test_gated_require_token_endpoint_accepts_cookie_session(gated_app):
         f"Expected the install handler's 400 (bad identifier), got "
         f"{r.status_code}: {r.text}"
     )
+    # The hardening that made the explicit origin necessary above: a cookie
+    # session WITHOUT the exact origin is refused before any handler runs.
+    denied = gated_app.post(
+        "/api/dashboard/agent-plugins/install",
+        json={"identifier": "x", "force": False, "enable": False},
+    )
+    assert denied.status_code == 403, denied.text
 
 
 # A representative spread of the OTHER ``_require_token`` endpoints (there are

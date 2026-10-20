@@ -1,0 +1,86 @@
+   Compiling cfg-if v1.0.4
+   Compiling version_check v0.9.5
+   Compiling libc v0.2.186
+   Compiling typenum v1.20.1
+   Compiling find-msvc-tools v0.1.9
+   Compiling shlex v2.0.1
+   Compiling pkg-config v0.3.33
+   Compiling proc-macro2 v1.0.106
+   Compiling zerocopy v0.8.54
+   Compiling unicode-ident v1.0.24
+   Compiling generic-array v0.14.7
+   Compiling quote v1.0.46
+   Compiling serde_core v1.0.228
+   Compiling subtle v2.6.1
+   Compiling ahash v0.8.12
+   Compiling once_cell v1.21.4
+   Compiling cpufeatures v0.2.17
+   Compiling vcpkg v0.2.15
+   Compiling autocfg v1.5.1
+   Compiling getrandom v0.4.3
+   Compiling syn v2.0.118
+   Compiling getrandom v0.2.17
+   Compiling jobserver v0.1.35
+   Compiling zmij v1.0.21
+   Compiling num-traits v0.2.19
+   Compiling rand_core v0.6.4
+   Compiling zstd-safe v7.3.0
+   Compiling opaque-debug v0.3.1
+   Compiling cc v1.2.65
+   Compiling serde_json v1.0.150
+   Compiling serde v1.0.228
+   Compiling bitflags v2.13.0
+   Compiling crypto-common v0.1.7
+   Compiling inout v0.1.4
+   Compiling block-buffer v0.10.4
+   Compiling cipher v0.4.4
+   Compiling universal-hash v0.5.1
+   Compiling digest v0.10.7
+   Compiling polyval v0.6.2
+   Compiling memchr v2.8.2
+   Compiling thiserror v2.0.18
+   Compiling itoa v1.0.18
+   Compiling ghash v0.5.1
+   Compiling aes v0.8.4
+   Compiling ctr v0.9.2
+   Compiling aead v0.5.2
+   Compiling fallible-iterator v0.3.0
+   Compiling smallvec v1.15.2
+   Compiling arrayvec v0.7.7
+   Compiling serde_derive v1.0.228
+   Compiling thiserror-impl v2.0.18
+   Compiling rustix v1.1.4
+   Compiling cpufeatures v0.3.0
+   Compiling arrayref v0.3.9
+   Compiling iana-time-zone v0.1.65
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling constant_time_eq v0.4.2
+   Compiling uuid v1.23.4
+   Compiling aes-gcm v0.10.3
+   Compiling zstd-sys v2.1.0+zstd.1.5.7
+   Compiling libsqlite3-sys v0.30.1
+   Compiling ppv-lite86 v0.2.21
+   Compiling hashbrown v0.14.5
+   Compiling blake3 v1.8.5
+   Compiling rand_chacha v0.3.1
+   Compiling hmac v0.12.1
+   Compiling rand v0.8.7
+   Compiling hashlink v0.9.1
+   Compiling sha2 v0.10.9
+   Compiling linux-raw-sys v0.12.1
+   Compiling hex v0.4.3
+   Compiling fastrand v2.4.1
+   Compiling chrono v0.4.45
+   Compiling tempfile v3.27.0
+   Compiling zstd v0.13.3
+   Compiling rusqlite v0.32.1
+   Compiling context-governor v0.2.0 (/workspace/scratch/bfe02ea97bc3/Libraries/context-governor)
+    Finished `release` profile [optimized] target(s) in 1m 03s
+     Running tests/lineage.rs (context-governor/target/release/deps/lineage-4949a1ab663b6f30)
+
+running 1 test
+LINEAGE_GROWTH_CERTIFICATION_METRICS {"projection_source_id_limit":4,"samples":[{"compaction_micros":0,"covered_original_sources":4,"cumulative_receipt_bytes":225820,"exact_expand_micros":941,"generation":1,"input_tokens":13180,"net_saved_tokens":13043,"output_tokens":137,"prompt_provenance_bytes":280,"provenance_bytes":2392,"receipt_bytes":225820,"restart_load_micros":1264},{"compaction_micros":23283,"covered_original_sources":7,"cumulative_receipt_bytes":471337,"exact_expand_micros":1550,"generation":2,"input_tokens":14054,"net_saved_tokens":13820,"output_tokens":234,"prompt_provenance_bytes":352,"provenance_bytes":4185,"receipt_bytes":245517,"restart_load_micros":2464},{"compaction_micros":45852,"covered_original_sources":13,"cumulative_receipt_bytes":974829,"exact_expand_micros":3242,"generation":4,"input_tokens":14246,"net_saved_tokens":13822,"output_tokens":424,"prompt_provenance_bytes":352,"provenance_bytes":7771,"receipt_bytes":253907,"restart_load_micros":4748},{"compaction_micros":90122,"covered_original_sources":25,"cumulative_receipt_bytes":2032167,"exact_expand_micros":7627,"generation":8,"input_tokens":14626,"net_saved_tokens":13822,"output_tokens":804,"prompt_provenance_bytes":352,"provenance_bytes":14949,"receipt_bytes":270699,"restart_load_micros":10462},{"compaction_micros":237074,"covered_original_sources":49,"cumulative_receipt_bytes":4348590,"exact_expand_micros":20134,"generation":16,"input_tokens":15387,"net_saved_tokens":13823,"output_tokens":1564,"prompt_provenance_bytes":352,"provenance_bytes":29338,"receipt_bytes":304323,"restart_load_micros":24875},{"compaction_micros":579700,"covered_original_sources":97,"cumulative_receipt_bytes":9787886,"exact_expand_micros":55171,"generation":32,"input_tokens":16907,"net_saved_tokens":13823,"output_tokens":3084,"prompt_provenance_bytes":352,"provenance_bytes":58122,"receipt_bytes":371523,"restart_load_micros":85193}],"schema":"ContextGovernorLineageGrowthMetricsV2"}
+test certified_growth_measurement_through_generation_thirty_two ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 37 filtered out; finished in 8.53s
+

@@ -779,7 +779,7 @@ class SessionPortabilityMixin:
                         clean[key] = self._reasoning_json_value(clean.get(key))
                     sanitized_messages.append(clean)
 
-                total_messages, total_tool_calls = self._insert_message_rows(
+                total_messages, total_tool_calls, _row_ids = self._insert_message_rows(
                     conn,
                     session_id,
                     sanitized_messages,

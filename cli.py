@@ -4998,6 +4998,25 @@ class _VoiceInputMessage:
         return self.text
 
 
+class _SyntheticInputMessage:
+    """Durably typed application-authored user-role turn queued by the CLI."""
+
+    __slots__ = ("text", "display_kind", "display_metadata")
+
+    def __init__(
+        self,
+        text: str,
+        display_kind: str = "internal_notification",
+        display_metadata: Optional[dict] = None,
+    ):
+        self.text = text
+        self.display_kind = display_kind
+        self.display_metadata = dict(display_metadata or {})
+
+    def __str__(self) -> str:
+        return self.text
+
+
 class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     """
     Interactive CLI for the Hermes Agent.
@@ -7758,6 +7777,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if text is None:
             self._flush_stream()
             self._reset_stream_state()
+            getattr(self, "_turn_streamed_segments", []).append("")
             return
         if not text:
             return
@@ -7931,6 +7951,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             fill = w - 2 - HermesCLI._status_bar_display_width(label)
             _cprint(f"\n{_ACCENT}╭─{label}{'─' * max(fill - 1, 0)}╮{_RST}")
 
+        # Keep delivery evidence across tool boundaries; opening a box alone
+        # does not prove that the result's eventual partial draft was shown.
+        segments = getattr(self, "_turn_streamed_segments", None)
+        if segments is not None:
+            if not segments:
+                segments.append("")
+            segments[-1] += text
         self._stream_buf += text
 
         # Emit complete lines, keep partial remainder in buffer
@@ -12790,6 +12817,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._goal_manager = mgr
         return mgr
 
+    def _queue_internal_input(
+        self,
+        text: str,
+        *,
+        source: str,
+        display_kind: str = "internal_notification",
+    ) -> None:
+        """Queue one application-authored turn without granting user authority."""
+        self._pending_input.put(
+            _SyntheticInputMessage(
+                text,
+                display_kind=display_kind,
+                display_metadata={"synthetic_source": source},
+            )
+        )
+
     def _get_heartbeat_manager(self):
         """Return the HeartbeatManager bound to the current session_id.
 
@@ -12848,7 +12891,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             continue
                         prompt = mgr.due_prompt()
                         if prompt:
-                            self._pending_input.put(prompt)
+                            self._queue_internal_input(prompt, source="heartbeat")
                     except Exception as exc:
                         logging.debug("heartbeat watchdog tick failed: %s", exc)
             finally:
@@ -12923,7 +12966,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             state = mgr.state
             tick_no = state.ticks_fired if state else "?"
             _cprint(f"  {_DIM}↻ /loop wakeup #{tick_no} firing…{_RST}")
-            self._pending_input.put(wakeup)
+            self._queue_internal_input(wakeup, source="loop")
         except Exception as exc:
             logging.debug("loop tick injection failed: %s", exc)
             try:
@@ -13047,7 +13090,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             claim = claim_event_delivery(event, consumer)
             if claim is None:
                 continue
-            self._pending_input.put(synthetic_message)
+            self._queue_internal_input(
+                synthetic_message,
+                source="async_delegation_complete",
+                display_kind="async_delegation_complete",
+            )
             complete_event_delivery(event, claim)
 
     def _drain_interrupt_queue_to_pending_input(self) -> None:
@@ -13204,7 +13251,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     _cprint(f"  {_DIM}⚠ Continuation already claimed by another worker; checkpoint retained.{_RST}")
                     return
                 try:
-                    self._pending_input.put(prompt)
+                    self._queue_internal_input(prompt, source="goal_continuation")
                     mgr.release_continuation(queued=True)
                 except Exception as exc:
                     mgr.release_continuation(queued=False)
@@ -14445,6 +14492,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         stacked line to scrollback on tool.completed so users can see the
         full history of tool calls (not just the current one in the spinner).
         """
+        # Native tool events do not send the default runtime's delta(None).
+        # Close the preceding text segment at this real semantic boundary.
+        segments = getattr(self, "_turn_streamed_segments", None)
+        if event_type == "tool.started" and segments and segments[-1]:
+            self._stream_delta(None)
         # MoA reference-model outputs: render each reference's answer as a
         # labelled thinking-style block BEFORE the aggregator acts, so the user
         # sees the mixture-of-agents process instead of a silent pause. These
@@ -16326,7 +16378,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception:
                 pass
 
-    def chat(self, message, images: list = None, voice_input: bool = False) -> Optional[str]:
+    def chat(
+        self,
+        message,
+        images: list = None,
+        voice_input: bool = False,
+        *,
+        persist_user_display_kind: Optional[str] = None,
+        persist_user_display_metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
         """
         Send a message to the agent and get a response.
         
@@ -16497,6 +16557,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             staged_user_message = stamp_message_timestamp(
                 {"role": "user", "content": message}
             )
+            if persist_user_display_kind:
+                staged_user_message["display_kind"] = persist_user_display_kind
+                if persist_user_display_metadata:
+                    staged_user_message["display_metadata"] = dict(
+                        persist_user_display_metadata
+                    )
             agent._pending_cli_user_message = staged_user_message
             self.conversation_history.append(staged_user_message)
 
@@ -16515,6 +16581,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
             # Reset streaming display state for this turn
             self._reset_stream_state()
+            self._turn_streamed_segments = [""]
             # Separate from _reset_stream_state because this must persist
             # across intermediate turn boundaries (tool-calling loops) — only
             # reset at the start of each user turn.
@@ -16537,6 +16604,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # chunks as they arrive, everything else synthesizes per sentence.
             use_streaming_tts = False
             _streaming_box_opened = False
+            _tts_displayed_text = ""
+            _tts_displayed_sentences = []
             _thinking_started = False
             text_queue = None
             tts_thread = None
@@ -16570,7 +16639,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 if not self.streaming_enabled:
                     def display_callback(sentence: str):
                         """Called by TTS consumer when a sentence is ready to display + speak."""
-                        nonlocal _streaming_box_opened
+                        nonlocal _streaming_box_opened, _tts_displayed_text
                         if not _streaming_box_opened:
                             _streaming_box_opened = True
                             w = self._scrollback_box_width(getattr(self.console, "width", 80))
@@ -16580,6 +16649,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             fill = w - 2 - HermesCLI._status_bar_display_width(label)
                             _cprint(f"\n{_ACCENT}╭─{label}{'─' * max(fill - 1, 0)}╮{_RST}")
                         _cprint(f"{_STREAM_PAD}{sentence.rstrip()}")
+                        _tts_displayed_text += sentence
+                        _tts_displayed_sentences.append(sentence)
                     _tts_display_cb = display_callback
 
                 tts_thread = threading.Thread(
@@ -16687,6 +16758,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         stream_callback=stream_callback,
                         task_id=self.session_id,
                         persist_user_message=_persist_clean_user_message,
+                        persist_user_display_kind=persist_user_display_kind,
+                        persist_user_display_metadata=persist_user_display_metadata,
                         moa_config=_moa_cfg,
                     )
                     if getattr(self, "_pending_moa_disable_after_turn", False):
@@ -16913,6 +16986,33 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
             # Get the final response
             response = result.get("final_response", "") if result else ""
+            # Native incomplete turns keep their draft separate from final_response.
+            # Project it for display without changing the completion contract.
+            _partial_draft = result.get("partial_response", "") if result and not response else ""
+            _partial_notice = ""
+            if _partial_draft:
+                _partial_notice = f"[Partial response — {result.get('error') or 'processing incomplete'}]"
+                response = f"{_partial_draft}\n\n{_partial_notice}"
+            _partial_remaining = _partial_draft
+            if _partial_draft:
+                # TTS can display queued commentary after a tool callback.
+                # Correlate only at its actual sentence-display boundaries,
+                # after joining the consumer, rather than resetting its
+                # delivery evidence from the producer thread.
+                _tts_tails = [
+                    "".join(_tts_displayed_sentences[index:])
+                    for index in range(len(_tts_displayed_sentences))
+                ]
+                for displayed in self._turn_streamed_segments + [_tts_displayed_text] + _tts_tails:
+                    if not displayed:
+                        continue
+                    if displayed.endswith(_partial_draft):
+                        _partial_remaining = ""
+                        break
+                    if _partial_draft.startswith(displayed):
+                        suffix = _partial_draft[len(displayed):]
+                        if len(suffix) < len(_partial_remaining):
+                            _partial_remaining = suffix
 
             # Session titling now runs at TURN START (agent/turn_context.py)
             # from the user's message alone, so it is already done — or in
@@ -17016,7 +17116,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
                 is_error_response = result and (result.get("failed") or result.get("partial"))
                 already_streamed = self._stream_started and self._stream_box_opened and not is_error_response
-                if use_streaming_tts and _streaming_box_opened and not is_error_response:
+                if _partial_draft and _partial_remaining != _partial_draft:
+                    # Display only the draft suffix proven missing from the
+                    # actual text, then label the incomplete outcome once.
+                    if use_streaming_tts and _streaming_box_opened and not self._stream_box_opened:
+                        w = self._scrollback_box_width()
+                        _cprint(f"\n{_ACCENT}╰{'─' * (w - 2)}╯{_RST}")
+                    if _partial_remaining:
+                        _cprint(_partial_remaining)
+                    _cprint(f"\n{_DIM}{_partial_notice}{_RST}")
+                elif use_streaming_tts and _streaming_box_opened and not is_error_response:
                     # Text was already printed sentence-by-sentence; just close the box
                     w = self._scrollback_box_width()
                     _cprint(f"\n{_ACCENT}╰{'─' * (w - 2)}╯{_RST}")
@@ -20429,6 +20538,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                                 pass
                         continue
 
+                    # Queue entries distinguish authentic user input from
+                    # application-authored continuation/wakeup turns before
+                    # any string transforms erase their origin.
+                    synthetic_kind = None
+                    synthetic_metadata = None
+                    if isinstance(user_input, _SyntheticInputMessage):
+                        synthetic_kind = user_input.display_kind
+                        synthetic_metadata = dict(user_input.display_metadata)
+                        user_input = user_input.text
+
                     # Voice-transcribed messages arrive wrapped in a sentinel
                     # so only genuine STT output gets the voice prefix (#65827).
                     is_voice_input = isinstance(user_input, _VoiceInputMessage)
@@ -20549,7 +20668,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     app.invalidate()  # Refresh status line
 
                     try:
-                        self.chat(user_input, images=submit_images or None, voice_input=is_voice_input)
+                        self.chat(
+                            user_input,
+                            images=submit_images or None,
+                            voice_input=is_voice_input,
+                            persist_user_display_kind=synthetic_kind,
+                            persist_user_display_metadata=synthetic_metadata,
+                        )
                     finally:
                         self._agent_running = False
                         self._spinner_text = ""
@@ -21629,6 +21754,9 @@ def main(
                         ):
                             cli.session_id = cli.agent.session_id
                         response = result.get("final_response", "") if isinstance(result, dict) else str(result)
+                        if isinstance(result, dict) and not response and result.get("partial_response"):
+                            print(result["partial_response"])
+                            print(f"Partial response: {result.get('error') or 'processing incomplete'}", file=sys.stderr)
                         # Surface backend errors that produced no visible output
                         # (e.g. invalid model slug → provider 4xx). Mirrors the
                         # interactive CLI path. Write to stderr so piped stdout
@@ -21636,6 +21764,7 @@ def main(
                         if (
                             not response
                             and isinstance(result, dict)
+                            and not result.get("partial_response")
                             and result.get("error")
                             and (result.get("failed") or result.get("partial"))
                         ):
@@ -21672,7 +21801,10 @@ def main(
                         # permanently block the card. Non-kanban runs keep the
                         # plain 0/1 contract automation wrappers expect.
                         _exit_code = 0
-                        if isinstance(result, dict) and result.get("failed"):
+                        if isinstance(result, dict) and (
+                            result.get("failed") or result.get("partial")
+                            or result.get("completed") is False or result.get("interrupted")
+                        ):
                             _exit_code = 1
                             if os.environ.get("HERMES_KANBAN_TASK") and result.get(
                                 "failure_reason"

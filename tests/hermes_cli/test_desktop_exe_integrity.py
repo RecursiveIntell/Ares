@@ -287,7 +287,7 @@ def test_build_only_fails_when_pack_produces_corrupt_exe(tmp_path, monkeypatch, 
     root = tmp_path / "hermes-agent"
     desktop_dir = root / "apps" / "desktop"
     desktop_dir.mkdir(parents=True)
-    (desktop_dir / "package.json").write_text("{}", encoding="utf-8")
+    (desktop_dir / "package.json").write_text('{"productName": "Hermes"}', encoding="utf-8")
     monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
 
     exe = desktop_dir / "release" / "win-unpacked" / "Hermes.exe"

@@ -76,6 +76,8 @@ def build_write_denied_prefixes(home: str) -> list[str]:
     return [
         os.path.realpath(p) + os.sep
         for p in [
+            str(_hermes_home_path() / "context-controller-keys"),
+            str(_hermes_root_path() / "context-controller-keys"),
             os.path.join(home, ".ssh"),
             os.path.join(home, ".aws"),
             os.path.join(home, ".gnupg"),
@@ -133,6 +135,8 @@ def _classify_write_denial(path: str) -> Optional[str]:
     """Return ``'credential'``, ``'safe_root'``, or ``None`` if writes are allowed."""
     home = os.path.realpath(os.path.expanduser("~"))
     resolved = os.path.realpath(os.path.expanduser(str(path)))
+    if "context-controller-keys" in Path(resolved).parts:
+        return "credential"
 
     # Approval-gated paths (e.g. ~/.ssh/config) are NOT hard-denied here:
     # they are allowed at this layer so the interactive file tools can run
@@ -290,6 +294,9 @@ def get_read_block_error(path: str) -> Optional[str]:
     terminal cwd differs from the process cwd.
     """
     resolved = Path(path).expanduser().resolve()
+
+    if "context-controller-keys" in resolved.parts:
+        return f"Access denied: {path} is a private context controller credential."
 
     # Resolve BOTH the active HERMES_HOME (profile-aware) AND the global
     # Hermes root so credential stores at <root>/auth.json etc. are also

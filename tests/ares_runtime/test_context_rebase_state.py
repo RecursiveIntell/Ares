@@ -1,0 +1,631 @@
+import hashlib
+import json
+
+import pytest
+
+from hermes_state import SessionDB
+from hermes_state_continuity import ContextContinuationError
+from hermes_state_runs import RunCheckpoint, RunCustodyError
+from plugins.context_engine._context_governor import ContextGovernorEngine
+
+
+def _sha(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _messages(label="next"):
+    return [
+        {"role": "assistant", "content": f"continuation brief {label}", "display_kind": "hidden"},
+        {"role": "user", "content": "continue the exact task"},
+    ]
+
+
+@pytest.fixture
+def db(tmp_path):
+    value = SessionDB(db_path=tmp_path / "state.db")
+    value.create_session("s0", source="cli", profile_name="p1", model="test")
+    value.append_message("s0", "user", "original task")
+    assert value.try_acquire_session_turn_lease("s0", "holder", ttl_seconds=300)
+    yield value
+    value.close()
+
+
+def _publish(db, *, transition="tx1", parent="s0", child="s1", digest=None, watermark=None, custody=()):
+    if watermark is None:
+        watermark = db.get_active_message_watermark(parent)
+    prior = db.read_context_rebase_transition(transition)
+    if prior is None:
+        snapshot = db.read_context_rebase_snapshot(parent)
+        snapshot_digest, control_revision = snapshot.digest, snapshot.control_revision
+    else:
+        config = json.loads(db.get_session(prior.child_session_id)["model_config"])
+        snapshot_digest = config["_context_rebase_snapshot_digest"]
+        control_revision = prior.control_revision
+    return db.publish_context_rebase_child(
+        transition_id=transition,
+        parent_session_id=parent,
+        child_session_id=child,
+        continuation_digest=digest or ("sha256:" + "a" * 64),
+        expected_snapshot_digest=snapshot_digest,
+        control_revision=control_revision,
+        input_watermark=watermark,
+        turn_lease_holder="holder",
+        source="cli",
+        messages=_messages(child),
+        model="test",
+        model_config={"temperature": 0},
+        system_prompt="trusted base prompt",
+        profile_name="p1",
+        custody_transfers=custody,
+    )
+
+
+def _ready(db, transition_id, **kwargs):
+    transition = db.read_context_rebase_transition(transition_id)
+    if transition.state != "ready":
+        recovery = db.begin_context_rebase_recovery(transition_id, turn_lease_holder="holder")
+    else:
+        recovery = json.loads(db.get_meta("context-rebase-recovery:" + transition_id))
+    kwargs.update(turn_lease_holder="holder", recovery_attempt=recovery["attempts"],
+                  expected_control_digest=recovery["action_control_digest"],
+                  expected_custody=tuple(db.list_run_custody_for_session(transition.child_session_id)))
+    return db.mark_context_rebase_ready(transition_id, **kwargs)
+
+
+def test_atomic_publication_creates_complete_pending_child_and_closes_parent(db):
+    transition = _publish(db)
+    assert transition.state == "committed_pending_activation"
+    assert transition.context_epoch == 1
+    parent = db.get_session("s0")
+    child = db.get_session("s1")
+    assert parent["end_reason"] == "context_rebase"
+    assert child["ended_at"] is None
+    assert child["parent_session_id"] == "s0"
+    config = json.loads(child["model_config"])
+    assert config["_context_rebase_from"] == "s0"
+    assert config["_context_rebase_transition"] == "tx1"
+    assert config["_context_epoch"] == 1
+    assert [row["content"] for row in db.get_messages_as_conversation("s1")] == [
+        "continuation brief s1", "continue the exact task"
+    ]
+    assert db.read_context_rebase_transition("tx1") == transition
+
+
+def test_stale_watermark_fails_without_closing_parent_or_creating_child(db):
+    watermark = db.get_active_message_watermark("s0")
+    db.append_message("s0", "assistant", "new durable state")
+    with pytest.raises(ContextContinuationError, match="CONTEXT_REBASE_STALE_INPUT"):
+        _publish(db, watermark=watermark)
+    assert db.get_session("s0")["ended_at"] is None
+    assert db.get_session("s1") is None
+    assert db.read_context_rebase_transition("tx1") is None
+
+
+def test_turn_lease_holder_is_required_and_must_match(db):
+    watermark = db.get_active_message_watermark("s0")
+    with pytest.raises(ContextContinuationError, match="TURN_LEASE_MISMATCH"):
+        db.publish_context_rebase_child(
+            transition_id="tx1", parent_session_id="s0", child_session_id="s1",
+            continuation_digest="sha256:" + "a" * 64, control_revision=7,
+            expected_snapshot_digest=db.read_context_rebase_snapshot("s0").digest,
+            input_watermark=watermark, turn_lease_holder="other", source="cli",
+            messages=_messages(), model="test", profile_name="p1",
+        )
+    assert db.get_session("s0")["ended_at"] is None
+
+
+def test_retry_same_transition_is_idempotent_but_changed_binding_refuses(db):
+    first = _publish(db)
+    second = _publish(db)
+    assert second == first
+    assert db.message_count("s1") == 2
+    with pytest.raises(ContextContinuationError, match="CONTEXT_REBASE_IDEMPOTENCY_MISMATCH"):
+        _publish(db, digest="sha256:" + "b" * 64)
+    assert db.message_count("s1") == 2
+
+
+def test_ready_requires_exact_child_and_continuation(db):
+    _publish(db)
+    with pytest.raises(ContextContinuationError, match="CONTEXT_REBASE_READY_BINDING_MISMATCH"):
+        _ready(db, "tx1", expected_continuation_digest="sha256:" + "b" * 64,
+                                     expected_child_session_id="s1")
+    ready = _ready(db, "tx1", expected_continuation_digest="sha256:" + "a" * 64,
+                                         expected_child_session_id="s1")
+    assert ready.state == "ready" and ready.ready_at is not None
+    assert _ready(db, "tx1", expected_continuation_digest="sha256:" + "a" * 64,
+                                        expected_child_session_id="s1") == ready
+
+
+def test_resume_and_turn_lease_follow_rebase_tip(db):
+    _publish(db)
+    assert db.resolve_resume_session_id("s0") == "s1"
+    assert db._session_turn_lease_key("s1") == db._session_turn_lease_key("s0")
+    assert db.refresh_session_turn_lease("s1", "holder", ttl_seconds=300)
+    assert not db.try_acquire_session_turn_lease("s1", "competing", ttl_seconds=300)
+
+
+@pytest.mark.parametrize("owner", ["goal", "heartbeat", "loop"])
+def test_conflicting_child_owner_rolls_back_whole_publication(db, owner):
+    from hermes_cli.goals import GoalState
+    from hermes_cli.heartbeat import HeartbeatState
+    from hermes_cli.loops import LoopState
+
+    parent, child = {
+        "goal": (GoalState(goal="Original", created_at=1), GoalState(goal="Unrelated", created_at=2)),
+        "heartbeat": (HeartbeatState(prompt="Original", interval_seconds=60, created_at=1),
+                      HeartbeatState(prompt="Unrelated", interval_seconds=60, created_at=2)),
+        "loop": (LoopState(prompt="Original", created_at=1), LoopState(prompt="Unrelated", created_at=2)),
+    }[owner]
+    db.set_meta(f"{owner}:s0", parent.to_json())
+    db.set_meta(f"{owner}:s1", child.to_json())
+    with pytest.raises(ContextContinuationError, match=f"{owner.upper()}_RECONCILIATION_FAILED"):
+        _publish(db)
+    assert db.get_session("s0")["ended_at"] is None
+    assert db.get_session("s1") is None
+    assert db.read_context_rebase_transition("tx1") is None
+    assert db.get_meta("context-rebase-recovery:tx1") is None
+    assert db.get_meta(f"{owner}:s0") == parent.to_json()
+    assert db.get_meta(f"{owner}:s1") == child.to_json()
+
+
+@pytest.mark.parametrize("invalid", ["omitted", "wrong_holder", "stale", "expired", "exhausted"])
+def test_native_ready_requires_current_bounded_recovery_reservation(db, invalid):
+    transition = _publish(db)
+    reservation = db.begin_context_rebase_recovery("tx1", turn_lease_holder="holder")
+    args = dict(turn_lease_holder="holder", recovery_attempt=reservation["attempts"])
+    if invalid == "omitted":
+        args = {}
+    elif invalid == "wrong_holder":
+        args["turn_lease_holder"] = "other"
+    elif invalid == "stale":
+        db.begin_context_rebase_recovery("tx1", turn_lease_holder="holder")
+    else:
+        reservation["deadline_at" if invalid == "expired" else "attempts"] = 0 if invalid == "expired" else 4
+        db.set_meta("context-rebase-recovery:tx1", json.dumps(reservation))
+    with pytest.raises(ContextContinuationError):
+        db.mark_context_rebase_ready("tx1", expected_continuation_digest=transition.continuation_digest,
+                                     expected_child_session_id="s1", **args)
+    assert db.read_context_rebase_transition("tx1").state == "committed_pending_activation"
+
+
+def test_explicit_branch_child_does_not_replace_rebase_tip(db):
+    _publish(db)
+    db.create_session("branch", source="cli", parent_session_id="s0",
+                      model_config={"_branched_from": "s0"}, profile_name="p1")
+    assert db.get_context_continuation_tip("s0") == "s1"
+
+
+def test_ambiguous_marker_bound_rebase_children_fail_closed(db):
+    _publish(db)
+    db.create_session("evil", source="cli", parent_session_id="s0",
+                      model_config={"_context_rebase_from": "s0", "_context_rebase_transition": "evil", "_context_epoch": 1},
+                      profile_name="p1")
+    with pytest.raises(ContextContinuationError, match="AMBIGUOUS_CONTEXT_REBASE"):
+        db.get_context_continuation_tip("s0")
+    with pytest.raises(ContextContinuationError, match="AMBIGUOUS_CONTEXT_REBASE"):
+        db.resolve_resume_session_id("s0")
+
+
+def test_depth_limit_returns_typed_error_not_stale_tip(db):
+    _publish(db, transition="tx1", parent="s0", child="s1")
+    # The same conversation lease spans the rebase edge.
+    db.append_message("s1", "assistant", "more work")
+    _publish(db, transition="tx2", parent="s1", child="s2")
+    with pytest.raises(ContextContinuationError, match="CONTINUATION_DEPTH_LIMIT"):
+        db.get_context_continuation_tip("s0", max_depth=1)
+    assert db.get_context_continuation_tip("s0", max_depth=3) == "s2"
+    assert json.loads(db.get_session("s2")["model_config"])["_context_epoch"] == 2
+
+
+def test_custody_transfer_preserves_owner_checkpoint_and_historical_binding(db):
+    goal = '{"goal":"same task","status":"active"}'
+    db.set_meta("goal:history", goal)
+    checkpoint = RunCheckpoint(
+        _sha("plan"), _sha("contract"), _sha("source"), "continue",
+        (("historical-goal-key", "goal:history"),), ("effect:unknown",), (), ("no publish",),
+    )
+    owner = db.claim_run_custody_checked(
+        "run1", lease_holder="holder", expected_generation=0, checkpoint=checkpoint,
+        origin_session_id="s0", current_session_id="s0", historical_goal_digest=_sha(goal),
+    )
+    _publish(db, custody=(owner,))
+    moved = db.read_run_custody("run1")
+    assert moved.current_session_id == "s1"
+    assert moved.origin_session_id == "s0"
+    assert moved.owner_token == owner.owner_token
+    assert moved.checkpoint == checkpoint
+    assert moved.historical_goal_digest == owner.historical_goal_digest
+    assert moved.generation == owner.generation + 1
+
+
+def test_custody_transfer_refuses_unrelated_child(db):
+    goal = '{"goal":"same task","status":"active"}'
+    db.set_meta("goal:history", goal)
+    checkpoint = RunCheckpoint(_sha("p"), _sha("c"), _sha("s"), "continue",
+        (("historical-goal-key", "goal:history"),), (), (), ())
+    owner = db.claim_run_custody_checked("run1", lease_holder="holder", expected_generation=0,
+        checkpoint=checkpoint, origin_session_id="s0", current_session_id="s0",
+        historical_goal_digest=_sha(goal))
+    db.create_session("branch", source="cli", parent_session_id="s0",
+                      model_config={"_branched_from":"s0"}, profile_name="p1")
+    with pytest.raises(RunCustodyError, match="SESSION_TRANSITION_MISMATCH"):
+        db.transfer_run_session("run1", owner_token=owner.owner_token,
+            expected_generation=owner.generation, expected_session_id="s0",
+            new_session_id="branch", ttl_seconds=300)
+    assert db.read_run_custody("run1") == owner
+
+
+def test_bounded_snapshot_carries_first_user_current_users_and_owner_state(db):
+    db.append_message("s0", "assistant", "older summary", _compressed_summary=True)
+    db.append_message("s0", "user", "new correction: still do not publish")
+    db.append_message("s0", "assistant", "working on it")
+    db.set_meta("goal:s0", '{"goal":"same task","status":"active"}')
+    snapshot = db.read_context_rebase_snapshot("s0", recent_limit=4)
+    assert snapshot.conversation_root == "s0"
+    assert snapshot.first_user["content"] == "original task"
+    assert [item["content"] for item in snapshot.current_users] == [
+        "new correction: still do not publish"
+    ]
+    assert snapshot.latest_summary["content"] == "older summary"
+    assert snapshot.goal_raw == '{"goal":"same task","status":"active"}'
+    assert snapshot.input_watermark == db.get_active_message_watermark("s0")
+
+
+def test_snapshot_refuses_too_many_user_changes_since_summary(db):
+    db.append_message("s0", "assistant", "summary", _compressed_summary=True)
+    for index in range(3):
+        db.append_message("s0", "user", f"correction {index}")
+    with pytest.raises(ContextContinuationError, match="TOO_MANY_UNSUMMARIZED_USER_CHANGES"):
+        db.read_context_rebase_snapshot("s0", user_limit=2)
+
+
+def test_snapshot_after_rebase_preserves_original_first_user(db):
+    _publish(db)
+    db.append_message("s1", "assistant", "summary child", _compressed_summary=True)
+    db.append_message("s1", "user", "latest correction")
+    snapshot = db.read_context_rebase_snapshot("s1")
+    assert snapshot.first_user["content"] == "original task"
+    assert snapshot.current_users[-1]["content"] == "latest correction"
+    assert snapshot.conversation_root == "s0"
+
+
+def test_governor_logical_lineage_survives_context_rebase(db):
+    _publish(db)
+    assert ContextGovernorEngine._context_lineage_root(db, "s1") == "s0"
+    assert ContextGovernorEngine._compression_lineage_root(db, "s1") == "s0"
+
+
+def test_governor_lineage_does_not_follow_fake_rebase_marker(db):
+    db.create_session(
+        "fake",
+        source="cli",
+        parent_session_id="s0",
+        model_config={"_context_rebase_from": "wrong", "_context_epoch": 1},
+        profile_name="p1",
+    )
+    assert ContextGovernorEngine._context_lineage_root(db, "fake") == "fake"
+
+
+def test_post_publish_ambiguity_enters_reconciliation_required(db):
+    transition = _publish(db)
+    updated = db.mark_context_rebase_reconciliation_required(transition.transition_id)
+    assert updated.state == "reconciliation_required"
+    assert updated.ready_at is None
+    assert db.mark_context_rebase_reconciliation_required(transition.transition_id) == updated
+    with pytest.raises(ContextContinuationError, match="CONTEXT_REBASE_NOT_READY"):
+        db.assert_context_rebase_ready_for_turn(transition.child_session_id)
+    recovered = _ready(db,
+        transition.transition_id,
+        expected_continuation_digest=transition.continuation_digest,
+        expected_child_session_id=transition.child_session_id,
+    )
+    assert recovered.state == "ready"
+    assert recovered.ready_at is not None
+    assert db.assert_context_rebase_ready_for_turn(transition.child_session_id) == recovered
+
+
+def test_ready_rebase_cannot_be_demoted_to_reconciliation(db):
+    transition = _publish(db)
+    ready = _ready(db,
+        transition.transition_id,
+        expected_continuation_digest=transition.continuation_digest,
+        expected_child_session_id=transition.child_session_id,
+    )
+    assert ready.state == "ready"
+    with pytest.raises(ContextContinuationError, match="CONTEXT_REBASE_NOT_RECONCILABLE"):
+        db.mark_context_rebase_reconciliation_required(transition.transition_id)
+
+
+def test_pending_child_refuses_ordinary_turn_admission(db):
+    transition = _publish(db)
+    assert transition.state == "committed_pending_activation"
+    with pytest.raises(ContextContinuationError, match="CONTEXT_REBASE_NOT_READY"):
+        db.assert_context_rebase_ready_for_turn("s1")
+
+
+def test_ready_child_allows_ordinary_turn_admission(db):
+    transition = _publish(db)
+    ready = _ready(db,
+        transition.transition_id,
+        expected_continuation_digest=transition.continuation_digest,
+        expected_child_session_id=transition.child_session_id,
+    )
+    assert db.assert_context_rebase_ready_for_turn("s1") == ready
+
+
+def test_non_rebase_session_has_no_continuity_admission_requirement(db):
+    assert db.assert_context_rebase_ready_for_turn("s0") is None
+
+
+def test_rebase_tip_projects_as_one_listed_conversation(db):
+    assert db.set_session_title("s0", "Queue repair")
+    _publish(db)
+    sessions = db.list_sessions_rich(limit=20)
+    ids = [row["id"] for row in sessions]
+    assert ids.count("s1") == 1
+    assert "s0" not in ids
+    projected = next(row for row in sessions if row["id"] == "s1")
+    assert projected["_lineage_root_id"] == "s0"
+
+
+def test_title_transfers_from_rebase_ancestor_to_live_tip(db):
+    assert db.set_session_title("s0", "Queue repair")
+    _publish(db)
+    assert db.set_session_title("s1", "Queue repair")
+    assert db.get_session_title("s0") is None
+    assert db.get_session_title("s1") == "Queue repair"
+
+
+def test_rebase_episode_is_conversation_scoped_and_resets_only_explicitly(db):
+    first = _publish(db, transition="tx1", parent="s0", child="s1")
+    _ready(db,
+        first.transition_id,
+        expected_continuation_digest=first.continuation_digest,
+        expected_child_session_id="s1",
+        before_tokens=90_000,
+        after_tokens=20_000,
+    )
+    assert db.read_context_rebase_episode("s0").attempts_without_recovery == 1
+    assert db.read_context_rebase_episode("s1").attempts_without_recovery == 1
+
+    db.append_message("s1", "user", "continue")
+    second = _publish(db, transition="tx2", parent="s1", child="s2")
+    _ready(db,
+        second.transition_id,
+        expected_continuation_digest=second.continuation_digest,
+        expected_child_session_id="s2",
+        before_tokens=91_000,
+        after_tokens=21_000,
+    )
+    assert db.read_context_rebase_episode("s2").attempts_without_recovery == 2
+
+    from hermes_cli.goals import GoalState
+    import uuid
+    goal = GoalState(goal="Explicitly resumed task", created_at=1.0).to_json()
+    db.set_meta("goal:s2", goal)
+    db.resume_context_goal("s2", **db.read_context_resume_basis("s2"), operator_action_id=str(uuid.uuid4()))
+    recovered = db.read_context_rebase_episode("s2")
+    assert recovered.attempts_without_recovery == 0
+    assert recovered.last_transition_id == "tx2"
+    assert db.read_context_rebase_episode("s0").attempts_without_recovery == 0
+
+
+def test_twenty_rebases_preserve_one_lineage_and_run_custody(db):
+    goal = '{"goal":"same task","status":"active"}'
+    db.set_meta("goal:history", goal)
+    checkpoint = RunCheckpoint(
+        _sha("plan"), _sha("contract"), _sha("source"), "continue",
+        (("historical-goal-key", "goal:history"),),
+        ("effect:unknown",), ("finding:open",), ("no publish",),
+    )
+    owner = db.claim_run_custody_checked(
+        "run-long",
+        lease_holder="holder",
+        expected_generation=0,
+        checkpoint=checkpoint,
+        origin_session_id="s0",
+        current_session_id="s0",
+        historical_goal_digest=_sha(goal),
+    )
+
+    parent = "s0"
+    for index in range(1, 21):
+        child = f"s{index}"
+        transition = _publish(
+            db,
+            transition=f"tx{index}",
+            parent=parent,
+            child=child,
+            digest="sha256:" + f"{index:064x}",
+            custody=(owner,),
+        )
+        owner = db.read_run_custody("run-long")
+        _ready(db,
+            transition.transition_id,
+            expected_continuation_digest=transition.continuation_digest,
+            expected_child_session_id=child,
+            before_tokens=100_000 + index,
+            after_tokens=20_000 + index,
+        )
+        if index < 20:
+            db.append_message(child, "user", f"continue epoch {index}")
+        parent = child
+
+    assert db.get_context_continuation_tip("s0", max_depth=25) == "s20"
+    assert db.resolve_resume_session_id("s0") == "s20"
+    assert json.loads(db.get_session("s20")["model_config"])["_context_epoch"] == 20
+    current = db.read_run_custody("run-long")
+    assert current.current_session_id == "s20"
+    assert current.origin_session_id == "s0"
+    assert current.owner_token == owner.owner_token
+    assert current.checkpoint.unresolved_effects == ("effect:unknown",)
+    assert current.checkpoint.unresolved_findings == ("finding:open",)
+    assert current.checkpoint.restrictions == ("no publish",)
+    assert current.generation == owner.generation
+    assert db.read_context_rebase_episode("s20").attempts_without_recovery == 20
+
+
+def test_restart_after_pending_publication_refuses_ordinary_work(tmp_path):
+    path = tmp_path / "pending.db"
+    db = SessionDB(db_path=path)
+    db.create_session("s0", source="cli", profile_name="p1", model="test")
+    db.append_message("s0", "user", "original task")
+    assert db.try_acquire_session_turn_lease("s0", "holder", ttl_seconds=300)
+    transition = _publish(db)
+    assert transition.state == "committed_pending_activation"
+    db.close()
+
+    reopened = SessionDB(db_path=path)
+    assert reopened.resolve_resume_session_id("s0") == "s1"
+    with pytest.raises(ContextContinuationError, match="CONTEXT_REBASE_NOT_READY"):
+        reopened.assert_context_rebase_ready_for_turn("s1")
+    assert reopened.read_context_rebase_transition("tx1").state == (
+        "committed_pending_activation"
+    )
+    reopened.close()
+
+
+def test_restart_after_reconciliation_required_remains_fail_closed(tmp_path):
+    path = tmp_path / "reconcile.db"
+    db = SessionDB(db_path=path)
+    db.create_session("s0", source="cli", profile_name="p1", model="test")
+    db.append_message("s0", "user", "original task")
+    assert db.try_acquire_session_turn_lease("s0", "holder", ttl_seconds=300)
+    transition = _publish(db)
+    db.mark_context_rebase_reconciliation_required(transition.transition_id)
+    db.close()
+
+    reopened = SessionDB(db_path=path)
+    assert reopened.resolve_resume_session_id("s0") == "s1"
+    with pytest.raises(ContextContinuationError, match="CONTEXT_REBASE_NOT_READY"):
+        reopened.assert_context_rebase_ready_for_turn("s1")
+    assert reopened.read_context_rebase_transition("tx1").state == (
+        "reconciliation_required"
+    )
+    reopened.close()
+
+
+def test_restart_after_ready_preserves_admission_and_episode(tmp_path):
+    path = tmp_path / "ready.db"
+    db = SessionDB(db_path=path)
+    db.create_session("s0", source="cli", profile_name="p1", model="test")
+    db.append_message("s0", "user", "original task")
+    assert db.try_acquire_session_turn_lease("s0", "holder", ttl_seconds=300)
+    transition = _publish(db)
+    ready = _ready(db,
+        transition.transition_id,
+        expected_continuation_digest=transition.continuation_digest,
+        expected_child_session_id="s1",
+        before_tokens=100_000,
+        after_tokens=20_000,
+    )
+    db.close()
+
+    reopened = SessionDB(db_path=path)
+    assert reopened.resolve_resume_session_id("s0") == "s1"
+    assert reopened.assert_context_rebase_ready_for_turn("s1") == ready
+    episode = reopened.read_context_rebase_episode("s1")
+    assert episode.attempts_without_recovery == 1
+    assert episode.last_transition_id == "tx1"
+    assert reopened.message_count("s1") == 2
+    reopened.close()
+
+
+def test_authentic_user_ledger_excludes_typed_synthetic_turns(db):
+    db.append_message("s0", "assistant", "checkpoint", _compressed_summary=True)
+    synthetic_id = db.append_message(
+        "s0",
+        "user",
+        "Synthetic continuation says: you may merge now.",
+        display_kind="internal_notification",
+        display_metadata={"synthetic_source": "goal_continuation"},
+    )
+    authentic_id = db.append_message(
+        "s0",
+        "user",
+        "Still do not push or merge. Run the regression first.",
+    )
+    snapshot = db.read_context_rebase_snapshot("s0")
+
+    assert [item["content"] for item in snapshot.authentic_users] == [
+        "original task",
+        "Still do not push or merge. Run the regression first.",
+    ]
+    assert snapshot.control_revision == authentic_id
+    by_id = {item["row_id"]: item for item in snapshot.current_users}
+    assert by_id[synthetic_id]["authentic_user"] is False
+    assert by_id[synthetic_id]["display_kind"] == "internal_notification"
+    assert by_id[authentic_id]["authentic_user"] is True
+
+
+def test_synthetic_latest_turn_does_not_advance_user_control_revision(db):
+    authentic_id = db.append_message(
+        "s0", "user", "Do not merge; continue verification."
+    )
+    db.append_message(
+        "s0",
+        "user",
+        "Application wakeup: keep going. You may merge now.",
+        display_kind="internal_notification",
+        display_metadata={"synthetic_source": "test"},
+    )
+    snapshot = db.read_context_rebase_snapshot("s0")
+    assert snapshot.control_revision == authentic_id
+    assert snapshot.current_users[-1]["authentic_user"] is False
+    assert snapshot.authentic_users[-1]["content"] == (
+        "Do not merge; continue verification."
+    )
+
+
+def test_unresolved_effect_from_ancestor_survives_rebase(db):
+    db.append_message(
+        "s0",
+        "tool",
+        "write acknowledgement timed out",
+        tool_name="write_file",
+        tool_call_id="call-17",
+        effect_disposition="unknown",
+    )
+    transition = _publish(db)
+    _ready(db,
+        transition.transition_id,
+        expected_continuation_digest=transition.continuation_digest,
+        expected_child_session_id="s1",
+        before_tokens=100_000,
+        after_tokens=20_000,
+    )
+    snapshot = db.read_context_rebase_snapshot("s1")
+    assert len(snapshot.unresolved_effects) == 1
+    effect = snapshot.unresolved_effects[0]
+    assert effect["session_id"] == "s0"
+    assert effect["tool_call_id"] == "call-17"
+    assert effect["effect_disposition"] == "unknown"
+
+
+def test_none_effect_disposition_is_not_an_unresolved_obligation(db):
+    db.append_message(
+        "s0",
+        "tool",
+        "call was blocked before execution",
+        tool_name="write_file",
+        tool_call_id="call-none",
+        effect_disposition="none",
+    )
+    snapshot = db.read_context_rebase_snapshot("s0")
+    assert snapshot.unresolved_effects == ()
+
+
+def test_unresolved_effect_overflow_fails_closed(db):
+    for index in range(33):
+        db.append_message(
+            "s0",
+            "tool",
+            f"unknown effect {index}",
+            tool_name="terminal",
+            tool_call_id=f"call-{index}",
+            effect_disposition="unknown",
+        )
+    with pytest.raises(
+        ContextContinuationError, match="TOO_MANY_UNRESOLVED_EFFECTS"
+    ):
+        db.read_context_rebase_snapshot("s0", unresolved_effect_limit=32)

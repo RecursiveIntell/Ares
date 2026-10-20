@@ -1,0 +1,22 @@
+{
+  ".github/workflows/context-continuity-qualification.yml": "1747fa5140e369919f7d249a41d0699ce655d4bcd18a320f47d5c4b062e43f4d",
+  "agent/agent_runtime_helpers.py": "2ab4c07c87ad8e362a186ac07b89eb0ea502abca35900c246bddf47917690f61",
+  "agent/chat_completion_helpers.py": "6b24a23ee1b4dcaf89433ed1b5d1037a64d0b5b34b2ba9704d3e83d0c7bbbfff",
+  "agent/codex_runtime.py": "43551208ed52eb2e7e784c282e13b209f4695986e28be86d5e112000c00b73eb",
+  "agent/conversation_loop.py": "75bb33c4890910befbcbd4abd754915b9145c0622d348e4f1400be1d699e9c63",
+  "agent/tool_executor.py": "728a08c7452ec8168349a2756b7af99afa75416410ee6ec452dfa61583de8007",
+  "ares_runtime/continuity/runtime.py": "048455c91bd6407b4f92eb22f0511ed15fa12700e843eef45df956299cc01663",
+  "hermes_cli/goals.py": "11211a2d3f089d11ace868ae472b30687ea917b17623fd960b6f4380df5cb130",
+  "hermes_state_continuity.py": "9371e2e9ffcb6c269579c2a737dda2b0f44d8315d65cd19b8270020baecc54d4",
+  "model_tools.py": "480b911049de891a817e34346c81c68d9b44d0e55c89112eb48153f09450afc8",
+  "run_agent.py": "3520b1147f3f8987d92570b1e2d44b34aaecf0d71149d1560f80b7c428857250",
+  "tests/ares_runtime/test_context_rebase_state.py": "242aa9b163cd21a47e3226c862e42758651a7c45dd52e2799ff99c52a04a1b56",
+  "tests/ares_runtime/test_continuity_dispatch.py": "1c12468d69fa0732bf95ba68290dd356b28e85fc1c3a07d3aafbedb13a95fc0c",
+  "tests/ares_runtime/test_continuity_runtime.py": "8ed2c780d96314ee5012885e6df09591cf44d5204b7312232d1003dc349320f5",
+  "tests/cli/test_cli_goal_interrupt.py": "5c01395c42262d45e3a7dcb6e2208954c160b11325b38df0c3e1b8bb90d65017",
+  "tests/gateway/test_goal_resume_restart.py": "3fa7901675467d23f8dce009805067362dfa9fe1703263eac8ddb89dc36a6e7c",
+  "tests/hermes_cli/test_goal_lifecycle_contract.py": "343425bcf189e1a2d14445d248d7e909b6a848ba00c965cb3cd27a58bd11d58f",
+  "tests/ares_runtime/test_continuity_tool_control.py": "bcee5ec2351478ad306610933bf0306f91875a359a65e5c97e8cef57f0a4a9f4",
+  "tests/ares_runtime/test_continuity_rollback.py": "3697226070bf9f8eaa9727981b13d41e4e092d25aa16c622f0f425d796f76ef7",
+  "tests/ares_runtime/test_continuity_progress.py": "b36a9a57635ca6c85d18368ad1e88e04af2be6e018156972efb581f77bf4d742"
+}

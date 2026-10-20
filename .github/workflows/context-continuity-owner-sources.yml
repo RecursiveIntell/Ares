@@ -1,0 +1,45 @@
+name: Context continuity owner source preflight
+
+on:
+  push:
+    branches: [feat/context-continuity-v4-20260923]
+    paths: ['.github/workflows/context-continuity-owner-sources.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  pinned-owner-sources:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: RecursiveIntell/Libraries
+          ref: 0b099ec416de60f6adafb182f1d1e83795d05c56
+          path: owners/Libraries
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: RecursiveIntell/recursive-agent
+          ref: 11fefae304d43d9d72f7a238f9d2df77862b51c6
+          path: owners/recursive-agent
+          persist-credentials: false
+      - name: Export tracked public source and exact identities only
+        shell: bash
+        run: |
+          set -euo pipefail
+          for owner in Libraries recursive-agent; do
+            out="$RUNNER_TEMP/owner-sources/$owner"
+            mkdir -p "$out"
+            git -C "owners/$owner" rev-parse HEAD > "$out/HEAD.txt"
+            git -C "owners/$owner" ls-tree -r HEAD > "$out/TREE.txt"
+            git -C "owners/$owner" archive --format=tar.gz HEAD > "$out/source.tar.gz"
+            (cd "$out" && sha256sum HEAD.txt TREE.txt source.tar.gz > SHA256SUMS)
+          done
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: continuity-pinned-owner-sources
+          path: ${{ runner.temp }}/owner-sources/
+          retention-days: 7
+          if-no-files-found: error

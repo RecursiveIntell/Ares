@@ -39,9 +39,39 @@ export function describeCrashReason(reason: unknown): string {
 /**
  * Record main-process faults to desktop.log and flush synchronously, since a
  * fault that does prove fatal leaves no chance for the batched async flush.
+ *
+ * EPIPE on stdout/stdin is special: it means the pipe reader (usually the
+ * process that launched the app) is gone. Both `log` and `flush` themselves
+ * write through that dead pipe, so recording the fault throws inside the
+ * uncaughtException handler — one logged fault becomes 353 suppressed
+ * recursions (#observed 2026-10-19). Count them, surface a rate-limited
+ * summary once a minute, and keep the app alive.
  */
 export function installCrashForensics({ flush, log, target = process }: CrashForensicsOptions): void {
+  let epipeSuppressed = 0
+  let epipeLastLoggedAt = 0
+
   const record = (label: string) => (reason: unknown) => {
+    const code = (reason as { code?: unknown } | null | undefined)?.code
+
+    if (code === 'EPIPE') {
+      epipeSuppressed += 1
+      const now = Date.now()
+
+      if (now - epipeLastLoggedAt > 60_000) {
+        epipeLastLoggedAt = now
+
+        try {
+          log(`[main] EPIPE on stdio suppressed x${epipeSuppressed} (pipe reader gone; app continuing)`)
+          flush()
+        } catch {
+          // The log channel itself is the dead pipe. Nothing left to do.
+        }
+      }
+
+      return
+    }
+
     log(`[main] ${label}: ${describeCrashReason(reason)}`)
     flush()
   }

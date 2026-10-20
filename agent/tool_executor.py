@@ -46,6 +46,7 @@ from tools.terminal_tool import (
     get_active_env,
 )
 from tools.thread_context import propagate_context_to_thread
+from ares_runtime.continuity.runtime import context_bound_tool_batch
 from tools.tool_result_storage import (
     maybe_persist_tool_result,
     enforce_turn_budget,
@@ -174,10 +175,22 @@ class _BatchAbandoned(BaseException):
 
 
 def _parse_tool_arguments(raw_arguments: Any) -> tuple[dict, Optional[str]]:
-    """Parse model-emitted arguments without repairing or coercing them."""
+    """Parse model-emitted arguments without repairing or coercing them.
+
+    Reject duplicate object keys at every depth before a lossy dict conversion,
+    including keys spelled with equivalent JSON escapes.
+    """
+    def unique_pairs(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate tool argument key")
+            result[key] = value
+        return result
+
     try:
-        arguments = json.loads(raw_arguments)
-    except (json.JSONDecodeError, TypeError):
+        arguments = json.loads(raw_arguments, object_pairs_hook=unique_pairs)
+    except (json.JSONDecodeError, TypeError, ValueError):
         arguments = None
     if isinstance(arguments, dict):
         return arguments, None
@@ -729,7 +742,17 @@ def _run_agent_tool_execution_middleware(
         )
         _hb_thread.start()
         try:
-            return execute(final_args)
+            from ares_runtime.continuity.runtime import (
+                ContextDispatchError, assert_context_tool_control_current,
+                context_tool_control_scope,
+            )
+            try:
+                with context_tool_control_scope(agent):
+                    assert_context_tool_control_current(session_id=agent.session_id)
+                    return execute(final_args)
+            except ContextDispatchError as exc:
+                state["blocked"] = True
+                return json.dumps({"error": str(exc)}, ensure_ascii=False)
         finally:
             _hb_stop.set()
             _hb_thread.join(timeout=2.0)
@@ -1095,6 +1118,7 @@ def _begin_tool_execution(
             pass
 
 
+@context_bound_tool_batch
 def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
     """Execute multiple tool calls concurrently using a thread pool.
 
@@ -1949,6 +1973,7 @@ def _append_cancelled_tool_results(messages: list, tool_calls, *, reason: str) -
         ))
 
 
+@context_bound_tool_batch
 def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
     """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools.
 
@@ -2083,12 +2108,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
         if function_name == "todo":
             def _execute(next_args: dict) -> Any:
-                from tools.todo_tool import todo_tool as _todo_tool
-                return _todo_tool(
-                    todos=next_args.get("todos"),
-                    merge=next_args.get("merge", False),
-                    store=agent._todo_store,
-                )
+                from agent.todo_execution import execute_todo
+                return execute_todo(agent, next_args, tool_call_id=tool_call_id, messages=messages)
             function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
                 agent,
                 function_name=function_name,
@@ -2861,6 +2882,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
 
 
+@context_bound_tool_batch
 def execute_tool_calls_segmented(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, segments=None) -> None:
     """Execute a mixed tool-call batch as ordered parallel/sequential segments.
 

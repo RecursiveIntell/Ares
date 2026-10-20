@@ -4,6 +4,7 @@ import type { ChangeEvent } from 'react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router'
 
+import type { OnMainModelChanged } from '@/app/session/hooks/composer-model-selection-owner'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { getElevenLabsVoices, getHermesConfigSchema, saveHermesConfig } from '@/hermes'
@@ -75,7 +76,7 @@ export function ConfigSettings({
 interface ConfigSettingsProps {
   activeSectionId: string
   onConfigSaved?: () => void
-  onMainModelChanged?: (provider: string, model: string) => void
+  onMainModelChanged?: OnMainModelChanged
   importInputRef: React.RefObject<HTMLInputElement | null>
 }
 

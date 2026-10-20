@@ -1,5 +1,7 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
+import { beginMainModelSave, ownsMainModelSave } from '@/app/session/hooks/composer-model-selection-owner'
+import type { ComposerSelectionOwner, OnMainModelChanged } from '@/app/session/hooks/composer-model-selection-owner'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
@@ -17,11 +19,18 @@ import { confirm } from '@/store/confirm'
 import { notify, notifyError } from '@/store/notifications'
 import type { CustomEndpoint, CustomEndpointUpdate } from '@/types/hermes'
 
+import {
+  requireCurrentModelOwner,
+  useModelFormKey,
+  useModelOwnerIsCurrent,
+  useModelRequestOwner
+} from '../hooks/use-composer-model-owner'
+
 import { EmptyState, Pill, SectionHeading, SettingsContent, SettingsSkeleton } from './primitives'
 
 interface CustomEndpointsSettingsProps {
   onConfigSaved?: () => void
-  onMainModelChanged?: (provider: string, model: string) => void
+  onMainModelChanged?: OnMainModelChanged
 }
 
 interface EndpointForm {
@@ -76,6 +85,25 @@ function toPayload(form: EndpointForm, models?: string[]): CustomEndpointUpdate 
 }
 
 export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: CustomEndpointsSettingsProps) {
+  const owner = useModelRequestOwner()
+  const formKey = useModelFormKey(owner)
+
+  return (
+    <CustomEndpointsForm
+      key={formKey}
+      onConfigSaved={onConfigSaved}
+      onMainModelChanged={onMainModelChanged}
+      owner={owner}
+    />
+  )
+}
+
+function CustomEndpointsForm({
+  onConfigSaved,
+  onMainModelChanged,
+  owner
+}: CustomEndpointsSettingsProps & { owner: ComposerSelectionOwner }) {
+  const isOwnerCurrent = useModelOwnerIsCurrent(owner)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [testing, setTesting] = useState(false)
@@ -84,10 +112,20 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
   const [endpoints, setEndpoints] = useState<CustomEndpoint[]>([])
   const [form, setForm] = useState<EndpointForm>(EMPTY_FORM)
   const [discoveredModels, setDiscoveredModels] = useState<string[]>([])
+  // Fence writes synchronously as well as disabling buttons: a second click
+  // must not supersede a successful activation before React paints the lock.
+  const modelWritePendingRef = useRef(false)
 
   async function refresh() {
+    if (!isOwnerCurrent()) {
+      return
+    }
+
     const data = await getCustomEndpoints()
-    setEndpoints(data.endpoints)
+
+    if (isOwnerCurrent()) {
+      setEndpoints(data.endpoints)
+    }
   }
 
   useEffect(() => {
@@ -97,7 +135,7 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
       try {
         const data = await getCustomEndpoints()
 
-        if (cancelled) {
+        if (cancelled || !isOwnerCurrent()) {
           return
         }
 
@@ -109,9 +147,11 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
           setDiscoveredModels(current.models)
         }
       } catch (err) {
-        notifyError(err, 'Could not load custom endpoints')
+        if (!cancelled && isOwnerCurrent()) {
+          notifyError(err, 'Could not load custom endpoints')
+        }
       } finally {
-        if (!cancelled) {
+        if (!cancelled && isOwnerCurrent()) {
           setLoading(false)
         }
       }
@@ -122,38 +162,64 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
     return () => {
       cancelled = true
     }
-  }, [])
+  }, [isOwnerCurrent])
 
   async function handleSave() {
+    if (modelWritePendingRef.current) {
+      return
+    }
+
+    modelWritePendingRef.current = true
+
     try {
+      requireCurrentModelOwner(isOwnerCurrent)
+      const origin = beginMainModelSave()
       setSaving(true)
       const response = await saveCustomEndpoint(toPayload(form, discoveredModels))
-      setEndpoints(response.endpoints)
+
+      if (!ownsMainModelSave(origin)) {
+        return
+      }
+
       const saved = response.endpoints.find(endpoint => endpoint.id === response.id)
+
+      if (saved && saved.is_current) {
+        onMainModelChanged?.({ ...origin, provider: saved.id, model: saved.model })
+      }
+
+      onConfigSaved?.()
+
+      if (!isOwnerCurrent()) {
+        return
+      }
+
+      setEndpoints(response.endpoints)
 
       if (saved) {
         setForm(formFromEndpoint(saved))
         setDiscoveredModels(saved.models)
       }
 
-      if (saved && saved.is_current) {
-        onMainModelChanged?.(saved.id, saved.model)
-      }
-
       triggerHaptic('success')
-      onConfigSaved?.()
       notify({ kind: 'success', message: 'Custom endpoint saved.' })
     } catch (err) {
       notifyError(err, 'Save failed')
     } finally {
+      modelWritePendingRef.current = false
       setSaving(false)
     }
   }
 
   async function handleValidate() {
     try {
+      requireCurrentModelOwner(isOwnerCurrent)
       setTesting(true)
       const response = await validateCustomEndpoint(toPayload(form))
+
+      if (!isOwnerCurrent()) {
+        return
+      }
+
       setDiscoveredModels(response.models)
 
       if (response.ok) {
@@ -181,29 +247,72 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
   }
 
   async function handleActivate(endpoint: CustomEndpoint) {
+    if (modelWritePendingRef.current) {
+      return
+    }
+
+    modelWritePendingRef.current = true
+
     try {
+      requireCurrentModelOwner(isOwnerCurrent)
+      const origin = beginMainModelSave()
       setActivating(endpoint.id)
       const response = await activateCustomEndpoint(endpoint.id)
-      await refresh()
+
+      if (!ownsMainModelSave(origin)) {
+        return
+      }
+
+      // The write is confirmed. A subsequent list-read failure must not hide
+      // the committed default from the composer or report activation failure.
       onConfigSaved?.()
-      onMainModelChanged?.(response.provider, response.model)
+      onMainModelChanged?.({ ...origin, provider: response.provider, model: response.model })
+
+      if (!isOwnerCurrent()) {
+        return
+      }
+
       triggerHaptic('success')
+
+      try {
+        await refresh()
+      } catch (err) {
+        notifyError(err, 'Could not refresh custom endpoints')
+      }
     } catch (err) {
       notifyError(err, 'Activation failed')
     } finally {
+      modelWritePendingRef.current = false
       setActivating(null)
     }
   }
 
   async function handleDelete(endpoint: CustomEndpoint) {
+    if (modelWritePendingRef.current) {
+      return
+    }
+
     // This panel is not internationalized at all — keep the literal it had.
     if (!(await confirm({ destructive: true, title: `Delete ${endpoint.name}?` }))) {
       return
     }
 
+    if (modelWritePendingRef.current) {
+      return
+    }
+
+    modelWritePendingRef.current = true
+
     try {
+      requireCurrentModelOwner(isOwnerCurrent)
       setDeleting(endpoint.id)
       const response = await deleteCustomEndpoint(endpoint.id)
+      onConfigSaved?.()
+
+      if (!isOwnerCurrent()) {
+        return
+      }
+
       setEndpoints(response.endpoints)
 
       if (form.id === endpoint.id) {
@@ -211,11 +320,11 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
         setDiscoveredModels([])
       }
 
-      onConfigSaved?.()
       triggerHaptic('success')
     } catch (err) {
       notifyError(err, 'Delete failed')
     } finally {
+      modelWritePendingRef.current = false
       setDeleting(null)
     }
   }
@@ -264,7 +373,7 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
                   </button>
                   <div className="flex items-center gap-2 sm:justify-end">
                     <Button
-                      disabled={endpoint.is_current || activating === endpoint.id}
+                      disabled={endpoint.is_current || activating !== null || saving || deleting !== null}
                       onClick={() => void handleActivate(endpoint)}
                       size="sm"
                       variant="outline"
@@ -275,7 +384,7 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
                     {endpoint.source !== 'direct-config' && (
                       <Button
                         className="hover:text-destructive"
-                        disabled={deleting === endpoint.id}
+                        disabled={deleting !== null || saving || activating !== null}
                         onClick={() => void handleDelete(endpoint)}
                         size="icon-sm"
                         title="Delete endpoint"
@@ -381,7 +490,10 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
                 {testing ? <Loader2 className="animate-spin" /> : <Zap />}
                 Test
               </Button>
-              <Button disabled={saving || !canSave} onClick={() => void handleSave()}>
+              <Button
+                disabled={saving || activating !== null || deleting !== null || !canSave}
+                onClick={() => void handleSave()}
+              >
                 {saving ? <Loader2 className="animate-spin" /> : <Save />}
                 Save
               </Button>

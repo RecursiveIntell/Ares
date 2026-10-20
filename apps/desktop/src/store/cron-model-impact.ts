@@ -147,17 +147,24 @@ function publishImpact(impact: CronModelImpact, profile: string, connection: str
 export async function setMainModelAssignment(
   request: Omit<ModelAssignmentRequest, 'scope'>,
   scopeProfile?: null | string,
-  options?: { skipConfirmPrompt?: boolean }
+  options?: { skipConfirmPrompt?: boolean; ownsOrigin?: () => boolean }
 ): Promise<ModelAssignmentResponse> {
   const { connection, generation } = beginCronModelImpactAssignment()
   const profile = profileIdentity()
 
   // Only pass the extra arg when a scope override exists, so unscoped callers
   // keep the exact legacy call shape.
-  const assign = (body: Omit<ModelAssignmentRequest, 'scope'>) =>
-    scopeProfile == null
+  const assign = (body: Omit<ModelAssignmentRequest, 'scope'>) => {
+    // Settings may wait on confirmation while the foreground route changes.
+    // Check immediately before every invocation, including the retry.
+    if (options?.ownsOrigin && !options.ownsOrigin()) {
+      throw new Error(translateNow('cron.modelImpact.saveFailed'))
+    }
+
+    return scopeProfile == null
       ? setModelAssignment({ ...body, scope: 'main' })
       : setModelAssignment({ ...body, scope: 'main' }, scopeProfile)
+  }
 
   let result = await assign(request)
 

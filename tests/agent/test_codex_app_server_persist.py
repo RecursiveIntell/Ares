@@ -35,6 +35,9 @@ from run_agent import AIAgent
 
 def _make_turn():
     return SimpleNamespace(
+        completed=True,
+        terminal_status="completed",
+        partial_text="",
         interrupted=False,
         error=None,
         thread_id="thread-1",
@@ -48,6 +51,7 @@ def _make_turn():
 
 def _make_agent(session_db=None, session_id="sess-codex"):
     agent = MagicMock()
+    agent.context_rebase_enabled = False
     # Pre-seed the session so run_codex_app_server_turn skips the spawn block.
     agent._codex_session = MagicMock()
     agent._codex_session.run_turn.return_value = _make_turn()

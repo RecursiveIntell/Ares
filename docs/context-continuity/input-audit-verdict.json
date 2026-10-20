@@ -1,0 +1,30 @@
+{
+  "stage": "independent-post-fix-audit",
+  "status": "bounded_pass",
+  "next_gate": "continue remaining V4 construction and broader integration gates",
+  "reason": "AUD-I1/I2/I3 closed in current source with decisive regressions; no additional blocker found in this bounded recheck",
+  "finding_ids": [],
+  "closed_findings": [
+    "AUD-I1",
+    "AUD-I2",
+    "AUD-I3"
+  ],
+  "audited_snapshot": "input-final-sources.json",
+  "tests": {
+    "runner": "HERMES_TEST_WORKERS=2 HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh",
+    "files": [
+      "tests/ares_runtime/test_continuity_input.py",
+      "tests/tui_gateway/test_prompt_recovery_contract.py"
+    ],
+    "passed": 24,
+    "failed": 0,
+    "log": "input-final.log"
+  },
+  "coverage_limits": [
+    "Gateway ingress integration remains outside this increment",
+    "Autonomous cold inbox draining/controller wakeup not certified",
+    "Stable transport IDs provide deduplication; generated IDs do not provide cross-delivery identity",
+    "Projected input is not a completion receipt; same-ID projected replay refuses rather than rerunning"
+  ],
+  "remaining_delta": []
+}

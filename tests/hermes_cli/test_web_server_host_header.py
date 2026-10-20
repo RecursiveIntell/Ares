@@ -201,8 +201,8 @@ class TestWebSocketHostOriginGuard:
         monkeypatch.setattr(ws.app.state, "auth_required", False, raising=False)
         monkeypatch.setattr(ws, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
 
-        client = TestClient(ws.app)
-        url = f"/api/events?token={ws._SESSION_TOKEN}&channel=security-test"
+        client = TestClient(ws.app, base_url="https://dashboard.example.test:9443")
+        url = f"wss://dashboard.example.test:9443/api/events?token={ws._SESSION_TOKEN}&channel=security-test"
         with client.websocket_connect(
             url,
             headers={

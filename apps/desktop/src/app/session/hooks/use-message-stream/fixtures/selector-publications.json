@@ -1,0 +1,10 @@
+[
+  {
+    "model": "B",
+    "effort": "high"
+  },
+  {
+    "model": "A",
+    "effort": "low"
+  }
+]

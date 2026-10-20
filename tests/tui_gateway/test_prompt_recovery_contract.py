@@ -74,11 +74,20 @@ def test_patient_first_prompt_wait_outlives_old_30_second_cliff(monkeypatch):
         _agent_build_thread=_BuildThread(),
     )
     events = []
-    times = iter((0.0, 31.0))
-    monkeypatch.setattr(server.time, "monotonic", lambda: next(times))
+    elapsed = [0.0]
+    original_wait = ready.wait
+
+    def advance_slice(timeout=None):
+        elapsed[0] += 31.0
+        return original_wait(timeout=timeout)
+
+    monkeypatch.setattr(ready, "wait", advance_slice)
+    monkeypatch.setattr(server.time, "monotonic", lambda: elapsed[0])
     monkeypatch.setattr(server, "_emit", lambda event, sid, payload=None: events.append((event, payload)))
 
     assert server._wait_agent_for_prompt(session, "rid", "sid") is None
+    assert ready.calls == 2
+    assert elapsed[0] > 30.0
     assert [event for event, _ in events] == [
         "notification.show",
         "notification.clear",
@@ -134,7 +143,7 @@ def turn_env(monkeypatch, tmp_path):
     monkeypatch.setattr(
         server,
         "_session_info",
-        lambda agent, session=None: {
+        lambda agent, session=None, *, lock_held=False: {
             "model": getattr(agent, "model", "fake-model"),
             "provider": getattr(agent, "provider", "fake-provider"),
         },
@@ -176,6 +185,67 @@ def test_returned_provider_error_is_terminal_and_replayable(emits, turn_env):
     assert snapshot["error"] == "provider 402: billing wall"
     assert snapshot["recoverable"] is True
     assert session["running"] is False
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_native_partial_result_remains_visible_without_success(
+    monkeypatch, emits, turn_env, streamed, interrupted,
+):
+    from agent import codex_runtime
+    from agent.transports.codex_app_server_session import TurnResult
+
+    draft = "A draft with unfinished reasoning"
+    memory, reviews, results = [], [], []
+    turn = TurnResult(partial_text=draft, error="native turn stopped",
+                      interrupted=interrupted, thread_id="thread", turn_id="turn")
+    native_session = types.SimpleNamespace(
+        matches_route=lambda **kwargs: True,
+        run_turn=lambda **kwargs: turn,
+    )
+    agent = types.SimpleNamespace(
+        session_id="prompt-recovery-session", model="gpt-test", provider="openai-codex",
+        api_mode="codex_app_server", context_rebase_enabled=False,
+        _codex_session=native_session, _interrupt_requested=interrupted,
+        _skill_nudge_interval=1, _iters_since_skill=0, valid_tool_names={"skill_manage"},
+        clear_interrupt=lambda: None,
+        _sync_external_memory_for_turn=lambda **kwargs: memory.append(kwargs),
+        _spawn_background_review=lambda **kwargs: reviews.append(kwargs),
+    )
+    monkeypatch.setattr(codex_runtime, "_record_codex_app_server_usage", lambda *args: {})
+    monkeypatch.setattr(codex_runtime, "_record_codex_app_server_compaction", lambda *args: None)
+
+    def run(message, stream_callback=None, **kwargs):
+        if streamed and stream_callback:
+            stream_callback(draft)
+        result = codex_runtime.run_codex_app_server_turn(
+            agent, user_message=message, original_user_message=message,
+            messages=[], effective_task_id="offline", should_review_memory=True,
+        )
+        results.append(result)
+        return result
+
+    agent.run_conversation = run
+    session = _session(agent=agent, running=True)
+    server._start_inflight_turn(session, "do the thing")
+    server._run_prompt_submit("rid", "sid", session, "do the thing")
+
+    completes = _events(emits, "message.complete")
+    assert len(completes) == 1
+    assert completes[0]["text"] == draft
+    assert completes[0]["partial"] is True
+    assert completes[0]["completed"] is False
+    assert completes[0]["error"] == "native turn stopped"
+    assert completes[0]["status"] == ("interrupted" if interrupted else "error")
+    assert results[0]["final_response"] == ""
+    assert results[0]["completed"] is False
+    assert memory == reviews == []
+    assert not session.get("model_verified_for")
+    if not interrupted:
+        assert completes[0]["error"] == "native turn stopped"
+        snapshot = server._inflight_snapshot(session)
+        assert snapshot["assistant"] == draft
+        assert snapshot["error"] == "native turn stopped"
 
 
 def test_exception_restores_agent_transcript_and_retains_partial(emits, turn_env):

@@ -138,6 +138,133 @@ def test_healthy_snapshot_carries_no_error_keys():
 # ── Returned-error path (run_conversation returns an error result) ────
 
 
+@pytest.mark.parametrize(
+    ("api_calls", "completed"),
+    [(0, True), (1, False), (None, True), (True, True)],
+)
+def test_no_request_completion_cannot_attest_model_readiness(
+    emits, turn_env, api_calls, completed
+):
+    """Local/incomplete/malformed completions cannot attest provider execution."""
+    agent = types.SimpleNamespace(
+        session_id="session-key",
+        provider="configured-provider",
+        model="configured-model",
+        run_conversation=lambda *a, **k: {
+            "final_response": "local handoff only",
+            "completed": completed,
+            "api_calls": api_calls,
+        },
+        clear_interrupt=lambda: None,
+    )
+    session = _session(
+        agent=agent,
+        running=True,
+        model_verified_for=("configured-provider", "configured-model"),
+    )
+    server._start_inflight_turn(session, "do the thing")
+
+    server._run_prompt_submit("rid", "sid", session, "do the thing")
+
+    assert _events(emits, "message.complete")[0]["status"] == "complete"
+    assert session.get("model_verified_for") is None
+    assert server._session_info(agent, session)["model_ready"] is False
+
+
+def test_positive_count_without_accepted_route_cannot_attest_readiness(emits, turn_env):
+    """A mutable end-of-turn route and positive count are not transport proof."""
+    agent = types.SimpleNamespace(
+        session_id="session-key", provider="configured-provider", model="configured-model",
+        run_conversation=lambda *a, **k: {
+            "final_response": "synthetic", "completed": True, "api_calls": 1,
+            "provider": "configured-provider", "model": "configured-model",
+        },
+        clear_interrupt=lambda: None,
+    )
+    session = _session(agent=agent, running=True)
+    server._start_inflight_turn(session, "hi")
+    server._run_prompt_submit("rid", "sid", session, "hi")
+    assert _events(emits, "message.complete")[0]["status"] == "complete"
+    assert session.get("model_verified_for") is None
+    assert server._session_info(agent, session)["model_ready"] is False
+
+
+@pytest.mark.parametrize("case", ["matching", "fallback", "unknown", "stale", "rotated", "detached"])
+def test_gateway_admits_only_current_exact_accepted_route(emits, turn_env, monkeypatch, case):
+    from agent.turn_finalizer import AcceptedResponseRoute
+
+    agent = types.SimpleNamespace(
+        session_id="session-key", provider="configured-provider", model="configured-model",
+        clear_interrupt=lambda: None,
+    )
+    session = _session(agent=agent, running=True)
+
+    def run_conversation(*args, **kwargs):
+        if case == "rotated":
+            session["session_key"] = "different-key"
+        if case == "detached":
+            # A newer owner reuses the same UI id before the old turn settles.
+            monkeypatch.setitem(server._sessions, "sid", _session(agent=types.SimpleNamespace()))
+        route = AcceptedResponseRoute(
+            turn_token=(object() if case == "stale" else agent._route_turn_token),
+            turn_id="turn-1", session_id="session-key", attempt_id="turn-1:api:1:0",
+            provider="fallback-provider" if case == "fallback" else "configured-provider",
+            model="fallback-model" if case == "fallback" else "configured-model",
+            served_model=None if case == "unknown" else (
+                "fallback-model" if case == "fallback" else "configured-model"
+            ),
+        )
+        return {"final_response": "answer", "completed": True, "api_calls": 1,
+                "accepted_response_route": route}
+
+    agent.run_conversation = run_conversation
+    server._start_inflight_turn(session, "hi")
+    server._run_prompt_submit("rid", "sid", session, "hi")
+    assert _events(emits, "message.complete")[0]["status"] == "complete"
+    assert session.get("model_verified_for") == (
+        ("configured-provider", "configured-model") if case == "matching" else None
+    )
+
+
+def test_rebind_between_turn_completion_and_info_emit_cannot_publish_old_readiness(
+    emits, turn_env, monkeypatch
+):
+    """The transport can rebind after accepted-route validation but before emit."""
+    from agent.turn_finalizer import AcceptedResponseRoute
+
+    agent = types.SimpleNamespace(
+        session_id="session-key", provider="configured-provider", model="configured-model",
+        clear_interrupt=lambda: None,
+    )
+    old = _session(agent=agent, running=True)
+    replacement = _session(agent=types.SimpleNamespace())
+    original_emit = server._emit
+
+    def rebind_on_complete(event, sid, payload=None):
+        if event == "message.complete":
+            monkeypatch.setitem(server._sessions, sid, replacement)
+        original_emit(event, sid, payload)
+
+    monkeypatch.setattr(server, "_emit", rebind_on_complete)
+
+    def run_conversation(*args, **kwargs):
+        return {
+            "final_response": "answer", "completed": True, "api_calls": 1,
+            "accepted_response_route": AcceptedResponseRoute(
+                turn_token=agent._route_turn_token, turn_id="turn-1",
+                session_id="session-key", attempt_id="turn-1:api:1:0",
+                provider="configured-provider", model="configured-model",
+                served_model="configured-model",
+            ),
+        }
+
+    agent.run_conversation = run_conversation
+    server._start_inflight_turn(old, "hi")
+    server._run_prompt_submit("rid", "sid", old, "hi")
+    assert server._sessions["sid"] is replacement
+    assert not [payload for payload in _events(emits, "session.info") if payload.get("model_ready")]
+
+
 def test_returned_error_result_retains_snapshot_and_emits_terminal_frame(
     emits, turn_env
 ):

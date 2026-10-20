@@ -95,6 +95,10 @@ def test_prewarm_warms_the_active_custom_endpoint_for_the_next_open(monkeypatch)
     calls = []
 
     def fake_fetch_api_models(api_key, url, **kwargs):
+        # Count the endpoint under test, not unrelated keyless catalogs
+        # refreshed by the real picker alongside the custom endpoint.
+        if url != base_url:
+            return []
         calls.append((api_key, url))
         return ["gateway-model-a", "gateway-model-b"]
 

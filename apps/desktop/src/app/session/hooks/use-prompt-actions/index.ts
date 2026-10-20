@@ -9,6 +9,7 @@ import { stripAnsi } from '@/lib/ansi'
 import { type ChatMessage, textPart } from '@/lib/chat-messages'
 import { pathLabel, SLASH_COMMAND_RE } from '@/lib/chat-runtime'
 import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
+import { gatewayDeliveryUnknownError } from '@/lib/gateway-delivery'
 import { triggerHaptic } from '@/lib/haptics'
 import { setMutableRef } from '@/lib/mutable-ref'
 import { normalize } from '@/lib/text'
@@ -25,6 +26,7 @@ import { resetSessionBackground } from '@/store/composer-status'
 import { requestGatewayForAgent } from '@/store/gateway'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { clearPreviewArtifacts } from '@/store/preview-status'
+import { $activeGatewayProfile } from '@/store/profile'
 import { clearAllPrompts } from '@/store/prompts'
 import {
   $busy,
@@ -32,7 +34,9 @@ import {
   $currentCwd,
   $messages,
   $terminalBackend,
-  getSessionOwnerHint,
+  getSessionOwnerHints,
+  ownerLookupSessionRows,
+  sessionMatchesStoredId,
   setActiveSessionId,
   setAwaitingResponse,
   setBusy,
@@ -80,6 +84,7 @@ import {
   readFileDataUrlForAttach,
   readImageForRemoteAttach,
   shouldInterruptBeforeRewind,
+  stopFailureNotice,
   type SubmitTextOptions,
   withSessionNotFoundResume
 } from './utils'
@@ -257,6 +262,13 @@ interface PromptActionsOptions {
 interface RestoreMessageTarget {
   text?: string
   userOrdinal?: number | null
+}
+
+class AmbiguousSessionOwnerError extends Error {
+  constructor() {
+    super('Session owner is ambiguous; select the exact source before sending a live control')
+    this.name = 'AmbiguousSessionOwnerError'
+  }
 }
 
 export function usePromptActions({
@@ -486,28 +498,68 @@ export function usePromptActions({
     }
   }, [activeSessionId, composerAttachments, eagerlyUploadAttachment])
 
-  // Session resume can be routed through a registry connection while the
-  // render-time requestGateway still points at the local default socket. Keep
-  // every follow-up session RPC on the same composite owner; otherwise resume
-  // succeeds on HERMES01 and prompt.submit immediately fails locally with
-  // "session not found".
-  const requestForPromptSession = useCallback<GatewayRequest>(
-    (method, params = {}, timeoutMs) => {
-      const storedSessionId = selectedStoredSessionIdRef.current
-      const owner = storedSessionId ? getSessionOwnerHint(storedSessionId) : undefined
+  // Bind the route once to a stored session. Interrupt/redirect and recovery
+  // retries must never follow whichever profile happens to be foreground after
+  // an await; they stay with the exact owner that received the user's action.
+  const requestForStoredSession = useCallback(
+    (storedSessionId: null | string | undefined): GatewayRequest => {
+      const owners = storedSessionId ? getSessionOwnerHints(storedSessionId) : []
+
+      const rowOwners = storedSessionId
+        ? ownerLookupSessionRows()
+            .filter(row => sessionMatchesStoredId(row, storedSessionId) && row.connection_id)
+            .map(row => ({ connectionId: row.connection_id!.trim(), profile: row.profile?.trim() || 'default' }))
+        : []
+
+      const distinctOwners = new Map(
+        [...owners, ...rowOwners].map(route => [`${route.connectionId}\u0000${route.profile}`, route])
+      )
+
+      const ambiguousOwner = distinctOwners.size > 1
+      const owner = distinctOwners.size === 1 ? [...distinctOwners.values()][0] : undefined
       const ambientConnection = $connection.get()
 
-      const connectionId =
-        owner?.connectionId ||
-        (ambientConnection?.mode === 'remote' ? ambientConnection.connectionId?.trim() || '' : '')
+      const ambientRemoteConnectionId =
+        ambientConnection?.mode === 'remote' ? ambientConnection.connectionId?.trim() || null : null
 
-      if (connectionId) {
-        return requestGatewayForAgent(connectionId, owner?.profile || 'default', method, params, timeoutMs)
+      const connectionId = owner?.connectionId?.trim() || ambientRemoteConnectionId
+
+      const profile =
+        owner?.profile || (ambientConnection?.mode === 'remote' ? ambientConnection.profile : 'default') || 'default'
+
+      const ownerProfileDiffersFromActive = Boolean(owner?.profile && owner.profile !== $activeGatewayProfile.get())
+
+      return async <T>(method: string, params: Record<string, unknown> = {}, timeoutMs?: number): Promise<T> => {
+        if (ambiguousOwner) {
+          throw new AmbiguousSessionOwnerError()
+        }
+
+        try {
+          if (connectionId || ownerProfileDiffersFromActive) {
+            return await requestGatewayForAgent<T>(connectionId, profile, method, params, timeoutMs)
+          }
+
+          return await (timeoutMs === undefined
+            ? requestGateway<T>(method, params)
+            : requestGateway<T>(method, params, timeoutMs))
+        } catch (error) {
+          const unknown = gatewayDeliveryUnknownError(method, error)
+
+          if (unknown) {
+            throw unknown
+          }
+
+          throw error
+        }
       }
-
-      return timeoutMs === undefined ? requestGateway(method, params) : requestGateway(method, params, timeoutMs)
     },
-    [requestGateway, selectedStoredSessionIdRef]
+    [requestGateway]
+  )
+
+  const requestForPromptSession = useCallback<GatewayRequest>(
+    (method, params = {}, timeoutMs) =>
+      requestForStoredSession(selectedStoredSessionIdRef.current)(method, params, timeoutMs),
+    [requestForStoredSession, selectedStoredSessionIdRef]
   )
 
   const submitPromptText = useSubmitPrompt({
@@ -682,77 +734,153 @@ export function usePromptActions({
     // the ChatView element's onCancel prop holds a stale cancelRun closure.
     // The closure's `activeSessionId` can be a previous session's id (or null
     // from a new-chat draft), sending session.interrupt to the wrong session.
-    // The ref is updated via useEffect on every activeSessionId change, so it
-    // always reflects the current session — same pattern submitText uses.
     const sessionId = activeSessionIdRef.current
+    const storedSessionId = selectedStoredSessionIdRef.current
+    const requestForTargetSession = requestForStoredSession(storedSessionId)
 
     const releaseBusy = () => {
       setMutableRef(busyRef, false)
       setBusy(false)
     }
 
-    setAwaitingResponse(false)
-    setTurnStartedAt(null)
-
     if (!sessionId) {
+      setAwaitingResponse(false)
+      setTurnStartedAt(null)
       releaseBusy()
       setMessages(finalizeInterruptedMessages($messages.get()))
 
       return
     }
 
-    // Frontend busy clears immediately; gateway wind-down can lag. Mark so a
-    // fast edit/resend still interrupt-first instead of racing 4009 (#83855).
-    markSessionRecentlyInterrupted(sessionId)
+    const turnAtStop = $sessionStates.get()[sessionId]
 
-    updateSessionState(sessionId, state => {
-      const streamId = state.streamId
-      const messages = finalizeInterruptedMessages(state.messages, streamId)
+    if (turnAtStop?.interruptPending) {
+      return
+    }
 
-      return {
-        ...state,
-        messages,
-        busy: false,
-        awaitingResponse: false,
-        streamId: null,
-        pendingBranchGroup: null,
-        needsInput: false,
-        interrupted: true,
-        turnStartedAt: null,
-        turnLive: false
-      }
-    })
+    // Keep the renderer projection busy and the transcript untouched while the
+    // write is in flight. A rejected/lost response must not make a live backend
+    // turn look idle or discard the user's partial output/prompts.
+    updateSessionState(sessionId, state => ({ ...state, interruptPending: true }))
 
-    clearSessionTodos(sessionId)
-    clearSessionSubagents(sessionId)
-    resetSessionBackground(sessionId)
-    setSessionDraftingTool(sessionId, '')
-    // Stop ends the turn, so the gateway is no longer blocked on any prompt it
-    // raised. Drop this session's pending clarify / approval / sudo / secret so
-    // a dead panel (and the sidebar "needs input" dot) can't linger and accept
-    // an answer the backend will reject.
-    clearAllPrompts(sessionId)
-    clearClarifyRequest(undefined, sessionId)
+    const interruptedSessionId = sessionId
 
     try {
-      await withSessionNotFoundResume(
-        sessionId,
-        selectedStoredSessionIdRef.current,
-        liveId => requestGateway('session.interrupt', { session_id: liveId }),
-        {
-          requestGateway,
-          onRecovered: recoveredId => {
-            activeSessionIdRef.current = recoveredId
-            setActiveSessionId(recoveredId)
-          }
+      // A missing runtime is not permission to cancel a resumed successor.
+      // Only an explicit later click may ask the original owner to reconcile.
+      await requestForTargetSession('session.interrupt', { session_id: sessionId })
+
+      let acceptedForCurrentTurn = false
+
+      const acceptedState = updateSessionState(interruptedSessionId, state => {
+        // Missing markers are not wildcards: a late ACK must not interrupt a
+        // newer turn that started before the RPC returned.
+        const sameTurn = Boolean(
+          (turnAtStop?.turnStartedAt != null || turnAtStop?.streamId) &&
+          (turnAtStop?.turnStartedAt == null || state.turnStartedAt === turnAtStop.turnStartedAt) &&
+          (!turnAtStop?.streamId || state.streamId === turnAtStop.streamId)
+        )
+
+        acceptedForCurrentTurn = sameTurn && (state.busy || state.awaitingResponse || state.reconnecting)
+
+        return {
+          ...state,
+          interruptPending: false,
+          // An interrupt ACK is acceptance, not completion. Preserve the
+          // current turn's busy/clock/stream state until message.complete or
+          // running=false is observed. Do not stamp a later turn interrupted.
+          ...(acceptedForCurrentTurn
+            ? {
+                interrupted: true,
+                needsInput: false,
+                pendingBranchGroup: null
+              }
+            : {})
         }
-      )
-      releaseBusy()
+      })
+
+      const stateStillActive = acceptedState.busy || acceptedState.awaitingResponse || acceptedState.reconnecting
+
+      if (acceptedForCurrentTurn) {
+        markSessionRecentlyInterrupted(interruptedSessionId)
+        clearSessionTodos(interruptedSessionId)
+        clearSessionSubagents(interruptedSessionId)
+        resetSessionBackground(interruptedSessionId)
+        setSessionDraftingTool(interruptedSessionId, '')
+      }
+
+      if (acceptedForCurrentTurn || !stateStillActive) {
+        // The gateway accepted Stop, or a terminal event already settled the
+        // same session while its ACK was in flight. Pending UI prompts are no
+        // longer answerable; never clear prompts for a newer active turn.
+        clearAllPrompts(interruptedSessionId)
+        clearClarifyRequest(undefined, interruptedSessionId)
+      }
     } catch (err) {
-      releaseBusy()
-      notifyError(err, copy.stopFailed)
+      updateSessionState(interruptedSessionId, state =>
+        state.interruptPending ? { ...state, interruptPending: false } : state
+      )
+
+      if (interruptedSessionId !== sessionId) {
+        updateSessionState(sessionId, state => (state.interruptPending ? { ...state, interruptPending: false } : state))
+      }
+
+      // A terminal event may beat the failed/late RPC response. Don't report a
+      // Stop failure if the authoritative stream already settled this session.
+      const current = $sessionStates.get()[sessionId]
+
+      if (
+        activeSessionIdRef.current === sessionId &&
+        selectedStoredSessionIdRef.current === storedSessionId &&
+        (current?.busy || current?.reconnecting || !current) &&
+        Boolean(turnAtStop?.streamId || turnAtStop?.turnStartedAt != null) &&
+        (!turnAtStop?.streamId || current?.streamId === turnAtStop.streamId) &&
+        (turnAtStop?.turnStartedAt == null || current?.turnStartedAt === turnAtStop.turnStartedAt)
+      ) {
+        const missingOwner =
+          err instanceof JsonRpcGatewayError
+            ? err.code === 4007
+            : err instanceof Error && /session not found/i.test(err.message)
+
+        // The backend types how the Stop actually resolved
+        // (`effect_disposition` on the 5019 payload). Report that instead of a
+        // bare "Stop failed": "nothing was cancelled" and "the turn is still
+        // running" call for completely different reactions from the user.
+        const notice = stopFailureNotice(err, copy)
+
+        if (notice) {
+          notify(notice)
+        } else if (missingOwner && storedSessionId) {
+          notify({
+            kind: 'error',
+            message: copy.stopFailed,
+            action: {
+              label: t.shell.gatewayMenu.reconnectGateway,
+              onClick: () => {
+                if (
+                  activeSessionIdRef.current === sessionId &&
+                  selectedStoredSessionIdRef.current === storedSessionId
+                ) {
+                  void resumeStoredSession(storedSessionId)
+                }
+              }
+            }
+          })
+        } else {
+          notifyError(err, copy.stopFailed)
+        }
+      }
     }
-  }, [activeSessionIdRef, busyRef, copy.stopFailed, requestGateway, selectedStoredSessionIdRef, updateSessionState])
+  }, [
+    activeSessionIdRef,
+    busyRef,
+    copy,
+    t.shell.gatewayMenu.reconnectGateway,
+    resumeStoredSession,
+    requestForStoredSession,
+    selectedStoredSessionIdRef,
+    updateSessionState
+  ])
 
   // The desktop steering action is an immediate correction: the core cancels
   // model generation and rebuilds the live turn with displayed reasoning and
@@ -765,6 +893,8 @@ export function usePromptActions({
       // reaches the live model mid-turn, so a stale target delivers the user's
       // correction into a conversation they are no longer looking at.
       const sessionId = activeSessionIdRef.current
+      const storedSessionId = selectedStoredSessionIdRef.current
+      const requestForTargetSession = requestForStoredSession(storedSessionId)
 
       if (!text || !sessionId) {
         return false
@@ -799,7 +929,10 @@ export function usePromptActions({
           })
 
         try {
-          const result = await requestGateway<SessionRedirectResponse>('session.redirect', { session_id: id, text })
+          const result = await requestForTargetSession<SessionRedirectResponse>('session.redirect', {
+            session_id: id,
+            text
+          })
 
           if (result?.status === 'redirected') {
             triggerHaptic('submit')
@@ -829,8 +962,12 @@ export function usePromptActions({
         // A stale runtime id after reconnect 404s ("session not found"): the
         // shared resolver resumes the stored session and retries once, so a
         // correction right after a reconnect isn't lost to the race.
-        const { result } = await withSessionNotFoundResume(sessionId, selectedStoredSessionIdRef.current, send, {
-          requestGateway,
+        const { result } = await withSessionNotFoundResume(sessionId, storedSessionId, send, {
+          requestGateway: requestForTargetSession,
+          driftReason: () =>
+            selectedStoredSessionIdRef.current !== storedSessionId || activeSessionIdRef.current !== sessionId
+              ? 'the selected session changed while redirect was reconnecting'
+              : null,
           onRecovered: recoveredId => {
             activeSessionIdRef.current = recoveredId
             setActiveSessionId(recoveredId)
@@ -838,13 +975,33 @@ export function usePromptActions({
         })
 
         return result
-      } catch {
-        // Swallow — caller queues the text so nothing is lost.
+      } catch (err) {
+        const unknown = gatewayDeliveryUnknownError('session.redirect', err)
+
+        if (unknown) {
+          notifyError(unknown, copy.promptFailed)
+
+          throw unknown
+        }
+
+        if (err instanceof AmbiguousSessionOwnerError) {
+          notifyError(err, copy.promptFailed)
+          throw err
+        }
+
+        // Explicit rejection/settle race is safe to fall back to queue behavior.
       }
 
       return false
     },
-    [activeSessionIdRef, appendSessionTextMessage, requestGateway, selectedStoredSessionIdRef, updateSessionState]
+    [
+      activeSessionIdRef,
+      appendSessionTextMessage,
+      copy.promptFailed,
+      requestForStoredSession,
+      selectedStoredSessionIdRef,
+      updateSessionState
+    ]
   )
 
   // After a durable rewind the surviving bubbles' cached rowIds are stale (the

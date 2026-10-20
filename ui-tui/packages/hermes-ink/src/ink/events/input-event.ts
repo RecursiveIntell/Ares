@@ -2,8 +2,14 @@ import { nonAlphanumericKeys, type ParsedKey } from '../parse-keypress.js'
 
 import { Event } from './event.js'
 
-const inputForSpecialSequence = (name: string): string =>
-  name === 'space' ? ' ' : name === 'return' || name === 'escape' ? '' : name
+const inputForSpecialSequence = (name: string, shift: boolean): string => {
+  const input = name === 'space' ? ' ' : name === 'return' || name === 'escape' ? '' : name
+
+  // Enhanced protocols normalize the canonical name to lowercase. Restore
+  // Shift only for inserted ASCII letters; keypress.name remains unchanged
+  // for command matching, and nonletter/functional-key projections stay put.
+  return shift && input.length === 1 && input >= 'a' && input <= 'z' ? input.toUpperCase() : input
+}
 
 export type Key = {
   upArrow: boolean
@@ -112,7 +118,7 @@ function parseKey(keypress: ParsedKey): [Key, string] {
       // so the raw "[57358u" doesn't leak into the prompt. See #38781.
       input = ''
     } else {
-      input = inputForSpecialSequence(keypress.name)
+      input = inputForSpecialSequence(keypress.name, keypress.shift)
     }
 
     processedAsSpecialSequence = true
@@ -130,7 +136,7 @@ function parseKey(keypress: ParsedKey): [Key, string] {
       // guards against future terminal behavior.
       input = ''
     } else {
-      input = inputForSpecialSequence(keypress.name)
+      input = inputForSpecialSequence(keypress.name, keypress.shift)
     }
 
     processedAsSpecialSequence = true

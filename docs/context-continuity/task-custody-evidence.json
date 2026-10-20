@@ -1,0 +1,53 @@
+{
+  "schema": "ares.context-continuity.task-custody-evidence/v1",
+  "base_commit": "050ddf96d102554722f3ad4d3be1ec20524032c3",
+  "source_sha256": {
+    ".github/workflows/context-continuity-qualification.yml": "ffc6162430bc3d0197fea66d352c7744e48fd0515460d0a0efdf1b1a8b6d5bae",
+    "agent/run_checkpoint_custody.py": "a90f093e36fd2154a4235c3f50964a733ca7c99b821b1e4e67c9afb15692863e",
+    "ares_runtime/continuity/checkpoint.py": "20a3e2ef64e859941d5e98fee34d803346d824657f388b046ff6cb8b2e6ad171",
+    "hermes_state_continuity.py": "add424bd60aaf12f8c47a42c8b584b7c2c22d2689d0f172a5d3a3cf250ede4c8",
+    "hermes_state_runs.py": "27b1677809cea45cc1e38df27a52285f3ff4c9653642a98f509cfc2a5d14eaa8",
+    "scripts/run_checkpoint_claim.py": "c5b241c344d8c714654df735aa2b16e7302ba0d42baf7077365e869702d43ff3",
+    "scripts/run_checkpoint_resume.py": "5b17758a6b39f46fa1119087463a1415bfb16dad6f89196d23438d6cb4c47132",
+    "tests/tui_gateway/test_run_checkpoint_claim_rpc.py": "6d14d52736db8c749a9c50e0dce73d461ea9b3a9afb9a6c0015b3c71795761d7",
+    "tui_gateway/run_checkpoint_rpc.py": "cc470509d06de6758f0f6b6dc03b5ffc9db0d8f76cc984df659fbaf910e0985f",
+    "tests/test_run_task_custody.py": "bb4953851f00ced98c0a5db6f415aeb7965695c03375c0d8a064411ed590143e"
+  },
+  "scope": "Strict ordinary-task custody and checked explicit dead-process takeover; not full V4 readiness",
+  "validation": {
+    "command": "HERMES_TEST_CONTEXT_GOVERNOR_BIN=<pinned-binary> HERMES_PYTHON=$PWD/.venv/bin/python HERMES_TEST_WORKERS=4 HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/ares_runtime/test_continuity*.py tests/ares_runtime/test_context_rebase_state.py tests/test_run_checkpoint*.py tests/test_run_task_custody.py tests/test_turn_run_custody.py tests/tui_gateway/test_run_checkpoint_claim_rpc.py tests/plugins/test_context_governor*.py",
+    "passed": 500,
+    "failed": 0,
+    "files": 28,
+    "log": "task-custody-test-run.log",
+    "independent_audit_passed": 155,
+    "independent_audit_files": 6,
+    "closed_findings": [
+      "AUD-T1",
+      "AUD-T2",
+      "AUD-T3"
+    ],
+    "ruff": "passed",
+    "git_diff_check": "passed"
+  },
+  "prior_hosted_validation": {
+    "source_commit": "050ddf96d102554722f3ad4d3be1ec20524032c3",
+    "run_id": 36126710422,
+    "job_id": 108044389505,
+    "url": "https://github.com/RecursiveIntell/Ares/actions/runs/36126710422",
+    "passed": 1630,
+    "skipped": 5,
+    "files": 44,
+    "execute_code_passed": 44
+  },
+  "remaining_gates": [
+    "Persisted cold recovery locators and autonomous restart/controller integration",
+    "Durable root input inbox and ordering",
+    "Native effect-owner transition fence and incarnation/acknowledgement closure",
+    "Working source and workspace conditional-write ownership",
+    "Current policy and revocation",
+    "Objective progress and shared physical-attempt cap",
+    "Reader compatibility, backup/rollback qualification",
+    "Installed selected-route capability/calibration, canaries and endurance"
+  ]
+}

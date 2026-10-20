@@ -1,5 +1,6 @@
 import { resolveGatewayWsUrl } from '@hermes/shared'
 
+import { NativeRendererSocket, nativeRoute, nativeRouteUrl } from '@/api/native-socket'
 import { getApiRequestConnection, getApiRequestProfile, speakText } from '@/hermes'
 import {
   cutSentences,
@@ -107,6 +108,10 @@ export function stopVoicePlayback() {
  *  exactly what broke in the desktop-remote voice report — keep it pinned. */
 export async function resolveSpeakStreamUrl(): Promise<null | string> {
   const desktop = window.hermesDesktop
+
+  if (desktop?.nativeSocket) {
+    return nativeRouteUrl(nativeRoute(getApiRequestProfile(), getApiRequestConnection()))
+  }
 
   if (!desktop?.getConnection) {
     return null
@@ -347,7 +352,14 @@ function openClientDirectSpeechSession(tts: DirectTtsConfig, options: VoicePlayb
  * stream (ChatGPT-style) with no per-sentence connection or synthesis gaps.
  */
 function openSpeechStream(wsUrl: string, options: VoicePlaybackOptions): SpeechStreamSession {
-  const ws = new WebSocket(wsUrl)
+  const ws = window.hermesDesktop?.nativeSocket
+    ? new NativeRendererSocket(
+        window.hermesDesktop.nativeSocket,
+        JSON.parse(decodeURIComponent(new URL(wsUrl).pathname.slice(1))),
+        { kind: 'tts' }
+      )
+    : new WebSocket(wsUrl)
+
   ws.binaryType = 'arraybuffer'
 
   let context: AudioContext | null = null
@@ -358,6 +370,7 @@ function openSpeechStream(wsUrl: string, options: VoicePlaybackOptions): SpeechS
   let settled = false
   let finished = false
   const pendingSends: string[] = []
+  let pendingSendBytes = 0
 
   let settle: (value: 'done' | 'fallback') => void = () => undefined
 
@@ -369,6 +382,8 @@ function openSpeechStream(wsUrl: string, options: VoicePlaybackOptions): SpeechS
 
       settled = true
       currentStop = null
+      pendingSends.length = 0
+      pendingSendBytes = 0
 
       try {
         ws.close()
@@ -388,6 +403,15 @@ function openSpeechStream(wsUrl: string, options: VoicePlaybackOptions): SpeechS
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(data)
     } else if (ws.readyState === WebSocket.CONNECTING) {
+      const bytes = new TextEncoder().encode(data).byteLength
+
+      if (pendingSends.length >= 128 || pendingSendBytes + bytes > 1024 * 1024) {
+        settle(started ? 'done' : 'fallback')
+
+        return
+      }
+
+      pendingSendBytes += bytes
       pendingSends.push(data)
     }
   }
@@ -450,6 +474,7 @@ function openSpeechStream(wsUrl: string, options: VoicePlaybackOptions): SpeechS
   }
 
   ws.onopen = () => {
+    pendingSendBytes = 0
     pendingSends.splice(0).forEach(data => ws.send(data))
   }
 

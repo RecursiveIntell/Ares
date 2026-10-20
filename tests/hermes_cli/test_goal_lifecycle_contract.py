@@ -16,6 +16,7 @@ def _manager(monkeypatch, tmp_path, sid="lifecycle-test", max_turns=4):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     (tmp_path / ".hermes").mkdir(exist_ok=True)
     goals._DB_CACHE.clear()
+    goals._get_session_db().create_session(sid, source="cli")
     return goals.GoalManager(sid, default_max_turns=max_turns)
 
 
@@ -206,8 +207,15 @@ def test_single_continuation_claim_and_stale_checkpoint_rejection(monkeypatch, t
     first.release_continuation(queued=False)
 
     stale = goals.GoalManager("lease")
+    assert stale.state is not None
     stale.state.checkpoint["goal_id"] = "wrong"
-    goals.save_goal("lease", stale.state)
+    # The guarded writer must reject corruption; inject it directly into the
+    # scratch store to exercise the independent claim-time check as well.
+    assert goals.save_goal("lease", stale.state) is False
+    db = goals._get_session_db()
+    assert db is not None
+    db.set_meta(goals._meta_key("lease"), stale.state.to_json())
+    assert db.get_meta(goals._meta_key("lease")) == stale.state.to_json()
     assert stale.validate_checkpoint()[0] is False
     assert stale.claim_continuation("worker-3") is False
 
@@ -370,7 +378,10 @@ def test_deferred_flush_retains_failed_write_and_removes_only_after_success(monk
     home = next(iter(goals._DEFERRED_GOAL_WRITES))[0]
 
     class FailingDB:
-        def set_meta(self, *_args, **_kwargs):
+        def get_meta(self, _key):
+            return None
+
+        def compare_and_set_meta(self, *_args, **_kwargs):
             raise OSError("injected flush failure")
 
     goals._flush_deferred_goal_writes(home, FailingDB())
@@ -380,8 +391,13 @@ def test_deferred_flush_retains_failed_write_and_removes_only_after_success(monk
         def __init__(self):
             self.writes = []
 
-        def set_meta(self, key, value):
+        def get_meta(self, _key):
+            return None
+
+        def compare_and_set_meta(self, key, expected, value):
+            assert expected is None
             self.writes.append((key, value))
+            return True
 
     db = WorkingDB()
     goals._flush_deferred_goal_writes(home, db)

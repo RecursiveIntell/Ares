@@ -40,6 +40,7 @@ dependencies = [
   "python-dotenv==1.2.2",
   "fire==0.7.1",
   "httpx[socks]==0.28.1",
+  "blake3>=1.0.8,<2",  # Exact physical provider-body ContentDigest; never substitute SHA.
   "rich==14.3.3",
   "tenacity==9.1.4",
   "pyyaml==6.0.3",
@@ -435,6 +436,10 @@ py-modules = [
   "hermes_constants",
   "hermes_state",
   "hermes_state_common",
+  "hermes_state_continuity",
+  "hermes_state_context_authority",
+  "hermes_state_inbox",
+  "hermes_state_input_turns",
   "hermes_state_portability",
   "hermes_state_runs",
   "hermes_state_schema",
@@ -446,6 +451,7 @@ py-modules = [
   # Runtime RPC imports: include only these private namespace modules, not
   # the unrelated operational scripts in the same source directory.
   "scripts.run_checkpoint_claim",
+  "scripts.run_checkpoint_context",
   "scripts.run_checkpoint_resume",
 ]
 

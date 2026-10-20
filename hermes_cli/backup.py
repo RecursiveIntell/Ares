@@ -66,6 +66,7 @@ _QUICK_SNAPSHOTS_DIR = "state-snapshots"
 # exclude ``.archive`` here because the curator's ``skills/.archive/`` holds
 # restorable user skills that must survive a backup.
 _EXCLUDED_DIRS = {
+    "context-controller-keys",  # local authority credentials require explicit recovery
     "hermes-agent",     # the codebase repo — re-clone instead
     "__pycache__",      # bytecode caches — regenerated on import
     ".git",             # nested git dirs (profiles shouldn't have these, but safety)
@@ -308,6 +309,8 @@ def _iter_external_files(base: Path) -> List[Path]:
     """Yield regular files under *base* (a file or a directory), skipping
     symlinks, caches, and pyc files. *base* itself may be a file."""
     files: List[Path] = []
+    if "context-controller-keys" in base.parts:
+        return files
     if base.is_file() and not base.is_symlink():
         files.append(base)
         return files
@@ -1098,12 +1101,10 @@ def _extract_member_atomically(
     ``atomic_replace`` rather than a bare ``os.replace``: it resolves a
     symlinked target first, so a deployment that links ``config.yaml`` into a
     dotfiles repo keeps the link instead of having it silently swapped for a
-    regular file (GitHub #16743), and it falls back to copy/fsync/unlink on
-    ``EXDEV``/``EBUSY`` for cross-device and bind-mount installs.  That
-    fallback uses ``shutil.copyfile``, which does truncate in place, so on the
-    cross-device path the guarantee above degrades to today's behaviour rather
-    than improving on it; closing that belongs in ``utils.atomic_replace``,
-    where every atomic writer in the repo would benefit, not here.
+    regular file (GitHub #16743). On EXDEV the shared helper restages beside
+    the resolved destination before publication. Busy or persistently
+    contended destinations fail without an in-place overwrite, preserving
+    the previous complete file for retry.
 
     Permission bits *and* ownership are carried across the replace so routing
     through mkstemp does not change the file the caller would otherwise have
@@ -1153,7 +1154,7 @@ def _extract_member_atomically(
             if mode is not None:
                 # Apply the mode to the temp file BEFORE the replace so the
                 # target never transits through mkstemp's 0600, and so
-                # ``atomic_replace``'s EXDEV/EBUSY ``shutil.copystat`` fallback
+                # ``atomic_replace``'s EXDEV restaging ``shutil.copystat``
                 # copies the intended bits rather than 0600.  fchmod is
                 # Unix-only; Windows takes the path-based chmod.
                 if hasattr(os, "fchmod"):
@@ -1245,6 +1246,11 @@ def run_import(args) -> None:
         t0 = time.monotonic()
 
         for member in members:
+            # Credentials must not be restored from older or foreign archives,
+            # including their external-provider subtree.
+            if "context-controller-keys" in Path(member).parts:
+                skipped_runtime.append(member)
+                continue
             # External memory-provider state captured under the reserved
             # ``_external/`` arc prefix restores to its original home-relative
             # location (e.g. ~/.honcho/config.json), NOT under HERMES_HOME.
@@ -1320,7 +1326,10 @@ def run_import(args) -> None:
 
         # Summary
         print()
-        print(f"Import complete: {restored} files restored in {elapsed:.1f}s")
+        if errors:
+            print(f"Import incomplete: {restored} files restored, {len(errors)} failed in {elapsed:.1f}s")
+        else:
+            print(f"Import complete: {restored} files restored in {elapsed:.1f}s")
         print(f"  Target: {display_hermes_home()}")
 
         if restored_external:
@@ -1330,7 +1339,7 @@ def run_import(args) -> None:
             )
 
         if errors:
-            print(f"\n  Warnings ({len(errors)} files skipped):")
+            print(f"\n  Failures ({len(errors)} files not fully restored):")
             for e in errors[:10]:
                 print(e)
             if len(errors) > 10:
@@ -1345,6 +1354,10 @@ def run_import(args) -> None:
                 print(f"    {rel}")
             if len(skipped_runtime) > 10:
                 print(f"    ... and {len(skipped_runtime) - 10} more")
+
+        if errors:
+            # A partial restore must not activate mixed old/new configuration.
+            raise SystemExit(1)
 
         # Post-import: restore profile wrapper scripts
         profiles_dir = hermes_root / "profiles"

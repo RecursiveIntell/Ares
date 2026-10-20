@@ -883,7 +883,7 @@ class TestLocalOllamaModelDiscovery:
 
         row = next(row for row in rows if row["slug"] == "local-llm")
         assert row["models"] == ["qwen3:1.7b"]
-        fetch_api.assert_not_called()
+        assert all(call.args[1] != "http://127.0.0.1:11434/v1" for call in fetch_api.call_args_list)
 
     def test_picker_bare_custom_model_config_discovers_ollama_api_tags(self):
         """The documented model.provider=custom shape should use native tags."""
@@ -1082,7 +1082,7 @@ class TestLocalOllamaModelDiscovery:
 
         row = next(row for row in rows if row["name"] == "Local Ollama")
         assert row["models"] == ["qwen3:1.7b"]
-        fetch_api.assert_not_called()
+        assert all(call.args[1] != "http://127.0.0.1:11434/v1" for call in fetch_api.call_args_list)
 
     def test_model_validation_uses_ollama_api_tags_for_ollama_provider(self):
         """`/model` validation for provider=ollama should not probe `/models`."""

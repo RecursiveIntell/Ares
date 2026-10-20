@@ -1,6 +1,7 @@
 import type * as React from 'react'
 
 import type { ChatMessage } from '@/lib/chat-messages'
+import type { SelectorObservation } from '@/lib/selector-observation'
 import type { SessionMessage, UsageStats } from '@/types/hermes'
 
 export interface ContextSuggestion {
@@ -179,6 +180,11 @@ export interface PendingModelSelection {
    * while a genuinely different backend-normalized value can still settle it. */
   previousModel: string
   previousProvider: string
+  /** Renderer-only baseline for explicit rejection after several optimistic
+   * picks. Separate from previous* (which belongs to heartbeat comparison). */
+  rollbackModel?: string
+  rollbackProvider?: string
+  rollbackSource?: '' | 'default' | 'manual'
 }
 
 export interface ClientSessionState {
@@ -191,9 +197,14 @@ export interface ClientSessionState {
   /** Local model intent awaiting a matching or normalized backend metadata
    * update. A heartbeat repeating `previous*` is stale, not a rejection. */
   pendingModelSelection?: null | PendingModelSelection
+  selectorObservation?: SelectorObservation
   reasoningEffort: string
   serviceTier: string
   fast: boolean
+  /** Renderer-only uncertainty after a lost option acknowledgement/readback. */
+  unconfirmedRuntimeOptions?: ('effort' | 'fast')[]
+  /** Explicit desired settings waiting for acknowledgement or next-turn application. */
+  pendingRuntimeOptions?: null | { effort?: string; fast?: boolean }
   yolo: boolean
   personality: string
   busy: boolean
@@ -211,6 +222,9 @@ export interface ClientSessionState {
   adoptedRunningTurn: boolean
   pendingBranchGroup: string | null
   interrupted: boolean
+  /** A session.interrupt RPC is outstanding. The session remains busy until
+   *  the backend reports terminal state; this is only a per-session UI latch. */
+  interruptPending: boolean
   /** True after message.interim finalized a bubble in the still-running turn. */
   interimBoundaryPending: boolean
   /** A blocking clarify prompt is waiting on the user for this session. Drives

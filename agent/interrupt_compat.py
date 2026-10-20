@@ -27,6 +27,7 @@ def request_hard_interrupt(
     message: str | None = None,
     *,
     tool_reason: str | None = None,
+    operation_id: str | None = None,
 ) -> bool:
     """Request an explicit stop, falling back to the legacy interrupt ABI.
 
@@ -57,6 +58,10 @@ def request_hard_interrupt(
     kwargs = {}
     if tool_reason is not None and _accepts_keyword(interrupt, "tool_reason"):
         kwargs["tool_reason"] = tool_reason
+    if operation_id is not None and _accepts_keyword(interrupt, "operation_id"):
+        kwargs["operation_id"] = operation_id
+    # Unsupported adapters still receive physical cancellation. Only an
+    # owner-produced, operation-matched receipt can qualify that effect.
     if message is None:
         interrupt(**kwargs)
     else:

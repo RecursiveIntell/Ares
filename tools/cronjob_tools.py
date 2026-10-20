@@ -1171,9 +1171,15 @@ def _try_dispatch_background_run(
         except Exception:
             pass
 
-        # Same snapshot claim as _execute_job_now: carry the owner-bearing
-        # record into the run so terminal writes stay fenced by this owner.
-        claimed_job = claim_job_for_fire(job_id, return_job=True)
+        # Opt in to an ephemeral owner/field fence for releasing this claim
+        # only when dispatch positively proves that execution never started.
+        from cron.jobs import claim_job_for_fire_with_unstarted_receipt
+
+        claim_result = claim_job_for_fire_with_unstarted_receipt(job_id)
+        if isinstance(claim_result, tuple) and len(claim_result) == 2:
+            claimed_job, unstarted_receipt = claim_result
+        else:
+            claimed_job, unstarted_receipt = None, None
         if not isinstance(claimed_job, dict):
             refreshed = get_job(job_id)
             if refreshed is None:
@@ -1185,11 +1191,40 @@ def _try_dispatch_background_run(
             return {"claimed": False, "success": False, "error": reason}
     except Exception as e:
         logger.error("Failed to claim cron job %s for background run: %s", job_id, e)
+        # No runner started, but a failed acquisition cannot certify whether
+        # the owner published a claim. Never terminally mark or erase it here.
+        return {
+            "claimed": None, "dispatched": False, "success": False,
+            "status": "rejected", "error_code": "durable_storage_unavailable",
+            "execution_started": False, "error": str(e),
+            "claim_release_status": "write_uncertain", "claim_release_confirmed": False,
+        }
+
+    def refuse_unstarted(dispatch_result: Dict[str, Any]) -> Dict[str, Any]:
         try:
-            mark_job_run(job_id, False, str(e))
-        except Exception:
-            pass
-        return {"claimed": True, "dispatched": False, "success": False, "error": str(e)}
+            from cron.jobs import release_unstarted_fire_claim
+
+            release = release_unstarted_fire_claim(unstarted_receipt)
+            release_status = release.get("status", "write_uncertain")
+        except Exception as exc:
+            logger.warning("Unstarted cron claim release failed for %s: %s", job_id, exc)
+            release_status = "write_uncertain"
+        confirmed = release_status == "released"
+        error = dispatch_result.get("error") or "Background dispatch refused before execution."
+        if not confirmed:
+            error += f" Claim release was not confirmed ({release_status})."
+        refusal = {
+            "claimed": True, "dispatched": False, "success": False,
+            "status": "rejected",
+            "error_code": dispatch_result.get("error_code") or "durable_storage_unavailable",
+            "execution_started": False, "error": error,
+            "claim_release_status": release_status,
+            "claim_release_confirmed": confirmed,
+        }
+        for field in ("delegation_id", "durable_reservation_released"):
+            if field in dispatch_result:
+                refusal[field] = dispatch_result[field]
+        return refusal
 
     origin_ui_session_id = ""
     try:
@@ -1207,13 +1242,11 @@ def _try_dispatch_background_run(
 
         origin_session_id = _current_origin_session_id()
     except Exception as e:
-        logger.warning(
-            "cronjob run: async delegation registry unavailable (%s); "
-            "running job '%s' inline.", e, job_name,
-        )
-        result = _run_claimed_job(claimed_job, extra_prompt=extra_prompt)
-        result["dispatched"] = False
-        return result
+        logger.warning("cronjob run: async delegation registry unavailable (%s)", e)
+        return refuse_unstarted({
+            "status": "rejected", "error_code": "durable_storage_unavailable",
+            "execution_started": False, "error": str(e),
+        })
 
     try:
         from tools.delegate_tool import _get_max_async_children
@@ -1278,13 +1311,28 @@ def _try_dispatch_background_run(
             "delegation_id": dispatch.get("delegation_id"),
         }
 
-    # Pool at capacity (or submit failure): the claim is already taken and
-    # must not be stranded — run inline exactly as the legacy path did.
+    known_unstarted = (
+        dispatch.get("status") == "rejected"
+        and dispatch.get("execution_started") is False
+    )
+    if not known_unstarted:
+        # The runner may have been accepted. Preserve claim custody and do
+        # not retry inline or use the unstarted-only release receipt.
+        return {
+            "claimed": True, "dispatched": False, "success": False,
+            "status": "dispatch_uncertain", "error_code": "scheduling_uncertain",
+            "execution_started": None, "delegation_id": dispatch.get("delegation_id"),
+            "error": dispatch.get("error") or "Background dispatch outcome is uncertain.",
+        }
+    if dispatch.get("error_code") != "pool_capacity":
+        return refuse_unstarted(dispatch)
+
+    # A typed pool refusal alone permits one owner-bearing inline run.
     logger.info(
         "cronjob run: background pool unavailable (%s); running job '%s' inline.",
         dispatch.get("error", "rejected"), job_name,
     )
-    result = _run_claimed_job(job, extra_prompt=extra_prompt)
+    result = _run_claimed_job(claimed_job, extra_prompt=extra_prompt)
     result["dispatched"] = False
     return result
 
@@ -1619,6 +1667,29 @@ def cronjob(
             bg = _try_dispatch_background_run(
                 job, session_id=session_id, extra_prompt=extra_prompt
             )
+            if bg is not None and bg.get("status") in {"rejected", "dispatch_uncertain"}:
+                result = _format_job(job)
+                result["executed"] = False if bg.get("execution_started") is False else None
+                response = {
+                    "success": False,
+                    "job": result,
+                    "status": bg["status"],
+                    "error_code": bg.get("error_code"),
+                    "execution_started": bg.get("execution_started"),
+                    "error": bg.get("error"),
+                }
+                for field in (
+                    "delegation_id", "durable_reservation_released",
+                    "claim_release_status", "claim_release_confirmed",
+                ):
+                    if field in bg:
+                        response[field] = bg[field]
+                if bg["status"] == "dispatch_uncertain":
+                    response["note"] = (
+                        "Work may already be running. Keep the delegation handle; "
+                        "do not retry or run inline while submission remains uncertain."
+                    )
+                return json.dumps(response, indent=2)
             if bg is not None and bg.get("dispatched"):
                 _notify_provider_jobs_changed_safe()
                 result = _format_job(get_job(job_id) or {"id": job_id})

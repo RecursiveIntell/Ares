@@ -4914,25 +4914,25 @@ class TestHeadlessServeTokenPage:
         ws.mount_spa(spa_app)
         return TestClient(spa_app), ws
 
-    def test_root_serves_token_page_when_not_gated(self, monkeypatch):
-        import re
+    def test_root_does_not_serve_token_page_when_not_gated(self, monkeypatch):
+        """Headless ``/`` must never emit the session token.
+
+        This guard used to require the renderer's token to be embedded in the
+        root HTML (the #95575 white-screen fix). The P2 possession hardening
+        moved the handshake off HTML: ``/`` no longer renders
+        ``window.__HERMES_SESSION_TOKEN__``, and the desktop obtains its token
+        through the native bootstrap contract — covered by
+        ``tests/hermes_cli/test_p2_native_possession.py`` and
+        ``apps/desktop/electron/dashboard-token.possession.test.ts``. What
+        must still hold here is the negative: the root page never leaks the
+        session token.
+        """
 
         client, ws = self._headless_client(monkeypatch, gated=False)
         resp = client.get("/")
-        assert resp.status_code == 200
-        assert resp.headers["content-type"].startswith("text/html")
-        assert "no-store" in resp.headers.get("cache-control", "")
-        # Must match the desktop's extraction regex exactly
-        # (apps/desktop/electron/dashboard-token.ts).
-        match = re.search(
-            r'window\.__HERMES_SESSION_TOKEN__\s*=\s*("(?:\\.|[^"\\])*")',
-            resp.text,
-        )
-        assert match, resp.text
-        import json as _json
-
-        assert _json.loads(match.group(1)) == ws._SESSION_TOKEN
-        assert "window.__HERMES_AUTH_REQUIRED__=false" in resp.text
+        assert resp.status_code == 404
+        assert ws._SESSION_TOKEN not in resp.text
+        assert "__HERMES_SESSION_TOKEN__" not in resp.text
 
     def test_root_stays_404_json_when_auth_gated(self, monkeypatch):
         client, ws = self._headless_client(monkeypatch, gated=True)

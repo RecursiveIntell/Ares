@@ -26,7 +26,7 @@ def test_dispatch_nonstreaming_uses_ri_when_enabled():
         )
 
     assert result is response
-    can_use_ri.assert_called_once_with(agent)
+    can_use_ri.assert_called_once_with(agent, api_kwargs)
     ri_call.assert_called_once_with(agent, api_kwargs)
 
 
@@ -45,7 +45,7 @@ def test_dispatch_nonstreaming_reverts_to_openai_when_ri_disabled():
         )
 
     assert result is response
-    can_use_ri.assert_called_once_with(agent)
+    can_use_ri.assert_called_once_with(agent, api_kwargs)
     ri_call.assert_not_called()
     mock_client.chat.completions.create.assert_called_once_with(**api_kwargs)
 
@@ -135,8 +135,8 @@ def test_interruptible_streaming_codex_path_not_intercepted_by_ri_gate():
     assert agent._interruptible_api_call.call_args.args[0]["stream"] is True
 
 
-def test_should_use_ri_pipeline_defaults_to_native_plus_config_path(monkeypatch):
-    """Use RiPipeline when native is available and provider filters allow it."""
+def test_should_use_ri_pipeline_default_incompatible_provider_retains_sdk(monkeypatch):
+    """Default native availability must preserve provider wire compatibility."""
     agent = SimpleNamespace(
         provider="openrouter",
         _ri_pipeline_enabled=True,
@@ -146,7 +146,7 @@ def test_should_use_ri_pipeline_defaults_to_native_plus_config_path(monkeypatch)
         with monkeypatch.context() as cm:
             cm.delenv("HERMES_RI_PIPELINE", raising=False)
             cm.delenv("HERMES_RI_PIPELINE_PROVIDERS", raising=False)
-            assert _should_use_ri_pipeline(agent) is True
+            assert _should_use_ri_pipeline(agent) is False
 
 
 def test_should_use_ri_pipeline_honors_agent_disable_config(monkeypatch):

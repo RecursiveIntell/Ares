@@ -2355,6 +2355,8 @@ export interface Translations {
   }
 
   modelPicker: {
+    selectionUnavailable: string
+    sessionSelection: string
     title: string
     current: string
     unknown: string
@@ -2404,6 +2406,9 @@ export interface Translations {
       ultra: string
       updateFailed: string
       fastFailed: string
+      unconfirmed: string
+      unconfirmedObserved: string
+      unconfirmedUnavailable: string
     }
     gatewayMenu: {
       gateway: string
@@ -2802,6 +2807,10 @@ export interface Translations {
       notReady: string
       gatewayDisconnected: string
       sendFailed: string
+      responseExpired: string
+      responseUncertain: string
+      responseAccepted: string
+      responseRejected: string
       loadingQuestion: string
       other: string
       placeholder: string
@@ -2924,6 +2933,9 @@ export interface Translations {
     setProfileFailed: string
     sttDisabled: string
     stopFailed: string
+    stopNotSent: string
+    stopAlreadySettled: string
+    stopUnconfirmed: string
     regenerateFailed: string
     editFailed: string
     editTurnUnavailable: string

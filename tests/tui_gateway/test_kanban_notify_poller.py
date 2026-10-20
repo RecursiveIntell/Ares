@@ -281,11 +281,24 @@ class TestNotificationPollerLoopKanbanWiring:
         monkeypatch.setattr(
             server, "_emit", lambda event, sid, payload=None: emits.append((event, payload))
         )
-        monkeypatch.setattr(
-            server,
-            "_run_prompt_submit",
-            lambda rid, sid, sess, text: submits.append(text),
-        )
+        def _capture_submit(
+            rid,
+            sid,
+            sess,
+            text,
+            *,
+            display_kind=None,
+            display_metadata=None,
+        ):
+            submits.append(text)
+            sess.setdefault("_test_dispatch_metadata", []).append(
+                {
+                    "display_kind": display_kind,
+                    "display_metadata": display_metadata,
+                }
+            )
+
+        monkeypatch.setattr(server, "_run_prompt_submit", _capture_submit)
         stop = threading.Event()
         thread = threading.Thread(
             target=server._notification_poller_loop,
@@ -331,6 +344,14 @@ class TestNotificationPollerLoopKanbanWiring:
         assert any(tid in t for t in status_texts), status_texts
         assert any(e == "message.start" for e, _ in emits)
         assert any(tid in text for text in submits), submits
+        assert session["_test_dispatch_metadata"] == [
+            {
+                "display_kind": "internal_notification",
+                "display_metadata": {
+                    "synthetic_source": "kanban_notification",
+                },
+            }
+        ]
         assert session["running"] is True  # poller claimed the turn
         assert not session.get("_kanban_pending")
 
@@ -358,5 +379,13 @@ class TestNotificationPollerLoopKanbanWiring:
             thread.join(timeout=5)
 
         assert any(tid in text for text in submits), submits
+        assert session["_test_dispatch_metadata"] == [
+            {
+                "display_kind": "internal_notification",
+                "display_metadata": {
+                    "synthetic_source": "kanban_notification",
+                },
+            }
+        ]
         assert session["_kanban_pending"] == []
         assert session["running"] is True

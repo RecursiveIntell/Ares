@@ -2,6 +2,7 @@ import { useStore } from '@nanostores/react'
 import { type RefObject, useCallback, useEffect, useRef, useState } from 'react'
 
 import { useI18n } from '@/i18n'
+import { isGatewayDeliveryUnknownError } from '@/lib/gateway-delivery'
 import { triggerHaptic } from '@/lib/haptics'
 import { useSessionSlice } from '@/lib/use-session-slice'
 import { type ComposerAttachment } from '@/store/composer'
@@ -12,6 +13,7 @@ import {
   enqueueQueuedPrompt,
   getQueuedPrompts,
   isSteerableEntry,
+  markQueuedPromptDeliveryUnknown,
   MAX_AUTO_DRAIN_ATTEMPTS,
   migrateQueuedPrompts,
   promoteQueuedPrompt,
@@ -79,7 +81,11 @@ export function useComposerQueue({
   // were queued. The map is tiny (only halted sessions) so a plain subscribe
   // is fine; the auto-drain effect below reads it as a gate.
   const parkedSessions = useStore($parkedQueueSessions)
-  const queueParked = Boolean(activeQueueSessionKey && parkedSessions[activeQueueSessionKey])
+
+  const queueParked = Boolean(
+    activeQueueSessionKey &&
+    (parkedSessions[activeQueueSessionKey] || queuedPrompts.some(entry => entry.deliveryUnknown))
+  )
 
   const [queueEdit, setQueueEdit] = useState<QueueEditState | null>(null)
   queueEditRef.current = queueEdit
@@ -96,6 +102,7 @@ export function useComposerQueue({
 
   const prevQueueKeyRef = useRef(activeQueueSessionKey)
   const drainingQueueRef = useRef(false)
+  const steeringEntryIdsRef = useRef(new Set<string>())
   const drainFailuresRef = useRef(new Map<string, number>())
 
   const beginQueuedEdit = (entry: QueuedPromptEntry) => {
@@ -208,7 +215,7 @@ export function useComposerQueue({
       const drainRuntimeSessionId = sessionId ?? null
       const entry = pickEntry(getQueuedPrompts(drainQueueSessionKey))
 
-      if (!entry) {
+      if (!entry || entry.deliveryUnknown || steeringEntryIdsRef.current.has(entry.id)) {
         return false
       }
 
@@ -220,6 +227,7 @@ export function useComposerQueue({
             attachments: entry.attachments,
             ...(entry.displayText ? { displayText: entry.displayText } : {}),
             fromQueue: true,
+            queueEntryId: entry.id,
             sessionId: drainRuntimeSessionId,
             storedSessionId: drainQueueSessionKey
           })
@@ -259,7 +267,11 @@ export function useComposerQueue({
 
   const sendQueuedNow = useCallback(
     (id: string) => {
-      if (!activeQueueSessionKey || id === queueEdit?.entryId) {
+      if (
+        !activeQueueSessionKey ||
+        id === queueEdit?.entryId ||
+        getQueuedPrompts(activeQueueSessionKey).some(entry => entry.id === id && entry.deliveryUnknown)
+      ) {
         return false
       }
 
@@ -300,28 +312,47 @@ export function useComposerQueue({
 
       const entry = getQueuedPrompts(activeQueueSessionKey).find(e => e.id === id)
 
-      if (!entry || !isSteerableEntry(entry)) {
+      if (!entry || entry.deliveryUnknown || steeringEntryIdsRef.current.has(id) || !isSteerableEntry(entry)) {
         return false
       }
 
+      steeringEntryIdsRef.current.add(id)
       triggerHaptic('submit')
 
-      const accepted = await Promise.resolve(onSteer(entry.text))
+      let accepted: boolean
 
-      // Rejected (turn already settling, gateway said no): leave the entry
-      // queued exactly where it was — the settle drain picks it up, so the
-      // words are never lost. Only a delivered redirect consumes the entry.
-      if (!accepted) {
-        return false
+      try {
+        try {
+          accepted = await Promise.resolve(onSteer(entry.text))
+        } catch (error) {
+          if (!isGatewayDeliveryUnknownError(error)) {
+            throw error
+          }
+
+          // Keep the queued text visible, but prevent idle auto-drain from
+          // duplicating a redirect the gateway may already have accepted.
+          markQueuedPromptDeliveryUnknown(activeQueueSessionKey, id)
+
+          return false
+        }
+
+        // Rejected (turn already settling, gateway said no): leave the entry
+        // queued exactly where it was — the settle drain picks it up, so the
+        // words are never lost. Only a delivered redirect consumes the entry.
+        if (!accepted) {
+          return false
+        }
+
+        drainFailuresRef.current.delete(id)
+        removeQueuedPrompt(activeQueueSessionKey, id)
+        // A steer is the same "keep it moving" intent as a manual send — a park
+        // from an earlier Stop must not hold back what's left of the queue.
+        unparkQueuedPrompts(activeQueueSessionKey)
+
+        return true
+      } finally {
+        steeringEntryIdsRef.current.delete(id)
       }
-
-      drainFailuresRef.current.delete(id)
-      removeQueuedPrompt(activeQueueSessionKey, id)
-      // A steer is the same "keep it moving" intent as a manual send — a park
-      // from an earlier Stop must not hold back what's left of the queue.
-      unparkQueuedPrompts(activeQueueSessionKey)
-
-      return true
     },
     [activeQueueSessionKey, busy, onSteer, queueEditRef]
   )

@@ -38,7 +38,11 @@ def test_auxiliary_retries_share_logical_relay_identity(monkeypatch):
     responses = iter([
         SimpleNamespace(choices=[]),
         SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content="ok"), finish_reason="stop"
+                )
+            ]
         ),
     ])
     client = SimpleNamespace(
@@ -123,7 +127,12 @@ def test_auxiliary_provider_fallback_closes_one_real_logical_call(
     responses = iter([
         SimpleNamespace(choices=[]),
         SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="recovered"))]
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content="recovered"),
+                    finish_reason="stop",
+                )
+            ]
         ),
     ])
     client = SimpleNamespace(
@@ -201,7 +210,12 @@ def test_auxiliary_provider_fallback_records_one_terminal_model_route(
         SimpleNamespace(model="failed/model", choices=[]),
         SimpleNamespace(
             model="Accepted/Model",
-            choices=[SimpleNamespace(message=SimpleNamespace(content="recovered"))],
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content="recovered"),
+                    finish_reason="stop",
+                )
+            ],
         ),
     ])
     client = SimpleNamespace(

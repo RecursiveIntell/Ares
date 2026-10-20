@@ -1,0 +1,109 @@
+{
+  "schema": "ares.continuity-recovery-dispatch-evidence/v1",
+  "date": "2026-09-25",
+  "baseline_commit": "68ec16bcb70a56fd6d7da54897b7aa38b0aa5091",
+  "local_integrated_source_commit": "c46068ea1303f4da139d15685a589878a41fd135",
+  "integrated_main_commit": "a49bb222eb4ad9c66cfd476b93dde40013d8849a",
+  "scope": "Durable local recovery and sealed stateless text dispatch; not whole V4 qualification.",
+  "source_sha256": {
+    ".github/workflows/context-continuity-qualification.yml": "d384feb105b0b285bb6c112e146bf88df1230d6c972c055a62f56a456de2ba70",
+    "agent/chat_completion_helpers.py": "0a08604acd0248f56bed3f4362cd62c585cb9be56fb69860cf909400909e3172",
+    "agent/codex_runtime.py": "d86aac50f1d5068338b08f64a6ac5beecff67fd321f56fe671e55f91e0a7b7e6",
+    "agent/conversation_loop.py": "d14a313396c53c446a874581847179c5cfd8df2ae23e4e376f1c3bb8457617ac",
+    "agent/run_checkpoint_custody.py": "709a6224d3722b1232cdc65bfc02dfaebf18bacead6126d991505a5fe3fca4c7",
+    "agent/turn_context.py": "dfce46d050a60c86147bc320786450e62a3c53e16ab4b23e68cbb3097bc2157e",
+    "apps/desktop/src/app/shell/model-edit-submenu.test.tsx": "aeb4df2e387c8ce1e5643faf44aae9b950ff2f102faaea14af99ecf3d7d6ecee",
+    "apps/desktop/src/app/shell/model-edit-submenu.tsx": "c12d4fdc1ed8930e8e1a3936c3b0aa91f7e578d165a9acc801180e518b998f5f",
+    "apps/desktop/src/sdk/index.ts": "44fbe388d7e58546f63bdc48e6049d2c1a9e97e4b403730a07ba360456f323d9",
+    "apps/desktop/src/sdk/profile-routing.test.ts": "8ac39d083a63a87b50c8f8430f0b5ca2c7625405fb2b6ecdc1e30d798242e4e0",
+    "ares_runtime/continuity/budget.py": "f1f07fca14f7557572583fcf15c74b43de6b75d5d10f014d64e7cc09e8b47d06",
+    "ares_runtime/continuity/live.py": "ee356850eddaa8746f01975ef20739dbab7da40b567713e307553b7ac2e2af83",
+    "ares_runtime/continuity/runtime.py": "1f9c48210ce094c8f73e7e0791705a951b15aa7db082394b0433b18188f68280",
+    "hermes_cli/goals.py": "43e38d1ebb8f0a7958bf3a2372d0cacf22532b23f86aa361c20bda0c9f9d4aa7",
+    "hermes_cli/heartbeat.py": "a26c85485508ec51cb443db5205c0ebc2719fd90dba9eeb1b4297d6de5acb5dd",
+    "hermes_cli/loops.py": "c3fbff57e26c96c51c56db7ada2b7b3f6a457d96d0badfa297b7d2d6d8d1e641",
+    "hermes_state.py": "227967edc5fe2e40ef0f7b3c0f28bc58f51404cea81a218c8bd7770b8ce3ae56",
+    "hermes_state_continuity.py": "c8a55fc7613f0942d1478783d596a8483564ac8a8cfedc870d42d2f0199c8f19",
+    "hermes_state_runs.py": "c9ebe4959e9944ff817f6f688fb2908f7bd8b926ba65d27805e63ff6fd583e7d",
+    "plugins/context_engine/_context_governor/__init__.py": "a73d161ca1a0d7670f663d0c7f9fb2771459dbdac91b19b50219a4b58c1b6169",
+    "run_agent.py": "1c1d0b87fa1dbbaeb9b22aa294973c967e4bd98fb80ec61979097c8231aed6c6",
+    "scripts/run_tests.sh": "f199d5dfc3708263192748df36c7be3e6c1c6d5e3228f2b0719de57c5b306c09",
+    "tests/ares_runtime/test_context_rebase_state.py": "f9fae6dae948d19a2cf940601fb3884bebfc6fdf96e7f422d837a7118df1ad0a",
+    "tests/ares_runtime/test_continuity_dispatch.py": "1f8252ced413a497b0f478bfe24885832b9ccbfb6a0f066285973693a363cd86",
+    "tests/ares_runtime/test_continuity_native_governor.py": "e66b5ea239f15eb270d6fb8aa046c626f87396c3ca4d8d35f6b01a2c91c1060c",
+    "tests/ares_runtime/test_continuity_recovery.py": "4757d822908345fbd8e8174cc9217fc339f2651019674ed0aac7e1d28265a6ef",
+    "tests/ares_runtime/test_continuity_runtime.py": "4ed7641f07276ed6fd1f5f4f0a014299578fef5230fab11bc018fdfc083d2fee",
+    "tests/ares_runtime/test_continuity_snapshot_races.py": "5e1ad78a7151cbb0351abca0fe0ad713fb9fc29198216a96cdf7ed7f19cb911f",
+    "tests/test_tui_gateway_server.py": "5b12412bd222dbeda81f203d2a83d68d4f46b455a396102df3137c311893c23c",
+    "tests/tui_gateway/test_compute_host_phase1.py": "fc650f6c29867d8b21b5677ab18ae52e28370291f8cf045fd76dea27a300f19c",
+    "tui_gateway/compute_host.py": "064f35edbe9c8fb0a37c470d6e8c068e46afb5306741b6d52b9dd0a972dfa457",
+    "tui_gateway/host_supervisor.py": "40532840802d46355e193f07cc997dde251e922129400be9185323a8b4339c81",
+    "tui_gateway/server.py": "5df56a0e9481a22634e8490073bd39a0b69cca3fc2d15f12ca97b045be90ba83"
+  },
+  "validation": {
+    "canonical_runner": "scripts/run_tests.sh",
+    "python": "3.13",
+    "dependency_install": "uv sync --frozen --extra dev --extra anthropic --python 3.13",
+    "workers": 4,
+    "per_file_retries": 0,
+    "files": 36,
+    "passed": 1471,
+    "failed": 0,
+    "skipped": 4,
+    "paired_native_tests_executed": 3,
+    "log": "recovery-dispatch-test-run.log"
+  },
+  "native_owner": {
+    "repository": "RecursiveIntell/Libraries",
+    "commit": "0b099ec416de60f6adafb182f1d1e83795d05c56",
+    "crate": "context-governor",
+    "rust": "1.94.0",
+    "build": "locked debug",
+    "binary_sha256": "ed5d0a4493df8a5ce19f1e3b66fb3616c2108f67d8f21f0e4b0a0b714d337730",
+    "passed": 198,
+    "failed": 0,
+    "ignored": 1,
+    "log": "native-governor-test-run.log",
+    "disposable_key_profile": true
+  },
+  "independent_audit": {
+    "status": "passed_for_repair_scope",
+    "reviewer": "continuity_post_audit",
+    "resolved_findings": [
+      "AUD-01",
+      "AUD-02",
+      "AUD-03",
+      "AUD-04",
+      "AUD-05",
+      "AUD-06",
+      "AUD-R1",
+      "AUD-R2",
+      "AUD-R3",
+      "AUD-R4",
+      "AUD-R5"
+    ],
+    "final_delta_gate": {
+      "passed": 68,
+      "failed": 0,
+      "skipped": 4
+    },
+    "paired_native_gate": {
+      "passed": 188,
+      "failed": 0,
+      "skipped": 4
+    },
+    "final_source_hashes": {
+      "agent/chat_completion_helpers.py": "0a08604acd0248f56bed3f4362cd62c585cb9be56fb69860cf909400909e3172",
+      "ares_runtime/continuity/runtime.py": "1f9c48210ce094c8f73e7e0791705a951b15aa7db082394b0433b18188f68280",
+      "tests/ares_runtime/test_continuity_dispatch.py": "1f8252ced413a497b0f478bfe24885832b9ccbfb6a0f066285973693a363cd86"
+    }
+  },
+  "whole_v4_stage_promotion": false,
+  "live_provider_calls": 0,
+  "live_profile_activation": false,
+  "merge_authorized": false,
+  "evidence_sha256": {
+    "recovery-dispatch-test-run.log": "86ade2a11cd9a6128bbe08254ba8a5c38d3a156cfe093aaa13e1855046d9373c",
+    "native-governor-test-run.log": "35227b4e22bb3effb801e555c13a8c9b379a220e61ee82add7d69e9273aff703"
+  }
+}

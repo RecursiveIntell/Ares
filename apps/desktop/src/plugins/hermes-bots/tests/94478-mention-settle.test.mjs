@@ -93,7 +93,7 @@ import { readFileSync } from 'node:fs'
 const pluginSource = readFileSync(new URL('../plugin.js', import.meta.url), 'utf8')
 
 test('#94478: the quiet-round exit consults unaddressedGroupMentions before settling', () => {
-  const loopStart = pluginSource.indexOf('async function runGroupChatRounds')
+  const loopStart = pluginSource.indexOf('async function driveFrozenGroupRounds')
   assert.ok(loopStart >= 0, 'runGroupChatRounds must exist')
 
   const loop = pluginSource.slice(loopStart, pluginSource.indexOf('\n}', loopStart) + 2)
@@ -111,7 +111,7 @@ test('#94478: the quiet-round exit consults unaddressedGroupMentions before sett
 })
 
 test('#94478: a cap-forced exit is labelled distinctly from consensus settle', () => {
-  const loopStart = pluginSource.indexOf('async function runGroupChatRounds')
+  const loopStart = pluginSource.indexOf('async function driveFrozenGroupRounds')
   const loop = pluginSource.slice(loopStart, pluginSource.indexOf('\n}', loopStart) + 2)
 
   // The finally must record the tracked exit kind, not a hardcoded 'settled'.

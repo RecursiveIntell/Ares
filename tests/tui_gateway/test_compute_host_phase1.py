@@ -1,4 +1,5 @@
 import io
+from io import open as ioopen
 import json
 import os
 import sys
@@ -53,6 +54,81 @@ def test_host_interrupt_clears_child_pending_prompt(monkeypatch):
         assert session["_turn_cancel_requested"] is True
     finally:
         host.close()
+
+
+def test_cold_compute_host_restore_preserves_only_durable_summary_markers(
+    monkeypatch, tmp_path
+):
+    """Cold host replay must preserve the DB-owned bit, never a text lookalike."""
+    from hermes_state import SessionDB
+
+    session_key = "cold-governor-summary"
+    database = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        database.create_session(session_key, "synthetic system prompt")
+        database.append_message(session_key, "user", "Original active task.")
+        database.append_message(
+            session_key,
+            "assistant",
+            "Authenticated prior summary.",
+            _compressed_summary=True,
+        )
+        database.append_message(
+            session_key,
+            "user",
+            "This literal text says _compressed_summary=true.",
+        )
+
+        # The inspection/default projection remains unmarked. The host's
+        # model-facing replay is the explicitly opted-in projection.
+        ordinary = database.get_messages_as_conversation(session_key)
+        assert not any(m.get("_compressed_summary") for m in ordinary)
+
+        class _Agent:
+            session_id = session_key
+            model = "synthetic"
+            provider = "synthetic"
+
+        monkeypatch.setattr(server, "_sessions", {}, raising=False)
+        monkeypatch.setattr(server, "_get_db", lambda: database)
+        monkeypatch.setattr(server, "_make_agent", lambda *a, **kw: _Agent())
+        monkeypatch.setattr(server, "_transfer_db_to_agent", lambda *a, **kw: False)
+
+        def _register(sid, key, agent, history, **kwargs):
+            server._sessions[sid] = {
+                "agent": agent,
+                "session_key": key,
+                "history": list(history),
+            }
+
+        monkeypatch.setattr(server, "_init_session", _register)
+        host = ComputeHost(stdout=io.StringIO(), heartbeat_secs=0)
+        try:
+            session = host._ensure_server_session(
+                server,
+                {
+                    "sid": "cold-host-id",
+                    "session_key": session_key,
+                    "history": [{"role": "user", "content": "stale snapshot"}],
+                    "history_version": 0,
+                    "cols": 80,
+                },
+            )
+        finally:
+            host.close()
+
+        replayed = session["history"]
+        flagged = [m for m in replayed if m.get("_compressed_summary") is True]
+        assert len(flagged) == 1
+        assert flagged[0]["role"] == "assistant"
+        assert flagged[0]["content"] == "Authenticated prior summary."
+        user_lookalikes = [m for m in replayed if m.get("role") == "user"]
+        assert user_lookalikes[-1]["content"] == (
+            "This literal text says _compressed_summary=true."
+        )
+        assert not any(m.get("_compressed_summary") for m in user_lookalikes)
+    finally:
+        database.close()
 
 
 def test_ensure_server_session_fallback_uses_canonical_source_resolver(monkeypatch):
@@ -166,6 +242,13 @@ def test_compute_host_workers_inherit_tui_pool_env_or_8(monkeypatch):
 def test_mutator_route_table_matches_prd_inventory():
     assert MUTATOR_ROUTE_TABLE == {
         "config.set.model": "run-concurrent",
+        "config.set.fast": "run-concurrent",
+        "config.set.reasoning": "run-concurrent",
+        "config.set.runtime_options": "run-concurrent",
+        "session.redirect": "run-concurrent",
+        "session.steer": "run-concurrent",
+        "clarify.snapshot": "run-concurrent",
+        "clarify.respond": "run-concurrent",
         "prompt.submit": "turn-path",
         "session.interrupt": "turn-path",
         "reload.mcp": "run-concurrent",
@@ -173,6 +256,7 @@ def test_mutator_route_table_matches_prd_inventory():
         "session.run_checkpoint.claim": "run-concurrent",
         "session.run_checkpoint.refresh": "run-concurrent",
         "session.run_checkpoint.release": "run-concurrent",
+        "session.run_checkpoint.basis": "run-concurrent",
         "session.compress": "idle-gated",
         "prompt.submit.truncate": "idle-gated",
         "slash.model": "idle-gated",
@@ -251,10 +335,42 @@ def test_supervisor_spawn_keeps_final_child_env_sanitized(tmp_path, monkeypatch)
     captured: dict = {}
 
     class _Proc:
-        pid = 4242
-        stdin = io.StringIO()
-        stdout = io.StringIO()
-        stderr = io.StringIO()
+        """Fake Popen honoring the supervisor's transport contract: live pipe
+        stdin (real fd for the nonblocking FIFO path), poll/terminate/wait."""
+
+        def __init__(self):
+            self.pid = 4242
+            r, w = os.pipe()
+            self.stdout = io.StringIO()
+            self.stderr = io.StringIO()
+            self.stdin = ioopen(w, "w")
+            self._r = r
+            self._returned = False
+
+        def poll(self):
+            return None if not self._returned else 0
+
+        def terminate(self):
+            self._close()
+
+        def kill(self):
+            self._close()
+
+        def wait(self, timeout=None):
+            self._close()
+            return 0
+
+        def _close(self):
+            if not self._returned:
+                self._returned = True
+                try:
+                    self.stdin.close()
+                except Exception:
+                    pass
+                try:
+                    os.close(self._r)
+                except Exception:
+                    pass
 
     class _NoopThread:
         def __init__(self, *args, **kwargs):
@@ -273,8 +389,14 @@ def test_supervisor_spawn_keeps_final_child_env_sanitized(tmp_path, monkeypatch)
 
     def _fake_popen(*args, **kwargs):
         captured["env"] = dict(kwargs["env"])
-        supervisor._hello = {"boot_id": "test"}
-        supervisor._hello_event.set()
+        # New-order spawn clears hello AFTER Popen returns; publish the fake
+        # hello on a short timer so it lands after the clear and satisfies
+        # the real wait + validate path.
+        def _publish():
+            time.sleep(0.05)
+            supervisor._hello = {"boot_id": "test"}
+            supervisor._hello_event.set()
+        threading.Timer(0.0, _publish).start()
         return _Proc()
 
     monkeypatch.setattr(supervisor_mod, "_Thread", _NoopThread)
@@ -329,10 +451,42 @@ def test_supervisor_contextless_respawn_uses_captured_profile_owner(
     captured: dict = {}
 
     class _Proc:
-        pid = 4243
-        stdin = io.StringIO()
-        stdout = io.StringIO()
-        stderr = io.StringIO()
+        """Fake Popen honoring the supervisor's transport contract: live pipe
+        stdin (real fd for the nonblocking FIFO path), poll/terminate/wait."""
+
+        def __init__(self):
+            self.pid = 4243
+            r, w = os.pipe()
+            self.stdout = io.StringIO()
+            self.stderr = io.StringIO()
+            self.stdin = ioopen(w, "w")
+            self._r = r
+            self._returned = False
+
+        def poll(self):
+            return None if not self._returned else 0
+
+        def terminate(self):
+            self._close()
+
+        def kill(self):
+            self._close()
+
+        def wait(self, timeout=None):
+            self._close()
+            return 0
+
+        def _close(self):
+            if not self._returned:
+                self._returned = True
+                try:
+                    self.stdin.close()
+                except Exception:
+                    pass
+                try:
+                    os.close(self._r)
+                except Exception:
+                    pass
 
     class _NoopThread:
         def __init__(self, *args, **kwargs):
@@ -355,11 +509,16 @@ def test_supervisor_contextless_respawn_uses_captured_profile_owner(
 
     def _fake_popen(*args, **kwargs):
         captured["env"] = dict(kwargs["env"])
-        supervisor._hello = {
-            "boot_id": "test",
-            "hermes_home": str(target),
-        }
-        supervisor._hello_event.set()
+        # New-order spawn clears hello AFTER Popen returns; publish the fake
+        # hello on a short timer so it lands after the clear.
+        def _publish():
+            time.sleep(0.05)
+            supervisor._hello = {
+                "boot_id": "test",
+                "hermes_home": str(target),
+            }
+            supervisor._hello_event.set()
+        threading.Timer(0.0, _publish).start()
         return _Proc()
 
     monkeypatch.setattr(supervisor_mod, "_Thread", _NoopThread)
@@ -604,17 +763,24 @@ def test_resume_claim_adopts_the_compute_host_owner_when_parent_mirror_is_gone(m
     observed = {}
 
     class _Supervisor:
+        def wait_ready(self):
+            pass
+
         def lookup_session_key(self, key):
             assert key == session_key
             return {
                 "session_id": owner_sid,
                 "session_info": {"model": "owner-model", "provider": "owner-provider"},
                 "running": True,
+                "request_id": "owner-request-1",
+                "host_boot_id": "test",
             }
 
-        def observe_session(self, sid, callback):
+        def observe_session(self, sid, callback, *, request_id, expected_boot_id=None):
             observed["sid"] = sid
             observed["callback"] = callback
+            observed["request_id"] = request_id
+            observed["expected_boot_id"] = expected_boot_id
 
     record = {
         "agent": None,
@@ -689,7 +855,8 @@ def test_isolated_model_switch_is_applied_by_the_compute_host_owner(monkeypatch)
         assert response["result"]["value"] == "new-model"
         assert len(calls) == 1
         control_sid, route_name, payload, wait, timeout = calls[0]
-        assert (control_sid, route_name, wait, timeout) == (sid, "config.set.model", True, 30.0)
+        # The installed model-authority path permits a bounded owner probe before ACK.
+        assert (control_sid, route_name, wait, timeout) == (sid, "config.set.model", True, 90.0)
         assert payload["params"] == {
             "key": "model",
             "value": "new-model --provider new-provider --session",
@@ -697,6 +864,128 @@ def test_isolated_model_switch_is_applied_by_the_compute_host_owner(monkeypatch)
         assert session["_metadata_mirror"]["model"] == "new-model"
     finally:
         server._sessions.pop(sid, None)
+
+
+def test_isolated_fast_switch_uses_compute_host_owner_not_parent_mirror(monkeypatch):
+    sid = "fast-host-owner"
+    stale_agent = types.SimpleNamespace(model="openai/gpt-5.4", service_tier="priority", request_overrides={"service_tier": "priority"})
+    session = {"agent": stale_agent, "history_lock": threading.Lock(), "session_key": "stored-fast",
+               "running": False, "_compute_host_active": True}
+    calls = []
+
+    class _Supervisor:
+        boot_id = "boot-fast-test"
+
+        def control(self, control_sid, *, route_name, payload, wait=True, timeout=30.0,
+                    expected_boot_id=None):
+            calls.append((control_sid, route_name, payload))
+            return {"type": "control.ack", "sid": control_sid, "route_name": route_name,
+                    "_host_boot_id": self.boot_id,
+                    "result": {"key": "fast", "value": "normal"},
+                    "session_info": {"service_tier": "normal", "fast": False}}
+
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: True)
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: _Supervisor())
+    monkeypatch.setattr(server, "_write_config_key", lambda *_: pytest.fail("scoped fast must not write global config"))
+    try:
+        response = server.handle_request({"id": "fast-off", "method": "config.set",
+                                          "params": {"session_id": sid, "key": "fast", "value": "normal"}})
+        assert response["result"]["value"] == "normal"
+        assert len(calls) == 1
+        assert calls[0][:2] == (sid, "config.set.fast")
+        assert calls[0][2]["params"] == {"key": "fast", "value": "normal"}
+        assert stale_agent.service_tier == "priority"
+        assert session["_metadata_mirror"]["fast"] is False
+        assert server._session_info(stale_agent, session)["fast"] is False
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_stale_scoped_fast_id_never_writes_global_default(monkeypatch):
+    monkeypatch.setattr(server, "_write_config_key", lambda *_: pytest.fail("stale scoped id mutated global default"))
+    response = server.handle_request({"id": "stale-fast", "method": "config.set",
+                                      "params": {"session_id": "missing-fast-runtime", "key": "fast", "value": "normal"}})
+    assert response["error"]["code"] == 4001
+
+
+def test_fast_choice_before_first_compute_host_turn_is_pinned_not_sent(monkeypatch):
+    sid = "pre-host-fast"
+    session = {"agent": None, "agent_ready": threading.Event(), "history_lock": threading.Lock(),
+               "model_override": {"model": "openai/gpt-5.4"}, "session_key": "new-chat"}
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: True)
+    monkeypatch.setattr(server, "_send_compute_host_control",
+                        lambda *_a, **_kw: pytest.fail("host does not yet own this session"))
+    monkeypatch.setattr("hermes_cli.models.resolve_fast_mode_overrides",
+                        lambda _model: {"service_tier": "priority"})
+    try:
+        response = server.handle_request({"id": "pre-fast", "method": "config.set",
+                                          "params": {"session_id": sid, "key": "fast", "value": "fast"}})
+        assert response["result"]["value"] == "fast"
+        assert session["create_service_tier_override"] == "priority"
+        assert server._compute_host_turn_frame("turn", sid, session, "hello")["service_tier_override"] == "priority"
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_existing_compute_host_agent_applies_fast_off_and_on_at_owner(monkeypatch):
+    sid = "host-fast-live"
+    agent = types.SimpleNamespace(model="openai/gpt-5.4", provider="openai", service_tier="priority",
+                                  request_overrides={"service_tier": "priority", "foo": "bar"})
+    session = {"agent": agent, "history_lock": threading.Lock(), "session_key": "stored-fast",
+               "running": False, "history": []}
+    output = io.StringIO()
+    host = ComputeHost(stdout=output, heartbeat_secs=0)
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_write_config_key", lambda *_: pytest.fail("host scoped control wrote global config"))
+    monkeypatch.setattr(server, "_persist_live_session_runtime", lambda *_: None)
+    monkeypatch.setattr("hermes_cli.models.resolve_fast_mode_overrides",
+                        lambda _model: {"service_tier": "priority"})
+    try:
+        host._handle_control({"sid": sid, "request_id": "off", "route_name": "config.set.fast",
+                              "params": {"value": "normal"}})
+        frames = _json_lines(output)
+        assert frames[-1]["type"] == "control.ack"
+        assert frames[-1]["session_info"]["fast"] is False
+        assert agent.service_tier is None
+        assert agent.request_overrides == {"foo": "bar"}
+        assert session["create_service_tier_override"] == ""
+
+        host._handle_control({"sid": sid, "request_id": "on", "route_name": "config.set.fast",
+                              "params": {"value": "fast"}})
+        frames = _json_lines(output)
+        assert frames[-1]["type"] == "control.ack"
+        assert frames[-1]["session_info"]["fast"] is True
+        assert agent.request_overrides == {"foo": "bar", "service_tier": "priority"}
+    finally:
+        server._sessions.pop(sid, None)
+        host.close()
+
+
+def test_busy_compute_host_fast_control_defers_without_mutating_live_request(monkeypatch):
+    sid = "host-fast-busy"
+    agent = types.SimpleNamespace(model="fixture", provider="fixture", service_tier="priority",
+                                  request_overrides={"service_tier": "priority"})
+    session = {"agent": agent, "running": True, "history_lock": threading.Lock()}
+    server._sessions[sid] = session
+    # run_host() exports this for the real host child; a bare ComputeHost does not.
+    monkeypatch.setenv("HERMES_COMPUTE_HOST_CHILD", "1")
+    output = io.StringIO()
+    host = ComputeHost(stdout=output, heartbeat_secs=0)
+    try:
+        host._handle_control({"sid": sid, "request_id": "busy", "route_name": "config.set.fast",
+                              "params": {"value": "normal"}})
+        frame = _json_lines(output)[-1]
+        assert frame["type"] == "control.ack"
+        assert frame["result"]["deferred"] is True
+        # The in-flight request is immutable; the edit waits for the next admission.
+        assert agent.service_tier == "priority"
+        assert agent.request_overrides == {"service_tier": "priority"}
+        assert session["pending_model_switch"]["runtime_options"] == {"fast": False}
+    finally:
+        server._sessions.pop(sid, None)
+        host.close()
 
 
 def test_reclaimed_compute_host_owner_receives_stop_for_the_original_runtime(monkeypatch):
@@ -749,10 +1038,14 @@ def test_compute_host_lookup_returns_session_owner_metadata(monkeypatch):
     output = io.StringIO()
     host = ComputeHost(stdout=output, heartbeat_secs=0)
     monkeypatch.setattr(server, "_sessions", {owner_sid: session})
+    def owner_info(_agent, _session, *, lock_held=False):
+        assert lock_held is True
+        assert _session["history_lock"].locked()
+        return {"model": "owner-model", "provider": "owner-provider"}
     monkeypatch.setattr(
         server,
         "_session_info",
-        lambda _agent, _session: {"model": "owner-model", "provider": "owner-provider"},
+        owner_info,
     )
     try:
         host._handle_session_lookup(
@@ -770,6 +1063,7 @@ def test_compute_host_lookup_returns_session_owner_metadata(monkeypatch):
             {
                 "session_id": owner_sid,
                 "running": True,
+                "request_id": None,
                 "session_info": {"model": "owner-model", "provider": "owner-provider"},
             }
         ],

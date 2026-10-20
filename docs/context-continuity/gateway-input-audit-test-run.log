@@ -1,0 +1,25 @@
+▶ running per-file parallel test suite via run_tests_parallel.py
+  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)
+▶ pre-compiling bytecode cache
+▶ launching test runner
+Discovered 5 test files (~73 tests) under ['tests/state/test_message_row_publication.py', 'tests/test_compression_watermark_commit.py', 'tests/test_run_custody_obligations.py', 'tests/gateway/test_context_input.py', 'tests/ares_runtime/test_continuity_input.py']; running with -j 2
+[ 20.5% |    15/~73 | ✓21 | ✗ 0] ✓ tests/gateway/test_context_input.py (21✓, 3.6s)
+[ 31.5% |    23/~73 | ✓44 | ✗ 0] ✓ tests/state/test_message_row_publication.py (23✓, 0.9s)
+[ 53.4% |    39/~73 | ✓61 | ✗ 0] ✓ tests/ares_runtime/test_continuity_input.py (17✓, 4.8s)
+[ 79.5% |    58/~73 | ✓98 | ✗ 0] ✓ tests/test_run_custody_obligations.py (37✓, 6.4s)
+[100.0% |    73/~73 | ✓114 | ✗  0] ✓ tests/test_compression_watermark_commit.py (16✓, 16.0s)
+
+=== Summary: 5 files, 114 tests passed, 0 failed (100% complete) in 20.5s (2 workers) ===
+  Durations cached to test_durations.json (5 files)
+
+=== Per-file subprocess time distribution ===
+  Files:   5
+  Total subprocess CPU-wall: 31.7s  (runner wall: 20.5s, parallelism: 2x)
+  P50: 4.75s  P90: 15.98s  P95: 15.98s  P99: 15.98s  Max: 15.98s
+  <1s: 1 files (20%)  <2s: 1 files (20%)
+  Top 10 slowest:
+     15.98s  tests/test_compression_watermark_commit.py
+      6.44s  tests/test_run_custody_obligations.py
+      4.75s  tests/ares_runtime/test_continuity_input.py
+      3.58s  tests/gateway/test_context_input.py
+      0.91s  tests/state/test_message_row_publication.py

@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import os
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -273,7 +274,8 @@ def test_session_info_carries_project_for_owned_cwd(tmp_path):
     folder.mkdir()
     _call("projects.create", {"name": "Proj", "folders": [str(folder)]})
 
-    info = server._session_info(None, {"cwd": str(folder), "session_key": "s1"})
+    info = server._session_info(None, {"cwd": str(folder), "session_key": "s1",
+                                       "history_lock": threading.Lock()})
     assert info["project"] == {
         "id": info["project"]["id"],
         "slug": "proj",

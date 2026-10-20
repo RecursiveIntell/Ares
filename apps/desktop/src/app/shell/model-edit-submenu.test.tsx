@@ -127,5 +127,6 @@ describe('ModelEditSubmenu reports edits without performing them', () => {
     fireEvent.click(screen.getByRole('switch'))
 
     expect(onSelectModel).toHaveBeenCalledWith('m1-fast')
+    expect(onSetOptions).not.toHaveBeenCalled()
   })
 })

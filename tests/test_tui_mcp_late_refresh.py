@@ -42,7 +42,7 @@ def _install(monkeypatch, *, in_flight, join_result, new_defs):
     monkeypatch.setattr(entry, "join_mcp_discovery", lambda timeout=None: join_result)
     monkeypatch.setattr(model_tools, "get_tool_definitions", lambda **kw: list(new_defs))
     monkeypatch.setattr(server, "_load_enabled_toolsets", lambda *_a, **_kw: None)
-    monkeypatch.setattr(server, "_session_info", lambda agent, session: {"tools_len": len(agent.tools)})
+    monkeypatch.setattr(server, "_session_info", lambda agent, session, *, lock_held=False: {"tools_len": len(agent.tools)})
 
     emitted = []
     monkeypatch.setattr(server, "_emit", lambda event, sid, payload=None: emitted.append((event, sid, payload)))

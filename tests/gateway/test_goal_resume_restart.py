@@ -56,6 +56,7 @@ def hermes_home(tmp_path, monkeypatch):
 
 def _exhaust_budget(session_id: str, goal_text: str = "ship the benchmark"):
     """Set a 1-turn goal and drive it to budget-exhaustion auto-pause."""
+    goals._get_session_db().create_session(session_id, source="cli")
     mgr = goals.GoalManager(session_id)
     mgr.set(goal_text, max_turns=1)
     with patch(
@@ -98,7 +99,11 @@ class TestCliResumeRestartsWork:
             "— otherwise the goal sits idle until the user types something"
         )
         queued = cli._pending_input.get_nowait()
-        assert queued.startswith("[Continuing toward your standing goal]")
+        assert queued.text.startswith("[Continuing toward your standing goal]")
+        assert queued.display_kind == "internal_notification"
+        assert queued.display_metadata == {
+            "synthetic_source": "goal_continuation",
+        }
 
         state = goals.GoalManager(sid).state
         assert state.status == "active"

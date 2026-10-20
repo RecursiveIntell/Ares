@@ -6,6 +6,7 @@ import {
   type ClarifyRequest,
   clearClarifyRequest,
   hasClarifyRequest,
+  markClarifyResponseState,
   normalizeChoices,
   normalizeQuestions,
   setClarifyRequest,
@@ -84,6 +85,19 @@ describe('clarify store', () => {
     expect($clarifyRequests.get()['session-a']).toBeUndefined()
     expect($clarifyRequests.get()['session-b']?.requestId).toBe('other')
   })
+
+  it('keeps terminal response state on the same request and ignores stale ids', () => {
+    setClarifyRequest(clarify('session-a', 'req-a'))
+    markClarifyResponseState('req-old', 'session-a', 'expired')
+    expect($clarifyRequests.get()['session-a']?.responseState).toBeUndefined()
+
+    markClarifyResponseState('req-a', 'session-a', 'expired')
+    setClarifyRequest(clarify('session-a', 'req-a'))
+    expect($clarifyRequests.get()['session-a']?.responseState).toBe('expired')
+
+    setClarifyRequest(clarify('session-a', 'req-new'))
+    expect($clarifyRequests.get()['session-a']?.responseState).toBeUndefined()
+  })
 })
 
 describe('skipClarifyRequest', () => {
@@ -106,7 +120,11 @@ describe('skipClarifyRequest', () => {
 
     await expect(skipClarifyRequest('session-a')).resolves.toBe(true)
 
-    expect(request).toHaveBeenCalledWith('clarify.respond', { request_id: 'req-a', answer: '' })
+    expect(request).toHaveBeenCalledWith('clarify.respond', {
+      request_id: 'req-a',
+      session_id: 'session-a',
+      answer: ''
+    })
     expect(hasClarifyRequest('session-a')).toBe(false)
     // A background session's question is untouched — only the one being typed
     // over is skipped.
@@ -211,5 +229,42 @@ describe('normalizeQuestions', () => {
 
     expect(result[0]?.multiSelect).toBe(true)
     expect(result[1]?.multiSelect).toBe(false)
+  })
+})
+
+describe('clarify lifecycle admission', () => {
+  afterEach(() => clearClarifyRequest())
+  it('rejects late results after a clear and a same-id replacement in the same session', async () => {
+    const { beginClarifyResponse, finishClarifyResponse, updateClarifyInteraction } = await import('./clarify')
+    setClarifyRequest(clarify('a', 'same'))
+    const original = $clarifyRequests.get().a
+    const old = beginClarifyResponse(original)!
+    clearClarifyRequest('same', 'a')
+    setClarifyRequest(clarify('a', 'same'))
+    const replacement = $clarifyRequests.get().a
+    const next = beginClarifyResponse(replacement)!
+    expect(next.generation).not.toBe(old.generation)
+    expect(updateClarifyInteraction(old, { accepted: true, sendError: 'old warning' })).toBe(false)
+    finishClarifyResponse(old)
+    expect($clarifyRequests.get().a.interaction?.submitting).toBe(true)
+    expect($clarifyRequests.get().a.interaction?.accepted).toBe(false)
+    expect($clarifyRequests.get().a.interaction?.sendError).toBeNull()
+    finishClarifyResponse(next)
+    expect($clarifyRequests.get().a.interaction?.submitting).toBe(false)
+  })
+  it('isolates identical request ids in distinct sessions and preserves replay state', async () => {
+    const { beginClarifyResponse, updateClarifyInteraction } = await import('./clarify')
+    setClarifyRequest(clarify('a', 'same'))
+    setClarifyRequest(clarify('b', 'same'))
+    const original = $clarifyRequests.get().a
+    updateClarifyInteraction(original, { draft: 'my answer', deliveryUncertain: true, sendError: 'uncertain' })
+    const token = beginClarifyResponse(original)
+    expect(beginClarifyResponse(original)).toBeNull()
+    setClarifyRequest(clarify('a', 'same'))
+    expect($clarifyRequests.get().a.generation).toBe(token?.generation)
+    expect($clarifyRequests.get().a.interaction?.draft).toBe('my answer')
+    expect($clarifyRequests.get().a.interaction?.sendError).toBe('uncertain')
+    expect($clarifyRequests.get().b.interaction?.draft).toBe('')
+    expect(beginClarifyResponse($clarifyRequests.get().b)).not.toBeNull()
   })
 })

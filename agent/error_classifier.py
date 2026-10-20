@@ -853,6 +853,8 @@ def classify_api_error(
     provider_lower = (provider or "").strip().lower()
     model_lower = (model or "").strip().lower()
 
+    from agent.transports.ri_llm import RiTransportUnsupported
+
     def _result(reason: FailoverReason, **overrides) -> ClassifiedError:
         defaults = {
             "reason": reason,
@@ -862,7 +864,19 @@ def classify_api_error(
             "message": _extract_message(error, body),
         }
         defaults.update(overrides)
+        if not isinstance(error, RiTransportUnsupported) and defaults.get("error_context"):
+            defaults["error_context"] = dict(defaults["error_context"])
+            defaults["error_context"].pop("native_transport_refusal", None)
         return ClassifiedError(**defaults)
+
+    # Local native selection is a request-contract refusal, not a provider error.
+    # Recognize the actual exception type before plugins or text heuristics.
+    if isinstance(error, RiTransportUnsupported):
+        return _result(
+            FailoverReason.format_error,
+            retryable=False,
+            error_context={"native_transport_refusal": True},
+        )
 
     # ── 0. Plugin classifiers (first valid result wins) ─────────────
     #

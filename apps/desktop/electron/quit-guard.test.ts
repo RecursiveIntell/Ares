@@ -2,7 +2,34 @@ import assert from 'node:assert/strict'
 
 import { test } from 'vitest'
 
-import { mergeActiveWork, normalizeActiveWork, quitPromptFor } from './quit-guard'
+import { mergeActiveWork, normalizeActiveWork, quitConfirmationDisposition, quitPromptFor } from './quit-guard'
+
+test('an unanswered quit confirmation holds repeated quit requests', () => {
+  assert.equal(
+    quitConfirmationDisposition({ skipConfirm: false, confirmed: false, promptOpen: true, quittingForHandoff: false }),
+    'hold'
+  )
+})
+
+test('explicit confirmation and managed handoff retain quit authority', () => {
+  for (const override of ['skipConfirm', 'confirmed', 'quittingForHandoff'] as const) {
+    assert.equal(
+      quitConfirmationDisposition({
+        skipConfirm: false,
+        confirmed: false,
+        promptOpen: true,
+        quittingForHandoff: false,
+        [override]: true
+      }),
+      'proceed'
+    )
+  }
+
+  assert.equal(
+    quitConfirmationDisposition({ skipConfirm: false, confirmed: false, promptOpen: false, quittingForHandoff: false }),
+    'check-work'
+  )
+})
 
 test('normalizeActiveWork drops junk and keeps the count at least the title count', () => {
   assert.deepEqual(normalizeActiveWork(null), { count: 0, titles: [] })

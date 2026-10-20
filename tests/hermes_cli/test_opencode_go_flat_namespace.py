@@ -77,10 +77,19 @@ def _run_switch(raw_input: str, **extra):
         # For other providers, return empty so tests don't depend on them.
         return []
 
+    def target_runtime(*, requested, target_model):
+        assert requested == "opencode-go"
+        assert target_model == raw_input
+        return {
+            "provider": requested, "api_key": "fixture-opencode-key",
+            "base_url": "https://opencode.ai/zen/go/v1", "api_mode": "chat_completions",
+            "extra_headers": {},
+        }
+
     with patch(
         "hermes_cli.model_switch.list_provider_models",
         side_effect=fake_list_provider_models,
-    ):
+    ), patch("hermes_cli.runtime_provider.resolve_runtime_provider", side_effect=target_runtime):
         return switch_model(raw_input=raw_input, **defaults)
 
 
@@ -91,5 +100,10 @@ def _run_switch(raw_input: str, **extra):
 def test_kimi_k2_6_stays_on_opencode_go():
     """Regression guard: this path was always working, keep it working."""
     result = _run_switch("kimi-k2.6", current_model="deepseek-v4-pro")
+    assert result.success is True, result.error_message
     assert result.target_provider == "opencode-go"
     assert result.new_model == "kimi-k2.6"
+    assert result.provider_changed is False
+    assert result.api_key == "fixture-opencode-key"
+    assert result.base_url == "https://opencode.ai/zen/go/v1"
+    assert result.api_mode == "chat_completions"

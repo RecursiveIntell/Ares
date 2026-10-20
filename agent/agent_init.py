@@ -533,6 +533,27 @@ def _refuse_checkpoint_required_on_codex_app_server(
         )
 
 
+def _configured_context_rebase_enabled(config: Optional[Dict[str, Any]] = None) -> bool:
+    """Return the existing continuity config gate without creating state."""
+    try:
+        if config is None:
+            from hermes_cli.config import load_config_readonly
+
+            config = load_config_readonly()
+        from utils import is_truthy_value
+
+        compression = config.get("compression") if isinstance(config, dict) else None
+        if not isinstance(compression, dict):
+            return False
+        return is_truthy_value(
+            compression.get("context_rebase_enabled"), default=False
+        )
+    except Exception:
+        raise RuntimeError(
+            "codex_app_server cannot verify compression.context_rebase_enabled"
+        ) from None
+
+
 def init_agent(
     agent,
     base_url: str = None,
@@ -712,6 +733,75 @@ def init_agent(
         if isinstance(requested_provider, str) and requested_provider.strip()
         else agent.provider
     )
+
+    # Direct AIAgent construction must honor the same configured native route
+    # as runtime_provider before it reaches generic credentials or SDK setup.
+    # Explicit alternate modes remain caller-authoritative outside continuity
+    # trials; during a required native trial they cannot widen the route.
+    if api_mode != "codex_app_server":
+        try:
+            from hermes_cli.config import load_config_readonly
+            from hermes_cli.runtime_provider import _native_codex_app_server_requested
+
+            _native_config = load_config_readonly()
+        except Exception:
+            raise RuntimeError(
+                "cannot verify model.api_mode/openai_runtime Codex app-server selection"
+            ) from None
+        _native_model_cfg = (
+            _native_config.get("model")
+            if isinstance(_native_config, dict)
+            else None
+        )
+        _native_model_cfg = (
+            _native_model_cfg if isinstance(_native_model_cfg, dict) else {}
+        )
+        if _native_codex_app_server_requested(_native_model_cfg):
+            _native_trial = _configured_context_rebase_enabled(_native_config)
+            _configured_native_api_mode = (
+                str(_native_model_cfg.get("api_mode") or "").strip().lower()
+                == "codex_app_server"
+            )
+            _raw_configured_default = _native_model_cfg.get("default")
+            _configured_provider = str(
+                agent.provider
+                or _native_model_cfg.get("provider")
+                or (
+                    _raw_configured_default.get("provider")
+                    if isinstance(_raw_configured_default, dict)
+                    else ""
+                )
+                or ""
+            ).strip().lower()
+            _saved_native_provider = str(
+                _native_model_cfg.get("provider")
+                or (_raw_configured_default.get("provider")
+                    if isinstance(_raw_configured_default, dict) else "")
+                or ""
+            ).strip().lower()
+            _explicit_alternate_api_route = bool(
+                not _native_trial
+                and _saved_native_provider in {"openai", "openai-codex"}
+                and agent.provider not in {"", "auto", "openai", "openai-codex"}
+                and api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse"}
+            )
+            if _configured_provider not in {"openai", "openai-codex"}:
+                if _native_trial or (_configured_native_api_mode and not _explicit_alternate_api_route):
+                    raise ValueError(
+                        "codex_app_server requires provider 'openai' or 'openai-codex'"
+                    )
+            else:
+                if _native_trial and api_mode is not None:
+                    raise ValueError(
+                        "explicit api_mode cannot override configured codex_app_server "
+                        "with compression.context_rebase_enabled"
+                    )
+                if api_mode is None:
+                    api_mode = "codex_app_server"
+                    if not agent.provider:
+                        agent.provider = _configured_provider
+                        if not agent.requested_provider:
+                            agent.requested_provider = _configured_provider
     agent._credential_pool = credential_pool
     agent.acp_command = acp_command or command
     agent.acp_args = list(acp_args or args or [])
@@ -774,6 +864,21 @@ def init_agent(
         else:
             agent.api_mode = "chat_completions"
 
+    if agent.api_mode == "codex_app_server":
+        if agent.provider not in {"openai", "openai-codex"}:
+            raise ValueError(
+                "codex_app_server requires provider 'openai' or 'openai-codex'"
+            )
+        if _configured_context_rebase_enabled():
+            if base_url or api_key:
+                raise ValueError(
+                    "codex_app_server with compression.context_rebase_enabled "
+                    "does not accept explicit API credentials or base_url"
+                )
+            raise ValueError(
+                "codex_app_server is not qualified for compression.context_rebase_enabled"
+            )
+
     # Credential-pool validation runs AFTER provider auto-detection so
     # a pool scoped to e.g. "anthropic" is not rejected when the agent
     # was constructed with provider=None and an anthropic.com URL.
@@ -794,10 +899,11 @@ def init_agent(
 
     # Eagerly warm the transport cache so import errors surface at init,
     # not mid-conversation.  Also validates the api_mode is registered.
-    try:
-        agent._get_transport()
-    except Exception:
-        pass  # Non-fatal — transport may not exist for all modes yet
+    if agent.api_mode != "codex_app_server":
+        try:
+            agent._get_transport()
+        except Exception:
+            pass  # Non-fatal — transport may not exist for all modes yet
 
     try:
         from hermes_cli.model_normalize import (
@@ -1283,6 +1389,14 @@ def init_agent(
         if not agent.quiet_mode:
             _gr_label = " + Guardrails" if agent._bedrock_guardrail_config else ""
             print(f"🤖 AI Agent initialized with model: {agent.model} (AWS Bedrock, {agent._bedrock_region}{_gr_label})")
+    elif agent.api_mode == "codex_app_server":
+        # Native Codex app-server owns transport and authentication. Keep the
+        # generic OpenAI SDK router completely out of this init path.
+        agent.client = None
+        agent.api_key = ""
+        agent._client_kwargs = {}
+        if not agent.quiet_mode:
+            print(f"🤖 AI Agent initialized with model: {agent.model} (Codex app-server)")
     else:
         client_kwargs = {}
         if api_key and base_url:
@@ -1992,6 +2106,8 @@ def init_agent(
     _agent_section = _agent_cfg.get("agent", {})
     if not isinstance(_agent_section, dict):
         _agent_section = {}
+    from agent.transports.ri_llm import configure_ri_pipeline
+    configure_ri_pipeline(agent, _agent_cfg)
     agent._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
 
     # Execution-discipline guidance gate: "auto" (default — matches
@@ -2207,6 +2323,20 @@ def init_agent(
         compression_max_attempts = 3
     compression_max_attempts = min(compression_max_attempts, 10)
 
+    _raw_rebase_no_progress = _compression_cfg.get(
+        "context_rebase_max_no_progress", 2
+    )
+    if isinstance(_raw_rebase_no_progress, bool):
+        context_rebase_max_no_progress = 2
+    else:
+        try:
+            context_rebase_max_no_progress = int(_raw_rebase_no_progress)
+        except (TypeError, ValueError):
+            context_rebase_max_no_progress = 2
+    if context_rebase_max_no_progress < 1:
+        context_rebase_max_no_progress = 2
+    context_rebase_max_no_progress = min(context_rebase_max_no_progress, 100)
+
     def _parse_prune_int(raw, default):
         # Same parser semantics as compression.max_attempts above: reject
         # booleans (bool subclasses int — YAML `true` would coerce to 1),
@@ -2291,6 +2421,12 @@ def init_agent(
     # load_config failure → {}), re-arming the pre-lease drift abort.
     compression_in_place = is_truthy_value(
         _compression_cfg.get("in_place"), default=True
+    )
+    # Automatic working-context rebase is deliberately opt-in until the
+    # selected provider/effect route has passed continuity qualification.
+    # Source support may ship disabled without widening live authority.
+    compression_context_rebase = is_truthy_value(
+        _compression_cfg.get("context_rebase_enabled"), default=False
     )
     # Opt-in (default False): a micro-compaction pass rewrites already-sent
     # history every turn, which breaks the provider prompt-cache prefix on a
@@ -2687,7 +2823,16 @@ def init_agent(
     except Exception:
         pass
 
-    if _engine_name != "compressor":
+    if _engine_name == "ri-context-governor":
+        # Ares explicitly selects a certified, receipt-preserving engine.
+        # Readiness failure must not select Hermes' LLM compressor instead.
+        from plugins.context_engine import (
+            ContextEngineActivationError,
+            load_context_engine_strict,
+        )
+
+        _selected_engine = load_context_engine_strict(_engine_name)
+    elif _engine_name != "compressor":
         # Try loading from plugins/context_engine/<name>/
         try:
             from plugins.context_engine import load_context_engine
@@ -2771,6 +2916,7 @@ def init_agent(
             api_key=getattr(agent, "api_key", ""),
             provider=agent.provider,
             api_mode=agent.api_mode,
+            max_tokens=agent.max_tokens,
             threshold_percent=compression_threshold,
         )
         if not agent.quiet_mode:
@@ -2803,10 +2949,15 @@ def init_agent(
     if callable(_bind_session_state):
         try:
             _bind_session_state(session_db=session_db, session_id=agent.session_id)
-        except Exception:
-            pass
+        except Exception as _ce_bind_err:
+            if _engine_name == "ri-context-governor":
+                raise ContextEngineActivationError(
+                    f"configured context engine '{_engine_name}' failed its "
+                    f"session binding: {_ce_bind_err}"
+                ) from _ce_bind_err
     agent.compression_enabled = compression_enabled
     agent.compression_in_place = compression_in_place
+    agent.context_rebase_enabled = compression_context_rebase
     # Apply micro-compaction settings to the compressor (feature is opt-in)
     _cc = getattr(agent, "context_compressor", None)
     # compression.checkpoint_required: micro-compaction is a lossy rewrite
@@ -2835,6 +2986,7 @@ def init_agent(
     agent.codex_responses_native_compaction = codex_responses_native_compaction
     agent.codex_responses_compact_threshold = codex_responses_compact_threshold
     agent.max_compression_attempts = compression_max_attempts
+    agent.context_rebase_max_no_progress = context_rebase_max_no_progress
     agent.compression_idle_compact_after_seconds = (
         compression_idle_compact_after_seconds
     )
@@ -2909,6 +3061,7 @@ def init_agent(
             agent.enabled_toolsets is None
             or "context_engine" in agent.enabled_toolsets
         )
+        and "context_engine" not in (agent.disabled_toolsets or [])
     ):
         _existing_tool_names = {
             t.get("function", {}).get("name")
@@ -2939,6 +3092,11 @@ def init_agent(
 
     # Notify context engine of session start
     if hasattr(agent, "context_compressor") and agent.context_compressor:
+        _session_start_context = (
+            {"session_db": session_db}
+            if _engine_name == "ri-context-governor"
+            else {}
+        )
         try:
             agent.context_compressor.on_session_start(
                 agent.session_id,
@@ -2947,8 +3105,14 @@ def init_agent(
                 model=agent.model,
                 context_length=getattr(agent.context_compressor, "context_length", 0),
                 conversation_id=getattr(agent, "_gateway_session_key", None),
+                **_session_start_context,
             )
         except Exception as _ce_err:
+            if _engine_name == "ri-context-governor":
+                raise ContextEngineActivationError(
+                    f"configured context engine '{_engine_name}' failed its "
+                    f"session start: {_ce_err}"
+                ) from _ce_err
             _ra().logger.debug("Context engine on_session_start: %s", _ce_err)
 
     agent._subdirectory_hints = SubdirectoryHintTracker(
@@ -3091,6 +3255,9 @@ def init_agent(
     # preferred model gets a fresh attempt each time.  Uses a single dict
     # so new state fields are easy to add without N individual attributes.
     _cc = agent.context_compressor
+    from agent.agent_runtime_helpers import apply_fast_mode_runtime, get_fast_mode_intent
+
+    requested_fast_tier = get_fast_mode_intent(agent)
     agent._primary_runtime = {
         "model": agent.model,
         "provider": agent.provider,
@@ -3102,6 +3269,7 @@ def init_agent(
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,
         "reasoning_echo_flag": getattr(agent, "_reasoning_echo_flag", False),
+        "service_tier_intent": requested_fast_tier,
         # Context engine state that _try_activate_fallback() overwrites.
         # Use getattr for model/base_url/api_key/provider since plugin
         # engines may not have these (they're ContextCompressor-specific).
@@ -3118,6 +3286,7 @@ def init_agent(
             "anthropic_base_url": agent._anthropic_base_url,
             "is_anthropic_oauth": agent._is_anthropic_oauth,
         })
+    apply_fast_mode_runtime(agent, requested_fast_tier)
 
 
 

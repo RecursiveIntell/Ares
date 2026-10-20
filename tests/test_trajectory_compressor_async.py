@@ -43,9 +43,12 @@ class TestAsyncClientLazyCreation:
         comp._async_client_api_key = "test-key"
         comp.async_client = None
 
-        mock_async_openai = MagicMock()
+        from openai import AsyncOpenAI
+        mock_async_openai = MagicMock(wraps=AsyncOpenAI)
         with patch("openai.AsyncOpenAI", mock_async_openai):
             client = comp._get_async_client()
+        import asyncio
+        asyncio.run(client.close())
 
         mock_async_openai.assert_called_once_with(
             api_key="test-key",
@@ -67,16 +70,20 @@ class TestAsyncClientLazyCreation:
         call_count = 0
         instances = []
 
+        from openai import AsyncOpenAI
         def mock_constructor(**kwargs):
             nonlocal call_count
             call_count += 1
-            instance = MagicMock()
+            instance = AsyncOpenAI(**kwargs)
             instances.append(instance)
             return instance
 
         with patch("openai.AsyncOpenAI", side_effect=mock_constructor):
             client1 = comp._get_async_client()
             client2 = comp._get_async_client()
+        import asyncio
+        for instance in instances:
+            asyncio.run(instance.close())
 
         # Should have created two separate instances
         assert call_count == 2

@@ -214,7 +214,16 @@ jobs:
           fi
 
           # Enable auto-merge (squash). If already enabled, this is a no-op.
-          gh pr merge "$PR_NUM" --auto --squash || true
+          # Org auto-merge may be disabled (enablePullRequestAutoMerge=false):
+          # in that case the PR stays open for team review instead of failing
+          # the run — the next run re-applies on the current state either way.
+          if ! gh pr merge "$PR_NUM" --auto --squash 2>/dev/null; then
+            if gh pr view "$PR_NUM" --json state,mergeable --jq '.state + "/" + .mergeable' 2>/dev/null | grep -q "OPEN/MERGEABLE"; then
+              echo "::notice::Auto-merge is disabled for this repository; the fmt(js) PR stays open for review."
+            else
+              echo "Could not enable auto-merge; the fmt(js) PR remains open for maintainer review."
+            fi
+          fi
 
       - name: Wait for merge, auto-close on failure or stale
         env:

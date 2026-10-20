@@ -1,5 +1,6 @@
 import type { Dispatch, SetStateAction } from 'react'
 
+import type { OnMainModelChanged } from '@/app/session/hooks/composer-model-selection-owner'
 import type { HermesGateway } from '@/hermes'
 import type { IconComponent } from '@/lib/icons'
 import type { EnvVarInfo } from '@/types/hermes'
@@ -22,7 +23,7 @@ export interface SettingsPageProps {
   gateway?: HermesGateway | null
   onClose: () => void
   onConfigSaved?: () => void
-  onMainModelChanged?: (provider: string, model: string) => void
+  onMainModelChanged?: OnMainModelChanged
 }
 
 export interface ProviderGroup {

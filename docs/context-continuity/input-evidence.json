@@ -1,0 +1,60 @@
+{
+  "schema": "ares.context-continuity.input-evidence/v1",
+  "base_commit": "cc06a6208c5b2e3eaf25230627b5a0012d38e866",
+  "source_sha256": {
+    "hermes_state_inbox.py": "65f27a0bce8d2a1ba6ac01e66053df95ab59b442525d322af114f766227936bb",
+    "hermes_state.py": "73e9e81a9713d6b5a13ab33fa1ec8164b234341f35ddf61262f4fca580694ac1",
+    "hermes_state_continuity.py": "daae5804b898fc58abedbf774c0855e2a7b39ec8240e325fac6a7725630ce329",
+    "hermes_state_runs.py": "24da62ae75dd8de70a991be03a2443a6f57c758be3b3d2d06f2131a54524b656",
+    "agent/context_input.py": "d7c5269b31c0122c4110a6f0456c974d4d7b9895c931ea3047af8f91f2522229",
+    "agent/turn_context.py": "5dc7587a0fffbce95c38af2cf224238886d65e2e261a815547110c9e9465b0b9",
+    "ares_runtime/continuity/runtime.py": "b47e2ba647cabdd2f695df70c5fe82fdb1ff23ba29835805b7dd321fd9a4cf8c",
+    "run_agent.py": "7d1c8572377f58b5833590e4b7cb2198a2b0e9f37d46727baf1fcde2754e0490",
+    "tui_gateway/server.py": "50a39fc92bcf6e2ba80c2557e7df6408b5437a5bd749dc09185785a0b42ac155",
+    "tui_gateway/methods_prompt.py": "de72370b069889c15fe1ce100c2a15e23184972b53d486d4db394e59431816d0",
+    "tui_gateway/compute_host.py": "616a553ccabdaf2d1977045fbd52a4ffa4fd241d86614ab72288553bb5328e16",
+    "tests/ares_runtime/test_continuity_input.py": "b6378de50ce4b1bbb206f8736f216ef659a5ee82b8b0b22e2c2a562ab3d64e6d"
+  },
+  "scope": "Native root inbox, real AIAgent lease boundary, selected TUI pre-ack acceptance and dispatch fencing",
+  "validation": {
+    "passed": 1020,
+    "failed": 0,
+    "files": 42,
+    "log": "input-test-run.log",
+    "independent_audit_passed": 24,
+    "closed_findings": [
+      "AUD-I1",
+      "AUD-I2",
+      "AUD-I3"
+    ],
+    "ruff": "passed",
+    "git_diff_check": "passed"
+  },
+  "proofs": [
+    "Durable root sequence, native deduplication and collision refusal before turn lease",
+    "Immutable authentic receipt and atomic ordered transcript projection",
+    "Unprojected late input invalidates stale provider/settlement/tool controls",
+    "Pre-stop queued input cannot resume execution by late projection",
+    "Default and named profile, continuation alias and fork scope isolation",
+    "Distinct identical submissions retained; duplicate ID never starts another execution",
+    "Real TUI file expansion uses original clean input with expanded API sidecar",
+    "Parked successor retry/recovery projects each input once",
+    "Separate process reopen and lost acceptance ACK reconcile stable event identity"
+  ],
+  "limits": [
+    "Gateway ingress and autonomous cold input draining/controller wake remain separate",
+    "Generated invocation IDs do not provide transport-level cross-delivery deduplication",
+    "Selected continuity routes currently support text; attachments refuse",
+    "Projection is not completion; an already-projected duplicate is refused",
+    "No external effect-owner fence or live provider qualification claimed"
+  ],
+  "hosted_baseline": {
+    "commit": "cc06a6208c5b2e3eaf25230627b5a0012d38e866",
+    "ci_run": 36130307929,
+    "conclusion": "success"
+  },
+  "packaging": {
+    "wheel": "Unsupported by canonical setup.py; attempted build refused without bypass",
+    "supported_routes": "Editable install locally; Nix/Docker hosted checks on the published candidate"
+  }
+}

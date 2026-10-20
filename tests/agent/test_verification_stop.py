@@ -8,6 +8,7 @@ import pytest
 from agent.verification_evidence import (
     mark_workspace_edited,
     record_terminal_result,
+    verification_status,
 )
 from agent.verification_stop import (
     build_verify_on_stop_nudge,
@@ -147,6 +148,50 @@ def test_nudge_checks_all_edited_workspaces(tmp_path, monkeypatch):
 
     assert nudge is not None
     assert "fresh passing verification evidence" in nudge
+
+
+@pytest.mark.parametrize("operation", ["update-delete", "move"])
+def test_patch_producer_stales_every_workspace_before_stop(tmp_path, monkeypatch, operation):
+    """Real producer/state/consumer; patch bytes stop at an inert backend."""
+    from types import SimpleNamespace
+    from tools import file_tools
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    project_a, project_b = tmp_path / "a", tmp_path / "b"
+    for project in (project_a, project_b):
+        _make_project(project)
+        (project / "src").mkdir()
+        (project / "src" / "app.ts").write_text("old\n", encoding="utf-8")
+        record_terminal_result(command="pnpm test", cwd=project, session_id="conversation", exit_code=0)
+    changed_a = str(project_a / "src" / "app.ts")
+    changed_b = str(project_b / "src" / "app.ts")
+    headers = (
+        f"*** Move File: {changed_a} -> {changed_b}"
+        if operation == "move"
+        else f"*** Update File: {changed_a}\n@@\n-old\n+new\n*** Delete File: {changed_b}"
+    )
+    backend = SimpleNamespace(patch_v4a=lambda patch: SimpleNamespace(to_dict=lambda: {"success": True}))
+    monkeypatch.setattr(file_tools, "_get_file_ops", lambda task_id: backend)
+    result = json.loads(file_tools.patch_tool(
+        mode="patch", patch=f"*** Begin Patch\n{headers}\n*** End Patch\n",
+        task_id="turn", session_id="conversation",
+    ))
+    assert "error" not in result
+    assert set(result["files_modified"]) == {changed_a, changed_b}
+    for project in (project_a, project_b):
+        status = verification_status(session_id="conversation", cwd=project)
+        assert status["status"] == "stale"
+        assert status["changed_paths"] == [str(project / "src" / "app.ts")]
+        assert verification_status(session_id="turn", cwd=project)["status"] == "unverified"
+    # Refresh only A. The real stop consumer must still notice stale B.
+    record_terminal_result(command="pnpm test", cwd=project_a, session_id="conversation", exit_code=0)
+    assert build_verify_on_stop_nudge(
+        session_id="conversation", changed_paths=[changed_a, changed_b]
+    ) is not None
+    record_terminal_result(command="pnpm test", cwd=project_b, session_id="conversation", exit_code=0)
+    assert build_verify_on_stop_nudge(
+        session_id="conversation", changed_paths=[changed_a, changed_b]
+    ) is None
 
 
 

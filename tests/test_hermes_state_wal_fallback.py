@@ -14,6 +14,7 @@ filesystem".
 """
 
 import sqlite3
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -495,11 +496,12 @@ class TestSessionDbUsesWalFallback:
         factory = _make_blocking_factory("locking protocol", attempts)
 
         def gated_connect(*args, **kwargs):
-            # connect_tracked passes a tracking-augmented factory; drop it and
-            # substitute the double, which connect_tracked re-applies to the
-            # returned instance.
-            kwargs.pop("factory", None)
-            return real_connect(str(target), factory=factory, **kwargs)
+            requested = args[0] if args else kwargs["database"]
+            # sqlite3 is shared across modules: leave schema-reference and
+            # other non-target connections untouched, including :memory:.
+            if Path(requested).resolve() == target.resolve():
+                kwargs["factory"] = factory
+            return real_connect(*args, **kwargs)
 
         with patch("hermes_state.sqlite3.connect", side_effect=gated_connect):
             db = SessionDB(db_path=target)
@@ -527,11 +529,12 @@ class TestSessionDbUsesWalFallback:
         factory = _make_silent_noop_factory("delete")
 
         def gated_connect(*args, **kwargs):
-            # connect_tracked passes a tracking-augmented factory; drop it and
-            # substitute the double, which connect_tracked re-applies to the
-            # returned instance.
-            kwargs.pop("factory", None)
-            return real_connect(str(target), factory=factory, **kwargs)
+            requested = args[0] if args else kwargs["database"]
+            # sqlite3 is shared across modules: leave schema-reference and
+            # other non-target connections untouched, including :memory:.
+            if Path(requested).resolve() == target.resolve():
+                kwargs["factory"] = factory
+            return real_connect(*args, **kwargs)
 
         with patch("hermes_state.sqlite3.connect", side_effect=gated_connect):
             with caplog.at_level("ERROR", logger="hermes_state"):

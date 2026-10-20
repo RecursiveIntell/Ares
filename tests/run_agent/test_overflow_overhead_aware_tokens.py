@@ -402,3 +402,43 @@ class TestLongContextTierOverheadAwareTokens:
             "during long-context-tier recovery. All calls: "
             + str([c["tools"] for c in estimate_calls])
         )
+
+    def test_context_overflow_no_progress_guidance_does_not_prompt_compress(
+        self, agent
+    ):
+        # This audited exit is ordinary context overflow after a no-op
+        # compression, not the distinct long-context subscription-tier route.
+        error = Exception("maximum context length exceeded")
+        error.status_code = 400
+        agent.client.chat.completions.create.side_effect = error
+        agent.context_rebase_enabled = False
+        agent.context_compressor.context_length = 200_000
+        agent.context_compressor.automatic_rebase_block_reason = lambda: (
+            "CONTEXT_REBASE_LINEAGE_INTEGRITY_MISMATCH"
+        )
+        agent.max_compression_attempts = 3
+        printed = []
+        agent._vprint = lambda message, *_args, **_kwargs: printed.append(str(message))
+
+        def no_progress(messages, system_message, **_kwargs):
+            return messages, system_message
+
+        with (
+            patch.object(agent, "_compress_context", side_effect=no_progress) as compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello", conversation_history=_prefill())
+
+        compress.assert_called_once()
+        assert result["failed"] is True
+        assert result["completed"] is False
+        assert result["api_calls"] == 1
+        assert agent.client.chat.completions.create.call_count == 1
+        assert result["compression_exhausted"] is True
+        guidance = "\n".join([*printed, result["final_response"]]).lower()
+        assert "/compress" not in guidance
+        assert "resolve the compression issue before retrying" in guidance
+        assert "separate conversation" in guidance
+        assert "does not repair this history" in guidance

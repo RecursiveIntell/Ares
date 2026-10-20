@@ -174,6 +174,32 @@ describe('actionAllowedInInput', () => {
     expect(actionAllowedInInput('session.new', 'shift+n')).toBe(false)
   })
 
+  it.each(['MacIntel', 'Linux x86_64'])('admits only terminal-cycle chords in terminal scope on %s', async platform => {
+    const { actionAllowedInInput, canonicalizeCombo } = await loadCombo(platform)
+    const host = document.createElement('div')
+    const terminal = document.createElement('textarea')
+    const prompt = document.createElement('textarea')
+    host.dataset.terminal = 'terminal-test'
+    host.append(terminal)
+    document.body.append(host, prompt)
+
+    try {
+      expect(actionAllowedInInput('view.prevTerminal', canonicalizeCombo('ctrl+shift+up'), terminal)).toBe(true)
+      expect(actionAllowedInInput('view.nextTerminal', canonicalizeCombo('ctrl+shift+down'), terminal)).toBe(true)
+      expect(actionAllowedInInput('view.prevTerminal', canonicalizeCombo('ctrl+shift+up'), prompt)).toBe(false)
+      expect(actionAllowedInInput('view.nextTerminal', canonicalizeCombo('ctrl+shift+down'), prompt)).toBe(false)
+      expect(actionAllowedInInput('view.prevTerminal', canonicalizeCombo('ctrl+up'), terminal)).toBe(false)
+      expect(actionAllowedInInput('view.prevTerminal', canonicalizeCombo('ctrl+shift+left'), terminal)).toBe(false)
+      expect(actionAllowedInInput('session.prev', canonicalizeCombo('ctrl+shift+up'), terminal)).toBe(false)
+      expect(actionAllowedInInput('view.prevTerminal', canonicalizeCombo('ctrl+shift+down'), terminal)).toBe(false)
+      expect(actionAllowedInInput('view.nextTerminal', canonicalizeCombo('ctrl+shift+up'), terminal)).toBe(false)
+      expect(actionAllowedInInput('view.nextTerminal', 'shift+down', terminal)).toBe(false)
+    } finally {
+      host.remove()
+      prompt.remove()
+    }
+  })
+
   it('leaves text navigation chords with the focused input even when rebound to an allowed action', async () => {
     const { actionAllowedInInput } = await loadCombo('Win32')
 

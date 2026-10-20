@@ -69,10 +69,12 @@ def built_wheel(tmp_path_factory):
     return work, installed, names
 
 
-def test_wheel_contains_only_the_two_required_scripts_modules(built_wheel):
+def test_wheel_contains_only_required_checkpoint_scripts_modules(built_wheel):
     _, _, names = built_wheel
     assert {p for p in names if p.startswith("scripts/")} == {
-        "scripts/run_checkpoint_claim.py", "scripts/run_checkpoint_resume.py",
+        "scripts/run_checkpoint_claim.py",
+        "scripts/run_checkpoint_context.py",
+        "scripts/run_checkpoint_resume.py",
     }
 
 

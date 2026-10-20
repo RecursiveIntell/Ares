@@ -21,6 +21,7 @@ import { asRpcResult } from '../lib/rpc.js'
 import type { Msg, PanelSection, SessionInfo, Usage } from '../types.js'
 
 import type { ComposerActions, GatewayRpc, StateSetter } from './interfaces.js'
+import { idleModelStatus } from './modelReadiness.js'
 import { patchOverlayState } from './overlayStore.js'
 import { scheduleResumeScrollToBottom } from './sessionResumeView.js'
 import { turnController } from './turnController.js'
@@ -31,7 +32,7 @@ export { refreshSessionView, scheduleResumeScrollToBottom } from './sessionResum
 
 const usageFrom = (info: null | SessionInfo): Usage => (info?.usage ? { ...ZERO, ...info.usage } : ZERO)
 
-const statusFromLiveSession = (status?: string, running = false) => {
+const statusFromLiveSession = (info: null | SessionInfo, sid: string, status?: string, running = false) => {
   if (status === 'waiting') {
     return 'waiting for input…'
   }
@@ -40,7 +41,7 @@ const statusFromLiveSession = (status?: string, running = false) => {
     return 'starting agent…'
   }
 
-  return running || status === 'working' ? 'running…' : 'ready'
+  return running || status === 'working' ? 'running…' : idleModelStatus(info, sid)
 }
 
 export const writeActiveSessionFile = (sessionId: null | string, file = process.env.HERMES_TUI_ACTIVE_SESSION_FILE) => {
@@ -203,7 +204,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
       const r = await rpc<SessionCreateResponse>('session.create', { cols: colsRef.current })
 
       if (!r) {
-        patchUiState({ status: 'ready' })
+        patchUiState({ status: 'model unverified' })
 
         return null
       }
@@ -218,7 +219,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
       patchUiState({
         info,
         sid: r.session_id,
-        status: info?.version ? 'ready' : 'starting agent…',
+        status: info?.version ? idleModelStatus(info, r.session_id) : 'starting agent…',
         usage: usageFrom(info)
       })
 
@@ -296,7 +297,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
           if (!r) {
             sys('error: invalid response: session.activate')
 
-            return patchUiState({ status: 'ready' })
+            return patchUiState({ status: 'model unverified' })
           }
 
           const info = r.info ?? null
@@ -311,7 +312,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
             busy: running,
             info,
             sid: r.session_id,
-            status: statusFromLiveSession(r.status, running),
+            status: statusFromLiveSession(info, r.session_id, r.status, running),
             usage: usageFrom(info)
           })
           hydrateLiveSessionInflight(r.inflight)
@@ -320,7 +321,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
         })
         .catch((e: Error) => {
           sys(`error: ${e.message}`)
-          patchUiState({ status: 'ready' })
+          patchUiState({ status: 'model unverified' })
         })
     },
     [gw, resetSession, scrollRef, setHistoryItems, setSessionStartedAt, sys]
@@ -348,7 +349,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
             if (!r) {
               sys('error: invalid response: session.resume')
 
-              return patchUiState({ status: 'ready' })
+              return patchUiState({ status: 'model unverified' })
             }
 
             const info = r.info ?? null
@@ -365,7 +366,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
               busy: running,
               info,
               sid: r.session_id,
-              status: statusFromLiveSession(r.status, running),
+              status: statusFromLiveSession(info, r.session_id, r.status, running),
               usage: usageFrom(info)
             })
             hydrateLiveSessionInflight(r.inflight)
@@ -378,7 +379,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
           })
           .catch((e: Error) => {
             sys(`error: ${e.message}`)
-            patchUiState({ status: 'ready' })
+            patchUiState({ status: 'model unverified' })
           })
       })
     },

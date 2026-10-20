@@ -53,11 +53,13 @@ afterEach(() => {
   gatewayState.set('closed')
   vi.clearAllMocks()
   vi.useRealTimers()
+  plugin.groupTurnRuntime.bindGroupTurnPorts(globalThis)
 })
 
 describe('Bot Mode hidden-session reconciliation lifecycle', () => {
   it('uses persisted REST on load/reconnect and stops with plugin disposal', async () => {
     vi.useFakeTimers()
+    plugin.groupTurnRuntime.bindGroupTurnPorts(globalThis)
     const disposers: Array<() => void> = []
 
     plugin.register(createPluginContext(plugin.id, dispose => disposers.push(dispose)))

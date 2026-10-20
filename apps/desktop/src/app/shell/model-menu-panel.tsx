@@ -1,29 +1,27 @@
 import { useStore } from '@nanostores/react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { useState } from 'react'
+import { computed } from 'nanostores'
+import { useMemo, useState } from 'react'
 
 import { useSessionView } from '@/app/chat/session-view'
 import { Codicon } from '@/components/ui/codicon'
 import { DropdownMenuItem, dropdownMenuRow } from '@/components/ui/dropdown-menu'
 import type { HermesGateway } from '@/hermes'
 import { useI18n } from '@/i18n'
-import { modelOptionsQueryKey, reconcileSelectionAfterCatalogRefresh, requestModelOptions } from '@/lib/model-options'
+import { modelOptionsQueryKey, requestModelOptions, selectionUnavailable } from '@/lib/model-options'
 import { currentPickerSelection } from '@/lib/model-status-label'
 import { DEFAULT_REASONING_EFFORT } from '@/lib/reasoning-effort'
 import { cn } from '@/lib/utils'
+import { activeGatewayConnectionId, requestGatewayForAgent } from '@/store/gateway'
 import { $modelPresets, applyModelPreset, modelPresetKey, setModelPreset } from '@/store/model-presets'
 import { $visibleModels } from '@/store/model-visibility'
-import { notifyError } from '@/store/notifications'
-import {
-  $defaultReasoningEffort,
-  markComposerSelectionManual,
-  setCurrentFastMode,
-  setCurrentReasoningEffort
-} from '@/store/session'
-import { sessionTileDelegate } from '@/store/session-states'
+import { $defaultReasoningEffort, getComposerModelSelection, markComposerSelectionManual } from '@/store/session'
+import { $sessionStates, knownOwnerForSession } from '@/store/session-states'
 import type { ModelOptionsResponse } from '@/types/hermes'
 
-import { ModelCatalogMenu, type ModelMenuController } from './model-catalog-menu'
+import { useDraftComposerOwner } from '../hooks/use-composer-model-owner'
+
+import { isCurrentProvider, ModelCatalogMenu, type ModelMenuController } from './model-catalog-menu'
 
 export { ModelMenuCloseContext } from './model-catalog-menu'
 
@@ -57,9 +55,50 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
   // shows/switches its own model — not the primary-only globals.
   const view = useSessionView()
   const activeSessionId = useStore(view.$runtimeId)
+  const owner = knownOwnerForSession(activeSessionId)
+  const draftOwner = useDraftComposerOwner()
+
+  const connectionId =
+    owner && typeof owner === 'object'
+      ? owner.connectionId
+      : owner
+        ? null
+        : !activeSessionId
+          ? draftOwner.connectionId
+          : activeGatewayConnectionId()
+
+  const catalogProfile =
+    (typeof owner === 'string' ? owner : owner?.targetProfile || owner?.profile) ||
+    (!activeSessionId ? draftOwner.targetProfile || draftOwner.profile : profile)
+
+  const catalogRequest = !activeSessionId
+    ? <T,>(method: string, params?: Record<string, unknown>) =>
+        requestGatewayForAgent<T>(draftOwner.connectionId, draftOwner.profile, method, params)
+    : requestGateway
+
+  const unconfirmedOptions = useStore(
+    useMemo(
+      () =>
+        computed($sessionStates, states =>
+          Boolean(activeSessionId && states[activeSessionId]?.unconfirmedRuntimeOptions?.length)
+        ),
+      [activeSessionId]
+    )
+  )
+
   const currentFastMode = useStore(view.$fast)
+
+  const pendingOptions = useStore(
+    useMemo(
+      () =>
+        computed($sessionStates, states => Boolean(activeSessionId && states[activeSessionId]?.pendingRuntimeOptions)),
+      [activeSessionId]
+    )
+  )
+
   const currentModel = useStore(view.$model)
   const currentProvider = useStore(view.$provider)
+  const draftSelection = !activeSessionId ? getComposerModelSelection(draftOwner) : null
   const currentReasoningEffort = useStore(view.$reasoningEffort)
   const modelPresets = useStore($modelPresets)
   const defaultEffort = useStore($defaultReasoningEffort) || DEFAULT_REASONING_EFFORT
@@ -72,13 +111,25 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
   // back to the catalog's reported current, and a non-reactive read would
   // never repaint that fallback once the catalog resolved.
   const modelOptions = useQuery({
-    queryKey: modelOptionsQueryKey(profile, activeSessionId),
+    queryKey: modelOptionsQueryKey(catalogProfile, activeSessionId, connectionId),
     queryFn: (): Promise<ModelOptionsResponse> =>
-      requestModelOptions({ gateway, profile, request: requestGateway, sessionId: activeSessionId })
+      requestModelOptions({
+        connectionId,
+        gateway,
+        profile: catalogProfile,
+        request: catalogRequest,
+        sessionId: activeSessionId
+      })
   })
 
   const { model: optionsModel, provider: optionsProvider } = currentPickerSelection(
-    { model: currentModel, provider: currentProvider },
+    activeSessionId
+      ? { model: currentModel, provider: currentProvider }
+      : {
+          model: draftSelection?.model || '',
+          provider: draftSelection?.provider || '',
+          authoritative: Boolean(draftSelection)
+        },
     modelOptions.data
   )
 
@@ -94,26 +145,21 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
     setRefreshing(true)
 
     try {
-      const queryKey = modelOptionsQueryKey(profile, activeSessionId)
+      const queryKey = modelOptionsQueryKey(catalogProfile, activeSessionId, connectionId)
 
       const next = await requestModelOptions({
+        connectionId,
         gateway,
-        profile,
+        profile: catalogProfile,
         refresh: true,
-        request: requestGateway,
+        request: catalogRequest,
         sessionId: activeSessionId
       })
 
       queryClient.setQueryData<ModelOptionsResponse>(queryKey, next)
 
-      // Group / credential swaps can return a catalog that no longer contains
-      // the session's current model. The store + currentPickerSelection would
-      // otherwise keep painting the stale id (it is not in the new list).
-      const switchTo = reconcileSelectionAfterCatalogRefresh(optionsModel, next.providers)
-
-      if (switchTo) {
-        await onSelectModel({ ...switchTo, sessionId: activeSessionId || null })
-      }
+      // Refresh changes discovery only. Preserve the session/manual selection;
+      // a missing binding is explained below until the user chooses another.
     } catch {
       // Network/backend hiccup — fall back to a plain invalidate so the next
       // open re-fetches (still cached, but no worse than before).
@@ -123,70 +169,30 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
     }
   }
 
-  // Push a reasoning change onto the session that owns it, with rollback.
-  const patchReasoning = async (next: string, previous: string, provider: string, model: string) => {
+  const patchRuntimeOption = async (dimension: 'effort' | 'fast', next: string | boolean, message: string) => {
     if (touchesPrimary) {
       markComposerSelectionManual()
-      setCurrentReasoningEffort(next)
-    } else if (activeSessionId) {
-      sessionTileDelegate()?.updateSession(activeSessionId, state => ({ ...state, reasoningEffort: next }))
     }
 
-    // Preset-only without a session: the gateway's `config.set` falls back to
-    // global config when none matches — so don't reach it (preset + optimistic
-    // store are the whole effect).
-    if (!activeSessionId) {
-      return
-    }
-
-    try {
-      await requestGateway('config.set', { key: 'reasoning', session_id: activeSessionId, value: next })
-    } catch (err) {
-      if (touchesPrimary) {
-        setCurrentReasoningEffort(previous)
-      } else {
-        sessionTileDelegate()?.updateSession(activeSessionId, state => ({ ...state, reasoningEffort: previous }))
-      }
-
-      setModelPreset(provider, model, { effort: previous })
-      notifyError(err, t.shell.modelOptions.updateFailed)
-    }
-  }
-
-  const patchFast = async (enabled: boolean, provider: string, model: string) => {
-    if (touchesPrimary) {
-      markComposerSelectionManual()
-      setCurrentFastMode(enabled)
-    } else if (activeSessionId) {
-      sessionTileDelegate()?.updateSession(activeSessionId, state => ({ ...state, fast: enabled }))
-    }
-
-    if (!activeSessionId) {
-      return
-    }
-
-    try {
-      await requestGateway('config.set', {
-        key: 'fast',
-        session_id: activeSessionId,
-        value: enabled ? 'fast' : 'normal'
-      })
-    } catch (err) {
-      if (touchesPrimary) {
-        setCurrentFastMode(!enabled)
-      } else {
-        sessionTileDelegate()?.updateSession(activeSessionId, state => ({ ...state, fast: !enabled }))
-      }
-
-      setModelPreset(provider, model, { fast: !enabled })
-      notifyError(err, t.shell.modelOptions.fastFailed)
-    }
+    await applyModelPreset(dimension === 'effort' ? { effort: next as string } : { fast: next as boolean }, {
+      failMessage: message,
+      primary: touchesPrimary,
+      request: requestGateway,
+      sessionId: activeSessionId
+    })
   }
 
   const controller: ModelMenuController = {
+    preserveOptionsOnSelect: true,
     // Selecting a model row restores that model's remembered preset onto the
     // session (effort/fast). applyModelPreset owns the batched gateway write.
     applyPreset: (preset, row) => {
+      const provider = modelOptions.data?.providers?.find(item => item.slug === row.provider)
+
+      if (view.$model.get() !== row.model || !provider || !isCurrentProvider(provider, view.$provider.get())) {
+        return
+      }
+
       setModelPreset(row.provider, row.model, preset)
 
       void applyModelPreset(preset, {
@@ -226,35 +232,58 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
       }
 
       if (patch.effort !== undefined) {
-        void patchReasoning(patch.effort, currentReasoningEffort, row.provider, row.model)
+        void patchRuntimeOption('effort', patch.effort, t.shell.modelOptions.updateFailed)
       }
 
       if (patch.fast !== undefined) {
-        void patchFast(patch.fast, row.provider, row.model)
+        void patchRuntimeOption('fast', patch.fast, t.shell.modelOptions.fastFailed)
       }
     }
   }
 
   return (
     <ModelCatalogMenu
+      connectionId={connectionId}
       controller={controller}
       footer={
-        <DropdownMenuItem
-          className={cn(dropdownMenuRow, 'text-(--ui-text-tertiary)')}
-          disabled={refreshing}
-          onSelect={event => {
-            event.preventDefault()
-            void refreshModels()
-          }}
-        >
-          <Codicon className={cn(refreshing && 'animate-spin')} name="sync" size="0.75rem" />
-          {copy.refreshModels}
-        </DropdownMenuItem>
+        <>
+          {modelOptions.data && selectionUnavailable(modelOptions.data.providers, optionsProvider, optionsModel) && (
+            <div className="px-2 py-1 text-xs text-(--ui-text-secondary)" role="status">
+              {t.modelPicker.selectionUnavailable}
+            </div>
+          )}
+          {activeSessionId && (
+            <div className="px-2 py-1 text-xs text-(--ui-text-secondary)" role="status">
+              {t.modelPicker.sessionSelection}
+            </div>
+          )}
+          {unconfirmedOptions && (
+            <div className="px-2 py-1 text-xs text-(--ui-text-secondary)" role="status">
+              {t.shell.modelOptions.unconfirmed}
+            </div>
+          )}
+          {pendingOptions && (
+            <div className="px-2 py-1 text-xs text-(--ui-text-secondary)" role="status">
+              {t.install.stageStates.pending} · {t.shell.modelOptions.options}
+            </div>
+          )}
+          <DropdownMenuItem
+            className={cn(dropdownMenuRow, 'text-(--ui-text-tertiary)')}
+            disabled={refreshing}
+            onSelect={event => {
+              event.preventDefault()
+              void refreshModels()
+            }}
+          >
+            <Codicon className={cn(refreshing && 'animate-spin')} name="sync" size="0.75rem" />
+            {copy.refreshModels}
+          </DropdownMenuItem>
+        </>
       }
       gateway={gateway}
       includeMoa
-      profile={profile}
-      request={requestGateway}
+      profile={catalogProfile}
+      request={catalogRequest}
       sessionId={activeSessionId}
     />
   )

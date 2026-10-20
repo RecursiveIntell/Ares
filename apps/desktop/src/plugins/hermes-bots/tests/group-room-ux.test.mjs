@@ -90,7 +90,7 @@ test('retained-pane reopen re-anchors to the bottom (#89835 follow-up)', () => {
 test('stranded replies get a bounded background harvest after the loop settles (#89545)', () => {
   assert.match(source, /function harvestStrandedUntilSettled\(/)
   // The loop's finally block kicks it off only when members remain stranded.
-  assert.match(source, /strandedLeft\.length/)
+  assert.match(source, /Object\.keys\(\$groupChats\.get\(\)\[group\]\.stranded \|\| \{\}\)\.length/)
   // Bounded: interval + max tries, and it yields to a live loop.
   const harvester = source.slice(source.indexOf('async function harvestStrandedUntilSettled'))
   assert.match(harvester.slice(0, 1600), /HARVEST_MAX_TRIES/)

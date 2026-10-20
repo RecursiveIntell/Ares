@@ -1,3 +1,5 @@
+> **Ares نوٹ:** یہ فائل upstream Hermes کی اردو دستاویزات محفوظ رکھتی ہے۔ Ares کی تنصیب، فرق اور تصدیق کی حدود کے لیے [Ares README](README.md) دیکھیں۔ یہاں درج Nous Research انسٹالر اور ریلیز upstream Hermes کے ہیں، Ares کی آفیشل ریلیز نہیں۔
+
 <div dir="rtl">
 
 <p align="center">

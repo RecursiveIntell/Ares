@@ -1,0 +1,53 @@
+▶ running per-file parallel test suite via run_tests_parallel.py
+  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)
+▶ pre-compiling bytecode cache
+▶ launching test runner
+Discovered 28 test files (~283 tests) under ['tests/ares_runtime/test_continuity_budget.py', 'tests/ares_runtime/test_continuity_checkpoint.py', 'tests/ares_runtime/test_continuity_compiler.py', 'tests/ares_runtime/test_continuity_dispatch.py', 'tests/ares_runtime/test_continuity_live.py', 'tests/ares_runtime/test_continuity_native_governor.py', 'tests/ares_runtime/test_continuity_progress.py', 'tests/ares_runtime/test_continuity_recovery.py', 'tests/ares_runtime/test_continuity_rollback.py', 'tests/ares_runtime/test_continuity_runtime.py', 'tests/ares_runtime/test_continuity_snapshot_races.py', 'tests/ares_runtime/test_continuity_tool_control.py', 'tests/ares_runtime/test_continuity_transport_bounds.py', 'tests/ares_runtime/test_context_rebase_state.py', 'tests/test_run_checkpoint_claim_admission.py', 'tests/test_run_checkpoint_claim_client.py', 'tests/test_run_checkpoint_import_boundaries.py', 'tests/test_run_checkpoint_owner.py', 'tests/test_run_checkpoint_refresh_storage.py', 'tests/test_run_checkpoint_resume.py', 'tests/test_run_task_custody.py', 'tests/test_turn_run_custody.py', 'tests/tui_gateway/test_run_checkpoint_claim_rpc.py', 'tests/plugins/test_context_governor_fd_ownership.py', 'tests/plugins/test_context_governor_key_state_v2.py', 'tests/plugins/test_context_governor_protocol.py', 'tests/plugins/test_context_governor_release_identity.py', 'tests/plugins/test_context_governor_runtime_closure.py']; running with -j 4
+[  5.7% |    16/~283 | ✓40 | ✗ 0] ✓ tests/ares_runtime/test_continuity_budget.py (40✓, 0.6s)
+[ 11.0% |    31/~283 | ✓67 | ✗ 0] ✓ tests/ares_runtime/test_continuity_compiler.py (27✓, 0.6s)
+[ 23.3% |    66/~283 | ✓108 | ✗  0] ✓ tests/ares_runtime/test_context_rebase_state.py (41✓, 1.4s)
+[ 27.2% |    77/~283 | ✓119 | ✗  0] ✓ tests/ares_runtime/test_continuity_live.py (11✓, 0.8s)
+[ 31.8% |    90/~283 | ✓134 | ✗  0] ✓ tests/ares_runtime/test_continuity_checkpoint.py (15✓, 1.6s)
+[ 32.9% |    93/~283 | ✓137 | ✗  0] ✓ tests/ares_runtime/test_continuity_native_governor.py (3✓, 1.0s)
+[ 35.0% |    99/~283 | ✓143 | ✗  0] ✓ tests/ares_runtime/test_continuity_recovery.py (6✓, 0.8s)
+[ 38.2% |   108/~283 | ✓152 | ✗  0] ✓ tests/ares_runtime/test_continuity_runtime.py (9✓, 1.0s)
+[ 40.6% |   115/~283 | ✓165 | ✗  0] ✓ tests/ares_runtime/test_continuity_snapshot_races.py (13✓, 0.8s)
+[ 43.1% |   122/~283 | ✓174 | ✗  0] ✓ tests/ares_runtime/test_continuity_progress.py (9✓, 3.4s)
+[ 45.9% |   130/~283 | ✓182 | ✗  0] ✓ tests/ares_runtime/test_continuity_transport_bounds.py (8✓, 1.4s)
+[ 47.0% |   133/~283 | ✓187 | ✗  0] ✓ tests/ares_runtime/test_continuity_rollback.py (5✓, 3.9s)
+[ 48.4% |   137/~283 | ✓191 | ✗  0] ✓ tests/plugins/test_context_governor_fd_ownership.py (4✓, 0.5s)
+[ 49.5% |   140/~283 | ✓194 | ✗  0] ✓ tests/plugins/test_context_governor_key_state_v2.py (3✓, 0.4s)
+[ 51.2% |   145/~283 | ✓207 | ✗  0] ✓ tests/plugins/test_context_governor_protocol.py (13✓, 0.4s)
+[ 53.4% |   151/~283 | ✓217 | ✗  0] ✓ tests/plugins/test_context_governor_release_identity.py (10✓, 0.5s)
+[ 55.8% |   158/~283 | ✓241 | ✗  0] ✓ tests/test_run_checkpoint_claim_admission.py (24✓, 0.8s)
+[ 58.0% |   164/~283 | ✓264 | ✗  0] ✓ tests/test_run_checkpoint_claim_client.py (23✓, 0.8s)
+[ 60.1% |   170/~283 | ✓275 | ✗  0] ✓ tests/ares_runtime/test_continuity_tool_control.py (11✓, 4.8s)
+[ 62.9% |   178/~283 | ✓283 | ✗  0] ✓ tests/plugins/test_context_governor_runtime_closure.py (8✓, 2.1s)
+[ 66.1% |   187/~283 | ✓295 | ✗  0] ✓ tests/test_run_checkpoint_refresh_storage.py (12✓, 1.1s)
+[ 74.6% |   211/~283 | ✓338 | ✗  0] ✓ tests/test_run_checkpoint_owner.py (43✓, 2.6s)
+[ 80.9% |   229/~283 | ✓367 | ✗  0] ✓ tests/test_run_checkpoint_resume.py (29✓, 1.6s)
+[ 83.0% |   235/~283 | ✓375 | ✗  0] ✓ tests/test_turn_run_custody.py (8✓, 0.5s)
+[ 84.5% |   239/~283 | ✓380 | ✗  0] ✓ tests/test_run_checkpoint_import_boundaries.py (5✓, 3.9s)
+[ 88.3% |   250/~283 | ✓401 | ✗  0] ✓ tests/test_run_task_custody.py (21✓, 1.2s)
+[ 94.3% |   267/~283 | ✓466 | ✗  0] ✓ tests/tui_gateway/test_run_checkpoint_claim_rpc.py (65✓, 1.6s)
+[100.0% |   283/~283 | ✓500 | ✗  0] ✓ tests/ares_runtime/test_continuity_dispatch.py (34✓, 18.9s)
+
+=== Summary: 28 files, 500 tests passed, 0 failed (100% complete) in 19.5s (4 workers) ===
+  Durations cached to test_durations.json (28 files)
+
+=== Per-file subprocess time distribution ===
+  Files:   28
+  Total subprocess CPU-wall: 58.9s  (runner wall: 19.5s, parallelism: 4x)
+  P50: 1.09s  P90: 3.93s  P95: 4.77s  P99: 18.89s  Max: 18.89s
+  <1s: 14 files (50%)  <2s: 21 files (75%)
+  Top 10 slowest:
+     18.89s  tests/ares_runtime/test_continuity_dispatch.py
+      4.77s  tests/ares_runtime/test_continuity_tool_control.py
+      3.93s  tests/ares_runtime/test_continuity_rollback.py
+      3.87s  tests/test_run_checkpoint_import_boundaries.py
+      3.38s  tests/ares_runtime/test_continuity_progress.py
+      2.65s  tests/test_run_checkpoint_owner.py
+      2.14s  tests/plugins/test_context_governor_runtime_closure.py
+      1.59s  tests/test_run_checkpoint_resume.py
+      1.59s  tests/ares_runtime/test_continuity_checkpoint.py
+      1.56s  tests/tui_gateway/test_run_checkpoint_claim_rpc.py

@@ -19,9 +19,8 @@ Usage:
 from __future__ import annotations
 
 import importlib
-import importlib.util
 import logging
-import sys
+import uuid
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -37,13 +36,27 @@ class ContextEngineActivationError(RuntimeError):
     silently substituting the built-in compressor changes provenance semantics.
     """
 
+    def __init__(self, message: str, *, stage: str | None = None,
+                 diagnostic_id: str | None = None):
+        super().__init__(message)
+        self.stage = stage
+        self.diagnostic_id = diagnostic_id
+
+
+def _activation_failure(name: str, stage: str, error: Exception) -> ContextEngineActivationError:
+    """Keep the exception chain local; never copy arbitrary failure text to UI."""
+    diagnostic_id = uuid.uuid4().hex
+    message = (f"configured context engine '{name}' failed its {stage} "
+               f"({type(error).__name__}; diagnostic {diagnostic_id})")
+    logger.warning("%s", message)
+    return ContextEngineActivationError(message, stage=stage, diagnostic_id=diagnostic_id)
+
 
 def discover_context_engines() -> List[Tuple[str, str, bool]]:
     """Scan plugins/context_engine/ for available engines.
 
     Returns list of (name, description, is_available) tuples.
-    Does NOT import the engines — just reads plugin.yaml for metadata
-    and does a lightweight availability check.
+    Reads plugin.yaml and best-effort loads each engine for availability.
     """
     results = []
     if not _CONTEXT_ENGINE_PLUGINS_DIR.is_dir():
@@ -131,9 +144,7 @@ def load_context_engine_strict(name: str) -> "ContextEngine":
         elif hasattr(engine, "is_available") and not engine.is_available():
             raise RuntimeError("availability check returned false")
     except Exception as exc:
-        raise ContextEngineActivationError(
-            f"configured context engine '{name}' failed its activation probe: {exc}"
-        ) from exc
+        raise _activation_failure(name, "activation probe", exc) from exc
     return engine
 
 
@@ -151,68 +162,15 @@ def _load_engine_from_dir(engine_dir: Path) -> Optional["ContextEngine"]:
     if not init_file.exists():
         return None
 
-    # Check if already loaded
-    if module_name in sys.modules:
-        mod = sys.modules[module_name]
-    else:
-        # Handle relative imports within the plugin
-        # First ensure the parent packages are registered
-        for parent in ("plugins", "plugins.context_engine"):
-            if parent not in sys.modules:
-                parent_path = Path(__file__).parent
-                if parent == "plugins":
-                    parent_path = parent_path.parent
-                parent_init = parent_path / "__init__.py"
-                if parent_init.exists():
-                    spec = importlib.util.spec_from_file_location(
-                        parent,
-                        str(parent_init),
-                        submodule_search_locations=[str(parent_path)],
-                    )
-                    if spec:
-                        parent_mod = importlib.util.module_from_spec(spec)
-                        sys.modules[parent] = parent_mod
-                        try:
-                            spec.loader.exec_module(parent_mod)
-                        except Exception:
-                            pass
-
-        # Now load the engine module
-        spec = importlib.util.spec_from_file_location(
-            module_name, str(init_file), submodule_search_locations=[str(engine_dir)]
-        )
-        if not spec:
-            return None
-
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = mod
-
-        # Register submodules so relative imports work
-        for sub_file in engine_dir.glob("*.py"):
-            if sub_file.name == "__init__.py":
-                continue
-            sub_name = sub_file.stem
-            full_sub_name = f"{module_name}.{sub_name}"
-            if full_sub_name not in sys.modules:
-                sub_spec = importlib.util.spec_from_file_location(
-                    full_sub_name, str(sub_file)
-                )
-                if sub_spec:
-                    sub_mod = importlib.util.module_from_spec(sub_spec)
-                    sys.modules[full_sub_name] = sub_mod
-                    try:
-                        sub_spec.loader.exec_module(sub_mod)
-                    except Exception as e:
-                        logger.debug(
-                            "Failed to load submodule %s: %s", full_sub_name, e
-                        )
-
-        try:
-            spec.loader.exec_module(mod)
-        except Exception as e:
-            logger.debug("Failed to exec_module %s: %s", module_name, e)
-            sys.modules.pop(module_name, None)
-            return None
+    # The standard importer owns its per-module lock, relative submodules and
+    # failure cleanup. Publishing a hand-built module in sys.modules before
+    # exec_module let concurrent session builds mistake partial import for
+    # completion; eagerly loading submodules also left failed partial objects.
+    # Cache the module, never a mutable per-session engine instance.
+    try:
+        mod = importlib.import_module(module_name)
+    except Exception as exc:
+        raise _activation_failure(name, "import", exc) from exc
 
     # Try register(ctx) pattern first (how plugins are written)
     if hasattr(mod, "register"):
@@ -221,8 +179,10 @@ def _load_engine_from_dir(engine_dir: Path) -> Optional["ContextEngine"]:
             mod.register(collector)
             if collector.engine:
                 return collector.engine
-        except Exception as e:
-            logger.debug("register() failed for %s: %s", name, e)
+        except Exception as exc:
+            # A failed explicit registration is not permission to instantiate
+            # an imported base class or replay a possibly effectful constructor.
+            raise _activation_failure(name, "registration", exc) from exc
 
     # Fallback: find a ContextEngine subclass and instantiate it
     from agent.context_engine import ContextEngine
@@ -236,8 +196,8 @@ def _load_engine_from_dir(engine_dir: Path) -> Optional["ContextEngine"]:
         ):
             try:
                 return attr()
-            except Exception:
-                pass
+            except Exception as exc:
+                raise _activation_failure(name, "construction", exc) from exc
 
     return None
 

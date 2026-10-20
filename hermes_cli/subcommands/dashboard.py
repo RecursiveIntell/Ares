@@ -107,6 +107,10 @@ def build_dashboard_parser(
     dashboard_parser.add_argument(
         "--no-open", action="store_true", help="Don't open browser automatically"
     )
+    dashboard_parser.add_argument(
+        "--print-launch-url", action="store_true",
+        help="Print a sensitive one-use browser launch URL (expires in 60 seconds); supports --no-open/headless terminals",
+    )
     # Backward-compat shim: older Hermes desktop app shells (<= 0.15.x) spawn the
     # backend as `hermes dashboard --no-open --tui --host ... --port ...`. The
     # `--tui` flag was removed from this subcommand in cae6b5486 (embedded chat is

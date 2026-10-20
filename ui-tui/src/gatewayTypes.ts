@@ -322,6 +322,7 @@ export interface SessionCloseResponse {
 
 export interface SessionInterruptResponse {
   ok?: boolean
+  status?: 'interrupted'
 }
 
 export interface SessionSteerResponse {
@@ -749,6 +750,7 @@ export type GatewayEvent =
         reasoning?: string
         rendered?: string
         response_previewed?: boolean
+        status?: string
         text?: string
         usage?: Usage
       }

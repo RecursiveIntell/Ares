@@ -181,6 +181,43 @@ def _(rid, params: dict) -> dict:
 @method("config.get")
 def _(rid, params: dict) -> dict:
     key = params.get("key", "")
+    sid = params.get("session_id")
+    if key in {"reasoning", "fast"} and sid not in (None, ""):
+        if not isinstance(sid, str):
+            return _err(rid, 4002, "session_id must be a string")
+        session = _sessions.get(sid)
+        if session is None:
+            return _err(rid, 4001, "session not found")
+        if _session_uses_compute_host(session):
+            # A lost write acknowledgement leaves both the serving agent and
+            # its metadata mirror potentially stale. Read the existing owner
+            # directly; absence or uncertainty must not become profile defaults.
+            session_key = _session_lookup_key(session, fallback=sid)
+            try:
+                owner = _get_compute_host_supervisor().lookup_session_key(
+                    session_key
+                )
+            except Exception:
+                return _err(rid, 5019, "session option readback unavailable")
+            if (_sessions.get(sid) is not session
+                    or _session_lookup_key(session, fallback=sid) != session_key
+                    or not isinstance(owner, dict)
+                    or owner.get("session_id") != sid
+                    or type(owner.get("host_boot_id")) is not str
+                    or not owner["host_boot_id"]):
+                return _err(rid, 5019, "session option owner could not be confirmed")
+            boot_id = owner["host_boot_id"]
+            info = owner.get("session_info")
+            field = "reasoning_effort" if key == "reasoning" else "fast"
+            expected_type = str if key == "reasoning" else bool
+            if not isinstance(info, dict) or type(info.get(field)) is not expected_type:
+                return _err(rid, 5019, "session option readback is incomplete")
+            if key == "fast":
+                return _ok(rid, {"value": "fast" if info["fast"] else "normal",
+                                 "owner": "compute_host", "session_id": sid, "host_boot_id": boot_id})
+            display = "show" if bool((_load_cfg().get("display") or {}).get("show_reasoning", True)) else "hide"
+            return _ok(rid, {"value": info["reasoning_effort"], "display": display,
+                             "owner": "compute_host", "session_id": sid, "host_boot_id": boot_id})
     if key == "provider":
         try:
             from hermes_cli.models import list_available_providers, normalize_provider
@@ -268,22 +305,30 @@ def _(rid, params: dict) -> dict:
             if bool((cfg.get("display") or {}).get("show_reasoning", True))
             else "hide"
         )
-        return _ok(rid, {"value": effort, "display": display})
+        return _ok(rid, {"value": effort, "display": display,
+                         **({"owner": "gateway", "session_id": sid} if session is not None else {})})
     if key == "fast":
         # Prefer the session's live/pinned value — `config.set fast` is
         # session-scoped, so the global key may not reflect this chat. A
         # pre-build session keeps its pin in create_service_tier_override.
         session = _sessions.get(params.get("session_id", ""))
-        tier = None
         if session is not None:
             agent = session.get("agent")
             if agent is not None:
-                tier = getattr(agent, "service_tier", None)
-            elif session.get("create_service_tier_override") is not None:
-                tier = session["create_service_tier_override"]
-        if tier is None:
+                # None is the live agent's authoritative normal tier, not
+                # permission to resurrect the profile's Fast default.
+                tier = getattr(agent, "service_tier", None) or ""
+            else:
+                requested = session.get("create_service_tier_override")
+                if requested is None:
+                    requested = _load_service_tier()
+                model_override = session.get("model_override") or {}
+                model = model_override.get("model") if isinstance(model_override, dict) else ""
+                tier, _ = _resolve_effective_fast_runtime(str(model or _resolve_model()), requested)
+        else:
             tier = _load_service_tier()
-        return _ok(rid, {"value": "fast" if tier == "priority" else "normal"})
+        return _ok(rid, {"value": "fast" if tier == "priority" else "normal",
+                         **({"owner": "gateway", "session_id": sid} if session is not None else {})})
     if key == "busy":
         return _ok(rid, {"value": _load_busy_input_mode()})
     if key in {"approval_mode", "approvals.mode"}:

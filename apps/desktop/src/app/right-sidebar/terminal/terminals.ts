@@ -6,6 +6,7 @@ import { $currentCwd } from '@/store/session'
 import { setTerminalTakeover } from '../store'
 
 import { seedAgentTerminalCommand } from './agent-terminal-stream'
+import { requestTerminalFocus, requestTerminalFocusAfterClose, terminalOwnsKeyboardFocus } from './focus'
 
 /** One in-app terminal tab. `id` is the renderer-side handle (distinct from the
  *  PTY session id the main process mints); each instance owns its own shell. */
@@ -159,10 +160,14 @@ const newId = () =>
 
 /** Append a fresh terminal and focus it. Captures the current cwd once (its only
  *  tie to session/project state); pass an explicit cwd to override. Returns the id. */
-export function createTerminal(cwd: string = $currentCwd.get()): string {
+export function createTerminal(cwd: string = $currentCwd.get(), focus = true): string {
   const id = newId()
   $terminals.set([...$terminals.get(), { id, title: 'Terminal', auto: true, cwd, kind: 'user' }])
   $activeTerminalId.set(id)
+
+  if (focus) {
+    requestTerminalFocus(id)
+  }
 
   return id
 }
@@ -207,6 +212,7 @@ export function openAgentTerminal(procId: string, title: string): void {
 
   $activeTerminalId.set(id)
   setTerminalTakeover(true)
+  requestTerminalFocus(id)
 }
 
 /** Guarantee at least one tab exists when the pane opens.
@@ -214,13 +220,14 @@ export function openAgentTerminal(procId: string, title: string): void {
  *  second, unrelated user shell just because the pane became visible. */
 export function ensureTerminal(): void {
   if ($terminals.get().length === 0) {
-    createTerminal()
+    createTerminal(undefined, false)
   }
 }
 
 export function selectTerminal(id: string): void {
   if ($terminals.get().some(term => term.id === id)) {
     $activeTerminalId.set(id)
+    requestTerminalFocus(id)
   }
 }
 
@@ -252,6 +259,11 @@ $currentCwd.listen(cwd => {
   const list = $terminals.get()
   const active = list.find(term => term.id === $activeTerminalId.get())
 
+  // A session update cannot hide the PTY the operator is currently typing in.
+  if (active && terminalOwnsKeyboardFocus(active.id)) {
+    return
+  }
+
   if (active?.kind === 'user' && terminalCwd(active) === target) {
     return
   }
@@ -276,12 +288,14 @@ export function cycleTerminal(direction: 1 | -1): void {
     list.findIndex(term => term.id === $activeTerminalId.get())
   )
 
-  $activeTerminalId.set(list[(current + direction + list.length) % list.length].id)
+  const nextId = list[(current + direction + list.length) % list.length].id
+  requestTerminalFocus(nextId)
+  $activeTerminalId.set(nextId)
 }
 
-/** Drop a terminal. Focus slides to the neighbor that fills its slot; closing
- *  the last one closes the whole pane. */
-export function closeTerminal(id: string): void {
+/** Drop a terminal. Passive by default. An explicit close may transfer the
+ *  closing terminal's keyboard focus to its neighbor, never from the prompt. */
+export function closeTerminal(id: string, transferFocus = false): void {
   const list = $terminals.get()
   const index = list.findIndex(term => term.id === id)
 
@@ -290,10 +304,17 @@ export function closeTerminal(id: string): void {
   }
 
   const next = list.filter(term => term.id !== id)
+  const active = $activeTerminalId.get() === id
+  const nextId = active ? ((next[index] ?? next[index - 1])?.id ?? null) : null
+
+  if (transferFocus && nextId) {
+    requestTerminalFocusAfterClose(nextId, id)
+  }
+
   $terminals.set(next)
 
-  if ($activeTerminalId.get() === id) {
-    $activeTerminalId.set((next[index] ?? next[index - 1])?.id ?? null)
+  if (active) {
+    $activeTerminalId.set(nextId)
   }
 
   if (!next.length) {
@@ -322,7 +343,7 @@ export function closeActiveTerminal(): void {
   const id = $activeTerminalId.get()
 
   if (id) {
-    closeTerminal(id)
+    closeTerminal(id, true)
   }
 }
 

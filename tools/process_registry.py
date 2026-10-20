@@ -2305,6 +2305,50 @@ class ProcessRegistry:
             result["timeout_note"] = base_note
         return result
 
+    @staticmethod
+    def _containment_verdict(session, scope_stopped: bool = False, pid_only: bool = False) -> dict:
+        """Machine-readable containment fidelity for a kill result (S1-04.03).
+
+        Distinguishes tracked-tree exit from quiescence so a caller cannot read
+        ``status: killed`` as "no survivors anywhere".  ``scope_stopped`` must be
+        the ACTUAL ``_stop_systemd_unit`` result (it returns False without
+        raising when systemctl is unavailable, the user bus is down, or the stop
+        times out) — otherwise a failed scope stop would be reported as verified.
+        """
+        if pid_only:
+            return {
+                "fidelity": "pid_only",
+                "quiescence": "unverified",
+                "note": (
+                    "non-local sandbox kill signalled only the recorded wrapper PID; "
+                    "the sandbox command tree is not guaranteed contained"
+                ),
+            }
+        if scope_stopped:
+            return {
+                "fidelity": "cgroup",
+                "quiescence": "verified",
+                "note": "systemd cgroup scope stopped successfully; reparented descendants reaped",
+            }
+        if session.systemd_unit:
+            return {
+                "fidelity": "tree",
+                "quiescence": "tree_only",
+                "note": (
+                    "systemd scope stop did not confirm success; only the tracked PID "
+                    "tree was signalled — reparented descendants are not guaranteed contained"
+                ),
+            }
+        return {
+            "fidelity": "tree",
+            "quiescence": "tree_only",
+            "note": (
+                "no systemd scope for this session: only the tracked PID tree was "
+                "signalled; a descendant reparented via setsid+double-fork is not "
+                "guaranteed contained"
+            ),
+        }
+
     def kill_process(
         self,
         session_id: str,
@@ -2333,8 +2377,7 @@ class ProcessRegistry:
             # descendant may still be alive in the systemd scope (#70716,
             # reviewer gap #2 — the ``already_exited`` early return skipped
             # unit cleanup).  Stop the scope to reap any survivors.
-            if session.systemd_unit:
-                _stop_systemd_unit(session.systemd_unit)
+            scope_stopped = _stop_systemd_unit(session.systemd_unit) if session.systemd_unit else False
             with session._lock:
                 result = {
                     "status": "already_exited",
@@ -2342,6 +2385,7 @@ class ProcessRegistry:
                     "exit_code": session.exit_code,
                     "completion_reason": session.completion_reason,
                     "termination_source": session.termination_source,
+                    "containment": self._containment_verdict(session, scope_stopped),
                     "output": strip_ansi(session.output_buffer[-2000:]),
                 }
             # Only suppress the autonomous turn after its output is present in
@@ -2351,6 +2395,7 @@ class ProcessRegistry:
             return result
 
         # Kill via PTY, Popen (local), or env execute (non-local)
+        pid_only = False
         try:
             if session._pty:
                 # PTY process -- terminate via ptyprocess
@@ -2365,8 +2410,11 @@ class ProcessRegistry:
                 # shell wrapper and leaves Git Bash descendants behind.
                 self._terminate_host_pid(session.process.pid, session.host_start_time)
             elif session.env_ref and session.pid:
-                # Non-local -- kill inside sandbox
+                # Non-local -- kill inside sandbox.  This signals only the
+                # recorded wrapper PID (spawn_via_env launches the real command
+                # as a nohup child), so fidelity is pid_only, not "tree".
                 session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
+                pid_only = True
             elif session.detached and session.pid_scope == "host" and session.pid:
                 # Identity check, not bare liveness: if the PID is gone OR was
                 # recycled onto an unrelated process, treat our process as
@@ -2376,8 +2424,7 @@ class ProcessRegistry:
                 # there even though the wrapper PID exited or was recycled
                 # across the gateway restart (#70716, teknium1 review).
                 if not self._host_pid_is_ours(session.pid, session.host_start_time):
-                    if session.systemd_unit:
-                        _stop_systemd_unit(session.systemd_unit)
+                    scope_stopped = _stop_systemd_unit(session.systemd_unit) if session.systemd_unit else False
                     with session._lock:
                         session.exited = True
                         session.exit_code = None
@@ -2388,6 +2435,7 @@ class ProcessRegistry:
                     return {
                         "status": "already_exited",
                         "exit_code": session.exit_code,
+                        "containment": self._containment_verdict(session, scope_stopped),
                         "output": output,
                     }
                 self._terminate_host_pid(session.pid, session.host_start_time)
@@ -2407,8 +2455,10 @@ class ProcessRegistry:
             # SIGTERM to every process in the cgroup and escalates to SIGKILL
             # after TimeoutStopSec.  This is additive — the PID-based kill
             # above already handled the main process; this catches stragglers.
-            if session.systemd_unit:
-                _stop_systemd_unit(session.systemd_unit)
+            # _stop_systemd_unit returns False (without raising) when the unit is
+            # unavailable / the user bus is down / the stop times out, so the
+            # VERIFIED verdict must depend on its result, not on the unit name.
+            scope_stopped = _stop_systemd_unit(session.systemd_unit) if session.systemd_unit else False
             # Capture output before marking consumed, then mark consumed before
             # exposing ``exited`` to watcher tasks. This closes the delayed
             # notification race without discarding the terminal transcript.
@@ -2422,11 +2472,23 @@ class ProcessRegistry:
                 session.termination_source = source
             self._move_to_finished(session)
             self._write_checkpoint()
+            # Containment fidelity (S1-04.03): a PID tree-walk signals the tracked
+            # tree, but a descendant that escaped via setsid + double-fork is NOT
+            # reachable by lineage; only a successfully stopped cgroup scope reaps
+            # those.  Report the distinction explicitly so a caller cannot read
+            # "status: killed" (tracked-tree exit) as "quiesced".
+            containment = self._containment_verdict(session, scope_stopped, pid_only)
+            if containment["quiescence"] != "verified":
+                logger.warning(
+                    "kill_process(%s): containment %s — %s",
+                    session_id, containment["fidelity"], containment["note"],
+                )
             return {
                 "status": "killed",
                 "session_id": session.id,
                 "completion_reason": session.completion_reason,
                 "termination_source": session.termination_source,
+                "containment": containment,
                 "output": output,
             }
         except Exception as e:

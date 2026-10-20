@@ -44,6 +44,16 @@ def rows(db):
         return conn.execute("SELECT key,value FROM state_meta ORDER BY key").fetchall()
 
 
+def assert_first_claim_delta(before, after):
+    """Preserve all prior metadata; admit only the first custody generation."""
+    before, after = dict(before), dict(after)
+    assert set(after) - set(before) == {
+        "run-custody:rpc-fixture:head", "run-custody:rpc-fixture:generation:1",
+        "run-custody:rpc-fixture:generation:1:files", "run-custody:rpc-fixture:recovery-files",
+    }
+    assert all(key in after and after[key] == value for key, value in before.items())
+
+
 @pytest.fixture
 def live(tmp_path, monkeypatch):
     db = SessionDB(db_path=tmp_path / "state.db")
@@ -100,6 +110,29 @@ def live(tmp_path, monkeypatch):
 def rpc_method(f, name, params):
     result = server.dispatch({"jsonrpc": "2.0", "id": 9, "method": name, "params": params}, f.transport)
     return result if result is not None else f.transport.responses.get(timeout=10)
+
+
+def test_rpc_accepts_strict_task_binding_without_historical_goal(live):
+    f = live
+    f.db._execute_write(lambda conn: conn.execute("UPDATE sessions SET profile_name='p' WHERE id='current'"))
+    row = f.db.append_message("current", "user", "Fix the queue", turn_lease_holder="active-holder")
+    binding, control = f.db.read_run_task_basis(run_id="rpc-fixture", origin_session_id="current",
+        current_session_id="current", input_row_id=row)
+    request = f.request
+    request["checkpoint"]["members"] = [["authority", "No downstream effects"]]
+    del request["files"]["members"]["historical-goal-key"]
+    path = Path(f.params["request_path"])
+    path.write_text(json.dumps(request))
+    params = {key: value for key, value in f.params.items() if key != "historical_goal_digest"}
+    params.update(origin_session_id="current", expected_request_digest=sha(path.read_bytes()),
+                  task_binding=dataclasses.asdict(binding), expected_control_digest=control)
+    # Mixed caller schemas cannot choose the weaker branch.
+    mixed = dispatch(f, {**params, "historical_goal_digest": sha(f.goal.encode())})
+    assert mixed["error"]["message"] == "INVALID_PARAMS"
+    response = dispatch(f, params)
+    assert response["result"]["generation"] == 1
+    assert f.db.read_run_custody("rpc-fixture").schema == "SessionDBRunCustodyV2"
+    assert f.db.get_meta("goal:old") == f.goal
 
 
 def test_rpc_manages_refresh_and_release_without_exposing_handle(live):
@@ -164,6 +197,7 @@ def refused(response, code=None):
 
 
 def test_rpc_dispatch_claims_real_owner_without_opening_or_closing_store(live):
+    before = rows(live.db)
     response = dispatch(live)
     assert "result" in response, response
     result = response["result"]
@@ -176,12 +210,38 @@ def test_rpc_dispatch_claims_real_owner_without_opening_or_closing_store(live):
     assert owner.controller_pid == os.getpid()
     assert owner.current_session_id == live.agent.session_id
     native = rows(live.db)
-    assert len(native) == 3  # historical goal, head, generation
+    assert_first_claim_delta(before, native)
     assert ("goal:old", live.goal) in native
     assert owner.owner_token not in json.dumps(response)
     assert "active-holder" not in json.dumps(response)
     live.db.set_meta("still-borrowed", "usable")
     assert live.db.get_meta("still-borrowed") == "usable"
+
+
+@pytest.mark.parametrize("fault", [
+    "prior-update", "prior-delete", "unexpected-key", "missing-head",
+    "missing-generation", "extra-generation",
+])
+def test_claim_delta_oracle_rejects_unexpected_metadata_changes(live, fault):
+    # Scratch-store mutations prove the oracle does not hide unrelated rows.
+    live.db.set_meta("unrelated-sentinel", "preserve-exactly")
+    before = rows(live.db)
+    assert "result" in dispatch(live)
+    assert_first_claim_delta(before, rows(live.db))
+    key = {
+        "prior-update": "unrelated-sentinel", "prior-delete": "unrelated-sentinel",
+        "unexpected-key": "unexpected", "missing-head": "run-custody:rpc-fixture:head",
+        "missing-generation": "run-custody:rpc-fixture:generation:1",
+        "extra-generation": "run-custody:rpc-fixture:generation:2",
+    }[fault]
+    if fault in {"prior-delete", "missing-head", "missing-generation"}:
+        live.db._execute_write(lambda conn: conn.execute(
+            "DELETE FROM state_meta WHERE key=?", (key,),
+        ))
+    else:
+        live.db.set_meta(key, "unexpected-value")
+    with pytest.raises(AssertionError):
+        assert_first_claim_delta(before, rows(live.db))
 
 
 def test_claim_uses_worker_dispatch_so_file_reads_do_not_block_reader(live, monkeypatch):
@@ -345,6 +405,7 @@ def test_post_commit_uncertainty_is_not_retry_or_refusal(live, monkeypatch, faul
 
 
 def test_concurrent_rpc_claims_admit_exactly_one_generation(live, monkeypatch):
+    before = rows(live.db)
     original = server._methods[METHOD]
     barrier = threading.Barrier(2)
     def race(*a, **kw):
@@ -359,11 +420,12 @@ def test_concurrent_rpc_claims_admit_exactly_one_generation(live, monkeypatch):
     assert sum("result" in r for r in replies) == 1
     refused(next(r for r in replies if "error" in r), "FENCE_MISMATCH")
     assert live.db.read_run_custody("rpc-fixture").generation == 1
-    assert len(rows(live.db)) == 3
+    assert_first_claim_delta(before, rows(live.db))
 
 
 @pytest.mark.parametrize("fault", ["session", "holder"])
 def test_selected_agent_and_native_binding_change_before_admission_is_refused(live, monkeypatch, fault):
+    before = rows(live.db)
     original = live.db.claim_run_custody_checked
     def changed(*a, **kw):
         if fault == "session":
@@ -378,7 +440,7 @@ def test_selected_agent_and_native_binding_change_before_admission_is_refused(li
     monkeypatch.setattr(live.db, "claim_run_custody_checked", changed)
     refused(dispatch(live))
     assert live.db.read_run_custody("rpc-fixture") is None
-    assert rows(live.db) == [("goal:old", live.goal)]
+    assert rows(live.db) == before
 
 
 def test_launch_profile_uses_existing_launch_home_not_ambient_profile(live, monkeypatch):
@@ -416,3 +478,124 @@ def test_rpc_native_transaction_rechecks_after_file_observation(live, monkeypatc
     monkeypatch.setattr(live.db, "_execute_write", interpose)
     refused(dispatch(live))
     assert live.db.read_run_custody("rpc-fixture") is None
+
+
+BASIS = "session.run_checkpoint.basis"
+
+
+def claim_observable(f, run_id="rpc-fixture"):
+    row = f.db.append_message("current", "user", "Fix the queue", turn_lease_holder="active-holder")
+    binding, control = f.db.read_run_task_basis(run_id=run_id, origin_session_id="current",
+        current_session_id="current", input_row_id=row)
+    request = f.request
+    request["checkpoint"]["members"] = [["authority", "No downstream effects"]]
+    request["checkpoint"]["unresolved_effects"] = []
+    request["files"]["members"].pop("historical-goal-key", None)
+    path = Path(f.params["request_path"])
+    path.write_text(json.dumps(request))
+    params = {key: value for key, value in f.params.items() if key != "historical_goal_digest"}
+    params.update(run_id=run_id, origin_session_id="current", expected_request_digest=sha(path.read_bytes()),
+                  task_binding=dataclasses.asdict(binding), expected_control_digest=control)
+    assert "result" in dispatch(f, params)
+    return dict(session_id="runtime-sid", run_id=run_id, expected_generation=1)
+
+
+def test_basis_real_dispatch_selects_second_run_and_uses_agent_session(live):
+    claim_observable(live)
+    second = claim_observable(live, "second")
+    before = rows(live.db)
+    result = rpc_method(live, BASIS, second)["result"]
+    assert result["run_id"] == "second"
+    assert result["current_session_id"] == "current"  # not caller's runtime-sid
+    assert result["custody_changed"] is False
+    assert result["observation_only"] is True
+    assert rows(live.db) == before
+    assert "active-holder" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("extra", [{"ttl_seconds": 120}, {"expected_generation": True},
+    {"owner_token": "private"}, {"db_path": "/private"}, {"expected_generation": 0}])
+def test_basis_closed_request_never_reads_ttl(live, extra):
+    params = claim_observable(live)
+    refused(rpc_method(live, BASIS, {**params, **extra}), "INVALID_PARAMS")
+
+
+def test_basis_v1_refuses_and_does_not_refresh(live):
+    assert "result" in dispatch(live)
+    before = rows(live.db)
+    refused(rpc_method(live, BASIS, dict(session_id="runtime-sid", run_id="rpc-fixture", expected_generation=1)), "INTEGRITY_TASK_SCHEMA")
+    assert rows(live.db) == before
+
+
+@pytest.mark.parametrize("fault", ["foreign-db", "foreign-owner", "actual-session", "read-error"])
+def test_basis_live_binding_and_unavailable_are_nonmutating(live, monkeypatch, tmp_path, fault):
+    params = claim_observable(live)
+    before = rows(live.db)
+    extra = None
+    if fault == "foreign-db":
+        extra = SessionDB(db_path=tmp_path / "foreign.db")
+        live.agent._session_db = extra
+    elif fault == "foreign-owner":
+        from agent.run_checkpoint_custody import TurnRunCustody
+        extra = SessionDB(db_path=tmp_path / "foreign.db")
+        live.agent._run_checkpoint_custody = TurnRunCustody(extra)
+    elif fault == "actual-session": live.agent.session_id = "other"
+    else:
+        def failed(*a, **k): raise OSError("private-token")
+        monkeypatch.setattr(live.db, "observe_owned_run", failed)
+    try:
+        response = rpc_method(live, BASIS, params)
+        assert response["error"]["data"]["custody_changed"] is False
+        assert "private-token" not in json.dumps(response)
+        assert rows(live.db) == before
+    finally:
+        if extra: extra.close()
+
+
+@pytest.mark.parametrize("fault", ["valid", "timeout", "extra", "digest", "run", "session", "generation", "error"])
+def test_basis_compute_host_ack_is_strict_and_never_relays_secrets(live, monkeypatch, fault):
+    params = claim_observable(live)
+    result = rpc_method(live, BASIS, params)["result"]
+    calls = []
+    def control(sid, **kwargs):
+        calls.append((sid, kwargs))
+        if fault == "timeout": raise TimeoutError("private-token")
+        response = {"jsonrpc": "2.0", "id": "host-id", "result": dict(result)}
+        field = {"extra": "owner_token", "digest": "digest", "run": "run_id",
+                 "session": "current_session_id", "generation": "generation"}.get(fault)
+        if field: response["result"][field] = "private-token"
+        if fault == "error": response = {"jsonrpc":"2.0", "id":"host-id", "error": {
+            "code": -32040, "message":"private-token", "data":{"status":"refused","secret":"private-token"}}}
+        return {"type":"control.ack", "sid":sid, "route_name":BASIS, "response":response}
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda s: True)
+    monkeypatch.setattr(server, "_compute_host_supervisor", SimpleNamespace(control=control))
+    live.session["_compute_host_active"] = True
+    live.agent._session_db = None  # proves no local fallback
+    before = rows(live.db)
+    response = rpc_method(live, BASIS, params)
+    assert len(calls) == 1
+    if fault == "valid": assert response["result"] == result
+    else: assert response["error"]["data"]["custody_changed"] is False
+    assert "private-token" not in json.dumps(response)
+    assert rows(live.db) == before
+
+
+def test_basis_real_compute_host_control_drives_private_owner(live, monkeypatch):
+    from tui_gateway.compute_host import ComputeHost
+    params = claim_observable(live)
+    host = ComputeHost(heartbeat_secs=0)
+    emitted = []
+    monkeypatch.setattr(host, "emit", emitted.append)
+    monkeypatch.setitem(live.session, "transport", host._transport)
+    before = rows(live.db)
+    try:
+        host._handle_control({"type":"control", "sid":"runtime-sid", "request_id":"basis-1",
+            "route_name": BASIS, "params":params})
+        assert len(emitted) == 1
+        assert emitted[0]["type"] == "control.ack"
+        assert emitted[0]["response"]["result"]["run_id"] == "rpc-fixture"
+        assert rows(live.db) == before
+    finally:
+        # The fixture owns the live session; shut down only this disposable executor.
+        host._closed.set()
+        host._executor.shutdown(wait=True)

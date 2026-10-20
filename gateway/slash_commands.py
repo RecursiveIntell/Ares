@@ -2939,10 +2939,11 @@ class GatewaySlashCommandsMixin:
                 return "Usage: /goal draft <objective in plain language>"
             try:
                 import asyncio
+                import functools
                 from hermes_cli.goals import draft_contract
 
                 draft_contract_obj = await asyncio.get_running_loop().run_in_executor(
-                    None, draft_contract, objective
+                    None, functools.partial(draft_contract, objective, session_id=getattr(mgr, "session_id", None))
                 )
             except Exception as exc:
                 logger.debug("goal draft failed: %s", exc)
@@ -4718,14 +4719,10 @@ class GatewaySlashCommandsMixin:
             lines.append(summary["token_line"])
             if summary["note"]:
                 lines.append(summary["note"])
-            if _summary_aborted:
-                lines.append(
-                    t(
-                        "gateway.compress.aborted",
-                        error=(_summary_err or "unknown error"),
-                    )
-                )
-            elif _aux_fail_model:
+            # summarize_manual_compression() already supplied the shared,
+            # redacted abort guidance above. Do not append the older localized
+            # template, which claimed availability and recommended a retry.
+            if not _summary_aborted and _aux_fail_model:
                 lines.append(
                     t(
                         "gateway.compress.aux_failed",

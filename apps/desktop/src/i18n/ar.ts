@@ -2182,6 +2182,10 @@ export const ar = defineLocale({
     docs: provider => `وثائق ${provider}`
   },
   modelPicker: {
+    selectionUnavailable:
+      'المزوّد أو النموذج المحدد غير متاح في هذا الملف الشخصي. قم بإعداده هنا أو اختر نموذجًا آخر. يتم الاحتفاظ باختيارك.',
+    sessionSelection:
+      'تحتفظ هذه الجلسة باختيار النموذج الخاص بها. تغييرات النموذج الافتراضي للملف الشخصي تنطبق على الجلسات الجديدة.',
     title: 'اختيار النموذج',
     current: 'الحالي',
     unknown: 'غير معروف',
@@ -2567,6 +2571,7 @@ export const ar = defineLocale({
       notReady: 'غير جاهز',
       gatewayDisconnected: 'البوابة غير متصلة',
       sendFailed: 'فشل الإرسال',
+      responseAccepted: 'تم استلام الإجابة',
       loadingQuestion: 'جار تحميل السؤال...',
       other: 'غير ذلك',
       placeholder: 'اكتب إجابتك...',

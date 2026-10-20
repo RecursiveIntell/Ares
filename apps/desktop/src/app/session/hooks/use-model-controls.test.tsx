@@ -2,9 +2,17 @@ import { QueryClient } from '@tanstack/react-query'
 import { act, cleanup, render, renderHook, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { setApiRequestConnection, setApiRequestProfile } from '@/api/client'
 import { getGlobalModelInfo } from '@/hermes'
 import { modelOptionsQueryKey } from '@/lib/model-options'
+import { $newChatProfile, $newChatRoute } from '@/store/profile'
 import { $activeGatewayProfile } from '@/store/profile'
+import {
+  _resetComposerModelSelectionsForTests,
+  captureComposerModelSelection,
+  recordComposerModelSelection,
+  setComposerModelSelectionOwner
+} from '@/store/session'
 import {
   $activeSessionId,
   $currentModel,
@@ -19,6 +27,7 @@ import type * as SessionStates from '@/store/session-states'
 
 import { deferred } from '../../../test/deferred'
 
+import { beginMainModelSave } from './composer-model-selection-owner'
 import { useModelControls } from './use-model-controls'
 
 const setGlobalModel = vi.fn()
@@ -81,6 +90,12 @@ function Harness({
 
 describe('useModelControls', () => {
   beforeEach(() => {
+    _resetComposerModelSelectionsForTests()
+    setApiRequestConnection(null)
+    setApiRequestProfile('default')
+    $newChatProfile.set(null)
+    $newChatRoute.set(null)
+    setComposerModelSelectionOwner({ connectionId: null, profile: 'default' })
     $activeGatewayProfile.set('default')
     $activeSessionId.set(null)
     $selectedStoredSessionId.set(null)
@@ -148,6 +163,11 @@ describe('useModelControls', () => {
     setCurrentModel('tencent/hy3:free')
     setCurrentProvider('nous')
     setCurrentModelSource('manual')
+    recordComposerModelSelection(captureComposerModelSelection({ connectionId: null, profile: 'default' }), {
+      model: 'tencent/hy3:free',
+      provider: 'nous',
+      source: 'manual'
+    })
     queryClient.setQueryData(modelOptionsQueryKey('default'), {
       model: 'tencent/hy3:free',
       provider: 'nous',
@@ -170,7 +190,11 @@ describe('useModelControls', () => {
       })
     )
 
-    result.current.applySavedMainModel('nous', 'poolside/laguna-xs-2.1:free')
+    result.current.applySavedMainModel({
+      ...beginMainModelSave(),
+      provider: 'nous',
+      model: 'poolside/laguna-xs-2.1:free'
+    })
     await result.current.refreshCurrentModel()
 
     // Settings changes the profile default, not the active session. The footer
@@ -184,7 +208,7 @@ describe('useModelControls', () => {
 
     // The global cache reflects the save, and the next fresh draft may reseed
     // from that default instead of preserving the old session's model.
-    expect(getCurrentModelSource()).toBe('default')
+    expect(getCurrentModelSource()).toBe('manual')
     expect(queryClient.getQueryData(modelOptionsQueryKey('default'))).toMatchObject({
       model: 'poolside/laguna-xs-2.1:free',
       provider: 'nous'
@@ -193,15 +217,20 @@ describe('useModelControls', () => {
     $activeSessionId.set(null)
     await result.current.refreshCurrentModel()
 
-    expect($currentModel.get()).toBe('poolside/laguna-xs-2.1:free')
+    expect($currentModel.get()).toBe('tencent/hy3:free')
     expect($currentProvider.get()).toBe('nous')
   })
 
-  it('paints a saved profile default immediately when no session is active', () => {
+  it('preserves a deliberate draft pin when a profile default is saved', () => {
     const queryClient = new QueryClient()
     setCurrentModel('tencent/hy3:free')
     setCurrentProvider('nous')
     setCurrentModelSource('manual')
+    recordComposerModelSelection(captureComposerModelSelection({ connectionId: null, profile: 'default' }), {
+      model: 'tencent/hy3:free',
+      provider: 'nous',
+      source: 'manual'
+    })
 
     const { result } = renderHook(() =>
       useModelControls({
@@ -210,11 +239,15 @@ describe('useModelControls', () => {
       })
     )
 
-    result.current.applySavedMainModel('nous', 'poolside/laguna-xs-2.1:free')
+    result.current.applySavedMainModel({
+      ...beginMainModelSave(),
+      provider: 'nous',
+      model: 'poolside/laguna-xs-2.1:free'
+    })
 
-    expect($currentModel.get()).toBe('poolside/laguna-xs-2.1:free')
+    expect($currentModel.get()).toBe('tencent/hy3:free')
     expect($currentProvider.get()).toBe('nous')
-    expect(getCurrentModelSource()).toBe('default')
+    expect(getCurrentModelSource()).toBe('manual')
     expect(queryClient.getQueryData(modelOptionsQueryKey('default'))).toEqual({
       model: 'poolside/laguna-xs-2.1:free',
       provider: 'nous',
@@ -245,7 +278,11 @@ describe('useModelControls', () => {
       })
     )
 
-    result.current.applySavedMainModel('nous', 'poolside/laguna-xs-2.1:free')
+    result.current.applySavedMainModel({
+      ...beginMainModelSave(),
+      provider: 'nous',
+      model: 'poolside/laguna-xs-2.1:free'
+    })
 
     expect(queryClient.getQueryData(modelOptionsQueryKey('default'))).toEqual({
       model: 'poolside/laguna-xs-2.1:free',
@@ -254,7 +291,7 @@ describe('useModelControls', () => {
     })
   })
 
-  it('persists an active primary-session picker change as the profile default via config.set --global', async () => {
+  it('keeps an active primary-session picker change scoped to that session', async () => {
     $activeSessionId.set('session-1')
     const requestGateway = vi.fn(async () => ({ key: 'model', value: 'claude-sonnet-4.6' }) as never)
     let controls!: Controls
@@ -268,13 +305,12 @@ describe('useModelControls', () => {
       })
     ).resolves.toBe(true)
 
-    // The primary main agent's pick IS the profile default, so it persists to
-    // config.yaml (model.default + model.provider) — which is what lets a
-    // chosen subscription provider outrank a leftover OPENAI_API_KEY env var.
+    // Composer intent targets this chat. Profile-default changes belong to
+    // the explicit Settings path, not primary-versus-tile layout identity.
     expect(requestGateway).toHaveBeenCalledWith('config.set', {
       session_id: 'session-1',
       key: 'model',
-      value: 'claude-sonnet-4.6 --provider anthropic --global'
+      value: 'claude-sonnet-4.6 --provider anthropic --session'
     })
     expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
   })
@@ -295,7 +331,7 @@ describe('useModelControls', () => {
     const requestGateway = vi
       .fn()
       .mockRejectedValueOnce(new Error('session not found'))
-      .mockResolvedValueOnce({ key: 'model', scope: 'global', value: 'claude-sonnet-4.6' })
+      .mockResolvedValueOnce({ key: 'model', scope: 'session', value: 'claude-sonnet-4.6' })
 
     const options = {
       queryClient: new QueryClient(),
@@ -311,12 +347,12 @@ describe('useModelControls', () => {
     expect(requestGateway).toHaveBeenNthCalledWith(1, 'config.set', {
       session_id: 'runtime-dead',
       key: 'model',
-      value: 'claude-sonnet-4.6 --provider anthropic --global'
+      value: 'claude-sonnet-4.6 --provider anthropic --session'
     })
     expect(requestGateway).toHaveBeenNthCalledWith(2, 'config.set', {
       session_id: 'runtime-fresh',
       key: 'model',
-      value: 'claude-sonnet-4.6 --provider anthropic --global'
+      value: 'claude-sonnet-4.6 --provider anthropic --session'
     })
     expect(notifyError).not.toHaveBeenCalled()
   })
@@ -429,7 +465,7 @@ describe('useModelControls', () => {
       confirm_expensive_model: true,
       key: 'model',
       session_id: 'session-1',
-      value: 'muse-spark-1.2-contributor --provider opencode-go --global'
+      value: 'muse-spark-1.2-contributor --provider opencode-go --session'
     })
     expect($currentModel.get()).toBe('muse-spark-1.2-contributor')
     expect($currentProvider.get()).toBe('opencode-go')
@@ -557,18 +593,20 @@ describe('useModelControls', () => {
 
     // A user pick must survive the lifecycle refreshes that fire on boot / fresh
     // draft / session events.
-    setCurrentModel('anthropic/claude-sonnet-4.6')
-    setCurrentModelSource('manual')
-    setCurrentProvider('anthropic')
+    await result.current.selectModel({ model: 'anthropic/claude-sonnet-4.6', provider: 'anthropic' })
     await result.current.refreshCurrentModel()
     expect($currentModel.get()).toBe('anthropic/claude-sonnet-4.6')
 
-    // A profile swap forces a reseed to the new profile's default.
+    // Force preserves this owner's pin; a different profile seeds its default.
+    await result.current.refreshCurrentModel(true)
+    expect($currentModel.get()).toBe('anthropic/claude-sonnet-4.6')
+    $activeGatewayProfile.set('another-profile')
+    setApiRequestProfile('another-profile')
     await result.current.refreshCurrentModel(true)
     expect($currentModel.get()).toBe('openai/gpt-5.5')
   })
 
-  it('reseeds a sticky manual pick that was removed from the catalog', async () => {
+  it('preserves a deliberate pin that was removed from the catalog', async () => {
     vi.mocked(getGlobalModelInfo).mockResolvedValue({ model: 'openai/gpt-5.5', provider: 'openai-codex' })
 
     const queryClient = new QueryClient()
@@ -587,10 +625,12 @@ describe('useModelControls', () => {
 
     const { result } = renderHook(() => useModelControls({ queryClient, requestGateway: vi.fn() }))
 
+    setApiRequestProfile('compass')
+    await result.current.selectModel({ model: 'openrouter/owl-alpha', provider: 'openrouter' })
     await result.current.refreshCurrentModel()
 
-    expect($currentModel.get()).toBe('openai/gpt-5.5')
-    expect(getCurrentModelSource()).toBe('default')
+    expect($currentModel.get()).toBe('openrouter/owl-alpha')
+    expect(getCurrentModelSource()).toBe('manual')
   })
 
   it('keeps a sticky manual pick that is still in the catalog', async () => {
@@ -607,6 +647,7 @@ describe('useModelControls', () => {
 
     const { result } = renderHook(() => useModelControls({ queryClient, requestGateway: vi.fn() }))
 
+    await result.current.selectModel({ model: 'openrouter/glm-4.7', provider: 'openrouter' })
     await result.current.refreshCurrentModel()
 
     expect($currentModel.get()).toBe('openrouter/glm-4.7')
@@ -664,6 +705,19 @@ describe('useModelControls', () => {
 
     expect($currentModel.get()).toBe('profile-c-model')
     expect($currentProvider.get()).toBe('profile-c-provider')
+  })
+
+  it('does not let a default read started before Settings save undo the saved choice', async () => {
+    const stale = deferred<Awaited<ReturnType<typeof getGlobalModelInfo>>>()
+    vi.mocked(getGlobalModelInfo).mockReturnValueOnce(stale.promise)
+    setCurrentModelSource('default')
+    const { result } = renderHook(() => useModelControls({ queryClient: new QueryClient(), requestGateway: vi.fn() }))
+    const pending = result.current.refreshCurrentModel()
+    result.current.applySavedMainModel({ ...beginMainModelSave(), provider: 'ollama-launch', model: 'saved-model-b' })
+    stale.resolve({ provider: 'openrouter', model: 'old-model-a' })
+    await pending
+    expect($currentModel.get()).toBe('saved-model-b')
+    expect($currentProvider.get()).toBe('ollama-launch')
   })
 
   it('refreshes legacy/default-derived composer state from the profile default', async () => {

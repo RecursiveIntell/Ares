@@ -44,10 +44,19 @@ def test_switch_model_allows_openai_codex_model_missing_from_listing():
     """switch_model() should succeed for Codex models that the runtime accepts
     even when the listing has not caught up yet.
     """
+    def target_runtime(*, requested, target_model):
+        assert requested == "openai-codex"
+        assert target_model == "gpt-5.3-codex-spark"
+        return {
+            "provider": requested, "api_key": "fixture-codex-key",
+            "base_url": "https://codex.fixture.invalid/v1", "api_mode": "codex_responses",
+            "extra_headers": {},
+        }
+
     with patch(
         "hermes_cli.models.provider_model_ids",
         return_value=["gpt-5.5", "gpt-5.4", "gpt-5.3-codex"],
-    ):
+    ), patch("hermes_cli.runtime_provider.resolve_runtime_provider", side_effect=target_runtime):
         result = switch_model(
             "gpt-5.3-codex-spark",
             current_provider="openai-codex",
@@ -60,5 +69,9 @@ def test_switch_model_allows_openai_codex_model_missing_from_listing():
     assert result.success is True
     assert result.new_model == "gpt-5.3-codex-spark"
     assert result.target_provider == "openai-codex"
+    assert result.provider_changed is False
+    assert result.api_key == "fixture-codex-key"
+    assert result.base_url == "https://codex.fixture.invalid/v1"
+    assert result.api_mode == "codex_responses"
     assert result.warning_message
     assert "OpenAI Codex model listing" in result.warning_message

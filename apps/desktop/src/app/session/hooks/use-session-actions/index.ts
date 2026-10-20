@@ -10,10 +10,12 @@ import {
   deleteSession,
   fetchStoredTranscriptAcrossBackends,
   getAllSessionMessages,
+  getApiRequestConnection,
+  getGlobalModelInfo,
   getLatestSessionMessages,
   setSessionArchived
 } from '@/hermes'
-import { useI18n } from '@/i18n'
+import { translateNow, useI18n } from '@/i18n'
 import {
   type ChatMessage,
   preserveLocalAssistantErrors,
@@ -25,7 +27,7 @@ import {
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { recoverInFlightTurnJournal } from '@/lib/inflight-turn-journal'
 import { setSessionYolo } from '@/lib/yolo-session'
-import { $clarifyRequests } from '@/store/clarify'
+import { $clarifyRequests, hasClarifyRequest } from '@/store/clarify'
 import { migrateSessionDraft } from '@/store/composer'
 import { clearQueuedPrompts, migrateQueuedPrompts } from '@/store/composer-queue'
 import {
@@ -63,14 +65,12 @@ import {
   $activeSessionStoredIdRotation,
   $connection,
   $currentCwd,
-  $currentFastMode,
-  $currentModel,
-  $currentProvider,
-  $currentReasoningEffort,
   $messages,
   $newChatWorkspaceTarget,
   $sessions,
   $yoloActive,
+  getComposerModelSelection,
+  getComposerRuntimeOptions,
   getSessionOwnerHint,
   type NewChatWorkspaceTarget,
   resolveComposerSessionKey,
@@ -236,6 +236,8 @@ function reconcileAuthoritativeMessages(
 // A no-op for single-profile/local-pooled users (a backend resolves its own launch
 // profile to None). The sticky UI model/effort/fast ride as per-session overrides,
 // never the profile default (that lives in Settings → Model).
+class ComposerModelSelectionLoadingError extends Error {}
+
 async function desktopSessionCreateParams(
   cwd: string,
   capturedRoute = resolveNewChatOwnerRoute()
@@ -244,14 +246,45 @@ async function desktopSessionCreateParams(
   // profile handshake below can yield long enough for background config/model
   // refreshes to finish; reading atoms afterward would silently create the
   // session with a different selection than the one the user submitted.
-  const selection = {
-    effort: $currentReasoningEffort.get().trim(),
-    fast: $currentFastMode.get(),
-    model: $currentModel.get().trim(),
-    provider: $currentProvider.get().trim()
+  const profile = capturedRoute?.profile || $newChatProfile.get() || normalizeProfileKey($activeGatewayProfile.get())
+  const owner = capturedRoute || { connectionId: getApiRequestConnection(), profile }
+  const { effort, fast } = getComposerRuntimeOptions()
+  let modelSelection: { model: string; provider: string } | null = getComposerModelSelection(owner)
+
+  if (!modelSelection) {
+    // One authoritative read per admission attempt recovers a failed initial
+    // seed and supports owners that have never occupied the foreground draft.
+    // Keep this result local; a background tile must not claim the foreground
+    // receipt slot or borrow the ambient connection's default.
+    try {
+      const info = await getGlobalModelInfo({
+        connectionId: owner.connectionId,
+        profile: capturedRoute?.targetProfile || profile
+      })
+
+      if (
+        typeof info?.model !== 'string' ||
+        !info.model.trim() ||
+        typeof info.provider !== 'string' ||
+        getComposerModelSelection(owner)?.source === 'manual'
+      ) {
+        throw new Error('Model selection changed or configuration is unavailable')
+      }
+
+      modelSelection = { model: info.model.trim(), provider: info.provider.trim() }
+    } catch {
+      // A new Send retries; a deliberate pin made during the read governs that
+      // next admission rather than silently repointing this in-flight one.
+      throw new ComposerModelSelectionLoadingError(translateNow('settings.model.loading'))
+    }
   }
 
-  const profile = capturedRoute?.profile || $newChatProfile.get() || normalizeProfileKey($activeGatewayProfile.get())
+  const selection = {
+    effort,
+    fast,
+    model: modelSelection.model,
+    provider: modelSelection.provider
+  }
 
   if (capturedRoute) {
     await ensureGatewayAgent(capturedRoute.connectionId, profile)
@@ -268,7 +301,7 @@ async function desktopSessionCreateParams(
       ? { model: selection.model, ...(selection.provider ? { provider: selection.provider } : {}) }
       : {}),
     ...(selection.effort ? { reasoning_effort: selection.effort } : {}),
-    fast: selection.fast
+    ...(selection.fast !== undefined ? { fast: selection.fast } : {})
   }
 }
 
@@ -473,6 +506,10 @@ export function useSessionActions({
 
   const createBackendSessionForSend = useCallback(
     async (preview: string | null = null): Promise<string | null> => {
+      if (creatingSessionRef.current) {
+        return null
+      }
+
       const startingStoredSessionId = selectedStoredSessionIdRef.current
       const startingRouteToken = getRouteToken()
 
@@ -625,6 +662,14 @@ export function useSessionActions({
         }
 
         return created.session_id
+      } catch (error) {
+        if (error instanceof ComposerModelSelectionLoadingError) {
+          notifyError(error, copy.createSessionFailed)
+
+          return null
+        }
+
+        throw error
       } finally {
         window.setTimeout(() => {
           creatingSessionRef.current = false
@@ -634,6 +679,7 @@ export function useSessionActions({
     [
       activeSessionIdRef,
       creatingSessionRef,
+      copy.createSessionFailed,
       ensureSessionState,
       getRouteToken,
       navigate,
@@ -1147,7 +1193,9 @@ export function useSessionActions({
                   needsInput:
                     pendingApproval ||
                     Boolean(pendingClarify) ||
-                    (clarifyAuthoritativelyAbsent ? false : state.needsInput),
+                    (pendingClarifyState.authoritativeAbsent && !hasClarifyRequest(cachedRuntimeId)
+                      ? false
+                      : state.needsInput),
                   // Adopting someone else's turn: we'll stream its reply
                   // without ever having received its prompt, so the settle
                   // path must not take the "I saw it all" shortcut.
@@ -1640,7 +1688,11 @@ export function useSessionActions({
             // Backend reported this turn running at resume time — live proof.
             turnLive: state.turnLive || resumedRunning,
             needsInput:
-              pendingApproval || Boolean(pendingClarify) || (clarifyAuthoritativelyAbsent ? false : state.needsInput),
+              pendingApproval ||
+              Boolean(pendingClarify) ||
+              (pendingClarifyState.authoritativeAbsent && !hasClarifyRequest(resumed.session_id)
+                ? false
+                : state.needsInput),
             adoptedRunningTurn: state.adoptedRunningTurn || resumedRunning,
             ...(inFlightRecovery.applied
               ? {

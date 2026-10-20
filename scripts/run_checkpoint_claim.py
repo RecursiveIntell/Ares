@@ -7,7 +7,7 @@ permission. Files are observed before the native transaction, not atomically
 with it. Unknown write/readback outcomes require reconciliation, never retry.
 """
 from hermes_state import SessionDB
-from hermes_state_runs import RunCheckpoint, RunCustodyError
+from hermes_state_runs import RunCheckpoint, RunCustodyV2, RunCustodyError, RunTaskBinding, _process_identity
 from scripts.run_checkpoint_resume import (
     BoundFileReader, ResumeRefusal, exact_keys, strict_json, verify_checkpoint_files,
 )
@@ -23,7 +23,8 @@ class ClaimOutcomeUnknown(RuntimeError):
 
 def claim_from_files(db, *, run_id, expected_generation, request_path,
                      expected_request_digest, origin_session_id,
-                     historical_goal_digest, controller_pid, ttl_seconds,
+                     controller_pid, ttl_seconds, historical_goal_digest=None,
+                     task_binding=None, expected_control_digest=None,
                      expected_session_id=None, expected_lease_holder=None, _on_claim=None):
     """Claim through the native owner and compare its exact persisted value.
 
@@ -33,7 +34,15 @@ def claim_from_files(db, *, run_id, expected_generation, request_path,
     """
     if not isinstance(db, SessionDB) or db.read_only:
         raise ClaimRefusal("WRITABLE_OWNER_REQUIRED")
+    v2 = task_binding is not None
+    if (v2 and historical_goal_digest is not None
+            or not v2 and (historical_goal_digest is None or expected_control_digest is not None)):
+        raise ClaimRefusal("MIXED_TASK_BINDING")
     try:
+        if v2:
+            task_binding = RunTaskBinding.from_dict(task_binding)
+            if task_binding.origin_session_id != origin_session_id:
+                raise ClaimRefusal("HISTORY_MISMATCH")
         reader = BoundFileReader()
         request = strict_json(reader.verified(str(request_path), expected_request_digest))
         exact_keys(request, ("checkpoint", "files", "session_id", "lease_holder"))
@@ -54,11 +63,15 @@ def claim_from_files(db, *, run_id, expected_generation, request_path,
     except (TypeError, ValueError, KeyError, RecursionError):
         raise ClaimRefusal("INVALID_REQUEST") from None
     try:
-        value = db.claim_run_custody_checked(run_id,
-            expected_generation=expected_generation, checkpoint=checkpoint,
-            origin_session_id=origin_session_id, current_session_id=request["session_id"],
-            lease_holder=request["lease_holder"], historical_goal_digest=historical_goal_digest,
-            controller_pid=controller_pid, ttl_seconds=ttl_seconds)
+        common = dict(expected_generation=expected_generation, checkpoint=checkpoint,
+            current_session_id=request["session_id"], lease_holder=request["lease_holder"],
+            controller_pid=controller_pid, ttl_seconds=ttl_seconds, recovery_files=request["files"])
+        if v2:
+            value = db.claim_run_task_custody_checked(run_id, **common,
+                task_binding=task_binding, expected_control_digest=expected_control_digest)
+        else:
+            value = db.claim_run_custody_checked(run_id, **common,
+                origin_session_id=origin_session_id, historical_goal_digest=historical_goal_digest)
     except RunCustodyError as exc:
         raise ClaimRefusal(exc.code) from None
     except BaseException:  # Cancellation can follow a committed native mutation.
@@ -81,3 +94,49 @@ def claim_from_files(db, *, run_id, expected_generation, request_path,
             "unresolved_effects": len(checkpoint.unresolved_effects),
             "unresolved_findings": len(checkpoint.unresolved_findings),
             "restrictions": len(checkpoint.restrictions)}
+
+
+def recover_from_files(db, value, *, expected_session_id, expected_lease_holder,
+                       expected_control_digest, recovery_reservation, controller_pid, ttl_seconds, _on_claim):
+    """Recover a proven-dead active owner from native-bound locators.
+
+    No old request/session/lease is replayed. Native checked admission again
+    verifies predecessor death, exact checkpoint/history and current controls.
+    """
+    from hermes_state_continuity import ContextContinuationError
+    if not isinstance(db, SessionDB) or db.read_only:
+        raise ClaimRefusal("WRITABLE_OWNER_REQUIRED")
+    if value.current_session_id != expected_session_id or value.disposition != "active":
+        raise ClaimRefusal("RECOVERY_ACTIVE_PREDECESSOR_REQUIRED")
+    try:
+        if _process_identity(value.controller_pid) == value.process_identity:
+            raise ClaimRefusal("OWNER_ACTIVE")
+        files = db.read_run_recovery_files(value)
+        source_count = verify_checkpoint_files(value.checkpoint, files, BoundFileReader())
+    except (RunCustodyError, ResumeRefusal) as exc:
+        raise ClaimRefusal(str(exc)) from None
+    try:
+        common = dict(lease_holder=expected_lease_holder, expected_generation=value.generation,
+            current_session_id=expected_session_id, checkpoint=value.checkpoint,
+            controller_pid=controller_pid, ttl_seconds=ttl_seconds, recovery_files=files,
+            expected_control_digest=expected_control_digest, require_dead_predecessor=True,
+            recovery_reservation=recovery_reservation)
+        if type(value) is RunCustodyV2:
+            updated = db.claim_run_task_custody_checked(value.run_id, **common, task_binding=value.task_binding)
+        else:
+            updated = db.claim_run_custody_checked(value.run_id, **common,
+                origin_session_id=value.origin_session_id, historical_goal_digest=value.historical_goal_digest)
+    except (RunCustodyError, ContextContinuationError) as exc:
+        raise ClaimRefusal(exc.code) from None
+    except BaseException:
+        raise ClaimOutcomeUnknown("CLAIM_OUTCOME_UNKNOWN") from None
+    try:
+        _on_claim(updated)
+        current = db.read_run_custody(value.run_id)
+    except BaseException:
+        raise ClaimOutcomeUnknown("CLAIM_READBACK_UNKNOWN") from None
+    if current != updated:
+        raise ClaimOutcomeUnknown("CLAIM_READBACK_MISMATCH")
+    return {"status": "cold_claim_observed", "run_id": updated.run_id, "generation": updated.generation,
+            "custody_changed": True, "resume_authorized": False, "downstream_effects_executed": False,
+            "source_files": source_count}

@@ -194,7 +194,17 @@ class LSPClient:
         cwd: Optional[str] = None,
         initialization_options: Optional[Dict[str, Any]] = None,
         seed_diagnostics_on_first_push: bool = False,
+        profile_boundary=None,
     ) -> None:
+        from agent.secret_scope import build_profile_env_boundary
+        from hermes_constants import get_hermes_home, get_process_hermes_home
+
+        boundary = profile_boundary or build_profile_env_boundary(
+            get_process_hermes_home(), get_hermes_home(),
+        )
+        self._profile_home = boundary.target_home
+        self._source_home = boundary.source_home
+        self._profile_generation = boundary.target_generation
         self.server_id = server_id
         self.workspace_root = workspace_root
         self._command = list(command)
@@ -305,9 +315,20 @@ class LSPClient:
         return cmd
 
     async def _spawn(self) -> None:
-        env = dict(os.environ)
-        if self._env:
-            env.update(self._env)
+        from agent.secret_scope import build_profile_env_boundary
+        from tools.environments.local import build_subprocess_env, hermes_subprocess_env
+
+        boundary = build_profile_env_boundary(self._source_home, self._profile_home)
+        if boundary.target_generation != self._profile_generation:
+            raise LSPProtocolError("LSP profile authority changed; refusing spawn")
+        # First remove launch-profile authority using the non-model child
+        # policy. Then admit explicit target-authored server env through the
+        # existing non-model filter; it must not become source-profile input.
+        base = hermes_subprocess_env(profile_boundary=boundary)
+        env = build_subprocess_env(
+            base=base, extra=self._env, profile_home=self._profile_home,
+            source_profile_home=self._profile_home, enforce_profile_boundary=True,
+        )
 
         cmd = self._command
         if sys.platform == "win32":

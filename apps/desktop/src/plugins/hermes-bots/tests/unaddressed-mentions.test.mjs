@@ -11,7 +11,7 @@ const source = readFileSync(new URL('../plugin.js', import.meta.url), 'utf8')
 
 function loadUnaddressed(roomLog) {
   const start = source.indexOf('function unaddressedGroupMentions')
-  const end = source.indexOf('/** Drive one bounded round-robin turn for ONE THREAD.')
+  const end = source.indexOf('/** Capture retained input identity once.')
 
   assert.ok(start >= 0 && end > start, 'unaddressedGroupMentions block must remain extractable')
 
