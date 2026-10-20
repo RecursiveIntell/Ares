@@ -124,9 +124,11 @@ it('keeps a late catalog reply in its original source and profile cache', async 
 
 it('visibility and picker subscribers share the same target catalog instead of a nonempty launch catalog', async () => {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
   const request = vi.fn(async (_method: string, params?: Record<string, unknown>) =>
     payload(params?.profile === 'target' ? 'target-model' : 'source-model')
   )
+
   const gateway = { request } as never
 
   const view = render(

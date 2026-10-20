@@ -918,6 +918,7 @@ export function useTerminalSession({
           if (!terminalHostVisible(host)) {
             return false
           }
+
           term.focus()
 
           return true

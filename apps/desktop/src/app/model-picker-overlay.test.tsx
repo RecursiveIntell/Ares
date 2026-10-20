@@ -45,6 +45,7 @@ beforeAll(() => {
   )
 })
 const owner = { connectionId: 'source-b', profile: 'same-name', targetProfile: 'backend-b' }
+
 const options = {
   model: 'catalog-b',
   provider: 'custom:b',
@@ -88,6 +89,7 @@ function mount() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   const ambient = vi.fn(async () => options)
   const select = vi.fn()
+
   const view = render(
     <QueryClientProvider client={client}>
       <ModelPickerOverlay gateway={{ request: ambient } as never} onSelect={select} profile="default" />

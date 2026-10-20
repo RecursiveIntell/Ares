@@ -13,6 +13,7 @@ afterEach(() => {
   for (const stop of cleanup.splice(0)) {
     stop()
   }
+
   document.body.replaceChildren()
 })
 
@@ -38,6 +39,7 @@ async function terminals() {
       if (store.$activeTerminalId.get() !== first) {
         return false
       }
+
       firstInput.focus()
 
       return true
@@ -48,6 +50,7 @@ async function terminals() {
       if (store.$activeTerminalId.get() !== second || !secondReady) {
         return false
       }
+
       secondInput.focus()
 
       return true
