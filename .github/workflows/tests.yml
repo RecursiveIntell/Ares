@@ -48,7 +48,11 @@ jobs:
   test:
     name: Run tests slice ${{ matrix.slice.index }}/${{ inputs.slice_count }}
     needs: generate
-    runs-on: ubuntu-latest
+    # Pinned: GitHub moved ubuntu-latest to 26.04 (uutils/Rust coreutils), where
+    # `sort` rejects dash-prefixed option values and /usr/bin/{printf,cat,...} are
+    # symlinks. tests/tools/test_execution_flag_detection.py asserts GNU sort
+    # behaviour. Unpin once the suite is verified on 26.04.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
