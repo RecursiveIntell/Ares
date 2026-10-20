@@ -391,6 +391,7 @@ def list_active_subagents() -> List[Dict[str, Any]]:
                     "owner_session_record",
                     "accepting_steer",
                     "future",
+                    "initialization_resources",
                 }
             } | {'cleanup_age_seconds': max(0.0, time.time() - r['first_stop_at']) if r.get('first_stop_at') else 0.0}
             for r in _active_subagents.values()
@@ -1640,6 +1641,22 @@ def _inherit_parent_base_url(parent_agent, fallback_base_url: Optional[str]) -> 
     return fallback_base_url or None
 
 
+class _ChildInitializationResources:
+    """Actual resources retained by one canonical initialization reservation."""
+
+    def __init__(self):
+        self.session_db = None
+        self.agent = None
+        self.constructor_error_class = None
+        self.cleanup_error_class = None
+        self.cleanup_failure_kind = None
+
+    def register_agent(self, agent):
+        if self.agent is not None and self.agent is not agent:
+            raise RuntimeError('DELEGATION_INITIALIZATION_OWNER_ALREADY_BOUND')
+        self.agent = agent
+
+
 def _build_child_agent(
     task_index: int,
     goal: str,
@@ -1663,6 +1680,7 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    _initialization_resources: Optional[_ChildInitializationResources] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1976,6 +1994,9 @@ def _build_child_agent(
     # the child's transcript into the launch profile's db, breaking
     # parent_session_id lineage and session_search. AsyncSessionDB wrappers
     # (gateway) forward .db_path via __getattr__, so this works through them.
+    if _initialization_resources is not None and not isinstance(
+            _initialization_resources, _ChildInitializationResources):
+        raise ValueError('DELEGATION_INVALID_INITIALIZATION_RESOURCE_OWNER')
     child_session_db = None
     parent_session_db = getattr(parent_agent, "_session_db", None)
     if parent_session_db is not None:
@@ -1995,11 +2016,18 @@ def _build_child_agent(
             )
             child_session_db = None
 
+    if _initialization_resources is not None:
+        _initialization_resources.session_db = child_session_db
+
     from agent.delegation_context import delegated_child_context
 
     with delegated_child_context():
         try:
             child = AIAgent(
+                _initialization_observer=(
+                    _initialization_resources.register_agent
+                    if _initialization_resources is not None else None
+                ),
                 base_url=effective_base_url,
                 api_key=effective_api_key,
                 model=effective_model,
@@ -2040,16 +2068,28 @@ def _build_child_agent(
                 iteration_budget=None,  # fresh budget per subagent
                 **child_optional_kwargs,
             )
-        except BaseException:
-            # Construction failed: the dedicated handle has no owner and no
-            # child close() will ever run — release it here so the sqlite fds
-            # don't outlive the failed spawn.
+        except BaseException as constructor_error:
+            # The initialization reservation owns this handle until positive
+            # close or transfer. Failure must not erase known cleanup uncertainty
+            # or replace the constructor's own exception/origin.
+            if _initialization_resources is not None:
+                _initialization_resources.constructor_error_class = type(constructor_error).__name__
             if child_session_db is not None:
                 try:
                     child_session_db.close()
-                except Exception:
-                    pass
+                except BaseException as cleanup_error:
+                    if _initialization_resources is not None:
+                        _initialization_resources.cleanup_error_class = type(cleanup_error).__name__
+                        _initialization_resources.cleanup_failure_kind = "close_exception"
+                else:
+                    if _initialization_resources is not None:
+                        if getattr(child_session_db, "_conn", object()) is None:
+                            _initialization_resources.session_db = None
+                        else:
+                            _initialization_resources.cleanup_failure_kind = "close_unconfirmed"
             raise
+    if _initialization_resources is not None:
+        _initialization_resources.agent = child
     child._print_fn = getattr(parent_agent, "_print_fn", None)
     # Ownership transfer for the dedicated handle: the child's close() must
     # release it (nothing else holds a reference), and no parent teardown can
@@ -2129,6 +2169,9 @@ def _build_child_agent(
     except Exception:
         logger.debug("subagent_start hook invocation failed", exc_info=True)
 
+    if _initialization_resources is not None:
+        # Only a successfully returned child receives the dedicated DB owner.
+        _initialization_resources.session_db = None
     return child
 
 
@@ -2506,6 +2549,80 @@ class _ChildInactivityExpired(_ChildDeadlineExpired):
 
 class _ChildStopRequested(InterruptedError):
     pass
+
+
+_PARENT_INTERRUPT_GENERATION_UNSET = object()
+
+
+def _parent_initialization_stop_reason(
+        parent, *, admitted_generation=_PARENT_INTERRUPT_GENERATION_UNSET):
+    """Read the owning parent's existing stop and close state."""
+    if parent is None:
+        return None
+    state = vars(parent)
+    if state.get('_close_cleanup_state') in {'incomplete', 'complete'}:
+        return 'closing'
+    if (admitted_generation is not _PARENT_INTERRUPT_GENERATION_UNSET
+            and state.get('_delegate_interrupt_generation') is not admitted_generation):
+        return 'interrupted'
+    if state.get('_interrupt_requested') is True:
+        return 'interrupted'
+    for name in ('_delegate_stop_event', '_hard_interrupt_requested'):
+        event = state.get(name)
+        if event is not None:
+            try:
+                if event.is_set():
+                    return 'interrupted'
+            except Exception:
+                pass
+    return None
+
+
+class _ParentInitializationStopSignal:
+    """Per-admission view of parent Stop plus its interrupt-generation fence."""
+
+    def __init__(self, parent, admitted_generation):
+        self.parent = parent
+        # This opaque token has identity-only, in-process meaning. It is not a
+        # durable epoch and is never normalized or interpreted as one.
+        self.admitted_generation = admitted_generation
+
+    def stop_reason(self):
+        lock = getattr(self.parent, '_pending_redirect_lock', None)
+        if lock is None:
+            return _parent_initialization_stop_reason(
+                self.parent, admitted_generation=self.admitted_generation)
+        with lock:
+            return _parent_initialization_stop_reason(
+                self.parent, admitted_generation=self.admitted_generation)
+
+    def is_set(self):
+        return self.stop_reason() is not None
+
+
+def _capture_parent_initialization_stop(parent):
+    """Capture the current in-process interrupt identity at admission."""
+    if parent is None:
+        return None, None
+
+    def capture_locked():
+        state = vars(parent)
+        return (_parent_initialization_stop_reason(parent),
+            state.get('_delegate_interrupt_generation'))
+
+    lock = getattr(parent, '_pending_redirect_lock', None)
+    if lock is None:
+        return capture_locked()
+    with lock:
+        return capture_locked()
+
+
+def _parent_initialization_error(reason, *, unsettled=False):
+    if reason == 'closing':
+        detail = 'child admission refused' if not unsettled else 'child initialization unsettled'
+        return ValueError(f'DELEGATION_PARENT_CLOSING: {detail}')
+    detail = 'child admission refused' if not unsettled else 'child initialization unsettled'
+    return ValueError(f'DELEGATION_PARENT_INTERRUPTED: {detail}')
 
 
 def _wait_child_attempt(future, deadline, stop_event=None, *, progress_witness=None) -> ChildWaitOutcome | InactivityVerdict:
@@ -3720,10 +3837,16 @@ def _retire_unstarted_child(child, parent, *, reservation_id=None):
     return True
 
 
-def _build_child_preserving_parent_tools(**kwargs):
-    """Reserve before owned initialization; preserve the parent's toolset."""
+def _build_child_preserving_parent_tools(*, _caller_initialization_done=None, **kwargs):
+    """Reserve construction through its caller's explicit result/error handoff.
+
+    The caller owns this fresh Future and completes it with None only after
+    consuming the construction result or finalizing its error. This helper
+    cannot infer that boundary from reaching its own finally block.
+    """
     policy = _get_child_lifetime_policy()
     timeout = _require_child_lifetime_policy(policy)
+    from concurrent.futures import Future
     import model_tools
     from tools.daemon_pool import DaemonThreadPoolExecutor
     import uuid
@@ -3735,26 +3858,40 @@ def _build_child_preserving_parent_tools(**kwargs):
         or _PARENT_FINALIZATION_FALLBACK_LOCK)
     parent_sid = str(getattr(parent, 'session_id', '') or '')
     reservation = 'sa-init-' + uuid.uuid4().hex
+    initialization_resources = _ChildInitializationResources()
     ceiling = _get_max_concurrent_children()
     with parent_admission_lock:
-        if parent is not None and vars(parent).get('_close_cleanup_state') in {'incomplete', 'complete'}:
-            raise ValueError('DELEGATION_PARENT_CLOSING: child admission refused')
+        stop_reason, admitted_generation = _capture_parent_initialization_stop(parent)
+        if stop_reason is not None:
+            raise _parent_initialization_error(stop_reason)
+        stop_signal = (_ParentInitializationStopSignal(parent, admitted_generation)
+            if parent is not None else None)
         with _active_subagents_lock:
             occupied = sum(r.get('owner_agent_session_id') == parent_sid
                 for r in _active_subagents.values())
             if occupied >= ceiling:
                 raise ValueError('DELEGATION_CAPACITY_OCCUPIED: running or cleanup-incomplete children at ceiling')
+            if not isinstance(_caller_initialization_done, Future) or _caller_initialization_done.done():
+                raise ValueError('DELEGATION_INITIALIZATION_OWNER_REQUIRED: fresh caller-owned handoff')
             _active_subagents[reservation] = {'subagent_id': reservation, 'goal': kwargs.get('goal'),
                 'owner_agent_session_id': parent_sid, 'agent': None, 'status': 'initializing',
-                'capacity_occupied': True, 'started_at': time.time(), 'accepting_steer': False}
+                'capacity_occupied': True, 'started_at': time.time(), 'accepting_steer': False,
+                'initialization_resources': initialization_resources}
 
     def build():
         with _CHILD_CONSTRUCTION_LOCK:
             if deadline is not None and time.monotonic() >= deadline:
                 raise _ChildDeadlineExpired('DELEGATION_DEADLINE_EXPIRED: initialization admission')
             parent_tool_names = list(model_tools._last_resolved_tool_names)
+            # Pair the constructor-start check with interrupt publication.
+            # The captured generation also keeps this admission stopped if a
+            # later turn clears the parent's mutable interrupt flag.
+            stop_reason = (stop_signal.stop_reason() if stop_signal is not None
+                else _parent_initialization_stop_reason(parent))
+            if stop_reason is not None:
+                raise _parent_initialization_error(stop_reason)
             try:
-                child = _build_child_agent(**kwargs)
+                child = _build_child_agent(_initialization_resources=initialization_resources, **kwargs)
             finally:
                 model_tools._last_resolved_tool_names = parent_tool_names
         child._delegate_saved_tool_names = parent_tool_names
@@ -3764,50 +3901,154 @@ def _build_child_preserving_parent_tools(**kwargs):
         child._delegate_lifetime_policy = policy
         return child
 
+    retirement_dispatch_lock = threading.Lock()
+    retirement_dispatched = False
     executor = DaemonThreadPoolExecutor(max_workers=1, thread_name_prefix='child-initialization')
+
+    def retry_parent_close():
+        if parent is None or vars(parent).get('_close_cleanup_state') != 'incomplete':
+            return
+        close = getattr(parent, 'close', None)
+        if callable(close):
+            try:
+                close()
+            except BaseException:
+                # Cleanup must not replace the constructor's own result/error.
+                logger.debug('Parent close retry after child initialization failed', exc_info=True)
+
+    def release_reservation(*, retry_close=False):
+        with _active_subagents_lock:
+            _active_subagents.pop(reservation, None)
+        # The caller acknowledgment and physical settlement jointly own this
+        # release; neither a returned Future nor this helper's finally does.
+        if retry_close:
+            retry_parent_close()
+
+    def retain_unsettled_initialization():
+        with _active_subagents_lock:
+            record = _active_subagents.get(reservation)
+            if record is not None:
+                record.update(status='cleanup-incomplete', cleanup_state='incomplete',
+                    first_stop_at=time.time())
+
+        def retire_initialization(done):
+            if initialization_resources.session_db is not None:
+                # The callable is finished, but actual factory-owned cleanup
+                # is unconfirmed. Retain the handle, reservation and parent;
+                # do not pretend an exceptional Future settled its resources.
+                with _active_subagents_lock:
+                    record = _active_subagents.get(reservation)
+                    if record is not None:
+                        record.update(status='cleanup-incomplete', cleanup_state='incomplete',
+                            capacity_occupied=True, cleanup={'status': 'incomplete',
+                                'outcome': 'unknown', 'retirement_phase': 'initialization_resource_cleanup',
+                                'resource_kind': 'session_db',
+                                'constructor_error_class': initialization_resources.constructor_error_class,
+                                'cleanup_error_class': initialization_resources.cleanup_error_class,
+                                'failure_kind': initialization_resources.cleanup_failure_kind or 'ownership_not_transferred'})
+                return
+            try:
+                child = done.result()
+            except BaseException:
+                # A fully constructed child can exist even if later factory/
+                # helper setup failed before the Future returned it.
+                child = initialization_resources.agent
+            if child is not None and initialization_resources.constructor_error_class is not None:
+                # __init__ already attempted local-only cleanup. Do not call
+                # close() and manufacture logical session-end for a failed
+                # constructor. Retain the actual partial instance while its
+                # engine/tool work is live or cleanup-indeterminate.
+                if child._has_owned_tool_work():
+                    with _active_subagents_lock:
+                        record = _active_subagents.get(reservation)
+                        if record is not None:
+                            record.update(status='cleanup-incomplete', cleanup_state='incomplete',
+                                capacity_occupied=True, cleanup={'status': 'incomplete',
+                                    'outcome': 'unknown', 'retirement_phase': 'initialization_resource_cleanup',
+                                    'resource_kind': 'partial_agent',
+                                    'constructor_error_class': initialization_resources.constructor_error_class})
+                    return
+                release_reservation(retry_close=True)
+                return
+            if child is not None:
+                request_hard_interrupt(child)
+                if not _retire_unstarted_child(child, parent, reservation_id=reservation):
+                    return
+            release_reservation(retry_close=True)
+
+        def dispatch_retirement(_done):
+            nonlocal retirement_dispatched
+            if not future.done() or not _caller_initialization_done.done():
+                return
+            try:
+                acknowledged = (not _caller_initialization_done.cancelled()
+                    and _caller_initialization_done.result() is None)
+            except BaseException:
+                acknowledged = False
+            if not acknowledged:
+                with _active_subagents_lock:
+                    record = _active_subagents.get(reservation)
+                    if record is not None:
+                        record['cleanup'] = {'status': 'incomplete', 'outcome': 'unknown',
+                            'retirement_phase': 'initialization_owner_acknowledgment'}
+                return
+            with retirement_dispatch_lock:
+                if retirement_dispatched:
+                    return
+                retirement_dispatched = True
+            # Either Future callback may run inline. Dispatch only after the
+            # real caller has acknowledged, and never clean up on its stack.
+            try:
+                threading.Thread(target=retire_initialization, args=(future,),
+                    name='initialization-settlement-' + reservation, daemon=True).start()
+            except Exception as exc:
+                with _active_subagents_lock:
+                    record = _active_subagents.get(reservation)
+                    if record is not None:
+                        record.update(status='cleanup-incomplete', cleanup_state='incomplete',
+                            cleanup={'status': 'incomplete', 'outcome': 'unknown',
+                                'retirement_phase': 'initialization_settlement_start',
+                                'error_class': type(exc).__name__})
+                logger.error('Initialization settlement supervisor could not start; retaining owner', exc_info=True)
+
+        future.add_done_callback(dispatch_retirement)
+        _caller_initialization_done.add_done_callback(dispatch_retirement)
+
     try:
         future = executor.submit(build)
         with _active_subagents_lock:
-            _active_subagents[reservation]['future'] = future
-        outcome = _wait_child_attempt(future, deadline)
+            record = _active_subagents.get(reservation)
+            if record is not None:
+                record['future'] = future
+        outcome = _wait_child_attempt(future, deadline, stop_signal)
         if outcome is ChildWaitOutcome.EXPIRED:
-            with _active_subagents_lock:
-                _active_subagents[reservation].update(status='cleanup-incomplete',
-                    cleanup_state='incomplete', first_stop_at=time.time())
-            def retire_initialization(done):
-                try:
-                    child = done.result()
-                except BaseException:
-                    child = None
-                if child is not None:
-                    request_hard_interrupt(child)
-                    if not _retire_unstarted_child(child, parent, reservation_id=reservation):
-                        return
-                with _active_subagents_lock:
-                    _active_subagents.pop(reservation, None)
-                if parent is not None and vars(parent).get('_close_cleanup_state') == 'incomplete':
-                    parent.close()
-            future.add_done_callback(retire_initialization)
+            retain_unsettled_initialization()
             raise _ChildDeadlineExpired('DELEGATION_DEADLINE_EXPIRED: initialization unsettled')
+        if outcome is ChildWaitOutcome.STOPPED:
+            stop_reason = ((stop_signal.stop_reason() if stop_signal is not None
+                else _parent_initialization_stop_reason(parent)) or 'interrupted')
+            retain_unsettled_initialization()
+            raise _parent_initialization_error(stop_reason, unsettled=True)
         try:
             child = future.result()
         except BaseException:
-            with _active_subagents_lock:
-                _active_subagents.pop(reservation, None)
+            retain_unsettled_initialization()
             raise
         with parent_admission_lock:
-            closing = parent is not None and vars(parent).get('_close_cleanup_state') in {'incomplete', 'complete'}
-            if not closing:
+            stop_reason = (stop_signal.stop_reason() if stop_signal is not None
+                else _parent_initialization_stop_reason(parent))
+            if stop_reason is None:
                 with _active_subagents_lock:
                     record = _active_subagents.pop(reservation)
                     record.update(subagent_id=child._subagent_id, agent=child, status='admitted')
                     record.pop('future', None)
+                    record.pop('initialization_resources', None)
                     _active_subagents[child._subagent_id] = record
-        if closing:
-            # The initialization reservation still charges this exact parent
-            # until the positively unstarted child's resources settle.
-            _retire_unstarted_child(child, parent, reservation_id=reservation)
-            raise ValueError('DELEGATION_PARENT_CLOSING: child admission revoked during initialization')
+        if stop_reason is not None:
+            # Keep the same reservation through caller error finalization and
+            # positively observed cleanup of this unstarted child.
+            retain_unsettled_initialization()
+            raise _parent_initialization_error(stop_reason)
         return child
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
@@ -4269,6 +4510,7 @@ def delegate_task(
     # resolved tool names around each construction under a lock, so child
     # toolset resolution never leaks into the parent (shared with the plugin
     # subagent-lifecycle API).
+    from concurrent.futures import Future
     children = []
     for i, t in enumerate(task_list):
         # Per-task role beats top-level; normalise again so unknown
@@ -4282,8 +4524,10 @@ def delegate_task(
             from tools.delegation_output_schema import append_output_contract
 
             _child_context = append_output_contract(_child_context, _task_schema)
+        initialization_caller_done = Future()
         try:
             child = _build_child_preserving_parent_tools(
+                _caller_initialization_done=initialization_caller_done,
                 task_index=i,
                 goal=t["goal"],
                 context=_child_context,
@@ -4313,6 +4557,10 @@ def delegate_task(
                 return json.dumps({'status': 'rejected', 'error_code': 'delegation_invalid_timeout',
                     'execution_started': False, 'error': str(exc)})
             return tool_error(str(exc))
+        finally:
+            # This caller has consumed the result or finalized its refusal;
+            # a stopped builder must never self-publish this handoff.
+            initialization_caller_done.set_result(None)
         # Attach the validated schema for the completion-side validation
         # hook in _run_single_child. Absent (None) on schema-less tasks.
         if _task_schema is not None:

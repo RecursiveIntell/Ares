@@ -22,15 +22,38 @@ def compile_obligation_projection(packet: Path, draft_path: Path, *, approved_dr
     if hashlib.sha256(raw).hexdigest() != approved_draft_sha256:
         raise ProjectionError('APPROVED_SUBCHECK_IDENTITY_MISMATCH')
     draft = json.loads(raw)
+    source_hashes = draft.get('source_hashes') if isinstance(draft, dict) else None
+    required_sources = {'COMPLETION_PLAN.md', 'inherited/ORIGINAL_DAG.json',
+                        'COMPLETION_DAG.json', 'COVERAGE.json'}
+    if not isinstance(source_hashes, dict):
+        raise ProjectionError('CANONICAL_SOURCE_BINDINGS_INVALID')
+    missing = required_sources - source_hashes.keys()
+    if missing:
+        raise ProjectionError('CANONICAL_SOURCE_BINDING_MISSING: ' + ', '.join(sorted(missing)))
     inputs = {}
-    for name, expected in draft['source_hashes'].items():
-        value = (packet / name).read_bytes()
+    admitted_bytes = {}
+    packet_root = packet.resolve()
+    for name, expected in source_hashes.items():
+        if (not isinstance(name, str) or not name or Path(name).is_absolute()
+                or '..' in Path(name).parts):
+            raise ProjectionError('CANONICAL_SOURCE_PATH_INVALID')
+        try:
+            source = (packet / name).resolve(strict=True)
+        except (OSError, ValueError) as exc:
+            raise ProjectionError('CANONICAL_SOURCE_UNAVAILABLE: ' + name) from exc
+        if not source.is_relative_to(packet_root):
+            raise ProjectionError('CANONICAL_SOURCE_PATH_INVALID: ' + name)
+        value = source.read_bytes()
         if hashlib.sha256(value).hexdigest() != expected:
             raise ProjectionError('CANONICAL_SOURCE_IDENTITY_MISMATCH: ' + name)
         inputs[name] = {'sha256': expected, 'path': str(packet / name)}
-    original = json.loads((packet / 'inherited/ORIGINAL_DAG.json').read_bytes())
-    current = json.loads((packet / 'COMPLETION_DAG.json').read_bytes())
-    coverage = json.loads((packet / 'COVERAGE.json').read_bytes())
+        admitted_bytes[name] = value
+    # Parse the bytes whose identities were checked, not a second mutable read.
+    original = json.loads(admitted_bytes['inherited/ORIGINAL_DAG.json'])
+    current = json.loads(admitted_bytes['COMPLETION_DAG.json'])
+    coverage = json.loads(admitted_bytes['COVERAGE.json'])
+    if current.get('plan_sha256') != source_hashes['COMPLETION_PLAN.md']:
+        raise ProjectionError('CANONICAL_PLAN_PROJECTION_MISMATCH')
     cases = {row['id']: row for row in coverage['cases']}
     if len(cases) != len(coverage['cases']):
         raise ProjectionError('CANONICAL_CASE_DUPLICATE')
@@ -50,6 +73,8 @@ def compile_obligation_projection(packet: Path, draft_path: Path, *, approved_dr
     if set(owners) & supplemental_ids or set(owners) | supplemental_ids != set(cases):
         raise ProjectionError('INHERITED_SUPPLEMENTAL_PARTITION_INVALID')
     cards = {card['id']: card for card in current['cards']}
+    if len(cards) != len(current['cards']):
+        raise ProjectionError('CANONICAL_CARD_DUPLICATE')
     for case, row in cases.items():
         if row.get('inherited_task') != owners.get(case):
             raise ProjectionError('INHERITED_CASE_OWNER_MISMATCH: ' + case)

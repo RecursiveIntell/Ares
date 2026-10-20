@@ -26,6 +26,7 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 
 import { _electron, type ElectronApplication, type Page } from '@playwright/test'
+import PACKAGE_JSON from '../package.json' with { type: 'json' }
 
 import { startMockServer, type MockServerOptions } from './mock-server'
 import { installErrorBannerGuard } from './test'
@@ -316,17 +317,18 @@ export function findElectron(): string {
  */
 export async function launchDesktop(
   env: Record<string, string>,
+  packaged = false,
 ): Promise<{ app: ElectronApplication; page: Page }> {
   assertDistBuilt()
 
-  const electronBin = findElectron()
+  const electronBin = packaged ? PACKAGED_BINARY_PATH : findElectron()
 
   // `electron .` loads from the package.json `main` field
   // (dist/electron-main.mjs after build).
   const app = await _electron.launch({
     executablePath: electronBin,
     args: [
-      DESKTOP_ROOT, // `electron .` — the `.` is the desktop package dir
+      ...(packaged ? [] : [DESKTOP_ROOT]), // packaged app owns its bundled entry point
       '--disable-gpu',
       '--no-sandbox',
     ],
@@ -355,6 +357,8 @@ export interface MockBackendFixture {
 }
 
 export interface MockBackendOptions {
+  /** Use the built packaged shell with this source-owned temporary backend. */
+  packaged?: boolean
   /**
    * Optional YAML lines to inject under the `display:` section of the
    * generated config.yaml. Used by the interim-message e2e test to toggle
@@ -399,7 +403,7 @@ export async function setupMockBackend(options: MockBackendOptions = {}): Promis
   const env = buildAppEnv(sandbox, {
     HERMES_DESKTOP_SKIP_QUIT_CONFIRM: options.skipQuitConfirm === false ? '0' : '1',
   })
-  const { app, page } = await launchDesktop(env)
+  const { app, page } = await launchDesktop(env, options.packaged)
 
   return {
     app,
@@ -512,17 +516,19 @@ providers:
  * electron-builder's output layout under release/.
  */
 function resolvePackagedBinaryPath(): string {
+  const productName = PACKAGE_JSON.build.productName || PACKAGE_JSON.productName
+  const executableName = PACKAGE_JSON.build.executableName || productName
   if (process.platform === 'win32') {
-    return path.join(RELEASE_ROOT, 'win-unpacked', 'Hermes.exe')
+    return path.join(RELEASE_ROOT, 'win-unpacked', `${executableName}.exe`)
   }
 
   if (process.platform === 'darwin') {
     const arch = process.arch === 'arm64' ? 'arm64' : 'x64'
 
-    return path.join(RELEASE_ROOT, `mac-${arch}`, 'Hermes.app', 'Contents', 'MacOS', 'Hermes')
+    return path.join(RELEASE_ROOT, `mac-${arch}`, `${productName}.app`, 'Contents', 'MacOS', executableName)
   }
 
-  return path.join(RELEASE_ROOT, 'linux-unpacked', 'hermes')
+  return path.join(RELEASE_ROOT, 'linux-unpacked', executableName)
 }
 
 export const PACKAGED_BINARY_PATH = resolvePackagedBinaryPath()

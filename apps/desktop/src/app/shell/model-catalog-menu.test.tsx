@@ -74,6 +74,29 @@ function renderMenu(overrides: Partial<ModelMenuController> = {}) {
 // the kanban board would end up disagreeing about what "my models" means —
 // which is exactly the drift extracting this component was meant to prevent.
 describe('the catalog owns model curation', () => {
+  it('preserves variant Fast across families without applying a preset', async () => {
+    getGlobalModelOptions.mockResolvedValue({
+      providers: [
+        {
+          slug: 'fixture',
+          name: 'Fixture',
+          models: ['alpha', 'alpha-fast', 'beta', 'beta-fast']
+        }
+      ]
+    })
+    const applyPreset = vi.fn()
+
+    const select = renderMenu({
+      preserveOptionsOnSelect: true,
+      applyPreset,
+      current: { model: 'alpha-fast', provider: 'fixture', effort: 'high', fast: false }
+    })
+
+    fireEvent.click(await screen.findByText('Beta'))
+    await vi.waitFor(() => expect(select).toHaveBeenCalledWith('beta-fast', 'fixture'))
+    expect(applyPreset).not.toHaveBeenCalled()
+  })
+
   it('a preserving surface selects only the model, never a remembered effort/Fast preset', async () => {
     const applyPreset = vi.fn()
 

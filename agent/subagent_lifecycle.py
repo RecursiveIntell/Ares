@@ -224,19 +224,26 @@ class SubagentLifecycleService:
             DEFAULT_MAX_ITERATIONS,
         )
 
-        child = _build_child_preserving_parent_tools(
-            task_index=0,
-            goal=request.goal,
-            context=request.context,
-            toolsets=list(request.allowed_toolsets)
-            if request.allowed_toolsets
-            else None,
-            model=request.model,
-            max_iterations=DEFAULT_MAX_ITERATIONS,
-            task_count=1,
-            parent_agent=parent,
-            role=request.role,
-        )
+        initialization_caller_done = Future()
+        try:
+            child = _build_child_preserving_parent_tools(
+                _caller_initialization_done=initialization_caller_done,
+                task_index=0,
+                goal=request.goal,
+                context=request.context,
+                toolsets=list(request.allowed_toolsets)
+                if request.allowed_toolsets
+                else None,
+                model=request.model,
+                max_iterations=DEFAULT_MAX_ITERATIONS,
+                task_count=1,
+                parent_agent=parent,
+                role=request.role,
+            )
+        finally:
+            # The service, not the builder, owns result/error handoff. A
+            # successful child retains its own canonical reservation below.
+            initialization_caller_done.set_result(None)
         subagent_id = str(getattr(child, "_subagent_id", "") or "")
         if not subagent_id:
             raise SubagentLifecycleError("Hermes failed to assign a child identity.")

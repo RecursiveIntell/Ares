@@ -403,6 +403,15 @@ class ContextEngine(ABC):
         NOT called per-turn — only when the session truly ends.
         """
 
+    def has_unsettled_work(self) -> bool:
+        """Whether instance-owned work still blocks physical retirement.
+
+        Resource-bearing engines must retain their exact handles until cleanup
+        is positively observed. Unknown cleanup is unsettled, not success.
+        This is a lifecycle observation, not logical-session authority.
+        """
+        return False
+
     def shutdown(self) -> None:
         """Release only handles owned by this engine instance.
 

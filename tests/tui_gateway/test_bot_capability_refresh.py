@@ -152,6 +152,10 @@ def test_real_prompt_refresh_keeps_admitted_receipt_and_messages_in_target(env):
                                            ({"effort": "high"}, "priority")])
 def test_refresh_keeps_effective_runtime_not_stale_session_metadata(env, mode, reasoning, tier):
     env.old.reasoning_config, env.old.service_tier = reasoning, tier
+    if tier == "priority":
+        # A priority-tier preservation witness needs a Fast-capable model;
+        # the arbitrary default fixture model deliberately has no capability.
+        env.old.model = "gpt-6.1-sol"
     if mode == "pinned":
         env.session["model_override"] = {"model": "stale-pin"}
     elif mode == "resumed":
@@ -172,6 +176,27 @@ def test_refresh_keeps_effective_runtime_not_stale_session_metadata(env, mode, r
     assert new.client_closes == []
     assert env.target.get_session(KEY)["ended_at"] is None
     assert env.session["config_model_seen"] == ("config-model", "fake")
+
+
+def test_refresh_refuses_to_silently_normalize_unsupported_live_fast(env):
+    from hermes_cli.models import resolve_fast_mode_overrides
+
+    assert resolve_fast_mode_overrides(env.old.model) is None
+    env.old.service_tier = "priority"
+    server._sync_bot_capabilities(SID, env.session)
+    # Capability refresh cannot rewrite the already-admitted runtime. The
+    # constructor normalizes unsupported Fast, so reject this replacement.
+    assert env.session["agent"] is env.old
+    assert env.old.service_tier == "priority"
+    assert env.old._owns_session_db is True
+    assert env.old.client_closes == []
+    assert env.session["bot_caps_seen"] == "old-caps"
+    candidate = env.built[-1]
+    assert candidate.service_tier is None
+    assert candidate.request_overrides == {}
+    assert candidate._owns_session_db is False
+    assert len(candidate.client_closes) == 1
+    assert env.target.get_session(KEY)["ended_at"] is None
 
 
 def test_once_turn_runs_effective_model_then_restores_original_after_refresh(env):

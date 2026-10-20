@@ -167,20 +167,23 @@ class TestTextOnlyMainSkippedForVision:
     """Vision auto-detect must not return a text-only main-provider client."""
 
     def test_text_only_main_skipped_when_no_aggregator(self, isolated_home, monkeypatch):
-        """DeepSeek main + no aggregator credentials → no client built.
+        """Declared text-only main + no aggregator credentials → no client.
 
-        Pre-fix this silently returned the deepseek client with model
-        substitution, producing ``unknown variant 'image_url'`` at call time.
+        The capability is fixture input, not a claim about a changing external
+        catalog. A cold/offline catalog legitimately returns unknown, whose
+        permissive behavior is covered separately below.
         """
         _write_config(isolated_home, """
 model:
   provider: deepseek
   default: deepseek-v4-pro
+  supports_vision: false
 """)
         monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
         _fresh_modules()
 
-        from agent.auxiliary_client import resolve_vision_provider_client
+        from agent.auxiliary_client import _main_model_supports_vision, resolve_vision_provider_client
+        assert _main_model_supports_vision("deepseek", "deepseek-v4-pro") is False
         provider, client, _model = resolve_vision_provider_client(provider="auto")
         assert client is None, (
             f"Vision auto-detect must skip text-only main {provider!r} when "

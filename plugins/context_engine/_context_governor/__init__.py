@@ -166,6 +166,8 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             or get_hermes_home() / "context-governor"
         )
         self.timeout_sec = int(os.environ.get("CONTEXT_GOVERNOR_TIMEOUT", timeout_sec))
+        # Instance-owned uncertainty survives an exceptional constructor.
+        self._unsettled_processes: dict[int, subprocess.Popen] = {}
         # Synthetic tool telemetry is advisory only: never causal evidence.
         self.telemetry_binary = shutil.which("cea-bridge") or ""
         self.telemetry_db_path = Path(
@@ -4061,6 +4063,10 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         pass_fds: tuple[int, ...] = (),
     ) -> Any:
         self._verify_managed_native()
+        if self.has_unsettled_work():
+            raise ContextGovernorCancellationIndeterminate(
+                "Context Governor still owns cleanup-indeterminate subprocess work"
+            )
         expect_failure_envelope = FAILURE_FLAG in args
         command = [str(self.binary), *args]
         popen_kwargs: dict[str, Any] = {
@@ -4082,10 +4088,15 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 timeout=self.timeout_sec,
             )
         except subprocess.TimeoutExpired as exc:
-            self._terminate_process_group(proc)
+            try:
+                self._terminate_process_group(proc)
+            except BaseException:
+                self.__dict__.setdefault('_unsettled_processes', {})[proc.pid] = proc
+                raise
             try:
                 stdout, stderr = proc.communicate(timeout=1)
             except subprocess.TimeoutExpired as drain_exc:
+                self.__dict__.setdefault('_unsettled_processes', {})[proc.pid] = proc
                 for stream in (proc.stdin, proc.stdout, proc.stderr):
                     if stream is not None:
                         try:
@@ -4126,6 +4137,32 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                     "Context Governor returned non-object certified success output"
                 )
         return result
+
+    def has_unsettled_work(self) -> bool:
+        return bool(getattr(self, '_unsettled_processes', {}))
+
+    def shutdown(self) -> None:
+        """Reconcile retained handles, never durable receipt/session state."""
+        owned = getattr(self, '_unsettled_processes', {})
+        for pid, proc in list(owned.items()):
+            try:
+                # Never send a new signal to a retained numeric PGID: after
+                # uncertainty it may have been reused. Observe only the exact
+                # child handle, group quiescence, and pipe EOF; unknown stays
+                # charged. Initial timeout containment owns the signal attempt.
+                if proc.poll() is None:
+                    continue
+                if os.name != 'nt' and self._process_group_alive(pid):
+                    continue
+                proc.communicate(timeout=1)
+            except Exception:
+                # Keep exact ownership until positive cleanup observation.
+                continue
+            owned.pop(pid, None)
+        if owned:
+            raise ContextGovernorCancellationIndeterminate(
+                "Context Governor subprocess cleanup remains indeterminate"
+            )
 
     @staticmethod
     def _process_group_alive(pgid: int) -> bool:

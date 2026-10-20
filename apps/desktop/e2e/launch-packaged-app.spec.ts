@@ -1,10 +1,12 @@
 import { expect, test } from './test'
+import PACKAGE_JSON from '../package.json' with { type: 'json' }
 
 import {
   PACKAGED_BINARY_PATH,
-  type PackagedAppFixture,
+  type MockBackendFixture,
   packagedBinaryExists,
-  setupPackagedApp,
+  setupMockBackend,
+  waitForAppReady,
 } from './fixtures'
 import { expectVisualSnapshot } from './visual-snapshot'
 
@@ -12,13 +14,14 @@ import { expectVisualSnapshot } from './visual-snapshot'
  * E2E smoke tests for the packaged Hermes desktop app.
  *
  * Launches the real packaged Electron binary (produced by `npm run pack` →
- * `electron-builder --dir`) with BOOT_FAKE=1 and full sandbox isolation
- * (credential stripping, isolated HERMES_HOME + userData, unique app name).
+ * `electron-builder --dir`) with a real temporary source backend and local
+ * mock inference. Private homes and stripped credentials protect operator
+ * state; existing --no-sandbox/--disable-gpu flags are NOT security/GPU proof.
  *
  * Skips if the packaged binary doesn't exist — run `npm run pack` first.
  */
 
-let fixture: PackagedAppFixture | null = null
+let fixture: MockBackendFixture | null = null
 
 test.beforeAll(async () => {
   test.skip(
@@ -26,7 +29,8 @@ test.beforeAll(async () => {
     `Built app binary not found: ${PACKAGED_BINARY_PATH}. Run 'npm run pack' first.`,
   )
 
-  fixture = await setupPackagedApp()
+  fixture = await setupMockBackend({ packaged: true })
+  await waitForAppReady(fixture, 120_000)
 })
 
 test.afterAll(async () => {
@@ -34,9 +38,9 @@ test.afterAll(async () => {
   fixture = null
 })
 
-test('window opens with the Hermes title', async () => {
+test('window opens with the configured product title', async () => {
   const title = await fixture!.page.title()
-  expect(title).toContain('Hermes')
+  expect(title).toBe(PACKAGE_JSON.build.productName || PACKAGE_JSON.productName)
 })
 
 test('renderer loads and shows DOM content', async () => {
@@ -114,34 +118,10 @@ test('HUD composer remains fully inside the transparent window', async () => {
   await hudPage.close()
 })
 
-test('boot progress overlay fades out or shows error state', async () => {
-  const page = fixture!.page
-  await page.waitForFunction(
-    () => {
-      const root = document.getElementById('root')
-
-      if (!root) {
-        return false
-      }
-
-      const text = root.textContent ?? ''
-
-      // Error path: boot failure overlay renders an error message.
-      if (text.includes('error') || text.includes('Error') || text.includes('failed')) {
-        return true
-      }
-
-      // Success path: overlay disappears and the app renders. If there's
-      // no "boot" / "starting" / "installing" text visible, boot has
-      // completed (either to the main UI or to onboarding).
-      const bootIndicators = ['starting', 'resolving', 'spawning', 'waiting', 'installing']
-      const lower = text.toLowerCase()
-
-      return !bootIndicators.some((word) => lower.includes(word))
-    },
-    undefined,
-    { timeout: 60_000 },
-  )
+test('packaged shell connects to its temporary backend without boot errors', async () => {
+  await waitForAppReady(fixture!, 60_000)
+  await expect(fixture!.page.locator('[data-slot="composer-rich-input"]')).toBeVisible()
+  await expect(fixture!.page.getByText('Desktop boot failed', { exact: true })).toHaveCount(0)
 })
 
 test('can capture a screenshot for the CI artifact', async () => {

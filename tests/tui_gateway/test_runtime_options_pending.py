@@ -85,6 +85,69 @@ def test_busy_option_updates_merge_dimensions_in_existing_model_intent(state):
     assert state['pending_model_switch']['runtime_options'] == {'effort':'low', 'fast':True}
 
 
+@pytest.mark.parametrize("replacement", [False, True])
+def test_failed_deferred_model_retains_only_owned_options(state, monkeypatch, replacement):
+    state['running'] = False
+    state['pending_model_switch'] = {'raw': 'chosen --session', 'runtime_options': {'effort': 'high', 'fast': True}}
+    original_agent = state['agent']
+    def fail(*args, **kwargs):
+        if replacement:
+            state['agent'] = SimpleNamespace(model='replacement')
+        raise RuntimeError('client construction failed')
+    monkeypatch.setattr(server, '_apply_model_switch', fail)
+    server._apply_pending_model_switch('live', state, before_admission=True)
+    if replacement:
+        assert not state.get('pending_model_switch')
+    else:
+        assert state['pending_model_switch'] == {'runtime_options': {'effort': 'high', 'fast': True}}
+        server._apply_pending_model_switch('live', state, before_admission=True)
+        assert not state.get('pending_model_switch')
+        assert original_agent.reasoning_config['effort'] == 'high'
+        assert original_agent.service_tier == 'priority'
+    server._write_config_key.assert_not_called()
+
+
+def test_failed_deferred_model_preserves_newer_pending_dimensions(state, monkeypatch):
+    state['running'] = False
+    state['pending_model_switch'] = {'raw': 'old --session', 'runtime_options': {'effort': 'high', 'fast': True}}
+
+    def fail(*args, **kwargs):
+        state['pending_model_switch'] = {'raw': 'new --session', 'runtime_options': {'effort': 'low'}}
+        raise RuntimeError('client construction failed')
+
+    monkeypatch.setattr(server, '_apply_model_switch', fail)
+    server._apply_pending_model_switch('live', state, before_admission=True)
+    assert state['pending_model_switch'] == {'raw': 'new --session', 'runtime_options': {'effort': 'low', 'fast': True}}
+
+
+@pytest.mark.parametrize('change', ['transport', 'generation', 'session'])
+def test_failed_model_cannot_requeue_options_across_an_owner_transition(state, monkeypatch, change):
+    state['running'] = False
+    state['pending_model_switch'] = {'raw': 'old --session', 'runtime_options': {'effort': 'high'}}
+
+    def fail(*args, **kwargs):
+        if change == 'transport':
+            state['transport'] = object()
+        elif change == 'generation':
+            state['_queued_prompt_generation'] = 1
+        else:
+            server._sessions['live'] = {}
+        raise RuntimeError('client construction failed')
+
+    monkeypatch.setattr(server, '_apply_model_switch', fail)
+    server._apply_pending_model_switch('live', state, before_admission=True)
+    assert not state.get('pending_model_switch')
+
+
+def test_expensive_model_confirmation_retains_options_without_replaying_model(state, monkeypatch):
+    state['running'] = False
+    state['pending_model_switch'] = {'raw': 'expensive --session', 'runtime_options': {'effort': 'high'}}
+    monkeypatch.setattr(server, '_apply_model_switch', lambda *args, **kwargs: {'confirm_required': True})
+    server._apply_pending_model_switch('live', state, before_admission=True)
+    assert state['pending_model_switch'] == {'runtime_options': {'effort': 'high'}}
+    assert state['agent'].reasoning_config['effort'] == 'low'
+
+
 def test_persist_failure_restores_all_live_option_fields(state, monkeypatch):
     state['running'] = False
     monkeypatch.setattr(server, '_persist_live_session_runtime', Mock(side_effect=RuntimeError('fixture failure')))
@@ -94,3 +157,23 @@ def test_persist_failure_restores_all_live_option_fields(state, monkeypatch):
     assert state['agent'].reasoning_config['effort'] == 'low'
     assert state['agent'].service_tier is None
     assert state['agent'].request_overrides == {}
+
+
+def test_compute_host_preserves_definitive_fast_rejection_delivery(state, monkeypatch):
+    state['agent'].model = 'claude-sonnet-5-5'
+    monkeypatch.setattr('hermes_cli.models.resolve_fast_mode_overrides', lambda model: None)
+    output = io.StringIO()
+    host = ComputeHost(stdout=output, heartbeat_secs=0)
+    try:
+        host._handle_control({'sid': 'live', 'request_id': 'unsupported-fast',
+                              'route_name': 'config.set.runtime_options',
+                              'params': {'value': {'fast': True}}})
+        ack = json.loads(output.getvalue().splitlines()[0])
+        assert ack['type'] == 'control.error'
+        assert ack['code'] == 4002
+        assert ack['delivery'] == 'not_applied'
+        assert state['agent'].service_tier is None
+        assert state['agent'].request_overrides == {}
+        assert not state.get('pending_model_switch')
+    finally:
+        host.close()

@@ -46,6 +46,8 @@ export interface MockServer {
   port: number
   url: string
   receivedPrompts: string[]
+  /** Exact JSON request bodies received from the real backend (synthetic fixtures only). */
+  receivedRequests: Record<string, unknown>[]
   waitForHeldStream: () => Promise<void>
   waitForHeldCompletion: () => Promise<void>
   releaseHeldStream: () => void
@@ -399,6 +401,7 @@ function includesBlockingClarifyTrigger(value: unknown): boolean {
 export function startMockServer(options: MockServerOptions = {}): Promise<MockServer> {
   return new Promise((resolve, reject) => {
     const receivedPrompts: string[] = []
+    const receivedRequests: Record<string, unknown>[] = []
     let resolveHeldStreamStarted: (() => void) | null = null
     let releaseHeldStream: (() => void) | null = null
     let heldCompletionCount = 0
@@ -453,6 +456,7 @@ export function startMockServer(options: MockServerOptions = {}): Promise<MockSe
 
           try {
             parsed = JSON.parse(body)
+            receivedRequests.push(structuredClone(parsed))
           } catch {
             // malformed JSON — treat as non-streaming with defaults
           }
@@ -668,6 +672,7 @@ export function startMockServer(options: MockServerOptions = {}): Promise<MockSe
         port,
         url,
         receivedPrompts,
+        receivedRequests,
         waitForHeldStream: () => heldStreamStarted,
         waitForHeldCompletion: () => heldStreamStarted,
         releaseHeldStream: () => releaseHeldStream?.(),

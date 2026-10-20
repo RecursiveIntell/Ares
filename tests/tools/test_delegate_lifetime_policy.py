@@ -143,7 +143,12 @@ def test_admitted_total_policy_does_not_reread_changed_config(monkeypatch):
         run_conversation=lambda **kw: {'final_response': 'offline complete', 'api_calls': 0},
         get_activity_summary=lambda: {'api_call_count': 0})
     monkeypatch.setattr(delegate, '_build_child_agent', lambda **kw: child)
-    child = delegate._build_child_preserving_parent_tools(goal='offline', parent_agent=parent)
+    caller_done = Future()
+    try:
+        child = delegate._build_child_preserving_parent_tools(goal='offline', parent_agent=parent,
+            _caller_initialization_done=caller_done)
+    finally:
+        caller_done.set_result(None)
     policy = child._delegate_lifetime_policy
     assert policy.mode == 'total' and policy.timeout_seconds == 600.0
     with pytest.raises(FrozenInstanceError):

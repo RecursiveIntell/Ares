@@ -1,8 +1,36 @@
-"""Fixtures shared across hermes_cli kanban tests."""
+"""Fixtures shared across hermes_cli unit tests."""
 
 from __future__ import annotations
 
 import pytest
+
+
+@pytest.fixture
+def s6_layout_chown_spy(tmp_path, monkeypatch):
+    """Observe owner intent; layout/FIFO operations stay real, chown does not.
+
+    Unit tests cannot assume the container UID/GID exists in the host's user
+    namespace. This does not rewrite that identity or prove real ownership;
+    privileged ownership/s6 behavior belongs to container integration tests.
+    """
+    import os
+    from pathlib import Path
+    from hermes_cli import service_manager
+
+    requests = []
+    root = tmp_path.resolve()
+    expected = (service_manager._HERMES_UID, service_manager._HERMES_GID)
+
+    def observe_chown(path, uid, gid):
+        target = Path(path)
+        assert target.resolve().is_relative_to(root), 'layout chown escaped the owned fixture'
+        assert (uid, gid) == expected, 'layout changed the canonical container owner'
+        assert target.exists(), 'layout requested ownership before creating its entry'
+        requests.append((target, uid, gid))
+
+    monkeypatch.setattr(os, 'chown', observe_chown)
+    yield requests
+    assert requests, 'layout fixture never observed its ownership boundary'
 
 
 @pytest.fixture

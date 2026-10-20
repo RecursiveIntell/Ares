@@ -552,6 +552,7 @@ class AIAgent:
         pass_session_id: bool = False,
         requested_provider: str = None,
         _resource_preserve_agent=None,
+        _initialization_observer=None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         if tool_delay is not None:
@@ -562,6 +563,12 @@ class AIAgent:
                 stacklevel=2,
             )
         from agent.agent_init import init_agent
+        # Publish custody before allocation; exceptional __init__ is not
+        # proof that instance-owned work has physically settled.
+        if _initialization_observer is not None:
+            if not callable(_initialization_observer):
+                raise TypeError("initialization observer must be callable")
+            _initialization_observer(self)
         try:
             init_agent(
                 self,
@@ -3402,6 +3409,10 @@ class AIAgent:
         _redirect_lock = getattr(self, "_pending_redirect_lock", None)
         if _redirect_lock is not None:
             with _redirect_lock:
+                # Private identity-only, in-process projection for owned
+                # initialization Stops. Never serialize or treat this token
+                # as a durable/native interrupt epoch.
+                self._delegate_interrupt_generation = object()
                 self._interrupt_requested = True
                 self._interrupt_message = message
                 self._tool_interrupt_reason = tool_interrupt_reason
@@ -3409,6 +3420,7 @@ class AIAgent:
                     _admit_hard_cancel()
                 self._pending_redirect = None
         else:
+            self._delegate_interrupt_generation = object()
             self._interrupt_requested = True
             self._interrupt_message = message
             self._tool_interrupt_reason = tool_interrupt_reason
@@ -4739,6 +4751,14 @@ class AIAgent:
 
     def _has_owned_tool_work(self) -> bool:
         """Exact retained sandbox witnesses, never a process-wide tool guess."""
+        engine = vars(self).get('context_compressor')
+        engine_work = getattr(type(engine), 'has_unsettled_work', None)
+        if callable(engine_work):
+            try:
+                if engine_work(engine) is not False:
+                    return True
+            except Exception:
+                return True  # Failed observation cannot authorize retirement.
         tracker = vars(self).get('_tool_worker_threads')
         lock = vars(self).get('_tool_worker_threads_lock')
         if tracker is not None and lock is not None:

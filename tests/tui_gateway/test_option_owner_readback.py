@@ -79,3 +79,22 @@ def test_retired_runtime_read_is_not_profile_default(owner, key):
 def test_malformed_runtime_read_does_not_fall_through_to_defaults(owner, sid):
     assert read("reasoning", sid)["error"]["code"] == 4002
     owner[1].assert_not_called()
+
+
+def test_inprocess_readback_reports_live_fast_off_and_exact_session_owner(monkeypatch):
+    record = {
+        "session_key": "stored",
+        "agent": SimpleNamespace(model="claude-sonnet-5-5", service_tier=None,
+                                 reasoning_config={"enabled": True, "effort": "low"}),
+        "create_service_tier_override": "priority",
+    }
+    monkeypatch.setattr(server, "_sessions", {"live": record})
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda s: False)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"agent": {"reasoning_effort": "high", "service_tier": "fast"}})
+
+    fast = read("fast")["result"]
+    assert fast == {"value": "normal", "owner": "gateway", "session_id": "live"}
+    effort = read("reasoning")["result"]
+    assert effort["value"] == "low"
+    assert effort["owner"] == "gateway"
+    assert effort["session_id"] == "live"

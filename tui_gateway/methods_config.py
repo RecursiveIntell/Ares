@@ -305,22 +305,30 @@ def _(rid, params: dict) -> dict:
             if bool((cfg.get("display") or {}).get("show_reasoning", True))
             else "hide"
         )
-        return _ok(rid, {"value": effort, "display": display})
+        return _ok(rid, {"value": effort, "display": display,
+                         **({"owner": "gateway", "session_id": sid} if session is not None else {})})
     if key == "fast":
         # Prefer the session's live/pinned value — `config.set fast` is
         # session-scoped, so the global key may not reflect this chat. A
         # pre-build session keeps its pin in create_service_tier_override.
         session = _sessions.get(params.get("session_id", ""))
-        tier = None
         if session is not None:
             agent = session.get("agent")
             if agent is not None:
-                tier = getattr(agent, "service_tier", None)
-            elif session.get("create_service_tier_override") is not None:
-                tier = session["create_service_tier_override"]
-        if tier is None:
+                # None is the live agent's authoritative normal tier, not
+                # permission to resurrect the profile's Fast default.
+                tier = getattr(agent, "service_tier", None) or ""
+            else:
+                requested = session.get("create_service_tier_override")
+                if requested is None:
+                    requested = _load_service_tier()
+                model_override = session.get("model_override") or {}
+                model = model_override.get("model") if isinstance(model_override, dict) else ""
+                tier, _ = _resolve_effective_fast_runtime(str(model or _resolve_model()), requested)
+        else:
             tier = _load_service_tier()
-        return _ok(rid, {"value": "fast" if tier == "priority" else "normal"})
+        return _ok(rid, {"value": "fast" if tier == "priority" else "normal",
+                         **({"owner": "gateway", "session_id": sid} if session is not None else {})})
     if key == "busy":
         return _ok(rid, {"value": _load_busy_input_mode()})
     if key in {"approval_mode", "approvals.mode"}:

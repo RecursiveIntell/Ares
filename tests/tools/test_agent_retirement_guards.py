@@ -1,5 +1,6 @@
 """Retirement requires positive settlement; absence is not permission."""
 import threading
+from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -224,10 +225,34 @@ def test_initialization_reservation_prevents_parent_retirement(monkeypatch, chil
 
     monkeypatch.setattr(delegate, "_get_child_lifetime_policy", lambda: DelegationLifetimePolicy("total", None))
     monkeypatch.setattr(delegate, "_build_child_agent", initialize)
+    caller_done = Future()
+    retirement_done, parent_retry_done = threading.Event(), threading.Event()
+    original_retire = delegate._retire_unstarted_child
+    original_parent_close = parent.close
+
+    def observed_retire(*args, **kwargs):
+        try:
+            return original_retire(*args, **kwargs)
+        finally:
+            retirement_done.set()
+
+    def observed_parent_close():
+        original_parent_close()
+        parent_retry_done.set()
+
+    monkeypatch.setattr(delegate, '_retire_unstarted_child', observed_retire)
+    parent.close = observed_parent_close
     with pytest.raises(ValueError, match="DELEGATION_PARENT_CLOSING"):
-        delegate._build_child_preserving_parent_tools(parent_agent=parent, goal="construction race")
-    assert child_closes == ["child"]
+        delegate._build_child_preserving_parent_tools(parent_agent=parent, goal="construction race",
+            _caller_initialization_done=caller_done)
+    assert child_closes == []
     assert closes == []
+    parent_retry_done.clear()
+    caller_done.set_result(None)
+    assert retirement_done.wait(3), 'acknowledged construction cleanup never settled'
+    if not child_close_fails:
+        assert parent_retry_done.wait(3)
+    assert child_closes == ["child"]
     with delegate._active_subagents_lock:
         retained = {key: row for key, row in delegate._active_subagents.items()
                     if row.get("owner_agent_session_id") == parent.session_id}

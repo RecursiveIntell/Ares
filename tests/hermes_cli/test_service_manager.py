@@ -192,7 +192,44 @@ def fake_subprocess_run(monkeypatch: pytest.MonkeyPatch):
 # tests/docker/test_s6_profile_gateway_integration.py.
 
 
-def test_seed_supervise_skeleton_creates_expected_layout(tmp_path) -> None:
+@pytest.mark.linux_only
+def test_seed_supervise_keeps_unmapped_owner_failure(tmp_path, monkeypatch) -> None:
+    import errno
+    import os
+    from hermes_cli import service_manager
+
+    observed = []
+
+    def unmapped_owner(path, uid, gid):
+        observed.append((uid, gid))
+        raise OSError(errno.EINVAL, 'controlled unmapped container owner')
+
+    monkeypatch.setattr(os, 'chown', unmapped_owner)
+    slot = tmp_path / 'gateway-unmapped'
+    slot.mkdir()
+    with pytest.raises(OSError) as failure:
+        service_manager._seed_supervise_skeleton(slot)
+    assert failure.value.errno == errno.EINVAL
+    assert observed == [(service_manager._HERMES_UID, service_manager._HERMES_GID)]
+
+
+@pytest.mark.linux_only
+def test_s6_layout_fixture_observes_owner_and_refuses_escape(tmp_path, s6_layout_chown_spy) -> None:
+    import os
+    from hermes_cli import service_manager
+
+    slot = tmp_path / 'gateway-observed'
+    slot.mkdir()
+    service_manager._seed_supervise_skeleton(slot)
+    expected = (service_manager._HERMES_UID, service_manager._HERMES_GID)
+    assert {str(path.relative_to(slot)) for path, _, _ in s6_layout_chown_spy} == {
+        'event', 'supervise', 'supervise/event', 'supervise/control'}
+    assert all((uid, gid) == expected for _, uid, gid in s6_layout_chown_spy)
+    with pytest.raises(AssertionError, match='escaped the owned fixture'):
+        os.chown(tmp_path.parent / 'foreign-layout', *expected)
+
+
+def test_seed_supervise_skeleton_creates_expected_layout(tmp_path, s6_layout_chown_spy) -> None:
     """Verifies the dirs + FIFO the helper lays down."""
     import stat
 
@@ -226,7 +263,7 @@ def test_seed_supervise_skeleton_creates_expected_layout(tmp_path) -> None:
 
 
 @pytest.mark.linux_only
-def test_seed_supervise_skeleton_sets_setgid_on_event_dirs(tmp_path) -> None:
+def test_seed_supervise_skeleton_sets_setgid_on_event_dirs(tmp_path, s6_layout_chown_spy) -> None:
     """The event dirs carry setgid so s6-supervise's EEXIST path leaves them alone.
 
     Linux-only because the assertion is about what ``chmod`` does, and that
@@ -372,7 +409,7 @@ def _log_run_setup_fragment(rendered: str) -> str:
 
 
 def test_s6_log_run_creates_leaf_as_hermes_without_chown(
-    s6_scandir, fake_subprocess_run,
+    s6_scandir, fake_subprocess_run, s6_layout_chown_spy,
 ) -> None:
     """log/run must not root-chown/unlink volume paths; create leaf as hermes.
 

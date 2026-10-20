@@ -136,16 +136,16 @@ export async function applyModelPreset(
   const previousEffort = state?.reasoningEffort ?? (primary ? $currentReasoningEffort.get() : '')
   const previousFast = state?.fast ?? (primary ? $currentFastMode.get() : false)
 
-  const paint = (patch: Partial<{ reasoningEffort: string; fast: boolean }>) => {
+  const paint = (patch: Partial<{ reasoningEffort: string; fast: boolean }>, persist = true) => {
     sessionTileDelegate()?.updateSession(runtimeId, current => ({ ...current, ...patch }))
 
     if (primary && $activeSessionId.get() === runtimeId && $selectedStoredSessionId.get() === state?.storedSessionId) {
       if (patch.reasoningEffort !== undefined) {
-        setCurrentReasoningEffort(patch.reasoningEffort)
+        setCurrentReasoningEffort(patch.reasoningEffort, persist)
       }
 
       if (patch.fast !== undefined) {
-        setCurrentFastMode(patch.fast)
+        setCurrentFastMode(patch.fast, persist)
       }
     }
   }
@@ -156,19 +156,29 @@ export async function applyModelPreset(
   })
 
   const desired = { ...(effort !== undefined ? { effort } : {}), ...(fast !== undefined ? { fast } : {}) }
+  // Legacy RPCs commit dimensions independently. A later failure cannot undo
+  // an earlier acknowledgement, and deferred dimensions stay pending.
+  const legacyAccepted = new Set<'effort' | 'fast'>()
+  const legacyDeferred = new Set<'effort' | 'fast'>()
   sessionTileDelegate()?.updateSession(runtimeId, current => ({
     ...current, pendingRuntimeOptions: { ...current.pendingRuntimeOptions, ...desired }
   }))
 
-  const clearPending = () => sessionTileDelegate()?.updateSession(runtimeId, current => {
-    const pending = { ...current.pendingRuntimeOptions }
+  const clearPending = () => {
+    // A settled write cannot recreate a closed runtime or touch a successor's
+    // intent. Check ownership before asking the delegate to update any slice.
+    if ((effort === undefined || !owns('effort')) && (fast === undefined || !owns('fast'))) {return}
 
-    if (effort !== undefined && owns('effort')) {delete pending.effort}
+    sessionTileDelegate()?.updateSession(runtimeId, current => {
+      const pending = { ...current.pendingRuntimeOptions }
 
-    if (fast !== undefined && owns('fast')) {delete pending.fast}
+      if (effort !== undefined && owns('effort') && !legacyDeferred.has('effort')) {delete pending.effort}
 
-    return { ...current, pendingRuntimeOptions: Object.keys(pending).length ? pending : null }
-  })
+      if (fast !== undefined && owns('fast') && !legacyDeferred.has('fast')) {delete pending.fast}
+
+      return { ...current, pendingRuntimeOptions: Object.keys(pending).length ? pending : null }
+    })
+  }
 
   try {
     let result: { deferred?: boolean; selector_info?: SessionRuntimeInfo } | undefined
@@ -185,11 +195,19 @@ export async function applyModelPreset(
       // Older backend: nothing was applied. Use its established per-option
       // writes, in the same order, so a mid-upgrade user keeps the feature.
       if (effort !== undefined) {
-        await ctx.request('config.set', { key: 'reasoning', session_id: runtimeId, value: effort })
+        const response = await ctx.request<{ deferred?: boolean }>('config.set', {
+          key: 'reasoning', session_id: runtimeId, value: effort
+        })
+        legacyAccepted.add('effort')
+        if (response?.deferred) { legacyDeferred.add('effort') }
       }
 
       if (fast !== undefined) {
-        await ctx.request('config.set', { key: 'fast', session_id: runtimeId, value: fast ? 'fast' : 'normal' })
+        const response = await ctx.request<{ deferred?: boolean }>('config.set', {
+          key: 'fast', session_id: runtimeId, value: fast ? 'fast' : 'normal'
+        })
+        legacyAccepted.add('fast')
+        if (response?.deferred) { legacyDeferred.add('fast') }
       }
     }
 
@@ -209,24 +227,31 @@ export async function applyModelPreset(
       clearPending()
     }
   } catch (err) {
-    let uncertain = false
+    let definitiveFailure = false
 
     for (const dimension of ['effort', 'fast'] as const) {
       if (!(dimension in desired) || !owns(dimension)) {continue}
 
+      if (legacyAccepted.has(dimension)) {
+        clearRuntimeOptionUncertainty(runtimeId, dimension)
+        continue
+      }
+
       const reconciled = await reconcileRuntimeOptionFailure(err, {
         sessionId: runtimeId, dimension, request: ctx.request, owns: () => owns(dimension),
-        applyObserved: value => paint(dimension === 'effort' ? { reasoningEffort: value as string } : { fast: value as boolean })
+        applyObserved: value => paint(dimension === 'effort' ? { reasoningEffort: value as string } : { fast: value as boolean }, false)
       })
 
-      uncertain ||= reconciled
-
-      if (!reconciled && owns(dimension)) {paint(dimension === 'effort' ? { reasoningEffort: previousEffort } : { fast: previousFast })}
+      if (reconciled === 'not_uncertain' && owns(dimension)) {
+        definitiveFailure = true
+        paint(dimension === 'effort' ? { reasoningEffort: previousEffort } : { fast: previousFast })
+      }
     }
 
-    if (!uncertain) {
-      clearPending()
-      notifyError(err, ctx.failMessage)
-    }
+    // The request has settled, even if delivery could not be reconciled.
+    // Uncertainty remains explicit via its warning/marker; it must not keep
+    // masking later authoritative selector observations or newer user edits.
+    clearPending()
+    if (definitiveFailure) { notifyError(err, ctx.failMessage) }
   }
 }

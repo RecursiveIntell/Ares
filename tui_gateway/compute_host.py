@@ -1055,9 +1055,13 @@ class ComputeHost:
                     {"key": option, "value": params.get("value", ""), "session_id": sid},
                 )
                 if "error" in response:
+                    error = response.get("error") or {}
+                    error_data = error.get("data") if isinstance(error, dict) else None
+                    delivery = error_data.get("delivery") if isinstance(error_data, dict) else None
                     self.emit({"type": "control.error", "sid": sid, "request_id": request_id,
-                               "code": response["error"].get("code"),
-                               "message": str(response["error"].get("message") or "option switch failed")})
+                               "code": error.get("code"),
+                               "message": str(error.get("message") or "option switch failed"),
+                               **({"delivery": delivery} if delivery in {"not_sent", "not_applied"} else {})})
                     return
                 self.emit({"type": "control.ack", "sid": sid, "request_id": request_id,
                            "route_name": route_name, "result": response.get("result") or {},

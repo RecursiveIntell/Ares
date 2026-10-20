@@ -7051,6 +7051,37 @@ def _load_service_tier() -> str | None:
     return None
 
 
+def _resolve_effective_fast_runtime(model: str, requested_tier: str | None) -> tuple[str | None, dict]:
+    """Resolve Fast intent to an effective tier and provider request fields.
+
+    The caller retains ``requested_tier`` in the session pin. Unsupported
+    models therefore run normally without destroying the preference for a
+    later supported model.
+    """
+    raw = str(requested_tier or "").strip().lower()
+    if raw not in {"priority", "fast", "on"}:
+        return None, {}
+    from hermes_cli.models import resolve_fast_mode_overrides
+
+    overrides = resolve_fast_mode_overrides(model)
+    if overrides is None:
+        return None, {}
+    if not isinstance(overrides, dict):
+        raise ValueError("invalid Fast capability result")
+    return "priority", dict(overrides)
+
+
+def _set_agent_fast_runtime(agent, effective_tier: str | None, fast_overrides: dict) -> str | None:
+    """Commit a pre-resolved Fast result without another capability lookup."""
+    request_overrides = dict(getattr(agent, "request_overrides", {}) or {})
+    request_overrides.pop("service_tier", None)
+    request_overrides.pop("speed", None)
+    request_overrides.update(fast_overrides)
+    agent.service_tier = effective_tier
+    agent.request_overrides = request_overrides
+    return effective_tier
+
+
 def _load_provider_routing() -> dict:
     """OpenRouter provider-routing prefs from config.yaml (``provider_routing``).
 
@@ -7357,6 +7388,8 @@ def _snapshot_agent_model_runtime(agent) -> dict:
         "api_mode": getattr(agent, "api_mode", ""),
         "primary_runtime": primary,
         "reasoning_config": reasoning,
+        "service_tier": getattr(agent, "service_tier", None),
+        "request_overrides": copy.deepcopy(getattr(agent, "request_overrides", {}) or {}),
     }
 
 
@@ -7422,6 +7455,12 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
             primary = getattr(agent, "_primary_runtime", None)
             if isinstance(primary, dict):
                 primary["reasoning_config"] = copy.deepcopy(agent.reasoning_config)
+        # Fast fields are model-specific and may have been disabled for the
+        # temporary model. Restore them only after the saved route succeeds.
+        if "service_tier" in snapshot:
+            agent.service_tier = snapshot["service_tier"]
+        if "request_overrides" in snapshot:
+            agent.request_overrides = copy.deepcopy(snapshot["request_overrides"])
 
     primary = snapshot.get("primary_runtime")
     if primary and hasattr(agent, "_restore_primary_runtime"):
@@ -7719,6 +7758,18 @@ def _apply_model_switch(
                 restore_snapshot = _snapshot_agent_model_runtime(agent)
 
         if agent:
+            # Capability lookup can fail independently of model support. Refuse
+            # before the in-place model mutation rather than silently changing
+            # Fast, or leaving a partially applied switch after lookup failure.
+            requested_tier = session.get("create_service_tier_override")
+            if requested_tier is None:
+                requested_tier = getattr(agent, "service_tier", None)
+                if requested_tier is None:
+                    requested_tier = _load_service_tier()
+            try:
+                fast_tier, fast_overrides = _resolve_effective_fast_runtime(result.new_model, requested_tier)
+            except Exception as exc:
+                raise ValueError("Fast capability resolution failed; model request not applied") from exc
             try:
                 agent.switch_model(
                     new_model=result.new_model,
@@ -7740,6 +7791,21 @@ def _apply_model_switch(
                     f"Model switch to {result.new_model} failed ({exc}); "
                     f"staying on {getattr(agent, 'model', current_model)}."
                 ) from exc
+            # The agent switch resolves profile defaults for the new model.
+            # An explicit session choice outranks that fallback and survives
+            # both the immediate switch and later agent reconstruction.
+            reasoning_intent = session.get("create_reasoning_override")
+            # --once keeps its existing temporary per-model default and exact
+            # restore contract; persistent session switches retain session intent.
+            if not one_turn and isinstance(reasoning_intent, dict):
+                agent.reasoning_config = copy.deepcopy(reasoning_intent)
+                primary_runtime = getattr(agent, "_primary_runtime", None)
+                if isinstance(primary_runtime, dict):
+                    primary_runtime["reasoning_config"] = copy.deepcopy(reasoning_intent)
+
+            # Keep Fast intent in the session pin, but clear effective Fast
+            # and its wire fields when the target model does not support it.
+            _set_agent_fast_runtime(agent, fast_tier, fast_overrides)
             _persist_live_session_runtime(session)
             _persist_live_session_system_prompt(session)
             _append_model_switch_marker(
@@ -8666,20 +8732,39 @@ def _apply_pending_model_switch(sid: str, session: dict, *, before_admission: bo
             if isinstance(window, TurnOutcomeWindow) and window.owns(session, sid) and window.turns else None)
     if not pending or session.get("agent") is None:
         return
+    def pending_still_owned():
+        # Called only while holding this session's history lock.
+        current_inflight = session.get("inflight_turn")
+        current_window = session.get("_turn_outcomes")
+        current_nonce = (current_window.turns[-1]["accepted_turn"]["request_id"]
+            if isinstance(current_window, TurnOutcomeWindow)
+            and current_window.owns(session, sid) and current_window.turns else None)
+        return not (_sessions.get(sid) is not session or session.get("agent") is not pending_agent
+                or session.get("transport") is not pending_transport
+                or int(session.get("_queued_prompt_generation", 0)) != pending_generation
+                or (before_admission and (
+                    (current_inflight.get("started_at") if isinstance(current_inflight, dict) else None) is not pending_admission[3]
+                    or current_window is not pending_admission[4]
+                    or current_nonce != pending_admission[5])))
+
+    def retain_pending_options():
+        if not pending.get("runtime_options"):
+            return
+        with session["history_lock"]:
+            if not pending_still_owned():
+                return
+            # Preserve a newer model/option intent; only fill its missing
+            # dimensions from the accepted option survivor, never replay the
+            # failed model choice or transfer intent to a replacement owner.
+            newer = session.get("pending_model_switch") or {}
+            session["pending_model_switch"] = {
+                **newer,
+                "runtime_options": {**pending["runtime_options"], **newer.get("runtime_options", {})},
+            }
+
     def emit_pending_error(message):
         with session["history_lock"]:
-            current_inflight = session.get("inflight_turn")
-            current_window = session.get("_turn_outcomes")
-            current_nonce = (current_window.turns[-1]["accepted_turn"]["request_id"]
-                if isinstance(current_window, TurnOutcomeWindow)
-                and current_window.owns(session, sid) and current_window.turns else None)
-            if (_sessions.get(sid) is not session or session.get("agent") is not pending_agent
-                    or session.get("transport") is not pending_transport
-                    or int(session.get("_queued_prompt_generation", 0)) != pending_generation
-                    or (before_admission and (
-                        (current_inflight.get("started_at") if isinstance(current_inflight, dict) else None) is not pending_admission[3]
-                        or current_window is not pending_admission[4]
-                        or current_nonce != pending_admission[5]))):
+            if not pending_still_owned():
                 return
         token = _turn_outcome_execution.set((session, sid, None))
         transport_token = bind_transport(pending_transport)
@@ -8708,9 +8793,11 @@ def _apply_pending_model_switch(sid: str, session: dict, *, before_admission: bo
         # confirm by NOT applying it silently — surface the warning and drop the
         # switch rather than spend on a pricey model the user never confirmed.
         if result.get("confirm_required"):
+            retain_pending_options()
             emit_pending_error(result.get("confirm_message") or result.get("warning") or "")
         return result
     except Exception as e:
+        retain_pending_options()
         emit_pending_error(f"Could not switch model: {e}")
 
 
@@ -10767,6 +10854,8 @@ def _make_agent(
         and not isinstance(provider_cap, bool) and provider_cap > 0
         else None
     )
+    requested_tier = service_tier_override if service_tier_override is not None else _load_service_tier()
+    effective_tier, fast_request_overrides = _resolve_effective_fast_runtime(str(model or ""), requested_tier)
     return AIAgent(
         model=model,
         max_tokens=max_tokens,
@@ -10791,11 +10880,8 @@ def _make_agent(
                 else _load_reasoning_config(str(model or ""))
             )
         ),
-        service_tier=(
-            service_tier_override
-            if service_tier_override is not None
-            else _load_service_tier()
-        ),
+        service_tier=effective_tier,
+        request_overrides=fast_request_overrides,
         enabled_toolsets=_load_enabled_toolsets(_resolve_agent_platform(platform_override)),
         disabled_toolsets=disabled_toolsets,
         # OpenRouter provider-routing prefs (config.yaml `provider_routing`).
@@ -17192,9 +17278,13 @@ def _(rid, params: dict) -> dict:
                 return _err(rid, 5019, "fast update returned an unconfirmed owner",
                             {"delivery": "uncertain"})
             if ack.get("type") in {"control.error", "error"}:
-                # A host error after an offered write carries no proof that
-                # the mutation was not applied, regardless of its error code.
+                # Preserve a host's definitive validation refusal. Only a
+                # missing/unknown delivery remains uncertain.
                 code = ack.get("code")
+                delivery = ack.get("delivery")
+                if delivery in {"not_sent", "not_applied"}:
+                    return _err(rid, 5019, str(ack.get("message") or "fast update rejected"),
+                                {"delivery": delivery, **({"host_code": code} if type(code) is int else {})})
                 return _err(rid, 5019, str(ack.get("message") or "fast update unconfirmed"),
                             {"delivery": "uncertain", **({"host_code": code} if type(code) is int else {})})
             result, info = ack.get("result"), ack.get("session_info")
@@ -17626,11 +17716,14 @@ def _(rid, params: dict) -> dict:
                     return _err(rid, 5019, "reasoning update returned an unconfirmed owner",
                                 {"delivery": "uncertain"})
                 if ack.get("type") in {"control.error", "error"}:
-                    # The control was offered; a host-reported error code is
-                    # not evidence that it did not apply before the reply.
+                    # Preserve a host's definitive validation refusal. Only a
+                    # missing/unknown delivery remains uncertain.
                     code = ack.get("code")
-                    return _err(rid, 5019,
-                                str(ack.get("message") or "reasoning update unconfirmed"),
+                    delivery = ack.get("delivery")
+                    if delivery in {"not_sent", "not_applied"}:
+                        return _err(rid, 5019, str(ack.get("message") or "reasoning update rejected"),
+                                    {"delivery": delivery, **({"host_code": code} if type(code) is int else {})})
+                    return _err(rid, 5019, str(ack.get("message") or "reasoning update unconfirmed"),
                                 {"delivery": "uncertain", **({"host_code": code} if type(code) is int else {})})
                 result, info = ack.get("result"), ack.get("session_info")
                 try:
@@ -19058,10 +19151,25 @@ def _model_picker_context(agent, session: dict | None = None):
 
     ctx = load_picker_context()
     selected = {}
-    if session is not None and _session_uses_compute_host(session) and not session.get("_compute_host_active"):
-        override = session.get("model_override")
-        if isinstance(override, dict):
-            selected = override
+    if session is not None and _session_uses_compute_host(session):
+        with session["history_lock"]:
+            override = session.get("model_override")
+            if isinstance(override, dict):
+                selected = dict(override)
+            if session.get("_compute_host_active"):
+                # The serving agent is only a prewarmed shadow. Use the
+                # admitted host projection, including a temporary --once pick.
+                mirror = _metadata_mirror(session)
+                host_model = mirror.get("model")
+                host_provider = mirror.get("provider")
+                if host_model and host_provider:
+                    same_route = (selected.get("model") == host_model
+                                  and selected.get("provider") == host_provider)
+                    selected.update(model=host_model, provider=host_provider)
+                    if not same_route:
+                        # Do not attach a durable/parent route URL to a
+                        # different host selection whose URL was not reported.
+                        selected["base_url"] = ""
     provider = selected.get("provider") or (getattr(agent, "provider", "") if agent else "")
     model = selected.get("model") or (getattr(agent, "model", "") if agent else "")
     base_url = selected.get("base_url") if selected else (getattr(agent, "base_url", "") if agent else "")
@@ -19536,10 +19644,8 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
             return "\n".join(_lines)
         elif name == "fast" and agent:
             mode = arg.lower()
-            if mode in {"fast", "on"}:
-                agent.service_tier = "priority"
-            elif mode in {"normal", "off"}:
-                agent.service_tier = None
+            if mode in {"fast", "on", "normal", "off"}:
+                _apply_session_runtime_options(sid, session, {"fast": mode in {"fast", "on"}})
             _emit("session.info", sid, _session_info(agent, session))
         elif name == "reload-mcp" and agent and hasattr(agent, "reload_mcp_tools"):
             agent.reload_mcp_tools()

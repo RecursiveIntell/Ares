@@ -1,4 +1,5 @@
 import threading
+from concurrent.futures import Future
 from types import SimpleNamespace
 
 import pytest
@@ -143,12 +144,18 @@ def test_initialization_retained_at_ceiling_and_late_child_never_runs(monkeypatc
         lambda: delegate.DelegationLifetimePolicy('total', 0.1))
     monkeypatch.setattr(delegate, '_get_max_concurrent_children', lambda: 1)
     monkeypatch.setattr(delegate, '_build_child_agent', build)
+    caller_done = Future()
     try:
-        with pytest.raises(ValueError, match='DELEGATION_DEADLINE_EXPIRED'):
-            delegate._build_child_preserving_parent_tools(goal='test', parent_agent=parent)
+        try:
+            with pytest.raises(ValueError, match='DELEGATION_DEADLINE_EXPIRED'):
+                delegate._build_child_preserving_parent_tools(goal='test', parent_agent=parent,
+                    _caller_initialization_done=caller_done)
+        finally:
+            caller_done.set_result(None)
         assert entered.is_set()
         with pytest.raises(ValueError, match='DELEGATION_CAPACITY_OCCUPIED'):
-            delegate._build_child_preserving_parent_tools(goal='refused', parent_agent=parent)
+            delegate._build_child_preserving_parent_tools(goal='refused', parent_agent=parent,
+                _caller_initialization_done=Future())
         assert any(r.get('owner_agent_session_id') == 'init-parent' and r['capacity_occupied']
             for r in delegate.list_active_subagents())
     finally:
