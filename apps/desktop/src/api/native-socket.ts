@@ -104,6 +104,7 @@ export class NativeRendererSocket extends EventTarget {
       if (this.readyState !== 0) {
         return
       }
+
       void bridge
         .open({ correlation: this.correlation, route, channel })
         .then(result => {
@@ -152,6 +153,7 @@ export class NativeRendererSocket extends EventTarget {
       if (this.readyState !== 1) {
         return
       }
+
       const message = new MessageEvent('message', { data: event.data })
 
       try {
@@ -173,6 +175,7 @@ export class NativeRendererSocket extends EventTarget {
     if (this.readyState === 3) {
       return
     }
+
     const event = new Event('error')
 
     if (oauth) {
@@ -188,6 +191,7 @@ export class NativeRendererSocket extends EventTarget {
     if (this.readyState === 3) {
       return
     }
+
     clearTimeout(this.timer)
     this.readyState = 3
     this.unsubscribe()
@@ -199,6 +203,7 @@ export class NativeRendererSocket extends EventTarget {
     if (this.readyState !== 1 || !this.handle || typeof data !== 'string') {
       throw new Error('Native socket is not open')
     }
+
     // Bound in-flight IPC copies as well as main's queue. Exact byte accounting
     // is enforced in main; UTF-16 upper bound avoids another huge allocation.
     const bytes = data.length * 2
@@ -230,6 +235,7 @@ export class NativeRendererSocket extends EventTarget {
     if (reason && new TextEncoder().encode(reason).byteLength > 123) {
       throw new Error('Invalid close reason')
     }
+
     this.readyState = 2
     clearTimeout(this.timer)
     this.timer = setTimeout(() => this.finish(1006, 'Close timed out', false), 2_500)

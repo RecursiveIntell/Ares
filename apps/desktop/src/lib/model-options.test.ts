@@ -226,12 +226,14 @@ describe('requestModelOptions', () => {
     setApiRequestConnection('source-a')
     setApiRequestProfile('target-a')
     let reject!: (err: Error) => void
+
     const request = vi.fn(
       () =>
         new Promise<never>((_, fail) => {
           reject = fail
         })
     )
+
     const pending = requestModelOptions({ request, sessionId: 'session-a' })
     setApiRequestConnection('source-b')
     setApiRequestProfile('target-b')
@@ -405,6 +407,7 @@ describe('legacy-null and explicit-local catalog authority', () => {
     const request = vi.fn(async () => {
       throw new Error('inert local RPC failure')
     })
+
     await expect(requestModelOptions({ connectionId: 'local', profile: 'default', request })).resolves.toEqual(
       catalog('model-local-b')
     )
@@ -440,9 +443,11 @@ describe('legacy-null and explicit-local catalog authority', () => {
     )
     const pending = deferred<ModelOptionsResponse>()
     const requestA = vi.fn(() => pending.promise)
+
     const requestB = vi.fn(async () => {
       throw new Error('inert local RPC failure')
     })
+
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
 
     const picker = (connectionId: null | string) =>

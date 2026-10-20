@@ -3662,9 +3662,11 @@ describe('usePromptActions sleep/wake session recovery', () => {
       turnStartedAt: 123
     })
     const resumeStoredSession = vi.fn(async () => undefined)
+
     const requestGateway = vi.fn(async () => {
       throw new Error('session not found')
     })
+
     let handle: HarnessHandle | null = null
     await actRender(
       <Harness

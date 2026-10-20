@@ -52,6 +52,7 @@ export async function claimNativeBackendLifetime(
   if (deps.source() !== source) {
     throw new Error('Backend source changed during claim')
   }
+
   const candidate: NativeBackendLifetimeCandidate | undefined = connection[lifetimeBinding]
 
   if (!candidate?.promise || candidate.current() !== candidate.promise) {

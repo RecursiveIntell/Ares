@@ -19,6 +19,7 @@ const request = (overrides: Record<string, unknown> = {}) => ({
 test('Electron reserves all four requested slots before spawning and rejects the fifth without eviction', async () => {
   const pool = new Map<string, Entry>()
   const spawnRunner = vi.fn(async () => ({ pid: 17 }))
+
   const admission = createSpecialistDispatchAdmission({
     maxCapacity: 4,
     pool,
@@ -48,6 +49,7 @@ test('Electron reserves all four requested slots before spawning and rejects the
 test('identical request coalesces, mismatched reuse is rejected, and exact release frees capacity', async () => {
   const pool = new Map<string, Entry>()
   const spawnRunner = vi.fn(async () => ({ pid: 18 }))
+
   const admission = createSpecialistDispatchAdmission({
     maxCapacity: 4,
     pool,
@@ -57,12 +59,15 @@ test('identical request coalesces, mismatched reuse is rejected, and exact relea
 
   const first = await admission.admit(request({ profileIds: ['explorer'] }))
   const duplicate = await admission.admit(request({ profileIds: ['explorer'] }))
+
   const conflict = await admission.admit(
     request({ requestDigest: `sha256:${'c'.repeat(64)}`, profileIds: ['explorer'] })
   )
+
   expect(admission.hasActive()).toBe(true)
   admission.release('specialist-run-00000001', 'released')
   expect(admission.hasActive()).toBe(false)
+
   const next = await admission.admit(
     request({
       requestDigest: `sha256:${'d'.repeat(64)}`,
@@ -79,6 +84,7 @@ test('identical request coalesces, mismatched reuse is rejected, and exact relea
 
 test('invalid request is rejected before a runner can spawn', async () => {
   const spawnRunner = vi.fn(async () => ({ pid: 19 }))
+
   const admission = createSpecialistDispatchAdmission({
     maxCapacity: 4,
     pool: new Map(),

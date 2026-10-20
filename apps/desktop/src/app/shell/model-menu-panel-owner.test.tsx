@@ -44,6 +44,7 @@ vi.mock('./model-catalog-menu', () => ({
 }))
 
 const ownerB = { connectionId: 'source-b', profile: 'same-name', targetProfile: 'backend-b' }
+
 const options = (model: string): ModelOptionsResponse => ({
   model,
   provider: 'custom:b',

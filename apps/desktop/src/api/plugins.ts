@@ -106,6 +106,7 @@ export function pluginSocket(pluginId: string, path: string, onMessage: (data: u
       if (disposed) {
         return
       }
+
       socket = new NativeRendererSocket(native, nativeRoute(getApiRequestProfile(), getApiRequestConnection()), {
         kind: 'plugin',
         pluginId,

@@ -209,6 +209,7 @@ test('ordered PCM/text events remain bounded until acknowledged; overflow is ter
   for (let i = 0; i < 129; i++) {
     f.wire.emit('message', Buffer.from('x'), false)
   }
+
   expect(f.events.at(-1).type).toBe('close')
   expect(f.wire.terminate).toHaveBeenCalledOnce()
 })

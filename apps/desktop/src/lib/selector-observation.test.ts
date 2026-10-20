@@ -4,11 +4,13 @@ import type { ClientSessionState } from '@/app/types'
 import { createClientSessionState } from '@/lib/chat-runtime'
 
 import { reconcileSelectorInfo } from './selector-observation'
+
 const info = (revision: number, model: string, epoch = 'owner') => ({
   model,
   provider: 'p',
   selector_version: { epoch, revision }
 })
+
 const observe = (state: ClientSessionState, incoming: ReturnType<typeof info>, options = {}) => ({
   ...state,
   ...reconcileSelectorInfo(state, incoming, options)
@@ -37,17 +39,20 @@ describe('selector owner ordering', () => {
   })
   it('an older Fast ACK cannot clear a newer effort intent', () => {
     const base = observe(createClientSessionState(), info(1, 'A'))
+
     const pending = {
       ...base,
       reasoningEffort: 'high',
       fast: false,
       pendingRuntimeOptions: { effort: 'high', fast: false }
     }
+
     const patch = reconcileSelectorInfo(
       pending,
       { ...info(2, 'A'), reasoning_effort: 'low', fast: false },
       { settleOptions: ['fast'] }
     )
+
     expect(patch.pendingRuntimeOptions).toEqual({ effort: 'high' })
     expect(patch.reasoningEffort).toBeUndefined()
   })
@@ -110,6 +115,7 @@ describe('selector owner ordering', () => {
       })
     } as typeof state
     expect(state.reasoningEffort).toBe('high')
+
     const applied = {
       ...state,
       ...reconcileSelectorInfo(state, {
@@ -118,6 +124,7 @@ describe('selector owner ordering', () => {
         selector_version: { epoch: 'owner', revision: 2 }
       })
     }
+
     expect(applied.pendingRuntimeOptions).toBeNull()
     expect(
       reconcileSelectorInfo(applied, { reasoning_effort: 'low', selector_version: { epoch: 'owner', revision: 1 } })

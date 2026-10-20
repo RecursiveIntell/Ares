@@ -33,6 +33,7 @@ export async function prepareNativeSocketTarget(
       delete headers[key]
     }
   }
+
   headers.Origin = base.origin
 
   const target = new URL(
@@ -59,6 +60,7 @@ export async function prepareNativeSocketTarget(
     if (!connection.token) {
       throw new Error('Canonical backend has no transport credential')
     }
+
     target.searchParams.set('token', connection.token)
   }
 
