@@ -109,8 +109,7 @@ try:
         FastAPI, File, Form, HTTPException, Query, Request, UploadFile,
         WebSocket, WebSocketDisconnect,
     )
-    from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+    from fastapi.responses import RedirectResponse, FileResponse, HTMLResponse, JSONResponse, Response
     from fastapi.staticfiles import StaticFiles
     from pydantic import BaseModel, SecretStr, field_validator
     from starlette.concurrency import run_in_threadpool
@@ -125,8 +124,7 @@ except ImportError:
             FastAPI, File, Form, HTTPException, Query, Request, UploadFile,
             WebSocket, WebSocketDisconnect,
         )
-        from fastapi.middleware.cors import CORSMiddleware
-        from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+        from fastapi.responses import RedirectResponse, FileResponse, HTMLResponse, JSONResponse, Response
         from fastapi.staticfiles import StaticFiles
         from pydantic import BaseModel, SecretStr, field_validator
         from starlette.concurrency import run_in_threadpool
@@ -626,16 +624,43 @@ _reveal_timestamps: List[float] = []
 _REVEAL_MAX_PER_WINDOW = 5
 _REVEAL_WINDOW_SECONDS = 30
 
-# CORS: restrict to localhost origins only.  The web UI is intended to run
-# locally; binding to 0.0.0.0 with allow_origins=["*"] would let any website
-# read/modify config and secrets.
+# Browser callers share one exact origin contract with WS and cookie auth.
+from hermes_cli.dashboard_auth.origins import ExactOriginCORS, origin_allowed
+from hermes_cli.dashboard_auth.browser_launch import BrowserLaunchTickets
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
-    allow_methods=["*"],
-    allow_headers=["*"],
+_BROWSER_LAUNCH_TICKETS = BrowserLaunchTickets()
+
+# Child-owned bootstrap proof is separate from the live session bearer and
+# authorizes only token discovery / native transport provenance. Never emit it
+# in HTML, connection descriptors, argv, readiness messages or logs.
+_DESKTOP_BOOTSTRAP_KEY = os.environ.get("HERMES_DESKTOP_BOOTSTRAP_KEY", "")
+_DESKTOP_BOOTSTRAP_ID = os.environ.get("HERMES_DESKTOP_BOOTSTRAP_ID", "")
+
+
+from hermes_cli.dashboard_auth.native_bootstrap import (
+    NativeReplayWindow, make_native_response, verify_native_request, native_listener_endpoint,
 )
+_NATIVE_BOOTSTRAP_NONCES = NativeReplayWindow()
+
+
+@app.get("/auth/desktop-bootstrap")
+async def desktop_bootstrap(request: Request):
+    if (request.headers.get("origin") is not None or request.url.query
+            or getattr(app.state, "auth_required", False)):
+        raise HTTPException(status_code=403, detail="Native bootstrap denied")
+    endpoint = native_listener_endpoint(request.scope, request.headers.get("host", ""))
+    if endpoint is None:
+        raise HTTPException(status_code=403, detail="Native listener binding denied")
+    admitted = verify_native_request(request.headers, endpoint, _DESKTOP_BOOTSTRAP_KEY,
+                                     _DESKTOP_BOOTSTRAP_ID, _NATIVE_BOOTSTRAP_NONCES)
+    if admitted is None:
+        raise HTTPException(status_code=403, detail="Native bootstrap denied")
+    nonce, issued = admitted
+    return JSONResponse(
+        make_native_response(_DESKTOP_BOOTSTRAP_KEY, endpoint, _DESKTOP_BOOTSTRAP_ID,
+                             nonce, issued, _SESSION_TOKEN),
+        headers={"Cache-Control": "no-store"},
+    )
 
 # ---------------------------------------------------------------------------
 # Endpoints that do NOT require the session token.  Everything else under
@@ -675,6 +700,30 @@ def _has_valid_session_token(request: Request) -> bool:
     auth = request.headers.get("authorization", "")
     expected = f"Bearer {_SESSION_TOKEN}"
     return hmac.compare_digest(auth.encode(), expected.encode())
+
+
+@app.post("/auth/browser-bootstrap")
+async def browser_bootstrap(request: Request):
+    """Redeem an exact-origin launch grant; never create ambient authority."""
+    headers = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
+    if (getattr(request.app.state, "auth_required", False)
+            or not origin_allowed(request.headers.get("origin", ""), request.scope)):
+        return JSONResponse({"detail": "Browser bootstrap denied"}, status_code=403, headers=headers)
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > 1024:
+            return JSONResponse({"detail": "Bootstrap body too large"}, status_code=413, headers=headers)
+    try:
+        payload = json.loads(body)
+    except (ValueError, UnicodeError):
+        return JSONResponse({"detail": "Invalid bootstrap request"}, status_code=400, headers=headers)
+    if payload == {} and _has_valid_session_token(request):
+        return Response(status_code=204, headers=headers)
+    if (not isinstance(payload, dict) or set(payload) != {"ticket"}
+            or not _BROWSER_LAUNCH_TICKETS.consume(payload.get("ticket"))):
+        return JSONResponse({"detail": "Browser bootstrap denied"}, status_code=403, headers=headers)
+    return JSONResponse({"protocol": "browser-launch-v1", "token": _SESSION_TOKEN}, headers=headers)
 
 
 # Routes that may also authenticate via a ``?token=`` query param, for download
@@ -999,6 +1048,8 @@ async def auth_middleware(request: Request, call_next):
     if getattr(request.app.state, "auth_required", False):
         return await call_next(request)
     path = request.url.path
+    if path == "/auth/desktop-bootstrap":
+        return await call_next(request)
     is_mcp_oauth_callback = path.startswith("/api/mcp/oauth/callback/")
     if path.startswith("/api/") and path not in _PUBLIC_API_PATHS and not is_mcp_oauth_callback:
         if not _has_valid_session_token(request) and not _has_valid_query_token(request, path):
@@ -1006,6 +1057,20 @@ async def auth_middleware(request: Request, call_next):
                 status_code=401,
                 content={"detail": "Unauthorized"},
             )
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def browser_origin_middleware(request: Request, call_next):
+    origin = request.headers.get("origin")
+    # Browser navigations/download anchors can omit Origin. Fetch Metadata
+    # still identifies sibling/foreign-site token URLs; OS/native links carry
+    # no such browser metadata and retain the explicit query-bearer path.
+    if (request.url.path in _QUERY_TOKEN_API_PATHS
+            and request.headers.get("sec-fetch-site") in {"same-site", "cross-site"}):
+        return JSONResponse({"detail": "Cross-origin download denied"}, status_code=403)
+    if origin is not None and not origin_allowed(origin, request.scope):
+        return JSONResponse({"detail": "Origin denied"}, status_code=403)
     return await call_next(request)
 
 
@@ -1021,6 +1086,10 @@ async def _token_auth_seam(request: Request, call_next):
     """
     from hermes_cli.dashboard_auth.token_auth import token_auth_middleware
     return await token_auth_middleware(request, call_next)
+
+
+# Outermost browser CORS owns OPTIONS before any authentication adapters.
+app.add_middleware(ExactOriginCORS)
 
 
 # ---------------------------------------------------------------------------
@@ -16487,15 +16556,12 @@ def _ws_host_origin_reason(ws: "WebSocket") -> Optional[str]:
     on rejection so the close path can log *why* the upgrade was refused.
     """
     bound_host = getattr(app.state, "bound_host", None)
-    if not bound_host:
-        return None
-
     trusted_public_hosts = getattr(
         app.state, "trusted_public_hosts", frozenset()
     )
 
     host_header = ws.headers.get("host", "")
-    if not _is_accepted_host(
+    if bound_host and not _is_accepted_host(
         host_header, bound_host, trusted_public_hosts
     ):
         return f"host_mismatch host={host_header or '?'} bound={bound_host}"
@@ -16504,20 +16570,8 @@ def _ws_host_origin_reason(ws: "WebSocket") -> Optional[str]:
     if not origin:
         return None
 
-    parsed = urllib.parse.urlparse(origin)
-    if parsed.scheme not in {"http", "https"}:
-        # Non-web origin (packaged Electron: file://, null, app://). The
-        # upstream credential check is the real auth boundary; trust it.
-        # See _ws_host_origin_is_allowed for the full rationale.
-        return None
-
-    if not parsed.netloc:
-        return f"origin_mismatch origin={origin} bound={bound_host}"
-
-    if not _is_accepted_host(
-        parsed.netloc, bound_host, trusted_public_hosts
-    ):
-        return f"origin_mismatch origin={origin} bound={bound_host}"
+    if not origin_allowed(origin, ws.scope):
+        return "origin_mismatch"
     return None
 
 
@@ -18023,32 +18077,6 @@ def mount_spa(application: FastAPI):
 
         @application.get("/{full_path:path}")
         async def no_frontend(full_path: str):
-            # Desktop token handshake (#94227): the Electron shell boots by
-            # fetching `/` and extracting ``window.__HERMES_SESSION_TOKEN__``
-            # for /api/ws auth (apps/desktop/electron/dashboard-token.ts).
-            # When headless serve 404'd every path, a renderer whose spawn
-            # token no longer matched the backend's live token (e.g. after
-            # `hermes update` replaced the backend) had no way to adopt the
-            # served token — the WS handshake failed and the window
-            # white-screened (#95575). Serve a minimal token-only page at the
-            # exact root, but ONLY when the dashboard auth gate is off: on a
-            # gated (non-loopback/remote) serve the token must never be
-            # readable without auth, so the 404 JSON stays.
-            gated = bool(getattr(application.state, "auth_required", False))
-            if full_path == "" and not gated:
-                token_js = json.dumps(_SESSION_TOKEN)
-                return HTMLResponse(
-                    "<!doctype html><html><head><script>"
-                    f"window.__HERMES_SESSION_TOKEN__={token_js};"
-                    "window.__HERMES_AUTH_REQUIRED__=false;"
-                    "</script></head><body>"
-                    "Headless backend (hermes serve): web UI disabled — use "
-                    "`hermes dashboard` for the browser UI."
-                    "</body></html>",
-                    headers={
-                        "Cache-Control": "no-store, no-cache, must-revalidate"
-                    },
-                )
             return JSONResponse({"error": _msg}, status_code=404)
         return
 
@@ -18066,8 +18094,8 @@ def mount_spa(application: FastAPI):
 
     _index_path = WEB_DIST / "index.html"
 
-    def _serve_index(prefix: str = ""):
-        """Return index.html with the session token + base-path injected.
+    def _serve_index(request: Request, prefix: str = ""):
+        """Return a bearer-free shell with auth mode and base-path metadata.
 
         ``prefix`` is the normalised ``X-Forwarded-Prefix`` (e.g. ``/hermes``)
         or empty string when served at root.
@@ -18078,6 +18106,10 @@ def mount_spa(application: FastAPI):
         ``__HERMES_AUTH_REQUIRED__`` flag lets the SPA pick the right
         auth scheme for /api/pty and /api/ws (ticket vs token).
         """
+        if "bootstrap" in request.query_params:
+            # Credentials belong in the fragment-to-POST flow, never request URLs.
+            return HTMLResponse("Use the authenticated fragment launch URL.", status_code=400,
+                                headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
         try:
             html = _index_path.read_text(encoding="utf-8")
         except OSError:
@@ -18091,24 +18123,15 @@ def mount_spa(application: FastAPI):
                 status_code=404,
             )
         chat_js = "true" if _DASHBOARD_EMBEDDED_CHAT_ENABLED else "false"
-        gated = bool(getattr(app.state, "auth_required", False))
+        gated = bool(getattr(application.state, "auth_required", False))
         gated_js = "true" if gated else "false"
-        if gated:
-            bootstrap_script = (
-                f"<script>"
-                f"window.__HERMES_DASHBOARD_EMBEDDED_CHAT__={chat_js};"
-                f'window.__HERMES_BASE_PATH__="{prefix}";'
-                f"window.__HERMES_AUTH_REQUIRED__={gated_js};"
-                f"</script>"
-            )
-        else:
-            bootstrap_script = (
-                f'<script>window.__HERMES_SESSION_TOKEN__="{_SESSION_TOKEN}";'
-                f"window.__HERMES_DASHBOARD_EMBEDDED_CHAT__={chat_js};"
-                f'window.__HERMES_BASE_PATH__="{prefix}";'
-                f"window.__HERMES_AUTH_REQUIRED__={gated_js};"
-                f"</script>"
-            )
+        bootstrap_script = (
+            f"<script>"
+            f"window.__HERMES_DASHBOARD_EMBEDDED_CHAT__={chat_js};"
+            f"window.__HERMES_BASE_PATH__={json.dumps(prefix).replace('<', chr(92) + 'u003c')};"
+            f"window.__HERMES_AUTH_REQUIRED__={gated_js};"
+            f"</script>"
+        )
         if prefix:
             # Rewrite absolute asset URLs baked into the Vite build so the
             # browser fetches them through the same proxy prefix.
@@ -18129,10 +18152,13 @@ def mount_spa(application: FastAPI):
         if theme_bootstrap:
             html = html.replace("</head>", f"{theme_bootstrap}</head>", 1)
         html = html.replace("</head>", f"{bootstrap_script}</head>", 1)
-        return HTMLResponse(
+        response = HTMLResponse(
             html,
-            headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+            headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Referrer-Policy": "no-referrer"},
         )
+        if not gated and "hermes_dashboard_bootstrap" in request.cookies:
+            response.delete_cookie("hermes_dashboard_bootstrap", path="/", httponly=True, samesite="strict")
+        return response
 
     # When served behind a path-prefix proxy, the built CSS contains
     # absolute ``url(/fonts/...)`` and ``url(/ds-assets/...)`` references.
@@ -18210,7 +18236,7 @@ def mount_spa(application: FastAPI):
             and file_path.is_file()
         ):
             return FileResponse(file_path)
-        return _serve_index(prefix)
+        return _serve_index(request, prefix)
 
 
 # ---------------------------------------------------------------------------
@@ -19428,7 +19454,8 @@ def _write_dashboard_ready_file(actual_port: int) -> None:
 
 
 def _maybe_open_browser(
-    host: str, actual_port: int, open_browser: bool, initial_profile: str
+    host: str, actual_port: int, open_browser: bool, initial_profile: str,
+    print_launch_url: bool = False,
 ) -> None:
     """Open the dashboard URL in the user's browser if appropriate.
 
@@ -19437,7 +19464,7 @@ def _maybe_open_browser(
     Maps ``0.0.0.0`` / ``::`` binds to ``127.0.0.1`` so the browser opens
     a reachable URL.
     """
-    if not open_browser:
+    if not open_browser and not print_launch_url:
         return
 
     import webbrowser
@@ -19447,7 +19474,7 @@ def _maybe_open_browser(
         or bool(os.environ.get("DISPLAY"))
         or bool(os.environ.get("WAYLAND_DISPLAY"))
     )
-    if not _has_display:
+    if not _has_display and not print_launch_url:
         _log.debug(
             "Skipping browser-open: no DISPLAY or WAYLAND_DISPLAY detected "
             "(headless Linux). Pass --no-open to suppress this detection."
@@ -19455,10 +19482,19 @@ def _maybe_open_browser(
         return
 
     _display_host = host if host not in ("0.0.0.0", "::") else "127.0.0.1"
+    if ":" in _display_host and not _display_host.startswith("["):
+        _display_host = f"[{_display_host}]"
     _open_url = f"http://{_display_host}:{actual_port}"
     if initial_profile:
         from urllib.parse import quote
         _open_url += f"/?profile={quote(initial_profile)}"
+
+    if not getattr(app.state, "auth_required", False):
+        _open_url += f"#bootstrap={urllib.parse.quote(_BROWSER_LAUNCH_TICKETS.issue())}"
+    if print_launch_url:
+        print(_open_url, flush=True)
+    if not open_browser or not _has_display:
+        return
 
     def _open():
         try:
@@ -19679,6 +19715,7 @@ def start_server(
     headless: bool = False,
     ssh_session_token: Optional[str] = None,
     ssh_owner_nonce: Optional[str] = None,
+    print_launch_url: bool = False,
 ):
     """Start the web UI server.
 
@@ -19907,6 +19944,14 @@ def start_server(
         except (TypeError, ValueError):
             return default
 
+    _proxy_trust = _dash_cfg.get("trusted_proxies", os.environ.get("FORWARDED_ALLOW_IPS", ""))
+    if _proxy_trust is None:
+        _proxy_trust = ""
+    if not isinstance(_proxy_trust, (str, list, tuple)):
+        raise ValueError("dashboard.trusted_proxies must be a list of trusted peers/networks")
+    _proxy_hosts = _proxy_trust.split(",") if isinstance(_proxy_trust, str) else _proxy_trust
+    if any(str(peer).strip() == "*" for peer in _proxy_hosts):
+        raise ValueError("dashboard.trusted_proxies must name explicit trusted peers/networks")
     config = uvicorn.Config(
         app, host=host, port=port, log_level="warning",
         # proxy_headers defaults to False so _ws_client_is_allowed sees
@@ -19917,6 +19962,7 @@ def start_server(
         # decide cookie Secure flags, so we flip proxy_headers on for that
         # mode.
         proxy_headers=bool(app.state.auth_required),
+        forwarded_allow_ips=_proxy_trust,
         # Half-open detection for public binds only (see above). Loopback
         # disables the protocol ping (None) so an event-loop stall can never
         # trigger a false disconnect; a genuinely dead local client is still
@@ -20063,7 +20109,7 @@ def start_server(
                 print(f"  Hermes backend listening on {host}:{actual_port}", flush=True)
             else:
                 print(f"  Hermes Web UI → http://{host}:{actual_port}")
-            _maybe_open_browser(host, actual_port, open_browser, initial_profile)
+            _maybe_open_browser(host, actual_port, open_browser, initial_profile, print_launch_url)
 
             # Collapse the peer-hangup teardown flood (#50005). When the Desktop
             # forcibly closes its WebSocket mid-write, asyncio logs a full

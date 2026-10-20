@@ -84,7 +84,9 @@ class RiPipeline:
                 "Install with: pip install llm-pipeline"
             )
         native_config = config._to_native() if config else None
-        return self._native.call(prompt, system=system, config=native_config)
+        from ares_runtime.physical_dispatch import unsupported_transport_scope
+        with unsupported_transport_scope('ri_pipeline'):
+            return self._native.call(prompt, system=system, config=native_config)
 
     def call_structured(
         self,
@@ -98,9 +100,9 @@ class RiPipeline:
         if self._native is None:
             raise RuntimeError("llm-pipeline native extension is not installed")
         native_config = config._to_native() if config else None
-        return self._native.call_structured(
-            prompt, json_schema, system=system, config=native_config
-        )
+        from ares_runtime.physical_dispatch import unsupported_transport_scope
+        with unsupported_transport_scope('ri_pipeline'):
+            return self._native.call_structured(prompt, json_schema, system=system, config=native_config)
 
     def __repr__(self) -> str:
         status = "native" if self.available else "unavailable"

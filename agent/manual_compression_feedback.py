@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Sequence
 
+from agent.context_engine import CONTEXT_REBASE_LINEAGE_INTEGRITY_MISMATCH
 from agent.redact import redact_sensitive_text
 
 
@@ -33,6 +34,56 @@ def describe_compression_lock_skip(lock_signal: Any) -> str:
         "compression lock. Another compression may still be running, or "
         "the lock check failed — try again shortly."
     )
+
+
+def compression_abort_guidance(compression_state: Any) -> str:
+    """Describe the latest abort and any unresolved lineage veto separately."""
+    outcome = getattr(compression_state, "last_outcome", None)
+    latest_integrity_failure = (
+        isinstance(outcome, dict)
+        and outcome.get("kind") == "compaction_failed_closed"
+        and outcome.get("source_operation") == "compact-v2"
+        and outcome.get("source_error_code") == "lineage_integrity_mismatch"
+    )
+    block_reason = None
+    veto_check = getattr(compression_state, "automatic_rebase_block_reason", None)
+    if callable(veto_check):
+        try:
+            block_reason = veto_check()
+        except Exception:
+            # Guidance remains conservative if the optional engine contract
+            # cannot be read; the runtime fails closed on that admission path.
+            block_reason = None
+
+    if latest_integrity_failure:
+        guidance = (
+            "Context Governor refused this compression attempt because of a "
+            "lineage integrity mismatch. No compacted transcript was committed. "
+            "The current working messages were retained, but context recovery is "
+            "not established; automatic durable-state rebase is blocked for this "
+            "lineage. Requests still must pass model-window and integrity checks. "
+            "Resolve the lineage issue before retrying this session."
+        )
+    elif block_reason == CONTEXT_REBASE_LINEAGE_INTEGRITY_MISMATCH:
+        guidance = (
+            "Compression aborted. No compacted transcript was committed. The current "
+            "working messages were retained, but context recovery is not established; "
+            "an unresolved lineage integrity mismatch remains recorded and automatic "
+            "durable-state rebase remains blocked. This attempt's abort cause is "
+            "separate; further requests remain subject to model-window admission."
+        )
+    else:
+        guidance = (
+            "Compression aborted. No compacted transcript was committed. The current "
+            "working messages were retained, but context recovery is not established; "
+            "the next request remains subject to model-window admission. Retrying "
+            "/compress may repeat the failure and is not proof of recovery."
+        )
+    failure_reason = getattr(compression_state, "_last_summary_error", None)
+    if isinstance(failure_reason, str) and failure_reason.strip():
+        safe_reason = redact_sensitive_text(failure_reason.strip(), force=True)
+        guidance = f"{guidance} Reason: {safe_reason}"
+    return guidance
 
 
 def summarize_manual_compression(
@@ -98,7 +149,7 @@ def summarize_manual_compression(
             "no messages were removed."
         )
     elif aborted:
-        note = "Summary generation failed; no messages were removed."
+        note = compression_abort_guidance(compression_state)
     elif fallback_used:
         dropped_count = getattr(compression_state, "_last_summary_dropped_count", None)
         if not isinstance(dropped_count, int) or isinstance(dropped_count, bool):
@@ -114,10 +165,10 @@ def summarize_manual_compression(
             "compression rewrites the transcript into denser summaries."
         )
 
-    if failure_reason and (aborted or fallback_used):
-        # This text crosses a user-facing UI boundary.  Never let a disabled
+    if failure_reason and fallback_used and not aborted:
+        # This text crosses a user-facing UI boundary. Never let a disabled
         # global redaction preference expose credentials embedded in provider
-        # exception text.
+        # exception text. Abort guidance already includes this safely.
         safe_reason = redact_sensitive_text(failure_reason.strip(), force=True)
         note = f"{note} Reason: {safe_reason}"
 

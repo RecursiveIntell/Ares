@@ -293,6 +293,61 @@ class SessionContextInputTurnsMixin:
         if not value["dispatch_attempts"] and time.time() >= value["deadline_at"]:
             raise ContextContinuationError("CONTEXT_INPUT_RECOVERY_EXHAUSTED")
 
+    def record_model_dispatch_materialization(self, session_id, *, turn_lease_holder,
+            source, request_digest, purpose, provider_identity, model_ref, api_mode):
+        """Append an ordinary-call correlation record under the existing turn owner.
+
+        Generation is explicitly the persisted session-lineage depth, not a
+        transcript revision or an invented episode. Input phase and its receipt
+        digest remain owned by the inbox/turn owner. Raw prompts are absent.
+        """
+        from ares_runtime.managed_calls import ManagedCallContextV2
+        from ares_runtime.collaboration import digest
+        def write(conn):
+            self._assert_context_rebase_lease_on_conn(conn, session_id, turn_lease_holder)
+            root, profile = self._context_input_scope_on_conn(conn, session_id)
+            phase = self._input_turn_on_conn(conn, root, profile)
+            if phase is None or phase["state"] != "active":
+                raise ContextContinuationError("TURN_IDENTITY_UNAVAILABLE")
+            self._assert_input_turn_owner_on_conn(conn, session_id, turn_lease_holder, phase)
+            lineage = self._context_rebase_lineage_on_conn(conn, session_id)
+            context = ManagedCallContextV2.create({
+                "call_ref": "ares-call:" + uuid.uuid4().hex,
+                "session_ref": session_id, "session_generation": len(lineage) - 1,
+                "turn_ref": phase["phase_id"], "input_digest": "sha256:" + phase["receipts_digest"],
+                "source_revision": source["source_revision"], "source_digest": source["source_digest"],
+                "provider_identity": provider_identity, "model_ref": model_ref,
+                "api_mode": api_mode, "purpose": purpose, "request_digest": request_digest,
+            })
+            record = {"schema": "ares.dispatch-materialization/v1", "context": context.to_dict()}
+            record_digest = digest(record)
+            record["materialization_digest"] = record_digest
+            record["materialization_ref"] = "ares-materialization:" + record_digest.removeprefix("sha256:")
+            conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?)",
+                (record["materialization_ref"], _canonical(record)))
+            return record
+        return self._execute_write(write)
+
+    def read_model_dispatch_materialization(self, materialization_ref):
+        """Exact owner readback; no mutable cache or alternate lineage source."""
+        from ares_runtime.collaboration import digest
+        from ares_runtime.managed_calls import ManagedCallContextV2
+        with self._read_ctx() as conn:
+            row = conn.execute("SELECT value FROM state_meta WHERE key=?", (materialization_ref,)).fetchone()
+        if row is None:
+            raise ContextContinuationError("MATERIALIZATION_UNAVAILABLE")
+        record = _strict_json(row[0])
+        if set(record) != {"schema", "context", "materialization_digest", "materialization_ref"}:
+            raise ContextContinuationError("MATERIALIZATION_INVALID")
+        ManagedCallContextV2.parse(record["context"])
+        expected = digest({"schema": record["schema"], "context": record["context"]})
+        if (record["schema"] != "ares.dispatch-materialization/v1"
+                or record["materialization_digest"] != expected
+                or record["materialization_ref"] != materialization_ref
+                or materialization_ref != "ares-materialization:" + expected.removeprefix("sha256:")):
+            raise ContextContinuationError("MATERIALIZATION_INVALID")
+        return record
+
     def read_context_input_work(self, session_id):
         """Read unfinished-phase evidence or eligible post-cut inbox inputs.
 

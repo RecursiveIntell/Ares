@@ -52,6 +52,7 @@ class _CapturingAgent:
     last_init = None
 
     def __init__(self, *args, **kwargs):
+        self.model = kwargs["model"]
         type(self).last_init = dict(kwargs)
         self.tools = []
 

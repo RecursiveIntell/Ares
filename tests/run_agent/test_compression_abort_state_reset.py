@@ -132,4 +132,53 @@ class TestAbortPathsResetPerAttemptState:
             assert new_history is history
             db.close()
 
+    def test_automatic_abort_warning_does_not_claim_lineage_recovery(self):
+        from unittest.mock import MagicMock
+
+        from agent.context_engine import CONTEXT_REBASE_LINEAGE_INTEGRITY_MISMATCH
+        from agent.conversation_compression import compress_context
+        from hermes_state import SessionDB
+
+        class LineageAbortCompressor(_InPlaceSuccessCompressor):
+            _last_compress_aborted = True
+            _last_summary_error = (
+                "context-governor compact-v2 failed [lineage_integrity_mismatch]"
+            )
+            last_outcome = {
+                "kind": "compaction_failed_closed",
+                "source_operation": "compact-v2",
+                "source_error_code": "lineage_integrity_mismatch",
+            }
+            _last_compression_made_progress = False
+
+            def automatic_rebase_block_reason(self):
+                return CONTEXT_REBASE_LINEAGE_INTEGRITY_MISMATCH
+
+            def compress(self, messages, **_kwargs):
+                return messages
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "warning.db")
+            agent = _make_agent(db)
+            agent._emit_warning = MagicMock()
+            agent.context_compressor = LineageAbortCompressor()
+            messages = [
+                {"role": "user", "content": "current request"},
+                {"role": "assistant", "content": "earlier answer"},
+            ]
+
+            returned, _ = compress_context(
+                agent, messages, "system", approx_tokens=100_000
+            )
+
+            assert returned == messages
+            agent._emit_warning.assert_called_once()
+            warning = agent._emit_warning.call_args.args[0].lower()
+            assert "lineage integrity mismatch" in warning
+            assert "no compacted transcript was committed" in warning
+            assert "automatic durable-state rebase is blocked" in warning
+            assert "conversation continues unchanged" not in warning
+            assert "run /compress to retry" not in warning
+            db.close()
+
 

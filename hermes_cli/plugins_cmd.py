@@ -11,6 +11,7 @@ from __future__ import annotations
 from hermes_cli.cli_output import line_input
 
 import functools
+import hashlib
 import importlib.metadata
 import json
 import logging
@@ -20,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import urllib.parse
 from pathlib import Path
 from typing import Any, Optional
@@ -1080,128 +1082,184 @@ def cmd_install(
     console.print()
 
 
+_PLUGIN_UPDATE_LOCK = threading.Lock()
+
+
+def _plugin_update_tree_digest(root: Path) -> str:
+    """Detect concurrent edits to the tree we are about to replace, including Git state."""
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*")):
+        digest.update(str(path.relative_to(root)).encode("utf-8"))
+        digest.update(b"\0")
+        if path.is_symlink():
+            digest.update(b"link\0" + os.readlink(path).encode("utf-8"))
+        elif path.is_file():
+            digest.update(b"file\0" + path.read_bytes())
+        else:
+            digest.update(b"dir\0")
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _update_plugin_core(name: str) -> dict[str, Any]:
+    """Admit a private candidate before publishing; never import plugin code.
+
+    The existing pull/autostash path runs only in the copy. Capability additions
+    have no revision-bound consent channel here and therefore fail closed.
+    Grants and enablement are never written by an update.
+    """
+    with _PLUGIN_UPDATE_LOCK:
+        plugins_dir = _plugins_dir()
+        target = _sanitize_plugin_name(name, plugins_dir, allow_subdir=True)
+        prefix = f".{target.name}.update-"
+        # Discovery descends into category directories, including dot names.
+        # Stage beside plugins/, outside discovery, for rename publication.
+        staging_root = plugins_dir.parent
+        if any(staging_root.glob(prefix + "*")):
+            raise PluginOperationError("A retained plugin update requires recovery review before retrying.")
+        if not target.is_dir():
+            raise PluginOperationError(f"Plugin '{name}' was not found.")
+        metadata = _read_install_metadata()
+        record = metadata.get(target.name, {})
+        if not isinstance(record, dict):
+            raise PluginOperationError("Invalid plugin install metadata record.")
+        if record.get("pinned") is True:
+            raise PluginOperationError(
+                f"Plugin '{name}' is pinned to {record.get('revision')}; "
+                "reinstall with an explicit --ref <40-character commit SHA> to move it."
+            )
+        git_dir = target / ".git"
+        if not git_dir.is_dir() or git_dir.is_symlink():
+            raise PluginOperationError("Cannot update: an independent .git directory is required.")
+        if any(p.is_symlink() for p in git_dir.rglob("*")):
+            raise PluginOperationError("Cannot stage a linked Git directory.")
+        git_exe = _resolve_git_executable()
+        if not git_exe:
+            raise PluginOperationError("git is not installed or not in PATH.")
+        origin = _run_plugin_git(git_exe, target, "remote", "get-url", "origin")
+        if origin.returncode != 0:
+            raise PluginOperationError("Cannot determine plugin source.")
+        git_url, subdir = _resolve_git_url(origin.stdout.strip())
+        source = _canonical_source(git_url, subdir)
+        if subdir or (record and record.get("source") != source):
+            raise PluginOperationError("Plugin Git origin does not match its installed source.")
+        metadata_path = _install_metadata_path()
+        old_metadata_bytes = metadata_path.read_bytes() if metadata_path.exists() else None
+        old_identity = target.stat()
+        old_revision = _git_head_revision(target, git_exe)
+        old_tree_digest = _plugin_update_tree_digest(target)
+        stage = Path(tempfile.mkdtemp(prefix=prefix, dir=staging_root))
+        candidate, backup = stage / "candidate", stage / "previous-plugin"
+        retain = False
+        try:
+            # A recovery copy of the exact sidecar survives an ambiguous rollback.
+            (stage / "previous-metadata.json").write_bytes(old_metadata_bytes or b"")
+            shutil.copytree(target, candidate, symlinks=True)
+            top = _run_plugin_git(git_exe, candidate, "rev-parse", "--show-toplevel")
+            if top.returncode != 0 or Path(top.stdout.strip()).resolve() != candidate.resolve():
+                raise PluginOperationError("Staged Git worktree points outside the private candidate.")
+            branch = _run_plugin_git(git_exe, candidate, "symbolic-ref", "--short", "HEAD")
+            upstream = _run_plugin_git(git_exe, candidate, "config", "--get", f"branch.{branch.stdout.strip()}.remote")
+            if branch.returncode != 0 or upstream.returncode != 0 or upstream.stdout.strip() != "origin":
+                raise PluginOperationError("Update branch does not track the installed origin.")
+            ok, output = _git_pull_plugin_dir(candidate)
+            if not ok:
+                raise PluginOperationError(output)
+            revision = _normalize_exact_revision(_git_head_revision(candidate, git_exe))
+            manifest = _read_manifest(candidate)
+            old_manifest = _read_manifest(target)
+            if not isinstance(manifest, dict) or not manifest:
+                raise PluginOperationError("Updated plugin manifest is missing or invalid.")
+            if not isinstance(old_manifest, dict) or not old_manifest:
+                raise PluginOperationError("Installed plugin manifest is missing or invalid.")
+            plugin_id = old_manifest.get("name") or target.name
+            if (manifest.get("name") or target.name) != plugin_id:
+                raise PluginOperationError("Updated plugin manifest changed its name.")
+            _sanitize_plugin_name(plugin_id, plugins_dir)
+            mv = manifest.get("manifest_version", 1)
+            if isinstance(mv, bool) or not str(mv).isdigit() or not 1 <= int(mv) <= _SUPPORTED_MANIFEST_VERSION:
+                raise PluginOperationError("Updated plugin has an unsupported manifest_version.")
+            raw_capabilities = manifest.get("capabilities")
+            if raw_capabilities is not None and (
+                not isinstance(raw_capabilities, list)
+                or any(not isinstance(cap, str) for cap in raw_capabilities)
+            ):
+                raise PluginOperationError("Updated plugin has an invalid capability declaration.")
+            declared = _declared_capabilities_from_manifest(manifest, plugin_id)
+            previous = _declared_capabilities_from_manifest(old_manifest, plugin_id)
+            additions = sorted(set(declared) - set(previous))
+            if additions:
+                from hermes_cli.plugin_capabilities import capability_set_hash
+                raise PluginOperationError(
+                    f"Update {revision} requires revision-bound capability consent "
+                    f"for {', '.join(additions)} (declaration {capability_set_hash(declared)})."
+                )
+            _clear_plugin_bytecode(candidate)
+            from rich.console import Console
+            _copy_example_files(candidate, Console())
+            _scan_plugin_tree(candidate, source, force=False)
+            current_bytes = metadata_path.read_bytes() if metadata_path.exists() else None
+            if (target.stat().st_ino != old_identity.st_ino
+                    or _git_head_revision(target, git_exe) != old_revision
+                    or _plugin_update_tree_digest(target) != old_tree_digest
+                    or current_bytes != old_metadata_bytes):
+                raise PluginOperationError("Installed plugin state changed during admission.")
+            if _git_head_revision(candidate, git_exe) != revision:
+                raise PluginOperationError("Candidate revision changed during admission.")
+            new_metadata = dict(metadata)
+            new_metadata[target.name] = {**record, "source": source, "revision": revision, "pinned": False}
+            candidate_identity = candidate.stat()
+            try:
+                os.replace(target, backup)
+                os.replace(candidate, target)
+                _write_install_metadata(new_metadata)
+            except Exception as exc:
+                try:
+                    # Inspect identities even if a rename raised after taking effect.
+                    if backup.exists():
+                        if backup.stat().st_ino != old_identity.st_ino:
+                            raise PluginOperationError("Previous-tree identity is ambiguous.")
+                        if target.exists():
+                            if target.stat().st_ino != candidate_identity.st_ino:
+                                raise PluginOperationError("Publication identity is ambiguous.")
+                            os.replace(target, stage / "rejected-candidate")
+                        os.replace(backup, target)
+                    elif not target.exists() or target.stat().st_ino != old_identity.st_ino:
+                        raise PluginOperationError("Previous-tree location is ambiguous.")
+                    if old_metadata_bytes is None:
+                        metadata_path.unlink(missing_ok=True)
+                    else:
+                        atomic_write_text(metadata_path, old_metadata_bytes.decode("utf-8"))
+                except Exception as recovery_exc:
+                    retain = True
+                    raise PluginOperationError(
+                        f"Update recovery incomplete; retained previous tree/metadata at {stage}; "
+                        f"review before retrying: {recovery_exc}"
+                    ) from exc
+                raise PluginOperationError(f"Update publication failed; previous state restored: {exc}") from exc
+            return {"ok": True, "name": name, "revision": revision,
+                    "output": output.replace(str(candidate), str(target)), "unchanged": revision == old_revision}
+        finally:
+            if not retain:
+                try:
+                    shutil.rmtree(stage)
+                except OSError as exc:
+                    raise PluginOperationError(
+                        f"Update cleanup incomplete; retained state at {stage}; review before retrying: {exc}"
+                    ) from exc
+
+
 def cmd_update(name: str) -> None:
-    """Update an installed plugin by pulling latest from its git remote."""
+    """Update through the same admission owner as the authenticated dashboard."""
     from rich.console import Console
     from rich.markup import escape
-
     console = Console()
-    plugins_dir = _plugins_dir()
-
     try:
-        target = _require_installed_plugin(name, plugins_dir, console)
-    except ValueError as e:
-        console.print(f"[red]Error:[/red] {e}")
+        result = _update_plugin_core(name)
+    except Exception as exc:
+        console.print(f"[red]Error:[/red] {escape(str(exc))}")
         sys.exit(1)
-
-    try:
-        metadata = _read_install_metadata()
-    except PluginOperationError as exc:
-        console.print(f"[red]Error:[/red] {exc}")
-        sys.exit(1)
-    install_record = metadata.get(target.name, {})
-    if install_record.get("pinned") is True:
-        recorded_source = escape(str(install_record.get("source", "<source>")))
-        console.print(
-            f"[red]Error:[/red] Plugin '{name}' is pinned to "
-            f"{install_record.get('revision')}. To move it, run "
-            f"`hermes plugins install {recorded_source} --force "
-            "--ref <40-character commit SHA>`."
-        )
-        sys.exit(1)
-
-    if not (target / ".git").exists():
-        console.print(
-            f"[red]Error:[/red] Plugin '{name}' was not installed from git "
-            f"(no .git directory). Cannot update."
-        )
-        sys.exit(1)
-
-    console.print(f"[dim]Updating {name}...[/dim]")
-
-    ok, output = _git_pull_plugin_dir(target)
-    if not ok:
-        console.print(f"[red]Error:[/red] {output}")
-        sys.exit(1)
-
-    if install_record:
-        git_exe = _resolve_git_executable()
-        if git_exe:
-            install_record["revision"] = _git_head_revision(target, git_exe)
-            metadata[target.name] = install_record
-            _write_install_metadata(metadata)
-
-    # Re-scan after update — Cowork re-scans skills/plugins on edit, and an
-    # update can introduce malicious content into a previously clean plugin.
-    # The pull has already mutated the tree, so a dangerous verdict disables
-    # the plugin rather than leaving it active.
-    if _scan_on_install_enabled():
-        from tools.plugin_guard import (
-            format_scan_report,
-            scan_plugin,
-            should_allow_plugin_install,
-        )
-
-        scan_result = scan_plugin(target, source=name)
-        allowed, reason = should_allow_plugin_install(scan_result)
-        if allowed is not True:
-            console.print()
-            console.print(
-                f"[yellow]⚠ Security scan flagged the updated plugin:[/yellow] {reason}",
-            )
-            console.print(format_scan_report(scan_result))
-            if scan_result.verdict == "dangerous":
-                enabled = _get_enabled_set()
-                disabled = _get_disabled_set()
-                if name in enabled or name not in disabled:
-                    enabled.discard(name)
-                    disabled.add(name)
-                    _save_enabled_set(enabled)
-                    _save_disabled_set(disabled)
-                console.print(
-                    f"[red]Plugin '{name}' has been disabled.[/red] Review the "
-                    f"findings, then re-enable with `hermes plugins enable {name}` "
-                    f"if you trust them.",
-                )
-
-    # Same stale-bytecode class as the main checkout (#6207/#60242): the
-    # pull just changed .py files under this plugin dir, so drop any
-    # __pycache__ compiled from the previous revision.
-    _clear_plugin_bytecode(target)
-
-    # Copy any new .example files
-    _copy_example_files(target, console)
-
-    # Update-time re-consent (#64228): if the new version declares
-    # capabilities the granted set lacks, surface the diff and require
-    # re-consent for the additions. The stored consent hash detects a
-    # changed declaration; additions stay ungranted until the user says yes
-    # (non-interactive updates leave them ungranted — fail closed).
-    updated_manifest = _read_manifest(target)
-    plugin_id = updated_manifest.get("name") or target.name
-    declared_caps = _declared_capabilities_from_manifest(
-        updated_manifest, plugin_id
-    )
-    if declared_caps:
-        from hermes_cli.plugin_capabilities import (
-            declared_set_changed,
-            pending_capabilities,
-        )
-        if pending_capabilities(plugin_id, declared_caps) or declared_set_changed(
-            plugin_id, declared_caps
-        ):
-            _run_capability_consent(
-                console, plugin_id, declared_caps, context="update"
-            )
-
-    out = output.strip()
-    if "Already up to date" in out:
-        console.print(
-            f"[green]✓[/green] Plugin [bold]{name}[/bold] is already up to date."
-        )
-    else:
-        console.print(f"[green]✓[/green] Plugin [bold]{name}[/bold] updated.")
-        console.print(f"[dim]{out}[/dim]")
+    console.print(f"[green]✓[/green] Plugin {escape(name)} updated to {result['revision']}.")
 
 
 def _remove_plugin_core(target: Path) -> None:
@@ -2834,56 +2892,11 @@ def _user_installed_plugin_dir(name: str) -> Optional[Path]:
 
 
 def dashboard_update_user_plugin(name: str) -> dict[str, Any]:
-    """``git pull`` inside ``~/.hermes/plugins/<name>``."""
-    target = _user_installed_plugin_dir(name)
-    if target is None:
-        return {
-            "ok": False,
-            "error": f"Plugin '{name}' was not found under {_plugins_dir()}.",
-        }
-
+    """Authenticated HTTP adapter for canonical staged update admission."""
     try:
-        metadata = _read_install_metadata()
-    except PluginOperationError as exc:
+        return _update_plugin_core(name)
+    except Exception as exc:
         return {"ok": False, "error": str(exc)}
-    install_record = metadata.get(target.name, {})
-    if install_record.get("pinned") is True:
-        recorded_source = install_record.get("source", "<source>")
-        return {
-            "ok": False,
-            "error": (
-                f"Plugin '{name}' is pinned to {install_record.get('revision')}; "
-                f"run `hermes plugins install {recorded_source} --force "
-                "--ref <40-character commit SHA>` to move it."
-            ),
-        }
-
-    if not (target / ".git").exists():
-        return {
-            "ok": False,
-            "error": f"Plugin '{name}' is not a git checkout; cannot pull updates.",
-        }
-
-    ok, msg = _git_pull_plugin_dir(target)
-    if not ok:
-        return {"ok": False, "error": msg}
-
-    if install_record:
-        git_exe = _resolve_git_executable()
-        if git_exe:
-            install_record["revision"] = _git_head_revision(target, git_exe)
-            metadata[target.name] = install_record
-            _write_install_metadata(metadata)
-
-    # Sibling of the CLI ``hermes plugins update`` path: drop bytecode
-    # compiled from the pre-pull plugin revision.
-    _clear_plugin_bytecode(target)
-
-    from rich.console import Console
-
-    _copy_example_files(target, Console())
-    unchanged = "Already up to date" in msg
-    return {"ok": True, "name": name, "output": msg, "unchanged": unchanged}
 
 
 def _clear_plugin_bytecode(target: Path) -> int:

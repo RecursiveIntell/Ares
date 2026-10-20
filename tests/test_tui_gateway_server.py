@@ -10405,17 +10405,20 @@ def test_session_compress_forwards_120_second_budget_to_compute_host(monkeypatch
         server._sessions.pop("sid", None)
 
     assert resp["result"]["status"] == "compressed"
-    assert calls == [
-        (
-            ("sid",),
-            {
-                "route_name": "session.compress",
-                "command": "/compress",
-                "wait": True,
-                "timeout": 120.0,
-            },
-        )
-    ]
+    # The 120s budget must reach the host unchanged. Since the manual-compress
+    # change the call also carries the serving gateway's session snapshot so
+    # the host can rebuild a resumed session before compressing it; assert the
+    # contract, not a brittle full-dict snapshot.
+    assert len(calls) == 1
+    (call_args, call_kwargs) = calls[0]
+    assert call_args == ("sid",)
+    assert call_kwargs["route_name"] == "session.compress"
+    assert call_kwargs["command"] == "/compress"
+    assert call_kwargs["wait"] is True
+    assert call_kwargs["timeout"] == 120.0
+    _snapshot = call_kwargs["payload"]["session_snapshot"]
+    assert _snapshot["type"] == "turn.start"
+    assert _snapshot["sid"] == "sid"
 
 
 def test_session_compress_preserves_compute_host_aborted_summary(monkeypatch):

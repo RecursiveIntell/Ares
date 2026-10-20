@@ -150,7 +150,8 @@ def test_chain_pending_keeps_order_and_does_not_settle(monkeypatch, projection_e
     output = io.StringIO()
     host = ComputeHost(stdout=output, heartbeat_secs=0)
     try:
-        host._emit_real_turn_terminal({"type": "turn.end", "sid": "s", "request_id": "A"})
+        host._admitted_request_sessions["s"] = ("A", session)
+        host._emit_real_turn_terminal({"type": "turn.end", "sid": "s", "request_id": "A"}, admitted_session=session)
     finally:
         host.close()
     outcome = json.loads(output.getvalue())["turn_outcome"]

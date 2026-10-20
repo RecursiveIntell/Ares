@@ -6,6 +6,10 @@ on:
       review_status:
         description: Screenshot and visual-diff status for the CI review comment.
         value: ${{ jobs.e2e.outputs.review_status }}
+  # Reachable on demand while the ci.yaml caller stays intentionally disabled
+  # (Aug 2 2026 team decision, tracking #76627): run the native security
+  # witnesses from the Actions UI / API without re-enabling the parked lane.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -76,6 +80,25 @@ jobs:
         uses: ./.github/actions/retry
         with:
           command: uv sync --locked --python 3.11 --extra all --extra dev
+
+      # Native authority witnesses use real Electron and the matched Python
+      # backend. Keep them out of the Node-only workspace matrix, not out of CI.
+      - name: Run normal-sandbox native security witnesses
+        env:
+          P2_FIXTURE_PYTHON: ${{ github.workspace }}/.venv/bin/python
+          P1A_EVIDENCE_DIR: ${{ runner.temp }}/native-security-evidence
+        run: |
+          mkdir -p "$P1A_EVIDENCE_DIR"
+          npm run --workspace apps/desktop test:desktop:native -- --maxWorkers=1
+
+      - name: Upload native security witness evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: native-security-evidence
+          path: ${{ runner.temp }}/native-security-evidence
+          if-no-files-found: error
+          retention-days: 7
 
       # ── Build desktop app ─────────────────────────────────────────────
       # The Playwright step below runs `npm run build` before testing so

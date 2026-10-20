@@ -3,6 +3,7 @@ import { reconnectBackoffDelayMs } from '@/lib/reconnect-backoff'
 import { RECONNECT_ATTEMPT_TIMEOUT_MS, withTimeout } from '@/lib/with-timeout'
 
 import { getApiRequestConnection, getApiRequestProfile, hermesApi, profileScoped } from './client'
+import { NativeRendererSocket, nativeRoute } from './native-socket'
 
 /** Resolve the ACTIVE backend's connection descriptor, (connectionId,
  *  profile)-scoped — mirroring how store/profile resolves $connection: a
@@ -94,24 +95,38 @@ export async function pluginRest<T>(pluginId: string, path: string, opts: Plugin
 export function pluginSocket(pluginId: string, path: string, onMessage: (data: unknown) => void): () => void {
   const suffix = pluginPathSuffix('pluginSocket', path)
 
-  let socket: null | WebSocket = null
+  let socket: null | WebSocket | NativeRendererSocket = null
   let disposed = false
   let attempt = 0
 
   const connect = async () => {
-    const connection = await activeConnection().catch(() => null)
+    const native = window.hermesDesktop?.nativeSocket
 
-    // No bridge / OAuth cookie auth (WS tickets are single-use, core-managed):
-    // stay on the polling fallback rather than half-working.
-    if (disposed || !connection || connection.authMode === 'oauth') {
-      return
+    if (native) {
+      if (disposed) {
+        return
+      }
+
+      socket = new NativeRendererSocket(native, nativeRoute(getApiRequestProfile(), getApiRequestConnection()), {
+        kind: 'plugin',
+        pluginId,
+        suffix
+      })
+    } else {
+      const connection = await activeConnection().catch(() => null)
+
+      // No bridge / OAuth cookie auth (WS tickets are single-use, core-managed):
+      // stay on the polling fallback rather than half-working.
+      if (disposed || !connection || connection.authMode === 'oauth') {
+        return
+      }
+
+      const base = connection.baseUrl.replace(/^http/, 'ws')
+      const join = suffix.includes('?') ? '&' : '?'
+      socket = new WebSocket(
+        `${base}/api/plugins/${pluginId}${suffix}${join}token=${encodeURIComponent(connection.token)}`
+      )
     }
-
-    const base = connection.baseUrl.replace(/^http/, 'ws')
-    const join = suffix.includes('?') ? '&' : '?'
-    socket = new WebSocket(
-      `${base}/api/plugins/${pluginId}${suffix}${join}token=${encodeURIComponent(connection.token)}`
-    )
 
     socket.onmessage = event => {
       attempt = 0
@@ -123,10 +138,10 @@ export function pluginSocket(pluginId: string, path: string, onMessage: (data: u
       }
     }
 
-    socket.onclose = () => {
+    socket.onclose = event => {
       socket = null
 
-      if (!disposed) {
+      if (!disposed && event.code !== 1008) {
         // Full-jitter exponential backoff: same rationale as the gateway
         // socket reconnect loops — an immediate-retry loop across many
         // desktop clients floods the gateway with connection attempts

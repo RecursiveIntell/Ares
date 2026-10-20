@@ -913,12 +913,17 @@ export function useTerminalSession({
 
       term.open(host)
       mountedRef.current = true
-      cleanup.push(registerTerminalFocus(id, () => {
-        if (!terminalHostVisible(host)) { return false }
-        term.focus()
+      cleanup.push(
+        registerTerminalFocus(id, () => {
+          if (!terminalHostVisible(host)) {
+            return false
+          }
 
-        return true
-      }))
+          term.focus()
+
+          return true
+        })
+      )
 
       // WebGL renderer matches the dashboard ChatPage path; xterm's default DOM
       // renderer paints SGR via CSS classes that visibly mute against our skins.

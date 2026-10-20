@@ -448,13 +448,7 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
         }
       }
     }
-  }, [
-    bindRecoveredRuntime,
-    copy,
-    readState,
-    requestSessionGateway,
-    update
-  ])
+  }, [bindRecoveredRuntime, copy, readState, requestSessionGateway, update])
 
   const steerPrompt = useCallback(
     async (rawText: string): Promise<boolean> => {

@@ -78,13 +78,17 @@ export function registerFsIpc({
   // it yields `undefined/desktop-plugins` (or a non-existent remote path) and the
   // on-disk plugin door silently breaks (#66899). Electron owns this resolution
   // so it stays valid in every connection mode. Created on demand, like openDir.
-  async function localPluginsRoot(dirName: string): Promise<string> {
+  async function localPluginsRoot(dirName: string, create = true): Promise<string> {
     // Profile-aware: a named Desktop profile gets its own plugin root under
     // profiles/<name>/, matching the profile-scoped hermes_home the backend
     // reported before this resolver existed. 'default'/unset pins the global root.
     const profile = readActiveDesktopProfile()
     const base = profile && profile !== 'default' ? path.join(hermesHome, 'profiles', profile) : hermesHome
     const dir = path.join(base, dirName)
+
+    if (!create) {
+      return dir
+    }
 
     try {
       await fs.promises.mkdir(dir, { recursive: true })
@@ -112,9 +116,9 @@ export function registerFsIpc({
   ipcMain.handle('hermes:fs:agentPluginsRoot', async () => localPluginsRoot('plugins'))
 
   ipcMain.handle('hermes:plugin:probe', async (_event, payload) => {
-    const identifier = String(payload?.identifier || payload?.repo || '').trim()
+    const identifier = String(payload?.identifier || payload?.repo || '')
 
-    if (!identifier) {
+    if (!identifier.trim()) {
       return { ok: false, error: 'identifier is required', agent: false, desktop: false, warnings: [] }
     }
 
@@ -122,15 +126,24 @@ export function registerFsIpc({
   })
 
   ipcMain.handle('hermes:plugin:installDesktop', async (_event, payload) => {
-    const identifier = String(payload?.identifier || payload?.repo || '').trim()
+    const identifier = String(payload?.identifier || payload?.repo || '')
 
-    if (!identifier) {
+    if (!identifier.trim()) {
       return { ok: false, error: 'identifier is required' }
     }
 
-    const desktopPluginsRoot = await localPluginsRoot('desktop-plugins')
+    // Installation owns creation only after independent destination validation.
+    const desktopPluginsRoot = await localPluginsRoot('desktop-plugins', false)
 
-    return installDesktopPluginFromGit(resolveGitBinary(), identifier, desktopPluginsRoot, Boolean(payload?.force))
+    // Only a literal `true` may replace an existing plugin: structured-clone
+    // payloads can carry strings such as "false", which Boolean() would enable.
+    return installDesktopPluginFromGit(
+      resolveGitBinary(),
+      identifier,
+      desktopPluginsRoot,
+      payload?.force === true,
+      payload?.revision
+    )
   })
 
   // Rename a file/folder in place. The renderer passes the existing path + a new

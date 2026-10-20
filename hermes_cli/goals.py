@@ -1480,6 +1480,40 @@ def _render_background_block(background_processes: Optional[List[Dict[str, Any]]
     return JUDGE_BACKGROUND_BLOCK_TEMPLATE.format(background_lines="\n".join(lines))
 
 
+def _goal_judge_opencode_headers(session_id: Optional[str]) -> Dict[str, str]:
+    """Return explicit affinity headers for the goal-judge auxiliary call.
+
+    The OpenCode relay requires ``x-opencode-session`` on every request.
+    The shared ``_build_call_kwargs`` helper only sees ambient
+    ``_runtime_main_value`` state, which is empty when the judge runs
+    outside the main turn (post-turn executor, gateway continuation).
+    Passing the goal's own ``session_id`` explicitly restores the intended
+    fallback: ambient conversation context wins when present, otherwise the
+    goal session scopes the judge call. Non-OpenCode targets return {}.
+    Fail-open: any import/config error yields {} (old behavior).
+    """
+    try:
+        from agent.opencode_affinity import opencode_session_headers
+    except Exception:
+        return {}
+    provider = "opencode-go"
+    base_url = ""
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        aux = (cfg.get("auxiliary") or {}).get("goal_judge") or {}
+        provider = str(aux.get("provider") or provider)
+        base_url = str(aux.get("base_url") or "")
+    except Exception:
+        pass
+    try:
+        sid = (session_id or "").strip() or None
+        return opencode_session_headers(provider, base_url, sid)
+    except Exception:
+        return {}
+
+
 def judge_goal(
     goal: str,
     last_response: str,
@@ -1488,6 +1522,7 @@ def judge_goal(
     subgoals: Optional[List[str]] = None,
     background_processes: Optional[List[Dict[str, Any]]] = None,
     contract: Optional[GoalContract] = None,
+    session_id: Optional[str] = None,
 ) -> Tuple[str, str, bool, Optional[Dict[str, Any]], bool]:
     """Ask the auxiliary model whether the goal is satisfied.
 
@@ -1588,6 +1623,12 @@ def judge_goal(
         # Route through call_llm so auxiliary.goal_judge.* config
         # (provider/model/base_url, extra_body, reasoning_effort, retries)
         # all apply — the direct-create path dropped extra_body (#35566).
+        # Explicit opencode affinity: the shared _build_call_kwargs only sees
+        # ambient runtime state, which is empty in post-turn/gateway judge
+        # context. Passing the goal session keeps glm-5.3-flash on
+        # opencode-go routable (MissingSessionID 400 fix). Non-opencode
+        # targets get {} (no-op).
+        _judge_extra_headers = _goal_judge_opencode_headers(session_id)
         resp = call_llm(
             task="goal_judge",
             messages=[
@@ -1597,10 +1638,11 @@ def judge_goal(
             temperature=0,
             max_tokens=_goal_judge_max_tokens(),
             timeout=timeout,
+            extra_headers=_judge_extra_headers or None,
         )
     except Exception as exc:
         logger.info("goal judge: API call failed (%s) — falling through to continue", exc)
-        return "continue", f"judge error: {type(exc).__name__}", False, None, True
+        return "continue", f"judge error: {type(exc).__name__}: {_truncate(str(exc), 300)}", False, None, True
 
     try:
         raw = resp.choices[0].message.content or ""
@@ -1636,7 +1678,7 @@ def gather_background_processes(task_id: Optional[str] = None) -> List[Dict[str,
     return [s for s in sessions if isinstance(s, dict) and s.get("status") != "exited"]
 
 
-def draft_contract(objective: str, *, timeout: Optional[float] = None) -> Optional[GoalContract]:
+def draft_contract(objective: str, *, timeout: Optional[float] = None, session_id: Optional[str] = None) -> Optional[GoalContract]:
     """Expand a plain-language objective into a structured completion contract.
 
     Uses the ``goal_judge`` auxiliary task (main-model-first, cache-safe — it
@@ -1661,6 +1703,8 @@ def draft_contract(objective: str, *, timeout: Optional[float] = None) -> Option
 
     try:
         # Route through call_llm — same #35566 fix as the judge call above.
+        # Same opencode affinity as judge_goal: keep glm-5.3-flash routable.
+        _draft_extra_headers = _goal_judge_opencode_headers(session_id)
         resp = call_llm(
             task="goal_judge",
             messages=[
@@ -1670,6 +1714,7 @@ def draft_contract(objective: str, *, timeout: Optional[float] = None) -> Option
             temperature=0,
             max_tokens=_goal_judge_max_tokens(),
             timeout=timeout,
+            extra_headers=_draft_extra_headers or None,
         )
     except Exception as exc:
         logger.info("goal draft: API call failed (%s)", exc)
@@ -1773,6 +1818,14 @@ def goal_resume_state(before: str, *, reset_budget: bool, operator_action_id: st
         return state
     state.recovery_episode_attempts = 0
     state.last_recovery_reason = None
+    # Operator resume re-arms judge health: a healed provider/key must not
+    # instant-re-pause on the next turn because stale consecutive counters
+    # survived the pause. Transport/parse streaks are per-episode signals;
+    # execution_failures likewise restarts the 2-strike budget stop so one
+    # post-resume provider blip does not immediately re-pause.
+    state.consecutive_parse_failures = 0
+    state.consecutive_transport_failures = 0
+    state.execution_failures = 0
     previous = dict(state.checkpoint or {})
     barrier = state.outcome in {GOAL_BLOCKED, WAITING_FOR_AUTHORITY} or bool(previous.get("blocker_kind") or previous.get("blockers"))
     outcome = state.outcome if barrier else CONTINUATION_REQUIRED
@@ -2958,6 +3011,7 @@ class GoalManager:
             subgoals=state.subgoals or None,
             background_processes=background_processes,
             contract=state.contract if state.has_contract() else None,
+            session_id=self.session_id,
         )
         parse_failed = parse_failed or verdict not in {"done", "continue", "wait", "blocked"}
         if parse_failed or transport_failed:
@@ -3058,9 +3112,10 @@ class GoalManager:
             state.outcome = PROVIDER_FAILED
             state.last_stop_reason = "provider/judge transport failure threshold reached"
             state.next_action = "repair provider configuration, then /goal resume"
+            _last_judge_detail = _truncate(reason, 200)
             state.paused_reason = (
                 f"judge API unreachable {state.consecutive_transport_failures} turns in a row "
-                f"(check auxiliary.goal_judge provider/key in config.yaml)"
+                f"({_last_judge_detail}; check auxiliary.goal_judge provider/key in config.yaml)"
             )
             save_goal(self.session_id, state)
             return {
@@ -3072,6 +3127,7 @@ class GoalManager:
                 "message": (
                     f"⏸ Goal paused — judge API returned errors "
                     f"({state.consecutive_transport_failures} turns). "
+                    f"Last error: {_last_judge_detail}\n"
                     "Check the goal_judge provider/key in ~/.hermes/config.yaml:\n"
                     "  auxiliary:\n"
                     "    goal_judge:\n"
@@ -3092,8 +3148,10 @@ class GoalManager:
             state.outcome = PROVIDER_FAILED
             state.last_stop_reason = "malformed judge output threshold reached"
             state.next_action = "repair judge/provider output contract, then /goal resume"
+            _last_parse_detail = _truncate(reason, 200)
             state.paused_reason = (
-                f"judge model returned unparseable output {state.consecutive_parse_failures} turns in a row"
+                f"judge model returned unparseable output {state.consecutive_parse_failures} turns in a row "
+                f"({_last_parse_detail})"
             )
             save_goal(self.session_id, state)
             return {
@@ -3104,7 +3162,9 @@ class GoalManager:
                 "reason": reason,
                 "message": (
                     f"⏸ Goal paused — the judge model ({state.consecutive_parse_failures} turns) "
-                    "isn't returning the required JSON verdict. Route the judge to a stricter "
+                    "isn't returning the required JSON verdict. "
+                    f"Last output: {_last_parse_detail}\n"
+                    "Route the judge to a stricter "
                     "model in ~/.hermes/config.yaml:\n"
                     "  auxiliary:\n"
                     "    goal_judge:\n"

@@ -1,101 +1,127 @@
-/**
- * Helpers for local dashboard session-token discovery.
- *
- * The desktop main process can pass HERMES_DASHBOARD_SESSION_TOKEN when it
- * spawns the local dashboard, but the dashboard is the source of truth for the
- * token it actually serves to the renderer. If those drift, HTTP readiness
- * probes still pass while /api/ws rejects the renderer's token.
- */
+/** Child-secret possession proof. Request/response contain no raw secret or bearer. */
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 
 const DEFAULT_TOKEN_FETCH_TIMEOUT_MS = 3_000
+const PROTOCOL = 'hermes-native-v1'
 
-async function fetchPublicText(url, options: any = {}) {
-  const { protocol } = new URL(url)
-
-  if (protocol !== 'http:' && protocol !== 'https:') {
-    throw new Error(`Unsupported Hermes backend URL protocol: ${protocol}`)
-  }
-
-  const timeoutMs = options.timeoutMs ?? DEFAULT_TOKEN_FETCH_TIMEOUT_MS
-
-  const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) }).catch(error => {
-    if (error.name === 'TimeoutError') {
-      throw new Error(`Timed out connecting to Hermes backend after ${timeoutMs}ms`)
-    }
-
-    throw error
-  })
-
-  const text = await res.text()
-
-  if (!res.ok) {
-    throw new Error(`${res.status}: ${text || res.statusText}`)
-  }
-
-  return text
+function mac(key: string, parts: unknown[]): string {
+  return createHmac('sha256', key).update(JSON.stringify(parts), 'utf8').digest('hex')
 }
 
-function extractInjectedDashboardToken(html) {
-  const match = /window\.__HERMES_SESSION_TOKEN__\s*=\s*("(?:\\.|[^"\\])*")/.exec(String(html || ''))
+function equalHex(actual: unknown, expected: string): boolean {
+  return (
+    typeof actual === 'string' &&
+    /^[0-9a-f]{64}$/.test(actual) &&
+    timingSafeEqual(Buffer.from(actual, 'hex'), Buffer.from(expected, 'hex'))
+  )
+}
 
-  if (!match) {
-    return null
+async function boundedJson(response: Response): Promise<any> {
+  const reader = response.body?.getReader()
+
+  if (!reader) {
+    throw new Error('Missing native bootstrap proof')
   }
+
+  const chunks: Uint8Array[] = []
+  let size = 0
 
   try {
-    return JSON.parse(match[1])
-  } catch {
-    return null
-  }
-}
+    while (true) {
+      const row = await reader.read()
 
-function dashboardIndexUrl(baseUrl) {
-  return `${String(baseUrl || '').replace(/\/+$/, '')}/`
+      if (row.done) {
+        break
+      }
+
+      size += row.value.length
+
+      if (size > 4096) {
+        await reader.cancel()
+        throw new Error('Oversized native bootstrap proof')
+      }
+
+      chunks.push(row.value)
+    }
+  } finally {
+    reader.releaseLock()
+  }
+
+  return JSON.parse(Buffer.concat(chunks).toString('utf8'))
 }
 
 async function resolveServedDashboardToken(baseUrl, fallbackToken, options: any = {}) {
-  const fetchText = options.fetchText || fetchPublicText
-
-  const html = await fetchText(dashboardIndexUrl(baseUrl), {
-    timeoutMs: options.timeoutMs ?? DEFAULT_TOKEN_FETCH_TIMEOUT_MS
-  })
-
-  const servedToken = extractInjectedDashboardToken(html)
-
-  if (servedToken && servedToken !== fallbackToken && typeof options.rememberLog === 'function') {
-    options.rememberLog('[boot] dashboard served a different session token; using served token for WebSocket auth')
+  // The SSH path owns its independent pinned-token/endpoint proof. No HTML scraping.
+  if (options.bootstrapKey === undefined && options.identity === undefined) {
+    return fallbackToken
   }
 
-  return servedToken || fallbackToken
-}
+  const key = options.bootstrapKey
+  const identity = options.identity
 
-/**
- * A served token that differs from our spawn token while our child is DEAD
- * came from a process we did not spawn (orphan/port squatter that satisfied
- * the public /api/status readiness probe). With a live child the mismatch is
- * benign: our own backend regenerated the token because the env pin did not
- * survive the spawn.
- */
-function isForeignBackendToken({ servedToken, spawnToken, childAlive }) {
-  return Boolean(servedToken) && servedToken !== spawnToken && !childAlive
-}
+  if (
+    typeof key !== 'string' ||
+    !/^[\x21-\x7e]{32,256}$/.test(key) ||
+    typeof identity !== 'string' ||
+    !/^[A-Za-z0-9_-]{1,128}$/.test(identity) ||
+    typeof fallbackToken !== 'string' ||
+    !/^[\x21-\x7e]{1,256}$/.test(fallbackToken)
+  ) {
+    throw new Error('Native bootstrap pairing unavailable; update Desktop and local backend together.')
+  }
 
-/**
- * Resolve the token the backend actually serves, adopting benign drift and
- * failing loudly on a foreign backend. `childAlive` is a thunk so liveness is
- * sampled after the fetch, not before.
- */
-async function adoptServedDashboardToken(baseUrl, spawnToken, { childAlive, label = 'Hermes backend', ...options }) {
-  const servedToken = await resolveServedDashboardToken(baseUrl, spawnToken, options).catch(error => {
-    options.rememberLog?.(`[boot] could not read served dashboard token (${label}): ${error.message}`)
+  const endpoint = new URL('/auth/desktop-bootstrap', baseUrl).toString()
+  const nonce = randomBytes(32).toString('hex')
+  const issued = Math.floor(Date.now() / 1000)
+  const parts = [PROTOCOL, 'request', endpoint, identity, nonce, issued]
 
-    return spawnToken
+  const response = await (options.fetch || fetch)(endpoint, {
+    headers: {
+      'X-Hermes-Native-Identity': identity,
+      'X-Hermes-Native-Nonce': nonce,
+      'X-Hermes-Native-Issued': String(issued),
+      'X-Hermes-Native-Proof': mac(key, parts)
+    },
+    redirect: 'error',
+    signal: AbortSignal.timeout(options.timeoutMs ?? DEFAULT_TOKEN_FETCH_TIMEOUT_MS)
   })
 
-  if (isForeignBackendToken({ servedToken, spawnToken, childAlive: childAlive() })) {
-    throw new Error(
-      `${label} exited and ${dashboardIndexUrl(baseUrl)} is served by a process we did not spawn; refusing its session token.`
-    )
+  if (response.status !== 200) {
+    throw new Error(`Native bootstrap denied (${response.status}); update Desktop and local backend together.`)
+  }
+
+  const result = await boundedJson(response)
+  const digest = createHash('sha256').update(fallbackToken, 'utf8').digest('hex')
+  const fields = ['identity', 'issued_at', 'nonce', 'proof', 'protocol', 'session_digest']
+
+  if (
+    !result ||
+    typeof result !== 'object' ||
+    Array.isArray(result) ||
+    Object.keys(result).sort().join(',') !== fields.join(',') ||
+    result.protocol !== PROTOCOL ||
+    result.identity !== identity ||
+    result.nonce !== nonce ||
+    result.issued_at !== issued ||
+    !equalHex(result.session_digest, digest) ||
+    !equalHex(result.proof, mac(key, [PROTOCOL, 'response', endpoint, identity, nonce, issued, digest]))
+  ) {
+    throw new Error('Native backend possession/token binding mismatch')
+  }
+
+  // Nothing from the listener is adopted as a new credential.
+  return fallbackToken
+}
+
+async function adoptServedDashboardToken(baseUrl, spawnToken, { childAlive, label = 'Hermes backend', ...options }) {
+  if (!childAlive()) {
+    throw new Error(`${label} exited; refusing its session token.`)
+  }
+
+  const servedToken = await resolveServedDashboardToken(baseUrl, spawnToken, options)
+
+  if (!childAlive()) {
+    throw new Error(`${label} exited during native bootstrap.`)
   }
 
   return servedToken
@@ -103,10 +129,7 @@ async function adoptServedDashboardToken(baseUrl, spawnToken, { childAlive, labe
 
 export {
   adoptServedDashboardToken,
-  dashboardIndexUrl,
   DEFAULT_TOKEN_FETCH_TIMEOUT_MS,
-  extractInjectedDashboardToken,
-  fetchPublicText,
-  isForeignBackendToken,
+  mac as nativeBootstrapMac,
   resolveServedDashboardToken
 }

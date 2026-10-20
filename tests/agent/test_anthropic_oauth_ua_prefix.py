@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import re
 from unittest.mock import MagicMock, patch
+from tests.agent.sdk_factory_fixtures import constructor_httpx_backend
 
 import pytest
 
@@ -29,7 +30,7 @@ class TestOAuthUserAgentPrefix:
         from agent.anthropic_adapter import build_anthropic_client
 
         mock_sdk = MagicMock()
-        with patch("agent.anthropic_adapter._get_anthropic_sdk", return_value=mock_sdk):
+        with patch("agent.anthropic_adapter._get_anthropic_sdk", return_value=mock_sdk), constructor_httpx_backend(mock_sdk):
             build_anthropic_client("sk-ant-oauth-abc123", "https://api.anthropic.com")
 
         # Inspect the kwargs passed to Anthropic()

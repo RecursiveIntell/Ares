@@ -180,4 +180,109 @@ class ManagedCallContextV1(ImmutableArtifact):
         return cls(full, "context_digest")
 
 
-__all__ = ["MANAGED_CALL_CONTEXT_SCHEMA", "ManagedCallContextV1"]
+# V2 is deliberately a narrower ordinary-call correlation contract, NOT a
+# relaxed V1. No V1 obligation is asserted absent/not-required by this version.
+MANAGED_CALL_CONTEXT_V2_SCHEMA = "ares.managed-call-context/v2"
+_V2_FIELDS = frozenset({
+    "schema_version", "scope", "integration_claims", "call_ref", "session_ref",
+    "session_generation", "turn_ref", "input_digest", "source_revision",
+    "source_digest", "provider_identity", "model_ref", "api_mode", "purpose",
+    "request_projection_schema", "request_digest", "context_digest",
+})
+
+
+@dataclass(frozen=True)
+class ManagedCallContextV2(ImmutableArtifact):
+    """Closed nonauthorizing normal-model-call correlation; not V1 compliance."""
+
+    @classmethod
+    def create(cls, values: Mapping[str, Any]) -> "ManagedCallContextV2":
+        value = dict(values)
+        for name, default in (
+            ("schema_version", MANAGED_CALL_CONTEXT_V2_SCHEMA),
+            ("scope", "normal_model_call"), ("integration_claims", "not_claimed"),
+            ("request_projection_schema", "ares-json-sorted-v1"),
+        ):
+            value.setdefault(name, default)
+        value.pop("context_digest", None)
+        return cls.parse(_finalize(value, "context_digest"))
+
+    @classmethod
+    def parse(cls, raw: Mapping[str, Any]) -> "ManagedCallContextV2":
+        value = _strict_payload(raw, set(_V2_FIELDS), set(_V2_FIELDS), "context_digest")
+        if (value["schema_version"] != MANAGED_CALL_CONTEXT_V2_SCHEMA
+                or value["scope"] != "normal_model_call"
+                or value["integration_claims"] != "not_claimed"
+                or value["request_projection_schema"] != "ares-json-sorted-v1"):
+            raise ContractError("UNSUPPORTED_MANAGED_CALL_CONTEXT")
+        for name in ("call_ref", "session_ref", "turn_ref", "source_revision",
+                     "provider_identity", "model_ref", "api_mode"):
+            _check_ref(value[name], name)
+        if value["purpose"] not in _MANAGED_CALL_CONTEXT_PURPOSES:
+            raise ContractError("UNSUPPORTED_CALL_PURPOSE")
+        if type(value["session_generation"]) is not int or value["session_generation"] < 0:
+            raise ContractError("INVALID_SESSION_GENERATION")
+        for name in ("input_digest", "source_digest", "request_digest"):
+            if not _is_algorithm_digest(value[name]):
+                raise ContractError("INVALID_DIGEST", name)
+        return cls({**value, "context_digest": raw["context_digest"]}, "context_digest")
+
+
+def logical_request_bytes(payload: Mapping[str, Any]) -> bytes:
+    """Exact ares-json-sorted-v1 preimage; rejects lossy/non-JSON members."""
+    import json
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":"), allow_nan=False).encode("utf-8")
+
+
+import contextvars
+from contextlib import contextmanager
+
+_model_call_owner = contextvars.ContextVar("ares_model_call_owner", default=None)
+
+
+@contextmanager
+def model_call_owner_scope(agent):
+    """Host-owned live turn binding; automatically restored across nested turns."""
+    token = _model_call_owner.set(agent)
+    try:
+        yield
+    finally:
+        _model_call_owner.reset(token)
+
+
+def produce_dispatch_materialization(agent, payload, *, purpose, route=None):
+    """Use actual source, SessionDB, input-phase and lease owners or qualify none.
+
+    A missing owner is data, not authorization. The consuming enforce governor
+    must reject qualification_error; observe must explicitly record unwitnessed.
+    No prompt content is persisted, only its logical projection digest.
+    """
+    import hashlib
+    agent = agent if agent is not None else _model_call_owner.get()
+    route = route or {}
+    if not getattr(agent, "session_id", None):
+        return {"materialization": None, "qualification_error": "SESSION_IDENTITY_UNAVAILABLE"}
+    db = getattr(agent, "_session_db", None)
+    if not callable(getattr(type(db), "record_model_dispatch_materialization", None)):
+        return {"materialization": None, "qualification_error": "SESSION_OWNER_UNAVAILABLE"}
+    from ares_runtime.local_runtime import read_dispatch_source_identity
+    from hermes_state_continuity import ContextContinuationError
+    try:
+        source = read_dispatch_source_identity()
+        request_digest = "sha256:" + hashlib.sha256(logical_request_bytes(payload)).hexdigest()
+        artifact = db.record_model_dispatch_materialization(
+            agent.session_id,
+            turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
+            source=source, request_digest=request_digest, purpose=purpose,
+            provider_identity=route.get("provider") or getattr(agent, "provider", None),
+            model_ref=payload.get("model") or getattr(agent, "model", None),
+            api_mode=route.get("api_mode") or getattr(agent, "api_mode", None),
+        )
+    except (ContractError, ContextContinuationError, ValueError, TypeError) as error:
+        return {"materialization": None, "qualification_error": getattr(error, "code", "MATERIALIZATION_UNAVAILABLE")}
+    return {"materialization": artifact, "qualification_error": None}
+
+
+__all__ = ["MANAGED_CALL_CONTEXT_SCHEMA", "ManagedCallContextV1", "ManagedCallContextV2",
+           "produce_dispatch_materialization", "logical_request_bytes"]

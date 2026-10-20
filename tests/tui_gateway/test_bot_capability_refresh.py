@@ -20,6 +20,7 @@ class FakeAgent:
     """Inert constructor/provider boundary; admission and SQLite stay real."""
     def __init__(self, **kw):
         self.__dict__.update(kw)
+        self._primary_runtime = {"service_tier_intent": kw.get("service_tier")}
         self._session_db = kw["session_db"]
         self._owns_session_db = False
         self._session_title_hint = "Bot Chat"
@@ -152,6 +153,7 @@ def test_real_prompt_refresh_keeps_admitted_receipt_and_messages_in_target(env):
                                            ({"effort": "high"}, "priority")])
 def test_refresh_keeps_effective_runtime_not_stale_session_metadata(env, mode, reasoning, tier):
     env.old.reasoning_config, env.old.service_tier = reasoning, tier
+    env.old._primary_runtime["service_tier_intent"] = tier
     if tier == "priority":
         # A priority-tier preservation witness needs a Fast-capable model;
         # the arbitrary default fixture model deliberately has no capability.
@@ -176,6 +178,36 @@ def test_refresh_keeps_effective_runtime_not_stale_session_metadata(env, mode, r
     assert new.client_closes == []
     assert env.target.get_session(KEY)["ended_at"] is None
     assert env.session["config_model_seen"] == ("config-model", "fake")
+
+
+def test_refresh_keeps_requested_fast_intent_while_effective_fast_is_off(env):
+    env.old._primary_runtime["service_tier_intent"] = "priority"
+    assert env.old.service_tier is None
+    server._sync_bot_capabilities(SID, env.session)
+    new = env.session["agent"]
+    assert new is not env.old
+    assert new.service_tier is None
+    assert new._primary_runtime["service_tier_intent"] == "priority"
+    assert new._owns_session_db is True
+
+
+def test_fast_intent_change_during_refresh_refuses_stale_replacement(env):
+    env.old._primary_runtime["service_tier_intent"] = "priority"
+
+    def change_intent(**kw):
+        new = env.construct(**kw)
+        env.old._primary_runtime["service_tier_intent"] = ""
+        return new
+
+    env.monkeypatch.setattr("run_agent.AIAgent", change_intent)
+    with pytest.raises(RuntimeError, match="BOT_CAPABILITY_OWNER_CHANGED"):
+        server._sync_bot_capabilities(SID, env.session)
+    assert env.session["agent"] is env.old
+    assert env.old._primary_runtime["service_tier_intent"] == ""
+    assert env.old._owns_session_db is True
+    assert env.old.client_closes == []
+    assert env.built[-1]._owns_session_db is False
+    assert len(env.built[-1].client_closes) == 1
 
 
 def test_refresh_refuses_to_silently_normalize_unsupported_live_fast(env):

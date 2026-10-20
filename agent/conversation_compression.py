@@ -71,6 +71,7 @@ from agent.context_engine import (
     automatic_compaction_status_message,
     sanitize_memory_context,
 )
+from agent.manual_compression_feedback import compression_abort_guidance
 from agent.memory_provider import PRE_COMPRESS_CHECKPOINT_API_VERSION
 from agent.model_metadata import (
     estimate_messages_tokens_rough,
@@ -184,8 +185,9 @@ CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE = (
     "⚠ Context is over the compression threshold "
     "(~{tokens:,} tokens >= {threshold:,}) "
     "but compression is currently blocked ({reason}). "
-    "The model may stop responding. Run /new to start a fresh "
-    "session or /compress to retry immediately."
+    "Requests that exceed the model context limit may be blocked. "
+    "Resolve the compression issue before retrying, or explicitly choose /new "
+    "to start a separate session; that does not repair this history."
 )
 
 # Sample-formatted instances of every routine compression status line, for
@@ -3394,11 +3396,10 @@ def compress_context(
             getattr(agent.context_compressor, "_last_feasibility_skip", False)
         )
 
-        # If compression aborted (aux LLM failed to produce a usable summary)
-        # the compressor returns the input messages unchanged.  Surface the
-        # error to the user, skip the session-rotation work entirely (no
-        # session has logically ended), and let auto-compress callers detect
-        # the no-op via len(returned) == len(input).
+        # If compression aborted, the engine returns the input messages
+        # unchanged. That is not evidence that the next request fits or that
+        # context recovery succeeded; surface the shared truthful guidance and
+        # skip session rotation.
         if getattr(agent.context_compressor, "_last_compress_aborted", False):
             try:
                 _discard_pending_once("engine_aborted")
@@ -3406,9 +3407,8 @@ def compress_context(
                 if getattr(agent, "_last_compression_summary_warning", None) != _err:
                     agent._last_compression_summary_warning = _err
                     agent._emit_warning(
-                        f"⚠ Compression aborted: {_err}. "
-                        "No messages were dropped — conversation continues unchanged. "
-                        "Run /compress to retry, or /new to start a fresh session."
+                        "⚠ "
+                        + compression_abort_guidance(agent.context_compressor)
                     )
                 _existing_sp = getattr(agent, "_cached_system_prompt", None)
                 if not _existing_sp:
@@ -3468,7 +3468,9 @@ def compress_context(
             try:
                 agent._emit_warning(
                     "⚠ Compression returned an empty transcript. "
-                    "No session split was performed; conversation continues unchanged."
+                    "No compacted transcript was committed. The current working "
+                    "messages remain, but this does not establish that the next "
+                    "request fits or can proceed."
                 )
             except Exception:
                 pass

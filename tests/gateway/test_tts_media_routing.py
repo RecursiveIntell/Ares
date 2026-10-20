@@ -490,6 +490,7 @@ class _QueuedMediaAgent:
     first_response = ""
 
     def __init__(self, **kwargs):
+        self.model = kwargs["model"]
         self.tools = []
 
     def run_conversation(self, message, conversation_history=None, task_id=None):

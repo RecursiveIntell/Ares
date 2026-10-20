@@ -49,6 +49,8 @@ from agent.transports.ri_llm import _should_use_ri_pipeline, ri_pipeline_chat_co
 from tools.terminal_tool import is_persistent_env
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 
+from hermes_cli.middleware import EgressDispatchDenied, EgressOutcomeUnrecorded
+
 logger = logging.getLogger(__name__)
 _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 _PROVIDER_STREAM_ERROR_FINISH_REASONS = {"error", "error_finish"}
@@ -2623,8 +2625,11 @@ def try_activate_fallback(
     # Use centralized router for client construction.
     # raw_codex=True because the main agent needs direct responses.stream()
     # access for Codex providers.
-    from agent.agent_runtime_helpers import _snapshot_context_handoff
+    from agent.agent_runtime_helpers import (
+        _snapshot_context_handoff, apply_fast_mode_runtime, get_fast_mode_intent,
+    )
 
+    requested_fast_tier = get_fast_mode_intent(agent)
     restore_handoff = _snapshot_context_handoff(agent)
     handoff_accepted = False
     try:
@@ -2750,6 +2755,9 @@ def try_activate_fallback(
         agent.requested_provider = fb_provider
         agent.base_url = fb_base_url
         agent.api_mode = fb_api_mode
+        # Provider resolution may have yielded to a newer explicit Fast choice.
+        requested_fast_tier = get_fast_mode_intent(agent)
+        apply_fast_mode_runtime(agent, requested_fast_tier)
         # Per-provider reasoning_content echo opt-in (see _reasoning_echo_opt_in).
         # Read from the fallback entry so the flag travels with the active
         # provider; restore_primary_runtime will revert it from the snapshot.
@@ -2901,6 +2909,10 @@ def try_activate_fallback(
             )
         handoff_accepted = True
 
+        primary = getattr(agent, "_primary_runtime", None)
+        if isinstance(primary, dict):
+            primary.setdefault("service_tier_intent", requested_fast_tier)
+
         # Re-resolve reasoning_config for the new fallback model (Closes #21256).
         # Shared chokepoint: per-model override > global reasoning_effort
         # (YAML boolean False = disabled). Wrapped in try/except because a
@@ -2998,9 +3010,15 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             getattr(agent, "base_url", None), getattr(agent, "session_id", None),
         )
 
+        from hermes_cli.middleware import run_llm_dispatch
+        def governed_summary(final):
+            return run_llm_dispatch(final, callback, _dispatch_agent=agent,
+                purpose="background_summary", session_id=getattr(agent, "session_id", None),
+                provider=getattr(agent, "provider", None), api_mode=getattr(agent, "api_mode", None))
+
         return relay_llm.execute_current(
             request,
-            callback,
+            governed_summary,
             name=str(getattr(agent, "provider", "") or "provider"),
             model_name=str(getattr(agent, "model", "") or ""),
             metadata={
@@ -3317,6 +3335,8 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             else:
                 final_response = "I reached the iteration limit and couldn't generate a summary."
 
+    except (EgressDispatchDenied, EgressOutcomeUnrecorded):
+        raise
     except Exception as e:
         logger.warning("Failed to get summary response: %s", e)
         final_response = f"I reached the maximum iterations ({agent.max_iterations}) but couldn't summarize. Error: {str(e)}"

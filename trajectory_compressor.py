@@ -47,6 +47,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 from rich.console import Console
 from hermes_constants import OPENROUTER_BASE_URL, get_hermes_home
 from agent.retry_utils import jittered_backoff
+from hermes_cli.middleware import EgressDispatchDenied, EgressOutcomeUnrecorded
 
 # Load .env from HERMES_HOME first, then project root as a dev fallback.
 from hermes_cli.env_loader import load_hermes_dotenv
@@ -398,9 +399,10 @@ class TrajectoryCompressor:
                     f"Missing API key. Set {self.config.api_key_env} "
                     f"environment variable.")
             from openai import OpenAI
+            from ares_runtime.physical_dispatch import bind_inference_client
             from agent.auxiliary_client import _to_openai_base_url
-            self.client = OpenAI(
-                api_key=api_key, base_url=_to_openai_base_url(self.config.base_url))
+            self.client = bind_inference_client(OpenAI(
+                api_key=api_key, base_url=_to_openai_base_url(self.config.base_url)))
             # AsyncOpenAI is created lazily in _get_async_client() so it
             # binds to the current event loop — avoids "Event loop is closed"
             # when process_directory() is called multiple times (each call
@@ -421,10 +423,11 @@ class TrajectoryCompressor:
         from openai import AsyncOpenAI
         from agent.auxiliary_client import _to_openai_base_url
         # Always create a fresh client so it binds to the running loop.
-        self.async_client = AsyncOpenAI(
+        from ares_runtime.physical_dispatch import bind_inference_client
+        self.async_client = bind_inference_client(AsyncOpenAI(
             api_key=self._async_client_api_key,
             base_url=_to_openai_base_url(self.config.base_url),
-        )
+        ))
         return self.async_client
 
     def _detect_provider(self) -> str:
@@ -656,11 +659,16 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
                     }
                     if summary_temperature is not None:
                         _create_kwargs["temperature"] = summary_temperature
-                    response = self.client.chat.completions.create(**_create_kwargs)
+                    from hermes_cli.middleware import run_llm_dispatch
+                    response = run_llm_dispatch(_create_kwargs,
+                        lambda body: self.client.chat.completions.create(**body),
+                        purpose='background_summary', api_mode='chat_completions')
                 
                 summary = self._coerce_summary_content(response.choices[0].message.content)
                 return self._ensure_summary_prefix(summary)
                 
+            except (EgressDispatchDenied, EgressOutcomeUnrecorded):
+                raise
             except Exception as e:
                 metrics.summarization_errors += 1
                 self.logger.warning("Summarization attempt %d failed: %s", attempt + 1, e)
@@ -725,11 +733,16 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
                     }
                     if summary_temperature is not None:
                         _create_kwargs["temperature"] = summary_temperature
-                    response = await self._get_async_client().chat.completions.create(**_create_kwargs)
+                    from hermes_cli.middleware import async_run_llm_dispatch
+                    response = await async_run_llm_dispatch(_create_kwargs,
+                        lambda body: self._get_async_client().chat.completions.create(**body),
+                        purpose='background_summary', api_mode='chat_completions')
                 
                 summary = self._coerce_summary_content(response.choices[0].message.content)
                 return self._ensure_summary_prefix(summary)
                 
+            except (EgressDispatchDenied, EgressOutcomeUnrecorded):
+                raise
             except Exception as e:
                 metrics.summarization_errors += 1
                 self.logger.warning("Summarization attempt %d failed: %s", attempt + 1, e)

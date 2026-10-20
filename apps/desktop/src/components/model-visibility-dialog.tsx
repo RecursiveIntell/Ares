@@ -61,10 +61,17 @@ export function ModelVisibilityDialog({
 
   const modelOptions = useQuery({
     queryKey: modelOptionsQueryKey(catalogProfile, sessionId, connectionId),
-    queryFn: (): Promise<ModelOptionsResponse> => requestModelOptions({
-      connectionId, gateway: gw, profile: catalogProfile, sessionId,
-      request: gw && sessionId ? (method, params) => requestForOwnedSession(sessionId, gw.request.bind(gw), method, params) : undefined
-    }),
+    queryFn: (): Promise<ModelOptionsResponse> =>
+      requestModelOptions({
+        connectionId,
+        gateway: gw,
+        profile: catalogProfile,
+        sessionId,
+        request:
+          gw && sessionId
+            ? (method, params) => requestForOwnedSession(sessionId, gw.request.bind(gw), method, params)
+            : undefined
+      }),
     enabled: open
   })
 

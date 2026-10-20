@@ -68,3 +68,60 @@ describe('installCrashForensics', () => {
     expect([...listeners.keys()].sort()).toEqual(['uncaughtException', 'unhandledRejection'])
   })
 })
+
+describe('installCrashForensics — EPIPE suppression', () => {
+  const epipe = () => Object.assign(new Error('write EPIPE'), { code: 'EPIPE' })
+
+  it('logs the summary on the first EPIPE so an isolated fault stays visible', () => {
+    const captured = new Map<string, (value: unknown) => void>()
+    const flush = vi.fn()
+    const log = vi.fn()
+    installCrashForensics({
+      flush,
+      log,
+      target: { on: (event, l) => captured.set(event, l as (value: unknown) => void) }
+    })
+    captured.get('uncaughtException')!(epipe())
+    expect(log).toHaveBeenCalledTimes(1)
+    expect(log.mock.calls[0][0]).toMatch(/EPIPE on stdio suppressed x1/)
+  })
+
+  it('rate-limits the summary to once per minute under a storm', () => {
+    vi.useFakeTimers()
+    const captured = new Map<string, (value: unknown) => void>()
+    const flush = vi.fn()
+    const log = vi.fn()
+    installCrashForensics({
+      flush,
+      log,
+      target: { on: (event, l) => captured.set(event, l as (value: unknown) => void) }
+    })
+    const storm = captured.get('uncaughtException')!
+
+    for (let i = 0; i < 100; i++) {
+      storm(epipe())
+    }
+
+    expect(log).toHaveBeenCalledTimes(1)
+    expect(log.mock.calls[0][0]).toMatch(/EPIPE on stdio suppressed x\d+/)
+
+    vi.advanceTimersByTime(61_000)
+    storm(epipe())
+    expect(log).toHaveBeenCalledTimes(2)
+    vi.useRealTimers()
+  })
+
+  it('still logs non-EPIPE faults normally', () => {
+    const captured = new Map<string, (value: unknown) => void>()
+    const flush = vi.fn()
+    const log = vi.fn()
+    installCrashForensics({
+      flush,
+      log,
+      target: { on: (event, l) => captured.set(event, l as (value: unknown) => void) }
+    })
+    captured.get('uncaughtException')!(new Error('boom'))
+    expect(log).toHaveBeenCalledTimes(1)
+    expect(log.mock.calls[0][0]).toMatch(/Uncaught exception: Error: boom/)
+  })
+})

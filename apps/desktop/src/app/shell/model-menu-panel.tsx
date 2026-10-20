@@ -14,11 +14,7 @@ import { DEFAULT_REASONING_EFFORT } from '@/lib/reasoning-effort'
 import { cn } from '@/lib/utils'
 import { activeGatewayConnectionId, requestGatewayForAgent } from '@/store/gateway'
 import { $modelPresets, applyModelPreset, modelPresetKey, setModelPreset } from '@/store/model-presets'
-import {
-  $defaultReasoningEffort,
-  getComposerModelSelection,
-  markComposerSelectionManual
-} from '@/store/session'
+import { $defaultReasoningEffort, getComposerModelSelection, markComposerSelectionManual } from '@/store/session'
 import { $sessionStates, knownOwnerForSession } from '@/store/session-states'
 import type { ModelOptionsResponse } from '@/types/hermes'
 
@@ -60,6 +56,7 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
   const activeSessionId = useStore(view.$runtimeId)
   const owner = knownOwnerForSession(activeSessionId)
   const draftOwner = useDraftComposerOwner()
+
   const connectionId =
     owner && typeof owner === 'object'
       ? owner.connectionId
@@ -68,6 +65,7 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
         : !activeSessionId
           ? draftOwner.connectionId
           : activeGatewayConnectionId()
+
   const catalogProfile =
     (typeof owner === 'string' ? owner : owner?.targetProfile || owner?.profile) ||
     (!activeSessionId ? draftOwner.targetProfile || draftOwner.profile : profile)

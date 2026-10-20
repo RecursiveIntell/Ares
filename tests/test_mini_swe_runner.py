@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+from tests.agent.sdk_factory_fixtures import mock_client_httpx_backend
 
 
 def test_run_task_kimi_omits_temperature():
@@ -7,8 +8,10 @@ def test_run_task_kimi_omits_temperature():
 
     The Kimi gateway selects the correct temperature server-side.
     """
-    with patch("openai.OpenAI") as mock_openai:
-        client = MagicMock()
+    client = MagicMock()
+    with patch("agent.auxiliary_client._load_openai_cls") as load_cls, mock_client_httpx_backend(client):
+        mock_openai = MagicMock(return_value=client)
+        load_cls.return_value = mock_openai
         client.chat.completions.create.return_value = SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content="done", tool_calls=[]))]
         )
@@ -34,8 +37,10 @@ def test_run_task_kimi_omits_temperature():
 
 def test_run_task_public_moonshot_kimi_k2_5_omits_temperature():
     """kimi-k2.5 on the public Moonshot API should not get a forced temperature."""
-    with patch("openai.OpenAI") as mock_openai:
-        client = MagicMock()
+    client = MagicMock()
+    with patch("agent.auxiliary_client._load_openai_cls") as load_cls, mock_client_httpx_backend(client):
+        mock_openai = MagicMock(return_value=client)
+        load_cls.return_value = mock_openai
         client.base_url = "https://api.moonshot.ai/v1"
         client.chat.completions.create.return_value = SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content="done", tool_calls=[]))]

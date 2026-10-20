@@ -47,7 +47,7 @@ def gated_app():
     web_server.app.state.bound_host = "fly-app.fly.dev"
     web_server.app.state.bound_port = 443
     web_server.app.state.auth_required = True
-    client = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
+    client = TestClient(web_server.app, base_url="https://fly-app.fly.dev", headers={"Origin": "https://fly-app.fly.dev"})
     yield client
     clear_providers()
     _reset_for_tests()
@@ -192,7 +192,13 @@ def _fake_ws(
         def get(self, k, default=""):
             return self._q.get(k, default)
 
-    return SimpleNamespace(
+    class FakeWS(SimpleNamespace):
+        @property
+        def scope(self):
+            return {"type": "websocket", "scheme": "wss" if self.headers.get("origin", "").startswith("https:") else "ws",
+                    "headers": [(k.encode(), v.encode()) for k, v in self.headers.items()]}
+
+    return FakeWS(
         query_params=_QP(query),
         headers={"sec-websocket-protocol": ", ".join(protocols)} if protocols else {},
         client=SimpleNamespace(host=client_host),
@@ -379,20 +385,7 @@ class TestWsRequestIsAllowedGated:
 
 
 class TestWsHostOriginGuardOrigins:
-    """The WS Origin guard must let the packaged desktop shell connect.
-
-    Electron loads the packaged renderer over ``file://``, so its WebSocket
-    handshake carries ``Origin: file://`` (or the opaque ``null``, or a custom
-    ``app://`` scheme). The DNS-rebinding guard only needs to block cross-site
-    http(s) origins — a malicious web page can never forge a non-web origin.
-
-    This guard runs only AFTER ``_ws_auth_ok`` has validated the WS credential
-    (session token on loopback / ``--insecure`` binds, single-use ``?ticket=``
-    on OAuth-gated binds), so a non-web origin is trusted in every mode: the
-    credential is the real gate, and a ``file://`` / ``null`` origin cannot
-    originate a DNS-rebinding browser attack. ``http(s)`` origins are still
-    match-checked against the bound host.
-    """
+    """Opaque origins require child-owned native proof; bearer alone is insufficient."""
 
     def _ws(self, *, origin, host):
         ws = _fake_ws(query={}, path="/api/ws")
@@ -400,15 +393,15 @@ class TestWsHostOriginGuardOrigins:
         return ws
 
 
-    def test_explicit_non_loopback_file_origin_allowed(self, insecure_explicit_host_app):
+    def test_explicit_non_loopback_file_origin_denied_without_native_proof(self, insecure_explicit_host_app):
         """Packaged Hermes Desktop also uses file:// when connecting to a
         Tailscale/LAN dashboard bind.
 
-        The WebSocket route calls _ws_auth_ok before this guard, so in
-        non-gated mode the legacy session token remains the auth boundary.
+        A valid bearer does not admit an opaque browser origin; Desktop
+        main must provide its verified native transport provenance.
         """
         ws = self._ws(origin="file://", host="100.64.0.10:9119")
-        assert web_server._ws_host_origin_is_allowed(ws) is True
+        assert web_server._ws_host_origin_is_allowed(ws) is False
 
 
 

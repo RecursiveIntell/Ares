@@ -213,6 +213,8 @@ ares rollback
 
 `ares update` stages a configured Hermes upstream revision, applies the Ares downstream state, builds the candidate, and switches only after the candidate succeeds. If the build or activation path fails, the active release is intended to remain selected. `ares rollback` returns to the previous stable release when one exists. Rolling back across a release boundary that predates a full installation (for example, a base release that this installer has upgraded) leaves the enhanced configuration pointing at tooling the older release does not bundle; the install receipt records this (`rollback_previous_has_bundled_tools`), and rolling forward again or rerunning the installer recovers.
 
+> **Note: moving to the latest upstream Hermes through `ares update` is not currently supported.** The behavior depends on how Ares was installed. Full-distribution installs (`install.sh`) are rejected by `ares update`; upgrade them by rerunning the installer. Base-recipe installs resolve the configured upstream branch's current head, so `ares update` advances them to the newest upstream commit. Whether that path stays supported is still under evaluation.
+
 Ordinary `ares setup` and `ares update` refuse an unqualified selected release.
 For a verified legacy release without `runtime_binding`, follow the
 [source-bound transition runbook](docs/operations/legacy-controller-transition.md):

@@ -106,10 +106,13 @@ def _redirect_uri(request: Request) -> str:
 
 
 def _client_ip(request: Request) -> str:
-    fwd = request.headers.get("x-forwarded-for", "")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    return request.client.host if request.client else ""
+    # Uvicorn alone resolves explicitly trusted proxies before this caller.
+    # Invalid / unavailable identities share one fail-closed bucket.
+    import ipaddress
+    try:
+        return str(ipaddress.ip_address(request.client.host)) if request.client else "_unknown_"
+    except ValueError:
+        return "_unknown_"
 
 
 def _prefix(request: Request) -> str:
@@ -648,13 +651,13 @@ def _validate_post_login_target(raw: str) -> str:
 # password we verify locally, so it's a credential-stuffing target. A
 # simple in-process sliding-window limiter per client IP raises the cost
 # of online guessing without any external dependency. It is intentionally
-# best-effort: process-local (resets on restart), and behind a trusting
-# proxy the IP is the proxy's unless X-Forwarded-For is set — which is why
-# this is defence-in-depth on top of the provider's own constant-time
-# verify, not the only line of defence.
+# process-local (resets on restart). Uvicorn resolves forwarded identity only
+# from explicitly trusted proxy peers; application callers never parse XFF.
+# This supplements the provider's constant-time credential verification.
 
 _PW_RATE_MAX_ATTEMPTS = 10
 _PW_RATE_WINDOW_SEC = 60.0
+_PW_RATE_MAX_PEERS = 4096
 _pw_attempts: Dict[str, Deque[float]] = defaultdict(deque)
 _pw_attempts_lock = threading.Lock()
 
@@ -672,6 +675,16 @@ def _password_rate_limited(ip: str) -> bool:
     cutoff = now - _PW_RATE_WINDOW_SEC
     key = ip or "_unknown_"
     with _pw_attempts_lock:
+        # Expire idle peers without evicting live budgets. At capacity a new
+        # peer is denied; cycling identities cannot reset an existing bucket.
+        for peer in list(_pw_attempts):
+            attempts = _pw_attempts[peer]
+            while attempts and attempts[0] <= cutoff:
+                attempts.popleft()
+            if not attempts:
+                del _pw_attempts[peer]
+        if key not in _pw_attempts and len(_pw_attempts) >= _PW_RATE_MAX_PEERS:
+            return True
         bucket = _pw_attempts[key]
         while bucket and bucket[0] < cutoff:
             bucket.popleft()

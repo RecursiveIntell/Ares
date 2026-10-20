@@ -88,7 +88,9 @@ export async function applyModelPreset(
   { effort, fast }: ModelPreset,
   ctx: { failMessage: string; primary?: boolean; request: RequestGateway; sessionId: null | string }
 ): Promise<void> {
-  if (effort === undefined && fast === undefined) {return}
+  if (effort === undefined && fast === undefined) {
+    return
+  }
 
   if (!ctx.sessionId) {
     if (effort !== undefined) {
@@ -161,20 +163,27 @@ export async function applyModelPreset(
   const legacyAccepted = new Set<'effort' | 'fast'>()
   const legacyDeferred = new Set<'effort' | 'fast'>()
   sessionTileDelegate()?.updateSession(runtimeId, current => ({
-    ...current, pendingRuntimeOptions: { ...current.pendingRuntimeOptions, ...desired }
+    ...current,
+    pendingRuntimeOptions: { ...current.pendingRuntimeOptions, ...desired }
   }))
 
   const clearPending = () => {
     // A settled write cannot recreate a closed runtime or touch a successor's
     // intent. Check ownership before asking the delegate to update any slice.
-    if ((effort === undefined || !owns('effort')) && (fast === undefined || !owns('fast'))) {return}
+    if ((effort === undefined || !owns('effort')) && (fast === undefined || !owns('fast'))) {
+      return
+    }
 
     sessionTileDelegate()?.updateSession(runtimeId, current => {
       const pending = { ...current.pendingRuntimeOptions }
 
-      if (effort !== undefined && owns('effort') && !legacyDeferred.has('effort')) {delete pending.effort}
+      if (effort !== undefined && owns('effort') && !legacyDeferred.has('effort')) {
+        delete pending.effort
+      }
 
-      if (fast !== undefined && owns('fast') && !legacyDeferred.has('fast')) {delete pending.fast}
+      if (fast !== undefined && owns('fast') && !legacyDeferred.has('fast')) {
+        delete pending.fast
+      }
 
       return { ...current, pendingRuntimeOptions: Object.keys(pending).length ? pending : null }
     })
@@ -185,7 +194,9 @@ export async function applyModelPreset(
 
     try {
       result = await ctx.request<{ deferred?: boolean; selector_info?: SessionRuntimeInfo }>('config.set', {
-        key: 'runtime_options', session_id: runtimeId, value: desired
+        key: 'runtime_options',
+        session_id: runtimeId,
+        value: desired
       })
     } catch (err) {
       if (!isLegacyRuntimeOptionsBackend(err)) {
@@ -196,28 +207,45 @@ export async function applyModelPreset(
       // writes, in the same order, so a mid-upgrade user keeps the feature.
       if (effort !== undefined) {
         const response = await ctx.request<{ deferred?: boolean }>('config.set', {
-          key: 'reasoning', session_id: runtimeId, value: effort
+          key: 'reasoning',
+          session_id: runtimeId,
+          value: effort
         })
+
         legacyAccepted.add('effort')
-        if (response?.deferred) { legacyDeferred.add('effort') }
+
+        if (response?.deferred) {
+          legacyDeferred.add('effort')
+        }
       }
 
       if (fast !== undefined) {
         const response = await ctx.request<{ deferred?: boolean }>('config.set', {
-          key: 'fast', session_id: runtimeId, value: fast ? 'fast' : 'normal'
+          key: 'fast',
+          session_id: runtimeId,
+          value: fast ? 'fast' : 'normal'
         })
+
         legacyAccepted.add('fast')
-        if (response?.deferred) { legacyDeferred.add('fast') }
+
+        if (response?.deferred) {
+          legacyDeferred.add('fast')
+        }
       }
     }
 
-    if (effort !== undefined && owns('effort')) {clearRuntimeOptionUncertainty(runtimeId, 'effort')}
+    if (effort !== undefined && owns('effort')) {
+      clearRuntimeOptionUncertainty(runtimeId, 'effort')
+    }
 
-    if (fast !== undefined && owns('fast')) {clearRuntimeOptionUncertainty(runtimeId, 'fast')}
+    if (fast !== undefined && owns('fast')) {
+      clearRuntimeOptionUncertainty(runtimeId, 'fast')
+    }
 
     if (!result?.deferred) {
       if (result?.selector_info && ((effort !== undefined && owns('effort')) || (fast !== undefined && owns('fast')))) {
-        sessionTileDelegate()?.updateSession(runtimeId, current => ({ ...current,
+        sessionTileDelegate()?.updateSession(runtimeId, current => ({
+          ...current,
           ...reconcileSelectorInfo(current, result!.selector_info!, {
             settleOptions: (['effort', 'fast'] as const).filter(dimension => dimension in desired && owns(dimension))
           })
@@ -230,7 +258,15 @@ export async function applyModelPreset(
     let definitiveFailure = false
 
     for (const dimension of ['effort', 'fast'] as const) {
-      if (!(dimension in desired) || !owns(dimension)) {continue}
+      if (!(dimension in desired) || !owns(dimension)) {
+        continue
+      }
+
+      if (legacyAccepted.has(dimension)) {
+        clearRuntimeOptionUncertainty(runtimeId, dimension)
+
+        continue
+      }
 
       if (legacyAccepted.has(dimension)) {
         clearRuntimeOptionUncertainty(runtimeId, dimension)
@@ -238,8 +274,12 @@ export async function applyModelPreset(
       }
 
       const reconciled = await reconcileRuntimeOptionFailure(err, {
-        sessionId: runtimeId, dimension, request: ctx.request, owns: () => owns(dimension),
-        applyObserved: value => paint(dimension === 'effort' ? { reasoningEffort: value as string } : { fast: value as boolean }, false)
+        sessionId: runtimeId,
+        dimension,
+        request: ctx.request,
+        owns: () => owns(dimension),
+        applyObserved: value =>
+          paint(dimension === 'effort' ? { reasoningEffort: value as string } : { fast: value as boolean }, false)
       })
 
       if (reconciled === 'not_uncertain' && owns(dimension)) {
@@ -252,6 +292,9 @@ export async function applyModelPreset(
     // Uncertainty remains explicit via its warning/marker; it must not keep
     // masking later authoritative selector observations or newer user edits.
     clearPending()
-    if (definitiveFailure) { notifyError(err, ctx.failMessage) }
+
+    if (definitiveFailure) {
+      notifyError(err, ctx.failMessage)
+    }
   }
 }

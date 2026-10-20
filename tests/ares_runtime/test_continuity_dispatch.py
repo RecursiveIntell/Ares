@@ -9,6 +9,12 @@ from ares_runtime.continuity.runtime import (
 from tests.run_agent.test_run_agent import agent, _mock_response  # noqa: F401
 
 
+@pytest.fixture(autouse=True)
+def _disable_automatic_title_provider(monkeypatch):
+    """Dispatch tests use provider doubles; suppress unrelated title egress."""
+    monkeypatch.setattr("agent.title_generator.maybe_auto_title", lambda *_a, **_kw: None)
+
+
 @pytest.fixture
 def durable_agent(agent, tmp_path):
     from hermes_state import SessionDB
@@ -226,6 +232,206 @@ def test_provider_overflow_refusal_preserves_charge_and_stops_retry(durable_agen
     assert agent.client.chat.completions.create.call_count == 1
     rebase.assert_called_once()
     tool.assert_not_called()
+
+
+def test_terminal_overflow_message_does_not_recommend_immediate_compress(durable_agent):
+    agent, _db = durable_agent
+    agent.context_rebase_enabled = False
+    agent.compression_enabled = True
+    agent.max_compression_attempts = 0
+    agent.max_iterations = 2
+    agent.context_compressor.threshold_tokens = 1_000_000
+    error = Exception("request entity too large")
+    error.status_code = 413
+    agent.client.chat.completions.create.side_effect = error
+    printed = []
+    agent._vprint = lambda message, *_args, **_kwargs: printed.append(str(message))
+
+    with (
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch("run_agent.handle_function_call") as tool,
+    ):
+        result = agent.run_conversation("continue")
+
+    assert result["failed"] is True
+    assert result["completed"] is False
+    assert result["api_calls"] == 1
+    assert agent.client.chat.completions.create.call_count == 1
+    tool.assert_not_called()
+    user_facing = "\n".join(printed).lower()
+    assert "/compress" not in user_facing
+    assert "resolve the compression issue before retrying" in user_facing
+    assert "that does not repair this history" in user_facing
+
+
+def test_auto_compaction_disabled_overflow_guidance_does_not_prompt_blind_compress(
+    durable_agent,
+):
+    agent, _db = durable_agent
+    agent.context_rebase_enabled = False
+    agent.compression_enabled = False
+    agent.max_compression_attempts = 0
+    agent.max_iterations = 2
+    agent.context_compressor.threshold_tokens = 1_000_000
+    agent.context_compressor.automatic_rebase_block_reason = lambda: (
+        "CONTEXT_REBASE_LINEAGE_INTEGRITY_MISMATCH"
+    )
+    error = Exception("request entity too large")
+    error.status_code = 413
+    agent.client.chat.completions.create.side_effect = error
+    printed = []
+    agent._vprint = lambda message, *_args, **_kwargs: printed.append(str(message))
+
+    with (
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch("run_agent.handle_function_call") as tool,
+    ):
+        result = agent.run_conversation("continue")
+
+    assert result["failed"] is True
+    assert result["completed"] is False
+    assert result["api_calls"] == 1
+    assert agent.client.chat.completions.create.call_count == 1
+    tool.assert_not_called()
+    user_facing = "\n".join([*printed, result["final_response"]]).lower()
+    assert "/compress" not in user_facing
+    assert "resolve the compression issue before retrying" in user_facing
+    assert "separate conversation" in user_facing
+    assert "does not repair this history" in user_facing
+
+
+@pytest.mark.parametrize("boundary", ["turn_start", "pre_api"])
+def test_active_lineage_veto_uses_real_owner_and_stops_provider_tool_admission(
+    durable_agent, boundary
+):
+    from agent import conversation_loop
+
+    agent, db = durable_agent
+    veto = "CONTEXT_REBASE_LINEAGE_INTEGRITY_MISMATCH"
+    agent._cached_system_prompt = "Trusted instructions"
+    agent._use_prompt_caching = False
+    agent.save_trajectories = False
+    agent.context_rebase_enabled = True
+    agent.compression_enabled = boundary == "turn_start"
+    agent.max_iterations = 1
+    agent.context_compressor.threshold_tokens = 100
+    agent.context_compressor.automatic_rebase_block_reason = lambda: veto
+    agent.client.chat.completions.create.return_value = _mock_response(
+        content="This provider call must never happen", finish_reason="stop",
+    )
+    before_sessions = db._conn.execute(
+        "SELECT COUNT(*) FROM sessions"
+    ).fetchone()[0]
+    warnings = []
+    printed = []
+    agent._emit_warning = warnings.append
+    agent._vprint = lambda message, *_args, **_kwargs: printed.append(str(message))
+    history = [
+        {"role": "user", "content": "old request"},
+        {"role": "assistant", "content": "old evidence " * 100},
+    ]
+    original_build = conversation_loop.build_turn_context
+
+    def build_then_enable(*args, **kwargs):
+        context = original_build(*args, **kwargs)
+        agent.compression_enabled = True
+        return context
+
+    with (
+        patch.object(agent.context_compressor, "should_compress_info",
+                     return_value=(False, "insufficient_progress")),
+        patch.object(agent.context_compressor, "should_defer_preflight_to_real_usage",
+                     return_value=False, create=True),
+        patch("agent.conversation_loop.build_turn_context", side_effect=build_then_enable),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch("run_agent.handle_function_call") as tool,
+    ):
+        if boundary == "turn_start":
+            with pytest.raises(AutomaticRebaseError, match=veto):
+                agent.run_conversation("continue", conversation_history=history)
+        else:
+            stopped = agent.run_conversation("continue", conversation_history=history)
+            assert stopped["failed"] is True
+            assert stopped["completed"] is False
+            assert stopped["error"] == veto
+            assert stopped["api_calls"] == 0
+            assert agent.iteration_budget.used == 0
+
+    agent.client.chat.completions.create.assert_not_called()
+    tool.assert_not_called()
+    after_sessions = db._conn.execute(
+        "SELECT COUNT(*) FROM sessions"
+    ).fetchone()[0]
+    assert after_sessions == before_sessions
+    assert db.get_session(agent.session_id)["ended_at"] is None
+    persisted_current_user = [
+        row
+        for row in db.get_messages_as_conversation(agent.session_id)
+        if row["role"] == "user" and row["content"] == "continue"
+    ]
+    assert len(persisted_current_user) == 1
+    if boundary == "turn_start":
+        assert warnings
+    assert all(
+        "/compress" not in output.lower() for output in [*warnings, *printed]
+    )
+
+
+def test_active_lineage_veto_blocks_provider_overflow_retry_without_successor(
+    durable_agent,
+):
+    agent, db = durable_agent
+    veto = "CONTEXT_REBASE_LINEAGE_INTEGRITY_MISMATCH"
+    agent._cached_system_prompt = "Trusted instructions"
+    agent._use_prompt_caching = False
+    agent.save_trajectories = False
+    agent.compression_enabled = True
+    agent.context_rebase_enabled = True
+    agent.max_compression_attempts = 0
+    agent.max_iterations = 3
+    agent.context_compressor.threshold_tokens = 1_000_000
+    agent.context_compressor.automatic_rebase_block_reason = lambda: veto
+    error = Exception("maximum context length exceeded")
+    error.status_code = 413
+    agent.client.chat.completions.create.side_effect = error
+    before_sessions = db._conn.execute(
+        "SELECT COUNT(*) FROM sessions"
+    ).fetchone()[0]
+    warnings = []
+    printed = []
+    agent._emit_warning = warnings.append
+    agent._vprint = lambda message, *_args, **_kwargs: printed.append(str(message))
+
+    with (
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch("run_agent.handle_function_call") as tool,
+    ):
+        stopped = agent.run_conversation("continue")
+
+    assert stopped["error"] == veto
+    assert stopped["failed"] is True
+    assert stopped["completed"] is False
+    assert stopped["api_calls"] == 1
+    assert agent.iteration_budget.used == 1
+    assert agent.client.chat.completions.create.call_count == 1
+    tool.assert_not_called()
+    after_sessions = db._conn.execute(
+        "SELECT COUNT(*) FROM sessions"
+    ).fetchone()[0]
+    assert after_sessions == before_sessions
+    persisted_current_user = [
+        row
+        for row in db.get_messages_as_conversation(agent.session_id)
+        if row["role"] == "user" and row["content"] == "continue"
+    ]
+    assert len(persisted_current_user) == 1
+    assert all(
+        "/compress" not in output.lower() for output in [*warnings, *printed]
+    )
 
 
 @pytest.mark.parametrize("mutation,reason", [
